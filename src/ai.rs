@@ -18,6 +18,7 @@ use image::{codecs::jpeg::JpegEncoder, ImageReader};
 use sea_orm::ActiveValue;
 use serde::{Deserialize, Serialize};
 use serde_json::{from_str, json, Value};
+use tokio::sync::Semaphore;
 use tracing::info;
 
 use crate::ensure_ends_with_punctuation;
@@ -63,6 +64,8 @@ pub struct Ai {
     client: Client<OpenAIConfig>,
     http: reqwest::Client,
     jina_token: String,
+    jina_semaphore: Semaphore,
+    chat_semaphore: Semaphore,
 }
 
 fn response_format() -> ResponseFormat {
@@ -218,6 +221,8 @@ impl Ai {
             client,
             http: reqwest::Client::new(),
             jina_token: std::env::var("JINA_API").expect("JINA_API must be provided"),
+            jina_semaphore: Semaphore::new(4),
+            chat_semaphore: Semaphore::new(4),
         }
     }
 
@@ -274,6 +279,8 @@ impl Ai {
     }
 
     async fn get_jina_embeddings(&self, req: impl Serialize) -> Result<Vec<f32>> {
+        let _permit = self.jina_semaphore.acquire().await?;
+
         let res: JinaAiResponse = self
             .http
             .post("https://api.jina.ai/v1/embeddings")
@@ -314,6 +321,8 @@ impl Ai {
         messages: Vec<ChatCompletionRequestMessage>,
         _cheap_model: bool,
     ) -> Result<AiMetadata> {
+        let _permit = self.chat_semaphore.acquire().await?;
+
         let request = CreateChatCompletionRequestArgs::default()
             .model("gemini-2.5-flash-preview-05-20")
             .max_tokens(1024u32)
