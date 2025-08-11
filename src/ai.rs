@@ -324,7 +324,7 @@ impl Ai {
         let _permit = self.chat_semaphore.acquire().await?;
 
         let request = CreateChatCompletionRequestArgs::default()
-            .model("gemini-2.5-flash-preview-05-20")
+            .model("gemini-2.5-flash")
             .max_tokens(1024u32)
             .reasoning_effort(ReasoningEffort::None)
             .response_format(response_format())
