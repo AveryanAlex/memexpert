@@ -268,6 +268,8 @@ impl Storage {
             .next()
             .context("meme not found")?;
 
+        trans.commit().await?;
+
         let control_msg = refresh_meme_control_msg(&self.bot, &meme, &translations).await?;
 
         if let Some(control_msg) = &control_msg {
@@ -276,7 +278,7 @@ impl Storage {
                 control_message_id: ActiveValue::set(control_msg.id.0),
                 ..Default::default()
             }
-            .save(&trans)
+            .save(&self.dc)
             .await?;
         }
         self.update_meme_in_qd(&meme, &translations, img_embedding)
@@ -286,8 +288,6 @@ impl Storage {
             .await?;
         self.load_tg_file(&meme.thumb_tg_id, meme.thumb_content_length.try_into()?)
             .await?;
-
-        trans.commit().await?;
 
         Ok(control_msg)
     }
