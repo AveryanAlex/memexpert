@@ -281,7 +281,7 @@ pub async fn refresh_meme_control_msg(
     let chat_id = ChatId(chat_id);
     let input_file = InputFile::file_id(meme.tg_id.clone());
 
-    Ok(if meme.control_message_id == -1 {
+    Ok(if meme.control_message_id < 0 {
         Some(match meme.media_type {
             MediaType::Animation => {
                 bot.send_animation(chat_id, input_file)

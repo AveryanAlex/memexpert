@@ -5,6 +5,7 @@ use std::time::Duration;
 use anyhow::{bail, ensure, Context, Result};
 use chrono::Utc;
 use itertools::Itertools;
+use rand::Rng;
 use teloxide::types::UserId;
 use tokio::time::{self, interval};
 use tracing::log::LevelFilter;
@@ -394,7 +395,8 @@ impl Storage {
 
         self.bruteforce_available_slug(&trans, &mut meme).await?;
 
-        meme.control_message_id = ActiveValue::set(-1);
+        // it should be None, but... historically...
+        meme.control_message_id = ActiveValue::set(-rand::thread_rng().gen_range(1..1_000_000));
         let meme = Memes::insert(meme)
             .exec_with_returning(&trans)
             .await
