@@ -282,7 +282,10 @@ async fn meme(
                 referer: ActiveValue::set(get_header(&headers, header::REFERER)),
                 is_bot: ActiveValue::set(
                     get_header(&headers, header::USER_AGENT)
-                        .map(|ua| ua.to_lowercase().contains("bot"))
+                        .map(|ua| {
+                            let ua = ua.to_lowercase();
+                            ua.contains("bot") || ua.contains("crawler")
+                        })
                         .unwrap_or(false),
                 ),
 
