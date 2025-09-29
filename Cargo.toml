@@ -61,7 +61,7 @@ async-openai = { git = "https://github.com/averyanalex/async-openai.git" }
 base64 = "0.22"
 chrono = "0.4"
 include_dir = "0.7.3"
-itertools = "0.13"
+itertools = "0.14"
 mime = "0.3"
 mime_guess = "2.0"
 rand = "0.8"

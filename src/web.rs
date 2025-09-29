@@ -27,6 +27,7 @@ use chrono::SecondsFormat;
 use entities::{memes, translations};
 use entities::{sea_orm_active_enums::MediaType, web_visits};
 use include_dir::{include_dir, Dir};
+use itertools::Itertools;
 use rand::{distributions::Alphanumeric, Rng};
 use sea_orm::ActiveValue;
 use serde::Deserialize;
@@ -47,6 +48,7 @@ pub async fn run_webserver(app_state: AppState) -> Result<()> {
         .route("/", get(index))
         .route("/sitemap.xml", get(sitemap_xml))
         .route("/sitemap.txt", get(sitemap_txt))
+        .route("/rss.xml", get(rss_feed))
         .layer(middleware::from_fn(minificator))
         .with_state(app_state);
 
@@ -130,6 +132,61 @@ async fn sitemap_txt(State(state): State<AppState>) -> Result<Response, AppError
         .into_response())
 }
 
+async fn rss_feed(State(state): State<AppState>) -> Result<Response, AppError> {
+    let memes = state.storage.all_memes_with_translations().await?;
+
+    let mut rss_items = memes
+        .into_iter()
+        .flat_map(|(m, trs)| {
+            trs.into_iter().map(move |tr| {
+                let mime_type: mime::Mime = m
+                    .mime_type
+                    .parse()
+                    .unwrap_or(mime::APPLICATION_OCTET_STREAM);
+                let extension = match mime_type.subtype() {
+                    mime::JPEG => "jpg",
+                    mime::MP4 => "mp4",
+                    _ => "jpg",
+                };
+
+                RssItem {
+                    text: m.text.clone(),
+                    title: tr.title,
+                    description: Some(tr.description),
+                    language: tr.language,
+                    caption: tr.caption,
+                    slug: m.slug.clone(),
+                    pub_date: m.creation_time.and_utc().to_rfc2822(),
+                    mime_type: mime_type.to_string(),
+                    content_length: m.content_length,
+                    width: m.width.try_into().unwrap_or(0),
+                    height: m.height.try_into().unwrap_or(0),
+                    thumb_width: m.thumb_width.try_into().unwrap_or(0),
+                    thumb_height: m.thumb_height.try_into().unwrap_or(0),
+                    source: m.source.clone(),
+                    filename: format!("{}.{}", m.slug, extension),
+                    thumb_filename: format!("{}.thumb.jpg", m.slug),
+                    duration_secs: m.duration,
+                    is_mime_video: mime_type.type_() == mime::VIDEO,
+                }
+            })
+        })
+        .collect_vec();
+
+    rss_items.sort_by(|a, b| b.pub_date.cmp(&a.pub_date));
+
+    let build_date = chrono::Utc::now().to_rfc2822();
+
+    Ok((
+        [(header::CONTENT_TYPE, "application/rss+xml; charset=utf-8")],
+        RssTemplate {
+            build_date,
+            items: rss_items,
+        },
+    )
+        .into_response())
+}
+
 async fn assets(Path(path): Path<String>) -> impl IntoResponse {
     let path = path.trim_start_matches('/');
     let mime_type = mime_guess::from_path(path).first_or_text_plain();
@@ -194,8 +251,7 @@ async fn file(
             let new_filename: String = [new_slug.as_str()]
                 .into_iter()
                 .chain(splitten.into_iter().skip(1))
-                .intersperse(".")
-                .collect();
+                .join(".");
             Redirect::permanent(&new_filename).into_response()
         } else {
             (StatusCode::NOT_FOUND, "meme not found").into_response()
@@ -217,7 +273,6 @@ fn memes_to_gallery(memes: &[memes::Model]) -> Vec<GalleryImage> {
     memes
         .iter()
         .map(|m| GalleryImage {
-            id: m.id,
             filename: format!("{}.thumb.jpg", m.slug),
             width: m.thumb_width,
             height: m.thumb_height,
@@ -412,7 +467,6 @@ async fn search(
 }
 
 struct GalleryImage {
-    id: i32,
     filename: String,
     width: i32,
     height: i32,
@@ -482,6 +536,34 @@ struct SitemapMeme {
     m: memes::Model,
     lastmod: String,
     trs: Vec<translations::Model>,
+}
+
+struct RssItem {
+    text: Option<String>,
+    title: String,
+    description: Option<String>,
+    caption: String,
+    language: String,
+    slug: String,
+    pub_date: String,
+    mime_type: String,
+    content_length: i32,
+    width: u32,
+    height: u32,
+    thumb_width: u32,
+    thumb_height: u32,
+    source: Option<String>,
+    filename: String,
+    thumb_filename: String,
+    duration_secs: i32,
+    is_mime_video: bool,
+}
+
+#[derive(Template)]
+#[template(path = "rss.xml")]
+struct RssTemplate {
+    build_date: String,
+    items: Vec<RssItem>,
 }
 
 struct AppError(anyhow::Error);

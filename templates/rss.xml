@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:media="http://search.yahoo.com/mrss/" xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <channel>
+    <title>MemeXpert - поисковик мемов</title>
+    <link>https://memexpert.net</link>
+    <description>Легко находите мем или гифку по описанию и тексту</description>
+    <language>ru</language>
+    <lastBuildDate>{{ build_date }}</lastBuildDate>
+    <generator>MemeXpert RSS Generator</generator>
+
+    <image>
+      <url>https://memexpert.net/apple-touch-icon.png</url>
+      <title>MemeXpert - поисковик мемов</title>
+      <link>https://memexpert.net</link>
+    </image>
+
+    {%- for item in items %}
+    <item>
+      <title>{{ item.title }}</title>
+
+      <description><![CDATA[
+        <p>{{ item.caption }}</p>
+        {%- if let Some(description) = item.description %}<p>{{ description }}</p>{%- endif %}
+        {%- if let Some(text) = item.text %}<p>Текст с картинки: {{ text }}</p>{%- endif %}
+        {%- if let Some(source) = item.source %}<p>Источник: {{ source }}</p>{%- endif %}
+      ]]></description>
+
+      <link>https://memexpert.net/{{ item.language }}/{{ item.slug }}</link>
+      <guid isPermaLink="true">https://memexpert.net/{{ item.language }}/{{ item.slug }}</guid>
+      <pubDate>{{ item.pub_date }}</pubDate>
+
+      {%- if item.is_mime_video %}
+      <enclosure url="https://memexpert.net/static/{{ item.filename }}" length="{{ item.content_length }}" type="{{ item.mime_type }}" />
+      <media:content 
+            url="https://memexpert.net/static/{{ item.filename }}" 
+            medium="video" 
+            type="{{ item.mime_type }}"
+            duration="{{ item.duration_secs }}"
+            width="{{ item.width }}" 
+            height="{{ item.height }}">
+        <media:title type="plain">{{ item.title }}</media:title>
+        <media:description type="plain">{{ item.caption }}</media:description>
+        <media:thumbnail 
+              url="https://memexpert.net/static/{{ item.thumb_filename }}" 
+              width="{{ item.thumb_width }}" 
+              height="{{ item.thumb_height }}" />
+      </media:content>
+      {%- else %}
+      <enclosure url="https://memexpert.net/static/{{ item.filename }}" length="{{ item.content_length }}" type="{{ item.mime_type }}" />
+      <media:content 
+            url="https://memexpert.net/static/{{ item.filename }}" 
+            medium="image" 
+            type="{{ item.mime_type }}"
+            width="{{ item.width }}" 
+            height="{{ item.height }}">
+        <media:title type="plain">{{ item.title }}</media:title>
+        <media:description type="plain">{{ item.caption }}</media:description>
+      </media:content>
+      {%- endif %}
+    </item>
+    {%- endfor %}
+  </channel>
+</rss>
