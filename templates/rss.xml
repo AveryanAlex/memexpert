@@ -17,6 +17,7 @@
     {%- for item in items %}
     <item>
       <title>{{ item.title }}</title>
+      <description>{{ item.caption }}</description>
 
       <link>https://memexpert.net/{{ item.language }}/{{ item.slug }}</link>
       <guid isPermaLink="true">https://memexpert.net/{{ item.language }}/{{ item.slug }}</guid>
