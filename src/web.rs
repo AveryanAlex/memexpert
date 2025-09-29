@@ -150,9 +150,7 @@ async fn rss_feed(State(state): State<AppState>) -> Result<Response, AppError> {
                 };
 
                 RssItem {
-                    text: m.text.clone(),
                     title: tr.title,
-                    description: Some(tr.description),
                     language: tr.language,
                     caption: tr.caption,
                     slug: m.slug.clone(),
@@ -163,7 +161,6 @@ async fn rss_feed(State(state): State<AppState>) -> Result<Response, AppError> {
                     height: m.height.try_into().unwrap_or(0),
                     thumb_width: m.thumb_width.try_into().unwrap_or(0),
                     thumb_height: m.thumb_height.try_into().unwrap_or(0),
-                    source: m.source.clone(),
                     filename: format!("{}.{}", m.slug, extension),
                     thumb_filename: format!("{}.thumb.jpg", m.slug),
                     duration_secs: m.duration,
@@ -539,9 +536,7 @@ struct SitemapMeme {
 }
 
 struct RssItem {
-    text: Option<String>,
     title: String,
-    description: Option<String>,
     caption: String,
     language: String,
     slug: String,
@@ -552,7 +547,6 @@ struct RssItem {
     height: u32,
     thumb_width: u32,
     thumb_height: u32,
-    source: Option<String>,
     filename: String,
     thumb_filename: String,
     duration_secs: i32,

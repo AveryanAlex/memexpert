@@ -18,13 +18,6 @@
     <item>
       <title>{{ item.title }}</title>
 
-      <description><![CDATA[
-        <p>{{ item.caption }}</p>
-        {%- if let Some(description) = item.description %}<p>{{ description }}</p>{%- endif %}
-        {%- if let Some(text) = item.text %}<p>Текст с картинки: {{ text }}</p>{%- endif %}
-        {%- if let Some(source) = item.source %}<p>Источник: {{ source }}</p>{%- endif %}
-      ]]></description>
-
       <link>https://memexpert.net/{{ item.language }}/{{ item.slug }}</link>
       <guid isPermaLink="true">https://memexpert.net/{{ item.language }}/{{ item.slug }}</guid>
       <pubDate>{{ item.pub_date }}</pubDate>
