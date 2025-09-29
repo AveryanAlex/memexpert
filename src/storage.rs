@@ -670,13 +670,17 @@ impl Storage {
     /// Get all memes with translations
     pub async fn all_memes_with_translations(
         &self,
+        limit: Option<u64>,
     ) -> Result<Vec<(memes::Model, Vec<translations::Model>)>> {
-        let memes = Memes::find()
+        let mut req = Memes::find()
             .filter(memes::Column::PublishStatus.eq(PublishStatus::Published))
             .order_by_asc(memes::Column::Id)
             .find_with_related(Translations)
-            .all(&self.dc)
-            .await?;
+            .order_by_desc(memes::Column::CreationTime);
+        if let Some(limit) = limit {
+            req = req.limit(limit);
+        }
+        let memes = req.all(&self.dc).await?;
         Ok(memes)
     }
 

@@ -92,7 +92,7 @@ async fn minificator(request: Request, next: middleware::Next) -> Response {
 }
 
 async fn sitemap_xml(State(state): State<AppState>) -> Result<Response, AppError> {
-    let memes = state.storage.all_memes_with_translations().await?;
+    let memes = state.storage.all_memes_with_translations(None).await?;
 
     let memes: Vec<_> = memes
         .into_iter()
@@ -114,7 +114,7 @@ async fn sitemap_xml(State(state): State<AppState>) -> Result<Response, AppError
 }
 
 async fn sitemap_txt(State(state): State<AppState>) -> Result<Response, AppError> {
-    let memes = state.storage.all_memes_with_translations().await?;
+    let memes = state.storage.all_memes_with_translations(None).await?;
     let mut sitemap = String::new();
     for (meme, translations) in memes {
         for translation in translations {
@@ -133,7 +133,10 @@ async fn sitemap_txt(State(state): State<AppState>) -> Result<Response, AppError
 }
 
 async fn rss_feed(State(state): State<AppState>) -> Result<Response, AppError> {
-    let memes = state.storage.all_memes_with_translations().await?;
+    let memes = state
+        .storage
+        .all_memes_with_translations(Some(5000))
+        .await?;
 
     let mut rss_items = memes
         .into_iter()
