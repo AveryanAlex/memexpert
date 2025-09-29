@@ -674,9 +674,8 @@ impl Storage {
     ) -> Result<Vec<(memes::Model, Vec<translations::Model>)>> {
         let mut req = Memes::find()
             .filter(memes::Column::PublishStatus.eq(PublishStatus::Published))
-            .order_by_asc(memes::Column::Id)
-            .find_with_related(Translations)
-            .order_by_desc(memes::Column::CreationTime);
+            .order_by_desc(memes::Column::Id)
+            .find_with_related(Translations);
         if let Some(limit) = limit {
             req = req.limit(limit);
         }

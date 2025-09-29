@@ -138,7 +138,7 @@ async fn rss_feed(State(state): State<AppState>) -> Result<Response, AppError> {
         .all_memes_with_translations(Some(5000))
         .await?;
 
-    let mut rss_items = memes
+    let rss_items = memes
         .into_iter()
         .flat_map(|(m, trs)| {
             trs.into_iter().map(move |tr| {
@@ -172,8 +172,6 @@ async fn rss_feed(State(state): State<AppState>) -> Result<Response, AppError> {
             })
         })
         .collect_vec();
-
-    rss_items.sort_by(|a, b| b.pub_date.cmp(&a.pub_date));
 
     let build_date = chrono::Utc::now().to_rfc2822();
 
