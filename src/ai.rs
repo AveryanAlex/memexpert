@@ -105,6 +105,7 @@ fn response_format() -> ResponseFormat {
                 "description",
                 "text_on_meme"
               ],
+              "additionalProperties": false,
             })),
             strict: Some(true),
         },
