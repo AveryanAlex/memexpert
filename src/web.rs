@@ -389,6 +389,7 @@ async fn meme(
                     source: meme.source,
                     gallery: memes_to_gallery(&similar_memes),
                     query_value: "".to_string(),
+                    show_template_ads: state.template_ads_enabled,
                 },
             )
                 .into_response()
@@ -411,6 +412,7 @@ async fn index(State(state): State<AppState>) -> Result<Response, AppError> {
             language: "ru".to_string(),
             gallery: memes_to_gallery(&popular_memes),
             query_value: "".to_string(),
+            show_template_ads: state.template_ads_enabled,
         },
     )
         .into_response())
@@ -447,6 +449,7 @@ async fn search(
                 query_value: query.clone(),
                 query,
                 gallery: memes_to_gallery(&memes),
+                show_template_ads: state.template_ads_enabled,
             },
         )
             .into_response()
@@ -456,6 +459,7 @@ async fn search(
             SearchTemplate {
                 language: "ru".to_string(),
                 query_value: "".to_string(),
+                show_template_ads: state.template_ads_enabled,
             },
         )
             .into_response()
@@ -477,6 +481,7 @@ struct IndexTemplate {
     language: String,
     gallery: Vec<GalleryImage>,
     query_value: String,
+    show_template_ads: bool,
 }
 
 #[derive(Template)]
@@ -486,6 +491,7 @@ struct SearchResultsTemplate {
     query: String,
     query_value: String,
     gallery: Vec<GalleryImage>,
+    show_template_ads: bool,
 }
 
 #[derive(Template)]
@@ -493,6 +499,7 @@ struct SearchResultsTemplate {
 struct SearchTemplate {
     query_value: String,
     language: String,
+    show_template_ads: bool,
 }
 
 #[derive(Template)]
@@ -522,6 +529,7 @@ struct MemeTemplate {
     source: Option<String>,
     gallery: Vec<GalleryImage>,
     query_value: String,
+    show_template_ads: bool,
 }
 
 #[derive(Template)]

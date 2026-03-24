@@ -78,6 +78,7 @@ pub struct AppState_ {
     bot: bot::Bot,
     ai: Arc<ai::Ai>,
     storage: storage::Storage,
+    template_ads_enabled: bool,
 }
 
 pub type AppState = Arc<AppState_>;
@@ -86,8 +87,21 @@ async fn _main() -> Result<()> {
     let bot = bot::new_bot();
     let ai = Arc::new(ai::Ai::new());
     let storage = Storage::new(bot.clone(), ai.clone()).await?;
+    let template_ads_enabled = std::env::var("TEMPLATE_ADS_ENABLED")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false);
 
-    let app_state = Arc::new(AppState_ { bot, ai, storage });
+    let app_state = Arc::new(AppState_ {
+        bot,
+        ai,
+        storage,
+        template_ads_enabled,
+    });
 
     tokio::select! {
         bot_res = bot::run_bot(app_state.clone()) => bot_res,
