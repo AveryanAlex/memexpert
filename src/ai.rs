@@ -62,6 +62,7 @@ impl AiMetadata {
 
 pub struct Ai {
     client: Client<OpenAIConfig>,
+    model: String,
     http: reqwest::Client,
     jina_token: String,
     jina_semaphore: Semaphore,
@@ -212,13 +213,22 @@ struct JinaAiEmbedding {
 
 impl Ai {
     pub fn new() -> Self {
+        let api_base = std::env::var("LLM_API_BASE").unwrap_or_else(|_| {
+            "https://generativelanguage.googleapis.com/v1beta/openai".into()
+        });
+        let api_key = std::env::var("LLM_API_KEY")
+            .or_else(|_| std::env::var("GEMINI_API_KEY"))
+            .expect("LLM_API_KEY or GEMINI_API_KEY must be provided");
+        let model = std::env::var("LLM_MODEL").unwrap_or_else(|_| "gemini-2.5-flash".into());
+
         let client = Client::with_config(
             OpenAIConfig::new()
-                .with_api_base("https://generativelanguage.googleapis.com/v1beta/openai")
-                .with_api_key(std::env::var("GEMINI_API_KEY").expect("JINA_API must be provided")),
+                .with_api_base(api_base)
+                .with_api_key(api_key),
         );
         Self {
             client,
+            model,
             http: reqwest::Client::new(),
             jina_token: std::env::var("JINA_API").expect("JINA_API must be provided"),
             jina_semaphore: Semaphore::new(4),
@@ -324,7 +334,7 @@ impl Ai {
         let _permit = self.chat_semaphore.acquire().await?;
 
         let request = CreateChatCompletionRequestArgs::default()
-            .model("gemini-2.5-flash")
+            .model(&self.model)
             .max_tokens(1024u32)
             .reasoning_effort(ReasoningEffort::None)
             .response_format(response_format())
