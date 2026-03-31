@@ -10,7 +10,7 @@ Owner (full control), Editor (add/remove memes, invite viewers), Viewer (read-on
 
 ## Sharing
 
-Via invite links. Shared as Mini App deep links in Telegram: `t.me/MemeXpertBot/app?startapp=invite_XXXXX`. No public collections at launch.
+Via invite links. Shared as Mini App deep links in Telegram: `t.me/memexpertbot/app?startapp=invite_XXXXX`. No public collections at launch.
 
 ## Pins
 

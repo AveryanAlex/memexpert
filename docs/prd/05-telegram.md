@@ -2,7 +2,7 @@
 
 ## Inline Mode
 
-`@MemeXpertBot <query>` in any chat.
+`@memexpertbot <query>` in any chat.
 
 - Scrollable grid of thumbnails, pagination on scroll
 - Tap → sends as photo (images) or animation (GIFs). Sent as a plain image, no buttons, no branding.
@@ -34,9 +34,9 @@ Forward any meme to the bot → bot recognizes it → immediately saves to the *
 Website registered as TG Mini App, accessible via:
 
 - Button in bot PM
-- Direct link: `t.me/MemeXpertBot/app`
-- Collection invite links: `t.me/MemeXpertBot/app?startapp=invite_XXXXX`
-- Meme share links: `t.me/MemeXpertBot/app?startapp=meme_XXXXX`
+- Direct link: `t.me/memexpertbot/app`
+- Collection invite links: `t.me/memexpertbot/app?startapp=invite_XXXXX`
+- Meme share links: `t.me/memexpertbot/app?startapp=meme_XXXXX`
 
 Provides:
 
