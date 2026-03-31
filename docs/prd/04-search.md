@@ -2,7 +2,7 @@
 
 ## How Search Works
 
-Full-text search (OCR text, Russian morphology via Meilisearch) + semantic search (Voyage AI multimodal embeddings via Qdrant). Results ranked by: semantic relevance (0.4) + text relevance (0.3) + popularity (0.3). Weights tunable via A/B testing.
+Full-text search (OCR text, Russian morphology via Meilisearch) + semantic search (Voyage AI multimodal embeddings via Qdrant). Results ranked by: semantic relevance (0.4) + text relevance (0.3) + popularity (0.3). Weight tuning deferred — see [Deferred Features](10-deferred.md).
 
 ## Search Scope
 
