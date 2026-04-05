@@ -17,7 +17,7 @@ def test_settings_load_from_env_file_and_ignore_extra(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     env_file = tmp_path / ".env"
-    env_file.write_text(
+    _ = env_file.write_text(
         "REDIS_URL=redis://cache.example:6379/9\nEXTRA_FIELD=ignored\n",
         encoding="utf-8",
     )
