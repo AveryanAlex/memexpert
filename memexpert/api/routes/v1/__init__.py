@@ -7,20 +7,23 @@ from typing import Literal
 from fastapi import APIRouter
 from pydantic import BaseModel
 
+from memexpert.api.routes.v1.auth import router as auth_router
+
 
 class VersionNamespaceResponse(BaseModel):
-    """Placeholder response for the versioned API namespace root."""
+    """Availability response for the versioned API namespace root."""
 
     version: Literal["v1"] = "v1"
     status: Literal["available"] = "available"
 
 
 router = APIRouter(prefix="/api/v1", tags=["v1"])
+router.include_router(auth_router)
 
 
 @router.get("/", response_model=VersionNamespaceResponse, summary="Versioned API namespace")
 async def api_v1_root() -> VersionNamespaceResponse:
-    """Expose the versioned namespace so it appears in OpenAPI before feature routes land."""
+    """Expose the versioned namespace alongside mounted feature routers."""
 
     return VersionNamespaceResponse()
 

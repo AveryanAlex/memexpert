@@ -16,12 +16,14 @@ from testcontainers.redis import RedisContainer  # pyright: ignore[reportMissing
 
 from alembic import command
 from memexpert.api.app import create_app
+from memexpert.core.config import get_settings
 from memexpert.core.database import (
     DatabaseConfigurationError,
     DatabaseConnectionError,
     build_async_engine,
     build_async_session_factory,
     normalize_async_database_url,
+    reset_async_database_state,
     verify_async_engine,
 )
 
@@ -36,6 +38,10 @@ TEST_POSTGRES_CONNECT_TIMEOUT_SECONDS: Final = 10.0
 ALEMBIC_COMMAND_TIMEOUT_SECONDS: Final = 20.0
 PROJECT_ROOT: Final = Path(__file__).resolve().parents[1]
 ALEMBIC_INI_PATH: Final = PROJECT_ROOT / "alembic.ini"
+TEST_BASE_URL: Final = "https://testserver"
+AUTH_TEST_JWT_SECRET: Final = "route-test-auth-secret-with-32-byte-minimum"
+AUTH_TEST_REFRESH_COOKIE_NAME: Final = "route_refresh_token"
+AUTH_TEST_REFRESH_COOKIE_SAMESITE: Final = "strict"
 
 
 def _build_alembic_config(database_url: str) -> Config:
@@ -68,6 +74,22 @@ async def _reset_public_schema(engine: AsyncEngine) -> None:
         _ = await connection.execute(text("CREATE SCHEMA public"))
 
 
+async def reset_test_runtime_state() -> None:
+    """Clear cached settings and global async engine state before env-driven app tests."""
+
+    get_settings.cache_clear()
+    await reset_async_database_state()
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _reset_runtime_state_between_tests() -> AsyncIterator[None]:
+    """Prevent stale settings and engine caches from leaking across tests."""
+
+    await reset_test_runtime_state()
+    yield
+    await reset_test_runtime_state()
+
+
 @pytest.fixture
 def app() -> FastAPI:
     """Build a fresh FastAPI app instance for each test."""
@@ -75,21 +97,13 @@ def app() -> FastAPI:
     return create_app()
 
 
-@pytest_asyncio.fixture(loop_scope="session")
+@pytest_asyncio.fixture
 async def client(app: FastAPI) -> AsyncIterator[AsyncClient]:
-    """Provide an async HTTP client bound directly to the ASGI app."""
+    """Provide an HTTPS async HTTP client bound directly to the ASGI app."""
 
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as async_client:
+    async with AsyncClient(transport=transport, base_url=TEST_BASE_URL) as async_client:
         yield async_client
-
-
-def _build_redis_url(container: RedisContainer) -> str:
-    """Construct a redis:// URL from a started Redis testcontainer."""
-
-    host = container.get_container_host_ip()
-    port = container.get_exposed_port(6379)
-    return f"redis://{host}:{port}/0"
 
 
 @pytest.fixture(scope="session")
@@ -175,6 +189,53 @@ async def migrated_db_session(
         await session.rollback()
 
     await _reset_public_schema(postgres_async_engine)
+
+
+@pytest.fixture
+def auth_settings_overrides(postgres_async_url: str) -> dict[str, str]:
+    """Return env overrides used by route tests to prove cache resets and secure cookies."""
+
+    return {
+        "DATABASE_URL": postgres_async_url,
+        "AUTH_JWT_SECRET": AUTH_TEST_JWT_SECRET,
+        "AUTH_REFRESH_COOKIE_NAME": AUTH_TEST_REFRESH_COOKIE_NAME,
+        "AUTH_REFRESH_COOKIE_SAMESITE": AUTH_TEST_REFRESH_COOKIE_SAMESITE,
+        "AUTH_REFRESH_COOKIE_SECURE": "true",
+    }
+
+
+@pytest_asyncio.fixture
+async def auth_app(
+    migrated_db_session: AsyncSession,
+    auth_settings_overrides: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncIterator[FastAPI]:
+    """Build an app wired to the migrated PostgreSQL test DB and auth-specific env overrides."""
+
+    _ = migrated_db_session
+    for key, value in auth_settings_overrides.items():
+        monkeypatch.setenv(key, value)
+
+    await reset_test_runtime_state()
+    yield create_app()
+    await reset_test_runtime_state()
+
+
+@pytest_asyncio.fixture
+async def auth_client(auth_app: FastAPI) -> AsyncIterator[AsyncClient]:
+    """Provide an HTTPS client for auth-route integration tests with truthful secure cookies."""
+
+    transport = ASGITransport(app=auth_app)
+    async with AsyncClient(transport=transport, base_url=TEST_BASE_URL) as async_client:
+        yield async_client
+
+
+def _build_redis_url(container: RedisContainer) -> str:
+    """Construct a redis:// URL from a started Redis testcontainer."""
+
+    host = container.get_container_host_ip()
+    port = container.get_exposed_port(6379)
+    return f"redis://{host}:{port}/0"
 
 
 @pytest.fixture(scope="session")
