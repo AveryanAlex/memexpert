@@ -4,13 +4,10 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, ClassVar, Final
+from typing import ClassVar, Final
 
 from sqlalchemy import DateTime, MetaData, Uuid, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
-
-if TYPE_CHECKING:
-    from sqlalchemy.sql.type_api import TypeEngine
 
 NAMING_CONVENTION: Final[dict[str, str]] = {
     "ix": "ix_%(table_name)s_%(column_0_name)s",
@@ -31,8 +28,9 @@ class Base(DeclarativeBase):
     """Base declarative model with stable naming conventions for Alembic."""
 
     metadata: ClassVar[MetaData] = MetaData(naming_convention=NAMING_CONVENTION)
-    type_annotation_map: ClassVar[dict[type[uuid.UUID], TypeEngine[uuid.UUID]]] = {
+    type_annotation_map: ClassVar[dict[object, object]] = {
         uuid.UUID: Uuid(as_uuid=True),
+        datetime: DateTime(timezone=True),
     }
 
 
