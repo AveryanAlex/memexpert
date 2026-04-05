@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --extra dev --locked
+
+      - name: Run Ruff
+        run: uv run ruff check .
+
+      - name: Run mypy
+        run: uv run mypy .
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --extra dev --locked
+
+      - name: Run pytest
+        run: uv run pytest -v
+
+  compose-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Start Docker Compose stack
+        run: docker compose up -d
+
+      - name: Wait for services to settle
+        run: sleep 30
+
+      - name: Show Docker Compose status
+        run: docker compose ps
+
+      - name: Verify required services are running
+        run: |
+          set -euo pipefail
+          expected_services=(
+            postgres
+            redis
+            rabbitmq
+            qdrant
+            meilisearch
+            minio
+            imgproxy
+          )
+          running_services="$(docker compose ps --services --filter status=running | sort)"
+          printf '%s\n' "$running_services"
+          for service in "${expected_services[@]}"; do
+            if ! grep -qx "$service" <<<"$running_services"; then
+              echo "Expected service '$service' to be running."
+              exit 1
+            fi
+          done
+
+      - name: Tear down Docker Compose stack
+        if: always()
+        run: docker compose down -v
