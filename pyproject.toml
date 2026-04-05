@@ -17,6 +17,7 @@ dependencies = [
     "httpx>=0.28.1",
     "meilisearch-python-sdk>=7.1.2",
     "pydantic-settings>=2.13.1",
+    "pyjwt>=2.12.1",
     "qdrant-client>=1.17.1",
     "redis[hiredis]>=7.4.0",
     "sqlalchemy[asyncio]>=2.0.49",
