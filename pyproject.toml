@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "memexpert"
+version = "0.1.0"
+description = "Core Python services for MemeXpert"
+requires-python = ">=3.14"
+dependencies = [
+  "fastapi",
+  "uvicorn[standard]",
+  "pydantic-settings",
+  "sqlalchemy[asyncio]",
+  "asyncpg",
+  "alembic",
+  "redis[hiredis]",
+  "aio-pika",
+  "qdrant-client",
+  "meilisearch-python-sdk",
+  "boto3",
+  "httpx",
+  "aiogram",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+  "pytest-asyncio",
+  "httpx",
+  "testcontainers[postgres,redis]",
+  "ruff",
+  "mypy",
+]
+
+[project.scripts]
+memexpert-api = "memexpert.api.main:main"
+memexpert-bot = "memexpert.bot.main:main"
+memexpert-workers = "memexpert.workers.main:main"
+
+[tool.ruff]
+line-length = 120
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "B", "SIM", "TCH"]
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
