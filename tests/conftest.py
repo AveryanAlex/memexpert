@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
+from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
 import pytest
 import pytest_asyncio
+from alembic.config import Config
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import text
 from testcontainers.postgres import PostgresContainer  # pyright: ignore[reportMissingTypeStubs]
 from testcontainers.redis import RedisContainer  # pyright: ignore[reportMissingTypeStubs]
 
+from alembic import command
 from memexpert.api.app import create_app
 from memexpert.core.database import (
     DatabaseConfigurationError,
@@ -28,6 +33,39 @@ if TYPE_CHECKING:
 
 TEST_POSTGRES_IMAGE: Final = "postgres:16"
 TEST_POSTGRES_CONNECT_TIMEOUT_SECONDS: Final = 10.0
+ALEMBIC_COMMAND_TIMEOUT_SECONDS: Final = 20.0
+PROJECT_ROOT: Final = Path(__file__).resolve().parents[1]
+ALEMBIC_INI_PATH: Final = PROJECT_ROOT / "alembic.ini"
+
+
+def _build_alembic_config(database_url: str) -> Config:
+    """Construct an Alembic config bound to the ephemeral PostgreSQL URL."""
+
+    config = Config(str(ALEMBIC_INI_PATH))
+    config.set_main_option("script_location", str(PROJECT_ROOT / "alembic"))
+    config.attributes["database_url"] = database_url
+    return config
+
+
+async def _run_alembic_upgrade(database_url: str) -> None:
+    """Apply the project's Alembic head revision with a bounded timeout."""
+
+    config = _build_alembic_config(database_url)
+    try:
+        async with asyncio.timeout(ALEMBIC_COMMAND_TIMEOUT_SECONDS):
+            await asyncio.to_thread(command.upgrade, config, "head")
+    except TimeoutError as exc:  # pragma: no cover - exercised only on failure
+        raise AssertionError(
+            f"Alembic upgrade timed out after {ALEMBIC_COMMAND_TIMEOUT_SECONDS:.1f}s",
+        ) from exc
+
+
+async def _reset_public_schema(engine: AsyncEngine) -> None:
+    """Drop and recreate the public schema for migration-backed integration tests."""
+
+    async with engine.begin() as connection:
+        _ = await connection.execute(text("DROP SCHEMA IF EXISTS public CASCADE"))
+        _ = await connection.execute(text("CREATE SCHEMA public"))
 
 
 @pytest.fixture
@@ -119,6 +157,24 @@ async def db_session(
     async with postgres_session_factory() as session:
         yield session
         await session.rollback()
+
+
+@pytest_asyncio.fixture(loop_scope="session")
+async def migrated_db_session(
+    postgres_async_engine: AsyncEngine,
+    postgres_async_url: str,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> AsyncIterator[AsyncSession]:
+    """Yield a session bound to a freshly migrated PostgreSQL schema."""
+
+    await _reset_public_schema(postgres_async_engine)
+    await _run_alembic_upgrade(postgres_async_url)
+
+    async with postgres_session_factory() as session:
+        yield session
+        await session.rollback()
+
+    await _reset_public_schema(postgres_async_engine)
 
 
 @pytest.fixture(scope="session")
