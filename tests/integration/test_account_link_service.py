@@ -36,6 +36,8 @@ from memexpert.services.provider_auth_service import GoogleIdentity, TelegramIde
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
+    from memexpert.schemas.user import UserRead
+
 PASSWORD = "correct-horse-battery"
 GOOGLE_AUTH_DATE = datetime.now(UTC)
 
@@ -85,7 +87,7 @@ async def create_password_user(
     email: str,
     language: UserLanguage = UserLanguage.ANY,
     nsfw_enabled: bool = False,
-):
+) -> UserRead:
     provider_auth_service = build_provider_auth_service(session)
     user_service = UserService(session)
     signup_identity = provider_auth_service.prepare_email_signup_identity(

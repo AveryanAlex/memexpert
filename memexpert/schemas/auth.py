@@ -1,8 +1,10 @@
-# ruff: noqa: TC001
+# ruff: noqa: TC001,TC003
 """Auth request, response, and error schemas for guest and provider-auth flows."""
 
 from __future__ import annotations
 
+import uuid
+from datetime import datetime
 from enum import StrEnum
 from typing import Literal
 
@@ -31,6 +33,8 @@ class AuthErrorCode(StrEnum):
     EMAIL_ALREADY_IN_USE = "email_already_in_use"
     ACCOUNT_UNAVAILABLE = "account_unavailable"
     UPGRADE_REQUIRED = "upgrade_required"
+    GUEST_ACCOUNT_REQUIRED = "guest_account_required"
+    ACCOUNT_LINK_INVARIANT_ERROR = "account_link_invariant_error"
 
 
 class GuestBootstrapRequest(BaseModel):
@@ -70,6 +74,39 @@ class AuthSessionRead(BaseModel):
     expires_in: int
     user: UserRead
     refresh_cookie: RefreshCookieMetadata
+
+
+class LinkedProvidersRead(BaseModel):
+    """Read-only provider-link state for an authenticated account."""
+
+    email: str | None
+    email_verified_at: datetime | None
+    has_password: bool
+    google_linked: bool
+    telegram_linked: bool
+
+
+class AccountLinkMergeSummaryRead(BaseModel):
+    """Lightweight merge outcome details returned after a successful guest link."""
+
+    merge_performed: bool
+    merge_log_id: uuid.UUID | None
+    guest_user_id: uuid.UUID
+    canonical_user_id: uuid.UUID
+    deleted_guest_user_id: uuid.UUID | None
+    favorites_transferred: int = Field(ge=0)
+    duplicate_favorites_skipped: int = Field(ge=0)
+    analytics_events_transferred: int = Field(ge=0)
+    inline_usage_events_transferred: int = Field(ge=0)
+    views_transferred: int = Field(ge=0)
+
+
+class AccountLinkResponseRead(BaseModel):
+    """Canonical link response wrapping the new session plus provider-state metadata."""
+
+    session: AuthSessionRead
+    linked_providers: LinkedProvidersRead
+    merge_summary: AccountLinkMergeSummaryRead
 
 
 class EmailCredentialsRequest(BaseModel):
@@ -167,6 +204,8 @@ def validate_auth_password(password: str) -> str:
 
 
 __all__ = [
+    "AccountLinkMergeSummaryRead",
+    "AccountLinkResponseRead",
     "AuthErrorCode",
     "AuthErrorResponse",
     "AuthSessionRead",
@@ -175,6 +214,7 @@ __all__ = [
     "EmailSignupRequest",
     "GoogleAuthRequest",
     "GuestBootstrapRequest",
+    "LinkedProvidersRead",
     "RefreshCookieMetadata",
     "TelegramMiniAppAuthRequest",
     "TelegramWidgetAuthRequest",

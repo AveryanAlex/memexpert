@@ -14,9 +14,11 @@ from memexpert.models.enums import AccountType
 from memexpert.schemas.auth import AuthErrorCode, AuthErrorResponse
 from memexpert.schemas.user import UserRead
 from memexpert.services import (
+    AccountLinkService,
     AuthConfigurationError,
     AuthService,
     AuthServiceError,
+    GuestAccountRequiredError,
     InvalidTokenError,
     MissingTokenError,
     ProviderAuthService,
@@ -34,7 +36,9 @@ AUTH_ERROR_STATUS_CODES: Final[dict[AuthErrorCode, int]] = {
     AuthErrorCode.INVALID_CREDENTIALS: int(HTTPStatus.UNAUTHORIZED),
     AuthErrorCode.ACCOUNT_UNAVAILABLE: int(HTTPStatus.FORBIDDEN),
     AuthErrorCode.UPGRADE_REQUIRED: int(HTTPStatus.FORBIDDEN),
+    AuthErrorCode.GUEST_ACCOUNT_REQUIRED: int(HTTPStatus.FORBIDDEN),
     AuthErrorCode.EMAIL_ALREADY_IN_USE: int(HTTPStatus.CONFLICT),
+    AuthErrorCode.ACCOUNT_LINK_INVARIANT_ERROR: int(HTTPStatus.CONFLICT),
 }
 
 AUTH_ERROR_RESPONSES: Final[dict[int | str, dict[str, object]]] = {
@@ -47,7 +51,7 @@ AUTH_ERROR_RESPONSES: Final[dict[int | str, dict[str, object]]] = {
         "model": AuthErrorResponse,
     },
     int(HTTPStatus.CONFLICT): {
-        "description": "The authentication request conflicts with existing account state.",
+        "description": "The authentication or link request conflicts with existing account state.",
         "model": AuthErrorResponse,
     },
     int(HTTPStatus.SERVICE_UNAVAILABLE): {
@@ -94,8 +98,21 @@ def get_provider_auth_service(session: DbSessionDep) -> ProviderAuthService:
     return ProviderAuthService.from_settings(session)
 
 
+def get_account_link_service(
+    session: DbSessionDep,
+    provider_auth_service: Annotated[ProviderAuthService, Depends(get_provider_auth_service)],
+) -> AccountLinkService:
+    """Build the shared guest-link orchestration service for explicit link routes."""
+
+    return AccountLinkService(
+        session,
+        provider_auth_service=provider_auth_service,
+    )
+
+
 AuthServiceDep = Annotated[AuthService, Depends(get_auth_service)]
 ProviderAuthServiceDep = Annotated[ProviderAuthService, Depends(get_provider_auth_service)]
+AccountLinkServiceDep = Annotated[AccountLinkService, Depends(get_account_link_service)]
 AuthorizationHeaderDep = Annotated[str | None, Header(alias="Authorization")]
 
 
@@ -181,23 +198,39 @@ async def get_full_account_user(current_user: CurrentUserDep) -> UserRead:
     return current_user
 
 
+async def get_guest_user(current_user: CurrentUserDep) -> UserRead:
+    """Require a guest account for explicit link routes and reject full callers early."""
+
+    if current_user.account_type is not AccountType.GUEST:
+        raise to_auth_http_error(
+            GuestAccountRequiredError("Only guest accounts can be linked."),
+        )
+
+    return current_user
+
+
 FullAccountUserDep = Annotated[UserRead, Depends(get_full_account_user)]
+GuestUserDep = Annotated[UserRead, Depends(get_guest_user)]
 
 
 __all__ = [
     "AUTH_ERROR_RESPONSES",
     "AUTH_ERROR_STATUS_CODES",
+    "AccountLinkServiceDep",
     "AuthHTTPError",
     "AuthServiceDep",
     "CurrentUserDep",
     "DbSessionDep",
     "FullAccountUserDep",
+    "GuestUserDep",
     "OptionalCurrentUserDep",
     "ProviderAuthServiceDep",
     "auth_http_exception_handler",
+    "get_account_link_service",
     "get_auth_service",
     "get_current_user",
     "get_full_account_user",
+    "get_guest_user",
     "get_optional_current_user",
     "get_provider_auth_service",
     "to_auth_http_error",
