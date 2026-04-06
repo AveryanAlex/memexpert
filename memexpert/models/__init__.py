@@ -42,6 +42,7 @@ from memexpert.models.user import (
     ChannelSuggestion,
     InlineUsageEvent,
     RefreshToken,
+    TelegramLinkCode,
     User,
 )
 
@@ -86,6 +87,7 @@ __all__ = [
     "SourceChannel",
     "SourcePlatform",
     "TelegramFileIdCache",
+    "TelegramLinkCode",
     "TelegramMediaFormat",
     "TimestampMixin",
     "UUIDPrimaryKeyMixin",

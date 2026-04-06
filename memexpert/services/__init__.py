@@ -4,6 +4,7 @@ from memexpert.services.account_link_service import (
     AccountLinkResult,
     AccountLinkService,
     LinkedProvidersProjection,
+    TelegramLinkStartResult,
 )
 from memexpert.services.auth_service import (
     ACCESS_TOKEN_TYPE,
@@ -95,6 +96,7 @@ __all__ = [
     "RefreshTokenReuseError",
     "ServiceError",
     "ServiceValidationError",
+    "TelegramLinkStartResult",
     "UpgradeRequiredError",
     "UserNotFoundError",
     "UserService",

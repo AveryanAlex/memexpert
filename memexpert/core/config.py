@@ -6,7 +6,7 @@ from datetime import timedelta
 from functools import lru_cache
 from typing import ClassVar, Literal
 
-from pydantic import Field, SecretStr
+from pydantic import AnyHttpUrl, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -39,8 +39,11 @@ class Settings(BaseSettings):
     auth_refresh_cookie_domain: str | None = None
     auth_bcrypt_rounds: int = Field(default=12, ge=4, le=31)
     auth_telegram_bot_token: SecretStr | None = None
+    auth_telegram_bot_username: str | None = None
     auth_telegram_login_max_age_seconds: int = Field(default=300, gt=0)
     auth_telegram_miniapp_max_age_seconds: int = Field(default=300, gt=0)
+    auth_telegram_link_code_ttl_seconds: int = Field(default=600, gt=0)
+    auth_telegram_link_return_url: AnyHttpUrl | None = None
     auth_google_client_id: str | None = None
     auth_google_client_secret: SecretStr | None = None
     auth_google_redirect_uri: str | None = None
@@ -53,6 +56,43 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+    @field_validator("auth_telegram_bot_username", mode="before")
+    @classmethod
+    def _normalize_optional_bot_username(cls, value: object) -> object:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            return value
+
+        normalized_value = value.strip().lstrip("@")
+        if not normalized_value:
+            return None
+        if " " in normalized_value:
+            raise ValueError("auth_telegram_bot_username must not contain spaces.")
+        return normalized_value
+
+    @field_validator("auth_google_client_id", "auth_google_redirect_uri", mode="before")
+    @classmethod
+    def _normalize_optional_text(cls, value: object) -> object:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            return value
+
+        normalized_value = value.strip()
+        return normalized_value or None
+
+    @field_validator("auth_telegram_link_return_url", mode="before")
+    @classmethod
+    def _normalize_optional_url(cls, value: object) -> object:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            return value
+
+        normalized_value = value.strip()
+        return normalized_value or None
 
     @property
     def auth_access_token_ttl(self) -> timedelta:

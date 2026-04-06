@@ -44,6 +44,7 @@ EXPECTED_TABLES = {
     "refresh_tokens",
     "source_channels",
     "telegram_file_id_cache",
+    "telegram_link_codes",
     "users",
 }
 ALEMBIC_TIMEOUT_SECONDS = 20.0
@@ -134,6 +135,22 @@ async def _get_index_definitions(engine: AsyncEngine, table_name: str) -> dict[s
         }
 
 
+async def _get_column_names(engine: AsyncEngine, table_name: str) -> set[str]:
+    async with engine.connect() as connection:
+        result = await connection.execute(
+            text(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = current_schema() AND table_name = :table_name
+                ORDER BY ordinal_position
+                """
+            ),
+            {"table_name": table_name},
+        )
+        return {cast(str, column_name) for column_name in result.scalars()}
+
+
 async def _inspect_constraints(engine: AsyncEngine) -> ConstraintSnapshot:
     async with engine.connect() as connection:
         return await connection.run_sync(_inspect_constraints_sync)
@@ -185,9 +202,9 @@ def test_initial_revision_metadata_is_present() -> None:
     revision = script_directory.get_revision("head")
 
     assert revision is not None
-    assert revision.revision == "0001"
-    assert revision.down_revision is None
-    assert revision.doc == "initial schema"
+    assert revision.revision == "0002"
+    assert revision.down_revision == "0001"
+    assert revision.doc == "telegram link codes"
 
 
 async def test_upgrade_head_creates_expected_schema_and_constraints(
@@ -200,12 +217,14 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
 
     table_names = await _get_table_names(engine)
     assert table_names == EXPECTED_TABLES | {"alembic_version"}
-    assert await _get_current_revision(engine) == "0001"
+    assert await _get_current_revision(engine) == "0002"
 
     users_indexes = await _get_index_definitions(engine, "users")
     collections_indexes = await _get_index_definitions(engine, "collections")
     meme_files_indexes = await _get_index_definitions(engine, "meme_files")
     telegram_indexes = await _get_index_definitions(engine, "telegram_file_id_cache")
+    telegram_link_indexes = await _get_index_definitions(engine, "telegram_link_codes")
+    telegram_link_columns = await _get_column_names(engine, "telegram_link_codes")
     constraints = await _inspect_constraints(engine)
 
     assert "uq_users_email_not_null" in users_indexes
@@ -249,6 +268,24 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
     assert "UNIQUE INDEX uq_telegram_file_id_cache_file_format_scope" in telegram_indexes[
         "uq_telegram_file_id_cache_file_format_scope"
     ]
+    assert telegram_link_columns == {
+        "guest_user_id",
+        "code_hash",
+        "expires_at",
+        "redeemed_at",
+        "redeemed_by_telegram_id",
+        "id",
+        "created_at",
+        "updated_at",
+    }
+    assert "uq_telegram_link_codes_code_hash" in telegram_link_indexes
+    assert "UNIQUE INDEX uq_telegram_link_codes_code_hash" in telegram_link_indexes[
+        "uq_telegram_link_codes_code_hash"
+    ]
+    assert "ix_telegram_link_codes_guest_user_id_expires_at" in telegram_link_indexes
+    assert "guest_user_id" in telegram_link_indexes["ix_telegram_link_codes_guest_user_id_expires_at"]
+    assert "expires_at" in telegram_link_indexes["ix_telegram_link_codes_guest_user_id_expires_at"]
+    assert "ix_telegram_link_codes_redeemed_by_telegram_id_redeemed_at" in telegram_link_indexes
 
 
 async def test_downgrade_base_reverses_the_schema_cleanly(
@@ -274,7 +311,7 @@ async def test_repeated_fresh_database_upgrades_work_after_a_full_downgrade(
     await _run_alembic_command(command.downgrade, config, "base")
     await _run_alembic_command(command.upgrade, config, "head")
 
-    assert await _get_current_revision(engine) == "0001"
+    assert await _get_current_revision(engine) == "0002"
     assert EXPECTED_TABLES.issubset(await _get_table_names(engine))
 
 

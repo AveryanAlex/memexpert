@@ -3,10 +3,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import re
+import secrets
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Self
 
 from sqlalchemy import func, literal, select, update
@@ -14,17 +17,20 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 
 from memexpert.core.config import Settings, get_settings
+from memexpert.models.base import utcnow
 from memexpert.models.collection import Collection, CollectionMeme
 from memexpert.models.enums import AccountStatus, AccountType, AnalyticsEventType, CollectionKind
-from memexpert.models.user import AccountMergeLog, AnalyticsEvent, InlineUsageEvent, User
+from memexpert.models.user import AccountMergeLog, AnalyticsEvent, InlineUsageEvent, TelegramLinkCode, User
 from memexpert.schemas.auth import TelegramWidgetAuthRequest
 from memexpert.schemas.user import UserRead
 from memexpert.services.errors import (
     AccountLinkInvariantError,
     AccountUnavailableError,
+    AuthConfigurationError,
     DuplicateIdentityError,
     EmailAlreadyInUseError,
     GuestAccountRequiredError,
+    ProviderNotConfiguredError,
     ProviderPayloadInvalidError,
     ServiceError,
     UserNotFoundError,
@@ -40,6 +46,12 @@ from memexpert.services.user_service import UserService
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
+
+TELEGRAM_LINK_START_PREFIX = "link_"
+TELEGRAM_MAX_START_PARAMETER_LENGTH = 64
+MAX_TELEGRAM_LINK_CODE_LENGTH = TELEGRAM_MAX_START_PARAMETER_LENGTH - len(TELEGRAM_LINK_START_PREFIX)
+TELEGRAM_LINK_CODE_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+TELEGRAM_LINK_CODE_BYTES = 16
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +84,17 @@ class AccountLinkResult:
     details: Mapping[str, object]
 
 
+@dataclass(frozen=True, slots=True)
+class TelegramLinkStartResult:
+    """Persisted Telegram deep-link issuance metadata returned to guest callers."""
+
+    code: str
+    deep_link_url: str
+    expires_at: datetime
+    expires_in_seconds: int
+    return_url: str
+
+
 class AccountLinkService:
     """Upgrade guests in place or merge them into an existing canonical full account."""
 
@@ -81,6 +104,9 @@ class AccountLinkService:
         *,
         provider_auth_service: ProviderAuthService | None = None,
         user_service: UserService | None = None,
+        telegram_link_bot_username: str | None = None,
+        telegram_link_code_ttl_seconds: int = 600,
+        telegram_link_return_url: str | None = None,
     ) -> None:
         self._session: AsyncSession = session
         self._user_service: UserService = user_service or UserService(session)
@@ -88,6 +114,12 @@ class AccountLinkService:
             session,
             user_service=self._user_service,
         )
+        self._telegram_link_bot_username: str | None = self._normalize_optional_text(telegram_link_bot_username)
+        self._telegram_link_code_ttl_seconds: int = self._require_positive_int(
+            "telegram_link_code_ttl_seconds",
+            telegram_link_code_ttl_seconds,
+        )
+        self._telegram_link_return_url: str | None = self._normalize_optional_text(telegram_link_return_url)
 
     @classmethod
     def from_settings(
@@ -100,16 +132,24 @@ class AccountLinkService:
     ) -> Self:
         """Build the service from cached runtime settings for later API and bot entrypoints."""
 
+        resolved_settings = settings or get_settings()
         resolved_user_service = user_service or UserService(session)
         resolved_provider_auth_service = provider_auth_service or ProviderAuthService.from_settings(
             session,
-            settings=settings or get_settings(),
+            settings=resolved_settings,
             user_service=resolved_user_service,
         )
         return cls(
             session,
             provider_auth_service=resolved_provider_auth_service,
             user_service=resolved_user_service,
+            telegram_link_bot_username=resolved_settings.auth_telegram_bot_username,
+            telegram_link_code_ttl_seconds=resolved_settings.auth_telegram_link_code_ttl_seconds,
+            telegram_link_return_url=(
+                str(resolved_settings.auth_telegram_link_return_url)
+                if resolved_settings.auth_telegram_link_return_url is not None
+                else None
+            ),
         )
 
     async def get_linked_providers(self, *, user_id: object) -> LinkedProvidersProjection:
@@ -120,6 +160,74 @@ class AccountLinkService:
         if user is None:
             raise UserNotFoundError(f"User {user_id} does not exist.")
         return self._build_linked_provider_projection(user)
+
+    async def issue_telegram_link_code(self, *, guest_user_id: uuid.UUID) -> TelegramLinkStartResult:
+        """Persist a short Telegram deep-link code for a guest-only link handoff."""
+
+        bot_username, return_url = self._require_telegram_link_configuration()
+        expires_at = utcnow() + timedelta(seconds=self._telegram_link_code_ttl_seconds)
+        code = self._normalize_telegram_link_code(self._generate_telegram_link_code())
+        code_hash = self._hash_telegram_link_code(code)
+
+        try:
+            guest_user = await self._lock_required_user(guest_user_id)
+            self._ensure_guest_can_link(guest_user)
+            _ = await self._require_guest_favorites_only_collection(guest_user)
+            await self._expire_active_telegram_link_codes(guest_user.id)
+
+            self._session.add(
+                TelegramLinkCode(
+                    guest_user_id=guest_user.id,
+                    code_hash=code_hash,
+                    expires_at=expires_at,
+                )
+            )
+            await self._session.commit()
+        except ServiceError:
+            await self._session.rollback()
+            raise
+        except IntegrityError as exc:
+            await self._session.rollback()
+            constraint_name = self._integrity_constraint_name(exc)
+            if constraint_name == "uq_telegram_link_codes_code_hash":
+                raise AccountLinkInvariantError("Telegram link code collision detected; please retry.") from exc
+            raise AccountLinkInvariantError("Failed to issue the Telegram link code.") from exc
+
+        return TelegramLinkStartResult(
+            code=code,
+            deep_link_url=self._build_telegram_deep_link(bot_username=bot_username, code=code),
+            expires_at=expires_at,
+            expires_in_seconds=self._telegram_link_code_ttl_seconds,
+            return_url=return_url,
+        )
+
+    async def redeem_telegram_link_code(
+        self,
+        *,
+        code: str,
+        identity: TelegramIdentity,
+    ) -> AccountLinkResult:
+        """Redeem a Telegram deep-link code exactly once and reuse the shared merge flow."""
+
+        normalized_code = self._normalize_telegram_link_code(code)
+        link_code = await self._lock_telegram_link_code(normalized_code)
+        if link_code.redeemed_at is not None:
+            raise AccountLinkInvariantError("Telegram link code has already been redeemed.")
+        if link_code.expires_at <= utcnow():
+            raise AccountLinkInvariantError("Telegram link code has expired.")
+
+        link_code.redeemed_at = utcnow()
+        link_code.redeemed_by_telegram_id = identity.telegram_id
+        try:
+            return await self.link_guest_with_telegram_identity(
+                guest_user_id=link_code.guest_user_id,
+                identity=identity,
+            )
+        except ServiceError:
+            raise
+        except IntegrityError as exc:
+            await self._session.rollback()
+            raise AccountLinkInvariantError("Failed to redeem the Telegram link code.") from exc
 
     async def link_guest_with_email_signup(
         self,
@@ -445,6 +553,32 @@ class AccountLinkService:
             details=details,
         )
 
+    async def _lock_telegram_link_code(self, code: str) -> TelegramLinkCode:
+        code_hash = self._hash_telegram_link_code(code)
+        result = await self._session.execute(
+            select(TelegramLinkCode)
+            .where(TelegramLinkCode.code_hash == code_hash)
+            .with_for_update()
+        )
+        link_codes = result.scalars().all()
+        if not link_codes:
+            raise AccountLinkInvariantError("Telegram link code is invalid.")
+        if len(link_codes) > 1:
+            raise AccountLinkInvariantError("Telegram link code state is invalid.")
+        return link_codes[0]
+
+    async def _expire_active_telegram_link_codes(self, guest_user_id: uuid.UUID) -> None:
+        now = utcnow()
+        _ = await self._session.execute(
+            update(TelegramLinkCode)
+            .where(
+                TelegramLinkCode.guest_user_id == guest_user_id,
+                TelegramLinkCode.redeemed_at.is_(None),
+                TelegramLinkCode.expires_at > now,
+            )
+            .values(expires_at=now)
+        )
+
     async def _lock_required_user(self, user_id: uuid.UUID) -> User:
         user = await self._user_service.get_locked_user_record(user_id)
         if user is None:
@@ -566,6 +700,71 @@ class AccountLinkService:
         )
         return self._rowcount(result)
 
+    def _require_telegram_link_configuration(self) -> tuple[str, str]:
+        bot_username = self._telegram_link_bot_username
+        if bot_username is None:
+            raise ProviderNotConfiguredError("Telegram link bot username is not configured.")
+
+        return_url = self._telegram_link_return_url
+        if return_url is None:
+            raise AuthConfigurationError("Telegram link return URL is not configured.")
+
+        return bot_username, return_url
+
+    @staticmethod
+    def _generate_telegram_link_code() -> str:
+        return secrets.token_urlsafe(TELEGRAM_LINK_CODE_BYTES)
+
+    @staticmethod
+    def _hash_telegram_link_code(code: str) -> str:
+        return hashlib.sha256(code.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _build_telegram_deep_link(*, bot_username: str, code: str) -> str:
+        return f"https://t.me/{bot_username}?start={TELEGRAM_LINK_START_PREFIX}{code}"
+
+    @staticmethod
+    def _normalize_telegram_link_code(code: str) -> str:
+        normalized_code = code.strip()
+        if (
+            not normalized_code
+            or len(normalized_code) > MAX_TELEGRAM_LINK_CODE_LENGTH
+            or TELEGRAM_LINK_CODE_PATTERN.fullmatch(normalized_code) is None
+        ):
+            raise AccountLinkInvariantError("Telegram link code is invalid.")
+        return normalized_code
+
+    @staticmethod
+    def _normalize_optional_text(value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized_value = value.strip()
+        return normalized_value or None
+
+    @staticmethod
+    def _require_positive_int(field_name: str, value: int) -> int:
+        if value <= 0:
+            raise AuthConfigurationError(f"{field_name} must be greater than zero.")
+        return value
+
+    @staticmethod
+    def _integrity_constraint_name(exc: IntegrityError) -> str | None:
+        candidates = [exc.orig, getattr(exc.orig, "__cause__", None)]
+        for candidate in candidates:
+            if candidate is None:
+                continue
+
+            constraint_name = getattr(candidate, "constraint_name", None)
+            if isinstance(constraint_name, str):
+                return constraint_name
+
+            diag = getattr(candidate, "diag", None)
+            diag_constraint_name = getattr(diag, "constraint_name", None)
+            if isinstance(diag_constraint_name, str):
+                return diag_constraint_name
+
+        return None
+
     @staticmethod
     def _rowcount(result: object) -> int:
         rowcount = getattr(result, "rowcount", 0)
@@ -617,4 +816,5 @@ __all__ = [
     "AccountLinkResult",
     "AccountLinkService",
     "LinkedProvidersProjection",
+    "TelegramLinkStartResult",
 ]

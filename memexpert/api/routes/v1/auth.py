@@ -25,6 +25,7 @@ from memexpert.schemas.auth import (
     GoogleAuthRequest,
     GuestBootstrapRequest,
     LinkedProvidersRead,
+    TelegramLinkStartRead,
     TelegramMiniAppAuthRequest,
     TelegramWidgetAuthRequest,
 )
@@ -245,6 +246,33 @@ async def link_guest_with_google(
 
     _set_refresh_cookie(response, auth_session)
     return _build_account_link_response(auth_session=auth_session, link_result=link_result)
+
+
+@router.post(
+    "/link/telegram",
+    response_model=TelegramLinkStartRead,
+    responses=AUTH_ERROR_RESPONSES,
+    status_code=status.HTTP_201_CREATED,
+    summary="Start the Telegram guest-link flow with a deep link",
+)
+async def start_telegram_link(
+    guest_user: GuestUserDep,
+    account_link_service: AccountLinkServiceDep,
+) -> TelegramLinkStartRead:
+    """Issue a short-lived Telegram deep link for the current guest without exposing internal identifiers."""
+
+    try:
+        link_result = await account_link_service.issue_telegram_link_code(guest_user_id=guest_user.id)
+    except AuthServiceError as exc:
+        raise to_auth_http_error(exc) from exc
+
+    return TelegramLinkStartRead(
+        code=link_result.code,
+        deep_link_url=link_result.deep_link_url,
+        expires_at=link_result.expires_at,
+        expires_in_seconds=link_result.expires_in_seconds,
+        return_url=link_result.return_url,
+    )
 
 
 @router.post(

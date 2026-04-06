@@ -52,6 +52,7 @@ from memexpert.models.user import (
     ChannelSuggestion,
     InlineUsageEvent,
     RefreshToken,
+    TelegramLinkCode,
     User,
 )
 from memexpert.schemas import CollectionRead, UserRead
@@ -82,6 +83,7 @@ EXPECTED_TABLES = {
     "refresh_tokens",
     "source_channels",
     "telegram_file_id_cache",
+    "telegram_link_codes",
     "users",
 }
 
@@ -135,6 +137,7 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
 
     assert user_relationships["active_save_collection"].mapper.class_ is Collection
     assert user_relationships["owned_collections"].mapper.class_ is Collection
+    assert user_relationships["telegram_link_codes"].mapper.class_ is TelegramLinkCode
     assert meme_relationships["files"].mapper.class_ is MemeFile
     assert meme_relationships["primary_file"].mapper.class_ is MemeFile
 
@@ -305,6 +308,13 @@ async def test_schema_handles_cycles_multi_invites_and_nullable_content_fields(
                     device_info="Firefox on Linux",
                     expires_at=utcnow() + timedelta(days=30),
                 ),
+                TelegramLinkCode(
+                    guest_user_id=owner.id,
+                    code_hash="1" * 64,
+                    expires_at=utcnow() + timedelta(minutes=10),
+                    redeemed_at=None,
+                    redeemed_by_telegram_id=None,
+                ),
                 AnalyticsEvent(
                     user=owner,
                     event_type=AnalyticsEventType.MEME_VIEW,
@@ -374,6 +384,27 @@ async def test_constraints_reject_duplicate_provider_ids_and_duplicate_favorites
             [
                 User(account_type=AccountType.FULL, google_id="google-subject-1"),
                 User(account_type=AccountType.FULL, google_id="google-subject-1"),
+            ]
+        )
+
+        with pytest.raises(IntegrityError):
+            await session.commit()
+
+        await session.rollback()
+
+    async with model_contract_session_factory() as session:
+        session.add_all(
+            [
+                TelegramLinkCode(
+                    guest_user_id=uuid.uuid7(),
+                    code_hash="a" * 64,
+                    expires_at=utcnow() + timedelta(minutes=5),
+                ),
+                TelegramLinkCode(
+                    guest_user_id=uuid.uuid7(),
+                    code_hash="a" * 64,
+                    expires_at=utcnow() + timedelta(minutes=5),
+                ),
             ]
         )
 

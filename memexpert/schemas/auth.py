@@ -17,6 +17,9 @@ MAX_DEVICE_INFO_LENGTH = 1024
 MAX_EMAIL_LENGTH = 320
 MIN_PASSWORD_LENGTH = 8
 MAX_PASSWORD_LENGTH = 72
+MAX_TELEGRAM_START_PARAMETER_LENGTH = 64
+TELEGRAM_LINK_START_PREFIX = "link_"
+MAX_TELEGRAM_LINK_CODE_LENGTH = MAX_TELEGRAM_START_PARAMETER_LENGTH - len(TELEGRAM_LINK_START_PREFIX)
 
 
 class AuthErrorCode(StrEnum):
@@ -107,6 +110,16 @@ class AccountLinkResponseRead(BaseModel):
     session: AuthSessionRead
     linked_providers: LinkedProvidersRead
     merge_summary: AccountLinkMergeSummaryRead
+
+
+class TelegramLinkStartRead(BaseModel):
+    """Guest-only Telegram deep-link handoff metadata for the bot merge flow."""
+
+    code: str = Field(min_length=1, max_length=MAX_TELEGRAM_LINK_CODE_LENGTH)
+    deep_link_url: str
+    expires_at: datetime
+    expires_in_seconds: int = Field(gt=0)
+    return_url: str
 
 
 class EmailCredentialsRequest(BaseModel):
@@ -216,6 +229,7 @@ __all__ = [
     "GuestBootstrapRequest",
     "LinkedProvidersRead",
     "RefreshCookieMetadata",
+    "TelegramLinkStartRead",
     "TelegramMiniAppAuthRequest",
     "TelegramWidgetAuthRequest",
     "normalize_auth_email",

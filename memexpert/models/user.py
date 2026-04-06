@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import BigInteger, CheckConstraint, ForeignKey, Index, String, Text, text
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, foreign, mapped_column, relationship
 
 from memexpert.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin, utcnow
 from memexpert.models.enums import (
@@ -124,6 +124,11 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         back_populates="user",
         cascade="all, delete-orphan",
     )
+    telegram_link_codes: Mapped[list["TelegramLinkCode"]] = relationship(
+        "TelegramLinkCode",
+        back_populates="guest_user",
+        primaryjoin=lambda: User.id == foreign(TelegramLinkCode.guest_user_id),
+    )
     analytics_events: Mapped[list["AnalyticsEvent"]] = relationship(
         "AnalyticsEvent",
         back_populates="user",
@@ -166,6 +171,33 @@ class RefreshToken(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     last_used_at: Mapped[datetime | None] = mapped_column(nullable=True)
 
     user: Mapped["User"] = relationship("User", back_populates="refresh_tokens")
+
+
+class TelegramLinkCode(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """Persisted opaque Telegram start-link codes for guest-to-full linking."""
+
+    __tablename__ = "telegram_link_codes"
+    __table_args__ = (
+        Index("uq_telegram_link_codes_code_hash", "code_hash", unique=True),
+        Index("ix_telegram_link_codes_guest_user_id_expires_at", "guest_user_id", "expires_at"),
+        Index(
+            "ix_telegram_link_codes_redeemed_by_telegram_id_redeemed_at",
+            "redeemed_by_telegram_id",
+            "redeemed_at",
+        ),
+    )
+
+    guest_user_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
+    code_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(nullable=False)
+    redeemed_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    redeemed_by_telegram_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+    guest_user: Mapped["User"] = relationship(
+        "User",
+        back_populates="telegram_link_codes",
+        primaryjoin=lambda: foreign(TelegramLinkCode.guest_user_id) == User.id,
+    )
 
 
 class AccountMergeLog(UUIDPrimaryKeyMixin, Base):
@@ -278,5 +310,6 @@ __all__ = [
     "ChannelSuggestion",
     "InlineUsageEvent",
     "RefreshToken",
+    "TelegramLinkCode",
     "User",
 ]

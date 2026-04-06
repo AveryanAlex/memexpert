@@ -104,7 +104,7 @@ def get_account_link_service(
 ) -> AccountLinkService:
     """Build the shared guest-link orchestration service for explicit link routes."""
 
-    return AccountLinkService(
+    return AccountLinkService.from_settings(
         session,
         provider_auth_service=provider_auth_service,
     )
