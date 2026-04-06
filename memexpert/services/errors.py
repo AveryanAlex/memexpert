@@ -101,6 +101,24 @@ class UpgradeRequiredError(AuthServiceError):
     error_code: ClassVar[str] = "upgrade_required"
 
 
+class AccountLinkError(AuthServiceError):
+    """Base error for guest-to-full account-link and merge failures."""
+
+    error_code: ClassVar[str] = "account_link_error"
+
+
+class GuestAccountRequiredError(AccountLinkError):
+    """Raised when a caller tries to link an account that is no longer a guest."""
+
+    error_code: ClassVar[str] = "guest_account_required"
+
+
+class AccountLinkInvariantError(AccountLinkError):
+    """Raised when merge prerequisites or audit invariants do not hold."""
+
+    error_code: ClassVar[str] = "account_link_invariant_error"
+
+
 class UserServiceError(ServiceError):
     """Base error for user/account service failures."""
 
@@ -158,6 +176,8 @@ class DuplicateCollectionInviteError(CollectionServiceError):
 
 
 __all__ = [
+    "AccountLinkError",
+    "AccountLinkInvariantError",
     "AccountUnavailableError",
     "AuthenticatedUserNotFoundError",
     "AuthConfigurationError",
@@ -172,6 +192,7 @@ __all__ = [
     "EmailAlreadyInUseError",
     "ExpiredTokenError",
     "GuestCollectionAccessError",
+    "GuestAccountRequiredError",
     "InvalidCollectionInviteError",
     "InvalidCollectionMembershipError",
     "InvalidCollectionTitleError",

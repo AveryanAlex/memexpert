@@ -1,0 +1,620 @@
+# ruff: noqa: TC001,TC003
+"""Guest-to-full account linking and merge orchestration with audit invariants."""
+
+from __future__ import annotations
+
+import uuid
+from collections.abc import Mapping
+from dataclasses import dataclass
+from datetime import datetime
+from typing import TYPE_CHECKING, Self
+
+from sqlalchemy import func, literal, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import IntegrityError
+
+from memexpert.core.config import Settings, get_settings
+from memexpert.models.collection import Collection, CollectionMeme
+from memexpert.models.enums import AccountStatus, AccountType, AnalyticsEventType, CollectionKind
+from memexpert.models.user import AccountMergeLog, AnalyticsEvent, InlineUsageEvent, User
+from memexpert.schemas.auth import TelegramWidgetAuthRequest
+from memexpert.schemas.user import UserRead
+from memexpert.services.errors import (
+    AccountLinkInvariantError,
+    AccountUnavailableError,
+    DuplicateIdentityError,
+    EmailAlreadyInUseError,
+    GuestAccountRequiredError,
+    ProviderPayloadInvalidError,
+    ServiceError,
+    UserNotFoundError,
+)
+from memexpert.services.provider_auth_service import (
+    EmailSignupIdentity,
+    GoogleIdentity,
+    GoogleIdentityResolution,
+    ProviderAuthService,
+    TelegramIdentity,
+)
+from memexpert.services.user_service import UserService
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+
+@dataclass(frozen=True, slots=True)
+class LinkedProvidersProjection:
+    """Read-only provider-link state for a canonical account."""
+
+    email: str | None
+    email_verified_at: datetime | None
+    has_password: bool
+    google_linked: bool
+    telegram_linked: bool
+
+
+@dataclass(frozen=True, slots=True)
+class AccountLinkResult:
+    """Canonical result returned by guest-link and merge operations."""
+
+    user: UserRead
+    linked_providers: LinkedProvidersProjection
+    merge_performed: bool
+    merge_log_id: uuid.UUID | None
+    guest_user_id: uuid.UUID
+    canonical_user_id: uuid.UUID
+    deleted_guest_user_id: uuid.UUID | None
+    favorites_transferred: int
+    duplicate_favorites_skipped: int
+    analytics_events_transferred: int
+    inline_usage_events_transferred: int
+    views_transferred: int
+    details: Mapping[str, object]
+
+
+class AccountLinkService:
+    """Upgrade guests in place or merge them into an existing canonical full account."""
+
+    def __init__(
+        self,
+        session: AsyncSession,
+        *,
+        provider_auth_service: ProviderAuthService | None = None,
+        user_service: UserService | None = None,
+    ) -> None:
+        self._session: AsyncSession = session
+        self._user_service: UserService = user_service or UserService(session)
+        self._provider_auth_service: ProviderAuthService = provider_auth_service or ProviderAuthService.from_settings(
+            session,
+            user_service=self._user_service,
+        )
+
+    @classmethod
+    def from_settings(
+        cls,
+        session: AsyncSession,
+        *,
+        settings: Settings | None = None,
+        provider_auth_service: ProviderAuthService | None = None,
+        user_service: UserService | None = None,
+    ) -> Self:
+        """Build the service from cached runtime settings for later API and bot entrypoints."""
+
+        resolved_user_service = user_service or UserService(session)
+        resolved_provider_auth_service = provider_auth_service or ProviderAuthService.from_settings(
+            session,
+            settings=settings or get_settings(),
+            user_service=resolved_user_service,
+        )
+        return cls(
+            session,
+            provider_auth_service=resolved_provider_auth_service,
+            user_service=resolved_user_service,
+        )
+
+    async def get_linked_providers(self, *, user_id: object) -> LinkedProvidersProjection:
+        """Return the caller's read-only linked-provider projection."""
+
+        result = await self._session.execute(select(User).where(User.id == user_id))
+        user = result.scalar_one_or_none()
+        if user is None:
+            raise UserNotFoundError(f"User {user_id} does not exist.")
+        return self._build_linked_provider_projection(user)
+
+    async def link_guest_with_email_signup(
+        self,
+        *,
+        guest_user_id: uuid.UUID,
+        email: str,
+        password: str,
+    ) -> AccountLinkResult:
+        """Upgrade a guest account in place with a new email/password identity."""
+
+        try:
+            signup_identity = self._provider_auth_service.prepare_email_signup_identity(
+                email=email,
+                password=password,
+            )
+            return await self._upgrade_guest_in_place(
+                guest_user_id=guest_user_id,
+                signup_identity=signup_identity,
+            )
+        except DuplicateIdentityError as exc:
+            await self._session.rollback()
+            raise EmailAlreadyInUseError("Email is already in use.") from exc
+        except ServiceError:
+            await self._session.rollback()
+            raise
+        except IntegrityError as exc:
+            await self._session.rollback()
+            raise AccountLinkInvariantError("Failed to link the guest account with email signup.") from exc
+
+    async def link_guest_with_email_login(
+        self,
+        *,
+        guest_user_id: uuid.UUID,
+        email: str,
+        password: str,
+    ) -> AccountLinkResult:
+        """Merge a guest account into an existing full email/password account."""
+
+        try:
+            target_user = await self._provider_auth_service.resolve_email_login_user(
+                email=email,
+                password=password,
+            )
+            return await self._merge_guest_into_existing_full(
+                guest_user_id=guest_user_id,
+                target_user_id=target_user.id,
+            )
+        except ServiceError:
+            await self._session.rollback()
+            raise
+        except IntegrityError as exc:
+            await self._session.rollback()
+            raise AccountLinkInvariantError("Failed to merge the guest account into the email account.") from exc
+
+    async def link_guest_with_google_code(
+        self,
+        *,
+        guest_user_id: uuid.UUID,
+        code: str,
+    ) -> AccountLinkResult:
+        """Exchange a Google code, then upgrade or merge the guest accordingly."""
+
+        google_identity = await self._provider_auth_service.resolve_google_identity_from_code(code=code)
+        return await self.link_guest_with_google_identity(
+            guest_user_id=guest_user_id,
+            identity=google_identity,
+        )
+
+    async def link_guest_with_google_identity(
+        self,
+        *,
+        guest_user_id: uuid.UUID,
+        identity: GoogleIdentity,
+    ) -> AccountLinkResult:
+        """Upgrade a guest with Google or merge it into the canonical Google/full account."""
+
+        try:
+            resolution = await self._provider_auth_service.resolve_google_identity(identity)
+            return await self._link_guest_with_google_resolution(
+                guest_user_id=guest_user_id,
+                resolution=resolution,
+            )
+        except DuplicateIdentityError as exc:
+            await self._session.rollback()
+            resolution = await self._provider_auth_service.resolve_google_identity(identity)
+            if resolution.user is None:
+                raise ProviderPayloadInvalidError("Google identity could not be resolved safely.") from exc
+            return await self._merge_guest_into_existing_full(
+                guest_user_id=guest_user_id,
+                target_user_id=resolution.user.id,
+                attach_google_identity=resolution.matched_by == "verified_email",
+                google_identity=identity,
+            )
+        except ServiceError:
+            await self._session.rollback()
+            raise
+        except IntegrityError as exc:
+            await self._session.rollback()
+            raise AccountLinkInvariantError("Failed to link the guest account with Google.") from exc
+
+    async def link_guest_with_telegram_widget(
+        self,
+        *,
+        guest_user_id: uuid.UUID,
+        payload: TelegramWidgetAuthRequest,
+    ) -> AccountLinkResult:
+        """Validate a Telegram Login Widget payload, then upgrade or merge the guest."""
+
+        identity = self._provider_auth_service.resolve_telegram_widget_identity(payload)
+        return await self.link_guest_with_telegram_identity(
+            guest_user_id=guest_user_id,
+            identity=identity,
+        )
+
+    async def link_guest_with_telegram_miniapp(
+        self,
+        *,
+        guest_user_id: uuid.UUID,
+        init_data: str | None,
+    ) -> AccountLinkResult:
+        """Validate Telegram Mini App initData, then upgrade or merge the guest."""
+
+        identity = self._provider_auth_service.resolve_telegram_miniapp_identity(init_data)
+        return await self.link_guest_with_telegram_identity(
+            guest_user_id=guest_user_id,
+            identity=identity,
+        )
+
+    async def link_guest_with_telegram_identity(
+        self,
+        *,
+        guest_user_id: uuid.UUID,
+        identity: TelegramIdentity,
+    ) -> AccountLinkResult:
+        """Upgrade a guest with Telegram or merge it into the canonical Telegram account."""
+
+        try:
+            target_user = await self._provider_auth_service.resolve_telegram_identity_user(identity)
+            if target_user is None:
+                return await self._upgrade_guest_in_place(
+                    guest_user_id=guest_user_id,
+                    telegram_identity=identity,
+                )
+            return await self._merge_guest_into_existing_full(
+                guest_user_id=guest_user_id,
+                target_user_id=target_user.id,
+            )
+        except DuplicateIdentityError as exc:
+            await self._session.rollback()
+            target_user = await self._provider_auth_service.resolve_telegram_identity_user(identity)
+            if target_user is None:
+                raise ProviderPayloadInvalidError("Telegram identity could not be resolved safely.") from exc
+            return await self._merge_guest_into_existing_full(
+                guest_user_id=guest_user_id,
+                target_user_id=target_user.id,
+            )
+        except ServiceError:
+            await self._session.rollback()
+            raise
+        except IntegrityError as exc:
+            await self._session.rollback()
+            raise AccountLinkInvariantError("Failed to link the guest account with Telegram.") from exc
+
+    async def _link_guest_with_google_resolution(
+        self,
+        *,
+        guest_user_id: uuid.UUID,
+        resolution: GoogleIdentityResolution,
+    ) -> AccountLinkResult:
+        if resolution.user is None:
+            return await self._upgrade_guest_in_place(
+                guest_user_id=guest_user_id,
+                google_identity=resolution.identity,
+            )
+
+        return await self._merge_guest_into_existing_full(
+            guest_user_id=guest_user_id,
+            target_user_id=resolution.user.id,
+            attach_google_identity=resolution.matched_by == "verified_email",
+            google_identity=resolution.identity,
+        )
+
+    async def _upgrade_guest_in_place(
+        self,
+        *,
+        guest_user_id: uuid.UUID,
+        signup_identity: EmailSignupIdentity | None = None,
+        google_identity: GoogleIdentity | None = None,
+        telegram_identity: TelegramIdentity | None = None,
+    ) -> AccountLinkResult:
+        guest_user = await self._lock_required_user(guest_user_id)
+        self._ensure_guest_can_link(guest_user)
+        _ = await self._require_guest_favorites_only_collection(guest_user)
+
+        _ = await self._user_service.upgrade_guest_to_full_account(
+            user_id=guest_user.id,
+            email=(
+                signup_identity.email
+                if signup_identity is not None
+                else google_identity.email if google_identity is not None else None
+            ),
+            password_hash=signup_identity.password_hash if signup_identity is not None else None,
+            google_id=google_identity.google_id if google_identity is not None else None,
+            email_verified_at=google_identity.email_verified_at if google_identity is not None else None,
+            telegram_id=telegram_identity.telegram_id if telegram_identity is not None else None,
+            commit=False,
+        )
+
+        details = {
+            "mode": "upgrade_in_place",
+            "favorites_transferred": 0,
+            "favorite_duplicates_skipped": 0,
+            "analytics_events_transferred": 0,
+            "views_transferred": 0,
+            "inline_usage_events_transferred": 0,
+        }
+        await self._session.commit()
+        return self._build_result(
+            canonical_user=guest_user,
+            merge_performed=False,
+            merge_log_id=None,
+            guest_user_id=guest_user.id,
+            deleted_guest_user_id=None,
+            favorites_transferred=0,
+            duplicate_favorites_skipped=0,
+            analytics_events_transferred=0,
+            inline_usage_events_transferred=0,
+            views_transferred=0,
+            details=details,
+        )
+
+    async def _merge_guest_into_existing_full(
+        self,
+        *,
+        guest_user_id: uuid.UUID,
+        target_user_id: uuid.UUID,
+        attach_google_identity: bool = False,
+        google_identity: GoogleIdentity | None = None,
+    ) -> AccountLinkResult:
+        if guest_user_id == target_user_id:
+            raise AccountLinkInvariantError("Guest account cannot merge into itself.")
+
+        locked_users = await self._lock_users_in_order(guest_user_id, target_user_id)
+        guest_user = locked_users[guest_user_id]
+        target_user = locked_users[target_user_id]
+        if guest_user is None:
+            raise UserNotFoundError(f"User {guest_user_id} does not exist.")
+        if target_user is None:
+            raise UserNotFoundError(f"User {target_user_id} does not exist.")
+
+        self._ensure_guest_can_link(guest_user)
+        self._ensure_canonical_target(target_user)
+        guest_favorites = await self._require_guest_favorites_only_collection(guest_user)
+        target_favorites = await self._require_favorites_collection(target_user, owner_label="Canonical full account")
+
+        if attach_google_identity:
+            if google_identity is None:
+                raise AccountLinkInvariantError("Google identity details are required for verified-email merges.")
+            _ = await self._user_service.attach_google_identity(
+                user_id=target_user.id,
+                google_id=google_identity.google_id,
+                email_verified_at=google_identity.email_verified_at,
+                commit=False,
+            )
+
+        guest_favorite_rows = await self._count_collection_memes(guest_favorites.id)
+        favorites_transferred = await self._transfer_favorites(
+            guest_favorites=guest_favorites,
+            target_favorites=target_favorites,
+            target_user=target_user,
+        )
+        duplicate_favorites_skipped = guest_favorite_rows - favorites_transferred
+        views_transferred = await self._count_meme_views(guest_user.id)
+        analytics_events_transferred = await self._reassign_analytics_events(
+            source_user_id=guest_user.id,
+            target_user_id=target_user.id,
+        )
+        inline_usage_events_transferred = await self._reassign_inline_usage_events(
+            source_user_id=guest_user.id,
+            target_user_id=target_user.id,
+        )
+
+        details = {
+            "mode": "merge_into_existing_full",
+            "guest_favorites_collection_id": str(guest_favorites.id),
+            "target_favorites_collection_id": str(target_favorites.id),
+            "guest_favorite_rows": guest_favorite_rows,
+            "favorites_transferred": favorites_transferred,
+            "favorite_duplicates_skipped": duplicate_favorites_skipped,
+            "analytics_events_transferred": analytics_events_transferred,
+            "views_transferred": views_transferred,
+            "inline_usage_events_transferred": inline_usage_events_transferred,
+        }
+
+        merge_log = AccountMergeLog(
+            guest_account_id=guest_user.id,
+            target_account_id=target_user.id,
+            favorites_transferred=favorites_transferred,
+            views_transferred=views_transferred,
+            details=details,
+        )
+        self._session.add(merge_log)
+        await self._session.flush()
+
+        guest_user.active_save_collection_id = None
+        await self._session.flush()
+        await self._session.delete(guest_favorites)
+        await self._session.flush()
+        await self._session.delete(guest_user)
+        await self._session.commit()
+
+        return self._build_result(
+            canonical_user=target_user,
+            merge_performed=True,
+            merge_log_id=merge_log.id,
+            guest_user_id=guest_user.id,
+            deleted_guest_user_id=guest_user.id,
+            favorites_transferred=favorites_transferred,
+            duplicate_favorites_skipped=duplicate_favorites_skipped,
+            analytics_events_transferred=analytics_events_transferred,
+            inline_usage_events_transferred=inline_usage_events_transferred,
+            views_transferred=views_transferred,
+            details=details,
+        )
+
+    async def _lock_required_user(self, user_id: uuid.UUID) -> User:
+        user = await self._user_service.get_locked_user_record(user_id)
+        if user is None:
+            raise UserNotFoundError(f"User {user_id} does not exist.")
+        return user
+
+    async def _lock_users_in_order(self, *user_ids: uuid.UUID) -> dict[uuid.UUID, User | None]:
+        ordered_ids = list(dict.fromkeys(sorted(user_ids, key=lambda value: value.int)))
+        locked_users: dict[uuid.UUID, User | None] = {}
+        for user_id in ordered_ids:
+            locked_users[user_id] = await self._user_service.get_locked_user_record(user_id)
+        return locked_users
+
+    def _ensure_guest_can_link(self, user: User) -> None:
+        if user.account_type is not AccountType.GUEST:
+            raise GuestAccountRequiredError("Only guest accounts can be linked.")
+        if user.status is not AccountStatus.ACTIVE:
+            raise AccountUnavailableError("Account is not available.")
+        if (
+            user.telegram_id is not None
+            or user.google_id is not None
+            or user.email is not None
+            or user.password_hash is not None
+        ):
+            raise AccountLinkInvariantError("Guest account already carries linked identities.")
+
+    def _ensure_canonical_target(self, user: User) -> None:
+        if user.account_type is not AccountType.FULL:
+            raise AccountLinkInvariantError("Canonical merge targets must be full accounts.")
+        if user.status is not AccountStatus.ACTIVE:
+            raise AccountUnavailableError("Account is not available.")
+
+    async def _require_guest_favorites_only_collection(self, guest_user: User) -> Collection:
+        owned_collections = await self._user_service.get_locked_owned_collections(guest_user.id)
+        favorites = [
+            collection
+            for collection in owned_collections
+            if collection.kind is CollectionKind.FAVORITES
+        ]
+        custom_collections = [
+            collection
+            for collection in owned_collections
+            if collection.kind is not CollectionKind.FAVORITES
+        ]
+
+        if len(favorites) != 1:
+            raise AccountLinkInvariantError(
+                f"Guest user {guest_user.id} must own exactly one Favorites collection before linking.",
+            )
+        if custom_collections:
+            raise AccountLinkInvariantError(
+                f"Guest user {guest_user.id} owns unexpected non-Favorites collections.",
+            )
+        return favorites[0]
+
+    async def _require_favorites_collection(self, user: User, *, owner_label: str) -> Collection:
+        favorites = await self._user_service.get_locked_favorites_collection_record(user.id)
+        if favorites is None:
+            raise AccountLinkInvariantError(
+                f"{owner_label} {user.id} is missing a Favorites collection.",
+            )
+        return favorites
+
+    async def _count_collection_memes(self, collection_id: uuid.UUID) -> int:
+        result = await self._session.execute(
+            select(func.count())
+            .select_from(CollectionMeme)
+            .where(CollectionMeme.collection_id == collection_id)
+        )
+        return int(result.scalar_one())
+
+    async def _transfer_favorites(
+        self,
+        *,
+        guest_favorites: Collection,
+        target_favorites: Collection,
+        target_user: User,
+    ) -> int:
+        insert_statement = (
+            pg_insert(CollectionMeme)
+            .from_select(
+                ["collection_id", "meme_id", "added_by_user_id", "added_at"],
+                select(
+                    literal(target_favorites.id),
+                    CollectionMeme.meme_id,
+                    literal(target_user.id),
+                    CollectionMeme.added_at,
+                ).where(CollectionMeme.collection_id == guest_favorites.id),
+            )
+            .on_conflict_do_nothing(index_elements=[CollectionMeme.collection_id, CollectionMeme.meme_id])
+        )
+        result = await self._session.execute(insert_statement)
+        return self._rowcount(result)
+
+    async def _count_meme_views(self, user_id: uuid.UUID) -> int:
+        result = await self._session.execute(
+            select(func.count())
+            .select_from(AnalyticsEvent)
+            .where(
+                AnalyticsEvent.user_id == user_id,
+                AnalyticsEvent.event_type == AnalyticsEventType.MEME_VIEW,
+            )
+        )
+        return int(result.scalar_one())
+
+    async def _reassign_analytics_events(self, *, source_user_id: uuid.UUID, target_user_id: uuid.UUID) -> int:
+        result = await self._session.execute(
+            update(AnalyticsEvent)
+            .where(AnalyticsEvent.user_id == source_user_id)
+            .values(user_id=target_user_id)
+        )
+        return self._rowcount(result)
+
+    async def _reassign_inline_usage_events(self, *, source_user_id: uuid.UUID, target_user_id: uuid.UUID) -> int:
+        result = await self._session.execute(
+            update(InlineUsageEvent)
+            .where(InlineUsageEvent.user_id == source_user_id)
+            .values(user_id=target_user_id)
+        )
+        return self._rowcount(result)
+
+    @staticmethod
+    def _rowcount(result: object) -> int:
+        rowcount = getattr(result, "rowcount", 0)
+        return rowcount if isinstance(rowcount, int) else 0
+
+    def _build_result(
+        self,
+        *,
+        canonical_user: User,
+        merge_performed: bool,
+        merge_log_id: uuid.UUID | None,
+        guest_user_id: uuid.UUID,
+        deleted_guest_user_id: uuid.UUID | None,
+        favorites_transferred: int,
+        duplicate_favorites_skipped: int,
+        analytics_events_transferred: int,
+        inline_usage_events_transferred: int,
+        views_transferred: int,
+        details: Mapping[str, object],
+    ) -> AccountLinkResult:
+        return AccountLinkResult(
+            user=UserRead.model_validate(canonical_user),
+            linked_providers=self._build_linked_provider_projection(canonical_user),
+            merge_performed=merge_performed,
+            merge_log_id=merge_log_id,
+            guest_user_id=guest_user_id,
+            canonical_user_id=canonical_user.id,
+            deleted_guest_user_id=deleted_guest_user_id,
+            favorites_transferred=favorites_transferred,
+            duplicate_favorites_skipped=duplicate_favorites_skipped,
+            analytics_events_transferred=analytics_events_transferred,
+            inline_usage_events_transferred=inline_usage_events_transferred,
+            views_transferred=views_transferred,
+            details=details,
+        )
+
+    @staticmethod
+    def _build_linked_provider_projection(user: User) -> LinkedProvidersProjection:
+        return LinkedProvidersProjection(
+            email=user.email,
+            email_verified_at=user.email_verified_at,
+            has_password=user.password_hash is not None and bool(user.password_hash.strip()),
+            google_linked=user.google_id is not None,
+            telegram_linked=user.telegram_id is not None,
+        )
+
+
+__all__ = [
+    "AccountLinkResult",
+    "AccountLinkService",
+    "LinkedProvidersProjection",
+]

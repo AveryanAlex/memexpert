@@ -1,5 +1,10 @@
 """Business services package."""
 
+from memexpert.services.account_link_service import (
+    AccountLinkResult,
+    AccountLinkService,
+    LinkedProvidersProjection,
+)
 from memexpert.services.auth_service import (
     ACCESS_TOKEN_TYPE,
     HS256_ALGORITHM,
@@ -8,6 +13,8 @@ from memexpert.services.auth_service import (
 )
 from memexpert.services.collection_service import CollectionService
 from memexpert.services.errors import (
+    AccountLinkError,
+    AccountLinkInvariantError,
     AccountUnavailableError,
     AuthConfigurationError,
     AuthenticatedUserNotFoundError,
@@ -21,6 +28,7 @@ from memexpert.services.errors import (
     DuplicateIdentityError,
     EmailAlreadyInUseError,
     ExpiredTokenError,
+    GuestAccountRequiredError,
     GuestCollectionAccessError,
     InvalidCollectionInviteError,
     InvalidCollectionMembershipError,
@@ -46,6 +54,10 @@ from memexpert.services.user_service import DEFAULT_GUEST_LIFETIME, FAVORITES_TI
 
 __all__ = [
     "ACCESS_TOKEN_TYPE",
+    "AccountLinkError",
+    "AccountLinkInvariantError",
+    "AccountLinkResult",
+    "AccountLinkService",
     "AccountUnavailableError",
     "AuthenticatedUserNotFoundError",
     "AuthConfigurationError",
@@ -65,6 +77,7 @@ __all__ = [
     "ExpiredTokenError",
     "FAVORITES_TITLE",
     "GuestCollectionAccessError",
+    "GuestAccountRequiredError",
     "HS256_ALGORITHM",
     "InvalidCollectionInviteError",
     "InvalidCollectionMembershipError",
@@ -72,6 +85,7 @@ __all__ = [
     "InvalidCredentialsError",
     "InvalidIdentityError",
     "InvalidTokenError",
+    "LinkedProvidersProjection",
     "MissingTokenError",
     "ProviderAccessDeniedError",
     "ProviderAuthService",

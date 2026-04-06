@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Self
+from typing import TYPE_CHECKING, Literal, Self, cast
 
 import bcrypt
 import httpx
@@ -56,6 +56,23 @@ class GoogleIdentity:
     google_id: str
     email: str | None
     email_verified_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class EmailSignupIdentity:
+    """Validated email-signup identity data prepared for account-link upgrades."""
+
+    email: str
+    password_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class GoogleIdentityResolution:
+    """Resolved Google identity state without coupling the caller to session issuance."""
+
+    identity: GoogleIdentity
+    user: UserRead | None
+    matched_by: Literal["google_id", "verified_email", "none"]
 
 
 class ProviderAuthService:
@@ -152,14 +169,12 @@ class ProviderAuthService:
     ) -> AuthSession:
         """Create a full account with a bcrypt password hash and issue a session."""
 
-        normalized_email = self._normalize_email(email)
-        normalized_password = self._validate_password(password)
-        password_hash = self._hash_password(normalized_password)
+        signup_identity = self.prepare_email_signup_identity(email=email, password=password)
 
         try:
             user = await self._user_service.create_full_user(
-                email=normalized_email,
-                password_hash=password_hash,
+                email=signup_identity.email,
+                password_hash=signup_identity.password_hash,
                 commit=False,
             )
         except DuplicateIdentityError as exc:
@@ -180,19 +195,9 @@ class ProviderAuthService:
     ) -> AuthSession:
         """Authenticate an existing full account via normalized email and bcrypt."""
 
-        normalized_email = self._normalize_email(email)
-        normalized_password = self._validate_password(password)
-        result = await self._session.execute(select(User).where(User.email == normalized_email))
-        user = result.scalar_one_or_none()
-        if user is None:
-            raise InvalidCredentialsError("Email or password is invalid.")
-
-        password_hash = self._require_stored_password_hash(user.password_hash)
-        if not self._check_password(normalized_password, password_hash):
-            raise InvalidCredentialsError("Email or password is invalid.")
-
+        user = await self.resolve_email_login_user(email=email, password=password)
         return await self._auth_service.issue_session_for_user(
-            UserRead.model_validate(user),
+            user,
             device_info=device_info,
             reload_user=False,
         )
@@ -205,7 +210,7 @@ class ProviderAuthService:
     ) -> AuthSession:
         """Exchange a Google OAuth code, resolve the full account, and issue a session."""
 
-        google_identity = await self._exchange_google_code_for_identity(code)
+        google_identity = await self.resolve_google_identity_from_code(code=code)
         return await self._authenticate_with_google_identity(google_identity, device_info=device_info)
 
     async def authenticate_with_telegram_widget(
@@ -216,7 +221,7 @@ class ProviderAuthService:
     ) -> AuthSession:
         """Validate Telegram Login Widget payloads and issue a full-account session."""
 
-        identity = self._verify_telegram_widget_payload(payload)
+        identity = self.resolve_telegram_widget_identity(payload)
         return await self._authenticate_with_telegram_identity(identity, device_info=device_info)
 
     async def authenticate_with_telegram_miniapp(
@@ -227,8 +232,80 @@ class ProviderAuthService:
     ) -> AuthSession:
         """Validate Telegram Mini App initData and issue a full-account session."""
 
-        identity = self._verify_telegram_miniapp_payload(init_data)
+        identity = self.resolve_telegram_miniapp_identity(init_data)
         return await self._authenticate_with_telegram_identity(identity, device_info=device_info)
+
+    def prepare_email_signup_identity(self, *, email: str, password: str) -> EmailSignupIdentity:
+        """Validate email-signup credentials and prepare a password hash without writing a session."""
+
+        normalized_email = self._normalize_email(email)
+        normalized_password = self._validate_password(password)
+        return EmailSignupIdentity(
+            email=normalized_email,
+            password_hash=self._hash_password(normalized_password),
+        )
+
+    async def resolve_email_login_user(self, *, email: str, password: str) -> UserRead:
+        """Validate email-login credentials and return the canonical full account."""
+
+        normalized_email = self._normalize_email(email)
+        normalized_password = self._validate_password(password)
+        result = await self._session.execute(select(User).where(User.email == normalized_email))
+        user = result.scalar_one_or_none()
+        if user is None:
+            raise InvalidCredentialsError("Email or password is invalid.")
+
+        password_hash = self._require_stored_password_hash(user.password_hash)
+        if not self._check_password(normalized_password, password_hash):
+            raise InvalidCredentialsError("Email or password is invalid.")
+
+        resolved_user = UserRead.model_validate(user)
+        self._ensure_account_is_available(resolved_user)
+        return resolved_user
+
+    async def resolve_google_identity_from_code(self, *, code: str) -> GoogleIdentity:
+        """Exchange a Google authorization code for a normalized identity payload."""
+
+        return await self._exchange_google_code_for_identity(code)
+
+    async def resolve_google_identity(self, identity: GoogleIdentity) -> GoogleIdentityResolution:
+        """Resolve whether a Google identity already maps to an existing full account."""
+
+        existing_google_user = await self._user_service.get_by_google_id(identity.google_id)
+        if existing_google_user is not None:
+            self._ensure_account_is_available(existing_google_user)
+            return GoogleIdentityResolution(
+                identity=identity,
+                user=existing_google_user,
+                matched_by="google_id",
+            )
+
+        if identity.email is not None and identity.email_verified_at is not None:
+            reusable_user = await self._user_service.get_by_email(identity.email)
+            if reusable_user is not None:
+                self._ensure_google_reuse_is_allowed(reusable_user)
+                return GoogleIdentityResolution(
+                    identity=identity,
+                    user=reusable_user,
+                    matched_by="verified_email",
+                )
+
+        return GoogleIdentityResolution(identity=identity, user=None, matched_by="none")
+
+    async def resolve_telegram_identity_user(self, identity: TelegramIdentity) -> UserRead | None:
+        """Resolve whether a Telegram identity already maps to an existing account."""
+
+        return await self._user_service.get_by_telegram_id(identity.telegram_id)
+
+    def resolve_telegram_widget_identity(self, payload: TelegramWidgetAuthRequest) -> TelegramIdentity:
+        """Validate a Telegram Login Widget payload without issuing a session."""
+
+        return self._verify_telegram_widget_payload(payload)
+
+    def resolve_telegram_miniapp_identity(self, init_data: str | None) -> TelegramIdentity:
+        """Validate Telegram Mini App initData without issuing a session."""
+
+        return self._verify_telegram_miniapp_payload(init_data)
 
     async def _authenticate_with_google_identity(
         self,
@@ -236,19 +313,11 @@ class ProviderAuthService:
         *,
         device_info: str | None = None,
     ) -> AuthSession:
-        existing_google_user = await self._user_service.get_by_google_id(identity.google_id)
-        if existing_google_user is not None:
-            return await self._auth_service.issue_session_for_user(
-                existing_google_user,
-                device_info=device_info,
-            )
-
-        if identity.email is not None and identity.email_verified_at is not None:
-            reusable_user = await self._user_service.get_by_email(identity.email)
-            if reusable_user is not None:
-                self._ensure_google_reuse_is_allowed(reusable_user)
+        resolution = await self.resolve_google_identity(identity)
+        if resolution.user is not None:
+            if resolution.matched_by == "verified_email":
                 linked_user = await self._user_service.attach_google_identity(
-                    user_id=reusable_user.id,
+                    user_id=resolution.user.id,
                     google_id=identity.google_id,
                     email_verified_at=identity.email_verified_at,
                     commit=False,
@@ -257,6 +326,11 @@ class ProviderAuthService:
                     linked_user,
                     device_info=device_info,
                 )
+
+            return await self._auth_service.issue_session_for_user(
+                resolution.user,
+                device_info=device_info,
+            )
 
         try:
             created_user = await self._user_service.create_full_user(
@@ -292,7 +366,7 @@ class ProviderAuthService:
         *,
         device_info: str | None = None,
     ) -> AuthSession:
-        resolved_user = await self._user_service.get_by_telegram_id(identity.telegram_id)
+        resolved_user = await self.resolve_telegram_identity_user(identity)
         if resolved_user is None:
             try:
                 resolved_user = await self._user_service.create_full_user(
@@ -550,12 +624,17 @@ class ProviderAuthService:
     @staticmethod
     def _decode_google_json(response: httpx.Response, *, source: str) -> dict[str, object]:
         try:
-            payload = response.json()
+            raw_payload = cast("object", response.json())
         except ValueError as exc:
             raise ProviderPayloadInvalidError(f"Google {source} is malformed.") from exc
-        if not isinstance(payload, dict):
+        if not isinstance(raw_payload, dict):
             raise ProviderPayloadInvalidError(f"Google {source} is malformed.")
-        return {str(key): value for key, value in payload.items()}
+
+        typed_payload = cast("dict[object, object]", raw_payload)
+        payload: dict[str, object] = {}
+        for key, value in typed_payload.items():
+            payload[str(key)] = value
+        return payload
 
     @staticmethod
     def _coerce_auth_date(auth_date: int | datetime, *, source: str) -> datetime:
@@ -640,4 +719,10 @@ class ProviderAuthService:
         return normalized_value or None
 
 
-__all__ = ["ProviderAuthService"]
+__all__ = [
+    "EmailSignupIdentity",
+    "GoogleIdentity",
+    "GoogleIdentityResolution",
+    "ProviderAuthService",
+    "TelegramIdentity",
+]

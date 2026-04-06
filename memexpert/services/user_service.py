@@ -92,7 +92,7 @@ class UserService:
         return normalized_google_id
 
     @staticmethod
-    def _normalize_telegram_id(telegram_id: int | None) -> int | None:
+    def normalize_telegram_id(telegram_id: int | None) -> int | None:
         if telegram_id is None:
             return None
         if telegram_id <= 0:
@@ -135,7 +135,7 @@ class UserService:
     async def get_by_telegram_id(self, telegram_id: int) -> UserRead | None:
         """Return a user by Telegram identifier if it exists."""
 
-        normalized_telegram_id = self._normalize_telegram_id(telegram_id)
+        normalized_telegram_id = self.normalize_telegram_id(telegram_id)
         result = await self._session.execute(select(User).where(User.telegram_id == normalized_telegram_id))
         user = result.scalar_one_or_none()
         return None if user is None else UserRead.model_validate(user)
@@ -159,6 +159,56 @@ class UserService:
         if not isinstance(subject, int):
             raise InvalidIdentityError("Telegram lookups require an integer Telegram ID.")
         return await self.get_by_telegram_id(subject)
+
+    async def get_locked_user_record(self, user_id: object) -> User | None:
+        """Return a row-locked user ORM record when it exists."""
+
+        result = await self._session.execute(select(User).where(User.id == user_id).with_for_update())
+        return result.scalar_one_or_none()
+
+    async def get_locked_guest_user(self, user_id: object) -> User | None:
+        """Return a row-locked guest account when the persisted state still matches."""
+
+        result = await self._session.execute(
+            select(User)
+            .where(User.id == user_id, User.account_type == AccountType.GUEST)
+            .with_for_update()
+        )
+        return result.scalar_one_or_none()
+
+    async def get_locked_full_user(self, user_id: object) -> User | None:
+        """Return a row-locked full account when the persisted state still matches."""
+
+        result = await self._session.execute(
+            select(User)
+            .where(User.id == user_id, User.account_type == AccountType.FULL)
+            .with_for_update()
+        )
+        return result.scalar_one_or_none()
+
+    async def get_locked_owned_collections(self, user_id: object) -> list[Collection]:
+        """Return all owner-scoped collections for a user under row lock."""
+
+        result = await self._session.execute(
+            select(Collection)
+            .where(Collection.owner_id == user_id)
+            .order_by(Collection.created_at.asc(), Collection.id.asc())
+            .with_for_update()
+        )
+        return list(result.scalars().all())
+
+    async def get_locked_favorites_collection_record(self, user_id: object) -> Collection | None:
+        """Return the caller's Favorites collection ORM row under lock if it exists."""
+
+        result = await self._session.execute(
+            select(Collection)
+            .where(
+                Collection.owner_id == user_id,
+                Collection.kind == CollectionKind.FAVORITES,
+            )
+            .with_for_update()
+        )
+        return result.scalar_one_or_none()
 
     async def get_favorites_collection(self, user_id: object) -> CollectionRead | None:
         """Return the caller's Favorites collection if it exists."""
@@ -211,7 +261,7 @@ class UserService:
     ) -> UserRead:
         """Create a full account with identity fields and Favorites bootstrap."""
 
-        normalized_telegram_id = self._normalize_telegram_id(telegram_id)
+        normalized_telegram_id = self.normalize_telegram_id(telegram_id)
         normalized_google_id = self.normalize_google_id(google_id)
         normalized_email = self.normalize_email(email)
         normalized_password_hash = self._normalize_password_hash(password_hash)
@@ -296,6 +346,152 @@ class UserService:
                     f"Google subject {normalized_google_id!r} is already linked to another account.",
                 ) from exc
             raise UserServiceError("Failed to attach the Google identity to the user.") from exc
+
+        return UserRead.model_validate(user)
+
+    async def attach_telegram_identity(
+        self,
+        *,
+        user_id: object,
+        telegram_id: int,
+        commit: bool = True,
+    ) -> UserRead:
+        """Attach a Telegram identifier to an existing user without duplicating an account."""
+
+        normalized_telegram_id = self.normalize_telegram_id(telegram_id)
+        result = await self._session.execute(select(User).where(User.id == user_id).with_for_update())
+        user = result.scalar_one_or_none()
+        if user is None:
+            raise UserNotFoundError(f"User {user_id} does not exist.")
+
+        if user.telegram_id is not None and user.telegram_id != normalized_telegram_id:
+            raise DuplicateIdentityError(
+                f"User {user.id} is already linked to Telegram ID {user.telegram_id}.",
+            )
+
+        if user.telegram_id is None:
+            await self._ensure_identity_is_available(
+                telegram_id=normalized_telegram_id,
+                google_id=None,
+                email=None,
+            )
+            user.telegram_id = normalized_telegram_id
+
+        try:
+            if commit:
+                await self._session.commit()
+            else:
+                await self._session.flush()
+        except IntegrityError as exc:
+            await self._session.rollback()
+            constraint_name = _integrity_constraint_name(exc)
+            if constraint_name == "uq_users_telegram_id_not_null":
+                raise DuplicateIdentityError(
+                    f"Telegram ID {normalized_telegram_id} is already linked to another account.",
+                ) from exc
+            raise UserServiceError("Failed to attach the Telegram identity to the user.") from exc
+
+        return UserRead.model_validate(user)
+
+    async def upgrade_guest_to_full_account(
+        self,
+        *,
+        user_id: object,
+        telegram_id: int | None = None,
+        google_id: str | None = None,
+        email: str | None = None,
+        email_verified_at: datetime | None = None,
+        password_hash: str | None = None,
+        commit: bool = True,
+    ) -> UserRead:
+        """Promote a guest account in place while safely attaching one or more identities."""
+
+        normalized_telegram_id = self.normalize_telegram_id(telegram_id)
+        normalized_google_id = self.normalize_google_id(google_id)
+        normalized_email = self.normalize_email(email)
+        normalized_password_hash = self._normalize_password_hash(password_hash)
+
+        if (
+            normalized_telegram_id is None
+            and normalized_google_id is None
+            and normalized_email is None
+        ):
+            raise InvalidIdentityError(
+                "Full accounts require at least one identity: telegram_id, google_id, or email.",
+            )
+        if normalized_email is None and email_verified_at is not None:
+            raise InvalidIdentityError("email_verified_at requires an email address.")
+        if normalized_email is None and normalized_password_hash is not None:
+            raise InvalidIdentityError("password_hash requires an email identity.")
+
+        result = await self._session.execute(select(User).where(User.id == user_id).with_for_update())
+        user = result.scalar_one_or_none()
+        if user is None:
+            raise UserNotFoundError(f"User {user_id} does not exist.")
+        if user.account_type is not AccountType.GUEST:
+            raise UserServiceError(f"User {user.id} is not a guest account.")
+
+        if user.telegram_id is not None and user.telegram_id != normalized_telegram_id:
+            raise DuplicateIdentityError(
+                f"User {user.id} is already linked to Telegram ID {user.telegram_id}.",
+            )
+        if user.google_id is not None and user.google_id != normalized_google_id:
+            raise DuplicateIdentityError(
+                f"User {user.id} is already linked to Google subject {user.google_id!r}.",
+            )
+        if user.email is not None and user.email != normalized_email:
+            raise DuplicateIdentityError(
+                f"User {user.id} is already linked to email {user.email!r}.",
+            )
+        if (
+            user.password_hash is not None
+            and normalized_password_hash is not None
+            and user.password_hash != normalized_password_hash
+        ):
+            raise DuplicateIdentityError(
+                f"User {user.id} already has a different password hash attached.",
+            )
+
+        await self._ensure_identity_is_available(
+            telegram_id=normalized_telegram_id if user.telegram_id is None else None,
+            google_id=normalized_google_id if user.google_id is None else None,
+            email=normalized_email if user.email is None else None,
+        )
+
+        user.account_type = AccountType.FULL
+        user.guest_expires_at = None
+        if normalized_telegram_id is not None:
+            user.telegram_id = normalized_telegram_id
+        if normalized_google_id is not None:
+            user.google_id = normalized_google_id
+        if normalized_email is not None:
+            user.email = normalized_email
+        if email_verified_at is not None:
+            user.email_verified_at = email_verified_at
+        if normalized_password_hash is not None:
+            user.password_hash = normalized_password_hash
+
+        try:
+            if commit:
+                await self._session.commit()
+            else:
+                await self._session.flush()
+        except IntegrityError as exc:
+            await self._session.rollback()
+            constraint_name = _integrity_constraint_name(exc)
+            if constraint_name == "uq_users_email_not_null":
+                raise DuplicateIdentityError(
+                    f"Email {normalized_email!r} is already linked to another account.",
+                ) from exc
+            if constraint_name == "uq_users_google_id_not_null":
+                raise DuplicateIdentityError(
+                    f"Google subject {normalized_google_id!r} is already linked to another account.",
+                ) from exc
+            if constraint_name == "uq_users_telegram_id_not_null":
+                raise DuplicateIdentityError(
+                    f"Telegram ID {normalized_telegram_id} is already linked to another account.",
+                ) from exc
+            raise UserServiceError("Failed to upgrade the guest account in place.") from exc
 
         return UserRead.model_validate(user)
 
