@@ -8,6 +8,7 @@ from memexpert.services.auth_service import (
 )
 from memexpert.services.collection_service import CollectionService
 from memexpert.services.errors import (
+    AccountUnavailableError,
     AuthConfigurationError,
     AuthenticatedUserNotFoundError,
     AuthServiceError,
@@ -17,14 +18,20 @@ from memexpert.services.errors import (
     DuplicateCollectionInviteError,
     DuplicateFavoritesCollectionError,
     DuplicateIdentityError,
+    EmailAlreadyInUseError,
     ExpiredTokenError,
     GuestCollectionAccessError,
     InvalidCollectionInviteError,
     InvalidCollectionMembershipError,
     InvalidCollectionTitleError,
+    InvalidCredentialsError,
     InvalidIdentityError,
     InvalidTokenError,
     MissingTokenError,
+    ProviderAccessDeniedError,
+    ProviderNotConfiguredError,
+    ProviderPayloadExpiredError,
+    ProviderPayloadInvalidError,
     RefreshTokenReuseError,
     ServiceError,
     ServiceValidationError,
@@ -33,10 +40,12 @@ from memexpert.services.errors import (
     UserServiceError,
     UserStateMismatchError,
 )
+from memexpert.services.provider_auth_service import ProviderAuthService
 from memexpert.services.user_service import DEFAULT_GUEST_LIFETIME, FAVORITES_TITLE, UserService
 
 __all__ = [
     "ACCESS_TOKEN_TYPE",
+    "AccountUnavailableError",
     "AuthenticatedUserNotFoundError",
     "AuthConfigurationError",
     "AuthService",
@@ -50,6 +59,7 @@ __all__ = [
     "DuplicateCollectionInviteError",
     "DuplicateFavoritesCollectionError",
     "DuplicateIdentityError",
+    "EmailAlreadyInUseError",
     "ExpiredTokenError",
     "FAVORITES_TITLE",
     "GuestCollectionAccessError",
@@ -57,9 +67,15 @@ __all__ = [
     "InvalidCollectionInviteError",
     "InvalidCollectionMembershipError",
     "InvalidCollectionTitleError",
+    "InvalidCredentialsError",
     "InvalidIdentityError",
     "InvalidTokenError",
     "MissingTokenError",
+    "ProviderAccessDeniedError",
+    "ProviderAuthService",
+    "ProviderNotConfiguredError",
+    "ProviderPayloadExpiredError",
+    "ProviderPayloadInvalidError",
     "RefreshTokenReuseError",
     "ServiceError",
     "ServiceValidationError",

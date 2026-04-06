@@ -19,16 +19,35 @@ from memexpert.services import (
     AuthServiceError,
     InvalidTokenError,
     MissingTokenError,
+    ProviderAuthService,
     UpgradeRequiredError,
 )
 
+AUTH_ERROR_STATUS_CODES: Final[dict[AuthErrorCode, int]] = {
+    AuthErrorCode.AUTH_CONFIGURATION_ERROR: int(HTTPStatus.SERVICE_UNAVAILABLE),
+    AuthErrorCode.PROVIDER_NOT_CONFIGURED: int(HTTPStatus.SERVICE_UNAVAILABLE),
+    AuthErrorCode.EXPIRED_TOKEN: int(HTTPStatus.UNAUTHORIZED),
+    AuthErrorCode.INVALID_TOKEN: int(HTTPStatus.UNAUTHORIZED),
+    AuthErrorCode.PROVIDER_PAYLOAD_INVALID: int(HTTPStatus.UNAUTHORIZED),
+    AuthErrorCode.PROVIDER_PAYLOAD_EXPIRED: int(HTTPStatus.UNAUTHORIZED),
+    AuthErrorCode.PROVIDER_ACCESS_DENIED: int(HTTPStatus.UNAUTHORIZED),
+    AuthErrorCode.INVALID_CREDENTIALS: int(HTTPStatus.UNAUTHORIZED),
+    AuthErrorCode.ACCOUNT_UNAVAILABLE: int(HTTPStatus.FORBIDDEN),
+    AuthErrorCode.UPGRADE_REQUIRED: int(HTTPStatus.FORBIDDEN),
+    AuthErrorCode.EMAIL_ALREADY_IN_USE: int(HTTPStatus.CONFLICT),
+}
+
 AUTH_ERROR_RESPONSES: Final[dict[int | str, dict[str, object]]] = {
     int(HTTPStatus.UNAUTHORIZED): {
-        "description": "Authentication failed.",
+        "description": "Authentication failed or provided credentials were not accepted.",
         "model": AuthErrorResponse,
     },
     int(HTTPStatus.FORBIDDEN): {
-        "description": "Authenticated user must upgrade to a full account.",
+        "description": "The identified account cannot perform this authenticated operation.",
+        "model": AuthErrorResponse,
+    },
+    int(HTTPStatus.CONFLICT): {
+        "description": "The authentication request conflicts with existing account state.",
         "model": AuthErrorResponse,
     },
     int(HTTPStatus.SERVICE_UNAVAILABLE): {
@@ -69,24 +88,29 @@ def get_auth_service(session: DbSessionDep) -> AuthService:
     return AuthService.from_settings(session)
 
 
+def get_provider_auth_service(session: DbSessionDep) -> ProviderAuthService:
+    """Build a provider-auth service from the current request session and cached settings."""
+
+    return ProviderAuthService.from_settings(session)
+
+
 AuthServiceDep = Annotated[AuthService, Depends(get_auth_service)]
+ProviderAuthServiceDep = Annotated[ProviderAuthService, Depends(get_provider_auth_service)]
 AuthorizationHeaderDep = Annotated[str | None, Header(alias="Authorization")]
 
 
 def to_auth_http_error(error: AuthServiceError) -> AuthHTTPError:
     """Convert a service-layer auth error into an API-facing JSON error response."""
 
-    if isinstance(error, UpgradeRequiredError):
-        status_code = int(HTTPStatus.FORBIDDEN)
-    elif isinstance(error, AuthConfigurationError):
-        status_code = int(HTTPStatus.SERVICE_UNAVAILABLE)
-    else:
-        status_code = int(HTTPStatus.UNAUTHORIZED)
-
     try:
         error_code = AuthErrorCode(error.error_code)
     except ValueError:
-        error_code = AuthErrorCode.INVALID_TOKEN
+        if isinstance(error, AuthConfigurationError):
+            error_code = AuthErrorCode.AUTH_CONFIGURATION_ERROR
+        else:
+            error_code = AuthErrorCode.INVALID_TOKEN
+
+    status_code = AUTH_ERROR_STATUS_CODES[error_code]
 
     return AuthHTTPError(
         status_code=status_code,
@@ -162,16 +186,19 @@ FullAccountUserDep = Annotated[UserRead, Depends(get_full_account_user)]
 
 __all__ = [
     "AUTH_ERROR_RESPONSES",
+    "AUTH_ERROR_STATUS_CODES",
     "AuthHTTPError",
     "AuthServiceDep",
     "CurrentUserDep",
     "DbSessionDep",
     "FullAccountUserDep",
     "OptionalCurrentUserDep",
+    "ProviderAuthServiceDep",
     "auth_http_exception_handler",
     "get_auth_service",
     "get_current_user",
     "get_full_account_user",
     "get_optional_current_user",
+    "get_provider_auth_service",
     "to_auth_http_error",
 ]

@@ -6,7 +6,7 @@ from datetime import timedelta
 from functools import lru_cache
 from typing import ClassVar, Literal
 
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -37,6 +37,16 @@ class Settings(BaseSettings):
     auth_refresh_cookie_samesite: Literal["lax", "strict", "none"] = "lax"
     auth_refresh_cookie_path: str = "/api/v1/auth/refresh"
     auth_refresh_cookie_domain: str | None = None
+    auth_bcrypt_rounds: int = Field(default=12, ge=4, le=31)
+    auth_telegram_bot_token: SecretStr | None = None
+    auth_telegram_login_max_age_seconds: int = Field(default=300, gt=0)
+    auth_telegram_miniapp_max_age_seconds: int = Field(default=300, gt=0)
+    auth_google_client_id: str | None = None
+    auth_google_client_secret: SecretStr | None = None
+    auth_google_redirect_uri: str | None = None
+    auth_google_token_url: str = "https://oauth2.googleapis.com/token"
+    auth_google_userinfo_url: str = "https://openidconnect.googleapis.com/v1/userinfo"
+    auth_google_timeout_seconds: float = Field(default=10.0, gt=0.0)
 
     model_config: ClassVar[SettingsConfigDict] = SettingsConfigDict(
         env_file=".env",

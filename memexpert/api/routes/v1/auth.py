@@ -1,4 +1,4 @@
-"""Guest-session auth routes for guest bootstrap, refresh rotation, and self lookup."""
+"""Guest-session and provider-auth routes for session issuance, rotation, and self lookup."""
 
 from __future__ import annotations
 
@@ -6,9 +6,22 @@ from typing import Annotated
 
 from fastapi import APIRouter, Body, Request, Response, status
 
-from memexpert.api.dependencies import AUTH_ERROR_RESPONSES, AuthServiceDep, CurrentUserDep, to_auth_http_error
+from memexpert.api.dependencies import (
+    AUTH_ERROR_RESPONSES,
+    AuthServiceDep,
+    CurrentUserDep,
+    ProviderAuthServiceDep,
+    to_auth_http_error,
+)
 from memexpert.core.config import get_settings
-from memexpert.schemas.auth import AuthSessionRead, GuestBootstrapRequest
+from memexpert.schemas.auth import (
+    AuthSessionRead,
+    EmailLoginRequest,
+    EmailSignupRequest,
+    GuestBootstrapRequest,
+    TelegramMiniAppAuthRequest,
+    TelegramWidgetAuthRequest,
+)
 from memexpert.schemas.user import UserRead
 from memexpert.services import AuthServiceError, AuthSession, MissingTokenError
 
@@ -31,6 +44,113 @@ async def create_guest_session(
 
     try:
         auth_session = await auth_service.create_guest_session(guest_request)
+    except AuthServiceError as exc:
+        raise to_auth_http_error(exc) from exc
+
+    _set_refresh_cookie(response, auth_session)
+    return auth_session.to_read()
+
+
+@router.post(
+    "/email/signup",
+    response_model=AuthSessionRead,
+    responses=AUTH_ERROR_RESPONSES,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a full account with email and password",
+)
+async def signup_with_email(
+    request: Request,
+    response: Response,
+    provider_auth_service: ProviderAuthServiceDep,
+    credentials: Annotated[EmailSignupRequest, Body()],
+) -> AuthSessionRead:
+    """Create a full account, issue a session immediately, and keep the refresh token cookie-only."""
+
+    try:
+        auth_session = await provider_auth_service.signup_with_email(
+            email=credentials.email,
+            password=credentials.password,
+            device_info=request.headers.get("user-agent"),
+        )
+    except AuthServiceError as exc:
+        raise to_auth_http_error(exc) from exc
+
+    _set_refresh_cookie(response, auth_session)
+    return auth_session.to_read()
+
+
+@router.post(
+    "/email/login",
+    response_model=AuthSessionRead,
+    responses=AUTH_ERROR_RESPONSES,
+    summary="Authenticate a full account with email and password",
+)
+async def login_with_email(
+    request: Request,
+    response: Response,
+    provider_auth_service: ProviderAuthServiceDep,
+    credentials: Annotated[EmailLoginRequest, Body()],
+) -> AuthSessionRead:
+    """Authenticate an existing email/password account and keep the refresh token cookie-only."""
+
+    try:
+        auth_session = await provider_auth_service.login_with_email(
+            email=credentials.email,
+            password=credentials.password,
+            device_info=request.headers.get("user-agent"),
+        )
+    except AuthServiceError as exc:
+        raise to_auth_http_error(exc) from exc
+
+    _set_refresh_cookie(response, auth_session)
+    return auth_session.to_read()
+
+
+@router.post(
+    "/telegram",
+    response_model=AuthSessionRead,
+    responses=AUTH_ERROR_RESPONSES,
+    summary="Authenticate a full account with Telegram Login Widget",
+)
+async def login_with_telegram_widget(
+    request: Request,
+    response: Response,
+    provider_auth_service: ProviderAuthServiceDep,
+    credentials: Annotated[TelegramWidgetAuthRequest, Body()],
+) -> AuthSessionRead:
+    """Validate a Telegram Login Widget payload and keep the refresh token cookie-only."""
+
+    try:
+        auth_session = await provider_auth_service.authenticate_with_telegram_widget(
+            payload=credentials,
+            device_info=request.headers.get("user-agent"),
+        )
+    except AuthServiceError as exc:
+        raise to_auth_http_error(exc) from exc
+
+    _set_refresh_cookie(response, auth_session)
+    return auth_session.to_read()
+
+
+@router.post(
+    "/telegram-miniapp",
+    response_model=AuthSessionRead,
+    responses=AUTH_ERROR_RESPONSES,
+    summary="Authenticate a full account with Telegram Mini App initData",
+)
+async def login_with_telegram_miniapp(
+    request: Request,
+    response: Response,
+    provider_auth_service: ProviderAuthServiceDep,
+    credentials: Annotated[TelegramMiniAppAuthRequest, Body()],
+) -> AuthSessionRead:
+    """Validate Telegram Mini App initData and keep the refresh token cookie-only."""
+
+    try:
+        auth_session = await provider_auth_service.authenticate_with_telegram_miniapp(
+            init_data=credentials.init_data,
+            device_info=request.headers.get("user-agent"),
+        )
     except AuthServiceError as exc:
         raise to_auth_http_error(exc) from exc
 

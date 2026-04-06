@@ -42,6 +42,9 @@ TEST_BASE_URL: Final = "https://testserver"
 AUTH_TEST_JWT_SECRET: Final = "route-test-auth-secret-with-32-byte-minimum"
 AUTH_TEST_REFRESH_COOKIE_NAME: Final = "route_refresh_token"
 AUTH_TEST_REFRESH_COOKIE_SAMESITE: Final = "strict"
+AUTH_TEST_TELEGRAM_BOT_TOKEN: Final = "123456:telegram-route-test-bot-token"
+AUTH_TEST_TELEGRAM_LOGIN_MAX_AGE_SECONDS: Final = 300
+AUTH_TEST_TELEGRAM_MINIAPP_MAX_AGE_SECONDS: Final = 300
 
 
 def _build_alembic_config(database_url: str) -> Config:
@@ -201,6 +204,9 @@ def auth_settings_overrides(postgres_async_url: str) -> dict[str, str]:
         "AUTH_REFRESH_COOKIE_NAME": AUTH_TEST_REFRESH_COOKIE_NAME,
         "AUTH_REFRESH_COOKIE_SAMESITE": AUTH_TEST_REFRESH_COOKIE_SAMESITE,
         "AUTH_REFRESH_COOKIE_SECURE": "true",
+        "AUTH_TELEGRAM_BOT_TOKEN": AUTH_TEST_TELEGRAM_BOT_TOKEN,
+        "AUTH_TELEGRAM_LOGIN_MAX_AGE_SECONDS": str(AUTH_TEST_TELEGRAM_LOGIN_MAX_AGE_SECONDS),
+        "AUTH_TELEGRAM_MINIAPP_MAX_AGE_SECONDS": str(AUTH_TEST_TELEGRAM_MINIAPP_MAX_AGE_SECONDS),
     }
 
 

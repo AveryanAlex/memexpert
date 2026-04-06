@@ -23,6 +23,7 @@ from memexpert.models.user import RefreshToken, User
 from memexpert.schemas.auth import AuthSessionRead, GuestBootstrapRequest, RefreshCookieMetadata
 from memexpert.schemas.user import UserRead
 from memexpert.services.errors import (
+    AccountUnavailableError,
     AuthConfigurationError,
     AuthenticatedUserNotFoundError,
     AuthServiceError,
@@ -148,10 +149,12 @@ class AuthService:
         user: UserRead,
         *,
         device_info: str | None = None,
+        reload_user: bool = True,
     ) -> AuthSession:
         """Issue a new access token and persisted opaque refresh token for a user."""
 
-        current_user = await self._get_user_by_id(user.id)
+        current_user = await self._get_user_by_id(user.id) if reload_user else user
+        self._ensure_account_is_available(current_user)
         issued_at = utcnow()
         access_token = self._encode_access_token(current_user, issued_at=issued_at)
         refresh_token = self._generate_refresh_token()
@@ -212,6 +215,11 @@ class AuthService:
             raise ExpiredTokenError("Refresh token has expired.")
 
         current_user = await self._get_user_by_id(refresh_token_row.user_id)
+        try:
+            self._ensure_account_is_available(current_user)
+        except AccountUnavailableError:
+            await self._commit_diagnostics("Failed to persist unavailable-account refresh diagnostics.")
+            raise
         replacement_refresh_token = self._generate_refresh_token()
         refresh_token_row.revoked_at = now
         replacement_expires_at = now + self._refresh_token_ttl
@@ -267,8 +275,7 @@ class AuthService:
                 "Access token no longer matches the current persisted account state.",
             )
 
-        if current_user.status is not AccountStatus.ACTIVE:
-            raise InvalidTokenError("Authenticated user is not active.")
+        self._ensure_account_is_available(current_user)
 
         if require_full_account and current_user.account_type is not AccountType.FULL:
             raise UpgradeRequiredError("A full account is required for this operation.")
@@ -299,6 +306,11 @@ class AuthService:
         except IntegrityError as exc:
             await self._session.rollback()
             raise AuthServiceError(message) from exc
+
+    @staticmethod
+    def _ensure_account_is_available(user: UserRead) -> None:
+        if user.status is not AccountStatus.ACTIVE:
+            raise AccountUnavailableError("Account is not available.")
 
     def _encode_access_token(self, user: UserRead, *, issued_at: datetime) -> str:
         expires_at = issued_at + self._access_token_ttl

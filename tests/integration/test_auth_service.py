@@ -13,10 +13,11 @@ import pytest
 from sqlalchemy import func, select
 
 from memexpert.models.collection import Collection
-from memexpert.models.enums import AccountType, CollectionKind, UserLanguage
+from memexpert.models.enums import AccountStatus, AccountType, CollectionKind, UserLanguage
 from memexpert.models.user import RefreshToken, User
 from memexpert.schemas import GuestBootstrapRequest, UserRead
 from memexpert.services import (
+    AccountUnavailableError,
     AuthConfigurationError,
     AuthenticatedUserNotFoundError,
     AuthService,
@@ -253,6 +254,48 @@ async def test_verify_access_token_reloads_current_user_state_and_enforces_full_
 
     assert verified_full_user.id == full_user.id
     assert verified_full_user.account_type is AccountType.FULL
+
+
+async def test_issue_session_and_refresh_rotation_reject_non_active_users(
+    migrated_db_session: AsyncSession,
+) -> None:
+    auth_service = build_auth_service(migrated_db_session)
+    user_service = UserService(migrated_db_session)
+    unavailable_user = await user_service.create_full_user(email="unavailable@example.com")
+
+    unavailable_user_result = await migrated_db_session.execute(select(User).where(User.id == unavailable_user.id))
+    persisted_unavailable_user = unavailable_user_result.scalar_one()
+    persisted_unavailable_user.status = AccountStatus.DELETION_PENDING
+    await migrated_db_session.commit()
+
+    with pytest.raises(AccountUnavailableError, match="not available"):
+        _ = await auth_service.issue_session_for_user(unavailable_user)
+
+    unavailable_refresh_count_result = await migrated_db_session.execute(
+        select(func.count())
+        .select_from(RefreshToken)
+        .where(RefreshToken.user_id == unavailable_user.id)
+    )
+    assert unavailable_refresh_count_result.scalar_one() == 0
+
+    active_user = await user_service.create_full_user(email="rotation-check@example.com")
+    active_session = await auth_service.issue_session_for_user(active_user)
+
+    active_user_result = await migrated_db_session.execute(select(User).where(User.id == active_user.id))
+    persisted_active_user = active_user_result.scalar_one()
+    persisted_active_user.status = AccountStatus.DELETED
+    await migrated_db_session.commit()
+
+    with pytest.raises(AccountUnavailableError, match="not available"):
+        _ = await auth_service.rotate_refresh_token(active_session.refresh_token)
+
+    await migrated_db_session.rollback()
+    refresh_token_result = await migrated_db_session.execute(
+        select(RefreshToken).where(RefreshToken.user_id == active_user.id)
+    )
+    refresh_token_row = refresh_token_result.scalar_one()
+    assert refresh_token_row.last_used_at is not None
+    assert refresh_token_row.revoked_at is None
 
 
 async def test_refresh_rotation_revokes_predecessor_and_rejected_reuse_persists_last_used_at(

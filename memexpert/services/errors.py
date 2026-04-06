@@ -25,6 +25,12 @@ class AuthConfigurationError(AuthServiceError):
     error_code: ClassVar[str] = "auth_configuration_error"
 
 
+class ProviderNotConfiguredError(AuthConfigurationError):
+    """Raised when a provider flow is invoked without the required runtime config."""
+
+    error_code: ClassVar[str] = "provider_not_configured"
+
+
 class InvalidTokenError(ServiceValidationError, AuthServiceError):
     """Raised when an access or refresh token is missing, malformed, or unusable."""
 
@@ -39,6 +45,42 @@ class ExpiredTokenError(AuthServiceError):
     """Raised when an otherwise valid token is past its expiry timestamp."""
 
     error_code: ClassVar[str] = "expired_token"
+
+
+class ProviderPayloadInvalidError(ServiceValidationError, AuthServiceError):
+    """Raised when a provider payload is malformed, tampered with, or incomplete."""
+
+    error_code: ClassVar[str] = "provider_payload_invalid"
+
+
+class ProviderPayloadExpiredError(AuthServiceError):
+    """Raised when a provider payload is well-formed but outside the allowed age window."""
+
+    error_code: ClassVar[str] = "provider_payload_expired"
+
+
+class ProviderAccessDeniedError(AuthServiceError):
+    """Raised when an upstream identity provider refuses the presented credentials."""
+
+    error_code: ClassVar[str] = "provider_access_denied"
+
+
+class InvalidCredentialsError(AuthServiceError):
+    """Raised when a first-party credential set is blank, malformed, or incorrect."""
+
+    error_code: ClassVar[str] = "invalid_credentials"
+
+
+class EmailAlreadyInUseError(AuthServiceError):
+    """Raised when signup attempts to create a full account for an existing email."""
+
+    error_code: ClassVar[str] = "email_already_in_use"
+
+
+class AccountUnavailableError(AuthServiceError):
+    """Raised when a non-active user attempts to authenticate or rotate a session."""
+
+    error_code: ClassVar[str] = "account_unavailable"
 
 
 class AuthenticatedUserNotFoundError(InvalidTokenError):
@@ -112,6 +154,7 @@ class DuplicateCollectionInviteError(CollectionServiceError):
 
 
 __all__ = [
+    "AccountUnavailableError",
     "AuthenticatedUserNotFoundError",
     "AuthConfigurationError",
     "AuthServiceError",
@@ -121,14 +164,20 @@ __all__ = [
     "DuplicateCollectionInviteError",
     "DuplicateFavoritesCollectionError",
     "DuplicateIdentityError",
+    "EmailAlreadyInUseError",
     "ExpiredTokenError",
     "GuestCollectionAccessError",
     "InvalidCollectionInviteError",
     "InvalidCollectionMembershipError",
     "InvalidCollectionTitleError",
+    "InvalidCredentialsError",
     "InvalidIdentityError",
     "InvalidTokenError",
     "MissingTokenError",
+    "ProviderAccessDeniedError",
+    "ProviderNotConfiguredError",
+    "ProviderPayloadExpiredError",
+    "ProviderPayloadInvalidError",
     "RefreshTokenReuseError",
     "ServiceError",
     "ServiceValidationError",

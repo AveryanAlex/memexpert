@@ -207,6 +207,7 @@ class UserService:
         password_hash: str | None = None,
         language: UserLanguage = UserLanguage.ANY,
         nsfw_enabled: bool = False,
+        commit: bool = True,
     ) -> UserRead:
         """Create a full account with identity fields and Favorites bootstrap."""
 
@@ -247,7 +248,7 @@ class UserService:
             last_active_at=utcnow(),
             guest_expires_at=None,
         )
-        favorites = await self._create_user_with_favorites(user)
+        favorites = await self._create_user_with_favorites(user, commit=commit)
         return UserRead.model_validate(user if user.active_save_collection_id == favorites.id else user)
 
     async def touch_last_active(
@@ -272,30 +273,33 @@ class UserService:
 
         return UserRead.model_validate(user)
 
-    async def _create_user_with_favorites(self, user: User) -> Collection:
-        self._session.add(user)
-        await self._session.flush()
-
-        favorites = Collection(
-            owner_id=user.id,
-            title=FAVORITES_TITLE,
-            kind=CollectionKind.FAVORITES,
-            visibility=CollectionVisibility.PRIVATE,
-        )
-        self._session.add(favorites)
-        await self._session.flush()
-
-        self._session.add(
-            CollectionMember(
-                collection_id=favorites.id,
-                user_id=user.id,
-                role=CollectionMembershipRole.OWNER,
-            )
-        )
-        user.active_save_collection_id = favorites.id
-
+    async def _create_user_with_favorites(self, user: User, *, commit: bool = True) -> Collection:
         try:
-            await self._session.commit()
+            self._session.add(user)
+            await self._session.flush()
+
+            favorites = Collection(
+                owner_id=user.id,
+                title=FAVORITES_TITLE,
+                kind=CollectionKind.FAVORITES,
+                visibility=CollectionVisibility.PRIVATE,
+            )
+            self._session.add(favorites)
+            await self._session.flush()
+
+            self._session.add(
+                CollectionMember(
+                    collection_id=favorites.id,
+                    user_id=user.id,
+                    role=CollectionMembershipRole.OWNER,
+                )
+            )
+            user.active_save_collection_id = favorites.id
+
+            if commit:
+                await self._session.commit()
+            else:
+                await self._session.flush()
         except IntegrityError as exc:
             await self._session.rollback()
             constraint_name = _integrity_constraint_name(exc)

@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 
 import jwt
 import pytest
-from fastapi import APIRouter
+from fastapi import APIRouter, FastAPI
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -150,7 +150,7 @@ async def test_me_route_accepts_guest_bearer_tokens_and_rejects_expired_tokens(
 
 
 async def test_refresh_route_rotates_refresh_cookie_and_rejects_revoked_token_reuse(
-    auth_app,
+    auth_app: FastAPI,
     auth_client: AsyncClient,
     auth_settings_overrides: dict[str, str],
 ) -> None:
@@ -181,7 +181,7 @@ async def test_refresh_route_rotates_refresh_cookie_and_rejects_revoked_token_re
 
 
 async def test_refresh_route_rejects_missing_refresh_cookie(
-    auth_app,
+    auth_app: FastAPI,
 ) -> None:
     transport = ASGITransport(app=auth_app)
     async with AsyncClient(transport=transport, base_url="https://testserver") as anonymous_client:
@@ -193,7 +193,7 @@ async def test_refresh_route_rejects_missing_refresh_cookie(
 
 
 async def test_full_account_dependency_returns_upgrade_required_for_guests_and_allows_full_users(
-    auth_app,
+    auth_app: FastAPI,
     auth_settings_overrides: dict[str, str],
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
