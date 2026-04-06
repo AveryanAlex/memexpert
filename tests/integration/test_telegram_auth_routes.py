@@ -11,7 +11,6 @@ from urllib.parse import urlencode
 
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select
-import pytest
 
 from memexpert.api.app import create_app
 from memexpert.core.config import get_settings
@@ -19,6 +18,7 @@ from memexpert.core.database import reset_async_database_state
 from memexpert.models.user import RefreshToken, User
 
 if TYPE_CHECKING:
+    from pytest import MonkeyPatch
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 
@@ -204,7 +204,7 @@ async def test_telegram_routes_return_typed_provider_errors_for_tampered_and_exp
 
 async def test_telegram_routes_return_provider_not_configured_when_bot_token_missing(
     postgres_async_url: str,
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("DATABASE_URL", postgres_async_url)
     monkeypatch.setenv("AUTH_JWT_SECRET", "route-test-auth-secret-with-32-byte-minimum")

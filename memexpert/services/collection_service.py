@@ -23,6 +23,7 @@ from memexpert.schemas import CollectionInviteRead, CollectionMemberRead, Collec
 from memexpert.services.errors import (
     CollectionNotFoundError,
     CollectionServiceError,
+    CollectionVerificationRequiredError,
     CollectionWriteAccessError,
     DuplicateCollectionInviteError,
     GuestCollectionAccessError,
@@ -175,8 +176,7 @@ class CollectionService:
             creator = await self._get_user_model(created_by_user_id)
             if creator is None:
                 raise UserNotFoundError(f"User {created_by_user_id} does not exist.")
-            if creator.account_type is AccountType.GUEST:
-                raise GuestCollectionAccessError("Guest accounts cannot create collection invites.")
+            _ensure_user_can_collaborate(creator)
             if not _user_can_write_collection(creator.id, collection):
                 raise CollectionWriteAccessError(
                     f"User {creator.id} cannot create invites for collection {collection.id}.",
@@ -342,6 +342,16 @@ def _resolve_invite_channel(channel: CollectionInviteChannel | str) -> Collectio
         return channel if isinstance(channel, CollectionInviteChannel) else CollectionInviteChannel(channel)
     except ValueError as exc:
         raise InvalidCollectionInviteError(f"Unsupported collection invite channel {channel!r}.") from exc
+
+
+def _ensure_user_can_collaborate(user: User) -> None:
+    if user.account_type is AccountType.GUEST:
+        raise GuestCollectionAccessError("Guest accounts cannot create collection invites.")
+    if user.telegram_id is not None or user.google_id is not None or user.email_verified_at is not None:
+        return
+    raise CollectionVerificationRequiredError(
+        "Collection collaboration requires a verified email or linked Telegram/Google identity.",
+    )
 
 
 def _user_can_write_collection(user_id: object, collection: Collection) -> bool:

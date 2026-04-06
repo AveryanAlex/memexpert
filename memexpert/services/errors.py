@@ -137,6 +137,10 @@ class GuestCollectionAccessError(CollectionServiceError):
     """Raised when a guest attempts a full-account-only collection operation."""
 
 
+class CollectionVerificationRequiredError(CollectionServiceError):
+    """Raised when collection collaboration requires a verified or provider-backed identity."""
+
+
 class InvalidCollectionTitleError(ServiceValidationError, CollectionServiceError):
     """Raised when a collection title is blank or exceeds allowed limits."""
 
@@ -160,6 +164,7 @@ __all__ = [
     "AuthServiceError",
     "CollectionNotFoundError",
     "CollectionServiceError",
+    "CollectionVerificationRequiredError",
     "CollectionWriteAccessError",
     "DuplicateCollectionInviteError",
     "DuplicateFavoritesCollectionError",

@@ -30,14 +30,21 @@ def test_v1_namespace_root_and_openapi_spec_are_available() -> None:
         openapi_response = client.get("/openapi.json")
 
     paths = openapi_response.json()["paths"]
+    expected_auth_paths = {
+        "/api/v1/auth/guest": "post",
+        "/api/v1/auth/email/signup": "post",
+        "/api/v1/auth/email/login": "post",
+        "/api/v1/auth/telegram": "post",
+        "/api/v1/auth/telegram-miniapp": "post",
+        "/api/v1/auth/google": "post",
+        "/api/v1/auth/refresh": "post",
+        "/api/v1/auth/me": "get",
+    }
 
     assert namespace_response.status_code == 200
     assert namespace_response.json() == {"version": "v1", "status": "available"}
     assert openapi_response.status_code == 200
     assert "/api/v1/" in paths
-    assert "/api/v1/auth/guest" in paths
-    assert "post" in paths["/api/v1/auth/guest"]
-    assert "/api/v1/auth/refresh" in paths
-    assert "post" in paths["/api/v1/auth/refresh"]
-    assert "/api/v1/auth/me" in paths
-    assert "get" in paths["/api/v1/auth/me"]
+    for path, method in expected_auth_paths.items():
+        assert path in paths
+        assert method in paths[path]

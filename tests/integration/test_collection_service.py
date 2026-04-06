@@ -20,6 +20,7 @@ from memexpert.models.enums import (
 from memexpert.models.user import User
 from memexpert.services import (
     CollectionService,
+    CollectionVerificationRequiredError,
     CollectionWriteAccessError,
     DuplicateCollectionInviteError,
     GuestCollectionAccessError,
@@ -143,12 +144,127 @@ async def test_active_save_collection_rejects_non_member_and_viewer_targets(
         )
 
 
-async def test_create_invite_persists_valid_payload_and_rejects_malformed_inputs(
+async def test_create_invite_rejects_unverified_email_only_accounts_without_persisting_invites(
     migrated_db_session: AsyncSession,
 ) -> None:
     user_service = UserService(migrated_db_session)
     collection_service = CollectionService(migrated_db_session)
     owner = await user_service.create_full_user(email="owner@example.com")
+    shared_collection = await collection_service.create_custom_collection(
+        owner_user_id=owner.id,
+        title="Shared board",
+    )
+
+    with pytest.raises(CollectionVerificationRequiredError, match="verified email"):
+        _ = await collection_service.create_invite(
+            collection_id=shared_collection.id,
+            created_by_user_id=owner.id,
+            token_hash="e" * 64,
+        )
+
+    invite_count_result = await migrated_db_session.execute(select(func.count()).select_from(CollectionInvite))
+    assert invite_count_result.scalar_one() == 0
+
+
+async def test_create_invite_preserves_guest_and_write_access_errors_without_persisting_invites(
+    migrated_db_session: AsyncSession,
+) -> None:
+    user_service = UserService(migrated_db_session)
+    collection_service = CollectionService(migrated_db_session)
+    owner = await user_service.create_full_user(
+        email="owner@example.com",
+        email_verified_at=datetime.now(UTC),
+    )
+    viewer = await user_service.create_full_user(
+        email="viewer@example.com",
+        email_verified_at=datetime.now(UTC),
+    )
+    guest = await user_service.create_guest_user()
+    shared_collection = await collection_service.create_custom_collection(
+        owner_user_id=owner.id,
+        title="Shared board",
+    )
+    _ = await collection_service.ensure_member(
+        collection_id=shared_collection.id,
+        user_id=viewer.id,
+        role=CollectionMembershipRole.VIEWER,
+    )
+
+    with pytest.raises(GuestCollectionAccessError, match="cannot create collection invites"):
+        _ = await collection_service.create_invite(
+            collection_id=shared_collection.id,
+            created_by_user_id=guest.id,
+            token_hash="f" * 64,
+        )
+
+    with pytest.raises(CollectionWriteAccessError, match=str(shared_collection.id)):
+        _ = await collection_service.create_invite(
+            collection_id=shared_collection.id,
+            created_by_user_id=viewer.id,
+            token_hash="g" * 64,
+        )
+
+    invite_count_result = await migrated_db_session.execute(select(func.count()).select_from(CollectionInvite))
+    assert invite_count_result.scalar_one() == 0
+
+
+async def test_create_invite_allows_telegram_and_google_backed_editors_with_write_access(
+    migrated_db_session: AsyncSession,
+) -> None:
+    user_service = UserService(migrated_db_session)
+    collection_service = CollectionService(migrated_db_session)
+    owner = await user_service.create_full_user(
+        email="owner@example.com",
+        email_verified_at=datetime.now(UTC),
+    )
+    telegram_editor = await user_service.create_full_user(telegram_id=123456789)
+    google_editor = await user_service.create_full_user(
+        google_id="google-subject-123",
+        email="google-editor@example.com",
+        email_verified_at=datetime.now(UTC),
+    )
+    shared_collection = await collection_service.create_custom_collection(
+        owner_user_id=owner.id,
+        title="Shared board",
+    )
+    _ = await collection_service.ensure_member(
+        collection_id=shared_collection.id,
+        user_id=telegram_editor.id,
+        role=CollectionMembershipRole.EDITOR,
+    )
+    _ = await collection_service.ensure_member(
+        collection_id=shared_collection.id,
+        user_id=google_editor.id,
+        role=CollectionMembershipRole.EDITOR,
+    )
+
+    telegram_invite = await collection_service.create_invite(
+        collection_id=shared_collection.id,
+        created_by_user_id=telegram_editor.id,
+        token_hash="h" * 64,
+    )
+    google_invite = await collection_service.create_invite(
+        collection_id=shared_collection.id,
+        created_by_user_id=google_editor.id,
+        token_hash="i" * 64,
+    )
+
+    assert telegram_invite.created_by_user_id == telegram_editor.id
+    assert google_invite.created_by_user_id == google_editor.id
+
+    invite_count_result = await migrated_db_session.execute(select(func.count()).select_from(CollectionInvite))
+    assert invite_count_result.scalar_one() == 2
+
+
+async def test_create_invite_persists_valid_payload_and_rejects_malformed_inputs(
+    migrated_db_session: AsyncSession,
+) -> None:
+    user_service = UserService(migrated_db_session)
+    collection_service = CollectionService(migrated_db_session)
+    owner = await user_service.create_full_user(
+        email="owner@example.com",
+        email_verified_at=datetime.now(UTC),
+    )
     shared_collection = await collection_service.create_custom_collection(
         owner_user_id=owner.id,
         title="Shared board",
