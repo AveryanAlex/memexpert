@@ -11,6 +11,7 @@ from urllib.parse import urlencode
 
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select
+import pytest
 
 from memexpert.api.app import create_app
 from memexpert.core.config import get_settings
@@ -45,7 +46,14 @@ def build_miniapp_init_data(
         "first_name": "Alice",
         "username": "alice_memexpert",
     }
-    user_payload.update(overrides.pop("user", {}))
+    raw_user_overrides = overrides.pop("user", None)
+    if raw_user_overrides is not None:
+        if not isinstance(raw_user_overrides, dict):
+            raise TypeError("Mini App user overrides must be a mapping.")
+        typed_user_overrides: dict[str, object] = {
+            str(key): value for key, value in raw_user_overrides.items()
+        }
+        user_payload.update(typed_user_overrides)
 
     fields: dict[str, str] = {
         "auth_date": str(auth_date if auth_date is not None else int(datetime.now(UTC).timestamp())),
@@ -196,7 +204,7 @@ async def test_telegram_routes_return_typed_provider_errors_for_tampered_and_exp
 
 async def test_telegram_routes_return_provider_not_configured_when_bot_token_missing(
     postgres_async_url: str,
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("DATABASE_URL", postgres_async_url)
     monkeypatch.setenv("AUTH_JWT_SECRET", "route-test-auth-secret-with-32-byte-minimum")

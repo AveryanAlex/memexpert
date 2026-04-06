@@ -7,6 +7,7 @@ from memexpert.schemas.auth import (
     EmailCredentialsRequest,
     EmailLoginRequest,
     EmailSignupRequest,
+    GoogleAuthRequest,
     GuestBootstrapRequest,
     RefreshCookieMetadata,
 )
@@ -35,6 +36,7 @@ __all__ = [
     "EmailCredentialsRequest",
     "EmailLoginRequest",
     "EmailSignupRequest",
+    "GoogleAuthRequest",
     "GuestBootstrapRequest",
     "InlineUsageEventRead",
     "RefreshCookieMetadata",

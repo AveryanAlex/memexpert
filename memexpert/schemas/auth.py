@@ -97,6 +97,14 @@ class EmailLoginRequest(EmailCredentialsRequest):
     """Email/password payload accepted by the login endpoint."""
 
 
+class GoogleAuthRequest(BaseModel):
+    """Payload forwarded from a Google OAuth frontend after authorization-code grant."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    code: str
+
+
 class TelegramWidgetAuthRequest(BaseModel):
     """Payload forwarded from the Telegram Login Widget to the backend."""
 
@@ -165,6 +173,7 @@ __all__ = [
     "EmailCredentialsRequest",
     "EmailLoginRequest",
     "EmailSignupRequest",
+    "GoogleAuthRequest",
     "GuestBootstrapRequest",
     "RefreshCookieMetadata",
     "TelegramMiniAppAuthRequest",

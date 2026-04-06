@@ -78,7 +78,7 @@ class UserService:
         return normalized_email
 
     @staticmethod
-    def _normalize_google_id(google_id: str | None) -> str | None:
+    def normalize_google_id(google_id: str | None) -> str | None:
         if google_id is None:
             return None
 
@@ -127,7 +127,7 @@ class UserService:
     async def get_by_google_id(self, google_id: str) -> UserRead | None:
         """Return a user by Google subject if it exists."""
 
-        normalized_google_id = self._normalize_google_id(google_id)
+        normalized_google_id = self.normalize_google_id(google_id)
         result = await self._session.execute(select(User).where(User.google_id == normalized_google_id))
         user = result.scalar_one_or_none()
         return None if user is None else UserRead.model_validate(user)
@@ -212,7 +212,7 @@ class UserService:
         """Create a full account with identity fields and Favorites bootstrap."""
 
         normalized_telegram_id = self._normalize_telegram_id(telegram_id)
-        normalized_google_id = self._normalize_google_id(google_id)
+        normalized_google_id = self.normalize_google_id(google_id)
         normalized_email = self.normalize_email(email)
         normalized_password_hash = self._normalize_password_hash(password_hash)
 
@@ -250,6 +250,54 @@ class UserService:
         )
         favorites = await self._create_user_with_favorites(user, commit=commit)
         return UserRead.model_validate(user if user.active_save_collection_id == favorites.id else user)
+
+    async def attach_google_identity(
+        self,
+        *,
+        user_id: object,
+        google_id: str,
+        email_verified_at: datetime | None = None,
+        commit: bool = True,
+    ) -> UserRead:
+        """Attach a Google subject to an existing user without creating a duplicate account."""
+
+        normalized_google_id = self.normalize_google_id(google_id)
+        result = await self._session.execute(select(User).where(User.id == user_id).with_for_update())
+        user = result.scalar_one_or_none()
+        if user is None:
+            raise UserNotFoundError(f"User {user_id} does not exist.")
+
+        if user.google_id is not None and user.google_id != normalized_google_id:
+            raise DuplicateIdentityError(
+                f"User {user.id} is already linked to Google subject {user.google_id!r}.",
+            )
+
+        if user.google_id is None:
+            await self._ensure_identity_is_available(
+                telegram_id=None,
+                google_id=normalized_google_id,
+                email=None,
+            )
+            user.google_id = normalized_google_id
+
+        if email_verified_at is not None:
+            user.email_verified_at = email_verified_at
+
+        try:
+            if commit:
+                await self._session.commit()
+            else:
+                await self._session.flush()
+        except IntegrityError as exc:
+            await self._session.rollback()
+            constraint_name = _integrity_constraint_name(exc)
+            if constraint_name == "uq_users_google_id_not_null":
+                raise DuplicateIdentityError(
+                    f"Google subject {normalized_google_id!r} is already linked to another account.",
+                ) from exc
+            raise UserServiceError("Failed to attach the Google identity to the user.") from exc
+
+        return UserRead.model_validate(user)
 
     async def touch_last_active(
         self,

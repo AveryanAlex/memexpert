@@ -91,7 +91,14 @@ def build_miniapp_init_data(
         "first_name": "Alice",
         "username": "alice_memexpert",
     }
-    user_payload.update(overrides.pop("user", {}))
+    raw_user_overrides = overrides.pop("user", None)
+    if raw_user_overrides is not None:
+        if not isinstance(raw_user_overrides, dict):
+            raise TypeError("Mini App user overrides must be a mapping.")
+        typed_user_overrides: dict[str, object] = {
+            str(key): value for key, value in raw_user_overrides.items()
+        }
+        user_payload.update(typed_user_overrides)
 
     fields: dict[str, str] = {
         "auth_date": str(auth_date if auth_date is not None else int(datetime.now(UTC).timestamp())),

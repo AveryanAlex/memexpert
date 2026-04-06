@@ -18,6 +18,7 @@ from memexpert.schemas.auth import (
     AuthSessionRead,
     EmailLoginRequest,
     EmailSignupRequest,
+    GoogleAuthRequest,
     GuestBootstrapRequest,
     TelegramMiniAppAuthRequest,
     TelegramWidgetAuthRequest,
@@ -97,6 +98,32 @@ async def login_with_email(
         auth_session = await provider_auth_service.login_with_email(
             email=credentials.email,
             password=credentials.password,
+            device_info=request.headers.get("user-agent"),
+        )
+    except AuthServiceError as exc:
+        raise to_auth_http_error(exc) from exc
+
+    _set_refresh_cookie(response, auth_session)
+    return auth_session.to_read()
+
+
+@router.post(
+    "/google",
+    response_model=AuthSessionRead,
+    responses=AUTH_ERROR_RESPONSES,
+    summary="Authenticate a full account with Google OAuth",
+)
+async def login_with_google(
+    request: Request,
+    response: Response,
+    provider_auth_service: ProviderAuthServiceDep,
+    credentials: Annotated[GoogleAuthRequest, Body()],
+) -> AuthSessionRead:
+    """Exchange a Google auth code, issue a session, and keep the refresh token cookie-only."""
+
+    try:
+        auth_session = await provider_auth_service.authenticate_with_google_code(
+            code=credentials.code,
             device_info=request.headers.get("user-agent"),
         )
     except AuthServiceError as exc:

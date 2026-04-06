@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Self
 
 import bcrypt
+import httpx
 from aiogram.utils import auth_widget
 from aiogram.utils.web_app import safe_parse_webapp_init_data
 from pydantic import ValidationError
@@ -14,6 +15,7 @@ from sqlalchemy import select
 
 from memexpert.core.config import Settings, get_settings
 from memexpert.models.base import utcnow
+from memexpert.models.enums import AccountStatus
 from memexpert.models.user import User
 from memexpert.schemas.auth import (
     TelegramWidgetAuthRequest,
@@ -23,10 +25,12 @@ from memexpert.schemas.auth import (
 from memexpert.schemas.user import UserRead
 from memexpert.services.auth_service import AuthService, AuthSession
 from memexpert.services.errors import (
+    AccountUnavailableError,
     AuthConfigurationError,
     DuplicateIdentityError,
     EmailAlreadyInUseError,
     InvalidCredentialsError,
+    ProviderAccessDeniedError,
     ProviderNotConfiguredError,
     ProviderPayloadExpiredError,
     ProviderPayloadInvalidError,
@@ -45,6 +49,15 @@ class TelegramIdentity:
     auth_date: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class GoogleIdentity:
+    """Normalized Google identity data resolved from token and userinfo calls."""
+
+    google_id: str
+    email: str | None
+    email_verified_at: datetime | None
+
+
 class ProviderAuthService:
     """Resolve provider credentials into full accounts, then delegate session issuance."""
 
@@ -56,6 +69,13 @@ class ProviderAuthService:
         telegram_bot_token: str | None = None,
         telegram_login_max_age_seconds: int = 300,
         telegram_miniapp_max_age_seconds: int = 300,
+        google_client_id: str | None = None,
+        google_client_secret: str | None = None,
+        google_redirect_uri: str | None = None,
+        google_token_url: str = "https://oauth2.googleapis.com/token",
+        google_userinfo_url: str = "https://openidconnect.googleapis.com/v1/userinfo",
+        google_timeout_seconds: float = 10.0,
+        google_http_transport: httpx.AsyncBaseTransport | None = None,
         auth_service: AuthService | None = None,
         user_service: UserService | None = None,
     ) -> None:
@@ -70,6 +90,16 @@ class ProviderAuthService:
             "telegram_miniapp_max_age_seconds",
             telegram_miniapp_max_age_seconds,
         )
+        self._google_client_id: str | None = self._normalize_optional_text(google_client_id)
+        self._google_client_secret: str | None = self._normalize_optional_text(google_client_secret)
+        self._google_redirect_uri: str | None = self._normalize_optional_text(google_redirect_uri)
+        self._google_token_url: str = self._require_non_blank("google_token_url", google_token_url)
+        self._google_userinfo_url: str = self._require_non_blank("google_userinfo_url", google_userinfo_url)
+        self._google_timeout_seconds: float = self._require_positive_float(
+            "google_timeout_seconds",
+            google_timeout_seconds,
+        )
+        self._google_http_transport: httpx.AsyncBaseTransport | None = google_http_transport
         self._auth_service: AuthService = auth_service or AuthService.from_settings(session)
         self._user_service: UserService = user_service or UserService(session)
 
@@ -79,6 +109,7 @@ class ProviderAuthService:
         session: AsyncSession,
         *,
         settings: Settings | None = None,
+        google_http_transport: httpx.AsyncBaseTransport | None = None,
         auth_service: AuthService | None = None,
         user_service: UserService | None = None,
     ) -> Self:
@@ -90,12 +121,24 @@ class ProviderAuthService:
             if resolved_settings.auth_telegram_bot_token is not None
             else None
         )
+        google_client_secret = (
+            resolved_settings.auth_google_client_secret.get_secret_value()
+            if resolved_settings.auth_google_client_secret is not None
+            else None
+        )
         return cls(
             session,
             password_hash_rounds=resolved_settings.auth_bcrypt_rounds,
             telegram_bot_token=telegram_bot_token,
             telegram_login_max_age_seconds=resolved_settings.auth_telegram_login_max_age_seconds,
             telegram_miniapp_max_age_seconds=resolved_settings.auth_telegram_miniapp_max_age_seconds,
+            google_client_id=resolved_settings.auth_google_client_id,
+            google_client_secret=google_client_secret,
+            google_redirect_uri=resolved_settings.auth_google_redirect_uri,
+            google_token_url=resolved_settings.auth_google_token_url,
+            google_userinfo_url=resolved_settings.auth_google_userinfo_url,
+            google_timeout_seconds=resolved_settings.auth_google_timeout_seconds,
+            google_http_transport=google_http_transport,
             auth_service=auth_service,
             user_service=user_service,
         )
@@ -154,6 +197,17 @@ class ProviderAuthService:
             reload_user=False,
         )
 
+    async def authenticate_with_google_code(
+        self,
+        *,
+        code: str,
+        device_info: str | None = None,
+    ) -> AuthSession:
+        """Exchange a Google OAuth code, resolve the full account, and issue a session."""
+
+        google_identity = await self._exchange_google_code_for_identity(code)
+        return await self._authenticate_with_google_identity(google_identity, device_info=device_info)
+
     async def authenticate_with_telegram_widget(
         self,
         *,
@@ -175,6 +229,62 @@ class ProviderAuthService:
 
         identity = self._verify_telegram_miniapp_payload(init_data)
         return await self._authenticate_with_telegram_identity(identity, device_info=device_info)
+
+    async def _authenticate_with_google_identity(
+        self,
+        identity: GoogleIdentity,
+        *,
+        device_info: str | None = None,
+    ) -> AuthSession:
+        existing_google_user = await self._user_service.get_by_google_id(identity.google_id)
+        if existing_google_user is not None:
+            return await self._auth_service.issue_session_for_user(
+                existing_google_user,
+                device_info=device_info,
+            )
+
+        if identity.email is not None and identity.email_verified_at is not None:
+            reusable_user = await self._user_service.get_by_email(identity.email)
+            if reusable_user is not None:
+                self._ensure_google_reuse_is_allowed(reusable_user)
+                linked_user = await self._user_service.attach_google_identity(
+                    user_id=reusable_user.id,
+                    google_id=identity.google_id,
+                    email_verified_at=identity.email_verified_at,
+                    commit=False,
+                )
+                return await self._auth_service.issue_session_for_user(
+                    linked_user,
+                    device_info=device_info,
+                )
+
+        try:
+            created_user = await self._user_service.create_full_user(
+                google_id=identity.google_id,
+                email=identity.email,
+                email_verified_at=identity.email_verified_at,
+                commit=False,
+            )
+        except DuplicateIdentityError as exc:
+            resolved_user = await self._user_service.get_by_google_id(identity.google_id)
+            if resolved_user is not None:
+                return await self._auth_service.issue_session_for_user(
+                    resolved_user,
+                    device_info=device_info,
+                )
+            if identity.email is not None:
+                conflicting_user = await self._user_service.get_by_email(identity.email)
+                if conflicting_user is not None:
+                    self._ensure_google_reuse_is_allowed(conflicting_user)
+                    raise EmailAlreadyInUseError(
+                        "Verified Google email is already linked to another full account.",
+                    ) from exc
+            raise ProviderPayloadInvalidError("Google identity could not be resolved safely.") from exc
+
+        return await self._auth_service.issue_session_for_user(
+            created_user,
+            device_info=device_info,
+        )
 
     async def _authenticate_with_telegram_identity(
         self,
@@ -201,6 +311,97 @@ class ProviderAuthService:
             resolved_user,
             device_info=device_info,
             reload_user=False,
+        )
+
+    async def _exchange_google_code_for_identity(self, code: str) -> GoogleIdentity:
+        normalized_code = self._require_google_code(code)
+        google_client_id, google_client_secret, google_redirect_uri = self._require_google_configuration()
+
+        async with httpx.AsyncClient(
+            transport=self._google_http_transport,
+            timeout=self._google_timeout_seconds,
+        ) as client:
+            token_response = await self._perform_google_request(
+                client,
+                method="POST",
+                url=self._google_token_url,
+                source="token exchange",
+                data={
+                    "code": normalized_code,
+                    "client_id": google_client_id,
+                    "client_secret": google_client_secret,
+                    "redirect_uri": google_redirect_uri,
+                    "grant_type": "authorization_code",
+                },
+            )
+            token_payload = self._decode_google_json(token_response, source="token response")
+            access_token = self._extract_google_access_token(token_payload)
+            userinfo_response = await self._perform_google_request(
+                client,
+                method="GET",
+                url=self._google_userinfo_url,
+                source="userinfo request",
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+
+        userinfo_payload = self._decode_google_json(userinfo_response, source="userinfo response")
+        return self._normalize_google_identity(userinfo_payload)
+
+    async def _perform_google_request(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        method: str,
+        url: str,
+        source: str,
+        headers: dict[str, str] | None = None,
+        data: dict[str, str] | None = None,
+    ) -> httpx.Response:
+        try:
+            response = await client.request(
+                method,
+                url,
+                headers=headers,
+                data=data,
+            )
+        except httpx.TimeoutException as exc:
+            raise ProviderAccessDeniedError(f"Google {source} timed out.") from exc
+        except httpx.HTTPError as exc:
+            raise ProviderAccessDeniedError(f"Google {source} failed.") from exc
+
+        if response.is_success:
+            return response
+
+        if response.status_code in {400, 401, 403}:
+            raise ProviderAccessDeniedError(f"Google {source} was denied.")
+        raise ProviderAccessDeniedError(
+            f"Google {source} failed with status {response.status_code}.",
+        )
+
+    def _normalize_google_identity(self, payload: dict[str, object]) -> GoogleIdentity:
+        google_id = self._normalize_google_subject(payload.get("sub"))
+        email_value = payload.get("email")
+        normalized_email: str | None = None
+        if email_value is not None:
+            normalized_email = self._normalize_google_email(email_value)
+
+        email_verified = self._coerce_google_email_verified(
+            payload.get("email_verified"),
+            require_field=normalized_email is not None,
+        )
+        if email_verified:
+            if normalized_email is None:
+                raise ProviderPayloadInvalidError("Google userinfo is missing a verified email address.")
+            return GoogleIdentity(
+                google_id=google_id,
+                email=normalized_email,
+                email_verified_at=utcnow(),
+            )
+
+        return GoogleIdentity(
+            google_id=google_id,
+            email=None,
+            email_verified_at=None,
         )
 
     def _verify_telegram_widget_payload(
@@ -267,10 +468,94 @@ class ProviderAuthService:
         except ValueError as exc:
             raise InvalidCredentialsError("Email or password is invalid.") from exc
 
+    def _require_google_configuration(self) -> tuple[str, str, str]:
+        if (
+            self._google_client_id is None
+            or self._google_client_secret is None
+            or self._google_redirect_uri is None
+        ):
+            raise ProviderNotConfiguredError("Google auth is not configured.")
+        return self._google_client_id, self._google_client_secret, self._google_redirect_uri
+
     def _require_telegram_bot_token(self) -> str:
         if self._telegram_bot_token is None:
             raise ProviderNotConfiguredError("Telegram auth is not configured.")
         return self._telegram_bot_token
+
+    @staticmethod
+    def _ensure_account_is_available(user: UserRead) -> None:
+        if user.status is not AccountStatus.ACTIVE:
+            raise AccountUnavailableError("Account is not available.")
+
+    def _ensure_google_reuse_is_allowed(self, user: UserRead) -> None:
+        self._ensure_account_is_available(user)
+        if user.telegram_id is not None:
+            raise EmailAlreadyInUseError(
+                "Verified Google email is already linked to a Telegram-backed account.",
+            )
+        if user.google_id is not None:
+            raise EmailAlreadyInUseError(
+                "Verified Google email is already linked to another Google-backed account.",
+            )
+
+    def _extract_google_access_token(self, payload: dict[str, object]) -> str:
+        access_token = payload.get("access_token")
+        if not isinstance(access_token, str) or not access_token.strip():
+            raise ProviderPayloadInvalidError("Google token response is missing access_token.")
+        return access_token.strip()
+
+    def _normalize_google_subject(self, subject: object) -> str:
+        if not isinstance(subject, str):
+            raise ProviderPayloadInvalidError("Google userinfo is missing sub.")
+        try:
+            normalized_subject = self._user_service.normalize_google_id(subject)
+        except Exception as exc:
+            raise ProviderPayloadInvalidError("Google userinfo sub is invalid.") from exc
+        if normalized_subject is None:  # pragma: no cover - defensive branch
+            raise ProviderPayloadInvalidError("Google userinfo is missing sub.")
+        return normalized_subject
+
+    @staticmethod
+    def _normalize_google_email(email: object) -> str:
+        if not isinstance(email, str):
+            raise ProviderPayloadInvalidError("Google userinfo email is invalid.")
+        try:
+            return normalize_auth_email(email)
+        except ValueError as exc:
+            raise ProviderPayloadInvalidError("Google userinfo email is invalid.") from exc
+
+    @staticmethod
+    def _coerce_google_email_verified(value: object, *, require_field: bool) -> bool:
+        if value is None:
+            if require_field:
+                raise ProviderPayloadInvalidError("Google userinfo email_verified is missing.")
+            return False
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized_value = value.strip().lower()
+            if normalized_value in {"1", "true"}:
+                return True
+            if normalized_value in {"0", "false"}:
+                return False
+        raise ProviderPayloadInvalidError("Google userinfo email_verified is invalid.")
+
+    @staticmethod
+    def _require_google_code(code: str) -> str:
+        normalized_code = code.strip()
+        if not normalized_code:
+            raise ProviderPayloadInvalidError("Google authorization code is required.")
+        return normalized_code
+
+    @staticmethod
+    def _decode_google_json(response: httpx.Response, *, source: str) -> dict[str, object]:
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise ProviderPayloadInvalidError(f"Google {source} is malformed.") from exc
+        if not isinstance(payload, dict):
+            raise ProviderPayloadInvalidError(f"Google {source} is malformed.")
+        return {str(key): value for key, value in payload.items()}
 
     @staticmethod
     def _coerce_auth_date(auth_date: int | datetime, *, source: str) -> datetime:
@@ -332,6 +617,19 @@ class ProviderAuthService:
         if value <= 0:
             raise AuthConfigurationError(f"{field_name} must be greater than zero.")
         return value
+
+    @staticmethod
+    def _require_positive_float(field_name: str, value: float) -> float:
+        if value <= 0:
+            raise AuthConfigurationError(f"{field_name} must be greater than zero.")
+        return value
+
+    @staticmethod
+    def _require_non_blank(field_name: str, value: str) -> str:
+        normalized_value = value.strip()
+        if not normalized_value:
+            raise AuthConfigurationError(f"{field_name} must not be blank.")
+        return normalized_value
 
     @staticmethod
     def _normalize_optional_text(value: str | None) -> str | None:
