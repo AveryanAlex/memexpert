@@ -22,6 +22,7 @@ from memexpert.services import (
     PipelinePayloadTooLargeError,
     PipelinePayloadValidationError,
     PipelinePublishError,
+    PipelineReplayNotAllowedError,
     PipelineServiceError,
     PipelineSourceConflictError,
     PipelineStorageError,
@@ -40,6 +41,7 @@ PIPELINE_ERROR_STATUS_CODES: Final[dict[ContentPipelineErrorCode, int]] = {
     ContentPipelineErrorCode.STORAGE_FAILURE: int(HTTPStatus.SERVICE_UNAVAILABLE),
     ContentPipelineErrorCode.INGEST_FAILURE: int(HTTPStatus.SERVICE_UNAVAILABLE),
     ContentPipelineErrorCode.PUBLISH_FAILURE: int(HTTPStatus.SERVICE_UNAVAILABLE),
+    ContentPipelineErrorCode.REPLAY_NOT_ALLOWED: int(HTTPStatus.CONFLICT),
 }
 
 PIPELINE_ERROR_RESPONSES: Final[dict[int | str, dict[str, object]]] = {
@@ -56,7 +58,7 @@ PIPELINE_ERROR_RESPONSES: Final[dict[int | str, dict[str, object]]] = {
         "model": ContentPipelineErrorResponse,
     },
     int(HTTPStatus.CONFLICT): {
-        "description": "The upload conflicts with existing durable pipeline state.",
+        "description": "The upload or replay request conflicts with existing durable pipeline state.",
         "model": ContentPipelineErrorResponse,
     },
     int(HTTPStatus.REQUEST_ENTITY_TOO_LARGE): {
@@ -135,6 +137,8 @@ def to_pipeline_http_error(error: PipelineServiceError) -> PipelineHTTPError:
         error_code = ContentPipelineErrorCode.UNSUPPORTED_MEDIA_TYPE
     elif isinstance(error, PipelineSourceConflictError):
         error_code = ContentPipelineErrorCode.SOURCE_CONFLICT
+    elif isinstance(error, PipelineReplayNotAllowedError):
+        error_code = ContentPipelineErrorCode.REPLAY_NOT_ALLOWED
     elif isinstance(error, PipelineStorageError):
         error_code = ContentPipelineErrorCode.STORAGE_FAILURE
     elif isinstance(error, PipelinePublishError):

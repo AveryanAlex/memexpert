@@ -23,10 +23,10 @@ from memexpert.api.dependencies.auth import (
     to_auth_http_error,
 )
 from memexpert.api.dependencies.pipeline import (
-    OperatorTokenDep,
     PIPELINE_ERROR_RESPONSES,
     PIPELINE_ERROR_STATUS_CODES,
     PIPELINE_OPERATOR_TOKEN_HEADER_NAME,
+    OperatorTokenDep,
     PipelineHTTPError,
     PipelineServiceDep,
     get_content_pipeline_service,

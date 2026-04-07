@@ -1,12 +1,12 @@
 # ruff: noqa: TC001,TC003
-"""Operator-only content-pipeline upload and item-detail routes."""
+"""Operator-only content-pipeline upload, inspect, and replay routes."""
 
 from __future__ import annotations
 
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, Form, Path, UploadFile, status
+from fastapi import APIRouter, Body, Depends, File, Form, Path, Query, UploadFile, status
 from pydantic import ValidationError
 
 from memexpert.api.dependencies.pipeline import (
@@ -15,9 +15,12 @@ from memexpert.api.dependencies.pipeline import (
     require_pipeline_operator_token,
     to_pipeline_http_error,
 )
-from memexpert.models.enums import SourcePlatform
+from memexpert.models.enums import ContentPipelineStage, SourcePlatform
 from memexpert.schemas.content_pipeline import (
+    ContentPipelineItemFilter,
     ContentPipelineItemRead,
+    ContentPipelineReplayAccepted,
+    ContentPipelineReplayRequest,
     ContentPipelineUploadMetadata,
     ContentPipelineUploadRead,
 )
@@ -74,6 +77,32 @@ async def create_pipeline_upload(
 
 
 @router.get(
+    "/items",
+    response_model=list[ContentPipelineItemRead],
+    responses=PIPELINE_ERROR_RESPONSES,
+    summary="List failed, stuck, duplicate, or all pipeline items",
+)
+async def list_pipeline_items(
+    pipeline_service: PipelineServiceDep,
+    filter_by: Annotated[ContentPipelineItemFilter, Query(alias="filter")] = ContentPipelineItemFilter.FAILED,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    stuck_after_seconds: Annotated[int, Query(ge=1, le=86_400)] = 60,
+) -> list[ContentPipelineItemRead]:
+    """Return operator-facing pipeline items filtered by the current durable stage state."""
+
+    try:
+        items = await pipeline_service.list_items(
+            filter_by=filter_by,
+            limit=limit,
+            stuck_after_seconds=stuck_after_seconds,
+        )
+    except PipelineServiceError as exc:
+        raise to_pipeline_http_error(exc) from exc
+
+    return list(items)
+
+
+@router.get(
     "/items/{meme_file_id}",
     response_model=ContentPipelineItemRead,
     responses=PIPELINE_ERROR_RESPONSES,
@@ -87,6 +116,33 @@ async def read_pipeline_item(
 
     try:
         return await pipeline_service.get_item(meme_file_id)
+    except PipelineServiceError as exc:
+        raise to_pipeline_http_error(exc) from exc
+
+
+@router.post(
+    "/items/{meme_file_id}/replay",
+    response_model=ContentPipelineReplayAccepted,
+    responses=PIPELINE_ERROR_RESPONSES,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Replay the last retryable failed stage for one pipeline item",
+)
+async def replay_pipeline_item(
+    meme_file_id: Annotated[uuid.UUID, Path()],
+    pipeline_service: PipelineServiceDep,
+    payload: Annotated[ContentPipelineReplayRequest | None, Body()] = None,
+) -> ContentPipelineReplayAccepted:
+    """Republish one failed stage without re-uploading the original durable ingest state."""
+
+    resolved_payload = payload or ContentPipelineReplayRequest()
+    requested_stage = resolved_payload.stage
+    if requested_stage is ContentPipelineStage.INGEST:
+        raise to_pipeline_http_error(
+            PipelinePayloadValidationError("Replay is only supported for downstream stages after ingest."),
+        )
+
+    try:
+        return await pipeline_service.replay_item(meme_file_id, stage=requested_stage)
     except PipelineServiceError as exc:
         raise to_pipeline_http_error(exc) from exc
 

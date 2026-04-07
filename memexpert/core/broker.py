@@ -14,6 +14,7 @@ from aio_pika import ExchangeType
 from faststream.rabbit import RabbitBroker
 
 from memexpert.core.config import Settings, get_settings
+from memexpert.schemas.content_pipeline import ContentPipelineEventType
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable
@@ -31,6 +32,8 @@ class PipelineBrokerSettings:
     exchange: str
     routing_key_prefix: str
     transcode_queue: str
+    retry_exchange: str
+    retry_queue: str
     dead_letter_exchange: str
     dead_letter_queue: str
     retry_max_attempts: int
@@ -44,10 +47,43 @@ class PipelineBrokerSettings:
         return f"{self.routing_key_prefix}.meme_created"
 
     @property
+    def stage_replay_routing_key(self) -> str:
+        """Return the routing key used for operator-triggered stage replays."""
+
+        return f"{self.routing_key_prefix}.stage_replay_requested"
+
+    @property
+    def retry_routing_key(self) -> str:
+        """Return the routing key used when failed work enters the retry queue."""
+
+        return f"{self.routing_key_prefix}.retry"
+
+    @property
+    def transcode_retry_routing_key(self) -> str:
+        """Return the routing key used when retried work returns to the transcode queue."""
+
+        return f"{self.routing_key_prefix}.transcode_retry"
+
+    @property
     def dead_letter_routing_key(self) -> str:
         """Return the routing key used when retries are exhausted."""
 
         return f"{self.routing_key_prefix}.dead_letter"
+
+    @property
+    def retry_backoff_milliseconds(self) -> int:
+        """Return the retry backoff expressed as a RabbitMQ queue TTL in milliseconds."""
+
+        return max(int(self.retry_backoff_seconds * 1000), 1)
+
+    def routing_key_for_event(self, event_type: ContentPipelineEventType) -> str:
+        """Map broker event types onto the topology routing keys."""
+
+        if event_type is ContentPipelineEventType.MEME_CREATED:
+            return self.meme_created_routing_key
+        if event_type is ContentPipelineEventType.STAGE_REPLAY_REQUESTED:
+            return self.stage_replay_routing_key
+        return self.meme_created_routing_key
 
 
 class BrokerConfigurationError(ValueError):
@@ -132,6 +168,14 @@ def get_pipeline_broker_settings(settings: Settings | None = None) -> PipelineBr
             resolved_settings.pipeline_broker_transcode_queue,
             field_name="pipeline_broker_transcode_queue",
         ),
+        retry_exchange=_normalize_topology_name(
+            resolved_settings.pipeline_broker_retry_exchange,
+            field_name="pipeline_broker_retry_exchange",
+        ),
+        retry_queue=_normalize_topology_name(
+            resolved_settings.pipeline_broker_retry_queue,
+            field_name="pipeline_broker_retry_queue",
+        ),
         dead_letter_exchange=_normalize_topology_name(
             resolved_settings.pipeline_broker_dead_letter_exchange,
             field_name="pipeline_broker_dead_letter_exchange",
@@ -192,6 +236,11 @@ async def verify_pipeline_broker(
                     ExchangeType.TOPIC,
                     durable=True,
                 )
+                retry_exchange = await channel.declare_exchange(
+                    broker_settings.retry_exchange,
+                    ExchangeType.TOPIC,
+                    durable=True,
+                )
                 dead_letter_exchange = await channel.declare_exchange(
                     broker_settings.dead_letter_exchange,
                     ExchangeType.TOPIC,
@@ -201,8 +250,17 @@ async def verify_pipeline_broker(
                     broker_settings.transcode_queue,
                     durable=True,
                     arguments={
-                        "x-dead-letter-exchange": broker_settings.dead_letter_exchange,
-                        "x-dead-letter-routing-key": broker_settings.dead_letter_routing_key,
+                        "x-dead-letter-exchange": broker_settings.retry_exchange,
+                        "x-dead-letter-routing-key": broker_settings.retry_routing_key,
+                    },
+                )
+                retry_queue = await channel.declare_queue(
+                    broker_settings.retry_queue,
+                    durable=True,
+                    arguments={
+                        "x-message-ttl": broker_settings.retry_backoff_milliseconds,
+                        "x-dead-letter-exchange": broker_settings.exchange,
+                        "x-dead-letter-routing-key": broker_settings.transcode_retry_routing_key,
                     },
                 )
                 dead_letter_queue = await channel.declare_queue(
@@ -210,6 +268,9 @@ async def verify_pipeline_broker(
                     durable=True,
                 )
                 _ = await transcode_queue.bind(exchange, routing_key=broker_settings.meme_created_routing_key)
+                _ = await transcode_queue.bind(exchange, routing_key=broker_settings.stage_replay_routing_key)
+                _ = await transcode_queue.bind(exchange, routing_key=broker_settings.transcode_retry_routing_key)
+                _ = await retry_queue.bind(retry_exchange, routing_key=broker_settings.retry_routing_key)
                 _ = await dead_letter_queue.bind(
                     dead_letter_exchange,
                     routing_key=broker_settings.dead_letter_routing_key,

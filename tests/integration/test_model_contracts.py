@@ -11,7 +11,6 @@ import pytest
 import pytest_asyncio
 from pydantic import ValidationError
 from sqlalchemy import inspect as sa_inspect, select
-from sqlalchemy.engine import Connection
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import configure_mappers, selectinload
 
@@ -70,6 +69,7 @@ from memexpert.schemas import (
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
+    from sqlalchemy.engine import Connection
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 EXPECTED_TABLES = {

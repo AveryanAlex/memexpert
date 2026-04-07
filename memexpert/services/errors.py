@@ -241,6 +241,12 @@ class PipelinePublishError(PipelineServiceError):
     error_code: ClassVar[str] = "pipeline_publish_failure"
 
 
+class PipelineReplayNotAllowedError(PipelineServiceError):
+    """Raised when durable state does not allow replaying a pipeline stage."""
+
+    error_code: ClassVar[str] = "pipeline_replay_not_allowed"
+
+
 __all__ = [
     "AccountLinkAlreadyCompletedError",
     "AccountLinkError",
@@ -273,6 +279,7 @@ __all__ = [
     "PipelinePayloadTooLargeError",
     "PipelinePayloadValidationError",
     "PipelinePublishError",
+    "PipelineReplayNotAllowedError",
     "PipelineServiceError",
     "PipelineSourceConflictError",
     "PipelineStorageError",

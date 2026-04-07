@@ -37,6 +37,16 @@ class ContentPipelineErrorCode(StrEnum):
     STORAGE_FAILURE = "pipeline_storage_failure"
     INGEST_FAILURE = "pipeline_ingest_failure"
     PUBLISH_FAILURE = "pipeline_publish_failure"
+    REPLAY_NOT_ALLOWED = "pipeline_replay_not_allowed"
+
+
+class ContentPipelineItemFilter(StrEnum):
+    """List filters exposed by the operator-only inspect surface."""
+
+    ALL = "all"
+    DUPLICATE = "duplicate"
+    FAILED = "failed"
+    STUCK = "stuck"
 
 
 class ContentPipelineErrorResponse(BaseModel):
@@ -156,6 +166,7 @@ __all__ = [
     "ContentPipelineErrorCode",
     "ContentPipelineErrorResponse",
     "ContentPipelineEventType",
+    "ContentPipelineItemFilter",
     "ContentPipelineItemRead",
     "ContentPipelineReplayAccepted",
     "ContentPipelineReplayRequest",

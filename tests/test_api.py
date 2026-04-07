@@ -48,7 +48,9 @@ def test_v1_namespace_root_and_openapi_spec_are_available() -> None:
     }
     expected_pipeline_paths = {
         "/api/v1/pipeline/uploads": "post",
+        "/api/v1/pipeline/items": "get",
         "/api/v1/pipeline/items/{meme_file_id}": "get",
+        "/api/v1/pipeline/items/{meme_file_id}/replay": "post",
     }
 
     assert namespace_response.status_code == 200
@@ -60,12 +62,22 @@ def test_v1_namespace_root_and_openapi_spec_are_available() -> None:
         assert method in paths[path]
 
     upload_parameters = paths["/api/v1/pipeline/uploads"]["post"]["parameters"]
+    list_parameters = paths["/api/v1/pipeline/items"]["get"]["parameters"]
     detail_parameters = paths["/api/v1/pipeline/items/{meme_file_id}"]["get"]["parameters"]
+    replay_parameters = paths["/api/v1/pipeline/items/{meme_file_id}/replay"]["post"]["parameters"]
     assert any(
         parameter["name"] == PIPELINE_OPERATOR_TOKEN_HEADER_NAME and parameter["in"] == "header"
         for parameter in upload_parameters
     )
     assert any(
         parameter["name"] == PIPELINE_OPERATOR_TOKEN_HEADER_NAME and parameter["in"] == "header"
+        for parameter in list_parameters
+    )
+    assert any(
+        parameter["name"] == PIPELINE_OPERATOR_TOKEN_HEADER_NAME and parameter["in"] == "header"
         for parameter in detail_parameters
+    )
+    assert any(
+        parameter["name"] == PIPELINE_OPERATOR_TOKEN_HEADER_NAME and parameter["in"] == "header"
+        for parameter in replay_parameters
     )

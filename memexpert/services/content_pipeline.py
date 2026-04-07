@@ -20,7 +20,12 @@ from sqlalchemy.orm import selectinload
 
 from memexpert.core.broker import get_pipeline_broker, get_pipeline_broker_settings
 from memexpert.core.config import Settings, get_settings
-from memexpert.core.storage import build_original_object_key, get_pipeline_storage_settings, get_s3_client
+from memexpert.core.storage import (
+    build_original_object_key,
+    build_web_video_object_key,
+    get_pipeline_storage_settings,
+    get_s3_client,
+)
 from memexpert.models.base import utcnow
 from memexpert.models.content import Meme, MemeFile, MemeSource, PipelineStageJournal
 from memexpert.models.enums import (
@@ -32,9 +37,13 @@ from memexpert.models.enums import (
     ContentSourceKind,
 )
 from memexpert.schemas.content_pipeline import (
+    MAX_PIPELINE_ERROR_LENGTH,
+    MAX_PIPELINE_REASON_LENGTH,
     ContentPipelineDispatchEvent,
     ContentPipelineEventType,
+    ContentPipelineItemFilter,
     ContentPipelineItemRead,
+    ContentPipelineReplayAccepted,
     ContentPipelineStageJournalRead,
     ContentPipelineUploadMetadata,
     ContentPipelineUploadRead,
@@ -45,6 +54,7 @@ from memexpert.services.errors import (
     PipelinePayloadTooLargeError,
     PipelinePayloadValidationError,
     PipelinePublishError,
+    PipelineReplayNotAllowedError,
     PipelineSourceConflictError,
     PipelineStorageError,
     PipelineUnsupportedMediaTypeError,
@@ -79,6 +89,11 @@ _ACTIVE_STAGE_STATUSES = {
     ContentPipelineStageStatus.DUPLICATE,
 }
 _MAX_PERCEPTUAL_HASH_LENGTH = 64
+_DEFAULT_PIPELINE_ITEMS_LIMIT = 50
+_MAX_PIPELINE_ITEMS_LIMIT = 200
+_DEFAULT_STUCK_AFTER_SECONDS = 60
+_PIPELINE_REASON_PUBLISH_FAILED = "publish_failed"
+_PIPELINE_REASON_REPLAY_REQUESTED = "replay_requested"
 
 
 class ObjectStorageClient(Protocol):
@@ -111,6 +126,21 @@ class PreparedUpload:
     height: int
     perceptual_hash: str
     object_key: str
+
+
+@dataclass(frozen=True, slots=True)
+class StageJournalSnapshot:
+    """Durable stage-journal state captured before replay reserves a new attempt."""
+
+    attempt_count: int
+    finished_at: datetime | None
+    is_retryable: bool
+    last_error_text: str | None
+    last_event_id: uuid.UUID | None
+    normalized_reason: str | None
+    retry_after: datetime | None
+    started_at: datetime | None
+    status: ContentPipelineStageStatus
 
 
 class ContentPipelineService:
@@ -197,19 +227,201 @@ class ContentPipelineService:
     async def get_item(self, meme_file_id: uuid.UUID) -> ContentPipelineItemRead:
         """Return one pipeline item and its stage journal from durable PostgreSQL state."""
 
+        meme_file = await self._get_meme_file(meme_file_id)
+        return self._build_item_read(meme_file)
+
+    async def list_items(
+        self,
+        *,
+        filter_by: ContentPipelineItemFilter = ContentPipelineItemFilter.FAILED,
+        limit: int = _DEFAULT_PIPELINE_ITEMS_LIMIT,
+        stuck_after_seconds: int = _DEFAULT_STUCK_AFTER_SECONDS,
+    ) -> tuple[ContentPipelineItemRead, ...]:
+        """Return operator-visible pipeline items filtered by the current durable state."""
+
+        resolved_limit = max(1, min(limit, _MAX_PIPELINE_ITEMS_LIMIT))
+        resolved_stuck_after_seconds = max(stuck_after_seconds, 1)
+        stale_before = utcnow() - timedelta(seconds=resolved_stuck_after_seconds)
+
         result = await self._session.execute(
             select(MemeFile)
             .options(
                 selectinload(MemeFile.meme),
                 selectinload(MemeFile.pipeline_stage_journal_entries),
             )
-            .where(MemeFile.id == meme_file_id)
+            .order_by(MemeFile.created_at.desc())
         )
-        meme_file = result.scalar_one_or_none()
-        if meme_file is None:
-            raise PipelineItemNotFoundError(f"Pipeline item {meme_file_id} does not exist.")
 
-        return self._build_item_read(meme_file)
+        items: list[ContentPipelineItemRead] = []
+        for meme_file in result.scalars().all():
+            stage_entries = self._sorted_stage_entries(meme_file)
+            if not stage_entries:
+                continue
+
+            current_entry = self._resolve_current_stage(stage_entries)
+            if not self._matches_list_filter(
+                current_entry,
+                filter_by=filter_by,
+                stale_before=stale_before,
+            ):
+                continue
+
+            items.append(self._build_item_read(meme_file, stage_entries=stage_entries, current_entry=current_entry))
+            if len(items) >= resolved_limit:
+                break
+
+        return tuple(items)
+
+    async def replay_item(
+        self,
+        meme_file_id: uuid.UUID,
+        *,
+        stage: ContentPipelineStage | None = None,
+    ) -> ContentPipelineReplayAccepted:
+        """Reserve and republish the last retryable failed stage without rewriting ingest state."""
+
+        meme_file = await self._get_meme_file(meme_file_id)
+        if not meme_file.s3_original_key:
+            raise PipelineReplayNotAllowedError(
+                f"Pipeline item {meme_file_id} is missing durable original storage identifiers.",
+            )
+
+        stage_entries = self._sorted_stage_entries(meme_file)
+        target_entry = self._select_replay_entry(stage_entries, requested_stage=stage)
+
+        if self._is_replay_reserved(target_entry):
+            if target_entry.last_event_id is None:
+                raise PipelineReplayNotAllowedError(
+                    f"Pipeline item {meme_file_id} is already reserved for replay, but its event id is missing.",
+                )
+            return ContentPipelineReplayAccepted(
+                meme_file_id=meme_file.id,
+                replay_event_id=target_entry.last_event_id,
+                stage=target_entry.stage,
+                attempt=max(target_entry.attempt_count, 1),
+            )
+
+        replay_attempt = max(target_entry.attempt_count + 1, 1)
+        replay_event = ContentPipelineDispatchEvent(
+            event_id=uuid.uuid7(),
+            event_type=ContentPipelineEventType.STAGE_REPLAY_REQUESTED,
+            meme_id=meme_file.meme_id,
+            meme_file_id=meme_file.id,
+            stage=target_entry.stage,
+            source_kind=ContentSourceKind.MANUAL_UPLOAD,
+            original_object_key=meme_file.s3_original_key,
+            attempt=replay_attempt,
+            created_at=utcnow(),
+        )
+        snapshot = self._snapshot_stage(target_entry)
+
+        self._reserve_replay(target_entry, replay_event)
+        try:
+            await self._session.commit()
+        except SQLAlchemyError as exc:
+            await self._session.rollback()
+            raise PipelineIngestError("Failed to persist replay reservation state.") from exc
+
+        try:
+            await self._publisher(replay_event)
+        except Exception as exc:
+            await self._restore_stage_snapshot(target_entry.id, snapshot)
+            raise PipelinePublishError("Replay was reserved, but downstream dispatch failed.") from exc
+
+        return ContentPipelineReplayAccepted(
+            meme_file_id=meme_file.id,
+            replay_event_id=replay_event.event_id,
+            stage=replay_event.stage,
+            attempt=replay_event.attempt,
+        )
+
+    async def mark_stage_processing(
+        self,
+        *,
+        meme_file_id: uuid.UUID,
+        stage: ContentPipelineStage,
+        attempt: int,
+        event_id: uuid.UUID,
+    ) -> None:
+        """Persist a worker transition from queued to actively running."""
+
+        meme_file, stage_entry = await self._get_meme_file_and_stage_entry(meme_file_id, stage)
+        started_at = utcnow()
+
+        stage_entry.status = ContentPipelineStageStatus.PROCESSING
+        stage_entry.attempt_count = max(stage_entry.attempt_count, attempt)
+        stage_entry.last_event_id = event_id
+        stage_entry.normalized_reason = None
+        stage_entry.last_error_text = None
+        stage_entry.is_retryable = True
+        stage_entry.retry_after = None
+        stage_entry.started_at = started_at
+        stage_entry.finished_at = None
+        meme_file.status = ContentProcessingStatus.PROCESSING
+
+        await self._commit_stage_mutation("Failed to persist running stage state.")
+
+    async def mark_stage_failed(
+        self,
+        *,
+        meme_file_id: uuid.UUID,
+        stage: ContentPipelineStage,
+        attempt: int,
+        event_id: uuid.UUID,
+        normalized_reason: str,
+        last_error_text: str,
+        retryable: bool,
+    ) -> None:
+        """Persist a failed worker attempt with an explicit retryability decision."""
+
+        meme_file, stage_entry = await self._get_meme_file_and_stage_entry(meme_file_id, stage)
+        failed_at = utcnow()
+
+        stage_entry.status = ContentPipelineStageStatus.FAILED
+        stage_entry.attempt_count = max(stage_entry.attempt_count, attempt)
+        stage_entry.last_event_id = event_id
+        stage_entry.normalized_reason = self._trim_reason(normalized_reason)
+        stage_entry.last_error_text = self._trim_error_text(last_error_text)
+        stage_entry.is_retryable = retryable
+        stage_entry.retry_after = (
+            failed_at + timedelta(seconds=self._broker_settings.retry_backoff_seconds)
+            if retryable
+            else None
+        )
+        stage_entry.started_at = stage_entry.started_at or failed_at
+        stage_entry.finished_at = failed_at
+        meme_file.status = ContentProcessingStatus.FAILED
+
+        await self._commit_stage_mutation("Failed to persist failed stage state.")
+
+    async def mark_stage_succeeded(
+        self,
+        *,
+        meme_file_id: uuid.UUID,
+        stage: ContentPipelineStage,
+        attempt: int,
+        event_id: uuid.UUID,
+    ) -> None:
+        """Persist a successful worker attempt and any derivative object-key state."""
+
+        meme_file, stage_entry = await self._get_meme_file_and_stage_entry(meme_file_id, stage)
+        finished_at = utcnow()
+
+        stage_entry.status = ContentPipelineStageStatus.SUCCEEDED
+        stage_entry.attempt_count = max(stage_entry.attempt_count, attempt)
+        stage_entry.last_event_id = event_id
+        stage_entry.normalized_reason = None
+        stage_entry.last_error_text = None
+        stage_entry.is_retryable = False
+        stage_entry.retry_after = None
+        stage_entry.started_at = stage_entry.started_at or finished_at
+        stage_entry.finished_at = finished_at
+
+        if stage is ContentPipelineStage.TRANSCODE:
+            meme_file.s3_web_video_key = build_web_video_object_key(meme_file_id, settings=self._settings)
+            meme_file.status = ContentProcessingStatus.READY
+
+        await self._commit_stage_mutation("Failed to persist successful stage state.")
 
     def _prepare_upload(
         self,
@@ -526,7 +738,7 @@ class ContentPipelineService:
         _ = await broker.publish(
             payload,
             exchange=self._broker_settings.exchange,
-            routing_key=self._broker_settings.meme_created_routing_key,
+            routing_key=self._broker_settings.routing_key_for_event(event.event_type),
             persist=True,
             content_type="application/json",
             message_id=str(event.event_id),
@@ -541,55 +753,116 @@ class ContentPipelineService:
         dispatch_event: ContentPipelineDispatchEvent,
         error: Exception,
     ) -> None:
-        result = await self._session.execute(
-            select(PipelineStageJournal).where(
-                PipelineStageJournal.meme_file_id == meme_file_id,
-                PipelineStageJournal.stage == ContentPipelineStage.TRANSCODE,
+        try:
+            await self.mark_stage_failed(
+                meme_file_id=meme_file_id,
+                stage=dispatch_event.stage,
+                attempt=dispatch_event.attempt,
+                event_id=dispatch_event.event_id,
+                normalized_reason=_PIPELINE_REASON_PUBLISH_FAILED,
+                last_error_text=str(error),
+                retryable=True,
             )
-        )
-        transcode_entry = result.scalar_one_or_none()
-        if transcode_entry is None:
+        except PipelineIngestError:
+            return
+        except PipelineItemNotFoundError:
             return
 
-        failed_at = utcnow()
-        transcode_entry.status = ContentPipelineStageStatus.FAILED
-        transcode_entry.attempt_count = max(transcode_entry.attempt_count, dispatch_event.attempt)
-        transcode_entry.last_event_id = dispatch_event.event_id
-        transcode_entry.normalized_reason = "publish_failed"
-        transcode_entry.last_error_text = str(error)[:4000]
-        transcode_entry.is_retryable = True
-        transcode_entry.retry_after = failed_at + timedelta(seconds=self._broker_settings.retry_backoff_seconds)
-        transcode_entry.started_at = failed_at
-        transcode_entry.finished_at = failed_at
+    async def _get_meme_file(self, meme_file_id: uuid.UUID) -> MemeFile:
+        result = await self._session.execute(
+            select(MemeFile)
+            .options(
+                selectinload(MemeFile.meme),
+                selectinload(MemeFile.pipeline_stage_journal_entries),
+            )
+            .where(MemeFile.id == meme_file_id)
+        )
+        meme_file = result.scalar_one_or_none()
+        if meme_file is None:
+            raise PipelineItemNotFoundError(f"Pipeline item {meme_file_id} does not exist.")
+        return meme_file
 
+    async def _get_meme_file_and_stage_entry(
+        self,
+        meme_file_id: uuid.UUID,
+        stage: ContentPipelineStage,
+    ) -> tuple[MemeFile, PipelineStageJournal]:
+        meme_file = await self._get_meme_file(meme_file_id)
+        stage_entry = next(
+            (entry for entry in meme_file.pipeline_stage_journal_entries if entry.stage is stage),
+            None,
+        )
+        if stage_entry is None:
+            raise PipelineReplayNotAllowedError(
+                f"Pipeline item {meme_file_id} does not have durable journal state for stage {stage.value}.",
+            )
+        return meme_file, stage_entry
+
+    async def _commit_stage_mutation(self, failure_message: str) -> None:
         try:
+            await self._session.commit()
+        except SQLAlchemyError as exc:
+            await self._session.rollback()
+            raise PipelineIngestError(failure_message) from exc
+
+    async def _restore_stage_snapshot(self, stage_entry_id: uuid.UUID, snapshot: StageJournalSnapshot) -> None:
+        try:
+            result = await self._session.execute(
+                select(PipelineStageJournal).where(PipelineStageJournal.id == stage_entry_id)
+            )
+            stage_entry = result.scalar_one_or_none()
+            if stage_entry is None:
+                raise PipelineIngestError(
+                    f"Replay reservation for stage journal {stage_entry_id} disappeared before restore.",
+                )
+
+            stage_entry.status = snapshot.status
+            stage_entry.attempt_count = snapshot.attempt_count
+            stage_entry.last_event_id = snapshot.last_event_id
+            stage_entry.normalized_reason = snapshot.normalized_reason
+            stage_entry.last_error_text = snapshot.last_error_text
+            stage_entry.is_retryable = snapshot.is_retryable
+            stage_entry.retry_after = snapshot.retry_after
+            stage_entry.started_at = snapshot.started_at
+            stage_entry.finished_at = snapshot.finished_at
             await self._session.commit()
         except SQLAlchemyError:
             await self._session.rollback()
+            raise
 
-    def _build_item_read(self, meme_file: MemeFile) -> ContentPipelineItemRead:
-        stage_entries = tuple(
+    def _build_item_read(
+        self,
+        meme_file: MemeFile,
+        *,
+        stage_entries: tuple[PipelineStageJournal, ...] | None = None,
+        current_entry: PipelineStageJournal | None = None,
+    ) -> ContentPipelineItemRead:
+        resolved_stage_entries = stage_entries or self._sorted_stage_entries(meme_file)
+        if not resolved_stage_entries:
+            raise PipelineIngestError(f"Pipeline item {meme_file.id} is missing journal state.")
+
+        resolved_current_entry = current_entry or self._resolve_current_stage(resolved_stage_entries)
+        return ContentPipelineItemRead(
+            meme_id=meme_file.meme_id,
+            meme_file_id=meme_file.id,
+            current_stage=resolved_current_entry.stage,
+            current_status=resolved_current_entry.status,
+            original_object_key=meme_file.s3_original_key,
+            web_video_object_key=meme_file.s3_web_video_key,
+            last_event_id=resolved_current_entry.last_event_id,
+            normalized_reason=resolved_current_entry.normalized_reason,
+            last_error_text=resolved_current_entry.last_error_text,
+            attempt_count=resolved_current_entry.attempt_count,
+            stages=tuple(ContentPipelineStageJournalRead.model_validate(entry) for entry in resolved_stage_entries),
+        )
+
+    @staticmethod
+    def _sorted_stage_entries(meme_file: MemeFile) -> tuple[PipelineStageJournal, ...]:
+        return tuple(
             sorted(
                 meme_file.pipeline_stage_journal_entries,
                 key=lambda entry: _STAGE_ORDER[entry.stage],
             )
-        )
-        if not stage_entries:
-            raise PipelineIngestError(f"Pipeline item {meme_file.id} is missing journal state.")
-
-        current_entry = self._resolve_current_stage(stage_entries)
-        return ContentPipelineItemRead(
-            meme_id=meme_file.meme_id,
-            meme_file_id=meme_file.id,
-            current_stage=current_entry.stage,
-            current_status=current_entry.status,
-            original_object_key=meme_file.s3_original_key,
-            web_video_object_key=meme_file.s3_web_video_key,
-            last_event_id=current_entry.last_event_id,
-            normalized_reason=current_entry.normalized_reason,
-            last_error_text=current_entry.last_error_text,
-            attempt_count=current_entry.attempt_count,
-            stages=tuple(ContentPipelineStageJournalRead.model_validate(entry) for entry in stage_entries),
         )
 
     @staticmethod
@@ -598,6 +871,103 @@ class ContentPipelineService:
             if stage_entry.status in _ACTIVE_STAGE_STATUSES:
                 return stage_entry
         return stage_entries[-1]
+
+    @staticmethod
+    def _is_replay_reserved(stage_entry: PipelineStageJournal) -> bool:
+        return (
+            stage_entry.status in {ContentPipelineStageStatus.PENDING, ContentPipelineStageStatus.PROCESSING}
+            and stage_entry.normalized_reason == _PIPELINE_REASON_REPLAY_REQUESTED
+            and stage_entry.last_event_id is not None
+        )
+
+    def _select_replay_entry(
+        self,
+        stage_entries: tuple[PipelineStageJournal, ...],
+        *,
+        requested_stage: ContentPipelineStage | None,
+    ) -> PipelineStageJournal:
+        if requested_stage is not None:
+            requested_entry = next(
+                (entry for entry in stage_entries if entry.stage is requested_stage),
+                None,
+            )
+            if requested_entry is None:
+                raise PipelineReplayNotAllowedError(
+                    f"Stage {requested_stage.value} has no durable journal row for this pipeline item.",
+                )
+            if self._is_replay_reserved(requested_entry):
+                return requested_entry
+            if requested_entry.status is not ContentPipelineStageStatus.FAILED or not requested_entry.is_retryable:
+                raise PipelineReplayNotAllowedError(
+                    f"Stage {requested_stage.value} is not in a retryable failed state.",
+                )
+            return requested_entry
+
+        for stage_entry in reversed(stage_entries):
+            if self._is_replay_reserved(stage_entry):
+                return stage_entry
+            if stage_entry.status is ContentPipelineStageStatus.FAILED and stage_entry.is_retryable:
+                return stage_entry
+
+        raise PipelineReplayNotAllowedError("No failed retryable stage exists for this pipeline item.")
+
+    @staticmethod
+    def _snapshot_stage(stage_entry: PipelineStageJournal) -> StageJournalSnapshot:
+        return StageJournalSnapshot(
+            status=stage_entry.status,
+            attempt_count=stage_entry.attempt_count,
+            last_event_id=stage_entry.last_event_id,
+            normalized_reason=stage_entry.normalized_reason,
+            last_error_text=stage_entry.last_error_text,
+            is_retryable=stage_entry.is_retryable,
+            retry_after=stage_entry.retry_after,
+            started_at=stage_entry.started_at,
+            finished_at=stage_entry.finished_at,
+        )
+
+    @staticmethod
+    def _reserve_replay(stage_entry: PipelineStageJournal, replay_event: ContentPipelineDispatchEvent) -> None:
+        stage_entry.status = ContentPipelineStageStatus.PENDING
+        stage_entry.attempt_count = replay_event.attempt
+        stage_entry.last_event_id = replay_event.event_id
+        stage_entry.normalized_reason = _PIPELINE_REASON_REPLAY_REQUESTED
+        stage_entry.last_error_text = None
+        stage_entry.is_retryable = True
+        stage_entry.retry_after = None
+        stage_entry.started_at = None
+        stage_entry.finished_at = None
+
+    @staticmethod
+    def _matches_list_filter(
+        current_entry: PipelineStageJournal,
+        *,
+        filter_by: ContentPipelineItemFilter,
+        stale_before: datetime,
+    ) -> bool:
+        if filter_by is ContentPipelineItemFilter.ALL:
+            return True
+        if filter_by is ContentPipelineItemFilter.DUPLICATE:
+            return current_entry.status is ContentPipelineStageStatus.DUPLICATE
+        if filter_by is ContentPipelineItemFilter.FAILED:
+            return current_entry.status is ContentPipelineStageStatus.FAILED
+        if filter_by is ContentPipelineItemFilter.STUCK:
+            if current_entry.status not in {
+                ContentPipelineStageStatus.PENDING,
+                ContentPipelineStageStatus.PROCESSING,
+            }:
+                return False
+            if current_entry.retry_after is not None:
+                return current_entry.retry_after <= utcnow()
+            return current_entry.updated_at <= stale_before
+        return False
+
+    @staticmethod
+    def _trim_reason(normalized_reason: str) -> str:
+        return normalized_reason.strip()[:MAX_PIPELINE_REASON_LENGTH]
+
+    @staticmethod
+    def _trim_error_text(last_error_text: str) -> str:
+        return last_error_text.strip()[:MAX_PIPELINE_ERROR_LENGTH]
 
     @staticmethod
     def _normalize_filename(filename: str | None) -> str:
@@ -627,4 +997,9 @@ class ContentPipelineService:
         return suffix
 
 
-__all__ = ["ContentPipelineService", "ContentPipelineUploadRead", "PreparedUpload"]
+__all__ = [
+    "ContentPipelineService",
+    "ContentPipelineUploadRead",
+    "PreparedUpload",
+    "StageJournalSnapshot",
+]

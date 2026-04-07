@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 from datetime import timedelta
 from functools import lru_cache
 from typing import Annotated, ClassVar, Literal, cast
@@ -72,12 +73,15 @@ class Settings(BaseSettings):
     pipeline_broker_exchange: str = "memexpert.pipeline"
     pipeline_broker_routing_key_prefix: str = "pipeline"
     pipeline_broker_transcode_queue: str = "pipeline.transcode"
+    pipeline_broker_retry_exchange: str = "memexpert.pipeline.retry"
+    pipeline_broker_retry_queue: str = "pipeline.retry"
     pipeline_broker_dead_letter_exchange: str = "memexpert.pipeline.dlx"
     pipeline_broker_dead_letter_queue: str = "pipeline.dlq"
     pipeline_broker_retry_max_attempts: int = Field(default=5, ge=1, le=32)
     pipeline_broker_retry_backoff_seconds: float = Field(default=5.0, gt=0.0, le=3600.0)
     pipeline_broker_connection_timeout_seconds: float = Field(default=5.0, gt=0.0)
     pipeline_storage_connection_timeout_seconds: float = Field(default=5.0, gt=0.0)
+    pipeline_worker_fail_transcode_for_meme_file_id: str | None = None
     auth_jwt_secret: SecretStr = SecretStr("memexpert-dev-jwt-secret-with-32-byte-minimum")
     auth_access_token_algorithm: Literal["HS256"] = "HS256"
     auth_access_token_ttl_seconds: int = 900
@@ -149,6 +153,8 @@ class Settings(BaseSettings):
         "pipeline_broker_exchange",
         "pipeline_broker_routing_key_prefix",
         "pipeline_broker_transcode_queue",
+        "pipeline_broker_retry_exchange",
+        "pipeline_broker_retry_queue",
         "pipeline_broker_dead_letter_exchange",
         "pipeline_broker_dead_letter_queue",
         mode="before",
@@ -217,6 +223,24 @@ class Settings(BaseSettings):
         ):
             raise ValueError("pipeline_allowed_mime_types must contain MIME types like image/jpeg.")
         return normalized_mime_types
+
+    @field_validator("pipeline_worker_fail_transcode_for_meme_file_id", mode="before")
+    @classmethod
+    def _normalize_optional_pipeline_worker_uuid(cls, value: object) -> object:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            return value
+
+        normalized_value = value.strip()
+        if not normalized_value:
+            return None
+
+        try:
+            uuid.UUID(normalized_value)
+        except ValueError as exc:
+            raise ValueError("pipeline_worker_fail_transcode_for_meme_file_id must be a UUID.") from exc
+        return normalized_value
 
     @field_validator("auth_telegram_bot_username", mode="before")
     @classmethod
