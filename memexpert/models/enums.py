@@ -132,6 +132,25 @@ class ContentProcessingStatus(StrEnum):
     READY = "ready"
 
 
+class ContentPipelineStage(StrEnum):
+    """Pipeline stages recorded in the DB-backed journal."""
+
+    INGEST = "ingest"
+    TRANSCODE = "transcode"
+    SYNC_QDRANT = "sync_qdrant"
+    SYNC_MEILI = "sync_meili"
+
+
+class ContentPipelineStageStatus(StrEnum):
+    """Latest-state outcomes recorded for each pipeline stage."""
+
+    PENDING = "pending"
+    PROCESSING = "processing"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    DUPLICATE = "duplicate"
+
+
 class ContentSourceKind(StrEnum):
     """Origin channels tracked for discovered content."""
 
@@ -202,6 +221,8 @@ __all__ = [
     "CollectionVisibility",
     "ContentKind",
     "ContentLanguage",
+    "ContentPipelineStage",
+    "ContentPipelineStageStatus",
     "ContentProcessingStatus",
     "ContentSourceKind",
     "EmbeddingInputType",

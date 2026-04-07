@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text
+from sqlalchemy import CheckConstraint, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import ARRAY, BYTEA, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -15,6 +15,8 @@ from memexpert.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin, utc
 from memexpert.models.enums import (
     ContentKind,
     ContentLanguage,
+    ContentPipelineStage,
+    ContentPipelineStageStatus,
     ContentProcessingStatus,
     EmbeddingInputType,
     SourcePlatform,
@@ -167,6 +169,49 @@ class MemeFile(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         "EmbeddingCache",
         back_populates="source_file",
     )
+    pipeline_stage_journal_entries: Mapped[list["PipelineStageJournal"]] = relationship(
+        "PipelineStageJournal",
+        back_populates="meme_file",
+        cascade="all, delete-orphan",
+    )
+
+
+class PipelineStageJournal(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """Latest per-stage truth for a meme file as it moves through the pipeline."""
+
+    __tablename__ = "pipeline_stage_journal"
+    __table_args__ = (
+        UniqueConstraint("meme_file_id", "stage", name="uq_pipeline_stage_journal_meme_file_id_stage"),
+        CheckConstraint("attempt_count >= 0", name="pipeline_stage_journal_attempt_count_non_negative"),
+        Index("ix_pipeline_stage_journal_stage_status", "stage", "status"),
+        Index("ix_pipeline_stage_journal_meme_file_id_updated_at", "meme_file_id", "updated_at"),
+        Index("ix_pipeline_stage_journal_last_event_id", "last_event_id"),
+        Index("ix_pipeline_stage_journal_status_retry_after", "status", "retry_after"),
+    )
+
+    meme_file_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("meme_files.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    stage: Mapped[ContentPipelineStage] = mapped_column(
+        string_enum(ContentPipelineStage),
+        nullable=False,
+    )
+    status: Mapped[ContentPipelineStageStatus] = mapped_column(
+        string_enum(ContentPipelineStageStatus),
+        default=ContentPipelineStageStatus.PENDING,
+        nullable=False,
+    )
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_event_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
+    normalized_reason: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_error_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_retryable: Mapped[bool] = mapped_column(default=False, nullable=False)
+    retry_after: Mapped[datetime | None] = mapped_column(nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(nullable=True)
+
+    meme_file: Mapped["MemeFile"] = relationship("MemeFile", back_populates="pipeline_stage_journal_entries")
 
 
 class MemeSource(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -358,6 +403,7 @@ __all__ = [
     "MemeSeoPage",
     "MemeSource",
     "MemeTemplate",
+    "PipelineStageJournal",
     "SourceChannel",
     "TelegramFileIdCache",
 ]

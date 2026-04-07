@@ -1,15 +1,34 @@
-"""Tests for configuration loading, validation, and caching."""
+"""Tests for configuration loading, validation, and lazy runtime helpers."""
 
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING
+import uuid
+from typing import TYPE_CHECKING, cast
 
 import pytest
 from pydantic import ValidationError
 
+from memexpert.core.broker import (
+    BrokerConfigurationError,
+    BrokerConnectionError,
+    build_pipeline_broker,
+    get_pipeline_broker_settings,
+    normalize_rabbitmq_url,
+    verify_pipeline_broker,
+)
 from memexpert.core.config import Settings, get_settings
 from memexpert.core.redis import RedisConfigurationError, normalize_redis_url
+from memexpert.core.storage import (
+    StorageConfigurationError,
+    StorageConnectionError,
+    build_original_object_key,
+    build_s3_client,
+    build_web_video_object_key,
+    normalize_s3_bucket_name,
+    normalize_s3_endpoint,
+    verify_s3_storage,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -48,6 +67,30 @@ def test_settings_parse_security_origins_and_preserve_refresh_cookie_path() -> N
     assert settings.auth_refresh_cookie_path == "/api/v1/auth/refresh"
 
 
+def test_settings_parse_pipeline_contract_and_normalize_object_prefixes() -> None:
+    settings = Settings.model_validate(
+        {
+            "pipeline_allowed_mime_types": "image/jpeg, image/png , image/webp",
+            "pipeline_s3_original_prefix": "/uploads/originals/",
+            "pipeline_s3_derivative_prefix": "uploads/derived/",
+            "s3_bucket": "MemExpert-Uploads",
+        }
+    )
+
+    assert settings.pipeline_allowed_mime_types == (
+        "image/jpeg",
+        "image/png",
+        "image/webp",
+    )
+    assert settings.pipeline_s3_original_prefix == "uploads/originals"
+    assert settings.pipeline_s3_derivative_prefix == "uploads/derived"
+    assert settings.s3_bucket == "memexpert-uploads"
+
+    broker_settings = get_pipeline_broker_settings(settings)
+    assert broker_settings.meme_created_routing_key == "pipeline.meme_created"
+    assert broker_settings.dead_letter_routing_key == "pipeline.dead_letter"
+
+
 def test_settings_default_cors_origin_policy_matches_memexpert_net_but_not_other_tlds() -> None:
     settings = Settings()
 
@@ -63,6 +106,26 @@ def test_settings_reject_blank_security_cors_allowed_origins() -> None:
 
 
 @pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        ({"pipeline_operator_token": "   "}, "pipeline_operator_token"),
+        ({"pipeline_broker_transcode_queue": "queue with spaces"}, "pipeline broker topology names"),
+        ({"pipeline_s3_original_prefix": "../escape"}, "object-key prefixes"),
+        ({"pipeline_allowed_mime_types": "jpeg"}, "MIME types"),
+        ({"s3_bucket": "BAD_BUCKET"}, "s3_bucket"),
+        ({"pipeline_broker_retry_max_attempts": 0}, "greater than or equal to 1"),
+        ({"pipeline_broker_retry_backoff_seconds": 0}, "greater than 0"),
+    ],
+)
+def test_settings_reject_invalid_pipeline_contracts(
+    payload: dict[str, object],
+    message: str,
+) -> None:
+    with pytest.raises(ValidationError, match=message):
+        _ = Settings.model_validate(payload)
+
+
+@pytest.mark.parametrize(
     "redis_url",
     [
         "",
@@ -74,6 +137,112 @@ def test_settings_reject_blank_security_cors_allowed_origins() -> None:
 def test_normalize_redis_url_rejects_invalid_values(redis_url: str) -> None:
     with pytest.raises(RedisConfigurationError):
         _ = normalize_redis_url(redis_url)
+
+
+@pytest.mark.parametrize(
+    "rabbitmq_url",
+    [
+        "",
+        "   ",
+        "http://broker.example:5672/",
+        "amqp://:badport/",
+    ],
+)
+def test_normalize_rabbitmq_url_rejects_invalid_values(rabbitmq_url: str) -> None:
+    with pytest.raises(BrokerConfigurationError):
+        _ = normalize_rabbitmq_url(rabbitmq_url)
+
+
+@pytest.mark.parametrize(
+    "s3_endpoint",
+    [
+        "",
+        "   ",
+        "amqp://storage.example:9000",
+        "http://:9000",
+    ],
+)
+def test_normalize_s3_endpoint_rejects_invalid_values(s3_endpoint: str) -> None:
+    with pytest.raises(StorageConfigurationError):
+        _ = normalize_s3_endpoint(s3_endpoint)
+
+
+@pytest.mark.parametrize(
+    "bucket_name",
+    [
+        "",
+        "   ",
+        "invalid_bucket",
+        "ab",
+        "192.168.1.10",
+    ],
+)
+def test_normalize_s3_bucket_name_rejects_invalid_values(bucket_name: str) -> None:
+    with pytest.raises(StorageConfigurationError):
+        _ = normalize_s3_bucket_name(bucket_name)
+
+
+def test_pipeline_runtime_helpers_are_lazy_until_verified() -> None:
+    settings = Settings.model_validate(
+        {
+            "rabbitmq_url": "amqp://guest:guest@127.0.0.1:9/",
+            "s3_endpoint": "http://127.0.0.1:9",
+            "s3_access_key": "test-access",
+            "s3_secret_key": "test-secret",
+            "s3_bucket": "memexpert-runtime",
+        }
+    )
+
+    broker = build_pipeline_broker(settings)
+    storage_client = cast("object", build_s3_client(settings))
+
+    assert broker is not None
+    assert storage_client is not None
+
+
+async def test_verify_pipeline_broker_reports_unreachable_runtime() -> None:
+    settings = Settings.model_validate(
+        {
+            "rabbitmq_url": "amqp://guest:guest@127.0.0.1:9/",
+            "pipeline_broker_connection_timeout_seconds": 0.2,
+        }
+    )
+
+    with pytest.raises(BrokerConnectionError, match=r"(Unable to verify|Timed out)"):
+        _ = await verify_pipeline_broker(settings, timeout=0.5)
+
+
+async def test_verify_s3_storage_reports_unreachable_runtime() -> None:
+    settings = Settings.model_validate(
+        {
+            "s3_endpoint": "http://127.0.0.1:9",
+            "s3_access_key": "test-access",
+            "s3_secret_key": "test-secret",
+            "s3_bucket": "memexpert-runtime",
+            "pipeline_storage_connection_timeout_seconds": 0.2,
+        }
+    )
+
+    client = cast("object", build_s3_client(settings))
+
+    with pytest.raises(StorageConnectionError, match=r"(Unable to verify|Timed out)"):
+        _ = await verify_s3_storage(client, settings, timeout=0.5)
+
+
+def test_pipeline_object_key_builders_follow_a_stable_contract() -> None:
+    meme_file_id = uuid.UUID("018f0f4d-37f1-7d32-9a60-7c84ec5f3acb")
+    settings = Settings.model_validate(
+        {
+            "pipeline_s3_original_prefix": "pipeline/originals",
+            "pipeline_s3_derivative_prefix": "pipeline/derived",
+        }
+    )
+
+    original_key = build_original_object_key(meme_file_id, "../strange name.JPEG", settings=settings)
+    web_video_key = build_web_video_object_key(meme_file_id, extension="MP4", settings=settings)
+
+    assert original_key == f"pipeline/originals/{meme_file_id}/original.jpeg"
+    assert web_video_key == f"pipeline/derived/{meme_file_id}/web.mp4"
 
 
 def test_get_settings_returns_cached_instance() -> None:

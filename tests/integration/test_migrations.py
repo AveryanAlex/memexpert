@@ -41,6 +41,7 @@ EXPECTED_TABLES = {
     "meme_templates",
     "memes",
     "pinned_memes",
+    "pipeline_stage_journal",
     "refresh_tokens",
     "source_channels",
     "telegram_file_id_cache",
@@ -52,6 +53,11 @@ ALEMBIC_TIMEOUT_SECONDS = 20.0
 
 class PrimaryKeyConstraintInfo(TypedDict):
     constrained_columns: list[str]
+
+
+class CheckConstraintInfo(TypedDict):
+    name: str | None
+    sqltext: str
 
 
 class ForeignKeyInfo(TypedDict):
@@ -67,6 +73,8 @@ class ConstraintSnapshot(TypedDict):
     meme_sources_uniques: dict[str, list[str]]
     source_channels_uniques: dict[str, list[str]]
     embedding_cache_uniques: dict[str, list[str]]
+    pipeline_stage_journal_uniques: dict[str, list[str]]
+    pipeline_stage_journal_checks: dict[str, str]
 
 
 def _build_alembic_config(database_url: str | None = None) -> Config:
@@ -161,6 +169,14 @@ def _inspect_constraints_sync(sync_connection: Connection) -> ConstraintSnapshot
     meme_sources_constraints = cast(list[dict[str, object]], inspector.get_unique_constraints("meme_sources"))
     source_channels_constraints = cast(list[dict[str, object]], inspector.get_unique_constraints("source_channels"))
     embedding_cache_constraints = cast(list[dict[str, object]], inspector.get_unique_constraints("embedding_cache"))
+    pipeline_stage_journal_uniques = cast(
+        list[dict[str, object]],
+        inspector.get_unique_constraints("pipeline_stage_journal"),
+    )
+    pipeline_stage_journal_checks = cast(
+        list[CheckConstraintInfo],
+        inspector.get_check_constraints("pipeline_stage_journal"),
+    )
 
     return {
         "collection_members_pk": cast(
@@ -180,6 +196,14 @@ def _inspect_constraints_sync(sync_connection: Connection) -> ConstraintSnapshot
         "embedding_cache_uniques": {
             cast(str, constraint["name"]): cast(list[str], constraint["column_names"])
             for constraint in embedding_cache_constraints
+        },
+        "pipeline_stage_journal_uniques": {
+            cast(str, constraint["name"]): cast(list[str], constraint["column_names"])
+            for constraint in pipeline_stage_journal_uniques
+        },
+        "pipeline_stage_journal_checks": {
+            str(constraint["name"]): constraint["sqltext"]
+            for constraint in pipeline_stage_journal_checks
         },
     }
 
@@ -202,9 +226,9 @@ def test_initial_revision_metadata_is_present() -> None:
     revision = script_directory.get_revision("head")
 
     assert revision is not None
-    assert revision.revision == "0002"
-    assert revision.down_revision == "0001"
-    assert revision.doc == "telegram link codes"
+    assert revision.revision == "0003"
+    assert revision.down_revision == "0002"
+    assert revision.doc == "pipeline stage journal"
 
 
 async def test_upgrade_head_creates_expected_schema_and_constraints(
@@ -217,14 +241,16 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
 
     table_names = await _get_table_names(engine)
     assert table_names == EXPECTED_TABLES | {"alembic_version"}
-    assert await _get_current_revision(engine) == "0002"
+    assert await _get_current_revision(engine) == "0003"
 
     users_indexes = await _get_index_definitions(engine, "users")
     collections_indexes = await _get_index_definitions(engine, "collections")
     meme_files_indexes = await _get_index_definitions(engine, "meme_files")
+    pipeline_stage_journal_indexes = await _get_index_definitions(engine, "pipeline_stage_journal")
     telegram_indexes = await _get_index_definitions(engine, "telegram_file_id_cache")
     telegram_link_indexes = await _get_index_definitions(engine, "telegram_link_codes")
     telegram_link_columns = await _get_column_names(engine, "telegram_link_codes")
+    pipeline_stage_journal_columns = await _get_column_names(engine, "pipeline_stage_journal")
     constraints = await _inspect_constraints(engine)
 
     assert "uq_users_email_not_null" in users_indexes
@@ -263,6 +289,42 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
     }
     assert constraints["embedding_cache_uniques"] == {
         "uq_embedding_cache_input_hash_model_version_input_type": ["input_hash", "model_version", "input_type"],
+    }
+    assert constraints["pipeline_stage_journal_uniques"] == {
+        "uq_pipeline_stage_journal_meme_file_id_stage": ["meme_file_id", "stage"],
+    }
+    pipeline_stage_journal_checks = " ".join(constraints["pipeline_stage_journal_checks"].values()).lower()
+    assert "attempt_count >= 0" in pipeline_stage_journal_checks
+    assert "ingest" in pipeline_stage_journal_checks
+    assert "transcode" in pipeline_stage_journal_checks
+    assert "sync_qdrant" in pipeline_stage_journal_checks
+    assert "sync_meili" in pipeline_stage_journal_checks
+    assert "duplicate" in pipeline_stage_journal_checks
+    assert "ix_pipeline_stage_journal_last_event_id" in pipeline_stage_journal_indexes
+    assert "last_event_id" in pipeline_stage_journal_indexes["ix_pipeline_stage_journal_last_event_id"]
+    assert "ix_pipeline_stage_journal_meme_file_id_updated_at" in pipeline_stage_journal_indexes
+    assert "meme_file_id" in pipeline_stage_journal_indexes["ix_pipeline_stage_journal_meme_file_id_updated_at"]
+    assert "updated_at" in pipeline_stage_journal_indexes["ix_pipeline_stage_journal_meme_file_id_updated_at"]
+    assert "ix_pipeline_stage_journal_stage_status" in pipeline_stage_journal_indexes
+    assert "stage" in pipeline_stage_journal_indexes["ix_pipeline_stage_journal_stage_status"]
+    assert "status" in pipeline_stage_journal_indexes["ix_pipeline_stage_journal_stage_status"]
+    assert "ix_pipeline_stage_journal_status_retry_after" in pipeline_stage_journal_indexes
+    assert "retry_after" in pipeline_stage_journal_indexes["ix_pipeline_stage_journal_status_retry_after"]
+    assert pipeline_stage_journal_columns == {
+        "attempt_count",
+        "created_at",
+        "finished_at",
+        "id",
+        "is_retryable",
+        "last_error_text",
+        "last_event_id",
+        "meme_file_id",
+        "normalized_reason",
+        "retry_after",
+        "stage",
+        "started_at",
+        "status",
+        "updated_at",
     }
     assert "uq_telegram_file_id_cache_file_format_scope" in telegram_indexes
     assert "UNIQUE INDEX uq_telegram_file_id_cache_file_format_scope" in telegram_indexes[
@@ -311,7 +373,7 @@ async def test_repeated_fresh_database_upgrades_work_after_a_full_downgrade(
     await _run_alembic_command(command.downgrade, config, "base")
     await _run_alembic_command(command.upgrade, config, "head")
 
-    assert await _get_current_revision(engine) == "0002"
+    assert await _get_current_revision(engine) == "0003"
     assert EXPECTED_TABLES.issubset(await _get_table_names(engine))
 
 

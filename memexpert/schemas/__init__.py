@@ -12,6 +12,14 @@ from memexpert.schemas.auth import (
     RefreshCookieMetadata,
 )
 from memexpert.schemas.collection import CollectionInviteRead, CollectionMemberRead, CollectionRead
+from memexpert.schemas.content_pipeline import (
+    ContentPipelineDispatchEvent,
+    ContentPipelineEventType,
+    ContentPipelineItemRead,
+    ContentPipelineReplayAccepted,
+    ContentPipelineReplayRequest,
+    ContentPipelineStageJournalRead,
+)
 from memexpert.schemas.user import (
     AccountDeletionLogRead,
     AccountMergeLogRead,
@@ -33,6 +41,12 @@ __all__ = [
     "CollectionInviteRead",
     "CollectionMemberRead",
     "CollectionRead",
+    "ContentPipelineDispatchEvent",
+    "ContentPipelineEventType",
+    "ContentPipelineItemRead",
+    "ContentPipelineReplayAccepted",
+    "ContentPipelineReplayRequest",
+    "ContentPipelineStageJournalRead",
     "EmailCredentialsRequest",
     "EmailLoginRequest",
     "EmailSignupRequest",

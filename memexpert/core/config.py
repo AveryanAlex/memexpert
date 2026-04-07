@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import timedelta
 from functools import lru_cache
 from typing import Annotated, ClassVar, Literal, cast
@@ -33,7 +34,15 @@ SECURITY_DEFAULT_ALLOWED_HEADERS = (
     "Content-Type",
     "X-Requested-With",
 )
+PIPELINE_DEFAULT_ALLOWED_MIME_TYPES = (
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "image/gif",
+)
 _ALLOWED_ORIGIN_LIST_ADAPTER = TypeAdapter(tuple[AnyHttpUrl, ...])
+_PIPELINE_TOPOLOGY_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_PIPELINE_BUCKET_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
 
 
 class Settings(BaseSettings):
@@ -53,6 +62,22 @@ class Settings(BaseSettings):
     s3_bucket: str = "memexpert"
     s3_region: str = "us-east-1"
     imgproxy_base_url: str = "http://localhost:8080"
+    pipeline_operator_token: SecretStr = SecretStr("memexpert-dev-pipeline-operator-token-min-32")
+    pipeline_upload_max_bytes: int = Field(default=20 * 1024 * 1024, gt=0)
+    pipeline_allowed_mime_types: Annotated[tuple[str, ...], NoDecode] = PIPELINE_DEFAULT_ALLOWED_MIME_TYPES
+    pipeline_phash_size: int = Field(default=16, ge=4, le=64)
+    pipeline_image_max_pixels: int = Field(default=45_000_000, gt=0)
+    pipeline_s3_original_prefix: str = "pipeline/originals"
+    pipeline_s3_derivative_prefix: str = "pipeline/derived"
+    pipeline_broker_exchange: str = "memexpert.pipeline"
+    pipeline_broker_routing_key_prefix: str = "pipeline"
+    pipeline_broker_transcode_queue: str = "pipeline.transcode"
+    pipeline_broker_dead_letter_exchange: str = "memexpert.pipeline.dlx"
+    pipeline_broker_dead_letter_queue: str = "pipeline.dlq"
+    pipeline_broker_retry_max_attempts: int = Field(default=5, ge=1, le=32)
+    pipeline_broker_retry_backoff_seconds: float = Field(default=5.0, gt=0.0, le=3600.0)
+    pipeline_broker_connection_timeout_seconds: float = Field(default=5.0, gt=0.0)
+    pipeline_storage_connection_timeout_seconds: float = Field(default=5.0, gt=0.0)
     auth_jwt_secret: SecretStr = SecretStr("memexpert-dev-jwt-secret-with-32-byte-minimum")
     auth_access_token_algorithm: Literal["HS256"] = "HS256"
     auth_access_token_ttl_seconds: int = 900
@@ -92,6 +117,106 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+    @field_validator("rabbitmq_url", "s3_endpoint", "s3_access_key", "s3_secret_key", "s3_region", mode="before")
+    @classmethod
+    def _normalize_required_runtime_text(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+
+        normalized_value = value.strip()
+        if not normalized_value:
+            raise ValueError("runtime settings must not be blank.")
+        return normalized_value
+
+    @field_validator("pipeline_operator_token", mode="before")
+    @classmethod
+    def _normalize_pipeline_operator_token(cls, value: object) -> object:
+        if value is None:
+            return value
+
+        raw_value = value.get_secret_value() if isinstance(value, SecretStr) else value
+
+        if not isinstance(raw_value, str):
+            return value
+
+        normalized_value = raw_value.strip()
+        if not normalized_value:
+            raise ValueError("pipeline_operator_token must not be blank.")
+        return normalized_value
+
+    @field_validator(
+        "pipeline_broker_exchange",
+        "pipeline_broker_routing_key_prefix",
+        "pipeline_broker_transcode_queue",
+        "pipeline_broker_dead_letter_exchange",
+        "pipeline_broker_dead_letter_queue",
+        mode="before",
+    )
+    @classmethod
+    def _normalize_pipeline_broker_name(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+
+        normalized_value = value.strip()
+        if not normalized_value:
+            raise ValueError("pipeline broker topology names must not be blank.")
+        if _PIPELINE_TOPOLOGY_NAME_RE.fullmatch(normalized_value) is None:
+            raise ValueError(
+                "pipeline broker topology names may contain only letters, numbers, dots, underscores, and hyphens.",
+            )
+        return normalized_value
+
+    @field_validator("pipeline_s3_original_prefix", "pipeline_s3_derivative_prefix", mode="before")
+    @classmethod
+    def _normalize_pipeline_object_prefix(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+
+        normalized_value = value.strip().strip("/")
+        if not normalized_value:
+            raise ValueError("pipeline object-key prefixes must not be blank.")
+
+        segments = tuple(segment for segment in normalized_value.split("/") if segment)
+        if not segments or any(segment in {".", ".."} for segment in segments):
+            raise ValueError("pipeline object-key prefixes must not contain empty, '.', or '..' path segments.")
+        return "/".join(segments)
+
+    @field_validator("s3_bucket", mode="before")
+    @classmethod
+    def _normalize_s3_bucket(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+
+        normalized_value = value.strip().lower()
+        if not normalized_value:
+            raise ValueError("s3_bucket must not be blank.")
+        if len(normalized_value) < 3 or len(normalized_value) > 63:
+            raise ValueError("s3_bucket must be between 3 and 63 characters long.")
+        if _PIPELINE_BUCKET_NAME_RE.fullmatch(normalized_value) is None:
+            raise ValueError("s3_bucket may contain only lowercase letters, numbers, dots, and hyphens.")
+        if normalized_value.count(".") == 3 and all(part.isdigit() for part in normalized_value.split(".")):
+            raise ValueError("s3_bucket must not be formatted like an IP address.")
+        return normalized_value
+
+    @field_validator("pipeline_allowed_mime_types", mode="before")
+    @classmethod
+    def _normalize_pipeline_allowed_mime_types(cls, value: object) -> object:
+        if value is None:
+            return value
+
+        raw_mime_types = cls._coerce_env_sequence(value)
+        normalized_mime_types = tuple(
+            dict.fromkeys(mime_type.strip().lower() for mime_type in raw_mime_types if mime_type.strip())
+        )
+        if not normalized_mime_types:
+            raise ValueError("pipeline_allowed_mime_types must include at least one MIME type.")
+        if any(
+            "/" not in mime_type or mime_type.startswith("/") or mime_type.endswith("/")
+            for mime_type in normalized_mime_types
+        ):
+            raise ValueError("pipeline_allowed_mime_types must contain MIME types like image/jpeg.")
+        return normalized_mime_types
 
     @field_validator("auth_telegram_bot_username", mode="before")
     @classmethod

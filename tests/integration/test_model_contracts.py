@@ -24,6 +24,7 @@ from memexpert.models.content import (
     MemeSeoPage,
     MemeSource,
     MemeTemplate,
+    PipelineStageJournal,
     SourceChannel,
     TelegramFileIdCache,
 )
@@ -39,6 +40,8 @@ from memexpert.models.enums import (
     CollectionVisibility,
     ContentKind,
     ContentLanguage,
+    ContentPipelineStage,
+    ContentPipelineStageStatus,
     ContentProcessingStatus,
     EmbeddingInputType,
     SourcePlatform,
@@ -55,7 +58,13 @@ from memexpert.models.user import (
     TelegramLinkCode,
     User,
 )
-from memexpert.schemas import CollectionRead, UserRead
+from memexpert.schemas import (
+    CollectionRead,
+    ContentPipelineDispatchEvent,
+    ContentPipelineEventType,
+    ContentPipelineStageJournalRead,
+    UserRead,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -80,6 +89,7 @@ EXPECTED_TABLES = {
     "meme_templates",
     "memes",
     "pinned_memes",
+    "pipeline_stage_journal",
     "refresh_tokens",
     "source_channels",
     "telegram_file_id_cache",
@@ -108,7 +118,11 @@ async def model_contract_session_factory(
 
 async def _get_table_names(engine: AsyncEngine) -> set[str]:
     async with engine.connect() as connection:
-        return await connection.run_sync(lambda sync_conn: set(sa_inspect(sync_conn).get_table_names()))
+        return await connection.run_sync(_get_table_names_sync)
+
+
+def _get_table_names_sync(sync_connection: object) -> set[str]:
+    return set(sa_inspect(sync_connection).get_table_names())
 
 
 def _postgresql_where(index_name: str, table_name: str) -> str | None:
@@ -134,12 +148,14 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
 
     user_relationships = sa_inspect(User).relationships
     meme_relationships = sa_inspect(Meme).relationships
+    meme_file_relationships = sa_inspect(MemeFile).relationships
 
     assert user_relationships["active_save_collection"].mapper.class_ is Collection
     assert user_relationships["owned_collections"].mapper.class_ is Collection
     assert user_relationships["telegram_link_codes"].mapper.class_ is TelegramLinkCode
     assert meme_relationships["files"].mapper.class_ is MemeFile
     assert meme_relationships["primary_file"].mapper.class_ is MemeFile
+    assert meme_file_relationships["pipeline_stage_journal_entries"].mapper.class_ is PipelineStageJournal
 
 
 async def test_metadata_creates_full_schema_on_postgres(postgres_async_engine: AsyncEngine) -> None:
@@ -300,6 +316,55 @@ async def test_schema_handles_cycles_multi_invites_and_nullable_content_fields(
                     model_version="voyage-multimodal-3.5",
                     source_file=file_one,
                 ),
+                PipelineStageJournal(
+                    meme_file=file_one,
+                    stage=ContentPipelineStage.INGEST,
+                    status=ContentPipelineStageStatus.SUCCEEDED,
+                    attempt_count=1,
+                    last_event_id=uuid.uuid7(),
+                    is_retryable=False,
+                    started_at=utcnow(),
+                    finished_at=utcnow(),
+                ),
+                PipelineStageJournal(
+                    meme_file=file_one,
+                    stage=ContentPipelineStage.TRANSCODE,
+                    status=ContentPipelineStageStatus.PENDING,
+                    attempt_count=0,
+                    last_event_id=uuid.uuid7(),
+                    is_retryable=True,
+                    retry_after=utcnow() + timedelta(minutes=5),
+                ),
+                PipelineStageJournal(
+                    meme_file=file_one,
+                    stage=ContentPipelineStage.SYNC_QDRANT,
+                    status=ContentPipelineStageStatus.PENDING,
+                    attempt_count=0,
+                    last_event_id=uuid.uuid7(),
+                    is_retryable=True,
+                ),
+                PipelineStageJournal(
+                    meme_file=file_one,
+                    stage=ContentPipelineStage.SYNC_MEILI,
+                    status=ContentPipelineStageStatus.FAILED,
+                    attempt_count=2,
+                    last_event_id=uuid.uuid7(),
+                    normalized_reason="forced_failure",
+                    last_error_text="stub transcode failed",
+                    is_retryable=True,
+                    retry_after=utcnow() + timedelta(minutes=1),
+                    started_at=utcnow(),
+                ),
+                PipelineStageJournal(
+                    meme_file=file_two,
+                    stage=ContentPipelineStage.INGEST,
+                    status=ContentPipelineStageStatus.DUPLICATE,
+                    attempt_count=1,
+                    last_event_id=uuid.uuid7(),
+                    normalized_reason="duplicate_perceptual_hash",
+                    is_retryable=False,
+                    finished_at=utcnow(),
+                ),
                 CollectionMeme(collection=shared, meme=meme, added_by_user=owner),
                 PinnedMeme(user=owner, meme=meme, position=1),
                 RefreshToken(
@@ -370,10 +435,32 @@ async def test_schema_handles_cycles_multi_invites_and_nullable_content_fields(
         )
         assert len(shared_collection.invites) == 2
 
-        meme_result = await session.execute(select(Meme).options(selectinload(Meme.files)).where(Meme.id == meme.id))
+        meme_result = await session.execute(
+            select(Meme)
+            .options(selectinload(Meme.files).selectinload(MemeFile.pipeline_stage_journal_entries))
+            .where(Meme.id == meme.id)
+        )
         persisted_meme = meme_result.scalar_one()
         assert persisted_meme.primary_file_id == file_one.id
         assert len(persisted_meme.files) == 2
+        assert len(persisted_meme.files[0].pipeline_stage_journal_entries) + len(
+            persisted_meme.files[1].pipeline_stage_journal_entries
+        ) == 5
+        assert {
+            entry.stage
+            for meme_file in persisted_meme.files
+            for entry in meme_file.pipeline_stage_journal_entries
+        } >= {
+            ContentPipelineStage.INGEST,
+            ContentPipelineStage.TRANSCODE,
+            ContentPipelineStage.SYNC_QDRANT,
+            ContentPipelineStage.SYNC_MEILI,
+        }
+        assert any(
+            entry.status is ContentPipelineStageStatus.DUPLICATE
+            for meme_file in persisted_meme.files
+            for entry in meme_file.pipeline_stage_journal_entries
+        )
 
 
 async def test_constraints_reject_duplicate_provider_ids_and_duplicate_favorites(
@@ -456,6 +543,49 @@ async def test_constraints_reject_multiple_primary_files_for_one_meme(
             await session.commit()
 
 
+async def test_pipeline_stage_journal_enforces_one_latest_row_per_stage(
+    model_contract_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with model_contract_session_factory() as session:
+        meme = Meme(media_type=ContentKind.IMAGE)
+        session.add(meme)
+        await session.flush()
+
+        meme_file = MemeFile(
+            meme=meme,
+            status=ContentProcessingStatus.PENDING,
+            s3_original_key="pipeline/originals/file/original.jpg",
+            is_primary=True,
+        )
+        session.add(meme_file)
+        await session.flush()
+
+        session.add_all(
+            [
+                PipelineStageJournal(
+                    meme_file=meme_file,
+                    stage=ContentPipelineStage.TRANSCODE,
+                    status=ContentPipelineStageStatus.PENDING,
+                    attempt_count=0,
+                    last_event_id=uuid.uuid7(),
+                    is_retryable=True,
+                ),
+                PipelineStageJournal(
+                    meme_file=meme_file,
+                    stage=ContentPipelineStage.TRANSCODE,
+                    status=ContentPipelineStageStatus.FAILED,
+                    attempt_count=1,
+                    last_event_id=uuid.uuid7(),
+                    normalized_reason="duplicate_stage_row",
+                    is_retryable=False,
+                ),
+            ]
+        )
+
+        with pytest.raises(IntegrityError):
+            await session.commit()
+
+
 def test_public_schemas_validate_from_attributes_and_reject_invalid_enums() -> None:
     now = utcnow()
     user_id = uuid.uuid7()
@@ -514,7 +644,7 @@ def test_public_schemas_validate_from_attributes_and_reject_invalid_enums() -> N
     assert collection_payload["invites"][0]["channel"] == CollectionInviteChannel.DIRECT_LINK.value
 
     with pytest.raises(ValidationError):
-        UserRead.model_validate(
+        _ = UserRead.model_validate(
             {
                 "id": user.id,
                 "account_type": "broken",
@@ -533,5 +663,79 @@ def test_public_schemas_validate_from_attributes_and_reject_invalid_enums() -> N
                 "deleted_at": None,
                 "created_at": now,
                 "updated_at": now,
+            }
+        )
+
+
+def test_content_pipeline_schemas_reject_invalid_stage_names_and_raw_media_payloads() -> None:
+    now = utcnow()
+    event_id = uuid.uuid7()
+    meme_id = uuid.uuid7()
+    meme_file_id = uuid.uuid7()
+    journal_entry = PipelineStageJournal(
+        id=uuid.uuid7(),
+        meme_file_id=meme_file_id,
+        stage=ContentPipelineStage.SYNC_MEILI,
+        status=ContentPipelineStageStatus.FAILED,
+        attempt_count=2,
+        last_event_id=event_id,
+        normalized_reason="forced_failure",
+        last_error_text="stub stage failed",
+        is_retryable=True,
+        retry_after=now,
+        started_at=now,
+        finished_at=now,
+        created_at=now,
+        updated_at=now,
+    )
+
+    event_payload = ContentPipelineDispatchEvent.model_validate(
+        {
+            "event_id": event_id,
+            "event_type": ContentPipelineEventType.MEME_CREATED.value,
+            "meme_id": meme_id,
+            "meme_file_id": meme_file_id,
+            "stage": ContentPipelineStage.TRANSCODE.value,
+            "source_kind": "manual_upload",
+            "original_object_key": "pipeline/originals/file/original.jpeg",
+            "attempt": 1,
+            "created_at": now,
+        }
+    ).model_dump(mode="json")
+    journal_payload = ContentPipelineStageJournalRead.model_validate(journal_entry).model_dump(mode="json")
+
+    assert event_payload["stage"] == ContentPipelineStage.TRANSCODE.value
+    assert event_payload["event_type"] == ContentPipelineEventType.MEME_CREATED.value
+    assert journal_payload["status"] == ContentPipelineStageStatus.FAILED.value
+    assert journal_payload["normalized_reason"] == "forced_failure"
+
+    with pytest.raises(ValidationError):
+        _ = ContentPipelineDispatchEvent.model_validate(
+            {
+                "event_id": event_id,
+                "event_type": ContentPipelineEventType.MEME_CREATED.value,
+                "meme_id": meme_id,
+                "meme_file_id": meme_file_id,
+                "stage": "unsupported_stage",
+                "source_kind": "manual_upload",
+                "original_object_key": "pipeline/originals/file/original.jpeg",
+                "attempt": 1,
+                "created_at": now,
+            }
+        )
+
+    with pytest.raises(ValidationError):
+        _ = ContentPipelineDispatchEvent.model_validate(
+            {
+                "event_id": event_id,
+                "event_type": ContentPipelineEventType.MEME_CREATED.value,
+                "meme_id": meme_id,
+                "meme_file_id": meme_file_id,
+                "stage": ContentPipelineStage.TRANSCODE.value,
+                "source_kind": "manual_upload",
+                "original_object_key": "pipeline/originals/file/original.jpeg",
+                "attempt": 1,
+                "created_at": now,
+                "raw_media_bytes": "still-not-allowed",
             }
         )
