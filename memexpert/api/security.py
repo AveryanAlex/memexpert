@@ -8,7 +8,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from http import HTTPStatus
-from typing import Final, cast
+from typing import Final, TypedDict, cast
 
 from fastapi import Request
 from fastapi.responses import JSONResponse, Response
@@ -126,7 +126,17 @@ class SecuritySubjectResolutionError(RuntimeError):
     """Raised when a protected request cannot be mapped to a limiter subject."""
 
 
-def build_security_cors_middleware_kwargs(settings: Settings | None = None) -> dict[str, object]:
+class SecurityCORSMiddlewareKwargs(TypedDict):
+    """Typed subset of CORSMiddleware kwargs used by the shared API app."""
+
+    allow_origins: list[str]
+    allow_origin_regex: str | None
+    allow_credentials: bool
+    allow_methods: list[str]
+    allow_headers: list[str]
+
+
+def build_security_cors_middleware_kwargs(settings: Settings | None = None) -> SecurityCORSMiddlewareKwargs:
     """Build the explicit credentialed CORS configuration for the shared API app."""
 
     resolved_settings = settings or get_settings()

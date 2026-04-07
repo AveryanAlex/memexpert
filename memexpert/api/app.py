@@ -25,7 +25,15 @@ def create_app() -> FastAPI:
     app.add_exception_handler(AuthHTTPError, auth_http_exception_handler)
     app.add_exception_handler(SecurityHTTPError, security_http_exception_handler)
     app.middleware("http")(security_http_middleware)
-    app.add_middleware(CORSMiddleware, **build_security_cors_middleware_kwargs(settings))
+    cors_middleware_kwargs = build_security_cors_middleware_kwargs(settings)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_middleware_kwargs["allow_origins"],
+        allow_origin_regex=cors_middleware_kwargs["allow_origin_regex"],
+        allow_credentials=cors_middleware_kwargs["allow_credentials"],
+        allow_methods=cors_middleware_kwargs["allow_methods"],
+        allow_headers=cors_middleware_kwargs["allow_headers"],
+    )
     app.include_router(health_router)
     app.include_router(v1_router)
     return app

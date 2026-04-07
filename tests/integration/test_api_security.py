@@ -10,7 +10,8 @@ from sqlalchemy import func, select
 
 from memexpert.core.config import Settings
 from memexpert.core.redis import get_async_redis, is_async_redis_initialized, reset_async_redis_state
-from memexpert.models.user import User
+from memexpert.models.user import RefreshToken, User
+from memexpert.services import ProviderAuthService
 
 if TYPE_CHECKING:
     from httpx import AsyncClient
@@ -54,6 +55,15 @@ def _build_cors_preflight_headers(
         "Access-Control-Request-Method": "POST",
         "Access-Control-Request-Headers": requested_headers,
     }
+
+
+async def _count_auth_side_effects(
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> tuple[int, int]:
+    async with postgres_session_factory() as session:
+        user_count_result = await session.execute(select(func.count()).select_from(User))
+        refresh_token_count_result = await session.execute(select(func.count()).select_from(RefreshToken))
+        return user_count_result.scalar_one(), refresh_token_count_result.scalar_one()
 
 
 async def test_safe_read_routes_keep_redis_runtime_lazy_until_first_protected_request(
@@ -197,6 +207,83 @@ async def test_auth_write_rate_limit_state_isolated_between_tests(
     assert guest_response.headers["X-RateLimit-Remaining"] == "1"
     assert refresh_response.status_code == 200
     assert refresh_response.headers["X-RateLimit-Remaining"] == "0"
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_loc"),
+    [
+        ({"unexpected": "boom"}, ["body", "unexpected"]),
+        ({"nsfw_enabled": "true"}, ["body", "nsfw_enabled"]),
+    ],
+)
+async def test_guest_bootstrap_validation_rejects_extra_fields_and_bool_coercion_before_side_effects(
+    security_client: AsyncClient,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    payload: dict[str, object],
+    expected_loc: list[str],
+) -> None:
+    response = await security_client.post("/api/v1/auth/guest", json=payload)
+    validation_errors = response.json()["detail"]
+
+    assert response.status_code == 422
+    assert expected_loc in [error["loc"] for error in validation_errors]
+    assert await _count_auth_side_effects(postgres_session_factory) == (0, 0)
+
+
+async def test_email_signup_validation_rejects_extra_fields_before_side_effects(
+    security_client: AsyncClient,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    response = await security_client.post(
+        "/api/v1/auth/email/signup",
+        json={
+            "email": "routeuser@example.com",
+            "password": "correct-horse-battery",
+            "unexpected": "boom",
+        },
+    )
+    validation_errors = response.json()["detail"]
+
+    assert response.status_code == 422
+    assert ["body", "unexpected"] in [error["loc"] for error in validation_errors]
+    assert await _count_auth_side_effects(postgres_session_factory) == (0, 0)
+
+
+async def test_google_auth_validation_rejects_extra_fields_before_provider_calls(
+    security_client: AsyncClient,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, str | None]] = []
+
+    async def fake_authenticate_with_google_code(
+        self: ProviderAuthService,
+        *,
+        code: str,
+        device_info: str | None = None,
+    ) -> object:
+        calls.append((code, device_info))
+        raise AssertionError("Google provider auth should not run when request validation fails.")
+
+    monkeypatch.setattr(
+        ProviderAuthService,
+        "authenticate_with_google_code",
+        fake_authenticate_with_google_code,
+    )
+
+    response = await security_client.post(
+        "/api/v1/auth/google",
+        json={
+            "code": "route-google-code",
+            "unexpected": "boom",
+        },
+    )
+    validation_errors = response.json()["detail"]
+
+    assert response.status_code == 422
+    assert ["body", "unexpected"] in [error["loc"] for error in validation_errors]
+    assert calls == []
+    assert await _count_auth_side_effects(postgres_session_factory) == (0, 0)
 
 
 @pytest.mark.parametrize(

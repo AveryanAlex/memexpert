@@ -8,7 +8,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 
 from memexpert.models.enums import UserLanguage
 from memexpert.schemas.user import UserRead
@@ -43,8 +43,10 @@ class AuthErrorCode(StrEnum):
 class GuestBootstrapRequest(BaseModel):
     """Optional guest-account preferences accepted at session bootstrap time."""
 
+    model_config = ConfigDict(extra="forbid")
+
     language: UserLanguage = UserLanguage.ANY
-    nsfw_enabled: bool = False
+    nsfw_enabled: StrictBool = False
     device_info: str | None = Field(default=None, max_length=MAX_DEVICE_INFO_LENGTH)
 
     @field_validator("device_info")
@@ -124,6 +126,8 @@ class TelegramLinkStartRead(BaseModel):
 
 class EmailCredentialsRequest(BaseModel):
     """Shared request body for email/password authentication entrypoints."""
+
+    model_config = ConfigDict(extra="forbid")
 
     email: str
     password: str = Field(min_length=MIN_PASSWORD_LENGTH, max_length=MAX_PASSWORD_LENGTH)
