@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import uuid
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from pydantic import ValidationError
@@ -13,6 +13,7 @@ from memexpert.core.broker import (
     BrokerConfigurationError,
     BrokerConnectionError,
     build_pipeline_broker,
+    ensure_pipeline_broker_started,
     get_pipeline_broker_settings,
     normalize_rabbitmq_url,
     verify_pipeline_broker,
@@ -32,6 +33,23 @@ from memexpert.core.storage import (
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+
+class StartableBroker:
+    """FastStream-like broker double that records ping/start behavior."""
+
+    def __init__(self) -> None:
+        self.started = False
+        self.start_calls = 0
+        self.ping_timeouts: list[float | None] = []
+
+    async def ping(self, timeout: float | None) -> bool:
+        self.ping_timeouts.append(timeout)
+        return self.started
+
+    async def start(self) -> None:
+        self.start_calls += 1
+        self.started = True
 
 
 def test_settings_load_from_env_file_and_ignore_extra(
@@ -198,6 +216,24 @@ def test_pipeline_runtime_helpers_are_lazy_until_verified() -> None:
 
     assert broker is not None
     assert storage_client is not None
+
+
+async def test_ensure_pipeline_broker_started_starts_an_unconnected_broker_once() -> None:
+    settings = Settings.model_validate(
+        {
+            "rabbitmq_url": "amqp://guest:guest@127.0.0.1:5672/",
+            "pipeline_broker_connection_timeout_seconds": 0.2,
+        }
+    )
+    broker = StartableBroker()
+
+    first = await ensure_pipeline_broker_started(cast("Any", broker), settings=settings)
+    second = await ensure_pipeline_broker_started(cast("Any", broker), settings=settings)
+
+    assert cast("Any", first) is broker
+    assert cast("Any", second) is broker
+    assert broker.start_calls == 1
+    assert broker.ping_timeouts == [0.2, 0.2, 0.2]
 
 
 async def test_verify_pipeline_broker_reports_unreachable_runtime() -> None:

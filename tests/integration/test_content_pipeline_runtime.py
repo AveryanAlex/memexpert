@@ -6,7 +6,7 @@ import json
 import uuid
 from dataclasses import dataclass, field
 from io import BytesIO
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from PIL import Image
 
@@ -147,8 +147,8 @@ async def test_pipeline_runtime_declares_explicit_retry_and_dlx_topology() -> No
         recorded_queues[queue.name] = recorded_queue
         return recorded_queue
 
-    broker.declare_exchange = declare_exchange  # type: ignore[method-assign]
-    broker.declare_queue = declare_queue  # type: ignore[method-assign]
+    cast("Any", broker).declare_exchange = declare_exchange
+    cast("Any", broker).declare_queue = declare_queue
 
     await runtime.declare_topology()
 
@@ -317,7 +317,7 @@ async def test_pipeline_runtime_dead_letters_malformed_dispatch_payloads_and_mar
             }
         )
 
-    broker.publish = publish_dead_letter  # type: ignore[method-assign]
+    cast("Any", broker).publish = publish_dead_letter
     malformed_message = FakeRabbitMessage(message_id="malformed-message")
     malformed_payload = {
         "meme_file_id": str(item.meme_file_id),

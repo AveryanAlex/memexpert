@@ -18,7 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import selectinload
 
-from memexpert.core.broker import get_pipeline_broker, get_pipeline_broker_settings
+from memexpert.core.broker import ensure_pipeline_broker_started, get_pipeline_broker_settings
 from memexpert.core.config import Settings, get_settings
 from memexpert.core.storage import (
     build_original_object_key,
@@ -733,7 +733,7 @@ class ContentPipelineService:
             return
 
     async def _publish_dispatch_event(self, event: ContentPipelineDispatchEvent) -> None:
-        broker = get_pipeline_broker()
+        broker = await ensure_pipeline_broker_started(settings=self._settings)
         payload = event.model_dump(mode="json")
         _ = await broker.publish(
             payload,

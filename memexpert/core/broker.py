@@ -95,6 +95,7 @@ class BrokerConnectionError(RuntimeError):
 
 
 _rabbitmq_broker: RabbitBroker | None = None
+_rabbitmq_broker_start_lock: asyncio.Lock | None = None
 
 
 async def _maybe_await(result: object) -> None:
@@ -212,6 +213,43 @@ def is_pipeline_broker_initialized() -> bool:
     return _rabbitmq_broker is not None
 
 
+async def ensure_pipeline_broker_started(
+    broker: RabbitBroker | None = None,
+    *,
+    settings: Settings | None = None,
+) -> RabbitBroker:
+    """Connect the lazy FastStream broker on first publish and reuse it afterward."""
+
+    global _rabbitmq_broker_start_lock
+
+    resolved_broker = broker or get_pipeline_broker()
+    broker_settings = get_pipeline_broker_settings(settings)
+    redacted_url = _redact_rabbitmq_url(broker_settings.url)
+
+    try:
+        if await resolved_broker.ping(broker_settings.connection_timeout):
+            return resolved_broker
+    except Exception:
+        pass
+
+    if _rabbitmq_broker_start_lock is None:
+        _rabbitmq_broker_start_lock = asyncio.Lock()
+
+    async with _rabbitmq_broker_start_lock:
+        try:
+            if await resolved_broker.ping(broker_settings.connection_timeout):
+                return resolved_broker
+        except Exception:
+            pass
+
+        try:
+            await resolved_broker.start()
+        except Exception as exc:
+            raise BrokerConnectionError(f"Unable to start RabbitMQ broker {redacted_url}: {exc}") from exc
+
+    return resolved_broker
+
+
 async def verify_pipeline_broker(
     settings: Settings | None = None,
     *,
@@ -292,10 +330,11 @@ async def verify_pipeline_broker(
 async def reset_pipeline_broker_state() -> None:
     """Dispose the cached FastStream broker so test/runtime state cannot leak."""
 
-    global _rabbitmq_broker
+    global _rabbitmq_broker, _rabbitmq_broker_start_lock
 
     cached_broker = _rabbitmq_broker
     _rabbitmq_broker = None
+    _rabbitmq_broker_start_lock = None
 
     if cached_broker is None:
         return
@@ -314,6 +353,7 @@ __all__ = [
     "DEFAULT_RABBITMQ_CONNECTION_TIMEOUT_SECONDS",
     "PipelineBrokerSettings",
     "build_pipeline_broker",
+    "ensure_pipeline_broker_started",
     "get_pipeline_broker",
     "get_pipeline_broker_settings",
     "is_pipeline_broker_initialized",

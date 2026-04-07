@@ -1,3 +1,4 @@
+# ruff: noqa: TC002
 """FastStream RabbitMQ runtime for the stub transcode worker."""
 
 from __future__ import annotations
@@ -7,10 +8,11 @@ import json
 import uuid
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import Any, Protocol, cast
 
 from faststream import AckPolicy
 from faststream.rabbit import ExchangeType, RabbitBroker, RabbitExchange, RabbitQueue
+from faststream.rabbit.annotations import RabbitMessage
 from pydantic import ValidationError
 
 from memexpert.core.broker import PipelineBrokerSettings, get_pipeline_broker, get_pipeline_broker_settings
@@ -19,9 +21,6 @@ from memexpert.core.database import AsyncSessionFactory, get_async_session_facto
 from memexpert.models.enums import ContentPipelineStage
 from memexpert.schemas.content_pipeline import ContentPipelineDispatchEvent
 from memexpert.services import ContentPipelineService
-
-if TYPE_CHECKING:
-    from faststream.rabbit.annotations import RabbitMessage
 
 PIPELINE_REASON_FORCED_TRANSCODE_FAILURE = "forced_transcode_failure"
 PIPELINE_REASON_MALFORMED_EVENT = "malformed_dispatch_event"

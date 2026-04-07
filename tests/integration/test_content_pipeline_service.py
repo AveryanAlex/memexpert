@@ -11,6 +11,7 @@ from PIL import Image
 from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
 
+import memexpert.services.content_pipeline as content_pipeline_module
 from memexpert.models.content import Meme, MemeFile, MemeSource, PipelineStageJournal
 from memexpert.models.enums import ContentPipelineStage, ContentPipelineStageStatus, SourcePlatform
 from memexpert.schemas.content_pipeline import ContentPipelineDispatchEvent, ContentPipelineUploadMetadata
@@ -89,6 +90,27 @@ class RecordingPublisher:
             raise self.fail_with
 
         self.events.append(event)
+
+
+@dataclass(slots=True)
+class StartableBroker:
+    """FastStream-like broker double that requires start() before publish()."""
+
+    started: bool = False
+    start_calls: int = 0
+    publish_calls: list[dict[str, object]] = field(default_factory=list)
+
+    async def ping(self) -> bool:
+        return self.started
+
+    async def start(self) -> None:
+        self.start_calls += 1
+        self.started = True
+
+    async def publish(self, payload: object, **kwargs: object) -> None:
+        if not self.started:
+            raise RuntimeError("publish called before broker.start()")
+        self.publish_calls.append({"payload": payload, **kwargs})
 
 
 def build_png_bytes(*, color: tuple[int, int, int]) -> bytes:
@@ -181,6 +203,42 @@ async def test_create_upload_persists_before_publish_and_exposes_pending_downstr
         assert persisted_source.source_id == "memexpert_channel"
         assert persisted_source.post_id == "1001"
         assert len(persisted_journal_rows) == 2
+
+
+async def test_create_upload_starts_lazy_broker_before_real_publish(
+    migrated_db_session: AsyncSession,
+    monkeypatch: MonkeyPatch,
+) -> None:
+    storage_client = FakeStorageClient()
+    broker = StartableBroker()
+
+    async def fake_ensure_pipeline_broker_started(*_: object, **__: object) -> object:
+        await broker.start()
+        return broker
+
+    monkeypatch.setattr(content_pipeline_module, "ensure_pipeline_broker_started", fake_ensure_pipeline_broker_started)
+
+    service = ContentPipelineService(
+        migrated_db_session,
+        storage_client=storage_client,
+    )
+
+    item = await service.create_upload(
+        metadata=ContentPipelineUploadMetadata(
+            source_platform=SourcePlatform.TELEGRAM,
+            source_id="broker-start",
+            post_id="1002",
+            views=7,
+        ),
+        filename="broker-start.png",
+        content_type="image/png",
+        media_bytes=build_png_bytes(color=(12, 34, 56)),
+    )
+
+    assert item.current_stage is ContentPipelineStage.TRANSCODE
+    assert item.current_status is ContentPipelineStageStatus.PENDING
+    assert broker.start_calls == 1
+    assert len(broker.publish_calls) == 1
 
 
 async def test_duplicate_upload_short_circuits_with_terminal_journal_state_and_no_second_publish(
