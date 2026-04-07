@@ -128,6 +128,7 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         "TelegramLinkCode",
         back_populates="guest_user",
         primaryjoin=lambda: User.id == foreign(TelegramLinkCode.guest_user_id),
+        passive_deletes="all",
     )
     analytics_events: Mapped[list["AnalyticsEvent"]] = relationship(
         "AnalyticsEvent",
