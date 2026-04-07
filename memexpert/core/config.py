@@ -166,11 +166,18 @@ class Settings(BaseSettings):
             normalized_value = value.strip()
             if not normalized_value:
                 raise ValueError("security sequence settings must not be blank.")
+
             if normalized_value.startswith("["):
-                parsed_value = cast("list[object]", json.loads(normalized_value))
+                parsed_json = cast("object", json.loads(normalized_value))
+                if not isinstance(parsed_json, list):
+                    raise ValueError("security sequence settings JSON text must decode to a list.")
+                normalized_items = tuple(str(item).strip() for item in parsed_json if str(item).strip())
             else:
-                parsed_value = normalized_value.split(",")
-            return tuple(str(item).strip() for item in parsed_value if str(item).strip())
+                normalized_items = tuple(str(item).strip() for item in normalized_value.split(",") if str(item).strip())
+
+            if not normalized_items:
+                raise ValueError("security sequence settings must not be empty.")
+            return normalized_items
 
         if isinstance(value, (list, tuple, set, frozenset)):
             normalized_items = tuple(str(item).strip() for item in value if str(item).strip())

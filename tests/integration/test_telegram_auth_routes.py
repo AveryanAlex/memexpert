@@ -211,6 +211,7 @@ async def test_telegram_routes_return_provider_not_configured_when_bot_token_mis
     monkeypatch.setenv("AUTH_REFRESH_COOKIE_NAME", "route_refresh_token")
     monkeypatch.setenv("AUTH_REFRESH_COOKIE_SAMESITE", "strict")
     monkeypatch.setenv("AUTH_REFRESH_COOKIE_SECURE", "true")
+    monkeypatch.setenv("SECURITY_RATE_LIMIT_ENABLED", "false")
     monkeypatch.delenv("AUTH_TELEGRAM_BOT_TOKEN", raising=False)
 
     get_settings.cache_clear()

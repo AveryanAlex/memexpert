@@ -21,6 +21,7 @@ class ApiErrorResponse(BaseModel):
 
     code: ApiErrorCode
     detail: str
+    retry_after_seconds: int | None = None
 
 
 __all__ = ["ApiErrorCode", "ApiErrorResponse"]

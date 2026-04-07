@@ -109,6 +109,7 @@ async def test_telegram_link_start_route_returns_typed_config_errors_before_pers
         "AUTH_REFRESH_COOKIE_NAME": "route_refresh_token",
         "AUTH_REFRESH_COOKIE_SAMESITE": "strict",
         "AUTH_REFRESH_COOKIE_SECURE": "true",
+        "SECURITY_RATE_LIMIT_ENABLED": "false",
         "AUTH_TELEGRAM_BOT_USERNAME": "memexpertbot",
         "AUTH_TELEGRAM_LINK_RETURN_URL": "https://memexpert.test/link/telegram/complete",
     }
