@@ -2,12 +2,27 @@
 
 from __future__ import annotations
 
+import json
 from datetime import timedelta
 from functools import lru_cache
-from typing import ClassVar, Literal
+from typing import ClassVar, Literal, cast
 
-from pydantic import AnyHttpUrl, Field, SecretStr, field_validator
+from pydantic import AnyHttpUrl, Field, SecretStr, TypeAdapter, ValidationError, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+SECURITY_DEFAULT_ALLOWED_ORIGINS = (
+    "https://memexpert.net",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "https://web.telegram.org",
+    "https://oauth.telegram.org",
+)
+SECURITY_DEFAULT_ALLOWED_HEADERS = (
+    "Authorization",
+    "Content-Type",
+    "X-Requested-With",
+)
+_ALLOWED_ORIGIN_LIST_ADAPTER = TypeAdapter(tuple[AnyHttpUrl, ...])
 
 
 class Settings(BaseSettings):
@@ -50,6 +65,15 @@ class Settings(BaseSettings):
     auth_google_token_url: str = "https://oauth2.googleapis.com/token"
     auth_google_userinfo_url: str = "https://openidconnect.googleapis.com/v1/userinfo"
     auth_google_timeout_seconds: float = Field(default=10.0, gt=0.0)
+    security_cors_allowed_origins: tuple[str, ...] = SECURITY_DEFAULT_ALLOWED_ORIGINS
+    security_cors_allowed_origin_regex: str = r"^https://([a-z0-9-]+\.)?memexpert\.net$"
+    security_cors_allowed_headers: tuple[str, ...] = SECURITY_DEFAULT_ALLOWED_HEADERS
+    security_csrf_header_name: str = "X-Requested-With"
+    security_rate_limit_enabled: bool = True
+    security_rate_limit_fail_closed: bool = True
+    security_rate_limit_redis_timeout_seconds: float = Field(default=0.5, gt=0.0)
+    security_rate_limit_auth_write_max_requests: int = Field(default=10, gt=0)
+    security_rate_limit_auth_write_window_seconds: int = Field(default=60, gt=0)
 
     model_config: ClassVar[SettingsConfigDict] = SettingsConfigDict(
         env_file=".env",
@@ -93,6 +117,68 @@ class Settings(BaseSettings):
 
         normalized_value = value.strip()
         return normalized_value or None
+
+    @field_validator("security_cors_allowed_origins", mode="before")
+    @classmethod
+    def _normalize_security_cors_allowed_origins(cls, value: object) -> object:
+        if value is None:
+            return value
+
+        raw_origins = cls._coerce_env_sequence(value)
+        try:
+            validated_origins = _ALLOWED_ORIGIN_LIST_ADAPTER.validate_python(raw_origins)
+        except ValidationError as exc:
+            raise ValueError(
+                "security_cors_allowed_origins must contain valid HTTP origins.",
+            ) from exc
+
+        normalized_origins = tuple(dict.fromkeys(str(origin).rstrip("/") for origin in validated_origins))
+        if not normalized_origins:
+            raise ValueError("security_cors_allowed_origins must include at least one origin.")
+        return normalized_origins
+
+    @field_validator("security_cors_allowed_headers", mode="before")
+    @classmethod
+    def _normalize_security_cors_allowed_headers(cls, value: object) -> object:
+        if value is None:
+            return value
+
+        raw_headers = cls._coerce_env_sequence(value)
+        normalized_headers = tuple(dict.fromkeys(header.strip() for header in raw_headers if header.strip()))
+        if not normalized_headers:
+            raise ValueError("security_cors_allowed_headers must include at least one header name.")
+        return normalized_headers
+
+    @field_validator("security_cors_allowed_origin_regex", "security_csrf_header_name", mode="before")
+    @classmethod
+    def _normalize_required_security_text(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+
+        normalized_value = value.strip()
+        if not normalized_value:
+            raise ValueError("security text settings must not be blank.")
+        return normalized_value
+
+    @classmethod
+    def _coerce_env_sequence(cls, value: object) -> tuple[str, ...]:
+        if isinstance(value, str):
+            normalized_value = value.strip()
+            if not normalized_value:
+                raise ValueError("security sequence settings must not be blank.")
+            if normalized_value.startswith("["):
+                parsed_value = cast("list[object]", json.loads(normalized_value))
+            else:
+                parsed_value = normalized_value.split(",")
+            return tuple(str(item).strip() for item in parsed_value if str(item).strip())
+
+        if isinstance(value, (list, tuple, set, frozenset)):
+            normalized_items = tuple(str(item).strip() for item in value if str(item).strip())
+            if not normalized_items:
+                raise ValueError("security sequence settings must not be empty.")
+            return normalized_items
+
+        raise TypeError("security sequence settings must be provided as text or a sequence.")
 
     @property
     def auth_access_token_ttl(self) -> timedelta:

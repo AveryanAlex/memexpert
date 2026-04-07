@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
@@ -29,11 +30,14 @@ def test_api_main_runs_uvicorn_with_factory_settings() -> None:
     )
 
 
-def test_bot_main_prints_placeholder_message(capsys: pytest.CaptureFixture[str]) -> None:
-    bot_main()
+def test_bot_main_runs_async_bot_runtime() -> None:
+    with patch("memexpert.bot.main.asyncio.run") as asyncio_run:
+        bot_main()
 
-    captured = capsys.readouterr()
-    assert "memexpert-bot: not implemented yet" in captured.out
+    asyncio_run.assert_called_once()
+    coroutine = asyncio_run.call_args.args[0]
+    assert inspect.iscoroutine(coroutine)
+    coroutine.close()
 
 
 def test_workers_main_prints_placeholder_message(capsys: pytest.CaptureFixture[str]) -> None:

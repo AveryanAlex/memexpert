@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from aiogram.client.session.base import BaseSession
 from aiogram.methods import GetMe, SendMessage, TelegramMethod
 from aiogram.types import Message as TelegramMessage
 from aiogram.types import User as TelegramUser
+from pydantic import AnyHttpUrl, SecretStr
 from sqlalchemy import func, select
 
 from memexpert.bot.main import build_bot, build_dispatcher
@@ -130,13 +131,13 @@ def build_bot_settings(
 
     return Settings(
         database_url=database_url,
-        auth_jwt_secret=JWT_SECRET,
+        auth_jwt_secret=SecretStr(JWT_SECRET),
         auth_refresh_cookie_name="route_refresh_token",
         auth_refresh_cookie_samesite="strict",
         auth_refresh_cookie_secure=True,
-        auth_telegram_bot_token=bot_token,
+        auth_telegram_bot_token=SecretStr(bot_token) if bot_token is not None else None,
         auth_telegram_bot_username=BOT_USERNAME,
-        auth_telegram_link_return_url=return_url,
+        auth_telegram_link_return_url=cast("AnyHttpUrl", return_url) if return_url is not None else None,
     )
 
 

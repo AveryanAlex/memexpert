@@ -1,15 +1,17 @@
-"""Tests for configuration loading and caching."""
+"""Tests for configuration loading, validation, and caching."""
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import pytest
+from pydantic import ValidationError
+
 from memexpert.core.config import Settings, get_settings
+from memexpert.core.redis import RedisConfigurationError, normalize_redis_url
 
 if TYPE_CHECKING:
     from pathlib import Path
-
-    import pytest
 
 
 def test_settings_load_from_env_file_and_ignore_extra(
@@ -26,6 +28,38 @@ def test_settings_load_from_env_file_and_ignore_extra(
     settings = Settings()
 
     assert settings.redis_url == "redis://cache.example:6379/9"
+
+
+def test_settings_parse_security_origins_and_preserve_refresh_cookie_path() -> None:
+    settings = Settings.model_validate(
+        {"security_cors_allowed_origins": "https://memexpert.net, http://localhost:3000"}
+    )
+
+    assert settings.security_cors_allowed_origins == (
+        "https://memexpert.net",
+        "http://localhost:3000",
+    )
+    assert settings.security_csrf_header_name == "X-Requested-With"
+    assert settings.auth_refresh_cookie_path == "/api/v1/auth/refresh"
+
+
+def test_settings_reject_blank_security_cors_allowed_origins() -> None:
+    with pytest.raises(ValidationError):
+        _ = Settings.model_validate({"security_cors_allowed_origins": "   "})
+
+
+@pytest.mark.parametrize(
+    "redis_url",
+    [
+        "",
+        "   ",
+        "http://cache.example:6379/0",
+        "not-a-redis-url",
+    ],
+)
+def test_normalize_redis_url_rejects_invalid_values(redis_url: str) -> None:
+    with pytest.raises(RedisConfigurationError):
+        _ = normalize_redis_url(redis_url)
 
 
 def test_get_settings_returns_cached_instance() -> None:

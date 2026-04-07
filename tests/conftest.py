@@ -26,6 +26,7 @@ from memexpert.core.database import (
     reset_async_database_state,
     verify_async_engine,
 )
+from memexpert.core.redis import reset_async_redis_state
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
@@ -42,6 +43,9 @@ TEST_BASE_URL: Final = "https://testserver"
 AUTH_TEST_JWT_SECRET: Final = "route-test-auth-secret-with-32-byte-minimum"
 AUTH_TEST_REFRESH_COOKIE_NAME: Final = "route_refresh_token"
 AUTH_TEST_REFRESH_COOKIE_SAMESITE: Final = "strict"
+SECURITY_TEST_REFRESH_COOKIE_SAMESITE: Final = "lax"
+SECURITY_TEST_UNAVAILABLE_REDIS_URL: Final = "redis://127.0.0.1:1/0"
+SECURITY_TEST_REDIS_TIMEOUT_SECONDS: Final = 0.1
 AUTH_TEST_TELEGRAM_BOT_TOKEN: Final = "123456:telegram-route-test-bot-token"
 AUTH_TEST_TELEGRAM_BOT_USERNAME: Final = "memexpertbot"
 AUTH_TEST_TELEGRAM_LOGIN_MAX_AGE_SECONDS: Final = 300
@@ -86,11 +90,12 @@ async def _reset_public_schema(engine: AsyncEngine) -> None:
         _ = await connection.execute(text("CREATE SCHEMA public"))
 
 
-async def reset_test_runtime_state() -> None:
-    """Clear cached settings and global async engine state before env-driven app tests."""
+async def reset_test_runtime_state(*, flush_redis: bool = False) -> None:
+    """Clear cached settings plus global DB/Redis runtime state before env-driven app tests."""
 
     get_settings.cache_clear()
     await reset_async_database_state()
+    await reset_async_redis_state(flushdb=flush_redis)
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -204,11 +209,15 @@ async def migrated_db_session(
 
 
 @pytest.fixture
-def auth_settings_overrides(postgres_async_url: str) -> dict[str, str]:
+def auth_settings_overrides(
+    postgres_async_url: str,
+    redis_container_url: str,
+) -> dict[str, str]:
     """Return env overrides used by route tests to prove cache resets and secure cookies."""
 
     return {
         "DATABASE_URL": postgres_async_url,
+        "REDIS_URL": redis_container_url,
         "AUTH_JWT_SECRET": AUTH_TEST_JWT_SECRET,
         "AUTH_REFRESH_COOKIE_NAME": AUTH_TEST_REFRESH_COOKIE_NAME,
         "AUTH_REFRESH_COOKIE_SAMESITE": AUTH_TEST_REFRESH_COOKIE_SAMESITE,
@@ -225,6 +234,34 @@ def auth_settings_overrides(postgres_async_url: str) -> dict[str, str]:
         "AUTH_GOOGLE_TOKEN_URL": AUTH_TEST_GOOGLE_TOKEN_URL,
         "AUTH_GOOGLE_USERINFO_URL": AUTH_TEST_GOOGLE_USERINFO_URL,
         "AUTH_GOOGLE_TIMEOUT_SECONDS": str(AUTH_TEST_GOOGLE_TIMEOUT_SECONDS),
+        "SECURITY_RATE_LIMIT_REDIS_TIMEOUT_SECONDS": str(SECURITY_TEST_REDIS_TIMEOUT_SECONDS),
+    }
+
+
+@pytest.fixture
+def security_settings_overrides(
+    auth_settings_overrides: dict[str, str],
+    redis_container_url: str,
+) -> dict[str, str]:
+    """Return auth-route overrides plus Redis and browser-cookie defaults for security tests."""
+
+    return {
+        **auth_settings_overrides,
+        "REDIS_URL": redis_container_url,
+        "AUTH_REFRESH_COOKIE_SAMESITE": SECURITY_TEST_REFRESH_COOKIE_SAMESITE,
+        "SECURITY_RATE_LIMIT_REDIS_TIMEOUT_SECONDS": str(SECURITY_TEST_REDIS_TIMEOUT_SECONDS),
+    }
+
+
+@pytest.fixture
+def unavailable_security_settings_overrides(
+    security_settings_overrides: dict[str, str],
+) -> dict[str, str]:
+    """Return security overrides with a deliberately unreachable Redis backend."""
+
+    return {
+        **security_settings_overrides,
+        "REDIS_URL": SECURITY_TEST_UNAVAILABLE_REDIS_URL,
     }
 
 
@@ -240,9 +277,9 @@ async def auth_app(
     for key, value in auth_settings_overrides.items():
         monkeypatch.setenv(key, value)
 
-    await reset_test_runtime_state()
+    await reset_test_runtime_state(flush_redis=True)
     yield create_app()
-    await reset_test_runtime_state()
+    await reset_test_runtime_state(flush_redis=True)
 
 
 @pytest_asyncio.fixture
@@ -250,6 +287,58 @@ async def auth_client(auth_app: FastAPI) -> AsyncIterator[AsyncClient]:
     """Provide an HTTPS client for auth-route integration tests with truthful secure cookies."""
 
     transport = ASGITransport(app=auth_app)
+    async with AsyncClient(transport=transport, base_url=TEST_BASE_URL) as async_client:
+        yield async_client
+
+
+@pytest_asyncio.fixture
+async def security_app(
+    migrated_db_session: AsyncSession,
+    security_settings_overrides: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncIterator[FastAPI]:
+    """Build an app wired to migrated PostgreSQL plus a real Redis backend for security tests."""
+
+    _ = migrated_db_session
+    for key, value in security_settings_overrides.items():
+        monkeypatch.setenv(key, value)
+
+    await reset_test_runtime_state(flush_redis=True)
+    yield create_app()
+    await reset_test_runtime_state(flush_redis=True)
+
+
+@pytest_asyncio.fixture
+async def security_client(security_app: FastAPI) -> AsyncIterator[AsyncClient]:
+    """Provide an HTTPS client for security tests with truthful SameSite=Lax cookies."""
+
+    transport = ASGITransport(app=security_app)
+    async with AsyncClient(transport=transport, base_url=TEST_BASE_URL) as async_client:
+        yield async_client
+
+
+@pytest_asyncio.fixture
+async def unavailable_security_app(
+    migrated_db_session: AsyncSession,
+    unavailable_security_settings_overrides: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncIterator[FastAPI]:
+    """Build an app with the same auth contract but a deliberately unavailable Redis backend."""
+
+    _ = migrated_db_session
+    for key, value in unavailable_security_settings_overrides.items():
+        monkeypatch.setenv(key, value)
+
+    await reset_test_runtime_state()
+    yield create_app()
+    await reset_test_runtime_state()
+
+
+@pytest_asyncio.fixture
+async def unavailable_security_client(unavailable_security_app: FastAPI) -> AsyncIterator[AsyncClient]:
+    """Provide an HTTPS client for degraded-mode security tests."""
+
+    transport = ASGITransport(app=unavailable_security_app)
     async with AsyncClient(transport=transport, base_url=TEST_BASE_URL) as async_client:
         yield async_client
 
