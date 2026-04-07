@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from aiogram.client.session.base import BaseSession
 from aiogram.methods import GetMe, SendMessage, TelegramMethod
 from aiogram.types import Message as TelegramMessage
 from aiogram.types import User as TelegramUser
-from pydantic import AnyHttpUrl, SecretStr
+from pydantic import AnyHttpUrl, SecretStr, TypeAdapter
 from sqlalchemy import func, select
 
 from memexpert.bot.main import build_bot, build_dispatcher
@@ -20,7 +20,9 @@ from memexpert.models.content import Meme
 from memexpert.models.enums import AccountType, AnalyticsEventType, CollectionKind, ContentKind
 from memexpert.models.user import AccountMergeLog, AnalyticsEvent, InlineUsageEvent, TelegramLinkCode, User
 from memexpert.services import (
+    AccountLinkAlreadyCompletedError,
     AccountLinkInvariantError,
+    AccountLinkResult,
     AccountLinkService,
     AuthConfigurationError,
     ProviderNotConfiguredError,
@@ -33,6 +35,8 @@ if TYPE_CHECKING:
 
     from aiogram import Bot, Dispatcher
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from memexpert.services.provider_auth_service import TelegramIdentity
 
 BOT_TOKEN = "123456:telegram-route-test-bot-token"
 BOT_USERNAME = "memexpertbot"
@@ -121,6 +125,22 @@ class ExplodingBotAccountLinkService(AccountLinkService):
         raise AccountLinkInvariantError("forced rollback after partial transfer")
 
 
+class AlreadyCompletedBotAccountLinkService(AccountLinkService):
+    """Force the bot surface onto the completed-elsewhere loser branch."""
+
+    async def redeem_telegram_link_code(
+        self,
+        *,
+        code: str,
+        identity: TelegramIdentity,
+    ) -> AccountLinkResult:
+        _ = (code, identity)
+        raise AccountLinkAlreadyCompletedError(
+            "This account link already completed elsewhere. Refresh or reload MemeXpert "
+            "to continue with the current account state instead of retrying."
+        )
+
+
 def build_bot_settings(
     database_url: str,
     *,
@@ -137,7 +157,9 @@ def build_bot_settings(
         auth_refresh_cookie_secure=True,
         auth_telegram_bot_token=SecretStr(bot_token) if bot_token is not None else None,
         auth_telegram_bot_username=BOT_USERNAME,
-        auth_telegram_link_return_url=cast("AnyHttpUrl", return_url) if return_url is not None else None,
+        auth_telegram_link_return_url=(
+            TypeAdapter(AnyHttpUrl).validate_python(return_url) if return_url is not None else None
+        ),
     )
 
 
@@ -441,6 +463,63 @@ async def test_start_link_rejects_replay_after_a_successful_redemption(
 
         assert link_code.redeemed_at is not None
         assert link_code.redeemed_by_telegram_id == TELEGRAM_ID
+        assert merge_log_count_result.scalar_one() == 0
+
+
+@pytest.mark.asyncio
+async def test_start_link_completed_elsewhere_tells_user_to_refresh_current_memexpert_state(
+    migrated_db_session: AsyncSession,
+    postgres_async_url: str,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    settings = build_bot_settings(postgres_async_url)
+    guest_user = await UserService(migrated_db_session).create_guest_user()
+    code = await issue_link_code(migrated_db_session, settings=settings, guest_user_id=guest_user.id)
+
+    telegram_session = RecordingTelegramSession()
+    bot = build_bot(settings, session=telegram_session)
+    dispatcher = build_dispatcher(
+        settings=settings,
+        session_factory=postgres_session_factory,
+        account_link_service_factory=lambda session: AlreadyCompletedBotAccountLinkService.from_settings(
+            session,
+            settings=settings,
+        ),
+    )
+
+    try:
+        await dispatch_start(
+            dispatcher=dispatcher,
+            bot=bot,
+            text=f"/start link_{code}",
+            telegram_id=TELEGRAM_ID,
+            update_id=22,
+        )
+    finally:
+        await bot.session.close()
+
+    reply_text = last_reply_text(telegram_session)
+    assert "уже заверш" in reply_text.lower()
+    assert "обновите страницу или mini app" in reply_text.lower()
+    assert "новую ссылку запрашивать не нужно" in reply_text.lower()
+    assert "запросите новую ссылку" not in reply_text.lower()
+    assert "таймаута" not in reply_text.lower()
+    assert "временной ошибки" not in reply_text.lower()
+    assert RETURN_URL in reply_text
+
+    async with postgres_session_factory() as session:
+        persisted_guest_result = await session.execute(select(User).where(User.id == guest_user.id))
+        link_code_result = await session.execute(
+            select(TelegramLinkCode).where(TelegramLinkCode.guest_user_id == guest_user.id)
+        )
+        merge_log_count_result = await session.execute(select(func.count()).select_from(AccountMergeLog))
+
+        persisted_guest = persisted_guest_result.scalar_one()
+        link_code = link_code_result.scalar_one()
+
+        assert persisted_guest.account_type is AccountType.GUEST
+        assert link_code.redeemed_at is None
+        assert link_code.redeemed_by_telegram_id is None
         assert merge_log_count_result.scalar_one() == 0
 
 

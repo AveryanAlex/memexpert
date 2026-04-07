@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
@@ -13,11 +14,16 @@ import httpx
 import pytest
 from sqlalchemy import func, select
 
-from memexpert.api.dependencies import DbSessionDep, get_provider_auth_service
+from memexpert.api.dependencies import (
+    DbSessionDep,
+    ProviderAuthServiceDep,
+    get_account_link_service,
+    get_provider_auth_service,
+)
 from memexpert.core.config import get_settings
 from memexpert.models.enums import AccountType
 from memexpert.models.user import AccountMergeLog, RefreshToken, User
-from memexpert.services import AuthService, ProviderAuthService, UserService
+from memexpert.services import AccountLinkService, AuthService, ProviderAuthService, UserService
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -103,6 +109,34 @@ def hash_password(password: str) -> str:
     """Build a bcrypt hash for route tests that seed password accounts directly."""
 
     return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(rounds=12)).decode("utf-8")
+
+
+class CoordinatedRouteMergeAccountLinkService(AccountLinkService):
+    """Pause the first route-level merge after locking rows so the loser resumes stale."""
+
+    def __init__(
+        self,
+        session: AsyncSession,
+        *,
+        first_lock_acquired: asyncio.Event,
+        second_attempt_started: asyncio.Event,
+        release_first: asyncio.Event,
+        provider_auth_service: ProviderAuthService | None = None,
+    ) -> None:
+        super().__init__(session, provider_auth_service=provider_auth_service)
+        self._first_lock_acquired: asyncio.Event = first_lock_acquired
+        self._second_attempt_started: asyncio.Event = second_attempt_started
+        self._release_first: asyncio.Event = release_first
+
+    async def _lock_users_in_order(self, *user_ids: uuid.UUID) -> dict[uuid.UUID, User | None]:
+        if not self._first_lock_acquired.is_set():
+            locked_users = await super()._lock_users_in_order(*user_ids)
+            self._first_lock_acquired.set()
+            await self._release_first.wait()
+            return locked_users
+
+        self._second_attempt_started.set()
+        return await super()._lock_users_in_order(*user_ids)
 
 
 async def test_email_signup_link_upgrades_guest_in_place_issues_canonical_session_and_updates_read_surface(
@@ -261,6 +295,182 @@ async def test_email_login_link_wrong_password_preserves_guest_bearer_and_refres
 
         assert persisted_guest_result.scalar_one().account_type is AccountType.GUEST
         assert merge_log_count_result.scalar_one() == 0
+
+
+async def test_email_login_link_route_concurrent_loser_gets_refresh_guided_conflict(
+    auth_app: FastAPI,
+    auth_settings_overrides: dict[str, str],
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with postgres_session_factory() as session:
+        user_service = UserService(session)
+        full_user = await user_service.create_full_user(
+            email="race-owner@example.com",
+            password_hash=hash_password(PASSWORD),
+        )
+
+    cookie_name = auth_settings_overrides["AUTH_REFRESH_COOKIE_NAME"]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=auth_app),
+        base_url="https://testserver",
+    ) as bootstrap_client:
+        guest_response = await bootstrap_client.post("/api/v1/auth/guest")
+        guest_payload = guest_response.json()
+        guest_access_token = guest_payload["access_token"]
+        guest_user_id = uuid.UUID(guest_payload["user"]["id"])
+        original_refresh_cookie = bootstrap_client.cookies.get(cookie_name)
+        refresh_cookie = next(cookie for cookie in bootstrap_client.cookies.jar if cookie.name == cookie_name)
+        cookie_domain = refresh_cookie.domain
+        cookie_path = refresh_cookie.path
+
+    assert guest_response.status_code == 201
+    assert original_refresh_cookie is not None
+
+    first_lock_acquired = asyncio.Event()
+    second_attempt_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def override_account_link_service(
+        session: DbSessionDep,
+        provider_auth_service: ProviderAuthServiceDep,
+    ) -> AccountLinkService:
+        return CoordinatedRouteMergeAccountLinkService(
+            session,
+            first_lock_acquired=first_lock_acquired,
+            second_attempt_started=second_attempt_started,
+            release_first=release_first,
+            provider_auth_service=provider_auth_service,
+        )
+
+    async def post_link(client: AsyncClient) -> httpx.Response:
+        return await client.post(
+            "/api/v1/auth/link/email/login",
+            headers={
+                "Authorization": f"Bearer {guest_access_token}",
+                "User-Agent": "Race Link Browser",
+            },
+            json={
+                "email": "race-owner@example.com",
+                "password": PASSWORD,
+            },
+        )
+
+    auth_app.dependency_overrides[get_account_link_service] = override_account_link_service
+    try:
+        async with (
+            httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=auth_app),
+                base_url="https://testserver",
+            ) as first_client,
+            httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=auth_app),
+                base_url="https://testserver",
+            ) as second_client,
+        ):
+            first_client.cookies.set(cookie_name, original_refresh_cookie, domain=cookie_domain, path=cookie_path)
+            second_client.cookies.set(cookie_name, original_refresh_cookie, domain=cookie_domain, path=cookie_path)
+
+            first_task = asyncio.create_task(post_link(first_client))
+            await first_lock_acquired.wait()
+
+            second_task = asyncio.create_task(post_link(second_client))
+            await second_attempt_started.wait()
+            release_first.set()
+
+            first_response, second_response = await asyncio.gather(first_task, second_task)
+            race_results = [(first_client, first_response), (second_client, second_response)]
+
+            successful_results = [
+                (client, response)
+                for client, response in race_results
+                if response.status_code == 200
+            ]
+            failed_results = [
+                (client, response)
+                for client, response in race_results
+                if response.status_code == 409
+            ]
+
+            unexpected_statuses = [
+                response.status_code
+                for _, response in race_results
+                if response.status_code not in {200, 409}
+            ]
+
+            assert unexpected_statuses == []
+            assert len(successful_results) == 1
+            assert len(failed_results) == 1
+
+            winner_client, winner_response = successful_results[0]
+            loser_client, loser_response = failed_results[0]
+            winner_payload = winner_response.json()
+            loser_payload = loser_response.json()
+            winner_cookie_value = winner_client.cookies.get(
+                cookie_name,
+                domain=cookie_domain,
+                path=cookie_path,
+            )
+            loser_cookie_value = loser_client.cookies.get(
+                cookie_name,
+                domain=cookie_domain,
+                path=cookie_path,
+            )
+
+            assert winner_payload["session"]["user"]["id"] == str(full_user.id)
+            assert winner_payload["session"]["user"]["account_type"] == "full"
+            assert winner_payload["session"]["refresh_cookie"]["name"] == cookie_name
+            assert winner_payload["merge_summary"] == {
+                "merge_performed": True,
+                "merge_log_id": winner_payload["merge_summary"]["merge_log_id"],
+                "guest_user_id": str(guest_user_id),
+                "canonical_user_id": str(full_user.id),
+                "deleted_guest_user_id": str(guest_user_id),
+                "favorites_transferred": 0,
+                "duplicate_favorites_skipped": 0,
+                "analytics_events_transferred": 0,
+                "inline_usage_events_transferred": 0,
+                "views_transferred": 0,
+            }
+            assert winner_payload["merge_summary"]["merge_log_id"] is not None
+            assert winner_cookie_value is not None
+            assert winner_cookie_value != original_refresh_cookie
+            assert winner_response.headers.get("set-cookie") is not None
+
+            assert loser_payload["code"] == "account_link_already_completed"
+            assert "already completed elsewhere" in loser_payload["detail"].lower()
+            assert "refresh or reload memexpert" in loser_payload["detail"].lower()
+            assert loser_response.headers.get("set-cookie") is None
+            assert loser_cookie_value == original_refresh_cookie
+
+            stale_guest_response = await loser_client.get(
+                "/api/v1/auth/me",
+                headers={"Authorization": f"Bearer {guest_access_token}"},
+            )
+
+            assert stale_guest_response.status_code == 401
+            assert stale_guest_response.json()["code"] == "invalid_token"
+
+    finally:
+        auth_app.dependency_overrides.pop(get_account_link_service, None)
+
+    async with postgres_session_factory() as session:
+        merge_logs_result = await session.execute(select(AccountMergeLog))
+        deleted_guest_result = await session.execute(select(User).where(User.id == guest_user_id))
+        refresh_token_rows_result = await session.execute(
+            select(RefreshToken)
+            .where(RefreshToken.user_id == full_user.id)
+            .order_by(RefreshToken.created_at.asc())
+        )
+
+        merge_logs = merge_logs_result.scalars().all()
+        refresh_token_rows = refresh_token_rows_result.scalars().all()
+
+        assert len(merge_logs) == 1
+        assert merge_logs[0].guest_account_id == guest_user_id
+        assert merge_logs[0].target_account_id == full_user.id
+        assert deleted_guest_result.scalar_one_or_none() is None
+        assert len(refresh_token_rows) == 1
+        assert refresh_token_rows[0].device_info == "Race Link Browser"
 
 
 async def test_google_link_merges_guest_into_existing_full_and_exposes_linked_provider_read_surface(

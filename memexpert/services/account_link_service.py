@@ -553,8 +553,8 @@ class AccountLinkService:
     @staticmethod
     def _account_link_already_completed_detail() -> str:
         return (
-            "This account link already completed elsewhere. Refresh or reload your current "
-            "account state instead of retrying."
+            "This account link already completed elsewhere. Refresh or reload MemeXpert to "
+            "continue with the current account state instead of retrying."
         )
 
     @staticmethod

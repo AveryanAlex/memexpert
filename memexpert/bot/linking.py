@@ -13,6 +13,7 @@ from memexpert.core.config import Settings, get_settings
 from memexpert.core.database import get_async_session_factory
 from memexpert.models.base import utcnow
 from memexpert.services import (
+    AccountLinkAlreadyCompletedError,
     AccountLinkInvariantError,
     AccountLinkResult,
     AccountLinkService,
@@ -101,6 +102,9 @@ async def handle_start_command(
     except TimeoutError:
         await message.answer(_build_timeout_message(return_url=return_url))
         return
+    except AccountLinkAlreadyCompletedError:
+        await message.answer(_build_completed_elsewhere_message(return_url=return_url))
+        return
     except AccountLinkInvariantError:
         await message.answer(_build_retry_message(return_url=return_url))
         return
@@ -130,6 +134,15 @@ def _build_missing_identity_message(*, return_url: str) -> str:
     return (
         "Не удалось определить ваш Telegram-профиль, поэтому привязка не была запущена.\n"
         "Откройте ссылку заново из личного чата с ботом и попробуйте ещё раз.\n"
+        f"Вернуться в MemeXpert: {return_url}"
+    )
+
+
+def _build_completed_elsewhere_message(*, return_url: str) -> str:
+    return (
+        "Эта привязка уже завершилась в другом окне или устройстве.\n"
+        "Вернитесь в MemeXpert, обновите страницу или Mini App и продолжайте с текущим аккаунтом — "
+        "новую ссылку запрашивать не нужно.\n"
         f"Вернуться в MemeXpert: {return_url}"
     )
 
