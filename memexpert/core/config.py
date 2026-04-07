@@ -5,17 +5,28 @@ from __future__ import annotations
 import json
 from datetime import timedelta
 from functools import lru_cache
-from typing import ClassVar, Literal, cast
+from typing import Annotated, ClassVar, Literal, cast
 
 from pydantic import AnyHttpUrl, Field, SecretStr, TypeAdapter, ValidationError, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 SECURITY_DEFAULT_ALLOWED_ORIGINS = (
     "https://memexpert.net",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
     "https://web.telegram.org",
     "https://oauth.telegram.org",
+)
+SECURITY_DEFAULT_ALLOWED_METHODS = (
+    "DELETE",
+    "GET",
+    "HEAD",
+    "OPTIONS",
+    "PATCH",
+    "POST",
+    "PUT",
 )
 SECURITY_DEFAULT_ALLOWED_HEADERS = (
     "Authorization",
@@ -65,9 +76,10 @@ class Settings(BaseSettings):
     auth_google_token_url: str = "https://oauth2.googleapis.com/token"
     auth_google_userinfo_url: str = "https://openidconnect.googleapis.com/v1/userinfo"
     auth_google_timeout_seconds: float = Field(default=10.0, gt=0.0)
-    security_cors_allowed_origins: tuple[str, ...] = SECURITY_DEFAULT_ALLOWED_ORIGINS
+    security_cors_allowed_origins: Annotated[tuple[str, ...], NoDecode] = SECURITY_DEFAULT_ALLOWED_ORIGINS
     security_cors_allowed_origin_regex: str = r"^https://([a-z0-9-]+\.)?memexpert\.net$"
-    security_cors_allowed_headers: tuple[str, ...] = SECURITY_DEFAULT_ALLOWED_HEADERS
+    security_cors_allowed_methods: Annotated[tuple[str, ...], NoDecode] = SECURITY_DEFAULT_ALLOWED_METHODS
+    security_cors_allowed_headers: Annotated[tuple[str, ...], NoDecode] = SECURITY_DEFAULT_ALLOWED_HEADERS
     security_csrf_header_name: str = "X-Requested-With"
     security_rate_limit_enabled: bool = True
     security_rate_limit_fail_closed: bool = True
@@ -136,6 +148,20 @@ class Settings(BaseSettings):
         if not normalized_origins:
             raise ValueError("security_cors_allowed_origins must include at least one origin.")
         return normalized_origins
+
+    @field_validator("security_cors_allowed_methods", mode="before")
+    @classmethod
+    def _normalize_security_cors_allowed_methods(cls, value: object) -> object:
+        if value is None:
+            return value
+
+        raw_methods = cls._coerce_env_sequence(value)
+        normalized_methods = tuple(
+            dict.fromkeys(method.strip().upper() for method in raw_methods if method.strip())
+        )
+        if not normalized_methods:
+            raise ValueError("security_cors_allowed_methods must include at least one HTTP method.")
+        return normalized_methods
 
     @field_validator("security_cors_allowed_headers", mode="before")
     @classmethod

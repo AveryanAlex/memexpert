@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING
 
 import pytest
@@ -32,15 +33,28 @@ def test_settings_load_from_env_file_and_ignore_extra(
 
 def test_settings_parse_security_origins_and_preserve_refresh_cookie_path() -> None:
     settings = Settings.model_validate(
-        {"security_cors_allowed_origins": "https://memexpert.net, http://localhost:3000"}
+        {
+            "security_cors_allowed_origins": "https://memexpert.net, http://localhost:3000",
+            "security_cors_allowed_methods": "GET, post , OPTIONS",
+        }
     )
 
     assert settings.security_cors_allowed_origins == (
         "https://memexpert.net",
         "http://localhost:3000",
     )
+    assert settings.security_cors_allowed_methods == ("GET", "POST", "OPTIONS")
     assert settings.security_csrf_header_name == "X-Requested-With"
     assert settings.auth_refresh_cookie_path == "/api/v1/auth/refresh"
+
+
+def test_settings_default_cors_origin_policy_matches_memexpert_net_but_not_other_tlds() -> None:
+    settings = Settings()
+
+    assert re.fullmatch(settings.security_cors_allowed_origin_regex, "https://app.memexpert.net")
+    assert re.fullmatch(settings.security_cors_allowed_origin_regex, "https://memexpert.net")
+    assert re.fullmatch(settings.security_cors_allowed_origin_regex, "https://app.memexpert.com") is None
+    assert re.fullmatch(settings.security_cors_allowed_origin_regex, "https://memexpert.net.evil.example") is None
 
 
 def test_settings_reject_blank_security_cors_allowed_origins() -> None:

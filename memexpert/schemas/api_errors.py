@@ -13,7 +13,7 @@ class ApiErrorCode(StrEnum):
     RATE_LIMITER_UNAVAILABLE = "rate_limiter_unavailable"
     RATE_LIMIT_EXCEEDED = "rate_limit_exceeded"
     ORIGIN_NOT_ALLOWED = "origin_not_allowed"
-    CSRF_HEADER_REQUIRED = "csrf_header_required"
+    CSRF_FAILED = "csrf_failed"
 
 
 class ApiErrorResponse(BaseModel):

@@ -1,5 +1,5 @@
 # ruff: noqa: TC002,TC003
-"""Shared request-security classification, rate limiting, degraded-mode guards, and API error plumbing."""
+"""Shared request-security classification, CORS config, CSRF enforcement, rate limiting, and API error plumbing."""
 
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ SECURITY_ERROR_STATUS_CODES: Final[dict[ApiErrorCode, int]] = {
     ApiErrorCode.RATE_LIMITER_UNAVAILABLE: int(HTTPStatus.SERVICE_UNAVAILABLE),
     ApiErrorCode.RATE_LIMIT_EXCEEDED: int(HTTPStatus.TOO_MANY_REQUESTS),
     ApiErrorCode.ORIGIN_NOT_ALLOWED: int(HTTPStatus.FORBIDDEN),
-    ApiErrorCode.CSRF_HEADER_REQUIRED: int(HTTPStatus.FORBIDDEN),
+    ApiErrorCode.CSRF_FAILED: int(HTTPStatus.FORBIDDEN),
 }
 
 SECURITY_ERROR_RESPONSES: Final[dict[int | str, dict[str, object]]] = {
@@ -126,6 +126,19 @@ class SecuritySubjectResolutionError(RuntimeError):
     """Raised when a protected request cannot be mapped to a limiter subject."""
 
 
+def build_security_cors_middleware_kwargs(settings: Settings | None = None) -> dict[str, object]:
+    """Build the explicit credentialed CORS configuration for the shared API app."""
+
+    resolved_settings = settings or get_settings()
+    return {
+        "allow_origins": list(resolved_settings.security_cors_allowed_origins),
+        "allow_origin_regex": resolved_settings.security_cors_allowed_origin_regex,
+        "allow_credentials": True,
+        "allow_methods": list(resolved_settings.security_cors_allowed_methods),
+        "allow_headers": list(resolved_settings.security_cors_allowed_headers),
+    }
+
+
 def _normalize_path_segments(path: str) -> tuple[str, ...]:
     normalized_path = path.rstrip("/") or "/"
     return tuple(segment for segment in normalized_path.split("/") if segment)
@@ -181,6 +194,45 @@ def build_security_http_error(
             retry_after_seconds=retry_after_seconds,
         ),
         headers=headers,
+    )
+
+
+def _get_request_origin(request: Request) -> str | None:
+    origin = request.headers.get("origin")
+    if origin is None:
+        return None
+
+    normalized_origin = origin.strip()
+    return normalized_origin or None
+
+
+def require_browser_csrf_header(
+    request: Request,
+    route_tier: SecurityRouteTier,
+    *,
+    settings: Settings,
+) -> None:
+    """Reject unsafe browser-style auth writes that omit the configured CSRF request header."""
+
+    if route_tier is not SecurityRouteTier.AUTH_WRITE:
+        return
+    if request.method.upper() in SAFE_HTTP_METHODS:
+        return
+
+    request_origin = _get_request_origin(request)
+    if request_origin is None:
+        return
+
+    csrf_header_name = settings.security_csrf_header_name
+    csrf_header_value = request.headers.get(csrf_header_name)
+    if csrf_header_value is not None and csrf_header_value.strip():
+        request.state.security_request_origin = request_origin
+        request.state.security_csrf_header_name = csrf_header_name
+        return
+
+    raise build_security_http_error(
+        ApiErrorCode.CSRF_FAILED,
+        f"Browser-style auth requests from {request_origin} must include the {csrf_header_name} header.",
     )
 
 
@@ -278,12 +330,14 @@ async def ensure_security_runtime_available(
     *,
     settings: Settings | None = None,
 ) -> SecurityRouteTier:
-    """Require and enforce the shared security runtime only for unsafe auth routes."""
+    """Require shared security guards only for unsafe auth routes and browser-style auth writes."""
 
     resolved_settings = settings or get_settings()
     route_tier = classify_security_route(request)
     request.state.security_route_tier = route_tier
     request.state.security_rate_limit_headers = {}
+
+    require_browser_csrf_header(request, route_tier, settings=resolved_settings)
 
     policy = get_security_rate_limit_policy(route_tier, settings=resolved_settings)
     if policy is None:
@@ -326,7 +380,7 @@ async def security_http_middleware(
     request: Request,
     call_next: Callable[[Request], Awaitable[Response]],
 ) -> Response:
-    """Guard risky auth routes with lazy shared-security runtime checks and rate limits."""
+    """Guard risky auth routes with CSRF checks, lazy shared-security runtime checks, and rate limits."""
 
     try:
         _ = await ensure_security_runtime_available(request)
@@ -358,11 +412,13 @@ __all__ = [
     "SecurityRateLimitTier",
     "SecurityRouteTier",
     "V1_AUTH_PATH_PREFIX",
+    "build_security_cors_middleware_kwargs",
     "build_security_http_error",
     "build_security_rate_limit_key",
     "classify_security_route",
     "ensure_security_runtime_available",
     "get_security_rate_limit_policy",
+    "require_browser_csrf_header",
     "resolve_security_rate_limit_subject",
     "security_http_exception_handler",
     "security_http_middleware",

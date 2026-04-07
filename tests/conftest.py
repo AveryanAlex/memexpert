@@ -46,6 +46,18 @@ AUTH_TEST_REFRESH_COOKIE_SAMESITE: Final = "strict"
 SECURITY_TEST_REFRESH_COOKIE_SAMESITE: Final = "lax"
 SECURITY_TEST_UNAVAILABLE_REDIS_URL: Final = "redis://127.0.0.1:1/0"
 SECURITY_TEST_REDIS_TIMEOUT_SECONDS: Final = 0.1
+BROWSER_SECURITY_ALLOWED_ORIGINS: Final = (
+    "https://memexpert.net",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "https://web.telegram.org",
+    "https://oauth.telegram.org",
+)
+BROWSER_SECURITY_ALLOWED_ORIGIN_REGEX: Final = r"^https://([a-z0-9-]+\.)?memexpert\.net$"
+BROWSER_SECURITY_ALLOWED_METHODS: Final = "DELETE,GET,HEAD,OPTIONS,PATCH,POST,PUT"
+BROWSER_SECURITY_ALLOWED_HEADERS: Final = "Authorization,Content-Type,X-Requested-With"
 AUTH_TEST_TELEGRAM_BOT_TOKEN: Final = "123456:telegram-route-test-bot-token"
 AUTH_TEST_TELEGRAM_BOT_USERNAME: Final = "memexpertbot"
 AUTH_TEST_TELEGRAM_LOGIN_MAX_AGE_SECONDS: Final = 300
@@ -313,6 +325,53 @@ async def security_client(security_app: FastAPI) -> AsyncIterator[AsyncClient]:
     """Provide an HTTPS client for security tests with truthful SameSite=Lax cookies."""
 
     transport = ASGITransport(app=security_app)
+    async with AsyncClient(transport=transport, base_url=TEST_BASE_URL) as async_client:
+        yield async_client
+
+
+@pytest.fixture
+def browser_security_settings_overrides(
+    auth_settings_overrides: dict[str, str],
+    redis_container_url: str,
+) -> dict[str, str]:
+    """Return dedicated browser-security overrides with explicit origins and SameSite=Lax cookies."""
+
+    return {
+        **auth_settings_overrides,
+        "REDIS_URL": redis_container_url,
+        "AUTH_REFRESH_COOKIE_SAMESITE": SECURITY_TEST_REFRESH_COOKIE_SAMESITE,
+        "SECURITY_CORS_ALLOWED_ORIGINS": ",".join(BROWSER_SECURITY_ALLOWED_ORIGINS),
+        "SECURITY_CORS_ALLOWED_ORIGIN_REGEX": BROWSER_SECURITY_ALLOWED_ORIGIN_REGEX,
+        "SECURITY_CORS_ALLOWED_METHODS": BROWSER_SECURITY_ALLOWED_METHODS,
+        "SECURITY_CORS_ALLOWED_HEADERS": BROWSER_SECURITY_ALLOWED_HEADERS,
+        "SECURITY_RATE_LIMIT_REDIS_TIMEOUT_SECONDS": str(SECURITY_TEST_REDIS_TIMEOUT_SECONDS),
+        "SECURITY_RATE_LIMIT_AUTH_WRITE_MAX_REQUESTS": "10",
+        "SECURITY_RATE_LIMIT_AUTH_WRITE_WINDOW_SECONDS": "60",
+    }
+
+
+@pytest_asyncio.fixture
+async def browser_security_app(
+    migrated_db_session: AsyncSession,
+    browser_security_settings_overrides: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncIterator[FastAPI]:
+    """Build an app for browser-targeted security tests with real Redis and explicit CORS config."""
+
+    _ = migrated_db_session
+    for key, value in browser_security_settings_overrides.items():
+        monkeypatch.setenv(key, value)
+
+    await reset_test_runtime_state(flush_redis=True)
+    yield create_app()
+    await reset_test_runtime_state(flush_redis=True)
+
+
+@pytest_asyncio.fixture
+async def browser_security_client(browser_security_app: FastAPI) -> AsyncIterator[AsyncClient]:
+    """Provide an HTTPS client for browser-targeted CORS/CSRF assertions with SameSite=Lax cookies."""
+
+    transport = ASGITransport(app=browser_security_app)
     async with AsyncClient(transport=transport, base_url=TEST_BASE_URL) as async_client:
         yield async_client
 
