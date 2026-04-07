@@ -11,6 +11,7 @@ import pytest
 import pytest_asyncio
 from pydantic import ValidationError
 from sqlalchemy import inspect as sa_inspect, select
+from sqlalchemy.engine import Connection
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import configure_mappers, selectinload
 
@@ -121,7 +122,7 @@ async def _get_table_names(engine: AsyncEngine) -> set[str]:
         return await connection.run_sync(_get_table_names_sync)
 
 
-def _get_table_names_sync(sync_connection: object) -> set[str]:
+def _get_table_names_sync(sync_connection: Connection) -> set[str]:
     return set(sa_inspect(sync_connection).get_table_names())
 
 

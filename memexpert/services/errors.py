@@ -181,6 +181,66 @@ class DuplicateCollectionInviteError(CollectionServiceError):
     """Raised when an invite token collides with an existing invite record."""
 
 
+class PipelineServiceError(ServiceError):
+    """Base error for operator-managed content-pipeline failures."""
+
+    error_code: ClassVar[str] = "pipeline_error"
+
+
+class PipelineOperatorTokenError(PipelineServiceError):
+    """Raised when the operator token header is missing, blank, or incorrect."""
+
+    error_code: ClassVar[str] = "invalid_operator_token"
+
+
+class PipelineItemNotFoundError(PipelineServiceError):
+    """Raised when a requested pipeline item does not exist."""
+
+    error_code: ClassVar[str] = "pipeline_item_not_found"
+
+
+class PipelinePayloadValidationError(ServiceValidationError, PipelineServiceError):
+    """Raised when uploaded bytes or provenance metadata are malformed."""
+
+    error_code: ClassVar[str] = "pipeline_payload_invalid"
+
+
+class PipelinePayloadTooLargeError(PipelinePayloadValidationError):
+    """Raised when an uploaded file exceeds the configured size limit."""
+
+    error_code: ClassVar[str] = "pipeline_payload_too_large"
+
+
+class PipelineUnsupportedMediaTypeError(PipelinePayloadValidationError):
+    """Raised when upload bytes do not match the supported image contract."""
+
+    error_code: ClassVar[str] = "pipeline_unsupported_media_type"
+
+
+class PipelineSourceConflictError(PipelineServiceError):
+    """Raised when source provenance collides with existing durable state."""
+
+    error_code: ClassVar[str] = "pipeline_source_conflict"
+
+
+class PipelineStorageError(PipelineServiceError):
+    """Raised when the S3-compatible original write cannot complete."""
+
+    error_code: ClassVar[str] = "pipeline_storage_failure"
+
+
+class PipelineIngestError(PipelineServiceError):
+    """Raised when PostgreSQL persistence cannot finalize an ingest transaction."""
+
+    error_code: ClassVar[str] = "pipeline_ingest_failure"
+
+
+class PipelinePublishError(PipelineServiceError):
+    """Raised when downstream dispatch fails after durable writes succeed."""
+
+    error_code: ClassVar[str] = "pipeline_publish_failure"
+
+
 __all__ = [
     "AccountLinkAlreadyCompletedError",
     "AccountLinkError",
@@ -207,6 +267,16 @@ __all__ = [
     "InvalidIdentityError",
     "InvalidTokenError",
     "MissingTokenError",
+    "PipelineIngestError",
+    "PipelineItemNotFoundError",
+    "PipelineOperatorTokenError",
+    "PipelinePayloadTooLargeError",
+    "PipelinePayloadValidationError",
+    "PipelinePublishError",
+    "PipelineServiceError",
+    "PipelineSourceConflictError",
+    "PipelineStorageError",
+    "PipelineUnsupportedMediaTypeError",
     "ProviderAccessDeniedError",
     "ProviderNotConfiguredError",
     "ProviderPayloadExpiredError",

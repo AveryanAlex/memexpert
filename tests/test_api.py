@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from memexpert.api.app import create_app
+from memexpert.api.dependencies.pipeline import PIPELINE_OPERATOR_TOKEN_HEADER_NAME
 
 
 def test_create_app_returns_fastapi_instance_with_expected_metadata() -> None:
@@ -45,11 +46,26 @@ def test_v1_namespace_root_and_openapi_spec_are_available() -> None:
         "/api/v1/auth/refresh": "post",
         "/api/v1/auth/me": "get",
     }
+    expected_pipeline_paths = {
+        "/api/v1/pipeline/uploads": "post",
+        "/api/v1/pipeline/items/{meme_file_id}": "get",
+    }
 
     assert namespace_response.status_code == 200
     assert namespace_response.json() == {"version": "v1", "status": "available"}
     assert openapi_response.status_code == 200
     assert "/api/v1/" in paths
-    for path, method in expected_auth_paths.items():
+    for path, method in {**expected_auth_paths, **expected_pipeline_paths}.items():
         assert path in paths
         assert method in paths[path]
+
+    upload_parameters = paths["/api/v1/pipeline/uploads"]["post"]["parameters"]
+    detail_parameters = paths["/api/v1/pipeline/items/{meme_file_id}"]["get"]["parameters"]
+    assert any(
+        parameter["name"] == PIPELINE_OPERATOR_TOKEN_HEADER_NAME and parameter["in"] == "header"
+        for parameter in upload_parameters
+    )
+    assert any(
+        parameter["name"] == PIPELINE_OPERATOR_TOKEN_HEADER_NAME and parameter["in"] == "header"
+        for parameter in detail_parameters
+    )

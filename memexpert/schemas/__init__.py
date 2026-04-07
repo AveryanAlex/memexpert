@@ -14,11 +14,15 @@ from memexpert.schemas.auth import (
 from memexpert.schemas.collection import CollectionInviteRead, CollectionMemberRead, CollectionRead
 from memexpert.schemas.content_pipeline import (
     ContentPipelineDispatchEvent,
+    ContentPipelineErrorCode,
+    ContentPipelineErrorResponse,
     ContentPipelineEventType,
     ContentPipelineItemRead,
     ContentPipelineReplayAccepted,
     ContentPipelineReplayRequest,
     ContentPipelineStageJournalRead,
+    ContentPipelineUploadMetadata,
+    ContentPipelineUploadRead,
 )
 from memexpert.schemas.user import (
     AccountDeletionLogRead,
@@ -42,11 +46,15 @@ __all__ = [
     "CollectionMemberRead",
     "CollectionRead",
     "ContentPipelineDispatchEvent",
+    "ContentPipelineErrorCode",
+    "ContentPipelineErrorResponse",
     "ContentPipelineEventType",
     "ContentPipelineItemRead",
     "ContentPipelineReplayAccepted",
     "ContentPipelineReplayRequest",
     "ContentPipelineStageJournalRead",
+    "ContentPipelineUploadMetadata",
+    "ContentPipelineUploadRead",
     "EmailCredentialsRequest",
     "EmailLoginRequest",
     "EmailSignupRequest",
