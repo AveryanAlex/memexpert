@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, override
@@ -22,19 +23,22 @@ from memexpert.models.enums import (
 )
 from memexpert.models.user import AccountMergeLog, AnalyticsEvent, InlineUsageEvent, User
 from memexpert.services import (
+    AccountLinkAlreadyCompletedError,
     AccountLinkInvariantError,
+    AccountLinkResult,
     AccountLinkService,
     AccountUnavailableError,
     GuestAccountRequiredError,
     InvalidCredentialsError,
     ProviderAuthService,
     ProviderPayloadInvalidError,
+    UserNotFoundError,
     UserService,
 )
 from memexpert.services.provider_auth_service import GoogleIdentity, TelegramIdentity
 
 if TYPE_CHECKING:
-    from sqlalchemy.ext.asyncio import AsyncSession
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
     from memexpert.schemas.user import UserRead
 
@@ -79,6 +83,54 @@ class ExplodingAccountLinkService(AccountLinkService):
             target_user_id=target_user_id,
         )
         raise AccountLinkInvariantError("forced rollback after partial transfer")
+
+
+class CoordinatedMergeAccountLinkService(AccountLinkService):
+    """Pause the first merge after locking users so a second caller must resume stale."""
+
+    def __init__(
+        self,
+        session: AsyncSession,
+        *,
+        first_lock_acquired: asyncio.Event,
+        release_first: asyncio.Event,
+        provider_auth_service: ProviderAuthService | None = None,
+    ) -> None:
+        super().__init__(session, provider_auth_service=provider_auth_service)
+        self._first_lock_acquired = first_lock_acquired
+        self._release_first = release_first
+
+    @override
+    async def _lock_users_in_order(self, *user_ids: uuid.UUID) -> dict[uuid.UUID, User | None]:
+        locked_users = await super()._lock_users_in_order(*user_ids)
+        if not self._first_lock_acquired.is_set():
+            self._first_lock_acquired.set()
+            await self._release_first.wait()
+        return locked_users
+
+
+class CoordinatedUpgradeAccountLinkService(AccountLinkService):
+    """Pause the first in-place upgrade after locking the guest so a second caller resumes stale."""
+
+    def __init__(
+        self,
+        session: AsyncSession,
+        *,
+        first_lock_acquired: asyncio.Event,
+        release_first: asyncio.Event,
+        provider_auth_service: ProviderAuthService | None = None,
+    ) -> None:
+        super().__init__(session, provider_auth_service=provider_auth_service)
+        self._first_lock_acquired = first_lock_acquired
+        self._release_first = release_first
+
+    @override
+    async def _lock_required_user(self, user_id: uuid.UUID) -> User:
+        user = await super()._lock_required_user(user_id)
+        if not self._first_lock_acquired.is_set():
+            self._first_lock_acquired.set()
+            await self._release_first.wait()
+        return user
 
 
 async def create_password_user(
@@ -321,6 +373,191 @@ async def test_email_login_merges_guest_into_existing_full_with_deduped_favorite
         "views_transferred": 1,
         "inline_usage_events_transferred": 1,
     }
+
+
+async def test_concurrent_email_login_merge_loser_raises_completed_elsewhere_after_guest_deletion(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    user_service = UserService(migrated_db_session)
+    guest = await user_service.create_guest_user(language=UserLanguage.EN, nsfw_enabled=True)
+    full_user = await create_password_user(
+        migrated_db_session,
+        email="race-owner@example.com",
+        language=UserLanguage.RU,
+        nsfw_enabled=False,
+    )
+
+    guest_favorites_id = await get_favorites_collection_id(migrated_db_session, owner_id=guest.id)
+    assert guest_favorites_id is not None
+
+    guest_meme = await create_meme(migrated_db_session)
+    await add_saved_meme(
+        migrated_db_session,
+        collection_id=guest_favorites_id,
+        meme_id=guest_meme.id,
+        added_by_user_id=guest.id,
+    )
+    await add_guest_history(migrated_db_session, guest_user_id=guest.id, meme_id=str(guest_meme.id))
+    await migrated_db_session.commit()
+
+    first_lock_acquired = asyncio.Event()
+    release_first = asyncio.Event()
+    second_started = asyncio.Event()
+
+    async def merge_once(*, started_event: asyncio.Event | None = None) -> AccountLinkResult | Exception:
+        if started_event is not None:
+            started_event.set()
+
+        async with postgres_session_factory() as session:
+            service = CoordinatedMergeAccountLinkService(
+                session,
+                first_lock_acquired=first_lock_acquired,
+                release_first=release_first,
+                provider_auth_service=build_provider_auth_service(session),
+            )
+            try:
+                return await service.link_guest_with_email_login(
+                    guest_user_id=guest.id,
+                    email="race-owner@example.com",
+                    password=PASSWORD,
+                )
+            except Exception as exc:  # pragma: no cover - assertions below validate the concrete type
+                return exc
+
+    first_task = asyncio.create_task(merge_once())
+    await first_lock_acquired.wait()
+
+    second_task = asyncio.create_task(merge_once(started_event=second_started))
+    await second_started.wait()
+    await asyncio.sleep(0)
+    release_first.set()
+
+    first_result, second_result = await asyncio.gather(first_task, second_task)
+    results = [first_result, second_result]
+    successful_results = [result for result in results if isinstance(result, AccountLinkResult)]
+    failed_results = [result for result in results if isinstance(result, Exception)]
+
+    assert len(successful_results) == 1
+    assert len(failed_results) == 1
+    assert isinstance(failed_results[0], AccountLinkAlreadyCompletedError)
+
+    winner = successful_results[0]
+    assert winner.merge_performed is True
+    assert winner.user.id == full_user.id
+    assert winner.deleted_guest_user_id == guest.id
+    assert winner.favorites_transferred == 1
+    assert winner.duplicate_favorites_skipped == 0
+    assert winner.analytics_events_transferred == 2
+    assert winner.inline_usage_events_transferred == 1
+    assert winner.views_transferred == 1
+
+    async with postgres_session_factory() as verification_session:
+        merge_logs_result = await verification_session.execute(select(AccountMergeLog))
+        persisted_guest_result = await verification_session.execute(select(User).where(User.id == guest.id))
+        analytics_user_ids_result = await verification_session.execute(select(AnalyticsEvent.user_id))
+        inline_user_ids_result = await verification_session.execute(select(InlineUsageEvent.user_id))
+
+        merge_logs = merge_logs_result.scalars().all()
+        assert len(merge_logs) == 1
+        merge_log = merge_logs[0]
+        assert merge_log.guest_account_id == guest.id
+        assert merge_log.target_account_id == full_user.id
+        assert merge_log.favorites_transferred == 1
+        assert merge_log.views_transferred == 1
+        assert merge_log.details["guest_favorite_rows"] == 1
+        assert merge_log.details["favorites_transferred"] == 1
+        assert merge_log.details["favorite_duplicates_skipped"] == 0
+        assert merge_log.details["analytics_events_transferred"] == 2
+        assert merge_log.details["inline_usage_events_transferred"] == 1
+        assert persisted_guest_result.scalar_one_or_none() is None
+        assert analytics_user_ids_result.scalars().all() == [full_user.id, full_user.id]
+        assert inline_user_ids_result.scalars().all() == [full_user.id]
+        assert await count_favorites_rows(verification_session, owner_id=full_user.id) == 1
+
+
+async def test_concurrent_email_signup_upgrade_loser_raises_completed_elsewhere_for_stale_full_guest(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    user_service = UserService(migrated_db_session)
+    guest = await user_service.create_guest_user(language=UserLanguage.RU, nsfw_enabled=True)
+    favorites_collection_id = await get_favorites_collection_id(migrated_db_session, owner_id=guest.id)
+    assert favorites_collection_id is not None
+    await migrated_db_session.commit()
+
+    first_lock_acquired = asyncio.Event()
+    release_first = asyncio.Event()
+    second_started = asyncio.Event()
+
+    async def upgrade_once(*, started_event: asyncio.Event | None = None) -> AccountLinkResult | Exception:
+        if started_event is not None:
+            started_event.set()
+
+        async with postgres_session_factory() as session:
+            service = CoordinatedUpgradeAccountLinkService(
+                session,
+                first_lock_acquired=first_lock_acquired,
+                release_first=release_first,
+                provider_auth_service=build_provider_auth_service(session),
+            )
+            try:
+                return await service.link_guest_with_email_signup(
+                    guest_user_id=guest.id,
+                    email="stale-upgrade@example.com",
+                    password=PASSWORD,
+                )
+            except Exception as exc:  # pragma: no cover - assertions below validate the concrete type
+                return exc
+
+    first_task = asyncio.create_task(upgrade_once())
+    await first_lock_acquired.wait()
+
+    second_task = asyncio.create_task(upgrade_once(started_event=second_started))
+    await second_started.wait()
+    await asyncio.sleep(0)
+    release_first.set()
+
+    first_result, second_result = await asyncio.gather(first_task, second_task)
+    results = [first_result, second_result]
+    successful_results = [result for result in results if isinstance(result, AccountLinkResult)]
+    failed_results = [result for result in results if isinstance(result, Exception)]
+
+    assert len(successful_results) == 1
+    assert len(failed_results) == 1
+    assert isinstance(failed_results[0], AccountLinkAlreadyCompletedError)
+
+    winner = successful_results[0]
+    assert winner.merge_performed is False
+    assert winner.user.id == guest.id
+    assert winner.user.account_type is AccountType.FULL
+    assert winner.user.email == "stale-upgrade@example.com"
+    assert winner.merge_log_id is None
+
+    async with postgres_session_factory() as verification_session:
+        persisted_guest_result = await verification_session.execute(select(User).where(User.id == guest.id))
+        merge_log_count_result = await verification_session.execute(select(func.count()).select_from(AccountMergeLog))
+
+        persisted_guest = persisted_guest_result.scalar_one()
+        assert persisted_guest.account_type is AccountType.FULL
+        assert persisted_guest.email == "stale-upgrade@example.com"
+        assert persisted_guest.active_save_collection_id == favorites_collection_id
+        assert merge_log_count_result.scalar_one() == 0
+        assert await count_favorites_rows(verification_session, owner_id=guest.id) == 0
+
+
+async def test_link_service_keeps_missing_guest_errors_loud(
+    migrated_db_session: AsyncSession,
+) -> None:
+    link_service = build_account_link_service(migrated_db_session)
+    missing_guest_id = uuid.uuid7()
+
+    with pytest.raises(UserNotFoundError, match=str(missing_guest_id)):
+        _ = await link_service.link_guest_with_email_signup(
+            guest_user_id=missing_guest_id,
+            email="missing-guest@example.com",
+            password=PASSWORD,
+        )
 
 
 async def test_google_verified_email_link_merges_guest_into_existing_full_and_attaches_google_id(

@@ -37,6 +37,7 @@ class AuthErrorCode(StrEnum):
     ACCOUNT_UNAVAILABLE = "account_unavailable"
     UPGRADE_REQUIRED = "upgrade_required"
     GUEST_ACCOUNT_REQUIRED = "guest_account_required"
+    ACCOUNT_LINK_ALREADY_COMPLETED = "account_link_already_completed"
     ACCOUNT_LINK_INVARIANT_ERROR = "account_link_invariant_error"
 
 

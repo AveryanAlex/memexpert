@@ -113,6 +113,12 @@ class GuestAccountRequiredError(AccountLinkError):
     error_code: ClassVar[str] = "guest_account_required"
 
 
+class AccountLinkAlreadyCompletedError(AccountLinkError):
+    """Raised when the requested guest-link already finished on another request or surface."""
+
+    error_code: ClassVar[str] = "account_link_already_completed"
+
+
 class AccountLinkInvariantError(AccountLinkError):
     """Raised when merge prerequisites or audit invariants do not hold."""
 
@@ -176,6 +182,7 @@ class DuplicateCollectionInviteError(CollectionServiceError):
 
 
 __all__ = [
+    "AccountLinkAlreadyCompletedError",
     "AccountLinkError",
     "AccountLinkInvariantError",
     "AccountUnavailableError",

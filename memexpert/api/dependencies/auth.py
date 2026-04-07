@@ -14,6 +14,7 @@ from memexpert.models.enums import AccountType
 from memexpert.schemas.auth import AuthErrorCode, AuthErrorResponse
 from memexpert.schemas.user import UserRead
 from memexpert.services import (
+    AccountLinkAlreadyCompletedError,
     AccountLinkService,
     AuthConfigurationError,
     AuthService,
@@ -37,6 +38,7 @@ AUTH_ERROR_STATUS_CODES: Final[dict[AuthErrorCode, int]] = {
     AuthErrorCode.ACCOUNT_UNAVAILABLE: int(HTTPStatus.FORBIDDEN),
     AuthErrorCode.UPGRADE_REQUIRED: int(HTTPStatus.FORBIDDEN),
     AuthErrorCode.GUEST_ACCOUNT_REQUIRED: int(HTTPStatus.FORBIDDEN),
+    AuthErrorCode.ACCOUNT_LINK_ALREADY_COMPLETED: int(HTTPStatus.CONFLICT),
     AuthErrorCode.EMAIL_ALREADY_IN_USE: int(HTTPStatus.CONFLICT),
     AuthErrorCode.ACCOUNT_LINK_INVARIANT_ERROR: int(HTTPStatus.CONFLICT),
 }
@@ -124,6 +126,8 @@ def to_auth_http_error(error: AuthServiceError) -> AuthHTTPError:
     except ValueError:
         if isinstance(error, AuthConfigurationError):
             error_code = AuthErrorCode.AUTH_CONFIGURATION_ERROR
+        elif isinstance(error, AccountLinkAlreadyCompletedError):
+            error_code = AuthErrorCode.ACCOUNT_LINK_ALREADY_COMPLETED
         else:
             error_code = AuthErrorCode.INVALID_TOKEN
 

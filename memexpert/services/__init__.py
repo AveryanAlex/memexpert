@@ -14,6 +14,7 @@ from memexpert.services.auth_service import (
 )
 from memexpert.services.collection_service import CollectionService
 from memexpert.services.errors import (
+    AccountLinkAlreadyCompletedError,
     AccountLinkError,
     AccountLinkInvariantError,
     AccountUnavailableError,
@@ -55,6 +56,7 @@ from memexpert.services.user_service import DEFAULT_GUEST_LIFETIME, FAVORITES_TI
 
 __all__ = [
     "ACCESS_TOKEN_TYPE",
+    "AccountLinkAlreadyCompletedError",
     "AccountLinkError",
     "AccountLinkInvariantError",
     "AccountLinkResult",
