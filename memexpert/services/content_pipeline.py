@@ -79,8 +79,11 @@ _MIME_TYPE_TO_EXTENSIONS: dict[str, frozenset[str]] = {
 _STAGE_ORDER: dict[ContentPipelineStage, int] = {
     ContentPipelineStage.INGEST: 0,
     ContentPipelineStage.TRANSCODE: 1,
-    ContentPipelineStage.SYNC_QDRANT: 2,
-    ContentPipelineStage.SYNC_MEILI: 3,
+    ContentPipelineStage.OCR: 2,
+    ContentPipelineStage.EMBED: 3,
+    ContentPipelineStage.CLASSIFY: 4,
+    ContentPipelineStage.SYNC_QDRANT: 5,
+    ContentPipelineStage.SYNC_MEILI: 6,
 }
 _ACTIVE_STAGE_STATUSES = {
     ContentPipelineStageStatus.PENDING,
@@ -141,6 +144,26 @@ class StageJournalSnapshot:
     retry_after: datetime | None
     started_at: datetime | None
     status: ContentPipelineStageStatus
+
+
+@dataclass(frozen=True, slots=True)
+class DownstreamStageDispatch:
+    """A durable next-stage dispatch created after one stage succeeds."""
+
+    event: ContentPipelineDispatchEvent
+    stage_entry: PipelineStageJournal
+
+
+_DOWNSTREAM_STAGE_EVENT_TYPES: dict[ContentPipelineStage, ContentPipelineEventType] = {
+    ContentPipelineStage.TRANSCODE: ContentPipelineEventType.MEME_TRANSCODED,
+    ContentPipelineStage.OCR: ContentPipelineEventType.MEME_OCR_DONE,
+    ContentPipelineStage.EMBED: ContentPipelineEventType.MEME_EMBEDDED,
+}
+_NEXT_STAGE_BY_STAGE: dict[ContentPipelineStage, ContentPipelineStage] = {
+    ContentPipelineStage.TRANSCODE: ContentPipelineStage.OCR,
+    ContentPipelineStage.OCR: ContentPipelineStage.EMBED,
+    ContentPipelineStage.EMBED: ContentPipelineStage.CLASSIFY,
+}
 
 
 class ContentPipelineService:
@@ -346,6 +369,7 @@ class ContentPipelineService:
         """Persist a worker transition from queued to actively running."""
 
         meme_file, stage_entry = await self._get_meme_file_and_stage_entry(meme_file_id, stage)
+        self._ensure_stage_attempt_is_current(stage_entry, attempt=attempt)
         started_at = utcnow()
 
         stage_entry.status = ContentPipelineStageStatus.PROCESSING
@@ -375,6 +399,7 @@ class ContentPipelineService:
         """Persist a failed worker attempt with an explicit retryability decision."""
 
         meme_file, stage_entry = await self._get_meme_file_and_stage_entry(meme_file_id, stage)
+        self._ensure_stage_attempt_is_current(stage_entry, attempt=attempt)
         failed_at = utcnow()
 
         stage_entry.status = ContentPipelineStageStatus.FAILED
@@ -402,9 +427,10 @@ class ContentPipelineService:
         attempt: int,
         event_id: uuid.UUID,
     ) -> None:
-        """Persist a successful worker attempt and any derivative object-key state."""
+        """Persist a successful worker attempt and enqueue the next durable stage when needed."""
 
         meme_file, stage_entry = await self._get_meme_file_and_stage_entry(meme_file_id, stage)
+        self._ensure_stage_attempt_is_current(stage_entry, attempt=attempt)
         finished_at = utcnow()
 
         stage_entry.status = ContentPipelineStageStatus.SUCCEEDED
@@ -417,11 +443,29 @@ class ContentPipelineService:
         stage_entry.started_at = stage_entry.started_at or finished_at
         stage_entry.finished_at = finished_at
 
-        if stage is ContentPipelineStage.TRANSCODE:
+        if stage is ContentPipelineStage.TRANSCODE and meme_file.s3_web_video_key is None:
             meme_file.s3_web_video_key = build_web_video_object_key(meme_file_id, settings=self._settings)
+
+        downstream_dispatches = self._prepare_downstream_dispatches(
+            meme_file=meme_file,
+            stage=stage,
+            created_at=finished_at,
+        )
+        if downstream_dispatches:
+            meme_file.status = ContentProcessingStatus.PROCESSING
+        elif stage is ContentPipelineStage.CLASSIFY:
             meme_file.status = ContentProcessingStatus.READY
+        else:
+            meme_file.status = ContentProcessingStatus.PROCESSING
 
         await self._commit_stage_mutation("Failed to persist successful stage state.")
+
+        for dispatch in downstream_dispatches:
+            try:
+                await self._publisher(dispatch.event)
+            except Exception as exc:
+                await self._mark_publish_failure_for_downstream_stage(dispatch=dispatch, error=exc)
+                raise PipelinePublishError("Stage success was stored, but downstream dispatch failed.") from exc
 
     def _prepare_upload(
         self,
@@ -738,7 +782,7 @@ class ContentPipelineService:
         _ = await broker.publish(
             payload,
             exchange=self._broker_settings.exchange,
-            routing_key=self._broker_settings.routing_key_for_event(event.event_type),
+            routing_key=self._broker_settings.routing_key_for_stage(event.stage),
             persist=True,
             content_type="application/json",
             message_id=str(event.event_id),
@@ -793,8 +837,8 @@ class ContentPipelineService:
             None,
         )
         if stage_entry is None:
-            raise PipelineReplayNotAllowedError(
-                f"Pipeline item {meme_file_id} does not have durable journal state for stage {stage.value}.",
+            raise PipelineIngestError(
+                f"Pipeline item {meme_file_id} does not have durable journal state for stage {stage.value}."
             )
         return meme_file, stage_entry
 
@@ -804,6 +848,74 @@ class ContentPipelineService:
         except SQLAlchemyError as exc:
             await self._session.rollback()
             raise PipelineIngestError(failure_message) from exc
+
+    def _prepare_downstream_dispatches(
+        self,
+        *,
+        meme_file: MemeFile,
+        stage: ContentPipelineStage,
+        created_at: datetime,
+    ) -> tuple[DownstreamStageDispatch, ...]:
+        next_stage = _NEXT_STAGE_BY_STAGE.get(stage)
+        if next_stage is None:
+            return ()
+
+        existing_stage_entry = next(
+            (entry for entry in meme_file.pipeline_stage_journal_entries if entry.stage is next_stage),
+            None,
+        )
+        if existing_stage_entry is not None:
+            return ()
+
+        dispatch_event = ContentPipelineDispatchEvent(
+            event_id=uuid.uuid7(),
+            event_type=_DOWNSTREAM_STAGE_EVENT_TYPES[stage],
+            meme_id=meme_file.meme_id,
+            meme_file_id=meme_file.id,
+            stage=next_stage,
+            source_kind=ContentSourceKind.MANUAL_UPLOAD,
+            original_object_key=meme_file.s3_original_key,
+            attempt=1,
+            created_at=created_at,
+        )
+        stage_entry = PipelineStageJournal(
+            meme_file_id=meme_file.id,
+            stage=next_stage,
+            status=ContentPipelineStageStatus.PENDING,
+            attempt_count=0,
+            last_event_id=dispatch_event.event_id,
+            is_retryable=True,
+        )
+        self._session.add(stage_entry)
+        meme_file.pipeline_stage_journal_entries.append(stage_entry)
+        return (DownstreamStageDispatch(event=dispatch_event, stage_entry=stage_entry),)
+
+    async def _mark_publish_failure_for_downstream_stage(
+        self,
+        *,
+        dispatch: DownstreamStageDispatch,
+        error: Exception,
+    ) -> None:
+        try:
+            await self.mark_stage_failed(
+                meme_file_id=dispatch.stage_entry.meme_file_id,
+                stage=dispatch.stage_entry.stage,
+                attempt=dispatch.event.attempt,
+                event_id=dispatch.event.event_id,
+                normalized_reason=_PIPELINE_REASON_PUBLISH_FAILED,
+                last_error_text=str(error),
+                retryable=True,
+            )
+        except (PipelineIngestError, PipelineItemNotFoundError):
+            return
+
+    @staticmethod
+    def _ensure_stage_attempt_is_current(stage_entry: PipelineStageJournal, *, attempt: int) -> None:
+        if attempt < stage_entry.attempt_count:
+            raise PipelineIngestError(
+                "Received a stale stage transition for "
+                f"{stage_entry.stage.value}: attempt {attempt} is behind durable attempt {stage_entry.attempt_count}."
+            )
 
     async def _restore_stage_snapshot(self, stage_entry_id: uuid.UUID, snapshot: StageJournalSnapshot) -> None:
         try:

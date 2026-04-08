@@ -14,6 +14,7 @@ from aio_pika import ExchangeType
 from faststream.rabbit import RabbitBroker
 
 from memexpert.core.config import Settings, get_settings
+from memexpert.models.enums import ContentPipelineStage
 from memexpert.schemas.content_pipeline import ContentPipelineEventType
 
 if TYPE_CHECKING:
@@ -32,6 +33,11 @@ class PipelineBrokerSettings:
     exchange: str
     routing_key_prefix: str
     transcode_queue: str
+    ocr_queue: str
+    embed_queue: str
+    classify_queue: str
+    sync_qdrant_queue: str
+    sync_meili_queue: str
     retry_exchange: str
     retry_queue: str
     dead_letter_exchange: str
@@ -41,16 +47,52 @@ class PipelineBrokerSettings:
     connection_timeout: float
 
     @property
-    def meme_created_routing_key(self) -> str:
-        """Return the routing key used for durable post-upload dispatches."""
+    def transcode_routing_key(self) -> str:
+        """Return the routing key used to dispatch transcode work."""
 
-        return f"{self.routing_key_prefix}.meme_created"
+        return self.routing_key_for_stage(ContentPipelineStage.TRANSCODE)
+
+    @property
+    def ocr_routing_key(self) -> str:
+        """Return the routing key used to dispatch OCR work."""
+
+        return self.routing_key_for_stage(ContentPipelineStage.OCR)
+
+    @property
+    def embed_routing_key(self) -> str:
+        """Return the routing key used to dispatch embedding work."""
+
+        return self.routing_key_for_stage(ContentPipelineStage.EMBED)
+
+    @property
+    def classify_routing_key(self) -> str:
+        """Return the routing key used to dispatch classification work."""
+
+        return self.routing_key_for_stage(ContentPipelineStage.CLASSIFY)
+
+    @property
+    def sync_qdrant_routing_key(self) -> str:
+        """Return the routing key used to dispatch Qdrant sync work."""
+
+        return self.routing_key_for_stage(ContentPipelineStage.SYNC_QDRANT)
+
+    @property
+    def sync_meili_routing_key(self) -> str:
+        """Return the routing key used to dispatch Meilisearch sync work."""
+
+        return self.routing_key_for_stage(ContentPipelineStage.SYNC_MEILI)
+
+    @property
+    def meme_created_routing_key(self) -> str:
+        """Return the routing key used for durable post-upload transcode dispatches."""
+
+        return self.transcode_routing_key
 
     @property
     def stage_replay_routing_key(self) -> str:
-        """Return the routing key used for operator-triggered stage replays."""
+        """Return the legacy transcode replay routing key kept for S01 compatibility."""
 
-        return f"{self.routing_key_prefix}.stage_replay_requested"
+        return self.transcode_routing_key
 
     @property
     def retry_routing_key(self) -> str:
@@ -76,11 +118,24 @@ class PipelineBrokerSettings:
 
         return max(int(self.retry_backoff_seconds * 1000), 1)
 
+    def routing_key_for_stage(self, stage: ContentPipelineStage) -> str:
+        """Map a pipeline stage onto the queue routing key that should receive its work."""
+
+        return f"{self.routing_key_prefix}.{stage.value}"
+
     def routing_key_for_event(self, event_type: ContentPipelineEventType) -> str:
-        """Map broker event types onto the topology routing keys."""
+        """Map legacy broker event types onto the existing topology routing keys."""
 
         if event_type is ContentPipelineEventType.MEME_CREATED:
             return self.meme_created_routing_key
+        if event_type is ContentPipelineEventType.MEME_TRANSCODED:
+            return self.ocr_routing_key
+        if event_type is ContentPipelineEventType.MEME_OCR_DONE:
+            return self.embed_routing_key
+        if event_type is ContentPipelineEventType.MEME_EMBEDDED:
+            return self.classify_routing_key
+        if event_type is ContentPipelineEventType.MEME_READY:
+            return self.sync_qdrant_routing_key
         if event_type is ContentPipelineEventType.STAGE_REPLAY_REQUESTED:
             return self.stage_replay_routing_key
         return self.meme_created_routing_key
@@ -168,6 +223,26 @@ def get_pipeline_broker_settings(settings: Settings | None = None) -> PipelineBr
         transcode_queue=_normalize_topology_name(
             resolved_settings.pipeline_broker_transcode_queue,
             field_name="pipeline_broker_transcode_queue",
+        ),
+        ocr_queue=_normalize_topology_name(
+            resolved_settings.pipeline_broker_ocr_queue,
+            field_name="pipeline_broker_ocr_queue",
+        ),
+        embed_queue=_normalize_topology_name(
+            resolved_settings.pipeline_broker_embed_queue,
+            field_name="pipeline_broker_embed_queue",
+        ),
+        classify_queue=_normalize_topology_name(
+            resolved_settings.pipeline_broker_classify_queue,
+            field_name="pipeline_broker_classify_queue",
+        ),
+        sync_qdrant_queue=_normalize_topology_name(
+            resolved_settings.pipeline_broker_sync_qdrant_queue,
+            field_name="pipeline_broker_sync_qdrant_queue",
+        ),
+        sync_meili_queue=_normalize_topology_name(
+            resolved_settings.pipeline_broker_sync_meili_queue,
+            field_name="pipeline_broker_sync_meili_queue",
         ),
         retry_exchange=_normalize_topology_name(
             resolved_settings.pipeline_broker_retry_exchange,

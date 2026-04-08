@@ -20,6 +20,8 @@ from memexpert.models.content import (
     EmbeddingCache,
     Meme,
     MemeFile,
+    MemeFileOCRResult,
+    MemeMergeLog,
     MemePopularitySnapshot,
     MemeSeoPage,
     MemeSource,
@@ -83,7 +85,9 @@ EXPECTED_TABLES = {
     "collections",
     "embedding_cache",
     "inline_usage_events",
+    "meme_file_ocr_results",
     "meme_files",
+    "meme_merge_logs",
     "meme_popularity_snapshots",
     "meme_seo_pages",
     "meme_sources",
@@ -157,6 +161,7 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
     assert meme_relationships["files"].mapper.class_ is MemeFile
     assert meme_relationships["primary_file"].mapper.class_ is MemeFile
     assert meme_file_relationships["pipeline_stage_journal_entries"].mapper.class_ is PipelineStageJournal
+    assert meme_file_relationships["ocr_result"].mapper.class_ is MemeFileOCRResult
 
 
 async def test_metadata_creates_full_schema_on_postgres(postgres_async_engine: AsyncEngine) -> None:
@@ -310,6 +315,18 @@ async def test_schema_handles_cycles_multi_invites_and_nullable_content_fields(
                     telegram_file_id="AgACAgIAAxkBAAIBQGmock",
                     telegram_file_unique_id="AQADmock",
                 ),
+                MemeFileOCRResult(
+                    meme_file=file_one,
+                    engine="paddleocr",
+                    fallback_engine="qwen2.5-vl-2b",
+                    fallback_used=False,
+                    low_confidence=False,
+                    confidence=0.93,
+                    language=ContentLanguage.EN,
+                    extracted_text="deadline monday",
+                    source_object_key="pipeline/derived/file-one/web.mp4",
+                    last_event_id=uuid.uuid7(),
+                ),
                 EmbeddingCache(
                     input_hash="d" * 64,
                     input_type=EmbeddingInputType.IMAGE,
@@ -330,11 +347,42 @@ async def test_schema_handles_cycles_multi_invites_and_nullable_content_fields(
                 PipelineStageJournal(
                     meme_file=file_one,
                     stage=ContentPipelineStage.TRANSCODE,
-                    status=ContentPipelineStageStatus.PENDING,
-                    attempt_count=0,
+                    status=ContentPipelineStageStatus.SUCCEEDED,
+                    attempt_count=1,
                     last_event_id=uuid.uuid7(),
-                    is_retryable=True,
-                    retry_after=utcnow() + timedelta(minutes=5),
+                    is_retryable=False,
+                    started_at=utcnow(),
+                    finished_at=utcnow(),
+                ),
+                PipelineStageJournal(
+                    meme_file=file_one,
+                    stage=ContentPipelineStage.OCR,
+                    status=ContentPipelineStageStatus.SUCCEEDED,
+                    attempt_count=1,
+                    last_event_id=uuid.uuid7(),
+                    is_retryable=False,
+                    started_at=utcnow(),
+                    finished_at=utcnow(),
+                ),
+                PipelineStageJournal(
+                    meme_file=file_one,
+                    stage=ContentPipelineStage.EMBED,
+                    status=ContentPipelineStageStatus.SUCCEEDED,
+                    attempt_count=1,
+                    last_event_id=uuid.uuid7(),
+                    is_retryable=False,
+                    started_at=utcnow(),
+                    finished_at=utcnow(),
+                ),
+                PipelineStageJournal(
+                    meme_file=file_one,
+                    stage=ContentPipelineStage.CLASSIFY,
+                    status=ContentPipelineStageStatus.SUCCEEDED,
+                    attempt_count=1,
+                    last_event_id=uuid.uuid7(),
+                    is_retryable=False,
+                    started_at=utcnow(),
+                    finished_at=utcnow(),
                 ),
                 PipelineStageJournal(
                     meme_file=file_one,
@@ -350,8 +398,8 @@ async def test_schema_handles_cycles_multi_invites_and_nullable_content_fields(
                     status=ContentPipelineStageStatus.FAILED,
                     attempt_count=2,
                     last_event_id=uuid.uuid7(),
-                    normalized_reason="forced_failure",
-                    last_error_text="stub transcode failed",
+                    normalized_reason="target_sync_failed",
+                    last_error_text="sync dispatch failed",
                     is_retryable=True,
                     retry_after=utcnow() + timedelta(minutes=1),
                     started_at=utcnow(),
@@ -365,6 +413,15 @@ async def test_schema_handles_cycles_multi_invites_and_nullable_content_fields(
                     normalized_reason="duplicate_perceptual_hash",
                     is_retryable=False,
                     finished_at=utcnow(),
+                ),
+                MemeMergeLog(
+                    source_meme_id=uuid.uuid7(),
+                    source_meme_file_id=file_two.id,
+                    target_meme_id=meme.id,
+                    target_primary_file_id=file_one.id,
+                    similarity_score=0.97,
+                    merge_reason="high_similarity_match",
+                    details={"moved_file_ids": [str(file_two.id)]},
                 ),
                 CollectionMeme(collection=shared, meme=meme, added_by_user=owner),
                 PinnedMeme(user=owner, meme=meme, position=1),
@@ -446,7 +503,7 @@ async def test_schema_handles_cycles_multi_invites_and_nullable_content_fields(
         assert len(persisted_meme.files) == 2
         assert len(persisted_meme.files[0].pipeline_stage_journal_entries) + len(
             persisted_meme.files[1].pipeline_stage_journal_entries
-        ) == 5
+        ) == 8
         assert {
             entry.stage
             for meme_file in persisted_meme.files
@@ -454,6 +511,9 @@ async def test_schema_handles_cycles_multi_invites_and_nullable_content_fields(
         } >= {
             ContentPipelineStage.INGEST,
             ContentPipelineStage.TRANSCODE,
+            ContentPipelineStage.OCR,
+            ContentPipelineStage.EMBED,
+            ContentPipelineStage.CLASSIFY,
             ContentPipelineStage.SYNC_QDRANT,
             ContentPipelineStage.SYNC_MEILI,
         }
@@ -462,6 +522,19 @@ async def test_schema_handles_cycles_multi_invites_and_nullable_content_fields(
             for meme_file in persisted_meme.files
             for entry in meme_file.pipeline_stage_journal_entries
         )
+
+        ocr_result = await session.scalar(
+            select(MemeFileOCRResult).where(MemeFileOCRResult.meme_file_id == file_one.id)
+        )
+        merge_log = await session.scalar(
+            select(MemeMergeLog).where(MemeMergeLog.source_meme_file_id == file_two.id)
+        )
+
+        assert ocr_result is not None
+        assert ocr_result.engine == "paddleocr"
+        assert ocr_result.language is ContentLanguage.EN
+        assert merge_log is not None
+        assert merge_log.merge_reason == "high_similarity_match"
 
 
 async def test_constraints_reject_duplicate_provider_ids_and_duplicate_favorites(
@@ -668,7 +741,7 @@ def test_public_schemas_validate_from_attributes_and_reject_invalid_enums() -> N
         )
 
 
-def test_content_pipeline_schemas_reject_invalid_stage_names_and_raw_media_payloads() -> None:
+def test_content_pipeline_schemas_reject_invalid_stage_names_event_pairings_and_raw_media_payloads() -> None:
     now = utcnow()
     event_id = uuid.uuid7()
     meme_id = uuid.uuid7()
@@ -690,7 +763,7 @@ def test_content_pipeline_schemas_reject_invalid_stage_names_and_raw_media_paylo
         updated_at=now,
     )
 
-    event_payload = ContentPipelineDispatchEvent.model_validate(
+    created_payload = ContentPipelineDispatchEvent.model_validate(
         {
             "event_id": event_id,
             "event_type": ContentPipelineEventType.MEME_CREATED.value,
@@ -703,10 +776,25 @@ def test_content_pipeline_schemas_reject_invalid_stage_names_and_raw_media_paylo
             "created_at": now,
         }
     ).model_dump(mode="json")
+    transcoded_payload = ContentPipelineDispatchEvent.model_validate(
+        {
+            "event_id": uuid.uuid7(),
+            "event_type": ContentPipelineEventType.MEME_TRANSCODED.value,
+            "meme_id": meme_id,
+            "meme_file_id": meme_file_id,
+            "stage": ContentPipelineStage.OCR.value,
+            "source_kind": "manual_upload",
+            "original_object_key": "pipeline/originals/file/original.jpeg",
+            "attempt": 1,
+            "created_at": now,
+        }
+    ).model_dump(mode="json")
     journal_payload = ContentPipelineStageJournalRead.model_validate(journal_entry).model_dump(mode="json")
 
-    assert event_payload["stage"] == ContentPipelineStage.TRANSCODE.value
-    assert event_payload["event_type"] == ContentPipelineEventType.MEME_CREATED.value
+    assert created_payload["stage"] == ContentPipelineStage.TRANSCODE.value
+    assert created_payload["event_type"] == ContentPipelineEventType.MEME_CREATED.value
+    assert transcoded_payload["stage"] == ContentPipelineStage.OCR.value
+    assert transcoded_payload["event_type"] == ContentPipelineEventType.MEME_TRANSCODED.value
     assert journal_payload["status"] == ContentPipelineStageStatus.FAILED.value
     assert journal_payload["normalized_reason"] == "forced_failure"
 
@@ -718,6 +806,21 @@ def test_content_pipeline_schemas_reject_invalid_stage_names_and_raw_media_paylo
                 "meme_id": meme_id,
                 "meme_file_id": meme_file_id,
                 "stage": "unsupported_stage",
+                "source_kind": "manual_upload",
+                "original_object_key": "pipeline/originals/file/original.jpeg",
+                "attempt": 1,
+                "created_at": now,
+            }
+        )
+
+    with pytest.raises(ValidationError):
+        _ = ContentPipelineDispatchEvent.model_validate(
+            {
+                "event_id": event_id,
+                "event_type": ContentPipelineEventType.MEME_OCR_DONE.value,
+                "meme_id": meme_id,
+                "meme_file_id": meme_file_id,
+                "stage": ContentPipelineStage.CLASSIFY.value,
                 "source_kind": "manual_upload",
                 "original_object_key": "pipeline/originals/file/original.jpeg",
                 "attempt": 1,

@@ -174,6 +174,12 @@ class MemeFile(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         back_populates="meme_file",
         cascade="all, delete-orphan",
     )
+    ocr_result: Mapped["MemeFileOCRResult | None"] = relationship(
+        "MemeFileOCRResult",
+        back_populates="meme_file",
+        cascade="all, delete-orphan",
+        uselist=False,
+    )
 
 
 class PipelineStageJournal(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -212,6 +218,41 @@ class PipelineStageJournal(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     finished_at: Mapped[datetime | None] = mapped_column(nullable=True)
 
     meme_file: Mapped["MemeFile"] = relationship("MemeFile", back_populates="pipeline_stage_journal_entries")
+
+
+class MemeFileOCRResult(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """Durable per-file OCR provenance, confidence, and extracted text state."""
+
+    __tablename__ = "meme_file_ocr_results"
+    __table_args__ = (
+        CheckConstraint(
+            "confidence IS NULL OR (confidence >= 0 AND confidence <= 1)",
+            name="meme_file_ocr_results_confidence_between_zero_and_one",
+        ),
+        Index("uq_meme_file_ocr_results_meme_file_id", "meme_file_id", unique=True),
+        Index("ix_meme_file_ocr_results_engine_updated_at", "engine", "updated_at"),
+        Index("ix_meme_file_ocr_results_low_confidence_updated_at", "low_confidence", "updated_at"),
+    )
+
+    meme_file_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("meme_files.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    engine: Mapped[str] = mapped_column(String(64), nullable=False)
+    fallback_engine: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    fallback_used: Mapped[bool] = mapped_column(default=False, nullable=False)
+    low_confidence: Mapped[bool] = mapped_column(default=False, nullable=False)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    language: Mapped[ContentLanguage] = mapped_column(
+        string_enum(ContentLanguage),
+        default=ContentLanguage.NONE,
+        nullable=False,
+    )
+    extracted_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_object_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_event_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
+
+    meme_file: Mapped["MemeFile"] = relationship("MemeFile", back_populates="ocr_result")
 
 
 class MemeSource(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -395,10 +436,32 @@ class EmbeddingCache(UUIDPrimaryKeyMixin, Base):
     source_file: Mapped["MemeFile | None"] = relationship("MemeFile", back_populates="embedding_cache_entries")
 
 
+class MemeMergeLog(UUIDPrimaryKeyMixin, Base):
+    """Audit records for canonical meme merge decisions and moved lineage."""
+
+    __tablename__ = "meme_merge_logs"
+    __table_args__ = (
+        Index("ix_meme_merge_logs_source_meme_id_created_at", "source_meme_id", "created_at"),
+        Index("ix_meme_merge_logs_target_meme_id_created_at", "target_meme_id", "created_at"),
+        Index("ix_meme_merge_logs_source_meme_file_id", "source_meme_file_id"),
+    )
+
+    source_meme_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
+    source_meme_file_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
+    target_meme_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
+    target_primary_file_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
+    similarity_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    merge_reason: Mapped[str] = mapped_column(String(128), nullable=False)
+    details: Mapped[dict[str, object]] = mapped_column(JSONB, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow, nullable=False)
+
+
 __all__ = [
     "EmbeddingCache",
     "Meme",
     "MemeFile",
+    "MemeFileOCRResult",
+    "MemeMergeLog",
     "MemePopularitySnapshot",
     "MemeSeoPage",
     "MemeSource",

@@ -27,3 +27,6 @@ vendor/
 coverage/
 .cache/
 tmp/
+
+.artifacts
+.pytest_cache

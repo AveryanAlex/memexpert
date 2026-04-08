@@ -137,6 +137,9 @@ class ContentPipelineStage(StrEnum):
 
     INGEST = "ingest"
     TRANSCODE = "transcode"
+    OCR = "ocr"
+    EMBED = "embed"
+    CLASSIFY = "classify"
     SYNC_QDRANT = "sync_qdrant"
     SYNC_MEILI = "sync_meili"
 

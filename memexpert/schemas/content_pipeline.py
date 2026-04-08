@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 from memexpert.models.enums import ContentPipelineStage, ContentPipelineStageStatus, ContentSourceKind, SourcePlatform
 
@@ -22,7 +22,35 @@ class ContentPipelineEventType(StrEnum):
     """Machine-readable broker event names used by the content pipeline."""
 
     MEME_CREATED = "meme_created"
+    MEME_TRANSCODED = "meme_transcoded"
+    MEME_OCR_DONE = "meme_ocr_done"
+    MEME_EMBEDDED = "meme_embedded"
+    MEME_READY = "meme_ready"
     STAGE_REPLAY_REQUESTED = "stage_replay_requested"
+
+
+_PIPELINE_EVENT_ALLOWED_STAGES: dict[ContentPipelineEventType, frozenset[ContentPipelineStage]] = {
+    ContentPipelineEventType.MEME_CREATED: frozenset({ContentPipelineStage.TRANSCODE}),
+    ContentPipelineEventType.MEME_TRANSCODED: frozenset({ContentPipelineStage.OCR}),
+    ContentPipelineEventType.MEME_OCR_DONE: frozenset({ContentPipelineStage.EMBED}),
+    ContentPipelineEventType.MEME_EMBEDDED: frozenset({ContentPipelineStage.CLASSIFY}),
+    ContentPipelineEventType.MEME_READY: frozenset(
+        {
+            ContentPipelineStage.SYNC_QDRANT,
+            ContentPipelineStage.SYNC_MEILI,
+        }
+    ),
+    ContentPipelineEventType.STAGE_REPLAY_REQUESTED: frozenset(
+        {
+            ContentPipelineStage.TRANSCODE,
+            ContentPipelineStage.OCR,
+            ContentPipelineStage.EMBED,
+            ContentPipelineStage.CLASSIFY,
+            ContentPipelineStage.SYNC_QDRANT,
+            ContentPipelineStage.SYNC_MEILI,
+        }
+    ),
+}
 
 
 class ContentPipelineErrorCode(StrEnum):
@@ -97,6 +125,17 @@ class ContentPipelineDispatchEvent(BaseModel):
         if not normalized_value:
             raise ValueError("original_object_key must not be blank.")
         return normalized_value
+
+    @model_validator(mode="after")
+    def _validate_event_stage_pairing(self) -> ContentPipelineDispatchEvent:
+        allowed_stages = _PIPELINE_EVENT_ALLOWED_STAGES[self.event_type]
+        if self.stage not in allowed_stages:
+            sorted_stages = sorted(allowed_stages, key=lambda stage: stage.value)
+            allowed_stage_values = ", ".join(stage.value for stage in sorted_stages)
+            raise ValueError(
+                f"event_type {self.event_type.value!r} only allows stage values: {allowed_stage_values}."
+            )
+        return self
 
 
 class ContentPipelineStageJournalRead(BaseModel):

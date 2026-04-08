@@ -73,6 +73,11 @@ class Settings(BaseSettings):
     pipeline_broker_exchange: str = "memexpert.pipeline"
     pipeline_broker_routing_key_prefix: str = "pipeline"
     pipeline_broker_transcode_queue: str = "pipeline.transcode"
+    pipeline_broker_ocr_queue: str = "pipeline.ocr"
+    pipeline_broker_embed_queue: str = "pipeline.embed"
+    pipeline_broker_classify_queue: str = "pipeline.classify"
+    pipeline_broker_sync_qdrant_queue: str = "pipeline.sync_qdrant"
+    pipeline_broker_sync_meili_queue: str = "pipeline.sync_meili"
     pipeline_broker_retry_exchange: str = "memexpert.pipeline.retry"
     pipeline_broker_retry_queue: str = "pipeline.retry"
     pipeline_broker_dead_letter_exchange: str = "memexpert.pipeline.dlx"
@@ -80,7 +85,15 @@ class Settings(BaseSettings):
     pipeline_broker_retry_max_attempts: int = Field(default=5, ge=1, le=32)
     pipeline_broker_retry_backoff_seconds: float = Field(default=5.0, gt=0.0, le=3600.0)
     pipeline_broker_connection_timeout_seconds: float = Field(default=5.0, gt=0.0)
+    pipeline_worker_prefetch_count: int = Field(default=1, ge=1, le=512)
     pipeline_storage_connection_timeout_seconds: float = Field(default=5.0, gt=0.0)
+    pipeline_ocr_primary_engine: str = "paddleocr"
+    pipeline_ocr_fallback_engine: str = "qwen2.5-vl-2b"
+    pipeline_ocr_low_confidence_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
+    pipeline_voyage_model: str = "voyage-multimodal-3.5"
+    pipeline_voyage_output_dimensions: int = Field(default=1024, ge=1)
+    pipeline_qdrant_collection_name: str = "memexpert-memes"
+    pipeline_merge_similarity_threshold: float = Field(default=0.92, ge=0.0, le=1.0)
     pipeline_worker_fail_transcode_for_meme_file_id: str | None = None
     auth_jwt_secret: SecretStr = SecretStr("memexpert-dev-jwt-secret-with-32-byte-minimum")
     auth_access_token_algorithm: Literal["HS256"] = "HS256"
@@ -153,6 +166,11 @@ class Settings(BaseSettings):
         "pipeline_broker_exchange",
         "pipeline_broker_routing_key_prefix",
         "pipeline_broker_transcode_queue",
+        "pipeline_broker_ocr_queue",
+        "pipeline_broker_embed_queue",
+        "pipeline_broker_classify_queue",
+        "pipeline_broker_sync_qdrant_queue",
+        "pipeline_broker_sync_meili_queue",
         "pipeline_broker_retry_exchange",
         "pipeline_broker_retry_queue",
         "pipeline_broker_dead_letter_exchange",
@@ -187,6 +205,23 @@ class Settings(BaseSettings):
         if not segments or any(segment in {".", ".."} for segment in segments):
             raise ValueError("pipeline object-key prefixes must not contain empty, '.', or '..' path segments.")
         return "/".join(segments)
+
+    @field_validator(
+        "pipeline_ocr_primary_engine",
+        "pipeline_ocr_fallback_engine",
+        "pipeline_voyage_model",
+        "pipeline_qdrant_collection_name",
+        mode="before",
+    )
+    @classmethod
+    def _normalize_required_pipeline_runtime_text(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+
+        normalized_value = value.strip()
+        if not normalized_value:
+            raise ValueError("pipeline runtime text settings must not be blank.")
+        return normalized_value
 
     @field_validator("s3_bucket", mode="before")
     @classmethod

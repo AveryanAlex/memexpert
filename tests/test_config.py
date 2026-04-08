@@ -105,7 +105,8 @@ def test_settings_parse_pipeline_contract_and_normalize_object_prefixes() -> Non
     assert settings.s3_bucket == "memexpert-uploads"
 
     broker_settings = get_pipeline_broker_settings(settings)
-    assert broker_settings.meme_created_routing_key == "pipeline.meme_created"
+    assert broker_settings.meme_created_routing_key == "pipeline.transcode"
+    assert broker_settings.ocr_queue == "pipeline.ocr"
     assert broker_settings.dead_letter_routing_key == "pipeline.dead_letter"
 
 

@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from io import BytesIO
 from typing import TYPE_CHECKING, Any, cast
 
+import memexpert.services.content_pipeline as content_pipeline_module
 from PIL import Image
 
 from memexpert.core.broker import build_pipeline_broker
@@ -26,6 +27,7 @@ from memexpert.workers.pipeline_runtime import (
 )
 
 if TYPE_CHECKING:
+    from pytest import MonkeyPatch
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 
@@ -67,6 +69,16 @@ class RecordingPublisher:
 
     async def __call__(self, event: ContentPipelineDispatchEvent) -> None:
         self.events.append(event)
+
+
+@dataclass(slots=True)
+class PublishingBroker:
+    """Small broker double used to observe downstream stage dispatches."""
+
+    publish_calls: list[dict[str, object]] = field(default_factory=list)
+
+    async def publish(self, payload: object, **kwargs: object) -> None:
+        self.publish_calls.append({"payload": payload, **kwargs})
 
 
 @dataclass(slots=True)
@@ -181,6 +193,7 @@ async def test_pipeline_runtime_declares_explicit_retry_and_dlx_topology() -> No
 async def test_pipeline_runtime_forced_failure_then_idempotent_replay_then_success(
     migrated_db_session: AsyncSession,
     postgres_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: MonkeyPatch,
 ) -> None:
     storage_client = FakeStorageClient()
     initial_publisher = RecordingPublisher()
@@ -245,6 +258,13 @@ async def test_pipeline_runtime_forced_failure_then_idempotent_replay_then_succe
     assert second_replay == first_replay
 
     successful_settings = Settings()
+    downstream_broker = PublishingBroker()
+
+    async def fake_ensure_pipeline_broker_started(*_: object, **__: object) -> object:
+        return downstream_broker
+
+    monkeypatch.setattr(content_pipeline_module, "ensure_pipeline_broker_started", fake_ensure_pipeline_broker_started)
+
     successful_runtime = build_pipeline_runtime(
         settings=successful_settings,
         broker=build_pipeline_broker(successful_settings),
@@ -255,14 +275,21 @@ async def test_pipeline_runtime_forced_failure_then_idempotent_replay_then_succe
     await successful_runtime.handle_transcode_message(replay_event.model_dump(mode="json"), success_message)
 
     succeeded_item = await _fetch_item(postgres_session_factory, item.meme_file_id, settings=successful_settings)
-    assert succeeded_item.current_status is ContentPipelineStageStatus.SUCCEEDED
-    assert succeeded_item.current_stage is ContentPipelineStage.TRANSCODE
+    assert succeeded_item.current_status is ContentPipelineStageStatus.PENDING
+    assert succeeded_item.current_stage is ContentPipelineStage.OCR
     assert succeeded_item.original_object_key == item.original_object_key
     assert succeeded_item.web_video_object_key is not None
     assert succeeded_item.web_video_object_key.endswith(f"/{item.meme_file_id}/web.mp4")
     assert succeeded_item.normalized_reason is None
     assert succeeded_item.last_error_text is None
-    assert succeeded_item.attempt_count == 2
+    assert succeeded_item.attempt_count == 0
+    assert tuple((stage.stage, stage.status) for stage in succeeded_item.stages) == (
+        (ContentPipelineStage.INGEST, ContentPipelineStageStatus.SUCCEEDED),
+        (ContentPipelineStage.TRANSCODE, ContentPipelineStageStatus.SUCCEEDED),
+        (ContentPipelineStage.OCR, ContentPipelineStageStatus.PENDING),
+    )
+    assert len(downstream_broker.publish_calls) == 1
+    assert downstream_broker.publish_calls[0]["routing_key"] == successful_runtime.broker_settings.ocr_routing_key
     assert success_message.ack_count == 1
     assert success_message.reject_calls == []
     assert success_message.nack_calls == []

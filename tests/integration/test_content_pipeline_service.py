@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, field
 from io import BytesIO
 from typing import TYPE_CHECKING
@@ -13,11 +14,22 @@ from sqlalchemy.exc import SQLAlchemyError
 
 import memexpert.services.content_pipeline as content_pipeline_module
 from memexpert.models.content import Meme, MemeFile, MemeSource, PipelineStageJournal
-from memexpert.models.enums import ContentPipelineStage, ContentPipelineStageStatus, SourcePlatform
-from memexpert.schemas.content_pipeline import ContentPipelineDispatchEvent, ContentPipelineUploadMetadata
+from memexpert.models.enums import (
+    ContentPipelineStage,
+    ContentPipelineStageStatus,
+    ContentProcessingStatus,
+    SourcePlatform,
+)
+from memexpert.schemas.content_pipeline import (
+    ContentPipelineDispatchEvent,
+    ContentPipelineEventType,
+    ContentPipelineUploadMetadata,
+)
 from memexpert.services import (
     ContentPipelineService,
     PipelineIngestError,
+    PipelinePublishError,
+    PipelineReplayNotAllowedError,
     PipelineSourceConflictError,
     PipelineStorageError,
 )
@@ -395,3 +407,220 @@ async def test_db_failure_rolls_back_rows_cleans_up_storage_and_skips_publish(
     assert len(storage_client.delete_calls) == 1
     assert publisher.events == []
     assert await _count_pipeline_rows(postgres_session_factory) == (0, 0, 0, 0)
+
+
+async def test_mark_stage_succeeded_creates_next_stage_rows_and_only_marks_ready_after_classify(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    service = ContentPipelineService(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+    )
+
+    item = await service.create_upload(
+        metadata=ContentPipelineUploadMetadata(
+            source_platform=SourcePlatform.TELEGRAM,
+            source_id="stage-chain",
+            post_id="6001",
+            views=9,
+        ),
+        filename="stage-chain.png",
+        content_type="image/png",
+        media_bytes=build_png_bytes(color=(123, 45, 67)),
+    )
+
+    await service.mark_stage_succeeded(
+        meme_file_id=item.meme_file_id,
+        stage=ContentPipelineStage.TRANSCODE,
+        attempt=1,
+        event_id=uuid.uuid7(),
+    )
+    after_transcode = await service.get_item(item.meme_file_id)
+    assert after_transcode.current_stage is ContentPipelineStage.OCR
+    assert after_transcode.current_status is ContentPipelineStageStatus.PENDING
+    assert tuple((stage.stage, stage.status) for stage in after_transcode.stages) == (
+        (ContentPipelineStage.INGEST, ContentPipelineStageStatus.SUCCEEDED),
+        (ContentPipelineStage.TRANSCODE, ContentPipelineStageStatus.SUCCEEDED),
+        (ContentPipelineStage.OCR, ContentPipelineStageStatus.PENDING),
+    )
+    assert publisher.events[-1].event_type is ContentPipelineEventType.MEME_TRANSCODED
+    assert publisher.events[-1].stage is ContentPipelineStage.OCR
+
+    await service.mark_stage_succeeded(
+        meme_file_id=item.meme_file_id,
+        stage=ContentPipelineStage.OCR,
+        attempt=1,
+        event_id=uuid.uuid7(),
+    )
+    after_ocr = await service.get_item(item.meme_file_id)
+    assert after_ocr.current_stage is ContentPipelineStage.EMBED
+    assert after_ocr.current_status is ContentPipelineStageStatus.PENDING
+    assert publisher.events[-1].event_type is ContentPipelineEventType.MEME_OCR_DONE
+    assert publisher.events[-1].stage is ContentPipelineStage.EMBED
+
+    await service.mark_stage_succeeded(
+        meme_file_id=item.meme_file_id,
+        stage=ContentPipelineStage.EMBED,
+        attempt=1,
+        event_id=uuid.uuid7(),
+    )
+    after_embed = await service.get_item(item.meme_file_id)
+    assert after_embed.current_stage is ContentPipelineStage.CLASSIFY
+    assert after_embed.current_status is ContentPipelineStageStatus.PENDING
+    assert publisher.events[-1].event_type is ContentPipelineEventType.MEME_EMBEDDED
+    assert publisher.events[-1].stage is ContentPipelineStage.CLASSIFY
+
+    published_event_count = len(publisher.events)
+    await service.mark_stage_succeeded(
+        meme_file_id=item.meme_file_id,
+        stage=ContentPipelineStage.CLASSIFY,
+        attempt=1,
+        event_id=uuid.uuid7(),
+    )
+    after_classify = await service.get_item(item.meme_file_id)
+    assert after_classify.current_stage is ContentPipelineStage.CLASSIFY
+    assert after_classify.current_status is ContentPipelineStageStatus.SUCCEEDED
+    assert len(publisher.events) == published_event_count
+
+    async with postgres_session_factory() as session:
+        persisted_file = await session.scalar(select(MemeFile).where(MemeFile.id == item.meme_file_id))
+
+    assert persisted_file is not None
+    assert persisted_file.status is ContentProcessingStatus.READY
+
+
+async def test_replay_item_rejects_stage_that_has_not_been_dispatched_yet(
+    migrated_db_session: AsyncSession,
+) -> None:
+    service = ContentPipelineService(
+        migrated_db_session,
+        storage_client=FakeStorageClient(),
+        publisher=RecordingPublisher(),
+    )
+    item = await service.create_upload(
+        metadata=ContentPipelineUploadMetadata(
+            source_platform=SourcePlatform.TELEGRAM,
+            source_id="replay-guard",
+            post_id="6002",
+        ),
+        filename="replay-guard.png",
+        content_type="image/png",
+        media_bytes=build_png_bytes(color=(10, 11, 12)),
+    )
+
+    with pytest.raises(PipelineReplayNotAllowedError, match="has no durable journal row"):
+        _ = await service.replay_item(item.meme_file_id, stage=ContentPipelineStage.EMBED)
+
+
+async def test_mark_stage_success_publish_failure_marks_next_stage_failed_and_keeps_file_not_ready(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    setup_service = ContentPipelineService(
+        migrated_db_session,
+        storage_client=FakeStorageClient(),
+        publisher=RecordingPublisher(),
+    )
+    item = await setup_service.create_upload(
+        metadata=ContentPipelineUploadMetadata(
+            source_platform=SourcePlatform.TELEGRAM,
+            source_id="publish-failure",
+            post_id="6003",
+        ),
+        filename="publish-failure.png",
+        content_type="image/png",
+        media_bytes=build_png_bytes(color=(90, 40, 20)),
+    )
+
+    failing_service = ContentPipelineService(
+        migrated_db_session,
+        storage_client=FakeStorageClient(),
+        publisher=RecordingPublisher(fail_with=RuntimeError("broker unavailable")),
+    )
+
+    with pytest.raises(PipelinePublishError, match="downstream dispatch failed"):
+        await failing_service.mark_stage_succeeded(
+            meme_file_id=item.meme_file_id,
+            stage=ContentPipelineStage.TRANSCODE,
+            attempt=1,
+            event_id=uuid.uuid7(),
+        )
+
+    async with postgres_session_factory() as session:
+        persisted_file = await session.scalar(select(MemeFile).where(MemeFile.id == item.meme_file_id))
+        persisted_rows = (
+            await session.execute(
+                select(PipelineStageJournal).where(PipelineStageJournal.meme_file_id == item.meme_file_id)
+            )
+        ).scalars().all()
+
+    sorted_rows = sorted(
+        persisted_rows,
+        key=lambda row: {
+            ContentPipelineStage.INGEST: 0,
+            ContentPipelineStage.TRANSCODE: 1,
+            ContentPipelineStage.OCR: 2,
+        }[row.stage],
+    )
+
+    assert persisted_file is not None
+    assert persisted_file.status is ContentProcessingStatus.FAILED
+    assert tuple((row.stage, row.status, row.normalized_reason) for row in sorted_rows) == (
+        (ContentPipelineStage.INGEST, ContentPipelineStageStatus.SUCCEEDED, None),
+        (ContentPipelineStage.TRANSCODE, ContentPipelineStageStatus.SUCCEEDED, None),
+        (ContentPipelineStage.OCR, ContentPipelineStageStatus.FAILED, "publish_failed"),
+    )
+
+
+async def test_replay_publish_failure_restores_previous_failed_stage_snapshot(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    service = ContentPipelineService(
+        migrated_db_session,
+        storage_client=FakeStorageClient(),
+        publisher=RecordingPublisher(),
+    )
+    item = await service.create_upload(
+        metadata=ContentPipelineUploadMetadata(
+            source_platform=SourcePlatform.TELEGRAM,
+            source_id="replay-restore",
+            post_id="6004",
+        ),
+        filename="replay-restore.png",
+        content_type="image/png",
+        media_bytes=build_png_bytes(color=(1, 2, 3)),
+    )
+    failed_event_id = uuid.uuid7()
+    await service.mark_stage_failed(
+        meme_file_id=item.meme_file_id,
+        stage=ContentPipelineStage.TRANSCODE,
+        attempt=1,
+        event_id=failed_event_id,
+        normalized_reason="forced_failure",
+        last_error_text="transcode failed the first time",
+        retryable=True,
+    )
+
+    failing_replay_service = ContentPipelineService(
+        migrated_db_session,
+        storage_client=FakeStorageClient(),
+        publisher=RecordingPublisher(fail_with=RuntimeError("republish failed")),
+    )
+
+    with pytest.raises(PipelinePublishError, match="Replay was reserved"):
+        _ = await failing_replay_service.replay_item(item.meme_file_id, stage=ContentPipelineStage.TRANSCODE)
+
+    async with postgres_session_factory() as session:
+        restored_item = await ContentPipelineService(session).get_item(item.meme_file_id)
+
+    transcode_stage = next(stage for stage in restored_item.stages if stage.stage is ContentPipelineStage.TRANSCODE)
+    assert restored_item.current_stage is ContentPipelineStage.TRANSCODE
+    assert restored_item.current_status is ContentPipelineStageStatus.FAILED
+    assert transcode_stage.attempt_count == 1
+    assert transcode_stage.last_event_id == failed_event_id
+    assert transcode_stage.normalized_reason == "forced_failure"
