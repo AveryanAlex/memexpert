@@ -1,0 +1,367 @@
+"""Meilisearch sync adapter boundary used by the heavy content pipeline."""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Protocol
+
+import httpx
+
+from memexpert.core._network import is_timeout_exception
+from memexpert.core.config import Settings, get_settings
+from memexpert.models.base import utcnow
+from memexpert.models.enums import SyncTargetKind
+from memexpert.schemas.content_pipeline import ContentPipelineSyncTargetPreview
+
+if TYPE_CHECKING:
+    import uuid
+    from collections.abc import Mapping
+    from datetime import datetime
+
+
+@dataclass(frozen=True, slots=True)
+class PipelineMeilisearchDocument:
+    """Durable per-file document advertised to Meilisearch as part of the sync upsert.
+
+    The runtime reads canonical meme truth (tags, language, NSFW flag) plus the
+    primary-file OCR text and quality score, assembles this struct once per
+    sync attempt, and hands it to :class:`PipelineMeilisearchSyncClient`. The
+    document ``id`` is the ``meme_file_id`` hex string so the route lookups and
+    the snapshot-row surface share the same primary key shape as Qdrant.
+    """
+
+    id: str
+    meme_id: str
+    language: str
+    is_nsfw: bool
+    updated_at: datetime
+    tags: list[str] = field(default_factory=list)
+    ocr_text: str | None = None
+    quality_score: float | None = None
+
+
+class MeilisearchSyncError(RuntimeError):
+    """Base error raised when Meilisearch sync work cannot complete.
+
+    Kept structurally parallel to :class:`memexpert.core.qdrant.QdrantSyncError`
+    so the runtime dispatcher can reuse its normalize-and-classify logic while
+    still reporting which sync target is failing to operators.
+    """
+
+
+class MeilisearchSyncProviderUnavailableError(MeilisearchSyncError):
+    """Raised when the Meilisearch provider is unreachable or refuses the sync write."""
+
+
+class MeilisearchSyncTimeoutError(MeilisearchSyncError):
+    """Raised when Meilisearch sync execution exceeds the configured timeout."""
+
+
+class MeilisearchSyncMalformedResponseError(MeilisearchSyncError):
+    """Raised when Meilisearch returns a sync-side payload the pipeline cannot trust."""
+
+
+class MeilisearchSyncConflictError(MeilisearchSyncError):
+    """Raised when Meilisearch refuses a sync write because of a conflict (HTTP 409).
+
+    Conflicts stay replayable because they represent transient races between
+    concurrent sync attempts — the runtime can safely retry once the colliding
+    operation completes.
+    """
+
+
+class MeilisearchSyncClientProtocol(Protocol):
+    """Typed Meilisearch sync adapter surface used by the runtime and tests.
+
+    The protocol is intentionally narrow: the runtime needs to upsert a
+    document, fetch the current state for operator diagnostics, delete a
+    document when a canonical file is retired, and ensure the index exists
+    before the first write. Anything beyond that belongs on the SDK.
+    """
+
+    async def upsert_document(
+        self,
+        document: PipelineMeilisearchDocument,
+    ) -> None: ...
+
+    async def fetch_document(
+        self,
+        meme_file_id: uuid.UUID,
+    ) -> ContentPipelineSyncTargetPreview | None: ...
+
+    async def delete_document(self, meme_file_id: uuid.UUID) -> None: ...
+
+    async def ensure_index(self) -> None: ...
+
+
+class PipelineMeilisearchSyncClient:
+    """Lazy Meilisearch sync adapter for per-file upsert/fetch/delete operations.
+
+    Mirrors :class:`memexpert.core.qdrant.PipelineQdrantSyncClient` so the
+    worker runtime can use the same normalize/classify path for both targets.
+    Every SDK exception is mapped onto exactly one of the four typed
+    ``MeilisearchSync*`` errors — callers never see raw SDK exceptions or
+    reach past the adapter to httpx/transport errors.
+    """
+
+    def __init__(self, *, settings: Settings | None = None) -> None:
+        self._settings = settings or get_settings()
+        self._client: Any | None = None
+        self._index: Any | None = None
+
+    async def upsert_document(
+        self,
+        document: PipelineMeilisearchDocument,
+    ) -> None:
+        """Advertise one canonical meme to Meilisearch so it becomes text-searchable."""
+
+        index = await self._ensure_index_client()
+        payload = _build_document_payload(document)
+        try:
+            _ = await index.update_documents([payload], primary_key="id")
+        except Exception as exc:
+            _raise_sync_error_from(exc, operation="upsert_document")
+
+    async def fetch_document(
+        self,
+        meme_file_id: uuid.UUID,
+    ) -> ContentPipelineSyncTargetPreview | None:
+        """Return the Meilisearch-side document preview used by the operator inspect surface.
+
+        Returns ``None`` when Meilisearch has no record of the document — the
+        runtime treats this case as a best-effort preview miss, not a sync
+        failure. The SDK raises ``MeilisearchApiError`` (HTTP 404) for missing
+        documents; we translate that specific case into ``None`` instead of
+        surfacing a malformed-response error so operators can tell "not yet
+        searchable" apart from "sync actually broken".
+        """
+
+        index = await self._ensure_index_client()
+        try:
+            raw_document = await index.get_document(str(meme_file_id))
+        except Exception as exc:
+            status_code = _extract_sdk_status_code(exc)
+            if status_code == 404:
+                return None
+            _raise_sync_error_from(exc, operation="fetch_document")
+            return None  # pragma: no cover - _raise_sync_error_from never returns
+
+        return _build_sync_preview(raw_document, fetched_at=utcnow())
+
+    async def delete_document(self, meme_file_id: uuid.UUID) -> None:
+        """Remove the canonical meme document from Meilisearch (e.g. after cascade delete)."""
+
+        index = await self._ensure_index_client()
+        try:
+            _ = await index.delete_document(str(meme_file_id))
+        except Exception as exc:
+            _raise_sync_error_from(exc, operation="delete_document")
+
+    async def ensure_index(self) -> None:
+        """Create the configured index if it does not already exist.
+
+        The runtime calls this lazily on startup so the first sync attempt does
+        not race the index-creation round-trip. Idempotent: the SDK's
+        ``get_or_create_index`` is a no-op when the index already exists.
+        """
+
+        client = await self._ensure_client()
+        try:
+            self._index = await client.get_or_create_index(
+                self._settings.pipeline_meilisearch_index_name,
+                primary_key="id",
+            )
+        except Exception as exc:
+            _raise_sync_error_from(exc, operation="ensure_index")
+
+    async def _ensure_index_client(self) -> Any:
+        if self._index is None:
+            client = await self._ensure_client()
+            # ``client.index`` is a cheap in-process factory — it does not
+            # contact the server. Real network work happens only on the first
+            # ``update_documents`` / ``get_document`` call below, preserving
+            # the "no I/O at import time" invariant.
+            self._index = client.index(self._settings.pipeline_meilisearch_index_name)
+        return self._index
+
+    async def _ensure_client(self) -> Any:
+        if self._client is None:
+            from meilisearch_python_sdk import AsyncClient
+
+            api_key = self._settings.meilisearch_master_key
+            self._client = AsyncClient(
+                url=self._settings.meilisearch_url,
+                api_key=api_key,
+                timeout=max(1, int(self._settings.pipeline_meilisearch_timeout_seconds)),
+            )
+        return self._client
+
+
+def _raise_sync_error_from(exc: BaseException, *, operation: str) -> None:
+    """Map an arbitrary SDK/transport exception onto the typed sync-error taxonomy.
+
+    Ordering matters: timeouts are detected first (so transport timeouts
+    wrapped in SDK exceptions surface as timeouts, not conflicts), then
+    HTTP-status-specific conflict/malformed classification, and finally
+    everything else falls through as ``MeilisearchSyncProviderUnavailableError``.
+    """
+
+    if isinstance(exc, (TimeoutError, asyncio.TimeoutError, httpx.TimeoutException)):
+        raise MeilisearchSyncTimeoutError(f"Meilisearch {operation} timed out: {exc}") from exc
+    if is_timeout_exception(exc):
+        raise MeilisearchSyncTimeoutError(f"Meilisearch {operation} timed out: {exc}") from exc
+
+    # The SDK exposes its own timeout error class (``MeilisearchTimeoutError``)
+    # which is NOT a subclass of ``asyncio.TimeoutError``. Detect by name so
+    # we don't have to import the SDK at module load time.
+    if exc.__class__.__name__ == "MeilisearchTimeoutError":
+        raise MeilisearchSyncTimeoutError(f"Meilisearch {operation} timed out: {exc}") from exc
+
+    status_code = _extract_sdk_status_code(exc)
+    if status_code == 409:
+        raise MeilisearchSyncConflictError(
+            f"Meilisearch {operation} rejected with a 409 conflict: {exc}",
+        ) from exc
+    if status_code is not None and 500 <= status_code < 600:
+        raise MeilisearchSyncProviderUnavailableError(
+            f"Meilisearch {operation} failed with status {status_code}: {exc}",
+        ) from exc
+    if status_code is not None and 400 <= status_code < 500 and status_code != 404:
+        # 4xx non-404 responses typically indicate a malformed payload the
+        # pipeline cannot repair by replaying — e.g. schema mismatch, bad
+        # primary key. Treat as terminal so the dead-letter path fires.
+        raise MeilisearchSyncMalformedResponseError(
+            f"Meilisearch {operation} rejected the request with status {status_code}: {exc}",
+        ) from exc
+
+    if _is_structural_parse_error(exc):
+        raise MeilisearchSyncMalformedResponseError(
+            f"Meilisearch {operation} returned a payload the pipeline cannot trust: {exc}",
+        ) from exc
+
+    raise MeilisearchSyncProviderUnavailableError(
+        f"Meilisearch {operation} failed: {exc}",
+    ) from exc
+
+
+def _extract_sdk_status_code(exc: BaseException) -> int | None:
+    """Pull an HTTP status code off a ``MeilisearchApiError`` without importing the SDK."""
+
+    raw_status = getattr(exc, "status_code", None)
+    if isinstance(raw_status, int):
+        return raw_status
+    return None
+
+
+def _is_structural_parse_error(exc: BaseException) -> bool:
+    """Return ``True`` when the SDK raised a validation/parse failure.
+
+    Pydantic ``ValidationError`` has a module path of ``pydantic``; any
+    ``ValueError`` raised while decoding a Meilisearch payload ends up here.
+    Treating these as malformed responses mirrors the Qdrant-side behavior.
+    """
+
+    if exc.__class__.__module__.startswith("pydantic"):
+        return True
+    cause = exc.__cause__
+    while cause is not None:
+        if cause.__class__.__module__.startswith("pydantic"):
+            return True
+        if isinstance(cause, ValueError) and not isinstance(cause, TypeError):
+            return True
+        cause = cause.__cause__
+    return False
+
+
+def _build_document_payload(document: PipelineMeilisearchDocument) -> dict[str, Any]:
+    """Serialize a ``PipelineMeilisearchDocument`` into the dict Meilisearch accepts."""
+
+    payload: dict[str, Any] = {
+        "id": document.id,
+        "meme_id": document.meme_id,
+        "language": document.language,
+        "is_nsfw": document.is_nsfw,
+        "tags": list(document.tags),
+        "updated_at": document.updated_at.isoformat(),
+    }
+    if document.ocr_text is not None:
+        payload["ocr_text"] = document.ocr_text
+    if document.quality_score is not None:
+        payload["quality_score"] = float(document.quality_score)
+    return payload
+
+
+def _build_sync_preview(
+    raw_document: object,
+    *,
+    fetched_at: datetime,
+) -> ContentPipelineSyncTargetPreview | None:
+    """Decode the ``get_document`` response into a bounded preview the inspect surface uses.
+
+    The SDK returns a ``Mapping``-like object (pydantic model or dict) — we
+    extract the well-known keys and drop anything else so the preview row does
+    not grow unbounded across schema drift.
+    """
+
+    if raw_document is None:
+        return None
+    raw_payload = _coerce_document_payload(raw_document)
+    if raw_payload is None:
+        return None
+
+    allowed_keys = {
+        "id",
+        "meme_id",
+        "language",
+        "is_nsfw",
+        "tags",
+        "ocr_text",
+        "quality_score",
+        "updated_at",
+    }
+    preview_fields: dict[str, object] = {
+        key: value for key, value in raw_payload.items() if key in allowed_keys
+    }
+    return ContentPipelineSyncTargetPreview(
+        target=SyncTargetKind.MEILISEARCH,
+        preview_fields=preview_fields,
+        preview_fetched_at=fetched_at,
+    )
+
+
+def _coerce_document_payload(raw_document: object) -> Mapping[str, object] | None:
+    """Return a dict-like view of the SDK response regardless of the concrete type.
+
+    ``get_document`` on the SDK can return a pydantic model, a plain dict, or
+    a custom container depending on the SDK version. The preview builder only
+    needs key/value access, so we normalize to a plain dict and fall back
+    through the usual suspects before giving up.
+    """
+
+    if isinstance(raw_document, dict):
+        return raw_document
+    model_dump = getattr(raw_document, "model_dump", None)
+    if callable(model_dump):
+        try:
+            dumped = model_dump()
+        except Exception:  # noqa: BLE001 - malformed model dumps degrade to None.
+            return None
+        if isinstance(dumped, dict):
+            return dumped
+    as_dict = getattr(raw_document, "__dict__", None)
+    if isinstance(as_dict, dict):
+        return as_dict
+    return None
+
+
+__all__ = [
+    "MeilisearchSyncClientProtocol",
+    "MeilisearchSyncConflictError",
+    "MeilisearchSyncError",
+    "MeilisearchSyncMalformedResponseError",
+    "MeilisearchSyncProviderUnavailableError",
+    "MeilisearchSyncTimeoutError",
+    "PipelineMeilisearchDocument",
+    "PipelineMeilisearchSyncClient",
+]

@@ -27,6 +27,13 @@ from memexpert.core.media import (
     PipelineMediaProcessorProtocol,
     UploadMediaDetails,
 )
+from memexpert.core.meilisearch import (
+    MeilisearchSyncConflictError,
+    MeilisearchSyncMalformedResponseError,
+    MeilisearchSyncProviderUnavailableError,
+    MeilisearchSyncTimeoutError,
+    PipelineMeilisearchDocument,
+)
 from memexpert.core.ocr import OCRExtractionResult, OCRTimeoutError
 from memexpert.core.qdrant import (
     QdrantMalformedResponseError,
@@ -54,6 +61,7 @@ from memexpert.models.content import (
     MemeMergeLog,
     MemePopularitySnapshot,
     MemeSource,
+    PipelineStageJournal,
 )
 from memexpert.models.enums import (
     ContentKind,
@@ -79,8 +87,9 @@ from memexpert.schemas.content_pipeline import (
     ContentPipelineStageJournalRead,
     ContentPipelineSyncTargetPreview,
     ContentPipelineUploadMetadata,
+    PerTargetSyncStatus,
 )
-from memexpert.services import ContentPipelineService
+from memexpert.services import ContentPipelineService, PipelinePublishError
 from memexpert.services.content_pipeline_reporting import (
     OUTCOME_BLOCKED,
     OUTCOME_READY,
@@ -96,10 +105,15 @@ from memexpert.workers.pipeline_runtime import (
     PIPELINE_REASON_EMBED_SIMILARITY_MALFORMED,
     PIPELINE_REASON_EMBED_SIMILARITY_TIMEOUT,
     PIPELINE_REASON_EMBED_TIMEOUT,
+    PIPELINE_REASON_FORCED_SYNC_MEILI_FAILURE,
     PIPELINE_REASON_FORCED_SYNC_QDRANT_FAILURE,
     PIPELINE_REASON_FORCED_TRANSCODE_FAILURE,
     PIPELINE_REASON_MALFORMED_EVENT,
     PIPELINE_REASON_OCR_TIMEOUT,
+    PIPELINE_REASON_SYNC_MEILI_CONFLICT,
+    PIPELINE_REASON_SYNC_MEILI_MALFORMED_PAYLOAD,
+    PIPELINE_REASON_SYNC_MEILI_PROVIDER_BLOCKED,
+    PIPELINE_REASON_SYNC_MEILI_TIMEOUT,
     PIPELINE_REASON_SYNC_QDRANT_CONFLICT,
     PIPELINE_REASON_SYNC_QDRANT_MALFORMED_PAYLOAD,
     PIPELINE_REASON_SYNC_QDRANT_PROVIDER_BLOCKED,
@@ -340,6 +354,49 @@ class FakeQdrantSyncClient:
 
     async def delete_meme_point(self, meme_file_id: uuid.UUID) -> None:
         self.delete_calls.append(meme_file_id)
+
+
+@dataclass(slots=True)
+class FakeMeilisearchSyncClient:
+    """Typed Meilisearch sync boundary double used to make runtime sync tests deterministic."""
+
+    upsert_error: Exception | None = None
+    fetch_error: Exception | None = None
+    fetch_preview: ContentPipelineSyncTargetPreview | None = None
+    upsert_calls: list[dict[str, object]] = field(default_factory=list)
+    fetch_calls: list[uuid.UUID] = field(default_factory=list)
+    delete_calls: list[uuid.UUID] = field(default_factory=list)
+
+    async def upsert_document(
+        self,
+        document: PipelineMeilisearchDocument,
+    ) -> None:
+        self.upsert_calls.append(
+            {
+                "id": document.id,
+                "meme_id": document.meme_id,
+                "tags": list(document.tags),
+                "is_nsfw": document.is_nsfw,
+                "language": document.language,
+            }
+        )
+        if self.upsert_error is not None:
+            raise self.upsert_error
+
+    async def fetch_document(
+        self,
+        meme_file_id: uuid.UUID,
+    ) -> ContentPipelineSyncTargetPreview | None:
+        self.fetch_calls.append(meme_file_id)
+        if self.fetch_error is not None:
+            raise self.fetch_error
+        return self.fetch_preview
+
+    async def delete_document(self, meme_file_id: uuid.UUID) -> None:
+        self.delete_calls.append(meme_file_id)
+
+    async def ensure_index(self) -> None:
+        return None
 
 
 @dataclass(slots=True)
@@ -1018,7 +1075,52 @@ async def _seed_sync_qdrant_pending_item(
         event_id=uuid.uuid7(),
         classification_result=build_classification_result(),
     )
-    return meme_file_id, publisher.events[-1], normalized
+    sync_qdrant_event = next(
+        event
+        for event in publisher.events
+        if event.stage is ContentPipelineStage.SYNC_QDRANT
+    )
+    return meme_file_id, sync_qdrant_event, normalized
+
+
+async def _seed_sync_meili_pending_item(
+    session: AsyncSession,
+    *,
+    storage_client: FakeStorageClient,
+    publisher: RecordingPublisher,
+    source_id: str = "sync-meili-runtime-source",
+    post_id: str = "8800",
+) -> tuple[uuid.UUID, ContentPipelineDispatchEvent, NormalizedMediaResult]:
+    """Create a pipeline item and drive it to the SYNC_MEILI-pending state via the service.
+
+    T03 ships the dual-target fan-out so this helper just selects the Meili
+    dispatch event from the classify-completion publish pair.
+    """
+
+    meme_file_id, _, normalized = await _seed_classify_pending_item(
+        session,
+        storage_client=storage_client,
+        publisher=publisher,
+        source_id=source_id,
+        post_id=post_id,
+    )
+    service = ContentPipelineService(
+        session,
+        storage_client=storage_client,
+        publisher=publisher,
+    )
+    await service.complete_classify_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        classification_result=build_classification_result(),
+    )
+    sync_meili_event = next(
+        event
+        for event in publisher.events
+        if event.stage is ContentPipelineStage.SYNC_MEILI
+    )
+    return meme_file_id, sync_meili_event, normalized
 
 
 async def test_pipeline_runtime_declares_embed_and_classify_queues_and_retry_topology() -> None:
@@ -2137,6 +2239,597 @@ async def test_pipeline_runtime_sync_qdrant_best_effort_preview_fetch_failure_st
     assert snapshot.last_payload_preview == {}
 
 
+# --- T03: sync_meili runtime tests ------------------------------------------
+
+
+async def test_pipeline_runtime_sync_meili_success_records_snapshot_and_publishes_synced_event(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Happy path: the sync_meili consumer upserts to Meilisearch, writes snapshot, acks."""
+
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    meme_file_id, sync_event, _ = await _seed_sync_meili_pending_item(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+    )
+
+    downstream_broker = PublishingBroker()
+
+    async def fake_ensure_pipeline_broker_started(*_: object, **__: object) -> object:
+        return downstream_broker
+
+    monkeypatch.setattr(
+        content_pipeline_module,
+        "ensure_pipeline_broker_started",
+        fake_ensure_pipeline_broker_started,
+    )
+
+    fetched_preview = ContentPipelineSyncTargetPreview(
+        target=SyncTargetKind.MEILISEARCH,
+        preview_fields={"id": meme_file_id.hex, "is_nsfw": False, "tags": []},
+        preview_fetched_at=datetime.now(tz=UTC),
+    )
+    meili_sync_client = FakeMeilisearchSyncClient(fetch_preview=fetched_preview)
+    runtime = build_pipeline_runtime(
+        settings=Settings(),
+        broker=build_pipeline_broker(Settings()),
+        session_factory=postgres_session_factory,
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(),
+        ocr_processor=FakeOCRProcessor(),
+        voyage_client=FakeVoyageClient(result=build_voyage_embedding_result()),
+        qdrant_client=FakeQdrantClient(),
+        qdrant_sync_client=FakeQdrantSyncClient(),
+        meilisearch_sync_client=meili_sync_client,
+        classification_client=FakeClassificationClient(result=build_classification_result()),
+    )
+    message = FakeRabbitMessage(message_id=str(sync_event.event_id))
+
+    await runtime.handle_sync_meili_message(sync_event.model_dump(mode="json"), message)
+
+    assert message.ack_count == 1
+    assert message.reject_calls == []
+    assert len(meili_sync_client.upsert_calls) == 1
+    assert meili_sync_client.upsert_calls[0]["id"] == meme_file_id.hex
+    assert meili_sync_client.fetch_calls == [meme_file_id]
+
+    snapshot = await _load_sync_target_snapshot(
+        postgres_session_factory,
+        meme_file_id,
+        SyncTargetKind.MEILISEARCH,
+    )
+    assert snapshot is not None
+    assert snapshot.status is SyncTargetStatus.SYNCED
+    assert snapshot.attempt_count == 1
+    assert snapshot.last_success_at is not None
+
+    synced_publishes = [
+        call
+        for call in downstream_broker.publish_calls
+        if isinstance(call.get("payload"), dict)
+        and call["payload"].get("event_type") == ContentPipelineEventType.MEME_MEILI_SYNCED.value
+    ]
+    assert len(synced_publishes) == 1
+
+
+async def _load_sync_meili_stage_row(
+    session_factory: async_sessionmaker[AsyncSession],
+    meme_file_id: uuid.UUID,
+) -> PipelineStageJournal:
+    """Fetch the durable sync_meili stage-journal row directly.
+
+    The ``_fetch_item`` helper returns the ``ContentPipelineItemRead`` view
+    whose ``current_stage``/``normalized_reason`` are chosen by the active
+    stage resolver. With the T03 dual fan-out, classify creates BOTH
+    sync_qdrant and sync_meili rows, so the resolver may pick sync_qdrant
+    (PENDING) over sync_meili (FAILED) and the item-level view loses the
+    Meili failure details. Tests that need the Meili row specifically must
+    read it directly from the journal.
+    """
+
+    async with session_factory() as session:
+        stage_row = await session.scalar(
+            select(PipelineStageJournal).where(
+                PipelineStageJournal.meme_file_id == meme_file_id,
+                PipelineStageJournal.stage == ContentPipelineStage.SYNC_MEILI,
+            )
+        )
+    assert stage_row is not None
+    return stage_row
+
+
+async def test_pipeline_runtime_sync_meili_provider_unavailable_keeps_stage_replayable(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    meme_file_id, sync_event, _ = await _seed_sync_meili_pending_item(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+        source_id="sync-meili-unavailable",
+        post_id="8810",
+    )
+    runtime = build_pipeline_runtime(
+        settings=Settings(),
+        broker=build_pipeline_broker(Settings()),
+        session_factory=postgres_session_factory,
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(),
+        ocr_processor=FakeOCRProcessor(),
+        voyage_client=FakeVoyageClient(result=build_voyage_embedding_result()),
+        qdrant_client=FakeQdrantClient(),
+        qdrant_sync_client=FakeQdrantSyncClient(),
+        meilisearch_sync_client=FakeMeilisearchSyncClient(
+            upsert_error=MeilisearchSyncProviderUnavailableError("meili down"),
+        ),
+        classification_client=FakeClassificationClient(result=build_classification_result()),
+    )
+    message = FakeRabbitMessage(message_id=str(sync_event.event_id))
+
+    await runtime.handle_sync_meili_message(sync_event.model_dump(mode="json"), message)
+
+    stage_row = await _load_sync_meili_stage_row(postgres_session_factory, meme_file_id)
+    assert stage_row.status is ContentPipelineStageStatus.FAILED
+    assert stage_row.normalized_reason == PIPELINE_REASON_SYNC_MEILI_PROVIDER_BLOCKED
+    assert stage_row.is_retryable is True
+    assert message.reject_calls == [False]
+
+    snapshot = await _load_sync_target_snapshot(
+        postgres_session_factory,
+        meme_file_id,
+        SyncTargetKind.MEILISEARCH,
+    )
+    assert snapshot is not None
+    assert snapshot.status is SyncTargetStatus.FAILED
+    assert snapshot.normalized_reason == PIPELINE_REASON_SYNC_MEILI_PROVIDER_BLOCKED
+
+
+async def test_pipeline_runtime_sync_meili_timeout_keeps_stage_replayable(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    meme_file_id, sync_event, _ = await _seed_sync_meili_pending_item(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+        source_id="sync-meili-timeout",
+        post_id="8811",
+    )
+    runtime = build_pipeline_runtime(
+        settings=Settings(),
+        broker=build_pipeline_broker(Settings()),
+        session_factory=postgres_session_factory,
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(),
+        ocr_processor=FakeOCRProcessor(),
+        voyage_client=FakeVoyageClient(result=build_voyage_embedding_result()),
+        qdrant_client=FakeQdrantClient(),
+        qdrant_sync_client=FakeQdrantSyncClient(),
+        meilisearch_sync_client=FakeMeilisearchSyncClient(
+            upsert_error=MeilisearchSyncTimeoutError("deadline"),
+        ),
+        classification_client=FakeClassificationClient(result=build_classification_result()),
+    )
+    message = FakeRabbitMessage(message_id=str(sync_event.event_id))
+
+    await runtime.handle_sync_meili_message(sync_event.model_dump(mode="json"), message)
+
+    stage_row = await _load_sync_meili_stage_row(postgres_session_factory, meme_file_id)
+    assert stage_row.normalized_reason == PIPELINE_REASON_SYNC_MEILI_TIMEOUT
+    assert stage_row.is_retryable is True
+    assert message.reject_calls == [False]
+
+
+async def test_pipeline_runtime_sync_meili_conflict_keeps_stage_replayable(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    meme_file_id, sync_event, _ = await _seed_sync_meili_pending_item(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+        source_id="sync-meili-conflict",
+        post_id="8812",
+    )
+    runtime = build_pipeline_runtime(
+        settings=Settings(),
+        broker=build_pipeline_broker(Settings()),
+        session_factory=postgres_session_factory,
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(),
+        ocr_processor=FakeOCRProcessor(),
+        voyage_client=FakeVoyageClient(result=build_voyage_embedding_result()),
+        qdrant_client=FakeQdrantClient(),
+        qdrant_sync_client=FakeQdrantSyncClient(),
+        meilisearch_sync_client=FakeMeilisearchSyncClient(
+            upsert_error=MeilisearchSyncConflictError("409 conflict"),
+        ),
+        classification_client=FakeClassificationClient(result=build_classification_result()),
+    )
+    message = FakeRabbitMessage(message_id=str(sync_event.event_id))
+
+    await runtime.handle_sync_meili_message(sync_event.model_dump(mode="json"), message)
+
+    stage_row = await _load_sync_meili_stage_row(postgres_session_factory, meme_file_id)
+    assert stage_row.normalized_reason == PIPELINE_REASON_SYNC_MEILI_CONFLICT
+    assert stage_row.is_retryable is True
+
+
+async def test_pipeline_runtime_sync_meili_malformed_response_dead_letters(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    meme_file_id, sync_event, _ = await _seed_sync_meili_pending_item(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+        source_id="sync-meili-malformed",
+        post_id="8813",
+    )
+    dead_letters: list[Any] = []
+
+    async def publish_dead_letter(
+        payload: object,
+        queue: object = "",
+        exchange: object | None = None,
+        *,
+        routing_key: str = "",
+        headers: dict[str, object] | None = None,
+        **_: object,
+    ) -> None:
+        _ = queue
+        dead_letters.append(
+            {
+                "payload": payload,
+                "exchange": getattr(exchange, "name", exchange),
+                "routing_key": routing_key,
+                "headers": headers,
+            }
+        )
+
+    broker = build_pipeline_broker(Settings())
+    runtime = build_pipeline_runtime(
+        settings=Settings(),
+        broker=broker,
+        session_factory=postgres_session_factory,
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(),
+        ocr_processor=FakeOCRProcessor(),
+        voyage_client=FakeVoyageClient(result=build_voyage_embedding_result()),
+        qdrant_client=FakeQdrantClient(),
+        qdrant_sync_client=FakeQdrantSyncClient(),
+        meilisearch_sync_client=FakeMeilisearchSyncClient(
+            upsert_error=MeilisearchSyncMalformedResponseError("bad schema"),
+        ),
+        classification_client=FakeClassificationClient(result=build_classification_result()),
+    )
+    cast("Any", broker).publish = publish_dead_letter
+    message = FakeRabbitMessage(message_id=str(sync_event.event_id))
+
+    await runtime.handle_sync_meili_message(sync_event.model_dump(mode="json"), message)
+
+    stage_row = await _load_sync_meili_stage_row(postgres_session_factory, meme_file_id)
+    assert stage_row.normalized_reason == PIPELINE_REASON_SYNC_MEILI_MALFORMED_PAYLOAD
+    assert stage_row.is_retryable is False
+    assert message.ack_count == 1
+    assert message.reject_calls == []
+    assert len(dead_letters) == 1
+    assert dead_letters[0]["headers"] == {
+        "x-memexpert-failure-reason": PIPELINE_REASON_SYNC_MEILI_MALFORMED_PAYLOAD,
+    }
+
+
+async def test_pipeline_runtime_sync_meili_forced_failure_knob_marks_stage_replayable(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    meme_file_id, sync_event, _ = await _seed_sync_meili_pending_item(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+        source_id="sync-meili-forced",
+        post_id="8814",
+    )
+    failing_settings = Settings.model_validate(
+        {"pipeline_worker_fail_sync_meili_for_meme_file_id": str(meme_file_id)}
+    )
+    runtime = build_pipeline_runtime(
+        settings=failing_settings,
+        broker=build_pipeline_broker(failing_settings),
+        session_factory=postgres_session_factory,
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(),
+        ocr_processor=FakeOCRProcessor(),
+        voyage_client=FakeVoyageClient(result=build_voyage_embedding_result()),
+        qdrant_client=FakeQdrantClient(),
+        qdrant_sync_client=FakeQdrantSyncClient(),
+        meilisearch_sync_client=FakeMeilisearchSyncClient(),
+        classification_client=FakeClassificationClient(result=build_classification_result()),
+    )
+    message = FakeRabbitMessage(message_id=str(sync_event.event_id))
+
+    await runtime.handle_sync_meili_message(sync_event.model_dump(mode="json"), message)
+
+    stage_row = await _load_sync_meili_stage_row(postgres_session_factory, meme_file_id)
+    assert stage_row.normalized_reason == PIPELINE_REASON_FORCED_SYNC_MEILI_FAILURE
+    assert stage_row.is_retryable is True
+
+
+# --- T03: classify fan-out atomicity + dual-target outcomes ------------------
+
+
+async def test_classify_completion_fans_out_both_sync_stages_and_publishes_both_events(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Classify success creates BOTH sync stage rows AND publishes BOTH dispatches."""
+
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    meme_file_id, _, _ = await _seed_classify_pending_item(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+        source_id="classify-fanout-happy",
+        post_id="9000",
+    )
+    service = ContentPipelineService(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+    )
+
+    await service.complete_classify_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        classification_result=build_classification_result(),
+    )
+
+    # Both downstream stage rows exist after the atomic commit.
+    async with postgres_session_factory() as session:
+        stage_values = {
+            row.stage
+            for row in (
+                await session.execute(
+                    select(PipelineStageJournal).where(
+                        PipelineStageJournal.meme_file_id == meme_file_id,
+                    )
+                )
+            ).scalars().all()
+        }
+    assert ContentPipelineStage.SYNC_QDRANT in stage_values
+    assert ContentPipelineStage.SYNC_MEILI in stage_values
+
+    # Both MEME_READY dispatches were published exactly once.
+    meme_ready_stages = {
+        event.stage
+        for event in publisher.events
+        if event.event_type is ContentPipelineEventType.MEME_READY
+    }
+    assert meme_ready_stages == {
+        ContentPipelineStage.SYNC_QDRANT,
+        ContentPipelineStage.SYNC_MEILI,
+    }
+
+
+async def test_classify_completion_fan_out_publish_failure_rolls_back_both_stage_rows(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A Meilisearch publish failure during fan-out must leave BOTH new rows absent."""
+
+    storage_client = FakeStorageClient()
+    setup_publisher = RecordingPublisher()
+    meme_file_id, _, _ = await _seed_classify_pending_item(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=setup_publisher,
+        source_id="classify-fanout-rollback",
+        post_id="9001",
+    )
+
+    # Publisher that fails specifically on the Meili dispatch so the first
+    # publish (qdrant) lands but the second one raises. Atomicity means
+    # BOTH new stage rows must be rolled back.
+    published: list[ContentPipelineDispatchEvent] = []
+
+    async def _publisher(event: ContentPipelineDispatchEvent) -> None:
+        published.append(event)
+        if event.stage is ContentPipelineStage.SYNC_MEILI:
+            raise RuntimeError("simulated meili publish failure")
+
+    fail_service = ContentPipelineService(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=_publisher,
+    )
+
+    with pytest.raises(PipelinePublishError, match="Classify fan-out publish failed"):
+        await fail_service.complete_classify_stage(
+            meme_file_id=meme_file_id,
+            attempt=1,
+            event_id=uuid.uuid7(),
+            classification_result=build_classification_result(),
+        )
+
+    # Both sync stage rows must be absent because the rollback undoes the
+    # in-memory mutations from the classify fan-out transaction.
+    async with postgres_session_factory() as session:
+        stage_values = {
+            row.stage
+            for row in (
+                await session.execute(
+                    select(PipelineStageJournal).where(
+                        PipelineStageJournal.meme_file_id == meme_file_id,
+                    )
+                )
+            ).scalars().all()
+        }
+    assert ContentPipelineStage.SYNC_QDRANT not in stage_values
+    assert ContentPipelineStage.SYNC_MEILI not in stage_values
+    # The classify stage row stays in whatever state it was before the
+    # rollback — critically it is NOT SUCCEEDED because the rollback
+    # unwound the in-memory mutation.
+    async with postgres_session_factory() as verify_session:
+        classify_row = await verify_session.scalar(
+            select(PipelineStageJournal).where(
+                PipelineStageJournal.meme_file_id == meme_file_id,
+                PipelineStageJournal.stage == ContentPipelineStage.CLASSIFY,
+            )
+        )
+    assert classify_row is not None
+    assert classify_row.status is not ContentPipelineStageStatus.SUCCEEDED
+
+
+# --- T03: dual-target outcome classification (reporting aggregator) ----------
+
+
+async def test_outcome_partially_searchable_when_exactly_one_target_synced(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Exactly one target synced + classify succeeded → OUTCOME_PARTIALLY_SEARCHABLE."""
+
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    meme_file_id, _, _ = await _seed_classify_pending_item(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+        source_id="outcome-partial",
+        post_id="9100",
+    )
+    service = ContentPipelineService(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+    )
+    await service.complete_classify_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        classification_result=build_classification_result(),
+    )
+    _ = await service.complete_sync_qdrant_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        payload_preview={"point_id": str(meme_file_id)},
+    )
+    # Meili stays failed (replayable) so the outcome lands on partially_searchable.
+    await service.fail_sync_meili_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        normalized_reason="sync_meili_timeout",
+        last_error_text="slow day",
+    )
+
+    async with postgres_session_factory() as read_session:
+        read_service = ContentPipelineService(
+            read_session,
+            storage_client=storage_client,
+            publisher=publisher,
+        )
+        detail = await read_service.get_item_detail(meme_file_id)
+
+    summary = summarize_run(
+        run_id="outcome-partial-run",
+        started_at=datetime(2026, 4, 10, 12, 0, 0, tzinfo=UTC),
+        finished_at=datetime(2026, 4, 10, 12, 1, 0, tzinfo=UTC),
+        dataset_root="/tmp/unused",
+        api_base_url="http://127.0.0.1:8000",
+        items=(detail,),
+    )
+    report = summary.item_reports[0]
+    assert report.outcome == "partially_searchable"
+    assert summary.stage_counts.partially_searchable_count == 1
+    assert summary.stage_counts.both_synced_count == 0
+    assert summary.stage_counts.sync_qdrant_pass == 1
+    assert summary.stage_counts.sync_meili_failed == 1
+
+    markdown = render_markdown_report(summary)
+    assert "partially_searchable" in markdown
+    assert "meilisearch" in markdown
+
+
+async def test_outcome_ready_when_both_targets_synced(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Both targets synced → OUTCOME_READY and both_synced_count == 1."""
+
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    meme_file_id, _, _ = await _seed_classify_pending_item(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+        source_id="outcome-ready",
+        post_id="9101",
+    )
+    service = ContentPipelineService(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+    )
+    await service.complete_classify_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        classification_result=build_classification_result(),
+    )
+    _ = await service.complete_sync_qdrant_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        payload_preview={"point_id": str(meme_file_id)},
+    )
+    _ = await service.complete_sync_meili_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        payload_preview={"id": meme_file_id.hex},
+    )
+
+    async with postgres_session_factory() as read_session:
+        read_service = ContentPipelineService(
+            read_session,
+            storage_client=storage_client,
+            publisher=publisher,
+        )
+        detail = await read_service.get_item_detail(meme_file_id)
+
+    summary = summarize_run(
+        run_id="outcome-ready-run",
+        started_at=datetime(2026, 4, 10, 12, 0, 0, tzinfo=UTC),
+        finished_at=datetime(2026, 4, 10, 12, 1, 0, tzinfo=UTC),
+        dataset_root="/tmp/unused",
+        api_base_url="http://127.0.0.1:8000",
+        items=(detail,),
+    )
+    report = summary.item_reports[0]
+    assert report.outcome == OUTCOME_READY
+    assert summary.stage_counts.both_synced_count == 1
+    assert summary.stage_counts.sync_qdrant_pass == 1
+    assert summary.stage_counts.sync_meili_pass == 1
+
+
 # --- S02 inspect enrichment + proof harness aggregation ----------------------
 
 
@@ -2170,6 +2863,37 @@ def _build_stage_entry(
         created_at=base,
         updated_at=base,
     )
+
+
+def _build_both_synced_sync_targets(
+    meme_file_id: uuid.UUID,
+) -> dict[SyncTargetKind, PerTargetSyncStatus]:
+    """Produce both-target-synced fixtures for the aggregation tests.
+
+    Both targets are set to ``SYNCED`` so ``_classify_outcome`` returns
+    ``OUTCOME_READY``. The fixture items never actually round-trip through
+    the live pipeline, so we stamp per-target counters directly here.
+    """
+
+    now = datetime(2026, 4, 10, 12, 5, 0, tzinfo=UTC)
+    return {
+        SyncTargetKind.QDRANT: PerTargetSyncStatus(
+            target=SyncTargetKind.QDRANT,
+            status=SyncTargetStatus.SYNCED,
+            last_event_id=uuid.uuid7(),
+            last_success_at=now,
+            last_attempt_at=now,
+            attempt_count=1,
+        ),
+        SyncTargetKind.MEILISEARCH: PerTargetSyncStatus(
+            target=SyncTargetKind.MEILISEARCH,
+            status=SyncTargetStatus.SYNCED,
+            last_event_id=uuid.uuid7(),
+            last_success_at=now,
+            last_attempt_at=now,
+            attempt_count=1,
+        ),
+    }
 
 
 def _build_ready_item_detail(
@@ -2250,6 +2974,7 @@ def _build_ready_item_detail(
             language=ContentLanguage.EN,
         ),
         ready_event=ready_event,
+        sync_targets=_build_both_synced_sync_targets(meme_file_id),
     )
 
 
@@ -2397,6 +3122,7 @@ def _build_merged_source_item_detail(*, target_meme_id: uuid.UUID) -> ContentPip
             classify_finished_at=datetime(2026, 4, 10, 12, 3, 0, tzinfo=UTC),
             meme_file_ready=False,
         ),
+        sync_targets=_build_both_synced_sync_targets(meme_file_id),
     )
 
 

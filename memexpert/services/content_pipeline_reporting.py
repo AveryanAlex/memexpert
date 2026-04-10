@@ -176,12 +176,12 @@ def _project_sync_targets(
             last_success_at=row.last_success_at,
             last_attempt_at=row.last_attempt_at,
             attempt_count=row.attempt_count,
-            last_preview=_decode_sync_preview(row.last_payload_preview, target=target),
+            last_preview=decode_sync_preview(row.last_payload_preview, target=target),
         )
     return projection
 
 
-def _decode_sync_preview(
+def decode_sync_preview(
     raw_preview: object,
     *,
     target: SyncTargetKind,
@@ -191,8 +191,9 @@ def _decode_sync_preview(
     Returns ``None`` when the stored dict is empty or shaped in a way that
     would not round-trip through :class:`ContentPipelineSyncTargetPreview`.
     The inspect surface treats malformed or empty previews as "no preview
-    known" rather than crashing the detail build. T03 inherits the same
-    decoding path for the Meilisearch branch.
+    known" rather than crashing the detail build. This is the single
+    canonical decode path the service layer, the reporting layer, and the
+    inspect route all share — there must be no second copy.
     """
 
     if not isinstance(raw_preview, dict) or not raw_preview:
@@ -377,6 +378,9 @@ def _build_item_report(
     ocr_confidence = item.ocr.confidence if item.ocr is not None else None
     is_nsfw = item.classification.is_nsfw if item.classification.classified else None
 
+    qdrant_status = item.sync_targets.get(SyncTargetKind.QDRANT)
+    meili_status = item.sync_targets.get(SyncTargetKind.MEILISEARCH)
+
     drill_down_url = f"{api_base_url.rstrip('/')}/api/v1/pipeline/items/{item.meme_file_id}/detail"
 
     return ContentPipelineRunItemReport(
@@ -393,24 +397,99 @@ def _build_item_report(
         ocr_confidence=ocr_confidence,
         merged_into_meme_id=merged_into,
         is_nsfw=is_nsfw,
+        sync_qdrant_status=qdrant_status.status if qdrant_status is not None else None,
+        sync_meili_status=meili_status.status if meili_status is not None else None,
         drill_down_url=drill_down_url,
     )
 
 
 def _classify_outcome(item: ContentPipelineItemDetail) -> str:
-    if item.ready_event is not None:
-        return OUTCOME_READY
+    """Classify one item's terminal outcome from the combined stage + sync truth.
+
+    T03 tightens the S02 classifier so it honestly distinguishes a fully
+    searchable item (both targets synced) from the partially-searchable
+    state (exactly one target synced). The ordering of checks is important:
+
+    1. Duplicate shortcut — ingest-side de-dup bypasses the heavy chain
+       entirely; no sync targets apply.
+    2. Terminal non-retryable pre-sync failure — ``OUTCOME_FAILED``.
+    3. Per-target sync status — if classify succeeded, interpret the pair
+       of sync_targets as ``READY`` / ``PARTIALLY_SEARCHABLE`` / ``BLOCKED``
+       / ``IN_FLIGHT``.
+    4. Pre-classify failure — ``OUTCOME_BLOCKED`` or ``OUTCOME_IN_FLIGHT``
+       depending on whether a retryable failure is present.
+    """
+
     if item.current_status is ContentPipelineStageStatus.DUPLICATE:
         return OUTCOME_DUPLICATE
+
+    classify_entry = next(
+        (entry for entry in item.stages if entry.stage is ContentPipelineStage.CLASSIFY),
+        None,
+    )
+    classify_succeeded = (
+        classify_entry is not None
+        and classify_entry.status is ContentPipelineStageStatus.SUCCEEDED
+    )
+
+    # Any non-retryable pre-sync failure is terminal and takes precedence
+    # over whatever the sync snapshot rows report.
     if item.current_status is ContentPipelineStageStatus.FAILED:
         failed_entry = next(
             (entry for entry in item.stages if entry.stage == item.current_stage),
             None,
         )
-        if failed_entry is not None and not failed_entry.is_retryable:
+        if (
+            failed_entry is not None
+            and not failed_entry.is_retryable
+            and failed_entry.stage
+            not in {ContentPipelineStage.SYNC_QDRANT, ContentPipelineStage.SYNC_MEILI}
+        ):
             return OUTCOME_FAILED
+
+    if classify_succeeded:
+        qdrant = item.sync_targets.get(SyncTargetKind.QDRANT)
+        meili = item.sync_targets.get(SyncTargetKind.MEILISEARCH)
+        qdrant_synced = qdrant is not None and qdrant.status.value == "synced"
+        meili_synced = meili is not None and meili.status.value == "synced"
+        if qdrant_synced and meili_synced:
+            return OUTCOME_READY
+        if qdrant_synced or meili_synced:
+            return OUTCOME_PARTIALLY_SEARCHABLE
+
+        qdrant_blocked = _is_sync_target_blocked(qdrant, item.stages, ContentPipelineStage.SYNC_QDRANT)
+        meili_blocked = _is_sync_target_blocked(meili, item.stages, ContentPipelineStage.SYNC_MEILI)
+        if qdrant_blocked or meili_blocked:
+            return OUTCOME_BLOCKED
+        return OUTCOME_IN_FLIGHT
+
+    if item.current_status is ContentPipelineStageStatus.FAILED:
         return OUTCOME_BLOCKED
     return OUTCOME_IN_FLIGHT
+
+
+def _is_sync_target_blocked(
+    status: PerTargetSyncStatus | None,
+    stages: Iterable[ContentPipelineStageJournalRead],
+    sync_stage: ContentPipelineStage,
+) -> bool:
+    """Return ``True`` when a sync target is genuinely blocked.
+
+    Blocked = snapshot row reports ``failed`` AND the matching stage-journal
+    row is marked non-retryable. This pairs the durable sync truth (the
+    snapshot row) with the replay gate (the stage row's ``is_retryable``
+    flag) so operators see the same decision the runtime would make.
+    """
+
+    if status is None or status.status.value != "failed":
+        return False
+    stage_entry = next(
+        (entry for entry in stages if entry.stage is sync_stage),
+        None,
+    )
+    if stage_entry is None:
+        return False
+    return not stage_entry.is_retryable
 
 
 def _build_stage_counts(
@@ -420,6 +499,7 @@ def _build_stage_counts(
 ) -> ContentPipelineRunStageCounts:
     counts = ContentPipelineRunStageCounts()
 
+    items_by_id = {item.meme_file_id: item for item in items}
     for item in items:
         for entry in item.stages:
             _tally_stage_entry(counts, entry)
@@ -435,8 +515,25 @@ def _build_stage_counts(
     for report in item_reports:
         if report.outcome == OUTCOME_READY:
             counts.ready_count += 1
+            counts.both_synced_count += 1
+        if report.outcome == OUTCOME_PARTIALLY_SEARCHABLE:
+            counts.partially_searchable_count += 1
         if report.outcome == OUTCOME_BLOCKED:
             counts.blocked_count += 1
+            blocked_item = items_by_id.get(report.meme_file_id)
+            if blocked_item is not None:
+                if _is_sync_target_blocked(
+                    blocked_item.sync_targets.get(SyncTargetKind.QDRANT),
+                    blocked_item.stages,
+                    ContentPipelineStage.SYNC_QDRANT,
+                ):
+                    counts.blocked_by_qdrant_count += 1
+                if _is_sync_target_blocked(
+                    blocked_item.sync_targets.get(SyncTargetKind.MEILISEARCH),
+                    blocked_item.stages,
+                    ContentPipelineStage.SYNC_MEILI,
+                ):
+                    counts.blocked_by_meili_count += 1
 
     return counts
 
@@ -445,15 +542,31 @@ def _tally_sync_targets(
     counts: ContentPipelineRunStageCounts,
     item: ContentPipelineItemDetail,
 ) -> None:
+    """Bump per-target sync counters from one item's snapshot rows.
+
+    Pure aggregation: ``_build_stage_counts`` owns the aggregate counters
+    (``both_synced_count``, ``partially_searchable_count``,
+    ``blocked_by_*_count``) because those cross-target decisions have to
+    honor the full ``_classify_outcome`` logic on a per-report basis. Here
+    we only touch the single-target pass/fail/pending counters.
+    """
+
     qdrant_status = item.sync_targets.get(SyncTargetKind.QDRANT)
-    if qdrant_status is None:
-        return
-    if qdrant_status.status.value == "synced":
-        counts.sync_qdrant_synced += 1
-    elif qdrant_status.status.value == "failed":
-        counts.sync_qdrant_failed += 1
-    else:
-        counts.sync_qdrant_pending += 1
+    if qdrant_status is not None:
+        if qdrant_status.status.value == "synced":
+            counts.sync_qdrant_synced += 1
+            counts.sync_qdrant_pass += 1
+        elif qdrant_status.status.value == "failed":
+            counts.sync_qdrant_failed += 1
+        else:
+            counts.sync_qdrant_pending += 1
+
+    meili_status = item.sync_targets.get(SyncTargetKind.MEILISEARCH)
+    if meili_status is not None:
+        if meili_status.status.value == "synced":
+            counts.sync_meili_pass += 1
+        elif meili_status.status.value == "failed":
+            counts.sync_meili_failed += 1
 
 
 def _tally_stage_entry(
@@ -562,12 +675,28 @@ def render_markdown_report(summary: ContentPipelineRunSummary) -> str:
     lines.append("")
     lines.append("## Search sync per target")
     lines.append("")
-    lines.append("| Target | Synced | Failed | Pending |")
-    lines.append("|--------|--------|--------|---------|")
+    lines.append("| Target | Synced | Failed |")
+    lines.append("|--------|--------|--------|")
     lines.append(
-        f"| qdrant | {summary.stage_counts.sync_qdrant_synced} | "
-        f"{summary.stage_counts.sync_qdrant_failed} | "
-        f"{summary.stage_counts.sync_qdrant_pending} |"
+        f"| qdrant | {summary.stage_counts.sync_qdrant_pass} | "
+        f"{summary.stage_counts.sync_qdrant_failed} |"
+    )
+    lines.append(
+        f"| meilisearch | {summary.stage_counts.sync_meili_pass} | "
+        f"{summary.stage_counts.sync_meili_failed} |"
+    )
+    lines.append("")
+    lines.append(
+        f"- both_synced: {summary.stage_counts.both_synced_count}"
+    )
+    lines.append(
+        f"- partially_searchable: {summary.stage_counts.partially_searchable_count}"
+    )
+    lines.append(
+        f"- blocked_by_qdrant: {summary.stage_counts.blocked_by_qdrant_count}"
+    )
+    lines.append(
+        f"- blocked_by_meili: {summary.stage_counts.blocked_by_meili_count}"
     )
     lines.append("")
     lines.append("## Emitted meme_ready events")
@@ -596,8 +725,12 @@ def render_markdown_report(summary: ContentPipelineRunSummary) -> str:
     lines.append("")
     lines.append("## Per-item detail")
     lines.append("")
-    lines.append("| meme_file_id | outcome | stage/status | ready event | drill-down |")
-    lines.append("|--------------|---------|--------------|-------------|------------|")
+    lines.append(
+        "| meme_file_id | outcome | stage/status | sync (qdrant / meili) | ready event | drill-down |"
+    )
+    lines.append(
+        "|--------------|---------|--------------|-----------------------|-------------|------------|"
+    )
     for report in summary.item_reports:
         mid = report.meme_file_id
         outcome = report.outcome
@@ -605,8 +738,11 @@ def render_markdown_report(summary: ContentPipelineRunSummary) -> str:
         status_label = report.terminal_status.value
         ready = str(report.meme_ready_event_id) if report.meme_ready_event_id else "—"
         url = report.drill_down_url
+        qdrant_label = report.sync_qdrant_status.value if report.sync_qdrant_status is not None else "—"
+        meili_label = report.sync_meili_status.value if report.sync_meili_status is not None else "—"
         lines.append(
-            f"| `{mid}` | {outcome} | {stage_label}/{status_label} | {ready} | [detail]({url}) |"
+            f"| `{mid}` | {outcome} | {stage_label}/{status_label} | "
+            f"{qdrant_label} / {meili_label} | {ready} | [detail]({url}) |"
         )
     if summary.errors:
         lines.append("")
@@ -632,6 +768,7 @@ __all__ = [
     "OUTCOME_PARTIALLY_SEARCHABLE",
     "OUTCOME_READY",
     "build_item_detail",
+    "decode_sync_preview",
     "render_markdown_report",
     "summarize_run",
 ]

@@ -176,6 +176,60 @@ async def replay_pipeline_item(
         raise to_pipeline_http_error(exc) from exc
 
 
+async def _read_sync_target_status(
+    *,
+    pipeline_service: PipelineServiceDep,
+    meme_file_id: uuid.UUID,
+    target: SyncTargetKind,
+) -> PerTargetSyncStatus:
+    """Shared GET helper used by both per-target sync status routes.
+
+    Extracted once three call sites existed (Qdrant + Meilisearch GET +
+    smoke proof in T04) so the typed error translation stays in one place.
+    """
+
+    try:
+        return await pipeline_service.get_sync_target_status(meme_file_id, target)
+    except PipelineServiceError as exc:
+        raise to_pipeline_http_error(exc) from exc
+
+
+async def _replay_sync_target(
+    *,
+    pipeline_service: PipelineServiceDep,
+    meme_file_id: uuid.UUID,
+    target: SyncTargetKind,
+) -> ContentPipelineReplayAccepted:
+    """Shared POST helper used by both per-target single-item replay routes."""
+
+    try:
+        return await pipeline_service.replay_sync_target(meme_file_id, target)
+    except PipelineServiceError as exc:
+        raise to_pipeline_http_error(exc) from exc
+
+
+async def _replay_sync_target_batch(
+    *,
+    pipeline_service: PipelineServiceDep,
+    payload: ContentPipelineSyncReplayBatchRequest,
+    target: SyncTargetKind,
+) -> list[ContentPipelineReplayAccepted]:
+    """Shared POST helper used by both per-target batch replay routes.
+
+    The service layer owns the ``SYNC_REPLAY_BATCH_MAX`` cap so the route
+    layer just forwards the payload without double-bookkeeping it.
+    """
+
+    try:
+        accepted = await pipeline_service.replay_sync_target_batch(
+            payload.meme_file_ids,
+            target,
+        )
+    except PipelineServiceError as exc:
+        raise to_pipeline_http_error(exc) from exc
+    return list(accepted)
+
+
 @router.get(
     "/items/{meme_file_id}/sync/qdrant",
     response_model=PerTargetSyncStatus,
@@ -193,10 +247,11 @@ async def read_pipeline_item_qdrant_sync_status(
     has never been synced to Qdrant".
     """
 
-    try:
-        return await pipeline_service.get_sync_target_status(meme_file_id, SyncTargetKind.QDRANT)
-    except PipelineServiceError as exc:
-        raise to_pipeline_http_error(exc) from exc
+    return await _read_sync_target_status(
+        pipeline_service=pipeline_service,
+        meme_file_id=meme_file_id,
+        target=SyncTargetKind.QDRANT,
+    )
 
 
 @router.post(
@@ -217,10 +272,11 @@ async def replay_pipeline_item_qdrant_sync(
     the service surface rejects the request with ``409``.
     """
 
-    try:
-        return await pipeline_service.replay_sync_target(meme_file_id, SyncTargetKind.QDRANT)
-    except PipelineServiceError as exc:
-        raise to_pipeline_http_error(exc) from exc
+    return await _replay_sync_target(
+        pipeline_service=pipeline_service,
+        meme_file_id=meme_file_id,
+        target=SyncTargetKind.QDRANT,
+    )
 
 
 @router.post(
@@ -241,14 +297,85 @@ async def replay_pipeline_items_qdrant_sync_batch(
     in one place.
     """
 
-    try:
-        accepted = await pipeline_service.replay_sync_target_batch(
-            payload.meme_file_ids,
-            SyncTargetKind.QDRANT,
-        )
-    except PipelineServiceError as exc:
-        raise to_pipeline_http_error(exc) from exc
-    return list(accepted)
+    return await _replay_sync_target_batch(
+        pipeline_service=pipeline_service,
+        payload=payload,
+        target=SyncTargetKind.QDRANT,
+    )
+
+
+@router.get(
+    "/items/{meme_file_id}/sync/meili",
+    response_model=PerTargetSyncStatus,
+    responses=PIPELINE_ERROR_RESPONSES,
+    summary="Read the per-target Meilisearch sync status for one pipeline item",
+)
+async def read_pipeline_item_meili_sync_status(
+    meme_file_id: Annotated[uuid.UUID, Path()],
+    pipeline_service: PipelineServiceDep,
+) -> PerTargetSyncStatus:
+    """Return the durable Meilisearch sync snapshot row for one pipeline item.
+
+    Returns ``404`` when the item exists but has no Meilisearch sync snapshot
+    row yet; operators must see the difference between "item missing" and
+    "item has never been synced to Meilisearch". Mirrors the Qdrant surface
+    exactly so operator drill-down is symmetric between the two targets.
+    """
+
+    return await _read_sync_target_status(
+        pipeline_service=pipeline_service,
+        meme_file_id=meme_file_id,
+        target=SyncTargetKind.MEILISEARCH,
+    )
+
+
+@router.post(
+    "/items/{meme_file_id}/sync/meili/replay",
+    response_model=ContentPipelineReplayAccepted,
+    responses=PIPELINE_ERROR_RESPONSES,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Replay the Meilisearch sync stage for one pipeline item",
+)
+async def replay_pipeline_item_meili_sync(
+    meme_file_id: Annotated[uuid.UUID, Path()],
+    pipeline_service: PipelineServiceDep,
+) -> ContentPipelineReplayAccepted:
+    """Reserve and republish the Meilisearch sync stage for one pipeline item.
+
+    Independent from the Qdrant replay route — replaying Meilisearch never
+    touches the Qdrant snapshot row or vice versa, so operators can fix the
+    two targets in either order without cross-contamination.
+    """
+
+    return await _replay_sync_target(
+        pipeline_service=pipeline_service,
+        meme_file_id=meme_file_id,
+        target=SyncTargetKind.MEILISEARCH,
+    )
+
+
+@router.post(
+    "/sync/meili/replay-batch",
+    response_model=list[ContentPipelineReplayAccepted],
+    responses=PIPELINE_ERROR_RESPONSES,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Replay the Meilisearch sync stage for a bounded batch of pipeline items",
+)
+async def replay_pipeline_items_meili_sync_batch(
+    pipeline_service: PipelineServiceDep,
+    payload: Annotated[ContentPipelineSyncReplayBatchRequest, Body()],
+) -> list[ContentPipelineReplayAccepted]:
+    """Reserve and republish the Meilisearch sync stage for every item in a bounded batch.
+
+    Same cap and translation semantics as the Qdrant batch route — the
+    service layer owns ``SYNC_REPLAY_BATCH_MAX``.
+    """
+
+    return await _replay_sync_target_batch(
+        pipeline_service=pipeline_service,
+        payload=payload,
+        target=SyncTargetKind.MEILISEARCH,
+    )
 
 
 __all__ = ["router"]

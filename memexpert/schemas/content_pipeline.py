@@ -388,7 +388,13 @@ class ContentPipelineReplayAccepted(BaseModel):
 
 
 class ContentPipelineRunItemReport(BaseModel):
-    """Compact per-item report row persisted by the S02 runtime proof harness."""
+    """Compact per-item report row persisted by the S02 runtime proof harness.
+
+    T03 adds the optional per-target sync status fields so the Markdown
+    report can render both sync targets side-by-side in the per-item table
+    without the report builder re-querying durable state. The fields default
+    to ``None`` so pre-S03 fixtures keep deserializing cleanly.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -405,6 +411,8 @@ class ContentPipelineRunItemReport(BaseModel):
     ocr_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     merged_into_meme_id: uuid.UUID | None = None
     is_nsfw: bool | None = None
+    sync_qdrant_status: SyncTargetStatus | None = None
+    sync_meili_status: SyncTargetStatus | None = None
     drill_down_url: str
 
 
@@ -421,7 +429,14 @@ class ContentPipelineStageTimings(BaseModel):
 
 
 class ContentPipelineRunStageCounts(BaseModel):
-    """Aggregate per-stage counters for a bounded proof-harness run."""
+    """Aggregate per-stage counters for a bounded proof-harness run.
+
+    T03 extends the S02 counters with per-target sync pass/fail splits plus
+    the cross-target aggregates (``both_synced_count``,
+    ``partially_searchable_count``) that the operator Markdown report needs.
+    All new fields default to ``0`` so pre-S03 clients that deserialize the
+    model without the new counters still validate.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -441,6 +456,13 @@ class ContentPipelineRunStageCounts(BaseModel):
     sync_qdrant_synced: StrictInt = Field(default=0, ge=0)
     sync_qdrant_failed: StrictInt = Field(default=0, ge=0)
     sync_qdrant_pending: StrictInt = Field(default=0, ge=0)
+    sync_qdrant_pass: StrictInt = Field(default=0, ge=0)
+    sync_meili_pass: StrictInt = Field(default=0, ge=0)
+    sync_meili_failed: StrictInt = Field(default=0, ge=0)
+    both_synced_count: StrictInt = Field(default=0, ge=0)
+    partially_searchable_count: StrictInt = Field(default=0, ge=0)
+    blocked_by_qdrant_count: StrictInt = Field(default=0, ge=0)
+    blocked_by_meili_count: StrictInt = Field(default=0, ge=0)
 
 
 class ContentPipelineRunSummary(BaseModel):

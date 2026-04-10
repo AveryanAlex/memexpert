@@ -1433,6 +1433,324 @@ async def test_pipeline_qdrant_sync_replay_route_registers_in_openapi(
     assert "/api/v1/pipeline/items/{meme_file_id}/sync/qdrant" in paths
     assert "/api/v1/pipeline/items/{meme_file_id}/sync/qdrant/replay" in paths
     assert "/api/v1/pipeline/sync/qdrant/replay-batch" in paths
+    assert "/api/v1/pipeline/items/{meme_file_id}/sync/meili" in paths
+    assert "/api/v1/pipeline/items/{meme_file_id}/sync/meili/replay" in paths
+    assert "/api/v1/pipeline/sync/meili/replay-batch" in paths
     # S01 routes are still present — the new sync surface is additive.
     assert "/api/v1/pipeline/items/{meme_file_id}" in paths
     assert "/api/v1/pipeline/items/{meme_file_id}/replay" in paths
+
+
+# --- T03: Meilisearch sync route tests --------------------------------------
+
+
+async def test_pipeline_meili_sync_status_route_returns_404_when_snapshot_missing(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    """GET sync/meili must return 404 when the snapshot row does not yet exist."""
+
+    operator_token = get_settings().pipeline_operator_token.get_secret_value()
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    meme_file_id = await _drive_item_to_classify_succeeded(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+        source_id="meili-status-missing",
+        post_id="9600",
+        phash_tag="1",
+        input_hash_seed="1",
+    )
+    service = ContentPipelineService(migrated_db_session, storage_client=storage_client, publisher=publisher)
+    app.dependency_overrides[get_content_pipeline_service] = lambda: service
+
+    try:
+        response = await client.get(
+            f"/api/v1/pipeline/items/{meme_file_id}/sync/meili",
+            headers={PIPELINE_OPERATOR_TOKEN_HEADER_NAME: operator_token},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 404
+    assert response.json()["code"] == "pipeline_item_not_found"
+
+
+async def test_pipeline_meili_sync_status_route_returns_synced_row(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    """GET sync/meili must return the synced snapshot row once the worker writes it."""
+
+    operator_token = get_settings().pipeline_operator_token.get_secret_value()
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    meme_file_id = await _drive_item_to_classify_succeeded(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+        source_id="meili-status-synced",
+        post_id="9601",
+        phash_tag="2",
+        input_hash_seed="2",
+    )
+    service = ContentPipelineService(migrated_db_session, storage_client=storage_client, publisher=publisher)
+    sync_event = uuid.uuid7()
+    _ = await service.complete_sync_meili_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=sync_event,
+        payload_preview={"id": meme_file_id.hex, "tags": []},
+    )
+    app.dependency_overrides[get_content_pipeline_service] = lambda: service
+
+    try:
+        response = await client.get(
+            f"/api/v1/pipeline/items/{meme_file_id}/sync/meili",
+            headers={PIPELINE_OPERATOR_TOKEN_HEADER_NAME: operator_token},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "synced"
+    assert body["target"] == "meilisearch"
+    assert body["attempt_count"] == 1
+    assert body["last_preview"] is not None
+
+
+async def test_pipeline_meili_sync_status_route_requires_operator_token(
+    app: FastAPI,
+    client: AsyncClient,
+) -> None:
+    """The GET sync/meili route must require the operator token header."""
+
+    meme_file_id = uuid.uuid7()
+    response = await client.get(f"/api/v1/pipeline/items/{meme_file_id}/sync/meili")
+    assert response.status_code == 401
+    assert response.json()["code"] == "invalid_operator_token"
+
+
+async def test_pipeline_meili_sync_replay_route_happy_path(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    """POST sync/meili/replay must reserve a new dispatch for an item past classify success."""
+
+    operator_token = get_settings().pipeline_operator_token.get_secret_value()
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    meme_file_id = await _drive_item_to_classify_succeeded(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+        source_id="meili-replay-happy",
+        post_id="9602",
+        phash_tag="3",
+        input_hash_seed="3",
+    )
+    service = ContentPipelineService(migrated_db_session, storage_client=storage_client, publisher=publisher)
+    app.dependency_overrides[get_content_pipeline_service] = lambda: service
+
+    try:
+        response = await client.post(
+            f"/api/v1/pipeline/items/{meme_file_id}/sync/meili/replay",
+            headers={PIPELINE_OPERATOR_TOKEN_HEADER_NAME: operator_token},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["stage"] == "sync_meili"
+    assert body["meme_file_id"] == str(meme_file_id)
+
+
+async def test_pipeline_meili_sync_replay_route_rejects_not_ready_items(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    """POST sync/meili/replay must 409 when classify has not yet succeeded."""
+
+    operator_token = get_settings().pipeline_operator_token.get_secret_value()
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    meme_file_id = await _seed_detail_item(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+        source_id="meili-replay-not-ready",
+        post_id="9603",
+        phash_tag="4",
+    )
+    service = ContentPipelineService(migrated_db_session, storage_client=storage_client, publisher=publisher)
+    app.dependency_overrides[get_content_pipeline_service] = lambda: service
+
+    try:
+        response = await client.post(
+            f"/api/v1/pipeline/items/{meme_file_id}/sync/meili/replay",
+            headers={PIPELINE_OPERATOR_TOKEN_HEADER_NAME: operator_token},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "pipeline_replay_not_allowed"
+
+
+async def test_pipeline_meili_sync_replay_batch_route_happy_path(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    """POST sync/meili/replay-batch must accept a bounded batch of ready items."""
+
+    operator_token = get_settings().pipeline_operator_token.get_secret_value()
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    first = await _drive_item_to_classify_succeeded(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+        source_id="meili-batch-one",
+        post_id="9604",
+        phash_tag="5",
+        input_hash_seed="5",
+    )
+    second = await _drive_item_to_classify_succeeded(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+        source_id="meili-batch-two",
+        post_id="9605",
+        phash_tag="6",
+        input_hash_seed="6",
+    )
+    service = ContentPipelineService(migrated_db_session, storage_client=storage_client, publisher=publisher)
+    app.dependency_overrides[get_content_pipeline_service] = lambda: service
+
+    try:
+        response = await client.post(
+            "/api/v1/pipeline/sync/meili/replay-batch",
+            headers={PIPELINE_OPERATOR_TOKEN_HEADER_NAME: operator_token},
+            json={"meme_file_ids": [str(first), str(second)]},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 202
+    body = response.json()
+    assert len(body) == 2
+    assert {item["meme_file_id"] for item in body} == {str(first), str(second)}
+    for item in body:
+        assert item["stage"] == "sync_meili"
+
+
+async def test_pipeline_meili_sync_replay_batch_route_rejects_oversize_batches(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    """The Meilisearch batch endpoint must reject requests > SYNC_REPLAY_BATCH_MAX."""
+
+    from memexpert.services.content_pipeline import SYNC_REPLAY_BATCH_MAX
+
+    operator_token = get_settings().pipeline_operator_token.get_secret_value()
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    meme_file_id = await _drive_item_to_classify_succeeded(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+        source_id="meili-batch-oversize",
+        post_id="9606",
+        phash_tag="7",
+        input_hash_seed="7",
+    )
+    service = ContentPipelineService(migrated_db_session, storage_client=storage_client, publisher=publisher)
+    app.dependency_overrides[get_content_pipeline_service] = lambda: service
+    oversized_batch = [str(meme_file_id)] * (SYNC_REPLAY_BATCH_MAX + 1)
+
+    try:
+        response = await client.post(
+            "/api/v1/pipeline/sync/meili/replay-batch",
+            headers={PIPELINE_OPERATOR_TOKEN_HEADER_NAME: operator_token},
+            json={"meme_file_ids": oversized_batch},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "pipeline_replay_not_allowed"
+
+
+async def test_pipeline_meili_sync_replay_batch_route_rejects_empty_body(
+    app: FastAPI,
+    client: AsyncClient,
+) -> None:
+    """FastAPI must surface Pydantic validation failures as 422 for empty batches."""
+
+    operator_token = get_settings().pipeline_operator_token.get_secret_value()
+    response = await client.post(
+        "/api/v1/pipeline/sync/meili/replay-batch",
+        headers={PIPELINE_OPERATOR_TOKEN_HEADER_NAME: operator_token},
+        json={"meme_file_ids": []},
+    )
+    assert response.status_code == 422
+
+
+async def test_pipeline_item_detail_preserves_pre_s03_byte_compatibility(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    """S01/S02 byte-compat: an item that never reached classify has empty sync_targets.
+
+    Every S01/S02 field must still deserialize identically from the
+    response payload for a pre-classify item — this proves the T03
+    ``sync_targets`` mapping addition is purely additive.
+    """
+
+    operator_token = get_settings().pipeline_operator_token.get_secret_value()
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    meme_file_id = await _seed_detail_item(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+        source_id="detail-bytecompat",
+        post_id="9607",
+        phash_tag="8",
+    )
+    service = ContentPipelineService(migrated_db_session, storage_client=storage_client, publisher=publisher)
+    app.dependency_overrides[get_content_pipeline_service] = lambda: service
+
+    try:
+        response = await client.get(
+            f"/api/v1/pipeline/items/{meme_file_id}/detail",
+            headers={PIPELINE_OPERATOR_TOKEN_HEADER_NAME: operator_token},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    body = response.json()
+    # sync_targets must be an empty mapping for pre-classify items.
+    assert body["sync_targets"] == {}
+    # Roundtrip through the pydantic model to prove the full S01/S02 field
+    # set still deserializes cleanly after T03's additive changes.
+    from memexpert.schemas.content_pipeline import ContentPipelineItemDetail
+
+    detail = ContentPipelineItemDetail.model_validate(body)
+    assert detail.sync_targets == {}
+    assert detail.meme_file_id == meme_file_id
+    # Critical S01 fields stay present.
+    assert detail.current_stage is not None
+    assert detail.current_status is not None
+    assert detail.attempt_count >= 0

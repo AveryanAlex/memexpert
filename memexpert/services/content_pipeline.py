@@ -58,7 +58,10 @@ from memexpert.schemas.content_pipeline import (
     PerTargetSyncStatus,
 )
 from memexpert.services.content_merge import ContentMergeService, MergeOutcome
-from memexpert.services.content_pipeline_reporting import build_item_detail
+from memexpert.services.content_pipeline_reporting import (
+    build_item_detail,
+    decode_sync_preview,
+)
 from memexpert.services.errors import (
     PipelineIngestError,
     PipelineItemNotFoundError,
@@ -119,6 +122,11 @@ PIPELINE_REASON_SYNC_REPLAY_REQUESTED = "sync_replay_requested"
 # with an explicit doc-comment is the narrowest way to share the one
 # terminal-failure reason the Qdrant sync surface knows about.
 _PIPELINE_REASON_SYNC_QDRANT_MALFORMED_PAYLOAD = "sync_qdrant_malformed_payload"
+# Mirror of ``pipeline_runtime.PIPELINE_REASON_SYNC_MEILI_MALFORMED_PAYLOAD`` —
+# same rationale as the Qdrant mirror above. The service layer honors the
+# runtime's malformed-response classification verbatim so retryability stays
+# consistent between the Qdrant and Meilisearch sync paths.
+_PIPELINE_REASON_SYNC_MEILI_MALFORMED_PAYLOAD = "sync_meili_malformed_payload"
 
 
 class ObjectStorageClient(Protocol):
@@ -195,16 +203,29 @@ _DOWNSTREAM_STAGE_EVENT_TYPES: dict[ContentPipelineStage, ContentPipelineEventTy
     ContentPipelineStage.EMBED: ContentPipelineEventType.MEME_EMBEDDED,
     ContentPipelineStage.CLASSIFY: ContentPipelineEventType.MEME_READY,
 }
+# Single-successor mapping used by every heavy-worker stage EXCEPT classify.
+# Classify fans out to BOTH sync targets so it intentionally does not appear
+# here — see ``_CLASSIFY_FAN_OUT_STAGES`` for the dual-target contract. The
+# separation keeps ``_prepare_downstream_dispatches`` honest: anything in
+# this dict goes through the single-target commit-then-publish flow, while
+# classify uses the publish-then-commit atomic path below.
 _NEXT_STAGE_BY_STAGE: dict[ContentPipelineStage, ContentPipelineStage] = {
     ContentPipelineStage.TRANSCODE: ContentPipelineStage.OCR,
     ContentPipelineStage.OCR: ContentPipelineStage.EMBED,
     ContentPipelineStage.EMBED: ContentPipelineStage.CLASSIFY,
-    ContentPipelineStage.CLASSIFY: ContentPipelineStage.SYNC_QDRANT,
 }
+# Classify success fans out to BOTH Qdrant and Meilisearch sync stages in a
+# single atomic commit. The tuple is ordered so the stage-row + dispatch
+# iteration is deterministic across test runs, which matters because the
+# runtime publishes the events sequentially and any ordering drift would
+# trigger test flakes.
+_CLASSIFY_FAN_OUT_STAGES: tuple[ContentPipelineStage, ...] = (
+    ContentPipelineStage.SYNC_QDRANT,
+    ContentPipelineStage.SYNC_MEILI,
+)
 # Each per-target sync target maps onto exactly one durable stage row so the
 # replay surface can resolve the journal row for a given target without
-# walking the full journal list in service callers. T03 will populate the
-# Meilisearch mapping with the corresponding enum value.
+# walking the full journal list in service callers.
 _SYNC_STAGE_BY_TARGET: dict[SyncTargetKind, ContentPipelineStage] = {
     SyncTargetKind.QDRANT: ContentPipelineStage.SYNC_QDRANT,
     SyncTargetKind.MEILISEARCH: ContentPipelineStage.SYNC_MEILI,
@@ -664,7 +685,11 @@ class ContentPipelineService:
             and stage_entry.last_event_id == event_id
         )
 
-        preview_model = _build_qdrant_preview_model(payload_preview) if payload_preview else None
+        preview_model = (
+            _build_sync_preview_model(payload_preview, target=SyncTargetKind.QDRANT)
+            if payload_preview
+            else None
+        )
         await self._upsert_sync_target_snapshot(
             meme_file_id=meme_file_id,
             target=SyncTargetKind.QDRANT,
@@ -820,16 +845,64 @@ class ContentPipelineService:
         event_id: uuid.UUID,
         payload_preview: dict[str, object],
     ) -> PerTargetSyncStatus:
-        """Persist a successful Meilisearch sync attempt and return the per-target truth.
+        """Persist a successful Meilisearch sync attempt and publish ``meme_meili_synced``.
 
-        T01 locks the signature so T03 can implement the Meilisearch consumer
-        without any further contract work. Until T03 lands, calling this method
-        raises ``NotImplementedError`` — the contract is locked, the
-        implementation is deliberately absent.
+        Idempotency: running the method twice with the same ``event_id`` reuses
+        the existing snapshot row, re-uses the prior success event id on the
+        journal row, and does not bump ``attempt_count`` — mirroring the
+        Qdrant path exactly so operators can drive repeated stage completion
+        through replay without accumulating spurious attempts or duplicate
+        events.
         """
 
-        _ = (meme_file_id, attempt, event_id, payload_preview)
-        raise NotImplementedError("T02/T03 implement this method; the contract is locked in T01.")
+        meme_file, stage_entry = await self._get_meme_file_and_stage_entry(
+            meme_file_id,
+            ContentPipelineStage.SYNC_MEILI,
+        )
+        self._ensure_stage_attempt_is_current(stage_entry, attempt=attempt)
+
+        already_succeeded = (
+            stage_entry.status is ContentPipelineStageStatus.SUCCEEDED
+            and stage_entry.last_event_id == event_id
+        )
+
+        preview_model = (
+            _build_sync_preview_model(payload_preview, target=SyncTargetKind.MEILISEARCH)
+            if payload_preview
+            else None
+        )
+        await self._upsert_sync_target_snapshot(
+            meme_file_id=meme_file_id,
+            target=SyncTargetKind.MEILISEARCH,
+            status=SyncTargetStatus.SYNCED,
+            last_event_id=event_id,
+            preview=preview_model,
+            normalized_reason=None,
+            last_error_text=None,
+            bump_attempt=not already_succeeded,
+            record_success=True,
+        )
+
+        await self._finalize_stage_success(
+            meme_file=meme_file,
+            stage_entry=stage_entry,
+            stage=ContentPipelineStage.SYNC_MEILI,
+            attempt=attempt,
+            event_id=event_id,
+        )
+
+        # Idempotent publish: on repeat calls with the same event id we do not
+        # re-emit the MEME_MEILI_SYNCED event because the commit above is a
+        # no-op under the stage-journal event-id equality check.
+        if not already_succeeded:
+            await self._publish_sync_success_event(
+                meme_file=meme_file,
+                stage_entry=stage_entry,
+                event_type=ContentPipelineEventType.MEME_MEILI_SYNCED,
+                stage=ContentPipelineStage.SYNC_MEILI,
+            )
+
+        return await self._load_sync_target_status(meme_file_id, SyncTargetKind.MEILISEARCH)
 
     async def fail_sync_meili_stage(
         self,
@@ -840,16 +913,39 @@ class ContentPipelineService:
         normalized_reason: str,
         last_error_text: str,
     ) -> PerTargetSyncStatus:
-        """Persist a failed Meilisearch sync attempt and return the per-target truth.
+        """Persist a failed Meilisearch sync attempt without publishing any success event.
 
-        T01 locks the signature so T03 can implement the Meilisearch consumer
-        without any further contract work. Until T03 lands, calling this method
-        raises ``NotImplementedError`` — the contract is locked, the
-        implementation is deliberately absent.
+        The journal row is delegated to :meth:`mark_stage_failed` so retryability
+        logic stays shared with the S02 heavy stages and the Qdrant sync path.
+        Prior ``last_success_at`` timestamps and preview payloads are preserved
+        so operators can still see when the target last worked even after a
+        transient failure. Retryability is derived from the normalized-reason
+        constant because the runtime owns the exception-to-reason mapping and
+        the service honors it verbatim.
         """
 
-        _ = (meme_file_id, attempt, event_id, normalized_reason, last_error_text)
-        raise NotImplementedError("T02/T03 implement this method; the contract is locked in T01.")
+        is_retryable = normalized_reason != _PIPELINE_REASON_SYNC_MEILI_MALFORMED_PAYLOAD
+        await self._upsert_sync_target_snapshot(
+            meme_file_id=meme_file_id,
+            target=SyncTargetKind.MEILISEARCH,
+            status=SyncTargetStatus.FAILED,
+            last_event_id=event_id,
+            preview=None,
+            normalized_reason=normalized_reason,
+            last_error_text=last_error_text,
+            bump_attempt=True,
+            record_success=False,
+        )
+        await self.mark_stage_failed(
+            meme_file_id=meme_file_id,
+            stage=ContentPipelineStage.SYNC_MEILI,
+            attempt=attempt,
+            event_id=event_id,
+            normalized_reason=normalized_reason,
+            last_error_text=last_error_text,
+            retryable=is_retryable,
+        )
+        return await self._load_sync_target_status(meme_file_id, SyncTargetKind.MEILISEARCH)
 
     async def replay_sync_target(
         self,
@@ -862,14 +958,10 @@ class ContentPipelineService:
         row for the requested target. The classify stage must have already
         succeeded — otherwise the per-target sync truth has no ready canonical
         state to advertise and the replay would race with the heavy chain.
+        Replays for one target never touch the other target's snapshot row.
         """
 
         await self._ensure_sync_replay_allowed(meme_file_id)
-        if target is SyncTargetKind.MEILISEARCH:
-            # T03 owns the real Meilisearch implementation; the T02 runtime only
-            # wires the Qdrant path so Meilisearch replay requests must still
-            # raise NotImplementedError until T03 extends this branch.
-            raise NotImplementedError("T03 implements Meilisearch sync replay; the contract is locked in T01.")
         return await self._replay_single_sync_target(meme_file_id, target)
 
     async def replay_sync_target_batch(
@@ -892,8 +984,6 @@ class ContentPipelineService:
             )
         for meme_file_id in meme_file_ids:
             await self._ensure_sync_replay_allowed(meme_file_id)
-        if target is SyncTargetKind.MEILISEARCH:
-            raise NotImplementedError("T03 implements Meilisearch sync replay; the contract is locked in T01.")
 
         accepted: list[ContentPipelineReplayAccepted] = []
         for meme_file_id in meme_file_ids:
@@ -1087,7 +1177,7 @@ class ContentPipelineService:
             last_success_at=row.last_success_at,
             last_attempt_at=row.last_attempt_at,
             attempt_count=row.attempt_count,
-            last_preview=_decode_sync_preview(row.last_payload_preview, target=target),
+            last_preview=decode_sync_preview(row.last_payload_preview, target=target),
         )
 
     async def get_sync_target_status(
@@ -1120,7 +1210,7 @@ class ContentPipelineService:
             last_success_at=row.last_success_at,
             last_attempt_at=row.last_attempt_at,
             attempt_count=row.attempt_count,
-            last_preview=_decode_sync_preview(row.last_payload_preview, target=target),
+            last_preview=decode_sync_preview(row.last_payload_preview, target=target),
         )
 
     async def _ensure_sync_replay_allowed(self, meme_file_id: uuid.UUID) -> None:
@@ -1262,6 +1352,21 @@ class ContentPipelineService:
         else:
             meme_file.status = ContentProcessingStatus.PROCESSING
 
+        # Classify fan-out is the only case that must be atomic across BOTH
+        # sync-target dispatches: publishing either event must not leave one
+        # sync stage row persisted while the other fails to dispatch. We
+        # therefore publish before committing, so a rollback undoes both the
+        # classify success AND the new sync stage rows in one shot when any
+        # publish fails. Every other stage keeps the existing commit-then-
+        # publish ordering because those downstream transitions are already
+        # single-target and their tests expect the predecessor to remain
+        # SUCCEEDED after a downstream publish failure.
+        if stage is ContentPipelineStage.CLASSIFY and downstream_dispatches:
+            await self._atomic_publish_then_commit_fan_out(
+                downstream_dispatches=downstream_dispatches,
+            )
+            return
+
         await self._commit_stage_mutation("Failed to persist successful stage state.")
 
         for dispatch in downstream_dispatches:
@@ -1270,6 +1375,42 @@ class ContentPipelineService:
             except Exception as exc:
                 await self._mark_publish_failure_for_downstream_stage(dispatch=dispatch, error=exc)
                 raise PipelinePublishError("Stage success was stored, but downstream dispatch failed.") from exc
+
+    async def _atomic_publish_then_commit_fan_out(
+        self,
+        *,
+        downstream_dispatches: tuple[DownstreamStageDispatch, ...],
+    ) -> None:
+        """Publish every fan-out dispatch first, then commit — atomic on failure.
+
+        Flushing the in-memory stage rows before publishing gives the new rows
+        their ``id`` values so the publisher can reference them, but the
+        surrounding transaction stays open. If ANY publish fails we rollback
+        the session so the classify mutation AND both new sync stage rows
+        never land in the DB, and then re-raise :class:`PipelinePublishError`
+        so the runtime dispatcher can classify the failure and dead-letter or
+        retry. If every publish succeeds we commit once and the whole fan-out
+        becomes durable at the same instant.
+        """
+
+        try:
+            await self._session.flush()
+        except SQLAlchemyError as exc:
+            await self._session.rollback()
+            raise PipelineIngestError(
+                "Failed to flush fan-out stage rows before publish.",
+            ) from exc
+
+        for dispatch in downstream_dispatches:
+            try:
+                await self._publisher(dispatch.event)
+            except Exception as exc:
+                await self._session.rollback()
+                raise PipelinePublishError(
+                    "Classify fan-out publish failed; rolled back both sync stage rows.",
+                ) from exc
+
+        await self._commit_stage_mutation("Failed to persist successful stage state.")
 
     async def _prepare_upload(
         self,
@@ -1721,6 +1862,12 @@ class ContentPipelineService:
         stage: ContentPipelineStage,
         created_at: datetime,
     ) -> tuple[DownstreamStageDispatch, ...]:
+        if stage is ContentPipelineStage.CLASSIFY:
+            return self._prepare_classify_fan_out_dispatches(
+                meme_file=meme_file,
+                created_at=created_at,
+            )
+
         next_stage = _NEXT_STAGE_BY_STAGE.get(stage)
         if next_stage is None:
             return ()
@@ -1732,9 +1879,71 @@ class ContentPipelineService:
         if existing_stage_entry is not None:
             return ()
 
+        dispatch = self._build_downstream_dispatch(
+            meme_file=meme_file,
+            predecessor_stage=stage,
+            next_stage=next_stage,
+            created_at=created_at,
+        )
+        return (dispatch,)
+
+    def _prepare_classify_fan_out_dispatches(
+        self,
+        *,
+        meme_file: MemeFile,
+        created_at: datetime,
+    ) -> tuple[DownstreamStageDispatch, ...]:
+        """Build both sync-target dispatches classify success must hand off to.
+
+        The fan-out is all-or-nothing: if either sync stage row already exists
+        (e.g. a prior classify completion is being retried and one downstream
+        stage was already created), we skip creating any new rows so the
+        atomic-commit contract stays honest. ``_finalize_stage_success``
+        relies on this invariant to decide whether to use the publish-then-
+        commit path or the normal single-target commit-then-publish path.
+        """
+
+        dispatches: list[DownstreamStageDispatch] = []
+        for next_stage in _CLASSIFY_FAN_OUT_STAGES:
+            existing_stage_entry = next(
+                (entry for entry in meme_file.pipeline_stage_journal_entries if entry.stage is next_stage),
+                None,
+            )
+            if existing_stage_entry is not None:
+                # Any prior sync stage row present means the fan-out is already
+                # past its one-shot creation point; classify completion becomes
+                # idempotent (no new rows, no new dispatches).
+                return ()
+            dispatches.append(
+                self._build_downstream_dispatch(
+                    meme_file=meme_file,
+                    predecessor_stage=ContentPipelineStage.CLASSIFY,
+                    next_stage=next_stage,
+                    created_at=created_at,
+                )
+            )
+        return tuple(dispatches)
+
+    def _build_downstream_dispatch(
+        self,
+        *,
+        meme_file: MemeFile,
+        predecessor_stage: ContentPipelineStage,
+        next_stage: ContentPipelineStage,
+        created_at: datetime,
+    ) -> DownstreamStageDispatch:
+        """Assemble one in-memory ``DownstreamStageDispatch`` and attach the new row.
+
+        Shared by the single-target and dual-target fan-out paths so the stage
+        row and dispatch event shapes stay identical across both contexts.
+        The row is added to the session but not flushed — the caller owns the
+        flush/commit ordering so the classify fan-out can publish events
+        before committing while the other stages commit first.
+        """
+
         dispatch_event = ContentPipelineDispatchEvent(
             event_id=uuid.uuid7(),
-            event_type=_DOWNSTREAM_STAGE_EVENT_TYPES[stage],
+            event_type=_DOWNSTREAM_STAGE_EVENT_TYPES[predecessor_stage],
             meme_id=meme_file.meme_id,
             meme_file_id=meme_file.id,
             stage=next_stage,
@@ -1753,7 +1962,7 @@ class ContentPipelineService:
         )
         self._session.add(stage_entry)
         meme_file.pipeline_stage_journal_entries.append(stage_entry)
-        return (DownstreamStageDispatch(event=dispatch_event, stage_entry=stage_entry),)
+        return DownstreamStageDispatch(event=dispatch_event, stage_entry=stage_entry)
 
     async def _mark_publish_failure_for_downstream_stage(
         self,
@@ -1995,50 +2204,26 @@ class ContentPipelineService:
         return suffix
 
 
-def _build_qdrant_preview_model(
+def _build_sync_preview_model(
     payload_preview: dict[str, object],
+    *,
+    target: SyncTargetKind,
 ) -> ContentPipelineSyncTargetPreview:
-    """Wrap a raw Qdrant-side dict preview into the typed projection record.
+    """Wrap a raw sync-target preview dict into the typed projection record.
 
-    The runtime captures the raw dict from the post-upsert retrieve response
-    (or from the upsert payload itself when retrieve is skipped); this helper
-    stamps the typed target + timestamp so the schema contract is enforced
-    before the row is persisted.
+    Shared by both the Qdrant and Meilisearch sync paths so every stored
+    preview row goes through the same timestamp-stamping and shape contract
+    before it is persisted. The runtime captures the raw dict from the
+    post-upsert retrieve response (or from the upsert payload itself when
+    retrieve is skipped); this helper stamps the typed target + timestamp so
+    the schema contract is enforced at the persistence boundary.
     """
 
     return ContentPipelineSyncTargetPreview(
-        target=SyncTargetKind.QDRANT,
+        target=target,
         preview_fields=dict(payload_preview),
         preview_fetched_at=utcnow(),
     )
-
-
-def _decode_sync_preview(
-    raw_preview: object,
-    *,
-    target: SyncTargetKind,
-) -> ContentPipelineSyncTargetPreview | None:
-    """Decode a stored ``last_payload_preview`` JSONB blob into the typed projection.
-
-    Returns ``None`` when the stored dict is empty, missing the
-    ``preview_fetched_at`` stamp, or shaped in a way that would not round-trip
-    through :class:`ContentPipelineSyncTargetPreview` — the inspect surface
-    treats malformed previews as "no preview known" rather than crashing the
-    detail build.
-    """
-
-    if not isinstance(raw_preview, dict) or not raw_preview:
-        return None
-    try:
-        return ContentPipelineSyncTargetPreview.model_validate(
-            {
-                "target": raw_preview.get("target", target.value),
-                "preview_fields": raw_preview.get("preview_fields", {}),
-                "preview_fetched_at": raw_preview.get("preview_fetched_at"),
-            }
-        )
-    except Exception:  # noqa: BLE001 - any decode failure is surfaced as a missing preview.
-        return None
 
 
 __all__ = [

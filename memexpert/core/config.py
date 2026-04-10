@@ -108,6 +108,8 @@ class Settings(BaseSettings):
     pipeline_qdrant_collection_name: str = "memexpert-memes"
     pipeline_qdrant_search_top_k: int = Field(default=5, ge=1, le=100)
     pipeline_qdrant_timeout_seconds: float = Field(default=10.0, gt=0.0, le=600.0)
+    pipeline_meilisearch_index_name: str = "memexpert-memes"
+    pipeline_meilisearch_timeout_seconds: float = Field(default=10.0, gt=0.0, le=600.0)
     pipeline_merge_similarity_threshold: float = Field(default=0.92, ge=0.0, le=1.0)
     pipeline_classification_api_url: str | None = None
     pipeline_classification_api_key: SecretStr | None = None
@@ -118,6 +120,7 @@ class Settings(BaseSettings):
     pipeline_worker_fail_embed_for_meme_file_id: str | None = None
     pipeline_worker_fail_classify_for_meme_file_id: str | None = None
     pipeline_worker_fail_sync_qdrant_for_meme_file_id: str | None = None
+    pipeline_worker_fail_sync_meili_for_meme_file_id: str | None = None
     auth_jwt_secret: SecretStr = SecretStr("memexpert-dev-jwt-secret-with-32-byte-minimum")
     auth_access_token_algorithm: Literal["HS256"] = "HS256"
     auth_access_token_ttl_seconds: int = 900
@@ -237,6 +240,7 @@ class Settings(BaseSettings):
         "pipeline_voyage_model",
         "pipeline_voyage_api_url",
         "pipeline_qdrant_collection_name",
+        "pipeline_meilisearch_index_name",
         "pipeline_classification_model",
         mode="before",
     )
@@ -291,6 +295,7 @@ class Settings(BaseSettings):
         "pipeline_worker_fail_embed_for_meme_file_id",
         "pipeline_worker_fail_classify_for_meme_file_id",
         "pipeline_worker_fail_sync_qdrant_for_meme_file_id",
+        "pipeline_worker_fail_sync_meili_for_meme_file_id",
         mode="before",
     )
     @classmethod

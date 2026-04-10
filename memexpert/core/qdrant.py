@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import httpx
 
+from memexpert.core._network import is_timeout_exception as _is_timeout_exception
 from memexpert.core.config import Settings, get_settings
 from memexpert.models.base import utcnow
 from memexpert.models.enums import SyncTargetKind
@@ -398,23 +399,6 @@ def _build_sync_preview(
         preview_fields=preview_fields,
         preview_fetched_at=fetched_at,
     )
-
-
-def _is_timeout_exception(exc: BaseException) -> bool:
-    """Return True if the SDK wrapped an underlying timeout exception.
-
-    Qdrant ``ResponseHandlingException`` re-raises the original transport error
-    via ``__cause__``; a ``TimeoutException`` surfacing there is a stage-level
-    timeout, not a provider outage. Shared between the sync and similarity
-    clients so both surfaces classify timeouts identically.
-    """
-
-    cause: BaseException | None = exc.__cause__
-    while cause is not None:
-        if isinstance(cause, (TimeoutError, asyncio.TimeoutError, httpx.TimeoutException)):
-            return True
-        cause = cause.__cause__
-    return False
 
 
 def _parse_qdrant_matches(
