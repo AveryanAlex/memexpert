@@ -44,6 +44,7 @@ from memexpert.schemas.content_pipeline import (
     MAX_PIPELINE_REASON_LENGTH,
     ContentPipelineDispatchEvent,
     ContentPipelineEventType,
+    ContentPipelineItemDetail,
     ContentPipelineItemFilter,
     ContentPipelineItemRead,
     ContentPipelineReplayAccepted,
@@ -52,6 +53,7 @@ from memexpert.schemas.content_pipeline import (
     ContentPipelineUploadRead,
 )
 from memexpert.services.content_merge import ContentMergeService, MergeOutcome
+from memexpert.services.content_pipeline_reporting import build_item_detail
 from memexpert.services.errors import (
     PipelineIngestError,
     PipelineItemNotFoundError,
@@ -275,6 +277,22 @@ class ContentPipelineService:
 
         meme_file = await self._get_meme_file(meme_file_id)
         return self._build_item_read(meme_file)
+
+    async def get_item_detail(self, meme_file_id: uuid.UUID) -> ContentPipelineItemDetail:
+        """Return the enriched S02 operator projection with OCR/merge/classify truth.
+
+        The S01 ``get_item`` contract stays untouched; this method builds a
+        strict superset that surfaces durable OCR provenance, merge lineage,
+        classification, canonical-primary context, and the emitted ``meme_ready``
+        event id when the heavy chain has reached classify completion. Optional
+        projections are absent (``None`` or empty) whenever the underlying audit
+        state has not been produced yet — operators must never see a defaulted
+        ``is_nsfw=False`` for an item that has not really been classified.
+        """
+
+        meme_file = await self._get_meme_file(meme_file_id)
+        base = self._build_item_read(meme_file)
+        return await build_item_detail(self._session, meme_file=meme_file, base=base)
 
     async def list_items(
         self,

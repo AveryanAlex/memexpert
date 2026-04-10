@@ -17,6 +17,7 @@ from memexpert.api.dependencies.pipeline import (
 )
 from memexpert.models.enums import ContentPipelineStage, SourcePlatform
 from memexpert.schemas.content_pipeline import (
+    ContentPipelineItemDetail,
     ContentPipelineItemFilter,
     ContentPipelineItemRead,
     ContentPipelineReplayAccepted,
@@ -116,6 +117,32 @@ async def read_pipeline_item(
 
     try:
         return await pipeline_service.get_item(meme_file_id)
+    except PipelineServiceError as exc:
+        raise to_pipeline_http_error(exc) from exc
+
+
+@router.get(
+    "/items/{meme_file_id}/detail",
+    response_model=ContentPipelineItemDetail,
+    responses=PIPELINE_ERROR_RESPONSES,
+    summary="Read enriched S02 inspect detail (OCR, merge, classify, meme_ready)",
+)
+async def read_pipeline_item_detail(
+    meme_file_id: Annotated[uuid.UUID, Path()],
+    pipeline_service: PipelineServiceDep,
+) -> ContentPipelineItemDetail:
+    """Return the operator-facing enriched projection for one pipeline item.
+
+    This surface is additive to ``GET /items/{meme_file_id}`` — it inherits
+    every S01 field and adds optional projections for OCR truth, merge
+    lineage, classification state, canonical-primary context, and the emitted
+    ``meme_ready`` event id. Missing projections mean the underlying audit
+    state has not yet been produced; operators must not read them as
+    defaulted-false values.
+    """
+
+    try:
+        return await pipeline_service.get_item_detail(meme_file_id)
     except PipelineServiceError as exc:
         raise to_pipeline_http_error(exc) from exc
 

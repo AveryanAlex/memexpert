@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import uuid
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from io import BytesIO
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
@@ -55,12 +58,25 @@ from memexpert.models.enums import (
     SourcePlatform,
 )
 from memexpert.schemas.content_pipeline import (
+    ContentPipelineCanonicalContext,
+    ContentPipelineClassificationDetail,
     ContentPipelineDispatchEvent,
+    ContentPipelineItemDetail,
     ContentPipelineItemRead,
+    ContentPipelineMergeDetail,
+    ContentPipelineMergeParticipation,
+    ContentPipelineOCRDetail,
+    ContentPipelineReadyEventSummary,
     ContentPipelineStageJournalRead,
     ContentPipelineUploadMetadata,
 )
 from memexpert.services import ContentPipelineService
+from memexpert.services.content_pipeline_reporting import (
+    OUTCOME_BLOCKED,
+    OUTCOME_READY,
+    render_markdown_report,
+    summarize_run,
+)
 from memexpert.workers.pipeline_runtime import (
     PIPELINE_REASON_CLASSIFY_PROVIDER_BLOCKED,
     PIPELINE_REASON_EMBED_MALFORMED_VECTOR,
@@ -79,6 +95,8 @@ from memexpert.workers.pipeline_runtime import (
 if TYPE_CHECKING:
     from pytest import MonkeyPatch
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+REPO_ROOT_FOR_SCRIPT = Path(__file__).resolve().parents[2]
 
 
 @dataclass(slots=True)
@@ -1649,3 +1667,456 @@ async def test_pipeline_runtime_embed_contract_violation_dead_letters_non_retrya
     assert message.ack_count == 1
     assert message.reject_calls == []
     assert len(dead_letters) == 1
+
+
+# --- S02 inspect enrichment + proof harness aggregation ----------------------
+
+
+def _build_stage_entry(
+    *,
+    stage: ContentPipelineStage,
+    status: ContentPipelineStageStatus,
+    finished_offset_seconds: float | None = None,
+    is_retryable: bool = False,
+    attempt_count: int = 1,
+) -> ContentPipelineStageJournalRead:
+    base = datetime(2026, 4, 10, 12, 0, 0, tzinfo=UTC)
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    if finished_offset_seconds is not None:
+        started_at = base
+        finished_at = base + timedelta(seconds=finished_offset_seconds)
+    return ContentPipelineStageJournalRead(
+        id=uuid.uuid7(),
+        meme_file_id=uuid.uuid7(),
+        stage=stage,
+        status=status,
+        attempt_count=attempt_count,
+        last_event_id=uuid.uuid7(),
+        normalized_reason=None,
+        last_error_text=None,
+        is_retryable=is_retryable,
+        retry_after=None,
+        started_at=started_at,
+        finished_at=finished_at,
+        created_at=base,
+        updated_at=base,
+    )
+
+
+def _build_ready_item_detail(
+    *,
+    fallback_used: bool = False,
+    low_confidence: bool = False,
+    transcode_duration: float = 0.4,
+    ocr_duration: float = 1.1,
+    embed_duration: float = 2.2,
+    classify_duration: float = 0.3,
+    is_nsfw: bool = False,
+) -> ContentPipelineItemDetail:
+    meme_file_id = uuid.uuid7()
+    meme_id = uuid.uuid7()
+    stage_entries = (
+        _build_stage_entry(
+            stage=ContentPipelineStage.INGEST,
+            status=ContentPipelineStageStatus.SUCCEEDED,
+            finished_offset_seconds=0.0,
+        ),
+        _build_stage_entry(
+            stage=ContentPipelineStage.TRANSCODE,
+            status=ContentPipelineStageStatus.SUCCEEDED,
+            finished_offset_seconds=transcode_duration,
+        ),
+        _build_stage_entry(
+            stage=ContentPipelineStage.OCR,
+            status=ContentPipelineStageStatus.SUCCEEDED,
+            finished_offset_seconds=ocr_duration,
+        ),
+        _build_stage_entry(
+            stage=ContentPipelineStage.EMBED,
+            status=ContentPipelineStageStatus.SUCCEEDED,
+            finished_offset_seconds=embed_duration,
+        ),
+        _build_stage_entry(
+            stage=ContentPipelineStage.CLASSIFY,
+            status=ContentPipelineStageStatus.SUCCEEDED,
+            finished_offset_seconds=classify_duration,
+        ),
+    )
+    ready_event = ContentPipelineReadyEventSummary(
+        event_id=uuid.uuid7(),
+        classify_finished_at=datetime(2026, 4, 10, 12, 1, 0, tzinfo=UTC),
+        meme_file_ready=True,
+    )
+    return ContentPipelineItemDetail(
+        meme_id=meme_id,
+        meme_file_id=meme_file_id,
+        current_stage=ContentPipelineStage.SYNC_QDRANT,
+        current_status=ContentPipelineStageStatus.PENDING,
+        original_object_key=f"pipeline/originals/{meme_file_id}/original.png",
+        web_video_object_key=None,
+        last_event_id=ready_event.event_id,
+        normalized_reason=None,
+        last_error_text=None,
+        attempt_count=1,
+        stages=stage_entries,
+        ocr=ContentPipelineOCRDetail(
+            engine="paddleocr",
+            fallback_engine="qwen2.5-vl-2b" if fallback_used else None,
+            fallback_used=fallback_used,
+            low_confidence=low_confidence,
+            confidence=0.42 if low_confidence else 0.91,
+            language=ContentLanguage.EN,
+            extracted_text="hello world",
+            source_object_key="pipeline/derived/example/web.png",
+            last_event_id=uuid.uuid7(),
+        ),
+        merge=ContentPipelineMergeDetail(),
+        classification=ContentPipelineClassificationDetail(is_nsfw=is_nsfw, classified=True),
+        canonical=ContentPipelineCanonicalContext(
+            canonical_meme_id=meme_id,
+            canonical_primary_file_id=meme_file_id,
+            is_canonical_primary=True,
+            quality_score=0.77,
+            ocr_text="hello world",
+            language=ContentLanguage.EN,
+        ),
+        ready_event=ready_event,
+    )
+
+
+def _build_blocked_item_detail() -> ContentPipelineItemDetail:
+    meme_file_id = uuid.uuid7()
+    meme_id = uuid.uuid7()
+    stage_entries = (
+        _build_stage_entry(
+            stage=ContentPipelineStage.INGEST,
+            status=ContentPipelineStageStatus.SUCCEEDED,
+            finished_offset_seconds=0.0,
+        ),
+        _build_stage_entry(
+            stage=ContentPipelineStage.TRANSCODE,
+            status=ContentPipelineStageStatus.SUCCEEDED,
+            finished_offset_seconds=0.3,
+        ),
+        _build_stage_entry(
+            stage=ContentPipelineStage.OCR,
+            status=ContentPipelineStageStatus.SUCCEEDED,
+            finished_offset_seconds=0.9,
+        ),
+        _build_stage_entry(
+            stage=ContentPipelineStage.EMBED,
+            status=ContentPipelineStageStatus.FAILED,
+            finished_offset_seconds=1.5,
+            is_retryable=True,
+        ),
+    )
+    return ContentPipelineItemDetail(
+        meme_id=meme_id,
+        meme_file_id=meme_file_id,
+        current_stage=ContentPipelineStage.EMBED,
+        current_status=ContentPipelineStageStatus.FAILED,
+        original_object_key=f"pipeline/originals/{meme_file_id}/original.png",
+        web_video_object_key=None,
+        last_event_id=uuid.uuid7(),
+        normalized_reason="embed_provider_blocked",
+        last_error_text="voyage quota exceeded",
+        attempt_count=1,
+        stages=stage_entries,
+        ocr=ContentPipelineOCRDetail(
+            engine="paddleocr",
+            fallback_engine=None,
+            fallback_used=False,
+            low_confidence=False,
+            confidence=0.88,
+            language=ContentLanguage.EN,
+            extracted_text="hello world",
+            source_object_key="pipeline/derived/example/web.png",
+            last_event_id=uuid.uuid7(),
+        ),
+        merge=ContentPipelineMergeDetail(),
+        classification=ContentPipelineClassificationDetail(is_nsfw=None, classified=False),
+        canonical=ContentPipelineCanonicalContext(
+            canonical_meme_id=meme_id,
+            canonical_primary_file_id=meme_file_id,
+            is_canonical_primary=True,
+            quality_score=0.77,
+            ocr_text=None,
+            language=ContentLanguage.NONE,
+        ),
+        ready_event=None,
+    )
+
+
+def _build_merged_source_item_detail(*, target_meme_id: uuid.UUID) -> ContentPipelineItemDetail:
+    meme_file_id = uuid.uuid7()
+    stage_entries = (
+        _build_stage_entry(
+            stage=ContentPipelineStage.INGEST,
+            status=ContentPipelineStageStatus.SUCCEEDED,
+            finished_offset_seconds=0.0,
+        ),
+        _build_stage_entry(
+            stage=ContentPipelineStage.TRANSCODE,
+            status=ContentPipelineStageStatus.SUCCEEDED,
+            finished_offset_seconds=0.5,
+        ),
+        _build_stage_entry(
+            stage=ContentPipelineStage.OCR,
+            status=ContentPipelineStageStatus.SUCCEEDED,
+            finished_offset_seconds=1.2,
+        ),
+        _build_stage_entry(
+            stage=ContentPipelineStage.EMBED,
+            status=ContentPipelineStageStatus.SUCCEEDED,
+            finished_offset_seconds=2.4,
+        ),
+        _build_stage_entry(
+            stage=ContentPipelineStage.CLASSIFY,
+            status=ContentPipelineStageStatus.SUCCEEDED,
+            finished_offset_seconds=0.4,
+        ),
+    )
+    return ContentPipelineItemDetail(
+        meme_id=target_meme_id,
+        meme_file_id=meme_file_id,
+        current_stage=ContentPipelineStage.SYNC_QDRANT,
+        current_status=ContentPipelineStageStatus.PENDING,
+        original_object_key=f"pipeline/originals/{meme_file_id}/original.png",
+        web_video_object_key=None,
+        last_event_id=uuid.uuid7(),
+        normalized_reason=None,
+        last_error_text=None,
+        attempt_count=1,
+        stages=stage_entries,
+        ocr=ContentPipelineOCRDetail(
+            engine="paddleocr",
+            fallback_engine=None,
+            fallback_used=False,
+            low_confidence=False,
+            confidence=0.94,
+            language=ContentLanguage.EN,
+            extracted_text="hello world",
+            source_object_key="pipeline/derived/example/web.png",
+            last_event_id=uuid.uuid7(),
+        ),
+        merge=ContentPipelineMergeDetail(
+            as_source=(
+                ContentPipelineMergeParticipation(
+                    log_id=uuid.uuid7(),
+                    source_meme_id=uuid.uuid7(),
+                    source_meme_file_id=meme_file_id,
+                    target_meme_id=target_meme_id,
+                    target_primary_file_id=None,
+                    similarity_score=0.95,
+                    merge_reason="high_similarity_match",
+                    moved_file_ids=(meme_file_id,),
+                    created_at=datetime(2026, 4, 10, 12, 2, 0, tzinfo=UTC),
+                ),
+            ),
+        ),
+        classification=ContentPipelineClassificationDetail(is_nsfw=False, classified=True),
+        canonical=ContentPipelineCanonicalContext(
+            canonical_meme_id=target_meme_id,
+            canonical_primary_file_id=None,
+            is_canonical_primary=False,
+            quality_score=0.6,
+            ocr_text="hello world",
+            language=ContentLanguage.EN,
+        ),
+        ready_event=ContentPipelineReadyEventSummary(
+            event_id=uuid.uuid7(),
+            classify_finished_at=datetime(2026, 4, 10, 12, 3, 0, tzinfo=UTC),
+            meme_file_ready=False,
+        ),
+    )
+
+
+def test_summarize_run_aggregates_ready_blocked_and_merged_items_with_percentiles() -> None:
+    """summarize_run honestly tallies ready/blocked/merged outcomes from fixtures."""
+
+    ready_item = _build_ready_item_detail(fallback_used=False, low_confidence=False)
+    low_conf_item = _build_ready_item_detail(fallback_used=True, low_confidence=True)
+    blocked_item = _build_blocked_item_detail()
+    target_meme_id = uuid.uuid7()
+    merged_item = _build_merged_source_item_detail(target_meme_id=target_meme_id)
+
+    summary = summarize_run(
+        run_id="unit-test-run",
+        started_at=datetime(2026, 4, 10, 12, 0, 0, tzinfo=UTC),
+        finished_at=datetime(2026, 4, 10, 12, 10, 0, tzinfo=UTC),
+        dataset_root="/tmp/unused",
+        api_base_url="http://127.0.0.1:8000",
+        items=(ready_item, low_conf_item, blocked_item, merged_item),
+    )
+
+    # Stage-count truth: ready_count reflects items with a real meme_ready event.
+    assert summary.stage_counts.ready_count == 3
+    assert summary.stage_counts.blocked_count == 1
+    assert summary.stage_counts.transcode_pass == 4
+    assert summary.stage_counts.ocr_pass == 4
+    assert summary.stage_counts.embed_pass == 3
+    assert summary.stage_counts.embed_blocked == 1
+    assert summary.stage_counts.classify_pass == 3
+    assert summary.stage_counts.merge_count == 1
+    assert summary.stage_counts.ocr_fallback_used == 1
+    assert summary.stage_counts.ocr_low_confidence == 1
+
+    transcode_timing = next(t for t in summary.stage_timings if t.stage is ContentPipelineStage.TRANSCODE)
+    assert transcode_timing.sample_count == 4
+    assert transcode_timing.p50_seconds is not None
+    assert transcode_timing.max_seconds is not None
+
+    outcomes = {report.outcome for report in summary.item_reports}
+    assert OUTCOME_READY in outcomes
+    assert OUTCOME_BLOCKED in outcomes
+
+    flagged_ids = set(summary.flagged_item_ids)
+    assert low_conf_item.meme_file_id in flagged_ids
+    assert ready_item.meme_file_id not in flagged_ids
+
+    blocked_ids = set(summary.blocked_item_ids)
+    assert blocked_item.meme_file_id in blocked_ids
+
+    ready_event_ids = set(summary.ready_event_ids)
+    assert ready_item.ready_event is not None
+    assert ready_item.ready_event.event_id in ready_event_ids
+
+    merged_report = next(
+        report for report in summary.item_reports if report.meme_file_id == merged_item.meme_file_id
+    )
+    assert merged_report.merged_into_meme_id == target_meme_id
+
+
+def test_summarize_run_returns_no_timings_when_corpus_is_empty() -> None:
+    """An empty corpus must produce a summary with zeroed counts and null timings."""
+
+    now = datetime(2026, 4, 10, 12, 0, 0, tzinfo=UTC)
+    summary = summarize_run(
+        run_id="empty",
+        started_at=now,
+        finished_at=now,
+        dataset_root="/tmp/unused",
+        api_base_url="http://127.0.0.1:8000",
+        items=(),
+    )
+
+    assert summary.bounded_item_count == 0
+    assert summary.stage_counts.ready_count == 0
+    assert summary.stage_counts.blocked_count == 0
+    for timing in summary.stage_timings:
+        assert timing.sample_count == 0
+        assert timing.p50_seconds is None
+        assert timing.p95_seconds is None
+        assert timing.max_seconds is None
+
+
+def test_render_markdown_report_includes_counts_timings_and_drill_down_links() -> None:
+    """The Markdown rendering must surface drill-down URLs for blocked items."""
+
+    ready_item = _build_ready_item_detail()
+    blocked_item = _build_blocked_item_detail()
+    summary = summarize_run(
+        run_id="md-unit",
+        started_at=datetime(2026, 4, 10, 12, 0, 0, tzinfo=UTC),
+        finished_at=datetime(2026, 4, 10, 12, 5, 0, tzinfo=UTC),
+        dataset_root="/tmp/unused",
+        api_base_url="http://127.0.0.1:8000",
+        items=(ready_item, blocked_item),
+    )
+
+    markdown = render_markdown_report(summary)
+    assert "# Content pipeline S02 heavy-worker run md-unit" in markdown
+    assert "## Stage counts" in markdown
+    assert "## Stage timings (seconds)" in markdown
+    assert "## Emitted meme_ready events" in markdown
+    assert ready_item.ready_event is not None
+    assert str(ready_item.ready_event.event_id) in markdown
+    drill_down_url = (
+        f"http://127.0.0.1:8000/api/v1/pipeline/items/{blocked_item.meme_file_id}/detail"
+    )
+    assert drill_down_url in markdown
+
+
+def _load_verify_s02_runtime_module(name: str) -> Any:
+    """Import scripts/verify_s02_runtime.py under a unique module name for tests."""
+
+    import sys
+
+    spec = importlib.util.spec_from_file_location(
+        name,
+        REPO_ROOT_FOR_SCRIPT / "scripts" / "verify_s02_runtime.py",
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    # Register before exec so module-level dataclasses can resolve their own
+    # __module__ via sys.modules during typing introspection on Python 3.14.
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_verify_s02_runtime_dry_run_writes_artifacts_with_empty_summary(tmp_path: Path) -> None:
+    """The harness --dry-run path must persist a runnable JSON + Markdown summary."""
+
+    module = _load_verify_s02_runtime_module("verify_s02_runtime_dry")
+
+    exit_code = module.main(
+        [
+            "--dry-run",
+            "--artifacts-dir",
+            str(tmp_path),
+            "--run-id",
+            "unit-dry",
+        ]
+    )
+    assert exit_code == 0
+
+    run_dir = tmp_path / "unit-dry"
+    report_json = run_dir / "report.json"
+    report_md = run_dir / "report.md"
+    assert report_json.is_file()
+    assert report_md.is_file()
+
+    payload = json.loads(report_json.read_text(encoding="utf-8"))
+    assert payload["run_id"] == "unit-dry"
+    assert payload["bounded_item_count"] == 0
+    assert "dry-run: no live stack was exercised" in payload["errors"]
+    assert "# Content pipeline S02 heavy-worker run unit-dry" in report_md.read_text(encoding="utf-8")
+
+
+def test_verify_s02_runtime_parse_args_round_trips_argparse_defaults_and_overrides() -> None:
+    """Argparse must accept the documented flags and surface them as expected types."""
+
+    module = _load_verify_s02_runtime_module("verify_s02_runtime_args")
+
+    args = module.parse_args(
+        [
+            "--dataset-root",
+            "/tmp/dataset",
+            "--api-base-url",
+            "http://127.0.0.1:9000",
+            "--artifacts-dir",
+            "/tmp/artifacts",
+            "--candidate-limit",
+            "3",
+            "--stage-timeout",
+            "5",
+            "--poll-interval",
+            "0.5",
+            "--api-timeout",
+            "8",
+            "--dry-run",
+            "--run-id",
+            "fixed",
+        ]
+    )
+    assert args.dataset_root == Path("/tmp/dataset")
+    assert args.api_base_url == "http://127.0.0.1:9000"
+    assert args.artifacts_dir == Path("/tmp/artifacts")
+    assert args.candidate_limit == 3
+    assert args.stage_timeout == 5.0
+    assert args.poll_interval == 0.5
+    assert args.api_timeout == 8.0
+    assert args.dry_run is True
+    assert args.run_id == "fixed"

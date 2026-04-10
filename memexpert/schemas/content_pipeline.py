@@ -9,7 +9,13 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
-from memexpert.models.enums import ContentPipelineStage, ContentPipelineStageStatus, ContentSourceKind, SourcePlatform
+from memexpert.models.enums import (
+    ContentLanguage,
+    ContentPipelineStage,
+    ContentPipelineStageStatus,
+    ContentSourceKind,
+    SourcePlatform,
+)
 
 MAX_OBJECT_KEY_LENGTH = 1024
 MAX_PIPELINE_REASON_LENGTH = 128
@@ -181,6 +187,115 @@ class ContentPipelineUploadRead(ContentPipelineItemRead):
     """Create-response payload returned after an operator upload is ingested."""
 
 
+class ContentPipelineOCRDetail(BaseModel):
+    """Durable OCR audit projection exposed by the enriched inspect surface.
+
+    This projection is absent from ``ContentPipelineItemDetail`` whenever the
+    item has not yet produced an ``MemeFileOCRResult`` row. Operators must not
+    treat a missing projection as empty text; it means OCR has not run.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    engine: str
+    fallback_engine: str | None = None
+    fallback_used: bool
+    low_confidence: bool
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    language: ContentLanguage
+    extracted_text: str | None = None
+    source_object_key: str | None = None
+    last_event_id: uuid.UUID | None = None
+
+
+class ContentPipelineMergeParticipation(BaseModel):
+    """One row in the merge-audit lineage for a pipeline item.
+
+    Either the item was the *source* (its meme was merged into the canonical)
+    or the item sits under the *target* (the canonical meme that absorbed another).
+    The enriched inspect detail exposes both directions so operators can walk
+    the lineage without poking at the audit table directly.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    log_id: uuid.UUID
+    source_meme_id: uuid.UUID
+    source_meme_file_id: uuid.UUID | None = None
+    target_meme_id: uuid.UUID
+    target_primary_file_id: uuid.UUID | None = None
+    similarity_score: float | None = None
+    merge_reason: str
+    moved_file_ids: tuple[uuid.UUID, ...] = ()
+    created_at: datetime
+
+
+class ContentPipelineMergeDetail(BaseModel):
+    """Aggregated merge-audit projection attached to the enriched inspect detail."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    as_source: tuple[ContentPipelineMergeParticipation, ...] = ()
+    as_target: tuple[ContentPipelineMergeParticipation, ...] = ()
+
+
+class ContentPipelineClassificationDetail(BaseModel):
+    """Classification projection with explicit unknown semantics.
+
+    ``is_nsfw`` is ``None`` while the heavy chain has not reached classify
+    completion. The enriched detail never defaults this to ``false`` because
+    operators must see the difference between "not yet classified" and
+    "classified as safe".
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    is_nsfw: bool | None = None
+    classified: bool = False
+
+
+class ContentPipelineCanonicalContext(BaseModel):
+    """Canonical meme context for one pipeline item after (possibly) merging."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    canonical_meme_id: uuid.UUID
+    canonical_primary_file_id: uuid.UUID | None = None
+    is_canonical_primary: bool
+    quality_score: float
+    ocr_text: str | None = None
+    language: ContentLanguage
+
+
+class ContentPipelineReadyEventSummary(BaseModel):
+    """Emitted ``meme_ready`` event identifier captured by the classify stage row."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    event_id: uuid.UUID
+    classify_finished_at: datetime
+    meme_file_ready: bool
+
+
+class ContentPipelineItemDetail(ContentPipelineItemRead):
+    """Enriched detail projection extending the S01 item read.
+
+    Every new field is optional: when the heavy chain has not produced the
+    underlying audit state, the projection is ``None`` or an empty collection.
+    This preserves the byte-for-byte S01 ``ContentPipelineItemRead`` contract
+    while giving operators first-class visibility into OCR, merge,
+    classification, and ``meme_ready`` truth.
+    """
+
+    ocr: ContentPipelineOCRDetail | None = None
+    merge: ContentPipelineMergeDetail = Field(default_factory=ContentPipelineMergeDetail)
+    classification: ContentPipelineClassificationDetail = Field(
+        default_factory=ContentPipelineClassificationDetail,
+    )
+    canonical: ContentPipelineCanonicalContext | None = None
+    ready_event: ContentPipelineReadyEventSummary | None = None
+
+
 class ContentPipelineReplayRequest(BaseModel):
     """Replay request payload accepted by the operator-only pipeline surface."""
 
@@ -200,16 +315,106 @@ class ContentPipelineReplayAccepted(BaseModel):
     attempt: StrictInt = Field(ge=1)
 
 
+class ContentPipelineRunItemReport(BaseModel):
+    """Compact per-item report row persisted by the S02 runtime proof harness."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    meme_file_id: uuid.UUID
+    meme_id: uuid.UUID
+    terminal_stage: ContentPipelineStage
+    terminal_status: ContentPipelineStageStatus
+    outcome: str
+    meme_ready_event_id: uuid.UUID | None = None
+    failure_reason: str | None = None
+    failure_text: str | None = None
+    ocr_fallback_used: bool = False
+    ocr_low_confidence: bool = False
+    ocr_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    merged_into_meme_id: uuid.UUID | None = None
+    is_nsfw: bool | None = None
+    drill_down_url: str
+
+
+class ContentPipelineStageTimings(BaseModel):
+    """Stage-latency percentiles derived from the journal's started_at/finished_at."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    stage: ContentPipelineStage
+    sample_count: StrictInt = Field(ge=0)
+    p50_seconds: float | None = None
+    p95_seconds: float | None = None
+    max_seconds: float | None = None
+
+
+class ContentPipelineRunStageCounts(BaseModel):
+    """Aggregate per-stage counters for a bounded proof-harness run."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    transcode_pass: StrictInt = Field(default=0, ge=0)
+    transcode_failed: StrictInt = Field(default=0, ge=0)
+    ocr_pass: StrictInt = Field(default=0, ge=0)
+    ocr_failed: StrictInt = Field(default=0, ge=0)
+    ocr_fallback_used: StrictInt = Field(default=0, ge=0)
+    ocr_low_confidence: StrictInt = Field(default=0, ge=0)
+    embed_pass: StrictInt = Field(default=0, ge=0)
+    embed_blocked: StrictInt = Field(default=0, ge=0)
+    merge_count: StrictInt = Field(default=0, ge=0)
+    classify_pass: StrictInt = Field(default=0, ge=0)
+    classify_blocked: StrictInt = Field(default=0, ge=0)
+    ready_count: StrictInt = Field(default=0, ge=0)
+    blocked_count: StrictInt = Field(default=0, ge=0)
+
+
+class ContentPipelineRunSummary(BaseModel):
+    """Persisted proof-harness summary written to the S02 artifact directory.
+
+    Combines pass-rate, fallback-rate, per-stage timings, merge counts, blocked
+    items, and emitted ``meme_ready`` ids into one machine-readable payload that
+    operators read before deciding whether the heavy chain behaved truthfully
+    for the current corpus run.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
+    started_at: datetime
+    finished_at: datetime
+    dataset_root: str
+    api_base_url: str
+    bounded_item_count: StrictInt = Field(ge=0)
+    stage_counts: ContentPipelineRunStageCounts
+    stage_timings: tuple[ContentPipelineStageTimings, ...]
+    ready_event_ids: tuple[uuid.UUID, ...]
+    blocked_item_ids: tuple[uuid.UUID, ...]
+    flagged_item_ids: tuple[uuid.UUID, ...]
+    item_reports: tuple[ContentPipelineRunItemReport, ...]
+    errors: tuple[str, ...] = ()
+
+
 __all__ = [
+    "ContentPipelineCanonicalContext",
+    "ContentPipelineClassificationDetail",
     "ContentPipelineDispatchEvent",
     "ContentPipelineErrorCode",
     "ContentPipelineErrorResponse",
     "ContentPipelineEventType",
+    "ContentPipelineItemDetail",
     "ContentPipelineItemFilter",
     "ContentPipelineItemRead",
+    "ContentPipelineMergeDetail",
+    "ContentPipelineMergeParticipation",
+    "ContentPipelineOCRDetail",
+    "ContentPipelineReadyEventSummary",
     "ContentPipelineReplayAccepted",
     "ContentPipelineReplayRequest",
+    "ContentPipelineRunItemReport",
+    "ContentPipelineRunStageCounts",
+    "ContentPipelineRunSummary",
     "ContentPipelineStageJournalRead",
+    "ContentPipelineStageTimings",
     "ContentPipelineUploadMetadata",
     "ContentPipelineUploadRead",
     "MAX_OBJECT_KEY_LENGTH",

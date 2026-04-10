@@ -13,11 +13,23 @@ from memexpert.api.dependencies.pipeline import (
     PIPELINE_OPERATOR_TOKEN_HEADER_NAME,
     get_content_pipeline_service,
 )
+from memexpert.core.classification import ClassificationResult
 from memexpert.core.config import get_settings
+from memexpert.core.media import NormalizedMediaResult, UploadMediaDetails
+from memexpert.core.ocr import OCRExtractionResult
+from memexpert.core.qdrant import QdrantSimilarityMatch
+from memexpert.core.voyage import VoyageEmbeddingResult
 from memexpert.models.base import utcnow
-from memexpert.models.enums import ContentPipelineStage, ContentPipelineStageStatus, SourcePlatform
+from memexpert.models.enums import (
+    ContentKind,
+    ContentLanguage,
+    ContentPipelineStage,
+    ContentPipelineStageStatus,
+    SourcePlatform,
+)
 from memexpert.schemas.content_pipeline import (
     ContentPipelineDispatchEvent,
+    ContentPipelineItemDetail,
     ContentPipelineItemFilter,
     ContentPipelineItemRead,
     ContentPipelineReplayAccepted,
@@ -156,13 +168,110 @@ class RecordingPublisher:
         self.events.append(event)
 
 
-def build_png_bytes() -> bytes:
+def build_png_bytes(*, color: tuple[int, int, int] = (255, 128, 0)) -> bytes:
     """Generate a tiny multipart upload body in memory for route tests."""
 
-    image = Image.new("RGB", (4, 4), color=(255, 128, 0))
+    image = Image.new("RGB", (4, 4), color=color)
     output = BytesIO()
     image.save(output, format="PNG")
     return output.getvalue()
+
+
+def _distinct_upload_media_details(*, tag: str) -> UploadMediaDetails:
+    """Build upload details with a unique perceptual hash for merge route fixtures."""
+
+    perceptual_hash = (tag * 16)[:16]
+    return UploadMediaDetails(
+        media_type=ContentKind.IMAGE,
+        mime_type="image/png",
+        width=32,
+        height=32,
+        file_size_bytes=64,
+        perceptual_hash=perceptual_hash,
+    )
+
+
+def _normalized_media_result(meme_file_id: uuid.UUID) -> NormalizedMediaResult:
+    """Return a deterministic transcode result for the enriched detail route tests."""
+
+    return NormalizedMediaResult(
+        mime_type="image/png",
+        width=32,
+        height=32,
+        file_size_bytes=128,
+        quality_score=0.77,
+        blur_hash="L4AS~q00~q.8%MRjM{Rj00IU%MRj",
+        web_video_object_key=f"pipeline/derived/{meme_file_id}/web.png",
+        web_video_bytes=b"detail-route-transcode-bytes",
+    )
+
+
+def _ocr_result(*, fallback_used: bool, low_confidence: bool, confidence: float | None) -> OCRExtractionResult:
+    """Return a deterministic OCR result with operator-visible fallback state."""
+
+    return OCRExtractionResult(
+        engine="paddleocr",
+        fallback_engine="qwen2.5-vl-2b" if fallback_used else None,
+        fallback_used=fallback_used,
+        low_confidence=low_confidence,
+        confidence=confidence,
+        language=ContentLanguage.EN,
+        extracted_text="enriched detail",
+        source_object_key="pipeline/derived/example/web.png",
+    )
+
+
+def _voyage_embedding(*, input_hash: str) -> VoyageEmbeddingResult:
+    """Return a deterministic 1024-dim voyage vector for the enriched detail route tests."""
+
+    return VoyageEmbeddingResult(
+        model="voyage-multimodal-3.5",
+        dimensions=1024,
+        vector=tuple(0.001 * index for index in range(1024)),
+        input_hash=input_hash,
+    )
+
+
+class _StaticInspectMediaProcessor:
+    """Real media processor that only overrides ``inspect_upload``.
+
+    The other methods are never exercised by the detail-route tests because
+    they stub transcode/OCR through direct service calls.
+    """
+
+    def __init__(self, *, inspect_result: UploadMediaDetails) -> None:
+        self._inspect_result = inspect_result
+
+    async def inspect_upload(
+        self,
+        *,
+        filename: str,
+        content_type: str,
+        media_bytes: bytes,
+    ) -> UploadMediaDetails:
+        _ = (filename, content_type, media_bytes)
+        return self._inspect_result
+
+    async def normalize_for_web(
+        self,
+        *,
+        meme_file_id: uuid.UUID,
+        filename: str,
+        content_type: str,
+        media_bytes: bytes,
+    ) -> NormalizedMediaResult:
+        _ = (meme_file_id, filename, content_type, media_bytes)
+        raise AssertionError("normalize_for_web is not used by the detail-route tests.")
+
+    async def extract_preview_frame(
+        self,
+        *,
+        filename: str,
+        content_type: str,
+        media_bytes: bytes,
+    ) -> bytes:
+        _ = (filename, content_type, media_bytes)
+        return b"fake-preview-bytes"
 
 
 def build_item() -> ContentPipelineItemRead:
@@ -561,3 +670,435 @@ async def test_pipeline_routes_list_failed_items_and_reject_replay_guards_with_r
         assert detail_response.json()["attempt_count"] == 1
     finally:
         app.dependency_overrides.clear()
+
+
+async def _seed_detail_item(
+    session: AsyncSession,
+    *,
+    storage_client: FakeStorageClient,
+    publisher: RecordingPublisher,
+    source_id: str,
+    post_id: str,
+    phash_tag: str,
+) -> uuid.UUID:
+    """Create a pipeline item with a unique perceptual hash for detail-route tests."""
+
+    service = ContentPipelineService(
+        session,
+        storage_client=storage_client,
+        publisher=publisher,
+        media_processor=_StaticInspectMediaProcessor(
+            inspect_result=_distinct_upload_media_details(tag=phash_tag),
+        ),
+    )
+    upload = await service.create_upload(
+        metadata=ContentPipelineUploadMetadata(
+            source_platform=SourcePlatform.TELEGRAM,
+            source_id=source_id,
+            post_id=post_id,
+            views=1,
+        ),
+        filename=f"{phash_tag}.png",
+        content_type="image/png",
+        media_bytes=build_png_bytes(color=(255, 0, 0)),
+    )
+    return upload.meme_file_id
+
+
+async def test_pipeline_detail_route_returns_empty_projections_before_ocr(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    """Items that have not reached OCR must expose no stub OCR/classify text."""
+
+    operator_token = get_settings().pipeline_operator_token.get_secret_value()
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    service = ContentPipelineService(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+    )
+    app.dependency_overrides[get_content_pipeline_service] = lambda: service
+
+    try:
+        item = await service.create_upload(
+            metadata=ContentPipelineUploadMetadata(
+                source_platform=SourcePlatform.TELEGRAM,
+                source_id="detail-early",
+                post_id="9101",
+                views=3,
+            ),
+            filename="early.png",
+            content_type="image/png",
+            media_bytes=build_png_bytes(color=(10, 20, 30)),
+        )
+
+        detail_response = await client.get(
+            f"/api/v1/pipeline/items/{item.meme_file_id}/detail",
+            headers={PIPELINE_OPERATOR_TOKEN_HEADER_NAME: operator_token},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert detail_response.status_code == 200
+    detail = ContentPipelineItemDetail.model_validate(detail_response.json())
+    assert detail.meme_file_id == item.meme_file_id
+    assert detail.current_stage is ContentPipelineStage.TRANSCODE
+    assert detail.current_status is ContentPipelineStageStatus.PENDING
+    # OCR has not run — the projection must be absent.
+    assert detail.ocr is None
+    # Classification must report unknown, never defaulted to false.
+    assert detail.classification.classified is False
+    assert detail.classification.is_nsfw is None
+    # No meme_ready event has been emitted.
+    assert detail.ready_event is None
+    # Merge lineage is empty.
+    assert detail.merge.as_source == ()
+    assert detail.merge.as_target == ()
+    # Canonical context still reports the new meme as the canonical primary.
+    assert detail.canonical is not None
+    assert detail.canonical.canonical_meme_id == item.meme_id
+    assert detail.canonical.is_canonical_primary is True
+    assert detail.canonical.ocr_text is None
+
+
+async def test_pipeline_detail_route_returns_ocr_and_unknown_classification_after_ocr(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    """A file past OCR but before classify must expose OCR truth but never fake is_nsfw."""
+
+    operator_token = get_settings().pipeline_operator_token.get_secret_value()
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    service = ContentPipelineService(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+    )
+    app.dependency_overrides[get_content_pipeline_service] = lambda: service
+
+    try:
+        item = await service.create_upload(
+            metadata=ContentPipelineUploadMetadata(
+                source_platform=SourcePlatform.TELEGRAM,
+                source_id="detail-ocr",
+                post_id="9102",
+                views=2,
+            ),
+            filename="ocr.png",
+            content_type="image/png",
+            media_bytes=build_png_bytes(color=(40, 50, 60)),
+        )
+        await service.complete_transcode_stage(
+            meme_file_id=item.meme_file_id,
+            attempt=1,
+            event_id=uuid.uuid7(),
+            result=_normalized_media_result(item.meme_file_id),
+        )
+        await service.complete_ocr_stage(
+            meme_file_id=item.meme_file_id,
+            attempt=1,
+            event_id=uuid.uuid7(),
+            result=_ocr_result(fallback_used=True, low_confidence=True, confidence=0.42),
+        )
+
+        detail_response = await client.get(
+            f"/api/v1/pipeline/items/{item.meme_file_id}/detail",
+            headers={PIPELINE_OPERATOR_TOKEN_HEADER_NAME: operator_token},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert detail_response.status_code == 200
+    detail = ContentPipelineItemDetail.model_validate(detail_response.json())
+    assert detail.current_stage is ContentPipelineStage.EMBED
+    assert detail.current_status is ContentPipelineStageStatus.PENDING
+    assert detail.ocr is not None
+    assert detail.ocr.fallback_used is True
+    assert detail.ocr.low_confidence is True
+    assert detail.ocr.confidence == 0.42
+    assert detail.ocr.extracted_text == "enriched detail"
+    assert detail.ocr.language is ContentLanguage.EN
+    # Classification still unknown until classify stage succeeds.
+    assert detail.classification.classified is False
+    assert detail.classification.is_nsfw is None
+    assert detail.ready_event is None
+    assert detail.canonical is not None
+    # Canonical still has ocr_text unset because classify owns that write.
+    assert detail.canonical.ocr_text is None
+
+
+async def test_pipeline_detail_route_reports_merge_and_classify_and_ready(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    """A fully processed merged item must expose merge + classify + meme_ready truth."""
+
+    operator_token = get_settings().pipeline_operator_token.get_secret_value()
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+
+    # Seed the older canonical item and drive it through the heavy chain.
+    older_meme_file_id = await _seed_detail_item(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+        source_id="detail-merge-older",
+        post_id="9200",
+        phash_tag="o",
+    )
+    older_service = ContentPipelineService(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+    )
+    older_meme = (
+        await older_service.get_item(older_meme_file_id)
+    ).meme_id
+    await older_service.complete_transcode_stage(
+        meme_file_id=older_meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        result=_normalized_media_result(older_meme_file_id),
+    )
+    await older_service.complete_ocr_stage(
+        meme_file_id=older_meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        result=_ocr_result(fallback_used=False, low_confidence=False, confidence=0.91),
+    )
+    _ = await older_service.complete_embed_stage(
+        meme_file_id=older_meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        embedding_result=_voyage_embedding(input_hash="1" * 64),
+        similarity_matches=(),
+    )
+    await older_service.complete_classify_stage(
+        meme_file_id=older_meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        classification_result=ClassificationResult(
+            model="memexpert-nsfw-v1",
+            is_nsfw=False,
+            nsfw_score=0.05,
+        ),
+    )
+
+    # Seed a newer item with a distinct hash and merge it into the older canonical.
+    newer_meme_file_id = await _seed_detail_item(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+        source_id="detail-merge-newer",
+        post_id="9201",
+        phash_tag="n",
+    )
+    newer_service = ContentPipelineService(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+    )
+    await newer_service.complete_transcode_stage(
+        meme_file_id=newer_meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        result=_normalized_media_result(newer_meme_file_id),
+    )
+    await newer_service.complete_ocr_stage(
+        meme_file_id=newer_meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        result=_ocr_result(fallback_used=False, low_confidence=False, confidence=0.93),
+    )
+    _ = await newer_service.complete_embed_stage(
+        meme_file_id=newer_meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        embedding_result=_voyage_embedding(input_hash="2" * 64),
+        similarity_matches=(
+            QdrantSimilarityMatch(
+                meme_file_id=older_meme_file_id,
+                meme_id=older_meme,
+                similarity_score=0.97,
+            ),
+        ),
+    )
+    # After the merge, the newer file lives under the older canonical meme.
+    await newer_service.complete_classify_stage(
+        meme_file_id=newer_meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        classification_result=ClassificationResult(
+            model="memexpert-nsfw-v1",
+            is_nsfw=True,
+            nsfw_score=0.82,
+        ),
+    )
+
+    service = ContentPipelineService(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+    )
+    app.dependency_overrides[get_content_pipeline_service] = lambda: service
+
+    try:
+        detail_response = await client.get(
+            f"/api/v1/pipeline/items/{newer_meme_file_id}/detail",
+            headers={PIPELINE_OPERATOR_TOKEN_HEADER_NAME: operator_token},
+        )
+        s01_response = await client.get(
+            f"/api/v1/pipeline/items/{newer_meme_file_id}",
+            headers={PIPELINE_OPERATOR_TOKEN_HEADER_NAME: operator_token},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert detail_response.status_code == 200
+    assert s01_response.status_code == 200
+
+    detail = ContentPipelineItemDetail.model_validate(detail_response.json())
+    assert detail.classification.classified is True
+    assert detail.classification.is_nsfw is True
+    assert detail.ocr is not None
+    assert detail.ocr.fallback_used is False
+    assert detail.ready_event is not None
+    # The merge projection must show the newer file as the source that moved under older_meme.
+    assert len(detail.merge.as_source) == 1
+    participation = detail.merge.as_source[0]
+    assert participation.target_meme_id == older_meme
+    assert participation.similarity_score == 0.97
+    assert participation.merge_reason == "high_similarity_match"
+    # Canonical context now points at the older meme.
+    assert detail.canonical is not None
+    assert detail.canonical.canonical_meme_id == older_meme
+
+    # S01 contract stayed compatible: the enriched surface is a strict superset,
+    # never replacing list/detail/replay payloads.
+    s01_payload = s01_response.json()
+    for field_name in (
+        "meme_id",
+        "meme_file_id",
+        "current_stage",
+        "current_status",
+        "original_object_key",
+        "web_video_object_key",
+        "last_event_id",
+        "normalized_reason",
+        "last_error_text",
+        "attempt_count",
+        "stages",
+    ):
+        assert field_name in s01_payload
+        assert s01_payload[field_name] == detail_response.json()[field_name]
+
+
+async def test_pipeline_detail_route_reports_blocked_items_without_defaulted_classify(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    """A blocked embed item must stay visible and expose the failure surface honestly."""
+
+    operator_token = get_settings().pipeline_operator_token.get_secret_value()
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    service = ContentPipelineService(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+    )
+    app.dependency_overrides[get_content_pipeline_service] = lambda: service
+
+    try:
+        item = await service.create_upload(
+            metadata=ContentPipelineUploadMetadata(
+                source_platform=SourcePlatform.TELEGRAM,
+                source_id="detail-blocked",
+                post_id="9300",
+                views=4,
+            ),
+            filename="blocked.png",
+            content_type="image/png",
+            media_bytes=build_png_bytes(color=(70, 80, 90)),
+        )
+        await service.complete_transcode_stage(
+            meme_file_id=item.meme_file_id,
+            attempt=1,
+            event_id=uuid.uuid7(),
+            result=_normalized_media_result(item.meme_file_id),
+        )
+        await service.complete_ocr_stage(
+            meme_file_id=item.meme_file_id,
+            attempt=1,
+            event_id=uuid.uuid7(),
+            result=_ocr_result(fallback_used=False, low_confidence=False, confidence=0.88),
+        )
+        await service.mark_stage_failed(
+            meme_file_id=item.meme_file_id,
+            stage=ContentPipelineStage.EMBED,
+            attempt=1,
+            event_id=uuid.uuid7(),
+            normalized_reason="embed_provider_blocked",
+            last_error_text="voyage quota exceeded",
+            retryable=True,
+        )
+
+        detail_response = await client.get(
+            f"/api/v1/pipeline/items/{item.meme_file_id}/detail",
+            headers={PIPELINE_OPERATOR_TOKEN_HEADER_NAME: operator_token},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert detail_response.status_code == 200
+    detail = ContentPipelineItemDetail.model_validate(detail_response.json())
+    assert detail.current_stage is ContentPipelineStage.EMBED
+    assert detail.current_status is ContentPipelineStageStatus.FAILED
+    assert detail.normalized_reason == "embed_provider_blocked"
+    assert detail.last_error_text == "voyage quota exceeded"
+    # OCR is durable truth and should still appear.
+    assert detail.ocr is not None
+    assert detail.ocr.confidence == 0.88
+    # Classification must still be unknown — no defaulted False.
+    assert detail.classification.classified is False
+    assert detail.classification.is_nsfw is None
+    assert detail.ready_event is None
+
+
+async def test_pipeline_detail_route_returns_404_for_unknown_item_and_registers_openapi(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    """The detail route must reject unknown ids and appear in the OpenAPI schema."""
+
+    operator_token = get_settings().pipeline_operator_token.get_secret_value()
+    service = ContentPipelineService(migrated_db_session)
+    app.dependency_overrides[get_content_pipeline_service] = lambda: service
+    unknown_id = uuid.uuid7()
+
+    try:
+        unknown_response = await client.get(
+            f"/api/v1/pipeline/items/{unknown_id}/detail",
+            headers={PIPELINE_OPERATOR_TOKEN_HEADER_NAME: operator_token},
+        )
+        openapi_response = await client.get("/openapi.json")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert unknown_response.status_code == 404
+    assert unknown_response.json()["code"] == "pipeline_item_not_found"
+
+    paths = openapi_response.json()["paths"]
+    assert "/api/v1/pipeline/items/{meme_file_id}/detail" in paths
+    # S01 routes are still present — the enriched surface is additive.
+    assert "/api/v1/pipeline/items/{meme_file_id}" in paths
+    assert "/api/v1/pipeline/items" in paths
+    assert "/api/v1/pipeline/items/{meme_file_id}/replay" in paths
