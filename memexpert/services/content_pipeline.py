@@ -56,12 +56,14 @@ from memexpert.schemas.content_pipeline import (
     ContentPipelineUploadMetadata,
     ContentPipelineUploadRead,
     PerTargetSyncStatus,
+    SmokeProofResult,
 )
 from memexpert.services.content_merge import ContentMergeService, MergeOutcome
 from memexpert.services.content_pipeline_reporting import (
     build_item_detail,
     decode_sync_preview,
 )
+from memexpert.services.content_pipeline_smoke import run_smoke_proof
 from memexpert.services.errors import (
     PipelineIngestError,
     PipelineItemNotFoundError,
@@ -79,7 +81,12 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from memexpert.core.classification import ClassificationResult
-    from memexpert.core.qdrant import QdrantSimilarityMatch
+    from memexpert.core.meilisearch import MeilisearchSyncClientProtocol
+    from memexpert.core.qdrant import (
+        QdrantSimilarityClientProtocol,
+        QdrantSimilarityMatch,
+        QdrantSyncClientProtocol,
+    )
     from memexpert.core.voyage import VoyageEmbeddingResult
 
 
@@ -329,6 +336,70 @@ class ContentPipelineService:
 
         meme_file = await self._get_meme_file(meme_file_id)
         return self._build_item_read(meme_file)
+
+    async def run_search_smoke_proof(
+        self,
+        *,
+        qdrant_sync_client: QdrantSyncClientProtocol,
+        qdrant_similarity_client: QdrantSimilarityClientProtocol,
+        meilisearch_sync_client: MeilisearchSyncClientProtocol,
+        meme_file_id: uuid.UUID,
+        query: str | None,
+    ) -> SmokeProofResult:
+        """Run the dual-target search-sync smoke proof for one pipeline item.
+
+        Thin delegator to :func:`run_smoke_proof` that keeps the reporting
+        module import-safe (no SQL session) while giving route handlers a
+        familiar ``pipeline_service.run_search_smoke_proof(...)`` entry
+        point. The service does not own the Qdrant or Meilisearch clients
+        because they must be overridable per request in tests.
+        """
+
+        return await run_smoke_proof(
+            self._session,
+            qdrant_sync_client=qdrant_sync_client,
+            qdrant_similarity_client=qdrant_similarity_client,
+            meilisearch_sync_client=meilisearch_sync_client,
+            meme_file_id=meme_file_id,
+            query=query,
+        )
+
+    async def resolve_meme_file_id_from_query(
+        self,
+        *,
+        meilisearch_sync_client: MeilisearchSyncClientProtocol,
+        query: str,
+    ) -> uuid.UUID:
+        """Return the top Meilisearch hit's ``meme_file_id`` for the given query.
+
+        Used by the smoke-proof route when an operator passes ``query`` but
+        no ``meme_file_id``. Raises :class:`PipelineItemNotFoundError` when
+        Meilisearch returns no hits so the route can map it onto a ``404``
+        with the standard ``pipeline_item_not_found`` error code. Adapter
+        exceptions propagate so the dispatcher surfaces a typed 5xx.
+        """
+
+        stripped_query = query.strip()
+        if not stripped_query:
+            raise PipelinePayloadValidationError(
+                "Smoke proof query must not be blank.",
+            )
+        hits = await meilisearch_sync_client.search(stripped_query, limit=1)
+        if not hits:
+            raise PipelineItemNotFoundError(
+                f"Smoke proof query '{stripped_query}' returned no Meilisearch hits.",
+            )
+        raw_id = hits[0].get("id") if isinstance(hits[0], dict) else None
+        if not isinstance(raw_id, str):
+            raise PipelineItemNotFoundError(
+                f"Smoke proof query '{stripped_query}' returned a malformed top hit id.",
+            )
+        try:
+            return uuid.UUID(raw_id)
+        except ValueError as exc:
+            raise PipelineItemNotFoundError(
+                f"Smoke proof query '{stripped_query}' returned a malformed top hit id.",
+            ) from exc
 
     async def get_item_detail(self, meme_file_id: uuid.UUID) -> ContentPipelineItemDetail:
         """Return the enriched S02 operator projection with OCR/merge/classify truth.

@@ -16,8 +16,17 @@ import memexpert.services.content_pipeline as content_pipeline_module
 from memexpert.core.classification import ClassificationResult
 from memexpert.core.config import Settings
 from memexpert.core.media import NormalizedMediaResult, UploadMediaDetails
+from memexpert.core.meilisearch import (
+    MeilisearchSyncMalformedResponseError,
+    MeilisearchSyncTimeoutError,
+    PipelineMeilisearchDocument,
+)
 from memexpert.core.ocr import OCRExtractionResult
-from memexpert.core.qdrant import QdrantSimilarityMatch
+from memexpert.core.qdrant import (
+    QdrantSimilarityMatch,
+    QdrantSyncPayload,
+    QdrantSyncTimeoutError,
+)
 from memexpert.core.voyage import VoyageEmbeddingResult
 from memexpert.models.content import (
     EmbeddingCache,
@@ -43,6 +52,7 @@ from memexpert.models.enums import (
 from memexpert.schemas.content_pipeline import (
     ContentPipelineDispatchEvent,
     ContentPipelineEventType,
+    ContentPipelineSyncTargetPreview,
     ContentPipelineUploadMetadata,
 )
 from memexpert.services import (
@@ -57,6 +67,8 @@ from memexpert.services import (
 from memexpert.services.content_merge import MERGE_REASON_HIGH_SIMILARITY
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     from pytest import MonkeyPatch
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -2032,5 +2044,470 @@ def _snapshot_row_to_dict(row: MemeFileSyncTargetSnapshot) -> dict[str, object]:
         "created_at": row.created_at,
         "updated_at": row.updated_at,
     }
+
+
+# --- T04: run_smoke_proof service tests -------------------------------------
+
+
+@dataclass(slots=True)
+class _FakeQdrantSyncClient:
+    """Narrow Qdrant sync double used by the T04 smoke-proof service tests."""
+
+    fetch_preview: ContentPipelineSyncTargetPreview | None = None
+    fetch_error: Exception | None = None
+    upsert_error: Exception | None = None
+    fetch_calls: list[uuid.UUID] = field(default_factory=list)
+
+    async def upsert_meme_point(
+        self,
+        payload: QdrantSyncPayload,
+        vector: tuple[float, ...],
+    ) -> None:
+        _ = (payload, vector)
+        if self.upsert_error is not None:
+            raise self.upsert_error
+
+    async def fetch_meme_point(
+        self,
+        meme_file_id: uuid.UUID,
+    ) -> ContentPipelineSyncTargetPreview | None:
+        self.fetch_calls.append(meme_file_id)
+        if self.fetch_error is not None:
+            raise self.fetch_error
+        return self.fetch_preview
+
+    async def delete_meme_point(self, meme_file_id: uuid.UUID) -> None:
+        _ = meme_file_id
+
+
+@dataclass(slots=True)
+class _FakeQdrantSimilarityClient:
+    """Narrow Qdrant similarity double used by the T04 smoke-proof service tests."""
+
+    matches: tuple[QdrantSimilarityMatch, ...] = ()
+    error: Exception | None = None
+    calls: list[dict[str, object]] = field(default_factory=list)
+
+    async def find_similar_memes(
+        self,
+        *,
+        vector: tuple[float, ...],
+        current_meme_file_id: uuid.UUID,
+        limit: int | None = None,
+    ) -> tuple[QdrantSimilarityMatch, ...]:
+        self.calls.append(
+            {
+                "vector_len": len(vector),
+                "current_meme_file_id": current_meme_file_id,
+                "limit": limit,
+            },
+        )
+        if self.error is not None:
+            raise self.error
+        return self.matches
+
+
+@dataclass(slots=True)
+class _FakeMeilisearchSyncClient:
+    """Narrow Meilisearch sync double used by the T04 smoke-proof service tests."""
+
+    fetch_preview: ContentPipelineSyncTargetPreview | None = None
+    fetch_error: Exception | None = None
+    search_hits: list[dict[str, object]] = field(default_factory=list)
+    search_error: Exception | None = None
+    upsert_error: Exception | None = None
+    fetch_calls: list[uuid.UUID] = field(default_factory=list)
+    search_calls: list[dict[str, object]] = field(default_factory=list)
+
+    async def upsert_document(
+        self,
+        document: PipelineMeilisearchDocument,
+    ) -> None:
+        _ = document
+        if self.upsert_error is not None:
+            raise self.upsert_error
+
+    async def fetch_document(
+        self,
+        meme_file_id: uuid.UUID,
+    ) -> ContentPipelineSyncTargetPreview | None:
+        self.fetch_calls.append(meme_file_id)
+        if self.fetch_error is not None:
+            raise self.fetch_error
+        return self.fetch_preview
+
+    async def delete_document(self, meme_file_id: uuid.UUID) -> None:
+        _ = meme_file_id
+
+    async def ensure_index(self) -> None:
+        return None
+
+    async def search(
+        self,
+        query: str,
+        *,
+        limit: int = 20,
+    ) -> list[dict[str, object]]:
+        self.search_calls.append({"query": query, "limit": limit})
+        if self.search_error is not None:
+            raise self.search_error
+        return list(self.search_hits)
+
+
+def _build_qdrant_preview(meme_file_id: uuid.UUID) -> ContentPipelineSyncTargetPreview:
+    return ContentPipelineSyncTargetPreview(
+        target=SyncTargetKind.QDRANT,
+        preview_fields={
+            "meme_id": str(uuid.uuid7()),
+            "meme_file_id": str(meme_file_id),
+            "language": "en",
+            "is_nsfw": False,
+            "tags": [],
+        },
+        preview_fetched_at=utcnow_for_tests(),
+    )
+
+
+def _build_meili_preview(meme_file_id: uuid.UUID) -> ContentPipelineSyncTargetPreview:
+    return ContentPipelineSyncTargetPreview(
+        target=SyncTargetKind.MEILISEARCH,
+        preview_fields={
+            "id": meme_file_id.hex,
+            "language": "en",
+            "is_nsfw": False,
+            "tags": [],
+        },
+        preview_fetched_at=utcnow_for_tests(),
+    )
+
+
+def utcnow_for_tests() -> datetime:
+    from datetime import UTC
+    from datetime import datetime as _datetime
+
+    return _datetime.now(tz=UTC)
+
+
+async def test_run_smoke_proof_reports_both_targets_searchable(
+    migrated_db_session: AsyncSession,
+) -> None:
+    """Happy path: both targets return ids + query matches → both_targets_searchable."""
+
+    meme_file_id, service = await _drive_to_classify_succeeded(
+        migrated_db_session,
+        source_id="smoke-happy",
+        post_id="9800",
+        phash_tag="h",
+        input_hash_seed="h",
+    )
+    _ = await service.complete_sync_qdrant_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        payload_preview={"point_id": str(meme_file_id)},
+    )
+    _ = await service.complete_sync_meili_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        payload_preview={"id": meme_file_id.hex},
+    )
+
+    qdrant_sync = _FakeQdrantSyncClient(fetch_preview=_build_qdrant_preview(meme_file_id))
+    similarity = _FakeQdrantSimilarityClient(
+        matches=(
+            QdrantSimilarityMatch(
+                meme_file_id=meme_file_id,
+                meme_id=uuid.uuid7(),
+                similarity_score=0.99,
+            ),
+        ),
+    )
+    meili = _FakeMeilisearchSyncClient(
+        fetch_preview=_build_meili_preview(meme_file_id),
+        search_hits=[{"id": meme_file_id.hex}],
+    )
+
+    result = await service.run_search_smoke_proof(
+        qdrant_sync_client=qdrant_sync,
+        qdrant_similarity_client=similarity,
+        meilisearch_sync_client=meili,
+        meme_file_id=meme_file_id,
+        query=None,
+    )
+
+    assert result.both_targets_searchable is True
+    assert result.meme_file_id == meme_file_id
+    qdrant_result = next(t for t in result.targets if t.target is SyncTargetKind.QDRANT)
+    meili_result = next(t for t in result.targets if t.target is SyncTargetKind.MEILISEARCH)
+    assert qdrant_result.searchable is True
+    assert qdrant_result.matched_by == "both"
+    assert meili_result.searchable is True
+    assert meili_result.matched_by == "both"
+
+
+async def test_run_smoke_proof_reports_point_not_found_when_qdrant_missing(
+    migrated_db_session: AsyncSession,
+) -> None:
+    """Qdrant snapshot says synced but fetch_point returns None → point_not_found."""
+
+    meme_file_id, service = await _drive_to_classify_succeeded(
+        migrated_db_session,
+        source_id="smoke-qdrant-missing",
+        post_id="9801",
+        phash_tag="m",
+        input_hash_seed="m",
+    )
+    _ = await service.complete_sync_qdrant_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        payload_preview={"point_id": str(meme_file_id)},
+    )
+    _ = await service.complete_sync_meili_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        payload_preview={"id": meme_file_id.hex},
+    )
+
+    qdrant_sync = _FakeQdrantSyncClient(fetch_preview=None)
+    similarity = _FakeQdrantSimilarityClient()
+    meili = _FakeMeilisearchSyncClient(
+        fetch_preview=_build_meili_preview(meme_file_id),
+        search_hits=[{"id": meme_file_id.hex}],
+    )
+
+    result = await service.run_search_smoke_proof(
+        qdrant_sync_client=qdrant_sync,
+        qdrant_similarity_client=similarity,
+        meilisearch_sync_client=meili,
+        meme_file_id=meme_file_id,
+        query=None,
+    )
+
+    assert result.both_targets_searchable is False
+    qdrant_result = next(t for t in result.targets if t.target is SyncTargetKind.QDRANT)
+    meili_result = next(t for t in result.targets if t.target is SyncTargetKind.MEILISEARCH)
+    assert qdrant_result.searchable is False
+    assert qdrant_result.reason == "point_not_found"
+    # Meilisearch must still produce a truthful per-target result.
+    assert meili_result.searchable is True
+
+
+async def test_run_smoke_proof_reports_document_not_found_when_meili_missing(
+    migrated_db_session: AsyncSession,
+) -> None:
+    """Meilisearch snapshot says synced but fetch_document returns None → document_not_found."""
+
+    meme_file_id, service = await _drive_to_classify_succeeded(
+        migrated_db_session,
+        source_id="smoke-meili-missing",
+        post_id="9802",
+        phash_tag="d",
+        input_hash_seed="d",
+    )
+    _ = await service.complete_sync_qdrant_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        payload_preview={"point_id": str(meme_file_id)},
+    )
+    _ = await service.complete_sync_meili_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        payload_preview={"id": meme_file_id.hex},
+    )
+
+    qdrant_sync = _FakeQdrantSyncClient(fetch_preview=_build_qdrant_preview(meme_file_id))
+    similarity = _FakeQdrantSimilarityClient(
+        matches=(
+            QdrantSimilarityMatch(
+                meme_file_id=meme_file_id,
+                meme_id=uuid.uuid7(),
+                similarity_score=0.99,
+            ),
+        ),
+    )
+    meili = _FakeMeilisearchSyncClient(fetch_preview=None)
+
+    result = await service.run_search_smoke_proof(
+        qdrant_sync_client=qdrant_sync,
+        qdrant_similarity_client=similarity,
+        meilisearch_sync_client=meili,
+        meme_file_id=meme_file_id,
+        query=None,
+    )
+
+    assert result.both_targets_searchable is False
+    meili_result = next(t for t in result.targets if t.target is SyncTargetKind.MEILISEARCH)
+    assert meili_result.searchable is False
+    assert meili_result.reason == "document_not_found"
+    # The Qdrant half must still pass — no short-circuit on partial failure.
+    qdrant_result = next(t for t in result.targets if t.target is SyncTargetKind.QDRANT)
+    assert qdrant_result.searchable is True
+
+
+async def test_run_smoke_proof_reports_qdrant_timeout_while_proving_meili(
+    migrated_db_session: AsyncSession,
+) -> None:
+    """Qdrant adapter raises timeout → reason=timeout, Meilisearch still proved."""
+
+    meme_file_id, service = await _drive_to_classify_succeeded(
+        migrated_db_session,
+        source_id="smoke-qdrant-timeout",
+        post_id="9803",
+        phash_tag="t",
+        input_hash_seed="t",
+    )
+    _ = await service.complete_sync_qdrant_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        payload_preview={"point_id": str(meme_file_id)},
+    )
+    _ = await service.complete_sync_meili_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        payload_preview={"id": meme_file_id.hex},
+    )
+
+    qdrant_sync = _FakeQdrantSyncClient(
+        fetch_error=QdrantSyncTimeoutError("qdrant fetch_meme_point timed out"),
+    )
+    similarity = _FakeQdrantSimilarityClient()
+    meili = _FakeMeilisearchSyncClient(
+        fetch_preview=_build_meili_preview(meme_file_id),
+        search_hits=[{"id": meme_file_id.hex}],
+    )
+
+    result = await service.run_search_smoke_proof(
+        qdrant_sync_client=qdrant_sync,
+        qdrant_similarity_client=similarity,
+        meilisearch_sync_client=meili,
+        meme_file_id=meme_file_id,
+        query=None,
+    )
+
+    assert result.both_targets_searchable is False
+    qdrant_result = next(t for t in result.targets if t.target is SyncTargetKind.QDRANT)
+    meili_result = next(t for t in result.targets if t.target is SyncTargetKind.MEILISEARCH)
+    assert qdrant_result.searchable is False
+    assert qdrant_result.reason == "timeout"
+    # Meilisearch was NOT short-circuited by the Qdrant timeout.
+    assert meili_result.searchable is True
+
+
+async def test_run_smoke_proof_reports_meili_malformed_while_proving_qdrant(
+    migrated_db_session: AsyncSession,
+) -> None:
+    """Meilisearch adapter raises malformed → reason=malformed_response, Qdrant still proved."""
+
+    meme_file_id, service = await _drive_to_classify_succeeded(
+        migrated_db_session,
+        source_id="smoke-meili-malformed",
+        post_id="9804",
+        phash_tag="f",
+        input_hash_seed="f",
+    )
+    _ = await service.complete_sync_qdrant_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        payload_preview={"point_id": str(meme_file_id)},
+    )
+    _ = await service.complete_sync_meili_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        payload_preview={"id": meme_file_id.hex},
+    )
+
+    qdrant_sync = _FakeQdrantSyncClient(fetch_preview=_build_qdrant_preview(meme_file_id))
+    similarity = _FakeQdrantSimilarityClient(
+        matches=(
+            QdrantSimilarityMatch(
+                meme_file_id=meme_file_id,
+                meme_id=uuid.uuid7(),
+                similarity_score=0.99,
+            ),
+        ),
+    )
+    meili = _FakeMeilisearchSyncClient(
+        fetch_error=MeilisearchSyncMalformedResponseError("bad payload"),
+    )
+
+    result = await service.run_search_smoke_proof(
+        qdrant_sync_client=qdrant_sync,
+        qdrant_similarity_client=similarity,
+        meilisearch_sync_client=meili,
+        meme_file_id=meme_file_id,
+        query=None,
+    )
+
+    assert result.both_targets_searchable is False
+    qdrant_result = next(t for t in result.targets if t.target is SyncTargetKind.QDRANT)
+    meili_result = next(t for t in result.targets if t.target is SyncTargetKind.MEILISEARCH)
+    # The Qdrant proof must still succeed even though Meilisearch raised.
+    assert qdrant_result.searchable is True
+    assert meili_result.searchable is False
+    assert meili_result.reason == "malformed_response"
+
+
+async def test_run_smoke_proof_uses_meili_search_timeout_reason_on_query_step(
+    migrated_db_session: AsyncSession,
+) -> None:
+    """Meilisearch id-lookup passes but the search re-query times out → reason=timeout."""
+
+    meme_file_id, service = await _drive_to_classify_succeeded(
+        migrated_db_session,
+        source_id="smoke-meili-search-timeout",
+        post_id="9805",
+        phash_tag="g",
+        input_hash_seed="g",
+    )
+    _ = await service.complete_sync_qdrant_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        payload_preview={"point_id": str(meme_file_id)},
+    )
+    _ = await service.complete_sync_meili_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        payload_preview={"id": meme_file_id.hex},
+    )
+
+    qdrant_sync = _FakeQdrantSyncClient(fetch_preview=_build_qdrant_preview(meme_file_id))
+    similarity = _FakeQdrantSimilarityClient(
+        matches=(
+            QdrantSimilarityMatch(
+                meme_file_id=meme_file_id,
+                meme_id=uuid.uuid7(),
+                similarity_score=0.99,
+            ),
+        ),
+    )
+    meili = _FakeMeilisearchSyncClient(
+        fetch_preview=_build_meili_preview(meme_file_id),
+        search_error=MeilisearchSyncTimeoutError("slow"),
+    )
+
+    result = await service.run_search_smoke_proof(
+        qdrant_sync_client=qdrant_sync,
+        qdrant_similarity_client=similarity,
+        meilisearch_sync_client=meili,
+        meme_file_id=meme_file_id,
+        query=None,
+    )
+
+    meili_result = next(t for t in result.targets if t.target is SyncTargetKind.MEILISEARCH)
+    assert meili_result.searchable is False
+    assert meili_result.reason == "timeout"
+    # id-lookup passed even though the query leg timed out.
+    assert meili_result.matched_by == "id_lookup"
 
 

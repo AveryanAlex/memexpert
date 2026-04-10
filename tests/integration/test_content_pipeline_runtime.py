@@ -3314,3 +3314,186 @@ def test_verify_s02_runtime_parse_args_round_trips_argparse_defaults_and_overrid
     assert args.api_timeout == 8.0
     assert args.dry_run is True
     assert args.run_id == "fixed"
+
+
+# --- T04: forced Qdrant failure → partially_searchable aggregation ----------
+
+
+async def test_forced_sync_qdrant_failure_produces_partially_searchable_outcome(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Forcing Qdrant failure on a classified item yields partially_searchable.
+
+    This exercises the runtime knob
+    ``pipeline_worker_fail_sync_qdrant_for_meme_file_id`` end-to-end: the
+    Qdrant consumer intentionally fails with
+    ``PIPELINE_REASON_FORCED_SYNC_QDRANT_FAILURE`` while the Meilisearch
+    consumer runs normally. The resulting run summary must report exactly
+    one partially searchable item and bump ``blocked_by_qdrant_count`` only
+    when the stage row is non-retryable — forced failures are replayable,
+    so the item's outcome is ``partially_searchable``.
+    """
+
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    meme_file_id, _, _ = await _seed_classify_pending_item(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+        source_id="t04-partial-outcome",
+        post_id="9901",
+    )
+    service = ContentPipelineService(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+    )
+    await service.complete_classify_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        classification_result=build_classification_result(),
+    )
+    # Meilisearch runs normally, Qdrant fails with the forced reason.
+    _ = await service.complete_sync_meili_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        payload_preview={"id": meme_file_id.hex},
+    )
+    _ = await service.fail_sync_qdrant_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        normalized_reason=PIPELINE_REASON_FORCED_SYNC_QDRANT_FAILURE,
+        last_error_text="forced qdrant sync failure",
+    )
+
+    async with postgres_session_factory() as read_session:
+        read_service = ContentPipelineService(
+            read_session,
+            storage_client=storage_client,
+            publisher=publisher,
+        )
+        detail = await read_service.get_item_detail(meme_file_id)
+
+    summary = summarize_run(
+        run_id="t04-partial",
+        started_at=datetime(2026, 4, 10, 12, 0, 0, tzinfo=UTC),
+        finished_at=datetime(2026, 4, 10, 12, 1, 0, tzinfo=UTC),
+        dataset_root="/tmp/unused",
+        api_base_url="http://127.0.0.1:8000",
+        items=(detail,),
+    )
+
+    assert summary.stage_counts.partially_searchable_count == 1
+    assert summary.stage_counts.both_synced_count == 0
+    report = summary.item_reports[0]
+    assert report.outcome == "partially_searchable"
+
+
+async def test_run_summary_reflects_k_of_n_forced_qdrant_failures(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """N items where K fail Qdrant non-retryably → blocked_by_qdrant=K, both_synced=N-K.
+
+    ``blocked_by_qdrant_count`` counts items whose outcome resolves to
+    ``blocked`` AND whose Qdrant snapshot is failed-non-retryable. To keep
+    the blocked classification honest the failing item's Meilisearch sync
+    stays pending — if we completed both sync stages and one target was
+    still "partially synced" the aggregator would (rightly) classify the
+    item as ``partially_searchable`` and leave ``blocked_by_qdrant_count``
+    at zero. Each item uses a distinct perceptual hash tag + input hash
+    seed so the heavy chain does not dedup them.
+    """
+
+    from memexpert.services.content_pipeline import (
+        _PIPELINE_REASON_SYNC_QDRANT_MALFORMED_PAYLOAD,
+    )
+
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    total = 3
+    failing_index = 0  # exactly one item force-fails Qdrant non-retryably.
+    details: list[ContentPipelineItemDetail] = []
+    phash_tags = ("a", "b", "c")
+    input_hash_seeds = ("1", "2", "3")
+    for index in range(total):
+        meme_file_id, _, _ = await _seed_embed_pending_item(
+            migrated_db_session,
+            storage_client=storage_client,
+            publisher=publisher,
+            source_id=f"t04-kofn-{index}",
+            post_id=f"99{index:02d}",
+            phash_tag=phash_tags[index],
+        )
+        service = ContentPipelineService(
+            migrated_db_session,
+            storage_client=storage_client,
+            publisher=publisher,
+        )
+        _ = await service.complete_embed_stage(
+            meme_file_id=meme_file_id,
+            attempt=1,
+            event_id=uuid.uuid7(),
+            embedding_result=build_voyage_embedding_result(
+                input_hash=input_hash_seeds[index] * 64,
+            ),
+            similarity_matches=(),
+        )
+        await service.complete_classify_stage(
+            meme_file_id=meme_file_id,
+            attempt=1,
+            event_id=uuid.uuid7(),
+            classification_result=build_classification_result(),
+        )
+        if index == failing_index:
+            # Non-retryable Qdrant failure. Meilisearch is INTENTIONALLY left
+            # pending so the aggregate outcome resolves to ``blocked`` rather
+            # than ``partially_searchable``.
+            _ = await service.fail_sync_qdrant_stage(
+                meme_file_id=meme_file_id,
+                attempt=1,
+                event_id=uuid.uuid7(),
+                normalized_reason=_PIPELINE_REASON_SYNC_QDRANT_MALFORMED_PAYLOAD,
+                last_error_text="forced malformed qdrant payload",
+            )
+        else:
+            _ = await service.complete_sync_qdrant_stage(
+                meme_file_id=meme_file_id,
+                attempt=1,
+                event_id=uuid.uuid7(),
+                payload_preview={"point_id": str(meme_file_id)},
+            )
+            _ = await service.complete_sync_meili_stage(
+                meme_file_id=meme_file_id,
+                attempt=1,
+                event_id=uuid.uuid7(),
+                payload_preview={"id": meme_file_id.hex},
+            )
+        async with postgres_session_factory() as read_session:
+            read_service = ContentPipelineService(
+                read_session,
+                storage_client=storage_client,
+                publisher=publisher,
+            )
+            details.append(await read_service.get_item_detail(meme_file_id))
+
+    summary = summarize_run(
+        run_id="t04-kofn",
+        started_at=datetime(2026, 4, 10, 12, 0, 0, tzinfo=UTC),
+        finished_at=datetime(2026, 4, 10, 12, 1, 0, tzinfo=UTC),
+        dataset_root="/tmp/unused",
+        api_base_url="http://127.0.0.1:8000",
+        items=tuple(details),
+    )
+
+    assert summary.stage_counts.both_synced_count == total - 1
+    assert summary.stage_counts.blocked_by_qdrant_count == 1
+    # The non-failing items are genuinely ready.
+    ready_reports = [
+        report for report in summary.item_reports if report.outcome == "ready"
+    ]
+    assert len(ready_reports) == total - 1

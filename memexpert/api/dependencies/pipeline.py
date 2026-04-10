@@ -13,6 +13,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from memexpert.core.config import get_settings
 from memexpert.core.database import get_db_session
+from memexpert.core.meilisearch import (
+    MeilisearchSyncClientProtocol,
+    PipelineMeilisearchSyncClient,
+)
+from memexpert.core.qdrant import (
+    PipelineQdrantClient,
+    PipelineQdrantSyncClient,
+    QdrantSimilarityClientProtocol,
+    QdrantSyncClientProtocol,
+)
 from memexpert.schemas.content_pipeline import ContentPipelineErrorCode, ContentPipelineErrorResponse
 from memexpert.services import (
     ContentPipelineService,
@@ -120,8 +130,40 @@ def get_content_pipeline_service(
     return ContentPipelineService.from_settings(session)
 
 
+def get_qdrant_sync_client() -> QdrantSyncClientProtocol:
+    """Return the lazy Qdrant sync adapter used by the smoke-proof route.
+
+    The adapter is cached across requests because the underlying
+    ``AsyncQdrantClient`` maintains a pooled HTTP connection; tests override
+    this dependency to inject fakes without importing the real SDK.
+    """
+
+    return PipelineQdrantSyncClient(settings=get_settings())
+
+
+def get_qdrant_similarity_client() -> QdrantSimilarityClientProtocol:
+    """Return the lazy Qdrant similarity adapter used by the smoke-proof route."""
+
+    return PipelineQdrantClient(settings=get_settings())
+
+
+def get_meilisearch_sync_client() -> MeilisearchSyncClientProtocol:
+    """Return the lazy Meilisearch sync adapter used by the smoke-proof route."""
+
+    return PipelineMeilisearchSyncClient(settings=get_settings())
+
+
 PipelineServiceDep = Annotated[ContentPipelineService, Depends(get_content_pipeline_service)]
 OperatorTokenDep = Annotated[None, Depends(require_pipeline_operator_token)]
+QdrantSyncClientDep = Annotated[QdrantSyncClientProtocol, Depends(get_qdrant_sync_client)]
+QdrantSimilarityClientDep = Annotated[
+    QdrantSimilarityClientProtocol,
+    Depends(get_qdrant_similarity_client),
+]
+MeilisearchSyncClientDep = Annotated[
+    MeilisearchSyncClientProtocol,
+    Depends(get_meilisearch_sync_client),
+]
 
 
 def to_pipeline_http_error(error: PipelineServiceError) -> PipelineHTTPError:
@@ -157,13 +199,19 @@ def to_pipeline_http_error(error: PipelineServiceError) -> PipelineHTTPError:
 
 
 __all__ = [
+    "MeilisearchSyncClientDep",
     "OperatorTokenDep",
     "PIPELINE_ERROR_RESPONSES",
     "PIPELINE_ERROR_STATUS_CODES",
     "PIPELINE_OPERATOR_TOKEN_HEADER_NAME",
     "PipelineHTTPError",
     "PipelineServiceDep",
+    "QdrantSimilarityClientDep",
+    "QdrantSyncClientDep",
     "get_content_pipeline_service",
+    "get_meilisearch_sync_client",
+    "get_qdrant_similarity_client",
+    "get_qdrant_sync_client",
     "pipeline_http_exception_handler",
     "require_pipeline_operator_token",
     "to_pipeline_http_error",

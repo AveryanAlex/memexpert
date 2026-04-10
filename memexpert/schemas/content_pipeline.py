@@ -6,6 +6,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 from enum import StrEnum
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
@@ -491,6 +492,124 @@ class ContentPipelineRunSummary(BaseModel):
     errors: tuple[str, ...] = ()
 
 
+class SmokeProofTargetResult(BaseModel):
+    """Per-target outcome of one search-sync smoke proof.
+
+    ``searchable`` is ``True`` only when BOTH the id-lookup and the typed
+    query-by-vector (Qdrant) or the text ``search`` call (Meilisearch) surface
+    the target ``meme_file_id`` in their top hits. ``matched_by`` documents
+    which of the two paths fired so operators can distinguish a document that
+    exists in the index but is not retrievable via the text/vector query.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    target: SyncTargetKind
+    searchable: bool
+    reason: str | None = None
+    latency_ms: float | None = None
+    matched_by: Literal["id_lookup", "query_match", "both"] | None = None
+
+
+class SmokeProofResult(BaseModel):
+    """Assembled dual-target smoke proof for one pipeline item.
+
+    The per-target breakdown is authoritative — ``both_targets_searchable`` is
+    derived from ``targets`` and must be ``True`` only when every per-target
+    ``searchable`` flag is also ``True``. The route handler returns this
+    model even on partial / negative proofs so operators see the per-target
+    reason strings in the response body.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    meme_file_id: uuid.UUID
+    query: str | None = None
+    both_targets_searchable: bool
+    targets: tuple[SmokeProofTargetResult, ...]
+    evaluated_at: datetime
+
+
+class ContentPipelineSearchSmokeRequest(BaseModel):
+    """Request body for ``POST /api/v1/pipeline/search/smoke``.
+
+    Exactly one of ``meme_file_id`` and ``query`` must be supplied. When only
+    the ``query`` is supplied the route resolves a ``meme_file_id`` from the
+    top Meilisearch hit before running the per-item proof, so the dual-target
+    truth check always runs against a concrete pipeline item.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    meme_file_id: uuid.UUID | None = None
+    query: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_exactly_one_input(self) -> ContentPipelineSearchSmokeRequest:
+        if self.meme_file_id is None and self.query is None:
+            raise ValueError(
+                "search smoke request must provide exactly one of "
+                "meme_file_id or query.",
+            )
+        if self.meme_file_id is not None and self.query is not None:
+            raise ValueError(
+                "search smoke request must provide exactly one of "
+                "meme_file_id or query — not both.",
+            )
+        if self.query is not None and not self.query.strip():
+            raise ValueError("search smoke request query must not be blank.")
+        return self
+
+
+class ContentPipelineS03RunItemReport(BaseModel):
+    """Compact per-item report row persisted by the S03 search-sync proof harness.
+
+    Each item carries its terminal outcome, per-target sync status, and the
+    per-item :class:`SmokeProofResult` captured after both sync targets reach
+    a terminal state. ``failure_reason`` is the normalized reason the harness
+    saw if either the polling or the smoke proof could not run for this item.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    meme_file_id: uuid.UUID
+    outcome: str
+    qdrant_status: SyncTargetStatus | None = None
+    meili_status: SyncTargetStatus | None = None
+    smoke_result: SmokeProofResult | None = None
+    failure_reason: str | None = None
+
+
+class ContentPipelineS03RunSummary(BaseModel):
+    """Persisted S03 search-sync proof summary written to the artifact directory.
+
+    The counters mirror :class:`ContentPipelineRunStageCounts` fields that
+    matter for the sync chain (``both_synced``, ``partially_searchable``,
+    ``blocked_by_*``) and add the smoke-proof specific ``smoke_pass_count``
+    and ``stale_snapshot_ids`` set. ``stale_snapshot_ids`` lists items whose
+    snapshot claimed both targets were synced but whose smoke proof said
+    otherwise — this is the operator-facing symptom that sync truth and the
+    search engine disagree.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str
+    started_at: datetime
+    finished_at: datetime
+    bounded_item_count: StrictInt = Field(ge=0)
+    qdrant_synced_count: StrictInt = Field(default=0, ge=0)
+    meilisearch_synced_count: StrictInt = Field(default=0, ge=0)
+    both_synced_count: StrictInt = Field(default=0, ge=0)
+    partial_count: StrictInt = Field(default=0, ge=0)
+    blocked_by_qdrant_count: StrictInt = Field(default=0, ge=0)
+    blocked_by_meili_count: StrictInt = Field(default=0, ge=0)
+    smoke_pass_count: StrictInt = Field(default=0, ge=0)
+    stale_snapshot_ids: tuple[uuid.UUID, ...] = ()
+    item_reports: tuple[ContentPipelineS03RunItemReport, ...] = ()
+    errors: tuple[str, ...] = ()
+
+
 __all__ = [
     "ContentPipelineCanonicalContext",
     "ContentPipelineClassificationDetail",
@@ -510,6 +629,9 @@ __all__ = [
     "ContentPipelineRunItemReport",
     "ContentPipelineRunStageCounts",
     "ContentPipelineRunSummary",
+    "ContentPipelineS03RunItemReport",
+    "ContentPipelineS03RunSummary",
+    "ContentPipelineSearchSmokeRequest",
     "ContentPipelineStageJournalRead",
     "ContentPipelineStageTimings",
     "ContentPipelineSyncReplayBatchRequest",
@@ -523,4 +645,6 @@ __all__ = [
     "MAX_POST_ID_LENGTH",
     "MAX_SOURCE_ID_LENGTH",
     "PerTargetSyncStatus",
+    "SmokeProofResult",
+    "SmokeProofTargetResult",
 ]

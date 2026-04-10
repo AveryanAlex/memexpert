@@ -76,8 +76,10 @@ class MeilisearchSyncClientProtocol(Protocol):
 
     The protocol is intentionally narrow: the runtime needs to upsert a
     document, fetch the current state for operator diagnostics, delete a
-    document when a canonical file is retired, and ensure the index exists
-    before the first write. Anything beyond that belongs on the SDK.
+    document when a canonical file is retired, ensure the index exists
+    before the first write, and — as of T04 — run a bounded text search
+    so the smoke-proof path can prove documents are actually retrievable.
+    Anything beyond that belongs on the SDK.
     """
 
     async def upsert_document(
@@ -93,6 +95,13 @@ class MeilisearchSyncClientProtocol(Protocol):
     async def delete_document(self, meme_file_id: uuid.UUID) -> None: ...
 
     async def ensure_index(self) -> None: ...
+
+    async def search(
+        self,
+        query: str,
+        *,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]: ...
 
 
 class PipelineMeilisearchSyncClient:
@@ -174,6 +183,31 @@ class PipelineMeilisearchSyncClient:
             )
         except Exception as exc:
             _raise_sync_error_from(exc, operation="ensure_index")
+
+    async def search(
+        self,
+        query: str,
+        *,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Run a bounded text search against the configured Meilisearch index.
+
+        Returns the raw ``hits`` list from the Meilisearch response as plain
+        dicts so the smoke-proof path can locate the target ``meme_file_id``
+        via the ``id`` key without the caller having to decode a full SDK
+        response model. Errors are mapped onto the same typed taxonomy as
+        the other adapter methods so the smoke proof sees consistent
+        provider-blocked / timeout / malformed-response reasons.
+        """
+
+        index = await self._ensure_index_client()
+        try:
+            raw_response = await index.search(query, limit=limit)
+        except Exception as exc:
+            _raise_sync_error_from(exc, operation="search")
+            return []  # pragma: no cover - _raise_sync_error_from never returns
+
+        return _coerce_search_hits(raw_response)
 
     async def _ensure_index_client(self) -> Any:
         if self._index is None:
@@ -328,6 +362,59 @@ def _build_sync_preview(
         preview_fields=preview_fields,
         preview_fetched_at=fetched_at,
     )
+
+
+def _coerce_search_hits(raw_response: object) -> list[dict[str, Any]]:
+    """Return the ``hits`` list from a Meilisearch search response as plain dicts.
+
+    The SDK returns a pydantic ``SearchResults`` model; older versions may
+    return a plain dict. We normalize both shapes here so the smoke-proof
+    caller always sees ``list[dict[str, Any]]`` regardless of which SDK
+    release the environment runs against.
+    """
+
+    raw_hits: object = None
+    if isinstance(raw_response, dict):
+        raw_hits = raw_response.get("hits")
+    else:
+        model_dump = getattr(raw_response, "model_dump", None)
+        if callable(model_dump):
+            try:
+                dumped = model_dump()
+            except Exception as exc:  # noqa: BLE001 - degrade a broken SDK model to malformed.
+                raise MeilisearchSyncMalformedResponseError(
+                    f"Meilisearch search returned a model we cannot decode: {exc}",
+                ) from exc
+            if isinstance(dumped, dict):
+                raw_hits = dumped.get("hits")
+        if raw_hits is None:
+            raw_hits = getattr(raw_response, "hits", None)
+
+    if raw_hits is None:
+        return []
+    if not isinstance(raw_hits, list):
+        raise MeilisearchSyncMalformedResponseError(
+            "Meilisearch search response 'hits' field is not a list.",
+        )
+
+    hits: list[dict[str, Any]] = []
+    for entry in raw_hits:
+        if isinstance(entry, dict):
+            hits.append(dict(entry))
+            continue
+        entry_dump = getattr(entry, "model_dump", None)
+        if callable(entry_dump):
+            try:
+                dumped_entry = entry_dump()
+            except Exception:  # noqa: BLE001 - skip malformed individual hits to stay honest.
+                continue
+            if isinstance(dumped_entry, dict):
+                hits.append(dict(dumped_entry))
+                continue
+        entry_dict = getattr(entry, "__dict__", None)
+        if isinstance(entry_dict, dict):
+            hits.append(dict(entry_dict))
+    return hits
 
 
 def _coerce_document_payload(raw_document: object) -> Mapping[str, object] | None:
