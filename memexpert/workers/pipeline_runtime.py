@@ -1,14 +1,14 @@
 # ruff: noqa: TC002
-"""FastStream RabbitMQ runtime for the stub transcode worker."""
+"""FastStream RabbitMQ runtime for the real transcode and OCR worker stages."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import uuid
-from contextlib import suppress
 from dataclasses import dataclass
-from typing import Any, Protocol, cast
+from pathlib import PurePosixPath
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from faststream import AckPolicy
 from faststream.rabbit import ExchangeType, RabbitBroker, RabbitExchange, RabbitQueue
@@ -18,14 +18,47 @@ from pydantic import ValidationError
 from memexpert.core.broker import PipelineBrokerSettings, get_pipeline_broker, get_pipeline_broker_settings
 from memexpert.core.config import Settings, get_settings
 from memexpert.core.database import AsyncSessionFactory, get_async_session_factory
+from memexpert.core.media import (
+    MediaTimeoutError,
+    MediaValidationError,
+    PipelineMediaProcessor,
+    PipelineMediaProcessorProtocol,
+)
+from memexpert.core.ocr import (
+    OCRProcessingError,
+    OCRProcessorProtocol,
+    OCRProviderUnavailableError,
+    OCRTimeoutError,
+    PipelineOCRProcessor,
+)
+from memexpert.core.storage import (
+    delete_object_if_present,
+    download_object_bytes,
+    get_pipeline_storage_settings,
+    get_s3_client,
+    upload_object_bytes,
+)
 from memexpert.models.enums import ContentPipelineStage
 from memexpert.schemas.content_pipeline import ContentPipelineDispatchEvent
-from memexpert.services import ContentPipelineService
+from memexpert.services import ContentPipelineService, PipelineIngestError
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from memexpert.core.media import NormalizedMediaResult
+    from memexpert.core.ocr import OCRExtractionResult
+    from memexpert.services.content_pipeline import PipelineStageWorkContext
 
 PIPELINE_REASON_FORCED_TRANSCODE_FAILURE = "forced_transcode_failure"
 PIPELINE_REASON_MALFORMED_EVENT = "malformed_dispatch_event"
+PIPELINE_REASON_OCR_FAILED = "ocr_stage_failed"
+PIPELINE_REASON_OCR_PROVIDER_BLOCKED = "ocr_provider_blocked"
+PIPELINE_REASON_OCR_TIMEOUT = "ocr_timeout"
 PIPELINE_REASON_TRANSCODE_FAILED = "transcode_stage_failed"
+PIPELINE_REASON_TRANSCODE_INVALID_MEDIA = "transcode_invalid_media"
+PIPELINE_REASON_TRANSCODE_TIMEOUT = "transcode_timeout"
 PIPELINE_REASON_UNSUPPORTED_STAGE = "unsupported_stage"
+
 
 type DeadLetterPayload = str | bytes | bytearray | int | float | bool | None
 
@@ -44,13 +77,31 @@ class RabbitMessageLike(Protocol):
     async def reject(self, requeue: bool = False) -> None: ...
 
 
+class ObjectStorageClientLike(Protocol):
+    """Small S3-compatible surface used by the runtime."""
+
+    def get_object(self, *, Bucket: str, Key: str) -> object: ...
+
+    def put_object(
+        self,
+        *,
+        Bucket: str,
+        Key: str,
+        Body: bytes,
+        ContentType: str,
+        ContentLength: int,
+    ) -> object: ...
+
+    def delete_object(self, *, Bucket: str, Key: str) -> object: ...
+
+
 class ForcedTranscodeFailure(RuntimeError):
     """Raised when the dev/test-only failure-injection knob forces one transcode attempt to fail."""
 
 
 @dataclass(slots=True)
 class PipelineRuntime:
-    """RabbitMQ-backed runtime that consumes the stub transcode stage."""
+    """RabbitMQ-backed runtime that consumes the transcode and OCR stages."""
 
     settings: Settings
     broker: RabbitBroker
@@ -60,23 +111,33 @@ class PipelineRuntime:
     retry_exchange: RabbitExchange
     dead_letter_exchange: RabbitExchange
     transcode_queue: RabbitQueue
-    retry_queue: RabbitQueue
+    ocr_queue: RabbitQueue
+    transcode_retry_queue: RabbitQueue
+    ocr_retry_queue: RabbitQueue
     dead_letter_queue: RabbitQueue
+    storage_client: ObjectStorageClientLike
+    media_processor: PipelineMediaProcessorProtocol
+    ocr_processor: OCRProcessorProtocol
 
     async def declare_topology(self) -> None:
-        """Declare the transcode queue, retry queue, and DLQ topology explicitly."""
+        """Declare the transcode/OCR queues, retry queues, and DLQ topology explicitly."""
 
         exchange = await self.broker.declare_exchange(self.pipeline_exchange)
         retry_exchange = await self.broker.declare_exchange(self.retry_exchange)
         dead_letter_exchange = await self.broker.declare_exchange(self.dead_letter_exchange)
         transcode_queue = await self.broker.declare_queue(self.transcode_queue)
-        retry_queue = await self.broker.declare_queue(self.retry_queue)
+        ocr_queue = await self.broker.declare_queue(self.ocr_queue)
+        transcode_retry_queue = await self.broker.declare_queue(self.transcode_retry_queue)
+        ocr_retry_queue = await self.broker.declare_queue(self.ocr_retry_queue)
         dead_letter_queue = await self.broker.declare_queue(self.dead_letter_queue)
 
         _ = await transcode_queue.bind(exchange, routing_key=self.broker_settings.meme_created_routing_key)
         _ = await transcode_queue.bind(exchange, routing_key=self.broker_settings.stage_replay_routing_key)
         _ = await transcode_queue.bind(exchange, routing_key=self.broker_settings.transcode_retry_routing_key)
-        _ = await retry_queue.bind(retry_exchange, routing_key=self.broker_settings.retry_routing_key)
+        _ = await ocr_queue.bind(exchange, routing_key=self.broker_settings.ocr_routing_key)
+        _ = await ocr_queue.bind(exchange, routing_key=self.broker_settings.ocr_retry_routing_key)
+        _ = await transcode_retry_queue.bind(retry_exchange, routing_key=self.broker_settings.retry_routing_key)
+        _ = await ocr_retry_queue.bind(retry_exchange, routing_key=self.broker_settings.ocr_retry_request_routing_key)
         _ = await dead_letter_queue.bind(
             dead_letter_exchange,
             routing_key=self.broker_settings.dead_letter_routing_key,
@@ -85,6 +146,28 @@ class PipelineRuntime:
     async def handle_transcode_message(self, payload: object, message: RabbitMessageLike) -> None:
         """Consume one transcode-stage dispatch, persisting durable stage truth as it changes."""
 
+        await self._handle_stage_message(
+            payload=payload,
+            message=message,
+            expected_stage=ContentPipelineStage.TRANSCODE,
+        )
+
+    async def handle_ocr_message(self, payload: object, message: RabbitMessageLike) -> None:
+        """Consume one OCR-stage dispatch, persisting durable stage truth as it changes."""
+
+        await self._handle_stage_message(
+            payload=payload,
+            message=message,
+            expected_stage=ContentPipelineStage.OCR,
+        )
+
+    async def _handle_stage_message(
+        self,
+        *,
+        payload: object,
+        message: RabbitMessageLike,
+        expected_stage: ContentPipelineStage,
+    ) -> None:
         dispatch_event = self._validate_event_payload(payload)
         if dispatch_event is None:
             await self._record_malformed_event_failure(payload)
@@ -96,15 +179,16 @@ class PipelineRuntime:
             return
 
         effective_attempt = self._effective_attempt(dispatch_event, message)
-        if dispatch_event.stage is not ContentPipelineStage.TRANSCODE:
+        if dispatch_event.stage is not expected_stage:
             await self._record_terminal_failure(
                 dispatch_event,
                 attempt=effective_attempt,
                 normalized_reason=PIPELINE_REASON_UNSUPPORTED_STAGE,
                 last_error_text=(
-                    "The stub runtime only handles the transcode stage, "
-                    f"but received {dispatch_event.stage.value!r}."
+                    f"The runtime handler for {expected_stage.value!r} received "
+                    f"{dispatch_event.stage.value!r}."
                 ),
+                retryable=False,
             )
             await self._dead_letter_or_requeue(
                 self._coerce_dead_letter_payload(dispatch_event.model_dump(mode="json")),
@@ -113,47 +197,215 @@ class PipelineRuntime:
             )
             return
 
-        async with self.session_factory() as session:
-            service = ContentPipelineService(session, settings=self.settings)
-            try:
-                await service.mark_stage_processing(
-                    meme_file_id=dispatch_event.meme_file_id,
-                    stage=dispatch_event.stage,
-                    attempt=effective_attempt,
-                    event_id=dispatch_event.event_id,
-                )
+        try:
+            stage_context = await self._start_stage_processing(
+                meme_file_id=dispatch_event.meme_file_id,
+                stage=dispatch_event.stage,
+                attempt=effective_attempt,
+                event_id=dispatch_event.event_id,
+            )
+            if dispatch_event.stage is ContentPipelineStage.TRANSCODE:
                 self._maybe_force_transcode_failure(dispatch_event)
-                await service.mark_stage_succeeded(
-                    meme_file_id=dispatch_event.meme_file_id,
-                    stage=dispatch_event.stage,
+                await self._run_transcode_stage(
+                    dispatch_event=dispatch_event,
+                    stage_context=stage_context,
                     attempt=effective_attempt,
-                    event_id=dispatch_event.event_id,
                 )
-            except Exception as exc:
-                retryable = effective_attempt < self.broker_settings.retry_max_attempts
-                with suppress(Exception):
-                    await service.mark_stage_failed(
-                        meme_file_id=dispatch_event.meme_file_id,
-                        stage=dispatch_event.stage,
-                        attempt=effective_attempt,
-                        event_id=dispatch_event.event_id,
-                        normalized_reason=self._normalize_failure_reason(exc),
-                        last_error_text=self._render_error_text(exc),
-                        retryable=retryable,
-                    )
-
-                if retryable:
-                    await message.reject(requeue=False)
-                    return
-
-                await self._dead_letter_or_requeue(
-                    self._coerce_dead_letter_payload(dispatch_event.model_dump(mode="json")),
-                    message=message,
-                    normalized_reason=self._normalize_failure_reason(exc),
+            else:
+                await self._run_ocr_stage(
+                    dispatch_event=dispatch_event,
+                    stage_context=stage_context,
+                    attempt=effective_attempt,
                 )
+        except Exception as exc:
+            normalized_reason = self._normalize_failure_reason(expected_stage, exc)
+            retryable = self._is_replayable_failure(expected_stage, exc)
+            await self._mark_stage_failed(
+                meme_file_id=dispatch_event.meme_file_id,
+                stage=dispatch_event.stage,
+                attempt=effective_attempt,
+                event_id=dispatch_event.event_id,
+                normalized_reason=normalized_reason,
+                last_error_text=self._render_error_text(exc),
+                retryable=retryable,
+            )
+
+            should_queue_retry = retryable and effective_attempt < self.broker_settings.retry_max_attempts
+            if should_queue_retry:
+                await message.reject(requeue=False)
                 return
 
+            await self._dead_letter_or_requeue(
+                self._coerce_dead_letter_payload(dispatch_event.model_dump(mode="json")),
+                message=message,
+                normalized_reason=normalized_reason,
+            )
+            return
+
         await message.ack()
+
+    async def _run_transcode_stage(
+        self,
+        *,
+        dispatch_event: ContentPipelineDispatchEvent,
+        stage_context: PipelineStageWorkContext,
+        attempt: int,
+    ) -> None:
+        resolved_context = stage_context
+        if resolved_context.mime_type is None:
+            raise MediaValidationError("Pipeline item is missing the original media type required for transcode.")
+
+        storage_settings = get_pipeline_storage_settings(self.settings)
+        original_bytes = await download_object_bytes(
+            self.storage_client,
+            bucket=storage_settings.bucket,
+            key=resolved_context.original_object_key,
+        )
+        normalized = await self.media_processor.normalize_for_web(
+            meme_file_id=dispatch_event.meme_file_id,
+            filename=PurePosixPath(resolved_context.original_object_key).name,
+            content_type=resolved_context.mime_type,
+            media_bytes=original_bytes,
+        )
+        await upload_object_bytes(
+            self.storage_client,
+            bucket=storage_settings.bucket,
+            key=normalized.web_video_object_key,
+            body=normalized.web_video_bytes,
+            content_type=normalized.mime_type,
+        )
+        try:
+            await self._complete_transcode_stage(
+                meme_file_id=dispatch_event.meme_file_id,
+                attempt=attempt,
+                event_id=dispatch_event.event_id,
+                normalized=normalized,
+            )
+        except Exception:
+            await delete_object_if_present(
+                self.storage_client,
+                bucket=storage_settings.bucket,
+                key=normalized.web_video_object_key,
+            )
+            raise
+
+    async def _run_ocr_stage(
+        self,
+        *,
+        dispatch_event: ContentPipelineDispatchEvent,
+        stage_context: PipelineStageWorkContext,
+        attempt: int,
+    ) -> None:
+        resolved_context = stage_context
+        source_object_key = resolved_context.web_video_object_key or resolved_context.original_object_key
+        source_mime_type = resolved_context.mime_type
+        if source_mime_type is None:
+            raise OCRProcessingError("Pipeline item is missing the media type required for OCR.")
+
+        storage_settings = get_pipeline_storage_settings(self.settings)
+        source_bytes = await download_object_bytes(
+            self.storage_client,
+            bucket=storage_settings.bucket,
+            key=source_object_key,
+        )
+        ocr_result = await self.ocr_processor.extract_text(
+            filename=PurePosixPath(source_object_key).name,
+            mime_type=source_mime_type,
+            media_bytes=source_bytes,
+            source_object_key=source_object_key,
+        )
+        await self._complete_ocr_stage(
+            meme_file_id=dispatch_event.meme_file_id,
+            attempt=attempt,
+            event_id=dispatch_event.event_id,
+            ocr_result=ocr_result,
+        )
+
+    async def _start_stage_processing(
+        self,
+        *,
+        meme_file_id: uuid.UUID,
+        stage: ContentPipelineStage,
+        attempt: int,
+        event_id: uuid.UUID,
+    ) -> PipelineStageWorkContext:
+        async with self.session_factory() as session:
+            service = self._build_service(session)
+            return await service.start_stage_processing(
+                meme_file_id=meme_file_id,
+                stage=stage,
+                attempt=attempt,
+                event_id=event_id,
+            )
+
+    async def _complete_transcode_stage(
+        self,
+        *,
+        meme_file_id: uuid.UUID,
+        attempt: int,
+        event_id: uuid.UUID,
+        normalized: NormalizedMediaResult,
+    ) -> None:
+        async with self.session_factory() as session:
+            service = self._build_service(session)
+            await service.complete_transcode_stage(
+                meme_file_id=meme_file_id,
+                attempt=attempt,
+                event_id=event_id,
+                result=normalized,
+            )
+
+    async def _complete_ocr_stage(
+        self,
+        *,
+        meme_file_id: uuid.UUID,
+        attempt: int,
+        event_id: uuid.UUID,
+        ocr_result: OCRExtractionResult,
+    ) -> None:
+        async with self.session_factory() as session:
+            service = self._build_service(session)
+            await service.complete_ocr_stage(
+                meme_file_id=meme_file_id,
+                attempt=attempt,
+                event_id=event_id,
+                result=ocr_result,
+            )
+
+    async def _mark_stage_failed(
+        self,
+        *,
+        meme_file_id: uuid.UUID,
+        stage: ContentPipelineStage,
+        attempt: int,
+        event_id: uuid.UUID,
+        normalized_reason: str,
+        last_error_text: str,
+        retryable: bool,
+    ) -> None:
+        try:
+            async with self.session_factory() as session:
+                service = self._build_service(session)
+                await service.mark_stage_failed(
+                    meme_file_id=meme_file_id,
+                    stage=stage,
+                    attempt=attempt,
+                    event_id=event_id,
+                    normalized_reason=normalized_reason,
+                    last_error_text=last_error_text,
+                    retryable=retryable,
+                )
+        except Exception:
+            return
+
+    def _build_service(self, session: AsyncSession) -> ContentPipelineService:
+        return ContentPipelineService(
+            session,
+            settings=self.settings,
+            storage_client=self.storage_client,
+            media_processor=self.media_processor,
+            ocr_processor=self.ocr_processor,
+        )
 
     async def run(self, *, stop_event: asyncio.Event | None = None) -> None:
         """Start the FastStream broker, declare topology, and block until shutdown."""
@@ -187,18 +439,23 @@ class PipelineRuntime:
         dispatch_event: ContentPipelineDispatchEvent,
         message: RabbitMessageLike,
     ) -> int:
-        retry_count = self._retry_cycle_count(message.headers)
+        retry_count = self._retry_cycle_count(dispatch_event.stage, message.headers)
         return max(dispatch_event.attempt + retry_count, 1)
 
-    def _retry_cycle_count(self, headers: dict[str, Any]) -> int:
+    def _retry_cycle_count(self, stage: ContentPipelineStage, headers: dict[str, Any]) -> int:
         raw_x_death = headers.get("x-death")
         if not isinstance(raw_x_death, list):
             return 0
 
+        retry_queue_name = (
+            self.transcode_retry_queue.name
+            if stage is ContentPipelineStage.TRANSCODE
+            else self.ocr_retry_queue.name
+        )
         for death_entry in raw_x_death:
             if not isinstance(death_entry, dict):
                 continue
-            if death_entry.get("queue") != self.broker_settings.retry_queue:
+            if death_entry.get("queue") != retry_queue_name:
                 continue
             if death_entry.get("reason") != "expired":
                 continue
@@ -223,20 +480,15 @@ class PipelineRuntime:
             return
 
         meme_file_id, stage, attempt, event_id = reference
-        async with self.session_factory() as session:
-            service = ContentPipelineService(session, settings=self.settings)
-            try:
-                await service.mark_stage_failed(
-                    meme_file_id=meme_file_id,
-                    stage=stage,
-                    attempt=attempt,
-                    event_id=event_id,
-                    normalized_reason=PIPELINE_REASON_MALFORMED_EVENT,
-                    last_error_text="Worker received a malformed content-pipeline dispatch payload.",
-                    retryable=False,
-                )
-            except Exception:
-                return
+        await self._mark_stage_failed(
+            meme_file_id=meme_file_id,
+            stage=stage,
+            attempt=attempt,
+            event_id=event_id,
+            normalized_reason=PIPELINE_REASON_MALFORMED_EVENT,
+            last_error_text="Worker received a malformed content-pipeline dispatch payload.",
+            retryable=False,
+        )
 
     async def _record_terminal_failure(
         self,
@@ -245,21 +497,17 @@ class PipelineRuntime:
         attempt: int,
         normalized_reason: str,
         last_error_text: str,
+        retryable: bool,
     ) -> None:
-        async with self.session_factory() as session:
-            service = ContentPipelineService(session, settings=self.settings)
-            try:
-                await service.mark_stage_failed(
-                    meme_file_id=dispatch_event.meme_file_id,
-                    stage=dispatch_event.stage,
-                    attempt=attempt,
-                    event_id=dispatch_event.event_id,
-                    normalized_reason=normalized_reason,
-                    last_error_text=last_error_text,
-                    retryable=False,
-                )
-            except Exception:
-                return
+        await self._mark_stage_failed(
+            meme_file_id=dispatch_event.meme_file_id,
+            stage=dispatch_event.stage,
+            attempt=attempt,
+            event_id=dispatch_event.event_id,
+            normalized_reason=normalized_reason,
+            last_error_text=last_error_text,
+            retryable=retryable,
+        )
 
     async def _dead_letter_or_requeue(
         self,
@@ -299,10 +547,27 @@ class PipelineRuntime:
         return str(payload)
 
     @staticmethod
-    def _normalize_failure_reason(exc: Exception) -> str:
-        if isinstance(exc, ForcedTranscodeFailure):
-            return PIPELINE_REASON_FORCED_TRANSCODE_FAILURE
-        return PIPELINE_REASON_TRANSCODE_FAILED
+    def _normalize_failure_reason(stage: ContentPipelineStage, exc: Exception) -> str:
+        if stage is ContentPipelineStage.TRANSCODE:
+            if isinstance(exc, ForcedTranscodeFailure):
+                return PIPELINE_REASON_FORCED_TRANSCODE_FAILURE
+            if isinstance(exc, MediaTimeoutError):
+                return PIPELINE_REASON_TRANSCODE_TIMEOUT
+            if isinstance(exc, MediaValidationError):
+                return PIPELINE_REASON_TRANSCODE_INVALID_MEDIA
+            return PIPELINE_REASON_TRANSCODE_FAILED
+
+        if isinstance(exc, OCRTimeoutError):
+            return PIPELINE_REASON_OCR_TIMEOUT
+        if isinstance(exc, OCRProviderUnavailableError):
+            return PIPELINE_REASON_OCR_PROVIDER_BLOCKED
+        return PIPELINE_REASON_OCR_FAILED
+
+    @staticmethod
+    def _is_replayable_failure(stage: ContentPipelineStage, exc: Exception) -> bool:
+        if stage is ContentPipelineStage.TRANSCODE:
+            return not isinstance(exc, MediaValidationError)
+        return not isinstance(exc, PipelineIngestError)
 
     @staticmethod
     def _render_error_text(exc: Exception) -> str:
@@ -365,26 +630,38 @@ def _build_dead_letter_exchange(broker_settings: PipelineBrokerSettings) -> Rabb
     )
 
 
-def _build_transcode_queue(broker_settings: PipelineBrokerSettings) -> RabbitQueue:
+def _build_stage_queue(
+    *,
+    queue_name: str,
+    routing_key: str,
+    retry_request_routing_key: str,
+    retry_exchange: str,
+) -> RabbitQueue:
     return RabbitQueue(
-        broker_settings.transcode_queue,
+        queue_name,
         durable=True,
-        routing_key=broker_settings.meme_created_routing_key,
+        routing_key=routing_key,
         arguments={
-            "x-dead-letter-exchange": broker_settings.retry_exchange,
-            "x-dead-letter-routing-key": broker_settings.retry_routing_key,
+            "x-dead-letter-exchange": retry_exchange,
+            "x-dead-letter-routing-key": retry_request_routing_key,
         },
     )
 
 
-def _build_retry_queue(broker_settings: PipelineBrokerSettings) -> RabbitQueue:
+def _build_retry_queue(
+    *,
+    queue_name: str,
+    retry_backoff_milliseconds: int,
+    exchange: str,
+    retry_return_routing_key: str,
+) -> RabbitQueue:
     return RabbitQueue(
-        broker_settings.retry_queue,
+        queue_name,
         durable=True,
         arguments={
-            "x-message-ttl": broker_settings.retry_backoff_milliseconds,
-            "x-dead-letter-exchange": broker_settings.exchange,
-            "x-dead-letter-routing-key": broker_settings.transcode_retry_routing_key,
+            "x-message-ttl": retry_backoff_milliseconds,
+            "x-dead-letter-exchange": exchange,
+            "x-dead-letter-routing-key": retry_return_routing_key,
         },
     )
 
@@ -401,13 +678,24 @@ def build_pipeline_runtime(
     settings: Settings | None = None,
     broker: RabbitBroker | None = None,
     session_factory: AsyncSessionFactory | None = None,
+    storage_client: ObjectStorageClientLike | None = None,
+    media_processor: PipelineMediaProcessorProtocol | None = None,
+    ocr_processor: OCRProcessorProtocol | None = None,
 ) -> PipelineRuntime:
-    """Build the RabbitMQ transcode runtime and register its FastStream subscriber."""
+    """Build the RabbitMQ transcode/OCR runtime and register its FastStream subscribers."""
 
     resolved_settings = settings or get_settings()
     resolved_broker_settings = get_pipeline_broker_settings(resolved_settings)
     resolved_broker = broker or get_pipeline_broker()
     resolved_session_factory = session_factory or get_async_session_factory()
+    resolved_storage_client = storage_client or cast("ObjectStorageClientLike", get_s3_client())
+    resolved_media_processor = media_processor or PipelineMediaProcessor(settings=resolved_settings)
+    resolved_ocr_processor = ocr_processor or PipelineOCRProcessor(
+        settings=resolved_settings,
+        media_processor=resolved_media_processor,
+    )
+    transcode_retry_queue_name = f"{resolved_broker_settings.transcode_queue}.retry"
+    ocr_retry_queue_name = f"{resolved_broker_settings.ocr_queue}.retry"
 
     runtime = PipelineRuntime(
         settings=resolved_settings,
@@ -417,9 +705,34 @@ def build_pipeline_runtime(
         pipeline_exchange=_build_pipeline_exchange(resolved_broker_settings),
         retry_exchange=_build_retry_exchange(resolved_broker_settings),
         dead_letter_exchange=_build_dead_letter_exchange(resolved_broker_settings),
-        transcode_queue=_build_transcode_queue(resolved_broker_settings),
-        retry_queue=_build_retry_queue(resolved_broker_settings),
+        transcode_queue=_build_stage_queue(
+            queue_name=resolved_broker_settings.transcode_queue,
+            routing_key=resolved_broker_settings.meme_created_routing_key,
+            retry_request_routing_key=resolved_broker_settings.retry_routing_key,
+            retry_exchange=resolved_broker_settings.retry_exchange,
+        ),
+        ocr_queue=_build_stage_queue(
+            queue_name=resolved_broker_settings.ocr_queue,
+            routing_key=resolved_broker_settings.ocr_routing_key,
+            retry_request_routing_key=resolved_broker_settings.ocr_retry_request_routing_key,
+            retry_exchange=resolved_broker_settings.retry_exchange,
+        ),
+        transcode_retry_queue=_build_retry_queue(
+            queue_name=transcode_retry_queue_name,
+            retry_backoff_milliseconds=resolved_broker_settings.retry_backoff_milliseconds,
+            exchange=resolved_broker_settings.exchange,
+            retry_return_routing_key=resolved_broker_settings.transcode_retry_routing_key,
+        ),
+        ocr_retry_queue=_build_retry_queue(
+            queue_name=ocr_retry_queue_name,
+            retry_backoff_milliseconds=resolved_broker_settings.retry_backoff_milliseconds,
+            exchange=resolved_broker_settings.exchange,
+            retry_return_routing_key=resolved_broker_settings.ocr_retry_routing_key,
+        ),
         dead_letter_queue=_build_dead_letter_queue(resolved_broker_settings),
+        storage_client=resolved_storage_client,
+        media_processor=resolved_media_processor,
+        ocr_processor=resolved_ocr_processor,
     )
 
     @resolved_broker.subscriber(
@@ -430,6 +743,15 @@ def build_pipeline_runtime(
     async def _consume_transcode(payload: object, message: RabbitMessage) -> None:
         rabbit_message = cast("RabbitMessageLike", cast("object", message))
         await runtime.handle_transcode_message(payload, rabbit_message)
+
+    @resolved_broker.subscriber(
+        runtime.ocr_queue,
+        runtime.pipeline_exchange,
+        ack_policy=AckPolicy.MANUAL,
+    )
+    async def _consume_ocr(payload: object, message: RabbitMessage) -> None:
+        rabbit_message = cast("RabbitMessageLike", cast("object", message))
+        await runtime.handle_ocr_message(payload, rabbit_message)
 
     return runtime
 
@@ -444,7 +766,12 @@ async def run_pipeline_runtime(*, settings: Settings | None = None) -> None:
 __all__ = [
     "PIPELINE_REASON_FORCED_TRANSCODE_FAILURE",
     "PIPELINE_REASON_MALFORMED_EVENT",
+    "PIPELINE_REASON_OCR_FAILED",
+    "PIPELINE_REASON_OCR_PROVIDER_BLOCKED",
+    "PIPELINE_REASON_OCR_TIMEOUT",
     "PIPELINE_REASON_TRANSCODE_FAILED",
+    "PIPELINE_REASON_TRANSCODE_INVALID_MEDIA",
+    "PIPELINE_REASON_TRANSCODE_TIMEOUT",
     "PIPELINE_REASON_UNSUPPORTED_STAGE",
     "ForcedTranscodeFailure",
     "PipelineRuntime",

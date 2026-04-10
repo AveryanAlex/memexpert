@@ -219,6 +219,70 @@ def build_web_video_object_key(
     return f"{storage_settings.derivative_prefix}/{meme_file_id}/web.{normalized_extension}"
 
 
+async def download_object_bytes(
+    client: Any,
+    *,
+    bucket: str,
+    key: str,
+) -> bytes:
+    """Read one object from S3-compatible storage into memory."""
+
+    response = await asyncio.to_thread(client.get_object, Bucket=bucket, Key=key)
+    body = response.get("Body")
+    if body is None or not hasattr(body, "read"):
+        raise StorageConnectionError(f"S3 object {key} did not return a readable body.")
+
+    try:
+        object_bytes = await asyncio.to_thread(body.read)
+    except Exception as exc:  # pragma: no cover - boto body implementations vary at runtime.
+        raise StorageConnectionError(f"Failed to read S3 object {key}: {exc}") from exc
+    finally:
+        close_method = getattr(body, "close", None)
+        if callable(close_method):
+            close_method()
+
+    if not isinstance(object_bytes, bytes):
+        raise StorageConnectionError(f"S3 object {key} returned a non-bytes payload.")
+    return object_bytes
+
+
+async def upload_object_bytes(
+    client: Any,
+    *,
+    bucket: str,
+    key: str,
+    body: bytes,
+    content_type: str,
+) -> None:
+    """Write one object to S3-compatible storage from in-memory bytes."""
+
+    try:
+        await asyncio.to_thread(
+            client.put_object,
+            Bucket=bucket,
+            Key=key,
+            Body=body,
+            ContentType=content_type,
+            ContentLength=len(body),
+        )
+    except Exception as exc:  # pragma: no cover - boto exceptions vary by backend.
+        raise StorageConnectionError(f"Failed to store S3 object {key}: {exc}") from exc
+
+
+async def delete_object_if_present(
+    client: Any,
+    *,
+    bucket: str,
+    key: str,
+) -> None:
+    """Best-effort object deletion used to clean up failed derivative writes."""
+
+    try:
+        await asyncio.to_thread(client.delete_object, Bucket=bucket, Key=key)
+    except Exception:
+        return
+
+
 async def verify_s3_storage(
     client: Any | None = None,
     settings: Settings | None = None,
@@ -274,6 +338,8 @@ __all__ = [
     "build_original_object_key",
     "build_s3_client",
     "build_web_video_object_key",
+    "delete_object_if_present",
+    "download_object_bytes",
     "get_pipeline_storage_settings",
     "get_s3_client",
     "is_s3_client_initialized",
@@ -281,5 +347,6 @@ __all__ = [
     "normalize_s3_bucket_name",
     "normalize_s3_endpoint",
     "reset_s3_client_state",
+    "upload_object_bytes",
     "verify_s3_storage",
 ]

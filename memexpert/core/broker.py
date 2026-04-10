@@ -96,21 +96,43 @@ class PipelineBrokerSettings:
 
     @property
     def retry_routing_key(self) -> str:
-        """Return the routing key used when failed work enters the retry queue."""
+        """Return the legacy transcode retry-exchange routing key kept for S01 compatibility."""
 
-        return f"{self.routing_key_prefix}.retry"
+        return self.retry_queue_routing_key_for_stage(ContentPipelineStage.TRANSCODE)
+
+    @property
+    def ocr_retry_request_routing_key(self) -> str:
+        """Return the retry-exchange routing key used by OCR failures."""
+
+        return self.retry_queue_routing_key_for_stage(ContentPipelineStage.OCR)
 
     @property
     def transcode_retry_routing_key(self) -> str:
-        """Return the routing key used when retried work returns to the transcode queue."""
+        """Return the routing key used when retried transcode work returns to the main exchange."""
 
-        return f"{self.routing_key_prefix}.transcode_retry"
+        return self.retry_return_routing_key_for_stage(ContentPipelineStage.TRANSCODE)
+
+    @property
+    def ocr_retry_routing_key(self) -> str:
+        """Return the routing key used when retried OCR work returns to the main exchange."""
+
+        return self.retry_return_routing_key_for_stage(ContentPipelineStage.OCR)
 
     @property
     def dead_letter_routing_key(self) -> str:
         """Return the routing key used when retries are exhausted."""
 
         return f"{self.routing_key_prefix}.dead_letter"
+
+    def retry_queue_routing_key_for_stage(self, stage: ContentPipelineStage) -> str:
+        """Return the retry-exchange routing key for one durable pipeline stage."""
+
+        return f"{self.routing_key_prefix}.retry.{stage.value}"
+
+    def retry_return_routing_key_for_stage(self, stage: ContentPipelineStage) -> str:
+        """Return the main-exchange routing key used after one retry TTL expires."""
+
+        return f"{self.routing_key_prefix}.{stage.value}_retry"
 
     @property
     def retry_backoff_milliseconds(self) -> int:

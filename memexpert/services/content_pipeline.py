@@ -8,26 +8,20 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from io import BytesIO
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Protocol, Self, cast
 
-import imagehash
-from PIL import Image, UnidentifiedImageError
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import selectinload
 
 from memexpert.core.broker import ensure_pipeline_broker_started, get_pipeline_broker_settings
 from memexpert.core.config import Settings, get_settings
-from memexpert.core.storage import (
-    build_original_object_key,
-    build_web_video_object_key,
-    get_pipeline_storage_settings,
-    get_s3_client,
-)
+from memexpert.core.media import NormalizedMediaResult, PipelineMediaProcessor, PipelineMediaProcessorProtocol
+from memexpert.core.ocr import OCRExtractionResult, OCRProcessorProtocol, PipelineOCRProcessor
+from memexpert.core.storage import build_original_object_key, get_pipeline_storage_settings, get_s3_client
 from memexpert.models.base import utcnow
-from memexpert.models.content import Meme, MemeFile, MemeSource, PipelineStageJournal
+from memexpert.models.content import Meme, MemeFile, MemeFileOCRResult, MemeSource, PipelineStageJournal
 from memexpert.models.enums import (
     ContentKind,
     ContentLanguage,
@@ -64,18 +58,6 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
 
-_IMAGE_FORMAT_TO_MIME_TYPE: dict[str, str] = {
-    "GIF": "image/gif",
-    "JPEG": "image/jpeg",
-    "PNG": "image/png",
-    "WEBP": "image/webp",
-}
-_MIME_TYPE_TO_EXTENSIONS: dict[str, frozenset[str]] = {
-    "image/gif": frozenset({"gif"}),
-    "image/jpeg": frozenset({"jpg", "jpeg"}),
-    "image/png": frozenset({"png"}),
-    "image/webp": frozenset({"webp"}),
-}
 _STAGE_ORDER: dict[ContentPipelineStage, int] = {
     ContentPipelineStage.INGEST: 0,
     ContentPipelineStage.TRANSCODE: 1,
@@ -123,12 +105,25 @@ class PreparedUpload:
     """Normalized upload bytes plus the derived media metadata written durably."""
 
     filename: str
+    media_type: ContentKind
     mime_type: str
     file_size_bytes: int
     width: int
     height: int
     perceptual_hash: str
     object_key: str
+
+
+@dataclass(frozen=True, slots=True)
+class PipelineStageWorkContext:
+    """Compact worker context returned after a stage is marked processing."""
+
+    meme_id: uuid.UUID
+    meme_file_id: uuid.UUID
+    stage: ContentPipelineStage
+    mime_type: str | None
+    original_object_key: str
+    web_video_object_key: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,6 +171,8 @@ class ContentPipelineService:
         settings: Settings | None = None,
         storage_client: ObjectStorageClient | None = None,
         publisher: DispatchEventPublisher | None = None,
+        media_processor: PipelineMediaProcessorProtocol | None = None,
+        ocr_processor: OCRProcessorProtocol | None = None,
     ) -> None:
         self._session = session
         self._settings = settings or get_settings()
@@ -183,6 +180,11 @@ class ContentPipelineService:
         self._broker_settings = get_pipeline_broker_settings(self._settings)
         self._storage_client = storage_client or cast("ObjectStorageClient", get_s3_client())
         self._publisher = publisher or self._publish_dispatch_event
+        self._media_processor = media_processor or PipelineMediaProcessor(settings=self._settings)
+        self._ocr_processor = ocr_processor or PipelineOCRProcessor(
+            settings=self._settings,
+            media_processor=self._media_processor,
+        )
 
     @classmethod
     def from_settings(
@@ -192,6 +194,8 @@ class ContentPipelineService:
         settings: Settings | None = None,
         storage_client: ObjectStorageClient | None = None,
         publisher: DispatchEventPublisher | None = None,
+        media_processor: PipelineMediaProcessorProtocol | None = None,
+        ocr_processor: OCRProcessorProtocol | None = None,
     ) -> Self:
         """Build the ingest service from shared runtime settings and lazy runtimes."""
 
@@ -200,6 +204,8 @@ class ContentPipelineService:
             settings=settings,
             storage_client=storage_client,
             publisher=publisher,
+            media_processor=media_processor,
+            ocr_processor=ocr_processor,
         )
 
     async def create_upload(
@@ -213,7 +219,7 @@ class ContentPipelineService:
         """Persist an operator upload durably, then publish downstream work exactly once."""
 
         meme_file_id = uuid.uuid7()
-        prepared_upload = self._prepare_upload(
+        prepared_upload = await self._prepare_upload(
             meme_file_id=meme_file_id,
             filename=filename,
             content_type=content_type,
@@ -358,15 +364,15 @@ class ContentPipelineService:
             attempt=replay_event.attempt,
         )
 
-    async def mark_stage_processing(
+    async def start_stage_processing(
         self,
         *,
         meme_file_id: uuid.UUID,
         stage: ContentPipelineStage,
         attempt: int,
         event_id: uuid.UUID,
-    ) -> None:
-        """Persist a worker transition from queued to actively running."""
+    ) -> PipelineStageWorkContext:
+        """Mark one stage as running and return the durable media context workers need."""
 
         meme_file, stage_entry = await self._get_meme_file_and_stage_entry(meme_file_id, stage)
         self._ensure_stage_attempt_is_current(stage_entry, attempt=attempt)
@@ -384,6 +390,104 @@ class ContentPipelineService:
         meme_file.status = ContentProcessingStatus.PROCESSING
 
         await self._commit_stage_mutation("Failed to persist running stage state.")
+        return PipelineStageWorkContext(
+            meme_id=meme_file.meme_id,
+            meme_file_id=meme_file.id,
+            stage=stage,
+            mime_type=meme_file.mime_type,
+            original_object_key=meme_file.s3_original_key,
+            web_video_object_key=meme_file.s3_web_video_key,
+        )
+
+    async def mark_stage_processing(
+        self,
+        *,
+        meme_file_id: uuid.UUID,
+        stage: ContentPipelineStage,
+        attempt: int,
+        event_id: uuid.UUID,
+    ) -> None:
+        """Persist a worker transition from queued to actively running."""
+
+        _ = await self.start_stage_processing(
+            meme_file_id=meme_file_id,
+            stage=stage,
+            attempt=attempt,
+            event_id=event_id,
+        )
+
+    async def complete_transcode_stage(
+        self,
+        *,
+        meme_file_id: uuid.UUID,
+        attempt: int,
+        event_id: uuid.UUID,
+        result: NormalizedMediaResult,
+    ) -> None:
+        """Persist normalized derivative metadata, then advance the durable stage chain."""
+
+        meme_file, stage_entry = await self._get_meme_file_and_stage_entry(meme_file_id, ContentPipelineStage.TRANSCODE)
+        self._ensure_stage_attempt_is_current(stage_entry, attempt=attempt)
+        meme_file.s3_web_video_key = result.web_video_object_key
+        meme_file.mime_type = result.mime_type
+        meme_file.width = result.width
+        meme_file.height = result.height
+        meme_file.file_size_bytes = result.file_size_bytes
+        meme_file.quality_score = result.quality_score
+        meme_file.blur_hash = result.blur_hash
+        await self._finalize_stage_success(
+            meme_file=meme_file,
+            stage_entry=stage_entry,
+            stage=ContentPipelineStage.TRANSCODE,
+            attempt=attempt,
+            event_id=event_id,
+        )
+
+    async def complete_ocr_stage(
+        self,
+        *,
+        meme_file_id: uuid.UUID,
+        attempt: int,
+        event_id: uuid.UUID,
+        result: OCRExtractionResult,
+    ) -> None:
+        """Persist durable OCR provenance, then advance the durable stage chain."""
+
+        meme_file, stage_entry = await self._get_meme_file_and_stage_entry(meme_file_id, ContentPipelineStage.OCR)
+        self._ensure_stage_attempt_is_current(stage_entry, attempt=attempt)
+
+        if meme_file.ocr_result is None:
+            meme_file.ocr_result = MemeFileOCRResult(
+                meme_file_id=meme_file.id,
+                engine=result.engine,
+                fallback_engine=result.fallback_engine,
+                fallback_used=result.fallback_used,
+                low_confidence=result.low_confidence,
+                confidence=result.confidence,
+                language=result.language,
+                extracted_text=result.extracted_text,
+                source_object_key=result.source_object_key,
+                last_event_id=event_id,
+            )
+            self._session.add(meme_file.ocr_result)
+        else:
+            meme_file.ocr_result.engine = result.engine
+            meme_file.ocr_result.fallback_engine = result.fallback_engine
+            meme_file.ocr_result.fallback_used = result.fallback_used
+            meme_file.ocr_result.low_confidence = result.low_confidence
+            meme_file.ocr_result.confidence = result.confidence
+            meme_file.ocr_result.language = result.language
+            meme_file.ocr_result.extracted_text = result.extracted_text
+            meme_file.ocr_result.source_object_key = result.source_object_key
+            meme_file.ocr_result.last_event_id = event_id
+
+        await self._finalize_stage_success(
+            meme_file=meme_file,
+            stage_entry=stage_entry,
+            stage=ContentPipelineStage.OCR,
+            attempt=attempt,
+            event_id=event_id,
+        )
 
     async def mark_stage_failed(
         self,
@@ -431,6 +535,23 @@ class ContentPipelineService:
 
         meme_file, stage_entry = await self._get_meme_file_and_stage_entry(meme_file_id, stage)
         self._ensure_stage_attempt_is_current(stage_entry, attempt=attempt)
+        await self._finalize_stage_success(
+            meme_file=meme_file,
+            stage_entry=stage_entry,
+            stage=stage,
+            attempt=attempt,
+            event_id=event_id,
+        )
+
+    async def _finalize_stage_success(
+        self,
+        *,
+        meme_file: MemeFile,
+        stage_entry: PipelineStageJournal,
+        stage: ContentPipelineStage,
+        attempt: int,
+        event_id: uuid.UUID,
+    ) -> None:
         finished_at = utcnow()
 
         stage_entry.status = ContentPipelineStageStatus.SUCCEEDED
@@ -442,9 +563,6 @@ class ContentPipelineService:
         stage_entry.retry_after = None
         stage_entry.started_at = stage_entry.started_at or finished_at
         stage_entry.finished_at = finished_at
-
-        if stage is ContentPipelineStage.TRANSCODE and meme_file.s3_web_video_key is None:
-            meme_file.s3_web_video_key = build_web_video_object_key(meme_file_id, settings=self._settings)
 
         downstream_dispatches = self._prepare_downstream_dispatches(
             meme_file=meme_file,
@@ -467,7 +585,7 @@ class ContentPipelineService:
                 await self._mark_publish_failure_for_downstream_stage(dispatch=dispatch, error=exc)
                 raise PipelinePublishError("Stage success was stored, but downstream dispatch failed.") from exc
 
-    def _prepare_upload(
+    async def _prepare_upload(
         self,
         *,
         meme_file_id: uuid.UUID,
@@ -480,65 +598,32 @@ class ContentPipelineService:
         file_size_bytes = len(media_bytes)
         if file_size_bytes <= 0:
             raise PipelinePayloadValidationError("Uploaded file is empty.")
-        if file_size_bytes > self._settings.pipeline_upload_max_bytes:
-            raise PipelinePayloadTooLargeError(
-                f"Uploaded file exceeds the {self._settings.pipeline_upload_max_bytes}-byte limit.",
-            )
 
         try:
-            with Image.open(BytesIO(media_bytes)) as image:
-                detected_format = image.format
-                image.load()
-                width = image.width
-                height = image.height
-        except UnidentifiedImageError as exc:
-            raise PipelineUnsupportedMediaTypeError("Uploaded file is not a readable image payload.") from exc
-        except Image.DecompressionBombError as exc:
-            raise PipelinePayloadValidationError("Uploaded image exceeds the configured pixel budget.") from exc
-        except OSError as exc:
-            raise PipelineUnsupportedMediaTypeError("Uploaded file is not a readable image payload.") from exc
-
-        pixel_count = width * height
-        if pixel_count <= 0:
-            raise PipelinePayloadValidationError("Uploaded image dimensions are invalid.")
-        if pixel_count > self._settings.pipeline_image_max_pixels:
-            raise PipelinePayloadValidationError("Uploaded image exceeds the configured pixel budget.")
-
-        if detected_format is None:
-            raise PipelineUnsupportedMediaTypeError("Uploaded file format could not be detected.")
-
-        detected_mime_type = _IMAGE_FORMAT_TO_MIME_TYPE.get(detected_format.upper())
-        if detected_mime_type is None:
-            raise PipelineUnsupportedMediaTypeError("Uploaded media type is not supported.")
-        if detected_mime_type not in self._settings.pipeline_allowed_mime_types:
-            raise PipelineUnsupportedMediaTypeError("Uploaded media type is not enabled for ingest.")
-        if normalized_content_type != detected_mime_type:
-            raise PipelineUnsupportedMediaTypeError(
-                "Uploaded content type "
-                f"{normalized_content_type!r} does not match detected media type {detected_mime_type!r}."
+            inspected_media = await self._media_processor.inspect_upload(
+                filename=normalized_filename,
+                content_type=normalized_content_type,
+                media_bytes=media_bytes,
             )
+        except Exception as exc:
+            raise self._translate_media_processing_error(exc) from exc
 
-        extension = self._normalize_extension(normalized_filename)
-        allowed_extensions = _MIME_TYPE_TO_EXTENSIONS[detected_mime_type]
-        if extension not in allowed_extensions:
-            raise PipelineUnsupportedMediaTypeError(
-                f"Filename extension .{extension} does not match uploaded media type {detected_mime_type!r}.",
-            )
-
-        with Image.open(BytesIO(media_bytes)) as hash_image:
-            perceptual_hash = str(imagehash.phash(hash_image, hash_size=self._settings.pipeline_phash_size))
-        if len(perceptual_hash) > _MAX_PERCEPTUAL_HASH_LENGTH:
+        upload_limit = self._upload_limit_for_media_type(inspected_media.media_type)
+        if file_size_bytes > upload_limit:
+            raise PipelinePayloadTooLargeError(f"Uploaded file exceeds the {upload_limit}-byte limit.")
+        if len(inspected_media.perceptual_hash) > _MAX_PERCEPTUAL_HASH_LENGTH:
             raise PipelineIngestError(
                 "Configured perceptual-hash size exceeds the persisted meme_files.perceptual_hash contract.",
             )
 
         return PreparedUpload(
             filename=normalized_filename,
-            mime_type=detected_mime_type,
-            file_size_bytes=file_size_bytes,
-            width=width,
-            height=height,
-            perceptual_hash=perceptual_hash,
+            media_type=inspected_media.media_type,
+            mime_type=inspected_media.mime_type,
+            file_size_bytes=inspected_media.file_size_bytes,
+            width=inspected_media.width,
+            height=inspected_media.height,
+            perceptual_hash=inspected_media.perceptual_hash,
             object_key=build_original_object_key(
                 meme_file_id,
                 normalized_filename,
@@ -614,7 +699,7 @@ class ContentPipelineService:
     ) -> None:
         meme = Meme(
             id=meme_id,
-            media_type=ContentKind.IMAGE,
+            media_type=prepared_upload.media_type,
             language=ContentLanguage.NONE,
             is_public=False,
         )
@@ -817,6 +902,7 @@ class ContentPipelineService:
             select(MemeFile)
             .options(
                 selectinload(MemeFile.meme),
+                selectinload(MemeFile.ocr_result),
                 selectinload(MemeFile.pipeline_stage_journal_entries),
             )
             .where(MemeFile.id == meme_file_id)
@@ -1080,6 +1166,27 @@ class ContentPipelineService:
     @staticmethod
     def _trim_error_text(last_error_text: str) -> str:
         return last_error_text.strip()[:MAX_PIPELINE_ERROR_LENGTH]
+
+    def _upload_limit_for_media_type(self, media_type: ContentKind) -> int:
+        if media_type is ContentKind.IMAGE:
+            return self._settings.pipeline_image_upload_max_bytes
+        if media_type is ContentKind.GIF:
+            return self._settings.pipeline_gif_upload_max_bytes
+        if media_type is ContentKind.VIDEO:
+            return self._settings.pipeline_video_upload_max_bytes
+        return self._settings.pipeline_image_upload_max_bytes
+
+    @staticmethod
+    def _translate_media_processing_error(exc: Exception) -> PipelinePayloadValidationError:
+        from memexpert.core.media import MediaProcessingError, MediaTimeoutError, MediaValidationError
+
+        if isinstance(exc, MediaTimeoutError):
+            return PipelinePayloadValidationError(str(exc))
+        if isinstance(exc, MediaValidationError):
+            return PipelineUnsupportedMediaTypeError(str(exc))
+        if isinstance(exc, MediaProcessingError):
+            return PipelinePayloadValidationError(str(exc))
+        return PipelinePayloadValidationError(str(exc))
 
     @staticmethod
     def _normalize_filename(filename: str | None) -> str:

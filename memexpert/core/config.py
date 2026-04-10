@@ -40,6 +40,9 @@ PIPELINE_DEFAULT_ALLOWED_MIME_TYPES = (
     "image/png",
     "image/webp",
     "image/gif",
+    "video/mp4",
+    "video/quicktime",
+    "video/webm",
 )
 _ALLOWED_ORIGIN_LIST_ADAPTER = TypeAdapter(tuple[AnyHttpUrl, ...])
 _PIPELINE_TOPOLOGY_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -64,10 +67,15 @@ class Settings(BaseSettings):
     s3_region: str = "us-east-1"
     imgproxy_base_url: str = "http://localhost:8080"
     pipeline_operator_token: SecretStr = SecretStr("memexpert-dev-pipeline-operator-token-min-32")
-    pipeline_upload_max_bytes: int = Field(default=20 * 1024 * 1024, gt=0)
+    pipeline_image_upload_max_bytes: int = Field(default=20 * 1024 * 1024, gt=0)
+    pipeline_gif_upload_max_bytes: int = Field(default=40 * 1024 * 1024, gt=0)
+    pipeline_video_upload_max_bytes: int = Field(default=150 * 1024 * 1024, gt=0)
     pipeline_allowed_mime_types: Annotated[tuple[str, ...], NoDecode] = PIPELINE_DEFAULT_ALLOWED_MIME_TYPES
     pipeline_phash_size: int = Field(default=16, ge=4, le=64)
     pipeline_image_max_pixels: int = Field(default=45_000_000, gt=0)
+    pipeline_transcode_timeout_seconds: float = Field(default=45.0, gt=0.0, le=900.0)
+    pipeline_ffmpeg_binary: str = "ffmpeg"
+    pipeline_ffprobe_binary: str = "ffprobe"
     pipeline_s3_original_prefix: str = "pipeline/originals"
     pipeline_s3_derivative_prefix: str = "pipeline/derived"
     pipeline_broker_exchange: str = "memexpert.pipeline"
@@ -89,6 +97,8 @@ class Settings(BaseSettings):
     pipeline_storage_connection_timeout_seconds: float = Field(default=5.0, gt=0.0)
     pipeline_ocr_primary_engine: str = "paddleocr"
     pipeline_ocr_fallback_engine: str = "qwen2.5-vl-2b"
+    pipeline_ocr_fallback_command: str | None = None
+    pipeline_ocr_timeout_seconds: float = Field(default=30.0, gt=0.0, le=600.0)
     pipeline_ocr_low_confidence_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
     pipeline_voyage_model: str = "voyage-multimodal-3.5"
     pipeline_voyage_output_dimensions: int = Field(default=1024, ge=1)
@@ -209,6 +219,8 @@ class Settings(BaseSettings):
     @field_validator(
         "pipeline_ocr_primary_engine",
         "pipeline_ocr_fallback_engine",
+        "pipeline_ffmpeg_binary",
+        "pipeline_ffprobe_binary",
         "pipeline_voyage_model",
         "pipeline_qdrant_collection_name",
         mode="before",
@@ -292,7 +304,12 @@ class Settings(BaseSettings):
             raise ValueError("auth_telegram_bot_username must not contain spaces.")
         return normalized_value
 
-    @field_validator("auth_google_client_id", "auth_google_redirect_uri", mode="before")
+    @field_validator(
+        "auth_google_client_id",
+        "auth_google_redirect_uri",
+        "pipeline_ocr_fallback_command",
+        mode="before",
+    )
     @classmethod
     def _normalize_optional_text(cls, value: object) -> object:
         if value is None:

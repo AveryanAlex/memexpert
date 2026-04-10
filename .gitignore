@@ -30,3 +30,6 @@ tmp/
 
 .artifacts
 .pytest_cache
+
+# ── GSD baseline (auto-generated) ──
+.bg-shell/
