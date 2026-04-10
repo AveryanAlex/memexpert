@@ -24,6 +24,7 @@ from memexpert.models.content import (
     Meme,
     MemeFile,
     MemeFileOCRResult,
+    MemeFileSyncTargetSnapshot,
     MemeMergeLog,
     MemePopularitySnapshot,
     MemeSource,
@@ -36,6 +37,8 @@ from memexpert.models.enums import (
     ContentPipelineStageStatus,
     ContentProcessingStatus,
     SourcePlatform,
+    SyncTargetKind,
+    SyncTargetStatus,
 )
 from memexpert.schemas.content_pipeline import (
     ContentPipelineDispatchEvent,
@@ -1405,3 +1408,209 @@ async def test_complete_embed_stage_rolls_back_partial_merge_and_keeps_embed_rep
     assert newer_file_after is not None
     assert newer_cache_rows == []
     assert newer_file_after.meme_id == newer_meme_id  # not moved
+
+
+async def _drive_to_classify_succeeded(
+    session: AsyncSession,
+    *,
+    source_id: str,
+    post_id: str,
+    phash_tag: str,
+    input_hash_seed: str,
+) -> tuple[uuid.UUID, ContentPipelineService]:
+    """Drive a pipeline item end-to-end through classify success for sync replay tests."""
+
+    meme_file_id, _, service = await _drive_to_embed_pending(
+        session,
+        source_id=source_id,
+        post_id=post_id,
+        phash_tag=phash_tag,
+    )
+    _ = await service.complete_embed_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        embedding_result=build_voyage_embedding_result(input_hash=input_hash_seed * 64),
+        similarity_matches=(),
+    )
+    await service.complete_classify_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        classification_result=build_classification_result(),
+    )
+    return meme_file_id, service
+
+
+async def test_sync_stub_methods_raise_not_implemented_error(
+    migrated_db_session: AsyncSession,
+) -> None:
+    meme_file_id, service = await _drive_to_classify_succeeded(
+        migrated_db_session,
+        source_id="stub-not-impl",
+        post_id="9900",
+        phash_tag="s",
+        input_hash_seed="9",
+    )
+
+    with pytest.raises(NotImplementedError, match="T02/T03 implement this method"):
+        _ = await service.complete_sync_qdrant_stage(
+            meme_file_id=meme_file_id,
+            attempt=1,
+            event_id=uuid.uuid7(),
+            payload_preview={},
+        )
+    with pytest.raises(NotImplementedError, match="T02/T03 implement this method"):
+        _ = await service.fail_sync_qdrant_stage(
+            meme_file_id=meme_file_id,
+            attempt=1,
+            event_id=uuid.uuid7(),
+            normalized_reason="sync_qdrant_timeout",
+            last_error_text="boom",
+        )
+    with pytest.raises(NotImplementedError, match="T02/T03 implement this method"):
+        _ = await service.complete_sync_meili_stage(
+            meme_file_id=meme_file_id,
+            attempt=1,
+            event_id=uuid.uuid7(),
+            payload_preview={},
+        )
+    with pytest.raises(NotImplementedError, match="T02/T03 implement this method"):
+        _ = await service.fail_sync_meili_stage(
+            meme_file_id=meme_file_id,
+            attempt=1,
+            event_id=uuid.uuid7(),
+            normalized_reason="sync_meili_timeout",
+            last_error_text="boom",
+        )
+
+
+async def test_replay_sync_target_rejects_items_without_classify_success(
+    migrated_db_session: AsyncSession,
+) -> None:
+    # Stop before classify so the replay guard must fire.
+    meme_file_id, _, service = await _drive_to_embed_pending(
+        migrated_db_session,
+        source_id="replay-guard",
+        post_id="9910",
+        phash_tag="r",
+    )
+
+    with pytest.raises(PipelineReplayNotAllowedError, match="cannot replay sync targets"):
+        _ = await service.replay_sync_target(meme_file_id, SyncTargetKind.QDRANT)
+    with pytest.raises(PipelineReplayNotAllowedError, match="cannot replay sync targets"):
+        _ = await service.replay_sync_target_batch([meme_file_id], SyncTargetKind.MEILISEARCH)
+
+
+async def test_replay_sync_target_stub_raises_not_implemented_after_classify_success(
+    migrated_db_session: AsyncSession,
+) -> None:
+    meme_file_id, service = await _drive_to_classify_succeeded(
+        migrated_db_session,
+        source_id="replay-stub",
+        post_id="9920",
+        phash_tag="t",
+        input_hash_seed="a",
+    )
+
+    with pytest.raises(NotImplementedError, match="T02/T03 implement this method"):
+        _ = await service.replay_sync_target(meme_file_id, SyncTargetKind.QDRANT)
+    with pytest.raises(NotImplementedError, match="T02/T03 implement this method"):
+        _ = await service.replay_sync_target_batch(
+            [meme_file_id],
+            SyncTargetKind.MEILISEARCH,
+        )
+
+
+async def test_replay_sync_target_batch_refuses_batches_beyond_the_max(
+    migrated_db_session: AsyncSession,
+) -> None:
+    from memexpert.services.content_pipeline import SYNC_REPLAY_BATCH_MAX
+
+    meme_file_id, service = await _drive_to_classify_succeeded(
+        migrated_db_session,
+        source_id="batch-max",
+        post_id="9940",
+        phash_tag="v",
+        input_hash_seed="c",
+    )
+    oversized_batch = [meme_file_id] * (SYNC_REPLAY_BATCH_MAX + 1)
+
+    with pytest.raises(PipelineReplayNotAllowedError, match="exceeds the configured maximum"):
+        _ = await service.replay_sync_target_batch(oversized_batch, SyncTargetKind.QDRANT)
+
+
+async def test_item_detail_projects_per_target_sync_status_from_snapshot_rows(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    meme_file_id, service = await _drive_to_classify_succeeded(
+        migrated_db_session,
+        source_id="detail-sync",
+        post_id="9950",
+        phash_tag="w",
+        input_hash_seed="d",
+    )
+
+    # First, the empty default: the item detail must already expose an empty
+    # mapping before any snapshot rows exist.
+    empty_detail = await service.get_item_detail(meme_file_id)
+    assert empty_detail.sync_targets == {}
+
+    from memexpert.models.base import utcnow as _utcnow
+
+    now = _utcnow()
+    async with postgres_session_factory() as write_session:
+        write_session.add(
+            MemeFileSyncTargetSnapshot(
+                meme_file_id=meme_file_id,
+                sync_target=SyncTargetKind.QDRANT,
+                status=SyncTargetStatus.SYNCED,
+                last_event_id=uuid.uuid7(),
+                normalized_reason=None,
+                last_error_text=None,
+                last_payload_preview={"point_id": str(meme_file_id)},
+                last_success_at=now,
+                last_attempt_at=now,
+                attempt_count=1,
+            ),
+        )
+        write_session.add(
+            MemeFileSyncTargetSnapshot(
+                meme_file_id=meme_file_id,
+                sync_target=SyncTargetKind.MEILISEARCH,
+                status=SyncTargetStatus.FAILED,
+                last_event_id=uuid.uuid7(),
+                normalized_reason="sync_meili_timeout",
+                last_error_text="deadline exceeded",
+                last_payload_preview={},
+                last_success_at=None,
+                last_attempt_at=now,
+                attempt_count=3,
+            ),
+        )
+        await write_session.commit()
+
+    async with postgres_session_factory() as read_session:
+        read_service = ContentPipelineService(
+            read_session,
+            storage_client=FakeStorageClient(),
+            publisher=RecordingPublisher(),
+            media_processor=FakeMediaProcessor(
+                inspect_result=_make_distinct_upload_media_details(tag="w"),
+            ),
+        )
+        detail = await read_service.get_item_detail(meme_file_id)
+
+    assert set(detail.sync_targets) == {SyncTargetKind.QDRANT, SyncTargetKind.MEILISEARCH}
+    qdrant_status = detail.sync_targets[SyncTargetKind.QDRANT]
+    meili_status = detail.sync_targets[SyncTargetKind.MEILISEARCH]
+    assert qdrant_status.status is SyncTargetStatus.SYNCED
+    assert qdrant_status.attempt_count == 1
+    assert qdrant_status.last_success_at is not None
+    assert meili_status.status is SyncTargetStatus.FAILED
+    assert meili_status.normalized_reason == "sync_meili_timeout"
+    assert meili_status.last_error_text == "deadline exceeded"
+    assert meili_status.attempt_count == 3
+
+

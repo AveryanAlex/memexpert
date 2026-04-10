@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import PurePosixPath
@@ -27,6 +27,7 @@ from memexpert.models.content import (
     Meme,
     MemeFile,
     MemeFileOCRResult,
+    MemeFileSyncTargetSnapshot,
     MemeSource,
     PipelineStageJournal,
 )
@@ -38,6 +39,7 @@ from memexpert.models.enums import (
     ContentProcessingStatus,
     ContentSourceKind,
     EmbeddingInputType,
+    SyncTargetKind,
 )
 from memexpert.schemas.content_pipeline import (
     MAX_PIPELINE_ERROR_LENGTH,
@@ -51,6 +53,7 @@ from memexpert.schemas.content_pipeline import (
     ContentPipelineStageJournalRead,
     ContentPipelineUploadMetadata,
     ContentPipelineUploadRead,
+    PerTargetSyncStatus,
 )
 from memexpert.services.content_merge import ContentMergeService, MergeOutcome
 from memexpert.services.content_pipeline_reporting import build_item_detail
@@ -96,6 +99,17 @@ _MAX_PIPELINE_ITEMS_LIMIT = 200
 _DEFAULT_STUCK_AFTER_SECONDS = 60
 _PIPELINE_REASON_PUBLISH_FAILED = "publish_failed"
 _PIPELINE_REASON_REPLAY_REQUESTED = "replay_requested"
+
+# Maximum number of items accepted by the per-target batch replay endpoint.
+# Kept small so operators cannot accidentally requeue an entire corpus in one
+# call; the S03 runbook documents the repeated-call pattern for larger batches.
+SYNC_REPLAY_BATCH_MAX = 10
+
+# Normalized reason used when a per-target sync replay is intentionally queued
+# by an operator. Distinct from ``_PIPELINE_REASON_REPLAY_REQUESTED`` because
+# the sync truth table is independent from the stage journal and the reason
+# strings must not collide when operators filter either surface.
+PIPELINE_REASON_SYNC_REPLAY_REQUESTED = "sync_replay_requested"
 
 
 class ObjectStorageClient(Protocol):
@@ -604,6 +618,170 @@ class ContentPipelineService:
             attempt=attempt,
             event_id=event_id,
         )
+
+    async def complete_sync_qdrant_stage(
+        self,
+        *,
+        meme_file_id: uuid.UUID,
+        attempt: int,
+        event_id: uuid.UUID,
+        payload_preview: dict[str, object],
+    ) -> PerTargetSyncStatus:
+        """Persist a successful Qdrant sync attempt and return the per-target truth.
+
+        T01 locks the signature so T02 can implement the Qdrant consumer without
+        any further contract work. Until T02 lands, calling this method raises
+        ``NotImplementedError`` — the contract is locked, the implementation is
+        deliberately absent.
+        """
+
+        _ = (meme_file_id, attempt, event_id, payload_preview)
+        raise NotImplementedError("T02/T03 implement this method; the contract is locked in T01.")
+
+    async def fail_sync_qdrant_stage(
+        self,
+        *,
+        meme_file_id: uuid.UUID,
+        attempt: int,
+        event_id: uuid.UUID,
+        normalized_reason: str,
+        last_error_text: str,
+    ) -> PerTargetSyncStatus:
+        """Persist a failed Qdrant sync attempt and return the per-target truth.
+
+        T01 locks the signature so T02 can implement the Qdrant consumer without
+        any further contract work. Until T02 lands, calling this method raises
+        ``NotImplementedError`` — the contract is locked, the implementation is
+        deliberately absent.
+        """
+
+        _ = (meme_file_id, attempt, event_id, normalized_reason, last_error_text)
+        raise NotImplementedError("T02/T03 implement this method; the contract is locked in T01.")
+
+    async def complete_sync_meili_stage(
+        self,
+        *,
+        meme_file_id: uuid.UUID,
+        attempt: int,
+        event_id: uuid.UUID,
+        payload_preview: dict[str, object],
+    ) -> PerTargetSyncStatus:
+        """Persist a successful Meilisearch sync attempt and return the per-target truth.
+
+        T01 locks the signature so T03 can implement the Meilisearch consumer
+        without any further contract work. Until T03 lands, calling this method
+        raises ``NotImplementedError`` — the contract is locked, the
+        implementation is deliberately absent.
+        """
+
+        _ = (meme_file_id, attempt, event_id, payload_preview)
+        raise NotImplementedError("T02/T03 implement this method; the contract is locked in T01.")
+
+    async def fail_sync_meili_stage(
+        self,
+        *,
+        meme_file_id: uuid.UUID,
+        attempt: int,
+        event_id: uuid.UUID,
+        normalized_reason: str,
+        last_error_text: str,
+    ) -> PerTargetSyncStatus:
+        """Persist a failed Meilisearch sync attempt and return the per-target truth.
+
+        T01 locks the signature so T03 can implement the Meilisearch consumer
+        without any further contract work. Until T03 lands, calling this method
+        raises ``NotImplementedError`` — the contract is locked, the
+        implementation is deliberately absent.
+        """
+
+        _ = (meme_file_id, attempt, event_id, normalized_reason, last_error_text)
+        raise NotImplementedError("T02/T03 implement this method; the contract is locked in T01.")
+
+    async def replay_sync_target(
+        self,
+        meme_file_id: uuid.UUID,
+        target: SyncTargetKind,
+    ) -> PerTargetSyncStatus:
+        """Queue a per-target sync replay for one pipeline item.
+
+        The classify stage must have already succeeded for the item — otherwise
+        the per-target sync truth has no ready canonical state to advertise and
+        the replay would race with the heavy chain. T01 enforces that guard here
+        so T02/T03 inherit it automatically, and raises ``NotImplementedError``
+        afterwards because the runtime work is still pending.
+        """
+
+        await self._ensure_sync_replay_allowed(meme_file_id)
+        _ = target
+        raise NotImplementedError("T02/T03 implement this method; the contract is locked in T01.")
+
+    async def replay_sync_target_batch(
+        self,
+        meme_file_ids: Sequence[uuid.UUID],
+        target: SyncTargetKind,
+    ) -> tuple[PerTargetSyncStatus, ...]:
+        """Queue per-target sync replays for a bounded batch of pipeline items.
+
+        Every item in ``meme_file_ids`` must have already reached classify
+        completion; the guard runs before any runtime work so T02/T03 cannot
+        accidentally ship an implementation that replays half-ready items.
+        T01 also rejects batches larger than :data:`SYNC_REPLAY_BATCH_MAX` so
+        operators cannot accidentally requeue an entire corpus in one call.
+        """
+
+        if len(meme_file_ids) > SYNC_REPLAY_BATCH_MAX:
+            raise PipelineReplayNotAllowedError(
+                "Sync replay batch size "
+                f"{len(meme_file_ids)} exceeds the configured maximum of {SYNC_REPLAY_BATCH_MAX}.",
+            )
+        for meme_file_id in meme_file_ids:
+            await self._ensure_sync_replay_allowed(meme_file_id)
+        _ = target
+        raise NotImplementedError("T02/T03 implement this method; the contract is locked in T01.")
+
+    async def _ensure_sync_replay_allowed(self, meme_file_id: uuid.UUID) -> None:
+        """Raise :class:`PipelineReplayNotAllowedError` when classify has not succeeded.
+
+        The per-target sync truth only makes sense after the heavy chain has
+        produced canonical state. Replaying sync before classify succeeds would
+        advertise incomplete truth to Qdrant or Meilisearch, so the service
+        refuses the request up-front.
+        """
+
+        meme_file = await self._get_meme_file(meme_file_id)
+        classify_entry = next(
+            (
+                entry
+                for entry in meme_file.pipeline_stage_journal_entries
+                if entry.stage is ContentPipelineStage.CLASSIFY
+            ),
+            None,
+        )
+        if classify_entry is None or classify_entry.status is not ContentPipelineStageStatus.SUCCEEDED:
+            raise PipelineReplayNotAllowedError(
+                f"Pipeline item {meme_file_id} cannot replay sync targets before classify succeeds.",
+            )
+
+    async def _load_sync_target_snapshots(
+        self,
+        session: AsyncSession,
+        meme_file_id: uuid.UUID,
+    ) -> dict[SyncTargetKind, MemeFileSyncTargetSnapshot]:
+        """Return the per-target snapshot rows for one meme file keyed by target.
+
+        This helper is the canonical read path T02/T03/T04 rely on so the
+        reporting layer and runtime handlers never diverge on how they load
+        per-target truth. The method is deliberately small and synchronous in
+        spirit (one round-trip) so callers can hold it open inside stage
+        transactions without surprising query overhead.
+        """
+
+        result = await session.execute(
+            select(MemeFileSyncTargetSnapshot).where(
+                MemeFileSyncTargetSnapshot.meme_file_id == meme_file_id,
+            )
+        )
+        return {row.sync_target: row for row in result.scalars().all()}
 
     async def mark_stage_failed(
         self,
@@ -1411,6 +1589,8 @@ class ContentPipelineService:
 
 
 __all__ = [
+    "PIPELINE_REASON_SYNC_REPLAY_REQUESTED",
+    "SYNC_REPLAY_BATCH_MAX",
     "ContentPipelineService",
     "ContentPipelineUploadRead",
     "PreparedUpload",

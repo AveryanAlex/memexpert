@@ -21,6 +21,7 @@ from memexpert.models.content import (
     Meme,
     MemeFile,
     MemeFileOCRResult,
+    MemeFileSyncTargetSnapshot,
     MemeMergeLog,
     MemePopularitySnapshot,
     MemeSeoPage,
@@ -47,6 +48,8 @@ from memexpert.models.enums import (
     ContentProcessingStatus,
     EmbeddingInputType,
     SourcePlatform,
+    SyncTargetKind,
+    SyncTargetStatus,
     TelegramMediaFormat,
     UserLanguage,
 )
@@ -86,6 +89,7 @@ EXPECTED_TABLES = {
     "embedding_cache",
     "inline_usage_events",
     "meme_file_ocr_results",
+    "meme_file_sync_target_snapshots",
     "meme_files",
     "meme_merge_logs",
     "meme_popularity_snapshots",
@@ -162,6 +166,7 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
     assert meme_relationships["primary_file"].mapper.class_ is MemeFile
     assert meme_file_relationships["pipeline_stage_journal_entries"].mapper.class_ is PipelineStageJournal
     assert meme_file_relationships["ocr_result"].mapper.class_ is MemeFileOCRResult
+    assert meme_file_relationships["sync_target_snapshots"].mapper.class_ is MemeFileSyncTargetSnapshot
 
 
 async def test_metadata_creates_full_schema_on_postgres(postgres_async_engine: AsyncEngine) -> None:
@@ -843,3 +848,260 @@ def test_content_pipeline_schemas_reject_invalid_stage_names_event_pairings_and_
                 "raw_media_bytes": "still-not-allowed",
             }
         )
+
+
+def test_sync_target_enum_values_are_locked_and_stable() -> None:
+    # Enum values are wire-visible: the durable snapshot rows store them verbatim
+    # and the broker payload schemas rely on them. Locking the tuple order here
+    # protects T02/T03/T04 against accidental reordering or renames.
+    assert tuple(SyncTargetKind) == (SyncTargetKind.QDRANT, SyncTargetKind.MEILISEARCH)
+    assert [member.value for member in SyncTargetKind] == ["qdrant", "meilisearch"]
+    assert tuple(SyncTargetStatus) == (
+        SyncTargetStatus.PENDING,
+        SyncTargetStatus.PROCESSING,
+        SyncTargetStatus.SYNCED,
+        SyncTargetStatus.FAILED,
+    )
+    assert [member.value for member in SyncTargetStatus] == [
+        "pending",
+        "processing",
+        "synced",
+        "failed",
+    ]
+
+
+def test_meme_qdrant_and_meili_events_validate_only_for_their_own_stage() -> None:
+    from memexpert.schemas.content_pipeline import _PIPELINE_EVENT_ALLOWED_STAGES
+
+    assert _PIPELINE_EVENT_ALLOWED_STAGES[ContentPipelineEventType.MEME_QDRANT_SYNCED] == frozenset(
+        {ContentPipelineStage.SYNC_QDRANT}
+    )
+    assert _PIPELINE_EVENT_ALLOWED_STAGES[ContentPipelineEventType.MEME_MEILI_SYNCED] == frozenset(
+        {ContentPipelineStage.SYNC_MEILI}
+    )
+
+    now = utcnow()
+    meme_id = uuid.uuid7()
+    meme_file_id = uuid.uuid7()
+
+    qdrant_payload = ContentPipelineDispatchEvent.model_validate(
+        {
+            "event_id": uuid.uuid7(),
+            "event_type": ContentPipelineEventType.MEME_QDRANT_SYNCED.value,
+            "meme_id": meme_id,
+            "meme_file_id": meme_file_id,
+            "stage": ContentPipelineStage.SYNC_QDRANT.value,
+            "source_kind": "manual_upload",
+            "original_object_key": "pipeline/originals/file/original.jpeg",
+            "attempt": 1,
+            "created_at": now,
+        }
+    )
+    meili_payload = ContentPipelineDispatchEvent.model_validate(
+        {
+            "event_id": uuid.uuid7(),
+            "event_type": ContentPipelineEventType.MEME_MEILI_SYNCED.value,
+            "meme_id": meme_id,
+            "meme_file_id": meme_file_id,
+            "stage": ContentPipelineStage.SYNC_MEILI.value,
+            "source_kind": "manual_upload",
+            "original_object_key": "pipeline/originals/file/original.jpeg",
+            "attempt": 1,
+            "created_at": now,
+        }
+    )
+    assert qdrant_payload.stage is ContentPipelineStage.SYNC_QDRANT
+    assert meili_payload.stage is ContentPipelineStage.SYNC_MEILI
+
+    # Each event must be rejected against any non-matching stage, including the
+    # other sync stage — locking the one-event-per-stage contract before T02/T03
+    # can rely on it.
+    for wrong_stage in (
+        ContentPipelineStage.INGEST,
+        ContentPipelineStage.TRANSCODE,
+        ContentPipelineStage.OCR,
+        ContentPipelineStage.EMBED,
+        ContentPipelineStage.CLASSIFY,
+        ContentPipelineStage.SYNC_MEILI,
+    ):
+        with pytest.raises(ValidationError):
+            _ = ContentPipelineDispatchEvent.model_validate(
+                {
+                    "event_id": uuid.uuid7(),
+                    "event_type": ContentPipelineEventType.MEME_QDRANT_SYNCED.value,
+                    "meme_id": meme_id,
+                    "meme_file_id": meme_file_id,
+                    "stage": wrong_stage.value,
+                    "source_kind": "manual_upload",
+                    "original_object_key": "pipeline/originals/file/original.jpeg",
+                    "attempt": 1,
+                    "created_at": now,
+                }
+            )
+
+    for wrong_stage in (
+        ContentPipelineStage.INGEST,
+        ContentPipelineStage.TRANSCODE,
+        ContentPipelineStage.OCR,
+        ContentPipelineStage.EMBED,
+        ContentPipelineStage.CLASSIFY,
+        ContentPipelineStage.SYNC_QDRANT,
+    ):
+        with pytest.raises(ValidationError):
+            _ = ContentPipelineDispatchEvent.model_validate(
+                {
+                    "event_id": uuid.uuid7(),
+                    "event_type": ContentPipelineEventType.MEME_MEILI_SYNCED.value,
+                    "meme_id": meme_id,
+                    "meme_file_id": meme_file_id,
+                    "stage": wrong_stage.value,
+                    "source_kind": "manual_upload",
+                    "original_object_key": "pipeline/originals/file/original.jpeg",
+                    "attempt": 1,
+                    "created_at": now,
+                }
+            )
+
+
+def test_item_detail_defaults_sync_targets_to_empty_mapping_and_preserves_s02_fields() -> None:
+    from memexpert.schemas.content_pipeline import (
+        ContentPipelineClassificationDetail,
+        ContentPipelineItemDetail,
+        ContentPipelineItemRead,
+        ContentPipelineMergeDetail,
+    )
+
+    now = utcnow()
+    meme_id = uuid.uuid7()
+    meme_file_id = uuid.uuid7()
+    event_id = uuid.uuid7()
+
+    journal_entry = PipelineStageJournal(
+        id=uuid.uuid7(),
+        meme_file_id=meme_file_id,
+        stage=ContentPipelineStage.TRANSCODE,
+        status=ContentPipelineStageStatus.SUCCEEDED,
+        attempt_count=1,
+        last_event_id=event_id,
+        normalized_reason=None,
+        last_error_text=None,
+        is_retryable=False,
+        retry_after=None,
+        started_at=now,
+        finished_at=now,
+        created_at=now,
+        updated_at=now,
+    )
+    base_read = ContentPipelineItemRead(
+        meme_id=meme_id,
+        meme_file_id=meme_file_id,
+        current_stage=ContentPipelineStage.TRANSCODE,
+        current_status=ContentPipelineStageStatus.SUCCEEDED,
+        original_object_key="pipeline/originals/file/original.png",
+        web_video_object_key=None,
+        last_event_id=event_id,
+        normalized_reason=None,
+        last_error_text=None,
+        attempt_count=1,
+        stages=(ContentPipelineStageJournalRead.model_validate(journal_entry),),
+    )
+
+    detail_default = ContentPipelineItemDetail(
+        **base_read.model_dump(mode="python"),
+        ocr=None,
+        merge=ContentPipelineMergeDetail(),
+        classification=ContentPipelineClassificationDetail(),
+        canonical=None,
+        ready_event=None,
+    )
+
+    # ``sync_targets`` must default to ``{}`` so pre-S03 serializer clients stay
+    # byte-compatible. The base S01 item-read payload must stay a strict subset.
+    assert detail_default.sync_targets == {}
+    detail_payload = detail_default.model_dump(mode="python")
+    base_payload = base_read.model_dump(mode="python")
+    for key, value in base_payload.items():
+        assert detail_payload[key] == value
+    assert detail_payload["sync_targets"] == {}
+
+
+async def test_sync_target_snapshot_orm_persists_and_enforces_uniqueness(
+    model_contract_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with model_contract_session_factory() as session:
+        meme = Meme(media_type=ContentKind.IMAGE)
+        session.add(meme)
+        await session.flush()
+
+        meme_file = MemeFile(
+            meme=meme,
+            status=ContentProcessingStatus.READY,
+            s3_original_key="pipeline/originals/sync/original.png",
+            is_primary=True,
+        )
+        session.add(meme_file)
+        await session.flush()
+
+        snapshot = MemeFileSyncTargetSnapshot(
+            meme_file=meme_file,
+            sync_target=SyncTargetKind.QDRANT,
+            status=SyncTargetStatus.SYNCED,
+            last_event_id=uuid.uuid7(),
+            normalized_reason=None,
+            last_error_text=None,
+            last_payload_preview={"point_id": str(meme_file.id)},
+            last_success_at=utcnow(),
+            last_attempt_at=utcnow(),
+            attempt_count=1,
+        )
+        session.add(snapshot)
+        await session.commit()
+
+        persisted_meme_file = await session.scalar(
+            select(MemeFile)
+            .options(selectinload(MemeFile.sync_target_snapshots))
+            .where(MemeFile.id == meme_file.id)
+        )
+        assert persisted_meme_file is not None
+        assert len(persisted_meme_file.sync_target_snapshots) == 1
+        persisted_snapshot = persisted_meme_file.sync_target_snapshots[0]
+        assert persisted_snapshot.sync_target is SyncTargetKind.QDRANT
+        assert persisted_snapshot.status is SyncTargetStatus.SYNCED
+        assert persisted_snapshot.last_payload_preview == {"point_id": str(meme_file.id)}
+        assert persisted_snapshot.attempt_count == 1
+
+    async with model_contract_session_factory() as session:
+        meme = Meme(media_type=ContentKind.IMAGE)
+        session.add(meme)
+        await session.flush()
+
+        meme_file = MemeFile(
+            meme=meme,
+            status=ContentProcessingStatus.READY,
+            s3_original_key="pipeline/originals/dup/original.png",
+            is_primary=True,
+        )
+        session.add(meme_file)
+        await session.flush()
+
+        session.add_all(
+            [
+                MemeFileSyncTargetSnapshot(
+                    meme_file=meme_file,
+                    sync_target=SyncTargetKind.QDRANT,
+                    status=SyncTargetStatus.PENDING,
+                    attempt_count=0,
+                    last_payload_preview={},
+                ),
+                MemeFileSyncTargetSnapshot(
+                    meme_file=meme_file,
+                    sync_target=SyncTargetKind.QDRANT,
+                    status=SyncTargetStatus.FAILED,
+                    attempt_count=1,
+                    last_payload_preview={},
+                ),
+            ]
+        )
+
+        with pytest.raises(IntegrityError):
+            await session.commit()

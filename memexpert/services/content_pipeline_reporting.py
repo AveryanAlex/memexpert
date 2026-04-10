@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import math
 import uuid
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -26,10 +26,15 @@ from sqlalchemy import or_, select
 from memexpert.models.content import (
     Meme,
     MemeFile,
+    MemeFileSyncTargetSnapshot,
     MemeMergeLog,
     PipelineStageJournal,
 )
-from memexpert.models.enums import ContentPipelineStage, ContentPipelineStageStatus
+from memexpert.models.enums import (
+    ContentPipelineStage,
+    ContentPipelineStageStatus,
+    SyncTargetKind,
+)
 from memexpert.schemas.content_pipeline import (
     ContentPipelineCanonicalContext,
     ContentPipelineClassificationDetail,
@@ -44,6 +49,7 @@ from memexpert.schemas.content_pipeline import (
     ContentPipelineRunSummary,
     ContentPipelineStageJournalRead,
     ContentPipelineStageTimings,
+    PerTargetSyncStatus,
 )
 
 if TYPE_CHECKING:
@@ -65,6 +71,10 @@ OUTCOME_BLOCKED = "blocked"
 OUTCOME_FAILED = "failed"
 OUTCOME_IN_FLIGHT = "in_flight"
 OUTCOME_DUPLICATE = "duplicate"
+# New in S03: emitted when at least one but not all sync targets have caught up.
+# T03 tightens ``_classify_outcome`` to actually return this value; T01 only
+# exposes the constant so downstream tests and the runbook can refer to it.
+OUTCOME_PARTIALLY_SEARCHABLE = "partially_searchable"
 
 
 async def build_item_detail(
@@ -108,6 +118,9 @@ async def build_item_detail(
         else None
     )
 
+    sync_snapshots = await _load_sync_target_snapshots(session, meme_file.id)
+    sync_targets = _project_sync_targets(sync_snapshots)
+
     return ContentPipelineItemDetail(
         **base.model_dump(mode="python"),
         ocr=ocr_projection,
@@ -115,7 +128,56 @@ async def build_item_detail(
         classification=classification,
         canonical=canonical_context,
         ready_event=ready_event,
+        sync_targets=sync_targets,
     )
+
+
+async def _load_sync_target_snapshots(
+    session: AsyncSession,
+    meme_file_id: uuid.UUID,
+) -> dict[SyncTargetKind, MemeFileSyncTargetSnapshot]:
+    """Read-only loader mirroring ``ContentPipelineService._load_sync_target_snapshots``.
+
+    The reporting layer intentionally keeps its own copy so the detail builder
+    can be exercised from tests without constructing a full service instance.
+    Both loaders return the same shape so the projection logic stays in one
+    place.
+    """
+
+    result = await session.execute(
+        select(MemeFileSyncTargetSnapshot).where(
+            MemeFileSyncTargetSnapshot.meme_file_id == meme_file_id,
+        )
+    )
+    return {row.sync_target: row for row in result.scalars().all()}
+
+
+def _project_sync_targets(
+    snapshots: Mapping[SyncTargetKind, MemeFileSyncTargetSnapshot],
+) -> dict[SyncTargetKind, PerTargetSyncStatus]:
+    """Turn snapshot rows into the public per-target projection.
+
+    Pure function, no DB access. The preview column is intentionally returned
+    as ``None`` in T01 — T02/T03 own the preview schema and will teach this
+    helper how to decode ``last_payload_preview`` into a typed preview. Empty
+    snapshot mapping yields an empty projection, which is what the inspect
+    surface must show for pre-S03 items that never went through sync.
+    """
+
+    projection: dict[SyncTargetKind, PerTargetSyncStatus] = {}
+    for target, row in snapshots.items():
+        projection[target] = PerTargetSyncStatus(
+            target=row.sync_target,
+            status=row.status,
+            last_event_id=row.last_event_id,
+            normalized_reason=row.normalized_reason,
+            last_error_text=row.last_error_text,
+            last_success_at=row.last_success_at,
+            last_attempt_at=row.last_attempt_at,
+            attempt_count=row.attempt_count,
+            last_preview=None,
+        )
+    return projection
 
 
 async def _load_canonical_meme(session: AsyncSession, meme_id: uuid.UUID) -> Meme:
@@ -512,6 +574,7 @@ __all__ = [
     "OUTCOME_DUPLICATE",
     "OUTCOME_FAILED",
     "OUTCOME_IN_FLIGHT",
+    "OUTCOME_PARTIALLY_SEARCHABLE",
     "OUTCOME_READY",
     "build_item_detail",
     "render_markdown_report",

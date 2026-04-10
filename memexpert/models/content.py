@@ -20,6 +20,8 @@ from memexpert.models.enums import (
     ContentProcessingStatus,
     EmbeddingInputType,
     SourcePlatform,
+    SyncTargetKind,
+    SyncTargetStatus,
     TelegramMediaFormat,
     string_enum,
 )
@@ -180,6 +182,11 @@ class MemeFile(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         cascade="all, delete-orphan",
         uselist=False,
     )
+    sync_target_snapshots: Mapped[list["MemeFileSyncTargetSnapshot"]] = relationship(
+        "MemeFileSyncTargetSnapshot",
+        back_populates="meme_file",
+        cascade="all, delete-orphan",
+    )
 
 
 class PipelineStageJournal(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -218,6 +225,66 @@ class PipelineStageJournal(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     finished_at: Mapped[datetime | None] = mapped_column(nullable=True)
 
     meme_file: Mapped["MemeFile"] = relationship("MemeFile", back_populates="pipeline_stage_journal_entries")
+
+
+class MemeFileSyncTargetSnapshot(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """Durable per-target sync truth for Qdrant and Meilisearch.
+
+    Each row tracks one ``(meme_file_id, sync_target)`` pair and captures the
+    latest success/failure timestamps, the normalized failure reason, the event
+    id that produced this state, and a bounded JSON preview of the payload that
+    the target last received. T02 (Qdrant) and T03 (Meilisearch) populate this
+    row as they execute; T04 and the reporting layer read from it without
+    re-deriving truth from stage-journal semantics.
+    """
+
+    __tablename__ = "meme_file_sync_target_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "meme_file_id",
+            "sync_target",
+            name="uq_meme_file_sync_target_snapshots_meme_file_id_sync_target",
+        ),
+        CheckConstraint(
+            "attempt_count >= 0",
+            name="meme_file_sync_target_snapshots_attempt_count_non_negative",
+        ),
+        Index(
+            "ix_meme_file_sync_target_snapshots_target_updated_at",
+            "sync_target",
+            "updated_at",
+        ),
+    )
+
+    meme_file_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("meme_files.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    sync_target: Mapped[SyncTargetKind] = mapped_column(
+        string_enum(SyncTargetKind),
+        nullable=False,
+    )
+    status: Mapped[SyncTargetStatus] = mapped_column(
+        string_enum(SyncTargetStatus),
+        default=SyncTargetStatus.PENDING,
+        nullable=False,
+    )
+    last_event_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
+    normalized_reason: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_error_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_payload_preview: Mapped[dict[str, object]] = mapped_column(
+        JSONB,
+        default=dict,
+        nullable=False,
+    )
+    last_success_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    meme_file: Mapped["MemeFile"] = relationship(
+        "MemeFile",
+        back_populates="sync_target_snapshots",
+    )
 
 
 class MemeFileOCRResult(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -461,6 +528,7 @@ __all__ = [
     "Meme",
     "MemeFile",
     "MemeFileOCRResult",
+    "MemeFileSyncTargetSnapshot",
     "MemeMergeLog",
     "MemePopularitySnapshot",
     "MemeSeoPage",

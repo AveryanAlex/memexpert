@@ -193,6 +193,34 @@ class TelegramMediaFormat(StrEnum):
     PHOTO = "photo"
 
 
+class SyncTargetKind(StrEnum):
+    """External search targets that must be kept in sync with canonical meme truth.
+
+    Each value maps to exactly one independent operational target. The per-target
+    snapshot table, service stubs, and schema projections all use this enum so
+    operators see Qdrant and Meilisearch as separate targets that can succeed,
+    fail, and be replayed without bleeding into each other's state.
+    """
+
+    QDRANT = "qdrant"
+    MEILISEARCH = "meilisearch"
+
+
+class SyncTargetStatus(StrEnum):
+    """Per-target sync lifecycle states for the S03 search-sync contract.
+
+    This taxonomy is intentionally separate from ``ContentPipelineStageStatus``
+    so sync progress and heavy-chain stage status never collide — operators must
+    be able to see a stage finished while a target is still pending and still
+    distinguish a transient sync failure from a heavy-stage failure.
+    """
+
+    PENDING = "pending"
+    PROCESSING = "processing"
+    SYNCED = "synced"
+    FAILED = "failed"
+
+
 class AnalyticsEventType(StrEnum):
     """General analytics event names recorded by product surfaces."""
 
@@ -230,6 +258,8 @@ __all__ = [
     "ContentSourceKind",
     "EmbeddingInputType",
     "SourcePlatform",
+    "SyncTargetKind",
+    "SyncTargetStatus",
     "TelegramMediaFormat",
     "UserLanguage",
     "string_enum",

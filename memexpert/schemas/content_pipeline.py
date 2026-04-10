@@ -15,6 +15,8 @@ from memexpert.models.enums import (
     ContentPipelineStageStatus,
     ContentSourceKind,
     SourcePlatform,
+    SyncTargetKind,
+    SyncTargetStatus,
 )
 
 MAX_OBJECT_KEY_LENGTH = 1024
@@ -32,6 +34,8 @@ class ContentPipelineEventType(StrEnum):
     MEME_OCR_DONE = "meme_ocr_done"
     MEME_EMBEDDED = "meme_embedded"
     MEME_READY = "meme_ready"
+    MEME_QDRANT_SYNCED = "meme_qdrant_synced"
+    MEME_MEILI_SYNCED = "meme_meili_synced"
     STAGE_REPLAY_REQUESTED = "stage_replay_requested"
 
 
@@ -46,6 +50,8 @@ _PIPELINE_EVENT_ALLOWED_STAGES: dict[ContentPipelineEventType, frozenset[Content
             ContentPipelineStage.SYNC_MEILI,
         }
     ),
+    ContentPipelineEventType.MEME_QDRANT_SYNCED: frozenset({ContentPipelineStage.SYNC_QDRANT}),
+    ContentPipelineEventType.MEME_MEILI_SYNCED: frozenset({ContentPipelineStage.SYNC_MEILI}),
     ContentPipelineEventType.STAGE_REPLAY_REQUESTED: frozenset(
         {
             ContentPipelineStage.TRANSCODE,
@@ -277,6 +283,57 @@ class ContentPipelineReadyEventSummary(BaseModel):
     meme_file_ready: bool
 
 
+class ContentPipelineSyncTargetPreview(BaseModel):
+    """Bounded JSON preview of the payload a sync target last received.
+
+    The preview is stored alongside the snapshot row so operators can see which
+    fields were advertised to Qdrant or Meilisearch without re-reading the full
+    payload. ``preview_fields`` is intentionally typed as ``dict[str, object]``
+    because the preview shape differs per target and T02/T03 define the keys.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    target: SyncTargetKind
+    preview_fields: dict[str, object] = Field(default_factory=dict)
+    preview_fetched_at: datetime
+
+
+class PerTargetSyncStatus(BaseModel):
+    """Per-target sync truth projection attached to the enriched inspect detail.
+
+    ``status`` is independent of the pipeline stage journal — a target can be
+    ``pending`` or ``failed`` even after the heavy-worker classify stage has
+    succeeded. Operators rely on this separation when deciding whether a meme is
+    ``partially_searchable`` (one target done, the other still catching up).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    target: SyncTargetKind
+    status: SyncTargetStatus
+    last_event_id: uuid.UUID | None = None
+    normalized_reason: str | None = Field(default=None, max_length=MAX_PIPELINE_REASON_LENGTH)
+    last_error_text: str | None = Field(default=None, max_length=MAX_PIPELINE_ERROR_LENGTH)
+    last_success_at: datetime | None = None
+    last_attempt_at: datetime | None = None
+    attempt_count: StrictInt = Field(ge=0)
+    last_preview: ContentPipelineSyncTargetPreview | None = None
+
+
+class ContentPipelineSyncReplayTarget(BaseModel):
+    """Request schema for the per-target replay routes introduced in T02/T03.
+
+    T01 locks this schema so the replay routes and batch endpoint can rely on a
+    single durable request shape. Exactly one target is replayed per call so
+    Qdrant and Meilisearch failures can be diagnosed independently.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    target: SyncTargetKind
+
+
 class ContentPipelineItemDetail(ContentPipelineItemRead):
     """Enriched detail projection extending the S01 item read.
 
@@ -284,7 +341,7 @@ class ContentPipelineItemDetail(ContentPipelineItemRead):
     underlying audit state, the projection is ``None`` or an empty collection.
     This preserves the byte-for-byte S01 ``ContentPipelineItemRead`` contract
     while giving operators first-class visibility into OCR, merge,
-    classification, and ``meme_ready`` truth.
+    classification, ``meme_ready`` truth, and the per-target sync state.
     """
 
     ocr: ContentPipelineOCRDetail | None = None
@@ -294,6 +351,7 @@ class ContentPipelineItemDetail(ContentPipelineItemRead):
     )
     canonical: ContentPipelineCanonicalContext | None = None
     ready_event: ContentPipelineReadyEventSummary | None = None
+    sync_targets: dict[SyncTargetKind, PerTargetSyncStatus] = Field(default_factory=dict)
 
 
 class ContentPipelineReplayRequest(BaseModel):
@@ -415,6 +473,8 @@ __all__ = [
     "ContentPipelineRunSummary",
     "ContentPipelineStageJournalRead",
     "ContentPipelineStageTimings",
+    "ContentPipelineSyncReplayTarget",
+    "ContentPipelineSyncTargetPreview",
     "ContentPipelineUploadMetadata",
     "ContentPipelineUploadRead",
     "MAX_OBJECT_KEY_LENGTH",
@@ -422,4 +482,5 @@ __all__ = [
     "MAX_PIPELINE_REASON_LENGTH",
     "MAX_POST_ID_LENGTH",
     "MAX_SOURCE_ID_LENGTH",
+    "PerTargetSyncStatus",
 ]

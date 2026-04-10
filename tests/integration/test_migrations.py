@@ -35,6 +35,7 @@ EXPECTED_TABLES = {
     "embedding_cache",
     "inline_usage_events",
     "meme_file_ocr_results",
+    "meme_file_sync_target_snapshots",
     "meme_files",
     "meme_merge_logs",
     "meme_popularity_snapshots",
@@ -228,9 +229,9 @@ def test_initial_revision_metadata_is_present() -> None:
     revision = script_directory.get_revision("head")
 
     assert revision is not None
-    assert revision.revision == "0004"
-    assert revision.down_revision == "0003"
-    assert revision.doc == "pipeline heavy contracts"
+    assert revision.revision == "0005"
+    assert revision.down_revision == "0004"
+    assert revision.doc == "sync target truth"
 
 
 async def test_upgrade_head_creates_expected_schema_and_constraints(
@@ -243,7 +244,7 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
 
     table_names = await _get_table_names(engine)
     assert table_names == EXPECTED_TABLES | {"alembic_version"}
-    assert await _get_current_revision(engine) == "0004"
+    assert await _get_current_revision(engine) == "0005"
 
     users_indexes = await _get_index_definitions(engine, "users")
     collections_indexes = await _get_index_definitions(engine, "collections")
@@ -401,6 +402,63 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
     assert "ix_telegram_link_codes_redeemed_by_telegram_id_redeemed_at" in telegram_link_indexes
 
 
+async def test_sync_target_snapshots_schema_is_created_with_expected_shape(
+    migrated_database: tuple[AsyncEngine, str],
+) -> None:
+    engine, database_url = migrated_database
+    config = _build_alembic_config(database_url)
+
+    await _run_alembic_command(command.upgrade, config, "head")
+
+    snapshot_indexes = await _get_index_definitions(engine, "meme_file_sync_target_snapshots")
+    snapshot_columns = await _get_column_names(engine, "meme_file_sync_target_snapshots")
+
+    assert snapshot_columns == {
+        "attempt_count",
+        "created_at",
+        "id",
+        "last_attempt_at",
+        "last_error_text",
+        "last_event_id",
+        "last_payload_preview",
+        "last_success_at",
+        "meme_file_id",
+        "normalized_reason",
+        "status",
+        "sync_target",
+        "updated_at",
+    }
+    assert "uq_meme_file_sync_target_snapshots_meme_file_id_sync_target" in snapshot_indexes
+    unique_index_definition = snapshot_indexes[
+        "uq_meme_file_sync_target_snapshots_meme_file_id_sync_target"
+    ]
+    assert "meme_file_id" in unique_index_definition
+    assert "sync_target" in unique_index_definition
+    assert "UNIQUE" in unique_index_definition.upper()
+    assert "ix_meme_file_sync_target_snapshots_target_updated_at" in snapshot_indexes
+    target_updated_index_definition = snapshot_indexes[
+        "ix_meme_file_sync_target_snapshots_target_updated_at"
+    ]
+    assert "sync_target" in target_updated_index_definition
+    assert "updated_at" in target_updated_index_definition
+
+
+async def test_downgrade_0005_removes_sync_target_snapshots_table(
+    migrated_database: tuple[AsyncEngine, str],
+) -> None:
+    engine, database_url = migrated_database
+    config = _build_alembic_config(database_url)
+
+    await _run_alembic_command(command.upgrade, config, "head")
+    assert "meme_file_sync_target_snapshots" in await _get_table_names(engine)
+
+    await _run_alembic_command(command.downgrade, config, "0004")
+
+    remaining_tables = await _get_table_names(engine)
+    assert "meme_file_sync_target_snapshots" not in remaining_tables
+    assert await _get_current_revision(engine) == "0004"
+
+
 async def test_downgrade_base_reverses_the_schema_cleanly(
     migrated_database: tuple[AsyncEngine, str],
 ) -> None:
@@ -424,7 +482,7 @@ async def test_repeated_fresh_database_upgrades_work_after_a_full_downgrade(
     await _run_alembic_command(command.downgrade, config, "base")
     await _run_alembic_command(command.upgrade, config, "head")
 
-    assert await _get_current_revision(engine) == "0004"
+    assert await _get_current_revision(engine) == "0005"
     assert EXPECTED_TABLES.issubset(await _get_table_names(engine))
 
 
