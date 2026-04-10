@@ -14,6 +14,7 @@ from faststream import AckPolicy
 from faststream.rabbit import ExchangeType, RabbitBroker, RabbitExchange, RabbitQueue
 from faststream.rabbit.annotations import RabbitMessage
 from pydantic import ValidationError
+from sqlalchemy import select
 
 from memexpert.core.broker import PipelineBrokerSettings, get_pipeline_broker, get_pipeline_broker_settings
 from memexpert.core.classification import (
@@ -40,10 +41,17 @@ from memexpert.core.ocr import (
 )
 from memexpert.core.qdrant import (
     PipelineQdrantClient,
+    PipelineQdrantSyncClient,
     QdrantMalformedResponseError,
     QdrantProviderUnavailableError,
     QdrantSimilarityClientProtocol,
     QdrantSimilarityError,
+    QdrantSyncClientProtocol,
+    QdrantSyncConflictError,
+    QdrantSyncMalformedResponseError,
+    QdrantSyncPayload,
+    QdrantSyncProviderUnavailableError,
+    QdrantSyncTimeoutError,
     QdrantTimeoutError,
 )
 from memexpert.core.storage import (
@@ -60,9 +68,15 @@ from memexpert.core.voyage import (
     VoyageProviderUnavailableError,
     VoyageTimeoutError,
 )
-from memexpert.models.enums import ContentPipelineStage
+from memexpert.models.content import EmbeddingCache, Meme, MemeFile, MemeFileOCRResult
+from memexpert.models.enums import ContentPipelineStage, EmbeddingInputType
 from memexpert.schemas.content_pipeline import ContentPipelineDispatchEvent
-from memexpert.services import ContentPipelineService, PipelineIngestError, PipelineMergeTransactionError
+from memexpert.services import (
+    ContentPipelineService,
+    PipelineIngestError,
+    PipelineMergeTransactionError,
+    PipelinePublishError,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -89,6 +103,7 @@ PIPELINE_REASON_EMBED_SIMILARITY_TIMEOUT = "embed_similarity_timeout"
 PIPELINE_REASON_EMBED_TIMEOUT = "embed_timeout"
 PIPELINE_REASON_FORCED_CLASSIFY_FAILURE = "forced_classify_failure"
 PIPELINE_REASON_FORCED_EMBED_FAILURE = "forced_embed_failure"
+PIPELINE_REASON_FORCED_SYNC_QDRANT_FAILURE = "forced_sync_qdrant_failure"
 PIPELINE_REASON_FORCED_TRANSCODE_FAILURE = "forced_transcode_failure"
 PIPELINE_REASON_MALFORMED_EVENT = "malformed_dispatch_event"
 PIPELINE_REASON_OCR_FAILED = "ocr_stage_failed"
@@ -155,6 +170,18 @@ class ForcedClassifyFailure(RuntimeError):
     """Raised when the dev/test-only failure-injection knob forces one classify attempt to fail."""
 
 
+class ForcedSyncQdrantFailure(RuntimeError):
+    """Raised when the dev/test-only failure-injection knob forces one sync_qdrant attempt to fail."""
+
+
+@dataclass(slots=True)
+class SyncQdrantInputs:
+    """Compact bundle of the canonical state the sync_qdrant stage needs per attempt."""
+
+    payload: QdrantSyncPayload
+    vector: tuple[float, ...]
+
+
 @dataclass(slots=True)
 class PipelineRuntime:
     """RabbitMQ-backed runtime that consumes the real heavy-worker pipeline stages."""
@@ -170,16 +197,19 @@ class PipelineRuntime:
     ocr_queue: RabbitQueue
     embed_queue: RabbitQueue
     classify_queue: RabbitQueue
+    sync_qdrant_queue: RabbitQueue
     transcode_retry_queue: RabbitQueue
     ocr_retry_queue: RabbitQueue
     embed_retry_queue: RabbitQueue
     classify_retry_queue: RabbitQueue
+    sync_qdrant_retry_queue: RabbitQueue
     dead_letter_queue: RabbitQueue
     storage_client: ObjectStorageClientLike
     media_processor: PipelineMediaProcessorProtocol
     ocr_processor: OCRProcessorProtocol
     voyage_client: VoyageClientProtocol
     qdrant_client: QdrantSimilarityClientProtocol
+    qdrant_sync_client: QdrantSyncClientProtocol
     classification_client: ClassificationClientProtocol
 
     async def declare_topology(self) -> None:
@@ -192,10 +222,12 @@ class PipelineRuntime:
         ocr_queue = await self.broker.declare_queue(self.ocr_queue)
         embed_queue = await self.broker.declare_queue(self.embed_queue)
         classify_queue = await self.broker.declare_queue(self.classify_queue)
+        sync_qdrant_queue = await self.broker.declare_queue(self.sync_qdrant_queue)
         transcode_retry_queue = await self.broker.declare_queue(self.transcode_retry_queue)
         ocr_retry_queue = await self.broker.declare_queue(self.ocr_retry_queue)
         embed_retry_queue = await self.broker.declare_queue(self.embed_retry_queue)
         classify_retry_queue = await self.broker.declare_queue(self.classify_retry_queue)
+        sync_qdrant_retry_queue = await self.broker.declare_queue(self.sync_qdrant_retry_queue)
         dead_letter_queue = await self.broker.declare_queue(self.dead_letter_queue)
 
         embed_retry_return_routing_key = self.broker_settings.retry_return_routing_key_for_stage(
@@ -210,6 +242,12 @@ class PipelineRuntime:
         classify_retry_request_routing_key = self.broker_settings.retry_queue_routing_key_for_stage(
             ContentPipelineStage.CLASSIFY,
         )
+        sync_qdrant_retry_return_routing_key = self.broker_settings.retry_return_routing_key_for_stage(
+            ContentPipelineStage.SYNC_QDRANT,
+        )
+        sync_qdrant_retry_request_routing_key = self.broker_settings.retry_queue_routing_key_for_stage(
+            ContentPipelineStage.SYNC_QDRANT,
+        )
 
         _ = await transcode_queue.bind(exchange, routing_key=self.broker_settings.meme_created_routing_key)
         _ = await transcode_queue.bind(exchange, routing_key=self.broker_settings.stage_replay_routing_key)
@@ -220,10 +258,13 @@ class PipelineRuntime:
         _ = await embed_queue.bind(exchange, routing_key=embed_retry_return_routing_key)
         _ = await classify_queue.bind(exchange, routing_key=self.broker_settings.classify_routing_key)
         _ = await classify_queue.bind(exchange, routing_key=classify_retry_return_routing_key)
+        _ = await sync_qdrant_queue.bind(exchange, routing_key=self.broker_settings.sync_qdrant_routing_key)
+        _ = await sync_qdrant_queue.bind(exchange, routing_key=sync_qdrant_retry_return_routing_key)
         _ = await transcode_retry_queue.bind(retry_exchange, routing_key=self.broker_settings.retry_routing_key)
         _ = await ocr_retry_queue.bind(retry_exchange, routing_key=self.broker_settings.ocr_retry_request_routing_key)
         _ = await embed_retry_queue.bind(retry_exchange, routing_key=embed_retry_request_routing_key)
         _ = await classify_retry_queue.bind(retry_exchange, routing_key=classify_retry_request_routing_key)
+        _ = await sync_qdrant_retry_queue.bind(retry_exchange, routing_key=sync_qdrant_retry_request_routing_key)
         _ = await dead_letter_queue.bind(
             dead_letter_exchange,
             routing_key=self.broker_settings.dead_letter_routing_key,
@@ -263,6 +304,15 @@ class PipelineRuntime:
             payload=payload,
             message=message,
             expected_stage=ContentPipelineStage.CLASSIFY,
+        )
+
+    async def handle_sync_qdrant_message(self, payload: object, message: RabbitMessageLike) -> None:
+        """Consume one sync_qdrant-stage dispatch, persisting per-target sync truth."""
+
+        await self._handle_stage_message(
+            payload=payload,
+            message=message,
+            expected_stage=ContentPipelineStage.SYNC_QDRANT,
         )
 
     async def _handle_stage_message(
@@ -378,6 +428,14 @@ class PipelineRuntime:
                 attempt=attempt,
             )
             return
+        if dispatch_event.stage is ContentPipelineStage.SYNC_QDRANT:
+            self._maybe_force_sync_qdrant_failure(dispatch_event)
+            await self._run_sync_qdrant_stage(
+                dispatch_event=dispatch_event,
+                stage_context=stage_context,
+                attempt=attempt,
+            )
+            return
         raise PipelineIngestError(
             f"Pipeline runtime cannot execute work for stage {dispatch_event.stage.value!r}.",
         )
@@ -482,6 +540,88 @@ class PipelineRuntime:
             embedding_result=embedding_result,
             similarity_matches=similarity_matches,
         )
+
+    async def _run_sync_qdrant_stage(
+        self,
+        *,
+        dispatch_event: ContentPipelineDispatchEvent,
+        stage_context: PipelineStageWorkContext,
+        attempt: int,
+    ) -> None:
+        """Load canonical state, upsert to Qdrant, and record per-target sync truth.
+
+        Failures from the adapter bubble up so ``_handle_stage_message`` can
+        run the shared normalize-and-classify path; before re-raising, we
+        always call :meth:`ContentPipelineService.fail_sync_qdrant_stage` so
+        the per-target snapshot row stays truthful even when the stage-journal
+        path is about to dead-letter.
+        """
+
+        try:
+            sync_inputs = await self._load_sync_qdrant_inputs(dispatch_event.meme_file_id)
+        except Exception:
+            await self._record_sync_qdrant_failure(
+                dispatch_event=dispatch_event,
+                attempt=attempt,
+                exc=PipelineIngestError(
+                    f"Canonical state for {dispatch_event.meme_file_id} "
+                    f"is missing or unreadable for sync_qdrant.",
+                ),
+            )
+            raise
+
+        try:
+            await self.qdrant_sync_client.upsert_meme_point(
+                payload=sync_inputs.payload,
+                vector=sync_inputs.vector,
+            )
+        except Exception as exc:
+            await self._record_sync_qdrant_failure(
+                dispatch_event=dispatch_event,
+                attempt=attempt,
+                exc=exc,
+            )
+            raise
+
+        # Best-effort preview refresh — if the post-upsert read fails we log
+        # and proceed: the sync itself already succeeded and the snapshot row
+        # must reflect that. Callers see ``last_preview=None`` until the next
+        # successful sync.
+        preview_payload: dict[str, object] = {}
+        try:
+            fetched_preview = await self.qdrant_sync_client.fetch_meme_point(dispatch_event.meme_file_id)
+        except Exception as exc:  # noqa: BLE001 - best-effort, any failure degrades to empty preview.
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "qdrant sync preview fetch failed for %s: %s",
+                dispatch_event.meme_file_id,
+                exc,
+            )
+            fetched_preview = None
+
+        if fetched_preview is not None:
+            preview_payload = dict(fetched_preview.preview_fields)
+
+        try:
+            await self._complete_sync_qdrant_stage(
+                meme_file_id=dispatch_event.meme_file_id,
+                attempt=attempt,
+                event_id=dispatch_event.event_id,
+                payload_preview=preview_payload,
+            )
+        except PipelinePublishError:
+            # Publish failure of the MEME_QDRANT_SYNCED notification is
+            # classified and re-raised so the standard dispatcher records a
+            # publish_failed stage reason and keeps the stage replayable.
+            raise
+        except Exception as exc:
+            await self._record_sync_qdrant_failure(
+                dispatch_event=dispatch_event,
+                attempt=attempt,
+                exc=exc,
+            )
+            raise
 
     async def _run_classify_stage(
         self,
@@ -607,6 +747,105 @@ class PipelineRuntime:
                 classification_result=classification_result,
             )
 
+    async def _complete_sync_qdrant_stage(
+        self,
+        *,
+        meme_file_id: uuid.UUID,
+        attempt: int,
+        event_id: uuid.UUID,
+        payload_preview: dict[str, object],
+    ) -> None:
+        async with self.session_factory() as session:
+            service = self._build_service(session)
+            _ = await service.complete_sync_qdrant_stage(
+                meme_file_id=meme_file_id,
+                attempt=attempt,
+                event_id=event_id,
+                payload_preview=payload_preview,
+            )
+
+    async def _load_sync_qdrant_inputs(
+        self,
+        meme_file_id: uuid.UUID,
+    ) -> SyncQdrantInputs:
+        """Load canonical meme + embedding vector + primary-file OCR text for sync_qdrant."""
+
+        async with self.session_factory() as session:
+            meme_file = await session.scalar(select(MemeFile).where(MemeFile.id == meme_file_id))
+            if meme_file is None:
+                raise PipelineIngestError(
+                    f"Sync_qdrant consumer could not find meme file {meme_file_id}.",
+                )
+            canonical_meme = await session.scalar(select(Meme).where(Meme.id == meme_file.meme_id))
+            if canonical_meme is None:
+                raise PipelineIngestError(
+                    f"Sync_qdrant consumer could not find canonical meme {meme_file.meme_id}.",
+                )
+            cache_row = await session.scalar(
+                select(EmbeddingCache)
+                .where(
+                    EmbeddingCache.source_file_id == meme_file_id,
+                    EmbeddingCache.input_type == EmbeddingInputType.IMAGE,
+                )
+                .order_by(EmbeddingCache.created_at.desc())
+                .limit(1)
+            )
+            if cache_row is None:
+                raise PipelineIngestError(
+                    f"Sync_qdrant consumer could not find an embedding cache row for {meme_file_id}.",
+                )
+            ocr_row = await session.scalar(
+                select(MemeFileOCRResult).where(MemeFileOCRResult.meme_file_id == meme_file_id)
+            )
+
+        from memexpert.core.voyage import decode_embedding_bytes
+
+        vector = decode_embedding_bytes(
+            cache_row.embedding,
+            dimensions=self.settings.pipeline_voyage_output_dimensions,
+        )
+        ocr_snippet = ocr_row.extracted_text if ocr_row is not None else canonical_meme.ocr_text
+        payload = QdrantSyncPayload(
+            meme_id=canonical_meme.id,
+            meme_file_id=meme_file_id,
+            language=canonical_meme.language.value,
+            is_nsfw=canonical_meme.is_nsfw,
+            tags=list(canonical_meme.tags),
+            ocr_snippet=ocr_snippet,
+            quality_score=meme_file.quality_score,
+            source_object_key=meme_file.s3_original_key,
+        )
+        return SyncQdrantInputs(payload=payload, vector=vector)
+
+    async def _record_sync_qdrant_failure(
+        self,
+        *,
+        dispatch_event: ContentPipelineDispatchEvent,
+        attempt: int,
+        exc: Exception,
+    ) -> None:
+        """Mark the per-target snapshot row as failed before re-raising to the dispatcher.
+
+        The runtime's ``_handle_stage_message`` already records the stage-row
+        failure via ``mark_stage_failed``; this helper adds the per-target
+        snapshot row so operators see the sync truth alongside the journal.
+        """
+
+        normalized_reason = self._normalize_failure_reason(ContentPipelineStage.SYNC_QDRANT, exc)
+        last_error_text = self._render_error_text(exc)
+        try:
+            async with self.session_factory() as session:
+                service = self._build_service(session)
+                _ = await service.fail_sync_qdrant_stage(
+                    meme_file_id=dispatch_event.meme_file_id,
+                    attempt=attempt,
+                    event_id=dispatch_event.event_id,
+                    normalized_reason=normalized_reason,
+                    last_error_text=last_error_text,
+                )
+        except Exception:  # noqa: BLE001 - snapshot upsert is best-effort before re-raise.
+            return
+
     async def _mark_stage_failed(
         self,
         *,
@@ -680,6 +919,16 @@ class PipelineRuntime:
                 "Forced classify failure requested by pipeline_worker_fail_classify_for_meme_file_id.",
             )
 
+    def _maybe_force_sync_qdrant_failure(self, dispatch_event: ContentPipelineDispatchEvent) -> None:
+        forced_target = self.settings.pipeline_worker_fail_sync_qdrant_for_meme_file_id
+        if forced_target is None:
+            return
+        if forced_target == str(dispatch_event.meme_file_id):
+            raise ForcedSyncQdrantFailure(
+                "Forced sync_qdrant failure requested by "
+                "pipeline_worker_fail_sync_qdrant_for_meme_file_id.",
+            )
+
     @staticmethod
     def _validate_event_payload(payload: object) -> ContentPipelineDispatchEvent | None:
         try:
@@ -704,6 +953,8 @@ class PipelineRuntime:
             return self.embed_retry_queue.name
         if stage is ContentPipelineStage.CLASSIFY:
             return self.classify_retry_queue.name
+        if stage is ContentPipelineStage.SYNC_QDRANT:
+            return self.sync_qdrant_retry_queue.name
         return None
 
     def _retry_cycle_count(self, stage: ContentPipelineStage, headers: dict[str, Any]) -> int:
@@ -858,6 +1109,19 @@ class PipelineRuntime:
                 return PIPELINE_REASON_CLASSIFY_MALFORMED
             return PIPELINE_REASON_CLASSIFY_FAILED
 
+        if stage is ContentPipelineStage.SYNC_QDRANT:
+            if isinstance(exc, ForcedSyncQdrantFailure):
+                return PIPELINE_REASON_FORCED_SYNC_QDRANT_FAILURE
+            if isinstance(exc, QdrantSyncTimeoutError):
+                return PIPELINE_REASON_SYNC_QDRANT_TIMEOUT
+            if isinstance(exc, QdrantSyncConflictError):
+                return PIPELINE_REASON_SYNC_QDRANT_CONFLICT
+            if isinstance(exc, QdrantSyncMalformedResponseError):
+                return PIPELINE_REASON_SYNC_QDRANT_MALFORMED_PAYLOAD
+            if isinstance(exc, QdrantSyncProviderUnavailableError):
+                return PIPELINE_REASON_SYNC_QDRANT_PROVIDER_BLOCKED
+            return PIPELINE_REASON_SYNC_QDRANT_PROVIDER_BLOCKED
+
         return PIPELINE_REASON_OCR_FAILED
 
     @staticmethod
@@ -877,6 +1141,14 @@ class PipelineRuntime:
                 (VoyageMalformedResponseError, QdrantMalformedResponseError, PipelineIngestError),
             )
         if stage is ContentPipelineStage.CLASSIFY:
+            return not isinstance(exc, PipelineIngestError)
+        if stage is ContentPipelineStage.SYNC_QDRANT:
+            # Malformed sync responses are terminal (dead-letter); timeout,
+            # provider-unavailable, and 409 conflicts are transient and
+            # replayable — including forced-failure injection so the dev
+            # knob exercises the full retry path.
+            if isinstance(exc, QdrantSyncMalformedResponseError):
+                return False
             return not isinstance(exc, PipelineIngestError)
         return not isinstance(exc, PipelineIngestError)
 
@@ -994,6 +1266,7 @@ def build_pipeline_runtime(
     ocr_processor: OCRProcessorProtocol | None = None,
     voyage_client: VoyageClientProtocol | None = None,
     qdrant_client: QdrantSimilarityClientProtocol | None = None,
+    qdrant_sync_client: QdrantSyncClientProtocol | None = None,
     classification_client: ClassificationClientProtocol | None = None,
 ) -> PipelineRuntime:
     """Build the RabbitMQ heavy-worker runtime and register its FastStream subscribers."""
@@ -1010,6 +1283,7 @@ def build_pipeline_runtime(
     )
     resolved_voyage_client = voyage_client or PipelineVoyageClient(settings=resolved_settings)
     resolved_qdrant_client = qdrant_client or PipelineQdrantClient(settings=resolved_settings)
+    resolved_qdrant_sync_client = qdrant_sync_client or PipelineQdrantSyncClient(settings=resolved_settings)
     resolved_classification_client = classification_client or PipelineClassificationClient(
         settings=resolved_settings,
     )
@@ -1017,17 +1291,24 @@ def build_pipeline_runtime(
     ocr_retry_queue_name = f"{resolved_broker_settings.ocr_queue}.retry"
     embed_retry_queue_name = f"{resolved_broker_settings.embed_queue}.retry"
     classify_retry_queue_name = f"{resolved_broker_settings.classify_queue}.retry"
+    sync_qdrant_retry_queue_name = f"{resolved_broker_settings.sync_qdrant_queue}.retry"
     embed_retry_request_routing_key = resolved_broker_settings.retry_queue_routing_key_for_stage(
         ContentPipelineStage.EMBED,
     )
     classify_retry_request_routing_key = resolved_broker_settings.retry_queue_routing_key_for_stage(
         ContentPipelineStage.CLASSIFY,
     )
+    sync_qdrant_retry_request_routing_key = resolved_broker_settings.retry_queue_routing_key_for_stage(
+        ContentPipelineStage.SYNC_QDRANT,
+    )
     embed_retry_return_routing_key = resolved_broker_settings.retry_return_routing_key_for_stage(
         ContentPipelineStage.EMBED,
     )
     classify_retry_return_routing_key = resolved_broker_settings.retry_return_routing_key_for_stage(
         ContentPipelineStage.CLASSIFY,
+    )
+    sync_qdrant_retry_return_routing_key = resolved_broker_settings.retry_return_routing_key_for_stage(
+        ContentPipelineStage.SYNC_QDRANT,
     )
 
     runtime = PipelineRuntime(
@@ -1062,6 +1343,12 @@ def build_pipeline_runtime(
             retry_request_routing_key=classify_retry_request_routing_key,
             retry_exchange=resolved_broker_settings.retry_exchange,
         ),
+        sync_qdrant_queue=_build_stage_queue(
+            queue_name=resolved_broker_settings.sync_qdrant_queue,
+            routing_key=resolved_broker_settings.sync_qdrant_routing_key,
+            retry_request_routing_key=sync_qdrant_retry_request_routing_key,
+            retry_exchange=resolved_broker_settings.retry_exchange,
+        ),
         transcode_retry_queue=_build_retry_queue(
             queue_name=transcode_retry_queue_name,
             retry_backoff_milliseconds=resolved_broker_settings.retry_backoff_milliseconds,
@@ -1086,12 +1373,19 @@ def build_pipeline_runtime(
             exchange=resolved_broker_settings.exchange,
             retry_return_routing_key=classify_retry_return_routing_key,
         ),
+        sync_qdrant_retry_queue=_build_retry_queue(
+            queue_name=sync_qdrant_retry_queue_name,
+            retry_backoff_milliseconds=resolved_broker_settings.retry_backoff_milliseconds,
+            exchange=resolved_broker_settings.exchange,
+            retry_return_routing_key=sync_qdrant_retry_return_routing_key,
+        ),
         dead_letter_queue=_build_dead_letter_queue(resolved_broker_settings),
         storage_client=resolved_storage_client,
         media_processor=resolved_media_processor,
         ocr_processor=resolved_ocr_processor,
         voyage_client=resolved_voyage_client,
         qdrant_client=resolved_qdrant_client,
+        qdrant_sync_client=resolved_qdrant_sync_client,
         classification_client=resolved_classification_client,
     )
 
@@ -1131,6 +1425,15 @@ def build_pipeline_runtime(
         rabbit_message = cast("RabbitMessageLike", cast("object", message))
         await runtime.handle_classify_message(payload, rabbit_message)
 
+    @resolved_broker.subscriber(
+        runtime.sync_qdrant_queue,
+        runtime.pipeline_exchange,
+        ack_policy=AckPolicy.MANUAL,
+    )
+    async def _consume_sync_qdrant(payload: object, message: RabbitMessage) -> None:
+        rabbit_message = cast("RabbitMessageLike", cast("object", message))
+        await runtime.handle_sync_qdrant_message(payload, rabbit_message)
+
     return runtime
 
 
@@ -1153,20 +1456,27 @@ __all__ = [
     "PIPELINE_REASON_EMBED_TIMEOUT",
     "PIPELINE_REASON_FORCED_CLASSIFY_FAILURE",
     "PIPELINE_REASON_FORCED_EMBED_FAILURE",
+    "PIPELINE_REASON_FORCED_SYNC_QDRANT_FAILURE",
     "PIPELINE_REASON_FORCED_TRANSCODE_FAILURE",
     "PIPELINE_REASON_MALFORMED_EVENT",
     "PIPELINE_REASON_OCR_FAILED",
     "PIPELINE_REASON_OCR_PROVIDER_BLOCKED",
     "PIPELINE_REASON_OCR_TIMEOUT",
+    "PIPELINE_REASON_SYNC_QDRANT_CONFLICT",
+    "PIPELINE_REASON_SYNC_QDRANT_MALFORMED_PAYLOAD",
+    "PIPELINE_REASON_SYNC_QDRANT_PROVIDER_BLOCKED",
+    "PIPELINE_REASON_SYNC_QDRANT_TIMEOUT",
     "PIPELINE_REASON_TRANSCODE_FAILED",
     "PIPELINE_REASON_TRANSCODE_INVALID_MEDIA",
     "PIPELINE_REASON_TRANSCODE_TIMEOUT",
     "PIPELINE_REASON_UNSUPPORTED_STAGE",
     "ForcedClassifyFailure",
     "ForcedEmbedFailure",
+    "ForcedSyncQdrantFailure",
     "ForcedTranscodeFailure",
     "PipelineRuntime",
     "RabbitMessageLike",
+    "SyncQdrantInputs",
     "build_pipeline_runtime",
     "run_pipeline_runtime",
 ]

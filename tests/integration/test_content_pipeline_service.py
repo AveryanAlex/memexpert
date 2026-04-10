@@ -1442,9 +1442,11 @@ async def _drive_to_classify_succeeded(
     return meme_file_id, service
 
 
-async def test_sync_stub_methods_raise_not_implemented_error(
+async def test_meili_sync_stub_methods_still_raise_not_implemented_error(
     migrated_db_session: AsyncSession,
 ) -> None:
+    """T02 implemented the Qdrant path, but the Meilisearch stubs are still locked for T03."""
+
     meme_file_id, service = await _drive_to_classify_succeeded(
         migrated_db_session,
         source_id="stub-not-impl",
@@ -1453,21 +1455,6 @@ async def test_sync_stub_methods_raise_not_implemented_error(
         input_hash_seed="9",
     )
 
-    with pytest.raises(NotImplementedError, match="T02/T03 implement this method"):
-        _ = await service.complete_sync_qdrant_stage(
-            meme_file_id=meme_file_id,
-            attempt=1,
-            event_id=uuid.uuid7(),
-            payload_preview={},
-        )
-    with pytest.raises(NotImplementedError, match="T02/T03 implement this method"):
-        _ = await service.fail_sync_qdrant_stage(
-            meme_file_id=meme_file_id,
-            attempt=1,
-            event_id=uuid.uuid7(),
-            normalized_reason="sync_qdrant_timeout",
-            last_error_text="boom",
-        )
     with pytest.raises(NotImplementedError, match="T02/T03 implement this method"):
         _ = await service.complete_sync_meili_stage(
             meme_file_id=meme_file_id,
@@ -1502,9 +1489,11 @@ async def test_replay_sync_target_rejects_items_without_classify_success(
         _ = await service.replay_sync_target_batch([meme_file_id], SyncTargetKind.MEILISEARCH)
 
 
-async def test_replay_sync_target_stub_raises_not_implemented_after_classify_success(
+async def test_replay_sync_target_meili_stub_still_raises_not_implemented_after_classify_success(
     migrated_db_session: AsyncSession,
 ) -> None:
+    """T02 wired the Qdrant replay path; Meilisearch replay is still stubbed for T03."""
+
     meme_file_id, service = await _drive_to_classify_succeeded(
         migrated_db_session,
         source_id="replay-stub",
@@ -1513,9 +1502,9 @@ async def test_replay_sync_target_stub_raises_not_implemented_after_classify_suc
         input_hash_seed="a",
     )
 
-    with pytest.raises(NotImplementedError, match="T02/T03 implement this method"):
-        _ = await service.replay_sync_target(meme_file_id, SyncTargetKind.QDRANT)
-    with pytest.raises(NotImplementedError, match="T02/T03 implement this method"):
+    with pytest.raises(NotImplementedError, match="T03 implements Meilisearch sync replay"):
+        _ = await service.replay_sync_target(meme_file_id, SyncTargetKind.MEILISEARCH)
+    with pytest.raises(NotImplementedError, match="T03 implements Meilisearch sync replay"):
         _ = await service.replay_sync_target_batch(
             [meme_file_id],
             SyncTargetKind.MEILISEARCH,
@@ -1538,6 +1527,172 @@ async def test_replay_sync_target_batch_refuses_batches_beyond_the_max(
 
     with pytest.raises(PipelineReplayNotAllowedError, match="exceeds the configured maximum"):
         _ = await service.replay_sync_target_batch(oversized_batch, SyncTargetKind.QDRANT)
+
+
+async def test_complete_sync_qdrant_stage_persists_snapshot_and_is_idempotent(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A successful Qdrant sync must upsert the snapshot row AND re-run as a no-op."""
+
+    meme_file_id, service = await _drive_to_classify_succeeded(
+        migrated_db_session,
+        source_id="sync-qdrant-happy",
+        post_id="9960",
+        phash_tag="q",
+        input_hash_seed="q",
+    )
+    event_id = uuid.uuid7()
+    preview = {"point_id": str(meme_file_id), "is_nsfw": False, "tags": []}
+
+    first = await service.complete_sync_qdrant_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=event_id,
+        payload_preview=preview,
+    )
+    assert first.status is SyncTargetStatus.SYNCED
+    assert first.attempt_count == 1
+    assert first.last_success_at is not None
+    assert first.last_preview is not None
+    assert first.last_preview.preview_fields["point_id"] == str(meme_file_id)
+
+    # Re-running with the same event id must not bump attempts or reset
+    # last_success_at to a new timestamp — the publish path is idempotent.
+    async with postgres_session_factory() as replay_session:
+        replay_service = ContentPipelineService(
+            replay_session,
+            storage_client=FakeStorageClient(),
+            publisher=RecordingPublisher(),
+            media_processor=FakeMediaProcessor(
+                inspect_result=_make_distinct_upload_media_details(tag="q"),
+            ),
+        )
+        second = await replay_service.complete_sync_qdrant_stage(
+            meme_file_id=meme_file_id,
+            attempt=1,
+            event_id=event_id,
+            payload_preview=preview,
+        )
+    assert second.status is SyncTargetStatus.SYNCED
+    assert second.attempt_count == first.attempt_count  # no bump on idempotent replay.
+    assert second.last_event_id == event_id
+
+
+async def test_fail_sync_qdrant_stage_preserves_prior_success_timestamps(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A transient failure must not erase the last known good sync timestamp."""
+
+    meme_file_id, service = await _drive_to_classify_succeeded(
+        migrated_db_session,
+        source_id="sync-qdrant-preserve",
+        post_id="9961",
+        phash_tag="p",
+        input_hash_seed="p",
+    )
+    first_success_event = uuid.uuid7()
+    first = await service.complete_sync_qdrant_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=first_success_event,
+        payload_preview={"marker": "first"},
+    )
+    assert first.last_success_at is not None
+    first_success_at = first.last_success_at
+    first_preview = first.last_preview
+    assert first_preview is not None
+
+    # A replay is required so the stage row becomes failable again; reserve it
+    # through replay_sync_target so both the snapshot row and the journal row
+    # are in the right state for a transient failure.
+    async with postgres_session_factory() as replay_session:
+        replay_service = ContentPipelineService(
+            replay_session,
+            storage_client=FakeStorageClient(),
+            publisher=RecordingPublisher(),
+            media_processor=FakeMediaProcessor(
+                inspect_result=_make_distinct_upload_media_details(tag="p"),
+            ),
+        )
+        accepted = await replay_service.replay_sync_target(meme_file_id, SyncTargetKind.QDRANT)
+
+    async with postgres_session_factory() as fail_session:
+        fail_service = ContentPipelineService(
+            fail_session,
+            storage_client=FakeStorageClient(),
+            publisher=RecordingPublisher(),
+            media_processor=FakeMediaProcessor(
+                inspect_result=_make_distinct_upload_media_details(tag="p"),
+            ),
+        )
+        failure = await fail_service.fail_sync_qdrant_stage(
+            meme_file_id=meme_file_id,
+            attempt=accepted.attempt,
+            event_id=accepted.replay_event_id,
+            normalized_reason="sync_qdrant_timeout",
+            last_error_text="transient timeout",
+        )
+    assert failure.status is SyncTargetStatus.FAILED
+    assert failure.normalized_reason == "sync_qdrant_timeout"
+    # The last known good sync timestamp and preview must still be intact.
+    assert failure.last_success_at == first_success_at
+    assert failure.last_preview is not None
+    assert failure.last_preview.preview_fields["marker"] == "first"
+
+
+async def test_replay_sync_target_qdrant_leaves_meili_row_untouched(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A Qdrant-only sync replay must not touch the Meilisearch snapshot row."""
+
+    meme_file_id, service = await _drive_to_classify_succeeded(
+        migrated_db_session,
+        source_id="replay-isolation",
+        post_id="9962",
+        phash_tag="i",
+        input_hash_seed="i",
+    )
+
+    # Seed a meilisearch snapshot row so we can prove the replay does not
+    # mutate it. Populating it directly via the ORM is safe because T03 has
+    # not wired the real Meilisearch consumer yet.
+    from memexpert.models.base import utcnow as _utcnow
+
+    async with postgres_session_factory() as seed_session:
+        meili_row = MemeFileSyncTargetSnapshot(
+            meme_file_id=meme_file_id,
+            sync_target=SyncTargetKind.MEILISEARCH,
+            status=SyncTargetStatus.FAILED,
+            last_event_id=uuid.uuid7(),
+            normalized_reason="sync_meili_timeout",
+            last_error_text="pre-existing",
+            last_payload_preview={},
+            last_success_at=None,
+            last_attempt_at=_utcnow(),
+            attempt_count=2,
+        )
+        seed_session.add(meili_row)
+        await seed_session.commit()
+        meili_updated_at = meili_row.updated_at
+
+    accepted = await service.replay_sync_target(meme_file_id, SyncTargetKind.QDRANT)
+    assert accepted.stage is ContentPipelineStage.SYNC_QDRANT
+
+    async with postgres_session_factory() as verify_session:
+        surviving = await verify_session.scalar(
+            select(MemeFileSyncTargetSnapshot).where(
+                MemeFileSyncTargetSnapshot.meme_file_id == meme_file_id,
+                MemeFileSyncTargetSnapshot.sync_target == SyncTargetKind.MEILISEARCH,
+            )
+        )
+    assert surviving is not None
+    assert surviving.normalized_reason == "sync_meili_timeout"
+    assert surviving.last_error_text == "pre-existing"
+    assert surviving.attempt_count == 2
+    assert surviving.updated_at == meili_updated_at
 
 
 async def test_item_detail_projects_per_target_sync_status_from_snapshot_rows(

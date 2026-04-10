@@ -83,6 +83,30 @@ class PipelineBrokerSettings:
         return self.routing_key_for_stage(ContentPipelineStage.SYNC_MEILI)
 
     @property
+    def meme_qdrant_synced_routing_key(self) -> str:
+        """Return the routing key used for the ``meme_qdrant_synced`` success event.
+
+        This key is deliberately distinct from ``sync_qdrant_routing_key`` so
+        the sync_qdrant worker queue does not consume its own success
+        notifications. External observers (metrics, reporting dashboards) can
+        bind onto this key later; until then the event goes to the exchange
+        and is silently discarded by the topic router.
+        """
+
+        return f"{self.routing_key_prefix}.{ContentPipelineStage.SYNC_QDRANT.value}.succeeded"
+
+    @property
+    def meme_meili_synced_routing_key(self) -> str:
+        """Return the routing key used for the ``meme_meili_synced`` success event.
+
+        Mirrors :attr:`meme_qdrant_synced_routing_key` so T03 can publish its
+        Meilisearch success event without re-deriving the same naming
+        convention in another layer.
+        """
+
+        return f"{self.routing_key_prefix}.{ContentPipelineStage.SYNC_MEILI.value}.succeeded"
+
+    @property
     def meme_created_routing_key(self) -> str:
         """Return the routing key used for durable post-upload transcode dispatches."""
 
@@ -158,6 +182,10 @@ class PipelineBrokerSettings:
             return self.classify_routing_key
         if event_type is ContentPipelineEventType.MEME_READY:
             return self.sync_qdrant_routing_key
+        if event_type is ContentPipelineEventType.MEME_QDRANT_SYNCED:
+            return self.meme_qdrant_synced_routing_key
+        if event_type is ContentPipelineEventType.MEME_MEILI_SYNCED:
+            return self.meme_meili_synced_routing_key
         if event_type is ContentPipelineEventType.STAGE_REPLAY_REQUESTED:
             return self.stage_replay_routing_key
         return self.meme_created_routing_key

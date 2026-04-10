@@ -15,15 +15,17 @@ from memexpert.api.dependencies.pipeline import (
     require_pipeline_operator_token,
     to_pipeline_http_error,
 )
-from memexpert.models.enums import ContentPipelineStage, SourcePlatform
+from memexpert.models.enums import ContentPipelineStage, SourcePlatform, SyncTargetKind
 from memexpert.schemas.content_pipeline import (
     ContentPipelineItemDetail,
     ContentPipelineItemFilter,
     ContentPipelineItemRead,
     ContentPipelineReplayAccepted,
     ContentPipelineReplayRequest,
+    ContentPipelineSyncReplayBatchRequest,
     ContentPipelineUploadMetadata,
     ContentPipelineUploadRead,
+    PerTargetSyncStatus,
 )
 from memexpert.services import PipelinePayloadValidationError, PipelineServiceError
 
@@ -172,6 +174,81 @@ async def replay_pipeline_item(
         return await pipeline_service.replay_item(meme_file_id, stage=requested_stage)
     except PipelineServiceError as exc:
         raise to_pipeline_http_error(exc) from exc
+
+
+@router.get(
+    "/items/{meme_file_id}/sync/qdrant",
+    response_model=PerTargetSyncStatus,
+    responses=PIPELINE_ERROR_RESPONSES,
+    summary="Read the per-target Qdrant sync status for one pipeline item",
+)
+async def read_pipeline_item_qdrant_sync_status(
+    meme_file_id: Annotated[uuid.UUID, Path()],
+    pipeline_service: PipelineServiceDep,
+) -> PerTargetSyncStatus:
+    """Return the durable Qdrant sync snapshot row for one pipeline item.
+
+    Returns ``404`` when the item exists but has no Qdrant sync snapshot row
+    yet; operators must see the difference between "item missing" and "item
+    has never been synced to Qdrant".
+    """
+
+    try:
+        return await pipeline_service.get_sync_target_status(meme_file_id, SyncTargetKind.QDRANT)
+    except PipelineServiceError as exc:
+        raise to_pipeline_http_error(exc) from exc
+
+
+@router.post(
+    "/items/{meme_file_id}/sync/qdrant/replay",
+    response_model=ContentPipelineReplayAccepted,
+    responses=PIPELINE_ERROR_RESPONSES,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Replay the Qdrant sync stage for one pipeline item",
+)
+async def replay_pipeline_item_qdrant_sync(
+    meme_file_id: Annotated[uuid.UUID, Path()],
+    pipeline_service: PipelineServiceDep,
+) -> ContentPipelineReplayAccepted:
+    """Reserve and republish the Qdrant sync stage for one pipeline item.
+
+    The classify stage must have already succeeded for the item — otherwise
+    the per-target sync truth has no ready canonical state to advertise and
+    the service surface rejects the request with ``409``.
+    """
+
+    try:
+        return await pipeline_service.replay_sync_target(meme_file_id, SyncTargetKind.QDRANT)
+    except PipelineServiceError as exc:
+        raise to_pipeline_http_error(exc) from exc
+
+
+@router.post(
+    "/sync/qdrant/replay-batch",
+    response_model=list[ContentPipelineReplayAccepted],
+    responses=PIPELINE_ERROR_RESPONSES,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Replay the Qdrant sync stage for a bounded batch of pipeline items",
+)
+async def replay_pipeline_items_qdrant_sync_batch(
+    pipeline_service: PipelineServiceDep,
+    payload: Annotated[ContentPipelineSyncReplayBatchRequest, Body()],
+) -> list[ContentPipelineReplayAccepted]:
+    """Reserve and republish the Qdrant sync stage for every item in a bounded batch.
+
+    The service layer enforces the bounded batch size; the route just forwards
+    the caller payload without imposing its own cap so the enforcement stays
+    in one place.
+    """
+
+    try:
+        accepted = await pipeline_service.replay_sync_target_batch(
+            payload.meme_file_ids,
+            SyncTargetKind.QDRANT,
+        )
+    except PipelineServiceError as exc:
+        raise to_pipeline_http_error(exc) from exc
+    return list(accepted)
 
 
 __all__ = ["router"]

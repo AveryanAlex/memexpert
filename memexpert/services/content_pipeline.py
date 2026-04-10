@@ -40,6 +40,7 @@ from memexpert.models.enums import (
     ContentSourceKind,
     EmbeddingInputType,
     SyncTargetKind,
+    SyncTargetStatus,
 )
 from memexpert.schemas.content_pipeline import (
     MAX_PIPELINE_ERROR_LENGTH,
@@ -51,6 +52,7 @@ from memexpert.schemas.content_pipeline import (
     ContentPipelineItemRead,
     ContentPipelineReplayAccepted,
     ContentPipelineStageJournalRead,
+    ContentPipelineSyncTargetPreview,
     ContentPipelineUploadMetadata,
     ContentPipelineUploadRead,
     PerTargetSyncStatus,
@@ -110,6 +112,13 @@ SYNC_REPLAY_BATCH_MAX = 10
 # the sync truth table is independent from the stage journal and the reason
 # strings must not collide when operators filter either surface.
 PIPELINE_REASON_SYNC_REPLAY_REQUESTED = "sync_replay_requested"
+
+# Mirror of ``pipeline_runtime.PIPELINE_REASON_SYNC_QDRANT_MALFORMED_PAYLOAD``.
+# The service layer must never import from ``memexpert.workers`` because the
+# worker runtime already depends on the service; duplicating the constant here
+# with an explicit doc-comment is the narrowest way to share the one
+# terminal-failure reason the Qdrant sync surface knows about.
+_PIPELINE_REASON_SYNC_QDRANT_MALFORMED_PAYLOAD = "sync_qdrant_malformed_payload"
 
 
 class ObjectStorageClient(Protocol):
@@ -191,6 +200,14 @@ _NEXT_STAGE_BY_STAGE: dict[ContentPipelineStage, ContentPipelineStage] = {
     ContentPipelineStage.OCR: ContentPipelineStage.EMBED,
     ContentPipelineStage.EMBED: ContentPipelineStage.CLASSIFY,
     ContentPipelineStage.CLASSIFY: ContentPipelineStage.SYNC_QDRANT,
+}
+# Each per-target sync target maps onto exactly one durable stage row so the
+# replay surface can resolve the journal row for a given target without
+# walking the full journal list in service callers. T03 will populate the
+# Meilisearch mapping with the corresponding enum value.
+_SYNC_STAGE_BY_TARGET: dict[SyncTargetKind, ContentPipelineStage] = {
+    SyncTargetKind.QDRANT: ContentPipelineStage.SYNC_QDRANT,
+    SyncTargetKind.MEILISEARCH: ContentPipelineStage.SYNC_MEILI,
 }
 
 
@@ -627,16 +644,131 @@ class ContentPipelineService:
         event_id: uuid.UUID,
         payload_preview: dict[str, object],
     ) -> PerTargetSyncStatus:
-        """Persist a successful Qdrant sync attempt and return the per-target truth.
+        """Persist a successful Qdrant sync attempt and publish ``meme_qdrant_synced``.
 
-        T01 locks the signature so T02 can implement the Qdrant consumer without
-        any further contract work. Until T02 lands, calling this method raises
-        ``NotImplementedError`` — the contract is locked, the implementation is
-        deliberately absent.
+        Idempotency: running the method twice with the same ``event_id`` reuses
+        the existing snapshot row, re-uses the prior success event id on the
+        journal row, and does not bump ``attempt_count`` — operators can safely
+        drive repeated stage completion through replay without accumulating
+        spurious attempts or duplicate events.
         """
 
-        _ = (meme_file_id, attempt, event_id, payload_preview)
-        raise NotImplementedError("T02/T03 implement this method; the contract is locked in T01.")
+        meme_file, stage_entry = await self._get_meme_file_and_stage_entry(
+            meme_file_id,
+            ContentPipelineStage.SYNC_QDRANT,
+        )
+        self._ensure_stage_attempt_is_current(stage_entry, attempt=attempt)
+
+        already_succeeded = (
+            stage_entry.status is ContentPipelineStageStatus.SUCCEEDED
+            and stage_entry.last_event_id == event_id
+        )
+
+        preview_model = _build_qdrant_preview_model(payload_preview) if payload_preview else None
+        await self._upsert_sync_target_snapshot(
+            meme_file_id=meme_file_id,
+            target=SyncTargetKind.QDRANT,
+            status=SyncTargetStatus.SYNCED,
+            last_event_id=event_id,
+            preview=preview_model,
+            normalized_reason=None,
+            last_error_text=None,
+            bump_attempt=not already_succeeded,
+            record_success=True,
+        )
+
+        await self._finalize_stage_success(
+            meme_file=meme_file,
+            stage_entry=stage_entry,
+            stage=ContentPipelineStage.SYNC_QDRANT,
+            attempt=attempt,
+            event_id=event_id,
+        )
+
+        # Idempotent publish: on repeat calls with the same event id we do not
+        # re-emit the MEME_QDRANT_SYNCED event because the commit above is a
+        # no-op under the stage-journal event-id equality check.
+        if not already_succeeded:
+            await self._publish_sync_success_event(
+                meme_file=meme_file,
+                stage_entry=stage_entry,
+                event_type=ContentPipelineEventType.MEME_QDRANT_SYNCED,
+                stage=ContentPipelineStage.SYNC_QDRANT,
+            )
+
+        # Re-read the snapshot for the response projection so the caller sees
+        # the committed state, not the in-memory mutation.
+        return await self._load_sync_target_status(meme_file_id, SyncTargetKind.QDRANT)
+
+    async def _publish_sync_success_event(
+        self,
+        *,
+        meme_file: MemeFile,
+        stage_entry: PipelineStageJournal,
+        event_type: ContentPipelineEventType,
+        stage: ContentPipelineStage,
+    ) -> None:
+        """Publish a post-commit sync-success dispatch event (non-work notification).
+
+        The stage row has already committed as ``SUCCEEDED`` by the time this
+        runs; a publish failure must not rewrite the snapshot row (the sync
+        did happen), so we record the publish failure as a terminal-replay
+        reason on the stage row via the existing ``mark_stage_failed`` path
+        and re-raise :class:`PipelinePublishError` so the runtime can
+        classify the failure using the standard dispatcher.
+        """
+
+        dispatch_event = ContentPipelineDispatchEvent(
+            event_id=uuid.uuid7(),
+            event_type=event_type,
+            meme_id=meme_file.meme_id,
+            meme_file_id=meme_file.id,
+            stage=stage,
+            source_kind=ContentSourceKind.MANUAL_UPLOAD,
+            original_object_key=meme_file.s3_original_key,
+            attempt=max(stage_entry.attempt_count, 1),
+            created_at=utcnow(),
+        )
+        try:
+            await self._publisher(dispatch_event)
+        except Exception as exc:
+            # The snapshot row stays truthful as SYNCED (the sync succeeded);
+            # we only need to record the publish failure as a replayable
+            # stage-row reason so operators can see and replay it.
+            await self._mark_sync_success_publish_failure(
+                meme_file_id=meme_file.id,
+                stage=stage,
+                attempt=dispatch_event.attempt,
+                event_id=dispatch_event.event_id,
+                error=exc,
+            )
+            raise PipelinePublishError(
+                f"Sync target {stage.value} succeeded, but the status notification dispatch failed.",
+            ) from exc
+
+    async def _mark_sync_success_publish_failure(
+        self,
+        *,
+        meme_file_id: uuid.UUID,
+        stage: ContentPipelineStage,
+        attempt: int,
+        event_id: uuid.UUID,
+        error: Exception,
+    ) -> None:
+        """Record a sync-success publish failure as a replayable stage-row reason."""
+
+        try:
+            await self.mark_stage_failed(
+                meme_file_id=meme_file_id,
+                stage=stage,
+                attempt=attempt,
+                event_id=event_id,
+                normalized_reason=_PIPELINE_REASON_PUBLISH_FAILED,
+                last_error_text=str(error),
+                retryable=True,
+            )
+        except (PipelineIngestError, PipelineItemNotFoundError):
+            return
 
     async def fail_sync_qdrant_stage(
         self,
@@ -647,16 +779,38 @@ class ContentPipelineService:
         normalized_reason: str,
         last_error_text: str,
     ) -> PerTargetSyncStatus:
-        """Persist a failed Qdrant sync attempt and return the per-target truth.
+        """Persist a failed Qdrant sync attempt without publishing any success event.
 
-        T01 locks the signature so T02 can implement the Qdrant consumer without
-        any further contract work. Until T02 lands, calling this method raises
-        ``NotImplementedError`` — the contract is locked, the implementation is
-        deliberately absent.
+        The journal row is delegated to :meth:`mark_stage_failed` so retryability
+        logic stays shared with the S02 heavy stages. Prior ``last_success_at``
+        timestamps and preview payloads are preserved so operators can still see
+        when the target last worked even after a transient failure. Retryability
+        is derived from the normalized-reason constant because the runtime owns
+        the exception-to-reason mapping and the service honors it verbatim.
         """
 
-        _ = (meme_file_id, attempt, event_id, normalized_reason, last_error_text)
-        raise NotImplementedError("T02/T03 implement this method; the contract is locked in T01.")
+        is_retryable = normalized_reason != _PIPELINE_REASON_SYNC_QDRANT_MALFORMED_PAYLOAD
+        await self._upsert_sync_target_snapshot(
+            meme_file_id=meme_file_id,
+            target=SyncTargetKind.QDRANT,
+            status=SyncTargetStatus.FAILED,
+            last_event_id=event_id,
+            preview=None,
+            normalized_reason=normalized_reason,
+            last_error_text=last_error_text,
+            bump_attempt=True,
+            record_success=False,
+        )
+        await self.mark_stage_failed(
+            meme_file_id=meme_file_id,
+            stage=ContentPipelineStage.SYNC_QDRANT,
+            attempt=attempt,
+            event_id=event_id,
+            normalized_reason=normalized_reason,
+            last_error_text=last_error_text,
+            retryable=is_retryable,
+        )
+        return await self._load_sync_target_status(meme_file_id, SyncTargetKind.QDRANT)
 
     async def complete_sync_meili_stage(
         self,
@@ -701,32 +855,34 @@ class ContentPipelineService:
         self,
         meme_file_id: uuid.UUID,
         target: SyncTargetKind,
-    ) -> PerTargetSyncStatus:
+    ) -> ContentPipelineReplayAccepted:
         """Queue a per-target sync replay for one pipeline item.
 
-        The classify stage must have already succeeded for the item — otherwise
-        the per-target sync truth has no ready canonical state to advertise and
-        the replay would race with the heavy chain. T01 enforces that guard here
-        so T02/T03 inherit it automatically, and raises ``NotImplementedError``
-        afterwards because the runtime work is still pending.
+        Mirrors the S01 single-stage replay path but scoped to the ``sync_*``
+        row for the requested target. The classify stage must have already
+        succeeded — otherwise the per-target sync truth has no ready canonical
+        state to advertise and the replay would race with the heavy chain.
         """
 
         await self._ensure_sync_replay_allowed(meme_file_id)
-        _ = target
-        raise NotImplementedError("T02/T03 implement this method; the contract is locked in T01.")
+        if target is SyncTargetKind.MEILISEARCH:
+            # T03 owns the real Meilisearch implementation; the T02 runtime only
+            # wires the Qdrant path so Meilisearch replay requests must still
+            # raise NotImplementedError until T03 extends this branch.
+            raise NotImplementedError("T03 implements Meilisearch sync replay; the contract is locked in T01.")
+        return await self._replay_single_sync_target(meme_file_id, target)
 
     async def replay_sync_target_batch(
         self,
         meme_file_ids: Sequence[uuid.UUID],
         target: SyncTargetKind,
-    ) -> tuple[PerTargetSyncStatus, ...]:
+    ) -> tuple[ContentPipelineReplayAccepted, ...]:
         """Queue per-target sync replays for a bounded batch of pipeline items.
 
-        Every item in ``meme_file_ids`` must have already reached classify
-        completion; the guard runs before any runtime work so T02/T03 cannot
-        accidentally ship an implementation that replays half-ready items.
-        T01 also rejects batches larger than :data:`SYNC_REPLAY_BATCH_MAX` so
-        operators cannot accidentally requeue an entire corpus in one call.
+        The bounded batch size guard runs at the service layer so route handlers
+        cannot accidentally bypass it. Every item in the batch must have already
+        reached classify completion; the classify guard fires before any runtime
+        work to keep partial-replay bugs impossible.
         """
 
         if len(meme_file_ids) > SYNC_REPLAY_BATCH_MAX:
@@ -736,8 +892,236 @@ class ContentPipelineService:
             )
         for meme_file_id in meme_file_ids:
             await self._ensure_sync_replay_allowed(meme_file_id)
-        _ = target
-        raise NotImplementedError("T02/T03 implement this method; the contract is locked in T01.")
+        if target is SyncTargetKind.MEILISEARCH:
+            raise NotImplementedError("T03 implements Meilisearch sync replay; the contract is locked in T01.")
+
+        accepted: list[ContentPipelineReplayAccepted] = []
+        for meme_file_id in meme_file_ids:
+            replay = await self._replay_single_sync_target(meme_file_id, target)
+            accepted.append(replay)
+        return tuple(accepted)
+
+    async def _replay_single_sync_target(
+        self,
+        meme_file_id: uuid.UUID,
+        target: SyncTargetKind,
+    ) -> ContentPipelineReplayAccepted:
+        """Reserve and republish one per-target sync stage row without touching the other target."""
+
+        stage = _SYNC_STAGE_BY_TARGET[target]
+        meme_file = await self._get_meme_file(meme_file_id)
+        if not meme_file.s3_original_key:
+            raise PipelineReplayNotAllowedError(
+                f"Pipeline item {meme_file_id} is missing durable original storage identifiers.",
+            )
+
+        stage_entry = next(
+            (entry for entry in meme_file.pipeline_stage_journal_entries if entry.stage is stage),
+            None,
+        )
+        if stage_entry is None:
+            # Classify succeeded and fanned out to exactly one downstream stage
+            # row (sync_qdrant today, both targets after T03). If operators ask
+            # to replay a target that has not been fanned out yet, the replay
+            # is genuinely not allowed — we do NOT synthesise a pending row
+            # because that would bypass the normal classify-succeeded → fan-out
+            # transaction that owns per-target row creation.
+            raise PipelineReplayNotAllowedError(
+                f"Pipeline item {meme_file_id} has no durable {stage.value} stage row yet.",
+            )
+
+        if self._is_replay_reserved(stage_entry):
+            if stage_entry.last_event_id is None:
+                raise PipelineReplayNotAllowedError(
+                    f"Pipeline item {meme_file_id} is already reserved for replay, "
+                    "but its event id is missing.",
+                )
+            return ContentPipelineReplayAccepted(
+                meme_file_id=meme_file.id,
+                replay_event_id=stage_entry.last_event_id,
+                stage=stage,
+                attempt=max(stage_entry.attempt_count, 1),
+            )
+
+        replay_attempt = max(stage_entry.attempt_count + 1, 1)
+        replay_event = ContentPipelineDispatchEvent(
+            event_id=uuid.uuid7(),
+            event_type=ContentPipelineEventType.STAGE_REPLAY_REQUESTED,
+            meme_id=meme_file.meme_id,
+            meme_file_id=meme_file.id,
+            stage=stage,
+            source_kind=ContentSourceKind.MANUAL_UPLOAD,
+            original_object_key=meme_file.s3_original_key,
+            attempt=replay_attempt,
+            created_at=utcnow(),
+        )
+        snapshot = self._snapshot_stage(stage_entry)
+        self._reserve_replay(stage_entry, replay_event)
+
+        # Mark the per-target snapshot row as an intentional replay so the
+        # inspect surface reflects the operator request even before the runtime
+        # picks up the dispatch. Prior ``last_success_at`` and preview stay
+        # untouched — this is why the helper has a ``record_success=False``
+        # flag instead of rewriting the whole row.
+        await self._upsert_sync_target_snapshot(
+            meme_file_id=meme_file_id,
+            target=target,
+            status=SyncTargetStatus.PENDING,
+            last_event_id=replay_event.event_id,
+            preview=None,
+            normalized_reason=PIPELINE_REASON_SYNC_REPLAY_REQUESTED,
+            last_error_text=None,
+            bump_attempt=False,
+            record_success=False,
+        )
+        try:
+            await self._session.commit()
+        except SQLAlchemyError as exc:
+            await self._session.rollback()
+            raise PipelineIngestError(
+                f"Failed to persist sync replay reservation state for {target.value}.",
+            ) from exc
+
+        try:
+            await self._publisher(replay_event)
+        except Exception as exc:
+            await self._restore_stage_snapshot(stage_entry.id, snapshot)
+            raise PipelinePublishError(
+                f"Sync replay was reserved, but downstream dispatch for {target.value} failed.",
+            ) from exc
+
+        return ContentPipelineReplayAccepted(
+            meme_file_id=meme_file.id,
+            replay_event_id=replay_event.event_id,
+            stage=replay_event.stage,
+            attempt=replay_event.attempt,
+        )
+
+    async def _upsert_sync_target_snapshot(
+        self,
+        *,
+        meme_file_id: uuid.UUID,
+        target: SyncTargetKind,
+        status: SyncTargetStatus,
+        last_event_id: uuid.UUID | None,
+        preview: ContentPipelineSyncTargetPreview | None,
+        normalized_reason: str | None,
+        last_error_text: str | None,
+        bump_attempt: bool,
+        record_success: bool,
+    ) -> MemeFileSyncTargetSnapshot:
+        """Upsert the snapshot row for one ``(meme_file_id, target)`` pair.
+
+        The helper is shared with T03 so the Meilisearch path can call it
+        without changes. ``record_success`` bumps ``last_success_at`` and
+        refreshes ``last_payload_preview`` to the supplied preview; failure
+        callers pass ``record_success=False`` so the last known good
+        timestamp and preview stay intact across transient outages.
+        """
+
+        now = utcnow()
+        snapshots = await self._load_sync_target_snapshots(self._session, meme_file_id)
+        existing = snapshots.get(target)
+
+        trimmed_reason = self._trim_reason(normalized_reason) if normalized_reason is not None else None
+        trimmed_error = self._trim_error_text(last_error_text) if last_error_text is not None else None
+        preview_json = preview.model_dump(mode="json") if preview is not None else None
+
+        if existing is None:
+            row = MemeFileSyncTargetSnapshot(
+                meme_file_id=meme_file_id,
+                sync_target=target,
+                status=status,
+                last_event_id=last_event_id,
+                normalized_reason=trimmed_reason,
+                last_error_text=trimmed_error,
+                last_payload_preview=preview_json or {},
+                last_success_at=now if record_success else None,
+                last_attempt_at=now,
+                attempt_count=1 if bump_attempt else 0,
+            )
+            self._session.add(row)
+            await self._session.flush()
+            return row
+
+        existing.status = status
+        existing.last_event_id = last_event_id
+        existing.normalized_reason = trimmed_reason
+        existing.last_error_text = trimmed_error
+        existing.last_attempt_at = now
+        if bump_attempt:
+            existing.attempt_count = existing.attempt_count + 1
+        if record_success:
+            existing.last_success_at = now
+            if preview_json is not None:
+                existing.last_payload_preview = preview_json
+        await self._session.flush()
+        return existing
+
+    async def _load_sync_target_status(
+        self,
+        meme_file_id: uuid.UUID,
+        target: SyncTargetKind,
+    ) -> PerTargetSyncStatus:
+        """Return the persisted :class:`PerTargetSyncStatus` for one target.
+
+        Reads from a fresh loader call so the caller sees the committed row,
+        not the in-memory mutation from the upsert helper. The sync snapshot
+        is decoded into the typed :class:`ContentPipelineSyncTargetPreview`
+        projection when the stored JSON has a non-empty payload.
+        """
+
+        snapshots = await self._load_sync_target_snapshots(self._session, meme_file_id)
+        row = snapshots.get(target)
+        if row is None:
+            raise PipelineIngestError(
+                f"Sync target snapshot for {target.value} disappeared after upsert on "
+                f"pipeline item {meme_file_id}.",
+            )
+        return PerTargetSyncStatus(
+            target=row.sync_target,
+            status=row.status,
+            last_event_id=row.last_event_id,
+            normalized_reason=row.normalized_reason,
+            last_error_text=row.last_error_text,
+            last_success_at=row.last_success_at,
+            last_attempt_at=row.last_attempt_at,
+            attempt_count=row.attempt_count,
+            last_preview=_decode_sync_preview(row.last_payload_preview, target=target),
+        )
+
+    async def get_sync_target_status(
+        self,
+        meme_file_id: uuid.UUID,
+        target: SyncTargetKind,
+    ) -> PerTargetSyncStatus:
+        """Return the current per-target sync truth for one pipeline item.
+
+        Raises :class:`PipelineItemNotFoundError` when the meme file itself
+        does not exist, and when the meme file exists but has no snapshot row
+        for the requested target — the route handler maps the latter to a
+        ``404`` so operators cannot accidentally conflate "item missing" with
+        "item has never been synced to this target".
+        """
+
+        _ = await self._get_meme_file(meme_file_id)
+        snapshots = await self._load_sync_target_snapshots(self._session, meme_file_id)
+        row = snapshots.get(target)
+        if row is None:
+            raise PipelineItemNotFoundError(
+                f"Pipeline item {meme_file_id} has no {target.value} sync snapshot row yet.",
+            )
+        return PerTargetSyncStatus(
+            target=row.sync_target,
+            status=row.status,
+            last_event_id=row.last_event_id,
+            normalized_reason=row.normalized_reason,
+            last_error_text=row.last_error_text,
+            last_success_at=row.last_success_at,
+            last_attempt_at=row.last_attempt_at,
+            attempt_count=row.attempt_count,
+            last_preview=_decode_sync_preview(row.last_payload_preview, target=target),
+        )
 
     async def _ensure_sync_replay_allowed(self, meme_file_id: uuid.UUID) -> None:
         """Raise :class:`PipelineReplayNotAllowedError` when classify has not succeeded.
@@ -865,9 +1249,14 @@ class ContentPipelineService:
         )
         # Classification is the terminal heavy-worker stage: once it succeeds the file
         # is truly downstream-ready even though we still publish MEME_READY so S03's
-        # sync_qdrant/sync_meili consumers can pick up the canonical state.
+        # sync_qdrant/sync_meili consumers can pick up the canonical state. Sync
+        # stages must not regress that READY truth — they advertise search-target
+        # visibility independently of the file's processing lifecycle.
         if stage is ContentPipelineStage.CLASSIFY:
             meme_file.status = ContentProcessingStatus.READY
+        elif stage in {ContentPipelineStage.SYNC_QDRANT, ContentPipelineStage.SYNC_MEILI}:
+            # Sync success never downgrades READY back to PROCESSING.
+            pass
         elif downstream_dispatches:
             meme_file.status = ContentProcessingStatus.PROCESSING
         else:
@@ -1164,13 +1553,31 @@ class ContentPipelineService:
         _ = await broker.publish(
             payload,
             exchange=self._broker_settings.exchange,
-            routing_key=self._broker_settings.routing_key_for_stage(event.stage),
+            routing_key=self._resolve_routing_key_for_event(event),
             persist=True,
             content_type="application/json",
             message_id=str(event.event_id),
             timestamp=event.created_at,
             mandatory=True,
         )
+
+    def _resolve_routing_key_for_event(self, event: ContentPipelineDispatchEvent) -> str:
+        """Select the routing key to use when publishing a dispatch or status event.
+
+        Stage dispatches (e.g. ``meme_ready`` → sync_qdrant) route by stage so
+        the appropriate worker queue consumes them. Status events
+        (``meme_qdrant_synced``, ``meme_meili_synced``) route by event type to
+        a distinct topic key so the sync workers never re-consume their own
+        success notifications.
+        """
+
+        status_event_types = {
+            ContentPipelineEventType.MEME_QDRANT_SYNCED,
+            ContentPipelineEventType.MEME_MEILI_SYNCED,
+        }
+        if event.event_type in status_event_types:
+            return self._broker_settings.routing_key_for_event(event.event_type)
+        return self._broker_settings.routing_key_for_stage(event.stage)
 
     async def _mark_dispatch_failure(
         self,
@@ -1586,6 +1993,52 @@ class ContentPipelineService:
         if not suffix:
             raise PipelineUnsupportedMediaTypeError("Uploaded filename must include an extension.")
         return suffix
+
+
+def _build_qdrant_preview_model(
+    payload_preview: dict[str, object],
+) -> ContentPipelineSyncTargetPreview:
+    """Wrap a raw Qdrant-side dict preview into the typed projection record.
+
+    The runtime captures the raw dict from the post-upsert retrieve response
+    (or from the upsert payload itself when retrieve is skipped); this helper
+    stamps the typed target + timestamp so the schema contract is enforced
+    before the row is persisted.
+    """
+
+    return ContentPipelineSyncTargetPreview(
+        target=SyncTargetKind.QDRANT,
+        preview_fields=dict(payload_preview),
+        preview_fetched_at=utcnow(),
+    )
+
+
+def _decode_sync_preview(
+    raw_preview: object,
+    *,
+    target: SyncTargetKind,
+) -> ContentPipelineSyncTargetPreview | None:
+    """Decode a stored ``last_payload_preview`` JSONB blob into the typed projection.
+
+    Returns ``None`` when the stored dict is empty, missing the
+    ``preview_fetched_at`` stamp, or shaped in a way that would not round-trip
+    through :class:`ContentPipelineSyncTargetPreview` — the inspect surface
+    treats malformed previews as "no preview known" rather than crashing the
+    detail build.
+    """
+
+    if not isinstance(raw_preview, dict) or not raw_preview:
+        return None
+    try:
+        return ContentPipelineSyncTargetPreview.model_validate(
+            {
+                "target": raw_preview.get("target", target.value),
+                "preview_fields": raw_preview.get("preview_fields", {}),
+                "preview_fetched_at": raw_preview.get("preview_fetched_at"),
+            }
+        )
+    except Exception:  # noqa: BLE001 - any decode failure is surfaced as a missing preview.
+        return None
 
 
 __all__ = [

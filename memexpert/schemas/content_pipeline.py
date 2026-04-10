@@ -334,6 +334,20 @@ class ContentPipelineSyncReplayTarget(BaseModel):
     target: SyncTargetKind
 
 
+class ContentPipelineSyncReplayBatchRequest(BaseModel):
+    """Request schema for the per-target sync batch replay route introduced in T02.
+
+    The service layer enforces the bounded batch size so operators cannot
+    accidentally requeue an entire corpus in one call; the batch endpoint
+    exists as a convenience for replaying a small cluster of failures in a
+    single operator action.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    meme_file_ids: list[uuid.UUID] = Field(min_length=1)
+
+
 class ContentPipelineItemDetail(ContentPipelineItemRead):
     """Enriched detail projection extending the S01 item read.
 
@@ -424,6 +438,9 @@ class ContentPipelineRunStageCounts(BaseModel):
     classify_blocked: StrictInt = Field(default=0, ge=0)
     ready_count: StrictInt = Field(default=0, ge=0)
     blocked_count: StrictInt = Field(default=0, ge=0)
+    sync_qdrant_synced: StrictInt = Field(default=0, ge=0)
+    sync_qdrant_failed: StrictInt = Field(default=0, ge=0)
+    sync_qdrant_pending: StrictInt = Field(default=0, ge=0)
 
 
 class ContentPipelineRunSummary(BaseModel):
@@ -473,6 +490,7 @@ __all__ = [
     "ContentPipelineRunSummary",
     "ContentPipelineStageJournalRead",
     "ContentPipelineStageTimings",
+    "ContentPipelineSyncReplayBatchRequest",
     "ContentPipelineSyncReplayTarget",
     "ContentPipelineSyncTargetPreview",
     "ContentPipelineUploadMetadata",

@@ -32,6 +32,11 @@ from memexpert.core.qdrant import (
     QdrantMalformedResponseError,
     QdrantProviderUnavailableError,
     QdrantSimilarityMatch,
+    QdrantSyncConflictError,
+    QdrantSyncMalformedResponseError,
+    QdrantSyncPayload,
+    QdrantSyncProviderUnavailableError,
+    QdrantSyncTimeoutError,
     QdrantTimeoutError,
 )
 from memexpert.core.voyage import (
@@ -45,6 +50,7 @@ from memexpert.models.content import (
     Meme,
     MemeFile,
     MemeFileOCRResult,
+    MemeFileSyncTargetSnapshot,
     MemeMergeLog,
     MemePopularitySnapshot,
     MemeSource,
@@ -56,11 +62,14 @@ from memexpert.models.enums import (
     ContentPipelineStageStatus,
     ContentProcessingStatus,
     SourcePlatform,
+    SyncTargetKind,
+    SyncTargetStatus,
 )
 from memexpert.schemas.content_pipeline import (
     ContentPipelineCanonicalContext,
     ContentPipelineClassificationDetail,
     ContentPipelineDispatchEvent,
+    ContentPipelineEventType,
     ContentPipelineItemDetail,
     ContentPipelineItemRead,
     ContentPipelineMergeDetail,
@@ -68,6 +77,7 @@ from memexpert.schemas.content_pipeline import (
     ContentPipelineOCRDetail,
     ContentPipelineReadyEventSummary,
     ContentPipelineStageJournalRead,
+    ContentPipelineSyncTargetPreview,
     ContentPipelineUploadMetadata,
 )
 from memexpert.services import ContentPipelineService
@@ -86,9 +96,14 @@ from memexpert.workers.pipeline_runtime import (
     PIPELINE_REASON_EMBED_SIMILARITY_MALFORMED,
     PIPELINE_REASON_EMBED_SIMILARITY_TIMEOUT,
     PIPELINE_REASON_EMBED_TIMEOUT,
+    PIPELINE_REASON_FORCED_SYNC_QDRANT_FAILURE,
     PIPELINE_REASON_FORCED_TRANSCODE_FAILURE,
     PIPELINE_REASON_MALFORMED_EVENT,
     PIPELINE_REASON_OCR_TIMEOUT,
+    PIPELINE_REASON_SYNC_QDRANT_CONFLICT,
+    PIPELINE_REASON_SYNC_QDRANT_MALFORMED_PAYLOAD,
+    PIPELINE_REASON_SYNC_QDRANT_PROVIDER_BLOCKED,
+    PIPELINE_REASON_SYNC_QDRANT_TIMEOUT,
     build_pipeline_runtime,
 )
 
@@ -284,6 +299,47 @@ class FakeQdrantClient:
         if self.error is not None:
             raise self.error
         return self.matches
+
+
+@dataclass(slots=True)
+class FakeQdrantSyncClient:
+    """Typed Qdrant sync boundary double used to make runtime sync tests deterministic."""
+
+    upsert_error: Exception | None = None
+    fetch_error: Exception | None = None
+    fetch_preview: ContentPipelineSyncTargetPreview | None = None
+    upsert_calls: list[dict[str, object]] = field(default_factory=list)
+    fetch_calls: list[uuid.UUID] = field(default_factory=list)
+    delete_calls: list[uuid.UUID] = field(default_factory=list)
+
+    async def upsert_meme_point(
+        self,
+        payload: QdrantSyncPayload,
+        vector: tuple[float, ...],
+    ) -> None:
+        self.upsert_calls.append(
+            {
+                "meme_file_id": payload.meme_file_id,
+                "meme_id": payload.meme_id,
+                "tags": list(payload.tags),
+                "is_nsfw": payload.is_nsfw,
+                "vector_len": len(vector),
+            }
+        )
+        if self.upsert_error is not None:
+            raise self.upsert_error
+
+    async def fetch_meme_point(
+        self,
+        meme_file_id: uuid.UUID,
+    ) -> ContentPipelineSyncTargetPreview | None:
+        self.fetch_calls.append(meme_file_id)
+        if self.fetch_error is not None:
+            raise self.fetch_error
+        return self.fetch_preview
+
+    async def delete_meme_point(self, meme_file_id: uuid.UUID) -> None:
+        self.delete_calls.append(meme_file_id)
 
 
 @dataclass(slots=True)
@@ -930,6 +986,37 @@ async def _seed_classify_pending_item(
         event_id=uuid.uuid7(),
         embedding_result=build_voyage_embedding_result(input_hash="d" * 64),
         similarity_matches=(),
+    )
+    return meme_file_id, publisher.events[-1], normalized
+
+
+async def _seed_sync_qdrant_pending_item(
+    session: AsyncSession,
+    *,
+    storage_client: FakeStorageClient,
+    publisher: RecordingPublisher,
+    source_id: str = "sync-qdrant-runtime-source",
+    post_id: str = "8700",
+) -> tuple[uuid.UUID, ContentPipelineDispatchEvent, NormalizedMediaResult]:
+    """Create a pipeline item and drive it to the SYNC_QDRANT-pending state via the service."""
+
+    meme_file_id, _, normalized = await _seed_classify_pending_item(
+        session,
+        storage_client=storage_client,
+        publisher=publisher,
+        source_id=source_id,
+        post_id=post_id,
+    )
+    service = ContentPipelineService(
+        session,
+        storage_client=storage_client,
+        publisher=publisher,
+    )
+    await service.complete_classify_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        classification_result=build_classification_result(),
     )
     return meme_file_id, publisher.events[-1], normalized
 
@@ -1667,6 +1754,387 @@ async def test_pipeline_runtime_embed_contract_violation_dead_letters_non_retrya
     assert message.ack_count == 1
     assert message.reject_calls == []
     assert len(dead_letters) == 1
+
+
+# --- S03 sync_qdrant consumer ----------------------------------------------
+
+
+async def _load_sync_target_snapshot(
+    session_factory: async_sessionmaker[AsyncSession],
+    meme_file_id: uuid.UUID,
+    target: SyncTargetKind,
+) -> MemeFileSyncTargetSnapshot | None:
+    async with session_factory() as session:
+        return await session.scalar(
+            select(MemeFileSyncTargetSnapshot).where(
+                MemeFileSyncTargetSnapshot.meme_file_id == meme_file_id,
+                MemeFileSyncTargetSnapshot.sync_target == target,
+            )
+        )
+
+
+async def test_pipeline_runtime_sync_qdrant_success_records_snapshot_and_publishes_synced_event(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Happy path: the sync_qdrant consumer upserts to Qdrant, writes the snapshot, acks."""
+
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    meme_file_id, sync_event, _ = await _seed_sync_qdrant_pending_item(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+    )
+
+    downstream_broker = PublishingBroker()
+
+    async def fake_ensure_pipeline_broker_started(*_: object, **__: object) -> object:
+        return downstream_broker
+
+    monkeypatch.setattr(
+        content_pipeline_module,
+        "ensure_pipeline_broker_started",
+        fake_ensure_pipeline_broker_started,
+    )
+
+    fetched_preview = ContentPipelineSyncTargetPreview(
+        target=SyncTargetKind.QDRANT,
+        preview_fields={"meme_file_id": str(meme_file_id), "is_nsfw": False, "tags": []},
+        preview_fetched_at=datetime.now(tz=UTC),
+    )
+    qdrant_sync_client = FakeQdrantSyncClient(fetch_preview=fetched_preview)
+    runtime = build_pipeline_runtime(
+        settings=Settings(),
+        broker=build_pipeline_broker(Settings()),
+        session_factory=postgres_session_factory,
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(),
+        ocr_processor=FakeOCRProcessor(),
+        voyage_client=FakeVoyageClient(result=build_voyage_embedding_result()),
+        qdrant_client=FakeQdrantClient(),
+        qdrant_sync_client=qdrant_sync_client,
+        classification_client=FakeClassificationClient(result=build_classification_result()),
+    )
+    message = FakeRabbitMessage(message_id=str(sync_event.event_id))
+
+    await runtime.handle_sync_qdrant_message(sync_event.model_dump(mode="json"), message)
+
+    assert message.ack_count == 1
+    assert message.reject_calls == []
+    assert len(qdrant_sync_client.upsert_calls) == 1
+    assert qdrant_sync_client.upsert_calls[0]["meme_file_id"] == meme_file_id
+    assert qdrant_sync_client.fetch_calls == [meme_file_id]
+
+    snapshot = await _load_sync_target_snapshot(
+        postgres_session_factory,
+        meme_file_id,
+        SyncTargetKind.QDRANT,
+    )
+    assert snapshot is not None
+    assert snapshot.status is SyncTargetStatus.SYNCED
+    assert snapshot.attempt_count == 1
+    assert snapshot.last_success_at is not None
+    assert "meme_file_id" in snapshot.last_payload_preview.get("preview_fields", {})
+
+    # Exactly one MEME_QDRANT_SYNCED dispatch event was published to the broker.
+    synced_publishes = [
+        call
+        for call in downstream_broker.publish_calls
+        if isinstance(call.get("payload"), dict)
+        and call["payload"].get("event_type") == ContentPipelineEventType.MEME_QDRANT_SYNCED.value
+    ]
+    assert len(synced_publishes) == 1
+
+
+async def test_pipeline_runtime_sync_qdrant_provider_unavailable_keeps_stage_replayable(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A transient provider outage surfaces the provider-blocked reason and stays replayable."""
+
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    meme_file_id, sync_event, _ = await _seed_sync_qdrant_pending_item(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+        source_id="sync-qdrant-unavailable",
+        post_id="8710",
+    )
+    runtime = build_pipeline_runtime(
+        settings=Settings(),
+        broker=build_pipeline_broker(Settings()),
+        session_factory=postgres_session_factory,
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(),
+        ocr_processor=FakeOCRProcessor(),
+        voyage_client=FakeVoyageClient(result=build_voyage_embedding_result()),
+        qdrant_client=FakeQdrantClient(),
+        qdrant_sync_client=FakeQdrantSyncClient(
+            upsert_error=QdrantSyncProviderUnavailableError("qdrant down"),
+        ),
+        classification_client=FakeClassificationClient(result=build_classification_result()),
+    )
+    message = FakeRabbitMessage(message_id=str(sync_event.event_id))
+
+    await runtime.handle_sync_qdrant_message(sync_event.model_dump(mode="json"), message)
+
+    failed_item = await _fetch_item(postgres_session_factory, meme_file_id)
+    assert failed_item.current_stage is ContentPipelineStage.SYNC_QDRANT
+    assert failed_item.current_status is ContentPipelineStageStatus.FAILED
+    assert failed_item.normalized_reason == PIPELINE_REASON_SYNC_QDRANT_PROVIDER_BLOCKED
+    stage_row = _select_stage_row(failed_item, ContentPipelineStage.SYNC_QDRANT)
+    assert stage_row.is_retryable is True
+    assert message.reject_calls == [False]
+
+    snapshot = await _load_sync_target_snapshot(
+        postgres_session_factory,
+        meme_file_id,
+        SyncTargetKind.QDRANT,
+    )
+    assert snapshot is not None
+    assert snapshot.status is SyncTargetStatus.FAILED
+    assert snapshot.normalized_reason == PIPELINE_REASON_SYNC_QDRANT_PROVIDER_BLOCKED
+
+
+async def test_pipeline_runtime_sync_qdrant_timeout_keeps_stage_replayable(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    meme_file_id, sync_event, _ = await _seed_sync_qdrant_pending_item(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+        source_id="sync-qdrant-timeout",
+        post_id="8711",
+    )
+    runtime = build_pipeline_runtime(
+        settings=Settings(),
+        broker=build_pipeline_broker(Settings()),
+        session_factory=postgres_session_factory,
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(),
+        ocr_processor=FakeOCRProcessor(),
+        voyage_client=FakeVoyageClient(result=build_voyage_embedding_result()),
+        qdrant_client=FakeQdrantClient(),
+        qdrant_sync_client=FakeQdrantSyncClient(
+            upsert_error=QdrantSyncTimeoutError("took too long"),
+        ),
+        classification_client=FakeClassificationClient(result=build_classification_result()),
+    )
+    message = FakeRabbitMessage(message_id=str(sync_event.event_id))
+
+    await runtime.handle_sync_qdrant_message(sync_event.model_dump(mode="json"), message)
+
+    failed_item = await _fetch_item(postgres_session_factory, meme_file_id)
+    assert failed_item.normalized_reason == PIPELINE_REASON_SYNC_QDRANT_TIMEOUT
+    stage_row = _select_stage_row(failed_item, ContentPipelineStage.SYNC_QDRANT)
+    assert stage_row.is_retryable is True
+    assert message.reject_calls == [False]
+
+
+async def test_pipeline_runtime_sync_qdrant_conflict_keeps_stage_replayable(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    meme_file_id, sync_event, _ = await _seed_sync_qdrant_pending_item(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+        source_id="sync-qdrant-conflict",
+        post_id="8712",
+    )
+    runtime = build_pipeline_runtime(
+        settings=Settings(),
+        broker=build_pipeline_broker(Settings()),
+        session_factory=postgres_session_factory,
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(),
+        ocr_processor=FakeOCRProcessor(),
+        voyage_client=FakeVoyageClient(result=build_voyage_embedding_result()),
+        qdrant_client=FakeQdrantClient(),
+        qdrant_sync_client=FakeQdrantSyncClient(
+            upsert_error=QdrantSyncConflictError("409 conflict"),
+        ),
+        classification_client=FakeClassificationClient(result=build_classification_result()),
+    )
+    message = FakeRabbitMessage(message_id=str(sync_event.event_id))
+
+    await runtime.handle_sync_qdrant_message(sync_event.model_dump(mode="json"), message)
+
+    failed_item = await _fetch_item(postgres_session_factory, meme_file_id)
+    assert failed_item.normalized_reason == PIPELINE_REASON_SYNC_QDRANT_CONFLICT
+    stage_row = _select_stage_row(failed_item, ContentPipelineStage.SYNC_QDRANT)
+    assert stage_row.is_retryable is True
+    assert message.reject_calls == [False]
+
+
+async def test_pipeline_runtime_sync_qdrant_malformed_response_dead_letters(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    meme_file_id, sync_event, _ = await _seed_sync_qdrant_pending_item(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+        source_id="sync-qdrant-malformed",
+        post_id="8713",
+    )
+    dead_letters: list[Any] = []
+
+    async def publish_dead_letter(
+        payload: object,
+        queue: object = "",
+        exchange: object | None = None,
+        *,
+        routing_key: str = "",
+        headers: dict[str, object] | None = None,
+        **_: object,
+    ) -> None:
+        _ = queue
+        dead_letters.append(
+            {
+                "payload": payload,
+                "exchange": getattr(exchange, "name", exchange),
+                "routing_key": routing_key,
+                "headers": headers,
+            }
+        )
+
+    broker = build_pipeline_broker(Settings())
+    runtime = build_pipeline_runtime(
+        settings=Settings(),
+        broker=broker,
+        session_factory=postgres_session_factory,
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(),
+        ocr_processor=FakeOCRProcessor(),
+        voyage_client=FakeVoyageClient(result=build_voyage_embedding_result()),
+        qdrant_client=FakeQdrantClient(),
+        qdrant_sync_client=FakeQdrantSyncClient(
+            upsert_error=QdrantSyncMalformedResponseError("bad schema"),
+        ),
+        classification_client=FakeClassificationClient(result=build_classification_result()),
+    )
+    cast("Any", broker).publish = publish_dead_letter
+    message = FakeRabbitMessage(message_id=str(sync_event.event_id))
+
+    await runtime.handle_sync_qdrant_message(sync_event.model_dump(mode="json"), message)
+
+    failed_item = await _fetch_item(postgres_session_factory, meme_file_id)
+    assert failed_item.normalized_reason == PIPELINE_REASON_SYNC_QDRANT_MALFORMED_PAYLOAD
+    stage_row = _select_stage_row(failed_item, ContentPipelineStage.SYNC_QDRANT)
+    assert stage_row.is_retryable is False
+    assert message.ack_count == 1
+    assert message.reject_calls == []
+    assert len(dead_letters) == 1
+    assert dead_letters[0]["headers"] == {
+        "x-memexpert-failure-reason": PIPELINE_REASON_SYNC_QDRANT_MALFORMED_PAYLOAD,
+    }
+
+
+async def test_pipeline_runtime_sync_qdrant_forced_failure_knob_marks_stage_replayable(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    meme_file_id, sync_event, _ = await _seed_sync_qdrant_pending_item(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+        source_id="sync-qdrant-forced",
+        post_id="8714",
+    )
+    failing_settings = Settings.model_validate(
+        {"pipeline_worker_fail_sync_qdrant_for_meme_file_id": str(meme_file_id)}
+    )
+    runtime = build_pipeline_runtime(
+        settings=failing_settings,
+        broker=build_pipeline_broker(failing_settings),
+        session_factory=postgres_session_factory,
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(),
+        ocr_processor=FakeOCRProcessor(),
+        voyage_client=FakeVoyageClient(result=build_voyage_embedding_result()),
+        qdrant_client=FakeQdrantClient(),
+        qdrant_sync_client=FakeQdrantSyncClient(),
+        classification_client=FakeClassificationClient(result=build_classification_result()),
+    )
+    message = FakeRabbitMessage(message_id=str(sync_event.event_id))
+
+    await runtime.handle_sync_qdrant_message(sync_event.model_dump(mode="json"), message)
+
+    failed_item = await _fetch_item(postgres_session_factory, meme_file_id, settings=failing_settings)
+    assert failed_item.normalized_reason == PIPELINE_REASON_FORCED_SYNC_QDRANT_FAILURE
+    stage_row = _select_stage_row(failed_item, ContentPipelineStage.SYNC_QDRANT)
+    assert stage_row.is_retryable is True
+    assert message.reject_calls == [False]
+
+
+async def test_pipeline_runtime_sync_qdrant_best_effort_preview_fetch_failure_still_succeeds(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """Preview fetch failures degrade to an empty preview, never failing the stage."""
+
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    meme_file_id, sync_event, _ = await _seed_sync_qdrant_pending_item(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+        source_id="sync-qdrant-preview-fail",
+        post_id="8715",
+    )
+
+    downstream_broker = PublishingBroker()
+
+    async def fake_ensure_pipeline_broker_started(*_: object, **__: object) -> object:
+        return downstream_broker
+
+    monkeypatch.setattr(
+        content_pipeline_module,
+        "ensure_pipeline_broker_started",
+        fake_ensure_pipeline_broker_started,
+    )
+    runtime = build_pipeline_runtime(
+        settings=Settings(),
+        broker=build_pipeline_broker(Settings()),
+        session_factory=postgres_session_factory,
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(),
+        ocr_processor=FakeOCRProcessor(),
+        voyage_client=FakeVoyageClient(result=build_voyage_embedding_result()),
+        qdrant_client=FakeQdrantClient(),
+        qdrant_sync_client=FakeQdrantSyncClient(
+            fetch_error=QdrantSyncTimeoutError("preview retrieve timed out"),
+        ),
+        classification_client=FakeClassificationClient(result=build_classification_result()),
+    )
+    message = FakeRabbitMessage(message_id=str(sync_event.event_id))
+
+    await runtime.handle_sync_qdrant_message(sync_event.model_dump(mode="json"), message)
+
+    assert message.ack_count == 1
+    snapshot = await _load_sync_target_snapshot(
+        postgres_session_factory,
+        meme_file_id,
+        SyncTargetKind.QDRANT,
+    )
+    assert snapshot is not None
+    assert snapshot.status is SyncTargetStatus.SYNCED
+    # The preview is intentionally empty because the best-effort retrieve failed.
+    assert snapshot.last_payload_preview == {}
 
 
 # --- S02 inspect enrichment + proof harness aggregation ----------------------

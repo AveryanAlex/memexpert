@@ -1102,3 +1102,337 @@ async def test_pipeline_detail_route_returns_404_for_unknown_item_and_registers_
     assert "/api/v1/pipeline/items/{meme_file_id}" in paths
     assert "/api/v1/pipeline/items" in paths
     assert "/api/v1/pipeline/items/{meme_file_id}/replay" in paths
+
+
+async def _drive_item_to_classify_succeeded(
+    session: AsyncSession,
+    *,
+    storage_client: FakeStorageClient,
+    publisher: RecordingPublisher,
+    source_id: str,
+    post_id: str,
+    phash_tag: str,
+    input_hash_seed: str,
+) -> uuid.UUID:
+    """Create + transcode + OCR + embed + classify a pipeline item for sync route tests."""
+
+    meme_file_id = await _seed_detail_item(
+        session,
+        storage_client=storage_client,
+        publisher=publisher,
+        source_id=source_id,
+        post_id=post_id,
+        phash_tag=phash_tag,
+    )
+    service = ContentPipelineService(session, storage_client=storage_client, publisher=publisher)
+    await service.complete_transcode_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        result=_normalized_media_result(meme_file_id),
+    )
+    await service.complete_ocr_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        result=_ocr_result(fallback_used=False, low_confidence=False, confidence=0.91),
+    )
+    _ = await service.complete_embed_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        embedding_result=_voyage_embedding(input_hash=input_hash_seed * 64),
+        similarity_matches=(),
+    )
+    await service.complete_classify_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        classification_result=ClassificationResult(
+            model="memexpert-nsfw-v1",
+            is_nsfw=False,
+            nsfw_score=0.05,
+        ),
+    )
+    return meme_file_id
+
+
+async def test_pipeline_qdrant_sync_status_route_returns_404_when_snapshot_missing(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    """GET sync/qdrant must return 404 when the snapshot row has not been written yet."""
+
+    operator_token = get_settings().pipeline_operator_token.get_secret_value()
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    meme_file_id = await _drive_item_to_classify_succeeded(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+        source_id="sync-status-missing",
+        post_id="9500",
+        phash_tag="x",
+        input_hash_seed="x",
+    )
+    service = ContentPipelineService(migrated_db_session, storage_client=storage_client, publisher=publisher)
+    app.dependency_overrides[get_content_pipeline_service] = lambda: service
+
+    try:
+        response = await client.get(
+            f"/api/v1/pipeline/items/{meme_file_id}/sync/qdrant",
+            headers={PIPELINE_OPERATOR_TOKEN_HEADER_NAME: operator_token},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 404
+    assert response.json()["code"] == "pipeline_item_not_found"
+
+
+async def test_pipeline_qdrant_sync_status_route_returns_synced_row(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    """GET sync/qdrant must return the synced snapshot row once the worker writes it."""
+
+    operator_token = get_settings().pipeline_operator_token.get_secret_value()
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    meme_file_id = await _drive_item_to_classify_succeeded(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+        source_id="sync-status-synced",
+        post_id="9501",
+        phash_tag="y",
+        input_hash_seed="y",
+    )
+    service = ContentPipelineService(migrated_db_session, storage_client=storage_client, publisher=publisher)
+    sync_event = uuid.uuid7()
+    _ = await service.complete_sync_qdrant_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=sync_event,
+        payload_preview={"point_id": str(meme_file_id), "tags": []},
+    )
+    app.dependency_overrides[get_content_pipeline_service] = lambda: service
+
+    try:
+        response = await client.get(
+            f"/api/v1/pipeline/items/{meme_file_id}/sync/qdrant",
+            headers={PIPELINE_OPERATOR_TOKEN_HEADER_NAME: operator_token},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "synced"
+    assert body["target"] == "qdrant"
+    assert body["attempt_count"] == 1
+    assert body["last_preview"] is not None
+
+
+async def test_pipeline_qdrant_sync_status_route_requires_operator_token(
+    app: FastAPI,
+    client: AsyncClient,
+) -> None:
+    """The GET sync/qdrant route must require the operator token header."""
+
+    meme_file_id = uuid.uuid7()
+    response = await client.get(f"/api/v1/pipeline/items/{meme_file_id}/sync/qdrant")
+    assert response.status_code == 401
+    assert response.json()["code"] == "invalid_operator_token"
+
+
+async def test_pipeline_qdrant_sync_replay_route_happy_path(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    """POST sync/qdrant/replay must reserve a new dispatch for an item past classify success."""
+
+    operator_token = get_settings().pipeline_operator_token.get_secret_value()
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    meme_file_id = await _drive_item_to_classify_succeeded(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+        source_id="sync-replay-happy",
+        post_id="9502",
+        phash_tag="z",
+        input_hash_seed="z",
+    )
+    service = ContentPipelineService(migrated_db_session, storage_client=storage_client, publisher=publisher)
+    app.dependency_overrides[get_content_pipeline_service] = lambda: service
+
+    try:
+        response = await client.post(
+            f"/api/v1/pipeline/items/{meme_file_id}/sync/qdrant/replay",
+            headers={PIPELINE_OPERATOR_TOKEN_HEADER_NAME: operator_token},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["stage"] == "sync_qdrant"
+    assert body["meme_file_id"] == str(meme_file_id)
+
+
+async def test_pipeline_qdrant_sync_replay_route_rejects_not_ready_items(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    """POST sync/qdrant/replay must 409 when classify has not yet succeeded."""
+
+    operator_token = get_settings().pipeline_operator_token.get_secret_value()
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    meme_file_id = await _seed_detail_item(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+        source_id="sync-replay-not-ready",
+        post_id="9503",
+        phash_tag="w",
+    )
+    service = ContentPipelineService(migrated_db_session, storage_client=storage_client, publisher=publisher)
+    app.dependency_overrides[get_content_pipeline_service] = lambda: service
+
+    try:
+        response = await client.post(
+            f"/api/v1/pipeline/items/{meme_file_id}/sync/qdrant/replay",
+            headers={PIPELINE_OPERATOR_TOKEN_HEADER_NAME: operator_token},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "pipeline_replay_not_allowed"
+
+
+async def test_pipeline_qdrant_sync_replay_batch_route_happy_path(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    """POST sync/qdrant/replay-batch must accept a bounded batch of ready items."""
+
+    operator_token = get_settings().pipeline_operator_token.get_secret_value()
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    first = await _drive_item_to_classify_succeeded(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+        source_id="sync-batch-one",
+        post_id="9504",
+        phash_tag="a",
+        input_hash_seed="1",
+    )
+    second = await _drive_item_to_classify_succeeded(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+        source_id="sync-batch-two",
+        post_id="9505",
+        phash_tag="b",
+        input_hash_seed="2",
+    )
+    service = ContentPipelineService(migrated_db_session, storage_client=storage_client, publisher=publisher)
+    app.dependency_overrides[get_content_pipeline_service] = lambda: service
+
+    try:
+        response = await client.post(
+            "/api/v1/pipeline/sync/qdrant/replay-batch",
+            headers={PIPELINE_OPERATOR_TOKEN_HEADER_NAME: operator_token},
+            json={"meme_file_ids": [str(first), str(second)]},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 202
+    body = response.json()
+    assert len(body) == 2
+    assert {item["meme_file_id"] for item in body} == {str(first), str(second)}
+    for item in body:
+        assert item["stage"] == "sync_qdrant"
+
+
+async def test_pipeline_qdrant_sync_replay_batch_route_rejects_oversize_batches(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    """The batch endpoint must reject requests larger than SYNC_REPLAY_BATCH_MAX."""
+
+    from memexpert.services.content_pipeline import SYNC_REPLAY_BATCH_MAX
+
+    operator_token = get_settings().pipeline_operator_token.get_secret_value()
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    meme_file_id = await _drive_item_to_classify_succeeded(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+        source_id="sync-batch-oversize",
+        post_id="9506",
+        phash_tag="c",
+        input_hash_seed="3",
+    )
+    service = ContentPipelineService(migrated_db_session, storage_client=storage_client, publisher=publisher)
+    app.dependency_overrides[get_content_pipeline_service] = lambda: service
+    oversized_batch = [str(meme_file_id)] * (SYNC_REPLAY_BATCH_MAX + 1)
+
+    try:
+        response = await client.post(
+            "/api/v1/pipeline/sync/qdrant/replay-batch",
+            headers={PIPELINE_OPERATOR_TOKEN_HEADER_NAME: operator_token},
+            json={"meme_file_ids": oversized_batch},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "pipeline_replay_not_allowed"
+
+
+async def test_pipeline_qdrant_sync_replay_batch_route_rejects_empty_body(
+    app: FastAPI,
+    client: AsyncClient,
+) -> None:
+    """FastAPI must surface Pydantic validation failures as 422 for empty batches."""
+
+    operator_token = get_settings().pipeline_operator_token.get_secret_value()
+    response = await client.post(
+        "/api/v1/pipeline/sync/qdrant/replay-batch",
+        headers={PIPELINE_OPERATOR_TOKEN_HEADER_NAME: operator_token},
+        json={"meme_file_ids": []},
+    )
+    assert response.status_code == 422
+
+
+async def test_pipeline_qdrant_sync_replay_route_registers_in_openapi(
+    app: FastAPI,
+    client: AsyncClient,
+) -> None:
+    """The new sync endpoints must appear in the generated OpenAPI schema."""
+
+    operator_token = get_settings().pipeline_operator_token.get_secret_value()
+    response = await client.get(
+        "/openapi.json",
+        headers={PIPELINE_OPERATOR_TOKEN_HEADER_NAME: operator_token},
+    )
+    paths = response.json()["paths"]
+    assert "/api/v1/pipeline/items/{meme_file_id}/sync/qdrant" in paths
+    assert "/api/v1/pipeline/items/{meme_file_id}/sync/qdrant/replay" in paths
+    assert "/api/v1/pipeline/sync/qdrant/replay-batch" in paths
+    # S01 routes are still present — the new sync surface is additive.
+    assert "/api/v1/pipeline/items/{meme_file_id}" in paths
+    assert "/api/v1/pipeline/items/{meme_file_id}/replay" in paths

@@ -117,6 +117,7 @@ class Settings(BaseSettings):
     pipeline_worker_fail_transcode_for_meme_file_id: str | None = None
     pipeline_worker_fail_embed_for_meme_file_id: str | None = None
     pipeline_worker_fail_classify_for_meme_file_id: str | None = None
+    pipeline_worker_fail_sync_qdrant_for_meme_file_id: str | None = None
     auth_jwt_secret: SecretStr = SecretStr("memexpert-dev-jwt-secret-with-32-byte-minimum")
     auth_access_token_algorithm: Literal["HS256"] = "HS256"
     auth_access_token_ttl_seconds: int = 900
@@ -289,6 +290,7 @@ class Settings(BaseSettings):
         "pipeline_worker_fail_transcode_for_meme_file_id",
         "pipeline_worker_fail_embed_for_meme_file_id",
         "pipeline_worker_fail_classify_for_meme_file_id",
+        "pipeline_worker_fail_sync_qdrant_for_meme_file_id",
         mode="before",
     )
     @classmethod

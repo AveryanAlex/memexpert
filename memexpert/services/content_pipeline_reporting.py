@@ -49,6 +49,7 @@ from memexpert.schemas.content_pipeline import (
     ContentPipelineRunSummary,
     ContentPipelineStageJournalRead,
     ContentPipelineStageTimings,
+    ContentPipelineSyncTargetPreview,
     PerTargetSyncStatus,
 )
 
@@ -157,11 +158,11 @@ def _project_sync_targets(
 ) -> dict[SyncTargetKind, PerTargetSyncStatus]:
     """Turn snapshot rows into the public per-target projection.
 
-    Pure function, no DB access. The preview column is intentionally returned
-    as ``None`` in T01 — T02/T03 own the preview schema and will teach this
-    helper how to decode ``last_payload_preview`` into a typed preview. Empty
-    snapshot mapping yields an empty projection, which is what the inspect
-    surface must show for pre-S03 items that never went through sync.
+    Pure function, no DB access. T02 taught the Qdrant branch how to decode
+    the stored ``last_payload_preview`` JSONB into a typed preview; T03 will
+    mirror the same decoding for the Meilisearch branch. Empty snapshot
+    mapping yields an empty projection, which is what the inspect surface
+    must show for pre-S03 items that never went through sync.
     """
 
     projection: dict[SyncTargetKind, PerTargetSyncStatus] = {}
@@ -175,9 +176,37 @@ def _project_sync_targets(
             last_success_at=row.last_success_at,
             last_attempt_at=row.last_attempt_at,
             attempt_count=row.attempt_count,
-            last_preview=None,
+            last_preview=_decode_sync_preview(row.last_payload_preview, target=target),
         )
     return projection
+
+
+def _decode_sync_preview(
+    raw_preview: object,
+    *,
+    target: SyncTargetKind,
+) -> ContentPipelineSyncTargetPreview | None:
+    """Decode a stored ``last_payload_preview`` JSONB blob into the typed projection.
+
+    Returns ``None`` when the stored dict is empty or shaped in a way that
+    would not round-trip through :class:`ContentPipelineSyncTargetPreview`.
+    The inspect surface treats malformed or empty previews as "no preview
+    known" rather than crashing the detail build. T03 inherits the same
+    decoding path for the Meilisearch branch.
+    """
+
+    if not isinstance(raw_preview, dict) or not raw_preview:
+        return None
+    try:
+        return ContentPipelineSyncTargetPreview.model_validate(
+            {
+                "target": raw_preview.get("target", target.value),
+                "preview_fields": raw_preview.get("preview_fields", {}),
+                "preview_fetched_at": raw_preview.get("preview_fetched_at"),
+            }
+        )
+    except Exception:  # noqa: BLE001 - malformed previews degrade to "no preview known".
+        return None
 
 
 async def _load_canonical_meme(session: AsyncSession, meme_id: uuid.UUID) -> Meme:
@@ -401,6 +430,7 @@ def _build_stage_counts(
                 counts.ocr_low_confidence += 1
         if item.merge.as_source:
             counts.merge_count += 1
+        _tally_sync_targets(counts, item)
 
     for report in item_reports:
         if report.outcome == OUTCOME_READY:
@@ -409,6 +439,21 @@ def _build_stage_counts(
             counts.blocked_count += 1
 
     return counts
+
+
+def _tally_sync_targets(
+    counts: ContentPipelineRunStageCounts,
+    item: ContentPipelineItemDetail,
+) -> None:
+    qdrant_status = item.sync_targets.get(SyncTargetKind.QDRANT)
+    if qdrant_status is None:
+        return
+    if qdrant_status.status.value == "synced":
+        counts.sync_qdrant_synced += 1
+    elif qdrant_status.status.value == "failed":
+        counts.sync_qdrant_failed += 1
+    else:
+        counts.sync_qdrant_pending += 1
 
 
 def _tally_stage_entry(
@@ -514,6 +559,16 @@ def render_markdown_report(summary: ContentPipelineRunSummary) -> str:
         p95 = _format_seconds(timing.p95_seconds)
         max_val = _format_seconds(timing.max_seconds)
         lines.append(f"| {stage_name} | {samples} | {p50} | {p95} | {max_val} |")
+    lines.append("")
+    lines.append("## Search sync per target")
+    lines.append("")
+    lines.append("| Target | Synced | Failed | Pending |")
+    lines.append("|--------|--------|--------|---------|")
+    lines.append(
+        f"| qdrant | {summary.stage_counts.sync_qdrant_synced} | "
+        f"{summary.stage_counts.sync_qdrant_failed} | "
+        f"{summary.stage_counts.sync_qdrant_pending} |"
+    )
     lines.append("")
     lines.append("## Emitted meme_ready events")
     lines.append("")
