@@ -13,10 +13,22 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
 
 import memexpert.services.content_pipeline as content_pipeline_module
+from memexpert.core.classification import ClassificationResult
 from memexpert.core.config import Settings
 from memexpert.core.media import NormalizedMediaResult, UploadMediaDetails
 from memexpert.core.ocr import OCRExtractionResult
-from memexpert.models.content import Meme, MemeFile, MemeFileOCRResult, MemeSource, PipelineStageJournal
+from memexpert.core.qdrant import QdrantSimilarityMatch
+from memexpert.core.voyage import VoyageEmbeddingResult
+from memexpert.models.content import (
+    EmbeddingCache,
+    Meme,
+    MemeFile,
+    MemeFileOCRResult,
+    MemeMergeLog,
+    MemePopularitySnapshot,
+    MemeSource,
+    PipelineStageJournal,
+)
 from memexpert.models.enums import (
     ContentKind,
     ContentLanguage,
@@ -38,6 +50,7 @@ from memexpert.services import (
     PipelineReplayNotAllowedError,
     PipelineStorageError,
 )
+from memexpert.services.content_merge import MERGE_REASON_HIGH_SIMILARITY
 
 if TYPE_CHECKING:
     from pytest import MonkeyPatch
@@ -203,6 +216,105 @@ def build_ocr_result(*, source_object_key: str) -> OCRExtractionResult:
         extracted_text="deadline\nmonday",
         source_object_key=source_object_key,
     )
+
+
+def build_voyage_embedding_result(
+    *,
+    vector: tuple[float, ...] | None = None,
+    dimensions: int = 1024,
+    model: str = "voyage-multimodal-3.5",
+    input_hash: str | None = None,
+) -> VoyageEmbeddingResult:
+    """Create a stable embedding result matching the 1024-dim Voyage contract."""
+
+    resolved_vector = vector if vector is not None else tuple(0.01 * index for index in range(dimensions))
+    resolved_hash = input_hash if input_hash is not None else ("a" * 64)
+    return VoyageEmbeddingResult(
+        model=model,
+        dimensions=dimensions,
+        vector=resolved_vector,
+        input_hash=resolved_hash,
+    )
+
+
+def build_classification_result(*, is_nsfw: bool = False, nsfw_score: float = 0.1) -> ClassificationResult:
+    """Create a stable classification result for service assertions."""
+
+    return ClassificationResult(
+        model="memexpert-nsfw-v1",
+        is_nsfw=is_nsfw,
+        nsfw_score=nsfw_score,
+    )
+
+
+def _make_distinct_upload_media_details(*, tag: str) -> UploadMediaDetails:
+    """Build unique upload metadata so repeated ingests get distinct perceptual hashes."""
+
+    perceptual_hash = (tag * 16)[:16]
+    return UploadMediaDetails(
+        media_type=ContentKind.IMAGE,
+        mime_type="image/png",
+        width=128,
+        height=128,
+        file_size_bytes=64,
+        perceptual_hash=perceptual_hash,
+    )
+
+
+def _build_service_with_distinct_phash(
+    session: AsyncSession,
+    *,
+    phash_tag: str,
+    publisher: RecordingPublisher | None = None,
+) -> ContentPipelineService:
+    """Return a service wired to a fake media processor with a caller-provided phash."""
+
+    return ContentPipelineService(
+        session,
+        storage_client=FakeStorageClient(),
+        publisher=publisher or RecordingPublisher(),
+        media_processor=FakeMediaProcessor(inspect_result=_make_distinct_upload_media_details(tag=phash_tag)),
+    )
+
+
+async def _drive_to_embed_pending(
+    session: AsyncSession,
+    *,
+    source_id: str,
+    post_id: str,
+    phash_tag: str,
+    publisher: RecordingPublisher | None = None,
+    filename: str = "embed-ready.png",
+) -> tuple[uuid.UUID, NormalizedMediaResult, ContentPipelineService]:
+    """Create + transcode + OCR a pipeline item up to the embed-pending state."""
+
+    service = _build_service_with_distinct_phash(
+        session,
+        phash_tag=phash_tag,
+        publisher=publisher,
+    )
+    meme_file_id = await _create_upload(
+        service,
+        filename=filename,
+        content_type="image/png",
+        media_bytes=b"fake-upload-bytes",
+        source_id=source_id,
+        post_id=post_id,
+    )
+    normalized = build_normalized_media_result(meme_file_id)
+    await service.complete_transcode_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        result=normalized,
+    )
+    await service.complete_ocr_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        result=build_ocr_result(source_object_key=normalized.web_video_object_key),
+    )
+    return meme_file_id, normalized, service
 
 
 async def _count_pipeline_rows(
@@ -740,3 +852,543 @@ async def test_db_failure_rolls_back_rows_cleans_up_storage_and_skips_publish(
     assert len(storage_client.delete_calls) == 1
     assert publisher.events == []
     assert await _count_pipeline_rows(postgres_session_factory) == (0, 0, 0, 0)
+
+
+async def test_complete_embed_stage_without_matches_persists_embedding_and_queues_classify(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    publisher = RecordingPublisher()
+    meme_file_id, _, service = await _drive_to_embed_pending(
+        migrated_db_session,
+        source_id="embed-no-match",
+        post_id="9001",
+        phash_tag="a",
+        publisher=publisher,
+    )
+    embedding_result = build_voyage_embedding_result(input_hash="1" * 64)
+
+    merge_outcome = await service.complete_embed_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        embedding_result=embedding_result,
+        similarity_matches=(),
+    )
+
+    assert merge_outcome.merged is False
+    after_embed = await service.get_item(meme_file_id)
+    assert after_embed.current_stage is ContentPipelineStage.CLASSIFY
+    assert after_embed.current_status is ContentPipelineStageStatus.PENDING
+    assert publisher.events[-1].event_type is ContentPipelineEventType.MEME_EMBEDDED
+    assert publisher.events[-1].stage is ContentPipelineStage.CLASSIFY
+
+    async with postgres_session_factory() as session:
+        persisted_cache_row = await session.scalar(
+            select(EmbeddingCache).where(EmbeddingCache.source_file_id == meme_file_id)
+        )
+        persisted_meme = await session.scalar(
+            select(Meme).where(Meme.id == after_embed.meme_id)
+        )
+
+    assert persisted_cache_row is not None
+    assert persisted_cache_row.input_hash == embedding_result.input_hash
+    assert persisted_cache_row.model_version == embedding_result.model
+    assert persisted_cache_row.embedding == embedding_result.embedding_bytes
+    assert persisted_meme is not None
+    # Classification has not run yet, so the canonical meme must not be truthfully NSFW.
+    assert persisted_meme.is_nsfw is False
+    assert persisted_meme.ocr_text is None
+
+
+async def test_complete_embed_stage_rejects_malformed_vector_dimensions(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    meme_file_id, _, service = await _drive_to_embed_pending(
+        migrated_db_session,
+        source_id="malformed-vector",
+        post_id="9002",
+        phash_tag="b",
+    )
+    malformed_result = build_voyage_embedding_result(
+        vector=tuple(0.1 for _ in range(512)),
+        dimensions=512,
+        input_hash="2" * 64,
+    )
+
+    with pytest.raises(PipelineIngestError, match="unexpected dimensionality"):
+        _ = await service.complete_embed_stage(
+            meme_file_id=meme_file_id,
+            attempt=1,
+            event_id=uuid.uuid7(),
+            embedding_result=malformed_result,
+            similarity_matches=(),
+        )
+
+    async with postgres_session_factory() as session:
+        cache_rows = (
+            await session.execute(select(EmbeddingCache).where(EmbeddingCache.source_file_id == meme_file_id))
+        ).scalars().all()
+
+    assert cache_rows == []
+
+
+async def test_complete_embed_stage_auto_merges_high_similarity_into_older_meme(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    publisher = RecordingPublisher()
+    older_meme_file_id, older_normalized, older_service = await _drive_to_embed_pending(
+        migrated_db_session,
+        source_id="merge-older",
+        post_id="9100",
+        phash_tag="c",
+        publisher=publisher,
+        filename="older.png",
+    )
+    _ = await older_service.complete_embed_stage(
+        meme_file_id=older_meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        embedding_result=build_voyage_embedding_result(input_hash="3" * 64),
+        similarity_matches=(),
+    )
+
+    older_file = await migrated_db_session.scalar(select(MemeFile).where(MemeFile.id == older_meme_file_id))
+    assert older_file is not None
+    older_meme_id = older_file.meme_id
+    older_file.quality_score = 0.99
+    migrated_db_session.add(
+        MemePopularitySnapshot(
+            meme_id=older_meme_id,
+            source_views=120,
+            source_reactions=10,
+            source_reposts=1,
+            platform_views=60,
+            platform_sends=2,
+            platform_saves=3,
+            platform_likes=4,
+            popularity_score=1.5,
+        )
+    )
+    older_meme = await migrated_db_session.scalar(select(Meme).where(Meme.id == older_meme_id))
+    assert older_meme is not None
+    older_meme.popularity_score = 0.5
+    older_meme.like_count = 3
+    await migrated_db_session.commit()
+
+    newer_meme_file_id, newer_normalized, newer_service = await _drive_to_embed_pending(
+        migrated_db_session,
+        source_id="merge-newer",
+        post_id="9101",
+        phash_tag="d",
+        publisher=publisher,
+        filename="newer.png",
+    )
+
+    async with postgres_session_factory() as pre_merge_session:
+        newer_file_before = await pre_merge_session.scalar(
+            select(MemeFile).where(MemeFile.id == newer_meme_file_id)
+        )
+        assert newer_file_before is not None
+        newer_meme_id = newer_file_before.meme_id
+
+    newer_embedding = build_voyage_embedding_result(input_hash="4" * 64)
+    similarity_match = QdrantSimilarityMatch(
+        meme_file_id=older_meme_file_id,
+        meme_id=older_meme_id,
+        similarity_score=0.97,
+    )
+
+    merge_outcome = await newer_service.complete_embed_stage(
+        meme_file_id=newer_meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        embedding_result=newer_embedding,
+        similarity_matches=(similarity_match,),
+    )
+
+    assert merge_outcome.merged is True
+    assert merge_outcome.target_meme_id == older_meme_id
+    assert merge_outcome.source_meme_id == newer_meme_id
+    assert merge_outcome.similarity_score == pytest.approx(0.97)
+
+    async with postgres_session_factory() as session:
+        surviving_memes = (
+            await session.execute(select(Meme.id))
+        ).scalars().all()
+        target_meme = await session.scalar(select(Meme).where(Meme.id == older_meme_id))
+        source_meme = await session.scalar(select(Meme).where(Meme.id == newer_meme_id))
+        moved_file = await session.scalar(select(MemeFile).where(MemeFile.id == newer_meme_file_id))
+        moved_popularity_rows = (
+            await session.execute(
+                select(MemePopularitySnapshot).where(MemePopularitySnapshot.meme_id == older_meme_id)
+            )
+        ).scalars().all()
+        merge_log = await session.scalar(
+            select(MemeMergeLog).where(MemeMergeLog.source_meme_file_id == newer_meme_file_id)
+        )
+
+    assert newer_meme_id not in set(surviving_memes)
+    assert source_meme is None
+    assert target_meme is not None
+    assert target_meme.like_count == 3  # newer meme contributes 0 likes so sum stays at 3.
+    assert moved_file is not None
+    assert moved_file.meme_id == older_meme_id
+    assert target_meme.primary_file_id == older_meme_file_id
+    assert len(moved_popularity_rows) == 1
+    assert merge_log is not None
+    assert merge_log.merge_reason == MERGE_REASON_HIGH_SIMILARITY
+    assert merge_log.similarity_score == pytest.approx(0.97)
+
+
+async def test_complete_embed_stage_ignores_self_matches_and_rejects_newer_targets(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    older_meme_file_id, _, older_service = await _drive_to_embed_pending(
+        migrated_db_session,
+        source_id="self-older",
+        post_id="9200",
+        phash_tag="e",
+    )
+    _ = await older_service.complete_embed_stage(
+        meme_file_id=older_meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        embedding_result=build_voyage_embedding_result(input_hash="5" * 64),
+        similarity_matches=(),
+    )
+
+    middle_meme_file_id, _, middle_service = await _drive_to_embed_pending(
+        migrated_db_session,
+        source_id="self-middle",
+        post_id="9201",
+        phash_tag="f",
+    )
+    _ = await middle_service.complete_embed_stage(
+        meme_file_id=middle_meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        embedding_result=build_voyage_embedding_result(input_hash="6" * 64),
+        similarity_matches=(),
+    )
+
+    newer_meme_file_id, _, newer_service = await _drive_to_embed_pending(
+        migrated_db_session,
+        source_id="self-newer",
+        post_id="9202",
+        phash_tag="g",
+    )
+
+    async with postgres_session_factory() as session:
+        middle_file = await session.scalar(select(MemeFile).where(MemeFile.id == middle_meme_file_id))
+        newer_file = await session.scalar(select(MemeFile).where(MemeFile.id == newer_meme_file_id))
+        older_file = await session.scalar(select(MemeFile).where(MemeFile.id == older_meme_file_id))
+        assert middle_file is not None and newer_file is not None and older_file is not None
+        middle_meme_id = middle_file.meme_id
+        newer_meme_id = newer_file.meme_id
+        older_meme_id = older_file.meme_id
+
+    # Self-match (same meme_file_id) must be ignored, and the only other candidate
+    # (middle meme) is older than the newer meme but we also include a pseudo-match
+    # pointing at the newer meme's own meme_id to confirm meme-id self-match is dropped.
+    self_file_match = QdrantSimilarityMatch(
+        meme_file_id=newer_meme_file_id,
+        meme_id=newer_meme_id,
+        similarity_score=0.99,
+    )
+    self_meme_match = QdrantSimilarityMatch(
+        meme_file_id=older_meme_file_id,
+        meme_id=newer_meme_id,
+        similarity_score=0.98,
+    )
+
+    merge_outcome = await newer_service.complete_embed_stage(
+        meme_file_id=newer_meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        embedding_result=build_voyage_embedding_result(input_hash="7" * 64),
+        similarity_matches=(self_file_match, self_meme_match),
+    )
+
+    assert merge_outcome.merged is False
+    assert merge_outcome.target_meme_id == newer_meme_id
+
+    async with postgres_session_factory() as session:
+        surviving = (await session.execute(select(Meme.id))).scalars().all()
+    assert older_meme_id in set(surviving)
+    assert middle_meme_id in set(surviving)
+    assert newer_meme_id in set(surviving)
+
+
+async def test_complete_classify_stage_makes_meme_ready_with_truthful_ocr_and_nsfw(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    publisher = RecordingPublisher()
+    meme_file_id, _, service = await _drive_to_embed_pending(
+        migrated_db_session,
+        source_id="classify-truth",
+        post_id="9300",
+        phash_tag="h",
+        publisher=publisher,
+    )
+    _ = await service.complete_embed_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        embedding_result=build_voyage_embedding_result(input_hash="7" * 64),
+        similarity_matches=(),
+    )
+
+    await service.complete_classify_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        classification_result=build_classification_result(is_nsfw=True, nsfw_score=0.88),
+    )
+
+    after_classify = await service.get_item(meme_file_id)
+    assert after_classify.current_stage is ContentPipelineStage.SYNC_QDRANT
+    assert publisher.events[-1].event_type is ContentPipelineEventType.MEME_READY
+    assert publisher.events[-1].stage is ContentPipelineStage.SYNC_QDRANT
+
+    async with postgres_session_factory() as session:
+        persisted_file = await session.scalar(select(MemeFile).where(MemeFile.id == meme_file_id))
+        assert persisted_file is not None
+        persisted_meme = await session.scalar(select(Meme).where(Meme.id == persisted_file.meme_id))
+
+    assert persisted_file.status is ContentProcessingStatus.READY
+    assert persisted_meme is not None
+    assert persisted_meme.is_nsfw is True
+    assert persisted_meme.ocr_text == "deadline\nmonday"
+    assert persisted_meme.language is ContentLanguage.EN
+
+
+async def test_complete_classify_stage_follows_primary_file_change_after_merge(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    older_meme_file_id, _, older_service = await _drive_to_embed_pending(
+        migrated_db_session,
+        source_id="primary-older",
+        post_id="9400",
+        phash_tag="i",
+        filename="primary-older.png",
+    )
+    _ = await older_service.complete_embed_stage(
+        meme_file_id=older_meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        embedding_result=build_voyage_embedding_result(input_hash="8" * 64),
+        similarity_matches=(),
+    )
+
+    # Mutate the older file + OCR row through the same session so the primary session
+    # sees the changes without cache-expiry surprises.
+    older_file_row = await migrated_db_session.scalar(
+        select(MemeFile).where(MemeFile.id == older_meme_file_id)
+    )
+    assert older_file_row is not None
+    older_meme_id = older_file_row.meme_id
+    older_file_row.quality_score = 0.3  # low so the newer file wins primary reselection.
+    older_ocr = await migrated_db_session.scalar(
+        select(MemeFileOCRResult).where(MemeFileOCRResult.meme_file_id == older_meme_file_id)
+    )
+    assert older_ocr is not None
+    older_ocr.extracted_text = "older-primary-text"
+    older_ocr.language = ContentLanguage.EN
+    await migrated_db_session.commit()
+
+    newer_meme_file_id, newer_normalized, newer_service = await _drive_to_embed_pending(
+        migrated_db_session,
+        source_id="primary-newer",
+        post_id="9401",
+        phash_tag="j",
+        filename="primary-newer.png",
+    )
+
+    newer_file_row = await migrated_db_session.scalar(
+        select(MemeFile).where(MemeFile.id == newer_meme_file_id)
+    )
+    assert newer_file_row is not None
+    newer_meme_id = newer_file_row.meme_id
+    newer_file_row.quality_score = 0.95
+    newer_ocr = await migrated_db_session.scalar(
+        select(MemeFileOCRResult).where(MemeFileOCRResult.meme_file_id == newer_meme_file_id)
+    )
+    assert newer_ocr is not None
+    newer_ocr.extracted_text = "newer-primary-text"
+    newer_ocr.language = ContentLanguage.RU
+    await migrated_db_session.commit()
+
+    merge_outcome = await newer_service.complete_embed_stage(
+        meme_file_id=newer_meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        embedding_result=build_voyage_embedding_result(input_hash="9" * 64),
+        similarity_matches=(
+            QdrantSimilarityMatch(
+                meme_file_id=older_meme_file_id,
+                meme_id=older_meme_id,
+                similarity_score=0.97,
+            ),
+        ),
+    )
+
+    assert merge_outcome.merged is True
+    assert merge_outcome.target_meme_id == older_meme_id
+    assert merge_outcome.primary_file_id == newer_meme_file_id
+
+    await newer_service.complete_classify_stage(
+        meme_file_id=newer_meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        classification_result=build_classification_result(is_nsfw=False, nsfw_score=0.2),
+    )
+
+    async with postgres_session_factory() as session:
+        target_meme = await session.scalar(select(Meme).where(Meme.id == older_meme_id))
+
+    assert target_meme is not None
+    assert target_meme.primary_file_id == newer_meme_file_id
+    # Canonical OCR truth must follow the new primary file's OCR row.
+    assert target_meme.ocr_text == "newer-primary-text"
+    assert target_meme.language is ContentLanguage.RU
+    assert target_meme.is_nsfw is False
+    # Pre-existing newer meme row must be gone.
+    async with postgres_session_factory() as session:
+        stale_meme = await session.scalar(select(Meme).where(Meme.id == newer_meme_id))
+    assert stale_meme is None
+
+
+async def test_complete_embed_stage_publish_failure_marks_classify_failed(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    meme_file_id, _, _ = await _drive_to_embed_pending(
+        migrated_db_session,
+        source_id="embed-publish-fail",
+        post_id="9500",
+        phash_tag="k",
+    )
+
+    failing_service = ContentPipelineService(
+        migrated_db_session,
+        storage_client=FakeStorageClient(),
+        publisher=RecordingPublisher(fail_with=RuntimeError("broker unavailable")),
+    )
+    with pytest.raises(PipelinePublishError, match="downstream dispatch failed"):
+        _ = await failing_service.complete_embed_stage(
+            meme_file_id=meme_file_id,
+            attempt=1,
+            event_id=uuid.uuid7(),
+            embedding_result=build_voyage_embedding_result(input_hash="a" * 64),
+            similarity_matches=(),
+        )
+
+    async with postgres_session_factory() as session:
+        persisted_rows = (
+            await session.execute(
+                select(PipelineStageJournal).where(PipelineStageJournal.meme_file_id == meme_file_id)
+            )
+        ).scalars().all()
+
+    stage_rows = {row.stage: row for row in persisted_rows}
+    assert stage_rows[ContentPipelineStage.EMBED].status is ContentPipelineStageStatus.SUCCEEDED
+    assert stage_rows[ContentPipelineStage.CLASSIFY].status is ContentPipelineStageStatus.FAILED
+    assert stage_rows[ContentPipelineStage.CLASSIFY].normalized_reason == "publish_failed"
+
+
+async def test_complete_embed_stage_rolls_back_partial_merge_and_keeps_embed_replayable(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    older_meme_file_id, _, older_service = await _drive_to_embed_pending(
+        migrated_db_session,
+        source_id="merge-rollback-older",
+        post_id="9600",
+        phash_tag="l",
+        filename="rollback-older.png",
+    )
+    _ = await older_service.complete_embed_stage(
+        meme_file_id=older_meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        embedding_result=build_voyage_embedding_result(input_hash="c" * 64),
+        similarity_matches=(),
+    )
+
+    async with postgres_session_factory() as stash_session:
+        older_file = await stash_session.scalar(select(MemeFile).where(MemeFile.id == older_meme_file_id))
+        assert older_file is not None
+        older_meme_id = older_file.meme_id
+
+    newer_meme_file_id, _, newer_service = await _drive_to_embed_pending(
+        migrated_db_session,
+        source_id="merge-rollback-newer",
+        post_id="9601",
+        phash_tag="m",
+        filename="rollback-newer.png",
+    )
+
+    async with postgres_session_factory() as stash_session:
+        newer_file = await stash_session.scalar(select(MemeFile).where(MemeFile.id == newer_meme_file_id))
+        assert newer_file is not None
+        newer_meme_id = newer_file.meme_id
+
+    from memexpert.services import content_merge as content_merge_module
+
+    async def fake_transfer(self: object, **_: object) -> tuple[uuid.UUID, ...]:
+        _ = self
+        raise RuntimeError("forced merge transfer failure")
+
+    monkeypatch.setattr(
+        content_merge_module.ContentMergeService,
+        "_transfer_meme_files",
+        fake_transfer,
+    )
+
+    similarity_match = QdrantSimilarityMatch(
+        meme_file_id=older_meme_file_id,
+        meme_id=older_meme_id,
+        similarity_score=0.95,
+    )
+
+    with pytest.raises(PipelineIngestError, match="post-embed auto-merge transaction"):
+        _ = await newer_service.complete_embed_stage(
+            meme_file_id=newer_meme_file_id,
+            attempt=1,
+            event_id=uuid.uuid7(),
+            embedding_result=build_voyage_embedding_result(input_hash="d" * 64),
+            similarity_matches=(similarity_match,),
+        )
+
+    async with postgres_session_factory() as verify_session:
+        # Both memes must still be intact because the merge transaction rolled back.
+        surviving_meme_ids = (
+            await verify_session.execute(select(Meme.id))
+        ).scalars().all()
+        embed_stage_row = await verify_session.scalar(
+            select(PipelineStageJournal).where(
+                PipelineStageJournal.meme_file_id == newer_meme_file_id,
+                PipelineStageJournal.stage == ContentPipelineStage.EMBED,
+            )
+        )
+        newer_file_after = await verify_session.scalar(
+            select(MemeFile).where(MemeFile.id == newer_meme_file_id)
+        )
+
+    assert newer_meme_id in set(surviving_meme_ids)
+    assert older_meme_id in set(surviving_meme_ids)
+    assert embed_stage_row is not None
+    # Embed stage must remain replayable after the rollback.
+    assert embed_stage_row.status in {
+        ContentPipelineStageStatus.PENDING,
+        ContentPipelineStageStatus.PROCESSING,
+    }
+    assert newer_file_after is not None
+    assert newer_file_after.meme_id == newer_meme_id  # not moved

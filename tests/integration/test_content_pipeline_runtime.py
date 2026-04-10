@@ -14,11 +14,26 @@ from sqlalchemy import select
 
 import memexpert.services.content_pipeline as content_pipeline_module
 from memexpert.core.broker import build_pipeline_broker
+from memexpert.core.classification import (
+    ClassificationProviderUnavailableError,
+    ClassificationResult,
+)
 from memexpert.core.config import Settings
 from memexpert.core.media import NormalizedMediaResult, UploadMediaDetails
 from memexpert.core.ocr import OCRExtractionResult, OCRTimeoutError
-from memexpert.models.content import Meme, MemeFile, MemeFileOCRResult
-from memexpert.models.enums import ContentLanguage, ContentPipelineStage, ContentPipelineStageStatus, SourcePlatform
+from memexpert.core.voyage import (
+    VoyageEmbeddingResult,
+    VoyageMalformedResponseError,
+    VoyageProviderUnavailableError,
+)
+from memexpert.models.content import EmbeddingCache, Meme, MemeFile, MemeFileOCRResult
+from memexpert.models.enums import (
+    ContentLanguage,
+    ContentPipelineStage,
+    ContentPipelineStageStatus,
+    ContentProcessingStatus,
+    SourcePlatform,
+)
 from memexpert.schemas.content_pipeline import (
     ContentPipelineDispatchEvent,
     ContentPipelineItemRead,
@@ -26,6 +41,9 @@ from memexpert.schemas.content_pipeline import (
 )
 from memexpert.services import ContentPipelineService
 from memexpert.workers.pipeline_runtime import (
+    PIPELINE_REASON_CLASSIFY_PROVIDER_BLOCKED,
+    PIPELINE_REASON_EMBED_MALFORMED_VECTOR,
+    PIPELINE_REASON_EMBED_PROVIDER_BLOCKED,
     PIPELINE_REASON_FORCED_TRANSCODE_FAILURE,
     PIPELINE_REASON_MALFORMED_EVENT,
     PIPELINE_REASON_OCR_TIMEOUT,
@@ -35,6 +53,8 @@ from memexpert.workers.pipeline_runtime import (
 if TYPE_CHECKING:
     from pytest import MonkeyPatch
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from memexpert.core.qdrant import QdrantSimilarityMatch
 
 
 @dataclass(slots=True)
@@ -125,6 +145,8 @@ class FakeMediaProcessor:
 
     normalize_result: NormalizedMediaResult | None = None
     normalize_error: Exception | None = None
+    preview_frame_bytes: bytes = b"fake-preview-frame-bytes"
+    inspect_result: UploadMediaDetails | None = None
 
     async def inspect_upload(
         self,
@@ -134,6 +156,8 @@ class FakeMediaProcessor:
         media_bytes: bytes,
     ) -> UploadMediaDetails:
         _ = (filename, content_type, media_bytes)
+        if self.inspect_result is not None:
+            return self.inspect_result
         raise AssertionError("inspect_upload should not be called by runtime tests")
 
     async def normalize_for_web(
@@ -158,7 +182,7 @@ class FakeMediaProcessor:
         media_bytes: bytes,
     ) -> bytes:
         _ = (filename, content_type, media_bytes)
-        raise AssertionError("extract_preview_frame should not be called by transcode tests")
+        return self.preview_frame_bytes
 
 
 @dataclass(slots=True)
@@ -177,6 +201,59 @@ class FakeOCRProcessor:
         source_object_key: str,
     ) -> OCRExtractionResult:
         _ = (filename, mime_type, media_bytes, source_object_key)
+        if self.error is not None:
+            raise self.error
+        assert self.result is not None
+        return self.result
+
+
+@dataclass(slots=True)
+class FakeVoyageClient:
+    """Typed Voyage boundary double used to make runtime embed tests deterministic."""
+
+    result: VoyageEmbeddingResult | None = None
+    error: Exception | None = None
+    calls: list[dict[str, object]] = field(default_factory=list)
+
+    async def embed_image(self, *, image_bytes: bytes, mime_type: str) -> VoyageEmbeddingResult:
+        self.calls.append({"mime_type": mime_type, "image_size": len(image_bytes)})
+        if self.error is not None:
+            raise self.error
+        assert self.result is not None
+        return self.result
+
+
+@dataclass(slots=True)
+class FakeQdrantClient:
+    """Typed Qdrant boundary double used to make runtime embed tests deterministic."""
+
+    matches: tuple[QdrantSimilarityMatch, ...] = ()
+    error: Exception | None = None
+    calls: list[dict[str, object]] = field(default_factory=list)
+
+    async def find_similar_memes(
+        self,
+        *,
+        vector: tuple[float, ...],
+        current_meme_file_id: uuid.UUID,
+        limit: int | None = None,
+    ) -> tuple[QdrantSimilarityMatch, ...]:
+        self.calls.append({"vector_len": len(vector), "meme_file_id": current_meme_file_id, "limit": limit})
+        if self.error is not None:
+            raise self.error
+        return self.matches
+
+
+@dataclass(slots=True)
+class FakeClassificationClient:
+    """Typed classification boundary double used to make runtime classify tests deterministic."""
+
+    result: ClassificationResult | None = None
+    error: Exception | None = None
+    calls: list[dict[str, object]] = field(default_factory=list)
+
+    async def classify_image(self, *, image_bytes: bytes, mime_type: str) -> ClassificationResult:
+        self.calls.append({"mime_type": mime_type, "image_size": len(image_bytes)})
         if self.error is not None:
             raise self.error
         assert self.result is not None
@@ -687,3 +764,398 @@ async def test_pipeline_runtime_dead_letters_malformed_dispatch_payloads_and_mar
             "headers": {"x-memexpert-failure-reason": PIPELINE_REASON_MALFORMED_EVENT},
         }
     ]
+
+
+def build_voyage_embedding_result(
+    *,
+    vector: tuple[float, ...] | None = None,
+    dimensions: int = 1024,
+    input_hash: str = "c" * 64,
+) -> VoyageEmbeddingResult:
+    """Create a deterministic embedding result for runtime tests."""
+
+    resolved_vector = vector if vector is not None else tuple(0.005 * index for index in range(dimensions))
+    return VoyageEmbeddingResult(
+        model="voyage-multimodal-3.5",
+        dimensions=dimensions,
+        vector=resolved_vector,
+        input_hash=input_hash,
+    )
+
+
+def build_classification_result(*, is_nsfw: bool = False, nsfw_score: float = 0.1) -> ClassificationResult:
+    """Create a deterministic classification result for runtime tests."""
+
+    return ClassificationResult(
+        model="memexpert-nsfw-v1",
+        is_nsfw=is_nsfw,
+        nsfw_score=nsfw_score,
+    )
+
+
+async def _seed_embed_pending_item(
+    session: AsyncSession,
+    *,
+    storage_client: FakeStorageClient,
+    publisher: RecordingPublisher,
+    source_id: str = "embed-runtime-source",
+    post_id: str = "8500",
+) -> tuple[uuid.UUID, ContentPipelineDispatchEvent, NormalizedMediaResult]:
+    """Create a pipeline item and drive it to the EMBED-pending state via the service."""
+
+    service = ContentPipelineService(
+        session,
+        storage_client=storage_client,
+        publisher=publisher,
+    )
+    item = await service.create_upload(
+        metadata=ContentPipelineUploadMetadata(
+            source_platform=SourcePlatform.TELEGRAM,
+            source_id=source_id,
+            post_id=post_id,
+            views=13,
+        ),
+        filename="embed-runtime.png",
+        content_type="image/png",
+        media_bytes=build_png_bytes(color=(30, 40, 50)),
+    )
+    normalized = build_normalized_media_result(item.meme_file_id)
+    storage_client.objects[normalized.web_video_object_key] = StoredObject(
+        body=normalized.web_video_bytes,
+        content_type=normalized.mime_type,
+    )
+    await service.complete_transcode_stage(
+        meme_file_id=item.meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        result=normalized,
+    )
+    await service.complete_ocr_stage(
+        meme_file_id=item.meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        result=build_ocr_result(source_object_key=normalized.web_video_object_key),
+    )
+    return item.meme_file_id, publisher.events[-1], normalized
+
+
+async def _seed_classify_pending_item(
+    session: AsyncSession,
+    *,
+    storage_client: FakeStorageClient,
+    publisher: RecordingPublisher,
+    source_id: str = "classify-runtime-source",
+    post_id: str = "8600",
+) -> tuple[uuid.UUID, ContentPipelineDispatchEvent, NormalizedMediaResult]:
+    """Create a pipeline item and drive it to the CLASSIFY-pending state via the service."""
+
+    meme_file_id, _, normalized = await _seed_embed_pending_item(
+        session,
+        storage_client=storage_client,
+        publisher=publisher,
+        source_id=source_id,
+        post_id=post_id,
+    )
+    service = ContentPipelineService(
+        session,
+        storage_client=storage_client,
+        publisher=publisher,
+    )
+    _ = await service.complete_embed_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        embedding_result=build_voyage_embedding_result(input_hash="d" * 64),
+        similarity_matches=(),
+    )
+    return meme_file_id, publisher.events[-1], normalized
+
+
+async def test_pipeline_runtime_declares_embed_and_classify_queues_and_retry_topology() -> None:
+    settings = Settings()
+    broker = build_pipeline_broker(settings)
+    runtime = build_pipeline_runtime(
+        settings=settings,
+        broker=broker,
+        storage_client=FakeStorageClient(),
+        media_processor=FakeMediaProcessor(normalize_result=build_normalized_media_result(uuid.uuid7())),
+        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key="pipeline/derived/example/web.mp4")),
+        voyage_client=FakeVoyageClient(result=build_voyage_embedding_result()),
+        qdrant_client=FakeQdrantClient(),
+        classification_client=FakeClassificationClient(result=build_classification_result()),
+    )
+
+    declared_queue_arguments: dict[str, dict[str, object] | None] = {}
+    recorded_queues: dict[str, RecordedQueue] = {}
+
+    async def declare_exchange(exchange: object) -> RecordedExchange:
+        return RecordedExchange(name=cast("Any", exchange).name)
+
+    async def declare_queue(queue: object) -> RecordedQueue:
+        queue_name = cast("Any", queue).name
+        declared_queue_arguments[queue_name] = cast("Any", queue).arguments
+        recorded_queue = RecordedQueue(name=queue_name)
+        recorded_queues[queue_name] = recorded_queue
+        return recorded_queue
+
+    cast("Any", broker).declare_exchange = declare_exchange
+    cast("Any", broker).declare_queue = declare_queue
+
+    await runtime.declare_topology()
+
+    assert runtime.embed_queue.name in declared_queue_arguments
+    assert runtime.classify_queue.name in declared_queue_arguments
+    assert runtime.embed_retry_queue.name in declared_queue_arguments
+    assert runtime.classify_retry_queue.name in declared_queue_arguments
+    embed_queue_arguments = declared_queue_arguments[runtime.embed_queue.name] or {}
+    classify_queue_arguments = declared_queue_arguments[runtime.classify_queue.name] or {}
+    embed_retry_queue_arguments = declared_queue_arguments[runtime.embed_retry_queue.name] or {}
+    classify_retry_queue_arguments = declared_queue_arguments[runtime.classify_retry_queue.name] or {}
+
+    assert embed_queue_arguments["x-dead-letter-exchange"] == runtime.broker_settings.retry_exchange
+    assert classify_queue_arguments["x-dead-letter-exchange"] == runtime.broker_settings.retry_exchange
+    assert embed_retry_queue_arguments["x-message-ttl"] == runtime.broker_settings.retry_backoff_milliseconds
+    assert classify_retry_queue_arguments["x-message-ttl"] == runtime.broker_settings.retry_backoff_milliseconds
+
+
+async def test_pipeline_runtime_embed_success_persists_cache_and_dispatches_classify(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    meme_file_id, embed_event, normalized = await _seed_embed_pending_item(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+    )
+    downstream_broker = PublishingBroker()
+
+    async def fake_ensure_pipeline_broker_started(*_: object, **__: object) -> object:
+        return downstream_broker
+
+    monkeypatch.setattr(content_pipeline_module, "ensure_pipeline_broker_started", fake_ensure_pipeline_broker_started)
+
+    embedding_result = build_voyage_embedding_result(input_hash="e" * 64)
+    voyage_client = FakeVoyageClient(result=embedding_result)
+    qdrant_client = FakeQdrantClient()
+    runtime = build_pipeline_runtime(
+        settings=Settings(),
+        broker=build_pipeline_broker(Settings()),
+        session_factory=postgres_session_factory,
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(normalize_result=normalized),
+        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key=normalized.web_video_object_key)),
+        voyage_client=voyage_client,
+        qdrant_client=qdrant_client,
+        classification_client=FakeClassificationClient(result=build_classification_result()),
+    )
+    message = FakeRabbitMessage(message_id=str(embed_event.event_id))
+
+    await runtime.handle_embed_message(embed_event.model_dump(mode="json"), message)
+
+    persisted_item = await _fetch_item(postgres_session_factory, meme_file_id)
+    assert persisted_item.current_stage is ContentPipelineStage.CLASSIFY
+    assert persisted_item.current_status is ContentPipelineStageStatus.PENDING
+    assert message.ack_count == 1
+    assert downstream_broker.publish_calls[0]["routing_key"] == runtime.broker_settings.classify_routing_key
+    assert voyage_client.calls == [
+        {"mime_type": "image/png", "image_size": len(b"fake-preview-frame-bytes")},
+    ]
+    assert qdrant_client.calls[0]["meme_file_id"] == meme_file_id
+
+    async with postgres_session_factory() as session:
+        persisted_cache_row = await session.scalar(
+            select(EmbeddingCache).where(EmbeddingCache.source_file_id == meme_file_id)
+        )
+    assert persisted_cache_row is not None
+    assert persisted_cache_row.embedding == embedding_result.embedding_bytes
+
+
+async def test_pipeline_runtime_embed_provider_unavailable_keeps_stage_replayable(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    meme_file_id, embed_event, normalized = await _seed_embed_pending_item(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+    )
+
+    runtime = build_pipeline_runtime(
+        settings=Settings(),
+        broker=build_pipeline_broker(Settings()),
+        session_factory=postgres_session_factory,
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(normalize_result=normalized),
+        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key=normalized.web_video_object_key)),
+        voyage_client=FakeVoyageClient(error=VoyageProviderUnavailableError("quota")),
+        qdrant_client=FakeQdrantClient(),
+        classification_client=FakeClassificationClient(result=build_classification_result()),
+    )
+    message = FakeRabbitMessage(message_id=str(embed_event.event_id))
+
+    await runtime.handle_embed_message(embed_event.model_dump(mode="json"), message)
+
+    failed_item = await _fetch_item(postgres_session_factory, meme_file_id)
+    assert failed_item.current_stage is ContentPipelineStage.EMBED
+    assert failed_item.current_status is ContentPipelineStageStatus.FAILED
+    assert failed_item.normalized_reason == PIPELINE_REASON_EMBED_PROVIDER_BLOCKED
+    assert message.reject_calls == [False]
+    assert message.ack_count == 0
+
+
+async def test_pipeline_runtime_embed_malformed_vector_marks_non_retryable_failure(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    meme_file_id, embed_event, normalized = await _seed_embed_pending_item(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+    )
+    dead_letters: list[Any] = []
+
+    async def publish_dead_letter(
+        payload: object,
+        queue: object = "",
+        exchange: object | None = None,
+        *,
+        routing_key: str = "",
+        headers: dict[str, object] | None = None,
+        **_: object,
+    ) -> None:
+        _ = queue
+        dead_letters.append(
+            {
+                "payload": payload,
+                "exchange": getattr(exchange, "name", exchange),
+                "routing_key": routing_key,
+                "headers": headers,
+            }
+        )
+
+    broker = build_pipeline_broker(Settings())
+    runtime = build_pipeline_runtime(
+        settings=Settings(),
+        broker=broker,
+        session_factory=postgres_session_factory,
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(normalize_result=normalized),
+        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key=normalized.web_video_object_key)),
+        voyage_client=FakeVoyageClient(
+            error=VoyageMalformedResponseError("wrong dimensions"),
+        ),
+        qdrant_client=FakeQdrantClient(),
+        classification_client=FakeClassificationClient(result=build_classification_result()),
+    )
+    cast("Any", broker).publish = publish_dead_letter
+    message = FakeRabbitMessage(message_id=str(embed_event.event_id))
+
+    await runtime.handle_embed_message(embed_event.model_dump(mode="json"), message)
+
+    failed_item = await _fetch_item(postgres_session_factory, meme_file_id)
+    assert failed_item.current_stage is ContentPipelineStage.EMBED
+    assert failed_item.current_status is ContentPipelineStageStatus.FAILED
+    assert failed_item.normalized_reason == PIPELINE_REASON_EMBED_MALFORMED_VECTOR
+    assert message.ack_count == 1
+    assert message.reject_calls == []
+    assert len(dead_letters) == 1
+    assert dead_letters[0]["headers"] == {
+        "x-memexpert-failure-reason": PIPELINE_REASON_EMBED_MALFORMED_VECTOR,
+    }
+
+
+async def test_pipeline_runtime_classify_success_emits_meme_ready_and_marks_file_ready(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    meme_file_id, classify_event, normalized = await _seed_classify_pending_item(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+    )
+    downstream_broker = PublishingBroker()
+
+    async def fake_ensure_pipeline_broker_started(*_: object, **__: object) -> object:
+        return downstream_broker
+
+    monkeypatch.setattr(content_pipeline_module, "ensure_pipeline_broker_started", fake_ensure_pipeline_broker_started)
+
+    runtime = build_pipeline_runtime(
+        settings=Settings(),
+        broker=build_pipeline_broker(Settings()),
+        session_factory=postgres_session_factory,
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(normalize_result=normalized),
+        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key=normalized.web_video_object_key)),
+        voyage_client=FakeVoyageClient(result=build_voyage_embedding_result()),
+        qdrant_client=FakeQdrantClient(),
+        classification_client=FakeClassificationClient(
+            result=build_classification_result(is_nsfw=True, nsfw_score=0.81),
+        ),
+    )
+    message = FakeRabbitMessage(message_id=str(classify_event.event_id))
+
+    await runtime.handle_classify_message(classify_event.model_dump(mode="json"), message)
+
+    persisted_item = await _fetch_item(postgres_session_factory, meme_file_id)
+    assert persisted_item.current_stage is ContentPipelineStage.SYNC_QDRANT
+    assert persisted_item.current_status is ContentPipelineStageStatus.PENDING
+    assert message.ack_count == 1
+    assert downstream_broker.publish_calls[0]["routing_key"] == runtime.broker_settings.sync_qdrant_routing_key
+
+    async with postgres_session_factory() as session:
+        persisted_file = await session.scalar(select(MemeFile).where(MemeFile.id == meme_file_id))
+        assert persisted_file is not None
+        persisted_meme = await session.scalar(select(Meme).where(Meme.id == persisted_file.meme_id))
+
+    assert persisted_file.status is ContentProcessingStatus.READY
+    assert persisted_meme is not None
+    assert persisted_meme.is_nsfw is True
+    assert persisted_meme.ocr_text == "deadline\nmonday"
+    assert persisted_meme.language is ContentLanguage.EN
+
+
+async def test_pipeline_runtime_classify_provider_unavailable_keeps_stage_replayable(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    meme_file_id, classify_event, normalized = await _seed_classify_pending_item(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+    )
+
+    runtime = build_pipeline_runtime(
+        settings=Settings(),
+        broker=build_pipeline_broker(Settings()),
+        session_factory=postgres_session_factory,
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(normalize_result=normalized),
+        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key=normalized.web_video_object_key)),
+        voyage_client=FakeVoyageClient(result=build_voyage_embedding_result()),
+        qdrant_client=FakeQdrantClient(),
+        classification_client=FakeClassificationClient(
+            error=ClassificationProviderUnavailableError("429 too many requests"),
+        ),
+    )
+    message = FakeRabbitMessage(message_id=str(classify_event.event_id))
+
+    await runtime.handle_classify_message(classify_event.model_dump(mode="json"), message)
+
+    failed_item = await _fetch_item(postgres_session_factory, meme_file_id)
+    assert failed_item.current_stage is ContentPipelineStage.CLASSIFY
+    assert failed_item.current_status is ContentPipelineStageStatus.FAILED
+    assert failed_item.normalized_reason == PIPELINE_REASON_CLASSIFY_PROVIDER_BLOCKED
+    assert message.reject_calls == [False]

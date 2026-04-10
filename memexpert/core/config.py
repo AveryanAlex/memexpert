@@ -102,9 +102,21 @@ class Settings(BaseSettings):
     pipeline_ocr_low_confidence_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
     pipeline_voyage_model: str = "voyage-multimodal-3.5"
     pipeline_voyage_output_dimensions: int = Field(default=1024, ge=1)
+    pipeline_voyage_api_url: str = "https://api.voyageai.com/v1/multimodalembeddings"
+    pipeline_voyage_api_key: SecretStr | None = None
+    pipeline_voyage_timeout_seconds: float = Field(default=30.0, gt=0.0, le=600.0)
     pipeline_qdrant_collection_name: str = "memexpert-memes"
+    pipeline_qdrant_search_top_k: int = Field(default=5, ge=1, le=100)
+    pipeline_qdrant_timeout_seconds: float = Field(default=10.0, gt=0.0, le=600.0)
     pipeline_merge_similarity_threshold: float = Field(default=0.92, ge=0.0, le=1.0)
+    pipeline_classification_api_url: str | None = None
+    pipeline_classification_api_key: SecretStr | None = None
+    pipeline_classification_model: str = "memexpert-nsfw-v1"
+    pipeline_classification_timeout_seconds: float = Field(default=15.0, gt=0.0, le=600.0)
+    pipeline_classification_nsfw_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
     pipeline_worker_fail_transcode_for_meme_file_id: str | None = None
+    pipeline_worker_fail_embed_for_meme_file_id: str | None = None
+    pipeline_worker_fail_classify_for_meme_file_id: str | None = None
     auth_jwt_secret: SecretStr = SecretStr("memexpert-dev-jwt-secret-with-32-byte-minimum")
     auth_access_token_algorithm: Literal["HS256"] = "HS256"
     auth_access_token_ttl_seconds: int = 900
@@ -222,7 +234,9 @@ class Settings(BaseSettings):
         "pipeline_ffmpeg_binary",
         "pipeline_ffprobe_binary",
         "pipeline_voyage_model",
+        "pipeline_voyage_api_url",
         "pipeline_qdrant_collection_name",
+        "pipeline_classification_model",
         mode="before",
     )
     @classmethod
@@ -271,7 +285,12 @@ class Settings(BaseSettings):
             raise ValueError("pipeline_allowed_mime_types must contain MIME types like image/jpeg.")
         return normalized_mime_types
 
-    @field_validator("pipeline_worker_fail_transcode_for_meme_file_id", mode="before")
+    @field_validator(
+        "pipeline_worker_fail_transcode_for_meme_file_id",
+        "pipeline_worker_fail_embed_for_meme_file_id",
+        "pipeline_worker_fail_classify_for_meme_file_id",
+        mode="before",
+    )
     @classmethod
     def _normalize_optional_pipeline_worker_uuid(cls, value: object) -> object:
         if value is None:
@@ -286,7 +305,7 @@ class Settings(BaseSettings):
         try:
             uuid.UUID(normalized_value)
         except ValueError as exc:
-            raise ValueError("pipeline_worker_fail_transcode_for_meme_file_id must be a UUID.") from exc
+            raise ValueError("pipeline worker failure-injection UUID settings must be a UUID.") from exc
         return normalized_value
 
     @field_validator("auth_telegram_bot_username", mode="before")
@@ -308,6 +327,7 @@ class Settings(BaseSettings):
         "auth_google_client_id",
         "auth_google_redirect_uri",
         "pipeline_ocr_fallback_command",
+        "pipeline_classification_api_url",
         mode="before",
     )
     @classmethod

@@ -20,8 +20,16 @@ from memexpert.core.config import Settings, get_settings
 from memexpert.core.media import NormalizedMediaResult, PipelineMediaProcessor, PipelineMediaProcessorProtocol
 from memexpert.core.ocr import OCRExtractionResult, OCRProcessorProtocol, PipelineOCRProcessor
 from memexpert.core.storage import build_original_object_key, get_pipeline_storage_settings, get_s3_client
+from memexpert.core.voyage import VoyageMalformedResponseError
 from memexpert.models.base import utcnow
-from memexpert.models.content import Meme, MemeFile, MemeFileOCRResult, MemeSource, PipelineStageJournal
+from memexpert.models.content import (
+    EmbeddingCache,
+    Meme,
+    MemeFile,
+    MemeFileOCRResult,
+    MemeSource,
+    PipelineStageJournal,
+)
 from memexpert.models.enums import (
     ContentKind,
     ContentLanguage,
@@ -29,6 +37,7 @@ from memexpert.models.enums import (
     ContentPipelineStageStatus,
     ContentProcessingStatus,
     ContentSourceKind,
+    EmbeddingInputType,
 )
 from memexpert.schemas.content_pipeline import (
     MAX_PIPELINE_ERROR_LENGTH,
@@ -42,6 +51,7 @@ from memexpert.schemas.content_pipeline import (
     ContentPipelineUploadMetadata,
     ContentPipelineUploadRead,
 )
+from memexpert.services.content_merge import ContentMergeService, MergeOutcome
 from memexpert.services.errors import (
     PipelineIngestError,
     PipelineItemNotFoundError,
@@ -56,6 +66,10 @@ from memexpert.services.errors import (
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
+
+    from memexpert.core.classification import ClassificationResult
+    from memexpert.core.qdrant import QdrantSimilarityMatch
+    from memexpert.core.voyage import VoyageEmbeddingResult
 
 
 _STAGE_ORDER: dict[ContentPipelineStage, int] = {
@@ -153,11 +167,13 @@ _DOWNSTREAM_STAGE_EVENT_TYPES: dict[ContentPipelineStage, ContentPipelineEventTy
     ContentPipelineStage.TRANSCODE: ContentPipelineEventType.MEME_TRANSCODED,
     ContentPipelineStage.OCR: ContentPipelineEventType.MEME_OCR_DONE,
     ContentPipelineStage.EMBED: ContentPipelineEventType.MEME_EMBEDDED,
+    ContentPipelineStage.CLASSIFY: ContentPipelineEventType.MEME_READY,
 }
 _NEXT_STAGE_BY_STAGE: dict[ContentPipelineStage, ContentPipelineStage] = {
     ContentPipelineStage.TRANSCODE: ContentPipelineStage.OCR,
     ContentPipelineStage.OCR: ContentPipelineStage.EMBED,
     ContentPipelineStage.EMBED: ContentPipelineStage.CLASSIFY,
+    ContentPipelineStage.CLASSIFY: ContentPipelineStage.SYNC_QDRANT,
 }
 
 
@@ -489,6 +505,81 @@ class ContentPipelineService:
             event_id=event_id,
         )
 
+    async def complete_embed_stage(
+        self,
+        *,
+        meme_file_id: uuid.UUID,
+        attempt: int,
+        event_id: uuid.UUID,
+        embedding_result: VoyageEmbeddingResult,
+        similarity_matches: tuple[QdrantSimilarityMatch, ...],
+    ) -> MergeOutcome:
+        """Persist the durable embedding, run auto-merge, and advance the stage chain."""
+
+        meme_file, stage_entry = await self._get_meme_file_and_stage_entry(
+            meme_file_id,
+            ContentPipelineStage.EMBED,
+        )
+        self._ensure_stage_attempt_is_current(stage_entry, attempt=attempt)
+        self._validate_embedding_contract(embedding_result)
+        await self._persist_embedding_cache_row(
+            meme_file=meme_file,
+            embedding_result=embedding_result,
+        )
+
+        merge_service = ContentMergeService(
+            self._session,
+            similarity_threshold=self._settings.pipeline_merge_similarity_threshold,
+        )
+        try:
+            merge_outcome = await merge_service.maybe_merge_after_embed(
+                meme_file=meme_file,
+                similarity_matches=similarity_matches,
+            )
+        except PipelineIngestError:
+            await self._session.rollback()
+            raise
+        except Exception as exc:
+            await self._session.rollback()
+            raise PipelineIngestError("Failed to apply the post-embed auto-merge transaction.") from exc
+
+        await self._finalize_stage_success(
+            meme_file=meme_file,
+            stage_entry=stage_entry,
+            stage=ContentPipelineStage.EMBED,
+            attempt=attempt,
+            event_id=event_id,
+        )
+        return merge_outcome
+
+    async def complete_classify_stage(
+        self,
+        *,
+        meme_file_id: uuid.UUID,
+        attempt: int,
+        event_id: uuid.UUID,
+        classification_result: ClassificationResult,
+    ) -> None:
+        """Persist classification truth on the canonical meme and emit meme_ready."""
+
+        meme_file, stage_entry = await self._get_meme_file_and_stage_entry(
+            meme_file_id,
+            ContentPipelineStage.CLASSIFY,
+        )
+        self._ensure_stage_attempt_is_current(stage_entry, attempt=attempt)
+
+        target_meme = await self._get_canonical_meme(meme_file.meme_id)
+        target_meme.is_nsfw = classification_result.is_nsfw
+        await self._apply_canonical_primary_truth(target_meme)
+
+        await self._finalize_stage_success(
+            meme_file=meme_file,
+            stage_entry=stage_entry,
+            stage=ContentPipelineStage.CLASSIFY,
+            attempt=attempt,
+            event_id=event_id,
+        )
+
     async def mark_stage_failed(
         self,
         *,
@@ -569,10 +660,13 @@ class ContentPipelineService:
             stage=stage,
             created_at=finished_at,
         )
-        if downstream_dispatches:
-            meme_file.status = ContentProcessingStatus.PROCESSING
-        elif stage is ContentPipelineStage.CLASSIFY:
+        # Classification is the terminal heavy-worker stage: once it succeeds the file
+        # is truly downstream-ready even though we still publish MEME_READY so S03's
+        # sync_qdrant/sync_meili consumers can pick up the canonical state.
+        if stage is ContentPipelineStage.CLASSIFY:
             meme_file.status = ContentProcessingStatus.READY
+        elif downstream_dispatches:
+            meme_file.status = ContentProcessingStatus.PROCESSING
         else:
             meme_file.status = ContentProcessingStatus.PROCESSING
 
@@ -911,6 +1005,81 @@ class ContentPipelineService:
         if meme_file is None:
             raise PipelineItemNotFoundError(f"Pipeline item {meme_file_id} does not exist.")
         return meme_file
+
+    async def _get_canonical_meme(self, meme_id: uuid.UUID) -> Meme:
+        result = await self._session.execute(select(Meme).where(Meme.id == meme_id))
+        meme = result.scalar_one_or_none()
+        if meme is None:
+            raise PipelineIngestError(
+                f"Canonical meme {meme_id} is missing when finalizing classification.",
+            )
+        return meme
+
+    async def _apply_canonical_primary_truth(self, meme: Meme) -> None:
+        primary_file_id = meme.primary_file_id
+        if primary_file_id is None:
+            meme.ocr_text = None
+            meme.language = ContentLanguage.NONE
+            return
+
+        result = await self._session.execute(
+            select(MemeFileOCRResult).where(MemeFileOCRResult.meme_file_id == primary_file_id)
+        )
+        ocr_row = result.scalar_one_or_none()
+        if ocr_row is None:
+            meme.ocr_text = None
+            meme.language = ContentLanguage.NONE
+            return
+
+        meme.ocr_text = ocr_row.extracted_text
+        meme.language = ocr_row.language
+
+    def _validate_embedding_contract(self, embedding_result: VoyageEmbeddingResult) -> None:
+        expected_dimensions = self._settings.pipeline_voyage_output_dimensions
+        if embedding_result.dimensions != expected_dimensions:
+            raise PipelineIngestError(
+                "Rejected embedding vector with unexpected dimensionality "
+                f"(got {embedding_result.dimensions}, expected {expected_dimensions}).",
+            )
+        if len(embedding_result.vector) != expected_dimensions:
+            raise PipelineIngestError(
+                "Rejected embedding vector whose length does not match the declared dimensions.",
+            )
+        try:
+            _ = embedding_result.embedding_bytes
+        except VoyageMalformedResponseError as exc:
+            raise PipelineIngestError(str(exc)) from exc
+
+    async def _persist_embedding_cache_row(
+        self,
+        *,
+        meme_file: MemeFile,
+        embedding_result: VoyageEmbeddingResult,
+    ) -> None:
+        existing_result = await self._session.execute(
+            select(EmbeddingCache).where(
+                EmbeddingCache.input_hash == embedding_result.input_hash,
+                EmbeddingCache.model_version == embedding_result.model,
+                EmbeddingCache.input_type == EmbeddingInputType.IMAGE,
+            )
+        )
+        existing_cache_row = existing_result.scalar_one_or_none()
+        if existing_cache_row is not None:
+            existing_cache_row.embedding = embedding_result.embedding_bytes
+            existing_cache_row.source_file_id = meme_file.id
+            await self._session.flush()
+            return
+
+        self._session.add(
+            EmbeddingCache(
+                input_hash=embedding_result.input_hash,
+                input_type=EmbeddingInputType.IMAGE,
+                embedding=embedding_result.embedding_bytes,
+                model_version=embedding_result.model,
+                source_file_id=meme_file.id,
+            )
+        )
+        await self._session.flush()
 
     async def _get_meme_file_and_stage_entry(
         self,
