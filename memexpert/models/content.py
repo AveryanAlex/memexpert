@@ -23,6 +23,7 @@ from memexpert.models.enums import (
     SyncTargetKind,
     SyncTargetStatus,
     TelegramMediaFormat,
+    TelegramSessionStatus,
     string_enum,
 )
 
@@ -345,8 +346,30 @@ class MemeSource(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     reactions: Mapped[dict[str, int]] = mapped_column(JSONB, default=dict, nullable=False)
     is_first_source: Mapped[bool] = mapped_column(default=False, nullable=False)
     source_alive: Mapped[bool] = mapped_column(default=True, nullable=False)
+    # The Telegram publish timestamp captured by the crawler; left NULL for
+    # operator uploads and backfilled rows because they have no upstream
+    # publish time the freshness SLO could measure against.
+    published_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    # Forward-chain attribution: when the crawler saw a reposter channel, the
+    # ``source_id``/``post_id`` pair still records the channel where the post
+    # was seen. These two columns preserve the original author pair so the
+    # product surface can attribute the original poster. Both are NULL when
+    # ``forward`` was absent on the underlying Telegram message.
+    forwarded_from_source_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    forwarded_from_post_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     file: Mapped["MemeFile"] = relationship("MemeFile", back_populates="sources")
+
+    @property
+    def is_forwarded(self) -> bool:
+        """Return ``True`` when this source row points at a forwarded Telegram post.
+
+        Small ergonomic helper so callers do not have to re-derive "this row
+        is a repost" from the two forward columns every time. Kept as a
+        computed property (no DB column) so the ORM contract stays small.
+        """
+
+        return self.forwarded_from_source_id is not None
 
 
 class MemeSeoPage(Base):
@@ -442,6 +465,54 @@ class SourceChannel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     is_active: Mapped[bool] = mapped_column(default=True, nullable=False)
     last_read_post_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     session_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Bounded number of messages to consume during initial catch-up. Prevents
+    # a brand new curated channel from drowning the crawler by fetching years
+    # of history the first time it is added.
+    catchup_message_limit: Mapped[int] = mapped_column(Integer, default=500, nullable=False)
+    # When ``True`` the crawler runs catch-up sweeps for this channel on
+    # startup and after reconnects. Operators can freeze catch-up without
+    # disabling the live listener by setting this to ``False``.
+    catchup_enabled: Mapped[bool] = mapped_column(default=True, nullable=False)
+    # When ``True`` the crawler skips this channel entirely (catch-up AND
+    # live listener). Operators use this to pause a problematic channel
+    # without losing its checkpoint state.
+    is_paused: Mapped[bool] = mapped_column(default=False, nullable=False)
+    # Most recent successful crawler poll for this channel. Distinct from
+    # ``last_read_post_id`` because a poll can return zero new messages;
+    # tracking this separately lets operators see staleness.
+    last_fetched_at: Mapped[datetime | None] = mapped_column(nullable=True)
+
+
+class TelegramSessionState(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """Durable per-session health and cooldown truth for Telethon userbot sessions.
+
+    T02 populates this row when a real Telethon client connects; T01 creates
+    the contract so the crawler runtime, operator surfaces, and the session
+    distributor all agree on the same persisted shape before any real network
+    work lands. Operators see at most one row per ``session_name`` so the
+    table doubles as a session registry. ``status`` uses
+    :class:`TelegramSessionStatus` (separate from sync-target statuses) so
+    session health never collides with any pipeline-stage lifecycle.
+    """
+
+    __tablename__ = "telegram_session_states"
+    __table_args__ = (
+        UniqueConstraint("session_name", name="uq_telegram_session_states_session_name"),
+        Index("ix_telegram_session_states_status_updated_at", "status", "updated_at"),
+    )
+
+    session_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[TelegramSessionStatus] = mapped_column(
+        string_enum(TelegramSessionStatus),
+        default=TelegramSessionStatus.STOPPED,
+        nullable=False,
+    )
+    last_error_class: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_error_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    flood_wait_until: Mapped[datetime | None] = mapped_column(nullable=True)
+    live_listener_started_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    last_heartbeat_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    quarantined_at: Mapped[datetime | None] = mapped_column(nullable=True)
 
 
 class TelegramFileIdCache(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -537,4 +608,5 @@ __all__ = [
     "PipelineStageJournal",
     "SourceChannel",
     "TelegramFileIdCache",
+    "TelegramSessionState",
 ]

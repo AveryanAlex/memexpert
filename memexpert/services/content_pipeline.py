@@ -30,6 +30,7 @@ from memexpert.models.content import (
     MemeFileSyncTargetSnapshot,
     MemeSource,
     PipelineStageJournal,
+    SourceChannel,
 )
 from memexpert.models.enums import (
     ContentKind,
@@ -39,6 +40,7 @@ from memexpert.models.enums import (
     ContentProcessingStatus,
     ContentSourceKind,
     EmbeddingInputType,
+    SourcePlatform,
     SyncTargetKind,
     SyncTargetStatus,
 )
@@ -55,7 +57,10 @@ from memexpert.schemas.content_pipeline import (
     ContentPipelineSyncTargetPreview,
     ContentPipelineUploadMetadata,
     ContentPipelineUploadRead,
+    CrawlerIngestOutcome,
+    CrawlerIngestResult,
     PerTargetSyncStatus,
+    RawCrawlerPost,
     SmokeProofResult,
 )
 from memexpert.services.content_merge import ContentMergeService, MergeOutcome
@@ -65,6 +70,8 @@ from memexpert.services.content_pipeline_reporting import (
 )
 from memexpert.services.content_pipeline_smoke import run_smoke_proof
 from memexpert.services.errors import (
+    CrawlerChannelNotTrackedError,
+    CrawlerPublishError,
     PipelineIngestError,
     PipelineItemNotFoundError,
     PipelineMergeTransactionError,
@@ -134,6 +141,24 @@ _PIPELINE_REASON_SYNC_QDRANT_MALFORMED_PAYLOAD = "sync_qdrant_malformed_payload"
 # runtime's malformed-response classification verbatim so retryability stays
 # consistent between the Qdrant and Meilisearch sync paths.
 _PIPELINE_REASON_SYNC_MEILI_MALFORMED_PAYLOAD = "sync_meili_malformed_payload"
+
+# Default filename + content-type hints used when a ``RawCrawlerPost`` omits
+# them. The media processor still validates the actual bytes and rejects
+# anything unsupported, but it needs a non-None filename/content_type
+# because both ``inspect_upload`` parameters are required. Keeping the
+# mapping narrow (only the three crawler media types) is deliberate: if
+# the crawler ever sends a media type outside this set, the service
+# short-circuits with ``SKIPPED_UNSUPPORTED_MEDIA`` before we get here.
+_CRAWLER_MEDIA_DEFAULT_FILENAMES: dict[str, str] = {
+    "photo": "telegram-photo.jpg",
+    "gif": "telegram-animation.mp4",
+    "video": "telegram-video.mp4",
+}
+_CRAWLER_MEDIA_DEFAULT_CONTENT_TYPES: dict[str, str] = {
+    "photo": "image/jpeg",
+    "gif": "video/mp4",
+    "video": "video/mp4",
+}
 
 
 class ObjectStorageClient(Protocol):
@@ -330,6 +355,119 @@ class ContentPipelineService:
             raise PipelinePublishError("Upload was stored, but downstream dispatch failed.") from exc
 
         return ContentPipelineUploadRead.model_validate(item.model_dump(mode="python"))
+
+    async def create_crawler_ingest(self, raw_post: RawCrawlerPost) -> CrawlerIngestResult:
+        """Persist one crawler post durably, then publish downstream work exactly once.
+
+        Parallel to :meth:`create_upload` but sourced from the Telegram crawler.
+        Reuses the media-inspection, S3 write, auto-dedup, stage-journal, and
+        publish-after-commit helpers so the two ingest paths stay byte-identical
+        below the row shape. The service layer enforces:
+
+        * unsupported-media short-circuit BEFORE touching S3 or the DB,
+        * paused / untracked channel guards BEFORE any durable writes,
+        * durable idempotency on ``(platform, source_id, post_id)``,
+        * forward-chain attribution preserved on reposter rows,
+        * ``last_read_post_id`` monotonic advancement,
+        * ``last_fetched_at`` updated on every successful ingest path.
+        """
+
+        received_at = utcnow()
+
+        if raw_post.media_type not in _CRAWLER_MEDIA_DEFAULT_FILENAMES:
+            # Unsupported media: the caller must not touch S3 or the DB, so
+            # we return the terminal outcome immediately. The channel
+            # checkpoint stays untouched here because the crawler decides
+            # whether this post counts as "scanned" — the service only
+            # reports what it saw.
+            return CrawlerIngestResult(
+                outcome=CrawlerIngestOutcome.SKIPPED_UNSUPPORTED_MEDIA,
+                published_at=raw_post.published_at,
+                received_at=received_at,
+            )
+
+        # Resolve the tracked channel. Curated channels MUST already exist as
+        # ``source_channels`` rows — silently accepting a stray crawler post
+        # would make the S04 curated-wave contract untrustworthy.
+        channel = await self._get_tracked_source_channel(
+            platform=raw_post.platform,
+            source_id=raw_post.source_id,
+        )
+        if channel.is_paused:
+            return CrawlerIngestResult(
+                outcome=CrawlerIngestOutcome.SKIPPED_PAUSED_CHANNEL,
+                published_at=raw_post.published_at,
+                received_at=received_at,
+            )
+
+        # Idempotency guard: re-deliveries of the same Telegram message hit the
+        # existing unique ``(platform, source_id, post_id)`` tuple. We short-
+        # circuit with the existing row ids BEFORE touching S3 so replays stay
+        # cheap. Checkpoint advancement still happens below because advancing
+        # the checkpoint on a known post is correct — the message is durable.
+        existing_source_row = await self._find_existing_crawler_source_row(
+            platform=raw_post.platform,
+            source_id=raw_post.source_id,
+            post_id=raw_post.post_id,
+        )
+        if existing_source_row is not None:
+            await self._advance_source_channel_checkpoint(
+                channel=channel,
+                post_id=raw_post.post_id,
+                fetched_at=received_at,
+            )
+            await self._commit_stage_mutation(
+                "Failed to persist crawler checkpoint advancement on duplicate post.",
+            )
+            return CrawlerIngestResult(
+                meme_file_id=existing_source_row.file_id,
+                meme_source_id=existing_source_row.id,
+                outcome=CrawlerIngestOutcome.SKIPPED_DUPLICATE_POST_ID,
+                published_at=raw_post.published_at,
+                received_at=received_at,
+            )
+
+        meme_file_id = uuid.uuid7()
+        prepared_upload = await self._prepare_upload(
+            meme_file_id=meme_file_id,
+            filename=raw_post.filename or _CRAWLER_MEDIA_DEFAULT_FILENAMES[raw_post.media_type],
+            content_type=raw_post.content_type or _CRAWLER_MEDIA_DEFAULT_CONTENT_TYPES[raw_post.media_type],
+            media_bytes=raw_post.media_bytes,
+        )
+
+        await self._put_original_object(
+            prepared_upload=prepared_upload,
+            media_bytes=raw_post.media_bytes,
+        )
+
+        try:
+            ingest_result, dispatch_event = await self._persist_crawler_ingest(
+                meme_file_id=meme_file_id,
+                raw_post=raw_post,
+                prepared_upload=prepared_upload,
+                channel=channel,
+                received_at=received_at,
+            )
+        except Exception:
+            await self._cleanup_uploaded_object(prepared_upload.object_key)
+            raise
+
+        if dispatch_event is None:
+            return ingest_result
+
+        try:
+            await self._publisher(dispatch_event)
+        except Exception as exc:
+            await self._mark_dispatch_failure(
+                meme_file_id=meme_file_id,
+                dispatch_event=dispatch_event,
+                error=exc,
+            )
+            raise CrawlerPublishError(
+                "Crawler ingest was stored, but downstream dispatch failed.",
+            ) from exc
+
+        return ingest_result
 
     async def get_item(self, meme_file_id: uuid.UUID) -> ContentPipelineItemRead:
         """Return one pipeline item and its stage journal from durable PostgreSQL state."""
@@ -1585,6 +1723,287 @@ class ContentPipelineService:
         item = await self.get_item(meme_file_id)
         return item, dispatch_event
 
+    async def _persist_crawler_ingest(
+        self,
+        *,
+        meme_file_id: uuid.UUID,
+        raw_post: RawCrawlerPost,
+        prepared_upload: PreparedUpload,
+        channel: SourceChannel,
+        received_at: datetime,
+    ) -> tuple[CrawlerIngestResult, ContentPipelineDispatchEvent | None]:
+        """Commit the crawler ingest rows in one transaction and return the result.
+
+        This helper mirrors :meth:`_persist_upload` but diverges on the row
+        shapes: the crawler ingest always adds a forward-attribution-aware
+        ``MemeSource`` row, populates ``published_at``, and advances the
+        ``SourceChannel`` checkpoint. Everything else (dispatch event,
+        duplicate-detection, new-meme creation) uses the same helpers the
+        upload path uses.
+        """
+
+        try:
+            duplicate_match = await self._find_duplicate_match(prepared_upload.perceptual_hash)
+            is_forwarded = raw_post.forward is not None
+
+            if duplicate_match is None:
+                meme_id = uuid.uuid7()
+                publish_event_id = uuid.uuid7()
+                dispatch_event: ContentPipelineDispatchEvent | None = ContentPipelineDispatchEvent(
+                    event_id=publish_event_id,
+                    event_type=ContentPipelineEventType.MEME_CREATED,
+                    meme_id=meme_id,
+                    meme_file_id=meme_file_id,
+                    stage=ContentPipelineStage.TRANSCODE,
+                    source_kind=ContentSourceKind.TELEGRAM,
+                    original_object_key=prepared_upload.object_key,
+                    attempt=1,
+                    created_at=received_at,
+                )
+                new_source_row = await self._create_new_crawler_ingest_rows(
+                    meme_id=meme_id,
+                    meme_file_id=meme_file_id,
+                    raw_post=raw_post,
+                    prepared_upload=prepared_upload,
+                    publish_event_id=publish_event_id,
+                    received_at=received_at,
+                    is_first_source=not is_forwarded,
+                )
+                outcome = CrawlerIngestOutcome.INGESTED
+                duplicate_of_meme_id: uuid.UUID | None = None
+            else:
+                dispatch_event = None
+                # For the dedupe branch we do NOT create a new meme or stage
+                # journal; we only attach a new ``MemeSource`` row to the
+                # existing ``MemeFile`` and mark ``is_first_source`` based on
+                # whether this observation is a forwarded repost AND whether
+                # no existing row has claimed first-source status yet.
+                any_existing_first_source = await self._meme_file_has_first_source(duplicate_match.id)
+                should_claim_first_source = (not is_forwarded) and not any_existing_first_source
+                new_source_row = self._attach_crawler_source_row_to_meme_file(
+                    meme_file=duplicate_match,
+                    raw_post=raw_post,
+                    is_first_source=should_claim_first_source,
+                )
+                meme_id = duplicate_match.meme_id
+                meme_file_id = duplicate_match.id
+                outcome = CrawlerIngestOutcome.DEDUPLICATED_EXACT
+                duplicate_of_meme_id = duplicate_match.meme_id
+
+            await self._advance_source_channel_checkpoint(
+                channel=channel,
+                post_id=raw_post.post_id,
+                fetched_at=received_at,
+            )
+            await self._session.commit()
+        except PipelinePayloadValidationError:
+            await self._session.rollback()
+            raise
+        except SQLAlchemyError as exc:
+            await self._session.rollback()
+            raise PipelineIngestError(
+                "Failed to persist the crawler ingest and journal state.",
+            ) from exc
+
+        # Refresh the source row after commit so callers see the id set.
+        await self._session.refresh(new_source_row)
+
+        return (
+            CrawlerIngestResult(
+                meme_file_id=meme_file_id,
+                meme_source_id=new_source_row.id,
+                outcome=outcome,
+                duplicate_of_meme_id=duplicate_of_meme_id,
+                published_at=raw_post.published_at,
+                received_at=received_at,
+            ),
+            dispatch_event,
+        )
+
+    async def _create_new_crawler_ingest_rows(
+        self,
+        *,
+        meme_id: uuid.UUID,
+        meme_file_id: uuid.UUID,
+        raw_post: RawCrawlerPost,
+        prepared_upload: PreparedUpload,
+        publish_event_id: uuid.UUID,
+        received_at: datetime,
+        is_first_source: bool,
+    ) -> MemeSource:
+        """Insert the Meme + MemeFile + MemeSource + stage rows for a new crawler post."""
+
+        meme = Meme(
+            id=meme_id,
+            media_type=prepared_upload.media_type,
+            language=ContentLanguage.NONE,
+            is_public=False,
+        )
+        self._session.add(meme)
+        await self._session.flush()
+
+        meme_file = MemeFile(
+            id=meme_file_id,
+            meme_id=meme_id,
+            status=ContentProcessingStatus.PENDING,
+            width=prepared_upload.width,
+            height=prepared_upload.height,
+            file_size_bytes=prepared_upload.file_size_bytes,
+            mime_type=prepared_upload.mime_type,
+            s3_original_key=prepared_upload.object_key,
+            perceptual_hash=prepared_upload.perceptual_hash,
+            is_primary=True,
+        )
+        self._session.add(meme_file)
+        await self._session.flush()
+
+        meme.primary_file_id = meme_file_id
+        new_source_row = MemeSource(
+            file_id=meme_file_id,
+            platform=raw_post.platform,
+            source_id=raw_post.source_id,
+            post_id=raw_post.post_id,
+            views=raw_post.views,
+            reactions=dict(raw_post.reactions),
+            is_first_source=is_first_source,
+            source_alive=True,
+            published_at=raw_post.published_at,
+            forwarded_from_source_id=raw_post.forward.source_id if raw_post.forward is not None else None,
+            forwarded_from_post_id=raw_post.forward.post_id if raw_post.forward is not None else None,
+        )
+        self._session.add_all(
+            [
+                new_source_row,
+                PipelineStageJournal(
+                    meme_file_id=meme_file_id,
+                    stage=ContentPipelineStage.INGEST,
+                    status=ContentPipelineStageStatus.SUCCEEDED,
+                    attempt_count=1,
+                    last_event_id=publish_event_id,
+                    is_retryable=False,
+                    started_at=received_at,
+                    finished_at=received_at,
+                ),
+                PipelineStageJournal(
+                    meme_file_id=meme_file_id,
+                    stage=ContentPipelineStage.TRANSCODE,
+                    status=ContentPipelineStageStatus.PENDING,
+                    attempt_count=0,
+                    last_event_id=publish_event_id,
+                    is_retryable=True,
+                ),
+            ]
+        )
+        await self._session.flush()
+        return new_source_row
+
+    def _attach_crawler_source_row_to_meme_file(
+        self,
+        *,
+        meme_file: MemeFile,
+        raw_post: RawCrawlerPost,
+        is_first_source: bool,
+    ) -> MemeSource:
+        """Add a new ``MemeSource`` row to an existing meme file on pHash dedup.
+
+        The existing meme + meme_file + pipeline stage journal state is
+        intentionally untouched — dedupe reuses the durable state already in
+        place. The new row carries the repost's ``published_at``, its
+        forward-chain attribution, and its own ``is_first_source`` flag.
+        """
+
+        new_source_row = MemeSource(
+            file_id=meme_file.id,
+            platform=raw_post.platform,
+            source_id=raw_post.source_id,
+            post_id=raw_post.post_id,
+            views=raw_post.views,
+            reactions=dict(raw_post.reactions),
+            is_first_source=is_first_source,
+            source_alive=True,
+            published_at=raw_post.published_at,
+            forwarded_from_source_id=raw_post.forward.source_id if raw_post.forward is not None else None,
+            forwarded_from_post_id=raw_post.forward.post_id if raw_post.forward is not None else None,
+        )
+        self._session.add(new_source_row)
+        return new_source_row
+
+    async def _get_tracked_source_channel(
+        self,
+        *,
+        platform: SourcePlatform,
+        source_id: str,
+    ) -> SourceChannel:
+        """Return the ``SourceChannel`` row for ``(platform, source_id)`` or raise.
+
+        Raises :class:`CrawlerChannelNotTrackedError` if the row is missing:
+        curated crawlers must only consume from channels an operator added.
+        """
+
+        result = await self._session.execute(
+            select(SourceChannel)
+            .where(
+                SourceChannel.platform == platform,
+                SourceChannel.platform_id == source_id,
+            )
+            .limit(1)
+        )
+        channel = result.scalar_one_or_none()
+        if channel is None:
+            raise CrawlerChannelNotTrackedError(
+                f"Crawler ingest received a post from untracked channel "
+                f"{platform.value}:{source_id}.",
+            )
+        return channel
+
+    async def _find_existing_crawler_source_row(
+        self,
+        *,
+        platform: SourcePlatform,
+        source_id: str,
+        post_id: str,
+    ) -> MemeSource | None:
+        result = await self._session.execute(
+            select(MemeSource)
+            .where(
+                MemeSource.platform == platform,
+                MemeSource.source_id == source_id,
+                MemeSource.post_id == post_id,
+            )
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
+    async def _meme_file_has_first_source(self, meme_file_id: uuid.UUID) -> bool:
+        result = await self._session.execute(
+            select(MemeSource.id)
+            .where(
+                MemeSource.file_id == meme_file_id,
+                MemeSource.is_first_source.is_(True),
+            )
+            .limit(1)
+        )
+        return result.scalar_one_or_none() is not None
+
+    async def _advance_source_channel_checkpoint(
+        self,
+        *,
+        channel: SourceChannel,
+        post_id: str,
+        fetched_at: datetime,
+    ) -> None:
+        """Advance the channel checkpoint monotonically.
+
+        ``last_fetched_at`` is always refreshed because every successful
+        ingest path is a proof of liveness. ``last_read_post_id`` only
+        advances to a strictly higher value so out-of-order deliveries
+        never regress the crawler's scan position.
+        """
+
+        channel.last_fetched_at = fetched_at
+        if _compare_telegram_post_ids(post_id, channel.last_read_post_id) > 0:
+            channel.last_read_post_id = post_id
+
     async def _create_new_upload_rows(
         self,
         *,
@@ -2273,6 +2692,31 @@ class ContentPipelineService:
         if not suffix:
             raise PipelineUnsupportedMediaTypeError("Uploaded filename must include an extension.")
         return suffix
+
+
+def _compare_telegram_post_ids(candidate: str, current: str | None) -> int:
+    """Return 1 if ``candidate`` is strictly after ``current``, 0 if equal, -1 if before.
+
+    Telegram channel message ids are integers that only ever grow, so the
+    normal path parses both as ints. When the current checkpoint is absent
+    the candidate always wins. The helper falls back to string comparison
+    only when either value cannot be parsed as an int, which keeps the
+    crawler resilient if a caller ever hands the service an opaque
+    identifier (e.g. during tests).
+    """
+
+    if current is None:
+        return 1
+    try:
+        candidate_int = int(candidate)
+        current_int = int(current)
+    except ValueError:
+        if candidate == current:
+            return 0
+        return 1 if candidate > current else -1
+    if candidate_int == current_int:
+        return 0
+    return 1 if candidate_int > current_int else -1
 
 
 def _build_sync_preview_model(

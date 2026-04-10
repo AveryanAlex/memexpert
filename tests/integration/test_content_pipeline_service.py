@@ -38,6 +38,7 @@ from memexpert.models.content import (
     MemePopularitySnapshot,
     MemeSource,
     PipelineStageJournal,
+    SourceChannel,
 )
 from memexpert.models.enums import (
     ContentKind,
@@ -54,9 +55,14 @@ from memexpert.schemas.content_pipeline import (
     ContentPipelineEventType,
     ContentPipelineSyncTargetPreview,
     ContentPipelineUploadMetadata,
+    CrawlerForwardAttribution,
+    CrawlerIngestOutcome,
+    RawCrawlerPost,
 )
 from memexpert.services import (
     ContentPipelineService,
+    CrawlerChannelNotTrackedError,
+    CrawlerPublishError,
     PipelineIngestError,
     PipelineMergeTransactionError,
     PipelinePayloadTooLargeError,
@@ -2510,4 +2516,614 @@ async def test_run_smoke_proof_uses_meili_search_timeout_reason_on_query_step(
     # id-lookup passed even though the query leg timed out.
     assert meili_result.matched_by == "id_lookup"
 
+
+# ---------------------------------------------------------------------------
+# S04 crawler ingest contract
+# ---------------------------------------------------------------------------
+
+
+async def _seed_tracked_telegram_channel(
+    session: AsyncSession,
+    *,
+    platform_id: str,
+    title: str,
+    username: str | None = None,
+    is_paused: bool = False,
+    last_read_post_id: str | None = None,
+) -> SourceChannel:
+    """Helper that creates a tracked Telegram channel the crawler is allowed to ingest from."""
+
+    channel = SourceChannel(
+        platform=SourcePlatform.TELEGRAM,
+        platform_id=platform_id,
+        username=username,
+        title=title,
+        is_active=True,
+        is_paused=is_paused,
+        last_read_post_id=last_read_post_id,
+    )
+    session.add(channel)
+    await session.commit()
+    await session.refresh(channel)
+    return channel
+
+
+def _build_raw_telegram_post(
+    *,
+    source_id: str,
+    post_id: str,
+    media_bytes: bytes,
+    published_at: datetime | None = None,
+    media_type: str = "photo",
+    forward: CrawlerForwardAttribution | None = None,
+    views: int = 7,
+    filename: str | None = None,
+    content_type: str | None = None,
+) -> RawCrawlerPost:
+    from typing import Literal as _Literal
+    from typing import cast as _cast
+
+    _CrawlerMediaType = _Literal["photo", "gif", "video"]
+    return RawCrawlerPost(
+        platform=SourcePlatform.TELEGRAM,
+        source_id=source_id,
+        post_id=post_id,
+        published_at=published_at or utcnow_for_tests(),
+        channel_username=None,
+        channel_title="Tracked Channel",
+        media_type=_cast("_CrawlerMediaType", media_type),
+        media_bytes=media_bytes,
+        filename=filename,
+        content_type=content_type,
+        views=views,
+        reactions={"like": 3},
+        forward=forward,
+    )
+
+
+def _build_crawler_service(
+    session: AsyncSession,
+    *,
+    phash_tag: str,
+    publisher: RecordingPublisher | None = None,
+) -> ContentPipelineService:
+    return ContentPipelineService(
+        session,
+        storage_client=FakeStorageClient(),
+        publisher=publisher or RecordingPublisher(),
+        media_processor=FakeMediaProcessor(inspect_result=_make_distinct_upload_media_details(tag=phash_tag)),
+    )
+
+
+async def test_create_crawler_ingest_happy_path_creates_rows_and_publishes_event(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    channel = await _seed_tracked_telegram_channel(
+        migrated_db_session,
+        platform_id="memes_channel",
+        title="Memes Channel",
+    )
+    publisher = RecordingPublisher(session_factory=postgres_session_factory)
+    service = _build_crawler_service(
+        migrated_db_session,
+        phash_tag="C",
+        publisher=publisher,
+    )
+
+    published_at = utcnow_for_tests()
+    raw_post = _build_raw_telegram_post(
+        source_id="memes_channel",
+        post_id="42",
+        media_bytes=b"crawler-photo",
+        published_at=published_at,
+    )
+
+    result = await service.create_crawler_ingest(raw_post)
+
+    assert result.outcome is CrawlerIngestOutcome.INGESTED
+    assert result.meme_file_id is not None
+    assert result.meme_source_id is not None
+    assert result.published_at == published_at
+    assert result.duplicate_of_meme_id is None
+
+    assert len(publisher.events) == 1
+    event = publisher.events[0]
+    assert event.event_type is ContentPipelineEventType.MEME_CREATED
+    assert event.stage is ContentPipelineStage.TRANSCODE
+
+    async with postgres_session_factory() as session:
+        persisted_source = await session.scalar(
+            select(MemeSource).where(MemeSource.id == result.meme_source_id)
+        )
+        persisted_channel = await session.scalar(
+            select(SourceChannel).where(SourceChannel.id == channel.id)
+        )
+
+    assert persisted_source is not None
+    assert persisted_source.is_first_source is True
+    assert persisted_source.published_at == published_at
+    assert persisted_source.forwarded_from_source_id is None
+    assert persisted_source.forwarded_from_post_id is None
+    assert persisted_source.views == 7
+
+    assert persisted_channel is not None
+    assert persisted_channel.last_read_post_id == "42"
+    assert persisted_channel.last_fetched_at is not None
+
+
+async def test_create_crawler_ingest_skips_unsupported_media_without_side_effects(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _seed_tracked_telegram_channel(
+        migrated_db_session,
+        platform_id="memes_channel_unsupported",
+        title="Unsupported",
+    )
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    service = ContentPipelineService(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+    )
+
+    from pydantic import ValidationError as _ValidationError
+
+    # The schema rejects a non-crawler media type up-front; the service is
+    # never reached for the unsupported-media case because it cannot type
+    # the post. We still exercise the service's early-exit path via a
+    # direct model_construct + service call to prove the guard is honest.
+    bypass_post = RawCrawlerPost.model_construct(
+        platform=SourcePlatform.TELEGRAM,
+        source_id="memes_channel_unsupported",
+        post_id="99",
+        published_at=utcnow_for_tests(),
+        channel_username=None,
+        channel_title="Unsupported",
+        media_type="sticker",  # type: ignore[arg-type]
+        media_bytes=b"ignored",
+        filename=None,
+        content_type=None,
+        views=0,
+        reactions={},
+        forward=None,
+    )
+
+    result = await service.create_crawler_ingest(bypass_post)
+    assert result.outcome is CrawlerIngestOutcome.SKIPPED_UNSUPPORTED_MEDIA
+    assert result.meme_file_id is None
+    assert result.meme_source_id is None
+    assert storage_client.put_calls == []
+    assert publisher.events == []
+    assert await _count_pipeline_rows(postgres_session_factory) == (0, 0, 0, 0)
+
+    # Also verify the schema-level validator rejects unsupported media at the
+    # boundary so the typed adapter path cannot reach the service with bad
+    # media in the first place.
+    with pytest.raises(_ValidationError):
+        _ = _build_raw_telegram_post(
+            source_id="memes_channel_unsupported",
+            post_id="99",
+            media_bytes=b"ignored",
+            media_type="sticker",
+        )
+
+
+async def test_create_crawler_ingest_skips_paused_channel(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _seed_tracked_telegram_channel(
+        migrated_db_session,
+        platform_id="paused_channel",
+        title="Paused",
+        is_paused=True,
+    )
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    service = ContentPipelineService(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+        media_processor=FakeMediaProcessor(
+            inspect_result=_make_distinct_upload_media_details(tag="P"),
+        ),
+    )
+
+    result = await service.create_crawler_ingest(
+        _build_raw_telegram_post(
+            source_id="paused_channel",
+            post_id="1",
+            media_bytes=b"paused-photo",
+        )
+    )
+
+    assert result.outcome is CrawlerIngestOutcome.SKIPPED_PAUSED_CHANNEL
+    assert result.meme_file_id is None
+    assert storage_client.put_calls == []
+    assert publisher.events == []
+    async with postgres_session_factory() as session:
+        meme_count = await session.scalar(select(func.count()).select_from(Meme))
+    assert meme_count == 0
+
+
+async def test_create_crawler_ingest_raises_when_channel_is_not_tracked(
+    migrated_db_session: AsyncSession,
+) -> None:
+    service = ContentPipelineService(
+        migrated_db_session,
+        storage_client=FakeStorageClient(),
+        publisher=RecordingPublisher(),
+        media_processor=FakeMediaProcessor(
+            inspect_result=_make_distinct_upload_media_details(tag="U"),
+        ),
+    )
+
+    with pytest.raises(CrawlerChannelNotTrackedError):
+        _ = await service.create_crawler_ingest(
+            _build_raw_telegram_post(
+                source_id="unknown_channel",
+                post_id="1",
+                media_bytes=b"unknown",
+            )
+        )
+
+
+async def test_create_crawler_ingest_second_delivery_returns_existing_row(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _seed_tracked_telegram_channel(
+        migrated_db_session,
+        platform_id="dup_channel",
+        title="Dup Channel",
+    )
+    publisher = RecordingPublisher()
+    service = _build_crawler_service(
+        migrated_db_session,
+        phash_tag="D",
+        publisher=publisher,
+    )
+
+    first = await service.create_crawler_ingest(
+        _build_raw_telegram_post(
+            source_id="dup_channel",
+            post_id="55",
+            media_bytes=b"dup-photo",
+        )
+    )
+    assert first.outcome is CrawlerIngestOutcome.INGESTED
+
+    second = await service.create_crawler_ingest(
+        _build_raw_telegram_post(
+            source_id="dup_channel",
+            post_id="55",
+            media_bytes=b"dup-photo-2",
+        )
+    )
+
+    assert second.outcome is CrawlerIngestOutcome.SKIPPED_DUPLICATE_POST_ID
+    assert second.meme_source_id == first.meme_source_id
+    assert second.meme_file_id == first.meme_file_id
+    # Only the initial ingest should have produced a dispatch event.
+    assert len(publisher.events) == 1
+
+    async with postgres_session_factory() as session:
+        source_count = await session.scalar(select(func.count()).select_from(MemeSource))
+    assert source_count == 1
+
+
+async def test_create_crawler_ingest_exact_phash_dedup_adds_second_source_row(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _seed_tracked_telegram_channel(
+        migrated_db_session,
+        platform_id="phash_primary",
+        title="Primary",
+    )
+    await _seed_tracked_telegram_channel(
+        migrated_db_session,
+        platform_id="phash_secondary",
+        title="Secondary",
+    )
+    publisher = RecordingPublisher()
+    # Use a single phash tag so both ingests see the same perceptual hash
+    # from the fake media processor — this drives the exact-dedup branch.
+    service = _build_crawler_service(
+        migrated_db_session,
+        phash_tag="E",
+        publisher=publisher,
+    )
+
+    original_published_at = utcnow_for_tests()
+    first = await service.create_crawler_ingest(
+        _build_raw_telegram_post(
+            source_id="phash_primary",
+            post_id="1",
+            media_bytes=b"original-bytes",
+            published_at=original_published_at,
+        )
+    )
+    assert first.outcome is CrawlerIngestOutcome.INGESTED
+
+    from datetime import timedelta
+
+    repost_published_at = original_published_at + timedelta(minutes=5)
+    second = await service.create_crawler_ingest(
+        _build_raw_telegram_post(
+            source_id="phash_secondary",
+            post_id="99",
+            media_bytes=b"original-bytes",
+            published_at=repost_published_at,
+        )
+    )
+
+    assert second.outcome is CrawlerIngestOutcome.DEDUPLICATED_EXACT
+    assert second.meme_file_id == first.meme_file_id
+    assert second.duplicate_of_meme_id is not None
+    # No new dispatch event is expected on dedupe.
+    assert len(publisher.events) == 1
+
+    async with postgres_session_factory() as session:
+        sources = (
+            (
+                await session.execute(
+                    select(MemeSource)
+                    .where(MemeSource.file_id == first.meme_file_id)
+                    .order_by(MemeSource.source_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    assert len(sources) == 2
+    primary_row = next(row for row in sources if row.source_id == "phash_primary")
+    secondary_row = next(row for row in sources if row.source_id == "phash_secondary")
+    # Only the original (non-forwarded, seen first) row is the first source.
+    assert primary_row.is_first_source is True
+    assert secondary_row.is_first_source is False
+    # The repost row records its own publish time, not the primary's.
+    assert secondary_row.published_at == repost_published_at
+
+
+async def test_create_crawler_ingest_forward_attribution_original_seen_first(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _seed_tracked_telegram_channel(
+        migrated_db_session,
+        platform_id="original_channel",
+        title="Original",
+    )
+    await _seed_tracked_telegram_channel(
+        migrated_db_session,
+        platform_id="reposter_channel",
+        title="Reposter",
+    )
+    publisher = RecordingPublisher()
+    service = _build_crawler_service(
+        migrated_db_session,
+        phash_tag="F",
+        publisher=publisher,
+    )
+
+    first = await service.create_crawler_ingest(
+        _build_raw_telegram_post(
+            source_id="original_channel",
+            post_id="1",
+            media_bytes=b"forward-bytes",
+        )
+    )
+    assert first.outcome is CrawlerIngestOutcome.INGESTED
+
+    repost = await service.create_crawler_ingest(
+        _build_raw_telegram_post(
+            source_id="reposter_channel",
+            post_id="10",
+            media_bytes=b"forward-bytes",
+            forward=CrawlerForwardAttribution(
+                source_id="original_channel",
+                post_id="1",
+                channel_username=None,
+                channel_title="Original",
+            ),
+        )
+    )
+    assert repost.outcome is CrawlerIngestOutcome.DEDUPLICATED_EXACT
+
+    async with postgres_session_factory() as session:
+        original_row = await session.scalar(
+            select(MemeSource).where(MemeSource.source_id == "original_channel")
+        )
+        reposter_row = await session.scalar(
+            select(MemeSource).where(MemeSource.source_id == "reposter_channel")
+        )
+
+    assert original_row is not None
+    assert reposter_row is not None
+    assert original_row.is_first_source is True
+    assert reposter_row.is_first_source is False
+    assert reposter_row.forwarded_from_source_id == "original_channel"
+    assert reposter_row.forwarded_from_post_id == "1"
+    assert original_row.forwarded_from_source_id is None
+
+
+async def test_create_crawler_ingest_forward_attribution_reposter_seen_first(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _seed_tracked_telegram_channel(
+        migrated_db_session,
+        platform_id="original_channel",
+        title="Original",
+    )
+    await _seed_tracked_telegram_channel(
+        migrated_db_session,
+        platform_id="reposter_channel",
+        title="Reposter",
+    )
+    publisher = RecordingPublisher()
+    service = _build_crawler_service(
+        migrated_db_session,
+        phash_tag="G",
+        publisher=publisher,
+    )
+
+    # Reposter seen first — with forward attribution pointing at the
+    # original, the reposter's row must NOT claim first-source status.
+    reposter_result = await service.create_crawler_ingest(
+        _build_raw_telegram_post(
+            source_id="reposter_channel",
+            post_id="10",
+            media_bytes=b"forward-bytes",
+            forward=CrawlerForwardAttribution(
+                source_id="original_channel",
+                post_id="1",
+                channel_username=None,
+                channel_title="Original",
+            ),
+        )
+    )
+    assert reposter_result.outcome is CrawlerIngestOutcome.INGESTED
+
+    async with postgres_session_factory() as session:
+        reposter_row = await session.scalar(
+            select(MemeSource).where(MemeSource.source_id == "reposter_channel")
+        )
+    assert reposter_row is not None
+    assert reposter_row.is_first_source is False
+    assert reposter_row.forwarded_from_source_id == "original_channel"
+    assert reposter_row.forwarded_from_post_id == "1"
+
+    # Now ingest the original later — pHash dedupes, and because no existing
+    # row claimed ``is_first_source``, the original's new row claims it.
+    original_result = await service.create_crawler_ingest(
+        _build_raw_telegram_post(
+            source_id="original_channel",
+            post_id="1",
+            media_bytes=b"forward-bytes",
+        )
+    )
+    assert original_result.outcome is CrawlerIngestOutcome.DEDUPLICATED_EXACT
+
+    async with postgres_session_factory() as session:
+        refreshed_reposter = await session.scalar(
+            select(MemeSource).where(MemeSource.source_id == "reposter_channel")
+        )
+        original_row = await session.scalar(
+            select(MemeSource).where(MemeSource.source_id == "original_channel")
+        )
+
+    assert original_row is not None
+    assert refreshed_reposter is not None
+    assert original_row.is_first_source is True
+    # Reposter row is untouched: still not first, still carries forward attribution.
+    assert refreshed_reposter.is_first_source is False
+
+
+async def test_create_crawler_ingest_checkpoint_advances_monotonically(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _seed_tracked_telegram_channel(
+        migrated_db_session,
+        platform_id="monotonic_channel",
+        title="Monotonic",
+        last_read_post_id="100",
+    )
+    publisher = RecordingPublisher()
+    service = _build_crawler_service(
+        migrated_db_session,
+        phash_tag="M",
+        publisher=publisher,
+    )
+
+    # Out-of-order delivery: a post with id 50 lands first even though the
+    # checkpoint is already at 100. ``last_read_post_id`` must NOT regress.
+    lower_result = await service.create_crawler_ingest(
+        _build_raw_telegram_post(
+            source_id="monotonic_channel",
+            post_id="50",
+            media_bytes=b"low-post",
+        )
+    )
+    assert lower_result.outcome is CrawlerIngestOutcome.INGESTED
+
+    async with postgres_session_factory() as session:
+        channel_after_low = await session.scalar(
+            select(SourceChannel).where(SourceChannel.platform_id == "monotonic_channel")
+        )
+    assert channel_after_low is not None
+    assert channel_after_low.last_read_post_id == "100"
+    assert channel_after_low.last_fetched_at is not None
+
+    # A higher id advances the checkpoint.
+    # Use a distinct phash for the second post so dedupe does not short-circuit.
+    service_higher = _build_crawler_service(
+        migrated_db_session,
+        phash_tag="N",
+        publisher=publisher,
+    )
+    higher_result = await service_higher.create_crawler_ingest(
+        _build_raw_telegram_post(
+            source_id="monotonic_channel",
+            post_id="200",
+            media_bytes=b"high-post",
+        )
+    )
+    assert higher_result.outcome is CrawlerIngestOutcome.INGESTED
+
+    async with postgres_session_factory() as session:
+        channel_after_high = await session.scalar(
+            select(SourceChannel).where(SourceChannel.platform_id == "monotonic_channel")
+        )
+    assert channel_after_high is not None
+    assert channel_after_high.last_read_post_id == "200"
+
+
+async def test_create_crawler_ingest_publish_failure_preserves_source_row(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _seed_tracked_telegram_channel(
+        migrated_db_session,
+        platform_id="publish_fail_channel",
+        title="Publish Fail",
+    )
+    failing_publisher = RecordingPublisher(fail_with=RuntimeError("broker unavailable"))
+    service = _build_crawler_service(
+        migrated_db_session,
+        phash_tag="H",
+        publisher=failing_publisher,
+    )
+
+    with pytest.raises(CrawlerPublishError, match="downstream dispatch failed"):
+        _ = await service.create_crawler_ingest(
+            _build_raw_telegram_post(
+                source_id="publish_fail_channel",
+                post_id="1",
+                media_bytes=b"publish-fail",
+            )
+        )
+
+    async with postgres_session_factory() as session:
+        persisted_source = await session.scalar(
+            select(MemeSource).where(MemeSource.source_id == "publish_fail_channel")
+        )
+        transcode_row = await session.scalar(
+            select(PipelineStageJournal)
+            .where(PipelineStageJournal.stage == ContentPipelineStage.TRANSCODE)
+        )
+
+    # The ingest committed durably before publish was attempted, so the row
+    # must survive the publish failure. The transcode stage row is marked
+    # failed with the publish-failure reason so operators can replay it.
+    assert persisted_source is not None
+    assert transcode_row is not None
+    assert transcode_row.status is ContentPipelineStageStatus.FAILED
+    assert transcode_row.normalized_reason == "publish_failed"
 

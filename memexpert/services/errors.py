@@ -262,6 +262,31 @@ class PipelineReplayNotAllowedError(PipelineServiceError):
     error_code: ClassVar[str] = "pipeline_replay_not_allowed"
 
 
+class CrawlerChannelNotTrackedError(PipelineIngestError):
+    """Raised when the crawler tries to ingest a post from an unknown channel.
+
+    Curated S04 crawlers must only consume from channels that exist as
+    ``source_channels`` rows. An ingest call for a channel with no row is a
+    genuine configuration bug (a curated channel got removed, or the
+    crawler is pointed at something it should not be), not a silent
+    fallthrough the service should ignore.
+    """
+
+    error_code: ClassVar[str] = "crawler_channel_not_tracked"
+
+
+class CrawlerPublishError(PipelineIngestError):
+    """Raised when a crawler ingest commits durably but downstream publish fails.
+
+    Parallel to :class:`PipelinePublishError` but scoped to the crawler
+    entrypoint so the runtime dispatcher can distinguish operator-upload
+    publish failures from crawler-ingest publish failures without
+    stringifying either exception.
+    """
+
+    error_code: ClassVar[str] = "crawler_publish_failure"
+
+
 __all__ = [
     "AccountLinkAlreadyCompletedError",
     "AccountLinkError",
@@ -274,6 +299,8 @@ __all__ = [
     "CollectionServiceError",
     "CollectionVerificationRequiredError",
     "CollectionWriteAccessError",
+    "CrawlerChannelNotTrackedError",
+    "CrawlerPublishError",
     "DuplicateCollectionInviteError",
     "DuplicateFavoritesCollectionError",
     "DuplicateIdentityError",

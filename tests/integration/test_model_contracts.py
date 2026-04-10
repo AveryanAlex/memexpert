@@ -30,6 +30,7 @@ from memexpert.models.content import (
     PipelineStageJournal,
     SourceChannel,
     TelegramFileIdCache,
+    TelegramSessionState,
 )
 from memexpert.models.enums import (
     AccountDeletionAction,
@@ -51,6 +52,7 @@ from memexpert.models.enums import (
     SyncTargetKind,
     SyncTargetStatus,
     TelegramMediaFormat,
+    TelegramSessionStatus,
     UserLanguage,
 )
 from memexpert.models.user import (
@@ -103,6 +105,7 @@ EXPECTED_TABLES = {
     "source_channels",
     "telegram_file_id_cache",
     "telegram_link_codes",
+    "telegram_session_states",
     "users",
 }
 
@@ -1099,6 +1102,120 @@ async def test_sync_target_snapshot_orm_persists_and_enforces_uniqueness(
                     status=SyncTargetStatus.FAILED,
                     attempt_count=1,
                     last_payload_preview={},
+                ),
+            ]
+        )
+
+        with pytest.raises(IntegrityError):
+            await session.commit()
+
+
+def test_telegram_session_status_values_are_locked_and_stable() -> None:
+    # Enum values are wire-visible: the durable session-state row stores them
+    # verbatim and the operator surface serializes them into the admin API
+    # response payload. Locking the tuple order here protects T02/T03/T04
+    # against accidental reordering or renames.
+    assert tuple(TelegramSessionStatus) == (
+        TelegramSessionStatus.ACTIVE,
+        TelegramSessionStatus.FLOOD_WAIT,
+        TelegramSessionStatus.QUARANTINED,
+        TelegramSessionStatus.STOPPED,
+    )
+    assert [member.value for member in TelegramSessionStatus] == [
+        "active",
+        "flood_wait",
+        "quarantined",
+        "stopped",
+    ]
+
+
+def test_meme_source_exposes_forward_attribution_columns_and_helper() -> None:
+    # The forward-chain columns must exist on the ORM model so create_crawler_ingest
+    # can populate them; ``is_forwarded`` is the ergonomic helper that keeps the
+    # reposter-detection logic out of every caller.
+    columns = MemeSource.__table__.c
+    assert "published_at" in columns
+    assert "forwarded_from_source_id" in columns
+    assert "forwarded_from_post_id" in columns
+
+    plain = MemeSource(
+        file_id=uuid.uuid7(),
+        platform=SourcePlatform.TELEGRAM,
+        source_id="memes_channel",
+        post_id="42",
+    )
+    assert plain.is_forwarded is False
+
+    reposter = MemeSource(
+        file_id=uuid.uuid7(),
+        platform=SourcePlatform.TELEGRAM,
+        source_id="reposter_channel",
+        post_id="100",
+        forwarded_from_source_id="original_channel",
+        forwarded_from_post_id="7",
+    )
+    assert reposter.is_forwarded is True
+
+
+def test_source_channel_exposes_crawler_checkpoint_columns() -> None:
+    columns = SourceChannel.__table__.c
+    assert "catchup_message_limit" in columns
+    assert "catchup_enabled" in columns
+    assert "is_paused" in columns
+    assert "last_fetched_at" in columns
+    # Defaults live on the column descriptors because SQLAlchemy resolves
+    # them at flush time, not at construction time. Reading them off the
+    # column keeps this a pure unit test that does not need a session.
+    assert columns["catchup_message_limit"].default.arg == 500  # type: ignore[union-attr]
+    assert columns["catchup_enabled"].default.arg is True  # type: ignore[union-attr]
+    assert columns["is_paused"].default.arg is False  # type: ignore[union-attr]
+
+
+def test_meme_source_unique_platform_source_post_still_holds() -> None:
+    # The crawler contract depends on this tuple to enforce idempotency.
+    # If T02/T03 ever accidentally drops the constraint, the crawler ingest
+    # would lose its duplicate-post guard, so locking this assertion keeps
+    # the S04 tests honest about the contract.
+    unique_constraints = {
+        constraint.name: tuple(column.name for column in constraint.columns)
+        for constraint in MemeSource.__table__.constraints
+        if constraint.__class__.__name__ == "UniqueConstraint"
+    }
+    assert unique_constraints == {
+        "uq_meme_sources_platform_source_post": ("platform", "source_id", "post_id"),
+    }
+
+
+async def test_telegram_session_state_orm_persists_and_enforces_uniqueness(
+    model_contract_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with model_contract_session_factory() as session:
+        row = TelegramSessionState(
+            session_name="primary",
+            status=TelegramSessionStatus.ACTIVE,
+            last_heartbeat_at=utcnow(),
+        )
+        session.add(row)
+        await session.commit()
+
+        persisted = await session.scalar(
+            select(TelegramSessionState).where(
+                TelegramSessionState.session_name == "primary",
+            )
+        )
+        assert persisted is not None
+        assert persisted.status is TelegramSessionStatus.ACTIVE
+
+    async with model_contract_session_factory() as session:
+        session.add_all(
+            [
+                TelegramSessionState(
+                    session_name="duplicate",
+                    status=TelegramSessionStatus.STOPPED,
+                ),
+                TelegramSessionState(
+                    session_name="duplicate",
+                    status=TelegramSessionStatus.ACTIVE,
                 ),
             ]
         )

@@ -221,6 +221,24 @@ class SyncTargetStatus(StrEnum):
     FAILED = "failed"
 
 
+class TelegramSessionStatus(StrEnum):
+    """Operational lifecycle for a Telethon userbot session.
+
+    Deliberately separate from ``SyncTargetStatus`` and
+    ``ContentPipelineStageStatus`` so session health does not collide with
+    sync-target or stage-journal semantics: an ``active`` session is
+    connected and eligible for ingest work, ``flood_wait`` records a
+    Telegram-enforced cooldown, ``quarantined`` documents that an operator
+    pulled the session out of rotation, and ``stopped`` marks a session
+    that was intentionally brought down.
+    """
+
+    ACTIVE = "active"
+    FLOOD_WAIT = "flood_wait"
+    QUARANTINED = "quarantined"
+    STOPPED = "stopped"
+
+
 class AnalyticsEventType(StrEnum):
     """General analytics event names recorded by product surfaces."""
 
@@ -261,6 +279,7 @@ __all__ = [
     "SyncTargetKind",
     "SyncTargetStatus",
     "TelegramMediaFormat",
+    "TelegramSessionStatus",
     "UserLanguage",
     "string_enum",
 ]

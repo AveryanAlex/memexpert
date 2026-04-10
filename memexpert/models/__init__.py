@@ -16,6 +16,7 @@ from memexpert.models.content import (
     PipelineStageJournal,
     SourceChannel,
     TelegramFileIdCache,
+    TelegramSessionState,
 )
 from memexpert.models.enums import (
     AccountDeletionAction,
@@ -40,6 +41,7 @@ from memexpert.models.enums import (
     SyncTargetKind,
     SyncTargetStatus,
     TelegramMediaFormat,
+    TelegramSessionStatus,
     UserLanguage,
     string_enum,
 )
@@ -105,6 +107,8 @@ __all__ = [
     "TelegramFileIdCache",
     "TelegramLinkCode",
     "TelegramMediaFormat",
+    "TelegramSessionState",
+    "TelegramSessionStatus",
     "TimestampMixin",
     "UUIDPrimaryKeyMixin",
     "User",

@@ -7,6 +7,7 @@ import re
 import uuid
 from datetime import timedelta
 from functools import lru_cache
+from pathlib import Path
 from typing import Annotated, ClassVar, Literal, cast
 
 from pydantic import AnyHttpUrl, Field, SecretStr, TypeAdapter, ValidationError, field_validator
@@ -121,6 +122,28 @@ class Settings(BaseSettings):
     pipeline_worker_fail_classify_for_meme_file_id: str | None = None
     pipeline_worker_fail_sync_qdrant_for_meme_file_id: str | None = None
     pipeline_worker_fail_sync_meili_for_meme_file_id: str | None = None
+    # --- S04: curated Telethon crawler + freshness SLO -----------------
+    # ``telegram_api_id`` / ``telegram_api_hash`` are deliberately optional at
+    # T01 so the pipeline service and the ``FakeTelegramClient`` stay
+    # side-effect free; T02 consumes them when the real Telethon adapter
+    # lands. ``telegram_session_dir`` documents where T02 will persist
+    # ``.session`` files; the directory is neither created nor read at
+    # import time.
+    telegram_api_id: int | None = None
+    telegram_api_hash: SecretStr | None = None
+    telegram_session_dir: Path = Path("./.telegram-sessions")
+    # Conservative crawler rate: the Telethon docs and the tech design both
+    # cap user-bot sessions at 30 req/s. T04's SLO proof harness measures
+    # freshness under this limit; T02's real adapter enforces it.
+    crawler_max_requests_per_second: float = Field(default=15.0, gt=0, le=30)
+    crawler_live_mode_enabled: bool = True
+    # Freshness SLO budgets (publish → both sync targets synced) in seconds.
+    # T04 asserts the measured p50/p95 against these numbers; T02/T03 do
+    # not depend on them directly but surface them through the operator
+    # inspect surface so drift is visible.
+    crawler_freshness_slo_p50_seconds: float = Field(default=60.0, gt=0)
+    crawler_freshness_slo_p95_seconds: float = Field(default=180.0, gt=0)
+    crawler_default_catchup_message_limit: int = Field(default=500, gt=0, le=10000)
     auth_jwt_secret: SecretStr = SecretStr("memexpert-dev-jwt-secret-with-32-byte-minimum")
     auth_access_token_algorithm: Literal["HS256"] = "HS256"
     auth_access_token_ttl_seconds: int = 900
