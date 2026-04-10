@@ -55,6 +55,7 @@ from memexpert.services.content_merge import ContentMergeService, MergeOutcome
 from memexpert.services.errors import (
     PipelineIngestError,
     PipelineItemNotFoundError,
+    PipelineMergeTransactionError,
     PipelinePayloadTooLargeError,
     PipelinePayloadValidationError,
     PipelinePublishError,
@@ -540,8 +541,14 @@ class ContentPipelineService:
             await self._session.rollback()
             raise
         except Exception as exc:
+            # A mid-merge exception (Qdrant outage during similarity lookup, row-lock
+            # conflict, or any transient runtime failure) rolls back the single merge
+            # transaction and stays replayable — distinct from contract-violation
+            # failures above, which surface the base ``PipelineIngestError``.
             await self._session.rollback()
-            raise PipelineIngestError("Failed to apply the post-embed auto-merge transaction.") from exc
+            raise PipelineMergeTransactionError(
+                "Failed to apply the post-embed auto-merge transaction.",
+            ) from exc
 
         await self._finalize_stage_success(
             meme_file=meme_file,

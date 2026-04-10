@@ -235,6 +235,21 @@ class PipelineIngestError(PipelineServiceError):
     error_code: ClassVar[str] = "pipeline_ingest_failure"
 
 
+class PipelineMergeTransactionError(PipelineIngestError):
+    """Raised when the post-embed auto-merge transaction fails transiently.
+
+    Unlike generic ``PipelineIngestError`` (which signals a contract violation that
+    cannot be recovered by retrying — e.g. malformed vectors, missing OCR rows,
+    impossible state transitions), a merge-transaction failure represents a
+    recoverable runtime condition: a Qdrant outage during similarity lookup, a
+    database row-lock conflict between two concurrent merges, or any transient
+    mid-merge exception. The embed stage row therefore stays replayable so the
+    runtime can retry without operator intervention.
+    """
+
+    error_code: ClassVar[str] = "pipeline_merge_transaction_failure"
+
+
 class PipelinePublishError(PipelineServiceError):
     """Raised when downstream dispatch fails after durable writes succeed."""
 
@@ -275,6 +290,7 @@ __all__ = [
     "MissingTokenError",
     "PipelineIngestError",
     "PipelineItemNotFoundError",
+    "PipelineMergeTransactionError",
     "PipelineOperatorTokenError",
     "PipelinePayloadTooLargeError",
     "PipelinePayloadValidationError",

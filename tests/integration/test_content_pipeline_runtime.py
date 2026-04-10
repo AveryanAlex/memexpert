@@ -19,15 +19,35 @@ from memexpert.core.classification import (
     ClassificationResult,
 )
 from memexpert.core.config import Settings
-from memexpert.core.media import NormalizedMediaResult, UploadMediaDetails
+from memexpert.core.media import (
+    NormalizedMediaResult,
+    PipelineMediaProcessorProtocol,
+    UploadMediaDetails,
+)
 from memexpert.core.ocr import OCRExtractionResult, OCRTimeoutError
+from memexpert.core.qdrant import (
+    QdrantMalformedResponseError,
+    QdrantProviderUnavailableError,
+    QdrantSimilarityMatch,
+    QdrantTimeoutError,
+)
 from memexpert.core.voyage import (
     VoyageEmbeddingResult,
     VoyageMalformedResponseError,
     VoyageProviderUnavailableError,
+    VoyageTimeoutError,
 )
-from memexpert.models.content import EmbeddingCache, Meme, MemeFile, MemeFileOCRResult
+from memexpert.models.content import (
+    EmbeddingCache,
+    Meme,
+    MemeFile,
+    MemeFileOCRResult,
+    MemeMergeLog,
+    MemePopularitySnapshot,
+    MemeSource,
+)
 from memexpert.models.enums import (
+    ContentKind,
     ContentLanguage,
     ContentPipelineStage,
     ContentPipelineStageStatus,
@@ -37,13 +57,19 @@ from memexpert.models.enums import (
 from memexpert.schemas.content_pipeline import (
     ContentPipelineDispatchEvent,
     ContentPipelineItemRead,
+    ContentPipelineStageJournalRead,
     ContentPipelineUploadMetadata,
 )
 from memexpert.services import ContentPipelineService
 from memexpert.workers.pipeline_runtime import (
     PIPELINE_REASON_CLASSIFY_PROVIDER_BLOCKED,
     PIPELINE_REASON_EMBED_MALFORMED_VECTOR,
+    PIPELINE_REASON_EMBED_MERGE_TRANSACTION,
     PIPELINE_REASON_EMBED_PROVIDER_BLOCKED,
+    PIPELINE_REASON_EMBED_SIMILARITY_BLOCKED,
+    PIPELINE_REASON_EMBED_SIMILARITY_MALFORMED,
+    PIPELINE_REASON_EMBED_SIMILARITY_TIMEOUT,
+    PIPELINE_REASON_EMBED_TIMEOUT,
     PIPELINE_REASON_FORCED_TRANSCODE_FAILURE,
     PIPELINE_REASON_MALFORMED_EVENT,
     PIPELINE_REASON_OCR_TIMEOUT,
@@ -53,8 +79,6 @@ from memexpert.workers.pipeline_runtime import (
 if TYPE_CHECKING:
     from pytest import MonkeyPatch
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-
-    from memexpert.core.qdrant import QdrantSimilarityMatch
 
 
 @dataclass(slots=True)
@@ -793,6 +817,20 @@ def build_classification_result(*, is_nsfw: bool = False, nsfw_score: float = 0.
     )
 
 
+def _make_distinct_upload_media_details(*, tag: str) -> UploadMediaDetails:
+    """Build unique upload metadata so repeated ingests get distinct perceptual hashes."""
+
+    perceptual_hash = (tag * 16)[:16]
+    return UploadMediaDetails(
+        media_type=ContentKind.IMAGE,
+        mime_type="image/png",
+        width=128,
+        height=128,
+        file_size_bytes=64,
+        perceptual_hash=perceptual_hash,
+    )
+
+
 async def _seed_embed_pending_item(
     session: AsyncSession,
     *,
@@ -800,13 +838,20 @@ async def _seed_embed_pending_item(
     publisher: RecordingPublisher,
     source_id: str = "embed-runtime-source",
     post_id: str = "8500",
+    phash_tag: str | None = None,
 ) -> tuple[uuid.UUID, ContentPipelineDispatchEvent, NormalizedMediaResult]:
     """Create a pipeline item and drive it to the EMBED-pending state via the service."""
 
+    media_processor: PipelineMediaProcessorProtocol | None = None
+    if phash_tag is not None:
+        media_processor = FakeMediaProcessor(
+            inspect_result=_make_distinct_upload_media_details(tag=phash_tag),
+        )
     service = ContentPipelineService(
         session,
         storage_client=storage_client,
         publisher=publisher,
+        media_processor=media_processor,
     )
     item = await service.create_upload(
         metadata=ContentPipelineUploadMetadata(
@@ -1159,3 +1204,448 @@ async def test_pipeline_runtime_classify_provider_unavailable_keeps_stage_replay
     assert failed_item.current_status is ContentPipelineStageStatus.FAILED
     assert failed_item.normalized_reason == PIPELINE_REASON_CLASSIFY_PROVIDER_BLOCKED
     assert message.reject_calls == [False]
+
+
+def _select_stage_row(
+    item: ContentPipelineItemRead,
+    stage: ContentPipelineStage,
+) -> ContentPipelineStageJournalRead:
+    row = next((entry for entry in item.stages if entry.stage is stage), None)
+    assert row is not None
+    return row
+
+
+async def test_pipeline_runtime_embed_merge_transaction_failure_keeps_stage_replayable(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A merge-time failure (Qdrant outage mid-merge, row-lock conflict, or any transient
+    exception during ``maybe_merge_after_embed``) must roll back the single embed
+    transaction but leave the stage row replayable — the runtime must not dead-letter
+    it, and ``replay_item`` must accept a replay against a clean durable state.
+    """
+
+    storage_client = FakeStorageClient()
+    seed_publisher = RecordingPublisher()
+
+    # Drive the older meme all the way to EMBED-succeeded so its row exists in
+    # Qdrant's perspective — that gives us a plausible similarity match for the
+    # newer meme to collide with.
+    older_meme_file_id, _, older_normalized = await _seed_embed_pending_item(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=seed_publisher,
+        source_id="runtime-merge-rollback-older",
+        post_id="9700",
+        phash_tag="o",
+    )
+    async with postgres_session_factory() as stash_session:
+        older_service = ContentPipelineService(
+            stash_session,
+            storage_client=storage_client,
+            publisher=seed_publisher,
+        )
+        _ = await older_service.complete_embed_stage(
+            meme_file_id=older_meme_file_id,
+            attempt=1,
+            event_id=uuid.uuid7(),
+            embedding_result=build_voyage_embedding_result(input_hash="2" * 64),
+            similarity_matches=(),
+        )
+        older_file_row = await stash_session.scalar(
+            select(MemeFile).where(MemeFile.id == older_meme_file_id)
+        )
+        assert older_file_row is not None
+        older_meme_id = older_file_row.meme_id
+
+    # Baseline snapshot: files, sources, merge-log, popularity for the older meme
+    # should remain unchanged after the merge rollback on the newer file.
+    async with postgres_session_factory() as baseline_session:
+        baseline_files = (
+            await baseline_session.execute(select(MemeFile).where(MemeFile.meme_id == older_meme_id))
+        ).scalars().all()
+        baseline_file_ids = {row.id for row in baseline_files}
+        baseline_sources = (
+            await baseline_session.execute(
+                select(MemeSource).where(MemeSource.file_id.in_(baseline_file_ids))
+            )
+        ).scalars().all()
+        baseline_merge_logs = (
+            await baseline_session.execute(select(MemeMergeLog))
+        ).scalars().all()
+        baseline_popularity = (
+            await baseline_session.execute(
+                select(MemePopularitySnapshot).where(MemePopularitySnapshot.meme_id == older_meme_id)
+            )
+        ).scalars().all()
+
+    newer_publisher = RecordingPublisher()
+    newer_meme_file_id, embed_event, newer_normalized = await _seed_embed_pending_item(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=newer_publisher,
+        source_id="runtime-merge-rollback-newer",
+        post_id="9701",
+        phash_tag="n",
+    )
+
+    # Force the merge transaction to fail inside _transfer_meme_files. The
+    # runtime wraps this into a PipelineMergeTransactionError via the service
+    # layer and the classifier must keep it replayable.
+    from memexpert.services import content_merge as content_merge_module
+
+    async def fake_transfer(self: object, **_: object) -> tuple[uuid.UUID, ...]:
+        _ = self
+        raise RuntimeError("forced runtime merge-transfer failure")
+
+    monkeypatch.setattr(
+        content_merge_module.ContentMergeService,
+        "_transfer_meme_files",
+        fake_transfer,
+    )
+
+    similarity_match = QdrantSimilarityMatch(
+        meme_file_id=older_meme_file_id,
+        meme_id=older_meme_id,
+        similarity_score=0.96,
+    )
+    runtime = build_pipeline_runtime(
+        settings=Settings(),
+        broker=build_pipeline_broker(Settings()),
+        session_factory=postgres_session_factory,
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(normalize_result=newer_normalized),
+        ocr_processor=FakeOCRProcessor(
+            result=build_ocr_result(source_object_key=newer_normalized.web_video_object_key),
+        ),
+        voyage_client=FakeVoyageClient(result=build_voyage_embedding_result(input_hash="3" * 64)),
+        qdrant_client=FakeQdrantClient(matches=(similarity_match,)),
+        classification_client=FakeClassificationClient(result=build_classification_result()),
+    )
+    message = FakeRabbitMessage(message_id=str(embed_event.event_id))
+
+    await runtime.handle_embed_message(embed_event.model_dump(mode="json"), message)
+
+    failed_item = await _fetch_item(postgres_session_factory, newer_meme_file_id)
+    assert failed_item.current_stage is ContentPipelineStage.EMBED
+    assert failed_item.current_status is ContentPipelineStageStatus.FAILED
+    assert failed_item.normalized_reason == PIPELINE_REASON_EMBED_MERGE_TRANSACTION
+    # Critical: merge-transaction failures must stay replayable so the runtime
+    # can retry without operator intervention.
+    embed_stage_row = _select_stage_row(failed_item, ContentPipelineStage.EMBED)
+    assert embed_stage_row.is_retryable is True
+    assert message.reject_calls == [False]
+    assert message.ack_count == 0
+
+    # The source (older) meme must remain bit-for-bit intact: same files, same
+    # sources, no merge-log emitted, popularity rows untouched.
+    async with postgres_session_factory() as verify_session:
+        post_files = (
+            await verify_session.execute(select(MemeFile).where(MemeFile.meme_id == older_meme_id))
+        ).scalars().all()
+        post_file_ids = {row.id for row in post_files}
+        post_sources = (
+            await verify_session.execute(
+                select(MemeSource).where(MemeSource.file_id.in_(post_file_ids))
+            )
+        ).scalars().all()
+        post_merge_logs = (
+            await verify_session.execute(select(MemeMergeLog))
+        ).scalars().all()
+        post_popularity = (
+            await verify_session.execute(
+                select(MemePopularitySnapshot).where(MemePopularitySnapshot.meme_id == older_meme_id)
+            )
+        ).scalars().all()
+        # The embed cache row for the newer file must have been rolled back so
+        # a replay starts from a clean durable state.
+        post_cache_rows = (
+            await verify_session.execute(
+                select(EmbeddingCache).where(EmbeddingCache.source_file_id == newer_meme_file_id)
+            )
+        ).scalars().all()
+
+    assert post_file_ids == baseline_file_ids
+    assert {row.id for row in post_sources} == {row.id for row in baseline_sources}
+    assert {row.id for row in post_merge_logs} == {row.id for row in baseline_merge_logs}
+    assert {row.id for row in post_popularity} == {row.id for row in baseline_popularity}
+    assert post_cache_rows == []
+
+    # Undo the monkeypatch so replay_item can execute a normal transaction path.
+    monkeypatch.undo()
+
+    replay_publisher = RecordingPublisher()
+    async with postgres_session_factory() as replay_session:
+        replay_service = ContentPipelineService(
+            replay_session,
+            storage_client=storage_client,
+            publisher=replay_publisher,
+        )
+        replay_response = await replay_service.replay_item(
+            newer_meme_file_id,
+            stage=ContentPipelineStage.EMBED,
+        )
+
+    assert replay_response.stage is ContentPipelineStage.EMBED
+    assert len(replay_publisher.events) == 1
+
+
+async def test_pipeline_runtime_embed_voyage_timeout_keeps_stage_replayable(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A Voyage embed timeout must surface with a timeout-flavored reason and
+    keep the stage replayable so the runtime can retry transiently."""
+
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    meme_file_id, embed_event, normalized = await _seed_embed_pending_item(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+    )
+    runtime = build_pipeline_runtime(
+        settings=Settings(),
+        broker=build_pipeline_broker(Settings()),
+        session_factory=postgres_session_factory,
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(normalize_result=normalized),
+        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key=normalized.web_video_object_key)),
+        voyage_client=FakeVoyageClient(error=VoyageTimeoutError("took too long")),
+        qdrant_client=FakeQdrantClient(),
+        classification_client=FakeClassificationClient(result=build_classification_result()),
+    )
+    message = FakeRabbitMessage(message_id=str(embed_event.event_id))
+
+    await runtime.handle_embed_message(embed_event.model_dump(mode="json"), message)
+
+    failed_item = await _fetch_item(postgres_session_factory, meme_file_id)
+    assert failed_item.current_stage is ContentPipelineStage.EMBED
+    assert failed_item.current_status is ContentPipelineStageStatus.FAILED
+    assert failed_item.normalized_reason == PIPELINE_REASON_EMBED_TIMEOUT
+    embed_stage_row = _select_stage_row(failed_item, ContentPipelineStage.EMBED)
+    assert embed_stage_row.is_retryable is True
+    assert message.reject_calls == [False]
+    assert message.ack_count == 0
+
+
+async def test_pipeline_runtime_embed_qdrant_timeout_keeps_stage_replayable(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A Qdrant timeout must surface distinctly from a generic provider outage
+    and keep the stage replayable so the runtime can retry transiently."""
+
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    meme_file_id, embed_event, normalized = await _seed_embed_pending_item(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+    )
+    runtime = build_pipeline_runtime(
+        settings=Settings(),
+        broker=build_pipeline_broker(Settings()),
+        session_factory=postgres_session_factory,
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(normalize_result=normalized),
+        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key=normalized.web_video_object_key)),
+        voyage_client=FakeVoyageClient(result=build_voyage_embedding_result()),
+        qdrant_client=FakeQdrantClient(error=QdrantTimeoutError("qdrant lookup timed out")),
+        classification_client=FakeClassificationClient(result=build_classification_result()),
+    )
+    message = FakeRabbitMessage(message_id=str(embed_event.event_id))
+
+    await runtime.handle_embed_message(embed_event.model_dump(mode="json"), message)
+
+    failed_item = await _fetch_item(postgres_session_factory, meme_file_id)
+    assert failed_item.current_stage is ContentPipelineStage.EMBED
+    assert failed_item.current_status is ContentPipelineStageStatus.FAILED
+    assert failed_item.normalized_reason == PIPELINE_REASON_EMBED_SIMILARITY_TIMEOUT
+    embed_stage_row = _select_stage_row(failed_item, ContentPipelineStage.EMBED)
+    assert embed_stage_row.is_retryable is True
+    assert message.reject_calls == [False]
+    assert message.ack_count == 0
+
+
+async def test_pipeline_runtime_embed_qdrant_malformed_response_dead_letters(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A structurally untrustworthy Qdrant response must dead-letter with a
+    distinct reason and the stage must be marked non-retryable — the same
+    "never replayable" behavior as VoyageMalformedResponseError."""
+
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    meme_file_id, embed_event, normalized = await _seed_embed_pending_item(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+    )
+    dead_letters: list[Any] = []
+
+    async def publish_dead_letter(
+        payload: object,
+        queue: object = "",
+        exchange: object | None = None,
+        *,
+        routing_key: str = "",
+        headers: dict[str, object] | None = None,
+        **_: object,
+    ) -> None:
+        _ = queue
+        dead_letters.append(
+            {
+                "payload": payload,
+                "exchange": getattr(exchange, "name", exchange),
+                "routing_key": routing_key,
+                "headers": headers,
+            }
+        )
+
+    broker = build_pipeline_broker(Settings())
+    runtime = build_pipeline_runtime(
+        settings=Settings(),
+        broker=broker,
+        session_factory=postgres_session_factory,
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(normalize_result=normalized),
+        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key=normalized.web_video_object_key)),
+        voyage_client=FakeVoyageClient(result=build_voyage_embedding_result()),
+        qdrant_client=FakeQdrantClient(
+            error=QdrantMalformedResponseError("response is not a sequence"),
+        ),
+        classification_client=FakeClassificationClient(result=build_classification_result()),
+    )
+    cast("Any", broker).publish = publish_dead_letter
+    message = FakeRabbitMessage(message_id=str(embed_event.event_id))
+
+    await runtime.handle_embed_message(embed_event.model_dump(mode="json"), message)
+
+    failed_item = await _fetch_item(postgres_session_factory, meme_file_id)
+    assert failed_item.current_stage is ContentPipelineStage.EMBED
+    assert failed_item.current_status is ContentPipelineStageStatus.FAILED
+    assert failed_item.normalized_reason == PIPELINE_REASON_EMBED_SIMILARITY_MALFORMED
+    embed_stage_row = _select_stage_row(failed_item, ContentPipelineStage.EMBED)
+    assert embed_stage_row.is_retryable is False
+    assert message.ack_count == 1
+    assert message.reject_calls == []
+    assert len(dead_letters) == 1
+    assert dead_letters[0]["headers"] == {
+        "x-memexpert-failure-reason": PIPELINE_REASON_EMBED_SIMILARITY_MALFORMED,
+    }
+
+
+async def test_pipeline_runtime_embed_qdrant_provider_unavailable_keeps_stage_replayable(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Regression guard: the existing provider-unavailable branch still keeps
+    the stage replayable and reports the similarity-blocked reason code."""
+
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    meme_file_id, embed_event, normalized = await _seed_embed_pending_item(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+    )
+    runtime = build_pipeline_runtime(
+        settings=Settings(),
+        broker=build_pipeline_broker(Settings()),
+        session_factory=postgres_session_factory,
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(normalize_result=normalized),
+        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key=normalized.web_video_object_key)),
+        voyage_client=FakeVoyageClient(result=build_voyage_embedding_result()),
+        qdrant_client=FakeQdrantClient(error=QdrantProviderUnavailableError("qdrant down")),
+        classification_client=FakeClassificationClient(result=build_classification_result()),
+    )
+    message = FakeRabbitMessage(message_id=str(embed_event.event_id))
+
+    await runtime.handle_embed_message(embed_event.model_dump(mode="json"), message)
+
+    failed_item = await _fetch_item(postgres_session_factory, meme_file_id)
+    assert failed_item.current_stage is ContentPipelineStage.EMBED
+    assert failed_item.current_status is ContentPipelineStageStatus.FAILED
+    assert failed_item.normalized_reason == PIPELINE_REASON_EMBED_SIMILARITY_BLOCKED
+    embed_stage_row = _select_stage_row(failed_item, ContentPipelineStage.EMBED)
+    assert embed_stage_row.is_retryable is True
+    assert message.reject_calls == [False]
+    assert message.ack_count == 0
+
+
+async def test_pipeline_runtime_embed_contract_violation_dead_letters_non_retryable(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Contract violations at the service layer (malformed vector that passes the
+    adapter but gets rejected by ``_validate_embedding_contract``) must still
+    dead-letter as non-retryable. This locks in the "PipelineIngestError is
+    terminal, PipelineMergeTransactionError is replayable" split."""
+
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    meme_file_id, embed_event, normalized = await _seed_embed_pending_item(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+    )
+    dead_letters: list[Any] = []
+
+    async def publish_dead_letter(
+        payload: object,
+        queue: object = "",
+        exchange: object | None = None,
+        *,
+        routing_key: str = "",
+        headers: dict[str, object] | None = None,
+        **_: object,
+    ) -> None:
+        _ = queue
+        dead_letters.append(
+            {
+                "payload": payload,
+                "exchange": getattr(exchange, "name", exchange),
+                "routing_key": routing_key,
+                "headers": headers,
+            }
+        )
+
+    malformed_dimensions_result = VoyageEmbeddingResult(
+        model="voyage-multimodal-3.5",
+        dimensions=256,  # Settings.pipeline_voyage_output_dimensions is 1024.
+        vector=tuple(0.001 * index for index in range(256)),
+        input_hash="f" * 64,
+    )
+
+    broker = build_pipeline_broker(Settings())
+    runtime = build_pipeline_runtime(
+        settings=Settings(),
+        broker=broker,
+        session_factory=postgres_session_factory,
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(normalize_result=normalized),
+        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key=normalized.web_video_object_key)),
+        voyage_client=FakeVoyageClient(result=malformed_dimensions_result),
+        qdrant_client=FakeQdrantClient(),
+        classification_client=FakeClassificationClient(result=build_classification_result()),
+    )
+    cast("Any", broker).publish = publish_dead_letter
+    message = FakeRabbitMessage(message_id=str(embed_event.event_id))
+
+    await runtime.handle_embed_message(embed_event.model_dump(mode="json"), message)
+
+    failed_item = await _fetch_item(postgres_session_factory, meme_file_id)
+    assert failed_item.current_stage is ContentPipelineStage.EMBED
+    assert failed_item.current_status is ContentPipelineStageStatus.FAILED
+    # The service layer converts the dimensionality rejection into a plain
+    # PipelineIngestError which the runtime classifies as the generic embed
+    # failure reason — the important invariant is it is terminal.
+    embed_stage_row = _select_stage_row(failed_item, ContentPipelineStage.EMBED)
+    assert embed_stage_row.is_retryable is False
+    assert message.ack_count == 1
+    assert message.reject_calls == []
+    assert len(dead_letters) == 1

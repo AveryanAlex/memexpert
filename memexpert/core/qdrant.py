@@ -6,10 +6,12 @@ import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
+import httpx
+
 from memexpert.core.config import Settings, get_settings
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterable, Sequence
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,7 +80,11 @@ class PipelineQdrantClient:
                 limit=resolved_limit,
                 with_payload=True,
             )
+        except (TimeoutError, httpx.TimeoutException) as exc:  # pragma: no cover - exercised via monkeypatch
+            raise QdrantTimeoutError(f"Qdrant similarity lookup timed out: {exc}") from exc
         except Exception as exc:  # pragma: no cover - exercised via monkeypatch in tests
+            if _is_timeout_response_handling_error(exc):
+                raise QdrantTimeoutError(f"Qdrant similarity lookup timed out: {exc}") from exc
             raise QdrantProviderUnavailableError(f"Qdrant similarity lookup failed: {exc}") from exc
 
         return _parse_qdrant_matches(raw_matches, current_meme_file_id=current_meme_file_id)
@@ -94,13 +100,38 @@ class PipelineQdrantClient:
         return self._client
 
 
+def _is_timeout_response_handling_error(exc: BaseException) -> bool:
+    """Return True if the Qdrant SDK wrapped an underlying timeout exception."""
+
+    # qdrant_client.http.exceptions.ResponseHandlingException re-raises the
+    # original transport error via __cause__; a TimeoutException surfacing there
+    # is a stage-level timeout, not a provider outage.
+    cause: BaseException | None = exc.__cause__
+    while cause is not None:
+        if isinstance(cause, (TimeoutError, httpx.TimeoutException)):
+            return True
+        cause = cause.__cause__
+    return False
+
+
 def _parse_qdrant_matches(
-    raw_matches: Sequence[object],
+    raw_matches: object,
     *,
     current_meme_file_id: uuid.UUID,
 ) -> tuple[QdrantSimilarityMatch, ...]:
+    # The adapter is defensive: if the SDK returns a payload we cannot iterate at
+    # all, the entire response is structurally untrustworthy and must surface as a
+    # malformed-response failure. Per-row noise (missing ids, wrong score types)
+    # keeps the existing silent-drop behavior so the pipeline can still ingest
+    # partially-valid similarity payloads.
+    if raw_matches is None or not isinstance(raw_matches, (list, tuple)):
+        raise QdrantMalformedResponseError(
+            "Qdrant similarity response is not an iterable sequence of matches.",
+        )
+
     resolved_matches: list[QdrantSimilarityMatch] = []
-    for raw_entry in raw_matches:
+    typed_matches: Iterable[object] = cast("Sequence[object]", raw_matches)
+    for raw_entry in typed_matches:
         payload = _extract_payload(raw_entry)
         if payload is None:
             continue

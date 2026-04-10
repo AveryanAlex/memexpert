@@ -45,6 +45,7 @@ from memexpert.schemas.content_pipeline import (
 from memexpert.services import (
     ContentPipelineService,
     PipelineIngestError,
+    PipelineMergeTransactionError,
     PipelinePayloadTooLargeError,
     PipelinePublishError,
     PipelineReplayNotAllowedError,
@@ -1358,7 +1359,7 @@ async def test_complete_embed_stage_rolls_back_partial_merge_and_keeps_embed_rep
         similarity_score=0.95,
     )
 
-    with pytest.raises(PipelineIngestError, match="post-embed auto-merge transaction"):
+    with pytest.raises(PipelineMergeTransactionError, match="post-embed auto-merge transaction"):
         _ = await newer_service.complete_embed_stage(
             meme_file_id=newer_meme_file_id,
             attempt=1,
@@ -1381,6 +1382,13 @@ async def test_complete_embed_stage_rolls_back_partial_merge_and_keeps_embed_rep
         newer_file_after = await verify_session.scalar(
             select(MemeFile).where(MemeFile.id == newer_meme_file_id)
         )
+        # The single merge transaction must also roll back the embedding-cache
+        # row so the replay re-runs end-to-end against a clean durable state.
+        newer_cache_rows = (
+            await verify_session.execute(
+                select(EmbeddingCache).where(EmbeddingCache.source_file_id == newer_meme_file_id)
+            )
+        ).scalars().all()
 
     assert newer_meme_id in set(surviving_meme_ids)
     assert older_meme_id in set(surviving_meme_ids)
@@ -1390,5 +1398,10 @@ async def test_complete_embed_stage_rolls_back_partial_merge_and_keeps_embed_rep
         ContentPipelineStageStatus.PENDING,
         ContentPipelineStageStatus.PROCESSING,
     }
+    # Locking in the single-transaction invariant at the service boundary: a
+    # merge failure must leave ``is_retryable=True`` so the runtime replay can
+    # take over without operator intervention.
+    assert embed_stage_row.is_retryable is True
     assert newer_file_after is not None
+    assert newer_cache_rows == []
     assert newer_file_after.meme_id == newer_meme_id  # not moved

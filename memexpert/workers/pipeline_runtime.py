@@ -40,8 +40,11 @@ from memexpert.core.ocr import (
 )
 from memexpert.core.qdrant import (
     PipelineQdrantClient,
+    QdrantMalformedResponseError,
+    QdrantProviderUnavailableError,
     QdrantSimilarityClientProtocol,
     QdrantSimilarityError,
+    QdrantTimeoutError,
 )
 from memexpert.core.storage import (
     delete_object_if_present,
@@ -59,7 +62,7 @@ from memexpert.core.voyage import (
 )
 from memexpert.models.enums import ContentPipelineStage
 from memexpert.schemas.content_pipeline import ContentPipelineDispatchEvent
-from memexpert.services import ContentPipelineService, PipelineIngestError
+from memexpert.services import ContentPipelineService, PipelineIngestError, PipelineMergeTransactionError
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -78,8 +81,11 @@ PIPELINE_REASON_CLASSIFY_PROVIDER_BLOCKED = "classify_provider_blocked"
 PIPELINE_REASON_CLASSIFY_TIMEOUT = "classify_timeout"
 PIPELINE_REASON_EMBED_FAILED = "embed_stage_failed"
 PIPELINE_REASON_EMBED_MALFORMED_VECTOR = "embed_malformed_vector"
+PIPELINE_REASON_EMBED_MERGE_TRANSACTION = "embed_merge_transaction_failed"
 PIPELINE_REASON_EMBED_PROVIDER_BLOCKED = "embed_provider_blocked"
 PIPELINE_REASON_EMBED_SIMILARITY_BLOCKED = "embed_similarity_blocked"
+PIPELINE_REASON_EMBED_SIMILARITY_MALFORMED = "embed_similarity_malformed"
+PIPELINE_REASON_EMBED_SIMILARITY_TIMEOUT = "embed_similarity_timeout"
 PIPELINE_REASON_EMBED_TIMEOUT = "embed_timeout"
 PIPELINE_REASON_FORCED_CLASSIFY_FAILURE = "forced_classify_failure"
 PIPELINE_REASON_FORCED_EMBED_FAILURE = "forced_embed_failure"
@@ -821,6 +827,14 @@ class PipelineRuntime:
                 return PIPELINE_REASON_EMBED_MALFORMED_VECTOR
             if isinstance(exc, VoyageProviderUnavailableError):
                 return PIPELINE_REASON_EMBED_PROVIDER_BLOCKED
+            if isinstance(exc, PipelineMergeTransactionError):
+                return PIPELINE_REASON_EMBED_MERGE_TRANSACTION
+            if isinstance(exc, QdrantTimeoutError):
+                return PIPELINE_REASON_EMBED_SIMILARITY_TIMEOUT
+            if isinstance(exc, QdrantMalformedResponseError):
+                return PIPELINE_REASON_EMBED_SIMILARITY_MALFORMED
+            if isinstance(exc, QdrantProviderUnavailableError):
+                return PIPELINE_REASON_EMBED_SIMILARITY_BLOCKED
             if isinstance(exc, QdrantSimilarityError):
                 return PIPELINE_REASON_EMBED_SIMILARITY_BLOCKED
             return PIPELINE_REASON_EMBED_FAILED
@@ -843,7 +857,17 @@ class PipelineRuntime:
         if stage is ContentPipelineStage.TRANSCODE:
             return not isinstance(exc, MediaValidationError)
         if stage is ContentPipelineStage.EMBED:
-            return not isinstance(exc, (VoyageMalformedResponseError, PipelineIngestError))
+            # Merge-transaction failures roll back the single embed transaction and
+            # must stay replayable. Genuine contract violations (malformed vectors,
+            # impossible state transitions) surface the base PipelineIngestError and
+            # dead-letter. Qdrant malformed responses match the VoyageMalformed
+            # behavior because the payload is structurally untrustworthy.
+            if isinstance(exc, PipelineMergeTransactionError):
+                return True
+            return not isinstance(
+                exc,
+                (VoyageMalformedResponseError, QdrantMalformedResponseError, PipelineIngestError),
+            )
         if stage is ContentPipelineStage.CLASSIFY:
             return not isinstance(exc, PipelineIngestError)
         return not isinstance(exc, PipelineIngestError)
