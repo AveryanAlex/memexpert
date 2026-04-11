@@ -28,6 +28,7 @@ from memexpert.services import (
     AccountLinkResult,
     AccountLinkService,
     AccountUnavailableError,
+    EmailAlreadyInUseError,
     GuestAccountRequiredError,
     InvalidCredentialsError,
     ProviderAuthService,
@@ -228,6 +229,53 @@ async def get_favorites_collection_id(
         )
     )
     return result.scalar_one_or_none()
+
+
+async def test_link_guest_with_email_signup_bootstraps_a_fresh_guest_when_id_is_none(
+    migrated_db_session: AsyncSession,
+) -> None:
+    """When guest_user_id=None, the link method bootstraps a throwaway guest and upgrades it in place."""
+
+    link_service = build_account_link_service(migrated_db_session)
+
+    result = await link_service.link_guest_with_email_signup(
+        guest_user_id=None,
+        email="bootstrap@example.com",
+        password=PASSWORD,
+    )
+
+    assert result.merge_performed is False
+    assert result.user.account_type is AccountType.FULL
+    assert result.user.email == "bootstrap@example.com"
+    assert result.merge_log_id is None
+
+    user_count_result = await migrated_db_session.execute(select(func.count()).select_from(User))
+    merge_log_count_result = await migrated_db_session.execute(select(func.count()).select_from(AccountMergeLog))
+
+    assert user_count_result.scalar_one() == 1
+    assert merge_log_count_result.scalar_one() == 0
+
+
+async def test_link_guest_with_email_signup_rolls_back_bootstrap_on_duplicate_email(
+    migrated_db_session: AsyncSession,
+) -> None:
+    """A duplicate-email failure with guest_user_id=None must leave zero bootstrapped rows."""
+
+    user_service = UserService(migrated_db_session)
+    link_service = build_account_link_service(migrated_db_session)
+    _ = await create_full_user_via_upgrade(user_service, email="taken@example.com")
+    baseline_user_count_result = await migrated_db_session.execute(select(func.count()).select_from(User))
+    baseline_user_count = baseline_user_count_result.scalar_one()
+
+    with pytest.raises(EmailAlreadyInUseError):
+        _ = await link_service.link_guest_with_email_signup(
+            guest_user_id=None,
+            email="taken@example.com",
+            password=PASSWORD,
+        )
+
+    user_count_result = await migrated_db_session.execute(select(func.count()).select_from(User))
+    assert user_count_result.scalar_one() == baseline_user_count
 
 
 async def test_email_signup_upgrades_guest_in_place_and_keeps_favorites_collection(

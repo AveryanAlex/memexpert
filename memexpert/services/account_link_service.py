@@ -256,13 +256,20 @@ class AccountLinkService:
     async def link_guest_with_email_signup(
         self,
         *,
-        guest_user_id: uuid.UUID,
+        guest_user_id: uuid.UUID | None,
         email: str,
         password: str,
     ) -> AccountLinkResult:
-        """Upgrade a guest account in place with a new email/password identity."""
+        """Upgrade a guest account in place with a new email/password identity.
 
-        state = await self._start_link_attempt(guest_user_id)
+        When ``guest_user_id`` is ``None`` a throwaway guest is bootstrapped
+        inside the same transaction and upgraded in place; a validation
+        failure rolls the bootstrap back atomically, so the call is
+        indistinguishable from a traditional direct signup to observers.
+        """
+
+        resolved_guest_id = await self._resolve_guest_user_id(guest_user_id)
+        state = await self._start_link_attempt(resolved_guest_id)
         try:
             signup_identity = self._provider_auth_service.prepare_email_signup_identity(
                 email=email,
@@ -270,7 +277,7 @@ class AccountLinkService:
             )
             state.resolved = True
             return await self._upgrade_guest_in_place(
-                guest_user_id=guest_user_id,
+                guest_user_id=resolved_guest_id,
                 signup_identity=signup_identity,
             )
         except DuplicateIdentityError as exc:
@@ -286,13 +293,20 @@ class AccountLinkService:
     async def link_guest_with_email_login(
         self,
         *,
-        guest_user_id: uuid.UUID,
+        guest_user_id: uuid.UUID | None,
         email: str,
         password: str,
     ) -> AccountLinkResult:
-        """Merge a guest account into an existing full email/password account."""
+        """Merge a guest account into an existing full email/password account.
 
-        state = await self._start_link_attempt(guest_user_id)
+        When ``guest_user_id`` is ``None`` a throwaway guest is bootstrapped
+        and immediately merged into the resolved target account, so callers
+        that arrive anonymously see the same end state as callers that
+        arrived holding a persistent guest session.
+        """
+
+        resolved_guest_id = await self._resolve_guest_user_id(guest_user_id)
+        state = await self._start_link_attempt(resolved_guest_id)
         try:
             target_user = await self._provider_auth_service.resolve_email_login_user(
                 email=email,
@@ -300,7 +314,7 @@ class AccountLinkService:
             )
             state.resolved = True
             return await self._merge_guest_into_existing_full(
-                guest_user_id=guest_user_id,
+                guest_user_id=resolved_guest_id,
                 target_user_id=target_user.id,
             )
         except ServiceError as exc:
@@ -313,10 +327,14 @@ class AccountLinkService:
     async def link_guest_with_google_code(
         self,
         *,
-        guest_user_id: uuid.UUID,
+        guest_user_id: uuid.UUID | None,
         code: str,
     ) -> AccountLinkResult:
-        """Exchange a Google code, then upgrade or merge the guest accordingly."""
+        """Exchange a Google code, then upgrade or merge the guest accordingly.
+
+        This is a thin delegator; the bootstrap, if any, happens once inside
+        :meth:`link_guest_with_google_identity`.
+        """
 
         google_identity = await self._provider_auth_service.resolve_google_identity_from_code(code=code)
         return await self.link_guest_with_google_identity(
@@ -327,17 +345,23 @@ class AccountLinkService:
     async def link_guest_with_google_identity(
         self,
         *,
-        guest_user_id: uuid.UUID,
+        guest_user_id: uuid.UUID | None,
         identity: GoogleIdentity,
     ) -> AccountLinkResult:
-        """Upgrade a guest with Google or merge it into the canonical Google/full account."""
+        """Upgrade a guest with Google or merge it into the canonical Google/full account.
 
-        state = await self._start_link_attempt(guest_user_id)
+        When ``guest_user_id`` is ``None`` a throwaway guest is bootstrapped
+        inside the same transaction; the subsequent upgrade or merge owns
+        the commit, and a failure rolls the bootstrap back atomically.
+        """
+
+        resolved_guest_id = await self._resolve_guest_user_id(guest_user_id)
+        state = await self._start_link_attempt(resolved_guest_id)
         try:
             resolution = await self._provider_auth_service.resolve_google_identity(identity)
             state.resolved = True
             return await self._link_guest_with_google_resolution(
-                guest_user_id=guest_user_id,
+                guest_user_id=resolved_guest_id,
                 resolution=resolution,
             )
         except DuplicateIdentityError as exc:
@@ -351,7 +375,7 @@ class AccountLinkService:
             if resolution.user is None:
                 raise ProviderPayloadInvalidError("Google identity could not be resolved safely.") from exc
             return await self._merge_guest_into_existing_full(
-                guest_user_id=guest_user_id,
+                guest_user_id=resolved_guest_id,
                 target_user_id=resolution.user.id,
                 attach_google_identity=resolution.matched_by == "verified_email",
                 google_identity=identity,
@@ -366,10 +390,14 @@ class AccountLinkService:
     async def link_guest_with_telegram_widget(
         self,
         *,
-        guest_user_id: uuid.UUID,
+        guest_user_id: uuid.UUID | None,
         payload: TelegramWidgetAuthRequest,
     ) -> AccountLinkResult:
-        """Validate a Telegram Login Widget payload, then upgrade or merge the guest."""
+        """Validate a Telegram Login Widget payload, then upgrade or merge the guest.
+
+        Thin delegator; the bootstrap, if any, happens once inside
+        :meth:`link_guest_with_telegram_identity`.
+        """
 
         identity = self._provider_auth_service.resolve_telegram_widget_identity(payload)
         return await self.link_guest_with_telegram_identity(
@@ -380,10 +408,14 @@ class AccountLinkService:
     async def link_guest_with_telegram_miniapp(
         self,
         *,
-        guest_user_id: uuid.UUID,
+        guest_user_id: uuid.UUID | None,
         init_data: str | None,
     ) -> AccountLinkResult:
-        """Validate Telegram Mini App initData, then upgrade or merge the guest."""
+        """Validate Telegram Mini App initData, then upgrade or merge the guest.
+
+        Thin delegator; the bootstrap, if any, happens once inside
+        :meth:`link_guest_with_telegram_identity`.
+        """
 
         identity = self._provider_auth_service.resolve_telegram_miniapp_identity(init_data)
         return await self.link_guest_with_telegram_identity(
@@ -394,22 +426,28 @@ class AccountLinkService:
     async def link_guest_with_telegram_identity(
         self,
         *,
-        guest_user_id: uuid.UUID,
+        guest_user_id: uuid.UUID | None,
         identity: TelegramIdentity,
     ) -> AccountLinkResult:
-        """Upgrade a guest with Telegram or merge it into the canonical Telegram account."""
+        """Upgrade a guest with Telegram or merge it into the canonical Telegram account.
 
-        state = await self._start_link_attempt(guest_user_id)
+        When ``guest_user_id`` is ``None`` a throwaway guest is bootstrapped
+        inside the same transaction; the subsequent upgrade or merge owns
+        the commit, and a failure rolls the bootstrap back atomically.
+        """
+
+        resolved_guest_id = await self._resolve_guest_user_id(guest_user_id)
+        state = await self._start_link_attempt(resolved_guest_id)
         try:
             target_user = await self._provider_auth_service.resolve_telegram_identity_user(identity)
             state.resolved = True
             if target_user is None:
                 return await self._upgrade_guest_in_place(
-                    guest_user_id=guest_user_id,
+                    guest_user_id=resolved_guest_id,
                     telegram_identity=identity,
                 )
             return await self._merge_guest_into_existing_full(
-                guest_user_id=guest_user_id,
+                guest_user_id=resolved_guest_id,
                 target_user_id=target_user.id,
             )
         except DuplicateIdentityError as exc:
@@ -421,7 +459,7 @@ class AccountLinkService:
             if target_user is None:
                 raise ProviderPayloadInvalidError("Telegram identity could not be resolved safely.") from exc
             return await self._merge_guest_into_existing_full(
-                guest_user_id=guest_user_id,
+                guest_user_id=resolved_guest_id,
                 target_user_id=target_user.id,
             )
         except ServiceError as exc:
@@ -430,6 +468,21 @@ class AccountLinkService:
         except IntegrityError as exc:
             await self._handle_link_failure(state, exc)
             raise AccountLinkInvariantError("Failed to link the guest account with Telegram.") from exc
+
+    async def _resolve_guest_user_id(self, guest_user_id: uuid.UUID | None) -> uuid.UUID:
+        """Return the caller's guest id or bootstrap a throwaway guest in the same transaction.
+
+        The bootstrap uses ``commit=False`` so the new row participates in
+        the outer transaction owned by the subsequent upgrade or merge
+        call. A validation failure downstream triggers
+        :meth:`_handle_link_failure`, which rolls the session back and
+        atomically removes the bootstrapped guest.
+        """
+
+        if guest_user_id is not None:
+            return guest_user_id
+        bootstrapped_guest = await self._user_service.create_guest_user(commit=False)
+        return bootstrapped_guest.id
 
     async def _start_link_attempt(self, guest_user_id: uuid.UUID) -> _LinkAttemptState:
         """Snapshot the guest state so link-failure post-mortem queries can see the pre-image."""
