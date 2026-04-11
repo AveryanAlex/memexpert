@@ -1,90 +1,66 @@
-# ruff: noqa: TC002
-"""FastStream RabbitMQ runtime for the real transcode and OCR worker stages."""
+# ruff: noqa: TC001,TC002,TC003
+"""FastStream RabbitMQ runtime for the real transcode, OCR, embed, classify, and sync stages."""
 
 from __future__ import annotations
 
 import asyncio
-import json
 import uuid
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol
 
-from faststream import AckPolicy
-from faststream.rabbit import ExchangeType, RabbitBroker, RabbitExchange, RabbitQueue
-from faststream.rabbit.annotations import RabbitMessage
-from pydantic import ValidationError
+from faststream.rabbit import RabbitBroker, RabbitExchange, RabbitQueue
 from sqlalchemy import select
 
-from memexpert.core.broker import PipelineBrokerSettings, get_pipeline_broker, get_pipeline_broker_settings
-from memexpert.core.classification import (
-    ClassificationClientProtocol,
-    ClassificationError,
-    ClassificationProviderUnavailableError,
-    ClassificationTimeoutError,
-    PipelineClassificationClient,
-)
-from memexpert.core.config import Settings, get_settings
-from memexpert.core.database import AsyncSessionFactory, get_async_session_factory
+from memexpert.core.broker import PipelineBrokerSettings
+from memexpert.core.classification import ClassificationClientProtocol
+from memexpert.core.config import Settings
+from memexpert.core.database import AsyncSessionFactory
 from memexpert.core.media import (
-    MediaTimeoutError,
     MediaValidationError,
-    PipelineMediaProcessor,
     PipelineMediaProcessorProtocol,
 )
 from memexpert.core.meilisearch import (
     MeilisearchSyncClientProtocol,
-    MeilisearchSyncConflictError,
-    MeilisearchSyncMalformedResponseError,
-    MeilisearchSyncProviderUnavailableError,
-    MeilisearchSyncTimeoutError,
     PipelineMeilisearchDocument,
-    PipelineMeilisearchSyncClient,
 )
-from memexpert.core.ocr import (
-    OCRProcessingError,
-    OCRProcessorProtocol,
-    OCRProviderUnavailableError,
-    OCRTimeoutError,
-    PipelineOCRProcessor,
-)
+from memexpert.core.ocr import OCRProcessingError, OCRProcessorProtocol
 from memexpert.core.qdrant import (
-    PipelineQdrantClient,
-    PipelineQdrantSyncClient,
-    QdrantMalformedResponseError,
-    QdrantProviderUnavailableError,
     QdrantSimilarityClientProtocol,
-    QdrantSimilarityError,
     QdrantSyncClientProtocol,
-    QdrantSyncConflictError,
-    QdrantSyncMalformedResponseError,
     QdrantSyncPayload,
-    QdrantSyncProviderUnavailableError,
-    QdrantSyncTimeoutError,
-    QdrantTimeoutError,
 )
 from memexpert.core.storage import (
     delete_object_if_present,
     download_object_bytes,
     get_pipeline_storage_settings,
-    get_s3_client,
     upload_object_bytes,
 )
-from memexpert.core.voyage import (
-    PipelineVoyageClient,
-    VoyageClientProtocol,
-    VoyageMalformedResponseError,
-    VoyageProviderUnavailableError,
-    VoyageTimeoutError,
-)
+from memexpert.core.voyage import VoyageClientProtocol
 from memexpert.models.content import EmbeddingCache, Meme, MemeFile, MemeFileOCRResult
 from memexpert.models.enums import ContentPipelineStage, EmbeddingInputType
 from memexpert.schemas.content_pipeline import ContentPipelineDispatchEvent
 from memexpert.services import (
     ContentPipelineService,
     PipelineIngestError,
-    PipelineMergeTransactionError,
     PipelinePublishError,
+)
+from memexpert.workers.pipeline_runtime.constants import (
+    PIPELINE_REASON_MALFORMED_EVENT,
+    PIPELINE_REASON_UNSUPPORTED_STAGE,
+)
+from memexpert.workers.pipeline_runtime.errors import (
+    ForcedClassifyFailure,
+    ForcedEmbedFailure,
+    ForcedSyncMeiliFailure,
+    ForcedSyncQdrantFailure,
+    ForcedTranscodeFailure,
+    coerce_dead_letter_payload,
+    extract_event_reference,
+    is_replayable_failure,
+    normalize_failure_reason,
+    render_error_text,
+    validate_event_payload,
 )
 
 if TYPE_CHECKING:
@@ -97,43 +73,6 @@ if TYPE_CHECKING:
     from memexpert.core.voyage import VoyageEmbeddingResult
     from memexpert.services.content_merge import MergeOutcome
     from memexpert.services.content_pipeline import PipelineStageWorkContext
-
-PIPELINE_REASON_CLASSIFY_FAILED = "classify_stage_failed"
-PIPELINE_REASON_CLASSIFY_MALFORMED = "classify_malformed_result"
-PIPELINE_REASON_CLASSIFY_PROVIDER_BLOCKED = "classify_provider_blocked"
-PIPELINE_REASON_CLASSIFY_TIMEOUT = "classify_timeout"
-PIPELINE_REASON_EMBED_FAILED = "embed_stage_failed"
-PIPELINE_REASON_EMBED_MALFORMED_VECTOR = "embed_malformed_vector"
-PIPELINE_REASON_EMBED_MERGE_TRANSACTION = "embed_merge_transaction_failed"
-PIPELINE_REASON_EMBED_PROVIDER_BLOCKED = "embed_provider_blocked"
-PIPELINE_REASON_EMBED_SIMILARITY_BLOCKED = "embed_similarity_blocked"
-PIPELINE_REASON_EMBED_SIMILARITY_MALFORMED = "embed_similarity_malformed"
-PIPELINE_REASON_EMBED_SIMILARITY_TIMEOUT = "embed_similarity_timeout"
-PIPELINE_REASON_EMBED_TIMEOUT = "embed_timeout"
-PIPELINE_REASON_FORCED_CLASSIFY_FAILURE = "forced_classify_failure"
-PIPELINE_REASON_FORCED_EMBED_FAILURE = "forced_embed_failure"
-PIPELINE_REASON_FORCED_SYNC_MEILI_FAILURE = "forced_sync_meili_failure"
-PIPELINE_REASON_FORCED_SYNC_QDRANT_FAILURE = "forced_sync_qdrant_failure"
-PIPELINE_REASON_FORCED_TRANSCODE_FAILURE = "forced_transcode_failure"
-PIPELINE_REASON_MALFORMED_EVENT = "malformed_dispatch_event"
-PIPELINE_REASON_OCR_FAILED = "ocr_stage_failed"
-PIPELINE_REASON_OCR_PROVIDER_BLOCKED = "ocr_provider_blocked"
-PIPELINE_REASON_OCR_TIMEOUT = "ocr_timeout"
-PIPELINE_REASON_SYNC_MEILI_CONFLICT = "sync_meili_conflict"
-PIPELINE_REASON_SYNC_MEILI_MALFORMED_PAYLOAD = "sync_meili_malformed_payload"
-PIPELINE_REASON_SYNC_MEILI_PROVIDER_BLOCKED = "sync_meili_provider_blocked"
-PIPELINE_REASON_SYNC_MEILI_TIMEOUT = "sync_meili_timeout"
-PIPELINE_REASON_SYNC_QDRANT_CONFLICT = "sync_qdrant_conflict"
-PIPELINE_REASON_SYNC_QDRANT_MALFORMED_PAYLOAD = "sync_qdrant_malformed_payload"
-PIPELINE_REASON_SYNC_QDRANT_PROVIDER_BLOCKED = "sync_qdrant_provider_blocked"
-PIPELINE_REASON_SYNC_QDRANT_TIMEOUT = "sync_qdrant_timeout"
-PIPELINE_REASON_TRANSCODE_FAILED = "transcode_stage_failed"
-PIPELINE_REASON_TRANSCODE_INVALID_MEDIA = "transcode_invalid_media"
-PIPELINE_REASON_TRANSCODE_TIMEOUT = "transcode_timeout"
-PIPELINE_REASON_UNSUPPORTED_STAGE = "unsupported_stage"
-
-
-type DeadLetterPayload = str | bytes | bytearray | int | float | bool | None
 
 
 class RabbitMessageLike(Protocol):
@@ -166,26 +105,6 @@ class ObjectStorageClientLike(Protocol):
     ) -> object: ...
 
     def delete_object(self, *, Bucket: str, Key: str) -> object: ...
-
-
-class ForcedTranscodeFailure(RuntimeError):
-    """Raised when the dev/test-only failure-injection knob forces one transcode attempt to fail."""
-
-
-class ForcedEmbedFailure(RuntimeError):
-    """Raised when the dev/test-only failure-injection knob forces one embed attempt to fail."""
-
-
-class ForcedClassifyFailure(RuntimeError):
-    """Raised when the dev/test-only failure-injection knob forces one classify attempt to fail."""
-
-
-class ForcedSyncQdrantFailure(RuntimeError):
-    """Raised when the dev/test-only failure-injection knob forces one sync_qdrant attempt to fail."""
-
-
-class ForcedSyncMeiliFailure(RuntimeError):
-    """Raised when the dev/test-only failure-injection knob forces one sync_meili attempt to fail."""
 
 
 @dataclass(slots=True)
@@ -366,11 +285,11 @@ class PipelineRuntime:
         message: RabbitMessageLike,
         expected_stage: ContentPipelineStage,
     ) -> None:
-        dispatch_event = self._validate_event_payload(payload)
+        dispatch_event = validate_event_payload(payload)
         if dispatch_event is None:
             await self._record_malformed_event_failure(payload)
             await self._dead_letter_or_requeue(
-                self._coerce_dead_letter_payload(payload),
+                coerce_dead_letter_payload(payload),
                 message=message,
                 normalized_reason=PIPELINE_REASON_MALFORMED_EVENT,
             )
@@ -389,7 +308,7 @@ class PipelineRuntime:
                 retryable=False,
             )
             await self._dead_letter_or_requeue(
-                self._coerce_dead_letter_payload(dispatch_event.model_dump(mode="json")),
+                coerce_dead_letter_payload(dispatch_event.model_dump(mode="json")),
                 message=message,
                 normalized_reason=PIPELINE_REASON_UNSUPPORTED_STAGE,
             )
@@ -408,15 +327,15 @@ class PipelineRuntime:
                 attempt=effective_attempt,
             )
         except Exception as exc:
-            normalized_reason = self._normalize_failure_reason(expected_stage, exc)
-            retryable = self._is_replayable_failure(expected_stage, exc)
+            normalized_reason = normalize_failure_reason(expected_stage, exc)
+            retryable = is_replayable_failure(expected_stage, exc)
             await self._mark_stage_failed(
                 meme_file_id=dispatch_event.meme_file_id,
                 stage=dispatch_event.stage,
                 attempt=effective_attempt,
                 event_id=dispatch_event.event_id,
                 normalized_reason=normalized_reason,
-                last_error_text=self._render_error_text(exc),
+                last_error_text=render_error_text(exc),
                 retryable=retryable,
             )
 
@@ -426,7 +345,7 @@ class PipelineRuntime:
                 return
 
             await self._dead_letter_or_requeue(
-                self._coerce_dead_letter_payload(dispatch_event.model_dump(mode="json")),
+                coerce_dead_letter_payload(dispatch_event.model_dump(mode="json")),
                 message=message,
                 normalized_reason=normalized_reason,
             )
@@ -609,6 +528,7 @@ class PipelineRuntime:
         path is about to dead-letter.
         """
 
+        _ = stage_context
         try:
             sync_inputs = await self._load_sync_qdrant_inputs(dispatch_event.meme_file_id)
         except Exception:
@@ -980,8 +900,8 @@ class PipelineRuntime:
         snapshot row so operators see the sync truth alongside the journal.
         """
 
-        normalized_reason = self._normalize_failure_reason(ContentPipelineStage.SYNC_QDRANT, exc)
-        last_error_text = self._render_error_text(exc)
+        normalized_reason = normalize_failure_reason(ContentPipelineStage.SYNC_QDRANT, exc)
+        last_error_text = render_error_text(exc)
         try:
             async with self.session_factory() as session:
                 service = self._build_service(session)
@@ -1050,8 +970,8 @@ class PipelineRuntime:
         dispatcher's normalize-and-classify step.
         """
 
-        normalized_reason = self._normalize_failure_reason(ContentPipelineStage.SYNC_MEILI, exc)
-        last_error_text = self._render_error_text(exc)
+        normalized_reason = normalize_failure_reason(ContentPipelineStage.SYNC_MEILI, exc)
+        last_error_text = render_error_text(exc)
         try:
             async with self.session_factory() as session:
                 service = self._build_service(session)
@@ -1158,13 +1078,6 @@ class PipelineRuntime:
                 "pipeline_worker_fail_sync_meili_for_meme_file_id.",
             )
 
-    @staticmethod
-    def _validate_event_payload(payload: object) -> ContentPipelineDispatchEvent | None:
-        try:
-            return ContentPipelineDispatchEvent.model_validate(payload)
-        except ValidationError:
-            return None
-
     def _effective_attempt(
         self,
         dispatch_event: ContentPipelineDispatchEvent,
@@ -1219,7 +1132,7 @@ class PipelineRuntime:
         return 0
 
     async def _record_malformed_event_failure(self, payload: object) -> None:
-        reference = self._extract_event_reference(payload)
+        reference = extract_event_reference(payload)
         if reference is None:
             return
 
@@ -1255,7 +1168,7 @@ class PipelineRuntime:
 
     async def _dead_letter_or_requeue(
         self,
-        payload: DeadLetterPayload,
+        payload: Any,
         *,
         message: RabbitMessageLike,
         normalized_reason: str,
@@ -1280,494 +1193,11 @@ class PipelineRuntime:
 
         await message.ack()
 
-    @staticmethod
-    def _coerce_dead_letter_payload(payload: object) -> DeadLetterPayload:
-        if payload is None:
-            return None
-        if isinstance(payload, (str, bytes, bytearray, int, float, bool)):
-            return payload
-        if isinstance(payload, dict):
-            return json.dumps(payload, sort_keys=True)
-        return str(payload)
-
-    @staticmethod
-    def _normalize_failure_reason(stage: ContentPipelineStage, exc: Exception) -> str:
-        if stage is ContentPipelineStage.TRANSCODE:
-            if isinstance(exc, ForcedTranscodeFailure):
-                return PIPELINE_REASON_FORCED_TRANSCODE_FAILURE
-            if isinstance(exc, MediaTimeoutError):
-                return PIPELINE_REASON_TRANSCODE_TIMEOUT
-            if isinstance(exc, MediaValidationError):
-                return PIPELINE_REASON_TRANSCODE_INVALID_MEDIA
-            return PIPELINE_REASON_TRANSCODE_FAILED
-
-        if stage is ContentPipelineStage.OCR:
-            if isinstance(exc, OCRTimeoutError):
-                return PIPELINE_REASON_OCR_TIMEOUT
-            if isinstance(exc, OCRProviderUnavailableError):
-                return PIPELINE_REASON_OCR_PROVIDER_BLOCKED
-            return PIPELINE_REASON_OCR_FAILED
-
-        if stage is ContentPipelineStage.EMBED:
-            if isinstance(exc, ForcedEmbedFailure):
-                return PIPELINE_REASON_FORCED_EMBED_FAILURE
-            if isinstance(exc, VoyageTimeoutError):
-                return PIPELINE_REASON_EMBED_TIMEOUT
-            if isinstance(exc, VoyageMalformedResponseError):
-                return PIPELINE_REASON_EMBED_MALFORMED_VECTOR
-            if isinstance(exc, VoyageProviderUnavailableError):
-                return PIPELINE_REASON_EMBED_PROVIDER_BLOCKED
-            if isinstance(exc, PipelineMergeTransactionError):
-                return PIPELINE_REASON_EMBED_MERGE_TRANSACTION
-            if isinstance(exc, QdrantTimeoutError):
-                return PIPELINE_REASON_EMBED_SIMILARITY_TIMEOUT
-            if isinstance(exc, QdrantMalformedResponseError):
-                return PIPELINE_REASON_EMBED_SIMILARITY_MALFORMED
-            if isinstance(exc, QdrantProviderUnavailableError):
-                return PIPELINE_REASON_EMBED_SIMILARITY_BLOCKED
-            if isinstance(exc, QdrantSimilarityError):
-                return PIPELINE_REASON_EMBED_SIMILARITY_BLOCKED
-            return PIPELINE_REASON_EMBED_FAILED
-
-        if stage is ContentPipelineStage.CLASSIFY:
-            if isinstance(exc, ForcedClassifyFailure):
-                return PIPELINE_REASON_FORCED_CLASSIFY_FAILURE
-            if isinstance(exc, ClassificationTimeoutError):
-                return PIPELINE_REASON_CLASSIFY_TIMEOUT
-            if isinstance(exc, ClassificationProviderUnavailableError):
-                return PIPELINE_REASON_CLASSIFY_PROVIDER_BLOCKED
-            if isinstance(exc, ClassificationError):
-                return PIPELINE_REASON_CLASSIFY_MALFORMED
-            return PIPELINE_REASON_CLASSIFY_FAILED
-
-        if stage is ContentPipelineStage.SYNC_QDRANT:
-            if isinstance(exc, ForcedSyncQdrantFailure):
-                return PIPELINE_REASON_FORCED_SYNC_QDRANT_FAILURE
-            if isinstance(exc, QdrantSyncTimeoutError):
-                return PIPELINE_REASON_SYNC_QDRANT_TIMEOUT
-            if isinstance(exc, QdrantSyncConflictError):
-                return PIPELINE_REASON_SYNC_QDRANT_CONFLICT
-            if isinstance(exc, QdrantSyncMalformedResponseError):
-                return PIPELINE_REASON_SYNC_QDRANT_MALFORMED_PAYLOAD
-            if isinstance(exc, QdrantSyncProviderUnavailableError):
-                return PIPELINE_REASON_SYNC_QDRANT_PROVIDER_BLOCKED
-            return PIPELINE_REASON_SYNC_QDRANT_PROVIDER_BLOCKED
-
-        if stage is ContentPipelineStage.SYNC_MEILI:
-            if isinstance(exc, ForcedSyncMeiliFailure):
-                return PIPELINE_REASON_FORCED_SYNC_MEILI_FAILURE
-            if isinstance(exc, MeilisearchSyncTimeoutError):
-                return PIPELINE_REASON_SYNC_MEILI_TIMEOUT
-            if isinstance(exc, MeilisearchSyncConflictError):
-                return PIPELINE_REASON_SYNC_MEILI_CONFLICT
-            if isinstance(exc, MeilisearchSyncMalformedResponseError):
-                return PIPELINE_REASON_SYNC_MEILI_MALFORMED_PAYLOAD
-            if isinstance(exc, MeilisearchSyncProviderUnavailableError):
-                return PIPELINE_REASON_SYNC_MEILI_PROVIDER_BLOCKED
-            return PIPELINE_REASON_SYNC_MEILI_PROVIDER_BLOCKED
-
-        return PIPELINE_REASON_OCR_FAILED
-
-    @staticmethod
-    def _is_replayable_failure(stage: ContentPipelineStage, exc: Exception) -> bool:
-        if stage is ContentPipelineStage.TRANSCODE:
-            return not isinstance(exc, MediaValidationError)
-        if stage is ContentPipelineStage.EMBED:
-            # Merge-transaction failures roll back the single embed transaction and
-            # must stay replayable. Genuine contract violations (malformed vectors,
-            # impossible state transitions) surface the base PipelineIngestError and
-            # dead-letter. Qdrant malformed responses match the VoyageMalformed
-            # behavior because the payload is structurally untrustworthy.
-            if isinstance(exc, PipelineMergeTransactionError):
-                return True
-            return not isinstance(
-                exc,
-                (VoyageMalformedResponseError, QdrantMalformedResponseError, PipelineIngestError),
-            )
-        if stage is ContentPipelineStage.CLASSIFY:
-            return not isinstance(exc, PipelineIngestError)
-        if stage is ContentPipelineStage.SYNC_QDRANT:
-            # Malformed sync responses are terminal (dead-letter); timeout,
-            # provider-unavailable, and 409 conflicts are transient and
-            # replayable — including forced-failure injection so the dev
-            # knob exercises the full retry path.
-            if isinstance(exc, QdrantSyncMalformedResponseError):
-                return False
-            return not isinstance(exc, PipelineIngestError)
-        if stage is ContentPipelineStage.SYNC_MEILI:
-            # Mirrors the Qdrant branch exactly: malformed dead-letters,
-            # everything else (including forced-failure injection) stays
-            # replayable until attempts are exhausted.
-            if isinstance(exc, MeilisearchSyncMalformedResponseError):
-                return False
-            return not isinstance(exc, PipelineIngestError)
-        return not isinstance(exc, PipelineIngestError)
-
-    @staticmethod
-    def _render_error_text(exc: Exception) -> str:
-        message = str(exc).strip()
-        if message:
-            return message
-        return exc.__class__.__name__
-
-    @staticmethod
-    def _extract_event_reference(
-        payload: object,
-    ) -> tuple[uuid.UUID, ContentPipelineStage, int, uuid.UUID] | None:
-        if not isinstance(payload, dict):
-            return None
-
-        raw_meme_file_id = payload.get("meme_file_id")
-        raw_stage = payload.get("stage")
-        if not isinstance(raw_meme_file_id, str) or not isinstance(raw_stage, str):
-            return None
-
-        try:
-            meme_file_id = uuid.UUID(raw_meme_file_id)
-            stage = ContentPipelineStage(raw_stage)
-        except (ValueError, TypeError):
-            return None
-
-        raw_attempt = payload.get("attempt")
-        attempt = raw_attempt if isinstance(raw_attempt, int) and raw_attempt >= 1 else 1
-
-        raw_event_id = payload.get("event_id")
-        try:
-            event_id = uuid.UUID(raw_event_id) if isinstance(raw_event_id, str) else uuid.uuid7()
-        except ValueError:
-            event_id = uuid.uuid7()
-
-        return meme_file_id, stage, attempt, event_id
-
-
-def _build_pipeline_exchange(broker_settings: PipelineBrokerSettings) -> RabbitExchange:
-    return RabbitExchange(
-        broker_settings.exchange,
-        type=ExchangeType.TOPIC,
-        durable=True,
-    )
-
-
-def _build_retry_exchange(broker_settings: PipelineBrokerSettings) -> RabbitExchange:
-    return RabbitExchange(
-        broker_settings.retry_exchange,
-        type=ExchangeType.TOPIC,
-        durable=True,
-    )
-
-
-def _build_dead_letter_exchange(broker_settings: PipelineBrokerSettings) -> RabbitExchange:
-    return RabbitExchange(
-        broker_settings.dead_letter_exchange,
-        type=ExchangeType.TOPIC,
-        durable=True,
-    )
-
-
-def _build_stage_queue(
-    *,
-    queue_name: str,
-    routing_key: str,
-    retry_request_routing_key: str,
-    retry_exchange: str,
-) -> RabbitQueue:
-    return RabbitQueue(
-        queue_name,
-        durable=True,
-        routing_key=routing_key,
-        arguments={
-            "x-dead-letter-exchange": retry_exchange,
-            "x-dead-letter-routing-key": retry_request_routing_key,
-        },
-    )
-
-
-def _build_retry_queue(
-    *,
-    queue_name: str,
-    retry_backoff_milliseconds: int,
-    exchange: str,
-    retry_return_routing_key: str,
-) -> RabbitQueue:
-    return RabbitQueue(
-        queue_name,
-        durable=True,
-        arguments={
-            "x-message-ttl": retry_backoff_milliseconds,
-            "x-dead-letter-exchange": exchange,
-            "x-dead-letter-routing-key": retry_return_routing_key,
-        },
-    )
-
-
-def _build_dead_letter_queue(broker_settings: PipelineBrokerSettings) -> RabbitQueue:
-    return RabbitQueue(
-        broker_settings.dead_letter_queue,
-        durable=True,
-    )
-
-
-def build_pipeline_runtime(
-    *,
-    settings: Settings | None = None,
-    broker: RabbitBroker | None = None,
-    session_factory: AsyncSessionFactory | None = None,
-    storage_client: ObjectStorageClientLike | None = None,
-    media_processor: PipelineMediaProcessorProtocol | None = None,
-    ocr_processor: OCRProcessorProtocol | None = None,
-    voyage_client: VoyageClientProtocol | None = None,
-    qdrant_client: QdrantSimilarityClientProtocol | None = None,
-    qdrant_sync_client: QdrantSyncClientProtocol | None = None,
-    meilisearch_sync_client: MeilisearchSyncClientProtocol | None = None,
-    classification_client: ClassificationClientProtocol | None = None,
-) -> PipelineRuntime:
-    """Build the RabbitMQ heavy-worker runtime and register its FastStream subscribers."""
-
-    resolved_settings = settings or get_settings()
-    resolved_broker_settings = get_pipeline_broker_settings(resolved_settings)
-    resolved_broker = broker or get_pipeline_broker()
-    resolved_session_factory = session_factory or get_async_session_factory()
-    resolved_storage_client = storage_client or cast("ObjectStorageClientLike", get_s3_client())
-    resolved_media_processor = media_processor or PipelineMediaProcessor(settings=resolved_settings)
-    resolved_ocr_processor = ocr_processor or PipelineOCRProcessor(
-        settings=resolved_settings,
-        media_processor=resolved_media_processor,
-    )
-    resolved_voyage_client = voyage_client or PipelineVoyageClient(settings=resolved_settings)
-    resolved_qdrant_client = qdrant_client or PipelineQdrantClient(settings=resolved_settings)
-    resolved_qdrant_sync_client = qdrant_sync_client or PipelineQdrantSyncClient(settings=resolved_settings)
-    resolved_meilisearch_sync_client = meilisearch_sync_client or PipelineMeilisearchSyncClient(
-        settings=resolved_settings,
-    )
-    resolved_classification_client = classification_client or PipelineClassificationClient(
-        settings=resolved_settings,
-    )
-    transcode_retry_queue_name = f"{resolved_broker_settings.transcode_queue}.retry"
-    ocr_retry_queue_name = f"{resolved_broker_settings.ocr_queue}.retry"
-    embed_retry_queue_name = f"{resolved_broker_settings.embed_queue}.retry"
-    classify_retry_queue_name = f"{resolved_broker_settings.classify_queue}.retry"
-    sync_qdrant_retry_queue_name = f"{resolved_broker_settings.sync_qdrant_queue}.retry"
-    sync_meili_retry_queue_name = f"{resolved_broker_settings.sync_meili_queue}.retry"
-    embed_retry_request_routing_key = resolved_broker_settings.retry_queue_routing_key_for_stage(
-        ContentPipelineStage.EMBED,
-    )
-    classify_retry_request_routing_key = resolved_broker_settings.retry_queue_routing_key_for_stage(
-        ContentPipelineStage.CLASSIFY,
-    )
-    sync_qdrant_retry_request_routing_key = resolved_broker_settings.retry_queue_routing_key_for_stage(
-        ContentPipelineStage.SYNC_QDRANT,
-    )
-    sync_meili_retry_request_routing_key = resolved_broker_settings.retry_queue_routing_key_for_stage(
-        ContentPipelineStage.SYNC_MEILI,
-    )
-    embed_retry_return_routing_key = resolved_broker_settings.retry_return_routing_key_for_stage(
-        ContentPipelineStage.EMBED,
-    )
-    classify_retry_return_routing_key = resolved_broker_settings.retry_return_routing_key_for_stage(
-        ContentPipelineStage.CLASSIFY,
-    )
-    sync_qdrant_retry_return_routing_key = resolved_broker_settings.retry_return_routing_key_for_stage(
-        ContentPipelineStage.SYNC_QDRANT,
-    )
-    sync_meili_retry_return_routing_key = resolved_broker_settings.retry_return_routing_key_for_stage(
-        ContentPipelineStage.SYNC_MEILI,
-    )
-
-    runtime = PipelineRuntime(
-        settings=resolved_settings,
-        broker=resolved_broker,
-        session_factory=resolved_session_factory,
-        broker_settings=resolved_broker_settings,
-        pipeline_exchange=_build_pipeline_exchange(resolved_broker_settings),
-        retry_exchange=_build_retry_exchange(resolved_broker_settings),
-        dead_letter_exchange=_build_dead_letter_exchange(resolved_broker_settings),
-        transcode_queue=_build_stage_queue(
-            queue_name=resolved_broker_settings.transcode_queue,
-            routing_key=resolved_broker_settings.meme_created_routing_key,
-            retry_request_routing_key=resolved_broker_settings.retry_routing_key,
-            retry_exchange=resolved_broker_settings.retry_exchange,
-        ),
-        ocr_queue=_build_stage_queue(
-            queue_name=resolved_broker_settings.ocr_queue,
-            routing_key=resolved_broker_settings.ocr_routing_key,
-            retry_request_routing_key=resolved_broker_settings.ocr_retry_request_routing_key,
-            retry_exchange=resolved_broker_settings.retry_exchange,
-        ),
-        embed_queue=_build_stage_queue(
-            queue_name=resolved_broker_settings.embed_queue,
-            routing_key=resolved_broker_settings.embed_routing_key,
-            retry_request_routing_key=embed_retry_request_routing_key,
-            retry_exchange=resolved_broker_settings.retry_exchange,
-        ),
-        classify_queue=_build_stage_queue(
-            queue_name=resolved_broker_settings.classify_queue,
-            routing_key=resolved_broker_settings.classify_routing_key,
-            retry_request_routing_key=classify_retry_request_routing_key,
-            retry_exchange=resolved_broker_settings.retry_exchange,
-        ),
-        sync_qdrant_queue=_build_stage_queue(
-            queue_name=resolved_broker_settings.sync_qdrant_queue,
-            routing_key=resolved_broker_settings.sync_qdrant_routing_key,
-            retry_request_routing_key=sync_qdrant_retry_request_routing_key,
-            retry_exchange=resolved_broker_settings.retry_exchange,
-        ),
-        sync_meili_queue=_build_stage_queue(
-            queue_name=resolved_broker_settings.sync_meili_queue,
-            routing_key=resolved_broker_settings.sync_meili_routing_key,
-            retry_request_routing_key=sync_meili_retry_request_routing_key,
-            retry_exchange=resolved_broker_settings.retry_exchange,
-        ),
-        transcode_retry_queue=_build_retry_queue(
-            queue_name=transcode_retry_queue_name,
-            retry_backoff_milliseconds=resolved_broker_settings.retry_backoff_milliseconds,
-            exchange=resolved_broker_settings.exchange,
-            retry_return_routing_key=resolved_broker_settings.transcode_retry_routing_key,
-        ),
-        ocr_retry_queue=_build_retry_queue(
-            queue_name=ocr_retry_queue_name,
-            retry_backoff_milliseconds=resolved_broker_settings.retry_backoff_milliseconds,
-            exchange=resolved_broker_settings.exchange,
-            retry_return_routing_key=resolved_broker_settings.ocr_retry_routing_key,
-        ),
-        embed_retry_queue=_build_retry_queue(
-            queue_name=embed_retry_queue_name,
-            retry_backoff_milliseconds=resolved_broker_settings.retry_backoff_milliseconds,
-            exchange=resolved_broker_settings.exchange,
-            retry_return_routing_key=embed_retry_return_routing_key,
-        ),
-        classify_retry_queue=_build_retry_queue(
-            queue_name=classify_retry_queue_name,
-            retry_backoff_milliseconds=resolved_broker_settings.retry_backoff_milliseconds,
-            exchange=resolved_broker_settings.exchange,
-            retry_return_routing_key=classify_retry_return_routing_key,
-        ),
-        sync_qdrant_retry_queue=_build_retry_queue(
-            queue_name=sync_qdrant_retry_queue_name,
-            retry_backoff_milliseconds=resolved_broker_settings.retry_backoff_milliseconds,
-            exchange=resolved_broker_settings.exchange,
-            retry_return_routing_key=sync_qdrant_retry_return_routing_key,
-        ),
-        sync_meili_retry_queue=_build_retry_queue(
-            queue_name=sync_meili_retry_queue_name,
-            retry_backoff_milliseconds=resolved_broker_settings.retry_backoff_milliseconds,
-            exchange=resolved_broker_settings.exchange,
-            retry_return_routing_key=sync_meili_retry_return_routing_key,
-        ),
-        dead_letter_queue=_build_dead_letter_queue(resolved_broker_settings),
-        storage_client=resolved_storage_client,
-        media_processor=resolved_media_processor,
-        ocr_processor=resolved_ocr_processor,
-        voyage_client=resolved_voyage_client,
-        qdrant_client=resolved_qdrant_client,
-        qdrant_sync_client=resolved_qdrant_sync_client,
-        meilisearch_sync_client=resolved_meilisearch_sync_client,
-        classification_client=resolved_classification_client,
-    )
-
-    @resolved_broker.subscriber(
-        runtime.transcode_queue,
-        runtime.pipeline_exchange,
-        ack_policy=AckPolicy.MANUAL,
-    )
-    async def _consume_transcode(payload: object, message: RabbitMessage) -> None:
-        rabbit_message = cast("RabbitMessageLike", cast("object", message))
-        await runtime.handle_transcode_message(payload, rabbit_message)
-
-    @resolved_broker.subscriber(
-        runtime.ocr_queue,
-        runtime.pipeline_exchange,
-        ack_policy=AckPolicy.MANUAL,
-    )
-    async def _consume_ocr(payload: object, message: RabbitMessage) -> None:
-        rabbit_message = cast("RabbitMessageLike", cast("object", message))
-        await runtime.handle_ocr_message(payload, rabbit_message)
-
-    @resolved_broker.subscriber(
-        runtime.embed_queue,
-        runtime.pipeline_exchange,
-        ack_policy=AckPolicy.MANUAL,
-    )
-    async def _consume_embed(payload: object, message: RabbitMessage) -> None:
-        rabbit_message = cast("RabbitMessageLike", cast("object", message))
-        await runtime.handle_embed_message(payload, rabbit_message)
-
-    @resolved_broker.subscriber(
-        runtime.classify_queue,
-        runtime.pipeline_exchange,
-        ack_policy=AckPolicy.MANUAL,
-    )
-    async def _consume_classify(payload: object, message: RabbitMessage) -> None:
-        rabbit_message = cast("RabbitMessageLike", cast("object", message))
-        await runtime.handle_classify_message(payload, rabbit_message)
-
-    @resolved_broker.subscriber(
-        runtime.sync_qdrant_queue,
-        runtime.pipeline_exchange,
-        ack_policy=AckPolicy.MANUAL,
-    )
-    async def _consume_sync_qdrant(payload: object, message: RabbitMessage) -> None:
-        rabbit_message = cast("RabbitMessageLike", cast("object", message))
-        await runtime.handle_sync_qdrant_message(payload, rabbit_message)
-
-    @resolved_broker.subscriber(
-        runtime.sync_meili_queue,
-        runtime.pipeline_exchange,
-        ack_policy=AckPolicy.MANUAL,
-    )
-    async def _consume_sync_meili(payload: object, message: RabbitMessage) -> None:
-        rabbit_message = cast("RabbitMessageLike", cast("object", message))
-        await runtime.handle_sync_meili_message(payload, rabbit_message)
-
-    return runtime
-
-
-async def run_pipeline_runtime(*, settings: Settings | None = None) -> None:
-    """Start the real RabbitMQ-backed content-pipeline worker runtime."""
-
-    runtime = build_pipeline_runtime(settings=settings)
-    await runtime.run()
-
 
 __all__ = [
-    "PIPELINE_REASON_CLASSIFY_FAILED",
-    "PIPELINE_REASON_CLASSIFY_MALFORMED",
-    "PIPELINE_REASON_CLASSIFY_PROVIDER_BLOCKED",
-    "PIPELINE_REASON_CLASSIFY_TIMEOUT",
-    "PIPELINE_REASON_EMBED_FAILED",
-    "PIPELINE_REASON_EMBED_MALFORMED_VECTOR",
-    "PIPELINE_REASON_EMBED_PROVIDER_BLOCKED",
-    "PIPELINE_REASON_EMBED_SIMILARITY_BLOCKED",
-    "PIPELINE_REASON_EMBED_TIMEOUT",
-    "PIPELINE_REASON_FORCED_CLASSIFY_FAILURE",
-    "PIPELINE_REASON_FORCED_EMBED_FAILURE",
-    "PIPELINE_REASON_FORCED_SYNC_MEILI_FAILURE",
-    "PIPELINE_REASON_FORCED_SYNC_QDRANT_FAILURE",
-    "PIPELINE_REASON_FORCED_TRANSCODE_FAILURE",
-    "PIPELINE_REASON_MALFORMED_EVENT",
-    "PIPELINE_REASON_OCR_FAILED",
-    "PIPELINE_REASON_OCR_PROVIDER_BLOCKED",
-    "PIPELINE_REASON_OCR_TIMEOUT",
-    "PIPELINE_REASON_SYNC_MEILI_CONFLICT",
-    "PIPELINE_REASON_SYNC_MEILI_MALFORMED_PAYLOAD",
-    "PIPELINE_REASON_SYNC_MEILI_PROVIDER_BLOCKED",
-    "PIPELINE_REASON_SYNC_MEILI_TIMEOUT",
-    "PIPELINE_REASON_SYNC_QDRANT_CONFLICT",
-    "PIPELINE_REASON_SYNC_QDRANT_MALFORMED_PAYLOAD",
-    "PIPELINE_REASON_SYNC_QDRANT_PROVIDER_BLOCKED",
-    "PIPELINE_REASON_SYNC_QDRANT_TIMEOUT",
-    "PIPELINE_REASON_TRANSCODE_FAILED",
-    "PIPELINE_REASON_TRANSCODE_INVALID_MEDIA",
-    "PIPELINE_REASON_TRANSCODE_TIMEOUT",
-    "PIPELINE_REASON_UNSUPPORTED_STAGE",
-    "ForcedClassifyFailure",
-    "ForcedEmbedFailure",
-    "ForcedSyncMeiliFailure",
-    "ForcedSyncQdrantFailure",
-    "ForcedTranscodeFailure",
+    "ObjectStorageClientLike",
     "PipelineRuntime",
     "RabbitMessageLike",
     "SyncMeiliInputs",
     "SyncQdrantInputs",
-    "build_pipeline_runtime",
-    "run_pipeline_runtime",
 ]
