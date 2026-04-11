@@ -1,0 +1,34 @@
+# S04 curated channel fixture — placeholder entries for operators to replace.
+#
+# The T04 freshness SLO proof harness reads this file via
+# ``--channel-fixture-path``. Live mode refuses to run if any listed channel
+# is missing from the ``GET /api/v1/crawler/channels`` response, so edit
+# this file to match the real curated channels you have seeded in the
+# ``source_channels`` table before running the harness. Dry-run mode
+# ignores this file entirely and uses canned in-process channels.
+#
+# Schema:
+#   channels:
+#     - platform_id: "@channel_handle"    # must match source_channels.platform_id
+#       username: "channel_handle"          # optional, Telegram handle without @
+#       title: "Human-readable title"       # operator-facing label for reports
+#       session_name: "primary"              # Telethon session row name
+#
+# Notes:
+# * ``platform_id`` is the ``source_channels.platform_id`` value the crawler
+#   runtime was bound to. For Telegram channels we conventionally prefix
+#   with ``@`` so the operator curl examples in the runbook line up.
+# * ``session_name`` must point at a row in ``telegram_session_state`` that
+#   is already authenticated via ``scripts/auth_telegram_session.py``.
+# * The harness does NOT seed rows automatically — operators must insert
+#   the ``source_channels`` rows ahead of time (see the runbook for the
+#   copy-pasteable SQL template).
+channels:
+  - platform_id: "@example_memes_en"
+    username: "example_memes_en"
+    title: "Example Memes (EN)"
+    session_name: "primary"
+  - platform_id: "@example_memes_ru"
+    username: "example_memes_ru"
+    title: "Example Memes (RU)"
+    session_name: "primary"

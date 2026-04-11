@@ -8,12 +8,19 @@ the S01-S03 ingest + sync + smoke-proof contract and adding the crawler
 channel/freshness projections would push it well past its soft-cap size.
 Keeping the crawler schemas here makes the operator-surface surface area
 scannable without touching the frozen pipeline schema module.
+
+The T04 ``CrawlerS04*`` report schemas also live here: they are the
+machine-readable contract the freshness SLO proof harness writes to
+``.artifacts/s04-runtime-smoke/<run-id>/report.json`` and tests exercise
+via the pure ``summarize_s04_run`` aggregator in
+:mod:`memexpert.services.crawler_s04_report`.
 """
 
 from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
@@ -176,6 +183,77 @@ class CrawlerFreshnessSnapshot(BaseModel):
     sample_items: tuple[CrawlerFreshnessSampleItem, ...] = ()
 
 
+class CrawlerS04RunItemReport(BaseModel):
+    """One row of the bounded per-item report the T04 proof harness writes.
+
+    Each row names a concrete meme file so operators can drill into the
+    enriched inspect surface from the Markdown report. ``freshness_seconds``
+    is ``None`` for items whose sync chain has not reached both targets.
+    The ``slo_bucket`` field is a pre-computed tag so the Markdown renderer
+    and the JSON consumer do not have to re-derive the same decision.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    meme_file_id: uuid.UUID
+    source_channel_id: uuid.UUID
+    channel_title: str = Field(min_length=1, max_length=MAX_TELEGRAM_CHANNEL_TITLE_LENGTH)
+    published_at: datetime | None = None
+    both_synced_at: datetime | None = None
+    freshness_seconds: float | None = None
+    slo_bucket: Literal["pass", "breached_p50", "breached_p95", "incomplete"]
+
+
+class CrawlerS04PerChannelSummary(BaseModel):
+    """Per-channel freshness roll-up used by the T04 proof harness report."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source_channel_id: uuid.UUID
+    channel_title: str = Field(min_length=1, max_length=MAX_TELEGRAM_CHANNEL_TITLE_LENGTH)
+    item_count: StrictInt = Field(ge=0)
+    p50_seconds: float | None = None
+    p95_seconds: float | None = None
+    slo_p50_pass: bool
+    slo_p95_pass: bool
+    most_recent_item_at: datetime | None = None
+    most_recent_freshness_seconds: float | None = None
+
+
+class CrawlerS04RunSummary(BaseModel):
+    """Top-level summary the T04 freshness proof harness persists.
+
+    ``mode`` distinguishes a ``live`` run (operator drove a real stack) from
+    ``catch_up_only`` (live listener skipped) and ``dry_run`` (no HTTP, no
+    DB — the reporting pipeline is exercised against a fixture snapshot).
+    The SLO pass flags follow the documented harness convention: a pass
+    requires ``slo_p50_pass AND slo_p95_pass AND observed_item_count >=
+    bounded_item_count``; the :func:`_exit_code_from_summary` helper in
+    the S04 report service is the single canonical evaluator.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str = Field(min_length=1, max_length=128)
+    started_at: datetime
+    finished_at: datetime
+    mode: Literal["live", "catch_up_only", "dry_run"]
+    api_base_url: str | None = Field(default=None, max_length=512)
+    channel_fixture_path: str | None = Field(default=None, max_length=1024)
+    bounded_item_count: StrictInt = Field(ge=0)
+    observed_item_count: StrictInt = Field(ge=0)
+    p50_seconds: float | None = None
+    p95_seconds: float | None = None
+    slo_p50_seconds: float = Field(gt=0)
+    slo_p95_seconds: float = Field(gt=0)
+    slo_p50_pass: bool
+    slo_p95_pass: bool
+    per_channel: tuple[CrawlerS04PerChannelSummary, ...] = ()
+    item_reports: tuple[CrawlerS04RunItemReport, ...] = ()
+    errors: tuple[str, ...] = ()
+    stalled_channels: tuple[str, ...] = ()
+
+
 __all__ = [
     "MAX_FRESHNESS_SAMPLE_ITEMS",
     "CrawlerChannelReassignRequest",
@@ -184,4 +262,7 @@ __all__ = [
     "CrawlerFreshnessChannelBreakdown",
     "CrawlerFreshnessSampleItem",
     "CrawlerFreshnessSnapshot",
+    "CrawlerS04PerChannelSummary",
+    "CrawlerS04RunItemReport",
+    "CrawlerS04RunSummary",
 ]
