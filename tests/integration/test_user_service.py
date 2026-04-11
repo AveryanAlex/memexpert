@@ -122,6 +122,39 @@ async def test_repeated_guest_creation_produces_distinct_accounts_with_one_favor
     assert membership_count_result.scalar_one() == 2
 
 
+async def test_create_guest_user_commit_false_rolls_back_on_session_rollback(
+    migrated_db_session: AsyncSession,
+) -> None:
+    """Bootstrapped guests must disappear when the outer transaction rolls back.
+
+    ``AccountLinkService`` relies on this: it bootstraps a guest with
+    ``commit=False`` so that a validation failure during the subsequent
+    in-place upgrade rolls the guest row back atomically instead of leaking
+    an orphan user + favorites + membership tuple.
+    """
+
+    service = UserService(migrated_db_session)
+
+    created_user = await service.create_guest_user(commit=False)
+
+    in_session_result = await migrated_db_session.execute(select(User).where(User.id == created_user.id))
+    assert in_session_result.scalar_one_or_none() is not None
+
+    await migrated_db_session.rollback()
+
+    user_count_result = await migrated_db_session.execute(select(func.count()).select_from(User))
+    favorites_count_result = await migrated_db_session.execute(
+        select(func.count())
+        .select_from(Collection)
+        .where(Collection.kind == CollectionKind.FAVORITES)
+    )
+    membership_count_result = await migrated_db_session.execute(select(func.count()).select_from(CollectionMember))
+
+    assert user_count_result.scalar_one() == 0
+    assert favorites_count_result.scalar_one() == 0
+    assert membership_count_result.scalar_one() == 0
+
+
 async def test_create_full_user_rejects_malformed_email_before_commit(
     migrated_db_session: AsyncSession,
 ) -> None:

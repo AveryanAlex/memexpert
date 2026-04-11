@@ -27,12 +27,17 @@ from memexpert.core.database import (
     verify_async_engine,
 )
 from memexpert.core.redis import reset_async_redis_state
+from memexpert.models.enums import UserLanguage
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
+    from datetime import datetime
 
     from fastapi import FastAPI
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
+
+    from memexpert.schemas.user import UserRead
+    from memexpert.services.user_service import UserService
 
 TEST_POSTGRES_IMAGE: Final = "postgres:16"
 TEST_POSTGRES_CONNECT_TIMEOUT_SECONDS: Final = 10.0
@@ -108,6 +113,44 @@ async def reset_test_runtime_state(*, flush_redis: bool = False) -> None:
     get_settings.cache_clear()
     await reset_async_database_state()
     await reset_async_redis_state(flushdb=flush_redis)
+
+
+async def create_full_user_via_upgrade(
+    user_service: UserService,
+    *,
+    telegram_id: int | None = None,
+    google_id: str | None = None,
+    email: str | None = None,
+    email_verified_at: datetime | None = None,
+    password_hash: str | None = None,
+    language: UserLanguage = UserLanguage.ANY,
+    nsfw_enabled: bool = False,
+) -> UserRead:
+    """Test-only seed helper: create a guest then upgrade it atomically.
+
+    Production code owns exactly one writer path for full accounts
+    (``AccountLinkService.link_guest_with_*``). Tests that need an existing
+    full-account fixture — to exercise "returning user" branches of the
+    writer path or of other services — use this helper instead of calling
+    ``UserService.create_full_user``.
+
+    The helper bootstraps the guest with ``commit=False`` so a validation
+    failure during the upgrade rolls the guest row back atomically, matching
+    the "rejected before commit" invariants that the deleted
+    ``create_full_user`` method enforced.
+    """
+
+    guest = await user_service.create_guest_user(
+        language=language, nsfw_enabled=nsfw_enabled, commit=False,
+    )
+    return await user_service.upgrade_guest_to_full_account(
+        user_id=guest.id,
+        telegram_id=telegram_id,
+        google_id=google_id,
+        email=email,
+        email_verified_at=email_verified_at,
+        password_hash=password_hash,
+    )
 
 
 @pytest_asyncio.fixture(autouse=True)

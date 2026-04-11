@@ -219,8 +219,17 @@ class UserService:
         *,
         language: UserLanguage = UserLanguage.ANY,
         nsfw_enabled: bool = False,
+        commit: bool = True,
     ) -> UserRead:
-        """Create a guest account with an initialized Favorites collection."""
+        """Create a guest account with an initialized Favorites collection.
+
+        When ``commit`` is ``False`` the new row is flushed into the session
+        but not committed, so the caller's outer transaction owns the fate of
+        the bootstrap. This is used by ``AccountLinkService`` to bootstrap a
+        guest inside the same transaction as a subsequent in-place upgrade,
+        so a validation failure during the upgrade rolls the guest back
+        atomically instead of leaking an orphan row.
+        """
 
         now = utcnow()
         user = User(
@@ -231,7 +240,7 @@ class UserService:
             last_active_at=now,
             guest_expires_at=now + self._guest_lifetime,
         )
-        favorites = await self._create_user_with_favorites(user)
+        favorites = await self._create_user_with_favorites(user, commit=commit)
         return UserRead.model_validate(user if user.active_save_collection_id == favorites.id else user)
 
     async def create_full_user(

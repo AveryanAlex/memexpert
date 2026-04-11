@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from memexpert.api.dependencies import FullAccountUserDep
 from memexpert.schemas.user import UserRead
 from memexpert.services import AuthService, UserService
+from tests.conftest import create_full_user_via_upgrade
 
 FULL_ONLY_PROBE_PATH = "/api/v1/test-auth/full-only"
 ACCESS_TOKEN_TTL = timedelta(minutes=15)
@@ -215,7 +216,9 @@ async def test_full_account_dependency_returns_upgrade_required_for_guests_and_a
     async with postgres_session_factory() as session:
         user_service = UserService(session)
         auth_service = build_test_auth_service(session, auth_settings_overrides)
-        full_user = await user_service.create_full_user(email="full-auth-route@example.com")
+        full_user = await create_full_user_via_upgrade(
+            user_service, email="full-auth-route@example.com",
+        )
         full_session = await auth_service.issue_session_for_user(full_user)
 
     async with AsyncClient(transport=transport, base_url="https://testserver") as full_client:

@@ -28,6 +28,7 @@ from memexpert.services import (
     UserService,
     UserStateMismatchError,
 )
+from tests.conftest import create_full_user_via_upgrade
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -50,9 +51,12 @@ class SpyUserService(UserService):
         *,
         language: UserLanguage = UserLanguage.ANY,
         nsfw_enabled: bool = False,
+        commit: bool = True,
     ) -> UserRead:
         self.create_guest_user_calls += 1
-        return await super().create_guest_user(language=language, nsfw_enabled=nsfw_enabled)
+        return await super().create_guest_user(
+            language=language, nsfw_enabled=nsfw_enabled, commit=commit,
+        )
 
 
 def build_auth_service(
@@ -245,7 +249,7 @@ async def test_verify_access_token_reloads_current_user_state_and_enforces_full_
     with pytest.raises(UserStateMismatchError, match="persisted account state"):
         _ = await auth_service.verify_access_token(guest_session.access_token)
 
-    full_user = await user_service.create_full_user(email="full@example.com")
+    full_user = await create_full_user_via_upgrade(user_service, email="full@example.com")
     full_session = await auth_service.issue_session_for_user(full_user)
     verified_full_user = await auth_service.verify_access_token(
         full_session.access_token,
@@ -261,7 +265,7 @@ async def test_issue_session_and_refresh_rotation_reject_non_active_users(
 ) -> None:
     auth_service = build_auth_service(migrated_db_session)
     user_service = UserService(migrated_db_session)
-    unavailable_user = await user_service.create_full_user(email="unavailable@example.com")
+    unavailable_user = await create_full_user_via_upgrade(user_service, email="unavailable@example.com")
 
     unavailable_user_result = await migrated_db_session.execute(select(User).where(User.id == unavailable_user.id))
     persisted_unavailable_user = unavailable_user_result.scalar_one()
@@ -278,7 +282,7 @@ async def test_issue_session_and_refresh_rotation_reject_non_active_users(
     )
     assert unavailable_refresh_count_result.scalar_one() == 0
 
-    active_user = await user_service.create_full_user(email="rotation-check@example.com")
+    active_user = await create_full_user_via_upgrade(user_service, email="rotation-check@example.com")
     active_session = await auth_service.issue_session_for_user(active_user)
 
     active_user_result = await migrated_db_session.execute(select(User).where(User.id == active_user.id))
