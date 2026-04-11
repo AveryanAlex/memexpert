@@ -147,16 +147,21 @@ async def test_email_login_normalizes_email_and_uses_bcrypt_comparison(
     migrated_db_session: AsyncSession,
 ) -> None:
     user_service = UserService(migrated_db_session)
-    provider_auth_service = build_provider_auth_service(migrated_db_session)
-    full_user = await create_full_user_via_upgrade(user_service,
+    link_service = build_account_link_service(migrated_db_session)
+    auth_service = build_auth_service(migrated_db_session)
+    full_user = await create_full_user_via_upgrade(
+        user_service,
         email="login@example.com",
         password_hash=hash_password(PASSWORD),
     )
 
-    auth_session = await provider_auth_service.login_with_email(
+    link_result = await link_service.link_guest_with_email_login(
+        guest_user_id=None,
         email="  LOGIN@example.com  ",
         password=PASSWORD,
-        device_info="Safari",
+    )
+    auth_session = await auth_service.issue_session_for_user(
+        link_result.user, device_info="Safari", reload_user=False,
     )
 
     assert auth_session.user.id == full_user.id
@@ -173,21 +178,26 @@ async def test_email_login_rejects_wrong_password_and_missing_stored_hash_withou
     migrated_db_session: AsyncSession,
 ) -> None:
     user_service = UserService(migrated_db_session)
-    provider_auth_service = build_provider_auth_service(migrated_db_session)
-    password_user = await create_full_user_via_upgrade(user_service,
+    link_service = build_account_link_service(migrated_db_session)
+    password_user = await create_full_user_via_upgrade(
+        user_service,
         email="password-user@example.com",
         password_hash=hash_password(PASSWORD),
     )
-    missing_hash_user = await create_full_user_via_upgrade(user_service, email="missing-hash@example.com")
+    missing_hash_user = await create_full_user_via_upgrade(
+        user_service, email="missing-hash@example.com",
+    )
 
     with pytest.raises(InvalidCredentialsError, match="invalid"):
-        _ = await provider_auth_service.login_with_email(
+        _ = await link_service.link_guest_with_email_login(
+            guest_user_id=None,
             email="password-user@example.com",
             password="wrong-password",
         )
 
     with pytest.raises(InvalidCredentialsError, match="not available"):
-        _ = await provider_auth_service.login_with_email(
+        _ = await link_service.link_guest_with_email_login(
+            guest_user_id=None,
             email="missing-hash@example.com",
             password=PASSWORD,
         )
@@ -204,8 +214,9 @@ async def test_email_login_rejects_non_active_accounts(
     migrated_db_session: AsyncSession,
 ) -> None:
     user_service = UserService(migrated_db_session)
-    provider_auth_service = build_provider_auth_service(migrated_db_session)
-    unavailable_user = await create_full_user_via_upgrade(user_service,
+    link_service = build_account_link_service(migrated_db_session)
+    unavailable_user = await create_full_user_via_upgrade(
+        user_service,
         email="inactive@example.com",
         password_hash=hash_password(PASSWORD),
     )
@@ -216,7 +227,8 @@ async def test_email_login_rejects_non_active_accounts(
     await migrated_db_session.commit()
 
     with pytest.raises(AccountUnavailableError, match="not available"):
-        _ = await provider_auth_service.login_with_email(
+        _ = await link_service.link_guest_with_email_login(
+            guest_user_id=None,
             email="inactive@example.com",
             password=PASSWORD,
         )

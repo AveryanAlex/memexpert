@@ -702,13 +702,25 @@ async def test_link_routes_reject_full_account_callers_with_guest_only_error(
         assert merge_log_count_result.scalar_one() == 0
 
 
-async def test_email_login_route_stays_plain_auth_even_when_guest_bearer_is_present(
+async def test_email_login_route_merges_guest_when_guest_bearer_is_present(
     auth_client: AsyncClient,
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
+    """Under the unified writer path /auth/email/login merges the guest into the target.
+
+    The previous direct-auth contract left the guest intact and issued a
+    session on a different account. Variant C collapses signup and login
+    onto the same ``link_guest_with_email_*`` primitives, so a guest bearer
+    present on ``/auth/email/login`` now rolls the guest's state (favorites,
+    analytics, inline usage) into the authenticated target account and the
+    transient guest row is deleted. A stale guest bearer is no longer
+    usable after the merge.
+    """
+
     async with postgres_session_factory() as session:
         user_service = UserService(session)
-        full_user = await create_full_user_via_upgrade(user_service,
+        full_user = await create_full_user_via_upgrade(
+            user_service,
             email="plain-login@example.com",
             password_hash=hash_password(PASSWORD),
         )
@@ -726,26 +738,24 @@ async def test_email_login_route_stays_plain_auth_even_when_guest_bearer_is_pres
             "password": PASSWORD,
         },
     )
-    guest_me_response = await auth_client.get(
-        "/api/v1/auth/me",
-        headers={"Authorization": f"Bearer {guest_access_token}"},
-    )
 
     assert login_response.status_code == 200
     assert login_response.json()["user"]["id"] == str(full_user.id)
     assert login_response.json()["user"]["account_type"] == "full"
 
-    assert guest_me_response.status_code == 200
-    assert guest_me_response.json()["id"] == str(guest_user_id)
-    assert guest_me_response.json()["account_type"] == "guest"
-
     async with postgres_session_factory() as session:
         persisted_guest_result = await session.execute(select(User).where(User.id == guest_user_id))
-        merge_log_count_result = await session.execute(select(func.count()).select_from(AccountMergeLog))
-        persisted_guest = persisted_guest_result.scalar_one()
+        persisted_target_result = await session.execute(select(User).where(User.id == full_user.id))
+        merge_log_count_result = await session.execute(
+            select(func.count()).select_from(AccountMergeLog).where(AccountMergeLog.guest_account_id == guest_user_id)
+        )
 
-        assert persisted_guest.account_type is AccountType.GUEST
-        assert merge_log_count_result.scalar_one() == 0
+        # The guest was merged into the target and deleted; the merge
+        # log row records the operation even though the transient guest
+        # had no favorites/analytics to transfer.
+        assert persisted_guest_result.scalar_one_or_none() is None
+        assert persisted_target_result.scalar_one() is not None
+        assert merge_log_count_result.scalar_one() == 1
 
 
 @pytest.mark.parametrize(

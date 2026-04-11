@@ -166,22 +166,6 @@ class ProviderAuthService:
             user_service=user_service,
         )
 
-    async def login_with_email(
-        self,
-        *,
-        email: str,
-        password: str,
-        device_info: str | None = None,
-    ) -> AuthSession:
-        """Authenticate an existing full account via normalized email and bcrypt."""
-
-        user = await self.resolve_email_login_user(email=email, password=password)
-        return await self._auth_service.issue_session_for_user(
-            user,
-            device_info=device_info,
-            reload_user=False,
-        )
-
     async def authenticate_with_google_code(
         self,
         *,

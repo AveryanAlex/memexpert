@@ -120,16 +120,32 @@ async def signup_with_email(
 async def login_with_email(
     request: Request,
     response: Response,
-    provider_auth_service: ProviderAuthServiceDep,
+    _guard: ForbidFullAccountCallerDep,
+    optional_guest: OptionalGuestUserDep,
+    account_link_service: AccountLinkServiceDep,
+    auth_service: AuthServiceDep,
     credentials: Annotated[EmailLoginRequest, Body()],
 ) -> AuthSessionRead:
-    """Authenticate an existing email/password account and keep the refresh token cookie-only."""
+    """Authenticate an existing email/password account via the unified merge path.
+
+    Under the unified writer path every login goes through
+    ``AccountLinkService.link_guest_with_email_login``, which merges the
+    caller's guest (or a throwaway bootstrapped one for anonymous callers)
+    into the target full account. Guest-side favorites, analytics, and
+    inline usage events are always carried across, so a browser that
+    switches from a guest session to a known account never loses state.
+    """
 
     try:
-        auth_session = await provider_auth_service.login_with_email(
+        link_result = await account_link_service.link_guest_with_email_login(
+            guest_user_id=optional_guest.id if optional_guest else None,
             email=credentials.email,
             password=credentials.password,
+        )
+        auth_session = await auth_service.issue_session_for_user(
+            link_result.user,
             device_info=request.headers.get("user-agent"),
+            reload_user=False,
         )
     except AuthServiceError as exc:
         raise to_auth_http_error(exc) from exc
