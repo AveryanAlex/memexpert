@@ -23,6 +23,7 @@ from memexpert.models.enums import (
 from memexpert.models.user import User
 from memexpert.schemas import CollectionRead, UserRead
 from memexpert.schemas.auth import normalize_auth_email
+from memexpert.services._integrity import integrity_constraint_name
 from memexpert.services.errors import (
     DuplicateFavoritesCollectionError,
     DuplicateIdentityError,
@@ -326,7 +327,7 @@ class UserService:
                 await self._session.flush()
         except IntegrityError as exc:
             await self._session.rollback()
-            constraint_name = _integrity_constraint_name(exc)
+            constraint_name = integrity_constraint_name(exc)
             if constraint_name == "uq_users_google_id_not_null":
                 raise DuplicateIdentityError(
                     f"Google subject {normalized_google_id!r} is already linked to another account.",
@@ -370,7 +371,7 @@ class UserService:
                 await self._session.flush()
         except IntegrityError as exc:
             await self._session.rollback()
-            constraint_name = _integrity_constraint_name(exc)
+            constraint_name = integrity_constraint_name(exc)
             if constraint_name == "uq_users_telegram_id_not_null":
                 raise DuplicateIdentityError(
                     f"Telegram ID {normalized_telegram_id} is already linked to another account.",
@@ -464,7 +465,7 @@ class UserService:
                 await self._session.flush()
         except IntegrityError as exc:
             await self._session.rollback()
-            constraint_name = _integrity_constraint_name(exc)
+            constraint_name = integrity_constraint_name(exc)
             if constraint_name == "uq_users_email_not_null":
                 raise DuplicateIdentityError(
                     f"Email {normalized_email!r} is already linked to another account.",
@@ -532,7 +533,7 @@ class UserService:
                 await self._session.flush()
         except IntegrityError as exc:
             await self._session.rollback()
-            constraint_name = _integrity_constraint_name(exc)
+            constraint_name = integrity_constraint_name(exc)
             if constraint_name == "uq_collections_one_favorites_per_owner":
                 raise DuplicateFavoritesCollectionError(
                     f"User {user.id} already has a Favorites collection.",
@@ -589,26 +590,6 @@ class UserService:
             return provider if isinstance(provider, AuthProvider) else AuthProvider(provider)
         except ValueError as exc:
             raise InvalidIdentityError(f"Unsupported auth provider {provider!r}.") from exc
-
-
-def _integrity_constraint_name(exc: IntegrityError) -> str | None:
-    """Extract a PostgreSQL constraint name from a SQLAlchemy integrity error."""
-
-    candidates = [exc.orig, getattr(exc.orig, "__cause__", None)]
-    for candidate in candidates:
-        if candidate is None:
-            continue
-
-        constraint_name = getattr(candidate, "constraint_name", None)
-        if isinstance(constraint_name, str):
-            return constraint_name
-
-        diag = getattr(candidate, "diag", None)
-        diag_constraint_name = getattr(diag, "constraint_name", None)
-        if isinstance(diag_constraint_name, str):
-            return diag_constraint_name
-
-    return None
 
 
 __all__ = [

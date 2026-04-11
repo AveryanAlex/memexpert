@@ -23,6 +23,7 @@ from memexpert.models.enums import AccountStatus, AccountType, AnalyticsEventTyp
 from memexpert.models.user import AccountMergeLog, AnalyticsEvent, InlineUsageEvent, TelegramLinkCode, User
 from memexpert.schemas.auth import TelegramWidgetAuthRequest
 from memexpert.schemas.user import UserRead
+from memexpert.services._integrity import integrity_constraint_name
 from memexpert.services.errors import (
     AccountLinkAlreadyCompletedError,
     AccountLinkInvariantError,
@@ -189,7 +190,7 @@ class AccountLinkService:
             raise
         except IntegrityError as exc:
             await self._session.rollback()
-            constraint_name = self._integrity_constraint_name(exc)
+            constraint_name = integrity_constraint_name(exc)
             if constraint_name == "uq_telegram_link_codes_code_hash":
                 raise AccountLinkInvariantError("Telegram link code collision detected; please retry.") from exc
             raise AccountLinkInvariantError("Failed to issue the Telegram link code.") from exc
@@ -921,24 +922,6 @@ class AccountLinkService:
         if value <= 0:
             raise AuthConfigurationError(f"{field_name} must be greater than zero.")
         return value
-
-    @staticmethod
-    def _integrity_constraint_name(exc: IntegrityError) -> str | None:
-        candidates = [exc.orig, getattr(exc.orig, "__cause__", None)]
-        for candidate in candidates:
-            if candidate is None:
-                continue
-
-            constraint_name = getattr(candidate, "constraint_name", None)
-            if isinstance(constraint_name, str):
-                return constraint_name
-
-            diag = getattr(candidate, "diag", None)
-            diag_constraint_name = getattr(diag, "constraint_name", None)
-            if isinstance(diag_constraint_name, str):
-                return diag_constraint_name
-
-        return None
 
     @staticmethod
     def _rowcount(result: object) -> int:

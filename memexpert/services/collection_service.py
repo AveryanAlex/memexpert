@@ -20,6 +20,7 @@ from memexpert.models.enums import (
 )
 from memexpert.models.user import User
 from memexpert.schemas import CollectionInviteRead, CollectionMemberRead, CollectionRead, UserRead
+from memexpert.services._integrity import integrity_constraint_name
 from memexpert.services.errors import (
     CollectionNotFoundError,
     CollectionServiceError,
@@ -219,7 +220,7 @@ class CollectionService:
             await self._session.commit()
         except IntegrityError as exc:
             await self._session.rollback()
-            if _integrity_constraint_name(exc) == "uq_collection_invites_token_hash":
+            if integrity_constraint_name(exc) == "uq_collection_invites_token_hash":
                 raise DuplicateCollectionInviteError("Invite token hash already exists.") from exc
             raise CollectionServiceError("Failed to persist the collection invite.") from exc
 
@@ -361,24 +362,6 @@ def _user_can_write_collection(user_id: object, collection: Collection) -> bool:
         membership.user_id == user_id and membership.role in WRITE_ROLES
         for membership in collection.memberships
     )
-
-
-def _integrity_constraint_name(exc: IntegrityError) -> str | None:
-    candidates = [exc.orig, getattr(exc.orig, "__cause__", None)]
-    for candidate in candidates:
-        if candidate is None:
-            continue
-
-        constraint_name = getattr(candidate, "constraint_name", None)
-        if isinstance(constraint_name, str):
-            return constraint_name
-
-        diag = getattr(candidate, "diag", None)
-        diag_constraint_name = getattr(diag, "constraint_name", None)
-        if isinstance(diag_constraint_name, str):
-            return diag_constraint_name
-
-    return None
 
 
 __all__ = [
