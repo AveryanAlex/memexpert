@@ -243,60 +243,6 @@ class UserService:
         favorites = await self._create_user_with_favorites(user, commit=commit)
         return UserRead.model_validate(user if user.active_save_collection_id == favorites.id else user)
 
-    async def create_full_user(
-        self,
-        *,
-        telegram_id: int | None = None,
-        google_id: str | None = None,
-        email: str | None = None,
-        email_verified_at: datetime | None = None,
-        password_hash: str | None = None,
-        language: UserLanguage = UserLanguage.ANY,
-        nsfw_enabled: bool = False,
-        commit: bool = True,
-    ) -> UserRead:
-        """Create a full account with identity fields and Favorites bootstrap."""
-
-        normalized_telegram_id = self.normalize_telegram_id(telegram_id)
-        normalized_google_id = self.normalize_google_id(google_id)
-        normalized_email = self.normalize_email(email)
-        normalized_password_hash = self._normalize_password_hash(password_hash)
-
-        if (
-            normalized_telegram_id is None
-            and normalized_google_id is None
-            and normalized_email is None
-        ):
-            raise InvalidIdentityError(
-                "Full accounts require at least one identity: telegram_id, google_id, or email.",
-            )
-        if normalized_email is None and email_verified_at is not None:
-            raise InvalidIdentityError("email_verified_at requires an email address.")
-        if normalized_email is None and normalized_password_hash is not None:
-            raise InvalidIdentityError("password_hash requires an email identity.")
-
-        await self._ensure_identity_is_available(
-            telegram_id=normalized_telegram_id,
-            google_id=normalized_google_id,
-            email=normalized_email,
-        )
-
-        user = User(
-            account_type=AccountType.FULL,
-            status=AccountStatus.ACTIVE,
-            telegram_id=normalized_telegram_id,
-            google_id=normalized_google_id,
-            email=normalized_email,
-            email_verified_at=email_verified_at,
-            password_hash=normalized_password_hash,
-            language=language,
-            nsfw_enabled=nsfw_enabled,
-            last_active_at=utcnow(),
-            guest_expires_at=None,
-        )
-        favorites = await self._create_user_with_favorites(user, commit=commit)
-        return UserRead.model_validate(user if user.active_save_collection_id == favorites.id else user)
-
     async def attach_google_identity(
         self,
         *,
