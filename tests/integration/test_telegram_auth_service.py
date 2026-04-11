@@ -23,6 +23,7 @@ from memexpert.services import (
     ProviderPayloadInvalidError,
     UserService,
 )
+from tests.conftest import create_full_user_via_upgrade
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -121,7 +122,7 @@ async def test_telegram_auth_reuses_same_account_across_widget_and_miniapp_witho
 ) -> None:
     user_service = UserService(migrated_db_session)
     provider_auth_service = build_provider_auth_service(migrated_db_session)
-    existing_email_user = await user_service.create_full_user(email="existing@example.com")
+    existing_email_user = await create_full_user_via_upgrade(user_service, email="existing@example.com")
 
     widget_session = await provider_auth_service.authenticate_with_telegram_widget(
         payload=build_widget_request(telegram_id=987654321),

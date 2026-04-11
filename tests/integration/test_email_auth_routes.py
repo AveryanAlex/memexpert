@@ -12,6 +12,7 @@ from sqlalchemy import func, select
 from memexpert.models.enums import AccountStatus
 from memexpert.models.user import RefreshToken, User
 from memexpert.services import UserService
+from tests.conftest import create_full_user_via_upgrade
 
 if TYPE_CHECKING:
     from httpx import AsyncClient
@@ -82,7 +83,11 @@ async def test_email_signup_route_rejects_duplicate_email_with_typed_conflict(
 ) -> None:
     async with postgres_session_factory() as session:
         user_service = UserService(session)
-        _ = await user_service.create_full_user(email="duplicate@example.com", password_hash=hash_password(PASSWORD))
+        _ = await create_full_user_via_upgrade(
+            user_service,
+            email="duplicate@example.com",
+            password_hash=hash_password(PASSWORD),
+        )
 
     response = await auth_client.post(
         "/api/v1/auth/email/signup",
@@ -136,7 +141,7 @@ async def test_email_login_route_accepts_normalized_email_and_reuses_shared_sess
 ) -> None:
     async with postgres_session_factory() as session:
         user_service = UserService(session)
-        full_user = await user_service.create_full_user(
+        full_user = await create_full_user_via_upgrade(user_service,
             email="login@example.com",
             password_hash=hash_password(PASSWORD),
         )
@@ -174,11 +179,11 @@ async def test_email_login_route_rejects_wrong_password_and_inactive_accounts(
 ) -> None:
     async with postgres_session_factory() as session:
         user_service = UserService(session)
-        wrong_password_user = await user_service.create_full_user(
+        wrong_password_user = await create_full_user_via_upgrade(user_service,
             email="wrong-password@example.com",
             password_hash=hash_password(PASSWORD),
         )
-        inactive_user = await user_service.create_full_user(
+        inactive_user = await create_full_user_via_upgrade(user_service,
             email="inactive@example.com",
             password_hash=hash_password(PASSWORD),
         )

@@ -24,6 +24,7 @@ from memexpert.core.config import get_settings
 from memexpert.models.enums import AccountType
 from memexpert.models.user import AccountMergeLog, RefreshToken, User
 from memexpert.services import AccountLinkService, AuthService, ProviderAuthService, UserService
+from tests.conftest import create_full_user_via_upgrade
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -249,7 +250,7 @@ async def test_email_login_link_wrong_password_preserves_guest_bearer_and_refres
 ) -> None:
     async with postgres_session_factory() as session:
         user_service = UserService(session)
-        _ = await user_service.create_full_user(
+        _ = await create_full_user_via_upgrade(user_service,
             email="owner@example.com",
             password_hash=hash_password(PASSWORD),
         )
@@ -304,7 +305,7 @@ async def test_email_login_link_route_concurrent_loser_gets_refresh_guided_confl
 ) -> None:
     async with postgres_session_factory() as session:
         user_service = UserService(session)
-        full_user = await user_service.create_full_user(
+        full_user = await create_full_user_via_upgrade(user_service,
             email="race-owner@example.com",
             password_hash=hash_password(PASSWORD),
         )
@@ -481,7 +482,7 @@ async def test_google_link_merges_guest_into_existing_full_and_exposes_linked_pr
 ) -> None:
     async with postgres_session_factory() as session:
         user_service = UserService(session)
-        full_user = await user_service.create_full_user(email="google-owner@example.com")
+        full_user = await create_full_user_via_upgrade(user_service, email="google-owner@example.com")
 
     guest_response = await auth_client.post("/api/v1/auth/guest")
     guest_payload = guest_response.json()
@@ -677,7 +678,7 @@ async def test_link_routes_reject_full_account_callers_with_guest_only_error(
     async with postgres_session_factory() as session:
         user_service = UserService(session)
         auth_service = build_auth_service(session, auth_settings_overrides)
-        full_user = await user_service.create_full_user(email="already-full@example.com")
+        full_user = await create_full_user_via_upgrade(user_service, email="already-full@example.com")
         full_session = await auth_service.issue_session_for_user(full_user)
 
     response = await auth_client.post(
@@ -707,7 +708,7 @@ async def test_email_login_route_stays_plain_auth_even_when_guest_bearer_is_pres
 ) -> None:
     async with postgres_session_factory() as session:
         user_service = UserService(session)
-        full_user = await user_service.create_full_user(
+        full_user = await create_full_user_via_upgrade(user_service,
             email="plain-login@example.com",
             password_hash=hash_password(PASSWORD),
         )

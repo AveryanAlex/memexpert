@@ -27,6 +27,7 @@ from memexpert.services import (
     InvalidCollectionInviteError,
     UserService,
 )
+from tests.conftest import create_full_user_via_upgrade
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -51,7 +52,7 @@ async def test_full_user_can_create_custom_collection_with_owner_membership(
 ) -> None:
     user_service = UserService(migrated_db_session)
     collection_service = CollectionService(migrated_db_session)
-    owner = await user_service.create_full_user(email="owner@example.com")
+    owner = await create_full_user_via_upgrade(user_service, email="owner@example.com")
 
     created_collection = await collection_service.create_custom_collection(
         owner_user_id=owner.id,
@@ -83,7 +84,7 @@ async def test_active_save_collection_switching_persists_across_transactions(
 ) -> None:
     user_service = UserService(migrated_db_session)
     collection_service = CollectionService(migrated_db_session)
-    owner = await user_service.create_full_user(email="switcher@example.com")
+    owner = await create_full_user_via_upgrade(user_service, email="switcher@example.com")
 
     first_collection = await collection_service.create_custom_collection(
         owner_user_id=owner.id,
@@ -117,9 +118,9 @@ async def test_active_save_collection_rejects_non_member_and_viewer_targets(
     user_service = UserService(migrated_db_session)
     collection_service = CollectionService(migrated_db_session)
 
-    owner = await user_service.create_full_user(email="owner@example.com")
-    viewer = await user_service.create_full_user(email="viewer@example.com")
-    outsider = await user_service.create_full_user(email="outsider@example.com")
+    owner = await create_full_user_via_upgrade(user_service, email="owner@example.com")
+    viewer = await create_full_user_via_upgrade(user_service, email="viewer@example.com")
+    outsider = await create_full_user_via_upgrade(user_service, email="outsider@example.com")
     shared_collection = await collection_service.create_custom_collection(
         owner_user_id=owner.id,
         title="Shared",
@@ -149,7 +150,7 @@ async def test_create_invite_rejects_unverified_email_only_accounts_without_pers
 ) -> None:
     user_service = UserService(migrated_db_session)
     collection_service = CollectionService(migrated_db_session)
-    owner = await user_service.create_full_user(email="owner@example.com")
+    owner = await create_full_user_via_upgrade(user_service, email="owner@example.com")
     shared_collection = await collection_service.create_custom_collection(
         owner_user_id=owner.id,
         title="Shared board",
@@ -171,11 +172,11 @@ async def test_create_invite_preserves_guest_and_write_access_errors_without_per
 ) -> None:
     user_service = UserService(migrated_db_session)
     collection_service = CollectionService(migrated_db_session)
-    owner = await user_service.create_full_user(
+    owner = await create_full_user_via_upgrade(user_service,
         email="owner@example.com",
         email_verified_at=datetime.now(UTC),
     )
-    viewer = await user_service.create_full_user(
+    viewer = await create_full_user_via_upgrade(user_service,
         email="viewer@example.com",
         email_verified_at=datetime.now(UTC),
     )
@@ -213,12 +214,12 @@ async def test_create_invite_allows_telegram_and_google_backed_editors_with_writ
 ) -> None:
     user_service = UserService(migrated_db_session)
     collection_service = CollectionService(migrated_db_session)
-    owner = await user_service.create_full_user(
+    owner = await create_full_user_via_upgrade(user_service,
         email="owner@example.com",
         email_verified_at=datetime.now(UTC),
     )
-    telegram_editor = await user_service.create_full_user(telegram_id=123456789)
-    google_editor = await user_service.create_full_user(
+    telegram_editor = await create_full_user_via_upgrade(user_service, telegram_id=123456789)
+    google_editor = await create_full_user_via_upgrade(user_service,
         google_id="google-subject-123",
         email="google-editor@example.com",
         email_verified_at=datetime.now(UTC),
@@ -261,7 +262,7 @@ async def test_create_invite_persists_valid_payload_and_rejects_malformed_inputs
 ) -> None:
     user_service = UserService(migrated_db_session)
     collection_service = CollectionService(migrated_db_session)
-    owner = await user_service.create_full_user(
+    owner = await create_full_user_via_upgrade(user_service,
         email="owner@example.com",
         email_verified_at=datetime.now(UTC),
     )

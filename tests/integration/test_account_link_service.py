@@ -36,6 +36,7 @@ from memexpert.services import (
     UserService,
 )
 from memexpert.services.provider_auth_service import GoogleIdentity, TelegramIdentity
+from tests.conftest import create_full_user_via_upgrade
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -146,7 +147,7 @@ async def create_password_user(
         email=email,
         password=PASSWORD,
     )
-    return await user_service.create_full_user(
+    return await create_full_user_via_upgrade(user_service,
         email=signup_identity.email,
         password_hash=signup_identity.password_hash,
         language=language,

@@ -28,6 +28,7 @@ from memexpert.services import (
     ProviderNotConfiguredError,
     UserService,
 )
+from tests.conftest import create_full_user_via_upgrade
 
 if TYPE_CHECKING:
     import uuid
@@ -598,7 +599,7 @@ async def test_start_link_service_failure_keeps_code_and_guest_retry_safe(
     settings = build_bot_settings(postgres_async_url)
     user_service = UserService(migrated_db_session)
     guest_user = await user_service.create_guest_user()
-    canonical_user = await user_service.create_full_user(telegram_id=TELEGRAM_ID)
+    canonical_user = await create_full_user_via_upgrade(user_service, telegram_id=TELEGRAM_ID)
     canonical_favorites_id = await get_favorites_collection_id(migrated_db_session, owner_id=canonical_user.id)
     guest_favorites_id = await get_favorites_collection_id(migrated_db_session, owner_id=guest_user.id)
     assert canonical_favorites_id is not None

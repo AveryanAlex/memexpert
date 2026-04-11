@@ -19,6 +19,7 @@ from memexpert.services import (
     ProviderAuthService,
     UserService,
 )
+from tests.conftest import create_full_user_via_upgrade
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -108,7 +109,7 @@ async def test_email_login_normalizes_email_and_uses_bcrypt_comparison(
 ) -> None:
     user_service = UserService(migrated_db_session)
     provider_auth_service = build_provider_auth_service(migrated_db_session)
-    full_user = await user_service.create_full_user(
+    full_user = await create_full_user_via_upgrade(user_service,
         email="login@example.com",
         password_hash=hash_password(PASSWORD),
     )
@@ -134,11 +135,11 @@ async def test_email_login_rejects_wrong_password_and_missing_stored_hash_withou
 ) -> None:
     user_service = UserService(migrated_db_session)
     provider_auth_service = build_provider_auth_service(migrated_db_session)
-    password_user = await user_service.create_full_user(
+    password_user = await create_full_user_via_upgrade(user_service,
         email="password-user@example.com",
         password_hash=hash_password(PASSWORD),
     )
-    missing_hash_user = await user_service.create_full_user(email="missing-hash@example.com")
+    missing_hash_user = await create_full_user_via_upgrade(user_service, email="missing-hash@example.com")
 
     with pytest.raises(InvalidCredentialsError, match="invalid"):
         _ = await provider_auth_service.login_with_email(
@@ -165,7 +166,7 @@ async def test_email_login_rejects_non_active_accounts(
 ) -> None:
     user_service = UserService(migrated_db_session)
     provider_auth_service = build_provider_auth_service(migrated_db_session)
-    unavailable_user = await user_service.create_full_user(
+    unavailable_user = await create_full_user_via_upgrade(user_service,
         email="inactive@example.com",
         password_hash=hash_password(PASSWORD),
     )

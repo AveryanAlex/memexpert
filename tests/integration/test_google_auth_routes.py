@@ -13,6 +13,7 @@ from memexpert.api.dependencies import DbSessionDep, get_provider_auth_service
 from memexpert.core.config import get_settings
 from memexpert.models.user import RefreshToken, User
 from memexpert.services import ProviderAuthService, UserService
+from tests.conftest import create_full_user_via_upgrade
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -80,7 +81,9 @@ async def test_google_route_sets_refresh_cookie_and_reuses_verified_email_accoun
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     async with postgres_session_factory() as session:
-        existing_user = await UserService(session).create_full_user(email="route-existing@example.com")
+        existing_user = await create_full_user_via_upgrade(
+            UserService(session), email="route-existing@example.com",
+        )
 
     flow = MockGoogleFlow(
         steps=deque(
@@ -141,7 +144,8 @@ async def test_google_route_returns_typed_conflict_for_telegram_email_collision(
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     async with postgres_session_factory() as session:
-        _ = await UserService(session).create_full_user(
+        _ = await create_full_user_via_upgrade(
+            UserService(session),
             telegram_id=999888777,
             email="telegram-collision@example.com",
         )

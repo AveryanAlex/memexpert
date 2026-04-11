@@ -21,6 +21,7 @@ from memexpert.services import (
     ProviderPayloadInvalidError,
     UserService,
 )
+from tests.conftest import create_full_user_via_upgrade
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -156,7 +157,7 @@ async def test_google_auth_reuses_verified_non_telegram_email_account_and_stamps
     migrated_db_session: AsyncSession,
 ) -> None:
     user_service = UserService(migrated_db_session)
-    existing_user = await user_service.create_full_user(email="existing@example.com")
+    existing_user = await create_full_user_via_upgrade(user_service, email="existing@example.com")
     flow = MockGoogleFlow(
         steps=deque(
             [
@@ -196,7 +197,7 @@ async def test_google_auth_does_not_reuse_unverified_email_matches_and_creates_g
     migrated_db_session: AsyncSession,
 ) -> None:
     user_service = UserService(migrated_db_session)
-    existing_user = await user_service.create_full_user(email="owner@example.com")
+    existing_user = await create_full_user_via_upgrade(user_service, email="owner@example.com")
     flow = MockGoogleFlow(
         steps=deque(
             [
@@ -238,7 +239,7 @@ async def test_google_auth_rejects_telegram_email_collisions_without_side_effect
     migrated_db_session: AsyncSession,
 ) -> None:
     user_service = UserService(migrated_db_session)
-    telegram_user = await user_service.create_full_user(
+    telegram_user = await create_full_user_via_upgrade(user_service,
         telegram_id=123456789,
         email="telegram@example.com",
     )
@@ -276,7 +277,7 @@ async def test_google_auth_rejects_inactive_verified_email_reuse_without_attachi
     migrated_db_session: AsyncSession,
 ) -> None:
     user_service = UserService(migrated_db_session)
-    existing_user = await user_service.create_full_user(email="inactive@example.com")
+    existing_user = await create_full_user_via_upgrade(user_service, email="inactive@example.com")
 
     existing_user_result = await migrated_db_session.execute(select(User).where(User.id == existing_user.id))
     persisted_user = existing_user_result.scalar_one()

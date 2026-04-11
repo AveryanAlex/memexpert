@@ -24,6 +24,7 @@ from memexpert.services import (
     UserService,
 )
 from memexpert.services.provider_auth_service import TelegramIdentity
+from tests.conftest import create_full_user_via_upgrade
 
 if TYPE_CHECKING:
     from pytest import MonkeyPatch
@@ -79,7 +80,7 @@ async def test_telegram_link_start_route_rejects_full_callers_without_persisting
 ) -> None:
     async with postgres_session_factory() as session:
         user_service = UserService(session)
-        full_user = await user_service.create_full_user(email="already-full@example.com")
+        full_user = await create_full_user_via_upgrade(user_service, email="already-full@example.com")
         auth_service = AuthService.from_settings(session)
         full_session = await auth_service.issue_session_for_user(full_user)
 

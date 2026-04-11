@@ -13,6 +13,7 @@ from memexpert.models.collection import Collection, CollectionMember
 from memexpert.models.enums import AccountType, AuthProvider, CollectionKind, CollectionMembershipRole
 from memexpert.models.user import User
 from memexpert.services import DuplicateIdentityError, InvalidIdentityError, UserService
+from tests.conftest import create_full_user_via_upgrade
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -51,12 +52,13 @@ async def test_create_guest_user_bootstraps_favorites_membership_and_active_save
     assert [member.user_id for member in favorites.memberships] == [persisted_user.id]
 
 
-async def test_create_full_user_normalizes_email_supports_provider_lookups_and_bootstraps_favorites(
+async def test_upgrade_guest_normalizes_email_supports_provider_lookups_and_preserves_favorites(
     migrated_db_session: AsyncSession,
 ) -> None:
     service = UserService(migrated_db_session)
 
-    created_user = await service.create_full_user(
+    created_user = await create_full_user_via_upgrade(
+        service,
         telegram_id=123456789,
         google_id="google-subject-123",
         email="  User@Example.COM ",
@@ -80,25 +82,31 @@ async def test_create_full_user_normalizes_email_supports_provider_lookups_and_b
     assert favorites.kind is CollectionKind.FAVORITES
 
 
-async def test_create_full_user_rejects_duplicate_identities_across_transactions(
+async def test_upgrade_guest_rejects_duplicate_identities_across_transactions(
     migrated_db_session: AsyncSession,
 ) -> None:
     service = UserService(migrated_db_session)
 
-    _ = await service.create_full_user(
+    _ = await create_full_user_via_upgrade(
+        service,
         telegram_id=99,
         google_id="google-dup",
         email="owner@example.com",
     )
 
     with pytest.raises(DuplicateIdentityError, match="google-dup"):
-        _ = await service.create_full_user(google_id="google-dup", email="other@example.com")
+        _ = await create_full_user_via_upgrade(
+            service, google_id="google-dup", email="other@example.com",
+        )
+    await migrated_db_session.rollback()
 
     with pytest.raises(DuplicateIdentityError, match="owner@example.com"):
-        _ = await service.create_full_user(email="OWNER@EXAMPLE.COM")
+        _ = await create_full_user_via_upgrade(service, email="OWNER@EXAMPLE.COM")
+    await migrated_db_session.rollback()
 
     with pytest.raises(DuplicateIdentityError, match="Telegram ID 99"):
-        _ = await service.create_full_user(telegram_id=99)
+        _ = await create_full_user_via_upgrade(service, telegram_id=99)
+    await migrated_db_session.rollback()
 
 
 async def test_repeated_guest_creation_produces_distinct_accounts_with_one_favorites_each(
@@ -155,13 +163,24 @@ async def test_create_guest_user_commit_false_rolls_back_on_session_rollback(
     assert membership_count_result.scalar_one() == 0
 
 
-async def test_create_full_user_rejects_malformed_email_before_commit(
+async def test_upgrade_guest_rejects_malformed_email_and_rolls_back_the_bootstrap(
     migrated_db_session: AsyncSession,
 ) -> None:
+    """Seeding via the upgrade helper with a malformed email must leave zero rows.
+
+    The helper bootstraps the guest with ``commit=False``, so when
+    ``upgrade_guest_to_full_account`` rejects the malformed email the outer
+    ``session.rollback()`` unwinds the bootstrap atomically — the same
+    "rejected before commit" invariant the deleted ``create_full_user``
+    seed primitive enforced.
+    """
+
     service = UserService(migrated_db_session)
 
     with pytest.raises(InvalidIdentityError, match="valid address"):
-        _ = await service.create_full_user(email="not-an-email")
+        _ = await create_full_user_via_upgrade(service, email="not-an-email")
+
+    await migrated_db_session.rollback()
 
     user_count_result = await migrated_db_session.execute(select(func.count()).select_from(User))
     collection_count_result = await migrated_db_session.execute(select(func.count()).select_from(Collection))
