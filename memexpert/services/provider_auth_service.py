@@ -23,6 +23,12 @@ from memexpert.schemas.auth import (
     validate_auth_password,
 )
 from memexpert.schemas.user import UserRead
+from memexpert.services._auth_validation import (
+    normalize_optional_text,
+    require_non_blank,
+    require_positive_float,
+    require_positive_int,
+)
 from memexpert.services.auth_service import AuthService, AuthSession
 from memexpert.services.errors import (
     AccountUnavailableError,
@@ -98,21 +104,21 @@ class ProviderAuthService:
     ) -> None:
         self._session: AsyncSession = session
         self._password_hash_rounds: int = self._require_bcrypt_rounds(password_hash_rounds)
-        self._telegram_bot_token: str | None = self._normalize_optional_text(telegram_bot_token)
-        self._telegram_login_max_age_seconds: int = self._require_positive_int(
+        self._telegram_bot_token: str | None = normalize_optional_text(telegram_bot_token)
+        self._telegram_login_max_age_seconds: int = require_positive_int(
             "telegram_login_max_age_seconds",
             telegram_login_max_age_seconds,
         )
-        self._telegram_miniapp_max_age_seconds: int = self._require_positive_int(
+        self._telegram_miniapp_max_age_seconds: int = require_positive_int(
             "telegram_miniapp_max_age_seconds",
             telegram_miniapp_max_age_seconds,
         )
-        self._google_client_id: str | None = self._normalize_optional_text(google_client_id)
-        self._google_client_secret: str | None = self._normalize_optional_text(google_client_secret)
-        self._google_redirect_uri: str | None = self._normalize_optional_text(google_redirect_uri)
-        self._google_token_url: str = self._require_non_blank("google_token_url", google_token_url)
-        self._google_userinfo_url: str = self._require_non_blank("google_userinfo_url", google_userinfo_url)
-        self._google_timeout_seconds: float = self._require_positive_float(
+        self._google_client_id: str | None = normalize_optional_text(google_client_id)
+        self._google_client_secret: str | None = normalize_optional_text(google_client_secret)
+        self._google_redirect_uri: str | None = normalize_optional_text(google_redirect_uri)
+        self._google_token_url: str = require_non_blank("google_token_url", google_token_url)
+        self._google_userinfo_url: str = require_non_blank("google_userinfo_url", google_userinfo_url)
+        self._google_timeout_seconds: float = require_positive_float(
             "google_timeout_seconds",
             google_timeout_seconds,
         )
@@ -690,33 +696,6 @@ class ProviderAuthService:
         if not 4 <= rounds <= 31:
             raise AuthConfigurationError("password_hash_rounds must be between 4 and 31.")
         return rounds
-
-    @staticmethod
-    def _require_positive_int(field_name: str, value: int) -> int:
-        if value <= 0:
-            raise AuthConfigurationError(f"{field_name} must be greater than zero.")
-        return value
-
-    @staticmethod
-    def _require_positive_float(field_name: str, value: float) -> float:
-        if value <= 0:
-            raise AuthConfigurationError(f"{field_name} must be greater than zero.")
-        return value
-
-    @staticmethod
-    def _require_non_blank(field_name: str, value: str) -> str:
-        normalized_value = value.strip()
-        if not normalized_value:
-            raise AuthConfigurationError(f"{field_name} must not be blank.")
-        return normalized_value
-
-    @staticmethod
-    def _normalize_optional_text(value: str | None) -> str | None:
-        if value is None:
-            return None
-
-        normalized_value = value.strip()
-        return normalized_value or None
 
 
 __all__ = [

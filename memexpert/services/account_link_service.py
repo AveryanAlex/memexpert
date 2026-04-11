@@ -23,6 +23,10 @@ from memexpert.models.enums import AccountStatus, AccountType, AnalyticsEventTyp
 from memexpert.models.user import AccountMergeLog, AnalyticsEvent, InlineUsageEvent, TelegramLinkCode, User
 from memexpert.schemas.auth import TelegramWidgetAuthRequest
 from memexpert.schemas.user import UserRead
+from memexpert.services._auth_validation import (
+    normalize_optional_text,
+    require_positive_int,
+)
 from memexpert.services._integrity import integrity_constraint_name
 from memexpert.services.errors import (
     AccountLinkAlreadyCompletedError,
@@ -134,12 +138,12 @@ class AccountLinkService:
             session,
             user_service=self._user_service,
         )
-        self._telegram_link_bot_username: str | None = self._normalize_optional_text(telegram_link_bot_username)
-        self._telegram_link_code_ttl_seconds: int = self._require_positive_int(
+        self._telegram_link_bot_username: str | None = normalize_optional_text(telegram_link_bot_username)
+        self._telegram_link_code_ttl_seconds: int = require_positive_int(
             "telegram_link_code_ttl_seconds",
             telegram_link_code_ttl_seconds,
         )
-        self._telegram_link_return_url: str | None = self._normalize_optional_text(telegram_link_return_url)
+        self._telegram_link_return_url: str | None = normalize_optional_text(telegram_link_return_url)
 
     @classmethod
     def from_settings(
@@ -882,19 +886,6 @@ class AccountLinkService:
         ):
             raise AccountLinkInvariantError("Telegram link code is invalid.")
         return normalized_code
-
-    @staticmethod
-    def _normalize_optional_text(value: str | None) -> str | None:
-        if value is None:
-            return None
-        normalized_value = value.strip()
-        return normalized_value or None
-
-    @staticmethod
-    def _require_positive_int(field_name: str, value: int) -> int:
-        if value <= 0:
-            raise AuthConfigurationError(f"{field_name} must be greater than zero.")
-        return value
 
     @staticmethod
     def _rowcount(result: object) -> int:

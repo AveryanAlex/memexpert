@@ -22,6 +22,11 @@ from memexpert.models.enums import AccountStatus, AccountType
 from memexpert.models.user import RefreshToken, User
 from memexpert.schemas.auth import AuthSessionRead, GuestBootstrapRequest, RefreshCookieMetadata
 from memexpert.schemas.user import UserRead
+from memexpert.services._auth_validation import (
+    normalize_optional_text,
+    require_non_blank,
+    require_positive_int,
+)
 from memexpert.services.errors import (
     AccountUnavailableError,
     AuthConfigurationError,
@@ -97,13 +102,13 @@ class AuthService:
         self._access_token_ttl: timedelta = self._require_positive_ttl("access_token_ttl", access_token_ttl)
         self._refresh_token_ttl: timedelta = self._require_positive_ttl("refresh_token_ttl", refresh_token_ttl)
         self._access_token_algorithm: str = self._require_algorithm(access_token_algorithm)
-        self._refresh_cookie_name: str = self._require_non_blank("refresh_cookie_name", refresh_cookie_name)
+        self._refresh_cookie_name: str = require_non_blank("refresh_cookie_name", refresh_cookie_name)
         self._refresh_cookie_secure: bool = refresh_cookie_secure
         self._refresh_cookie_httponly: bool = refresh_cookie_httponly
         self._refresh_cookie_samesite: SameSiteMode = self._normalize_same_site(refresh_cookie_samesite)
-        self._refresh_cookie_path: str = self._require_non_blank("refresh_cookie_path", refresh_cookie_path)
-        self._refresh_cookie_domain: str | None = self._normalize_optional_text(refresh_cookie_domain)
-        self._refresh_token_bytes: int = self._require_positive_int("refresh_token_bytes", refresh_token_bytes)
+        self._refresh_cookie_path: str = require_non_blank("refresh_cookie_path", refresh_cookie_path)
+        self._refresh_cookie_domain: str | None = normalize_optional_text(refresh_cookie_domain)
+        self._refresh_token_bytes: int = require_positive_int("refresh_token_bytes", refresh_token_bytes)
 
     @classmethod
     def from_settings(
@@ -164,7 +169,7 @@ class AuthService:
             RefreshToken(
                 user_id=current_user.id,
                 token_hash=self.hash_refresh_token(refresh_token),
-                device_info=self._normalize_optional_text(device_info),
+                device_info=normalize_optional_text(device_info),
                 expires_at=refresh_expires_at,
             )
         )
@@ -229,7 +234,7 @@ class AuthService:
             RefreshToken(
                 user_id=current_user.id,
                 token_hash=self.hash_refresh_token(replacement_refresh_token),
-                device_info=self._normalize_optional_text(device_info) or refresh_token_row.device_info,
+                device_info=normalize_optional_text(device_info) or refresh_token_row.device_info,
                 expires_at=replacement_expires_at,
             )
         )
@@ -372,19 +377,6 @@ class AuthService:
             raise AuthConfigurationError("jwt_secret must be at least 32 bytes long.")
         return normalized_value
 
-    @staticmethod
-    def _require_non_blank(field_name: str, value: str) -> str:
-        normalized_value = value.strip()
-        if not normalized_value:
-            raise AuthConfigurationError(f"{field_name} must not be blank.")
-        return normalized_value
-
-    @staticmethod
-    def _require_positive_int(field_name: str, value: int) -> int:
-        if value <= 0:
-            raise AuthConfigurationError(f"{field_name} must be greater than zero.")
-        return value
-
     @classmethod
     def _require_positive_ttl(cls, field_name: str, value: timedelta) -> timedelta:
         if value.total_seconds() <= 0:
@@ -399,14 +391,6 @@ class AuthService:
                 f"access_token_algorithm must be {HS256_ALGORITHM} for this auth flow.",
             )
         return normalized_value
-
-    @staticmethod
-    def _normalize_optional_text(value: str | None) -> str | None:
-        if value is None:
-            return None
-
-        normalized_value = value.strip()
-        return normalized_value or None
 
     @staticmethod
     def _normalize_same_site(value: str) -> SameSiteMode:
