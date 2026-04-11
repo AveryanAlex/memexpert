@@ -3409,8 +3409,8 @@ async def test_run_summary_reflects_k_of_n_forced_qdrant_failures(
     seed so the heavy chain does not dedup them.
     """
 
-    from memexpert.services.content_pipeline import (
-        _PIPELINE_REASON_SYNC_QDRANT_MALFORMED_PAYLOAD,
+    from memexpert.services.content_pipeline_constants import (
+        PIPELINE_REASON_SYNC_QDRANT_MALFORMED_PAYLOAD,
     )
 
     storage_client = FakeStorageClient()
@@ -3457,7 +3457,7 @@ async def test_run_summary_reflects_k_of_n_forced_qdrant_failures(
                 meme_file_id=meme_file_id,
                 attempt=1,
                 event_id=uuid.uuid7(),
-                normalized_reason=_PIPELINE_REASON_SYNC_QDRANT_MALFORMED_PAYLOAD,
+                normalized_reason=PIPELINE_REASON_SYNC_QDRANT_MALFORMED_PAYLOAD,
                 last_error_text="forced malformed qdrant payload",
             )
         else:
