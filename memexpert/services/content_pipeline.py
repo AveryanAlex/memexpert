@@ -59,49 +59,11 @@ from memexpert.schemas.content_pipeline import (
     RawCrawlerPost,
     SmokeProofResult,
 )
+from memexpert.services import content_pipeline_constants as _consts
 from memexpert.services.content_merge import ContentMergeService, MergeOutcome
-from memexpert.services.content_pipeline_constants import (
-    CLASSIFY_FAN_OUT_STAGES as _CLASSIFY_FAN_OUT_STAGES,
-)
-from memexpert.services.content_pipeline_constants import (
-    CRAWLER_MEDIA_DEFAULT_CONTENT_TYPES as _CRAWLER_MEDIA_DEFAULT_CONTENT_TYPES,
-)
-from memexpert.services.content_pipeline_constants import (
-    CRAWLER_MEDIA_DEFAULT_FILENAMES as _CRAWLER_MEDIA_DEFAULT_FILENAMES,
-)
-from memexpert.services.content_pipeline_constants import (
-    DEFAULT_PIPELINE_ITEMS_LIMIT as _DEFAULT_PIPELINE_ITEMS_LIMIT,
-)
-from memexpert.services.content_pipeline_constants import (
-    DEFAULT_STUCK_AFTER_SECONDS as _DEFAULT_STUCK_AFTER_SECONDS,
-)
-from memexpert.services.content_pipeline_constants import (
-    DOWNSTREAM_STAGE_EVENT_TYPES as _DOWNSTREAM_STAGE_EVENT_TYPES,
-)
-from memexpert.services.content_pipeline_constants import (
-    MAX_PERCEPTUAL_HASH_LENGTH as _MAX_PERCEPTUAL_HASH_LENGTH,
-)
-from memexpert.services.content_pipeline_constants import (
-    MAX_PIPELINE_ITEMS_LIMIT as _MAX_PIPELINE_ITEMS_LIMIT,
-)
-from memexpert.services.content_pipeline_constants import (
-    NEXT_STAGE_BY_STAGE as _NEXT_STAGE_BY_STAGE,
-)
-from memexpert.services.content_pipeline_constants import (
-    PIPELINE_REASON_PUBLISH_FAILED as _PIPELINE_REASON_PUBLISH_FAILED,
-)
-from memexpert.services.content_pipeline_constants import (
-    PIPELINE_REASON_SYNC_MEILI_MALFORMED_PAYLOAD as _PIPELINE_REASON_SYNC_MEILI_MALFORMED_PAYLOAD,
-)
-from memexpert.services.content_pipeline_constants import (
-    PIPELINE_REASON_SYNC_QDRANT_MALFORMED_PAYLOAD as _PIPELINE_REASON_SYNC_QDRANT_MALFORMED_PAYLOAD,
-)
 from memexpert.services.content_pipeline_constants import (
     PIPELINE_REASON_SYNC_REPLAY_REQUESTED,
     SYNC_REPLAY_BATCH_MAX,
-)
-from memexpert.services.content_pipeline_constants import (
-    SYNC_STAGE_BY_TARGET as _SYNC_STAGE_BY_TARGET,
 )
 from memexpert.services.content_pipeline_crawler_queries import (
     advance_source_channel_checkpoint,
@@ -322,7 +284,7 @@ class ContentPipelineService:
 
         received_at = utcnow()
 
-        if raw_post.media_type not in _CRAWLER_MEDIA_DEFAULT_FILENAMES:
+        if raw_post.media_type not in _consts.CRAWLER_MEDIA_DEFAULT_FILENAMES:
             # Unsupported media: the caller must not touch S3 or the DB, so
             # we return the terminal outcome immediately. The channel
             # checkpoint stays untouched here because the crawler decides
@@ -380,8 +342,8 @@ class ContentPipelineService:
         meme_file_id = uuid.uuid7()
         prepared_upload = await self._prepare_upload(
             meme_file_id=meme_file_id,
-            filename=raw_post.filename or _CRAWLER_MEDIA_DEFAULT_FILENAMES[raw_post.media_type],
-            content_type=raw_post.content_type or _CRAWLER_MEDIA_DEFAULT_CONTENT_TYPES[raw_post.media_type],
+            filename=raw_post.filename or _consts.CRAWLER_MEDIA_DEFAULT_FILENAMES[raw_post.media_type],
+            content_type=raw_post.content_type or _consts.CRAWLER_MEDIA_DEFAULT_CONTENT_TYPES[raw_post.media_type],
             media_bytes=raw_post.media_bytes,
         )
 
@@ -509,12 +471,12 @@ class ContentPipelineService:
         self,
         *,
         filter_by: ContentPipelineItemFilter = ContentPipelineItemFilter.FAILED,
-        limit: int = _DEFAULT_PIPELINE_ITEMS_LIMIT,
-        stuck_after_seconds: int = _DEFAULT_STUCK_AFTER_SECONDS,
+        limit: int = _consts.DEFAULT_PIPELINE_ITEMS_LIMIT,
+        stuck_after_seconds: int = _consts.DEFAULT_STUCK_AFTER_SECONDS,
     ) -> tuple[ContentPipelineItemRead, ...]:
         """Return operator-visible pipeline items filtered by the current durable state."""
 
-        resolved_limit = max(1, min(limit, _MAX_PIPELINE_ITEMS_LIMIT))
+        resolved_limit = max(1, min(limit, _consts.MAX_PIPELINE_ITEMS_LIMIT))
         resolved_stuck_after_seconds = max(stuck_after_seconds, 1)
         stale_before = utcnow() - timedelta(seconds=resolved_stuck_after_seconds)
 
@@ -947,7 +909,7 @@ class ContentPipelineService:
                 stage=stage,
                 attempt=attempt,
                 event_id=event_id,
-                normalized_reason=_PIPELINE_REASON_PUBLISH_FAILED,
+                normalized_reason=_consts.PIPELINE_REASON_PUBLISH_FAILED,
                 last_error_text=str(error),
                 retryable=True,
             )
@@ -973,7 +935,7 @@ class ContentPipelineService:
         the exception-to-reason mapping and the service honors it verbatim.
         """
 
-        is_retryable = normalized_reason != _PIPELINE_REASON_SYNC_QDRANT_MALFORMED_PAYLOAD
+        is_retryable = normalized_reason != _consts.PIPELINE_REASON_SYNC_QDRANT_MALFORMED_PAYLOAD
         await self._upsert_sync_target_snapshot(
             meme_file_id=meme_file_id,
             target=SyncTargetKind.QDRANT,
@@ -1083,7 +1045,7 @@ class ContentPipelineService:
         the service honors it verbatim.
         """
 
-        is_retryable = normalized_reason != _PIPELINE_REASON_SYNC_MEILI_MALFORMED_PAYLOAD
+        is_retryable = normalized_reason != _consts.PIPELINE_REASON_SYNC_MEILI_MALFORMED_PAYLOAD
         await self._upsert_sync_target_snapshot(
             meme_file_id=meme_file_id,
             target=SyncTargetKind.MEILISEARCH,
@@ -1157,7 +1119,7 @@ class ContentPipelineService:
     ) -> ContentPipelineReplayAccepted:
         """Reserve and republish one per-target sync stage row without touching the other target."""
 
-        stage = _SYNC_STAGE_BY_TARGET[target]
+        stage = _consts.SYNC_STAGE_BY_TARGET[target]
         meme_file = await self._get_meme_file(meme_file_id)
         if not meme_file.s3_original_key:
             raise PipelineReplayNotAllowedError(
@@ -1597,7 +1559,7 @@ class ContentPipelineService:
         upload_limit = self._upload_limit_for_media_type(inspected_media.media_type)
         if file_size_bytes > upload_limit:
             raise PipelinePayloadTooLargeError(f"Uploaded file exceeds the {upload_limit}-byte limit.")
-        if len(inspected_media.perceptual_hash) > _MAX_PERCEPTUAL_HASH_LENGTH:
+        if len(inspected_media.perceptual_hash) > _consts.MAX_PERCEPTUAL_HASH_LENGTH:
             raise PipelineIngestError(
                 "Configured perceptual-hash size exceeds the persisted meme_files.perceptual_hash contract.",
             )
@@ -2070,7 +2032,7 @@ class ContentPipelineService:
                 stage=dispatch_event.stage,
                 attempt=dispatch_event.attempt,
                 event_id=dispatch_event.event_id,
-                normalized_reason=_PIPELINE_REASON_PUBLISH_FAILED,
+                normalized_reason=_consts.PIPELINE_REASON_PUBLISH_FAILED,
                 last_error_text=str(error),
                 retryable=True,
             )
@@ -2205,7 +2167,7 @@ class ContentPipelineService:
                 created_at=created_at,
             )
 
-        next_stage = _NEXT_STAGE_BY_STAGE.get(stage)
+        next_stage = _consts.NEXT_STAGE_BY_STAGE.get(stage)
         if next_stage is None:
             return ()
 
@@ -2241,7 +2203,7 @@ class ContentPipelineService:
         """
 
         dispatches: list[DownstreamStageDispatch] = []
-        for next_stage in _CLASSIFY_FAN_OUT_STAGES:
+        for next_stage in _consts.CLASSIFY_FAN_OUT_STAGES:
             existing_stage_entry = next(
                 (entry for entry in meme_file.pipeline_stage_journal_entries if entry.stage is next_stage),
                 None,
@@ -2280,7 +2242,7 @@ class ContentPipelineService:
 
         dispatch_event = ContentPipelineDispatchEvent(
             event_id=uuid.uuid7(),
-            event_type=_DOWNSTREAM_STAGE_EVENT_TYPES[predecessor_stage],
+            event_type=_consts.DOWNSTREAM_STAGE_EVENT_TYPES[predecessor_stage],
             meme_id=meme_file.meme_id,
             meme_file_id=meme_file.id,
             stage=next_stage,
@@ -2313,7 +2275,7 @@ class ContentPipelineService:
                 stage=dispatch.stage_entry.stage,
                 attempt=dispatch.event.attempt,
                 event_id=dispatch.event.event_id,
-                normalized_reason=_PIPELINE_REASON_PUBLISH_FAILED,
+                normalized_reason=_consts.PIPELINE_REASON_PUBLISH_FAILED,
                 last_error_text=str(error),
                 retryable=True,
             )
