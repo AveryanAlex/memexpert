@@ -97,6 +97,24 @@ class TelegramLinkStartResult:
     return_url: str
 
 
+@dataclass(slots=True)
+class _LinkAttemptState:
+    """Per-flow context used to run the shared link-failure post-mortem check.
+
+    Each ``link_guest_with_*`` entrypoint snapshots the guest at call time and
+    sets ``resolved`` after the provider identity has been validated. On
+    failure the caller hands this state to
+    :meth:`AccountLinkService._handle_link_failure`, which rolls back the
+    session and — only when ``resolved`` is ``True`` — asserts that no
+    concurrent request already finished the link.
+    """
+
+    guest_user_id: uuid.UUID
+    operation_started_at: datetime
+    initial_guest_snapshot: UserRead | None
+    resolved: bool = False
+
+
 class AccountLinkService:
     """Upgrade guests in place or merge them into an existing canonical full account."""
 
@@ -240,47 +258,25 @@ class AccountLinkService:
     ) -> AccountLinkResult:
         """Upgrade a guest account in place with a new email/password identity."""
 
-        operation_started_at = utcnow()
-        initial_guest_snapshot = await self._user_service.get_by_id(guest_user_id)
-        signup_identity: EmailSignupIdentity | None = None
+        state = await self._start_link_attempt(guest_user_id)
         try:
             signup_identity = self._provider_auth_service.prepare_email_signup_identity(
                 email=email,
                 password=password,
             )
+            state.resolved = True
             return await self._upgrade_guest_in_place(
                 guest_user_id=guest_user_id,
                 signup_identity=signup_identity,
             )
         except DuplicateIdentityError as exc:
-            await self._session.rollback()
-            if signup_identity is not None:
-                await self._raise_if_account_link_already_completed(
-                    guest_user_id=guest_user_id,
-                    operation_started_at=operation_started_at,
-                    initial_guest_snapshot=initial_guest_snapshot,
-                    cause=exc,
-                )
+            await self._handle_link_failure(state, exc)
             raise EmailAlreadyInUseError("Email is already in use.") from exc
         except ServiceError as exc:
-            await self._session.rollback()
-            if signup_identity is not None:
-                await self._raise_if_account_link_already_completed(
-                    guest_user_id=guest_user_id,
-                    operation_started_at=operation_started_at,
-                    initial_guest_snapshot=initial_guest_snapshot,
-                    cause=exc,
-                )
+            await self._handle_link_failure(state, exc)
             raise
         except IntegrityError as exc:
-            await self._session.rollback()
-            if signup_identity is not None:
-                await self._raise_if_account_link_already_completed(
-                    guest_user_id=guest_user_id,
-                    operation_started_at=operation_started_at,
-                    initial_guest_snapshot=initial_guest_snapshot,
-                    cause=exc,
-                )
+            await self._handle_link_failure(state, exc)
             raise AccountLinkInvariantError("Failed to link the guest account with email signup.") from exc
 
     async def link_guest_with_email_login(
@@ -292,37 +288,22 @@ class AccountLinkService:
     ) -> AccountLinkResult:
         """Merge a guest account into an existing full email/password account."""
 
-        operation_started_at = utcnow()
-        initial_guest_snapshot = await self._user_service.get_by_id(guest_user_id)
-        target_user: UserRead | None = None
+        state = await self._start_link_attempt(guest_user_id)
         try:
             target_user = await self._provider_auth_service.resolve_email_login_user(
                 email=email,
                 password=password,
             )
+            state.resolved = True
             return await self._merge_guest_into_existing_full(
                 guest_user_id=guest_user_id,
                 target_user_id=target_user.id,
             )
         except ServiceError as exc:
-            await self._session.rollback()
-            if target_user is not None:
-                await self._raise_if_account_link_already_completed(
-                    guest_user_id=guest_user_id,
-                    operation_started_at=operation_started_at,
-                    initial_guest_snapshot=initial_guest_snapshot,
-                    cause=exc,
-                )
+            await self._handle_link_failure(state, exc)
             raise
         except IntegrityError as exc:
-            await self._session.rollback()
-            if target_user is not None:
-                await self._raise_if_account_link_already_completed(
-                    guest_user_id=guest_user_id,
-                    operation_started_at=operation_started_at,
-                    initial_guest_snapshot=initial_guest_snapshot,
-                    cause=exc,
-                )
+            await self._handle_link_failure(state, exc)
             raise AccountLinkInvariantError("Failed to merge the guest account into the email account.") from exc
 
     async def link_guest_with_google_code(
@@ -347,24 +328,21 @@ class AccountLinkService:
     ) -> AccountLinkResult:
         """Upgrade a guest with Google or merge it into the canonical Google/full account."""
 
-        operation_started_at = utcnow()
-        initial_guest_snapshot = await self._user_service.get_by_id(guest_user_id)
-        resolution: GoogleIdentityResolution | None = None
+        state = await self._start_link_attempt(guest_user_id)
         try:
             resolution = await self._provider_auth_service.resolve_google_identity(identity)
+            state.resolved = True
             return await self._link_guest_with_google_resolution(
                 guest_user_id=guest_user_id,
                 resolution=resolution,
             )
         except DuplicateIdentityError as exc:
-            await self._session.rollback()
-            if resolution is not None:
-                await self._raise_if_account_link_already_completed(
-                    guest_user_id=guest_user_id,
-                    operation_started_at=operation_started_at,
-                    initial_guest_snapshot=initial_guest_snapshot,
-                    cause=exc,
-                )
+            await self._handle_link_failure(state, exc)
+            # Re-resolve so the merge target reflects any user that was
+            # created concurrently between the first resolve and the failed
+            # upgrade attempt; the post-mortem above would have fired if the
+            # whole link already completed elsewhere, so anything else here
+            # is a live Google identity we can safely merge into.
             resolution = await self._provider_auth_service.resolve_google_identity(identity)
             if resolution.user is None:
                 raise ProviderPayloadInvalidError("Google identity could not be resolved safely.") from exc
@@ -375,24 +353,10 @@ class AccountLinkService:
                 google_identity=identity,
             )
         except ServiceError as exc:
-            await self._session.rollback()
-            if resolution is not None:
-                await self._raise_if_account_link_already_completed(
-                    guest_user_id=guest_user_id,
-                    operation_started_at=operation_started_at,
-                    initial_guest_snapshot=initial_guest_snapshot,
-                    cause=exc,
-                )
+            await self._handle_link_failure(state, exc)
             raise
         except IntegrityError as exc:
-            await self._session.rollback()
-            if resolution is not None:
-                await self._raise_if_account_link_already_completed(
-                    guest_user_id=guest_user_id,
-                    operation_started_at=operation_started_at,
-                    initial_guest_snapshot=initial_guest_snapshot,
-                    cause=exc,
-                )
+            await self._handle_link_failure(state, exc)
             raise AccountLinkInvariantError("Failed to link the guest account with Google.") from exc
 
     async def link_guest_with_telegram_widget(
@@ -431,13 +395,10 @@ class AccountLinkService:
     ) -> AccountLinkResult:
         """Upgrade a guest with Telegram or merge it into the canonical Telegram account."""
 
-        operation_started_at = utcnow()
-        initial_guest_snapshot = await self._user_service.get_by_id(guest_user_id)
-        resolved_identity = False
-        target_user: UserRead | None = None
+        state = await self._start_link_attempt(guest_user_id)
         try:
             target_user = await self._provider_auth_service.resolve_telegram_identity_user(identity)
-            resolved_identity = True
+            state.resolved = True
             if target_user is None:
                 return await self._upgrade_guest_in_place(
                     guest_user_id=guest_user_id,
@@ -448,14 +409,10 @@ class AccountLinkService:
                 target_user_id=target_user.id,
             )
         except DuplicateIdentityError as exc:
-            await self._session.rollback()
-            if resolved_identity:
-                await self._raise_if_account_link_already_completed(
-                    guest_user_id=guest_user_id,
-                    operation_started_at=operation_started_at,
-                    initial_guest_snapshot=initial_guest_snapshot,
-                    cause=exc,
-                )
+            await self._handle_link_failure(state, exc)
+            # Re-resolve so we see any account that was created between the
+            # first resolve and the failed upgrade; the post-mortem above
+            # already handled the "link finished elsewhere" case.
             target_user = await self._provider_auth_service.resolve_telegram_identity_user(identity)
             if target_user is None:
                 raise ProviderPayloadInvalidError("Telegram identity could not be resolved safely.") from exc
@@ -464,25 +421,41 @@ class AccountLinkService:
                 target_user_id=target_user.id,
             )
         except ServiceError as exc:
-            await self._session.rollback()
-            if resolved_identity:
-                await self._raise_if_account_link_already_completed(
-                    guest_user_id=guest_user_id,
-                    operation_started_at=operation_started_at,
-                    initial_guest_snapshot=initial_guest_snapshot,
-                    cause=exc,
-                )
+            await self._handle_link_failure(state, exc)
             raise
         except IntegrityError as exc:
-            await self._session.rollback()
-            if resolved_identity:
-                await self._raise_if_account_link_already_completed(
-                    guest_user_id=guest_user_id,
-                    operation_started_at=operation_started_at,
-                    initial_guest_snapshot=initial_guest_snapshot,
-                    cause=exc,
-                )
+            await self._handle_link_failure(state, exc)
             raise AccountLinkInvariantError("Failed to link the guest account with Telegram.") from exc
+
+    async def _start_link_attempt(self, guest_user_id: uuid.UUID) -> _LinkAttemptState:
+        """Snapshot the guest state so link-failure post-mortem queries can see the pre-image."""
+
+        return _LinkAttemptState(
+            guest_user_id=guest_user_id,
+            operation_started_at=utcnow(),
+            initial_guest_snapshot=await self._user_service.get_by_id(guest_user_id),
+        )
+
+    async def _handle_link_failure(self, state: _LinkAttemptState, exc: Exception) -> None:
+        """Roll back the session and, when the identity was resolved, assert no concurrent completion.
+
+        Callers invoke this from every ``except`` arm of a
+        ``link_guest_with_*`` flow before translating the original error
+        into its caller-facing type. When
+        :meth:`_raise_if_account_link_already_completed` detects that the
+        link already finished on a separate request, it raises
+        :class:`AccountLinkAlreadyCompletedError` here and the caller never
+        gets to run its translation block.
+        """
+
+        await self._session.rollback()
+        if state.resolved:
+            await self._raise_if_account_link_already_completed(
+                guest_user_id=state.guest_user_id,
+                operation_started_at=state.operation_started_at,
+                initial_guest_snapshot=state.initial_guest_snapshot,
+                cause=exc,
+            )
 
     async def _raise_if_account_link_already_completed(
         self,
