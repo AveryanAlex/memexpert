@@ -64,6 +64,58 @@ from memexpert.schemas.content_pipeline import (
     SmokeProofResult,
 )
 from memexpert.services.content_merge import ContentMergeService, MergeOutcome
+from memexpert.services.content_pipeline_constants import (
+    ACTIVE_STAGE_STATUSES as _ACTIVE_STAGE_STATUSES,
+)
+from memexpert.services.content_pipeline_constants import (
+    CLASSIFY_FAN_OUT_STAGES as _CLASSIFY_FAN_OUT_STAGES,
+)
+from memexpert.services.content_pipeline_constants import (
+    CRAWLER_MEDIA_DEFAULT_CONTENT_TYPES as _CRAWLER_MEDIA_DEFAULT_CONTENT_TYPES,
+)
+from memexpert.services.content_pipeline_constants import (
+    CRAWLER_MEDIA_DEFAULT_FILENAMES as _CRAWLER_MEDIA_DEFAULT_FILENAMES,
+)
+from memexpert.services.content_pipeline_constants import (
+    DEFAULT_PIPELINE_ITEMS_LIMIT as _DEFAULT_PIPELINE_ITEMS_LIMIT,
+)
+from memexpert.services.content_pipeline_constants import (
+    DEFAULT_STUCK_AFTER_SECONDS as _DEFAULT_STUCK_AFTER_SECONDS,
+)
+from memexpert.services.content_pipeline_constants import (
+    DOWNSTREAM_STAGE_EVENT_TYPES as _DOWNSTREAM_STAGE_EVENT_TYPES,
+)
+from memexpert.services.content_pipeline_constants import (
+    MAX_PERCEPTUAL_HASH_LENGTH as _MAX_PERCEPTUAL_HASH_LENGTH,
+)
+from memexpert.services.content_pipeline_constants import (
+    MAX_PIPELINE_ITEMS_LIMIT as _MAX_PIPELINE_ITEMS_LIMIT,
+)
+from memexpert.services.content_pipeline_constants import (
+    NEXT_STAGE_BY_STAGE as _NEXT_STAGE_BY_STAGE,
+)
+from memexpert.services.content_pipeline_constants import (
+    PIPELINE_REASON_PUBLISH_FAILED as _PIPELINE_REASON_PUBLISH_FAILED,
+)
+from memexpert.services.content_pipeline_constants import (
+    PIPELINE_REASON_REPLAY_REQUESTED as _PIPELINE_REASON_REPLAY_REQUESTED,
+)
+from memexpert.services.content_pipeline_constants import (
+    PIPELINE_REASON_SYNC_MEILI_MALFORMED_PAYLOAD as _PIPELINE_REASON_SYNC_MEILI_MALFORMED_PAYLOAD,
+)
+from memexpert.services.content_pipeline_constants import (
+    PIPELINE_REASON_SYNC_QDRANT_MALFORMED_PAYLOAD as _PIPELINE_REASON_SYNC_QDRANT_MALFORMED_PAYLOAD,
+)
+from memexpert.services.content_pipeline_constants import (
+    PIPELINE_REASON_SYNC_REPLAY_REQUESTED,
+    SYNC_REPLAY_BATCH_MAX,
+)
+from memexpert.services.content_pipeline_constants import (
+    STAGE_ORDER as _STAGE_ORDER,
+)
+from memexpert.services.content_pipeline_constants import (
+    SYNC_STAGE_BY_TARGET as _SYNC_STAGE_BY_TARGET,
+)
 from memexpert.services.content_pipeline_reporting import (
     build_item_detail,
     decode_sync_preview,
@@ -95,70 +147,6 @@ if TYPE_CHECKING:
         QdrantSyncClientProtocol,
     )
     from memexpert.core.voyage import VoyageEmbeddingResult
-
-
-_STAGE_ORDER: dict[ContentPipelineStage, int] = {
-    ContentPipelineStage.INGEST: 0,
-    ContentPipelineStage.TRANSCODE: 1,
-    ContentPipelineStage.OCR: 2,
-    ContentPipelineStage.EMBED: 3,
-    ContentPipelineStage.CLASSIFY: 4,
-    ContentPipelineStage.SYNC_QDRANT: 5,
-    ContentPipelineStage.SYNC_MEILI: 6,
-}
-_ACTIVE_STAGE_STATUSES = {
-    ContentPipelineStageStatus.PENDING,
-    ContentPipelineStageStatus.PROCESSING,
-    ContentPipelineStageStatus.FAILED,
-    ContentPipelineStageStatus.DUPLICATE,
-}
-_MAX_PERCEPTUAL_HASH_LENGTH = 64
-_DEFAULT_PIPELINE_ITEMS_LIMIT = 50
-_MAX_PIPELINE_ITEMS_LIMIT = 200
-_DEFAULT_STUCK_AFTER_SECONDS = 60
-_PIPELINE_REASON_PUBLISH_FAILED = "publish_failed"
-_PIPELINE_REASON_REPLAY_REQUESTED = "replay_requested"
-
-# Maximum number of items accepted by the per-target batch replay endpoint.
-# Kept small so operators cannot accidentally requeue an entire corpus in one
-# call; the S03 runbook documents the repeated-call pattern for larger batches.
-SYNC_REPLAY_BATCH_MAX = 10
-
-# Normalized reason used when a per-target sync replay is intentionally queued
-# by an operator. Distinct from ``_PIPELINE_REASON_REPLAY_REQUESTED`` because
-# the sync truth table is independent from the stage journal and the reason
-# strings must not collide when operators filter either surface.
-PIPELINE_REASON_SYNC_REPLAY_REQUESTED = "sync_replay_requested"
-
-# Mirror of ``pipeline_runtime.PIPELINE_REASON_SYNC_QDRANT_MALFORMED_PAYLOAD``.
-# The service layer must never import from ``memexpert.workers`` because the
-# worker runtime already depends on the service; duplicating the constant here
-# with an explicit doc-comment is the narrowest way to share the one
-# terminal-failure reason the Qdrant sync surface knows about.
-_PIPELINE_REASON_SYNC_QDRANT_MALFORMED_PAYLOAD = "sync_qdrant_malformed_payload"
-# Mirror of ``pipeline_runtime.PIPELINE_REASON_SYNC_MEILI_MALFORMED_PAYLOAD`` —
-# same rationale as the Qdrant mirror above. The service layer honors the
-# runtime's malformed-response classification verbatim so retryability stays
-# consistent between the Qdrant and Meilisearch sync paths.
-_PIPELINE_REASON_SYNC_MEILI_MALFORMED_PAYLOAD = "sync_meili_malformed_payload"
-
-# Default filename + content-type hints used when a ``RawCrawlerPost`` omits
-# them. The media processor still validates the actual bytes and rejects
-# anything unsupported, but it needs a non-None filename/content_type
-# because both ``inspect_upload`` parameters are required. Keeping the
-# mapping narrow (only the three crawler media types) is deliberate: if
-# the crawler ever sends a media type outside this set, the service
-# short-circuits with ``SKIPPED_UNSUPPORTED_MEDIA`` before we get here.
-_CRAWLER_MEDIA_DEFAULT_FILENAMES: dict[str, str] = {
-    "photo": "telegram-photo.jpg",
-    "gif": "telegram-animation.mp4",
-    "video": "telegram-video.mp4",
-}
-_CRAWLER_MEDIA_DEFAULT_CONTENT_TYPES: dict[str, str] = {
-    "photo": "image/jpeg",
-    "gif": "video/mp4",
-    "video": "video/mp4",
-}
 
 
 class ObjectStorageClient(Protocol):
@@ -227,41 +215,6 @@ class DownstreamStageDispatch:
 
     event: ContentPipelineDispatchEvent
     stage_entry: PipelineStageJournal
-
-
-_DOWNSTREAM_STAGE_EVENT_TYPES: dict[ContentPipelineStage, ContentPipelineEventType] = {
-    ContentPipelineStage.TRANSCODE: ContentPipelineEventType.MEME_TRANSCODED,
-    ContentPipelineStage.OCR: ContentPipelineEventType.MEME_OCR_DONE,
-    ContentPipelineStage.EMBED: ContentPipelineEventType.MEME_EMBEDDED,
-    ContentPipelineStage.CLASSIFY: ContentPipelineEventType.MEME_READY,
-}
-# Single-successor mapping used by every heavy-worker stage EXCEPT classify.
-# Classify fans out to BOTH sync targets so it intentionally does not appear
-# here — see ``_CLASSIFY_FAN_OUT_STAGES`` for the dual-target contract. The
-# separation keeps ``_prepare_downstream_dispatches`` honest: anything in
-# this dict goes through the single-target commit-then-publish flow, while
-# classify uses the publish-then-commit atomic path below.
-_NEXT_STAGE_BY_STAGE: dict[ContentPipelineStage, ContentPipelineStage] = {
-    ContentPipelineStage.TRANSCODE: ContentPipelineStage.OCR,
-    ContentPipelineStage.OCR: ContentPipelineStage.EMBED,
-    ContentPipelineStage.EMBED: ContentPipelineStage.CLASSIFY,
-}
-# Classify success fans out to BOTH Qdrant and Meilisearch sync stages in a
-# single atomic commit. The tuple is ordered so the stage-row + dispatch
-# iteration is deterministic across test runs, which matters because the
-# runtime publishes the events sequentially and any ordering drift would
-# trigger test flakes.
-_CLASSIFY_FAN_OUT_STAGES: tuple[ContentPipelineStage, ...] = (
-    ContentPipelineStage.SYNC_QDRANT,
-    ContentPipelineStage.SYNC_MEILI,
-)
-# Each per-target sync target maps onto exactly one durable stage row so the
-# replay surface can resolve the journal row for a given target without
-# walking the full journal list in service callers.
-_SYNC_STAGE_BY_TARGET: dict[SyncTargetKind, ContentPipelineStage] = {
-    SyncTargetKind.QDRANT: ContentPipelineStage.SYNC_QDRANT,
-    SyncTargetKind.MEILISEARCH: ContentPipelineStage.SYNC_MEILI,
-}
 
 
 class ContentPipelineService:
