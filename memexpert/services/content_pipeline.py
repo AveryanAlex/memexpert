@@ -39,7 +39,6 @@ from memexpert.models.enums import (
     ContentProcessingStatus,
     ContentSourceKind,
     EmbeddingInputType,
-    SourcePlatform,
     SyncTargetKind,
     SyncTargetStatus,
 )
@@ -104,6 +103,13 @@ from memexpert.services.content_pipeline_constants import (
 from memexpert.services.content_pipeline_constants import (
     SYNC_STAGE_BY_TARGET as _SYNC_STAGE_BY_TARGET,
 )
+from memexpert.services.content_pipeline_crawler_queries import (
+    advance_source_channel_checkpoint,
+    attach_crawler_source_row_to_meme_file,
+    find_existing_crawler_source_row,
+    get_tracked_source_channel,
+    meme_file_has_first_source,
+)
 from memexpert.services.content_pipeline_helpers import (
     StageJournalSnapshot,
     ensure_stage_attempt_is_current,
@@ -122,16 +128,12 @@ from memexpert.services.content_pipeline_helpers import (
 from memexpert.services.content_pipeline_helpers import (
     build_sync_preview_model as _build_sync_preview_model,
 )
-from memexpert.services.content_pipeline_helpers import (
-    compare_telegram_post_ids as _compare_telegram_post_ids,
-)
 from memexpert.services.content_pipeline_reporting import (
     build_item_detail,
     decode_sync_preview,
 )
 from memexpert.services.content_pipeline_smoke import run_smoke_proof
 from memexpert.services.errors import (
-    CrawlerChannelNotTrackedError,
     CrawlerPublishError,
     PipelineIngestError,
     PipelineItemNotFoundError,
@@ -335,7 +337,8 @@ class ContentPipelineService:
         # Resolve the tracked channel. Curated channels MUST already exist as
         # ``source_channels`` rows — silently accepting a stray crawler post
         # would make the S04 curated-wave contract untrustworthy.
-        channel = await self._get_tracked_source_channel(
+        channel = await get_tracked_source_channel(
+            self._session,
             platform=raw_post.platform,
             source_id=raw_post.source_id,
         )
@@ -351,14 +354,15 @@ class ContentPipelineService:
         # circuit with the existing row ids BEFORE touching S3 so replays stay
         # cheap. Checkpoint advancement still happens below because advancing
         # the checkpoint on a known post is correct — the message is durable.
-        existing_source_row = await self._find_existing_crawler_source_row(
+        existing_source_row = await find_existing_crawler_source_row(
+            self._session,
             platform=raw_post.platform,
             source_id=raw_post.source_id,
             post_id=raw_post.post_id,
         )
         if existing_source_row is not None:
-            await self._advance_source_channel_checkpoint(
-                channel=channel,
+            await advance_source_channel_checkpoint(
+                channel,
                 post_id=raw_post.post_id,
                 fetched_at=received_at,
             )
@@ -1724,9 +1728,13 @@ class ContentPipelineService:
                 # existing ``MemeFile`` and mark ``is_first_source`` based on
                 # whether this observation is a forwarded repost AND whether
                 # no existing row has claimed first-source status yet.
-                any_existing_first_source = await self._meme_file_has_first_source(duplicate_match.id)
+                any_existing_first_source = await meme_file_has_first_source(
+                    self._session,
+                    duplicate_match.id,
+                )
                 should_claim_first_source = (not is_forwarded) and not any_existing_first_source
-                new_source_row = self._attach_crawler_source_row_to_meme_file(
+                new_source_row = attach_crawler_source_row_to_meme_file(
+                    self._session,
                     meme_file=duplicate_match,
                     raw_post=raw_post,
                     is_first_source=should_claim_first_source,
@@ -1736,8 +1744,8 @@ class ContentPipelineService:
                 outcome = CrawlerIngestOutcome.DEDUPLICATED_EXACT
                 duplicate_of_meme_id = duplicate_match.meme_id
 
-            await self._advance_source_channel_checkpoint(
-                channel=channel,
+            await advance_source_channel_checkpoint(
+                channel,
                 post_id=raw_post.post_id,
                 fetched_at=received_at,
             )
@@ -1842,113 +1850,6 @@ class ContentPipelineService:
         )
         await self._session.flush()
         return new_source_row
-
-    def _attach_crawler_source_row_to_meme_file(
-        self,
-        *,
-        meme_file: MemeFile,
-        raw_post: RawCrawlerPost,
-        is_first_source: bool,
-    ) -> MemeSource:
-        """Add a new ``MemeSource`` row to an existing meme file on pHash dedup.
-
-        The existing meme + meme_file + pipeline stage journal state is
-        intentionally untouched — dedupe reuses the durable state already in
-        place. The new row carries the repost's ``published_at``, its
-        forward-chain attribution, and its own ``is_first_source`` flag.
-        """
-
-        new_source_row = MemeSource(
-            file_id=meme_file.id,
-            platform=raw_post.platform,
-            source_id=raw_post.source_id,
-            post_id=raw_post.post_id,
-            views=raw_post.views,
-            reactions=dict(raw_post.reactions),
-            is_first_source=is_first_source,
-            source_alive=True,
-            published_at=raw_post.published_at,
-            forwarded_from_source_id=raw_post.forward.source_id if raw_post.forward is not None else None,
-            forwarded_from_post_id=raw_post.forward.post_id if raw_post.forward is not None else None,
-        )
-        self._session.add(new_source_row)
-        return new_source_row
-
-    async def _get_tracked_source_channel(
-        self,
-        *,
-        platform: SourcePlatform,
-        source_id: str,
-    ) -> SourceChannel:
-        """Return the ``SourceChannel`` row for ``(platform, source_id)`` or raise.
-
-        Raises :class:`CrawlerChannelNotTrackedError` if the row is missing:
-        curated crawlers must only consume from channels an operator added.
-        """
-
-        result = await self._session.execute(
-            select(SourceChannel)
-            .where(
-                SourceChannel.platform == platform,
-                SourceChannel.platform_id == source_id,
-            )
-            .limit(1)
-        )
-        channel = result.scalar_one_or_none()
-        if channel is None:
-            raise CrawlerChannelNotTrackedError(
-                f"Crawler ingest received a post from untracked channel "
-                f"{platform.value}:{source_id}.",
-            )
-        return channel
-
-    async def _find_existing_crawler_source_row(
-        self,
-        *,
-        platform: SourcePlatform,
-        source_id: str,
-        post_id: str,
-    ) -> MemeSource | None:
-        result = await self._session.execute(
-            select(MemeSource)
-            .where(
-                MemeSource.platform == platform,
-                MemeSource.source_id == source_id,
-                MemeSource.post_id == post_id,
-            )
-            .limit(1)
-        )
-        return result.scalar_one_or_none()
-
-    async def _meme_file_has_first_source(self, meme_file_id: uuid.UUID) -> bool:
-        result = await self._session.execute(
-            select(MemeSource.id)
-            .where(
-                MemeSource.file_id == meme_file_id,
-                MemeSource.is_first_source.is_(True),
-            )
-            .limit(1)
-        )
-        return result.scalar_one_or_none() is not None
-
-    async def _advance_source_channel_checkpoint(
-        self,
-        *,
-        channel: SourceChannel,
-        post_id: str,
-        fetched_at: datetime,
-    ) -> None:
-        """Advance the channel checkpoint monotonically.
-
-        ``last_fetched_at`` is always refreshed because every successful
-        ingest path is a proof of liveness. ``last_read_post_id`` only
-        advances to a strictly higher value so out-of-order deliveries
-        never regress the crawler's scan position.
-        """
-
-        channel.last_fetched_at = fetched_at
-        if _compare_telegram_post_ids(post_id, channel.last_read_post_id) > 0:
-            channel.last_read_post_id = post_id
 
     async def _create_new_upload_rows(
         self,
