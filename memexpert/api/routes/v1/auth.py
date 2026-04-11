@@ -14,7 +14,6 @@ from memexpert.api.dependencies import (
     ForbidFullAccountCallerDep,
     GuestUserDep,
     OptionalGuestUserDep,
-    ProviderAuthServiceDep,
     to_auth_http_error,
 )
 from memexpert.core.config import get_settings
@@ -333,15 +332,23 @@ async def start_telegram_link(
 async def login_with_telegram_widget(
     request: Request,
     response: Response,
-    provider_auth_service: ProviderAuthServiceDep,
+    _guard: ForbidFullAccountCallerDep,
+    optional_guest: OptionalGuestUserDep,
+    account_link_service: AccountLinkServiceDep,
+    auth_service: AuthServiceDep,
     credentials: Annotated[TelegramWidgetAuthRequest, Body()],
 ) -> AuthSessionRead:
-    """Validate a Telegram Login Widget payload and keep the refresh token cookie-only."""
+    """Validate a Telegram Login Widget payload via the unified writer path."""
 
     try:
-        auth_session = await provider_auth_service.authenticate_with_telegram_widget(
+        link_result = await account_link_service.link_guest_with_telegram_widget(
+            guest_user_id=optional_guest.id if optional_guest else None,
             payload=credentials,
+        )
+        auth_session = await auth_service.issue_session_for_user(
+            link_result.user,
             device_info=request.headers.get("user-agent"),
+            reload_user=False,
         )
     except AuthServiceError as exc:
         raise to_auth_http_error(exc) from exc
@@ -359,15 +366,30 @@ async def login_with_telegram_widget(
 async def login_with_telegram_miniapp(
     request: Request,
     response: Response,
-    provider_auth_service: ProviderAuthServiceDep,
+    _guard: ForbidFullAccountCallerDep,
+    optional_guest: OptionalGuestUserDep,
+    account_link_service: AccountLinkServiceDep,
+    auth_service: AuthServiceDep,
     credentials: Annotated[TelegramMiniAppAuthRequest, Body()],
 ) -> AuthSessionRead:
-    """Validate Telegram Mini App initData and keep the refresh token cookie-only."""
+    """Validate Telegram Mini App initData via the unified writer path.
+
+    For Mini App callers — who typically arrive without a prior guest
+    cookie — the service bootstraps a transient guest and upgrades or
+    merges it in place, so the user experiences an "instant full account"
+    on first open while the server-side writer path stays
+    single-source-of-truth.
+    """
 
     try:
-        auth_session = await provider_auth_service.authenticate_with_telegram_miniapp(
+        link_result = await account_link_service.link_guest_with_telegram_miniapp(
+            guest_user_id=optional_guest.id if optional_guest else None,
             init_data=credentials.init_data,
+        )
+        auth_session = await auth_service.issue_session_for_user(
+            link_result.user,
             device_info=request.headers.get("user-agent"),
+            reload_user=False,
         )
     except AuthServiceError as exc:
         raise to_auth_http_error(exc) from exc

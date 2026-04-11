@@ -29,11 +29,10 @@ from memexpert.services._auth_validation import (
     require_positive_float,
     require_positive_int,
 )
-from memexpert.services.auth_service import AuthService, AuthSession
+from memexpert.services.auth_service import AuthService
 from memexpert.services.errors import (
     AccountUnavailableError,
     AuthConfigurationError,
-    DuplicateIdentityError,
     EmailAlreadyInUseError,
     InvalidCredentialsError,
     ProviderAccessDeniedError,
@@ -166,28 +165,6 @@ class ProviderAuthService:
             user_service=user_service,
         )
 
-    async def authenticate_with_telegram_widget(
-        self,
-        *,
-        payload: TelegramWidgetAuthRequest,
-        device_info: str | None = None,
-    ) -> AuthSession:
-        """Validate Telegram Login Widget payloads and issue a full-account session."""
-
-        identity = self.resolve_telegram_widget_identity(payload)
-        return await self._authenticate_with_telegram_identity(identity, device_info=device_info)
-
-    async def authenticate_with_telegram_miniapp(
-        self,
-        *,
-        init_data: str | None,
-        device_info: str | None = None,
-    ) -> AuthSession:
-        """Validate Telegram Mini App initData and issue a full-account session."""
-
-        identity = self.resolve_telegram_miniapp_identity(init_data)
-        return await self._authenticate_with_telegram_identity(identity, device_info=device_info)
-
     def prepare_email_signup_identity(self, *, email: str, password: str) -> EmailSignupIdentity:
         """Validate email-signup credentials and prepare a password hash without writing a session."""
 
@@ -259,33 +236,6 @@ class ProviderAuthService:
         """Validate Telegram Mini App initData without issuing a session."""
 
         return self._verify_telegram_miniapp_payload(init_data)
-
-    async def _authenticate_with_telegram_identity(
-        self,
-        identity: TelegramIdentity,
-        *,
-        device_info: str | None = None,
-    ) -> AuthSession:
-        resolved_user = await self.resolve_telegram_identity_user(identity)
-        if resolved_user is None:
-            try:
-                resolved_user = await self._user_service.create_full_user(
-                    telegram_id=identity.telegram_id,
-                    commit=False,
-                )
-            except DuplicateIdentityError as exc:
-                existing_user = await self._user_service.get_by_telegram_id(identity.telegram_id)
-                if existing_user is None:
-                    raise ProviderPayloadInvalidError(
-                        "Telegram identity could not be resolved safely.",
-                    ) from exc
-                resolved_user = existing_user
-
-        return await self._auth_service.issue_session_for_user(
-            resolved_user,
-            device_info=device_info,
-            reload_user=False,
-        )
 
     async def _exchange_google_code_for_identity(self, code: str) -> GoogleIdentity:
         normalized_code = self._require_google_code(code)

@@ -15,7 +15,8 @@ from sqlalchemy import func, select
 from memexpert.api.app import create_app
 from memexpert.core.config import get_settings
 from memexpert.core.database import reset_async_database_state
-from memexpert.models.user import RefreshToken, User
+from memexpert.models.enums import AccountType
+from memexpert.models.user import AccountMergeLog, RefreshToken, User
 
 if TYPE_CHECKING:
     from pytest import MonkeyPatch
@@ -111,6 +112,48 @@ async def test_telegram_widget_route_sets_refresh_cookie_and_returns_shared_sess
         refresh_token_row = refresh_token_result.scalar_one()
         assert refresh_token_row.device_info == "Telegram Widget Browser"
         assert refresh_token_row.token_hash != auth_client.cookies.get(cookie_name)
+
+
+async def test_telegram_miniapp_route_first_open_creates_exactly_one_full_user_no_merge_log(
+    auth_client: AsyncClient,
+    auth_settings_overrides: dict[str, str],
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Mini App first-open must produce a single full account with zero merge logs.
+
+    The route bootstraps a throwaway guest and upgrades it in place (fresh
+    telegram_id → no existing user to merge into), so the end state is one
+    user row with account_type=full. The transient bootstrap must not
+    leak as an extra guest row, and no AccountMergeLog should be written
+    because upgrade-in-place does not write the log.
+    """
+
+    response = await auth_client.post(
+        "/api/v1/auth/telegram-miniapp",
+        headers={"User-Agent": "Telegram Mini App"},
+        json={
+            "initData": build_miniapp_init_data(
+                telegram_id=303030303,
+                token=auth_settings_overrides["AUTH_TELEGRAM_BOT_TOKEN"],
+            ),
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["user"]["account_type"] == "full"
+    assert payload["user"]["telegram_id"] == 303030303
+
+    async with postgres_session_factory() as session:
+        user_count_result = await session.execute(select(func.count()).select_from(User))
+        full_count_result = await session.execute(
+            select(func.count()).select_from(User).where(User.account_type == AccountType.FULL)
+        )
+        merge_log_count_result = await session.execute(select(func.count()).select_from(AccountMergeLog))
+
+        assert user_count_result.scalar_one() == 1
+        assert full_count_result.scalar_one() == 1
+        assert merge_log_count_result.scalar_one() == 0
 
 
 async def test_telegram_miniapp_route_reuses_existing_telegram_account_across_surfaces(
