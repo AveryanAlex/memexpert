@@ -213,8 +213,54 @@ async def get_guest_user(current_user: CurrentUserDep) -> UserRead:
     return current_user
 
 
+async def get_optional_guest_user(
+    current_user: OptionalCurrentUserDep,
+) -> UserRead | None:
+    """Return the caller's guest user when one is present; ``None`` otherwise.
+
+    Used by the direct ``/auth/*`` routes under the unified writer path:
+    a guest caller forwards their existing guest id into
+    ``AccountLinkService.link_guest_with_*``, an anonymous caller forwards
+    ``None`` so the service bootstraps a throwaway guest inside the same
+    transaction. Full-account callers are filtered to ``None`` here and
+    rejected by :func:`forbid_full_account_caller` before the route runs.
+    """
+
+    if current_user is None:
+        return None
+    if current_user.account_type is not AccountType.GUEST:
+        return None
+    return current_user
+
+
+async def forbid_full_account_caller(
+    current_user: OptionalCurrentUserDep,
+) -> None:
+    """Reject authenticated full-account callers on direct auth entry points.
+
+    The unified writer path bootstraps a guest when the caller has no
+    session, or reuses the caller's guest when they do. A full-account
+    caller falls into neither category and would silently create a
+    second unrelated account; reject with the same
+    ``GUEST_ACCOUNT_REQUIRED`` / 403 mapping the departing ``/auth/link/*``
+    routes used for the symmetric "full caller on guest-only endpoint"
+    case.
+    """
+
+    if current_user is None:
+        return
+    if current_user.account_type is not AccountType.GUEST:
+        raise to_auth_http_error(
+            GuestAccountRequiredError(
+                "This endpoint rejects authenticated full-account callers; sign out first.",
+            ),
+        )
+
+
 FullAccountUserDep = Annotated[UserRead, Depends(get_full_account_user)]
 GuestUserDep = Annotated[UserRead, Depends(get_guest_user)]
+OptionalGuestUserDep = Annotated["UserRead | None", Depends(get_optional_guest_user)]
+ForbidFullAccountCallerDep = Annotated[None, Depends(forbid_full_account_caller)]
 
 
 __all__ = [
@@ -225,17 +271,21 @@ __all__ = [
     "AuthServiceDep",
     "CurrentUserDep",
     "DbSessionDep",
+    "ForbidFullAccountCallerDep",
     "FullAccountUserDep",
     "GuestUserDep",
     "OptionalCurrentUserDep",
+    "OptionalGuestUserDep",
     "ProviderAuthServiceDep",
     "auth_http_exception_handler",
+    "forbid_full_account_caller",
     "get_account_link_service",
     "get_auth_service",
     "get_current_user",
     "get_full_account_user",
     "get_guest_user",
     "get_optional_current_user",
+    "get_optional_guest_user",
     "get_provider_auth_service",
     "to_auth_http_error",
 ]
