@@ -219,6 +219,34 @@ async def test_fake_telegram_client_resolve_channel_returns_canned_row() -> None
         _ = await client.resolve_channel("unknown")
 
 
+async def test_fake_telegram_client_fetch_single_message_returns_pinned_entry() -> None:
+    message = _build_message(message_id="100", channel_id="memes_channel")
+    client = FakeTelegramClient()
+    client.pin_single_message(
+        channel_id="memes_channel",
+        post_id="100",
+        message=message,
+        media=b"single-message-media",
+    )
+
+    fetched = await client.fetch_single_message(
+        channel_id="memes_channel",
+        post_id="100",
+    )
+    assert fetched is message
+
+    # The media helper pins media alongside the message entry.
+    media_bytes = await client.download_media(fetched)
+    assert media_bytes == b"single-message-media"
+
+    # Unknown (channel, post) pairs raise the typed malformed error.
+    with pytest.raises(PipelineTelegramMalformedMessageError):
+        _ = await client.fetch_single_message(
+            channel_id="memes_channel",
+            post_id="999",
+        )
+
+
 def test_pipeline_telegram_errors_form_a_taxonomy() -> None:
     # Every concrete error class must subclass the base so the runtime
     # dispatcher can classify them with a single except clause.
@@ -240,30 +268,6 @@ class _StubPipelineService:
             outcome=CrawlerIngestOutcome.INGESTED,
             received_at=_now(),
         )
-
-
-async def test_telegram_crawler_runtime_stubs_raise_not_implemented(
-    migrated_db_session: AsyncSession,
-) -> None:
-    service = cast("ContentPipelineService", _StubPipelineService())
-    client = FakeTelegramClient()
-    runtime = TelegramCrawlerRuntime(
-        pipeline_service=service,
-        telegram_client=client,
-        session=migrated_db_session,
-        settings=Settings(),
-    )
-
-    with pytest.raises(NotImplementedError, match="T02"):
-        _ = await runtime.catch_up_channel("primary", "memes_channel")
-    with pytest.raises(NotImplementedError, match="T02"):
-        _ = await runtime.start_live_listener("primary")
-    with pytest.raises(NotImplementedError, match="T02"):
-        _ = await runtime.stop_live_listener("primary")
-    with pytest.raises(NotImplementedError, match="T02"):
-        _ = await runtime.reassign_channel("memes_channel", "secondary")
-    with pytest.raises(NotImplementedError, match="T02"):
-        _ = await runtime.replay_post("memes_channel", "1")
 
 
 async def test_telegram_crawler_runtime_load_session_state_creates_and_returns_rows(

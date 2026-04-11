@@ -142,6 +142,21 @@ class PipelineTelegramClientProtocol(Protocol):
     async def resolve_channel(self, username_or_id: str) -> RawTelegramChannel:
         """Resolve a human-friendly channel identifier into its typed projection."""
 
+    async def fetch_single_message(
+        self,
+        *,
+        channel_id: str,
+        post_id: str,
+    ) -> RawTelegramMessage:
+        """Return one specific message by ``(channel_id, post_id)`` for replay.
+
+        The crawler runtime replays failed ingests by id without advancing
+        the channel checkpoint. Implementations raise
+        :class:`PipelineTelegramMalformedMessageError` when Telegram has
+        no such message (or cannot parse it), and translate any transport
+        failure into the typed error taxonomy like the other methods.
+        """
+
     async def close(self) -> None:
         """Shut the adapter down and release any underlying client resources."""
 
@@ -219,9 +234,33 @@ class FakeTelegramClient:
     canned_channels: dict[str, RawTelegramChannel] = field(default_factory=dict)
     media_by_message: dict[str, bytes] = field(default_factory=dict)
     live_messages: dict[str, list[RawTelegramMessage]] = field(default_factory=dict)
+    single_messages: dict[tuple[str, str], RawTelegramMessage] = field(default_factory=dict)
     next_error: PipelineTelegramError | None = None
+    # Typed errors injected on download_media calls, keyed by message id.
+    # Tests use this to simulate per-message provider failures without
+    # tripping ``next_error`` pinning on other methods.
+    download_errors: dict[str, PipelineTelegramError] = field(default_factory=dict)
     downloaded_message_ids: list[str] = field(default_factory=list)
     closed: bool = False
+
+    def pin_single_message(
+        self,
+        *,
+        channel_id: str,
+        post_id: str,
+        message: RawTelegramMessage,
+        media: bytes | None = None,
+    ) -> None:
+        """Pre-seed a single-message lookup the runtime's replay path uses.
+
+        When ``media`` is provided, the entry is also registered with
+        ``media_by_message`` so a subsequent ``download_media`` call on
+        the returned message succeeds without a second helper call.
+        """
+
+        self.single_messages[(channel_id, post_id)] = message
+        if media is not None:
+            self.media_by_message[message.message_id] = media
 
     def _consume_pinned_error(self) -> None:
         if self.next_error is not None:
@@ -264,6 +303,9 @@ class FakeTelegramClient:
                 yield message
 
     async def download_media(self, message: RawTelegramMessage) -> bytes:
+        pinned_download_error = self.download_errors.pop(message.message_id, None)
+        if pinned_download_error is not None:
+            raise pinned_download_error
         self._consume_pinned_error()
         try:
             media_bytes = self.media_by_message[message.message_id]
@@ -281,6 +323,21 @@ class FakeTelegramClient:
         except KeyError as exc:
             raise PipelineTelegramMalformedMessageError(
                 f"FakeTelegramClient has no canned channel for {username_or_id!r}.",
+            ) from exc
+
+    async def fetch_single_message(
+        self,
+        *,
+        channel_id: str,
+        post_id: str,
+    ) -> RawTelegramMessage:
+        self._consume_pinned_error()
+        try:
+            return self.single_messages[(channel_id, post_id)]
+        except KeyError as exc:
+            raise PipelineTelegramMalformedMessageError(
+                f"FakeTelegramClient has no pinned single message for "
+                f"({channel_id!r}, {post_id!r}).",
             ) from exc
 
     async def close(self) -> None:

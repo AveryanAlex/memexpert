@@ -1,0 +1,636 @@
+"""Integration tests for :class:`TelegramCrawlerRuntime` with FakeTelegramClient.
+
+These tests wire the runtime against a real migrated PostgreSQL session
+(provided by :func:`migrated_db_session`) and the in-process
+``FakeTelegramClient`` + fake storage/publisher doubles borrowed from
+:mod:`tests.integration.test_content_pipeline_service`. No test in this
+module imports :mod:`telethon` — the adapter's translation layer is
+exercised only by the pure-Python mapper tests.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING
+
+import pytest
+from sqlalchemy import select
+
+from memexpert.core.config import Settings
+from memexpert.crawlers.telegram.client import (
+    FakeTelegramClient,
+    PipelineTelegramFloodWaitError,
+    PipelineTelegramProviderUnavailableError,
+    PipelineTelegramSessionBannedError,
+    RawTelegramChannel,
+    RawTelegramMessage,
+)
+from memexpert.crawlers.telegram.runtime import (
+    CrawlerCatchupReport,
+    TelegramCrawlerRuntime,
+)
+from memexpert.models.content import (
+    MemeSource,
+    SourceChannel,
+    TelegramSessionState,
+)
+from memexpert.models.enums import SourcePlatform, TelegramSessionStatus
+from memexpert.schemas.content_pipeline import CrawlerForwardAttribution
+from memexpert.services import CrawlerSessionNotRunnableError
+from memexpert.services.content_pipeline import ContentPipelineService
+from tests.integration.test_content_pipeline_service import (
+    FakeMediaProcessor,
+    FakeStorageClient,
+    RecordingPublisher,
+    _make_distinct_upload_media_details,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+
+def _now() -> datetime:
+    return datetime.now(tz=UTC)
+
+
+def _build_photo_message(
+    *,
+    message_id: str,
+    channel_id: str = "curated_channel",
+    forward: CrawlerForwardAttribution | None = None,
+    views: int = 11,
+) -> RawTelegramMessage:
+    return RawTelegramMessage(
+        message_id=message_id,
+        channel_id=channel_id,
+        channel_username=None,
+        channel_title="Curated Channel",
+        published_at=_now(),
+        media_type="photo",
+        views=views,
+        reactions={"heart": 3},
+        forward=forward,
+    )
+
+
+def _build_unsupported_message(
+    *,
+    message_id: str,
+    channel_id: str = "curated_channel",
+) -> RawTelegramMessage:
+    return RawTelegramMessage(
+        message_id=message_id,
+        channel_id=channel_id,
+        channel_username=None,
+        channel_title="Curated Channel",
+        published_at=_now(),
+        media_type="unsupported",
+        views=0,
+        reactions={},
+        forward=None,
+    )
+
+
+async def _seed_active_session(
+    session: AsyncSession,
+    *,
+    session_name: str,
+) -> TelegramSessionState:
+    row = TelegramSessionState(
+        session_name=session_name,
+        status=TelegramSessionStatus.ACTIVE,
+        last_heartbeat_at=_now(),
+    )
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+async def _seed_curated_channel(
+    session: AsyncSession,
+    *,
+    platform_id: str,
+    title: str = "Curated Channel",
+    catchup_message_limit: int = 500,
+    catchup_enabled: bool = True,
+    is_paused: bool = False,
+    session_id: str | None = None,
+    last_read_post_id: str | None = None,
+) -> SourceChannel:
+    channel = SourceChannel(
+        platform=SourcePlatform.TELEGRAM,
+        platform_id=platform_id,
+        title=title,
+        is_active=True,
+        is_paused=is_paused,
+        catchup_message_limit=catchup_message_limit,
+        catchup_enabled=catchup_enabled,
+        session_id=session_id,
+        last_read_post_id=last_read_post_id,
+    )
+    session.add(channel)
+    await session.commit()
+    await session.refresh(channel)
+    return channel
+
+
+def _build_runtime(
+    session: AsyncSession,
+    *,
+    telegram_client: FakeTelegramClient,
+    phash_tag: str = "R",
+) -> TelegramCrawlerRuntime:
+    service = ContentPipelineService(
+        session,
+        storage_client=FakeStorageClient(),
+        publisher=RecordingPublisher(),
+        media_processor=FakeMediaProcessor(
+            inspect_result=_make_distinct_upload_media_details(tag=phash_tag),
+        ),
+    )
+    return TelegramCrawlerRuntime(
+        pipeline_service=service,
+        telegram_client=telegram_client,
+        session=session,
+        settings=Settings(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# catch_up_channel happy path + counters
+# ---------------------------------------------------------------------------
+
+
+async def test_catch_up_channel_ingests_and_counts_mixed_media(
+    migrated_db_session: AsyncSession,
+) -> None:
+    await _seed_active_session(migrated_db_session, session_name="primary")
+    channel = await _seed_curated_channel(
+        migrated_db_session,
+        platform_id="curated_channel",
+    )
+
+    messages = [
+        _build_photo_message(message_id="1"),
+        _build_photo_message(message_id="2"),
+        RawTelegramMessage(
+            message_id="3",
+            channel_id="curated_channel",
+            channel_username=None,
+            channel_title="Curated Channel",
+            published_at=_now(),
+            media_type="gif",
+            views=5,
+            reactions={},
+            forward=None,
+        ),
+        RawTelegramMessage(
+            message_id="4",
+            channel_id="curated_channel",
+            channel_username=None,
+            channel_title="Curated Channel",
+            published_at=_now(),
+            media_type="video",
+            views=9,
+            reactions={},
+            forward=None,
+        ),
+        _build_unsupported_message(message_id="5"),
+    ]
+    fake = FakeTelegramClient(
+        canned_messages={"curated_channel": messages},
+        canned_channels={
+            "curated_channel": RawTelegramChannel(
+                channel_id="curated_channel",
+                username=None,
+                title="Curated Channel",
+                subscriber_count=100,
+            ),
+        },
+        media_by_message={m.message_id: b"bytes-" + m.message_id.encode() for m in messages[:4]},
+    )
+    runtime = _build_runtime(migrated_db_session, telegram_client=fake)
+
+    report = await runtime.catch_up_channel("primary", "curated_channel")
+
+    assert isinstance(report, CrawlerCatchupReport)
+    assert report.messages_scanned == 5
+    # The FakeMediaProcessor assigns the same phash to every upload so
+    # the first supported message ingests and the rest are counted as
+    # skipped_dedup (the service reports DEDUPLICATED_EXACT because the
+    # phash collides). The one unsupported media short-circuits before
+    # reaching the service.
+    assert report.messages_ingested == 1
+    assert report.messages_skipped_dedup == 3
+    assert report.messages_skipped_unsupported == 1
+    assert report.errors == ()
+    assert report.session_name == "primary"
+    assert report.channel_id == "curated_channel"
+
+    await migrated_db_session.refresh(channel)
+    assert channel.last_read_post_id == "4"
+    assert channel.last_fetched_at is not None
+    # Channel metadata refresh should have updated subscriber_count from
+    # the fake resolve_channel response.
+    assert channel.subscriber_count == 100
+
+
+async def test_catch_up_channel_respects_catchup_message_limit(
+    migrated_db_session: AsyncSession,
+) -> None:
+    await _seed_active_session(migrated_db_session, session_name="primary")
+    channel = await _seed_curated_channel(
+        migrated_db_session,
+        platform_id="limited_channel",
+        catchup_message_limit=3,
+    )
+
+    messages = [_build_photo_message(message_id=str(i), channel_id="limited_channel") for i in range(1, 11)]
+    fake = FakeTelegramClient(
+        canned_messages={"limited_channel": messages},
+        media_by_message={m.message_id: b"img" for m in messages},
+    )
+    runtime = _build_runtime(migrated_db_session, telegram_client=fake, phash_tag="L")
+
+    report = await runtime.catch_up_channel("primary", "limited_channel")
+
+    # Only 3 messages are scanned because the channel's catchup limit is
+    # 3. With the shared-phash fake processor, one ingests and two dedup.
+    assert report.messages_scanned == 3
+    assert report.messages_ingested == 1
+    assert report.messages_skipped_dedup == 2
+    await migrated_db_session.refresh(channel)
+    assert channel.last_read_post_id == "3"
+
+
+async def test_catch_up_channel_honors_paused_channel(
+    migrated_db_session: AsyncSession,
+) -> None:
+    await _seed_active_session(migrated_db_session, session_name="primary")
+    await _seed_curated_channel(
+        migrated_db_session,
+        platform_id="paused_channel",
+        is_paused=True,
+    )
+    fake = FakeTelegramClient(
+        canned_messages={"paused_channel": [_build_photo_message(message_id="1")]},
+        media_by_message={"1": b"img"},
+    )
+    runtime = _build_runtime(migrated_db_session, telegram_client=fake, phash_tag="P")
+
+    report = await runtime.catch_up_channel("primary", "paused_channel")
+
+    assert report.messages_scanned == 0
+    assert report.messages_ingested == 0
+    assert len(report.errors) == 1
+    assert "paused" in report.errors[0]
+
+
+async def test_catch_up_channel_honors_catchup_disabled(
+    migrated_db_session: AsyncSession,
+) -> None:
+    await _seed_active_session(migrated_db_session, session_name="primary")
+    await _seed_curated_channel(
+        migrated_db_session,
+        platform_id="cold_channel",
+        catchup_enabled=False,
+    )
+    fake = FakeTelegramClient(
+        canned_messages={"cold_channel": [_build_photo_message(message_id="1")]},
+        media_by_message={"1": b"img"},
+    )
+    runtime = _build_runtime(migrated_db_session, telegram_client=fake, phash_tag="C")
+
+    report = await runtime.catch_up_channel("primary", "cold_channel")
+
+    assert report.messages_scanned == 0
+    assert report.messages_ingested == 0
+    assert len(report.errors) == 1
+    assert "catchup_disabled" in report.errors[0]
+
+
+# ---------------------------------------------------------------------------
+# Error + session-state paths
+# ---------------------------------------------------------------------------
+
+
+async def test_catch_up_channel_quarantines_session_on_banned_error(
+    migrated_db_session: AsyncSession,
+) -> None:
+    session_row = await _seed_active_session(migrated_db_session, session_name="primary")
+    await _seed_curated_channel(
+        migrated_db_session,
+        platform_id="banned_channel",
+    )
+
+    class _BannedOnIter(FakeTelegramClient):
+        async def iter_channel_messages(
+            self,
+            *,
+            channel_id: str,
+            min_message_id: int | None,
+            limit: int,
+        ) -> AsyncIterator[RawTelegramMessage]:
+            _ = (channel_id, min_message_id, limit)
+            raise PipelineTelegramSessionBannedError("session revoked")
+            yield  # pragma: no cover - unreachable, kept so the method is an async generator
+
+    fake = _BannedOnIter(
+        canned_messages={
+            "banned_channel": [_build_photo_message(message_id="1", channel_id="banned_channel")],
+        },
+        media_by_message={"1": b"img"},
+    )
+    runtime = _build_runtime(migrated_db_session, telegram_client=fake, phash_tag="B")
+
+    with pytest.raises(PipelineTelegramSessionBannedError):
+        _ = await runtime.catch_up_channel("primary", "banned_channel")
+
+    await migrated_db_session.refresh(session_row)
+    assert session_row.status is TelegramSessionStatus.QUARANTINED
+    assert session_row.quarantined_at is not None
+    assert session_row.last_error_class == "PipelineTelegramSessionBannedError"
+    assert session_row.last_error_text is not None
+    assert "session revoked" in session_row.last_error_text
+
+
+async def test_catch_up_channel_flood_wait_parks_session_with_partial_report(
+    migrated_db_session: AsyncSession,
+) -> None:
+    session_row = await _seed_active_session(migrated_db_session, session_name="primary")
+    channel = await _seed_curated_channel(
+        migrated_db_session,
+        platform_id="flood_channel",
+    )
+
+    # Two messages are successfully streamed. The FakeTelegramClient has a
+    # tiny subclass that raises a flood wait on the SECOND download_media
+    # call so the first message ingests and the second trips the flood.
+    messages = [
+        _build_photo_message(message_id="10", channel_id="flood_channel"),
+        _build_photo_message(message_id="20", channel_id="flood_channel"),
+    ]
+
+    class _FloodOnSecondDownload(FakeTelegramClient):
+        async def download_media(self, message: RawTelegramMessage) -> bytes:
+            self.downloaded_message_ids.append(message.message_id)
+            if len(self.downloaded_message_ids) >= 2:
+                raise PipelineTelegramFloodWaitError(
+                    "cooldown",
+                    wait_seconds=300,
+                )
+            return self.media_by_message.get(message.message_id, b"img")
+
+    fake = _FloodOnSecondDownload(
+        canned_messages={"flood_channel": messages},
+        media_by_message={"10": b"img"},
+    )
+    runtime = _build_runtime(migrated_db_session, telegram_client=fake, phash_tag="F")
+
+    report = await runtime.catch_up_channel("primary", "flood_channel")
+
+    assert report.messages_ingested == 1
+    assert any("flood_wait" in e for e in report.errors)
+
+    await migrated_db_session.refresh(session_row)
+    assert session_row.status is TelegramSessionStatus.FLOOD_WAIT
+    assert session_row.flood_wait_until is not None
+    cooldown_delta = session_row.flood_wait_until - _now()
+    # Allow generous slack for clock drift; the fake pins ``wait_seconds=300``.
+    assert timedelta(seconds=250) < cooldown_delta < timedelta(seconds=350)
+
+    await migrated_db_session.refresh(channel)
+    # ``last_read_post_id`` advanced for the one message that successfully
+    # ingested before the flood fired.
+    assert channel.last_read_post_id == "10"
+
+
+async def test_catch_up_channel_continues_after_per_message_provider_error(
+    migrated_db_session: AsyncSession,
+) -> None:
+    session_row = await _seed_active_session(migrated_db_session, session_name="primary")
+    await _seed_curated_channel(
+        migrated_db_session,
+        platform_id="transient_channel",
+    )
+
+    messages = [
+        _build_photo_message(message_id="10", channel_id="transient_channel"),
+        _build_photo_message(message_id="20", channel_id="transient_channel"),
+        _build_photo_message(message_id="30", channel_id="transient_channel"),
+    ]
+
+    fake = FakeTelegramClient(
+        canned_messages={"transient_channel": messages},
+        media_by_message={"10": b"img-10", "30": b"img-30"},
+    )
+    fake.download_errors["20"] = PipelineTelegramProviderUnavailableError("Telegram hiccup")
+    runtime = _build_runtime(migrated_db_session, telegram_client=fake, phash_tag="T")
+
+    report = await runtime.catch_up_channel("primary", "transient_channel")
+
+    # 3 scanned. Message 10 ingests successfully. Message 20's download
+    # pin raises PipelineTelegramProviderUnavailableError so the loop
+    # records an error and continues. Message 30 downloads cleanly but
+    # pHash-dedupes against message 10 (FakeMediaProcessor returns the
+    # same phash for every upload), so it lands in skipped_dedup.
+    assert report.messages_scanned == 3
+    assert report.messages_ingested == 1
+    assert report.messages_skipped_dedup == 1
+    assert any("download_unavailable:20" in e for e in report.errors)
+
+    await migrated_db_session.refresh(session_row)
+    assert session_row.status is TelegramSessionStatus.ACTIVE
+
+
+async def test_catch_up_channel_preserves_forward_attribution_on_ingested_row(
+    migrated_db_session: AsyncSession,
+) -> None:
+    await _seed_active_session(migrated_db_session, session_name="primary")
+    # Seed BOTH the original source channel and the reposter channel so
+    # forwards resolve cleanly.
+    await _seed_curated_channel(
+        migrated_db_session,
+        platform_id="reposter_channel",
+        title="Reposter",
+    )
+
+    forward = CrawlerForwardAttribution(
+        source_id="origin_channel",
+        post_id="99",
+        channel_username=None,
+        channel_title="Origin",
+    )
+    message = _build_photo_message(
+        message_id="42",
+        channel_id="reposter_channel",
+        forward=forward,
+    )
+    fake = FakeTelegramClient(
+        canned_messages={"reposter_channel": [message]},
+        media_by_message={"42": b"image"},
+    )
+    runtime = _build_runtime(migrated_db_session, telegram_client=fake, phash_tag="W")
+
+    report = await runtime.catch_up_channel("primary", "reposter_channel")
+    assert report.messages_ingested == 1
+
+    result = await migrated_db_session.execute(
+        select(MemeSource).where(MemeSource.source_id == "reposter_channel"),
+    )
+    source_row = result.scalar_one()
+    assert source_row.forwarded_from_source_id == "origin_channel"
+    assert source_row.forwarded_from_post_id == "99"
+    assert source_row.is_first_source is False
+
+
+# ---------------------------------------------------------------------------
+# Live listener lifecycle
+# ---------------------------------------------------------------------------
+
+
+async def test_live_listener_round_trips_one_message_and_stops_cleanly(
+    migrated_db_session: AsyncSession,
+) -> None:
+    session_row = await _seed_active_session(migrated_db_session, session_name="primary")
+    await _seed_curated_channel(
+        migrated_db_session,
+        platform_id="live_channel",
+        session_id="primary",
+    )
+
+    live_message = _build_photo_message(message_id="100", channel_id="live_channel")
+    fake = FakeTelegramClient(
+        live_messages={"live_channel": [live_message]},
+        media_by_message={"100": b"live-bytes"},
+    )
+    runtime = _build_runtime(migrated_db_session, telegram_client=fake, phash_tag="V")
+
+    await runtime.start_live_listener("primary")
+
+    await migrated_db_session.refresh(session_row)
+    assert session_row.live_listener_started_at is not None
+
+    # Wait for the fake's one-shot stream to be consumed.
+    for _ in range(50):
+        if "100" in fake.downloaded_message_ids:
+            break
+        await asyncio.sleep(0.02)
+    else:  # pragma: no cover - safety net for flaky CI
+        pytest.fail("Live listener did not process the pinned message in time.")
+
+    await runtime.stop_live_listener("primary")
+
+    await migrated_db_session.refresh(session_row)
+    assert session_row.status is TelegramSessionStatus.STOPPED
+    assert session_row.live_listener_started_at is None
+    assert session_row.last_heartbeat_at is not None
+
+
+# ---------------------------------------------------------------------------
+# replay_post + reassign_channel
+# ---------------------------------------------------------------------------
+
+
+async def test_replay_post_does_not_advance_checkpoint(
+    migrated_db_session: AsyncSession,
+) -> None:
+    await _seed_active_session(migrated_db_session, session_name="primary")
+    channel = await _seed_curated_channel(
+        migrated_db_session,
+        platform_id="replay_channel",
+        last_read_post_id="500",
+    )
+
+    message = _build_photo_message(message_id="42", channel_id="replay_channel")
+    fake = FakeTelegramClient()
+    fake.pin_single_message(
+        channel_id="replay_channel",
+        post_id="42",
+        message=message,
+        media=b"replay-bytes",
+    )
+    runtime = _build_runtime(migrated_db_session, telegram_client=fake, phash_tag="Y")
+
+    result = await runtime.replay_post("replay_channel", "42")
+    assert result.meme_file_id is not None
+    assert result.published_at is not None
+
+    await migrated_db_session.refresh(channel)
+    # The checkpoint must NOT regress or advance for an idempotent replay.
+    assert channel.last_read_post_id == "500"
+
+
+async def test_reassign_channel_updates_session_binding(
+    migrated_db_session: AsyncSession,
+) -> None:
+    await _seed_active_session(migrated_db_session, session_name="primary")
+    await _seed_active_session(migrated_db_session, session_name="secondary")
+    channel = await _seed_curated_channel(
+        migrated_db_session,
+        platform_id="movable_channel",
+        session_id="primary",
+    )
+
+    fake = FakeTelegramClient()
+    runtime = _build_runtime(migrated_db_session, telegram_client=fake, phash_tag="X")
+
+    await runtime.reassign_channel("movable_channel", "secondary")
+
+    await migrated_db_session.refresh(channel)
+    assert channel.session_id == "secondary"
+
+
+async def test_reassign_channel_rejects_unknown_session(
+    migrated_db_session: AsyncSession,
+) -> None:
+    await _seed_active_session(migrated_db_session, session_name="primary")
+    await _seed_curated_channel(
+        migrated_db_session,
+        platform_id="guarded_channel",
+        session_id="primary",
+    )
+
+    fake = FakeTelegramClient()
+    runtime = _build_runtime(migrated_db_session, telegram_client=fake, phash_tag="Z")
+
+    with pytest.raises(CrawlerSessionNotRunnableError):
+        await runtime.reassign_channel("guarded_channel", "does_not_exist")
+
+
+# ---------------------------------------------------------------------------
+# Session-not-runnable guard
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "status",
+    [TelegramSessionStatus.STOPPED, TelegramSessionStatus.QUARANTINED],
+)
+async def test_catch_up_channel_refuses_non_active_session(
+    migrated_db_session: AsyncSession,
+    status: TelegramSessionStatus,
+) -> None:
+    row = TelegramSessionState(
+        session_name="idle",
+        status=status,
+        last_heartbeat_at=_now(),
+    )
+    migrated_db_session.add(row)
+    await migrated_db_session.commit()
+    await _seed_curated_channel(
+        migrated_db_session,
+        platform_id="some_channel",
+    )
+
+    fake = FakeTelegramClient()
+    runtime = _build_runtime(migrated_db_session, telegram_client=fake, phash_tag="Q")
+
+    with pytest.raises(CrawlerSessionNotRunnableError):
+        _ = await runtime.catch_up_channel("idle", "some_channel")
+
+

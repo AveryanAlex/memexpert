@@ -30,6 +30,15 @@ tmp/
 
 .artifacts
 .pytest_cache
+.artifacts/s04-runtime-smoke/
+
+# Telegram crawler session files. The directory is kept via .gitkeep so
+# fresh checkouts have a writable session dir, but the session blobs are
+# per-environment secrets and must never be committed. Ignore ``*`` inside
+# the directory rather than the directory itself so git still descends
+# into it and honors the ``.gitkeep`` negation below.
+.telegram-sessions/*
+!.telegram-sessions/.gitkeep
 
 # ── GSD baseline (auto-generated) ──
 .bg-shell/

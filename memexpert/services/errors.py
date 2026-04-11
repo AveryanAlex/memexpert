@@ -287,6 +287,20 @@ class CrawlerPublishError(PipelineIngestError):
     error_code: ClassVar[str] = "crawler_publish_failure"
 
 
+class CrawlerSessionNotRunnableError(PipelineIngestError):
+    """Raised when the crawler runtime is asked to work a non-runnable session.
+
+    A session is "runnable" only when its durable ``TelegramSessionState``
+    row is in the ``active`` status. Stopped, flood-waiting, and
+    quarantined sessions must not accept catch-up or live-listener work —
+    the operator surface is responsible for re-arming the session after a
+    cooldown or ban clears. Raising this error (instead of silently
+    skipping) makes mis-routed catch-up calls a loud configuration bug.
+    """
+
+    error_code: ClassVar[str] = "crawler_session_not_runnable"
+
+
 __all__ = [
     "AccountLinkAlreadyCompletedError",
     "AccountLinkError",
@@ -301,6 +315,7 @@ __all__ = [
     "CollectionWriteAccessError",
     "CrawlerChannelNotTrackedError",
     "CrawlerPublishError",
+    "CrawlerSessionNotRunnableError",
     "DuplicateCollectionInviteError",
     "DuplicateFavoritesCollectionError",
     "DuplicateIdentityError",
