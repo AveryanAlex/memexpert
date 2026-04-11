@@ -6,16 +6,16 @@ import asyncio
 import contextlib
 import io
 import json
-import math
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Protocol
 
 import imagehash
 from PIL import Image, ImageFilter, ImageSequence, ImageStat, UnidentifiedImageError
 
 from memexpert.core.config import Settings, get_settings
+from memexpert.core.media_blurhash import encode_blur_hash
 from memexpert.core.storage import build_web_video_object_key
 from memexpert.models.enums import ContentKind
 
@@ -38,9 +38,6 @@ _MIME_TYPE_TO_EXTENSIONS: dict[str, frozenset[str]] = {
     "video/webm": frozenset({"webm"}),
 }
 _VIDEO_MIME_TYPES = frozenset({"video/mp4", "video/quicktime", "video/webm"})
-_BLURHASH_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz#$%*+,-.:;=?@[]^_{|}~"
-_DEFAULT_BLURHASH_COMPONENTS_X = 4
-_DEFAULT_BLURHASH_COMPONENTS_Y = 3
 _DEFAULT_IMAGE_DURATION_SECONDS = 3.0
 
 
@@ -211,7 +208,7 @@ class PipelineMediaProcessor:
             inspected_media.width,
             inspected_media.height,
         )
-        blur_hash = await asyncio.to_thread(_encode_blur_hash, preview_image)
+        blur_hash = await asyncio.to_thread(encode_blur_hash, preview_image)
 
         with tempfile.TemporaryDirectory(prefix="memexpert-media-") as temp_dir:
             temp_path = Path(temp_dir)
@@ -549,95 +546,6 @@ def _compute_quality_score(image: Image.Image, width: int, height: int) -> float
     sharpness_score = min(edge_stats.mean[0] / 96.0, 1.0)
     combined = (0.45 * resolution_score) + (0.25 * contrast_score) + (0.30 * sharpness_score)
     return round(max(0.0, min(combined, 1.0)), 4)
-
-
-def _encode_blur_hash(image: Image.Image) -> str | None:
-    resized = image.convert("RGB").resize((32, 32), Image.Resampling.LANCZOS)
-    width, height = resized.size
-    if width <= 0 or height <= 0:
-        return None
-
-    factors: list[tuple[float, float, float]] = []
-    for component_y in range(_DEFAULT_BLURHASH_COMPONENTS_Y):
-        for component_x in range(_DEFAULT_BLURHASH_COMPONENTS_X):
-            normalization = 1.0 if component_x == 0 and component_y == 0 else 2.0
-            red = 0.0
-            green = 0.0
-            blue = 0.0
-            for y in range(height):
-                for x in range(width):
-                    basis = normalization * math.cos(math.pi * component_x * x / width) * math.cos(
-                        math.pi * component_y * y / height
-                    )
-                    pixel_red, pixel_green, pixel_blue = cast(
-                        "tuple[int, int, int]",
-                        resized.getpixel((x, y)),
-                    )
-                    red += basis * _srgb_to_linear(pixel_red)
-                    green += basis * _srgb_to_linear(pixel_green)
-                    blue += basis * _srgb_to_linear(pixel_blue)
-            scale = 1.0 / float(width * height)
-            factors.append((red * scale, green * scale, blue * scale))
-
-    dc = factors[0]
-    ac = factors[1:]
-    maximum_value = max((max(abs(r), abs(g), abs(b)) for r, g, b in ac), default=0.0)
-    quantized_maximum_value = max(0, min(82, int(math.floor((maximum_value * 166.0) - 0.5))))
-    actual_maximum_value = (quantized_maximum_value + 1) / 166.0
-
-    encoded = [
-        _encode_base83((_DEFAULT_BLURHASH_COMPONENTS_X - 1) + ((_DEFAULT_BLURHASH_COMPONENTS_Y - 1) * 9), 1),
-        _encode_base83(quantized_maximum_value, 1),
-        _encode_base83(_encode_dc(dc), 4),
-    ]
-    encoded.extend(_encode_base83(_encode_ac(factor, actual_maximum_value), 2) for factor in ac)
-    return "".join(encoded)
-
-
-def _encode_dc(value: tuple[float, float, float]) -> int:
-    red = _linear_to_srgb(value[0])
-    green = _linear_to_srgb(value[1])
-    blue = _linear_to_srgb(value[2])
-    return (red << 16) + (green << 8) + blue
-
-
-def _encode_ac(value: tuple[float, float, float], maximum_value: float) -> int:
-    if maximum_value <= 0.0:
-        return 9 * 19 * 19 + 9 * 19 + 9
-    quantized_red = int(max(0, min(18, math.floor((_sign_pow(value[0] / maximum_value, 0.5) * 9) + 9.5))))
-    quantized_green = int(max(0, min(18, math.floor((_sign_pow(value[1] / maximum_value, 0.5) * 9) + 9.5))))
-    quantized_blue = int(max(0, min(18, math.floor((_sign_pow(value[2] / maximum_value, 0.5) * 9) + 9.5))))
-    return (quantized_red * 19 * 19) + (quantized_green * 19) + quantized_blue
-
-
-def _encode_base83(value: int, length: int) -> str:
-    encoded = []
-    divisor = 1
-    for _ in range(length - 1):
-        divisor *= 83
-    for _ in range(length):
-        digit = (value // divisor) % 83
-        encoded.append(_BLURHASH_ALPHABET[digit])
-        divisor //= 83
-    return "".join(encoded)
-
-
-def _srgb_to_linear(value: int) -> float:
-    normalized = value / 255.0
-    if normalized <= 0.04045:
-        return normalized / 12.92
-    return float(((normalized + 0.055) / 1.055) ** 2.4)
-
-
-def _linear_to_srgb(value: float) -> int:
-    clamped = max(0.0, min(value, 1.0))
-    if clamped <= 0.0031308:
-        return int((clamped * 12.92 * 255.0) + 0.5)
-    return int((((1.055 * (clamped ** (1.0 / 2.4))) - 0.055) * 255.0) + 0.5)
-
-
-def _sign_pow(value: float, exponent: float) -> float:
-    return math.copysign(abs(value) ** exponent, value)
 
 
 __all__ = [
