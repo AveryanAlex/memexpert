@@ -11,7 +11,9 @@ from memexpert.api.dependencies import (
     AccountLinkServiceDep,
     AuthServiceDep,
     CurrentUserDep,
+    ForbidFullAccountCallerDep,
     GuestUserDep,
+    OptionalGuestUserDep,
     ProviderAuthServiceDep,
     to_auth_http_error,
 )
@@ -76,16 +78,31 @@ async def create_guest_session(
 async def signup_with_email(
     request: Request,
     response: Response,
-    provider_auth_service: ProviderAuthServiceDep,
+    _guard: ForbidFullAccountCallerDep,
+    optional_guest: OptionalGuestUserDep,
+    account_link_service: AccountLinkServiceDep,
+    auth_service: AuthServiceDep,
     credentials: Annotated[EmailSignupRequest, Body()],
 ) -> AuthSessionRead:
-    """Create a full account, issue a session immediately, and keep the refresh token cookie-only."""
+    """Create a full account via the unified guest-upgrade writer path.
+
+    If the caller holds a guest session, that guest is upgraded in place;
+    otherwise ``AccountLinkService`` bootstraps a throwaway guest inside
+    the same transaction and upgrades it in one commit so the user
+    experience matches a direct signup while the writer path stays
+    single-source-of-truth.
+    """
 
     try:
-        auth_session = await provider_auth_service.signup_with_email(
+        link_result = await account_link_service.link_guest_with_email_signup(
+            guest_user_id=optional_guest.id if optional_guest else None,
             email=credentials.email,
             password=credentials.password,
+        )
+        auth_session = await auth_service.issue_session_for_user(
+            link_result.user,
             device_info=request.headers.get("user-agent"),
+            reload_user=False,
         )
     except AuthServiceError as exc:
         raise to_auth_http_error(exc) from exc

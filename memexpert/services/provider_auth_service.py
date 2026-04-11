@@ -166,32 +166,6 @@ class ProviderAuthService:
             user_service=user_service,
         )
 
-    async def signup_with_email(
-        self,
-        *,
-        email: str,
-        password: str,
-        device_info: str | None = None,
-    ) -> AuthSession:
-        """Create a full account with a bcrypt password hash and issue a session."""
-
-        signup_identity = self.prepare_email_signup_identity(email=email, password=password)
-
-        try:
-            user = await self._user_service.create_full_user(
-                email=signup_identity.email,
-                password_hash=signup_identity.password_hash,
-                commit=False,
-            )
-        except DuplicateIdentityError as exc:
-            raise EmailAlreadyInUseError("Email is already in use.") from exc
-
-        return await self._auth_service.issue_session_for_user(
-            user,
-            device_info=device_info,
-            reload_user=False,
-        )
-
     async def login_with_email(
         self,
         *,

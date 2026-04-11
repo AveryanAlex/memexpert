@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import TYPE_CHECKING
 
 import bcrypt
@@ -12,8 +13,10 @@ from memexpert.models.collection import Collection
 from memexpert.models.enums import AccountStatus, AccountType, CollectionKind
 from memexpert.models.user import RefreshToken, User
 from memexpert.services import (
+    AccountLinkService,
     AccountUnavailableError,
     AuthConfigurationError,
+    AuthService,
     EmailAlreadyInUseError,
     InvalidCredentialsError,
     ProviderAuthService,
@@ -25,6 +28,9 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
 PASSWORD = "correct-horse-battery"
+JWT_SECRET = "email-service-test-jwt-secret-with-32-byte-minimum"
+ACCESS_TOKEN_TTL = timedelta(minutes=15)
+REFRESH_TOKEN_TTL = timedelta(days=30)
 
 
 def build_provider_auth_service(
@@ -38,6 +44,23 @@ def build_provider_auth_service(
     )
 
 
+def build_auth_service(session: AsyncSession) -> AuthService:
+    return AuthService(
+        session,
+        jwt_secret=JWT_SECRET,
+        access_token_ttl=ACCESS_TOKEN_TTL,
+        refresh_token_ttl=REFRESH_TOKEN_TTL,
+        refresh_cookie_secure=False,
+    )
+
+
+def build_account_link_service(session: AsyncSession) -> AccountLinkService:
+    return AccountLinkService(
+        session,
+        provider_auth_service=ProviderAuthService(session, password_hash_rounds=12),
+    )
+
+
 def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(rounds=12)).decode("utf-8")
 
@@ -45,12 +68,18 @@ def hash_password(password: str) -> str:
 async def test_email_signup_hashes_password_bootstraps_favorites_and_issues_session(
     migrated_db_session: AsyncSession,
 ) -> None:
-    provider_auth_service = build_provider_auth_service(migrated_db_session)
+    link_service = build_account_link_service(migrated_db_session)
+    auth_service = build_auth_service(migrated_db_session)
 
-    auth_session = await provider_auth_service.signup_with_email(
+    link_result = await link_service.link_guest_with_email_signup(
+        guest_user_id=None,
         email="  NewUser@Example.COM ",
         password=PASSWORD,
+    )
+    auth_session = await auth_service.issue_session_for_user(
+        link_result.user,
         device_info="  Firefox on macOS  ",
+        reload_user=False,
     )
     public_session = auth_session.to_read()
 
@@ -88,12 +117,22 @@ async def test_email_signup_hashes_password_bootstraps_favorites_and_issues_sess
 async def test_email_signup_rejects_duplicate_email_and_invalid_hashing_config(
     migrated_db_session: AsyncSession,
 ) -> None:
-    provider_auth_service = build_provider_auth_service(migrated_db_session)
+    link_service = build_account_link_service(migrated_db_session)
+    auth_service = build_auth_service(migrated_db_session)
 
-    _ = await provider_auth_service.signup_with_email(email="owner@example.com", password=PASSWORD)
+    first_result = await link_service.link_guest_with_email_signup(
+        guest_user_id=None,
+        email="owner@example.com",
+        password=PASSWORD,
+    )
+    _ = await auth_service.issue_session_for_user(first_result.user, reload_user=False)
 
     with pytest.raises(EmailAlreadyInUseError, match="already in use"):
-        _ = await provider_auth_service.signup_with_email(email=" OWNER@example.com ", password=PASSWORD)
+        _ = await link_service.link_guest_with_email_signup(
+            guest_user_id=None,
+            email=" OWNER@example.com ",
+            password=PASSWORD,
+        )
 
     user_count_result = await migrated_db_session.execute(select(func.count()).select_from(User))
     refresh_token_count_result = await migrated_db_session.execute(select(func.count()).select_from(RefreshToken))

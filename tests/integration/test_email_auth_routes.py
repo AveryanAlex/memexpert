@@ -102,12 +102,46 @@ async def test_email_signup_route_rejects_duplicate_email_with_typed_conflict(
     assert "already in use" in response.json()["detail"].lower()
 
     async with postgres_session_factory() as session:
+        total_user_count_result = await session.execute(select(func.count()).select_from(User))
         user_count_result = await session.execute(
             select(func.count()).select_from(User).where(User.email == "duplicate@example.com")
         )
         refresh_token_count_result = await session.execute(select(func.count()).select_from(RefreshToken))
+        # R1: bootstrap rollback — the transient guest created inside
+        # AccountLinkService for the failing signup must not leak, so the
+        # only user row is the seeded duplicate and zero refresh tokens
+        # reference a throwaway bootstrap.
+        assert total_user_count_result.scalar_one() == 1
         assert user_count_result.scalar_one() == 1
         assert refresh_token_count_result.scalar_one() == 0
+
+
+async def test_email_signup_route_rejects_full_account_caller_with_guest_required(
+    auth_client: AsyncClient,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """R2: a caller authenticated as a full account may not bootstrap a second account."""
+
+    # First signup creates a full account and primes auth_client's bearer token.
+    signup_response = await auth_client.post(
+        "/api/v1/auth/email/signup",
+        json={"email": "full-caller@example.com", "password": PASSWORD},
+    )
+    assert signup_response.status_code == 201
+    access_token = signup_response.json()["access_token"]
+
+    conflict_response = await auth_client.post(
+        "/api/v1/auth/email/signup",
+        headers={"Authorization": f"Bearer {access_token}"},
+        json={"email": "second-account@example.com", "password": PASSWORD},
+    )
+
+    assert conflict_response.status_code == 403
+    assert conflict_response.json()["code"] == "guest_account_required"
+
+    async with postgres_session_factory() as session:
+        total_user_count_result = await session.execute(select(func.count()).select_from(User))
+        assert total_user_count_result.scalar_one() == 1
 
 
 @pytest.mark.parametrize(
