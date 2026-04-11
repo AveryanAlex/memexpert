@@ -121,6 +121,26 @@ SYNC_STAGE_BY_TARGET: dict[SyncTargetKind, ContentPipelineStage] = {
     SyncTargetKind.MEILISEARCH: ContentPipelineStage.SYNC_MEILI,
 }
 
+# Dispatch event emitted after a successful per-target sync commit. Keeping
+# the mapping here lets the service express the Qdrant/Meilisearch success
+# flow as one target-parameterized method instead of two nearly-identical
+# twins, and it stays close to ``SYNC_STAGE_BY_TARGET`` so adding a new
+# target is a single-place edit.
+SYNC_SUCCESS_EVENT_TYPE_BY_TARGET: dict[SyncTargetKind, ContentPipelineEventType] = {
+    SyncTargetKind.QDRANT: ContentPipelineEventType.MEME_QDRANT_SYNCED,
+    SyncTargetKind.MEILISEARCH: ContentPipelineEventType.MEME_MEILI_SYNCED,
+}
+
+# Normalized-reason marker that classifies a per-target sync failure as
+# non-retryable. The runtime owns the exception-to-reason mapping and the
+# service honors it verbatim, so we need a per-target lookup to decide
+# retryability without hard-coding Qdrant/Meilisearch literals in the
+# service flow.
+SYNC_MALFORMED_REASON_BY_TARGET: dict[SyncTargetKind, str] = {
+    SyncTargetKind.QDRANT: PIPELINE_REASON_SYNC_QDRANT_MALFORMED_PAYLOAD,
+    SyncTargetKind.MEILISEARCH: PIPELINE_REASON_SYNC_MEILI_MALFORMED_PAYLOAD,
+}
+
 
 __all__ = [
     "ACTIVE_STAGE_STATUSES",
@@ -139,6 +159,8 @@ __all__ = [
     "PIPELINE_REASON_SYNC_QDRANT_MALFORMED_PAYLOAD",
     "PIPELINE_REASON_SYNC_REPLAY_REQUESTED",
     "STAGE_ORDER",
+    "SYNC_MALFORMED_REASON_BY_TARGET",
     "SYNC_REPLAY_BATCH_MAX",
     "SYNC_STAGE_BY_TARGET",
+    "SYNC_SUCCESS_EVENT_TYPE_BY_TARGET",
 ]

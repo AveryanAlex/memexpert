@@ -786,19 +786,38 @@ class ContentPipelineService:
         event_id: uuid.UUID,
         payload_preview: dict[str, object],
     ) -> PerTargetSyncStatus:
-        """Persist a successful Qdrant sync attempt and publish ``meme_qdrant_synced``.
+        """Persist a successful Qdrant sync attempt and publish ``meme_qdrant_synced``."""
+
+        return await self._complete_sync_target_stage(
+            target=SyncTargetKind.QDRANT,
+            meme_file_id=meme_file_id,
+            attempt=attempt,
+            event_id=event_id,
+            payload_preview=payload_preview,
+        )
+
+    async def _complete_sync_target_stage(
+        self,
+        *,
+        target: SyncTargetKind,
+        meme_file_id: uuid.UUID,
+        attempt: int,
+        event_id: uuid.UUID,
+        payload_preview: dict[str, object],
+    ) -> PerTargetSyncStatus:
+        """Persist a successful per-target sync attempt and publish the success event.
 
         Idempotency: running the method twice with the same ``event_id`` reuses
         the existing snapshot row, re-uses the prior success event id on the
         journal row, and does not bump ``attempt_count`` — operators can safely
         drive repeated stage completion through replay without accumulating
-        spurious attempts or duplicate events.
+        spurious attempts or duplicate events. The Qdrant and Meilisearch
+        flows are strictly symmetric and resolved through
+        ``SYNC_STAGE_BY_TARGET`` and ``SYNC_SUCCESS_EVENT_TYPE_BY_TARGET``.
         """
 
-        meme_file, stage_entry = await self._get_meme_file_and_stage_entry(
-            meme_file_id,
-            ContentPipelineStage.SYNC_QDRANT,
-        )
+        stage = _consts.SYNC_STAGE_BY_TARGET[target]
+        meme_file, stage_entry = await self._get_meme_file_and_stage_entry(meme_file_id, stage)
         ensure_stage_attempt_is_current(stage_entry, attempt=attempt)
 
         already_succeeded = (
@@ -807,13 +826,13 @@ class ContentPipelineService:
         )
 
         preview_model = (
-            _build_sync_preview_model(payload_preview, target=SyncTargetKind.QDRANT)
+            _build_sync_preview_model(payload_preview, target=target)
             if payload_preview
             else None
         )
         await self._upsert_sync_target_snapshot(
             meme_file_id=meme_file_id,
-            target=SyncTargetKind.QDRANT,
+            target=target,
             status=SyncTargetStatus.SYNCED,
             last_event_id=event_id,
             preview=preview_model,
@@ -826,25 +845,25 @@ class ContentPipelineService:
         await self._finalize_stage_success(
             meme_file=meme_file,
             stage_entry=stage_entry,
-            stage=ContentPipelineStage.SYNC_QDRANT,
+            stage=stage,
             attempt=attempt,
             event_id=event_id,
         )
 
         # Idempotent publish: on repeat calls with the same event id we do not
-        # re-emit the MEME_QDRANT_SYNCED event because the commit above is a
-        # no-op under the stage-journal event-id equality check.
+        # re-emit the success event because the commit above is a no-op under
+        # the stage-journal event-id equality check.
         if not already_succeeded:
             await self._publish_sync_success_event(
                 meme_file=meme_file,
                 stage_entry=stage_entry,
-                event_type=ContentPipelineEventType.MEME_QDRANT_SYNCED,
-                stage=ContentPipelineStage.SYNC_QDRANT,
+                event_type=_consts.SYNC_SUCCESS_EVENT_TYPE_BY_TARGET[target],
+                stage=stage,
             )
 
         # Re-read the snapshot for the response projection so the caller sees
         # the committed state, not the in-memory mutation.
-        return await self._load_sync_target_status(meme_file_id, SyncTargetKind.QDRANT)
+        return await self._load_sync_target_status(meme_file_id, target)
 
     async def _publish_sync_success_event(
         self,
@@ -925,38 +944,16 @@ class ContentPipelineService:
         normalized_reason: str,
         last_error_text: str,
     ) -> PerTargetSyncStatus:
-        """Persist a failed Qdrant sync attempt without publishing any success event.
+        """Persist a failed Qdrant sync attempt without publishing any success event."""
 
-        The journal row is delegated to :meth:`mark_stage_failed` so retryability
-        logic stays shared with the S02 heavy stages. Prior ``last_success_at``
-        timestamps and preview payloads are preserved so operators can still see
-        when the target last worked even after a transient failure. Retryability
-        is derived from the normalized-reason constant because the runtime owns
-        the exception-to-reason mapping and the service honors it verbatim.
-        """
-
-        is_retryable = normalized_reason != _consts.PIPELINE_REASON_SYNC_QDRANT_MALFORMED_PAYLOAD
-        await self._upsert_sync_target_snapshot(
-            meme_file_id=meme_file_id,
+        return await self._fail_sync_target_stage(
             target=SyncTargetKind.QDRANT,
-            status=SyncTargetStatus.FAILED,
-            last_event_id=event_id,
-            preview=None,
-            normalized_reason=normalized_reason,
-            last_error_text=last_error_text,
-            bump_attempt=True,
-            record_success=False,
-        )
-        await self.mark_stage_failed(
             meme_file_id=meme_file_id,
-            stage=ContentPipelineStage.SYNC_QDRANT,
             attempt=attempt,
             event_id=event_id,
             normalized_reason=normalized_reason,
             last_error_text=last_error_text,
-            retryable=is_retryable,
         )
-        return await self._load_sync_target_status(meme_file_id, SyncTargetKind.QDRANT)
 
     async def complete_sync_meili_stage(
         self,
@@ -966,64 +963,15 @@ class ContentPipelineService:
         event_id: uuid.UUID,
         payload_preview: dict[str, object],
     ) -> PerTargetSyncStatus:
-        """Persist a successful Meilisearch sync attempt and publish ``meme_meili_synced``.
+        """Persist a successful Meilisearch sync attempt and publish ``meme_meili_synced``."""
 
-        Idempotency: running the method twice with the same ``event_id`` reuses
-        the existing snapshot row, re-uses the prior success event id on the
-        journal row, and does not bump ``attempt_count`` — mirroring the
-        Qdrant path exactly so operators can drive repeated stage completion
-        through replay without accumulating spurious attempts or duplicate
-        events.
-        """
-
-        meme_file, stage_entry = await self._get_meme_file_and_stage_entry(
-            meme_file_id,
-            ContentPipelineStage.SYNC_MEILI,
-        )
-        ensure_stage_attempt_is_current(stage_entry, attempt=attempt)
-
-        already_succeeded = (
-            stage_entry.status is ContentPipelineStageStatus.SUCCEEDED
-            and stage_entry.last_event_id == event_id
-        )
-
-        preview_model = (
-            _build_sync_preview_model(payload_preview, target=SyncTargetKind.MEILISEARCH)
-            if payload_preview
-            else None
-        )
-        await self._upsert_sync_target_snapshot(
-            meme_file_id=meme_file_id,
+        return await self._complete_sync_target_stage(
             target=SyncTargetKind.MEILISEARCH,
-            status=SyncTargetStatus.SYNCED,
-            last_event_id=event_id,
-            preview=preview_model,
-            normalized_reason=None,
-            last_error_text=None,
-            bump_attempt=not already_succeeded,
-            record_success=True,
-        )
-
-        await self._finalize_stage_success(
-            meme_file=meme_file,
-            stage_entry=stage_entry,
-            stage=ContentPipelineStage.SYNC_MEILI,
+            meme_file_id=meme_file_id,
             attempt=attempt,
             event_id=event_id,
+            payload_preview=payload_preview,
         )
-
-        # Idempotent publish: on repeat calls with the same event id we do not
-        # re-emit the MEME_MEILI_SYNCED event because the commit above is a
-        # no-op under the stage-journal event-id equality check.
-        if not already_succeeded:
-            await self._publish_sync_success_event(
-                meme_file=meme_file,
-                stage_entry=stage_entry,
-                event_type=ContentPipelineEventType.MEME_MEILI_SYNCED,
-                stage=ContentPipelineStage.SYNC_MEILI,
-            )
-
-        return await self._load_sync_target_status(meme_file_id, SyncTargetKind.MEILISEARCH)
 
     async def fail_sync_meili_stage(
         self,
@@ -1034,21 +982,42 @@ class ContentPipelineService:
         normalized_reason: str,
         last_error_text: str,
     ) -> PerTargetSyncStatus:
-        """Persist a failed Meilisearch sync attempt without publishing any success event.
+        """Persist a failed Meilisearch sync attempt without publishing any success event."""
+
+        return await self._fail_sync_target_stage(
+            target=SyncTargetKind.MEILISEARCH,
+            meme_file_id=meme_file_id,
+            attempt=attempt,
+            event_id=event_id,
+            normalized_reason=normalized_reason,
+            last_error_text=last_error_text,
+        )
+
+    async def _fail_sync_target_stage(
+        self,
+        *,
+        target: SyncTargetKind,
+        meme_file_id: uuid.UUID,
+        attempt: int,
+        event_id: uuid.UUID,
+        normalized_reason: str,
+        last_error_text: str,
+    ) -> PerTargetSyncStatus:
+        """Persist a failed per-target sync attempt without publishing any success event.
 
         The journal row is delegated to :meth:`mark_stage_failed` so retryability
-        logic stays shared with the S02 heavy stages and the Qdrant sync path.
-        Prior ``last_success_at`` timestamps and preview payloads are preserved
-        so operators can still see when the target last worked even after a
-        transient failure. Retryability is derived from the normalized-reason
-        constant because the runtime owns the exception-to-reason mapping and
-        the service honors it verbatim.
+        logic stays shared with the S02 heavy stages. Prior ``last_success_at``
+        timestamps and preview payloads are preserved so operators can still see
+        when the target last worked even after a transient failure. Retryability
+        is derived from the per-target malformed-payload reason because the
+        runtime owns the exception-to-reason mapping and the service honors it
+        verbatim.
         """
 
-        is_retryable = normalized_reason != _consts.PIPELINE_REASON_SYNC_MEILI_MALFORMED_PAYLOAD
+        is_retryable = normalized_reason != _consts.SYNC_MALFORMED_REASON_BY_TARGET[target]
         await self._upsert_sync_target_snapshot(
             meme_file_id=meme_file_id,
-            target=SyncTargetKind.MEILISEARCH,
+            target=target,
             status=SyncTargetStatus.FAILED,
             last_event_id=event_id,
             preview=None,
@@ -1059,14 +1028,14 @@ class ContentPipelineService:
         )
         await self.mark_stage_failed(
             meme_file_id=meme_file_id,
-            stage=ContentPipelineStage.SYNC_MEILI,
+            stage=_consts.SYNC_STAGE_BY_TARGET[target],
             attempt=attempt,
             event_id=event_id,
             normalized_reason=normalized_reason,
             last_error_text=last_error_text,
             retryable=is_retryable,
         )
-        return await self._load_sync_target_status(meme_file_id, SyncTargetKind.MEILISEARCH)
+        return await self._load_sync_target_status(meme_file_id, target)
 
     async def replay_sync_target(
         self,
