@@ -18,8 +18,6 @@ from memexpert.api.dependencies import (
 )
 from memexpert.core.config import get_settings
 from memexpert.schemas.auth import (
-    AccountLinkMergeSummaryRead,
-    AccountLinkResponseRead,
     AuthSessionRead,
     EmailLoginRequest,
     EmailSignupRequest,
@@ -32,7 +30,6 @@ from memexpert.schemas.auth import (
 )
 from memexpert.schemas.user import UserRead
 from memexpert.services import (
-    AccountLinkResult,
     AuthenticatedUserNotFoundError,
     AuthServiceError,
     AuthSession,
@@ -193,107 +190,6 @@ async def login_with_google(
 
     _set_refresh_cookie(response, auth_session)
     return auth_session.to_read()
-
-
-@router.post(
-    "/link/email/signup",
-    response_model=AccountLinkResponseRead,
-    responses=AUTH_ERROR_RESPONSES,
-    summary="Link a guest account by creating email/password credentials",
-)
-async def link_guest_with_email_signup(
-    request: Request,
-    response: Response,
-    guest_user: GuestUserDep,
-    account_link_service: AccountLinkServiceDep,
-    auth_service: AuthServiceDep,
-    credentials: Annotated[EmailSignupRequest, Body()],
-) -> AccountLinkResponseRead:
-    """Upgrade the current guest in place with email/password credentials and issue a canonical session."""
-
-    try:
-        link_result = await account_link_service.link_guest_with_email_signup(
-            guest_user_id=guest_user.id,
-            email=credentials.email,
-            password=credentials.password,
-        )
-        auth_session = await auth_service.issue_session_for_user(
-            link_result.user,
-            device_info=request.headers.get("user-agent"),
-            reload_user=False,
-        )
-    except AuthServiceError as exc:
-        raise to_auth_http_error(exc) from exc
-
-    _set_refresh_cookie(response, auth_session)
-    return _build_account_link_response(auth_session=auth_session, link_result=link_result)
-
-
-@router.post(
-    "/link/email/login",
-    response_model=AccountLinkResponseRead,
-    responses=AUTH_ERROR_RESPONSES,
-    summary="Link a guest account to an existing email/password account",
-)
-async def link_guest_with_email_login(
-    request: Request,
-    response: Response,
-    guest_user: GuestUserDep,
-    account_link_service: AccountLinkServiceDep,
-    auth_service: AuthServiceDep,
-    credentials: Annotated[EmailLoginRequest, Body()],
-) -> AccountLinkResponseRead:
-    """Merge the current guest into the canonical email/password account and issue a fresh session."""
-
-    try:
-        link_result = await account_link_service.link_guest_with_email_login(
-            guest_user_id=guest_user.id,
-            email=credentials.email,
-            password=credentials.password,
-        )
-        auth_session = await auth_service.issue_session_for_user(
-            link_result.user,
-            device_info=request.headers.get("user-agent"),
-            reload_user=False,
-        )
-    except AuthServiceError as exc:
-        raise to_auth_http_error(exc) from exc
-
-    _set_refresh_cookie(response, auth_session)
-    return _build_account_link_response(auth_session=auth_session, link_result=link_result)
-
-
-@router.post(
-    "/link/google",
-    response_model=AccountLinkResponseRead,
-    responses=AUTH_ERROR_RESPONSES,
-    summary="Link a guest account with Google OAuth",
-)
-async def link_guest_with_google(
-    request: Request,
-    response: Response,
-    guest_user: GuestUserDep,
-    account_link_service: AccountLinkServiceDep,
-    auth_service: AuthServiceDep,
-    credentials: Annotated[GoogleAuthRequest, Body()],
-) -> AccountLinkResponseRead:
-    """Link the current guest with Google and issue a fresh canonical session on success."""
-
-    try:
-        link_result = await account_link_service.link_guest_with_google_code(
-            guest_user_id=guest_user.id,
-            code=credentials.code,
-        )
-        auth_session = await auth_service.issue_session_for_user(
-            link_result.user,
-            device_info=request.headers.get("user-agent"),
-            reload_user=False,
-        )
-    except AuthServiceError as exc:
-        raise to_auth_http_error(exc) from exc
-
-    _set_refresh_cookie(response, auth_session)
-    return _build_account_link_response(auth_session=auth_session, link_result=link_result)
 
 
 @router.post(
@@ -491,29 +387,6 @@ def _build_linked_providers_read(linked_providers: LinkedProvidersProjection) ->
         has_password=linked_providers.has_password,
         google_linked=linked_providers.google_linked,
         telegram_linked=linked_providers.telegram_linked,
-    )
-
-
-def _build_account_link_response(
-    *,
-    auth_session: AuthSession,
-    link_result: AccountLinkResult,
-) -> AccountLinkResponseRead:
-    return AccountLinkResponseRead(
-        session=auth_session.to_read(),
-        linked_providers=_build_linked_providers_read(link_result.linked_providers),
-        merge_summary=AccountLinkMergeSummaryRead(
-            merge_performed=link_result.merge_performed,
-            merge_log_id=link_result.merge_log_id,
-            guest_user_id=link_result.guest_user_id,
-            canonical_user_id=link_result.canonical_user_id,
-            deleted_guest_user_id=link_result.deleted_guest_user_id,
-            favorites_transferred=link_result.favorites_transferred,
-            duplicate_favorites_skipped=link_result.duplicate_favorites_skipped,
-            analytics_events_transferred=link_result.analytics_events_transferred,
-            inline_usage_events_transferred=link_result.inline_usage_events_transferred,
-            views_transferred=link_result.views_transferred,
-        ),
     )
 
 

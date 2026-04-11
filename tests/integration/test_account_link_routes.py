@@ -160,7 +160,7 @@ async def test_email_signup_link_upgrades_guest_in_place_issues_canonical_sessio
         headers={"Authorization": f"Bearer {guest_access_token}"},
     )
     link_response = await auth_client.post(
-        "/api/v1/auth/link/email/signup",
+        "/api/v1/auth/email/signup",
         headers={
             "Authorization": f"Bearer {guest_access_token}",
             "User-Agent": "Link Safari",
@@ -171,7 +171,7 @@ async def test_email_signup_link_upgrades_guest_in_place_issues_canonical_sessio
         },
     )
     link_payload = link_response.json()
-    canonical_access_token = link_payload["session"]["access_token"]
+    canonical_access_token = link_payload["access_token"]
     linked_providers_response = await auth_client.get(
         "/api/v1/auth/linked-providers",
         headers={"Authorization": f"Bearer {canonical_access_token}"},
@@ -191,39 +191,30 @@ async def test_email_signup_link_upgrades_guest_in_place_issues_canonical_sessio
         "telegram_linked": False,
     }
 
-    assert link_response.status_code == 200
-    assert link_payload["session"]["user"]["id"] == str(guest_user_id)
-    assert link_payload["session"]["user"]["account_type"] == "full"
-    assert link_payload["session"]["user"]["email"] == "linkuser@example.com"
-    assert link_payload["session"]["refresh_cookie"]["name"] == cookie_name
+    assert link_response.status_code == 201
+    assert link_payload["user"]["id"] == str(guest_user_id)
+    assert link_payload["user"]["account_type"] == "full"
+    assert link_payload["user"]["email"] == "linkuser@example.com"
+    assert link_payload["refresh_cookie"]["name"] == cookie_name
     assert auth_client.cookies.get(cookie_name) is not None
     assert auth_client.cookies.get(cookie_name) != original_refresh_cookie
     assert "password_hash" not in link_response.text
-    assert link_payload["linked_providers"] == {
+
+    assert linked_providers_response.status_code == 200
+    assert linked_providers_response.json() == {
         "email": "linkuser@example.com",
         "email_verified_at": None,
         "has_password": True,
         "google_linked": False,
         "telegram_linked": False,
     }
-    assert link_payload["merge_summary"] == {
-        "merge_performed": False,
-        "merge_log_id": None,
-        "guest_user_id": str(guest_user_id),
-        "canonical_user_id": str(guest_user_id),
-        "deleted_guest_user_id": None,
-        "favorites_transferred": 0,
-        "duplicate_favorites_skipped": 0,
-        "analytics_events_transferred": 0,
-        "inline_usage_events_transferred": 0,
-        "views_transferred": 0,
-    }
-
-    assert linked_providers_response.status_code == 200
-    assert linked_providers_response.json() == link_payload["linked_providers"]
 
     assert stale_guest_response.status_code == 401
     assert stale_guest_response.json()["code"] == "invalid_token"
+
+    async with postgres_session_factory() as session:
+        merge_log_count_result = await session.execute(select(func.count()).select_from(AccountMergeLog))
+        assert merge_log_count_result.scalar_one() == 0
 
     async with postgres_session_factory() as session:
         persisted_user_result = await session.execute(select(User).where(User.id == guest_user_id))
@@ -263,7 +254,7 @@ async def test_email_login_link_wrong_password_preserves_guest_bearer_and_refres
     original_refresh_cookie = auth_client.cookies.get(cookie_name)
 
     failed_link_response = await auth_client.post(
-        "/api/v1/auth/link/email/login",
+        "/api/v1/auth/email/login",
         headers={"Authorization": f"Bearer {guest_access_token}"},
         json={
             "email": "owner@example.com",
@@ -345,7 +336,7 @@ async def test_email_login_link_route_concurrent_loser_gets_refresh_guided_confl
 
     async def post_link(client: AsyncClient) -> httpx.Response:
         return await client.post(
-            "/api/v1/auth/link/email/login",
+            "/api/v1/auth/email/login",
             headers={
                 "Authorization": f"Bearer {guest_access_token}",
                 "User-Agent": "Race Link Browser",
@@ -417,22 +408,9 @@ async def test_email_login_link_route_concurrent_loser_gets_refresh_guided_confl
                 path=cookie_path,
             )
 
-            assert winner_payload["session"]["user"]["id"] == str(full_user.id)
-            assert winner_payload["session"]["user"]["account_type"] == "full"
-            assert winner_payload["session"]["refresh_cookie"]["name"] == cookie_name
-            assert winner_payload["merge_summary"] == {
-                "merge_performed": True,
-                "merge_log_id": winner_payload["merge_summary"]["merge_log_id"],
-                "guest_user_id": str(guest_user_id),
-                "canonical_user_id": str(full_user.id),
-                "deleted_guest_user_id": str(guest_user_id),
-                "favorites_transferred": 0,
-                "duplicate_favorites_skipped": 0,
-                "analytics_events_transferred": 0,
-                "inline_usage_events_transferred": 0,
-                "views_transferred": 0,
-            }
-            assert winner_payload["merge_summary"]["merge_log_id"] is not None
+            assert winner_payload["user"]["id"] == str(full_user.id)
+            assert winner_payload["user"]["account_type"] == "full"
+            assert winner_payload["refresh_cookie"]["name"] == cookie_name
             assert winner_cookie_value is not None
             assert winner_cookie_value != original_refresh_cookie
             assert winner_response.headers.get("set-cookie") is not None
@@ -509,7 +487,7 @@ async def test_google_link_merges_guest_into_existing_full_and_exposes_linked_pr
     )
     try:
         link_response = await auth_client.post(
-            "/api/v1/auth/link/google",
+            "/api/v1/auth/google",
             headers={
                 "Authorization": f"Bearer {guest_access_token}",
                 "User-Agent": "Google Link Browser",
@@ -520,7 +498,7 @@ async def test_google_link_merges_guest_into_existing_full_and_exposes_linked_pr
         auth_app.dependency_overrides.clear()
 
     link_payload = link_response.json()
-    canonical_access_token = link_payload["session"]["access_token"]
+    canonical_access_token = link_payload["access_token"]
     linked_providers_response = await auth_client.get(
         "/api/v1/auth/linked-providers",
         headers={"Authorization": f"Bearer {canonical_access_token}"},
@@ -531,25 +509,22 @@ async def test_google_link_merges_guest_into_existing_full_and_exposes_linked_pr
     )
 
     assert link_response.status_code == 200
-    assert link_payload["session"]["user"]["id"] == str(full_user.id)
-    assert link_payload["session"]["user"]["account_type"] == "full"
-    assert link_payload["session"]["user"]["email"] == "google-owner@example.com"
-    assert link_payload["linked_providers"] == {
-        "email": "google-owner@example.com",
-        "email_verified_at": link_payload["linked_providers"]["email_verified_at"],
-        "has_password": False,
-        "google_linked": True,
-        "telegram_linked": False,
-    }
-    assert link_payload["merge_summary"]["merge_performed"] is True
-    assert link_payload["merge_summary"]["guest_user_id"] == str(guest_user_id)
-    assert link_payload["merge_summary"]["canonical_user_id"] == str(full_user.id)
-    assert link_payload["merge_summary"]["deleted_guest_user_id"] == str(guest_user_id)
+    assert link_payload["user"]["id"] == str(full_user.id)
+    assert link_payload["user"]["account_type"] == "full"
+    assert link_payload["user"]["email"] == "google-owner@example.com"
     assert auth_client.cookies.get(cookie_name) is not None
     assert len(flow.history) == 2
 
     assert linked_providers_response.status_code == 200
-    assert linked_providers_response.json() == link_payload["linked_providers"]
+    linked_providers_payload = linked_providers_response.json()
+    assert linked_providers_payload == {
+        "email": "google-owner@example.com",
+        "email_verified_at": linked_providers_payload["email_verified_at"],
+        "has_password": False,
+        "google_linked": True,
+        "telegram_linked": False,
+    }
+    assert linked_providers_payload["email_verified_at"] is not None
 
     assert stale_guest_response.status_code == 401
     assert stale_guest_response.json()["code"] == "invalid_token"
@@ -562,12 +537,16 @@ async def test_google_link_merges_guest_into_existing_full_and_exposes_linked_pr
         )
         refresh_token_row = refresh_token_result.scalar_one()
         persisted_full = persisted_full_result.scalar_one()
+        merge_log_count_result = await session.execute(
+            select(func.count()).select_from(AccountMergeLog).where(AccountMergeLog.guest_account_id == guest_user_id)
+        )
 
         assert persisted_full.google_id == "google-link-subject"
         assert persisted_full.email_verified_at is not None
         assert deleted_guest_result.scalar_one_or_none() is None
         assert refresh_token_row.device_info == "Google Link Browser"
         assert refresh_token_row.token_hash != auth_client.cookies.get(cookie_name)
+        assert merge_log_count_result.scalar_one() == 1
 
 
 async def test_google_link_provider_denial_leaves_guest_session_and_cookie_usable(
@@ -591,7 +570,7 @@ async def test_google_link_provider_denial_leaves_guest_session_and_cookie_usabl
     )
     try:
         failed_link_response = await auth_client.post(
-            "/api/v1/auth/link/google",
+            "/api/v1/auth/google",
             headers={"Authorization": f"Bearer {guest_access_token}"},
             json={"code": "denied-google-code"},
         )
@@ -632,44 +611,6 @@ async def test_google_link_provider_denial_leaves_guest_session_and_cookie_usabl
         assert refresh_token_count_result.scalar_one() == 1
 
 
-@pytest.mark.parametrize(
-    ("endpoint", "payload"),
-    [
-        (
-            "/api/v1/auth/link/email/signup",
-            {"email": "fresh-link@example.com", "password": PASSWORD},
-        ),
-        (
-            "/api/v1/auth/link/email/login",
-            {"email": "owner@example.com", "password": PASSWORD},
-        ),
-        (
-            "/api/v1/auth/link/google",
-            {"code": "google-link-code"},
-        ),
-    ],
-)
-async def test_link_routes_require_guest_bearer_tokens_before_any_side_effects(
-    auth_client: AsyncClient,
-    postgres_session_factory: async_sessionmaker[AsyncSession],
-    endpoint: str,
-    payload: dict[str, str],
-) -> None:
-    response = await auth_client.post(endpoint, json=payload)
-
-    assert response.status_code == 401
-    assert response.json()["code"] == "invalid_token"
-
-    async with postgres_session_factory() as session:
-        user_count_result = await session.execute(select(func.count()).select_from(User))
-        refresh_token_count_result = await session.execute(select(func.count()).select_from(RefreshToken))
-        merge_log_count_result = await session.execute(select(func.count()).select_from(AccountMergeLog))
-
-        assert user_count_result.scalar_one() == 0
-        assert refresh_token_count_result.scalar_one() == 0
-        assert merge_log_count_result.scalar_one() == 0
-
-
 async def test_link_routes_reject_full_account_callers_with_guest_only_error(
     auth_client: AsyncClient,
     auth_settings_overrides: dict[str, str],
@@ -682,7 +623,7 @@ async def test_link_routes_reject_full_account_callers_with_guest_only_error(
         full_session = await auth_service.issue_session_for_user(full_user)
 
     response = await auth_client.post(
-        "/api/v1/auth/link/email/signup",
+        "/api/v1/auth/email/signup",
         headers={"Authorization": f"Bearer {full_session.access_token}"},
         json={
             "email": "replacement@example.com",
@@ -692,7 +633,7 @@ async def test_link_routes_reject_full_account_callers_with_guest_only_error(
 
     assert response.status_code == 403
     assert response.json()["code"] == "guest_account_required"
-    assert "guest" in response.json()["detail"].lower()
+    assert "full-account" in response.json()["detail"].lower()
 
     async with postgres_session_factory() as session:
         user_count_result = await session.execute(select(func.count()).select_from(User))
@@ -762,19 +703,19 @@ async def test_email_login_route_merges_guest_when_guest_bearer_is_present(
     ("endpoint", "payload", "expected_status", "expected_code"),
     [
         (
-            "/api/v1/auth/link/email/signup",
+            "/api/v1/auth/email/signup",
             {"email": "   ", "password": PASSWORD},
             422,
             None,
         ),
         (
-            "/api/v1/auth/link/email/login",
+            "/api/v1/auth/email/login",
             {"email": "owner@example.com", "password": "short"},
             422,
             None,
         ),
         (
-            "/api/v1/auth/link/google",
+            "/api/v1/auth/google",
             {"code": "   "},
             401,
             "provider_payload_invalid",
