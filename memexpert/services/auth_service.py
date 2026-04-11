@@ -1,14 +1,12 @@
 # ruff: noqa: TC003
-"""JWT-backed guest-session auth service and refresh-token rotation helpers."""
+"""JWT-backed auth service with per-user nonce revocation and login-event audit."""
 
 from __future__ import annotations
 
-import hashlib
-import secrets
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Final, Literal, Self, cast
+from typing import TYPE_CHECKING, Final, Self
 
 import jwt
 from jwt import ExpiredSignatureError
@@ -19,14 +17,9 @@ from sqlalchemy.exc import IntegrityError
 from memexpert.core.config import Settings, get_settings
 from memexpert.models.base import utcnow
 from memexpert.models.enums import AccountStatus, AccountType
-from memexpert.models.user import RefreshToken, User
-from memexpert.schemas.auth import AuthSessionRead, GuestBootstrapRequest, RefreshCookieMetadata
+from memexpert.models.user import LoginEvent, User
+from memexpert.schemas.auth import AuthSessionRead, GuestBootstrapRequest
 from memexpert.schemas.user import UserRead
-from memexpert.services._auth_validation import (
-    normalize_optional_text,
-    require_non_blank,
-    require_positive_int,
-)
 from memexpert.services.errors import (
     AccountUnavailableError,
     AuthConfigurationError,
@@ -35,7 +28,6 @@ from memexpert.services.errors import (
     ExpiredTokenError,
     InvalidTokenError,
     MissingTokenError,
-    RefreshTokenReuseError,
     UpgradeRequiredError,
     UserStateMismatchError,
 )
@@ -45,25 +37,18 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
 ACCESS_TOKEN_TYPE: Final = "access"
-DEFAULT_REFRESH_TOKEN_BYTES: Final = 32
 HS256_ALGORITHM: Final = "HS256"
-REQUIRED_ACCESS_TOKEN_CLAIMS: Final[tuple[str, ...]] = ("sub", "type", "exp", "iat")
-SUPPORTED_SAMESITE_VALUES: Final = frozenset({"lax", "none", "strict"})
-
-type SameSiteMode = Literal["lax", "strict", "none"]
+REQUIRED_ACCESS_TOKEN_CLAIMS: Final[tuple[str, ...]] = ("sub", "type", "exp", "iat", "nonce")
 
 
 @dataclass(slots=True)
 class AuthSession:
-    """Internal auth-session result that carries the raw refresh secret for cookie setting."""
+    """Internal auth-session result returned by every auth write path."""
 
     access_token: str
-    refresh_token: str
     user: UserRead
     expires_in: int
-    refresh_cookie: RefreshCookieMetadata
     issued_at: datetime
-    refresh_expires_at: datetime
 
     def to_read(self) -> AuthSessionRead:
         """Convert the internal session result into the public response schema."""
@@ -72,12 +57,18 @@ class AuthSession:
             access_token=self.access_token,
             expires_in=self.expires_in,
             user=self.user,
-            refresh_cookie=self.refresh_cookie,
         )
 
 
 class AuthService:
-    """Issue, verify, and rotate JWT-backed guest sessions with DB-backed refresh tokens."""
+    """Issue and verify JWT-backed sessions with nonce-based revocation.
+
+    Every access token carries a ``nonce`` claim snapshot of the user's
+    ``token_nonce`` column at issue time. Verification compares the claim
+    against the live column; a mismatch invalidates the token. "Log out
+    everywhere" bumps the column, which atomically kills every outstanding
+    JWT for that user without any server-side session store.
+    """
 
     def __init__(
         self,
@@ -85,30 +76,14 @@ class AuthService:
         *,
         jwt_secret: str,
         access_token_ttl: timedelta,
-        refresh_token_ttl: timedelta,
         access_token_algorithm: str = HS256_ALGORITHM,
-        refresh_cookie_name: str = "memexpert_refresh_token",
-        refresh_cookie_secure: bool = True,
-        refresh_cookie_httponly: bool = True,
-        refresh_cookie_samesite: str = "lax",
-        refresh_cookie_path: str = "/api/v1/auth/refresh",
-        refresh_cookie_domain: str | None = None,
-        refresh_token_bytes: int = DEFAULT_REFRESH_TOKEN_BYTES,
         user_service: UserService | None = None,
     ) -> None:
         self._session: AsyncSession = session
         self._user_service: UserService = user_service or UserService(session)
         self._jwt_secret: str = self._require_jwt_secret(jwt_secret)
         self._access_token_ttl: timedelta = self._require_positive_ttl("access_token_ttl", access_token_ttl)
-        self._refresh_token_ttl: timedelta = self._require_positive_ttl("refresh_token_ttl", refresh_token_ttl)
         self._access_token_algorithm: str = self._require_algorithm(access_token_algorithm)
-        self._refresh_cookie_name: str = require_non_blank("refresh_cookie_name", refresh_cookie_name)
-        self._refresh_cookie_secure: bool = refresh_cookie_secure
-        self._refresh_cookie_httponly: bool = refresh_cookie_httponly
-        self._refresh_cookie_samesite: SameSiteMode = self._normalize_same_site(refresh_cookie_samesite)
-        self._refresh_cookie_path: str = require_non_blank("refresh_cookie_path", refresh_cookie_path)
-        self._refresh_cookie_domain: str | None = normalize_optional_text(refresh_cookie_domain)
-        self._refresh_token_bytes: int = require_positive_int("refresh_token_bytes", refresh_token_bytes)
 
     @classmethod
     def from_settings(
@@ -125,20 +100,16 @@ class AuthService:
             session,
             jwt_secret=resolved_settings.auth_jwt_secret.get_secret_value(),
             access_token_ttl=resolved_settings.auth_access_token_ttl,
-            refresh_token_ttl=resolved_settings.auth_refresh_token_ttl,
             access_token_algorithm=resolved_settings.auth_access_token_algorithm,
-            refresh_cookie_name=resolved_settings.auth_refresh_cookie_name,
-            refresh_cookie_secure=resolved_settings.auth_refresh_cookie_secure,
-            refresh_cookie_httponly=resolved_settings.auth_refresh_cookie_httponly,
-            refresh_cookie_samesite=resolved_settings.auth_refresh_cookie_samesite,
-            refresh_cookie_path=resolved_settings.auth_refresh_cookie_path,
-            refresh_cookie_domain=resolved_settings.auth_refresh_cookie_domain,
             user_service=user_service,
         )
 
     async def create_guest_session(
         self,
         request: GuestBootstrapRequest | None = None,
+        *,
+        ip_address: str | None = None,
+        user_agent: str | None = None,
     ) -> AuthSession:
         """Create a guest user via UserService and immediately issue a session for it."""
 
@@ -147,30 +118,33 @@ class AuthService:
             language=resolved_request.language,
             nsfw_enabled=resolved_request.nsfw_enabled,
         )
-        return await self.issue_session_for_user(guest_user, device_info=resolved_request.device_info)
+        return await self.issue_session_for_user(
+            guest_user,
+            ip_address=ip_address,
+            user_agent=user_agent or resolved_request.device_info,
+        )
 
     async def issue_session_for_user(
         self,
         user: UserRead,
         *,
-        device_info: str | None = None,
+        ip_address: str | None = None,
+        user_agent: str | None = None,
         reload_user: bool = True,
     ) -> AuthSession:
-        """Issue a new access token and persisted opaque refresh token for a user."""
+        """Mint a fresh access token and record a login-event audit row."""
 
         current_user = await self._get_user_by_id(user.id) if reload_user else user
         self._ensure_account_is_available(current_user)
         issued_at = utcnow()
         access_token = self._encode_access_token(current_user, issued_at=issued_at)
-        refresh_token = self._generate_refresh_token()
-        refresh_expires_at = issued_at + self._refresh_token_ttl
 
         self._session.add(
-            RefreshToken(
+            LoginEvent(
                 user_id=current_user.id,
-                token_hash=self.hash_refresh_token(refresh_token),
-                device_info=normalize_optional_text(device_info),
-                expires_at=refresh_expires_at,
+                ip_address=_truncate(ip_address, 45),
+                user_agent=_truncate(user_agent, 2048),
+                occurred_at=issued_at,
             )
         )
 
@@ -178,81 +152,13 @@ class AuthService:
             await self._session.commit()
         except IntegrityError as exc:
             await self._session.rollback()
-            raise AuthServiceError("Failed to persist the refresh token.") from exc
+            raise AuthServiceError("Failed to persist the login event.") from exc
 
         return AuthSession(
             access_token=access_token,
-            refresh_token=refresh_token,
             user=current_user,
             expires_in=int(self._access_token_ttl.total_seconds()),
-            refresh_cookie=self._build_refresh_cookie_metadata(),
             issued_at=issued_at,
-            refresh_expires_at=refresh_expires_at,
-        )
-
-    async def rotate_refresh_token(
-        self,
-        refresh_token: str,
-        *,
-        device_info: str | None = None,
-    ) -> AuthSession:
-        """Rotate a persisted refresh token transactionally and mint replacement credentials."""
-
-        token_hash = self.hash_refresh_token(refresh_token)
-        now = utcnow()
-        result = await self._session.execute(
-            select(RefreshToken)
-            .where(RefreshToken.token_hash == token_hash)
-            .with_for_update()
-        )
-        refresh_token_row = result.scalar_one_or_none()
-        if refresh_token_row is None:
-            raise InvalidTokenError("Refresh token is invalid.")
-
-        refresh_token_row.last_used_at = now
-
-        if refresh_token_row.revoked_at is not None:
-            await self._commit_diagnostics("Failed to persist revoked refresh-token reuse diagnostics.")
-            raise RefreshTokenReuseError("Refresh token has already been revoked.")
-
-        if refresh_token_row.expires_at <= now:
-            await self._commit_diagnostics("Failed to persist expired refresh-token diagnostics.")
-            raise ExpiredTokenError("Refresh token has expired.")
-
-        current_user = await self._get_user_by_id(refresh_token_row.user_id)
-        try:
-            self._ensure_account_is_available(current_user)
-        except AccountUnavailableError:
-            await self._commit_diagnostics("Failed to persist unavailable-account refresh diagnostics.")
-            raise
-        replacement_refresh_token = self._generate_refresh_token()
-        refresh_token_row.revoked_at = now
-        replacement_expires_at = now + self._refresh_token_ttl
-        access_token = self._encode_access_token(current_user, issued_at=now)
-
-        self._session.add(
-            RefreshToken(
-                user_id=current_user.id,
-                token_hash=self.hash_refresh_token(replacement_refresh_token),
-                device_info=normalize_optional_text(device_info) or refresh_token_row.device_info,
-                expires_at=replacement_expires_at,
-            )
-        )
-
-        try:
-            await self._session.commit()
-        except IntegrityError as exc:
-            await self._session.rollback()
-            raise AuthServiceError("Failed to rotate the refresh token.") from exc
-
-        return AuthSession(
-            access_token=access_token,
-            refresh_token=replacement_refresh_token,
-            user=current_user,
-            expires_in=int(self._access_token_ttl.total_seconds()),
-            refresh_cookie=self._build_refresh_cookie_metadata(),
-            issued_at=now,
-            refresh_expires_at=replacement_expires_at,
         )
 
     async def verify_access_token(
@@ -273,7 +179,16 @@ class AuthService:
         except ValueError as exc:
             raise InvalidTokenError("Access token subject is invalid.") from exc
 
+        claimed_nonce = payload.get("nonce")
+        if not isinstance(claimed_nonce, int):
+            raise InvalidTokenError("Access token nonce is invalid.")
+
         current_user = await self._get_user_by_id(user_id)
+        if current_user.token_nonce != claimed_nonce:
+            raise InvalidTokenError(
+                "Session has been revoked; please sign in again.",
+            )
+
         token_account_type = payload.get("account_type")
         if token_account_type is not None and token_account_type != current_user.account_type.value:
             raise UserStateMismatchError(
@@ -287,15 +202,6 @@ class AuthService:
 
         return current_user
 
-    @staticmethod
-    def hash_refresh_token(refresh_token: str) -> str:
-        """Return the SHA256 hex digest used for persisted refresh-token storage."""
-
-        normalized_refresh_token = refresh_token.strip()
-        if not normalized_refresh_token:
-            raise MissingTokenError("Refresh token is required.")
-        return hashlib.sha256(normalized_refresh_token.encode("utf-8")).hexdigest()
-
     async def _get_user_by_id(self, user_id: uuid.UUID) -> UserRead:
         result = await self._session.execute(select(User).where(User.id == user_id))
         user = result.scalar_one_or_none()
@@ -304,13 +210,6 @@ class AuthService:
                 f"Authenticated user {user_id} no longer exists.",
             )
         return UserRead.model_validate(user)
-
-    async def _commit_diagnostics(self, message: str) -> None:
-        try:
-            await self._session.commit()
-        except IntegrityError as exc:
-            await self._session.rollback()
-            raise AuthServiceError(message) from exc
 
     @staticmethod
     def _ensure_account_is_available(user: UserRead) -> None:
@@ -324,6 +223,7 @@ class AuthService:
             "type": ACCESS_TOKEN_TYPE,
             "iat": issued_at,
             "exp": expires_at,
+            "nonce": user.token_nonce,
             "account_type": user.account_type.value,
         }
         return jwt.encode(
@@ -354,20 +254,6 @@ class AuthService:
 
         return payload
 
-    def _build_refresh_cookie_metadata(self) -> RefreshCookieMetadata:
-        return RefreshCookieMetadata(
-            name=self._refresh_cookie_name,
-            path=self._refresh_cookie_path,
-            max_age=int(self._refresh_token_ttl.total_seconds()),
-            secure=self._refresh_cookie_secure,
-            http_only=self._refresh_cookie_httponly,
-            same_site=self._refresh_cookie_samesite,
-            domain=self._refresh_cookie_domain,
-        )
-
-    def _generate_refresh_token(self) -> str:
-        return secrets.token_urlsafe(self._refresh_token_bytes)
-
     @staticmethod
     def _require_jwt_secret(value: str) -> str:
         normalized_value = value.strip()
@@ -392,14 +278,14 @@ class AuthService:
             )
         return normalized_value
 
-    @staticmethod
-    def _normalize_same_site(value: str) -> SameSiteMode:
-        normalized_value = value.strip().lower()
-        if normalized_value not in SUPPORTED_SAMESITE_VALUES:
-            raise AuthConfigurationError(
-                "refresh_cookie_samesite must be one of: lax, strict, none.",
-            )
-        return cast("SameSiteMode", normalized_value)
+
+def _truncate(value: str | None, limit: int) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    if not normalized:
+        return None
+    return normalized[:limit]
 
 
 __all__ = ["ACCESS_TOKEN_TYPE", "AuthService", "AuthSession", "HS256_ALGORITHM"]

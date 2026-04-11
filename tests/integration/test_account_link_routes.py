@@ -22,7 +22,7 @@ from memexpert.api.dependencies import (
 )
 from memexpert.core.config import get_settings
 from memexpert.models.enums import AccountType
-from memexpert.models.user import AccountMergeLog, RefreshToken, User
+from memexpert.models.user import AccountMergeLog, LoginEvent, User
 from memexpert.services import AccountLinkService, AuthService, ProviderAuthService, UserService
 from tests.conftest import create_full_user_via_upgrade
 
@@ -99,10 +99,6 @@ def build_auth_service(
         session,
         jwt_secret=auth_settings_overrides["AUTH_JWT_SECRET"],
         access_token_ttl=ACCESS_TOKEN_TTL,
-        refresh_token_ttl=REFRESH_TOKEN_TTL,
-        refresh_cookie_name=auth_settings_overrides["AUTH_REFRESH_COOKIE_NAME"],
-        refresh_cookie_secure=True,
-        refresh_cookie_samesite=auth_settings_overrides["AUTH_REFRESH_COOKIE_SAMESITE"],
     )
 
 
@@ -142,7 +138,6 @@ class CoordinatedRouteMergeAccountLinkService(AccountLinkService):
 
 async def test_email_signup_link_upgrades_guest_in_place_issues_canonical_session_and_updates_read_surface(
     auth_client: AsyncClient,
-    auth_settings_overrides: dict[str, str],
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     guest_response = await auth_client.post(
@@ -152,8 +147,6 @@ async def test_email_signup_link_upgrades_guest_in_place_issues_canonical_sessio
     guest_payload = guest_response.json()
     guest_access_token = guest_payload["access_token"]
     guest_user_id = uuid.UUID(guest_payload["user"]["id"])
-    cookie_name = auth_settings_overrides["AUTH_REFRESH_COOKIE_NAME"]
-    original_refresh_cookie = auth_client.cookies.get(cookie_name)
 
     before_link_response = await auth_client.get(
         "/api/v1/auth/linked-providers",
@@ -195,9 +188,7 @@ async def test_email_signup_link_upgrades_guest_in_place_issues_canonical_sessio
     assert link_payload["user"]["id"] == str(guest_user_id)
     assert link_payload["user"]["account_type"] == "full"
     assert link_payload["user"]["email"] == "linkuser@example.com"
-    assert link_payload["refresh_cookie"]["name"] == cookie_name
-    assert auth_client.cookies.get(cookie_name) is not None
-    assert auth_client.cookies.get(cookie_name) != original_refresh_cookie
+    assert link_payload["token_type"] == "bearer"
     assert "password_hash" not in link_response.text
 
     assert linked_providers_response.status_code == 200
@@ -209,6 +200,10 @@ async def test_email_signup_link_upgrades_guest_in_place_issues_canonical_sessio
         "telegram_linked": False,
     }
 
+    # The upgrade changes the user's account_type from GUEST to FULL, so
+    # the stale bearer's `account_type` claim no longer matches the live
+    # user row and verify_access_token raises UserStateMismatchError
+    # (which the route layer renders as 401 invalid_token).
     assert stale_guest_response.status_code == 401
     assert stale_guest_response.json()["code"] == "invalid_token"
 
@@ -219,29 +214,28 @@ async def test_email_signup_link_upgrades_guest_in_place_issues_canonical_sessio
     async with postgres_session_factory() as session:
         persisted_user_result = await session.execute(select(User).where(User.id == guest_user_id))
         persisted_user = persisted_user_result.scalar_one()
-        refresh_token_rows_result = await session.execute(
-            select(RefreshToken)
-            .where(RefreshToken.user_id == guest_user_id)
-            .order_by(RefreshToken.created_at.asc())
+        login_event_rows_result = await session.execute(
+            select(LoginEvent)
+            .where(LoginEvent.user_id == guest_user_id)
+            .order_by(LoginEvent.created_at.asc())
         )
-        refresh_token_rows = refresh_token_rows_result.scalars().all()
+        login_event_rows = login_event_rows_result.scalars().all()
 
         assert persisted_user.account_type is AccountType.FULL
         assert persisted_user.email == "linkuser@example.com"
         assert persisted_user.password_hash is not None
-        assert len(refresh_token_rows) == 2
-        assert refresh_token_rows[-1].device_info == "Link Safari"
-        assert refresh_token_rows[-1].token_hash != auth_client.cookies.get(cookie_name)
+        assert len(login_event_rows) == 2
+        assert login_event_rows[-1].user_agent == "Link Safari"
 
 
-async def test_email_login_link_wrong_password_preserves_guest_bearer_and_refresh_cookie(
+async def test_email_login_link_wrong_password_leaves_guest_session_intact(
     auth_client: AsyncClient,
-    auth_settings_overrides: dict[str, str],
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     async with postgres_session_factory() as session:
         user_service = UserService(session)
-        _ = await create_full_user_via_upgrade(user_service,
+        _ = await create_full_user_via_upgrade(
+            user_service,
             email="owner@example.com",
             password_hash=hash_password(PASSWORD),
         )
@@ -250,8 +244,6 @@ async def test_email_login_link_wrong_password_preserves_guest_bearer_and_refres
     guest_payload = guest_response.json()
     guest_access_token = guest_payload["access_token"]
     guest_user_id = guest_payload["user"]["id"]
-    cookie_name = auth_settings_overrides["AUTH_REFRESH_COOKIE_NAME"]
-    original_refresh_cookie = auth_client.cookies.get(cookie_name)
 
     failed_link_response = await auth_client.post(
         "/api/v1/auth/email/login",
@@ -261,25 +253,17 @@ async def test_email_login_link_wrong_password_preserves_guest_bearer_and_refres
             "password": "wrong-password",
         },
     )
-    cookie_after_failed_link = auth_client.cookies.get(cookie_name)
     me_response = await auth_client.get(
         "/api/v1/auth/me",
         headers={"Authorization": f"Bearer {guest_access_token}"},
     )
-    refresh_response = await auth_client.post("/api/v1/auth/refresh")
 
     assert failed_link_response.status_code == 401
     assert failed_link_response.json()["code"] == "invalid_credentials"
-    assert cookie_after_failed_link == original_refresh_cookie
 
     assert me_response.status_code == 200
     assert me_response.json()["id"] == guest_user_id
     assert me_response.json()["account_type"] == "guest"
-
-    assert refresh_response.status_code == 200
-    assert refresh_response.json()["user"]["id"] == guest_user_id
-    assert refresh_response.json()["user"]["account_type"] == "guest"
-    assert auth_client.cookies.get(cookie_name) != original_refresh_cookie
 
     async with postgres_session_factory() as session:
         persisted_guest_result = await session.execute(select(User).where(User.id == uuid.UUID(guest_user_id)))
@@ -289,19 +273,18 @@ async def test_email_login_link_wrong_password_preserves_guest_bearer_and_refres
         assert merge_log_count_result.scalar_one() == 0
 
 
-async def test_email_login_link_route_concurrent_loser_gets_refresh_guided_conflict(
+async def test_email_login_link_route_concurrent_loser_gets_already_completed_conflict(
     auth_app: FastAPI,
-    auth_settings_overrides: dict[str, str],
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     async with postgres_session_factory() as session:
         user_service = UserService(session)
-        full_user = await create_full_user_via_upgrade(user_service,
+        full_user = await create_full_user_via_upgrade(
+            user_service,
             email="race-owner@example.com",
             password_hash=hash_password(PASSWORD),
         )
 
-    cookie_name = auth_settings_overrides["AUTH_REFRESH_COOKIE_NAME"]
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=auth_app),
         base_url="https://testserver",
@@ -310,13 +293,8 @@ async def test_email_login_link_route_concurrent_loser_gets_refresh_guided_confl
         guest_payload = guest_response.json()
         guest_access_token = guest_payload["access_token"]
         guest_user_id = uuid.UUID(guest_payload["user"]["id"])
-        original_refresh_cookie = bootstrap_client.cookies.get(cookie_name)
-        refresh_cookie = next(cookie for cookie in bootstrap_client.cookies.jar if cookie.name == cookie_name)
-        cookie_domain = refresh_cookie.domain
-        cookie_path = refresh_cookie.path
 
     assert guest_response.status_code == 201
-    assert original_refresh_cookie is not None
 
     first_lock_acquired = asyncio.Event()
     second_attempt_started = asyncio.Event()
@@ -359,9 +337,6 @@ async def test_email_login_link_route_concurrent_loser_gets_refresh_guided_confl
                 base_url="https://testserver",
             ) as second_client,
         ):
-            first_client.cookies.set(cookie_name, original_refresh_cookie, domain=cookie_domain, path=cookie_path)
-            second_client.cookies.set(cookie_name, original_refresh_cookie, domain=cookie_domain, path=cookie_path)
-
             first_task = asyncio.create_task(post_link(first_client))
             await first_lock_acquired.wait()
 
@@ -393,41 +368,18 @@ async def test_email_login_link_route_concurrent_loser_gets_refresh_guided_confl
             assert len(successful_results) == 1
             assert len(failed_results) == 1
 
-            winner_client, winner_response = successful_results[0]
-            loser_client, loser_response = failed_results[0]
+            _winner_client, winner_response = successful_results[0]
+            _loser_client, loser_response = failed_results[0]
             winner_payload = winner_response.json()
             loser_payload = loser_response.json()
-            winner_cookie_value = winner_client.cookies.get(
-                cookie_name,
-                domain=cookie_domain,
-                path=cookie_path,
-            )
-            loser_cookie_value = loser_client.cookies.get(
-                cookie_name,
-                domain=cookie_domain,
-                path=cookie_path,
-            )
 
             assert winner_payload["user"]["id"] == str(full_user.id)
             assert winner_payload["user"]["account_type"] == "full"
-            assert winner_payload["refresh_cookie"]["name"] == cookie_name
-            assert winner_cookie_value is not None
-            assert winner_cookie_value != original_refresh_cookie
-            assert winner_response.headers.get("set-cookie") is not None
+            assert winner_payload["token_type"] == "bearer"
 
             assert loser_payload["code"] == "account_link_already_completed"
             assert "already completed elsewhere" in loser_payload["detail"].lower()
             assert "refresh or reload memexpert" in loser_payload["detail"].lower()
-            assert loser_response.headers.get("set-cookie") is None
-            assert loser_cookie_value == original_refresh_cookie
-
-            stale_guest_response = await loser_client.get(
-                "/api/v1/auth/me",
-                headers={"Authorization": f"Bearer {guest_access_token}"},
-            )
-
-            assert stale_guest_response.status_code == 401
-            assert stale_guest_response.json()["code"] == "invalid_token"
 
     finally:
         auth_app.dependency_overrides.pop(get_account_link_service, None)
@@ -435,21 +387,21 @@ async def test_email_login_link_route_concurrent_loser_gets_refresh_guided_confl
     async with postgres_session_factory() as session:
         merge_logs_result = await session.execute(select(AccountMergeLog))
         deleted_guest_result = await session.execute(select(User).where(User.id == guest_user_id))
-        refresh_token_rows_result = await session.execute(
-            select(RefreshToken)
-            .where(RefreshToken.user_id == full_user.id)
-            .order_by(RefreshToken.created_at.asc())
+        login_event_rows_result = await session.execute(
+            select(LoginEvent)
+            .where(LoginEvent.user_id == full_user.id)
+            .order_by(LoginEvent.created_at.asc())
         )
 
         merge_logs = merge_logs_result.scalars().all()
-        refresh_token_rows = refresh_token_rows_result.scalars().all()
+        login_event_rows = login_event_rows_result.scalars().all()
 
         assert len(merge_logs) == 1
         assert merge_logs[0].guest_account_id == guest_user_id
         assert merge_logs[0].target_account_id == full_user.id
         assert deleted_guest_result.scalar_one_or_none() is None
-        assert len(refresh_token_rows) == 1
-        assert refresh_token_rows[0].device_info == "Race Link Browser"
+        assert len(login_event_rows) == 1
+        assert login_event_rows[0].user_agent == "Race Link Browser"
 
 
 async def test_google_link_merges_guest_into_existing_full_and_exposes_linked_provider_read_surface(
@@ -466,7 +418,6 @@ async def test_google_link_merges_guest_into_existing_full_and_exposes_linked_pr
     guest_payload = guest_response.json()
     guest_access_token = guest_payload["access_token"]
     guest_user_id = uuid.UUID(guest_payload["user"]["id"])
-    cookie_name = auth_settings_overrides["AUTH_REFRESH_COOKIE_NAME"]
 
     flow = MockGoogleFlow(
         steps=deque(
@@ -512,7 +463,7 @@ async def test_google_link_merges_guest_into_existing_full_and_exposes_linked_pr
     assert link_payload["user"]["id"] == str(full_user.id)
     assert link_payload["user"]["account_type"] == "full"
     assert link_payload["user"]["email"] == "google-owner@example.com"
-    assert auth_client.cookies.get(cookie_name) is not None
+    assert link_payload["token_type"] == "bearer"
     assert len(flow.history) == 2
 
     assert linked_providers_response.status_code == 200
@@ -526,16 +477,18 @@ async def test_google_link_merges_guest_into_existing_full_and_exposes_linked_pr
     }
     assert linked_providers_payload["email_verified_at"] is not None
 
+    # The guest was merged into the canonical account and deleted, so the
+    # old guest bearer can no longer decode to a user row.
     assert stale_guest_response.status_code == 401
     assert stale_guest_response.json()["code"] == "invalid_token"
 
     async with postgres_session_factory() as session:
         persisted_full_result = await session.execute(select(User).where(User.id == full_user.id))
         deleted_guest_result = await session.execute(select(User).where(User.id == guest_user_id))
-        refresh_token_result = await session.execute(
-            select(RefreshToken).where(RefreshToken.user_id == full_user.id)
+        login_event_result = await session.execute(
+            select(LoginEvent).where(LoginEvent.user_id == full_user.id)
         )
-        refresh_token_row = refresh_token_result.scalar_one()
+        login_event_row = login_event_result.scalar_one()
         persisted_full = persisted_full_result.scalar_one()
         merge_log_count_result = await session.execute(
             select(func.count()).select_from(AccountMergeLog).where(AccountMergeLog.guest_account_id == guest_user_id)
@@ -544,23 +497,19 @@ async def test_google_link_merges_guest_into_existing_full_and_exposes_linked_pr
         assert persisted_full.google_id == "google-link-subject"
         assert persisted_full.email_verified_at is not None
         assert deleted_guest_result.scalar_one_or_none() is None
-        assert refresh_token_row.device_info == "Google Link Browser"
-        assert refresh_token_row.token_hash != auth_client.cookies.get(cookie_name)
+        assert login_event_row.user_agent == "Google Link Browser"
         assert merge_log_count_result.scalar_one() == 1
 
 
-async def test_google_link_provider_denial_leaves_guest_session_and_cookie_usable(
+async def test_google_link_provider_denial_leaves_guest_session_usable(
     auth_app: FastAPI,
     auth_client: AsyncClient,
-    auth_settings_overrides: dict[str, str],
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     guest_response = await auth_client.post("/api/v1/auth/guest")
     guest_payload = guest_response.json()
     guest_access_token = guest_payload["access_token"]
     guest_user_id = guest_payload["user"]["id"]
-    cookie_name = auth_settings_overrides["AUTH_REFRESH_COOKIE_NAME"]
-    original_refresh_cookie = auth_client.cookies.get(cookie_name)
 
     flow = MockGoogleFlow(
         steps=deque([google_response(status_code=401, payload={"error": "invalid_grant"})])
@@ -588,7 +537,6 @@ async def test_google_link_provider_denial_leaves_guest_session_and_cookie_usabl
 
     assert failed_link_response.status_code == 401
     assert failed_link_response.json()["code"] == "provider_access_denied"
-    assert auth_client.cookies.get(cookie_name) == original_refresh_cookie
 
     assert me_response.status_code == 200
     assert me_response.json()["id"] == guest_user_id
@@ -605,10 +553,10 @@ async def test_google_link_provider_denial_leaves_guest_session_and_cookie_usabl
 
     async with postgres_session_factory() as session:
         user_count_result = await session.execute(select(func.count()).select_from(User))
-        refresh_token_count_result = await session.execute(select(func.count()).select_from(RefreshToken))
+        login_event_count_result = await session.execute(select(func.count()).select_from(LoginEvent))
 
         assert user_count_result.scalar_one() == 1
-        assert refresh_token_count_result.scalar_one() == 1
+        assert login_event_count_result.scalar_one() == 1
 
 
 async def test_link_routes_reject_full_account_callers_with_guest_only_error(
@@ -724,7 +672,6 @@ async def test_email_login_route_merges_guest_when_guest_bearer_is_present(
 )
 async def test_link_routes_reject_malformed_payloads_without_mutating_guest_state(
     auth_client: AsyncClient,
-    auth_settings_overrides: dict[str, str],
     postgres_session_factory: async_sessionmaker[AsyncSession],
     endpoint: str,
     payload: dict[str, str],
@@ -735,8 +682,6 @@ async def test_link_routes_reject_malformed_payloads_without_mutating_guest_stat
     guest_payload = guest_response.json()
     guest_access_token = guest_payload["access_token"]
     guest_user_id = guest_payload["user"]["id"]
-    cookie_name = auth_settings_overrides["AUTH_REFRESH_COOKIE_NAME"]
-    original_refresh_cookie = auth_client.cookies.get(cookie_name)
 
     response = await auth_client.post(
         endpoint,
@@ -751,7 +696,6 @@ async def test_link_routes_reject_malformed_payloads_without_mutating_guest_stat
     assert response.status_code == expected_status
     if expected_code is not None:
         assert response.json()["code"] == expected_code
-    assert auth_client.cookies.get(cookie_name) == original_refresh_cookie
 
     assert me_response.status_code == 200
     assert me_response.json()["id"] == guest_user_id

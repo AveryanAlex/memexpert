@@ -1,22 +1,23 @@
-"""Guest-session and provider-auth routes for session issuance, rotation, self lookup, and linking."""
+"""Guest-session and provider-auth routes for session issuance, self lookup, and linking."""
 
 from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Body, Request, Response, status
+from fastapi import APIRouter, Body, Request, status
+from fastapi.responses import Response
 
 from memexpert.api.dependencies import (
     AUTH_ERROR_RESPONSES,
     AccountLinkServiceDep,
     AuthServiceDep,
     CurrentUserDep,
+    DbSessionDep,
     ForbidFullAccountCallerDep,
     GuestUserDep,
     OptionalGuestUserDep,
     to_auth_http_error,
 )
-from memexpert.core.config import get_settings
 from memexpert.schemas.auth import (
     AuthSessionRead,
     EmailLoginRequest,
@@ -32,13 +33,20 @@ from memexpert.schemas.user import UserRead
 from memexpert.services import (
     AuthenticatedUserNotFoundError,
     AuthServiceError,
-    AuthSession,
     LinkedProvidersProjection,
-    MissingTokenError,
     UserNotFoundError,
+    UserService,
 )
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+def _extract_client_ip(request: Request) -> str | None:
+    """Return the raw request client host, or None for non-HTTP test drivers."""
+
+    if request.client is None:
+        return None
+    return request.client.host
 
 
 @router.post(
@@ -49,18 +57,21 @@ router = APIRouter(prefix="/auth", tags=["auth"])
     summary="Bootstrap a guest session",
 )
 async def create_guest_session(
-    response: Response,
+    request: Request,
     auth_service: AuthServiceDep,
     guest_request: Annotated[GuestBootstrapRequest | None, Body()] = None,
 ) -> AuthSessionRead:
-    """Create a guest account, issue tokens, and set the opaque refresh token as a cookie."""
+    """Create a guest account and immediately issue a long-lived access token."""
 
     try:
-        auth_session = await auth_service.create_guest_session(guest_request)
+        auth_session = await auth_service.create_guest_session(
+            guest_request,
+            ip_address=_extract_client_ip(request),
+            user_agent=request.headers.get("user-agent"),
+        )
     except AuthServiceError as exc:
         raise to_auth_http_error(exc) from exc
 
-    _set_refresh_cookie(response, auth_session)
     return auth_session.to_read()
 
 
@@ -73,21 +84,13 @@ async def create_guest_session(
 )
 async def signup_with_email(
     request: Request,
-    response: Response,
     _guard: ForbidFullAccountCallerDep,
     optional_guest: OptionalGuestUserDep,
     account_link_service: AccountLinkServiceDep,
     auth_service: AuthServiceDep,
     credentials: Annotated[EmailSignupRequest, Body()],
 ) -> AuthSessionRead:
-    """Create a full account via the unified guest-upgrade writer path.
-
-    If the caller holds a guest session, that guest is upgraded in place;
-    otherwise ``AccountLinkService`` bootstraps a throwaway guest inside
-    the same transaction and upgrades it in one commit so the user
-    experience matches a direct signup while the writer path stays
-    single-source-of-truth.
-    """
+    """Create a full account via the unified guest-upgrade writer path."""
 
     try:
         link_result = await account_link_service.link_guest_with_email_signup(
@@ -97,13 +100,13 @@ async def signup_with_email(
         )
         auth_session = await auth_service.issue_session_for_user(
             link_result.user,
-            device_info=request.headers.get("user-agent"),
+            ip_address=_extract_client_ip(request),
+            user_agent=request.headers.get("user-agent"),
             reload_user=False,
         )
     except AuthServiceError as exc:
         raise to_auth_http_error(exc) from exc
 
-    _set_refresh_cookie(response, auth_session)
     return auth_session.to_read()
 
 
@@ -115,22 +118,13 @@ async def signup_with_email(
 )
 async def login_with_email(
     request: Request,
-    response: Response,
     _guard: ForbidFullAccountCallerDep,
     optional_guest: OptionalGuestUserDep,
     account_link_service: AccountLinkServiceDep,
     auth_service: AuthServiceDep,
     credentials: Annotated[EmailLoginRequest, Body()],
 ) -> AuthSessionRead:
-    """Authenticate an existing email/password account via the unified merge path.
-
-    Under the unified writer path every login goes through
-    ``AccountLinkService.link_guest_with_email_login``, which merges the
-    caller's guest (or a throwaway bootstrapped one for anonymous callers)
-    into the target full account. Guest-side favorites, analytics, and
-    inline usage events are always carried across, so a browser that
-    switches from a guest session to a known account never loses state.
-    """
+    """Authenticate an existing email/password account via the unified merge path."""
 
     try:
         link_result = await account_link_service.link_guest_with_email_login(
@@ -140,13 +134,13 @@ async def login_with_email(
         )
         auth_session = await auth_service.issue_session_for_user(
             link_result.user,
-            device_info=request.headers.get("user-agent"),
+            ip_address=_extract_client_ip(request),
+            user_agent=request.headers.get("user-agent"),
             reload_user=False,
         )
     except AuthServiceError as exc:
         raise to_auth_http_error(exc) from exc
 
-    _set_refresh_cookie(response, auth_session)
     return auth_session.to_read()
 
 
@@ -158,22 +152,13 @@ async def login_with_email(
 )
 async def login_with_google(
     request: Request,
-    response: Response,
     _guard: ForbidFullAccountCallerDep,
     optional_guest: OptionalGuestUserDep,
     account_link_service: AccountLinkServiceDep,
     auth_service: AuthServiceDep,
     credentials: Annotated[GoogleAuthRequest, Body()],
 ) -> AuthSessionRead:
-    """Exchange a Google auth code through the unified guest-upgrade writer path.
-
-    When the Google identity is unknown, ``AccountLinkService`` bootstraps
-    a guest (or reuses the caller's existing guest) and upgrades it in
-    place. When the identity already maps to a full account, the service
-    merges the guest into that account, carrying any guest-phase state
-    across. Either way the result is a single session on the canonical
-    account.
-    """
+    """Exchange a Google auth code through the unified guest-upgrade writer path."""
 
     try:
         link_result = await account_link_service.link_guest_with_google_code(
@@ -182,13 +167,13 @@ async def login_with_google(
         )
         auth_session = await auth_service.issue_session_for_user(
             link_result.user,
-            device_info=request.headers.get("user-agent"),
+            ip_address=_extract_client_ip(request),
+            user_agent=request.headers.get("user-agent"),
             reload_user=False,
         )
     except AuthServiceError as exc:
         raise to_auth_http_error(exc) from exc
 
-    _set_refresh_cookie(response, auth_session)
     return auth_session.to_read()
 
 
@@ -227,7 +212,6 @@ async def start_telegram_link(
 )
 async def login_with_telegram_widget(
     request: Request,
-    response: Response,
     _guard: ForbidFullAccountCallerDep,
     optional_guest: OptionalGuestUserDep,
     account_link_service: AccountLinkServiceDep,
@@ -243,13 +227,13 @@ async def login_with_telegram_widget(
         )
         auth_session = await auth_service.issue_session_for_user(
             link_result.user,
-            device_info=request.headers.get("user-agent"),
+            ip_address=_extract_client_ip(request),
+            user_agent=request.headers.get("user-agent"),
             reload_user=False,
         )
     except AuthServiceError as exc:
         raise to_auth_http_error(exc) from exc
 
-    _set_refresh_cookie(response, auth_session)
     return auth_session.to_read()
 
 
@@ -261,21 +245,13 @@ async def login_with_telegram_widget(
 )
 async def login_with_telegram_miniapp(
     request: Request,
-    response: Response,
     _guard: ForbidFullAccountCallerDep,
     optional_guest: OptionalGuestUserDep,
     account_link_service: AccountLinkServiceDep,
     auth_service: AuthServiceDep,
     credentials: Annotated[TelegramMiniAppAuthRequest, Body()],
 ) -> AuthSessionRead:
-    """Validate Telegram Mini App initData via the unified writer path.
-
-    For Mini App callers — who typically arrive without a prior guest
-    cookie — the service bootstraps a transient guest and upgrades or
-    merges it in place, so the user experiences an "instant full account"
-    on first open while the server-side writer path stays
-    single-source-of-truth.
-    """
+    """Validate Telegram Mini App initData via the unified writer path."""
 
     try:
         link_result = await account_link_service.link_guest_with_telegram_miniapp(
@@ -284,41 +260,64 @@ async def login_with_telegram_miniapp(
         )
         auth_session = await auth_service.issue_session_for_user(
             link_result.user,
-            device_info=request.headers.get("user-agent"),
+            ip_address=_extract_client_ip(request),
+            user_agent=request.headers.get("user-agent"),
             reload_user=False,
         )
     except AuthServiceError as exc:
         raise to_auth_http_error(exc) from exc
 
-    _set_refresh_cookie(response, auth_session)
     return auth_session.to_read()
 
 
 @router.post(
-    "/refresh",
-    response_model=AuthSessionRead,
+    "/logout",
+    status_code=status.HTTP_204_NO_CONTENT,
     responses=AUTH_ERROR_RESPONSES,
-    summary="Rotate the refresh token and mint a fresh access token",
+    summary="Soft logout for the current client",
 )
-async def refresh_session(
-    request: Request,
-    response: Response,
-    auth_service: AuthServiceDep,
-) -> AuthSessionRead:
-    """Rotate the caller's refresh token using the configured cookie name and metadata."""
+async def logout(_current_user: CurrentUserDep) -> Response:
+    """Return a 204 so the caller can drop its locally-held access token.
 
-    refresh_token = _get_refresh_token_from_request(request)
+    This is a "single device" soft logout: the server performs no
+    state mutation. Clients that hold the access token in memory simply
+    discard it; nothing else needs to happen on the server because the
+    JWT is stateless. Call ``/auth/logout-all`` to invalidate every
+    outstanding token for the account.
+    """
 
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post(
+    "/logout-all",
+    status_code=status.HTTP_204_NO_CONTENT,
+    responses=AUTH_ERROR_RESPONSES,
+    summary="Invalidate every outstanding session for the current account",
+)
+async def logout_all(
+    current_user: CurrentUserDep,
+    session: DbSessionDep,
+) -> Response:
+    """Bump the user's token nonce so every live JWT fails verification.
+
+    This is the nuclear revocation primitive: the caller stays
+    authenticated for exactly this one response, and every other
+    outstanding access token (browser, mobile, stale tab) is invalid on
+    its next request because its ``nonce`` claim no longer matches the
+    user row.
+    """
+
+    user_service = UserService(session)
     try:
-        auth_session = await auth_service.rotate_refresh_token(
-            refresh_token,
-            device_info=request.headers.get("user-agent"),
-        )
-    except AuthServiceError as exc:
-        raise to_auth_http_error(exc) from exc
-
-    _set_refresh_cookie(response, auth_session)
-    return auth_session.to_read()
+        await user_service.bump_token_nonce(user_id=current_user.id)
+    except UserNotFoundError as exc:
+        raise to_auth_http_error(
+            AuthenticatedUserNotFoundError(
+                f"Authenticated user {current_user.id} no longer exists.",
+            )
+        ) from exc
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get(
@@ -355,29 +354,6 @@ async def read_linked_providers(
         ) from exc
 
     return _build_linked_providers_read(linked_providers)
-
-
-def _get_refresh_token_from_request(request: Request) -> str:
-    settings = get_settings()
-    refresh_token = request.cookies.get(settings.auth_refresh_cookie_name)
-    if refresh_token is None or not refresh_token.strip():
-        raise to_auth_http_error(MissingTokenError("Refresh token cookie is required."))
-    return refresh_token
-
-
-def _set_refresh_cookie(response: Response, auth_session: AuthSession) -> None:
-    refresh_cookie = auth_session.refresh_cookie
-    response.set_cookie(
-        key=refresh_cookie.name,
-        value=auth_session.refresh_token,
-        max_age=refresh_cookie.max_age,
-        expires=auth_session.refresh_expires_at,
-        path=refresh_cookie.path,
-        domain=refresh_cookie.domain,
-        secure=refresh_cookie.secure,
-        httponly=refresh_cookie.http_only,
-        samesite=refresh_cookie.same_site,
-    )
 
 
 def _build_linked_providers_read(linked_providers: LinkedProvidersProjection) -> LinkedProvidersRead:

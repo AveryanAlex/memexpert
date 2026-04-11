@@ -153,9 +153,6 @@ def build_bot_settings(
     return Settings(
         database_url=database_url,
         auth_jwt_secret=SecretStr(JWT_SECRET),
-        auth_refresh_cookie_name="route_refresh_token",
-        auth_refresh_cookie_samesite="strict",
-        auth_refresh_cookie_secure=True,
         auth_telegram_bot_token=SecretStr(bot_token) if bot_token is not None else None,
         auth_telegram_bot_username=BOT_USERNAME,
         auth_telegram_link_return_url=(

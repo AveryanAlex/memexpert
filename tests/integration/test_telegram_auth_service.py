@@ -14,7 +14,7 @@ from sqlalchemy import func, select
 
 from memexpert.models.collection import Collection
 from memexpert.models.enums import AccountType, CollectionKind
-from memexpert.models.user import AccountMergeLog, RefreshToken, User
+from memexpert.models.user import AccountMergeLog, LoginEvent, User
 from memexpert.schemas.auth import TelegramWidgetAuthRequest
 from memexpert.services import (
     AccountLinkResult,
@@ -77,8 +77,6 @@ def build_auth_service(session: AsyncSession) -> AuthService:
         session,
         jwt_secret=JWT_SECRET,
         access_token_ttl=timedelta(minutes=15),
-        refresh_token_ttl=timedelta(days=30),
-        refresh_cookie_secure=False,
     )
 
 
@@ -86,12 +84,12 @@ async def _issue_session_for(
     session: AsyncSession,
     link_result: AccountLinkResult,
     *,
-    device_info: str | None = None,
+    user_agent: str | None = None,
 ) -> AuthSession:
     auth_service = build_auth_service(session)
     return await auth_service.issue_session_for_user(
         link_result.user,
-        device_info=device_info,
+        user_agent=user_agent,
         reload_user=False,
     )
 
@@ -176,14 +174,14 @@ async def test_telegram_auth_reuses_same_account_across_widget_and_miniapp_witho
         payload=build_widget_request(telegram_id=987654321),
     )
     widget_session = await _issue_session_for(
-        migrated_db_session, widget_link, device_info="Telegram Widget",
+        migrated_db_session, widget_link, user_agent="Telegram Widget",
     )
     miniapp_link = await link_service.link_guest_with_telegram_miniapp(
         guest_user_id=None,
         init_data=build_miniapp_init_data(telegram_id=987654321),
     )
     miniapp_session = await _issue_session_for(
-        migrated_db_session, miniapp_link, device_info="Telegram Mini App",
+        migrated_db_session, miniapp_link, user_agent="Telegram Mini App",
     )
 
     assert widget_session.user.account_type is AccountType.FULL
@@ -212,13 +210,13 @@ async def test_telegram_auth_reuses_same_account_across_widget_and_miniapp_witho
     assert favorites_count_result.scalar_one() == 1
 
     refresh_tokens_result = await migrated_db_session.execute(
-        select(RefreshToken)
-        .where(RefreshToken.user_id == widget_session.user.id)
-        .order_by(RefreshToken.created_at.asc())
+        select(LoginEvent)
+        .where(LoginEvent.user_id == widget_session.user.id)
+        .order_by(LoginEvent.created_at.asc())
     )
     refresh_tokens = refresh_tokens_result.scalars().all()
     assert len(refresh_tokens) == 2
-    assert {row.device_info for row in refresh_tokens} == {"Telegram Widget", "Telegram Mini App"}
+    assert {row.user_agent for row in refresh_tokens} == {"Telegram Widget", "Telegram Mini App"}
 
     # The miniapp call produced a merge log because its transient guest
     # was merged into the existing Telegram account rather than upgraded
@@ -244,11 +242,11 @@ async def test_telegram_auth_rejects_blank_widget_hash_and_malformed_miniapp_bef
         )
 
     user_count_result = await migrated_db_session.execute(select(func.count()).select_from(User))
-    refresh_token_count_result = await migrated_db_session.execute(select(func.count()).select_from(RefreshToken))
+    login_event_count_result = await migrated_db_session.execute(select(func.count()).select_from(LoginEvent))
     # Payload validation runs before the bootstrap (the delegators
     # resolve the identity first), so nothing is persisted.
     assert user_count_result.scalar_one() == 0
-    assert refresh_token_count_result.scalar_one() == 0
+    assert login_event_count_result.scalar_one() == 0
 
 
 async def test_telegram_auth_maps_tampered_and_expired_payloads_to_typed_failures(
@@ -286,9 +284,9 @@ async def test_telegram_auth_maps_tampered_and_expired_payloads_to_typed_failure
         )
 
     user_count_result = await migrated_db_session.execute(select(func.count()).select_from(User))
-    refresh_token_count_result = await migrated_db_session.execute(select(func.count()).select_from(RefreshToken))
+    login_event_count_result = await migrated_db_session.execute(select(func.count()).select_from(LoginEvent))
     assert user_count_result.scalar_one() == 0
-    assert refresh_token_count_result.scalar_one() == 0
+    assert login_event_count_result.scalar_one() == 0
 
 
 async def test_telegram_auth_requires_bot_token_configuration(
@@ -303,6 +301,6 @@ async def test_telegram_auth_requires_bot_token_configuration(
         )
 
     user_count_result = await migrated_db_session.execute(select(func.count()).select_from(User))
-    refresh_token_count_result = await migrated_db_session.execute(select(func.count()).select_from(RefreshToken))
+    login_event_count_result = await migrated_db_session.execute(select(func.count()).select_from(LoginEvent))
     assert user_count_result.scalar_one() == 0
-    assert refresh_token_count_result.scalar_one() == 0
+    assert login_event_count_result.scalar_one() == 0

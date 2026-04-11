@@ -87,10 +87,6 @@ class AuthenticatedUserNotFoundError(InvalidTokenError):
     """Raised when token claims refer to a user row that no longer exists."""
 
 
-class RefreshTokenReuseError(InvalidTokenError):
-    """Raised when a refresh token has already been revoked and is replayed."""
-
-
 class UserStateMismatchError(InvalidTokenError):
     """Raised when bearer claims no longer match the current persisted user state."""
 
@@ -378,7 +374,6 @@ __all__ = [
     "ProviderNotConfiguredError",
     "ProviderPayloadExpiredError",
     "ProviderPayloadInvalidError",
-    "RefreshTokenReuseError",
     "ServiceError",
     "ServiceValidationError",
     "UpgradeRequiredError",

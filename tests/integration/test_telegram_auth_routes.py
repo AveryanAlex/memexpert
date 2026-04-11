@@ -16,7 +16,7 @@ from memexpert.api.app import create_app
 from memexpert.core.config import get_settings
 from memexpert.core.database import reset_async_database_state
 from memexpert.models.enums import AccountType
-from memexpert.models.user import AccountMergeLog, RefreshToken, User
+from memexpert.models.user import AccountMergeLog, LoginEvent, User
 
 if TYPE_CHECKING:
     from pytest import MonkeyPatch
@@ -72,7 +72,7 @@ def build_miniapp_init_data(
     return urlencode(fields)
 
 
-async def test_telegram_widget_route_sets_refresh_cookie_and_returns_shared_session_contract(
+async def test_telegram_widget_route_returns_session_and_records_login_event(
     auth_client: AsyncClient,
     auth_settings_overrides: dict[str, str],
     postgres_session_factory: async_sessionmaker[AsyncSession],
@@ -91,27 +91,25 @@ async def test_telegram_widget_route_sets_refresh_cookie_and_returns_shared_sess
         ),
     )
 
-    cookie_name = auth_settings_overrides["AUTH_REFRESH_COOKIE_NAME"]
     payload = response.json()
 
     assert response.status_code == 200
     assert payload["user"]["account_type"] == "full"
     assert payload["user"]["telegram_id"] == 111222333
     assert payload["user"]["email"] is None
-    assert payload["refresh_cookie"]["name"] == cookie_name
-    assert auth_client.cookies.get(cookie_name) is not None
+    assert payload["token_type"] == "bearer"
+    assert payload["access_token"]
 
     async with postgres_session_factory() as session:
         persisted_user_result = await session.execute(select(User).where(User.telegram_id == 111222333))
         persisted_user = persisted_user_result.scalar_one()
         assert persisted_user.email is None
 
-        refresh_token_result = await session.execute(
-            select(RefreshToken).where(RefreshToken.user_id == persisted_user.id)
+        login_event_result = await session.execute(
+            select(LoginEvent).where(LoginEvent.user_id == persisted_user.id)
         )
-        refresh_token_row = refresh_token_result.scalar_one()
-        assert refresh_token_row.device_info == "Telegram Widget Browser"
-        assert refresh_token_row.token_hash != auth_client.cookies.get(cookie_name)
+        login_event_row = login_event_result.scalar_one()
+        assert login_event_row.user_agent == "Telegram Widget Browser"
 
 
 async def test_telegram_miniapp_route_first_open_creates_exactly_one_full_user_no_merge_log(
@@ -200,10 +198,10 @@ async def test_telegram_miniapp_route_reuses_existing_telegram_account_across_su
 
         persisted_user_result = await session.execute(select(User).where(User.telegram_id == 444555666))
         persisted_user = persisted_user_result.scalar_one()
-        refresh_token_count_result = await session.execute(
-            select(func.count()).select_from(RefreshToken).where(RefreshToken.user_id == persisted_user.id)
+        login_event_count_result = await session.execute(
+            select(func.count()).select_from(LoginEvent).where(LoginEvent.user_id == persisted_user.id)
         )
-        assert refresh_token_count_result.scalar_one() == 2
+        assert login_event_count_result.scalar_one() == 2
 
 
 async def test_telegram_routes_return_typed_provider_errors_for_tampered_and_expired_payloads(
@@ -240,9 +238,9 @@ async def test_telegram_routes_return_typed_provider_errors_for_tampered_and_exp
 
     async with postgres_session_factory() as session:
         user_count_result = await session.execute(select(func.count()).select_from(User))
-        refresh_token_count_result = await session.execute(select(func.count()).select_from(RefreshToken))
+        login_event_count_result = await session.execute(select(func.count()).select_from(LoginEvent))
         assert user_count_result.scalar_one() == 0
-        assert refresh_token_count_result.scalar_one() == 0
+        assert login_event_count_result.scalar_one() == 0
 
 
 async def test_telegram_routes_return_provider_not_configured_when_bot_token_missing(
@@ -251,9 +249,6 @@ async def test_telegram_routes_return_provider_not_configured_when_bot_token_mis
 ) -> None:
     monkeypatch.setenv("DATABASE_URL", postgres_async_url)
     monkeypatch.setenv("AUTH_JWT_SECRET", "route-test-auth-secret-with-32-byte-minimum")
-    monkeypatch.setenv("AUTH_REFRESH_COOKIE_NAME", "route_refresh_token")
-    monkeypatch.setenv("AUTH_REFRESH_COOKIE_SAMESITE", "strict")
-    monkeypatch.setenv("AUTH_REFRESH_COOKIE_SECURE", "true")
     monkeypatch.setenv("SECURITY_RATE_LIMIT_ENABLED", "false")
     monkeypatch.delenv("AUTH_TELEGRAM_BOT_TOKEN", raising=False)
 

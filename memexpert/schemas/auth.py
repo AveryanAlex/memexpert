@@ -60,26 +60,13 @@ class GuestBootstrapRequest(BaseModel):
         return normalized_value or None
 
 
-class RefreshCookieMetadata(BaseModel):
-    """Public refresh-cookie metadata without exposing the raw cookie value."""
-
-    name: str
-    path: str
-    max_age: int
-    secure: bool
-    http_only: bool
-    same_site: Literal["lax", "strict", "none"]
-    domain: str | None = None
-
-
 class AuthSessionRead(BaseModel):
-    """Public auth-session payload returned by guest bootstrap and refresh flows."""
+    """Public auth-session payload returned by guest bootstrap and auth flows."""
 
     access_token: str
     token_type: Literal["bearer"] = "bearer"
     expires_in: int
     user: UserRead
-    refresh_cookie: RefreshCookieMetadata
 
 
 class LinkedProvidersRead(BaseModel):
@@ -233,7 +220,6 @@ __all__ = [
     "GoogleAuthRequest",
     "GuestBootstrapRequest",
     "LinkedProvidersRead",
-    "RefreshCookieMetadata",
     "TelegramLinkStartRead",
     "TelegramMiniAppAuthRequest",
     "TelegramWidgetAuthRequest",

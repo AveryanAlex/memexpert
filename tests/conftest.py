@@ -46,9 +46,6 @@ PROJECT_ROOT: Final = Path(__file__).resolve().parents[1]
 ALEMBIC_INI_PATH: Final = PROJECT_ROOT / "alembic.ini"
 TEST_BASE_URL: Final = "https://testserver"
 AUTH_TEST_JWT_SECRET: Final = "route-test-auth-secret-with-32-byte-minimum"
-AUTH_TEST_REFRESH_COOKIE_NAME: Final = "route_refresh_token"
-AUTH_TEST_REFRESH_COOKIE_SAMESITE: Final = "strict"
-SECURITY_TEST_REFRESH_COOKIE_SAMESITE: Final = "lax"
 SECURITY_TEST_UNAVAILABLE_REDIS_URL: Final = "redis://127.0.0.1:1/0"
 SECURITY_TEST_REDIS_TIMEOUT_SECONDS: Final = 0.1
 BROWSER_SECURITY_ALLOWED_ORIGINS: Final = (
@@ -274,9 +271,6 @@ def auth_settings_overrides(
         "DATABASE_URL": postgres_async_url,
         "REDIS_URL": redis_container_url,
         "AUTH_JWT_SECRET": AUTH_TEST_JWT_SECRET,
-        "AUTH_REFRESH_COOKIE_NAME": AUTH_TEST_REFRESH_COOKIE_NAME,
-        "AUTH_REFRESH_COOKIE_SAMESITE": AUTH_TEST_REFRESH_COOKIE_SAMESITE,
-        "AUTH_REFRESH_COOKIE_SECURE": "true",
         "AUTH_TELEGRAM_BOT_TOKEN": AUTH_TEST_TELEGRAM_BOT_TOKEN,
         "AUTH_TELEGRAM_BOT_USERNAME": AUTH_TEST_TELEGRAM_BOT_USERNAME,
         "AUTH_TELEGRAM_LOGIN_MAX_AGE_SECONDS": str(AUTH_TEST_TELEGRAM_LOGIN_MAX_AGE_SECONDS),
@@ -303,7 +297,6 @@ def security_settings_overrides(
     return {
         **auth_settings_overrides,
         "REDIS_URL": redis_container_url,
-        "AUTH_REFRESH_COOKIE_SAMESITE": SECURITY_TEST_REFRESH_COOKIE_SAMESITE,
         "SECURITY_RATE_LIMIT_REDIS_TIMEOUT_SECONDS": str(SECURITY_TEST_REDIS_TIMEOUT_SECONDS),
     }
 
@@ -382,7 +375,6 @@ def browser_security_settings_overrides(
     return {
         **auth_settings_overrides,
         "REDIS_URL": redis_container_url,
-        "AUTH_REFRESH_COOKIE_SAMESITE": SECURITY_TEST_REFRESH_COOKIE_SAMESITE,
         "SECURITY_CORS_ALLOWED_ORIGINS": ",".join(BROWSER_SECURITY_ALLOWED_ORIGINS),
         "SECURITY_CORS_ALLOWED_ORIGIN_REGEX": BROWSER_SECURITY_ALLOWED_ORIGIN_REGEX,
         "SECURITY_CORS_ALLOWED_METHODS": BROWSER_SECURITY_ALLOWED_METHODS,

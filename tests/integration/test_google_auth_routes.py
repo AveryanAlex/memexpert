@@ -12,7 +12,7 @@ from sqlalchemy import func, select
 from memexpert.api.dependencies import DbSessionDep, get_provider_auth_service
 from memexpert.core.config import get_settings
 from memexpert.models.enums import AccountType
-from memexpert.models.user import AccountMergeLog, RefreshToken, User
+from memexpert.models.user import AccountMergeLog, LoginEvent, User
 from memexpert.services import ProviderAuthService, UserService
 from tests.conftest import create_full_user_via_upgrade
 
@@ -75,10 +75,9 @@ def build_google_provider_override(
     return override_provider_auth_service
 
 
-async def test_google_route_sets_refresh_cookie_and_reuses_verified_email_account(
+async def test_google_route_reuses_verified_email_account_and_records_login_event(
     auth_app: FastAPI,
     auth_client: AsyncClient,
-    auth_settings_overrides: dict[str, str],
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     async with postgres_session_factory() as session:
@@ -112,15 +111,13 @@ async def test_google_route_sets_refresh_cookie_and_reuses_verified_email_accoun
     finally:
         auth_app.dependency_overrides.clear()
 
-    cookie_name = auth_settings_overrides["AUTH_REFRESH_COOKIE_NAME"]
     payload = response.json()
 
     assert response.status_code == 200
     assert payload["user"]["id"] == str(existing_user.id)
     assert payload["user"]["google_id"] == "route-google-subject"
     assert payload["user"]["email"] == "route-existing@example.com"
-    assert payload["refresh_cookie"]["name"] == cookie_name
-    assert auth_client.cookies.get(cookie_name) is not None
+    assert payload["token_type"] == "bearer"
     assert len(flow.history) == 2
     assert flow.history[0].method == "POST"
     assert flow.history[1].headers["Authorization"] == "Bearer google-access-token"
@@ -128,15 +125,14 @@ async def test_google_route_sets_refresh_cookie_and_reuses_verified_email_accoun
     async with postgres_session_factory() as session:
         persisted_user_result = await session.execute(select(User).where(User.id == existing_user.id))
         persisted_user = persisted_user_result.scalar_one()
-        refresh_token_result = await session.execute(
-            select(RefreshToken).where(RefreshToken.user_id == existing_user.id)
+        login_event_result = await session.execute(
+            select(LoginEvent).where(LoginEvent.user_id == existing_user.id)
         )
-        refresh_token_row = refresh_token_result.scalar_one()
+        login_event_row = login_event_result.scalar_one()
 
         assert persisted_user.google_id == "route-google-subject"
         assert persisted_user.email_verified_at is not None
-        assert refresh_token_row.device_info == "Google Chrome"
-        assert refresh_token_row.token_hash != auth_client.cookies.get(cookie_name)
+        assert login_event_row.user_agent == "Google Chrome"
 
 
 async def test_google_route_anonymous_caller_upgrades_bootstrapped_guest_without_merge_log(
@@ -373,7 +369,7 @@ async def test_google_route_rejects_blank_codes_and_malformed_userinfo_before_si
 
     async with postgres_session_factory() as session:
         user_count_result = await session.execute(select(User).where(User.google_id.is_not(None)))
-        refresh_token_result = await session.execute(select(RefreshToken))
+        login_event_result = await session.execute(select(LoginEvent))
 
         assert user_count_result.scalars().all() == []
-        assert refresh_token_result.scalars().all() == []
+        assert login_event_result.scalars().all() == []

@@ -34,6 +34,7 @@ EXPECTED_TABLES = {
     "collections",
     "embedding_cache",
     "inline_usage_events",
+    "login_events",
     "meme_file_ocr_results",
     "meme_file_sync_target_snapshots",
     "meme_files",
@@ -45,7 +46,6 @@ EXPECTED_TABLES = {
     "memes",
     "pinned_memes",
     "pipeline_stage_journal",
-    "refresh_tokens",
     "source_channels",
     "telegram_file_id_cache",
     "telegram_link_codes",
@@ -230,9 +230,9 @@ def test_initial_revision_metadata_is_present() -> None:
     revision = script_directory.get_revision("head")
 
     assert revision is not None
-    assert revision.revision == "0006"
-    assert revision.down_revision == "0005"
-    assert revision.doc == "crawler sources"
+    assert revision.revision == "0007"
+    assert revision.down_revision == "0006"
+    assert revision.doc == "nonce auth and login events"
 
 
 async def test_upgrade_head_creates_expected_schema_and_constraints(
@@ -245,7 +245,7 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
 
     table_names = await _get_table_names(engine)
     assert table_names == EXPECTED_TABLES | {"alembic_version"}
-    assert await _get_current_revision(engine) == "0006"
+    assert await _get_current_revision(engine) == "0007"
 
     users_indexes = await _get_index_definitions(engine, "users")
     collections_indexes = await _get_index_definitions(engine, "collections")
@@ -469,7 +469,7 @@ async def test_crawler_sources_migration_applies_and_reverses(
     config = _build_alembic_config(database_url)
 
     await _run_alembic_command(command.upgrade, config, "head")
-    assert await _get_current_revision(engine) == "0006"
+    assert await _get_current_revision(engine) == "0007"
 
     meme_sources_columns = await _get_column_names(engine, "meme_sources")
     source_channels_columns = await _get_column_names(engine, "source_channels")
@@ -561,7 +561,7 @@ async def test_repeated_fresh_database_upgrades_work_after_a_full_downgrade(
     await _run_alembic_command(command.downgrade, config, "base")
     await _run_alembic_command(command.upgrade, config, "head")
 
-    assert await _get_current_revision(engine) == "0006"
+    assert await _get_current_revision(engine) == "0007"
     assert EXPECTED_TABLES.issubset(await _get_table_names(engine))
 
 

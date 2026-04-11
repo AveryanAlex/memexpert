@@ -9,7 +9,6 @@ from memexpert.schemas.auth import (
     EmailSignupRequest,
     GoogleAuthRequest,
     GuestBootstrapRequest,
-    RefreshCookieMetadata,
 )
 from memexpert.schemas.collection import CollectionInviteRead, CollectionMemberRead, CollectionRead
 from memexpert.schemas.content_pipeline import (
@@ -31,7 +30,7 @@ from memexpert.schemas.user import (
     AnalyticsEventRead,
     ChannelSuggestionRead,
     InlineUsageEventRead,
-    RefreshTokenRead,
+    LoginEventRead,
     UserRead,
 )
 
@@ -63,7 +62,6 @@ __all__ = [
     "GoogleAuthRequest",
     "GuestBootstrapRequest",
     "InlineUsageEventRead",
-    "RefreshCookieMetadata",
-    "RefreshTokenRead",
+    "LoginEventRead",
     "UserRead",
 ]

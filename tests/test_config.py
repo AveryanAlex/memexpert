@@ -82,7 +82,6 @@ def test_settings_parse_security_origins_and_preserve_refresh_cookie_path() -> N
     )
     assert settings.security_cors_allowed_methods == ("GET", "POST", "OPTIONS")
     assert settings.security_csrf_header_name == "X-Requested-With"
-    assert settings.auth_refresh_cookie_path == "/api/v1/auth/refresh"
 
 
 def test_settings_parse_pipeline_contract_and_normalize_object_prefixes() -> None:

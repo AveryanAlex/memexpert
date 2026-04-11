@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
 from typing import TYPE_CHECKING
 
 import bcrypt
@@ -10,7 +9,7 @@ import pytest
 from sqlalchemy import func, select
 
 from memexpert.models.enums import AccountStatus
-from memexpert.models.user import RefreshToken, User
+from memexpert.models.user import LoginEvent, User
 from memexpert.services import UserService
 from tests.conftest import create_full_user_via_upgrade
 
@@ -19,16 +18,14 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 PASSWORD = "correct-horse-battery"
-REFRESH_TOKEN_TTL = timedelta(days=30)
 
 
 def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(rounds=12)).decode("utf-8")
 
 
-async def test_email_signup_route_sets_refresh_cookie_and_returns_only_public_session_data(
+async def test_email_signup_route_returns_public_session_data_and_records_login_event(
     auth_client: AsyncClient,
-    auth_settings_overrides: dict[str, str],
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     response = await auth_client.post(
@@ -40,28 +37,15 @@ async def test_email_signup_route_sets_refresh_cookie_and_returns_only_public_se
         },
     )
 
-    cookie_name = auth_settings_overrides["AUTH_REFRESH_COOKIE_NAME"]
     payload = response.json()
-    set_cookie_header = response.headers["set-cookie"].lower()
 
     assert response.status_code == 201
     assert payload["user"]["account_type"] == "full"
     assert payload["user"]["email"] == "routeuser@example.com"
+    assert payload["token_type"] == "bearer"
+    assert payload["access_token"]
     assert "refresh_token" not in payload
     assert "password_hash" not in response.text
-    assert payload["refresh_cookie"] == {
-        "name": cookie_name,
-        "path": "/api/v1/auth/refresh",
-        "max_age": int(REFRESH_TOKEN_TTL.total_seconds()),
-        "secure": True,
-        "http_only": True,
-        "same_site": auth_settings_overrides["AUTH_REFRESH_COOKIE_SAMESITE"],
-        "domain": None,
-    }
-    assert auth_client.cookies.get(cookie_name) is not None
-    assert f"{cookie_name.lower()}=" in set_cookie_header
-    assert "httponly" in set_cookie_header
-    assert "secure" in set_cookie_header
 
     async with postgres_session_factory() as session:
         persisted_user_result = await session.execute(select(User).where(User.email == "routeuser@example.com"))
@@ -69,12 +53,11 @@ async def test_email_signup_route_sets_refresh_cookie_and_returns_only_public_se
         assert persisted_user.password_hash is not None
         assert bcrypt.checkpw(PASSWORD.encode("utf-8"), persisted_user.password_hash.encode("utf-8")) is True
 
-        refresh_token_result = await session.execute(
-            select(RefreshToken).where(RefreshToken.user_id == persisted_user.id)
+        login_event_result = await session.execute(
+            select(LoginEvent).where(LoginEvent.user_id == persisted_user.id)
         )
-        refresh_token_row = refresh_token_result.scalar_one()
-        assert refresh_token_row.device_info == "Mobile Safari"
-        assert refresh_token_row.token_hash != auth_client.cookies.get(cookie_name)
+        login_event_row = login_event_result.scalar_one()
+        assert login_event_row.user_agent == "Mobile Safari"
 
 
 async def test_email_signup_route_rejects_duplicate_email_with_typed_conflict(
@@ -106,14 +89,14 @@ async def test_email_signup_route_rejects_duplicate_email_with_typed_conflict(
         user_count_result = await session.execute(
             select(func.count()).select_from(User).where(User.email == "duplicate@example.com")
         )
-        refresh_token_count_result = await session.execute(select(func.count()).select_from(RefreshToken))
+        login_event_count_result = await session.execute(select(func.count()).select_from(LoginEvent))
         # R1: bootstrap rollback — the transient guest created inside
         # AccountLinkService for the failing signup must not leak, so the
         # only user row is the seeded duplicate and zero refresh tokens
         # reference a throwaway bootstrap.
         assert total_user_count_result.scalar_one() == 1
         assert user_count_result.scalar_one() == 1
-        assert refresh_token_count_result.scalar_one() == 0
+        assert login_event_count_result.scalar_one() == 0
 
 
 async def test_email_signup_route_rejects_full_account_caller_with_guest_required(
@@ -163,14 +146,13 @@ async def test_email_signup_route_rejects_invalid_payloads_before_side_effects(
 
     async with postgres_session_factory() as session:
         user_count_result = await session.execute(select(func.count()).select_from(User))
-        refresh_token_count_result = await session.execute(select(func.count()).select_from(RefreshToken))
+        login_event_count_result = await session.execute(select(func.count()).select_from(LoginEvent))
         assert user_count_result.scalar_one() == 0
-        assert refresh_token_count_result.scalar_one() == 0
+        assert login_event_count_result.scalar_one() == 0
 
 
 async def test_email_login_route_accepts_normalized_email_and_reuses_shared_session_contract(
     auth_client: AsyncClient,
-    auth_settings_overrides: dict[str, str],
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     async with postgres_session_factory() as session:
@@ -189,22 +171,21 @@ async def test_email_login_route_accepts_normalized_email_and_reuses_shared_sess
         },
     )
 
-    cookie_name = auth_settings_overrides["AUTH_REFRESH_COOKIE_NAME"]
     payload = response.json()
 
     assert response.status_code == 200
     assert payload["user"]["id"] == str(full_user.id)
     assert payload["user"]["account_type"] == "full"
     assert payload["user"]["email"] == "login@example.com"
-    assert payload["refresh_cookie"]["name"] == cookie_name
-    assert auth_client.cookies.get(cookie_name) is not None
+    assert payload["token_type"] == "bearer"
+    assert payload["access_token"]
 
     async with postgres_session_factory() as session:
-        refresh_token_result = await session.execute(
-            select(RefreshToken).where(RefreshToken.user_id == full_user.id)
+        login_event_result = await session.execute(
+            select(LoginEvent).where(LoginEvent.user_id == full_user.id)
         )
-        refresh_token_row = refresh_token_result.scalar_one()
-        assert refresh_token_row.device_info == "Firefox"
+        login_event_row = login_event_result.scalar_one()
+        assert login_event_row.user_agent == "Firefox"
 
 
 async def test_email_login_route_rejects_wrong_password_and_inactive_accounts(
@@ -251,9 +232,9 @@ async def test_email_login_route_rejects_wrong_password_and_inactive_accounts(
     assert "not available" in inactive_response.json()["detail"].lower()
 
     async with postgres_session_factory() as session:
-        refresh_token_count_result = await session.execute(
+        login_event_count_result = await session.execute(
             select(func.count())
-            .select_from(RefreshToken)
-            .where(RefreshToken.user_id.in_([wrong_password_user.id, inactive_user.id]))
+            .select_from(LoginEvent)
+            .where(LoginEvent.user_id.in_([wrong_password_user.id, inactive_user.id]))
         )
-        assert refresh_token_count_result.scalar_one() == 0
+        assert login_event_count_result.scalar_one() == 0

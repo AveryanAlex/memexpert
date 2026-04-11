@@ -18,15 +18,14 @@ from memexpert.models.enums import (
 from memexpert.schemas.base import ORMSchema
 
 
-class RefreshTokenRead(ORMSchema):
-    """Public refresh-token record without exposing the raw token secret."""
+class LoginEventRead(ORMSchema):
+    """Durable audit row for a session issuance (login or guest bootstrap)."""
 
     id: uuid.UUID
     user_id: uuid.UUID
-    device_info: str | None
-    expires_at: datetime
-    revoked_at: datetime | None
-    last_used_at: datetime | None
+    ip_address: str | None
+    user_agent: str | None
+    occurred_at: datetime
     created_at: datetime
     updated_at: datetime
 
@@ -104,6 +103,7 @@ class UserRead(ORMSchema):
     deletion_requested_at: datetime | None
     deletion_due_at: datetime | None
     deleted_at: datetime | None
+    token_nonce: int
     created_at: datetime
     updated_at: datetime
 
@@ -114,6 +114,6 @@ __all__ = [
     "AnalyticsEventRead",
     "ChannelSuggestionRead",
     "InlineUsageEventRead",
-    "RefreshTokenRead",
+    "LoginEventRead",
     "UserRead",
 ]

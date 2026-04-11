@@ -11,7 +11,7 @@ from sqlalchemy import func, select
 
 from memexpert.models.collection import Collection
 from memexpert.models.enums import AccountStatus, AccountType, CollectionKind
-from memexpert.models.user import RefreshToken, User
+from memexpert.models.user import LoginEvent, User
 from memexpert.services import (
     AccountLinkService,
     AccountUnavailableError,
@@ -29,8 +29,7 @@ if TYPE_CHECKING:
 
 PASSWORD = "correct-horse-battery"
 JWT_SECRET = "email-service-test-jwt-secret-with-32-byte-minimum"
-ACCESS_TOKEN_TTL = timedelta(minutes=15)
-REFRESH_TOKEN_TTL = timedelta(days=30)
+ACCESS_TOKEN_TTL = timedelta(days=30)
 
 
 def build_provider_auth_service(
@@ -49,8 +48,6 @@ def build_auth_service(session: AsyncSession) -> AuthService:
         session,
         jwt_secret=JWT_SECRET,
         access_token_ttl=ACCESS_TOKEN_TTL,
-        refresh_token_ttl=REFRESH_TOKEN_TTL,
-        refresh_cookie_secure=False,
     )
 
 
@@ -78,7 +75,7 @@ async def test_email_signup_hashes_password_bootstraps_favorites_and_issues_sess
     )
     auth_session = await auth_service.issue_session_for_user(
         link_result.user,
-        device_info="  Firefox on macOS  ",
+        user_agent="  Firefox on macOS  ",
         reload_user=False,
     )
     public_session = auth_session.to_read()
@@ -87,7 +84,7 @@ async def test_email_signup_hashes_password_bootstraps_favorites_and_issues_sess
     assert auth_session.user.email == "newuser@example.com"
     assert public_session.user.email == "newuser@example.com"
     assert "password_hash" not in public_session.model_dump_json()
-    assert auth_session.refresh_cookie.path == "/api/v1/auth/refresh"
+    assert public_session.token_type == "bearer"
 
     persisted_user_result = await migrated_db_session.execute(select(User).where(User.id == auth_session.user.id))
     persisted_user = persisted_user_result.scalar_one()
@@ -105,13 +102,11 @@ async def test_email_signup_hashes_password_bootstraps_favorites_and_issues_sess
     )
     assert favorites_count_result.scalar_one() == 1
 
-    refresh_token_result = await migrated_db_session.execute(
-        select(RefreshToken).where(RefreshToken.user_id == auth_session.user.id)
+    login_event_result = await migrated_db_session.execute(
+        select(LoginEvent).where(LoginEvent.user_id == auth_session.user.id)
     )
-    refresh_token_row = refresh_token_result.scalar_one()
-    assert refresh_token_row.token_hash != auth_session.refresh_token
-    assert refresh_token_row.device_info == "Firefox on macOS"
-    assert refresh_token_row.revoked_at is None
+    login_event_row = login_event_result.scalar_one()
+    assert login_event_row.user_agent == "Firefox on macOS"
 
 
 async def test_email_signup_rejects_duplicate_email_and_invalid_hashing_config(
@@ -135,9 +130,9 @@ async def test_email_signup_rejects_duplicate_email_and_invalid_hashing_config(
         )
 
     user_count_result = await migrated_db_session.execute(select(func.count()).select_from(User))
-    refresh_token_count_result = await migrated_db_session.execute(select(func.count()).select_from(RefreshToken))
+    login_event_count_result = await migrated_db_session.execute(select(func.count()).select_from(LoginEvent))
     assert user_count_result.scalar_one() == 1
-    assert refresh_token_count_result.scalar_one() == 1
+    assert login_event_count_result.scalar_one() == 1
 
     with pytest.raises(AuthConfigurationError, match="between 4 and 31"):
         _ = build_provider_auth_service(migrated_db_session, password_hash_rounds=0)
@@ -161,17 +156,17 @@ async def test_email_login_normalizes_email_and_uses_bcrypt_comparison(
         password=PASSWORD,
     )
     auth_session = await auth_service.issue_session_for_user(
-        link_result.user, device_info="Safari", reload_user=False,
+        link_result.user, user_agent="Safari", reload_user=False,
     )
 
     assert auth_session.user.id == full_user.id
     assert auth_session.user.account_type is AccountType.FULL
 
-    refresh_token_result = await migrated_db_session.execute(
-        select(RefreshToken).where(RefreshToken.user_id == full_user.id)
+    login_event_result = await migrated_db_session.execute(
+        select(LoginEvent).where(LoginEvent.user_id == full_user.id)
     )
-    refresh_token_row = refresh_token_result.scalar_one()
-    assert refresh_token_row.device_info == "Safari"
+    login_event_row = login_event_result.scalar_one()
+    assert login_event_row.user_agent == "Safari"
 
 
 async def test_email_login_rejects_wrong_password_and_missing_stored_hash_without_side_effects(
@@ -202,12 +197,12 @@ async def test_email_login_rejects_wrong_password_and_missing_stored_hash_withou
             password=PASSWORD,
         )
 
-    refresh_token_count_result = await migrated_db_session.execute(
+    login_event_count_result = await migrated_db_session.execute(
         select(func.count())
-        .select_from(RefreshToken)
-        .where(RefreshToken.user_id.in_([password_user.id, missing_hash_user.id]))
+        .select_from(LoginEvent)
+        .where(LoginEvent.user_id.in_([password_user.id, missing_hash_user.id]))
     )
-    assert refresh_token_count_result.scalar_one() == 0
+    assert login_event_count_result.scalar_one() == 0
 
 
 async def test_email_login_rejects_non_active_accounts(
@@ -233,7 +228,7 @@ async def test_email_login_rejects_non_active_accounts(
             password=PASSWORD,
         )
 
-    refresh_token_count_result = await migrated_db_session.execute(
-        select(func.count()).select_from(RefreshToken).where(RefreshToken.user_id == unavailable_user.id)
+    login_event_count_result = await migrated_db_session.execute(
+        select(func.count()).select_from(LoginEvent).where(LoginEvent.user_id == unavailable_user.id)
     )
-    assert refresh_token_count_result.scalar_one() == 0
+    assert login_event_count_result.scalar_one() == 0

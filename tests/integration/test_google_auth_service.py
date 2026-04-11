@@ -13,7 +13,7 @@ from sqlalchemy import func, select
 
 from memexpert.models.collection import Collection
 from memexpert.models.enums import AccountStatus, AccountType, CollectionKind
-from memexpert.models.user import AccountMergeLog, RefreshToken, User
+from memexpert.models.user import AccountMergeLog, LoginEvent, User
 from memexpert.services import (
     AccountLinkResult,
     AccountLinkService,
@@ -114,8 +114,6 @@ def build_auth_service(session: AsyncSession) -> AuthService:
         session,
         jwt_secret=JWT_SECRET,
         access_token_ttl=timedelta(minutes=15),
-        refresh_token_ttl=timedelta(days=30),
-        refresh_cookie_secure=False,
     )
 
 
@@ -123,12 +121,12 @@ async def _issue_session_for(
     migrated_db_session: AsyncSession,
     link_result: AccountLinkResult,
     *,
-    device_info: str | None = None,
+    user_agent: str | None = None,
 ) -> AuthSession:
     auth_service = build_auth_service(migrated_db_session)
     return await auth_service.issue_session_for_user(
         link_result.user,
-        device_info=device_info,
+        user_agent=user_agent,
         reload_user=False,
     )
 
@@ -160,7 +158,7 @@ async def test_google_auth_creates_new_user_by_sub_and_records_mocked_exchange_h
         code="google-auth-code",
     )
     auth_session = await _issue_session_for(
-        migrated_db_session, link_result, device_info="Chrome on macOS",
+        migrated_db_session, link_result, user_agent="Chrome on macOS",
     )
 
     assert auth_session.user.account_type is AccountType.FULL
@@ -191,15 +189,14 @@ async def test_google_auth_creates_new_user_by_sub_and_records_mocked_exchange_h
             Collection.kind == CollectionKind.FAVORITES,
         )
     )
-    refresh_token_result = await migrated_db_session.execute(
-        select(RefreshToken).where(RefreshToken.user_id == auth_session.user.id)
+    login_event_result = await migrated_db_session.execute(
+        select(LoginEvent).where(LoginEvent.user_id == auth_session.user.id)
     )
-    refresh_token_row = refresh_token_result.scalar_one()
+    login_event_row = login_event_result.scalar_one()
     merge_log_count_result = await migrated_db_session.execute(select(func.count()).select_from(AccountMergeLog))
 
     assert favorites_count_result.scalar_one() == 1
-    assert refresh_token_row.device_info == "Chrome on macOS"
-    assert refresh_token_row.token_hash != auth_session.refresh_token
+    assert login_event_row.user_agent == "Chrome on macOS"
     # Fresh Google sign-in upgrades a bootstrapped guest in place, no merge
     # log because there was no existing account to merge into.
     assert merge_log_count_result.scalar_one() == 0
@@ -330,11 +327,11 @@ async def test_google_auth_rejects_telegram_email_collisions_without_side_effect
 
     persisted_user_result = await migrated_db_session.execute(select(User).where(User.id == telegram_user.id))
     persisted_user = persisted_user_result.scalar_one()
-    refresh_token_count_result = await migrated_db_session.execute(select(func.count()).select_from(RefreshToken))
+    login_event_count_result = await migrated_db_session.execute(select(func.count()).select_from(LoginEvent))
     user_count_result = await migrated_db_session.execute(select(func.count()).select_from(User))
 
     assert persisted_user.google_id is None
-    assert refresh_token_count_result.scalar_one() == 0
+    assert login_event_count_result.scalar_one() == 0
     # Bootstrapped guest must be rolled back atomically.
     assert user_count_result.scalar_one() == 1
 
@@ -376,10 +373,10 @@ async def test_google_auth_rejects_inactive_verified_email_reuse_without_attachi
 
     reloaded_user_result = await migrated_db_session.execute(select(User).where(User.id == existing_user.id))
     reloaded_user = reloaded_user_result.scalar_one()
-    refresh_token_count_result = await migrated_db_session.execute(select(func.count()).select_from(RefreshToken))
+    login_event_count_result = await migrated_db_session.execute(select(func.count()).select_from(LoginEvent))
 
     assert reloaded_user.google_id is None
-    assert refresh_token_count_result.scalar_one() == 0
+    assert login_event_count_result.scalar_one() == 0
 
 
 @pytest.mark.parametrize(
@@ -452,9 +449,9 @@ async def test_google_auth_surfaces_typed_upstream_and_payload_failures_without_
         _ = await link_service.link_guest_with_google_code(guest_user_id=None, code=code)
 
     user_count_result = await migrated_db_session.execute(select(func.count()).select_from(User))
-    refresh_token_count_result = await migrated_db_session.execute(select(func.count()).select_from(RefreshToken))
+    login_event_count_result = await migrated_db_session.execute(select(func.count()).select_from(LoginEvent))
 
     # Upstream/payload failures happen before any bootstrap is attempted,
     # so no user rows should exist.
     assert user_count_result.scalar_one() == 0
-    assert refresh_token_count_result.scalar_one() == 0
+    assert login_event_count_result.scalar_one() == 0

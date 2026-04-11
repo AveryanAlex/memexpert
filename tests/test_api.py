@@ -40,7 +40,8 @@ def test_v1_namespace_root_and_openapi_spec_are_available() -> None:
         "/api/v1/auth/telegram": "post",
         "/api/v1/auth/telegram-miniapp": "post",
         "/api/v1/auth/google": "post",
-        "/api/v1/auth/refresh": "post",
+        "/api/v1/auth/logout": "post",
+        "/api/v1/auth/logout-all": "post",
         "/api/v1/auth/me": "get",
     }
     expected_pipeline_paths = {

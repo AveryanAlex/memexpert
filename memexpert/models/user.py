@@ -85,6 +85,12 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     deletion_requested_at: Mapped[datetime | None] = mapped_column(nullable=True)
     deletion_due_at: Mapped[datetime | None] = mapped_column(nullable=True)
     deleted_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    token_nonce: Mapped[int] = mapped_column(
+        BigInteger,
+        default=0,
+        server_default=text("0"),
+        nullable=False,
+    )
 
     active_save_collection: Mapped["Collection | None"] = relationship(
         "Collection",
@@ -119,8 +125,8 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         foreign_keys="PinnedMeme.user_id",
         cascade="all, delete-orphan",
     )
-    refresh_tokens: Mapped[list["RefreshToken"]] = relationship(
-        "RefreshToken",
+    login_events: Mapped[list["LoginEvent"]] = relationship(
+        "LoginEvent",
         back_populates="user",
         cascade="all, delete-orphan",
     )
@@ -152,26 +158,33 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
 
 
-class RefreshToken(UUIDPrimaryKeyMixin, TimestampMixin, Base):
-    """Persisted refresh tokens for the custom JWT flow."""
+class LoginEvent(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """Durable audit row for every session issued to a user.
 
-    __tablename__ = "refresh_tokens"
+    Captured on every call to ``AuthService.issue_session_for_user`` so
+    operators can review per-user sign-in history (IP, user-agent, when).
+    Rows are never mutated after insert — ``token_nonce`` bumping handles
+    revocation at the JWT layer, so login events stay immutable.
+    """
+
+    __tablename__ = "login_events"
     __table_args__ = (
-        Index("uq_refresh_tokens_token_hash", "token_hash", unique=True),
-        Index("ix_refresh_tokens_user_id_expires_at", "user_id", "expires_at"),
+        Index("ix_login_events_user_id_occurred_at", "user_id", "occurred_at"),
     )
 
     user_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("users.id", ondelete="CASCADE"),
         nullable=False,
     )
-    token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    device_info: Mapped[str | None] = mapped_column(Text, nullable=True)
-    expires_at: Mapped[datetime] = mapped_column(nullable=False)
-    revoked_at: Mapped[datetime | None] = mapped_column(nullable=True)
-    last_used_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    ip_address: Mapped[str | None] = mapped_column(String(45), nullable=True)
+    user_agent: Mapped[str | None] = mapped_column(Text, nullable=True)
+    occurred_at: Mapped[datetime] = mapped_column(
+        default=utcnow,
+        server_default=text("now()"),
+        nullable=False,
+    )
 
-    user: Mapped["User"] = relationship("User", back_populates="refresh_tokens")
+    user: Mapped["User"] = relationship("User", back_populates="login_events")
 
 
 class TelegramLinkCode(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -310,7 +323,7 @@ __all__ = [
     "AnalyticsEvent",
     "ChannelSuggestion",
     "InlineUsageEvent",
-    "RefreshToken",
+    "LoginEvent",
     "TelegramLinkCode",
     "User",
 ]

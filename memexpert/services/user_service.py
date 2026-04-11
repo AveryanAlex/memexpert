@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Final
 
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
@@ -33,6 +33,8 @@ from memexpert.services.errors import (
 )
 
 if TYPE_CHECKING:
+    import uuid
+
     from sqlalchemy.ext.asyncio import AsyncSession
     from sqlalchemy.sql.elements import ColumnElement
 
@@ -458,6 +460,34 @@ class UserService:
             raise UserServiceError("Failed to persist the user's activity timestamp.") from exc
 
         return UserRead.model_validate(user)
+
+    async def bump_token_nonce(self, *, user_id: uuid.UUID) -> int:
+        """Atomically increment the user's token nonce to revoke every live JWT.
+
+        The increment happens inside the database to avoid racing with a
+        concurrent login: any access token issued against the old nonce
+        fails its next verification, and the caller uses the returned value
+        to know which nonce the client should now see.
+        """
+
+        result = await self._session.execute(
+            update(User)
+            .where(User.id == user_id)
+            .values(token_nonce=User.token_nonce + 1)
+            .returning(User.token_nonce)
+        )
+        new_nonce = result.scalar_one_or_none()
+        if new_nonce is None:
+            await self._session.rollback()
+            raise UserNotFoundError(f"User {user_id} does not exist.")
+
+        try:
+            await self._session.commit()
+        except IntegrityError as exc:  # pragma: no cover - defensive branch
+            await self._session.rollback()
+            raise UserServiceError("Failed to rotate the token nonce.") from exc
+
+        return int(new_nonce)
 
     async def _create_user_with_favorites(self, user: User, *, commit: bool = True) -> Collection:
         try:

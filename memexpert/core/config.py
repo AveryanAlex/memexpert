@@ -146,14 +146,11 @@ class Settings(BaseSettings):
     crawler_default_catchup_message_limit: int = Field(default=500, gt=0, le=10000)
     auth_jwt_secret: SecretStr = SecretStr("memexpert-dev-jwt-secret-with-32-byte-minimum")
     auth_access_token_algorithm: Literal["HS256"] = "HS256"
-    auth_access_token_ttl_seconds: int = 900
-    auth_refresh_token_ttl_days: int = 30
-    auth_refresh_cookie_name: str = "memexpert_refresh_token"
-    auth_refresh_cookie_secure: bool = True
-    auth_refresh_cookie_httponly: bool = True
-    auth_refresh_cookie_samesite: Literal["lax", "strict", "none"] = "lax"
-    auth_refresh_cookie_path: str = "/api/v1/auth/refresh"
-    auth_refresh_cookie_domain: str | None = None
+    # Access tokens are long-lived because revocation is handled by the
+    # per-user ``token_nonce`` counter: logout-everywhere bumps the nonce
+    # and every outstanding JWT is instantly invalid on the next request.
+    # A 30-day TTL keeps natural hygiene for abandoned sessions.
+    auth_access_token_ttl_seconds: int = Field(default=30 * 24 * 60 * 60, gt=0)
     auth_bcrypt_rounds: int = Field(default=12, ge=4, le=31)
     auth_telegram_bot_token: SecretStr | None = None
     auth_telegram_bot_username: str | None = None
@@ -469,12 +466,6 @@ class Settings(BaseSettings):
         """Return the configured access-token lifetime as a timedelta."""
 
         return timedelta(seconds=self.auth_access_token_ttl_seconds)
-
-    @property
-    def auth_refresh_token_ttl(self) -> timedelta:
-        """Return the configured refresh-token lifetime as a timedelta."""
-
-        return timedelta(days=self.auth_refresh_token_ttl_days)
 
 
 @lru_cache(maxsize=1)

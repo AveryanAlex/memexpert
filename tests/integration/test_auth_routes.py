@@ -9,16 +9,17 @@ import jwt
 import pytest
 from fastapi import APIRouter, FastAPI
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from memexpert.api.dependencies import FullAccountUserDep
+from memexpert.models.user import LoginEvent, User
 from memexpert.schemas.user import UserRead
 from memexpert.services import AuthService, UserService
 from tests.conftest import create_full_user_via_upgrade
 
 FULL_ONLY_PROBE_PATH = "/api/v1/test-auth/full-only"
-ACCESS_TOKEN_TTL = timedelta(minutes=15)
-REFRESH_TOKEN_TTL = timedelta(days=30)
+ACCESS_TOKEN_TTL = timedelta(days=30)
 
 full_only_probe_router = APIRouter()
 
@@ -40,10 +41,6 @@ def build_test_auth_service(
         session,
         jwt_secret=auth_settings_overrides["AUTH_JWT_SECRET"],
         access_token_ttl=ACCESS_TOKEN_TTL,
-        refresh_token_ttl=REFRESH_TOKEN_TTL,
-        refresh_cookie_name=auth_settings_overrides["AUTH_REFRESH_COOKIE_NAME"],
-        refresh_cookie_secure=True,
-        refresh_cookie_samesite=auth_settings_overrides["AUTH_REFRESH_COOKIE_SAMESITE"],
     )
 
 
@@ -69,9 +66,9 @@ async def test_me_route_rejects_missing_wrong_scheme_and_malformed_tokens(
     assert detail_fragment in response.json()["detail"].lower()
 
 
-async def test_guest_route_sets_secure_refresh_cookie_and_returns_only_public_session_data(
+async def test_guest_route_returns_public_session_data_and_persists_login_event(
     auth_client: AsyncClient,
-    auth_settings_overrides: dict[str, str],
+    postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     response = await auth_client.post(
         "/api/v1/auth/guest",
@@ -82,30 +79,25 @@ async def test_guest_route_sets_secure_refresh_cookie_and_returns_only_public_se
         },
     )
 
-    cookie_name = auth_settings_overrides["AUTH_REFRESH_COOKIE_NAME"]
     payload = response.json()
-    set_cookie_header = response.headers["set-cookie"].lower()
 
     assert response.status_code == 201
     assert payload["user"]["account_type"] == "guest"
     assert payload["user"]["language"] == "ru"
     assert payload["user"]["nsfw_enabled"] is True
-    assert "refresh_token" not in payload
-    assert payload["refresh_cookie"] == {
-        "name": cookie_name,
-        "path": "/api/v1/auth/refresh",
-        "max_age": int(REFRESH_TOKEN_TTL.total_seconds()),
-        "secure": True,
-        "http_only": True,
-        "same_site": auth_settings_overrides["AUTH_REFRESH_COOKIE_SAMESITE"],
-        "domain": None,
-    }
-    assert auth_client.cookies.get(cookie_name) is not None
-    assert f"{cookie_name.lower()}=" in set_cookie_header
-    assert "httponly" in set_cookie_header
-    assert "secure" in set_cookie_header
-    assert "path=/api/v1/auth/refresh" in set_cookie_header
-    assert f"samesite={auth_settings_overrides['AUTH_REFRESH_COOKIE_SAMESITE']}" in set_cookie_header
+    assert payload["user"]["token_nonce"] == 0
+    assert payload["token_type"] == "bearer"
+    assert payload["access_token"]
+
+    async with postgres_session_factory() as session:
+        login_event_result = await session.execute(
+            select(LoginEvent).where(LoginEvent.user_id == payload["user"]["id"])
+        )
+        login_event = login_event_result.scalar_one()
+        # The route captures the HTTP User-Agent header; under the httpx
+        # test driver that header is the httpx default user-agent.
+        assert login_event.user_agent is not None
+        assert "httpx" in login_event.user_agent
 
 
 async def test_me_route_accepts_guest_bearer_tokens_and_rejects_expired_tokens(
@@ -134,6 +126,7 @@ async def test_me_route_accepts_guest_bearer_tokens_and_rejects_expired_tokens(
                 "type": "access",
                 "iat": now - timedelta(minutes=10),
                 "exp": now - timedelta(minutes=5),
+                "nonce": 0,
                 "account_type": "guest",
             },
             auth_settings_overrides["AUTH_JWT_SECRET"],
@@ -150,47 +143,51 @@ async def test_me_route_accepts_guest_bearer_tokens_and_rejects_expired_tokens(
     assert "expired" in expired_response.json()["detail"].lower()
 
 
-async def test_refresh_route_rotates_refresh_cookie_and_rejects_revoked_token_reuse(
-    auth_app: FastAPI,
+async def test_logout_route_is_noop_server_side(auth_client: AsyncClient) -> None:
+    guest_response = await auth_client.post("/api/v1/auth/guest")
+    access_token = guest_response.json()["access_token"]
+
+    logout_response = await auth_client.post(
+        "/api/v1/auth/logout",
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+
+    assert logout_response.status_code == 204
+
+    # Bearer token still valid after /auth/logout — this is a soft logout.
+    reverify_response = await auth_client.get(
+        "/api/v1/auth/me",
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    assert reverify_response.status_code == 200
+
+
+async def test_logout_all_route_bumps_nonce_and_kills_existing_tokens(
     auth_client: AsyncClient,
-    auth_settings_overrides: dict[str, str],
+    postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     guest_response = await auth_client.post("/api/v1/auth/guest")
-    cookie_name = auth_settings_overrides["AUTH_REFRESH_COOKIE_NAME"]
-    original_refresh_token = auth_client.cookies.get(cookie_name)
+    access_token = guest_response.json()["access_token"]
+    guest_user_id = guest_response.json()["user"]["id"]
 
-    refresh_response = await auth_client.post("/api/v1/auth/refresh")
-    rotated_refresh_token = auth_client.cookies.get(cookie_name)
+    logout_all_response = await auth_client.post(
+        "/api/v1/auth/logout-all",
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    assert logout_all_response.status_code == 204
 
-    assert guest_response.status_code == 201
-    assert original_refresh_token is not None
-    assert refresh_response.status_code == 200
-    assert refresh_response.json()["user"]["id"] == guest_response.json()["user"]["id"]
-    assert refresh_response.json()["refresh_cookie"]["name"] == cookie_name
-    assert rotated_refresh_token is not None
-    assert rotated_refresh_token != original_refresh_token
-    assert "refresh_token" not in refresh_response.json()
+    # The previously-valid bearer is now rejected on the next call.
+    reverify_response = await auth_client.get(
+        "/api/v1/auth/me",
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    assert reverify_response.status_code == 401
+    assert reverify_response.json()["code"] == "invalid_token"
 
-    replay_transport = ASGITransport(app=auth_app)
-    async with AsyncClient(transport=replay_transport, base_url="https://testserver") as replay_client:
-        replay_client.cookies.set(cookie_name, original_refresh_token)
-        replay_response = await replay_client.post("/api/v1/auth/refresh")
-
-    assert replay_response.status_code == 401
-    assert replay_response.json()["code"] == "invalid_token"
-    assert "revoked" in replay_response.json()["detail"].lower()
-
-
-async def test_refresh_route_rejects_missing_refresh_cookie(
-    auth_app: FastAPI,
-) -> None:
-    transport = ASGITransport(app=auth_app)
-    async with AsyncClient(transport=transport, base_url="https://testserver") as anonymous_client:
-        response = await anonymous_client.post("/api/v1/auth/refresh")
-
-    assert response.status_code == 401
-    assert response.json()["code"] == "invalid_token"
-    assert "refresh token cookie" in response.json()["detail"].lower()
+    async with postgres_session_factory() as session:
+        persisted_user_result = await session.execute(select(User).where(User.id == guest_user_id))
+        persisted_user = persisted_user_result.scalar_one()
+        assert persisted_user.token_nonce == 1
 
 
 async def test_full_account_dependency_returns_upgrade_required_for_guests_and_allows_full_users(

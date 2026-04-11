@@ -10,7 +10,7 @@ from sqlalchemy import func, select
 
 from memexpert.core.config import Settings
 from memexpert.core.redis import get_async_redis, is_async_redis_initialized, reset_async_redis_state
-from memexpert.models.user import RefreshToken, User
+from memexpert.models.user import LoginEvent, User
 from memexpert.services import AccountLinkService
 
 if TYPE_CHECKING:
@@ -64,8 +64,8 @@ async def _count_auth_side_effects(
 ) -> tuple[int, int]:
     async with postgres_session_factory() as session:
         user_count_result = await session.execute(select(func.count()).select_from(User))
-        refresh_token_count_result = await session.execute(select(func.count()).select_from(RefreshToken))
-        return user_count_result.scalar_one(), refresh_token_count_result.scalar_one()
+        login_event_count_result = await session.execute(select(func.count()).select_from(LoginEvent))
+        return user_count_result.scalar_one(), login_event_count_result.scalar_one()
 
 
 async def test_safe_read_routes_keep_redis_runtime_lazy_until_first_protected_request(
@@ -85,7 +85,6 @@ async def test_safe_read_routes_keep_redis_runtime_lazy_until_first_protected_re
     guest_response = await security_client.post("/api/v1/auth/guest")
 
     assert guest_response.status_code == 201
-    assert guest_response.json()["refresh_cookie"]["same_site"] == "lax"
     assert guest_response.headers["X-RateLimit-Limit"] == "2"
     assert guest_response.headers["X-RateLimit-Remaining"] == "1"
     assert guest_response.headers["X-RateLimit-Tier"] == "auth_write"
@@ -160,8 +159,14 @@ async def test_auth_write_rate_limit_returns_retry_metadata_and_skips_safe_reads
         "/api/v1/auth/linked-providers",
         headers=auth_headers,
     )
-    refresh_response = await security_client.post("/api/v1/auth/refresh")
-    limited_response = await security_client.post("/api/v1/auth/refresh")
+    logout_all_response = await security_client.post(
+        "/api/v1/auth/logout-all",
+        headers=auth_headers,
+    )
+    limited_response = await security_client.post(
+        "/api/v1/auth/logout-all",
+        headers=auth_headers,
+    )
     limited_payload = limited_response.json()
 
     assert guest_response.status_code == 201
@@ -182,10 +187,10 @@ async def test_auth_write_rate_limit_returns_retry_metadata_and_skips_safe_reads
     }
     assert "X-RateLimit-Limit" not in linked_providers_response.headers
 
-    assert refresh_response.status_code == 200
-    assert refresh_response.headers["X-RateLimit-Limit"] == "2"
-    assert refresh_response.headers["X-RateLimit-Remaining"] == "0"
-    assert refresh_response.headers["X-RateLimit-Tier"] == "auth_write"
+    assert logout_all_response.status_code == 204
+    assert logout_all_response.headers["X-RateLimit-Limit"] == "2"
+    assert logout_all_response.headers["X-RateLimit-Remaining"] == "0"
+    assert logout_all_response.headers["X-RateLimit-Tier"] == "auth_write"
 
     assert limited_response.status_code == 429
     assert limited_payload["code"] == "rate_limit_exceeded"
@@ -203,12 +208,16 @@ async def test_auth_write_rate_limit_state_isolated_between_tests(
     security_client: AsyncClient,
 ) -> None:
     guest_response = await security_client.post("/api/v1/auth/guest")
-    refresh_response = await security_client.post("/api/v1/auth/refresh")
+    access_token = guest_response.json()["access_token"]
+    logout_all_response = await security_client.post(
+        "/api/v1/auth/logout-all",
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
 
     assert guest_response.status_code == 201
     assert guest_response.headers["X-RateLimit-Remaining"] == "1"
-    assert refresh_response.status_code == 200
-    assert refresh_response.headers["X-RateLimit-Remaining"] == "0"
+    assert logout_all_response.status_code == 204
+    assert logout_all_response.headers["X-RateLimit-Remaining"] == "0"
 
 
 @pytest.mark.parametrize(
@@ -377,15 +386,11 @@ async def test_csrf_allows_browser_guest_bootstrap_with_required_header_and_sets
         json={"language": "ru", "nsfw_enabled": True},
     )
 
-    set_cookie_header = response.headers["set-cookie"].lower()
-
     assert response.status_code == 201
     assert response.headers["Access-Control-Allow-Origin"] == "https://app.memexpert.net"
     assert response.headers["Access-Control-Allow-Credentials"] == "true"
-    assert response.json()["refresh_cookie"]["path"] == "/api/v1/auth/refresh"
-    assert response.json()["refresh_cookie"]["same_site"] == "lax"
-    assert "path=/api/v1/auth/refresh" in set_cookie_header
-    assert "samesite=lax" in set_cookie_header
+    assert response.json()["token_type"] == "bearer"
+    assert response.json()["access_token"]
 
 
 async def test_csrf_safe_get_remains_exempt_when_origin_is_present(
@@ -413,9 +418,11 @@ async def test_csrf_safe_get_remains_exempt_when_origin_is_present(
     assert me_response.json()["account_type"] == "guest"
 
 
-async def test_csrf_does_not_apply_to_non_browser_refresh_post_without_origin(
+async def test_csrf_does_not_apply_to_non_browser_logout_all_post_without_origin(
     browser_security_client: AsyncClient,
 ) -> None:
+    """Non-browser clients (no Origin header) are exempt from the CSRF guard."""
+
     guest_response = await browser_security_client.post(
         "/api/v1/auth/guest",
         headers={
@@ -423,23 +430,21 @@ async def test_csrf_does_not_apply_to_non_browser_refresh_post_without_origin(
             "X-Requested-With": BROWSER_REQUESTED_WITH_VALUE,
         },
     )
-    cookie_name = guest_response.json()["refresh_cookie"]["name"]
-    original_refresh_token = browser_security_client.cookies.get(cookie_name)
+    access_token = guest_response.json()["access_token"]
 
-    refresh_response = await browser_security_client.post("/api/v1/auth/refresh")
-    rotated_refresh_token = browser_security_client.cookies.get(cookie_name)
+    logout_all_response = await browser_security_client.post(
+        "/api/v1/auth/logout-all",
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
 
-    assert original_refresh_token is not None
-    assert refresh_response.status_code == 200
-    assert refresh_response.json()["refresh_cookie"]["path"] == "/api/v1/auth/refresh"
-    assert refresh_response.json()["refresh_cookie"]["same_site"] == "lax"
-    assert rotated_refresh_token is not None
-    assert rotated_refresh_token != original_refresh_token
+    assert logout_all_response.status_code == 204
 
 
-async def test_csrf_refresh_route_requires_header_and_rotates_cookie_when_present(
+async def test_csrf_logout_all_route_requires_header_when_browser_origin_present(
     browser_security_client: AsyncClient,
 ) -> None:
+    """With an Origin header the CSRF guard requires X-Requested-With on mutations."""
+
     guest_response = await browser_security_client.post(
         "/api/v1/auth/guest",
         headers={
@@ -447,39 +452,31 @@ async def test_csrf_refresh_route_requires_header_and_rotates_cookie_when_presen
             "X-Requested-With": BROWSER_REQUESTED_WITH_VALUE,
         },
     )
-    cookie_name = guest_response.json()["refresh_cookie"]["name"]
-    original_refresh_token = browser_security_client.cookies.get(cookie_name)
+    access_token = guest_response.json()["access_token"]
 
     rejected_response = await browser_security_client.post(
-        "/api/v1/auth/refresh",
-        headers={"Origin": "https://app.memexpert.net"},
+        "/api/v1/auth/logout-all",
+        headers={
+            "Origin": "https://app.memexpert.net",
+            "Authorization": f"Bearer {access_token}",
+        },
     )
-    refresh_token_after_rejection = browser_security_client.cookies.get(cookie_name)
     accepted_response = await browser_security_client.post(
-        "/api/v1/auth/refresh",
+        "/api/v1/auth/logout-all",
         headers={
             "Origin": "https://app.memexpert.net",
             "X-Requested-With": BROWSER_REQUESTED_WITH_VALUE,
+            "Authorization": f"Bearer {access_token}",
         },
     )
-    rotated_refresh_token = browser_security_client.cookies.get(cookie_name)
-    accepted_set_cookie_header = accepted_response.headers["set-cookie"].lower()
 
-    assert original_refresh_token is not None
     assert rejected_response.status_code == 403
     assert rejected_response.headers["Access-Control-Allow-Origin"] == "https://app.memexpert.net"
     assert rejected_response.json()["code"] == "csrf_failed"
-    assert refresh_token_after_rejection == original_refresh_token
 
-    assert accepted_response.status_code == 200
+    assert accepted_response.status_code == 204
     assert accepted_response.headers["Access-Control-Allow-Origin"] == "https://app.memexpert.net"
     assert accepted_response.headers["Access-Control-Allow-Credentials"] == "true"
-    assert accepted_response.json()["refresh_cookie"]["path"] == "/api/v1/auth/refresh"
-    assert accepted_response.json()["refresh_cookie"]["same_site"] == "lax"
-    assert rotated_refresh_token is not None
-    assert rotated_refresh_token != original_refresh_token
-    assert "path=/api/v1/auth/refresh" in accepted_set_cookie_header
-    assert "samesite=lax" in accepted_set_cookie_header
 
 
 @pytest.mark.parametrize(

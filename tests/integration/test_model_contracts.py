@@ -61,7 +61,7 @@ from memexpert.models.user import (
     AnalyticsEvent,
     ChannelSuggestion,
     InlineUsageEvent,
-    RefreshToken,
+    LoginEvent,
     TelegramLinkCode,
     User,
 )
@@ -92,6 +92,7 @@ EXPECTED_TABLES = {
     "inline_usage_events",
     "meme_file_ocr_results",
     "meme_file_sync_target_snapshots",
+    "login_events",
     "meme_files",
     "meme_merge_logs",
     "meme_popularity_snapshots",
@@ -101,7 +102,6 @@ EXPECTED_TABLES = {
     "memes",
     "pinned_memes",
     "pipeline_stage_journal",
-    "refresh_tokens",
     "source_channels",
     "telegram_file_id_cache",
     "telegram_link_codes",
@@ -433,11 +433,10 @@ async def test_schema_handles_cycles_multi_invites_and_nullable_content_fields(
                 ),
                 CollectionMeme(collection=shared, meme=meme, added_by_user=owner),
                 PinnedMeme(user=owner, meme=meme, position=1),
-                RefreshToken(
+                LoginEvent(
                     user=owner,
-                    token_hash="e" * 64,
-                    device_info="Firefox on Linux",
-                    expires_at=utcnow() + timedelta(days=30),
+                    ip_address="203.0.113.10",
+                    user_agent="Firefox on Linux",
                 ),
                 TelegramLinkCode(
                     guest_user_id=owner.id,
@@ -681,6 +680,7 @@ def test_public_schemas_validate_from_attributes_and_reject_invalid_enums() -> N
         language=UserLanguage.RU,
         nsfw_enabled=True,
         last_active_at=now,
+        token_nonce=0,
         created_at=now,
         updated_at=now,
     )
