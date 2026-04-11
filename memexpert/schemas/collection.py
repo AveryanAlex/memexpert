@@ -6,7 +6,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import Field
 
 from memexpert.models.enums import (
     CollectionInviteChannel,
@@ -15,12 +15,7 @@ from memexpert.models.enums import (
     CollectionMembershipRole,
     CollectionVisibility,
 )
-
-
-class ORMSchema(BaseModel):
-    """Base schema that can validate directly from ORM instances."""
-
-    model_config = ConfigDict(from_attributes=True)
+from memexpert.schemas.base import ORMSchema
 
 
 class CollectionMemberRead(ORMSchema):

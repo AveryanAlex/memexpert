@@ -25,6 +25,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
 from memexpert.models.enums import SourcePlatform
+from memexpert.schemas.base import ORMSchema
 from memexpert.schemas.content_pipeline import (
     MAX_POST_ID_LENGTH,
     MAX_SOURCE_ID_LENGTH,
@@ -40,7 +41,7 @@ from memexpert.schemas.content_pipeline import (
 MAX_FRESHNESS_SAMPLE_ITEMS = 50
 
 
-class CrawlerChannelRead(BaseModel):
+class CrawlerChannelRead(ORMSchema):
     """Operator-facing projection of one tracked ``SourceChannel`` row.
 
     Every field is derived from the durable ``source_channels`` table so
@@ -49,7 +50,7 @@ class CrawlerChannelRead(BaseModel):
     or the freshness snapshot, not on the inspect projection.
     """
 
-    model_config = ConfigDict(from_attributes=True, extra="forbid")
+    model_config = ConfigDict(extra="forbid")
 
     id: uuid.UUID
     platform: SourcePlatform

@@ -28,6 +28,7 @@ from memexpert.models.enums import (
     SyncTargetStatus,
     TelegramSessionStatus,
 )
+from memexpert.schemas.base import ORMSchema
 from memexpert.schemas.pipeline_base import (
     _PIPELINE_EVENT_ALLOWED_STAGES,
     MAX_OBJECT_KEY_LENGTH,
@@ -56,7 +57,7 @@ from memexpert.schemas.pipeline_ingest import (
 )
 
 
-class TelegramSessionStateRead(BaseModel):
+class TelegramSessionStateRead(ORMSchema):
     """Read projection of ``TelegramSessionState`` rows for T03 operator routes.
 
     Kept in the schemas module so the operator-facing routes introduced in
@@ -70,8 +71,6 @@ class TelegramSessionStateRead(BaseModel):
     ``CrawlerOperationsService.list_sessions`` method computes the value
     from a second query and passes it explicitly.
     """
-
-    model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
     session_name: str = Field(min_length=1, max_length=MAX_TELEGRAM_SESSION_NAME_LENGTH)
@@ -122,10 +121,8 @@ class ContentPipelineDispatchEvent(BaseModel):
         return self
 
 
-class ContentPipelineStageJournalRead(BaseModel):
+class ContentPipelineStageJournalRead(ORMSchema):
     """Public read model for a single stage-journal row."""
-
-    model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
     meme_file_id: uuid.UUID
@@ -165,15 +162,13 @@ class ContentPipelineUploadRead(ContentPipelineItemRead):
     """Create-response payload returned after an operator upload is ingested."""
 
 
-class ContentPipelineOCRDetail(BaseModel):
+class ContentPipelineOCRDetail(ORMSchema):
     """Durable OCR audit projection exposed by the enriched inspect surface.
 
     This projection is absent from ``ContentPipelineItemDetail`` whenever the
     item has not yet produced an ``MemeFileOCRResult`` row. Operators must not
     treat a missing projection as empty text; it means OCR has not run.
     """
-
-    model_config = ConfigDict(from_attributes=True)
 
     engine: str
     fallback_engine: str | None = None
@@ -186,7 +181,7 @@ class ContentPipelineOCRDetail(BaseModel):
     last_event_id: uuid.UUID | None = None
 
 
-class ContentPipelineMergeParticipation(BaseModel):
+class ContentPipelineMergeParticipation(ORMSchema):
     """One row in the merge-audit lineage for a pipeline item.
 
     Either the item was the *source* (its meme was merged into the canonical)
@@ -194,8 +189,6 @@ class ContentPipelineMergeParticipation(BaseModel):
     The enriched inspect detail exposes both directions so operators can walk
     the lineage without poking at the audit table directly.
     """
-
-    model_config = ConfigDict(from_attributes=True)
 
     log_id: uuid.UUID
     source_meme_id: uuid.UUID

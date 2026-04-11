@@ -6,8 +6,6 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict
-
 from memexpert.models.enums import (
     AccountDeletionAction,
     AccountStatus,
@@ -17,12 +15,7 @@ from memexpert.models.enums import (
     SourcePlatform,
     UserLanguage,
 )
-
-
-class ORMSchema(BaseModel):
-    """Base schema that can validate directly from ORM instances."""
-
-    model_config = ConfigDict(from_attributes=True)
+from memexpert.schemas.base import ORMSchema
 
 
 class RefreshTokenRead(ORMSchema):
