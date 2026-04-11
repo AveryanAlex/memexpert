@@ -8,7 +8,6 @@ import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Protocol, Self, cast
 
 from sqlalchemy import select
@@ -45,8 +44,6 @@ from memexpert.models.enums import (
     SyncTargetStatus,
 )
 from memexpert.schemas.content_pipeline import (
-    MAX_PIPELINE_ERROR_LENGTH,
-    MAX_PIPELINE_REASON_LENGTH,
     ContentPipelineDispatchEvent,
     ContentPipelineEventType,
     ContentPipelineItemDetail,
@@ -64,9 +61,6 @@ from memexpert.schemas.content_pipeline import (
     SmokeProofResult,
 )
 from memexpert.services.content_merge import ContentMergeService, MergeOutcome
-from memexpert.services.content_pipeline_constants import (
-    ACTIVE_STAGE_STATUSES as _ACTIVE_STAGE_STATUSES,
-)
 from memexpert.services.content_pipeline_constants import (
     CLASSIFY_FAN_OUT_STAGES as _CLASSIFY_FAN_OUT_STAGES,
 )
@@ -98,9 +92,6 @@ from memexpert.services.content_pipeline_constants import (
     PIPELINE_REASON_PUBLISH_FAILED as _PIPELINE_REASON_PUBLISH_FAILED,
 )
 from memexpert.services.content_pipeline_constants import (
-    PIPELINE_REASON_REPLAY_REQUESTED as _PIPELINE_REASON_REPLAY_REQUESTED,
-)
-from memexpert.services.content_pipeline_constants import (
     PIPELINE_REASON_SYNC_MEILI_MALFORMED_PAYLOAD as _PIPELINE_REASON_SYNC_MEILI_MALFORMED_PAYLOAD,
 )
 from memexpert.services.content_pipeline_constants import (
@@ -111,10 +102,28 @@ from memexpert.services.content_pipeline_constants import (
     SYNC_REPLAY_BATCH_MAX,
 )
 from memexpert.services.content_pipeline_constants import (
-    STAGE_ORDER as _STAGE_ORDER,
-)
-from memexpert.services.content_pipeline_constants import (
     SYNC_STAGE_BY_TARGET as _SYNC_STAGE_BY_TARGET,
+)
+from memexpert.services.content_pipeline_helpers import (
+    StageJournalSnapshot,
+    ensure_stage_attempt_is_current,
+    is_replay_reserved,
+    matches_list_filter,
+    normalize_content_type,
+    normalize_filename,
+    reserve_replay,
+    resolve_current_stage,
+    snapshot_stage,
+    sorted_stage_entries,
+    translate_media_processing_error,
+    trim_error_text,
+    trim_reason,
+)
+from memexpert.services.content_pipeline_helpers import (
+    build_sync_preview_model as _build_sync_preview_model,
+)
+from memexpert.services.content_pipeline_helpers import (
+    compare_telegram_post_ids as _compare_telegram_post_ids,
 )
 from memexpert.services.content_pipeline_reporting import (
     build_item_detail,
@@ -133,7 +142,6 @@ from memexpert.services.errors import (
     PipelineReplayNotAllowedError,
     PipelineSourceConflictError,
     PipelineStorageError,
-    PipelineUnsupportedMediaTypeError,
 )
 
 if TYPE_CHECKING:
@@ -192,21 +200,6 @@ class PipelineStageWorkContext:
     mime_type: str | None
     original_object_key: str
     web_video_object_key: str | None
-
-
-@dataclass(frozen=True, slots=True)
-class StageJournalSnapshot:
-    """Durable stage-journal state captured before replay reserves a new attempt."""
-
-    attempt_count: int
-    finished_at: datetime | None
-    is_retryable: bool
-    last_error_text: str | None
-    last_event_id: uuid.UUID | None
-    normalized_reason: str | None
-    retry_after: datetime | None
-    started_at: datetime | None
-    status: ContentPipelineStageStatus
 
 
 @dataclass(frozen=True, slots=True)
@@ -532,12 +525,12 @@ class ContentPipelineService:
 
         items: list[ContentPipelineItemRead] = []
         for meme_file in result.scalars().all():
-            stage_entries = self._sorted_stage_entries(meme_file)
+            stage_entries = sorted_stage_entries(meme_file)
             if not stage_entries:
                 continue
 
-            current_entry = self._resolve_current_stage(stage_entries)
-            if not self._matches_list_filter(
+            current_entry = resolve_current_stage(stage_entries)
+            if not matches_list_filter(
                 current_entry,
                 filter_by=filter_by,
                 stale_before=stale_before,
@@ -564,10 +557,10 @@ class ContentPipelineService:
                 f"Pipeline item {meme_file_id} is missing durable original storage identifiers.",
             )
 
-        stage_entries = self._sorted_stage_entries(meme_file)
+        stage_entries = sorted_stage_entries(meme_file)
         target_entry = self._select_replay_entry(stage_entries, requested_stage=stage)
 
-        if self._is_replay_reserved(target_entry):
+        if is_replay_reserved(target_entry):
             if target_entry.last_event_id is None:
                 raise PipelineReplayNotAllowedError(
                     f"Pipeline item {meme_file_id} is already reserved for replay, but its event id is missing.",
@@ -591,9 +584,9 @@ class ContentPipelineService:
             attempt=replay_attempt,
             created_at=utcnow(),
         )
-        snapshot = self._snapshot_stage(target_entry)
+        snapshot = snapshot_stage(target_entry)
 
-        self._reserve_replay(target_entry, replay_event)
+        reserve_replay(target_entry, replay_event)
         try:
             await self._session.commit()
         except SQLAlchemyError as exc:
@@ -624,7 +617,7 @@ class ContentPipelineService:
         """Mark one stage as running and return the durable media context workers need."""
 
         meme_file, stage_entry = await self._get_meme_file_and_stage_entry(meme_file_id, stage)
-        self._ensure_stage_attempt_is_current(stage_entry, attempt=attempt)
+        ensure_stage_attempt_is_current(stage_entry, attempt=attempt)
         started_at = utcnow()
 
         stage_entry.status = ContentPipelineStageStatus.PROCESSING
@@ -676,7 +669,7 @@ class ContentPipelineService:
         """Persist normalized derivative metadata, then advance the durable stage chain."""
 
         meme_file, stage_entry = await self._get_meme_file_and_stage_entry(meme_file_id, ContentPipelineStage.TRANSCODE)
-        self._ensure_stage_attempt_is_current(stage_entry, attempt=attempt)
+        ensure_stage_attempt_is_current(stage_entry, attempt=attempt)
         meme_file.s3_web_video_key = result.web_video_object_key
         meme_file.mime_type = result.mime_type
         meme_file.width = result.width
@@ -703,7 +696,7 @@ class ContentPipelineService:
         """Persist durable OCR provenance, then advance the durable stage chain."""
 
         meme_file, stage_entry = await self._get_meme_file_and_stage_entry(meme_file_id, ContentPipelineStage.OCR)
-        self._ensure_stage_attempt_is_current(stage_entry, attempt=attempt)
+        ensure_stage_attempt_is_current(stage_entry, attempt=attempt)
 
         if meme_file.ocr_result is None:
             meme_file.ocr_result = MemeFileOCRResult(
@@ -753,7 +746,7 @@ class ContentPipelineService:
             meme_file_id,
             ContentPipelineStage.EMBED,
         )
-        self._ensure_stage_attempt_is_current(stage_entry, attempt=attempt)
+        ensure_stage_attempt_is_current(stage_entry, attempt=attempt)
         self._validate_embedding_contract(embedding_result)
         await self._persist_embedding_cache_row(
             meme_file=meme_file,
@@ -805,7 +798,7 @@ class ContentPipelineService:
             meme_file_id,
             ContentPipelineStage.CLASSIFY,
         )
-        self._ensure_stage_attempt_is_current(stage_entry, attempt=attempt)
+        ensure_stage_attempt_is_current(stage_entry, attempt=attempt)
 
         target_meme = await self._get_canonical_meme(meme_file.meme_id)
         target_meme.is_nsfw = classification_result.is_nsfw
@@ -840,7 +833,7 @@ class ContentPipelineService:
             meme_file_id,
             ContentPipelineStage.SYNC_QDRANT,
         )
-        self._ensure_stage_attempt_is_current(stage_entry, attempt=attempt)
+        ensure_stage_attempt_is_current(stage_entry, attempt=attempt)
 
         already_succeeded = (
             stage_entry.status is ContentPipelineStageStatus.SUCCEEDED
@@ -1021,7 +1014,7 @@ class ContentPipelineService:
             meme_file_id,
             ContentPipelineStage.SYNC_MEILI,
         )
-        self._ensure_stage_attempt_is_current(stage_entry, attempt=attempt)
+        ensure_stage_attempt_is_current(stage_entry, attempt=attempt)
 
         already_succeeded = (
             stage_entry.status is ContentPipelineStageStatus.SUCCEEDED
@@ -1182,7 +1175,7 @@ class ContentPipelineService:
                 f"Pipeline item {meme_file_id} has no durable {stage.value} stage row yet.",
             )
 
-        if self._is_replay_reserved(stage_entry):
+        if is_replay_reserved(stage_entry):
             if stage_entry.last_event_id is None:
                 raise PipelineReplayNotAllowedError(
                     f"Pipeline item {meme_file_id} is already reserved for replay, "
@@ -1207,8 +1200,8 @@ class ContentPipelineService:
             attempt=replay_attempt,
             created_at=utcnow(),
         )
-        snapshot = self._snapshot_stage(stage_entry)
-        self._reserve_replay(stage_entry, replay_event)
+        snapshot = snapshot_stage(stage_entry)
+        reserve_replay(stage_entry, replay_event)
 
         # Mark the per-target snapshot row as an intentional replay so the
         # inspect surface reflects the operator request even before the runtime
@@ -1275,8 +1268,8 @@ class ContentPipelineService:
         snapshots = await self._load_sync_target_snapshots(self._session, meme_file_id)
         existing = snapshots.get(target)
 
-        trimmed_reason = self._trim_reason(normalized_reason) if normalized_reason is not None else None
-        trimmed_error = self._trim_error_text(last_error_text) if last_error_text is not None else None
+        trimmed_reason = trim_reason(normalized_reason) if normalized_reason is not None else None
+        trimmed_error = trim_error_text(last_error_text) if last_error_text is not None else None
         preview_json = preview.model_dump(mode="json") if preview is not None else None
 
         if existing is None:
@@ -1433,14 +1426,14 @@ class ContentPipelineService:
         """Persist a failed worker attempt with an explicit retryability decision."""
 
         meme_file, stage_entry = await self._get_meme_file_and_stage_entry(meme_file_id, stage)
-        self._ensure_stage_attempt_is_current(stage_entry, attempt=attempt)
+        ensure_stage_attempt_is_current(stage_entry, attempt=attempt)
         failed_at = utcnow()
 
         stage_entry.status = ContentPipelineStageStatus.FAILED
         stage_entry.attempt_count = max(stage_entry.attempt_count, attempt)
         stage_entry.last_event_id = event_id
-        stage_entry.normalized_reason = self._trim_reason(normalized_reason)
-        stage_entry.last_error_text = self._trim_error_text(last_error_text)
+        stage_entry.normalized_reason = trim_reason(normalized_reason)
+        stage_entry.last_error_text = trim_error_text(last_error_text)
         stage_entry.is_retryable = retryable
         stage_entry.retry_after = (
             failed_at + timedelta(seconds=self._broker_settings.retry_backoff_seconds)
@@ -1464,7 +1457,7 @@ class ContentPipelineService:
         """Persist a successful worker attempt and enqueue the next durable stage when needed."""
 
         meme_file, stage_entry = await self._get_meme_file_and_stage_entry(meme_file_id, stage)
-        self._ensure_stage_attempt_is_current(stage_entry, attempt=attempt)
+        ensure_stage_attempt_is_current(stage_entry, attempt=attempt)
         await self._finalize_stage_success(
             meme_file=meme_file,
             stage_entry=stage_entry,
@@ -1582,8 +1575,8 @@ class ContentPipelineService:
         content_type: str | None,
         media_bytes: bytes,
     ) -> PreparedUpload:
-        normalized_filename = self._normalize_filename(filename)
-        normalized_content_type = self._normalize_content_type(content_type)
+        normalized_filename = normalize_filename(filename)
+        normalized_content_type = normalize_content_type(content_type)
         file_size_bytes = len(media_bytes)
         if file_size_bytes <= 0:
             raise PipelinePayloadValidationError("Uploaded file is empty.")
@@ -1595,7 +1588,7 @@ class ContentPipelineService:
                 media_bytes=media_bytes,
             )
         except Exception as exc:
-            raise self._translate_media_processing_error(exc) from exc
+            raise translate_media_processing_error(exc) from exc
 
         upload_limit = self._upload_limit_for_media_type(inspected_media.media_type)
         if file_size_bytes > upload_limit:
@@ -2426,14 +2419,6 @@ class ContentPipelineService:
         except (PipelineIngestError, PipelineItemNotFoundError):
             return
 
-    @staticmethod
-    def _ensure_stage_attempt_is_current(stage_entry: PipelineStageJournal, *, attempt: int) -> None:
-        if attempt < stage_entry.attempt_count:
-            raise PipelineIngestError(
-                "Received a stale stage transition for "
-                f"{stage_entry.stage.value}: attempt {attempt} is behind durable attempt {stage_entry.attempt_count}."
-            )
-
     async def _restore_stage_snapshot(self, stage_entry_id: uuid.UUID, snapshot: StageJournalSnapshot) -> None:
         try:
             result = await self._session.execute(
@@ -2466,11 +2451,11 @@ class ContentPipelineService:
         stage_entries: tuple[PipelineStageJournal, ...] | None = None,
         current_entry: PipelineStageJournal | None = None,
     ) -> ContentPipelineItemRead:
-        resolved_stage_entries = stage_entries or self._sorted_stage_entries(meme_file)
+        resolved_stage_entries = stage_entries or sorted_stage_entries(meme_file)
         if not resolved_stage_entries:
             raise PipelineIngestError(f"Pipeline item {meme_file.id} is missing journal state.")
 
-        resolved_current_entry = current_entry or self._resolve_current_stage(resolved_stage_entries)
+        resolved_current_entry = current_entry or resolve_current_stage(resolved_stage_entries)
         return ContentPipelineItemRead(
             meme_id=meme_file.meme_id,
             meme_file_id=meme_file.id,
@@ -2483,30 +2468,6 @@ class ContentPipelineService:
             last_error_text=resolved_current_entry.last_error_text,
             attempt_count=resolved_current_entry.attempt_count,
             stages=tuple(ContentPipelineStageJournalRead.model_validate(entry) for entry in resolved_stage_entries),
-        )
-
-    @staticmethod
-    def _sorted_stage_entries(meme_file: MemeFile) -> tuple[PipelineStageJournal, ...]:
-        return tuple(
-            sorted(
-                meme_file.pipeline_stage_journal_entries,
-                key=lambda entry: _STAGE_ORDER[entry.stage],
-            )
-        )
-
-    @staticmethod
-    def _resolve_current_stage(stage_entries: tuple[PipelineStageJournal, ...]) -> PipelineStageJournal:
-        for stage_entry in stage_entries:
-            if stage_entry.status in _ACTIVE_STAGE_STATUSES:
-                return stage_entry
-        return stage_entries[-1]
-
-    @staticmethod
-    def _is_replay_reserved(stage_entry: PipelineStageJournal) -> bool:
-        return (
-            stage_entry.status in {ContentPipelineStageStatus.PENDING, ContentPipelineStageStatus.PROCESSING}
-            and stage_entry.normalized_reason == _PIPELINE_REASON_REPLAY_REQUESTED
-            and stage_entry.last_event_id is not None
         )
 
     def _select_replay_entry(
@@ -2524,7 +2485,7 @@ class ContentPipelineService:
                 raise PipelineReplayNotAllowedError(
                     f"Stage {requested_stage.value} has no durable journal row for this pipeline item.",
                 )
-            if self._is_replay_reserved(requested_entry):
+            if is_replay_reserved(requested_entry):
                 return requested_entry
             if requested_entry.status is not ContentPipelineStageStatus.FAILED or not requested_entry.is_retryable:
                 raise PipelineReplayNotAllowedError(
@@ -2533,70 +2494,12 @@ class ContentPipelineService:
             return requested_entry
 
         for stage_entry in reversed(stage_entries):
-            if self._is_replay_reserved(stage_entry):
+            if is_replay_reserved(stage_entry):
                 return stage_entry
             if stage_entry.status is ContentPipelineStageStatus.FAILED and stage_entry.is_retryable:
                 return stage_entry
 
         raise PipelineReplayNotAllowedError("No failed retryable stage exists for this pipeline item.")
-
-    @staticmethod
-    def _snapshot_stage(stage_entry: PipelineStageJournal) -> StageJournalSnapshot:
-        return StageJournalSnapshot(
-            status=stage_entry.status,
-            attempt_count=stage_entry.attempt_count,
-            last_event_id=stage_entry.last_event_id,
-            normalized_reason=stage_entry.normalized_reason,
-            last_error_text=stage_entry.last_error_text,
-            is_retryable=stage_entry.is_retryable,
-            retry_after=stage_entry.retry_after,
-            started_at=stage_entry.started_at,
-            finished_at=stage_entry.finished_at,
-        )
-
-    @staticmethod
-    def _reserve_replay(stage_entry: PipelineStageJournal, replay_event: ContentPipelineDispatchEvent) -> None:
-        stage_entry.status = ContentPipelineStageStatus.PENDING
-        stage_entry.attempt_count = replay_event.attempt
-        stage_entry.last_event_id = replay_event.event_id
-        stage_entry.normalized_reason = _PIPELINE_REASON_REPLAY_REQUESTED
-        stage_entry.last_error_text = None
-        stage_entry.is_retryable = True
-        stage_entry.retry_after = None
-        stage_entry.started_at = None
-        stage_entry.finished_at = None
-
-    @staticmethod
-    def _matches_list_filter(
-        current_entry: PipelineStageJournal,
-        *,
-        filter_by: ContentPipelineItemFilter,
-        stale_before: datetime,
-    ) -> bool:
-        if filter_by is ContentPipelineItemFilter.ALL:
-            return True
-        if filter_by is ContentPipelineItemFilter.DUPLICATE:
-            return current_entry.status is ContentPipelineStageStatus.DUPLICATE
-        if filter_by is ContentPipelineItemFilter.FAILED:
-            return current_entry.status is ContentPipelineStageStatus.FAILED
-        if filter_by is ContentPipelineItemFilter.STUCK:
-            if current_entry.status not in {
-                ContentPipelineStageStatus.PENDING,
-                ContentPipelineStageStatus.PROCESSING,
-            }:
-                return False
-            if current_entry.retry_after is not None:
-                return current_entry.retry_after <= utcnow()
-            return current_entry.updated_at <= stale_before
-        return False
-
-    @staticmethod
-    def _trim_reason(normalized_reason: str) -> str:
-        return normalized_reason.strip()[:MAX_PIPELINE_REASON_LENGTH]
-
-    @staticmethod
-    def _trim_error_text(last_error_text: str) -> str:
-        return last_error_text.strip()[:MAX_PIPELINE_ERROR_LENGTH]
 
     def _upload_limit_for_media_type(self, media_type: ContentKind) -> int:
         if media_type is ContentKind.IMAGE:
@@ -2606,92 +2509,6 @@ class ContentPipelineService:
         if media_type is ContentKind.VIDEO:
             return self._settings.pipeline_video_upload_max_bytes
         return self._settings.pipeline_image_upload_max_bytes
-
-    @staticmethod
-    def _translate_media_processing_error(exc: Exception) -> PipelinePayloadValidationError:
-        from memexpert.core.media import MediaProcessingError, MediaTimeoutError, MediaValidationError
-
-        if isinstance(exc, MediaTimeoutError):
-            return PipelinePayloadValidationError(str(exc))
-        if isinstance(exc, MediaValidationError):
-            return PipelineUnsupportedMediaTypeError(str(exc))
-        if isinstance(exc, MediaProcessingError):
-            return PipelinePayloadValidationError(str(exc))
-        return PipelinePayloadValidationError(str(exc))
-
-    @staticmethod
-    def _normalize_filename(filename: str | None) -> str:
-        if filename is None:
-            raise PipelinePayloadValidationError("Uploaded file must include a filename.")
-
-        normalized_filename = PurePosixPath(filename).name.strip()
-        if not normalized_filename:
-            raise PipelinePayloadValidationError("Uploaded file must include a filename.")
-        return normalized_filename
-
-    @staticmethod
-    def _normalize_content_type(content_type: str | None) -> str:
-        if content_type is None:
-            raise PipelineUnsupportedMediaTypeError("Uploaded file must include a media type.")
-
-        normalized_content_type = content_type.strip().lower()
-        if not normalized_content_type:
-            raise PipelineUnsupportedMediaTypeError("Uploaded file must include a media type.")
-        return normalized_content_type
-
-    @staticmethod
-    def _normalize_extension(filename: str) -> str:
-        suffix = PurePosixPath(filename).suffix.lstrip(".").lower()
-        if not suffix:
-            raise PipelineUnsupportedMediaTypeError("Uploaded filename must include an extension.")
-        return suffix
-
-
-def _compare_telegram_post_ids(candidate: str, current: str | None) -> int:
-    """Return 1 if ``candidate`` is strictly after ``current``, 0 if equal, -1 if before.
-
-    Telegram channel message ids are integers that only ever grow, so the
-    normal path parses both as ints. When the current checkpoint is absent
-    the candidate always wins. The helper falls back to string comparison
-    only when either value cannot be parsed as an int, which keeps the
-    crawler resilient if a caller ever hands the service an opaque
-    identifier (e.g. during tests).
-    """
-
-    if current is None:
-        return 1
-    try:
-        candidate_int = int(candidate)
-        current_int = int(current)
-    except ValueError:
-        if candidate == current:
-            return 0
-        return 1 if candidate > current else -1
-    if candidate_int == current_int:
-        return 0
-    return 1 if candidate_int > current_int else -1
-
-
-def _build_sync_preview_model(
-    payload_preview: dict[str, object],
-    *,
-    target: SyncTargetKind,
-) -> ContentPipelineSyncTargetPreview:
-    """Wrap a raw sync-target preview dict into the typed projection record.
-
-    Shared by both the Qdrant and Meilisearch sync paths so every stored
-    preview row goes through the same timestamp-stamping and shape contract
-    before it is persisted. The runtime captures the raw dict from the
-    post-upsert retrieve response (or from the upsert payload itself when
-    retrieve is skipped); this helper stamps the typed target + timestamp so
-    the schema contract is enforced at the persistence boundary.
-    """
-
-    return ContentPipelineSyncTargetPreview(
-        target=target,
-        preview_fields=dict(payload_preview),
-        preview_fetched_at=utcnow(),
-    )
 
 
 __all__ = [
