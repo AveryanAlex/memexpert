@@ -22,6 +22,7 @@ from memexpert.models.enums import (
 )
 from memexpert.models.user import User
 from memexpert.schemas import CollectionRead, UserRead
+from memexpert.schemas.auth import normalize_auth_email
 from memexpert.services.errors import (
     DuplicateFavoritesCollectionError,
     DuplicateIdentityError,
@@ -36,7 +37,6 @@ if TYPE_CHECKING:
 
 DEFAULT_GUEST_LIFETIME: Final = timedelta(days=90)
 FAVORITES_TITLE: Final = "Favorites"
-MAX_EMAIL_LENGTH: Final = 320
 MAX_GOOGLE_ID_LENGTH: Final = 255
 
 
@@ -54,28 +54,14 @@ class UserService:
 
     @staticmethod
     def normalize_email(email: str | None) -> str | None:
-        """Normalize and validate a user email address."""
+        """Normalize and validate a user email, delegating to the shared auth-schema helper."""
 
         if email is None:
             return None
-
-        normalized_email = email.strip().lower()
-        if not normalized_email:
-            raise InvalidIdentityError("Email cannot be blank.")
-        if len(normalized_email) > MAX_EMAIL_LENGTH:
-            raise InvalidIdentityError(
-                f"Email must be at most {MAX_EMAIL_LENGTH} characters long.",
-            )
-        if " " in normalized_email:
-            raise InvalidIdentityError("Email cannot contain spaces.")
-
-        local_part, separator, domain = normalized_email.partition("@")
-        if separator != "@" or not local_part or not domain or "." not in domain:
-            raise InvalidIdentityError("Email must be a valid address.")
-        if domain.startswith(".") or domain.endswith(".") or ".." in normalized_email:
-            raise InvalidIdentityError("Email must be a valid address.")
-
-        return normalized_email
+        try:
+            return normalize_auth_email(email)
+        except ValueError as exc:
+            raise InvalidIdentityError(str(exc)) from exc
 
     @staticmethod
     def normalize_google_id(google_id: str | None) -> str | None:
