@@ -301,6 +301,36 @@ class CrawlerSessionNotRunnableError(PipelineIngestError):
     error_code: ClassVar[str] = "crawler_session_not_runnable"
 
 
+class CrawlerChannelNotFoundError(PipelineIngestError):
+    """Raised when an operator references a source channel id that does not exist.
+
+    Distinct from :class:`CrawlerChannelNotTrackedError`: that error fires
+    when the crawler ingest path receives a post for a channel it cannot
+    find by ``(platform, platform_id)``; this one fires in the operator
+    surface when an operator pokes a ``source_channel_id`` that does not
+    resolve to any row at all. Keeping them separate lets the route
+    dispatcher map each to a different error code without stringifying
+    the exception.
+    """
+
+    error_code: ClassVar[str] = "crawler_channel_not_found"
+
+
+class CrawlerInvalidSessionError(PipelineIngestError):
+    """Raised when the reassignment target session does not exist.
+
+    Distinct from :class:`CrawlerSessionNotRunnableError` — that error
+    fires when a session is known but is in a flood-wait, stopped, or
+    quarantined state; this one fires when the operator points the
+    reassignment call at a session name that has no
+    :class:`memexpert.models.content.TelegramSessionState` row at all.
+    Operator tooling relies on the distinction because the recovery path
+    differs: "unknown target" is a typo, "not runnable" is a cooldown.
+    """
+
+    error_code: ClassVar[str] = "crawler_invalid_session"
+
+
 __all__ = [
     "AccountLinkAlreadyCompletedError",
     "AccountLinkError",
@@ -313,7 +343,9 @@ __all__ = [
     "CollectionServiceError",
     "CollectionVerificationRequiredError",
     "CollectionWriteAccessError",
+    "CrawlerChannelNotFoundError",
     "CrawlerChannelNotTrackedError",
+    "CrawlerInvalidSessionError",
     "CrawlerPublishError",
     "CrawlerSessionNotRunnableError",
     "DuplicateCollectionInviteError",

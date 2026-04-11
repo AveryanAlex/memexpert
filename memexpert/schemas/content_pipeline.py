@@ -85,6 +85,14 @@ class ContentPipelineErrorCode(StrEnum):
     INGEST_FAILURE = "pipeline_ingest_failure"
     PUBLISH_FAILURE = "pipeline_publish_failure"
     REPLAY_NOT_ALLOWED = "pipeline_replay_not_allowed"
+    CRAWLER_CHANNEL_NOT_FOUND = "crawler_channel_not_found"
+    CRAWLER_CHANNEL_NOT_TRACKED = "crawler_channel_not_tracked"
+    CRAWLER_INVALID_SESSION = "crawler_invalid_session"
+    CRAWLER_SESSION_NOT_RUNNABLE = "crawler_session_not_runnable"
+    TELEGRAM_FLOOD_WAIT = "telegram_flood_wait"
+    TELEGRAM_SESSION_BANNED = "telegram_session_banned"
+    TELEGRAM_PROVIDER_UNAVAILABLE = "telegram_provider_unavailable"
+    TELEGRAM_MALFORMED_MESSAGE = "telegram_malformed_message"
 
 
 class ContentPipelineItemFilter(StrEnum):
@@ -295,6 +303,12 @@ class TelegramSessionStateRead(BaseModel):
     T03 can serialize the state without re-exporting SQLAlchemy models to
     the API layer. The projection is intentionally 1:1 with the ORM row so
     operators see the full session-health surface.
+
+    ``owned_channel_count`` is additive — it defaults to ``0`` so callers
+    that validate a raw ORM row (for tests and pre-T03 fixtures) still
+    round-trip cleanly without providing the count. The T03
+    ``CrawlerOperationsService.list_sessions`` method computes the value
+    from a second query and passes it explicitly.
     """
 
     model_config = ConfigDict(from_attributes=True)
@@ -310,6 +324,7 @@ class TelegramSessionStateRead(BaseModel):
     quarantined_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
+    owned_channel_count: StrictInt = Field(default=0, ge=0)
 
 
 class ContentPipelineDispatchEvent(BaseModel):

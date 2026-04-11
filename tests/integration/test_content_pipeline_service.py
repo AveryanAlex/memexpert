@@ -3127,3 +3127,63 @@ async def test_create_crawler_ingest_publish_failure_preserves_source_row(
     assert transcode_row.status is ContentPipelineStageStatus.FAILED
     assert transcode_row.normalized_reason == "publish_failed"
 
+
+async def test_crawler_operations_list_sessions_populates_owned_channel_count(
+    migrated_db_session: AsyncSession,
+) -> None:
+    """T03: ``CrawlerOperationsService.list_sessions`` must compute owned channel counts."""
+
+    from memexpert.crawlers.telegram.client import FakeTelegramClient
+    from memexpert.crawlers.telegram.runtime import TelegramCrawlerRuntime
+    from memexpert.models.content import TelegramSessionState
+    from memexpert.models.enums import TelegramSessionStatus
+    from memexpert.services.crawler_operations import CrawlerOperationsService
+
+    migrated_db_session.add(
+        TelegramSessionState(
+            session_name="primary",
+            status=TelegramSessionStatus.ACTIVE,
+        )
+    )
+    migrated_db_session.add(
+        TelegramSessionState(
+            session_name="empty",
+            status=TelegramSessionStatus.STOPPED,
+        )
+    )
+    await migrated_db_session.commit()
+
+    await _seed_tracked_telegram_channel(
+        migrated_db_session,
+        platform_id="owned_one",
+        title="Owned One",
+    )
+    await _seed_tracked_telegram_channel(
+        migrated_db_session,
+        platform_id="owned_two",
+        title="Owned Two",
+    )
+    # Bind both channels to the primary session so the operations surface
+    # can count them.
+    primary_channels = (
+        await migrated_db_session.execute(
+            select(SourceChannel).where(SourceChannel.platform_id.in_(["owned_one", "owned_two"]))
+        )
+    ).scalars().all()
+    for channel in primary_channels:
+        channel.session_id = "primary"
+    await migrated_db_session.commit()
+
+    pipeline_service = _build_crawler_service(migrated_db_session, phash_tag="O")
+    runtime = TelegramCrawlerRuntime(
+        pipeline_service=pipeline_service,
+        telegram_client=FakeTelegramClient(),
+        session=migrated_db_session,
+        settings=Settings(),
+    )
+    service = CrawlerOperationsService(session=migrated_db_session, runtime=runtime)
+
+    sessions_by_name = {row.session_name: row for row in await service.list_sessions()}
+    assert sessions_by_name["primary"].owned_channel_count == 2
+    assert sessions_by_name["empty"].owned_channel_count == 0
+

@@ -634,3 +634,77 @@ async def test_catch_up_channel_refuses_non_active_session(
         _ = await runtime.catch_up_channel("idle", "some_channel")
 
 
+# ---------------------------------------------------------------------------
+# CrawlerOperationsService layered tests (T03)
+# ---------------------------------------------------------------------------
+
+
+async def test_crawler_operations_service_reassign_updates_session_binding_and_projects_row(
+    migrated_db_session: AsyncSession,
+) -> None:
+    from memexpert.services import CrawlerInvalidSessionError
+    from memexpert.services.crawler_operations import CrawlerOperationsService
+
+    await _seed_active_session(migrated_db_session, session_name="primary")
+    await _seed_active_session(migrated_db_session, session_name="secondary")
+    channel = await _seed_curated_channel(
+        migrated_db_session,
+        platform_id="service_movable",
+        session_id="primary",
+    )
+    runtime = _build_runtime(
+        migrated_db_session,
+        telegram_client=FakeTelegramClient(),
+        phash_tag="S",
+    )
+    service = CrawlerOperationsService(session=migrated_db_session, runtime=runtime)
+
+    projection = await service.reassign_channel(
+        channel.id,
+        new_session_name="secondary",
+    )
+    assert projection.session_id == "secondary"
+    assert projection.id == channel.id
+
+    # The durable row actually moved to the new binding.
+    await migrated_db_session.refresh(channel)
+    assert channel.session_id == "secondary"
+
+    # Unknown target session surfaces as the distinct typed error.
+    with pytest.raises(CrawlerInvalidSessionError):
+        _ = await service.reassign_channel(channel.id, new_session_name="ghost")
+
+
+async def test_crawler_operations_service_replay_channel_post_delegates_to_runtime(
+    migrated_db_session: AsyncSession,
+) -> None:
+    from memexpert.schemas.content_pipeline import CrawlerIngestOutcome
+    from memexpert.services.crawler_operations import CrawlerOperationsService
+
+    await _seed_active_session(migrated_db_session, session_name="primary")
+    channel = await _seed_curated_channel(
+        migrated_db_session,
+        platform_id="service_replay",
+        session_id="primary",
+        last_read_post_id="999",
+    )
+
+    fake = FakeTelegramClient()
+    fake.pin_single_message(
+        channel_id="service_replay",
+        post_id="42",
+        message=_build_photo_message(message_id="42", channel_id="service_replay"),
+        media=b"service-replay-bytes",
+    )
+    runtime = _build_runtime(migrated_db_session, telegram_client=fake, phash_tag="D")
+    service = CrawlerOperationsService(session=migrated_db_session, runtime=runtime)
+
+    result = await service.replay_channel_post(channel.id, post_id="42")
+    assert result.outcome is CrawlerIngestOutcome.INGESTED
+    assert result.meme_file_id is not None
+
+    # Replay still does not advance the durable checkpoint.
+    await migrated_db_session.refresh(channel)
+    assert channel.last_read_post_id == "999"
+
+

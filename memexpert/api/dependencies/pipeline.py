@@ -23,9 +23,23 @@ from memexpert.core.qdrant import (
     QdrantSimilarityClientProtocol,
     QdrantSyncClientProtocol,
 )
+from memexpert.crawlers.telegram.client import (
+    FakeTelegramClient,
+    PipelineTelegramClientProtocol,
+    PipelineTelegramError,
+    PipelineTelegramFloodWaitError,
+    PipelineTelegramMalformedMessageError,
+    PipelineTelegramProviderUnavailableError,
+    PipelineTelegramSessionBannedError,
+)
+from memexpert.crawlers.telegram.runtime import TelegramCrawlerRuntime
 from memexpert.schemas.content_pipeline import ContentPipelineErrorCode, ContentPipelineErrorResponse
 from memexpert.services import (
     ContentPipelineService,
+    CrawlerChannelNotFoundError,
+    CrawlerChannelNotTrackedError,
+    CrawlerInvalidSessionError,
+    CrawlerSessionNotRunnableError,
     PipelineIngestError,
     PipelineItemNotFoundError,
     PipelineOperatorTokenError,
@@ -38,6 +52,7 @@ from memexpert.services import (
     PipelineStorageError,
     PipelineUnsupportedMediaTypeError,
 )
+from memexpert.services.crawler_operations import CrawlerOperationsService
 
 PIPELINE_OPERATOR_TOKEN_HEADER_NAME: Final = "X-Memexpert-Operator-Token"
 
@@ -52,6 +67,14 @@ PIPELINE_ERROR_STATUS_CODES: Final[dict[ContentPipelineErrorCode, int]] = {
     ContentPipelineErrorCode.INGEST_FAILURE: int(HTTPStatus.SERVICE_UNAVAILABLE),
     ContentPipelineErrorCode.PUBLISH_FAILURE: int(HTTPStatus.SERVICE_UNAVAILABLE),
     ContentPipelineErrorCode.REPLAY_NOT_ALLOWED: int(HTTPStatus.CONFLICT),
+    ContentPipelineErrorCode.CRAWLER_CHANNEL_NOT_FOUND: int(HTTPStatus.NOT_FOUND),
+    ContentPipelineErrorCode.CRAWLER_CHANNEL_NOT_TRACKED: int(HTTPStatus.NOT_FOUND),
+    ContentPipelineErrorCode.CRAWLER_INVALID_SESSION: int(HTTPStatus.CONFLICT),
+    ContentPipelineErrorCode.CRAWLER_SESSION_NOT_RUNNABLE: int(HTTPStatus.CONFLICT),
+    ContentPipelineErrorCode.TELEGRAM_FLOOD_WAIT: int(HTTPStatus.SERVICE_UNAVAILABLE),
+    ContentPipelineErrorCode.TELEGRAM_SESSION_BANNED: int(HTTPStatus.SERVICE_UNAVAILABLE),
+    ContentPipelineErrorCode.TELEGRAM_PROVIDER_UNAVAILABLE: int(HTTPStatus.BAD_GATEWAY),
+    ContentPipelineErrorCode.TELEGRAM_MALFORMED_MESSAGE: int(HTTPStatus.UNPROCESSABLE_ENTITY),
 }
 
 PIPELINE_ERROR_RESPONSES: Final[dict[int | str, dict[str, object]]] = {
@@ -75,8 +98,19 @@ PIPELINE_ERROR_RESPONSES: Final[dict[int | str, dict[str, object]]] = {
         "description": "The uploaded file exceeds the configured byte limit.",
         "model": ContentPipelineErrorResponse,
     },
+    int(HTTPStatus.UNPROCESSABLE_ENTITY): {
+        "description": (
+            "The request payload is structurally invalid or the Telegram adapter "
+            "returned a malformed message."
+        ),
+        "model": ContentPipelineErrorResponse,
+    },
     int(HTTPStatus.UNSUPPORTED_MEDIA_TYPE): {
         "description": "The uploaded media type is not supported by the ingest path.",
+        "model": ContentPipelineErrorResponse,
+    },
+    int(HTTPStatus.BAD_GATEWAY): {
+        "description": "An upstream dependency (Telegram or a sync target) is unreachable.",
         "model": ContentPipelineErrorResponse,
     },
     int(HTTPStatus.SERVICE_UNAVAILABLE): {
@@ -87,14 +121,29 @@ PIPELINE_ERROR_RESPONSES: Final[dict[int | str, dict[str, object]]] = {
 
 
 class PipelineHTTPError(Exception):
-    """Internal API-layer pipeline exception rendered as a stable JSON payload."""
+    """Internal API-layer pipeline exception rendered as a stable JSON payload.
+
+    ``headers`` carries optional HTTP headers that must be attached to
+    the JSON response (for example, ``Retry-After`` when the Telegram
+    adapter surfaces a flood-wait cooldown). Keep the headers mapping
+    typed as ``dict[str, str]`` so the JSON response renderer can pass
+    it straight to :class:`JSONResponse` without format translation.
+    """
 
     status_code: int
     payload: ContentPipelineErrorResponse
+    headers: dict[str, str] | None
 
-    def __init__(self, *, status_code: int, payload: ContentPipelineErrorResponse) -> None:
+    def __init__(
+        self,
+        *,
+        status_code: int,
+        payload: ContentPipelineErrorResponse,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self.status_code = status_code
         self.payload = payload
+        self.headers = headers
         super().__init__(payload.detail)
 
 
@@ -105,6 +154,7 @@ async def pipeline_http_exception_handler(_request: Request, exc: Exception) -> 
     return JSONResponse(
         status_code=pipeline_error.status_code,
         content=pipeline_error.payload.model_dump(mode="json"),
+        headers=pipeline_error.headers,
     )
 
 
@@ -153,6 +203,50 @@ def get_meilisearch_sync_client() -> MeilisearchSyncClientProtocol:
     return PipelineMeilisearchSyncClient(settings=get_settings())
 
 
+def get_pipeline_telegram_client() -> PipelineTelegramClientProtocol:
+    """Return the default Telegram adapter bound to the crawler runtime.
+
+    The default is :class:`FakeTelegramClient` (no network calls, no
+    Telethon import at call time) because the real
+    :class:`PipelineTelethonClient` is inherently bound to a single
+    ``session_name`` and the operator inspect surface cannot pick a
+    session for the caller. Tests and the crawler worker override this
+    provider via :meth:`FastAPI.dependency_overrides` to inject either a
+    pinned fake or a per-session real client. Keeping the default a
+    safe no-op means the route layer never imports Telethon at import
+    time.
+    """
+
+    return FakeTelegramClient()
+
+
+def get_crawler_runtime(
+    session: Annotated[AsyncSession, Depends(get_db_session)],
+    pipeline_service: Annotated[ContentPipelineService, Depends(get_content_pipeline_service)],
+    telegram_client: Annotated[
+        PipelineTelegramClientProtocol,
+        Depends(get_pipeline_telegram_client),
+    ],
+) -> TelegramCrawlerRuntime:
+    """Construct the single-session crawler runtime for one request."""
+
+    return TelegramCrawlerRuntime(
+        pipeline_service=pipeline_service,
+        telegram_client=telegram_client,
+        session=session,
+        settings=get_settings(),
+    )
+
+
+def get_crawler_operations_service(
+    session: Annotated[AsyncSession, Depends(get_db_session)],
+    runtime: Annotated[TelegramCrawlerRuntime, Depends(get_crawler_runtime)],
+) -> CrawlerOperationsService:
+    """Return the operator crawler-operations service for one request."""
+
+    return CrawlerOperationsService(session=session, runtime=runtime)
+
+
 PipelineServiceDep = Annotated[ContentPipelineService, Depends(get_content_pipeline_service)]
 OperatorTokenDep = Annotated[None, Depends(require_pipeline_operator_token)]
 QdrantSyncClientDep = Annotated[QdrantSyncClientProtocol, Depends(get_qdrant_sync_client)]
@@ -164,41 +258,112 @@ MeilisearchSyncClientDep = Annotated[
     MeilisearchSyncClientProtocol,
     Depends(get_meilisearch_sync_client),
 ]
+PipelineTelegramClientDep = Annotated[
+    PipelineTelegramClientProtocol,
+    Depends(get_pipeline_telegram_client),
+]
+CrawlerRuntimeDep = Annotated[TelegramCrawlerRuntime, Depends(get_crawler_runtime)]
+CrawlerOperationsServiceDep = Annotated[
+    CrawlerOperationsService,
+    Depends(get_crawler_operations_service),
+]
 
 
-def to_pipeline_http_error(error: PipelineServiceError) -> PipelineHTTPError:
-    """Convert a service-layer pipeline error into an API-facing JSON error response."""
+def to_pipeline_http_error(
+    error: PipelineServiceError | PipelineTelegramError,
+) -> PipelineHTTPError:
+    """Convert a service-layer or crawler adapter error into an API-facing JSON payload.
 
-    if isinstance(error, PipelineOperatorTokenError):
-        error_code = ContentPipelineErrorCode.INVALID_OPERATOR_TOKEN
-    elif isinstance(error, PipelineItemNotFoundError):
-        error_code = ContentPipelineErrorCode.ITEM_NOT_FOUND
-    elif isinstance(error, PipelinePayloadTooLargeError):
-        error_code = ContentPipelineErrorCode.PAYLOAD_TOO_LARGE
-    elif isinstance(error, PipelineUnsupportedMediaTypeError):
-        error_code = ContentPipelineErrorCode.UNSUPPORTED_MEDIA_TYPE
-    elif isinstance(error, PipelineSourceConflictError):
-        error_code = ContentPipelineErrorCode.SOURCE_CONFLICT
-    elif isinstance(error, PipelineReplayNotAllowedError):
-        error_code = ContentPipelineErrorCode.REPLAY_NOT_ALLOWED
-    elif isinstance(error, PipelineStorageError):
-        error_code = ContentPipelineErrorCode.STORAGE_FAILURE
-    elif isinstance(error, PipelinePublishError):
-        error_code = ContentPipelineErrorCode.PUBLISH_FAILURE
-    elif isinstance(error, PipelineIngestError):
-        error_code = ContentPipelineErrorCode.INGEST_FAILURE
-    elif isinstance(error, PipelinePayloadValidationError):
-        error_code = ContentPipelineErrorCode.PAYLOAD_INVALID
-    else:
-        error_code = ContentPipelineErrorCode.INGEST_FAILURE
+    The function accepts BOTH the pipeline service exception hierarchy
+    (:class:`PipelineServiceError`) and the crawler adapter hierarchy
+    (:class:`PipelineTelegramError`) so the operator route layer never
+    has to maintain a second dispatcher. The two hierarchies are
+    intentionally distinct classes so the service layer can raise one
+    without importing the other, but the route translation is centralized
+    here because the operator pipeline and crawler surfaces share the
+    same JSON error envelope.
+    """
 
+    if isinstance(error, PipelineTelegramError):
+        return _telegram_error_to_http(error)
+    error_code = _classify_pipeline_service_error(error)
     return PipelineHTTPError(
         status_code=PIPELINE_ERROR_STATUS_CODES[error_code],
         payload=ContentPipelineErrorResponse(code=error_code, detail=str(error)),
     )
 
 
+def _classify_pipeline_service_error(
+    error: PipelineServiceError,
+) -> ContentPipelineErrorCode:
+    """Return the machine-readable error code for a typed service error."""
+
+    if isinstance(error, PipelineOperatorTokenError):
+        return ContentPipelineErrorCode.INVALID_OPERATOR_TOKEN
+    if isinstance(error, PipelineItemNotFoundError):
+        return ContentPipelineErrorCode.ITEM_NOT_FOUND
+    if isinstance(error, PipelinePayloadTooLargeError):
+        return ContentPipelineErrorCode.PAYLOAD_TOO_LARGE
+    if isinstance(error, PipelineUnsupportedMediaTypeError):
+        return ContentPipelineErrorCode.UNSUPPORTED_MEDIA_TYPE
+    if isinstance(error, PipelineSourceConflictError):
+        return ContentPipelineErrorCode.SOURCE_CONFLICT
+    if isinstance(error, PipelineReplayNotAllowedError):
+        return ContentPipelineErrorCode.REPLAY_NOT_ALLOWED
+    if isinstance(error, PipelineStorageError):
+        return ContentPipelineErrorCode.STORAGE_FAILURE
+    if isinstance(error, PipelinePublishError):
+        return ContentPipelineErrorCode.PUBLISH_FAILURE
+    # Crawler service errors are ``PipelineIngestError`` subclasses so
+    # the dispatcher routes them to the dedicated operator codes BEFORE
+    # falling through to the generic ingest-failure mapping.
+    if isinstance(error, CrawlerChannelNotFoundError):
+        return ContentPipelineErrorCode.CRAWLER_CHANNEL_NOT_FOUND
+    if isinstance(error, CrawlerChannelNotTrackedError):
+        return ContentPipelineErrorCode.CRAWLER_CHANNEL_NOT_TRACKED
+    if isinstance(error, CrawlerInvalidSessionError):
+        return ContentPipelineErrorCode.CRAWLER_INVALID_SESSION
+    if isinstance(error, CrawlerSessionNotRunnableError):
+        return ContentPipelineErrorCode.CRAWLER_SESSION_NOT_RUNNABLE
+    if isinstance(error, PipelineIngestError):
+        return ContentPipelineErrorCode.INGEST_FAILURE
+    if isinstance(error, PipelinePayloadValidationError):
+        return ContentPipelineErrorCode.PAYLOAD_INVALID
+    return ContentPipelineErrorCode.INGEST_FAILURE
+
+
+def _telegram_error_to_http(error: PipelineTelegramError) -> PipelineHTTPError:
+    """Translate a crawler adapter error into the JSON error envelope.
+
+    Flood-wait errors carry a concrete ``wait_seconds`` cooldown value
+    Telegram told us to respect, so the function attaches a
+    :rfc:`7231` ``Retry-After`` header (in seconds) to the response —
+    operator tooling relies on that header to back off without
+    stringifying the detail field.
+    """
+
+    headers: dict[str, str] | None = None
+    if isinstance(error, PipelineTelegramFloodWaitError):
+        error_code = ContentPipelineErrorCode.TELEGRAM_FLOOD_WAIT
+        headers = {"Retry-After": str(max(0, int(error.wait_seconds)))}
+    elif isinstance(error, PipelineTelegramSessionBannedError):
+        error_code = ContentPipelineErrorCode.TELEGRAM_SESSION_BANNED
+    elif isinstance(error, PipelineTelegramProviderUnavailableError):
+        error_code = ContentPipelineErrorCode.TELEGRAM_PROVIDER_UNAVAILABLE
+    elif isinstance(error, PipelineTelegramMalformedMessageError):
+        error_code = ContentPipelineErrorCode.TELEGRAM_MALFORMED_MESSAGE
+    else:
+        error_code = ContentPipelineErrorCode.TELEGRAM_PROVIDER_UNAVAILABLE
+    return PipelineHTTPError(
+        status_code=PIPELINE_ERROR_STATUS_CODES[error_code],
+        payload=ContentPipelineErrorResponse(code=error_code, detail=str(error)),
+        headers=headers,
+    )
+
+
 __all__ = [
+    "CrawlerOperationsServiceDep",
+    "CrawlerRuntimeDep",
     "MeilisearchSyncClientDep",
     "OperatorTokenDep",
     "PIPELINE_ERROR_RESPONSES",
@@ -206,10 +371,14 @@ __all__ = [
     "PIPELINE_OPERATOR_TOKEN_HEADER_NAME",
     "PipelineHTTPError",
     "PipelineServiceDep",
+    "PipelineTelegramClientDep",
     "QdrantSimilarityClientDep",
     "QdrantSyncClientDep",
     "get_content_pipeline_service",
+    "get_crawler_operations_service",
+    "get_crawler_runtime",
     "get_meilisearch_sync_client",
+    "get_pipeline_telegram_client",
     "get_qdrant_similarity_client",
     "get_qdrant_sync_client",
     "pipeline_http_exception_handler",
