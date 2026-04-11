@@ -1431,15 +1431,12 @@ class ContentPipelineService:
         # is truly downstream-ready even though we still publish MEME_READY so S03's
         # sync_qdrant/sync_meili consumers can pick up the canonical state. Sync
         # stages must not regress that READY truth — they advertise search-target
-        # visibility independently of the file's processing lifecycle.
+        # visibility independently of the file's processing lifecycle. Every other
+        # upstream stage leaves the file in PROCESSING so the readiness truth only
+        # flips through the classify path.
         if stage is ContentPipelineStage.CLASSIFY:
             meme_file.status = ContentProcessingStatus.READY
-        elif stage in {ContentPipelineStage.SYNC_QDRANT, ContentPipelineStage.SYNC_MEILI}:
-            # Sync success never downgrades READY back to PROCESSING.
-            pass
-        elif downstream_dispatches:
-            meme_file.status = ContentProcessingStatus.PROCESSING
-        else:
+        elif stage not in {ContentPipelineStage.SYNC_QDRANT, ContentPipelineStage.SYNC_MEILI}:
             meme_file.status = ContentProcessingStatus.PROCESSING
 
         # Classify fan-out is the only case that must be atomic across BOTH
