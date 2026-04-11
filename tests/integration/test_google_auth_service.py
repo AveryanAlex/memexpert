@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import TYPE_CHECKING
 
 import httpx
@@ -12,9 +13,13 @@ from sqlalchemy import func, select
 
 from memexpert.models.collection import Collection
 from memexpert.models.enums import AccountStatus, AccountType, CollectionKind
-from memexpert.models.user import RefreshToken, User
+from memexpert.models.user import AccountMergeLog, RefreshToken, User
 from memexpert.services import (
+    AccountLinkResult,
+    AccountLinkService,
     AccountUnavailableError,
+    AuthService,
+    AuthSession,
     EmailAlreadyInUseError,
     ProviderAccessDeniedError,
     ProviderAuthService,
@@ -70,6 +75,9 @@ def google_response(
     return httpx.Response(status_code=status_code)
 
 
+JWT_SECRET = "google-service-test-jwt-secret-with-32-byte-minimum"
+
+
 def build_provider_auth_service(
     migrated_db_session: AsyncSession,
     *,
@@ -85,6 +93,43 @@ def build_provider_auth_service(
         google_userinfo_url=GOOGLE_USERINFO_URL,
         google_timeout_seconds=GOOGLE_TIMEOUT_SECONDS,
         google_http_transport=google_http_transport,
+    )
+
+
+def build_account_link_service(
+    migrated_db_session: AsyncSession,
+    *,
+    google_http_transport: httpx.AsyncBaseTransport | None = None,
+) -> AccountLinkService:
+    return AccountLinkService(
+        migrated_db_session,
+        provider_auth_service=build_provider_auth_service(
+            migrated_db_session, google_http_transport=google_http_transport,
+        ),
+    )
+
+
+def build_auth_service(session: AsyncSession) -> AuthService:
+    return AuthService(
+        session,
+        jwt_secret=JWT_SECRET,
+        access_token_ttl=timedelta(minutes=15),
+        refresh_token_ttl=timedelta(days=30),
+        refresh_cookie_secure=False,
+    )
+
+
+async def _issue_session_for(
+    migrated_db_session: AsyncSession,
+    link_result: AccountLinkResult,
+    *,
+    device_info: str | None = None,
+) -> AuthSession:
+    auth_service = build_auth_service(migrated_db_session)
+    return await auth_service.issue_session_for_user(
+        link_result.user,
+        device_info=device_info,
+        reload_user=False,
     )
 
 
@@ -105,14 +150,17 @@ async def test_google_auth_creates_new_user_by_sub_and_records_mocked_exchange_h
             ]
         )
     )
-    provider_auth_service = build_provider_auth_service(
+    link_service = build_account_link_service(
         migrated_db_session,
         google_http_transport=flow.build_transport(),
     )
 
-    auth_session = await provider_auth_service.authenticate_with_google_code(
+    link_result = await link_service.link_guest_with_google_code(
+        guest_user_id=None,
         code="google-auth-code",
-        device_info="Chrome on macOS",
+    )
+    auth_session = await _issue_session_for(
+        migrated_db_session, link_result, device_info="Chrome on macOS",
     )
 
     assert auth_session.user.account_type is AccountType.FULL
@@ -147,10 +195,14 @@ async def test_google_auth_creates_new_user_by_sub_and_records_mocked_exchange_h
         select(RefreshToken).where(RefreshToken.user_id == auth_session.user.id)
     )
     refresh_token_row = refresh_token_result.scalar_one()
+    merge_log_count_result = await migrated_db_session.execute(select(func.count()).select_from(AccountMergeLog))
 
     assert favorites_count_result.scalar_one() == 1
     assert refresh_token_row.device_info == "Chrome on macOS"
     assert refresh_token_row.token_hash != auth_session.refresh_token
+    # Fresh Google sign-in upgrades a bootstrapped guest in place, no merge
+    # log because there was no existing account to merge into.
+    assert merge_log_count_result.scalar_one() == 0
 
 
 async def test_google_auth_reuses_verified_non_telegram_email_account_and_stamps_verification(
@@ -172,12 +224,15 @@ async def test_google_auth_reuses_verified_non_telegram_email_account_and_stamps
             ]
         )
     )
-    provider_auth_service = build_provider_auth_service(
+    link_service = build_account_link_service(
         migrated_db_session,
         google_http_transport=flow.build_transport(),
     )
 
-    auth_session = await provider_auth_service.authenticate_with_google_code(code="reuse-code")
+    link_result = await link_service.link_guest_with_google_code(
+        guest_user_id=None, code="reuse-code",
+    )
+    auth_session = await _issue_session_for(migrated_db_session, link_result)
 
     assert auth_session.user.id == existing_user.id
     assert auth_session.user.google_id == "google-subject-456"
@@ -190,6 +245,8 @@ async def test_google_auth_reuses_verified_non_telegram_email_account_and_stamps
 
     assert persisted_user.google_id == "google-subject-456"
     assert persisted_user.email_verified_at is not None
+    # Exactly one full account survives — the transient guest was merged
+    # into the existing account and deleted.
     assert user_count_result.scalar_one() == 1
 
 
@@ -212,12 +269,15 @@ async def test_google_auth_does_not_reuse_unverified_email_matches_and_creates_g
             ]
         )
     )
-    provider_auth_service = build_provider_auth_service(
+    link_service = build_account_link_service(
         migrated_db_session,
         google_http_transport=flow.build_transport(),
     )
 
-    auth_session = await provider_auth_service.authenticate_with_google_code(code="unverified-code")
+    link_result = await link_service.link_guest_with_google_code(
+        guest_user_id=None, code="unverified-code",
+    )
+    auth_session = await _issue_session_for(migrated_db_session, link_result)
 
     assert auth_session.user.id != existing_user.id
     assert auth_session.user.google_id == "google-subject-unverified"
@@ -230,6 +290,8 @@ async def test_google_auth_does_not_reuse_unverified_email_matches_and_creates_g
     )
     google_only_user = google_only_user_result.scalar_one()
 
+    # Two users: the original email-only account and the new Google-only
+    # account upgraded in place from the bootstrapped guest.
     assert user_count_result.scalar_one() == 2
     assert google_only_user.email is None
     assert google_only_user.google_id == "google-subject-unverified"
@@ -239,9 +301,8 @@ async def test_google_auth_rejects_telegram_email_collisions_without_side_effect
     migrated_db_session: AsyncSession,
 ) -> None:
     user_service = UserService(migrated_db_session)
-    telegram_user = await create_full_user_via_upgrade(user_service,
-        telegram_id=123456789,
-        email="telegram@example.com",
+    telegram_user = await create_full_user_via_upgrade(
+        user_service, telegram_id=123456789, email="telegram@example.com",
     )
     flow = MockGoogleFlow(
         steps=deque(
@@ -257,20 +318,25 @@ async def test_google_auth_rejects_telegram_email_collisions_without_side_effect
             ]
         )
     )
-    provider_auth_service = build_provider_auth_service(
+    link_service = build_account_link_service(
         migrated_db_session,
         google_http_transport=flow.build_transport(),
     )
 
     with pytest.raises(EmailAlreadyInUseError, match="Telegram-backed"):
-        _ = await provider_auth_service.authenticate_with_google_code(code="conflict-code")
+        _ = await link_service.link_guest_with_google_code(
+            guest_user_id=None, code="conflict-code",
+        )
 
     persisted_user_result = await migrated_db_session.execute(select(User).where(User.id == telegram_user.id))
     persisted_user = persisted_user_result.scalar_one()
     refresh_token_count_result = await migrated_db_session.execute(select(func.count()).select_from(RefreshToken))
+    user_count_result = await migrated_db_session.execute(select(func.count()).select_from(User))
 
     assert persisted_user.google_id is None
     assert refresh_token_count_result.scalar_one() == 0
+    # Bootstrapped guest must be rolled back atomically.
+    assert user_count_result.scalar_one() == 1
 
 
 async def test_google_auth_rejects_inactive_verified_email_reuse_without_attaching_google_id(
@@ -298,13 +364,15 @@ async def test_google_auth_rejects_inactive_verified_email_reuse_without_attachi
             ]
         )
     )
-    provider_auth_service = build_provider_auth_service(
+    link_service = build_account_link_service(
         migrated_db_session,
         google_http_transport=flow.build_transport(),
     )
 
     with pytest.raises(AccountUnavailableError, match="not available"):
-        _ = await provider_auth_service.authenticate_with_google_code(code="inactive-code")
+        _ = await link_service.link_guest_with_google_code(
+            guest_user_id=None, code="inactive-code",
+        )
 
     reloaded_user_result = await migrated_db_session.execute(select(User).where(User.id == existing_user.id))
     reloaded_user = reloaded_user_result.scalar_one()
@@ -366,7 +434,7 @@ async def test_google_auth_surfaces_typed_upstream_and_payload_failures_without_
     flow: httpx.AsyncBaseTransport | None,
     message_fragment: str,
 ) -> None:
-    provider_auth_service = build_provider_auth_service(
+    link_service = build_account_link_service(
         migrated_db_session,
         google_http_transport=flow,
     )
@@ -381,10 +449,12 @@ async def test_google_auth_surfaces_typed_upstream_and_payload_failures_without_
     else:
         expected_error = ProviderAccessDeniedError
     with pytest.raises(expected_error, match=message_fragment):
-        _ = await provider_auth_service.authenticate_with_google_code(code=code)
+        _ = await link_service.link_guest_with_google_code(guest_user_id=None, code=code)
 
     user_count_result = await migrated_db_session.execute(select(func.count()).select_from(User))
     refresh_token_count_result = await migrated_db_session.execute(select(func.count()).select_from(RefreshToken))
 
+    # Upstream/payload failures happen before any bootstrap is attempted,
+    # so no user rows should exist.
     assert user_count_result.scalar_one() == 0
     assert refresh_token_count_result.scalar_one() == 0

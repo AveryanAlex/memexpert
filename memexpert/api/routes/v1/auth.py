@@ -163,15 +163,31 @@ async def login_with_email(
 async def login_with_google(
     request: Request,
     response: Response,
-    provider_auth_service: ProviderAuthServiceDep,
+    _guard: ForbidFullAccountCallerDep,
+    optional_guest: OptionalGuestUserDep,
+    account_link_service: AccountLinkServiceDep,
+    auth_service: AuthServiceDep,
     credentials: Annotated[GoogleAuthRequest, Body()],
 ) -> AuthSessionRead:
-    """Exchange a Google auth code, issue a session, and keep the refresh token cookie-only."""
+    """Exchange a Google auth code through the unified guest-upgrade writer path.
+
+    When the Google identity is unknown, ``AccountLinkService`` bootstraps
+    a guest (or reuses the caller's existing guest) and upgrades it in
+    place. When the identity already maps to a full account, the service
+    merges the guest into that account, carrying any guest-phase state
+    across. Either way the result is a single session on the canonical
+    account.
+    """
 
     try:
-        auth_session = await provider_auth_service.authenticate_with_google_code(
+        link_result = await account_link_service.link_guest_with_google_code(
+            guest_user_id=optional_guest.id if optional_guest else None,
             code=credentials.code,
+        )
+        auth_session = await auth_service.issue_session_for_user(
+            link_result.user,
             device_info=request.headers.get("user-agent"),
+            reload_user=False,
         )
     except AuthServiceError as exc:
         raise to_auth_http_error(exc) from exc

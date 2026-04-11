@@ -166,17 +166,6 @@ class ProviderAuthService:
             user_service=user_service,
         )
 
-    async def authenticate_with_google_code(
-        self,
-        *,
-        code: str,
-        device_info: str | None = None,
-    ) -> AuthSession:
-        """Exchange a Google OAuth code, resolve the full account, and issue a session."""
-
-        google_identity = await self.resolve_google_identity_from_code(code=code)
-        return await self._authenticate_with_google_identity(google_identity, device_info=device_info)
-
     async def authenticate_with_telegram_widget(
         self,
         *,
@@ -270,59 +259,6 @@ class ProviderAuthService:
         """Validate Telegram Mini App initData without issuing a session."""
 
         return self._verify_telegram_miniapp_payload(init_data)
-
-    async def _authenticate_with_google_identity(
-        self,
-        identity: GoogleIdentity,
-        *,
-        device_info: str | None = None,
-    ) -> AuthSession:
-        resolution = await self.resolve_google_identity(identity)
-        if resolution.user is not None:
-            if resolution.matched_by == "verified_email":
-                linked_user = await self._user_service.attach_google_identity(
-                    user_id=resolution.user.id,
-                    google_id=identity.google_id,
-                    email_verified_at=identity.email_verified_at,
-                    commit=False,
-                )
-                return await self._auth_service.issue_session_for_user(
-                    linked_user,
-                    device_info=device_info,
-                )
-
-            return await self._auth_service.issue_session_for_user(
-                resolution.user,
-                device_info=device_info,
-            )
-
-        try:
-            created_user = await self._user_service.create_full_user(
-                google_id=identity.google_id,
-                email=identity.email,
-                email_verified_at=identity.email_verified_at,
-                commit=False,
-            )
-        except DuplicateIdentityError as exc:
-            resolved_user = await self._user_service.get_by_google_id(identity.google_id)
-            if resolved_user is not None:
-                return await self._auth_service.issue_session_for_user(
-                    resolved_user,
-                    device_info=device_info,
-                )
-            if identity.email is not None:
-                conflicting_user = await self._user_service.get_by_email(identity.email)
-                if conflicting_user is not None:
-                    self._ensure_google_reuse_is_allowed(conflicting_user)
-                    raise EmailAlreadyInUseError(
-                        "Verified Google email is already linked to another full account.",
-                    ) from exc
-            raise ProviderPayloadInvalidError("Google identity could not be resolved safely.") from exc
-
-        return await self._auth_service.issue_session_for_user(
-            created_user,
-            device_info=device_info,
-        )
 
     async def _authenticate_with_telegram_identity(
         self,

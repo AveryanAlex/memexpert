@@ -11,9 +11,11 @@ from sqlalchemy import func, select
 from memexpert.core.config import Settings
 from memexpert.core.redis import get_async_redis, is_async_redis_initialized, reset_async_redis_state
 from memexpert.models.user import RefreshToken, User
-from memexpert.services import ProviderAuthService
+from memexpert.services import AccountLinkService
 
 if TYPE_CHECKING:
+    import uuid
+
     from httpx import AsyncClient
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -254,21 +256,21 @@ async def test_google_auth_validation_rejects_extra_fields_before_provider_calls
     postgres_session_factory: async_sessionmaker[AsyncSession],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[tuple[str, str | None]] = []
+    calls: list[tuple[uuid.UUID | None, str]] = []
 
-    async def fake_authenticate_with_google_code(
-        self: ProviderAuthService,
+    async def fake_link_guest_with_google_code(
+        self: AccountLinkService,
         *,
+        guest_user_id: uuid.UUID | None,
         code: str,
-        device_info: str | None = None,
     ) -> object:
-        calls.append((code, device_info))
-        raise AssertionError("Google provider auth should not run when request validation fails.")
+        calls.append((guest_user_id, code))
+        raise AssertionError("Google account-link service should not run when request validation fails.")
 
     monkeypatch.setattr(
-        ProviderAuthService,
-        "authenticate_with_google_code",
-        fake_authenticate_with_google_code,
+        AccountLinkService,
+        "link_guest_with_google_code",
+        fake_link_guest_with_google_code,
     )
 
     response = await security_client.post(

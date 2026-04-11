@@ -7,11 +7,12 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from memexpert.api.dependencies import DbSessionDep, get_provider_auth_service
 from memexpert.core.config import get_settings
-from memexpert.models.user import RefreshToken, User
+from memexpert.models.enums import AccountType
+from memexpert.models.user import AccountMergeLog, RefreshToken, User
 from memexpert.services import ProviderAuthService, UserService
 from tests.conftest import create_full_user_via_upgrade
 
@@ -136,6 +137,136 @@ async def test_google_route_sets_refresh_cookie_and_reuses_verified_email_accoun
         assert persisted_user.email_verified_at is not None
         assert refresh_token_row.device_info == "Google Chrome"
         assert refresh_token_row.token_hash != auth_client.cookies.get(cookie_name)
+
+
+async def test_google_route_anonymous_caller_upgrades_bootstrapped_guest_without_merge_log(
+    auth_app: FastAPI,
+    auth_client: AsyncClient,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Fresh Google sign-in from an anonymous caller upgrades a throwaway guest in place.
+
+    Under Variant C a previously-unknown google_id takes the
+    ``_upgrade_guest_in_place`` branch (bootstrap a guest, upgrade it,
+    return session). No merge happens because there's no existing
+    account to merge into, so ``account_merge_logs`` must stay empty.
+    """
+
+    flow = MockGoogleFlow(
+        steps=deque(
+            [
+                google_response(payload={"access_token": "google-access-token"}),
+                google_response(
+                    payload={
+                        "sub": "anon-google-subject",
+                        "email": "anon-google@example.com",
+                        "email_verified": True,
+                    }
+                ),
+            ]
+        )
+    )
+    auth_app.dependency_overrides[get_provider_auth_service] = build_google_provider_override(
+        flow.build_transport()
+    )
+    try:
+        response = await auth_client.post(
+            "/api/v1/auth/google",
+            json={"code": "anon-oauth-code"},
+        )
+    finally:
+        auth_app.dependency_overrides.clear()
+
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload["user"]["account_type"] == "full"
+    assert payload["user"]["google_id"] == "anon-google-subject"
+    assert payload["user"]["email"] == "anon-google@example.com"
+
+    async with postgres_session_factory() as session:
+        user_count_result = await session.execute(select(func.count()).select_from(User))
+        full_count_result = await session.execute(
+            select(func.count()).select_from(User).where(User.account_type == AccountType.FULL)
+        )
+        merge_log_count_result = await session.execute(select(func.count()).select_from(AccountMergeLog))
+
+        # Exactly one user row: the bootstrapped guest, upgraded in place
+        # to a full account. No leftover transient guest, no merge log.
+        assert user_count_result.scalar_one() == 1
+        assert full_count_result.scalar_one() == 1
+        assert merge_log_count_result.scalar_one() == 0
+
+
+async def test_google_route_rejects_full_account_caller_with_guest_required(
+    auth_app: FastAPI,
+    auth_client: AsyncClient,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """R2: a full-account caller on /auth/google gets 403 guest_account_required."""
+
+    # Seed a full user + bearer session via an earlier Google signup.
+    flow = MockGoogleFlow(
+        steps=deque(
+            [
+                google_response(payload={"access_token": "seed-token"}),
+                google_response(
+                    payload={
+                        "sub": "seed-sub",
+                        "email": "seed@example.com",
+                        "email_verified": True,
+                    }
+                ),
+            ]
+        )
+    )
+    auth_app.dependency_overrides[get_provider_auth_service] = build_google_provider_override(
+        flow.build_transport()
+    )
+    try:
+        seed_response = await auth_client.post(
+            "/api/v1/auth/google",
+            json={"code": "seed-oauth-code"},
+        )
+    finally:
+        auth_app.dependency_overrides.clear()
+    assert seed_response.status_code == 200
+    access_token = seed_response.json()["access_token"]
+
+    second_flow = MockGoogleFlow(
+        steps=deque(
+            [
+                google_response(payload={"access_token": "second-token"}),
+                google_response(
+                    payload={
+                        "sub": "second-sub",
+                        "email": "second@example.com",
+                        "email_verified": True,
+                    }
+                ),
+            ]
+        )
+    )
+    auth_app.dependency_overrides[get_provider_auth_service] = build_google_provider_override(
+        second_flow.build_transport()
+    )
+    try:
+        conflict_response = await auth_client.post(
+            "/api/v1/auth/google",
+            headers={"Authorization": f"Bearer {access_token}"},
+            json={"code": "second-oauth-code"},
+        )
+    finally:
+        auth_app.dependency_overrides.clear()
+
+    assert conflict_response.status_code == 403
+    assert conflict_response.json()["code"] == "guest_account_required"
+
+    async with postgres_session_factory() as session:
+        user_count_result = await session.execute(select(func.count()).select_from(User))
+        # Only the seeded account exists; the second call did not touch
+        # the Google transport (guard fires before the service runs).
+        assert user_count_result.scalar_one() == 1
+    assert len(second_flow.history) == 0
 
 
 async def test_google_route_returns_typed_conflict_for_telegram_email_collision(
