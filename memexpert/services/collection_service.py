@@ -27,6 +27,7 @@ from memexpert.services.errors import (
     CollectionVerificationRequiredError,
     CollectionWriteAccessError,
     DuplicateCollectionInviteError,
+    DuplicateFavoritesCollectionError,
     GuestCollectionAccessError,
     InvalidCollectionInviteError,
     InvalidCollectionMembershipError,
@@ -36,11 +37,14 @@ from memexpert.services.errors import (
 from memexpert.services.user_service import UserService
 
 if TYPE_CHECKING:
+    import uuid
+
     from sqlalchemy.ext.asyncio import AsyncSession
 
 MAX_COLLECTION_TITLE_LENGTH: Final = 120
 MAX_COLLECTION_LABEL_LENGTH: Final = 120
 MAX_INVITE_TOKEN_HASH_LENGTH: Final = 64
+FAVORITES_TITLE: Final = "Favorites"
 WRITE_ROLES: Final = frozenset({CollectionMembershipRole.OWNER, CollectionMembershipRole.EDITOR})
 
 
@@ -55,6 +59,75 @@ class CollectionService:
 
         collection = await self._get_collection_model(collection_id)
         return None if collection is None else CollectionRead.model_validate(collection)
+
+    async def ensure_favorites_collection(
+        self,
+        user_id: uuid.UUID,
+        *,
+        commit: bool = True,
+    ) -> CollectionRead:
+        """Return the caller's Favorites collection, creating it on first use.
+
+        Lazy bootstrap — the Favorites row, its owner membership, and the
+        user's ``active_save_collection_id`` pointer are only materialized
+        when the user first interacts with a collection surface. One-shot
+        visitors (crawlers, link previews, health checks) never allocate
+        these rows.
+
+        Concurrency-safe: takes a row lock on the user before inserting so
+        two concurrent ensures converge on the same Favorites row. The
+        ``uq_collections_one_favorites_per_owner`` unique index backs the
+        invariant as a defensive fallback. ``commit=False`` lets account
+        linking piggyback the bootstrap on an outer merge transaction.
+        """
+
+        user_service = UserService(self._session)
+        user = await user_service.get_locked_user_record(user_id)
+        if user is None:
+            raise UserNotFoundError(f"User {user_id} does not exist.")
+
+        existing_favorites = await user_service.get_locked_favorites_collection_record(user_id)
+        if existing_favorites is not None:
+            loaded = await self._get_collection_model(existing_favorites.id)
+            if loaded is None:  # pragma: no cover - defensive branch
+                raise CollectionServiceError("Existing Favorites could not be reloaded.")
+            return CollectionRead.model_validate(loaded)
+
+        favorites = Collection(
+            owner_id=user.id,
+            title=FAVORITES_TITLE,
+            kind=CollectionKind.FAVORITES,
+            visibility=CollectionVisibility.PRIVATE,
+        )
+        self._session.add(favorites)
+        await self._session.flush()
+
+        self._session.add(
+            CollectionMember(
+                collection_id=favorites.id,
+                user_id=user.id,
+                role=CollectionMembershipRole.OWNER,
+            )
+        )
+        user.active_save_collection_id = favorites.id
+
+        try:
+            if commit:
+                await self._session.commit()
+            else:
+                await self._session.flush()
+        except IntegrityError as exc:
+            await self._session.rollback()
+            if integrity_constraint_name(exc) == "uq_collections_one_favorites_per_owner":
+                raise DuplicateFavoritesCollectionError(
+                    f"User {user.id} already has a Favorites collection.",
+                ) from exc
+            raise CollectionServiceError("Failed to bootstrap the Favorites collection.") from exc
+
+        persisted = await self._get_collection_model(favorites.id)
+        if persisted is None:  # pragma: no cover - defensive branch
+            raise CollectionServiceError("Created Favorites could not be reloaded.")
+        return CollectionRead.model_validate(persisted)
 
     async def create_custom_collection(
         self,
@@ -366,5 +439,6 @@ def _user_can_write_collection(user_id: object, collection: Collection) -> bool:
 
 __all__ = [
     "CollectionService",
+    "FAVORITES_TITLE",
     "MAX_COLLECTION_TITLE_LENGTH",
 ]

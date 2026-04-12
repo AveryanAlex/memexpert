@@ -12,7 +12,7 @@ from memexpert.services.auth_service import (
     AuthService,
     AuthSession,
 )
-from memexpert.services.collection_service import CollectionService
+from memexpert.services.collection_service import FAVORITES_TITLE, CollectionService
 from memexpert.services.content_pipeline import ContentPipelineService
 from memexpert.services.errors import (
     AccountLinkAlreadyCompletedError,
@@ -69,7 +69,7 @@ from memexpert.services.errors import (
     UserStateMismatchError,
 )
 from memexpert.services.provider_auth_service import ProviderAuthService
-from memexpert.services.user_service import DEFAULT_GUEST_LIFETIME, FAVORITES_TITLE, UserService
+from memexpert.services.user_service import DEFAULT_GUEST_LIFETIME, UserService
 
 __all__ = [
     "ACCESS_TOKEN_TYPE",

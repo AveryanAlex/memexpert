@@ -43,8 +43,39 @@ async def test_guest_cannot_create_custom_collection(
     with pytest.raises(GuestCollectionAccessError, match="cannot create custom collections"):
         _ = await collection_service.create_custom_collection(owner_user_id=guest.id, title="Guest board")
 
+    # Under lazy Favorites the guest owns zero collections until first save.
     collection_count_result = await migrated_db_session.execute(select(func.count()).select_from(Collection))
-    assert collection_count_result.scalar_one() == 1
+    assert collection_count_result.scalar_one() == 0
+
+
+async def test_ensure_favorites_collection_lazily_bootstraps_and_is_idempotent(
+    migrated_db_session: AsyncSession,
+) -> None:
+    user_service = UserService(migrated_db_session)
+    collection_service = CollectionService(migrated_db_session)
+    guest = await user_service.create_guest_user()
+
+    assert guest.active_save_collection_id is None
+
+    first_call = await collection_service.ensure_favorites_collection(guest.id)
+    second_call = await collection_service.ensure_favorites_collection(guest.id)
+
+    assert first_call.id == second_call.id
+    assert first_call.kind is CollectionKind.FAVORITES
+    assert first_call.title == "Favorites"
+    assert [member.role for member in first_call.memberships] == [CollectionMembershipRole.OWNER]
+    assert [member.user_id for member in first_call.memberships] == [guest.id]
+
+    favorites_count_result = await migrated_db_session.execute(
+        select(func.count())
+        .select_from(Collection)
+        .where(Collection.kind == CollectionKind.FAVORITES)
+    )
+    assert favorites_count_result.scalar_one() == 1
+
+    persisted_user_result = await migrated_db_session.execute(select(User).where(User.id == guest.id))
+    persisted_user = persisted_user_result.scalar_one()
+    assert persisted_user.active_save_collection_id == first_call.id
 
 
 async def test_full_user_can_create_custom_collection_with_owner_membership(

@@ -25,6 +25,7 @@ from memexpert.services import (
     AccountLinkResult,
     AccountLinkService,
     AuthConfigurationError,
+    CollectionService,
     ProviderNotConfiguredError,
     UserService,
 )
@@ -358,8 +359,11 @@ async def test_start_link_reuses_existing_full_strictly_by_telegram_id_and_prese
         async with postgres_session_factory() as setup_session:
             setup_user_service = UserService(setup_session)
             second_guest = await setup_user_service.create_guest_user()
-            second_guest_favorites_id = await get_favorites_collection_id(setup_session, owner_id=second_guest.id)
-            assert second_guest_favorites_id is not None
+            # Lazy Favorites: materialize explicitly because the test
+            # exercises a transfer branch.
+            second_collection_service = CollectionService(setup_session)
+            second_guest_favorites = await second_collection_service.ensure_favorites_collection(second_guest.id)
+            second_guest_favorites_id = second_guest_favorites.id
 
             guest_only_meme = await create_meme(setup_session)
             await add_saved_meme(
@@ -597,10 +601,12 @@ async def test_start_link_service_failure_keeps_code_and_guest_retry_safe(
     user_service = UserService(migrated_db_session)
     guest_user = await user_service.create_guest_user()
     canonical_user = await create_full_user_via_upgrade(user_service, telegram_id=TELEGRAM_ID)
-    canonical_favorites_id = await get_favorites_collection_id(migrated_db_session, owner_id=canonical_user.id)
-    guest_favorites_id = await get_favorites_collection_id(migrated_db_session, owner_id=guest_user.id)
-    assert canonical_favorites_id is not None
-    assert guest_favorites_id is not None
+    # Lazy Favorites: materialize the guest's Favorites so the saved meme
+    # has somewhere to live. The canonical user's Favorites is lazily
+    # created inside the merge flow when the transfer actually runs.
+    collection_service = CollectionService(migrated_db_session)
+    guest_favorites = await collection_service.ensure_favorites_collection(guest_user.id)
+    guest_favorites_id = guest_favorites.id
 
     transferable_meme = await create_meme(migrated_db_session)
     await add_saved_meme(

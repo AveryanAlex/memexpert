@@ -28,6 +28,7 @@ from memexpert.services._auth_validation import (
     require_positive_int,
 )
 from memexpert.services._integrity import integrity_constraint_name
+from memexpert.services.collection_service import CollectionService
 from memexpert.services.errors import (
     AccountLinkAlreadyCompletedError,
     AccountLinkInvariantError,
@@ -196,7 +197,7 @@ class AccountLinkService:
         try:
             guest_user = await self._lock_required_user(guest_user_id)
             self._ensure_guest_can_link(guest_user)
-            _ = await self._require_guest_favorites_only_collection(guest_user)
+            _ = await self._require_guest_has_no_custom_collections(guest_user)
             await self._expire_active_telegram_link_codes(guest_user.id)
 
             self._session.add(
@@ -626,7 +627,7 @@ class AccountLinkService:
     ) -> AccountLinkResult:
         guest_user = await self._lock_required_user(guest_user_id)
         self._ensure_guest_can_link(guest_user)
-        _ = await self._require_guest_favorites_only_collection(guest_user)
+        _ = await self._require_guest_has_no_custom_collections(guest_user)
 
         _ = await self._user_service.upgrade_guest_to_full_account(
             user_id=guest_user.id,
@@ -686,8 +687,8 @@ class AccountLinkService:
 
         self._ensure_guest_can_link(guest_user)
         self._ensure_canonical_target(target_user)
-        guest_favorites = await self._require_guest_favorites_only_collection(guest_user)
-        target_favorites = await self._require_favorites_collection(target_user, owner_label="Canonical full account")
+        guest_favorites = await self._require_guest_has_no_custom_collections(guest_user)
+        target_favorites = await self._user_service.get_locked_favorites_collection_record(target_user.id)
 
         if attach_google_identity:
             if google_identity is None:
@@ -699,12 +700,23 @@ class AccountLinkService:
                 commit=False,
             )
 
-        guest_favorite_rows = await self._count_collection_memes(guest_favorites.id)
-        favorites_transferred = await self._transfer_favorites(
-            guest_favorites=guest_favorites,
-            target_favorites=target_favorites,
-            target_user=target_user,
+        # Lazy-create the target's Favorites row only when the guest actually
+        # has favorites to hand over. A zero-favorites merge (cold-path
+        # crawler guest, anonymous sign-in with no prior activity) leaves
+        # the target's Favorites untouched so we don't materialize rows
+        # for accounts that never asked for them.
+        guest_favorite_rows = (
+            await self._count_collection_memes(guest_favorites.id) if guest_favorites is not None else 0
         )
+        favorites_transferred = 0
+        if guest_favorites is not None and guest_favorite_rows > 0:
+            if target_favorites is None:
+                target_favorites = await self._ensure_target_favorites(target_user)
+            favorites_transferred = await self._transfer_favorites(
+                guest_favorites=guest_favorites,
+                target_favorites=target_favorites,
+                target_user=target_user,
+            )
         duplicate_favorites_skipped = guest_favorite_rows - favorites_transferred
         views_transferred = await self._count_meme_views(guest_user.id)
         analytics_events_transferred = await self._reassign_analytics_events(
@@ -718,8 +730,8 @@ class AccountLinkService:
 
         details = {
             "mode": "merge_into_existing_full",
-            "guest_favorites_collection_id": str(guest_favorites.id),
-            "target_favorites_collection_id": str(target_favorites.id),
+            "guest_favorites_collection_id": str(guest_favorites.id) if guest_favorites is not None else None,
+            "target_favorites_collection_id": str(target_favorites.id) if target_favorites is not None else None,
             "guest_favorite_rows": guest_favorite_rows,
             "favorites_transferred": favorites_transferred,
             "favorite_duplicates_skipped": duplicate_favorites_skipped,
@@ -740,8 +752,9 @@ class AccountLinkService:
 
         guest_user.active_save_collection_id = None
         await self._session.flush()
-        await self._session.delete(guest_favorites)
-        await self._session.flush()
+        if guest_favorites is not None:
+            await self._session.delete(guest_favorites)
+            await self._session.flush()
         await self._session.delete(guest_user)
         await self._session.commit()
 
@@ -817,7 +830,16 @@ class AccountLinkService:
         if user.status is not AccountStatus.ACTIVE:
             raise AccountUnavailableError("Account is not available.")
 
-    async def _require_guest_favorites_only_collection(self, guest_user: User) -> Collection:
+    async def _require_guest_has_no_custom_collections(self, guest_user: User) -> Collection | None:
+        """Validate a guest owns no custom collections, returning Favorites if lazily created.
+
+        Under lazy Favorites bootstrap, a brand-new guest owns zero
+        collections. Once the guest first interacts with Favorites, the
+        single Favorites row appears. Anything else (a CUSTOM collection,
+        or more than one Favorites) is an invariant violation and must
+        abort the link.
+        """
+
         owned_collections = await self._user_service.get_locked_owned_collections(guest_user.id)
         favorites = [
             collection
@@ -830,21 +852,32 @@ class AccountLinkService:
             if collection.kind is not CollectionKind.FAVORITES
         ]
 
-        if len(favorites) != 1:
-            raise AccountLinkInvariantError(
-                f"Guest user {guest_user.id} must own exactly one Favorites collection before linking.",
-            )
         if custom_collections:
             raise AccountLinkInvariantError(
                 f"Guest user {guest_user.id} owns unexpected non-Favorites collections.",
             )
-        return favorites[0]
-
-    async def _require_favorites_collection(self, user: User, *, owner_label: str) -> Collection:
-        favorites = await self._user_service.get_locked_favorites_collection_record(user.id)
-        if favorites is None:
+        if len(favorites) > 1:
             raise AccountLinkInvariantError(
-                f"{owner_label} {user.id} is missing a Favorites collection.",
+                f"Guest user {guest_user.id} owns more than one Favorites collection.",
+            )
+        return favorites[0] if favorites else None
+
+    async def _ensure_target_favorites(self, target_user: User) -> Collection:
+        """Lazily bootstrap the merge target's Favorites collection during a merge.
+
+        Only reached when the guest carries favorites to transfer and the
+        target (previously a cold-path guest that upgraded in place with
+        zero activity) never materialized its own Favorites row. Reuses
+        ``CollectionService.ensure_favorites_collection`` with ``commit=False``
+        so the bootstrap participates in the outer merge transaction.
+        """
+
+        collection_service = CollectionService(self._session)
+        _ = await collection_service.ensure_favorites_collection(target_user.id, commit=False)
+        favorites = await self._user_service.get_locked_favorites_collection_record(target_user.id)
+        if favorites is None:  # pragma: no cover - defensive branch
+            raise AccountLinkInvariantError(
+                f"Failed to bootstrap target Favorites collection for {target_user.id}.",
             )
         return favorites
 

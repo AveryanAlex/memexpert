@@ -7,10 +7,9 @@ from typing import TYPE_CHECKING
 
 import pytest
 from sqlalchemy import func, select
-from sqlalchemy.orm import selectinload
 
 from memexpert.models.collection import Collection, CollectionMember
-from memexpert.models.enums import AccountType, AuthProvider, CollectionKind, CollectionMembershipRole
+from memexpert.models.enums import AccountType, AuthProvider, CollectionKind
 from memexpert.models.user import User
 from memexpert.services import DuplicateIdentityError, InvalidIdentityError, UserService
 from tests.conftest import create_full_user_via_upgrade
@@ -19,40 +18,37 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
 
-async def test_create_guest_user_bootstraps_favorites_membership_and_active_save_collection(
+async def test_create_guest_user_writes_only_the_user_row_with_no_favorites_bootstrap(
     migrated_db_session: AsyncSession,
 ) -> None:
+    """Cold-path guests must not touch collections or memberships.
+
+    Favorites are materialized lazily by
+    ``CollectionService.ensure_favorites_collection``, so a fresh guest
+    ends up with ``active_save_collection_id=None`` and zero collection
+    rows — crawlers and link-preview fetchers never pay that cost.
+    """
+
     service = UserService(migrated_db_session)
 
     created_user = await service.create_guest_user()
 
     assert created_user.account_type is AccountType.GUEST
-    assert created_user.active_save_collection_id is not None
+    assert created_user.active_save_collection_id is None
     assert created_user.guest_expires_at is not None
     assert created_user.last_active_at is not None
 
-    result = await migrated_db_session.execute(
-        select(User)
-        .options(
-            selectinload(User.active_save_collection),
-            selectinload(User.owned_collections).selectinload(Collection.memberships),
-        )
-        .where(User.id == created_user.id)
-    )
+    result = await migrated_db_session.execute(select(User).where(User.id == created_user.id))
     persisted_user = result.scalar_one()
+    assert persisted_user.active_save_collection_id is None
 
-    assert persisted_user.active_save_collection is not None
-    assert persisted_user.active_save_collection.kind is CollectionKind.FAVORITES
-    assert persisted_user.active_save_collection_id == persisted_user.active_save_collection.id
-    assert len(persisted_user.owned_collections) == 1
-    favorites = persisted_user.owned_collections[0]
-    assert favorites.kind is CollectionKind.FAVORITES
-    assert favorites.title == "Favorites"
-    assert [member.role for member in favorites.memberships] == [CollectionMembershipRole.OWNER]
-    assert [member.user_id for member in favorites.memberships] == [persisted_user.id]
+    collection_count_result = await migrated_db_session.execute(select(func.count()).select_from(Collection))
+    member_count_result = await migrated_db_session.execute(select(func.count()).select_from(CollectionMember))
+    assert collection_count_result.scalar_one() == 0
+    assert member_count_result.scalar_one() == 0
 
 
-async def test_upgrade_guest_normalizes_email_supports_provider_lookups_and_preserves_favorites(
+async def test_upgrade_guest_normalizes_email_and_supports_provider_lookups(
     migrated_db_session: AsyncSession,
 ) -> None:
     service = UserService(migrated_db_session)
@@ -66,20 +62,17 @@ async def test_upgrade_guest_normalizes_email_supports_provider_lookups_and_pres
 
     assert created_user.account_type is AccountType.FULL
     assert created_user.email == "user@example.com"
-    assert created_user.active_save_collection_id is not None
+    # Upgrade does not touch collections — Favorites stays lazy.
+    assert created_user.active_save_collection_id is None
     assert created_user.guest_expires_at is None
 
     by_email = await service.get_by_email("USER@example.com")
     by_google = await service.get_by_provider(AuthProvider.GOOGLE, "google-subject-123")
     by_telegram = await service.get_by_provider(AuthProvider.TELEGRAM, 123456789)
-    favorites = await service.get_favorites_collection(created_user.id)
 
     assert by_email is not None and by_email.id == created_user.id
     assert by_google is not None and by_google.id == created_user.id
     assert by_telegram is not None and by_telegram.id == created_user.id
-    assert favorites is not None
-    assert favorites.id == created_user.active_save_collection_id
-    assert favorites.kind is CollectionKind.FAVORITES
 
 
 async def test_upgrade_guest_rejects_duplicate_identities_across_transactions(
@@ -109,7 +102,7 @@ async def test_upgrade_guest_rejects_duplicate_identities_across_transactions(
     await migrated_db_session.rollback()
 
 
-async def test_repeated_guest_creation_produces_distinct_accounts_with_one_favorites_each(
+async def test_repeated_guest_creation_produces_distinct_accounts_with_no_collections(
     migrated_db_session: AsyncSession,
 ) -> None:
     service = UserService(migrated_db_session)
@@ -126,8 +119,8 @@ async def test_repeated_guest_creation_produces_distinct_accounts_with_one_favor
     )
     membership_count_result = await migrated_db_session.execute(select(func.count()).select_from(CollectionMember))
 
-    assert favorites_count_result.scalar_one() == 2
-    assert membership_count_result.scalar_one() == 2
+    assert favorites_count_result.scalar_one() == 0
+    assert membership_count_result.scalar_one() == 0
 
 
 async def test_create_guest_user_commit_false_rolls_back_on_session_rollback(

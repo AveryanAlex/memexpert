@@ -195,7 +195,8 @@ async def test_google_auth_creates_new_user_by_sub_and_records_mocked_exchange_h
     login_event_row = login_event_result.scalar_one()
     merge_log_count_result = await migrated_db_session.execute(select(func.count()).select_from(AccountMergeLog))
 
-    assert favorites_count_result.scalar_one() == 1
+    # Lazy Favorites: in-place upgrade does not materialize collections.
+    assert favorites_count_result.scalar_one() == 0
     assert login_event_row.user_agent == "Chrome on macOS"
     # Fresh Google sign-in upgrades a bootstrapped guest in place, no merge
     # log because there was no existing account to merge into.

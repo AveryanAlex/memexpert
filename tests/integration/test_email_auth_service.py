@@ -100,7 +100,9 @@ async def test_email_signup_hashes_password_bootstraps_favorites_and_issues_sess
             Collection.kind == CollectionKind.FAVORITES,
         )
     )
-    assert favorites_count_result.scalar_one() == 1
+    # Lazy Favorites: email signup upgrades a guest in place without
+    # materializing the Favorites row.
+    assert favorites_count_result.scalar_one() == 0
 
     login_event_result = await migrated_db_session.execute(
         select(LoginEvent).where(LoginEvent.user_id == auth_session.user.id)

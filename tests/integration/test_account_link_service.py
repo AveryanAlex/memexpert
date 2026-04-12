@@ -28,6 +28,7 @@ from memexpert.services import (
     AccountLinkResult,
     AccountLinkService,
     AccountUnavailableError,
+    CollectionService,
     EmailAlreadyInUseError,
     GuestAccountRequiredError,
     InvalidCredentialsError,
@@ -163,6 +164,20 @@ async def create_meme(session: AsyncSession) -> Meme:
     return meme
 
 
+async def bootstrap_favorites(session: AsyncSession, *, user_id: uuid.UUID) -> uuid.UUID:
+    """Lazily materialize Favorites for a user in tests that need pre-existing rows.
+
+    Under the lazy-Favorites cold path ``create_guest_user`` /
+    ``create_full_user_via_upgrade`` no longer bootstrap Favorites.
+    Tests that exercise the merge-with-transfer branch of
+    ``AccountLinkService`` seed the rows explicitly through this helper.
+    """
+
+    collection_service = CollectionService(session)
+    favorites = await collection_service.ensure_favorites_collection(user_id)
+    return favorites.id
+
+
 async def add_saved_meme(
     session: AsyncSession,
     *,
@@ -278,13 +293,12 @@ async def test_link_guest_with_email_signup_rolls_back_bootstrap_on_duplicate_em
     assert user_count_result.scalar_one() == baseline_user_count
 
 
-async def test_email_signup_upgrades_guest_in_place_and_keeps_favorites_collection(
+async def test_email_signup_upgrades_guest_in_place_and_preserves_lazy_favorites_state(
     migrated_db_session: AsyncSession,
 ) -> None:
     user_service = UserService(migrated_db_session)
     link_service = build_account_link_service(migrated_db_session)
     guest = await user_service.create_guest_user(language=UserLanguage.RU, nsfw_enabled=True)
-    favorites_collection_id = await get_favorites_collection_id(migrated_db_session, owner_id=guest.id)
 
     result = await link_service.link_guest_with_email_signup(
         guest_user_id=guest.id,
@@ -309,8 +323,12 @@ async def test_email_signup_upgrades_guest_in_place_and_keeps_favorites_collecti
     persisted_user_result = await migrated_db_session.execute(select(User).where(User.id == guest.id))
     persisted_user = persisted_user_result.scalar_one()
     merge_log_count_result = await migrated_db_session.execute(select(func.count()).select_from(AccountMergeLog))
+    collection_count_result = await migrated_db_session.execute(select(func.count()).select_from(Collection))
 
-    assert persisted_user.active_save_collection_id == favorites_collection_id
+    # Upgrade-in-place must not materialize Favorites; the lazy bootstrap
+    # only fires when the user actually interacts with a save surface.
+    assert persisted_user.active_save_collection_id is None
+    assert collection_count_result.scalar_one() == 0
     assert persisted_user.password_hash is not None
     assert merge_log_count_result.scalar_one() == 0
 
@@ -329,10 +347,11 @@ async def test_email_login_merges_guest_into_existing_full_with_deduped_favorite
         nsfw_enabled=False,
     )
 
-    guest_favorites_id = await get_favorites_collection_id(migrated_db_session, owner_id=guest.id)
-    full_favorites_id = await get_favorites_collection_id(migrated_db_session, owner_id=full_user.id)
-    assert guest_favorites_id is not None
-    assert full_favorites_id is not None
+    # Lazy Favorites: materialize both sides up front because this test
+    # exercises the transfer branch and needs pre-existing rows to save
+    # memes into.
+    guest_favorites_id = await bootstrap_favorites(migrated_db_session, user_id=guest.id)
+    full_favorites_id = await bootstrap_favorites(migrated_db_session, user_id=full_user.id)
 
     duplicate_meme = await create_meme(migrated_db_session)
     transferred_meme = await create_meme(migrated_db_session)
@@ -437,8 +456,7 @@ async def test_concurrent_email_login_merge_loser_raises_completed_elsewhere_aft
         nsfw_enabled=False,
     )
 
-    guest_favorites_id = await get_favorites_collection_id(migrated_db_session, owner_id=guest.id)
-    assert guest_favorites_id is not None
+    guest_favorites_id = await bootstrap_favorites(migrated_db_session, user_id=guest.id)
 
     guest_meme = await create_meme(migrated_db_session)
     await add_saved_meme(
@@ -531,8 +549,6 @@ async def test_concurrent_email_signup_upgrade_loser_raises_completed_elsewhere_
 ) -> None:
     user_service = UserService(migrated_db_session)
     guest = await user_service.create_guest_user(language=UserLanguage.RU, nsfw_enabled=True)
-    favorites_collection_id = await get_favorites_collection_id(migrated_db_session, owner_id=guest.id)
-    assert favorites_collection_id is not None
     await migrated_db_session.commit()
 
     first_lock_acquired = asyncio.Event()
@@ -590,7 +606,8 @@ async def test_concurrent_email_signup_upgrade_loser_raises_completed_elsewhere_
         persisted_guest = persisted_guest_result.scalar_one()
         assert persisted_guest.account_type is AccountType.FULL
         assert persisted_guest.email == "stale-upgrade@example.com"
-        assert persisted_guest.active_save_collection_id == favorites_collection_id
+        # Lazy Favorites: upgrade does not touch collections.
+        assert persisted_guest.active_save_collection_id is None
         assert merge_log_count_result.scalar_one() == 0
         assert await count_favorites_rows(verification_session, owner_id=guest.id) == 0
 
@@ -647,8 +664,10 @@ async def test_telegram_link_reuses_existing_full_strictly_by_telegram_id(
     link_service = build_account_link_service(migrated_db_session)
     first_guest = await user_service.create_guest_user()
     second_guest = await user_service.create_guest_user()
-    second_guest_favorites_id = await get_favorites_collection_id(migrated_db_session, owner_id=second_guest.id)
-    assert second_guest_favorites_id is not None
+    # Lazy Favorites: materialize second guest's Favorites row up front
+    # because the test exercises a transfer branch and needs rows to save
+    # the meme into.
+    second_guest_favorites_id = await bootstrap_favorites(migrated_db_session, user_id=second_guest.id)
 
     guest_only_meme = await create_meme(migrated_db_session)
     await add_saved_meme(
@@ -690,8 +709,6 @@ async def test_link_service_rejects_malformed_inputs_without_side_effects(
     user_service = UserService(migrated_db_session)
     link_service = build_account_link_service(migrated_db_session)
     guest = await user_service.create_guest_user()
-    guest_favorites_id = await get_favorites_collection_id(migrated_db_session, owner_id=guest.id)
-    assert guest_favorites_id is not None
 
     with pytest.raises(InvalidCredentialsError, match="invalid"):
         _ = await link_service.link_guest_with_email_signup(
@@ -717,8 +734,9 @@ async def test_link_service_rejects_malformed_inputs_without_side_effects(
     merge_log_count_result = await migrated_db_session.execute(select(func.count()).select_from(AccountMergeLog))
 
     assert persisted_guest_result.scalar_one().account_type is AccountType.GUEST
+    # Lazy Favorites invariant: rejection path never touches collections.
     assert await count_favorites_rows(migrated_db_session, owner_id=guest.id) == 0
-    assert await get_favorites_collection_id(migrated_db_session, owner_id=guest.id) == guest_favorites_id
+    assert await get_favorites_collection_id(migrated_db_session, owner_id=guest.id) is None
     assert merge_log_count_result.scalar_one() == 0
 
 
@@ -784,8 +802,8 @@ async def test_transaction_failures_roll_back_partial_favorites_and_history_tran
 
     guest = await user_service.create_guest_user()
     full_user = await create_password_user(migrated_db_session, email="rollback-owner@example.com")
-    guest_favorites_id = await get_favorites_collection_id(migrated_db_session, owner_id=guest.id)
-    assert guest_favorites_id is not None
+    # Lazy Favorites: materialize explicitly for the transfer-branch test.
+    guest_favorites_id = await bootstrap_favorites(migrated_db_session, user_id=guest.id)
 
     guest_meme = await create_meme(migrated_db_session)
     await add_saved_meme(

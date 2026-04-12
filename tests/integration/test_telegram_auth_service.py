@@ -207,7 +207,9 @@ async def test_telegram_auth_reuses_same_account_across_widget_and_miniapp_witho
             Collection.kind == CollectionKind.FAVORITES,
         )
     )
-    assert favorites_count_result.scalar_one() == 1
+    # Lazy Favorites: neither upgrade-in-place nor merge pre-allocates
+    # Favorites for the canonical Telegram account.
+    assert favorites_count_result.scalar_one() == 0
 
     refresh_tokens_result = await migrated_db_session.execute(
         select(LoginEvent)

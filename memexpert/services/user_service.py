@@ -1,4 +1,4 @@
-"""User/account service primitives with Favorites bootstrap invariants."""
+"""User/account service primitives with cold-path guest bootstrap and lifecycle helpers."""
 
 from __future__ import annotations
 
@@ -10,14 +10,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
 from memexpert.models.base import utcnow
-from memexpert.models.collection import Collection, CollectionMember
+from memexpert.models.collection import Collection
 from memexpert.models.enums import (
     AccountStatus,
     AccountType,
     AuthProvider,
     CollectionKind,
-    CollectionMembershipRole,
-    CollectionVisibility,
     UserLanguage,
 )
 from memexpert.models.user import User
@@ -25,7 +23,6 @@ from memexpert.schemas import CollectionRead, UserRead
 from memexpert.schemas.auth import normalize_auth_email
 from memexpert.services._integrity import integrity_constraint_name
 from memexpert.services.errors import (
-    DuplicateFavoritesCollectionError,
     DuplicateIdentityError,
     InvalidIdentityError,
     UserNotFoundError,
@@ -39,7 +36,6 @@ if TYPE_CHECKING:
     from sqlalchemy.sql.elements import ColumnElement
 
 DEFAULT_GUEST_LIFETIME: Final = timedelta(days=90)
-FAVORITES_TITLE: Final = "Favorites"
 MAX_GOOGLE_ID_LENGTH: Final = 255
 
 
@@ -223,7 +219,13 @@ class UserService:
         nsfw_enabled: bool = False,
         commit: bool = True,
     ) -> UserRead:
-        """Create a guest account with an initialized Favorites collection.
+        """Create a cold-path guest account with no Favorites collection.
+
+        Favorites (plus owner membership and ``active_save_collection_id``)
+        are lazily bootstrapped by
+        :meth:`CollectionService.ensure_favorites_collection` on first use,
+        so one-shot visitors (crawlers, link previews, health checks) never
+        allocate those rows.
 
         When ``commit`` is ``False`` the new row is flushed into the session
         but not committed, so the caller's outer transaction owns the fate of
@@ -242,8 +244,15 @@ class UserService:
             last_active_at=now,
             guest_expires_at=now + self._guest_lifetime,
         )
-        favorites = await self._create_user_with_favorites(user, commit=commit)
-        return UserRead.model_validate(user if user.active_save_collection_id == favorites.id else user)
+        self._session.add(user)
+        try:
+            await self._session.flush()
+            if commit:
+                await self._session.commit()
+        except IntegrityError as exc:  # pragma: no cover - defensive branch
+            await self._session.rollback()
+            raise UserServiceError("Failed to create the guest user row.") from exc
+        return UserRead.model_validate(user)
 
     async def attach_google_identity(
         self,
@@ -489,52 +498,6 @@ class UserService:
 
         return int(new_nonce)
 
-    async def _create_user_with_favorites(self, user: User, *, commit: bool = True) -> Collection:
-        try:
-            self._session.add(user)
-            await self._session.flush()
-
-            favorites = Collection(
-                owner_id=user.id,
-                title=FAVORITES_TITLE,
-                kind=CollectionKind.FAVORITES,
-                visibility=CollectionVisibility.PRIVATE,
-            )
-            self._session.add(favorites)
-            await self._session.flush()
-
-            self._session.add(
-                CollectionMember(
-                    collection_id=favorites.id,
-                    user_id=user.id,
-                    role=CollectionMembershipRole.OWNER,
-                )
-            )
-            user.active_save_collection_id = favorites.id
-
-            if commit:
-                await self._session.commit()
-            else:
-                await self._session.flush()
-        except IntegrityError as exc:
-            await self._session.rollback()
-            constraint_name = integrity_constraint_name(exc)
-            if constraint_name == "uq_collections_one_favorites_per_owner":
-                raise DuplicateFavoritesCollectionError(
-                    f"User {user.id} already has a Favorites collection.",
-                ) from exc
-            if constraint_name in {
-                "uq_users_email_not_null",
-                "uq_users_google_id_not_null",
-                "uq_users_telegram_id_not_null",
-            }:
-                raise DuplicateIdentityError(
-                    "One of the provided identities is already linked to another account.",
-                ) from exc
-            raise UserServiceError("Failed to create the user and Favorites bootstrap rows.") from exc
-
-        return favorites
-
     async def _ensure_identity_is_available(
         self,
         *,
@@ -579,6 +542,5 @@ class UserService:
 
 __all__ = [
     "DEFAULT_GUEST_LIFETIME",
-    "FAVORITES_TITLE",
     "UserService",
 ]

@@ -117,7 +117,8 @@ async def test_create_guest_session_composes_guest_bootstrap_and_records_login_e
     assert session.user.account_type is AccountType.GUEST
     assert session.user.language is UserLanguage.RU
     assert session.user.nsfw_enabled is True
-    assert session.user.active_save_collection_id is not None
+    # Lazy Favorites: cold-path guest bootstrap does not allocate collections.
+    assert session.user.active_save_collection_id is None
     assert session.user.token_nonce == 0
     assert public_session.access_token == session.access_token
     assert public_session.token_type == "bearer"
@@ -149,7 +150,7 @@ async def test_create_guest_session_composes_guest_bootstrap_and_records_login_e
             Collection.kind == CollectionKind.FAVORITES,
         )
     )
-    assert favorites_count_result.scalar_one() == 1
+    assert favorites_count_result.scalar_one() == 0
 
 
 async def test_auth_service_rejects_blank_secret_and_nonpositive_ttls(
