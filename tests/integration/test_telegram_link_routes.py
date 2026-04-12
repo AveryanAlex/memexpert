@@ -37,14 +37,9 @@ async def test_telegram_link_start_route_persists_short_hash_only_code_and_retur
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     guest_response = await auth_client.post("/api/v1/auth/guest")
-    guest_payload = guest_response.json()
-    guest_access_token = guest_payload["access_token"]
-    guest_user_id = uuid.UUID(guest_payload["user"]["id"])
+    guest_user_id = uuid.UUID(guest_response.json()["user"]["id"])
 
-    response = await auth_client.post(
-        "/api/v1/auth/link/telegram",
-        headers={"Authorization": f"Bearer {guest_access_token}"},
-    )
+    response = await auth_client.post("/api/v1/auth/link/telegram")
     payload = response.json()
     start_parameter = f"link_{payload['code']}"
 
@@ -84,10 +79,8 @@ async def test_telegram_link_start_route_rejects_full_callers_without_persisting
         auth_service = AuthService.from_settings(session)
         full_session = await auth_service.issue_session_for_user(full_user)
 
-    response = await auth_client.post(
-        "/api/v1/auth/link/telegram",
-        headers={"Authorization": f"Bearer {full_session.access_token}"},
-    )
+    auth_client.cookies.set("memexpert_access_token", full_session.access_token)
+    response = await auth_client.post("/api/v1/auth/link/telegram")
 
     assert response.status_code == 403
     assert response.json()["code"] == "guest_account_required"
@@ -124,12 +117,8 @@ async def test_telegram_link_start_route_returns_typed_config_errors_before_pers
     app = create_app()
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="https://testserver") as client:
-        guest_response = await client.post("/api/v1/auth/guest")
-        guest_access_token = guest_response.json()["access_token"]
-        response = await client.post(
-            "/api/v1/auth/link/telegram",
-            headers={"Authorization": f"Bearer {guest_access_token}"},
-        )
+        _ = await client.post("/api/v1/auth/guest")
+        response = await client.post("/api/v1/auth/link/telegram")
 
     assert response.status_code == 503
     assert response.json()["code"] == "provider_not_configured"
@@ -145,12 +134,8 @@ async def test_telegram_link_start_route_returns_typed_config_errors_before_pers
     app = create_app()
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="https://testserver") as client:
-        guest_response = await client.post("/api/v1/auth/guest")
-        guest_access_token = guest_response.json()["access_token"]
-        response = await client.post(
-            "/api/v1/auth/link/telegram",
-            headers={"Authorization": f"Bearer {guest_access_token}"},
-        )
+        _ = await client.post("/api/v1/auth/guest")
+        response = await client.post("/api/v1/auth/link/telegram")
 
     await reset_async_database_state()
     get_settings.cache_clear()
@@ -169,8 +154,7 @@ async def test_telegram_link_start_route_surfaces_duplicate_hash_collisions_expl
     monkeypatch: MonkeyPatch,
 ) -> None:
     forced_code = "collision_code_123"
-    guest_response = await auth_client.post("/api/v1/auth/guest")
-    guest_access_token = guest_response.json()["access_token"]
+    _ = await auth_client.post("/api/v1/auth/guest")
 
     async with postgres_session_factory() as session:
         session.add(
@@ -188,10 +172,7 @@ async def test_telegram_link_start_route_surfaces_duplicate_hash_collisions_expl
         staticmethod(lambda: forced_code),
     )
 
-    response = await auth_client.post(
-        "/api/v1/auth/link/telegram",
-        headers={"Authorization": f"Bearer {guest_access_token}"},
-    )
+    response = await auth_client.post("/api/v1/auth/link/telegram")
 
     assert response.status_code == 409
     assert response.json()["code"] == "account_link_invariant_error"

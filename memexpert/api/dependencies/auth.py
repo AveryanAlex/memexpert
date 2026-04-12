@@ -5,7 +5,7 @@ from __future__ import annotations
 from http import HTTPStatus
 from typing import Annotated, Final, cast
 
-from fastapi import Depends, Header, Request
+from fastapi import Cookie, Depends, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -20,7 +20,6 @@ from memexpert.services import (
     AuthService,
     AuthServiceError,
     GuestAccountRequiredError,
-    InvalidTokenError,
     MissingTokenError,
     ProviderAuthService,
     UpgradeRequiredError,
@@ -115,7 +114,7 @@ def get_account_link_service(
 AuthServiceDep = Annotated[AuthService, Depends(get_auth_service)]
 ProviderAuthServiceDep = Annotated[ProviderAuthService, Depends(get_provider_auth_service)]
 AccountLinkServiceDep = Annotated[AccountLinkService, Depends(get_account_link_service)]
-AuthorizationHeaderDep = Annotated[str | None, Header(alias="Authorization")]
+AccessCookieDep = Annotated[str | None, Cookie(alias="memexpert_access_token")]
 
 
 def to_auth_http_error(error: AuthServiceError) -> AuthHTTPError:
@@ -139,33 +138,31 @@ def to_auth_http_error(error: AuthServiceError) -> AuthHTTPError:
     )
 
 
-def get_optional_bearer_token(authorization: AuthorizationHeaderDep = None) -> str | None:
-    """Parse a Bearer token from the Authorization header when present."""
+def get_optional_access_token(access_cookie: AccessCookieDep = None) -> str | None:
+    """Read the access token exclusively from the ``memexpert_access_token`` cookie.
 
-    if authorization is None:
+    The cookie is the sole transport for the access token — no
+    ``Authorization: Bearer`` fallback exists. Routes that want
+    authenticated callers consume the token string downstream via
+    :func:`get_optional_current_user`, which doesn't care how it
+    arrived.
+    """
+
+    if access_cookie is None:
         return None
 
-    header_parts = authorization.strip().split()
-    if len(header_parts) != 2 or header_parts[0].lower() != "bearer":
-        raise to_auth_http_error(
-            InvalidTokenError("Authorization header must use the Bearer scheme."),
-        )
-
-    access_token = header_parts[1].strip()
-    if not access_token:
-        raise to_auth_http_error(MissingTokenError("Bearer token is required."))
-
-    return access_token
+    trimmed = access_cookie.strip()
+    return trimmed or None
 
 
-OptionalBearerTokenDep = Annotated[str | None, Depends(get_optional_bearer_token)]
+OptionalAccessTokenDep = Annotated[str | None, Depends(get_optional_access_token)]
 
 
 async def get_optional_current_user(
     auth_service: AuthServiceDep,
-    access_token: OptionalBearerTokenDep,
+    access_token: OptionalAccessTokenDep,
 ) -> UserRead | None:
-    """Return the current authenticated user when a bearer token is provided."""
+    """Return the current authenticated user when a session cookie is provided."""
 
     if access_token is None:
         return None
@@ -183,7 +180,7 @@ async def get_current_user(current_user: OptionalCurrentUserDep) -> UserRead:
     """Require an authenticated caller and return the current DB-backed user."""
 
     if current_user is None:
-        raise to_auth_http_error(MissingTokenError("Bearer token is required."))
+        raise to_auth_http_error(MissingTokenError("Access session cookie is required."))
 
     return current_user
 

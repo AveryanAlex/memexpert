@@ -42,10 +42,13 @@ async def test_email_signup_route_returns_public_session_data_and_records_login_
     assert response.status_code == 201
     assert payload["user"]["account_type"] == "full"
     assert payload["user"]["email"] == "routeuser@example.com"
-    assert payload["token_type"] == "bearer"
-    assert payload["access_token"]
+    # Cookie-only transport: the JSON body only contains the user.
+    assert "access_token" not in payload
+    assert "token_type" not in payload
+    assert "expires_in" not in payload
     assert "refresh_token" not in payload
     assert "password_hash" not in response.text
+    assert auth_client.cookies.get("memexpert_access_token")
 
     async with postgres_session_factory() as session:
         persisted_user_result = await session.execute(select(User).where(User.email == "routeuser@example.com"))
@@ -105,17 +108,17 @@ async def test_email_signup_route_rejects_full_account_caller_with_guest_require
 ) -> None:
     """R2: a caller authenticated as a full account may not bootstrap a second account."""
 
-    # First signup creates a full account and primes auth_client's bearer token.
+    # First signup creates a full account; httpx's cookie jar carries
+    # the resulting access cookie onto the second call.
     signup_response = await auth_client.post(
         "/api/v1/auth/email/signup",
         json={"email": "full-caller@example.com", "password": PASSWORD},
     )
     assert signup_response.status_code == 201
-    access_token = signup_response.json()["access_token"]
+    assert auth_client.cookies.get("memexpert_access_token")
 
     conflict_response = await auth_client.post(
         "/api/v1/auth/email/signup",
-        headers={"Authorization": f"Bearer {access_token}"},
         json={"email": "second-account@example.com", "password": PASSWORD},
     )
 
@@ -177,8 +180,8 @@ async def test_email_login_route_accepts_normalized_email_and_reuses_shared_sess
     assert payload["user"]["id"] == str(full_user.id)
     assert payload["user"]["account_type"] == "full"
     assert payload["user"]["email"] == "login@example.com"
-    assert payload["token_type"] == "bearer"
-    assert payload["access_token"]
+    assert "access_token" not in payload
+    assert auth_client.cookies.get("memexpert_access_token")
 
     async with postgres_session_factory() as session:
         login_event_result = await session.execute(

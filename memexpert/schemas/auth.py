@@ -6,7 +6,6 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 from enum import StrEnum
-from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 
@@ -61,11 +60,14 @@ class GuestBootstrapRequest(BaseModel):
 
 
 class AuthSessionRead(BaseModel):
-    """Public auth-session payload returned by guest bootstrap and auth flows."""
+    """Public auth-session payload returned by guest bootstrap and auth flows.
 
-    access_token: str
-    token_type: Literal["bearer"] = "bearer"
-    expires_in: int
+    The access token itself is delivered exclusively through the
+    ``memexpert_access_token`` HttpOnly cookie; exposing it in the
+    response body would invite clients to cache it in JS and recreate
+    the XSS exposure cookie-only transport is meant to eliminate.
+    """
+
     user: UserRead
 
 

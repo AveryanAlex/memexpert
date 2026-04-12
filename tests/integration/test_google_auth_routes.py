@@ -117,7 +117,8 @@ async def test_google_route_reuses_verified_email_account_and_records_login_even
     assert payload["user"]["id"] == str(existing_user.id)
     assert payload["user"]["google_id"] == "route-google-subject"
     assert payload["user"]["email"] == "route-existing@example.com"
-    assert payload["token_type"] == "bearer"
+    assert "access_token" not in payload
+    assert auth_client.cookies.get("memexpert_access_token")
     assert len(flow.history) == 2
     assert flow.history[0].method == "POST"
     assert flow.history[1].headers["Authorization"] == "Bearer google-access-token"
@@ -226,7 +227,9 @@ async def test_google_route_rejects_full_account_caller_with_guest_required(
     finally:
         auth_app.dependency_overrides.clear()
     assert seed_response.status_code == 200
-    access_token = seed_response.json()["access_token"]
+    # httpx's cookie jar now carries the seeded full-account session
+    # onto the next call, which must fail the guest-only guard.
+    assert auth_client.cookies.get("memexpert_access_token")
 
     second_flow = MockGoogleFlow(
         steps=deque(
@@ -248,7 +251,6 @@ async def test_google_route_rejects_full_account_caller_with_guest_required(
     try:
         conflict_response = await auth_client.post(
             "/api/v1/auth/google",
-            headers={"Authorization": f"Bearer {access_token}"},
             json={"code": "second-oauth-code"},
         )
     finally:

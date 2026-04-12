@@ -36,6 +36,7 @@ if TYPE_CHECKING:
 PASSWORD = "correct-horse-battery"
 ACCESS_TOKEN_TTL = timedelta(minutes=15)
 REFRESH_TOKEN_TTL = timedelta(days=30)
+ACCESS_COOKIE_NAME = "memexpert_access_token"
 
 
 @dataclass(slots=True)
@@ -145,34 +146,30 @@ async def test_email_signup_link_upgrades_guest_in_place_issues_canonical_sessio
         json={"language": "ru", "nsfw_enabled": True},
     )
     guest_payload = guest_response.json()
-    guest_access_token = guest_payload["access_token"]
     guest_user_id = uuid.UUID(guest_payload["user"]["id"])
+    # Capture the pre-upgrade guest token so we can later re-attach it
+    # and prove that stale claims (account_type=guest) fail verification
+    # against the post-upgrade user row (account_type=full).
+    stale_guest_access_token = auth_client.cookies.get(ACCESS_COOKIE_NAME)
+    assert stale_guest_access_token is not None
 
-    before_link_response = await auth_client.get(
-        "/api/v1/auth/linked-providers",
-        headers={"Authorization": f"Bearer {guest_access_token}"},
-    )
+    before_link_response = await auth_client.get("/api/v1/auth/linked-providers")
     link_response = await auth_client.post(
         "/api/v1/auth/email/signup",
-        headers={
-            "Authorization": f"Bearer {guest_access_token}",
-            "User-Agent": "Link Safari",
-        },
+        headers={"User-Agent": "Link Safari"},
         json={
             "email": "  LinkUser@Example.com ",
             "password": PASSWORD,
         },
     )
     link_payload = link_response.json()
-    canonical_access_token = link_payload["access_token"]
-    linked_providers_response = await auth_client.get(
-        "/api/v1/auth/linked-providers",
-        headers={"Authorization": f"Bearer {canonical_access_token}"},
-    )
-    stale_guest_response = await auth_client.get(
-        "/api/v1/auth/me",
-        headers={"Authorization": f"Bearer {guest_access_token}"},
-    )
+    # The signup response rotated the cookie to the canonical session.
+    linked_providers_response = await auth_client.get("/api/v1/auth/linked-providers")
+
+    # Forge the old guest cookie back onto the client to verify the
+    # post-upgrade user row rejects the stale account_type claim.
+    auth_client.cookies.set(ACCESS_COOKIE_NAME, stale_guest_access_token)
+    stale_guest_response = await auth_client.get("/api/v1/auth/me")
 
     assert guest_response.status_code == 201
     assert before_link_response.status_code == 200
@@ -188,7 +185,7 @@ async def test_email_signup_link_upgrades_guest_in_place_issues_canonical_sessio
     assert link_payload["user"]["id"] == str(guest_user_id)
     assert link_payload["user"]["account_type"] == "full"
     assert link_payload["user"]["email"] == "linkuser@example.com"
-    assert link_payload["token_type"] == "bearer"
+    assert "access_token" not in link_payload
     assert "password_hash" not in link_response.text
 
     assert linked_providers_response.status_code == 200
@@ -241,22 +238,16 @@ async def test_email_login_link_wrong_password_leaves_guest_session_intact(
         )
 
     guest_response = await auth_client.post("/api/v1/auth/guest")
-    guest_payload = guest_response.json()
-    guest_access_token = guest_payload["access_token"]
-    guest_user_id = guest_payload["user"]["id"]
+    guest_user_id = guest_response.json()["user"]["id"]
 
     failed_link_response = await auth_client.post(
         "/api/v1/auth/email/login",
-        headers={"Authorization": f"Bearer {guest_access_token}"},
         json={
             "email": "owner@example.com",
             "password": "wrong-password",
         },
     )
-    me_response = await auth_client.get(
-        "/api/v1/auth/me",
-        headers={"Authorization": f"Bearer {guest_access_token}"},
-    )
+    me_response = await auth_client.get("/api/v1/auth/me")
 
     assert failed_link_response.status_code == 401
     assert failed_link_response.json()["code"] == "invalid_credentials"
@@ -291,8 +282,9 @@ async def test_email_login_link_route_concurrent_loser_gets_already_completed_co
     ) as bootstrap_client:
         guest_response = await bootstrap_client.post("/api/v1/auth/guest")
         guest_payload = guest_response.json()
-        guest_access_token = guest_payload["access_token"]
         guest_user_id = uuid.UUID(guest_payload["user"]["id"])
+        guest_access_token = bootstrap_client.cookies.get(ACCESS_COOKIE_NAME)
+        assert guest_access_token is not None
 
     assert guest_response.status_code == 201
 
@@ -315,10 +307,7 @@ async def test_email_login_link_route_concurrent_loser_gets_already_completed_co
     async def post_link(client: AsyncClient) -> httpx.Response:
         return await client.post(
             "/api/v1/auth/email/login",
-            headers={
-                "Authorization": f"Bearer {guest_access_token}",
-                "User-Agent": "Race Link Browser",
-            },
+            headers={"User-Agent": "Race Link Browser"},
             json={
                 "email": "race-owner@example.com",
                 "password": PASSWORD,
@@ -337,6 +326,8 @@ async def test_email_login_link_route_concurrent_loser_gets_already_completed_co
                 base_url="https://testserver",
             ) as second_client,
         ):
+            first_client.cookies.set(ACCESS_COOKIE_NAME, guest_access_token)
+            second_client.cookies.set(ACCESS_COOKIE_NAME, guest_access_token)
             first_task = asyncio.create_task(post_link(first_client))
             await first_lock_acquired.wait()
 
@@ -375,7 +366,7 @@ async def test_email_login_link_route_concurrent_loser_gets_already_completed_co
 
             assert winner_payload["user"]["id"] == str(full_user.id)
             assert winner_payload["user"]["account_type"] == "full"
-            assert winner_payload["token_type"] == "bearer"
+            assert "access_token" not in winner_payload
 
             assert loser_payload["code"] == "account_link_already_completed"
             assert "already completed elsewhere" in loser_payload["detail"].lower()
@@ -415,9 +406,9 @@ async def test_google_link_merges_guest_into_existing_full_and_exposes_linked_pr
         full_user = await create_full_user_via_upgrade(user_service, email="google-owner@example.com")
 
     guest_response = await auth_client.post("/api/v1/auth/guest")
-    guest_payload = guest_response.json()
-    guest_access_token = guest_payload["access_token"]
-    guest_user_id = uuid.UUID(guest_payload["user"]["id"])
+    guest_user_id = uuid.UUID(guest_response.json()["user"]["id"])
+    stale_guest_access_token = auth_client.cookies.get(ACCESS_COOKIE_NAME)
+    assert stale_guest_access_token is not None
 
     flow = MockGoogleFlow(
         steps=deque(
@@ -439,31 +430,24 @@ async def test_google_link_merges_guest_into_existing_full_and_exposes_linked_pr
     try:
         link_response = await auth_client.post(
             "/api/v1/auth/google",
-            headers={
-                "Authorization": f"Bearer {guest_access_token}",
-                "User-Agent": "Google Link Browser",
-            },
+            headers={"User-Agent": "Google Link Browser"},
             json={"code": "route-link-google-code"},
         )
     finally:
         auth_app.dependency_overrides.clear()
 
     link_payload = link_response.json()
-    canonical_access_token = link_payload["access_token"]
-    linked_providers_response = await auth_client.get(
-        "/api/v1/auth/linked-providers",
-        headers={"Authorization": f"Bearer {canonical_access_token}"},
-    )
-    stale_guest_response = await auth_client.get(
-        "/api/v1/auth/me",
-        headers={"Authorization": f"Bearer {guest_access_token}"},
-    )
+    # Cookie was rotated to the canonical session by the link response.
+    linked_providers_response = await auth_client.get("/api/v1/auth/linked-providers")
+
+    auth_client.cookies.set(ACCESS_COOKIE_NAME, stale_guest_access_token)
+    stale_guest_response = await auth_client.get("/api/v1/auth/me")
 
     assert link_response.status_code == 200
     assert link_payload["user"]["id"] == str(full_user.id)
     assert link_payload["user"]["account_type"] == "full"
     assert link_payload["user"]["email"] == "google-owner@example.com"
-    assert link_payload["token_type"] == "bearer"
+    assert "access_token" not in link_payload
     assert len(flow.history) == 2
 
     assert linked_providers_response.status_code == 200
@@ -507,9 +491,7 @@ async def test_google_link_provider_denial_leaves_guest_session_usable(
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     guest_response = await auth_client.post("/api/v1/auth/guest")
-    guest_payload = guest_response.json()
-    guest_access_token = guest_payload["access_token"]
-    guest_user_id = guest_payload["user"]["id"]
+    guest_user_id = guest_response.json()["user"]["id"]
 
     flow = MockGoogleFlow(
         steps=deque([google_response(status_code=401, payload={"error": "invalid_grant"})])
@@ -520,20 +502,13 @@ async def test_google_link_provider_denial_leaves_guest_session_usable(
     try:
         failed_link_response = await auth_client.post(
             "/api/v1/auth/google",
-            headers={"Authorization": f"Bearer {guest_access_token}"},
             json={"code": "denied-google-code"},
         )
     finally:
         auth_app.dependency_overrides.clear()
 
-    me_response = await auth_client.get(
-        "/api/v1/auth/me",
-        headers={"Authorization": f"Bearer {guest_access_token}"},
-    )
-    linked_providers_response = await auth_client.get(
-        "/api/v1/auth/linked-providers",
-        headers={"Authorization": f"Bearer {guest_access_token}"},
-    )
+    me_response = await auth_client.get("/api/v1/auth/me")
+    linked_providers_response = await auth_client.get("/api/v1/auth/linked-providers")
 
     assert failed_link_response.status_code == 401
     assert failed_link_response.json()["code"] == "provider_access_denied"
@@ -570,9 +545,9 @@ async def test_link_routes_reject_full_account_callers_with_guest_only_error(
         full_user = await create_full_user_via_upgrade(user_service, email="already-full@example.com")
         full_session = await auth_service.issue_session_for_user(full_user)
 
+    auth_client.cookies.set(ACCESS_COOKIE_NAME, full_session.access_token)
     response = await auth_client.post(
         "/api/v1/auth/email/signup",
-        headers={"Authorization": f"Bearer {full_session.access_token}"},
         json={
             "email": "replacement@example.com",
             "password": PASSWORD,
@@ -615,13 +590,10 @@ async def test_email_login_route_merges_guest_when_guest_bearer_is_present(
         )
 
     guest_response = await auth_client.post("/api/v1/auth/guest")
-    guest_payload = guest_response.json()
-    guest_access_token = guest_payload["access_token"]
-    guest_user_id = uuid.UUID(guest_payload["user"]["id"])
+    guest_user_id = uuid.UUID(guest_response.json()["user"]["id"])
 
     login_response = await auth_client.post(
         "/api/v1/auth/email/login",
-        headers={"Authorization": f"Bearer {guest_access_token}"},
         json={
             "email": "plain-login@example.com",
             "password": PASSWORD,
@@ -679,19 +651,10 @@ async def test_link_routes_reject_malformed_payloads_without_mutating_guest_stat
     expected_code: str | None,
 ) -> None:
     guest_response = await auth_client.post("/api/v1/auth/guest")
-    guest_payload = guest_response.json()
-    guest_access_token = guest_payload["access_token"]
-    guest_user_id = guest_payload["user"]["id"]
+    guest_user_id = guest_response.json()["user"]["id"]
 
-    response = await auth_client.post(
-        endpoint,
-        headers={"Authorization": f"Bearer {guest_access_token}"},
-        json=payload,
-    )
-    me_response = await auth_client.get(
-        "/api/v1/auth/me",
-        headers={"Authorization": f"Bearer {guest_access_token}"},
-    )
+    response = await auth_client.post(endpoint, json=payload)
+    me_response = await auth_client.get("/api/v1/auth/me")
 
     assert response.status_code == expected_status
     if expected_code is not None:

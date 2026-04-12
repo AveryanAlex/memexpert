@@ -51,13 +51,15 @@ class AuthSession:
     issued_at: datetime
 
     def to_read(self) -> AuthSessionRead:
-        """Convert the internal session result into the public response schema."""
+        """Convert the internal session result into the public response schema.
 
-        return AuthSessionRead(
-            access_token=self.access_token,
-            expires_in=self.expires_in,
-            user=self.user,
-        )
+        The raw access token stays on the ``AuthSession`` dataclass so
+        routes can attach it to the outgoing ``Set-Cookie`` header; the
+        public ``AuthSessionRead`` schema deliberately omits it so the
+        token never leaks into response bodies or access logs.
+        """
+
+        return AuthSessionRead(user=self.user)
 
 
 class AuthService:

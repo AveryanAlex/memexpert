@@ -7,6 +7,7 @@ from typing import Annotated
 from fastapi import APIRouter, Body, Request, status
 from fastapi.responses import Response
 
+from memexpert.api.cookies import delete_access_cookie, set_access_cookie
 from memexpert.api.dependencies import (
     AUTH_ERROR_RESPONSES,
     AccountLinkServiceDep,
@@ -33,6 +34,7 @@ from memexpert.schemas.user import UserRead
 from memexpert.services import (
     AuthenticatedUserNotFoundError,
     AuthServiceError,
+    AuthSession,
     LinkedProvidersProjection,
     UserNotFoundError,
     UserService,
@@ -49,6 +51,13 @@ def _extract_client_ip(request: Request) -> str | None:
     return request.client.host
 
 
+def _issue_session_response(response: Response, auth_session: AuthSession) -> AuthSessionRead:
+    """Attach the access cookie and return the cookie-less public session schema."""
+
+    set_access_cookie(response, auth_session.access_token)
+    return auth_session.to_read()
+
+
 @router.post(
     "/guest",
     response_model=AuthSessionRead,
@@ -58,6 +67,7 @@ def _extract_client_ip(request: Request) -> str | None:
 )
 async def create_guest_session(
     request: Request,
+    response: Response,
     auth_service: AuthServiceDep,
     guest_request: Annotated[GuestBootstrapRequest | None, Body()] = None,
 ) -> AuthSessionRead:
@@ -72,7 +82,7 @@ async def create_guest_session(
     except AuthServiceError as exc:
         raise to_auth_http_error(exc) from exc
 
-    return auth_session.to_read()
+    return _issue_session_response(response, auth_session)
 
 
 @router.post(
@@ -84,6 +94,7 @@ async def create_guest_session(
 )
 async def signup_with_email(
     request: Request,
+    response: Response,
     _guard: ForbidFullAccountCallerDep,
     optional_guest: OptionalGuestUserDep,
     account_link_service: AccountLinkServiceDep,
@@ -107,7 +118,7 @@ async def signup_with_email(
     except AuthServiceError as exc:
         raise to_auth_http_error(exc) from exc
 
-    return auth_session.to_read()
+    return _issue_session_response(response, auth_session)
 
 
 @router.post(
@@ -118,6 +129,7 @@ async def signup_with_email(
 )
 async def login_with_email(
     request: Request,
+    response: Response,
     _guard: ForbidFullAccountCallerDep,
     optional_guest: OptionalGuestUserDep,
     account_link_service: AccountLinkServiceDep,
@@ -141,7 +153,7 @@ async def login_with_email(
     except AuthServiceError as exc:
         raise to_auth_http_error(exc) from exc
 
-    return auth_session.to_read()
+    return _issue_session_response(response, auth_session)
 
 
 @router.post(
@@ -152,6 +164,7 @@ async def login_with_email(
 )
 async def login_with_google(
     request: Request,
+    response: Response,
     _guard: ForbidFullAccountCallerDep,
     optional_guest: OptionalGuestUserDep,
     account_link_service: AccountLinkServiceDep,
@@ -174,7 +187,7 @@ async def login_with_google(
     except AuthServiceError as exc:
         raise to_auth_http_error(exc) from exc
 
-    return auth_session.to_read()
+    return _issue_session_response(response, auth_session)
 
 
 @router.post(
@@ -212,6 +225,7 @@ async def start_telegram_link(
 )
 async def login_with_telegram_widget(
     request: Request,
+    response: Response,
     _guard: ForbidFullAccountCallerDep,
     optional_guest: OptionalGuestUserDep,
     account_link_service: AccountLinkServiceDep,
@@ -234,7 +248,7 @@ async def login_with_telegram_widget(
     except AuthServiceError as exc:
         raise to_auth_http_error(exc) from exc
 
-    return auth_session.to_read()
+    return _issue_session_response(response, auth_session)
 
 
 @router.post(
@@ -245,6 +259,7 @@ async def login_with_telegram_widget(
 )
 async def login_with_telegram_miniapp(
     request: Request,
+    response: Response,
     _guard: ForbidFullAccountCallerDep,
     optional_guest: OptionalGuestUserDep,
     account_link_service: AccountLinkServiceDep,
@@ -267,7 +282,7 @@ async def login_with_telegram_miniapp(
     except AuthServiceError as exc:
         raise to_auth_http_error(exc) from exc
 
-    return auth_session.to_read()
+    return _issue_session_response(response, auth_session)
 
 
 @router.post(
@@ -277,16 +292,19 @@ async def login_with_telegram_miniapp(
     summary="Soft logout for the current client",
 )
 async def logout(_current_user: CurrentUserDep) -> Response:
-    """Return a 204 so the caller can drop its locally-held access token.
+    """Clear the caller's access cookie and return 204.
 
-    This is a "single device" soft logout: the server performs no
-    state mutation. Clients that hold the access token in memory simply
-    discard it; nothing else needs to happen on the server because the
-    JWT is stateless. Call ``/auth/logout-all`` to invalidate every
-    outstanding token for the account.
+    Single-device soft logout: the server performs no state mutation;
+    the JWT remains cryptographically valid until its TTL or a
+    ``logout-all`` nonce bump. Dropping the cookie here guarantees the
+    caller's current tab stops sending it immediately. Call
+    ``/auth/logout-all`` to invalidate every outstanding token for the
+    account server-side.
     """
 
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+    response = Response(status_code=status.HTTP_204_NO_CONTENT)
+    delete_access_cookie(response)
+    return response
 
 
 @router.post(
@@ -305,7 +323,8 @@ async def logout_all(
     authenticated for exactly this one response, and every other
     outstanding access token (browser, mobile, stale tab) is invalid on
     its next request because its ``nonce`` claim no longer matches the
-    user row.
+    user row. The caller's own cookie is also cleared so its current
+    tab stops sending a token the server will immediately reject.
     """
 
     user_service = UserService(session)
@@ -317,7 +336,9 @@ async def logout_all(
                 f"Authenticated user {current_user.id} no longer exists.",
             )
         ) from exc
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+    response = Response(status_code=status.HTTP_204_NO_CONTENT)
+    delete_access_cookie(response)
+    return response
 
 
 @router.get(

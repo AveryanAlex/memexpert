@@ -6,7 +6,6 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import jwt
-import pytest
 from fastapi import APIRouter, FastAPI
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
@@ -20,6 +19,7 @@ from tests.conftest import create_full_user_via_upgrade
 
 FULL_ONLY_PROBE_PATH = "/api/v1/test-auth/full-only"
 ACCESS_TOKEN_TTL = timedelta(days=30)
+ACCESS_COOKIE_NAME = "memexpert_access_token"
 
 full_only_probe_router = APIRouter()
 
@@ -44,29 +44,28 @@ def build_test_auth_service(
     )
 
 
-@pytest.mark.parametrize(
-    ("authorization", "detail_fragment"),
-    [
-        (None, "bearer token is required"),
-        ("Basic abc123", "bearer scheme"),
-        ("Bearer not-a-jwt", "access token is invalid"),
-    ],
-)
-async def test_me_route_rejects_missing_wrong_scheme_and_malformed_tokens(
+async def test_me_route_rejects_missing_and_malformed_cookies(
     auth_client: AsyncClient,
-    authorization: str | None,
-    detail_fragment: str,
 ) -> None:
-    headers = {} if authorization is None else {"Authorization": authorization}
+    """Both absent and structurally-invalid access cookies must fail with 401."""
 
-    response = await auth_client.get("/api/v1/auth/me", headers=headers)
+    no_cookie_response = await auth_client.get("/api/v1/auth/me")
+    assert no_cookie_response.status_code == 401
+    assert no_cookie_response.json()["code"] == "invalid_token"
+    assert "access session cookie is required" in no_cookie_response.json()["detail"].lower()
 
-    assert response.status_code == 401
-    assert response.json()["code"] == "invalid_token"
-    assert detail_fragment in response.json()["detail"].lower()
+    auth_client.cookies.set(ACCESS_COOKIE_NAME, "not-a-jwt")
+    try:
+        malformed_response = await auth_client.get("/api/v1/auth/me")
+    finally:
+        auth_client.cookies.delete(ACCESS_COOKIE_NAME)
+
+    assert malformed_response.status_code == 401
+    assert malformed_response.json()["code"] == "invalid_token"
+    assert "access token is invalid" in malformed_response.json()["detail"].lower()
 
 
-async def test_guest_route_returns_public_session_data_and_persists_login_event(
+async def test_guest_route_sets_access_cookie_and_persists_login_event(
     auth_client: AsyncClient,
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -86,8 +85,19 @@ async def test_guest_route_returns_public_session_data_and_persists_login_event(
     assert payload["user"]["language"] == "ru"
     assert payload["user"]["nsfw_enabled"] is True
     assert payload["user"]["token_nonce"] == 0
-    assert payload["token_type"] == "bearer"
-    assert payload["access_token"]
+    # Cookie-only transport: no token fields in the body.
+    assert "access_token" not in payload
+    assert "token_type" not in payload
+    assert "expires_in" not in payload
+
+    set_cookie_header = response.headers["set-cookie"]
+    assert f"{ACCESS_COOKIE_NAME}=" in set_cookie_header
+    assert "HttpOnly" in set_cookie_header
+    assert "Secure" in set_cookie_header
+    assert "SameSite=lax".lower() in set_cookie_header.lower()
+    assert "Path=/" in set_cookie_header
+    # The httpx cookie jar picked up the token for subsequent calls.
+    assert auth_client.cookies.get(ACCESS_COOKIE_NAME)
 
     async with postgres_session_factory() as session:
         login_event_result = await session.execute(
@@ -100,19 +110,14 @@ async def test_guest_route_returns_public_session_data_and_persists_login_event(
         assert "httpx" in login_event.user_agent
 
 
-async def test_me_route_accepts_guest_bearer_tokens_and_rejects_expired_tokens(
+async def test_me_route_accepts_cookie_only_caller_and_rejects_expired_tokens(
     auth_client: AsyncClient,
     auth_settings_overrides: dict[str, str],
 ) -> None:
     guest_response = await auth_client.post("/api/v1/auth/guest")
-    guest_payload = guest_response.json()
-    access_token = guest_payload["access_token"]
-    guest_user_id = guest_payload["user"]["id"]
+    guest_user_id = guest_response.json()["user"]["id"]
 
-    me_response = await auth_client.get(
-        "/api/v1/auth/me",
-        headers={"Authorization": f"Bearer {access_token}"},
-    )
+    me_response = await auth_client.get("/api/v1/auth/me")
 
     assert me_response.status_code == 200
     assert me_response.json()["id"] == guest_user_id
@@ -133,33 +138,63 @@ async def test_me_route_accepts_guest_bearer_tokens_and_rejects_expired_tokens(
             algorithm="HS256",
         )
     )
-    expired_response = await auth_client.get(
-        "/api/v1/auth/me",
-        headers={"Authorization": f"Bearer {expired_access_token}"},
-    )
+    auth_client.cookies.set(ACCESS_COOKIE_NAME, expired_access_token)
+    expired_response = await auth_client.get("/api/v1/auth/me")
 
     assert expired_response.status_code == 401
     assert expired_response.json()["code"] == "expired_token"
     assert "expired" in expired_response.json()["detail"].lower()
 
 
-async def test_logout_route_is_noop_server_side(auth_client: AsyncClient) -> None:
-    guest_response = await auth_client.post("/api/v1/auth/guest")
-    access_token = guest_response.json()["access_token"]
+async def test_me_route_ignores_authorization_header_without_cookie(
+    auth_client: AsyncClient,
+) -> None:
+    """A bogus bearer header with no cookie must not satisfy the dep.
 
-    logout_response = await auth_client.post(
-        "/api/v1/auth/logout",
-        headers={"Authorization": f"Bearer {access_token}"},
+    Proves the transport is cookie-only: passing
+    ``Authorization: Bearer ...`` does not bypass the cookie read.
+    """
+
+    response = await auth_client.get(
+        "/api/v1/auth/me",
+        headers={"Authorization": "Bearer not-a-jwt"},
     )
+
+    assert response.status_code == 401
+    assert response.json()["code"] == "invalid_token"
+    assert "cookie" in response.json()["detail"].lower()
+
+
+async def test_logout_route_deletes_cookie_without_bumping_nonce(
+    auth_client: AsyncClient,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    guest_response = await auth_client.post("/api/v1/auth/guest")
+    guest_user_id = guest_response.json()["user"]["id"]
+    live_access_token = auth_client.cookies.get(ACCESS_COOKIE_NAME)
+    assert live_access_token is not None
+
+    logout_response = await auth_client.post("/api/v1/auth/logout")
 
     assert logout_response.status_code == 204
+    logout_set_cookie = logout_response.headers["set-cookie"]
+    assert f'{ACCESS_COOKIE_NAME}=""' in logout_set_cookie or f"{ACCESS_COOKIE_NAME}=;" in logout_set_cookie
+    # httpx honors the cookie delete, so the next call has no cookie.
+    assert auth_client.cookies.get(ACCESS_COOKIE_NAME) is None
 
-    # Bearer token still valid after /auth/logout — this is a soft logout.
-    reverify_response = await auth_client.get(
-        "/api/v1/auth/me",
-        headers={"Authorization": f"Bearer {access_token}"},
-    )
-    assert reverify_response.status_code == 200
+    reverify_response = await auth_client.get("/api/v1/auth/me")
+    assert reverify_response.status_code == 401
+
+    # The server-side nonce is unchanged — soft logout — so the
+    # pre-logout token still verifies when manually re-attached.
+    auth_client.cookies.set(ACCESS_COOKIE_NAME, live_access_token)
+    revived_response = await auth_client.get("/api/v1/auth/me")
+    assert revived_response.status_code == 200
+
+    async with postgres_session_factory() as session:
+        persisted_user_result = await session.execute(select(User).where(User.id == guest_user_id))
+        persisted_user = persisted_user_result.scalar_one()
+        assert persisted_user.token_nonce == 0
 
 
 async def test_logout_all_route_bumps_nonce_and_kills_existing_tokens(
@@ -167,20 +202,19 @@ async def test_logout_all_route_bumps_nonce_and_kills_existing_tokens(
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     guest_response = await auth_client.post("/api/v1/auth/guest")
-    access_token = guest_response.json()["access_token"]
     guest_user_id = guest_response.json()["user"]["id"]
+    live_access_token = auth_client.cookies.get(ACCESS_COOKIE_NAME)
+    assert live_access_token is not None
 
-    logout_all_response = await auth_client.post(
-        "/api/v1/auth/logout-all",
-        headers={"Authorization": f"Bearer {access_token}"},
-    )
+    logout_all_response = await auth_client.post("/api/v1/auth/logout-all")
     assert logout_all_response.status_code == 204
+    # logout-all clears the caller's cookie too.
+    assert auth_client.cookies.get(ACCESS_COOKIE_NAME) is None
 
-    # The previously-valid bearer is now rejected on the next call.
-    reverify_response = await auth_client.get(
-        "/api/v1/auth/me",
-        headers={"Authorization": f"Bearer {access_token}"},
-    )
+    # Re-attach the pre-bump token; the server now rejects it because
+    # the nonce claim no longer matches the persisted user row.
+    auth_client.cookies.set(ACCESS_COOKIE_NAME, live_access_token)
+    reverify_response = await auth_client.get("/api/v1/auth/me")
     assert reverify_response.status_code == 401
     assert reverify_response.json()["code"] == "invalid_token"
 
@@ -199,12 +233,8 @@ async def test_full_account_dependency_returns_upgrade_required_for_guests_and_a
     transport = ASGITransport(app=auth_app)
 
     async with AsyncClient(transport=transport, base_url="https://testserver") as guest_client:
-        guest_response = await guest_client.post("/api/v1/auth/guest")
-        guest_access_token = guest_response.json()["access_token"]
-        guest_probe_response = await guest_client.get(
-            FULL_ONLY_PROBE_PATH,
-            headers={"Authorization": f"Bearer {guest_access_token}"},
-        )
+        _ = await guest_client.post("/api/v1/auth/guest")
+        guest_probe_response = await guest_client.get(FULL_ONLY_PROBE_PATH)
 
     assert guest_probe_response.status_code == 403
     assert guest_probe_response.json()["code"] == "upgrade_required"
@@ -219,10 +249,8 @@ async def test_full_account_dependency_returns_upgrade_required_for_guests_and_a
         full_session = await auth_service.issue_session_for_user(full_user)
 
     async with AsyncClient(transport=transport, base_url="https://testserver") as full_client:
-        full_probe_response = await full_client.get(
-            FULL_ONLY_PROBE_PATH,
-            headers={"Authorization": f"Bearer {full_session.access_token}"},
-        )
+        full_client.cookies.set(ACCESS_COOKIE_NAME, full_session.access_token)
+        full_probe_response = await full_client.get(FULL_ONLY_PROBE_PATH)
 
     assert full_probe_response.status_code == 200
     assert full_probe_response.json()["id"] == str(full_user.id)

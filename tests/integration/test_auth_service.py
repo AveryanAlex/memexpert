@@ -120,8 +120,9 @@ async def test_create_guest_session_composes_guest_bootstrap_and_records_login_e
     # Lazy Favorites: cold-path guest bootstrap does not allocate collections.
     assert session.user.active_save_collection_id is None
     assert session.user.token_nonce == 0
-    assert public_session.access_token == session.access_token
-    assert public_session.token_type == "bearer"
+    # Cookie-only transport: the public session carries the user only.
+    assert "access_token" not in public_session.model_dump()
+    assert "token_type" not in public_session.model_dump()
 
     access_token_claims = jwt.decode(
         session.access_token,

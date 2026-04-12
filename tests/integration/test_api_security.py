@@ -151,22 +151,14 @@ async def test_auth_write_rate_limit_returns_retry_metadata_and_skips_safe_reads
         json={"language": "ru", "nsfw_enabled": True},
     )
     guest_payload = guest_response.json()
-    bearer_token = guest_payload["access_token"]
-    auth_headers = {"Authorization": f"Bearer {bearer_token}"}
 
-    me_response = await security_client.get("/api/v1/auth/me", headers=auth_headers)
-    linked_providers_response = await security_client.get(
-        "/api/v1/auth/linked-providers",
-        headers=auth_headers,
-    )
-    logout_all_response = await security_client.post(
-        "/api/v1/auth/logout-all",
-        headers=auth_headers,
-    )
-    limited_response = await security_client.post(
-        "/api/v1/auth/logout-all",
-        headers=auth_headers,
-    )
+    me_response = await security_client.get("/api/v1/auth/me")
+    linked_providers_response = await security_client.get("/api/v1/auth/linked-providers")
+    logout_all_response = await security_client.post("/api/v1/auth/logout-all")
+    # Second logout-all is rate-limited at the middleware layer (IP
+    # bucket), which fires before the auth dep would ever look at the
+    # now-cleared cookie.
+    limited_response = await security_client.post("/api/v1/auth/logout-all")
     limited_payload = limited_response.json()
 
     assert guest_response.status_code == 201
@@ -208,11 +200,7 @@ async def test_auth_write_rate_limit_state_isolated_between_tests(
     security_client: AsyncClient,
 ) -> None:
     guest_response = await security_client.post("/api/v1/auth/guest")
-    access_token = guest_response.json()["access_token"]
-    logout_all_response = await security_client.post(
-        "/api/v1/auth/logout-all",
-        headers={"Authorization": f"Bearer {access_token}"},
-    )
+    logout_all_response = await security_client.post("/api/v1/auth/logout-all")
 
     assert guest_response.status_code == 201
     assert guest_response.headers["X-RateLimit-Remaining"] == "1"
@@ -389,28 +377,25 @@ async def test_csrf_allows_browser_guest_bootstrap_with_required_header_and_sets
     assert response.status_code == 201
     assert response.headers["Access-Control-Allow-Origin"] == "https://app.memexpert.net"
     assert response.headers["Access-Control-Allow-Credentials"] == "true"
-    assert response.json()["token_type"] == "bearer"
-    assert response.json()["access_token"]
+    assert "access_token" not in response.json()
+    # Cookie-only transport: the access token lives in Set-Cookie only.
+    assert "memexpert_access_token=" in response.headers["set-cookie"]
 
 
 async def test_csrf_safe_get_remains_exempt_when_origin_is_present(
     browser_security_client: AsyncClient,
 ) -> None:
-    guest_response = await browser_security_client.post(
+    _ = await browser_security_client.post(
         "/api/v1/auth/guest",
         headers={
             "Origin": "https://app.memexpert.net",
             "X-Requested-With": BROWSER_REQUESTED_WITH_VALUE,
         },
     )
-    access_token = guest_response.json()["access_token"]
 
     me_response = await browser_security_client.get(
         "/api/v1/auth/me",
-        headers={
-            "Origin": "https://app.memexpert.net",
-            "Authorization": f"Bearer {access_token}",
-        },
+        headers={"Origin": "https://app.memexpert.net"},
     )
 
     assert me_response.status_code == 200
@@ -423,19 +408,15 @@ async def test_csrf_does_not_apply_to_non_browser_logout_all_post_without_origin
 ) -> None:
     """Non-browser clients (no Origin header) are exempt from the CSRF guard."""
 
-    guest_response = await browser_security_client.post(
+    _ = await browser_security_client.post(
         "/api/v1/auth/guest",
         headers={
             "Origin": "https://app.memexpert.net",
             "X-Requested-With": BROWSER_REQUESTED_WITH_VALUE,
         },
     )
-    access_token = guest_response.json()["access_token"]
 
-    logout_all_response = await browser_security_client.post(
-        "/api/v1/auth/logout-all",
-        headers={"Authorization": f"Bearer {access_token}"},
-    )
+    logout_all_response = await browser_security_client.post("/api/v1/auth/logout-all")
 
     assert logout_all_response.status_code == 204
 
@@ -445,28 +426,23 @@ async def test_csrf_logout_all_route_requires_header_when_browser_origin_present
 ) -> None:
     """With an Origin header the CSRF guard requires X-Requested-With on mutations."""
 
-    guest_response = await browser_security_client.post(
+    _ = await browser_security_client.post(
         "/api/v1/auth/guest",
         headers={
             "Origin": "https://app.memexpert.net",
             "X-Requested-With": BROWSER_REQUESTED_WITH_VALUE,
         },
     )
-    access_token = guest_response.json()["access_token"]
 
     rejected_response = await browser_security_client.post(
         "/api/v1/auth/logout-all",
-        headers={
-            "Origin": "https://app.memexpert.net",
-            "Authorization": f"Bearer {access_token}",
-        },
+        headers={"Origin": "https://app.memexpert.net"},
     )
     accepted_response = await browser_security_client.post(
         "/api/v1/auth/logout-all",
         headers={
             "Origin": "https://app.memexpert.net",
             "X-Requested-With": BROWSER_REQUESTED_WITH_VALUE,
-            "Authorization": f"Bearer {access_token}",
         },
     )
 

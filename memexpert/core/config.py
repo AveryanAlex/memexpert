@@ -151,6 +151,15 @@ class Settings(BaseSettings):
     # and every outstanding JWT is instantly invalid on the next request.
     # A 30-day TTL keeps natural hygiene for abandoned sessions.
     auth_access_token_ttl_seconds: int = Field(default=30 * 24 * 60 * 60, gt=0)
+    # Cookie-only transport for the access token. The JWT lives
+    # exclusively in ``memexpert_access_token`` — no ``Authorization:
+    # Bearer`` fallback, no ``access_token`` in response bodies.
+    auth_access_cookie_name: str = "memexpert_access_token"
+    auth_access_cookie_secure: bool = True
+    auth_access_cookie_httponly: bool = True
+    auth_access_cookie_samesite: Literal["lax", "strict", "none"] = "lax"
+    auth_access_cookie_path: str = "/"
+    auth_access_cookie_domain: str | None = None
     auth_bcrypt_rounds: int = Field(default=12, ge=4, le=31)
     auth_telegram_bot_token: SecretStr | None = None
     auth_telegram_bot_username: str | None = None

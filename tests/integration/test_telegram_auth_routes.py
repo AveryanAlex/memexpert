@@ -97,8 +97,8 @@ async def test_telegram_widget_route_returns_session_and_records_login_event(
     assert payload["user"]["account_type"] == "full"
     assert payload["user"]["telegram_id"] == 111222333
     assert payload["user"]["email"] is None
-    assert payload["token_type"] == "bearer"
-    assert payload["access_token"]
+    assert "access_token" not in payload
+    assert auth_client.cookies.get("memexpert_access_token")
 
     async with postgres_session_factory() as session:
         persisted_user_result = await session.execute(select(User).where(User.telegram_id == 111222333))
@@ -172,6 +172,10 @@ async def test_telegram_miniapp_route_reuses_existing_telegram_account_across_su
         ),
     )
     widget_user_id = widget_response.json()["user"]["id"]
+    # Drop the widget session cookie so the miniapp call arrives as an
+    # anonymous caller — the guest-only guard would otherwise reject a
+    # full-account session attempting a second login.
+    auth_client.cookies.delete("memexpert_access_token")
 
     miniapp_response = await auth_client.post(
         "/api/v1/auth/telegram-miniapp",

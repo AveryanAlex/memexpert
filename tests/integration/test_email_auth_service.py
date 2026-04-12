@@ -84,7 +84,8 @@ async def test_email_signup_hashes_password_bootstraps_favorites_and_issues_sess
     assert auth_session.user.email == "newuser@example.com"
     assert public_session.user.email == "newuser@example.com"
     assert "password_hash" not in public_session.model_dump_json()
-    assert public_session.token_type == "bearer"
+    # Cookie-only transport: the public payload carries the user only.
+    assert "access_token" not in public_session.model_dump()
 
     persisted_user_result = await migrated_db_session.execute(select(User).where(User.id == auth_session.user.id))
     persisted_user = persisted_user_result.scalar_one()
