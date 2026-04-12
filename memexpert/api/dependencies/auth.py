@@ -5,10 +5,11 @@ from __future__ import annotations
 from http import HTTPStatus
 from typing import Annotated, Final, cast
 
-from fastapi import Cookie, Depends, Request
+from fastapi import Cookie, Depends, Request, Response
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from memexpert.api.cookies import set_access_cookie
 from memexpert.core.database import get_db_session
 from memexpert.models.enums import AccountType
 from memexpert.schemas.auth import AuthErrorCode, AuthErrorResponse
@@ -210,6 +211,46 @@ async def get_guest_user(current_user: CurrentUserDep) -> UserRead:
     return current_user
 
 
+async def get_or_bootstrap_guest_user(
+    request: Request,
+    response: Response,
+    optional_current_user: OptionalCurrentUserDep,
+    auth_service: AuthServiceDep,
+) -> UserRead:
+    """Return the current user or transparently bootstrap a guest one.
+
+    Use this on routes where the caller MUST be attributed to a user
+    (writes, personalized reads, analytics-carrying endpoints) and the
+    frontend should not need to explicitly call ``/auth/guest`` first.
+    On cache miss the dep creates a guest via
+    :meth:`AuthService.create_guest_session`, sets the access cookie on
+    the outgoing response, and returns the freshly-minted ``UserRead``.
+
+    NOTE: this dependency writes to the database on cache miss — it is
+    NOT a safe read. Prefer :class:`OptionalCurrentUserDep` for pure
+    anonymous-friendly reads that don't need attribution. Callers that
+    present a structurally-invalid or forged cookie hit
+    :func:`get_optional_current_user` first and get the usual 401 —
+    auto-bootstrap only fires for *absent* sessions, not broken ones.
+    """
+
+    if optional_current_user is not None:
+        return optional_current_user
+
+    client_ip = request.client.host if request.client is not None else None
+    try:
+        auth_session = await auth_service.create_guest_session(
+            None,
+            ip_address=client_ip,
+            user_agent=request.headers.get("user-agent"),
+        )
+    except AuthServiceError as exc:
+        raise to_auth_http_error(exc) from exc
+
+    set_access_cookie(response, auth_session.access_token)
+    return auth_session.user
+
+
 async def get_optional_guest_user(
     current_user: OptionalCurrentUserDep,
 ) -> UserRead | None:
@@ -258,6 +299,7 @@ FullAccountUserDep = Annotated[UserRead, Depends(get_full_account_user)]
 GuestUserDep = Annotated[UserRead, Depends(get_guest_user)]
 OptionalGuestUserDep = Annotated["UserRead | None", Depends(get_optional_guest_user)]
 ForbidFullAccountCallerDep = Annotated[None, Depends(forbid_full_account_caller)]
+AutoGuestUserDep = Annotated[UserRead, Depends(get_or_bootstrap_guest_user)]
 
 
 __all__ = [
@@ -266,6 +308,7 @@ __all__ = [
     "AccountLinkServiceDep",
     "AuthHTTPError",
     "AuthServiceDep",
+    "AutoGuestUserDep",
     "CurrentUserDep",
     "DbSessionDep",
     "ForbidFullAccountCallerDep",
@@ -283,6 +326,7 @@ __all__ = [
     "get_guest_user",
     "get_optional_current_user",
     "get_optional_guest_user",
+    "get_or_bootstrap_guest_user",
     "get_provider_auth_service",
     "to_auth_http_error",
 ]
