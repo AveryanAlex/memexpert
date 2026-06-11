@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 from aiogram import Bot, Dispatcher
 
-from memexpert.bot.inline import MemeSearchServiceFactory, build_inline_router
+from memexpert.bot.inline import InlineMediaUrlProvider, MemeSearchServiceFactory, build_inline_router
 from memexpert.bot.linking import AccountLinkServiceFactory, build_linking_router
 from memexpert.core.config import Settings, get_settings
 from memexpert.services import ProviderNotConfiguredError
@@ -32,6 +32,7 @@ def build_dispatcher(
     session_factory: AsyncSessionFactory | None = None,
     account_link_service_factory: AccountLinkServiceFactory | None = None,
     meme_search_service_factory: MemeSearchServiceFactory | None = None,
+    inline_media_url_provider: InlineMediaUrlProvider | None = None,
 ) -> Dispatcher:
     """Build the dispatcher for account linking and inline meme search."""
 
@@ -49,6 +50,7 @@ def build_dispatcher(
             settings=resolved_settings,
             session_factory=session_factory,
             meme_search_service_factory=meme_search_service_factory,
+            inline_media_url_provider=inline_media_url_provider,
         )
     )
     return dispatcher
