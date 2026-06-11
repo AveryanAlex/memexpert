@@ -1,4 +1,5 @@
 <script lang="ts">
+  import MemeMedia from '$lib/components/MemeMedia.svelte';
   import type { PageData } from './$types';
 
   let { data }: { data: PageData } = $props();
@@ -6,7 +7,12 @@
 
 {#if data.meme}
   <article class="detail-card">
-    <div class="media-panel detail-media">{data.meme.media_type}</div>
+    <MemeMedia
+      file={data.meme.primary_file}
+      mediaType={data.meme.media_type}
+      alt={data.meme.seo_alt_text || data.meme.caption}
+      variant="detail"
+    />
     <div class="detail-copy">
       <p class="pill">{data.meme.language} · {data.meme.like_count} likes</p>
       <h1>{data.meme.seo_title || data.meme.caption || 'Meme detail'}</h1>

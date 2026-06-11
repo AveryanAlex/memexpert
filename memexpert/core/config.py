@@ -10,7 +10,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, ClassVar, Literal, cast
 
-from pydantic import AnyHttpUrl, Field, SecretStr, TypeAdapter, ValidationError, field_validator
+from pydantic import AnyHttpUrl, Field, SecretStr, TypeAdapter, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 SECURITY_DEFAULT_ALLOWED_ORIGINS = (
@@ -67,6 +67,9 @@ class Settings(BaseSettings):
     s3_bucket: str = "memexpert"
     s3_region: str = "us-east-1"
     imgproxy_base_url: str = "http://localhost:8080"
+    imgproxy_key: SecretStr | None = None
+    imgproxy_salt: SecretStr | None = None
+    media_public_base_url: str | None = None
     pipeline_operator_token: SecretStr = SecretStr("memexpert-dev-pipeline-operator-token-min-32")
     pipeline_image_upload_max_bytes: int = Field(default=20 * 1024 * 1024, gt=0)
     pipeline_gif_upload_max_bytes: int = Field(default=40 * 1024 * 1024, gt=0)
@@ -200,6 +203,45 @@ class Settings(BaseSettings):
         if not normalized_value:
             raise ValueError("runtime settings must not be blank.")
         return normalized_value
+
+    @field_validator("imgproxy_base_url", mode="before")
+    @classmethod
+    def _normalize_imgproxy_base_url(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+
+        normalized_value = value.strip().rstrip("/")
+        if not normalized_value:
+            raise ValueError("imgproxy_base_url must not be blank.")
+        return normalized_value
+
+    @field_validator("imgproxy_key", "imgproxy_salt", mode="before")
+    @classmethod
+    def _normalize_optional_secret_text(cls, value: object) -> object:
+        if value is None:
+            return None
+        raw_value = value.get_secret_value() if isinstance(value, SecretStr) else value
+        if not isinstance(raw_value, str):
+            return value
+        normalized_value = raw_value.strip()
+        return normalized_value or None
+
+    @field_validator("media_public_base_url", mode="before")
+    @classmethod
+    def _normalize_optional_base_url_or_path(cls, value: object) -> object:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            return value
+
+        normalized_value = value.strip().rstrip("/")
+        return normalized_value or None
+
+    @model_validator(mode="after")
+    def _validate_imgproxy_signature_pair(self) -> Settings:
+        if (self.imgproxy_key is None) != (self.imgproxy_salt is None):
+            raise ValueError("imgproxy_key and imgproxy_salt must be configured together.")
+        return self
 
     @field_validator("pipeline_operator_token", mode="before")
     @classmethod

@@ -9,6 +9,19 @@ export interface PublicMemeFileRead {
   file_size_bytes: number | null;
   blur_hash: string | null;
   quality_score: number;
+  render: PublicMemeFileRenderRead | null;
+}
+
+export interface PublicMemeFileRenderRead {
+  thumbnail_url: string | null;
+  preview_url: string | null;
+  display_url: string | null;
+  original_url: string | null;
+  download_url: string | null;
+  web_video_url: string | null;
+  width: number | null;
+  height: number | null;
+  blur_hash: string | null;
 }
 
 export interface PublicMemeCardRead {
