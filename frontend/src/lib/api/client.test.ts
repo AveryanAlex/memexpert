@@ -1,6 +1,18 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { ApiError, fetchMemeDetail, fetchMemePage, fetchTagLanding, type ApiFetch } from './client';
+import {
+  ApiError,
+  favoriteMeme,
+  fetchMemeDetail,
+  fetchMemePage,
+  fetchTagLanding,
+  pinMeme,
+  removeSavedMeme,
+  saveMeme,
+  unfavoriteMeme,
+  unpinMeme,
+  type ApiFetch
+} from './client';
 import type { PublicMemeSearchPageRead } from './types';
 
 const page: PublicMemeSearchPageRead = {
@@ -138,6 +150,44 @@ describe('catalog API client', () => {
         memeId: 'missing'
       })
     ).rejects.toEqual(new ApiError(404, 'Meme was not found.'));
+  });
+
+  it('posts and deletes favorite actions with credentials', async () => {
+    const calls: Array<{ method: string | undefined; path: string; credentials: RequestCredentials | undefined }> = [];
+    const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? new URL(input, 'https://web.memexpert.test') : new URL(String(input));
+      calls.push({ method: init?.method, path: url.pathname, credentials: init?.credentials });
+      return jsonResponse(init?.method === 'DELETE' ? { removed: true } : { id: 'collection-meme-1' });
+    }) satisfies ApiFetch;
+
+    await favoriteMeme({ fetch: mockFetch, memeId: 'meme-123' });
+    await unfavoriteMeme({ fetch: mockFetch, memeId: 'meme-123' });
+
+    expect(calls).toEqual([
+      { method: 'POST', path: '/api/v1/memes/meme-123/favorite', credentials: 'include' },
+      { method: 'DELETE', path: '/api/v1/memes/meme-123/favorite', credentials: 'include' }
+    ]);
+  });
+
+  it('uses existing save and pin action endpoints', async () => {
+    const calls: Array<{ method: string | undefined; path: string }> = [];
+    const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      calls.push({ method: init?.method, path: url.pathname });
+      return jsonResponse(init?.method === 'DELETE' ? { removed: false } : { id: 'action-row-1' });
+    }) satisfies ApiFetch;
+
+    await saveMeme({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', memeId: 'meme-123' });
+    await removeSavedMeme({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', memeId: 'meme-123' });
+    await pinMeme({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', memeId: 'meme-123' });
+    await unpinMeme({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', memeId: 'meme-123' });
+
+    expect(calls).toEqual([
+      { method: 'POST', path: '/api/v1/memes/meme-123/save' },
+      { method: 'DELETE', path: '/api/v1/memes/meme-123/save' },
+      { method: 'POST', path: '/api/v1/memes/meme-123/pin' },
+      { method: 'DELETE', path: '/api/v1/memes/meme-123/pin' }
+    ]);
   });
 });
 

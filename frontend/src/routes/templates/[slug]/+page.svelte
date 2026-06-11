@@ -1,5 +1,5 @@
 <script lang="ts">
-  import MemeMedia from '$lib/components/MemeMedia.svelte';
+  import MemeCard from '$lib/components/MemeCard.svelte';
   import type { PageData } from './$types';
 
   let { data }: { data: PageData } = $props();
@@ -12,10 +12,6 @@
 
   function pageHref(offset: number): string {
     return offset > 0 ? `?offset=${offset}` : '';
-  }
-
-  function memeHref(meme: { id: string; seo_page_slug: string | null }): string {
-    return `/memes/${meme.seo_page_slug || meme.id}`;
   }
 </script>
 
@@ -38,22 +34,7 @@
   {#if page.items.length > 0}
     <section class="grid" aria-label="Template memes">
       {#each page.items as item (item.meme.id)}
-        {@const meme = item.meme}
-        <article class="card">
-          <a class="card-media-link" href={memeHref(meme)} aria-label={`Open ${meme.caption || 'meme'}`}>
-            <MemeMedia file={meme.primary_file} mediaType={meme.media_type} alt={meme.caption} showDownload={false} />
-          </a>
-          <div class="card-body">
-            <p class="caption"><a href={memeHref(meme)}>{meme.caption || meme.tags[0] || 'Untitled meme'}</a></p>
-            {#if meme.primary_file?.render?.download_url}
-              <a class="download-link" href={meme.primary_file.render.download_url} download>Download media</a>
-            {/if}
-            <div class="meta" aria-label="Meme metadata">
-              <span>{meme.language}</span>
-              <span>{meme.like_count} likes</span>
-            </div>
-          </div>
-        </article>
+        <MemeCard meme={item.meme} />
       {/each}
     </section>
   {:else}

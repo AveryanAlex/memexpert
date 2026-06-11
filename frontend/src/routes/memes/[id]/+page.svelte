@@ -1,4 +1,5 @@
 <script lang="ts">
+  import MemeActionMenu from '$lib/components/MemeActionMenu.svelte';
   import MemeMedia from '$lib/components/MemeMedia.svelte';
   import type { PageData } from './$types';
 
@@ -7,15 +8,11 @@
 
 {#if data.meme}
   <article class="detail-card">
-    <MemeMedia
-      file={data.meme.primary_file}
-      mediaType={data.meme.media_type}
-      alt={data.meme.seo_alt_text || data.meme.caption}
-      variant="detail"
-    />
+    <MemeMedia meme={data.meme} detail />
     <div class="detail-copy">
       <p class="pill">{data.meme.language} · {data.meme.like_count} likes</p>
       <h1>{data.meme.seo_title || data.meme.caption || 'Meme detail'}</h1>
+      <MemeActionMenu meme={data.meme} showPrimary />
       {#if data.meme.seo_description}
         <p>{data.meme.seo_description}</p>
       {:else if data.meme.caption}
