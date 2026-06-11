@@ -146,6 +146,17 @@ def _build_item_reports(
                 both_synced_at=sample.both_synced_at,
                 freshness_seconds=sample.freshness_seconds,
                 slo_bucket=bucket,
+                pipeline_stage=sample.pipeline_stage,
+                pipeline_status=sample.pipeline_status,
+                failure_reason=sample.failure_reason,
+                failure_text=sample.failure_text,
+                qdrant_status=sample.qdrant_status,
+                qdrant_reason=sample.qdrant_reason,
+                qdrant_error=sample.qdrant_error,
+                meili_status=sample.meili_status,
+                meili_reason=sample.meili_reason,
+                meili_error=sample.meili_error,
+                searchability=sample.searchability,
             )
         )
     return tuple(reports)
@@ -346,12 +357,16 @@ def _render_sample_items_section(summary: CrawlerS04RunSummary) -> list[str]:
         lines.append("_(no sample items observed)_")
         lines.append("")
         return lines
-    lines.append("| meme_file_id | channel | freshness | bucket | drill-down |")
-    lines.append("|--------------|---------|-----------|--------|------------|")
+    lines.append("| meme_file_id | channel | searchable | stage | qdrant | meili | freshness | bucket | drill-down |")
+    lines.append("|--------------|---------|------------|-------|--------|-------|-----------|--------|------------|")
     for report in summary.item_reports:
         url = f"/api/v1/pipeline/items/{report.meme_file_id}/detail"
         lines.append(
             f"| `{report.meme_file_id}` | {report.channel_title} | "
+            f"{report.searchability or 'unknown'} | "
+            f"{_format_stage_state(report.pipeline_stage, report.pipeline_status, report.failure_reason)} | "
+            f"{_format_target_state(report.qdrant_status, report.qdrant_reason)} | "
+            f"{_format_target_state(report.meili_status, report.meili_reason)} | "
             f"{_format_seconds(report.freshness_seconds)} | {report.slo_bucket} | "
             f"[detail]({url}) |"
         )
@@ -369,6 +384,32 @@ def _render_errors_section(summary: CrawlerS04RunSummary) -> list[str]:
         lines.append(f"- {error_line}")
     lines.append("")
     return lines
+
+
+def _format_stage_state(
+    stage: object | None,
+    status: object | None,
+    reason: str | None,
+) -> str:
+    if stage is None or status is None:
+        return "unknown"
+    rendered = f"{_enum_value(stage)}:{_enum_value(status)}"
+    if reason:
+        rendered += f" ({reason})"
+    return rendered
+
+
+def _format_target_state(status: object | None, reason: str | None) -> str:
+    if status is None:
+        return "unknown"
+    rendered = _enum_value(status)
+    if reason:
+        rendered += f" ({reason})"
+    return rendered
+
+
+def _enum_value(value: object) -> str:
+    return getattr(value, "value", str(value))
 
 
 def _overall_verdict_label(summary: CrawlerS04RunSummary) -> str:

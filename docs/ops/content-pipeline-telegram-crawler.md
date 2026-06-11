@@ -240,6 +240,22 @@ What the harness does:
    `CrawlerS04RunSummary` and writes `report.json` + `report.md` under
    `<artifacts-dir>/<run-id>/`.
 
+For staging, keep the same command shape but point `--api-base-url` at
+the staging API and pass the staging operator token explicitly when the
+local `.env` does not match that environment:
+
+```bash
+uv run python scripts/verify_s04_runtime.py \
+  --api-base-url https://staging-api.example.invalid \
+  --operator-token "$STAGING_PIPELINE_OPERATOR_TOKEN" \
+  --channel-fixture-path .artifacts/staging-channels.yaml \
+  --candidate-limit 8 \
+  --artifacts-dir .artifacts/s04-runtime-smoke-staging
+```
+
+Do not use `--dry-run` as staging proof. Dry-run only proves the report
+renderer; it does not contact Telegram, Qdrant, Meilisearch, or the API.
+
 ### Catch-up-only mode
 
 ```bash
@@ -308,7 +324,7 @@ Key JSON fields:
 | `slo_p50_seconds` / `slo_p95_seconds` | The configured SLO thresholds. |
 | `slo_p50_pass` / `slo_p95_pass` | Whether the observed percentiles are inside the SLO. |
 | `per_channel` | Per-channel roll-up with per-channel SLO pass flags. |
-| `item_reports` | Per-item breakdown with pre-computed `slo_bucket`. |
+| `item_reports` | Per-item breakdown with pre-computed `slo_bucket`, `searchability`, current `pipeline_stage` / `pipeline_status`, and Qdrant/Meili status + failure reason fields. |
 | `stalled_channels` | Expected channels that produced **zero** items. |
 | `errors` | Harness-captured error strings (dry-run note, HTTP failures, etc.). |
 
@@ -320,8 +336,28 @@ Every item carries one of:
 - `breached_p50` — between `slo_p50` and `slo_p95`.
 - `breached_p95` — at or above `slo_p95`.
 - `incomplete` — the sync chain never reached both targets (sample has
-  `freshness_seconds=None`). Treat as "no data", not as a breach; chase
-  the item through the S03 per-target diagnostics to find out why.
+  `freshness_seconds=None`). Treat as "no data", not as a breach; read
+  the same row's `searchability`, `pipeline_stage`, `qdrant_status`,
+  `meili_status`, and reason/error fields to see whether the item is
+  blocked, partially searchable, or still in flight.
+
+### Per-item freshness evidence
+
+The freshness endpoint and S04 report now carry enough per-item evidence
+to choose the next diagnostic surface without guessing:
+
+| field | meaning |
+|-------|---------|
+| `searchability` | `ready`, `partially_searchable`, `blocked`, or `in_flight` based on current stage + target truth. |
+| `pipeline_stage` / `pipeline_status` | Furthest active or completed stage from `pipeline_stage_journal`. Failed rows include `failure_reason` and `failure_text`. |
+| `qdrant_status` / `meili_status` | Per-target status, preferring `meme_file_sync_target_snapshots` and falling back to sync stage-journal rows. |
+| `qdrant_reason` / `meili_reason` | Normalized provider or payload failure reason for the target, when known. |
+
+If an item is `partially_searchable`, user search may work through one
+target but the product promise is not fully proven. Use
+`GET /api/v1/pipeline/items/<meme_file_id>/detail` for the full stage
+history and `POST /api/v1/pipeline/search/smoke` to prove the user-facing
+search path for that item.
 
 ### `stalled_channels`
 
@@ -455,6 +491,13 @@ The only recoveries are:
 - **`telegram_provider_unavailable`.** Telegram is reachable but refused
   the request. Transient; the runtime reports the stage as retryable and
   the worker will requeue it.
+- **Network/provider blocked proof.** If Telegram, Qdrant, Meilisearch,
+  or the embedding/OCR provider is unreachable from local or staging, the
+  correct S04 result is setup/runtime failure with evidence in
+  `errors`, `pipeline_status`, or per-target status fields. Do not mark
+  provider calls as successful in fixtures to force a green run; use
+  `--dry-run` only to validate report plumbing while waiting on network
+  access.
 - **`telegram_malformed_message`.** Telethon returned a message shape
   the adapter cannot type-check. Non-retryable — the replay route will
   return 422 until Telegram fixes the underlying message. Do not

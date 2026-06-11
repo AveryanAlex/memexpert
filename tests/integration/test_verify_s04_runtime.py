@@ -20,6 +20,11 @@ from typing import Any
 
 import pytest
 
+from memexpert.models.enums import (
+    ContentPipelineStage,
+    ContentPipelineStageStatus,
+    SyncTargetStatus,
+)
 from memexpert.schemas.crawler import (
     CrawlerFreshnessChannelBreakdown,
     CrawlerFreshnessSampleItem,
@@ -365,6 +370,65 @@ def test_summarize_s04_run_mixed_slo_buckets() -> None:
     assert "Silent" in summary.stalled_channels
     assert "Incomplete" not in summary.stalled_channels
     assert summary.observed_item_count == 2
+
+
+def test_summarize_s04_run_propagates_stage_and_search_sync_evidence() -> None:
+    """S04 artifacts must carry concrete stage/target evidence for blocked samples."""
+
+    evaluated_at = datetime(2026, 4, 10, 12, 0, 0, tzinfo=UTC)
+    channel_id = uuid.uuid5(uuid.NAMESPACE_OID, "Blocked")
+    meme_file_id = uuid.uuid5(uuid.NAMESPACE_OID, "Blocked:item")
+    snapshot = CrawlerFreshnessSnapshot(
+        snapshot_evaluated_at=evaluated_at,
+        since=None,
+        item_count=1,
+        p50_seconds=None,
+        p95_seconds=None,
+        slo_p50_seconds=60.0,
+        slo_p95_seconds=180.0,
+        slo_p50_pass=True,
+        slo_p95_pass=True,
+        per_channel=(
+            CrawlerFreshnessChannelBreakdown(
+                source_channel_id=channel_id,
+                platform_id="@blocked",
+                channel_title="Blocked",
+                item_count=1,
+            ),
+        ),
+        sample_items=(
+            CrawlerFreshnessSampleItem(
+                meme_file_id=meme_file_id,
+                source_channel_id=channel_id,
+                published_at=evaluated_at,
+                first_ingested_at=evaluated_at,
+                pipeline_stage=ContentPipelineStage.SYNC_MEILI,
+                pipeline_status=ContentPipelineStageStatus.FAILED,
+                failure_reason="sync_meili_malformed_payload",
+                failure_text="missing document id",
+                qdrant_status=SyncTargetStatus.SYNCED,
+                meili_status=SyncTargetStatus.FAILED,
+                meili_reason="sync_meili_malformed_payload",
+                meili_error="missing document id",
+                searchability="partially_searchable",
+            ),
+        ),
+    )
+
+    summary = _build_summary(snapshot, bounded_item_count=1)
+
+    report = summary.item_reports[0]
+    assert report.searchability == "partially_searchable"
+    assert report.pipeline_stage is ContentPipelineStage.SYNC_MEILI
+    assert report.pipeline_status is ContentPipelineStageStatus.FAILED
+    assert report.meili_status is SyncTargetStatus.FAILED
+    assert report.meili_reason == "sync_meili_malformed_payload"
+
+    markdown = render_s04_markdown_report(summary)
+    assert "partially_searchable" in markdown
+    assert "sync_meili:failed (sync_meili_malformed_payload)" in markdown
+    assert "synced" in markdown
+    assert "failed (sync_meili_malformed_payload)" in markdown
 
 
 def test_render_s04_markdown_report_surfaces_stalled_channels_and_slo_verdict() -> None:

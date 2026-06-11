@@ -32,6 +32,7 @@ from memexpert.crawlers.telegram.runtime import TelegramCrawlerRuntime
 from memexpert.models.content import (
     Meme,
     MemeFile,
+    MemeFileSyncTargetSnapshot,
     MemeSource,
     PipelineStageJournal,
     SourceChannel,
@@ -44,6 +45,8 @@ from memexpert.models.enums import (
     ContentPipelineStageStatus,
     ContentProcessingStatus,
     SourcePlatform,
+    SyncTargetKind,
+    SyncTargetStatus,
     TelegramSessionStatus,
 )
 from memexpert.services.content_pipeline import ContentPipelineService
@@ -633,6 +636,16 @@ async def _seed_freshness_item(
                 finished_at=qdrant_finished_at,
             )
         )
+        session.add(
+            MemeFileSyncTargetSnapshot(
+                meme_file_id=file_row.id,
+                sync_target=SyncTargetKind.QDRANT,
+                status=SyncTargetStatus.SYNCED,
+                last_success_at=qdrant_finished_at,
+                last_attempt_at=qdrant_finished_at,
+                attempt_count=1,
+            )
+        )
     if meili_finished_at is not None:
         session.add(
             PipelineStageJournal(
@@ -642,6 +655,16 @@ async def _seed_freshness_item(
                 attempt_count=1,
                 started_at=meili_finished_at,
                 finished_at=meili_finished_at,
+            )
+        )
+        session.add(
+            MemeFileSyncTargetSnapshot(
+                meme_file_id=file_row.id,
+                sync_target=SyncTargetKind.MEILISEARCH,
+                status=SyncTargetStatus.SYNCED,
+                last_success_at=meili_finished_at,
+                last_attempt_at=meili_finished_at,
+                attempt_count=1,
             )
         )
     await session.commit()
@@ -759,6 +782,14 @@ async def test_freshness_snapshot_aggregates_per_channel_percentiles_and_slo_fla
     sample_ids = {row["meme_file_id"] for row in snapshot["sample_items"]}
     assert len(sample_ids) == 5
 
+    samples_by_searchability = {row["searchability"]: row for row in snapshot["sample_items"]}
+    assert samples_by_searchability["ready"]["qdrant_status"] == "synced"
+    assert samples_by_searchability["ready"]["meili_status"] == "synced"
+    assert samples_by_searchability["partially_searchable"]["qdrant_status"] == "synced"
+    assert samples_by_searchability["partially_searchable"]["meili_status"] is None
+    assert samples_by_searchability["in_flight"]["qdrant_status"] is None
+    assert samples_by_searchability["in_flight"]["meili_status"] is None
+
 
 async def test_freshness_snapshot_honors_since_filter(
     app: FastAPI,
@@ -815,6 +846,87 @@ async def test_freshness_snapshot_honors_since_filter(
     assert body["since"] is not None
     sample_ids = [row["meme_file_id"] for row in body["sample_items"]]
     assert len(sample_ids) == 1
+
+
+async def test_freshness_snapshot_surfaces_blocked_stage_and_target_reason(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    await _seed_session(migrated_db_session, session_name="primary")
+    await _seed_channel(
+        migrated_db_session,
+        platform_id="blocked_chan",
+        title="Blocked Channel",
+    )
+    published_at = _now() - timedelta(minutes=2)
+    file_row = _seed_meme_and_file(migrated_db_session, source_id="blocked-item")
+    await migrated_db_session.flush()
+    meme_source = MemeSource(
+        file_id=file_row.id,
+        platform=SourcePlatform.TELEGRAM,
+        source_id="blocked_chan",
+        post_id="blocked-1",
+        views=1,
+        reactions={},
+        is_first_source=True,
+        source_alive=True,
+        published_at=published_at,
+    )
+    meme_source.created_at = published_at + timedelta(seconds=1)
+    migrated_db_session.add(meme_source)
+    migrated_db_session.add(
+        PipelineStageJournal(
+            meme_file_id=file_row.id,
+            stage=ContentPipelineStage.SYNC_QDRANT,
+            status=ContentPipelineStageStatus.FAILED,
+            attempt_count=2,
+            normalized_reason="sync_qdrant_timeout",
+            last_error_text="qdrant timed out",
+            is_retryable=True,
+            started_at=published_at + timedelta(seconds=5),
+            finished_at=published_at + timedelta(seconds=20),
+        )
+    )
+    migrated_db_session.add(
+        MemeFileSyncTargetSnapshot(
+            meme_file_id=file_row.id,
+            sync_target=SyncTargetKind.QDRANT,
+            status=SyncTargetStatus.FAILED,
+            normalized_reason="sync_qdrant_timeout",
+            last_error_text="qdrant timed out",
+            last_attempt_at=published_at + timedelta(seconds=20),
+            attempt_count=2,
+        )
+    )
+    await migrated_db_session.commit()
+
+    operations_service = _build_real_operations_service(
+        migrated_db_session,
+        telegram_client=FakeTelegramClient(),
+    )
+    _install_operations_service_override(app, operations_service)
+
+    try:
+        response = await client.get(
+            "/api/v1/crawler/freshness",
+            headers=_operator_headers(),
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    sample = response.json()["sample_items"][0]
+    assert sample["freshness_seconds"] is None
+    assert sample["searchability"] == "blocked"
+    assert sample["pipeline_stage"] == "sync_qdrant"
+    assert sample["pipeline_status"] == "failed"
+    assert sample["failure_reason"] == "sync_qdrant_timeout"
+    assert sample["failure_text"] == "qdrant timed out"
+    assert sample["qdrant_status"] == "failed"
+    assert sample["qdrant_reason"] == "sync_qdrant_timeout"
+    assert sample["qdrant_error"] == "qdrant timed out"
+    assert sample["meili_status"] is None
 
 
 async def test_freshness_snapshot_with_no_items_reports_null_percentiles_and_slo_pass(
