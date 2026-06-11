@@ -1,4 +1,4 @@
-"""Console entry point for the Telegram account-linking bot."""
+"""Console entry point for the Telegram bot."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 from aiogram import Bot, Dispatcher
 
+from memexpert.bot.inline import MemeSearchServiceFactory, build_inline_router
 from memexpert.bot.linking import AccountLinkServiceFactory, build_linking_router
 from memexpert.core.config import Settings, get_settings
 from memexpert.services import ProviderNotConfiguredError
@@ -30,8 +31,9 @@ def build_dispatcher(
     settings: Settings | None = None,
     session_factory: AsyncSessionFactory | None = None,
     account_link_service_factory: AccountLinkServiceFactory | None = None,
+    meme_search_service_factory: MemeSearchServiceFactory | None = None,
 ) -> Dispatcher:
-    """Build the minimal dispatcher that only serves Telegram account linking."""
+    """Build the dispatcher for account linking and inline meme search."""
 
     resolved_settings = settings or get_settings()
     dispatcher = Dispatcher()
@@ -42,11 +44,18 @@ def build_dispatcher(
             account_link_service_factory=account_link_service_factory,
         )
     )
+    _ = dispatcher.include_router(
+        build_inline_router(
+            settings=resolved_settings,
+            session_factory=session_factory,
+            meme_search_service_factory=meme_search_service_factory,
+        )
+    )
     return dispatcher
 
 
 async def run_bot(*, settings: Settings | None = None) -> None:
-    """Start polling Telegram updates for the linking-only bot runtime."""
+    """Start polling Telegram updates for the bot runtime."""
 
     resolved_settings = settings or get_settings()
     bot = build_bot(resolved_settings)
@@ -59,7 +68,7 @@ async def run_bot(*, settings: Settings | None = None) -> None:
 
 
 def main() -> None:
-    """Run the Telegram account-linking bot."""
+    """Run the Telegram bot."""
 
     asyncio.run(run_bot())
 

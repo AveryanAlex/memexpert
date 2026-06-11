@@ -9,6 +9,8 @@
 - Videos excluded from inline
 - Empty query: pins → recent sends → trending (full accounts); trending only (guests)
 
+MVP implementation note: inline answers can reuse cached Telegram Bot API `file_id`s and public HTTPS media URLs. First-send upload from private object storage is deferred until the bot has a presigned/public media URL or a proactive upload/cache warmup path.
+
 ## Direct Messages (Bot PM)
 
 Auto-creates full account on first interaction.
