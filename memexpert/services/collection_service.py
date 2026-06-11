@@ -5,11 +5,13 @@ from __future__ import annotations
 from datetime import datetime
 from typing import TYPE_CHECKING, Final
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, delete, func, or_, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
-from memexpert.models.collection import Collection, CollectionInvite, CollectionMember
+from memexpert.models.collection import Collection, CollectionInvite, CollectionMember, CollectionMeme, PinnedMeme
+from memexpert.models.content import Meme
 from memexpert.models.enums import (
     AccountType,
     CollectionInviteChannel,
@@ -19,7 +21,14 @@ from memexpert.models.enums import (
     CollectionVisibility,
 )
 from memexpert.models.user import User
-from memexpert.schemas import CollectionInviteRead, CollectionMemberRead, CollectionRead, UserRead
+from memexpert.schemas import (
+    CollectionInviteRead,
+    CollectionMemberRead,
+    CollectionMemeRead,
+    CollectionRead,
+    PinnedMemeRead,
+    UserRead,
+)
 from memexpert.services._integrity import integrity_constraint_name
 from memexpert.services.errors import (
     CollectionNotFoundError,
@@ -32,8 +41,11 @@ from memexpert.services.errors import (
     InvalidCollectionInviteError,
     InvalidCollectionMembershipError,
     InvalidCollectionTitleError,
+    InvalidPinnedMemeOrderError,
+    PinLimitExceededError,
     UserNotFoundError,
 )
+from memexpert.services.meme_search import MemeNotFoundError
 from memexpert.services.user_service import UserService
 
 if TYPE_CHECKING:
@@ -44,6 +56,7 @@ if TYPE_CHECKING:
 MAX_COLLECTION_TITLE_LENGTH: Final = 120
 MAX_COLLECTION_LABEL_LENGTH: Final = 120
 MAX_INVITE_TOKEN_HASH_LENGTH: Final = 64
+MAX_PINNED_MEMES: Final = 20
 FAVORITES_TITLE: Final = "Favorites"
 WRITE_ROLES: Final = frozenset({CollectionMembershipRole.OWNER, CollectionMembershipRole.EDITOR})
 
@@ -62,7 +75,7 @@ class CollectionService:
 
     async def ensure_favorites_collection(
         self,
-        user_id: uuid.UUID,
+        user_id: object,
         *,
         commit: bool = True,
     ) -> CollectionRead:
@@ -173,6 +186,229 @@ class CollectionService:
         if persisted_collection is None:  # pragma: no cover - defensive branch
             raise CollectionServiceError("Created collection could not be reloaded.")
         return CollectionRead.model_validate(persisted_collection)
+
+    async def favorite_meme(self, *, user_id: object, meme_id: object) -> CollectionMemeRead:
+        """Save a meme to the user's Favorites collection and count the first favorite as a like."""
+
+        meme = await self._get_visible_meme_model(meme_id=meme_id, viewer_user_id=user_id)
+        if meme is None:
+            raise MemeNotFoundError(f"Meme {meme_id} does not exist.")
+
+        favorites = await self.ensure_favorites_collection(user_id, commit=False)
+        saved_meme, inserted = await self._insert_collection_meme(
+            collection_id=favorites.id,
+            meme_id=meme.id,
+            added_by_user_id=favorites.owner_id,
+        )
+        if inserted:
+            await self._increment_like_count(meme.id)
+
+        try:
+            await self._session.commit()
+        except IntegrityError as exc:
+            await self._session.rollback()
+            raise CollectionServiceError("Failed to favorite the meme.") from exc
+
+        return CollectionMemeRead.model_validate(saved_meme)
+
+    async def unfavorite_meme(self, *, user_id: object, meme_id: object) -> bool:
+        """Remove a meme from Favorites without bootstrapping an empty Favorites collection."""
+
+        favorites = await self._get_favorites_collection_model(user_id)
+        if favorites is None:
+            return False
+
+        removed = await self._delete_collection_meme(collection_id=favorites.id, meme_id=meme_id)
+        if not removed:
+            return False
+
+        await self._decrement_like_count(meme_id)
+
+        try:
+            await self._session.commit()
+        except IntegrityError as exc:
+            await self._session.rollback()
+            raise CollectionServiceError("Failed to unfavorite the meme.") from exc
+        return True
+
+    async def list_favorite_memes(self, *, user_id: object) -> list[CollectionMemeRead]:
+        """Return Favorites saves newest-first, or an empty list before lazy bootstrap."""
+
+        favorites = await self._get_favorites_collection_model(user_id)
+        if favorites is None:
+            return []
+
+        result = await self._session.execute(
+            select(CollectionMeme)
+            .where(CollectionMeme.collection_id == favorites.id)
+            .order_by(CollectionMeme.added_at.desc(), CollectionMeme.meme_id.asc())
+        )
+        return [CollectionMemeRead.model_validate(row) for row in result.scalars()]
+
+    async def get_active_save_collection(self, *, user_id: object) -> CollectionRead:
+        """Return the user's active save destination, defaulting to Favorites on first use."""
+
+        user = await self._get_user_model(user_id)
+        if user is None:
+            raise UserNotFoundError(f"User {user_id} does not exist.")
+        if user.active_save_collection_id is None:
+            return await self.ensure_favorites_collection(user.id)
+
+        collection = await self._get_collection_model(user.active_save_collection_id)
+        if collection is None:
+            raise CollectionNotFoundError(f"Collection {user.active_save_collection_id} does not exist.")
+        return CollectionRead.model_validate(collection)
+
+    async def save_meme_to_active_collection(self, *, user_id: object, meme_id: object) -> CollectionMemeRead:
+        """Save a meme into the user's writable active collection, lazily defaulting to Favorites."""
+
+        user, collection = await self._get_active_collection_model_for_write(user_id)
+        meme = await self._get_visible_meme_model(meme_id=meme_id, viewer_user_id=user.id)
+        if meme is None:
+            raise MemeNotFoundError(f"Meme {meme_id} does not exist.")
+
+        saved_meme, inserted = await self._insert_collection_meme(
+            collection_id=collection.id,
+            meme_id=meme.id,
+            added_by_user_id=user.id,
+        )
+        if inserted and collection.kind is CollectionKind.FAVORITES:
+            await self._increment_like_count(meme.id)
+
+        try:
+            await self._session.commit()
+        except IntegrityError as exc:
+            await self._session.rollback()
+            raise CollectionServiceError("Failed to save the meme to the active collection.") from exc
+
+        return CollectionMemeRead.model_validate(saved_meme)
+
+    async def remove_meme_from_active_collection(self, *, user_id: object, meme_id: object) -> bool:
+        """Remove a meme from the user's active save collection when present."""
+
+        user = await self._get_user_model(user_id)
+        if user is None:
+            raise UserNotFoundError(f"User {user_id} does not exist.")
+        if user.active_save_collection_id is None:
+            return False
+
+        collection = await self._get_collection_model(user.active_save_collection_id)
+        if collection is None:
+            raise CollectionNotFoundError(f"Collection {user.active_save_collection_id} does not exist.")
+        self._ensure_can_write_collection(user, collection)
+
+        removed = await self._delete_collection_meme(collection_id=collection.id, meme_id=meme_id)
+        if not removed:
+            return False
+
+        if collection.kind is CollectionKind.FAVORITES:
+            await self._decrement_like_count(meme_id)
+        try:
+            await self._session.commit()
+        except IntegrityError as exc:
+            await self._session.rollback()
+            raise CollectionServiceError("Failed to remove the meme from the active collection.") from exc
+        return True
+
+    async def list_pinned_memes(self, *, user_id: object) -> list[PinnedMemeRead]:
+        """Return a full account's pins in display order."""
+
+        await self._get_full_user_model(user_id)
+        result = await self._session.execute(
+            select(PinnedMeme)
+            .where(PinnedMeme.user_id == user_id)
+            .order_by(PinnedMeme.position.asc(), PinnedMeme.pinned_at.asc())
+        )
+        return [PinnedMemeRead.model_validate(row) for row in result.scalars()]
+
+    async def pin_meme(self, *, user_id: object, meme_id: object) -> PinnedMemeRead:
+        """Append a meme to the user's pins while preventing duplicates and the 20-pin overflow."""
+
+        user = await self._get_full_user_model(user_id)
+        meme = await self._get_visible_meme_model(meme_id=meme_id, viewer_user_id=user.id)
+        if meme is None:
+            raise MemeNotFoundError(f"Meme {meme_id} does not exist.")
+
+        existing = await self._get_pinned_meme_model(user_id=user.id, meme_id=meme.id)
+        if existing is not None:
+            return PinnedMemeRead.model_validate(existing)
+
+        pin_count = await self._session.scalar(
+            select(func.count()).select_from(PinnedMeme).where(PinnedMeme.user_id == user.id)
+        )
+        if (pin_count or 0) >= MAX_PINNED_MEMES:
+            raise PinLimitExceededError(f"Users can pin at most {MAX_PINNED_MEMES} memes.")
+
+        position = int(pin_count or 0) + 1
+        pinned_meme = PinnedMeme(user_id=user.id, meme_id=meme.id, position=position)
+        self._session.add(pinned_meme)
+
+        try:
+            await self._session.commit()
+        except IntegrityError as exc:
+            await self._session.rollback()
+            raise CollectionServiceError("Failed to pin the meme.") from exc
+        return PinnedMemeRead.model_validate(pinned_meme)
+
+    async def unpin_meme(self, *, user_id: object, meme_id: object) -> bool:
+        """Remove a pin and compact the remaining positions."""
+
+        user = await self._get_full_user_model(user_id)
+        result = await self._session.execute(
+            select(PinnedMeme).where(PinnedMeme.user_id == user.id).order_by(PinnedMeme.position.asc())
+        )
+        existing_pins = list(result.scalars())
+        if not any(pin.meme_id == meme_id for pin in existing_pins):
+            return False
+
+        await self._session.execute(delete(PinnedMeme).where(PinnedMeme.user_id == user.id))
+        await self._session.flush()
+        remaining_pins = [pin for pin in existing_pins if pin.meme_id != meme_id]
+        self._session.add_all(
+            PinnedMeme(user_id=user.id, meme_id=pin.meme_id, position=index, pinned_at=pin.pinned_at)
+            for index, pin in enumerate(remaining_pins, start=1)
+        )
+
+        try:
+            await self._session.commit()
+        except IntegrityError as exc:
+            await self._session.rollback()
+            raise CollectionServiceError("Failed to unpin the meme.") from exc
+        return True
+
+    async def reorder_pins(self, *, user_id: object, meme_ids: list[uuid.UUID]) -> list[PinnedMemeRead]:
+        """Replace the current pin order with the supplied full ordered pin list."""
+
+        user = await self._get_full_user_model(user_id)
+        if len(meme_ids) > MAX_PINNED_MEMES:
+            raise InvalidPinnedMemeOrderError(f"Users can pin at most {MAX_PINNED_MEMES} memes.")
+        if len(set(meme_ids)) != len(meme_ids):
+            raise InvalidPinnedMemeOrderError("Pin reorder payload cannot contain duplicate meme IDs.")
+
+        result = await self._session.execute(
+            select(PinnedMeme).where(PinnedMeme.user_id == user.id).order_by(PinnedMeme.position.asc())
+        )
+        existing_pins = list(result.scalars())
+        existing_ids = {pin.meme_id for pin in existing_pins}
+        requested_ids = set(meme_ids)
+        if existing_ids != requested_ids:
+            raise InvalidPinnedMemeOrderError("Pin reorder payload must contain exactly the currently pinned memes.")
+
+        await self._session.execute(delete(PinnedMeme).where(PinnedMeme.user_id == user.id))
+        await self._session.flush()
+        pinned_at_by_meme_id = {pin.meme_id: pin.pinned_at for pin in existing_pins}
+        new_pins = [
+            PinnedMeme(user_id=user.id, meme_id=meme_id, position=index, pinned_at=pinned_at_by_meme_id[meme_id])
+            for index, meme_id in enumerate(meme_ids, start=1)
+        ]
+        self._session.add_all(new_pins)
+
+        try:
+            await self._session.commit()
+        except IntegrityError as exc:
+            await self._session.rollback()
+            raise CollectionServiceError("Failed to reorder pinned memes.") from exc
+        return [PinnedMemeRead.model_validate(pin) for pin in new_pins]
 
     async def ensure_member(
         self,
@@ -344,6 +580,126 @@ class CollectionService:
         )
         return result.scalar_one_or_none()
 
+    async def _get_favorites_collection_model(self, user_id: object) -> Collection | None:
+        result = await self._session.execute(
+            select(Collection)
+            .options(selectinload(Collection.memberships), selectinload(Collection.invites))
+            .where(Collection.owner_id == user_id, Collection.kind == CollectionKind.FAVORITES)
+        )
+        return result.scalar_one_or_none()
+
+    async def _get_collection_meme_model(self, *, collection_id: object, meme_id: object) -> CollectionMeme | None:
+        result = await self._session.execute(
+            select(CollectionMeme).where(
+                CollectionMeme.collection_id == collection_id,
+                CollectionMeme.meme_id == meme_id,
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def _insert_collection_meme(
+        self,
+        *,
+        collection_id: object,
+        meme_id: object,
+        added_by_user_id: object,
+    ) -> tuple[CollectionMeme, bool]:
+        result = await self._session.execute(
+            pg_insert(CollectionMeme)
+            .values(collection_id=collection_id, meme_id=meme_id, added_by_user_id=added_by_user_id)
+            .on_conflict_do_nothing(index_elements=[CollectionMeme.collection_id, CollectionMeme.meme_id])
+            .returning(CollectionMeme.collection_id)
+        )
+        inserted = result.scalar_one_or_none() is not None
+        saved_meme = await self._get_collection_meme_model(collection_id=collection_id, meme_id=meme_id)
+        if saved_meme is None:  # pragma: no cover - defensive concurrent delete branch
+            raise CollectionServiceError("Saved meme association could not be loaded.")
+        return saved_meme, inserted
+
+    async def _delete_collection_meme(self, *, collection_id: object, meme_id: object) -> bool:
+        result = await self._session.execute(
+            delete(CollectionMeme)
+            .where(CollectionMeme.collection_id == collection_id, CollectionMeme.meme_id == meme_id)
+            .returning(CollectionMeme.meme_id)
+        )
+        return result.scalar_one_or_none() is not None
+
+    async def _get_meme_model(self, meme_id: object) -> Meme | None:
+        result = await self._session.execute(select(Meme).where(Meme.id == meme_id))
+        return result.scalar_one_or_none()
+
+    async def _get_visible_meme_model(self, *, meme_id: object, viewer_user_id: object) -> Meme | None:
+        authorized_collection = (
+            select(CollectionMeme.meme_id)
+            .select_from(CollectionMeme)
+            .join(Collection, Collection.id == CollectionMeme.collection_id)
+            .outerjoin(CollectionMember, CollectionMember.collection_id == Collection.id)
+            .where(
+                CollectionMeme.meme_id == Meme.id,
+                or_(Collection.owner_id == viewer_user_id, CollectionMember.user_id == viewer_user_id),
+            )
+            .exists()
+        )
+        result = await self._session.execute(
+            select(Meme).where(
+                Meme.id == meme_id,
+                or_(
+                    Meme.is_public.is_(True),
+                    Meme.author_user_id == viewer_user_id,
+                    authorized_collection,
+                ),
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def _increment_like_count(self, meme_id: object) -> None:
+        _ = await self._session.execute(
+            update(Meme).where(Meme.id == meme_id).values(like_count=Meme.like_count + 1)
+        )
+
+    async def _decrement_like_count(self, meme_id: object) -> None:
+        _ = await self._session.execute(
+            update(Meme).where(Meme.id == meme_id).values(like_count=func.greatest(Meme.like_count - 1, 0))
+        )
+
+    async def _get_pinned_meme_model(self, *, user_id: object, meme_id: object) -> PinnedMeme | None:
+        result = await self._session.execute(
+            select(PinnedMeme).where(PinnedMeme.user_id == user_id, PinnedMeme.meme_id == meme_id)
+        )
+        return result.scalar_one_or_none()
+
+    async def _get_full_user_model(self, user_id: object) -> User:
+        user = await self._get_user_model(user_id)
+        if user is None:
+            raise UserNotFoundError(f"User {user_id} does not exist.")
+        if user.account_type is not AccountType.FULL:
+            raise GuestCollectionAccessError("A full account is required for pins.")
+        return user
+
+    async def _get_active_collection_model_for_write(self, user_id: object) -> tuple[User, Collection]:
+        user = await self._get_user_model(user_id)
+        if user is None:
+            raise UserNotFoundError(f"User {user_id} does not exist.")
+        if user.active_save_collection_id is None:
+            favorites = await self.ensure_favorites_collection(user.id, commit=False)
+            collection = await self._get_collection_model(favorites.id)
+        else:
+            collection = await self._get_collection_model(user.active_save_collection_id)
+        if collection is None:
+            raise CollectionNotFoundError(f"Collection {user.active_save_collection_id} does not exist.")
+        self._ensure_can_write_collection(user, collection)
+        return user, collection
+
+    def _ensure_can_write_collection(self, user: User, collection: Collection) -> None:
+        if user.account_type is AccountType.GUEST and collection.kind is not CollectionKind.FAVORITES:
+            raise GuestCollectionAccessError(
+                "Guest accounts can only use Favorites as the active save collection.",
+            )
+        if not _user_can_write_collection(user.id, collection):
+            raise CollectionWriteAccessError(
+                f"User {user.id} cannot write to collection {collection.id}.",
+            )
+
     async def _get_user_model(self, user_id: object) -> User | None:
         result = await self._session.execute(select(User).where(User.id == user_id))
         return result.scalar_one_or_none()
@@ -441,4 +797,5 @@ __all__ = [
     "CollectionService",
     "FAVORITES_TITLE",
     "MAX_COLLECTION_TITLE_LENGTH",
+    "MAX_PINNED_MEMES",
 ]

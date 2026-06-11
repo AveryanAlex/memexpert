@@ -11,7 +11,10 @@ from urllib.parse import urlparse
 
 from aiogram import Router
 from aiogram.types import (
+    CallbackQuery,
     ChosenInlineResult,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
     InlineQuery,
     InlineQueryResultCachedGif,
     InlineQueryResultCachedMpeg4Gif,
@@ -43,7 +46,7 @@ from memexpert.schemas.meme import (
     MemeSearchResultRead,
     MemeSearchScoreRead,
 )
-from memexpert.services import ProviderNotConfiguredError
+from memexpert.services import CollectionService, CollectionServiceError, ProviderNotConfiguredError
 from memexpert.services.meme_search import MemeSearchService
 from memexpert.services.query_embedding import CachedTextQueryEmbeddingService
 
@@ -57,6 +60,7 @@ logger = logging.getLogger(__name__)
 INLINE_SEARCH_LIMIT = 20
 INLINE_CACHE_TIME_SECONDS = 5
 MPEG4_GIF_MIME_TYPE = "video/mp4"
+LIBRARY_CALLBACK_PREFIX = "lib"
 
 
 class InlineMemeSearchService(Protocol):
@@ -145,6 +149,16 @@ def build_inline_router(
     async def handle_chosen_inline_result(chosen_result: ChosenInlineResult) -> None:
         await record_chosen_inline_result(
             chosen_result=chosen_result,
+            session_factory=resolved_session_factory,
+        )
+
+    @router.callback_query(
+        lambda callback_query: callback_query.data is not None
+        and callback_query.data.startswith(f"{LIBRARY_CALLBACK_PREFIX}:")
+    )
+    async def handle_library_callback(callback_query: CallbackQuery) -> None:
+        await handle_inline_library_callback(
+            callback_query=callback_query,
             session_factory=resolved_session_factory,
         )
 
@@ -246,6 +260,57 @@ async def record_chosen_inline_result(
             )
         )
         await _commit_analytics(session)
+
+
+async def handle_inline_library_callback(
+    *,
+    callback_query: CallbackQuery,
+    session_factory: AsyncSessionFactory,
+) -> None:
+    """Handle the simple Favorite/Save/Pin buttons attached to inline meme results."""
+
+    action, file_id = _parse_library_callback_data(callback_query.data)
+    if action is None or file_id is None:
+        await callback_query.answer("This meme action is no longer supported.", show_alert=True)
+        return
+
+    async with session_factory() as session:
+        meme_id = await session.scalar(select(MemeFile.meme_id).where(MemeFile.id == file_id))
+        if meme_id is None:
+            await callback_query.answer("Meme was not found.", show_alert=True)
+            return
+
+        user_id, inactive_user = await _resolve_active_linked_user_id(
+            session,
+            telegram_user_id=callback_query.from_user.id,
+        )
+        if user_id is None:
+            if inactive_user:
+                await callback_query.answer("Your MemeXpert account is not active.", show_alert=True)
+                return
+            await callback_query.answer("Link your Telegram account to use meme library actions.", show_alert=True)
+            return
+
+        service = CollectionService(session)
+        try:
+            if action == "fav":
+                _ = await service.favorite_meme(user_id=user_id, meme_id=meme_id)
+                text = "Added to Favorites."
+            elif action == "save":
+                _ = await service.save_meme_to_active_collection(user_id=user_id, meme_id=meme_id)
+                text = "Saved to active collection."
+            elif action == "pin":
+                _ = await service.pin_meme(user_id=user_id, meme_id=meme_id)
+                text = "Pinned."
+            else:
+                await callback_query.answer("This meme action is no longer supported.", show_alert=True)
+                return
+        except CollectionServiceError as exc:
+            logger.info("Telegram inline library callback rejected: %s", exc)
+            await callback_query.answer(str(exc), show_alert=True)
+            return
+
+    await callback_query.answer(text)
 
 
 def _build_default_search_service_factory(settings: Settings) -> MemeSearchServiceFactory:
@@ -570,6 +635,25 @@ async def _resolve_linked_user(session: AsyncSession, *, telegram_user_id: int) 
     return user
 
 
+async def _resolve_active_linked_user_id(
+    session: AsyncSession,
+    *,
+    telegram_user_id: int,
+) -> tuple[uuid.UUID | None, bool]:
+    row = await session.execute(
+        select(User.id, User.account_type, User.status).where(User.telegram_id == telegram_user_id)
+    )
+    user = row.one_or_none()
+    if user is None:
+        return None, False
+    user_id, account_type, status = user
+    if account_type is not AccountType.FULL:
+        return None, False
+    if status is not AccountStatus.ACTIVE:
+        return None, True
+    return user_id, False
+
+
 async def _commit_analytics(session: AsyncSession) -> None:
     try:
         await session.commit()
@@ -604,6 +688,7 @@ def _to_inline_result(
 ) -> InlineResult | None:
     result_id = _build_result_id(media_format=candidate.media_format, file_id=candidate.file.id)
     title = _build_title(candidate.meme)
+    reply_markup = _build_library_reply_markup(result_id)
 
     if cached_file_id is not None:
         if candidate.media_format is TelegramMediaFormat.PHOTO:
@@ -612,14 +697,21 @@ def _to_inline_result(
                 photo_file_id=cached_file_id,
                 title=title,
                 description=_build_description(candidate.meme),
+                reply_markup=reply_markup,
             )
         if _is_mpeg4_gif(candidate.file):
             return InlineQueryResultCachedMpeg4Gif(
                 id=result_id,
                 mpeg4_file_id=cached_file_id,
                 title=title,
+                reply_markup=reply_markup,
             )
-        return InlineQueryResultCachedGif(id=result_id, gif_file_id=cached_file_id, title=title)
+        return InlineQueryResultCachedGif(
+            id=result_id,
+            gif_file_id=cached_file_id,
+            title=title,
+            reply_markup=reply_markup,
+        )
 
     if media_url is None:
         return None
@@ -633,6 +725,7 @@ def _to_inline_result(
             photo_height=candidate.file.height,
             title=title,
             description=_build_description(candidate.meme),
+            reply_markup=reply_markup,
         )
     if _is_mpeg4_gif(candidate.file):
         return InlineQueryResultMpeg4Gif(
@@ -642,6 +735,7 @@ def _to_inline_result(
             mpeg4_width=candidate.file.width,
             mpeg4_height=candidate.file.height,
             title=title,
+            reply_markup=reply_markup,
         )
     return InlineQueryResultGif(
         id=result_id,
@@ -650,6 +744,19 @@ def _to_inline_result(
         gif_width=candidate.file.width,
         gif_height=candidate.file.height,
         title=title,
+        reply_markup=reply_markup,
+    )
+
+
+def _build_library_reply_markup(result_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Favorite", callback_data=_build_library_callback_data("fav", result_id)),
+                InlineKeyboardButton(text="Save", callback_data=_build_library_callback_data("save", result_id)),
+                InlineKeyboardButton(text="Pin", callback_data=_build_library_callback_data("pin", result_id)),
+            ]
+        ]
     )
 
 
@@ -717,6 +824,22 @@ def _parse_result_file_id(result_id: str) -> uuid.UUID | None:
         return None
 
 
+def _build_library_callback_data(action: str, result_id: str) -> str:
+    return f"{LIBRARY_CALLBACK_PREFIX}:{action}:{result_id}"
+
+
+def _parse_library_callback_data(value: str | None) -> tuple[str | None, uuid.UUID | None]:
+    if value is None:
+        return None, None
+    try:
+        prefix, action, result_id = value.split(":", maxsplit=2)
+    except ValueError:
+        return None, None
+    if prefix != LIBRARY_CALLBACK_PREFIX:
+        return None, None
+    return action, _parse_result_file_id(result_id)
+
+
 def _build_bot_scope(settings: Settings) -> str:
     secret = settings.auth_telegram_bot_token
     if secret is None:
@@ -731,9 +854,11 @@ def _build_bot_scope(settings: Settings) -> str:
 __all__ = [
     "INLINE_SEARCH_LIMIT",
     "InlineMediaUrlProvider",
+    "LIBRARY_CALLBACK_PREFIX",
     "MemeSearchServiceFactory",
     "S3PresignedInlineMediaUrlProvider",
     "answer_inline_query",
     "build_inline_router",
+    "handle_inline_library_callback",
     "record_chosen_inline_result",
 ]
