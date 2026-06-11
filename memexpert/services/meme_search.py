@@ -15,10 +15,10 @@ from sqlalchemy.orm import selectinload
 
 from memexpert.core.qdrant import QdrantUserSearchClientProtocol, QdrantUserSearchMatch
 from memexpert.models.base import utcnow
-from memexpert.models.collection import Collection, CollectionMember, CollectionMeme
+from memexpert.models.collection import Collection, CollectionMember, CollectionMeme, PinnedMeme
 from memexpert.models.content import Meme, MemeFile, MemePopularitySnapshot, MemeSeoPage, MemeTemplate
-from memexpert.models.enums import AnalyticsEventType, ContentKind, ContentLanguage
-from memexpert.models.user import AnalyticsEvent
+from memexpert.models.enums import AnalyticsEventType, CollectionKind, ContentKind, ContentLanguage
+from memexpert.models.user import AnalyticsEvent, User
 from memexpert.schemas.meme import (
     MemeCardRead,
     MemeDetailRead,
@@ -101,6 +101,22 @@ class _CandidateScore:
     text: float = 0.0
     popularity: float = 0.0
     total: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class _ViewerMemeActionState:
+    favorited_meme_ids: frozenset[uuid.UUID] = frozenset()
+    saved_meme_ids: frozenset[uuid.UUID] = frozenset()
+    pinned_meme_ids: frozenset[uuid.UUID] = frozenset()
+
+    def has_favorited(self, meme_id: uuid.UUID) -> bool:
+        return meme_id in self.favorited_meme_ids
+
+    def has_saved(self, meme_id: uuid.UUID) -> bool:
+        return meme_id in self.saved_meme_ids
+
+    def has_pinned(self, meme_id: uuid.UUID) -> bool:
+        return meme_id in self.pinned_meme_ids
 
 
 class MemeSearchService:
@@ -254,7 +270,12 @@ class MemeSearchService:
         include_nsfw: bool = False,
     ) -> PublicMemeDetailRead:
         meme = await self._load_visible_meme_by_id(meme_id, viewer_user_id=viewer_user_id, include_nsfw=include_nsfw)
-        return _to_public_detail_read(meme, media_render_service=self._media_render_service)
+        action_state = await self._load_viewer_action_state((meme.id,), viewer_user_id=viewer_user_id)
+        return _to_public_detail_read(
+            meme,
+            media_render_service=self._media_render_service,
+            viewer_action_state=action_state,
+        )
 
     async def get_public_meme_detail_by_slug(
         self,
@@ -268,7 +289,12 @@ class MemeSearchService:
             viewer_user_id=viewer_user_id,
             include_nsfw=include_nsfw,
         )
-        return _to_public_detail_read(meme, media_render_service=self._media_render_service)
+        action_state = await self._load_viewer_action_state((meme.id,), viewer_user_id=viewer_user_id)
+        return _to_public_detail_read(
+            meme,
+            media_render_service=self._media_render_service,
+            viewer_action_state=action_state,
+        )
 
     async def get_slug_redirect(
         self,
@@ -697,9 +723,14 @@ class MemeSearchService:
             )
         result = await self._session.execute(_visible_meme_stmt(viewer_user_id).where(Meme.id.in_(meme_ids)))
         memes_by_id = {meme.id: meme for meme in result.scalars().all()}
+        action_state = await self._load_viewer_action_state(meme_ids, viewer_user_id=viewer_user_id)
         public_items = [
             PublicMemeSearchResultRead(
-                meme=_to_public_card_read(meme, media_render_service=self._media_render_service),
+                meme=_to_public_card_read(
+                    meme,
+                    media_render_service=self._media_render_service,
+                    viewer_action_state=action_state,
+                ),
             )
             for meme_id in meme_ids
             if (meme := memes_by_id.get(meme_id)) is not None
@@ -710,6 +741,70 @@ class MemeSearchService:
             offset=page.offset,
             total=page.total,
             has_more=page.has_more,
+        )
+
+    async def _load_viewer_action_state(
+        self,
+        meme_ids: tuple[uuid.UUID, ...],
+        *,
+        viewer_user_id: uuid.UUID | None,
+    ) -> _ViewerMemeActionState:
+        if viewer_user_id is None or not meme_ids:
+            return _ViewerMemeActionState()
+
+        unique_meme_ids = tuple(dict.fromkeys(meme_ids))
+        active_save_collection_id = (
+            select(User.active_save_collection_id).where(User.id == viewer_user_id).scalar_subquery()
+        )
+        viewer_has_favorited = (
+            select(CollectionMeme.meme_id)
+            .join(Collection, Collection.id == CollectionMeme.collection_id)
+            .where(
+                CollectionMeme.meme_id == Meme.id,
+                Collection.owner_id == viewer_user_id,
+                Collection.kind == CollectionKind.FAVORITES,
+            )
+            .exists()
+        )
+        viewer_has_saved = (
+            select(CollectionMeme.meme_id)
+            .where(
+                CollectionMeme.meme_id == Meme.id,
+                CollectionMeme.collection_id == active_save_collection_id,
+            )
+            .exists()
+        )
+        viewer_has_pinned = (
+            select(PinnedMeme.meme_id)
+            .where(
+                PinnedMeme.meme_id == Meme.id,
+                PinnedMeme.user_id == viewer_user_id,
+            )
+            .exists()
+        )
+
+        result = await self._session.execute(
+            select(
+                Meme.id,
+                viewer_has_favorited.label("viewer_has_favorited"),
+                viewer_has_saved.label("viewer_has_saved"),
+                viewer_has_pinned.label("viewer_has_pinned"),
+            ).where(Meme.id.in_(unique_meme_ids))
+        )
+        favorited_meme_ids: set[uuid.UUID] = set()
+        saved_meme_ids: set[uuid.UUID] = set()
+        pinned_meme_ids: set[uuid.UUID] = set()
+        for meme_id, has_favorited, has_saved, has_pinned in result.all():
+            if has_favorited:
+                favorited_meme_ids.add(meme_id)
+            if has_saved:
+                saved_meme_ids.add(meme_id)
+            if has_pinned:
+                pinned_meme_ids.add(meme_id)
+        return _ViewerMemeActionState(
+            favorited_meme_ids=frozenset(favorited_meme_ids),
+            saved_meme_ids=frozenset(saved_meme_ids),
+            pinned_meme_ids=frozenset(pinned_meme_ids),
         )
 
     async def _popular_page(
@@ -884,7 +979,12 @@ def _to_card_read(meme: Meme) -> MemeCardRead:
     )
 
 
-def _to_public_card_read(meme: Meme, *, media_render_service: MediaRenderUrlService) -> PublicMemeCardRead:
+def _to_public_card_read(
+    meme: Meme,
+    *,
+    media_render_service: MediaRenderUrlService,
+    viewer_action_state: _ViewerMemeActionState | None = None,
+) -> PublicMemeCardRead:
     seo_slug = meme.seo_page.slug if meme.seo_page else None
     caption = meme.seo_page.caption if meme.seo_page else None
     context = PublicMediaRenderContext(meme_id=meme.id, seo_slug=seo_slug, caption=caption)
@@ -907,6 +1007,9 @@ def _to_public_card_read(meme: Meme, *, media_render_service: MediaRenderUrlServ
         ),
         caption=caption,
         seo_page_slug=seo_slug,
+        viewer_has_favorited=viewer_action_state.has_favorited(meme.id) if viewer_action_state else False,
+        viewer_has_saved=viewer_action_state.has_saved(meme.id) if viewer_action_state else False,
+        viewer_has_pinned=viewer_action_state.has_pinned(meme.id) if viewer_action_state else False,
         created_at=meme.created_at,
         updated_at=meme.updated_at,
     )
@@ -930,8 +1033,17 @@ def _to_detail_read(meme: Meme) -> MemeDetailRead:
     )
 
 
-def _to_public_detail_read(meme: Meme, *, media_render_service: MediaRenderUrlService) -> PublicMemeDetailRead:
-    card = _to_public_card_read(meme, media_render_service=media_render_service)
+def _to_public_detail_read(
+    meme: Meme,
+    *,
+    media_render_service: MediaRenderUrlService,
+    viewer_action_state: _ViewerMemeActionState | None = None,
+) -> PublicMemeDetailRead:
+    card = _to_public_card_read(
+        meme,
+        media_render_service=media_render_service,
+        viewer_action_state=viewer_action_state,
+    )
     seo_slug = meme.seo_page.slug if meme.seo_page else None
     caption = meme.seo_page.caption if meme.seo_page else None
     context = PublicMediaRenderContext(meme_id=meme.id, seo_slug=seo_slug, caption=caption)

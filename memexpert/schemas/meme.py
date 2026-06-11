@@ -133,6 +133,9 @@ class PublicMemeCardRead(BaseModel):
     primary_file: PublicMemeFileRead | None
     caption: str | None
     seo_page_slug: str | None = None
+    viewer_has_favorited: bool = False
+    viewer_has_saved: bool = False
+    viewer_has_pinned: bool = False
     created_at: datetime
     updated_at: datetime
 
