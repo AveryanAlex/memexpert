@@ -42,6 +42,16 @@ export interface TelegramLinkStartRead {
 }
 export type SourcePlatform = 'reddit' | 'telegram' | 'vk';
 export type ChannelSuggestionStatus = 'approved' | 'pending' | 'rejected';
+export type ModerationReportStatus = 'pending' | 'in_review' | 'resolved' | 'dismissed';
+export type ModerationReason = 'copyright' | 'harassment' | 'illegal' | 'nsfw' | 'other' | 'spam';
+export type ModerationAction =
+  | 'hide'
+  | 'hide_and_mark_nsfw'
+  | 'mark_nsfw'
+  | 'mark_sfw'
+  | 'no_action'
+  | 'override_flags'
+  | 'publish';
 
 export interface PublicMemeFileRead {
   id: string;
@@ -180,4 +190,33 @@ export interface AdminMemeRead {
   author_user_id: string | null;
   created_at: string;
   updated_at: string;
+}
+
+export interface AdminModerationReportRead {
+  id: string;
+  meme_id: string;
+  reporter_user_id: string | null;
+  status: ModerationReportStatus;
+  reason: ModerationReason;
+  note: string | null;
+  resolved_by_admin_user_id: string | null;
+  resolved_at: string | null;
+  created_at: string;
+  updated_at: string;
+  meme: AdminMemeRead;
+}
+
+export interface AdminModerationDecisionRead {
+  id: string;
+  meme_id: string;
+  report_id: string | null;
+  admin_user_id: string | null;
+  action: ModerationAction;
+  reason: ModerationReason | null;
+  note: string | null;
+  previous_is_public: boolean;
+  previous_is_nsfw: boolean;
+  new_is_public: boolean;
+  new_is_nsfw: boolean;
+  created_at: string;
 }

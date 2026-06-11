@@ -163,6 +163,7 @@ button {
 .admin-form button,
 .inline-form button,
 .admin-row button,
+.moderation-form button,
 .template-form button {
   border: 0;
   border-radius: 18px;
@@ -501,7 +502,8 @@ button {
 }
 
 .inline-form,
-.template-form {
+.template-form,
+.moderation-form {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
@@ -511,6 +513,9 @@ button {
 .admin-form input,
 .admin-form select,
 .inline-form input,
+.inline-form select,
+.moderation-form input,
+.moderation-form select,
 .template-form input {
   min-width: 0;
   border: 1px solid #dfd4c4;
@@ -518,6 +523,14 @@ button {
   background: #fffaf1;
   color: #17212f;
   padding: 12px 14px;
+}
+
+.moderation-report-row {
+  align-items: start;
+}
+
+.decision-row {
+  grid-template-columns: 1fr;
 }
 
 .checkbox-row {

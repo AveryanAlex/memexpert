@@ -4,6 +4,7 @@ import {
   addSourceChannel,
   ApiError,
   favoriteMeme,
+  fetchAdminDashboard,
   fetchAdminSession,
   fetchCurrentSession,
   fetchMemeDetail,
@@ -12,11 +13,13 @@ import {
   pinMeme,
   refreshCurrentSession,
   removeSavedMeme,
+  resolveModerationReport,
   reviewChannelSuggestion,
   saveMeme,
   startTelegramLink,
   unfavoriteMeme,
   unpinMeme,
+  updateMemeModeration,
   type ApiFetch
 } from './client';
 import type { CurrentSessionRead, PublicMemeSearchPageRead } from './types';
@@ -367,6 +370,88 @@ describe('admin API client', () => {
 
     expect(mockFetch).toHaveBeenCalledOnce();
   });
+
+  it('loads moderation reports and decision history with the admin dashboard', async () => {
+    const calls: string[] = [];
+    const mockFetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      calls.push(`${url.pathname}?${url.searchParams.toString()}`);
+
+      if (url.pathname === '/api/v1/admin/moderation-reports') {
+        expect(url.searchParams.get('limit')).toBe('20');
+        return jsonResponse([moderationReportPayload()]);
+      }
+      if (url.pathname === '/api/v1/admin/moderation-decisions') {
+        expect(url.searchParams.get('limit')).toBe('20');
+        return jsonResponse([moderationDecisionPayload()]);
+      }
+      return jsonResponse([]);
+    }) satisfies ApiFetch;
+
+    const dashboard = await fetchAdminDashboard({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test' });
+
+    expect(dashboard.reports).toHaveLength(1);
+    expect(dashboard.decisions).toHaveLength(1);
+    expect(calls).toContain('/api/v1/admin/moderation-reports?limit=20');
+    expect(calls).toContain('/api/v1/admin/moderation-decisions?limit=20');
+  });
+
+  it('resolves moderation reports through an audited admin write', async () => {
+    const reportId = '44444444-4444-4444-8444-444444444444';
+    const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const headers = new Headers(init?.headers);
+
+      expect(url.pathname).toBe(`/api/v1/admin/moderation-reports/${reportId}/resolve`);
+      expect(init?.method).toBe('POST');
+      expect(headers.get('x-requested-with')).toBe('XMLHttpRequest');
+      expect(JSON.parse(String(init?.body))).toEqual({ action: 'mark_nsfw', reason: 'nsfw', note: 'confirmed' });
+
+      return jsonResponse({ ...moderationReportPayload(), id: reportId, status: 'resolved' });
+    }) satisfies ApiFetch;
+
+    await resolveModerationReport(
+      {
+        fetch: mockFetch,
+        baseUrl: 'https://api.memexpert.test',
+        body: { action: 'mark_nsfw', reason: 'nsfw', note: 'confirmed' }
+      },
+      reportId
+    );
+
+    expect(mockFetch).toHaveBeenCalledOnce();
+  });
+
+  it('updates direct meme moderation flags with audit reason and note', async () => {
+    const memeId = '55555555-5555-4555-8555-555555555555';
+    const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const headers = new Headers(init?.headers);
+
+      expect(url.pathname).toBe(`/api/v1/admin/memes/${memeId}/moderation`);
+      expect(init?.method).toBe('PATCH');
+      expect(headers.get('x-requested-with')).toBe('XMLHttpRequest');
+      expect(JSON.parse(String(init?.body))).toEqual({
+        is_public: false,
+        is_nsfw: true,
+        reason: 'spam',
+        note: 'manual override'
+      });
+
+      return jsonResponse({ ...adminMemePayload(), id: memeId, is_public: false, is_nsfw: true });
+    }) satisfies ApiFetch;
+
+    await updateMemeModeration(
+      {
+        fetch: mockFetch,
+        baseUrl: 'https://api.memexpert.test',
+        body: { is_public: false, is_nsfw: true, reason: 'spam', note: 'manual override' }
+      },
+      memeId
+    );
+
+    expect(mockFetch).toHaveBeenCalledOnce();
+  });
 });
 
 function memeDetail(overrides: { id: string; seo_page_slug: string | null }) {
@@ -421,6 +506,56 @@ function sessionPayload(accountType: 'full' | 'guest'): CurrentSessionRead {
       google_linked: false,
       telegram_linked: accountType === 'full'
     }
+  };
+}
+
+function adminMemePayload() {
+  return {
+    id: '33333333-3333-4333-8333-333333333333',
+    media_type: 'image',
+    language: 'en',
+    is_nsfw: false,
+    is_public: true,
+    popularity_score: 1,
+    like_count: 0,
+    tags: [],
+    template_id: null,
+    author_user_id: null,
+    created_at: '2026-01-01T00:00:00Z',
+    updated_at: '2026-01-01T00:00:00Z'
+  };
+}
+
+function moderationReportPayload() {
+  return {
+    id: '44444444-4444-4444-8444-444444444444',
+    meme_id: '33333333-3333-4333-8333-333333333333',
+    reporter_user_id: '22222222-2222-4222-8222-222222222222',
+    status: 'pending',
+    reason: 'nsfw',
+    note: 'reported from UI',
+    resolved_by_admin_user_id: null,
+    resolved_at: null,
+    created_at: '2026-01-01T00:00:00Z',
+    updated_at: '2026-01-01T00:00:00Z',
+    meme: adminMemePayload()
+  };
+}
+
+function moderationDecisionPayload() {
+  return {
+    id: '66666666-6666-4666-8666-666666666666',
+    meme_id: '33333333-3333-4333-8333-333333333333',
+    report_id: '44444444-4444-4444-8444-444444444444',
+    admin_user_id: '11111111-1111-4111-8111-111111111111',
+    action: 'mark_nsfw',
+    reason: 'nsfw',
+    note: 'confirmed',
+    previous_is_public: true,
+    previous_is_nsfw: false,
+    new_is_public: true,
+    new_is_nsfw: true,
+    created_at: '2026-01-01T00:00:00Z'
   };
 }
 

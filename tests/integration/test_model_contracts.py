@@ -27,6 +27,8 @@ from memexpert.models.content import (
     MemeSeoPage,
     MemeSource,
     MemeTemplate,
+    ModerationDecision,
+    ModerationReport,
     PipelineStageJournal,
     SourceChannel,
     TelegramFileIdCache,
@@ -48,6 +50,9 @@ from memexpert.models.enums import (
     ContentPipelineStageStatus,
     ContentProcessingStatus,
     EmbeddingInputType,
+    ModerationAction,
+    ModerationReason,
+    ModerationReportStatus,
     SourcePlatform,
     SyncTargetKind,
     SyncTargetStatus,
@@ -100,6 +105,8 @@ EXPECTED_TABLES = {
     "meme_sources",
     "meme_templates",
     "memes",
+    "moderation_decisions",
+    "moderation_reports",
     "pinned_memes",
     "pipeline_stage_journal",
     "source_channels",
@@ -167,6 +174,11 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
     assert user_relationships["telegram_link_codes"].mapper.class_ is TelegramLinkCode
     assert meme_relationships["files"].mapper.class_ is MemeFile
     assert meme_relationships["primary_file"].mapper.class_ is MemeFile
+    assert meme_relationships["moderation_reports"].mapper.class_ is ModerationReport
+    assert meme_relationships["moderation_decisions"].mapper.class_ is ModerationDecision
+    assert user_relationships["moderation_reports_submitted"].mapper.class_ is ModerationReport
+    assert user_relationships["moderation_reports_resolved"].mapper.class_ is ModerationReport
+    assert user_relationships["moderation_decisions"].mapper.class_ is ModerationDecision
     assert meme_file_relationships["pipeline_stage_journal_entries"].mapper.class_ is PipelineStageJournal
     assert meme_file_relationships["ocr_result"].mapper.class_ is MemeFileOCRResult
     assert meme_file_relationships["sync_target_snapshots"].mapper.class_ is MemeFileSyncTargetSnapshot
@@ -196,6 +208,58 @@ async def test_user_admin_flag_defaults_false_in_memory_and_when_persisted(
         await session.refresh(user)
 
         assert user.is_admin is False
+
+
+async def test_moderation_report_and_decision_orm_persist_admin_audit_history(
+    model_contract_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with model_contract_session_factory() as session:
+        reporter = User(account_type=AccountType.FULL, email="reporter@example.com")
+        admin = User(account_type=AccountType.FULL, email="moderator@example.com", is_admin=True)
+        meme = Meme(media_type=ContentKind.IMAGE, is_public=True, is_nsfw=False)
+        report = ModerationReport(
+            meme=meme,
+            reporter_user=reporter,
+            reason=ModerationReason.NSFW,
+            note="Looks explicit",
+        )
+        session.add_all([reporter, admin, meme, report])
+        await session.flush()
+
+        report.status = ModerationReportStatus.RESOLVED
+        report.resolved_by_admin_user = admin
+        report.resolved_at = utcnow()
+        session.add(
+            ModerationDecision(
+                meme=meme,
+                report=report,
+                admin_user=admin,
+                action=ModerationAction.MARK_NSFW,
+                reason=ModerationReason.NSFW,
+                note="Confirmed by admin",
+                previous_is_public=True,
+                previous_is_nsfw=False,
+                new_is_public=True,
+                new_is_nsfw=True,
+            ),
+        )
+        await session.commit()
+
+        persisted = await session.scalar(
+            select(ModerationReport)
+            .options(selectinload(ModerationReport.decisions), selectinload(ModerationReport.meme))
+            .where(ModerationReport.id == report.id)
+        )
+
+        assert persisted is not None
+        assert persisted.status is ModerationReportStatus.RESOLVED
+        assert persisted.reason is ModerationReason.NSFW
+        assert persisted.resolved_by_admin_user_id == admin.id
+        assert persisted.meme.id == meme.id
+        assert len(persisted.decisions) == 1
+        assert persisted.decisions[0].action is ModerationAction.MARK_NSFW
+        assert persisted.decisions[0].previous_is_nsfw is False
+        assert persisted.decisions[0].new_is_nsfw is True
 
 
 async def test_schema_handles_cycles_multi_invites_and_nullable_content_fields(
@@ -902,6 +966,32 @@ def test_sync_target_enum_values_are_locked_and_stable() -> None:
         "processing",
         "synced",
         "failed",
+    ]
+
+
+def test_moderation_enum_values_are_locked_and_stable() -> None:
+    assert [member.value for member in ModerationReportStatus] == [
+        "pending",
+        "in_review",
+        "resolved",
+        "dismissed",
+    ]
+    assert [member.value for member in ModerationReason] == [
+        "copyright",
+        "harassment",
+        "illegal",
+        "nsfw",
+        "other",
+        "spam",
+    ]
+    assert [member.value for member in ModerationAction] == [
+        "hide",
+        "hide_and_mark_nsfw",
+        "mark_nsfw",
+        "mark_sfw",
+        "no_action",
+        "override_flags",
+        "publish",
     ]
 
 
