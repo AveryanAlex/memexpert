@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -29,6 +30,8 @@ SEMANTIC_WEIGHT = 0.50
 TEXT_WEIGHT = 0.35
 POPULARITY_WEIGHT = 0.15
 
+logger = logging.getLogger(__name__)
+
 
 class MemeNotFoundError(LookupError):
     """Raised when a meme does not exist or is not visible to the caller."""
@@ -43,6 +46,12 @@ class MemeTextSearchClientProtocol(Protocol):
         *,
         limit: int = 20,
     ) -> list[dict[str, Any]]: ...
+
+
+class MemeQueryEmbeddingClientProtocol(Protocol):
+    """Plain-text query embedding boundary used before user-facing semantic search."""
+
+    async def embed_query(self, query: str) -> tuple[float, ...]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,10 +98,12 @@ class MemeSearchService:
         *,
         text_client: MemeTextSearchClientProtocol | None = None,
         semantic_client: QdrantUserSearchClientProtocol | None = None,
+        query_embedding_client: MemeQueryEmbeddingClientProtocol | None = None,
     ) -> None:
         self._session = session
         self._text_client = text_client
         self._semantic_client = semantic_client
+        self._query_embedding_client = query_embedding_client
 
     async def search_memes(
         self,
@@ -109,9 +120,11 @@ class MemeSearchService:
         resolved_offset = max(0, offset)
         candidate_limit = max(resolved_limit + resolved_offset, resolved_limit) * 4
 
+        normalized_query = query.strip()
+        resolved_query_vector = await self._resolve_query_vector(normalized_query, query_vector=query_vector)
         candidates = await self._collect_index_candidates(
-            query.strip(),
-            query_vector=query_vector,
+            normalized_query,
+            query_vector=resolved_query_vector,
             limit=candidate_limit,
         )
         if not candidates:
@@ -174,6 +187,22 @@ class MemeSearchService:
             raise MemeNotFoundError("Meme was not found or is not visible to this caller.")
         return _to_detail_read(meme)
 
+    async def _resolve_query_vector(
+        self,
+        query: str,
+        *,
+        query_vector: tuple[float, ...] | None,
+    ) -> tuple[float, ...] | None:
+        if query_vector is not None or not query or self._query_embedding_client is None:
+            return query_vector
+
+        try:
+            vector = await self._query_embedding_client.embed_query(query)
+        except Exception:
+            logger.exception("Text query embedding failed; falling back to text-only meme search.")
+            return None
+        return vector or None
+
     async def _collect_index_candidates(
         self,
         query: str,
@@ -194,10 +223,14 @@ class MemeSearchService:
                 candidate.text_raw = max(candidate.text_raw, _text_score_from_hit(hit, rank))
 
         if self._semantic_client is not None and query_vector is not None:
-            semantic_hits = await self._semantic_client.search_memes_by_vector(
-                query_vector=query_vector,
-                limit=limit,
-            )
+            try:
+                semantic_hits = await self._semantic_client.search_memes_by_vector(
+                    query_vector=query_vector,
+                    limit=limit,
+                )
+            except Exception:
+                logger.exception("Semantic meme search failed; falling back to text-only candidates.")
+                semantic_hits = ()
             for semantic_hit in semantic_hits:
                 key = semantic_hit.meme_id
                 candidate = candidates.setdefault(key, _CandidateScore(meme_id=semantic_hit.meme_id))
@@ -415,6 +448,7 @@ __all__ = [
     "MemeNotFoundError",
     "MemeSearchFilters",
     "MemeSearchService",
+    "MemeQueryEmbeddingClientProtocol",
     "MemeTextSearchClientProtocol",
     "QdrantUserSearchMatch",
 ]

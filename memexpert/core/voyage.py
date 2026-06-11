@@ -83,6 +83,36 @@ class PipelineVoyageClient:
     async def embed_image(self, *, image_bytes: bytes, mime_type: str) -> VoyageEmbeddingResult:
         api_key = self._resolve_api_key()
         payload = self._build_request_payload(image_bytes=image_bytes, mime_type=mime_type)
+        vector = await self._post_embedding_request(api_key=api_key, payload=payload)
+        expected_dimensions = self._settings.pipeline_voyage_output_dimensions
+        if len(vector) != expected_dimensions:
+            raise VoyageMalformedResponseError(
+                f"Voyage embedding returned {len(vector)} dims, expected {expected_dimensions}.",
+            )
+        return VoyageEmbeddingResult(
+            model=self._settings.pipeline_voyage_model,
+            dimensions=expected_dimensions,
+            vector=vector,
+            input_hash=build_voyage_input_hash(image_bytes),
+        )
+
+    async def embed_text(self, *, text: str) -> VoyageEmbeddingResult:
+        api_key = self._resolve_api_key()
+        payload = self._build_text_request_payload(text=text)
+        vector = await self._post_embedding_request(api_key=api_key, payload=payload)
+        expected_dimensions = self._settings.pipeline_voyage_output_dimensions
+        if len(vector) != expected_dimensions:
+            raise VoyageMalformedResponseError(
+                f"Voyage embedding returned {len(vector)} dims, expected {expected_dimensions}.",
+            )
+        return VoyageEmbeddingResult(
+            model=self._settings.pipeline_voyage_model,
+            dimensions=expected_dimensions,
+            vector=vector,
+            input_hash=build_voyage_text_input_hash(text),
+        )
+
+    async def _post_embedding_request(self, *, api_key: str, payload: dict[str, object]) -> tuple[float, ...]:
         try:
             async with httpx.AsyncClient(timeout=self._settings.pipeline_voyage_timeout_seconds) as client:
                 response = await client.post(
@@ -114,18 +144,7 @@ class PipelineVoyageClient:
         except ValueError as exc:
             raise VoyageMalformedResponseError("Voyage provider returned a non-JSON response.") from exc
 
-        vector = _extract_voyage_vector(body)
-        expected_dimensions = self._settings.pipeline_voyage_output_dimensions
-        if len(vector) != expected_dimensions:
-            raise VoyageMalformedResponseError(
-                f"Voyage embedding returned {len(vector)} dims, expected {expected_dimensions}.",
-            )
-        return VoyageEmbeddingResult(
-            model=self._settings.pipeline_voyage_model,
-            dimensions=expected_dimensions,
-            vector=vector,
-            input_hash=build_voyage_input_hash(image_bytes),
-        )
+        return _extract_voyage_vector(body)
 
     def _resolve_api_key(self) -> str:
         configured_key = self._settings.pipeline_voyage_api_key
@@ -156,6 +175,23 @@ class PipelineVoyageClient:
             ],
         }
 
+    def _build_text_request_payload(self, *, text: str) -> dict[str, object]:
+        return {
+            "model": self._settings.pipeline_voyage_model,
+            "output_dimension": self._settings.pipeline_voyage_output_dimensions,
+            "input_type": "query",
+            "inputs": [
+                {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": text,
+                        }
+                    ],
+                }
+            ],
+        }
+
 
 def decode_embedding_bytes(embedding_bytes: bytes, *, dimensions: int) -> tuple[float, ...]:
     """Decode ``EmbeddingCache.embedding`` bytes into a typed vector for Qdrant lookups."""
@@ -172,6 +208,12 @@ def decode_embedding_bytes(embedding_bytes: bytes, *, dimensions: int) -> tuple[
             "Embedding bytes could not be decoded as float32 on this platform.",
         )
     return tuple(float(value) for value in float_array)
+
+
+def build_voyage_text_input_hash(text: str) -> str:
+    """Return the deterministic SHA-256 key used for cached text query embeddings."""
+
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _extract_voyage_vector(payload: object) -> tuple[float, ...]:
@@ -207,5 +249,6 @@ __all__ = [
     "VoyageProviderUnavailableError",
     "VoyageTimeoutError",
     "build_voyage_input_hash",
+    "build_voyage_text_input_hash",
     "decode_embedding_bytes",
 ]

@@ -7,8 +7,12 @@ import uuid
 from typing import Any
 
 import pytest
+from fastapi import FastAPI
+from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from memexpert.api.dependencies.auth import get_optional_current_user
+from memexpert.api.dependencies.meme import get_meme_search_service
 from memexpert.core.qdrant import QdrantUserSearchMatch
 from memexpert.models.collection import Collection, CollectionMember, CollectionMeme
 from memexpert.models.content import Meme, MemeFile
@@ -28,15 +32,17 @@ pytestmark = pytest.mark.asyncio
 class FakeTextSearchClient:
     def __init__(self, hits: list[dict[str, Any]]) -> None:
         self._hits = hits
+        self.calls: list[dict[str, Any]] = []
 
     async def search(self, query: str, *, limit: int = 20) -> list[dict[str, Any]]:
-        _ = query
+        self.calls.append({"query": query, "limit": limit})
         return self._hits[:limit]
 
 
 class FakeSemanticSearchClient:
     def __init__(self, hits: tuple[QdrantUserSearchMatch, ...]) -> None:
         self._hits = hits
+        self.calls: list[dict[str, Any]] = []
 
     async def search_memes_by_vector(
         self,
@@ -44,8 +50,18 @@ class FakeSemanticSearchClient:
         query_vector: tuple[float, ...],
         limit: int = 20,
     ) -> tuple[QdrantUserSearchMatch, ...]:
-        assert query_vector
+        self.calls.append({"query_vector": query_vector, "limit": limit})
         return self._hits[:limit]
+
+
+class FakeQueryEmbeddingClient:
+    def __init__(self, vector: tuple[float, ...]) -> None:
+        self._vector = vector
+        self.calls: list[str] = []
+
+    async def embed_query(self, query: str) -> tuple[float, ...]:
+        self.calls.append(query)
+        return self._vector
 
 
 async def _create_meme(
@@ -126,6 +142,92 @@ async def test_hybrid_search_ranks_by_weighted_semantic_text_and_popularity(
     assert page.items[0].score.semantic == 1.0
     assert page.items[1].score.text == 1.0
     assert page.items[0].score.total > page.items[1].score.total
+
+
+async def test_plain_text_query_embedding_feeds_qdrant_and_hybrid_merge(
+    migrated_db_session: AsyncSession,
+) -> None:
+    semantic_meme = await _create_meme(migrated_db_session, popularity_score=10.0)
+    text_meme = await _create_meme(migrated_db_session, popularity_score=100.0)
+    text_client = FakeTextSearchClient(
+        [
+            {"id": str(text_meme.primary_file_id), "meme_id": str(text_meme.id), "_rankingScore": 1.0},
+        ],
+    )
+    semantic_client = FakeSemanticSearchClient(
+        (
+            QdrantUserSearchMatch(
+                meme_file_id=_primary_file_id(semantic_meme),
+                meme_id=semantic_meme.id,
+                semantic_score=0.95,
+            ),
+        ),
+    )
+    embedding_client = FakeQueryEmbeddingClient((0.3, 0.4))
+    service = MemeSearchService(
+        migrated_db_session,
+        text_client=text_client,
+        semantic_client=semantic_client,
+        query_embedding_client=embedding_client,
+    )
+
+    page = await service.search_memes("  frog wizard  ", limit=10)
+
+    assert embedding_client.calls == ["frog wizard"]
+    assert semantic_client.calls == [{"query_vector": (0.3, 0.4), "limit": 40}]
+    assert text_client.calls == [{"query": "frog wizard", "limit": 40}]
+    assert [item.meme.id for item in page.items] == [semantic_meme.id, text_meme.id]
+    assert page.items[0].score.semantic == 1.0
+    assert page.items[1].score.text == 1.0
+
+
+async def test_search_route_uses_plain_text_semantic_path_with_overridden_fakes(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    semantic_meme = await _create_meme(migrated_db_session, popularity_score=10.0)
+    text_meme = await _create_meme(migrated_db_session, popularity_score=100.0)
+    text_client = FakeTextSearchClient(
+        [
+            {"id": str(text_meme.primary_file_id), "meme_id": str(text_meme.id), "_rankingScore": 1.0},
+        ],
+    )
+    semantic_client = FakeSemanticSearchClient(
+        (
+            QdrantUserSearchMatch(
+                meme_file_id=_primary_file_id(semantic_meme),
+                meme_id=semantic_meme.id,
+                semantic_score=0.95,
+            ),
+        ),
+    )
+    embedding_client = FakeQueryEmbeddingClient((0.7, 0.8))
+
+    def override_meme_search_service() -> MemeSearchService:
+        return MemeSearchService(
+            migrated_db_session,
+            text_client=text_client,
+            semantic_client=semantic_client,
+            query_embedding_client=embedding_client,
+        )
+
+    async def override_current_user() -> None:
+        return None
+
+    app.dependency_overrides[get_meme_search_service] = override_meme_search_service
+    app.dependency_overrides[get_optional_current_user] = override_current_user
+
+    try:
+        response = await client.get("/api/v1/memes/search", params={"query": "frog wizard", "limit": 10})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [item["meme"]["id"] for item in payload["items"]] == [str(semantic_meme.id), str(text_meme.id)]
+    assert embedding_client.calls == ["frog wizard"]
+    assert semantic_client.calls == [{"query_vector": (0.7, 0.8), "limit": 40}]
 
 
 async def test_search_filters_and_paginates_after_visibility(migrated_db_session: AsyncSession) -> None:
