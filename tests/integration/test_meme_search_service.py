@@ -9,23 +9,28 @@ from typing import Any
 import pytest
 from fastapi import FastAPI
 from httpx import AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from memexpert.api.dependencies import PIPELINE_OPERATOR_TOKEN_HEADER_NAME
 from memexpert.api.dependencies.auth import get_optional_current_user
-from memexpert.api.dependencies.meme import get_meme_search_service
+from memexpert.api.dependencies.meme import get_analytics_service, get_meme_search_service
+from memexpert.core.config import get_settings
 from memexpert.core.qdrant import QdrantUserSearchMatch
 from memexpert.models.collection import Collection, CollectionMember, CollectionMeme
-from memexpert.models.content import Meme, MemeFile
+from memexpert.models.content import Meme, MemeFile, MemePopularitySnapshot
 from memexpert.models.enums import (
     AccountType,
+    AnalyticsEventType,
     CollectionKind,
     CollectionMembershipRole,
     CollectionVisibility,
     ContentKind,
     ContentLanguage,
 )
-from memexpert.models.user import User
+from memexpert.models.user import AccountMergeLog, AnalyticsEvent, User
 from memexpert.schemas.user import UserRead
+from memexpert.services.analytics import AnalyticsService
 from memexpert.services.meme_search import MemeNotFoundError, MemeSearchFilters, MemeSearchService
 
 pytestmark = pytest.mark.asyncio
@@ -92,6 +97,7 @@ async def _create_meme(
     tags: list[str] | None = None,
     is_nsfw: bool = False,
     popularity_score: float = 0.0,
+    like_count: int = 0,
     is_public: bool = True,
     author_user_id: uuid.UUID | None = None,
 ) -> Meme:
@@ -101,6 +107,7 @@ async def _create_meme(
         tags=tags or [],
         is_nsfw=is_nsfw,
         popularity_score=popularity_score,
+        like_count=like_count,
         is_public=is_public,
         author_user_id=author_user_id,
     )
@@ -142,7 +149,11 @@ def _install_meme_route_overrides(
     async def override_current_user() -> UserRead | None:
         return current_user
 
+    def override_analytics_service() -> AnalyticsService:
+        return AnalyticsService(session)
+
     app.dependency_overrides[get_meme_search_service] = override_meme_search_service
+    app.dependency_overrides[get_analytics_service] = override_analytics_service
     app.dependency_overrides[get_optional_current_user] = override_current_user
 
 
@@ -269,6 +280,24 @@ async def test_search_route_uses_plain_text_semantic_path_with_overridden_fakes(
     assert embedding_client.calls == ["frog wizard"]
     assert semantic_client.calls == [{"query_vector": (0.7, 0.8), "limit": 40}]
 
+    event = await migrated_db_session.scalar(
+        select(AnalyticsEvent).where(AnalyticsEvent.event_type == AnalyticsEventType.SEARCH_QUERY)
+    )
+    assert event is not None
+    assert event.user_id is None
+    assert event.payload == {
+        "surface": "public_api",
+        "query": "frog wizard",
+        "language": None,
+        "media_type": None,
+        "include_nsfw": False,
+        "tags": [],
+        "limit": 10,
+        "offset": 0,
+        "result_count": 2,
+        "has_more": False,
+    }
+
 
 async def test_public_openapi_registers_catalog_routes_without_internal_surface(app: FastAPI) -> None:
     schema = app.openapi()
@@ -277,6 +306,7 @@ async def test_public_openapi_registers_catalog_routes_without_internal_surface(
 
     assert "/api/v1/memes/search" in paths
     assert "/api/v1/memes/browse" in paths
+    assert "/api/v1/memes/trending" in paths
     assert "/api/v1/memes/{meme_id}" in paths
     search_parameters = {parameter["name"] for parameter in paths["/api/v1/memes/search"]["get"]["parameters"]}
     assert "query" in search_parameters
@@ -340,6 +370,55 @@ async def test_browse_route_filters_and_paginates_popular_catalog(
     assert payload["has_more"] is False
     assert [item["meme"]["id"] for item in payload["items"]] == [str(second.id)]
     assert str(first.id) != str(second.id)
+
+
+async def test_trending_route_ranks_recent_events_snapshots_and_popularity_without_private_ids(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    event_meme = await _create_meme(migrated_db_session, tags=["trend"], popularity_score=1.0, like_count=1)
+    snapshot_meme = await _create_meme(migrated_db_session, tags=["trend"], popularity_score=2.0, like_count=1)
+    popularity_meme = await _create_meme(migrated_db_session, tags=["trend"], popularity_score=20.0, like_count=10)
+    private_meme = await _create_meme(migrated_db_session, tags=["trend"], popularity_score=100.0, is_public=False)
+    migrated_db_session.add_all(
+        [
+            AnalyticsEvent(
+                event_type=AnalyticsEventType.MEME_SEND,
+                payload={"meme_id": str(event_meme.id), "telegram_user_hash": "hashed-user"},
+            ),
+            AnalyticsEvent(
+                event_type=AnalyticsEventType.MEME_LIKE,
+                payload={"meme_id": str(event_meme.id), "telegram_user_hash": "hashed-user"},
+            ),
+            AnalyticsEvent(
+                event_type=AnalyticsEventType.MEME_SEND,
+                payload={"meme_id": str(private_meme.id), "telegram_user_id": 12345},
+            ),
+            MemePopularitySnapshot(meme_id=snapshot_meme.id, popularity_score=100.0, source_views=50),
+        ]
+    )
+    await migrated_db_session.flush()
+    _install_meme_route_overrides(app, migrated_db_session)
+
+    try:
+        first_response = await client.get("/api/v1/memes/trending", params={"tags": "trend", "limit": 10})
+        second_response = await client.get("/api/v1/memes/trending", params={"tags": "trend", "limit": 10})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    assert first_response.json() == second_response.json()
+    payload = first_response.json()
+    assert [item["meme"]["id"] for item in payload["items"]] == [
+        str(event_meme.id),
+        str(snapshot_meme.id),
+        str(popularity_meme.id),
+    ]
+    assert str(private_meme.id) not in first_response.text
+    assert "telegram_user_id" not in first_response.text
+    assert "telegram_user_hash" not in first_response.text
 
 
 async def test_public_routes_apply_nsfw_defaults_and_authenticated_opt_in(
@@ -454,6 +533,79 @@ async def test_detail_route_returns_not_found_for_missing_private_or_nsfw_withou
     assert await detail_status(private_meme.id, _user_read(author)) == 200
     assert await detail_status(nsfw_meme.id, _user_read(author)) == 404
     assert await detail_status(nsfw_meme.id, _user_read(author), include_nsfw=True) == 200
+
+    event = await migrated_db_session.scalar(
+        select(AnalyticsEvent)
+        .where(AnalyticsEvent.event_type == AnalyticsEventType.MEME_VIEW)
+        .order_by(AnalyticsEvent.occurred_at.desc())
+    )
+    assert event is not None
+    assert event.payload["surface"] == "public_api"
+    assert event.payload["meme_id"] == str(nsfw_meme.id)
+
+
+async def test_operator_launch_kpis_count_events_source_metrics_and_conversions(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    user = User(account_type=AccountType.FULL)
+    guest = User(account_type=AccountType.GUEST)
+    target = User(account_type=AccountType.FULL)
+    migrated_db_session.add_all([user, guest, target])
+    await migrated_db_session.flush()
+    meme = await _create_meme(migrated_db_session)
+    migrated_db_session.add_all(
+        [
+            AnalyticsEvent(user_id=user.id, event_type=AnalyticsEventType.SEARCH_QUERY, payload={"query": "cats"}),
+            AnalyticsEvent(user_id=user.id, event_type=AnalyticsEventType.MEME_VIEW, payload={"meme_id": str(meme.id)}),
+            AnalyticsEvent(user_id=user.id, event_type=AnalyticsEventType.MEME_SEND, payload={"meme_id": str(meme.id)}),
+            AnalyticsEvent(user_id=user.id, event_type=AnalyticsEventType.MEME_LIKE, payload={"meme_id": str(meme.id)}),
+            AnalyticsEvent(user_id=None, event_type=AnalyticsEventType.MEME_SAVE, payload={"meme_id": str(meme.id)}),
+            AccountMergeLog(
+                guest_account_id=guest.id,
+                target_account_id=target.id,
+                favorites_transferred=1,
+                views_transferred=2,
+            ),
+            MemePopularitySnapshot(
+                meme_id=meme.id,
+                source_views=100,
+                source_reactions=7,
+                source_reposts=3,
+                popularity_score=10.0,
+            ),
+        ]
+    )
+    await migrated_db_session.flush()
+    operator_token = get_settings().pipeline_operator_token.get_secret_value()
+
+    def override_analytics_service() -> AnalyticsService:
+        return AnalyticsService(migrated_db_session)
+
+    app.dependency_overrides[get_analytics_service] = override_analytics_service
+    try:
+        response = await client.get(
+            "/api/v1/pipeline/launch-kpis",
+            headers={PIPELINE_OPERATOR_TOKEN_HEADER_NAME: operator_token},
+            params={"lookback_hours": 24},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["lookback_hours"] == 24
+    assert payload["searches"] == 1
+    assert payload["views"] == 1
+    assert payload["sends"] == 1
+    assert payload["active_users"] == 1
+    assert payload["likes"] == 1
+    assert payload["saves"] == 1
+    assert payload["guest_to_full_conversions"] == 1
+    assert payload["source_views"] == 100
+    assert payload["source_reactions"] == 7
+    assert payload["source_reposts"] == 3
 
 
 async def test_provider_failures_fall_back_to_popular_without_raw_error_payload(

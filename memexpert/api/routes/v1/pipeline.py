@@ -9,6 +9,7 @@ from typing import Annotated
 from fastapi import APIRouter, Body, Depends, File, Form, Path, Query, UploadFile, status
 from pydantic import ValidationError
 
+from memexpert.api.dependencies.meme import AnalyticsServiceDep
 from memexpert.api.dependencies.pipeline import (
     PIPELINE_ERROR_RESPONSES,
     MeilisearchSyncClientDep,
@@ -33,12 +34,28 @@ from memexpert.schemas.content_pipeline import (
     SmokeProofResult,
 )
 from memexpert.services import PipelinePayloadValidationError, PipelineServiceError
+from memexpert.services.analytics import LaunchKPIRead
 
 router = APIRouter(
     prefix="/pipeline",
     tags=["pipeline"],
     dependencies=[Depends(require_pipeline_operator_token)],
 )
+
+
+@router.get(
+    "/launch-kpis",
+    response_model=LaunchKPIRead,
+    responses=PIPELINE_ERROR_RESPONSES,
+    summary="Read launch KPI counts from analytics and source metrics",
+)
+async def read_launch_kpis(
+    analytics_service: AnalyticsServiceDep,
+    lookback_hours: Annotated[int, Query(ge=1, le=24 * 90)] = 168,
+) -> LaunchKPIRead:
+    """Return operator launch KPIs for the requested recent window."""
+
+    return await analytics_service.launch_kpis(lookback_hours=lookback_hours)
 
 
 @router.post(

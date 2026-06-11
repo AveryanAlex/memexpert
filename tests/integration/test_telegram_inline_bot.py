@@ -304,13 +304,15 @@ async def test_inline_plain_text_query_calls_shared_search_service_and_records_q
     assert result.photo_file_id == "cached-photo-id"
 
     async with postgres_session_factory() as session:
-        inline_events = await session.scalar(
-            select(func.count())
-            .select_from(AnalyticsEvent)
-            .where(AnalyticsEvent.event_type == AnalyticsEventType.INLINE_QUERY)
+        inline_event = await session.scalar(
+            select(AnalyticsEvent).where(AnalyticsEvent.event_type == AnalyticsEventType.INLINE_QUERY)
         )
         inline_usage_events = await session.scalar(select(func.count()).select_from(InlineUsageEvent))
-    assert inline_events == 1
+    assert inline_event is not None
+    assert inline_event.payload["telegram_user_hash"] == hashlib.sha256(
+        f"telegram_user:{TELEGRAM_ID}".encode()
+    ).hexdigest()
+    assert "telegram_user_id" not in inline_event.payload
     assert inline_usage_events == 0
 
 
@@ -529,3 +531,5 @@ async def test_chosen_inline_result_records_meme_send_analytics(
     assert event.payload["meme_id"] == str(meme.id)
     assert event.payload["meme_file_id"] == str(file.id)
     assert event.payload["result_id"] == result_id
+    assert event.payload["telegram_user_hash"] == hashlib.sha256(f"telegram_user:{TELEGRAM_ID}".encode()).hexdigest()
+    assert "telegram_user_id" not in event.payload
