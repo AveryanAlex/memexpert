@@ -1794,6 +1794,7 @@ class ContentPipelineService:
             media_type=prepared_upload.media_type,
             language=ContentLanguage.NONE,
             is_public=False,
+            author_user_id=metadata.owner_user_id,
         )
         self._session.add(meme)
         await self._session.flush()
