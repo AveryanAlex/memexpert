@@ -187,6 +187,23 @@ class MemeSearchService:
             raise MemeNotFoundError("Meme was not found or is not visible to this caller.")
         return _to_detail_read(meme)
 
+    async def browse_memes(
+        self,
+        *,
+        viewer_user_id: uuid.UUID | None = None,
+        filters: MemeSearchFilters | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> MemeSearchPageRead:
+        """Return a stable popular catalog page using the service fallback behavior."""
+
+        return await self._popular_page(
+            viewer_user_id=viewer_user_id,
+            filters=filters or MemeSearchFilters(),
+            limit=_clamp_limit(limit),
+            offset=max(0, offset),
+        )
+
     async def _resolve_query_vector(
         self,
         query: str,
@@ -213,7 +230,11 @@ class MemeSearchService:
         candidates: dict[uuid.UUID, _CandidateScore] = {}
 
         if self._text_client is not None and query:
-            text_hits = await self._text_client.search(query, limit=limit)
+            try:
+                text_hits = await self._text_client.search(query, limit=limit)
+            except Exception:
+                logger.exception("Text meme search failed; falling back to semantic/popular candidates.")
+                text_hits = []
             for rank, hit in enumerate(text_hits, start=1):
                 key = _candidate_key_from_hit(hit)
                 if key is None:
