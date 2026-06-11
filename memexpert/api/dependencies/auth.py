@@ -36,6 +36,7 @@ AUTH_ERROR_STATUS_CODES: Final[dict[AuthErrorCode, int]] = {
     AuthErrorCode.PROVIDER_ACCESS_DENIED: int(HTTPStatus.UNAUTHORIZED),
     AuthErrorCode.INVALID_CREDENTIALS: int(HTTPStatus.UNAUTHORIZED),
     AuthErrorCode.ACCOUNT_UNAVAILABLE: int(HTTPStatus.FORBIDDEN),
+    AuthErrorCode.ADMIN_REQUIRED: int(HTTPStatus.FORBIDDEN),
     AuthErrorCode.UPGRADE_REQUIRED: int(HTTPStatus.FORBIDDEN),
     AuthErrorCode.GUEST_ACCOUNT_REQUIRED: int(HTTPStatus.FORBIDDEN),
     AuthErrorCode.ACCOUNT_LINK_ALREADY_COMPLETED: int(HTTPStatus.CONFLICT),
@@ -211,6 +212,21 @@ async def get_guest_user(current_user: CurrentUserDep) -> UserRead:
     return current_user
 
 
+async def get_admin_user(current_user: CurrentUserDep) -> UserRead:
+    """Require a durable admin flag on the current cookie-authenticated user."""
+
+    if not current_user.is_admin:
+        raise AuthHTTPError(
+            status_code=int(HTTPStatus.FORBIDDEN),
+            payload=AuthErrorResponse(
+                code=AuthErrorCode.ADMIN_REQUIRED,
+                detail="An admin account is required for this operation.",
+            ),
+        )
+
+    return current_user
+
+
 async def get_or_bootstrap_guest_user(
     request: Request,
     response: Response,
@@ -296,6 +312,7 @@ async def forbid_full_account_caller(
 
 
 FullAccountUserDep = Annotated[UserRead, Depends(get_full_account_user)]
+AdminUserDep = Annotated[UserRead, Depends(get_admin_user)]
 GuestUserDep = Annotated[UserRead, Depends(get_guest_user)]
 OptionalGuestUserDep = Annotated["UserRead | None", Depends(get_optional_guest_user)]
 ForbidFullAccountCallerDep = Annotated[None, Depends(forbid_full_account_caller)]
@@ -306,6 +323,7 @@ __all__ = [
     "AUTH_ERROR_RESPONSES",
     "AUTH_ERROR_STATUS_CODES",
     "AccountLinkServiceDep",
+    "AdminUserDep",
     "AuthHTTPError",
     "AuthServiceDep",
     "AutoGuestUserDep",
@@ -324,6 +342,7 @@ __all__ = [
     "get_auth_service",
     "get_current_user",
     "get_full_account_user",
+    "get_admin_user",
     "get_guest_user",
     "get_optional_current_user",
     "get_optional_guest_user",

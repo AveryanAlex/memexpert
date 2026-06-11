@@ -1,4 +1,9 @@
 import type {
+  AdminMemeRead,
+  AdminMemeTemplateRead,
+  AdminSessionRead,
+  AdminSourceChannelRead,
+  ChannelSuggestionRead,
   CurrentSessionRead,
   PublicMemeDetailRead,
   PublicMemeLandingRead,
@@ -36,6 +41,10 @@ interface MemeActionRequest {
 
 export interface RemoveActionResponse {
   removed?: boolean;
+}
+
+interface AdminMutationRequest extends CatalogRequest {
+  body?: unknown;
 }
 
 interface LandingRequest extends CatalogRequest {
@@ -123,6 +132,73 @@ export async function fetchTemplateLanding(request: LandingRequest): Promise<Pub
   return fetchLanding(`/api/v1/memes/templates/${encodeURIComponent(request.slug)}`, request);
 }
 
+export async function fetchAdminSession(request: CatalogRequest): Promise<AdminSessionRead> {
+  return apiGet<AdminSessionRead>('/api/v1/admin/session', new URLSearchParams(), request);
+}
+
+export async function fetchAdminDashboard(request: CatalogRequest): Promise<{
+  suggestions: ChannelSuggestionRead[];
+  sourceChannels: AdminSourceChannelRead[];
+  templates: AdminMemeTemplateRead[];
+  memes: AdminMemeRead[];
+}> {
+  const [suggestions, sourceChannels, templates, memes] = await Promise.all([
+    apiGet<ChannelSuggestionRead[]>('/api/v1/admin/channel-suggestions', new URLSearchParams(), request),
+    apiGet<AdminSourceChannelRead[]>('/api/v1/admin/source-channels', new URLSearchParams(), request),
+    apiGet<AdminMemeTemplateRead[]>('/api/v1/admin/meme-templates', new URLSearchParams(), request),
+    apiGet<AdminMemeRead[]>('/api/v1/admin/memes', new URLSearchParams({ limit: '20' }), request)
+  ]);
+
+  return { suggestions, sourceChannels, templates, memes };
+}
+
+export async function reviewChannelSuggestion(
+  request: AdminMutationRequest,
+  suggestionId: string,
+  decision: 'approve' | 'reject'
+): Promise<ChannelSuggestionRead> {
+  return apiWrite<ChannelSuggestionRead>(
+    `/api/v1/admin/channel-suggestions/${encodeURIComponent(suggestionId)}/${decision}`,
+    'POST',
+    request
+  );
+}
+
+export async function addSourceChannel(request: AdminMutationRequest): Promise<AdminSourceChannelRead> {
+  return apiWrite<AdminSourceChannelRead>('/api/v1/admin/source-channels', 'POST', request);
+}
+
+export async function setSourceChannelPaused(
+  request: CatalogRequest,
+  channelId: string,
+  paused: boolean
+): Promise<AdminSourceChannelRead> {
+  return apiWrite<AdminSourceChannelRead>(
+    `/api/v1/admin/source-channels/${encodeURIComponent(channelId)}/${paused ? 'pause' : 'resume'}`,
+    'POST',
+    request
+  );
+}
+
+export async function updateMemeTemplate(
+  request: AdminMutationRequest,
+  templateId: string
+): Promise<AdminMemeTemplateRead> {
+  return apiWrite<AdminMemeTemplateRead>(
+    `/api/v1/admin/meme-templates/${encodeURIComponent(templateId)}`,
+    'PATCH',
+    request
+  );
+}
+
+export async function updateMemeModeration(request: AdminMutationRequest, memeId: string): Promise<AdminMemeRead> {
+  return apiWrite<AdminMemeRead>(
+    `/api/v1/admin/memes/${encodeURIComponent(memeId)}/moderation`,
+    'PATCH',
+    request
+  );
+}
+
 async function fetchLanding(path: string, request: LandingRequest): Promise<PublicMemeLandingRead> {
   return apiGet<PublicMemeLandingRead>(
     path,
@@ -177,6 +253,30 @@ async function apiMutation<T>(path: string, method: 'DELETE' | 'POST', request: 
 
   if (!response.ok) {
     throw new ApiError(response.status, readErrorDetail(payload) ?? `Meme action returned ${response.status}`);
+  }
+
+  return payload as T;
+}
+
+async function apiWrite<T>(path: string, method: 'PATCH' | 'POST', request: AdminMutationRequest): Promise<T> {
+  const url = new URL(path, request.baseUrl);
+  const headers = new Headers({ accept: 'application/json', 'x-requested-with': 'XMLHttpRequest' });
+  if (request.body !== undefined) {
+    headers.set('content-type', 'application/json');
+  }
+  if (request.cookieHeader) {
+    headers.set('cookie', request.cookieHeader);
+  }
+
+  const response = await request.fetch(url, {
+    method,
+    headers,
+    body: request.body === undefined ? undefined : JSON.stringify(request.body)
+  });
+  const payload = await readJson(response);
+
+  if (!response.ok) {
+    throw new ApiError(response.status, readErrorDetail(payload) ?? `Admin API returned ${response.status}`);
   }
 
   return payload as T;

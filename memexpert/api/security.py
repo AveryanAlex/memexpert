@@ -23,6 +23,7 @@ from memexpert.schemas.api_errors import ApiErrorCode, ApiErrorResponse
 SAFE_HTTP_METHODS: Final[frozenset[str]] = frozenset({"GET", "HEAD", "OPTIONS"})
 API_PATH_SEGMENT: Final = "api"
 AUTH_PATH_SEGMENT: Final = "auth"
+ADMIN_PATH_SEGMENT: Final = "admin"
 VERSION_PATH_PREFIX: Final = "v"
 V1_AUTH_PATH_PREFIX: Final = "/api/v1/auth"
 RATE_LIMIT_KEY_PREFIX: Final = "security:rate_limit"
@@ -60,6 +61,7 @@ class SecurityRouteTier(StrEnum):
 
     SAFE = "safe"
     AUTH_WRITE = "auth_write"
+    BROWSER_WRITE = "browser_write"
 
 
 class SecurityRateLimitTier(StrEnum):
@@ -170,9 +172,11 @@ def classify_security_route(request: Request) -> SecurityRouteTier:
         return SecurityRouteTier.SAFE
     if segments[0] != API_PATH_SEGMENT or not _is_version_segment(segments[1]):
         return SecurityRouteTier.SAFE
-    if segments[2] != AUTH_PATH_SEGMENT:
-        return SecurityRouteTier.SAFE
-    return SecurityRouteTier.AUTH_WRITE
+    if segments[2] == AUTH_PATH_SEGMENT:
+        return SecurityRouteTier.AUTH_WRITE
+    if segments[2] == ADMIN_PATH_SEGMENT:
+        return SecurityRouteTier.BROWSER_WRITE
+    return SecurityRouteTier.SAFE
 
 
 async def security_http_exception_handler(_request: Request, exc: Exception) -> JSONResponse:
@@ -224,7 +228,7 @@ def require_browser_csrf_header(
 ) -> None:
     """Reject unsafe browser-style auth writes that omit the configured CSRF request header."""
 
-    if route_tier is not SecurityRouteTier.AUTH_WRITE:
+    if route_tier not in {SecurityRouteTier.AUTH_WRITE, SecurityRouteTier.BROWSER_WRITE}:
         return
     if request.method.upper() in SAFE_HTTP_METHODS:
         return
