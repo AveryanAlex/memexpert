@@ -37,6 +37,7 @@ async def test_telegram_link_start_route_persists_short_hash_only_code_and_retur
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     guest_response = await auth_client.post("/api/v1/auth/guest")
+    assert guest_response.status_code == 201
     guest_user_id = uuid.UUID(guest_response.json()["user"]["id"])
 
     response = await auth_client.post("/api/v1/auth/link/telegram")
