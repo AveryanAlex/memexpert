@@ -68,6 +68,7 @@ from memexpert.services.errors import (
     UserServiceError,
     UserStateMismatchError,
 )
+from memexpert.services.meme_search import MemeNotFoundError, MemeSearchFilters, MemeSearchService
 from memexpert.services.provider_auth_service import ProviderAuthService
 from memexpert.services.user_service import DEFAULT_GUEST_LIFETIME, UserService
 
@@ -112,6 +113,9 @@ __all__ = [
     "InvalidIdentityError",
     "InvalidTokenError",
     "LinkedProvidersProjection",
+    "MemeNotFoundError",
+    "MemeSearchFilters",
+    "MemeSearchService",
     "MissingTokenError",
     "PipelineIngestError",
     "PipelineItemNotFoundError",

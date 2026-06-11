@@ -1,0 +1,228 @@
+# ruff: noqa: TC002,TC003
+"""Focused tests for the shared hybrid meme search service."""
+
+from __future__ import annotations
+
+import uuid
+from typing import Any
+
+import pytest
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from memexpert.core.qdrant import QdrantUserSearchMatch
+from memexpert.models.collection import Collection, CollectionMember, CollectionMeme
+from memexpert.models.content import Meme, MemeFile
+from memexpert.models.enums import (
+    CollectionKind,
+    CollectionMembershipRole,
+    CollectionVisibility,
+    ContentKind,
+    ContentLanguage,
+)
+from memexpert.models.user import User
+from memexpert.services.meme_search import MemeNotFoundError, MemeSearchFilters, MemeSearchService
+
+pytestmark = pytest.mark.asyncio
+
+
+class FakeTextSearchClient:
+    def __init__(self, hits: list[dict[str, Any]]) -> None:
+        self._hits = hits
+
+    async def search(self, query: str, *, limit: int = 20) -> list[dict[str, Any]]:
+        _ = query
+        return self._hits[:limit]
+
+
+class FakeSemanticSearchClient:
+    def __init__(self, hits: tuple[QdrantUserSearchMatch, ...]) -> None:
+        self._hits = hits
+
+    async def search_memes_by_vector(
+        self,
+        *,
+        query_vector: tuple[float, ...],
+        limit: int = 20,
+    ) -> tuple[QdrantUserSearchMatch, ...]:
+        assert query_vector
+        return self._hits[:limit]
+
+
+async def _create_meme(
+    session: AsyncSession,
+    *,
+    media_type: ContentKind = ContentKind.IMAGE,
+    language: ContentLanguage = ContentLanguage.EN,
+    tags: list[str] | None = None,
+    is_nsfw: bool = False,
+    popularity_score: float = 0.0,
+    is_public: bool = True,
+    author_user_id: uuid.UUID | None = None,
+) -> Meme:
+    meme = Meme(
+        media_type=media_type,
+        language=language,
+        tags=tags or [],
+        is_nsfw=is_nsfw,
+        popularity_score=popularity_score,
+        is_public=is_public,
+        author_user_id=author_user_id,
+    )
+    session.add(meme)
+    await session.flush()
+    file = MemeFile(
+        meme_id=meme.id,
+        s3_original_key=f"memes/{meme.id}.jpg",
+        mime_type="image/jpeg",
+        quality_score=0.8,
+        is_primary=True,
+    )
+    session.add(file)
+    await session.flush()
+    meme.primary_file_id = file.id
+    await session.flush()
+    return meme
+
+
+def _primary_file_id(meme: Meme) -> uuid.UUID:
+    assert meme.primary_file_id is not None
+    return meme.primary_file_id
+
+
+async def test_hybrid_search_ranks_by_weighted_semantic_text_and_popularity(
+    migrated_db_session: AsyncSession,
+) -> None:
+    semantic_meme = await _create_meme(migrated_db_session, popularity_score=10.0)
+    text_meme = await _create_meme(migrated_db_session, popularity_score=100.0)
+    popular_meme = await _create_meme(migrated_db_session, popularity_score=200.0)
+
+    service = MemeSearchService(
+        migrated_db_session,
+        text_client=FakeTextSearchClient(
+            [
+                {"id": str(text_meme.primary_file_id), "meme_id": str(text_meme.id), "_rankingScore": 1.0},
+                {"id": str(popular_meme.primary_file_id), "meme_id": str(popular_meme.id), "_rankingScore": 0.1},
+            ],
+        ),
+        semantic_client=FakeSemanticSearchClient(
+            (
+                QdrantUserSearchMatch(
+                    meme_file_id=_primary_file_id(semantic_meme),
+                    meme_id=semantic_meme.id,
+                    semantic_score=0.95,
+                ),
+                QdrantUserSearchMatch(
+                    meme_file_id=_primary_file_id(popular_meme),
+                    meme_id=popular_meme.id,
+                    semantic_score=0.4,
+                ),
+            ),
+        ),
+    )
+
+    page = await service.search_memes("frog", query_vector=(0.1, 0.2), limit=10)
+
+    assert [item.meme.id for item in page.items] == [semantic_meme.id, text_meme.id, popular_meme.id]
+    assert page.items[0].score.semantic == 1.0
+    assert page.items[1].score.text == 1.0
+    assert page.items[0].score.total > page.items[1].score.total
+
+
+async def test_search_filters_and_paginates_after_visibility(migrated_db_session: AsyncSession) -> None:
+    first = await _create_meme(migrated_db_session, tags=["cat"], popularity_score=3.0)
+    second = await _create_meme(migrated_db_session, tags=["cat"], popularity_score=2.0)
+    await _create_meme(migrated_db_session, tags=["dog"], popularity_score=100.0)
+    await _create_meme(
+        migrated_db_session,
+        tags=["cat"],
+        language=ContentLanguage.RU,
+        is_nsfw=True,
+        popularity_score=200.0,
+    )
+    service = MemeSearchService(migrated_db_session)
+
+    page = await service.search_memes(
+        "",
+        filters=MemeSearchFilters(language=ContentLanguage.EN, tags=("cat",)),
+        limit=1,
+        offset=1,
+    )
+
+    assert page.total == 2
+    assert page.has_more is False
+    assert [item.meme.id for item in page.items] == [second.id]
+    assert first.id != second.id
+
+
+async def test_private_memes_are_visible_only_to_author_or_collection_member(
+    migrated_db_session: AsyncSession,
+) -> None:
+    author = User()
+    member = User()
+    stranger = User()
+    migrated_db_session.add_all([author, member, stranger])
+    await migrated_db_session.flush()
+
+    authored_private = await _create_meme(migrated_db_session, is_public=False, author_user_id=author.id)
+    shared_private = await _create_meme(migrated_db_session, is_public=False)
+    collection = Collection(
+        owner_id=author.id,
+        title="Shared",
+        kind=CollectionKind.CUSTOM,
+        visibility=CollectionVisibility.PRIVATE,
+    )
+    migrated_db_session.add(collection)
+    await migrated_db_session.flush()
+    migrated_db_session.add_all(
+        [
+            CollectionMember(
+                collection_id=collection.id,
+                user_id=member.id,
+                role=CollectionMembershipRole.VIEWER,
+            ),
+            CollectionMeme(collection_id=collection.id, meme_id=shared_private.id, added_by_user_id=author.id),
+        ],
+    )
+    await migrated_db_session.flush()
+
+    service = MemeSearchService(
+        migrated_db_session,
+        text_client=FakeTextSearchClient(
+            [
+                {
+                    "id": str(authored_private.primary_file_id),
+                    "meme_id": str(authored_private.id),
+                    "_rankingScore": 1.0,
+                },
+                {"id": str(shared_private.primary_file_id), "meme_id": str(shared_private.id), "_rankingScore": 0.9},
+            ],
+        ),
+    )
+
+    anonymous_page = await service.search_memes("private")
+    author_page = await service.search_memes("private", viewer_user_id=author.id)
+    member_page = await service.search_memes("private", viewer_user_id=member.id)
+    stranger_page = await service.search_memes("private", viewer_user_id=stranger.id)
+
+    assert anonymous_page.items == []
+    assert {item.meme.id for item in author_page.items} == {authored_private.id, shared_private.id}
+    assert {item.meme.id for item in member_page.items} == {shared_private.id}
+    assert stranger_page.items == []
+
+
+async def test_detail_read_enforces_visibility_and_nsfw(migrated_db_session: AsyncSession) -> None:
+    viewer = User()
+    migrated_db_session.add(viewer)
+    await migrated_db_session.flush()
+    private_meme = await _create_meme(migrated_db_session, is_public=False, author_user_id=viewer.id)
+    nsfw_meme = await _create_meme(migrated_db_session, is_nsfw=True)
+    service = MemeSearchService(migrated_db_session)
+
+    detail = await service.get_meme_detail(private_meme.id, viewer_user_id=viewer.id)
+
+    assert detail.id == private_meme.id
+    with pytest.raises(MemeNotFoundError):
+        await service.get_meme_detail(private_meme.id)
+    with pytest.raises(MemeNotFoundError):
+        await service.get_meme_detail(nsfw_meme.id)
+    assert (await service.get_meme_detail(nsfw_meme.id, include_nsfw=True)).id == nsfw_meme.id
