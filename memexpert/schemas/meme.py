@@ -79,6 +79,60 @@ class MemeSearchPageRead(BaseModel):
     has_more: bool
 
 
+class PublicMemeFileRead(BaseModel):
+    """Safe public file metadata without internal storage object keys."""
+
+    id: uuid.UUID
+    mime_type: str | None
+    width: int | None
+    height: int | None
+    file_size_bytes: int | None
+    blur_hash: str | None
+    quality_score: float
+
+
+class PublicMemeCardRead(BaseModel):
+    """Safe public meme card for catalog search and browse responses."""
+
+    id: uuid.UUID
+    media_type: ContentKind
+    language: ContentLanguage
+    is_nsfw: bool
+    popularity_score: float
+    like_count: int
+    tags: list[str] = Field(default_factory=list)
+    primary_file: PublicMemeFileRead | None
+    caption: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class PublicMemeDetailRead(PublicMemeCardRead):
+    """Safe public meme detail DTO without owner or storage internals."""
+
+    ocr_text: str | None
+    seo_page_slug: str | None
+    seo_title: str | None
+    seo_description: str | None
+    files: list[PublicMemeFileRead] = Field(default_factory=list)
+
+
+class PublicMemeSearchResultRead(BaseModel):
+    """One public search result without internal ranking/debug components."""
+
+    meme: PublicMemeCardRead
+
+
+class PublicMemeSearchPageRead(BaseModel):
+    """Offset pagination envelope for public meme catalog responses."""
+
+    items: list[PublicMemeSearchResultRead]
+    limit: int
+    offset: int
+    total: int
+    has_more: bool
+
+
 __all__ = [
     "MemeCardRead",
     "MemeDetailRead",
@@ -86,4 +140,9 @@ __all__ = [
     "MemeSearchPageRead",
     "MemeSearchResultRead",
     "MemeSearchScoreRead",
+    "PublicMemeCardRead",
+    "PublicMemeDetailRead",
+    "PublicMemeFileRead",
+    "PublicMemeSearchPageRead",
+    "PublicMemeSearchResultRead",
 ]
