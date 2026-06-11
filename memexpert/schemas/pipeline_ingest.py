@@ -37,6 +37,7 @@ class ContentPipelineUploadMetadata(BaseModel):
     source_platform: SourcePlatform
     source_id: str = Field(min_length=1, max_length=MAX_SOURCE_ID_LENGTH)
     post_id: str = Field(min_length=1, max_length=MAX_POST_ID_LENGTH)
+    owner_user_id: uuid.UUID | None = None
     views: StrictInt = Field(default=0, ge=0)
 
     @field_validator("source_id", "post_id")
