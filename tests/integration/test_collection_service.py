@@ -9,13 +9,16 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 
-from memexpert.models.collection import Collection, CollectionInvite
+from memexpert.models.collection import Collection, CollectionInvite, CollectionMeme, PinnedMeme
+from memexpert.models.content import Meme
 from memexpert.models.enums import (
     CollectionInviteChannel,
     CollectionInviteStatus,
     CollectionKind,
     CollectionMembershipRole,
     CollectionVisibility,
+    ContentKind,
+    ContentLanguage,
 )
 from memexpert.models.user import User
 from memexpert.services import (
@@ -25,12 +28,34 @@ from memexpert.services import (
     DuplicateCollectionInviteError,
     GuestCollectionAccessError,
     InvalidCollectionInviteError,
+    InvalidPinnedMemeOrderError,
+    MemeNotFoundError,
+    PinLimitExceededError,
     UserService,
 )
 from tests.conftest import create_full_user_via_upgrade
 
 if TYPE_CHECKING:
+    import uuid
+
     from sqlalchemy.ext.asyncio import AsyncSession
+
+
+async def _create_meme(
+    session: AsyncSession,
+    *,
+    is_public: bool = True,
+    author_user_id: uuid.UUID | None = None,
+) -> Meme:
+    meme = Meme(
+        media_type=ContentKind.IMAGE,
+        language=ContentLanguage.EN,
+        is_public=is_public,
+        author_user_id=author_user_id,
+    )
+    session.add(meme)
+    await session.flush()
+    return meme
 
 
 async def test_guest_cannot_create_custom_collection(
@@ -175,6 +200,116 @@ async def test_active_save_collection_rejects_non_member_and_viewer_targets(
             collection_id=shared_collection.id,
         )
 
+
+async def test_favorite_unfavorite_is_idempotent_and_updates_like_count(
+    migrated_db_session: AsyncSession,
+) -> None:
+    user_service = UserService(migrated_db_session)
+    collection_service = CollectionService(migrated_db_session)
+    guest = await user_service.create_guest_user()
+    meme = await _create_meme(migrated_db_session)
+    await migrated_db_session.commit()
+
+    first = await collection_service.favorite_meme(user_id=guest.id, meme_id=meme.id)
+    second = await collection_service.favorite_meme(user_id=guest.id, meme_id=meme.id)
+    favorites = await collection_service.list_favorite_memes(user_id=guest.id)
+
+    assert first.collection_id == second.collection_id
+    assert [favorite.meme_id for favorite in favorites] == [meme.id]
+    assert await migrated_db_session.scalar(select(func.count()).select_from(CollectionMeme)) == 1
+    assert await migrated_db_session.scalar(select(Meme.like_count).where(Meme.id == meme.id)) == 1
+
+    assert await collection_service.unfavorite_meme(user_id=guest.id, meme_id=meme.id) is True
+    assert await collection_service.unfavorite_meme(user_id=guest.id, meme_id=meme.id) is False
+    assert await migrated_db_session.scalar(select(Meme.like_count).where(Meme.id == meme.id)) == 0
+
+
+async def test_save_uses_guest_favorites_or_full_active_custom_collection(
+    migrated_db_session: AsyncSession,
+) -> None:
+    user_service = UserService(migrated_db_session)
+    collection_service = CollectionService(migrated_db_session)
+    guest = await user_service.create_guest_user()
+    full_user = await create_full_user_via_upgrade(user_service, email="save@example.com")
+    guest_meme = await _create_meme(migrated_db_session)
+    full_meme = await _create_meme(migrated_db_session)
+    custom = await collection_service.create_custom_collection(owner_user_id=full_user.id, title="Keepers")
+    _ = await collection_service.update_active_save_collection(user_id=full_user.id, collection_id=custom.id)
+
+    guest_save = await collection_service.save_meme_to_active_collection(user_id=guest.id, meme_id=guest_meme.id)
+    full_save = await collection_service.save_meme_to_active_collection(user_id=full_user.id, meme_id=full_meme.id)
+
+    guest_favorites = await collection_service.ensure_favorites_collection(guest.id)
+    assert guest_save.collection_id == guest_favorites.id
+    assert full_save.collection_id == custom.id
+    assert await migrated_db_session.scalar(select(Meme.like_count).where(Meme.id == guest_meme.id)) == 1
+    assert await collection_service.remove_meme_from_active_collection(user_id=guest.id, meme_id=guest_meme.id) is True
+    assert await migrated_db_session.scalar(select(Meme.like_count).where(Meme.id == guest_meme.id)) == 0
+
+    with pytest.raises(GuestCollectionAccessError, match="Guest accounts can only use Favorites"):
+        _ = await collection_service.update_active_save_collection(user_id=guest.id, collection_id=custom.id)
+
+
+async def test_pins_require_full_account_enforce_limit_and_reorder(
+    migrated_db_session: AsyncSession,
+) -> None:
+    user_service = UserService(migrated_db_session)
+    collection_service = CollectionService(migrated_db_session)
+    guest = await user_service.create_guest_user()
+    full_user = await create_full_user_via_upgrade(user_service, email="pins@example.com")
+    memes = [await _create_meme(migrated_db_session) for _ in range(21)]
+    await migrated_db_session.commit()
+
+    with pytest.raises(GuestCollectionAccessError, match="full account"):
+        _ = await collection_service.pin_meme(user_id=guest.id, meme_id=memes[0].id)
+
+    first = await collection_service.pin_meme(user_id=full_user.id, meme_id=memes[0].id)
+    duplicate = await collection_service.pin_meme(user_id=full_user.id, meme_id=memes[0].id)
+    assert first.position == duplicate.position == 1
+
+    for meme in memes[1:20]:
+        _ = await collection_service.pin_meme(user_id=full_user.id, meme_id=meme.id)
+
+    with pytest.raises(PinLimitExceededError, match="at most 20"):
+        _ = await collection_service.pin_meme(user_id=full_user.id, meme_id=memes[20].id)
+
+    reordered = await collection_service.reorder_pins(
+        user_id=full_user.id,
+        meme_ids=[memes[2].id, memes[1].id, *[meme.id for meme in memes[3:20]], memes[0].id],
+    )
+    assert [pin.meme_id for pin in reordered[:2]] == [memes[2].id, memes[1].id]
+    assert [pin.position for pin in reordered] == list(range(1, 21))
+
+    with pytest.raises(InvalidPinnedMemeOrderError, match="duplicate"):
+        _ = await collection_service.reorder_pins(user_id=full_user.id, meme_ids=[memes[0].id, memes[0].id])
+
+    assert await collection_service.unpin_meme(user_id=full_user.id, meme_id=memes[2].id) is True
+    persisted_positions = await migrated_db_session.scalars(
+        select(PinnedMeme.position).where(PinnedMeme.user_id == full_user.id).order_by(PinnedMeme.position.asc())
+    )
+    assert list(persisted_positions) == list(range(1, 20))
+
+
+async def test_library_writes_reject_private_memes_not_visible_to_user(
+    migrated_db_session: AsyncSession,
+) -> None:
+    user_service = UserService(migrated_db_session)
+    collection_service = CollectionService(migrated_db_session)
+    author = await create_full_user_via_upgrade(user_service, email="private-author@example.com")
+    stranger = await create_full_user_via_upgrade(user_service, email="private-stranger@example.com")
+    private_meme = await _create_meme(migrated_db_session, is_public=False, author_user_id=author.id)
+    await migrated_db_session.commit()
+
+    with pytest.raises(MemeNotFoundError):
+        _ = await collection_service.favorite_meme(user_id=stranger.id, meme_id=private_meme.id)
+    with pytest.raises(MemeNotFoundError):
+        _ = await collection_service.save_meme_to_active_collection(user_id=stranger.id, meme_id=private_meme.id)
+    with pytest.raises(MemeNotFoundError):
+        _ = await collection_service.pin_meme(user_id=stranger.id, meme_id=private_meme.id)
+
+    assert await migrated_db_session.scalar(select(func.count()).select_from(CollectionMeme)) == 0
+    assert await migrated_db_session.scalar(select(func.count()).select_from(PinnedMeme)) == 0
+    assert await migrated_db_session.scalar(select(Meme.like_count).where(Meme.id == private_meme.id)) == 0
 
 async def test_create_invite_rejects_unverified_email_only_accounts_without_persisting_invites(
     migrated_db_session: AsyncSession,

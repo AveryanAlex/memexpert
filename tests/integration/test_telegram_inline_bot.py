@@ -8,17 +8,18 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 from aiogram.client.session.base import BaseSession
-from aiogram.methods import AnswerInlineQuery, GetMe, TelegramMethod
+from aiogram.methods import AnswerCallbackQuery, AnswerInlineQuery, GetMe, TelegramMethod
 from aiogram.types import InlineQueryResultCachedGif, InlineQueryResultCachedMpeg4Gif, InlineQueryResultCachedPhoto
 from aiogram.types import User as TelegramUser
 from pydantic import AnyHttpUrl, SecretStr, TypeAdapter
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
 from memexpert.bot.main import build_bot, build_dispatcher
 from memexpert.core.config import Settings
+from memexpert.models.collection import CollectionMeme, PinnedMeme
 from memexpert.models.content import Meme, MemeFile, TelegramFileIdCache
-from memexpert.models.enums import AnalyticsEventType, ContentKind, ContentLanguage, TelegramMediaFormat
-from memexpert.models.user import AnalyticsEvent, InlineUsageEvent
+from memexpert.models.enums import AccountStatus, AnalyticsEventType, ContentKind, ContentLanguage, TelegramMediaFormat
+from memexpert.models.user import AnalyticsEvent, InlineUsageEvent, User
 from memexpert.schemas.meme import (
     MemeCardRead,
     MemeFileRead,
@@ -26,6 +27,8 @@ from memexpert.schemas.meme import (
     MemeSearchResultRead,
     MemeSearchScoreRead,
 )
+from memexpert.services import UserService
+from tests.conftest import create_full_user_via_upgrade
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -61,6 +64,9 @@ class RecordingTelegramSession(BaseSession):
         self.sent_methods.append(method)
 
         if isinstance(method, AnswerInlineQuery):
+            return True
+
+        if isinstance(method, AnswerCallbackQuery):
             return True
 
         if isinstance(method, GetMe):
@@ -259,6 +265,33 @@ async def dispatch_chosen_inline_result(
     )
 
 
+async def dispatch_library_callback(
+    *,
+    dispatcher: Dispatcher,
+    bot: Bot,
+    data: str,
+    update_id: int = 30,
+) -> None:
+    await dispatcher.feed_raw_update(
+        bot,
+        {
+            "update_id": update_id,
+            "callback_query": {
+                "id": f"callback-{update_id}",
+                "from": {
+                    "id": TELEGRAM_ID,
+                    "is_bot": False,
+                    "first_name": "Inline",
+                    "username": "inline_user",
+                },
+                "chat_instance": "inline-chat-instance",
+                "inline_message_id": f"inline-message-{update_id}",
+                "data": data,
+            },
+        },
+    )
+
+
 def last_inline_answer(session: RecordingTelegramSession) -> AnswerInlineQuery:
     assert session.sent_methods, "Expected an inline answer."
     method = session.sent_methods[-1]
@@ -302,6 +335,8 @@ async def test_inline_plain_text_query_calls_shared_search_service_and_records_q
     result = answer.results[0]
     assert isinstance(result, InlineQueryResultCachedPhoto)
     assert result.photo_file_id == "cached-photo-id"
+    assert result.reply_markup is not None
+    assert [button.text for button in result.reply_markup.inline_keyboard[0]] == ["Favorite", "Save", "Pin"]
 
     async with postgres_session_factory() as session:
         inline_events = await session.scalar(
@@ -529,3 +564,168 @@ async def test_chosen_inline_result_records_meme_send_analytics(
     assert event.payload["meme_id"] == str(meme.id)
     assert event.payload["meme_file_id"] == str(file.id)
     assert event.payload["result_id"] == result_id
+
+
+@pytest.mark.asyncio
+async def test_chosen_inline_result_records_linked_telegram_user(
+    migrated_db_session: AsyncSession,
+    postgres_async_url: str,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    user_service = UserService(migrated_db_session)
+    linked_user = await create_full_user_via_upgrade(user_service, telegram_id=TELEGRAM_ID)
+    _meme, file = await create_meme_file(migrated_db_session, media_type=ContentKind.IMAGE, mime_type="image/jpeg")
+    await migrated_db_session.commit()
+
+    telegram_session = RecordingTelegramSession()
+    bot = build_bot(build_bot_settings(postgres_async_url), session=telegram_session)
+    dispatcher = build_dispatcher(
+        settings=build_bot_settings(postgres_async_url),
+        session_factory=postgres_session_factory,
+        meme_search_service_factory=lambda session: FakeMemeSearchService(
+            MemeSearchPageRead(items=[], limit=20, offset=0, total=0, has_more=False)
+        ),
+    )
+
+    try:
+        await dispatch_chosen_inline_result(dispatcher=dispatcher, bot=bot, result_id=f"p:{file.id.hex}")
+    finally:
+        await bot.session.close()
+
+    async with postgres_session_factory() as session:
+        event = await session.scalar(
+            select(AnalyticsEvent).where(AnalyticsEvent.event_type == AnalyticsEventType.MEME_SEND)
+        )
+    assert event is not None
+    assert event.user_id == linked_user.id
+
+
+@pytest.mark.asyncio
+async def test_inline_library_callbacks_call_collection_service_paths(
+    migrated_db_session: AsyncSession,
+    postgres_async_url: str,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    user_service = UserService(migrated_db_session)
+    linked_user = await create_full_user_via_upgrade(user_service, telegram_id=TELEGRAM_ID)
+    favorite_meme, favorite_file = await create_meme_file(
+        migrated_db_session,
+        media_type=ContentKind.IMAGE,
+        mime_type="image/jpeg",
+    )
+    save_meme, save_file = await create_meme_file(
+        migrated_db_session,
+        media_type=ContentKind.IMAGE,
+        mime_type="image/jpeg",
+    )
+    await migrated_db_session.commit()
+
+    telegram_session = RecordingTelegramSession()
+    bot = build_bot(build_bot_settings(postgres_async_url), session=telegram_session)
+    dispatcher = build_dispatcher(
+        settings=build_bot_settings(postgres_async_url),
+        session_factory=postgres_session_factory,
+        meme_search_service_factory=lambda session: FakeMemeSearchService(
+            MemeSearchPageRead(items=[], limit=20, offset=0, total=0, has_more=False)
+        ),
+    )
+
+    try:
+        await dispatch_library_callback(
+            dispatcher=dispatcher,
+            bot=bot,
+            data=f"lib:fav:p:{favorite_file.id.hex}",
+        )
+        await dispatch_library_callback(
+            dispatcher=dispatcher,
+            bot=bot,
+            data=f"lib:save:p:{save_file.id.hex}",
+            update_id=31,
+        )
+        await dispatch_library_callback(
+            dispatcher=dispatcher,
+            bot=bot,
+            data=f"lib:pin:p:{favorite_file.id.hex}",
+            update_id=32,
+        )
+    finally:
+        await bot.session.close()
+
+    async with postgres_session_factory() as session:
+        saved_meme_ids = await session.scalars(select(CollectionMeme.meme_id).order_by(CollectionMeme.meme_id.asc()))
+        pinned_meme_ids = await session.scalars(select(PinnedMeme.meme_id).where(PinnedMeme.user_id == linked_user.id))
+        like_count = await session.scalar(select(Meme.like_count).where(Meme.id == favorite_meme.id))
+
+    assert set(saved_meme_ids) == {favorite_meme.id, save_meme.id}
+    assert list(pinned_meme_ids) == [favorite_meme.id]
+    assert like_count == 1
+
+
+@pytest.mark.asyncio
+async def test_inline_library_callback_requires_linked_telegram_user(
+    migrated_db_session: AsyncSession,
+    postgres_async_url: str,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    _meme, file = await create_meme_file(migrated_db_session, media_type=ContentKind.IMAGE, mime_type="image/jpeg")
+    await migrated_db_session.commit()
+
+    telegram_session = RecordingTelegramSession()
+    bot = build_bot(build_bot_settings(postgres_async_url), session=telegram_session)
+    dispatcher = build_dispatcher(
+        settings=build_bot_settings(postgres_async_url),
+        session_factory=postgres_session_factory,
+        meme_search_service_factory=lambda session: FakeMemeSearchService(
+            MemeSearchPageRead(items=[], limit=20, offset=0, total=0, has_more=False)
+        ),
+    )
+
+    try:
+        await dispatch_library_callback(dispatcher=dispatcher, bot=bot, data=f"lib:fav:p:{file.id.hex}")
+    finally:
+        await bot.session.close()
+
+    callback_answers = [method for method in telegram_session.sent_methods if isinstance(method, AnswerCallbackQuery)]
+    assert callback_answers[-1].show_alert is True
+    assert "Link your Telegram account" in str(callback_answers[-1].text)
+
+    async with postgres_session_factory() as session:
+        assert await session.scalar(select(func.count()).select_from(CollectionMeme)) == 0
+
+
+@pytest.mark.asyncio
+async def test_inline_library_callback_rejects_inactive_linked_user_without_writes(
+    migrated_db_session: AsyncSession,
+    postgres_async_url: str,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    user_service = UserService(migrated_db_session)
+    linked_user = await create_full_user_via_upgrade(user_service, telegram_id=TELEGRAM_ID)
+    _ = await migrated_db_session.execute(
+        update(User).where(User.id == linked_user.id).values(status=AccountStatus.DELETION_PENDING)
+    )
+    _meme, file = await create_meme_file(migrated_db_session, media_type=ContentKind.IMAGE, mime_type="image/jpeg")
+    await migrated_db_session.commit()
+
+    telegram_session = RecordingTelegramSession()
+    bot = build_bot(build_bot_settings(postgres_async_url), session=telegram_session)
+    dispatcher = build_dispatcher(
+        settings=build_bot_settings(postgres_async_url),
+        session_factory=postgres_session_factory,
+        meme_search_service_factory=lambda session: FakeMemeSearchService(
+            MemeSearchPageRead(items=[], limit=20, offset=0, total=0, has_more=False)
+        ),
+    )
+
+    try:
+        await dispatch_library_callback(dispatcher=dispatcher, bot=bot, data=f"lib:fav:p:{file.id.hex}")
+    finally:
+        await bot.session.close()
+
+    callback_answers = [method for method in telegram_session.sent_methods if isinstance(method, AnswerCallbackQuery)]
+    assert callback_answers[-1].show_alert is True
+    assert "not active" in str(callback_answers[-1].text)
+
+    async with postgres_session_factory() as session:
+        assert await session.scalar(select(func.count()).select_from(CollectionMeme)) == 0
+        assert await session.scalar(select(Meme.like_count).where(Meme.id == file.meme_id)) == 0

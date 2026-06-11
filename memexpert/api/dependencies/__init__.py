@@ -28,6 +28,7 @@ from memexpert.api.dependencies.auth import (
     get_provider_auth_service,
     to_auth_http_error,
 )
+from memexpert.api.dependencies.collection import CollectionServiceDep, get_collection_service
 from memexpert.api.dependencies.meme import MemeSearchServiceDep, get_meme_search_service
 from memexpert.api.dependencies.pipeline import (
     PIPELINE_ERROR_RESPONSES,
@@ -49,6 +50,7 @@ __all__ = [
     "AuthHTTPError",
     "AuthServiceDep",
     "AutoGuestUserDep",
+    "CollectionServiceDep",
     "CurrentUserDep",
     "DbSessionDep",
     "ForbidFullAccountCallerDep",
@@ -68,6 +70,7 @@ __all__ = [
     "forbid_full_account_caller",
     "get_account_link_service",
     "get_auth_service",
+    "get_collection_service",
     "get_content_pipeline_service",
     "get_current_user",
     "get_full_account_user",

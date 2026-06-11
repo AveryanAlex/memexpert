@@ -177,6 +177,14 @@ class DuplicateCollectionInviteError(CollectionServiceError):
     """Raised when an invite token collides with an existing invite record."""
 
 
+class PinLimitExceededError(CollectionServiceError):
+    """Raised when a user attempts to pin more memes than the quick-access surface allows."""
+
+
+class InvalidPinnedMemeOrderError(ServiceValidationError, CollectionServiceError):
+    """Raised when a pin reorder payload is duplicated, incomplete, or out of range."""
+
+
 class PipelineServiceError(ServiceError):
     """Base error for operator-managed content-pipeline failures."""
 

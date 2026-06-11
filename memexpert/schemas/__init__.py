@@ -10,7 +10,13 @@ from memexpert.schemas.auth import (
     GoogleAuthRequest,
     GuestBootstrapRequest,
 )
-from memexpert.schemas.collection import CollectionInviteRead, CollectionMemberRead, CollectionRead
+from memexpert.schemas.collection import (
+    CollectionInviteRead,
+    CollectionMemberRead,
+    CollectionMemeRead,
+    CollectionRead,
+    PinnedMemeRead,
+)
 from memexpert.schemas.content_pipeline import (
     ContentPipelineDispatchEvent,
     ContentPipelineErrorCode,
@@ -43,6 +49,7 @@ __all__ = [
     "AuthSessionRead",
     "ChannelSuggestionRead",
     "CollectionInviteRead",
+    "CollectionMemeRead",
     "CollectionMemberRead",
     "CollectionRead",
     "ContentPipelineDispatchEvent",
@@ -63,5 +70,6 @@ __all__ = [
     "GuestBootstrapRequest",
     "InlineUsageEventRead",
     "LoginEventRead",
+    "PinnedMemeRead",
     "UserRead",
 ]

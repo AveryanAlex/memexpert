@@ -62,8 +62,28 @@ class CollectionRead(ORMSchema):
     updated_at: datetime
 
 
+class CollectionMemeRead(ORMSchema):
+    """DTO for a meme saved into a collection."""
+
+    collection_id: uuid.UUID
+    meme_id: uuid.UUID
+    added_by_user_id: uuid.UUID | None
+    added_at: datetime
+
+
+class PinnedMemeRead(ORMSchema):
+    """DTO for a user's pinned meme position."""
+
+    user_id: uuid.UUID
+    meme_id: uuid.UUID
+    position: int
+    pinned_at: datetime
+
+
 __all__ = [
     "CollectionInviteRead",
+    "CollectionMemeRead",
     "CollectionMemberRead",
     "CollectionRead",
+    "PinnedMemeRead",
 ]
