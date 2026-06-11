@@ -30,6 +30,15 @@ class QdrantSimilarityMatch:
 
 
 @dataclass(frozen=True, slots=True)
+class QdrantUserSearchMatch:
+    """One semantic meme-search candidate returned by a user-facing Qdrant adapter."""
+
+    meme_file_id: uuid.UUID
+    meme_id: uuid.UUID
+    semantic_score: float
+
+
+@dataclass(frozen=True, slots=True)
 class QdrantSyncPayload:
     """Durable payload advertised to Qdrant as part of the per-file sync upsert.
 
@@ -109,6 +118,23 @@ class QdrantSimilarityClientProtocol(Protocol):
     ) -> tuple[QdrantSimilarityMatch, ...]: ...
 
 
+class QdrantUserSearchClientProtocol(Protocol):
+    """Narrow semantic search boundary for user-facing meme search.
+
+    Qdrant does not embed free text itself. Callers either pass a precomputed
+    query vector from an embedding provider or use a fake implementation in
+    tests. This protocol deliberately performs no provider construction or
+    network I/O at import time.
+    """
+
+    async def search_memes_by_vector(
+        self,
+        *,
+        query_vector: tuple[float, ...],
+        limit: int = 20,
+    ) -> tuple[QdrantUserSearchMatch, ...]: ...
+
+
 class QdrantSyncClientProtocol(Protocol):
     """Typed Qdrant sync adapter surface used by the runtime and tests.
 
@@ -169,6 +195,55 @@ class PipelineQdrantClient:
             raise QdrantProviderUnavailableError(f"Qdrant similarity lookup failed: {exc}") from exc
 
         return _parse_qdrant_matches(raw_matches, current_meme_file_id=current_meme_file_id)
+
+    async def _ensure_client(self) -> Any:
+        if self._client is None:
+            from qdrant_client import AsyncQdrantClient
+
+            self._client = AsyncQdrantClient(
+                url=self._settings.qdrant_url,
+                timeout=max(1, int(self._settings.pipeline_qdrant_timeout_seconds)),
+            )
+        return self._client
+
+
+class PipelineQdrantUserSearchClient:
+    """Lazy Qdrant adapter for user-facing semantic meme search.
+
+    The adapter accepts an already-computed text query vector because Qdrant is
+    not responsible for embedding user text. Importing or constructing this
+    class does not contact Qdrant; the SDK client is created only when semantic
+    search is actually requested.
+    """
+
+    def __init__(self, *, settings: Settings | None = None) -> None:
+        self._settings = settings or get_settings()
+        self._client: Any | None = None
+
+    async def search_memes_by_vector(
+        self,
+        *,
+        query_vector: tuple[float, ...],
+        limit: int = 20,
+    ) -> tuple[QdrantUserSearchMatch, ...]:
+        client = await self._ensure_client()
+        resolved_limit = max(1, limit)
+
+        try:
+            raw_matches = await client.search(
+                collection_name=self._settings.pipeline_qdrant_collection_name,
+                query_vector=list(query_vector),
+                limit=resolved_limit,
+                with_payload=True,
+            )
+        except (TimeoutError, httpx.TimeoutException) as exc:  # pragma: no cover - exercised via monkeypatch
+            raise QdrantTimeoutError(f"Qdrant user search timed out: {exc}") from exc
+        except Exception as exc:  # pragma: no cover - exercised via monkeypatch in tests
+            if _is_timeout_exception(exc):
+                raise QdrantTimeoutError(f"Qdrant user search timed out: {exc}") from exc
+            raise QdrantProviderUnavailableError(f"Qdrant user search failed: {exc}") from exc
+
+        return _parse_qdrant_user_search_matches(raw_matches)
 
     async def _ensure_client(self) -> Any:
         if self._client is None:
@@ -457,6 +532,49 @@ def _parse_qdrant_matches(
     return tuple(resolved_matches)
 
 
+def _parse_qdrant_user_search_matches(raw_matches: object) -> tuple[QdrantUserSearchMatch, ...]:
+    """Decode Qdrant search results for user-facing semantic search."""
+
+    if raw_matches is None or not isinstance(raw_matches, (list, tuple)):
+        raise QdrantMalformedResponseError(
+            "Qdrant user search response is not an iterable sequence of matches.",
+        )
+
+    resolved_matches: list[QdrantUserSearchMatch] = []
+    typed_matches: Iterable[object] = cast("Sequence[object]", raw_matches)
+    for raw_entry in typed_matches:
+        payload = _extract_payload(raw_entry)
+        if payload is None:
+            continue
+
+        raw_meme_file_id = payload.get("meme_file_id")
+        raw_meme_id = payload.get("meme_id")
+        if not isinstance(raw_meme_file_id, str) or not isinstance(raw_meme_id, str):
+            continue
+
+        try:
+            meme_file_id = uuid.UUID(raw_meme_file_id)
+            meme_id = uuid.UUID(raw_meme_id)
+        except ValueError:
+            continue
+
+        raw_score = getattr(raw_entry, "score", None)
+        if isinstance(raw_score, bool) or not isinstance(raw_score, (int, float)):
+            continue
+        semantic_score = float(raw_score)
+        if semantic_score < 0.0:
+            continue
+
+        resolved_matches.append(
+            QdrantUserSearchMatch(
+                meme_file_id=meme_file_id,
+                meme_id=meme_id,
+                semantic_score=semantic_score,
+            ),
+        )
+    return tuple(resolved_matches)
+
+
 def _extract_payload(raw_entry: object) -> dict[str, object] | None:
     payload = getattr(raw_entry, "payload", None)
     if not isinstance(payload, dict):
@@ -467,6 +585,7 @@ def _extract_payload(raw_entry: object) -> dict[str, object] | None:
 __all__ = [
     "PipelineQdrantClient",
     "PipelineQdrantSyncClient",
+    "PipelineQdrantUserSearchClient",
     "QdrantMalformedResponseError",
     "QdrantProviderUnavailableError",
     "QdrantSimilarityClientProtocol",
@@ -480,4 +599,6 @@ __all__ = [
     "QdrantSyncProviderUnavailableError",
     "QdrantSyncTimeoutError",
     "QdrantTimeoutError",
+    "QdrantUserSearchClientProtocol",
+    "QdrantUserSearchMatch",
 ]
