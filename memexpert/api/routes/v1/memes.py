@@ -17,6 +17,7 @@ from memexpert.api.dependencies import (
     FullAccountUserDep,
     MemeSearchServiceDep,
     OptionalCurrentUserDep,
+    PublicTrendsServiceDep,
 )
 from memexpert.models.enums import AnalyticsEventType, ContentKind, ContentLanguage
 from memexpert.schemas.collection import CollectionMemeRead, CollectionRead, PinnedMemeRead
@@ -24,7 +25,11 @@ from memexpert.schemas.meme import (
     MemeSlugRedirectRead,
     PublicMemeDetailRead,
     PublicMemeLandingRead,
+    PublicMemePopularitySummaryRead,
     PublicMemeSearchPageRead,
+    PublicMemeSearchResultRead,
+    PublicMemeTrendPageRead,
+    PublicTrendSummaryRead,
 )
 from memexpert.schemas.user import UserRead
 from memexpert.services import (
@@ -37,6 +42,7 @@ from memexpert.services import (
     UserNotFoundError,
 )
 from memexpert.services.meme_search import MemeNotFoundError, MemeSearchFilters
+from memexpert.services.public_trends import PublicTrendRanking
 
 router = APIRouter(prefix="/memes", tags=["memes"])
 
@@ -131,7 +137,7 @@ async def browse_memes(
 
 @router.get("/trending", response_model=PublicMemeSearchPageRead, summary="Browse trending memes")
 async def trending_memes(
-    meme_search_service: MemeSearchServiceDep,
+    public_trends_service: PublicTrendsServiceDep,
     current_user: OptionalCurrentUserDep,
     language: Annotated[ContentLanguage | None, Query()] = None,
     media_type: Annotated[ContentKind | None, Query()] = None,
@@ -139,23 +145,82 @@ async def trending_memes(
     tags: Annotated[list[str] | None, Query()] = None,
     limit: Annotated[int, Query(ge=1, le=100)] = 20,
     offset: Annotated[int, Query(ge=0)] = 0,
-    lookback_hours: Annotated[int, Query(ge=1, le=24 * 30)] = 168,
-) -> PublicMemeSearchPageRead:
-    """Return memes ranked by recent product events plus source popularity signals."""
-
-    page = await meme_search_service.trending_public_memes(
-        viewer_user_id=current_user.id if current_user else None,
-        filters=_build_filters(
-            language=language,
-            media_type=media_type,
-            include_nsfw=_nsfw_allowed(current_user, include_nsfw),
-            tags=tags,
+    lookback_hours: Annotated[
+        int,
+        Query(
+            ge=1,
+            le=24 * 30,
+            description=(
+                "Deprecated compatibility parameter. Current MV-backed public trending uses the materialized "
+                "view windows and ignores this value."
+            ),
         ),
+    ] = 168,
+) -> PublicMemeSearchPageRead:
+    """Return memes ranked by materialized public trend projections.
+
+    ``lookback_hours`` is accepted only to avoid breaking existing clients; the
+    materialized view owns the ranking windows until versioned APIs are added.
+    """
+
+    _ = lookback_hours  # Compatibility-only parameter; MV windows are fixed at refresh time.
+    page = await public_trends_service.rank_memes(
+        ranking="trending",
+        language=language,
+        media_type=media_type,
+        include_nsfw=_nsfw_allowed(current_user, include_nsfw),
+        tags=tuple(tag.strip() for tag in tags or () if tag.strip()),
         limit=limit,
         offset=offset,
-        lookback_hours=lookback_hours,
     )
-    return page
+    return _trend_page_to_search_page(page)
+
+
+@router.get("/trends", response_model=PublicMemeTrendPageRead, summary="Browse public trend rankings")
+async def trend_rankings(
+    public_trends_service: PublicTrendsServiceDep,
+    current_user: OptionalCurrentUserDep,
+    ranking: Annotated[PublicTrendRanking, Query()] = "trending",
+    language: Annotated[ContentLanguage | None, Query()] = None,
+    media_type: Annotated[ContentKind | None, Query()] = None,
+    include_nsfw: Annotated[bool, Query()] = False,
+    tags: Annotated[list[str] | None, Query()] = None,
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> PublicMemeTrendPageRead:
+    """Return aggregate-only public meme trend rankings from materialized views."""
+
+    return await public_trends_service.rank_memes(
+        ranking=ranking,
+        language=language,
+        media_type=media_type,
+        include_nsfw=_nsfw_allowed(current_user, include_nsfw),
+        tags=tuple(tag.strip() for tag in tags or () if tag.strip()),
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get("/trends/tags", response_model=list[PublicTrendSummaryRead], summary="Browse public tag trends")
+async def tag_trend_summaries(
+    public_trends_service: PublicTrendsServiceDep,
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> list[PublicTrendSummaryRead]:
+    """Return aggregate-only public tag trend summaries from materialized views."""
+
+    return await public_trends_service.tag_summaries(limit=limit, offset=offset)
+
+
+@router.get("/trends/templates", response_model=list[PublicTrendSummaryRead], summary="Browse public template trends")
+async def template_trend_summaries(
+    public_trends_service: PublicTrendsServiceDep,
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> list[PublicTrendSummaryRead]:
+    """Return aggregate-only public template trend summaries from materialized views."""
+
+    return await public_trends_service.template_summaries(limit=limit, offset=offset)
 
 
 @router.get("/favorites", response_model=list[CollectionMemeRead], summary="List favorite memes")
@@ -341,6 +406,7 @@ async def get_meme_detail_by_slug(
 @router.get("/tags/{tag_slug}", response_model=PublicMemeLandingRead, summary="Browse memes by tag")
 async def browse_tag_landing(
     meme_search_service: MemeSearchServiceDep,
+    public_trends_service: PublicTrendsServiceDep,
     current_user: OptionalCurrentUserDep,
     tag_slug: Annotated[str, Path(min_length=1, max_length=64)],
     include_nsfw: Annotated[bool, Query()] = False,
@@ -363,12 +429,14 @@ async def browse_tag_landing(
         title=f"{normalized_tag.replace('-', ' ').title()} memes",
         description=f"Browse public memes tagged {normalized_tag}.",
         page=page,
+        trend_summary=await public_trends_service.tag_summary(normalized_tag),
     )
 
 
 @router.get("/templates/{template_slug}", response_model=PublicMemeLandingRead, summary="Browse memes by template")
 async def browse_template_landing(
     meme_search_service: MemeSearchServiceDep,
+    public_trends_service: PublicTrendsServiceDep,
     current_user: OptionalCurrentUserDep,
     template_slug: Annotated[str, Path(min_length=1, max_length=255)],
     include_nsfw: Annotated[bool, Query()] = False,
@@ -395,6 +463,7 @@ async def browse_template_landing(
         title=f"{template.name} memes",
         description=template.description,
         page=page,
+        trend_summary=await public_trends_service.template_summary(template.slug),
     )
 
 
@@ -418,6 +487,28 @@ async def get_meme_canonical_slug(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Meme was not found.",
         ) from exc
+
+
+@router.get(
+    "/{meme_id}/popularity",
+    response_model=PublicMemePopularitySummaryRead,
+    summary="Read public meme popularity summary",
+)
+async def get_meme_popularity_summary(
+    public_trends_service: PublicTrendsServiceDep,
+    current_user: OptionalCurrentUserDep,
+    meme_id: Annotated[uuid.UUID, Path()],
+    include_nsfw: Annotated[bool, Query()] = False,
+) -> PublicMemePopularitySummaryRead:
+    """Return aggregate public trend metrics plus real snapshot sparkline points."""
+
+    summary = await public_trends_service.meme_popularity_summary(
+        meme_id,
+        include_nsfw=_nsfw_allowed(current_user, include_nsfw),
+    )
+    if summary is None:
+        raise _meme_not_found_http_error()
+    return summary
 
 
 @router.get("/{meme_id}", response_model=PublicMemeDetailRead, summary="Read meme details")
@@ -470,6 +561,16 @@ def _build_filters(
 
 def _nsfw_allowed(current_user: UserRead | None, include_nsfw: bool) -> bool:
     return include_nsfw and bool(current_user and current_user.nsfw_enabled)
+
+
+def _trend_page_to_search_page(page: PublicMemeTrendPageRead) -> PublicMemeSearchPageRead:
+    return PublicMemeSearchPageRead(
+        items=[PublicMemeSearchResultRead(meme=item.meme) for item in page.items],
+        limit=page.limit,
+        offset=page.offset,
+        total=page.total,
+        has_more=page.has_more,
+    )
 
 
 def _meme_not_found_http_error() -> HTTPException:

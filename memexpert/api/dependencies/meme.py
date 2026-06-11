@@ -14,6 +14,7 @@ from memexpert.core.qdrant import PipelineQdrantUserSearchClient
 from memexpert.core.voyage import PipelineVoyageClient
 from memexpert.services.analytics import AnalyticsService
 from memexpert.services.meme_search import MemeSearchService
+from memexpert.services.public_trends import PublicTrendsService
 from memexpert.services.query_embedding import CachedTextQueryEmbeddingService
 
 
@@ -43,8 +44,22 @@ def get_analytics_service(session: Annotated[AsyncSession, Depends(get_db_sessio
     return AnalyticsService(session)
 
 
+def get_public_trends_service(session: Annotated[AsyncSession, Depends(get_db_session)]) -> PublicTrendsService:
+    """Build the MV-backed public trends service for request handlers."""
+
+    return PublicTrendsService(session)
+
+
 AnalyticsServiceDep = Annotated[AnalyticsService, Depends(get_analytics_service)]
 MemeSearchServiceDep = Annotated[MemeSearchService, Depends(get_meme_search_service)]
+PublicTrendsServiceDep = Annotated[PublicTrendsService, Depends(get_public_trends_service)]
 
 
-__all__ = ["AnalyticsServiceDep", "MemeSearchServiceDep", "get_analytics_service", "get_meme_search_service"]
+__all__ = [
+    "AnalyticsServiceDep",
+    "MemeSearchServiceDep",
+    "PublicTrendsServiceDep",
+    "get_analytics_service",
+    "get_meme_search_service",
+    "get_public_trends_service",
+]

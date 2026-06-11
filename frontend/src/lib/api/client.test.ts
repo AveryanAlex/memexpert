@@ -8,7 +8,11 @@ import {
   fetchCurrentSession,
   fetchMemeDetail,
   fetchMemePage,
+  fetchMemePopularitySummary,
   fetchTagLanding,
+  fetchTagTrendSummaries,
+  fetchTemplateTrendSummaries,
+  fetchTrendPage,
   pinMeme,
   refreshCurrentSession,
   removeSavedMeme,
@@ -19,9 +23,17 @@ import {
   unpinMeme,
   type ApiFetch
 } from './client';
-import type { CurrentSessionRead, PublicMemeSearchPageRead } from './types';
+import type { CurrentSessionRead, PublicMemeSearchPageRead, PublicMemeTrendPageRead } from './types';
 
 const page: PublicMemeSearchPageRead = {
+  items: [],
+  limit: 12,
+  offset: 0,
+  total: 0,
+  has_more: false
+};
+
+const trendPage: PublicMemeTrendPageRead = {
   items: [],
   limit: 12,
   offset: 0,
@@ -141,6 +153,55 @@ describe('catalog API client', () => {
       slug: 'reaction',
       limit: 12,
       offset: 24
+    });
+
+    expect(mockFetch).toHaveBeenCalledOnce();
+  });
+
+  it('requests trend ranking pages and aggregate summaries', async () => {
+    const calls: string[] = [];
+    const mockFetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      calls.push(`${url.pathname}?${url.searchParams.toString()}`);
+      if (url.pathname === '/api/v1/memes/trends') {
+        expect(url.searchParams.get('ranking')).toBe('fastest_rising');
+        return jsonResponse(trendPage);
+      }
+      return jsonResponse([]);
+    }) satisfies ApiFetch;
+
+    await fetchTrendPage({
+      fetch: mockFetch,
+      baseUrl: 'https://api.memexpert.test',
+      ranking: 'fastest_rising',
+      limit: 12,
+      offset: 24
+    });
+    await fetchTagTrendSummaries({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', limit: 8, offset: 0 });
+    await fetchTemplateTrendSummaries({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', limit: 8, offset: 0 });
+
+    expect(calls).toEqual([
+      '/api/v1/memes/trends?ranking=fastest_rising&limit=12&offset=24',
+      '/api/v1/memes/trends/tags?limit=8&offset=0',
+      '/api/v1/memes/trends/templates?limit=8&offset=0'
+    ]);
+  });
+
+  it('requests per-meme popularity summary through aggregate endpoint', async () => {
+    const memeId = '11111111-1111-4111-8111-111111111111';
+    const mockFetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+
+      expect(url.pathname).toBe(`/api/v1/memes/${memeId}/popularity`);
+      expect(url.searchParams.get('include_nsfw')).toBe('false');
+
+      return jsonResponse({ meme_id: memeId, trend: null, sparkline: [] });
+    }) satisfies ApiFetch;
+
+    await fetchMemePopularitySummary({
+      fetch: mockFetch,
+      baseUrl: 'https://api.memexpert.test',
+      memeId
     });
 
     expect(mockFetch).toHaveBeenCalledOnce();

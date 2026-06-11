@@ -167,6 +167,85 @@ class PublicMemeSearchPageRead(BaseModel):
     has_more: bool
 
 
+class PublicTrendCountsRead(BaseModel):
+    """Aggregate public trend event counts for one ranking window."""
+
+    views: int = 0
+    sends: int = 0
+    likes: int = 0
+    saves: int = 0
+    downloads: int = 0
+
+
+class PublicTrendMetricsRead(BaseModel):
+    """Materialized public trend metrics without raw user or query payloads."""
+
+    recent: PublicTrendCountsRead = Field(default_factory=PublicTrendCountsRead)
+    previous: PublicTrendCountsRead = Field(default_factory=PublicTrendCountsRead)
+    latest_snapshot_at: datetime | None = None
+    latest_source_views: int = 0
+    latest_source_reactions: int = 0
+    latest_source_reposts: int = 0
+    latest_platform_views: int = 0
+    latest_platform_sends: int = 0
+    latest_platform_saves: int = 0
+    latest_platform_likes: int = 0
+    latest_popularity_score: float = 0.0
+    engagement_24h: float = 0.0
+    trending_score: float = 0.0
+    refreshed_at: datetime | None = None
+
+
+class PublicMemeTrendRead(BaseModel):
+    """One public meme ranking row plus aggregate trend metrics."""
+
+    meme: PublicMemeCardRead
+    trend: PublicTrendMetricsRead
+
+
+class PublicMemeTrendPageRead(BaseModel):
+    """Offset pagination envelope for public trend rankings."""
+
+    items: list[PublicMemeTrendRead]
+    limit: int
+    offset: int
+    total: int
+    has_more: bool
+
+
+class PublicMemePopularityPointRead(BaseModel):
+    """One real captured popularity snapshot for a public meme sparkline."""
+
+    captured_at: datetime
+    source_views: int
+    source_reactions: int
+    source_reposts: int
+    platform_views: int
+    platform_sends: int
+    platform_saves: int
+    platform_likes: int
+    popularity_score: float
+
+
+class PublicMemePopularitySummaryRead(BaseModel):
+    """Public per-meme popularity summary backed by MV metrics and real snapshots."""
+
+    meme_id: uuid.UUID
+    trend: PublicTrendMetricsRead | None = None
+    sparkline: list[PublicMemePopularityPointRead] = Field(default_factory=list)
+
+
+class PublicTrendSummaryRead(BaseModel):
+    """Aggregate trend summary for a public tag or template."""
+
+    kind: str
+    slug: str
+    title: str
+    description: str | None = None
+    meme_count: int
+    trend: PublicTrendMetricsRead
+
+
 class PublicMemeLandingRead(BaseModel):
     """Minimal tag/template landing response for organic pages."""
 
@@ -175,6 +254,7 @@ class PublicMemeLandingRead(BaseModel):
     title: str
     description: str | None
     page: PublicMemeSearchPageRead
+    trend_summary: PublicTrendSummaryRead | None = None
 
 
 __all__ = [
@@ -190,6 +270,13 @@ __all__ = [
     "PublicMemeFileRead",
     "PublicMemeFileRenderRead",
     "PublicMemeLandingRead",
+    "PublicMemePopularityPointRead",
+    "PublicMemePopularitySummaryRead",
     "PublicMemeSearchPageRead",
     "PublicMemeSearchResultRead",
+    "PublicMemeTrendPageRead",
+    "PublicMemeTrendRead",
+    "PublicTrendCountsRead",
+    "PublicTrendMetricsRead",
+    "PublicTrendSummaryRead",
 ]
