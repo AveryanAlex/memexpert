@@ -9,6 +9,12 @@ from aiogram import Bot, Dispatcher
 
 from memexpert.bot.inline import InlineMediaUrlProvider, MemeSearchServiceFactory, build_inline_router
 from memexpert.bot.linking import AccountLinkServiceFactory, build_linking_router
+from memexpert.bot.private_upload import (
+    CollectionServiceFactory,
+    PrivateUploadPipelineServiceFactory,
+    TelegramFileDownloader,
+    build_private_upload_router,
+)
 from memexpert.core.config import Settings, get_settings
 from memexpert.services import ProviderNotConfiguredError
 
@@ -33,8 +39,11 @@ def build_dispatcher(
     account_link_service_factory: AccountLinkServiceFactory | None = None,
     meme_search_service_factory: MemeSearchServiceFactory | None = None,
     inline_media_url_provider: InlineMediaUrlProvider | None = None,
+    private_upload_pipeline_service_factory: PrivateUploadPipelineServiceFactory | None = None,
+    private_upload_collection_service_factory: CollectionServiceFactory | None = None,
+    telegram_file_downloader: TelegramFileDownloader | None = None,
 ) -> Dispatcher:
-    """Build the dispatcher for account linking and inline meme search."""
+    """Build the dispatcher for account linking, inline search, and PM uploads."""
 
     resolved_settings = settings or get_settings()
     dispatcher = Dispatcher()
@@ -51,6 +60,15 @@ def build_dispatcher(
             session_factory=session_factory,
             meme_search_service_factory=meme_search_service_factory,
             inline_media_url_provider=inline_media_url_provider,
+        )
+    )
+    _ = dispatcher.include_router(
+        build_private_upload_router(
+            settings=resolved_settings,
+            session_factory=session_factory,
+            pipeline_service_factory=private_upload_pipeline_service_factory,
+            collection_service_factory=private_upload_collection_service_factory,
+            telegram_file_downloader=telegram_file_downloader,
         )
     )
     return dispatcher
