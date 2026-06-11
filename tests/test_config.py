@@ -109,6 +109,11 @@ def test_settings_parse_pipeline_contract_and_normalize_object_prefixes() -> Non
     assert broker_settings.dead_letter_routing_key == "pipeline.dead_letter"
 
 
+def test_settings_require_imgproxy_key_and_salt_together() -> None:
+    with pytest.raises(ValidationError, match="imgproxy_key and imgproxy_salt"):
+        _ = Settings.model_validate({"imgproxy_key": "001122"})
+
+
 def test_settings_default_cors_origin_policy_matches_memexpert_net_but_not_other_tlds() -> None:
     settings = Settings()
 

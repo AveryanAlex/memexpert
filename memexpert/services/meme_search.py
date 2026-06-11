@@ -27,7 +27,13 @@ from memexpert.schemas.meme import (
     MemeSearchResultRead,
     MemeSearchScoreRead,
     MemeSlugRedirectRead,
+    PublicMemeCardRead,
+    PublicMemeDetailRead,
+    PublicMemeFileRead,
+    PublicMemeSearchPageRead,
+    PublicMemeSearchResultRead,
 )
+from memexpert.services.media_render_urls import MediaRenderUrlService, PublicMediaRenderContext
 
 TEXT_SCORE_KEYS = ("_rankingScore", "_score", "rankingScore", "score")
 SEMANTIC_WEIGHT = 0.50
@@ -115,11 +121,13 @@ class MemeSearchService:
         text_client: MemeTextSearchClientProtocol | None = None,
         semantic_client: QdrantUserSearchClientProtocol | None = None,
         query_embedding_client: MemeQueryEmbeddingClientProtocol | None = None,
+        media_render_service: MediaRenderUrlService | None = None,
     ) -> None:
         self._session = session
         self._text_client = text_client
         self._semantic_client = semantic_client
         self._query_embedding_client = query_embedding_client
+        self._media_render_service = media_render_service or MediaRenderUrlService()
 
     async def search_memes(
         self,
@@ -187,6 +195,24 @@ class MemeSearchService:
             has_more=resolved_offset + resolved_limit < total,
         )
 
+    async def search_public_memes(
+        self,
+        query: str,
+        *,
+        viewer_user_id: uuid.UUID | None = None,
+        filters: MemeSearchFilters | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> PublicMemeSearchPageRead:
+        page = await self.search_memes(
+            query,
+            viewer_user_id=viewer_user_id,
+            filters=filters,
+            limit=limit,
+            offset=offset,
+        )
+        return await self._to_public_search_page(page, viewer_user_id=viewer_user_id)
+
     async def get_meme_detail(
         self,
         meme_id: uuid.UUID,
@@ -219,6 +245,30 @@ class MemeSearchService:
         if meme is None:
             raise MemeNotFoundError("Meme slug was not found or is not visible to this caller.")
         return _to_detail_read(meme)
+
+    async def get_public_meme_detail(
+        self,
+        meme_id: uuid.UUID,
+        *,
+        viewer_user_id: uuid.UUID | None = None,
+        include_nsfw: bool = False,
+    ) -> PublicMemeDetailRead:
+        meme = await self._load_visible_meme_by_id(meme_id, viewer_user_id=viewer_user_id, include_nsfw=include_nsfw)
+        return _to_public_detail_read(meme, media_render_service=self._media_render_service)
+
+    async def get_public_meme_detail_by_slug(
+        self,
+        slug: str,
+        *,
+        viewer_user_id: uuid.UUID | None = None,
+        include_nsfw: bool = False,
+    ) -> PublicMemeDetailRead:
+        meme = await self._load_visible_meme_by_slug(
+            slug,
+            viewer_user_id=viewer_user_id,
+            include_nsfw=include_nsfw,
+        )
+        return _to_public_detail_read(meme, media_render_service=self._media_render_service)
 
     async def get_slug_redirect(
         self,
@@ -257,6 +307,22 @@ class MemeSearchService:
             limit=_clamp_limit(limit),
             offset=max(0, offset),
         )
+
+    async def browse_public_memes(
+        self,
+        *,
+        viewer_user_id: uuid.UUID | None = None,
+        filters: MemeSearchFilters | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> PublicMemeSearchPageRead:
+        page = await self.browse_memes(
+            viewer_user_id=viewer_user_id,
+            filters=filters,
+            limit=limit,
+            offset=offset,
+        )
+        return await self._to_public_search_page(page, viewer_user_id=viewer_user_id)
 
     async def trending_memes(
         self,
@@ -341,6 +407,24 @@ class MemeSearchService:
             has_more=resolved_offset + resolved_limit < len(ranked),
         )
 
+    async def trending_public_memes(
+        self,
+        *,
+        viewer_user_id: uuid.UUID | None = None,
+        filters: MemeSearchFilters | None = None,
+        limit: int = 20,
+        offset: int = 0,
+        lookback_hours: int = 168,
+    ) -> PublicMemeSearchPageRead:
+        page = await self.trending_memes(
+            viewer_user_id=viewer_user_id,
+            filters=filters,
+            limit=limit,
+            offset=offset,
+            lookback_hours=lookback_hours,
+        )
+        return await self._to_public_search_page(page, viewer_user_id=viewer_user_id)
+
     async def _recent_event_scores(self, meme_ids: set[uuid.UUID], *, since: object) -> dict[uuid.UUID, float]:
         result = await self._session.execute(
             select(AnalyticsEvent).where(
@@ -395,6 +479,24 @@ class MemeSearchService:
             offset=max(0, offset),
         )
 
+    async def browse_public_tag(
+        self,
+        tag: str,
+        *,
+        viewer_user_id: uuid.UUID | None = None,
+        include_nsfw: bool = False,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> PublicMemeSearchPageRead:
+        page = await self.browse_tag(
+            tag,
+            viewer_user_id=viewer_user_id,
+            include_nsfw=include_nsfw,
+            limit=limit,
+            offset=offset,
+        )
+        return await self._to_public_search_page(page, viewer_user_id=viewer_user_id)
+
     async def browse_template(
         self,
         template_slug: str,
@@ -443,6 +545,24 @@ class MemeSearchService:
             total=total,
             has_more=resolved_offset + resolved_limit < total,
         )
+
+    async def browse_public_template(
+        self,
+        template_slug: str,
+        *,
+        viewer_user_id: uuid.UUID | None = None,
+        include_nsfw: bool = False,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> tuple[MemeTemplate | None, PublicMemeSearchPageRead]:
+        template, page = await self.browse_template(
+            template_slug,
+            viewer_user_id=viewer_user_id,
+            include_nsfw=include_nsfw,
+            limit=limit,
+            offset=offset,
+        )
+        return template, await self._to_public_search_page(page, viewer_user_id=viewer_user_id)
 
     async def _resolve_query_vector(
         self,
@@ -528,6 +648,69 @@ class MemeSearchService:
         stmt = _apply_filters(stmt, filters)
         result = await self._session.execute(stmt)
         return list(result.scalars().all())
+
+    async def _load_visible_meme_by_id(
+        self,
+        meme_id: uuid.UUID,
+        *,
+        viewer_user_id: uuid.UUID | None,
+        include_nsfw: bool,
+    ) -> Meme:
+        stmt = _visible_meme_stmt(viewer_user_id).where(Meme.id == meme_id)
+        if not include_nsfw:
+            stmt = stmt.where(Meme.is_nsfw.is_(False))
+        meme = await self._session.scalar(stmt)
+        if meme is None:
+            raise MemeNotFoundError("Meme was not found or is not visible to this caller.")
+        return meme
+
+    async def _load_visible_meme_by_slug(
+        self,
+        slug: str,
+        *,
+        viewer_user_id: uuid.UUID | None,
+        include_nsfw: bool,
+    ) -> Meme:
+        normalized_slug = slug.strip().lower()
+        stmt = _visible_meme_stmt(viewer_user_id).join(MemeSeoPage).where(MemeSeoPage.slug == normalized_slug)
+        if not include_nsfw:
+            stmt = stmt.where(Meme.is_nsfw.is_(False))
+        meme = await self._session.scalar(stmt)
+        if meme is None:
+            raise MemeNotFoundError("Meme slug was not found or is not visible to this caller.")
+        return meme
+
+    async def _to_public_search_page(
+        self,
+        page: MemeSearchPageRead,
+        *,
+        viewer_user_id: uuid.UUID | None,
+    ) -> PublicMemeSearchPageRead:
+        meme_ids = tuple(item.meme.id for item in page.items)
+        if not meme_ids:
+            return PublicMemeSearchPageRead(
+                items=[],
+                limit=page.limit,
+                offset=page.offset,
+                total=page.total,
+                has_more=page.has_more,
+            )
+        result = await self._session.execute(_visible_meme_stmt(viewer_user_id).where(Meme.id.in_(meme_ids)))
+        memes_by_id = {meme.id: meme for meme in result.scalars().all()}
+        public_items = [
+            PublicMemeSearchResultRead(
+                meme=_to_public_card_read(meme, media_render_service=self._media_render_service),
+            )
+            for meme_id in meme_ids
+            if (meme := memes_by_id.get(meme_id)) is not None
+        ]
+        return PublicMemeSearchPageRead(
+            items=public_items,
+            limit=page.limit,
+            offset=page.offset,
+            total=page.total,
+            has_more=page.has_more,
+        )
 
     async def _popular_page(
         self,
@@ -666,6 +849,24 @@ def _to_file_read(file: MemeFile) -> MemeFileRead:
     )
 
 
+def _to_public_file_read(
+    file: MemeFile,
+    *,
+    context: PublicMediaRenderContext,
+    media_render_service: MediaRenderUrlService,
+) -> PublicMemeFileRead:
+    return PublicMemeFileRead(
+        id=file.id,
+        mime_type=file.mime_type,
+        width=file.width,
+        height=file.height,
+        file_size_bytes=file.file_size_bytes,
+        blur_hash=file.blur_hash,
+        quality_score=file.quality_score,
+        render=media_render_service.build_render(file, context=context),
+    )
+
+
 def _to_card_read(meme: Meme) -> MemeCardRead:
     return MemeCardRead(
         id=meme.id,
@@ -678,6 +879,34 @@ def _to_card_read(meme: Meme) -> MemeCardRead:
         primary_file=_to_file_read(meme.primary_file) if meme.primary_file else None,
         caption=meme.seo_page.caption if meme.seo_page else None,
         seo_page_slug=meme.seo_page.slug if meme.seo_page else None,
+        created_at=meme.created_at,
+        updated_at=meme.updated_at,
+    )
+
+
+def _to_public_card_read(meme: Meme, *, media_render_service: MediaRenderUrlService) -> PublicMemeCardRead:
+    seo_slug = meme.seo_page.slug if meme.seo_page else None
+    caption = meme.seo_page.caption if meme.seo_page else None
+    context = PublicMediaRenderContext(meme_id=meme.id, seo_slug=seo_slug, caption=caption)
+    return PublicMemeCardRead(
+        id=meme.id,
+        media_type=meme.media_type,
+        language=meme.language,
+        is_nsfw=meme.is_nsfw,
+        popularity_score=meme.popularity_score,
+        like_count=meme.like_count,
+        tags=list(meme.tags),
+        primary_file=(
+            _to_public_file_read(
+                meme.primary_file,
+                context=context,
+                media_render_service=media_render_service,
+            )
+            if meme.primary_file
+            else None
+        ),
+        caption=caption,
+        seo_page_slug=seo_slug,
         created_at=meme.created_at,
         updated_at=meme.updated_at,
     )
@@ -698,6 +927,28 @@ def _to_detail_read(meme: Meme) -> MemeDetailRead:
         seo_prompt_version=meme.seo_page.prompt_version if meme.seo_page else None,
         seo_generated_at=meme.seo_page.generated_at if meme.seo_page else None,
         files=[_to_file_read(file) for file in meme.files],
+    )
+
+
+def _to_public_detail_read(meme: Meme, *, media_render_service: MediaRenderUrlService) -> PublicMemeDetailRead:
+    card = _to_public_card_read(meme, media_render_service=media_render_service)
+    seo_slug = meme.seo_page.slug if meme.seo_page else None
+    caption = meme.seo_page.caption if meme.seo_page else None
+    context = PublicMediaRenderContext(meme_id=meme.id, seo_slug=seo_slug, caption=caption)
+    return PublicMemeDetailRead(
+        **card.model_dump(),
+        ocr_text=meme.ocr_text,
+        seo_title=meme.seo_page.page_title if meme.seo_page else None,
+        seo_description=meme.seo_page.meta_description if meme.seo_page else None,
+        seo_alt_text=meme.seo_page.alt_text if meme.seo_page else None,
+        seo_body_text=meme.seo_page.body_text if meme.seo_page else None,
+        seo_model_id=meme.seo_page.model_id if meme.seo_page else None,
+        seo_prompt_version=meme.seo_page.prompt_version if meme.seo_page else None,
+        seo_generated_at=meme.seo_page.generated_at if meme.seo_page else None,
+        files=[
+            _to_public_file_read(file, context=context, media_render_service=media_render_service)
+            for file in meme.files
+        ],
     )
 
 

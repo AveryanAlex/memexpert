@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from memexpert.api.dependencies import PIPELINE_OPERATOR_TOKEN_HEADER_NAME
 from memexpert.api.dependencies.auth import get_optional_current_user
 from memexpert.api.dependencies.meme import get_analytics_service, get_meme_search_service
-from memexpert.core.config import get_settings
+from memexpert.core.config import Settings, get_settings
 from memexpert.core.qdrant import QdrantUserSearchMatch
 from memexpert.models.collection import Collection, CollectionMember, CollectionMeme
 from memexpert.models.content import Meme, MemeFile, MemePopularitySnapshot, MemeSeoPage, MemeTemplate
@@ -32,6 +32,7 @@ from memexpert.models.enums import (
 from memexpert.models.user import AccountMergeLog, AnalyticsEvent, User
 from memexpert.schemas.user import UserRead
 from memexpert.services.analytics import AnalyticsService
+from memexpert.services.media_render_urls import MediaRenderUrlService
 from memexpert.services.meme_search import MemeNotFoundError, MemeSearchFilters, MemeSearchService
 from memexpert.services.meme_seo import MemeSeoGenerationService, MemeSeoProviderResult
 
@@ -124,6 +125,12 @@ async def _create_meme(
     is_public: bool = True,
     author_user_id: uuid.UUID | None = None,
     ocr_text: str | None = None,
+    s3_original_key: str | None = None,
+    s3_web_video_key: str | None = None,
+    mime_type: str = "image/jpeg",
+    width: int | None = None,
+    height: int | None = None,
+    blur_hash: str | None = None,
 ) -> Meme:
     meme = Meme(
         media_type=media_type,
@@ -140,8 +147,12 @@ async def _create_meme(
     await session.flush()
     file = MemeFile(
         meme_id=meme.id,
-        s3_original_key=f"memes/{meme.id}.jpg",
-        mime_type="image/jpeg",
+        s3_original_key=s3_original_key or f"memes/{meme.id}.jpg",
+        s3_web_video_key=s3_web_video_key,
+        mime_type=mime_type,
+        width=width,
+        height=height,
+        blur_hash=blur_hash,
         quality_score=0.8,
         is_primary=True,
     )
@@ -346,6 +357,114 @@ async def test_public_openapi_registers_catalog_routes_without_internal_surface(
     assert "s3_web_video_key" not in components["PublicMemeFileRead"]["properties"]
     assert "author_user_id" not in components["PublicMemeDetailRead"]["properties"]
     assert "is_public" not in components["PublicMemeDetailRead"]["properties"]
+
+
+async def test_public_route_json_includes_render_contract_without_storage_leakage(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    meme = await _create_meme(
+        migrated_db_session,
+        s3_original_key="pipeline/originals/private/source.jpg",
+        width=640,
+        height=480,
+        blur_hash="LEHV6nWB2yk8pyo0adR*.7kCMdnj",
+    )
+    migrated_db_session.add(
+        MemeSeoPage(
+            meme_id=meme.id,
+            slug="frog-wizard",
+            page_title="Frog Wizard",
+            meta_description="A frog wizard meme.",
+            alt_text="Frog wizard image",
+            caption="Frog wizard",
+            tags=["frog"],
+            model_id="test",
+            prompt_version="test-v1",
+            generated_at=datetime.now(UTC),
+        )
+    )
+    private_meme = await _create_meme(
+        migrated_db_session,
+        is_public=False,
+        s3_original_key="pipeline/originals/private/hidden.jpg",
+    )
+    await migrated_db_session.commit()
+
+    settings = Settings.model_validate(
+        {
+            "imgproxy_base_url": "https://img.memexpert.test",
+            "imgproxy_key": "00112233445566778899aabbccddeeff",
+            "imgproxy_salt": "ffeeddccbbaa99887766554433221100",
+            "s3_bucket": "private-media-bucket",
+        }
+    )
+    service = MemeSearchService(
+        migrated_db_session,
+        media_render_service=MediaRenderUrlService(settings),
+    )
+    _install_meme_route_overrides(app, migrated_db_session, service=service)
+
+    try:
+        response = await client.get("/api/v1/memes/browse", params={"limit": 10})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [item["meme"]["id"] for item in payload["items"]] == [str(meme.id)]
+    assert str(private_meme.id) not in response.text
+    primary_file = payload["items"][0]["meme"]["primary_file"]
+    assert "s3_original_key" not in primary_file
+    assert "s3_web_video_key" not in primary_file
+    render = primary_file["render"]
+    assert render["thumbnail_url"].startswith("https://img.memexpert.test/")
+    assert "/unsafe/" not in render["thumbnail_url"]
+    assert render["thumbnail_url"].endswith(".webp")
+    assert "@webp" not in render["thumbnail_url"]
+    assert render["preview_url"] == render["display_url"]
+    assert render["download_url"] is not None
+    assert "fn:ZnJvZy13aXphcmQuanBn:1" in render["download_url"]
+    assert render["download_url"].endswith(".jpg")
+    assert "@jpg" not in render["download_url"]
+    assert render["width"] == 640
+    assert render["height"] == 480
+    assert render["blur_hash"] == "LEHV6nWB2yk8pyo0adR*.7kCMdnj"
+    assert "private-media-bucket" not in response.text
+    assert "pipeline/originals/private/source.jpg" not in response.text
+    assert "pipeline/originals/private/hidden.jpg" not in response.text
+
+
+async def test_public_video_detail_uses_direct_media_base_without_imgproxy(
+    migrated_db_session: AsyncSession,
+) -> None:
+    meme = await _create_meme(
+        migrated_db_session,
+        media_type=ContentKind.VIDEO,
+        s3_original_key="pipeline/originals/private/video.mov",
+        s3_web_video_key="pipeline/derived/private/web.mp4",
+        mime_type="video/mp4",
+    )
+    await migrated_db_session.commit()
+    settings = Settings.model_validate(
+        {
+            "imgproxy_base_url": "https://img.memexpert.test",
+            "media_public_base_url": "https://media.memexpert.test/files",
+        }
+    )
+    service = MemeSearchService(
+        migrated_db_session,
+        media_render_service=MediaRenderUrlService(settings),
+    )
+
+    detail = await service.get_public_meme_detail(meme.id)
+
+    assert detail.primary_file is not None
+    assert detail.primary_file.render is not None
+    assert detail.primary_file.render.web_video_url is not None
+    assert detail.primary_file.render.web_video_url.startswith("https://media.memexpert.test/files/")
+    assert "img.memexpert.test" not in detail.primary_file.render.web_video_url
 
 
 async def test_seo_generation_stores_prompt_evidence_unique_slugs_tags_and_template(

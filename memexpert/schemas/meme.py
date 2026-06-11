@@ -93,6 +93,20 @@ class MemeSearchPageRead(BaseModel):
     has_more: bool
 
 
+class PublicMemeFileRenderRead(BaseModel):
+    """Public media URLs and render metadata safe for website clients."""
+
+    thumbnail_url: str | None = None
+    preview_url: str | None = None
+    display_url: str | None = None
+    original_url: str | None = None
+    download_url: str | None = None
+    web_video_url: str | None = None
+    width: int | None = None
+    height: int | None = None
+    blur_hash: str | None = None
+
+
 class PublicMemeFileRead(BaseModel):
     """Safe public file metadata without internal storage object keys."""
 
@@ -103,6 +117,7 @@ class PublicMemeFileRead(BaseModel):
     file_size_bytes: int | None
     blur_hash: str | None
     quality_score: float
+    render: PublicMemeFileRenderRead | None = None
 
 
 class PublicMemeCardRead(BaseModel):
@@ -173,6 +188,7 @@ __all__ = [
     "PublicMemeCardRead",
     "PublicMemeDetailRead",
     "PublicMemeFileRead",
+    "PublicMemeFileRenderRead",
     "PublicMemeLandingRead",
     "PublicMemeSearchPageRead",
     "PublicMemeSearchResultRead",

@@ -137,7 +137,13 @@ input {
   box-shadow: 0 18px 40px rgb(57 38 10 / 7%);
 }
 
+.card-media-link,
+.caption a {
+  text-decoration: none;
+}
+
 .media-panel {
+  position: relative;
   display: grid;
   min-height: 150px;
   place-items: center;
@@ -149,6 +155,64 @@ input {
   font-weight: 900;
   letter-spacing: 0.16em;
   text-transform: uppercase;
+}
+
+.media-panel-detail {
+  min-height: 360px;
+  border-radius: 22px;
+  overflow: hidden;
+}
+
+.media-panel[data-has-media='true'] {
+  background: #101725;
+}
+
+.media-asset {
+  display: block;
+  width: 100%;
+  height: 100%;
+  min-height: inherit;
+  object-fit: cover;
+}
+
+.media-panel-detail .media-asset {
+  object-fit: contain;
+}
+
+.media-placeholder {
+  display: grid;
+  gap: 8px;
+  place-items: center;
+}
+
+.media-placeholder small {
+  color: #d8d0c2;
+  font-size: 0.72rem;
+  letter-spacing: 0.04em;
+  text-transform: none;
+}
+
+.media-download {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  border-radius: 999px;
+  background: rgb(255 250 241 / 92%);
+  color: #17212f;
+  font-size: 0.78rem;
+  font-weight: 900;
+  letter-spacing: normal;
+  padding: 8px 11px;
+  text-decoration: none;
+  text-transform: none;
+}
+
+.download-link {
+  color: #17212f;
+  font-size: 0.82rem;
+  font-weight: 900;
+  text-decoration-thickness: 2px;
+  text-underline-offset: 3px;
 }
 
 .card-body {
@@ -206,11 +270,6 @@ input {
   display: grid;
   grid-template-columns: minmax(260px, 0.9fr) minmax(0, 1fr);
   gap: 24px;
-}
-
-.detail-media {
-  min-height: 360px;
-  border-radius: 22px;
 }
 
 .detail-copy h1 {

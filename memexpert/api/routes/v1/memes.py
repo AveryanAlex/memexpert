@@ -71,7 +71,7 @@ async def search_memes(
     Plain text in ``query`` is embedded inside the service boundary before Qdrant search.
     """
 
-    page = await meme_search_service.search_memes(
+    page = await meme_search_service.search_public_memes(
         query,
         viewer_user_id=current_user.id if current_user else None,
         filters=_build_filters(
@@ -99,7 +99,7 @@ async def search_memes(
             "has_more": page.has_more,
         },
     )
-    return PublicMemeSearchPageRead.model_validate(page.model_dump())
+    return page
 
 
 @router.get("/browse", response_model=PublicMemeSearchPageRead, summary="Browse popular memes")
@@ -115,7 +115,7 @@ async def browse_memes(
 ) -> PublicMemeSearchPageRead:
     """Return a stable popular catalog page with the same filters as search."""
 
-    page = await meme_search_service.browse_memes(
+    page = await meme_search_service.browse_public_memes(
         viewer_user_id=current_user.id if current_user else None,
         filters=_build_filters(
             language=language,
@@ -126,7 +126,7 @@ async def browse_memes(
         limit=limit,
         offset=offset,
     )
-    return PublicMemeSearchPageRead.model_validate(page.model_dump())
+    return page
 
 
 @router.get("/trending", response_model=PublicMemeSearchPageRead, summary="Browse trending memes")
@@ -143,7 +143,7 @@ async def trending_memes(
 ) -> PublicMemeSearchPageRead:
     """Return memes ranked by recent product events plus source popularity signals."""
 
-    page = await meme_search_service.trending_memes(
+    page = await meme_search_service.trending_public_memes(
         viewer_user_id=current_user.id if current_user else None,
         filters=_build_filters(
             language=language,
@@ -155,7 +155,7 @@ async def trending_memes(
         offset=offset,
         lookback_hours=lookback_hours,
     )
-    return PublicMemeSearchPageRead.model_validate(page.model_dump())
+    return page
 
 
 @router.get("/favorites", response_model=list[CollectionMemeRead], summary="List favorite memes")
@@ -325,7 +325,7 @@ async def get_meme_detail_by_slug(
     """Resolve a visible meme detail DTO from its canonical SEO slug."""
 
     try:
-        detail = await meme_search_service.get_meme_detail_by_slug(
+        detail = await meme_search_service.get_public_meme_detail_by_slug(
             slug,
             viewer_user_id=current_user.id if current_user else None,
             include_nsfw=_nsfw_allowed(current_user, include_nsfw),
@@ -335,7 +335,7 @@ async def get_meme_detail_by_slug(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Meme was not found.",
         ) from exc
-    return PublicMemeDetailRead.model_validate(detail.model_dump())
+    return detail
 
 
 @router.get("/tags/{tag_slug}", response_model=PublicMemeLandingRead, summary="Browse memes by tag")
@@ -350,7 +350,7 @@ async def browse_tag_landing(
     """Return a minimal public organic landing contract for one tag."""
 
     normalized_tag = tag_slug.strip().lower()
-    page = await meme_search_service.browse_tag(
+    page = await meme_search_service.browse_public_tag(
         normalized_tag,
         viewer_user_id=current_user.id if current_user else None,
         include_nsfw=_nsfw_allowed(current_user, include_nsfw),
@@ -362,7 +362,7 @@ async def browse_tag_landing(
         slug=normalized_tag,
         title=f"{normalized_tag.replace('-', ' ').title()} memes",
         description=f"Browse public memes tagged {normalized_tag}.",
-        page=PublicMemeSearchPageRead.model_validate(page.model_dump()),
+        page=page,
     )
 
 
@@ -377,7 +377,7 @@ async def browse_template_landing(
 ) -> PublicMemeLandingRead:
     """Return a minimal public organic landing contract for one meme template."""
 
-    template, page = await meme_search_service.browse_template(
+    template, page = await meme_search_service.browse_public_template(
         template_slug,
         viewer_user_id=current_user.id if current_user else None,
         include_nsfw=_nsfw_allowed(current_user, include_nsfw),
@@ -394,7 +394,7 @@ async def browse_template_landing(
         slug=template.slug,
         title=f"{template.name} memes",
         description=template.description,
-        page=PublicMemeSearchPageRead.model_validate(page.model_dump()),
+        page=page,
     )
 
 
@@ -431,7 +431,7 @@ async def get_meme_detail(
     """Return a detail DTO for a visible meme."""
 
     try:
-        detail = await meme_search_service.get_meme_detail(
+        detail = await meme_search_service.get_public_meme_detail(
             meme_id,
             viewer_user_id=current_user.id if current_user else None,
             include_nsfw=_nsfw_allowed(current_user, include_nsfw),
@@ -450,7 +450,7 @@ async def get_meme_detail(
             "include_nsfw": _nsfw_allowed(current_user, include_nsfw),
         },
     )
-    return PublicMemeDetailRead.model_validate(detail.model_dump())
+    return detail
 
 
 def _build_filters(
