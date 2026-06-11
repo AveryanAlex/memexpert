@@ -37,6 +37,7 @@ class MemeCardRead(BaseModel):
     tags: list[str] = Field(default_factory=list)
     primary_file: MemeFileRead | None
     caption: str | None
+    seo_page_slug: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -47,10 +48,23 @@ class MemeDetailRead(MemeCardRead):
     ocr_text: str | None
     is_public: bool
     author_user_id: uuid.UUID | None
-    seo_page_slug: str | None
     seo_title: str | None
     seo_description: str | None
+    seo_alt_text: str | None = None
+    seo_body_text: str | None = None
+    seo_model_id: str | None = None
+    seo_prompt_version: str | None = None
+    seo_generated_at: datetime | None = None
     files: list[MemeFileRead] = Field(default_factory=list)
+
+
+class MemeSlugRedirectRead(BaseModel):
+    """Canonical slug metadata for id-based public links."""
+
+    meme_id: uuid.UUID
+    slug: str
+    path: str
+    should_redirect: bool
 
 
 class MemeSearchScoreRead(BaseModel):
@@ -103,6 +117,7 @@ class PublicMemeCardRead(BaseModel):
     tags: list[str] = Field(default_factory=list)
     primary_file: PublicMemeFileRead | None
     caption: str | None
+    seo_page_slug: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -111,9 +126,13 @@ class PublicMemeDetailRead(PublicMemeCardRead):
     """Safe public meme detail DTO without owner or storage internals."""
 
     ocr_text: str | None
-    seo_page_slug: str | None
     seo_title: str | None
     seo_description: str | None
+    seo_alt_text: str | None = None
+    seo_body_text: str | None = None
+    seo_model_id: str | None = None
+    seo_prompt_version: str | None = None
+    seo_generated_at: datetime | None = None
     files: list[PublicMemeFileRead] = Field(default_factory=list)
 
 
@@ -133,16 +152,28 @@ class PublicMemeSearchPageRead(BaseModel):
     has_more: bool
 
 
+class PublicMemeLandingRead(BaseModel):
+    """Minimal tag/template landing response for organic pages."""
+
+    kind: str
+    slug: str
+    title: str
+    description: str | None
+    page: PublicMemeSearchPageRead
+
+
 __all__ = [
     "MemeCardRead",
     "MemeDetailRead",
     "MemeFileRead",
+    "MemeSlugRedirectRead",
     "MemeSearchPageRead",
     "MemeSearchResultRead",
     "MemeSearchScoreRead",
     "PublicMemeCardRead",
     "PublicMemeDetailRead",
     "PublicMemeFileRead",
+    "PublicMemeLandingRead",
     "PublicMemeSearchPageRead",
     "PublicMemeSearchResultRead",
 ]

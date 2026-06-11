@@ -21,6 +21,7 @@ export interface PublicMemeCardRead {
   tags: string[];
   primary_file: PublicMemeFileRead | null;
   caption: string | null;
+  seo_page_slug: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -30,6 +31,11 @@ export interface PublicMemeDetailRead extends PublicMemeCardRead {
   seo_page_slug: string | null;
   seo_title: string | null;
   seo_description: string | null;
+  seo_alt_text: string | null;
+  seo_body_text: string | null;
+  seo_model_id: string | null;
+  seo_prompt_version: string | null;
+  seo_generated_at: string | null;
   files: PublicMemeFileRead[];
 }
 
@@ -43,4 +49,12 @@ export interface PublicMemeSearchPageRead {
   offset: number;
   total: number;
   has_more: boolean;
+}
+
+export interface PublicMemeLandingRead {
+  kind: 'tag' | 'template' | string;
+  slug: string;
+  title: string;
+  description: string | null;
+  page: PublicMemeSearchPageRead;
 }
