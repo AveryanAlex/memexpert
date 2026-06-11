@@ -1,4 +1,5 @@
 <script lang="ts">
+  import MemeCard from '$lib/components/MemeCard.svelte';
   import type { PageData } from './$types';
 
   let { data }: { data: PageData } = $props();
@@ -11,10 +12,6 @@
 
   function pageHref(offset: number): string {
     return offset > 0 ? `?offset=${offset}` : '';
-  }
-
-  function memeHref(meme: { id: string; seo_page_slug: string | null }): string {
-    return `/memes/${meme.seo_page_slug || meme.id}`;
   }
 </script>
 
@@ -37,17 +34,7 @@
   {#if page.items.length > 0}
     <section class="grid" aria-label="Template memes">
       {#each page.items as item (item.meme.id)}
-        {@const meme = item.meme}
-        <a class="card" href={memeHref(meme)}>
-          <div class="media-panel">{meme.media_type}</div>
-          <div class="card-body">
-            <p class="caption">{meme.caption || meme.tags[0] || 'Untitled meme'}</p>
-            <div class="meta" aria-label="Meme metadata">
-              <span>{meme.language}</span>
-              <span>{meme.like_count} likes</span>
-            </div>
-          </div>
-        </a>
+        <MemeCard meme={item.meme} />
       {/each}
     </section>
   {:else}

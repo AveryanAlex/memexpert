@@ -9,6 +9,8 @@ export interface PublicMemeFileRead {
   file_size_bytes: number | null;
   blur_hash: string | null;
   quality_score: number;
+  render_url?: string | null;
+  download_url?: string | null;
 }
 
 export interface PublicMemeCardRead {
@@ -24,6 +26,11 @@ export interface PublicMemeCardRead {
   seo_page_slug: string | null;
   created_at: string;
   updated_at: string;
+  render_url?: string | null;
+  download_url?: string | null;
+  viewer_has_favorited?: boolean | null;
+  viewer_has_saved?: boolean | null;
+  viewer_has_pinned?: boolean | null;
 }
 
 export interface PublicMemeDetailRead extends PublicMemeCardRead {

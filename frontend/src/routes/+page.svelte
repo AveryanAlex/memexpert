@@ -1,4 +1,5 @@
 <script lang="ts">
+  import MemeCard from '$lib/components/MemeCard.svelte';
   import type { PageData } from './$types';
 
   let { data }: { data: PageData } = $props();
@@ -21,10 +22,6 @@
 
     const query = params.toString();
     return query ? `/?${query}` : '/';
-  }
-
-  function memeHref(meme: { id: string; seo_page_slug: string | null }): string {
-    return `/memes/${meme.seo_page_slug || meme.id}`;
   }
 </script>
 
@@ -65,27 +62,7 @@
 {#if data.page.items.length > 0}
   <section class="grid" aria-label="Meme results">
     {#each data.page.items as item (item.meme.id)}
-      {@const meme = item.meme}
-      <a class="card" href={memeHref(meme)}>
-        <div class="media-panel">{meme.media_type}</div>
-        <div class="card-body">
-          <p class="caption">{meme.caption || meme.tags[0] || 'Untitled meme'}</p>
-          <div class="meta" aria-label="Meme metadata">
-            <span>{meme.language}</span>
-            <span>{meme.like_count} likes</span>
-            {#if meme.primary_file?.width && meme.primary_file.height}
-              <span>{meme.primary_file.width}x{meme.primary_file.height}</span>
-            {/if}
-          </div>
-          {#if meme.tags.length > 0}
-            <div class="tags" aria-label="Tags">
-              {#each meme.tags.slice(0, 3) as tag}
-                <span class="tag">#{tag}</span>
-              {/each}
-            </div>
-          {/if}
-        </div>
-      </a>
+      <MemeCard meme={item.meme} />
     {/each}
   </section>
 {:else if !data.errorMessage}

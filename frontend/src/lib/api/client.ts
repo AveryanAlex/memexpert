@@ -20,6 +20,17 @@ interface DetailRequest extends CatalogRequest {
   memeId: string;
 }
 
+interface MemeActionRequest {
+  fetch: ApiFetch;
+  baseUrl?: string;
+  cookieHeader?: string;
+  memeId: string;
+}
+
+export interface RemoveActionResponse {
+  removed?: boolean;
+}
+
 interface LandingRequest extends CatalogRequest {
   slug: string;
   limit: number;
@@ -61,6 +72,30 @@ export async function fetchMemeDetail(request: DetailRequest): Promise<PublicMem
   );
 }
 
+export async function favoriteMeme(request: MemeActionRequest): Promise<unknown> {
+  return apiMutation(`/api/v1/memes/${encodeURIComponent(request.memeId)}/favorite`, 'POST', request);
+}
+
+export async function unfavoriteMeme(request: MemeActionRequest): Promise<RemoveActionResponse> {
+  return apiMutation(`/api/v1/memes/${encodeURIComponent(request.memeId)}/favorite`, 'DELETE', request);
+}
+
+export async function saveMeme(request: MemeActionRequest): Promise<unknown> {
+  return apiMutation(`/api/v1/memes/${encodeURIComponent(request.memeId)}/save`, 'POST', request);
+}
+
+export async function removeSavedMeme(request: MemeActionRequest): Promise<RemoveActionResponse> {
+  return apiMutation(`/api/v1/memes/${encodeURIComponent(request.memeId)}/save`, 'DELETE', request);
+}
+
+export async function pinMeme(request: MemeActionRequest): Promise<unknown> {
+  return apiMutation(`/api/v1/memes/${encodeURIComponent(request.memeId)}/pin`, 'POST', request);
+}
+
+export async function unpinMeme(request: MemeActionRequest): Promise<RemoveActionResponse> {
+  return apiMutation(`/api/v1/memes/${encodeURIComponent(request.memeId)}/pin`, 'DELETE', request);
+}
+
 export async function fetchTagLanding(request: LandingRequest): Promise<PublicMemeLandingRead> {
   return fetchLanding(`/api/v1/memes/tags/${encodeURIComponent(request.slug)}`, request);
 }
@@ -94,6 +129,30 @@ async function apiGet<T>(path: string, params: URLSearchParams, request: Catalog
   }
 
   return payload as T;
+}
+
+async function apiMutation<T>(path: string, method: 'DELETE' | 'POST', request: MemeActionRequest): Promise<T> {
+  const headers = new Headers({ accept: 'application/json' });
+  if (request.cookieHeader) {
+    headers.set('cookie', request.cookieHeader);
+  }
+
+  const response = await request.fetch(buildApiInput(path, request.baseUrl), {
+    method,
+    headers,
+    credentials: 'include'
+  });
+  const payload = await readJson(response);
+
+  if (!response.ok) {
+    throw new ApiError(response.status, readErrorDetail(payload) ?? `Meme action returned ${response.status}`);
+  }
+
+  return payload as T;
+}
+
+function buildApiInput(path: string, baseUrl: string | undefined): RequestInfo | URL {
+  return baseUrl ? new URL(path, baseUrl) : path;
 }
 
 async function readJson(response: Response): Promise<unknown> {
