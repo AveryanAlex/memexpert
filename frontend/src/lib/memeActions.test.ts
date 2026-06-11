@@ -35,6 +35,7 @@ describe('meme action helpers', () => {
         file_size_bytes: 12,
         blur_hash: null,
         quality_score: 1,
+        render: null,
         render_url: 'https://cdn.memexpert.test/render.png',
         download_url: 'https://cdn.memexpert.test/download.png'
       }

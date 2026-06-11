@@ -10,6 +10,7 @@ describe('selectMediaRender', () => {
     expect(media).toEqual({
       imageUrl: 'https://img.example/display.webp',
       videoUrl: null,
+      audioUrl: null,
       downloadUrl: 'https://img.example/download.jpg',
       hasMedia: true
     });
@@ -27,6 +28,7 @@ describe('selectMediaRender', () => {
     expect(selectMediaRender(null)).toEqual({
       imageUrl: null,
       videoUrl: null,
+      audioUrl: null,
       downloadUrl: null,
       hasMedia: false
     });

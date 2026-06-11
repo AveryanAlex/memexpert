@@ -1,3 +1,5 @@
+import { describe, expect, it, vi } from 'vitest';
+
 import {
   addSourceChannel,
   ApiError,
@@ -192,6 +194,8 @@ describe('catalog API client', () => {
       { method: 'POST', path: '/api/v1/memes/meme-123/pin' },
       { method: 'DELETE', path: '/api/v1/memes/meme-123/pin' }
     ]);
+  });
+
   it('loads current session through the web bootstrap endpoint and forwards Set-Cookie hooks', async () => {
     const responses: Response[] = [];
     const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -406,6 +410,7 @@ function sessionPayload(accountType: 'full' | 'guest'): CurrentSessionRead {
       status: 'active',
       guest_expires_at: accountType === 'guest' ? '2026-07-12T00:00:00Z' : null,
       active_save_collection_id: null,
+      is_admin: accountType === 'full',
       created_at: '2026-01-01T00:00:00Z',
       updated_at: '2026-01-01T00:00:00Z'
     },

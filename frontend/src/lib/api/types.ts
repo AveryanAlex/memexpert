@@ -15,6 +15,7 @@ export interface UserRead {
   status: string;
   guest_expires_at: string | null;
   active_save_collection_id: string | null;
+  is_admin: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -118,15 +119,6 @@ export interface PublicMemeLandingRead {
   title: string;
   description: string | null;
   page: PublicMemeSearchPageRead;
-}
-
-export interface UserRead {
-  id: string;
-  account_type: 'guest' | 'full';
-  email: string | null;
-  telegram_id: number | null;
-  google_id: string | null;
-  is_admin: boolean;
 }
 
 export interface AdminSessionRead {

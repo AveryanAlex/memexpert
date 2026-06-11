@@ -36,6 +36,7 @@ interface MemeActionRequest {
   fetch: ApiFetch;
   baseUrl?: string;
   cookieHeader?: string;
+  onResponse?: (response: Response) => void;
   memeId: string;
 }
 
@@ -249,6 +250,7 @@ async function apiMutation<T>(path: string, method: 'DELETE' | 'POST', request: 
     headers,
     credentials: 'include'
   });
+  request.onResponse?.(response);
   const payload = await readJson(response);
 
   if (!response.ok) {
