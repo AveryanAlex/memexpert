@@ -1,9 +1,12 @@
 <script lang="ts">
+  import { page } from '$app/state';
   import MemeActionMenu from '$lib/components/MemeActionMenu.svelte';
   import MemeMedia from '$lib/components/MemeMedia.svelte';
-  import type { PageData } from './$types';
+  import type { ActionData, PageData } from './$types';
 
-  let { data }: { data: PageData } = $props();
+  let { data, form }: { data: PageData; form: ActionData } = $props();
+
+  const returnTo = $derived(page.url.pathname);
 </script>
 
 {#if data.meme}
@@ -39,8 +42,23 @@
         </div>
       {/if}
       <div class="detail-actions">
+        <form method="POST" action="?/favorite">
+          <input type="hidden" name="memeId" value={data.meme.id} />
+          <button type="submit">Save to favorites</button>
+        </form>
         <a class="button-link secondary" href="/">Back to search</a>
       </div>
+      {#if form?.message}
+        <p class="notice" role="status">{form.message}</p>
+      {/if}
+      {#if form?.status === 'saved' && form.showConnectTelegram}
+        <section class="benefit-cta" aria-label="Keep favorites">
+          <p class="caption">Keep this save beyond this browser.</p>
+          <a class="button-link" href={`/account/telegram?returnTo=${encodeURIComponent(returnTo)}`}>
+            Connect Telegram to keep saves/favorites
+          </a>
+        </section>
+      {/if}
     </div>
   </article>
 {:else}

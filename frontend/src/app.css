@@ -25,6 +25,10 @@ input {
   font: inherit;
 }
 
+button {
+  border: 0;
+}
+
 .shell {
   width: min(1120px, calc(100% - 32px));
   margin: 0 auto;
@@ -37,6 +41,13 @@ input {
   justify-content: space-between;
   gap: 16px;
   margin-bottom: 36px;
+}
+
+.brand-block {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
 }
 
 .brand {
@@ -52,6 +63,56 @@ input {
   color: #675d4d;
   padding: 8px 12px;
   font-size: 0.9rem;
+  white-space: nowrap;
+}
+
+.pill.success {
+  border-color: #9bc5a8;
+  color: #1e6c3a;
+  background: #effaf2;
+}
+
+.account-chip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  max-width: 560px;
+  border: 1px solid #ded3c4;
+  border-radius: 24px;
+  background: #fffaf1;
+  padding: 12px;
+  box-shadow: 0 14px 34px rgb(57 38 10 / 7%);
+}
+
+.account-title,
+.account-copy {
+  margin: 0;
+}
+
+.account-title {
+  font-weight: 900;
+}
+
+.account-copy {
+  color: #6d6253;
+  font-size: 0.86rem;
+}
+
+.account-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.stub-pill {
+  border-radius: 999px;
+  background: #f0e6d5;
+  color: #7a6f60;
+  font-size: 0.78rem;
+  padding: 8px 10px;
   white-space: nowrap;
 }
 
@@ -96,7 +157,8 @@ input {
 }
 
 .search-form button,
-.button-link {
+.button-link,
+.detail-actions button {
   border: 0;
   border-radius: 18px;
   background: #17212f;
@@ -105,6 +167,23 @@ input {
   font-weight: 800;
   padding: 15px 20px;
   text-decoration: none;
+}
+
+.button-link.compact {
+  padding: 10px 13px;
+  border-radius: 14px;
+  font-size: 0.86rem;
+  white-space: nowrap;
+}
+
+.secondary-button {
+  border-radius: 18px;
+  background: #fffaf1;
+  border: 1px solid #dfd4c4;
+  color: #17212f;
+  cursor: pointer;
+  font-weight: 800;
+  padding: 15px 20px;
 }
 
 .button-link.secondary {
@@ -368,7 +447,8 @@ input {
 
 .empty-state,
 .notice,
-.detail-card {
+.detail-card,
+.telegram-card {
   border: 1px solid #dfd4c4;
   border-radius: 28px;
   background: #fffaf1;
@@ -388,9 +468,67 @@ input {
   letter-spacing: -0.06em;
 }
 
+.benefit-cta {
+  display: grid;
+  gap: 10px;
+  margin-top: 16px;
+  border: 1px solid #cfd8b8;
+  border-radius: 22px;
+  background: #f4f8e9;
+  padding: 16px;
+}
+
+.telegram-panel {
+  display: grid;
+  grid-template-columns: minmax(0, 0.95fr) minmax(320px, 0.7fr);
+  gap: 22px;
+  align-items: start;
+}
+
+.telegram-panel h1 {
+  margin: 14px 0;
+  font-size: clamp(2.2rem, 7vw, 5rem);
+  line-height: 0.94;
+  letter-spacing: -0.06em;
+}
+
+.telegram-card h2 {
+  margin-top: 0;
+}
+
+.stacked-form {
+  display: grid;
+  gap: 10px;
+  margin: 14px 0;
+}
+
+.stacked-form button {
+  border-radius: 18px;
+  background: #17212f;
+  color: #fffaf1;
+  cursor: pointer;
+  font-weight: 800;
+  padding: 15px 20px;
+}
+
+.stacked-form button.secondary-button {
+  background: #fffaf1;
+  color: #17212f;
+}
+
+.handoff-box {
+  display: grid;
+  gap: 10px;
+  border: 1px dashed #c7b9a7;
+  border-radius: 20px;
+  background: #f8efe1;
+  padding: 16px;
+}
+
 @media (max-width: 780px) {
   .hero,
-  .detail-card {
+  .detail-card,
+  .telegram-panel {
     grid-template-columns: 1fr;
   }
 
@@ -403,8 +541,13 @@ input {
   }
 
   .status-row,
-  .site-header {
+  .site-header,
+  .account-chip {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .account-actions {
+    justify-content: flex-start;
   }
 }

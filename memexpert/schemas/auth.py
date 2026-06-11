@@ -81,6 +81,13 @@ class LinkedProvidersRead(BaseModel):
     telegram_linked: bool
 
 
+class CurrentSessionRead(BaseModel):
+    """Web-facing current account state loaded through cookie-only auth."""
+
+    user: UserRead
+    linked_providers: LinkedProvidersRead
+
+
 class AccountLinkMergeSummaryRead(BaseModel):
     """Lightweight merge outcome details returned after a successful guest link."""
 
@@ -216,6 +223,7 @@ __all__ = [
     "AuthErrorCode",
     "AuthErrorResponse",
     "AuthSessionRead",
+    "CurrentSessionRead",
     "EmailCredentialsRequest",
     "EmailLoginRequest",
     "EmailSignupRequest",

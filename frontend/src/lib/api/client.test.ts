@@ -3,17 +3,20 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   ApiError,
   favoriteMeme,
+  fetchCurrentSession,
   fetchMemeDetail,
   fetchMemePage,
   fetchTagLanding,
   pinMeme,
+  refreshCurrentSession,
   removeSavedMeme,
   saveMeme,
+  startTelegramLink,
   unfavoriteMeme,
   unpinMeme,
   type ApiFetch
 } from './client';
-import type { PublicMemeSearchPageRead } from './types';
+import type { CurrentSessionRead, PublicMemeSearchPageRead } from './types';
 
 const page: PublicMemeSearchPageRead = {
   items: [],
@@ -188,6 +191,80 @@ describe('catalog API client', () => {
       { method: 'POST', path: '/api/v1/memes/meme-123/pin' },
       { method: 'DELETE', path: '/api/v1/memes/meme-123/pin' }
     ]);
+  it('loads current session through the web bootstrap endpoint and forwards Set-Cookie hooks', async () => {
+    const responses: Response[] = [];
+    const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const headers = new Headers(init?.headers);
+
+      expect(url.pathname).toBe('/api/v1/auth/session');
+      expect(headers.get('cookie')).toBe('memexpert_access_token=old');
+
+      return jsonResponse(sessionPayload('guest'), 200, {
+        'set-cookie': 'memexpert_access_token=new; HttpOnly; Secure; SameSite=lax; Path=/'
+      });
+    }) satisfies ApiFetch;
+
+    const session = await fetchCurrentSession({
+      fetch: mockFetch,
+      baseUrl: 'https://api.memexpert.test',
+      cookieHeader: 'memexpert_access_token=old',
+      onResponse: (response) => responses.push(response)
+    });
+
+    expect(session.user.account_type).toBe('guest');
+    expect(responses[0].headers.get('set-cookie')).toContain('memexpert_access_token=new');
+  });
+
+  it('starts and refreshes Telegram linking without token payloads', async () => {
+    const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const method = init?.method ?? 'GET';
+
+      if (url.pathname === '/api/v1/auth/link/telegram') {
+        expect(method).toBe('POST');
+        return jsonResponse({
+          code: 'abc123',
+          deep_link_url: 'https://t.me/memexpertbot?start=link_abc123',
+          expires_at: '2026-06-12T12:00:00Z',
+          expires_in_seconds: 600,
+          return_url: 'https://memexpert.test/account/telegram'
+        });
+      }
+
+      expect(url.pathname).toBe('/api/v1/auth/session/refresh');
+      expect(method).toBe('POST');
+      return jsonResponse(sessionPayload('full'));
+    }) satisfies ApiFetch;
+
+    const link = await startTelegramLink({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test' });
+    const refreshed = await refreshCurrentSession({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test' });
+
+    expect(link.deep_link_url).toContain('https://t.me/');
+    expect(refreshed.user.account_type).toBe('full');
+    expect('access_token' in refreshed).toBe(false);
+  });
+
+  it('saves a favorite through cookie-only transport', async () => {
+    const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const headers = new Headers(init?.headers);
+
+      expect(url.pathname).toBe('/api/v1/memes/11111111-1111-4111-8111-111111111111/favorite');
+      expect(init?.method).toBe('POST');
+      expect(headers.get('cookie')).toBe('memexpert_access_token=guest');
+
+      return jsonResponse({ id: 'save-1' });
+    }) satisfies ApiFetch;
+
+    await favoriteMeme({
+      fetch: mockFetch,
+      baseUrl: 'https://api.memexpert.test',
+      memeId: '11111111-1111-4111-8111-111111111111',
+      cookieHeader: 'memexpert_access_token=guest'
+    });
+
+    expect(mockFetch).toHaveBeenCalledOnce();
   });
 });
 
@@ -217,9 +294,37 @@ function memeDetail(overrides: { id: string; seo_page_slug: string | null }) {
   };
 }
 
-function jsonResponse(body: unknown, status = 200): Response {
+function sessionPayload(accountType: 'full' | 'guest'): CurrentSessionRead {
+  return {
+    user: {
+      id: '22222222-2222-4222-8222-222222222222',
+      account_type: accountType,
+      telegram_id: accountType === 'full' ? 123 : null,
+      google_id: null,
+      email: null,
+      email_verified_at: null,
+      language: 'any',
+      nsfw_enabled: false,
+      token_nonce: 0,
+      status: 'active',
+      guest_expires_at: accountType === 'guest' ? '2026-07-12T00:00:00Z' : null,
+      active_save_collection_id: null,
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z'
+    },
+    linked_providers: {
+      email: null,
+      email_verified_at: null,
+      has_password: false,
+      google_linked: false,
+      telegram_linked: accountType === 'full'
+    }
+  };
+}
+
+function jsonResponse(body: unknown, status = 200, headers: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { 'content-type': 'application/json' }
+    headers: { 'content-type': 'application/json', ...headers }
   });
 }

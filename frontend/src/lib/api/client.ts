@@ -1,4 +1,10 @@
-import type { PublicMemeDetailRead, PublicMemeLandingRead, PublicMemeSearchPageRead } from './types';
+import type {
+  CurrentSessionRead,
+  PublicMemeDetailRead,
+  PublicMemeLandingRead,
+  PublicMemeSearchPageRead,
+  TelegramLinkStartRead
+} from './types';
 
 export const DEFAULT_PAGE_SIZE = 12;
 
@@ -8,6 +14,7 @@ interface CatalogRequest {
   fetch: ApiFetch;
   baseUrl: string;
   cookieHeader?: string;
+  onResponse?: (response: Response) => void;
 }
 
 interface PageRequest extends CatalogRequest {
@@ -62,6 +69,18 @@ export async function fetchMemePage(request: PageRequest): Promise<PublicMemeSea
   return apiGet<PublicMemeSearchPageRead>('/api/v1/memes/browse', params, request);
 }
 
+export async function fetchCurrentSession(request: CatalogRequest): Promise<CurrentSessionRead> {
+  return apiJson<CurrentSessionRead>('/api/v1/auth/session', undefined, request);
+}
+
+export async function refreshCurrentSession(request: CatalogRequest): Promise<CurrentSessionRead> {
+  return apiJson<CurrentSessionRead>('/api/v1/auth/session/refresh', undefined, request, { method: 'POST' });
+}
+
+export async function startTelegramLink(request: CatalogRequest): Promise<TelegramLinkStartRead> {
+  return apiJson<TelegramLinkStartRead>('/api/v1/auth/link/telegram', undefined, request, { method: 'POST' });
+}
+
 export async function fetchMemeDetail(request: DetailRequest): Promise<PublicMemeDetailRead> {
   const encoded = encodeURIComponent(request.memeId);
   const path = isUuid(request.memeId) ? `/api/v1/memes/${encoded}` : `/api/v1/memes/slug/${encoded}`;
@@ -113,15 +132,27 @@ async function fetchLanding(path: string, request: LandingRequest): Promise<Publ
 }
 
 async function apiGet<T>(path: string, params: URLSearchParams, request: CatalogRequest): Promise<T> {
+  return apiJson<T>(path, params, request);
+}
+
+async function apiJson<T>(
+  path: string,
+  params: URLSearchParams | undefined,
+  request: CatalogRequest,
+  init: RequestInit = {}
+): Promise<T> {
   const url = new URL(path, request.baseUrl);
-  url.search = params.toString();
+  if (params) {
+    url.search = params.toString();
+  }
 
   const headers = new Headers({ accept: 'application/json' });
   if (request.cookieHeader) {
     headers.set('cookie', request.cookieHeader);
   }
 
-  const response = await request.fetch(url, { headers });
+  const response = await request.fetch(url, { ...init, headers });
+  request.onResponse?.(response);
   const payload = await readJson(response);
 
   if (!response.ok) {
