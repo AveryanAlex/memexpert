@@ -25,7 +25,6 @@ from aiogram.types import (
     InlineQueryResultUnion,
 )
 from sqlalchemy import select
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import selectinload
 
 from memexpert.core.config import Settings, get_settings
@@ -47,6 +46,7 @@ from memexpert.schemas.meme import (
     MemeSearchScoreRead,
 )
 from memexpert.services import CollectionService, CollectionServiceError, ProviderNotConfiguredError
+from memexpert.services.analytics import AnalyticsService, hash_external_identifier
 from memexpert.services.meme_search import MemeSearchService
 from memexpert.services.query_embedding import CachedTextQueryEmbeddingService
 
@@ -245,21 +245,18 @@ async def record_chosen_inline_result(
             meme_id = await session.scalar(select(MemeFile.meme_id).where(MemeFile.id == file_id))
 
         user_id = await _resolve_linked_user_id(session, telegram_user_id=chosen_result.from_user.id)
-        session.add(
-            AnalyticsEvent(
-                user_id=user_id,
-                event_type=AnalyticsEventType.MEME_SEND,
-                payload={
-                    "surface": "telegram_inline",
-                    "telegram_user_id": chosen_result.from_user.id,
-                    "query": chosen_result.query,
-                    "result_id": chosen_result.result_id,
-                    "meme_id": str(meme_id) if meme_id is not None else None,
-                    "meme_file_id": str(file_id) if file_id is not None else None,
-                },
-            )
+        await AnalyticsService(session).record_event(
+            AnalyticsEventType.MEME_SEND,
+            user_id=user_id,
+            payload={
+                "surface": "telegram_inline",
+                "telegram_user_hash": hash_external_identifier("telegram_user", chosen_result.from_user.id),
+                "query": chosen_result.query,
+                "result_id": chosen_result.result_id,
+                "meme_id": str(meme_id) if meme_id is not None else None,
+                "meme_file_id": str(file_id) if file_id is not None else None,
+            },
         )
-        await _commit_analytics(session)
 
 
 async def handle_inline_library_callback(
@@ -601,22 +598,19 @@ async def _record_inline_query_event(
     has_more: bool,
 ) -> None:
     user_id = await _resolve_linked_user_id(session, telegram_user_id=inline_query.from_user.id)
-    session.add(
-        AnalyticsEvent(
-            user_id=user_id,
-            event_type=AnalyticsEventType.INLINE_QUERY,
-            payload={
-                "surface": "telegram_inline",
-                "telegram_user_id": inline_query.from_user.id,
-                "query": inline_query.query.strip(),
-                "offset": offset,
-                "result_count": result_count,
-                "has_more": has_more,
-                "chat_type": inline_query.chat_type,
-            },
-        )
+    await AnalyticsService(session).record_event(
+        AnalyticsEventType.INLINE_QUERY,
+        user_id=user_id,
+        payload={
+            "surface": "telegram_inline",
+            "telegram_user_hash": hash_external_identifier("telegram_user", inline_query.from_user.id),
+            "query": inline_query.query.strip(),
+            "offset": offset,
+            "result_count": result_count,
+            "has_more": has_more,
+            "chat_type": inline_query.chat_type,
+        },
     )
-    await _commit_analytics(session)
 
 
 async def _resolve_linked_user_id(session: AsyncSession, *, telegram_user_id: int) -> uuid.UUID | None:
@@ -652,14 +646,6 @@ async def _resolve_active_linked_user_id(
     if status is not AccountStatus.ACTIVE:
         return None, True
     return user_id, False
-
-
-async def _commit_analytics(session: AsyncSession) -> None:
-    try:
-        await session.commit()
-    except SQLAlchemyError:
-        logger.exception("Telegram inline analytics write failed.")
-        await session.rollback()
 
 
 class _InlineCandidate:

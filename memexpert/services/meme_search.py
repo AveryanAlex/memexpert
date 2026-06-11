@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any, Protocol
 
 from sqlalchemy import Select, func, literal, or_, select
@@ -13,9 +14,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from memexpert.core.qdrant import QdrantUserSearchClientProtocol, QdrantUserSearchMatch
+from memexpert.models.base import utcnow
 from memexpert.models.collection import Collection, CollectionMember, CollectionMeme
-from memexpert.models.content import Meme, MemeFile
-from memexpert.models.enums import ContentKind, ContentLanguage
+from memexpert.models.content import Meme, MemeFile, MemePopularitySnapshot
+from memexpert.models.enums import AnalyticsEventType, ContentKind, ContentLanguage
+from memexpert.models.user import AnalyticsEvent
 from memexpert.schemas.meme import (
     MemeCardRead,
     MemeDetailRead,
@@ -29,6 +32,18 @@ TEXT_SCORE_KEYS = ("_rankingScore", "_score", "rankingScore", "score")
 SEMANTIC_WEIGHT = 0.50
 TEXT_WEIGHT = 0.35
 POPULARITY_WEIGHT = 0.15
+TRENDING_EVENT_WEIGHT = 0.55
+TRENDING_SNAPSHOT_WEIGHT = 0.25
+TRENDING_POPULARITY_WEIGHT = 0.15
+TRENDING_LIKE_WEIGHT = 0.05
+TRENDING_EVENT_WEIGHTS = {
+    AnalyticsEventType.MEME_VIEW: 1.0,
+    AnalyticsEventType.MEME_SEND: 3.0,
+    AnalyticsEventType.MEME_SAVE: 4.0,
+    AnalyticsEventType.SAVE: 4.0,
+    AnalyticsEventType.FAVORITE: 4.0,
+    AnalyticsEventType.MEME_LIKE: 5.0,
+}
 
 logger = logging.getLogger(__name__)
 
@@ -203,6 +218,118 @@ class MemeSearchService:
             limit=_clamp_limit(limit),
             offset=max(0, offset),
         )
+
+    async def trending_memes(
+        self,
+        *,
+        viewer_user_id: uuid.UUID | None = None,
+        filters: MemeSearchFilters | None = None,
+        limit: int = 20,
+        offset: int = 0,
+        lookback_hours: int = 168,
+    ) -> MemeSearchPageRead:
+        """Return a deterministic popular/trending catalog page.
+
+        Scoring is intentionally simple and explainable: 55% normalized recent
+        platform event weight (views, sends, saves, likes), 25% latest
+        ``MemePopularitySnapshot.popularity_score`` in the lookback window, 15%
+        current ``Meme.popularity_score``, and 5% current ``Meme.like_count``.
+        Ties are broken by the raw components, creation time, and UUID so the
+        same data always returns the same order. Private identifiers in event
+        payloads are never returned; only public meme DTOs leave the service.
+        """
+
+        resolved_filters = filters or MemeSearchFilters()
+        resolved_limit = _clamp_limit(limit)
+        resolved_offset = max(0, offset)
+        since = utcnow() - timedelta(hours=max(1, lookback_hours))
+
+        base_stmt = _apply_filters(_visible_meme_stmt(viewer_user_id), resolved_filters)
+        result = await self._session.execute(base_stmt)
+        memes = list(result.scalars().all())
+        if not memes:
+            return MemeSearchPageRead(items=[], limit=resolved_limit, offset=resolved_offset, total=0, has_more=False)
+
+        meme_ids = {meme.id for meme in memes}
+        recent_scores = await self._recent_event_scores(meme_ids, since=since)
+        snapshot_scores = await self._latest_snapshot_scores(meme_ids, since=since)
+        max_recent = max(recent_scores.values(), default=0.0)
+        max_snapshot = max(snapshot_scores.values(), default=0.0)
+        max_popularity = max((meme.popularity_score for meme in memes), default=0.0)
+        max_likes = max((meme.like_count for meme in memes), default=0)
+
+        ranked: list[tuple[Meme, _CandidateScore, float]] = []
+        for meme in memes:
+            recent = _normalize_value(recent_scores.get(meme.id, 0.0), max_recent)
+            snapshot = _normalize_value(snapshot_scores.get(meme.id, 0.0), max_snapshot)
+            popularity = _normalize_value(meme.popularity_score, max_popularity)
+            likes = _normalize_value(float(meme.like_count), float(max_likes))
+            total_score = (
+                TRENDING_EVENT_WEIGHT * recent
+                + TRENDING_SNAPSHOT_WEIGHT * snapshot
+                + TRENDING_POPULARITY_WEIGHT * popularity
+                + TRENDING_LIKE_WEIGHT * likes
+            )
+            ranked.append(
+                (
+                    meme,
+                    _CandidateScore(semantic=recent, text=snapshot, popularity=popularity, total=total_score),
+                    likes,
+                )
+            )
+
+        ranked.sort(
+            key=lambda item: (
+                item[1].total,
+                item[1].semantic,
+                item[1].text,
+                item[1].popularity,
+                item[2],
+                item[0].created_at,
+                str(item[0].id),
+            ),
+            reverse=True,
+        )
+        page = ranked[resolved_offset : resolved_offset + resolved_limit]
+        return MemeSearchPageRead(
+            items=[
+                MemeSearchResultRead(meme=_to_card_read(meme), score=_to_score_read(score))
+                for meme, score, _ in page
+            ],
+            limit=resolved_limit,
+            offset=resolved_offset,
+            total=len(ranked),
+            has_more=resolved_offset + resolved_limit < len(ranked),
+        )
+
+    async def _recent_event_scores(self, meme_ids: set[uuid.UUID], *, since: object) -> dict[uuid.UUID, float]:
+        result = await self._session.execute(
+            select(AnalyticsEvent).where(
+                AnalyticsEvent.event_type.in_(tuple(TRENDING_EVENT_WEIGHTS)),
+                AnalyticsEvent.occurred_at >= since,
+            )
+        )
+        scores: dict[uuid.UUID, float] = {}
+        for event in result.scalars():
+            meme_id = _parse_uuid(event.payload.get("meme_id"))
+            if meme_id is None or meme_id not in meme_ids:
+                continue
+            scores[meme_id] = scores.get(meme_id, 0.0) + TRENDING_EVENT_WEIGHTS[event.event_type]
+        return scores
+
+    async def _latest_snapshot_scores(self, meme_ids: set[uuid.UUID], *, since: object) -> dict[uuid.UUID, float]:
+        result = await self._session.execute(
+            select(MemePopularitySnapshot)
+            .where(
+                MemePopularitySnapshot.meme_id.in_(tuple(meme_ids)),
+                MemePopularitySnapshot.captured_at >= since,
+            )
+            .order_by(MemePopularitySnapshot.meme_id, MemePopularitySnapshot.captured_at.desc())
+        )
+        scores: dict[uuid.UUID, float] = {}
+        for snapshot in result.scalars():
+            scores.setdefault(snapshot.meme_id, snapshot.popularity_score)
+        return scores
 
     async def _resolve_query_vector(
         self,
