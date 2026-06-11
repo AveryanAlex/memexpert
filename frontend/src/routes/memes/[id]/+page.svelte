@@ -18,6 +18,9 @@
       {#if data.meme.ocr_text}
         <p class="muted">Detected text: {data.meme.ocr_text}</p>
       {/if}
+      {#if data.meme.seo_body_text}
+        <p>{data.meme.seo_body_text}</p>
+      {/if}
       <div class="meta">
         <span>{data.meme.files.length || (data.meme.primary_file ? 1 : 0)} files</span>
         <span>score {data.meme.popularity_score.toFixed(1)}</span>
@@ -28,7 +31,7 @@
       {#if data.meme.tags.length > 0}
         <div class="tags" aria-label="Tags">
           {#each data.meme.tags as tag}
-            <span class="tag">#{tag}</span>
+            <span class="tag"><a href={`/tags/${tag}`}>#{tag}</a></span>
           {/each}
         </div>
       {/if}

@@ -22,6 +22,10 @@
     const query = params.toString();
     return query ? `/?${query}` : '/';
   }
+
+  function memeHref(meme: { id: string; seo_page_slug: string | null }): string {
+    return `/memes/${meme.seo_page_slug || meme.id}`;
+  }
 </script>
 
 <section class="hero" aria-labelledby="search-title">
@@ -62,7 +66,7 @@
   <section class="grid" aria-label="Meme results">
     {#each data.page.items as item (item.meme.id)}
       {@const meme = item.meme}
-      <a class="card" href={`/memes/${meme.id}`}>
+      <a class="card" href={memeHref(meme)}>
         <div class="media-panel">{meme.media_type}</div>
         <div class="card-body">
           <p class="caption">{meme.caption || meme.tags[0] || 'Untitled meme'}</p>

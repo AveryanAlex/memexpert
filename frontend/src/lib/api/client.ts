@@ -1,4 +1,4 @@
-import type { PublicMemeDetailRead, PublicMemeSearchPageRead } from './types';
+import type { PublicMemeDetailRead, PublicMemeLandingRead, PublicMemeSearchPageRead } from './types';
 
 export const DEFAULT_PAGE_SIZE = 12;
 
@@ -18,6 +18,12 @@ interface PageRequest extends CatalogRequest {
 
 interface DetailRequest extends CatalogRequest {
   memeId: string;
+}
+
+interface LandingRequest extends CatalogRequest {
+  slug: string;
+  limit: number;
+  offset: number;
 }
 
 export class ApiError extends Error {
@@ -46,9 +52,27 @@ export async function fetchMemePage(request: PageRequest): Promise<PublicMemeSea
 }
 
 export async function fetchMemeDetail(request: DetailRequest): Promise<PublicMemeDetailRead> {
+  const encoded = encodeURIComponent(request.memeId);
+  const path = isUuid(request.memeId) ? `/api/v1/memes/${encoded}` : `/api/v1/memes/slug/${encoded}`;
   return apiGet<PublicMemeDetailRead>(
-    `/api/v1/memes/${encodeURIComponent(request.memeId)}`,
+    path,
     new URLSearchParams({ include_nsfw: 'false' }),
+    request
+  );
+}
+
+export async function fetchTagLanding(request: LandingRequest): Promise<PublicMemeLandingRead> {
+  return fetchLanding(`/api/v1/memes/tags/${encodeURIComponent(request.slug)}`, request);
+}
+
+export async function fetchTemplateLanding(request: LandingRequest): Promise<PublicMemeLandingRead> {
+  return fetchLanding(`/api/v1/memes/templates/${encodeURIComponent(request.slug)}`, request);
+}
+
+async function fetchLanding(path: string, request: LandingRequest): Promise<PublicMemeLandingRead> {
+  return apiGet<PublicMemeLandingRead>(
+    path,
+    new URLSearchParams({ limit: String(request.limit), offset: String(request.offset) }),
     request
   );
 }
@@ -102,4 +126,8 @@ export function emptyMemePage(limit: number, offset: number): PublicMemeSearchPa
     total: 0,
     has_more: false
   };
+}
+
+function isUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
 }

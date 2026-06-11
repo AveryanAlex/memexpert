@@ -181,6 +181,10 @@ input {
   padding: 6px 9px;
 }
 
+.tag a {
+  text-decoration: none;
+}
+
 .pagination,
 .detail-actions {
   display: flex;

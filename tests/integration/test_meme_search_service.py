@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -15,7 +16,7 @@ from memexpert.api.dependencies.auth import get_optional_current_user
 from memexpert.api.dependencies.meme import get_meme_search_service
 from memexpert.core.qdrant import QdrantUserSearchMatch
 from memexpert.models.collection import Collection, CollectionMember, CollectionMeme
-from memexpert.models.content import Meme, MemeFile
+from memexpert.models.content import Meme, MemeFile, MemeSeoPage, MemeTemplate
 from memexpert.models.enums import (
     AccountType,
     CollectionKind,
@@ -27,6 +28,7 @@ from memexpert.models.enums import (
 from memexpert.models.user import User
 from memexpert.schemas.user import UserRead
 from memexpert.services.meme_search import MemeNotFoundError, MemeSearchFilters, MemeSearchService
+from memexpert.services.meme_seo import MemeSeoGenerationService, MemeSeoProviderResult
 
 pytestmark = pytest.mark.asyncio
 
@@ -84,6 +86,27 @@ class FailingQueryEmbeddingClient:
         raise RuntimeError("provider-secret-embedding-failure")
 
 
+class FakeSeoProvider:
+    model_id = "fake-seo-model"
+    prompt_version = "seo-test-v1"
+
+    def __init__(self, payloads: list[MemeSeoProviderResult]) -> None:
+        self._payloads = payloads
+        self.calls: list[uuid.UUID] = []
+
+    async def generate(self, meme: Meme) -> MemeSeoProviderResult:
+        self.calls.append(meme.id)
+        return self._payloads.pop(0)
+
+
+class FailingSeoProvider:
+    model_id = "fake-failing-model"
+    prompt_version = "seo-test-v1"
+
+    async def generate(self, meme: Meme) -> MemeSeoProviderResult:
+        raise RuntimeError("provider-secret-seo-failure")
+
+
 async def _create_meme(
     session: AsyncSession,
     *,
@@ -94,6 +117,7 @@ async def _create_meme(
     popularity_score: float = 0.0,
     is_public: bool = True,
     author_user_id: uuid.UUID | None = None,
+    ocr_text: str | None = None,
 ) -> Meme:
     meme = Meme(
         media_type=media_type,
@@ -103,6 +127,7 @@ async def _create_meme(
         popularity_score=popularity_score,
         is_public=is_public,
         author_user_id=author_user_id,
+        ocr_text=ocr_text,
     )
     session.add(meme)
     await session.flush()
@@ -277,6 +302,10 @@ async def test_public_openapi_registers_catalog_routes_without_internal_surface(
 
     assert "/api/v1/memes/search" in paths
     assert "/api/v1/memes/browse" in paths
+    assert "/api/v1/memes/slug/{slug}" in paths
+    assert "/api/v1/memes/tags/{tag_slug}" in paths
+    assert "/api/v1/memes/templates/{template_slug}" in paths
+    assert "/api/v1/memes/{meme_id}/canonical" in paths
     assert "/api/v1/memes/{meme_id}" in paths
     search_parameters = {parameter["name"] for parameter in paths["/api/v1/memes/search"]["get"]["parameters"]}
     assert "query" in search_parameters
@@ -287,6 +316,212 @@ async def test_public_openapi_registers_catalog_routes_without_internal_surface(
     assert "s3_web_video_key" not in components["PublicMemeFileRead"]["properties"]
     assert "author_user_id" not in components["PublicMemeDetailRead"]["properties"]
     assert "is_public" not in components["PublicMemeDetailRead"]["properties"]
+
+
+async def test_seo_generation_stores_prompt_evidence_unique_slugs_tags_and_template(
+    migrated_db_session: AsyncSession,
+) -> None:
+    first = await _create_meme(migrated_db_session, tags=["old"], ocr_text="frog wizard text")
+    second = await _create_meme(migrated_db_session, tags=["old"], ocr_text="frog wizard text")
+    provider = FakeSeoProvider(
+        [
+            MemeSeoProviderResult(
+                slug="Frog Wizard",
+                page_title="Frog Wizard Reaction",
+                meta_description="A frog wizard reaction meme.",
+                alt_text="Frog wizard reaction image",
+                caption="Frog wizard",
+                body_text="A wizard frog casts a spell.",
+                tags=("frog", "wizard", "frog"),
+                template_slug="wizard-frog",
+                template_name="Wizard Frog",
+                template_description="Frog wizard image macro template.",
+            ),
+            MemeSeoProviderResult(
+                slug="frog wizard",
+                page_title="Another Frog Wizard",
+                meta_description="Another frog wizard meme.",
+                alt_text="Another frog wizard image",
+                tags=("frog", "magic"),
+                template_slug="wizard-frog",
+                template_name="Wizard Frog",
+            ),
+        ],
+    )
+    service = MemeSeoGenerationService(migrated_db_session, provider=provider)
+
+    results = await service.generate_for_meme_ids((first.id, second.id), commit=False)
+
+    assert [result.status for result in results] == ["generated", "generated"]
+    assert [result.slug for result in results] == ["frog-wizard", "frog-wizard-2"]
+    assert [result.model_id for result in results] == ["fake-seo-model", "fake-seo-model"]
+    assert [result.prompt_version for result in results] == ["seo-test-v1", "seo-test-v1"]
+    assert provider.calls == [first.id, second.id]
+
+    first_page = await migrated_db_session.get(MemeSeoPage, first.id)
+    second_page = await migrated_db_session.get(MemeSeoPage, second.id)
+    assert first_page is not None
+    assert second_page is not None
+    assert first_page.slug == "frog-wizard"
+    assert second_page.slug == "frog-wizard-2"
+    assert first_page.model_id == "fake-seo-model"
+    assert first_page.prompt_version == "seo-test-v1"
+    assert first_page.tags == ["frog", "wizard"]
+    assert first.tags == ["frog", "wizard"]
+    assert first.template_id is not None
+    assert second.template_id == first.template_id
+
+
+async def test_seo_generation_preserves_manual_pages_without_force(
+    migrated_db_session: AsyncSession,
+) -> None:
+    meme = await _create_meme(migrated_db_session, tags=["original"])
+    migrated_db_session.add(
+        MemeSeoPage(
+            meme_id=meme.id,
+            slug="manual-slug",
+            page_title="Manual title",
+            meta_description="Manual description",
+            alt_text="Manual alt",
+            tags=["manual"],
+            model_id="admin",
+            prompt_version="manual-v1",
+            generated_at=datetime.now(UTC),
+            edited_at=datetime.now(UTC),
+        ),
+    )
+    await migrated_db_session.flush()
+    provider = FakeSeoProvider(
+        [
+            MemeSeoProviderResult(
+                slug="provider-slug",
+                page_title="Provider title",
+                meta_description="Provider description",
+                alt_text="Provider alt",
+                tags=("provider",),
+            ),
+        ],
+    )
+    service = MemeSeoGenerationService(migrated_db_session, provider=provider)
+
+    skipped = await service.generate_for_meme_id(meme.id, commit=False)
+    forced = await service.generate_for_meme_id(meme.id, force=True, commit=False)
+
+    assert skipped.status == "skipped"
+    assert skipped.reason == "manual_edit_present"
+    assert provider.calls == [meme.id]
+    assert forced.status == "generated"
+    page = await migrated_db_session.get(MemeSeoPage, meme.id)
+    assert page is not None
+    assert page.slug == "provider-slug"
+    assert page.page_title == "Provider title"
+
+
+async def test_seo_provider_failure_returns_failed_without_raw_error_or_page(
+    migrated_db_session: AsyncSession,
+) -> None:
+    meme = await _create_meme(migrated_db_session)
+    service = MemeSeoGenerationService(migrated_db_session, provider=FailingSeoProvider())
+
+    result = await service.generate_for_meme_id(meme.id, commit=False)
+
+    assert result.status == "failed"
+    assert result.reason == "provider_error"
+    assert "provider-secret" not in repr(result)
+    assert await migrated_db_session.get(MemeSeoPage, meme.id) is None
+
+
+async def test_slug_route_uuid_route_and_id_to_slug_metadata_return_seo_fields(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    meme = await _create_meme(migrated_db_session, tags=["frog"])
+    service = MemeSeoGenerationService(
+        migrated_db_session,
+        provider=FakeSeoProvider(
+            [
+                MemeSeoProviderResult(
+                    slug="frog wizard",
+                    page_title="Frog Wizard Reaction",
+                    meta_description="A frog wizard reaction meme.",
+                    alt_text="Frog wizard reaction image",
+                    body_text="Generated body text.",
+                    tags=("frog", "wizard"),
+                ),
+            ],
+        ),
+    )
+    await service.generate_for_meme_id(meme.id, commit=False)
+    _install_meme_route_overrides(app, migrated_db_session)
+
+    try:
+        by_id = await client.get(f"/api/v1/memes/{meme.id}")
+        canonical = await client.get(f"/api/v1/memes/{meme.id}/canonical")
+        by_slug = await client.get("/api/v1/memes/slug/frog-wizard")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert by_id.status_code == 200
+    by_id_payload = by_id.json()
+    assert by_id_payload["id"] == str(meme.id)
+    assert by_id_payload["seo_page_slug"] == "frog-wizard"
+    assert by_id_payload["seo_title"] == "Frog Wizard Reaction"
+    assert by_id_payload["seo_description"] == "A frog wizard reaction meme."
+    assert by_id_payload["seo_alt_text"] == "Frog wizard reaction image"
+    assert by_id_payload["seo_body_text"] == "Generated body text."
+    assert by_id_payload["seo_model_id"] == "fake-seo-model"
+    assert by_id_payload["seo_prompt_version"] == "seo-test-v1"
+    assert by_id_payload["seo_generated_at"] is not None
+    assert canonical.status_code == 200
+    assert canonical.json() == {
+        "meme_id": str(meme.id),
+        "slug": "frog-wizard",
+        "path": "/memes/frog-wizard",
+        "should_redirect": True,
+    }
+    assert by_slug.status_code == 200
+    assert by_slug.json()["id"] == str(meme.id)
+
+
+async def test_tag_and_template_landing_routes_return_public_pages(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    template = MemeTemplate(slug="drake-template", name="Drake Template", description="Drake choices memes")
+    migrated_db_session.add(template)
+    await migrated_db_session.flush()
+    first = await _create_meme(migrated_db_session, tags=["reaction"], popularity_score=10.0)
+    second = await _create_meme(migrated_db_session, tags=["reaction"], popularity_score=5.0)
+    unrelated = await _create_meme(migrated_db_session, tags=["cat"], popularity_score=100.0)
+    first.template_id = template.id
+    second.template_id = template.id
+    await migrated_db_session.flush()
+    _install_meme_route_overrides(app, migrated_db_session)
+
+    try:
+        tag_response = await client.get("/api/v1/memes/tags/reaction", params={"limit": 10})
+        template_response = await client.get("/api/v1/memes/templates/drake-template", params={"limit": 10})
+        missing_template_response = await client.get("/api/v1/memes/templates/missing-template")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert tag_response.status_code == 200
+    tag_payload = tag_response.json()
+    assert tag_payload["kind"] == "tag"
+    assert tag_payload["slug"] == "reaction"
+    assert tag_payload["page"]["total"] == 2
+    assert [item["meme"]["id"] for item in tag_payload["page"]["items"]] == [str(first.id), str(second.id)]
+    assert str(unrelated.id) not in tag_response.text
+
+    assert template_response.status_code == 200
+    template_payload = template_response.json()
+    assert template_payload["kind"] == "template"
+    assert template_payload["title"] == "Drake Template memes"
+    assert template_payload["page"]["total"] == 2
+    assert [item["meme"]["id"] for item in template_payload["page"]["items"]] == [str(first.id), str(second.id)]
+    assert missing_template_response.status_code == 404
 
 
 async def test_search_filters_and_paginates_after_visibility(migrated_db_session: AsyncSession) -> None:

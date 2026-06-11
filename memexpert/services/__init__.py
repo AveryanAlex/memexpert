@@ -69,6 +69,13 @@ from memexpert.services.errors import (
     UserStateMismatchError,
 )
 from memexpert.services.meme_search import MemeNotFoundError, MemeSearchFilters, MemeSearchService
+from memexpert.services.meme_seo import (
+    MemeSeoGenerationResult,
+    MemeSeoGenerationService,
+    MemeSeoProviderProtocol,
+    MemeSeoProviderResult,
+    StaticMemeSeoProvider,
+)
 from memexpert.services.provider_auth_service import ProviderAuthService
 from memexpert.services.user_service import DEFAULT_GUEST_LIFETIME, UserService
 
@@ -116,6 +123,11 @@ __all__ = [
     "MemeNotFoundError",
     "MemeSearchFilters",
     "MemeSearchService",
+    "MemeSeoGenerationResult",
+    "MemeSeoGenerationService",
+    "MemeSeoProviderProtocol",
+    "MemeSeoProviderResult",
+    "StaticMemeSeoProvider",
     "MissingTokenError",
     "PipelineIngestError",
     "PipelineItemNotFoundError",
