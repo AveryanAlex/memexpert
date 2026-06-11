@@ -3,22 +3,39 @@
 from __future__ import annotations
 
 import hashlib
+import uuid
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import pytest
 from aiogram.client.session.base import BaseSession
 from aiogram.methods import AnswerInlineQuery, GetMe, TelegramMethod
-from aiogram.types import InlineQueryResultCachedGif, InlineQueryResultCachedMpeg4Gif, InlineQueryResultCachedPhoto
+from aiogram.types import (
+    InlineQueryResultCachedGif,
+    InlineQueryResultCachedMpeg4Gif,
+    InlineQueryResultCachedPhoto,
+    InlineQueryResultPhoto,
+)
 from aiogram.types import User as TelegramUser
 from pydantic import AnyHttpUrl, SecretStr, TypeAdapter
 from sqlalchemy import func, select
 
+from memexpert.bot import inline as inline_module
+from memexpert.bot.inline import S3PresignedInlineMediaUrlProvider
 from memexpert.bot.main import build_bot, build_dispatcher
 from memexpert.core.config import Settings
+from memexpert.models.collection import PinnedMeme
 from memexpert.models.content import Meme, MemeFile, TelegramFileIdCache
-from memexpert.models.enums import AnalyticsEventType, ContentKind, ContentLanguage, TelegramMediaFormat
-from memexpert.models.user import AnalyticsEvent, InlineUsageEvent
+from memexpert.models.enums import (
+    AccountStatus,
+    AccountType,
+    AnalyticsEventType,
+    ContentKind,
+    ContentLanguage,
+    TelegramMediaFormat,
+)
+from memexpert.models.user import AnalyticsEvent, InlineUsageEvent, User
 from memexpert.schemas.meme import (
     MemeCardRead,
     MemeFileRead,
@@ -97,6 +114,26 @@ class FakeMemeSearchService:
     async def search_memes(self, query: str, *, limit: int = 20, offset: int = 0) -> MemeSearchPageRead:
         self.calls.append({"query": query, "limit": limit, "offset": offset})
         return self.page
+
+
+class FakeInlineMediaUrlProvider:
+    def __init__(self, urls_by_key: dict[str, str] | None = None) -> None:
+        self.urls_by_key = urls_by_key or {}
+        self.calls: list[MemeFileRead] = []
+
+    async def get_media_url(self, file: MemeFileRead) -> str | None:
+        self.calls.append(file)
+        return self.urls_by_key.get(file.s3_original_key)
+
+
+class FakePresignClient:
+    def __init__(self, url: str) -> None:
+        self.url = url
+        self.calls: list[dict[str, Any]] = []
+
+    def generate_presigned_url(self, operation_name: str, **kwargs: Any) -> str:
+        self.calls.append({"operation_name": operation_name, **kwargs})
+        return self.url
 
 
 def build_bot_settings(database_url: str) -> Settings:
@@ -297,6 +334,7 @@ async def test_inline_plain_text_query_calls_shared_search_service_and_records_q
 
     assert fake_service.calls == [{"query": "grumpy cat", "limit": 20, "offset": 0}]
     answer = last_inline_answer(telegram_session)
+    assert answer.is_personal is False
     assert answer.next_offset == ""
     assert len(answer.results) == 1
     result = answer.results[0]
@@ -471,12 +509,196 @@ async def test_inline_uses_cached_mpeg4_gif_for_gif_media_stored_as_mp4(
 
 
 @pytest.mark.asyncio
-async def test_inline_empty_query_uses_shared_search_fallback_path(
+async def test_inline_uses_injected_media_url_provider_for_private_uncached_media(
     migrated_db_session: AsyncSession,
     postgres_async_url: str,
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    _ = migrated_db_session
+    private_meme, private_file = await create_meme_file(
+        migrated_db_session,
+        media_type=ContentKind.IMAGE,
+        mime_type="image/jpeg",
+        s3_original_key="private/original.jpg",
+    )
+    await migrated_db_session.commit()
+
+    fake_service = FakeMemeSearchService(search_page_for([(private_meme, private_file)]))
+    media_provider = FakeInlineMediaUrlProvider({"private/original.jpg": "https://storage.example.test/private/original.jpg?sig=1"})
+    telegram_session = RecordingTelegramSession()
+    bot = build_bot(build_bot_settings(postgres_async_url), session=telegram_session)
+    dispatcher = build_dispatcher(
+        settings=build_bot_settings(postgres_async_url),
+        session_factory=postgres_session_factory,
+        meme_search_service_factory=lambda session: fake_service,
+        inline_media_url_provider=media_provider,
+    )
+
+    try:
+        await dispatch_inline_query(dispatcher=dispatcher, bot=bot, query="private meme")
+    finally:
+        await bot.session.close()
+
+    assert [file.id for file in media_provider.calls] == [private_file.id]
+    answer = last_inline_answer(telegram_session)
+    assert len(answer.results) == 1
+    result = answer.results[0]
+    assert isinstance(result, InlineQueryResultPhoto)
+    assert str(result.photo_url) == "https://storage.example.test/private/original.jpg?sig=1"
+
+
+@pytest.mark.asyncio
+async def test_inline_keeps_public_https_media_sendable_without_media_url_provider_call(
+    migrated_db_session: AsyncSession,
+    postgres_async_url: str,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    public_meme, public_file = await create_meme_file(
+        migrated_db_session,
+        media_type=ContentKind.IMAGE,
+        mime_type="image/jpeg",
+        s3_original_key="https://cdn.example.test/public/original.jpg",
+    )
+    await migrated_db_session.commit()
+
+    fake_service = FakeMemeSearchService(search_page_for([(public_meme, public_file)]))
+    media_provider = FakeInlineMediaUrlProvider()
+    telegram_session = RecordingTelegramSession()
+    bot = build_bot(build_bot_settings(postgres_async_url), session=telegram_session)
+    dispatcher = build_dispatcher(
+        settings=build_bot_settings(postgres_async_url),
+        session_factory=postgres_session_factory,
+        meme_search_service_factory=lambda session: fake_service,
+        inline_media_url_provider=media_provider,
+    )
+
+    try:
+        await dispatch_inline_query(dispatcher=dispatcher, bot=bot, query="public meme")
+    finally:
+        await bot.session.close()
+
+    assert media_provider.calls == []
+    answer = last_inline_answer(telegram_session)
+    assert len(answer.results) == 1
+    result = answer.results[0]
+    assert isinstance(result, InlineQueryResultPhoto)
+    assert str(result.photo_url) == "https://cdn.example.test/public/original.jpg"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("presigned_url", "expected_url"),
+    [
+        ("https://storage.example.test/private/original.jpg?sig=1", "https://storage.example.test/private/original.jpg?sig=1"),
+        ("http://storage.example.test/private/original.jpg?sig=1", None),
+    ],
+)
+async def test_s3_presigned_inline_media_url_provider_returns_only_https_presigned_urls(
+    postgres_async_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+    presigned_url: str,
+    expected_url: str | None,
+) -> None:
+    fake_client = FakePresignClient(presigned_url)
+    monkeypatch.setattr(inline_module, "build_s3_client", lambda settings: fake_client)
+    monkeypatch.setattr(
+        inline_module,
+        "get_pipeline_storage_settings",
+        lambda settings: SimpleNamespace(bucket="inline-test-bucket"),
+    )
+    file = MemeFileRead(
+        id=uuid.uuid4(),
+        mime_type="image/jpeg",
+        width=640,
+        height=480,
+        file_size_bytes=None,
+        s3_original_key="private/original.jpg",
+        s3_web_video_key=None,
+        blur_hash=None,
+        quality_score=0.9,
+    )
+
+    provider = S3PresignedInlineMediaUrlProvider(build_bot_settings(postgres_async_url))
+
+    assert await provider.get_media_url(file) == expected_url
+    assert fake_client.calls == [
+        {
+            "operation_name": "get_object",
+            "Params": {"Bucket": "inline-test-bucket", "Key": "private/original.jpg"},
+            "ExpiresIn": 300,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_inline_skips_private_uncached_media_when_media_url_provider_is_unavailable(
+    migrated_db_session: AsyncSession,
+    postgres_async_url: str,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    private_meme, private_file = await create_meme_file(
+        migrated_db_session,
+        media_type=ContentKind.IMAGE,
+        mime_type="image/jpeg",
+        s3_original_key="private/missing-url.jpg",
+    )
+    await migrated_db_session.commit()
+
+    fake_service = FakeMemeSearchService(search_page_for([(private_meme, private_file)], total=2, has_more=True))
+    media_provider = FakeInlineMediaUrlProvider()
+    telegram_session = RecordingTelegramSession()
+    bot = build_bot(build_bot_settings(postgres_async_url), session=telegram_session)
+    dispatcher = build_dispatcher(
+        settings=build_bot_settings(postgres_async_url),
+        session_factory=postgres_session_factory,
+        meme_search_service_factory=lambda session: fake_service,
+        inline_media_url_provider=media_provider,
+    )
+
+    try:
+        await dispatch_inline_query(dispatcher=dispatcher, bot=bot, query="private meme")
+    finally:
+        await bot.session.close()
+
+    assert [file.id for file in media_provider.calls] == [private_file.id]
+    answer = last_inline_answer(telegram_session)
+    assert answer.results == []
+    assert answer.next_offset == ""
+
+
+@pytest.mark.asyncio
+async def test_inline_empty_query_for_linked_user_returns_pins_and_is_personal(
+    migrated_db_session: AsyncSession,
+    postgres_async_url: str,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    user = User(account_type=AccountType.FULL, telegram_id=TELEGRAM_ID)
+    migrated_db_session.add(user)
+    pinned_meme, pinned_file = await create_meme_file(
+        migrated_db_session,
+        media_type=ContentKind.IMAGE,
+        mime_type="image/jpeg",
+    )
+    popular_meme, popular_file = await create_meme_file(
+        migrated_db_session,
+        media_type=ContentKind.IMAGE,
+        mime_type="image/jpeg",
+    )
+    popular_meme.popularity_score = 900.0
+    migrated_db_session.add(PinnedMeme(user=user, meme=pinned_meme, position=1))
+    await add_file_id_cache(
+        migrated_db_session,
+        file=pinned_file,
+        media_format=TelegramMediaFormat.PHOTO,
+        telegram_file_id="cached-pinned-photo-id",
+    )
+    await add_file_id_cache(
+        migrated_db_session,
+        file=popular_file,
+        media_format=TelegramMediaFormat.PHOTO,
+        telegram_file_id="cached-popular-photo-id",
+    )
+    await migrated_db_session.commit()
+
     fake_service = FakeMemeSearchService(MemeSearchPageRead(items=[], limit=20, offset=0, total=0, has_more=False))
     telegram_session = RecordingTelegramSession()
     bot = build_bot(build_bot_settings(postgres_async_url), session=telegram_session)
@@ -491,8 +713,282 @@ async def test_inline_empty_query_uses_shared_search_fallback_path(
     finally:
         await bot.session.close()
 
-    assert fake_service.calls == [{"query": "", "limit": 20, "offset": 0}]
-    assert last_inline_answer(telegram_session).results == []
+    assert fake_service.calls == []
+    answer = last_inline_answer(telegram_session)
+    assert answer.is_personal is True
+    assert len(answer.results) == 1
+    result = answer.results[0]
+    assert isinstance(result, InlineQueryResultCachedPhoto)
+    assert result.photo_file_id == "cached-pinned-photo-id"
+
+
+@pytest.mark.asyncio
+async def test_inline_empty_query_for_linked_user_falls_back_to_recent_sends_when_no_pins(
+    migrated_db_session: AsyncSession,
+    postgres_async_url: str,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    user = User(account_type=AccountType.FULL, telegram_id=TELEGRAM_ID)
+    migrated_db_session.add(user)
+    recent_meme, recent_file = await create_meme_file(
+        migrated_db_session,
+        media_type=ContentKind.IMAGE,
+        mime_type="image/jpeg",
+    )
+    popular_meme, popular_file = await create_meme_file(
+        migrated_db_session,
+        media_type=ContentKind.IMAGE,
+        mime_type="image/jpeg",
+    )
+    popular_meme.popularity_score = 900.0
+    migrated_db_session.add(
+        AnalyticsEvent(
+            user=user,
+            event_type=AnalyticsEventType.MEME_SEND,
+            payload={"meme_id": str(recent_meme.id), "meme_file_id": str(recent_file.id)},
+        )
+    )
+    await add_file_id_cache(
+        migrated_db_session,
+        file=recent_file,
+        media_format=TelegramMediaFormat.PHOTO,
+        telegram_file_id="cached-recent-photo-id",
+    )
+    await add_file_id_cache(
+        migrated_db_session,
+        file=popular_file,
+        media_format=TelegramMediaFormat.PHOTO,
+        telegram_file_id="cached-popular-photo-id",
+    )
+    await migrated_db_session.commit()
+
+    fake_service = FakeMemeSearchService(MemeSearchPageRead(items=[], limit=20, offset=0, total=0, has_more=False))
+    telegram_session = RecordingTelegramSession()
+    bot = build_bot(build_bot_settings(postgres_async_url), session=telegram_session)
+    dispatcher = build_dispatcher(
+        settings=build_bot_settings(postgres_async_url),
+        session_factory=postgres_session_factory,
+        meme_search_service_factory=lambda session: fake_service,
+    )
+
+    try:
+        await dispatch_inline_query(dispatcher=dispatcher, bot=bot, query="")
+    finally:
+        await bot.session.close()
+
+    assert fake_service.calls == []
+    answer = last_inline_answer(telegram_session)
+    assert answer.is_personal is True
+    assert len(answer.results) == 1
+    result = answer.results[0]
+    assert isinstance(result, InlineQueryResultCachedPhoto)
+    assert result.photo_file_id == "cached-recent-photo-id"
+
+
+@pytest.mark.asyncio
+async def test_inline_empty_query_for_linked_user_falls_back_to_popular_when_no_pins_or_recents(
+    migrated_db_session: AsyncSession,
+    postgres_async_url: str,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    user = User(account_type=AccountType.FULL, status=AccountStatus.ACTIVE, telegram_id=TELEGRAM_ID)
+    migrated_db_session.add(user)
+    popular_meme, popular_file = await create_meme_file(
+        migrated_db_session,
+        media_type=ContentKind.IMAGE,
+        mime_type="image/jpeg",
+    )
+    popular_meme.popularity_score = 900.0
+    await add_file_id_cache(
+        migrated_db_session,
+        file=popular_file,
+        media_format=TelegramMediaFormat.PHOTO,
+        telegram_file_id="cached-linked-popular-photo-id",
+    )
+    await migrated_db_session.commit()
+
+    fake_service = FakeMemeSearchService(MemeSearchPageRead(items=[], limit=20, offset=0, total=0, has_more=False))
+    telegram_session = RecordingTelegramSession()
+    bot = build_bot(build_bot_settings(postgres_async_url), session=telegram_session)
+    dispatcher = build_dispatcher(
+        settings=build_bot_settings(postgres_async_url),
+        session_factory=postgres_session_factory,
+        meme_search_service_factory=lambda session: fake_service,
+    )
+
+    try:
+        await dispatch_inline_query(dispatcher=dispatcher, bot=bot, query="")
+    finally:
+        await bot.session.close()
+
+    assert fake_service.calls == []
+    answer = last_inline_answer(telegram_session)
+    assert answer.is_personal is True
+    assert len(answer.results) == 1
+    result = answer.results[0]
+    assert isinstance(result, InlineQueryResultCachedPhoto)
+    assert result.photo_file_id == "cached-linked-popular-photo-id"
+
+
+@pytest.mark.asyncio
+async def test_inline_empty_query_skips_unsendable_pin_and_uses_later_popular_fallback(
+    migrated_db_session: AsyncSession,
+    postgres_async_url: str,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    user = User(account_type=AccountType.FULL, status=AccountStatus.ACTIVE, telegram_id=TELEGRAM_ID)
+    migrated_db_session.add(user)
+    video_meme, _ = await create_meme_file(
+        migrated_db_session,
+        media_type=ContentKind.VIDEO,
+        mime_type="video/mp4",
+    )
+    popular_meme, popular_file = await create_meme_file(
+        migrated_db_session,
+        media_type=ContentKind.IMAGE,
+        mime_type="image/jpeg",
+    )
+    popular_meme.popularity_score = 900.0
+    migrated_db_session.add(PinnedMeme(user=user, meme=video_meme, position=1))
+    await add_file_id_cache(
+        migrated_db_session,
+        file=popular_file,
+        media_format=TelegramMediaFormat.PHOTO,
+        telegram_file_id="cached-popular-after-unsendable-pin-id",
+    )
+    await migrated_db_session.commit()
+
+    fake_service = FakeMemeSearchService(MemeSearchPageRead(items=[], limit=20, offset=0, total=0, has_more=False))
+    telegram_session = RecordingTelegramSession()
+    bot = build_bot(build_bot_settings(postgres_async_url), session=telegram_session)
+    dispatcher = build_dispatcher(
+        settings=build_bot_settings(postgres_async_url),
+        session_factory=postgres_session_factory,
+        meme_search_service_factory=lambda session: fake_service,
+    )
+
+    try:
+        await dispatch_inline_query(dispatcher=dispatcher, bot=bot, query="")
+    finally:
+        await bot.session.close()
+
+    assert fake_service.calls == []
+    answer = last_inline_answer(telegram_session)
+    assert answer.is_personal is True
+    assert len(answer.results) == 1
+    result = answer.results[0]
+    assert isinstance(result, InlineQueryResultCachedPhoto)
+    assert result.photo_file_id == "cached-popular-after-unsendable-pin-id"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("account_type", "status"),
+    [
+        (AccountType.FULL, AccountStatus.DELETION_PENDING),
+        (AccountType.FULL, AccountStatus.DELETED),
+        (AccountType.GUEST, AccountStatus.ACTIVE),
+    ],
+)
+async def test_inline_empty_query_treats_ineligible_linked_users_as_guests(
+    migrated_db_session: AsyncSession,
+    postgres_async_url: str,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    account_type: AccountType,
+    status: AccountStatus,
+) -> None:
+    user = User(account_type=account_type, status=status, telegram_id=TELEGRAM_ID)
+    migrated_db_session.add(user)
+    popular_meme, popular_file = await create_meme_file(
+        migrated_db_session,
+        media_type=ContentKind.IMAGE,
+        mime_type="image/jpeg",
+    )
+    popular_meme.popularity_score = 900.0
+    await add_file_id_cache(
+        migrated_db_session,
+        file=popular_file,
+        media_format=TelegramMediaFormat.PHOTO,
+        telegram_file_id="cached-guest-treated-popular-photo-id",
+    )
+    await migrated_db_session.commit()
+
+    fake_service = FakeMemeSearchService(MemeSearchPageRead(items=[], limit=20, offset=0, total=0, has_more=False))
+    telegram_session = RecordingTelegramSession()
+    bot = build_bot(build_bot_settings(postgres_async_url), session=telegram_session)
+    dispatcher = build_dispatcher(
+        settings=build_bot_settings(postgres_async_url),
+        session_factory=postgres_session_factory,
+        meme_search_service_factory=lambda session: fake_service,
+    )
+
+    try:
+        await dispatch_inline_query(dispatcher=dispatcher, bot=bot, query="")
+    finally:
+        await bot.session.close()
+
+    assert fake_service.calls == []
+    answer = last_inline_answer(telegram_session)
+    assert answer.is_personal is False
+    assert len(answer.results) == 1
+    result = answer.results[0]
+    assert isinstance(result, InlineQueryResultCachedPhoto)
+    assert result.photo_file_id == "cached-guest-treated-popular-photo-id"
+
+
+@pytest.mark.asyncio
+async def test_inline_empty_query_for_guest_returns_popular_public_memes_non_personal(
+    migrated_db_session: AsyncSession,
+    postgres_async_url: str,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    less_popular_meme, less_popular_file = await create_meme_file(
+        migrated_db_session,
+        media_type=ContentKind.IMAGE,
+        mime_type="image/jpeg",
+    )
+    less_popular_meme.popularity_score = 10.0
+    more_popular_meme, more_popular_file = await create_meme_file(
+        migrated_db_session,
+        media_type=ContentKind.IMAGE,
+        mime_type="image/jpeg",
+    )
+    more_popular_meme.popularity_score = 99.0
+    await add_file_id_cache(
+        migrated_db_session,
+        file=less_popular_file,
+        media_format=TelegramMediaFormat.PHOTO,
+        telegram_file_id="cached-less-popular-photo-id",
+    )
+    await add_file_id_cache(
+        migrated_db_session,
+        file=more_popular_file,
+        media_format=TelegramMediaFormat.PHOTO,
+        telegram_file_id="cached-more-popular-photo-id",
+    )
+    await migrated_db_session.commit()
+
+    fake_service = FakeMemeSearchService(MemeSearchPageRead(items=[], limit=20, offset=0, total=0, has_more=False))
+    telegram_session = RecordingTelegramSession()
+    bot = build_bot(build_bot_settings(postgres_async_url), session=telegram_session)
+    dispatcher = build_dispatcher(
+        settings=build_bot_settings(postgres_async_url),
+        session_factory=postgres_session_factory,
+        meme_search_service_factory=lambda session: fake_service,
+    )
+
+    try:
+        await dispatch_inline_query(dispatcher=dispatcher, bot=bot, query=" ")
+    finally:
+        await bot.session.close()
+
+    assert fake_service.calls == []
+    answer = last_inline_answer(telegram_session)
+    assert answer.is_personal is False
+    assert len(answer.results) == 2
+    first_result = answer.results[0]
+    assert isinstance(first_result, InlineQueryResultCachedPhoto)
+    assert first_result.photo_file_id == "cached-more-popular-photo-id"
 
 
 @pytest.mark.asyncio
