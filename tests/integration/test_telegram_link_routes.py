@@ -70,6 +70,84 @@ async def test_telegram_link_start_route_persists_short_hash_only_code_and_retur
         assert persisted_row.redeemed_by_telegram_id is None
 
 
+async def test_telegram_link_refresh_replaces_stale_guest_cookie_after_in_place_upgrade(
+    auth_client: AsyncClient,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    guest_response = await auth_client.post("/api/v1/auth/guest")
+    guest_user_id = guest_response.json()["user"]["id"]
+    start_response = await auth_client.post("/api/v1/auth/link/telegram")
+    code = start_response.json()["code"]
+
+    async with postgres_session_factory() as session:
+        link_service = AccountLinkService.from_settings(session)
+        link_result = await link_service.redeem_telegram_link_code(
+            code=code,
+            identity=TelegramIdentity(telegram_id=2026061201, auth_date=utcnow()),
+        )
+
+    assert str(link_result.user.id) == guest_user_id
+    assert link_result.merge_performed is False
+    assert link_result.user.account_type.value == "full"
+
+    stale_response = await auth_client.get("/api/v1/auth/session")
+    assert stale_response.status_code == 401
+
+    refresh_response = await auth_client.post("/api/v1/auth/session/refresh")
+    payload = refresh_response.json()
+
+    assert refresh_response.status_code == 200
+    assert "memexpert_access_token=" in refresh_response.headers["set-cookie"]
+    assert payload["user"]["id"] == guest_user_id
+    assert payload["user"]["account_type"] == "full"
+    assert payload["linked_providers"]["telegram_linked"] is True
+    assert "access_token" not in payload
+
+    current_response = await auth_client.get("/api/v1/auth/session")
+    assert current_response.status_code == 200
+    assert current_response.json()["user"]["account_type"] == "full"
+
+
+async def test_telegram_link_refresh_replaces_guest_cookie_after_merge_into_existing_profile(
+    auth_client: AsyncClient,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    telegram_id = 2026061202
+    async with postgres_session_factory() as session:
+        full_user = await create_full_user_via_upgrade(
+            UserService(session),
+            telegram_id=telegram_id,
+        )
+        full_user_id = str(full_user.id)
+
+    _ = await auth_client.post("/api/v1/auth/guest")
+    start_response = await auth_client.post("/api/v1/auth/link/telegram")
+    code = start_response.json()["code"]
+
+    async with postgres_session_factory() as session:
+        link_service = AccountLinkService.from_settings(session)
+        link_result = await link_service.redeem_telegram_link_code(
+            code=code,
+            identity=TelegramIdentity(telegram_id=telegram_id, auth_date=utcnow()),
+        )
+
+    assert str(link_result.user.id) == full_user_id
+    assert link_result.merge_performed is True
+    assert link_result.deleted_guest_user_id is not None
+
+    stale_response = await auth_client.get("/api/v1/auth/session")
+    assert stale_response.status_code == 401
+
+    refresh_response = await auth_client.post("/api/v1/auth/session/refresh")
+    payload = refresh_response.json()
+
+    assert refresh_response.status_code == 200
+    assert payload["user"]["id"] == full_user_id
+    assert payload["user"]["account_type"] == "full"
+    assert payload["linked_providers"]["telegram_linked"] is True
+    assert "memexpert_access_token=" in refresh_response.headers["set-cookie"]
+
+
 async def test_telegram_link_start_route_rejects_full_callers_without_persisting_code(
     auth_client: AsyncClient,
     postgres_session_factory: async_sessionmaker[AsyncSession],

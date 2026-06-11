@@ -1,5 +1,44 @@
 export type ContentKind = 'audio' | 'gif' | 'image' | 'link' | 'text' | 'video';
 export type ContentLanguage = 'en' | 'mixed' | 'none' | 'ru';
+export type AccountType = 'full' | 'guest';
+
+export interface UserRead {
+  id: string;
+  account_type: AccountType;
+  telegram_id: number | null;
+  google_id: string | null;
+  email: string | null;
+  email_verified_at: string | null;
+  language: ContentLanguage | 'any';
+  nsfw_enabled: boolean;
+  token_nonce: number;
+  status: string;
+  guest_expires_at: string | null;
+  active_save_collection_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface LinkedProvidersRead {
+  email: string | null;
+  email_verified_at: string | null;
+  has_password: boolean;
+  google_linked: boolean;
+  telegram_linked: boolean;
+}
+
+export interface CurrentSessionRead {
+  user: UserRead;
+  linked_providers: LinkedProvidersRead;
+}
+
+export interface TelegramLinkStartRead {
+  code: string;
+  deep_link_url: string;
+  expires_at: string;
+  expires_in_seconds: number;
+  return_url: string;
+}
 
 export interface PublicMemeFileRead {
   id: string;

@@ -110,6 +110,35 @@ async def test_guest_route_sets_access_cookie_and_persists_login_event(
         assert "httpx" in login_event.user_agent
 
 
+async def test_current_session_auto_bootstraps_guest_and_returns_linked_providers(
+    auth_client: AsyncClient,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    response = await auth_client.get("/api/v1/auth/session")
+    payload = response.json()
+
+    assert response.status_code == 200
+    assert f"{ACCESS_COOKIE_NAME}=" in response.headers["set-cookie"]
+    assert payload["user"]["account_type"] == "guest"
+    assert payload["linked_providers"] == {
+        "email": None,
+        "email_verified_at": None,
+        "has_password": False,
+        "google_linked": False,
+        "telegram_linked": False,
+    }
+    assert "access_token" not in payload
+
+    second_response = await auth_client.get("/api/v1/auth/session")
+    assert second_response.status_code == 200
+    assert second_response.json()["user"]["id"] == payload["user"]["id"]
+    assert "set-cookie" not in second_response.headers
+
+    async with postgres_session_factory() as session:
+        user_count_result = await session.execute(select(User).where(User.id == payload["user"]["id"]))
+        assert user_count_result.scalar_one().account_type.value == "guest"
+
+
 async def test_me_route_accepts_cookie_only_caller_and_rejects_expired_tokens(
     auth_client: AsyncClient,
     auth_settings_overrides: dict[str, str],

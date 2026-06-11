@@ -314,6 +314,7 @@ __all__ = [
     "ForbidFullAccountCallerDep",
     "FullAccountUserDep",
     "GuestUserDep",
+    "OptionalAccessTokenDep",
     "OptionalCurrentUserDep",
     "OptionalGuestUserDep",
     "ProviderAuthServiceDep",
