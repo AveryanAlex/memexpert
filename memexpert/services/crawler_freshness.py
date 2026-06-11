@@ -26,12 +26,13 @@ from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from sqlalchemy import select
 
 from memexpert.models.base import utcnow
 from memexpert.models.content import (
+    MemeFileSyncTargetSnapshot,
     MemeSource,
     PipelineStageJournal,
     SourceChannel,
@@ -40,6 +41,8 @@ from memexpert.models.enums import (
     ContentPipelineStage,
     ContentPipelineStageStatus,
     SourcePlatform,
+    SyncTargetKind,
+    SyncTargetStatus,
 )
 from memexpert.schemas.crawler import (
     MAX_FRESHNESS_SAMPLE_ITEMS,
@@ -47,6 +50,7 @@ from memexpert.schemas.crawler import (
     CrawlerFreshnessSampleItem,
     CrawlerFreshnessSnapshot,
 )
+from memexpert.services.content_pipeline_constants import ACTIVE_STAGE_STATUSES, STAGE_ORDER
 
 if TYPE_CHECKING:
     import uuid
@@ -83,6 +87,15 @@ class _ChannelBucket:
     platform_id: str
     channel_title: str
     items: list[CrawlerFreshnessSampleItem]
+
+
+@dataclass(slots=True, frozen=True)
+class _TargetEvidence:
+    """Latest per-target sync evidence for one meme file."""
+
+    status: SyncTargetStatus | None
+    normalized_reason: str | None
+    last_error_text: str | None
 
 
 async def build_crawler_freshness_snapshot(
@@ -165,8 +178,14 @@ async def _load_candidate_rows(
 
     source_ids = {row.source_id for row in source_rows}
     channels_by_id = await _load_channels_by_platform_id(session, source_ids)
-    sync_finishes = await _load_sync_finishes(
+    stage_entries = await _load_stage_entries(
         session,
+        meme_file_ids=[row.file_id for row in source_rows],
+    )
+    sync_finishes = _compute_sync_finishes(stage_entries)
+    target_evidence = await _load_target_evidence(
+        session,
+        stage_entries=stage_entries,
         meme_file_ids=[row.file_id for row in source_rows],
     )
 
@@ -187,6 +206,9 @@ async def _load_candidate_rows(
             continue
         finishes = sync_finishes.get(source_row.file_id, {})
         both_synced_at = _compute_both_synced_at(finishes)
+        current_stage = _resolve_current_stage(stage_entries.get(source_row.file_id, ()))
+        qdrant = target_evidence.get(source_row.file_id, {}).get(SyncTargetKind.QDRANT)
+        meili = target_evidence.get(source_row.file_id, {}).get(SyncTargetKind.MEILISEARCH)
         candidates.append(
             _CandidateRow(
                 meme_file_id=source_row.file_id,
@@ -196,6 +218,16 @@ async def _load_candidate_rows(
                 published_at=published_at,
                 first_ingested_at=source_row.created_at,
                 both_synced_at=both_synced_at,
+                pipeline_stage=current_stage.stage if current_stage is not None else None,
+                pipeline_status=current_stage.status if current_stage is not None else None,
+                failure_reason=current_stage.normalized_reason if current_stage is not None else None,
+                failure_text=current_stage.last_error_text if current_stage is not None else None,
+                qdrant_status=qdrant.status if qdrant is not None else None,
+                qdrant_reason=qdrant.normalized_reason if qdrant is not None else None,
+                qdrant_error=qdrant.last_error_text if qdrant is not None else None,
+                meili_status=meili.status if meili is not None else None,
+                meili_reason=meili.normalized_reason if meili is not None else None,
+                meili_error=meili.last_error_text if meili is not None else None,
             )
         )
     return candidates
@@ -217,27 +249,123 @@ async def _load_channels_by_platform_id(
     return {row.platform_id: row for row in rows}
 
 
-async def _load_sync_finishes(
+async def _load_stage_entries(
     session: AsyncSession,
     *,
     meme_file_ids: list[uuid.UUID],
-) -> dict[uuid.UUID, dict[ContentPipelineStage, datetime]]:
-    """Return the finished_at timestamps for every succeeded sync stage row."""
+) -> dict[uuid.UUID, tuple[PipelineStageJournal, ...]]:
+    """Return stage-journal rows keyed by file id and sorted in pipeline order."""
 
     if not meme_file_ids:
         return {}
     stmt = select(PipelineStageJournal).where(
         PipelineStageJournal.meme_file_id.in_(meme_file_ids),
-        PipelineStageJournal.stage.in_(_SYNC_STAGES),
-        PipelineStageJournal.status == ContentPipelineStageStatus.SUCCEEDED,
     )
     result = (await session.execute(stmt)).scalars().all()
-    by_file: dict[uuid.UUID, dict[ContentPipelineStage, datetime]] = defaultdict(dict)
+    by_file: dict[uuid.UUID, list[PipelineStageJournal]] = defaultdict(list)
     for entry in result:
-        if entry.finished_at is None:
-            continue
-        by_file[entry.meme_file_id][entry.stage] = entry.finished_at
+        by_file[entry.meme_file_id].append(entry)
+    return {
+        meme_file_id: tuple(
+            sorted(entries, key=lambda entry: STAGE_ORDER.get(entry.stage, 999)),
+        )
+        for meme_file_id, entries in by_file.items()
+    }
+
+
+def _compute_sync_finishes(
+    stage_entries: dict[uuid.UUID, tuple[PipelineStageJournal, ...]],
+) -> dict[uuid.UUID, dict[ContentPipelineStage, datetime]]:
+    """Return the finished_at timestamps for every succeeded sync stage row."""
+
+    by_file: dict[uuid.UUID, dict[ContentPipelineStage, datetime]] = defaultdict(dict)
+    for meme_file_id, entries in stage_entries.items():
+        for entry in entries:
+            if entry.stage not in _SYNC_STAGES:
+                continue
+            if entry.status is not ContentPipelineStageStatus.SUCCEEDED:
+                continue
+            if entry.finished_at is None:
+                continue
+            by_file[meme_file_id][entry.stage] = entry.finished_at
     return by_file
+
+
+async def _load_target_evidence(
+    session: AsyncSession,
+    *,
+    stage_entries: dict[uuid.UUID, tuple[PipelineStageJournal, ...]],
+    meme_file_ids: list[uuid.UUID],
+) -> dict[uuid.UUID, dict[SyncTargetKind, _TargetEvidence]]:
+    """Return per-target sync evidence, preferring sync snapshots over stage rows."""
+
+    evidence = _target_evidence_from_stage_entries(stage_entries)
+    if not meme_file_ids:
+        return evidence
+
+    stmt = select(MemeFileSyncTargetSnapshot).where(
+        MemeFileSyncTargetSnapshot.meme_file_id.in_(meme_file_ids),
+    )
+    rows = (await session.execute(stmt)).scalars().all()
+    for row in rows:
+        evidence[row.meme_file_id][row.sync_target] = _TargetEvidence(
+            status=row.status,
+            normalized_reason=row.normalized_reason,
+            last_error_text=row.last_error_text,
+        )
+    return evidence
+
+
+def _target_evidence_from_stage_entries(
+    stage_entries: dict[uuid.UUID, tuple[PipelineStageJournal, ...]],
+) -> dict[uuid.UUID, dict[SyncTargetKind, _TargetEvidence]]:
+    """Fallback per-target state derived from the sync stage journal."""
+
+    by_file: dict[uuid.UUID, dict[SyncTargetKind, _TargetEvidence]] = defaultdict(dict)
+    target_by_stage = {
+        ContentPipelineStage.SYNC_QDRANT: SyncTargetKind.QDRANT,
+        ContentPipelineStage.SYNC_MEILI: SyncTargetKind.MEILISEARCH,
+    }
+    for meme_file_id, entries in stage_entries.items():
+        for entry in entries:
+            target = target_by_stage.get(entry.stage)
+            if target is None:
+                continue
+            by_file[meme_file_id][target] = _TargetEvidence(
+                status=_sync_status_from_stage_status(entry.status),
+                normalized_reason=entry.normalized_reason,
+                last_error_text=entry.last_error_text,
+            )
+    return by_file
+
+
+def _sync_status_from_stage_status(
+    status: ContentPipelineStageStatus,
+) -> SyncTargetStatus | None:
+    """Map sync stage-journal status onto public per-target status."""
+
+    if status is ContentPipelineStageStatus.SUCCEEDED:
+        return SyncTargetStatus.SYNCED
+    if status is ContentPipelineStageStatus.FAILED:
+        return SyncTargetStatus.FAILED
+    if status is ContentPipelineStageStatus.PROCESSING:
+        return SyncTargetStatus.PROCESSING
+    if status is ContentPipelineStageStatus.PENDING:
+        return SyncTargetStatus.PENDING
+    return None
+
+
+def _resolve_current_stage(
+    entries: tuple[PipelineStageJournal, ...],
+) -> PipelineStageJournal | None:
+    """Return active stage truth, falling back to the furthest completed stage."""
+
+    if not entries:
+        return None
+    for entry in entries:
+        if entry.status in ACTIVE_STAGE_STATUSES:
+            return entry
+    return entries[-1]
 
 
 def _compute_both_synced_at(
@@ -263,6 +391,16 @@ class _CandidateRow:
     published_at: datetime
     first_ingested_at: datetime
     both_synced_at: datetime | None
+    pipeline_stage: ContentPipelineStage | None
+    pipeline_status: ContentPipelineStageStatus | None
+    failure_reason: str | None
+    failure_text: str | None
+    qdrant_status: SyncTargetStatus | None
+    qdrant_reason: str | None
+    qdrant_error: str | None
+    meili_status: SyncTargetStatus | None
+    meili_reason: str | None
+    meili_error: str | None
 
 
 def _bucket_rows_by_channel(
@@ -304,7 +442,45 @@ def _candidate_to_sample(row: _CandidateRow) -> CrawlerFreshnessSampleItem:
         first_ingested_at=row.first_ingested_at,
         both_synced_at=row.both_synced_at,
         freshness_seconds=freshness_seconds,
+        pipeline_stage=row.pipeline_stage,
+        pipeline_status=row.pipeline_status,
+        failure_reason=row.failure_reason,
+        failure_text=row.failure_text,
+        qdrant_status=row.qdrant_status,
+        qdrant_reason=row.qdrant_reason,
+        qdrant_error=row.qdrant_error,
+        meili_status=row.meili_status,
+        meili_reason=row.meili_reason,
+        meili_error=row.meili_error,
+        searchability=_classify_searchability(
+            pipeline_status=row.pipeline_status,
+            qdrant_status=row.qdrant_status,
+            meili_status=row.meili_status,
+        ),
     )
+
+
+def _classify_searchability(
+    *,
+    pipeline_status: ContentPipelineStageStatus | None,
+    qdrant_status: SyncTargetStatus | None,
+    meili_status: SyncTargetStatus | None,
+) -> Literal["ready", "partially_searchable", "blocked", "in_flight"]:
+    """Classify a freshness sample by how searchable it is right now."""
+
+    qdrant_synced = qdrant_status is SyncTargetStatus.SYNCED
+    meili_synced = meili_status is SyncTargetStatus.SYNCED
+    if qdrant_synced and meili_synced:
+        return "ready"
+    if qdrant_synced or meili_synced:
+        return "partially_searchable"
+    if (
+        pipeline_status is ContentPipelineStageStatus.FAILED
+        or qdrant_status is SyncTargetStatus.FAILED
+        or meili_status is SyncTargetStatus.FAILED
+    ):
+        return "blocked"
+    return "in_flight"
 
 
 def _build_channel_breakdown(bucket: _ChannelBucket) -> CrawlerFreshnessChannelBreakdown:

@@ -24,7 +24,12 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
-from memexpert.models.enums import SourcePlatform
+from memexpert.models.enums import (
+    ContentPipelineStage,
+    ContentPipelineStageStatus,
+    SourcePlatform,
+    SyncTargetStatus,
+)
 from memexpert.schemas.base import ORMSchema
 from memexpert.schemas.content_pipeline import (
     MAX_POST_ID_LENGTH,
@@ -134,6 +139,17 @@ class CrawlerFreshnessSampleItem(BaseModel):
     first_ingested_at: datetime | None = None
     both_synced_at: datetime | None = None
     freshness_seconds: float | None = None
+    pipeline_stage: ContentPipelineStage | None = None
+    pipeline_status: ContentPipelineStageStatus | None = None
+    failure_reason: str | None = Field(default=None, max_length=128)
+    failure_text: str | None = None
+    qdrant_status: SyncTargetStatus | None = None
+    qdrant_reason: str | None = Field(default=None, max_length=128)
+    qdrant_error: str | None = None
+    meili_status: SyncTargetStatus | None = None
+    meili_reason: str | None = Field(default=None, max_length=128)
+    meili_error: str | None = None
+    searchability: Literal["ready", "partially_searchable", "blocked", "in_flight"] | None = None
 
 
 class CrawlerFreshnessChannelBreakdown(BaseModel):
@@ -203,6 +219,17 @@ class CrawlerS04RunItemReport(BaseModel):
     both_synced_at: datetime | None = None
     freshness_seconds: float | None = None
     slo_bucket: Literal["pass", "breached_p50", "breached_p95", "incomplete"]
+    pipeline_stage: ContentPipelineStage | None = None
+    pipeline_status: ContentPipelineStageStatus | None = None
+    failure_reason: str | None = Field(default=None, max_length=128)
+    failure_text: str | None = None
+    qdrant_status: SyncTargetStatus | None = None
+    qdrant_reason: str | None = Field(default=None, max_length=128)
+    qdrant_error: str | None = None
+    meili_status: SyncTargetStatus | None = None
+    meili_reason: str | None = Field(default=None, max_length=128)
+    meili_error: str | None = None
+    searchability: Literal["ready", "partially_searchable", "blocked", "in_flight"] | None = None
 
 
 class CrawlerS04PerChannelSummary(BaseModel):
