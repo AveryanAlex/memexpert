@@ -95,6 +95,19 @@ Python app runs natively via `uv` (package manager + virtualenv). All infrastruc
 
 ## Testing
 
+Run the Python suite through the project `uv` environment:
+
+```bash
+uv run pytest -q
+```
+
+`pyproject.toml` configures pytest to use `pytest-xdist` by default (`-n 4 --dist loadfile`). This keeps file-local test ordering intact while running different test files across four workers, which is the fastest safe default found so far. Use `uv run pytest -q --override-ini 'addopts='` when you need a single-process diagnostic run.
+
+Current runtime comparison from the pytest parallelization validation:
+
+- Single-process baseline: 411 tests passed in 421.78s pytest time / 430.64s wall time.
+- Default xdist command (`uv run pytest -q`): 411 tests passed in 187.26s pytest time / 192.98s wall time in the latest validation run.
+
 ### Unit Tests (pytest, no I/O)
 
 Fast, mocked, run on every push. Target pure business logic in the service layer:
