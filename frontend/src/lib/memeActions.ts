@@ -25,10 +25,6 @@ export function memeTitle(meme: Pick<MemeLike, 'caption' | 'tags'> & Partial<Pic
   return meme.seo_title || meme.caption || meme.tags[0] || 'Untitled meme';
 }
 
-export function readViewerFlag(value: boolean | null | undefined): boolean | null {
-  return typeof value === 'boolean' ? value : null;
-}
-
 export function memeRenderUrl(meme: MemeLike): string | null {
   return firstUrl(meme.render_url, meme.primary_file?.render_url, ...readFileUrls(meme, 'render_url'));
 }

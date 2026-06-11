@@ -8,7 +8,6 @@ import {
   memeDownloadUrl,
   memeHref,
   memeRenderUrl,
-  readViewerFlag,
   telegramShareUrl
 } from './memeActions';
 
@@ -45,13 +44,6 @@ describe('meme action helpers', () => {
     expect(memeDownloadUrl(meme)).toBe('https://cdn.memexpert.test/download.png');
   });
 
-  it('keeps missing viewer flags unknown', () => {
-    expect(readViewerFlag(true)).toBe(true);
-    expect(readViewerFlag(false)).toBe(false);
-    expect(readViewerFlag(null)).toBeNull();
-    expect(readViewerFlag(undefined)).toBeNull();
-  });
-
   it('formats account and active collection failures clearly', () => {
     expect(actionFailureMessage('pin', new ApiError(403, 'Full account required.'))).toBe(
       'Pinning requires a full MemeXpert account. Link or sign in, then try again.'
@@ -77,6 +69,9 @@ function detail(overrides: Partial<PublicMemeDetailRead> & { id: string; seo_pag
     primary_file: null,
     caption: null,
     seo_page_slug,
+    viewer_has_favorited: false,
+    viewer_has_saved: false,
+    viewer_has_pinned: false,
     created_at: '2026-01-01T00:00:00Z',
     updated_at: '2026-01-01T00:00:00Z',
     ocr_text: null,

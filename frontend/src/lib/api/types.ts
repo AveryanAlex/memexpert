@@ -83,9 +83,9 @@ export interface PublicMemeCardRead {
   updated_at: string;
   render_url?: string | null;
   download_url?: string | null;
-  viewer_has_favorited?: boolean | null;
-  viewer_has_saved?: boolean | null;
-  viewer_has_pinned?: boolean | null;
+  viewer_has_favorited: boolean;
+  viewer_has_saved: boolean;
+  viewer_has_pinned: boolean;
 }
 
 export interface PublicMemeDetailRead extends PublicMemeCardRead {

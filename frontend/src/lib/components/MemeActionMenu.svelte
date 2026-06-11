@@ -17,7 +17,6 @@
     memeDownloadUrl,
     memeHref,
     memeTitle,
-    readViewerFlag,
     telegramShareUrl,
     type MemeActionKind
   } from '$lib/memeActions';
@@ -31,9 +30,9 @@
 
   let { meme, href = memeHref(meme), showPrimary = false, compact = false }: Props = $props();
 
-  let favorited = $state<boolean | null>(null);
-  let saved = $state<boolean | null>(null);
-  let pinned = $state<boolean | null>(null);
+  let favorited = $state(false);
+  let saved = $state(false);
+  let pinned = $state(false);
   let likeCount = $state(0);
   let pending = $state<MemeActionKind | null>(null);
   let statusMessage = $state<string | null>(null);
@@ -45,16 +44,16 @@
   const actionRequest = $derived({ fetch, memeId: meme.id });
 
   $effect(() => {
-    favorited = readViewerFlag(meme.viewer_has_favorited);
-    saved = readViewerFlag(meme.viewer_has_saved);
-    pinned = readViewerFlag(meme.viewer_has_pinned);
+    favorited = meme.viewer_has_favorited;
+    saved = meme.viewer_has_saved;
+    pinned = meme.viewer_has_pinned;
     likeCount = meme.like_count;
   });
 
   async function toggleFavorite() {
-    const next = favorited !== true;
+    const next = !favorited;
     await runAction(next ? 'favorite' : 'unfavorite', async () => {
-      const wasFavorited = favorited === true;
+      const wasFavorited = favorited;
       const response = next ? await favoriteMeme(actionRequest) : await unfavoriteMeme(actionRequest);
       favorited = next;
       if (next && !wasFavorited) {
@@ -67,7 +66,7 @@
   }
 
   async function toggleSave() {
-    const next = saved !== true;
+    const next = !saved;
     await runAction(next ? 'save' : 'unsave', async () => {
       await (next ? saveMeme(actionRequest) : removeSavedMeme(actionRequest));
       saved = next;
@@ -76,7 +75,7 @@
   }
 
   async function togglePin() {
-    const next = pinned !== true;
+    const next = !pinned;
     await runAction(next ? 'pin' : 'unpin', async () => {
       await (next ? pinMeme(actionRequest) : unpinMeme(actionRequest));
       pinned = next;
@@ -156,13 +155,13 @@
   {#if showPrimary}
     <div class="primary-actions" aria-label="Primary meme actions">
       <button class="button-link secondary action-button" type="button" disabled={pending !== null} onclick={toggleFavorite}>
-        {favorited === true ? 'Unlike' : 'Like'} ({likeCount})
+        {favorited ? 'Unlike' : 'Like'} ({likeCount})
       </button>
       <button class="button-link secondary action-button" type="button" disabled={pending !== null} onclick={toggleSave}>
-        {saved === true ? 'Saved' : 'Save'}
+        {saved ? 'Saved' : 'Save'}
       </button>
       <button class="button-link secondary action-button" type="button" disabled={pending !== null} onclick={togglePin}>
-        {pinned === true ? 'Unpin' : 'Pin'}
+        {pinned ? 'Unpin' : 'Pin'}
       </button>
     </div>
   {/if}
@@ -174,13 +173,13 @@
     <DropdownMenu.Portal>
       <DropdownMenu.Content class="action-menu" align="end" sideOffset={8}>
         <DropdownMenu.Item class="action-menu-item" onSelect={toggleFavorite} disabled={pending !== null}>
-          {favorited === true ? 'Unlike' : 'Like'} meme
+          {favorited ? 'Unlike' : 'Like'} meme
         </DropdownMenu.Item>
         <DropdownMenu.Item class="action-menu-item" onSelect={toggleSave} disabled={pending !== null}>
-          {saved === true ? 'Remove save' : 'Save'}
+          {saved ? 'Remove save' : 'Save'}
         </DropdownMenu.Item>
         <DropdownMenu.Item class="action-menu-item" onSelect={togglePin} disabled={pending !== null}>
-          {pinned === true ? 'Unpin' : 'Pin'}
+          {pinned ? 'Unpin' : 'Pin'}
         </DropdownMenu.Item>
         <DropdownMenu.Separator class="action-menu-separator" />
         <DropdownMenu.Item class="action-menu-item" onSelect={shareTelegram}>Share to Telegram</DropdownMenu.Item>

@@ -10,15 +10,15 @@ from typing import Any
 import pytest
 from fastapi import FastAPI
 from httpx import AsyncClient
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import event, select
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from memexpert.api.dependencies import PIPELINE_OPERATOR_TOKEN_HEADER_NAME
 from memexpert.api.dependencies.auth import get_optional_current_user
 from memexpert.api.dependencies.meme import get_analytics_service, get_meme_search_service
 from memexpert.core.config import Settings, get_settings
 from memexpert.core.qdrant import QdrantUserSearchMatch
-from memexpert.models.collection import Collection, CollectionMember, CollectionMeme
+from memexpert.models.collection import Collection, CollectionMember, CollectionMeme, PinnedMeme
 from memexpert.models.content import Meme, MemeFile, MemePopularitySnapshot, MemeSeoPage, MemeTemplate
 from memexpert.models.enums import (
     AccountType,
@@ -352,6 +352,9 @@ async def test_public_openapi_registers_catalog_routes_without_internal_surface(
     assert "query" in search_parameters
     assert "query_vector" not in search_parameters
     assert set(components["PublicMemeSearchResultRead"]["properties"]) == {"meme"}
+    assert "viewer_has_favorited" in components["PublicMemeCardRead"]["properties"]
+    assert "viewer_has_saved" in components["PublicMemeCardRead"]["properties"]
+    assert "viewer_has_pinned" in components["PublicMemeCardRead"]["properties"]
     assert "MemeSearchScoreRead" not in components
     assert "s3_original_key" not in components["PublicMemeFileRead"]["properties"]
     assert "s3_web_video_key" not in components["PublicMemeFileRead"]["properties"]
@@ -414,6 +417,9 @@ async def test_public_route_json_includes_render_contract_without_storage_leakag
     assert response.status_code == 200
     payload = response.json()
     assert [item["meme"]["id"] for item in payload["items"]] == [str(meme.id)]
+    assert payload["items"][0]["meme"]["viewer_has_favorited"] is False
+    assert payload["items"][0]["meme"]["viewer_has_saved"] is False
+    assert payload["items"][0]["meme"]["viewer_has_pinned"] is False
     assert str(private_meme.id) not in response.text
     primary_file = payload["items"][0]["meme"]["primary_file"]
     assert "s3_original_key" not in primary_file
@@ -434,6 +440,170 @@ async def test_public_route_json_includes_render_contract_without_storage_leakag
     assert "private-media-bucket" not in response.text
     assert "pipeline/originals/private/source.jpg" not in response.text
     assert "pipeline/originals/private/hidden.jpg" not in response.text
+
+
+async def test_public_meme_dtos_include_viewer_action_state_for_anonymous_guest_and_full_accounts(
+    migrated_db_session: AsyncSession,
+) -> None:
+    tag = "action-state"
+    template = MemeTemplate(slug="action-template", name="Action Template")
+    migrated_db_session.add(template)
+    await migrated_db_session.flush()
+    favorite_meme = await _create_meme(migrated_db_session, tags=[tag], popularity_score=30.0)
+    saved_meme = await _create_meme(migrated_db_session, tags=[tag], popularity_score=20.0)
+    pinned_meme = await _create_meme(migrated_db_session, tags=[tag], popularity_score=10.0)
+    favorite_meme.template_id = template.id
+    saved_meme.template_id = template.id
+    pinned_meme.template_id = template.id
+    guest_user = User(account_type=AccountType.GUEST)
+    full_user = User(account_type=AccountType.FULL)
+    migrated_db_session.add_all([guest_user, full_user])
+    await migrated_db_session.flush()
+
+    guest_favorites = Collection(
+        owner_id=guest_user.id,
+        title="Favorites",
+        kind=CollectionKind.FAVORITES,
+        visibility=CollectionVisibility.PRIVATE,
+    )
+    full_favorites = Collection(
+        owner_id=full_user.id,
+        title="Favorites",
+        kind=CollectionKind.FAVORITES,
+        visibility=CollectionVisibility.PRIVATE,
+    )
+    full_active_collection = Collection(
+        owner_id=full_user.id,
+        title="Saved reactions",
+        kind=CollectionKind.CUSTOM,
+        visibility=CollectionVisibility.PRIVATE,
+    )
+    migrated_db_session.add_all([guest_favorites, full_favorites, full_active_collection])
+    await migrated_db_session.flush()
+    guest_user.active_save_collection_id = guest_favorites.id
+    full_user.active_save_collection_id = full_active_collection.id
+    migrated_db_session.add_all(
+        [
+            CollectionMeme(collection_id=guest_favorites.id, meme_id=favorite_meme.id, added_by_user_id=guest_user.id),
+            CollectionMeme(collection_id=full_favorites.id, meme_id=favorite_meme.id, added_by_user_id=full_user.id),
+            CollectionMeme(
+                collection_id=full_active_collection.id,
+                meme_id=saved_meme.id,
+                added_by_user_id=full_user.id,
+            ),
+            PinnedMeme(user_id=full_user.id, meme_id=pinned_meme.id, position=1),
+        ]
+    )
+    await migrated_db_session.flush()
+    service = MemeSearchService(migrated_db_session)
+    search_service = MemeSearchService(
+        migrated_db_session,
+        text_client=FakeTextSearchClient(
+            [
+                {"id": str(favorite_meme.primary_file_id), "meme_id": str(favorite_meme.id), "_rankingScore": 1.0},
+                {"id": str(saved_meme.primary_file_id), "meme_id": str(saved_meme.id), "_rankingScore": 0.9},
+                {"id": str(pinned_meme.primary_file_id), "meme_id": str(pinned_meme.id), "_rankingScore": 0.8},
+            ]
+        ),
+    )
+
+    def page_states(page: object) -> dict[uuid.UUID, tuple[bool, bool, bool]]:
+        return {
+            item.meme.id: (item.meme.viewer_has_favorited, item.meme.viewer_has_saved, item.meme.viewer_has_pinned)
+            for item in page.items
+        }
+
+    anonymous_page = await service.browse_public_memes(limit=10)
+    guest_page = await service.browse_public_memes(viewer_user_id=guest_user.id, limit=10)
+    full_page = await service.browse_public_memes(viewer_user_id=full_user.id, limit=10)
+    full_search_page = await search_service.search_public_memes("action", viewer_user_id=full_user.id, limit=10)
+    full_tag_page = await service.browse_public_tag(tag, viewer_user_id=full_user.id, limit=10)
+    matched_template, full_template_page = await service.browse_public_template(
+        template.slug,
+        viewer_user_id=full_user.id,
+        limit=10,
+    )
+    full_saved_detail = await service.get_public_meme_detail(saved_meme.id, viewer_user_id=full_user.id)
+
+    anonymous_states = page_states(anonymous_page)
+    guest_states = page_states(guest_page)
+    full_states = page_states(full_page)
+    expected_full_states = {
+        favorite_meme.id: (True, False, False),
+        saved_meme.id: (False, True, False),
+        pinned_meme.id: (False, False, True),
+    }
+
+    assert set(anonymous_states) == {favorite_meme.id, saved_meme.id, pinned_meme.id}
+    assert all(state == (False, False, False) for state in anonymous_states.values())
+    assert guest_states[favorite_meme.id] == (True, True, False)
+    assert guest_states[saved_meme.id] == (False, False, False)
+    assert full_states == expected_full_states
+    assert page_states(full_search_page) == expected_full_states
+    assert page_states(full_tag_page) == expected_full_states
+    assert matched_template is not None
+    assert page_states(full_template_page) == expected_full_states
+    assert full_saved_detail.viewer_has_favorited is False
+    assert full_saved_detail.viewer_has_saved is True
+    assert full_saved_detail.viewer_has_pinned is False
+
+
+async def test_public_page_viewer_action_state_uses_fixed_query_count(
+    migrated_db_session: AsyncSession,
+    postgres_async_engine: AsyncEngine,
+) -> None:
+    memes = [await _create_meme(migrated_db_session, popularity_score=float(score)) for score in (30, 20, 10)]
+    user = User(account_type=AccountType.FULL)
+    migrated_db_session.add(user)
+    await migrated_db_session.flush()
+    user_id = user.id
+    favorites = Collection(
+        owner_id=user.id,
+        title="Favorites",
+        kind=CollectionKind.FAVORITES,
+        visibility=CollectionVisibility.PRIVATE,
+    )
+    active_collection = Collection(
+        owner_id=user.id,
+        title="Saved reactions",
+        kind=CollectionKind.CUSTOM,
+        visibility=CollectionVisibility.PRIVATE,
+    )
+    migrated_db_session.add_all([favorites, active_collection])
+    await migrated_db_session.flush()
+    user.active_save_collection_id = active_collection.id
+    migrated_db_session.add_all(
+        [
+            CollectionMeme(collection_id=favorites.id, meme_id=memes[0].id, added_by_user_id=user.id),
+            CollectionMeme(collection_id=active_collection.id, meme_id=memes[1].id, added_by_user_id=user.id),
+            PinnedMeme(user_id=user.id, meme_id=memes[2].id, position=1),
+        ]
+    )
+    await migrated_db_session.flush()
+    service = MemeSearchService(migrated_db_session)
+
+    async def count_selects(limit: int) -> int:
+        migrated_db_session.expire_all()
+        select_count = 0
+
+        def count_select(_conn: object, _cursor: object, statement: str, *_args: object) -> None:
+            nonlocal select_count
+            if statement.lstrip().upper().startswith("SELECT"):
+                select_count += 1
+
+        event.listen(postgres_async_engine.sync_engine, "before_cursor_execute", count_select)
+        try:
+            page = await service.browse_public_memes(viewer_user_id=user_id, limit=limit)
+        finally:
+            event.remove(postgres_async_engine.sync_engine, "before_cursor_execute", count_select)
+        assert len(page.items) == limit
+        return select_count
+
+    one_item_selects = await count_selects(1)
+    three_item_selects = await count_selects(3)
+
+    assert one_item_selects > 0
+    assert three_item_selects == one_item_selects
 
 
 async def test_public_video_detail_uses_direct_media_base_without_imgproxy(
