@@ -34,6 +34,7 @@ class AuthErrorCode(StrEnum):
     INVALID_CREDENTIALS = "invalid_credentials"
     EMAIL_ALREADY_IN_USE = "email_already_in_use"
     ACCOUNT_UNAVAILABLE = "account_unavailable"
+    ADMIN_REQUIRED = "admin_required"
     UPGRADE_REQUIRED = "upgrade_required"
     GUEST_ACCOUNT_REQUIRED = "guest_account_required"
     ACCOUNT_LINK_ALREADY_COMPLETED = "account_link_already_completed"

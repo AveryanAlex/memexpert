@@ -455,6 +455,29 @@ async def test_csrf_logout_all_route_requires_header_when_browser_origin_present
     assert accepted_response.headers["Access-Control-Allow-Credentials"] == "true"
 
 
+async def test_csrf_admin_browser_writes_require_header_before_auth_dependency(
+    browser_security_client: AsyncClient,
+) -> None:
+    rejected_response = await browser_security_client.post(
+        "/api/v1/admin/source-channels",
+        headers={"Origin": "https://app.memexpert.net"},
+        json={"platform": "telegram", "platform_id": "source", "title": "Source"},
+    )
+    accepted_response = await browser_security_client.post(
+        "/api/v1/admin/source-channels",
+        headers={
+            "Origin": "https://app.memexpert.net",
+            "X-Requested-With": BROWSER_REQUESTED_WITH_VALUE,
+        },
+        json={"platform": "telegram", "platform_id": "source", "title": "Source"},
+    )
+
+    assert rejected_response.status_code == 403
+    assert rejected_response.json()["code"] == "csrf_failed"
+    assert accepted_response.status_code == 401
+    assert accepted_response.json()["code"] == "invalid_token"
+
+
 @pytest.mark.parametrize(
     ("field_name", "value"),
     [

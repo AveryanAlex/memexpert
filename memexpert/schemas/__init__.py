@@ -1,5 +1,11 @@
 """Public schema exports for service and FastAPI boundaries."""
 
+from memexpert.schemas.admin import (
+    AdminMemeRead,
+    AdminMemeTemplateRead,
+    AdminSessionRead,
+    AdminSourceChannelRead,
+)
 from memexpert.schemas.auth import (
     AuthErrorCode,
     AuthErrorResponse,
@@ -43,6 +49,10 @@ from memexpert.schemas.user import (
 __all__ = [
     "AccountDeletionLogRead",
     "AccountMergeLogRead",
+    "AdminMemeRead",
+    "AdminMemeTemplateRead",
+    "AdminSessionRead",
+    "AdminSourceChannelRead",
     "AnalyticsEventRead",
     "AuthErrorCode",
     "AuthErrorResponse",

@@ -183,6 +183,21 @@ async def test_metadata_creates_full_schema_on_postgres(postgres_async_engine: A
         await connection.run_sync(metadata.drop_all, checkfirst=True)
 
 
+async def test_user_admin_flag_defaults_false_in_memory_and_when_persisted(
+    model_contract_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    user = User()
+
+    assert user.is_admin is False
+
+    async with model_contract_session_factory() as session:
+        session.add(user)
+        await session.commit()
+        await session.refresh(user)
+
+        assert user.is_admin is False
+
+
 async def test_schema_handles_cycles_multi_invites_and_nullable_content_fields(
     model_contract_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -684,6 +699,7 @@ def test_public_schemas_validate_from_attributes_and_reject_invalid_enums() -> N
         created_at=now,
         updated_at=now,
     )
+    default_user = User()
     collection = Collection(
         id=collection_id,
         owner_id=user.id,
@@ -717,9 +733,24 @@ def test_public_schemas_validate_from_attributes_and_reject_invalid_enums() -> N
     )
 
     user_payload = UserRead.model_validate(user).model_dump(mode="json")
+    default_user_payload = UserRead.model_validate(
+        User(
+            id=uuid.uuid7(),
+            account_type=AccountType.GUEST,
+            status=AccountStatus.ACTIVE,
+            language=UserLanguage.ANY,
+            nsfw_enabled=False,
+            token_nonce=0,
+            created_at=now,
+            updated_at=now,
+        )
+    ).model_dump(mode="json")
     collection_payload = CollectionRead.model_validate(collection).model_dump(mode="json")
 
     assert user_payload["account_type"] == AccountType.FULL.value
+    assert user_payload["is_admin"] is False
+    assert default_user.is_admin is False
+    assert default_user_payload["is_admin"] is False
     assert user_payload["language"] == UserLanguage.RU.value
     assert collection_payload["kind"] == CollectionKind.FAVORITES.value
     assert collection_payload["memberships"][0]["role"] == CollectionMembershipRole.OWNER.value
@@ -737,6 +768,7 @@ def test_public_schemas_validate_from_attributes_and_reject_invalid_enums() -> N
                 "email_verified_at": None,
                 "active_save_collection_id": None,
                 "nsfw_enabled": False,
+                "is_admin": False,
                 "language": UserLanguage.ANY.value,
                 "last_active_at": None,
                 "guest_expires_at": None,

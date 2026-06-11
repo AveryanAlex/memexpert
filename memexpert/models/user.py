@@ -55,6 +55,12 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         Index("ix_users_account_type_status", "account_type", "status"),
     )
 
+    def __init__(self, **kwargs: object) -> None:
+        """Apply security-sensitive defaults for transient ORM instances too."""
+
+        kwargs.setdefault("is_admin", False)
+        super().__init__(**kwargs)
+
     account_type: Mapped[AccountType] = mapped_column(
         string_enum(AccountType),
         default=AccountType.GUEST,
@@ -75,6 +81,7 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         nullable=True,
     )
     nsfw_enabled: Mapped[bool] = mapped_column(default=False, nullable=False)
+    is_admin: Mapped[bool] = mapped_column(default=False, server_default=text("false"), nullable=False)
     language: Mapped[UserLanguage] = mapped_column(
         string_enum(UserLanguage),
         default=UserLanguage.ANY,

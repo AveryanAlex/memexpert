@@ -6,6 +6,7 @@ from memexpert.services.account_link_service import (
     LinkedProvidersProjection,
     TelegramLinkStartResult,
 )
+from memexpert.services.admin import AdminConflictError, AdminNotFoundError, AdminService, AdminServiceError
 from memexpert.services.auth_service import (
     ACCESS_TOKEN_TYPE,
     HS256_ALGORITHM,
@@ -89,6 +90,10 @@ __all__ = [
     "AccountLinkResult",
     "AccountLinkService",
     "AccountUnavailableError",
+    "AdminConflictError",
+    "AdminNotFoundError",
+    "AdminService",
+    "AdminServiceError",
     "AuthenticatedUserNotFoundError",
     "AuthConfigurationError",
     "AuthService",

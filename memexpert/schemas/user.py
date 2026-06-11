@@ -97,6 +97,7 @@ class UserRead(ORMSchema):
     email_verified_at: datetime | None
     active_save_collection_id: uuid.UUID | None
     nsfw_enabled: bool
+    is_admin: bool
     language: UserLanguage
     last_active_at: datetime | None
     guest_expires_at: datetime | None

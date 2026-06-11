@@ -21,7 +21,8 @@ a {
 }
 
 button,
-input {
+input,
+select {
   font: inherit;
 }
 
@@ -96,7 +97,11 @@ input {
 }
 
 .search-form button,
-.button-link {
+.button-link,
+.admin-form button,
+.inline-form button,
+.admin-row button,
+.template-form button {
   border: 0;
   border-radius: 18px;
   background: #17212f;
@@ -105,6 +110,12 @@ input {
   font-weight: 800;
   padding: 15px 20px;
   text-decoration: none;
+}
+
+.secondary-button {
+  background: #fffaf1 !important;
+  border: 1px solid #dfd4c4 !important;
+  color: #17212f !important;
 }
 
 .button-link.secondary {
@@ -195,11 +206,77 @@ input {
 
 .empty-state,
 .notice,
-.detail-card {
+.detail-card,
+.admin-panel {
   border: 1px solid #dfd4c4;
   border-radius: 28px;
   background: #fffaf1;
   padding: 24px;
+}
+
+.admin-hero h1 {
+  margin: 10px 0;
+  font-size: clamp(2.4rem, 8vw, 5.2rem);
+  line-height: 0.9;
+  letter-spacing: -0.075em;
+}
+
+.admin-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) minmax(280px, 0.8fr);
+  gap: 16px;
+  margin: 18px 0;
+}
+
+.admin-panel {
+  margin-top: 16px;
+}
+
+.admin-panel h2 {
+  margin: 0 0 16px;
+}
+
+.admin-list,
+.admin-form,
+.template-form {
+  display: grid;
+  gap: 12px;
+}
+
+.admin-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  border-top: 1px solid #eadfce;
+  padding-top: 12px;
+}
+
+.inline-form,
+.template-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.admin-form input,
+.admin-form select,
+.inline-form input,
+.template-form input {
+  min-width: 0;
+  border: 1px solid #dfd4c4;
+  border-radius: 14px;
+  background: #fffaf1;
+  color: #17212f;
+  padding: 12px 14px;
+}
+
+.checkbox-row {
+  display: inline-flex;
+  gap: 8px;
+  align-items: center;
+  color: #594e42;
 }
 
 .detail-card {
@@ -222,7 +299,9 @@ input {
 
 @media (max-width: 780px) {
   .hero,
-  .detail-card {
+  .detail-card,
+  .admin-grid,
+  .admin-row {
     grid-template-columns: 1fr;
   }
 

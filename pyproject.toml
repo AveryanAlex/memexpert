@@ -43,6 +43,7 @@ dev = [
 
 [project.scripts]
 memexpert-api = "memexpert.api.main:main"
+memexpert-admin-users = "scripts.admin_users:main"
 memexpert-bot = "memexpert.bot.main:main"
 memexpert-workers = "memexpert.workers.main:main"
 
