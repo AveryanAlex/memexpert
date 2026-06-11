@@ -9,11 +9,11 @@ Minimal SvelteKit MVP for the public meme catalog. It uses the existing FastAPI 
 ## Local Commands
 
 ```sh
-npm install
-npm run dev
-npm run check
-npm test
-npm run build
+pnpm install
+pnpm dev
+pnpm check
+pnpm test
+pnpm build
 ```
 
 ## CI Commands
@@ -21,8 +21,8 @@ npm run build
 Run these from `frontend/`:
 
 ```sh
-npm ci
-npm run check
-npm test
-npm run build
+pnpm install --frozen-lockfile
+pnpm check
+pnpm test
+pnpm build
 ```
