@@ -12,7 +12,9 @@ import pytest
 from memexpert.api.dependencies.meme import get_meme_search_service
 from memexpert.core.meilisearch import PipelineMeilisearchSyncClient
 from memexpert.core.qdrant import PipelineQdrantUserSearchClient, QdrantUserSearchMatch
+from memexpert.core.voyage import PipelineVoyageClient
 from memexpert.services.meme_search import MemeSearchService
+from memexpert.services.query_embedding import CachedTextQueryEmbeddingService
 
 if TYPE_CHECKING:
     from memexpert.core.config import Settings
@@ -76,11 +78,14 @@ async def test_user_search_client_parses_valid_matches_and_skips_invalid_payload
     ]
 
 
-def test_meme_search_dependency_wires_lazy_text_and_semantic_clients() -> None:
+def test_meme_search_dependency_wires_lazy_text_semantic_and_embedding_clients() -> None:
     service = get_meme_search_service(cast("Any", object()))
 
     assert isinstance(service, MemeSearchService)
     assert isinstance(service._text_client, PipelineMeilisearchSyncClient)
     assert isinstance(service._semantic_client, PipelineQdrantUserSearchClient)
+    assert isinstance(service._query_embedding_client, CachedTextQueryEmbeddingService)
+    assert isinstance(service._query_embedding_client._provider, PipelineVoyageClient)
+    assert service._query_embedding_client._cache_session_factory is not None
     assert service._text_client._client is None
     assert service._semantic_client._client is None

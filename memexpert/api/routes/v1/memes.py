@@ -25,11 +25,22 @@ async def search_memes(
     media_type: Annotated[ContentKind | None, Query()] = None,
     include_nsfw: Annotated[bool, Query()] = False,
     tags: Annotated[list[str] | None, Query()] = None,
-    query_vector: Annotated[list[float] | None, Query()] = None,
+    query_vector: Annotated[
+        list[float] | None,
+        Query(
+            include_in_schema=False,
+            description="Internal debug/test override; normal callers should pass query text only.",
+        ),
+    ] = None,
     limit: Annotated[int, Query(ge=1, le=100)] = 20,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> MemeSearchPageRead:
-    """Run hybrid indexed search and return DB-backed meme card DTOs."""
+    """Run hybrid indexed search and return DB-backed meme card DTOs.
+
+    Plain text in ``query`` is embedded inside the service boundary before Qdrant
+    search. ``query_vector`` is retained only as an internal/debug override for
+    tests and manual diagnostics.
+    """
 
     nsfw_allowed = include_nsfw and bool(current_user and current_user.nsfw_enabled)
     filters = MemeSearchFilters(
