@@ -186,6 +186,7 @@ class CrawlerIngestOutcome(StrEnum):
     INGESTED = "ingested"
     DEDUPLICATED_EXACT = "deduplicated_exact"
     DEDUPLICATED_SIMILAR = "deduplicated_similar"
+    BLOCKED_PERCEPTUAL_HASH = "blocked_perceptual_hash"
     SKIPPED_UNSUPPORTED_MEDIA = "skipped_unsupported_media"
     SKIPPED_PAUSED_CHANNEL = "skipped_paused_channel"
     SKIPPED_DUPLICATE_POST_ID = "skipped_duplicate_post_id"

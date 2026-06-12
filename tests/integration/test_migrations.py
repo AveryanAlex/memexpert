@@ -28,6 +28,8 @@ EXPECTED_TABLES = {
     "account_deletion_logs",
     "account_merge_logs",
     "analytics_events",
+    "blocked_perceptual_hash_audit_logs",
+    "blocked_perceptual_hashes",
     "channel_suggestions",
     "collection_invites",
     "collection_members",
@@ -252,9 +254,9 @@ def test_initial_revision_metadata_is_present() -> None:
     revision = script_directory.get_revision("head")
 
     assert revision is not None
-    assert revision.revision == "0012"
-    assert revision.down_revision == "0011"
-    assert revision.doc == "admin meme destructive audit"
+    assert revision.revision == "0013"
+    assert revision.down_revision == "0012"
+    assert revision.doc == "blocked perceptual hashes"
 
 
 async def test_upgrade_head_creates_expected_schema_and_constraints(
@@ -267,7 +269,7 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
 
     table_names = await _get_table_names(engine)
     assert table_names == EXPECTED_TABLES | {"alembic_version"}
-    assert await _get_current_revision(engine) == "0012"
+    assert await _get_current_revision(engine) == "0013"
     assert await _get_materialized_view_names(engine) == EXPECTED_MATERIALIZED_VIEWS
 
     users_indexes = await _get_index_definitions(engine, "users")
@@ -286,6 +288,10 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
     meme_merge_log_columns = await _get_column_names(engine, "meme_merge_logs")
     admin_meme_audit_columns = await _get_column_names(engine, "admin_meme_destructive_audit_logs")
     admin_meme_audit_indexes = await _get_index_definitions(engine, "admin_meme_destructive_audit_logs")
+    blocked_hash_columns = await _get_column_names(engine, "blocked_perceptual_hashes")
+    blocked_hash_indexes = await _get_index_definitions(engine, "blocked_perceptual_hashes")
+    blocked_hash_audit_columns = await _get_column_names(engine, "blocked_perceptual_hash_audit_logs")
+    blocked_hash_audit_indexes = await _get_index_definitions(engine, "blocked_perceptual_hash_audit_logs")
     pipeline_stage_journal_columns = await _get_column_names(engine, "pipeline_stage_journal")
     constraints = await _inspect_constraints(engine)
 
@@ -311,6 +317,7 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
 
     assert "uq_meme_files_single_primary_per_meme" in meme_files_indexes
     assert "is_primary" in meme_files_indexes["uq_meme_files_single_primary_per_meme"]
+    assert "blocked_perceptual_hash_id" in await _get_column_names(engine, "meme_files")
     assert any(
         foreign_key["name"] == "fk_memes_primary_file_id_meme_files"
         and foreign_key["constrained_columns"] == ["primary_file_id"]
@@ -349,6 +356,36 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
     assert "status" in pipeline_stage_journal_indexes["ix_pipeline_stage_journal_stage_status"]
     assert "ix_pipeline_stage_journal_status_retry_after" in pipeline_stage_journal_indexes
     assert "retry_after" in pipeline_stage_journal_indexes["ix_pipeline_stage_journal_status_retry_after"]
+    assert blocked_hash_columns == {
+        "created_at",
+        "created_by_admin_user_id",
+        "hash_algorithm",
+        "hash_size",
+        "id",
+        "is_active",
+        "max_hamming_distance",
+        "note",
+        "perceptual_hash",
+        "reason",
+        "updated_at",
+    }
+    assert "uq_blocked_perceptual_hashes_algorithm_size_hash" in blocked_hash_indexes
+    assert "hash_algorithm" in blocked_hash_indexes["uq_blocked_perceptual_hashes_algorithm_size_hash"]
+    assert "hash_size" in blocked_hash_indexes["uq_blocked_perceptual_hashes_algorithm_size_hash"]
+    assert "perceptual_hash" in blocked_hash_indexes["uq_blocked_perceptual_hashes_algorithm_size_hash"]
+    assert "ix_blocked_perceptual_hashes_active_algorithm" in blocked_hash_indexes
+    assert "is_active" in blocked_hash_indexes["ix_blocked_perceptual_hashes_active_algorithm"]
+    assert blocked_hash_audit_columns == {
+        "action",
+        "admin_user_id",
+        "blocked_perceptual_hash_id",
+        "created_at",
+        "id",
+        "new_values",
+        "note",
+        "previous_values",
+    }
+    assert "ix_blocked_perceptual_hash_audit_logs_hash_created_at" in blocked_hash_audit_indexes
     assert pipeline_stage_journal_columns == {
         "attempt_count",
         "created_at",
@@ -529,7 +566,7 @@ async def test_crawler_sources_migration_applies_and_reverses(
     config = _build_alembic_config(database_url)
 
     await _run_alembic_command(command.upgrade, config, "head")
-    assert await _get_current_revision(engine) == "0012"
+    assert await _get_current_revision(engine) == "0013"
 
     meme_sources_columns = await _get_column_names(engine, "meme_sources")
     source_channels_columns = await _get_column_names(engine, "source_channels")
@@ -625,7 +662,7 @@ async def test_repeated_fresh_database_upgrades_work_after_a_full_downgrade(
     await _run_alembic_command(command.downgrade, config, "base")
     await _run_alembic_command(command.upgrade, config, "head")
 
-    assert await _get_current_revision(engine) == "0012"
+    assert await _get_current_revision(engine) == "0013"
     assert EXPECTED_TABLES.issubset(await _get_table_names(engine))
 
 

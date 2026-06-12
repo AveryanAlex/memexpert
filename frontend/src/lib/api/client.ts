@@ -1,4 +1,6 @@
 import type {
+  AdminBlockedPerceptualHashActionRead,
+  AdminBlockedPerceptualHashRead,
   AdminMemeDestructiveActionRead,
   AdminMemeDetailRead,
   AdminMemeRead,
@@ -323,20 +325,22 @@ export async function fetchAdminDashboard(request: CatalogRequest): Promise<{
   suggestions: ChannelSuggestionRead[];
   sourceChannels: AdminSourceChannelRead[];
   templates: AdminMemeTemplateRead[];
+  blockedPerceptualHashes: AdminBlockedPerceptualHashRead[];
   memes: AdminMemeRead[];
   reports: AdminModerationReportRead[];
   decisions: AdminModerationDecisionRead[];
 }> {
-  const [suggestions, sourceChannels, templates, memes, reports, decisions] = await Promise.all([
+  const [suggestions, sourceChannels, templates, blockedPerceptualHashes, memes, reports, decisions] = await Promise.all([
     apiGet<ChannelSuggestionRead[]>('/api/v1/admin/channel-suggestions', new URLSearchParams(), request),
     apiGet<AdminSourceChannelRead[]>('/api/v1/admin/source-channels', new URLSearchParams(), request),
     apiGet<AdminMemeTemplateRead[]>('/api/v1/admin/meme-templates', new URLSearchParams(), request),
+    apiGet<AdminBlockedPerceptualHashRead[]>('/api/v1/admin/blocked-perceptual-hashes', new URLSearchParams(), request),
     apiGet<AdminMemeRead[]>('/api/v1/admin/memes', new URLSearchParams({ limit: '20' }), request),
     apiGet<AdminModerationReportRead[]>('/api/v1/admin/moderation-reports', new URLSearchParams({ limit: '20' }), request),
     apiGet<AdminModerationDecisionRead[]>('/api/v1/admin/moderation-decisions', new URLSearchParams({ limit: '20' }), request)
   ]);
 
-  return { suggestions, sourceChannels, templates, memes, reports, decisions };
+  return { suggestions, sourceChannels, templates, blockedPerceptualHashes, memes, reports, decisions };
 }
 
 export async function fetchAdminMemeDetail(request: CatalogRequest, memeId: string): Promise<AdminMemeDetailRead> {
@@ -418,6 +422,43 @@ export async function deleteMemeTemplate(
 ): Promise<AdminMemeTemplateActionRead> {
   return apiWrite<AdminMemeTemplateActionRead>(
     `/api/v1/admin/meme-templates/${encodeURIComponent(templateId)}`,
+    'DELETE',
+    request
+  );
+}
+
+export async function createBlockedPerceptualHash(request: JsonMutationRequest): Promise<AdminBlockedPerceptualHashRead> {
+  return apiWrite<AdminBlockedPerceptualHashRead>('/api/v1/admin/blocked-perceptual-hashes', 'POST', request);
+}
+
+export async function updateBlockedPerceptualHash(
+  request: JsonMutationRequest,
+  blockedHashId: string
+): Promise<AdminBlockedPerceptualHashRead> {
+  return apiWrite<AdminBlockedPerceptualHashRead>(
+    `/api/v1/admin/blocked-perceptual-hashes/${encodeURIComponent(blockedHashId)}`,
+    'PATCH',
+    request
+  );
+}
+
+export async function deactivateBlockedPerceptualHash(
+  request: JsonMutationRequest,
+  blockedHashId: string
+): Promise<AdminBlockedPerceptualHashActionRead> {
+  return apiWrite<AdminBlockedPerceptualHashActionRead>(
+    `/api/v1/admin/blocked-perceptual-hashes/${encodeURIComponent(blockedHashId)}/deactivate`,
+    'POST',
+    request
+  );
+}
+
+export async function deleteBlockedPerceptualHash(
+  request: CatalogRequest,
+  blockedHashId: string
+): Promise<AdminBlockedPerceptualHashActionRead> {
+  return apiWrite<AdminBlockedPerceptualHashActionRead>(
+    `/api/v1/admin/blocked-perceptual-hashes/${encodeURIComponent(blockedHashId)}`,
     'DELETE',
     request
   );

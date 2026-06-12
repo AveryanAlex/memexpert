@@ -9,6 +9,13 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, field_validator, model_validator
 
+from memexpert.core.perceptual_hashes import (
+    DEFAULT_PERCEPTUAL_HASH_ALGORITHM,
+    MAX_PERCEPTUAL_HASH_HEX_LENGTH,
+    normalize_hash_algorithm,
+    normalize_perceptual_hash,
+    perceptual_hash_bit_size,
+)
 from memexpert.models.enums import (
     ChannelSuggestionStatus,
     ContentKind,
@@ -29,6 +36,7 @@ MAX_ADMIN_NOTE_LENGTH = 2048
 MAX_TEMPLATE_SLUG_LENGTH = 255
 MAX_TEMPLATE_NAME_LENGTH = 255
 MAX_DESTRUCTIVE_CONFIRMATION_LENGTH = 128
+MAX_HASH_ALGORITHM_LENGTH = 32
 
 
 class AdminSessionRead(BaseModel):
@@ -210,6 +218,154 @@ class AdminMemeTemplateActionRead(BaseModel):
     message: str
 
 
+class AdminBlockedPerceptualHashRead(ORMSchema):
+    """Admin projection for a blocked perceptual-hash pattern."""
+
+    model_config = ConfigDict(extra="forbid", from_attributes=True)
+
+    id: uuid.UUID
+    perceptual_hash: str
+    hash_algorithm: str
+    hash_size: int
+    max_hamming_distance: int
+    reason: ModerationReason
+    note: str | None
+    is_active: bool
+    created_by_admin_user_id: uuid.UUID | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class AdminBlockedPerceptualHashCreateRequest(BaseModel):
+    """Create a durable blocked perceptual-hash pattern."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    perceptual_hash: str = Field(min_length=1, max_length=MAX_PERCEPTUAL_HASH_HEX_LENGTH)
+    hash_algorithm: str = Field(
+        default=DEFAULT_PERCEPTUAL_HASH_ALGORITHM,
+        min_length=1,
+        max_length=MAX_HASH_ALGORITHM_LENGTH,
+    )
+    hash_size: StrictInt | None = Field(default=None, ge=1)
+    max_hamming_distance: StrictInt = Field(default=0, ge=0)
+    reason: ModerationReason = ModerationReason.OTHER
+    note: str | None = Field(default=None, max_length=MAX_ADMIN_NOTE_LENGTH)
+    is_active: StrictBool = True
+
+    @field_validator("perceptual_hash")
+    @classmethod
+    def _normalize_perceptual_hash(cls, value: str) -> str:
+        return normalize_perceptual_hash(value)
+
+    @field_validator("hash_algorithm")
+    @classmethod
+    def _normalize_hash_algorithm(cls, value: str) -> str:
+        normalized = normalize_hash_algorithm(value)
+        if normalized != DEFAULT_PERCEPTUAL_HASH_ALGORITHM:
+            raise ValueError("Only the phash perceptual hash algorithm is currently enforced by ingest.")
+        return normalized
+
+    @field_validator("note")
+    @classmethod
+    def _normalize_note(cls, value: str | None) -> str | None:
+        return normalize_optional_text(value)
+
+    @model_validator(mode="after")
+    def _derive_and_check_hash_size(self) -> AdminBlockedPerceptualHashCreateRequest:
+        derived_size = perceptual_hash_bit_size(self.perceptual_hash)
+        if self.hash_size is None:
+            self.hash_size = derived_size
+        if self.hash_size != derived_size:
+            raise ValueError("hash_size must match perceptual_hash bit length.")
+        if self.max_hamming_distance > self.hash_size:
+            raise ValueError("max_hamming_distance cannot exceed hash_size.")
+        return self
+
+
+class AdminBlockedPerceptualHashUpdateRequest(BaseModel):
+    """Partial update for a blocked perceptual-hash pattern."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    perceptual_hash: str | None = Field(default=None, min_length=1, max_length=MAX_PERCEPTUAL_HASH_HEX_LENGTH)
+    hash_algorithm: str | None = Field(default=None, min_length=1, max_length=MAX_HASH_ALGORITHM_LENGTH)
+    hash_size: StrictInt | None = Field(default=None, ge=1)
+    max_hamming_distance: StrictInt | None = Field(default=None, ge=0)
+    reason: ModerationReason | None = None
+    note: str | None = Field(default=None, max_length=MAX_ADMIN_NOTE_LENGTH)
+    is_active: StrictBool | None = None
+
+    @field_validator("perceptual_hash")
+    @classmethod
+    def _normalize_perceptual_hash(cls, value: str | None) -> str | None:
+        return None if value is None else normalize_perceptual_hash(value)
+
+    @field_validator("hash_algorithm")
+    @classmethod
+    def _normalize_hash_algorithm(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = normalize_hash_algorithm(value)
+        if normalized != DEFAULT_PERCEPTUAL_HASH_ALGORITHM:
+            raise ValueError("Only the phash perceptual hash algorithm is currently enforced by ingest.")
+        return normalized
+
+    @field_validator("note")
+    @classmethod
+    def _normalize_note(cls, value: str | None) -> str | None:
+        return normalize_optional_text(value)
+
+    @model_validator(mode="after")
+    def _check_inline_hash_size(self) -> AdminBlockedPerceptualHashUpdateRequest:
+        if self.perceptual_hash is not None:
+            derived_size = perceptual_hash_bit_size(self.perceptual_hash)
+            if self.hash_size is None:
+                self.hash_size = derived_size
+            if self.hash_size != derived_size:
+                raise ValueError("hash_size must match perceptual_hash bit length.")
+        return self
+
+
+class AdminBlockedPerceptualHashDeactivateRequest(BaseModel):
+    """Optional audit note for blocked pHash deactivation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    note: str | None = Field(default=None, max_length=MAX_ADMIN_NOTE_LENGTH)
+
+    @field_validator("note")
+    @classmethod
+    def _normalize_note(cls, value: str | None) -> str | None:
+        return normalize_optional_text(value)
+
+
+class AdminBlockedPerceptualHashActionRead(BaseModel):
+    """Result of a safe blocked pHash admin action."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["deactivate", "delete"]
+    blocked_perceptual_hash_id: uuid.UUID
+    matched_meme_file_count: int
+    message: str
+
+
+class AdminBlockedPerceptualHashAuditRead(ORMSchema):
+    """Immutable blocked pHash lifecycle audit row."""
+
+    model_config = ConfigDict(extra="forbid", from_attributes=True)
+
+    id: uuid.UUID
+    blocked_perceptual_hash_id: uuid.UUID
+    admin_user_id: uuid.UUID | None
+    action: str
+    previous_values: dict[str, object]
+    new_values: dict[str, object]
+    note: str | None
+    created_at: datetime
+
+
 class AdminMemeRead(ORMSchema):
     """Minimal admin meme moderation row."""
 
@@ -359,6 +515,12 @@ class AdminMemeDetailRead(BaseModel):
 
 
 __all__ = [
+    "AdminBlockedPerceptualHashActionRead",
+    "AdminBlockedPerceptualHashAuditRead",
+    "AdminBlockedPerceptualHashCreateRequest",
+    "AdminBlockedPerceptualHashDeactivateRequest",
+    "AdminBlockedPerceptualHashRead",
+    "AdminBlockedPerceptualHashUpdateRequest",
     "AdminChannelSuggestionReviewRequest",
     "AdminMemeTemplateActionRead",
     "AdminMemeTemplateCreateRequest",

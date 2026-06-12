@@ -42,6 +42,7 @@ DEFAULT_STUCK_AFTER_SECONDS = 60
 
 PIPELINE_REASON_PUBLISH_FAILED = "publish_failed"
 PIPELINE_REASON_REPLAY_REQUESTED = "replay_requested"
+PIPELINE_REASON_BLOCKED_PERCEPTUAL_HASH = "blocked_perceptual_hash"
 
 # Maximum number of items accepted by the per-target batch replay endpoint.
 # Kept small so operators cannot accidentally requeue an entire corpus in one
@@ -154,6 +155,7 @@ __all__ = [
     "MAX_PIPELINE_ITEMS_LIMIT",
     "NEXT_STAGE_BY_STAGE",
     "PIPELINE_REASON_PUBLISH_FAILED",
+    "PIPELINE_REASON_BLOCKED_PERCEPTUAL_HASH",
     "PIPELINE_REASON_REPLAY_REQUESTED",
     "PIPELINE_REASON_SYNC_MEILI_MALFORMED_PAYLOAD",
     "PIPELINE_REASON_SYNC_QDRANT_MALFORMED_PAYLOAD",

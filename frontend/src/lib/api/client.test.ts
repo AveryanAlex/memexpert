@@ -3,8 +3,11 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   addSourceChannel,
   ApiError,
+  createBlockedPerceptualHash,
   createCollection,
   createCollectionInvite,
+  deactivateBlockedPerceptualHash,
+  deleteBlockedPerceptualHash,
   deleteCollection,
   favoriteMeme,
   fetchAdminDashboard,
@@ -33,6 +36,7 @@ import {
   unfavoriteMeme,
   unpinMeme,
   updateActiveSaveCollection,
+  updateBlockedPerceptualHash,
   updateMemeModeration,
   type ApiFetch
 } from './client';
@@ -646,8 +650,65 @@ describe('admin API client', () => {
 
     expect(dashboard.reports).toHaveLength(1);
     expect(dashboard.decisions).toHaveLength(1);
+    expect(calls).toContain('/api/v1/admin/blocked-perceptual-hashes?');
     expect(calls).toContain('/api/v1/admin/moderation-reports?limit=20');
     expect(calls).toContain('/api/v1/admin/moderation-decisions?limit=20');
+  });
+
+  it('manages blocked perceptual hashes through admin endpoints', async () => {
+    const blockedHashId = '66666666-6666-4666-8666-666666666666';
+    const calls: Array<{ method: string | undefined; path: string; body: unknown }> = [];
+    const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      calls.push({
+        method: init?.method,
+        path: url.pathname,
+        body: init?.body ? JSON.parse(String(init.body)) : null
+      });
+      return jsonResponse(blockedPhashPayload({ id: blockedHashId }));
+    }) satisfies ApiFetch;
+
+    await createBlockedPerceptualHash({
+      fetch: mockFetch,
+      baseUrl: 'https://api.memexpert.test',
+      body: { perceptual_hash: 'abcdef1234567890', hash_size: 64, max_hamming_distance: 1, reason: 'spam' }
+    });
+    await updateBlockedPerceptualHash(
+      {
+        fetch: mockFetch,
+        baseUrl: 'https://api.memexpert.test',
+        body: { max_hamming_distance: 2, note: 'updated' }
+      },
+      blockedHashId
+    );
+    await deactivateBlockedPerceptualHash(
+      { fetch: mockFetch, baseUrl: 'https://api.memexpert.test', body: { note: 'pause' } },
+      blockedHashId
+    );
+    await deleteBlockedPerceptualHash({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test' }, blockedHashId);
+
+    expect(calls).toEqual([
+      {
+        method: 'POST',
+        path: '/api/v1/admin/blocked-perceptual-hashes',
+        body: { perceptual_hash: 'abcdef1234567890', hash_size: 64, max_hamming_distance: 1, reason: 'spam' }
+      },
+      {
+        method: 'PATCH',
+        path: `/api/v1/admin/blocked-perceptual-hashes/${blockedHashId}`,
+        body: { max_hamming_distance: 2, note: 'updated' }
+      },
+      {
+        method: 'POST',
+        path: `/api/v1/admin/blocked-perceptual-hashes/${blockedHashId}/deactivate`,
+        body: { note: 'pause' }
+      },
+      {
+        method: 'DELETE',
+        path: `/api/v1/admin/blocked-perceptual-hashes/${blockedHashId}`,
+        body: null
+      }
+    ]);
   });
 
   it('resolves moderation reports through an audited admin write', async () => {
@@ -915,6 +976,22 @@ function moderationDecisionPayload() {
     new_is_public: true,
     new_is_nsfw: true,
     created_at: '2026-01-01T00:00:00Z'
+  };
+}
+
+function blockedPhashPayload(overrides: { id: string }) {
+  return {
+    id: overrides.id,
+    perceptual_hash: 'abcdef1234567890',
+    hash_algorithm: 'phash',
+    hash_size: 64,
+    max_hamming_distance: 1,
+    reason: 'spam',
+    note: null,
+    is_active: true,
+    created_by_admin_user_id: '11111111-1111-4111-8111-111111111111',
+    created_at: '2026-01-01T00:00:00Z',
+    updated_at: '2026-01-01T00:00:00Z'
   };
 }
 

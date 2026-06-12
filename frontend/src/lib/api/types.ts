@@ -355,6 +355,38 @@ export interface AdminMemeTemplateRead {
   updated_at: string;
 }
 
+export interface AdminBlockedPerceptualHashRead {
+  id: string;
+  perceptual_hash: string;
+  hash_algorithm: string;
+  hash_size: number;
+  max_hamming_distance: number;
+  reason: ModerationReason;
+  note: string | null;
+  is_active: boolean;
+  created_by_admin_user_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AdminBlockedPerceptualHashActionRead {
+  action: 'deactivate' | 'delete';
+  blocked_perceptual_hash_id: string;
+  matched_meme_file_count: number;
+  message: string;
+}
+
+export interface AdminBlockedPerceptualHashAuditRead {
+  id: string;
+  blocked_perceptual_hash_id: string;
+  admin_user_id: string | null;
+  action: string;
+  previous_values: Record<string, unknown>;
+  new_values: Record<string, unknown>;
+  note: string | null;
+  created_at: string;
+}
+
 export interface AdminMemeRead {
   id: string;
   media_type: ContentKind;

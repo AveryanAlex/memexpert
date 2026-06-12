@@ -192,9 +192,81 @@
 </AdminPanel>
 
 <AdminPanel title="Moderation Pattern Controls">
-  <Notice>
-    Blocked pHash controls are intentionally not shown yet. This repository stores file pHashes and uses them for duplicate detection, but it does not have a blocked-pattern model or ingest/moderation contract that would consume admin bans.
-  </Notice>
+  <div class="grid gap-4 lg:grid-cols-[minmax(280px,0.7fr)_minmax(0,1.3fr)]">
+    <form method="POST" action="?/createBlockedPerceptualHash" class="grid gap-3 rounded-2xl border border-line bg-soft/40 p-3">
+      <strong>Create blocked pHash</strong>
+      <FormRow label="Perceptual hash">
+        <Input name="perceptual_hash" placeholder="16 hex chars for 64-bit pHash" pattern="[0-9A-Fa-f]+" maxlength={64} required />
+      </FormRow>
+      <div class="grid gap-3 sm:grid-cols-2">
+        <FormRow label="Algorithm"><Input name="hash_algorithm" value="phash" maxlength={32} required /></FormRow>
+        <FormRow label="Max distance"><Input name="max_hamming_distance" type="number" min={0} value="0" required /></FormRow>
+      </div>
+      <div class="grid gap-3 sm:grid-cols-2">
+        <FormRow label="Reason">
+          <Select name="reason" required>
+            {#each moderationReasons as reason}
+              <option value={reason}>{reason}</option>
+            {/each}
+          </Select>
+        </FormRow>
+        <label class="inline-flex items-center gap-2 text-chiptext"><input name="is_active" type="checkbox" checked /> Active</label>
+      </div>
+      <FormRow label="Note"><Textarea name="note" rows={2} placeholder="why this pattern is blocked" /></FormRow>
+      <Button type="submit">Block pHash</Button>
+    </form>
+
+    <div class="grid gap-3">
+      {#if data.dashboard.blockedPerceptualHashes.length === 0}
+        <EmptyState title="No blocked pHashes" message="Create a pattern to quarantine matching uploads and crawler items during ingest." />
+      {:else}
+        {#each data.dashboard.blockedPerceptualHashes as blockedHash (blockedHash.id)}
+          <article class="grid gap-3 rounded-2xl border border-line bg-paper p-3">
+            <div class="flex flex-wrap items-start justify-between gap-2">
+              <div>
+                <strong class="font-mono text-sm">{blockedHash.perceptual_hash}</strong>
+                <p class="m-0 text-muted">
+                  {blockedHash.hash_algorithm} · {blockedHash.hash_size} bits · distance &lt;= {blockedHash.max_hamming_distance} · {blockedHash.reason}
+                </p>
+              </div>
+              <Badge>{blockedHash.is_active ? 'active' : 'inactive'}</Badge>
+            </div>
+            {#if blockedHash.note}
+              <p class="m-0 text-sm">{blockedHash.note}</p>
+            {/if}
+            <form method="POST" action="?/updateBlockedPerceptualHash" class="grid gap-2 lg:grid-cols-[1.3fr_0.7fr_0.5fr_0.7fr_1fr_auto]">
+              <input type="hidden" name="blocked_hash_id" value={blockedHash.id} />
+              <Input name="perceptual_hash" value={blockedHash.perceptual_hash} aria-label="Perceptual hash" pattern="[0-9A-Fa-f]+" maxlength={64} required />
+              <Input name="hash_algorithm" value={blockedHash.hash_algorithm} aria-label="Hash algorithm" maxlength={32} required />
+              <Input name="max_hamming_distance" type="number" min={0} value={blockedHash.max_hamming_distance} aria-label="Max Hamming distance" required />
+              <Select name="reason" aria-label="Reason">
+                {#each moderationReasons as reason}
+                  <option value={reason} selected={reason === blockedHash.reason}>{reason}</option>
+                {/each}
+              </Select>
+              <Input name="note" value={blockedHash.note ?? ''} aria-label="Note" />
+              <label class="inline-flex items-center gap-2 text-chiptext"><input name="is_active" type="checkbox" checked={blockedHash.is_active} /> Active</label>
+              <div class="lg:col-span-6"><Button type="submit">Save blocked pHash</Button></div>
+            </form>
+            <div class="flex flex-wrap gap-2">
+              {#if blockedHash.is_active}
+                <form method="POST" action="?/deactivateBlockedPerceptualHash" class="flex flex-wrap gap-2">
+                  <input type="hidden" name="blocked_hash_id" value={blockedHash.id} />
+                  <Input name="note" placeholder="deactivation note" />
+                  <Button type="submit" variant="secondary">Deactivate</Button>
+                </form>
+              {/if}
+              <form method="POST" action="?/deleteBlockedPerceptualHash">
+                <input type="hidden" name="blocked_hash_id" value={blockedHash.id} />
+                <Button type="submit" variant="secondary">Delete if unreferenced</Button>
+              </form>
+            </div>
+            <p class="m-0 text-xs text-muted">Blocked pHash ID: {blockedHash.id}</p>
+          </article>
+        {/each}
+      {/if}
+    </div>
+  </div>
 </AdminPanel>
 
 <AdminPanel title="Moderation Reports Queue">

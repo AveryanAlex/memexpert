@@ -262,6 +262,10 @@ class MemeFile(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     s3_original_key: Mapped[str] = mapped_column(Text, nullable=False)
     s3_web_video_key: Mapped[str | None] = mapped_column(Text, nullable=True)
     perceptual_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    blocked_perceptual_hash_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("blocked_perceptual_hashes.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     quality_score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     blur_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
     is_primary: Mapped[bool] = mapped_column(default=False, nullable=False)
@@ -307,6 +311,86 @@ class MemeFile(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         back_populates="meme_file",
         cascade="all, delete-orphan",
     )
+    blocked_perceptual_hash: Mapped["BlockedPerceptualHash | None"] = relationship(
+        "BlockedPerceptualHash",
+        back_populates="matched_meme_files",
+    )
+
+
+class BlockedPerceptualHash(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """Admin-managed perceptual-hash pattern consumed by real ingest paths."""
+
+    __tablename__ = "blocked_perceptual_hashes"
+    __table_args__ = (
+        UniqueConstraint(
+            "hash_algorithm",
+            "hash_size",
+            "perceptual_hash",
+            name="uq_blocked_perceptual_hashes_algorithm_size_hash",
+        ),
+        CheckConstraint("hash_size > 0", name="blocked_perceptual_hashes_hash_size_positive"),
+        CheckConstraint(
+            "max_hamming_distance >= 0 AND max_hamming_distance <= hash_size",
+            name="blocked_perceptual_hashes_distance_within_hash_size",
+        ),
+        CheckConstraint(
+            "perceptual_hash = lower(perceptual_hash)",
+            name="blocked_perceptual_hashes_hash_lowercase",
+        ),
+        CheckConstraint(
+            "perceptual_hash ~ '^[0-9a-f]+$'",
+            name="blocked_perceptual_hashes_hash_hex",
+        ),
+        CheckConstraint(
+            "hash_size = char_length(perceptual_hash) * 4",
+            name="blocked_perceptual_hashes_hash_size_matches_hash",
+        ),
+        Index("ix_blocked_perceptual_hashes_active_algorithm", "is_active", "hash_algorithm"),
+        Index("ix_blocked_perceptual_hashes_created_by_created_at", "created_by_admin_user_id", "created_at"),
+    )
+
+    perceptual_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    hash_algorithm: Mapped[str] = mapped_column(String(32), default="phash", nullable=False)
+    hash_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    max_hamming_distance: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    reason: Mapped[ModerationReason] = mapped_column(
+        string_enum(ModerationReason),
+        default=ModerationReason.OTHER,
+        nullable=False,
+    )
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_active: Mapped[bool] = mapped_column(default=True, nullable=False)
+    created_by_admin_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    matched_meme_files: Mapped[list["MemeFile"]] = relationship(
+        "MemeFile",
+        back_populates="blocked_perceptual_hash",
+    )
+
+
+class BlockedPerceptualHashAuditLog(UUIDPrimaryKeyMixin, Base):
+    """Immutable admin history for blocked perceptual-hash lifecycle changes."""
+
+    __tablename__ = "blocked_perceptual_hash_audit_logs"
+    __table_args__ = (
+        Index("ix_blocked_perceptual_hash_audit_logs_hash_created_at", "blocked_perceptual_hash_id", "created_at"),
+        Index("ix_blocked_perceptual_hash_audit_logs_admin_created_at", "admin_user_id", "created_at"),
+        Index("ix_blocked_perceptual_hash_audit_logs_action_created_at", "action", "created_at"),
+    )
+
+    blocked_perceptual_hash_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
+    admin_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+    previous_values: Mapped[dict[str, object]] = mapped_column(JSONB, default=dict, nullable=False)
+    new_values: Mapped[dict[str, object]] = mapped_column(JSONB, default=dict, nullable=False)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow, nullable=False)
 
 
 class PipelineStageJournal(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -737,6 +821,8 @@ class MemeMergeLog(UUIDPrimaryKeyMixin, Base):
 
 __all__ = [
     "AdminMemeDestructiveAuditLog",
+    "BlockedPerceptualHash",
+    "BlockedPerceptualHashAuditLog",
     "EmbeddingCache",
     "Meme",
     "MemeFile",

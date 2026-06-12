@@ -29,6 +29,7 @@ from memexpert.core.qdrant import (
 )
 from memexpert.core.voyage import VoyageEmbeddingResult
 from memexpert.models.content import (
+    BlockedPerceptualHash,
     EmbeddingCache,
     Meme,
     MemeFile,
@@ -37,6 +38,7 @@ from memexpert.models.content import (
     MemeMergeLog,
     MemePopularitySnapshot,
     MemeSource,
+    ModerationDecision,
     PipelineStageJournal,
     SourceChannel,
 )
@@ -46,6 +48,7 @@ from memexpert.models.enums import (
     ContentPipelineStage,
     ContentPipelineStageStatus,
     ContentProcessingStatus,
+    ModerationReason,
     SourcePlatform,
     SyncTargetKind,
     SyncTargetStatus,
@@ -378,6 +381,27 @@ async def _create_upload(
     return item.meme_file_id
 
 
+async def _seed_blocked_perceptual_hash(
+    session: AsyncSession,
+    *,
+    perceptual_hash: str,
+    max_hamming_distance: int,
+) -> BlockedPerceptualHash:
+    blocked_hash = BlockedPerceptualHash(
+        perceptual_hash=perceptual_hash.lower(),
+        hash_algorithm="phash",
+        hash_size=len(perceptual_hash) * 4,
+        max_hamming_distance=max_hamming_distance,
+        reason=ModerationReason.SPAM,
+        note="blocked in test",
+        is_active=True,
+    )
+    session.add(blocked_hash)
+    await session.commit()
+    await session.refresh(blocked_hash)
+    return blocked_hash
+
+
 async def test_create_upload_persists_before_publish_and_exposes_pending_downstream_state(
     migrated_db_session: AsyncSession,
     postgres_session_factory: async_sessionmaker[AsyncSession],
@@ -425,6 +449,131 @@ async def test_create_upload_persists_before_publish_and_exposes_pending_downstr
     assert persisted_file.height == 8
     assert persisted_file.mime_type == "image/png"
     assert persisted_meme.media_type is ContentKind.IMAGE
+
+
+async def test_create_upload_quarantines_active_blocked_phash_before_s3_and_dispatch(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    blocked_hash = await _seed_blocked_perceptual_hash(
+        migrated_db_session,
+        perceptual_hash="0000000000000001",
+        max_hamming_distance=1,
+    )
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    service = ContentPipelineService(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+        media_processor=FakeMediaProcessor(inspect_result=_make_distinct_upload_media_details(tag="0")),
+    )
+
+    item = await service.create_upload(
+        metadata=ContentPipelineUploadMetadata(
+            source_platform=SourcePlatform.TELEGRAM,
+            source_id="blocked-upload-source",
+            post_id="blocked-upload-post",
+            views=1,
+        ),
+        filename="blocked.png",
+        content_type="image/png",
+        media_bytes=b"blocked-upload-bytes",
+    )
+
+    assert item.current_stage is ContentPipelineStage.INGEST
+    assert item.current_status is ContentPipelineStageStatus.FAILED
+    assert item.normalized_reason == "blocked_perceptual_hash"
+    assert len(publisher.events) == 0
+    assert storage_client.put_calls == []
+    assert storage_client.delete_calls == []
+
+    async with postgres_session_factory() as session:
+        persisted_file = await session.scalar(select(MemeFile).where(MemeFile.id == item.meme_file_id))
+        persisted_meme = await session.scalar(select(Meme).where(Meme.id == item.meme_id))
+        transcode_stage = await session.scalar(
+            select(PipelineStageJournal).where(
+                PipelineStageJournal.meme_file_id == item.meme_file_id,
+                PipelineStageJournal.stage == ContentPipelineStage.TRANSCODE,
+            )
+        )
+        decision = await session.scalar(select(ModerationDecision).where(ModerationDecision.meme_id == item.meme_id))
+
+    assert persisted_file is not None
+    assert persisted_file.status is ContentProcessingStatus.FAILED
+    assert persisted_file.blocked_perceptual_hash_id == blocked_hash.id
+    assert persisted_meme is not None
+    assert persisted_meme.is_public is False
+    assert transcode_stage is None
+    assert decision is not None
+    assert decision.reason is ModerationReason.SPAM
+    assert str(blocked_hash.id) in (decision.note or "")
+
+
+async def test_deactivated_blocked_phash_does_not_poison_future_duplicate_matching(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    blocked_hash = await _seed_blocked_perceptual_hash(
+        migrated_db_session,
+        perceptual_hash="1111111111111111",
+        max_hamming_distance=0,
+    )
+    blocked_publisher = RecordingPublisher()
+    blocked_storage_client = FakeStorageClient()
+    blocked_service = ContentPipelineService(
+        migrated_db_session,
+        storage_client=blocked_storage_client,
+        publisher=blocked_publisher,
+        media_processor=FakeMediaProcessor(inspect_result=_make_distinct_upload_media_details(tag="1")),
+    )
+
+    blocked_item = await blocked_service.create_upload(
+        metadata=ContentPipelineUploadMetadata(
+            source_platform=SourcePlatform.TELEGRAM,
+            source_id="blocked-once-source",
+            post_id="blocked-once-post",
+        ),
+        filename="blocked-once.png",
+        content_type="image/png",
+        media_bytes=b"blocked-once-bytes",
+    )
+
+    blocked_hash.is_active = False
+    await migrated_db_session.commit()
+
+    allowed_publisher = RecordingPublisher()
+    allowed_storage_client = FakeStorageClient()
+    allowed_service = ContentPipelineService(
+        migrated_db_session,
+        storage_client=allowed_storage_client,
+        publisher=allowed_publisher,
+        media_processor=FakeMediaProcessor(inspect_result=_make_distinct_upload_media_details(tag="1")),
+    )
+    allowed_item = await allowed_service.create_upload(
+        metadata=ContentPipelineUploadMetadata(
+            source_platform=SourcePlatform.TELEGRAM,
+            source_id="allowed-after-deactivate-source",
+            post_id="allowed-after-deactivate-post",
+        ),
+        filename="allowed-after-deactivate.png",
+        content_type="image/png",
+        media_bytes=b"allowed-after-deactivate-bytes",
+    )
+
+    assert blocked_item.current_status is ContentPipelineStageStatus.FAILED
+    assert allowed_item.meme_file_id != blocked_item.meme_file_id
+    assert allowed_item.current_stage is ContentPipelineStage.TRANSCODE
+    assert allowed_item.current_status is ContentPipelineStageStatus.PENDING
+    assert len(allowed_publisher.events) == 1
+    assert len(allowed_storage_client.put_calls) == 1
+
+    async with postgres_session_factory() as session:
+        allowed_file = await session.scalar(select(MemeFile).where(MemeFile.id == allowed_item.meme_file_id))
+
+    assert allowed_file is not None
+    assert allowed_file.blocked_perceptual_hash_id is None
+    assert allowed_file.status is ContentProcessingStatus.PENDING
 
 
 @pytest.mark.parametrize(
@@ -2649,6 +2798,73 @@ async def test_create_crawler_ingest_happy_path_creates_rows_and_publishes_event
     assert persisted_channel is not None
     assert persisted_channel.last_read_post_id == "42"
     assert persisted_channel.last_fetched_at is not None
+
+
+async def test_create_crawler_ingest_quarantines_active_blocked_phash_without_s3_or_dispatch(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    channel = await _seed_tracked_telegram_channel(
+        migrated_db_session,
+        platform_id="blocked_crawler_channel",
+        title="Blocked Crawler Channel",
+    )
+    blocked_hash = await _seed_blocked_perceptual_hash(
+        migrated_db_session,
+        perceptual_hash="dddddddddddddddc",
+        max_hamming_distance=1,
+    )
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    service = ContentPipelineService(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+        media_processor=FakeMediaProcessor(inspect_result=_make_distinct_upload_media_details(tag="d")),
+    )
+
+    result = await service.create_crawler_ingest(
+        _build_raw_telegram_post(
+            source_id="blocked_crawler_channel",
+            post_id="901",
+            media_bytes=b"blocked-crawler-photo",
+        )
+    )
+
+    assert result.outcome is CrawlerIngestOutcome.BLOCKED_PERCEPTUAL_HASH
+    assert result.meme_file_id is not None
+    assert result.meme_source_id is not None
+    assert publisher.events == []
+    assert storage_client.put_calls == []
+    assert storage_client.delete_calls == []
+
+    async with postgres_session_factory() as session:
+        persisted_file = await session.scalar(select(MemeFile).where(MemeFile.id == result.meme_file_id))
+        persisted_source = await session.scalar(select(MemeSource).where(MemeSource.id == result.meme_source_id))
+        persisted_channel = await session.scalar(select(SourceChannel).where(SourceChannel.id == channel.id))
+        stages = (
+            await session.execute(
+                select(PipelineStageJournal)
+                .where(PipelineStageJournal.meme_file_id == result.meme_file_id)
+                .order_by(PipelineStageJournal.stage.asc()),
+            )
+        ).scalars().all()
+        persisted_meme = (
+            await session.scalar(select(Meme).where(Meme.id == persisted_file.meme_id)) if persisted_file else None
+        )
+
+    assert persisted_file is not None
+    assert persisted_file.status is ContentProcessingStatus.FAILED
+    assert persisted_file.blocked_perceptual_hash_id == blocked_hash.id
+    assert persisted_source is not None
+    assert persisted_source.post_id == "901"
+    assert persisted_channel is not None
+    assert persisted_channel.last_read_post_id == "901"
+    assert persisted_meme is not None
+    assert persisted_meme.is_public is False
+    assert [(stage.stage, stage.status, stage.normalized_reason) for stage in stages] == [
+        (ContentPipelineStage.INGEST, ContentPipelineStageStatus.FAILED, "blocked_perceptual_hash"),
+    ]
 
 
 async def test_create_crawler_ingest_skips_unsupported_media_without_side_effects(

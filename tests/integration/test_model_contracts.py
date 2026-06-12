@@ -18,6 +18,8 @@ from memexpert.models import metadata, utcnow
 from memexpert.models.collection import Collection, CollectionInvite, CollectionMember, CollectionMeme, PinnedMeme
 from memexpert.models.content import (
     AdminMemeDestructiveAuditLog,
+    BlockedPerceptualHash,
+    BlockedPerceptualHashAuditLog,
     EmbeddingCache,
     Meme,
     MemeFile,
@@ -90,6 +92,8 @@ EXPECTED_TABLES = {
     "account_deletion_logs",
     "account_merge_logs",
     "analytics_events",
+    "blocked_perceptual_hash_audit_logs",
+    "blocked_perceptual_hashes",
     "channel_suggestions",
     "collection_invites",
     "collection_members",
@@ -179,12 +183,17 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
     assert meme_relationships["moderation_reports"].mapper.class_ is ModerationReport
     assert meme_relationships["moderation_decisions"].mapper.class_ is ModerationDecision
     assert metadata.tables["admin_meme_destructive_audit_logs"].c["admin_user_id"].foreign_keys
+    assert metadata.tables["blocked_perceptual_hashes"].c["created_by_admin_user_id"].foreign_keys
+    assert metadata.tables["blocked_perceptual_hash_audit_logs"].c["admin_user_id"].foreign_keys
+    assert metadata.tables["meme_files"].c["blocked_perceptual_hash_id"].foreign_keys
     assert user_relationships["moderation_reports_submitted"].mapper.class_ is ModerationReport
     assert user_relationships["moderation_reports_resolved"].mapper.class_ is ModerationReport
     assert user_relationships["moderation_decisions"].mapper.class_ is ModerationDecision
     assert meme_file_relationships["pipeline_stage_journal_entries"].mapper.class_ is PipelineStageJournal
     assert meme_file_relationships["ocr_result"].mapper.class_ is MemeFileOCRResult
     assert meme_file_relationships["sync_target_snapshots"].mapper.class_ is MemeFileSyncTargetSnapshot
+    assert meme_file_relationships["blocked_perceptual_hash"].mapper.class_ is BlockedPerceptualHash
+    assert sa_inspect(BlockedPerceptualHashAuditLog).columns["blocked_perceptual_hash_id"] is not None
 
 
 async def test_metadata_creates_full_schema_on_postgres(postgres_async_engine: AsyncEngine) -> None:

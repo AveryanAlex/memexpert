@@ -4,6 +4,8 @@ from memexpert.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin, utc
 from memexpert.models.collection import Collection, CollectionInvite, CollectionMember, CollectionMeme, PinnedMeme
 from memexpert.models.content import (
     AdminMemeDestructiveAuditLog,
+    BlockedPerceptualHash,
+    BlockedPerceptualHashAuditLog,
     EmbeddingCache,
     Meme,
     MemeFile,
@@ -71,6 +73,8 @@ __all__ = [
     "AccountStatus",
     "AccountType",
     "AdminMemeDestructiveAuditLog",
+    "BlockedPerceptualHash",
+    "BlockedPerceptualHashAuditLog",
     "AnalyticsEvent",
     "AnalyticsEventType",
     "AuthProvider",
