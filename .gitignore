@@ -33,6 +33,7 @@ tmp/
 .artifacts
 .pytest_cache
 .artifacts/s04-runtime-smoke/
+frontend/playwright-e2e-artifacts/
 
 # Telegram crawler session files. The directory is kept via .gitkeep so
 # fresh checkouts have a writable session dir, but the session blobs are

@@ -12,7 +12,8 @@
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "test": "svelte-kit sync && vitest run",
     "test:watch": "svelte-kit sync && vitest",
-    "test:smoke": "playwright test"
+    "test:smoke": "playwright test",
+    "test:e2e:container": "playwright test -c playwright.e2e.config.ts"
   },
   "devDependencies": {
     "@playwright/test": "^1.60.0",

@@ -1,0 +1,277 @@
+x-app-image: &app-image
+  image: ${MEMEXPERT_APP_IMAGE:-memexpert-app:e2e}
+  build:
+    context: .
+    dockerfile: Dockerfile
+
+x-app-env: &app-env
+  APP_HOST: 0.0.0.0
+  APP_PORT: 8000
+  DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-memexpert}:${POSTGRES_PASSWORD:-memexpert}@postgres:5432/${POSTGRES_DB:-memexpert}
+  REDIS_URL: redis://redis:6379/0
+  RABBITMQ_URL: amqp://${RABBITMQ_DEFAULT_USER:-memexpert}:${RABBITMQ_DEFAULT_PASS:-memexpert}@rabbitmq:5672/
+  QDRANT_URL: http://qdrant:6333
+  MEILISEARCH_URL: http://meilisearch:7700
+  MEILISEARCH_MASTER_KEY: ${MEILISEARCH_MASTER_KEY:-memexpert-e2e-meili-key}
+  S3_ENDPOINT: http://minio:9000
+  S3_ACCESS_KEY: ${S3_ACCESS_KEY:-memexpert}
+  S3_SECRET_KEY: ${S3_SECRET_KEY:-memexpert-secret}
+  S3_BUCKET: ${S3_BUCKET:-memexpert-e2e}
+  S3_REGION: ${S3_REGION:-us-east-1}
+  IMGPROXY_BASE_URL: http://imgproxy:8080
+  MEDIA_PUBLIC_BASE_URL: ""
+  PIPELINE_OPERATOR_TOKEN: ${PIPELINE_OPERATOR_TOKEN:-memexpert-e2e-pipeline-operator-token-min-32}
+  PIPELINE_ALLOWED_MIME_TYPES: image/jpeg,image/png,image/webp,image/gif,video/mp4,video/quicktime,video/webm
+  PIPELINE_BROKER_CONNECTION_TIMEOUT_SECONDS: "10.0"
+  PIPELINE_STORAGE_CONNECTION_TIMEOUT_SECONDS: "10.0"
+  PIPELINE_OCR_PROVIDER_MODE: fake
+  PIPELINE_VOYAGE_PROVIDER_MODE: fake
+  PIPELINE_CLASSIFICATION_PROVIDER_MODE: fake
+  PIPELINE_VOYAGE_OUTPUT_DIMENSIONS: "4"
+  PIPELINE_QDRANT_COLLECTION_NAME: memexpert-memes-e2e
+  PIPELINE_MEILISEARCH_INDEX_NAME: memexpert-memes-e2e
+  PIPELINE_WORKER_PREFETCH_COUNT: "1"
+  AUTH_JWT_SECRET: ${AUTH_JWT_SECRET:-memexpert-e2e-jwt-secret-with-32-byte-minimum}
+  AUTH_ACCESS_COOKIE_SECURE: "false"
+  SECURITY_CORS_ALLOWED_ORIGINS: http://frontend:3000,http://localhost:3000,http://127.0.0.1:3000
+  SECURITY_RATE_LIMIT_ENABLED: "false"
+  TELEGRAM_SESSION_DIR: /app/.telegram-sessions
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-memexpert}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-memexpert}
+      POSTGRES_DB: ${POSTGRES_DB:-memexpert}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  redis:
+    image: redis:7
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  rabbitmq:
+    image: rabbitmq:4-management
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-memexpert}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-memexpert}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 20s
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "bash -lc 'exec 3<>/dev/tcp/127.0.0.1/6333 && printf \"GET /readyz HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n\" >&3 && grep -q \"200 OK\" <&3'",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  meilisearch:
+    image: getmeili/meilisearch:latest
+    environment:
+      MEILI_MASTER_KEY: ${MEILISEARCH_MASTER_KEY:-memexpert-e2e-meili-key}
+      MEILI_ENV: development
+      MEILI_NO_ANALYTICS: "true"
+    volumes:
+      - meili_data:/meili_data
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider --quiet http://127.0.0.1:7700/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-memexpert}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-memexpert-secret}
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/minio/health/live || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  minio-init:
+    image: minio/mc:latest
+    entrypoint: [""]
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-memexpert}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-memexpert-secret}
+      S3_BUCKET: ${S3_BUCKET:-memexpert-e2e}
+    command:
+      [
+        "/bin/sh",
+        "-c",
+        "mc alias set memexpert http://minio:9000 \"$${MINIO_ROOT_USER}\" \"$${MINIO_ROOT_PASSWORD}\" && mc mb --ignore-existing \"memexpert/$${S3_BUCKET}\"",
+      ]
+
+  imgproxy:
+    image: darthsim/imgproxy:latest
+    environment:
+      IMGPROXY_USE_S3: "true"
+      IMGPROXY_S3_ENDPOINT: http://minio:9000
+      IMGPROXY_S3_REGION: ${S3_REGION:-us-east-1}
+      IMGPROXY_S3_USE_PATH_STYLE: "true"
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-memexpert}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-memexpert-secret}
+      IMGPROXY_BIND: ":8080"
+    depends_on:
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "imgproxy", "health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  migrate:
+    <<: *app-image
+    restart: "no"
+    command: ["alembic", "upgrade", "head"]
+    environment: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      meilisearch:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      imgproxy:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+
+  api:
+    <<: *app-image
+    environment: *app-env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  workers:
+    <<: *app-image
+    command: ["memexpert-workers"]
+    environment: *app-env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+
+  frontend:
+    image: ${MEMEXPERT_FRONTEND_IMAGE:-memexpert-frontend:e2e}
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    environment:
+      HOST: 0.0.0.0
+      PORT: 3000
+      ORIGIN: http://frontend:3000
+      API_BASE_URL: http://api:8000
+    depends_on:
+      api:
+        condition: service_healthy
+
+  seed:
+    <<: *app-image
+    restart: "no"
+    command:
+      [
+        "python",
+        "-m",
+        "scripts.seed_e2e_smoke",
+        "--api-base-url",
+        "http://api:8000",
+        "--artifacts-dir",
+        "/artifacts",
+        "--run-id",
+        "${E2E_RUN_ID:-local}",
+      ]
+    environment: *app-env
+    depends_on:
+      api:
+        condition: service_healthy
+      workers:
+        condition: service_started
+    volumes:
+      - type: bind
+        source: ${E2E_ARTIFACT_DIR:?set E2E_ARTIFACT_DIR to an absolute per-run artifact directory}
+        target: /artifacts
+
+  e2e-runner:
+    image: ${MEMEXPERT_E2E_RUNNER_IMAGE:-memexpert-frontend-e2e:e2e}
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile.e2e
+    restart: "no"
+    environment:
+      CI: "1"
+      E2E_RUN_ID: ${E2E_RUN_ID:-local}
+      E2E_ARTIFACTS_DIR: /artifacts
+      E2E_SEED_FILE: /artifacts/seed.json
+      E2E_FRONTEND_BASE_URL: http://frontend:3000
+      E2E_API_BASE_URL: http://api:8000
+      E2E_OPERATOR_TOKEN: ${PIPELINE_OPERATOR_TOKEN:-memexpert-e2e-pipeline-operator-token-min-32}
+    depends_on:
+      frontend:
+        condition: service_healthy
+      seed:
+        condition: service_completed_successfully
+    volumes:
+      - type: bind
+        source: ${E2E_ARTIFACT_DIR:?set E2E_ARTIFACT_DIR to an absolute per-run artifact directory}
+        target: /artifacts
+
+volumes:
+  postgres_data:
+  redis_data:
+  rabbitmq_data:
+  qdrant_data:
+  meili_data:
+  minio_data:

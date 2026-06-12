@@ -293,6 +293,13 @@ class FakeVoyageClient:
         assert self.result is not None
         return self.result
 
+    async def embed_text(self, *, text: str) -> VoyageEmbeddingResult:
+        self.calls.append({"text": text})
+        if self.error is not None:
+            raise self.error
+        assert self.result is not None
+        return self.result
+
 
 @dataclass(slots=True)
 class FakeQdrantClient:

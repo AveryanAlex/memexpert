@@ -19,7 +19,7 @@ from faststream.rabbit.annotations import RabbitMessage
 from memexpert.core.broker import PipelineBrokerSettings, get_pipeline_broker, get_pipeline_broker_settings
 from memexpert.core.classification import (
     ClassificationClientProtocol,
-    PipelineClassificationClient,
+    build_pipeline_classification_client,
 )
 from memexpert.core.config import Settings, get_settings
 from memexpert.core.database import AsyncSessionFactory, get_async_session_factory
@@ -28,7 +28,7 @@ from memexpert.core.meilisearch import (
     MeilisearchSyncClientProtocol,
     PipelineMeilisearchSyncClient,
 )
-from memexpert.core.ocr import OCRProcessorProtocol, PipelineOCRProcessor
+from memexpert.core.ocr import OCRProcessorProtocol, build_pipeline_ocr_processor
 from memexpert.core.qdrant import (
     PipelineQdrantClient,
     PipelineQdrantSyncClient,
@@ -36,7 +36,7 @@ from memexpert.core.qdrant import (
     QdrantSyncClientProtocol,
 )
 from memexpert.core.storage import get_s3_client
-from memexpert.core.voyage import PipelineVoyageClient, VoyageClientProtocol
+from memexpert.core.voyage import VoyageClientProtocol, build_pipeline_voyage_client
 from memexpert.models.enums import ContentPipelineStage
 from memexpert.workers.pipeline_runtime.runtime import (
     ObjectStorageClientLike,
@@ -134,17 +134,17 @@ def build_pipeline_runtime(
     resolved_session_factory = session_factory or get_async_session_factory()
     resolved_storage_client = storage_client or cast("ObjectStorageClientLike", get_s3_client())
     resolved_media_processor = media_processor or PipelineMediaProcessor(settings=resolved_settings)
-    resolved_ocr_processor = ocr_processor or PipelineOCRProcessor(
+    resolved_ocr_processor = ocr_processor or build_pipeline_ocr_processor(
         settings=resolved_settings,
         media_processor=resolved_media_processor,
     )
-    resolved_voyage_client = voyage_client or PipelineVoyageClient(settings=resolved_settings)
+    resolved_voyage_client = voyage_client or build_pipeline_voyage_client(settings=resolved_settings)
     resolved_qdrant_client = qdrant_client or PipelineQdrantClient(settings=resolved_settings)
     resolved_qdrant_sync_client = qdrant_sync_client or PipelineQdrantSyncClient(settings=resolved_settings)
     resolved_meilisearch_sync_client = meilisearch_sync_client or PipelineMeilisearchSyncClient(
         settings=resolved_settings,
     )
-    resolved_classification_client = classification_client or PipelineClassificationClient(
+    resolved_classification_client = classification_client or build_pipeline_classification_client(
         settings=resolved_settings,
     )
     transcode_retry_queue_name = f"{resolved_broker_settings.transcode_queue}.retry"

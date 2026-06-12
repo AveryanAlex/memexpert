@@ -140,6 +140,34 @@ class PipelineClassificationClient:
         )
 
 
+class FakeClassificationClient:
+    """Safe deterministic classifier used by local E2E smoke runs."""
+
+    def __init__(self, *, settings: Settings | None = None) -> None:
+        self._settings = settings or get_settings()
+
+    async def classify_image(self, *, image_bytes: bytes, mime_type: str) -> ClassificationResult:
+        _ = (image_bytes, mime_type)
+        nsfw_score = self._settings.pipeline_fake_classification_nsfw_score
+        return ClassificationResult(
+            model=self._settings.pipeline_classification_model,
+            is_nsfw=nsfw_score >= self._settings.pipeline_classification_nsfw_threshold,
+            nsfw_score=nsfw_score,
+        )
+
+
+def build_pipeline_classification_client(
+    *,
+    settings: Settings | None = None,
+) -> ClassificationClientProtocol:
+    """Return the configured classification provider without changing live defaults."""
+
+    resolved_settings = settings or get_settings()
+    if resolved_settings.pipeline_classification_provider_mode == "fake":
+        return FakeClassificationClient(settings=resolved_settings)
+    return PipelineClassificationClient(settings=resolved_settings)
+
+
 __all__ = [
     "ClassificationClientProtocol",
     "ClassificationError",
@@ -147,5 +175,7 @@ __all__ = [
     "ClassificationProviderUnavailableError",
     "ClassificationResult",
     "ClassificationTimeoutError",
+    "FakeClassificationClient",
     "PipelineClassificationClient",
+    "build_pipeline_classification_client",
 ]
