@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import uuid
+from typing import TYPE_CHECKING
 
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select
@@ -16,6 +17,9 @@ from memexpert.services import AuthService, UserService
 from tests.conftest import create_full_user_via_upgrade
 from tests.integration.test_api_security import BROWSER_REQUESTED_WITH_VALUE
 from tests.integration.test_auth_routes import ACCESS_COOKIE_NAME, build_test_auth_service
+
+if TYPE_CHECKING:
+    from fastapi import FastAPI
 
 
 async def _issue_full_user_cookie(
@@ -59,7 +63,7 @@ async def _create_meme(
 
 
 async def test_report_meme_requires_authenticated_full_account_and_rejects_guests(
-    auth_app,
+    auth_app: FastAPI,
     auth_settings_overrides: dict[str, str],
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -123,7 +127,7 @@ async def test_browser_report_write_requires_csrf_header_before_auth_dependency(
 
 
 async def test_full_user_report_creates_admin_queue_entry_and_normalizes_payload(
-    auth_app,
+    auth_app: FastAPI,
     auth_settings_overrides: dict[str, str],
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -169,7 +173,7 @@ async def test_full_user_report_creates_admin_queue_entry_and_normalizes_payload
 
 
 async def test_duplicate_open_user_report_reuses_existing_row_without_spam(
-    auth_app,
+    auth_app: FastAPI,
     auth_settings_overrides: dict[str, str],
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -208,7 +212,7 @@ async def test_duplicate_open_user_report_reuses_existing_row_without_spam(
 
 
 async def test_report_rejects_hidden_and_nsfw_filtered_memes_without_creating_rows(
-    auth_app,
+    auth_app: FastAPI,
     auth_settings_overrides: dict[str, str],
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -246,7 +250,7 @@ async def test_report_rejects_hidden_and_nsfw_filtered_memes_without_creating_ro
 
 
 async def test_report_reuses_existing_in_review_but_not_closed_report(
-    auth_app,
+    auth_app: FastAPI,
     auth_settings_overrides: dict[str, str],
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

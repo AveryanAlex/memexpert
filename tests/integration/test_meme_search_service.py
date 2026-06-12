@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from fastapi import FastAPI
@@ -38,6 +38,9 @@ from memexpert.services.meme_seo import MemeSeoGenerationService, MemeSeoProvide
 from memexpert.services.public_trends import PublicTrendsService, refresh_public_trend_materialized_views
 
 pytestmark = pytest.mark.asyncio
+
+if TYPE_CHECKING:
+    from memexpert.schemas.meme import PublicMemeSearchPageRead
 
 
 class FakeTextSearchClient:
@@ -578,7 +581,7 @@ async def test_public_meme_dtos_include_viewer_action_state_for_anonymous_guest_
         ),
     )
 
-    def page_states(page: object) -> dict[uuid.UUID, tuple[bool, bool, bool]]:
+    def page_states(page: PublicMemeSearchPageRead) -> dict[uuid.UUID, tuple[bool, bool, bool]]:
         return {
             item.meme.id: (item.meme.viewer_has_favorited, item.meme.viewer_has_saved, item.meme.viewer_has_pinned)
             for item in page.items

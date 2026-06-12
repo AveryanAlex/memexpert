@@ -1384,8 +1384,7 @@ async def test_complete_embed_stage_rolls_back_partial_merge_and_keeps_embed_rep
 
     from memexpert.services import content_merge as content_merge_module
 
-    async def fake_transfer(self: object, **_: object) -> tuple[uuid.UUID, ...]:
-        _ = self
+    async def fake_transfer(_self: object, **_kwargs: object) -> tuple[uuid.UUID, ...]:
         raise RuntimeError("forced merge transfer failure")
 
     monkeypatch.setattr(
@@ -1494,7 +1493,7 @@ async def test_meili_sync_methods_persist_snapshot_and_emit_synced_event(
         input_hash_seed="9",
     )
     event_id = uuid.uuid7()
-    preview = {"id": meme_file_id.hex, "language": "en", "tags": ["a"]}
+    preview: dict[str, object] = {"id": meme_file_id.hex, "language": "en", "tags": ["a"]}
 
     first = await service.complete_sync_meili_stage(
         meme_file_id=meme_file_id,
@@ -2682,7 +2681,7 @@ async def test_create_crawler_ingest_skips_unsupported_media_without_side_effect
         published_at=utcnow_for_tests(),
         channel_username=None,
         channel_title="Unsupported",
-        media_type="sticker",  # type: ignore[arg-type]
+        media_type="sticker",
         media_bytes=b"ignored",
         filename=None,
         content_type=None,
@@ -3186,4 +3185,3 @@ async def test_crawler_operations_list_sessions_populates_owned_channel_count(
     sessions_by_name = {row.session_name: row for row in await service.list_sessions()}
     assert sessions_by_name["primary"].owned_channel_count == 2
     assert sessions_by_name["empty"].owned_channel_count == 0
-
