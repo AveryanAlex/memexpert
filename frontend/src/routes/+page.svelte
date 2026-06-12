@@ -30,7 +30,7 @@
 
 <PageHeader title="Find the right meme fast." description="Search the public MemeXpert catalog with plain text, or browse what is already popular." badge="Guest access enabled" />
 
-<form class="mb-6 flex flex-col gap-2 rounded-3xl border border-line bg-paper p-2 shadow-warm-lg md:flex-row" method="GET" action="/">
+<form class="mb-6 flex flex-col gap-2 rounded-3xl border border-line bg-paper p-2 shadow-warm-lg md:flex-row" method="GET" action="/search">
   <Input
     class="flex-1 border-0 bg-transparent"
     aria-label="Search memes"
@@ -41,6 +41,11 @@
   />
   <Button type="submit">Search</Button>
 </form>
+
+<div class="mb-6 flex flex-wrap gap-2">
+  <ActionLink variant="secondary" size="compact" href="/search">Advanced search</ActionLink>
+  <ActionLink variant="ghost" size="compact" href="/search?tags=reaction&include_nsfw=false">Browse reactions</ActionLink>
+</div>
 
 {#if data.errorMessage}
   <Notice>{data.errorMessage}</Notice>

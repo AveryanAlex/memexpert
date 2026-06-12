@@ -105,6 +105,49 @@ describe('catalog API client', () => {
     expect(mockFetch).toHaveBeenCalledOnce();
   });
 
+  it('forwards catalog filters with repeated tag params', async () => {
+    const calls: string[] = [];
+    const mockFetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      calls.push(`${url.pathname}?${url.searchParams.toString()}`);
+
+      expect(url.searchParams.getAll('tags')).toEqual(['reaction', 'cat']);
+      expect(url.searchParams.get('include_nsfw')).toBe('true');
+      expect(url.searchParams.get('media_type')).toBe('gif');
+      expect(url.searchParams.get('language')).toBe('mixed');
+
+      return jsonResponse(page);
+    }) satisfies ApiFetch;
+
+    await fetchMemePage({
+      fetch: mockFetch,
+      baseUrl: 'https://api.memexpert.test',
+      query: 'frog',
+      tags: [' reaction ', '', 'cat'],
+      includeNsfw: true,
+      mediaType: 'gif',
+      language: 'mixed',
+      limit: 12,
+      offset: 0
+    });
+    await fetchMemePage({
+      fetch: mockFetch,
+      baseUrl: 'https://api.memexpert.test',
+      query: '',
+      tags: ['reaction', 'cat'],
+      includeNsfw: true,
+      mediaType: 'gif',
+      language: 'mixed',
+      limit: 12,
+      offset: 12
+    });
+
+    expect(calls).toEqual([
+      '/api/v1/memes/search?limit=12&offset=0&tags=reaction&tags=cat&include_nsfw=true&media_type=gif&language=mixed&query=frog',
+      '/api/v1/memes/browse?limit=12&offset=12&tags=reaction&tags=cat&include_nsfw=true&media_type=gif&language=mixed'
+    ]);
+  });
+
   it('requests detail with the public NSFW filter', async () => {
     const mockFetch = vi.fn(async (input: RequestInfo | URL) => {
       const url = new URL(String(input));
