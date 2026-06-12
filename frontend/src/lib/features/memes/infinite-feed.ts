@@ -8,6 +8,19 @@ export interface MemeFeedFilters {
   language?: ContentLanguage | null;
 }
 
+export const INFINITE_FEED_OBSERVER_ROOT_MARGIN = '420px 0px';
+
+export interface MemeFeedLoadState {
+  hasMore: boolean;
+  loading: boolean;
+  errorMessage: string | null | undefined;
+  itemCount: number;
+}
+
+export function canLoadNextMemePage({ hasMore, loading, errorMessage, itemCount }: MemeFeedLoadState): boolean {
+  return hasMore && !loading && !errorMessage && itemCount > 0;
+}
+
 export function appendUniqueMemeResults(
   existing: PublicMemeSearchResultRead[],
   incoming: PublicMemeSearchResultRead[]

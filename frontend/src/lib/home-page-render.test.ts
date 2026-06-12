@@ -14,9 +14,10 @@ describe('/ page', () => {
     const page: PublicMemeSearchPageRead = {
       items: [
         { meme: memeCard('11111111-1111-4111-8111-111111111111', 'SSR cat reaction') },
-        { meme: memeCard('22222222-2222-4222-8222-222222222222', 'SSR launch mood') }
+        { meme: memeCard('22222222-2222-4222-8222-222222222222', 'SSR launch mood') },
+        { meme: videoMemeCard('33333333-3333-4333-8333-333333333333', 'SSR video mood') }
       ],
-      limit: 2,
+      limit: 3,
       offset: 0,
       total: 8,
       has_more: true
@@ -44,8 +45,14 @@ describe('/ page', () => {
     expect(body).toContain('Results for');
     expect(body).toContain('SSR cat reaction');
     expect(body).toContain('SSR launch mood');
-    expect(body).toContain('Showing 2 of 8');
+    expect(body).toContain('SSR video mood');
+    expect(body).toContain('Showing 3 of 8');
     expect(body).toContain('Load more');
+    expect(body).toContain('role="list"');
+    expect(body).toContain('aria-posinset="1"');
+    expect(body).toContain('loading="lazy"');
+    expect(body).toContain('preload="none"');
+    expect(body).toContain('Actions for SSR cat reaction');
     expect(body).not.toContain('Previous');
     expect(body).not.toContain('Next page');
   });
@@ -151,5 +158,32 @@ function memeCard(id: string, caption: string): PublicMemeCardRead {
     viewer_has_favorited: false,
     viewer_has_saved: false,
     viewer_has_pinned: false
+  };
+}
+
+function videoMemeCard(id: string, caption: string): PublicMemeCardRead {
+  return {
+    ...memeCard(id, caption),
+    media_type: 'video',
+    primary_file: {
+      id: `${id}-file`,
+      mime_type: 'video/mp4',
+      width: null,
+      height: null,
+      file_size_bytes: 1234,
+      blur_hash: null,
+      quality_score: 1,
+      render: {
+        thumbnail_url: '/video-poster.jpg',
+        preview_url: null,
+        display_url: null,
+        original_url: null,
+        download_url: '/video-download.mp4',
+        web_video_url: '/video.mp4',
+        width: null,
+        height: null,
+        blur_hash: null
+      }
+    }
   };
 }

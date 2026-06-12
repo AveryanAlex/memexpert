@@ -26,6 +26,12 @@ Search bar + "Meme of the Day" featured section + trending memes in masonry grid
 
 Masonry grid, infinite scroll. Filter sidebar (tags, NSFW, media type, language). Ad banners appear periodically in the grid as meme-sized slots.
 
+#### Public Feed Ordering Policy
+
+Public meme feeds consume the backend-ranked array sequentially. On desktop/tablet masonry, each result is placed into the current shortest estimated column, with ties going to the earlier column, so assignment is deterministic and does not shuffle the backend response. Top-down visual scanning under this policy should encounter earlier/higher-ranked results before later/lower-ranked results, while still reducing mixed image/GIF/video height gaps.
+
+On mobile one-column layouts, the masonry algorithm preserves the exact backend order. Infinite loading appends only unseen meme IDs in backend page order, so duplicate results from overlapping pages do not move already-rendered cards. Tag, template, and collection-specific scope policies are deferred unless those pages explicitly document a different ranking contract.
+
 ### Tag Pages (`/tag/{slug}`)
 
 SEO landing pages. Description + meme grid sorted by popularity. Seasonal tags auto-populated (e.g., `/tag/new-year` fills with holiday memes when tagged by AI).

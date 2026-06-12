@@ -1,7 +1,14 @@
 import { describe, expect, it } from 'vitest';
 
 import type { PublicMemeCardRead, PublicMemeSearchPageRead, PublicMemeSearchResultRead } from '$lib/api/types';
-import { appendUniqueMemeResults, memeFeedKey, nextMemePageOffset, uniqueMemeResults } from './infinite-feed';
+import {
+  INFINITE_FEED_OBSERVER_ROOT_MARGIN,
+  appendUniqueMemeResults,
+  canLoadNextMemePage,
+  memeFeedKey,
+  nextMemePageOffset,
+  uniqueMemeResults
+} from './infinite-feed';
 
 describe('infinite meme feed helpers', () => {
   it('appends incoming results in backend order without duplicate meme ids', () => {
@@ -14,6 +21,14 @@ describe('infinite meme feed helpers', () => {
     const items = uniqueMemeResults([result('a'), result('b'), result('a')]);
 
     expect(items.map((item) => item.meme.id)).toEqual(['a', 'b']);
+  });
+
+  it('does not reorder existing items when an incoming page is entirely duplicate', () => {
+    const existing = [result('rank-1'), result('rank-2'), result('rank-3')];
+    const merged = appendUniqueMemeResults(existing, [result('rank-2'), result('rank-1')]);
+
+    expect(merged).toHaveLength(3);
+    expect(merged.map((item) => item.meme.id)).toEqual(['rank-1', 'rank-2', 'rank-3']);
   });
 
   it('advances by backend limit for the next offset', () => {
@@ -32,6 +47,18 @@ describe('infinite meme feed helpers', () => {
         language: 'en'
       })
     ).toBe(memeFeedKey({ query: 'cats', tags: ['reaction', 'cat'], includeNsfw: false, mediaType: 'gif', language: 'en' }));
+  });
+
+  it('only allows observer or Load more fetching in a stable ready state', () => {
+    expect(canLoadNextMemePage({ hasMore: true, loading: false, errorMessage: null, itemCount: 3 })).toBe(true);
+    expect(canLoadNextMemePage({ hasMore: false, loading: false, errorMessage: null, itemCount: 3 })).toBe(false);
+    expect(canLoadNextMemePage({ hasMore: true, loading: true, errorMessage: null, itemCount: 3 })).toBe(false);
+    expect(canLoadNextMemePage({ hasMore: true, loading: false, errorMessage: 'Network failed', itemCount: 3 })).toBe(false);
+    expect(canLoadNextMemePage({ hasMore: true, loading: false, errorMessage: null, itemCount: 0 })).toBe(false);
+  });
+
+  it('uses a fixed early root margin for stable IntersectionObserver prefetching', () => {
+    expect(INFINITE_FEED_OBSERVER_ROOT_MARGIN).toBe('420px 0px');
   });
 });
 

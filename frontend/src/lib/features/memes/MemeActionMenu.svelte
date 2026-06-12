@@ -242,7 +242,7 @@
   {/if}
 
   <Menu.Root>
-    <Menu.Trigger aria-label="Meme actions" disabled={pending !== null}>
+    <Menu.Trigger aria-label={compact ? `Actions for ${title}` : 'Meme actions'} disabled={pending !== null}>
       <MoreHorizontal class="size-5" aria-hidden="true" />
     </Menu.Trigger>
     <Menu.Content>

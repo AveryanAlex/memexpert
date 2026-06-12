@@ -1,7 +1,14 @@
 import { describe, expect, it } from 'vitest';
 
 import type { PublicMemeFileRead } from '$lib/api/types';
-import { selectMediaAspectRatio, selectMediaRender } from './render';
+import {
+  FEED_PREVIEW_FALLBACK_ASPECT_RATIO,
+  selectFeedPreviewAspectRatio,
+  selectImageLoading,
+  selectMediaAspectRatio,
+  selectMediaPreload,
+  selectMediaRender
+} from './render';
 
 describe('selectMediaRender', () => {
   it('selects real image display and download URLs', () => {
@@ -62,6 +69,26 @@ describe('selectMediaAspectRatio', () => {
   it('returns null when dimensions are unavailable or invalid', () => {
     expect(selectMediaAspectRatio(null)).toBeNull();
     expect(selectMediaAspectRatio({ ...file({ width: 0, height: 180 }), width: null, height: null })).toBeNull();
+  });
+});
+
+describe('feed preview media loading', () => {
+  it('uses known dimensions to reserve mixed media layout space', () => {
+    expect(selectFeedPreviewAspectRatio(file({ width: 320, height: 180 }))).toBe('320 / 180');
+  });
+
+  it('uses a stable fallback aspect ratio when feed media dimensions are missing', () => {
+    expect(selectFeedPreviewAspectRatio(null)).toBe(FEED_PREVIEW_FALLBACK_ASPECT_RATIO);
+    expect(selectFeedPreviewAspectRatio({ ...file({ width: null, height: null }), width: null, height: null })).toBe(
+      FEED_PREVIEW_FALLBACK_ASPECT_RATIO
+    );
+  });
+
+  it('keeps feed images lazy and feed video/audio metadata deferred', () => {
+    expect(selectImageLoading(false)).toBe('lazy');
+    expect(selectImageLoading(true)).toBe('eager');
+    expect(selectMediaPreload(false)).toBe('none');
+    expect(selectMediaPreload(true)).toBe('metadata');
   });
 });
 
