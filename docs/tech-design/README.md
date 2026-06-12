@@ -12,3 +12,4 @@ Companion document to MemeXpert PRD.
 - [Content Pipeline](04-content-pipeline.md) — Ingestion, deduplication, processing, media storage, SEO generation
 - [Accounts & Auth](05-accounts-auth.md) — Account model, JWT, auth flows, account deletion & export, access control
 - [Infrastructure](06-infrastructure.md) — Caching, resilience, monitoring, model upgrades, risks
+- [Frontend Charting](frontend-charting.md) — Audit of current bespoke charts and charting library recommendation

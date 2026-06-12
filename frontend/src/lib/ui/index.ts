@@ -3,6 +3,7 @@ export { default as ActionRow } from './ActionRow.svelte';
 export { default as Badge } from './Badge.svelte';
 export { default as Button } from './Button.svelte';
 export { default as Card } from './Card.svelte';
+export { default as ChartFrame } from './chart/ChartFrame.svelte';
 export { default as EmptyState } from './EmptyState.svelte';
 export { default as FormRow } from './FormRow.svelte';
 export { default as Input } from './Input.svelte';
