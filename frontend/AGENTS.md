@@ -1,6 +1,6 @@
 # Frontend Architecture Notes
 
-This SvelteKit app uses Svelte 5, pnpm 10.28.0, Tailwind CSS v4 through `@tailwindcss/vite`, Bits UI 2.18.1 for accessible compound primitives, and `@lucide/svelte` when an icon clarifies an action.
+This SvelteKit app uses Svelte 5, pnpm 10.28.0, Tailwind CSS v4 through `@tailwindcss/vite`, Bits UI 2.18.1 for accessible compound primitives, LayerChart 1.0.13 for charts, and `@lucide/svelte` when an icon clarifies an action.
 
 ## Conventions
 
@@ -9,7 +9,10 @@ This SvelteKit app uses Svelte 5, pnpm 10.28.0, Tailwind CSS v4 through `@tailwi
 - Put reusable visual primitives in `src/lib/ui`. These components should be small, prop-forwarding, and independent of MemeExpert domain data.
 - Put composed product UI in `src/lib/features/<area>`, for example `memes`, `trends`, `collections`, `profile`, and `admin`.
 - Use Bits UI through local wrappers for repeated primitives. Dropdown menu wrappers live in `src/lib/ui/dropdown-menu` and own the Portal/Content styling.
-- Use `src/lib/ui/chart` for LayerChart-backed analytics charts. Product components should import `ChartFrame` and the `LayerChart*` re-exports from this wrapper instead of importing `layerchart` directly.
+- Use `src/lib/ui/chart` for LayerChart-backed analytics charts. Product code should import `ChartFrame` and the `LayerChart*` re-exports from `$lib/ui/chart`, not `layerchart` directly.
+- Keep reusable chart wrappers and primitives in `src/lib/ui/chart`; put feature/product charts under `src/lib/features/<area>`.
+- Prefer LayerChart through the local wrapper for data-driven charts that need scales, axes, tooltips, responsive frames, loading/empty states, or reuse. A tiny inline SVG is acceptable for decorative or static one-off marks that do not need those behaviors.
+- Charts should use responsive `ChartFrame` sizing, warm MemeExpert tokens, clear labels/ARIA titles, loading and empty states, and readable fallback data or summaries where appropriate.
 - Dialog, Popover, and Tooltip wrappers should stay thin, forward useful props, and support `bind:open` where the underlying primitive does.
 - Keep `Tooltip.Provider` near root layout. Tooltips are supplemental desktop help only; essential content belongs in Popover, Dialog, or visible text.
 - Preserve server actions and route URLs. Refactors should thin route markup without changing form names, actions, query params, or data contracts.
