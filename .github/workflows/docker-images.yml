@@ -1,0 +1,93 @@
+name: Docker Images
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Validate production compose example
+        run: docker compose --env-file .env.prod.example -f docker-compose.prod.example.yml config
+
+      - name: Build Python app image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          tags: memexpert-app:ci
+          load: true
+          cache-from: type=gha,scope=memexpert-app
+          cache-to: type=gha,scope=memexpert-app,mode=max
+
+      - name: Build frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: frontend/Dockerfile
+          tags: memexpert-frontend:ci
+          load: true
+          cache-from: type=gha,scope=memexpert-frontend
+          cache-to: type=gha,scope=memexpert-frontend,mode=max
+
+      - name: Smoke test app images
+        run: |
+          set -euo pipefail
+
+          docker network create memexpert-smoke
+          docker run -d --rm \
+            --name memexpert-api-smoke \
+            --network memexpert-smoke \
+            -e APP_HOST=0.0.0.0 \
+            -e APP_PORT=8000 \
+            -p 8000:8000 \
+            memexpert-app:ci
+
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8000/health; then
+              break
+            fi
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:8000/health
+
+          docker run --rm memexpert-app:ci sh -c 'command -v memexpert-workers && command -v ffmpeg && command -v ffprobe'
+          docker run --rm memexpert-app:ci ffmpeg -version
+          docker run --rm memexpert-app:ci ffprobe -version
+
+          docker run -d --rm \
+            --name memexpert-frontend-smoke \
+            --network memexpert-smoke \
+            -e HOST=0.0.0.0 \
+            -e PORT=3000 \
+            -e API_BASE_URL=http://memexpert-api-smoke:8000 \
+            -p 3000:3000 \
+            memexpert-frontend:ci
+
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:3000/ >/dev/null; then
+              break
+            fi
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:3000/ >/dev/null
+
+      - name: Show smoke logs on failure
+        if: failure()
+        run: |
+          docker ps -a
+          docker logs memexpert-api-smoke || true
+          docker logs memexpert-frontend-smoke || true
+
+      - name: Tear down smoke containers
+        if: always()
+        run: |
+          docker rm -f memexpert-frontend-smoke memexpert-api-smoke || true
+          docker network rm memexpert-smoke || true
