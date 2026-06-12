@@ -1,30 +1,44 @@
 import type { PageServerLoad } from './$types';
-import { DEFAULT_PAGE_SIZE, ApiError, emptyMemePage, fetchMemePage } from '$lib/api/client';
-import { apiBaseUrl } from '$lib/server/backend';
+import { DEFAULT_PAGE_SIZE, ApiError, emptyMemePage, fetchCollections, fetchMemePage } from '$lib/api/client';
+import { apiBaseUrl, forwardBackendAccessCookie } from '$lib/server/backend';
 import { parseSearchParams } from '$lib/searchParams';
 
-export const load: PageServerLoad = async ({ fetch, request, url }) => {
+export const load: PageServerLoad = async ({ cookies, fetch, parent, request, url }) => {
   const filters = parseSearchParams(url.searchParams);
   const cookieHeader = request.headers.get('cookie') ?? undefined;
+  const { session } = await parent();
 
   try {
-    const page = await fetchMemePage({
-      fetch,
-      baseUrl: apiBaseUrl(),
-      query: filters.query,
-      tags: filters.tags,
-      includeNsfw: filters.includeNsfw,
-      mediaType: filters.mediaType,
-      language: filters.language,
-      limit: DEFAULT_PAGE_SIZE,
-      offset: filters.offset,
-      cookieHeader
-    });
+    const [page, collections] = await Promise.all([
+      fetchMemePage({
+        fetch,
+        baseUrl: apiBaseUrl(),
+        query: filters.query,
+        tags: filters.tags,
+        includeNsfw: filters.includeNsfw,
+        mediaType: filters.mediaType,
+        language: filters.language,
+        limit: DEFAULT_PAGE_SIZE,
+        offset: filters.offset,
+        cookieHeader
+      }),
+      session
+        ? fetchCollections({
+            fetch,
+            baseUrl: apiBaseUrl(),
+            cookieHeader,
+            onResponse: (response) => {
+              forwardBackendAccessCookie(response, cookies);
+            }
+          }).catch(() => null)
+        : Promise.resolve(null)
+    ]);
 
-    return { page, filters, errorMessage: null };
+    return { page, collections, filters, errorMessage: null };
   } catch (error) {
     return {
       page: emptyMemePage(DEFAULT_PAGE_SIZE, filters.offset),
+      collections: null,
       filters,
       errorMessage: error instanceof ApiError ? error.message : 'Could not reach the meme catalog API.'
     };

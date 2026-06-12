@@ -4,6 +4,8 @@ import {
   activeCollectionId,
   libraryEmptyText,
   profileCapabilities,
+  profilePreferences,
+  profileStats,
   writableCollectionOptions
 } from './view-model';
 import type { CurrentSessionRead, MemeLibraryRead } from '$lib/api/types';
@@ -33,6 +35,24 @@ describe('profile view model', () => {
 
     expect(activeCollectionId(library)).toBe('favorites-id');
     expect(writableCollectionOptions(library).map((collection) => collection.title)).toEqual(['Favorites', 'Team']);
+  });
+
+  it('builds honest stats and preference rows from loaded data', () => {
+    const session = sessionPayload('guest');
+    session.user.nsfw_enabled = true;
+    session.user.language = 'ru';
+
+    expect(profileStats(libraryPayload()).map((stat) => [stat.label, stat.value])).toEqual([
+      ['Favorites', '0'],
+      ['Pins', '0'],
+      ['Collections', '3'],
+      ['Saved rows', '0']
+    ]);
+    expect(profilePreferences(session.user).map((preference) => [preference.label, preference.value])).toContainEqual([
+      'Language',
+      'Russian'
+    ]);
+    expect(profilePreferences(session.user).map((preference) => [preference.label, preference.value])).toContainEqual(['NSFW', 'Enabled']);
   });
 });
 

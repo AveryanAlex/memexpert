@@ -64,10 +64,7 @@ export const actions: Actions = {
         body: {
           title: String(form.get('title') ?? ''),
           description: String(form.get('description') ?? ''),
-          visibility:
-            form.get('visibility') === 'public' || form.get('visibility') === 'unlisted'
-              ? (form.get('visibility') as 'public' | 'unlisted')
-              : 'private'
+          visibility: form.get('visibility') === 'unlisted' ? 'unlisted' : 'private'
         },
         onResponse: (response) => {
           forwardBackendAccessCookie(response, cookies);

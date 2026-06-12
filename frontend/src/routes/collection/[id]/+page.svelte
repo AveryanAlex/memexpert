@@ -1,5 +1,11 @@
 <script lang="ts">
-  import MemeCard from '$lib/features/memes/MemeCard.svelte';
+  import {
+    collectionAccessSummary,
+    collectionInviteRows,
+    collectionManagementNotice,
+    collectionMemberRows
+  } from '$lib/features/collections/view-model';
+  import MemeGrid from '$lib/features/memes/MemeGrid.svelte';
   import { ActionLink, Badge, Button, Card, EmptyState, Input, Notice, Select } from '$lib/ui';
   import type { ActionData, PageData } from './$types';
 
@@ -10,6 +16,11 @@
   const capabilities = $derived(detail?.capabilities ?? null);
   const isActive = $derived(Boolean(detail && detail.active_save_collection_id === detail.collection.id));
   const memberCount = $derived(collection?.memberships.length ?? 0);
+  const memberRows = $derived(detail ? collectionMemberRows(detail) : []);
+  const inviteRows = $derived(collection ? collectionInviteRows(collection.invites) : []);
+  const managementNotice = $derived(detail ? collectionManagementNotice(detail, data.session ?? null) : '');
+  const accessSummary = $derived(detail ? collectionAccessSummary(detail) : '');
+  const savedMemes = $derived(detail?.saved_memes.map((item) => item.meme) ?? []);
 
   function formatDate(value: string): string {
     return new Intl.DateTimeFormat('en', { dateStyle: 'medium' }).format(new Date(value));
@@ -24,6 +35,7 @@
       <p class="m-0 text-muted">
         {collection.description || 'No description yet.'}
       </p>
+      <p class="m-0 mt-3 text-sm text-muted">{accessSummary}</p>
       <div class="mt-4 flex flex-wrap gap-2" aria-label="Collection metadata">
         <Badge>{collection.kind}</Badge>
         <Badge>{collection.visibility}</Badge>
@@ -42,6 +54,10 @@
         <form method="POST" action="?/setActive">
           <Button size="compact" type="submit" disabled={isActive}>{isActive ? 'Active now' : 'Set active'}</Button>
         </form>
+      {:else if data.session?.user.account_type === 'guest'}
+        <ActionLink size="compact" href="/account/telegram?returnTo=/profile">Connect for custom saves</ActionLink>
+      {:else}
+        <p class="m-0 text-sm text-muted">You need editor or owner access to make this the save destination.</p>
       {/if}
     </Card>
   </section>
@@ -70,7 +86,6 @@
           <Select name="visibility" aria-label="Collection visibility">
             <option value="private" selected={collection.visibility === 'private'}>Private</option>
             <option value="unlisted" selected={collection.visibility === 'unlisted'}>Unlisted</option>
-            <option value="public" selected={collection.visibility === 'public'}>Public</option>
           </Select>
           <Button type="submit">Save changes</Button>
         </form>
@@ -91,6 +106,14 @@
           <Button type="submit">Create invite</Button>
         </form>
       </Card>
+    {:else}
+      <Card class="grid gap-3 shadow-none">
+        <h2 class="m-0 text-2xl font-black tracking-[-0.04em]">Invite links</h2>
+        <p class="m-0 text-muted">{managementNotice}</p>
+        {#if data.session?.user.account_type === 'guest'}
+          <ActionLink size="compact" href={`/account/telegram?returnTo=/collection/${collection.id}`}>Connect Telegram</ActionLink>
+        {/if}
+      </Card>
     {/if}
 
     {#if capabilities.can_delete}
@@ -102,25 +125,81 @@
     {/if}
   </section>
 
+  <section class="my-5 grid gap-4 md:grid-cols-2" aria-label="Members and invite state">
+    <Card class="grid gap-3 shadow-none" aria-labelledby="members-title">
+      <div class="flex flex-wrap items-center justify-between gap-3">
+        <h2 id="members-title" class="m-0 text-2xl font-black tracking-[-0.04em]">Members</h2>
+        <Badge>{memberRows.length} total</Badge>
+      </div>
+      <p class="m-0 text-muted">Roles reflect the existing collection access model. Role changes/removal are not exposed by the current API.</p>
+      {#if memberRows.length > 0}
+        <div class="grid gap-2">
+          {#each memberRows as member (member.id)}
+            <article class="grid gap-2 rounded-[20px] border border-line p-4 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center">
+              <div>
+                <p class="m-0 font-black">{member.label}</p>
+                <p class="m-0 text-sm text-muted">Joined {member.joined}</p>
+              </div>
+              <div class="flex flex-wrap gap-2 sm:justify-end">
+                <Badge>{member.role}</Badge>
+                {#if member.isOwner}<Badge tone="success">Owner</Badge>{/if}
+              </div>
+            </article>
+          {/each}
+        </div>
+      {:else}
+        <p class="m-0 text-muted">No membership rows were returned for this collection.</p>
+      {/if}
+    </Card>
+
+    <Card class="grid gap-3 shadow-none" aria-labelledby="invites-title">
+      <div class="flex flex-wrap items-center justify-between gap-3">
+        <h2 id="invites-title" class="m-0 text-2xl font-black tracking-[-0.04em]">Invites</h2>
+        <Badge>{inviteRows.length} total</Badge>
+      </div>
+      <p class="m-0 text-muted">Invite links can be created here when allowed. Revoking, resending, and role edits are not backed by current APIs.</p>
+      {#if inviteRows.length > 0}
+        <div class="grid gap-2">
+          {#each inviteRows as invite (invite.id)}
+            <article class="grid gap-2 rounded-[20px] border border-line p-4">
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <p class="m-0 font-black">{invite.label}</p>
+                <div class="flex flex-wrap gap-2">
+                  <Badge>{invite.role}</Badge>
+                  <Badge>{invite.status}</Badge>
+                </div>
+              </div>
+              <p class="m-0 text-sm text-muted">{invite.usage} · Expires {invite.expires} · Created {invite.created}</p>
+            </article>
+          {/each}
+        </div>
+      {:else}
+        <p class="m-0 text-muted">No invite rows yet. Create a direct invite link when the form is available.</p>
+      {/if}
+    </Card>
+  </section>
+
   <div class="my-7 flex flex-wrap justify-between gap-3">
     <p class="m-0 text-muted">{detail.saved_memes.length} saved meme{detail.saved_memes.length === 1 ? '' : 's'}</p>
-    <p class="m-0 text-muted">Remove controls appear for writable collections.</p>
+    <p class="m-0 text-muted">Use bulk selection to download or remove saved memes when allowed.</p>
   </div>
 
   {#if detail.saved_memes.length > 0}
-    <section class="grid grid-cols-1 gap-4 md:grid-cols-3" aria-label="Saved memes">
-      {#each detail.saved_memes as item (item.save.meme_id)}
-        <div class="relative">
-          <MemeCard meme={item.meme} />
-          {#if capabilities.can_remove_memes}
-            <form class="absolute bottom-3 right-3 z-10" method="POST" action="?/removeMeme">
-              <input type="hidden" name="meme_id" value={item.save.meme_id} />
-              <Button size="compact" variant="secondary" type="submit">Remove</Button>
-            </form>
-          {/if}
-        </div>
-      {/each}
-    </section>
+    <MemeGrid
+      memes={savedMemes}
+      label="Saved memes"
+      bulk={{
+        enabled: true,
+        accountType: data.session?.user.account_type ?? null,
+        removeCollectionId: collection.id,
+        removeEnabled: capabilities.can_remove_memes,
+        guidance: capabilities.can_remove_memes
+          ? 'Editors and owners can remove selected memes from this collection.'
+          : data.session?.user.account_type === 'guest'
+            ? 'Guests can browse and favorite. Connect Telegram for collection collaboration actions.'
+            : 'Your role can view this collection but cannot remove saved memes.'
+      }}
+    />
   {:else}
     <EmptyState title="No saved memes yet" message={isActive ? 'Browse the catalog and use Save to add memes here.' : 'Set this collection active, then browse and save memes into it.'}>
       <ActionLink size="compact" href="/">Browse memes</ActionLink>
