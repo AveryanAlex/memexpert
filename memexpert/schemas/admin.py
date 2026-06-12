@@ -17,6 +17,7 @@ from memexpert.models.enums import (
     ModerationReportStatus,
     SourcePlatform,
 )
+from memexpert.schemas._text import normalize_optional_text, normalize_required_text
 from memexpert.schemas.base import ORMSchema
 from memexpert.schemas.user import ChannelSuggestionRead, UserRead
 
@@ -45,10 +46,7 @@ class AdminChannelSuggestionReviewRequest(BaseModel):
     @field_validator("admin_note")
     @classmethod
     def _normalize_note(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        normalized = value.strip()
-        return normalized or None
+        return normalize_optional_text(value)
 
 
 class AdminSourceChannelRead(ORMSchema):
@@ -90,18 +88,12 @@ class AdminSourceChannelCreateRequest(BaseModel):
     @field_validator("platform_id", "title")
     @classmethod
     def _normalize_required_text(cls, value: str) -> str:
-        normalized = value.strip()
-        if not normalized:
-            raise ValueError("value must not be blank.")
-        return normalized
+        return normalize_required_text(value)
 
     @field_validator("username", "session_id")
     @classmethod
     def _normalize_optional_text(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        normalized = value.strip()
-        return normalized or None
+        return normalize_optional_text(value)
 
 
 class AdminMemeTemplateRead(ORMSchema):
@@ -137,18 +129,12 @@ class AdminMemeTemplateUpdateRequest(BaseModel):
     def _normalize_required_update_text(cls, value: str | None) -> str | None:
         if value is None:
             return None
-        normalized = value.strip()
-        if not normalized:
-            raise ValueError("value must not be blank.")
-        return normalized
+        return normalize_required_text(value)
 
     @field_validator("description", "base_image_url")
     @classmethod
     def _normalize_text(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        normalized = value.strip()
-        return normalized or None
+        return normalize_optional_text(value)
 
 
 class AdminMemeRead(ORMSchema):
@@ -184,7 +170,7 @@ class AdminMemeModerationUpdateRequest(BaseModel):
     @field_validator("note")
     @classmethod
     def _normalize_note(cls, value: str | None) -> str | None:
-        return _normalize_optional_text(value)
+        return normalize_optional_text(value)
 
     @model_validator(mode="after")
     def _require_flag_change(self) -> AdminMemeModerationUpdateRequest:
@@ -204,10 +190,7 @@ class AdminMemeDeleteRequest(BaseModel):
     @field_validator("confirmation", "note")
     @classmethod
     def _normalize_required_text(cls, value: str) -> str:
-        normalized = value.strip()
-        if not normalized:
-            raise ValueError("value must not be blank.")
-        return normalized
+        return normalize_required_text(value)
 
 
 class AdminMemeMergeRequest(BaseModel):
@@ -222,10 +205,7 @@ class AdminMemeMergeRequest(BaseModel):
     @field_validator("confirmation", "note")
     @classmethod
     def _normalize_required_text(cls, value: str) -> str:
-        normalized = value.strip()
-        if not normalized:
-            raise ValueError("value must not be blank.")
-        return normalized
+        return normalize_required_text(value)
 
 
 class AdminMemeDestructiveActionRead(BaseModel):
@@ -292,14 +272,7 @@ class AdminModerationReportResolveRequest(BaseModel):
     @field_validator("note")
     @classmethod
     def _normalize_note(cls, value: str | None) -> str | None:
-        return _normalize_optional_text(value)
-
-
-def _normalize_optional_text(value: str | None) -> str | None:
-    if value is None:
-        return None
-    normalized = value.strip()
-    return normalized or None
+        return normalize_optional_text(value)
 
 
 class AdminMemeDetailRead(BaseModel):

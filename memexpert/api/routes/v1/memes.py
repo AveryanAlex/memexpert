@@ -20,6 +20,7 @@ from memexpert.api.dependencies import (
     OptionalCurrentUserDep,
     PublicTrendsServiceDep,
 )
+from memexpert.api.routes._collection_errors import collection_service_http_error
 from memexpert.models.enums import AnalyticsEventType, ContentKind, ContentLanguage
 from memexpert.schemas.collection import CollectionMemeRead, CollectionRead, MemeLibraryRead, PinnedMemeRead
 from memexpert.schemas.meme import (
@@ -35,13 +36,9 @@ from memexpert.schemas.meme import (
 from memexpert.schemas.report import MemeReportCreateRequest, MemeReportRead
 from memexpert.schemas.user import UserRead
 from memexpert.services import (
-    CollectionNotFoundError,
     CollectionServiceError,
-    CollectionWriteAccessError,
-    GuestCollectionAccessError,
     InvalidPinnedMemeOrderError,
     PinLimitExceededError,
-    UserNotFoundError,
 )
 from memexpert.services.meme_search import MemeNotFoundError, MemeSearchFilters
 from memexpert.services.public_trends import PublicTrendRanking
@@ -617,13 +614,10 @@ def _meme_not_found_http_error() -> HTTPException:
 
 
 def _collection_http_error(exc: CollectionServiceError) -> HTTPException:
-    if isinstance(exc, (CollectionNotFoundError, UserNotFoundError)):
-        return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
-    if isinstance(exc, (CollectionWriteAccessError, GuestCollectionAccessError)):
-        return HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
-    if isinstance(exc, (InvalidPinnedMemeOrderError, PinLimitExceededError)):
-        return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
-    return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    return collection_service_http_error(
+        exc,
+        conflict_errors=(InvalidPinnedMemeOrderError, PinLimitExceededError),
+    )
 
 
 __all__ = ["router"]

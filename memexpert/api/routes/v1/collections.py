@@ -18,6 +18,7 @@ from memexpert.api.dependencies import (
     FullAccountUserDep,
     MemeSearchServiceDep,
 )
+from memexpert.api.routes._collection_errors import collection_service_http_error
 from memexpert.models.enums import (
     CollectionInviteChannel,
     CollectionKind,
@@ -35,16 +36,10 @@ from memexpert.schemas.collection import (
 )
 from memexpert.schemas.user import UserRead
 from memexpert.services import (
-    CollectionNotFoundError,
     CollectionServiceError,
     CollectionVerificationRequiredError,
-    CollectionWriteAccessError,
     DuplicateCollectionInviteError,
-    GuestCollectionAccessError,
-    InvalidCollectionInviteError,
     InvalidCollectionMembershipError,
-    InvalidCollectionTitleError,
-    UserNotFoundError,
 )
 from memexpert.services.meme_search import MemeNotFoundError
 
@@ -376,15 +371,11 @@ def _meme_not_found_http_error() -> HTTPException:
 
 
 def _collection_http_error(exc: CollectionServiceError) -> HTTPException:
-    if isinstance(exc, (CollectionNotFoundError, UserNotFoundError)):
-        return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
-    if isinstance(exc, (CollectionWriteAccessError, GuestCollectionAccessError, CollectionVerificationRequiredError)):
-        return HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
-    if isinstance(exc, (DuplicateCollectionInviteError, InvalidCollectionMembershipError)):
-        return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
-    if isinstance(exc, (InvalidCollectionInviteError, InvalidCollectionTitleError)):
-        return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
-    return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    return collection_service_http_error(
+        exc,
+        forbidden_errors=(CollectionVerificationRequiredError,),
+        conflict_errors=(DuplicateCollectionInviteError, InvalidCollectionMembershipError),
+    )
 
 
 __all__ = ["router"]
