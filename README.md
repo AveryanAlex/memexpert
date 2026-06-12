@@ -209,7 +209,7 @@ The default CI E2E path uses the operator upload pipeline plus fake providers. F
 
 ## CI
 
-`.github/workflows/ci.yml` runs backend lint/type/test checks, frontend checks/tests/builds, frontend mock smoke tests, local infrastructure compose smoke checks, and the deterministic container E2E smoke job. On container E2E failure, CI uploads `.artifacts/e2e/**`.
+`.github/workflows/ci.yml` runs backend lint/type/test checks, frontend checks/tests/builds, frontend mock smoke tests, and deterministic E2E. On E2E failure, CI uploads `.artifacts/e2e/**`.
 
 `.github/workflows/docker-images.yml` validates the production compose example, builds the Python and frontend images with BuildKit/GitHub Actions cache, loads local CI tags, and performs lightweight API/frontend HTTP smoke checks without publishing images or requiring secrets.
 
