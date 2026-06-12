@@ -207,6 +207,7 @@ class ModerationAction(StrEnum):
     MARK_NSFW = "mark_nsfw"
     MARK_SFW = "mark_sfw"
     NO_ACTION = "no_action"
+    TEMPLATE_OVERRIDE = "template_override"
     OVERRIDE_FLAGS = "override_flags"
     PUBLISH = "publish"
 
@@ -307,6 +308,9 @@ __all__ = [
     "ContentProcessingStatus",
     "ContentSourceKind",
     "EmbeddingInputType",
+    "ModerationAction",
+    "ModerationReason",
+    "ModerationReportStatus",
     "SourcePlatform",
     "SyncTargetKind",
     "SyncTargetStatus",

@@ -12,6 +12,7 @@ from memexpert.api.dependencies import AdminUserDep, DbSessionDep
 from memexpert.models.enums import ChannelSuggestionStatus, ModerationReportStatus
 from memexpert.schemas.admin import (
     AdminChannelSuggestionReviewRequest,
+    AdminMemeDetailRead,
     AdminMemeModerationUpdateRequest,
     AdminMemeRead,
     AdminMemeTemplateRead,
@@ -197,7 +198,19 @@ async def list_moderation_memes(
     )
 
 
-@router.patch("/memes/{meme_id}/moderation", response_model=AdminMemeRead, summary="Override meme moderation flags")
+@router.get("/memes/{meme_id}", response_model=AdminMemeDetailRead, summary="Read admin meme detail")
+async def get_admin_meme_detail(
+    _admin: AdminUserDep,
+    admin_service: AdminServiceDep,
+    meme_id: Annotated[uuid.UUID, Path()],
+) -> AdminMemeDetailRead:
+    try:
+        return await admin_service.get_meme_detail(meme_id)
+    except (AdminNotFoundError, AdminConflictError) as exc:
+        raise _map_admin_error(exc) from exc
+
+
+@router.patch("/memes/{meme_id}/moderation", response_model=AdminMemeRead, summary="Override meme admin fields")
 async def update_meme_moderation(
     admin_user: AdminUserDep,
     admin_service: AdminServiceDep,

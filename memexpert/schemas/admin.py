@@ -170,12 +170,13 @@ class AdminMemeRead(ORMSchema):
 
 
 class AdminMemeModerationUpdateRequest(BaseModel):
-    """Audited direct moderation override for current meme fields."""
+    """Audited direct override for current meme moderation and template fields."""
 
     model_config = ConfigDict(extra="forbid")
 
     is_nsfw: StrictBool | None = None
     is_public: StrictBool | None = None
+    template_id: uuid.UUID | None = None
     reason: ModerationReason | None = None
     note: str | None = Field(default=None, max_length=MAX_ADMIN_NOTE_LENGTH)
 
@@ -186,8 +187,8 @@ class AdminMemeModerationUpdateRequest(BaseModel):
 
     @model_validator(mode="after")
     def _require_flag_change(self) -> AdminMemeModerationUpdateRequest:
-        if self.is_nsfw is None and self.is_public is None:
-            raise ValueError("At least one moderation flag must be supplied.")
+        if self.is_nsfw is None and self.is_public is None and "template_id" not in self.model_fields_set:
+            raise ValueError("At least one moderation field must be supplied.")
         return self
 
 
@@ -207,6 +208,8 @@ class AdminModerationDecisionRead(ORMSchema):
     previous_is_nsfw: bool
     new_is_public: bool
     new_is_nsfw: bool
+    previous_template_id: uuid.UUID | None
+    new_template_id: uuid.UUID | None
     created_at: datetime
 
 
@@ -250,8 +253,19 @@ def _normalize_optional_text(value: str | None) -> str | None:
     return normalized or None
 
 
+class AdminMemeDetailRead(BaseModel):
+    """Admin meme detail bundle for the browser management page."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    meme: AdminMemeRead
+    reports: list[AdminModerationReportRead]
+    decisions: list[AdminModerationDecisionRead]
+
+
 __all__ = [
     "AdminChannelSuggestionReviewRequest",
+    "AdminMemeDetailRead",
     "AdminMemeModerationUpdateRequest",
     "AdminMemeRead",
     "AdminMemeTemplateRead",
