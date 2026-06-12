@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, cast
 
 from httpx import ASGITransport, AsyncClient
@@ -19,6 +20,7 @@ from memexpert.models.content import (
     MemeTemplate,
     ModerationDecision,
     ModerationReport,
+    SourceChannel,
 )
 from memexpert.models.enums import (
     ContentKind,
@@ -95,6 +97,13 @@ async def test_admin_routes_require_session_cookie_admin_flag_and_ignore_operato
             f"/api/v1/admin/memes/{meme_id}/merge",
             json={"target_meme_id": meme_id, "confirmation": meme_id, "note": "test"},
         )
+        forbidden_template_create_response = await non_admin_client.post(
+            "/api/v1/admin/meme-templates",
+            json={"slug": "permission-test", "name": "Permission Test"},
+        )
+        forbidden_source_mark_dead_response = await non_admin_client.post(
+            f"/api/v1/admin/source-channels/{meme_id}/mark-dead",
+        )
         forbidden_reports_response = await non_admin_client.get("/api/v1/admin/moderation-reports")
 
     async with AsyncClient(transport=transport, base_url="https://testserver") as operator_header_client:
@@ -121,6 +130,8 @@ async def test_admin_routes_require_session_cookie_admin_flag_and_ignore_operato
     assert forbidden_override_response.status_code == 403
     assert forbidden_delete_response.status_code == 403
     assert forbidden_merge_response.status_code == 403
+    assert forbidden_template_create_response.status_code == 403
+    assert forbidden_source_mark_dead_response.status_code == 403
     assert forbidden_reports_response.status_code == 403
     assert forbidden_session_response.json()["code"] == "admin_required"
     assert forbidden_reports_response.json()["code"] == "admin_required"
@@ -340,6 +351,224 @@ async def test_admin_direct_meme_override_persists_template_and_decision_audit_r
         assert flag_decision.new_template_id == template_id
         assert template_decision.previous_template_id is None
         assert template_decision.new_template_id == template_id
+
+
+async def test_admin_template_create_rejects_duplicate_slug(
+    auth_app: FastAPI,
+    auth_settings_overrides: dict[str, str],
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    admin_token = await _issue_user_cookie(
+        postgres_session_factory,
+        auth_settings_overrides,
+        email="admin-create-template@example.com",
+        is_admin=True,
+    )
+
+    transport = ASGITransport(app=auth_app)
+    async with AsyncClient(transport=transport, base_url="https://testserver") as admin_client:
+        admin_client.cookies.set(ACCESS_COOKIE_NAME, admin_token)
+        create_response = await admin_client.post(
+            "/api/v1/admin/meme-templates",
+            json={"slug": "launch-template", "name": "Launch Template", "is_curated": True},
+        )
+        duplicate_response = await admin_client.post(
+            "/api/v1/admin/meme-templates",
+            json={"slug": "launch-template", "name": "Duplicate Launch Template"},
+        )
+
+    assert create_response.status_code == 201
+    payload = create_response.json()
+    assert payload["slug"] == "launch-template"
+    assert payload["name"] == "Launch Template"
+    assert payload["is_curated"] is True
+    assert duplicate_response.status_code == 409
+    assert "slug" in duplicate_response.json()["detail"]
+
+
+async def test_admin_template_merge_reassigns_memes_and_writes_template_override_audit(
+    auth_app: FastAPI,
+    auth_settings_overrides: dict[str, str],
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    admin_token = await _issue_user_cookie(
+        postgres_session_factory,
+        auth_settings_overrides,
+        email="admin-merge-template@example.com",
+        is_admin=True,
+    )
+
+    async with postgres_session_factory() as session:
+        admin = (
+            await session.execute(select(User).where(User.email == "admin-merge-template@example.com"))
+        ).scalar_one()
+        source_template = MemeTemplate(slug="duplicate-template", name="Duplicate Template")
+        target_template = MemeTemplate(slug="canonical-template", name="Canonical Template")
+        first_meme = Meme(media_type=ContentKind.IMAGE, is_public=True, is_nsfw=False, template=source_template)
+        second_meme = Meme(media_type=ContentKind.IMAGE, is_public=False, is_nsfw=True, template=source_template)
+        session.add_all([source_template, target_template, first_meme, second_meme])
+        await session.commit()
+        source_template_id = source_template.id
+        target_template_id = target_template.id
+        first_meme_id = first_meme.id
+        second_meme_id = second_meme.id
+        admin_id = admin.id
+
+    transport = ASGITransport(app=auth_app)
+    async with AsyncClient(transport=transport, base_url="https://testserver") as admin_client:
+        admin_client.cookies.set(ACCESS_COOKIE_NAME, admin_token)
+        response = await admin_client.post(
+            f"/api/v1/admin/meme-templates/{source_template_id}/merge",
+            json={
+                "target_template_id": str(target_template_id),
+                "confirmation": str(source_template_id),
+                "note": "Canonical template selected by content ops",
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["action"] == "merge"
+    assert payload["source_template_id"] == str(source_template_id)
+    assert payload["target_template_id"] == str(target_template_id)
+    assert payload["affected_meme_count"] == 2
+
+    async with postgres_session_factory() as session:
+        deleted_source = await session.get(MemeTemplate, source_template_id)
+        persisted_first_meme = await session.get(Meme, first_meme_id)
+        persisted_second_meme = await session.get(Meme, second_meme_id)
+        decisions = (
+            await session.execute(
+                select(ModerationDecision)
+                .where(ModerationDecision.meme_id.in_([first_meme_id, second_meme_id]))
+                .order_by(ModerationDecision.created_at.asc()),
+            )
+        ).scalars().all()
+
+        assert deleted_source is None
+        assert persisted_first_meme is not None
+        assert persisted_second_meme is not None
+        assert persisted_first_meme.template_id == target_template_id
+        assert persisted_second_meme.template_id == target_template_id
+        assert len(decisions) == 2
+        assert {decision.action for decision in decisions} == {ModerationAction.TEMPLATE_OVERRIDE}
+        assert {decision.admin_user_id for decision in decisions} == {admin_id}
+        assert {decision.new_template_id for decision in decisions} == {target_template_id}
+        assert all("Canonical template selected" in (decision.note or "") for decision in decisions)
+
+
+async def test_admin_template_delete_only_allows_unreferenced_templates(
+    auth_app: FastAPI,
+    auth_settings_overrides: dict[str, str],
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    admin_token = await _issue_user_cookie(
+        postgres_session_factory,
+        auth_settings_overrides,
+        email="admin-delete-template@example.com",
+        is_admin=True,
+    )
+
+    async with postgres_session_factory() as session:
+        referenced_template = MemeTemplate(slug="referenced-template", name="Referenced Template")
+        unreferenced_template = MemeTemplate(slug="unreferenced-template", name="Unreferenced Template")
+        meme = Meme(media_type=ContentKind.IMAGE, is_public=True, is_nsfw=False, template=referenced_template)
+        session.add_all([referenced_template, unreferenced_template, meme])
+        await session.commit()
+        referenced_template_id = referenced_template.id
+        unreferenced_template_id = unreferenced_template.id
+
+    transport = ASGITransport(app=auth_app)
+    async with AsyncClient(transport=transport, base_url="https://testserver") as admin_client:
+        admin_client.cookies.set(ACCESS_COOKIE_NAME, admin_token)
+        blocked_response = await admin_client.request(
+            "DELETE",
+            f"/api/v1/admin/meme-templates/{referenced_template_id}",
+            json={"confirmation": str(referenced_template_id), "note": "try referenced delete"},
+        )
+        deleted_response = await admin_client.request(
+            "DELETE",
+            f"/api/v1/admin/meme-templates/{unreferenced_template_id}",
+            json={"confirmation": str(unreferenced_template_id), "note": "safe cleanup"},
+        )
+
+    assert blocked_response.status_code == 409
+    assert "referenced by memes" in blocked_response.json()["detail"]
+    assert deleted_response.status_code == 200
+    assert deleted_response.json()["action"] == "delete"
+
+    async with postgres_session_factory() as session:
+        persisted_referenced_template = await session.get(MemeTemplate, referenced_template_id)
+        deleted_unreferenced_template = await session.get(MemeTemplate, unreferenced_template_id)
+        assert persisted_referenced_template is not None
+        assert deleted_unreferenced_template is None
+
+
+async def test_admin_source_channel_health_and_mark_dead_conflicts(
+    auth_app: FastAPI,
+    auth_settings_overrides: dict[str, str],
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    admin_token = await _issue_user_cookie(
+        postgres_session_factory,
+        auth_settings_overrides,
+        email="admin-source-health@example.com",
+        is_admin=True,
+    )
+
+    async with postgres_session_factory() as session:
+        stale_channel = SourceChannel(
+            platform=SourcePlatform.TELEGRAM,
+            platform_id="source-health-stale",
+            username="source_health_stale",
+            title="Source Health Stale",
+            last_read_post_id="42",
+            last_fetched_at=datetime.now(UTC) - timedelta(days=2),
+        )
+        checkpoint_channel = SourceChannel(
+            platform=SourcePlatform.TELEGRAM,
+            platform_id="source-health-checkpoint",
+            username="source_health_checkpoint",
+            title="Source Health Checkpoint",
+            last_read_post_id="43",
+        )
+        session.add_all([stale_channel, checkpoint_channel])
+        await session.commit()
+        stale_channel_id = stale_channel.id
+        checkpoint_channel_id = checkpoint_channel.id
+
+    transport = ASGITransport(app=auth_app)
+    async with AsyncClient(transport=transport, base_url="https://testserver") as admin_client:
+        admin_client.cookies.set(ACCESS_COOKIE_NAME, admin_token)
+        list_response = await admin_client.get("/api/v1/admin/source-channels")
+        mark_dead_response = await admin_client.post(f"/api/v1/admin/source-channels/{stale_channel_id}/mark-dead")
+        resume_dead_response = await admin_client.post(f"/api/v1/admin/source-channels/{stale_channel_id}/resume")
+        mark_dead_again_response = await admin_client.post(
+            f"/api/v1/admin/source-channels/{stale_channel_id}/mark-dead",
+        )
+
+    assert list_response.status_code == 200
+    channels = {item["id"]: item for item in list_response.json()}
+    assert channels[str(stale_channel_id)]["operational_status"] == "active"
+    assert channels[str(stale_channel_id)]["freshness_status"] == "stale"
+    assert channels[str(stale_channel_id)]["seconds_since_last_fetch"] >= 2 * 24 * 60 * 60 - 10
+    assert channels[str(checkpoint_channel_id)]["freshness_status"] == "checkpoint_only"
+
+    assert mark_dead_response.status_code == 200
+    mark_dead_payload = mark_dead_response.json()
+    assert mark_dead_payload["is_active"] is False
+    assert mark_dead_payload["is_paused"] is True
+    assert mark_dead_payload["operational_status"] == "inactive"
+    assert resume_dead_response.status_code == 409
+    assert "marked dead" in resume_dead_response.json()["detail"]
+    assert mark_dead_again_response.status_code == 409
+    assert "already marked dead" in mark_dead_again_response.json()["detail"]
+
+    async with postgres_session_factory() as session:
+        persisted_stale_channel = await session.get(SourceChannel, stale_channel_id)
+        assert persisted_stale_channel is not None
+        assert persisted_stale_channel.is_active is False
+        assert persisted_stale_channel.is_paused is True
 
 
 async def test_admin_can_delete_meme_with_durable_destructive_audit(

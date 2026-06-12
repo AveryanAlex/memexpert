@@ -336,6 +336,9 @@ export interface AdminSourceChannelRead {
   session_id: string | null;
   last_read_post_id: string | null;
   last_fetched_at: string | null;
+  operational_status: 'active' | 'inactive' | 'paused';
+  freshness_status: 'checkpoint_only' | 'fresh' | 'never_fetched' | 'stale';
+  seconds_since_last_fetch: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -420,5 +423,13 @@ export interface AdminMemeDestructiveActionRead {
   target_meme_id: string | null;
   audit_log_id: string;
   affected_snapshot: Record<string, unknown>;
+  message: string;
+}
+
+export interface AdminMemeTemplateActionRead {
+  action: 'delete' | 'merge';
+  source_template_id: string;
+  target_template_id: string | null;
+  affected_meme_count: number;
   message: string;
 }

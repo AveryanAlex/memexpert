@@ -4,7 +4,11 @@ import type { Actions, PageServerLoad } from './$types';
 import {
   addSourceChannel,
   ApiError,
+  createMemeTemplate,
+  deleteMemeTemplate,
   fetchAdminDashboard,
+  markSourceChannelDead,
+  mergeMemeTemplate,
   reviewChannelSuggestion,
   resolveModerationReport,
   setSourceChannelPaused,
@@ -80,6 +84,34 @@ export const actions: Actions = {
       return { message: 'Source channel updated.' };
     });
   },
+  markSourceChannelDead: async ({ fetch, request }) => {
+    const data = await request.formData();
+    return runAction(async () => {
+      await markSourceChannelDead(
+        { fetch, baseUrl: apiBaseUrl(), cookieHeader: request.headers.get('cookie') ?? undefined },
+        readRequired(data, 'channel_id')
+      );
+      return { message: 'Source channel marked dead; crawler checkpoint state was preserved.' };
+    });
+  },
+  createTemplate: async ({ fetch, request }) => {
+    const data = await request.formData();
+    return runAction(async () => {
+      await createMemeTemplate({
+        fetch,
+        baseUrl: apiBaseUrl(),
+        cookieHeader: request.headers.get('cookie') ?? undefined,
+        body: {
+          slug: readRequired(data, 'slug'),
+          name: readRequired(data, 'name'),
+          description: readOptional(data, 'description'),
+          is_curated: data.get('is_curated') === 'on',
+          base_image_url: readOptional(data, 'base_image_url')
+        }
+      });
+      return { message: 'Template created.' };
+    });
+  },
   updateTemplate: async ({ fetch, request }) => {
     const data = await request.formData();
     return runAction(async () => {
@@ -99,6 +131,45 @@ export const actions: Actions = {
         readRequired(data, 'template_id')
       );
       return { message: 'Template updated.' };
+    });
+  },
+  mergeTemplate: async ({ fetch, request }) => {
+    const data = await request.formData();
+    const templateId = readRequired(data, 'template_id');
+    return runAction(async () => {
+      await mergeMemeTemplate(
+        {
+          fetch,
+          baseUrl: apiBaseUrl(),
+          cookieHeader: request.headers.get('cookie') ?? undefined,
+          body: {
+            target_template_id: readRequired(data, 'target_template_id'),
+            confirmation: readRequired(data, 'confirmation'),
+            note: readRequired(data, 'note')
+          }
+        },
+        templateId
+      );
+      return { message: 'Template merged and affected memes audited.' };
+    });
+  },
+  deleteTemplate: async ({ fetch, request }) => {
+    const data = await request.formData();
+    const templateId = readRequired(data, 'template_id');
+    return runAction(async () => {
+      await deleteMemeTemplate(
+        {
+          fetch,
+          baseUrl: apiBaseUrl(),
+          cookieHeader: request.headers.get('cookie') ?? undefined,
+          body: {
+            confirmation: readRequired(data, 'confirmation'),
+            note: readOptional(data, 'note')
+          }
+        },
+        templateId
+      );
+      return { message: 'Unreferenced template deleted.' };
     });
   },
   updateMemeModeration: async ({ fetch, request }) => {

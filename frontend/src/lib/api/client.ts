@@ -2,6 +2,7 @@ import type {
   AdminMemeDestructiveActionRead,
   AdminMemeDetailRead,
   AdminMemeRead,
+  AdminMemeTemplateActionRead,
   AdminMemeTemplateRead,
   AdminModerationDecisionRead,
   AdminModerationReportRead,
@@ -374,6 +375,21 @@ export async function setSourceChannelPaused(
   );
 }
 
+export async function markSourceChannelDead(
+  request: CatalogRequest,
+  channelId: string
+): Promise<AdminSourceChannelRead> {
+  return apiWrite<AdminSourceChannelRead>(
+    `/api/v1/admin/source-channels/${encodeURIComponent(channelId)}/mark-dead`,
+    'POST',
+    request
+  );
+}
+
+export async function createMemeTemplate(request: JsonMutationRequest): Promise<AdminMemeTemplateRead> {
+  return apiWrite<AdminMemeTemplateRead>('/api/v1/admin/meme-templates', 'POST', request);
+}
+
 export async function updateMemeTemplate(
   request: JsonMutationRequest,
   templateId: string
@@ -381,6 +397,28 @@ export async function updateMemeTemplate(
   return apiWrite<AdminMemeTemplateRead>(
     `/api/v1/admin/meme-templates/${encodeURIComponent(templateId)}`,
     'PATCH',
+    request
+  );
+}
+
+export async function mergeMemeTemplate(
+  request: JsonMutationRequest,
+  templateId: string
+): Promise<AdminMemeTemplateActionRead> {
+  return apiWrite<AdminMemeTemplateActionRead>(
+    `/api/v1/admin/meme-templates/${encodeURIComponent(templateId)}/merge`,
+    'POST',
+    request
+  );
+}
+
+export async function deleteMemeTemplate(
+  request: JsonMutationRequest,
+  templateId: string
+): Promise<AdminMemeTemplateActionRead> {
+  return apiWrite<AdminMemeTemplateActionRead>(
+    `/api/v1/admin/meme-templates/${encodeURIComponent(templateId)}`,
+    'DELETE',
     request
   );
 }

@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
@@ -37,6 +37,10 @@ from memexpert.schemas.admin import (
     AdminMemeMergeRequest,
     AdminMemeModerationUpdateRequest,
     AdminMemeRead,
+    AdminMemeTemplateActionRead,
+    AdminMemeTemplateCreateRequest,
+    AdminMemeTemplateDeleteRequest,
+    AdminMemeTemplateMergeRequest,
     AdminMemeTemplateRead,
     AdminMemeTemplateUpdateRequest,
     AdminModerationDecisionRead,
@@ -51,6 +55,8 @@ from memexpert.services.content_merge import ContentMergeService
 if TYPE_CHECKING:
     import uuid
     from collections.abc import Iterable
+    from datetime import datetime
+    from typing import Literal
 
     from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -111,7 +117,8 @@ class AdminService:
         rows = (
             await self.session.execute(select(SourceChannel).order_by(SourceChannel.title.asc()))
         ).scalars().all()
-        return [AdminSourceChannelRead.model_validate(row) for row in rows]
+        now = utcnow()
+        return [self._source_channel_read(row, now=now) for row in rows]
 
     async def add_source_channel(self, request: AdminSourceChannelCreateRequest) -> AdminSourceChannelRead:
         channel = SourceChannel(
@@ -133,23 +140,56 @@ class AdminService:
                 f"Source channel {request.platform.value}:{request.platform_id} already exists.",
             ) from exc
         await self.session.refresh(channel)
-        return AdminSourceChannelRead.model_validate(channel)
+        return self._source_channel_read(channel)
 
     async def set_source_channel_paused(self, channel_id: uuid.UUID, *, is_paused: bool) -> AdminSourceChannelRead:
         channel = await self.session.get(SourceChannel, channel_id)
         if channel is None:
             raise AdminNotFoundError(f"Source channel {channel_id} does not exist.")
+        if not channel.is_active:
+            raise AdminConflictError(f"Source channel {channel_id} is marked dead and cannot be paused or resumed.")
         if channel.is_paused != is_paused:
             channel.is_paused = is_paused
             await self.session.commit()
             await self.session.refresh(channel)
-        return AdminSourceChannelRead.model_validate(channel)
+        return self._source_channel_read(channel)
+
+    async def mark_source_channel_dead(self, channel_id: uuid.UUID) -> AdminSourceChannelRead:
+        channel = await self.session.get(SourceChannel, channel_id)
+        if channel is None:
+            raise AdminNotFoundError(f"Source channel {channel_id} does not exist.")
+        if not channel.is_active:
+            raise AdminConflictError(f"Source channel {channel_id} is already marked dead.")
+
+        channel.is_active = False
+        channel.is_paused = True
+        await self.session.commit()
+        await self.session.refresh(channel)
+        return self._source_channel_read(channel)
 
     async def list_meme_templates(self) -> list[AdminMemeTemplateRead]:
         rows = (
             await self.session.execute(select(MemeTemplate).order_by(MemeTemplate.name.asc()))
         ).scalars().all()
         return [AdminMemeTemplateRead.model_validate(row) for row in rows]
+
+    async def create_meme_template(self, request: AdminMemeTemplateCreateRequest) -> AdminMemeTemplateRead:
+        template = MemeTemplate(
+            slug=request.slug,
+            name=request.name,
+            description=request.description,
+            is_curated=request.is_curated,
+            base_image_url=request.base_image_url,
+            text_regions=request.text_regions,
+        )
+        self.session.add(template)
+        try:
+            await self.session.commit()
+        except IntegrityError as exc:
+            await self.session.rollback()
+            raise AdminConflictError("Meme template slug already exists.") from exc
+        await self.session.refresh(template)
+        return AdminMemeTemplateRead.model_validate(template)
 
     async def update_meme_template(
         self,
@@ -170,6 +210,113 @@ class AdminService:
             raise AdminConflictError("Meme template slug already exists.") from exc
         await self.session.refresh(template)
         return AdminMemeTemplateRead.model_validate(template)
+
+    async def merge_meme_template(
+        self,
+        template_id: uuid.UUID,
+        *,
+        admin_user_id: uuid.UUID,
+        request: AdminMemeTemplateMergeRequest,
+    ) -> AdminMemeTemplateActionRead:
+        if request.confirmation != str(template_id):
+            raise AdminConflictError("Template merge confirmation must exactly match the source template id.")
+        if request.target_template_id == template_id:
+            raise AdminConflictError("A meme template cannot be merged into itself.")
+
+        source_template = await self.session.scalar(
+            select(MemeTemplate).where(MemeTemplate.id == template_id).with_for_update(),
+        )
+        if source_template is None:
+            raise AdminNotFoundError(f"Meme template {template_id} does not exist.")
+        target_template = await self.session.scalar(
+            select(MemeTemplate).where(MemeTemplate.id == request.target_template_id).with_for_update(),
+        )
+        if target_template is None:
+            raise AdminNotFoundError(f"Target meme template {request.target_template_id} does not exist.")
+
+        affected_memes = (
+            await self.session.execute(select(Meme).where(Meme.template_id == template_id).with_for_update())
+        ).scalars().all()
+        source_label = f"{source_template.name} ({source_template.id})"
+        target_label = f"{target_template.name} ({target_template.id})"
+        decision_note = f"Template merge {source_label} -> {target_label}. {request.note}"
+
+        for meme in affected_memes:
+            previous_template_id = meme.template_id
+            meme.template_id = request.target_template_id
+            self.session.add(
+                ModerationDecision(
+                    meme=meme,
+                    admin_user_id=admin_user_id,
+                    action=ModerationAction.TEMPLATE_OVERRIDE,
+                    reason=None,
+                    note=decision_note,
+                    previous_is_public=meme.is_public,
+                    previous_is_nsfw=meme.is_nsfw,
+                    new_is_public=meme.is_public,
+                    new_is_nsfw=meme.is_nsfw,
+                    previous_template_id=previous_template_id,
+                    new_template_id=request.target_template_id,
+                ),
+            )
+
+        affected_count = len(affected_memes)
+        await self.session.flush()
+        await self.session.delete(source_template)
+        await self.session.commit()
+
+        return AdminMemeTemplateActionRead(
+            action="merge",
+            source_template_id=template_id,
+            target_template_id=request.target_template_id,
+            affected_meme_count=affected_count,
+            message="Template memes reassigned to target and duplicate template removed.",
+        )
+
+    async def delete_meme_template(
+        self,
+        template_id: uuid.UUID,
+        request: AdminMemeTemplateDeleteRequest,
+    ) -> AdminMemeTemplateActionRead:
+        template = await self.session.scalar(
+            select(MemeTemplate).where(MemeTemplate.id == template_id).with_for_update(),
+        )
+        if template is None:
+            raise AdminNotFoundError(f"Meme template {template_id} does not exist.")
+        if request.confirmation != str(template_id):
+            raise AdminConflictError("Template deletion confirmation must exactly match the template id.")
+
+        meme_count = await self.session.scalar(
+            select(func.count()).select_from(Meme).where(Meme.template_id == template_id),
+        )
+        if meme_count:
+            raise AdminConflictError(
+                "Meme template is still referenced by memes; merge it into a target template first.",
+            )
+        decision_count = await self.session.scalar(
+            select(func.count())
+            .select_from(ModerationDecision)
+            .where(
+                or_(
+                    ModerationDecision.previous_template_id == template_id,
+                    ModerationDecision.new_template_id == template_id,
+                ),
+            ),
+        )
+        if decision_count:
+            raise AdminConflictError(
+                "Meme template is referenced by moderation decision history and cannot be deleted safely.",
+            )
+
+        await self.session.delete(template)
+        await self.session.commit()
+        return AdminMemeTemplateActionRead(
+            action="delete",
+            source_template_id=template_id,
+            target_template_id=None,
+            affected_meme_count=0,
+            message="Unreferenced template deleted.",
+        )
 
     async def list_moderation_memes(
         self,
@@ -617,6 +764,42 @@ class AdminService:
             meme.is_nsfw = True
             return
         raise AdminConflictError(f"Unsupported moderation action {action.value}.")
+
+    @staticmethod
+    def _source_channel_read(channel: SourceChannel, *, now: datetime | None = None) -> AdminSourceChannelRead:
+        current_time = utcnow() if now is None else now
+        operational_status: Literal["active", "inactive", "paused"] = (
+            "inactive" if not channel.is_active else "paused" if channel.is_paused else "active"
+        )
+        seconds_since_last_fetch: int | None = None
+        if channel.last_fetched_at is None:
+            freshness_status: Literal["checkpoint_only", "fresh", "never_fetched", "stale"] = (
+                "checkpoint_only" if channel.last_read_post_id else "never_fetched"
+            )
+        else:
+            seconds_since_last_fetch = max(0, int((current_time - channel.last_fetched_at).total_seconds()))
+            freshness_status = "fresh" if seconds_since_last_fetch <= 24 * 60 * 60 else "stale"
+
+        return AdminSourceChannelRead(
+            id=channel.id,
+            platform=channel.platform,
+            platform_id=channel.platform_id,
+            username=channel.username,
+            title=channel.title,
+            subscriber_count=channel.subscriber_count,
+            is_active=channel.is_active,
+            is_paused=channel.is_paused,
+            catchup_enabled=channel.catchup_enabled,
+            catchup_message_limit=channel.catchup_message_limit,
+            session_id=channel.session_id,
+            last_read_post_id=channel.last_read_post_id,
+            last_fetched_at=channel.last_fetched_at,
+            operational_status=operational_status,
+            freshness_status=freshness_status,
+            seconds_since_last_fetch=seconds_since_last_fetch,
+            created_at=channel.created_at,
+            updated_at=channel.updated_at,
+        )
 
 
 __all__ = ["AdminConflictError", "AdminNotFoundError", "AdminService", "AdminServiceError"]

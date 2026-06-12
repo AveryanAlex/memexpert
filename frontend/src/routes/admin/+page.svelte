@@ -1,6 +1,6 @@
 <script lang="ts">
   import AdminPanel from '$lib/features/admin/AdminPanel.svelte';
-  import { ActionLink, Badge, Button, Input, Notice, Select } from '$lib/ui';
+  import { ActionLink, Badge, Button, EmptyState, FormRow, Input, Notice, Select, Textarea } from '$lib/ui';
   import type { PageData } from './$types';
   import type { ActionData } from './$types';
 
@@ -15,6 +15,30 @@
     ['publish', 'Publish'],
     ['no_action', 'No action']
   ];
+
+  function freshnessCopy(channel: PageData['dashboard']['sourceChannels'][number]): string {
+    if (channel.freshness_status === 'fresh') {
+      return `fresh${channel.seconds_since_last_fetch === null ? '' : ` · ${formatAge(channel.seconds_since_last_fetch)} ago`}`;
+    }
+    if (channel.freshness_status === 'stale') {
+      return `stale · ${formatAge(channel.seconds_since_last_fetch ?? 0)} ago`;
+    }
+    if (channel.freshness_status === 'checkpoint_only') {
+      return `checkpoint only · last post ${channel.last_read_post_id}`;
+    }
+    return 'never fetched';
+  }
+
+  function formatAge(seconds: number): string {
+    if (seconds >= 86400) return `${Math.floor(seconds / 86400)}d`;
+    if (seconds >= 3600) return `${Math.floor(seconds / 3600)}h`;
+    if (seconds >= 60) return `${Math.floor(seconds / 60)}m`;
+    return `${seconds}s`;
+  }
+
+  function templateTargets(templateId: string): PageData['dashboard']['templates'] {
+    return data.dashboard.templates.filter((template) => template.id !== templateId);
+  }
 </script>
 
 <section>
@@ -75,36 +99,102 @@
 
 <AdminPanel title="Source Channels">
   <div class="grid gap-3">
-    {#each data.dashboard.sourceChannels as channel (channel.id)}
-      <article class="grid items-center gap-3 border-t border-line pt-3 md:grid-cols-[minmax(0,1fr)_auto]">
-        <div>
-          <strong>{channel.title}</strong>
-          <p class="m-0 text-muted">{channel.platform}:{channel.platform_id} · {channel.is_paused ? 'paused' : 'active'}</p>
-        </div>
-        <form method="POST" action="?/toggleSourceChannel">
-          <input type="hidden" name="channel_id" value={channel.id} />
-          <input type="hidden" name="paused" value={channel.is_paused ? 'false' : 'true'} />
-          <Button type="submit">{channel.is_paused ? 'Resume' : 'Pause'}</Button>
-        </form>
-      </article>
-    {/each}
+    {#if data.dashboard.sourceChannels.length === 0}
+      <EmptyState title="No source channels" message="Add a source channel to let crawler operations pick it up." />
+    {:else}
+      {#each data.dashboard.sourceChannels as channel (channel.id)}
+        <article class="grid items-center gap-3 border-t border-line pt-3 md:grid-cols-[minmax(0,1fr)_auto]">
+          <div>
+            <strong>{channel.title}</strong>
+            <p class="m-0 text-muted">
+              {channel.platform}:{channel.platform_id} · {channel.operational_status} · {freshnessCopy(channel)}
+            </p>
+            <p class="m-0 text-muted">
+              {channel.username ?? 'no username'} · session {channel.session_id ?? 'default'} · catch-up {channel.catchup_enabled ? 'on' : 'off'} / {channel.catchup_message_limit}
+            </p>
+          </div>
+          <div class="flex flex-wrap justify-end gap-2">
+            {#if channel.is_active}
+              <form method="POST" action="?/toggleSourceChannel">
+                <input type="hidden" name="channel_id" value={channel.id} />
+                <input type="hidden" name="paused" value={channel.is_paused ? 'false' : 'true'} />
+                <Button type="submit">{channel.is_paused ? 'Resume' : 'Pause'}</Button>
+              </form>
+              <form method="POST" action="?/markSourceChannelDead">
+                <input type="hidden" name="channel_id" value={channel.id} />
+                <Button type="submit" variant="secondary">Mark dead</Button>
+              </form>
+            {:else}
+              <Badge>Removed from crawl</Badge>
+            {/if}
+          </div>
+        </article>
+      {/each}
+    {/if}
   </div>
+</AdminPanel>
+
+<AdminPanel title="Create Meme Template">
+  <form method="POST" action="?/createTemplate" class="grid gap-3 md:grid-cols-2">
+    <FormRow label="Slug"><Input name="slug" placeholder="drake-hotline-bling" required /></FormRow>
+    <FormRow label="Name"><Input name="name" placeholder="Drake Hotline Bling" required /></FormRow>
+    <FormRow label="Description" class="md:col-span-2"><Textarea name="description" rows={2} placeholder="Template taxonomy notes" /></FormRow>
+    <FormRow label="Base image URL"><Input name="base_image_url" placeholder="https://..." /></FormRow>
+    <label class="inline-flex items-center gap-2 text-chiptext"><input name="is_curated" type="checkbox" /> Curated</label>
+    <div class="md:col-span-2"><Button type="submit">Create template</Button></div>
+  </form>
 </AdminPanel>
 
 <AdminPanel title="Meme Templates">
   <div class="grid gap-3">
-    {#each data.dashboard.templates as template (template.id)}
-      <form method="POST" action="?/updateTemplate" class="flex flex-wrap items-center gap-2">
-        <input type="hidden" name="template_id" value={template.id} />
-        <Input name="slug" value={template.slug} aria-label="Slug" />
-        <Input name="name" value={template.name} aria-label="Name" />
-        <Input name="description" value={template.description ?? ''} aria-label="Description" />
-        <Input name="base_image_url" value={template.base_image_url ?? ''} aria-label="Base image URL" />
-        <label class="inline-flex items-center gap-2 text-chiptext"><input name="is_curated" type="checkbox" checked={template.is_curated} /> Curated</label>
-        <Button type="submit">Save</Button>
-      </form>
-    {/each}
+    {#if data.dashboard.templates.length === 0}
+      <EmptyState title="No meme templates" message="Create the first template before assigning memes or merging duplicates." />
+    {:else}
+      {#each data.dashboard.templates as template (template.id)}
+        <article class="grid gap-3 border-t border-line pt-3">
+          <form method="POST" action="?/updateTemplate" class="grid gap-2 lg:grid-cols-[1fr_1fr_1.4fr_1.4fr_auto_auto]">
+            <input type="hidden" name="template_id" value={template.id} />
+            <Input name="slug" value={template.slug} aria-label="Slug" />
+            <Input name="name" value={template.name} aria-label="Name" />
+            <Input name="description" value={template.description ?? ''} aria-label="Description" />
+            <Input name="base_image_url" value={template.base_image_url ?? ''} aria-label="Base image URL" />
+            <label class="inline-flex items-center gap-2 text-chiptext"><input name="is_curated" type="checkbox" checked={template.is_curated} /> Curated</label>
+            <Button type="submit">Save</Button>
+          </form>
+          <div class="grid gap-2 rounded-2xl border border-line bg-soft/50 p-3 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
+            <form method="POST" action="?/mergeTemplate" class="grid gap-2">
+              <input type="hidden" name="template_id" value={template.id} />
+              <strong>Merge duplicate</strong>
+              <Select name="target_template_id" aria-label="Target template" required>
+                <option value="">Target template</option>
+                {#each templateTargets(template.id) as target (target.id)}
+                  <option value={target.id}>{target.name} · {target.slug}</option>
+                {/each}
+              </Select>
+              <Input name="confirmation" placeholder="paste source template id" />
+              <Input name="note" placeholder="audit note" />
+              <Button type="submit" variant="secondary">Merge into target</Button>
+            </form>
+            <form method="POST" action="?/deleteTemplate" class="grid gap-2">
+              <input type="hidden" name="template_id" value={template.id} />
+              <strong>Safe delete</strong>
+              <p class="m-0 text-sm text-muted">Only succeeds when no memes or moderation history reference this template.</p>
+              <Input name="confirmation" placeholder="paste template id" />
+              <Input name="note" placeholder="optional note" />
+              <Button type="submit" variant="secondary">Delete if unreferenced</Button>
+            </form>
+          </div>
+          <p class="m-0 text-xs text-muted">Template ID: {template.id}</p>
+        </article>
+      {/each}
+    {/if}
   </div>
+</AdminPanel>
+
+<AdminPanel title="Moderation Pattern Controls">
+  <Notice>
+    Blocked pHash controls are intentionally not shown yet. This repository stores file pHashes and uses them for duplicate detection, but it does not have a blocked-pattern model or ingest/moderation contract that would consume admin bans.
+  </Notice>
 </AdminPanel>
 
 <AdminPanel title="Moderation Reports Queue">
