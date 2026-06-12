@@ -990,6 +990,7 @@ def test_moderation_enum_values_are_locked_and_stable() -> None:
         "mark_nsfw",
         "mark_sfw",
         "no_action",
+        "template_override",
         "override_flags",
         "publish",
     ]
