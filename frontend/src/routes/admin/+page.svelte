@@ -3,6 +3,16 @@
   import type { ActionData } from './$types';
 
   let { data, form }: { data: PageData; form: ActionData } = $props();
+
+  const moderationReasons = ['nsfw', 'spam', 'harassment', 'copyright', 'illegal', 'other'];
+  const reportActions = [
+    ['mark_nsfw', 'Mark NSFW'],
+    ['mark_sfw', 'Mark SFW'],
+    ['hide', 'Hide'],
+    ['hide_and_mark_nsfw', 'Hide + NSFW'],
+    ['publish', 'Publish'],
+    ['no_action', 'No action']
+  ];
 </script>
 
 <section class="admin-hero">
@@ -100,11 +110,74 @@
 </section>
 
 <section class="admin-panel">
+  <h2>Moderation Reports Queue</h2>
+  <p class="muted">Open user/admin reports awaiting a decision. Resolving a report writes immutable decision history.</p>
+  {#if data.dashboard.reports.length === 0}
+    <p class="muted">No open moderation reports.</p>
+  {:else}
+    <div class="admin-list">
+      {#each data.dashboard.reports as report (report.id)}
+        <article class="admin-row moderation-report-row">
+          <div>
+            <strong>{report.reason.toUpperCase()} report for {report.meme_id}</strong>
+            <p class="muted">
+              {report.status} · public {report.meme.is_public ? 'yes' : 'no'} · nsfw {report.meme.is_nsfw ? 'yes' : 'no'} · {report.created_at}
+            </p>
+            {#if report.note}
+              <p>{report.note}</p>
+            {/if}
+          </div>
+          <form method="POST" action="?/resolveModerationReport" class="inline-form moderation-form">
+            <input type="hidden" name="report_id" value={report.id} />
+            <select name="action" aria-label="Resolution action">
+              {#each reportActions as [value, label]}
+                <option value={value}>{label}</option>
+              {/each}
+            </select>
+            <select name="reason" aria-label="Decision reason">
+              {#each moderationReasons as reason}
+                <option value={reason} selected={reason === report.reason}>{reason}</option>
+              {/each}
+            </select>
+            <input name="note" placeholder="decision note" />
+            <button type="submit">Resolve</button>
+          </form>
+        </article>
+      {/each}
+    </div>
+  {/if}
+</section>
+
+<section class="admin-panel">
+  <h2>Moderation Decision History</h2>
+  {#if data.dashboard.decisions.length === 0}
+    <p class="muted">No moderation decisions recorded yet.</p>
+  {:else}
+    <div class="admin-list">
+      {#each data.dashboard.decisions as decision (decision.id)}
+        <article class="admin-row decision-row">
+          <div>
+            <strong>{decision.action} · {decision.meme_id}</strong>
+            <p class="muted">
+              public {decision.previous_is_public ? 'yes' : 'no'} -> {decision.new_is_public ? 'yes' : 'no'} · nsfw {decision.previous_is_nsfw ? 'yes' : 'no'} -> {decision.new_is_nsfw ? 'yes' : 'no'}
+            </p>
+            <p class="muted">{decision.reason ?? 'no reason'} · {decision.created_at}</p>
+            {#if decision.note}
+              <p>{decision.note}</p>
+            {/if}
+          </div>
+        </article>
+      {/each}
+    </div>
+  {/if}
+</section>
+
+<section class="admin-panel">
   <h2>Meme Moderation</h2>
-  <p class="muted">Current model support is limited to direct public and NSFW flag overrides.</p>
+  <p class="muted">Direct public and NSFW flag overrides are preserved for admin emergencies. Every submission writes a moderation decision audit record.</p>
   <div class="admin-list">
     {#each data.dashboard.memes as meme (meme.id)}
-      <form method="POST" action="?/updateMemeModeration" class="admin-row">
+      <form method="POST" action="?/updateMemeModeration" class="admin-row moderation-form">
         <input type="hidden" name="meme_id" value={meme.id} />
         <div>
           <strong>{meme.id}</strong>
@@ -112,7 +185,14 @@
         </div>
         <label class="checkbox-row"><input name="is_public" type="checkbox" checked={meme.is_public} /> Public</label>
         <label class="checkbox-row"><input name="is_nsfw" type="checkbox" checked={meme.is_nsfw} /> NSFW</label>
-        <button type="submit">Update</button>
+        <select name="reason" aria-label="Override reason">
+          <option value="">No reason</option>
+          {#each moderationReasons as reason}
+            <option value={reason}>{reason}</option>
+          {/each}
+        </select>
+        <input name="note" placeholder="audit note" />
+        <button type="submit">Update audited flags</button>
       </form>
     {/each}
   </div>

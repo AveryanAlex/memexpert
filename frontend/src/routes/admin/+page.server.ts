@@ -6,6 +6,7 @@ import {
   ApiError,
   fetchAdminDashboard,
   reviewChannelSuggestion,
+  resolveModerationReport,
   setSourceChannelPaused,
   updateMemeModeration,
   updateMemeTemplate
@@ -20,7 +21,7 @@ export const load: PageServerLoad = async ({ fetch, request }) => {
     };
   } catch (caught) {
     return {
-      dashboard: { suggestions: [], sourceChannels: [], templates: [], memes: [] },
+      dashboard: { suggestions: [], sourceChannels: [], templates: [], memes: [], reports: [], decisions: [] },
       loadError: caught instanceof ApiError ? caught.message : 'Could not load admin tools.'
     };
   }
@@ -110,12 +111,33 @@ export const actions: Actions = {
           cookieHeader: request.headers.get('cookie') ?? undefined,
           body: {
             is_nsfw: data.get('is_nsfw') === 'on',
-            is_public: data.get('is_public') === 'on'
+            is_public: data.get('is_public') === 'on',
+            reason: readOptional(data, 'reason'),
+            note: readOptional(data, 'note')
           }
         },
         readRequired(data, 'meme_id')
       );
-      return { message: 'Meme moderation flags updated.' };
+      return { message: 'Meme moderation flags updated and audited.' };
+    });
+  },
+  resolveModerationReport: async ({ fetch, request }) => {
+    const data = await request.formData();
+    return runAction(async () => {
+      await resolveModerationReport(
+        {
+          fetch,
+          baseUrl: apiBaseUrl(),
+          cookieHeader: request.headers.get('cookie') ?? undefined,
+          body: {
+            action: readRequired(data, 'action'),
+            reason: readOptional(data, 'reason'),
+            note: readOptional(data, 'note')
+          }
+        },
+        readRequired(data, 'report_id')
+      );
+      return { message: 'Moderation report resolved and audited.' };
     });
   }
 };

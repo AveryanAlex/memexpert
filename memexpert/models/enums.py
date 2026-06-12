@@ -179,6 +179,38 @@ class ChannelSuggestionStatus(StrEnum):
     REJECTED = "rejected"
 
 
+class ModerationReportStatus(StrEnum):
+    """Lifecycle states for user/admin reports against memes."""
+
+    PENDING = "pending"
+    IN_REVIEW = "in_review"
+    RESOLVED = "resolved"
+    DISMISSED = "dismissed"
+
+
+class ModerationReason(StrEnum):
+    """Normalized moderation reason taxonomy shown to admins."""
+
+    COPYRIGHT = "copyright"
+    HARASSMENT = "harassment"
+    ILLEGAL = "illegal"
+    NSFW = "nsfw"
+    OTHER = "other"
+    SPAM = "spam"
+
+
+class ModerationAction(StrEnum):
+    """Audited admin actions that may change meme moderation flags."""
+
+    HIDE = "hide"
+    HIDE_AND_MARK_NSFW = "hide_and_mark_nsfw"
+    MARK_NSFW = "mark_nsfw"
+    MARK_SFW = "mark_sfw"
+    NO_ACTION = "no_action"
+    OVERRIDE_FLAGS = "override_flags"
+    PUBLISH = "publish"
+
+
 class EmbeddingInputType(StrEnum):
     """Embedding cache entry kinds persisted in PostgreSQL."""
 

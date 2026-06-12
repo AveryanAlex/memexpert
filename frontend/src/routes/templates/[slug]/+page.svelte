@@ -1,5 +1,6 @@
 <script lang="ts">
   import MemeCard from '$lib/components/MemeCard.svelte';
+  import TrendSummary from '$lib/components/TrendSummary.svelte';
   import type { PageData } from './$types';
 
   let { data }: { data: PageData } = $props();
@@ -30,6 +31,16 @@
     <p class="muted">Showing {resultStart}-{resultEnd} of {page.total}</p>
     <a href="/" class="muted">Search all memes</a>
   </div>
+
+  <section class="trend-section" aria-label="Template trend summary">
+    <h2>Template trend</h2>
+    {#if data.landing.trend_summary}
+      <p class="muted">{data.landing.trend_summary.meme_count} public memes in this aggregate.</p>
+      <TrendSummary trend={data.landing.trend_summary.trend} />
+    {:else}
+      <p class="muted">No materialized trend data for this template yet.</p>
+    {/if}
+  </section>
 
   {#if page.items.length > 0}
     <section class="grid" aria-label="Template memes">

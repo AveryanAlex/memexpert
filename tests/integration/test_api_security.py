@@ -458,18 +458,19 @@ async def test_csrf_logout_all_route_requires_header_when_browser_origin_present
 async def test_csrf_admin_browser_writes_require_header_before_auth_dependency(
     browser_security_client: AsyncClient,
 ) -> None:
+    report_id = "11111111-1111-4111-8111-111111111111"
     rejected_response = await browser_security_client.post(
-        "/api/v1/admin/source-channels",
+        f"/api/v1/admin/moderation-reports/{report_id}/resolve",
         headers={"Origin": "https://app.memexpert.net"},
-        json={"platform": "telegram", "platform_id": "source", "title": "Source"},
+        json={"action": "no_action", "reason": "other", "note": "csrf probe"},
     )
     accepted_response = await browser_security_client.post(
-        "/api/v1/admin/source-channels",
+        f"/api/v1/admin/moderation-reports/{report_id}/resolve",
         headers={
             "Origin": "https://app.memexpert.net",
             "X-Requested-With": BROWSER_REQUESTED_WITH_VALUE,
         },
-        json={"platform": "telegram", "platform_id": "source", "title": "Source"},
+        json={"action": "no_action", "reason": "other", "note": "csrf probe"},
     )
 
     assert rejected_response.status_code == 403

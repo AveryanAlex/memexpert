@@ -42,6 +42,16 @@ export interface TelegramLinkStartRead {
 }
 export type SourcePlatform = 'reddit' | 'telegram' | 'vk';
 export type ChannelSuggestionStatus = 'approved' | 'pending' | 'rejected';
+export type ModerationReportStatus = 'pending' | 'in_review' | 'resolved' | 'dismissed';
+export type ModerationReason = 'copyright' | 'harassment' | 'illegal' | 'nsfw' | 'other' | 'spam';
+export type ModerationAction =
+  | 'hide'
+  | 'hide_and_mark_nsfw'
+  | 'mark_nsfw'
+  | 'mark_sfw'
+  | 'no_action'
+  | 'override_flags'
+  | 'publish';
 
 export interface PublicMemeFileRead {
   id: string;
@@ -138,12 +148,78 @@ export interface MemeLibraryRead {
   active_save_collection: CollectionSummaryRead | null;
 }
 
+export interface PublicTrendCountsRead {
+  views: number;
+  sends: number;
+  likes: number;
+  saves: number;
+  downloads: number;
+}
+
+export interface PublicTrendMetricsRead {
+  recent: PublicTrendCountsRead;
+  previous: PublicTrendCountsRead;
+  latest_snapshot_at: string | null;
+  latest_source_views: number;
+  latest_source_reactions: number;
+  latest_source_reposts: number;
+  latest_platform_views: number;
+  latest_platform_sends: number;
+  latest_platform_saves: number;
+  latest_platform_likes: number;
+  latest_popularity_score: number;
+  engagement_24h: number;
+  trending_score: number;
+  refreshed_at: string | null;
+}
+
+export interface PublicMemeTrendRead {
+  meme: PublicMemeCardRead;
+  trend: PublicTrendMetricsRead;
+}
+
+export interface PublicMemeTrendPageRead {
+  items: PublicMemeTrendRead[];
+  limit: number;
+  offset: number;
+  total: number;
+  has_more: boolean;
+}
+
+export interface PublicMemePopularityPointRead {
+  captured_at: string;
+  source_views: number;
+  source_reactions: number;
+  source_reposts: number;
+  platform_views: number;
+  platform_sends: number;
+  platform_saves: number;
+  platform_likes: number;
+  popularity_score: number;
+}
+
+export interface PublicMemePopularitySummaryRead {
+  meme_id: string;
+  trend: PublicTrendMetricsRead | null;
+  sparkline: PublicMemePopularityPointRead[];
+}
+
+export interface PublicTrendSummaryRead {
+  kind: 'tag' | 'template' | string;
+  slug: string;
+  title: string;
+  description: string | null;
+  meme_count: number;
+  trend: PublicTrendMetricsRead;
+}
+
 export interface PublicMemeLandingRead {
   kind: 'tag' | 'template' | string;
   slug: string;
   title: string;
   description: string | null;
   page: PublicMemeSearchPageRead;
+  trend_summary: PublicTrendSummaryRead | null;
 }
 
 export interface AdminSessionRead {
@@ -205,4 +281,33 @@ export interface AdminMemeRead {
   author_user_id: string | null;
   created_at: string;
   updated_at: string;
+}
+
+export interface AdminModerationReportRead {
+  id: string;
+  meme_id: string;
+  reporter_user_id: string | null;
+  status: ModerationReportStatus;
+  reason: ModerationReason;
+  note: string | null;
+  resolved_by_admin_user_id: string | null;
+  resolved_at: string | null;
+  created_at: string;
+  updated_at: string;
+  meme: AdminMemeRead;
+}
+
+export interface AdminModerationDecisionRead {
+  id: string;
+  meme_id: string;
+  report_id: string | null;
+  admin_user_id: string | null;
+  action: ModerationAction;
+  reason: ModerationReason | null;
+  note: string | null;
+  previous_is_public: boolean;
+  previous_is_nsfw: boolean;
+  new_is_public: boolean;
+  new_is_nsfw: boolean;
+  created_at: string;
 }

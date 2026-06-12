@@ -16,6 +16,7 @@
   <header class="site-header">
     <div class="brand-block">
       <a class="brand" href="/">MemeXpert</a>
+      <a class="pill" href="/trends">Trends</a>
       <span class="pill">Public catalog MVP</span>
     </div>
     <section class="account-chip" aria-label="Account state">

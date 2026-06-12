@@ -1,6 +1,8 @@
 import type {
   AdminMemeRead,
   AdminMemeTemplateRead,
+  AdminModerationDecisionRead,
+  AdminModerationReportRead,
   AdminSessionRead,
   AdminSourceChannelRead,
   ChannelSuggestionRead,
@@ -8,7 +10,10 @@ import type {
   MemeLibraryRead,
   PublicMemeDetailRead,
   PublicMemeLandingRead,
+  PublicMemePopularitySummaryRead,
   PublicMemeSearchPageRead,
+  PublicMemeTrendPageRead,
+  PublicTrendSummaryRead,
   TelegramLinkStartRead
 } from './types';
 
@@ -31,6 +36,12 @@ interface PageRequest extends CatalogRequest {
 
 interface DetailRequest extends CatalogRequest {
   memeId: string;
+}
+
+interface TrendRequest extends CatalogRequest {
+  ranking?: 'trending' | 'fastest_rising' | 'most_liked';
+  limit: number;
+  offset: number;
 }
 
 interface MemeActionRequest {
@@ -117,6 +128,39 @@ export async function updateActiveSaveCollection(request: ActiveSaveCollectionRe
   });
 }
 
+export async function fetchTrendPage(request: TrendRequest): Promise<PublicMemeTrendPageRead> {
+  const params = new URLSearchParams({
+    ranking: request.ranking ?? 'trending',
+    limit: String(request.limit),
+    offset: String(request.offset)
+  });
+  return apiGet<PublicMemeTrendPageRead>('/api/v1/memes/trends', params, request);
+}
+
+export async function fetchTagTrendSummaries(request: TrendRequest): Promise<PublicTrendSummaryRead[]> {
+  return apiGet<PublicTrendSummaryRead[]>(
+    '/api/v1/memes/trends/tags',
+    new URLSearchParams({ limit: String(request.limit), offset: String(request.offset) }),
+    request
+  );
+}
+
+export async function fetchTemplateTrendSummaries(request: TrendRequest): Promise<PublicTrendSummaryRead[]> {
+  return apiGet<PublicTrendSummaryRead[]>(
+    '/api/v1/memes/trends/templates',
+    new URLSearchParams({ limit: String(request.limit), offset: String(request.offset) }),
+    request
+  );
+}
+
+export async function fetchMemePopularitySummary(request: DetailRequest): Promise<PublicMemePopularitySummaryRead> {
+  return apiGet<PublicMemePopularitySummaryRead>(
+    `/api/v1/memes/${encodeURIComponent(request.memeId)}/popularity`,
+    new URLSearchParams({ include_nsfw: 'false' }),
+    request
+  );
+}
+
 export async function favoriteMeme(request: MemeActionRequest): Promise<unknown> {
   return apiMutation(`/api/v1/memes/${encodeURIComponent(request.memeId)}/favorite`, 'POST', request);
 }
@@ -158,15 +202,19 @@ export async function fetchAdminDashboard(request: CatalogRequest): Promise<{
   sourceChannels: AdminSourceChannelRead[];
   templates: AdminMemeTemplateRead[];
   memes: AdminMemeRead[];
+  reports: AdminModerationReportRead[];
+  decisions: AdminModerationDecisionRead[];
 }> {
-  const [suggestions, sourceChannels, templates, memes] = await Promise.all([
+  const [suggestions, sourceChannels, templates, memes, reports, decisions] = await Promise.all([
     apiGet<ChannelSuggestionRead[]>('/api/v1/admin/channel-suggestions', new URLSearchParams(), request),
     apiGet<AdminSourceChannelRead[]>('/api/v1/admin/source-channels', new URLSearchParams(), request),
     apiGet<AdminMemeTemplateRead[]>('/api/v1/admin/meme-templates', new URLSearchParams(), request),
-    apiGet<AdminMemeRead[]>('/api/v1/admin/memes', new URLSearchParams({ limit: '20' }), request)
+    apiGet<AdminMemeRead[]>('/api/v1/admin/memes', new URLSearchParams({ limit: '20' }), request),
+    apiGet<AdminModerationReportRead[]>('/api/v1/admin/moderation-reports', new URLSearchParams({ limit: '20' }), request),
+    apiGet<AdminModerationDecisionRead[]>('/api/v1/admin/moderation-decisions', new URLSearchParams({ limit: '20' }), request)
   ]);
 
-  return { suggestions, sourceChannels, templates, memes };
+  return { suggestions, sourceChannels, templates, memes, reports, decisions };
 }
 
 export async function reviewChannelSuggestion(
@@ -212,6 +260,17 @@ export async function updateMemeModeration(request: JsonMutationRequest, memeId:
   return apiWrite<AdminMemeRead>(
     `/api/v1/admin/memes/${encodeURIComponent(memeId)}/moderation`,
     'PATCH',
+    request
+  );
+}
+
+export async function resolveModerationReport(
+  request: JsonMutationRequest,
+  reportId: string
+): Promise<AdminModerationReportRead> {
+  return apiWrite<AdminModerationReportRead>(
+    `/api/v1/admin/moderation-reports/${encodeURIComponent(reportId)}/resolve`,
+    'POST',
     request
   );
 }
@@ -328,6 +387,16 @@ function readErrorDetail(payload: unknown): string | null {
 }
 
 export function emptyMemePage(limit: number, offset: number): PublicMemeSearchPageRead {
+  return {
+    items: [],
+    limit,
+    offset,
+    total: 0,
+    has_more: false
+  };
+}
+
+export function emptyTrendPage(limit: number, offset: number): PublicMemeTrendPageRead {
   return {
     items: [],
     limit,
