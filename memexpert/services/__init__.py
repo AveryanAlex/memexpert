@@ -13,6 +13,13 @@ from memexpert.services.auth_service import (
     AuthService,
     AuthSession,
 )
+from memexpert.services.channel_suggestion_service import (
+    ChannelSuggestionService,
+    ChannelSuggestionServiceError,
+    ChannelSuggestionSubmitResult,
+    InvalidChannelSuggestionError,
+    normalize_channel_suggestion,
+)
 from memexpert.services.collection_service import FAVORITES_TITLE, CollectionService
 from memexpert.services.content_pipeline import ContentPipelineService
 from memexpert.services.errors import (
@@ -100,6 +107,9 @@ __all__ = [
     "AuthService",
     "AuthServiceError",
     "AuthSession",
+    "ChannelSuggestionService",
+    "ChannelSuggestionServiceError",
+    "ChannelSuggestionSubmitResult",
     "CollectionNotFoundError",
     "CollectionService",
     "CollectionServiceError",
@@ -125,6 +135,7 @@ __all__ = [
     "InvalidCollectionMembershipError",
     "InvalidCollectionTitleError",
     "InvalidCredentialsError",
+    "InvalidChannelSuggestionError",
     "InvalidIdentityError",
     "InvalidPinnedMemeOrderError",
     "InvalidTokenError",
@@ -167,4 +178,5 @@ __all__ = [
     "UserService",
     "UserServiceError",
     "UserStateMismatchError",
+    "normalize_channel_suggestion",
 ]
