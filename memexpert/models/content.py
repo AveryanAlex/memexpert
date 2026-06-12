@@ -212,6 +212,14 @@ class ModerationDecision(UUIDPrimaryKeyMixin, Base):
     previous_is_nsfw: Mapped[bool] = mapped_column(nullable=False)
     new_is_public: Mapped[bool] = mapped_column(nullable=False)
     new_is_nsfw: Mapped[bool] = mapped_column(nullable=False)
+    previous_template_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("meme_templates.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    new_template_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("meme_templates.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(default=utcnow, nullable=False)
 
     meme: Mapped["Meme"] = relationship("Meme", back_populates="moderation_decisions")
@@ -716,6 +724,8 @@ __all__ = [
     "MemeSeoPage",
     "MemeSource",
     "MemeTemplate",
+    "ModerationDecision",
+    "ModerationReport",
     "PipelineStageJournal",
     "SourceChannel",
     "TelegramFileIdCache",

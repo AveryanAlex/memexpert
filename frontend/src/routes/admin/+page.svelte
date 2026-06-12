@@ -183,6 +183,7 @@
           <strong>{meme.id}</strong>
           <p class="muted">{meme.media_type} · {meme.language} · score {meme.popularity_score.toFixed(1)}</p>
         </div>
+        <a class="button-link compact secondary" href={`/admin/memes/${meme.id}`}>Open detail</a>
         <label class="checkbox-row"><input name="is_public" type="checkbox" checked={meme.is_public} /> Public</label>
         <label class="checkbox-row"><input name="is_nsfw" type="checkbox" checked={meme.is_nsfw} /> NSFW</label>
         <select name="reason" aria-label="Override reason">

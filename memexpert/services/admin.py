@@ -14,6 +14,7 @@ from memexpert.models.content import Meme, MemeTemplate, ModerationDecision, Mod
 from memexpert.models.enums import ModerationAction, ModerationReportStatus
 from memexpert.models.user import ChannelSuggestion
 from memexpert.schemas.admin import (
+    AdminMemeDetailRead,
     AdminMemeModerationUpdateRequest,
     AdminMemeRead,
     AdminMemeTemplateRead,
@@ -161,6 +162,34 @@ class AdminService:
         rows = (await self.session.execute(stmt)).scalars().all()
         return [AdminMemeRead.model_validate(row) for row in rows]
 
+    async def get_meme_detail(self, meme_id: uuid.UUID) -> AdminMemeDetailRead:
+        meme = await self.session.get(Meme, meme_id)
+        if meme is None:
+            raise AdminNotFoundError(f"Meme {meme_id} does not exist.")
+
+        reports = (
+            await self.session.execute(
+                select(ModerationReport)
+                .options(selectinload(ModerationReport.meme))
+                .where(ModerationReport.meme_id == meme_id)
+                .order_by(ModerationReport.created_at.desc()),
+            )
+        ).scalars().all()
+        decisions = (
+            await self.session.execute(
+                select(ModerationDecision)
+                .where(ModerationDecision.meme_id == meme_id)
+                .order_by(ModerationDecision.created_at.desc())
+                .limit(100),
+            )
+        ).scalars().all()
+
+        return AdminMemeDetailRead(
+            meme=AdminMemeRead.model_validate(meme),
+            reports=[AdminModerationReportRead.model_validate(report) for report in reports],
+            decisions=[AdminModerationDecisionRead.model_validate(decision) for decision in decisions],
+        )
+
     async def update_meme_moderation(
         self,
         meme_id: uuid.UUID,
@@ -174,24 +203,54 @@ class AdminService:
 
         previous_is_public = meme.is_public
         previous_is_nsfw = meme.is_nsfw
+        previous_template_id = meme.template_id
+
+        if "template_id" in request.model_fields_set and request.template_id is not None:
+            template = await self.session.get(MemeTemplate, request.template_id)
+            if template is None:
+                raise AdminNotFoundError(f"Meme template {request.template_id} does not exist.")
+
         if request.is_nsfw is not None:
             meme.is_nsfw = request.is_nsfw
         if request.is_public is not None:
             meme.is_public = request.is_public
+        if "template_id" in request.model_fields_set:
+            meme.template_id = request.template_id
 
-        self.session.add(
-            ModerationDecision(
-                meme=meme,
-                admin_user_id=admin_user_id,
-                action=ModerationAction.OVERRIDE_FLAGS,
-                reason=request.reason,
-                note=request.note,
-                previous_is_public=previous_is_public,
-                previous_is_nsfw=previous_is_nsfw,
-                new_is_public=meme.is_public,
-                new_is_nsfw=meme.is_nsfw,
-            ),
-        )
+        flags_changed = previous_is_public != meme.is_public or previous_is_nsfw != meme.is_nsfw
+        template_changed = previous_template_id != meme.template_id
+        if flags_changed:
+            self.session.add(
+                ModerationDecision(
+                    meme=meme,
+                    admin_user_id=admin_user_id,
+                    action=ModerationAction.OVERRIDE_FLAGS,
+                    reason=request.reason,
+                    note=request.note,
+                    previous_is_public=previous_is_public,
+                    previous_is_nsfw=previous_is_nsfw,
+                    new_is_public=meme.is_public,
+                    new_is_nsfw=meme.is_nsfw,
+                    previous_template_id=previous_template_id,
+                    new_template_id=meme.template_id,
+                ),
+            )
+        if template_changed:
+            self.session.add(
+                ModerationDecision(
+                    meme=meme,
+                    admin_user_id=admin_user_id,
+                    action=ModerationAction.TEMPLATE_OVERRIDE,
+                    reason=request.reason,
+                    note=request.note,
+                    previous_is_public=meme.is_public,
+                    previous_is_nsfw=meme.is_nsfw,
+                    new_is_public=meme.is_public,
+                    new_is_nsfw=meme.is_nsfw,
+                    previous_template_id=previous_template_id,
+                    new_template_id=meme.template_id,
+                ),
+            )
         await self.session.commit()
         await self.session.refresh(meme)
         return AdminMemeRead.model_validate(meme)
@@ -264,6 +323,8 @@ class AdminService:
             previous_is_nsfw=previous_is_nsfw,
             new_is_public=meme.is_public,
             new_is_nsfw=meme.is_nsfw,
+            previous_template_id=meme.template_id,
+            new_template_id=meme.template_id,
         )
         self.session.add(decision)
         await self.session.commit()

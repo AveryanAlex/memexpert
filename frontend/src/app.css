@@ -164,6 +164,7 @@ button {
 .inline-form button,
 .admin-row button,
 .moderation-form button,
+.planned-actions button,
 .template-form button {
   border: 0;
   border-radius: 18px;
@@ -533,11 +534,67 @@ button {
   grid-template-columns: 1fr;
 }
 
+.admin-form label:not(.checkbox-row) {
+  display: grid;
+  gap: 6px;
+  color: #594e42;
+}
+
 .checkbox-row {
   display: inline-flex;
   gap: 8px;
   align-items: center;
   color: #594e42;
+}
+
+.detail-admin-grid {
+  align-items: start;
+}
+
+.admin-meta-list {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+}
+
+.admin-meta-list div,
+.audit-row {
+  display: grid;
+  gap: 6px;
+  border-top: 1px solid #eadfce;
+  padding-top: 10px;
+}
+
+.admin-meta-list dt {
+  color: #6d6253;
+  font-size: 0.78rem;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.admin-meta-list dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.planned-actions {
+  display: grid;
+  gap: 10px;
+  margin-top: 16px;
+  border-top: 1px solid #eadfce;
+  padding-top: 16px;
+}
+
+.planned-actions button,
+.admin-row button:disabled,
+.planned-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.audit-row code {
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .detail-card {

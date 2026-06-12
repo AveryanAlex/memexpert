@@ -1,4 +1,5 @@
 import type {
+  AdminMemeDetailRead,
   AdminMemeRead,
   AdminMemeTemplateRead,
   AdminModerationDecisionRead,
@@ -199,6 +200,14 @@ export async function fetchAdminDashboard(request: CatalogRequest): Promise<{
   ]);
 
   return { suggestions, sourceChannels, templates, memes, reports, decisions };
+}
+
+export async function fetchAdminMemeDetail(request: CatalogRequest, memeId: string): Promise<AdminMemeDetailRead> {
+  return apiGet<AdminMemeDetailRead>(`/api/v1/admin/memes/${encodeURIComponent(memeId)}`, new URLSearchParams(), request);
+}
+
+export async function fetchAdminMemeTemplates(request: CatalogRequest): Promise<AdminMemeTemplateRead[]> {
+  return apiGet<AdminMemeTemplateRead[]>('/api/v1/admin/meme-templates', new URLSearchParams(), request);
 }
 
 export async function reviewChannelSuggestion(

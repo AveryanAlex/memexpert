@@ -7,7 +7,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from memexpert.models.content import Meme, ModerationDecision, ModerationReport
+from memexpert.models.content import Meme, MemeTemplate, ModerationDecision, ModerationReport
 from memexpert.models.enums import (
     ContentKind,
     ModerationAction,
@@ -45,10 +45,16 @@ async def test_admin_routes_require_session_cookie_admin_flag_and_ignore_operato
     auth_settings_overrides: dict[str, str],
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
+    meme_id = "11111111-1111-4111-8111-111111111111"
     transport = ASGITransport(app=auth_app)
 
     async with AsyncClient(transport=transport, base_url="https://testserver") as anonymous_client:
-        anonymous_response = await anonymous_client.get("/api/v1/admin/session")
+        anonymous_session_response = await anonymous_client.get("/api/v1/admin/session")
+        anonymous_detail_response = await anonymous_client.get(f"/api/v1/admin/memes/{meme_id}")
+        anonymous_override_response = await anonymous_client.patch(
+            f"/api/v1/admin/memes/{meme_id}/moderation",
+            json={"is_nsfw": True},
+        )
 
     non_admin_token = await _issue_user_cookie(
         postgres_session_factory,
@@ -58,21 +64,35 @@ async def test_admin_routes_require_session_cookie_admin_flag_and_ignore_operato
     )
     async with AsyncClient(transport=transport, base_url="https://testserver") as non_admin_client:
         non_admin_client.cookies.set(ACCESS_COOKIE_NAME, non_admin_token)
-        forbidden_response = await non_admin_client.get("/api/v1/admin/session")
+        forbidden_session_response = await non_admin_client.get("/api/v1/admin/session")
+        forbidden_detail_response = await non_admin_client.get(f"/api/v1/admin/memes/{meme_id}")
+        forbidden_override_response = await non_admin_client.patch(
+            f"/api/v1/admin/memes/{meme_id}/moderation",
+            json={"is_nsfw": True},
+        )
         forbidden_reports_response = await non_admin_client.get("/api/v1/admin/moderation-reports")
 
     async with AsyncClient(transport=transport, base_url="https://testserver") as operator_header_client:
-        operator_response = await operator_header_client.get(
+        operator_session_response = await operator_header_client.get(
             "/api/v1/admin/session",
             headers={"X-Pipeline-Operator-Token": "anything"},
         )
+        operator_detail_response = await operator_header_client.get(
+            f"/api/v1/admin/memes/{meme_id}",
+            headers={"X-Pipeline-Operator-Token": "anything"},
+        )
 
-    assert anonymous_response.status_code == 401
-    assert forbidden_response.status_code == 403
-    assert forbidden_response.json()["code"] == "admin_required"
+    assert anonymous_session_response.status_code == 401
+    assert anonymous_detail_response.status_code == 401
+    assert anonymous_override_response.status_code == 401
+    assert forbidden_session_response.status_code == 403
+    assert forbidden_detail_response.status_code == 403
+    assert forbidden_override_response.status_code == 403
     assert forbidden_reports_response.status_code == 403
+    assert forbidden_session_response.json()["code"] == "admin_required"
     assert forbidden_reports_response.json()["code"] == "admin_required"
-    assert operator_response.status_code == 401
+    assert operator_session_response.status_code == 401
+    assert operator_detail_response.status_code == 401
 
 
 async def test_admin_can_approve_channel_suggestion_through_cookie_session(
@@ -119,7 +139,7 @@ async def test_admin_can_approve_channel_suggestion_through_cookie_session(
         assert persisted.status.value == "approved"
 
 
-async def test_admin_can_list_and_resolve_moderation_report_with_audited_decision(
+async def test_admin_can_list_read_and_resolve_moderation_report_with_audited_decision(
     auth_app,
     auth_settings_overrides: dict[str, str],
     postgres_session_factory: async_sessionmaker[AsyncSession],
@@ -155,6 +175,7 @@ async def test_admin_can_list_and_resolve_moderation_report_with_audited_decisio
     async with AsyncClient(transport=transport, base_url="https://testserver") as admin_client:
         admin_client.cookies.set(ACCESS_COOKIE_NAME, admin_token)
         list_response = await admin_client.get("/api/v1/admin/moderation-reports")
+        detail_response = await admin_client.get(f"/api/v1/admin/memes/{meme_id}")
         resolve_response = await admin_client.post(
             f"/api/v1/admin/moderation-reports/{report_id}/resolve",
             json={"action": "mark_nsfw", "reason": "nsfw", "note": "Confirmed by moderator"},
@@ -164,6 +185,12 @@ async def test_admin_can_list_and_resolve_moderation_report_with_audited_decisio
     assert list_response.status_code == 200
     assert [item["id"] for item in list_response.json()] == [str(report_id)]
     assert list_response.json()[0]["meme"]["id"] == str(meme_id)
+
+    assert detail_response.status_code == 200
+    detail_payload = detail_response.json()
+    assert detail_payload["meme"]["id"] == str(meme_id)
+    assert [item["id"] for item in detail_payload["reports"]] == [str(report_id)]
+    assert detail_payload["decisions"] == []
 
     assert resolve_response.status_code == 200
     resolved_payload = resolve_response.json()
@@ -178,6 +205,8 @@ async def test_admin_can_list_and_resolve_moderation_report_with_audited_decisio
     assert history_payload[0]["action"] == "mark_nsfw"
     assert history_payload[0]["previous_is_nsfw"] is False
     assert history_payload[0]["new_is_nsfw"] is True
+    assert history_payload[0]["previous_template_id"] is None
+    assert history_payload[0]["new_template_id"] is None
 
     async with postgres_session_factory() as session:
         persisted_report = await session.get(ModerationReport, report_id)
@@ -196,7 +225,7 @@ async def test_admin_can_list_and_resolve_moderation_report_with_audited_decisio
         assert persisted_decision.reason is ModerationReason.NSFW
 
 
-async def test_admin_direct_meme_moderation_override_creates_decision_audit_record(
+async def test_admin_direct_meme_override_persists_template_and_decision_audit_records(
     auth_app,
     auth_settings_overrides: dict[str, str],
     postgres_session_factory: async_sessionmaker[AsyncSession],
@@ -212,46 +241,68 @@ async def test_admin_direct_meme_moderation_override_creates_decision_audit_reco
         admin = (
             await session.execute(select(User).where(User.email == "admin-direct-override@example.com"))
         ).scalar_one()
+        template = MemeTemplate(slug="new-template", name="New Template")
         meme = Meme(media_type=ContentKind.IMAGE, is_public=True, is_nsfw=False)
-        session.add(meme)
+        session.add_all([template, meme])
         await session.commit()
+        await session.refresh(template)
         await session.refresh(meme)
+        template_id = template.id
         meme_id = meme.id
         admin_id = admin.id
 
     transport = ASGITransport(app=auth_app)
     async with AsyncClient(transport=transport, base_url="https://testserver") as admin_client:
         admin_client.cookies.set(ACCESS_COOKIE_NAME, admin_token)
-        response = await admin_client.patch(
+        override_response = await admin_client.patch(
             f"/api/v1/admin/memes/{meme_id}/moderation",
             json={
                 "is_public": False,
                 "is_nsfw": True,
+                "template_id": str(template_id),
                 "reason": "spam",
                 "note": "Manual override from admin screen",
             },
         )
+        detail_response = await admin_client.get(f"/api/v1/admin/memes/{meme_id}")
 
-    assert response.status_code == 200
-    payload = response.json()
+    assert override_response.status_code == 200
+    payload = override_response.json()
     assert payload["is_public"] is False
     assert payload["is_nsfw"] is True
+    assert payload["template_id"] == str(template_id)
+
+    assert detail_response.status_code == 200
+    detail_payload = detail_response.json()
+    decision_actions = {decision["action"] for decision in detail_payload["decisions"]}
+    assert decision_actions == {"template_override", "override_flags"}
 
     async with postgres_session_factory() as session:
         persisted_meme = await session.get(Meme, meme_id)
-        persisted_decision = await session.scalar(
-            select(ModerationDecision).where(ModerationDecision.meme_id == meme_id),
-        )
+        persisted_decisions = (
+            await session.execute(
+                select(ModerationDecision)
+                .where(ModerationDecision.meme_id == meme_id)
+                .order_by(ModerationDecision.created_at.asc()),
+            )
+        ).scalars().all()
 
         assert persisted_meme is not None
         assert persisted_meme.is_public is False
         assert persisted_meme.is_nsfw is True
-        assert persisted_decision is not None
-        assert persisted_decision.report_id is None
-        assert persisted_decision.admin_user_id == admin_id
-        assert persisted_decision.action is ModerationAction.OVERRIDE_FLAGS
-        assert persisted_decision.reason is ModerationReason.SPAM
-        assert persisted_decision.previous_is_public is True
-        assert persisted_decision.previous_is_nsfw is False
-        assert persisted_decision.new_is_public is False
-        assert persisted_decision.new_is_nsfw is True
+        assert persisted_meme.template_id == template_id
+        decisions_by_action = {decision.action: decision for decision in persisted_decisions}
+        assert set(decisions_by_action) == {ModerationAction.OVERRIDE_FLAGS, ModerationAction.TEMPLATE_OVERRIDE}
+        flag_decision = decisions_by_action[ModerationAction.OVERRIDE_FLAGS]
+        template_decision = decisions_by_action[ModerationAction.TEMPLATE_OVERRIDE]
+        assert flag_decision.report_id is None
+        assert flag_decision.admin_user_id == admin_id
+        assert flag_decision.reason is ModerationReason.SPAM
+        assert flag_decision.previous_is_public is True
+        assert flag_decision.previous_is_nsfw is False
+        assert flag_decision.new_is_public is False
+        assert flag_decision.new_is_nsfw is True
+        assert flag_decision.previous_template_id is None
+        assert flag_decision.new_template_id == template_id
+        assert template_decision.previous_template_id is None
+        assert template_decision.new_template_id == template_id

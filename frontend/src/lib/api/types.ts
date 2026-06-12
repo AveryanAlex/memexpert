@@ -50,6 +50,7 @@ export type ModerationAction =
   | 'mark_nsfw'
   | 'mark_sfw'
   | 'no_action'
+  | 'template_override'
   | 'override_flags'
   | 'publish';
 
@@ -284,5 +285,13 @@ export interface AdminModerationDecisionRead {
   previous_is_nsfw: boolean;
   new_is_public: boolean;
   new_is_nsfw: boolean;
+  previous_template_id: string | null;
+  new_template_id: string | null;
   created_at: string;
+}
+
+export interface AdminMemeDetailRead {
+  meme: AdminMemeRead;
+  reports: AdminModerationReportRead[];
+  decisions: AdminModerationDecisionRead[];
 }
