@@ -22,7 +22,8 @@ IMAGE_ENV_DEFAULTS: Final = {
     "MEMEXPERT_FRONTEND_IMAGE": "memexpert-frontend:e2e-{run_id}",
     "MEMEXPERT_E2E_RUNNER_IMAGE": "memexpert-frontend-e2e:e2e-{run_id}",
 }
-LONG_LIVED_SERVICES: Final = ("api", "workers", "frontend")
+WAITED_LONG_LIVED_SERVICES: Final = ("api", "frontend")
+NON_HEALTHCHECKED_LONG_LIVED_SERVICES: Final = ("workers",)
 LOG_SERVICES: Final = (
     "postgres",
     "redis",
@@ -73,9 +74,12 @@ def main() -> int:
     try:
         print(f"Starting {project_name}; artifacts: {artifact_dir}", flush=True)
         run_checked(
-            [*compose, "up", "--detach", "--build", "--wait", "--wait-timeout", "420", *LONG_LIVED_SERVICES],
+            [*compose, "up", "--detach", "--build", "--wait", "--wait-timeout", "420", *WAITED_LONG_LIVED_SERVICES],
             env=env,
         )
+        run_checked([*compose, "up", "--detach", "--no-deps", *NON_HEALTHCHECKED_LONG_LIVED_SERVICES], env=env)
+        for service in NON_HEALTHCHECKED_LONG_LIVED_SERVICES:
+            assert_service_running(compose, service=service, env=env)
         run_checked([*compose, "build", "e2e-runner"], env=env)
         run_checked([*compose, "run", "--rm", "--no-deps", "seed"], env=env)
         run_checked([*compose, "run", "--rm", "--no-deps", "e2e-runner"], env=env)
@@ -129,10 +133,39 @@ def run_best_effort(command: list[str], *, env: dict[str, str]) -> None:
     subprocess.run(command, cwd=ROOT, env=env, check=False)
 
 
+def assert_service_running(compose: list[str], *, service: str, env: dict[str, str]) -> None:
+    command = [*compose, "ps", "--status", "running", "--services", service]
+    print(f"$ {' '.join(command)}", flush=True)
+    completed = subprocess.run(command, cwd=ROOT, env=env, check=True, stdout=subprocess.PIPE, text=True)
+    running_services = set(completed.stdout.splitlines())
+    print(f"Observed running Compose services: {', '.join(sorted(running_services)) or '(none)'}", flush=True)
+    if service not in running_services:
+        print(f"Compose service {service!r} is not running.", file=sys.stderr, flush=True)
+        raise subprocess.CalledProcessError(
+            1,
+            command,
+            output=completed.stdout,
+            stderr=f"Compose service {service!r} is not running.",
+        )
+
+
 def remove_defaulted_images(images: list[str], *, env: dict[str, str]) -> None:
-    if not images:
+    existing_images = [image for image in images if image_exists(image, env=env)]
+    if not existing_images:
         return
-    run_best_effort(["docker", "image", "rm", *images], env=env)
+    run_best_effort(["docker", "image", "rm", *existing_images], env=env)
+
+
+def image_exists(image: str, *, env: dict[str, str]) -> bool:
+    completed = subprocess.run(
+        ["docker", "image", "inspect", image],
+        cwd=ROOT,
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return completed.returncode == 0
 
 
 def collect_artifacts(compose: list[str], *, env: dict[str, str], artifact_dir: Path) -> None:
