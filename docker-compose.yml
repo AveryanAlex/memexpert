@@ -1,3 +1,5 @@
+# Local development infrastructure only. The production app stack example lives
+# in docker-compose.prod.example.yml.
 services:
   postgres:
     image: postgres:16

@@ -1,0 +1,253 @@
+x-app-image: &app-image
+  image: ${MEMEXPERT_APP_IMAGE:-memexpert-app:prod}
+  build:
+    context: .
+    dockerfile: Dockerfile
+
+x-app-env: &app-env
+  APP_HOST: 0.0.0.0
+  APP_PORT: 8000
+  DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:?set POSTGRES_USER}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:?set POSTGRES_DB}
+  REDIS_URL: redis://redis:6379/0
+  RABBITMQ_URL: amqp://${RABBITMQ_DEFAULT_USER:?set RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS:?set RABBITMQ_DEFAULT_PASS}@rabbitmq:5672/
+  QDRANT_URL: http://qdrant:6333
+  MEILISEARCH_URL: http://meilisearch:7700
+  MEILISEARCH_MASTER_KEY: ${MEILISEARCH_MASTER_KEY:?set MEILISEARCH_MASTER_KEY}
+  S3_ENDPOINT: http://minio:9000
+  S3_ACCESS_KEY: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY}
+  S3_SECRET_KEY: ${S3_SECRET_KEY:?set S3_SECRET_KEY}
+  S3_BUCKET: ${S3_BUCKET:?set S3_BUCKET}
+  S3_REGION: ${S3_REGION:-us-east-1}
+  IMGPROXY_BASE_URL: http://imgproxy:8080
+  IMGPROXY_KEY: ${IMGPROXY_KEY:?set IMGPROXY_KEY}
+  IMGPROXY_SALT: ${IMGPROXY_SALT:?set IMGPROXY_SALT}
+  MEDIA_PUBLIC_BASE_URL: ${MEDIA_PUBLIC_BASE_URL:-}
+  PIPELINE_OPERATOR_TOKEN: ${PIPELINE_OPERATOR_TOKEN:?set PIPELINE_OPERATOR_TOKEN}
+  PIPELINE_ALLOWED_MIME_TYPES: ${PIPELINE_ALLOWED_MIME_TYPES:-image/jpeg,image/png,image/webp,image/gif,video/mp4,video/quicktime,video/webm}
+  PIPELINE_BROKER_CONNECTION_TIMEOUT_SECONDS: ${PIPELINE_BROKER_CONNECTION_TIMEOUT_SECONDS:-10.0}
+  PIPELINE_STORAGE_CONNECTION_TIMEOUT_SECONDS: ${PIPELINE_STORAGE_CONNECTION_TIMEOUT_SECONDS:-10.0}
+  AUTH_JWT_SECRET: ${AUTH_JWT_SECRET:?set AUTH_JWT_SECRET}
+  SECURITY_CORS_ALLOWED_ORIGINS: ${SECURITY_CORS_ALLOWED_ORIGINS:?set SECURITY_CORS_ALLOWED_ORIGINS}
+  SECURITY_CORS_ALLOWED_ORIGIN_REGEX: ${SECURITY_CORS_ALLOWED_ORIGIN_REGEX:-^https://([a-z0-9-]+\.)?memexpert\.net$}
+  TELEGRAM_SESSION_DIR: /app/.telegram-sessions
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  rabbitmq:
+    image: rabbitmq:4-management
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:?set RABBITMQ_DEFAULT_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:?set RABBITMQ_DEFAULT_PASS}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    restart: unless-stopped
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "bash -lc 'exec 3<>/dev/tcp/127.0.0.1/6333 && printf \"GET /readyz HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n\" >&3 && grep -q \"200 OK\" <&3'",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  meilisearch:
+    image: getmeili/meilisearch:latest
+    restart: unless-stopped
+    environment:
+      MEILI_MASTER_KEY: ${MEILISEARCH_MASTER_KEY:?set MEILISEARCH_MASTER_KEY}
+      MEILI_ENV: production
+      MEILI_NO_ANALYTICS: "true"
+    volumes:
+      - meili_data:/meili_data
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider --quiet http://127.0.0.1:7700/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:?set S3_SECRET_KEY}
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/minio/health/live || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  minio-init:
+    image: minio/mc:latest
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:?set S3_SECRET_KEY}
+      S3_BUCKET: ${S3_BUCKET:?set S3_BUCKET}
+    command:
+      [
+        "/bin/sh",
+        "-c",
+        "mc alias set memexpert http://minio:9000 \"$${MINIO_ROOT_USER}\" \"$${MINIO_ROOT_PASSWORD}\" && mc mb --ignore-existing \"memexpert/$${S3_BUCKET}\"",
+      ]
+
+  imgproxy:
+    image: darthsim/imgproxy:latest
+    restart: unless-stopped
+    environment:
+      IMGPROXY_USE_S3: "true"
+      IMGPROXY_S3_ENDPOINT: http://minio:9000
+      IMGPROXY_S3_REGION: ${S3_REGION:-us-east-1}
+      IMGPROXY_S3_USE_PATH_STYLE: "true"
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:?set S3_SECRET_KEY}
+      IMGPROXY_BIND: ":8080"
+      IMGPROXY_KEY: ${IMGPROXY_KEY:?set IMGPROXY_KEY}
+      IMGPROXY_SALT: ${IMGPROXY_SALT:?set IMGPROXY_SALT}
+    depends_on:
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "imgproxy", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  migrate:
+    <<: *app-image
+    restart: "no"
+    command: ["alembic", "upgrade", "head"]
+    environment: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      meilisearch:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      imgproxy:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+
+  api:
+    <<: *app-image
+    restart: unless-stopped
+    environment: *app-env
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  workers:
+    <<: *app-image
+    restart: unless-stopped
+    command: ["memexpert-workers"]
+    environment: *app-env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+
+  bot:
+    <<: *app-image
+    profiles: ["bot"]
+    restart: unless-stopped
+    command: ["sh", "-c", ": \"$${AUTH_TELEGRAM_BOT_TOKEN:?set AUTH_TELEGRAM_BOT_TOKEN when enabling the bot profile}\" && exec memexpert-bot"]
+    environment:
+      <<: *app-env
+      AUTH_TELEGRAM_BOT_TOKEN: ${AUTH_TELEGRAM_BOT_TOKEN:-}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - telegram_sessions:/app/.telegram-sessions
+    healthcheck:
+      disable: true
+
+  frontend:
+    image: ${MEMEXPERT_FRONTEND_IMAGE:-memexpert-frontend:prod}
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    restart: unless-stopped
+    environment:
+      HOST: 0.0.0.0
+      PORT: 3000
+      ORIGIN: ${FRONTEND_ORIGIN:?set FRONTEND_ORIGIN}
+      API_BASE_URL: http://api:8000
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  redis_data:
+  rabbitmq_data:
+  qdrant_data:
+  meili_data:
+  minio_data:
+  telegram_sessions:
