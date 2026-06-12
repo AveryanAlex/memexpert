@@ -1,5 +1,6 @@
 <script lang="ts">
   import CollectionChip from '$lib/features/collections/CollectionChip.svelte';
+  import { bulkGuestGuidance, collectionListBulkOptions } from '$lib/features/memes/bulk-view-model';
   import MemeGrid from '$lib/features/memes/MemeGrid.svelte';
   import { ActionLink, Badge, Button, Card, EmptyState, Input, Notice, PageHeader, Select } from '$lib/ui';
   import type { ActionData, PageData } from './$types';
@@ -11,6 +12,9 @@
   const previousOffset = $derived(Math.max(data.offset - data.page.limit, 0));
   const nextOffset = $derived(data.offset + data.page.limit);
   const memes = $derived(data.page.items.map((item) => item.meme));
+  const bulkOptions = $derived(collectionListBulkOptions(data.collections));
+  const accountType = $derived(data.session?.user.account_type ?? null);
+  const bulkGuidance = $derived(bulkGuestGuidance(accountType, bulkOptions.some((collection) => collection.kind === 'custom')));
 
   function pageHref(offset: number): string {
     const params = new URLSearchParams();
@@ -90,7 +94,6 @@
       <Select name="visibility" aria-label="Collection visibility">
         <option value="private">Private</option>
         <option value="unlisted">Unlisted</option>
-        <option value="public">Public</option>
       </Select>
       <Button type="submit">Create collection</Button>
     </form>
@@ -111,7 +114,10 @@
 </div>
 
 {#if data.page.items.length > 0}
-  <MemeGrid {memes} />
+  <MemeGrid
+    {memes}
+    bulk={{ enabled: true, accountType, saveEnabled: true, collectionOptions: bulkOptions, guidance: bulkGuidance }}
+  />
 {:else if !data.errorMessage}
   <EmptyState title="No memes found" message="Try a shorter phrase, a different synonym, or clear the search box to browse." />
 {/if}

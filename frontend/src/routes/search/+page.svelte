@@ -1,5 +1,6 @@
 <script lang="ts">
   import { navigating } from '$app/state';
+  import { bulkGuestGuidance, collectionListBulkOptions } from '$lib/features/memes/bulk-view-model';
   import MemeGrid from '$lib/features/memes/MemeGrid.svelte';
   import { ActionLink, Badge, Button, Card, EmptyState, FormRow, Input, LoadingState, Notice, PageHeader, Select } from '$lib/ui';
   import { buildSearchHref, LANGUAGE_OPTIONS, MEDIA_TYPE_OPTIONS, QUICK_SEARCH_TAGS } from '$lib/searchParams';
@@ -12,6 +13,9 @@
   const previousOffset = $derived(Math.max(data.filters.offset - data.page.limit, 0));
   const nextOffset = $derived(data.filters.offset + data.page.limit);
   const memes = $derived(data.page.items.map((item) => item.meme));
+  const bulkOptions = $derived(collectionListBulkOptions(data.collections));
+  const accountType = $derived(data.session?.user.account_type ?? null);
+  const bulkGuidance = $derived(bulkGuestGuidance(accountType, bulkOptions.some((collection) => collection.kind === 'custom')));
   const loadingSearch = $derived(navigating.to?.url.pathname === '/search');
   const activeFilterCount = $derived(
     data.filters.tags.length +
@@ -119,7 +123,11 @@
 </div>
 
 {#if data.page.items.length > 0}
-  <MemeGrid {memes} label="Search results" />
+  <MemeGrid
+    {memes}
+    label="Search results"
+    bulk={{ enabled: true, accountType, saveEnabled: true, collectionOptions: bulkOptions, guidance: bulkGuidance }}
+  />
 {:else if !data.errorMessage}
   <EmptyState title="No memes found" message="Try a shorter phrase, remove a tag, or broaden media and language filters.">
     {#if activeFilterCount > 0 || data.filters.query}

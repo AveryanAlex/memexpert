@@ -1,12 +1,208 @@
 <script lang="ts">
+  import { browser } from '$app/environment';
+  import { invalidateAll } from '$app/navigation';
   import type { PublicMemeCardRead } from '$lib/api/types';
+  import { Button, Select } from '$lib/ui';
+  import { Download } from '@lucide/svelte';
+  import {
+    bulkDownloadItems,
+    bulkToolbarSummary,
+    selectedMemes,
+    type MemeGridBulkOptions
+  } from './bulk-view-model';
   import MemeCard from './MemeCard.svelte';
 
-  let { memes, label = 'Meme results' }: { memes: PublicMemeCardRead[]; label?: string } = $props();
+  let {
+    memes,
+    label = 'Meme results',
+    bulk = { enabled: false }
+  }: { memes: PublicMemeCardRead[]; label?: string; bulk?: MemeGridBulkOptions } = $props();
+
+  let selectedIds = $state<string[]>([]);
+  let targetCollectionId = $state('');
+  let pendingAction = $state<string | null>(null);
+  let statusMessage = $state<string | null>(null);
+
+  const bulkEnabled = $derived(Boolean(bulk.enabled));
+  const selected = $derived(selectedMemes(memes, selectedIds));
+  const downloadable = $derived(bulkDownloadItems(selected));
+  const allSelected = $derived(memes.length > 0 && selectedIds.length === memes.length);
+  const collectionOptions = $derived(bulk.collectionOptions ?? []);
+  const canAddToCollection = $derived(collectionOptions.length > 0);
+  const canRemoveFromCollection = $derived(Boolean(bulk.removeEnabled && bulk.removeCollectionId));
+  const toolbarSummary = $derived(bulkToolbarSummary(memes.length, selected.length, downloadable.length));
+
+  $effect(() => {
+    const availableIds = new Set(memes.map((meme) => meme.id));
+    const nextSelectedIds = selectedIds.filter((id) => availableIds.has(id));
+    if (nextSelectedIds.length !== selectedIds.length) {
+      selectedIds = nextSelectedIds;
+    }
+
+    if (collectionOptions.length > 0 && !collectionOptions.some((collection) => collection.id === targetCollectionId)) {
+      targetCollectionId = collectionOptions[0].id;
+    }
+  });
+
+  function toggleSelection(memeId: string) {
+    statusMessage = null;
+    selectedIds = selectedIds.includes(memeId) ? selectedIds.filter((id) => id !== memeId) : [...selectedIds, memeId];
+  }
+
+  function toggleAll() {
+    statusMessage = null;
+    selectedIds = allSelected ? [] : memes.map((meme) => meme.id);
+  }
+
+  function clearSelection() {
+    selectedIds = [];
+    statusMessage = null;
+  }
+
+  async function saveSelectedToActive() {
+    await runBulkAction('save', 'Saving selected memes...', async () => {
+      await mutateSelected((meme) => `/api/v1/memes/${encodeURIComponent(meme.id)}/save`, 'POST');
+      statusMessage = `${selected.length} selected meme${selected.length === 1 ? '' : 's'} saved to the active collection.`;
+    });
+  }
+
+  async function addSelectedToCollection() {
+    if (!targetCollectionId) return;
+
+    const targetTitle = collectionOptions.find((collection) => collection.id === targetCollectionId)?.title ?? 'collection';
+    await runBulkAction('add', `Adding selected memes to ${targetTitle}...`, async () => {
+      await mutateSelected(
+        (meme) => `/api/v1/collections/${encodeURIComponent(targetCollectionId)}/memes/${encodeURIComponent(meme.id)}`,
+        'POST'
+      );
+      statusMessage = `${selected.length} selected meme${selected.length === 1 ? '' : 's'} added to ${targetTitle}.`;
+    });
+  }
+
+  async function removeSelectedFromCollection() {
+    const collectionId = bulk.removeCollectionId;
+    if (!collectionId) return;
+
+    await runBulkAction('remove', 'Removing selected memes...', async () => {
+      await mutateSelected(
+        (meme) => `/api/v1/collections/${encodeURIComponent(collectionId)}/memes/${encodeURIComponent(meme.id)}`,
+        'DELETE'
+      );
+      statusMessage = `${selected.length} selected meme${selected.length === 1 ? '' : 's'} removed from this collection.`;
+      selectedIds = [];
+    });
+  }
+
+  function downloadSelected() {
+    if (!browser || downloadable.length === 0) {
+      statusMessage = 'No selected memes have a media URL for download.';
+      return;
+    }
+
+    for (const item of downloadable) {
+      const link = document.createElement('a');
+      link.href = item.url;
+      link.download = downloadName(item.title);
+      link.rel = 'noopener noreferrer';
+      document.body.append(link);
+      link.click();
+      link.remove();
+    }
+
+    statusMessage = `Started ${downloadable.length} download${downloadable.length === 1 ? '' : 's'}.`;
+  }
+
+  async function runBulkAction(action: string, pendingText: string, callback: () => Promise<void>) {
+    if (pendingAction || selected.length === 0) return;
+    pendingAction = action;
+    statusMessage = pendingText;
+    try {
+      await callback();
+      await invalidateAll();
+    } catch (error) {
+      statusMessage = error instanceof Error ? error.message : 'Bulk action failed.';
+    } finally {
+      pendingAction = null;
+    }
+  }
+
+  async function mutateSelected(urlForMeme: (meme: PublicMemeCardRead) => string, method: 'DELETE' | 'POST') {
+    for (const meme of selected) {
+      const response = await fetch(urlForMeme(meme), {
+        method,
+        credentials: 'include',
+        headers: { accept: 'application/json', 'x-requested-with': 'XMLHttpRequest' }
+      });
+
+      if (!response.ok) {
+        const payload = await response.json().catch(() => null);
+        const detail = typeof payload?.detail === 'string' ? payload.detail : `HTTP ${response.status}`;
+        throw new Error(`Could not update ${meme.caption || meme.tags[0] || 'selected meme'}: ${detail}`);
+      }
+    }
+  }
+
+  function downloadName(title: string): string {
+    return title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'meme';
+  }
 </script>
+
+{#if bulkEnabled}
+  <div class="mb-4 grid gap-3 rounded-[28px] border border-line bg-paper p-4 shadow-warm" aria-label={`${label} bulk actions`}>
+    <div class="flex flex-wrap items-center justify-between gap-3">
+      <div>
+        <p class="m-0 font-black">Bulk actions</p>
+        <p class="m-0 text-sm text-muted">{toolbarSummary}</p>
+      </div>
+      <div class="flex flex-wrap gap-2">
+        <Button size="compact" variant="secondary" type="button" onclick={toggleAll} disabled={memes.length === 0 || pendingAction !== null}>{allSelected ? 'Clear all' : 'Select all'}</Button>
+        <Button size="compact" variant="ghost" type="button" onclick={clearSelection} disabled={selected.length === 0 || pendingAction !== null}>Clear</Button>
+      </div>
+    </div>
+
+    <div class="flex flex-wrap items-center gap-2">
+      {#if bulk.saveEnabled}
+        <Button size="compact" type="button" onclick={saveSelectedToActive} disabled={selected.length === 0 || pendingAction !== null}>Save selected</Button>
+      {/if}
+
+      {#if canAddToCollection}
+        <Select class="max-w-[260px]" bind:value={targetCollectionId} aria-label="Bulk add collection" disabled={pendingAction !== null}>
+          {#each collectionOptions as collection (collection.id)}
+            <option value={collection.id}>{collection.title}</option>
+          {/each}
+        </Select>
+        <Button size="compact" variant="secondary" type="button" onclick={addSelectedToCollection} disabled={selected.length === 0 || pendingAction !== null || !targetCollectionId}>Add to collection</Button>
+      {/if}
+
+      {#if canRemoveFromCollection}
+        <Button size="compact" variant="danger" type="button" onclick={removeSelectedFromCollection} disabled={selected.length === 0 || pendingAction !== null}>Remove selected</Button>
+      {/if}
+
+      <Button size="compact" variant="secondary" type="button" onclick={downloadSelected} disabled={downloadable.length === 0 || pendingAction !== null}>
+        <Download class="size-4" aria-hidden="true" />
+        Download selected
+      </Button>
+    </div>
+
+    {#if bulk.guidance}
+      <p class="m-0 text-sm text-muted">{bulk.guidance}</p>
+    {/if}
+    {#if statusMessage}
+      <p class="m-0 text-sm text-muted" role="status">{statusMessage}</p>
+    {/if}
+  </div>
+{/if}
 
 <section class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4" aria-label={label}>
   {#each memes as meme (meme.id)}
-    <MemeCard {meme} />
+    <div class="relative">
+      {#if bulkEnabled}
+        <label class="absolute left-3 top-3 z-20 inline-flex items-center gap-2 rounded-full border border-line bg-paper/95 px-3 py-2 text-sm font-extrabold shadow-warm">
+          <input type="checkbox" checked={selectedIds.includes(meme.id)} onchange={() => toggleSelection(meme.id)} aria-label={`Select ${meme.caption || meme.tags[0] || 'meme'}`} />
+          Select
+        </label>
+      {/if}
+      <MemeCard {meme} />
+    </div>
   {/each}
 </section>
