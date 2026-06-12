@@ -193,11 +193,12 @@ class PipelineQdrantClient(_LazyQdrantClient):
         resolved_limit = limit or self._settings.pipeline_qdrant_search_top_k
 
         try:
-            raw_matches = await client.search(
+            raw_matches = await client.query_points(
                 collection_name=self._settings.pipeline_qdrant_collection_name,
-                query_vector=list(vector),
+                query=list(vector),
                 limit=resolved_limit,
                 with_payload=True,
+                with_vectors=False,
             )
         except (TimeoutError, httpx.TimeoutException) as exc:  # pragma: no cover - exercised via monkeypatch
             raise QdrantTimeoutError(f"Qdrant similarity lookup timed out: {exc}") from exc
@@ -227,11 +228,12 @@ class PipelineQdrantUserSearchClient(_LazyQdrantClient):
         resolved_limit = max(1, limit)
 
         try:
-            raw_matches = await client.search(
+            raw_matches = await client.query_points(
                 collection_name=self._settings.pipeline_qdrant_collection_name,
-                query_vector=list(query_vector),
+                query=list(query_vector),
                 limit=resolved_limit,
                 with_payload=True,
+                with_vectors=False,
             )
         except (TimeoutError, httpx.TimeoutException) as exc:  # pragma: no cover - exercised via monkeypatch
             raise QdrantTimeoutError(f"Qdrant user search timed out: {exc}") from exc
@@ -457,13 +459,14 @@ def _parse_qdrant_matches(
     # malformed-response failure. Per-row noise (missing ids, wrong score types)
     # keeps the existing silent-drop behavior so the pipeline can still ingest
     # partially-valid similarity payloads.
-    if raw_matches is None or not isinstance(raw_matches, (list, tuple)):
+    points = _extract_qdrant_points(raw_matches)
+    if points is None:
         raise QdrantMalformedResponseError(
             "Qdrant similarity response is not an iterable sequence of matches.",
         )
 
     resolved_matches: list[QdrantSimilarityMatch] = []
-    typed_matches: Iterable[object] = cast("Sequence[object]", raw_matches)
+    typed_matches: Iterable[object] = points
     for raw_entry in typed_matches:
         payload = _extract_payload(raw_entry)
         if payload is None:
@@ -506,13 +509,14 @@ def _parse_qdrant_matches(
 def _parse_qdrant_user_search_matches(raw_matches: object) -> tuple[QdrantUserSearchMatch, ...]:
     """Decode Qdrant search results for user-facing semantic search."""
 
-    if raw_matches is None or not isinstance(raw_matches, (list, tuple)):
+    points = _extract_qdrant_points(raw_matches)
+    if points is None:
         raise QdrantMalformedResponseError(
             "Qdrant user search response is not an iterable sequence of matches.",
         )
 
     resolved_matches: list[QdrantUserSearchMatch] = []
-    typed_matches: Iterable[object] = cast("Sequence[object]", raw_matches)
+    typed_matches: Iterable[object] = points
     for raw_entry in typed_matches:
         payload = _extract_payload(raw_entry)
         if payload is None:
@@ -551,6 +555,15 @@ def _extract_payload(raw_entry: object) -> dict[str, object] | None:
     if not isinstance(payload, dict):
         return None
     return cast("dict[str, object]", payload)
+
+
+def _extract_qdrant_points(raw_matches: object) -> Sequence[object] | None:
+    if isinstance(raw_matches, (list, tuple)):
+        return cast("Sequence[object]", raw_matches)
+    raw_points = getattr(raw_matches, "points", None)
+    if isinstance(raw_points, (list, tuple)):
+        return cast("Sequence[object]", raw_points)
+    return None
 
 
 __all__ = [

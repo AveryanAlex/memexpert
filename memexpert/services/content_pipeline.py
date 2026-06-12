@@ -17,7 +17,7 @@ from sqlalchemy.orm import selectinload
 from memexpert.core.broker import ensure_pipeline_broker_started, get_pipeline_broker_settings
 from memexpert.core.config import Settings, get_settings
 from memexpert.core.media import NormalizedMediaResult, PipelineMediaProcessor, PipelineMediaProcessorProtocol
-from memexpert.core.ocr import OCRExtractionResult, OCRProcessorProtocol, PipelineOCRProcessor
+from memexpert.core.ocr import OCRExtractionResult, OCRProcessorProtocol, build_pipeline_ocr_processor
 from memexpert.core.perceptual_hashes import (
     DEFAULT_PERCEPTUAL_HASH_ALGORITHM,
     hamming_distance_hex,
@@ -210,7 +210,7 @@ class ContentPipelineService:
         self._storage_client = storage_client or cast("ObjectStorageClient", get_s3_client())
         self._publisher = publisher or self._publish_dispatch_event
         self._media_processor = media_processor or PipelineMediaProcessor(settings=self._settings)
-        self._ocr_processor = ocr_processor or PipelineOCRProcessor(
+        self._ocr_processor = ocr_processor or build_pipeline_ocr_processor(
             settings=self._settings,
             media_processor=self._media_processor,
         )

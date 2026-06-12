@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from memexpert.core.database import get_async_session_factory, get_db_session
 from memexpert.core.meilisearch import PipelineMeilisearchSyncClient
 from memexpert.core.qdrant import PipelineQdrantUserSearchClient
-from memexpert.core.voyage import PipelineVoyageClient
+from memexpert.core.voyage import build_pipeline_voyage_client
 from memexpert.services.analytics import AnalyticsService
 from memexpert.services.meme_search import MemeSearchService
 from memexpert.services.public_trends import PublicTrendsService
@@ -33,7 +33,7 @@ def get_meme_search_service(session: Annotated[AsyncSession, Depends(get_db_sess
         semantic_client=PipelineQdrantUserSearchClient(),
         query_embedding_client=CachedTextQueryEmbeddingService(
             session,
-            provider=PipelineVoyageClient(),
+            provider=build_pipeline_voyage_client(),
             cache_session_factory=get_async_session_factory(),
         ),
     )

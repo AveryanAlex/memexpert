@@ -5,10 +5,13 @@ from __future__ import annotations
 import array
 import base64
 import hashlib
+import io
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Protocol
 
 import httpx
+from PIL import Image, UnidentifiedImageError
 
 from memexpert.core.config import Settings, get_settings
 
@@ -60,6 +63,15 @@ class VoyageClientProtocol(Protocol):
     """Typed Voyage adapter surface used by worker runtime and tests."""
 
     async def embed_image(self, *, image_bytes: bytes, mime_type: str) -> VoyageEmbeddingResult: ...
+
+    async def embed_text(self, *, text: str) -> VoyageEmbeddingResult: ...
+
+
+class _FakeMarker(StrEnum):
+    CAT = "cat"
+    DOG = "dog"
+    FROG = "frog"
+    UNKNOWN = "unknown"
 
 
 def build_voyage_input_hash(image_bytes: bytes) -> str:
@@ -193,6 +205,49 @@ class PipelineVoyageClient:
         }
 
 
+class FakeVoyageClient:
+    """Deterministic embedding provider for local E2E runs without Voyage credentials."""
+
+    def __init__(self, *, settings: Settings | None = None) -> None:
+        self._settings = settings or get_settings()
+
+    async def embed_image(self, *, image_bytes: bytes, mime_type: str) -> VoyageEmbeddingResult:
+        _ = mime_type
+        marker = _detect_fake_image_marker(image_bytes)
+        return VoyageEmbeddingResult(
+            model=self._settings.pipeline_voyage_model,
+            dimensions=self._settings.pipeline_voyage_output_dimensions,
+            vector=_fake_vector_for_marker(
+                marker,
+                dimensions=self._settings.pipeline_voyage_output_dimensions,
+                stable_input=image_bytes,
+            ),
+            input_hash=build_voyage_input_hash(image_bytes),
+        )
+
+    async def embed_text(self, *, text: str) -> VoyageEmbeddingResult:
+        marker = _detect_fake_text_marker(text)
+        return VoyageEmbeddingResult(
+            model=self._settings.pipeline_voyage_model,
+            dimensions=self._settings.pipeline_voyage_output_dimensions,
+            vector=_fake_vector_for_marker(
+                marker,
+                dimensions=self._settings.pipeline_voyage_output_dimensions,
+                stable_input=text.encode("utf-8"),
+            ),
+            input_hash=build_voyage_text_input_hash(text),
+        )
+
+
+def build_pipeline_voyage_client(*, settings: Settings | None = None) -> VoyageClientProtocol:
+    """Return the configured Voyage-compatible embedding provider."""
+
+    resolved_settings = settings or get_settings()
+    if resolved_settings.pipeline_voyage_provider_mode == "fake":
+        return FakeVoyageClient(settings=resolved_settings)
+    return PipelineVoyageClient(settings=resolved_settings)
+
+
 def decode_embedding_bytes(embedding_bytes: bytes, *, dimensions: int) -> tuple[float, ...]:
     """Decode ``EmbeddingCache.embedding`` bytes into a typed vector for Qdrant lookups."""
 
@@ -214,6 +269,67 @@ def build_voyage_text_input_hash(text: str) -> str:
     """Return the deterministic SHA-256 key used for cached text query embeddings."""
 
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _detect_fake_text_marker(text: str) -> _FakeMarker:
+    normalized_text = text.casefold()
+    if "cat" in normalized_text:
+        return _FakeMarker.CAT
+    if "dog" in normalized_text:
+        return _FakeMarker.DOG
+    if "frog" in normalized_text or "other" in normalized_text:
+        return _FakeMarker.FROG
+    return _FakeMarker.UNKNOWN
+
+
+def _detect_fake_image_marker(image_bytes: bytes) -> _FakeMarker:
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            rgb_image = image.convert("RGB").resize((1, 1))
+            pixel = rgb_image.getpixel((0, 0))
+    except (UnidentifiedImageError, OSError, ValueError):
+        return _FakeMarker.UNKNOWN
+
+    if not isinstance(pixel, tuple) or len(pixel) < 3:
+        return _FakeMarker.UNKNOWN
+    red, green, blue = int(pixel[0]), int(pixel[1]), int(pixel[2])
+
+    if red > green and red > blue:
+        return _FakeMarker.CAT
+    if blue > red and blue > green:
+        return _FakeMarker.DOG
+    if green > red and green > blue:
+        return _FakeMarker.FROG
+    return _FakeMarker.UNKNOWN
+
+
+def _fake_vector_for_marker(
+    marker: _FakeMarker,
+    *,
+    dimensions: int,
+    stable_input: bytes,
+) -> tuple[float, ...]:
+    vector = [0.0] * dimensions
+    bucket = _fake_bucket_for_marker(marker, dimensions=dimensions, stable_input=stable_input)
+    vector[bucket] = 1.0
+    return tuple(vector)
+
+
+def _fake_bucket_for_marker(
+    marker: _FakeMarker,
+    *,
+    dimensions: int,
+    stable_input: bytes,
+) -> int:
+    if marker is _FakeMarker.CAT:
+        return 0
+    if marker is _FakeMarker.DOG:
+        return min(1, dimensions - 1)
+    if marker is _FakeMarker.FROG:
+        return min(2, dimensions - 1)
+
+    digest = hashlib.sha256(stable_input).digest()
+    return int.from_bytes(digest[:8], byteorder="big") % dimensions
 
 
 def _extract_voyage_vector(payload: object) -> tuple[float, ...]:
@@ -241,6 +357,7 @@ def _extract_voyage_vector(payload: object) -> tuple[float, ...]:
 
 
 __all__ = [
+    "FakeVoyageClient",
     "PipelineVoyageClient",
     "VoyageClientProtocol",
     "VoyageEmbeddingError",
@@ -248,6 +365,7 @@ __all__ = [
     "VoyageMalformedResponseError",
     "VoyageProviderUnavailableError",
     "VoyageTimeoutError",
+    "build_pipeline_voyage_client",
     "build_voyage_input_hash",
     "build_voyage_text_input_hash",
     "decode_embedding_bytes",

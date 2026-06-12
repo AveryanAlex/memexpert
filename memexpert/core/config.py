@@ -102,8 +102,11 @@ class Settings(BaseSettings):
     pipeline_ocr_primary_engine: str = "paddleocr"
     pipeline_ocr_fallback_engine: str = "qwen2.5-vl-2b"
     pipeline_ocr_fallback_command: str | None = None
+    pipeline_ocr_provider_mode: Literal["live", "fake"] = "live"
+    pipeline_fake_ocr_text: str = "cat e2e smoke fake ocr text"
     pipeline_ocr_timeout_seconds: float = Field(default=30.0, gt=0.0, le=600.0)
     pipeline_ocr_low_confidence_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
+    pipeline_voyage_provider_mode: Literal["live", "fake"] = "live"
     pipeline_voyage_model: str = "voyage-multimodal-3.5"
     pipeline_voyage_output_dimensions: int = Field(default=1024, ge=1)
     pipeline_voyage_api_url: str = "https://api.voyageai.com/v1/multimodalembeddings"
@@ -117,7 +120,9 @@ class Settings(BaseSettings):
     pipeline_merge_similarity_threshold: float = Field(default=0.92, ge=0.0, le=1.0)
     pipeline_classification_api_url: str | None = None
     pipeline_classification_api_key: SecretStr | None = None
+    pipeline_classification_provider_mode: Literal["live", "fake"] = "live"
     pipeline_classification_model: str = "memexpert-nsfw-v1"
+    pipeline_fake_classification_nsfw_score: float = Field(default=0.0, ge=0.0, le=1.0)
     pipeline_classification_timeout_seconds: float = Field(default=15.0, gt=0.0, le=600.0)
     pipeline_classification_nsfw_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
     pipeline_worker_fail_transcode_for_meme_file_id: str | None = None

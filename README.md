@@ -191,9 +191,25 @@ docker compose --env-file .env.prod -f docker-compose.prod.example.yml ps
 docker compose --env-file .env.prod -f docker-compose.prod.example.yml logs -f api workers frontend
 ```
 
+## Containerized E2E Smoke
+
+Run the deterministic real-stack smoke suite with one command:
+
+```sh
+python scripts/run_container_e2e_smoke.py
+```
+
+The runner creates a sanitized run id, sets per-run default app/frontend/Playwright image tags, starts `docker-compose.e2e.yml` with `docker compose -p memexpert-e2e-<run-id>`, builds the app/frontend/Playwright images, runs `seed`, runs the in-network Playwright/API checks, collects Compose status/logs, and tears the stack down with volumes unless `E2E_KEEP_STACK=1` is set.
+
+The suite is parallel-safe by default: it uses no fixed host ports, no `container_name`, project-scoped named volumes, an absolute per-run artifact bind mount at `.artifacts/e2e/<run-id>/`, and run-scoped default app/frontend/e2e-runner image tags. Set `E2E_RUN_ID=<id>` to choose a deterministic run id, or set `MEMEXPERT_APP_IMAGE`, `MEMEXPERT_FRONTEND_IMAGE`, or `MEMEXPERT_E2E_RUNNER_IMAGE` to opt into explicit image tags.
+
+Default E2E provider policy is local and secret-free: OCR, Voyage embeddings, and classification run in fake mode, Voyage dimensions are reduced to `4`, auth cookies are non-secure for the Compose network, and security rate limiting is disabled for smoke stability. CI does not call live Voyage, Telegram, Google, or other provider APIs.
+
+The default CI E2E path uses the operator upload pipeline plus fake providers. Full fake Telegram ingest is not wired in this slice.
+
 ## CI
 
-`.github/workflows/ci.yml` runs backend lint/type/test checks, frontend checks/tests/builds, frontend smoke tests, and local infrastructure compose smoke checks.
+`.github/workflows/ci.yml` runs backend lint/type/test checks, frontend checks/tests/builds, frontend mock smoke tests, local infrastructure compose smoke checks, and the deterministic container E2E smoke job. On container E2E failure, CI uploads `.artifacts/e2e/**`.
 
 `.github/workflows/docker-images.yml` validates the production compose example, builds the Python and frontend images with BuildKit/GitHub Actions cache, loads local CI tags, and performs lightweight API/frontend HTTP smoke checks without publishing images or requiring secrets.
 

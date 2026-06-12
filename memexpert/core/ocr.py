@@ -223,6 +223,46 @@ class PipelineOCRProcessor:
         return _parse_fallback_payload(payload)
 
 
+class FakeOCRProcessor:
+    """Deterministic OCR provider used by containerized local E2E runs."""
+
+    def __init__(self, *, settings: Settings | None = None) -> None:
+        self._settings = settings or get_settings()
+
+    async def extract_text(
+        self,
+        *,
+        filename: str,
+        mime_type: str,
+        media_bytes: bytes,
+        source_object_key: str,
+    ) -> OCRExtractionResult:
+        _ = (filename, mime_type, media_bytes)
+        return OCRExtractionResult(
+            engine="fake",
+            fallback_engine=None,
+            fallback_used=False,
+            low_confidence=False,
+            confidence=1.0,
+            language=ContentLanguage.EN,
+            extracted_text=self._settings.pipeline_fake_ocr_text,
+            source_object_key=source_object_key,
+        )
+
+
+def build_pipeline_ocr_processor(
+    *,
+    settings: Settings | None = None,
+    media_processor: PipelineMediaProcessorProtocol | None = None,
+) -> OCRProcessorProtocol:
+    """Return the configured OCR provider without changing live defaults."""
+
+    resolved_settings = settings or get_settings()
+    if resolved_settings.pipeline_ocr_provider_mode == "fake":
+        return FakeOCRProcessor(settings=resolved_settings)
+    return PipelineOCRProcessor(settings=resolved_settings, media_processor=media_processor)
+
+
 def _parse_paddle_result(payload: object) -> _OCRCandidate:
     if not isinstance(payload, list) or not payload:
         raise OCRMalformedOutputError("PaddleOCR returned an empty result set.")
@@ -395,6 +435,7 @@ def _detect_language(text: str | None) -> ContentLanguage:
 
 
 __all__ = [
+    "FakeOCRProcessor",
     "OCRExtractionResult",
     "OCRMalformedOutputError",
     "OCRProcessingError",
@@ -402,4 +443,5 @@ __all__ = [
     "OCRProviderUnavailableError",
     "OCRTimeoutError",
     "PipelineOCRProcessor",
+    "build_pipeline_ocr_processor",
 ]

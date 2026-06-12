@@ -148,7 +148,7 @@ class PipelineMeilisearchSyncClient:
 
         index = await self._ensure_index_client()
         try:
-            raw_document = await index.get_document(str(meme_file_id))
+            raw_document = await index.get_document(_document_id_for_meme_file(meme_file_id))
         except Exception as exc:
             status_code = _extract_sdk_status_code(exc)
             if status_code == 404:
@@ -163,7 +163,7 @@ class PipelineMeilisearchSyncClient:
 
         index = await self._ensure_index_client()
         try:
-            _ = await index.delete_document(str(meme_file_id))
+            _ = await index.delete_document(_document_id_for_meme_file(meme_file_id))
         except Exception as exc:
             _raise_sync_error_from(exc, operation="delete_document")
 
@@ -324,6 +324,10 @@ def _build_document_payload(document: PipelineMeilisearchDocument) -> dict[str, 
     if document.quality_score is not None:
         payload["quality_score"] = float(document.quality_score)
     return payload
+
+
+def _document_id_for_meme_file(meme_file_id: uuid.UUID) -> str:
+    return meme_file_id.hex
 
 
 def _build_sync_preview(
