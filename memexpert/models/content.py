@@ -19,6 +19,9 @@ from memexpert.models.enums import (
     ContentPipelineStageStatus,
     ContentProcessingStatus,
     EmbeddingInputType,
+    ModerationAction,
+    ModerationReason,
+    ModerationReportStatus,
     SourcePlatform,
     SyncTargetKind,
     SyncTargetStatus,
@@ -109,6 +112,114 @@ class Meme(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         "PinnedMeme",
         back_populates="meme",
         cascade="all, delete-orphan",
+    )
+    moderation_reports: Mapped[list["ModerationReport"]] = relationship(
+        "ModerationReport",
+        back_populates="meme",
+        cascade="all, delete-orphan",
+    )
+    moderation_decisions: Mapped[list["ModerationDecision"]] = relationship(
+        "ModerationDecision",
+        back_populates="meme",
+        cascade="all, delete-orphan",
+    )
+
+
+class ModerationReport(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """Durable user/admin report that feeds the admin moderation queue."""
+
+    __tablename__ = "moderation_reports"
+    __table_args__ = (
+        Index("ix_moderation_reports_status_created_at", "status", "created_at"),
+        Index("ix_moderation_reports_meme_id_status", "meme_id", "status"),
+        Index("ix_moderation_reports_reporter_user_id_created_at", "reporter_user_id", "created_at"),
+    )
+
+    meme_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("memes.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    reporter_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    status: Mapped[ModerationReportStatus] = mapped_column(
+        string_enum(ModerationReportStatus),
+        default=ModerationReportStatus.PENDING,
+        nullable=False,
+    )
+    reason: Mapped[ModerationReason] = mapped_column(
+        string_enum(ModerationReason),
+        default=ModerationReason.OTHER,
+        nullable=False,
+    )
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    resolved_by_admin_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(nullable=True)
+
+    meme: Mapped["Meme"] = relationship("Meme", back_populates="moderation_reports")
+    reporter_user: Mapped["User | None"] = relationship(
+        "User",
+        foreign_keys=[reporter_user_id],
+        back_populates="moderation_reports_submitted",
+    )
+    resolved_by_admin_user: Mapped["User | None"] = relationship(
+        "User",
+        foreign_keys=[resolved_by_admin_user_id],
+        back_populates="moderation_reports_resolved",
+    )
+    decisions: Mapped[list["ModerationDecision"]] = relationship(
+        "ModerationDecision",
+        back_populates="report",
+    )
+
+
+class ModerationDecision(UUIDPrimaryKeyMixin, Base):
+    """Immutable admin audit entry for report resolutions and direct overrides."""
+
+    __tablename__ = "moderation_decisions"
+    __table_args__ = (
+        Index("ix_moderation_decisions_meme_id_created_at", "meme_id", "created_at"),
+        Index("ix_moderation_decisions_report_id_created_at", "report_id", "created_at"),
+        Index("ix_moderation_decisions_admin_user_id_created_at", "admin_user_id", "created_at"),
+    )
+
+    meme_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("memes.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    report_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("moderation_reports.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    admin_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    action: Mapped[ModerationAction] = mapped_column(
+        string_enum(ModerationAction),
+        nullable=False,
+    )
+    reason: Mapped[ModerationReason | None] = mapped_column(
+        string_enum(ModerationReason),
+        nullable=True,
+    )
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    previous_is_public: Mapped[bool] = mapped_column(nullable=False)
+    previous_is_nsfw: Mapped[bool] = mapped_column(nullable=False)
+    new_is_public: Mapped[bool] = mapped_column(nullable=False)
+    new_is_nsfw: Mapped[bool] = mapped_column(nullable=False)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow, nullable=False)
+
+    meme: Mapped["Meme"] = relationship("Meme", back_populates="moderation_decisions")
+    report: Mapped["ModerationReport | None"] = relationship("ModerationReport", back_populates="decisions")
+    admin_user: Mapped["User | None"] = relationship(
+        "User",
+        foreign_keys=[admin_user_id],
+        back_populates="moderation_decisions",
     )
 
 

@@ -6,9 +6,17 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, field_validator, model_validator
 
-from memexpert.models.enums import ChannelSuggestionStatus, ContentKind, ContentLanguage, SourcePlatform
+from memexpert.models.enums import (
+    ChannelSuggestionStatus,
+    ContentKind,
+    ContentLanguage,
+    ModerationAction,
+    ModerationReason,
+    ModerationReportStatus,
+    SourcePlatform,
+)
 from memexpert.schemas.base import ORMSchema
 from memexpert.schemas.user import ChannelSuggestionRead, UserRead
 
@@ -143,12 +151,7 @@ class AdminMemeTemplateUpdateRequest(BaseModel):
 
 
 class AdminMemeRead(ORMSchema):
-    """Minimal admin meme moderation row.
-
-    Current schema has no moderation queue/audit table, so moderation in this
-    first slice is a direct override of durable ``memes.is_public`` and
-    ``memes.is_nsfw`` fields.
-    """
+    """Minimal admin meme moderation row."""
 
     model_config = ConfigDict(extra="forbid", from_attributes=True)
 
@@ -167,12 +170,84 @@ class AdminMemeRead(ORMSchema):
 
 
 class AdminMemeModerationUpdateRequest(BaseModel):
-    """Direct moderation override for current meme fields."""
+    """Audited direct moderation override for current meme fields."""
 
     model_config = ConfigDict(extra="forbid")
 
     is_nsfw: StrictBool | None = None
     is_public: StrictBool | None = None
+    reason: ModerationReason | None = None
+    note: str | None = Field(default=None, max_length=MAX_ADMIN_NOTE_LENGTH)
+
+    @field_validator("note")
+    @classmethod
+    def _normalize_note(cls, value: str | None) -> str | None:
+        return _normalize_optional_text(value)
+
+    @model_validator(mode="after")
+    def _require_flag_change(self) -> AdminMemeModerationUpdateRequest:
+        if self.is_nsfw is None and self.is_public is None:
+            raise ValueError("At least one moderation flag must be supplied.")
+        return self
+
+
+class AdminModerationDecisionRead(ORMSchema):
+    """Admin-visible immutable moderation audit record."""
+
+    model_config = ConfigDict(extra="forbid", from_attributes=True)
+
+    id: uuid.UUID
+    meme_id: uuid.UUID
+    report_id: uuid.UUID | None
+    admin_user_id: uuid.UUID | None
+    action: ModerationAction
+    reason: ModerationReason | None
+    note: str | None
+    previous_is_public: bool
+    previous_is_nsfw: bool
+    new_is_public: bool
+    new_is_nsfw: bool
+    created_at: datetime
+
+
+class AdminModerationReportRead(ORMSchema):
+    """Admin queue projection for open and historical reports."""
+
+    model_config = ConfigDict(extra="forbid", from_attributes=True)
+
+    id: uuid.UUID
+    meme_id: uuid.UUID
+    reporter_user_id: uuid.UUID | None
+    status: ModerationReportStatus
+    reason: ModerationReason
+    note: str | None
+    resolved_by_admin_user_id: uuid.UUID | None
+    resolved_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+    meme: AdminMemeRead
+
+
+class AdminModerationReportResolveRequest(BaseModel):
+    """Resolve a report and create the corresponding decision audit record."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    action: ModerationAction
+    reason: ModerationReason | None = None
+    note: str | None = Field(default=None, max_length=MAX_ADMIN_NOTE_LENGTH)
+
+    @field_validator("note")
+    @classmethod
+    def _normalize_note(cls, value: str | None) -> str | None:
+        return _normalize_optional_text(value)
+
+
+def _normalize_optional_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    return normalized or None
 
 
 __all__ = [
@@ -181,6 +256,9 @@ __all__ = [
     "AdminMemeRead",
     "AdminMemeTemplateRead",
     "AdminMemeTemplateUpdateRequest",
+    "AdminModerationDecisionRead",
+    "AdminModerationReportRead",
+    "AdminModerationReportResolveRequest",
     "AdminSessionRead",
     "AdminSourceChannelCreateRequest",
     "AdminSourceChannelRead",

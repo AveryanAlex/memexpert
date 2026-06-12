@@ -1,6 +1,8 @@
 import type {
   AdminMemeRead,
   AdminMemeTemplateRead,
+  AdminModerationDecisionRead,
+  AdminModerationReportRead,
   AdminSessionRead,
   AdminSourceChannelRead,
   ChannelSuggestionRead,
@@ -184,15 +186,19 @@ export async function fetchAdminDashboard(request: CatalogRequest): Promise<{
   sourceChannels: AdminSourceChannelRead[];
   templates: AdminMemeTemplateRead[];
   memes: AdminMemeRead[];
+  reports: AdminModerationReportRead[];
+  decisions: AdminModerationDecisionRead[];
 }> {
-  const [suggestions, sourceChannels, templates, memes] = await Promise.all([
+  const [suggestions, sourceChannels, templates, memes, reports, decisions] = await Promise.all([
     apiGet<ChannelSuggestionRead[]>('/api/v1/admin/channel-suggestions', new URLSearchParams(), request),
     apiGet<AdminSourceChannelRead[]>('/api/v1/admin/source-channels', new URLSearchParams(), request),
     apiGet<AdminMemeTemplateRead[]>('/api/v1/admin/meme-templates', new URLSearchParams(), request),
-    apiGet<AdminMemeRead[]>('/api/v1/admin/memes', new URLSearchParams({ limit: '20' }), request)
+    apiGet<AdminMemeRead[]>('/api/v1/admin/memes', new URLSearchParams({ limit: '20' }), request),
+    apiGet<AdminModerationReportRead[]>('/api/v1/admin/moderation-reports', new URLSearchParams({ limit: '20' }), request),
+    apiGet<AdminModerationDecisionRead[]>('/api/v1/admin/moderation-decisions', new URLSearchParams({ limit: '20' }), request)
   ]);
 
-  return { suggestions, sourceChannels, templates, memes };
+  return { suggestions, sourceChannels, templates, memes, reports, decisions };
 }
 
 export async function reviewChannelSuggestion(
@@ -238,6 +244,17 @@ export async function updateMemeModeration(request: AdminMutationRequest, memeId
   return apiWrite<AdminMemeRead>(
     `/api/v1/admin/memes/${encodeURIComponent(memeId)}/moderation`,
     'PATCH',
+    request
+  );
+}
+
+export async function resolveModerationReport(
+  request: AdminMutationRequest,
+  reportId: string
+): Promise<AdminModerationReportRead> {
+  return apiWrite<AdminModerationReportRead>(
+    `/api/v1/admin/moderation-reports/${encodeURIComponent(reportId)}/resolve`,
+    'POST',
     request
   );
 }

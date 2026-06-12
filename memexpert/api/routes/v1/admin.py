@@ -9,13 +9,16 @@ from typing import Annotated
 from fastapi import APIRouter, Body, Depends, HTTPException, Path, Query, status
 
 from memexpert.api.dependencies import AdminUserDep, DbSessionDep
-from memexpert.models.enums import ChannelSuggestionStatus
+from memexpert.models.enums import ChannelSuggestionStatus, ModerationReportStatus
 from memexpert.schemas.admin import (
     AdminChannelSuggestionReviewRequest,
     AdminMemeModerationUpdateRequest,
     AdminMemeRead,
     AdminMemeTemplateRead,
     AdminMemeTemplateUpdateRequest,
+    AdminModerationDecisionRead,
+    AdminModerationReportRead,
+    AdminModerationReportResolveRequest,
     AdminSessionRead,
     AdminSourceChannelCreateRequest,
     AdminSourceChannelRead,
@@ -196,7 +199,7 @@ async def list_moderation_memes(
 
 @router.patch("/memes/{meme_id}/moderation", response_model=AdminMemeRead, summary="Override meme moderation flags")
 async def update_meme_moderation(
-    _admin: AdminUserDep,
+    admin_user: AdminUserDep,
     admin_service: AdminServiceDep,
     meme_id: Annotated[uuid.UUID, Path()],
     request: Annotated[AdminMemeModerationUpdateRequest, Body()],
@@ -204,11 +207,72 @@ async def update_meme_moderation(
     try:
         return await admin_service.update_meme_moderation(
             meme_id,
-            is_nsfw=request.is_nsfw,
-            is_public=request.is_public,
+            admin_user_id=admin_user.id,
+            request=request,
         )
     except (AdminNotFoundError, AdminConflictError) as exc:
         raise _map_admin_error(exc) from exc
+
+
+@router.get(
+    "/moderation-reports",
+    response_model=list[AdminModerationReportRead],
+    summary="List open moderation reports",
+)
+async def list_moderation_reports(
+    _admin: AdminUserDep,
+    admin_service: AdminServiceDep,
+    report_status: Annotated[ModerationReportStatus | None, Query(alias="status")] = None,
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> list[AdminModerationReportRead]:
+    return await admin_service.list_moderation_reports(
+        report_status=report_status,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.post(
+    "/moderation-reports/{report_id}/resolve",
+    response_model=AdminModerationReportRead,
+    summary="Resolve a moderation report",
+)
+async def resolve_moderation_report(
+    admin_user: AdminUserDep,
+    admin_service: AdminServiceDep,
+    report_id: Annotated[uuid.UUID, Path()],
+    request: Annotated[AdminModerationReportResolveRequest, Body()],
+) -> AdminModerationReportRead:
+    try:
+        return await admin_service.resolve_moderation_report(
+            report_id,
+            admin_user_id=admin_user.id,
+            request=request,
+        )
+    except (AdminNotFoundError, AdminConflictError) as exc:
+        raise _map_admin_error(exc) from exc
+
+
+@router.get(
+    "/moderation-decisions",
+    response_model=list[AdminModerationDecisionRead],
+    summary="List moderation decision history",
+)
+async def list_moderation_decisions(
+    _admin: AdminUserDep,
+    admin_service: AdminServiceDep,
+    meme_id: Annotated[uuid.UUID | None, Query()] = None,
+    report_id: Annotated[uuid.UUID | None, Query()] = None,
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> list[AdminModerationDecisionRead]:
+    return await admin_service.list_moderation_decisions(
+        meme_id=meme_id,
+        report_id=report_id,
+        limit=limit,
+        offset=offset,
+    )
 
 
 __all__ = ["AdminServiceDep", "get_admin_service", "router"]

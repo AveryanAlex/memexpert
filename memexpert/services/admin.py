@@ -7,14 +7,20 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import selectinload
 
 from memexpert.models.base import utcnow
-from memexpert.models.content import Meme, MemeTemplate, SourceChannel
+from memexpert.models.content import Meme, MemeTemplate, ModerationDecision, ModerationReport, SourceChannel
+from memexpert.models.enums import ModerationAction, ModerationReportStatus
 from memexpert.models.user import ChannelSuggestion
 from memexpert.schemas.admin import (
+    AdminMemeModerationUpdateRequest,
     AdminMemeRead,
     AdminMemeTemplateRead,
     AdminMemeTemplateUpdateRequest,
+    AdminModerationDecisionRead,
+    AdminModerationReportRead,
+    AdminModerationReportResolveRequest,
     AdminSourceChannelCreateRequest,
     AdminSourceChannelRead,
 )
@@ -159,19 +165,154 @@ class AdminService:
         self,
         meme_id: uuid.UUID,
         *,
-        is_nsfw: bool | None,
-        is_public: bool | None,
+        admin_user_id: uuid.UUID,
+        request: AdminMemeModerationUpdateRequest,
     ) -> AdminMemeRead:
         meme = await self.session.get(Meme, meme_id)
         if meme is None:
             raise AdminNotFoundError(f"Meme {meme_id} does not exist.")
-        if is_nsfw is not None:
-            meme.is_nsfw = is_nsfw
-        if is_public is not None:
-            meme.is_public = is_public
+
+        previous_is_public = meme.is_public
+        previous_is_nsfw = meme.is_nsfw
+        if request.is_nsfw is not None:
+            meme.is_nsfw = request.is_nsfw
+        if request.is_public is not None:
+            meme.is_public = request.is_public
+
+        self.session.add(
+            ModerationDecision(
+                meme=meme,
+                admin_user_id=admin_user_id,
+                action=ModerationAction.OVERRIDE_FLAGS,
+                reason=request.reason,
+                note=request.note,
+                previous_is_public=previous_is_public,
+                previous_is_nsfw=previous_is_nsfw,
+                new_is_public=meme.is_public,
+                new_is_nsfw=meme.is_nsfw,
+            ),
+        )
         await self.session.commit()
         await self.session.refresh(meme)
         return AdminMemeRead.model_validate(meme)
+
+    async def list_moderation_reports(
+        self,
+        *,
+        report_status: ModerationReportStatus | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[AdminModerationReportRead]:
+        stmt = (
+            select(ModerationReport)
+            .options(selectinload(ModerationReport.meme))
+            .order_by(ModerationReport.created_at.asc())
+            .limit(limit)
+            .offset(offset)
+        )
+        if report_status is None:
+            stmt = stmt.where(
+                ModerationReport.status.in_(
+                    [ModerationReportStatus.PENDING, ModerationReportStatus.IN_REVIEW],
+                ),
+            )
+        else:
+            stmt = stmt.where(ModerationReport.status == report_status)
+        rows = (await self.session.execute(stmt)).scalars().all()
+        return [AdminModerationReportRead.model_validate(row) for row in rows]
+
+    async def resolve_moderation_report(
+        self,
+        report_id: uuid.UUID,
+        *,
+        admin_user_id: uuid.UUID,
+        request: AdminModerationReportResolveRequest,
+    ) -> AdminModerationReportRead:
+        if request.action is ModerationAction.OVERRIDE_FLAGS:
+            raise AdminConflictError("Use the direct meme moderation endpoint for override_flags decisions.")
+
+        report = await self.session.scalar(
+            select(ModerationReport)
+            .options(selectinload(ModerationReport.meme))
+            .where(ModerationReport.id == report_id),
+        )
+        if report is None:
+            raise AdminNotFoundError(f"Moderation report {report_id} does not exist.")
+        if report.status not in {ModerationReportStatus.PENDING, ModerationReportStatus.IN_REVIEW}:
+            raise AdminConflictError(f"Moderation report {report_id} is already closed.")
+
+        meme = report.meme
+        previous_is_public = meme.is_public
+        previous_is_nsfw = meme.is_nsfw
+        self._apply_moderation_action(meme, request.action)
+
+        report.status = (
+            ModerationReportStatus.DISMISSED
+            if request.action is ModerationAction.NO_ACTION
+            else ModerationReportStatus.RESOLVED
+        )
+        report.resolved_by_admin_user_id = admin_user_id
+        report.resolved_at = utcnow()
+        decision = ModerationDecision(
+            meme=meme,
+            report=report,
+            admin_user_id=admin_user_id,
+            action=request.action,
+            reason=request.reason or report.reason,
+            note=request.note,
+            previous_is_public=previous_is_public,
+            previous_is_nsfw=previous_is_nsfw,
+            new_is_public=meme.is_public,
+            new_is_nsfw=meme.is_nsfw,
+        )
+        self.session.add(decision)
+        await self.session.commit()
+
+        refreshed = await self.session.scalar(
+            select(ModerationReport)
+            .options(selectinload(ModerationReport.meme))
+            .where(ModerationReport.id == report_id),
+        )
+        if refreshed is None:
+            raise AdminNotFoundError(f"Moderation report {report_id} does not exist.")
+        return AdminModerationReportRead.model_validate(refreshed)
+
+    async def list_moderation_decisions(
+        self,
+        *,
+        meme_id: uuid.UUID | None = None,
+        report_id: uuid.UUID | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[AdminModerationDecisionRead]:
+        stmt = select(ModerationDecision).order_by(ModerationDecision.created_at.desc()).limit(limit).offset(offset)
+        if meme_id is not None:
+            stmt = stmt.where(ModerationDecision.meme_id == meme_id)
+        if report_id is not None:
+            stmt = stmt.where(ModerationDecision.report_id == report_id)
+        rows = (await self.session.execute(stmt)).scalars().all()
+        return [AdminModerationDecisionRead.model_validate(row) for row in rows]
+
+    def _apply_moderation_action(self, meme: Meme, action: ModerationAction) -> None:
+        if action is ModerationAction.NO_ACTION:
+            return
+        if action is ModerationAction.MARK_NSFW:
+            meme.is_nsfw = True
+            return
+        if action is ModerationAction.MARK_SFW:
+            meme.is_nsfw = False
+            return
+        if action is ModerationAction.HIDE:
+            meme.is_public = False
+            return
+        if action is ModerationAction.PUBLISH:
+            meme.is_public = True
+            return
+        if action is ModerationAction.HIDE_AND_MARK_NSFW:
+            meme.is_public = False
+            meme.is_nsfw = True
+            return
+        raise AdminConflictError(f"Unsupported moderation action {action.value}.")
 
 
 __all__ = ["AdminConflictError", "AdminNotFoundError", "AdminService", "AdminServiceError"]
