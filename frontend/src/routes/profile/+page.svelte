@@ -1,13 +1,15 @@
 <script lang="ts">
   import { invalidateAll } from '$app/navigation';
   import { connectedProviderLabels } from '$lib/account/view-model';
-  import MemeCard from '$lib/components/MemeCard.svelte';
+  import MemeGrid from '$lib/features/memes/MemeGrid.svelte';
+  import LibrarySection from '$lib/features/profile/LibrarySection.svelte';
   import {
     activeCollectionId,
     libraryEmptyText,
     profileCapabilities,
     writableCollectionOptions
   } from '$lib/profile/view-model';
+  import { ActionLink, Badge, Card, EmptyState, Notice, Select } from '$lib/ui';
   import type { PageData } from './$types';
 
   let { data }: { data: PageData } = $props();
@@ -60,121 +62,101 @@
   }
 </script>
 
-<section class="profile-hero" aria-labelledby="profile-title">
+<section class="mb-5 grid items-stretch gap-6 md:grid-cols-[minmax(0,1fr)_minmax(280px,0.55fr)]" aria-labelledby="profile-title">
   <div>
-    <span class="pill">Profile library</span>
-    <h1 id="profile-title">Your meme shelf.</h1>
-    <p class="muted">Favorites, pins, collections, and save routing from this account session.</p>
+    <Badge>Profile library</Badge>
+    <h1 id="profile-title" class="mb-3 mt-4 text-[clamp(2.4rem,8vw,5.4rem)] font-black leading-[0.9] tracking-[-0.075em]">Your meme shelf.</h1>
+    <p class="m-0 text-muted">Favorites, pins, collections, and save routing from this account session.</p>
   </div>
-  <aside class="profile-status-card" aria-label="Account and provider status">
-    <p class="account-title">{capabilities.accountLabel}</p>
-    <p class="account-copy">{capabilities.persistenceText}</p>
-    <p class="account-copy">{capabilities.pinText}</p>
-    <p class="account-copy">{capabilities.collectionText}</p>
+  <aside class="grid content-start gap-2 rounded-[28px] border border-success-line bg-success-surface p-5" aria-label="Account and provider status">
+    <p class="m-0 font-black">{capabilities.accountLabel}</p>
+    <p class="m-0 text-sm text-muted">{capabilities.persistenceText}</p>
+    <p class="m-0 text-sm text-muted">{capabilities.pinText}</p>
+    <p class="m-0 text-sm text-muted">{capabilities.collectionText}</p>
     {#if providerLabels.length > 0}
-      <p class="account-copy">Connected: {providerLabels.join(', ')}</p>
+      <p class="m-0 text-sm text-muted">Connected: {providerLabels.join(', ')}</p>
     {:else if data.session}
-      <p class="account-copy">Connected: none yet</p>
+      <p class="m-0 text-sm text-muted">Connected: none yet</p>
     {/if}
     {#if capabilities.showConnectTelegram}
-      <a class="button-link compact" href="/account/telegram?returnTo=/profile">Connect Telegram</a>
+      <ActionLink size="compact" href="/account/telegram?returnTo=/profile">Connect Telegram</ActionLink>
     {:else if data.session?.linked_providers.telegram_linked}
-      <span class="pill success">Telegram connected</span>
+      <Badge tone="success">Telegram connected</Badge>
     {/if}
   </aside>
 </section>
 
 {#if data.libraryError}
-  <p class="notice" role="status">{data.libraryError}</p>
+  <Notice>{data.libraryError}</Notice>
 {:else if data.library}
-  <section class="library-panel" aria-labelledby="active-save-title">
+  <Card class="my-4 grid gap-3 shadow-none" aria-labelledby="active-save-title">
     <div>
-      <h2 id="active-save-title">Active save collection</h2>
-      <p class="muted">Card save actions go to this destination.</p>
+      <h2 id="active-save-title" class="m-0 text-2xl font-black tracking-[-0.04em]">Active save collection</h2>
+      <p class="m-0 text-muted">Card save actions go to this destination.</p>
     </div>
-    <label class="selector-label">
+    <label class="grid gap-2 font-extrabold text-chiptext">
       <span>Save into</span>
-      <select bind:value={selectedCollectionId} onchange={changeActiveCollection} disabled={selectorPending || !hasMultipleCollections}>
+      <Select class="w-full max-w-[420px]" bind:value={selectedCollectionId} onchange={changeActiveCollection} disabled={selectorPending || !hasMultipleCollections}>
         {#each collectionOptions as collection (collection.id)}
           <option value={collection.id}>{collection.title} ({collection.saved_meme_count})</option>
         {/each}
-      </select>
+      </Select>
     </label>
     {#if !hasMultipleCollections}
-      <p class="muted">{data.session?.user.account_type === 'full' ? 'Create more collections later to switch destinations.' : 'Guests save into Favorites.'}</p>
+      <p class="m-0 text-muted">{data.session?.user.account_type === 'full' ? 'Create more collections later to switch destinations.' : 'Guests save into Favorites.'}</p>
     {/if}
     {#if selectorMessage}
-      <p class="action-status" role="status">{selectorMessage}</p>
+      <p class="m-0 text-sm text-muted" role="status">{selectorMessage}</p>
     {/if}
-  </section>
+  </Card>
 
-  <section class="library-panel" aria-labelledby="collections-title">
-    <div class="section-heading">
-      <h2 id="collections-title">Collections</h2>
-      <span class="pill">{data.library.collections.length} total</span>
+  <Card class="my-4 grid gap-3 shadow-none" aria-labelledby="collections-title">
+    <div class="flex flex-wrap items-center justify-between gap-3">
+      <h2 id="collections-title" class="m-0 text-2xl font-black tracking-[-0.04em]">Collections</h2>
+      <Badge>{data.library.collections.length} total</Badge>
     </div>
     {#if data.library.collections.length > 0}
-      <div class="collection-list">
+      <div class="grid gap-2">
         {#each data.library.collections as collection (collection.id)}
-          <article class="collection-row" class:active={collection.id === data.library.active_save_collection?.id}>
+          <article class={collection.id === data.library.active_save_collection?.id ? 'grid items-center gap-3 rounded-[20px] border border-success-line bg-success-surface p-4 md:grid-cols-[minmax(0,1fr)_auto]' : 'grid items-center gap-3 rounded-[20px] border border-line p-4 md:grid-cols-[minmax(0,1fr)_auto]'}>
             <div>
-              <h3>{collection.title}</h3>
-              <p class="muted">{collection.kind === 'favorites' ? 'Default favorites' : collection.visibility} · {collection.saved_meme_count} memes · {collection.role}</p>
+              <h3 class="m-0 text-lg font-black">{collection.title}</h3>
+              <p class="m-0 text-muted">{collection.kind === 'favorites' ? 'Default favorites' : collection.visibility} · {collection.saved_meme_count} memes · {collection.role}</p>
             </div>
             {#if collection.id === data.library.active_save_collection?.id}
-              <span class="pill success">Active save</span>
+              <Badge tone="success">Active save</Badge>
             {:else if collection.can_write}
-              <span class="pill">Writable</span>
+              <Badge>Writable</Badge>
             {:else}
-              <span class="pill">View only</span>
+              <Badge>View only</Badge>
             {/if}
           </article>
         {/each}
       </div>
     {:else}
-      <p class="muted">Collections will appear after your account session is ready.</p>
+      <p class="m-0 text-muted">Collections will appear after your account session is ready.</p>
     {/if}
-  </section>
+  </Card>
 
-  <section class="library-section" aria-labelledby="favorites-title">
-    <div class="section-heading">
-      <h2 id="favorites-title">Favorites</h2>
-      <span class="pill">{data.library.favorites.length} memes</span>
-    </div>
+  <LibrarySection title="Favorites" count={`${data.library.favorites.length} memes`}>
     {#if data.library.favorites.length > 0}
-      <div class="grid" aria-label="Favorite memes">
-        {#each data.library.favorites as meme (meme.id)}
-          <MemeCard {meme} />
-        {/each}
-      </div>
+      <MemeGrid memes={data.library.favorites} label="Favorite memes" />
     {:else}
-      <section class="empty-state">
-        <h3>No favorites yet</h3>
-        <p class="muted">{libraryEmptyText('favorites', data.session ?? null)}</p>
-        <a class="button-link compact secondary" href="/">Browse memes</a>
-      </section>
+      <EmptyState title="No favorites yet" message={libraryEmptyText('favorites', data.session ?? null)}>
+        <ActionLink size="compact" variant="secondary" href="/">Browse memes</ActionLink>
+      </EmptyState>
     {/if}
-  </section>
+  </LibrarySection>
 
-  <section class="library-section" aria-labelledby="pins-title">
-    <div class="section-heading">
-      <h2 id="pins-title">Pinned memes</h2>
-      <span class="pill">{data.library.pinned_memes.length} pinned</span>
-    </div>
+  <LibrarySection title="Pinned memes" count={`${data.library.pinned_memes.length} pinned`}>
     {#if data.library.pinned_memes.length > 0}
-      <div class="grid" aria-label="Pinned memes">
-        {#each data.library.pinned_memes as meme (meme.id)}
-          <MemeCard {meme} />
-        {/each}
-      </div>
+      <MemeGrid memes={data.library.pinned_memes} label="Pinned memes" />
     {:else}
-      <section class="empty-state">
-        <h3>No pinned memes yet</h3>
-        <p class="muted">{libraryEmptyText('pins', data.session ?? null)}</p>
+      <EmptyState title="No pinned memes yet" message={libraryEmptyText('pins', data.session ?? null)}>
         {#if capabilities.showConnectTelegram}
-          <a class="button-link compact" href="/account/telegram?returnTo=/profile">Connect Telegram</a>
+          <ActionLink size="compact" href="/account/telegram?returnTo=/profile">Connect Telegram</ActionLink>
         {/if}
-      </section>
+      </EmptyState>
     {/if}
-  </section>
+  </LibrarySection>
 {/if}

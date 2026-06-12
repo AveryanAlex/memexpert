@@ -1,6 +1,5 @@
 <script lang="ts">
   import { browser } from '$app/environment';
-  import { DropdownMenu } from 'bits-ui';
   import {
     favoriteMeme,
     pinMeme,
@@ -21,6 +20,9 @@
     telegramShareUrl,
     type MemeActionKind
   } from '$lib/memeActions';
+  import { Button, Select, Textarea } from '$lib/ui';
+  import * as Menu from '$lib/ui/dropdown-menu';
+  import { Bookmark, Copy, Download, Flag, Heart, MoreHorizontal, Pin, Send } from '@lucide/svelte';
 
   interface Props {
     meme: PublicMemeCardRead | PublicMemeDetailRead;
@@ -193,130 +195,83 @@
   }
 </script>
 
-<div class={compact ? 'meme-actions compact' : 'meme-actions'}>
+<div class={compact ? 'flex flex-wrap items-start gap-2' : 'my-3 flex flex-wrap items-start gap-2'}>
   {#if showPrimary}
-    <div class="primary-actions" aria-label="Primary meme actions">
-      <button class="button-link secondary action-button" type="button" disabled={pending !== null} onclick={toggleFavorite}>
+    <div class="flex flex-wrap gap-2" aria-label="Primary meme actions">
+      <Button variant="secondary" type="button" disabled={pending !== null} onclick={toggleFavorite}>
+        <Heart class="size-4" aria-hidden="true" />
         {favorited ? 'Unlike' : 'Like'} ({likeCount})
-      </button>
-      <button class="button-link secondary action-button" type="button" disabled={pending !== null} onclick={toggleSave}>
+      </Button>
+      <Button variant="secondary" type="button" disabled={pending !== null} onclick={toggleSave}>
+        <Bookmark class="size-4" aria-hidden="true" />
         {saved ? 'Saved' : 'Save'}
-      </button>
-      <button class="button-link secondary action-button" type="button" disabled={pending !== null} onclick={togglePin}>
+      </Button>
+      <Button variant="secondary" type="button" disabled={pending !== null} onclick={togglePin}>
+        <Pin class="size-4" aria-hidden="true" />
         {pinned ? 'Unpin' : 'Pin'}
-      </button>
+      </Button>
     </div>
   {/if}
 
-  <DropdownMenu.Root>
-    <DropdownMenu.Trigger class="menu-trigger" aria-label="Meme actions" disabled={pending !== null}>
-      <span aria-hidden="true">...</span>
-    </DropdownMenu.Trigger>
-    <DropdownMenu.Portal>
-      <DropdownMenu.Content class="action-menu" align="end" sideOffset={8}>
-        <DropdownMenu.Item class="action-menu-item" onSelect={toggleFavorite} disabled={pending !== null}>
-          {favorited ? 'Unlike' : 'Like'} meme
-        </DropdownMenu.Item>
-        <DropdownMenu.Item class="action-menu-item" onSelect={toggleSave} disabled={pending !== null}>
-          {saved ? 'Remove save' : 'Save'}
-        </DropdownMenu.Item>
-        <DropdownMenu.Item class="action-menu-item" onSelect={togglePin} disabled={pending !== null}>
-          {pinned ? 'Unpin' : 'Pin'}
-        </DropdownMenu.Item>
-        <DropdownMenu.Separator class="action-menu-separator" />
-        <DropdownMenu.Item class="action-menu-item" onSelect={shareTelegram}>Share to Telegram</DropdownMenu.Item>
-        <DropdownMenu.Item class="action-menu-item" onSelect={copyLink}>Copy link</DropdownMenu.Item>
-        <DropdownMenu.Item class="action-menu-item" onSelect={downloadMeme} disabled={!canDownload}>
-          {canDownload ? 'Download' : 'Download unavailable'}
-        </DropdownMenu.Item>
-        <DropdownMenu.Separator class="action-menu-separator" />
-        <DropdownMenu.Item
-          class="action-menu-item"
-          style="color: var(--danger-color, #b42318);"
-          onSelect={openReportForm}
-          disabled={pending !== null}
-        >
-          Report meme
-        </DropdownMenu.Item>
-      </DropdownMenu.Content>
-    </DropdownMenu.Portal>
-  </DropdownMenu.Root>
+  <Menu.Root>
+    <Menu.Trigger aria-label="Meme actions" disabled={pending !== null}>
+      <MoreHorizontal class="size-5" aria-hidden="true" />
+    </Menu.Trigger>
+    <Menu.Content>
+      <Menu.Item onSelect={toggleFavorite} disabled={pending !== null}>
+        <Heart class="size-4" aria-hidden="true" />
+        {favorited ? 'Unlike' : 'Like'} meme
+      </Menu.Item>
+      <Menu.Item onSelect={toggleSave} disabled={pending !== null}>
+        <Bookmark class="size-4" aria-hidden="true" />
+        {saved ? 'Remove save' : 'Save'}
+      </Menu.Item>
+      <Menu.Item onSelect={togglePin} disabled={pending !== null}>
+        <Pin class="size-4" aria-hidden="true" />
+        {pinned ? 'Unpin' : 'Pin'}
+      </Menu.Item>
+      <Menu.Separator />
+      <Menu.Item onSelect={shareTelegram}><Send class="size-4" aria-hidden="true" />Share to Telegram</Menu.Item>
+      <Menu.Item onSelect={copyLink}><Copy class="size-4" aria-hidden="true" />Copy link</Menu.Item>
+      <Menu.Item onSelect={downloadMeme} disabled={!canDownload}>
+        <Download class="size-4" aria-hidden="true" />
+        {canDownload ? 'Download' : 'Download unavailable'}
+      </Menu.Item>
+      <Menu.Separator />
+      <Menu.Item tone="danger" onSelect={openReportForm} disabled={pending !== null}>
+        <Flag class="size-4" aria-hidden="true" />
+        Report meme
+      </Menu.Item>
+    </Menu.Content>
+  </Menu.Root>
 
   {#if reportOpen}
-    <form class="report-panel" onsubmit={handleReportSubmit}>
-      <label class="report-label" for={`report-reason-${meme.id}`}>Reason</label>
-      <select id={`report-reason-${meme.id}`} class="report-select" bind:value={reportReason} disabled={pending !== null}>
+    <form class="grid w-full max-w-sm gap-2 rounded-2xl border border-line bg-paper p-3 shadow-warm" onsubmit={handleReportSubmit}>
+      <label class="grid gap-1 text-xs font-extrabold uppercase tracking-wide" for={`report-reason-${meme.id}`}>Reason</label>
+      <Select id={`report-reason-${meme.id}`} bind:value={reportReason} disabled={pending !== null}>
         {#each reportReasons as reason}
           <option value={reason.value}>{reason.label}</option>
         {/each}
-      </select>
+      </Select>
 
-      <label class="report-label" for={`report-note-${meme.id}`}>Optional note</label>
-      <textarea
+      <label class="grid gap-1 text-xs font-extrabold uppercase tracking-wide" for={`report-note-${meme.id}`}>Optional note</label>
+      <Textarea
         id={`report-note-${meme.id}`}
-        class="report-note"
         bind:value={reportNote}
-        maxlength="2048"
-        rows="3"
+        maxlength={2048}
+        rows={3}
         placeholder="Add context for moderators"
         disabled={pending !== null}
-      ></textarea>
+      />
 
-      <div class="report-actions">
-        <button class="button-link secondary action-button" type="button" onclick={closeReportForm} disabled={pending !== null}>
-          Cancel
-        </button>
-        <button class="button-link action-button" type="submit" disabled={pending !== null}>
-          {pending === 'report' ? 'Submitting...' : 'Submit report'}
-        </button>
+      <div class="flex justify-end gap-2">
+        <Button variant="secondary" size="compact" type="button" onclick={closeReportForm} disabled={pending !== null}>Cancel</Button>
+        <Button size="compact" type="submit" disabled={pending !== null}>{pending === 'report' ? 'Submitting...' : 'Submit report'}</Button>
       </div>
     </form>
   {/if}
 
   {#if statusMessage}
-    <p class="action-status" role="status">{statusMessage}</p>
+    <p class="basis-full text-sm text-muted" role="status">{statusMessage}</p>
   {/if}
 </div>
-
-<style>
-  .report-panel {
-    margin-top: 0.75rem;
-    display: grid;
-    gap: 0.45rem;
-    max-width: 22rem;
-    padding: 0.75rem;
-    border: 1px solid color-mix(in srgb, currentColor 16%, transparent);
-    border-radius: 0.8rem;
-    background: var(--surface-elevated, Canvas);
-    box-shadow: 0 12px 28px color-mix(in srgb, black 12%, transparent);
-  }
-
-  .report-label {
-    font-size: 0.78rem;
-    font-weight: 700;
-    letter-spacing: 0.02em;
-    text-transform: uppercase;
-  }
-
-  .report-select,
-  .report-note {
-    width: 100%;
-    box-sizing: border-box;
-    border: 1px solid color-mix(in srgb, currentColor 18%, transparent);
-    border-radius: 0.6rem;
-    padding: 0.55rem 0.65rem;
-    font: inherit;
-    color: inherit;
-    background: var(--surface, Canvas);
-  }
-
-  .report-note {
-    resize: vertical;
-  }
-
-  .report-actions {
-    display: flex;
-    justify-content: flex-end;
-    gap: 0.5rem;
-  }
-</style>
