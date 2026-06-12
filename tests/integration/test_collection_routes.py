@@ -7,7 +7,9 @@ from typing import TYPE_CHECKING
 from memexpert.api.dependencies.auth import get_optional_current_user
 from memexpert.api.dependencies.collection import get_collection_service
 from memexpert.api.dependencies.meme import get_meme_search_service
-from memexpert.models.content import Meme
+from memexpert.api.routes.v1 import media as media_routes
+from memexpert.core.database import get_db_session
+from memexpert.models.content import Meme, MemeFile
 from memexpert.models.enums import ContentKind, ContentLanguage
 from memexpert.schemas.user import UserRead
 from memexpert.services import CollectionService, MemeSearchService, UserService
@@ -21,14 +23,45 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
 
-async def _create_meme(session: AsyncSession, *, author_user_id: uuid.UUID | None = None) -> Meme:
+class FakeS3Client:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def generate_presigned_url(self, operation: str, *, Params: dict[str, str], ExpiresIn: int) -> str:
+        self.calls.append({"operation": operation, "params": Params, "expires_in": ExpiresIn})
+        return f"https://s3.memexpert.test/{Params['Key']}"
+
+
+async def _create_meme(
+    session: AsyncSession,
+    *,
+    author_user_id: uuid.UUID | None = None,
+    is_public: bool = True,
+    mime_type: str = "image/jpeg",
+    s3_original_key: str | None = None,
+    s3_web_video_key: str | None = None,
+) -> Meme:
     meme = Meme(
         media_type=ContentKind.IMAGE,
         language=ContentLanguage.EN,
-        is_public=True,
+        is_public=is_public,
         author_user_id=author_user_id,
     )
     session.add(meme)
+    await session.flush()
+    file = MemeFile(
+        meme_id=meme.id,
+        s3_original_key=s3_original_key or f"pipeline/originals/test/{meme.id}.jpg",
+        s3_web_video_key=s3_web_video_key,
+        mime_type=mime_type,
+        width=640,
+        height=480,
+        quality_score=0.8,
+        is_primary=True,
+    )
+    session.add(file)
+    await session.flush()
+    meme.primary_file_id = file.id
     await session.flush()
     return meme
 
@@ -115,3 +148,108 @@ async def test_collection_routes_crud_detail_remove_active_and_invites(
     assert remove_response.json()["removed"] is True
     assert delete_response.status_code == 200
     assert delete_response.json()["deleted"] is True
+
+
+async def test_collection_detail_and_media_route_authorize_private_saved_media(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+    monkeypatch: object,
+) -> None:
+    user_service = UserService(migrated_db_session)
+    owner = await create_full_user_via_upgrade(user_service, telegram_id=2001, email="private-owner@example.com")
+    member = await create_full_user_via_upgrade(user_service, telegram_id=2002, email="private-member@example.com")
+    outsider = await create_full_user_via_upgrade(user_service, telegram_id=2003, email="private-outsider@example.com")
+    private_meme = await _create_meme(
+        migrated_db_session,
+        author_user_id=owner.id,
+        is_public=False,
+        s3_original_key="pipeline/originals/private/owner-upload.png",
+        s3_web_video_key="pipeline/derived/private/owner-upload.mp4",
+        mime_type="image/png",
+    )
+    await migrated_db_session.commit()
+    assert private_meme.primary_file_id is not None
+    private_file_id = private_meme.primary_file_id
+
+    current_user = UserRead.model_validate(owner)
+    fake_s3_client = FakeS3Client()
+    monkeypatch.setattr(media_routes, "get_s3_client", lambda: fake_s3_client)
+
+    def override_collection_service() -> CollectionService:
+        return CollectionService(migrated_db_session)
+
+    def override_meme_search_service() -> MemeSearchService:
+        return MemeSearchService(migrated_db_session)
+
+    async def override_current_user() -> UserRead | None:
+        return current_user
+
+    async def override_db_session() -> AsyncSession:
+        return migrated_db_session
+
+    app.dependency_overrides[get_collection_service] = override_collection_service
+    app.dependency_overrides[get_meme_search_service] = override_meme_search_service
+    app.dependency_overrides[get_optional_current_user] = override_current_user
+    app.dependency_overrides[get_db_session] = override_db_session
+    try:
+        create_response = await client.post("/api/v1/collections", json={"title": "Private saves"})
+        collection_id = create_response.json()["collection"]["id"]
+        save_response = await client.post(f"/api/v1/collections/{collection_id}/memes/{private_meme.id}")
+        owner_detail_response = await client.get(f"/api/v1/collections/{collection_id}")
+        owner_media_response = await client.get(
+            f"/api/v1/media/files/{private_file_id}/web-video.mp4",
+            follow_redirects=False,
+        )
+
+        invite_response = await client.post(
+            f"/api/v1/collections/{collection_id}/invites",
+            json={"role": "viewer", "max_uses": 1, "expires_in_hours": 24},
+        )
+        current_user = UserRead.model_validate(member)
+        join_response = await client.post(f"/api/v1/collections/invites/{invite_response.json()['token']}/join")
+        member_detail_response = await client.get(f"/api/v1/collections/{collection_id}")
+        member_media_response = await client.get(
+            f"/api/v1/media/files/{private_file_id}/preview",
+            follow_redirects=False,
+        )
+
+        current_user = UserRead.model_validate(outsider)
+        outsider_detail_response = await client.get(f"/api/v1/collections/{collection_id}")
+        outsider_media_response = await client.get(
+            f"/api/v1/media/files/{private_file_id}/preview",
+            follow_redirects=False,
+        )
+
+        current_user = None
+        anonymous_media_response = await client.get(
+            f"/api/v1/media/files/{private_file_id}/preview",
+            follow_redirects=False,
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert create_response.status_code == 201
+    assert save_response.status_code == 200
+    assert owner_detail_response.status_code == 200
+    owner_render = owner_detail_response.json()["saved_memes"][0]["meme"]["primary_file"]["render"]
+    assert owner_render["thumbnail_url"] == f"/api/v1/media/files/{private_file_id}/thumbnail"
+    assert owner_render["preview_url"] == f"/api/v1/media/files/{private_file_id}/preview"
+    assert owner_render["web_video_url"] == f"/api/v1/media/files/{private_file_id}/web-video.mp4"
+    assert "pipeline/originals/private/owner-upload.png" not in owner_detail_response.text
+    assert "pipeline/derived/private/owner-upload.mp4" not in owner_detail_response.text
+    assert owner_media_response.status_code == 307
+    assert owner_media_response.headers["location"] == "https://s3.memexpert.test/pipeline/derived/private/owner-upload.mp4"
+
+    assert join_response.status_code == 200
+    assert member_detail_response.status_code == 200
+    member_render = member_detail_response.json()["saved_memes"][0]["meme"]["primary_file"]["render"]
+    assert member_render["preview_url"] == f"/api/v1/media/files/{private_file_id}/preview"
+    assert member_media_response.status_code == 307
+    assert member_media_response.headers["location"] == "https://s3.memexpert.test/pipeline/originals/private/owner-upload.png"
+
+    assert outsider_detail_response.status_code == 404
+    assert outsider_media_response.status_code == 404
+    assert anonymous_media_response.status_code == 401
+    assert fake_s3_client.calls[0]["params"]["Key"] == "pipeline/derived/private/owner-upload.mp4"
+    assert fake_s3_client.calls[1]["params"]["Key"] == "pipeline/originals/private/owner-upload.png"

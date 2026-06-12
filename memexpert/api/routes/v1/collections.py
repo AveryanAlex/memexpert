@@ -160,7 +160,7 @@ async def get_collection_detail(
     except CollectionServiceError as exc:
         raise _collection_http_error(exc) from exc
 
-    cards = await meme_search_service.get_public_meme_cards_by_ids(
+    cards = await meme_search_service.get_authorized_meme_cards_by_ids(
         tuple(row.meme_id for row in saved_rows),
         viewer_user_id=current_user.id,
         include_nsfw=current_user.nsfw_enabled,

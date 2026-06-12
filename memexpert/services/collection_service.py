@@ -850,7 +850,11 @@ class CollectionService:
         viewer_user_id: uuid.UUID,
     ) -> list[PublicMemeCardRead]:
         meme_search_service = MemeSearchService(self._session, media_render_service=self._media_render_service)
-        return await meme_search_service.load_public_meme_cards(meme_ids, viewer_user_id=viewer_user_id)
+        return await meme_search_service.get_authorized_meme_cards_by_ids(
+            tuple(meme_ids),
+            viewer_user_id=viewer_user_id,
+            include_nsfw=True,
+        )
 
     async def _get_collection_for_read(self, *, collection_id: object, user_id: object) -> tuple[User, Collection]:
         user = await self._get_user_model(user_id)

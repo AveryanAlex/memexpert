@@ -129,3 +129,57 @@ def test_web_video_returns_null_without_public_media_base() -> None:
 
     assert render.web_video_url is None
     assert render.download_url is None
+
+
+def test_private_image_render_uses_authenticated_api_variants() -> None:
+    file_id = uuid.UUID("11111111-1111-4111-8111-111111111115")
+    file = MemeFile(
+        id=file_id,
+        meme_id=uuid.UUID("22222222-2222-4222-8222-222222222226"),
+        s3_original_key="pipeline/originals/private/upload.png",
+        mime_type="image/png",
+        width=800,
+        height=600,
+        blur_hash="LEHV6nWB2yk8pyo0adR*.7kCMdnj",
+        quality_score=0.8,
+        is_primary=True,
+    )
+
+    render = MediaRenderUrlService(Settings()).build_private_render(file)
+
+    assert render.thumbnail_url == f"/api/v1/media/files/{file_id}/thumbnail"
+    assert render.preview_url == f"/api/v1/media/files/{file_id}/preview"
+    assert render.display_url == render.preview_url
+    assert render.original_url == f"/api/v1/media/files/{file_id}/original"
+    assert render.download_url == f"/api/v1/media/files/{file_id}/download"
+    assert render.width == 800
+    assert render.height == 600
+    assert render.blur_hash == "LEHV6nWB2yk8pyo0adR*.7kCMdnj"
+    serialized_urls = " ".join(
+        url
+        for url in [render.thumbnail_url, render.preview_url, render.original_url, render.download_url]
+        if url is not None
+    )
+    assert "pipeline/originals/private/upload.png" not in serialized_urls
+
+
+def test_private_web_video_uses_authenticated_direct_variant_without_imgproxy() -> None:
+    file_id = uuid.UUID("11111111-1111-4111-8111-111111111116")
+    file = MemeFile(
+        id=file_id,
+        meme_id=uuid.UUID("22222222-2222-4222-8222-222222222227"),
+        s3_original_key="pipeline/originals/private/source.mov",
+        s3_web_video_key="pipeline/derived/private/web.mp4",
+        mime_type="video/mp4",
+        quality_score=0.7,
+        is_primary=True,
+    )
+
+    render = MediaRenderUrlService(Settings.model_validate({"imgproxy_base_url": "https://img.memexpert.test"})).build_private_render(file)
+
+    assert render.thumbnail_url is None
+    assert render.preview_url is None
+    assert render.web_video_url == f"/api/v1/media/files/{file_id}/web-video.mp4"
+    assert render.download_url == render.web_video_url
+    assert "img.memexpert.test" not in render.web_video_url
+    assert "pipeline/derived/private/web.mp4" not in render.web_video_url
