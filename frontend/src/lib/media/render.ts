@@ -8,6 +8,8 @@ export interface SelectedMediaRender {
   hasMedia: boolean;
 }
 
+export const FEED_PREVIEW_FALLBACK_ASPECT_RATIO = '4 / 3';
+
 interface MediaDimensions {
   width: number;
   height: number;
@@ -32,6 +34,18 @@ export function selectMediaRender(file: PublicMemeFileRead | null | undefined): 
 export function selectMediaAspectRatio(file: PublicMemeFileRead | null | undefined): string | null {
   const dimensions = selectMediaDimensions(file);
   return dimensions ? `${dimensions.width} / ${dimensions.height}` : null;
+}
+
+export function selectFeedPreviewAspectRatio(file: PublicMemeFileRead | null | undefined): string {
+  return selectMediaAspectRatio(file) ?? FEED_PREVIEW_FALLBACK_ASPECT_RATIO;
+}
+
+export function selectImageLoading(detail: boolean): 'eager' | 'lazy' {
+  return detail ? 'eager' : 'lazy';
+}
+
+export function selectMediaPreload(detail: boolean): 'metadata' | 'none' {
+  return detail ? 'metadata' : 'none';
 }
 
 function selectMediaDimensions(file: PublicMemeFileRead | null | undefined): MediaDimensions | null {

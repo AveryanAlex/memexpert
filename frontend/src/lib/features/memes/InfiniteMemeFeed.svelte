@@ -7,6 +7,8 @@
   import type { MemeGridBulkOptions } from './bulk-view-model';
   import {
     appendUniqueMemeResults,
+    canLoadNextMemePage,
+    INFINITE_FEED_OBSERVER_ROOT_MARGIN,
     memeFeedKey,
     nextMemePageOffset,
     uniqueMemeResults,
@@ -95,7 +97,7 @@
           void loadNext();
         }
       },
-      { rootMargin: '420px 0px' }
+      { rootMargin: INFINITE_FEED_OBSERVER_ROOT_MARGIN }
     );
 
     observer.observe(sentinel);
@@ -106,7 +108,7 @@
   });
 
   async function loadNext() {
-    if (!hasMore || loading || errorMessage || items.length === 0) return;
+    if (!canLoadNextMemePage({ hasMore, loading, errorMessage, itemCount: items.length })) return;
     await loadPage(nextOffset, 'append');
   }
 
@@ -161,7 +163,7 @@
   <div class="flex flex-wrap items-center gap-2">
     {#if summary}{@render summary()}{/if}
   </div>
-  <p class="m-0 text-muted">Showing {showingCount} of {total}</p>
+  <p class="m-0 text-muted" aria-live="polite">Showing {showingCount} of {total}</p>
 </div>
 
 {#if firstLoading}
@@ -188,13 +190,15 @@
     <Notice tone="danger" role="alert" class="w-full max-w-2xl">{errorMessage}</Notice>
     <Button type="button" variant="secondary" onclick={retry} disabled={loading}>Retry loading more</Button>
   {:else if showLoadMore}
-    <Button type="button" variant="secondary" onclick={loadNext} disabled={loading}>Load more</Button>
+    <Button type="button" variant="secondary" onclick={loadNext} disabled={loading} aria-describedby="meme-feed-load-more-help">Load more</Button>
     <p class="m-0 text-sm text-muted">
-      {#if observerAvailable}
-        More results also load automatically as you scroll.
-      {:else}
-        Automatic loading is unavailable in this browser, so use Load more.
-      {/if}
+      <span id="meme-feed-load-more-help">
+        {#if observerAvailable}
+          More results also load automatically as you scroll.
+        {:else}
+          Automatic loading is unavailable in this browser, so use Load more.
+        {/if}
+      </span>
     </p>
   {:else if showEnd}
     <p class="m-0 rounded-full border border-line bg-paper px-4 py-2 text-sm font-extrabold text-muted">End of results.</p>

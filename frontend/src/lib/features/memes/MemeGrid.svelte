@@ -40,6 +40,7 @@
   const canAddToCollection = $derived(collectionOptions.length > 0);
   const canRemoveFromCollection = $derived(Boolean(bulk.removeEnabled && bulk.removeCollectionId));
   const toolbarSummary = $derived(bulkToolbarSummary(memes.length, selected.length, downloadable.length));
+  const memePositions = $derived(new Map(memes.map((meme, index) => [meme.id, index + 1])));
 
   $effect(() => {
     const availableIds = new Set(memes.map((meme) => meme.id));
@@ -215,18 +216,18 @@
   </div>
 {/if}
 
-<section bind:this={gridElement} class="flex gap-4" aria-label={label} data-column-count={columnCount}>
+<section bind:this={gridElement} class="flex gap-4" aria-label={label} data-column-count={columnCount} role="list" aria-busy={pendingAction !== null}>
   {#each masonryColumns as column (column.id)}
-    <div class="grid min-w-0 flex-1 content-start gap-4">
+    <div class="grid min-w-0 flex-1 content-start gap-4" role="presentation">
       {#each column.items as meme (meme.id)}
-        <div class="relative">
+        <div class="relative" role="presentation">
           {#if bulkEnabled}
             <label class="absolute left-3 top-3 z-20 inline-flex items-center gap-2 rounded-full border border-line bg-paper/95 px-3 py-2 text-sm font-extrabold shadow-warm">
               <input type="checkbox" checked={selectedIds.includes(meme.id)} onchange={() => toggleSelection(meme.id)} aria-label={`Select ${meme.caption || meme.tags[0] || 'meme'}`} />
               Select
             </label>
           {/if}
-          <MemeCard {meme} />
+          <MemeCard {meme} position={memePositions.get(meme.id)} total={memes.length} />
         </div>
       {/each}
     </div>

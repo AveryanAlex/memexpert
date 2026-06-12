@@ -60,6 +60,25 @@ describe("buildMasonryColumns", () => {
       buildMasonryColumns(memes, 1)[0].items.map((meme) => meme.id),
     ).toEqual(["rank-1", "rank-2", "rank-3"]);
   });
+
+  it("keeps earlier ranks in the first available shortest column for top-down scanning", () => {
+    const memes = [
+      memeCard("rank-1", 640, 480),
+      memeCard("rank-2", 640, 480),
+      memeCard("rank-3", 640, 480),
+      memeCard("rank-4", 640, 480),
+    ];
+
+    const columns = buildMasonryColumns(memes, 3).map((column) =>
+      column.items.map((meme) => meme.id),
+    );
+
+    expect(columns).toEqual([
+      ["rank-1", "rank-4"],
+      ["rank-2"],
+      ["rank-3"],
+    ]);
+  });
 });
 
 function memeCard(
