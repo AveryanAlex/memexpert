@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, field_validator, model_validator
 
@@ -67,6 +68,9 @@ class AdminSourceChannelRead(ORMSchema):
     session_id: str | None
     last_read_post_id: str | None
     last_fetched_at: datetime | None
+    operational_status: Literal["active", "inactive", "paused"]
+    freshness_status: Literal["checkpoint_only", "fresh", "never_fetched", "stale"]
+    seconds_since_last_fetch: int | None
     created_at: datetime
     updated_at: datetime
 
@@ -112,6 +116,29 @@ class AdminMemeTemplateRead(ORMSchema):
     updated_at: datetime
 
 
+class AdminMemeTemplateCreateRequest(BaseModel):
+    """Create a meme template taxonomy row."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    slug: str = Field(min_length=1, max_length=MAX_TEMPLATE_SLUG_LENGTH)
+    name: str = Field(min_length=1, max_length=MAX_TEMPLATE_NAME_LENGTH)
+    description: str | None = None
+    is_curated: StrictBool = False
+    base_image_url: str | None = None
+    text_regions: list[dict[str, object]] | None = None
+
+    @field_validator("slug", "name")
+    @classmethod
+    def _normalize_required_text(cls, value: str) -> str:
+        return normalize_required_text(value)
+
+    @field_validator("description", "base_image_url")
+    @classmethod
+    def _normalize_text(cls, value: str | None) -> str | None:
+        return normalize_optional_text(value)
+
+
 class AdminMemeTemplateUpdateRequest(BaseModel):
     """Partial update for meme template metadata."""
 
@@ -135,6 +162,52 @@ class AdminMemeTemplateUpdateRequest(BaseModel):
     @classmethod
     def _normalize_text(cls, value: str | None) -> str | None:
         return normalize_optional_text(value)
+
+
+class AdminMemeTemplateMergeRequest(BaseModel):
+    """Merge one duplicate template into a target template."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    target_template_id: uuid.UUID
+    confirmation: str = Field(min_length=1, max_length=MAX_DESTRUCTIVE_CONFIRMATION_LENGTH)
+    note: str = Field(min_length=1, max_length=MAX_ADMIN_NOTE_LENGTH)
+
+    @field_validator("confirmation", "note")
+    @classmethod
+    def _normalize_required_text(cls, value: str) -> str:
+        return normalize_required_text(value)
+
+
+class AdminMemeTemplateDeleteRequest(BaseModel):
+    """Explicit confirmation payload for safe template deletion."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    confirmation: str = Field(min_length=1, max_length=MAX_DESTRUCTIVE_CONFIRMATION_LENGTH)
+    note: str | None = Field(default=None, max_length=MAX_ADMIN_NOTE_LENGTH)
+
+    @field_validator("confirmation")
+    @classmethod
+    def _normalize_confirmation(cls, value: str) -> str:
+        return normalize_required_text(value)
+
+    @field_validator("note")
+    @classmethod
+    def _normalize_note(cls, value: str | None) -> str | None:
+        return normalize_optional_text(value)
+
+
+class AdminMemeTemplateActionRead(BaseModel):
+    """Result of a safe meme-template admin action."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["delete", "merge"]
+    source_template_id: uuid.UUID
+    target_template_id: uuid.UUID | None
+    affected_meme_count: int
+    message: str
 
 
 class AdminMemeRead(ORMSchema):
@@ -287,6 +360,10 @@ class AdminMemeDetailRead(BaseModel):
 
 __all__ = [
     "AdminChannelSuggestionReviewRequest",
+    "AdminMemeTemplateActionRead",
+    "AdminMemeTemplateCreateRequest",
+    "AdminMemeTemplateDeleteRequest",
+    "AdminMemeTemplateMergeRequest",
     "AdminMemeDeleteRequest",
     "AdminMemeDetailRead",
     "AdminMemeDestructiveActionRead",

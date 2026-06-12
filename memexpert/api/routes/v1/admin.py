@@ -18,6 +18,10 @@ from memexpert.schemas.admin import (
     AdminMemeMergeRequest,
     AdminMemeModerationUpdateRequest,
     AdminMemeRead,
+    AdminMemeTemplateActionRead,
+    AdminMemeTemplateCreateRequest,
+    AdminMemeTemplateDeleteRequest,
+    AdminMemeTemplateMergeRequest,
     AdminMemeTemplateRead,
     AdminMemeTemplateUpdateRequest,
     AdminModerationDecisionRead,
@@ -162,9 +166,42 @@ async def resume_source_channel(
         raise _map_admin_error(exc) from exc
 
 
+@router.post(
+    "/source-channels/{channel_id}/mark-dead",
+    response_model=AdminSourceChannelRead,
+    summary="Mark a source channel dead without deleting checkpoint state",
+)
+async def mark_source_channel_dead(
+    _admin: AdminUserDep,
+    admin_service: AdminServiceDep,
+    channel_id: Annotated[uuid.UUID, Path()],
+) -> AdminSourceChannelRead:
+    try:
+        return await admin_service.mark_source_channel_dead(channel_id)
+    except (AdminNotFoundError, AdminConflictError) as exc:
+        raise _map_admin_error(exc) from exc
+
+
 @router.get("/meme-templates", response_model=list[AdminMemeTemplateRead], summary="List meme templates")
 async def list_meme_templates(_admin: AdminUserDep, admin_service: AdminServiceDep) -> list[AdminMemeTemplateRead]:
     return await admin_service.list_meme_templates()
+
+
+@router.post(
+    "/meme-templates",
+    response_model=AdminMemeTemplateRead,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a meme template",
+)
+async def create_meme_template(
+    _admin: AdminUserDep,
+    admin_service: AdminServiceDep,
+    request: Annotated[AdminMemeTemplateCreateRequest, Body()],
+) -> AdminMemeTemplateRead:
+    try:
+        return await admin_service.create_meme_template(request)
+    except (AdminNotFoundError, AdminConflictError) as exc:
+        raise _map_admin_error(exc) from exc
 
 
 @router.patch(
@@ -180,6 +217,44 @@ async def update_meme_template(
 ) -> AdminMemeTemplateRead:
     try:
         return await admin_service.update_meme_template(template_id, request)
+    except (AdminNotFoundError, AdminConflictError) as exc:
+        raise _map_admin_error(exc) from exc
+
+
+@router.post(
+    "/meme-templates/{template_id}/merge",
+    response_model=AdminMemeTemplateActionRead,
+    summary="Merge a duplicate meme template into a target",
+)
+async def merge_meme_template(
+    admin_user: AdminUserDep,
+    admin_service: AdminServiceDep,
+    template_id: Annotated[uuid.UUID, Path()],
+    request: Annotated[AdminMemeTemplateMergeRequest, Body()],
+) -> AdminMemeTemplateActionRead:
+    try:
+        return await admin_service.merge_meme_template(
+            template_id,
+            admin_user_id=admin_user.id,
+            request=request,
+        )
+    except (AdminNotFoundError, AdminConflictError) as exc:
+        raise _map_admin_error(exc) from exc
+
+
+@router.delete(
+    "/meme-templates/{template_id}",
+    response_model=AdminMemeTemplateActionRead,
+    summary="Delete an unreferenced meme template",
+)
+async def delete_meme_template(
+    _admin: AdminUserDep,
+    admin_service: AdminServiceDep,
+    template_id: Annotated[uuid.UUID, Path()],
+    request: Annotated[AdminMemeTemplateDeleteRequest, Body()],
+) -> AdminMemeTemplateActionRead:
+    try:
+        return await admin_service.delete_meme_template(template_id, request)
     except (AdminNotFoundError, AdminConflictError) as exc:
         raise _map_admin_error(exc) from exc
 
