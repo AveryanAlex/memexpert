@@ -6,6 +6,7 @@ import {
   favoriteMeme,
   fetchAdminSession,
   fetchCurrentSession,
+  fetchMemeLibrary,
   fetchMemeDetail,
   fetchMemePage,
   fetchTagLanding,
@@ -17,9 +18,10 @@ import {
   startTelegramLink,
   unfavoriteMeme,
   unpinMeme,
+  updateActiveSaveCollection,
   type ApiFetch
 } from './client';
-import type { CurrentSessionRead, PublicMemeSearchPageRead } from './types';
+import type { CurrentSessionRead, MemeLibraryRead, PublicMemeSearchPageRead } from './types';
 
 const page: PublicMemeSearchPageRead = {
   items: [],
@@ -271,6 +273,58 @@ describe('catalog API client', () => {
 
     expect(mockFetch).toHaveBeenCalledOnce();
   });
+
+  it('loads profile library data with SSR cookie forwarding', async () => {
+    const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const headers = new Headers(init?.headers);
+
+      expect(url.pathname).toBe('/api/v1/memes/library');
+      expect(headers.get('cookie')).toBe('memexpert_access_token=guest');
+
+      return jsonResponse(libraryPayload());
+    }) satisfies ApiFetch;
+
+    const library = await fetchMemeLibrary({
+      fetch: mockFetch,
+      baseUrl: 'https://api.memexpert.test',
+      cookieHeader: 'memexpert_access_token=guest'
+    });
+
+    expect(library.favorites[0].viewer_has_favorited).toBe(true);
+    expect(library.pinned_memes[0].viewer_has_pinned).toBe(true);
+    expect(library.active_save_collection?.title).toBe('Favorites');
+    expect(mockFetch).toHaveBeenCalledOnce();
+  });
+
+  it('updates active save collection with JSON body and cookies', async () => {
+    const collectionId = '44444444-4444-4444-8444-444444444444';
+    const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const headers = new Headers(init?.headers);
+
+      expect(url.pathname).toBe('/api/v1/memes/active-save-collection');
+      expect(init?.method).toBe('PUT');
+      expect(headers.get('cookie')).toBe('memexpert_access_token=full');
+      expect(headers.get('content-type')).toBe('application/json');
+      expect(JSON.parse(String(init?.body))).toEqual({ collection_id: collectionId });
+
+      return jsonResponse({ ...sessionPayload('full').user, active_save_collection_id: collectionId });
+    }) satisfies ApiFetch;
+    const onResponse = vi.fn();
+
+    const user = await updateActiveSaveCollection({
+      fetch: mockFetch,
+      baseUrl: 'https://api.memexpert.test',
+      cookieHeader: 'memexpert_access_token=full',
+      onResponse,
+      collectionId
+    });
+
+    expect(user.active_save_collection_id).toBe(collectionId);
+    expect(mockFetch).toHaveBeenCalledOnce();
+    expect(onResponse).toHaveBeenCalledOnce();
+  });
 });
 
 describe('admin API client', () => {
@@ -424,6 +478,60 @@ function sessionPayload(accountType: 'full' | 'guest'): CurrentSessionRead {
       google_linked: false,
       telegram_linked: accountType === 'full'
     }
+  };
+}
+
+function libraryPayload(): MemeLibraryRead {
+  const favorite = memeCard('11111111-1111-4111-8111-111111111111', {
+    viewer_has_favorited: true,
+    viewer_has_saved: true,
+    viewer_has_pinned: false
+  });
+  const pinned = memeCard('22222222-2222-4222-8222-222222222222', {
+    viewer_has_favorited: false,
+    viewer_has_saved: false,
+    viewer_has_pinned: true
+  });
+  const collection = {
+    id: '33333333-3333-4333-8333-333333333333',
+    owner_id: '22222222-2222-4222-8222-222222222222',
+    title: 'Favorites',
+    description: null,
+    kind: 'favorites' as const,
+    visibility: 'private' as const,
+    role: 'owner' as const,
+    can_write: true,
+    saved_meme_count: 1,
+    created_at: '2026-01-01T00:00:00Z',
+    updated_at: '2026-01-01T00:00:00Z'
+  };
+
+  return {
+    favorites: [favorite],
+    pinned_memes: [pinned],
+    collections: [collection],
+    active_save_collection: collection
+  };
+}
+
+function memeCard(id: string, flags: Partial<MemeLibraryRead['favorites'][number]>): MemeLibraryRead['favorites'][number] {
+  return {
+    id,
+    media_type: 'image',
+    language: 'en',
+    is_nsfw: false,
+    popularity_score: 1,
+    like_count: 3,
+    tags: ['reaction'],
+    primary_file: null,
+    caption: 'Reaction meme',
+    seo_page_slug: null,
+    viewer_has_favorited: false,
+    viewer_has_saved: false,
+    viewer_has_pinned: false,
+    created_at: '2026-01-01T00:00:00Z',
+    updated_at: '2026-01-01T00:00:00Z',
+    ...flags
   };
 }
 

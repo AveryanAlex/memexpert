@@ -224,6 +224,60 @@ async def test_favorite_unfavorite_is_idempotent_and_updates_like_count(
     assert await migrated_db_session.scalar(select(Meme.like_count).where(Meme.id == meme.id)) == 0
 
 
+async def test_meme_library_bootstraps_guest_active_favorites_without_cards(
+    migrated_db_session: AsyncSession,
+) -> None:
+    user_service = UserService(migrated_db_session)
+    collection_service = CollectionService(migrated_db_session)
+    guest = await user_service.create_guest_user()
+
+    library = await collection_service.get_meme_library(user_id=guest.id)
+
+    assert library.favorites == []
+    assert library.pinned_memes == []
+    assert library.active_save_collection is not None
+    assert library.active_save_collection.kind is CollectionKind.FAVORITES
+    assert library.active_save_collection.can_write is True
+    assert [(collection.title, collection.saved_meme_count) for collection in library.collections] == [("Favorites", 0)]
+
+
+async def test_meme_library_returns_renderable_cards_collections_and_viewer_flags(
+    migrated_db_session: AsyncSession,
+) -> None:
+    user_service = UserService(migrated_db_session)
+    collection_service = CollectionService(migrated_db_session)
+    full_user = await create_full_user_via_upgrade(user_service, email="library@example.com")
+    favorite_meme = await _create_meme(migrated_db_session)
+    pinned_meme = await _create_meme(migrated_db_session)
+    custom_meme = await _create_meme(migrated_db_session)
+    _ = await collection_service.favorite_meme(user_id=full_user.id, meme_id=favorite_meme.id)
+    custom = await collection_service.create_custom_collection(owner_user_id=full_user.id, title="Work saves")
+    _ = await collection_service.update_active_save_collection(user_id=full_user.id, collection_id=custom.id)
+    _ = await collection_service.pin_meme(user_id=full_user.id, meme_id=pinned_meme.id)
+    _ = await collection_service.save_meme_to_active_collection(user_id=full_user.id, meme_id=custom_meme.id)
+
+    library = await collection_service.get_meme_library(user_id=full_user.id)
+
+    assert [meme.id for meme in library.favorites] == [favorite_meme.id]
+    assert [meme.id for meme in library.pinned_memes] == [pinned_meme.id]
+    assert library.favorites[0].viewer_has_favorited is True
+    assert library.favorites[0].viewer_has_saved is False
+    assert library.favorites[0].viewer_has_pinned is False
+    assert library.pinned_memes[0].viewer_has_favorited is False
+    assert library.pinned_memes[0].viewer_has_saved is False
+    assert library.pinned_memes[0].viewer_has_pinned is True
+    assert library.active_save_collection is not None
+    assert library.active_save_collection.id == custom.id
+    collection_rows = [
+        (collection.title, collection.saved_meme_count, collection.can_write)
+        for collection in library.collections
+    ]
+    assert collection_rows == [
+        ("Favorites", 1, True),
+        ("Work saves", 1, True),
+    ]
+
+
 async def test_save_uses_guest_favorites_or_full_active_custom_collection(
     migrated_db_session: AsyncSession,
 ) -> None:

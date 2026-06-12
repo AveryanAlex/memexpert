@@ -5,6 +5,7 @@ import type {
   AdminSourceChannelRead,
   ChannelSuggestionRead,
   CurrentSessionRead,
+  MemeLibraryRead,
   PublicMemeDetailRead,
   PublicMemeLandingRead,
   PublicMemeSearchPageRead,
@@ -40,11 +41,15 @@ interface MemeActionRequest {
   memeId: string;
 }
 
+interface ActiveSaveCollectionRequest extends CatalogRequest {
+  collectionId: string;
+}
+
 export interface RemoveActionResponse {
   removed?: boolean;
 }
 
-interface AdminMutationRequest extends CatalogRequest {
+interface JsonMutationRequest extends CatalogRequest {
   body?: unknown;
 }
 
@@ -101,6 +106,17 @@ export async function fetchMemeDetail(request: DetailRequest): Promise<PublicMem
   );
 }
 
+export async function fetchMemeLibrary(request: CatalogRequest): Promise<MemeLibraryRead> {
+  return apiGet<MemeLibraryRead>('/api/v1/memes/library', new URLSearchParams(), request);
+}
+
+export async function updateActiveSaveCollection(request: ActiveSaveCollectionRequest): Promise<CurrentSessionRead['user']> {
+  return apiWrite<CurrentSessionRead['user']>('/api/v1/memes/active-save-collection', 'PUT', {
+    ...request,
+    body: { collection_id: request.collectionId }
+  });
+}
+
 export async function favoriteMeme(request: MemeActionRequest): Promise<unknown> {
   return apiMutation(`/api/v1/memes/${encodeURIComponent(request.memeId)}/favorite`, 'POST', request);
 }
@@ -154,7 +170,7 @@ export async function fetchAdminDashboard(request: CatalogRequest): Promise<{
 }
 
 export async function reviewChannelSuggestion(
-  request: AdminMutationRequest,
+  request: JsonMutationRequest,
   suggestionId: string,
   decision: 'approve' | 'reject'
 ): Promise<ChannelSuggestionRead> {
@@ -165,7 +181,7 @@ export async function reviewChannelSuggestion(
   );
 }
 
-export async function addSourceChannel(request: AdminMutationRequest): Promise<AdminSourceChannelRead> {
+export async function addSourceChannel(request: JsonMutationRequest): Promise<AdminSourceChannelRead> {
   return apiWrite<AdminSourceChannelRead>('/api/v1/admin/source-channels', 'POST', request);
 }
 
@@ -182,7 +198,7 @@ export async function setSourceChannelPaused(
 }
 
 export async function updateMemeTemplate(
-  request: AdminMutationRequest,
+  request: JsonMutationRequest,
   templateId: string
 ): Promise<AdminMemeTemplateRead> {
   return apiWrite<AdminMemeTemplateRead>(
@@ -192,7 +208,7 @@ export async function updateMemeTemplate(
   );
 }
 
-export async function updateMemeModeration(request: AdminMutationRequest, memeId: string): Promise<AdminMemeRead> {
+export async function updateMemeModeration(request: JsonMutationRequest, memeId: string): Promise<AdminMemeRead> {
   return apiWrite<AdminMemeRead>(
     `/api/v1/admin/memes/${encodeURIComponent(memeId)}/moderation`,
     'PATCH',
@@ -260,7 +276,7 @@ async function apiMutation<T>(path: string, method: 'DELETE' | 'POST', request: 
   return payload as T;
 }
 
-async function apiWrite<T>(path: string, method: 'PATCH' | 'POST', request: AdminMutationRequest): Promise<T> {
+async function apiWrite<T>(path: string, method: 'PATCH' | 'POST' | 'PUT', request: JsonMutationRequest): Promise<T> {
   const url = new URL(path, request.baseUrl);
   const headers = new Headers({ accept: 'application/json', 'x-requested-with': 'XMLHttpRequest' });
   if (request.body !== undefined) {
@@ -275,10 +291,11 @@ async function apiWrite<T>(path: string, method: 'PATCH' | 'POST', request: Admi
     headers,
     body: request.body === undefined ? undefined : JSON.stringify(request.body)
   });
+  request.onResponse?.(response);
   const payload = await readJson(response);
 
   if (!response.ok) {
-    throw new ApiError(response.status, readErrorDetail(payload) ?? `Admin API returned ${response.status}`);
+    throw new ApiError(response.status, readErrorDetail(payload) ?? `API returned ${response.status}`);
   }
 
   return payload as T;

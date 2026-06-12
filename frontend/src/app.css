@@ -455,11 +455,98 @@ button {
 .notice,
 .detail-card,
 .telegram-card,
-.admin-panel {
+.admin-panel,
+.library-panel {
   border: 1px solid #dfd4c4;
   border-radius: 28px;
   background: #fffaf1;
   padding: 24px;
+}
+
+.profile-hero {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(280px, 0.55fr);
+  gap: 22px;
+  align-items: stretch;
+  margin-bottom: 18px;
+}
+
+.profile-hero h1 {
+  margin: 14px 0 12px;
+  font-size: clamp(2.4rem, 8vw, 5.4rem);
+  line-height: 0.9;
+  letter-spacing: -0.075em;
+}
+
+.profile-status-card {
+  display: grid;
+  align-content: start;
+  gap: 10px;
+  border: 1px solid #cfd8b8;
+  border-radius: 28px;
+  background: #f4f8e9;
+  padding: 20px;
+}
+
+.library-panel {
+  display: grid;
+  gap: 14px;
+  margin: 16px 0;
+}
+
+.library-panel h2,
+.library-section h2,
+.collection-row h3,
+.empty-state h3 {
+  margin: 0;
+}
+
+.selector-label {
+  display: grid;
+  gap: 8px;
+  color: #594e42;
+  font-weight: 800;
+}
+
+.selector-label select {
+  width: min(100%, 420px);
+  border: 1px solid #dfd4c4;
+  border-radius: 16px;
+  background: #fffaf1;
+  color: #17212f;
+  padding: 13px 14px;
+}
+
+.collection-list {
+  display: grid;
+  gap: 10px;
+}
+
+.collection-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  border: 1px solid #eadfce;
+  border-radius: 20px;
+  padding: 14px;
+}
+
+.collection-row.active {
+  border-color: #9bc5a8;
+  background: #effaf2;
+}
+
+.section-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.library-section {
+  margin-top: 28px;
 }
 
 .admin-hero h1 {
@@ -599,10 +686,12 @@ button {
 
 @media (max-width: 780px) {
   .hero,
+  .profile-hero,
   .detail-card,
   .telegram-panel,
   .admin-grid,
-  .admin-row {
+  .admin-row,
+  .collection-row {
     grid-template-columns: 1fr;
   }
 
@@ -615,8 +704,10 @@ button {
   }
 
   .status-row,
+  .section-heading,
   .site-header,
-  .account-chip {
+  .account-chip,
+  .collection-row {
     align-items: flex-start;
     flex-direction: column;
   }

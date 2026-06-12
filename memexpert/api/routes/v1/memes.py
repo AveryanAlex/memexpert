@@ -19,7 +19,7 @@ from memexpert.api.dependencies import (
     OptionalCurrentUserDep,
 )
 from memexpert.models.enums import AnalyticsEventType, ContentKind, ContentLanguage
-from memexpert.schemas.collection import CollectionMemeRead, CollectionRead, PinnedMemeRead
+from memexpert.schemas.collection import CollectionMemeRead, CollectionRead, MemeLibraryRead, PinnedMemeRead
 from memexpert.schemas.meme import (
     MemeSlugRedirectRead,
     PublicMemeDetailRead,
@@ -166,6 +166,19 @@ async def list_favorites(
     """Return the caller's Favorites saves without requiring frontend guest bootstrap."""
 
     return await collection_service.list_favorite_memes(user_id=current_user.id)
+
+
+@router.get("/library", response_model=MemeLibraryRead, summary="Read profile meme library")
+async def get_meme_library(
+    collection_service: CollectionServiceDep,
+    current_user: AutoGuestUserDep,
+) -> MemeLibraryRead:
+    """Return renderable profile/library data without frontend ID stitching."""
+
+    try:
+        return await collection_service.get_meme_library(user_id=current_user.id)
+    except CollectionServiceError as exc:
+        raise _collection_http_error(exc) from exc
 
 
 @router.post("/{meme_id}/favorite", response_model=CollectionMemeRead, summary="Favorite a meme")

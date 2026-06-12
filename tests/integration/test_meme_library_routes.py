@@ -60,6 +60,22 @@ async def test_favorite_save_routes_auto_bootstrap_guest_session(
     assert await migrated_db_session.scalar(select(func.count()).select_from(CollectionMeme)) == 2
 
 
+async def test_library_route_auto_bootstraps_guest_and_returns_empty_profile(
+    auth_client: AsyncClient,
+) -> None:
+    response = await auth_client.get("/api/v1/memes/library")
+
+    assert response.status_code == 200
+    assert "memexpert_access_token" in response.headers["set-cookie"]
+    payload = response.json()
+    assert payload["favorites"] == []
+    assert payload["pinned_memes"] == []
+    assert payload["active_save_collection"]["title"] == "Favorites"
+    assert [(collection["title"], collection["saved_meme_count"]) for collection in payload["collections"]] == [
+        ("Favorites", 0)
+    ]
+
+
 async def test_full_account_routes_update_active_collection_and_manage_pins(
     app: FastAPI,
     client: AsyncClient,
@@ -119,6 +135,45 @@ async def test_full_account_routes_update_active_collection_and_manage_pins(
         select(PinnedMeme.meme_id).where(PinnedMeme.user_id == full_user.id).order_by(PinnedMeme.position.asc())
     )
     assert list(persisted_positions) == [second_meme.id, first_meme.id]
+
+
+async def test_library_route_returns_cards_collections_and_active_save_state(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    user_service = UserService(migrated_db_session)
+    collection_service = CollectionService(migrated_db_session)
+    full_user = await create_full_user_via_upgrade(user_service, email="route-library@example.com")
+    favorite_meme = await _create_meme(migrated_db_session)
+    pinned_meme = await _create_meme(migrated_db_session)
+    _ = await collection_service.favorite_meme(user_id=full_user.id, meme_id=favorite_meme.id)
+    custom = await collection_service.create_custom_collection(owner_user_id=full_user.id, title="API Saves")
+    _ = await collection_service.update_active_save_collection(user_id=full_user.id, collection_id=custom.id)
+    _ = await collection_service.pin_meme(user_id=full_user.id, meme_id=pinned_meme.id)
+
+    def override_collection_service() -> CollectionService:
+        return CollectionService(migrated_db_session)
+
+    async def override_current_user() -> UserRead | None:
+        return UserRead.model_validate(full_user)
+
+    app.dependency_overrides[get_collection_service] = override_collection_service
+    app.dependency_overrides[get_optional_current_user] = override_current_user
+    try:
+        response = await client.get("/api/v1/memes/library")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [meme["id"] for meme in payload["favorites"]] == [str(favorite_meme.id)]
+    assert [meme["id"] for meme in payload["pinned_memes"]] == [str(pinned_meme.id)]
+    assert payload["favorites"][0]["viewer_has_favorited"] is True
+    assert payload["favorites"][0]["viewer_has_saved"] is False
+    assert payload["pinned_memes"][0]["viewer_has_pinned"] is True
+    assert payload["active_save_collection"]["id"] == str(custom.id)
+    assert [collection["title"] for collection in payload["collections"]] == ["Favorites", "API Saves"]
 
 
 async def test_library_routes_reject_private_memes_not_visible_to_user(

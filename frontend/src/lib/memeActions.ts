@@ -38,7 +38,7 @@ export function actionFailureMessage(action: MemeActionKind, error: unknown): st
   const detail = readMessage(error);
 
   if ((action === 'pin' || action === 'unpin') && (status === 401 || status === 403)) {
-    return 'Pinning requires a full MemeXpert account. Link or sign in, then try again.';
+    return 'Pinning requires a connected MemeXpert profile. Connect Telegram, then try again.';
   }
 
   if (action === 'save' || action === 'unsave') {

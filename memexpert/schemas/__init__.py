@@ -21,6 +21,8 @@ from memexpert.schemas.collection import (
     CollectionMemberRead,
     CollectionMemeRead,
     CollectionRead,
+    CollectionSummaryRead,
+    MemeLibraryRead,
     PinnedMemeRead,
 )
 from memexpert.schemas.content_pipeline import (
@@ -62,6 +64,7 @@ __all__ = [
     "CollectionMemeRead",
     "CollectionMemberRead",
     "CollectionRead",
+    "CollectionSummaryRead",
     "ContentPipelineDispatchEvent",
     "ContentPipelineErrorCode",
     "ContentPipelineErrorResponse",
@@ -80,6 +83,7 @@ __all__ = [
     "GuestBootstrapRequest",
     "InlineUsageEventRead",
     "LoginEventRead",
+    "MemeLibraryRead",
     "PinnedMemeRead",
     "UserRead",
 ]
