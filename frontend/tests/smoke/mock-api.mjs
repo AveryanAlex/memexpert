@@ -1,0 +1,162 @@
+import { createServer } from 'node:http';
+
+const port = Number(process.env.PORT ?? 8787);
+
+const meme = {
+  id: 'smoke-meme-1',
+  media_type: 'image',
+  language: 'en',
+  is_nsfw: false,
+  popularity_score: 42.5,
+  like_count: 7,
+  tags: ['cat', 'reaction', 'smoke'],
+  primary_file: {
+    id: 'smoke-file-1',
+    mime_type: 'image/svg+xml',
+    width: 640,
+    height: 360,
+    file_size_bytes: 512,
+    blur_hash: null,
+    quality_score: 0.99,
+    render: {
+      thumbnail_url: `http://127.0.0.1:${port}/media/smoke-cat.svg`,
+      preview_url: `http://127.0.0.1:${port}/media/smoke-cat.svg`,
+      display_url: `http://127.0.0.1:${port}/media/smoke-cat.svg`,
+      original_url: `http://127.0.0.1:${port}/media/smoke-cat.svg`,
+      download_url: `http://127.0.0.1:${port}/media/smoke-cat.svg`,
+      web_video_url: null,
+      width: 640,
+      height: 360,
+      blur_hash: null
+    },
+    render_url: `http://127.0.0.1:${port}/media/smoke-cat.svg`,
+    download_url: `http://127.0.0.1:${port}/media/smoke-cat.svg`
+  },
+  caption: 'Smoke test cat reaction',
+  seo_page_slug: 'smoke-test-cat-reaction',
+  created_at: '2026-01-01T00:00:00Z',
+  updated_at: '2026-01-01T00:00:00Z',
+  render_url: `http://127.0.0.1:${port}/media/smoke-cat.svg`,
+  download_url: `http://127.0.0.1:${port}/media/smoke-cat.svg`,
+  viewer_has_favorited: false,
+  viewer_has_saved: false,
+  viewer_has_pinned: false
+};
+
+const detail = {
+  ...meme,
+  ocr_text: 'cat says ship it',
+  seo_title: 'Smoke test cat reaction',
+  seo_description: 'A deterministic smoke-test meme served by the local mocked backend.',
+  seo_alt_text: 'A cat reaction smoke test graphic',
+  seo_body_text: 'Used by Playwright to verify search, detail, media, and action visibility.',
+  seo_model_id: null,
+  seo_prompt_version: null,
+  seo_generated_at: null,
+  files: [meme.primary_file]
+};
+
+const trend = {
+  recent: { views: 120, sends: 8, likes: 7, saves: 4, downloads: 3 },
+  previous: { views: 90, sends: 5, likes: 4, saves: 2, downloads: 1 },
+  latest_snapshot_at: '2026-01-01T00:00:00Z',
+  latest_source_views: 120,
+  latest_source_reactions: 7,
+  latest_source_reposts: 8,
+  latest_platform_views: 120,
+  latest_platform_sends: 8,
+  latest_platform_saves: 4,
+  latest_platform_likes: 7,
+  latest_popularity_score: 42.5,
+  engagement_24h: 22,
+  trending_score: 42.5,
+  refreshed_at: '2026-01-01T00:00:00Z'
+};
+
+const server = createServer((request, response) => {
+  const url = new URL(request.url ?? '/', `http://${request.headers.host ?? `127.0.0.1:${port}`}`);
+
+  if (url.pathname === '/health') {
+    sendJson(response, 200, { ok: true });
+    return;
+  }
+
+  if (url.pathname === '/media/smoke-cat.svg') {
+    response.writeHead(200, {
+      'content-type': 'image/svg+xml',
+      'cache-control': 'no-store'
+    });
+    response.end(svgImage());
+    return;
+  }
+
+  if (url.pathname === '/api/v1/auth/session') {
+    sendJson(response, 401, { detail: 'Smoke test runs as a guest browser.' });
+    return;
+  }
+
+  if (url.pathname === '/api/v1/memes/search') {
+    sendJson(response, 200, {
+      items: [{ meme }],
+      limit: Number(url.searchParams.get('limit') ?? 12),
+      offset: Number(url.searchParams.get('offset') ?? 0),
+      total: 1,
+      has_more: false
+    });
+    return;
+  }
+
+  if (url.pathname === '/api/v1/memes/browse') {
+    sendJson(response, 200, {
+      items: [{ meme }],
+      limit: Number(url.searchParams.get('limit') ?? 12),
+      offset: Number(url.searchParams.get('offset') ?? 0),
+      total: 1,
+      has_more: false
+    });
+    return;
+  }
+
+  if (url.pathname === '/api/v1/memes/slug/smoke-test-cat-reaction') {
+    sendJson(response, 200, detail);
+    return;
+  }
+
+  if (url.pathname === '/api/v1/memes/smoke-meme-1/popularity') {
+    sendJson(response, 200, {
+      meme_id: 'smoke-meme-1',
+      trend,
+      sparkline: [
+        { captured_at: '2026-01-01T00:00:00Z', source_views: 90, source_reactions: 4, source_reposts: 5, platform_views: 90, platform_sends: 5, platform_saves: 2, platform_likes: 4, popularity_score: 30 },
+        { captured_at: '2026-01-01T01:00:00Z', source_views: 120, source_reactions: 7, source_reposts: 8, platform_views: 120, platform_sends: 8, platform_saves: 4, platform_likes: 7, popularity_score: 42.5 }
+      ]
+    });
+    return;
+  }
+
+  sendJson(response, 404, { detail: `Unhandled smoke API route: ${url.pathname}` });
+});
+
+server.listen(port, '127.0.0.1', () => {
+  process.stdout.write(`Smoke API listening on http://127.0.0.1:${port}\n`);
+});
+
+function sendJson(response, status, payload) {
+  response.writeHead(status, {
+    'content-type': 'application/json',
+    'cache-control': 'no-store'
+  });
+  response.end(JSON.stringify(payload));
+}
+
+function svgImage() {
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360" viewBox="0 0 640 360" role="img" aria-label="Smoke test cat reaction">
+  <rect width="640" height="360" fill="#111827"/>
+  <circle cx="220" cy="165" r="82" fill="#facc15"/>
+  <circle cx="190" cy="145" r="12" fill="#111827"/>
+  <circle cx="250" cy="145" r="12" fill="#111827"/>
+  <path d="M180 220 Q220 250 260 220" fill="none" stroke="#111827" stroke-width="14" stroke-linecap="round"/>
+  <text x="340" y="150" fill="#f9fafb" font-family="Arial, sans-serif" font-size="34" font-weight="700">ship it</text>
+  <text x="340" y="200" fill="#93c5fd" font-family="Arial, sans-serif" font-size="24">smoke media</text>
+</svg>`;
+}
