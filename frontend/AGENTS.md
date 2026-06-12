@@ -9,6 +9,7 @@ This SvelteKit app uses Svelte 5, pnpm 10.28.0, Tailwind CSS v4 through `@tailwi
 - Put reusable visual primitives in `src/lib/ui`. These components should be small, prop-forwarding, and independent of MemeExpert domain data.
 - Put composed product UI in `src/lib/features/<area>`, for example `memes`, `trends`, `collections`, `profile`, and `admin`.
 - Use Bits UI through local wrappers for repeated primitives. Dropdown menu wrappers live in `src/lib/ui/dropdown-menu` and own the Portal/Content styling.
+- Use `src/lib/ui/chart` for LayerChart-backed analytics charts. Product components should import `ChartFrame` and the `LayerChart*` re-exports from this wrapper instead of importing `layerchart` directly.
 - Dialog, Popover, and Tooltip wrappers should stay thin, forward useful props, and support `bind:open` where the underlying primitive does.
 - Keep `Tooltip.Provider` near root layout. Tooltips are supplemental desktop help only; essential content belongs in Popover, Dialog, or visible text.
 - Preserve server actions and route URLs. Refactors should thin route markup without changing form names, actions, query params, or data contracts.
