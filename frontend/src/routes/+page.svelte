@@ -1,8 +1,8 @@
 <script lang="ts">
   import MemeCard from '$lib/components/MemeCard.svelte';
-  import type { PageData } from './$types';
+  import type { ActionData, PageData } from './$types';
 
-  let { data }: { data: PageData } = $props();
+  let { data, form }: { data: PageData; form: ActionData } = $props();
 
   const resultStart = $derived(data.page.total === 0 ? 0 : data.offset + 1);
   const resultEnd = $derived(Math.min(data.offset + data.page.items.length, data.page.total));
@@ -47,6 +47,52 @@
 {#if data.errorMessage}
   <p class="notice" role="status">{data.errorMessage}</p>
 {/if}
+
+<section class="collection-home-panel" aria-labelledby="collections-title">
+  <div class="collection-home-copy">
+    <h2 id="collections-title">Your collections</h2>
+    <p class="muted">Use Favorites for quick saves, or create custom collections from a full account.</p>
+  </div>
+
+  {#if data.collections}
+    <div class="collection-link-row" aria-label="Collection list">
+      {#each data.collections.collections as item (item.collection.id)}
+        <a class={item.active_save_collection_id === item.collection.id ? 'collection-chip active' : 'collection-chip'} href={`/collection/${item.collection.id}`}>
+          <span>{item.collection.title}</span>
+          <small>{item.collection.kind}{item.active_save_collection_id === item.collection.id ? ' · active' : ''}</small>
+        </a>
+      {/each}
+    </div>
+  {:else}
+    <p class="muted">Collections are unavailable until your session is ready.</p>
+  {/if}
+
+  {#if form?.collectionError}
+    <p class="notice" role="alert">{form.collectionError}</p>
+  {:else if form?.successMessage}
+    <p class="notice" role="status">
+      {form.successMessage}
+      {#if form.collectionCreatedId}
+        <a href={`/collection/${form.collectionCreatedId}`}>Open it</a>
+      {/if}
+    </p>
+  {/if}
+
+  {#if data.session?.user.account_type === 'full'}
+    <form class="inline-form collection-create-form" method="POST" action="?/createCollection">
+      <input name="title" placeholder="New collection title" maxlength="120" required aria-label="New collection title" />
+      <input name="description" placeholder="Description" aria-label="Collection description" />
+      <select name="visibility" aria-label="Collection visibility">
+        <option value="private">Private</option>
+        <option value="unlisted">Unlisted</option>
+        <option value="public">Public</option>
+      </select>
+      <button type="submit">Create collection</button>
+    </form>
+  {:else}
+    <p class="muted">Connect Telegram to create custom collections and collaborate.</p>
+  {/if}
+</section>
 
 <div class="status-row">
   <p class="muted">

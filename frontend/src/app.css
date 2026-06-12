@@ -165,6 +165,7 @@ button {
 .admin-row button,
 .moderation-form button,
 .planned-actions button,
+.collection-actions-card button,
 .template-form button {
   border: 0;
   border-radius: 18px;
@@ -458,7 +459,10 @@ button {
 .detail-card,
 .telegram-card,
 .admin-panel,
-.library-panel {
+.library-panel,
+.collection-home-panel,
+.collection-actions-card,
+.admin-panel {
   border: 1px solid #dfd4c4;
   border-radius: 28px;
   background: #fffaf1;
@@ -604,6 +608,7 @@ button {
 .inline-form select,
 .moderation-form input,
 .moderation-form select,
+.copy-field,
 .template-form input {
   min-width: 0;
   border: 1px solid #dfd4c4;
@@ -625,6 +630,112 @@ button {
   display: grid;
   gap: 6px;
   color: #594e42;
+}
+
+.collection-home-panel {
+  display: grid;
+  gap: 16px;
+  margin: 22px 0;
+}
+
+.collection-home-copy h2,
+.collection-actions-card p,
+.collection-home-copy p {
+  margin: 0;
+}
+
+.collection-link-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.collection-chip {
+  display: grid;
+  gap: 3px;
+  min-width: 150px;
+  border: 1px solid #dfd4c4;
+  border-radius: 18px;
+  background: #fffaf1;
+  padding: 12px 14px;
+  text-decoration: none;
+}
+
+.collection-chip.active {
+  border-color: #17212f;
+  box-shadow: inset 0 0 0 1px #17212f;
+}
+
+.collection-chip span {
+  font-weight: 900;
+}
+
+.collection-chip small {
+  color: #6d6253;
+}
+
+.collection-create-form {
+  align-items: stretch;
+}
+
+.collection-hero {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(230px, 0.35fr);
+  gap: 18px;
+  align-items: start;
+  margin-bottom: 20px;
+}
+
+.collection-hero h1 {
+  margin: 8px 0 12px;
+  font-size: clamp(2.4rem, 8vw, 5.2rem);
+  line-height: 0.9;
+  letter-spacing: -0.075em;
+}
+
+.eyebrow-link {
+  color: #6d6253;
+  font-size: 0.86rem;
+  font-weight: 900;
+  text-decoration-thickness: 2px;
+  text-underline-offset: 3px;
+}
+
+.collection-meta {
+  margin-top: 14px;
+}
+
+.collection-actions-card {
+  display: grid;
+  gap: 12px;
+}
+
+.collection-panels {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+  margin: 18px 0;
+}
+
+.danger-panel {
+  border-color: #dfb5a5;
+  background: #fff3ed;
+}
+
+.collection-card-wrap {
+  position: relative;
+}
+
+.remove-save-form {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  z-index: 2;
+}
+
+.copy-field {
+  width: 100%;
+  margin-top: 8px;
 }
 
 .checkbox-row {
@@ -861,6 +972,8 @@ button {
   .hero,
   .profile-hero,
   .detail-card,
+  .collection-hero,
+  .collection-panels,
   .telegram-panel,
   .admin-grid,
   .admin-row,

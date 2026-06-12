@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Final
 
 from sqlalchemy import and_, case, delete, func, or_, select, update
@@ -192,6 +192,134 @@ class CollectionService:
         if persisted_collection is None:  # pragma: no cover - defensive branch
             raise CollectionServiceError("Created collection could not be reloaded.")
         return CollectionRead.model_validate(persisted_collection)
+
+    async def list_collections_for_user(self, *, user_id: object) -> list[CollectionRead]:
+        """Return collections the user belongs to, newest-updated first, with Favorites ensured."""
+
+        user = await self._get_user_model(user_id)
+        if user is None:
+            raise UserNotFoundError(f"User {user_id} does not exist.")
+
+        _ = await self.ensure_favorites_collection(user.id)
+        result = await self._session.execute(
+            select(Collection)
+            .options(selectinload(Collection.memberships), selectinload(Collection.invites))
+            .join(CollectionMember, CollectionMember.collection_id == Collection.id)
+            .where(CollectionMember.user_id == user.id)
+            .order_by(Collection.kind.asc(), Collection.updated_at.desc(), Collection.title.asc())
+        )
+        return [CollectionRead.model_validate(collection) for collection in result.scalars().unique()]
+
+    async def get_collection_for_user(self, *, collection_id: object, user_id: object) -> CollectionRead:
+        """Return a collection only when the user has member-level read access."""
+
+        user, collection = await self._get_collection_for_read(collection_id=collection_id, user_id=user_id)
+        _ = user
+        return CollectionRead.model_validate(collection)
+
+    async def list_collection_memes(self, *, collection_id: object, user_id: object) -> list[CollectionMemeRead]:
+        """Return saved meme rows for a collection the user can read."""
+
+        _user, collection = await self._get_collection_for_read(collection_id=collection_id, user_id=user_id)
+        result = await self._session.execute(
+            select(CollectionMeme)
+            .where(CollectionMeme.collection_id == collection.id)
+            .order_by(CollectionMeme.added_at.desc(), CollectionMeme.meme_id.asc())
+        )
+        return [CollectionMemeRead.model_validate(row) for row in result.scalars()]
+
+    async def update_custom_collection(
+        self,
+        *,
+        collection_id: object,
+        user_id: object,
+        title: str,
+        description: str | None = None,
+        visibility: CollectionVisibility | str = CollectionVisibility.PRIVATE,
+    ) -> CollectionRead:
+        """Update owner-managed metadata for a custom collection."""
+
+        user, collection = await self._get_collection_for_read(collection_id=collection_id, user_id=user_id)
+        self._ensure_owner_can_manage_custom_collection(user, collection)
+        collection.title = _normalize_collection_title(title)
+        collection.description = _normalize_optional_text(description)
+        collection.visibility = _resolve_visibility(visibility)
+
+        try:
+            await self._session.commit()
+        except IntegrityError as exc:
+            await self._session.rollback()
+            raise CollectionServiceError("Failed to update the collection.") from exc
+
+        persisted = await self._get_collection_model(collection.id)
+        if persisted is None:  # pragma: no cover - defensive branch
+            raise CollectionServiceError("Updated collection could not be reloaded.")
+        return CollectionRead.model_validate(persisted)
+
+    async def delete_custom_collection(self, *, collection_id: object, user_id: object) -> bool:
+        """Delete an owner-managed custom collection and clear active-save pointers."""
+
+        user, collection = await self._get_collection_for_read(collection_id=collection_id, user_id=user_id)
+        self._ensure_owner_can_manage_custom_collection(user, collection)
+        await self._session.execute(
+            update(User).where(User.active_save_collection_id == collection.id).values(active_save_collection_id=None)
+        )
+        await self._session.delete(collection)
+
+        try:
+            await self._session.commit()
+        except IntegrityError as exc:
+            await self._session.rollback()
+            raise CollectionServiceError("Failed to delete the collection.") from exc
+        return True
+
+    async def save_meme_to_collection(
+        self,
+        *,
+        collection_id: object,
+        user_id: object,
+        meme_id: object,
+    ) -> CollectionMemeRead:
+        """Save a visible meme into a specific writable collection."""
+
+        user, collection = await self._get_collection_for_read(collection_id=collection_id, user_id=user_id)
+        self._ensure_can_write_collection(user, collection)
+        meme = await self._get_visible_meme_model(meme_id=meme_id, viewer_user_id=user.id)
+        if meme is None:
+            raise MemeNotFoundError(f"Meme {meme_id} does not exist.")
+
+        saved_meme, inserted = await self._insert_collection_meme(
+            collection_id=collection.id,
+            meme_id=meme.id,
+            added_by_user_id=user.id,
+        )
+        if inserted and collection.kind is CollectionKind.FAVORITES:
+            await self._increment_like_count(meme.id)
+
+        try:
+            await self._session.commit()
+        except IntegrityError as exc:
+            await self._session.rollback()
+            raise CollectionServiceError("Failed to save the meme to the collection.") from exc
+        return CollectionMemeRead.model_validate(saved_meme)
+
+    async def remove_meme_from_collection(self, *, collection_id: object, user_id: object, meme_id: object) -> bool:
+        """Remove a meme from a specific writable collection when present."""
+
+        user, collection = await self._get_collection_for_read(collection_id=collection_id, user_id=user_id)
+        self._ensure_can_write_collection(user, collection)
+        removed = await self._delete_collection_meme(collection_id=collection.id, meme_id=meme_id)
+        if not removed:
+            return False
+        if collection.kind is CollectionKind.FAVORITES:
+            await self._decrement_like_count(meme_id)
+
+        try:
+            await self._session.commit()
+        except IntegrityError as exc:
+            await self._session.rollback()
+            raise CollectionServiceError("Failed to remove the meme from the collection.") from exc
+        return True
 
     async def favorite_meme(self, *, user_id: object, meme_id: object) -> CollectionMemeRead:
         """Save a meme to the user's Favorites collection and count the first favorite as a like."""
@@ -508,6 +636,8 @@ class CollectionService:
         collection = await self._get_collection_model(collection_id)
         if collection is None:
             raise CollectionNotFoundError(f"Collection {collection_id} does not exist.")
+        if collection.kind is CollectionKind.FAVORITES:
+            raise InvalidCollectionInviteError("Favorites collections cannot be shared by invite.")
 
         creator: User | None = None
         if created_by_user_id is not None:
@@ -562,6 +692,51 @@ class CollectionService:
             raise CollectionServiceError("Failed to persist the collection invite.") from exc
 
         return CollectionInviteRead.model_validate(invite)
+
+    async def join_invite(self, *, token_hash: str, user_id: object) -> CollectionRead:
+        """Redeem a direct-link invite for a full account and return the joined collection."""
+
+        user = await self._get_user_model(user_id)
+        if user is None:
+            raise UserNotFoundError(f"User {user_id} does not exist.")
+        if user.account_type is AccountType.GUEST:
+            raise GuestCollectionAccessError("Guest accounts cannot join shared collections.")
+
+        invite = await self._get_invite_by_token_hash(token_hash)
+        if invite is None:
+            raise InvalidCollectionInviteError("Invite link is invalid or expired.")
+        _ensure_invite_can_be_used(invite)
+
+        collection = await self._get_collection_model(invite.collection_id)
+        if collection is None:
+            raise CollectionNotFoundError(f"Collection {invite.collection_id} does not exist.")
+        if collection.kind is CollectionKind.FAVORITES:
+            raise InvalidCollectionInviteError("Favorites collections cannot be joined by invite.")
+
+        existing_role = _membership_role_for_user(user.id, collection)
+        if existing_role is None:
+            self._session.add(
+                CollectionMember(
+                    collection_id=collection.id,
+                    user_id=user.id,
+                    role=invite.role,
+                )
+            )
+            invite.use_count += 1
+            invite.last_used_at = datetime.now(UTC)
+            if invite.max_uses is not None and invite.use_count >= invite.max_uses:
+                invite.status = CollectionInviteStatus.ACCEPTED
+
+        try:
+            await self._session.commit()
+        except IntegrityError as exc:
+            await self._session.rollback()
+            raise CollectionServiceError("Failed to join the collection invite.") from exc
+
+        persisted = await self._get_collection_model(collection.id)
+        if persisted is None:  # pragma: no cover - defensive branch
+            raise CollectionServiceError("Joined collection could not be reloaded.")
+        return CollectionRead.model_validate(persisted)
 
     async def update_active_save_collection(
         self,
@@ -676,6 +851,26 @@ class CollectionService:
     ) -> list[PublicMemeCardRead]:
         meme_search_service = MemeSearchService(self._session, media_render_service=self._media_render_service)
         return await meme_search_service.load_public_meme_cards(meme_ids, viewer_user_id=viewer_user_id)
+
+    async def _get_collection_for_read(self, *, collection_id: object, user_id: object) -> tuple[User, Collection]:
+        user = await self._get_user_model(user_id)
+        if user is None:
+            raise UserNotFoundError(f"User {user_id} does not exist.")
+
+        collection = await self._get_collection_model(collection_id)
+        if collection is None:
+            raise CollectionNotFoundError(f"Collection {collection_id} does not exist.")
+        if collection.kind is not CollectionKind.FAVORITES and user.account_type is AccountType.GUEST:
+            raise GuestCollectionAccessError("A full account is required for custom collections.")
+        if not _user_can_read_collection(user.id, collection):
+            raise CollectionNotFoundError(f"Collection {collection_id} does not exist.")
+        return user, collection
+
+    async def _get_invite_by_token_hash(self, token_hash: str) -> CollectionInvite | None:
+        result = await self._session.execute(
+            select(CollectionInvite).where(CollectionInvite.token_hash == _normalize_token_hash(token_hash))
+        )
+        return result.scalar_one_or_none()
 
     async def _get_favorites_collection_model(self, user_id: object) -> Collection | None:
         result = await self._session.execute(
@@ -797,6 +992,14 @@ class CollectionService:
                 f"User {user.id} cannot write to collection {collection.id}.",
             )
 
+    def _ensure_owner_can_manage_custom_collection(self, user: User, collection: Collection) -> None:
+        if collection.kind is not CollectionKind.CUSTOM:
+            raise CollectionWriteAccessError("Favorites collection metadata cannot be changed.")
+        if collection.owner_id != user.id:
+            raise CollectionWriteAccessError(
+                f"Only the owner can manage collection {collection.id}.",
+            )
+
     async def _get_user_model(self, user_id: object) -> User | None:
         result = await self._session.execute(select(User).where(User.id == user_id))
         return result.scalar_one_or_none()
@@ -881,6 +1084,26 @@ def _ensure_user_can_collaborate(user: User) -> None:
     )
 
 
+def _ensure_invite_can_be_used(invite: CollectionInvite) -> None:
+    if invite.channel is not CollectionInviteChannel.DIRECT_LINK:
+        raise InvalidCollectionInviteError("Invite link is invalid or expired.")
+    if invite.status is not CollectionInviteStatus.PENDING:
+        raise InvalidCollectionInviteError("Invite link is invalid or expired.")
+    if invite.revoked_at is not None:
+        raise InvalidCollectionInviteError("Invite link is invalid or expired.")
+    now = datetime.now(UTC)
+    expires_at = invite.expires_at
+    if expires_at is not None:
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=UTC)
+        if expires_at <= now:
+            invite.status = CollectionInviteStatus.EXPIRED
+            raise InvalidCollectionInviteError("Invite link is invalid or expired.")
+    if invite.max_uses is not None and invite.use_count >= invite.max_uses:
+        invite.status = CollectionInviteStatus.ACCEPTED
+        raise InvalidCollectionInviteError("Invite link is invalid or expired.")
+
+
 def _user_can_write_collection(user_id: object, collection: Collection) -> bool:
     if collection.owner_id == user_id:
         return True
@@ -888,6 +1111,19 @@ def _user_can_write_collection(user_id: object, collection: Collection) -> bool:
         membership.user_id == user_id and membership.role in WRITE_ROLES
         for membership in collection.memberships
     )
+
+
+def _user_can_read_collection(user_id: object, collection: Collection) -> bool:
+    if collection.owner_id == user_id:
+        return True
+    return _membership_role_for_user(user_id, collection) is not None
+
+
+def _membership_role_for_user(user_id: object, collection: Collection) -> CollectionMembershipRole | None:
+    for membership in collection.memberships:
+        if membership.user_id == user_id:
+            return membership.role
+    return None
 
 
 __all__ = [

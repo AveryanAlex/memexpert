@@ -7,6 +7,9 @@ import type {
   AdminSessionRead,
   AdminSourceChannelRead,
   ChannelSuggestionRead,
+  CollectionInviteLinkRead,
+  CollectionMembershipRole,
+  CollectionVisibility,
   CurrentSessionRead,
   MemeLibraryRead,
   PublicMemeDetailRead,
@@ -17,7 +20,10 @@ import type {
   PublicTrendSummaryRead,
   MemeReportRead,
   ModerationReason,
-  TelegramLinkStartRead
+  TelegramLinkStartRead,
+  WebCollectionDetailRead,
+  WebCollectionListRead,
+  WebCollectionSummaryRead
 } from './types';
 
 export const DEFAULT_PAGE_SIZE = 12;
@@ -70,6 +76,27 @@ export interface RemoveActionResponse {
 
 interface JsonMutationRequest extends CatalogRequest {
   body?: unknown;
+}
+
+export interface DeleteCollectionResponse {
+  deleted?: boolean;
+}
+
+export interface SaveCollectionMemeResponse {
+  saved?: boolean;
+}
+
+export interface CollectionFormPayload {
+  title: string;
+  description?: string | null;
+  visibility?: CollectionVisibility;
+}
+
+export interface CollectionInvitePayload {
+  role?: CollectionMembershipRole;
+  label?: string | null;
+  max_uses?: number | null;
+  expires_in_hours?: number | null;
 }
 
 interface LandingRequest extends CatalogRequest {
@@ -169,6 +196,59 @@ export async function fetchMemePopularitySummary(request: DetailRequest): Promis
   );
 }
 
+export async function fetchCollections(request: CatalogRequest): Promise<WebCollectionListRead> {
+  return apiGet<WebCollectionListRead>('/api/v1/collections', new URLSearchParams(), request);
+}
+
+export async function fetchCollectionDetail(request: CatalogRequest & { collectionId: string }): Promise<WebCollectionDetailRead> {
+  return apiGet<WebCollectionDetailRead>(`/api/v1/collections/${encodeURIComponent(request.collectionId)}`, new URLSearchParams(), request);
+}
+
+export async function createCollection(request: CatalogRequest & { body: CollectionFormPayload }): Promise<WebCollectionSummaryRead> {
+  return apiWrite<WebCollectionSummaryRead>('/api/v1/collections', 'POST', request);
+}
+
+export async function updateCollection(request: CatalogRequest & { collectionId: string; body: CollectionFormPayload }): Promise<WebCollectionSummaryRead> {
+  return apiWrite<WebCollectionSummaryRead>(`/api/v1/collections/${encodeURIComponent(request.collectionId)}`, 'PATCH', request);
+}
+
+export async function deleteCollection(request: CatalogRequest & { collectionId: string }): Promise<DeleteCollectionResponse> {
+  return apiWrite<DeleteCollectionResponse>(`/api/v1/collections/${encodeURIComponent(request.collectionId)}`, 'DELETE', request);
+}
+
+export async function setActiveSaveCollection(request: CatalogRequest & { collectionId: string }): Promise<{ active_save_collection_id: string | null }> {
+  return apiWrite<{ active_save_collection_id: string | null }>(
+    `/api/v1/collections/${encodeURIComponent(request.collectionId)}/active-save`,
+    'PUT',
+    request
+  );
+}
+
+export async function saveMemeToCollection(request: CatalogRequest & { collectionId: string; memeId: string }): Promise<SaveCollectionMemeResponse> {
+  return apiWrite<SaveCollectionMemeResponse>(
+    `/api/v1/collections/${encodeURIComponent(request.collectionId)}/memes/${encodeURIComponent(request.memeId)}`,
+    'POST',
+    request
+  );
+}
+
+export async function removeMemeFromCollection(request: CatalogRequest & { collectionId: string; memeId: string }): Promise<RemoveActionResponse> {
+  return apiWrite<RemoveActionResponse>(
+    `/api/v1/collections/${encodeURIComponent(request.collectionId)}/memes/${encodeURIComponent(request.memeId)}`,
+    'DELETE',
+    request
+  );
+}
+
+export async function createCollectionInvite(
+  request: CatalogRequest & { collectionId: string; body: CollectionInvitePayload }
+): Promise<CollectionInviteLinkRead> {
+  return apiWrite<CollectionInviteLinkRead>(`/api/v1/collections/${encodeURIComponent(request.collectionId)}/invites`, 'POST', request);
+}
+
+export async function joinCollectionInvite(request: CatalogRequest & { token: string }): Promise<WebCollectionSummaryRead> {
+  return apiWrite<WebCollectionSummaryRead>(`/api/v1/collections/invites/${encodeURIComponent(request.token)}/join`, 'POST', request);
+}
 export async function favoriteMeme(request: MemeActionRequest): Promise<unknown> {
   return apiMutation(`/api/v1/memes/${encodeURIComponent(request.memeId)}/favorite`, 'POST', request);
 }
@@ -358,7 +438,7 @@ async function apiMutation<T>(path: string, method: 'DELETE' | 'POST', request: 
   return payload as T;
 }
 
-async function apiWrite<T>(path: string, method: 'PATCH' | 'POST' | 'PUT', request: JsonMutationRequest): Promise<T> {
+async function apiWrite<T>(path: string, method: 'DELETE' | 'PATCH' | 'POST' | 'PUT', request: JsonMutationRequest): Promise<T> {
   const url = new URL(path, request.baseUrl);
   const headers = new Headers({ accept: 'application/json', 'x-requested-with': 'XMLHttpRequest' });
   if (request.body !== undefined) {

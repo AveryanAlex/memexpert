@@ -106,12 +106,67 @@ class MemeLibraryRead(ORMSchema):
     active_save_collection: CollectionSummaryRead | None = None
 
 
+class CollectionCapabilitiesRead(ORMSchema):
+    """Viewer-specific collection actions exposed to web clients."""
+
+    can_view: bool
+    can_add_memes: bool
+    can_remove_memes: bool
+    can_rename: bool
+    can_delete: bool
+    can_create_invites: bool
+    can_set_active_save: bool
+
+
+class WebCollectionSummaryRead(ORMSchema):
+    """Collection metadata plus the caller's role/capabilities."""
+
+    collection: CollectionRead
+    viewer_role: CollectionMembershipRole
+    capabilities: CollectionCapabilitiesRead
+    active_save_collection_id: uuid.UUID | None
+
+
+class CollectionSavedMemeRead(ORMSchema):
+    """A saved meme card with collection-save metadata."""
+
+    save: CollectionMemeRead
+    meme: PublicMemeCardRead
+
+
+class CollectionDetailRead(WebCollectionSummaryRead):
+    """Collection detail payload for the web collection page."""
+
+    saved_memes: list[CollectionSavedMemeRead] = Field(default_factory=list)
+
+
+class CollectionListRead(ORMSchema):
+    """Collection list payload including active-save state."""
+
+    collections: list[WebCollectionSummaryRead] = Field(default_factory=list)
+    active_save_collection_id: uuid.UUID | None
+
+
+class CollectionInviteLinkRead(ORMSchema):
+    """Direct-link invite response including the one-time plaintext token."""
+
+    invite: CollectionInviteRead
+    token: str
+    join_path: str
+
+
 __all__ = [
     "CollectionInviteRead",
+    "CollectionCapabilitiesRead",
+    "CollectionDetailRead",
+    "CollectionInviteLinkRead",
+    "CollectionListRead",
     "CollectionMemeRead",
     "CollectionMemberRead",
     "CollectionRead",
     "CollectionSummaryRead",
     "MemeLibraryRead",
+    "CollectionSavedMemeRead",
     "PinnedMemeRead",
+    "WebCollectionSummaryRead",
 ]

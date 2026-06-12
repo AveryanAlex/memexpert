@@ -1,6 +1,11 @@
 export type ContentKind = 'audio' | 'gif' | 'image' | 'link' | 'text' | 'video';
 export type ContentLanguage = 'en' | 'mixed' | 'none' | 'ru';
 export type AccountType = 'full' | 'guest';
+export type CollectionKind = 'custom' | 'favorites';
+export type CollectionVisibility = 'private' | 'public' | 'unlisted';
+export type CollectionMembershipRole = 'editor' | 'owner' | 'viewer';
+export type CollectionInviteChannel = 'direct_link' | 'email' | 'telegram';
+export type CollectionInviteStatus = 'accepted' | 'expired' | 'pending' | 'revoked';
 
 export interface UserRead {
   id: string;
@@ -124,10 +129,6 @@ export interface PublicMemeSearchPageRead {
   has_more: boolean;
 }
 
-export type CollectionKind = 'custom' | 'favorites';
-export type CollectionVisibility = 'private' | 'public' | 'unlisted';
-export type CollectionMembershipRole = 'editor' | 'owner' | 'viewer';
-
 export interface CollectionSummaryRead {
   id: string;
   owner_id: string;
@@ -138,6 +139,44 @@ export interface CollectionSummaryRead {
   role: CollectionMembershipRole;
   can_write: boolean;
   saved_meme_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CollectionMemberRead {
+  collection_id: string;
+  user_id: string;
+  role: CollectionMembershipRole;
+  joined_at: string;
+}
+
+export interface CollectionInviteRead {
+  id: string;
+  collection_id: string;
+  created_by_user_id: string | null;
+  role: CollectionMembershipRole;
+  channel: CollectionInviteChannel;
+  label: string | null;
+  status: CollectionInviteStatus;
+  max_uses: number | null;
+  use_count: number;
+  expires_at: string | null;
+  last_used_at: string | null;
+  revoked_at: string | null;
+  recipient_email: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CollectionRead {
+  id: string;
+  owner_id: string;
+  title: string;
+  description: string | null;
+  kind: CollectionKind;
+  visibility: CollectionVisibility;
+  memberships: CollectionMemberRead[];
+  invites: CollectionInviteRead[];
   created_at: string;
   updated_at: string;
 }
@@ -212,6 +251,50 @@ export interface PublicTrendSummaryRead {
   description: string | null;
   meme_count: number;
   trend: PublicTrendMetricsRead;
+}
+
+export interface CollectionCapabilitiesRead {
+  can_view: boolean;
+  can_add_memes: boolean;
+  can_remove_memes: boolean;
+  can_rename: boolean;
+  can_delete: boolean;
+  can_create_invites: boolean;
+  can_set_active_save: boolean;
+}
+
+export interface WebCollectionSummaryRead {
+  collection: CollectionRead;
+  viewer_role: CollectionMembershipRole;
+  capabilities: CollectionCapabilitiesRead;
+  active_save_collection_id: string | null;
+}
+
+export interface CollectionMemeRead {
+  collection_id: string;
+  meme_id: string;
+  added_by_user_id: string | null;
+  added_at: string;
+}
+
+export interface CollectionSavedMemeRead {
+  save: CollectionMemeRead;
+  meme: PublicMemeCardRead;
+}
+
+export interface WebCollectionDetailRead extends WebCollectionSummaryRead {
+  saved_memes: CollectionSavedMemeRead[];
+}
+
+export interface WebCollectionListRead {
+  collections: WebCollectionSummaryRead[];
+  active_save_collection_id: string | null;
+}
+
+export interface CollectionInviteLinkRead {
+  invite: CollectionInviteRead;
+  token: string;
+  join_path: string;
 }
 
 export interface PublicMemeLandingRead {

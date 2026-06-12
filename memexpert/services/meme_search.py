@@ -299,6 +299,34 @@ class MemeSearchService:
             viewer_action_state=action_state,
         )
 
+    async def get_public_meme_cards_by_ids(
+        self,
+        meme_ids: tuple[uuid.UUID, ...],
+        *,
+        viewer_user_id: uuid.UUID | None = None,
+        include_nsfw: bool = False,
+    ) -> list[PublicMemeCardRead]:
+        """Return visible public card DTOs in the caller-supplied order."""
+
+        if not meme_ids:
+            return []
+
+        stmt = _visible_meme_stmt(viewer_user_id).where(Meme.id.in_(meme_ids))
+        if not include_nsfw:
+            stmt = stmt.where(Meme.is_nsfw.is_(False))
+        result = await self._session.execute(stmt)
+        memes_by_id = {meme.id: meme for meme in result.scalars().unique()}
+        action_state = await self._load_viewer_action_state(meme_ids, viewer_user_id=viewer_user_id)
+        return [
+            _to_public_card_read(
+                meme,
+                media_render_service=self._media_render_service,
+                viewer_action_state=action_state,
+            )
+            for meme_id in meme_ids
+            if (meme := memes_by_id.get(meme_id)) is not None
+        ]
+
     async def get_slug_redirect(
         self,
         meme_id: uuid.UUID,
