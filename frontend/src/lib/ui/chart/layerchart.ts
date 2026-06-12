@@ -6,6 +6,7 @@ export {
   Line as LayerChartLine,
   Point as LayerChartPoint,
   Points as LayerChartPoints,
+  Spline as LayerChartSpline,
   Svg as LayerChartSvg,
   Tooltip as LayerChartTooltip
 } from 'layerchart';

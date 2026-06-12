@@ -2,17 +2,17 @@
 
 ## Decision
 
-Use `layerchart` for non-trivial analytics/trends visualizations in the SvelteKit frontend, pinned initially to `layerchart@1.0.13`.
+Use `layerchart` for analytics/trends visualizations in the SvelteKit frontend, pinned initially to `layerchart@1.0.13`.
 
-Keep tiny, decorative sparklines as bespoke SVG when they do not need axes, legends, tooltips, or user interaction. Migrate comparison and future analytics charts to a shared chart component layer built on LayerChart.
+Route chart rendering through a shared chart component layer built on LayerChart. Very small chart components can stay compact and non-interactive, but should still use the wrapper when they plot API data.
 
 ## Current frontend audit
 
-Current bespoke SVG/chart-like components found under `frontend/src`:
+Current chart-like components found under `frontend/src`:
 
 | Component | Current usage | Current behavior | Recommendation |
 | --- | --- | --- | --- |
-| `src/lib/features/trends/TrendSparkline.svelte` | `src/routes/memes/[id]/+page.svelte` public popularity card | 26-line inline SVG polyline over `PublicMemePopularityPointRead.popularity_score`; no axis, legend, tooltip, or point labels; simple `role="img"` label | Keep custom for now. It is a compact decorative trend glyph and a library would add churn. Improve later only if product asks for hover values, multiple metrics, or expanded chart mode. |
+| `src/lib/features/trends/TrendSparkline.svelte` | `src/routes/memes/[id]/+page.svelte` public popularity card | LayerChart-backed compact sparkline over `PublicMemePopularityPointRead.popularity_score`; no axis, legend, tooltip, or point labels; screen-reader chart label and route-level empty state copy | Keep on the shared chart wrapper. It remains compact and non-interactive, but plotting/scales are handled by LayerChart instead of bespoke SVG coordinate math. |
 | `src/lib/features/trends/TrendComparisonChart.svelte` | `src/routes/trends/compare/+page.svelte` comparison card | Hand-computed SVG axes, paths, points, and legend for multiple series; only `<title>` point labels; no real axis ticks, responsive tooltip, scale formatting, or accessible data summary | Migrate to LayerChart first. This is already doing chart-library work by hand and planned comparison UI needs axes, legends, tooltips, responsive layout, and eventually screenshots/share polish. |
 
 No other `<svg>`, `<canvas>`, `<path>`, `<polyline>`, `<line>`, or `<circle>` chart-like Svelte components were found in `frontend/src`.
@@ -69,7 +69,7 @@ LayerChart gives us reusable primitives for the solved parts:
    - render line/point series with real axes;
    - use a visible legend and chart tooltip;
    - keep the existing data table as the exact-value accessible fallback.
-4. Keep `TrendSparkline.svelte` custom unless it evolves into an expandable chart with interactions or multiple metrics.
+4. Keep `TrendSparkline.svelte` on the shared wrapper; only add interactions or an expanded chart mode if product needs hover values, multiple metrics, or axes.
 5. Add future LayerChart-based components for tag/template time-series and per-meme expanded analytics once backend data exists.
 6. Run `pnpm check`, `pnpm test`, and `pnpm build` from `frontend` after the dependency and first migration.
 
@@ -84,7 +84,7 @@ LayerChart gives us reusable primitives for the solved parts:
 - warm-token Tailwind hooks using `paper`, `soft`, `line`, `ink`, and `muted`, with `class`, `captionClass`, and `plotClass` overrides for composed chart components;
 - visible or screen-reader-only caption text through `label`, `description`, and `showCaption`.
 
-Keep exact values in adjacent tables or summaries when a visual chart is not sufficient for accessibility. Keep decorative tiny sparklines bespoke until they need axes, legends, tooltips, or multi-series behavior.
+Keep exact values in adjacent tables or summaries when a visual chart is not sufficient for accessibility. Compact sparklines should use the shared wrapper when they render API data, while staying visually minimal unless they need axes, legends, tooltips, or multi-series behavior.
 
 ## Backend/API follow-up scope discovered
 
