@@ -28,10 +28,11 @@
     meme: PublicMemeCardRead | PublicMemeDetailRead;
     href?: string;
     showPrimary?: boolean;
+    showSharing?: boolean;
     compact?: boolean;
   }
 
-  let { meme, href = memeHref(meme), showPrimary = false, compact = false }: Props = $props();
+  let { meme, href = memeHref(meme), showPrimary = false, showSharing = false, compact = false }: Props = $props();
 
   let favorited = $state(false);
   let saved = $state(false);
@@ -58,12 +59,18 @@
   const canDownload = $derived(Boolean(downloadUrl));
   const actionRequest = $derived({ fetch, memeId: meme.id });
 
+  syncStateFromMeme();
+
   $effect(() => {
+    syncStateFromMeme();
+  });
+
+  function syncStateFromMeme() {
     favorited = meme.viewer_has_favorited;
     saved = meme.viewer_has_saved;
     pinned = meme.viewer_has_pinned;
     likeCount = meme.like_count;
-  });
+  }
 
   async function toggleFavorite() {
     const next = !favorited;
@@ -209,6 +216,27 @@
       <Button variant="secondary" type="button" disabled={pending !== null} onclick={togglePin}>
         <Pin class="size-4" aria-hidden="true" />
         {pinned ? 'Unpin' : 'Pin'}
+      </Button>
+    </div>
+  {/if}
+
+  {#if showSharing}
+    <div class="flex flex-wrap gap-2" aria-label="Share and safety actions">
+      <Button variant="secondary" type="button" disabled={pending !== null} onclick={shareTelegram}>
+        <Send class="size-4" aria-hidden="true" />
+        Share to Telegram
+      </Button>
+      <Button variant="secondary" type="button" disabled={pending !== null} onclick={copyLink}>
+        <Copy class="size-4" aria-hidden="true" />
+        Copy link
+      </Button>
+      <Button variant="secondary" type="button" disabled={pending !== null || !canDownload} onclick={downloadMeme}>
+        <Download class="size-4" aria-hidden="true" />
+        {canDownload ? 'Download' : 'Download unavailable'}
+      </Button>
+      <Button variant="ghost" type="button" disabled={pending !== null} onclick={openReportForm}>
+        <Flag class="size-4" aria-hidden="true" />
+        Report
       </Button>
     </div>
   {/if}
