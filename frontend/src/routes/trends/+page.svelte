@@ -20,7 +20,10 @@
   }
 </script>
 
-<PageHeader title="Public meme trends." description="Aggregate launch-scope analytics from MemeXpert activity and source popularity snapshots." badge="No per-user data" />
+<PageHeader title="Public meme trends." description="Aggregate launch-scope analytics from MemeXpert activity and source popularity snapshots." badge="No per-user data">
+  <ActionLink href="/trends/compare" variant="secondary">Compare trends</ActionLink>
+  <ActionLink href="/trends/timeline" variant="secondary">Timeline</ActionLink>
+</PageHeader>
 
 <nav class="mb-6 flex flex-wrap gap-2" aria-label="Trend rankings">
   <a class={data.ranking === 'trending' ? 'rounded-full bg-ink px-4 py-3 font-extrabold text-paper no-underline' : 'rounded-full border border-line bg-paper px-4 py-3 font-extrabold text-ink no-underline'} href={rankingHref('trending')}>Trending</a>

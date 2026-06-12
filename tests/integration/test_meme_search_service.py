@@ -1150,6 +1150,147 @@ async def test_public_trend_empty_states_are_honest(
     assert popularity_payload["sparkline"] == []
 
 
+async def test_public_trend_compare_returns_real_series_and_insufficient_history_states(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    template = MemeTemplate(slug="frog-template", name="Frog Template", description="Frog format")
+    migrated_db_session.add(template)
+    await migrated_db_session.flush()
+    meme = await _create_meme(migrated_db_session, tags=["reaction"], popularity_score=1.0)
+    meme.template_id = template.id
+    migrated_db_session.add(
+        MemeSeoPage(
+            meme_id=meme.id,
+            slug="launch-reaction",
+            page_title="Launch reaction meme",
+            meta_description="Launch reaction",
+            alt_text="Launch reaction",
+            model_id="test",
+            prompt_version="v1",
+        )
+    )
+    migrated_db_session.add_all(
+        [
+            MemePopularitySnapshot(
+                meme_id=meme.id,
+                captured_at=datetime(2026, 1, 1, tzinfo=UTC),
+                popularity_score=10.0,
+                source_views=10,
+            ),
+            MemePopularitySnapshot(
+                meme_id=meme.id,
+                captured_at=datetime(2026, 1, 2, tzinfo=UTC),
+                popularity_score=15.0,
+                source_views=15,
+            ),
+        ]
+    )
+    await migrated_db_session.flush()
+    await _refresh_trend_views(migrated_db_session)
+    _install_meme_route_overrides(app, migrated_db_session)
+
+    try:
+        response = await client.get(
+            "/api/v1/memes/trends/compare",
+            params=[
+                ("item", "meme:launch-reaction"),
+                ("item", "tag:reaction"),
+                ("item", "template:frog-template"),
+                ("item", "bad-spec"),
+            ],
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["max_items"] == 6
+    assert payload["requested_items"] == ["meme:launch-reaction", "tag:reaction", "template:frog-template", "bad-spec"]
+
+    meme_series = payload["items"][0]
+    assert meme_series["kind"] == "meme"
+    assert meme_series["title"] == "Launch reaction meme"
+    assert meme_series["insufficient_history"] is False
+    assert [point["value"] for point in meme_series["points"]] == [10.0, 15.0]
+    assert {point["metric"] for point in meme_series["points"]} == {"popularity_score"}
+
+    tag_series = payload["items"][1]
+    assert tag_series["kind"] == "tag"
+    assert tag_series["insufficient_history"] is True
+    assert tag_series["points"][0]["metric"] == "trending_score"
+    assert tag_series["points"][0]["value"] > 0
+
+    template_series = payload["items"][2]
+    assert template_series["kind"] == "template"
+    assert template_series["insufficient_history"] is True
+    assert template_series["points"][0]["metric"] == "trending_score"
+
+    invalid_series = payload["items"][3]
+    assert invalid_series["kind"] == "unknown"
+    assert invalid_series["points"] == []
+    assert invalid_series["no_data_reason"].startswith("Use item specs")
+
+
+async def test_public_trend_timeline_groups_real_snapshot_periods_without_private_memes(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    january_meme = await _create_meme(migrated_db_session, popularity_score=1.0)
+    february_meme = await _create_meme(migrated_db_session, popularity_score=1.0)
+    private_meme = await _create_meme(migrated_db_session, popularity_score=100.0, is_public=False)
+    migrated_db_session.add_all(
+        [
+            MemePopularitySnapshot(
+                meme_id=january_meme.id,
+                captured_at=datetime(2026, 1, 15, tzinfo=UTC),
+                popularity_score=20.0,
+                source_views=200,
+            ),
+            MemePopularitySnapshot(
+                meme_id=february_meme.id,
+                captured_at=datetime(2026, 2, 10, tzinfo=UTC),
+                popularity_score=30.0,
+                source_views=100,
+                platform_views=40,
+            ),
+            MemePopularitySnapshot(
+                meme_id=private_meme.id,
+                captured_at=datetime(2026, 2, 11, tzinfo=UTC),
+                popularity_score=999.0,
+                source_views=999,
+            ),
+        ]
+    )
+    await migrated_db_session.flush()
+    _install_meme_route_overrides(app, migrated_db_session)
+
+    try:
+        month_response = await client.get("/api/v1/memes/trends/timeline", params={"granularity": "month"})
+        year_response = await client.get("/api/v1/memes/trends/timeline", params={"granularity": "year"})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert month_response.status_code == 200
+    month_payload = month_response.json()
+    assert month_payload["granularity"] == "month"
+    assert [period["period"] for period in month_payload["periods"]] == ["2026-02", "2026-01"]
+    assert month_payload["periods"][0]["top_memes"][0]["meme"]["id"] == str(february_meme.id)
+    assert month_payload["periods"][0]["top_memes"][0]["popularity_score"] == 30.0
+    assert str(private_meme.id) not in month_response.text
+
+    assert year_response.status_code == 200
+    year_payload = year_response.json()
+    assert year_payload["granularity"] == "year"
+    assert year_payload["periods"][0]["period"] == "2026"
+    assert [item["meme"]["id"] for item in year_payload["periods"][0]["top_memes"]] == [
+        str(february_meme.id),
+        str(january_meme.id),
+    ]
+
+
 async def test_public_trend_refresh_command_path_uses_concurrent_refresh_with_fallback(
     postgres_async_engine: AsyncEngine,
     migrated_db_session: AsyncSession,
