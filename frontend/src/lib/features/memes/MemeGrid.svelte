@@ -11,6 +11,7 @@
     type MemeGridBulkOptions
   } from './bulk-view-model';
   import MemeCard from './MemeCard.svelte';
+  import { buildMasonryColumns, masonryColumnCount, masonryColumnWidth } from './masonry-layout';
 
   let {
     memes,
@@ -22,6 +23,14 @@
   let targetCollectionId = $state('');
   let pendingAction = $state<string | null>(null);
   let statusMessage = $state<string | null>(null);
+  let gridElement = $state<HTMLElement>();
+  let gridWidth = $state(0);
+
+  const columnCount = $derived(masonryColumnCount(gridWidth));
+  const columnWidth = $derived(masonryColumnWidth(gridWidth, columnCount));
+  // Preserve backend ranking by processing memes strictly in array order. Each meme is appended to
+  // the current shortest estimated column, so the layout is deterministic without random shuffling.
+  const masonryColumns = $derived(buildMasonryColumns(memes, columnCount, columnWidth));
 
   const bulkEnabled = $derived(Boolean(bulk.enabled));
   const selected = $derived(selectedMemes(memes, selectedIds));
@@ -42,6 +51,19 @@
     if (collectionOptions.length > 0 && !collectionOptions.some((collection) => collection.id === targetCollectionId)) {
       targetCollectionId = collectionOptions[0].id;
     }
+  });
+
+  $effect(() => {
+    if (!browser || !gridElement) return;
+
+    const updateGridWidth = () => {
+      gridWidth = gridElement?.clientWidth ?? 0;
+    };
+    const observer = new ResizeObserver(updateGridWidth);
+    updateGridWidth();
+    observer.observe(gridElement);
+
+    return () => observer.disconnect();
   });
 
   function toggleSelection(memeId: string) {
@@ -193,16 +215,20 @@
   </div>
 {/if}
 
-<section class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4" aria-label={label}>
-  {#each memes as meme (meme.id)}
-    <div class="relative">
-      {#if bulkEnabled}
-        <label class="absolute left-3 top-3 z-20 inline-flex items-center gap-2 rounded-full border border-line bg-paper/95 px-3 py-2 text-sm font-extrabold shadow-warm">
-          <input type="checkbox" checked={selectedIds.includes(meme.id)} onchange={() => toggleSelection(meme.id)} aria-label={`Select ${meme.caption || meme.tags[0] || 'meme'}`} />
-          Select
-        </label>
-      {/if}
-      <MemeCard {meme} />
+<section bind:this={gridElement} class="flex gap-4" aria-label={label} data-column-count={columnCount}>
+  {#each masonryColumns as column (column.id)}
+    <div class="grid min-w-0 flex-1 content-start gap-4">
+      {#each column.items as meme (meme.id)}
+        <div class="relative">
+          {#if bulkEnabled}
+            <label class="absolute left-3 top-3 z-20 inline-flex items-center gap-2 rounded-full border border-line bg-paper/95 px-3 py-2 text-sm font-extrabold shadow-warm">
+              <input type="checkbox" checked={selectedIds.includes(meme.id)} onchange={() => toggleSelection(meme.id)} aria-label={`Select ${meme.caption || meme.tags[0] || 'meme'}`} />
+              Select
+            </label>
+          {/if}
+          <MemeCard {meme} />
+        </div>
+      {/each}
     </div>
   {/each}
 </section>

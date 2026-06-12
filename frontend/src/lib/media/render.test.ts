@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { PublicMemeFileRead } from '$lib/api/types';
-import { selectMediaRender } from './render';
+import { selectMediaAspectRatio, selectMediaRender } from './render';
 
 describe('selectMediaRender', () => {
   it('selects real image display and download URLs', () => {
@@ -47,6 +47,21 @@ describe('selectMediaRender', () => {
       downloadUrl: null,
       hasMedia: false
     });
+  });
+});
+
+describe('selectMediaAspectRatio', () => {
+  it('prefers render dimensions over source file dimensions', () => {
+    expect(selectMediaAspectRatio(file({ width: 320, height: 180 }))).toBe('320 / 180');
+  });
+
+  it('falls back to source file dimensions', () => {
+    expect(selectMediaAspectRatio({ ...file({ width: null, height: null }), width: 1024, height: 768 })).toBe('1024 / 768');
+  });
+
+  it('returns null when dimensions are unavailable or invalid', () => {
+    expect(selectMediaAspectRatio(null)).toBeNull();
+    expect(selectMediaAspectRatio({ ...file({ width: 0, height: 180 }), width: null, height: null })).toBeNull();
   });
 });
 

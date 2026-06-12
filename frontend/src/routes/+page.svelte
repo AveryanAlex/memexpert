@@ -1,35 +1,15 @@
 <script lang="ts">
   import CollectionChip from '$lib/features/collections/CollectionChip.svelte';
   import { bulkGuestGuidance, collectionListBulkOptions } from '$lib/features/memes/bulk-view-model';
-  import MemeGrid from '$lib/features/memes/MemeGrid.svelte';
-  import { ActionLink, Badge, Button, Card, EmptyState, Input, Notice, PageHeader, Select } from '$lib/ui';
+  import InfiniteMemeFeed from '$lib/features/memes/InfiniteMemeFeed.svelte';
+  import { ActionLink, Button, Card, Input, Notice, PageHeader, Select } from '$lib/ui';
   import type { ActionData, PageData } from './$types';
 
   let { data, form }: { data: PageData; form: ActionData } = $props();
 
-  const resultStart = $derived(data.page.total === 0 ? 0 : data.offset + 1);
-  const resultEnd = $derived(Math.min(data.offset + data.page.items.length, data.page.total));
-  const previousOffset = $derived(Math.max(data.offset - data.page.limit, 0));
-  const nextOffset = $derived(data.offset + data.page.limit);
-  const memes = $derived(data.page.items.map((item) => item.meme));
   const bulkOptions = $derived(collectionListBulkOptions(data.collections));
   const accountType = $derived(data.session?.user.account_type ?? null);
   const bulkGuidance = $derived(bulkGuestGuidance(accountType, bulkOptions.some((collection) => collection.kind === 'custom')));
-
-  function pageHref(offset: number): string {
-    const params = new URLSearchParams();
-
-    if (data.query) {
-      params.set('q', data.query);
-    }
-
-    if (offset > 0) {
-      params.set('offset', String(offset));
-    }
-
-    const query = params.toString();
-    return query ? `/?${query}` : '/';
-  }
 </script>
 
 <PageHeader title="Find the right meme fast." description="Search the public MemeXpert catalog with plain text, or browse what is already popular." badge="Guest access enabled" />
@@ -50,10 +30,6 @@
   <ActionLink variant="secondary" size="compact" href="/search">Advanced search</ActionLink>
   <ActionLink variant="ghost" size="compact" href="/search?tags=reaction&include_nsfw=false">Browse reactions</ActionLink>
 </div>
-
-{#if data.errorMessage}
-  <Notice>{data.errorMessage}</Notice>
-{/if}
 
 <Card class="my-6 grid gap-4" aria-labelledby="collections-title">
   <div>
@@ -102,31 +78,20 @@
   {/if}
 </Card>
 
-<div class="my-7 flex flex-wrap justify-between gap-3">
-  <p class="m-0 text-muted">
-    {#if data.query}
-      Results for “{data.query}”
-    {:else}
-      Browsing public memes
-    {/if}
-  </p>
-  <p class="m-0 text-muted">Showing {resultStart}-{resultEnd} of {data.page.total}</p>
-</div>
-
-{#if data.page.items.length > 0}
-  <MemeGrid
-    {memes}
-    bulk={{ enabled: true, accountType, saveEnabled: true, collectionOptions: bulkOptions, guidance: bulkGuidance }}
-  />
-{:else if !data.errorMessage}
-  <EmptyState title="No memes found" message="Try a shorter phrase, a different synonym, or clear the search box to browse." />
-{/if}
-
-<nav class="mt-6 flex flex-wrap gap-2" aria-label="Pagination">
-  {#if data.offset > 0}
-    <ActionLink variant="secondary" href={pageHref(previousOffset)}>Previous</ActionLink>
-  {/if}
-  {#if data.page.has_more}
-    <ActionLink href={pageHref(nextOffset)}>Next page</ActionLink>
-  {/if}
-</nav>
+<InfiniteMemeFeed
+  initialPage={data.page}
+  filters={{ query: data.query }}
+  initialError={data.errorMessage}
+  emptyMessage="Try a shorter phrase, a different synonym, or clear the search box to browse."
+  bulk={{ enabled: true, accountType, saveEnabled: true, collectionOptions: bulkOptions, guidance: bulkGuidance }}
+>
+  {#snippet summary()}
+    <p class="m-0 text-muted">
+      {#if data.query}
+        Results for “{data.query}”
+      {:else}
+        Browsing public memes
+      {/if}
+    </p>
+  {/snippet}
+</InfiniteMemeFeed>

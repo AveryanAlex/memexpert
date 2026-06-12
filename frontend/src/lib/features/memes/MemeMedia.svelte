@@ -1,20 +1,24 @@
 <script lang="ts">
   import type { PublicMemeCardRead, PublicMemeDetailRead } from '$lib/api/types';
-  import { selectMediaRender } from '$lib/media/render';
+  import { selectMediaAspectRatio, selectMediaRender } from '$lib/media/render';
   import { memeTitle } from '$lib/memeActions';
   import { Download } from '@lucide/svelte';
 
   interface Props {
     meme: PublicMemeCardRead | PublicMemeDetailRead;
     detail?: boolean;
+    preview?: boolean;
     showDownload?: boolean;
   }
 
-  let { meme, detail = false, showDownload = false }: Props = $props();
+  let { meme, detail = false, preview = false, showDownload = false }: Props = $props();
 
   const file = $derived(meme.primary_file);
   const media = $derived(selectMediaRender(file));
   const title = $derived(memeTitle(meme));
+  const feedPreview = $derived(preview && !detail);
+  const previewAspectRatio = $derived(feedPreview && (media.videoUrl || media.imageUrl) ? selectMediaAspectRatio(file) : null);
+  const mediaClass = $derived(detail || feedPreview ? 'block size-full min-h-[inherit] object-contain' : 'block size-full min-h-[inherit] object-cover');
 </script>
 
 <div
@@ -23,11 +27,12 @@
     detail ? 'min-h-[22.5rem] rounded-[22px]' : 'min-h-[9.5rem]',
     media.hasMedia ? 'bg-[#101725] p-0' : ''
   ].join(' ')}
+  style:aspect-ratio={previewAspectRatio}
   data-has-media={media.hasMedia}
 >
   {#if media.videoUrl}
     <video
-      class={detail ? 'block size-full min-h-[inherit] object-contain' : 'block size-full min-h-[inherit] object-cover'}
+      class={mediaClass}
       controls={detail}
       muted={!detail}
       playsinline
@@ -40,7 +45,7 @@
     </video>
   {:else if media.imageUrl}
     <img
-      class={detail ? 'block size-full min-h-[inherit] object-contain' : 'block size-full min-h-[inherit] object-cover'}
+      class={mediaClass}
       src={media.imageUrl}
       alt={title}
       width={file?.render?.width || file?.width || undefined}
