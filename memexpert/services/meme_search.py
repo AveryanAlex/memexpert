@@ -7,7 +7,7 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from sqlalchemy import Select, func, literal, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -53,6 +53,9 @@ TRENDING_EVENT_WEIGHTS = {
 }
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 
 class MemeNotFoundError(LookupError):
@@ -806,6 +809,33 @@ class MemeSearchService:
             saved_meme_ids=frozenset(saved_meme_ids),
             pinned_meme_ids=frozenset(pinned_meme_ids),
         )
+
+    async def load_public_meme_cards(
+        self,
+        meme_ids: Sequence[uuid.UUID],
+        *,
+        viewer_user_id: uuid.UUID | None,
+    ) -> list[PublicMemeCardRead]:
+        """Return visible public meme cards in caller-provided order with viewer action state."""
+
+        if not meme_ids:
+            return []
+
+        unique_meme_ids = tuple(dict.fromkeys(meme_ids))
+        result = await self._session.execute(
+            _visible_meme_stmt(viewer_user_id).where(Meme.id.in_(unique_meme_ids)),
+        )
+        memes_by_id = {meme.id: meme for meme in result.scalars().all()}
+        action_state = await self._load_viewer_action_state(unique_meme_ids, viewer_user_id=viewer_user_id)
+        return [
+            _to_public_card_read(
+                meme,
+                media_render_service=self._media_render_service,
+                viewer_action_state=action_state,
+            )
+            for meme_id in meme_ids
+            if (meme := memes_by_id.get(meme_id)) is not None
+        ]
 
     async def _popular_page(
         self,

@@ -46,7 +46,7 @@ describe('meme action helpers', () => {
 
   it('formats account and active collection failures clearly', () => {
     expect(actionFailureMessage('pin', new ApiError(403, 'Full account required.'))).toBe(
-      'Pinning requires a full MemeXpert account. Link or sign in, then try again.'
+      'Pinning requires a connected MemeXpert profile. Connect Telegram, then try again.'
     );
     expect(actionFailureMessage('save', new ApiError(409, 'Active collection is read-only.'))).toBe(
       'Could not update your active save collection: Active collection is read-only.'

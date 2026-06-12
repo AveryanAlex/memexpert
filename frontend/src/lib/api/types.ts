@@ -124,6 +124,31 @@ export interface PublicMemeSearchPageRead {
   has_more: boolean;
 }
 
+export type CollectionKind = 'custom' | 'favorites';
+export type CollectionVisibility = 'private' | 'public' | 'unlisted';
+export type CollectionMembershipRole = 'editor' | 'owner' | 'viewer';
+
+export interface CollectionSummaryRead {
+  id: string;
+  owner_id: string;
+  title: string;
+  description: string | null;
+  kind: CollectionKind;
+  visibility: CollectionVisibility;
+  role: CollectionMembershipRole;
+  can_write: boolean;
+  saved_meme_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface MemeLibraryRead {
+  favorites: PublicMemeCardRead[];
+  pinned_memes: PublicMemeCardRead[];
+  collections: CollectionSummaryRead[];
+  active_save_collection: CollectionSummaryRead | null;
+}
+
 export interface PublicTrendCountsRead {
   views: number;
   sends: number;

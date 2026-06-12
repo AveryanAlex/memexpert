@@ -16,6 +16,7 @@ from memexpert.models.enums import (
     CollectionVisibility,
 )
 from memexpert.schemas.base import ORMSchema
+from memexpert.schemas.meme import PublicMemeCardRead
 
 
 class CollectionMemberRead(ORMSchema):
@@ -80,10 +81,37 @@ class PinnedMemeRead(ORMSchema):
     pinned_at: datetime
 
 
+class CollectionSummaryRead(ORMSchema):
+    """Compact collection DTO for profile/library selectors and lists."""
+
+    id: uuid.UUID
+    owner_id: uuid.UUID
+    title: str
+    description: str | None
+    kind: CollectionKind
+    visibility: CollectionVisibility
+    role: CollectionMembershipRole
+    can_write: bool
+    saved_meme_count: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class MemeLibraryRead(ORMSchema):
+    """Renderable profile/library payload for web clients."""
+
+    favorites: list[PublicMemeCardRead] = Field(default_factory=list)
+    pinned_memes: list[PublicMemeCardRead] = Field(default_factory=list)
+    collections: list[CollectionSummaryRead] = Field(default_factory=list)
+    active_save_collection: CollectionSummaryRead | None = None
+
+
 __all__ = [
     "CollectionInviteRead",
     "CollectionMemeRead",
     "CollectionMemberRead",
     "CollectionRead",
+    "CollectionSummaryRead",
+    "MemeLibraryRead",
     "PinnedMemeRead",
 ]

@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import TYPE_CHECKING, Final
 
-from sqlalchemy import and_, delete, func, or_, select, update
+from sqlalchemy import and_, case, delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
@@ -26,6 +26,8 @@ from memexpert.schemas import (
     CollectionMemberRead,
     CollectionMemeRead,
     CollectionRead,
+    CollectionSummaryRead,
+    MemeLibraryRead,
     PinnedMemeRead,
     UserRead,
 )
@@ -45,13 +47,16 @@ from memexpert.services.errors import (
     PinLimitExceededError,
     UserNotFoundError,
 )
-from memexpert.services.meme_search import MemeNotFoundError
+from memexpert.services.media_render_urls import MediaRenderUrlService
+from memexpert.services.meme_search import MemeNotFoundError, MemeSearchService
 from memexpert.services.user_service import UserService
 
 if TYPE_CHECKING:
     import uuid
 
     from sqlalchemy.ext.asyncio import AsyncSession
+
+    from memexpert.schemas.meme import PublicMemeCardRead
 
 MAX_COLLECTION_TITLE_LENGTH: Final = 120
 MAX_COLLECTION_LABEL_LENGTH: Final = 120
@@ -64,8 +69,9 @@ WRITE_ROLES: Final = frozenset({CollectionMembershipRole.OWNER, CollectionMember
 class CollectionService:
     """Service-layer helpers for custom collections, memberships, invites, and active-save state."""
 
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(self, session: AsyncSession, *, media_render_service: MediaRenderUrlService | None = None) -> None:
         self._session: AsyncSession = session
+        self._media_render_service = media_render_service or MediaRenderUrlService()
 
     async def get_collection(self, collection_id: object) -> CollectionRead | None:
         """Return a collection with memberships and invites if it exists."""
@@ -244,6 +250,28 @@ class CollectionService:
             .order_by(CollectionMeme.added_at.desc(), CollectionMeme.meme_id.asc())
         )
         return [CollectionMemeRead.model_validate(row) for row in result.scalars()]
+
+    async def get_meme_library(self, *, user_id: object) -> MemeLibraryRead:
+        """Return renderable profile/library data for the caller."""
+
+        user = await self._get_user_model(user_id)
+        if user is None:
+            raise UserNotFoundError(f"User {user_id} does not exist.")
+
+        active_collection = await self.get_active_save_collection(user_id=user.id)
+        collections = await self._list_collection_summaries(user)
+        active_summary = next(
+            (collection for collection in collections if collection.id == active_collection.id),
+            None,
+        )
+        favorites = await self._load_favorite_cards(user.id)
+        pinned_memes = await self._load_pinned_cards(user.id) if user.account_type is AccountType.FULL else []
+        return MemeLibraryRead(
+            favorites=favorites,
+            pinned_memes=pinned_memes,
+            collections=collections,
+            active_save_collection=active_summary,
+        )
 
     async def get_active_save_collection(self, *, user_id: object) -> CollectionRead:
         """Return the user's active save destination, defaulting to Favorites on first use."""
@@ -579,6 +607,75 @@ class CollectionService:
             .where(Collection.id == collection_id)
         )
         return result.scalar_one_or_none()
+
+    async def _list_collection_summaries(self, user: User) -> list[CollectionSummaryRead]:
+        result = await self._session.execute(
+            select(Collection, CollectionMember.role, func.count(CollectionMeme.meme_id).label("saved_meme_count"))
+            .outerjoin(
+                CollectionMember,
+                and_(CollectionMember.collection_id == Collection.id, CollectionMember.user_id == user.id),
+            )
+            .outerjoin(CollectionMeme, CollectionMeme.collection_id == Collection.id)
+            .where(or_(Collection.owner_id == user.id, CollectionMember.user_id == user.id))
+            .group_by(Collection.id, CollectionMember.role)
+            .order_by(
+                case((Collection.kind == CollectionKind.FAVORITES, 0), else_=1),
+                Collection.updated_at.desc(),
+                Collection.title.asc(),
+            )
+        )
+        summaries: list[CollectionSummaryRead] = []
+        for collection, member_role, saved_meme_count in result.all():
+            role = CollectionMembershipRole.OWNER if collection.owner_id == user.id else member_role
+            if role is None:  # pragma: no cover - protected by query predicate
+                continue
+            summaries.append(
+                CollectionSummaryRead(
+                    id=collection.id,
+                    owner_id=collection.owner_id,
+                    title=collection.title,
+                    description=collection.description,
+                    kind=collection.kind,
+                    visibility=collection.visibility,
+                    role=role,
+                    can_write=collection.owner_id == user.id or role in WRITE_ROLES,
+                    saved_meme_count=int(saved_meme_count or 0),
+                    created_at=collection.created_at,
+                    updated_at=collection.updated_at,
+                )
+            )
+        return summaries
+
+    async def _load_favorite_cards(self, user_id: uuid.UUID) -> list[PublicMemeCardRead]:
+        favorites = await self._get_favorites_collection_model(user_id)
+        if favorites is None:
+            return []
+
+        result = await self._session.execute(
+            select(CollectionMeme.meme_id)
+            .where(CollectionMeme.collection_id == favorites.id)
+            .order_by(CollectionMeme.added_at.desc(), CollectionMeme.meme_id.asc())
+        )
+        meme_ids = list(result.scalars().all())
+        return await self._load_public_cards(meme_ids, viewer_user_id=user_id)
+
+    async def _load_pinned_cards(self, user_id: uuid.UUID) -> list[PublicMemeCardRead]:
+        result = await self._session.execute(
+            select(PinnedMeme.meme_id)
+            .where(PinnedMeme.user_id == user_id)
+            .order_by(PinnedMeme.position.asc(), PinnedMeme.pinned_at.asc())
+        )
+        meme_ids = list(result.scalars().all())
+        return await self._load_public_cards(meme_ids, viewer_user_id=user_id)
+
+    async def _load_public_cards(
+        self,
+        meme_ids: list[uuid.UUID],
+        *,
+        viewer_user_id: uuid.UUID,
+    ) -> list[PublicMemeCardRead]:
+        meme_search_service = MemeSearchService(self._session, media_render_service=self._media_render_service)
+        return await meme_search_service.load_public_meme_cards(meme_ids, viewer_user_id=viewer_user_id)
 
     async def _get_favorites_collection_model(self, user_id: object) -> Collection | None:
         result = await self._session.execute(
