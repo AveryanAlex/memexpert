@@ -11,6 +11,8 @@ import type {
   CollectionInviteLinkRead,
   CollectionMembershipRole,
   CollectionVisibility,
+  ContentKind,
+  ContentLanguage,
   CurrentSessionRead,
   MemeLibraryRead,
   PublicMemeDetailRead,
@@ -40,6 +42,10 @@ interface CatalogRequest {
 
 interface PageRequest extends CatalogRequest {
   query: string;
+  tags?: string[];
+  includeNsfw?: boolean;
+  mediaType?: ContentKind | null;
+  language?: ContentLanguage | null;
   limit: number;
   offset: number;
 }
@@ -122,6 +128,25 @@ export async function fetchMemePage(request: PageRequest): Promise<PublicMemeSea
     limit: String(request.limit),
     offset: String(request.offset)
   });
+
+  for (const tag of request.tags ?? []) {
+    const normalized = tag.trim();
+    if (normalized) {
+      params.append('tags', normalized);
+    }
+  }
+
+  if (request.includeNsfw !== undefined) {
+    params.set('include_nsfw', String(request.includeNsfw));
+  }
+
+  if (request.mediaType) {
+    params.set('media_type', request.mediaType);
+  }
+
+  if (request.language) {
+    params.set('language', request.language);
+  }
 
   if (query) {
     params.set('query', query);
