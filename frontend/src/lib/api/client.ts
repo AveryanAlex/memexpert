@@ -23,7 +23,9 @@ import type {
   PublicMemePopularitySummaryRead,
   PublicMemeSearchPageRead,
   PublicMemeTrendPageRead,
+  PublicTrendComparisonRead,
   PublicTrendSummaryRead,
+  PublicTrendTimelinePageRead,
   MemeReportRead,
   ModerationReason,
   TelegramLinkStartRead,
@@ -59,6 +61,16 @@ interface DetailRequest extends CatalogRequest {
 
 interface TrendRequest extends CatalogRequest {
   ranking?: 'trending' | 'fastest_rising' | 'most_liked';
+  limit: number;
+  offset: number;
+}
+
+interface TrendComparisonRequest extends CatalogRequest {
+  items: string[];
+}
+
+interface TrendTimelineRequest extends CatalogRequest {
+  granularity: 'month' | 'year';
   limit: number;
   offset: number;
 }
@@ -213,6 +225,25 @@ export async function fetchTemplateTrendSummaries(request: TrendRequest): Promis
   return apiGet<PublicTrendSummaryRead[]>(
     '/api/v1/memes/trends/templates',
     new URLSearchParams({ limit: String(request.limit), offset: String(request.offset) }),
+    request
+  );
+}
+
+export async function fetchTrendComparison(request: TrendComparisonRequest): Promise<PublicTrendComparisonRead> {
+  const params = new URLSearchParams();
+  for (const item of request.items) {
+    const normalized = item.trim();
+    if (normalized) {
+      params.append('item', normalized);
+    }
+  }
+  return apiGet<PublicTrendComparisonRead>('/api/v1/memes/trends/compare', params, request);
+}
+
+export async function fetchTrendTimeline(request: TrendTimelineRequest): Promise<PublicTrendTimelinePageRead> {
+  return apiGet<PublicTrendTimelinePageRead>(
+    '/api/v1/memes/trends/timeline',
+    new URLSearchParams({ granularity: request.granularity, limit: String(request.limit), offset: String(request.offset) }),
     request
   );
 }
@@ -660,6 +691,17 @@ export function emptyMemePage(limit: number, offset: number): PublicMemeSearchPa
 export function emptyTrendPage(limit: number, offset: number): PublicMemeTrendPageRead {
   return {
     items: [],
+    limit,
+    offset,
+    total: 0,
+    has_more: false
+  };
+}
+
+export function emptyTrendTimeline(granularity: 'month' | 'year', limit: number, offset: number): PublicTrendTimelinePageRead {
+  return {
+    granularity,
+    periods: [],
     limit,
     offset,
     total: 0,

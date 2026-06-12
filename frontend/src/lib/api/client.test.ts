@@ -22,6 +22,8 @@ import {
   fetchTagLanding,
   fetchTagTrendSummaries,
   fetchTemplateTrendSummaries,
+  fetchTrendComparison,
+  fetchTrendTimeline,
   fetchTrendPage,
   pinMeme,
   refreshCurrentSession,
@@ -218,7 +220,7 @@ describe('catalog API client', () => {
     expect(mockFetch).toHaveBeenCalledOnce();
   });
 
-  it('requests trend ranking pages and aggregate summaries', async () => {
+  it('requests trend ranking pages, aggregate summaries, comparison, and timeline', async () => {
     const calls: string[] = [];
     const mockFetch = vi.fn(async (input: RequestInfo | URL) => {
       const url = new URL(String(input));
@@ -226,6 +228,16 @@ describe('catalog API client', () => {
       if (url.pathname === '/api/v1/memes/trends') {
         expect(url.searchParams.get('ranking')).toBe('fastest_rising');
         return jsonResponse(trendPage);
+      }
+      if (url.pathname === '/api/v1/memes/trends/compare') {
+        expect(url.searchParams.getAll('item')).toEqual(['meme:launch-reaction', 'tag:reaction']);
+        return jsonResponse({ items: [], requested_items: ['meme:launch-reaction', 'tag:reaction'], max_items: 6 });
+      }
+      if (url.pathname === '/api/v1/memes/trends/timeline') {
+        expect(url.searchParams.get('granularity')).toBe('year');
+        expect(url.searchParams.get('limit')).toBe('12');
+        expect(url.searchParams.get('offset')).toBe('24');
+        return jsonResponse({ granularity: 'year', periods: [], limit: 12, offset: 24, total: 0, has_more: false });
       }
       return jsonResponse([]);
     }) satisfies ApiFetch;
@@ -239,11 +251,19 @@ describe('catalog API client', () => {
     });
     await fetchTagTrendSummaries({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', limit: 8, offset: 0 });
     await fetchTemplateTrendSummaries({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', limit: 8, offset: 0 });
+    await fetchTrendComparison({
+      fetch: mockFetch,
+      baseUrl: 'https://api.memexpert.test',
+      items: [' meme:launch-reaction ', '', 'tag:reaction']
+    });
+    await fetchTrendTimeline({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', granularity: 'year', limit: 12, offset: 24 });
 
     expect(calls).toEqual([
       '/api/v1/memes/trends?ranking=fastest_rising&limit=12&offset=24',
       '/api/v1/memes/trends/tags?limit=8&offset=0',
-      '/api/v1/memes/trends/templates?limit=8&offset=0'
+      '/api/v1/memes/trends/templates?limit=8&offset=0',
+      '/api/v1/memes/trends/compare?item=meme%3Alaunch-reaction&item=tag%3Areaction',
+      '/api/v1/memes/trends/timeline?granularity=year&limit=12&offset=24'
     ]);
   });
 

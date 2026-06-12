@@ -31,7 +31,9 @@ from memexpert.schemas.meme import (
     PublicMemeSearchPageRead,
     PublicMemeSearchResultRead,
     PublicMemeTrendPageRead,
+    PublicTrendComparisonRead,
     PublicTrendSummaryRead,
+    PublicTrendTimelinePageRead,
 )
 from memexpert.schemas.report import MemeReportCreateRequest, MemeReportRead
 from memexpert.schemas.user import UserRead
@@ -41,7 +43,7 @@ from memexpert.services import (
     PinLimitExceededError,
 )
 from memexpert.services.meme_search import MemeNotFoundError, MemeSearchFilters
-from memexpert.services.public_trends import PublicTrendRanking
+from memexpert.services.public_trends import PublicTrendRanking, PublicTrendTimelineGranularity
 from memexpert.services.report import MemeReportTargetNotVisibleError
 
 router = APIRouter(prefix="/memes", tags=["memes"])
@@ -221,6 +223,43 @@ async def template_trend_summaries(
     """Return aggregate-only public template trend summaries from materialized views."""
 
     return await public_trends_service.template_summaries(limit=limit, offset=offset)
+
+
+@router.get("/trends/compare", response_model=PublicTrendComparisonRead, summary="Compare public trend items")
+async def compare_public_trends(
+    public_trends_service: PublicTrendsServiceDep,
+    current_user: OptionalCurrentUserDep,
+    item: Annotated[
+        list[str] | None,
+        Query(description="Repeated item specs: meme:<uuid-or-slug>, tag:<slug>, or template:<slug>."),
+    ] = None,
+    include_nsfw: Annotated[bool, Query()] = False,
+) -> PublicTrendComparisonRead:
+    """Return shareable comparison series backed only by real public trend data."""
+
+    return await public_trends_service.compare_items(
+        tuple(item or ()),
+        include_nsfw=_nsfw_allowed(current_user, include_nsfw),
+    )
+
+
+@router.get("/trends/timeline", response_model=PublicTrendTimelinePageRead, summary="Browse public meme timeline")
+async def public_trend_timeline(
+    public_trends_service: PublicTrendsServiceDep,
+    current_user: OptionalCurrentUserDep,
+    granularity: Annotated[PublicTrendTimelineGranularity, Query()] = "month",
+    include_nsfw: Annotated[bool, Query()] = False,
+    limit: Annotated[int, Query(ge=1, le=100)] = 12,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> PublicTrendTimelinePageRead:
+    """Return month/year timeline periods from real public popularity snapshots."""
+
+    return await public_trends_service.timeline_periods(
+        granularity=granularity,
+        include_nsfw=_nsfw_allowed(current_user, include_nsfw),
+        limit=limit,
+        offset=offset,
+    )
 
 
 @router.get("/favorites", response_model=list[CollectionMemeRead], summary="List favorite memes")

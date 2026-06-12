@@ -238,6 +238,37 @@ class PublicMemePopularitySummaryRead(BaseModel):
     sparkline: list[PublicMemePopularityPointRead] = Field(default_factory=list)
 
 
+class PublicTrendComparisonPointRead(BaseModel):
+    """One real trend comparison point for a meme or current aggregate."""
+
+    observed_at: datetime | None = None
+    value: float
+    metric: str
+    label: str
+
+
+class PublicTrendComparisonSeriesRead(BaseModel):
+    """One requested comparison item plus real analytics points when available."""
+
+    kind: str
+    value: str
+    title: str
+    description: str | None = None
+    meme: PublicMemeCardRead | None = None
+    trend: PublicTrendMetricsRead | None = None
+    points: list[PublicTrendComparisonPointRead] = Field(default_factory=list)
+    insufficient_history: bool = False
+    no_data_reason: str | None = None
+
+
+class PublicTrendComparisonRead(BaseModel):
+    """Shareable public trend comparison response for URL item params."""
+
+    items: list[PublicTrendComparisonSeriesRead]
+    requested_items: list[str] = Field(default_factory=list)
+    max_items: int
+
+
 class PublicTrendSummaryRead(BaseModel):
     """Aggregate trend summary for a public tag or template."""
 
@@ -247,6 +278,44 @@ class PublicTrendSummaryRead(BaseModel):
     description: str | None = None
     meme_count: int
     trend: PublicTrendMetricsRead
+
+
+class PublicTrendTimelineMemeRead(BaseModel):
+    """Top meme for one real snapshot timeline period."""
+
+    meme: PublicMemeCardRead
+    popularity_score: float
+    snapshot_count: int
+    first_captured_at: datetime
+    last_captured_at: datetime
+    source_views: int = 0
+    source_reactions: int = 0
+    source_reposts: int = 0
+    platform_views: int = 0
+    platform_sends: int = 0
+    platform_saves: int = 0
+    platform_likes: int = 0
+
+
+class PublicTrendTimelinePeriodRead(BaseModel):
+    """One month/year period with top public memes from real snapshots."""
+
+    period: str
+    period_start: datetime
+    top_memes: list[PublicTrendTimelineMemeRead] = Field(default_factory=list)
+    meme_count: int
+    snapshot_count: int
+
+
+class PublicTrendTimelinePageRead(BaseModel):
+    """Offset pagination envelope for public meme timeline periods."""
+
+    granularity: str
+    periods: list[PublicTrendTimelinePeriodRead]
+    limit: int
+    offset: int
+    total: int
+    has_more: bool
 
 
 class PublicMemeLandingRead(BaseModel):
@@ -275,6 +344,9 @@ __all__ = [
     "PublicMemeLandingRead",
     "PublicMemePopularityPointRead",
     "PublicMemePopularitySummaryRead",
+    "PublicTrendComparisonPointRead",
+    "PublicTrendComparisonRead",
+    "PublicTrendComparisonSeriesRead",
     "PublicMemeSearchPageRead",
     "PublicMemeSearchResultRead",
     "PublicMemeTrendPageRead",
@@ -282,4 +354,7 @@ __all__ = [
     "PublicTrendCountsRead",
     "PublicTrendMetricsRead",
     "PublicTrendSummaryRead",
+    "PublicTrendTimelineMemeRead",
+    "PublicTrendTimelinePageRead",
+    "PublicTrendTimelinePeriodRead",
 ]

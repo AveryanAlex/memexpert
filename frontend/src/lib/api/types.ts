@@ -244,6 +244,31 @@ export interface PublicMemePopularitySummaryRead {
   sparkline: PublicMemePopularityPointRead[];
 }
 
+export interface PublicTrendComparisonPointRead {
+  observed_at: string | null;
+  value: number;
+  metric: string;
+  label: string;
+}
+
+export interface PublicTrendComparisonSeriesRead {
+  kind: 'meme' | 'tag' | 'template' | 'unknown' | string;
+  value: string;
+  title: string;
+  description: string | null;
+  meme: PublicMemeCardRead | null;
+  trend: PublicTrendMetricsRead | null;
+  points: PublicTrendComparisonPointRead[];
+  insufficient_history: boolean;
+  no_data_reason: string | null;
+}
+
+export interface PublicTrendComparisonRead {
+  items: PublicTrendComparisonSeriesRead[];
+  requested_items: string[];
+  max_items: number;
+}
+
 export interface PublicTrendSummaryRead {
   kind: 'tag' | 'template' | string;
   slug: string;
@@ -251,6 +276,38 @@ export interface PublicTrendSummaryRead {
   description: string | null;
   meme_count: number;
   trend: PublicTrendMetricsRead;
+}
+
+export interface PublicTrendTimelineMemeRead {
+  meme: PublicMemeCardRead;
+  popularity_score: number;
+  snapshot_count: number;
+  first_captured_at: string;
+  last_captured_at: string;
+  source_views: number;
+  source_reactions: number;
+  source_reposts: number;
+  platform_views: number;
+  platform_sends: number;
+  platform_saves: number;
+  platform_likes: number;
+}
+
+export interface PublicTrendTimelinePeriodRead {
+  period: string;
+  period_start: string;
+  top_memes: PublicTrendTimelineMemeRead[];
+  meme_count: number;
+  snapshot_count: number;
+}
+
+export interface PublicTrendTimelinePageRead {
+  granularity: 'month' | 'year' | string;
+  periods: PublicTrendTimelinePeriodRead[];
+  limit: number;
+  offset: number;
+  total: number;
+  has_more: boolean;
 }
 
 export interface CollectionCapabilitiesRead {
