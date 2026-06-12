@@ -13,6 +13,7 @@ from memexpert.bot.private_library import (
     PrivateLibraryCollectionServiceFactory,
     build_private_library_router,
 )
+from memexpert.bot.private_retention import build_private_retention_router
 from memexpert.bot.private_upload import (
     CollectionServiceFactory,
     PrivateUploadPipelineServiceFactory,
@@ -72,6 +73,12 @@ def build_dispatcher(
             settings=resolved_settings,
             session_factory=session_factory,
             collection_service_factory=private_library_collection_service_factory,
+        )
+    )
+    _ = dispatcher.include_router(
+        build_private_retention_router(
+            settings=resolved_settings,
+            session_factory=session_factory,
         )
     )
     _ = dispatcher.include_router(

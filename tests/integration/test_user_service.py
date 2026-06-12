@@ -9,7 +9,7 @@ import pytest
 from sqlalchemy import func, select
 
 from memexpert.models.collection import Collection, CollectionMember
-from memexpert.models.enums import AccountType, AuthProvider, CollectionKind
+from memexpert.models.enums import AccountType, AuthProvider, CollectionKind, UserLanguage
 from memexpert.models.user import User
 from memexpert.services import DuplicateIdentityError, InvalidIdentityError, UserService
 from tests.conftest import create_full_user_via_upgrade
@@ -196,3 +196,24 @@ async def test_touch_last_active_updates_lifecycle_timestamp(
     result = await migrated_db_session.execute(select(User).where(User.id == created_user.id))
     persisted_user = result.scalar_one()
     assert persisted_user.last_active_at == updated_at
+
+
+async def test_update_preferences_persists_user_row_settings(
+    migrated_db_session: AsyncSession,
+) -> None:
+    service = UserService(migrated_db_session)
+    created_user = await service.create_guest_user()
+
+    updated_user = await service.update_preferences(
+        user_id=created_user.id,
+        nsfw_enabled=True,
+        language=UserLanguage.RU,
+    )
+
+    assert updated_user.nsfw_enabled is True
+    assert updated_user.language is UserLanguage.RU
+
+    result = await migrated_db_session.execute(select(User).where(User.id == created_user.id))
+    persisted_user = result.scalar_one()
+    assert persisted_user.nsfw_enabled is True
+    assert persisted_user.language is UserLanguage.RU

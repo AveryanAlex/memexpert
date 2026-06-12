@@ -470,6 +470,38 @@ class UserService:
 
         return UserRead.model_validate(user)
 
+    async def update_preferences(
+        self,
+        *,
+        user_id: object,
+        nsfw_enabled: bool | None = None,
+        language: UserLanguage | None = None,
+        commit: bool = True,
+    ) -> UserRead:
+        """Persist user-controlled content preferences on the account row."""
+
+        result = await self._session.execute(select(User).where(User.id == user_id).with_for_update())
+        user = result.scalar_one_or_none()
+        if user is None:
+            raise UserNotFoundError(f"User {user_id} does not exist.")
+
+        if nsfw_enabled is not None:
+            user.nsfw_enabled = nsfw_enabled
+        if language is not None:
+            user.language = language
+
+        try:
+            if commit:
+                await self._session.commit()
+                await self._session.refresh(user)
+            else:
+                await self._session.flush()
+        except IntegrityError as exc:  # pragma: no cover - defensive branch
+            await self._session.rollback()
+            raise UserServiceError("Failed to persist the user's preferences.") from exc
+
+        return UserRead.model_validate(user)
+
     async def bump_token_nonce(self, *, user_id: uuid.UUID) -> int:
         """Atomically increment the user's token nonce to revoke every live JWT.
 
