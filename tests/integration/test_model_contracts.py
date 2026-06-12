@@ -17,6 +17,7 @@ from sqlalchemy.orm import configure_mappers, selectinload
 from memexpert.models import metadata, utcnow
 from memexpert.models.collection import Collection, CollectionInvite, CollectionMember, CollectionMeme, PinnedMeme
 from memexpert.models.content import (
+    AdminMemeDestructiveAuditLog,
     EmbeddingCache,
     Meme,
     MemeFile,
@@ -85,6 +86,7 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 EXPECTED_TABLES = {
+    "admin_meme_destructive_audit_logs",
     "account_deletion_logs",
     "account_merge_logs",
     "analytics_events",
@@ -176,6 +178,7 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
     assert meme_relationships["primary_file"].mapper.class_ is MemeFile
     assert meme_relationships["moderation_reports"].mapper.class_ is ModerationReport
     assert meme_relationships["moderation_decisions"].mapper.class_ is ModerationDecision
+    assert metadata.tables["admin_meme_destructive_audit_logs"].c["admin_user_id"].foreign_keys
     assert user_relationships["moderation_reports_submitted"].mapper.class_ is ModerationReport
     assert user_relationships["moderation_reports_resolved"].mapper.class_ is ModerationReport
     assert user_relationships["moderation_decisions"].mapper.class_ is ModerationDecision
@@ -546,6 +549,14 @@ async def test_schema_handles_cycles_multi_invites_and_nullable_content_fields(
                     user_id=owner.id,
                     action=AccountDeletionAction.CANCELLED,
                     details={"restored": True},
+                ),
+                AdminMemeDestructiveAuditLog(
+                    admin_user_id=owner.id,
+                    source_meme_id=meme.id,
+                    target_meme_id=None,
+                    action="delete",
+                    note="Admin removed unsafe test content",
+                    affected_snapshot={"meme_files": {"count": 2}},
                 ),
                 SourceChannel(
                     platform=SourcePlatform.TELEGRAM,

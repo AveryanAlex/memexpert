@@ -7,9 +7,20 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from memexpert.models.content import Meme, MemeTemplate, ModerationDecision, ModerationReport
+from memexpert.models.collection import Collection, CollectionMeme, PinnedMeme
+from memexpert.models.content import (
+    AdminMemeDestructiveAuditLog,
+    Meme,
+    MemeFile,
+    MemeMergeLog,
+    MemeSeoPage,
+    MemeTemplate,
+    ModerationDecision,
+    ModerationReport,
+)
 from memexpert.models.enums import (
     ContentKind,
+    ContentProcessingStatus,
     ModerationAction,
     ModerationReason,
     ModerationReportStatus,
@@ -70,6 +81,15 @@ async def test_admin_routes_require_session_cookie_admin_flag_and_ignore_operato
             f"/api/v1/admin/memes/{meme_id}/moderation",
             json={"is_nsfw": True},
         )
+        forbidden_delete_response = await non_admin_client.request(
+            "DELETE",
+            f"/api/v1/admin/memes/{meme_id}",
+            json={"confirmation": meme_id, "note": "test"},
+        )
+        forbidden_merge_response = await non_admin_client.post(
+            f"/api/v1/admin/memes/{meme_id}/merge",
+            json={"target_meme_id": meme_id, "confirmation": meme_id, "note": "test"},
+        )
         forbidden_reports_response = await non_admin_client.get("/api/v1/admin/moderation-reports")
 
     async with AsyncClient(transport=transport, base_url="https://testserver") as operator_header_client:
@@ -81,6 +101,12 @@ async def test_admin_routes_require_session_cookie_admin_flag_and_ignore_operato
             f"/api/v1/admin/memes/{meme_id}",
             headers={"X-Pipeline-Operator-Token": "anything"},
         )
+        operator_delete_response = await operator_header_client.request(
+            "DELETE",
+            f"/api/v1/admin/memes/{meme_id}",
+            headers={"X-Pipeline-Operator-Token": "anything"},
+            json={"confirmation": meme_id, "note": "test"},
+        )
 
     assert anonymous_session_response.status_code == 401
     assert anonymous_detail_response.status_code == 401
@@ -88,11 +114,14 @@ async def test_admin_routes_require_session_cookie_admin_flag_and_ignore_operato
     assert forbidden_session_response.status_code == 403
     assert forbidden_detail_response.status_code == 403
     assert forbidden_override_response.status_code == 403
+    assert forbidden_delete_response.status_code == 403
+    assert forbidden_merge_response.status_code == 403
     assert forbidden_reports_response.status_code == 403
     assert forbidden_session_response.json()["code"] == "admin_required"
     assert forbidden_reports_response.json()["code"] == "admin_required"
     assert operator_session_response.status_code == 401
     assert operator_detail_response.status_code == 401
+    assert operator_delete_response.status_code == 401
 
 
 async def test_admin_can_approve_channel_suggestion_through_cookie_session(
@@ -306,3 +335,293 @@ async def test_admin_direct_meme_override_persists_template_and_decision_audit_r
         assert flag_decision.new_template_id == template_id
         assert template_decision.previous_template_id is None
         assert template_decision.new_template_id == template_id
+
+
+async def test_admin_can_delete_meme_with_durable_destructive_audit(
+    auth_app,
+    auth_settings_overrides: dict[str, str],
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    admin_token = await _issue_user_cookie(
+        postgres_session_factory,
+        auth_settings_overrides,
+        email="admin-delete-meme@example.com",
+        is_admin=True,
+    )
+
+    async with postgres_session_factory() as session:
+        admin = (await session.execute(select(User).where(User.email == "admin-delete-meme@example.com"))).scalar_one()
+        meme = Meme(media_type=ContentKind.IMAGE, is_public=True, is_nsfw=False, like_count=7)
+        meme_file = MemeFile(
+            meme=meme,
+            status=ContentProcessingStatus.READY,
+            s3_original_key="admin/delete/original.jpg",
+            mime_type="image/jpeg",
+            quality_score=0.9,
+            is_primary=True,
+        )
+        collection = Collection(owner_id=admin.id, title="Admin saved memes")
+        report = ModerationReport(meme=meme, reporter_user_id=admin.id, reason=ModerationReason.SPAM)
+        decision = ModerationDecision(
+            meme=meme,
+            report=report,
+            admin_user_id=admin.id,
+            action=ModerationAction.HIDE,
+            reason=ModerationReason.SPAM,
+            note="Prior hide",
+            previous_is_public=True,
+            previous_is_nsfw=False,
+            new_is_public=False,
+            new_is_nsfw=False,
+        )
+        seo_page = MemeSeoPage(
+            meme=meme,
+            slug="admin-delete-test",
+            page_title="Delete test",
+            meta_description="Delete test",
+            alt_text="Delete test",
+            tags=["delete"],
+            model_id="test-model",
+            prompt_version="v1",
+        )
+        session.add_all([admin, meme, meme_file, collection, report, decision, seo_page])
+        await session.flush()
+        meme.primary_file_id = meme_file.id
+        session.add_all(
+            [
+                CollectionMeme(collection=collection, meme=meme, added_by_user_id=admin.id),
+                PinnedMeme(user_id=admin.id, meme=meme, position=1),
+            ]
+        )
+        await session.commit()
+        meme_id = meme.id
+        file_id = meme_file.id
+        admin_id = admin.id
+
+    transport = ASGITransport(app=auth_app)
+    async with AsyncClient(transport=transport, base_url="https://testserver") as admin_client:
+        admin_client.cookies.set(ACCESS_COOKIE_NAME, admin_token)
+        response = await admin_client.request(
+            "DELETE",
+            f"/api/v1/admin/memes/{meme_id}",
+            json={"confirmation": str(meme_id), "note": "Unsafe duplicate should be removed"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["action"] == "delete"
+    assert payload["source_meme_id"] == str(meme_id)
+    assert payload["target_meme_id"] is None
+    assert payload["affected_snapshot"]["meme_files"]["count"] == 1
+    assert payload["affected_snapshot"]["seo_page"]["count"] == 1
+    assert payload["affected_snapshot"]["collection_saves"]["count"] == 1
+    assert payload["affected_snapshot"]["pins"]["count"] == 1
+    assert payload["affected_snapshot"]["moderation_reports"]["count"] == 1
+    assert payload["affected_snapshot"]["moderation_decisions"]["count"] == 1
+
+    async with postgres_session_factory() as session:
+        persisted_meme = await session.get(Meme, meme_id)
+        persisted_file = await session.get(MemeFile, file_id)
+        audit_log = await session.scalar(
+            select(AdminMemeDestructiveAuditLog).where(AdminMemeDestructiveAuditLog.source_meme_id == meme_id),
+        )
+
+        assert persisted_meme is None
+        assert persisted_file is None
+        assert audit_log is not None
+        assert audit_log.admin_user_id == admin_id
+        assert audit_log.action == "delete"
+        assert audit_log.note == "Unsafe duplicate should be removed"
+        assert audit_log.affected_snapshot["meme_files"]["ids"] == [str(file_id)]
+
+
+async def test_admin_delete_requires_exact_confirmation_without_partial_delete(
+    auth_app,
+    auth_settings_overrides: dict[str, str],
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    admin_token = await _issue_user_cookie(
+        postgres_session_factory,
+        auth_settings_overrides,
+        email="admin-delete-blocked@example.com",
+        is_admin=True,
+    )
+
+    async with postgres_session_factory() as session:
+        meme = Meme(media_type=ContentKind.IMAGE, is_public=True, is_nsfw=False)
+        session.add(meme)
+        await session.commit()
+        meme_id = meme.id
+
+    transport = ASGITransport(app=auth_app)
+    async with AsyncClient(transport=transport, base_url="https://testserver") as admin_client:
+        admin_client.cookies.set(ACCESS_COOKIE_NAME, admin_token)
+        response = await admin_client.request(
+            "DELETE",
+            f"/api/v1/admin/memes/{meme_id}",
+            json={"confirmation": "wrong-id", "note": "try delete"},
+        )
+
+    assert response.status_code == 409
+    assert "confirmation" in response.json()["detail"]
+
+    async with postgres_session_factory() as session:
+        persisted_meme = await session.get(Meme, meme_id)
+        audit_count = await session.scalar(
+            select(AdminMemeDestructiveAuditLog).where(AdminMemeDestructiveAuditLog.source_meme_id == meme_id),
+        )
+
+        assert persisted_meme is not None
+        assert audit_count is None
+
+
+async def test_admin_can_merge_meme_with_shared_lineage_transfer_and_audit(
+    auth_app,
+    auth_settings_overrides: dict[str, str],
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    admin_token = await _issue_user_cookie(
+        postgres_session_factory,
+        auth_settings_overrides,
+        email="admin-merge-meme@example.com",
+        is_admin=True,
+    )
+
+    async with postgres_session_factory() as session:
+        admin = (await session.execute(select(User).where(User.email == "admin-merge-meme@example.com"))).scalar_one()
+        source_meme = Meme(
+            media_type=ContentKind.IMAGE,
+            is_public=True,
+            is_nsfw=False,
+            like_count=2,
+            popularity_score=4.0,
+        )
+        target_meme = Meme(
+            media_type=ContentKind.IMAGE,
+            is_public=True,
+            is_nsfw=False,
+            like_count=5,
+            popularity_score=3.0,
+        )
+        source_file = MemeFile(
+            meme=source_meme,
+            status=ContentProcessingStatus.READY,
+            s3_original_key="admin/merge/source.jpg",
+            mime_type="image/jpeg",
+            quality_score=0.5,
+            is_primary=True,
+        )
+        target_file = MemeFile(
+            meme=target_meme,
+            status=ContentProcessingStatus.READY,
+            s3_original_key="admin/merge/target.jpg",
+            mime_type="image/jpeg",
+            quality_score=1.0,
+            is_primary=True,
+        )
+        collection = Collection(owner_id=admin.id, title="Merge collection")
+        session.add_all([source_meme, target_meme, source_file, target_file, collection])
+        await session.flush()
+        source_meme.primary_file_id = source_file.id
+        target_meme.primary_file_id = target_file.id
+        session.add_all(
+            [
+                CollectionMeme(collection=collection, meme=source_meme, added_by_user_id=admin.id),
+                PinnedMeme(user_id=admin.id, meme=source_meme, position=1),
+            ]
+        )
+        await session.commit()
+        source_meme_id = source_meme.id
+        target_meme_id = target_meme.id
+        source_file_id = source_file.id
+        target_file_id = target_file.id
+        collection_id = collection.id
+        admin_id = admin.id
+
+    transport = ASGITransport(app=auth_app)
+    async with AsyncClient(transport=transport, base_url="https://testserver") as admin_client:
+        admin_client.cookies.set(ACCESS_COOKIE_NAME, admin_token)
+        response = await admin_client.post(
+            f"/api/v1/admin/memes/{source_meme_id}/merge",
+            json={
+                "target_meme_id": str(target_meme_id),
+                "confirmation": str(source_meme_id),
+                "note": "Confirmed duplicate canonical merge",
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["action"] == "merge"
+    assert payload["source_meme_id"] == str(source_meme_id)
+    assert payload["target_meme_id"] == str(target_meme_id)
+    assert payload["affected_snapshot"]["meme_files"]["ids"] == [str(source_file_id)]
+
+    async with postgres_session_factory() as session:
+        deleted_source = await session.get(Meme, source_meme_id)
+        target = await session.get(Meme, target_meme_id)
+        moved_file = await session.get(MemeFile, source_file_id)
+        collection_link = await session.get(CollectionMeme, (collection_id, target_meme_id))
+        pin_link = await session.get(PinnedMeme, (admin_id, target_meme_id))
+        audit_log = await session.scalar(
+            select(AdminMemeDestructiveAuditLog).where(AdminMemeDestructiveAuditLog.source_meme_id == source_meme_id),
+        )
+        merge_log = await session.scalar(select(MemeMergeLog).where(MemeMergeLog.source_meme_id == source_meme_id))
+
+        assert deleted_source is None
+        assert target is not None
+        assert target.like_count == 7
+        assert target.popularity_score == 4.0
+        assert target.primary_file_id == target_file_id
+        assert moved_file is not None
+        assert moved_file.meme_id == target_meme_id
+        assert moved_file.is_primary is False
+        assert collection_link is not None
+        assert pin_link is not None
+        assert audit_log is not None
+        assert audit_log.admin_user_id == admin_id
+        assert audit_log.action == "merge"
+        assert audit_log.note == "Confirmed duplicate canonical merge"
+        assert merge_log is not None
+        assert merge_log.merge_reason == "admin_destructive_merge"
+        assert merge_log.details["admin_user_id"] == str(admin_id)
+        assert merge_log.details["admin_note"] == "Confirmed duplicate canonical merge"
+
+
+async def test_admin_merge_self_is_blocked_without_partial_delete_or_audit(
+    auth_app,
+    auth_settings_overrides: dict[str, str],
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    admin_token = await _issue_user_cookie(
+        postgres_session_factory,
+        auth_settings_overrides,
+        email="admin-merge-blocked@example.com",
+        is_admin=True,
+    )
+
+    async with postgres_session_factory() as session:
+        meme = Meme(media_type=ContentKind.IMAGE, is_public=True, is_nsfw=False)
+        session.add(meme)
+        await session.commit()
+        meme_id = meme.id
+
+    transport = ASGITransport(app=auth_app)
+    async with AsyncClient(transport=transport, base_url="https://testserver") as admin_client:
+        admin_client.cookies.set(ACCESS_COOKIE_NAME, admin_token)
+        response = await admin_client.post(
+            f"/api/v1/admin/memes/{meme_id}/merge",
+            json={"target_meme_id": str(meme_id), "confirmation": str(meme_id), "note": "try self merge"},
+        )
+
+    assert response.status_code == 409
+    assert "cannot be merged into itself" in response.json()["detail"]
+
+    async with postgres_session_factory() as session:
+        persisted_meme = await session.get(Meme, meme_id)
+        audit_log = await session.scalar(
+            select(AdminMemeDestructiveAuditLog).where(AdminMemeDestructiveAuditLog.source_meme_id == meme_id),
+        )
+
+        assert persisted_meme is not None
+        assert audit_log is None

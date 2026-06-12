@@ -1,4 +1,5 @@
 import type {
+  AdminMemeDestructiveActionRead,
   AdminMemeDetailRead,
   AdminMemeRead,
   AdminMemeTemplateRead,
@@ -363,6 +364,28 @@ export async function updateMemeModeration(request: JsonMutationRequest, memeId:
   return apiWrite<AdminMemeRead>(
     `/api/v1/admin/memes/${encodeURIComponent(memeId)}/moderation`,
     'PATCH',
+    request
+  );
+}
+
+export async function deleteAdminMeme(
+  request: JsonMutationRequest,
+  memeId: string
+): Promise<AdminMemeDestructiveActionRead> {
+  return apiWrite<AdminMemeDestructiveActionRead>(
+    `/api/v1/admin/memes/${encodeURIComponent(memeId)}`,
+    'DELETE',
+    request
+  );
+}
+
+export async function mergeAdminMeme(
+  request: JsonMutationRequest,
+  memeId: string
+): Promise<AdminMemeDestructiveActionRead> {
+  return apiWrite<AdminMemeDestructiveActionRead>(
+    `/api/v1/admin/memes/${encodeURIComponent(memeId)}/merge`,
+    'POST',
     request
   );
 }

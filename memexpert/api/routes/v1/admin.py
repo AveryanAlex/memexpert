@@ -12,7 +12,10 @@ from memexpert.api.dependencies import AdminUserDep, DbSessionDep
 from memexpert.models.enums import ChannelSuggestionStatus, ModerationReportStatus
 from memexpert.schemas.admin import (
     AdminChannelSuggestionReviewRequest,
+    AdminMemeDeleteRequest,
+    AdminMemeDestructiveActionRead,
     AdminMemeDetailRead,
+    AdminMemeMergeRequest,
     AdminMemeModerationUpdateRequest,
     AdminMemeRead,
     AdminMemeTemplateRead,
@@ -219,6 +222,40 @@ async def update_meme_moderation(
 ) -> AdminMemeRead:
     try:
         return await admin_service.update_meme_moderation(
+            meme_id,
+            admin_user_id=admin_user.id,
+            request=request,
+        )
+    except (AdminNotFoundError, AdminConflictError) as exc:
+        raise _map_admin_error(exc) from exc
+
+
+@router.delete("/memes/{meme_id}", response_model=AdminMemeDestructiveActionRead, summary="Delete a meme")
+async def delete_admin_meme(
+    admin_user: AdminUserDep,
+    admin_service: AdminServiceDep,
+    meme_id: Annotated[uuid.UUID, Path()],
+    request: Annotated[AdminMemeDeleteRequest, Body()],
+) -> AdminMemeDestructiveActionRead:
+    try:
+        return await admin_service.delete_meme(
+            meme_id,
+            admin_user_id=admin_user.id,
+            request=request,
+        )
+    except (AdminNotFoundError, AdminConflictError) as exc:
+        raise _map_admin_error(exc) from exc
+
+
+@router.post("/memes/{meme_id}/merge", response_model=AdminMemeDestructiveActionRead, summary="Merge a meme")
+async def merge_admin_meme(
+    admin_user: AdminUserDep,
+    admin_service: AdminServiceDep,
+    meme_id: Annotated[uuid.UUID, Path()],
+    request: Annotated[AdminMemeMergeRequest, Body()],
+) -> AdminMemeDestructiveActionRead:
+    try:
+        return await admin_service.merge_meme(
             meme_id,
             admin_user_id=admin_user.id,
             request=request,

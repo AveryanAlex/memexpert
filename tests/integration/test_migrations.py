@@ -24,6 +24,7 @@ if TYPE_CHECKING:
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ALEMBIC_INI_PATH = PROJECT_ROOT / "alembic.ini"
 EXPECTED_TABLES = {
+    "admin_meme_destructive_audit_logs",
     "account_deletion_logs",
     "account_merge_logs",
     "analytics_events",
@@ -251,9 +252,9 @@ def test_initial_revision_metadata_is_present() -> None:
     revision = script_directory.get_revision("head")
 
     assert revision is not None
-    assert revision.revision == "0010"
-    assert revision.down_revision == "0009"
-    assert revision.doc == "moderation reports and decision audit"
+    assert revision.revision == "0012"
+    assert revision.down_revision == "0011"
+    assert revision.doc == "admin meme destructive audit"
 
 
 async def test_upgrade_head_creates_expected_schema_and_constraints(
@@ -266,7 +267,7 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
 
     table_names = await _get_table_names(engine)
     assert table_names == EXPECTED_TABLES | {"alembic_version"}
-    assert await _get_current_revision(engine) == "0010"
+    assert await _get_current_revision(engine) == "0012"
     assert await _get_materialized_view_names(engine) == EXPECTED_MATERIALIZED_VIEWS
 
     users_indexes = await _get_index_definitions(engine, "users")
@@ -283,6 +284,8 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
     public_template_trends_indexes = await _get_index_definitions(engine, "public_template_trends_mv")
     meme_file_ocr_result_columns = await _get_column_names(engine, "meme_file_ocr_results")
     meme_merge_log_columns = await _get_column_names(engine, "meme_merge_logs")
+    admin_meme_audit_columns = await _get_column_names(engine, "admin_meme_destructive_audit_logs")
+    admin_meme_audit_indexes = await _get_index_definitions(engine, "admin_meme_destructive_audit_logs")
     pipeline_stage_journal_columns = await _get_column_names(engine, "pipeline_stage_journal")
     constraints = await _inspect_constraints(engine)
 
@@ -404,6 +407,25 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
         "target_meme_id",
         "target_primary_file_id",
     }
+    assert admin_meme_audit_columns == {
+        "action",
+        "admin_user_id",
+        "affected_snapshot",
+        "created_at",
+        "id",
+        "note",
+        "source_meme_id",
+        "target_meme_id",
+    }
+    assert "ix_admin_meme_destructive_audit_logs_source_created_at" in admin_meme_audit_indexes
+    assert "source_meme_id" in admin_meme_audit_indexes[
+        "ix_admin_meme_destructive_audit_logs_source_created_at"
+    ]
+    assert "ix_admin_meme_destructive_audit_logs_admin_created_at" in admin_meme_audit_indexes
+    assert "admin_user_id" in admin_meme_audit_indexes[
+        "ix_admin_meme_destructive_audit_logs_admin_created_at"
+    ]
+    assert "ix_admin_meme_destructive_audit_logs_action_created_at" in admin_meme_audit_indexes
     assert "uq_telegram_file_id_cache_file_format_scope" in telegram_indexes
     assert "UNIQUE INDEX uq_telegram_file_id_cache_file_format_scope" in telegram_indexes[
         "uq_telegram_file_id_cache_file_format_scope"
@@ -507,7 +529,7 @@ async def test_crawler_sources_migration_applies_and_reverses(
     config = _build_alembic_config(database_url)
 
     await _run_alembic_command(command.upgrade, config, "head")
-    assert await _get_current_revision(engine) == "0010"
+    assert await _get_current_revision(engine) == "0012"
 
     meme_sources_columns = await _get_column_names(engine, "meme_sources")
     source_channels_columns = await _get_column_names(engine, "source_channels")
@@ -603,7 +625,7 @@ async def test_repeated_fresh_database_upgrades_work_after_a_full_downgrade(
     await _run_alembic_command(command.downgrade, config, "base")
     await _run_alembic_command(command.upgrade, config, "head")
 
-    assert await _get_current_revision(engine) == "0010"
+    assert await _get_current_revision(engine) == "0012"
     assert EXPECTED_TABLES.issubset(await _get_table_names(engine))
 
 
