@@ -18,16 +18,23 @@ from memexpert.core.broker import ensure_pipeline_broker_started, get_pipeline_b
 from memexpert.core.config import Settings, get_settings
 from memexpert.core.media import NormalizedMediaResult, PipelineMediaProcessor, PipelineMediaProcessorProtocol
 from memexpert.core.ocr import OCRExtractionResult, OCRProcessorProtocol, PipelineOCRProcessor
+from memexpert.core.perceptual_hashes import (
+    DEFAULT_PERCEPTUAL_HASH_ALGORITHM,
+    hamming_distance_hex,
+    perceptual_hash_bit_size,
+)
 from memexpert.core.storage import build_original_object_key, get_pipeline_storage_settings, get_s3_client
 from memexpert.core.voyage import VoyageMalformedResponseError
 from memexpert.models.base import utcnow
 from memexpert.models.content import (
+    BlockedPerceptualHash,
     EmbeddingCache,
     Meme,
     MemeFile,
     MemeFileOCRResult,
     MemeFileSyncTargetSnapshot,
     MemeSource,
+    ModerationDecision,
     PipelineStageJournal,
     SourceChannel,
 )
@@ -39,6 +46,7 @@ from memexpert.models.enums import (
     ContentProcessingStatus,
     ContentSourceKind,
     EmbeddingInputType,
+    ModerationAction,
     SyncTargetKind,
     SyncTargetStatus,
 )
@@ -155,6 +163,14 @@ class PreparedUpload:
 
 
 @dataclass(frozen=True, slots=True)
+class BlockedPerceptualHashMatch:
+    """Active blocked pHash row plus its computed distance to an incoming file."""
+
+    blocked_hash: BlockedPerceptualHash
+    hamming_distance: int
+
+
+@dataclass(frozen=True, slots=True)
 class PipelineStageWorkContext:
     """Compact worker context returned after a stage is marked processing."""
 
@@ -238,6 +254,15 @@ class ContentPipelineService:
             content_type=content_type,
             media_bytes=media_bytes,
         )
+        blocked_match = await self._find_blocked_perceptual_hash_match(prepared_upload.perceptual_hash)
+        if blocked_match is not None:
+            item = await self._persist_blocked_upload(
+                meme_file_id=meme_file_id,
+                metadata=metadata,
+                prepared_upload=prepared_upload,
+                blocked_match=blocked_match,
+            )
+            return ContentPipelineUploadRead.model_validate(item.model_dump(mode="python"))
 
         await self._put_original_object(prepared_upload=prepared_upload, media_bytes=media_bytes)
 
@@ -346,6 +371,16 @@ class ContentPipelineService:
             content_type=raw_post.content_type or _consts.CRAWLER_MEDIA_DEFAULT_CONTENT_TYPES[raw_post.media_type],
             media_bytes=raw_post.media_bytes,
         )
+        blocked_match = await self._find_blocked_perceptual_hash_match(prepared_upload.perceptual_hash)
+        if blocked_match is not None:
+            return await self._persist_blocked_crawler_ingest(
+                meme_file_id=meme_file_id,
+                raw_post=raw_post,
+                prepared_upload=prepared_upload,
+                blocked_match=blocked_match,
+                channel=channel,
+                received_at=received_at,
+            )
 
         await self._put_original_object(
             prepared_upload=prepared_upload,
@@ -1702,6 +1737,213 @@ class ContentPipelineService:
             dispatch_event,
         )
 
+    async def _persist_blocked_upload(
+        self,
+        *,
+        meme_file_id: uuid.UUID,
+        metadata: ContentPipelineUploadMetadata,
+        prepared_upload: PreparedUpload,
+        blocked_match: BlockedPerceptualHashMatch,
+    ) -> ContentPipelineItemRead:
+        now = utcnow()
+        try:
+            await self._ensure_source_identifier_is_available(metadata)
+            await self._create_blocked_upload_rows(
+                meme_id=uuid.uuid7(),
+                meme_file_id=meme_file_id,
+                metadata=metadata,
+                prepared_upload=prepared_upload,
+                blocked_match=blocked_match,
+                created_at=now,
+            )
+            await self._session.commit()
+        except (PipelinePayloadValidationError, PipelineSourceConflictError):
+            await self._session.rollback()
+            raise
+        except SQLAlchemyError as exc:
+            await self._session.rollback()
+            raise PipelineIngestError("Failed to persist blocked upload quarantine state.") from exc
+
+        return await self.get_item(meme_file_id)
+
+    async def _persist_blocked_crawler_ingest(
+        self,
+        *,
+        meme_file_id: uuid.UUID,
+        raw_post: RawCrawlerPost,
+        prepared_upload: PreparedUpload,
+        blocked_match: BlockedPerceptualHashMatch,
+        channel: SourceChannel,
+        received_at: datetime,
+    ) -> CrawlerIngestResult:
+        try:
+            new_source_row = await self._create_blocked_crawler_ingest_rows(
+                meme_id=uuid.uuid7(),
+                meme_file_id=meme_file_id,
+                raw_post=raw_post,
+                prepared_upload=prepared_upload,
+                blocked_match=blocked_match,
+                received_at=received_at,
+            )
+            await advance_source_channel_checkpoint(
+                channel,
+                post_id=raw_post.post_id,
+                fetched_at=received_at,
+            )
+            await self._session.commit()
+        except SQLAlchemyError as exc:
+            await self._session.rollback()
+            raise PipelineIngestError("Failed to persist blocked crawler quarantine state.") from exc
+
+        await self._session.refresh(new_source_row)
+        return CrawlerIngestResult(
+            meme_file_id=meme_file_id,
+            meme_source_id=new_source_row.id,
+            outcome=CrawlerIngestOutcome.BLOCKED_PERCEPTUAL_HASH,
+            published_at=raw_post.published_at,
+            received_at=received_at,
+        )
+
+    async def _create_blocked_upload_rows(
+        self,
+        *,
+        meme_id: uuid.UUID,
+        meme_file_id: uuid.UUID,
+        metadata: ContentPipelineUploadMetadata,
+        prepared_upload: PreparedUpload,
+        blocked_match: BlockedPerceptualHashMatch,
+        created_at: datetime,
+    ) -> None:
+        await self._create_blocked_base_rows(
+            meme_id=meme_id,
+            meme_file_id=meme_file_id,
+            media_type=prepared_upload.media_type,
+            owner_user_id=metadata.owner_user_id,
+            prepared_upload=prepared_upload,
+            blocked_match=blocked_match,
+            created_at=created_at,
+        )
+        self._session.add(
+            MemeSource(
+                file_id=meme_file_id,
+                platform=metadata.source_platform,
+                source_id=metadata.source_id,
+                post_id=metadata.post_id,
+                views=metadata.views,
+                reactions={},
+                is_first_source=True,
+                source_alive=True,
+            ),
+        )
+        await self._session.flush()
+
+    async def _create_blocked_crawler_ingest_rows(
+        self,
+        *,
+        meme_id: uuid.UUID,
+        meme_file_id: uuid.UUID,
+        raw_post: RawCrawlerPost,
+        prepared_upload: PreparedUpload,
+        blocked_match: BlockedPerceptualHashMatch,
+        received_at: datetime,
+    ) -> MemeSource:
+        await self._create_blocked_base_rows(
+            meme_id=meme_id,
+            meme_file_id=meme_file_id,
+            media_type=prepared_upload.media_type,
+            owner_user_id=None,
+            prepared_upload=prepared_upload,
+            blocked_match=blocked_match,
+            created_at=received_at,
+        )
+        new_source_row = MemeSource(
+            file_id=meme_file_id,
+            platform=raw_post.platform,
+            source_id=raw_post.source_id,
+            post_id=raw_post.post_id,
+            views=raw_post.views,
+            reactions=dict(raw_post.reactions),
+            is_first_source=raw_post.forward is None,
+            source_alive=True,
+            published_at=raw_post.published_at,
+            forwarded_from_source_id=raw_post.forward.source_id if raw_post.forward is not None else None,
+            forwarded_from_post_id=raw_post.forward.post_id if raw_post.forward is not None else None,
+        )
+        self._session.add(new_source_row)
+        await self._session.flush()
+        return new_source_row
+
+    async def _create_blocked_base_rows(
+        self,
+        *,
+        meme_id: uuid.UUID,
+        meme_file_id: uuid.UUID,
+        media_type: ContentKind,
+        owner_user_id: uuid.UUID | None,
+        prepared_upload: PreparedUpload,
+        blocked_match: BlockedPerceptualHashMatch,
+        created_at: datetime,
+    ) -> None:
+        blocked_hash = blocked_match.blocked_hash
+        event_id = uuid.uuid7()
+        meme = Meme(
+            id=meme_id,
+            media_type=media_type,
+            language=ContentLanguage.NONE,
+            is_public=False,
+            author_user_id=owner_user_id,
+        )
+        self._session.add(meme)
+        await self._session.flush()
+
+        meme_file = MemeFile(
+            id=meme_file_id,
+            meme_id=meme_id,
+            status=ContentProcessingStatus.FAILED,
+            width=prepared_upload.width,
+            height=prepared_upload.height,
+            file_size_bytes=prepared_upload.file_size_bytes,
+            mime_type=prepared_upload.mime_type,
+            s3_original_key=prepared_upload.object_key,
+            perceptual_hash=prepared_upload.perceptual_hash,
+            blocked_perceptual_hash_id=blocked_hash.id,
+            is_primary=True,
+        )
+        self._session.add(meme_file)
+        await self._session.flush()
+
+        meme.primary_file_id = meme_file_id
+        self._session.add_all(
+            [
+                PipelineStageJournal(
+                    meme_file_id=meme_file_id,
+                    stage=ContentPipelineStage.INGEST,
+                    status=ContentPipelineStageStatus.FAILED,
+                    attempt_count=1,
+                    last_event_id=event_id,
+                    normalized_reason=_consts.PIPELINE_REASON_BLOCKED_PERCEPTUAL_HASH,
+                    last_error_text=self._blocked_hash_error_text(blocked_match),
+                    is_retryable=False,
+                    started_at=created_at,
+                    finished_at=created_at,
+                ),
+                ModerationDecision(
+                    meme=meme,
+                    admin_user_id=None,
+                    action=ModerationAction.HIDE,
+                    reason=blocked_hash.reason,
+                    note=self._blocked_hash_error_text(blocked_match),
+                    previous_is_public=False,
+                    previous_is_nsfw=False,
+                    new_is_public=False,
+                    new_is_nsfw=False,
+                    previous_template_id=None,
+                    new_template_id=None,
+                ),
+            ],
+        )
+        await self._session.flush()
+
     async def _create_new_crawler_ingest_rows(
         self,
         *,
@@ -1901,10 +2143,54 @@ class ContentPipelineService:
         )
         await self._session.flush()
 
+    async def _find_blocked_perceptual_hash_match(
+        self,
+        perceptual_hash: str,
+    ) -> BlockedPerceptualHashMatch | None:
+        try:
+            hash_size = perceptual_hash_bit_size(perceptual_hash)
+        except ValueError:
+            return None
+        rows = (
+            await self._session.execute(
+                select(BlockedPerceptualHash)
+                .where(
+                    BlockedPerceptualHash.is_active.is_(True),
+                    BlockedPerceptualHash.hash_algorithm == DEFAULT_PERCEPTUAL_HASH_ALGORITHM,
+                    BlockedPerceptualHash.hash_size == hash_size,
+                )
+                .order_by(BlockedPerceptualHash.created_at.asc(), BlockedPerceptualHash.id.asc()),
+            )
+        ).scalars().all()
+
+        best_match: BlockedPerceptualHashMatch | None = None
+        for blocked_hash in rows:
+            distance = hamming_distance_hex(perceptual_hash, blocked_hash.perceptual_hash)
+            if distance is None or distance > blocked_hash.max_hamming_distance:
+                continue
+            candidate = BlockedPerceptualHashMatch(blocked_hash=blocked_hash, hamming_distance=distance)
+            if best_match is None or candidate.hamming_distance < best_match.hamming_distance:
+                best_match = candidate
+        return best_match
+
+    @staticmethod
+    def _blocked_hash_error_text(blocked_match: BlockedPerceptualHashMatch) -> str:
+        blocked_hash = blocked_match.blocked_hash
+        note_suffix = f" Note: {blocked_hash.note}" if blocked_hash.note else ""
+        return trim_error_text(
+            "Upload matched blocked perceptual hash "
+            f"{blocked_hash.id} ({blocked_hash.hash_algorithm}, distance "
+            f"{blocked_match.hamming_distance}/{blocked_hash.max_hamming_distance}, reason "
+            f"{blocked_hash.reason.value}).{note_suffix}"
+        )
+
     async def _find_duplicate_match(self, perceptual_hash: str) -> MemeFile | None:
         result = await self._session.execute(
             select(MemeFile)
-            .where(MemeFile.perceptual_hash == perceptual_hash)
+            .where(
+                MemeFile.perceptual_hash == perceptual_hash,
+                MemeFile.blocked_perceptual_hash_id.is_(None),
+            )
             .order_by(MemeFile.created_at.asc(), MemeFile.id.asc())
             .limit(1)
         )

@@ -4,7 +4,10 @@ import type { Actions, PageServerLoad } from './$types';
 import {
   addSourceChannel,
   ApiError,
+  createBlockedPerceptualHash,
   createMemeTemplate,
+  deactivateBlockedPerceptualHash,
+  deleteBlockedPerceptualHash,
   deleteMemeTemplate,
   fetchAdminDashboard,
   markSourceChannelDead,
@@ -13,8 +16,10 @@ import {
   resolveModerationReport,
   setSourceChannelPaused,
   updateMemeModeration,
+  updateBlockedPerceptualHash,
   updateMemeTemplate
 } from '$lib/api/client';
+import { buildBlockedPhashPayload } from '$lib/admin/blockedPhash';
 
 export const load: PageServerLoad = async ({ fetch, request }) => {
   const cookieHeader = request.headers.get('cookie') ?? undefined;
@@ -25,7 +30,15 @@ export const load: PageServerLoad = async ({ fetch, request }) => {
     };
   } catch (caught) {
     return {
-      dashboard: { suggestions: [], sourceChannels: [], templates: [], memes: [], reports: [], decisions: [] },
+      dashboard: {
+        suggestions: [],
+        sourceChannels: [],
+        templates: [],
+        blockedPerceptualHashes: [],
+        memes: [],
+        reports: [],
+        decisions: []
+      },
       loadError: caught instanceof ApiError ? caught.message : 'Could not load admin tools.'
     };
   }
@@ -172,6 +185,58 @@ export const actions: Actions = {
       return { message: 'Unreferenced template deleted.' };
     });
   },
+  createBlockedPerceptualHash: async ({ fetch, request }) => {
+    const data = await request.formData();
+    return runAction(async () => {
+      await createBlockedPerceptualHash({
+        fetch,
+        baseUrl: apiBaseUrl(),
+        cookieHeader: request.headers.get('cookie') ?? undefined,
+        body: blockedPhashPayloadFromForm(data)
+      });
+      return { message: 'Blocked perceptual hash created.' };
+    });
+  },
+  updateBlockedPerceptualHash: async ({ fetch, request }) => {
+    const data = await request.formData();
+    return runAction(async () => {
+      await updateBlockedPerceptualHash(
+        {
+          fetch,
+          baseUrl: apiBaseUrl(),
+          cookieHeader: request.headers.get('cookie') ?? undefined,
+          body: blockedPhashPayloadFromForm(data)
+        },
+        readRequired(data, 'blocked_hash_id')
+      );
+      return { message: 'Blocked perceptual hash updated.' };
+    });
+  },
+  deactivateBlockedPerceptualHash: async ({ fetch, request }) => {
+    const data = await request.formData();
+    return runAction(async () => {
+      await deactivateBlockedPerceptualHash(
+        {
+          fetch,
+          baseUrl: apiBaseUrl(),
+          cookieHeader: request.headers.get('cookie') ?? undefined,
+          body: { note: readOptional(data, 'note') }
+        },
+        readRequired(data, 'blocked_hash_id')
+      );
+      return { message: 'Blocked perceptual hash deactivated.' };
+    });
+  },
+  deleteBlockedPerceptualHash: async ({ fetch, request }) => {
+    const data = await request.formData();
+    return runAction(async () => {
+      const result = await deleteBlockedPerceptualHash(
+        { fetch, baseUrl: apiBaseUrl(), cookieHeader: request.headers.get('cookie') ?? undefined },
+        readRequired(data, 'blocked_hash_id')
+      );
+      return { message: result.message };
+    });
+  },
   updateMemeModeration: async ({ fetch, request }) => {
     const data = await request.formData();
     return runAction(async () => {
@@ -220,6 +285,9 @@ async function runAction(operation: () => Promise<{ message: string }>) {
     if (caught instanceof ApiError) {
       return fail(caught.status, { message: caught.message });
     }
+    if (caught instanceof Error) {
+      return fail(400, { message: caught.message });
+    }
     return fail(500, { message: 'Admin operation failed.' });
   }
 }
@@ -238,8 +306,25 @@ function readOptional(data: FormData, name: string): string | null {
 }
 
 function readInt(data: FormData, name: string, fallback: number): number {
-  const value = Number.parseInt(String(data.get(name) ?? ''), 10);
-  return Number.isFinite(value) ? value : fallback;
+  const raw = String(data.get(name) ?? '').trim();
+  if (!raw) {
+    return fallback;
+  }
+  if (!/^\d+$/.test(raw)) {
+    throw new Error(`${name} must be a whole number.`);
+  }
+  return Number(raw);
+}
+
+function blockedPhashPayloadFromForm(data: FormData) {
+  return buildBlockedPhashPayload({
+    perceptualHash: readRequired(data, 'perceptual_hash'),
+    hashAlgorithm: readOptional(data, 'hash_algorithm'),
+    maxHammingDistance: readInt(data, 'max_hamming_distance', 0),
+    reason: readRequired(data, 'reason'),
+    note: readOptional(data, 'note'),
+    isActive: data.get('is_active') === 'on'
+  });
 }
 
 function apiBaseUrl(): string {

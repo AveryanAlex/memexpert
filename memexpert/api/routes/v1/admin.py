@@ -11,6 +11,12 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Path, Query, status
 from memexpert.api.dependencies import AdminUserDep, DbSessionDep
 from memexpert.models.enums import ChannelSuggestionStatus, ModerationReportStatus
 from memexpert.schemas.admin import (
+    AdminBlockedPerceptualHashActionRead,
+    AdminBlockedPerceptualHashAuditRead,
+    AdminBlockedPerceptualHashCreateRequest,
+    AdminBlockedPerceptualHashDeactivateRequest,
+    AdminBlockedPerceptualHashRead,
+    AdminBlockedPerceptualHashUpdateRequest,
     AdminChannelSuggestionReviewRequest,
     AdminMemeDeleteRequest,
     AdminMemeDestructiveActionRead,
@@ -257,6 +263,107 @@ async def delete_meme_template(
         return await admin_service.delete_meme_template(template_id, request)
     except (AdminNotFoundError, AdminConflictError) as exc:
         raise _map_admin_error(exc) from exc
+
+
+@router.get(
+    "/blocked-perceptual-hashes",
+    response_model=list[AdminBlockedPerceptualHashRead],
+    summary="List blocked perceptual hashes",
+)
+async def list_blocked_perceptual_hashes(
+    _admin: AdminUserDep,
+    admin_service: AdminServiceDep,
+    is_active: Annotated[bool | None, Query()] = None,
+) -> list[AdminBlockedPerceptualHashRead]:
+    return await admin_service.list_blocked_perceptual_hashes(is_active=is_active)
+
+
+@router.post(
+    "/blocked-perceptual-hashes",
+    response_model=AdminBlockedPerceptualHashRead,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a blocked perceptual hash",
+)
+async def create_blocked_perceptual_hash(
+    admin_user: AdminUserDep,
+    admin_service: AdminServiceDep,
+    request: Annotated[AdminBlockedPerceptualHashCreateRequest, Body()],
+) -> AdminBlockedPerceptualHashRead:
+    try:
+        return await admin_service.create_blocked_perceptual_hash(request, admin_user_id=admin_user.id)
+    except (AdminNotFoundError, AdminConflictError) as exc:
+        raise _map_admin_error(exc) from exc
+
+
+@router.patch(
+    "/blocked-perceptual-hashes/{blocked_hash_id}",
+    response_model=AdminBlockedPerceptualHashRead,
+    summary="Update a blocked perceptual hash",
+)
+async def update_blocked_perceptual_hash(
+    admin_user: AdminUserDep,
+    admin_service: AdminServiceDep,
+    blocked_hash_id: Annotated[uuid.UUID, Path()],
+    request: Annotated[AdminBlockedPerceptualHashUpdateRequest, Body()],
+) -> AdminBlockedPerceptualHashRead:
+    try:
+        return await admin_service.update_blocked_perceptual_hash(
+            blocked_hash_id,
+            request,
+            admin_user_id=admin_user.id,
+        )
+    except (AdminNotFoundError, AdminConflictError) as exc:
+        raise _map_admin_error(exc) from exc
+
+
+@router.post(
+    "/blocked-perceptual-hashes/{blocked_hash_id}/deactivate",
+    response_model=AdminBlockedPerceptualHashActionRead,
+    summary="Deactivate a blocked perceptual hash",
+)
+async def deactivate_blocked_perceptual_hash(
+    admin_user: AdminUserDep,
+    admin_service: AdminServiceDep,
+    blocked_hash_id: Annotated[uuid.UUID, Path()],
+    request: Annotated[AdminBlockedPerceptualHashDeactivateRequest | None, Body()] = None,
+) -> AdminBlockedPerceptualHashActionRead:
+    try:
+        return await admin_service.deactivate_blocked_perceptual_hash(
+            blocked_hash_id,
+            request or AdminBlockedPerceptualHashDeactivateRequest(),
+            admin_user_id=admin_user.id,
+        )
+    except (AdminNotFoundError, AdminConflictError) as exc:
+        raise _map_admin_error(exc) from exc
+
+
+@router.delete(
+    "/blocked-perceptual-hashes/{blocked_hash_id}",
+    response_model=AdminBlockedPerceptualHashActionRead,
+    summary="Delete an unreferenced blocked perceptual hash or deactivate a referenced one",
+)
+async def delete_blocked_perceptual_hash(
+    admin_user: AdminUserDep,
+    admin_service: AdminServiceDep,
+    blocked_hash_id: Annotated[uuid.UUID, Path()],
+) -> AdminBlockedPerceptualHashActionRead:
+    try:
+        return await admin_service.delete_blocked_perceptual_hash_safe(blocked_hash_id, admin_user_id=admin_user.id)
+    except (AdminNotFoundError, AdminConflictError) as exc:
+        raise _map_admin_error(exc) from exc
+
+
+@router.get(
+    "/blocked-perceptual-hashes/{blocked_hash_id}/audit-log",
+    response_model=list[AdminBlockedPerceptualHashAuditRead],
+    summary="List blocked perceptual hash audit history",
+)
+async def list_blocked_perceptual_hash_audit(
+    _admin: AdminUserDep,
+    admin_service: AdminServiceDep,
+    blocked_hash_id: Annotated[uuid.UUID, Path()],
+) -> list[AdminBlockedPerceptualHashAuditRead]:
+    return await admin_service.list_blocked_perceptual_hash_audit(blocked_hash_id)
 
 
 @router.get("/memes", response_model=list[AdminMemeRead], summary="List memes for minimal moderation")

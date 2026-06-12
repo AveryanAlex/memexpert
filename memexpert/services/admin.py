@@ -9,10 +9,13 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
+from memexpert.core.perceptual_hashes import perceptual_hash_bit_size
 from memexpert.models.base import utcnow
 from memexpert.models.collection import CollectionMeme, PinnedMeme
 from memexpert.models.content import (
     AdminMemeDestructiveAuditLog,
+    BlockedPerceptualHash,
+    BlockedPerceptualHashAuditLog,
     EmbeddingCache,
     Meme,
     MemeFile,
@@ -31,6 +34,12 @@ from memexpert.models.content import (
 from memexpert.models.enums import ModerationAction, ModerationReportStatus
 from memexpert.models.user import ChannelSuggestion
 from memexpert.schemas.admin import (
+    AdminBlockedPerceptualHashActionRead,
+    AdminBlockedPerceptualHashAuditRead,
+    AdminBlockedPerceptualHashCreateRequest,
+    AdminBlockedPerceptualHashDeactivateRequest,
+    AdminBlockedPerceptualHashRead,
+    AdminBlockedPerceptualHashUpdateRequest,
     AdminMemeDeleteRequest,
     AdminMemeDestructiveActionRead,
     AdminMemeDetailRead,
@@ -317,6 +326,192 @@ class AdminService:
             affected_meme_count=0,
             message="Unreferenced template deleted.",
         )
+
+    async def list_blocked_perceptual_hashes(
+        self,
+        *,
+        is_active: bool | None = None,
+    ) -> list[AdminBlockedPerceptualHashRead]:
+        stmt = select(BlockedPerceptualHash).order_by(BlockedPerceptualHash.created_at.desc())
+        if is_active is not None:
+            stmt = stmt.where(BlockedPerceptualHash.is_active.is_(is_active))
+        rows = (await self.session.execute(stmt)).scalars().all()
+        return [AdminBlockedPerceptualHashRead.model_validate(row) for row in rows]
+
+    async def create_blocked_perceptual_hash(
+        self,
+        request: AdminBlockedPerceptualHashCreateRequest,
+        *,
+        admin_user_id: uuid.UUID,
+    ) -> AdminBlockedPerceptualHashRead:
+        blocked_hash = BlockedPerceptualHash(
+            perceptual_hash=request.perceptual_hash,
+            hash_algorithm=request.hash_algorithm,
+            hash_size=request.hash_size,
+            max_hamming_distance=request.max_hamming_distance,
+            reason=request.reason,
+            note=request.note,
+            is_active=request.is_active,
+            created_by_admin_user_id=admin_user_id,
+        )
+        self.session.add(blocked_hash)
+        try:
+            await self.session.flush()
+            self._add_blocked_hash_audit(
+                blocked_hash,
+                admin_user_id=admin_user_id,
+                action="create",
+                previous_values={},
+                new_values=self._blocked_hash_snapshot(blocked_hash),
+                note=request.note,
+            )
+            await self.session.commit()
+        except IntegrityError as exc:
+            await self.session.rollback()
+            raise AdminConflictError(
+                "Blocked perceptual hash already exists for that algorithm and hash size.",
+            ) from exc
+        await self.session.refresh(blocked_hash)
+        return AdminBlockedPerceptualHashRead.model_validate(blocked_hash)
+
+    async def update_blocked_perceptual_hash(
+        self,
+        blocked_hash_id: uuid.UUID,
+        request: AdminBlockedPerceptualHashUpdateRequest,
+        *,
+        admin_user_id: uuid.UUID,
+    ) -> AdminBlockedPerceptualHashRead:
+        blocked_hash = await self.session.scalar(
+            select(BlockedPerceptualHash).where(BlockedPerceptualHash.id == blocked_hash_id).with_for_update(),
+        )
+        if blocked_hash is None:
+            raise AdminNotFoundError(f"Blocked perceptual hash {blocked_hash_id} does not exist.")
+
+        previous_values = self._blocked_hash_snapshot(blocked_hash)
+        for field_name in request.model_fields_set:
+            setattr(blocked_hash, field_name, getattr(request, field_name))
+        if blocked_hash.hash_size != perceptual_hash_bit_size(blocked_hash.perceptual_hash):
+            await self.session.rollback()
+            raise AdminConflictError("hash_size must match perceptual_hash bit length.")
+        if blocked_hash.max_hamming_distance > blocked_hash.hash_size:
+            await self.session.rollback()
+            raise AdminConflictError("max_hamming_distance cannot exceed hash_size.")
+
+        try:
+            self._add_blocked_hash_audit(
+                blocked_hash,
+                admin_user_id=admin_user_id,
+                action="update",
+                previous_values=previous_values,
+                new_values=self._blocked_hash_snapshot(blocked_hash),
+                note=request.note,
+            )
+            await self.session.commit()
+        except IntegrityError as exc:
+            await self.session.rollback()
+            raise AdminConflictError(
+                "Blocked perceptual hash already exists for that algorithm and hash size.",
+            ) from exc
+        await self.session.refresh(blocked_hash)
+        return AdminBlockedPerceptualHashRead.model_validate(blocked_hash)
+
+    async def deactivate_blocked_perceptual_hash(
+        self,
+        blocked_hash_id: uuid.UUID,
+        request: AdminBlockedPerceptualHashDeactivateRequest,
+        *,
+        admin_user_id: uuid.UUID,
+    ) -> AdminBlockedPerceptualHashActionRead:
+        blocked_hash = await self.session.scalar(
+            select(BlockedPerceptualHash).where(BlockedPerceptualHash.id == blocked_hash_id).with_for_update(),
+        )
+        if blocked_hash is None:
+            raise AdminNotFoundError(f"Blocked perceptual hash {blocked_hash_id} does not exist.")
+        matched_count = await self._count_blocked_hash_matches(blocked_hash_id)
+        if blocked_hash.is_active:
+            previous_values = self._blocked_hash_snapshot(blocked_hash)
+            blocked_hash.is_active = False
+            self._add_blocked_hash_audit(
+                blocked_hash,
+                admin_user_id=admin_user_id,
+                action="deactivate",
+                previous_values=previous_values,
+                new_values=self._blocked_hash_snapshot(blocked_hash),
+                note=request.note,
+            )
+            await self.session.commit()
+        return AdminBlockedPerceptualHashActionRead(
+            action="deactivate",
+            blocked_perceptual_hash_id=blocked_hash_id,
+            matched_meme_file_count=matched_count,
+            message="Blocked perceptual hash deactivated.",
+        )
+
+    async def delete_blocked_perceptual_hash_safe(
+        self,
+        blocked_hash_id: uuid.UUID,
+        *,
+        admin_user_id: uuid.UUID,
+    ) -> AdminBlockedPerceptualHashActionRead:
+        blocked_hash = await self.session.scalar(
+            select(BlockedPerceptualHash).where(BlockedPerceptualHash.id == blocked_hash_id).with_for_update(),
+        )
+        if blocked_hash is None:
+            raise AdminNotFoundError(f"Blocked perceptual hash {blocked_hash_id} does not exist.")
+        matched_count = await self._count_blocked_hash_matches(blocked_hash_id)
+        previous_values = self._blocked_hash_snapshot(blocked_hash)
+
+        if matched_count:
+            blocked_hash.is_active = False
+            self._add_blocked_hash_audit(
+                blocked_hash,
+                admin_user_id=admin_user_id,
+                action="deactivate",
+                previous_values=previous_values,
+                new_values=self._blocked_hash_snapshot(blocked_hash),
+                note="Delete requested; deactivated because matched meme files still reference this blocked hash.",
+            )
+            await self.session.commit()
+            return AdminBlockedPerceptualHashActionRead(
+                action="deactivate",
+                blocked_perceptual_hash_id=blocked_hash_id,
+                matched_meme_file_count=matched_count,
+                message=(
+                    "Blocked perceptual hash is referenced by quarantined files, "
+                    "so it was deactivated instead of deleted."
+                ),
+            )
+
+        self._add_blocked_hash_audit(
+            blocked_hash,
+            admin_user_id=admin_user_id,
+            action="delete",
+            previous_values=previous_values,
+            new_values={},
+            note=None,
+        )
+        await self.session.flush()
+        await self.session.delete(blocked_hash)
+        await self.session.commit()
+        return AdminBlockedPerceptualHashActionRead(
+            action="delete",
+            blocked_perceptual_hash_id=blocked_hash_id,
+            matched_meme_file_count=0,
+            message="Unreferenced blocked perceptual hash deleted; audit history preserved.",
+        )
+
+    async def list_blocked_perceptual_hash_audit(
+        self,
+        blocked_hash_id: uuid.UUID,
+    ) -> list[AdminBlockedPerceptualHashAuditRead]:
+        rows = (
+            await self.session.execute(
+                select(BlockedPerceptualHashAuditLog)
+                .where(BlockedPerceptualHashAuditLog.blocked_perceptual_hash_id == blocked_hash_id)
+                .order_by(BlockedPerceptualHashAuditLog.created_at.desc()),
+            )
+        ).scalars().all()
+        return [AdminBlockedPerceptualHashAuditRead.model_validate(row) for row in rows]
 
     async def list_moderation_memes(
         self,
@@ -683,6 +878,48 @@ class AdminService:
                 ],
             },
             **file_bound_counts,
+        }
+
+    async def _count_blocked_hash_matches(self, blocked_hash_id: uuid.UUID) -> int:
+        return await self.session.scalar(
+            select(func.count()).select_from(MemeFile).where(MemeFile.blocked_perceptual_hash_id == blocked_hash_id),
+        ) or 0
+
+    def _add_blocked_hash_audit(
+        self,
+        blocked_hash: BlockedPerceptualHash,
+        *,
+        admin_user_id: uuid.UUID,
+        action: str,
+        previous_values: dict[str, object],
+        new_values: dict[str, object],
+        note: str | None,
+    ) -> None:
+        self.session.add(
+            BlockedPerceptualHashAuditLog(
+                blocked_perceptual_hash_id=blocked_hash.id,
+                admin_user_id=admin_user_id,
+                action=action,
+                previous_values=previous_values,
+                new_values=new_values,
+                note=note,
+            ),
+        )
+
+    @staticmethod
+    def _blocked_hash_snapshot(blocked_hash: BlockedPerceptualHash) -> dict[str, object]:
+        return {
+            "id": str(blocked_hash.id),
+            "perceptual_hash": blocked_hash.perceptual_hash,
+            "hash_algorithm": blocked_hash.hash_algorithm,
+            "hash_size": blocked_hash.hash_size,
+            "max_hamming_distance": blocked_hash.max_hamming_distance,
+            "reason": blocked_hash.reason.value,
+            "note": blocked_hash.note,
+            "is_active": blocked_hash.is_active,
+            "created_by_admin_user_id": (
+                None if blocked_hash.created_by_admin_user_id is None else str(blocked_hash.created_by_admin_user_id)
+            ),
         }
 
     async def _snapshot_file_bound_counts(
