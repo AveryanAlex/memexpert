@@ -1,4 +1,6 @@
-export type ProxyFetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+import { passthroughUpstreamResponse, type ProxyFetch } from './proxyResponse';
+
+export type { ProxyFetch };
 
 interface ActiveSaveProxyRequest {
   fetch: ProxyFetch;
@@ -23,29 +25,5 @@ export async function proxyActiveSaveCollection({
     body: await request.text()
   });
 
-  const responseHeaders = new Headers();
-  const contentType = upstream.headers.get('content-type');
-  if (contentType) {
-    responseHeaders.set('content-type', contentType);
-  }
-
-  for (const setCookie of readSetCookieHeaders(upstream.headers)) {
-    responseHeaders.append('set-cookie', setCookie);
-  }
-
-  return new Response(upstream.body, {
-    status: upstream.status,
-    statusText: upstream.statusText,
-    headers: responseHeaders
-  });
-}
-
-function readSetCookieHeaders(headers: Headers): string[] {
-  const headersWithSetCookie = headers as Headers & { getSetCookie?: () => string[] };
-  if (typeof headersWithSetCookie.getSetCookie === 'function') {
-    return headersWithSetCookie.getSetCookie();
-  }
-
-  const setCookie = headers.get('set-cookie');
-  return setCookie ? [setCookie] : [];
+  return passthroughUpstreamResponse(upstream);
 }

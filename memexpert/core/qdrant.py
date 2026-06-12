@@ -158,17 +158,29 @@ class QdrantSyncClientProtocol(Protocol):
     async def delete_meme_point(self, meme_file_id: uuid.UUID) -> None: ...
 
 
-class PipelineQdrantClient:
+class _LazyQdrantClient:
+    def __init__(self, *, settings: Settings | None = None) -> None:
+        self._settings = settings or get_settings()
+        self._client: Any | None = None
+
+    async def _ensure_client(self) -> Any:
+        if self._client is None:
+            from qdrant_client import AsyncQdrantClient
+
+            self._client = AsyncQdrantClient(
+                url=self._settings.qdrant_url,
+                timeout=max(1, int(self._settings.pipeline_qdrant_timeout_seconds)),
+            )
+        return self._client
+
+
+class PipelineQdrantClient(_LazyQdrantClient):
     """Real Qdrant adapter that wraps ``AsyncQdrantClient`` with lazy construction.
 
     S02 uses Qdrant only as an index of already-persisted embeddings — the real source of
     truth for vectors is ``EmbeddingCache``. The adapter is lazy so that importing the
     module during app startup does not open any network connections.
     """
-
-    def __init__(self, *, settings: Settings | None = None) -> None:
-        self._settings = settings or get_settings()
-        self._client: Any | None = None
 
     async def find_similar_memes(
         self,
@@ -196,18 +208,7 @@ class PipelineQdrantClient:
 
         return _parse_qdrant_matches(raw_matches, current_meme_file_id=current_meme_file_id)
 
-    async def _ensure_client(self) -> Any:
-        if self._client is None:
-            from qdrant_client import AsyncQdrantClient
-
-            self._client = AsyncQdrantClient(
-                url=self._settings.qdrant_url,
-                timeout=max(1, int(self._settings.pipeline_qdrant_timeout_seconds)),
-            )
-        return self._client
-
-
-class PipelineQdrantUserSearchClient:
+class PipelineQdrantUserSearchClient(_LazyQdrantClient):
     """Lazy Qdrant adapter for user-facing semantic meme search.
 
     The adapter accepts an already-computed text query vector because Qdrant is
@@ -215,10 +216,6 @@ class PipelineQdrantUserSearchClient:
     class does not contact Qdrant; the SDK client is created only when semantic
     search is actually requested.
     """
-
-    def __init__(self, *, settings: Settings | None = None) -> None:
-        self._settings = settings or get_settings()
-        self._client: Any | None = None
 
     async def search_memes_by_vector(
         self,
@@ -245,18 +242,7 @@ class PipelineQdrantUserSearchClient:
 
         return _parse_qdrant_user_search_matches(raw_matches)
 
-    async def _ensure_client(self) -> Any:
-        if self._client is None:
-            from qdrant_client import AsyncQdrantClient
-
-            self._client = AsyncQdrantClient(
-                url=self._settings.qdrant_url,
-                timeout=max(1, int(self._settings.pipeline_qdrant_timeout_seconds)),
-            )
-        return self._client
-
-
-class PipelineQdrantSyncClient:
+class PipelineQdrantSyncClient(_LazyQdrantClient):
     """Lazy Qdrant sync adapter for per-file upsert/fetch/delete operations.
 
     Shares the same ``AsyncQdrantClient`` construction pattern as
@@ -266,10 +252,6 @@ class PipelineQdrantSyncClient:
     ``QdrantSync*`` errors — callers never see raw SDK exceptions or reach past
     the adapter to httpx/transport errors.
     """
-
-    def __init__(self, *, settings: Settings | None = None) -> None:
-        self._settings = settings or get_settings()
-        self._client: Any | None = None
 
     async def upsert_meme_point(
         self,
@@ -325,17 +307,6 @@ class PipelineQdrantSyncClient:
             )
         except Exception as exc:
             _raise_sync_error_from(exc, operation="delete_meme_point")
-
-    async def _ensure_client(self) -> Any:
-        if self._client is None:
-            from qdrant_client import AsyncQdrantClient
-
-            self._client = AsyncQdrantClient(
-                url=self._settings.qdrant_url,
-                timeout=max(1, int(self._settings.pipeline_qdrant_timeout_seconds)),
-            )
-        return self._client
-
 
 def _raise_sync_error_from(exc: BaseException, *, operation: str) -> None:
     """Map an arbitrary SDK/transport exception onto the typed sync-error taxonomy.

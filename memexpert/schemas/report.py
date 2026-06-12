@@ -9,6 +9,7 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from memexpert.models.enums import ModerationReason, ModerationReportStatus
+from memexpert.schemas._text import normalize_optional_text
 from memexpert.schemas.base import ORMSchema
 
 MAX_REPORT_NOTE_LENGTH = 2048
@@ -25,10 +26,7 @@ class MemeReportCreateRequest(BaseModel):
     @field_validator("note")
     @classmethod
     def _normalize_note(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        normalized = value.strip()
-        return normalized or None
+        return normalize_optional_text(value)
 
 
 class MemeReportRead(ORMSchema):
