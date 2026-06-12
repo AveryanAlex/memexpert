@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from memexpert.core.qdrant import QdrantSimilarityMatch
 
 MERGE_REASON_HIGH_SIMILARITY = "high_similarity_match"
+MERGE_REASON_ADMIN = "admin_destructive_merge"
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +95,31 @@ class ContentMergeService:
             source_meme_file_id=meme_file.id,
             target_meme=target_meme,
             similarity_score=matched_score,
+            merge_reason=MERGE_REASON_HIGH_SIMILARITY,
+        )
+
+    async def merge_memes_for_admin(
+        self,
+        *,
+        source_meme: Meme,
+        target_meme: Meme,
+        admin_user_id: uuid.UUID,
+        note: str,
+        affected_snapshot: dict[str, object],
+    ) -> MergeOutcome:
+        """Merge one explicit source meme into a target using the shared lineage transfer path."""
+
+        return await self._apply_merge(
+            source_meme=source_meme,
+            source_meme_file_id=source_meme.primary_file_id,
+            target_meme=target_meme,
+            similarity_score=None,
+            merge_reason=MERGE_REASON_ADMIN,
+            details={
+                "admin_user_id": str(admin_user_id),
+                "admin_note": note,
+                "affected_snapshot": affected_snapshot,
+            },
         )
 
     async def _evaluate_initial_target(self, *, meme_file: MemeFile) -> Meme:
@@ -140,9 +166,11 @@ class ContentMergeService:
         self,
         *,
         source_meme: Meme,
-        source_meme_file_id: uuid.UUID,
+        source_meme_file_id: uuid.UUID | None,
         target_meme: Meme,
-        similarity_score: float,
+        similarity_score: float | None,
+        merge_reason: str,
+        details: dict[str, object] | None = None,
     ) -> MergeOutcome:
         moved_file_ids = await self._transfer_meme_files(source_meme_id=source_meme.id, target_meme_id=target_meme.id)
         await self._transfer_collection_memberships(source_meme_id=source_meme.id, target_meme_id=target_meme.id)
@@ -156,6 +184,9 @@ class ContentMergeService:
 
         primary_file_id = await self._reselect_primary_file(target_meme.id)
 
+        log_details = dict(details or {})
+        log_details["moved_file_ids"] = [str(file_id) for file_id in moved_file_ids]
+
         self._session.add(
             MemeMergeLog(
                 source_meme_id=source_meme.id,
@@ -163,8 +194,8 @@ class ContentMergeService:
                 target_meme_id=target_meme.id,
                 target_primary_file_id=primary_file_id,
                 similarity_score=similarity_score,
-                merge_reason=MERGE_REASON_HIGH_SIMILARITY,
-                details={"moved_file_ids": [str(file_id) for file_id in moved_file_ids]},
+                merge_reason=merge_reason,
+                details=log_details,
             )
         )
         await self._session.flush()
@@ -303,6 +334,7 @@ class ContentMergeService:
         return best_file.id
 
 __all__ = [
+    "MERGE_REASON_ADMIN",
     "MERGE_REASON_HIGH_SIMILARITY",
     "ContentMergeService",
     "MergeOutcome",

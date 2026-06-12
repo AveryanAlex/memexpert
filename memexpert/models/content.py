@@ -693,6 +693,28 @@ class EmbeddingCache(UUIDPrimaryKeyMixin, Base):
     source_file: Mapped["MemeFile | None"] = relationship("MemeFile", back_populates="embedding_cache_entries")
 
 
+class AdminMemeDestructiveAuditLog(UUIDPrimaryKeyMixin, Base):
+    """Durable admin audit for meme destructive actions that outlives meme deletion."""
+
+    __tablename__ = "admin_meme_destructive_audit_logs"
+    __table_args__ = (
+        Index("ix_admin_meme_destructive_audit_logs_source_created_at", "source_meme_id", "created_at"),
+        Index("ix_admin_meme_destructive_audit_logs_admin_created_at", "admin_user_id", "created_at"),
+        Index("ix_admin_meme_destructive_audit_logs_action_created_at", "action", "created_at"),
+    )
+
+    admin_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    source_meme_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
+    target_meme_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+    note: Mapped[str] = mapped_column(Text, nullable=False)
+    affected_snapshot: Mapped[dict[str, object]] = mapped_column(JSONB, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow, nullable=False)
+
+
 class MemeMergeLog(UUIDPrimaryKeyMixin, Base):
     """Audit records for canonical meme merge decisions and moved lineage."""
 
@@ -714,6 +736,7 @@ class MemeMergeLog(UUIDPrimaryKeyMixin, Base):
 
 
 __all__ = [
+    "AdminMemeDestructiveAuditLog",
     "EmbeddingCache",
     "Meme",
     "MemeFile",

@@ -5,16 +5,36 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
 from memexpert.models.base import utcnow
-from memexpert.models.content import Meme, MemeTemplate, ModerationDecision, ModerationReport, SourceChannel
+from memexpert.models.collection import CollectionMeme, PinnedMeme
+from memexpert.models.content import (
+    AdminMemeDestructiveAuditLog,
+    EmbeddingCache,
+    Meme,
+    MemeFile,
+    MemeFileOCRResult,
+    MemeFileSyncTargetSnapshot,
+    MemePopularitySnapshot,
+    MemeSeoPage,
+    MemeSource,
+    MemeTemplate,
+    ModerationDecision,
+    ModerationReport,
+    PipelineStageJournal,
+    SourceChannel,
+    TelegramFileIdCache,
+)
 from memexpert.models.enums import ModerationAction, ModerationReportStatus
 from memexpert.models.user import ChannelSuggestion
 from memexpert.schemas.admin import (
+    AdminMemeDeleteRequest,
+    AdminMemeDestructiveActionRead,
     AdminMemeDetailRead,
+    AdminMemeMergeRequest,
     AdminMemeModerationUpdateRequest,
     AdminMemeRead,
     AdminMemeTemplateRead,
@@ -26,13 +46,18 @@ from memexpert.schemas.admin import (
     AdminSourceChannelRead,
 )
 from memexpert.schemas.user import ChannelSuggestionRead
+from memexpert.services.content_merge import ContentMergeService
 
 if TYPE_CHECKING:
     import uuid
+    from collections.abc import Iterable
 
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from memexpert.models.enums import ChannelSuggestionStatus
+
+
+MAX_AUDIT_SNAPSHOT_IDS = 25
 
 
 class AdminServiceError(Exception):
@@ -188,6 +213,98 @@ class AdminService:
             meme=AdminMemeRead.model_validate(meme),
             reports=[AdminModerationReportRead.model_validate(report) for report in reports],
             decisions=[AdminModerationDecisionRead.model_validate(decision) for decision in decisions],
+        )
+
+    async def delete_meme(
+        self,
+        meme_id: uuid.UUID,
+        *,
+        admin_user_id: uuid.UUID,
+        request: AdminMemeDeleteRequest,
+    ) -> AdminMemeDestructiveActionRead:
+        meme = await self.session.scalar(select(Meme).where(Meme.id == meme_id).with_for_update())
+        if meme is None:
+            raise AdminNotFoundError(f"Meme {meme_id} does not exist.")
+        if request.confirmation != str(meme_id):
+            raise AdminConflictError("Meme deletion confirmation must exactly match the meme id.")
+
+        affected_snapshot = await self._snapshot_meme_dependents(meme)
+        audit_log = AdminMemeDestructiveAuditLog(
+            admin_user_id=admin_user_id,
+            source_meme_id=meme_id,
+            target_meme_id=None,
+            action="delete",
+            note=request.note,
+            affected_snapshot=affected_snapshot,
+        )
+        self.session.add(audit_log)
+
+        # Avoid primary-file FK ordering surprises before ORM/database cascades remove file rows.
+        meme.primary_file_id = None
+        await self.session.flush()
+        audit_log_id = audit_log.id
+        await self.session.delete(meme)
+        await self.session.commit()
+
+        return AdminMemeDestructiveActionRead(
+            action="delete",
+            source_meme_id=meme_id,
+            target_meme_id=None,
+            audit_log_id=audit_log_id,
+            affected_snapshot=affected_snapshot,
+            message="Meme deleted and destructive audit log recorded.",
+        )
+
+    async def merge_meme(
+        self,
+        meme_id: uuid.UUID,
+        *,
+        admin_user_id: uuid.UUID,
+        request: AdminMemeMergeRequest,
+    ) -> AdminMemeDestructiveActionRead:
+        source_meme = await self.session.scalar(select(Meme).where(Meme.id == meme_id).with_for_update())
+        if source_meme is None:
+            raise AdminNotFoundError(f"Meme {meme_id} does not exist.")
+        if request.confirmation != str(meme_id):
+            raise AdminConflictError("Meme merge confirmation must exactly match the source meme id.")
+        if request.target_meme_id == meme_id:
+            raise AdminConflictError("A meme cannot be merged into itself.")
+
+        target_meme = await self.session.scalar(select(Meme).where(Meme.id == request.target_meme_id).with_for_update())
+        if target_meme is None:
+            raise AdminNotFoundError(f"Target meme {request.target_meme_id} does not exist.")
+
+        affected_snapshot = await self._snapshot_meme_dependents(source_meme)
+        affected_snapshot["target_meme_id"] = str(request.target_meme_id)
+        audit_log = AdminMemeDestructiveAuditLog(
+            admin_user_id=admin_user_id,
+            source_meme_id=meme_id,
+            target_meme_id=request.target_meme_id,
+            action="merge",
+            note=request.note,
+            affected_snapshot=affected_snapshot,
+        )
+        self.session.add(audit_log)
+
+        merge_service = ContentMergeService(self.session, similarity_threshold=1.0)
+        await merge_service.merge_memes_for_admin(
+            source_meme=source_meme,
+            target_meme=target_meme,
+            admin_user_id=admin_user_id,
+            note=request.note,
+            affected_snapshot=affected_snapshot,
+        )
+        await self.session.flush()
+        audit_log_id = audit_log.id
+        await self.session.commit()
+
+        return AdminMemeDestructiveActionRead(
+            action="merge",
+            source_meme_id=meme_id,
+            target_meme_id=request.target_meme_id,
+            audit_log_id=audit_log_id,
+            affected_snapshot=affected_snapshot,
+            message="Meme merged into target and destructive audit log recorded.",
         )
 
     async def update_meme_moderation(
@@ -353,6 +470,132 @@ class AdminService:
             stmt = stmt.where(ModerationDecision.report_id == report_id)
         rows = (await self.session.execute(stmt)).scalars().all()
         return [AdminModerationDecisionRead.model_validate(row) for row in rows]
+
+    async def _snapshot_meme_dependents(self, meme: Meme) -> dict[str, object]:
+        file_ids = tuple(
+            (await self.session.execute(select(MemeFile.id).where(MemeFile.meme_id == meme.id))).scalars().all()
+        )
+        collection_ids = tuple(
+            (
+                await self.session.execute(
+                    select(CollectionMeme.collection_id).where(CollectionMeme.meme_id == meme.id),
+                )
+            ).scalars().all()
+        )
+        pinned_user_ids = tuple(
+            (
+                await self.session.execute(select(PinnedMeme.user_id).where(PinnedMeme.meme_id == meme.id))
+            ).scalars().all()
+        )
+        report_rows = (
+            await self.session.execute(
+                select(ModerationReport.id, ModerationReport.status).where(ModerationReport.meme_id == meme.id),
+            )
+        ).all()
+        decision_rows = (
+            await self.session.execute(
+                select(ModerationDecision.id, ModerationDecision.action).where(ModerationDecision.meme_id == meme.id),
+            )
+        ).all()
+        seo_slug = await self.session.scalar(select(MemeSeoPage.slug).where(MemeSeoPage.meme_id == meme.id))
+
+        file_bound_counts = await self._snapshot_file_bound_counts(meme.id, file_ids)
+        return {
+            "meme": {
+                "id": str(meme.id),
+                "primary_file_id": None if meme.primary_file_id is None else str(meme.primary_file_id),
+                "media_type": meme.media_type.value,
+                "language": meme.language.value,
+                "is_public": meme.is_public,
+                "is_nsfw": meme.is_nsfw,
+                "template_id": None if meme.template_id is None else str(meme.template_id),
+                "author_user_id": None if meme.author_user_id is None else str(meme.author_user_id),
+                "like_count": meme.like_count,
+                "popularity_score": meme.popularity_score,
+                "tags": list(meme.tags[:MAX_AUDIT_SNAPSHOT_IDS]),
+            },
+            "meme_files": {"count": len(file_ids), "ids": self._bounded_uuid_strings(file_ids)},
+            "seo_page": {"count": 0 if seo_slug is None else 1, "slug": seo_slug},
+            "collection_saves": {
+                "count": len(collection_ids),
+                "collection_ids": self._bounded_uuid_strings(collection_ids),
+            },
+            "pins": {"count": len(pinned_user_ids), "user_ids": self._bounded_uuid_strings(pinned_user_ids)},
+            "moderation_reports": {
+                "count": len(report_rows),
+                "items": [
+                    {"id": str(report_id), "status": status.value}
+                    for report_id, status in report_rows[:MAX_AUDIT_SNAPSHOT_IDS]
+                ],
+            },
+            "moderation_decisions": {
+                "count": len(decision_rows),
+                "items": [
+                    {"id": str(decision_id), "action": action.value}
+                    for decision_id, action in decision_rows[:MAX_AUDIT_SNAPSHOT_IDS]
+                ],
+            },
+            **file_bound_counts,
+        }
+
+    async def _snapshot_file_bound_counts(
+        self,
+        meme_id: uuid.UUID,
+        file_ids: tuple[uuid.UUID, ...],
+    ) -> dict[str, object]:
+        popularity_count = await self.session.scalar(
+            select(func.count()).select_from(MemePopularitySnapshot).where(MemePopularitySnapshot.meme_id == meme_id),
+        )
+        if not file_ids:
+            return {
+                "meme_sources": {"count": 0},
+                "ocr_results": {"count": 0},
+                "pipeline_stage_journal": {"count": 0},
+                "popularity_snapshots": {"count": popularity_count or 0},
+                "sync_target_snapshots": {"count": 0, "by_target": {}},
+                "telegram_file_id_cache": {"count": 0},
+                "embedding_cache_source_links": {"count": 0},
+            }
+
+        sync_rows = (
+            await self.session.execute(
+                select(MemeFileSyncTargetSnapshot.sync_target, func.count())
+                .where(MemeFileSyncTargetSnapshot.meme_file_id.in_(file_ids))
+                .group_by(MemeFileSyncTargetSnapshot.sync_target),
+            )
+        ).all()
+        source_count = await self.session.scalar(
+            select(func.count()).select_from(MemeSource).where(MemeSource.file_id.in_(file_ids)),
+        )
+        ocr_count = await self.session.scalar(
+            select(func.count()).select_from(MemeFileOCRResult).where(MemeFileOCRResult.meme_file_id.in_(file_ids)),
+        )
+        stage_count = await self.session.scalar(
+            select(func.count()).select_from(PipelineStageJournal).where(PipelineStageJournal.meme_file_id.in_(file_ids)),
+        )
+        telegram_count = await self.session.scalar(
+            select(func.count()).select_from(TelegramFileIdCache).where(TelegramFileIdCache.meme_file_id.in_(file_ids)),
+        )
+        embedding_count = await self.session.scalar(
+            select(func.count()).select_from(EmbeddingCache).where(EmbeddingCache.source_file_id.in_(file_ids)),
+        )
+
+        return {
+            "meme_sources": {"count": source_count or 0},
+            "ocr_results": {"count": ocr_count or 0},
+            "pipeline_stage_journal": {"count": stage_count or 0},
+            "popularity_snapshots": {"count": popularity_count or 0},
+            "sync_target_snapshots": {
+                "count": sum(count for _, count in sync_rows),
+                "by_target": {target.value: count for target, count in sync_rows},
+            },
+            "telegram_file_id_cache": {"count": telegram_count or 0},
+            "embedding_cache_source_links": {"count": embedding_count or 0},
+        }
+
+    @staticmethod
+    def _bounded_uuid_strings(values: Iterable[object]) -> list[str]:
+        return [str(value) for value in tuple(values)[:MAX_AUDIT_SNAPSHOT_IDS]]
 
     def _apply_moderation_action(self, meme: Meme, action: ModerationAction) -> None:
         if action is ModerationAction.NO_ACTION:

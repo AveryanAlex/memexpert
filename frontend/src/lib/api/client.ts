@@ -1,4 +1,5 @@
 import type {
+  AdminMemeDestructiveActionRead,
   AdminMemeDetailRead,
   AdminMemeRead,
   AdminMemeTemplateRead,
@@ -287,6 +288,28 @@ export async function updateMemeModeration(request: JsonMutationRequest, memeId:
   );
 }
 
+export async function deleteAdminMeme(
+  request: JsonMutationRequest,
+  memeId: string
+): Promise<AdminMemeDestructiveActionRead> {
+  return apiWrite<AdminMemeDestructiveActionRead>(
+    `/api/v1/admin/memes/${encodeURIComponent(memeId)}`,
+    'DELETE',
+    request
+  );
+}
+
+export async function mergeAdminMeme(
+  request: JsonMutationRequest,
+  memeId: string
+): Promise<AdminMemeDestructiveActionRead> {
+  return apiWrite<AdminMemeDestructiveActionRead>(
+    `/api/v1/admin/memes/${encodeURIComponent(memeId)}/merge`,
+    'POST',
+    request
+  );
+}
+
 export async function resolveModerationReport(
   request: JsonMutationRequest,
   reportId: string
@@ -358,7 +381,7 @@ async function apiMutation<T>(path: string, method: 'DELETE' | 'POST', request: 
   return payload as T;
 }
 
-async function apiWrite<T>(path: string, method: 'PATCH' | 'POST' | 'PUT', request: JsonMutationRequest): Promise<T> {
+async function apiWrite<T>(path: string, method: 'DELETE' | 'PATCH' | 'POST' | 'PUT', request: JsonMutationRequest): Promise<T> {
   const url = new URL(path, request.baseUrl);
   const headers = new Headers({ accept: 'application/json', 'x-requested-with': 'XMLHttpRequest' });
   if (request.body !== undefined) {

@@ -3,6 +3,7 @@
 from memexpert.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin, utcnow
 from memexpert.models.collection import Collection, CollectionInvite, CollectionMember, CollectionMeme, PinnedMeme
 from memexpert.models.content import (
+    AdminMemeDestructiveAuditLog,
     EmbeddingCache,
     Meme,
     MemeFile,
@@ -69,6 +70,7 @@ __all__ = [
     "AccountMergeLog",
     "AccountStatus",
     "AccountType",
+    "AdminMemeDestructiveAuditLog",
     "AnalyticsEvent",
     "AnalyticsEventType",
     "AuthProvider",

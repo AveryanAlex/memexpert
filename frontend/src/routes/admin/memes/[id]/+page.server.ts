@@ -1,10 +1,12 @@
 import { env } from '$env/dynamic/private';
-import { error, fail } from '@sveltejs/kit';
+import { error, fail, redirect } from '@sveltejs/kit';
 import type { Actions, PageServerLoad } from './$types';
 import {
   ApiError,
+  deleteAdminMeme,
   fetchAdminMemeDetail,
   fetchAdminMemeTemplates,
+  mergeAdminMeme,
   resolveModerationReport,
   updateMemeModeration
 } from '$lib/api/client';
@@ -72,6 +74,54 @@ export const actions: Actions = {
       );
       return { message: 'Moderation report resolved.' };
     });
+  },
+  deleteMeme: async ({ fetch, params, request }) => {
+    const data = await request.formData();
+    try {
+      await deleteAdminMeme(
+        {
+          fetch,
+          baseUrl: apiBaseUrl(),
+          cookieHeader: request.headers.get('cookie') ?? undefined,
+          body: {
+            confirmation: readRequired(data, 'confirmation'),
+            note: readRequired(data, 'note')
+          }
+        },
+        params.id
+      );
+    } catch (caught) {
+      if (caught instanceof ApiError) {
+        return fail(caught.status, { message: caught.message });
+      }
+      return fail(500, { message: 'Admin meme deletion failed.' });
+    }
+    throw redirect(303, '/admin');
+  },
+  mergeMeme: async ({ fetch, params, request }) => {
+    const data = await request.formData();
+    const targetMemeId = readRequired(data, 'target_meme_id');
+    try {
+      await mergeAdminMeme(
+        {
+          fetch,
+          baseUrl: apiBaseUrl(),
+          cookieHeader: request.headers.get('cookie') ?? undefined,
+          body: {
+            target_meme_id: targetMemeId,
+            confirmation: readRequired(data, 'confirmation'),
+            note: readRequired(data, 'note')
+          }
+        },
+        params.id
+      );
+    } catch (caught) {
+      if (caught instanceof ApiError) {
+        return fail(caught.status, { message: caught.message });
+      }
+      return fail(500, { message: 'Admin meme merge failed.' });
+    }
+    throw redirect(303, `/admin/memes/${targetMemeId}`);
   }
 };
 

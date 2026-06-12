@@ -330,3 +330,12 @@ export interface AdminMemeDetailRead {
   reports: AdminModerationReportRead[];
   decisions: AdminModerationDecisionRead[];
 }
+
+export interface AdminMemeDestructiveActionRead {
+  action: 'delete' | 'merge' | string;
+  source_meme_id: string;
+  target_meme_id: string | null;
+  audit_log_id: string;
+  affected_snapshot: Record<string, unknown>;
+  message: string;
+}

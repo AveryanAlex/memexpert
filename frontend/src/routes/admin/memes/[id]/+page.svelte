@@ -73,10 +73,41 @@
         <button type="submit">Save overrides</button>
       </form>
 
-      <div class="planned-actions" aria-label="Planned destructive actions">
-        <button type="button" disabled>Delete planned</button>
-        <button type="button" disabled>Merge planned</button>
-        <p class="muted">Destructive actions are intentionally disabled until a safe backend workflow exists.</p>
+      <div class="destructive-actions" aria-label="Destructive actions">
+        <h3>Destructive actions</h3>
+        <p class="warning-copy">Irreversible. These actions record a durable admin audit before the source meme row is removed.</p>
+
+        <form method="POST" action="?/deleteMeme" class="admin-form destructive-form">
+          <strong>Delete meme</strong>
+          <p class="muted">Removes the meme and cascaded dependents after snapshotting files, SEO, saves, pins, reports, decisions, popularity, and sync state.</p>
+          <label>
+            Type meme id to confirm
+            <input name="confirmation" placeholder={detail.meme.id} required />
+          </label>
+          <label>
+            Required audit note
+            <input name="note" placeholder="why this deletion is necessary" required />
+          </label>
+          <button type="submit" class="danger-button">Delete permanently</button>
+        </form>
+
+        <form method="POST" action="?/mergeMeme" class="admin-form destructive-form">
+          <strong>Merge into another meme</strong>
+          <p class="muted">Transfers files, collection saves, pins, and popularity lineage into the target, then deletes this source meme.</p>
+          <label>
+            Target meme id
+            <input name="target_meme_id" placeholder="target UUID" required />
+          </label>
+          <label>
+            Type source meme id to confirm
+            <input name="confirmation" placeholder={detail.meme.id} required />
+          </label>
+          <label>
+            Required audit note
+            <input name="note" placeholder="why these memes should be merged" required />
+          </label>
+          <button type="submit" class="danger-button">Merge into target</button>
+        </form>
       </div>
     </section>
   </div>

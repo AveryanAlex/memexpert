@@ -26,6 +26,7 @@ MAX_SOURCE_USERNAME_LENGTH = 255
 MAX_ADMIN_NOTE_LENGTH = 2048
 MAX_TEMPLATE_SLUG_LENGTH = 255
 MAX_TEMPLATE_NAME_LENGTH = 255
+MAX_DESTRUCTIVE_CONFIRMATION_LENGTH = 128
 
 
 class AdminSessionRead(BaseModel):
@@ -192,6 +193,54 @@ class AdminMemeModerationUpdateRequest(BaseModel):
         return self
 
 
+class AdminMemeDeleteRequest(BaseModel):
+    """Explicit confirmation payload for irreversible meme deletion."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    confirmation: str = Field(min_length=1, max_length=MAX_DESTRUCTIVE_CONFIRMATION_LENGTH)
+    note: str = Field(min_length=1, max_length=MAX_ADMIN_NOTE_LENGTH)
+
+    @field_validator("confirmation", "note")
+    @classmethod
+    def _normalize_required_text(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("value must not be blank.")
+        return normalized
+
+
+class AdminMemeMergeRequest(BaseModel):
+    """Explicit target and confirmation payload for irreversible meme merging."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    target_meme_id: uuid.UUID
+    confirmation: str = Field(min_length=1, max_length=MAX_DESTRUCTIVE_CONFIRMATION_LENGTH)
+    note: str = Field(min_length=1, max_length=MAX_ADMIN_NOTE_LENGTH)
+
+    @field_validator("confirmation", "note")
+    @classmethod
+    def _normalize_required_text(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("value must not be blank.")
+        return normalized
+
+
+class AdminMemeDestructiveActionRead(BaseModel):
+    """Result of an audited admin destructive meme action."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    action: str
+    source_meme_id: uuid.UUID
+    target_meme_id: uuid.UUID | None
+    audit_log_id: uuid.UUID
+    affected_snapshot: dict[str, object]
+    message: str
+
+
 class AdminModerationDecisionRead(ORMSchema):
     """Admin-visible immutable moderation audit record."""
 
@@ -265,7 +314,10 @@ class AdminMemeDetailRead(BaseModel):
 
 __all__ = [
     "AdminChannelSuggestionReviewRequest",
+    "AdminMemeDeleteRequest",
     "AdminMemeDetailRead",
+    "AdminMemeDestructiveActionRead",
+    "AdminMemeMergeRequest",
     "AdminMemeModerationUpdateRequest",
     "AdminMemeRead",
     "AdminMemeTemplateRead",

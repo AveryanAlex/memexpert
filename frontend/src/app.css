@@ -679,6 +679,35 @@ button {
   opacity: 0.55;
 }
 
+.destructive-actions {
+  display: grid;
+  gap: 14px;
+  margin-top: 16px;
+  border-top: 1px solid #eadfce;
+  padding-top: 16px;
+}
+
+.destructive-actions h3 {
+  margin: 0;
+}
+
+.destructive-form {
+  border: 1px solid #e2b5a9;
+  border-radius: 18px;
+  background: #fff4ee;
+  padding: 14px;
+}
+
+.warning-copy {
+  margin: 0;
+  color: #8b271a;
+  font-weight: 800;
+}
+
+.admin-form .danger-button {
+  background: #8b271a;
+}
+
 .audit-row code {
   overflow-wrap: anywhere;
   white-space: normal;
