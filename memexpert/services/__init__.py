@@ -80,6 +80,7 @@ from memexpert.services.meme_seo import (
     StaticMemeSeoProvider,
 )
 from memexpert.services.provider_auth_service import ProviderAuthService
+from memexpert.services.report import MemeReportService, MemeReportServiceError, MemeReportTargetNotVisibleError
 from memexpert.services.user_service import DEFAULT_GUEST_LIFETIME, UserService
 
 __all__ = [
@@ -135,6 +136,9 @@ __all__ = [
     "MemeSeoGenerationService",
     "MemeSeoProviderProtocol",
     "MemeSeoProviderResult",
+    "MemeReportService",
+    "MemeReportServiceError",
+    "MemeReportTargetNotVisibleError",
     "StaticMemeSeoProvider",
     "MissingTokenError",
     "PipelineIngestError",

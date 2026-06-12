@@ -4,13 +4,14 @@
   import {
     favoriteMeme,
     pinMeme,
+    reportMeme,
     removeSavedMeme,
     saveMeme,
     unfavoriteMeme,
     unpinMeme,
     type RemoveActionResponse
   } from '$lib/api/client';
-  import type { PublicMemeCardRead, PublicMemeDetailRead } from '$lib/api/types';
+  import type { ModerationReason, PublicMemeCardRead, PublicMemeDetailRead } from '$lib/api/types';
   import {
     actionFailureMessage,
     canonicalMemeUrl,
@@ -36,6 +37,18 @@
   let likeCount = $state(0);
   let pending = $state<MemeActionKind | null>(null);
   let statusMessage = $state<string | null>(null);
+  let reportOpen = $state(false);
+  let reportReason = $state<ModerationReason>('spam');
+  let reportNote = $state('');
+
+  const reportReasons: Array<{ value: ModerationReason; label: string }> = [
+    { value: 'spam', label: 'Spam or scam' },
+    { value: 'nsfw', label: 'Nudity or explicit content' },
+    { value: 'harassment', label: 'Harassment or hate' },
+    { value: 'illegal', label: 'Illegal content' },
+    { value: 'copyright', label: 'Copyright issue' },
+    { value: 'other', label: 'Other' }
+  ];
 
   const title = $derived(memeTitle(meme));
   const canonicalUrl = $derived(browser ? canonicalMemeUrl(meme, window.location.origin) : href);
@@ -113,6 +126,35 @@
     statusMessage = 'Download started.';
   }
 
+  function openReportForm() {
+    reportOpen = true;
+    statusMessage = null;
+  }
+
+  function closeReportForm() {
+    reportOpen = false;
+    reportNote = '';
+    reportReason = 'spam';
+  }
+
+  async function submitReport() {
+    await runAction('report', async () => {
+      await reportMeme({
+        ...actionRequest,
+        reason: reportReason,
+        note: reportNote
+      });
+      reportOpen = false;
+      reportNote = '';
+      statusMessage = 'Report submitted. Thanks for helping keep MemeXpert clean.';
+    });
+  }
+
+  function handleReportSubmit(event: SubmitEvent) {
+    event.preventDefault();
+    void submitReport();
+  }
+
   async function runAction(action: MemeActionKind, callback: () => Promise<void>) {
     if (pending) return;
     pending = action;
@@ -187,11 +229,94 @@
         <DropdownMenu.Item class="action-menu-item" onSelect={downloadMeme} disabled={!canDownload}>
           {canDownload ? 'Download' : 'Download unavailable'}
         </DropdownMenu.Item>
+        <DropdownMenu.Separator class="action-menu-separator" />
+        <DropdownMenu.Item
+          class="action-menu-item"
+          style="color: var(--danger-color, #b42318);"
+          onSelect={openReportForm}
+          disabled={pending !== null}
+        >
+          Report meme
+        </DropdownMenu.Item>
       </DropdownMenu.Content>
     </DropdownMenu.Portal>
   </DropdownMenu.Root>
+
+  {#if reportOpen}
+    <form class="report-panel" onsubmit={handleReportSubmit}>
+      <label class="report-label" for={`report-reason-${meme.id}`}>Reason</label>
+      <select id={`report-reason-${meme.id}`} class="report-select" bind:value={reportReason} disabled={pending !== null}>
+        {#each reportReasons as reason}
+          <option value={reason.value}>{reason.label}</option>
+        {/each}
+      </select>
+
+      <label class="report-label" for={`report-note-${meme.id}`}>Optional note</label>
+      <textarea
+        id={`report-note-${meme.id}`}
+        class="report-note"
+        bind:value={reportNote}
+        maxlength="2048"
+        rows="3"
+        placeholder="Add context for moderators"
+        disabled={pending !== null}
+      ></textarea>
+
+      <div class="report-actions">
+        <button class="button-link secondary action-button" type="button" onclick={closeReportForm} disabled={pending !== null}>
+          Cancel
+        </button>
+        <button class="button-link action-button" type="submit" disabled={pending !== null}>
+          {pending === 'report' ? 'Submitting...' : 'Submit report'}
+        </button>
+      </div>
+    </form>
+  {/if}
 
   {#if statusMessage}
     <p class="action-status" role="status">{statusMessage}</p>
   {/if}
 </div>
+
+<style>
+  .report-panel {
+    margin-top: 0.75rem;
+    display: grid;
+    gap: 0.45rem;
+    max-width: 22rem;
+    padding: 0.75rem;
+    border: 1px solid color-mix(in srgb, currentColor 16%, transparent);
+    border-radius: 0.8rem;
+    background: var(--surface-elevated, Canvas);
+    box-shadow: 0 12px 28px color-mix(in srgb, black 12%, transparent);
+  }
+
+  .report-label {
+    font-size: 0.78rem;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+  }
+
+  .report-select,
+  .report-note {
+    width: 100%;
+    box-sizing: border-box;
+    border: 1px solid color-mix(in srgb, currentColor 18%, transparent);
+    border-radius: 0.6rem;
+    padding: 0.55rem 0.65rem;
+    font: inherit;
+    color: inherit;
+    background: var(--surface, Canvas);
+  }
+
+  .report-note {
+    resize: vertical;
+  }
+
+  .report-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.5rem;
+  }
+</style>

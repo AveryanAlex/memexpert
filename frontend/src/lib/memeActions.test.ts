@@ -51,6 +51,12 @@ describe('meme action helpers', () => {
     expect(actionFailureMessage('save', new ApiError(409, 'Active collection is read-only.'))).toBe(
       'Could not update your active save collection: Active collection is read-only.'
     );
+    expect(actionFailureMessage('report', new ApiError(403, 'A full account is required for this operation.'))).toBe(
+      'A full account is required for this operation.'
+    );
+    expect(actionFailureMessage('report', new ApiError(404, 'Meme was not found.'))).toBe(
+      'Could not submit report: Meme was not found.'
+    );
     expect(actionFailureMessage('download', null)).toBe('Download is unavailable until this meme has a media download URL.');
   });
 });

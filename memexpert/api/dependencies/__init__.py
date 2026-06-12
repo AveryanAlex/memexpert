@@ -34,9 +34,11 @@ from memexpert.api.dependencies.auth import (
 from memexpert.api.dependencies.collection import CollectionServiceDep, get_collection_service
 from memexpert.api.dependencies.meme import (
     AnalyticsServiceDep,
+    MemeReportServiceDep,
     MemeSearchServiceDep,
     PublicTrendsServiceDep,
     get_analytics_service,
+    get_meme_report_service,
     get_meme_search_service,
     get_public_trends_service,
 )
@@ -69,6 +71,7 @@ __all__ = [
     "FullAccountUserDep",
     "GuestUserDep",
     "MemeSearchServiceDep",
+    "MemeReportServiceDep",
     "OperatorTokenDep",
     "OptionalAccessTokenDep",
     "OptionalCurrentUserDep",
@@ -92,6 +95,7 @@ __all__ = [
     "get_admin_user",
     "get_guest_user",
     "get_meme_search_service",
+    "get_meme_report_service",
     "get_optional_current_user",
     "get_optional_guest_user",
     "get_or_bootstrap_guest_user",

@@ -1,6 +1,6 @@
 import type { PublicMemeCardRead, PublicMemeDetailRead, PublicMemeFileRead } from '$lib/api/types';
 
-export type MemeActionKind = 'copy' | 'download' | 'favorite' | 'pin' | 'save' | 'telegram' | 'unfavorite' | 'unpin' | 'unsave';
+export type MemeActionKind = 'copy' | 'download' | 'favorite' | 'pin' | 'report' | 'save' | 'telegram' | 'unfavorite' | 'unpin' | 'unsave';
 
 type MemeLike = PublicMemeCardRead | PublicMemeDetailRead;
 
@@ -39,6 +39,14 @@ export function actionFailureMessage(action: MemeActionKind, error: unknown): st
 
   if ((action === 'pin' || action === 'unpin') && (status === 401 || status === 403)) {
     return 'Pinning requires a full MemeXpert account. Link or sign in, then try again.';
+  }
+
+  if (action === 'report' && (status === 401 || status === 403)) {
+    return detail ?? 'Reporting requires a full MemeXpert account. Link or sign in, then try again.';
+  }
+
+  if (action === 'report') {
+    return detail ? `Could not submit report: ${detail}` : 'Could not submit report. Check your connection and try again.';
   }
 
   if (action === 'save' || action === 'unsave') {
@@ -85,6 +93,8 @@ function actionLabel(action: MemeActionKind): string {
       return 'share to Telegram';
     case 'copy':
       return 'copy the link';
+    case 'report':
+      return 'report this meme';
     default:
       return action;
   }

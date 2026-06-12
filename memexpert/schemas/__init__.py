@@ -36,6 +36,7 @@ from memexpert.schemas.content_pipeline import (
     ContentPipelineUploadMetadata,
     ContentPipelineUploadRead,
 )
+from memexpert.schemas.report import MemeReportCreateRequest, MemeReportRead
 from memexpert.schemas.user import (
     AccountDeletionLogRead,
     AccountMergeLogRead,
@@ -80,6 +81,8 @@ __all__ = [
     "GuestBootstrapRequest",
     "InlineUsageEventRead",
     "LoginEventRead",
+    "MemeReportCreateRequest",
+    "MemeReportRead",
     "PinnedMemeRead",
     "UserRead",
 ]

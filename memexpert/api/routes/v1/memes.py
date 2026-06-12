@@ -15,6 +15,7 @@ from memexpert.api.dependencies import (
     CollectionServiceDep,
     CurrentUserDep,
     FullAccountUserDep,
+    MemeReportServiceDep,
     MemeSearchServiceDep,
     OptionalCurrentUserDep,
     PublicTrendsServiceDep,
@@ -31,6 +32,7 @@ from memexpert.schemas.meme import (
     PublicMemeTrendPageRead,
     PublicTrendSummaryRead,
 )
+from memexpert.schemas.report import MemeReportCreateRequest, MemeReportRead
 from memexpert.schemas.user import UserRead
 from memexpert.services import (
     CollectionNotFoundError,
@@ -43,6 +45,7 @@ from memexpert.services import (
 )
 from memexpert.services.meme_search import MemeNotFoundError, MemeSearchFilters
 from memexpert.services.public_trends import PublicTrendRanking
+from memexpert.services.report import MemeReportTargetNotVisibleError
 
 router = APIRouter(prefix="/memes", tags=["memes"])
 
@@ -378,6 +381,26 @@ async def reorder_pins(
         return await collection_service.reorder_pins(user_id=current_user.id, meme_ids=payload.meme_ids)
     except CollectionServiceError as exc:
         raise _collection_http_error(exc) from exc
+
+
+@router.post("/{meme_id}/report", response_model=MemeReportRead, summary="Report a meme")
+async def report_meme(
+    report_service: MemeReportServiceDep,
+    current_user: FullAccountUserDep,
+    meme_id: Annotated[uuid.UUID, Path()],
+    payload: MemeReportCreateRequest,
+) -> MemeReportRead:
+    """Create or reuse the caller's open moderation report for a visible meme."""
+
+    try:
+        return await report_service.report_meme(
+            meme_id,
+            reporter_user_id=current_user.id,
+            reporter_nsfw_enabled=current_user.nsfw_enabled,
+            request=payload,
+        )
+    except MemeReportTargetNotVisibleError as exc:
+        raise _meme_not_found_http_error() from exc
 
 
 @router.get("/slug/{slug}", response_model=PublicMemeDetailRead, summary="Read meme details by SEO slug")
