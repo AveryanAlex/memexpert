@@ -465,6 +465,54 @@ async def test_public_route_json_includes_render_contract_without_storage_leakag
     assert "pipeline/originals/private/hidden.jpg" not in response.text
 
 
+async def test_public_search_and_detail_do_not_emit_authenticated_private_media(
+    migrated_db_session: AsyncSession,
+) -> None:
+    owner = User(account_type=AccountType.FULL)
+    migrated_db_session.add(owner)
+    await migrated_db_session.flush()
+    public_meme = await _create_meme(migrated_db_session, popularity_score=20.0)
+    private_meme = await _create_meme(
+        migrated_db_session,
+        is_public=False,
+        author_user_id=owner.id,
+        popularity_score=100.0,
+        s3_original_key="pipeline/originals/private/authenticated-owner.jpg",
+    )
+    await migrated_db_session.commit()
+    assert private_meme.primary_file_id is not None
+    service = MemeSearchService(
+        migrated_db_session,
+        text_client=FakeTextSearchClient(
+            [
+                {
+                    "id": str(private_meme.primary_file_id),
+                    "meme_id": str(private_meme.id),
+                    "_rankingScore": 1.0,
+                },
+                {"id": str(public_meme.primary_file_id), "meme_id": str(public_meme.id), "_rankingScore": 0.5},
+            ]
+        ),
+        media_render_service=MediaRenderUrlService(Settings.model_validate({"imgproxy_base_url": "https://img.memexpert.test"})),
+    )
+
+    search_page = await service.search_public_memes("owner private", viewer_user_id=owner.id, limit=10)
+    browse_page = await service.browse_public_memes(viewer_user_id=owner.id, limit=10)
+    public_detail = await service.get_public_meme_detail(public_meme.id, viewer_user_id=owner.id)
+
+    assert [item.meme.id for item in search_page.items] == [public_meme.id]
+    assert private_meme.id not in {item.meme.id for item in browse_page.items}
+    assert public_detail.primary_file is not None
+    assert public_detail.primary_file.id == public_meme.primary_file_id
+    with pytest.raises(MemeNotFoundError):
+        _ = await service.get_public_meme_detail(private_meme.id, viewer_user_id=owner.id)
+
+    serialized = search_page.model_dump_json() + browse_page.model_dump_json()
+    assert str(private_meme.id) not in serialized
+    assert str(private_meme.primary_file_id) not in serialized
+    assert "authenticated-owner.jpg" not in serialized
+
+
 async def test_public_meme_dtos_include_viewer_action_state_for_anonymous_guest_and_full_accounts(
     migrated_db_session: AsyncSession,
 ) -> None:
@@ -1216,7 +1264,7 @@ async def test_detail_route_returns_not_found_for_missing_private_or_nsfw_withou
     assert await detail_status(missing_id, None) == 404
     assert await detail_status(private_meme.id, None) == 404
     assert await detail_status(private_meme.id, _user_read(stranger)) == 404
-    assert await detail_status(private_meme.id, _user_read(author)) == 200
+    assert await detail_status(private_meme.id, _user_read(author)) == 404
     assert await detail_status(nsfw_meme.id, _user_read(author)) == 404
     assert await detail_status(nsfw_meme.id, _user_read(author), include_nsfw=True) == 200
 

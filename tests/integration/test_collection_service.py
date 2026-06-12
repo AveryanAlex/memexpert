@@ -10,7 +10,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 
 from memexpert.models.collection import Collection, CollectionInvite, CollectionMeme, PinnedMeme
-from memexpert.models.content import Meme
+from memexpert.models.content import Meme, MemeFile
 from memexpert.models.enums import (
     CollectionInviteChannel,
     CollectionInviteStatus,
@@ -46,6 +46,9 @@ async def _create_meme(
     *,
     is_public: bool = True,
     author_user_id: uuid.UUID | None = None,
+    s3_original_key: str | None = None,
+    s3_web_video_key: str | None = None,
+    mime_type: str = "image/jpeg",
 ) -> Meme:
     meme = Meme(
         media_type=ContentKind.IMAGE,
@@ -54,6 +57,20 @@ async def _create_meme(
         author_user_id=author_user_id,
     )
     session.add(meme)
+    await session.flush()
+    file = MemeFile(
+        meme_id=meme.id,
+        s3_original_key=s3_original_key or f"pipeline/originals/test/{meme.id}.jpg",
+        s3_web_video_key=s3_web_video_key,
+        mime_type=mime_type,
+        width=640,
+        height=480,
+        quality_score=0.8,
+        is_primary=True,
+    )
+    session.add(file)
+    await session.flush()
+    meme.primary_file_id = file.id
     await session.flush()
     return meme
 
@@ -276,6 +293,39 @@ async def test_meme_library_returns_renderable_cards_collections_and_viewer_flag
         ("Favorites", 1, True),
         ("Work saves", 1, True),
     ]
+
+
+async def test_meme_library_returns_private_authenticated_render_urls_for_owner(
+    migrated_db_session: AsyncSession,
+) -> None:
+    user_service = UserService(migrated_db_session)
+    collection_service = CollectionService(migrated_db_session)
+    owner = await create_full_user_via_upgrade(user_service, email="private-library@example.com")
+    private_meme = await _create_meme(
+        migrated_db_session,
+        is_public=False,
+        author_user_id=owner.id,
+        s3_original_key="pipeline/originals/private/library-upload.gif",
+        s3_web_video_key="pipeline/derived/private/library-upload.mp4",
+        mime_type="image/gif",
+    )
+    await migrated_db_session.commit()
+    assert private_meme.primary_file_id is not None
+
+    _ = await collection_service.favorite_meme(user_id=owner.id, meme_id=private_meme.id)
+    library = await collection_service.get_meme_library(user_id=owner.id)
+
+    assert [meme.id for meme in library.favorites] == [private_meme.id]
+    primary_file = library.favorites[0].primary_file
+    assert primary_file is not None
+    assert primary_file.id == private_meme.primary_file_id
+    assert primary_file.render is not None
+    assert primary_file.render.thumbnail_url == f"/api/v1/media/files/{private_meme.primary_file_id}/thumbnail"
+    assert primary_file.render.preview_url == f"/api/v1/media/files/{private_meme.primary_file_id}/preview"
+    assert primary_file.render.web_video_url == f"/api/v1/media/files/{private_meme.primary_file_id}/web-video.mp4"
+    serialized = library.model_dump_json()
+    assert "pipeline/originals/private/library-upload.gif" not in serialized
+    assert "pipeline/derived/private/library-upload.mp4" not in serialized
 
 
 async def test_save_uses_guest_favorites_or_full_active_custom_collection(

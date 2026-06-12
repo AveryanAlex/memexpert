@@ -24,6 +24,21 @@ describe('selectMediaRender', () => {
     expect(media.hasMedia).toBe(true);
   });
 
+  it('selects authenticated private collection/profile render variants', () => {
+    const media = selectMediaRender(
+      file({
+        preview_url: '/api/v1/media/files/file-1/preview',
+        download_url: '/api/v1/media/files/file-1/download',
+        web_video_url: '/api/v1/media/files/file-1/web-video.mp4'
+      })
+    );
+
+    expect(media.imageUrl).toBe('/api/v1/media/files/file-1/preview');
+    expect(media.videoUrl).toBe('/api/v1/media/files/file-1/web-video.mp4');
+    expect(media.downloadUrl).toBe('/api/v1/media/files/file-1/download');
+    expect(media.hasMedia).toBe(true);
+  });
+
   it('falls back when render URLs are absent', () => {
     expect(selectMediaRender(null)).toEqual({
       imageUrl: null,

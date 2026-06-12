@@ -1,4 +1,4 @@
-"""Build safe public media render/download URL contracts for visible meme files."""
+"""Build safe media render/download URL contracts for visible meme files."""
 
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ class PublicMediaRenderContext:
 
 
 class MediaRenderUrlService:
-    """Construct public render contracts without exposing object keys in DTO fields."""
+    """Construct render contracts without exposing object keys in DTO fields."""
 
     def __init__(self, settings: Settings | None = None) -> None:
         self._settings = settings or get_settings()
@@ -82,6 +82,23 @@ class MediaRenderUrlService:
                 render.download_url = render.web_video_url
         return render
 
+    def build_private_render(self, file: MemeFile) -> PublicMemeFileRenderRead:
+        """Build authenticated API render URLs for one already-authorized private file."""
+
+        render = PublicMemeFileRenderRead(width=file.width, height=file.height, blur_hash=file.blur_hash)
+        if _is_image_mime(file.mime_type):
+            render.thumbnail_url = self._private_file_url(file.id, variant="thumbnail")
+            render.preview_url = self._private_file_url(file.id, variant="preview")
+            render.display_url = render.preview_url
+            render.original_url = self._private_file_url(file.id, variant="original")
+            render.download_url = self._private_file_url(file.id, variant="download")
+
+        if file.s3_web_video_key:
+            render.web_video_url = self._private_file_url(file.id, variant="web-video.mp4")
+            if render.download_url is None:
+                render.download_url = render.web_video_url
+        return render
+
     def _imgproxy_url(self, object_key: str, *, options: tuple[str, ...], extension: str) -> str:
         source_url = f"s3://{self._settings.s3_bucket}/{object_key}"
         encoded_source = _base64url(source_url)
@@ -99,6 +116,9 @@ class MediaRenderUrlService:
         if self._public_media_base_url is None:
             return None
         return f"{self._public_media_base_url}/{file_id}/{quote(variant, safe='')}"
+
+    def _private_file_url(self, file_id: uuid.UUID, *, variant: str) -> str:
+        return f"/api/v1/media/files/{file_id}/{quote(variant, safe='')}"
 
 
 def _is_image_mime(mime_type: str | None) -> bool:

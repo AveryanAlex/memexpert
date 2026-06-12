@@ -11,6 +11,7 @@ from memexpert.api.routes.v1.admin import router as admin_router
 from memexpert.api.routes.v1.auth import router as auth_router
 from memexpert.api.routes.v1.collections import router as collections_router
 from memexpert.api.routes.v1.crawler import router as crawler_router
+from memexpert.api.routes.v1.media import router as media_router
 from memexpert.api.routes.v1.memes import router as memes_router
 from memexpert.api.routes.v1.pipeline import router as pipeline_router
 
@@ -26,6 +27,7 @@ router = APIRouter(prefix="/api/v1", tags=["v1"])
 router.include_router(admin_router)
 router.include_router(auth_router)
 router.include_router(collections_router)
+router.include_router(media_router)
 router.include_router(memes_router)
 router.include_router(pipeline_router)
 router.include_router(crawler_router)
