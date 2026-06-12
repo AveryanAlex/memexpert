@@ -1,22 +1,37 @@
 import { fail, redirect } from '@sveltejs/kit';
 import type { Actions, PageServerLoad } from './$types';
-import { ApiError, favoriteMeme, fetchCurrentSession, fetchMemeDetail, fetchMemePopularitySummary } from '$lib/api/client';
+import {
+  ApiError,
+  favoriteMeme,
+  fetchCurrentSession,
+  fetchMemeDetail,
+  fetchMemePopularitySummary,
+  fetchTagLanding,
+  fetchTrendPage
+} from '$lib/api/client';
+import type { ApiFetch } from '$lib/api/client';
+import type { PublicMemeDetailRead } from '$lib/api/types';
+import type { MemeDetailRelatedSource } from '$lib/meme-detail-view';
 import { apiBaseUrl, cookieHeaderWithAccessToken, forwardBackendAccessCookie } from '$lib/server/backend';
 
+const RELATED_LIMIT = 7;
+
 export const load: PageServerLoad = async ({ fetch, params, request }) => {
+  const cookieHeader = request.headers.get('cookie') ?? undefined;
   let meme: Awaited<ReturnType<typeof fetchMemeDetail>>;
   try {
     meme = await fetchMemeDetail({
       fetch,
       baseUrl: apiBaseUrl(),
       memeId: params.id,
-      cookieHeader: request.headers.get('cookie') ?? undefined
+      cookieHeader
     });
   } catch (error) {
     if (error instanceof ApiError && error.status === 404) {
       return {
         meme: null,
         popularity: null,
+        relatedSource: null,
         unavailableMessage: 'This meme is not available. It may be private, removed, or filtered by safety settings.'
       };
     }
@@ -25,6 +40,7 @@ export const load: PageServerLoad = async ({ fetch, params, request }) => {
       return {
         meme: null,
         popularity: null,
+        relatedSource: null,
         unavailableMessage: 'This meme link is invalid.'
       };
     }
@@ -32,23 +48,65 @@ export const load: PageServerLoad = async ({ fetch, params, request }) => {
     return {
       meme: null,
       popularity: null,
+      relatedSource: null,
       unavailableMessage: 'Could not reach the meme catalog API.'
     };
   }
-
-  const popularity = await fetchMemePopularitySummary({
-    fetch,
-    baseUrl: apiBaseUrl(),
-    memeId: meme.id,
-    cookieHeader: request.headers.get('cookie') ?? undefined
-  }).catch(() => null);
 
   if (meme.seo_page_slug && params.id !== meme.seo_page_slug) {
     throw redirect(308, `/memes/${meme.seo_page_slug}`);
   }
 
-  return { meme, popularity, unavailableMessage: null };
+  const [popularity, relatedSource] = await Promise.all([
+    fetchMemePopularitySummary({
+      fetch,
+      baseUrl: apiBaseUrl(),
+      memeId: meme.id,
+      cookieHeader
+    }).catch(() => null),
+    fetchRelatedDiscoverySource(fetch, cookieHeader, meme)
+  ]);
+
+  return { meme, popularity, relatedSource, unavailableMessage: null };
 };
+
+async function fetchRelatedDiscoverySource(
+  fetch: ApiFetch,
+  cookieHeader: string | undefined,
+  meme: PublicMemeDetailRead
+): Promise<MemeDetailRelatedSource> {
+  const firstTag = meme.tags[0]?.trim();
+
+  if (firstTag) {
+    try {
+      const landing = await fetchTagLanding({
+        fetch,
+        baseUrl: apiBaseUrl(),
+        slug: firstTag,
+        limit: RELATED_LIMIT,
+        offset: 0,
+        cookieHeader
+      });
+      return { kind: 'tag', tag: firstTag, memes: landing.page.items.map((item) => item.meme) };
+    } catch {
+      // Fall through to public trends so tag API issues do not break detail pages.
+    }
+  }
+
+  try {
+    const trends = await fetchTrendPage({
+      fetch,
+      baseUrl: apiBaseUrl(),
+      ranking: 'trending',
+      limit: RELATED_LIMIT,
+      offset: 0,
+      cookieHeader
+    });
+    return { kind: 'trending', memes: trends.items.map((item) => item.meme) };
+  } catch {
+    return null;
+  }
+}
 
 export const actions: Actions = {
   favorite: async ({ cookies, fetch, request }) => {
