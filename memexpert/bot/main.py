@@ -9,6 +9,10 @@ from aiogram import Bot, Dispatcher
 
 from memexpert.bot.inline import InlineMediaUrlProvider, MemeSearchServiceFactory, build_inline_router
 from memexpert.bot.linking import AccountLinkServiceFactory, build_linking_router
+from memexpert.bot.private_library import (
+    PrivateLibraryCollectionServiceFactory,
+    build_private_library_router,
+)
 from memexpert.bot.private_upload import (
     CollectionServiceFactory,
     PrivateUploadPipelineServiceFactory,
@@ -41,9 +45,10 @@ def build_dispatcher(
     inline_media_url_provider: InlineMediaUrlProvider | None = None,
     private_upload_pipeline_service_factory: PrivateUploadPipelineServiceFactory | None = None,
     private_upload_collection_service_factory: CollectionServiceFactory | None = None,
+    private_library_collection_service_factory: PrivateLibraryCollectionServiceFactory | None = None,
     telegram_file_downloader: TelegramFileDownloader | None = None,
 ) -> Dispatcher:
-    """Build the dispatcher for account linking, inline search, and PM uploads."""
+    """Build the dispatcher for account linking, inline search, and PM chat handlers."""
 
     resolved_settings = settings or get_settings()
     dispatcher = Dispatcher()
@@ -60,6 +65,13 @@ def build_dispatcher(
             session_factory=session_factory,
             meme_search_service_factory=meme_search_service_factory,
             inline_media_url_provider=inline_media_url_provider,
+        )
+    )
+    _ = dispatcher.include_router(
+        build_private_library_router(
+            settings=resolved_settings,
+            session_factory=session_factory,
+            collection_service_factory=private_library_collection_service_factory,
         )
     )
     _ = dispatcher.include_router(
