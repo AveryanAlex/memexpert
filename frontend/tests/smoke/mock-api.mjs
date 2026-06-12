@@ -56,6 +56,18 @@ const detail = {
   files: [meme.primary_file]
 };
 
+const nextMeme = {
+  ...meme,
+  id: 'smoke-meme-2',
+  caption: 'Smoke test deploy mood',
+  seo_page_slug: 'smoke-test-deploy-mood',
+  tags: ['deploy', 'smoke'],
+  primary_file: {
+    ...meme.primary_file,
+    id: 'smoke-file-2'
+  }
+};
+
 const trend = {
   recent: { views: 120, sends: 8, likes: 7, saves: 4, downloads: 3 },
   previous: { views: 90, sends: 5, likes: 4, saves: 2, downloads: 1 },
@@ -107,12 +119,13 @@ const server = createServer((request, response) => {
   }
 
   if (url.pathname === '/api/v1/memes/browse') {
+    const offset = Number(url.searchParams.get('offset') ?? 0);
     sendJson(response, 200, {
-      items: [{ meme }],
+      items: [{ meme: offset > 0 ? nextMeme : meme }],
       limit: Number(url.searchParams.get('limit') ?? 12),
-      offset: Number(url.searchParams.get('offset') ?? 0),
-      total: 1,
-      has_more: false
+      offset,
+      total: 2,
+      has_more: offset <= 0
     });
     return;
   }
