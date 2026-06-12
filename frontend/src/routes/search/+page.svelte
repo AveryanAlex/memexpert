@@ -1,18 +1,13 @@
 <script lang="ts">
   import { navigating } from '$app/state';
   import { bulkGuestGuidance, collectionListBulkOptions } from '$lib/features/memes/bulk-view-model';
-  import MemeGrid from '$lib/features/memes/MemeGrid.svelte';
-  import { ActionLink, Badge, Button, Card, EmptyState, FormRow, Input, LoadingState, Notice, PageHeader, Select } from '$lib/ui';
+  import InfiniteMemeFeed from '$lib/features/memes/InfiniteMemeFeed.svelte';
+  import { ActionLink, Badge, Button, Card, FormRow, Input, LoadingState, PageHeader, Select } from '$lib/ui';
   import { buildSearchHref, LANGUAGE_OPTIONS, MEDIA_TYPE_OPTIONS, QUICK_SEARCH_TAGS } from '$lib/searchParams';
   import type { PageData } from './$types';
 
   let { data }: { data: PageData } = $props();
 
-  const resultStart = $derived(data.page.total === 0 ? 0 : data.filters.offset + 1);
-  const resultEnd = $derived(Math.min(data.filters.offset + data.page.items.length, data.page.total));
-  const previousOffset = $derived(Math.max(data.filters.offset - data.page.limit, 0));
-  const nextOffset = $derived(data.filters.offset + data.page.limit);
-  const memes = $derived(data.page.items.map((item) => item.meme));
   const bulkOptions = $derived(collectionListBulkOptions(data.collections));
   const accountType = $derived(data.session?.user.account_type ?? null);
   const bulkGuidance = $derived(bulkGuestGuidance(accountType, bulkOptions.some((collection) => collection.kind === 'custom')));
@@ -23,10 +18,6 @@
       (data.filters.mediaType ? 1 : 0) +
       (data.filters.language ? 1 : 0)
   );
-
-  function pageHref(offset: number): string {
-    return buildSearchHref(data.filters, { offset });
-  }
 
   function tagHref(tag: string): string {
     const selected = data.filters.tags.includes(tag);
@@ -97,16 +88,25 @@
   </div>
 </Card>
 
-{#if data.errorMessage}
-  <Notice tone="danger" role="alert">{data.errorMessage}</Notice>
-{/if}
-
 {#if loadingSearch}
   <LoadingState label="Loading filtered results" />
 {/if}
 
-<div class="my-7 flex flex-wrap items-center justify-between gap-3">
-  <div class="flex flex-wrap items-center gap-2">
+<InfiniteMemeFeed
+  initialPage={data.page}
+  filters={{
+    query: data.filters.query,
+    tags: data.filters.tags,
+    includeNsfw: data.filters.includeNsfw,
+    mediaType: data.filters.mediaType,
+    language: data.filters.language
+  }}
+  initialError={data.errorMessage}
+  label="Search results"
+  emptyMessage="Try a shorter phrase, remove a tag, or broaden media and language filters."
+  bulk={{ enabled: true, accountType, saveEnabled: true, collectionOptions: bulkOptions, guidance: bulkGuidance }}
+>
+  {#snippet summary()}
     {#if data.filters.query}
       <p class="m-0 text-muted">Results for “{data.filters.query}”</p>
     {:else}
@@ -118,29 +118,10 @@
     {#if data.filters.mediaType}<Badge>{data.filters.mediaType}</Badge>{/if}
     {#if data.filters.language}<Badge>{data.filters.language}</Badge>{/if}
     {#if data.filters.includeNsfw}<Badge>NSFW included</Badge>{/if}
-  </div>
-  <p class="m-0 text-muted">Showing {resultStart}-{resultEnd} of {data.page.total}</p>
-</div>
-
-{#if data.page.items.length > 0}
-  <MemeGrid
-    {memes}
-    label="Search results"
-    bulk={{ enabled: true, accountType, saveEnabled: true, collectionOptions: bulkOptions, guidance: bulkGuidance }}
-  />
-{:else if !data.errorMessage}
-  <EmptyState title="No memes found" message="Try a shorter phrase, remove a tag, or broaden media and language filters.">
+  {/snippet}
+  {#snippet emptyAction()}
     {#if activeFilterCount > 0 || data.filters.query}
       <ActionLink href="/search">Browse everything</ActionLink>
     {/if}
-  </EmptyState>
-{/if}
-
-<nav class="mt-6 flex flex-wrap gap-2" aria-label="Pagination">
-  {#if data.filters.offset > 0}
-    <ActionLink variant="secondary" href={pageHref(previousOffset)}>Previous</ActionLink>
-  {/if}
-  {#if data.page.has_more}
-    <ActionLink href={pageHref(nextOffset)}>Next page</ActionLink>
-  {/if}
-</nav>
+  {/snippet}
+</InfiniteMemeFeed>
