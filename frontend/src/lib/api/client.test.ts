@@ -3,9 +3,14 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   addSourceChannel,
   ApiError,
+  createCollection,
+  createCollectionInvite,
+  deleteCollection,
   favoriteMeme,
   fetchAdminDashboard,
   fetchAdminSession,
+  fetchCollectionDetail,
+  fetchCollections,
   fetchCurrentSession,
   fetchMemeLibrary,
   fetchMemeDetail,
@@ -17,11 +22,13 @@ import {
   fetchTrendPage,
   pinMeme,
   refreshCurrentSession,
+  removeMemeFromCollection,
   removeSavedMeme,
   reportMeme,
   resolveModerationReport,
   reviewChannelSuggestion,
   saveMeme,
+  setActiveSaveCollection,
   startTelegramLink,
   unfavoriteMeme,
   unpinMeme,
@@ -428,6 +435,56 @@ describe('catalog API client', () => {
     expect(mockFetch).toHaveBeenCalledOnce();
     expect(onResponse).toHaveBeenCalledOnce();
   });
+
+  it('uses collection list, detail, mutation, active-save, remove, and invite endpoints', async () => {
+    const collectionId = '11111111-1111-4111-8111-111111111111';
+    const memeId = '22222222-2222-4222-8222-222222222222';
+    const calls: Array<{ method: string; path: string; body: unknown }> = [];
+    const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      calls.push({ method: init?.method ?? 'GET', path: url.pathname, body: init?.body ? JSON.parse(String(init.body)) : null });
+
+      if (url.pathname === '/api/v1/collections' && (init?.method ?? 'GET') === 'GET') {
+        return jsonResponse({ collections: [], active_save_collection_id: null });
+      }
+      if (url.pathname === `/api/v1/collections/${collectionId}` && (init?.method ?? 'GET') === 'GET') {
+        return jsonResponse({ ...collectionSummary(collectionId), saved_memes: [] });
+      }
+      if (url.pathname === `/api/v1/collections/${collectionId}/invites`) {
+        return jsonResponse({ invite: collectionInvite(collectionId), token: 'invite-token', join_path: '/collection/invite/invite-token' });
+      }
+      if (url.pathname.endsWith('/active-save')) {
+        return jsonResponse({ active_save_collection_id: collectionId });
+      }
+      if (url.pathname.endsWith(`/memes/${memeId}`)) {
+        return jsonResponse(init?.method === 'DELETE' ? { removed: true } : { saved: true });
+      }
+      if (init?.method === 'DELETE') {
+        return jsonResponse({ deleted: true });
+      }
+      return jsonResponse(collectionSummary(collectionId));
+    }) satisfies ApiFetch;
+
+    await fetchCollections({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test' });
+    await fetchCollectionDetail({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', collectionId });
+    await createCollection({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', body: { title: 'Launch', visibility: 'private' } });
+    await setActiveSaveCollection({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', collectionId });
+    await removeMemeFromCollection({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', collectionId, memeId });
+    await createCollectionInvite({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', collectionId, body: { role: 'viewer', max_uses: 1 } });
+    await deleteCollection({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', collectionId });
+
+    expect(calls.map((call) => [call.method, call.path])).toEqual([
+      ['GET', '/api/v1/collections'],
+      ['GET', `/api/v1/collections/${collectionId}`],
+      ['POST', '/api/v1/collections'],
+      ['PUT', `/api/v1/collections/${collectionId}/active-save`],
+      ['DELETE', `/api/v1/collections/${collectionId}/memes/${memeId}`],
+      ['POST', `/api/v1/collections/${collectionId}/invites`],
+      ['DELETE', `/api/v1/collections/${collectionId}`]
+    ]);
+    expect(calls[2].body).toEqual({ title: 'Launch', visibility: 'private' });
+    expect(calls[5].body).toEqual({ role: 'viewer', max_uses: 1 });
+  });
 });
 
 describe('admin API client', () => {
@@ -634,6 +691,54 @@ function memeDetail(overrides: { id: string; seo_page_slug: string | null }) {
     seo_prompt_version: null,
     seo_generated_at: null,
     files: []
+  };
+}
+
+function collectionSummary(collectionId: string) {
+  return {
+    collection: {
+      id: collectionId,
+      owner_id: '22222222-2222-4222-8222-222222222222',
+      title: 'Launch',
+      description: null,
+      kind: 'custom',
+      visibility: 'private',
+      memberships: [],
+      invites: [],
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z'
+    },
+    viewer_role: 'owner',
+    capabilities: {
+      can_view: true,
+      can_add_memes: true,
+      can_remove_memes: true,
+      can_rename: true,
+      can_delete: true,
+      can_create_invites: true,
+      can_set_active_save: true
+    },
+    active_save_collection_id: null
+  };
+}
+
+function collectionInvite(collectionId: string) {
+  return {
+    id: '33333333-3333-4333-8333-333333333333',
+    collection_id: collectionId,
+    created_by_user_id: '22222222-2222-4222-8222-222222222222',
+    role: 'viewer',
+    channel: 'direct_link',
+    label: null,
+    status: 'pending',
+    max_uses: 1,
+    use_count: 0,
+    expires_at: null,
+    last_used_at: null,
+    revoked_at: null,
+    recipient_email: null,
+    created_at: '2026-01-01T00:00:00Z',
+    updated_at: '2026-01-01T00:00:00Z'
   };
 }
 

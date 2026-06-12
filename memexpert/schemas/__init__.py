@@ -17,13 +17,19 @@ from memexpert.schemas.auth import (
     GuestBootstrapRequest,
 )
 from memexpert.schemas.collection import (
+    CollectionCapabilitiesRead,
+    CollectionDetailRead,
+    CollectionInviteLinkRead,
     CollectionInviteRead,
+    CollectionListRead,
     CollectionMemberRead,
     CollectionMemeRead,
     CollectionRead,
+    CollectionSavedMemeRead,
     CollectionSummaryRead,
     MemeLibraryRead,
     PinnedMemeRead,
+    WebCollectionSummaryRead,
 )
 from memexpert.schemas.content_pipeline import (
     ContentPipelineDispatchEvent,
@@ -61,10 +67,15 @@ __all__ = [
     "AuthErrorResponse",
     "AuthSessionRead",
     "ChannelSuggestionRead",
+    "CollectionCapabilitiesRead",
+    "CollectionDetailRead",
+    "CollectionInviteLinkRead",
     "CollectionInviteRead",
+    "CollectionListRead",
     "CollectionMemeRead",
     "CollectionMemberRead",
     "CollectionRead",
+    "CollectionSavedMemeRead",
     "CollectionSummaryRead",
     "ContentPipelineDispatchEvent",
     "ContentPipelineErrorCode",
@@ -89,4 +100,5 @@ __all__ = [
     "MemeReportRead",
     "PinnedMemeRead",
     "UserRead",
+    "WebCollectionSummaryRead",
 ]
