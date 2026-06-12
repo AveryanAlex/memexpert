@@ -131,13 +131,10 @@ Service layer with real infrastructure — each test run spins up fresh containe
 
 ### SvelteKit Tests
 
-- **Component tests (Vitest):** individual components in isolation — meme cards, search bar, collection grid, filter sidebar, admin panels
-- **E2E tests (Playwright):** full browser flows against running API:
-  - Search → view meme → like → appears in favorites
-  - Collection create → invite link → join → see shared memes
-  - Guest browsing → link Telegram → account merge
-  - Admin: meme merge, SEO AI-assisted edit, template curation
-  - SSR: pages render correctly with SEO content, meta tags, OpenGraph
+- The frontend lives under `frontend/` and uses pnpm with SvelteKit.
+- Current CI runs `pnpm install --frozen-lockfile`, `pnpm check`, Vitest, a Playwright smoke test with a local mocked backend, and `pnpm build`.
+- The smoke path covers search results → meme detail → rendered media → visible meme actions.
+- The temporary/staging production target is `@sveltejs/adapter-node`; `pnpm build` writes `frontend/build`, and `pnpm start` runs the built Node server.
 
 ### What We Don't Test Automatically
 
@@ -150,7 +147,7 @@ Service layer with real infrastructure — each test run spins up fresh containe
 ```
 push/PR → [parallel]
             ├─ Python: lint (ruff) → type check (mypy) → unit tests → integration tests (testcontainers)
-            └─ SvelteKit: lint (biome) → type check (svelte-check) → Vitest component tests
+            └─ SvelteKit: pnpm install → svelte-check → Vitest → Playwright smoke → build
 merge    → build images → deploy staging → Playwright E2E → deploy production
 ```
 

@@ -4,7 +4,20 @@ Minimal SvelteKit MVP for the public meme catalog. It uses the existing FastAPI 
 
 ## Configuration
 
-- `API_BASE_URL`: backend origin for SSR API calls. Defaults to `http://localhost:8000`.
+- `API_BASE_URL`: backend origin for SSR API calls. Defaults to `http://localhost:8000`. Set this to the private backend origin reachable from the SvelteKit Node server, not necessarily the public browser origin.
+- Auth/session cookies are forwarded by SSR load functions when present. Keep backend cookie `SameSite`, `Secure`, domain, and CORS settings aligned with the frontend origin used in staging/production.
+- Media URLs are emitted by the backend from imgproxy/CDN settings such as `IMGPROXY_BASE_URL`, `IMGPROXY_KEY`, `IMGPROXY_SALT`, and `MEDIA_PUBLIC_BASE_URL`. The frontend renders those URLs directly, so they must be browser-reachable in the deployed environment.
+
+## Production Target
+
+This app deliberately uses `@sveltejs/adapter-node` as the temporary/staging production target because no committed project docs select a provider-specific platform yet. `pnpm build` writes a standalone Node server to `build/`, and `pnpm start` runs it with `node build`.
+
+Useful runtime variables for the Node server:
+
+- `HOST`: bind host for the SvelteKit Node server. Defaults to `0.0.0.0`.
+- `PORT`: bind port for the SvelteKit Node server. Defaults to `3000`.
+- `ORIGIN`: public origin when the app runs behind a reverse proxy.
+- `API_BASE_URL`: backend origin used by SSR API calls.
 
 ## Local Commands
 
@@ -13,8 +26,15 @@ pnpm install
 pnpm dev
 pnpm check
 pnpm test
+pnpm exec playwright install chromium
+pnpm test:smoke
 pnpm build
+pnpm start
 ```
+
+After `pnpm build`, verify the production server locally with a command such as `HOST=127.0.0.1 PORT=3000 API_BASE_URL=http://localhost:8000 pnpm start`.
+
+For local Playwright setup, `pnpm exec playwright install chromium` installs the bundled Chromium browser. On a fresh Linux workstation that is missing browser system libraries, use `pnpm exec playwright install --with-deps chromium` instead. CI uses that `--with-deps` command on Ubuntu 24.04 so the bundled Chromium path is deterministic. If bundled Chromium is unavailable on a local runner but system Chrome is installed, run the same smoke script with `PLAYWRIGHT_CHANNEL=chrome pnpm test:smoke`.
 
 ## CI Commands
 
@@ -24,5 +44,7 @@ Run these from `frontend/`:
 pnpm install --frozen-lockfile
 pnpm check
 pnpm test
+pnpm exec playwright install --with-deps chromium
+pnpm test:smoke
 pnpm build
 ```

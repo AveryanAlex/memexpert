@@ -53,7 +53,7 @@ jobs:
         run: uv run pytest -v
 
   frontend:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -81,6 +81,14 @@ jobs:
 
       - name: Test frontend
         run: pnpm test
+        working-directory: frontend
+
+      - name: Install Playwright browser
+        run: pnpm exec playwright install --with-deps chromium
+        working-directory: frontend
+
+      - name: Smoke test frontend
+        run: pnpm test:smoke
         working-directory: frontend
 
       - name: Build frontend
