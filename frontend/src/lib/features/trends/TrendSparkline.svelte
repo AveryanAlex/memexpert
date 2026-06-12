@@ -18,9 +18,9 @@
 </script>
 
 {#if points.length >= 2}
-  <svg class="sparkline" viewBox="0 0 100 48" role="img" aria-label="Popularity sparkline">
+  <svg class="h-24 w-full max-w-[420px] rounded-[18px] bg-gradient-to-b from-paper to-soft p-2.5 text-ink" viewBox="0 0 100 48" role="img" aria-label="Popularity sparkline">
     <polyline points={polyline} fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" />
   </svg>
 {:else}
-  <p class="muted">Not enough real snapshots for a sparkline yet.</p>
+  <p class="m-0 text-muted">Not enough real snapshots for a sparkline yet.</p>
 {/if}

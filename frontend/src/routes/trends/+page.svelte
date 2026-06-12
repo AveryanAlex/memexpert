@@ -1,6 +1,7 @@
 <script lang="ts">
-  import MemeCard from '$lib/components/MemeCard.svelte';
-  import TrendSummary from '$lib/components/TrendSummary.svelte';
+  import MemeCard from '$lib/features/memes/MemeCard.svelte';
+  import TrendSummary from '$lib/features/trends/TrendSummary.svelte';
+  import { ActionLink, Card, EmptyState, Notice, PageHeader } from '$lib/ui';
   import type { PageData } from './$types';
 
   let { data }: { data: PageData } = $props();
@@ -19,79 +20,70 @@
   }
 </script>
 
-<section class="hero trend-hero" aria-labelledby="trends-title">
-  <div>
-    <h1 id="trends-title">Public meme trends.</h1>
-    <p class="muted">Aggregate launch-scope analytics from MemeXpert activity and source popularity snapshots.</p>
-  </div>
-  <span class="pill">No per-user data</span>
-</section>
+<PageHeader title="Public meme trends." description="Aggregate launch-scope analytics from MemeXpert activity and source popularity snapshots." badge="No per-user data" />
 
-<nav class="trend-tabs" aria-label="Trend rankings">
-  <a class:active={data.ranking === 'trending'} href={rankingHref('trending')}>Trending</a>
-  <a class:active={data.ranking === 'fastest_rising'} href={rankingHref('fastest_rising')}>Fastest rising</a>
-  <a class:active={data.ranking === 'most_liked'} href={rankingHref('most_liked')}>Most liked</a>
+<nav class="mb-6 flex flex-wrap gap-2" aria-label="Trend rankings">
+  <a class={data.ranking === 'trending' ? 'rounded-full bg-ink px-4 py-3 font-extrabold text-paper no-underline' : 'rounded-full border border-line bg-paper px-4 py-3 font-extrabold text-ink no-underline'} href={rankingHref('trending')}>Trending</a>
+  <a class={data.ranking === 'fastest_rising' ? 'rounded-full bg-ink px-4 py-3 font-extrabold text-paper no-underline' : 'rounded-full border border-line bg-paper px-4 py-3 font-extrabold text-ink no-underline'} href={rankingHref('fastest_rising')}>Fastest rising</a>
+  <a class={data.ranking === 'most_liked' ? 'rounded-full bg-ink px-4 py-3 font-extrabold text-paper no-underline' : 'rounded-full border border-line bg-paper px-4 py-3 font-extrabold text-ink no-underline'} href={rankingHref('most_liked')}>Most liked</a>
 </nav>
 
 {#if data.errorMessage}
-  <p class="notice" role="status">{data.errorMessage}</p>
+  <Notice>{data.errorMessage}</Notice>
 {/if}
 
-<div class="status-row">
-  <p class="muted">Showing {resultStart}-{resultEnd} of {data.page.total}</p>
-  <a href="/" class="muted">Search all memes</a>
+<div class="my-7 flex flex-wrap justify-between gap-3">
+  <p class="m-0 text-muted">Showing {resultStart}-{resultEnd} of {data.page.total}</p>
+  <a href="/" class="text-muted">Search all memes</a>
 </div>
 
 {#if data.page.items.length > 0}
-  <section class="trend-grid" aria-label="Trend ranked memes">
+  <section class="grid grid-cols-1 gap-4 md:grid-cols-3" aria-label="Trend ranked memes">
     {#each data.page.items as item (item.meme.id)}
-      <article class="trend-card">
+      <Card class="grid gap-3 p-4 shadow-none">
         <MemeCard meme={item.meme} />
         <TrendSummary trend={item.trend} />
-      </article>
+      </Card>
     {/each}
   </section>
 {:else if !data.errorMessage}
-  <section class="empty-state">
-    <h2>No trend data yet</h2>
-    <p class="muted">Trend materialized views are empty. Refresh analytics after events or snapshots are available.</p>
-  </section>
+  <EmptyState title="No trend data yet" message="Trend materialized views are empty. Refresh analytics after events or snapshots are available." />
 {/if}
 
-<nav class="pagination" aria-label="Pagination">
+<nav class="mt-6 flex flex-wrap gap-2" aria-label="Pagination">
   {#if data.offset > 0}
-    <a class="button-link secondary" href={rankingHref(data.ranking, previousOffset)}>Previous</a>
+    <ActionLink variant="secondary" href={rankingHref(data.ranking, previousOffset)}>Previous</ActionLink>
   {/if}
   {#if data.page.has_more}
-    <a class="button-link" href={rankingHref(data.ranking, nextOffset)}>Next page</a>
+    <ActionLink href={rankingHref(data.ranking, nextOffset)}>Next page</ActionLink>
   {/if}
 </nav>
 
-<section class="summary-columns" aria-label="Aggregate trend summaries">
-  <div class="summary-panel">
-    <h2>Tags moving now</h2>
+<section class="mt-7 grid gap-4 md:grid-cols-2" aria-label="Aggregate trend summaries">
+  <Card class="grid gap-3 shadow-none">
+    <h2 class="m-0 text-2xl font-black tracking-[-0.04em]">Tags moving now</h2>
     {#if data.tagSummaries.length > 0}
       {#each data.tagSummaries as summary}
-        <a class="summary-row" href={`/tags/${summary.slug}`}>
+        <a class="flex items-center justify-between gap-3 rounded-[18px] border border-line bg-paper px-4 py-3 font-extrabold no-underline" href={`/tags/${summary.slug}`}>
           <span>{summary.title}</span>
-          <small>{summary.meme_count} memes · {summary.trend.trending_score.toFixed(1)} score</small>
+          <small class="text-muted">{summary.meme_count} memes · {summary.trend.trending_score.toFixed(1)} score</small>
         </a>
       {/each}
     {:else}
-      <p class="muted">No tag aggregates yet.</p>
+      <p class="m-0 text-muted">No tag aggregates yet.</p>
     {/if}
-  </div>
-  <div class="summary-panel">
-    <h2>Templates moving now</h2>
+  </Card>
+  <Card class="grid gap-3 shadow-none">
+    <h2 class="m-0 text-2xl font-black tracking-[-0.04em]">Templates moving now</h2>
     {#if data.templateSummaries.length > 0}
       {#each data.templateSummaries as summary}
-        <a class="summary-row" href={`/templates/${summary.slug}`}>
+        <a class="flex items-center justify-between gap-3 rounded-[18px] border border-line bg-paper px-4 py-3 font-extrabold no-underline" href={`/templates/${summary.slug}`}>
           <span>{summary.title}</span>
-          <small>{summary.meme_count} memes · {summary.trend.trending_score.toFixed(1)} score</small>
+          <small class="text-muted">{summary.meme_count} memes · {summary.trend.trending_score.toFixed(1)} score</small>
         </a>
       {/each}
     {:else}
-      <p class="muted">No template aggregates yet.</p>
+      <p class="m-0 text-muted">No template aggregates yet.</p>
     {/if}
-  </div>
+  </Card>
 </section>
