@@ -13,7 +13,7 @@ Current chart-like components found under `frontend/src`:
 | Component | Current usage | Current behavior | Recommendation |
 | --- | --- | --- | --- |
 | `src/lib/features/trends/TrendSparkline.svelte` | `src/routes/memes/[id]/+page.svelte` public popularity card | LayerChart-backed compact sparkline over `PublicMemePopularityPointRead.popularity_score`; no axis, legend, tooltip, or point labels; screen-reader chart label and route-level empty state copy | Keep on the shared chart wrapper. It remains compact and non-interactive, but plotting/scales are handled by LayerChart instead of bespoke SVG coordinate math. |
-| `src/lib/features/trends/TrendComparisonChart.svelte` | `src/routes/trends/compare/+page.svelte` comparison card | Hand-computed SVG axes, paths, points, and legend for multiple series; only `<title>` point labels; no real axis ticks, responsive tooltip, scale formatting, or accessible data summary | Migrate to LayerChart first. This is already doing chart-library work by hand and planned comparison UI needs axes, legends, tooltips, responsive layout, and eventually screenshots/share polish. |
+| `src/lib/features/trends/TrendComparisonChart.svelte` | `src/routes/trends/compare/+page.svelte` comparison card | LayerChart-backed multi-series comparison through `$lib/ui/chart`; `ChartFrame` owns shell/empty state/sizing, LayerChart owns axes/grid/line/point/tooltip rendering, and a visible warm-token legend stays below the chart | Keep on the shared chart wrapper. Future work should prefer timestamp-aware x values once every comparison point has a reliable `observed_at`, while preserving the adjacent exact-value data table. |
 
 No other `<svg>`, `<canvas>`, `<path>`, `<polyline>`, `<line>`, or `<circle>` chart-like Svelte components were found in `frontend/src`.
 
@@ -64,8 +64,8 @@ LayerChart gives us reusable primitives for the solved parts:
 
 1. Add `layerchart@1.0.13` as a frontend dependency in a focused implementation task.
 2. Create a small MemeExpert chart wrapper under `frontend/src/lib/ui/chart` or `frontend/src/lib/features/trends/charts` rather than importing LayerChart directly in routes.
-3. Migrate `TrendComparisonChart.svelte` first:
-   - map comparison points to `{ x: Date | number, y: number, seriesKey, label }`;
+3. Keep `TrendComparisonChart.svelte` on LayerChart:
+   - map comparison points to chart data in the feature component;
    - render line/point series with real axes;
    - use a visible legend and chart tooltip;
    - keep the existing data table as the exact-value accessible fallback.
