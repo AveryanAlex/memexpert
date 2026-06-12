@@ -24,6 +24,8 @@ SAFE_HTTP_METHODS: Final[frozenset[str]] = frozenset({"GET", "HEAD", "OPTIONS"})
 API_PATH_SEGMENT: Final = "api"
 AUTH_PATH_SEGMENT: Final = "auth"
 ADMIN_PATH_SEGMENT: Final = "admin"
+MEMES_PATH_SEGMENT: Final = "memes"
+REPORT_PATH_SEGMENT: Final = "report"
 VERSION_PATH_PREFIX: Final = "v"
 V1_AUTH_PATH_PREFIX: Final = "/api/v1/auth"
 RATE_LIMIT_KEY_PREFIX: Final = "security:rate_limit"
@@ -175,6 +177,8 @@ def classify_security_route(request: Request) -> SecurityRouteTier:
     if segments[2] == AUTH_PATH_SEGMENT:
         return SecurityRouteTier.AUTH_WRITE
     if segments[2] == ADMIN_PATH_SEGMENT:
+        return SecurityRouteTier.BROWSER_WRITE
+    if segments[2] == MEMES_PATH_SEGMENT and len(segments) == 5 and segments[4] == REPORT_PATH_SEGMENT:
         return SecurityRouteTier.BROWSER_WRITE
     return SecurityRouteTier.SAFE
 

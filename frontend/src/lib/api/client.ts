@@ -13,6 +13,8 @@ import type {
   PublicMemeSearchPageRead,
   PublicMemeTrendPageRead,
   PublicTrendSummaryRead,
+  MemeReportRead,
+  ModerationReason,
   TelegramLinkStartRead
 } from './types';
 
@@ -49,6 +51,11 @@ interface MemeActionRequest {
   cookieHeader?: string;
   onResponse?: (response: Response) => void;
   memeId: string;
+}
+
+interface MemeReportRequest extends MemeActionRequest {
+  reason: ModerationReason;
+  note?: string | null;
 }
 
 export interface RemoveActionResponse {
@@ -167,6 +174,13 @@ export async function pinMeme(request: MemeActionRequest): Promise<unknown> {
 
 export async function unpinMeme(request: MemeActionRequest): Promise<RemoveActionResponse> {
   return apiMutation(`/api/v1/memes/${encodeURIComponent(request.memeId)}/pin`, 'DELETE', request);
+}
+
+export async function reportMeme(request: MemeReportRequest): Promise<MemeReportRead> {
+  return apiJsonWrite<MemeReportRead>(`/api/v1/memes/${encodeURIComponent(request.memeId)}/report`, 'POST', request, {
+    reason: request.reason,
+    note: request.note ?? null
+  });
 }
 
 export async function fetchTagLanding(request: LandingRequest): Promise<PublicMemeLandingRead> {
@@ -338,6 +352,37 @@ async function apiWrite<T>(path: string, method: 'PATCH' | 'POST', request: Admi
 
   if (!response.ok) {
     throw new ApiError(response.status, readErrorDetail(payload) ?? `Admin API returned ${response.status}`);
+  }
+
+  return payload as T;
+}
+
+async function apiJsonWrite<T>(
+  path: string,
+  method: 'PATCH' | 'POST',
+  request: MemeActionRequest,
+  body: unknown
+): Promise<T> {
+  const headers = new Headers({
+    accept: 'application/json',
+    'content-type': 'application/json',
+    'x-requested-with': 'XMLHttpRequest'
+  });
+  if (request.cookieHeader) {
+    headers.set('cookie', request.cookieHeader);
+  }
+
+  const response = await request.fetch(buildApiInput(path, request.baseUrl), {
+    method,
+    headers,
+    credentials: 'include',
+    body: JSON.stringify(body)
+  });
+  request.onResponse?.(response);
+  const payload = await readJson(response);
+
+  if (!response.ok) {
+    throw new ApiError(response.status, readErrorDetail(payload) ?? `API write returned ${response.status}`);
   }
 
   return payload as T;

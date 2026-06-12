@@ -16,6 +16,7 @@ from memexpert.services.analytics import AnalyticsService
 from memexpert.services.meme_search import MemeSearchService
 from memexpert.services.public_trends import PublicTrendsService
 from memexpert.services.query_embedding import CachedTextQueryEmbeddingService
+from memexpert.services.report import MemeReportService
 
 
 def get_meme_search_service(session: Annotated[AsyncSession, Depends(get_db_session)]) -> MemeSearchService:
@@ -50,16 +51,25 @@ def get_public_trends_service(session: Annotated[AsyncSession, Depends(get_db_se
     return PublicTrendsService(session)
 
 
+def get_meme_report_service(session: Annotated[AsyncSession, Depends(get_db_session)]) -> MemeReportService:
+    """Build the user-facing meme report service for request handlers."""
+
+    return MemeReportService(session=session)
+
+
 AnalyticsServiceDep = Annotated[AnalyticsService, Depends(get_analytics_service)]
+MemeReportServiceDep = Annotated[MemeReportService, Depends(get_meme_report_service)]
 MemeSearchServiceDep = Annotated[MemeSearchService, Depends(get_meme_search_service)]
 PublicTrendsServiceDep = Annotated[PublicTrendsService, Depends(get_public_trends_service)]
 
 
 __all__ = [
     "AnalyticsServiceDep",
+    "MemeReportServiceDep",
     "MemeSearchServiceDep",
     "PublicTrendsServiceDep",
     "get_analytics_service",
     "get_meme_search_service",
+    "get_meme_report_service",
     "get_public_trends_service",
 ]

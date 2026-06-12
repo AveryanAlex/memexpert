@@ -1,4 +1,4 @@
-export type MemeProxyAction = 'favorite' | 'pin' | 'save';
+export type MemeProxyAction = 'favorite' | 'pin' | 'report' | 'save';
 export type MemeProxyMethod = 'DELETE' | 'POST';
 export type ProxyFetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
@@ -24,10 +24,20 @@ export async function proxyMemeAction({
   if (cookie) {
     headers.set('cookie', cookie);
   }
+  const requestedWith = request.headers.get('x-requested-with');
+  if (requestedWith) {
+    headers.set('x-requested-with', requestedWith);
+  }
+
+  const bodyText = method === 'POST' ? await request.text() : '';
+  if (bodyText) {
+    headers.set('content-type', request.headers.get('content-type') ?? 'application/json');
+  }
 
   const upstream = await fetch(new URL(`/api/v1/memes/${encodeURIComponent(memeId)}/${action}`, apiBaseUrl), {
     method,
-    headers
+    headers,
+    body: bodyText || undefined
   });
 
   const responseHeaders = new Headers();

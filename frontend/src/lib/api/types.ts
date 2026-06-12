@@ -272,6 +272,16 @@ export interface AdminModerationReportRead {
   meme: AdminMemeRead;
 }
 
+export interface MemeReportRead {
+  id: string;
+  meme_id: string;
+  status: ModerationReportStatus;
+  reason: ModerationReason;
+  note: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface AdminModerationDecisionRead {
   id: string;
   meme_id: string;

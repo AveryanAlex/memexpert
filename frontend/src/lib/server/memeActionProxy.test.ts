@@ -61,4 +61,41 @@ describe('meme action proxy', () => {
     expect(response.status).toBe(403);
     await expect(response.json()).resolves.toEqual({ detail: 'Full account required.' });
   });
+
+  it('forwards report JSON bodies and CSRF-compatible request headers', async () => {
+    const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const headers = new Headers(init?.headers);
+
+      expect(url.toString()).toBe('https://api.memexpert.test/api/v1/memes/meme-123/report');
+      expect(init?.method).toBe('POST');
+      expect(headers.get('content-type')).toBe('application/json');
+      expect(headers.get('x-requested-with')).toBe('XMLHttpRequest');
+      expect(init?.body).toBe(JSON.stringify({ reason: 'spam', note: 'bad link' }));
+
+      return new Response(JSON.stringify({ id: 'report-1' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      });
+    }) satisfies ProxyFetch;
+
+    const response = await proxyMemeAction({
+      fetch: mockFetch,
+      request: new Request('https://web.memexpert.test/api/v1/memes/meme-123/report', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-requested-with': 'XMLHttpRequest'
+        },
+        body: JSON.stringify({ reason: 'spam', note: 'bad link' })
+      }),
+      apiBaseUrl: 'https://api.memexpert.test',
+      memeId: 'meme-123',
+      action: 'report',
+      method: 'POST'
+    });
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ id: 'report-1' });
+  });
 });

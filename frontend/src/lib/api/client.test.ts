@@ -17,6 +17,7 @@ import {
   pinMeme,
   refreshCurrentSession,
   removeSavedMeme,
+  reportMeme,
   resolveModerationReport,
   reviewChannelSuggestion,
   saveMeme,
@@ -258,6 +259,44 @@ describe('catalog API client', () => {
       { method: 'POST', path: '/api/v1/memes/meme-123/pin' },
       { method: 'DELETE', path: '/api/v1/memes/meme-123/pin' }
     ]);
+  });
+
+  it('submits meme reports with JSON body and CSRF-compatible request header', async () => {
+    const memeId = '11111111-1111-4111-8111-111111111111';
+    const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const headers = new Headers(init?.headers);
+
+      expect(url.pathname).toBe(`/api/v1/memes/${memeId}/report`);
+      expect(init?.method).toBe('POST');
+      expect(init?.credentials).toBe('include');
+      expect(headers.get('content-type')).toBe('application/json');
+      expect(headers.get('x-requested-with')).toBe('XMLHttpRequest');
+      expect(headers.get('cookie')).toBe('memexpert_access_token=full');
+      expect(JSON.parse(String(init?.body))).toEqual({ reason: 'harassment', note: 'targets someone' });
+
+      return jsonResponse({
+        id: '22222222-2222-4222-8222-222222222222',
+        meme_id: memeId,
+        status: 'pending',
+        reason: 'harassment',
+        note: 'targets someone',
+        created_at: '2026-01-01T00:00:00Z',
+        updated_at: '2026-01-01T00:00:00Z'
+      });
+    }) satisfies ApiFetch;
+
+    const report = await reportMeme({
+      fetch: mockFetch,
+      baseUrl: 'https://api.memexpert.test',
+      cookieHeader: 'memexpert_access_token=full',
+      memeId,
+      reason: 'harassment',
+      note: 'targets someone'
+    });
+
+    expect(report.status).toBe('pending');
+    expect(mockFetch).toHaveBeenCalledOnce();
   });
 
   it('loads current session through the web bootstrap endpoint and forwards Set-Cookie hooks', async () => {
