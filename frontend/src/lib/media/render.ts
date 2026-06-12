@@ -8,6 +8,11 @@ export interface SelectedMediaRender {
   hasMedia: boolean;
 }
 
+interface MediaDimensions {
+  width: number;
+  height: number;
+}
+
 export function selectMediaRender(file: PublicMemeFileRead | null | undefined): SelectedMediaRender {
   const render = file?.render;
   const videoUrl = render?.web_video_url ?? null;
@@ -22,4 +27,21 @@ export function selectMediaRender(file: PublicMemeFileRead | null | undefined): 
     downloadUrl,
     hasMedia: Boolean(videoUrl || imageUrl || audioUrl)
   };
+}
+
+export function selectMediaAspectRatio(file: PublicMemeFileRead | null | undefined): string | null {
+  const dimensions = selectMediaDimensions(file);
+  return dimensions ? `${dimensions.width} / ${dimensions.height}` : null;
+}
+
+function selectMediaDimensions(file: PublicMemeFileRead | null | undefined): MediaDimensions | null {
+  const renderDimensions = validDimensions(file?.render?.width, file?.render?.height);
+  if (renderDimensions) return renderDimensions;
+
+  return validDimensions(file?.width, file?.height);
+}
+
+function validDimensions(width: number | null | undefined, height: number | null | undefined): MediaDimensions | null {
+  if (!width || !height || width <= 0 || height <= 0) return null;
+  return { width, height };
 }

@@ -20,7 +20,7 @@
     <MemeActionMenu {meme} {href} compact />
   </div>
   <a class="grid text-inherit no-underline" {href} aria-label={`Open ${title}`}>
-    <MemeMedia {meme} />
+    <MemeMedia {meme} preview />
     <div class="grid content-between gap-4 p-4">
       <p class="m-0 text-lg font-extrabold leading-tight">{title}</p>
       <div class="flex flex-wrap gap-2" aria-label="Meme metadata">
