@@ -7,7 +7,10 @@ import type {
   CurrentSessionRead,
   PublicMemeDetailRead,
   PublicMemeLandingRead,
+  PublicMemePopularitySummaryRead,
   PublicMemeSearchPageRead,
+  PublicMemeTrendPageRead,
+  PublicTrendSummaryRead,
   TelegramLinkStartRead
 } from './types';
 
@@ -30,6 +33,12 @@ interface PageRequest extends CatalogRequest {
 
 interface DetailRequest extends CatalogRequest {
   memeId: string;
+}
+
+interface TrendRequest extends CatalogRequest {
+  ranking?: 'trending' | 'fastest_rising' | 'most_liked';
+  limit: number;
+  offset: number;
 }
 
 interface MemeActionRequest {
@@ -96,6 +105,39 @@ export async function fetchMemeDetail(request: DetailRequest): Promise<PublicMem
   const path = isUuid(request.memeId) ? `/api/v1/memes/${encoded}` : `/api/v1/memes/slug/${encoded}`;
   return apiGet<PublicMemeDetailRead>(
     path,
+    new URLSearchParams({ include_nsfw: 'false' }),
+    request
+  );
+}
+
+export async function fetchTrendPage(request: TrendRequest): Promise<PublicMemeTrendPageRead> {
+  const params = new URLSearchParams({
+    ranking: request.ranking ?? 'trending',
+    limit: String(request.limit),
+    offset: String(request.offset)
+  });
+  return apiGet<PublicMemeTrendPageRead>('/api/v1/memes/trends', params, request);
+}
+
+export async function fetchTagTrendSummaries(request: TrendRequest): Promise<PublicTrendSummaryRead[]> {
+  return apiGet<PublicTrendSummaryRead[]>(
+    '/api/v1/memes/trends/tags',
+    new URLSearchParams({ limit: String(request.limit), offset: String(request.offset) }),
+    request
+  );
+}
+
+export async function fetchTemplateTrendSummaries(request: TrendRequest): Promise<PublicTrendSummaryRead[]> {
+  return apiGet<PublicTrendSummaryRead[]>(
+    '/api/v1/memes/trends/templates',
+    new URLSearchParams({ limit: String(request.limit), offset: String(request.offset) }),
+    request
+  );
+}
+
+export async function fetchMemePopularitySummary(request: DetailRequest): Promise<PublicMemePopularitySummaryRead> {
+  return apiGet<PublicMemePopularitySummaryRead>(
+    `/api/v1/memes/${encodeURIComponent(request.memeId)}/popularity`,
     new URLSearchParams({ include_nsfw: 'false' }),
     request
   );
@@ -311,6 +353,16 @@ function readErrorDetail(payload: unknown): string | null {
 }
 
 export function emptyMemePage(limit: number, offset: number): PublicMemeSearchPageRead {
+  return {
+    items: [],
+    limit,
+    offset,
+    total: 0,
+    has_more: false
+  };
+}
+
+export function emptyTrendPage(limit: number, offset: number): PublicMemeTrendPageRead {
   return {
     items: [],
     limit,

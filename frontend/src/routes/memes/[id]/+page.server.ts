@@ -1,6 +1,6 @@
 import { fail, redirect } from '@sveltejs/kit';
 import type { Actions, PageServerLoad } from './$types';
-import { ApiError, favoriteMeme, fetchCurrentSession, fetchMemeDetail } from '$lib/api/client';
+import { ApiError, favoriteMeme, fetchCurrentSession, fetchMemeDetail, fetchMemePopularitySummary } from '$lib/api/client';
 import { apiBaseUrl, cookieHeaderWithAccessToken, forwardBackendAccessCookie } from '$lib/server/backend';
 
 export const load: PageServerLoad = async ({ fetch, params, request }) => {
@@ -16,6 +16,7 @@ export const load: PageServerLoad = async ({ fetch, params, request }) => {
     if (error instanceof ApiError && error.status === 404) {
       return {
         meme: null,
+        popularity: null,
         unavailableMessage: 'This meme is not available. It may be private, removed, or filtered by safety settings.'
       };
     }
@@ -23,21 +24,30 @@ export const load: PageServerLoad = async ({ fetch, params, request }) => {
     if (error instanceof ApiError && error.status === 422) {
       return {
         meme: null,
+        popularity: null,
         unavailableMessage: 'This meme link is invalid.'
       };
     }
 
     return {
       meme: null,
+      popularity: null,
       unavailableMessage: 'Could not reach the meme catalog API.'
     };
   }
+
+  const popularity = await fetchMemePopularitySummary({
+    fetch,
+    baseUrl: apiBaseUrl(),
+    memeId: meme.id,
+    cookieHeader: request.headers.get('cookie') ?? undefined
+  }).catch(() => null);
 
   if (meme.seo_page_slug && params.id !== meme.seo_page_slug) {
     throw redirect(308, `/memes/${meme.seo_page_slug}`);
   }
 
-  return { meme, unavailableMessage: null };
+  return { meme, popularity, unavailableMessage: null };
 };
 
 export const actions: Actions = {

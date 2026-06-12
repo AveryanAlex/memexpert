@@ -4,18 +4,18 @@
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
 from fastapi import FastAPI
 from httpx import AsyncClient
-from sqlalchemy import event, select
+from sqlalchemy import event, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from memexpert.api.dependencies import PIPELINE_OPERATOR_TOKEN_HEADER_NAME
 from memexpert.api.dependencies.auth import get_optional_current_user
-from memexpert.api.dependencies.meme import get_analytics_service, get_meme_search_service
+from memexpert.api.dependencies.meme import get_analytics_service, get_meme_search_service, get_public_trends_service
 from memexpert.core.config import Settings, get_settings
 from memexpert.core.qdrant import QdrantUserSearchMatch
 from memexpert.models.collection import Collection, CollectionMember, CollectionMeme, PinnedMeme
@@ -35,6 +35,7 @@ from memexpert.services.analytics import AnalyticsService
 from memexpert.services.media_render_urls import MediaRenderUrlService
 from memexpert.services.meme_search import MemeNotFoundError, MemeSearchFilters, MemeSearchService
 from memexpert.services.meme_seo import MemeSeoGenerationService, MemeSeoProviderResult
+from memexpert.services.public_trends import PublicTrendsService, refresh_public_trend_materialized_views
 
 pytestmark = pytest.mark.asyncio
 
@@ -188,9 +189,19 @@ def _install_meme_route_overrides(
     def override_analytics_service() -> AnalyticsService:
         return AnalyticsService(session)
 
+    def override_public_trends_service() -> PublicTrendsService:
+        return PublicTrendsService(session)
+
     app.dependency_overrides[get_meme_search_service] = override_meme_search_service
     app.dependency_overrides[get_analytics_service] = override_analytics_service
+    app.dependency_overrides[get_public_trends_service] = override_public_trends_service
     app.dependency_overrides[get_optional_current_user] = override_current_user
+
+
+async def _refresh_trend_views(session: AsyncSession) -> None:
+    await session.execute(text("REFRESH MATERIALIZED VIEW public_meme_trends_mv"))
+    await session.execute(text("REFRESH MATERIALIZED VIEW public_tag_trends_mv"))
+    await session.execute(text("REFRESH MATERIALIZED VIEW public_template_trends_mv"))
 
 
 async def test_hybrid_search_ranks_by_weighted_semantic_text_and_popularity(
@@ -343,19 +354,31 @@ async def test_public_openapi_registers_catalog_routes_without_internal_surface(
     assert "/api/v1/memes/search" in paths
     assert "/api/v1/memes/browse" in paths
     assert "/api/v1/memes/trending" in paths
+    assert "/api/v1/memes/trends" in paths
+    assert "/api/v1/memes/trends/tags" in paths
+    assert "/api/v1/memes/trends/templates" in paths
     assert "/api/v1/memes/slug/{slug}" in paths
     assert "/api/v1/memes/tags/{tag_slug}" in paths
     assert "/api/v1/memes/templates/{template_slug}" in paths
     assert "/api/v1/memes/{meme_id}/canonical" in paths
+    assert "/api/v1/memes/{meme_id}/popularity" in paths
     assert "/api/v1/memes/{meme_id}" in paths
     search_parameters = {parameter["name"] for parameter in paths["/api/v1/memes/search"]["get"]["parameters"]}
+    trending_parameters = {
+        parameter["name"]: parameter
+        for parameter in paths["/api/v1/memes/trending"]["get"]["parameters"]
+    }
     assert "query" in search_parameters
     assert "query_vector" not in search_parameters
+    assert "lookback_hours" in trending_parameters
+    assert "ignores this value" in trending_parameters["lookback_hours"]["description"]
     assert set(components["PublicMemeSearchResultRead"]["properties"]) == {"meme"}
     assert "viewer_has_favorited" in components["PublicMemeCardRead"]["properties"]
     assert "viewer_has_saved" in components["PublicMemeCardRead"]["properties"]
     assert "viewer_has_pinned" in components["PublicMemeCardRead"]["properties"]
     assert "MemeSearchScoreRead" not in components
+    assert set(components["PublicMemeTrendRead"]["properties"]) == {"meme", "trend"}
+    assert set(components["PublicMemePopularitySummaryRead"]["properties"]) == {"meme_id", "trend", "sparkline"}
     assert "s3_original_key" not in components["PublicMemeFileRead"]["properties"]
     assert "s3_web_video_key" not in components["PublicMemeFileRead"]["properties"]
     assert "author_user_id" not in components["PublicMemeDetailRead"]["properties"]
@@ -907,22 +930,24 @@ async def test_trending_route_ranks_recent_events_snapshots_and_popularity_witho
     private_meme = await _create_meme(migrated_db_session, tags=["trend"], popularity_score=100.0, is_public=False)
     migrated_db_session.add_all(
         [
-            AnalyticsEvent(
-                event_type=AnalyticsEventType.MEME_SEND,
-                payload={"meme_id": str(event_meme.id), "telegram_user_hash": "hashed-user"},
-            ),
-            AnalyticsEvent(
-                event_type=AnalyticsEventType.MEME_LIKE,
-                payload={"meme_id": str(event_meme.id), "telegram_user_hash": "hashed-user"},
-            ),
+            *[
+                AnalyticsEvent(
+                    event_type=AnalyticsEventType.MEME_LIKE,
+                    payload={"meme_id": str(event_meme.id), "telegram_user_hash": "hashed-user"},
+                )
+                for _ in range(10)
+            ],
             AnalyticsEvent(
                 event_type=AnalyticsEventType.MEME_SEND,
                 payload={"meme_id": str(private_meme.id), "telegram_user_id": 12345},
             ),
+            AnalyticsEvent(event_type=AnalyticsEventType.MEME_VIEW, payload={"meme_id": "not-a-uuid"}),
+            AnalyticsEvent(event_type=AnalyticsEventType.MEME_VIEW, payload={"meme_id": {"bad": "json"}}),
             MemePopularitySnapshot(meme_id=snapshot_meme.id, popularity_score=100.0, source_views=50),
         ]
     )
     await migrated_db_session.flush()
+    await _refresh_trend_views(migrated_db_session)
     _install_meme_route_overrides(app, migrated_db_session)
 
     try:
@@ -943,6 +968,143 @@ async def test_trending_route_ranks_recent_events_snapshots_and_popularity_witho
     assert str(private_meme.id) not in first_response.text
     assert "telegram_user_id" not in first_response.text
     assert "telegram_user_hash" not in first_response.text
+
+
+async def test_public_trend_endpoints_rank_from_materialized_views_and_return_aggregates(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    template = MemeTemplate(slug="frog-template", name="Frog Template", description="Frog format")
+    migrated_db_session.add(template)
+    await migrated_db_session.flush()
+    snapshot_meme = await _create_meme(migrated_db_session, tags=["reaction"], popularity_score=1.0)
+    snapshot_meme.template_id = template.id
+    liked_meme = await _create_meme(migrated_db_session, tags=["reaction"], popularity_score=1.0)
+    rising_meme = await _create_meme(migrated_db_session, tags=["reaction"], popularity_score=1.0)
+    now = datetime.now(UTC)
+    migrated_db_session.add_all(
+        [
+            *[
+                AnalyticsEvent(event_type=AnalyticsEventType.MEME_LIKE, payload={"meme_id": str(liked_meme.id)})
+                for _ in range(3)
+            ],
+            *[
+                AnalyticsEvent(event_type=AnalyticsEventType.MEME_SEND, payload={"meme_id": str(rising_meme.id)})
+                for _ in range(7)
+            ],
+            MemePopularitySnapshot(
+                meme_id=snapshot_meme.id,
+                captured_at=now - timedelta(hours=2),
+                source_views=10,
+                popularity_score=100.0,
+            ),
+            MemePopularitySnapshot(
+                meme_id=snapshot_meme.id,
+                captured_at=now,
+                source_views=20,
+                source_reactions=4,
+                source_reposts=1,
+                popularity_score=200.0,
+            ),
+        ]
+    )
+    await migrated_db_session.flush()
+    await _refresh_trend_views(migrated_db_session)
+    _install_meme_route_overrides(app, migrated_db_session)
+
+    try:
+        trending_response = await client.get("/api/v1/memes/trends", params={"ranking": "trending", "limit": 10})
+        rising_response = await client.get(
+            "/api/v1/memes/trends",
+            params={"ranking": "fastest_rising", "limit": 10},
+        )
+        liked_response = await client.get("/api/v1/memes/trends", params={"ranking": "most_liked", "limit": 10})
+        tag_response = await client.get("/api/v1/memes/trends/tags", params={"limit": 10})
+        template_response = await client.get("/api/v1/memes/trends/templates", params={"limit": 10})
+        popularity_response = await client.get(f"/api/v1/memes/{snapshot_meme.id}/popularity")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert trending_response.status_code == 200
+    assert rising_response.status_code == 200
+    assert liked_response.status_code == 200
+    assert tag_response.status_code == 200
+    assert template_response.status_code == 200
+    assert popularity_response.status_code == 200
+    assert trending_response.json()["items"][0]["meme"]["id"] == str(snapshot_meme.id)
+    assert rising_response.json()["items"][0]["meme"]["id"] == str(rising_meme.id)
+    assert liked_response.json()["items"][0]["meme"]["id"] == str(liked_meme.id)
+    assert liked_response.json()["items"][0]["trend"]["recent"]["likes"] == 3
+    assert liked_response.json()["items"][0]["trend"]["recent"]["downloads"] == 0
+    assert liked_response.json()["items"][0]["trend"]["previous"]["downloads"] == 0
+    assert "payload" not in trending_response.text
+    assert "query" not in trending_response.text
+
+    tag_payload = tag_response.json()
+    reaction_summary = next(summary for summary in tag_payload if summary["slug"] == "reaction")
+    assert reaction_summary["meme_count"] == 3
+    assert reaction_summary["trend"]["recent"]["sends"] == 7
+    assert reaction_summary["trend"]["recent"]["likes"] == 3
+    assert reaction_summary["trend"]["recent"]["downloads"] == 0
+
+    template_payload = template_response.json()
+    assert template_payload[0]["slug"] == "frog-template"
+    assert template_payload[0]["meme_count"] == 1
+    assert template_payload[0]["trend"]["latest_source_views"] == 20
+    assert template_payload[0]["trend"]["recent"]["downloads"] == 0
+
+    popularity_payload = popularity_response.json()
+    assert popularity_payload["meme_id"] == str(snapshot_meme.id)
+    assert [point["popularity_score"] for point in popularity_payload["sparkline"]] == [100.0, 200.0]
+    assert popularity_payload["trend"]["latest_source_views"] == 20
+
+
+async def test_public_trend_empty_states_are_honest(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    await _refresh_trend_views(migrated_db_session)
+    _install_meme_route_overrides(app, migrated_db_session)
+
+    try:
+        trends_response = await client.get("/api/v1/memes/trends")
+        tags_response = await client.get("/api/v1/memes/trends/tags")
+        templates_response = await client.get("/api/v1/memes/trends/templates")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert trends_response.status_code == 200
+    assert trends_response.json() == {"items": [], "limit": 20, "offset": 0, "total": 0, "has_more": False}
+    assert tags_response.status_code == 200
+    assert tags_response.json() == []
+    # Static trend routes must be matched before dynamic /{meme_id} detail routes.
+    assert tags_response.headers["content-type"].startswith("application/json")
+    assert templates_response.status_code == 200
+    assert templates_response.json() == []
+    assert templates_response.headers["content-type"].startswith("application/json")
+
+    meme = await _create_meme(migrated_db_session)
+    await _refresh_trend_views(migrated_db_session)
+    _install_meme_route_overrides(app, migrated_db_session)
+    try:
+        popularity_response = await client.get(f"/api/v1/memes/{meme.id}/popularity")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert popularity_response.status_code == 200
+    popularity_payload = popularity_response.json()
+    assert popularity_payload["trend"] is not None
+    assert popularity_payload["sparkline"] == []
+
+
+async def test_public_trend_refresh_command_path_uses_concurrent_refresh_with_fallback(
+    postgres_async_engine: AsyncEngine,
+    migrated_db_session: AsyncSession,
+) -> None:
+    _ = migrated_db_session
+    await refresh_public_trend_materialized_views(postgres_async_engine, concurrently=True)
 
 
 async def test_public_routes_apply_nsfw_defaults_and_authenticated_opt_in(

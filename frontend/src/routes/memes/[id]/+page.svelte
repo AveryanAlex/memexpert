@@ -2,6 +2,8 @@
   import { page } from '$app/state';
   import MemeActionMenu from '$lib/components/MemeActionMenu.svelte';
   import MemeMedia from '$lib/components/MemeMedia.svelte';
+  import TrendSparkline from '$lib/components/TrendSparkline.svelte';
+  import TrendSummary from '$lib/components/TrendSummary.svelte';
   import type { ActionData, PageData } from './$types';
 
   let { data, form }: { data: PageData; form: ActionData } = $props();
@@ -41,6 +43,15 @@
           {/each}
         </div>
       {/if}
+      <section class="trend-section" aria-label="Popularity trend">
+        <h2>Popularity trend</h2>
+        <TrendSummary trend={data.popularity?.trend ?? null} />
+        {#if data.popularity}
+          <TrendSparkline points={data.popularity.sparkline} />
+        {:else}
+          <p class="muted">Popularity analytics are not available for this meme yet.</p>
+        {/if}
+      </section>
       <div class="detail-actions">
         <form method="POST" action="?/favorite">
           <input type="hidden" name="memeId" value={data.meme.id} />
