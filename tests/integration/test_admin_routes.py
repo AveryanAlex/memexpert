@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, cast
+
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -31,6 +33,9 @@ from memexpert.services import AuthService, UserService
 from tests.conftest import create_full_user_via_upgrade
 from tests.integration.test_auth_routes import ACCESS_COOKIE_NAME, build_test_auth_service
 
+if TYPE_CHECKING:
+    from fastapi import FastAPI
+
 
 async def _issue_user_cookie(
     session_factory: async_sessionmaker[AsyncSession],
@@ -52,7 +57,7 @@ async def _issue_user_cookie(
 
 
 async def test_admin_routes_require_session_cookie_admin_flag_and_ignore_operator_header(
-    auth_app,
+    auth_app: FastAPI,
     auth_settings_overrides: dict[str, str],
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -125,7 +130,7 @@ async def test_admin_routes_require_session_cookie_admin_flag_and_ignore_operato
 
 
 async def test_admin_can_approve_channel_suggestion_through_cookie_session(
-    auth_app,
+    auth_app: FastAPI,
     auth_settings_overrides: dict[str, str],
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -169,7 +174,7 @@ async def test_admin_can_approve_channel_suggestion_through_cookie_session(
 
 
 async def test_admin_can_list_read_and_resolve_moderation_report_with_audited_decision(
-    auth_app,
+    auth_app: FastAPI,
     auth_settings_overrides: dict[str, str],
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -255,7 +260,7 @@ async def test_admin_can_list_read_and_resolve_moderation_report_with_audited_de
 
 
 async def test_admin_direct_meme_override_persists_template_and_decision_audit_records(
-    auth_app,
+    auth_app: FastAPI,
     auth_settings_overrides: dict[str, str],
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -338,7 +343,7 @@ async def test_admin_direct_meme_override_persists_template_and_decision_audit_r
 
 
 async def test_admin_can_delete_meme_with_durable_destructive_audit(
-    auth_app,
+    auth_app: FastAPI,
     auth_settings_overrides: dict[str, str],
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -432,11 +437,12 @@ async def test_admin_can_delete_meme_with_durable_destructive_audit(
         assert audit_log.admin_user_id == admin_id
         assert audit_log.action == "delete"
         assert audit_log.note == "Unsafe duplicate should be removed"
-        assert audit_log.affected_snapshot["meme_files"]["ids"] == [str(file_id)]
+        affected_snapshot = cast("dict[str, dict[str, object]]", audit_log.affected_snapshot)
+        assert affected_snapshot["meme_files"]["ids"] == [str(file_id)]
 
 
 async def test_admin_delete_requires_exact_confirmation_without_partial_delete(
-    auth_app,
+    auth_app: FastAPI,
     auth_settings_overrides: dict[str, str],
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -476,7 +482,7 @@ async def test_admin_delete_requires_exact_confirmation_without_partial_delete(
 
 
 async def test_admin_can_merge_meme_with_shared_lineage_transfer_and_audit(
-    auth_app,
+    auth_app: FastAPI,
     auth_settings_overrides: dict[str, str],
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -589,7 +595,7 @@ async def test_admin_can_merge_meme_with_shared_lineage_transfer_and_audit(
 
 
 async def test_admin_merge_self_is_blocked_without_partial_delete_or_audit(
-    auth_app,
+    auth_app: FastAPI,
     auth_settings_overrides: dict[str, str],
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:

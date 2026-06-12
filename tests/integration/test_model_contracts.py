@@ -5,12 +5,12 @@ from __future__ import annotations
 
 import uuid
 from datetime import timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
 import pytest_asyncio
 from pydantic import ValidationError
-from sqlalchemy import inspect as sa_inspect, select
+from sqlalchemy import Table, UniqueConstraint, inspect as sa_inspect, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import configure_mappers, selectinload
 
@@ -1300,9 +1300,9 @@ def test_source_channel_exposes_crawler_checkpoint_columns() -> None:
     # Defaults live on the column descriptors because SQLAlchemy resolves
     # them at flush time, not at construction time. Reading them off the
     # column keeps this a pure unit test that does not need a session.
-    assert columns["catchup_message_limit"].default.arg == 500  # type: ignore[union-attr]
-    assert columns["catchup_enabled"].default.arg is True  # type: ignore[union-attr]
-    assert columns["is_paused"].default.arg is False  # type: ignore[union-attr]
+    assert columns["catchup_message_limit"].default.arg == 500
+    assert columns["catchup_enabled"].default.arg is True
+    assert columns["is_paused"].default.arg is False
 
 
 def test_meme_source_unique_platform_source_post_still_holds() -> None:
@@ -1310,10 +1310,11 @@ def test_meme_source_unique_platform_source_post_still_holds() -> None:
     # If T02/T03 ever accidentally drops the constraint, the crawler ingest
     # would lose its duplicate-post guard, so locking this assertion keeps
     # the S04 tests honest about the contract.
+    meme_source_table = cast("Table", MemeSource.__table__)
     unique_constraints = {
         constraint.name: tuple(column.name for column in constraint.columns)
-        for constraint in MemeSource.__table__.constraints
-        if constraint.__class__.__name__ == "UniqueConstraint"
+        for constraint in meme_source_table.constraints
+        if isinstance(constraint, UniqueConstraint)
     }
     assert unique_constraints == {
         "uq_meme_sources_platform_source_post": ("platform", "source_id", "post_id"),

@@ -398,6 +398,11 @@ class FakeMeilisearchSyncClient:
     async def ensure_index(self) -> None:
         return None
 
+    async def search(self, query: str, *, limit: int = 20) -> list[dict[str, Any]]:
+        _ = query
+        _ = limit
+        return []
+
 
 @dataclass(slots=True)
 class FakeClassificationClient:
@@ -872,14 +877,13 @@ async def test_pipeline_runtime_dead_letters_malformed_dispatch_payloads_and_mar
 
     async def publish_dead_letter(
         payload: object,
-        queue: object = "",
+        _queue: object = "",
         exchange: object | None = None,
         *,
         routing_key: str = "",
         headers: dict[str, object] | None = None,
         **_: object,
     ) -> None:
-        _ = queue
         dead_letters.append(
             cast(
                 "Any",
@@ -1275,14 +1279,13 @@ async def test_pipeline_runtime_embed_malformed_vector_marks_non_retryable_failu
 
     async def publish_dead_letter(
         payload: object,
-        queue: object = "",
+        _queue: object = "",
         exchange: object | None = None,
         *,
         routing_key: str = "",
         headers: dict[str, object] | None = None,
         **_: object,
     ) -> None:
-        _ = queue
         dead_letters.append(
             {
                 "payload": payload,
@@ -1502,8 +1505,7 @@ async def test_pipeline_runtime_embed_merge_transaction_failure_keeps_stage_repl
     # layer and the classifier must keep it replayable.
     from memexpert.services import content_merge as content_merge_module
 
-    async def fake_transfer(self: object, **_: object) -> tuple[uuid.UUID, ...]:
-        _ = self
+    async def fake_transfer(_self: object, **_kwargs: object) -> tuple[uuid.UUID, ...]:
         raise RuntimeError("forced runtime merge-transfer failure")
 
     monkeypatch.setattr(
@@ -1695,14 +1697,13 @@ async def test_pipeline_runtime_embed_qdrant_malformed_response_dead_letters(
 
     async def publish_dead_letter(
         payload: object,
-        queue: object = "",
+        _queue: object = "",
         exchange: object | None = None,
         *,
         routing_key: str = "",
         headers: dict[str, object] | None = None,
         **_: object,
     ) -> None:
-        _ = queue
         dead_letters.append(
             {
                 "payload": payload,
@@ -1804,14 +1805,13 @@ async def test_pipeline_runtime_embed_contract_violation_dead_letters_non_retrya
 
     async def publish_dead_letter(
         payload: object,
-        queue: object = "",
+        _queue: object = "",
         exchange: object | None = None,
         *,
         routing_key: str = "",
         headers: dict[str, object] | None = None,
         **_: object,
     ) -> None:
-        _ = queue
         dead_letters.append(
             {
                 "payload": payload,
@@ -1867,12 +1867,13 @@ async def _load_sync_target_snapshot(
     target: SyncTargetKind,
 ) -> MemeFileSyncTargetSnapshot | None:
     async with session_factory() as session:
-        return await session.scalar(
+        snapshot: MemeFileSyncTargetSnapshot | None = await session.scalar(
             select(MemeFileSyncTargetSnapshot).where(
                 MemeFileSyncTargetSnapshot.meme_file_id == meme_file_id,
                 MemeFileSyncTargetSnapshot.sync_target == target,
             )
         )
+        return snapshot
 
 
 async def test_pipeline_runtime_sync_qdrant_success_records_snapshot_and_publishes_synced_event(
@@ -1938,14 +1939,16 @@ async def test_pipeline_runtime_sync_qdrant_success_records_snapshot_and_publish
     assert snapshot.status is SyncTargetStatus.SYNCED
     assert snapshot.attempt_count == 1
     assert snapshot.last_success_at is not None
-    assert "meme_file_id" in snapshot.last_payload_preview.get("preview_fields", {})
+    preview_fields = snapshot.last_payload_preview.get("preview_fields")
+    assert isinstance(preview_fields, dict)
+    assert "meme_file_id" in preview_fields
 
     # Exactly one MEME_QDRANT_SYNCED dispatch event was published to the broker.
     synced_publishes = [
         call
         for call in downstream_broker.publish_calls
-        if isinstance(call.get("payload"), dict)
-        and call["payload"].get("event_type") == ContentPipelineEventType.MEME_QDRANT_SYNCED.value
+        if isinstance(payload := call.get("payload"), dict)
+        and payload.get("event_type") == ContentPipelineEventType.MEME_QDRANT_SYNCED.value
     ]
     assert len(synced_publishes) == 1
 
@@ -2094,14 +2097,13 @@ async def test_pipeline_runtime_sync_qdrant_malformed_response_dead_letters(
 
     async def publish_dead_letter(
         payload: object,
-        queue: object = "",
+        _queue: object = "",
         exchange: object | None = None,
         *,
         routing_key: str = "",
         headers: dict[str, object] | None = None,
         **_: object,
     ) -> None:
-        _ = queue
         dead_letters.append(
             {
                 "payload": payload,
@@ -2310,8 +2312,8 @@ async def test_pipeline_runtime_sync_meili_success_records_snapshot_and_publishe
     synced_publishes = [
         call
         for call in downstream_broker.publish_calls
-        if isinstance(call.get("payload"), dict)
-        and call["payload"].get("event_type") == ContentPipelineEventType.MEME_MEILI_SYNCED.value
+        if isinstance(payload := call.get("payload"), dict)
+        and payload.get("event_type") == ContentPipelineEventType.MEME_MEILI_SYNCED.value
     ]
     assert len(synced_publishes) == 1
 
@@ -2482,14 +2484,13 @@ async def test_pipeline_runtime_sync_meili_malformed_response_dead_letters(
 
     async def publish_dead_letter(
         payload: object,
-        queue: object = "",
+        _queue: object = "",
         exchange: object | None = None,
         *,
         routing_key: str = "",
         headers: dict[str, object] | None = None,
         **_: object,
     ) -> None:
-        _ = queue
         dead_letters.append(
             {
                 "payload": payload,

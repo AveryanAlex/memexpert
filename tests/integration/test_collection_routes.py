@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from memexpert.api.dependencies.auth import get_optional_current_user
 from memexpert.api.dependencies.collection import get_collection_service
@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 
     from fastapi import FastAPI
     from httpx import AsyncClient
+    from pytest import MonkeyPatch
     from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -154,7 +155,7 @@ async def test_collection_detail_and_media_route_authorize_private_saved_media(
     app: FastAPI,
     client: AsyncClient,
     migrated_db_session: AsyncSession,
-    monkeypatch: object,
+    monkeypatch: MonkeyPatch,
 ) -> None:
     user_service = UserService(migrated_db_session)
     owner = await create_full_user_via_upgrade(user_service, telegram_id=2001, email="private-owner@example.com")
@@ -172,7 +173,7 @@ async def test_collection_detail_and_media_route_authorize_private_saved_media(
     assert private_meme.primary_file_id is not None
     private_file_id = private_meme.primary_file_id
 
-    current_user = UserRead.model_validate(owner)
+    current_user: UserRead | None = UserRead.model_validate(owner)
     fake_s3_client = FakeS3Client()
     monkeypatch.setattr(media_routes, "get_s3_client", lambda: fake_s3_client)
 
@@ -251,5 +252,7 @@ async def test_collection_detail_and_media_route_authorize_private_saved_media(
     assert outsider_detail_response.status_code == 404
     assert outsider_media_response.status_code == 404
     assert anonymous_media_response.status_code == 401
-    assert fake_s3_client.calls[0]["params"]["Key"] == "pipeline/derived/private/owner-upload.mp4"
-    assert fake_s3_client.calls[1]["params"]["Key"] == "pipeline/originals/private/owner-upload.png"
+    first_params = cast("dict[str, str]", fake_s3_client.calls[0]["params"])
+    second_params = cast("dict[str, str]", fake_s3_client.calls[1]["params"])
+    assert first_params["Key"] == "pipeline/derived/private/owner-upload.mp4"
+    assert second_params["Key"] == "pipeline/originals/private/owner-upload.png"
