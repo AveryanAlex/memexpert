@@ -19,6 +19,8 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
     from datetime import datetime
 
+    from memexpert.core.search_index_prefilter import SearchIndexPrefilter
+
 
 @dataclass(frozen=True, slots=True)
 class QdrantSimilarityMatch:
@@ -42,18 +44,35 @@ class QdrantUserSearchMatch:
 class QdrantSyncPayload:
     """Durable payload advertised to Qdrant as part of the per-file sync upsert.
 
-    The runtime reads canonical meme truth (tags, language, NSFW flag) plus the
-    primary-file OCR snippet and quality score and builds this struct once per
-    sync attempt. Keeping the shape frozen makes it obvious which fields are
-    persisted in ``EmbeddingCache``-adjacent Qdrant payloads and which come from
-    the canonical meme.
+    The runtime rebuilds this struct from canonical PostgreSQL state once per
+    sync attempt. Keeping the shape frozen makes it obvious which safe access,
+    collection, and ranking hints are advertised to Qdrant; PostgreSQL remains
+    the final access authority for user-facing results.
     """
 
     meme_id: uuid.UUID
     meme_file_id: uuid.UUID
+    search_index_algorithm_version: str
+    is_public: bool
+    author_user_id: str | None
+    media_type: str
     language: str
     is_nsfw: bool
+    seo_page_slug: str | None
+    template_id: str | None
+    template_slug: str | None
+    popularity_score: float
+    like_count: int
+    created_at: datetime
+    updated_at: datetime
     tags: list[str] = field(default_factory=list)
+    collection_ids: list[str] = field(default_factory=list)
+    public_collection_ids: list[str] = field(default_factory=list)
+    unlisted_collection_ids: list[str] = field(default_factory=list)
+    private_collection_ids: list[str] = field(default_factory=list)
+    shared_collection_ids: list[str] = field(default_factory=list)
+    collection_owner_user_ids: list[str] = field(default_factory=list)
+    collection_member_user_ids: list[str] = field(default_factory=list)
     ocr_snippet: str | None = None
     quality_score: float | None = None
     source_object_key: str | None = None
@@ -132,6 +151,7 @@ class QdrantUserSearchClientProtocol(Protocol):
         *,
         query_vector: tuple[float, ...],
         limit: int = 20,
+        prefilter: SearchIndexPrefilter | None = None,
     ) -> tuple[QdrantUserSearchMatch, ...]: ...
 
 
@@ -223,14 +243,17 @@ class PipelineQdrantUserSearchClient(_LazyQdrantClient):
         *,
         query_vector: tuple[float, ...],
         limit: int = 20,
+        prefilter: SearchIndexPrefilter | None = None,
     ) -> tuple[QdrantUserSearchMatch, ...]:
         client = await self._ensure_client()
         resolved_limit = max(1, limit)
+        query_filter = prefilter.to_qdrant_filter() if prefilter is not None else None
 
         try:
             raw_matches = await client.query_points(
                 collection_name=self._settings.pipeline_qdrant_collection_name,
                 query=list(query_vector),
+                query_filter=query_filter,
                 limit=resolved_limit,
                 with_payload=True,
                 with_vectors=False,
@@ -392,9 +415,27 @@ def _build_meme_point(
     qdrant_payload: dict[str, Any] = {
         "meme_id": str(payload.meme_id),
         "meme_file_id": str(payload.meme_file_id),
+        "search_index_algorithm_version": payload.search_index_algorithm_version,
+        "is_public": payload.is_public,
+        "author_user_id": payload.author_user_id,
+        "media_type": payload.media_type,
         "language": payload.language,
         "is_nsfw": payload.is_nsfw,
+        "seo_page_slug": payload.seo_page_slug,
+        "template_id": payload.template_id,
+        "template_slug": payload.template_slug,
+        "popularity_score": float(payload.popularity_score),
+        "like_count": int(payload.like_count),
+        "created_at": payload.created_at.isoformat(),
+        "updated_at": payload.updated_at.isoformat(),
         "tags": list(payload.tags),
+        "collection_ids": list(payload.collection_ids),
+        "public_collection_ids": list(payload.public_collection_ids),
+        "unlisted_collection_ids": list(payload.unlisted_collection_ids),
+        "private_collection_ids": list(payload.private_collection_ids),
+        "shared_collection_ids": list(payload.shared_collection_ids),
+        "collection_owner_user_ids": list(payload.collection_owner_user_ids),
+        "collection_member_user_ids": list(payload.collection_member_user_ids),
     }
     if payload.ocr_snippet is not None:
         qdrant_payload["ocr_snippet"] = payload.ocr_snippet
@@ -432,9 +473,27 @@ def _build_sync_preview(
     allowed_keys = {
         "meme_id",
         "meme_file_id",
+        "search_index_algorithm_version",
+        "is_public",
+        "author_user_id",
+        "media_type",
         "language",
         "is_nsfw",
+        "seo_page_slug",
+        "template_id",
+        "template_slug",
+        "popularity_score",
+        "like_count",
+        "created_at",
+        "updated_at",
         "tags",
+        "collection_ids",
+        "public_collection_ids",
+        "unlisted_collection_ids",
+        "private_collection_ids",
+        "shared_collection_ids",
+        "collection_owner_user_ids",
+        "collection_member_user_ids",
         "ocr_snippet",
         "quality_score",
         "source_object_key",

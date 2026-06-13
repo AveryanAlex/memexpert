@@ -81,6 +81,8 @@ if TYPE_CHECKING:
     from pytest import MonkeyPatch
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+    from memexpert.core.search_index_prefilter import SearchIndexPrefilter
+
 
 @dataclass(slots=True)
 class FakeStorageClient:
@@ -2301,8 +2303,9 @@ class _FakeMeilisearchSyncClient:
         query: str,
         *,
         limit: int = 20,
+        prefilter: SearchIndexPrefilter | None = None,
     ) -> list[dict[str, object]]:
-        self.search_calls.append({"query": query, "limit": limit})
+        self.search_calls.append({"query": query, "limit": limit, "prefilter": prefilter})
         if self.search_error is not None:
             raise self.search_error
         return list(self.search_hits)

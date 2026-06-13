@@ -18,6 +18,7 @@ from memexpert.api.dependencies.auth import get_optional_current_user
 from memexpert.api.dependencies.meme import get_analytics_service, get_meme_search_service, get_public_trends_service
 from memexpert.core.config import Settings, get_settings
 from memexpert.core.qdrant import QdrantUserSearchMatch
+from memexpert.core.search_index_prefilter import SearchIndexPrefilter, SearchIndexPrefilterScope
 from memexpert.models.collection import Collection, CollectionMember, CollectionMeme, PinnedMeme
 from memexpert.models.content import Meme, MemeFile, MemePopularitySnapshot, MemeSeoPage, MemeTemplate
 from memexpert.models.enums import (
@@ -36,6 +37,7 @@ from memexpert.services.media_render_urls import MediaRenderUrlService
 from memexpert.services.meme_search import MemeNotFoundError, MemeSearchFilters, MemeSearchScope, MemeSearchService
 from memexpert.services.meme_seo import MemeSeoGenerationService, MemeSeoProviderResult
 from memexpert.services.public_trends import PublicTrendsService, refresh_public_trend_materialized_views
+from memexpert.services.search_index_sync import SEARCH_INDEX_ALGORITHM_VERSION
 
 pytestmark = pytest.mark.asyncio
 
@@ -48,8 +50,14 @@ class FakeTextSearchClient:
         self._hits = hits
         self.calls: list[dict[str, Any]] = []
 
-    async def search(self, query: str, *, limit: int = 20) -> list[dict[str, Any]]:
-        self.calls.append({"query": query, "limit": limit})
+    async def search(
+        self,
+        query: str,
+        *,
+        limit: int = 20,
+        prefilter: SearchIndexPrefilter | None = None,
+    ) -> list[dict[str, Any]]:
+        self.calls.append({"query": query, "limit": limit, "prefilter": prefilter})
         return self._hits[:limit]
 
 
@@ -63,8 +71,9 @@ class FakeSemanticSearchClient:
         *,
         query_vector: tuple[float, ...],
         limit: int = 20,
+        prefilter: SearchIndexPrefilter | None = None,
     ) -> tuple[QdrantUserSearchMatch, ...]:
-        self.calls.append({"query_vector": query_vector, "limit": limit})
+        self.calls.append({"query_vector": query_vector, "limit": limit, "prefilter": prefilter})
         return self._hits[:limit]
 
 
@@ -82,8 +91,14 @@ class FailingTextSearchClient:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
 
-    async def search(self, query: str, *, limit: int = 20) -> list[dict[str, Any]]:
-        self.calls.append({"query": query, "limit": limit})
+    async def search(
+        self,
+        query: str,
+        *,
+        limit: int = 20,
+        prefilter: SearchIndexPrefilter | None = None,
+    ) -> list[dict[str, Any]]:
+        self.calls.append({"query": query, "limit": limit, "prefilter": prefilter})
         raise RuntimeError("provider-secret-text-failure")
 
 
@@ -237,6 +252,28 @@ def _primary_file_id(meme: Meme) -> uuid.UUID:
     return meme.primary_file_id
 
 
+def _expected_prefilter(
+    *,
+    scope: SearchIndexPrefilterScope,
+    viewer_user_id: uuid.UUID | None = None,
+    collection_ids: tuple[uuid.UUID, ...] = (),
+    media_type: ContentKind | None = None,
+    language: ContentLanguage | None = None,
+    include_nsfw: bool = False,
+    tags: tuple[str, ...] = (),
+) -> SearchIndexPrefilter:
+    return SearchIndexPrefilter(
+        scope=scope,
+        search_index_algorithm_version=SEARCH_INDEX_ALGORITHM_VERSION,
+        viewer_user_id=None if viewer_user_id is None else str(viewer_user_id),
+        collection_ids=tuple(str(collection_id) for collection_id in collection_ids),
+        media_type=media_type.value if media_type is not None else None,
+        language=language.value if language is not None else None,
+        include_nsfw=include_nsfw,
+        tags=tags,
+    )
+
+
 def _user_read(user: User) -> UserRead:
     return UserRead.model_validate(user)
 
@@ -341,8 +378,20 @@ async def test_plain_text_query_embedding_feeds_qdrant_and_hybrid_merge(
     page = await service.search_memes("  frog wizard  ", limit=10)
 
     assert embedding_client.calls == ["frog wizard"]
-    assert semantic_client.calls == [{"query_vector": (0.3, 0.4), "limit": 40}]
-    assert text_client.calls == [{"query": "frog wizard", "limit": 40}]
+    assert semantic_client.calls == [
+        {
+            "query_vector": (0.3, 0.4),
+            "limit": 40,
+            "prefilter": _expected_prefilter(scope=SearchIndexPrefilterScope.PUBLIC),
+        }
+    ]
+    assert text_client.calls == [
+        {
+            "query": "frog wizard",
+            "limit": 40,
+            "prefilter": _expected_prefilter(scope=SearchIndexPrefilterScope.PUBLIC),
+        }
+    ]
     assert [item.meme.id for item in page.items] == [semantic_meme.id, text_meme.id]
     assert page.items[0].score.semantic == 1.0
     assert page.items[1].score.text == 1.0
@@ -393,7 +442,13 @@ async def test_search_route_uses_plain_text_semantic_path_with_overridden_fakes(
     assert "score" not in payload["items"][0]
     assert "s3_original_key" not in payload["items"][0]["meme"]["primary_file"]
     assert embedding_client.calls == ["frog wizard"]
-    assert semantic_client.calls == [{"query_vector": (0.7, 0.8), "limit": 40}]
+    assert semantic_client.calls == [
+        {
+            "query_vector": (0.7, 0.8),
+            "limit": 40,
+            "prefilter": _expected_prefilter(scope=SearchIndexPrefilterScope.PUBLIC),
+        }
+    ]
 
     event = await migrated_db_session.scalar(
         select(AnalyticsEvent).where(AnalyticsEvent.event_type == AnalyticsEventType.SEARCH_QUERY)
@@ -457,6 +512,138 @@ async def test_public_openapi_registers_catalog_routes_without_internal_surface(
     assert "s3_web_video_key" not in components["PublicMemeFileRead"]["properties"]
     assert "author_user_id" not in components["PublicMemeDetailRead"]["properties"]
     assert "is_public" not in components["PublicMemeDetailRead"]["properties"]
+
+
+async def test_search_service_passes_conservative_prefilters_to_text_and_semantic_clients(
+    migrated_db_session: AsyncSession,
+) -> None:
+    viewer = User(account_type=AccountType.FULL)
+    migrated_db_session.add(viewer)
+    await migrated_db_session.flush()
+    requested_collection_id = uuid.uuid4()
+
+    public_text_client = FakeTextSearchClient([])
+    public_semantic_client = FakeSemanticSearchClient(())
+    public_service = MemeSearchService(
+        migrated_db_session,
+        text_client=public_text_client,
+        semantic_client=public_semantic_client,
+    )
+    _ = await public_service.search_memes(
+        "frog",
+        query_vector=(0.1, 0.2),
+        filters=MemeSearchFilters(
+            language=ContentLanguage.EN,
+            media_type=ContentKind.IMAGE,
+            tags=("frog", "wizard"),
+        ),
+        limit=10,
+    )
+
+    assert public_text_client.calls == [
+        {
+            "query": "frog",
+            "limit": 40,
+            "prefilter": _expected_prefilter(
+                scope=SearchIndexPrefilterScope.PUBLIC,
+                media_type=ContentKind.IMAGE,
+                language=ContentLanguage.EN,
+                tags=("frog", "wizard"),
+            ),
+        }
+    ]
+    assert public_semantic_client.calls == [
+        {
+            "query_vector": (0.1, 0.2),
+            "limit": 40,
+            "prefilter": _expected_prefilter(
+                scope=SearchIndexPrefilterScope.PUBLIC,
+                media_type=ContentKind.IMAGE,
+                language=ContentLanguage.EN,
+                tags=("frog", "wizard"),
+            ),
+        }
+    ]
+
+    all_text_client = FakeTextSearchClient([])
+    all_semantic_client = FakeSemanticSearchClient(())
+    all_service = MemeSearchService(
+        migrated_db_session,
+        text_client=all_text_client,
+        semantic_client=all_semantic_client,
+    )
+    _ = await all_service.search_memes(
+        "scope",
+        viewer_user_id=viewer.id,
+        query_vector=(0.1, 0.2),
+        filters=MemeSearchFilters(scope=MemeSearchScope.ALL),
+        limit=10,
+    )
+
+    assert all_text_client.calls[0]["prefilter"] == _expected_prefilter(
+        scope=SearchIndexPrefilterScope.ALL,
+        viewer_user_id=viewer.id,
+    )
+    assert all_semantic_client.calls[0]["prefilter"] == _expected_prefilter(
+        scope=SearchIndexPrefilterScope.ALL,
+        viewer_user_id=viewer.id,
+    )
+
+    private_text_client = FakeTextSearchClient([])
+    private_semantic_client = FakeSemanticSearchClient(())
+    private_service = MemeSearchService(
+        migrated_db_session,
+        text_client=private_text_client,
+        semantic_client=private_semantic_client,
+    )
+    _ = await private_service.search_memes(
+        "scope",
+        viewer_user_id=viewer.id,
+        query_vector=(0.1, 0.2),
+        filters=MemeSearchFilters(scope=MemeSearchScope.PRIVATE),
+        limit=10,
+    )
+
+    assert private_text_client.calls[0]["prefilter"] == _expected_prefilter(
+        scope=SearchIndexPrefilterScope.PRIVATE,
+        viewer_user_id=viewer.id,
+    )
+    assert private_semantic_client.calls[0]["prefilter"] == _expected_prefilter(
+        scope=SearchIndexPrefilterScope.PRIVATE,
+        viewer_user_id=viewer.id,
+    )
+
+    collections_text_client = FakeTextSearchClient([])
+    collections_semantic_client = FakeSemanticSearchClient(())
+    collections_service = MemeSearchService(
+        migrated_db_session,
+        text_client=collections_text_client,
+        semantic_client=collections_semantic_client,
+    )
+    _ = await collections_service.search_memes(
+        "scope",
+        viewer_user_id=viewer.id,
+        query_vector=(0.1, 0.2),
+        filters=MemeSearchFilters(
+            scope=MemeSearchScope.COLLECTIONS,
+            collection_ids=(requested_collection_id,),
+            include_nsfw=True,
+        ),
+        limit=10,
+    )
+
+    assert collections_text_client.calls[0]["prefilter"] == _expected_prefilter(
+        scope=SearchIndexPrefilterScope.COLLECTIONS,
+        viewer_user_id=viewer.id,
+        collection_ids=(requested_collection_id,),
+        include_nsfw=True,
+    )
+    assert collections_semantic_client.calls[0]["prefilter"] == _expected_prefilter(
+        scope=SearchIndexPrefilterScope.COLLECTIONS,
+        viewer_user_id=viewer.id,
+        collection_ids=(requested_collection_id,),
+        include_nsfw=True,
+    )
 
 
 async def test_public_route_json_includes_render_contract_without_storage_leakage(
@@ -2240,7 +2427,13 @@ async def test_provider_failures_fall_back_to_popular_without_raw_error_payload(
     assert "provider-secret" not in response.text
     payload = response.json()
     assert [item["meme"]["id"] for item in payload["items"]] == [str(popular_meme.id)]
-    assert text_client.calls == [{"query": "frog", "limit": 80}]
+    assert text_client.calls == [
+        {
+            "query": "frog",
+            "limit": 80,
+            "prefilter": _expected_prefilter(scope=SearchIndexPrefilterScope.PUBLIC),
+        }
+    ]
     assert embedding_client.calls == ["frog"]
 
 

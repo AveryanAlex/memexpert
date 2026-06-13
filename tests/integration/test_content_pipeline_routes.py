@@ -53,6 +53,8 @@ if TYPE_CHECKING:
     from httpx import AsyncClient
     from sqlalchemy.ext.asyncio import AsyncSession
 
+    from memexpert.core.search_index_prefilter import SearchIndexPrefilter
+
 
 @dataclass(slots=True)
 class StubPipelineService:
@@ -1834,8 +1836,9 @@ class _RouteFakeMeilisearchSyncClient:
         query: str,
         *,
         limit: int = 20,
+        prefilter: SearchIndexPrefilter | None = None,
     ) -> list[dict[str, object]]:
-        self.search_calls.append({"query": query, "limit": limit})
+        self.search_calls.append({"query": query, "limit": limit, "prefilter": prefilter})
         if self.search_error is not None:
             raise self.search_error
         return list(self.search_hits)

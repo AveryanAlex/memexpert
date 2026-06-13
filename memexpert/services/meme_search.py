@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from memexpert.core.qdrant import QdrantUserSearchClientProtocol, QdrantUserSearchMatch
+from memexpert.core.search_index_prefilter import SearchIndexPrefilter, SearchIndexPrefilterScope
 from memexpert.models.base import utcnow
 from memexpert.models.collection import Collection, CollectionMember, CollectionMeme, PinnedMeme
 from memexpert.models.content import Meme, MemeFile, MemePopularitySnapshot, MemeSeoPage, MemeTemplate
@@ -35,6 +36,7 @@ from memexpert.schemas.meme import (
     PublicMemeSearchResultRead,
 )
 from memexpert.services.media_render_urls import MediaRenderUrlService, PublicMediaRenderContext
+from memexpert.services.search_index_sync import SEARCH_INDEX_ALGORITHM_VERSION
 
 TEXT_SCORE_KEYS = ("_rankingScore", "_score", "rankingScore", "score")
 SEMANTIC_WEIGHT = 0.50
@@ -74,6 +76,7 @@ class MemeTextSearchClientProtocol(Protocol):
         query: str,
         *,
         limit: int = 20,
+        prefilter: SearchIndexPrefilter | None = None,
     ) -> list[dict[str, Any]]: ...
 
 
@@ -180,9 +183,11 @@ class MemeSearchService:
 
         normalized_query = query.strip()
         resolved_query_vector = await self._resolve_query_vector(normalized_query, query_vector=query_vector)
+        index_prefilter = _build_search_index_prefilter(resolved_filters, viewer_user_id=viewer_user_id)
         candidates = await self._collect_index_candidates(
             normalized_query,
             query_vector=resolved_query_vector,
+            prefilter=index_prefilter,
             limit=candidate_limit,
         )
         if not candidates:
@@ -728,13 +733,14 @@ class MemeSearchService:
         query: str,
         *,
         query_vector: tuple[float, ...] | None,
+        prefilter: SearchIndexPrefilter,
         limit: int,
     ) -> dict[uuid.UUID, _CandidateScore]:
         candidates: dict[uuid.UUID, _CandidateScore] = {}
 
         if self._text_client is not None and query:
             try:
-                text_hits = await self._text_client.search(query, limit=limit)
+                text_hits = await self._text_client.search(query, limit=limit, prefilter=prefilter)
             except Exception:
                 logger.exception("Text meme search failed; falling back to semantic/popular candidates.")
                 text_hits = []
@@ -751,6 +757,7 @@ class MemeSearchService:
                 semantic_hits = await self._semantic_client.search_memes_by_vector(
                     query_vector=query_vector,
                     limit=limit,
+                    prefilter=prefilter,
                 )
             except Exception:
                 logger.exception("Semantic meme search failed; falling back to text-only candidates.")
@@ -1108,6 +1115,44 @@ def _default_search_scope(viewer_user_id: uuid.UUID | None) -> MemeSearchScope:
 
 def _normalize_collection_ids(collection_ids: tuple[uuid.UUID, ...]) -> tuple[uuid.UUID, ...]:
     return tuple(dict.fromkeys(collection_ids))
+
+
+def _build_search_index_prefilter(
+    filters: MemeSearchFilters,
+    *,
+    viewer_user_id: uuid.UUID | None,
+) -> SearchIndexPrefilter:
+    return SearchIndexPrefilter(
+        scope=_search_index_prefilter_scope(
+            filters.scope or _default_search_scope(viewer_user_id),
+            viewer_user_id=viewer_user_id,
+        ),
+        search_index_algorithm_version=SEARCH_INDEX_ALGORITHM_VERSION,
+        viewer_user_id=None if viewer_user_id is None else str(viewer_user_id),
+        collection_ids=tuple(str(collection_id) for collection_id in filters.collection_ids),
+        media_type=filters.media_type.value if filters.media_type is not None else None,
+        language=filters.language.value if filters.language is not None else None,
+        include_nsfw=filters.include_nsfw,
+        tags=filters.tags,
+    )
+
+
+def _search_index_prefilter_scope(
+    scope: MemeSearchScope,
+    *,
+    viewer_user_id: uuid.UUID | None,
+) -> SearchIndexPrefilterScope:
+    if viewer_user_id is None and scope is not MemeSearchScope.PUBLIC:
+        return SearchIndexPrefilterScope.NONE
+    if scope is MemeSearchScope.PUBLIC:
+        return SearchIndexPrefilterScope.PUBLIC
+    if scope is MemeSearchScope.PRIVATE:
+        return SearchIndexPrefilterScope.PRIVATE
+    if scope is MemeSearchScope.ALL:
+        return SearchIndexPrefilterScope.ALL
+    if scope is MemeSearchScope.COLLECTIONS:
+        return SearchIndexPrefilterScope.COLLECTIONS
+    raise ValueError(f"Unsupported meme search scope: {scope!r}")
 
 
 def _meme_access_predicate(

@@ -25,8 +25,8 @@ from sqlalchemy import select
 
 from memexpert.core.config import Settings, get_settings
 from memexpert.core.database import get_async_session_factory
-from memexpert.core.meilisearch import PipelineMeilisearchDocument, PipelineMeilisearchSyncClient
-from memexpert.core.qdrant import PipelineQdrantSyncClient, QdrantSyncPayload
+from memexpert.core.meilisearch import PipelineMeilisearchSyncClient
+from memexpert.core.qdrant import PipelineQdrantSyncClient
 from memexpert.core.storage import get_pipeline_storage_settings, get_s3_client
 from memexpert.core.voyage import build_pipeline_voyage_client
 from memexpert.models.base import utcnow
@@ -56,6 +56,11 @@ from memexpert.schemas.content_pipeline import (
     ContentPipelineItemDetail,
     ContentPipelineUploadRead,
     SmokeProofResult,
+)
+from memexpert.services.search_index_sync import (
+    build_meilisearch_document,
+    build_qdrant_sync_payload,
+    load_search_index_state,
 )
 
 if TYPE_CHECKING:
@@ -504,43 +509,39 @@ async def seed_direct_corpus(
                     ),
                 ],
             )
+            await session.flush()
+
+            loaded_index_state = await load_search_index_state(session, meme_file_id)
+            qdrant_payload = build_qdrant_sync_payload(loaded_index_state.canonical)
+            meili_document = build_meilisearch_document(loaded_index_state.canonical)
 
             await qdrant_sync_client.upsert_meme_point(
-                QdrantSyncPayload(
-                    meme_id=meme_id,
-                    meme_file_id=meme_file_id,
-                    language=spec.language.value,
-                    is_nsfw=spec.is_nsfw,
-                    tags=list(spec.tags),
-                    ocr_snippet=spec.ocr_text,
-                    quality_score=1.0,
-                    source_object_key=object_key,
-                ),
+                qdrant_payload,
                 embedding.vector,
             )
-            document = PipelineMeilisearchDocument(
-                id=meme_file_id.hex,
-                meme_id=str(meme_id),
-                language=spec.language.value,
-                is_nsfw=spec.is_nsfw,
-                updated_at=now,
-                tags=list(spec.tags),
-                ocr_text=spec.ocr_text,
-                quality_score=1.0,
-            )
-            await meili_client.upsert_document(document)
+            await meili_client.upsert_document(meili_document)
             session.add_all(
                 [
                     _build_sync_snapshot(
                         meme_file_id=meme_file_id,
                         target=SyncTargetKind.QDRANT,
-                        preview={"meme_id": str(meme_id), "tags": list(spec.tags)},
+                        preview={
+                            "meme_id": str(qdrant_payload.meme_id),
+                            "search_index_algorithm_version": qdrant_payload.search_index_algorithm_version,
+                            "is_public": qdrant_payload.is_public,
+                            "tags": list(qdrant_payload.tags),
+                        },
                         now=now,
                     ),
                     _build_sync_snapshot(
                         meme_file_id=meme_file_id,
                         target=SyncTargetKind.MEILISEARCH,
-                        preview={"id": meme_file_id.hex, "ocr_text": spec.ocr_text},
+                        preview={
+                            "id": meili_document.id,
+                            "search_index_algorithm_version": meili_document.search_index_algorithm_version,
+                            "is_public": meili_document.is_public,
+                            "ocr_text": meili_document.ocr_text or "",
+                        },
                         now=now,
                     ),
                 ],
