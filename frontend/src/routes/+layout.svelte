@@ -3,10 +3,13 @@
   import { accountBenefitText, accountStatusLabel, connectedProviderLabels } from '$lib/account/view-model';
   import { ActionLink, Badge, PageShell } from '$lib/ui';
   import TooltipProvider from '$lib/ui/tooltip/Provider.svelte';
+  import { provideViewerCapabilities, viewerCapabilitiesFromSession } from '$lib/viewer-capabilities';
   import type { Snippet } from 'svelte';
   import type { LayoutData } from './$types';
 
   let { data, children }: { data: LayoutData; children: Snippet } = $props();
+
+  provideViewerCapabilities(() => viewerCapabilitiesFromSession(data.session ?? null));
 
   const providerLabels = $derived(connectedProviderLabels(data.session?.linked_providers ?? null));
   const canConnectTelegram = $derived(

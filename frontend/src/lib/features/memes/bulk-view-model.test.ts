@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'vitest';
 
-import type { PublicMemeCardRead, WebCollectionListRead } from '$lib/api/types';
+import type { CurrentSessionRead, PublicMemeCardRead, WebCollectionListRead } from '$lib/api/types';
 import {
   bulkCollectionOptions,
   bulkDownloadItems,
+  bulkGuidanceFromSessionAndCollections,
   bulkGuestGuidance,
   bulkToolbarSummary,
   collectionListBulkOptions,
@@ -42,12 +43,44 @@ describe('bulk meme grid view model', () => {
   });
 
   it('summarizes guest boundaries and selected downloads', () => {
-    expect(bulkGuestGuidance('guest', false)).toContain('Guests can bulk-save into Favorites');
-    expect(bulkGuestGuidance('full', true)).toBeNull();
+    expect(bulkGuestGuidance(sessionPayload('guest'), false)).toContain('Guests can bulk-save into Favorites');
+    expect(bulkGuestGuidance(sessionPayload('full'), true)).toBeNull();
+    expect(bulkGuidanceFromSessionAndCollections(sessionPayload('guest'), bulkCollectionOptions([collectionSummary('favorites', 'Favorites', true)]))).toContain(
+      'Guests can bulk-save into Favorites'
+    );
     expect(bulkToolbarSummary(12, 0, 0)).toBe('12 memes available for selection.');
     expect(bulkToolbarSummary(12, 2, 1)).toBe('2 selected. 1 has a media URL for download.');
   });
 });
+
+function sessionPayload(accountType: 'full' | 'guest'): CurrentSessionRead {
+  return {
+    user: {
+      id: 'user-id',
+      account_type: accountType,
+      telegram_id: accountType === 'full' ? 123 : null,
+      google_id: null,
+      email: accountType === 'full' ? 'user@example.com' : null,
+      email_verified_at: null,
+      language: 'en',
+      nsfw_enabled: false,
+      token_nonce: 1,
+      status: 'active',
+      guest_expires_at: accountType === 'guest' ? '2026-07-12T00:00:00Z' : null,
+      active_save_collection_id: 'favorites',
+      is_admin: false,
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z'
+    },
+    linked_providers: {
+      email: accountType === 'full' ? 'user@example.com' : null,
+      email_verified_at: null,
+      has_password: false,
+      google_linked: false,
+      telegram_linked: accountType === 'full'
+    }
+  };
+}
 
 function memeCard(id: string, overrides: Partial<PublicMemeCardRead> = {}): PublicMemeCardRead {
   return {

@@ -1,6 +1,6 @@
 <script lang="ts">
   import CollectionChip from '$lib/features/collections/CollectionChip.svelte';
-  import { bulkGuestGuidance, collectionListBulkOptions } from '$lib/features/memes/bulk-view-model';
+  import { bulkGuidanceFromSessionAndCollections, collectionListBulkOptions } from '$lib/features/memes/bulk-view-model';
   import InfiniteMemeFeed from '$lib/features/memes/InfiniteMemeFeed.svelte';
   import { ActionLink, Button, Card, Input, Notice, PageHeader, Select } from '$lib/ui';
   import type { ActionData, PageData } from './$types';
@@ -8,8 +8,7 @@
   let { data, form }: { data: PageData; form: ActionData } = $props();
 
   const bulkOptions = $derived(collectionListBulkOptions(data.collections));
-  const accountType = $derived(data.session?.user.account_type ?? null);
-  const bulkGuidance = $derived(bulkGuestGuidance(accountType, bulkOptions.some((collection) => collection.kind === 'custom')));
+  const bulkGuidance = $derived(bulkGuidanceFromSessionAndCollections(data.session ?? null, bulkOptions));
 </script>
 
 <PageHeader title="Find the right meme fast." description="Search the public MemeXpert catalog with plain text, or browse what is already popular." badge="Guest access enabled" />
@@ -83,7 +82,7 @@
   filters={{ query: data.query }}
   initialError={data.errorMessage}
   emptyMessage="Try a shorter phrase, a different synonym, or clear the search box to browse."
-  bulk={{ enabled: true, accountType, saveEnabled: true, collectionOptions: bulkOptions, guidance: bulkGuidance }}
+  bulk={{ enabled: true, saveEnabled: true, collectionOptions: bulkOptions, guidance: bulkGuidance }}
 >
   {#snippet summary()}
     <p class="m-0 text-muted">
