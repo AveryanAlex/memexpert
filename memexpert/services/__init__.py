@@ -78,7 +78,7 @@ from memexpert.services.errors import (
     UserServiceError,
     UserStateMismatchError,
 )
-from memexpert.services.meme_search import MemeNotFoundError, MemeSearchFilters, MemeSearchService
+from memexpert.services.meme_search import MemeNotFoundError, MemeSearchFilters, MemeSearchScope, MemeSearchService
 from memexpert.services.meme_seo import (
     MemeSeoGenerationResult,
     MemeSeoGenerationService,
@@ -142,6 +142,7 @@ __all__ = [
     "LinkedProvidersProjection",
     "MemeNotFoundError",
     "MemeSearchFilters",
+    "MemeSearchScope",
     "MemeSearchService",
     "MemeSeoGenerationResult",
     "MemeSeoGenerationService",

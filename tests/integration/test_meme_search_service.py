@@ -33,7 +33,7 @@ from memexpert.models.user import AccountMergeLog, AnalyticsEvent, User
 from memexpert.schemas.user import UserRead
 from memexpert.services.analytics import AnalyticsService
 from memexpert.services.media_render_urls import MediaRenderUrlService
-from memexpert.services.meme_search import MemeNotFoundError, MemeSearchFilters, MemeSearchService
+from memexpert.services.meme_search import MemeNotFoundError, MemeSearchFilters, MemeSearchScope, MemeSearchService
 from memexpert.services.meme_seo import MemeSeoGenerationService, MemeSeoProviderResult
 from memexpert.services.public_trends import PublicTrendsService, refresh_public_trend_materialized_views
 
@@ -165,6 +165,37 @@ async def _create_meme(
     meme.primary_file_id = file.id
     await session.flush()
     return meme
+
+
+async def _create_collection(
+    session: AsyncSession,
+    *,
+    owner: User,
+    title: str,
+    kind: CollectionKind = CollectionKind.CUSTOM,
+    visibility: CollectionVisibility = CollectionVisibility.PRIVATE,
+    memberships: list[tuple[User, CollectionMembershipRole]] | None = None,
+    memes: list[Meme] | None = None,
+) -> Collection:
+    collection = Collection(
+        owner_id=owner.id,
+        title=title,
+        kind=kind,
+        visibility=visibility,
+    )
+    session.add(collection)
+    await session.flush()
+    session.add_all(
+        [CollectionMember(collection_id=collection.id, user_id=user.id, role=role) for user, role in memberships or []]
+    )
+    session.add_all(
+        [
+            CollectionMeme(collection_id=collection.id, meme_id=meme.id, added_by_user_id=owner.id)
+            for meme in memes or []
+        ]
+    )
+    await session.flush()
+    return collection
 
 
 def _primary_file_id(meme: Meme) -> uuid.UUID:
@@ -340,6 +371,8 @@ async def test_search_route_uses_plain_text_semantic_path_with_overridden_fakes(
         "query": "frog wizard",
         "language": None,
         "media_type": None,
+        "scope": "public",
+        "collection_ids": [],
         "include_nsfw": False,
         "tags": [],
         "limit": 10,
@@ -367,11 +400,15 @@ async def test_public_openapi_registers_catalog_routes_without_internal_surface(
     assert "/api/v1/memes/{meme_id}/popularity" in paths
     assert "/api/v1/memes/{meme_id}" in paths
     search_parameters = {parameter["name"] for parameter in paths["/api/v1/memes/search"]["get"]["parameters"]}
+    browse_parameters = {parameter["name"] for parameter in paths["/api/v1/memes/browse"]["get"]["parameters"]}
     trending_parameters = {
-        parameter["name"]: parameter
-        for parameter in paths["/api/v1/memes/trending"]["get"]["parameters"]
+        parameter["name"]: parameter for parameter in paths["/api/v1/memes/trending"]["get"]["parameters"]
     }
     assert "query" in search_parameters
+    assert "scope" in search_parameters
+    assert "collection_ids" in search_parameters
+    assert "scope" in browse_parameters
+    assert "collection_ids" in browse_parameters
     assert "query_vector" not in search_parameters
     assert "lookback_hours" in trending_parameters
     assert "ignores this value" in trending_parameters["lookback_hours"]["description"]
@@ -468,6 +505,81 @@ async def test_public_route_json_includes_render_contract_without_storage_leakag
     assert "pipeline/originals/private/hidden.jpg" not in response.text
 
 
+async def test_search_route_scope_collections_returns_only_authorized_requested_collection_memes(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    viewer = User(account_type=AccountType.FULL)
+    stranger = User(account_type=AccountType.FULL)
+    migrated_db_session.add_all([viewer, stranger])
+    await migrated_db_session.flush()
+    authorized_private = await _create_meme(
+        migrated_db_session,
+        is_public=False,
+        author_user_id=viewer.id,
+        s3_original_key="pipeline/originals/private/authorized-search-route.jpg",
+    )
+    unauthorized_private = await _create_meme(
+        migrated_db_session,
+        is_public=False,
+        author_user_id=stranger.id,
+        s3_original_key="pipeline/originals/private/unauthorized-search-route.jpg",
+    )
+    authorized_collection = await _create_collection(
+        migrated_db_session,
+        owner=viewer,
+        title="Authorized collection",
+        memes=[authorized_private],
+    )
+    unauthorized_collection = await _create_collection(
+        migrated_db_session,
+        owner=stranger,
+        title="Unauthorized collection",
+        memes=[unauthorized_private],
+    )
+    await migrated_db_session.commit()
+
+    service = MemeSearchService(
+        migrated_db_session,
+        media_render_service=MediaRenderUrlService(
+            Settings.model_validate({"imgproxy_base_url": "https://img.memexpert.test"})
+        ),
+    )
+    _install_meme_route_overrides(app, migrated_db_session, current_user=_user_read(viewer), service=service)
+
+    try:
+        response = await client.get(
+            "/api/v1/memes/search",
+            params=[
+                ("scope", "collections"),
+                ("collection_ids", str(authorized_collection.id)),
+                ("collection_ids", str(unauthorized_collection.id)),
+                ("collection_ids", str(authorized_collection.id)),
+                ("limit", "10"),
+            ],
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [item["meme"]["id"] for item in payload["items"]] == [str(authorized_private.id)]
+    assert payload["items"][0]["meme"]["primary_file"]["render"]["thumbnail_url"] == (
+        f"/api/v1/media/files/{authorized_private.primary_file_id}/thumbnail"
+    )
+    assert str(unauthorized_private.id) not in response.text
+    assert "authorized-search-route.jpg" not in response.text
+    assert "unauthorized-search-route.jpg" not in response.text
+
+    event = await migrated_db_session.scalar(
+        select(AnalyticsEvent).where(AnalyticsEvent.event_type == AnalyticsEventType.SEARCH_QUERY)
+    )
+    assert event is not None
+    assert event.payload["scope"] == "collections"
+    assert event.payload["collection_ids"] == [str(authorized_collection.id), str(unauthorized_collection.id)]
+
+
 async def test_public_search_and_detail_do_not_emit_authenticated_private_media(
     migrated_db_session: AsyncSession,
 ) -> None:
@@ -496,7 +608,9 @@ async def test_public_search_and_detail_do_not_emit_authenticated_private_media(
                 {"id": str(public_meme.primary_file_id), "meme_id": str(public_meme.id), "_rankingScore": 0.5},
             ]
         ),
-        media_render_service=MediaRenderUrlService(Settings.model_validate({"imgproxy_base_url": "https://img.memexpert.test"})),
+        media_render_service=MediaRenderUrlService(
+            Settings.model_validate({"imgproxy_base_url": "https://img.memexpert.test"})
+        ),
     )
 
     search_page = await service.search_public_memes("owner private", viewer_user_id=owner.id, limit=10)
@@ -514,6 +628,381 @@ async def test_public_search_and_detail_do_not_emit_authenticated_private_media(
     assert str(private_meme.id) not in serialized
     assert str(private_meme.primary_file_id) not in serialized
     assert "authenticated-owner.jpg" not in serialized
+
+
+async def test_search_scopes_filter_db_candidates_memberships_and_nsfw(
+    migrated_db_session: AsyncSession,
+) -> None:
+    viewer = User(account_type=AccountType.FULL)
+    editor_owner = User(account_type=AccountType.FULL)
+    viewer_owner = User(account_type=AccountType.FULL)
+    stranger = User(account_type=AccountType.FULL)
+    migrated_db_session.add_all([viewer, editor_owner, viewer_owner, stranger])
+    await migrated_db_session.flush()
+
+    public_catalog = await _create_meme(migrated_db_session, popularity_score=1.0)
+    viewer_private_upload = await _create_meme(
+        migrated_db_session,
+        is_public=False,
+        author_user_id=viewer.id,
+        popularity_score=1.0,
+    )
+    public_in_favorites = await _create_meme(migrated_db_session, popularity_score=1.0)
+    owned_collection_private = await _create_meme(
+        migrated_db_session,
+        is_public=False,
+        author_user_id=viewer.id,
+        popularity_score=1.0,
+    )
+    editor_collection_private = await _create_meme(
+        migrated_db_session,
+        is_public=False,
+        author_user_id=editor_owner.id,
+        popularity_score=1.0,
+    )
+    viewer_collection_private = await _create_meme(
+        migrated_db_session,
+        is_public=False,
+        author_user_id=viewer_owner.id,
+        popularity_score=1.0,
+    )
+    nsfw_editor_collection_private = await _create_meme(
+        migrated_db_session,
+        is_public=False,
+        is_nsfw=True,
+        author_user_id=editor_owner.id,
+        popularity_score=1.0,
+    )
+    unauthorized_collection_private = await _create_meme(
+        migrated_db_session,
+        is_public=False,
+        author_user_id=stranger.id,
+        popularity_score=1.0,
+    )
+    stale_private_candidate = await _create_meme(
+        migrated_db_session,
+        is_public=False,
+        author_user_id=stranger.id,
+        popularity_score=1.0,
+    )
+
+    favorites = await _create_collection(
+        migrated_db_session,
+        owner=viewer,
+        title="Favorites",
+        kind=CollectionKind.FAVORITES,
+        memes=[public_in_favorites],
+    )
+    owned_collection = await _create_collection(
+        migrated_db_session,
+        owner=viewer,
+        title="Owned collection",
+        memes=[owned_collection_private],
+    )
+    editor_shared = await _create_collection(
+        migrated_db_session,
+        owner=editor_owner,
+        title="Editor shared",
+        memberships=[(viewer, CollectionMembershipRole.EDITOR)],
+        memes=[editor_collection_private, nsfw_editor_collection_private],
+    )
+    await _create_collection(
+        migrated_db_session,
+        owner=viewer_owner,
+        title="Viewer shared",
+        memberships=[(viewer, CollectionMembershipRole.VIEWER)],
+        memes=[viewer_collection_private],
+    )
+    unauthorized_collection = await _create_collection(
+        migrated_db_session,
+        owner=stranger,
+        title="Unauthorized",
+        memes=[unauthorized_collection_private],
+    )
+    await migrated_db_session.commit()
+
+    service = MemeSearchService(
+        migrated_db_session,
+        text_client=FakeTextSearchClient(
+            [
+                {
+                    "id": str(viewer_private_upload.primary_file_id),
+                    "meme_id": str(viewer_private_upload.id),
+                    "_rankingScore": 1.0,
+                },
+                {
+                    "id": str(public_in_favorites.primary_file_id),
+                    "meme_id": str(public_in_favorites.id),
+                    "_rankingScore": 0.95,
+                },
+                {
+                    "id": str(owned_collection_private.primary_file_id),
+                    "meme_id": str(owned_collection_private.id),
+                    "_rankingScore": 0.9,
+                },
+                {
+                    "id": str(editor_collection_private.primary_file_id),
+                    "meme_id": str(editor_collection_private.id),
+                    "_rankingScore": 0.85,
+                },
+                {
+                    "id": str(viewer_collection_private.primary_file_id),
+                    "meme_id": str(viewer_collection_private.id),
+                    "_rankingScore": 0.8,
+                },
+                {
+                    "id": str(nsfw_editor_collection_private.primary_file_id),
+                    "meme_id": str(nsfw_editor_collection_private.id),
+                    "_rankingScore": 0.75,
+                },
+                {
+                    "id": str(unauthorized_collection_private.primary_file_id),
+                    "meme_id": str(unauthorized_collection_private.id),
+                    "_rankingScore": 0.7,
+                },
+                {
+                    "id": str(stale_private_candidate.primary_file_id),
+                    "meme_id": str(stale_private_candidate.id),
+                    "_rankingScore": 0.65,
+                },
+                {
+                    "id": str(public_catalog.primary_file_id),
+                    "meme_id": str(public_catalog.id),
+                    "_rankingScore": 0.6,
+                },
+            ]
+        ),
+        semantic_client=FakeSemanticSearchClient(
+            (
+                QdrantUserSearchMatch(
+                    meme_file_id=_primary_file_id(stale_private_candidate),
+                    meme_id=stale_private_candidate.id,
+                    semantic_score=0.99,
+                ),
+                QdrantUserSearchMatch(
+                    meme_file_id=_primary_file_id(viewer_collection_private),
+                    meme_id=viewer_collection_private.id,
+                    semantic_score=0.9,
+                ),
+            )
+        ),
+    )
+
+    all_page = await service.search_memes(
+        "scope",
+        viewer_user_id=viewer.id,
+        query_vector=(0.1, 0.2),
+        filters=MemeSearchFilters(scope=MemeSearchScope.ALL),
+        limit=20,
+    )
+    private_page = await service.search_memes(
+        "scope",
+        viewer_user_id=viewer.id,
+        query_vector=(0.1, 0.2),
+        filters=MemeSearchFilters(scope=MemeSearchScope.PRIVATE),
+        limit=20,
+    )
+    collections_page = await service.search_memes(
+        "scope",
+        viewer_user_id=viewer.id,
+        query_vector=(0.1, 0.2),
+        filters=MemeSearchFilters(
+            scope=MemeSearchScope.COLLECTIONS,
+            collection_ids=(editor_shared.id, unauthorized_collection.id),
+        ),
+        limit=20,
+    )
+    collections_with_nsfw_page = await service.search_memes(
+        "scope",
+        viewer_user_id=viewer.id,
+        query_vector=(0.1, 0.2),
+        filters=MemeSearchFilters(
+            scope=MemeSearchScope.COLLECTIONS,
+            collection_ids=(editor_shared.id,),
+            include_nsfw=True,
+        ),
+        limit=20,
+    )
+    empty_collections_page = await service.search_memes(
+        "scope",
+        viewer_user_id=viewer.id,
+        query_vector=(0.1, 0.2),
+        filters=MemeSearchFilters(scope=MemeSearchScope.COLLECTIONS),
+        limit=20,
+    )
+    anonymous_private_page = await service.search_memes(
+        "scope",
+        query_vector=(0.1, 0.2),
+        filters=MemeSearchFilters(scope=MemeSearchScope.PRIVATE),
+        limit=20,
+    )
+
+    assert {item.meme.id for item in all_page.items} == {
+        public_catalog.id,
+        viewer_private_upload.id,
+        public_in_favorites.id,
+        owned_collection_private.id,
+        editor_collection_private.id,
+        viewer_collection_private.id,
+    }
+    assert {item.meme.id for item in private_page.items} == {
+        viewer_private_upload.id,
+        public_in_favorites.id,
+        owned_collection_private.id,
+        editor_collection_private.id,
+        viewer_collection_private.id,
+    }
+    assert public_catalog.id not in {item.meme.id for item in private_page.items}
+    assert {item.meme.id for item in collections_page.items} == {editor_collection_private.id}
+    assert {item.meme.id for item in collections_with_nsfw_page.items} == {
+        editor_collection_private.id,
+        nsfw_editor_collection_private.id,
+    }
+    assert empty_collections_page.items == []
+    assert anonymous_private_page.items == []
+    assert unauthorized_collection_private.id not in {item.meme.id for item in all_page.items}
+    assert stale_private_candidate.id not in {item.meme.id for item in all_page.items}
+    assert favorites.id != owned_collection.id
+
+
+async def test_guest_search_scope_includes_guest_uploads_and_favorites(
+    migrated_db_session: AsyncSession,
+) -> None:
+    guest = User(account_type=AccountType.GUEST)
+    stranger = User(account_type=AccountType.FULL)
+    migrated_db_session.add_all([guest, stranger])
+    await migrated_db_session.flush()
+
+    public_catalog = await _create_meme(migrated_db_session, popularity_score=1.0)
+    guest_private_upload = await _create_meme(
+        migrated_db_session,
+        is_public=False,
+        author_user_id=guest.id,
+        popularity_score=1.0,
+    )
+    guest_favorite_public = await _create_meme(migrated_db_session, popularity_score=1.0)
+    stranger_private = await _create_meme(
+        migrated_db_session,
+        is_public=False,
+        author_user_id=stranger.id,
+        popularity_score=1.0,
+    )
+    favorites = await _create_collection(
+        migrated_db_session,
+        owner=guest,
+        title="Favorites",
+        kind=CollectionKind.FAVORITES,
+        memes=[guest_favorite_public],
+    )
+    await migrated_db_session.commit()
+
+    service = MemeSearchService(
+        migrated_db_session,
+        text_client=FakeTextSearchClient(
+            [
+                {
+                    "id": str(guest_private_upload.primary_file_id),
+                    "meme_id": str(guest_private_upload.id),
+                    "_rankingScore": 1.0,
+                },
+                {
+                    "id": str(guest_favorite_public.primary_file_id),
+                    "meme_id": str(guest_favorite_public.id),
+                    "_rankingScore": 0.9,
+                },
+                {
+                    "id": str(stranger_private.primary_file_id),
+                    "meme_id": str(stranger_private.id),
+                    "_rankingScore": 0.8,
+                },
+                {
+                    "id": str(public_catalog.primary_file_id),
+                    "meme_id": str(public_catalog.id),
+                    "_rankingScore": 0.7,
+                },
+            ]
+        ),
+    )
+
+    private_page = await service.search_memes(
+        "guest",
+        viewer_user_id=guest.id,
+        filters=MemeSearchFilters(scope=MemeSearchScope.PRIVATE),
+        limit=20,
+    )
+    all_page = await service.search_memes("guest", viewer_user_id=guest.id, limit=20)
+    collections_page = await service.search_memes(
+        "guest",
+        viewer_user_id=guest.id,
+        filters=MemeSearchFilters(scope=MemeSearchScope.COLLECTIONS, collection_ids=(favorites.id,)),
+        limit=20,
+    )
+
+    assert {item.meme.id for item in private_page.items} == {guest_private_upload.id, guest_favorite_public.id}
+    assert {item.meme.id for item in all_page.items} == {
+        public_catalog.id,
+        guest_private_upload.id,
+        guest_favorite_public.id,
+    }
+    assert [item.meme.id for item in collections_page.items] == [guest_favorite_public.id]
+    assert stranger_private.id not in {item.meme.id for item in all_page.items}
+
+
+async def test_public_wrappers_stay_public_by_default_and_allow_authorized_scope_expansion(
+    migrated_db_session: AsyncSession,
+) -> None:
+    owner = User(account_type=AccountType.FULL)
+    migrated_db_session.add(owner)
+    await migrated_db_session.flush()
+    public_meme = await _create_meme(migrated_db_session, popularity_score=1.0)
+    private_meme = await _create_meme(
+        migrated_db_session,
+        is_public=False,
+        author_user_id=owner.id,
+        popularity_score=1.0,
+        s3_original_key="pipeline/originals/private/scope-owner.jpg",
+    )
+    await migrated_db_session.commit()
+
+    service = MemeSearchService(
+        migrated_db_session,
+        text_client=FakeTextSearchClient(
+            [
+                {"id": str(private_meme.primary_file_id), "meme_id": str(private_meme.id), "_rankingScore": 1.0},
+                {"id": str(public_meme.primary_file_id), "meme_id": str(public_meme.id), "_rankingScore": 0.9},
+            ]
+        ),
+        media_render_service=MediaRenderUrlService(
+            Settings.model_validate({"imgproxy_base_url": "https://img.memexpert.test"})
+        ),
+    )
+
+    default_search_page = await service.search_public_memes("owner", viewer_user_id=owner.id, limit=10)
+    expanded_search_page = await service.search_public_memes(
+        "owner",
+        viewer_user_id=owner.id,
+        filters=MemeSearchFilters(scope=MemeSearchScope.ALL),
+        limit=10,
+    )
+    default_browse_page = await service.browse_public_memes(viewer_user_id=owner.id, limit=10)
+    expanded_browse_page = await service.browse_public_memes(
+        viewer_user_id=owner.id,
+        filters=MemeSearchFilters(scope=MemeSearchScope.ALL),
+        limit=10,
+    )
+
+    assert [item.meme.id for item in default_search_page.items] == [public_meme.id]
+    assert private_meme.id not in {item.meme.id for item in default_browse_page.items}
+    assert {item.meme.id for item in expanded_search_page.items} == {public_meme.id, private_meme.id}
+    assert {item.meme.id for item in expanded_browse_page.items} == {public_meme.id, private_meme.id}
+
+    private_card = next(item.meme for item in expanded_search_page.items if item.meme.id == private_meme.id)
+    assert private_card.primary_file is not None
+    assert private_card.primary_file.render is not None
+    assert private_card.primary_file.render.thumbnail_url == (
+        f"/api/v1/media/files/{private_meme.primary_file_id}/thumbnail"
+    )
+    assert "scope-owner.jpg" not in expanded_search_page.model_dump_json()
 
 
 async def test_public_meme_dtos_include_viewer_action_state_for_anonymous_guest_and_full_accounts(

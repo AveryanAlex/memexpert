@@ -38,7 +38,7 @@ Access control rules:
 - Qdrant/Meilisearch can prefilter by payloads where possible (`is_public`, `author_user_id`, collection payload hints), but **PostgreSQL is the final authority**.
 - Candidate IDs from search indexes must be filtered through collection membership/ownership before DTOs are returned.
 - Collection filters are ignored or rejected for unauthenticated users without a guest/full user row.
-- Cache keys, if used, must include user id, scope, collection ids, NSFW flag, and algorithm version to prevent private result leaks.
+- Cache keys, if used, must include the normalized query, every content filter, viewer/user identity, scope, normalized collection ids, NSFW allowance or user preference, and algorithm/version fields to prevent private result leaks.
 
 ### Collection Filters
 
@@ -63,7 +63,9 @@ Optional stabilization when ranking becomes more expensive or pagination instabi
 2. Cache the ordered list of `(meme_id, combined_score, attribution)` in Redis.
 3. Subsequent page requests read from the cache and slice by offset.
 
-Candidate-pool cache key must include: query, filters, user id, search scope, collection ids, NSFW flag, and `algorithm_version`. TTL should be short (60–120s). This cache is an optimization, not a correctness dependency for the first implementation.
+Candidate-pool cache key must include: normalized query, content filters, viewer/user identity, search scope, normalized collection ids, NSFW allowance or user preference, and `algorithm_version` plus any ranking/version fields that affect candidate selection. TTL should be short (60–120s). This cache is an optimization, not a correctness dependency for the first implementation.
+
+Even when a cached candidate pool is used, those cached IDs are only an optimization. The final PostgreSQL access predicate and NSFW/content filters must still run before DTOs are returned so stale cache/index entries cannot leak private memes.
 
 ### Degraded Mode and Fallbacks
 
@@ -103,7 +105,7 @@ Search results return `meme_id` lists from Meilisearch/Qdrant, then fetch full d
 
 ## Search Result Caching
 
-Redis search/candidate caching is optional for MVP. If enabled, cache keys must include user id and every access-shaping filter. It must never be possible for a cached result containing user A's private memes to be served to user B.
+Redis search/candidate caching is optional for MVP. If enabled, cache keys must include normalized query text, every content/access-shaping filter, viewer identity, scope, normalized collection ids, NSFW allowance or user preference, and algorithm/version fields. It must never be possible for a cached result containing user A's private memes to be served to user B, and cached candidate IDs must still be filtered through PostgreSQL before response DTOs are built.
 
 ## Sync Strategy
 

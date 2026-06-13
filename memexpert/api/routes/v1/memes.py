@@ -42,7 +42,7 @@ from memexpert.services import (
     InvalidPinnedMemeOrderError,
     PinLimitExceededError,
 )
-from memexpert.services.meme_search import MemeNotFoundError, MemeSearchFilters
+from memexpert.services.meme_search import MemeNotFoundError, MemeSearchFilters, MemeSearchScope
 from memexpert.services.public_trends import PublicTrendRanking, PublicTrendTimelineGranularity
 from memexpert.services.report import MemeReportTargetNotVisibleError
 
@@ -69,6 +69,8 @@ async def search_memes(
     query: Annotated[str, Query(max_length=500)] = "",
     language: Annotated[ContentLanguage | None, Query()] = None,
     media_type: Annotated[ContentKind | None, Query()] = None,
+    scope: Annotated[MemeSearchScope, Query()] = MemeSearchScope.PUBLIC,
+    collection_ids: Annotated[list[uuid.UUID] | None, Query()] = None,
     include_nsfw: Annotated[bool, Query()] = False,
     tags: Annotated[list[str] | None, Query()] = None,
     limit: Annotated[int, Query(ge=1, le=100)] = 20,
@@ -85,6 +87,8 @@ async def search_memes(
         filters=_build_filters(
             language=language,
             media_type=media_type,
+            scope=scope,
+            collection_ids=collection_ids,
             include_nsfw=_nsfw_allowed(current_user, include_nsfw),
             tags=tags,
         ),
@@ -99,6 +103,8 @@ async def search_memes(
             "query": query.strip(),
             "language": language.value if language is not None else None,
             "media_type": media_type.value if media_type is not None else None,
+            "scope": scope.value,
+            "collection_ids": _normalized_collection_id_strings(collection_ids),
             "include_nsfw": _nsfw_allowed(current_user, include_nsfw),
             "tags": [tag.strip() for tag in tags or [] if tag.strip()],
             "limit": limit,
@@ -116,6 +122,8 @@ async def browse_memes(
     current_user: OptionalCurrentUserDep,
     language: Annotated[ContentLanguage | None, Query()] = None,
     media_type: Annotated[ContentKind | None, Query()] = None,
+    scope: Annotated[MemeSearchScope, Query()] = MemeSearchScope.PUBLIC,
+    collection_ids: Annotated[list[uuid.UUID] | None, Query()] = None,
     include_nsfw: Annotated[bool, Query()] = False,
     tags: Annotated[list[str] | None, Query()] = None,
     limit: Annotated[int, Query(ge=1, le=100)] = 20,
@@ -128,6 +136,8 @@ async def browse_memes(
         filters=_build_filters(
             language=language,
             media_type=media_type,
+            scope=scope,
+            collection_ids=collection_ids,
             include_nsfw=_nsfw_allowed(current_user, include_nsfw),
             tags=tags,
         ),
@@ -620,12 +630,16 @@ def _build_filters(
     *,
     language: ContentLanguage | None,
     media_type: ContentKind | None,
+    scope: MemeSearchScope,
+    collection_ids: list[uuid.UUID] | None,
     include_nsfw: bool,
     tags: list[str] | None,
 ) -> MemeSearchFilters:
     return MemeSearchFilters(
         language=language,
         media_type=media_type,
+        scope=scope,
+        collection_ids=tuple(dict.fromkeys(collection_ids or [])),
         include_nsfw=include_nsfw,
         tags=tuple(tag.strip() for tag in tags or () if tag.strip()),
     )
@@ -633,6 +647,10 @@ def _build_filters(
 
 def _nsfw_allowed(current_user: UserRead | None, include_nsfw: bool) -> bool:
     return include_nsfw and bool(current_user and current_user.nsfw_enabled)
+
+
+def _normalized_collection_id_strings(collection_ids: list[uuid.UUID] | None) -> list[str]:
+    return [str(collection_id) for collection_id in dict.fromkeys(collection_ids or [])]
 
 
 def _trend_page_to_search_page(page: PublicMemeTrendPageRead) -> PublicMemeSearchPageRead:

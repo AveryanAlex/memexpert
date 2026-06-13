@@ -47,7 +47,7 @@ from memexpert.schemas.meme import (
 )
 from memexpert.services import CollectionService, CollectionServiceError, ProviderNotConfiguredError
 from memexpert.services.analytics import AnalyticsService, hash_external_identifier
-from memexpert.services.meme_search import MemeSearchService
+from memexpert.services.meme_search import MemeSearchFilters, MemeSearchScope, MemeSearchService
 from memexpert.services.query_embedding import CachedTextQueryEmbeddingService
 
 if TYPE_CHECKING:
@@ -68,6 +68,8 @@ class InlineMemeSearchService(Protocol):
         self,
         query: str,
         *,
+        viewer_user_id: uuid.UUID | None = None,
+        filters: MemeSearchFilters | None = None,
         limit: int = 20,
         offset: int = 0,
     ) -> MemeSearchPageRead: ...
@@ -153,8 +155,9 @@ def build_inline_router(
         )
 
     @router.callback_query(
-        lambda callback_query: callback_query.data is not None
-        and callback_query.data.startswith(f"{LIBRARY_CALLBACK_PREFIX}:")
+        lambda callback_query: (
+            callback_query.data is not None and callback_query.data.startswith(f"{LIBRARY_CALLBACK_PREFIX}:")
+        )
     )
     async def handle_library_callback(callback_query: CallbackQuery) -> None:
         await handle_inline_library_callback(
@@ -182,14 +185,25 @@ async def answer_inline_query(
         try:
             is_personal = False
             if query:
+                linked_user = await _resolve_linked_user(session, telegram_user_id=inline_query.from_user.id)
                 search_service = meme_search_service_factory(session)
-                page = await search_service.search_memes(query, limit=INLINE_SEARCH_LIMIT, offset=offset)
+                page = await search_service.search_memes(
+                    query,
+                    viewer_user_id=linked_user.id if linked_user else None,
+                    filters=MemeSearchFilters(
+                        include_nsfw=linked_user.nsfw_enabled if linked_user else False,
+                        scope=MemeSearchScope.ALL if linked_user else MemeSearchScope.PUBLIC,
+                    ),
+                    limit=INLINE_SEARCH_LIMIT,
+                    offset=offset,
+                )
                 results = await _build_inline_results(
                     session=session,
                     page=page,
                     bot_scope=bot_scope,
                     inline_media_url_provider=inline_media_url_provider,
                 )
+                is_personal = linked_user is not None
             else:
                 linked_user = await _resolve_linked_user(session, telegram_user_id=inline_query.from_user.id)
                 page, results = await _build_empty_query_results(
@@ -806,7 +820,7 @@ def _parse_result_file_id(result_id: str) -> uuid.UUID | None:
     try:
         _, raw_file_id = result_id.split(":", maxsplit=1)
         return uuid.UUID(hex=raw_file_id)
-    except (ValueError, AttributeError):
+    except ValueError, AttributeError:
         return None
 
 
