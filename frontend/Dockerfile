@@ -33,16 +33,12 @@ COPY frontend/ ./
 RUN pnpm build
 
 
-FROM node:${NODE_VERSION}-${DEBIAN_VERSION}-slim AS runtime
+FROM prod-deps AS runtime
 
 ENV NODE_ENV=production \
     HOST=0.0.0.0 \
     PORT=3000
 
-WORKDIR /app
-
-COPY --from=prod-deps --chown=node:node /app/node_modules ./node_modules
-COPY --from=prod-deps --chown=node:node /app/package.json ./package.json
 COPY --from=build-deps --chown=node:node /app/build ./build
 
 USER node
