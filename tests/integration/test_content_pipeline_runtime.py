@@ -52,6 +52,7 @@ from memexpert.core.voyage import (
     VoyageProviderUnavailableError,
     VoyageTimeoutError,
 )
+from memexpert.models.collection import Collection, CollectionMember, CollectionMeme
 from memexpert.models.content import (
     EmbeddingCache,
     Meme,
@@ -60,10 +61,14 @@ from memexpert.models.content import (
     MemeFileSyncTargetSnapshot,
     MemeMergeLog,
     MemePopularitySnapshot,
+    MemeSeoPage,
     MemeSource,
+    MemeTemplate,
     PipelineStageJournal,
 )
 from memexpert.models.enums import (
+    CollectionMembershipRole,
+    CollectionVisibility,
     ContentKind,
     ContentLanguage,
     ContentPipelineStage,
@@ -73,6 +78,7 @@ from memexpert.models.enums import (
     SyncTargetKind,
     SyncTargetStatus,
 )
+from memexpert.models.user import User
 from memexpert.schemas.content_pipeline import (
     ContentPipelineCanonicalContext,
     ContentPipelineClassificationDetail,
@@ -96,6 +102,7 @@ from memexpert.services.content_pipeline_reporting import (
     render_markdown_report,
     summarize_run,
 )
+from memexpert.services.search_index_sync import SEARCH_INDEX_ALGORITHM_VERSION
 from memexpert.workers.pipeline_runtime import (
     PIPELINE_REASON_CLASSIFY_PROVIDER_BLOCKED,
     PIPELINE_REASON_EMBED_MALFORMED_VECTOR,
@@ -124,6 +131,8 @@ from memexpert.workers.pipeline_runtime import (
 if TYPE_CHECKING:
     from pytest import MonkeyPatch
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from memexpert.core.search_index_prefilter import SearchIndexPrefilter
 
 REPO_ROOT_FOR_SCRIPT = Path(__file__).resolve().parents[2]
 
@@ -342,8 +351,23 @@ class FakeQdrantSyncClient:
             {
                 "meme_file_id": payload.meme_file_id,
                 "meme_id": payload.meme_id,
+                "search_index_algorithm_version": payload.search_index_algorithm_version,
+                "is_public": payload.is_public,
+                "author_user_id": payload.author_user_id,
+                "media_type": payload.media_type,
+                "language": payload.language,
                 "tags": list(payload.tags),
                 "is_nsfw": payload.is_nsfw,
+                "template_slug": payload.template_slug,
+                "popularity_score": payload.popularity_score,
+                "like_count": payload.like_count,
+                "collection_ids": list(payload.collection_ids),
+                "public_collection_ids": list(payload.public_collection_ids),
+                "unlisted_collection_ids": list(payload.unlisted_collection_ids),
+                "private_collection_ids": list(payload.private_collection_ids),
+                "shared_collection_ids": list(payload.shared_collection_ids),
+                "collection_owner_user_ids": list(payload.collection_owner_user_ids),
+                "collection_member_user_ids": list(payload.collection_member_user_ids),
                 "vector_len": len(vector),
             }
         )
@@ -382,9 +406,24 @@ class FakeMeilisearchSyncClient:
             {
                 "id": document.id,
                 "meme_id": document.meme_id,
+                "meme_file_id": document.meme_file_id,
+                "search_index_algorithm_version": document.search_index_algorithm_version,
+                "is_public": document.is_public,
+                "author_user_id": document.author_user_id,
+                "media_type": document.media_type,
                 "tags": list(document.tags),
                 "is_nsfw": document.is_nsfw,
                 "language": document.language,
+                "template_slug": document.template_slug,
+                "popularity_score": document.popularity_score,
+                "like_count": document.like_count,
+                "collection_ids": list(document.collection_ids),
+                "public_collection_ids": list(document.public_collection_ids),
+                "unlisted_collection_ids": list(document.unlisted_collection_ids),
+                "private_collection_ids": list(document.private_collection_ids),
+                "shared_collection_ids": list(document.shared_collection_ids),
+                "collection_owner_user_ids": list(document.collection_owner_user_ids),
+                "collection_member_user_ids": list(document.collection_member_user_ids),
             }
         )
         if self.upsert_error is not None:
@@ -405,9 +444,16 @@ class FakeMeilisearchSyncClient:
     async def ensure_index(self) -> None:
         return None
 
-    async def search(self, query: str, *, limit: int = 20) -> list[dict[str, Any]]:
+    async def search(
+        self,
+        query: str,
+        *,
+        limit: int = 20,
+        prefilter: SearchIndexPrefilter | None = None,
+    ) -> list[dict[str, Any]]:
         _ = query
         _ = limit
+        _ = prefilter
         return []
 
 
@@ -1960,6 +2006,129 @@ async def test_pipeline_runtime_sync_qdrant_success_records_snapshot_and_publish
     assert len(synced_publishes) == 1
 
 
+async def test_pipeline_runtime_sync_qdrant_rebuilds_collection_aware_payload_from_current_db_state(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    meme_file_id, sync_event, _ = await _seed_sync_qdrant_pending_item(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+        source_id="sync-qdrant-rebuild-state",
+        post_id="8701",
+    )
+
+    author = User()
+    collection_owner = User()
+    collaborator = User()
+    migrated_db_session.add_all([author, collection_owner, collaborator])
+    await migrated_db_session.flush()
+
+    meme_file = await migrated_db_session.get(MemeFile, meme_file_id)
+    assert meme_file is not None
+    canonical_meme = await migrated_db_session.get(Meme, meme_file.meme_id)
+    assert canonical_meme is not None
+
+    template = MemeTemplate(slug="runtime-frog-template", name="Runtime Frog Template")
+    collection = Collection(
+        owner_id=collection_owner.id,
+        title="Runtime shared",
+        visibility=CollectionVisibility.UNLISTED,
+    )
+    migrated_db_session.add_all([template, collection])
+    await migrated_db_session.flush()
+
+    canonical_meme.author_user_id = author.id
+    canonical_meme.is_public = True
+    canonical_meme.tags = ["runtime", "fresh"]
+    canonical_meme.like_count = 9
+    canonical_meme.popularity_score = 18.5
+    canonical_meme.template_id = template.id
+    migrated_db_session.add(
+        MemeSeoPage(
+            meme_id=canonical_meme.id,
+            slug="runtime-fresh",
+            page_title="Runtime Fresh",
+            meta_description="Runtime updated payload",
+            alt_text="runtime fresh",
+            model_id="test-model",
+            prompt_version="v1",
+        )
+    )
+    migrated_db_session.add_all(
+        [
+            CollectionMeme(
+                collection_id=collection.id,
+                meme_id=canonical_meme.id,
+                added_by_user_id=collection_owner.id,
+            ),
+            CollectionMember(
+                collection_id=collection.id,
+                user_id=collaborator.id,
+                role=CollectionMembershipRole.VIEWER,
+            ),
+        ]
+    )
+    await migrated_db_session.commit()
+
+    downstream_broker = PublishingBroker()
+
+    async def fake_ensure_pipeline_broker_started(*_: object, **__: object) -> object:
+        return downstream_broker
+
+    monkeypatch.setattr(
+        content_pipeline_module,
+        "ensure_pipeline_broker_started",
+        fake_ensure_pipeline_broker_started,
+    )
+
+    settings = Settings()
+    qdrant_sync_client = FakeQdrantSyncClient()
+    runtime = build_pipeline_runtime(
+        settings=settings,
+        broker=build_pipeline_broker(settings),
+        session_factory=postgres_session_factory,
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(),
+        ocr_processor=FakeOCRProcessor(),
+        voyage_client=FakeVoyageClient(result=build_voyage_embedding_result()),
+        qdrant_client=FakeQdrantClient(),
+        qdrant_sync_client=qdrant_sync_client,
+        classification_client=FakeClassificationClient(result=build_classification_result()),
+    )
+    message = FakeRabbitMessage(message_id=str(sync_event.event_id))
+
+    await runtime.handle_sync_qdrant_message(sync_event.model_dump(mode="json"), message)
+
+    assert message.ack_count == 1
+    assert len(qdrant_sync_client.upsert_calls) == 1
+    assert qdrant_sync_client.upsert_calls[0] == {
+        "meme_file_id": meme_file_id,
+        "meme_id": canonical_meme.id,
+        "search_index_algorithm_version": SEARCH_INDEX_ALGORITHM_VERSION,
+        "is_public": True,
+        "author_user_id": str(author.id),
+        "media_type": ContentKind.IMAGE.value,
+        "language": ContentLanguage.EN.value,
+        "tags": ["runtime", "fresh"],
+        "is_nsfw": False,
+        "template_slug": "runtime-frog-template",
+        "popularity_score": 18.5,
+        "like_count": 9,
+        "collection_ids": [str(collection.id)],
+        "public_collection_ids": [],
+        "unlisted_collection_ids": [str(collection.id)],
+        "private_collection_ids": [],
+        "shared_collection_ids": [str(collection.id)],
+        "collection_owner_user_ids": [str(collection_owner.id)],
+        "collection_member_user_ids": [str(collaborator.id)],
+        "vector_len": settings.pipeline_voyage_output_dimensions,
+    }
+
+
 async def test_pipeline_runtime_sync_qdrant_provider_unavailable_keeps_stage_replayable(
     migrated_db_session: AsyncSession,
     postgres_session_factory: async_sessionmaker[AsyncSession],
@@ -2323,6 +2492,130 @@ async def test_pipeline_runtime_sync_meili_success_records_snapshot_and_publishe
         and payload.get("event_type") == ContentPipelineEventType.MEME_MEILI_SYNCED.value
     ]
     assert len(synced_publishes) == 1
+
+
+async def test_pipeline_runtime_sync_meili_rebuilds_collection_aware_document_from_current_db_state(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    storage_client = FakeStorageClient()
+    publisher = RecordingPublisher()
+    meme_file_id, sync_event, _ = await _seed_sync_meili_pending_item(
+        migrated_db_session,
+        storage_client=storage_client,
+        publisher=publisher,
+        source_id="sync-meili-rebuild-state",
+        post_id="8801",
+    )
+
+    author = User()
+    collection_owner = User()
+    collaborator = User()
+    migrated_db_session.add_all([author, collection_owner, collaborator])
+    await migrated_db_session.flush()
+
+    meme_file = await migrated_db_session.get(MemeFile, meme_file_id)
+    assert meme_file is not None
+    canonical_meme = await migrated_db_session.get(Meme, meme_file.meme_id)
+    assert canonical_meme is not None
+
+    template = MemeTemplate(slug="runtime-meili-template", name="Runtime Meili Template")
+    collection = Collection(
+        owner_id=collection_owner.id,
+        title="Runtime public",
+        visibility=CollectionVisibility.PUBLIC,
+    )
+    migrated_db_session.add_all([template, collection])
+    await migrated_db_session.flush()
+
+    canonical_meme.author_user_id = author.id
+    canonical_meme.is_public = False
+    canonical_meme.tags = ["meili", "updated"]
+    canonical_meme.like_count = 5
+    canonical_meme.popularity_score = 33.0
+    canonical_meme.template_id = template.id
+    migrated_db_session.add(
+        MemeSeoPage(
+            meme_id=canonical_meme.id,
+            slug="runtime-meili",
+            page_title="Runtime Meili",
+            meta_description="Runtime meili payload",
+            alt_text="runtime meili",
+            model_id="test-model",
+            prompt_version="v1",
+        )
+    )
+    migrated_db_session.add_all(
+        [
+            CollectionMeme(
+                collection_id=collection.id,
+                meme_id=canonical_meme.id,
+                added_by_user_id=collection_owner.id,
+            ),
+            CollectionMember(
+                collection_id=collection.id,
+                user_id=collaborator.id,
+                role=CollectionMembershipRole.EDITOR,
+            ),
+        ]
+    )
+    await migrated_db_session.commit()
+
+    downstream_broker = PublishingBroker()
+
+    async def fake_ensure_pipeline_broker_started(*_: object, **__: object) -> object:
+        return downstream_broker
+
+    monkeypatch.setattr(
+        content_pipeline_module,
+        "ensure_pipeline_broker_started",
+        fake_ensure_pipeline_broker_started,
+    )
+
+    settings = Settings()
+    meili_sync_client = FakeMeilisearchSyncClient()
+    runtime = build_pipeline_runtime(
+        settings=settings,
+        broker=build_pipeline_broker(settings),
+        session_factory=postgres_session_factory,
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(),
+        ocr_processor=FakeOCRProcessor(),
+        voyage_client=FakeVoyageClient(result=build_voyage_embedding_result()),
+        qdrant_client=FakeQdrantClient(),
+        qdrant_sync_client=FakeQdrantSyncClient(),
+        meilisearch_sync_client=meili_sync_client,
+        classification_client=FakeClassificationClient(result=build_classification_result()),
+    )
+    message = FakeRabbitMessage(message_id=str(sync_event.event_id))
+
+    await runtime.handle_sync_meili_message(sync_event.model_dump(mode="json"), message)
+
+    assert message.ack_count == 1
+    assert len(meili_sync_client.upsert_calls) == 1
+    assert meili_sync_client.upsert_calls[0] == {
+        "id": meme_file_id.hex,
+        "meme_id": str(canonical_meme.id),
+        "meme_file_id": str(meme_file_id),
+        "search_index_algorithm_version": SEARCH_INDEX_ALGORITHM_VERSION,
+        "is_public": False,
+        "author_user_id": str(author.id),
+        "media_type": ContentKind.IMAGE.value,
+        "tags": ["meili", "updated"],
+        "is_nsfw": False,
+        "language": ContentLanguage.EN.value,
+        "template_slug": "runtime-meili-template",
+        "popularity_score": 33.0,
+        "like_count": 5,
+        "collection_ids": [str(collection.id)],
+        "public_collection_ids": [str(collection.id)],
+        "unlisted_collection_ids": [],
+        "private_collection_ids": [],
+        "shared_collection_ids": [str(collection.id)],
+        "collection_owner_user_ids": [str(collection_owner.id)],
+        "collection_member_user_ids": [str(collaborator.id)],
+    }
 
 
 async def _load_sync_meili_stage_row(

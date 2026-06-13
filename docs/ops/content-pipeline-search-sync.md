@@ -42,6 +42,59 @@ If any search engine is unreachable the harness will still run, but items will
 stall at the corresponding sync stage and the run summary will tag them as
 `blocked_by_qdrant` or `blocked_by_meili`. That is the truthful outcome.
 
+## Indexed metadata contract
+
+Every `sync_qdrant` and `sync_meili` attempt rebuilds its payload/document from
+canonical PostgreSQL state at consume time. The broker event does **not** carry
+visibility, collection, template, or popularity truth; the worker re-reads it
+so replay and full rebuild paths always advertise the latest safe state.
+
+Fields intentionally carried into both indexes:
+
+- Access/ranking hints: `is_public`, `author_user_id`, `collection_ids`,
+  `public_collection_ids`, `unlisted_collection_ids`,
+  `private_collection_ids`, `shared_collection_ids`,
+  `collection_owner_user_ids`, `collection_member_user_ids`.
+- Canonical ranking metadata: `search_index_algorithm_version`, `media_type`,
+  `language`, `is_nsfw`, `tags`, `template_id`, `template_slug`,
+  `popularity_score`, `like_count`, `created_at`, `updated_at`,
+  `quality_score`.
+- Safe content hints already used by the search sync path: `meme_id`,
+  `meme_file_id`/`id`, `seo_page_slug`, and OCR text/snippet.
+
+Indexes remain **candidate sources only**. PostgreSQL is still the final access
+authority in `MemeSearchService`; stale Qdrant or Meilisearch payloads must not
+be treated as authorization.
+
+User-facing search also applies a small conservative query-time prefilter before
+candidate collection. The prefilter uses only safe index hints already stored in
+Qdrant/Meilisearch: algorithm version, public/private/access hints,
+collection ids, media type, language, NSFW flag, and tags. It is intentionally
+best-effort:
+
+- if the hint is clearly safe, the adapters pass it through;
+- if the hint would risk hiding a legitimate result, the prefilter stays broad;
+- PostgreSQL still performs the final visibility and access check after index
+  candidate collection.
+
+Meilisearch-specific requirement: the prefilter only works after the index has
+its filterable attributes configured. `PipelineMeilisearchSyncClient.ensure_index`
+now applies the required filterable fields before search traffic relies on them.
+If operators recreate the index out-of-band, run the normal startup/index-ensure
+path before expecting query-time filters to work.
+
+Fields intentionally omitted from indexes:
+
+- Collection invite tokens, hashes, recipient emails, and any other invite
+  secret material.
+- Collection membership roles and permission state; indexes only carry coarse
+  owner/member id hints, and PostgreSQL resolves actual access.
+- Raw auth/session material and any non-UUID user PII.
+- SEO prose/modeling fields other than `seo_page_slug` (`page_title`,
+  `meta_description`, `alt_text`, `caption`, `body_text`, SEO tag copies,
+  `model_id`, `prompt_version`), moderation notes, and other
+  operator/internal audit fields.
+
 ## Running the S03 proof harness
 
 ### Live mode
@@ -176,6 +229,31 @@ The batch endpoints enforce the service-layer `SYNC_REPLAY_BATCH_MAX` cap.
 Operators who need to replay more than that must split the work into
 successive calls. The cap is deliberate — it prevents accidental
 "requeue the entire corpus" operator errors.
+
+## When to replay or rebuild
+
+Use per-target replay when canonical PostgreSQL truth changed after the last
+successful sync and the search indexes need to catch up. Typical triggers:
+
+- `is_public` flipped between public/private.
+- A meme was added to or removed from a collection.
+- Collection visibility changed between `private`, `unlisted`, and `public`.
+- Tags, template assignment, template slug, or SEO slug changed.
+- `like_count`, `popularity_score`, or `quality_score` changed enough to matter
+  for ranking.
+
+Operational guidance:
+
+1. Replay **only the affected target** when one engine is stale and the other
+   is already correct.
+2. Use the batch replay endpoints for many affected ids after a moderation,
+   collection, template, or popularity backfill.
+3. For a full rebuild, enumerate every ready `meme_file_id` and feed the same
+   per-target batch endpoints in bounded chunks until the whole corpus has been
+   re-queued. The payload/document is rebuilt from PostgreSQL on every consume,
+   so the rebuild does not depend on any stale snapshot JSON.
+4. Re-run the smoke proof after the replay/rebuild wave. A `synced` snapshot is
+   only trustworthy when the engine itself can still find the item.
 
 ## Running the smoke proof directly
 

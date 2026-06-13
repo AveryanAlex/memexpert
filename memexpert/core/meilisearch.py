@@ -19,24 +19,62 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from datetime import datetime
 
+    from memexpert.core.search_index_prefilter import SearchIndexPrefilter
+
+
+MEILISEARCH_FILTERABLE_ATTRIBUTES: tuple[str, ...] = (
+    "search_index_algorithm_version",
+    "is_public",
+    "author_user_id",
+    "collection_owner_user_ids",
+    "collection_member_user_ids",
+    "collection_ids",
+    "public_collection_ids",
+    "unlisted_collection_ids",
+    "private_collection_ids",
+    "shared_collection_ids",
+    "media_type",
+    "language",
+    "is_nsfw",
+    "tags",
+)
+
 
 @dataclass(frozen=True, slots=True)
 class PipelineMeilisearchDocument:
     """Durable per-file document advertised to Meilisearch as part of the sync upsert.
 
-    The runtime reads canonical meme truth (tags, language, NSFW flag) plus the
-    primary-file OCR text and quality score, assembles this struct once per
-    sync attempt, and hands it to :class:`PipelineMeilisearchSyncClient`. The
-    document ``id`` is the ``meme_file_id`` hex string so the route lookups and
-    the snapshot-row surface share the same primary key shape as Qdrant.
+    The runtime rebuilds this document from canonical PostgreSQL state once per
+    sync attempt and hands it to :class:`PipelineMeilisearchSyncClient`. The
+    document ``id`` is the ``meme_file_id`` hex string so route lookups and the
+    snapshot-row surface share the same primary key shape as Qdrant. Access
+    fields are index hints only; PostgreSQL remains the final authority.
     """
 
     id: str
     meme_id: str
+    meme_file_id: str
+    search_index_algorithm_version: str
+    is_public: bool
+    author_user_id: str | None
+    media_type: str
     language: str
     is_nsfw: bool
+    created_at: datetime
     updated_at: datetime
+    seo_page_slug: str | None
+    template_id: str | None
+    template_slug: str | None
+    popularity_score: float
+    like_count: int
     tags: list[str] = field(default_factory=list)
+    collection_ids: list[str] = field(default_factory=list)
+    public_collection_ids: list[str] = field(default_factory=list)
+    unlisted_collection_ids: list[str] = field(default_factory=list)
+    private_collection_ids: list[str] = field(default_factory=list)
+    shared_collection_ids: list[str] = field(default_factory=list)
+    collection_owner_user_ids: list[str] = field(default_factory=list)
+    collection_member_user_ids: list[str] = field(default_factory=list)
     ocr_text: str | None = None
     quality_score: float | None = None
 
@@ -101,6 +139,7 @@ class MeilisearchSyncClientProtocol(Protocol):
         query: str,
         *,
         limit: int = 20,
+        prefilter: SearchIndexPrefilter | None = None,
     ) -> list[dict[str, Any]]: ...
 
 
@@ -181,6 +220,9 @@ class PipelineMeilisearchSyncClient:
                 self._settings.pipeline_meilisearch_index_name,
                 primary_key="id",
             )
+            index = self._index
+            assert index is not None
+            _ = await index.update_filterable_attributes(list(MEILISEARCH_FILTERABLE_ATTRIBUTES))
         except Exception as exc:
             _raise_sync_error_from(exc, operation="ensure_index")
 
@@ -189,6 +231,7 @@ class PipelineMeilisearchSyncClient:
         query: str,
         *,
         limit: int = 20,
+        prefilter: SearchIndexPrefilter | None = None,
     ) -> list[dict[str, Any]]:
         """Run a bounded text search against the configured Meilisearch index.
 
@@ -201,8 +244,9 @@ class PipelineMeilisearchSyncClient:
         """
 
         index = await self._ensure_index_client()
+        filter_expression = prefilter.to_meilisearch_filter() if prefilter is not None else None
         try:
-            raw_response = await index.search(query, limit=limit)
+            raw_response = await index.search(query, limit=limit, filter=filter_expression)
         except Exception as exc:
             _raise_sync_error_from(exc, operation="search")
             return []  # pragma: no cover - _raise_sync_error_from never returns
@@ -314,9 +358,27 @@ def _build_document_payload(document: PipelineMeilisearchDocument) -> dict[str, 
     payload: dict[str, Any] = {
         "id": document.id,
         "meme_id": document.meme_id,
+        "meme_file_id": document.meme_file_id,
+        "search_index_algorithm_version": document.search_index_algorithm_version,
+        "is_public": document.is_public,
+        "author_user_id": document.author_user_id,
+        "media_type": document.media_type,
         "language": document.language,
         "is_nsfw": document.is_nsfw,
+        "created_at": document.created_at.isoformat(),
         "tags": list(document.tags),
+        "seo_page_slug": document.seo_page_slug,
+        "template_id": document.template_id,
+        "template_slug": document.template_slug,
+        "popularity_score": float(document.popularity_score),
+        "like_count": int(document.like_count),
+        "collection_ids": list(document.collection_ids),
+        "public_collection_ids": list(document.public_collection_ids),
+        "unlisted_collection_ids": list(document.unlisted_collection_ids),
+        "private_collection_ids": list(document.private_collection_ids),
+        "shared_collection_ids": list(document.shared_collection_ids),
+        "collection_owner_user_ids": list(document.collection_owner_user_ids),
+        "collection_member_user_ids": list(document.collection_member_user_ids),
         "updated_at": document.updated_at.isoformat(),
     }
     if document.ocr_text is not None:
@@ -351,9 +413,27 @@ def _build_sync_preview(
     allowed_keys = {
         "id",
         "meme_id",
+        "meme_file_id",
+        "search_index_algorithm_version",
+        "is_public",
+        "author_user_id",
+        "media_type",
         "language",
         "is_nsfw",
+        "created_at",
         "tags",
+        "seo_page_slug",
+        "template_id",
+        "template_slug",
+        "popularity_score",
+        "like_count",
+        "collection_ids",
+        "public_collection_ids",
+        "unlisted_collection_ids",
+        "private_collection_ids",
+        "shared_collection_ids",
+        "collection_owner_user_ids",
+        "collection_member_user_ids",
         "ocr_text",
         "quality_score",
         "updated_at",
@@ -447,6 +527,7 @@ def _coerce_document_payload(raw_document: object) -> Mapping[str, object] | Non
 
 
 __all__ = [
+    "MEILISEARCH_FILTERABLE_ATTRIBUTES",
     "MeilisearchSyncClientProtocol",
     "MeilisearchSyncConflictError",
     "MeilisearchSyncError",

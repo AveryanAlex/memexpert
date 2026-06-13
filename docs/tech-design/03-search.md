@@ -83,21 +83,39 @@ Circuit breakers can protect Qdrant/Meilisearch/Voyage from repeated failing cal
 
 ## Qdrant
 
-Single collection `meme_files`. One point per MemeFile (only `status = ready` files indexed).
+Single collection `meme_files`. One point per `MemeFile` that the pipeline has
+classified and synced.
 
 - **Vector:** Voyage AI `voyage-multimodal-3.5`, 1024 dimensions, cosine distance
-- **Payload:** meme-level metadata for filtered search — `meme_id`, `is_primary`, `is_public`, `is_nsfw`, `media_type`, `language`, `popularity_score`, `like_count`, `tags`, `author_user_id`, `template_id`, `created_at`
-- **Payload indexes** on all fields used in filtering
+- **Payload:** safe PostgreSQL-derived metadata for candidate prefiltering and
+  ranking: `meme_id`, `meme_file_id`, `search_index_algorithm_version`,
+  `is_public`, `author_user_id`, `media_type`, `language`, `is_nsfw`, `tags`,
+  `template_id`, `template_slug`, `seo_page_slug`, `popularity_score`,
+  `like_count`, `quality_score`, `created_at`, `updated_at`, collection id
+  buckets by visibility, shared collection ids, collection owner ids, and
+  collection member ids.
+- **Payload indexes:** should be created on fields used by Qdrant-side
+  prefilters. These indexes are performance hints only; PostgreSQL filters are
+  still the authorization boundary.
 
 Used for: semantic search, similar memes, personalized feed (recommend API / vector search from positives), and deduplication during ingestion (high-threshold similarity search).
 
 ## Meilisearch
 
-Single index `memes`. One document per Meme.
+Single index `memes`. The current pipeline writes one document per `MemeFile`,
+keyed by the `meme_file_id` hex string, so operator lookups and Qdrant point ids
+share the same file identity.
 
-- **Searchable:** `ocr_text`, `tags`, `caption`, `page_title`
-- **Filterable:** `is_public`, `is_nsfw`, `media_type`, `language`, `tags`, `template_slug`, `author_user_id`
-- **Sortable:** `popularity_score`, `like_count`, `created_at`
+- **Searchable:** `ocr_text` plus tag/template terms already present on the
+  document. SEO prose/modeling fields other than `seo_page_slug`, moderation
+  notes, invite data, and raw auth/session data are intentionally not indexed.
+- **Filterable/prefilter hints:** `is_public`, `is_nsfw`, `media_type`,
+  `language`, `tags`, `template_slug`, `author_user_id`, collection id buckets
+  by visibility, shared collection ids, collection owner ids, and collection
+  member ids. Collection roles are deliberately not indexed; PostgreSQL applies
+  the final permission predicate.
+- **Sortable/ranking hints:** `popularity_score`, `like_count`, `quality_score`,
+  `created_at`, `updated_at`, and `search_index_algorithm_version`.
 - **Russian stop words** configured
 - **Typo tolerance** enabled (min 4 chars for 1 typo, 8 for 2)
 
@@ -109,13 +127,24 @@ Redis search/candidate caching is optional for MVP. If enabled, cache keys must 
 
 ## Sync Strategy
 
-**Event-driven:** The content pipeline publishes `meme_ready` events to a RabbitMQ fanout exchange. Qdrant and Meilisearch sync consumers each bind their own queue, processing independently with retries via dead letter exchanges.
+**Event-driven:** The content pipeline publishes sync dispatch events to RabbitMQ. Qdrant and Meilisearch sync consumers each bind their own queue, processing independently with retries via dead letter exchanges.
 
-- `meme_ready` → Qdrant consumer syncs embedding + payload; Meilisearch consumer syncs full document
+- `classify` success → Qdrant consumer syncs embedding + payload; Meilisearch consumer syncs a text document
 - Meme-level field changes (popularity, likes, tags, access/publicity) → API publishes update event → both sync consumers update
 - Like count and popularity changes → batched sync via Scheduler (not per-like)
 
-**Full resync:** Uses Qdrant collection aliases for zero-downtime rebuild — create new collection, populate, atomic alias switch, delete old. Same pattern used for embedding model upgrades.
+Every sync attempt rebuilds its payload/document from PostgreSQL at consume time
+via `load_search_index_state`; event payloads carry routing identity, not access
+or ranking truth. This keeps public/private flips, collection membership or
+visibility changes, SEO slug/template edits, and popularity/like updates safe to
+replay without trusting stale snapshot JSON.
+
+**Full resync/payload rebuild today:** enumerate ready `meme_file_id` values and
+feed the per-target batch replay routes in bounded chunks. The runtime reloads
+the current canonical row before each Qdrant/Meilisearch write. Qdrant alias
+swaps remain a future zero-downtime optimization for embedding-model upgrades,
+but the current safe metadata rebuild path is replay/batch replay through the
+pipeline service.
 
 ## Pagination
 

@@ -10,7 +10,6 @@ from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any, Protocol
 
 from faststream.rabbit import RabbitBroker, RabbitExchange, RabbitQueue
-from sqlalchemy import select
 
 from memexpert.core.broker import PipelineBrokerSettings
 from memexpert.core.classification import ClassificationClientProtocol
@@ -37,13 +36,17 @@ from memexpert.core.storage import (
     upload_object_bytes,
 )
 from memexpert.core.voyage import VoyageClientProtocol
-from memexpert.models.content import EmbeddingCache, Meme, MemeFile, MemeFileOCRResult
-from memexpert.models.enums import ContentPipelineStage, EmbeddingInputType
+from memexpert.models.enums import ContentPipelineStage
 from memexpert.schemas.content_pipeline import ContentPipelineDispatchEvent
 from memexpert.services import (
     ContentPipelineService,
     PipelineIngestError,
     PipelinePublishError,
+)
+from memexpert.services.search_index_sync import (
+    build_meilisearch_document,
+    build_qdrant_sync_payload,
+    load_search_index_state,
 )
 from memexpert.workers.pipeline_runtime.constants import (
     PIPELINE_REASON_MALFORMED_EVENT,
@@ -840,51 +843,19 @@ class PipelineRuntime:
         """Load canonical meme + embedding vector + primary-file OCR text for sync_qdrant."""
 
         async with self.session_factory() as session:
-            meme_file = await session.scalar(select(MemeFile).where(MemeFile.id == meme_file_id))
-            if meme_file is None:
-                raise PipelineIngestError(
-                    f"Sync_qdrant consumer could not find meme file {meme_file_id}.",
-                )
-            canonical_meme = await session.scalar(select(Meme).where(Meme.id == meme_file.meme_id))
-            if canonical_meme is None:
-                raise PipelineIngestError(
-                    f"Sync_qdrant consumer could not find canonical meme {meme_file.meme_id}.",
-                )
-            cache_row = await session.scalar(
-                select(EmbeddingCache)
-                .where(
-                    EmbeddingCache.source_file_id == meme_file_id,
-                    EmbeddingCache.input_type == EmbeddingInputType.IMAGE,
-                )
-                .order_by(EmbeddingCache.created_at.desc())
-                .limit(1)
+            loaded_state = await load_search_index_state(
+                session,
+                meme_file_id,
+                vector_dimensions=self.settings.pipeline_voyage_output_dimensions,
             )
-            if cache_row is None:
-                raise PipelineIngestError(
-                    f"Sync_qdrant consumer could not find an embedding cache row for {meme_file_id}.",
-                )
-            ocr_row = await session.scalar(
-                select(MemeFileOCRResult).where(MemeFileOCRResult.meme_file_id == meme_file_id)
+        if loaded_state.vector is None:
+            raise PipelineIngestError(
+                f"Sync_qdrant consumer could not decode an embedding vector for {meme_file_id}.",
             )
-
-        from memexpert.core.voyage import decode_embedding_bytes
-
-        vector = decode_embedding_bytes(
-            cache_row.embedding,
-            dimensions=self.settings.pipeline_voyage_output_dimensions,
+        return SyncQdrantInputs(
+            payload=build_qdrant_sync_payload(loaded_state.canonical),
+            vector=loaded_state.vector,
         )
-        ocr_snippet = ocr_row.extracted_text if ocr_row is not None else canonical_meme.ocr_text
-        payload = QdrantSyncPayload(
-            meme_id=canonical_meme.id,
-            meme_file_id=meme_file_id,
-            language=canonical_meme.language.value,
-            is_nsfw=canonical_meme.is_nsfw,
-            tags=list(canonical_meme.tags),
-            ocr_snippet=ocr_snippet,
-            quality_score=meme_file.quality_score,
-            source_object_key=meme_file.s3_original_key,
-        )
-        return SyncQdrantInputs(payload=payload, vector=vector)
 
     async def _record_sync_qdrant_failure(
         self,
@@ -929,32 +900,8 @@ class PipelineRuntime:
         """
 
         async with self.session_factory() as session:
-            meme_file = await session.scalar(select(MemeFile).where(MemeFile.id == meme_file_id))
-            if meme_file is None:
-                raise PipelineIngestError(
-                    f"Sync_meili consumer could not find meme file {meme_file_id}.",
-                )
-            canonical_meme = await session.scalar(select(Meme).where(Meme.id == meme_file.meme_id))
-            if canonical_meme is None:
-                raise PipelineIngestError(
-                    f"Sync_meili consumer could not find canonical meme {meme_file.meme_id}.",
-                )
-            ocr_row = await session.scalar(
-                select(MemeFileOCRResult).where(MemeFileOCRResult.meme_file_id == meme_file_id)
-            )
-
-        ocr_text = ocr_row.extracted_text if ocr_row is not None else canonical_meme.ocr_text
-        document = PipelineMeilisearchDocument(
-            id=meme_file_id.hex,
-            meme_id=str(canonical_meme.id),
-            language=canonical_meme.language.value,
-            is_nsfw=canonical_meme.is_nsfw,
-            tags=list(canonical_meme.tags),
-            ocr_text=ocr_text,
-            quality_score=meme_file.quality_score,
-            updated_at=meme_file.updated_at,
-        )
-        return SyncMeiliInputs(document=document)
+            loaded_state = await load_search_index_state(session, meme_file_id)
+        return SyncMeiliInputs(document=build_meilisearch_document(loaded_state.canonical))
 
     async def _record_sync_meili_failure(
         self,
