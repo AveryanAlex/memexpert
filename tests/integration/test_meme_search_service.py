@@ -31,7 +31,7 @@ from memexpert.models.enums import (
 )
 from memexpert.models.user import AccountMergeLog, AnalyticsEvent, User
 from memexpert.schemas.user import UserRead
-from memexpert.services.analytics import AnalyticsService
+from memexpert.services.analytics import AnalyticsService, InteractionEventRefs, InteractionEventWrite
 from memexpert.services.media_render_urls import MediaRenderUrlService
 from memexpert.services.meme_search import MemeNotFoundError, MemeSearchFilters, MemeSearchService
 from memexpert.services.meme_seo import MemeSeoGenerationService, MemeSeoProviderResult
@@ -1021,6 +1021,30 @@ async def test_trending_route_ranks_recent_events_snapshots_and_popularity_witho
     assert "telegram_user_hash" not in first_response.text
 
 
+async def test_trending_memes_uses_strict_interaction_event_refs_for_recent_scores(
+    migrated_db_session: AsyncSession,
+) -> None:
+    strict_event_meme = await _create_meme(migrated_db_session, tags=["trend"], popularity_score=1.0, like_count=1)
+    no_event_meme = await _create_meme(migrated_db_session, tags=["trend"], popularity_score=1.0, like_count=1)
+    analytics_service = AnalyticsService(migrated_db_session)
+    await analytics_service.record_interaction_event(
+        InteractionEventWrite(
+            event_type=AnalyticsEventType.MEME_SAVE,
+            surface="public_api",
+            refs=InteractionEventRefs(meme_id=strict_event_meme.id),
+            properties={"chat_hash": "hashed-chat"},
+        )
+    )
+
+    page = await MemeSearchService(migrated_db_session).trending_memes(
+        filters=MemeSearchFilters(tags=("trend",)),
+        limit=10,
+        lookback_hours=24,
+    )
+
+    assert [item.meme.id for item in page.items] == [strict_event_meme.id, no_event_meme.id]
+
+
 async def test_public_trend_endpoints_rank_from_materialized_views_and_return_aggregates(
     app: FastAPI,
     client: AsyncClient,
@@ -1033,6 +1057,23 @@ async def test_public_trend_endpoints_rank_from_materialized_views_and_return_ag
     snapshot_meme.template_id = template.id
     liked_meme = await _create_meme(migrated_db_session, tags=["reaction"], popularity_score=1.0)
     rising_meme = await _create_meme(migrated_db_session, tags=["reaction"], popularity_score=1.0)
+    analytics_service = AnalyticsService(migrated_db_session)
+    await analytics_service.record_interaction_event(
+        InteractionEventWrite(
+            event_type=AnalyticsEventType.MEME_DOWNLOAD,
+            surface="public_api",
+            refs=InteractionEventRefs(meme_id=liked_meme.id),
+            properties={"chat_hash": "hashed-chat-1"},
+        )
+    )
+    await analytics_service.record_interaction_event(
+        InteractionEventWrite(
+            event_type=AnalyticsEventType.MEME_DOWNLOAD,
+            surface="public_api",
+            refs=InteractionEventRefs(meme_id=liked_meme.id),
+            properties={"chat_hash": "hashed-chat-2"},
+        )
+    )
     now = datetime.now(UTC)
     migrated_db_session.add_all(
         [
@@ -1087,7 +1128,7 @@ async def test_public_trend_endpoints_rank_from_materialized_views_and_return_ag
     assert rising_response.json()["items"][0]["meme"]["id"] == str(rising_meme.id)
     assert liked_response.json()["items"][0]["meme"]["id"] == str(liked_meme.id)
     assert liked_response.json()["items"][0]["trend"]["recent"]["likes"] == 3
-    assert liked_response.json()["items"][0]["trend"]["recent"]["downloads"] == 0
+    assert liked_response.json()["items"][0]["trend"]["recent"]["downloads"] == 2
     assert liked_response.json()["items"][0]["trend"]["previous"]["downloads"] == 0
     assert "payload" not in trending_response.text
     assert "query" not in trending_response.text
@@ -1097,7 +1138,7 @@ async def test_public_trend_endpoints_rank_from_materialized_views_and_return_ag
     assert reaction_summary["meme_count"] == 3
     assert reaction_summary["trend"]["recent"]["sends"] == 7
     assert reaction_summary["trend"]["recent"]["likes"] == 3
-    assert reaction_summary["trend"]["recent"]["downloads"] == 0
+    assert reaction_summary["trend"]["recent"]["downloads"] == 2
 
     template_payload = template_response.json()
     assert template_payload[0]["slug"] == "frog-template"
@@ -1109,6 +1150,33 @@ async def test_public_trend_endpoints_rank_from_materialized_views_and_return_ag
     assert popularity_payload["meme_id"] == str(snapshot_meme.id)
     assert [point["popularity_score"] for point in popularity_payload["sparkline"]] == [100.0, 200.0]
     assert popularity_payload["trend"]["latest_source_views"] == 20
+
+
+async def test_public_trend_views_count_strict_writer_nested_meme_refs(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    meme = await _create_meme(migrated_db_session, tags=["trend"], popularity_score=1.0)
+    analytics_service = AnalyticsService(migrated_db_session)
+    await analytics_service.record_interaction_event(
+        InteractionEventWrite(
+            event_type=AnalyticsEventType.MEME_DOWNLOAD,
+            surface="public_api",
+            refs=InteractionEventRefs(meme_id=meme.id),
+            properties={"chat_hash": "hashed-chat"},
+        )
+    )
+    await _refresh_trend_views(migrated_db_session)
+    _install_meme_route_overrides(app, migrated_db_session)
+
+    try:
+        response = await client.get(f"/api/v1/memes/{meme.id}/popularity")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()["trend"]["recent"]["downloads"] == 1
 
 
 async def test_public_trend_empty_states_are_honest(
