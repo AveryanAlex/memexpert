@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any, Final
 import httpx
 from botocore.exceptions import ClientError
 from PIL import Image, PngImagePlugin
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.http.models import Distance, VectorParams
 from sqlalchemy import select
@@ -939,7 +939,7 @@ def _stable_uuid(name: str) -> uuid.UUID:
     return uuid.uuid5(UUID_NAMESPACE, name)
 
 
-def _validate_response[ModelT](
+def _validate_response[ModelT: BaseModel](
     response: httpx.Response,
     *,
     expected_status: int,
@@ -947,7 +947,7 @@ def _validate_response[ModelT](
 ) -> ModelT:
     payload = _validate_json_response(response, expected_status=expected_status)
     try:
-        return model.model_validate(payload)  # type: ignore[attr-defined, no-any-return]
+        return model.model_validate(payload)
     except ValidationError as exc:
         raise E2ESeedError(
             f"{response.request.method} {response.request.url.path} returned a malformed payload: {exc}",

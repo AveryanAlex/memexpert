@@ -27,10 +27,10 @@ if TYPE_CHECKING:
 
 
 def _as_message(fake: Any) -> _TelethonMessageLike:
-    """Duck-typed pass-through so mypy stops flagging protocol variance.
+    """Duck-typed pass-through so ty stops flagging protocol variance.
 
     ``_TelethonMessageLike`` is a runtime-checkable Protocol, so at
-    runtime the fake dataclasses satisfy it structurally. Mypy's
+    runtime the fake dataclasses satisfy it structurally. Ty's
     invariant attribute typing still complains because ``_FakeMessage``
     uses narrow types, so we cast through ``Any`` at the call site.
     """

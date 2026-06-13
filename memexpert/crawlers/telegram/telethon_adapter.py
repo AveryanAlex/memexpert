@@ -10,9 +10,11 @@ underlying ``TelegramClient`` lazily on first use.
 from __future__ import annotations
 
 import asyncio
+import inspect
 from contextlib import suppress
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, cast
+from io import BytesIO
+from typing import TYPE_CHECKING, Any, cast
 
 from telethon import TelegramClient, events
 from telethon.errors import (
@@ -23,6 +25,7 @@ from telethon.errors import (
     UserDeactivatedError,
 )
 from telethon.tl.types import Channel, InputPeerChannel
+from telethon.tl.types import Message as TelethonMessage
 
 from memexpert.crawlers.telegram.client import (
     PipelineTelegramClientProtocol,
@@ -360,18 +363,20 @@ class PipelineTelethonClient(PipelineTelegramClientProtocol):
 
         client = await self.factory.get_client()
         raw_payload = message.raw_payload
-        if raw_payload is None:
+        if not isinstance(raw_payload, TelethonMessage):
             raise PipelineTelegramMalformedMessageError(
-                "RawTelegramMessage.raw_payload is required for download_media.",
+                "RawTelegramMessage.raw_payload must be a Telethon message for download_media.",
             )
+        media_buffer = BytesIO()
         await self.rate_limiter.acquire()
         try:
-            result = await client.download_media(raw_payload, file=bytes)
+            _ = await client.download_media(raw_payload, file=media_buffer)
         except Exception as exc:
             raise _translate_telethon_error(exc) from exc
-        if not isinstance(result, bytes):
+        result = media_buffer.getvalue()
+        if not result:
             raise PipelineTelegramMalformedMessageError(
-                f"Telethon returned non-bytes media for message_id={message.message_id!r}.",
+                f"Telethon returned empty media for message_id={message.message_id!r}.",
             )
         return result
 
@@ -414,8 +419,12 @@ class PipelineTelethonClient(PipelineTelegramClientProtocol):
             raise PipelineTelegramMalformedMessageError(
                 f"Telegram returned no message for ({channel_id!r}, {post_id!r}).",
             )
+        if not isinstance(fetched, TelethonMessage):
+            raise PipelineTelegramMalformedMessageError(
+                f"Telegram returned a non-message container for ({channel_id!r}, {post_id!r}).",
+            )
         return TelethonMessageNormalizer.build(
-            message=fetched,
+            message=cast("Any", fetched),
             channel_id=channel_id,
             channel_title=channel_title,
             channel_username=channel_username,
@@ -437,7 +446,9 @@ class PipelineTelethonClient(PipelineTelegramClientProtocol):
         client = self.factory._client  # noqa: SLF001 - intentional peek: close-only path
         if client is not None and client.is_connected():
             with suppress(Exception):
-                await client.disconnect()
+                disconnect_result: object = client.disconnect()
+                if inspect.isawaitable(disconnect_result):
+                    await disconnect_result
 
 
 __all__ = [

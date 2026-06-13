@@ -107,8 +107,10 @@ def test_web_video_uses_public_media_base_and_never_imgproxy() -> None:
     assert render.preview_url is None
     assert render.web_video_url == f"https://media.memexpert.test/files/{file_id}/web-video.mp4"
     assert render.download_url == render.web_video_url
-    assert "img.memexpert.test" not in render.web_video_url
-    assert "pipeline/derived/secret/web.mp4" not in render.web_video_url
+    web_video_url = render.web_video_url
+    assert web_video_url is not None
+    assert "img.memexpert.test" not in web_video_url
+    assert "pipeline/derived/secret/web.mp4" not in web_video_url
 
 
 def test_web_video_returns_null_without_public_media_base() -> None:
@@ -181,5 +183,7 @@ def test_private_web_video_uses_authenticated_direct_variant_without_imgproxy() 
     assert render.preview_url is None
     assert render.web_video_url == f"/api/v1/media/files/{file_id}/web-video.mp4"
     assert render.download_url == render.web_video_url
-    assert "img.memexpert.test" not in render.web_video_url
-    assert "pipeline/derived/private/web.mp4" not in render.web_video_url
+    web_video_url = render.web_video_url
+    assert web_video_url is not None
+    assert "img.memexpert.test" not in web_video_url
+    assert "pipeline/derived/private/web.mp4" not in web_video_url

@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
 import httpx
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from memexpert.core.config import get_settings
 from memexpert.models.enums import ContentPipelineStageStatus
@@ -145,7 +145,7 @@ class PipelineApiClient:
         )
 
 
-def _validate_response[ModelT](
+def _validate_response[ModelT: BaseModel](
     response: httpx.Response,
     *,
     expected_status: int,
@@ -174,9 +174,7 @@ def _validate_response[ModelT](
         )
 
     try:
-        # ``model`` is a pydantic BaseModel subclass at the call sites; the generic
-        # binding keeps the return type concrete for mypy-strict.
-        return model.model_validate(payload)  # type: ignore[attr-defined, no-any-return]
+        return model.model_validate(payload)
     except ValidationError as exc:
         raise SmokeError(
             f"{response.request.method} {response.request.url.path} returned a malformed payload: {exc}"

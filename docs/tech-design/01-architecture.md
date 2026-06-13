@@ -120,7 +120,7 @@ SvelteKit handles server-side rendering for SEO and fast initial page loads. `+p
 | **OCR** | PaddleOCR PP-OCRv5 + Qwen2.5-VL-2B | Primary + VLM fallback for stylized text |
 | **LLM/SEO** | PydanticAI provider boundary | Baseline prompts ported from v0 Rust branch; model configured per environment |
 | **Cache / rate limiting** | Redis | Rate limiting, hot caches, optional search candidate pools |
-| **Python Tooling** | uv (package manager), ruff (lint), mypy (type check), pytest | Single `pyproject.toml`, uv for deps + virtualenv + scripts |
+| **Python Tooling** | uv (package manager), ruff (lint), ty (type check), pytest | Single `pyproject.toml`, uv for deps + virtualenv + scripts |
 | **SvelteKit Tooling** | pnpm, biome (lint), svelte-check, Vitest, Playwright | Component tests + E2E |
 | **Observability** | OpenTelemetry planned | Prometheus endpoint is deferred; structured logs/traces first |
 

@@ -41,7 +41,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, Literal
+from typing import TYPE_CHECKING, Final, Literal, cast
 
 import httpx
 from pydantic import ValidationError
@@ -63,7 +63,7 @@ from memexpert.services.crawler_s04_report import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
 REPO_ROOT: Final = Path(__file__).resolve().parent.parent
 DEFAULT_ARTIFACTS_DIR: Final = REPO_ROOT / ".artifacts" / "s04-runtime-smoke"
@@ -927,15 +927,16 @@ def _validate_fixture_payload(
             raise SetupError(
                 f"Channel fixture {path} channel[{index}] is not a mapping: {raw_entry!r}",
             )
+        entry = cast("dict[str, object]", raw_entry)
         try:
-            platform_id = _require_non_blank_string(raw_entry, "platform_id", path=path)
-            title = _require_non_blank_string(raw_entry, "title", path=path)
-            session_name = _require_non_blank_string(raw_entry, "session_name", path=path)
+            platform_id = _require_non_blank_string(entry, "platform_id", path=path)
+            title = _require_non_blank_string(entry, "title", path=path)
+            session_name = _require_non_blank_string(entry, "session_name", path=path)
         except KeyError as exc:
             raise SetupError(
                 f"Channel fixture {path} channel[{index}] is missing required key: {exc.args[0]!r}",
             ) from exc
-        username_raw = raw_entry.get("username")
+        username_raw = entry.get("username")
         username = (
             username_raw.strip() if isinstance(username_raw, str) and username_raw.strip() else None
         )
@@ -951,7 +952,7 @@ def _validate_fixture_payload(
 
 
 def _require_non_blank_string(
-    mapping: dict[str, object],
+    mapping: Mapping[str, object],
     key: str,
     *,
     path: Path,

@@ -273,7 +273,7 @@ class _StubPipelineService:
 async def test_telegram_crawler_runtime_load_session_state_creates_and_returns_rows(
     migrated_db_session: AsyncSession,
 ) -> None:
-    service = cast("ContentPipelineService", _StubPipelineService())
+    service = cast("ContentPipelineService", cast("object", _StubPipelineService()))
     client = FakeTelegramClient()
     runtime = TelegramCrawlerRuntime(
         pipeline_service=service,
@@ -312,12 +312,14 @@ def test_crawler_catchup_report_is_extra_forbid_and_defaults_counters_to_zero() 
     assert report.errors == ()
 
     with pytest.raises(ValidationError):
-        _ = CrawlerCatchupReport(
-            session_name="primary",
-            channel_id="memes_channel",
-            started_at=now,
-            finished_at=now,
-            extra_field="nope",  # type: ignore[call-arg]
+        _ = CrawlerCatchupReport.model_validate(
+            {
+                "session_name": "primary",
+                "channel_id": "memes_channel",
+                "started_at": now,
+                "finished_at": now,
+                "extra_field": "nope",
+            }
         )
 
 
@@ -330,7 +332,7 @@ async def test_telegram_crawler_runtime_accepts_async_mock_clients(
     so make sure T01's contract keeps those drop-in replacements usable.
     """
 
-    service = cast("ContentPipelineService", _StubPipelineService())
+    service = cast("ContentPipelineService", cast("object", _StubPipelineService()))
     mock_client = cast("PipelineTelegramClientProtocol", AsyncMock())
     runtime = TelegramCrawlerRuntime(
         pipeline_service=service,

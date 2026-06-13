@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from sqlalchemy import func, select
 
 from memexpert.core.config import Settings, get_settings
@@ -26,7 +26,7 @@ from memexpert.services import (
 )
 
 if TYPE_CHECKING:
-    from aiogram.types import MaybeInaccessibleMessage, Message
+    from aiogram.types import MaybeInaccessibleMessage
     from sqlalchemy.ext.asyncio import AsyncSession
     from sqlalchemy.sql import Executable
 
@@ -466,7 +466,7 @@ async def _edit_or_answer_callback(
     reply_markup: InlineKeyboardMarkup,
 ) -> None:
     message: MaybeInaccessibleMessage | None = callback_query.message
-    if message is not None and hasattr(message, "edit_text"):
+    if isinstance(message, Message):
         await message.edit_text(text, reply_markup=reply_markup)
         await callback_query.answer()
         return

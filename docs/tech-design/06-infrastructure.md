@@ -156,7 +156,7 @@ Service layer with real infrastructure — each test run spins up fresh containe
 
 ```
 push/PR → [parallel]
-            ├─ Python: lint (ruff) → type check (mypy) → unit tests → integration tests (testcontainers)
+            ├─ Python: lint (ruff) → type check (ty) → unit tests → integration tests (testcontainers)
             └─ SvelteKit: pnpm install → svelte-check → Vitest → Playwright smoke → build
 merge    → build images → deploy staging → Playwright E2E → deploy production
 ```

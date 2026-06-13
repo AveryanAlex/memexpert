@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import sys
 import uuid
 from typing import TYPE_CHECKING, Final
@@ -119,7 +120,9 @@ async def _authorize_session_file(session_name: str, session_dir: Path) -> None:
         api_hash=api_hash.get_secret_value(),
     )
     async with client:
-        await client.start()
+        start_result: object = client.start()
+        if inspect.isawaitable(start_result):
+            await start_result
         me = await client.get_me()
         sys.stdout.write(
             f"Authorized session {session_name!r} as {getattr(me, 'username', None) or me!r}.\n",

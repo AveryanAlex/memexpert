@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Protocol, Self, cast
@@ -819,7 +819,7 @@ class ContentPipelineService:
         meme_file_id: uuid.UUID,
         attempt: int,
         event_id: uuid.UUID,
-        payload_preview: dict[str, object],
+        payload_preview: Mapping[str, object],
     ) -> PerTargetSyncStatus:
         """Persist a successful Qdrant sync attempt and publish ``meme_qdrant_synced``."""
 
@@ -838,7 +838,7 @@ class ContentPipelineService:
         meme_file_id: uuid.UUID,
         attempt: int,
         event_id: uuid.UUID,
-        payload_preview: dict[str, object],
+        payload_preview: Mapping[str, object],
     ) -> PerTargetSyncStatus:
         """Persist a successful per-target sync attempt and publish the success event.
 

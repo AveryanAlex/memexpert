@@ -93,7 +93,7 @@ Run backend checks:
 
 ```sh
 uv run ruff check .
-uv run mypy .
+uv run ty check
 uv run pytest -v
 ```
 

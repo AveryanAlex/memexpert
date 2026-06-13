@@ -200,7 +200,7 @@ async def _load_candidate_rows(
             continue
         # The SQL query filters ``published_at IS NOT NULL`` up front,
         # but the ORM column is declared ``Mapped[datetime | None]`` so
-        # mypy needs an explicit narrowing to know the value is present.
+        # ty needs an explicit narrowing to know the value is present.
         published_at = source_row.published_at
         if published_at is None:
             continue

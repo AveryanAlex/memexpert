@@ -7,7 +7,7 @@ import inspect
 import logging
 import signal
 from contextlib import suppress
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -26,11 +26,21 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class SchedulerLike(Protocol):
+    """Small scheduler seam used by the runtime and tests."""
+
+    def add_job(self, func: object, **kwargs: object) -> object: ...
+
+    def start(self) -> None: ...
+
+    def shutdown(self, *, wait: bool) -> None: ...
+
+
 async def run_scheduler_runtime(
     *,
     settings: Settings | None = None,
     engine: AsyncEngine | None = None,
-    scheduler: AsyncIOScheduler | None = None,
+    scheduler: SchedulerLike | None = None,
     stop_waiter: Callable[[], Awaitable[None] | None] | None = None,
     lock: Any | None = None,
 ) -> None:
@@ -78,7 +88,7 @@ async def run_scheduler_runtime(
 
             scheduler_instance.add_job(
                 _job_runner,
-                trigger=IntervalTrigger(seconds=definition.trigger_seconds),
+                trigger=IntervalTrigger(seconds=cast("Any", definition.trigger_seconds)),
                 id=definition.id,
                 replace_existing=True,
                 coalesce=True,

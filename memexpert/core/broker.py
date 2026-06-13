@@ -6,7 +6,7 @@ import asyncio
 import inspect
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Final, cast
+from typing import Final, cast
 from urllib.parse import urlparse, urlunparse
 
 import aio_pika
@@ -16,9 +16,6 @@ from faststream.rabbit import RabbitBroker
 from memexpert.core.config import Settings, get_settings
 from memexpert.models.enums import ContentPipelineStage
 from memexpert.schemas.content_pipeline import ContentPipelineEventType
-
-if TYPE_CHECKING:
-    from collections.abc import Awaitable
 
 DEFAULT_RABBITMQ_CONNECTION_TIMEOUT_SECONDS: Final = 5.0
 SUPPORTED_RABBITMQ_SCHEMES: Final[frozenset[str]] = frozenset({"amqp", "amqps"})
@@ -205,7 +202,7 @@ _rabbitmq_broker_start_lock: asyncio.Lock | None = None
 
 async def _maybe_await(result: object) -> None:
     if inspect.isawaitable(result):
-        _ = await cast("Awaitable[object]", result)
+        _ = await result
 
 
 def _normalize_topology_name(value: str, *, field_name: str) -> str:

@@ -16,7 +16,7 @@ import sys
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 
@@ -141,7 +141,7 @@ def _build_summary(
     *,
     bounded_item_count: int,
     expected_channel_titles: tuple[str, ...] = (),
-    mode: str = "live",
+    mode: Literal["live", "catch_up_only", "dry_run"] = "live",
 ) -> Any:
     now = datetime(2026, 4, 10, 12, 30, 0, tzinfo=UTC)
     return summarize_s04_run(
@@ -149,7 +149,7 @@ def _build_summary(
         run_id="test-run",
         started_at=now,
         finished_at=now,
-        mode=mode,  # type: ignore[arg-type]
+        mode=mode,
         api_base_url="http://127.0.0.1:8000",
         channel_fixture_path="/tmp/fixture.yaml",
         bounded_item_count=bounded_item_count,

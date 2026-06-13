@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import httpx
 
@@ -484,7 +484,7 @@ def _coerce_search_hits(raw_response: object) -> list[dict[str, Any]]:
     hits: list[dict[str, Any]] = []
     for entry in raw_hits:
         if isinstance(entry, dict):
-            hits.append(dict(entry))
+            hits.append(_plain_string_key_dict(cast("Mapping[object, object]", entry)))
             continue
         entry_dump = getattr(entry, "model_dump", None)
         if callable(entry_dump):
@@ -493,11 +493,11 @@ def _coerce_search_hits(raw_response: object) -> list[dict[str, Any]]:
             except Exception:  # noqa: BLE001 - skip malformed individual hits to stay honest.
                 continue
             if isinstance(dumped_entry, dict):
-                hits.append(dict(dumped_entry))
+                hits.append(_plain_string_key_dict(dumped_entry))
                 continue
         entry_dict = getattr(entry, "__dict__", None)
         if isinstance(entry_dict, dict):
-            hits.append(dict(entry_dict))
+            hits.append(_plain_string_key_dict(entry_dict))
     return hits
 
 
@@ -511,7 +511,7 @@ def _coerce_document_payload(raw_document: object) -> Mapping[str, object] | Non
     """
 
     if isinstance(raw_document, dict):
-        return raw_document
+        return _plain_string_key_dict(cast("Mapping[object, object]", raw_document))
     model_dump = getattr(raw_document, "model_dump", None)
     if callable(model_dump):
         try:
@@ -519,11 +519,17 @@ def _coerce_document_payload(raw_document: object) -> Mapping[str, object] | Non
         except Exception:  # noqa: BLE001 - malformed model dumps degrade to None.
             return None
         if isinstance(dumped, dict):
-            return dumped
+            return _plain_string_key_dict(dumped)
     as_dict = getattr(raw_document, "__dict__", None)
     if isinstance(as_dict, dict):
-        return as_dict
+        return _plain_string_key_dict(as_dict)
     return None
+
+
+def _plain_string_key_dict(raw_mapping: Mapping[object, object]) -> dict[str, Any]:
+    """Copy an SDK mapping into a plain dict with string keys."""
+
+    return {str(key): value for key, value in raw_mapping.items()}
 
 
 __all__ = [

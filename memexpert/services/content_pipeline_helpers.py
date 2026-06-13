@@ -12,6 +12,7 @@ an argument or on a stateless container and never touches
 from __future__ import annotations
 
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import PurePosixPath
@@ -144,7 +145,7 @@ def compare_telegram_post_ids(candidate: str, current: str | None) -> int:
 
 
 def build_sync_preview_model(
-    payload_preview: dict[str, object],
+    payload_preview: Mapping[str, object],
     *,
     target: SyncTargetKind,
 ) -> ContentPipelineSyncTargetPreview:

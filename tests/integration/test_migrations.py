@@ -109,7 +109,8 @@ async def _run_alembic_command(
         async with asyncio.timeout(timeout):
             await asyncio.to_thread(action, config, *args)
     except TimeoutError as exc:  # pragma: no cover - exercised only on failure
-        raise AssertionError(f"Alembic {action.__name__} timed out after {timeout:.1f}s") from exc
+        action_name = getattr(action, "__name__", action.__class__.__name__)
+        raise AssertionError(f"Alembic {action_name} timed out after {timeout:.1f}s") from exc
 
 
 async def _reset_public_schema(engine: AsyncEngine) -> None:

@@ -10,7 +10,7 @@ from datetime import timedelta
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Protocol
 
-from sqlalchemy import Select, and_, false, func, literal, or_, select
+from sqlalchemy import Select, and_, any_, false, func, literal, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -1091,7 +1091,7 @@ def _apply_filters(stmt: Select[tuple[Meme]], filters: MemeSearchFilters) -> Sel
     if not filters.include_nsfw:
         stmt = stmt.where(Meme.is_nsfw.is_(False))
     for tag in filters.tags:
-        stmt = stmt.where(Meme.tags.any(literal(tag)))
+        stmt = stmt.where(literal(tag) == any_(Meme.tags))
     return stmt
 
 

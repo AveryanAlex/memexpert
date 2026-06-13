@@ -171,15 +171,17 @@ class PipelineOCRProcessor:
         if paddle_ocr_cls is None:
             raise OCRProviderUnavailableError("PaddleOCR could not be imported from the installed package.")
 
-        if self._paddle_ocr is None:
-            self._paddle_ocr = paddle_ocr_cls(
+        paddle_ocr = self._paddle_ocr
+        if paddle_ocr is None:
+            paddle_ocr = paddle_ocr_cls(
                 use_doc_orientation_classify=False,
                 use_doc_unwarping=False,
                 use_textline_orientation=False,
             )
+            self._paddle_ocr = paddle_ocr
 
         try:
-            result = cast("Any", self._paddle_ocr).predict(input=str(image_path))
+            result = paddle_ocr.predict(input=str(image_path))
         except Exception as exc:
             raise OCRProcessingError(f"PaddleOCR failed to process {image_path.name}: {exc}") from exc
 
@@ -276,10 +278,10 @@ def _parse_paddle_result(payload: object) -> _OCRCandidate:
     if not isinstance(resolved, dict):
         raise OCRMalformedOutputError("PaddleOCR returned an unexpected result shape.")
 
-    if isinstance(resolved.get("rec_text"), str):
-        text = resolved.get("rec_text")
+    rec_text = resolved.get("rec_text")
+    if isinstance(rec_text, str):
         confidence = _normalize_confidence(resolved.get("rec_score"))
-        return _OCRCandidate(extracted_text=text, confidence=confidence, language=None)
+        return _OCRCandidate(extracted_text=rec_text, confidence=confidence, language=None)
 
     rec_texts = resolved.get("rec_texts")
     rec_scores = resolved.get("rec_scores")
