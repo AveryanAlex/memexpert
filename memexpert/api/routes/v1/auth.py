@@ -32,6 +32,7 @@ from memexpert.schemas.auth import (
     TelegramLinkStartRead,
     TelegramMiniAppAuthRequest,
     TelegramWidgetAuthRequest,
+    UserPreferencesUpdateRequest,
 )
 from memexpert.schemas.user import UserRead
 from memexpert.services import (
@@ -425,6 +426,34 @@ async def read_current_user(current_user: CurrentUserDep) -> UserRead:
     """Return the current DB-backed user for the supplied bearer token."""
 
     return current_user
+
+
+@router.patch(
+    "/preferences",
+    response_model=UserRead,
+    responses=AUTH_ERROR_RESPONSES,
+    summary="Update the authenticated caller's preferences",
+)
+async def update_current_user_preferences(
+    current_user: CurrentUserDep,
+    session: DbSessionDep,
+    preferences: Annotated[UserPreferencesUpdateRequest, Body()],
+) -> UserRead:
+    """Persist user preferences for the cookie-authenticated caller."""
+
+    user_service = UserService(session)
+    try:
+        return await user_service.update_preferences(
+            user_id=current_user.id,
+            nsfw_enabled=preferences.nsfw_enabled,
+            language=preferences.language,
+        )
+    except UserNotFoundError as exc:
+        raise to_auth_http_error(
+            AuthenticatedUserNotFoundError(
+                f"Authenticated user {current_user.id} no longer exists.",
+            )
+        ) from exc
 
 
 @router.get(

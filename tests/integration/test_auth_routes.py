@@ -194,6 +194,64 @@ async def test_me_route_ignores_authorization_header_without_cookie(
     assert "cookie" in response.json()["detail"].lower()
 
 
+async def test_preferences_route_rejects_missing_cookie(
+    auth_client: AsyncClient,
+) -> None:
+    response = await auth_client.patch(
+        "/api/v1/auth/preferences",
+        headers={"Authorization": "Bearer not-a-jwt"},
+        json={"nsfw_enabled": True},
+    )
+
+    assert response.status_code == 401
+    assert response.json()["code"] == "invalid_token"
+    assert "cookie" in response.json()["detail"].lower()
+
+
+async def test_preferences_route_updates_and_persists_current_user_preferences(
+    auth_client: AsyncClient,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    guest_response = await auth_client.post("/api/v1/auth/guest")
+    guest_user_id = guest_response.json()["user"]["id"]
+
+    response = await auth_client.patch(
+        "/api/v1/auth/preferences",
+        json={"nsfw_enabled": True, "language": "ru"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["id"] == guest_user_id
+    assert response.json()["nsfw_enabled"] is True
+    assert response.json()["language"] == "ru"
+    assert "access_token" not in response.json()
+
+    async with postgres_session_factory() as session:
+        persisted_user_result = await session.execute(select(User).where(User.id == guest_user_id))
+        persisted_user = persisted_user_result.scalar_one()
+        assert persisted_user.nsfw_enabled is True
+        assert persisted_user.language.value == "ru"
+
+
+async def test_preferences_route_rejects_extra_empty_and_malformed_bodies(
+    auth_client: AsyncClient,
+) -> None:
+    _ = await auth_client.post("/api/v1/auth/guest")
+
+    invalid_payloads: list[object] = [
+        {},
+        {"nsfw_enabled": True, "unknown": "value"},
+        {"nsfw_enabled": "true"},
+        {"nsfw_enabled": None},
+        {"language": None},
+        {"language": "de"},
+    ]
+    for payload in invalid_payloads:
+        response = await auth_client.patch("/api/v1/auth/preferences", json=payload)
+
+        assert response.status_code == 422
+
+
 async def test_logout_route_deletes_cookie_without_bumping_nonce(
     auth_client: AsyncClient,
     postgres_session_factory: async_sessionmaker[AsyncSession],

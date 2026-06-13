@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
 
 from memexpert.models.enums import UserLanguage
 from memexpert.schemas.user import UserRead
@@ -87,6 +87,25 @@ class CurrentSessionRead(BaseModel):
 
     user: UserRead
     linked_providers: LinkedProvidersRead
+
+
+class UserPreferencesUpdateRequest(BaseModel):
+    """Partial authenticated update for user-controlled preferences."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    nsfw_enabled: StrictBool | None = None
+    language: UserLanguage | None = None
+
+    @model_validator(mode="after")
+    def _require_preference_change(self) -> UserPreferencesUpdateRequest:
+        if not self.model_fields_set:
+            raise ValueError("At least one preference field must be supplied.")
+        if "nsfw_enabled" in self.model_fields_set and self.nsfw_enabled is None:
+            raise ValueError("nsfw_enabled cannot be null when supplied.")
+        if "language" in self.model_fields_set and self.language is None:
+            raise ValueError("language cannot be null when supplied.")
+        return self
 
 
 class AccountLinkMergeSummaryRead(BaseModel):
@@ -234,6 +253,7 @@ __all__ = [
     "TelegramLinkStartRead",
     "TelegramMiniAppAuthRequest",
     "TelegramWidgetAuthRequest",
+    "UserPreferencesUpdateRequest",
     "normalize_auth_email",
     "validate_auth_password",
 ]
