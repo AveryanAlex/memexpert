@@ -44,6 +44,7 @@ from memexpert.schemas.meme import (
     MemeSearchScoreRead,
 )
 from memexpert.services import UserService
+from memexpert.services.meme_search import MemeSearchFilters, MemeSearchScope
 from tests.conftest import create_full_user_via_upgrade
 
 if TYPE_CHECKING:
@@ -116,8 +117,25 @@ class FakeMemeSearchService:
         self.page = page
         self.calls: list[dict[str, object]] = []
 
-    async def search_memes(self, query: str, *, limit: int = 20, offset: int = 0) -> MemeSearchPageRead:
-        self.calls.append({"query": query, "limit": limit, "offset": offset})
+    async def search_memes(
+        self,
+        query: str,
+        *,
+        viewer_user_id: uuid.UUID | None = None,
+        filters: MemeSearchFilters | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> MemeSearchPageRead:
+        self.calls.append(
+            {
+                "query": query,
+                "viewer_user_id": viewer_user_id,
+                "scope": filters.scope if filters is not None else None,
+                "include_nsfw": filters.include_nsfw if filters is not None else None,
+                "limit": limit,
+                "offset": offset,
+            }
+        )
         return self.page
 
 
@@ -364,7 +382,16 @@ async def test_inline_plain_text_query_calls_shared_search_service_and_records_q
     finally:
         await bot.session.close()
 
-    assert fake_service.calls == [{"query": "grumpy cat", "limit": 20, "offset": 0}]
+    assert fake_service.calls == [
+        {
+            "query": "grumpy cat",
+            "viewer_user_id": None,
+            "scope": MemeSearchScope.PUBLIC,
+            "include_nsfw": False,
+            "limit": 20,
+            "offset": 0,
+        }
+    ]
     answer = last_inline_answer(telegram_session)
     assert answer.is_personal is False
     assert answer.next_offset == ""
@@ -381,11 +408,61 @@ async def test_inline_plain_text_query_calls_shared_search_service_and_records_q
         )
         inline_usage_events = await session.scalar(select(func.count()).select_from(InlineUsageEvent))
     assert inline_event is not None
-    assert inline_event.payload["telegram_user_hash"] == hashlib.sha256(
-        f"telegram_user:{TELEGRAM_ID}".encode()
-    ).hexdigest()
+    assert (
+        inline_event.payload["telegram_user_hash"]
+        == hashlib.sha256(f"telegram_user:{TELEGRAM_ID}".encode()).hexdigest()
+    )
     assert "telegram_user_id" not in inline_event.payload
     assert inline_usage_events == 0
+
+
+@pytest.mark.asyncio
+async def test_inline_plain_text_query_uses_linked_full_user_scope_and_nsfw_preference(
+    migrated_db_session: AsyncSession,
+    postgres_async_url: str,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    linked_user = User(
+        account_type=AccountType.FULL,
+        status=AccountStatus.ACTIVE,
+        telegram_id=TELEGRAM_ID,
+        nsfw_enabled=True,
+    )
+    migrated_db_session.add(linked_user)
+    meme, file = await create_meme_file(migrated_db_session, media_type=ContentKind.IMAGE, mime_type="image/jpeg")
+    await add_file_id_cache(
+        migrated_db_session,
+        file=file,
+        media_format=TelegramMediaFormat.PHOTO,
+        telegram_file_id="linked-user-cached-photo-id",
+    )
+    await migrated_db_session.commit()
+
+    fake_service = FakeMemeSearchService(search_page_for([(meme, file)]))
+    telegram_session = RecordingTelegramSession()
+    bot = build_bot(build_bot_settings(postgres_async_url), session=telegram_session)
+    dispatcher = build_dispatcher(
+        settings=build_bot_settings(postgres_async_url),
+        session_factory=postgres_session_factory,
+        meme_search_service_factory=lambda session: fake_service,
+    )
+
+    try:
+        await dispatch_inline_query(dispatcher=dispatcher, bot=bot, query="linked scope")
+    finally:
+        await bot.session.close()
+
+    assert fake_service.calls == [
+        {
+            "query": "linked scope",
+            "viewer_user_id": linked_user.id,
+            "scope": MemeSearchScope.ALL,
+            "include_nsfw": True,
+            "limit": 20,
+            "offset": 0,
+        }
+    ]
+    assert last_inline_answer(telegram_session).is_personal is True
 
 
 @pytest.mark.asyncio
@@ -417,7 +494,16 @@ async def test_inline_pagination_uses_offset_and_next_offset(
     finally:
         await bot.session.close()
 
-    assert fake_service.calls == [{"query": "cats", "limit": 20, "offset": 20}]
+    assert fake_service.calls == [
+        {
+            "query": "cats",
+            "viewer_user_id": None,
+            "scope": MemeSearchScope.PUBLIC,
+            "include_nsfw": False,
+            "limit": 20,
+            "offset": 20,
+        }
+    ]
     assert last_inline_answer(telegram_session).next_offset == "40"
 
 
@@ -559,7 +645,9 @@ async def test_inline_uses_injected_media_url_provider_for_private_uncached_medi
     await migrated_db_session.commit()
 
     fake_service = FakeMemeSearchService(search_page_for([(private_meme, private_file)]))
-    media_provider = FakeInlineMediaUrlProvider({"private/original.jpg": "https://storage.example.test/private/original.jpg?sig=1"})
+    media_provider = FakeInlineMediaUrlProvider(
+        {"private/original.jpg": "https://storage.example.test/private/original.jpg?sig=1"}
+    )
     telegram_session = RecordingTelegramSession()
     bot = build_bot(build_bot_settings(postgres_async_url), session=telegram_session)
     dispatcher = build_dispatcher(
@@ -624,7 +712,10 @@ async def test_inline_keeps_public_https_media_sendable_without_media_url_provid
 @pytest.mark.parametrize(
     ("presigned_url", "expected_url"),
     [
-        ("https://storage.example.test/private/original.jpg?sig=1", "https://storage.example.test/private/original.jpg?sig=1"),
+        (
+            "https://storage.example.test/private/original.jpg?sig=1",
+            "https://storage.example.test/private/original.jpg?sig=1",
+        ),
         ("http://storage.example.test/private/original.jpg?sig=1", None),
     ],
 )

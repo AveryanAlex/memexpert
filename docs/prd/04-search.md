@@ -17,6 +17,8 @@ Search must work across both public and user-accessible private content:
 
 The bot and web share the same service-level search contract. Telegram inline search resolves/creates the full account from `telegram_id` first, then searches the user's accessible scope. The bot does not need to visually distinguish public vs private results; the web should subtly indicate private/shared results.
 
+Any cached search candidate pool or result key must include normalized query text, content filters, viewer identity, scope, normalized collection ids, NSFW allowance or user preference, and algorithm/version fields. Cached candidates are only an optimization; final PostgreSQL access filtering still decides what can be returned.
+
 ## Filters
 
 In the website search sidebar, available at launch:
