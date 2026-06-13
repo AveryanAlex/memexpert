@@ -28,12 +28,14 @@ Every meme goes through:
 - **NSFW detection** (filtered by default in search)
 - **Political content detection** (deferred — see [Deferred Features](10-deferred.md))
 - **Language detection** (ru / en / mixed / none)
-- **Popularity scoring** (views, reactions, reposts, platform engagement)
+- **Popularity scoring** (views, impressions, downloads, reactions, reposts, platform engagement)
 - **Template identification** (AI-assigned during SEO generation)
 
 ### SEO Page Content Generation
 
-Async, prioritized by popularity (~2,000 memes/day at ~$60/month). Each meme receives:
+Async, prioritized by popularity. The MVP SEO generation path should be a typed POC using **PydanticAI** with prompts ported from the project's v0 Rust branch as the baseline. Prompt tuning is expected to continue after launch, but the pipeline must already validate structured outputs before persisting.
+
+Each generated meme receives:
 
 - **URL slug** (human-readable, SEO-friendly)
 - **Page title** and **meta description**
@@ -42,11 +44,13 @@ Async, prioritized by popularity (~2,000 memes/day at ~$60/month). Each meme rec
 - **Tags** (for categorization and filtering)
 - **Template assignment** (if the AI recognizes a known meme template)
 
-URL strategy: memes with SEO content → `/meme/{slug}` (indexed). Without → `/meme/{id}` (accessible, not indexed). When SEO content is generated, `/meme/{id}` 301-redirects to `/meme/{slug}`.
+URL strategy: memes with SEO content → `/memes/{slug}` (indexed). Without → `/memes/{id}` (accessible, not indexed). When SEO content is generated, `/memes/{id}` 301-redirects to `/memes/{slug}`.
 
 ### Popularity Tracking
 
-Periodic snapshots track meme popularity over time. This powers:
+Periodic snapshots and/or materialized views track meme popularity over time. Use materialized views where they simplify trend, tag, template, and timeline queries without duplicating business logic in application code.
+
+Popularity tracking powers:
 
 - Popularity charts on meme pages (public)
 - Template and tag-level trend analytics (public)
@@ -54,6 +58,7 @@ Periodic snapshots track meme popularity over time. This powers:
 - "Meme of the day" automated selection
 - Rising memes detection
 - Trending feed
+- Recommendation cold-start fallback
 
 ---
 
@@ -63,7 +68,7 @@ Periodic snapshots track meme popularity over time. This powers:
 
 In V1, a template is a **label, not an editor tool.** It has a name, slug, and links to memes. No base image, no text regions, no editing capability.
 
-Example: the meme template "Drake Hotline Bling" — a page at `/template/drake-hotline-bling` showing all memes in the database that use this template.
+Example: the meme template "Drake Hotline Bling" — a page at `/templates/drake-hotline-bling` showing all memes in the database that use this template.
 
 ### How Templates Are Assigned
 
@@ -71,7 +76,7 @@ AI assigns templates during SEO page content generation. The LLM sees the meme i
 
 ### Template Pages
 
-`/template/{slug}` — always by slug, never by UUID. Contains:
+`/templates/{slug}` — always by slug, never by UUID. Contains:
 
 - Template name and description
 - Gallery of memes using this template (sorted by popularity)

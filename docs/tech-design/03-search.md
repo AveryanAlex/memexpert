@@ -4,44 +4,80 @@
 
 ### Candidate Retrieval
 
-Every search query runs two retrieval paths in parallel:
+Every search query may use several retrieval paths in parallel:
 
-1. **Semantic:** Qdrant returns top candidates ranked by embedding cosine similarity
-2. **Text:** Meilisearch returns top candidates ranked by text relevance (`_rankingScore`, 0–1)
+1. **Semantic:** Qdrant returns top candidates ranked by embedding cosine similarity.
+2. **Text:** Meilisearch returns top candidates ranked by text relevance (`_rankingScore`, 0–1).
+3. **Popularity/trending:** PostgreSQL/materialized views provide fallback and boosting signals.
+4. **Personal recommendations:** Qdrant recommend/search APIs provide user-history candidates for feed surfaces and optional query-independent blending.
 
-Both engines return a fixed-size candidate pool (configurable, default: 200 candidates each). Results are merged by `meme_id` (full outer join — a meme may appear in one or both result sets) and scored:
+Both engines return a fixed-size candidate pool (configurable, default: 200 candidates each). Results are merged by `meme_id` and scored with configurable weights. Example shape:
 
+```text
+combined_score = w_semantic × semantic_score
+               + w_text × text_score
+               + w_popularity × normalized_popularity
+               + w_personal × personal_score
 ```
-combined_score = 0.4 × semantic_score + 0.3 × text_score + 0.3 × normalized_popularity
-```
 
-Memes found by only one engine receive 0 for the missing component. Meilisearch provides native `_rankingScore` (0–1); Qdrant cosine scores are already 0–1. Popularity is min-max normalized from PostgreSQL.
+Weights are **configuration and experiment inputs**, not fixed truth. Every response/log entry that feeds analytics should include `algorithm_version`, active weights, score components, and result attribution.
 
-Weights are hardcoded for launch. Tuning requires A/B testing infrastructure and sufficient traffic volume — deferred post-launch.
+### Access-Aware Search Scope
+
+Search must be user-aware before final display data is returned. The same service contract is used by FastAPI, SvelteKit, Mini App, and aiogram bot.
+
+Scopes:
+
+- `public` / `common`: public catalog only
+- `private`: non-public memes in collections accessible to the current user
+- `all`: public + accessible private/shared collections
+- `collections`: explicit `collection_ids[]` selected by the user
+
+Access control rules:
+
+- Qdrant/Meilisearch can prefilter by payloads where possible (`is_public`, `author_user_id`, collection payload hints), but **PostgreSQL is the final authority**.
+- Candidate IDs from search indexes must be filtered through collection membership/ownership before DTOs are returned.
+- Collection filters are ignored or rejected for unauthenticated users without a guest/full user row.
+- Cache keys, if used, must include user id, scope, collection ids, NSFW flag, and algorithm version to prevent private result leaks.
+
+### Collection Filters
+
+Web search exposes collection filtering:
+
+- public/common only
+- private/shared only
+- all accessible
+- specific selected private/shared collections
+
+Bot inline search normally uses `all` after resolving/creating the Telegram full account. PM/Mini App surfaces may later expose explicit collection selection.
 
 ### Paginating Hybrid Results
 
-True cursor-based pagination is impossible on a score computed from two independent engines — neither engine knows the other's scores, so neither can produce a stable cursor for the merged ranking.
+True cursor-based pagination is hard on a score computed from independent engines because neither engine knows the other's scores.
 
-Solution: **cached candidate pool.**
+Baseline MVP may use bounded offset pagination with over-fetch + deterministic merge/rerank. This is acceptable while candidate pools are small and traffic is low.
 
-1. On the first page request, execute both retrievals, merge, score, sort
-2. Cache the full ordered list of `(meme_id, combined_score)` in Redis (key: `search:{hash(query, filters, user_id)}`, TTL: 60s)
-3. Subsequent page requests read from the cache and slice by offset
+Optional stabilization when ranking becomes more expensive or pagination instability becomes visible: **cached candidate pool**.
 
-When the cache expires or the user scrolls through the entire pool, re-execute the query. The candidate pool size (up to 400 merged candidates — ~16–20 pages at 20–25 items per page) is a practical depth limit; users rarely scroll further. If exhausted, show a "Refine your search" prompt.
+1. On the first page request, execute retrievals, merge, score, sort.
+2. Cache the ordered list of `(meme_id, combined_score, attribution)` in Redis.
+3. Subsequent page requests read from the cache and slice by offset.
 
-### Degraded Mode
+Candidate-pool cache key must include: query, filters, user id, search scope, collection ids, NSFW flag, and `algorithm_version`. TTL should be short (60–120s). This cache is an optimization, not a correctness dependency for the first implementation.
 
-When a circuit breaker trips on one engine, the remaining engine serves results alone with rebalanced weights:
+### Degraded Mode and Fallbacks
 
-| Mode | Weights |
-|------|---------|
-| Normal | semantic 0.4 + text 0.3 + popularity 0.3 |
-| Qdrant down (text-only) | text 0.6 + popularity 0.4 |
-| Meilisearch down (semantic-only) | semantic 0.6 + popularity 0.4 |
+Fallbacks should be explicit and observable, not silent behavior changes. Search responses/logs should record `degraded=true` and missing components when a source is skipped.
 
-In degraded mode, results come from a single engine — standard cursor-based pagination applies directly, no candidate pool needed.
+| Failure | Behavior |
+|---------|----------|
+| Query embedding provider fails | Skip semantic query path; use text + popularity/trending. |
+| Qdrant down | Text + popularity/trending. Similar/recommendation endpoints fall back to tag-related/trending with attribution. |
+| Meilisearch down | Semantic + popularity/trending. Text-specific ranking unavailable. |
+| Both search engines down | Trending/popular materialized view fallback. |
+| Redis down | Recompute; no candidate-pool cache/rate-limit cache. Search correctness should remain intact. |
+
+Circuit breakers can protect Qdrant/Meilisearch/Voyage from repeated failing calls. Exact thresholds are operational config. Reweighting uses the same configurable weight model with missing components zeroed or renormalized.
 
 ## Qdrant
 
@@ -51,7 +87,7 @@ Single collection `meme_files`. One point per MemeFile (only `status = ready` fi
 - **Payload:** meme-level metadata for filtered search — `meme_id`, `is_primary`, `is_public`, `is_nsfw`, `media_type`, `language`, `popularity_score`, `like_count`, `tags`, `author_user_id`, `template_id`, `created_at`
 - **Payload indexes** on all fields used in filtering
 
-Used for: semantic search, similar memes (recommend API), personalized feed (recommend API), deduplication during ingestion (high-threshold similarity search).
+Used for: semantic search, similar memes, personalized feed (recommend API / vector search from positives), and deduplication during ingestion (high-threshold similarity search).
 
 ## Meilisearch
 
@@ -65,25 +101,17 @@ Single index `memes`. One document per Meme.
 
 Search results return `meme_id` lists from Meilisearch/Qdrant, then fetch full display data from PostgreSQL.
 
-## Private Meme Search
-
-Public and private memes live in the same indexes (both Qdrant and Meilisearch). Filtered using OR clauses:
-
-- `is_public = true` OR `author_user_id = {current_user_id}`
-
-This ensures private memes appear only for their owner. API endpoints additionally verify ownership before returning meme details.
-
 ## Search Result Caching
 
-Search results cached in Redis. **Cache key must include `user_id`** alongside query hash and filter hash — otherwise a cached result containing user A's private memes could be served to user B.
+Redis search/candidate caching is optional for MVP. If enabled, cache keys must include user id and every access-shaping filter. It must never be possible for a cached result containing user A's private memes to be served to user B.
 
 ## Sync Strategy
 
 **Event-driven:** The content pipeline publishes `meme_ready` events to a RabbitMQ fanout exchange. Qdrant and Meilisearch sync consumers each bind their own queue, processing independently with retries via dead letter exchanges.
 
 - `meme_ready` → Qdrant consumer syncs embedding + payload; Meilisearch consumer syncs full document
-- Meme-level field changes (popularity, likes, tags) → API publishes `meme_updated` event → both sync consumers update
-- Like count changes → batched sync every 5 minutes via APScheduler (not per-like)
+- Meme-level field changes (popularity, likes, tags, access/publicity) → API publishes update event → both sync consumers update
+- Like count and popularity changes → batched sync via Scheduler (not per-like)
 
 **Full resync:** Uses Qdrant collection aliases for zero-downtime rebuild — create new collection, populate, atomic alias switch, delete old. Same pattern used for embedding model upgrades.
 
@@ -91,26 +119,55 @@ Search results cached in Redis. **Cache key must include `user_id`** alongside q
 
 | Context | Strategy | Details |
 |---------|----------|---------|
-| Search results | Cached candidate pool | See [Hybrid Search](#paginating-hybrid-results) — offset within Redis-cached merged result set |
+| Search results | Offset or optional cached candidate pool | Deterministic merge/rerank; Redis pool added when needed for stable deep pagination |
 | Collection browsing | Cursor-based | `(added_at, meme_id)` |
-| Trending / feeds | Cursor-based | `(score, meme_id)` |
-| Recommendations | Cursor-based | Qdrant offset / page token |
-
-Collections and feeds use cursor-based pagination (single data source, stable ordering). Search results use a cached candidate pool because the merged score cannot be expressed as a cursor in either engine.
+| Trending / feeds | Cursor-based | `(score, meme_id)` or materialized-view rank |
+| Recommendations | Cursor-based/bounded pages | Qdrant recommend/search result pages plus DB access filtering |
 
 ## Recommendations
 
 ### Similar Memes
 
-Qdrant recommend API from a meme's primary file. Filtered to public, primary files only, excluding the source meme.
+Service endpoint/function accepts a source `meme_id`, loads the primary file embedding, queries Qdrant for nearest neighbors, filters by access/NSFW, excludes the source meme, and returns result DTOs with similarity scores and attribution.
+
+Fallback order:
+
+1. Similarity results from Qdrant.
+2. Tag/template-related accessible memes when no embedding/Qdrant is available.
+3. Trending/popular fallback.
 
 ### Personalized Feed
 
-Qdrant recommend API using recent interaction history (up to 20 positive examples). Excludes already-seen memes. Falls back to trending for users without history.
+Recommendation service builds a short-term user preference vector/candidate request from recent positive events:
+
+- strong positives: favorite/like, save, pin, download, Telegram send/chosen inline result
+- medium positives: detail view, repeated view, collection add
+- weak/neutral signals: impression without click, later used for evaluation/reranking
+
+The service calls Qdrant recommend/search APIs using recent positive examples, filters access/NSFW, excludes already-seen or recently-impressed memes where practical, and falls back to trending for cold start.
+
+Personalized recommendations are used:
+
+- on the home page feed;
+- as a small blend in the meme detail related/similar section;
+- as an optional boost in empty-query bot/Mini App discovery.
 
 ### Trending
 
-Uses the trending score from [Content Pipeline: Trending Score](04-content-pipeline.md#trending-score). Precomputed every 5 min, cached in Redis. Default feed for users without interaction history.
+Uses materialized-view backed public trend rankings and popularity snapshots. Default feed for users without interaction history.
+
+## Interaction Attribution
+
+Search/recommendation service should return enough metadata for event tracking:
+
+- request id
+- rank
+- source algorithm/reason
+- source meme id for related sections
+- score and score components
+- query/filter/scope/collection context
+
+Frontend and bot presentation layers must pass this metadata back when recording impressions, views, detail clicks, sends, downloads, saves, and shares.
 
 ## Russian Query Translation
 

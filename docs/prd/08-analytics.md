@@ -4,11 +4,11 @@
 
 ### Per-Meme Analytics
 
-Every meme page shows a public popularity chart (sparkline or expandable). Data: popularity score over time, view count, like count, source count.
+Every meme page shows a public popularity chart (sparkline or expandable). Data: popularity score over time, view count, impression count, download count, like count, source count.
 
 ### Template Analytics
 
-Template pages show aggregate analytics: when the template first appeared, peak popularity, number of memes, current activity level. "Biography of a meme template."
+Template pages show aggregate analytics: when the template first appeared, peak popularity, number of memes, current activity level, and trend history when enough snapshots exist. "Biography of a meme template."
 
 ### Tag/Theme Analytics
 
@@ -46,14 +46,34 @@ Chronological browsing: "Top memes of January 2026," "Memes of 2025." Nostalgia 
 
 ### Events to Track
 
-- **search_query:** query, source (inline/web/miniapp), user_id, result_count, latency_ms, filters
-- **meme_view / meme_send / meme_like / meme_save / meme_pin / meme_upload / meme_download**
+Event tracking is a product requirement because recommendations, ranking evaluation, and analytics depend on it. Events must preserve enough attribution to answer: "where did the user see this meme, why was it shown, what did they do next?"
+
+Core events:
+
+- **search_query:** query, source (inline/web/miniapp), user_id, result_count, latency_ms, filters, collection scope
+- **meme_impression:** meme shown on screen/web feed or returned in a Telegram inline result; includes rank, surface, request/impression id, algorithm/source, score components
+- **meme_view:** detail page opened or PM/detail view shown
+- **meme_detail_click:** user clicked from a feed/search/related block to a meme detail page
+- **meme_send / inline_chosen / inline_sent**
+- **meme_like / meme_save / meme_pin / meme_upload / meme_download / meme_share**
 - **collection_create / collection_invite / collection_join / bulk_action**
 - **meme_report**
 - **auth_event / account_merge**
 - **miniapp_open**
 - **channel_suggest:** user_id, channel_url
 - **inline_viral_tracking:** group_id (hashed), unique users from same group over time
+
+Required attribution fields where applicable:
+
+- `surface`: `web_home`, `web_search`, `web_related`, `web_collection`, `web_profile`, `telegram_inline`, `telegram_pm`, `miniapp`
+- `source_algorithm`: `search`, `similarity`, `tag_related`, `personalized`, `trending`, `motd`, `collection`, `fallback`
+- `source_meme_id`: source meme when a result appears under related/similar memes
+- `query`, `filters`, `collection_id`, `rank`, `score`, `score_components`, `reason`
+- `request_id` and/or `impression_id` so later clicks/downloads can be tied back to the result that exposed the meme
+
+### Recommendation Signals
+
+Recommendation service consumes positive interaction history. Download, save/favorite, pin, send/chosen-inline are strong positives; detail view is medium; impression without click is stored for future ranking/evaluation but should be weak or neutral initially.
 
 ### Viral Analytics
 

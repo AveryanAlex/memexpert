@@ -4,10 +4,13 @@
 
 `@memexpertbot <query>` in any chat.
 
-- Scrollable grid of thumbnails, pagination on scroll
+- First inline query resolves the Telegram user by `telegram_id`; if no user exists, a full account is created automatically.
+- Searches public memes plus the user's accessible private/shared collections.
+- Scrollable grid of thumbnails, pagination on scroll.
 - Tap → sends as photo (images) or animation (GIFs). Sent as a plain image, no buttons, no branding.
-- Videos excluded from inline
-- Empty query: pins → recent sends → trending (full accounts); trending only (guests)
+- Videos excluded from inline.
+- Empty query: pins → personalized/recent sends → trending (full accounts); trending only until enough personal history exists.
+- Inline impressions and chosen/sent results are tracked for analytics and recommendations.
 
 MVP implementation note: inline answers can reuse cached Telegram Bot API `file_id`s and public HTTPS media URLs. First-send upload from private object storage is deferred until the bot has a presigned/public media URL or a proactive upload/cache warmup path.
 
@@ -21,11 +24,13 @@ Auto-creates full account on first interaction.
 - **Pins:** add, remove, reorder (up to 20)
 - **Active save collection:** set which collection receives forwarded memes (default: Favorites)
 - **Collections:** create, browse, delete, manage members via invite links
+- **Collection invites:** create invite links, accept invite links, list membership role where useful
 - **Upload:** send image → saved to active collection
+- **Search:** public + accessible private/shared collections
 - **Settings:** NSFW default, language
 - **Suggest channel:** form to submit a channel for crawling review
 - **Account linking:** link web account, view linked providers
-- **User stats:** fun statistics (memes sent, saved, days active, favorite tag/template)
+- **User stats:** fun statistics (memes sent, saved, downloaded, days active, favorite tag/template)
 
 ## Quick Save
 
@@ -42,14 +47,14 @@ Website registered as TG Mini App, accessible via:
 
 Provides:
 
-- Full collection management with bulk actions
+- Same SvelteKit frontend shell as the website, adapted to Telegram viewport/theme where needed
+- Seamless auth via Telegram `initData`, creating/resolving a full account
+- Full collection management with bulk actions and invites
 - Meme browsing with personalized feed
-- Search with filters
-- All content visible (including sensitive political — no web restrictions apply)
+- Search with filters, including collection scope
+- All content visible according to user settings (including content that may later be hidden on the public web by sensitivity policy)
 - Meme editor (V2)
 - User stats
-
-Auth via Telegram `initData` — seamless.
 
 ## Share from Website
 

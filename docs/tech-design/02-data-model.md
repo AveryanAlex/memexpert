@@ -21,7 +21,11 @@ Embeddings live in a separate cache table, not on MemeFile. This decouples embed
 
 ### User
 
-Account for both guest (website) and full (Telegram/linked) users. Key fields: `account_type` (guest/full), `status` (active/deletion_pending/deleted), `telegram_id`, `google_id`, `email`, `password_hash`, `active_save_collection_id`, `nsfw_enabled`, `language`.
+Account for both guest (website) and full (Telegram/linked) users. Key fields: `account_type` (guest/full), `status`, `telegram_id`, `google_id`, `email`, `password_hash`, `active_save_collection_id`, `nsfw_enabled`, `language`, `token_nonce`.
+
+`token_nonce` is the server-side revocation primitive for cookie-backed access/session JWTs. Refresh-token rows are not part of the current auth design.
+
+Deletion-related fields may exist as schema placeholders, but user-initiated account deletion/export is deferred from MVP.
 
 ### Meme
 
@@ -33,7 +37,7 @@ A specific media file belonging to a meme. Key fields: `meme_id` (FK → Meme), 
 
 ### MemeSeoPage
 
-1:1 with Meme. Generated async by LLM. Key fields: `slug` (unique, URL-safe), `page_title`, `meta_description`, `alt_text`, `caption`, `body_text`, `tags[]`, `model_id` (LiteLLM model identifier, e.g. `gemini/gemini-2.5-flash`), `prompt_version` (e.g. `seo-v3`), `generated_at`, `edited_at` (nullable — set when admin edits).
+1:1 with Meme. Generated async by a PydanticAI-backed provider. Key fields: `slug` (unique, URL-safe), `page_title`, `meta_description`, `alt_text`, `caption`, `body_text`, `tags[]`, `model_id`, `prompt_version`, `generated_at`, `edited_at` (nullable — set when admin edits).
 
 ### MemeTemplate
 
@@ -41,7 +45,7 @@ Template label (V1 — no editor, but schema is V2-ready). Key fields: `slug` (u
 
 ### MemePopularitySnapshot
 
-Periodic snapshots for historical charts. Key fields: `meme_id`, `timestamp`, source metrics (views, reactions, source_count), platform metrics (views, sends, saves, likes), `popularity_score`.
+Periodic snapshots for historical charts and materialized-view refreshes. Key fields: `meme_id`, `timestamp`, source metrics (views, reactions, source_count), platform metrics (impressions, views, sends, saves, downloads, likes), `popularity_score`.
 
 ### MemeSource
 
@@ -59,11 +63,15 @@ User-submitted channel suggestions. Key fields: `user_id`, `platform`, `channel_
 
 ### Collection
 
-Every account has auto-created Favorites (not deletable). Full accounts can create additional collections. Key fields: `owner_id`, `title`, `is_favorites`, `invite_link`.
+Every account has auto-created Favorites (not deletable). Full accounts can create additional private collections. Key fields: `owner_id`, `title`, `is_favorites`, visibility/internal flags.
 
 ### CollectionMember
 
-Composite PK: `(collection_id, user_id)`. Role: owner/editor/viewer.
+Composite PK: `(collection_id, user_id)`. Role: owner/editor/viewer. Search and browsing access are derived from this table.
+
+### CollectionInvite
+
+Reusable invite record for a collection. Key fields: `collection_id`, `token_hash` or opaque code, `role`, `created_by_user_id`, `expires_at`, `revoked_at`, `max_uses`, `uses_count`. Invites are consumed by web, bot PM, and Mini App deep links.
 
 ### CollectionMeme
 
@@ -88,21 +96,35 @@ Design notes:
 - `model_version` enables future model upgrades: recompute with new model, keep both, switch Qdrant atomically.
 - Text query embeddings act as a query cache — intentionally no eviction, as the table size is bounded by unique query volume.
 
-### RefreshToken
-
-Tracks active refresh tokens for JWT auth. Key fields: `user_id`, `token_hash` (SHA256, unique), `device_info`, `expires_at`, `revoked_at`.
-
 ### AccountMergeLog
 
-Audit trail for guest → full account merges. Key fields: `guest_account_id`, `target_account_id`, `favorites_transferred`, `views_transferred`.
+Audit trail for guest → full account merges. Key fields: `guest_account_id`, `target_account_id`, `favorites_transferred`, `views_transferred`, `interaction_events_transferred`, `inline_usage_events_transferred`.
 
 ### AccountDeletionLog
 
-Audit trail for account deletions. Key fields: `user_id` (not FK — user row is deleted), `action` (deletion_requested/grace_period_expired/hard_deleted/cancelled), `details` (JSON).
+Deferred/reserved. If present, it is a schema placeholder for a future account deletion flow; MVP does not require user-facing deletion/export behavior or scheduled hard delete jobs.
 
 ### AnalyticsEvent
 
-General-purpose event tracking table. Key fields: `user_id`, `event_type` (search_query/meme_view/meme_send/meme_like/meme_save/etc.), `payload` (JSON — event-specific data), `timestamp`. Schema to be designed during implementation based on analytics requirements.
+General-purpose product analytics event stream. Key fields: `user_id`, `event_type`, `payload` (JSON — event-specific data), `occurred_at`.
+
+### MemeInteractionEvent
+
+Append-only, recommendation-oriented interaction stream. This may be implemented as a dedicated table or as a strict subtype/schema on `AnalyticsEvent`, but the contract must support efficient reads by user and meme.
+
+Key fields:
+
+- `user_id` (nullable only for truly anonymous telemetry; normal web guests have users)
+- `meme_id`
+- `event_type` (`impression`, `view`, `detail_click`, `download`, `favorite`, `save`, `pin`, `share`, `inline_served`, `inline_chosen`, `send`, etc.)
+- `surface` (`web_home`, `web_search`, `web_related`, `web_collection`, `telegram_inline`, `telegram_pm`, `miniapp`)
+- `source_algorithm` (`search`, `similarity`, `personalized`, `tag_related`, `trending`, `motd`, `collection`, `fallback`)
+- `source_meme_id` for related/similar flows
+- `collection_id`, `query`, `rank`, `score`, `score_components`, `reason`
+- `request_id` / `impression_id`
+- `occurred_at`
+
+Indexes: `(user_id, occurred_at)`, `(meme_id, occurred_at)`, `(event_type, occurred_at)`, and optionally `(request_id)` / `(impression_id)` for attribution joins.
 
 ### InlineUsageEvent
 

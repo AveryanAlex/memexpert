@@ -79,7 +79,7 @@ raw_meme ──→ [Ingest & pHash Dedup] ──→ meme_created
 | `q.classify` | CPU-light | NSFW detection, language classification from OCR text |
 | `q.sync.qdrant` | I/O-bound (Qdrant) | Vector + payload sync |
 | `q.sync.meili` | I/O-bound (Meilisearch) | Document sync |
-| `q.seo` | API-bound (LiteLLM) | SEO page generation, template assignment (prioritized by popularity) |
+| `q.seo` | API-bound (PydanticAI provider) | SEO page generation, tag/template assignment (prioritized by popularity) |
 
 Each queue has a configurable prefetch count to control concurrency per worker process.
 
@@ -109,10 +109,14 @@ RabbitMQ dead letter exchanges (DLX) handle failures. Messages exceeding max ret
 
 Tasks that run on a schedule (not event-driven) are managed by APScheduler in a dedicated process:
 
-- Popularity snapshot computation (every 6h)
-- Like count reconciliation (every 5 min)
-- Guest account cleanup (daily)
-- Trending recomputation (every 5 min)
+- Public trend materialized-view refresh (e.g. every 5 min or adaptive)
+- Popularity snapshot computation (initially every 6h; tune after observing traffic)
+- Like count / popularity sync to search indexes (batched, not per-like)
+- Trending recomputation if not fully covered by materialized views
+- Meme of the Day selection/cache refresh
+- Scheduled SEO generation batches prioritized by popularity/backlog
+
+Guest TTL/deletion jobs are intentionally not part of the current product direction.
 
 ### OCR Pipeline
 
@@ -141,17 +145,18 @@ When multiple files belong to one meme, the primary file is selected by `quality
 
 ## SEO Generation
 
-### LLM Integration
+### PydanticAI Integration
 
-All LLM calls go through **LiteLLM**, providing a unified interface to swap models without code changes. The model is expected to change frequently as pricing and quality evolve.
+SEO generation goes through a typed provider boundary built on **PydanticAI**. The baseline prompt set should be ported from the project's v0 Rust branch, then tuned iteratively after enough generated pages can be reviewed.
 
-- **Baseline model:** Gemini Flash 2.5 (tested, good quality/cost ratio for this task)
-- **Model selection:** configured per environment, not hardcoded
-- **Provenance tracking:** every `MemeSeoPage` stores `model_id` (e.g., `gemini/gemini-2.5-flash`) and `prompt_version` (e.g., `seo-v3`) so pages can be filtered by which model/prompt produced them
+- **Baseline provider:** configured per environment through PydanticAI-compatible model settings.
+- **Prompt baseline:** v0 Rust prompts are the starting point; prompt tuning is explicitly expected later.
+- **Structured output:** provider returns a Pydantic model with title, meta description, alt text, caption, body text, tags, template fields.
+- **Provenance tracking:** every `MemeSeoPage` stores `model_id` and `prompt_version` so pages can be filtered by which model/prompt produced them.
 
 ### Auto-Generation
 
-LLM-based, async, prioritized by popularity score (~2,000 memes/day at ~$60/month budget). Each meme receives: URL slug, page title, meta description, alt text, caption, body text (2–4 paragraphs), tags, template assignment. No output validation — LLM output is stored as-is.
+Async, prioritized by popularity/backlog. Each meme receives: URL slug, page title, meta description, alt text, caption, body text (2–4 paragraphs), tags, template assignment. Output is validated structurally before persistence; quality still depends on prompt tuning and later manual/admin review.
 
 ### Admin Editing
 
@@ -160,11 +165,11 @@ Admins can edit SEO pages through:
 - **Manual edit:** direct field editing in admin UI
 - **AI-assisted edit:** "Edit with AI" — admin selects fields, optionally provides instructions, LLM regenerates selected fields. Admin reviews and confirms before saving.
 
-Bulk regeneration of pages is out of scope. Individual re-generation is a special case of AI-assisted edit (select all fields, no custom instructions).
+Bulk regeneration of pages is out of scope for the first SEO POC. Individual re-generation is a special case of AI-assisted edit (select all fields, no custom instructions).
 
 ### URL Strategy
 
-Memes with SEO content → `/meme/{slug}` (indexed). Without → `/meme/{id}` (accessible, not indexed). When SEO is generated, `/meme/{id}` 301-redirects to `/meme/{slug}`.
+Memes with SEO content → `/memes/{slug}` (indexed). Without → `/memes/{id}` (accessible, not indexed). When SEO is generated, `/memes/{id}` 301-redirects to `/memes/{slug}`.
 
 ### Template Assignment
 
@@ -174,33 +179,35 @@ LLM identifies known templates from image during SEO generation. Fuzzy-matched a
 
 ### Static Popularity
 
-A baseline score reflecting a meme's cumulative engagement. Computed every 6h, stored as snapshots for historical charts. Updated scores synced to Qdrant and Meilisearch in batch.
+A baseline score reflecting a meme's cumulative engagement. Computed on a schedule and stored as snapshots/materialized aggregates for historical charts. Updated scores synced to Qdrant and Meilisearch in batch.
 
-```
-popularity = log(1 + source_views) × 0.3
-           + log(1 + source_reactions) × 0.2
-           + log(1 + source_reposts) × 0.2
-           + log(1 + platform_sends) × 0.15
-           + log(1 + platform_likes) × 0.1
-           + log(1 + platform_saves) × 0.05
+```text
+popularity = log(1 + source_views) × source_view_weight
+           + log(1 + source_reactions) × source_reaction_weight
+           + log(1 + source_reposts) × source_repost_weight
+           + log(1 + platform_sends) × send_weight
+           + log(1 + platform_likes) × like_weight
+           + log(1 + platform_saves) × save_weight
+           + log(1 + platform_downloads) × download_weight
+           + log(1 + platform_views) × view_weight
 ```
 
-Logarithmic scaling prevents viral outliers from dominating. Weights are initial values — tuning deferred post-launch alongside search ranking weights.
+Logarithmic scaling prevents viral outliers from dominating. Weights are tunable configuration, not product truth.
 
 ### Trending Score
 
-Measures recent growth velocity. Computed every 5 min, cached in Redis.
+Measures recent growth velocity. Prefer materialized views for rankings and aggregate trend surfaces when they simplify reads.
 
-```
+```text
 trending = (engagement_last_24h - engagement_prev_24h) / (engagement_prev_24h + k)
 ```
 
-Where `engagement` = weighted sum of sends, saves, likes, views, new source appearances over the window. `k = 10` dampens noise from low-volume memes (a meme going from 1 to 3 interactions shouldn't rank higher than one going from 100 to 200).
+Where `engagement` = weighted sum of sends, saves, downloads, likes, views, impressions, and new source appearances over the window. `k` dampens noise from low-volume memes.
 
 ### Meme of the Day
 
-Highest `trending` score over a 24h window. Cached in Redis (1h TTL). Recomputed alongside trending.
+Selected on a schedule from recent high-quality, non-NSFW candidates using trending/popularity growth and novelty. Store/cache the selected meme with provenance (`selected_at`, score inputs, algorithm_version). Recompute at least daily; refresh cache more often if the selection window changes.
 
 ## Like System
 
-Like = add to Favorites collection. Unlike = remove. `like_count` on Meme is denormalized — incremented/decremented synchronously in PostgreSQL on every like/unlike (single `UPDATE`, negligible cost). The user sees the updated count immediately (read-your-writes). Periodic reconciliation job fixes any drift. Like count changes synced to search indexes in batches (every 5 minutes), not per-like.
+Like = add to Favorites collection. Unlike = remove. `like_count` on Meme is denormalized — incremented/decremented synchronously in PostgreSQL on every like/unlike (single `UPDATE`, negligible cost). The user sees the updated count immediately (read-your-writes). Periodic reconciliation job fixes any drift. Like count changes synced to search indexes in batches, not per-like.
