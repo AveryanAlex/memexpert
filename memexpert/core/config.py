@@ -125,6 +125,13 @@ class Settings(BaseSettings):
     pipeline_fake_classification_nsfw_score: float = Field(default=0.0, ge=0.0, le=1.0)
     pipeline_classification_timeout_seconds: float = Field(default=15.0, gt=0.0, le=600.0)
     pipeline_classification_nsfw_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    pipeline_seo_provider_mode: Literal["static", "live"] = "static"
+    pipeline_seo_model: str = Field(default="gpt-5-mini", min_length=1, max_length=255)
+    pipeline_seo_api_base_url: str | None = None
+    pipeline_seo_api_key: SecretStr | None = None
+    pipeline_seo_timeout_seconds: float = Field(default=30.0, gt=0.0, le=600.0)
+    pipeline_seo_max_attempts: int = Field(default=2, ge=1, le=16)
+    pipeline_seo_prompt_version: str = Field(default="meme-seo-v1", min_length=1, max_length=64)
     pipeline_worker_fail_transcode_for_meme_file_id: str | None = None
     pipeline_worker_fail_embed_for_meme_file_id: str | None = None
     pipeline_worker_fail_classify_for_meme_file_id: str | None = None
@@ -220,7 +227,7 @@ class Settings(BaseSettings):
             raise ValueError("imgproxy_base_url must not be blank.")
         return normalized_value
 
-    @field_validator("imgproxy_key", "imgproxy_salt", mode="before")
+    @field_validator("imgproxy_key", "imgproxy_salt", "pipeline_seo_api_key", mode="before")
     @classmethod
     def _normalize_optional_secret_text(cls, value: object) -> object:
         if value is None:
@@ -231,7 +238,7 @@ class Settings(BaseSettings):
         normalized_value = raw_value.strip()
         return normalized_value or None
 
-    @field_validator("media_public_base_url", mode="before")
+    @field_validator("media_public_base_url", "pipeline_seo_api_base_url", mode="before")
     @classmethod
     def _normalize_optional_base_url_or_path(cls, value: object) -> object:
         if value is None:
@@ -318,6 +325,8 @@ class Settings(BaseSettings):
         "pipeline_qdrant_collection_name",
         "pipeline_meilisearch_index_name",
         "pipeline_classification_model",
+        "pipeline_seo_model",
+        "pipeline_seo_prompt_version",
         mode="before",
     )
     @classmethod

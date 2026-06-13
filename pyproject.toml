@@ -20,6 +20,7 @@ dependencies = [
     "imagehash>=4.3.2",
     "meilisearch-python-sdk>=7.1.2",
     "pillow>=12.2.0",
+    "pydantic-ai-slim[openai]>=1.107.0",
     "pydantic-settings>=2.13.1",
     "pyjwt>=2.12.1",
     "python-multipart>=0.0.24",

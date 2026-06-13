@@ -80,11 +80,15 @@ from memexpert.services.errors import (
 )
 from memexpert.services.meme_search import MemeNotFoundError, MemeSearchFilters, MemeSearchScope, MemeSearchService
 from memexpert.services.meme_seo import (
+    SEO_PROMPT_BASELINE,
     MemeSeoGenerationResult,
     MemeSeoGenerationService,
     MemeSeoProviderProtocol,
     MemeSeoProviderResult,
+    MemeSeoStructuredOutput,
+    PydanticAIMemeSeoProvider,
     StaticMemeSeoProvider,
+    build_meme_seo_provider,
 )
 from memexpert.services.provider_auth_service import ProviderAuthService
 from memexpert.services.report import MemeReportService, MemeReportServiceError, MemeReportTargetNotVisibleError
@@ -148,9 +152,12 @@ __all__ = [
     "MemeSeoGenerationService",
     "MemeSeoProviderProtocol",
     "MemeSeoProviderResult",
+    "MemeSeoStructuredOutput",
     "MemeReportService",
     "MemeReportServiceError",
     "MemeReportTargetNotVisibleError",
+    "PydanticAIMemeSeoProvider",
+    "SEO_PROMPT_BASELINE",
     "StaticMemeSeoProvider",
     "MissingTokenError",
     "PipelineIngestError",
@@ -179,5 +186,6 @@ __all__ = [
     "UserService",
     "UserServiceError",
     "UserStateMismatchError",
+    "build_meme_seo_provider",
     "normalize_channel_suggestion",
 ]
