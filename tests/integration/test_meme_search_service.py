@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from fastapi import FastAPI
@@ -109,12 +109,46 @@ class FakeSeoProvider:
         return self._payloads.pop(0)
 
 
+class FakeSeoObjectProvider:
+    model_id = "fake-seo-model"
+    prompt_version = "seo-test-v1"
+
+    def __init__(self, payloads: list[object]) -> None:
+        self._payloads = payloads
+        self.calls: list[uuid.UUID] = []
+
+    async def generate(self, meme: Meme) -> MemeSeoProviderResult:
+        self.calls.append(meme.id)
+        return cast("MemeSeoProviderResult", self._payloads.pop(0))
+
+
 class FailingSeoProvider:
     model_id = "fake-failing-model"
     prompt_version = "seo-test-v1"
 
+    def __init__(self) -> None:
+        self.calls: list[uuid.UUID] = []
+
     async def generate(self, meme: Meme) -> MemeSeoProviderResult:
+        self.calls.append(meme.id)
         raise RuntimeError("provider-secret-seo-failure")
+
+
+class FlakySeoProvider:
+    model_id = "fake-flaky-model"
+    prompt_version = "seo-test-v1"
+
+    def __init__(self, *, failures_before_success: int, payload: MemeSeoProviderResult) -> None:
+        self._remaining_failures = failures_before_success
+        self._payload = payload
+        self.calls: list[uuid.UUID] = []
+
+    async def generate(self, meme: Meme) -> MemeSeoProviderResult:
+        self.calls.append(meme.id)
+        if self._remaining_failures > 0:
+            self._remaining_failures -= 1
+            raise RuntimeError("provider-secret-transient-seo-failure")
+        return self._payload
 
 
 async def _create_meme(
@@ -725,7 +759,7 @@ async def test_seo_generation_stores_prompt_evidence_unique_slugs_tags_and_templ
                 alt_text="Frog wizard reaction image",
                 caption="Frog wizard",
                 body_text="A wizard frog casts a spell.",
-                tags=("frog", "wizard", "frog"),
+                tags=(" Frog ", "wizard", "frog"),
                 template_slug="wizard-frog",
                 template_name="Wizard Frog",
                 template_description="Frog wizard image macro template.",
@@ -814,14 +848,153 @@ async def test_seo_provider_failure_returns_failed_without_raw_error_or_page(
     migrated_db_session: AsyncSession,
 ) -> None:
     meme = await _create_meme(migrated_db_session)
-    service = MemeSeoGenerationService(migrated_db_session, provider=FailingSeoProvider())
+    provider = FailingSeoProvider()
+    service = MemeSeoGenerationService(migrated_db_session, provider=provider, provider_max_attempts=2)
 
     result = await service.generate_for_meme_id(meme.id, commit=False)
 
     assert result.status == "failed"
     assert result.reason == "provider_error"
     assert "provider-secret" not in repr(result)
+    assert provider.calls == [meme.id, meme.id]
     assert await migrated_db_session.get(MemeSeoPage, meme.id) is None
+
+
+async def test_seo_generation_accepts_v0_alias_payload_safely(
+    migrated_db_session: AsyncSession,
+) -> None:
+    meme = await _create_meme(migrated_db_session, tags=["frog"], ocr_text="wizard frog")
+    provider = FakeSeoObjectProvider(
+        [
+            {
+                "title": "Wizard Frog",
+                "description": "A wizard frog meme.",
+                "subtitle": "Wizard frog reaction image",
+                "text_on_meme": "THIS SHOULD NOT PERSIST",
+                "slug": "wizard frog",
+                "tags": ["frog", "magic"],
+            }
+        ],
+    )
+    service = MemeSeoGenerationService(migrated_db_session, provider=provider)
+
+    result = await service.generate_for_meme_id(meme.id, commit=False)
+
+    assert result.status == "generated"
+    page = await migrated_db_session.get(MemeSeoPage, meme.id)
+    assert page is not None
+    assert page.page_title == "Wizard Frog"
+    assert page.meta_description == "A wizard frog meme."
+    assert page.alt_text == "Wizard frog reaction image"
+    assert page.caption == "Wizard frog reaction image"
+    assert page.body_text is None
+    assert page.slug == "wizard-frog"
+    assert page.tags == ["frog", "magic"]
+
+
+async def test_seo_generation_rejects_invalid_tag_payload_without_creating_page(
+    migrated_db_session: AsyncSession,
+) -> None:
+    meme = await _create_meme(migrated_db_session, tags=["frog"])
+    service = MemeSeoGenerationService(
+        migrated_db_session,
+        provider=FakeSeoObjectProvider(
+            [
+                {
+                    "page_title": "Wizard Frog",
+                    "meta_description": "A wizard frog meme.",
+                    "alt_text": "Wizard frog reaction image",
+                    "tags": {"frog": "magic"},
+                }
+            ],
+        ),
+    )
+
+    result = await service.generate_for_meme_id(meme.id, commit=False)
+
+    assert result.status == "failed"
+    assert result.reason == "invalid_output"
+    assert await migrated_db_session.get(MemeSeoPage, meme.id) is None
+
+
+async def test_seo_generation_retries_transient_provider_failures_before_success(
+    migrated_db_session: AsyncSession,
+) -> None:
+    meme = await _create_meme(migrated_db_session, tags=["frog"], ocr_text="wizard frog")
+    provider = FlakySeoProvider(
+        failures_before_success=2,
+        payload=MemeSeoProviderResult(
+            slug="wizard frog",
+            page_title="Wizard Frog",
+            meta_description="A wizard frog meme.",
+            alt_text="Wizard frog meme image",
+            tags=("frog", "magic"),
+        ),
+    )
+    service = MemeSeoGenerationService(migrated_db_session, provider=provider, provider_max_attempts=3)
+
+    result = await service.generate_for_meme_id(meme.id, commit=False)
+
+    assert result.status == "generated"
+    assert result.slug == "wizard-frog"
+    assert provider.calls == [meme.id, meme.id, meme.id]
+    page = await migrated_db_session.get(MemeSeoPage, meme.id)
+    assert page is not None
+    assert page.page_title == "Wizard Frog"
+
+
+async def test_seo_generation_rejects_invalid_provider_output_without_updating_existing_page(
+    migrated_db_session: AsyncSession,
+) -> None:
+    meme = await _create_meme(migrated_db_session, tags=["frog"])
+    existing_generated_at = datetime.now(UTC) - timedelta(days=1)
+    migrated_db_session.add(
+        MemeSeoPage(
+            meme_id=meme.id,
+            slug="existing-slug",
+            page_title="Existing title",
+            meta_description="Existing description",
+            alt_text="Existing alt text",
+            caption="Existing caption",
+            body_text="Existing body text",
+            tags=["existing"],
+            model_id="existing-model",
+            prompt_version="existing-v1",
+            generated_at=existing_generated_at,
+        ),
+    )
+    await migrated_db_session.flush()
+    service = MemeSeoGenerationService(
+        migrated_db_session,
+        provider=FakeSeoObjectProvider(
+            [
+                {
+                    "page_title": "Replacement title",
+                    "meta_description": "Replacement description",
+                    "alt_text": "Replacement alt text",
+                    "template_slug": "replacement-template",
+                    "template_description": "Replacement template description",
+                },
+            ],
+        ),
+    )
+
+    result = await service.generate_for_meme_id(meme.id, force=True, commit=False)
+
+    assert result.status == "failed"
+    assert result.reason == "invalid_output"
+    page = await migrated_db_session.get(MemeSeoPage, meme.id)
+    assert page is not None
+    assert page.slug == "existing-slug"
+    assert page.page_title == "Existing title"
+    assert page.meta_description == "Existing description"
+    assert page.alt_text == "Existing alt text"
+    assert page.caption == "Existing caption"
+    assert page.body_text == "Existing body text"
+    assert page.tags == ["existing"]
+    assert page.model_id == "existing-model"
+    assert page.prompt_version == "existing-v1"
+    assert page.generated_at == existing_generated_at
 
 
 async def test_slug_route_uuid_route_and_id_to_slug_metadata_return_seo_fields(

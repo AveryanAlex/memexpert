@@ -153,6 +153,8 @@ SEO generation goes through a typed provider boundary built on **PydanticAI**. T
 - **Prompt baseline:** v0 Rust prompts are the starting point; prompt tuning is explicitly expected later.
 - **Structured output:** provider returns a Pydantic model with title, meta description, alt text, caption, body text, tags, template fields.
 - **Provenance tracking:** every `MemeSeoPage` stores `model_id` and `prompt_version` so pages can be filtered by which model/prompt produced them.
+- **Current runtime inputs:** the Python backend currently passes OCR text, existing tags, language, and current template metadata only. It does not pass image bytes yet, so providers must not invent image-only details.
+- **Current provenance caveat:** the existing schema stores `model_id`, `prompt_version`, `generated_at`, and `edited_at`, but not full raw prompt/response captures. This POC preserves that schema instead of adding a migration.
 
 ### Auto-Generation
 

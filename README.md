@@ -34,6 +34,8 @@ Important runtime variables:
 - `S3_ENDPOINT`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_BUCKET`, `S3_REGION`: object storage.
 - `IMGPROXY_BASE_URL`, `IMGPROXY_KEY`, `IMGPROXY_SALT`: media URL generation and imgproxy signing.
 - `PIPELINE_OPERATOR_TOKEN`: backend operator token for pipeline admin/smoke endpoints.
+- `PIPELINE_SEO_PROVIDER_MODE`: `static` by default for safe local runs; switch to `live` to enable the PydanticAI/OpenAI-compatible SEO provider.
+- `PIPELINE_SEO_MODEL`, `PIPELINE_SEO_API_BASE_URL`, `PIPELINE_SEO_API_KEY`, `PIPELINE_SEO_TIMEOUT_SECONDS`, `PIPELINE_SEO_MAX_ATTEMPTS`, `PIPELINE_SEO_PROMPT_VERSION`: SEO structured-output provider settings.
 - `AUTH_JWT_SECRET`: signing secret for auth cookies and tokens.
 - `SECURITY_CORS_ALLOWED_ORIGINS`: comma-separated browser origins allowed to call the API.
 - `API_BASE_URL`: private backend URL used by the SvelteKit Node server.
@@ -86,6 +88,21 @@ uv run ruff check .
 uv run mypy .
 uv run pytest -v
 ```
+
+## SEO Structured Output
+
+The backend SEO POC keeps local development secret-free by default:
+
+- `PIPELINE_SEO_PROVIDER_MODE=static` uses the no-network fallback provider.
+- `PIPELINE_SEO_PROVIDER_MODE=live` enables the OpenAI-compatible PydanticAI provider and requires `PIPELINE_SEO_API_KEY`.
+- `PIPELINE_SEO_API_BASE_URL` is optional; leave it blank to use the provider default, or set it for an OpenAI-compatible gateway.
+- `PIPELINE_SEO_MAX_ATTEMPTS` bounds transient provider retries at the service layer.
+
+Prompt provenance notes:
+
+- The baseline prompt in `memexpert/services/meme_seo.py` is derived from the v0 Rust branch prompt at `v0:prompts/meta.md` and its structured schema in `v0:src/ai.rs`.
+- The current Python backend does not pass image bytes into SEO generation yet. Live generation only sees OCR text, existing tags, language, and current template metadata, so output quality is intentionally bounded until image-aware inputs are added in a later phase.
+- Current DB provenance remains limited to `model_id`, `prompt_version`, `generated_at`, and `edited_at`; this POC does not add a richer provenance migration.
 
 Run the frontend locally:
 

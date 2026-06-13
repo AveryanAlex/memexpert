@@ -35,6 +35,8 @@ Every meme goes through:
 
 Async, prioritized by popularity. The MVP SEO generation path should be a typed POC using **PydanticAI** with prompts ported from the project's v0 Rust branch as the baseline. Prompt tuning is expected to continue after launch, but the pipeline must already validate structured outputs before persisting.
 
+Current POC quality caveat: the backend SEO generator currently works from OCR text, existing tags, language, and template metadata, not raw image bytes. The prompt and provider must stay grounded in those available facts until image-aware inputs are added later.
+
 Each generated meme receives:
 
 - **URL slug** (human-readable, SEO-friendly)
