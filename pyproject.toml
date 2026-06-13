@@ -12,6 +12,7 @@ dependencies = [
     "aiogram>=3.27.0",
     "alembic>=1.18.4",
     "asyncpg>=0.31.0",
+    "apscheduler>=3.11.0",
     "bcrypt>=5.0.0",
     "boto3>=1.42.83",
     "fastapi>=0.135.3",
@@ -46,6 +47,7 @@ memexpert-api = "memexpert.api.main:main"
 memexpert-admin-users = "scripts.admin_users:main"
 memexpert-analytics = "scripts.analytics:main"
 memexpert-bot = "memexpert.bot.main:main"
+memexpert-scheduler = "memexpert.scheduler.main:main"
 memexpert-workers = "memexpert.workers.main:main"
 
 [tool.ruff]

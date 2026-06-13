@@ -109,6 +109,28 @@ def test_settings_parse_pipeline_contract_and_normalize_object_prefixes() -> Non
     assert broker_settings.dead_letter_routing_key == "pipeline.dead_letter"
 
 
+def test_settings_parse_scheduler_contracts() -> None:
+    settings = Settings.model_validate(
+        {
+            "scheduler_materialized_view_refresh_enabled": False,
+            "scheduler_popularity_snapshots_interval_seconds": 120.0,
+            "scheduler_motd_interval_seconds": 300.0,
+            "scheduler_search_index_sync_interval_seconds": 180.0,
+            "scheduler_seo_backlog_batches_interval_seconds": 240.0,
+            "scheduler_advisory_lock_enabled": False,
+            "scheduler_advisory_lock_key": "123, 456",
+        }
+    )
+
+    assert settings.scheduler_materialized_view_refresh_enabled is False
+    assert settings.scheduler_popularity_snapshots_interval_seconds == 120.0
+    assert settings.scheduler_motd_interval_seconds == 300.0
+    assert settings.scheduler_search_index_sync_interval_seconds == 180.0
+    assert settings.scheduler_seo_backlog_batches_interval_seconds == 240.0
+    assert settings.scheduler_advisory_lock_enabled is False
+    assert settings.scheduler_advisory_lock_key == (123, 456)
+
+
 def test_settings_require_imgproxy_key_and_salt_together() -> None:
     with pytest.raises(ValidationError, match="imgproxy_key and imgproxy_salt"):
         _ = Settings.model_validate({"imgproxy_key": "001122"})

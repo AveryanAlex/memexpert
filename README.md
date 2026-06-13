@@ -6,6 +6,7 @@ MemeExpert is a meme catalog and content-pipeline service. The backend is a Fast
 
 - `memexpert-api`: FastAPI HTTP API. It exposes `/health` on port `8000` and the application routes under `/api/v1`.
 - `memexpert-workers`: RabbitMQ-backed content-pipeline workers for transcode, OCR, embedding, classification, and search-index sync.
+- `memexpert-scheduler`: APScheduler runtime for periodic jobs and scheduler-only operational logs.
 - `memexpert-bot`: Optional Telegram bot process using the same backend services and database.
 - `frontend`: SvelteKit Node server. It serves adapter-node output on port `3000` and uses `API_BASE_URL` for private SSR API calls.
 - Infrastructure: PostgreSQL, Redis, RabbitMQ, Qdrant, Meilisearch, MinIO/S3, and imgproxy.
@@ -40,6 +41,7 @@ Important runtime variables:
 - `HOST`, `PORT`, `ORIGIN`: SvelteKit adapter-node server settings.
 - `AUTH_TELEGRAM_BOT_TOKEN`: required only when running the optional bot profile.
 - `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_SESSION_DIR`: optional Telegram crawler session settings.
+- `SCHEDULER_*`: enable flags, interval seconds, and PostgreSQL advisory-lock settings for the scheduler process.
 
 ## Local Development
 
@@ -73,6 +75,12 @@ Run the workers:
 uv run memexpert-workers
 ```
 
+Run the scheduler:
+
+```sh
+uv run memexpert-scheduler
+```
+
 Run the optional Telegram bot after configuring `AUTH_TELEGRAM_BOT_TOKEN`:
 
 ```sh
@@ -104,6 +112,35 @@ pnpm test
 pnpm build
 ```
 
+## Scheduler
+
+`memexpert-scheduler` is the dedicated APScheduler process for periodic jobs. The current registry is intentionally limited to five jobs:
+
+| Job | Enable variable | Interval variable | Default interval |
+|---|---|---|---|
+| Public trend materialized-view refresh | `SCHEDULER_MATERIALIZED_VIEW_REFRESH_ENABLED` | `SCHEDULER_MATERIALIZED_VIEW_REFRESH_INTERVAL_SECONDS` | `300` seconds |
+| Popularity snapshots placeholder | `SCHEDULER_POPULARITY_SNAPSHOTS_ENABLED` | `SCHEDULER_POPULARITY_SNAPSHOTS_INTERVAL_SECONDS` | `3600` seconds |
+| Meme of the Day placeholder | `SCHEDULER_MOTD_ENABLED` | `SCHEDULER_MOTD_INTERVAL_SECONDS` | `86400` seconds |
+| Search-index sync placeholder | `SCHEDULER_SEARCH_INDEX_SYNC_ENABLED` | `SCHEDULER_SEARCH_INDEX_SYNC_INTERVAL_SECONDS` | `600` seconds |
+| SEO backlog batches placeholder | `SCHEDULER_SEO_BACKLOG_BATCHES_ENABLED` | `SCHEDULER_SEO_BACKLOG_BATCHES_INTERVAL_SECONDS` | `900` seconds |
+
+Only the public trend materialized-view refresh currently performs real business work in this slice. The other four jobs are deliberate no-op placeholders so the scheduler infrastructure, observability, and deployment wiring can ship before the business logic lands.
+
+For local no-op/startup testing, disable some or all jobs with the `*_ENABLED=false` flags and still run the scheduler process. Disabling all five jobs is a supported way to validate startup, advisory-lock acquisition, and graceful shutdown without executing business work.
+
+The scheduler emits structured stdout logs by default. Operators should watch for these event names:
+
+- `scheduler_runtime_started` and `scheduler_runtime_stopped` for process lifecycle.
+- `scheduler_stop_requested` when the process receives `SIGINT` or `SIGTERM`.
+- `scheduler_job_started`, `scheduler_job_succeeded`, and `scheduler_job_failed` with `job_id` and `duration_seconds` for each run.
+- `scheduler_job_placeholder_completed` for the current no-op jobs.
+- `scheduler_instance_lock_unavailable` if another scheduler instance already holds the advisory lock.
+- `scheduler_advisory_lock_disabled` only when `SCHEDULER_ADVISORY_LOCK_ENABLED=false`.
+
+Graceful shutdown is built into `memexpert-scheduler`: on `SIGINT` or `SIGTERM`, APScheduler stops accepting new work, waits for in-flight jobs to finish, releases the PostgreSQL advisory lock, and then exits.
+
+Duplicate production execution is guarded by the PostgreSQL advisory lock. Keep `SCHEDULER_ADVISORY_LOCK_ENABLED=true` and set `SCHEDULER_ADVISORY_LOCK_KEY` to the same two-integer key for every legitimate scheduler deployment. If a second instance is started accidentally, it fails fast before registering jobs.
+
 ## Container Images
 
 Build the Python app image for API, workers, and bot:
@@ -123,6 +160,12 @@ Run the worker command from the same image:
 
 ```sh
 docker run --rm --env-file .env.example memexpert-app:local memexpert-workers
+```
+
+Run the scheduler command from the same image:
+
+```sh
+docker run --rm --env-file .env.example memexpert-app:local memexpert-scheduler
 ```
 
 Run the bot command from the same image:
@@ -172,6 +215,8 @@ Build and start the production-oriented stack:
 docker compose --env-file .env.prod -f docker-compose.prod.example.yml up -d --build
 ```
 
+The production example starts exactly one `scheduler` service from the shared app image. If a second scheduler container is started accidentally, the PostgreSQL advisory lock remains the duplicate-run guard.
+
 Run the optional bot profile only when `AUTH_TELEGRAM_BOT_TOKEN` is configured:
 
 ```sh
@@ -188,7 +233,7 @@ Check status and logs:
 
 ```sh
 docker compose --env-file .env.prod -f docker-compose.prod.example.yml ps
-docker compose --env-file .env.prod -f docker-compose.prod.example.yml logs -f api workers frontend
+docker compose --env-file .env.prod -f docker-compose.prod.example.yml logs -f api workers scheduler frontend
 ```
 
 ## Containerized PRD E2E

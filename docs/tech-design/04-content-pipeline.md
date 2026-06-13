@@ -111,10 +111,11 @@ Tasks that run on a schedule (not event-driven) are managed by APScheduler in a 
 
 - Public trend materialized-view refresh (e.g. every 5 min or adaptive)
 - Popularity snapshot computation (initially every 6h; tune after observing traffic)
-- Like count / popularity sync to search indexes (batched, not per-like)
-- Trending recomputation if not fully covered by materialized views
+- Search-index sync (batched, not per-like)
 - Meme of the Day selection/cache refresh
 - Scheduled SEO generation batches prioritized by popularity/backlog
+
+The current implementation registers exactly these five jobs. Only the public trend materialized-view refresh contains real business logic in this slice; the other four jobs are intentionally lightweight placeholders until their production behavior is implemented.
 
 Guest TTL/deletion jobs are intentionally not part of the current product direction.
 
