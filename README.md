@@ -136,12 +136,16 @@ pnpm build
 | Job | Enable variable | Interval variable | Default interval |
 |---|---|---|---|
 | Public trend materialized-view refresh | `SCHEDULER_MATERIALIZED_VIEW_REFRESH_ENABLED` | `SCHEDULER_MATERIALIZED_VIEW_REFRESH_INTERVAL_SECONDS` | `300` seconds |
-| Popularity snapshots placeholder | `SCHEDULER_POPULARITY_SNAPSHOTS_ENABLED` | `SCHEDULER_POPULARITY_SNAPSHOTS_INTERVAL_SECONDS` | `3600` seconds |
+| Popularity snapshots | `SCHEDULER_POPULARITY_SNAPSHOTS_ENABLED` | `SCHEDULER_POPULARITY_SNAPSHOTS_INTERVAL_SECONDS` | `21600` seconds |
 | Meme of the Day placeholder | `SCHEDULER_MOTD_ENABLED` | `SCHEDULER_MOTD_INTERVAL_SECONDS` | `86400` seconds |
 | Search-index sync placeholder | `SCHEDULER_SEARCH_INDEX_SYNC_ENABLED` | `SCHEDULER_SEARCH_INDEX_SYNC_INTERVAL_SECONDS` | `600` seconds |
 | SEO backlog batches placeholder | `SCHEDULER_SEO_BACKLOG_BATCHES_ENABLED` | `SCHEDULER_SEO_BACKLOG_BATCHES_INTERVAL_SECONDS` | `900` seconds |
 
-Only the public trend materialized-view refresh currently performs real business work in this slice. The other four jobs are deliberate no-op placeholders so the scheduler infrastructure, observability, and deployment wiring can ship before the business logic lands.
+The public trend materialized-view refresh and popularity snapshot capture perform real business work. MOTD, search-index sync, and SEO backlog batches remain deliberate no-op placeholders so the scheduler infrastructure, observability, and deployment wiring can ship before those business behaviors land.
+
+Popularity snapshots use `log1p`-scaled cumulative metrics from persisted tables only. Current metrics are source views, summed source reactions, forwarded/reposted source rows, platform views (`meme_view`/`view`), platform sends (`meme_send`/`share`), platform saves (`meme_save`/`save`), and platform likes (`meme_like`/`favorite`). Snapshot columns for impressions/downloads are deferred, so they are not part of the static popularity score in this stage.
+
+Popularity weights are configurable with flat scheduler settings: `SCHEDULER_POPULARITY_SOURCE_VIEW_WEIGHT=1.0`, `SCHEDULER_POPULARITY_SOURCE_REACTION_WEIGHT=2.0`, `SCHEDULER_POPULARITY_SOURCE_REPOST_WEIGHT=3.0`, `SCHEDULER_POPULARITY_PLATFORM_VIEW_WEIGHT=1.0`, `SCHEDULER_POPULARITY_PLATFORM_SEND_WEIGHT=3.0`, `SCHEDULER_POPULARITY_PLATFORM_SAVE_WEIGHT=4.0`, and `SCHEDULER_POPULARITY_PLATFORM_LIKE_WEIGHT=5.0`.
 
 For local no-op/startup testing, disable some or all jobs with the `*_ENABLED=false` flags and still run the scheduler process. Disabling all five jobs is a supported way to validate startup, advisory-lock acquisition, and graceful shutdown without executing business work.
 
@@ -150,7 +154,9 @@ The scheduler emits structured stdout logs by default. Operators should watch fo
 - `scheduler_runtime_started` and `scheduler_runtime_stopped` for process lifecycle.
 - `scheduler_stop_requested` when the process receives `SIGINT` or `SIGTERM`.
 - `scheduler_job_started`, `scheduler_job_succeeded`, and `scheduler_job_failed` with `job_id` and `duration_seconds` for each run.
-- `scheduler_job_placeholder_completed` for the current no-op jobs.
+- `popularity_snapshot_capture_started` and `popularity_snapshot_capture_succeeded` with `captured_at` and row counts for snapshot runs.
+- `public_trend_mv_concurrent_refresh_fallback` with `view_name` when a concurrent materialized-view refresh cannot run and the scheduler retries without `CONCURRENTLY`.
+- `scheduler_job_placeholder_completed` for the remaining no-op jobs.
 - `scheduler_instance_lock_unavailable` if another scheduler instance already holds the advisory lock.
 - `scheduler_advisory_lock_disabled` only when `SCHEDULER_ADVISORY_LOCK_ENABLED=false`.
 

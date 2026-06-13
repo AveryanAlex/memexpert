@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
 from typing import TYPE_CHECKING, cast
@@ -87,6 +88,20 @@ class FakeLock:
         self.release_calls += 1
 
 
+class FakeSessionContext:
+    def __init__(self, session: object) -> None:
+        self.session = session
+        self.enter_calls = 0
+        self.exit_calls = 0
+
+    async def __aenter__(self) -> object:
+        self.enter_calls += 1
+        return self.session
+
+    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self.exit_calls += 1
+
+
 class FailingLock:
     def __init__(self) -> None:
         self.acquire_calls = 0
@@ -140,6 +155,30 @@ def test_configure_scheduler_logging_uses_stdout_when_bootstrapping(monkeypatch:
         assert isinstance(handler, logging.StreamHandler)
         assert handler.stream is sys.stdout
         assert root_logger.level == logging.INFO
+
+        record = logging.LogRecord(
+            name="memexpert.scheduler.test",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=0,
+            msg="scheduler structured field test",
+            args=(),
+            exc_info=None,
+        )
+        record.event = "popularity_snapshot_capture_succeeded"
+        record.captured_at = "2026-03-01T12:00:00+00:00"
+        record.public_meme_count = 7
+        record.snapshot_count = 7
+        record.updated_meme_count = 7
+        record.view_name = "public_meme_trends_mv"
+
+        payload = json.loads(handler.format(record))
+        assert payload["event"] == "popularity_snapshot_capture_succeeded"
+        assert payload["captured_at"] == "2026-03-01T12:00:00+00:00"
+        assert payload["public_meme_count"] == 7
+        assert payload["snapshot_count"] == 7
+        assert payload["updated_meme_count"] == 7
+        assert payload["view_name"] == "public_meme_trends_mv"
     finally:
         root_logger.handlers.clear()
         root_logger.setLevel(logging.NOTSET)
@@ -193,6 +232,37 @@ async def test_materialized_view_job_calls_refresh_helper(monkeypatch: pytest.Mo
     await definition.action()
 
     assert called == {"engine": sentinel, "concurrently": True}
+
+
+@pytest.mark.asyncio
+async def test_popularity_snapshots_job_uses_scheduler_engine_session_and_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings.model_validate({"scheduler_popularity_snapshots_enabled": True})
+    engine = cast("AsyncEngine", object())
+    session = object()
+    session_context = FakeSessionContext(session)
+    called: dict[str, object] = {}
+
+    def fake_build_session_factory(bound_engine: object) -> object:
+        called["engine"] = bound_engine
+        return lambda: session_context
+
+    async def fake_capture(session_arg: object, *, settings: Settings) -> object:
+        called["session"] = session_arg
+        called["settings"] = settings
+        return object()
+
+    monkeypatch.setattr("memexpert.scheduler.jobs.build_async_session_factory", fake_build_session_factory)
+    monkeypatch.setattr("memexpert.scheduler.jobs.capture_popularity_snapshots", fake_capture)
+
+    definition = build_scheduler_job_definitions(settings, engine=engine)[1]
+    await definition.action()
+
+    assert definition.id == JOB_ID_POPULARITY_SNAPSHOTS
+    assert called == {"engine": engine, "session": session, "settings": settings}
+    assert session_context.enter_calls == 1
+    assert session_context.exit_calls == 1
 
 
 @pytest.mark.asyncio

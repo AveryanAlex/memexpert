@@ -15,6 +15,11 @@ class _SchedulerStructuredFormatter(logging.Formatter):
         "jobs_registered",
         "advisory_lock_enabled",
         "advisory_lock_key",
+        "captured_at",
+        "public_meme_count",
+        "snapshot_count",
+        "updated_meme_count",
+        "view_name",
     )
 
     def format(self, record: logging.LogRecord) -> str:
