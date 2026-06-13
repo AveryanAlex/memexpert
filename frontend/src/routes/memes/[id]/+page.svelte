@@ -104,7 +104,7 @@
           <h2 class="m-0 text-2xl font-black tracking-[-0.04em]">Share, save, or report</h2>
           <p class="m-0 text-muted">Use the public action surface for likes, favorites, active saves, pins, sharing, downloads, and moderation reports.</p>
         </div>
-        <MemeActionMenu meme={data.meme} showPrimary showSharing accountType={data.session?.user.account_type ?? null} />
+        <MemeActionMenu meme={data.meme} showPrimary showSharing />
       </Card>
 
       {#if detail.bodyText || detail.detectedText}

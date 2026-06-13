@@ -1,5 +1,5 @@
 import { memeDownloadUrl, memeRenderUrl, memeTitle } from '$lib/memeActions';
-import type { AccountType, CollectionSummaryRead, PublicMemeCardRead, WebCollectionListRead } from '$lib/api/types';
+import type { CollectionSummaryRead, CurrentSessionRead, PublicMemeCardRead, WebCollectionListRead } from '$lib/api/types';
 
 export interface BulkCollectionOption {
   id: string;
@@ -10,7 +10,6 @@ export interface BulkCollectionOption {
 
 export interface MemeGridBulkOptions {
   enabled: boolean;
-  accountType?: AccountType | null;
   saveEnabled?: boolean;
   collectionOptions?: BulkCollectionOption[];
   removeCollectionId?: string | null;
@@ -44,12 +43,19 @@ export function bulkToolbarSummary(total: number, selected: number, downloadable
   return `${selected} selected. ${downloadable} ${downloadable === 1 ? 'has' : 'have'} a media URL for download.`;
 }
 
-export function bulkGuestGuidance(accountType: AccountType | null | undefined, hasCustomCollections: boolean): string | null {
-  if (accountType === 'guest' && !hasCustomCollections) {
+export function bulkGuestGuidance(session: CurrentSessionRead | null | undefined, hasCustomCollections: boolean): string | null {
+  if (session?.user.account_type === 'guest' && !hasCustomCollections) {
     return 'Guests can bulk-save into Favorites. Connect Telegram for custom collections, uploads, and member actions.';
   }
 
   return null;
+}
+
+export function bulkGuidanceFromSessionAndCollections(session: CurrentSessionRead | null | undefined, collections: BulkCollectionOption[]): string | null {
+  return bulkGuestGuidance(
+    session,
+    collections.some((collection) => collection.kind === 'custom')
+  );
 }
 
 export function bulkCollectionOptions(collections: CollectionSummaryRead[] | null | undefined): BulkCollectionOption[] {

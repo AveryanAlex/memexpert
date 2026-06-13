@@ -1,6 +1,6 @@
 <script lang="ts">
   import { navigating } from '$app/state';
-  import { bulkGuestGuidance, collectionListBulkOptions } from '$lib/features/memes/bulk-view-model';
+  import { bulkGuidanceFromSessionAndCollections, collectionListBulkOptions } from '$lib/features/memes/bulk-view-model';
   import InfiniteMemeFeed from '$lib/features/memes/InfiniteMemeFeed.svelte';
   import { ActionLink, Badge, Button, Card, FormRow, Input, LoadingState, PageHeader, Select } from '$lib/ui';
   import { buildSearchHref, LANGUAGE_OPTIONS, MEDIA_TYPE_OPTIONS, QUICK_SEARCH_TAGS } from '$lib/searchParams';
@@ -9,8 +9,7 @@
   let { data }: { data: PageData } = $props();
 
   const bulkOptions = $derived(collectionListBulkOptions(data.collections));
-  const accountType = $derived(data.session?.user.account_type ?? null);
-  const bulkGuidance = $derived(bulkGuestGuidance(accountType, bulkOptions.some((collection) => collection.kind === 'custom')));
+  const bulkGuidance = $derived(bulkGuidanceFromSessionAndCollections(data.session ?? null, bulkOptions));
   const loadingSearch = $derived(navigating.to?.url.pathname === '/search');
   const activeFilterCount = $derived(
     data.filters.tags.length +
@@ -104,7 +103,7 @@
   initialError={data.errorMessage}
   label="Search results"
   emptyMessage="Try a shorter phrase, remove a tag, or broaden media and language filters."
-  bulk={{ enabled: true, accountType, saveEnabled: true, collectionOptions: bulkOptions, guidance: bulkGuidance }}
+  bulk={{ enabled: true, saveEnabled: true, collectionOptions: bulkOptions, guidance: bulkGuidance }}
 >
   {#snippet summary()}
     {#if data.filters.query}

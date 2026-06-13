@@ -190,7 +190,6 @@
       label="Saved memes"
       bulk={{
         enabled: true,
-        accountType: data.session?.user.account_type ?? null,
         removeCollectionId: collection.id,
         removeEnabled: capabilities.can_remove_memes,
         guidance: capabilities.can_remove_memes

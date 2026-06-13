@@ -13,6 +13,7 @@ This SvelteKit app uses Svelte 5, pnpm 10.28.0, Tailwind CSS v4 through `@tailwi
 - Keep reusable chart wrappers and primitives in `src/lib/ui/chart`; put feature/product charts under `src/lib/features/<area>`.
 - Prefer LayerChart through the local wrapper for data-driven charts that need scales, axes, tooltips, responsive frames, loading/empty states, or reuse. A tiny inline SVG is acceptable for decorative or static one-off marks that do not need those behaviors.
 - Charts should use responsive `ChartFrame` sizing, warm MemeExpert tokens, clear labels/ARIA titles, loading and empty states, and readable fallback data or summaries where appropriate.
+- Viewer/account capability needed by shared meme UI comes from `$lib/viewer-capabilities` provided by the root layout Svelte context; do not prop-drill raw `accountType` through unrelated grid/card/bulk props or use module-level per-user stores.
 - Dialog, Popover, and Tooltip wrappers should stay thin, forward useful props, and support `bind:open` where the underlying primitive does.
 - Keep `Tooltip.Provider` near root layout. Tooltips are supplemental desktop help only; essential content belongs in Popover, Dialog, or visible text.
 - Preserve server actions and route URLs. Refactors should thin route markup without changing form names, actions, query params, or data contracts.

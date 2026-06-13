@@ -1,7 +1,7 @@
 <script lang="ts">
   import { invalidateAll } from '$app/navigation';
   import { connectedProviderLabels } from '$lib/account/view-model';
-  import { bulkCollectionOptions, bulkGuestGuidance } from '$lib/features/memes/bulk-view-model';
+  import { bulkCollectionOptions, bulkGuidanceFromSessionAndCollections } from '$lib/features/memes/bulk-view-model';
   import MemeGrid from '$lib/features/memes/MemeGrid.svelte';
   import LibrarySection from '$lib/features/profile/LibrarySection.svelte';
   import {
@@ -28,8 +28,7 @@
   const hasMultipleCollections = $derived(collectionOptions.length > 1);
   const stats = $derived(profileStats(data.library));
   const preferences = $derived(profilePreferences(data.session?.user ?? null));
-  const accountType = $derived(data.session?.user.account_type ?? null);
-  const bulkGuidance = $derived(bulkGuestGuidance(accountType, bulkOptions.some((collection) => collection.kind === 'custom')));
+  const bulkGuidance = $derived(bulkGuidanceFromSessionAndCollections(data.session ?? null, bulkOptions));
 
   $effect(() => {
     selectedCollectionId = activeCollectionId(data.library);
@@ -185,7 +184,7 @@
       <MemeGrid
         memes={data.library.favorites}
         label="Favorite memes"
-        bulk={{ enabled: true, accountType, saveEnabled: true, collectionOptions: bulkOptions, guidance: bulkGuidance }}
+        bulk={{ enabled: true, saveEnabled: true, collectionOptions: bulkOptions, guidance: bulkGuidance }}
       />
     {:else}
       <EmptyState title="No favorites yet" message={libraryEmptyText('favorites', data.session ?? null)}>
@@ -199,7 +198,7 @@
       <MemeGrid
         memes={data.library.pinned_memes}
         label="Pinned memes"
-        bulk={{ enabled: true, accountType, saveEnabled: true, collectionOptions: bulkOptions, guidance: bulkGuidance }}
+        bulk={{ enabled: true, saveEnabled: true, collectionOptions: bulkOptions, guidance: bulkGuidance }}
       />
     {:else}
       <EmptyState title="No pinned memes yet" message={libraryEmptyText('pins', data.session ?? null)}>

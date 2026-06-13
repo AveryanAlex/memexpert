@@ -10,7 +10,7 @@
     unpinMeme,
     type RemoveActionResponse
   } from '$lib/api/client';
-  import type { AccountType, ModerationReason, PublicMemeCardRead, PublicMemeDetailRead } from '$lib/api/types';
+  import type { ModerationReason, PublicMemeCardRead, PublicMemeDetailRead } from '$lib/api/types';
   import {
     actionFailureMessage,
     canonicalMemeUrl,
@@ -21,6 +21,7 @@
     type MemeActionKind
   } from '$lib/memeActions';
   import { Button, Select, Textarea } from '$lib/ui';
+  import { readViewerCapabilities } from '$lib/viewer-capabilities';
   import * as Menu from '$lib/ui/dropdown-menu';
   import { Bookmark, Copy, Download, Flag, Heart, MoreHorizontal, Pin, Send } from '@lucide/svelte';
 
@@ -30,10 +31,11 @@
     showPrimary?: boolean;
     showSharing?: boolean;
     compact?: boolean;
-    accountType?: AccountType | null;
   }
 
-  let { meme, href = memeHref(meme), showPrimary = false, showSharing = false, compact = false, accountType = null }: Props = $props();
+  let { meme, href = memeHref(meme), showPrimary = false, showSharing = false, compact = false }: Props = $props();
+
+  const viewerCapabilities = readViewerCapabilities();
 
   let favorited = $state(false);
   let saved = $state(false);
@@ -58,7 +60,7 @@
   const canonicalUrl = $derived(browser ? canonicalMemeUrl(meme, window.location.origin) : href);
   const downloadUrl = $derived(memeDownloadUrl(meme));
   const canDownload = $derived(Boolean(downloadUrl));
-  const canPin = $derived(accountType === 'full');
+  const canPin = $derived(viewerCapabilities().canPinMemes);
   const actionRequest = $derived({ fetch, memeId: meme.id });
 
   syncStateFromMeme();
