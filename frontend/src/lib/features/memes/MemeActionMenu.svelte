@@ -10,7 +10,7 @@
     unpinMeme,
     type RemoveActionResponse
   } from '$lib/api/client';
-  import type { ModerationReason, PublicMemeCardRead, PublicMemeDetailRead } from '$lib/api/types';
+  import type { AccountType, ModerationReason, PublicMemeCardRead, PublicMemeDetailRead } from '$lib/api/types';
   import {
     actionFailureMessage,
     canonicalMemeUrl,
@@ -30,9 +30,10 @@
     showPrimary?: boolean;
     showSharing?: boolean;
     compact?: boolean;
+    accountType?: AccountType | null;
   }
 
-  let { meme, href = memeHref(meme), showPrimary = false, showSharing = false, compact = false }: Props = $props();
+  let { meme, href = memeHref(meme), showPrimary = false, showSharing = false, compact = false, accountType = null }: Props = $props();
 
   let favorited = $state(false);
   let saved = $state(false);
@@ -57,6 +58,7 @@
   const canonicalUrl = $derived(browser ? canonicalMemeUrl(meme, window.location.origin) : href);
   const downloadUrl = $derived(memeDownloadUrl(meme));
   const canDownload = $derived(Boolean(downloadUrl));
+  const canPin = $derived(accountType === 'full');
   const actionRequest = $derived({ fetch, memeId: meme.id });
 
   syncStateFromMeme();
@@ -213,10 +215,17 @@
         <Bookmark class="size-4" aria-hidden="true" />
         {saved ? 'Saved' : 'Save'}
       </Button>
-      <Button variant="secondary" type="button" disabled={pending !== null} onclick={togglePin}>
-        <Pin class="size-4" aria-hidden="true" />
-        {pinned ? 'Unpin' : 'Pin'}
-      </Button>
+      {#if canPin}
+        <Button variant="secondary" type="button" disabled={pending !== null} onclick={togglePin}>
+          <Pin class="size-4" aria-hidden="true" />
+          {pinned ? 'Unpin' : 'Pin'}
+        </Button>
+      {:else}
+        <p class="m-0 inline-flex items-center gap-2 rounded-full border border-line bg-soft px-4 py-2 text-sm font-extrabold text-muted">
+          <Pin class="size-4" aria-hidden="true" />
+          Pin requires a full account
+        </p>
+      {/if}
     </div>
   {/if}
 
@@ -254,10 +263,12 @@
         <Bookmark class="size-4" aria-hidden="true" />
         {saved ? 'Remove save' : 'Save'}
       </Menu.Item>
-      <Menu.Item onSelect={togglePin} disabled={pending !== null}>
-        <Pin class="size-4" aria-hidden="true" />
-        {pinned ? 'Unpin' : 'Pin'}
-      </Menu.Item>
+      {#if canPin}
+        <Menu.Item onSelect={togglePin} disabled={pending !== null}>
+          <Pin class="size-4" aria-hidden="true" />
+          {pinned ? 'Unpin' : 'Pin'}
+        </Menu.Item>
+      {/if}
       <Menu.Separator />
       <Menu.Item onSelect={shareTelegram}><Send class="size-4" aria-hidden="true" />Share to Telegram</Menu.Item>
       <Menu.Item onSelect={copyLink}><Copy class="size-4" aria-hidden="true" />Copy link</Menu.Item>

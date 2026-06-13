@@ -4,7 +4,7 @@ const artifactsDir = process.env.E2E_ARTIFACTS_DIR ?? './playwright-e2e-artifact
 const browserChannel = process.env.PLAYWRIGHT_CHANNEL;
 
 export default defineConfig({
-  testDir: './tests/e2e',
+  testDir: './specs',
   timeout: 45_000,
   expect: {
     timeout: 10_000

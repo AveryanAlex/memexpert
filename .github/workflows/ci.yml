@@ -104,8 +104,8 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Run E2E
-        run: python scripts/run_container_e2e_smoke.py
+      - name: Run PRD E2E
+        run: python scripts/run_container_e2e.py
 
       - name: Upload E2E artifacts on failure
         if: failure()

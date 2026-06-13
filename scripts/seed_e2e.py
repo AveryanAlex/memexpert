@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Seed and prove the deterministic containerized E2E smoke corpus."""
+"""Seed and prove the deterministic containerized PRD E2E corpus."""
 
 from __future__ import annotations
 
@@ -66,14 +66,14 @@ DEFAULT_ARTIFACTS_DIR: Final = Path("/artifacts")
 DEFAULT_TIMEOUT_SECONDS: Final = 180.0
 DEFAULT_API_TIMEOUT_SECONDS: Final = 20.0
 POLL_INTERVAL_SECONDS: Final = 1.0
-SMOKE_SOURCE_ID: Final = "e2e-smoke-seed"
-SMOKE_UPLOAD_SOURCE_ID: Final = "e2e-smoke-upload"
-SMOKE_MODEL_ID: Final = "e2e-smoke-seed"
-SMOKE_PROMPT_VERSION: Final = "e2e-smoke-v1"
+E2E_SOURCE_ID: Final = "e2e-prd-seed"
+E2E_UPLOAD_SOURCE_ID: Final = "e2e-prd-upload"
+E2E_MODEL_ID: Final = "e2e-prd-seed"
+E2E_PROMPT_VERSION: Final = "e2e-prd-v1"
 UUID_NAMESPACE: Final = uuid.UUID("176f5e31-6e5d-5e43-80aa-1f7aa3aa0d4b")
 
 
-class SmokeSeedError(RuntimeError):
+class E2ESeedError(RuntimeError):
     """Raised when the seed/proof flow cannot complete truthfully."""
 
 
@@ -85,10 +85,11 @@ class SeedSpec:
     ocr_text: str
     caption: str
     alt_text: str
-
-    @property
-    def query(self) -> str:
-        return self.category
+    query: str
+    tags: tuple[str, ...]
+    is_nsfw: bool = False
+    language: ContentLanguage = ContentLanguage.EN
+    media_type: ContentKind = ContentKind.IMAGE
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +100,11 @@ class SeededMeme:
     slug: str
     query: str
     object_key: str
+    title: str
+    tags: tuple[str, ...]
+    is_nsfw: bool
+    language: ContentLanguage
+    media_type: ContentKind
 
 
 class PipelineApiClient:
@@ -123,7 +129,7 @@ class PipelineApiClient:
     def healthcheck(self) -> None:
         response = self._client.get("/health")
         if response.status_code != 200:
-            raise SmokeSeedError(
+            raise E2ESeedError(
                 f"GET /health returned unexpected status {response.status_code}: {response.text!r}",
             )
 
@@ -132,11 +138,11 @@ class PipelineApiClient:
             "/api/v1/pipeline/uploads",
             data={
                 "source_platform": SourcePlatform.TELEGRAM.value,
-                "source_id": SMOKE_UPLOAD_SOURCE_ID,
+                "source_id": E2E_UPLOAD_SOURCE_ID,
                 "post_id": run_id,
                 "views": "1",
             },
-            files={"file": ("e2e-smoke-cat.png", image_bytes, "image/png")},
+            files={"file": ("e2e-prd-cat.png", image_bytes, "image/png")},
         )
         return _validate_response(response, expected_status=201, model=ContentPipelineUploadRead)
 
@@ -144,23 +150,43 @@ class PipelineApiClient:
         response = self._client.get(f"/api/v1/pipeline/items/{meme_file_id}/detail")
         return _validate_response(response, expected_status=200, model=ContentPipelineItemDetail)
 
-    def run_smoke_proof(self, meme_file_id: uuid.UUID) -> SmokeProofResult:
+    def run_dual_index_proof(self, meme_file_id: uuid.UUID) -> SmokeProofResult:
         response = self._client.post(
             "/api/v1/pipeline/search/smoke",
             json={"meme_file_id": str(meme_file_id)},
         )
         return _validate_response(response, expected_status=200, model=SmokeProofResult)
 
-    def public_search(self, query: str) -> dict[str, Any]:
+    def public_search(self, query: str, *, include_nsfw: bool = False) -> dict[str, Any]:
         response = self._client.get(
             "/api/v1/memes/search",
-            params={"query": query, "limit": "10", "offset": "0"},
+            params={"query": query, "include_nsfw": str(include_nsfw).lower(), "limit": "10", "offset": "0"},
         )
         return _validate_json_response(response, expected_status=200)
 
-    def public_detail_by_slug(self, slug: str) -> dict[str, Any]:
-        response = self._client.get(f"/api/v1/memes/slug/{slug}")
+    def public_detail_by_slug(self, slug: str, *, include_nsfw: bool = False) -> dict[str, Any]:
+        response = self._client.get(
+            f"/api/v1/memes/slug/{slug}",
+            params={"include_nsfw": str(include_nsfw).lower()},
+        )
         return _validate_json_response(response, expected_status=200)
+
+    def public_detail_by_slug_status(self, slug: str, *, include_nsfw: bool = False) -> tuple[int, dict[str, Any]]:
+        response = self._client.get(
+            f"/api/v1/memes/slug/{slug}",
+            params={"include_nsfw": str(include_nsfw).lower()},
+        )
+        try:
+            payload = response.json()
+        except json.JSONDecodeError as exc:
+            raise E2ESeedError(
+                f"GET /api/v1/memes/slug/{slug} returned non-JSON output: {exc}; body={response.text!r}",
+            ) from exc
+        if not isinstance(payload, dict):
+            raise E2ESeedError(
+                f"GET /api/v1/memes/slug/{slug} returned non-object JSON: {type(payload).__name__}",
+            )
+        return response.status_code, payload
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -200,8 +226,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
         asyncio.run(_run(args))
-    except SmokeSeedError as exc:
-        print(f"E2E smoke seed failed: {exc}", file=sys.stderr)
+    except E2ESeedError as exc:
+        print(f"PRD E2E seed failed: {exc}", file=sys.stderr)
         return 2
     return 0
 
@@ -223,7 +249,7 @@ async def _run(args: argparse.Namespace) -> None:
 
     qdrant_sync_client = PipelineQdrantSyncClient(settings=settings)
     specs = build_seed_specs()
-    await cleanup_smoke_rows(settings=settings, specs=specs)
+    await cleanup_e2e_rows(settings=settings, specs=specs)
 
     cat_png = build_png_bytes((255, 0, 0))
     operator_token = settings.pipeline_operator_token.get_secret_value()
@@ -241,7 +267,7 @@ async def _run(args: argparse.Namespace) -> None:
             timeout_seconds=args.timeout_seconds,
         )
         print(f"Uploaded item dual-synced: meme_file_id={upload.meme_file_id}")
-        smoke_result = wait_for_smoke_proof(
+        dual_index_result = wait_for_dual_index_proof(
             api_client,
             meme_file_id=upload.meme_file_id,
             timeout_seconds=args.timeout_seconds,
@@ -289,6 +315,11 @@ async def _run(args: argparse.Namespace) -> None:
                 "slug": item.slug,
                 "query": item.query,
                 "object_key": item.object_key,
+                "title": item.title,
+                "tags": list(item.tags),
+                "is_nsfw": item.is_nsfw,
+                "language": item.language.value,
+                "media_type": item.media_type.value,
             }
             for item in seeded
         ],
@@ -297,9 +328,10 @@ async def _run(args: argparse.Namespace) -> None:
             "meme_file_id": str(upload.meme_file_id),
             "slug": slug,
             "query": "cat",
+            "title": "Created cat pipeline meme",
         },
         "proof": {
-            "pipeline_smoke": smoke_result.model_dump(mode="json"),
+            "dual_index": dual_index_result.model_dump(mode="json"),
             "public_search_total": created_search_payload.get("total"),
             "public_search_hit_ids": [
                 item.get("meme", {}).get("id")
@@ -323,7 +355,7 @@ async def ensure_bucket(*, settings: Settings, s3_client: Any) -> None:
     except ClientError as exc:
         status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
         if status not in {404, 400}:
-            raise SmokeSeedError(f"Unable to inspect S3 bucket {storage_settings.bucket}: {exc}") from exc
+            raise E2ESeedError(f"Unable to inspect S3 bucket {storage_settings.bucket}: {exc}") from exc
 
     kwargs: dict[str, Any] = {"Bucket": storage_settings.bucket}
     if storage_settings.region != "us-east-1":
@@ -331,7 +363,7 @@ async def ensure_bucket(*, settings: Settings, s3_client: Any) -> None:
     try:
         await asyncio.to_thread(s3_client.create_bucket, **kwargs)
     except ClientError as exc:
-        raise SmokeSeedError(f"Unable to create S3 bucket {storage_settings.bucket}: {exc}") from exc
+        raise E2ESeedError(f"Unable to create S3 bucket {storage_settings.bucket}: {exc}") from exc
 
 
 async def ensure_qdrant_collection(*, settings: Settings) -> None:
@@ -354,14 +386,14 @@ async def ensure_qdrant_collection(*, settings: Settings) -> None:
         info = await client.get_collection(settings.pipeline_qdrant_collection_name)
         size = _extract_qdrant_vector_size(info)
         if size is not None and size != settings.pipeline_voyage_output_dimensions:
-            raise SmokeSeedError(
+            raise E2ESeedError(
                 "Qdrant collection dimension mismatch: "
                 f"{size} != {settings.pipeline_voyage_output_dimensions}",
             )
-    except SmokeSeedError:
+    except E2ESeedError:
         raise
     except Exception as exc:
-        raise SmokeSeedError(f"Unable to ensure Qdrant collection: {exc}") from exc
+        raise E2ESeedError(f"Unable to ensure Qdrant collection: {exc}") from exc
     finally:
         await client.close()
 
@@ -382,7 +414,7 @@ async def seed_direct_corpus(
         seeded: list[SeededMeme] = []
         for spec in specs:
             image_bytes = build_seed_png_bytes(spec)
-            object_key = f"{storage_settings.original_prefix}/e2e-smoke/{spec.category}.png"
+            object_key = f"{storage_settings.original_prefix}/e2e-prd/{spec.category}.png"
             await asyncio.to_thread(
                 s3_client.put_object,
                 Bucket=storage_settings.bucket,
@@ -397,13 +429,13 @@ async def seed_direct_corpus(
             meme_file_id = _stable_uuid(f"{spec.category}:file")
             meme = Meme(
                 id=meme_id,
-                media_type=ContentKind.IMAGE,
+                media_type=spec.media_type,
                 ocr_text=spec.ocr_text,
-                language=ContentLanguage.EN,
-                is_nsfw=False,
+                language=spec.language,
+                is_nsfw=spec.is_nsfw,
                 is_public=True,
                 popularity_score=10.0,
-                tags=[spec.category, "e2e-smoke"],
+                tags=list(spec.tags),
             )
             session.add(meme)
             await session.flush()
@@ -427,7 +459,7 @@ async def seed_direct_corpus(
                     MemeSource(
                         file_id=meme_file_id,
                         platform=SourcePlatform.TELEGRAM,
-                        source_id=SMOKE_SOURCE_ID,
+                        source_id=E2E_SOURCE_ID,
                         post_id=spec.category,
                         views=1,
                         reactions={},
@@ -441,7 +473,7 @@ async def seed_direct_corpus(
                         fallback_used=False,
                         low_confidence=False,
                         confidence=1.0,
-                        language=ContentLanguage.EN,
+                        language=spec.language,
                         extracted_text=spec.ocr_text,
                         source_object_key=object_key,
                     ),
@@ -456,13 +488,13 @@ async def seed_direct_corpus(
                         meme_id=meme_id,
                         slug=spec.slug,
                         page_title=spec.caption,
-                        meta_description=f"Search fixture for {spec.category} E2E smoke.",
+                        meta_description=f"Search fixture for {spec.category} PRD E2E.",
                         alt_text=spec.alt_text,
                         caption=spec.caption,
-                        body_text=f"Deterministic {spec.category} E2E smoke fixture.",
-                        tags=[spec.category, "e2e-smoke"],
-                        model_id=SMOKE_MODEL_ID,
-                        prompt_version=SMOKE_PROMPT_VERSION,
+                        body_text=f"Deterministic {spec.category} PRD E2E fixture.",
+                        tags=list(spec.tags),
+                        model_id=E2E_MODEL_ID,
+                        prompt_version=E2E_PROMPT_VERSION,
                         generated_at=now,
                     ),
                     *_build_succeeded_stage_rows(
@@ -477,9 +509,9 @@ async def seed_direct_corpus(
                 QdrantSyncPayload(
                     meme_id=meme_id,
                     meme_file_id=meme_file_id,
-                    language=ContentLanguage.EN.value,
-                    is_nsfw=False,
-                    tags=[spec.category, "e2e-smoke"],
+                    language=spec.language.value,
+                    is_nsfw=spec.is_nsfw,
+                    tags=list(spec.tags),
                     ocr_snippet=spec.ocr_text,
                     quality_score=1.0,
                     source_object_key=object_key,
@@ -489,10 +521,10 @@ async def seed_direct_corpus(
             document = PipelineMeilisearchDocument(
                 id=meme_file_id.hex,
                 meme_id=str(meme_id),
-                language=ContentLanguage.EN.value,
-                is_nsfw=False,
+                language=spec.language.value,
+                is_nsfw=spec.is_nsfw,
                 updated_at=now,
-                tags=[spec.category, "e2e-smoke"],
+                tags=list(spec.tags),
                 ocr_text=spec.ocr_text,
                 quality_score=1.0,
             )
@@ -502,7 +534,7 @@ async def seed_direct_corpus(
                     _build_sync_snapshot(
                         meme_file_id=meme_file_id,
                         target=SyncTargetKind.QDRANT,
-                        preview={"meme_id": str(meme_id), "tags": [spec.category, "e2e-smoke"]},
+                        preview={"meme_id": str(meme_id), "tags": list(spec.tags)},
                         now=now,
                     ),
                     _build_sync_snapshot(
@@ -521,6 +553,11 @@ async def seed_direct_corpus(
                     slug=spec.slug,
                     query=spec.query,
                     object_key=object_key,
+                    title=spec.caption,
+                    tags=spec.tags,
+                    is_nsfw=spec.is_nsfw,
+                    language=spec.language,
+                    media_type=spec.media_type,
                 ),
             )
         await session.commit()
@@ -534,31 +571,48 @@ def build_seed_specs() -> list[SeedSpec]:
         SeedSpec(
             category="cat",
             color=(255, 0, 0),
-            slug="e2e-smoke-cat",
-            ocr_text="cat e2e smoke corpus meme",
-            caption="Deterministic cat smoke meme",
-            alt_text="Red square cat smoke meme fixture",
+            slug="e2e-prd-cat-search",
+            ocr_text="cat e2e prd corpus meme",
+            caption="Deterministic cat search meme",
+            alt_text="Red square cat PRD E2E meme fixture",
+            query="cat",
+            tags=("cat", "e2e-prd"),
         ),
         SeedSpec(
             category="dog",
             color=(0, 0, 255),
-            slug="e2e-smoke-dog",
-            ocr_text="dog e2e smoke corpus meme",
-            caption="Deterministic dog smoke meme",
-            alt_text="Blue square dog smoke meme fixture",
+            slug="e2e-prd-dog-search",
+            ocr_text="dog e2e prd corpus meme",
+            caption="Deterministic dog search meme",
+            alt_text="Blue square dog PRD E2E meme fixture",
+            query="dog",
+            tags=("dog", "e2e-prd"),
         ),
         SeedSpec(
             category="frog",
             color=(0, 255, 0),
-            slug="e2e-smoke-frog",
-            ocr_text="frog e2e smoke corpus meme",
-            caption="Deterministic frog smoke meme",
-            alt_text="Green square frog smoke meme fixture",
+            slug="e2e-prd-frog-search",
+            ocr_text="frog e2e prd corpus meme",
+            caption="Deterministic frog search meme",
+            alt_text="Green square frog PRD E2E meme fixture",
+            query="frog",
+            tags=("frog", "e2e-prd"),
+        ),
+        SeedSpec(
+            category="cat-nsfw",
+            color=(128, 0, 128),
+            slug="e2e-prd-cat-nsfw",
+            ocr_text="cat nsfw e2e prd corpus meme",
+            caption="Deterministic cat NSFW meme",
+            alt_text="Purple square cat NSFW PRD E2E meme fixture",
+            query="cat",
+            tags=("cat", "e2e-prd", "nsfw-fixture"),
+            is_nsfw=True,
         ),
     ]
 
 
-async def cleanup_smoke_rows(*, settings: Settings, specs: list[SeedSpec]) -> None:
+async def cleanup_e2e_rows(*, settings: Settings, specs: list[SeedSpec]) -> None:
     session_factory = get_async_session_factory()
     async with session_factory() as session:
         await cleanup_seed_rows(session, settings=settings, specs=specs)
@@ -567,7 +621,7 @@ async def cleanup_smoke_rows(*, settings: Settings, specs: list[SeedSpec]) -> No
 
 async def cleanup_seed_rows(session: AsyncSession, *, settings: Settings, specs: list[SeedSpec]) -> None:
     source_result = await session.execute(
-        select(MemeSource).where(MemeSource.source_id.in_([SMOKE_SOURCE_ID, SMOKE_UPLOAD_SOURCE_ID])),
+        select(MemeSource).where(MemeSource.source_id.in_([E2E_SOURCE_ID, E2E_UPLOAD_SOURCE_ID])),
     )
     meme_ids: set[uuid.UUID] = set()
     for source in source_result.scalars():
@@ -578,7 +632,7 @@ async def cleanup_seed_rows(session: AsyncSession, *, settings: Settings, specs:
     slug_result = await session.execute(
         select(MemeSeoPage).where(
             MemeSeoPage.slug.in_([spec.slug for spec in specs])
-            | MemeSeoPage.slug.like("e2e-smoke-created-%"),
+            | MemeSeoPage.slug.like("e2e-prd-created-%"),
         ),
     )
     for seo_page in slug_result.scalars():
@@ -604,16 +658,16 @@ async def cleanup_seed_rows(session: AsyncSession, *, settings: Settings, specs:
 
 
 async def publish_created_meme(*, settings: Settings, meme_id: uuid.UUID, query: str) -> str:
-    slug = f"e2e-smoke-created-{meme_id.hex[:12]}"
+    slug = f"e2e-prd-created-{meme_id.hex[:12]}"
     session_factory = get_async_session_factory()
     async with session_factory() as session:
         meme = await session.get(Meme, meme_id)
         if meme is None:
-            raise SmokeSeedError(f"Created meme {meme_id} is missing from the database.")
+            raise E2ESeedError(f"Created meme {meme_id} is missing from the database.")
         meme.is_public = True
         meme.is_nsfw = False
         if query not in meme.tags:
-            meme.tags = [*meme.tags, query, "e2e-smoke"]
+            meme.tags = [*meme.tags, query, "e2e-prd"]
         existing_seo = await session.get(MemeSeoPage, meme_id)
         now = utcnow()
         if existing_seo is None:
@@ -621,27 +675,27 @@ async def publish_created_meme(*, settings: Settings, meme_id: uuid.UUID, query:
                 MemeSeoPage(
                     meme_id=meme_id,
                     slug=slug,
-                    page_title="Created cat E2E smoke meme",
-                    meta_description="Created cat upload proven through the containerized smoke pipeline.",
-                    alt_text="Generated red square cat smoke upload",
-                    caption="Created cat E2E smoke meme",
+                    page_title="Created cat pipeline meme",
+                    meta_description="Created cat upload proven through the containerized PRD E2E pipeline.",
+                    alt_text="Generated red square cat pipeline upload",
+                    caption="Created cat pipeline meme",
                     body_text="Generated upload proven through pipeline, Qdrant, Meilisearch, and public API.",
-                    tags=[query, "e2e-smoke"],
-                    model_id=SMOKE_MODEL_ID,
-                    prompt_version=SMOKE_PROMPT_VERSION,
+                    tags=[query, "e2e-prd"],
+                    model_id=E2E_MODEL_ID,
+                    prompt_version=E2E_PROMPT_VERSION,
                     generated_at=now,
                 ),
             )
         else:
             existing_seo.slug = slug
-            existing_seo.page_title = "Created cat E2E smoke meme"
-            existing_seo.meta_description = "Created cat upload proven through the containerized smoke pipeline."
-            existing_seo.alt_text = "Generated red square cat smoke upload"
-            existing_seo.caption = "Created cat E2E smoke meme"
+            existing_seo.page_title = "Created cat pipeline meme"
+            existing_seo.meta_description = "Created cat upload proven through the containerized PRD E2E pipeline."
+            existing_seo.alt_text = "Generated red square cat pipeline upload"
+            existing_seo.caption = "Created cat pipeline meme"
             existing_seo.body_text = "Generated upload proven through pipeline, Qdrant, Meilisearch, and public API."
-            existing_seo.tags = [query, "e2e-smoke"]
-            existing_seo.model_id = SMOKE_MODEL_ID
-            existing_seo.prompt_version = SMOKE_PROMPT_VERSION
+            existing_seo.tags = [query, "e2e-prd"]
+            existing_seo.model_id = E2E_MODEL_ID
+            existing_seo.prompt_version = E2E_PROMPT_VERSION
             existing_seo.generated_at = now
         await session.commit()
     _ = settings
@@ -670,12 +724,12 @@ def wait_for_dual_synced(
             return detail
         time.sleep(POLL_INTERVAL_SECONDS)
     snapshot = last_detail.model_dump(mode="json") if last_detail is not None else None
-    raise SmokeSeedError(
+    raise E2ESeedError(
         f"Timed out waiting for {meme_file_id} to dual-sync. Last detail: {snapshot}",
     )
 
 
-def wait_for_smoke_proof(
+def wait_for_dual_index_proof(
     client: PipelineApiClient,
     *,
     meme_file_id: uuid.UUID,
@@ -684,15 +738,15 @@ def wait_for_smoke_proof(
     deadline = time.monotonic() + timeout_seconds
     last_result: SmokeProofResult | None = None
     while time.monotonic() < deadline:
-        result = client.run_smoke_proof(meme_file_id)
+        result = client.run_dual_index_proof(meme_file_id)
         last_result = result
         if result.both_targets_searchable:
             return result
         time.sleep(POLL_INTERVAL_SECONDS)
 
     snapshot = last_result.model_dump(mode="json") if last_result is not None else None
-    raise SmokeSeedError(
-        "Created meme failed /api/v1/pipeline/search/smoke before timeout: "
+    raise E2ESeedError(
+        "Created meme failed the internal dual-index proof before timeout: "
         f"{snapshot}",
     )
 
@@ -705,7 +759,7 @@ def validate_provider_policy(settings: Settings) -> None:
     }
     live_modes = {name: mode for name, mode in provider_modes.items() if mode != "fake"}
     if live_modes:
-        raise SmokeSeedError(
+        raise E2ESeedError(
             "The E2E seed path requires fake provider modes; set "
             "PIPELINE_OCR_PROVIDER_MODE=fake, PIPELINE_VOYAGE_PROVIDER_MODE=fake, "
             "and PIPELINE_CLASSIFICATION_PROVIDER_MODE=fake. "
@@ -719,31 +773,52 @@ async def wait_for_meili_hits(meili_client: PipelineMeilisearchSyncClient, *, sp
         missing: list[str] = []
         for spec in specs:
             hits = await meili_client.search(spec.query, limit=10)
-            if not any(spec.category in json.dumps(hit, sort_keys=True) for hit in hits):
+            expected_document_id = _stable_uuid(f"{spec.category}:file").hex
+            if not any(hit.get("id") == expected_document_id for hit in hits if isinstance(hit, dict)):
                 missing.append(spec.category)
         if not missing:
             return
         await asyncio.sleep(0.5)
-    raise SmokeSeedError("Timed out waiting for seeded Meilisearch documents to become searchable.")
+    raise E2ESeedError("Timed out waiting for seeded Meilisearch documents to become searchable.")
 
 
 def assert_created_is_distinct(*, created_meme_id: uuid.UUID, seeded: list[SeededMeme]) -> None:
     seeded_ids = [item.meme_id for item in seeded]
     if len(seeded_ids) != len(set(seeded_ids)):
-        raise SmokeSeedError(f"Seeded corpus contains duplicate meme ids: {seeded_ids}")
+        raise E2ESeedError(f"Seeded corpus contains duplicate meme ids: {seeded_ids}")
     if created_meme_id in seeded_ids:
-        raise SmokeSeedError(
+        raise E2ESeedError(
             f"Created meme {created_meme_id} must be distinct from seeded corpus ids {seeded_ids}.",
         )
 
 
-def prove_seeded_public_corpus(client: PipelineApiClient, *, seeded: list[SeededMeme]) -> dict[str, str | None]:
-    proof: dict[str, str | None] = {}
+def prove_seeded_public_corpus(client: PipelineApiClient, *, seeded: list[SeededMeme]) -> dict[str, dict[str, object]]:
+    proof: dict[str, dict[str, object]] = {}
     for item in seeded:
+        if item.is_nsfw:
+            default_search = client.public_search(item.query)
+            requested_search = client.public_search(item.query, include_nsfw=True)
+            assert_public_search_excludes(default_search, meme_id=item.meme_id, label=f"seeded {item.category}")
+            assert_public_search_excludes(requested_search, meme_id=item.meme_id, label=f"seeded {item.category}")
+            assert_public_detail_hidden(client, slug=item.slug, meme_id=item.meme_id)
+            assert_public_detail_hidden(client, slug=item.slug, meme_id=item.meme_id, include_nsfw=True)
+            proof[item.slug] = {
+                "positive_detail_id": None,
+                "anonymous_search_hidden_by_default": True,
+                "anonymous_search_hidden_with_include_nsfw": True,
+                "anonymous_detail_hidden_by_default": True,
+                "anonymous_detail_hidden_with_include_nsfw": True,
+            }
+            continue
+
         search_payload = client.public_search(item.query)
         assert_public_search_contains(search_payload, meme_id=item.meme_id, label=f"seeded {item.category}")
-        detail_payload = assert_public_detail_resolves(client, slug=item.slug, meme_id=item.meme_id)
-        proof[item.slug] = detail_payload.get("id")
+        detail_payload = assert_public_detail_resolves(
+            client,
+            slug=item.slug,
+            meme_id=item.meme_id,
+        )
+        proof[item.slug] = {"positive_detail_id": detail_payload.get("id")}
     return proof
 
 
@@ -752,17 +827,36 @@ def assert_public_detail_resolves(
     *,
     slug: str,
     meme_id: uuid.UUID,
+    include_nsfw: bool = False,
 ) -> dict[str, Any]:
-    detail_payload = client.public_detail_by_slug(slug)
+    detail_payload = client.public_detail_by_slug(slug, include_nsfw=include_nsfw)
     if detail_payload.get("id") != str(meme_id):
-        raise SmokeSeedError(
+        raise E2ESeedError(
             f"Public slug detail {slug!r} resolved {detail_payload.get('id')}, expected {meme_id}.",
         )
     if detail_payload.get("seo_page_slug") != slug:
-        raise SmokeSeedError(
+        raise E2ESeedError(
             f"Public slug detail {slug!r} returned seo_page_slug={detail_payload.get('seo_page_slug')!r}.",
         )
     return detail_payload
+
+
+def assert_public_detail_hidden(
+    client: PipelineApiClient,
+    *,
+    slug: str,
+    meme_id: uuid.UUID,
+    include_nsfw: bool = False,
+) -> None:
+    status_code, payload = client.public_detail_by_slug_status(slug, include_nsfw=include_nsfw)
+    if status_code == 404:
+        return
+    if status_code == 200 and payload.get("id") != str(meme_id):
+        return
+    raise E2ESeedError(
+        f"Anonymous public detail for NSFW slug {slug!r} should be hidden; "
+        f"status={status_code}, payload={payload}",
+    )
 
 
 def assert_public_search_contains(payload: dict[str, Any], *, meme_id: uuid.UUID, label: str = "created meme") -> None:
@@ -772,7 +866,17 @@ def assert_public_search_contains(payload: dict[str, Any], *, meme_id: uuid.UUID
         if isinstance(item, dict)
     ]
     if str(meme_id) not in hit_ids:
-        raise SmokeSeedError(f"Public search did not include {label} {meme_id}; hits={hit_ids}")
+        raise E2ESeedError(f"Public search did not include {label} {meme_id}; hits={hit_ids}")
+
+
+def assert_public_search_excludes(payload: dict[str, Any], *, meme_id: uuid.UUID, label: str) -> None:
+    hit_ids = [
+        item.get("meme", {}).get("id")
+        for item in payload.get("items", [])
+        if isinstance(item, dict)
+    ]
+    if str(meme_id) in hit_ids:
+        raise E2ESeedError(f"Anonymous public search exposed hidden {label} {meme_id}; hits={hit_ids}")
 
 
 def build_seed_png_bytes(spec: SeedSpec) -> bytes:
@@ -844,7 +948,7 @@ def _validate_response[ModelT](
     try:
         return model.model_validate(payload)  # type: ignore[attr-defined, no-any-return]
     except ValidationError as exc:
-        raise SmokeSeedError(
+        raise E2ESeedError(
             f"{response.request.method} {response.request.url.path} returned a malformed payload: {exc}",
         ) from exc
 
@@ -853,7 +957,7 @@ def _validate_json_response(response: httpx.Response, *, expected_status: int) -
     try:
         payload = response.json()
     except json.JSONDecodeError as exc:
-        raise SmokeSeedError(
+        raise E2ESeedError(
             f"{response.request.method} {response.request.url.path} returned non-JSON output: "
             f"{exc}; body={response.text!r}",
         ) from exc
@@ -863,17 +967,17 @@ def _validate_json_response(response: httpx.Response, *, expected_status: int) -
             error_payload = ContentPipelineErrorResponse.model_validate(payload)
         except ValidationError:
             rendered = json.dumps(payload, sort_keys=True) if isinstance(payload, dict | list) else repr(payload)
-            raise SmokeSeedError(
+            raise E2ESeedError(
                 f"{response.request.method} {response.request.url.path} failed with HTTP "
                 f"{response.status_code} and malformed payload: {rendered}",
             ) from None
-        raise SmokeSeedError(
+        raise E2ESeedError(
             f"{response.request.method} {response.request.url.path} failed with HTTP "
             f"{response.status_code}: {error_payload.code.value} - {error_payload.detail}",
         )
 
     if not isinstance(payload, dict):
-        raise SmokeSeedError(
+        raise E2ESeedError(
             f"{response.request.method} {response.request.url.path} returned non-object JSON: {type(payload).__name__}",
         )
     return payload

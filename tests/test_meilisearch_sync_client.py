@@ -21,7 +21,7 @@ class FakeMeiliIndex:
 
     async def get_document(self, document_id: str) -> dict[str, object]:
         self.get_document_calls.append(document_id)
-        return {"id": document_id, "meme_id": str(uuid.uuid4()), "tags": ["e2e-smoke"]}
+        return {"id": document_id, "meme_id": str(uuid.uuid4()), "tags": ["e2e-prd"]}
 
     async def delete_document(self, document_id: str) -> None:
         self.delete_document_calls.append(document_id)

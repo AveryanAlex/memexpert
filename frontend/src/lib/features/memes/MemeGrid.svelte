@@ -37,6 +37,7 @@
   const downloadable = $derived(bulkDownloadItems(selected));
   const allSelected = $derived(memes.length > 0 && selectedIds.length === memes.length);
   const collectionOptions = $derived(bulk.collectionOptions ?? []);
+  const accountType = $derived(bulk.accountType ?? null);
   const canAddToCollection = $derived(collectionOptions.length > 0);
   const canRemoveFromCollection = $derived(Boolean(bulk.removeEnabled && bulk.removeCollectionId));
   const toolbarSummary = $derived(bulkToolbarSummary(memes.length, selected.length, downloadable.length));
@@ -227,7 +228,7 @@
               Select
             </label>
           {/if}
-          <MemeCard {meme} position={memePositions.get(meme.id)} total={memes.length} />
+          <MemeCard {meme} position={memePositions.get(meme.id)} total={memes.length} {accountType} />
         </div>
       {/each}
     </div>

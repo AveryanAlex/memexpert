@@ -225,7 +225,7 @@ services:
       [
         "python",
         "-m",
-        "scripts.seed_e2e_smoke",
+        "scripts.seed_e2e",
         "--api-base-url",
         "http://api:8000",
         "--artifacts-dir",
@@ -245,10 +245,10 @@ services:
         target: /artifacts
 
   e2e-runner:
-    image: ${MEMEXPERT_E2E_RUNNER_IMAGE:-memexpert-frontend-e2e:e2e}
+    image: ${MEMEXPERT_E2E_RUNNER_IMAGE:-memexpert-e2e-runner:e2e}
     build:
       context: .
-      dockerfile: frontend/Dockerfile.e2e
+      dockerfile: e2e/Dockerfile
     restart: "no"
     environment:
       CI: "1"

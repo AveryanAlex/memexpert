@@ -48,8 +48,9 @@ test.describe('public masonry feed smoke', () => {
 test('search result opens detail with media and actions', async ({ page }) => {
   await page.goto('/');
 
-  await page.getByLabel('Search memes').fill('cat reaction');
-  await page.getByRole('button', { name: 'Search' }).click();
+  const searchInput = page.getByLabel('Search memes');
+  await searchInput.fill('cat reaction');
+  await searchInput.press('Enter');
 
   await expect(page.getByText('Results for “cat reaction”')).toBeVisible();
 
@@ -63,7 +64,8 @@ test('search result opens detail with media and actions', async ({ page }) => {
 
   await expect(page.getByRole('button', { name: 'Like (7)' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Save', exact: true })).toBeVisible();
-  await expect(page.getByRole('button', { name: 'Pin' })).toBeVisible();
+  await expect(page.getByText('Pin requires a full account')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Pin', exact: true })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Meme actions' })).toBeVisible();
 });
 

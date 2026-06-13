@@ -30,12 +30,17 @@ tmp/
 .artifacts/
 
 node_modules/
+e2e/node_modules/
 frontend/node_modules/
 frontend/.svelte-kit/
 frontend/build/
 frontend/dist/
 frontend/test-results/
 frontend/playwright-report/
+e2e/playwright-e2e-artifacts/
+e2e/playwright-report/
+e2e/playwright-test-results/
+e2e/test-results/
 
 .telegram-sessions/*
 !.telegram-sessions/.gitkeep
