@@ -137,6 +137,18 @@ class Settings(BaseSettings):
     pipeline_worker_fail_classify_for_meme_file_id: str | None = None
     pipeline_worker_fail_sync_qdrant_for_meme_file_id: str | None = None
     pipeline_worker_fail_sync_meili_for_meme_file_id: str | None = None
+    scheduler_materialized_view_refresh_enabled: bool = True
+    scheduler_materialized_view_refresh_interval_seconds: float = Field(default=300.0, gt=0.0)
+    scheduler_popularity_snapshots_enabled: bool = True
+    scheduler_popularity_snapshots_interval_seconds: float = Field(default=3600.0, gt=0.0)
+    scheduler_motd_enabled: bool = True
+    scheduler_motd_interval_seconds: float = Field(default=86400.0, gt=0.0)
+    scheduler_search_index_sync_enabled: bool = True
+    scheduler_search_index_sync_interval_seconds: float = Field(default=600.0, gt=0.0)
+    scheduler_seo_backlog_batches_enabled: bool = True
+    scheduler_seo_backlog_batches_interval_seconds: float = Field(default=900.0, gt=0.0)
+    scheduler_advisory_lock_enabled: bool = True
+    scheduler_advisory_lock_key: Annotated[tuple[int, int], NoDecode] = (0, 0)
     # --- S04: curated Telethon crawler + freshness SLO -----------------
     # ``telegram_api_id`` / ``telegram_api_hash`` are deliberately optional at
     # T01 so the pipeline service and the ``FakeTelegramClient`` stay
@@ -399,6 +411,23 @@ class Settings(BaseSettings):
         except ValueError as exc:
             raise ValueError("pipeline worker failure-injection UUID settings must be a UUID.") from exc
         return normalized_value
+
+    @field_validator("scheduler_advisory_lock_key", mode="before")
+    @classmethod
+    def _normalize_scheduler_advisory_lock_key(cls, value: object) -> object:
+        if value is None:
+            return value
+
+        raw_parts = cls._coerce_env_sequence(value)
+        if len(raw_parts) != 2:
+            raise ValueError("scheduler_advisory_lock_key must contain exactly two integers.")
+
+        try:
+            normalized_key = tuple(int(part) for part in raw_parts)
+        except ValueError as exc:
+            raise ValueError("scheduler_advisory_lock_key must contain only integers.") from exc
+
+        return normalized_key
 
     @field_validator("auth_telegram_bot_username", mode="before")
     @classmethod

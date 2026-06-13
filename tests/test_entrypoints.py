@@ -8,6 +8,7 @@ from unittest.mock import patch
 from memexpert.api.main import main as api_main
 from memexpert.bot.main import main as bot_main
 from memexpert.core.config import Settings
+from memexpert.scheduler.main import main as scheduler_main
 from memexpert.workers.main import main as workers_main
 from scripts.analytics import main as analytics_main
 
@@ -40,6 +41,16 @@ def test_bot_main_runs_async_bot_runtime() -> None:
 def test_workers_main_runs_async_pipeline_runtime() -> None:
     with patch("memexpert.workers.main.asyncio.run") as asyncio_run:
         workers_main()
+
+    asyncio_run.assert_called_once()
+    coroutine = asyncio_run.call_args.args[0]
+    assert inspect.iscoroutine(coroutine)
+    coroutine.close()
+
+
+def test_scheduler_main_runs_async_scheduler_runtime() -> None:
+    with patch("memexpert.scheduler.main.asyncio.run") as asyncio_run:
+        scheduler_main()
 
     asyncio_run.assert_called_once()
     coroutine = asyncio_run.call_args.args[0]

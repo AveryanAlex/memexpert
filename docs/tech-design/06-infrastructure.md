@@ -94,13 +94,14 @@ MVP observability requirements:
 - API error rates by endpoint
 - Embedding and SEO provider latency/error rate
 - Crawler health (last crawl time, error rate per channel)
-- Scheduler job duration/failure logs
+- Scheduler lifecycle, advisory-lock conflict, and job duration/failure logs
 
 ## Local Development
 
 ```
 docker compose up -d   # PG, Qdrant, Meilisearch, Redis, RabbitMQ, imgproxy
 uv run memexpert-api   # run API locally
+uv run memexpert-scheduler   # run periodic jobs locally
 uv run memexpert-bot   # run bot locally
 ```
 
