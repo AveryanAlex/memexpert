@@ -8,6 +8,11 @@ export interface SeededMeme {
   slug: string;
   query: string;
   object_key: string;
+  title: string;
+  tags: string[];
+  is_nsfw: boolean;
+  language: string;
+  media_type: string;
 }
 
 export interface SeedArtifact {
@@ -18,6 +23,12 @@ export interface SeedArtifact {
     meme_file_id: string;
     slug: string;
     query: string;
+    title: string;
+  };
+  proof?: {
+    dual_index?: {
+      both_targets_searchable?: boolean;
+    };
   };
 }
 

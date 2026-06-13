@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the parallel-safe containerized E2E smoke suite."""
+"""Run the parallel-safe containerized PRD E2E suite."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ PROJECT_PREFIX: Final = "memexpert-e2e"
 IMAGE_ENV_DEFAULTS: Final = {
     "MEMEXPERT_APP_IMAGE": "memexpert-app:e2e-{run_id}",
     "MEMEXPERT_FRONTEND_IMAGE": "memexpert-frontend:e2e-{run_id}",
-    "MEMEXPERT_E2E_RUNNER_IMAGE": "memexpert-frontend-e2e:e2e-{run_id}",
+    "MEMEXPERT_E2E_RUNNER_IMAGE": "memexpert-e2e-runner:e2e-{run_id}",
 }
 WAITED_LONG_LIVED_SERVICES: Final = ("api", "frontend")
 NON_HEALTHCHECKED_LONG_LIVED_SERVICES: Final = ("workers",)
@@ -85,7 +85,7 @@ def main() -> int:
         run_checked([*compose, "run", "--rm", "--no-deps", "e2e-runner"], env=env)
     except subprocess.CalledProcessError as exc:
         exit_code = exc.returncode or 1
-        print(f"Container E2E smoke failed with exit code {exit_code}.", file=sys.stderr, flush=True)
+        print(f"Container PRD E2E failed with exit code {exit_code}.", file=sys.stderr, flush=True)
     finally:
         collect_artifacts(compose, env=env, artifact_dir=artifact_dir)
         append_metadata(

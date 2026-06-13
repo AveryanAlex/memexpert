@@ -15,10 +15,10 @@ WORKDIR /app
 RUN corepack enable \
     && corepack prepare "pnpm@${PNPM_VERSION}" --activate
 
-COPY frontend/package.json frontend/pnpm-lock.yaml ./
+COPY e2e/package.json e2e/pnpm-lock.yaml ./
 RUN --mount=type=cache,id=pnpm-e2e-store,target=/pnpm/store \
     pnpm install --frozen-lockfile --store-dir /pnpm/store
 
-COPY frontend/ ./
+COPY e2e/ ./
 
-CMD ["pnpm", "exec", "playwright", "test", "-c", "playwright.e2e.config.ts"]
+CMD ["pnpm", "exec", "playwright", "test"]

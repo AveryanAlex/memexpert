@@ -1,9 +1,9 @@
-# Containerized E2E Smoke
+# Containerized PRD E2E
 
-Run the real-stack smoke suite from the repository root:
+Run the real-stack PRD E2E suite from the repository root:
 
 ```sh
-python scripts/run_container_e2e_smoke.py
+python scripts/run_container_e2e.py
 ```
 
 The orchestrator creates `.artifacts/e2e/<run-id>/`, exports `E2E_RUN_ID` and `E2E_ARTIFACT_DIR`, sets per-run default app/frontend/e2e-runner image tags, starts `docker-compose.e2e.yml` with `docker compose -p memexpert-e2e-<run-id>`, waits for service health, runs the seed proof, runs Playwright inside the Compose network, captures status/logs/metadata, and removes the stack with volumes unless `E2E_KEEP_STACK=1` is set.
@@ -27,6 +27,12 @@ Default CI and local E2E runs are deterministic and secret-free:
 
 The suite does not call live Voyage, Telegram, Google, or other provider APIs. The current default path proves the manual/operator upload pipeline with fake providers. Full fake Telegram ingest is a follow-up.
 
+## Launch-Critical Scenarios
+
+- Public discovery through website search, URL-backed filters, detail pages, and imgproxy media rendering.
+- Guest favorite/unfavorite behavior with custom collections and Pin gated to full accounts.
+- Fake-provider content pipeline upload, dual search-index proof, and website discovery of the created meme.
+
 ## Artifacts
 
 Artifacts are written under `.artifacts/e2e/<run-id>/`:
@@ -43,7 +49,7 @@ Artifacts are written under `.artifacts/e2e/<run-id>/`:
 Keep the stack for inspection:
 
 ```sh
-E2E_KEEP_STACK=1 python scripts/run_container_e2e_smoke.py
+E2E_KEEP_STACK=1 python scripts/run_container_e2e.py
 ```
 
 Then inspect it with the project name from `run-metadata.json`, for example:

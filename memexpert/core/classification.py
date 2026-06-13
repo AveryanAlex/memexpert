@@ -141,7 +141,7 @@ class PipelineClassificationClient:
 
 
 class FakeClassificationClient:
-    """Safe deterministic classifier used by local E2E smoke runs."""
+    """Safe deterministic classifier used by local E2E runs."""
 
     def __init__(self, *, settings: Settings | None = None) -> None:
         self._settings = settings or get_settings()

@@ -36,11 +36,11 @@ After `pnpm build`, verify the production server locally with a command such as 
 
 For local Playwright setup, `pnpm exec playwright install chromium` installs the bundled Chromium browser. On a fresh Linux workstation that is missing browser system libraries, use `pnpm exec playwright install --with-deps chromium` instead. CI uses that `--with-deps` command on Ubuntu 24.04 so the bundled Chromium path is deterministic. If bundled Chromium is unavailable on a local runner but system Chrome is installed, run the same smoke script with `PLAYWRIGHT_CHANNEL=chrome pnpm test:smoke`.
 
-## Playwright Suites
+## Playwright Suite
 
 `pnpm test:smoke` runs the existing fast mock smoke suite from `playwright.config.ts`. It owns its mock API and local Vite web server and is intended for quick frontend feedback.
 
-`pnpm test:e2e:container` runs `playwright.e2e.config.ts` against an already-running real stack. It does not start web servers; the top-level `python scripts/run_container_e2e_smoke.py` command owns Compose, seeding, and artifact collection. The containerized runner image writes traces, screenshots, videos, and reports under `/artifacts`, which is bound to `.artifacts/e2e/<run-id>/` on the host.
+The real-stack PRD E2E suite lives at repository root under `e2e/` and is run with `python scripts/run_container_e2e.py`.
 
 ## CI Commands
 

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { PublicMemeCardRead } from '$lib/api/types';
+  import type { AccountType, PublicMemeCardRead } from '$lib/api/types';
   import { memeHref, memeTitle } from '$lib/memeActions';
   import Badge from '$lib/ui/Badge.svelte';
   import { cn, focusRing } from '$lib/ui/styles';
@@ -10,9 +10,10 @@
     meme: PublicMemeCardRead;
     position?: number;
     total?: number;
+    accountType?: AccountType | null;
   }
 
-  let { meme, position, total }: Props = $props();
+  let { meme, position, total, accountType = null }: Props = $props();
 
   const href = $derived(memeHref(meme));
   const title = $derived(memeTitle(meme));
@@ -47,6 +48,6 @@
     </div>
   </a>
   <div class="absolute right-3 top-3 z-10">
-    <MemeActionMenu {meme} {href} compact />
+    <MemeActionMenu {meme} {href} {accountType} compact />
   </div>
 </article>
