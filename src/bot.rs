@@ -169,6 +169,83 @@ fn get_admin_chat_id() -> Result<i64> {
     Ok(std::env::var("ADMIN_CHANNEL_ID")?.parse()?)
 }
 
+fn message_text_or_caption(msg: &Message) -> Option<&str> {
+    msg.text().or_else(|| msg.caption())
+}
+
+fn user_facing_error_message(prefix: &str, error: &anyhow::Error) -> String {
+    const MAX_DETAILS_CHARS: usize = 3500;
+
+    let mut details = error.chain().map(|cause| cause.to_string()).join("\n↳ ");
+    if details.chars().count() > MAX_DETAILS_CHARS {
+        details = details.chars().take(MAX_DETAILS_CHARS).collect();
+        details.push_str("\n…");
+    }
+
+    format!("{prefix}\n\nОшибка:\n{details}")
+}
+
+async fn report_meme_creation_error(
+    app_state: &AppState,
+    msg: &Message,
+    error: &anyhow::Error,
+) -> Result<()> {
+    error!(error = ?error, "failed to add meme");
+
+    app_state
+        .bot
+        .send_message(
+            msg.chat.id,
+            user_facing_error_message("Не удалось добавить мем.", error),
+        )
+        .reply_parameters(ReplyParameters::new(msg.id))
+        .await?;
+
+    Ok(())
+}
+
+async fn process_meme_creation_with_user_report(
+    app_state: &AppState,
+    bot_state: &BotState,
+    msg: &Message,
+) -> Result<()> {
+    if let Err(error) = process_meme_creation(app_state, bot_state, msg).await {
+        if let Err(report_error) = report_meme_creation_error(app_state, msg, &error).await {
+            error!(error = ?report_error, "failed to report meme creation error to user");
+        }
+        return Err(error);
+    }
+
+    Ok(())
+}
+
+async fn finish_meme_creation_with_user_report(
+    app_state: &AppState,
+    bot_state: &BotState,
+    data: MemeCreationData,
+) -> Result<()> {
+    let msg = data.msg.clone();
+
+    if let Err(error) = finish_meme_creation(app_state, bot_state, data).await {
+        if let Err(report_error) = report_meme_creation_error(app_state, &msg, &error).await {
+            error!(error = ?report_error, "failed to report meme creation error to user");
+        }
+        return Err(error);
+    }
+
+    Ok(())
+}
+
+async fn ask_for_text_input(app_state: &AppState, msg: &Message, prompt: &str) -> Result<()> {
+    app_state
+        .bot
+        .send_message(msg.chat.id, prompt)
+        .reply_parameters(ReplyParameters::new(msg.id))
+        .await?;
+
+    Ok(())
+}
+
 async fn is_user_admin(app_state: &AppState, user: UserId) -> Result<bool> {
     Ok(app_state
         .bot
@@ -192,16 +269,16 @@ async fn finish_meme_creation(
         .entry(data.msg.from.context("no from")?.id)
         .or_default()
         .cheap_model;
+    let thumb_data = app_state
+        .storage
+        .load_tg_file(&data.thumb_file_id, data.thumb_file_size)
+        .await
+        .context("не удалось загрузить миниатюру из Telegram")?;
     let ai_meta = app_state
         .ai
-        .gen_new_meme_metadata(
-            app_state
-                .storage
-                .load_tg_file(&data.thumb_file_id, data.thumb_file_size)
-                .await?,
-            is_cheap_model,
-        )
-        .await?;
+        .gen_new_meme_metadata(thumb_data, is_cheap_model)
+        .await
+        .context("не удалось сгенерировать метаданные мема")?;
 
     let mut translation = translations::ActiveModel::new();
     translation.language = ActiveValue::set("ru".to_owned());
@@ -212,7 +289,8 @@ async fn finish_meme_creation(
     let control_msg = app_state
         .storage
         .create_meme(data.meme, translation, data.img_embedding)
-        .await?;
+        .await
+        .context("не удалось сохранить мем")?;
     let control_msg_url = control_msg.url().context("can't create url")?;
 
     app_state
@@ -257,11 +335,13 @@ async fn process_meme_creation(
             let thumb_data = app_state
                 .storage
                 .load_tg_file(&thumb.file.id, thumb.file.size as usize)
-                .await?;
+                .await
+                .context("не удалось загрузить миниатюру из Telegram")?;
             let embedding = app_state
                 .ai
                 .jina_clip(thumb_data.into(), JinaTaskType::Passage)
-                .await?;
+                .await
+                .context("не удалось подготовить изображение для поиска похожих мемов")?;
 
             let meme_creation_data = MemeCreationData {
                 msg: msg.clone(),
@@ -271,7 +351,12 @@ async fn process_meme_creation(
                 img_embedding: embedding.clone(),
             };
 
-            if let Some(found_meme) = app_state.storage.find_similar_image(embedding).await? {
+            if let Some(found_meme) = app_state
+                .storage
+                .find_similar_image(embedding)
+                .await
+                .context("не удалось найти похожие мемы")?
+            {
                 let sent_msg = app_state
                     .bot
                     .send_message(
@@ -327,7 +412,15 @@ async fn process_meme_edition(
 
     match action {
         MemeEditAction::Ai => {
-            let prompt = msg.text().context("no text")?;
+            let Some(prompt) = message_text_or_caption(msg) else {
+                ask_for_text_input(
+                    app_state,
+                    msg,
+                    "Отправьте текстовый промпт для редактирования или нажмите «Отмена».",
+                )
+                .await?;
+                return Ok(());
+            };
             let (current_meme_ver, translations) = app_state
                 .storage
                 .load_meme_with_translations_by_id(meme_id)
@@ -363,7 +456,11 @@ async fn process_meme_edition(
                 .await?;
         }
         MemeEditAction::Slug => {
-            let text = msg.text().context("no text")?;
+            let Some(text) = message_text_or_caption(msg) else {
+                ask_for_text_input(app_state, msg, "Отправьте новый слаг или нажмите «Отмена».")
+                    .await?;
+                return Ok(());
+            };
             meme.slug = ActiveValue::set(text.to_owned());
             app_state
                 .storage
@@ -371,7 +468,15 @@ async fn process_meme_edition(
                 .await?;
         }
         MemeEditAction::Title => {
-            let text = msg.text().context("no text")?;
+            let Some(text) = message_text_or_caption(msg) else {
+                ask_for_text_input(
+                    app_state,
+                    msg,
+                    "Отправьте новый заголовок текстом или нажмите «Отмена».",
+                )
+                .await?;
+                return Ok(());
+            };
             translation.title = ActiveValue::set(text.to_owned());
             app_state
                 .storage
@@ -379,7 +484,15 @@ async fn process_meme_edition(
                 .await?;
         }
         MemeEditAction::Caption => {
-            let text = msg.text().context("no text")?;
+            let Some(text) = message_text_or_caption(msg) else {
+                ask_for_text_input(
+                    app_state,
+                    msg,
+                    "Отправьте новую подпись текстом или нажмите «Отмена».",
+                )
+                .await?;
+                return Ok(());
+            };
             translation.caption = ActiveValue::set(text.to_owned());
             app_state
                 .storage
@@ -387,7 +500,15 @@ async fn process_meme_edition(
                 .await?;
         }
         MemeEditAction::Description => {
-            let text = msg.text().context("no text")?;
+            let Some(text) = message_text_or_caption(msg) else {
+                ask_for_text_input(
+                    app_state,
+                    msg,
+                    "Отправьте новое описание текстом или нажмите «Отмена».",
+                )
+                .await?;
+                return Ok(());
+            };
             translation.description = ActiveValue::set(text.to_owned());
             app_state
                 .storage
@@ -395,7 +516,15 @@ async fn process_meme_edition(
                 .await?;
         }
         MemeEditAction::Text => {
-            let text = msg.text().context("no text")?;
+            let Some(text) = message_text_or_caption(msg) else {
+                ask_for_text_input(
+                    app_state,
+                    msg,
+                    "Отправьте новый текст мема или нажмите «Отмена».",
+                )
+                .await?;
+                return Ok(());
+            };
             meme.text = ActiveValue::set(if text != "Нет текста" {
                 Some(text.to_owned())
             } else {
@@ -407,7 +536,15 @@ async fn process_meme_edition(
                 .await?;
         }
         MemeEditAction::Source => {
-            let text = msg.text().context("no text")?;
+            let Some(text) = message_text_or_caption(msg) else {
+                ask_for_text_input(
+                    app_state,
+                    msg,
+                    "Отправьте новый источник текстом или нажмите «Отмена».",
+                )
+                .await?;
+                return Ok(());
+            };
             meme.source = ActiveValue::set(if text != "Неизвестен" {
                 Some(text.to_owned())
             } else {
@@ -506,7 +643,9 @@ async fn handle_message(app_state: AppState, bot_state: BotState, msg: Message) 
         }
 
         match state {
-            ChatState::Start => process_meme_creation(&app_state, &bot_state, &msg).await?,
+            ChatState::Start => {
+                process_meme_creation_with_user_report(&app_state, &bot_state, &msg).await?
+            }
             ChatState::MemeEdition {
                 meme_id,
                 language,
@@ -611,7 +750,16 @@ async fn handle_callback_query(
             .unwrap()
             .remove(&(q.from.id, q.message.context("no message")?.id()));
         if let Some(data) = data {
-            finish_meme_creation(&app_state, &bot_state, data).await?;
+            if let Err(error) =
+                finish_meme_creation_with_user_report(&app_state, &bot_state, data).await
+            {
+                app_state
+                    .bot
+                    .answer_callback_query(q.id.clone())
+                    .text("Не удалось добавить мем")
+                    .await?;
+                return Err(error);
+            }
         };
     } else {
         let callback: MemeEditCallback = data.parse()?;

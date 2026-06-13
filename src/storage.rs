@@ -397,10 +397,7 @@ impl Storage {
 
         // it should be None, but... historically...
         meme.control_message_id = ActiveValue::set(-rand::thread_rng().gen_range(1..1_000_000));
-        let meme = Memes::insert(meme)
-            .exec_with_returning(&trans)
-            .await
-            .unwrap();
+        let meme = Memes::insert(meme).exec_with_returning(&trans).await?;
 
         translation.meme_id = ActiveValue::set(meme.id);
         Translations::insert(translation).exec(&trans).await?;
