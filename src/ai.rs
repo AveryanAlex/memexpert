@@ -214,9 +214,8 @@ struct JinaAiEmbedding {
 
 impl Ai {
     pub fn new() -> Self {
-        let api_base = std::env::var("LLM_API_BASE").unwrap_or_else(|_| {
-            "https://generativelanguage.googleapis.com/v1beta/openai".into()
-        });
+        let api_base = std::env::var("LLM_API_BASE")
+            .unwrap_or_else(|_| "https://generativelanguage.googleapis.com/v1beta/openai".into());
         let api_key = std::env::var("LLM_API_KEY")
             .or_else(|_| std::env::var("GEMINI_API_KEY"))
             .expect("LLM_API_KEY or GEMINI_API_KEY must be provided");
