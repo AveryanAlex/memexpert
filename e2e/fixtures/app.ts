@@ -3,6 +3,7 @@ import { E2EApi } from '../helpers/api';
 import { readSeedArtifact, type SeedArtifact } from '../helpers/seed';
 import { HomePage } from '../pages/HomePage';
 import { MemeDetailPage } from '../pages/MemeDetailPage';
+import { ProfilePage } from '../pages/ProfilePage';
 import { SearchPage } from '../pages/SearchPage';
 
 type AppFixtures = {
@@ -14,6 +15,7 @@ type AppFixtures = {
     home: HomePage;
     search: SearchPage;
     detail: MemeDetailPage;
+    profile: ProfilePage;
   };
 };
 
@@ -30,7 +32,8 @@ export const test = base.extend<AppFixtures>({
     await use({
       home: new HomePage(page),
       search: new SearchPage(page),
-      detail: new MemeDetailPage(page)
+      detail: new MemeDetailPage(page),
+      profile: new ProfilePage(page)
     });
   }
 });
