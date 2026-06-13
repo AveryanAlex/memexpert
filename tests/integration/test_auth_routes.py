@@ -6,16 +6,18 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import jwt
+import pytest
 from fastapi import APIRouter, FastAPI
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from memexpert.api.app import create_app
 from memexpert.api.dependencies import FullAccountUserDep
 from memexpert.models.user import LoginEvent, User
 from memexpert.schemas.user import UserRead
 from memexpert.services import AuthService, UserService
-from tests.conftest import create_full_user_via_upgrade
+from tests.conftest import create_full_user_via_upgrade, reset_test_runtime_state
 
 FULL_ONLY_PROBE_PATH = "/api/v1/test-auth/full-only"
 ACCESS_TOKEN_TTL = timedelta(days=30)
@@ -108,6 +110,44 @@ async def test_guest_route_sets_access_cookie_and_persists_login_event(
         # test driver that header is the httpx default user-agent.
         assert login_event.user_agent is not None
         assert "httpx" in login_event.user_agent
+
+
+async def test_auth_routes_honor_configured_access_cookie_name_end_to_end(
+    migrated_db_session: AsyncSession,
+    auth_settings_overrides: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _ = migrated_db_session
+    custom_access_cookie_name = "memexpert_custom_session_cookie"
+
+    for key, value in {
+        **auth_settings_overrides,
+        "AUTH_ACCESS_COOKIE_NAME": custom_access_cookie_name,
+    }.items():
+        monkeypatch.setenv(key, value)
+
+    await reset_test_runtime_state(flush_redis=True)
+    app = create_app()
+    transport = ASGITransport(app=app)
+
+    try:
+        async with AsyncClient(transport=transport, base_url="https://testserver") as custom_cookie_client:
+            guest_response = await custom_cookie_client.post("/api/v1/auth/guest")
+            guest_user_id = guest_response.json()["user"]["id"]
+
+            assert guest_response.status_code == 201
+            assert f"{custom_access_cookie_name}=" in guest_response.headers["set-cookie"]
+            assert "memexpert_access_token=" not in guest_response.headers["set-cookie"]
+            assert custom_cookie_client.cookies.get(custom_access_cookie_name) is not None
+            assert custom_cookie_client.cookies.get(ACCESS_COOKIE_NAME) is None
+
+            me_response = await custom_cookie_client.get("/api/v1/auth/me")
+
+            assert me_response.status_code == 200
+            assert me_response.json()["id"] == guest_user_id
+            assert me_response.json()["account_type"] == "guest"
+    finally:
+        await reset_test_runtime_state(flush_redis=True)
 
 
 async def test_current_session_auto_bootstraps_guest_and_returns_linked_providers(

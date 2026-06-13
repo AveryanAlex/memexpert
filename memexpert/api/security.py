@@ -4,14 +4,18 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from http import HTTPStatus
 from typing import Final, TypedDict, cast
 
+import jwt
 from fastapi import Request
 from fastapi.responses import JSONResponse, Response
+from jwt import ExpiredSignatureError
+from jwt.exceptions import InvalidTokenError as PyJWTInvalidTokenError
 from redis.exceptions import ConnectionError as RedisBackendConnectionError
 from redis.exceptions import RedisError
 from redis.exceptions import TimeoutError as RedisBackendTimeoutError
@@ -21,10 +25,13 @@ from memexpert.core.redis import RedisConfigurationError, RedisConnectionError, 
 from memexpert.schemas.api_errors import ApiErrorCode, ApiErrorResponse
 
 SAFE_HTTP_METHODS: Final[frozenset[str]] = frozenset({"GET", "HEAD", "OPTIONS"})
+READ_HTTP_METHODS: Final[frozenset[str]] = frozenset({"GET", "HEAD"})
 API_PATH_SEGMENT: Final = "api"
 AUTH_PATH_SEGMENT: Final = "auth"
 ADMIN_PATH_SEGMENT: Final = "admin"
 MEMES_PATH_SEGMENT: Final = "memes"
+PIPELINE_PATH_SEGMENT: Final = "pipeline"
+UPLOADS_PATH_SEGMENT: Final = "uploads"
 REPORT_PATH_SEGMENT: Final = "report"
 VERSION_PATH_PREFIX: Final = "v"
 V1_AUTH_PATH_PREFIX: Final = "/api/v1/auth"
@@ -63,13 +70,20 @@ class SecurityRouteTier(StrEnum):
 
     SAFE = "safe"
     AUTH_WRITE = "auth_write"
-    BROWSER_WRITE = "browser_write"
+    SEARCH_FEED = "search_feed"
+    WRITE = "write"
+    UPLOAD = "upload"
+    ADMIN = "admin"
 
 
 class SecurityRateLimitTier(StrEnum):
     """Rate-limit buckets enforced by the shared API security middleware."""
 
     AUTH_WRITE = "auth_write"
+    SEARCH_FEED = "search_feed"
+    WRITE = "write"
+    UPLOAD = "upload"
+    ADMIN = "admin"
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,24 +176,54 @@ def _is_version_segment(segment: str) -> bool:
     return len(segment) > 1 and segment.startswith(VERSION_PATH_PREFIX) and segment[1:].isdigit()
 
 
+def _is_versioned_api_path_segments(segments: tuple[str, ...]) -> bool:
+    return len(segments) >= 3 and segments[0] == API_PATH_SEGMENT and _is_version_segment(segments[1])
+
+
+def _is_search_feed_path(segments: tuple[str, ...]) -> bool:
+    if len(segments) < 4 or segments[2] != MEMES_PATH_SEGMENT:
+        return False
+
+    memes_path = segments[3:]
+    if not memes_path:
+        return False
+
+    first_segment = memes_path[0]
+    if first_segment in {"search", "browse", "trending"} and len(memes_path) == 1:
+        return True
+    return first_segment == "trends"
+
+
 def classify_security_route(request: Request) -> SecurityRouteTier:
-    """Classify versioned API requests into safe or protected security tiers."""
+    """Classify versioned API requests into the shared CSRF and rate-limit tiers."""
 
     normalized_method = request.method.upper()
-    if normalized_method in SAFE_HTTP_METHODS:
+    if normalized_method == "OPTIONS":
         return SecurityRouteTier.SAFE
 
     segments = _normalize_path_segments(request.url.path)
-    if len(segments) < 3:
+    if not _is_versioned_api_path_segments(segments):
         return SecurityRouteTier.SAFE
-    if segments[0] != API_PATH_SEGMENT or not _is_version_segment(segments[1]):
-        return SecurityRouteTier.SAFE
+
     if segments[2] == AUTH_PATH_SEGMENT:
-        return SecurityRouteTier.AUTH_WRITE
+        return SecurityRouteTier.AUTH_WRITE if normalized_method not in SAFE_HTTP_METHODS else SecurityRouteTier.SAFE
     if segments[2] == ADMIN_PATH_SEGMENT:
-        return SecurityRouteTier.BROWSER_WRITE
+        return SecurityRouteTier.ADMIN
+
+    if normalized_method in READ_HTTP_METHODS:
+        return SecurityRouteTier.SEARCH_FEED if _is_search_feed_path(segments) else SecurityRouteTier.SAFE
+    if normalized_method in SAFE_HTTP_METHODS:
+        return SecurityRouteTier.SAFE
+
+    if segments[2] == PIPELINE_PATH_SEGMENT and len(segments) == 4 and segments[3] == UPLOADS_PATH_SEGMENT:
+        return SecurityRouteTier.UPLOAD
+
     if segments[2] == MEMES_PATH_SEGMENT and len(segments) == 5 and segments[4] == REPORT_PATH_SEGMENT:
-        return SecurityRouteTier.BROWSER_WRITE
+        return SecurityRouteTier.WRITE
+
+    if _is_versioned_api_path_segments(segments):
+        return SecurityRouteTier.WRITE
+
     return SecurityRouteTier.SAFE
 
 
@@ -230,12 +274,15 @@ def require_browser_csrf_header(
     *,
     settings: Settings,
 ) -> None:
-    """Reject unsafe browser-style auth writes that omit the configured CSRF request header."""
+    """Reject unsafe versioned API browser writes that omit the configured CSRF request header."""
 
-    if route_tier not in {SecurityRouteTier.AUTH_WRITE, SecurityRouteTier.BROWSER_WRITE}:
-        return
     if request.method.upper() in SAFE_HTTP_METHODS:
         return
+
+    if route_tier is SecurityRouteTier.SAFE:
+        segments = _normalize_path_segments(request.url.path)
+        if not _is_versioned_api_path_segments(segments):
+            return
 
     request_origin = _get_request_origin(request)
     if request_origin is None:
@@ -250,7 +297,7 @@ def require_browser_csrf_header(
 
     raise build_security_http_error(
         ApiErrorCode.CSRF_FAILED,
-        f"Browser-style auth requests from {request_origin} must include the {csrf_header_name} header.",
+        f"Browser-style versioned API writes from {request_origin} must include the {csrf_header_name} header.",
     )
 
 
@@ -261,33 +308,127 @@ def get_security_rate_limit_policy(
 ) -> SecurityRateLimitPolicy | None:
     """Resolve the active Redis-backed rate-limit policy for the classified route."""
 
-    if route_tier is not SecurityRouteTier.AUTH_WRITE or not settings.security_rate_limit_enabled:
+    if not settings.security_rate_limit_enabled:
         return None
 
-    return SecurityRateLimitPolicy(
-        tier=SecurityRateLimitTier.AUTH_WRITE,
-        max_requests=settings.security_rate_limit_auth_write_max_requests,
-        window_seconds=settings.security_rate_limit_auth_write_window_seconds,
-    )
+    if route_tier is SecurityRouteTier.AUTH_WRITE:
+        return SecurityRateLimitPolicy(
+            tier=SecurityRateLimitTier.AUTH_WRITE,
+            max_requests=settings.security_rate_limit_auth_write_max_requests,
+            window_seconds=settings.security_rate_limit_auth_write_window_seconds,
+        )
+    if route_tier is SecurityRouteTier.SEARCH_FEED:
+        return SecurityRateLimitPolicy(
+            tier=SecurityRateLimitTier.SEARCH_FEED,
+            max_requests=settings.security_rate_limit_search_feed_max_requests,
+            window_seconds=settings.security_rate_limit_search_feed_window_seconds,
+        )
+    if route_tier is SecurityRouteTier.WRITE:
+        return SecurityRateLimitPolicy(
+            tier=SecurityRateLimitTier.WRITE,
+            max_requests=settings.security_rate_limit_write_max_requests,
+            window_seconds=settings.security_rate_limit_write_window_seconds,
+        )
+    if route_tier is SecurityRouteTier.UPLOAD:
+        return SecurityRateLimitPolicy(
+            tier=SecurityRateLimitTier.UPLOAD,
+            max_requests=settings.security_rate_limit_upload_max_requests,
+            window_seconds=settings.security_rate_limit_upload_window_seconds,
+        )
+    if route_tier is SecurityRouteTier.ADMIN:
+        return SecurityRateLimitPolicy(
+            tier=SecurityRateLimitTier.ADMIN,
+            max_requests=settings.security_rate_limit_admin_max_requests,
+            window_seconds=settings.security_rate_limit_admin_window_seconds,
+        )
+    return None
+
+
+def _resolve_security_ip_subject(request: Request) -> str:
+    client = request.client
+    if client is None or not client.host.strip():
+        raise SecuritySubjectResolutionError("Protected security rate limiting requires request.client.host.")
+    return f"ip:{client.host.strip()}"
+
+
+def _resolve_signed_access_cookie_subject(request: Request, *, settings: Settings) -> str | None:
+    access_cookie = request.cookies.get(settings.auth_access_cookie_name)
+    if access_cookie is None:
+        return None
+
+    normalized_access_cookie = access_cookie.strip()
+    if not normalized_access_cookie:
+        return None
+
+    try:
+        payload = cast(
+            "dict[str, object]",
+            jwt.decode(
+                normalized_access_cookie,
+                settings.auth_jwt_secret.get_secret_value(),
+                algorithms=[settings.auth_access_token_algorithm],
+                options={"require": ["sub", "exp", "iat"]},
+            ),
+        )
+    except (ExpiredSignatureError, PyJWTInvalidTokenError):
+        return None
+
+    raw_subject = payload.get("sub")
+    if not isinstance(raw_subject, str):
+        return None
+
+    normalized_subject = raw_subject.strip()
+    if not normalized_subject:
+        return None
+
+    try:
+        subject = uuid.UUID(normalized_subject)
+    except ValueError:
+        return None
+
+    return f"user:{subject}"
+
+
+def _resolve_signed_user_or_ip_subject(request: Request, *, settings: Settings) -> str:
+    return _resolve_signed_access_cookie_subject(request, settings=settings) or _resolve_security_ip_subject(request)
 
 
 def resolve_security_rate_limit_subject(
     request: Request,
     policy: SecurityRateLimitPolicy,
+    *,
+    settings: Settings,
 ) -> str:
     """Resolve the subject key used for the current request's active limit tier."""
 
     if policy.tier is SecurityRateLimitTier.AUTH_WRITE:
-        client = request.client
-        if client is None or not client.host.strip():
-            raise SecuritySubjectResolutionError(
-                "Protected auth rate limiting requires request.client.host.",
-            )
-        return f"ip:{client.host.strip()}"
+        return _resolve_security_ip_subject(request)
+    if policy.tier in {
+        SecurityRateLimitTier.SEARCH_FEED,
+        SecurityRateLimitTier.WRITE,
+        SecurityRateLimitTier.ADMIN,
+    }:
+        return _resolve_signed_user_or_ip_subject(request, settings=settings)
+    if policy.tier is SecurityRateLimitTier.UPLOAD:
+        return _resolve_security_ip_subject(request)
 
     raise SecuritySubjectResolutionError(
         f"Unsupported security rate-limit tier: {policy.tier.value}",
     )
+
+
+def _build_rate_limit_exceeded_detail(policy: SecurityRateLimitPolicy, *, retry_after_seconds: int) -> str:
+    if policy.tier is SecurityRateLimitTier.AUTH_WRITE:
+        return f"Too many auth requests from this client IP; retry after {retry_after_seconds} seconds."
+    if policy.tier is SecurityRateLimitTier.SEARCH_FEED:
+        return f"Too many search feed requests; retry after {retry_after_seconds} seconds."
+    if policy.tier is SecurityRateLimitTier.WRITE:
+        return f"Too many write requests; retry after {retry_after_seconds} seconds."
+    if policy.tier is SecurityRateLimitTier.UPLOAD:
+        return f"Too many upload requests; retry after {retry_after_seconds} seconds."
+    if policy.tier is SecurityRateLimitTier.ADMIN:
+        return f"Too many admin requests; retry after {retry_after_seconds} seconds."
+    return f"Too many requests; retry after {retry_after_seconds} seconds."
 
 
 def build_security_rate_limit_key(policy: SecurityRateLimitPolicy, *, subject: str) -> str:
@@ -348,7 +489,7 @@ async def ensure_security_runtime_available(
     *,
     settings: Settings | None = None,
 ) -> SecurityRouteTier:
-    """Require shared security guards only for unsafe auth routes and browser-style auth writes."""
+    """Apply shared CSRF and rate-limit guards for classified versioned API requests."""
 
     resolved_settings = settings or get_settings()
     route_tier = classify_security_route(request)
@@ -362,7 +503,7 @@ async def ensure_security_runtime_available(
         return route_tier
 
     try:
-        subject = resolve_security_rate_limit_subject(request, policy)
+        subject = resolve_security_rate_limit_subject(request, policy, settings=resolved_settings)
         rate_limit_result = await _consume_security_rate_limit(
             settings=resolved_settings,
             policy=policy,
@@ -386,7 +527,7 @@ async def ensure_security_runtime_available(
         retry_after_seconds = rate_limit_result.retry_after_seconds
         raise build_security_http_error(
             ApiErrorCode.RATE_LIMIT_EXCEEDED,
-            f"Too many auth requests from this client IP; retry after {retry_after_seconds} seconds.",
+            _build_rate_limit_exceeded_detail(policy, retry_after_seconds=retry_after_seconds),
             retry_after_seconds=retry_after_seconds,
             headers=rate_limit_result.build_headers(include_retry_after=True),
         )

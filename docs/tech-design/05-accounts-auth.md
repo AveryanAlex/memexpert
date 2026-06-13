@@ -88,8 +88,8 @@ Do not implement the earlier daily hard-delete scheduler job or expose profile d
 
 ## Security
 
-- **CORS:** allow `memexpert.com`, `*.memexpert.com`, Telegram Mini App origins
-- **CSRF:** SameSite cookies + custom header check (`X-Requested-With`) for state-changing browser requests
+- **CORS:** allow `memexpert.net`, `*.memexpert.net`, localhost web dev origins, and Telegram web origins
+- **CSRF:** SameSite cookies + custom header check (`X-Requested-With`) for any unsafe versioned API request with an `Origin` header; safe methods and non-browser clients without `Origin` stay exempt
 - **Auth cookie:** HttpOnly, secure in production, SameSite policy configured per deployment, scoped Path=/
 - **Revocation:** `token_nonce` bump invalidates outstanding JWTs for a user
 - **Input validation:** Pydantic models for all request bodies, Query() constraints for params
@@ -98,12 +98,14 @@ Do not implement the earlier daily hard-delete scheduler job or expose profile d
 
 ## Rate Limiting
 
-Redis sliding window counters in FastAPI middleware:
+Redis sliding-window counters in shared FastAPI middleware. User-scoped tiers derive their subject directly from the signed access-cookie JWT `sub` claim when present and valid; otherwise they fall back to client IP. Middleware never hits PostgreSQL for subject resolution.
 
 | Tier | Endpoints | Limit |
 |------|-----------|-------|
-| Search | `/api/search`, `/api/feed` | 30 req/min per user |
-| Write | POST/PUT/DELETE | 60 req/min per user |
-| Upload | `/api/memes/upload` | 10 req/min per user |
-| Auth | `/api/auth/*` | 10 req/min per IP |
-| Admin | `/api/admin/*` | 120 req/min |
+| `search_feed` | Safe reads on `/api/v1/memes/search`, `/browse`, `/trending`, `/trends`, and `/trends/*` | 30 req/min per signed user, else IP |
+| `write` | Remaining unsafe `/api/v1/*` requests | 60 req/min per signed user, else IP |
+| `upload` | Unsafe `/api/v1/pipeline/uploads` | 10 req/min per operator identity when a safe non-secret one exists, else IP |
+| `auth_write` | Unsafe `/api/v1/auth/*` | 10 req/min per IP |
+| `admin` | All `/api/v1/admin/*` requests, including reads | 120 req/min per signed user, else IP |
+
+Other safe reads remain unlimited.

@@ -68,7 +68,7 @@ def test_settings_load_from_env_file_and_ignore_extra(
     assert settings.redis_url == "redis://cache.example:6379/9"
 
 
-def test_settings_parse_security_origins_and_preserve_refresh_cookie_path() -> None:
+def test_settings_parse_security_origins_and_preserve_csrf_header_default() -> None:
     settings = Settings.model_validate(
         {
             "security_cors_allowed_origins": "https://memexpert.net, http://localhost:3000",
@@ -136,6 +136,53 @@ def test_settings_require_imgproxy_key_and_salt_together() -> None:
         _ = Settings.model_validate({"imgproxy_key": "001122"})
 
 
+def test_settings_trim_and_validate_auth_access_cookie_fields() -> None:
+    settings = Settings.model_validate(
+        {
+            "auth_access_cookie_name": "  memexpert_session  ",
+            "auth_access_cookie_path": "  /auth  ",
+        }
+    )
+
+    assert settings.auth_access_cookie_name == "memexpert_session"
+    assert settings.auth_access_cookie_path == "/auth"
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        ({"auth_access_cookie_name": "   "}, "auth_access_cookie_name must not be blank"),
+        ({"auth_access_cookie_path": "   "}, "auth_access_cookie_path must not be blank"),
+        ({"auth_access_cookie_path": "auth"}, "auth_access_cookie_path must start with '/'"),
+    ],
+)
+def test_settings_reject_invalid_auth_access_cookie_fields(
+    payload: dict[str, object],
+    message: str,
+) -> None:
+    with pytest.raises(ValidationError, match=message):
+        _ = Settings.model_validate(payload)
+
+
+def test_settings_normalize_blank_auth_access_cookie_domain_to_none() -> None:
+    settings = Settings.model_validate({"auth_access_cookie_domain": "   "})
+
+    assert settings.auth_access_cookie_domain is None
+
+
+def test_settings_require_secure_cookies_for_samesite_none() -> None:
+    with pytest.raises(
+        ValidationError,
+        match="auth_access_cookie_samesite='none' requires auth_access_cookie_secure=true",
+    ):
+        _ = Settings.model_validate(
+            {
+                "auth_access_cookie_samesite": "none",
+                "auth_access_cookie_secure": False,
+            }
+        )
+
+
 def test_settings_default_cors_origin_policy_matches_memexpert_net_but_not_other_tlds() -> None:
     settings = Settings()
 
@@ -148,6 +195,29 @@ def test_settings_default_cors_origin_policy_matches_memexpert_net_but_not_other
 def test_settings_reject_blank_security_cors_allowed_origins() -> None:
     with pytest.raises(ValidationError):
         _ = Settings.model_validate({"security_cors_allowed_origins": "   "})
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("security_rate_limit_auth_write_max_requests", 0),
+        ("security_rate_limit_auth_write_window_seconds", 0),
+        ("security_rate_limit_search_feed_max_requests", 0),
+        ("security_rate_limit_search_feed_window_seconds", 0),
+        ("security_rate_limit_write_max_requests", 0),
+        ("security_rate_limit_write_window_seconds", 0),
+        ("security_rate_limit_upload_max_requests", 0),
+        ("security_rate_limit_upload_window_seconds", 0),
+        ("security_rate_limit_admin_max_requests", 0),
+        ("security_rate_limit_admin_window_seconds", 0),
+    ],
+)
+def test_security_rate_limit_settings_reject_non_positive_values(
+    field_name: str,
+    value: int,
+) -> None:
+    with pytest.raises(ValidationError):
+        _ = Settings.model_validate({field_name: value})
 
 
 @pytest.mark.parametrize(
