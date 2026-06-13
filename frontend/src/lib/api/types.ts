@@ -1,5 +1,6 @@
 export type ContentKind = 'audio' | 'gif' | 'image' | 'link' | 'text' | 'video';
 export type ContentLanguage = 'en' | 'mixed' | 'none' | 'ru';
+export type UserLanguage = 'any' | 'en' | 'ru';
 export type AccountType = 'full' | 'guest';
 export type CollectionKind = 'custom' | 'favorites';
 export type CollectionVisibility = 'private' | 'public' | 'unlisted';
@@ -14,7 +15,7 @@ export interface UserRead {
   google_id: string | null;
   email: string | null;
   email_verified_at: string | null;
-  language: ContentLanguage | 'any';
+  language: UserLanguage;
   nsfw_enabled: boolean;
   token_nonce: number;
   status: string;

@@ -29,6 +29,8 @@ import type {
   MemeReportRead,
   ModerationReason,
   TelegramLinkStartRead,
+  UserLanguage,
+  UserRead,
   WebCollectionDetailRead,
   WebCollectionListRead,
   WebCollectionSummaryRead
@@ -92,6 +94,14 @@ interface ActiveSaveCollectionRequest extends CatalogRequest {
   collectionId: string;
 }
 
+interface PreferenceMutationRequest {
+  fetch: ApiFetch;
+  baseUrl?: string;
+  cookieHeader?: string;
+  onResponse?: (response: Response) => void;
+  body: UserPreferencesUpdate;
+}
+
 export interface RemoveActionResponse {
   removed?: boolean;
 }
@@ -119,6 +129,11 @@ export interface CollectionInvitePayload {
   label?: string | null;
   max_uses?: number | null;
   expires_in_hours?: number | null;
+}
+
+export interface UserPreferencesUpdate {
+  nsfw_enabled?: boolean;
+  language?: UserLanguage;
 }
 
 interface LandingRequest extends CatalogRequest {
@@ -202,6 +217,10 @@ export async function updateActiveSaveCollection(request: ActiveSaveCollectionRe
     ...request,
     body: { collection_id: request.collectionId }
   });
+}
+
+export async function updateUserPreferences(request: PreferenceMutationRequest): Promise<UserRead> {
+  return apiBrowserWrite<UserRead>('/api/v1/auth/preferences', 'PATCH', request);
 }
 
 export async function fetchTrendPage(request: TrendRequest): Promise<PublicMemeTrendPageRead> {
@@ -616,6 +635,36 @@ async function apiWrite<T>(path: string, method: 'DELETE' | 'PATCH' | 'POST' | '
 
   if (!response.ok) {
     throw new ApiError(response.status, readErrorDetail(payload) ?? `API returned ${response.status}`);
+  }
+
+  return payload as T;
+}
+
+async function apiBrowserWrite<T>(
+  path: string,
+  method: 'PATCH' | 'POST' | 'PUT',
+  request: PreferenceMutationRequest
+): Promise<T> {
+  const headers = new Headers({
+    accept: 'application/json',
+    'content-type': 'application/json',
+    'x-requested-with': 'XMLHttpRequest'
+  });
+  if (request.cookieHeader) {
+    headers.set('cookie', request.cookieHeader);
+  }
+
+  const response = await request.fetch(buildApiInput(path, request.baseUrl), {
+    method,
+    headers,
+    credentials: 'include',
+    body: JSON.stringify(request.body)
+  });
+  request.onResponse?.(response);
+  const payload = await readJson(response);
+
+  if (!response.ok) {
+    throw new ApiError(response.status, readErrorDetail(payload) ?? `API write returned ${response.status}`);
   }
 
   return payload as T;

@@ -130,7 +130,9 @@ export function profilePreferences(user: UserRead | null): ProfilePreferenceView
     {
       label: 'NSFW',
       value: user.nsfw_enabled ? 'Enabled' : 'Hidden by default',
-      detail: 'Current backend account preference. This web page does not expose a preference mutation endpoint yet.'
+      detail: user.nsfw_enabled
+        ? 'Search can include NSFW memes when the URL filter asks for them.'
+        : 'Enable from the Search NSFW filter confirmation when you want to include those results.'
     },
     {
       label: 'Account status',
@@ -148,10 +150,6 @@ function languageLabel(language: UserRead['language']): string {
       return 'English';
     case 'ru':
       return 'Russian';
-    case 'mixed':
-      return 'Mixed';
-    case 'none':
-      return 'No text';
     default:
       return language;
   }

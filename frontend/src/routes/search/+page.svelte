@@ -1,16 +1,28 @@
 <script lang="ts">
+  import { goto } from '$app/navigation';
   import { navigating } from '$app/state';
+  import { ApiError, updateUserPreferences } from '$lib/api/client';
+  import type { ContentKind, ContentLanguage } from '$lib/api/types';
   import { bulkGuidanceFromSessionAndCollections, collectionListBulkOptions } from '$lib/features/memes/bulk-view-model';
   import InfiniteMemeFeed from '$lib/features/memes/InfiniteMemeFeed.svelte';
-  import { ActionLink, Badge, Button, Card, FormRow, Input, LoadingState, PageHeader, Select } from '$lib/ui';
-  import { buildSearchHref, LANGUAGE_OPTIONS, MEDIA_TYPE_OPTIONS, QUICK_SEARCH_TAGS } from '$lib/searchParams';
+  import { ActionLink, Badge, Button, Card, FormRow, Input, LoadingState, Notice, PageHeader, Select } from '$lib/ui';
+  import * as Dialog from '$lib/ui/dialog';
+  import { buildSearchHref, LANGUAGE_OPTIONS, MEDIA_TYPE_OPTIONS, normalizeTags, QUICK_SEARCH_TAGS, type SearchRouteState } from '$lib/searchParams';
   import type { PageData } from './$types';
 
   let { data }: { data: PageData } = $props();
 
+  let searchForm = $state<HTMLFormElement>();
+  let nsfwGateOpen = $state(false);
+  let pendingSearchHref = $state<string | null>(null);
+  let nsfwGatePending = $state(false);
+  let nsfwGateMessage = $state<string | null>(null);
+
   const bulkOptions = $derived(collectionListBulkOptions(data.collections));
   const bulkGuidance = $derived(bulkGuidanceFromSessionAndCollections(data.session ?? null, bulkOptions));
   const loadingSearch = $derived(navigating.to?.url.pathname === '/search');
+  const shouldConfirmNsfw = $derived(data.session?.user.nsfw_enabled === false);
+  const nsfwRequestedButDisabled = $derived(data.filters.includeNsfw && data.session?.user.nsfw_enabled !== true);
   const activeFilterCount = $derived(
     data.filters.tags.length +
       (data.filters.includeNsfw ? 1 : 0) +
@@ -27,6 +39,64 @@
   function removeTagHref(tag: string): string {
     return buildSearchHref(data.filters, { tags: data.filters.tags.filter((item) => item !== tag), offset: 0 });
   }
+
+  function handleSearchSubmit(event: SubmitEvent) {
+    const form = event.currentTarget as HTMLFormElement;
+    const nextFilters = searchStateFromForm(form);
+    if (!nextFilters.includeNsfw || !shouldConfirmNsfw) {
+      return;
+    }
+
+    event.preventDefault();
+    pendingSearchHref = buildSearchHref(nextFilters, { offset: 0 });
+    nsfwGateMessage = null;
+    nsfwGateOpen = true;
+  }
+
+  function cancelNsfwOptIn() {
+    nsfwGateOpen = false;
+    pendingSearchHref = null;
+    nsfwGateMessage = null;
+    const nsfwSelect = searchForm?.elements.namedItem('include_nsfw');
+    if (nsfwSelect instanceof HTMLSelectElement) {
+      nsfwSelect.value = 'false';
+    }
+  }
+
+  async function confirmNsfwOptIn() {
+    if (!pendingSearchHref) {
+      return;
+    }
+
+    nsfwGatePending = true;
+    nsfwGateMessage = null;
+    try {
+      await updateUserPreferences({ fetch, body: { nsfw_enabled: true } });
+      const href = pendingSearchHref;
+      nsfwGateOpen = false;
+      pendingSearchHref = null;
+      await goto(href, { invalidateAll: true });
+    } catch (error) {
+      nsfwGateMessage = error instanceof ApiError || error instanceof Error ? error.message : 'Could not update NSFW preference.';
+    } finally {
+      nsfwGatePending = false;
+    }
+  }
+
+  function searchStateFromForm(form: HTMLFormElement): SearchRouteState {
+    const formData = new FormData(form);
+    const rawMediaType = String(formData.get('media_type') ?? '');
+    const rawLanguage = String(formData.get('language') ?? '');
+
+    return {
+      query: String(formData.get('q') ?? '').trim(),
+      tags: normalizeTags([String(formData.get('tags') ?? '')]),
+      includeNsfw: String(formData.get('include_nsfw') ?? 'false') === 'true',
+      mediaType: MEDIA_TYPE_OPTIONS.some((option) => option.value === rawMediaType) ? (rawMediaType as ContentKind) : null,
+      language: LANGUAGE_OPTIONS.some((option) => option.value === rawLanguage) ? (rawLanguage as ContentLanguage) : null,
+      offset: 0
+    };
+  }
 </script>
 
 <PageHeader title="Search MemeXpert." description="Find a meme by phrase, tag, format, language, and safe-content preferences. Every filter lives in the URL so results are shareable." badge="Public catalog" />
@@ -42,7 +112,7 @@
     {/if}
   </div>
 
-  <form class="grid gap-3 md:grid-cols-[minmax(16rem,1.2fr)_minmax(12rem,0.9fr)_minmax(10rem,0.7fr)_minmax(10rem,0.7fr)_auto]" method="GET" action="/search">
+  <form bind:this={searchForm} class="grid gap-3 md:grid-cols-[minmax(16rem,1.2fr)_minmax(12rem,0.9fr)_minmax(10rem,0.7fr)_minmax(10rem,0.7fr)_auto]" method="GET" action="/search" onsubmit={handleSearchSubmit}>
     <FormRow label="Search text" class="md:col-span-2">
       <Input name="q" type="search" placeholder="try: cat reaction, friday mood" value={data.filters.query} />
     </FormRow>
@@ -86,6 +156,26 @@
     {/each}
   </div>
 </Card>
+
+{#if nsfwRequestedButDisabled}
+  <Notice>NSFW was requested in the URL, but this session has not opted in. Results remain filtered until you choose Include NSFW from Search and confirm the account preference.</Notice>
+{/if}
+
+<Dialog.Root bind:open={nsfwGateOpen}>
+  <Dialog.Content role="alertdialog" aria-labelledby="nsfw-confirm-title" aria-describedby="nsfw-confirm-description">
+    <Dialog.Title id="nsfw-confirm-title" class="m-0 text-2xl font-black tracking-[-0.04em]">Include NSFW results?</Dialog.Title>
+    <Dialog.Description id="nsfw-confirm-description" class="m-0 text-muted">
+      This changes your account preference so searches can include NSFW memes when the URL filter asks for them. You can turn it back off from Profile.
+    </Dialog.Description>
+    {#if nsfwGateMessage}
+      <p class="m-0 rounded-[18px] border border-danger/30 bg-danger/10 p-3 text-sm font-extrabold text-danger" role="alert">{nsfwGateMessage}</p>
+    {/if}
+    <div class="flex flex-wrap justify-end gap-3">
+      <Button type="button" variant="secondary" onclick={cancelNsfwOptIn} disabled={nsfwGatePending}>Cancel</Button>
+      <Button type="button" onclick={confirmNsfwOptIn} disabled={nsfwGatePending}>{nsfwGatePending ? 'Saving...' : 'Confirm and search'}</Button>
+    </div>
+  </Dialog.Content>
+</Dialog.Root>
 
 {#if loadingSearch}
   <LoadingState label="Loading filtered results" />

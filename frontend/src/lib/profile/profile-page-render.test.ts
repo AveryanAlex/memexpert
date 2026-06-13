@@ -20,8 +20,27 @@ describe('/profile page', () => {
     expect(body).toContain('Guest library');
     expect(body).toContain('Connect Telegram');
     expect(body).toContain('Guests save into Favorites.');
+    expect(body).toContain('To include NSFW results, use the NSFW filter on Search');
     expect(body).toContain('No favorites yet');
     expect(body).toContain('No pinned memes yet');
+  });
+
+  it('renders the NSFW disable control when the account preference is enabled', () => {
+    const session = sessionPayload('guest');
+    session.user.nsfw_enabled = true;
+    const { body } = render(ProfilePage, {
+      props: {
+        data: {
+          session,
+          sessionError: null,
+          library: emptyLibrary(),
+          libraryError: null
+        }
+      }
+    });
+
+    expect(body).toContain('NSFW search is enabled.');
+    expect(body).toContain('Turn off NSFW');
   });
 
   it('renders favorites, pins, collections, and active save state', () => {

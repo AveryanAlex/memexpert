@@ -1,5 +1,6 @@
 <script lang="ts">
   import { invalidateAll } from '$app/navigation';
+  import { ApiError, updateUserPreferences } from '$lib/api/client';
   import { connectedProviderLabels } from '$lib/account/view-model';
   import { bulkCollectionOptions, bulkGuidanceFromSessionAndCollections } from '$lib/features/memes/bulk-view-model';
   import MemeGrid from '$lib/features/memes/MemeGrid.svelte';
@@ -12,7 +13,7 @@
     profileStats,
     writableCollectionOptions
   } from '$lib/profile/view-model';
-  import { ActionLink, Badge, Card, EmptyState, Notice, Select } from '$lib/ui';
+  import { ActionLink, Badge, Button, Card, EmptyState, Notice, Select } from '$lib/ui';
   import type { PageData } from './$types';
 
   let { data }: { data: PageData } = $props();
@@ -20,6 +21,8 @@
   let selectedCollectionId = $state('');
   let selectorPending = $state(false);
   let selectorMessage = $state<string | null>(null);
+  let nsfwPending = $state(false);
+  let nsfwMessage = $state<string | null>(null);
 
   const capabilities = $derived(profileCapabilities(data.session ?? null));
   const providerLabels = $derived(connectedProviderLabels(data.session?.linked_providers ?? null));
@@ -65,6 +68,21 @@
       selectorMessage = error instanceof Error ? error.message : 'Could not update active collection.';
     } finally {
       selectorPending = false;
+    }
+  }
+
+  async function disableNsfw() {
+    nsfwPending = true;
+    nsfwMessage = null;
+
+    try {
+      await updateUserPreferences({ fetch, body: { nsfw_enabled: false } });
+      nsfwMessage = 'NSFW is hidden again.';
+      await invalidateAll();
+    } catch (error) {
+      nsfwMessage = error instanceof ApiError || error instanceof Error ? error.message : 'Could not update NSFW preference.';
+    } finally {
+      nsfwPending = false;
     }
   }
 </script>
@@ -123,6 +141,20 @@
           <p class="m-0 text-sm text-muted">{preference.detail}</p>
         </article>
       {/each}
+    </div>
+    <div class="rounded-[20px] border border-line bg-soft/50 p-4">
+      {#if data.session?.user.nsfw_enabled}
+        <p class="m-0 font-black">NSFW search is enabled.</p>
+        <p class="m-0 mb-3 text-sm text-muted">Turn it off to keep NSFW memes filtered from public discovery again.</p>
+        <Button type="button" variant="secondary" size="compact" onclick={disableNsfw} disabled={nsfwPending}>{nsfwPending ? 'Saving...' : 'Turn off NSFW'}</Button>
+      {:else}
+        <p class="m-0 font-black">NSFW stays hidden.</p>
+        <p class="m-0 mb-3 text-sm text-muted">To include NSFW results, use the NSFW filter on Search and confirm the opt-in there.</p>
+        <ActionLink size="compact" variant="secondary" href="/search">Open Search filters</ActionLink>
+      {/if}
+      {#if nsfwMessage}
+        <p class="m-0 mt-3 text-sm text-muted" role="status">{nsfwMessage}</p>
+      {/if}
     </div>
   </Card>
 </section>

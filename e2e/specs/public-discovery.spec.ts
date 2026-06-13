@@ -16,12 +16,45 @@ test('guest discovers a public meme with URL-backed filters and imgproxy media',
   await app.search.expectResultVisible(cat);
   await app.search.expectResultHidden(nsfwCat);
 
-  await app.search.applyFilters({ query: cat.query, tag: 'e2e-prd', mediaType: 'image', language: 'en', includeNsfw: true });
+  await app.search.gotoFilters({ query: cat.query, tag: 'e2e-prd', mediaType: 'image', language: 'en', includeNsfw: true });
   await app.search.expectUrlFilters({ query: cat.query, tag: 'e2e-prd', mediaType: 'image', language: 'en', includeNsfw: true });
+  await app.search.expectNsfwUrlRequestNote();
+  await app.search.expectNoNsfwOptInPrompt();
   await app.search.expectResultVisible(cat);
   await app.search.expectResultHidden(nsfwCat);
 
   await app.search.openResult(cat);
   await app.detail.expectOpen(cat);
   await app.detail.expectMediaLoadedThroughImgproxy(cat.title);
+});
+
+test('guest opts into NSFW from search confirmation and can disable it from profile', async ({ app, seed }) => {
+  const cat = seededByCategory(seed, 'cat');
+  const nsfwCat = seededByCategory(seed, 'cat-nsfw');
+  const filters = { query: cat.query, tag: 'e2e-prd', mediaType: 'image', language: 'en', includeNsfw: false };
+  const nsfwFilters = { ...filters, includeNsfw: true };
+
+  await app.search.gotoFilters(filters);
+  await app.search.expectResultVisible(cat);
+  await app.search.expectResultHidden(nsfwCat);
+
+  await app.search.applyFilters(nsfwFilters);
+  await app.search.cancelNsfwOptIn();
+  await app.search.expectUrlFilters(filters);
+  await app.search.expectResultHidden(nsfwCat);
+
+  await app.search.applyFilters(nsfwFilters);
+  await app.search.confirmNsfwOptIn();
+  await app.search.expectUrlFilters(nsfwFilters);
+  await app.search.expectResultVisible(cat);
+  await app.search.expectResultVisible(nsfwCat);
+
+  await app.profile.goto();
+  await app.profile.expectNsfwEnabled();
+  await app.profile.disableNsfw();
+
+  await app.search.gotoFilters(nsfwFilters);
+  await app.search.expectNsfwUrlRequestNote();
+  await app.search.expectResultVisible(cat);
+  await app.search.expectResultHidden(nsfwCat);
 });

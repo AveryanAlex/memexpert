@@ -53,6 +53,14 @@ describe('profile view model', () => {
       'Russian'
     ]);
     expect(profilePreferences(session.user).map((preference) => [preference.label, preference.value])).toContainEqual(['NSFW', 'Enabled']);
+    expect(profilePreferences(session.user).find((preference) => preference.label === 'NSFW')?.detail).toContain('Search can include');
+  });
+
+  it('points disabled NSFW users to the search confirmation flow', () => {
+    const nsfwPreference = profilePreferences(sessionPayload('guest').user).find((preference) => preference.label === 'NSFW');
+
+    expect(nsfwPreference?.value).toBe('Hidden by default');
+    expect(nsfwPreference?.detail).toContain('Enable from the Search NSFW filter confirmation');
   });
 });
 

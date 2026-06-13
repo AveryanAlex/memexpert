@@ -40,6 +40,7 @@ import {
   updateActiveSaveCollection,
   updateBlockedPerceptualHash,
   updateMemeModeration,
+  updateUserPreferences,
   type ApiFetch
 } from './client';
 import type { CurrentSessionRead, MemeLibraryRead, PublicMemeSearchPageRead, PublicMemeTrendPageRead } from './types';
@@ -501,6 +502,32 @@ describe('catalog API client', () => {
     expect(user.active_save_collection_id).toBe(collectionId);
     expect(mockFetch).toHaveBeenCalledOnce();
     expect(onResponse).toHaveBeenCalledOnce();
+  });
+
+  it('updates user preferences through cookie-only JSON transport', async () => {
+    const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? new URL(input, 'https://web.memexpert.test') : new URL(String(input));
+      const headers = new Headers(init?.headers);
+
+      expect(url.pathname).toBe('/api/v1/auth/preferences');
+      expect(init?.method).toBe('PATCH');
+      expect(init?.credentials).toBe('include');
+      expect(headers.get('cookie')).toBe('memexpert_access_token=full');
+      expect(headers.get('content-type')).toBe('application/json');
+      expect(headers.get('x-requested-with')).toBe('XMLHttpRequest');
+      expect(JSON.parse(String(init?.body))).toEqual({ nsfw_enabled: true, language: 'en' });
+
+      return jsonResponse({ ...sessionPayload('full').user, nsfw_enabled: true, language: 'en' });
+    }) satisfies ApiFetch;
+
+    const user = await updateUserPreferences({
+      fetch: mockFetch,
+      cookieHeader: 'memexpert_access_token=full',
+      body: { nsfw_enabled: true, language: 'en' }
+    });
+
+    expect(user.nsfw_enabled).toBe(true);
+    expect(mockFetch).toHaveBeenCalledOnce();
   });
 
   it('uses collection list, detail, mutation, active-save, remove, and invite endpoints', async () => {
