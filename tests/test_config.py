@@ -114,6 +114,13 @@ def test_settings_parse_scheduler_contracts() -> None:
         {
             "scheduler_materialized_view_refresh_enabled": False,
             "scheduler_popularity_snapshots_interval_seconds": 120.0,
+            "scheduler_popularity_source_view_weight": 1.5,
+            "scheduler_popularity_source_reaction_weight": 2.5,
+            "scheduler_popularity_source_repost_weight": 3.5,
+            "scheduler_popularity_platform_view_weight": 4.5,
+            "scheduler_popularity_platform_send_weight": 5.5,
+            "scheduler_popularity_platform_save_weight": 6.5,
+            "scheduler_popularity_platform_like_weight": 7.5,
             "scheduler_motd_interval_seconds": 300.0,
             "scheduler_search_index_sync_interval_seconds": 180.0,
             "scheduler_seo_backlog_batches_interval_seconds": 240.0,
@@ -124,11 +131,48 @@ def test_settings_parse_scheduler_contracts() -> None:
 
     assert settings.scheduler_materialized_view_refresh_enabled is False
     assert settings.scheduler_popularity_snapshots_interval_seconds == 120.0
+    assert settings.scheduler_popularity_source_view_weight == 1.5
+    assert settings.scheduler_popularity_source_reaction_weight == 2.5
+    assert settings.scheduler_popularity_source_repost_weight == 3.5
+    assert settings.scheduler_popularity_platform_view_weight == 4.5
+    assert settings.scheduler_popularity_platform_send_weight == 5.5
+    assert settings.scheduler_popularity_platform_save_weight == 6.5
+    assert settings.scheduler_popularity_platform_like_weight == 7.5
     assert settings.scheduler_motd_interval_seconds == 300.0
     assert settings.scheduler_search_index_sync_interval_seconds == 180.0
     assert settings.scheduler_seo_backlog_batches_interval_seconds == 240.0
     assert settings.scheduler_advisory_lock_enabled is False
     assert settings.scheduler_advisory_lock_key == (123, 456)
+
+
+def test_settings_scheduler_popularity_defaults_match_design() -> None:
+    settings = Settings()
+
+    assert settings.scheduler_popularity_snapshots_interval_seconds == 21600.0
+    assert settings.scheduler_popularity_source_view_weight == 1.0
+    assert settings.scheduler_popularity_source_reaction_weight == 2.0
+    assert settings.scheduler_popularity_source_repost_weight == 3.0
+    assert settings.scheduler_popularity_platform_view_weight == 1.0
+    assert settings.scheduler_popularity_platform_send_weight == 3.0
+    assert settings.scheduler_popularity_platform_save_weight == 4.0
+    assert settings.scheduler_popularity_platform_like_weight == 5.0
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "scheduler_popularity_source_view_weight",
+        "scheduler_popularity_source_reaction_weight",
+        "scheduler_popularity_source_repost_weight",
+        "scheduler_popularity_platform_view_weight",
+        "scheduler_popularity_platform_send_weight",
+        "scheduler_popularity_platform_save_weight",
+        "scheduler_popularity_platform_like_weight",
+    ],
+)
+def test_settings_reject_negative_scheduler_popularity_weights(field_name: str) -> None:
+    with pytest.raises(ValidationError):
+        _ = Settings.model_validate({field_name: -0.1})
 
 
 def test_settings_require_imgproxy_key_and_salt_together() -> None:

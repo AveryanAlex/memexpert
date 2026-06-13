@@ -115,7 +115,7 @@ Tasks that run on a schedule (not event-driven) are managed by APScheduler in a 
 - Meme of the Day selection/cache refresh
 - Scheduled SEO generation batches prioritized by popularity/backlog
 
-The current implementation registers exactly these five jobs. Only the public trend materialized-view refresh contains real business logic in this slice; the other four jobs are intentionally lightweight placeholders until their production behavior is implemented.
+The current implementation registers exactly these five jobs. Public trend materialized-view refresh and popularity snapshot computation contain real business logic; Meme of the Day, search-index sync, and SEO backlog batches are intentionally lightweight placeholders until their production behavior is implemented.
 
 Guest TTL/deletion jobs are intentionally not part of the current product direction.
 
@@ -195,7 +195,7 @@ popularity = log(1 + source_views) × source_view_weight
            + log(1 + platform_views) × view_weight
 ```
 
-Logarithmic scaling prevents viral outliers from dominating. Weights are tunable configuration, not product truth.
+Logarithmic scaling prevents viral outliers from dominating. Weights are tunable configuration, not product truth. The current snapshot table intentionally includes only source views, summed source reactions, source repost rows, platform views, sends, saves, and likes. Impression/download snapshot columns and their weights are deferred until a schema stage adds those persisted fields.
 
 ### Trending Score
 

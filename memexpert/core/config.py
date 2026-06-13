@@ -140,7 +140,14 @@ class Settings(BaseSettings):
     scheduler_materialized_view_refresh_enabled: bool = True
     scheduler_materialized_view_refresh_interval_seconds: float = Field(default=300.0, gt=0.0)
     scheduler_popularity_snapshots_enabled: bool = True
-    scheduler_popularity_snapshots_interval_seconds: float = Field(default=3600.0, gt=0.0)
+    scheduler_popularity_snapshots_interval_seconds: float = Field(default=21600.0, gt=0.0)
+    scheduler_popularity_source_view_weight: float = Field(default=1.0, ge=0.0, le=1000.0)
+    scheduler_popularity_source_reaction_weight: float = Field(default=2.0, ge=0.0, le=1000.0)
+    scheduler_popularity_source_repost_weight: float = Field(default=3.0, ge=0.0, le=1000.0)
+    scheduler_popularity_platform_view_weight: float = Field(default=1.0, ge=0.0, le=1000.0)
+    scheduler_popularity_platform_send_weight: float = Field(default=3.0, ge=0.0, le=1000.0)
+    scheduler_popularity_platform_save_weight: float = Field(default=4.0, ge=0.0, le=1000.0)
+    scheduler_popularity_platform_like_weight: float = Field(default=5.0, ge=0.0, le=1000.0)
     scheduler_motd_enabled: bool = True
     scheduler_motd_interval_seconds: float = Field(default=86400.0, gt=0.0)
     scheduler_search_index_sync_enabled: bool = True

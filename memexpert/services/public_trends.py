@@ -548,7 +548,14 @@ async def refresh_public_trend_materialized_views(engine: AsyncEngine, *, concur
                     await refresh_connection.execute(text(f"REFRESH MATERIALIZED VIEW CONCURRENTLY {view_name}"))
                     continue
                 except DBAPIError:
-                    logger.exception("Concurrent refresh failed for %s; retrying without CONCURRENTLY.", view_name)
+                    logger.warning(
+                        "public_trend_mv_concurrent_refresh_fallback",
+                        extra={
+                            "event": "public_trend_mv_concurrent_refresh_fallback",
+                            "view_name": view_name,
+                        },
+                        exc_info=True,
+                    )
                     await refresh_connection.rollback()
             await refresh_connection.execute(text(f"REFRESH MATERIALIZED VIEW {view_name}"))
 

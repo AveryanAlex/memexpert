@@ -8,6 +8,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from memexpert.core.database import build_async_session_factory
+from memexpert.services.popularity_snapshots import capture_popularity_snapshots
 from memexpert.services.public_trends import refresh_public_trend_materialized_views
 
 if TYPE_CHECKING:
@@ -47,7 +49,7 @@ def build_scheduler_job_definitions(settings: Settings, engine: AsyncEngine) -> 
         SchedulerJobDefinition(
             id=JOB_ID_POPULARITY_SNAPSHOTS,
             trigger_seconds=settings.scheduler_popularity_snapshots_interval_seconds,
-            action=_build_placeholder_job_action(JOB_ID_POPULARITY_SNAPSHOTS),
+            action=_build_popularity_snapshots_job_action(settings, engine),
             enabled=settings.scheduler_popularity_snapshots_enabled,
             description="Capture popularity snapshots.",
         ),
@@ -114,6 +116,15 @@ def _build_placeholder_job_action(job_id: str) -> SchedulerJobAction:
             "scheduler_job_placeholder_completed",
             extra={"event": "scheduler_job_placeholder_completed", "job_id": job_id},
         )
+
+    return _action
+
+
+def _build_popularity_snapshots_job_action(settings: Settings, engine: AsyncEngine) -> SchedulerJobAction:
+    async def _action() -> None:
+        session_factory = build_async_session_factory(engine)
+        async with session_factory() as session:
+            _ = await capture_popularity_snapshots(session, settings=settings)
 
     return _action
 

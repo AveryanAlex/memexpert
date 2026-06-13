@@ -62,7 +62,7 @@ RabbitMQ consumers: exponential backoff via DLX TTL, max retries configured per 
 
 Alembic for PostgreSQL. All migrations reversible where practical. Data migrations separated from schema migrations. Zero-downtime strategy: add columns as nullable first, backfill, then add constraints.
 
-Materialized views can power public trends/tag/template analytics, Meme of the Day candidate sets, and timeline pages. Prefer `REFRESH MATERIALIZED VIEW CONCURRENTLY` where the view has the required unique indexes and the refresh interval is user-visible.
+Materialized views can power public trends/tag/template analytics, Meme of the Day candidate sets, and timeline pages. Prefer `REFRESH MATERIALIZED VIEW CONCURRENTLY` where the view has the required unique indexes and the refresh interval is user-visible. The scheduler refreshes public trend views in dependency order (`public_meme_trends_mv`, then tag, then template) and logs `public_trend_mv_concurrent_refresh_fallback` with the view name before retrying without `CONCURRENTLY` when PostgreSQL rejects concurrent refresh.
 
 ## Embedding Model Upgrades
 
@@ -94,7 +94,7 @@ MVP observability requirements:
 - API error rates by endpoint
 - Embedding and SEO provider latency/error rate
 - Crawler health (last crawl time, error rate per channel)
-- Scheduler lifecycle, advisory-lock conflict, and job duration/failure logs
+- Scheduler lifecycle, advisory-lock conflict, job duration/failure logs, popularity snapshot counts, and materialized-view concurrent-refresh fallback logs
 
 ## Local Development
 
