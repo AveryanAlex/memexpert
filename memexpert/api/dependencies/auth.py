@@ -5,11 +5,12 @@ from __future__ import annotations
 from http import HTTPStatus
 from typing import Annotated, Final, cast
 
-from fastapi import Cookie, Depends, Request, Response
+from fastapi import Depends, Request, Response
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from memexpert.api.cookies import set_access_cookie
+from memexpert.core.config import get_settings
 from memexpert.core.database import get_db_session
 from memexpert.models.enums import AccountType
 from memexpert.schemas.auth import AuthErrorCode, AuthErrorResponse
@@ -116,7 +117,6 @@ def get_account_link_service(
 AuthServiceDep = Annotated[AuthService, Depends(get_auth_service)]
 ProviderAuthServiceDep = Annotated[ProviderAuthService, Depends(get_provider_auth_service)]
 AccountLinkServiceDep = Annotated[AccountLinkService, Depends(get_account_link_service)]
-AccessCookieDep = Annotated[str | None, Cookie(alias="memexpert_access_token")]
 
 
 def to_auth_http_error(error: AuthServiceError) -> AuthHTTPError:
@@ -140,8 +140,8 @@ def to_auth_http_error(error: AuthServiceError) -> AuthHTTPError:
     )
 
 
-def get_optional_access_token(access_cookie: AccessCookieDep = None) -> str | None:
-    """Read the access token exclusively from the ``memexpert_access_token`` cookie.
+def get_optional_access_token(request: Request) -> str | None:
+    """Read the access token exclusively from the configured access cookie.
 
     The cookie is the sole transport for the access token — no
     ``Authorization: Bearer`` fallback exists. Routes that want
@@ -149,6 +149,9 @@ def get_optional_access_token(access_cookie: AccessCookieDep = None) -> str | No
     :func:`get_optional_current_user`, which doesn't care how it
     arrived.
     """
+
+    access_cookie_name = get_settings().auth_access_cookie_name
+    access_cookie = request.cookies.get(access_cookie_name)
 
     if access_cookie is None:
         return None

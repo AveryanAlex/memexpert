@@ -191,6 +191,14 @@ class Settings(BaseSettings):
     security_rate_limit_redis_timeout_seconds: float = Field(default=0.5, gt=0.0)
     security_rate_limit_auth_write_max_requests: int = Field(default=10, gt=0)
     security_rate_limit_auth_write_window_seconds: int = Field(default=60, gt=0)
+    security_rate_limit_search_feed_max_requests: int = Field(default=30, gt=0)
+    security_rate_limit_search_feed_window_seconds: int = Field(default=60, gt=0)
+    security_rate_limit_write_max_requests: int = Field(default=60, gt=0)
+    security_rate_limit_write_window_seconds: int = Field(default=60, gt=0)
+    security_rate_limit_upload_max_requests: int = Field(default=10, gt=0)
+    security_rate_limit_upload_window_seconds: int = Field(default=60, gt=0)
+    security_rate_limit_admin_max_requests: int = Field(default=120, gt=0)
+    security_rate_limit_admin_window_seconds: int = Field(default=60, gt=0)
 
     model_config: ClassVar[SettingsConfigDict] = SettingsConfigDict(
         env_file=".env",

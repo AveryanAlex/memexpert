@@ -5,18 +5,21 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import pytest
-from pydantic import ValidationError
+from httpx import ASGITransport, AsyncClient, Response
 from sqlalchemy import func, select
+from starlette.requests import Request
 
-from memexpert.core.config import Settings
+from memexpert.api.security import SecurityRouteTier, classify_security_route
 from memexpert.core.redis import get_async_redis, is_async_redis_initialized, reset_async_redis_state
 from memexpert.models.user import LoginEvent, User
-from memexpert.services import AccountLinkService
+from memexpert.services import AccountLinkService, AuthService, UserService
+from tests.conftest import create_full_user_via_upgrade
+from tests.integration.test_auth_routes import ACCESS_COOKIE_NAME, build_test_auth_service
 
 if TYPE_CHECKING:
     import uuid
 
-    from httpx import AsyncClient
+    from fastapi import FastAPI
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 ALLOWED_BROWSER_ORIGINS = (
@@ -35,15 +38,22 @@ def security_settings_overrides(
     auth_settings_overrides: dict[str, str],
     redis_container_url: str,
 ) -> dict[str, str]:
-    """Tighten the dedicated security fixture to a tiny auth-write budget for rate-limit tests."""
+    """Tighten every shared security tier to a tiny budget for rate-limit tests."""
 
     return {
         **auth_settings_overrides,
         "REDIS_URL": redis_container_url,
-        "AUTH_REFRESH_COOKIE_SAMESITE": "lax",
         "SECURITY_RATE_LIMIT_REDIS_TIMEOUT_SECONDS": "0.1",
         "SECURITY_RATE_LIMIT_AUTH_WRITE_MAX_REQUESTS": "2",
         "SECURITY_RATE_LIMIT_AUTH_WRITE_WINDOW_SECONDS": "60",
+        "SECURITY_RATE_LIMIT_SEARCH_FEED_MAX_REQUESTS": "2",
+        "SECURITY_RATE_LIMIT_SEARCH_FEED_WINDOW_SECONDS": "60",
+        "SECURITY_RATE_LIMIT_WRITE_MAX_REQUESTS": "2",
+        "SECURITY_RATE_LIMIT_WRITE_WINDOW_SECONDS": "60",
+        "SECURITY_RATE_LIMIT_UPLOAD_MAX_REQUESTS": "2",
+        "SECURITY_RATE_LIMIT_UPLOAD_WINDOW_SECONDS": "60",
+        "SECURITY_RATE_LIMIT_ADMIN_MAX_REQUESTS": "2",
+        "SECURITY_RATE_LIMIT_ADMIN_WINDOW_SECONDS": "60",
     }
 
 
@@ -66,6 +76,49 @@ async def _count_auth_side_effects(
         user_count_result = await session.execute(select(func.count()).select_from(User))
         login_event_count_result = await session.execute(select(func.count()).select_from(LoginEvent))
         return user_count_result.scalar_one(), login_event_count_result.scalar_one()
+
+
+def _build_request(method: str, path: str) -> Request:
+    return Request(
+        {
+            "type": "http",
+            "method": method,
+            "path": path,
+            "headers": [],
+        }
+    )
+
+
+async def _post_operator_upload(client: AsyncClient) -> Response:
+    return await client.post(
+        "/api/v1/pipeline/uploads",
+        data={
+            "source_platform": "telegram",
+            "source_id": "channel-1",
+            "post_id": "post-1",
+            "views": "0",
+        },
+        files={"file": ("upload.png", b"fake-image-bytes", "image/png")},
+    )
+
+
+async def _issue_session_cookie(
+    session_factory: async_sessionmaker[AsyncSession],
+    auth_settings_overrides: dict[str, str],
+    *,
+    email: str,
+    is_admin: bool = False,
+) -> str:
+    async with session_factory() as session:
+        user_service = UserService(session)
+        auth_service: AuthService = build_test_auth_service(session, auth_settings_overrides)
+        user = await create_full_user_via_upgrade(user_service, email=email)
+        persisted_user = await session.get(User, user.id)
+        assert persisted_user is not None
+        persisted_user.is_admin = is_admin
+        await session.commit()
+        auth_session = await auth_service.issue_session_for_user(user)
+        return auth_session.access_token
 
 
 async def test_safe_read_routes_keep_redis_runtime_lazy_until_first_protected_request(
@@ -143,6 +196,30 @@ async def test_safe_read_routes_stay_available_when_redis_unavailable(
     assert is_async_redis_initialized() is False
 
 
+@pytest.mark.parametrize(
+    ("method", "path", "expected_tier"),
+    [
+        ("GET", "/api/v1/memes/search", SecurityRouteTier.SEARCH_FEED),
+        ("GET", "/api/v1/memes/browse", SecurityRouteTier.SEARCH_FEED),
+        ("GET", "/api/v1/memes/trending", SecurityRouteTier.SEARCH_FEED),
+        ("GET", "/api/v1/memes/trends", SecurityRouteTier.SEARCH_FEED),
+        ("GET", "/api/v1/memes/trends/tags", SecurityRouteTier.SEARCH_FEED),
+        ("POST", "/api/v1/collections", SecurityRouteTier.WRITE),
+        ("POST", "/api/v1/pipeline/uploads", SecurityRouteTier.UPLOAD),
+        ("GET", "/api/v1/admin/session", SecurityRouteTier.ADMIN),
+        ("POST", "/api/v1/auth/guest", SecurityRouteTier.AUTH_WRITE),
+    ],
+)
+def test_classify_security_route_matches_documented_tiers(
+    method: str,
+    path: str,
+    expected_tier: SecurityRouteTier,
+) -> None:
+    request = _build_request(method, path)
+
+    assert classify_security_route(request) is expected_tier
+
+
 async def test_auth_write_rate_limit_returns_retry_metadata_and_skips_safe_reads(
     security_client: AsyncClient,
 ) -> None:
@@ -206,6 +283,222 @@ async def test_auth_write_rate_limit_state_isolated_between_tests(
     assert guest_response.headers["X-RateLimit-Remaining"] == "1"
     assert logout_all_response.status_code == 204
     assert logout_all_response.headers["X-RateLimit-Remaining"] == "0"
+
+
+async def test_search_feed_rate_limit_returns_retry_metadata_on_trends_subpaths(
+    security_client: AsyncClient,
+) -> None:
+    first_response = await security_client.get("/api/v1/memes/trends/not-a-route")
+    second_response = await security_client.get("/api/v1/memes/trends/not-a-route")
+    limited_response = await security_client.get("/api/v1/memes/trends/not-a-route")
+    limited_payload = limited_response.json()
+
+    assert first_response.status_code == 404
+    assert first_response.headers["X-RateLimit-Limit"] == "2"
+    assert first_response.headers["X-RateLimit-Remaining"] == "1"
+    assert first_response.headers["X-RateLimit-Tier"] == "search_feed"
+
+    assert second_response.status_code == 404
+    assert second_response.headers["X-RateLimit-Remaining"] == "0"
+    assert second_response.headers["X-RateLimit-Tier"] == "search_feed"
+
+    assert limited_response.status_code == 429
+    assert limited_payload["code"] == "rate_limit_exceeded"
+    assert limited_response.headers["Retry-After"] == str(limited_payload["retry_after_seconds"])
+    assert limited_response.headers["X-RateLimit-Limit"] == "2"
+    assert limited_response.headers["X-RateLimit-Remaining"] == "0"
+    assert limited_response.headers["X-RateLimit-Tier"] == "search_feed"
+
+
+async def test_write_rate_limit_returns_retry_metadata_for_generic_versioned_writes(
+    security_client: AsyncClient,
+) -> None:
+    request_payload = {"title": "Writer route", "visibility": "private"}
+    first_response = await security_client.post("/api/v1/collections", json=request_payload)
+    second_response = await security_client.post("/api/v1/collections", json=request_payload)
+    limited_response = await security_client.post("/api/v1/collections", json=request_payload)
+    limited_payload = limited_response.json()
+
+    assert first_response.status_code == 401
+    assert first_response.json()["code"] == "invalid_token"
+    assert first_response.headers["X-RateLimit-Limit"] == "2"
+    assert first_response.headers["X-RateLimit-Remaining"] == "1"
+    assert first_response.headers["X-RateLimit-Tier"] == "write"
+
+    assert second_response.status_code == 401
+    assert second_response.headers["X-RateLimit-Remaining"] == "0"
+    assert second_response.headers["X-RateLimit-Tier"] == "write"
+
+    assert limited_response.status_code == 429
+    assert limited_payload["code"] == "rate_limit_exceeded"
+    assert limited_response.headers["Retry-After"] == str(limited_payload["retry_after_seconds"])
+    assert limited_response.headers["X-RateLimit-Limit"] == "2"
+    assert limited_response.headers["X-RateLimit-Remaining"] == "0"
+    assert limited_response.headers["X-RateLimit-Tier"] == "write"
+
+
+async def test_upload_rate_limit_returns_retry_metadata_before_operator_auth(
+    security_client: AsyncClient,
+) -> None:
+    first_response = await _post_operator_upload(security_client)
+    second_response = await _post_operator_upload(security_client)
+    limited_response = await _post_operator_upload(security_client)
+    limited_payload = limited_response.json()
+
+    assert first_response.status_code == 401
+    assert first_response.headers["X-RateLimit-Limit"] == "2"
+    assert first_response.headers["X-RateLimit-Remaining"] == "1"
+    assert first_response.headers["X-RateLimit-Tier"] == "upload"
+
+    assert second_response.status_code == 401
+    assert second_response.headers["X-RateLimit-Remaining"] == "0"
+    assert second_response.headers["X-RateLimit-Tier"] == "upload"
+
+    assert limited_response.status_code == 429
+    assert limited_payload["code"] == "rate_limit_exceeded"
+    assert limited_response.headers["Retry-After"] == str(limited_payload["retry_after_seconds"])
+    assert limited_response.headers["X-RateLimit-Limit"] == "2"
+    assert limited_response.headers["X-RateLimit-Remaining"] == "0"
+    assert limited_response.headers["X-RateLimit-Tier"] == "upload"
+
+
+async def test_admin_rate_limit_applies_to_safe_reads_and_returns_retry_metadata(
+    security_client: AsyncClient,
+) -> None:
+    first_response = await security_client.get("/api/v1/admin/session")
+    second_response = await security_client.get("/api/v1/admin/session")
+    limited_response = await security_client.get("/api/v1/admin/session")
+    limited_payload = limited_response.json()
+
+    assert first_response.status_code == 401
+    assert first_response.json()["code"] == "invalid_token"
+    assert first_response.headers["X-RateLimit-Limit"] == "2"
+    assert first_response.headers["X-RateLimit-Remaining"] == "1"
+    assert first_response.headers["X-RateLimit-Tier"] == "admin"
+
+    assert second_response.status_code == 401
+    assert second_response.headers["X-RateLimit-Remaining"] == "0"
+    assert second_response.headers["X-RateLimit-Tier"] == "admin"
+
+    assert limited_response.status_code == 429
+    assert limited_payload["code"] == "rate_limit_exceeded"
+    assert limited_response.headers["Retry-After"] == str(limited_payload["retry_after_seconds"])
+    assert limited_response.headers["X-RateLimit-Limit"] == "2"
+    assert limited_response.headers["X-RateLimit-Remaining"] == "0"
+    assert limited_response.headers["X-RateLimit-Tier"] == "admin"
+
+
+async def test_search_feed_rate_limit_uses_signed_user_subject_instead_of_shared_ip_bucket(
+    security_app: FastAPI,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    security_settings_overrides: dict[str, str],
+) -> None:
+    first_cookie = await _issue_session_cookie(
+        postgres_session_factory,
+        security_settings_overrides,
+        email="security-search-1@example.com",
+    )
+    second_cookie = await _issue_session_cookie(
+        postgres_session_factory,
+        security_settings_overrides,
+        email="security-search-2@example.com",
+    )
+    transport = ASGITransport(app=security_app)
+
+    async with AsyncClient(transport=transport, base_url="https://testserver") as first_client:
+        first_client.cookies.set(ACCESS_COOKIE_NAME, first_cookie)
+        first_response = await first_client.get("/api/v1/memes/trends/not-a-route")
+        second_first_response = await first_client.get("/api/v1/memes/trends/not-a-route")
+
+    async with AsyncClient(transport=transport, base_url="https://testserver") as second_client:
+        second_client.cookies.set(ACCESS_COOKIE_NAME, second_cookie)
+        second_response = await second_client.get("/api/v1/memes/trends/not-a-route")
+
+    assert first_response.status_code == 404
+    assert first_response.headers["X-RateLimit-Remaining"] == "1"
+    assert second_response.status_code == 404
+    assert second_response.headers["X-RateLimit-Remaining"] == "1"
+    assert second_first_response.status_code == 404
+    assert second_first_response.headers["X-RateLimit-Remaining"] == "0"
+
+
+async def test_write_rate_limit_uses_signed_user_subject_instead_of_shared_ip_bucket(
+    security_app: FastAPI,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    security_settings_overrides: dict[str, str],
+) -> None:
+    first_cookie = await _issue_session_cookie(
+        postgres_session_factory,
+        security_settings_overrides,
+        email="security-write-1@example.com",
+    )
+    second_cookie = await _issue_session_cookie(
+        postgres_session_factory,
+        security_settings_overrides,
+        email="security-write-2@example.com",
+    )
+    transport = ASGITransport(app=security_app)
+
+    async with AsyncClient(transport=transport, base_url="https://testserver") as first_client:
+        first_client.cookies.set(ACCESS_COOKIE_NAME, first_cookie)
+        first_response = await first_client.post(
+            "/api/v1/collections",
+            json={"title": "Security write one", "visibility": "private"},
+        )
+        second_first_response = await first_client.post(
+            "/api/v1/collections",
+            json={"title": "Security write two", "visibility": "private"},
+        )
+
+    async with AsyncClient(transport=transport, base_url="https://testserver") as second_client:
+        second_client.cookies.set(ACCESS_COOKIE_NAME, second_cookie)
+        second_response = await second_client.post(
+            "/api/v1/collections",
+            json={"title": "Security write three", "visibility": "private"},
+        )
+
+    assert first_response.status_code == 201
+    assert first_response.headers["X-RateLimit-Remaining"] == "1"
+    assert second_response.status_code == 201
+    assert second_response.headers["X-RateLimit-Remaining"] == "1"
+    assert second_first_response.status_code == 201
+    assert second_first_response.headers["X-RateLimit-Remaining"] == "0"
+
+
+async def test_admin_rate_limit_uses_signed_user_subject_instead_of_shared_ip_bucket(
+    security_app: FastAPI,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    security_settings_overrides: dict[str, str],
+) -> None:
+    first_cookie = await _issue_session_cookie(
+        postgres_session_factory,
+        security_settings_overrides,
+        email="security-admin-1@example.com",
+        is_admin=True,
+    )
+    second_cookie = await _issue_session_cookie(
+        postgres_session_factory,
+        security_settings_overrides,
+        email="security-admin-2@example.com",
+        is_admin=True,
+    )
+    transport = ASGITransport(app=security_app)
+
+    async with AsyncClient(transport=transport, base_url="https://testserver") as first_client:
+        first_client.cookies.set(ACCESS_COOKIE_NAME, first_cookie)
+        first_response = await first_client.get("/api/v1/admin/session")
+        second_first_response = await first_client.get("/api/v1/admin/session")
+
+    async with AsyncClient(transport=transport, base_url="https://testserver") as second_client:
+        second_client.cookies.set(ACCESS_COOKIE_NAME, second_cookie)
+        second_response = await second_client.get("/api/v1/admin/session")
+
+    assert first_response.status_code == 200
+    assert first_response.headers["X-RateLimit-Remaining"] == "1"
+    assert second_response.status_code == 200
+    assert second_response.headers["X-RateLimit-Remaining"] == "1"
+    assert second_first_response.status_code == 200
+    assert second_first_response.headers["X-RateLimit-Remaining"] == "0"
 
 
 @pytest.mark.parametrize(
@@ -382,6 +675,40 @@ async def test_csrf_allows_browser_guest_bootstrap_with_required_header_and_sets
     assert "memexpert_access_token=" in response.headers["set-cookie"]
 
 
+async def test_csrf_rejects_generic_browser_write_without_required_header(
+    browser_security_client: AsyncClient,
+) -> None:
+    response = await browser_security_client.post(
+        "/api/v1/collections",
+        headers={"Origin": "https://app.memexpert.net"},
+        json={"title": "csrf probe", "visibility": "private"},
+    )
+
+    assert response.status_code == 403
+    assert response.headers["Access-Control-Allow-Origin"] == "https://app.memexpert.net"
+    assert response.headers["Access-Control-Allow-Credentials"] == "true"
+    assert response.json()["code"] == "csrf_failed"
+    assert "x-requested-with" in response.json()["detail"].lower()
+
+
+async def test_csrf_generic_browser_write_proceeds_past_csrf_with_required_header(
+    browser_security_client: AsyncClient,
+) -> None:
+    response = await browser_security_client.post(
+        "/api/v1/collections",
+        headers={
+            "Origin": "https://app.memexpert.net",
+            "X-Requested-With": BROWSER_REQUESTED_WITH_VALUE,
+        },
+        json={"title": "csrf probe", "visibility": "private"},
+    )
+
+    assert response.status_code == 401
+    assert response.headers["Access-Control-Allow-Origin"] == "https://app.memexpert.net"
+    assert response.headers["Access-Control-Allow-Credentials"] == "true"
+    assert response.json()["code"] == "invalid_token"
+
+
 async def test_csrf_safe_get_remains_exempt_when_origin_is_present(
     browser_security_client: AsyncClient,
 ) -> None:
@@ -477,18 +804,3 @@ async def test_csrf_admin_browser_writes_require_header_before_auth_dependency(
     assert rejected_response.json()["code"] == "csrf_failed"
     assert accepted_response.status_code == 401
     assert accepted_response.json()["code"] == "invalid_token"
-
-
-@pytest.mark.parametrize(
-    ("field_name", "value"),
-    [
-        ("security_rate_limit_auth_write_max_requests", 0),
-        ("security_rate_limit_auth_write_window_seconds", 0),
-    ],
-)
-def test_auth_rate_limit_settings_reject_non_positive_values(
-    field_name: str,
-    value: int,
-) -> None:
-    with pytest.raises(ValidationError):
-        _ = Settings.model_validate({field_name: value})

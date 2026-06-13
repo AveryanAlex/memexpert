@@ -160,8 +160,15 @@ async def _reset_runtime_state_between_tests() -> AsyncIterator[None]:
 
 
 @pytest.fixture
-def app() -> FastAPI:
-    """Build a fresh FastAPI app instance for each test."""
+def app(monkeypatch: pytest.MonkeyPatch) -> FastAPI:
+    """Build a fresh FastAPI app instance for non-security tests.
+
+    Generic route/service tests are not about Redis-backed abuse controls, so
+    they run with shared rate limiting disabled unless they opt into one of the
+    dedicated security fixtures below.
+    """
+
+    monkeypatch.setenv("SECURITY_RATE_LIMIT_ENABLED", "false")
 
     return create_app()
 

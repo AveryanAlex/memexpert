@@ -68,7 +68,7 @@ def test_settings_load_from_env_file_and_ignore_extra(
     assert settings.redis_url == "redis://cache.example:6379/9"
 
 
-def test_settings_parse_security_origins_and_preserve_refresh_cookie_path() -> None:
+def test_settings_parse_security_origins_and_preserve_csrf_header_default() -> None:
     settings = Settings.model_validate(
         {
             "security_cors_allowed_origins": "https://memexpert.net, http://localhost:3000",
@@ -126,6 +126,29 @@ def test_settings_default_cors_origin_policy_matches_memexpert_net_but_not_other
 def test_settings_reject_blank_security_cors_allowed_origins() -> None:
     with pytest.raises(ValidationError):
         _ = Settings.model_validate({"security_cors_allowed_origins": "   "})
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("security_rate_limit_auth_write_max_requests", 0),
+        ("security_rate_limit_auth_write_window_seconds", 0),
+        ("security_rate_limit_search_feed_max_requests", 0),
+        ("security_rate_limit_search_feed_window_seconds", 0),
+        ("security_rate_limit_write_max_requests", 0),
+        ("security_rate_limit_write_window_seconds", 0),
+        ("security_rate_limit_upload_max_requests", 0),
+        ("security_rate_limit_upload_window_seconds", 0),
+        ("security_rate_limit_admin_max_requests", 0),
+        ("security_rate_limit_admin_window_seconds", 0),
+    ],
+)
+def test_security_rate_limit_settings_reject_non_positive_values(
+    field_name: str,
+    value: int,
+) -> None:
+    with pytest.raises(ValidationError):
+        _ = Settings.model_validate({field_name: value})
 
 
 @pytest.mark.parametrize(
