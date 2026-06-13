@@ -44,6 +44,7 @@ TRENDING_SNAPSHOT_WEIGHT = 0.25
 TRENDING_POPULARITY_WEIGHT = 0.15
 TRENDING_LIKE_WEIGHT = 0.05
 TRENDING_EVENT_WEIGHTS = {
+    AnalyticsEventType.MEME_DOWNLOAD: 2.0,
     AnalyticsEventType.MEME_VIEW: 1.0,
     AnalyticsEventType.MEME_SEND: 3.0,
     AnalyticsEventType.MEME_SAVE: 4.0,
@@ -518,7 +519,7 @@ class MemeSearchService:
         )
         scores: dict[uuid.UUID, float] = {}
         for event in result.scalars():
-            meme_id = _parse_uuid(event.payload.get("meme_id"))
+            meme_id = _analytics_event_meme_id(event.payload)
             if meme_id is None or meme_id not in meme_ids:
                 continue
             scores[meme_id] = scores.get(meme_id, 0.0) + TRENDING_EVENT_WEIGHTS[event.event_type]
@@ -1041,6 +1042,18 @@ def _parse_uuid(value: object) -> uuid.UUID | None:
         except ValueError:
             return None
     return None
+
+
+def _analytics_event_meme_id(payload: object) -> uuid.UUID | None:
+    if not isinstance(payload, dict):
+        return None
+    flat_meme_id = _parse_uuid(payload.get("meme_id"))
+    if flat_meme_id is not None:
+        return flat_meme_id
+    refs = payload.get("refs")
+    if not isinstance(refs, dict):
+        return None
+    return _parse_uuid(refs.get("meme_id"))
 
 
 def _normalize_value(value: float, max_value: float) -> float:

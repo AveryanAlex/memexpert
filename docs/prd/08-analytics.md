@@ -56,12 +56,14 @@ Core events:
 - **meme_detail_click:** user clicked from a feed/search/related block to a meme detail page
 - **meme_send / inline_chosen / inline_sent**
 - **meme_like / meme_save / meme_pin / meme_upload / meme_download / meme_share**
-- **collection_create / collection_invite / collection_join / bulk_action**
+- **collection_action** with `action` in payload for create/invite/join/add/remove/bulk flows
 - **meme_report**
 - **auth_event / account_merge**
 - **miniapp_open**
 - **channel_suggest:** user_id, channel_url
 - **inline_viral_tracking:** group_id (hashed), unique users from same group over time
+
+Current backend foundation decision: all strict interaction writes stay in the existing `analytics_events` table with a versioned payload envelope (`schema_version`, `actor_type`, `actor_account_type`, `surface`, `refs`, `properties`). Legacy names remain valid for compatibility, and recommendation/trend readers must accept both legacy flat `payload.meme_id` and strict `payload.refs.meme_id` during the transition, but new reusable writes should prefer the canonical event names above and must never store raw `group_id`, `chat_id`, tokens, authorization/cookie headers, request headers, IP addresses, or user agents.
 
 Required attribution fields where applicable:
 

@@ -110,18 +110,21 @@ General-purpose product analytics event stream. Key fields: `user_id`, `event_ty
 
 ### MemeInteractionEvent
 
-Append-only, recommendation-oriented interaction stream. This may be implemented as a dedicated table or as a strict subtype/schema on `AnalyticsEvent`, but the contract must support efficient reads by user and meme.
+Append-only, recommendation-oriented interaction stream. Implemented as a strict, versioned payload schema on `AnalyticsEvent` so MemeExpert keeps one durable `analytics_events` stream instead of splitting interaction writes into a second table.
 
 Key fields:
 
 - `user_id` (nullable only for truly anonymous telemetry; normal web guests have users)
 - `meme_id`
-- `event_type` (`impression`, `view`, `detail_click`, `download`, `favorite`, `save`, `pin`, `share`, `inline_served`, `inline_chosen`, `send`, etc.)
+- `event_type` keeps legacy values (`impression`, `view`, `click`, `favorite`, `save`, `share`, `meme_view`, `meme_send`, `meme_like`, `meme_save`, `search_query`, `inline_query`) and adds canonical meme-scoped/foundation values (`meme_impression`, `meme_detail_click`, `meme_download`, `meme_pin`, `meme_share`, `meme_report`, `inline_served`, `inline_chosen`, `inline_sent`, `collection_action`, `auth_event`, `account_merge`, `miniapp_open`, `channel_suggest`)
 - `surface` (`web_home`, `web_search`, `web_related`, `web_collection`, `telegram_inline`, `telegram_pm`, `miniapp`)
 - `source_algorithm` (`search`, `similarity`, `personalized`, `tag_related`, `trending`, `motd`, `collection`, `fallback`)
 - `source_meme_id` for related/similar flows
 - `collection_id`, `query`, `rank`, `score`, `score_components`, `reason`
 - `request_id` / `impression_id`
+- Payload envelope always stores `schema_version`, `actor_type`, `actor_account_type` (when a user exists), typed internal UUID refs under `refs`, and a JSON-safe `properties` bag for extra attribution.
+- Compatibility reads still accept legacy flat `payload.meme_id`, but new strict writes store meme attribution under `payload.refs.meme_id`.
+- Raw `group_id`, `chat_id`, tokens, authorization/cookie headers, IP addresses, user agents, and request headers are forbidden. External/chat identifiers must be hashed before storage.
 - `occurred_at`
 
 Indexes: `(user_id, occurred_at)`, `(meme_id, occurred_at)`, `(event_type, occurred_at)`, and optionally `(request_id)` / `(impression_id)` for attribution joins.

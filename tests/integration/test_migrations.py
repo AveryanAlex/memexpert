@@ -187,6 +187,44 @@ async def _get_column_names(engine: AsyncEngine, table_name: str) -> set[str]:
         return {cast(str, column_name) for column_name in result.scalars()}
 
 
+async def _get_varchar_length(engine: AsyncEngine, table_name: str, column_name: str) -> int | None:
+    async with engine.connect() as connection:
+        result = await connection.execute(
+            text(
+                """
+                SELECT character_maximum_length
+                FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = :table_name
+                  AND column_name = :column_name
+                """
+            ),
+            {"table_name": table_name, "column_name": column_name},
+        )
+        length = result.scalar_one_or_none()
+        return None if length is None else cast(int, length)
+
+
+async def _get_check_constraint_sql(engine: AsyncEngine, table_name: str) -> str:
+    async with engine.connect() as connection:
+        result = await connection.execute(
+            text(
+                """
+                SELECT pg_get_constraintdef(c.oid)
+                FROM pg_constraint c
+                JOIN pg_class t ON t.oid = c.conrelid
+                JOIN pg_namespace n ON n.oid = t.relnamespace
+                WHERE n.nspname = current_schema()
+                  AND t.relname = :table_name
+                  AND c.contype = 'c'
+                ORDER BY c.conname
+                """
+            ),
+            {"table_name": table_name},
+        )
+        return " ".join(cast(str, sql) for sql in result.scalars()).lower()
+
+
 async def _inspect_constraints(engine: AsyncEngine) -> ConstraintSnapshot:
     async with engine.connect() as connection:
         return await connection.run_sync(_inspect_constraints_sync)
@@ -254,9 +292,9 @@ def test_initial_revision_metadata_is_present() -> None:
     revision = script_directory.get_revision("head")
 
     assert revision is not None
-    assert revision.revision == "0013"
-    assert revision.down_revision == "0012"
-    assert revision.doc == "blocked perceptual hashes"
+    assert revision.revision == "0014"
+    assert revision.down_revision == "0013"
+    assert revision.doc == "interaction event foundation"
 
 
 async def test_upgrade_head_creates_expected_schema_and_constraints(
@@ -269,7 +307,7 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
 
     table_names = await _get_table_names(engine)
     assert table_names == EXPECTED_TABLES | {"alembic_version"}
-    assert await _get_current_revision(engine) == "0013"
+    assert await _get_current_revision(engine) == "0014"
     assert await _get_materialized_view_names(engine) == EXPECTED_MATERIALIZED_VIEWS
 
     users_indexes = await _get_index_definitions(engine, "users")
@@ -293,6 +331,8 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
     blocked_hash_audit_columns = await _get_column_names(engine, "blocked_perceptual_hash_audit_logs")
     blocked_hash_audit_indexes = await _get_index_definitions(engine, "blocked_perceptual_hash_audit_logs")
     pipeline_stage_journal_columns = await _get_column_names(engine, "pipeline_stage_journal")
+    analytics_event_type_length = await _get_varchar_length(engine, "analytics_events", "event_type")
+    analytics_event_checks = await _get_check_constraint_sql(engine, "analytics_events")
     constraints = await _inspect_constraints(engine)
 
     assert "uq_users_email_not_null" in users_indexes
@@ -485,6 +525,9 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
     assert "guest_user_id" in telegram_link_indexes["ix_telegram_link_codes_guest_user_id_expires_at"]
     assert "expires_at" in telegram_link_indexes["ix_telegram_link_codes_guest_user_id_expires_at"]
     assert "ix_telegram_link_codes_redeemed_by_telegram_id_redeemed_at" in telegram_link_indexes
+    assert analytics_event_type_length == 32
+    assert "meme_download" in analytics_event_checks
+    assert "inline_sent" in analytics_event_checks
     assert "uq_public_meme_trends_mv_meme_id" in public_meme_trends_indexes
     assert "UNIQUE" in public_meme_trends_indexes["uq_public_meme_trends_mv_meme_id"].upper()
     assert "ix_public_meme_trends_mv_trending" in public_meme_trends_indexes
@@ -566,7 +609,7 @@ async def test_crawler_sources_migration_applies_and_reverses(
     config = _build_alembic_config(database_url)
 
     await _run_alembic_command(command.upgrade, config, "head")
-    assert await _get_current_revision(engine) == "0013"
+    assert await _get_current_revision(engine) == "0014"
 
     meme_sources_columns = await _get_column_names(engine, "meme_sources")
     source_channels_columns = await _get_column_names(engine, "source_channels")
@@ -662,7 +705,7 @@ async def test_repeated_fresh_database_upgrades_work_after_a_full_downgrade(
     await _run_alembic_command(command.downgrade, config, "base")
     await _run_alembic_command(command.upgrade, config, "head")
 
-    assert await _get_current_revision(engine) == "0013"
+    assert await _get_current_revision(engine) == "0014"
     assert EXPECTED_TABLES.issubset(await _get_table_names(engine))
 
 
