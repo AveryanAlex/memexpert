@@ -17,8 +17,8 @@ use entities::{
 use migration::{Migrator, MigratorTrait};
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{
-    prelude::*, ActiveValue, ConnectOptions, Database, DatabaseTransaction, FromQueryResult,
-    IntoActiveModel, Order, QueryOrder, QuerySelect, TransactionTrait,
+    prelude::*, ActiveValue, ConnectOptions, ConnectionTrait, Database, DatabaseTransaction,
+    FromQueryResult, IntoActiveModel, Order, QueryOrder, QuerySelect, TransactionTrait,
 };
 
 use qdrant_client::qdrant::{
@@ -87,6 +87,7 @@ impl Storage {
 
         let dc = Database::connect(conn_options).await?;
         Migrator::up(&dc, None).await?;
+        Self::create_database_indexes(&dc).await?;
 
         let qd = Arc::new(Qdrant::from_url("http://127.0.0.1:6334").build()?);
 
@@ -99,6 +100,18 @@ impl Storage {
         storage.create_indexes().await?;
 
         Ok(storage)
+    }
+
+    /// Create PostgreSQL indexes that must be built outside SeaORM's transactional migrator.
+    async fn create_database_indexes(dc: &DatabaseConnection) -> Result<()> {
+        dc.execute_unprepared(
+            r#"CREATE INDEX CONCURRENTLY IF NOT EXISTS web_visits_nonbot_timestamp_meme_idx
+ON web_visits ("timestamp", meme_id)
+WHERE is_bot = false"#,
+        )
+        .await?;
+
+        Ok(())
     }
 
     /// Create qdrant index if it doesn't exist
