@@ -414,6 +414,39 @@ class Settings(BaseSettings):
             raise ValueError("auth_telegram_bot_username must not contain spaces.")
         return normalized_value
 
+    @field_validator("auth_access_cookie_name", mode="before")
+    @classmethod
+    def _normalize_auth_access_cookie_name(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+
+        normalized_value = value.strip()
+        if not normalized_value:
+            raise ValueError("auth_access_cookie_name must not be blank.")
+        return normalized_value
+
+    @field_validator("auth_access_cookie_path", mode="before")
+    @classmethod
+    def _normalize_auth_access_cookie_path(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+
+        normalized_value = value.strip()
+        if not normalized_value:
+            raise ValueError("auth_access_cookie_path must not be blank.")
+        if not normalized_value.startswith("/"):
+            raise ValueError("auth_access_cookie_path must start with '/'.")
+        return normalized_value
+
+    @field_validator("auth_access_cookie_domain", mode="before")
+    @classmethod
+    def _normalize_auth_access_cookie_domain(cls, value: object) -> object:
+        if value is None or not isinstance(value, str):
+            return value
+
+        normalized_value = value.strip()
+        return normalized_value or None
+
     @field_validator(
         "auth_google_client_id",
         "auth_google_redirect_uri",
@@ -441,6 +474,12 @@ class Settings(BaseSettings):
 
         normalized_value = value.strip()
         return normalized_value or None
+
+    @model_validator(mode="after")
+    def _validate_auth_access_cookie_security(self) -> Settings:
+        if self.auth_access_cookie_samesite == "none" and not self.auth_access_cookie_secure:
+            raise ValueError("auth_access_cookie_samesite='none' requires auth_access_cookie_secure=true.")
+        return self
 
     @field_validator("security_cors_allowed_origins", mode="before")
     @classmethod
