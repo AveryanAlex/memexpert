@@ -300,11 +300,22 @@ describe('catalog API client', () => {
     ).rejects.toEqual(new ApiError(404, 'Meme was not found.'));
   });
 
-  it('posts and deletes favorite actions with credentials', async () => {
-    const calls: Array<{ method: string | undefined; path: string; credentials: RequestCredentials | undefined }> = [];
+  it('posts and deletes favorite actions with credentials and CSRF-compatible request header', async () => {
+    const calls: Array<{
+      method: string | undefined;
+      path: string;
+      credentials: RequestCredentials | undefined;
+      requestedWith: string | null;
+    }> = [];
     const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === 'string' ? new URL(input, 'https://web.memexpert.test') : new URL(String(input));
-      calls.push({ method: init?.method, path: url.pathname, credentials: init?.credentials });
+      const headers = new Headers(init?.headers);
+      calls.push({
+        method: init?.method,
+        path: url.pathname,
+        credentials: init?.credentials,
+        requestedWith: headers.get('x-requested-with')
+      });
       return jsonResponse(init?.method === 'DELETE' ? { removed: true } : { id: 'collection-meme-1' });
     }) satisfies ApiFetch;
 
@@ -312,16 +323,17 @@ describe('catalog API client', () => {
     await unfavoriteMeme({ fetch: mockFetch, memeId: 'meme-123' });
 
     expect(calls).toEqual([
-      { method: 'POST', path: '/api/v1/memes/meme-123/favorite', credentials: 'include' },
-      { method: 'DELETE', path: '/api/v1/memes/meme-123/favorite', credentials: 'include' }
+      { method: 'POST', path: '/api/v1/memes/meme-123/favorite', credentials: 'include', requestedWith: 'XMLHttpRequest' },
+      { method: 'DELETE', path: '/api/v1/memes/meme-123/favorite', credentials: 'include', requestedWith: 'XMLHttpRequest' }
     ]);
   });
 
-  it('uses existing save and pin action endpoints', async () => {
-    const calls: Array<{ method: string | undefined; path: string }> = [];
+  it('uses existing save and pin action endpoints with CSRF-compatible request header', async () => {
+    const calls: Array<{ method: string | undefined; path: string; requestedWith: string | null }> = [];
     const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = new URL(String(input));
-      calls.push({ method: init?.method, path: url.pathname });
+      const headers = new Headers(init?.headers);
+      calls.push({ method: init?.method, path: url.pathname, requestedWith: headers.get('x-requested-with') });
       return jsonResponse(init?.method === 'DELETE' ? { removed: false } : { id: 'action-row-1' });
     }) satisfies ApiFetch;
 
@@ -331,10 +343,10 @@ describe('catalog API client', () => {
     await unpinMeme({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', memeId: 'meme-123' });
 
     expect(calls).toEqual([
-      { method: 'POST', path: '/api/v1/memes/meme-123/save' },
-      { method: 'DELETE', path: '/api/v1/memes/meme-123/save' },
-      { method: 'POST', path: '/api/v1/memes/meme-123/pin' },
-      { method: 'DELETE', path: '/api/v1/memes/meme-123/pin' }
+      { method: 'POST', path: '/api/v1/memes/meme-123/save', requestedWith: 'XMLHttpRequest' },
+      { method: 'DELETE', path: '/api/v1/memes/meme-123/save', requestedWith: 'XMLHttpRequest' },
+      { method: 'POST', path: '/api/v1/memes/meme-123/pin', requestedWith: 'XMLHttpRequest' },
+      { method: 'DELETE', path: '/api/v1/memes/meme-123/pin', requestedWith: 'XMLHttpRequest' }
     ]);
   });
 
@@ -438,6 +450,7 @@ describe('catalog API client', () => {
       expect(url.pathname).toBe('/api/v1/memes/11111111-1111-4111-8111-111111111111/favorite');
       expect(init?.method).toBe('POST');
       expect(headers.get('cookie')).toBe('memexpert_access_token=guest');
+      expect(headers.get('x-requested-with')).toBe('XMLHttpRequest');
 
       return jsonResponse({ id: 'save-1' });
     }) satisfies ApiFetch;
