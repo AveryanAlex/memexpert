@@ -595,7 +595,7 @@ async function apiJson<T>(
 }
 
 async function apiMutation<T>(path: string, method: 'DELETE' | 'POST', request: MemeActionRequest): Promise<T> {
-  const headers = new Headers({ accept: 'application/json' });
+  const headers = new Headers({ accept: 'application/json', 'x-requested-with': 'XMLHttpRequest' });
   if (request.cookieHeader) {
     headers.set('cookie', request.cookieHeader);
   }
