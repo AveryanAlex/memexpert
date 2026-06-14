@@ -66,6 +66,9 @@ from memexpert.services.search_index_sync import (
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
+    from memexpert.core.meilisearch import MeilisearchSyncClientProtocol
+    from memexpert.core.qdrant import QdrantSyncClientProtocol
+
 DEFAULT_API_BASE_URL: Final = "http://api:8000"
 DEFAULT_ARTIFACTS_DIR: Final = Path("/artifacts")
 DEFAULT_TIMEOUT_SECONDS: Final = 180.0
@@ -282,6 +285,23 @@ async def _run(args: argparse.Namespace) -> None:
             meme_id=detail.meme_id,
             query="cat",
         )
+        await resync_created_public_meme_indexes(
+            settings=settings,
+            meme_file_id=upload.meme_file_id,
+            qdrant_sync_client=qdrant_sync_client,
+            meili_client=meili_client,
+        )
+        created_search_payload = wait_for_public_search_contains(
+            api_client,
+            query="cat",
+            meme_id=detail.meme_id,
+            timeout_seconds=args.timeout_seconds,
+        )
+        created_detail_payload = assert_public_detail_resolves(
+            api_client,
+            slug=slug,
+            meme_id=detail.meme_id,
+        )
 
         seeded = await seed_direct_corpus(
             settings=settings,
@@ -295,11 +315,6 @@ async def _run(args: argparse.Namespace) -> None:
         assert_created_is_distinct(created_meme_id=detail.meme_id, seeded=seeded)
         created_search_payload = api_client.public_search("cat")
         assert_public_search_contains(created_search_payload, meme_id=detail.meme_id)
-        created_detail_payload = assert_public_detail_resolves(
-            api_client,
-            slug=slug,
-            meme_id=detail.meme_id,
-        )
         seeded_proofs = prove_seeded_public_corpus(api_client, seeded=seeded)
 
     artifact_payload = {
@@ -659,48 +674,152 @@ async def cleanup_seed_rows(session: AsyncSession, *, settings: Settings, specs:
 
 
 async def publish_created_meme(*, settings: Settings, meme_id: uuid.UUID, query: str) -> str:
-    slug = f"e2e-prd-created-{meme_id.hex[:12]}"
     session_factory = get_async_session_factory()
     async with session_factory() as session:
-        meme = await session.get(Meme, meme_id)
-        if meme is None:
-            raise E2ESeedError(f"Created meme {meme_id} is missing from the database.")
-        meme.is_public = True
-        meme.is_nsfw = False
-        if query not in meme.tags:
-            meme.tags = [*meme.tags, query, "e2e-prd"]
-        existing_seo = await session.get(MemeSeoPage, meme_id)
-        now = utcnow()
-        if existing_seo is None:
-            session.add(
-                MemeSeoPage(
-                    meme_id=meme_id,
-                    slug=slug,
-                    page_title="Created cat pipeline meme",
-                    meta_description="Created cat upload proven through the containerized PRD E2E pipeline.",
-                    alt_text="Generated red square cat pipeline upload",
-                    caption="Created cat pipeline meme",
-                    body_text="Generated upload proven through pipeline, Qdrant, Meilisearch, and public API.",
-                    tags=[query, "e2e-prd"],
-                    model_id=E2E_MODEL_ID,
-                    prompt_version=E2E_PROMPT_VERSION,
-                    generated_at=now,
-                ),
-            )
-        else:
-            existing_seo.slug = slug
-            existing_seo.page_title = "Created cat pipeline meme"
-            existing_seo.meta_description = "Created cat upload proven through the containerized PRD E2E pipeline."
-            existing_seo.alt_text = "Generated red square cat pipeline upload"
-            existing_seo.caption = "Created cat pipeline meme"
-            existing_seo.body_text = "Generated upload proven through pipeline, Qdrant, Meilisearch, and public API."
-            existing_seo.tags = [query, "e2e-prd"]
-            existing_seo.model_id = E2E_MODEL_ID
-            existing_seo.prompt_version = E2E_PROMPT_VERSION
-            existing_seo.generated_at = now
+        slug = await publish_created_meme_in_session(session, meme_id=meme_id, query=query)
         await session.commit()
     _ = settings
     return slug
+
+
+async def publish_created_meme_in_session(session: AsyncSession, *, meme_id: uuid.UUID, query: str) -> str:
+    slug = f"e2e-prd-created-{meme_id.hex[:12]}"
+    meme = await session.get(Meme, meme_id)
+    if meme is None:
+        raise E2ESeedError(f"Created meme {meme_id} is missing from the database.")
+    meme.is_public = True
+    meme.is_nsfw = False
+    tags = list(meme.tags)
+    for tag in (query, "e2e-prd"):
+        if tag not in tags:
+            tags.append(tag)
+    meme.tags = tags
+    existing_seo = await session.get(MemeSeoPage, meme_id)
+    now = utcnow()
+    if existing_seo is None:
+        session.add(
+            MemeSeoPage(
+                meme_id=meme_id,
+                slug=slug,
+                page_title="Created cat pipeline meme",
+                meta_description="Created cat upload proven through the containerized PRD E2E pipeline.",
+                alt_text="Generated red square cat pipeline upload",
+                caption="Created cat pipeline meme",
+                body_text="Generated upload proven through pipeline, Qdrant, Meilisearch, and public API.",
+                tags=[query, "e2e-prd"],
+                model_id=E2E_MODEL_ID,
+                prompt_version=E2E_PROMPT_VERSION,
+                generated_at=now,
+            ),
+        )
+    else:
+        existing_seo.slug = slug
+        existing_seo.page_title = "Created cat pipeline meme"
+        existing_seo.meta_description = "Created cat upload proven through the containerized PRD E2E pipeline."
+        existing_seo.alt_text = "Generated red square cat pipeline upload"
+        existing_seo.caption = "Created cat pipeline meme"
+        existing_seo.body_text = "Generated upload proven through pipeline, Qdrant, Meilisearch, and public API."
+        existing_seo.tags = [query, "e2e-prd"]
+        existing_seo.model_id = E2E_MODEL_ID
+        existing_seo.prompt_version = E2E_PROMPT_VERSION
+        existing_seo.generated_at = now
+    await session.flush()
+    return slug
+
+
+async def resync_created_public_meme_indexes(
+    *,
+    settings: Settings,
+    meme_file_id: uuid.UUID,
+    qdrant_sync_client: QdrantSyncClientProtocol,
+    meili_client: MeilisearchSyncClientProtocol,
+) -> None:
+    session_factory = get_async_session_factory()
+    async with session_factory() as session:
+        await resync_created_public_meme_indexes_in_session(
+            session,
+            settings=settings,
+            meme_file_id=meme_file_id,
+            qdrant_sync_client=qdrant_sync_client,
+            meili_client=meili_client,
+        )
+
+
+async def resync_created_public_meme_indexes_in_session(
+    session: AsyncSession,
+    *,
+    settings: Settings,
+    meme_file_id: uuid.UUID,
+    qdrant_sync_client: QdrantSyncClientProtocol,
+    meili_client: MeilisearchSyncClientProtocol,
+) -> None:
+    loaded_index_state = await load_search_index_state(
+        session,
+        meme_file_id,
+        vector_dimensions=settings.pipeline_voyage_output_dimensions,
+    )
+    canonical = loaded_index_state.canonical
+    if loaded_index_state.vector is None:
+        raise E2ESeedError(f"Created meme file {meme_file_id} has no embedding vector for Qdrant re-sync.")
+    if not canonical.is_public:
+        raise E2ESeedError(f"Created meme {canonical.meme_id} is not public after publish mutation.")
+    if canonical.seo_page_slug is None:
+        raise E2ESeedError(f"Created meme {canonical.meme_id} has no SEO slug after publish mutation.")
+
+    qdrant_payload = build_qdrant_sync_payload(canonical)
+    meili_document = build_meilisearch_document(canonical)
+    await qdrant_sync_client.upsert_meme_point(qdrant_payload, loaded_index_state.vector)
+    await meili_client.upsert_document(meili_document)
+
+    now = utcnow()
+    await _upsert_sync_snapshot(
+        session,
+        meme_file_id=meme_file_id,
+        target=SyncTargetKind.QDRANT,
+        preview={
+            "meme_id": str(qdrant_payload.meme_id),
+            "search_index_algorithm_version": qdrant_payload.search_index_algorithm_version,
+            "is_public": qdrant_payload.is_public,
+            "tags": list(qdrant_payload.tags),
+        },
+        now=now,
+    )
+    await _upsert_sync_snapshot(
+        session,
+        meme_file_id=meme_file_id,
+        target=SyncTargetKind.MEILISEARCH,
+        preview={
+            "id": meili_document.id,
+            "search_index_algorithm_version": meili_document.search_index_algorithm_version,
+            "is_public": meili_document.is_public,
+            "ocr_text": meili_document.ocr_text or "",
+        },
+        now=now,
+    )
+    await session.commit()
+
+
+def wait_for_public_search_contains(
+    client: PipelineApiClient,
+    *,
+    query: str,
+    meme_id: uuid.UUID,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_seconds
+    last_payload: dict[str, Any] | None = None
+    while time.monotonic() < deadline:
+        payload = client.public_search(query)
+        last_payload = payload
+        hit_ids = _public_search_hit_ids(payload)
+        if str(meme_id) in hit_ids:
+            return payload
+        time.sleep(POLL_INTERVAL_SECONDS)
+
+    hit_ids = _public_search_hit_ids(last_payload) if last_payload is not None else []
+    raise E2ESeedError(
+        f"Public search did not include created meme {meme_id} after post-publish re-sync; hits={hit_ids}",
+    )
 
 
 def wait_for_dual_synced(
@@ -861,23 +980,23 @@ def assert_public_detail_hidden(
 
 
 def assert_public_search_contains(payload: dict[str, Any], *, meme_id: uuid.UUID, label: str = "created meme") -> None:
-    hit_ids = [
-        item.get("meme", {}).get("id")
-        for item in payload.get("items", [])
-        if isinstance(item, dict)
-    ]
+    hit_ids = _public_search_hit_ids(payload)
     if str(meme_id) not in hit_ids:
         raise E2ESeedError(f"Public search did not include {label} {meme_id}; hits={hit_ids}")
 
 
 def assert_public_search_excludes(payload: dict[str, Any], *, meme_id: uuid.UUID, label: str) -> None:
-    hit_ids = [
+    hit_ids = _public_search_hit_ids(payload)
+    if str(meme_id) in hit_ids:
+        raise E2ESeedError(f"Anonymous public search exposed hidden {label} {meme_id}; hits={hit_ids}")
+
+
+def _public_search_hit_ids(payload: dict[str, Any]) -> list[object]:
+    return [
         item.get("meme", {}).get("id")
         for item in payload.get("items", [])
         if isinstance(item, dict)
     ]
-    if str(meme_id) in hit_ids:
-        raise E2ESeedError(f"Anonymous public search exposed hidden {label} {meme_id}; hits={hit_ids}")
 
 
 def build_seed_png_bytes(spec: SeedSpec) -> bytes:
@@ -933,6 +1052,36 @@ def _build_sync_snapshot(
         last_attempt_at=now,
         attempt_count=1,
     )
+
+
+async def _upsert_sync_snapshot(
+    session: AsyncSession,
+    *,
+    meme_file_id: uuid.UUID,
+    target: SyncTargetKind,
+    preview: dict[str, object],
+    now: datetime,
+) -> None:
+    existing = await session.scalar(
+        select(MemeFileSyncTargetSnapshot).where(
+            MemeFileSyncTargetSnapshot.meme_file_id == meme_file_id,
+            MemeFileSyncTargetSnapshot.sync_target == target,
+        ),
+    )
+    if existing is None:
+        session.add(_build_sync_snapshot(meme_file_id=meme_file_id, target=target, preview=preview, now=now))
+        await session.flush()
+        return
+
+    existing.status = SyncTargetStatus.SYNCED
+    existing.last_event_id = uuid.uuid7()
+    existing.normalized_reason = None
+    existing.last_error_text = None
+    existing.last_payload_preview = preview
+    existing.last_success_at = now
+    existing.last_attempt_at = now
+    existing.attempt_count = max(existing.attempt_count + 1, 1)
+    await session.flush()
 
 
 def _stable_uuid(name: str) -> uuid.UUID:
