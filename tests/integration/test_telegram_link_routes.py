@@ -70,7 +70,7 @@ async def test_telegram_link_start_route_persists_short_hash_only_code_and_retur
         assert persisted_row.redeemed_by_telegram_id is None
 
 
-async def test_telegram_link_refresh_replaces_stale_guest_cookie_after_in_place_upgrade(
+async def test_telegram_link_refresh_is_idempotent_after_in_place_upgrade(
     auth_client: AsyncClient,
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -90,8 +90,11 @@ async def test_telegram_link_refresh_replaces_stale_guest_cookie_after_in_place_
     assert link_result.merge_performed is False
     assert link_result.user.account_type.value == "full"
 
-    stale_response = await auth_client.get("/api/v1/auth/session")
-    assert stale_response.status_code == 401
+    current_before_refresh_response = await auth_client.get("/api/v1/auth/session")
+    assert current_before_refresh_response.status_code == 200
+    assert current_before_refresh_response.json()["user"]["id"] == guest_user_id
+    assert current_before_refresh_response.json()["user"]["account_type"] == "full"
+    assert current_before_refresh_response.json()["linked_providers"]["telegram_linked"] is True
 
     refresh_response = await auth_client.post("/api/v1/auth/session/refresh")
     payload = refresh_response.json()

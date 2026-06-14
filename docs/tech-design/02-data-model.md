@@ -21,7 +21,7 @@ Embeddings live in a separate cache table, not on MemeFile. This decouples embed
 
 ### User
 
-Account for both guest (website) and full (Telegram/linked) users. Key fields: `account_type` (guest/full), `status`, `telegram_id`, `google_id`, `email`, `password_hash`, `active_save_collection_id`, `nsfw_enabled`, `language`, `token_nonce`.
+Account for both guest (website) and full (Telegram/linked) users. Guest/full is a derived API/domain projection: an account is full when it has at least one linked login identity (`telegram_id`, `google_id`, `email`, or non-blank `password_hash`) and guest otherwise; no `account_type` column is stored. Key fields: `status`, `telegram_id`, `google_id`, `email`, `password_hash`, `active_save_collection_id`, `nsfw_enabled`, `language`, `token_nonce`.
 
 `token_nonce` is the server-side revocation primitive for cookie-backed access/session JWTs. Refresh-token rows are not part of the current auth design.
 

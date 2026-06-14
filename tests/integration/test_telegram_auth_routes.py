@@ -121,9 +121,10 @@ async def test_telegram_miniapp_route_first_open_creates_exactly_one_full_user_n
 
     The route bootstraps a throwaway guest and upgrades it in place (fresh
     telegram_id → no existing user to merge into), so the end state is one
-    user row with account_type=full. The transient bootstrap must not
-    leak as an extra guest row, and no AccountMergeLog should be written
-    because upgrade-in-place does not write the log.
+    user row whose linked Telegram identity derives account_type=full. The
+    transient bootstrap must not leak as an extra guest row, and no
+    AccountMergeLog should be written because upgrade-in-place does not write
+    the log.
     """
 
     response = await auth_client.post(

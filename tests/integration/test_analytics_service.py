@@ -11,7 +11,7 @@ from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from memexpert.models.enums import AccountType, AnalyticsEventType
+from memexpert.models.enums import AnalyticsEventType
 from memexpert.models.user import AccountMergeLog, AnalyticsEvent, User
 from memexpert.services.analytics import (
     AnalyticsService,
@@ -19,6 +19,7 @@ from memexpert.services.analytics import (
     InteractionEventRefs,
     InteractionEventWrite,
 )
+from tests.factories import build_full_user
 
 pytestmark = pytest.mark.asyncio
 
@@ -26,7 +27,7 @@ pytestmark = pytest.mark.asyncio
 async def test_record_interaction_event_persists_full_user_refs_and_utc_timestamp(
     migrated_db_session: AsyncSession,
 ) -> None:
-    user = User(account_type=AccountType.FULL)
+    user = build_full_user()
     migrated_db_session.add(user)
     await migrated_db_session.flush()
 
@@ -97,8 +98,8 @@ async def test_record_interaction_event_persists_full_user_refs_and_utc_timestam
 async def test_record_interaction_event_supports_guest_anonymous_and_system_actor_contexts(
     migrated_db_session: AsyncSession,
 ) -> None:
-    guest_user = User(account_type=AccountType.GUEST)
-    full_user = User(account_type=AccountType.FULL)
+    guest_user = User()
+    full_user = build_full_user()
     merge_log = AccountMergeLog(
         guest_account_id=uuid.uuid7(),
         target_account_id=uuid.uuid7(),
@@ -169,7 +170,7 @@ async def test_record_interaction_event_supports_guest_anonymous_and_system_acto
 async def test_record_interaction_event_rejects_unsafe_payloads_before_insert(
     migrated_db_session: AsyncSession,
 ) -> None:
-    user = User(account_type=AccountType.FULL)
+    user = build_full_user()
     migrated_db_session.add(user)
     await migrated_db_session.flush()
 

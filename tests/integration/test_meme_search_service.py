@@ -22,7 +22,6 @@ from memexpert.core.search_index_prefilter import SearchIndexPrefilter, SearchIn
 from memexpert.models.collection import Collection, CollectionMember, CollectionMeme, PinnedMeme
 from memexpert.models.content import Meme, MemeFile, MemePopularitySnapshot, MemeSeoPage, MemeTemplate
 from memexpert.models.enums import (
-    AccountType,
     AnalyticsEventType,
     CollectionKind,
     CollectionMembershipRole,
@@ -38,6 +37,7 @@ from memexpert.services.meme_search import MemeNotFoundError, MemeSearchFilters,
 from memexpert.services.meme_seo import MemeSeoGenerationService, MemeSeoProviderResult
 from memexpert.services.public_trends import PublicTrendsService, refresh_public_trend_materialized_views
 from memexpert.services.search_index_sync import SEARCH_INDEX_ALGORITHM_VERSION
+from tests.factories import build_full_user
 
 pytestmark = pytest.mark.asyncio
 
@@ -517,7 +517,7 @@ async def test_public_openapi_registers_catalog_routes_without_internal_surface(
 async def test_search_service_passes_conservative_prefilters_to_text_and_semantic_clients(
     migrated_db_session: AsyncSession,
 ) -> None:
-    viewer = User(account_type=AccountType.FULL)
+    viewer = build_full_user()
     migrated_db_session.add(viewer)
     await migrated_db_session.flush()
     requested_collection_id = uuid.uuid4()
@@ -731,8 +731,8 @@ async def test_search_route_scope_collections_returns_only_authorized_requested_
     client: AsyncClient,
     migrated_db_session: AsyncSession,
 ) -> None:
-    viewer = User(account_type=AccountType.FULL)
-    stranger = User(account_type=AccountType.FULL)
+    viewer = build_full_user()
+    stranger = build_full_user()
     migrated_db_session.add_all([viewer, stranger])
     await migrated_db_session.flush()
     authorized_private = await _create_meme(
@@ -804,7 +804,7 @@ async def test_search_route_scope_collections_returns_only_authorized_requested_
 async def test_public_search_and_detail_do_not_emit_authenticated_private_media(
     migrated_db_session: AsyncSession,
 ) -> None:
-    owner = User(account_type=AccountType.FULL)
+    owner = build_full_user()
     migrated_db_session.add(owner)
     await migrated_db_session.flush()
     public_meme = await _create_meme(migrated_db_session, popularity_score=20.0)
@@ -854,10 +854,10 @@ async def test_public_search_and_detail_do_not_emit_authenticated_private_media(
 async def test_search_scopes_filter_db_candidates_memberships_and_nsfw(
     migrated_db_session: AsyncSession,
 ) -> None:
-    viewer = User(account_type=AccountType.FULL)
-    editor_owner = User(account_type=AccountType.FULL)
-    viewer_owner = User(account_type=AccountType.FULL)
-    stranger = User(account_type=AccountType.FULL)
+    viewer = build_full_user()
+    editor_owner = build_full_user()
+    viewer_owner = build_full_user()
+    stranger = build_full_user()
     migrated_db_session.add_all([viewer, editor_owner, viewer_owner, stranger])
     await migrated_db_session.flush()
 
@@ -1089,8 +1089,8 @@ async def test_search_scopes_filter_db_candidates_memberships_and_nsfw(
 async def test_guest_search_scope_includes_guest_uploads_and_favorites(
     migrated_db_session: AsyncSession,
 ) -> None:
-    guest = User(account_type=AccountType.GUEST)
-    stranger = User(account_type=AccountType.FULL)
+    guest = User()
+    stranger = build_full_user()
     migrated_db_session.add_all([guest, stranger])
     await migrated_db_session.flush()
 
@@ -1172,7 +1172,7 @@ async def test_guest_search_scope_includes_guest_uploads_and_favorites(
 async def test_public_wrappers_stay_public_by_default_and_allow_authorized_scope_expansion(
     migrated_db_session: AsyncSession,
 ) -> None:
-    owner = User(account_type=AccountType.FULL)
+    owner = build_full_user()
     migrated_db_session.add(owner)
     await migrated_db_session.flush()
     public_meme = await _create_meme(migrated_db_session, popularity_score=1.0)
@@ -1239,8 +1239,8 @@ async def test_public_meme_dtos_include_viewer_action_state_for_anonymous_guest_
     favorite_meme.template_id = template.id
     saved_meme.template_id = template.id
     pinned_meme.template_id = template.id
-    guest_user = User(account_type=AccountType.GUEST)
-    full_user = User(account_type=AccountType.FULL)
+    guest_user = User()
+    full_user = build_full_user()
     migrated_db_session.add_all([guest_user, full_user])
     await migrated_db_session.flush()
 
@@ -1337,7 +1337,7 @@ async def test_public_page_viewer_action_state_uses_fixed_query_count(
     postgres_async_engine: AsyncEngine,
 ) -> None:
     memes = [await _create_meme(migrated_db_session, popularity_score=float(score)) for score in (30, 20, 10)]
-    user = User(account_type=AccountType.FULL)
+    user = build_full_user()
     migrated_db_session.add(user)
     await migrated_db_session.flush()
     user_id = user.id
@@ -2224,8 +2224,8 @@ async def test_public_routes_apply_nsfw_defaults_and_authenticated_opt_in(
     safe_meme = await _create_meme(migrated_db_session, popularity_score=10.0)
     nsfw_meme = await _create_meme(migrated_db_session, is_nsfw=True, popularity_score=100.0)
     guest_user = User(nsfw_enabled=True)
-    full_user = User(account_type=AccountType.FULL, nsfw_enabled=True)
-    full_user_without_nsfw = User(account_type=AccountType.FULL, nsfw_enabled=False)
+    full_user = build_full_user(nsfw_enabled=True)
+    full_user_without_nsfw = build_full_user(nsfw_enabled=False)
     migrated_db_session.add_all([guest_user, full_user, full_user_without_nsfw])
     await migrated_db_session.flush()
 
@@ -2270,7 +2270,7 @@ async def test_search_route_applies_nsfw_gate_for_anonymous_guest_and_full_accou
     safe_meme = await _create_meme(migrated_db_session, popularity_score=10.0)
     nsfw_meme = await _create_meme(migrated_db_session, is_nsfw=True, popularity_score=100.0)
     guest_user = User(nsfw_enabled=True)
-    full_user = User(account_type=AccountType.FULL, nsfw_enabled=True)
+    full_user = build_full_user(nsfw_enabled=True)
     migrated_db_session.add_all([guest_user, full_user])
     await migrated_db_session.flush()
     service = MemeSearchService(
@@ -2306,8 +2306,8 @@ async def test_detail_route_returns_not_found_for_missing_private_or_nsfw_withou
     client: AsyncClient,
     migrated_db_session: AsyncSession,
 ) -> None:
-    author = User(account_type=AccountType.FULL, nsfw_enabled=True)
-    stranger = User(account_type=AccountType.FULL, nsfw_enabled=True)
+    author = build_full_user(nsfw_enabled=True)
+    stranger = build_full_user(nsfw_enabled=True)
     migrated_db_session.add_all([author, stranger])
     await migrated_db_session.flush()
     private_meme = await _create_meme(migrated_db_session, is_public=False, author_user_id=author.id)
@@ -2344,9 +2344,9 @@ async def test_operator_launch_kpis_count_events_source_metrics_and_conversions(
     client: AsyncClient,
     migrated_db_session: AsyncSession,
 ) -> None:
-    user = User(account_type=AccountType.FULL)
-    guest = User(account_type=AccountType.GUEST)
-    target = User(account_type=AccountType.FULL)
+    user = build_full_user()
+    guest = User()
+    target = build_full_user()
     migrated_db_session.add_all([user, guest, target])
     await migrated_db_session.flush()
     meme = await _create_meme(migrated_db_session)

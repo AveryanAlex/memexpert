@@ -226,8 +226,8 @@ async def test_moderation_report_and_decision_orm_persist_admin_audit_history(
     model_contract_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     async with model_contract_session_factory() as session:
-        reporter = User(account_type=AccountType.FULL, email="reporter@example.com")
-        admin = User(account_type=AccountType.FULL, email="moderator@example.com", is_admin=True)
+        reporter = User(email="reporter@example.com")
+        admin = User(email="moderator@example.com", is_admin=True)
         meme = Meme(media_type=ContentKind.IMAGE, is_public=True, is_nsfw=False)
         report = ModerationReport(
             meme=meme,
@@ -279,7 +279,6 @@ async def test_schema_handles_cycles_multi_invites_and_nullable_content_fields(
 ) -> None:
     async with model_contract_session_factory() as session:
         owner = User(
-            account_type=AccountType.FULL,
             status=AccountStatus.ACTIVE,
             email="owner@example.com",
             language=UserLanguage.ANY,
@@ -649,8 +648,8 @@ async def test_constraints_reject_duplicate_provider_ids_and_duplicate_favorites
     async with model_contract_session_factory() as session:
         session.add_all(
             [
-                User(account_type=AccountType.FULL, google_id="google-subject-1"),
-                User(account_type=AccountType.FULL, google_id="google-subject-1"),
+                User(google_id="google-subject-1"),
+                User(google_id="google-subject-1"),
             ]
         )
 
@@ -681,7 +680,7 @@ async def test_constraints_reject_duplicate_provider_ids_and_duplicate_favorites
         await session.rollback()
 
     async with model_contract_session_factory() as session:
-        owner = User(account_type=AccountType.FULL, email="favorites@example.com")
+        owner = User(email="favorites@example.com")
         session.add(owner)
         await session.flush()
         session.add_all(
@@ -773,7 +772,6 @@ def test_public_schemas_validate_from_attributes_and_reject_invalid_enums() -> N
 
     user = User(
         id=user_id,
-        account_type=AccountType.FULL,
         status=AccountStatus.ACTIVE,
         email="reader@example.com",
         language=UserLanguage.RU,
@@ -820,7 +818,6 @@ def test_public_schemas_validate_from_attributes_and_reject_invalid_enums() -> N
     default_user_payload = UserRead.model_validate(
         User(
             id=uuid.uuid7(),
-            account_type=AccountType.GUEST,
             status=AccountStatus.ACTIVE,
             language=UserLanguage.ANY,
             nsfw_enabled=False,

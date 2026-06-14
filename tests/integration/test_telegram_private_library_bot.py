@@ -20,7 +20,6 @@ from memexpert.models.collection import Collection, CollectionMeme, PinnedMeme
 from memexpert.models.content import Meme, MemeFile
 from memexpert.models.enums import (
     AccountStatus,
-    AccountType,
     CollectionKind,
     CollectionMembershipRole,
     CollectionVisibility,
@@ -656,22 +655,22 @@ async def test_private_library_create_set_active_and_delete_collections_keep_fav
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("account_type", "status"),
+    ("user_kwargs", "expected_user_count"),
     [
-        (None, None),
-        (AccountType.GUEST, AccountStatus.ACTIVE),
-        (AccountType.FULL, AccountStatus.DELETION_PENDING),
+        (None, 0),
+        ({"status": AccountStatus.ACTIVE}, 1),
+        ({"status": AccountStatus.DELETION_PENDING, "telegram_id": TELEGRAM_ID}, 1),
     ],
 )
 async def test_private_library_requires_active_full_linked_telegram_user_without_creating_guests(
     migrated_db_session: AsyncSession,
     postgres_session_factory: async_sessionmaker[AsyncSession],
     postgres_async_url: str,
-    account_type: AccountType | None,
-    status: AccountStatus | None,
+    user_kwargs: dict[str, object] | None,
+    expected_user_count: int,
 ) -> None:
-    if account_type is not None and status is not None:
-        migrated_db_session.add(User(account_type=account_type, status=status, telegram_id=TELEGRAM_ID))
+    if user_kwargs is not None:
+        migrated_db_session.add(User(**user_kwargs))
     await migrated_db_session.commit()
     fake_service = FakePrivateLibraryCollectionService()
 
@@ -692,4 +691,4 @@ async def test_private_library_requires_active_full_linked_telegram_user_without
     assert "Сначала привяжите Telegram" in str(last_message(telegram_session).text)
     assert fake_service.calls == []
     async with postgres_session_factory() as session:
-        assert await session.scalar(select(func.count()).select_from(User)) == (0 if account_type is None else 1)
+        assert await session.scalar(select(func.count()).select_from(User)) == expected_user_count

@@ -293,9 +293,9 @@ def test_initial_revision_metadata_is_present() -> None:
     revision = script_directory.get_revision("head")
 
     assert revision is not None
-    assert revision.revision == "0014"
-    assert revision.down_revision == "0013"
-    assert revision.doc == "interaction event foundation"
+    assert revision.revision == "0015"
+    assert revision.down_revision == "0014"
+    assert revision.doc == "derive account type from login identities"
 
 
 async def test_upgrade_head_creates_expected_schema_and_constraints(
@@ -308,10 +308,11 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
 
     table_names = await _get_table_names(engine)
     assert table_names == EXPECTED_TABLES | {"alembic_version"}
-    assert await _get_current_revision(engine) == "0014"
+    assert await _get_current_revision(engine) == "0015"
     assert await _get_materialized_view_names(engine) == EXPECTED_MATERIALIZED_VIEWS
 
     users_indexes = await _get_index_definitions(engine, "users")
+    users_columns = await _get_column_names(engine, "users")
     collections_indexes = await _get_index_definitions(engine, "collections")
     meme_files_indexes = await _get_index_definitions(engine, "meme_files")
     meme_file_ocr_result_indexes = await _get_index_definitions(engine, "meme_file_ocr_results")
@@ -342,6 +343,8 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
     assert "google_id IS NOT NULL" in users_indexes["uq_users_google_id_not_null"]
     assert "uq_users_telegram_id_not_null" in users_indexes
     assert "telegram_id IS NOT NULL" in users_indexes["uq_users_telegram_id_not_null"]
+    assert "account_type" not in users_columns
+    assert "ix_users_account_type_status" not in users_indexes
 
     assert "uq_collections_one_favorites_per_owner" in collections_indexes
     favorites_index = collections_indexes["uq_collections_one_favorites_per_owner"]
@@ -610,7 +613,7 @@ async def test_crawler_sources_migration_applies_and_reverses(
     config = _build_alembic_config(database_url)
 
     await _run_alembic_command(command.upgrade, config, "head")
-    assert await _get_current_revision(engine) == "0014"
+    assert await _get_current_revision(engine) == "0015"
 
     meme_sources_columns = await _get_column_names(engine, "meme_sources")
     source_channels_columns = await _get_column_names(engine, "source_channels")
@@ -706,7 +709,7 @@ async def test_repeated_fresh_database_upgrades_work_after_a_full_downgrade(
     await _run_alembic_command(command.downgrade, config, "base")
     await _run_alembic_command(command.upgrade, config, "head")
 
-    assert await _get_current_revision(engine) == "0014"
+    assert await _get_current_revision(engine) == "0015"
     assert EXPECTED_TABLES.issubset(await _get_table_names(engine))
 
 

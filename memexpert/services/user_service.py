@@ -237,7 +237,6 @@ class UserService:
 
         now = utcnow()
         user = User(
-            account_type=AccountType.GUEST,
             status=AccountStatus.ACTIVE,
             language=language,
             nsfw_enabled=nsfw_enabled,
@@ -411,7 +410,6 @@ class UserService:
             email=normalized_email if user.email is None else None,
         )
 
-        user.account_type = AccountType.FULL
         user.guest_expires_at = None
         if normalized_telegram_id is not None:
             user.telegram_id = normalized_telegram_id

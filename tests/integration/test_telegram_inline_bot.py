@@ -29,7 +29,6 @@ from memexpert.models.collection import CollectionMeme, PinnedMeme
 from memexpert.models.content import Meme, MemeFile, TelegramFileIdCache
 from memexpert.models.enums import (
     AccountStatus,
-    AccountType,
     AnalyticsEventType,
     ContentKind,
     ContentLanguage,
@@ -423,7 +422,6 @@ async def test_inline_plain_text_query_uses_linked_full_user_scope_and_nsfw_pref
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     linked_user = User(
-        account_type=AccountType.FULL,
         status=AccountStatus.ACTIVE,
         telegram_id=TELEGRAM_ID,
         nsfw_enabled=True,
@@ -798,7 +796,7 @@ async def test_inline_empty_query_for_linked_user_returns_pins_and_is_personal(
     postgres_async_url: str,
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    user = User(account_type=AccountType.FULL, telegram_id=TELEGRAM_ID)
+    user = User(telegram_id=TELEGRAM_ID)
     migrated_db_session.add(user)
     pinned_meme, pinned_file = await create_meme_file(
         migrated_db_session,
@@ -855,7 +853,7 @@ async def test_inline_empty_query_for_linked_user_falls_back_to_recent_sends_whe
     postgres_async_url: str,
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    user = User(account_type=AccountType.FULL, telegram_id=TELEGRAM_ID)
+    user = User(telegram_id=TELEGRAM_ID)
     migrated_db_session.add(user)
     recent_meme, recent_file = await create_meme_file(
         migrated_db_session,
@@ -918,7 +916,7 @@ async def test_inline_empty_query_for_linked_user_falls_back_to_popular_when_no_
     postgres_async_url: str,
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    user = User(account_type=AccountType.FULL, status=AccountStatus.ACTIVE, telegram_id=TELEGRAM_ID)
+    user = User(status=AccountStatus.ACTIVE, telegram_id=TELEGRAM_ID)
     migrated_db_session.add(user)
     popular_meme, popular_file = await create_meme_file(
         migrated_db_session,
@@ -963,7 +961,7 @@ async def test_inline_empty_query_skips_unsendable_pin_and_uses_later_popular_fa
     postgres_async_url: str,
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    user = User(account_type=AccountType.FULL, status=AccountStatus.ACTIVE, telegram_id=TELEGRAM_ID)
+    user = User(status=AccountStatus.ACTIVE, telegram_id=TELEGRAM_ID)
     migrated_db_session.add(user)
     video_meme, _ = await create_meme_file(
         migrated_db_session,
@@ -1010,21 +1008,19 @@ async def test_inline_empty_query_skips_unsendable_pin_and_uses_later_popular_fa
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("account_type", "status"),
+    "status",
     [
-        (AccountType.FULL, AccountStatus.DELETION_PENDING),
-        (AccountType.FULL, AccountStatus.DELETED),
-        (AccountType.GUEST, AccountStatus.ACTIVE),
+        AccountStatus.DELETION_PENDING,
+        AccountStatus.DELETED,
     ],
 )
 async def test_inline_empty_query_treats_ineligible_linked_users_as_guests(
     migrated_db_session: AsyncSession,
     postgres_async_url: str,
     postgres_session_factory: async_sessionmaker[AsyncSession],
-    account_type: AccountType,
     status: AccountStatus,
 ) -> None:
-    user = User(account_type=account_type, status=status, telegram_id=TELEGRAM_ID)
+    user = User(status=status, telegram_id=TELEGRAM_ID)
     migrated_db_session.add(user)
     popular_meme, popular_file = await create_meme_file(
         migrated_db_session,

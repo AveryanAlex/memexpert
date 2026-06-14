@@ -29,7 +29,6 @@ from memexpert.services.errors import (
     InvalidTokenError,
     MissingTokenError,
     UpgradeRequiredError,
-    UserStateMismatchError,
 )
 from memexpert.services.user_service import UserService
 
@@ -191,12 +190,6 @@ class AuthService:
                 "Session has been revoked; please sign in again.",
             )
 
-        token_account_type = payload.get("account_type")
-        if token_account_type is not None and token_account_type != current_user.account_type.value:
-            raise UserStateMismatchError(
-                "Access token no longer matches the current persisted account state.",
-            )
-
         self._ensure_account_is_available(current_user)
 
         if require_full_account and current_user.account_type is not AccountType.FULL:
@@ -213,10 +206,10 @@ class AuthService:
     ) -> AuthSession:
         """Issue a fresh cookie session for a browser returning from an external link flow.
 
-        Normal verification intentionally rejects a guest JWT after Telegram upgrades that
-        same row to a full account, because the token's ``account_type`` claim is stale.
-        This refresh path is narrower: it still requires a valid, unexpired cookie token
-        and matching nonce for surviving users, but tolerates that one state transition.
+        Normal verification reloads the current user row and derives account type from
+        linked identities instead of trusting a stale token claim. This refresh path is
+        narrower: it still requires a valid, unexpired cookie token and matching nonce
+        for surviving users, while also handling guest rows merged into existing full accounts.
         When the guest was merged into an existing full account, the merge audit log is
         used to move the browser session to the canonical target account.
         """
@@ -301,7 +294,6 @@ class AuthService:
             "iat": issued_at,
             "exp": expires_at,
             "nonce": user.token_nonce,
-            "account_type": user.account_type.value,
         }
         return jwt.encode(
             payload,

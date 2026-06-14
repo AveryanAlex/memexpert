@@ -87,10 +87,6 @@ class AuthenticatedUserNotFoundError(InvalidTokenError):
     """Raised when token claims refer to a user row that no longer exists."""
 
 
-class UserStateMismatchError(InvalidTokenError):
-    """Raised when bearer claims no longer match the current persisted user state."""
-
-
 class UpgradeRequiredError(AuthServiceError):
     """Raised when a guest account attempts a full-account-only operation."""
 
@@ -387,5 +383,4 @@ __all__ = [
     "UpgradeRequiredError",
     "UserNotFoundError",
     "UserServiceError",
-    "UserStateMismatchError",
 ]

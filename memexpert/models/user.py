@@ -7,8 +7,9 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import BigInteger, CheckConstraint, ForeignKey, Index, String, Text, text
+from sqlalchemy import BigInteger, CheckConstraint, ForeignKey, Index, String, Text, case, func, or_, text
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.orm import Mapped, foreign, mapped_column, relationship
 
 from memexpert.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin, utcnow
@@ -52,7 +53,6 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             unique=True,
             postgresql_where=text("email IS NOT NULL"),
         ),
-        Index("ix_users_account_type_status", "account_type", "status"),
     )
 
     def __init__(self, **kwargs: object) -> None:
@@ -61,11 +61,6 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         kwargs.setdefault("is_admin", False)
         super().__init__(**kwargs)
 
-    account_type: Mapped[AccountType] = mapped_column(
-        string_enum(AccountType),
-        default=AccountType.GUEST,
-        nullable=False,
-    )
     status: Mapped[AccountStatus] = mapped_column(
         string_enum(AccountStatus),
         default=AccountStatus.ACTIVE,
@@ -98,6 +93,41 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         server_default=text("0"),
         nullable=False,
     )
+
+    @hybrid_property
+    def has_linked_login_identity(self) -> bool:
+        """Return whether this user has any durable login identity attached."""
+
+        return (
+            self.telegram_id is not None
+            or self.google_id is not None
+            or self.email is not None
+            or (self.password_hash is not None and bool(self.password_hash.strip()))
+        )
+
+    @has_linked_login_identity.inplace.expression
+    @classmethod
+    def _has_linked_login_identity_expression(cls):
+        return or_(
+            cls.telegram_id.is_not(None),
+            cls.google_id.is_not(None),
+            cls.email.is_not(None),
+            func.length(func.trim(cls.password_hash)) > 0,
+        )
+
+    @hybrid_property
+    def account_type(self) -> AccountType:
+        """Derived public account type based on linked login identities."""
+
+        return AccountType.FULL if self.has_linked_login_identity else AccountType.GUEST
+
+    @account_type.inplace.expression
+    @classmethod
+    def _account_type_expression(cls):
+        return case(
+            (cls.has_linked_login_identity, AccountType.FULL.value),
+            else_=AccountType.GUEST.value,
+        )
 
     active_save_collection: Mapped["Collection | None"] = relationship(
         "Collection",

@@ -648,18 +648,14 @@ async def _resolve_active_linked_user_id(
     *,
     telegram_user_id: int,
 ) -> tuple[uuid.UUID | None, bool]:
-    row = await session.execute(
-        select(User.id, User.account_type, User.status).where(User.telegram_id == telegram_user_id)
-    )
-    user = row.one_or_none()
+    user = await session.scalar(select(User).where(User.telegram_id == telegram_user_id))
     if user is None:
         return None, False
-    user_id, account_type, status = user
-    if account_type is not AccountType.FULL:
+    if user.account_type is not AccountType.FULL:
         return None, False
-    if status is not AccountStatus.ACTIVE:
+    if user.status is not AccountStatus.ACTIVE:
         return None, True
-    return user_id, False
+    return user.id, False
 
 
 class _InlineCandidate:

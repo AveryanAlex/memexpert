@@ -76,7 +76,6 @@ from memexpert.services.errors import (
     UpgradeRequiredError,
     UserNotFoundError,
     UserServiceError,
-    UserStateMismatchError,
 )
 from memexpert.services.meme_search import MemeNotFoundError, MemeSearchFilters, MemeSearchScope, MemeSearchService
 from memexpert.services.meme_seo import (
@@ -185,7 +184,6 @@ __all__ = [
     "UserNotFoundError",
     "UserService",
     "UserServiceError",
-    "UserStateMismatchError",
     "build_meme_seo_provider",
     "normalize_channel_suggestion",
 ]

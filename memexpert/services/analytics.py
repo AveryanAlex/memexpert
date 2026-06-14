@@ -337,9 +337,10 @@ class AnalyticsService:
             return actor_type, None
 
         actor_type = write.actor_type or InteractionActorType.USER
-        account_type = await self._session.scalar(select(User.account_type).where(User.id == write.user_id))
-        if account_type is None:
+        user = await self._session.scalar(select(User).where(User.id == write.user_id))
+        if user is None:
             raise ValueError(f"Unknown analytics user_id '{write.user_id}'")
+        account_type = user.account_type
         if actor_type != InteractionActorType.USER:
             raise ValueError("Non-user actor types cannot carry user_id")
         if write.actor_account_type is not None and write.actor_account_type != account_type:

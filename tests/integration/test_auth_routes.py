@@ -201,7 +201,6 @@ async def test_me_route_accepts_cookie_only_caller_and_rejects_expired_tokens(
                 "iat": now - timedelta(minutes=10),
                 "exp": now - timedelta(minutes=5),
                 "nonce": 0,
-                "account_type": "guest",
             },
             auth_settings_overrides["AUTH_JWT_SECRET"],
             algorithm="HS256",

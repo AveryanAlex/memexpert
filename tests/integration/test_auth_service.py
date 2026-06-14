@@ -23,7 +23,6 @@ from memexpert.services import (
     InvalidTokenError,
     UpgradeRequiredError,
     UserService,
-    UserStateMismatchError,
 )
 from tests.conftest import create_full_user_via_upgrade
 
@@ -74,7 +73,6 @@ def build_access_token(
     *,
     user_id: uuid.UUID,
     nonce: int = 0,
-    account_type: AccountType = AccountType.GUEST,
     token_type: str = "access",
     issued_at: datetime | None = None,
     expires_at: datetime | None = None,
@@ -89,7 +87,6 @@ def build_access_token(
                 "iat": resolved_issued_at,
                 "exp": resolved_expires_at,
                 "nonce": nonce,
-                "account_type": account_type.value,
             },
             JWT_SECRET,
             algorithm="HS256",
@@ -133,7 +130,7 @@ async def test_create_guest_session_composes_guest_bootstrap_and_records_login_e
     assert access_token_claims["sub"] == str(session.user.id)
     assert access_token_claims["type"] == "access"
     assert access_token_claims["nonce"] == 0
-    assert access_token_claims["account_type"] == AccountType.GUEST.value
+    assert "account_type" not in access_token_claims
     assert access_token_claims["exp"] - access_token_claims["iat"] == int(ACCESS_TOKEN_TTL.total_seconds())
 
     login_event_result = await migrated_db_session.execute(
@@ -182,7 +179,6 @@ async def test_verify_access_token_rejects_malformed_missing_claim_and_wrong_typ
                 "sub": str(session.user.id),
                 "type": "access",
                 "exp": datetime.now(UTC) + ACCESS_TOKEN_TTL,
-                "account_type": AccountType.GUEST.value,
             },
             JWT_SECRET,
             algorithm="HS256",
@@ -193,7 +189,6 @@ async def test_verify_access_token_rejects_malformed_missing_claim_and_wrong_typ
 
     wrong_type_token = build_access_token(
         user_id=session.user.id,
-        account_type=AccountType.GUEST,
         token_type="refresh",
     )
     with pytest.raises(InvalidTokenError, match="unexpected type"):
@@ -231,11 +226,16 @@ async def test_verify_access_token_reloads_current_user_state_and_enforces_full_
 
     guest_result = await migrated_db_session.execute(select(User).where(User.id == guest_session.user.id))
     persisted_guest = guest_result.scalar_one()
-    persisted_guest.account_type = AccountType.FULL
+    persisted_guest.email = "upgraded-current-state@example.com"
+    persisted_guest.guest_expires_at = None
     await migrated_db_session.commit()
 
-    with pytest.raises(UserStateMismatchError, match="persisted account state"):
-        _ = await auth_service.verify_access_token(guest_session.access_token)
+    verified_upgraded_user = await auth_service.verify_access_token(
+        guest_session.access_token,
+        require_full_account=True,
+    )
+    assert verified_upgraded_user.id == guest_session.user.id
+    assert verified_upgraded_user.account_type is AccountType.FULL
 
     full_user = await create_full_user_via_upgrade(user_service, email="full@example.com")
     full_session = await auth_service.issue_session_for_user(full_user)

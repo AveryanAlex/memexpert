@@ -148,8 +148,8 @@ async def test_email_signup_link_upgrades_guest_in_place_issues_canonical_sessio
     guest_payload = guest_response.json()
     guest_user_id = uuid.UUID(guest_payload["user"]["id"])
     # Capture the pre-upgrade guest token so we can later re-attach it
-    # and prove that stale claims (account_type=guest) fail verification
-    # against the post-upgrade user row (account_type=full).
+    # and prove verification reloads the row and derives account type
+    # from the newly linked identity instead of trusting a stale claim.
     stale_guest_access_token = auth_client.cookies.get(ACCESS_COOKIE_NAME)
     assert stale_guest_access_token is not None
 
@@ -166,8 +166,8 @@ async def test_email_signup_link_upgrades_guest_in_place_issues_canonical_sessio
     # The signup response rotated the cookie to the canonical session.
     linked_providers_response = await auth_client.get("/api/v1/auth/linked-providers")
 
-    # Forge the old guest cookie back onto the client to verify the
-    # post-upgrade user row rejects the stale account_type claim.
+    # Forge the old guest cookie back onto the client; without an account-type
+    # token claim, verification should reload the upgraded row successfully.
     auth_client.cookies.set(ACCESS_COOKIE_NAME, stale_guest_access_token)
     stale_guest_response = await auth_client.get("/api/v1/auth/me")
 
@@ -197,12 +197,9 @@ async def test_email_signup_link_upgrades_guest_in_place_issues_canonical_sessio
         "telegram_linked": False,
     }
 
-    # The upgrade changes the user's account_type from GUEST to FULL, so
-    # the stale bearer's `account_type` claim no longer matches the live
-    # user row and verify_access_token raises UserStateMismatchError
-    # (which the route layer renders as 401 invalid_token).
-    assert stale_guest_response.status_code == 401
-    assert stale_guest_response.json()["code"] == "invalid_token"
+    assert stale_guest_response.status_code == 200
+    assert stale_guest_response.json()["account_type"] == "full"
+    assert stale_guest_response.json()["email"] == "linkuser@example.com"
 
     async with postgres_session_factory() as session:
         merge_log_count_result = await session.execute(select(func.count()).select_from(AccountMergeLog))
