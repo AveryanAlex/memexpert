@@ -37,10 +37,12 @@ from memexpert.api.dependencies.meme import (
     MemeReportServiceDep,
     MemeSearchServiceDep,
     PublicTrendsServiceDep,
+    SeoCatalogServiceDep,
     get_analytics_service,
     get_meme_report_service,
     get_meme_search_service,
     get_public_trends_service,
+    get_seo_catalog_service,
 )
 from memexpert.api.dependencies.pipeline import (
     PIPELINE_ERROR_RESPONSES,
@@ -83,6 +85,7 @@ __all__ = [
     "PipelineServiceDep",
     "ProviderAuthServiceDep",
     "PublicTrendsServiceDep",
+    "SeoCatalogServiceDep",
     "auth_http_exception_handler",
     "forbid_full_account_caller",
     "get_account_link_service",
@@ -101,6 +104,7 @@ __all__ = [
     "get_or_bootstrap_guest_user",
     "get_provider_auth_service",
     "get_public_trends_service",
+    "get_seo_catalog_service",
     "pipeline_http_exception_handler",
     "require_pipeline_operator_token",
     "to_auth_http_error",
