@@ -179,21 +179,28 @@ async def create_meme_file(
     mime_type: str,
     s3_original_key: str | None = None,
 ) -> tuple[Meme, MemeFile]:
-    meme = Meme(media_type=media_type, language=ContentLanguage.EN, tags=[media_type.value], popularity_score=42.0)
-    session.add(meme)
-    await session.flush()
+    meme_id = uuid.uuid7()
+    file_id = uuid.uuid7()
+    meme = Meme(
+        id=meme_id,
+        media_type=media_type,
+        primary_file_id=file_id,
+        language=ContentLanguage.EN,
+        tags=[media_type.value],
+        popularity_score=42.0,
+    )
     file = MemeFile(
-        meme_id=meme.id,
-        s3_original_key=s3_original_key or f"memes/{meme.id}",
+        id=file_id,
+        meme_id=meme_id,
+        s3_original_key=s3_original_key or f"memes/{meme_id}",
         mime_type=mime_type,
         width=640,
         height=480,
         quality_score=0.9,
-        is_primary=True,
     )
-    session.add(file)
+    session.add(meme)
     await session.flush()
-    meme.primary_file_id = file.id
+    session.add(file)
     await session.flush()
     return meme, file
 

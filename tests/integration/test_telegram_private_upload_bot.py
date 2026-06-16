@@ -159,28 +159,30 @@ async def seed_meme(
     is_public: bool,
     author_user_id: uuid.UUID | None = None,
 ) -> tuple[Meme, MemeFile]:
+    meme_id = uuid.uuid7()
+    file_id = uuid.uuid7()
     meme = Meme(
+        id=meme_id,
         media_type=ContentKind.IMAGE,
+        primary_file_id=file_id,
         language=ContentLanguage.EN,
         is_public=is_public,
         author_user_id=author_user_id,
     )
-    session.add(meme)
-    await session.flush()
     file = MemeFile(
-        meme_id=meme.id,
+        id=file_id,
+        meme_id=meme_id,
         status=ContentProcessingStatus.PENDING,
         width=100,
         height=100,
         file_size_bytes=5,
         mime_type="image/png",
-        s3_original_key=f"pipeline/originals/{meme.id}/original.png",
-        perceptual_hash=f"hash-{meme.id}",
-        is_primary=True,
+        s3_original_key=f"pipeline/originals/{meme_id}/original.png",
+        perceptual_hash=f"hash-{meme_id}",
     )
-    session.add(file)
+    session.add(meme)
     await session.flush()
-    meme.primary_file_id = file.id
+    session.add(file)
     await session.flush()
     return meme, file
 

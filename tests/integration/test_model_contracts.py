@@ -163,13 +163,32 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
     configure_mappers()
 
     assert set(metadata.tables) == EXPECTED_TABLES
+    memes_table = metadata.tables["memes"]
+    meme_files_table = metadata.tables["meme_files"]
     assert "invite_link" not in metadata.tables["collections"].c
     assert metadata.tables["users"].c["active_save_collection_id"].foreign_keys
     assert metadata.tables["collections"].c["owner_id"].foreign_keys
-    assert metadata.tables["memes"].c["primary_file_id"].foreign_keys
-    assert metadata.tables["meme_files"].c["meme_id"].foreign_keys
+    assert not memes_table.c["primary_file_id"].nullable
+    assert meme_files_table.c["meme_id"].foreign_keys
+    assert any(
+        isinstance(constraint, UniqueConstraint)
+        and constraint.name == "uq_meme_files_meme_id_id"
+        and [column.name for column in constraint.columns] == ["meme_id", "id"]
+        for constraint in meme_files_table.constraints
+    )
+    primary_file_fk = next(
+        constraint
+        for constraint in memes_table.foreign_key_constraints
+        if constraint.name == "fk_memes_primary_file_id_meme_files"
+    )
+    assert [column.name for column in primary_file_fk.columns] == ["id", "primary_file_id"]
+    assert [(element.column.table.name, element.column.name) for element in primary_file_fk.elements] == [
+        ("meme_files", "meme_id"),
+        ("meme_files", "id"),
+    ]
+    assert primary_file_fk.deferrable is True
+    assert primary_file_fk.initially == "DEFERRED"
     assert _postgresql_where("uq_collections_one_favorites_per_owner", "collections") == "kind = 'favorites'"
-    assert _postgresql_where("uq_meme_files_single_primary_per_meme", "meme_files") == "is_primary"
 
     user_relationships = sa_inspect(User).relationships
     meme_relationships = sa_inspect(Meme).relationships
@@ -228,14 +247,32 @@ async def test_moderation_report_and_decision_orm_persist_admin_audit_history(
     async with model_contract_session_factory() as session:
         reporter = User(email="reporter@example.com")
         admin = User(email="moderator@example.com", is_admin=True)
-        meme = Meme(media_type=ContentKind.IMAGE, is_public=True, is_nsfw=False)
+        meme_id = uuid.uuid7()
+        meme_file_id = uuid.uuid7()
+        meme = Meme(
+            id=meme_id,
+            media_type=ContentKind.IMAGE,
+            primary_file_id=meme_file_id,
+            is_public=True,
+            is_nsfw=False,
+        )
+        meme_file = MemeFile(
+            id=meme_file_id,
+            meme_id=meme_id,
+            status=ContentProcessingStatus.READY,
+            s3_original_key="files/report/original.jpg",
+        )
         report = ModerationReport(
             meme=meme,
             reporter_user=reporter,
             reason=ModerationReason.NSFW,
             note="Looks explicit",
         )
-        session.add_all([reporter, admin, meme, report])
+        session.add_all([reporter, admin, meme])
+        await session.flush()
+        session.add(meme_file)
+        await session.flush()
+        session.add(report)
         await session.flush()
 
         report.status = ModerationReportStatus.RESOLVED
@@ -338,8 +375,13 @@ async def test_schema_handles_cycles_multi_invites_and_nullable_content_fields(
             base_image_url=None,
             text_regions=None,
         )
+        meme_id = uuid.uuid7()
+        file_one_id = uuid.uuid7()
+        file_two_id = uuid.uuid7()
         meme = Meme(
+            id=meme_id,
             media_type=ContentKind.IMAGE,
+            primary_file_id=file_one_id,
             language=ContentLanguage.EN,
             is_public=False,
             author=owner,
@@ -347,7 +389,8 @@ async def test_schema_handles_cycles_multi_invites_and_nullable_content_fields(
             tags=["reaction", "deadline"],
         )
         file_one = MemeFile(
-            meme=meme,
+            id=file_one_id,
+            meme_id=meme_id,
             status=ContentProcessingStatus.READY,
             width=1200,
             height=900,
@@ -356,10 +399,10 @@ async def test_schema_handles_cycles_multi_invites_and_nullable_content_fields(
             s3_original_key="files/1/original.jpg",
             perceptual_hash="c" * 16,
             quality_score=1.0,
-            is_primary=True,
         )
         file_two = MemeFile(
-            meme=meme,
+            id=file_two_id,
+            meme_id=meme_id,
             status=ContentProcessingStatus.READY,
             width=1080,
             height=810,
@@ -367,12 +410,11 @@ async def test_schema_handles_cycles_multi_invites_and_nullable_content_fields(
             mime_type="image/png",
             s3_original_key="files/2/original.png",
             quality_score=0.8,
-            is_primary=False,
         )
-        session.add_all([template, meme, file_one, file_two])
+        session.add_all([template, meme])
         await session.flush()
-
-        meme.primary_file = file_one
+        session.add_all([file_one, file_two])
+        await session.flush()
         session.add_all(
             [
                 MemeSeoPage(
@@ -694,26 +736,36 @@ async def test_constraints_reject_duplicate_provider_ids_and_duplicate_favorites
             await session.commit()
 
 
-async def test_constraints_reject_multiple_primary_files_for_one_meme(
+async def test_constraints_reject_missing_or_cross_meme_primary_file(
     model_contract_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     async with model_contract_session_factory() as session:
         meme = Meme(media_type=ContentKind.IMAGE)
         session.add(meme)
-        await session.flush()
+
+        with pytest.raises(IntegrityError):
+            await session.flush()
+
+    async with model_contract_session_factory() as session:
+        source_meme_id = uuid.uuid7()
+        source_file_id = uuid.uuid7()
+        invalid_meme_id = uuid.uuid7()
+        invalid_file_id = uuid.uuid7()
         session.add_all(
             [
+                Meme(id=source_meme_id, media_type=ContentKind.IMAGE, primary_file_id=source_file_id),
                 MemeFile(
-                    meme=meme,
+                    id=source_file_id,
+                    meme_id=source_meme_id,
                     status=ContentProcessingStatus.READY,
-                    s3_original_key="files/a/original.jpg",
-                    is_primary=True,
+                    s3_original_key="files/source/original.jpg",
                 ),
+                Meme(id=invalid_meme_id, media_type=ContentKind.IMAGE, primary_file_id=source_file_id),
                 MemeFile(
-                    meme=meme,
+                    id=invalid_file_id,
+                    meme_id=invalid_meme_id,
                     status=ContentProcessingStatus.READY,
-                    s3_original_key="files/b/original.jpg",
-                    is_primary=True,
+                    s3_original_key="files/invalid/original.jpg",
                 ),
             ]
         )
@@ -726,16 +778,18 @@ async def test_pipeline_stage_journal_enforces_one_latest_row_per_stage(
     model_contract_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     async with model_contract_session_factory() as session:
-        meme = Meme(media_type=ContentKind.IMAGE)
-        session.add(meme)
-        await session.flush()
+        meme_id = uuid.uuid7()
+        meme_file_id = uuid.uuid7()
+        meme = Meme(id=meme_id, media_type=ContentKind.IMAGE, primary_file_id=meme_file_id)
 
         meme_file = MemeFile(
-            meme=meme,
+            id=meme_file_id,
+            meme_id=meme_id,
             status=ContentProcessingStatus.PENDING,
             s3_original_key="pipeline/originals/file/original.jpg",
-            is_primary=True,
         )
+        session.add(meme)
+        await session.flush()
         session.add(meme_file)
         await session.flush()
 
@@ -1172,16 +1226,18 @@ async def test_sync_target_snapshot_orm_persists_and_enforces_uniqueness(
     model_contract_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     async with model_contract_session_factory() as session:
-        meme = Meme(media_type=ContentKind.IMAGE)
-        session.add(meme)
-        await session.flush()
+        meme_id = uuid.uuid7()
+        meme_file_id = uuid.uuid7()
+        meme = Meme(id=meme_id, media_type=ContentKind.IMAGE, primary_file_id=meme_file_id)
 
         meme_file = MemeFile(
-            meme=meme,
+            id=meme_file_id,
+            meme_id=meme_id,
             status=ContentProcessingStatus.READY,
             s3_original_key="pipeline/originals/sync/original.png",
-            is_primary=True,
         )
+        session.add(meme)
+        await session.flush()
         session.add(meme_file)
         await session.flush()
 
@@ -1214,16 +1270,18 @@ async def test_sync_target_snapshot_orm_persists_and_enforces_uniqueness(
         assert persisted_snapshot.attempt_count == 1
 
     async with model_contract_session_factory() as session:
-        meme = Meme(media_type=ContentKind.IMAGE)
-        session.add(meme)
-        await session.flush()
+        meme_id = uuid.uuid7()
+        meme_file_id = uuid.uuid7()
+        meme = Meme(id=meme_id, media_type=ContentKind.IMAGE, primary_file_id=meme_file_id)
 
         meme_file = MemeFile(
-            meme=meme,
+            id=meme_file_id,
+            meme_id=meme_id,
             status=ContentProcessingStatus.READY,
             s3_original_key="pipeline/originals/dup/original.png",
-            is_primary=True,
         )
+        session.add(meme)
+        await session.flush()
         session.add(meme_file)
         await session.flush()
 

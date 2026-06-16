@@ -77,28 +77,31 @@ async def test_publish_created_meme_resync_rebuilds_public_indexes_from_canonica
         vector=(0.1, 0.2, 0.3),
         input_hash=uuid.uuid4().hex,
     )
+    meme_id = uuid.uuid7()
+    meme_file_id = uuid.uuid7()
     meme = Meme(
+        id=meme_id,
         media_type=ContentKind.IMAGE,
+        primary_file_id=meme_file_id,
         language=ContentLanguage.EN,
         tags=[],
         is_public=False,
         is_nsfw=True,
         ocr_text="pre-public upload",
     )
-    migrated_db_session.add(meme)
-    await migrated_db_session.flush()
 
     meme_file = MemeFile(
-        meme_id=meme.id,
+        id=meme_file_id,
+        meme_id=meme_id,
         status=ContentProcessingStatus.READY,
-        s3_original_key=f"pipeline/originals/{meme.id}.png",
+        s3_original_key=f"pipeline/originals/{meme_id}.png",
         mime_type="image/png",
         quality_score=0.9,
-        is_primary=True,
     )
+    migrated_db_session.add(meme)
+    await migrated_db_session.flush()
     migrated_db_session.add(meme_file)
     await migrated_db_session.flush()
-    meme.primary_file_id = meme_file.id
     migrated_db_session.add_all(
         [
             MemeFileOCRResult(

@@ -10,8 +10,8 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from memexpert.models.content import Meme, ModerationReport
-from memexpert.models.enums import ContentKind, ModerationReason, ModerationReportStatus
+from memexpert.models.content import Meme, MemeFile, ModerationReport
+from memexpert.models.enums import ContentKind, ContentProcessingStatus, ModerationReason, ModerationReportStatus
 from memexpert.models.user import User
 from memexpert.services import AuthService, UserService
 from tests.conftest import create_full_user_via_upgrade
@@ -54,8 +54,24 @@ async def _create_meme(
     is_nsfw: bool = False,
 ) -> uuid.UUID:
     async with session_factory() as session:
-        meme = Meme(media_type=ContentKind.IMAGE, is_public=is_public, is_nsfw=is_nsfw)
+        meme_id = uuid.uuid7()
+        meme_file_id = uuid.uuid7()
+        meme = Meme(
+            id=meme_id,
+            media_type=ContentKind.IMAGE,
+            primary_file_id=meme_file_id,
+            is_public=is_public,
+            is_nsfw=is_nsfw,
+        )
+        meme_file = MemeFile(
+            id=meme_file_id,
+            meme_id=meme_id,
+            status=ContentProcessingStatus.READY,
+            s3_original_key=f"pipeline/originals/{meme_id}.jpg",
+        )
         session.add(meme)
+        await session.flush()
+        session.add(meme_file)
         await session.flush()
         meme_id = meme.id
         await session.commit()

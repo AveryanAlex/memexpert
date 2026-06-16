@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from typing import TYPE_CHECKING
 
 from sqlalchemy import func, select
@@ -9,15 +10,13 @@ from sqlalchemy import func, select
 from memexpert.api.dependencies.auth import get_optional_current_user
 from memexpert.api.dependencies.collection import get_collection_service
 from memexpert.models.collection import CollectionMeme, PinnedMeme
-from memexpert.models.content import Meme
-from memexpert.models.enums import ContentKind, ContentLanguage
+from memexpert.models.content import Meme, MemeFile
+from memexpert.models.enums import ContentKind, ContentLanguage, ContentProcessingStatus
 from memexpert.schemas.user import UserRead
 from memexpert.services import CollectionService, UserService
 from tests.conftest import create_full_user_via_upgrade
 
 if TYPE_CHECKING:
-    import uuid
-
     from fastapi import FastAPI
     from httpx import AsyncClient
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -29,13 +28,25 @@ async def _create_meme(
     is_public: bool = True,
     author_user_id: uuid.UUID | None = None,
 ) -> Meme:
+    meme_id = uuid.uuid7()
+    meme_file_id = uuid.uuid7()
     meme = Meme(
+        id=meme_id,
         media_type=ContentKind.IMAGE,
+        primary_file_id=meme_file_id,
         language=ContentLanguage.EN,
         is_public=is_public,
         author_user_id=author_user_id,
     )
+    meme_file = MemeFile(
+        id=meme_file_id,
+        meme_id=meme_id,
+        status=ContentProcessingStatus.READY,
+        s3_original_key=f"pipeline/originals/{meme_id}.jpg",
+    )
     session.add(meme)
+    await session.flush()
+    session.add(meme_file)
     await session.flush()
     return meme
 

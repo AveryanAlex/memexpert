@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from typing import TYPE_CHECKING
 
 from memexpert.models.collection import Collection, CollectionMember, CollectionMeme
@@ -21,8 +22,6 @@ from memexpert.services.search_index_sync import (
 )
 
 if TYPE_CHECKING:
-    import uuid
-
     from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -40,8 +39,12 @@ async def _create_meme_with_primary_file(
     ocr_text: str | None = None,
     quality_score: float = 0.8,
 ) -> tuple[Meme, MemeFile]:
+    meme_id = uuid.uuid7()
+    file_id = uuid.uuid7()
     meme = Meme(
+        id=meme_id,
         media_type=media_type,
+        primary_file_id=file_id,
         language=language,
         tags=tags or [],
         is_public=is_public,
@@ -51,20 +54,17 @@ async def _create_meme_with_primary_file(
         author_user_id=author_user_id,
         ocr_text=ocr_text,
     )
-    session.add(meme)
-    await session.flush()
 
     meme_file = MemeFile(
-        meme_id=meme.id,
-        s3_original_key=f"pipeline/originals/{meme.id}.jpg",
+        id=file_id,
+        meme_id=meme_id,
+        s3_original_key=f"pipeline/originals/{meme_id}.jpg",
         mime_type="image/jpeg",
         quality_score=quality_score,
-        is_primary=True,
     )
-    session.add(meme_file)
+    session.add(meme)
     await session.flush()
-
-    meme.primary_file_id = meme_file.id
+    session.add(meme_file)
     await session.flush()
     return meme, meme_file
 

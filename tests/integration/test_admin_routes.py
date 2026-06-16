@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, cast
-from uuid import UUID
+from uuid import UUID, uuid7
 
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
@@ -59,6 +59,33 @@ async def _issue_user_cookie(
         await session.commit()
         auth_session = await auth_service.issue_session_for_user(user)
         return auth_session.access_token
+
+
+def _canonical_meme(
+    *,
+    file_key: str | None = None,
+    file_quality: float = 0.9,
+    **meme_kwargs: object,
+) -> tuple[Meme, MemeFile]:
+    meme_id = uuid7()
+    file_id = uuid7()
+    meme = Meme(id=meme_id, primary_file_id=file_id, **meme_kwargs)
+    file = MemeFile(
+        id=file_id,
+        meme_id=meme_id,
+        status=ContentProcessingStatus.READY,
+        s3_original_key=file_key or f"admin/{meme_id}/primary.jpg",
+        mime_type="image/jpeg",
+        quality_score=file_quality,
+    )
+    return meme, file
+
+
+async def _persist_canonical_meme(session: AsyncSession, meme: Meme, file: MemeFile) -> None:
+    session.add(meme)
+    await session.flush()
+    session.add(file)
+    await session.flush()
 
 
 async def test_admin_routes_require_session_cookie_admin_flag_and_ignore_operator_header(
@@ -208,14 +235,15 @@ async def test_admin_can_list_read_and_resolve_moderation_report_with_audited_de
         admin = (
             await session.execute(select(User).where(User.email == "admin-resolve-report@example.com"))
         ).scalar_one()
-        meme = Meme(media_type=ContentKind.IMAGE, is_public=True, is_nsfw=False)
+        meme, meme_file = _canonical_meme(media_type=ContentKind.IMAGE, is_public=True, is_nsfw=False)
         report = ModerationReport(
             meme=meme,
             reporter_user_id=reporter.id,
             reason=ModerationReason.NSFW,
             note="This should be marked nsfw",
         )
-        session.add_all([meme, report])
+        await _persist_canonical_meme(session, meme, meme_file)
+        session.add(report)
         await session.commit()
         await session.refresh(report)
         report_id = report.id
@@ -293,8 +321,9 @@ async def test_admin_direct_meme_override_persists_template_and_decision_audit_r
             await session.execute(select(User).where(User.email == "admin-direct-override@example.com"))
         ).scalar_one()
         template = MemeTemplate(slug="new-template", name="New Template")
-        meme = Meme(media_type=ContentKind.IMAGE, is_public=True, is_nsfw=False)
-        session.add_all([template, meme])
+        meme, meme_file = _canonical_meme(media_type=ContentKind.IMAGE, is_public=True, is_nsfw=False)
+        session.add(template)
+        await _persist_canonical_meme(session, meme, meme_file)
         await session.commit()
         await session.refresh(template)
         await session.refresh(meme)
@@ -504,9 +533,21 @@ async def test_admin_template_merge_reassigns_memes_and_writes_template_override
         ).scalar_one()
         source_template = MemeTemplate(slug="duplicate-template", name="Duplicate Template")
         target_template = MemeTemplate(slug="canonical-template", name="Canonical Template")
-        first_meme = Meme(media_type=ContentKind.IMAGE, is_public=True, is_nsfw=False, template=source_template)
-        second_meme = Meme(media_type=ContentKind.IMAGE, is_public=False, is_nsfw=True, template=source_template)
-        session.add_all([source_template, target_template, first_meme, second_meme])
+        first_meme, first_file = _canonical_meme(
+            media_type=ContentKind.IMAGE,
+            is_public=True,
+            is_nsfw=False,
+            template=source_template,
+        )
+        second_meme, second_file = _canonical_meme(
+            media_type=ContentKind.IMAGE,
+            is_public=False,
+            is_nsfw=True,
+            template=source_template,
+        )
+        session.add_all([source_template, target_template])
+        await _persist_canonical_meme(session, first_meme, first_file)
+        await _persist_canonical_meme(session, second_meme, second_file)
         await session.commit()
         source_template_id = source_template.id
         target_template_id = target_template.id
@@ -572,8 +613,14 @@ async def test_admin_template_delete_only_allows_unreferenced_templates(
     async with postgres_session_factory() as session:
         referenced_template = MemeTemplate(slug="referenced-template", name="Referenced Template")
         unreferenced_template = MemeTemplate(slug="unreferenced-template", name="Unreferenced Template")
-        meme = Meme(media_type=ContentKind.IMAGE, is_public=True, is_nsfw=False, template=referenced_template)
-        session.add_all([referenced_template, unreferenced_template, meme])
+        meme, meme_file = _canonical_meme(
+            media_type=ContentKind.IMAGE,
+            is_public=True,
+            is_nsfw=False,
+            template=referenced_template,
+        )
+        session.add_all([referenced_template, unreferenced_template])
+        await _persist_canonical_meme(session, meme, meme_file)
         await session.commit()
         referenced_template_id = referenced_template.id
         unreferenced_template_id = unreferenced_template.id
@@ -685,15 +732,14 @@ async def test_admin_can_delete_meme_with_durable_destructive_audit(
 
     async with postgres_session_factory() as session:
         admin = (await session.execute(select(User).where(User.email == "admin-delete-meme@example.com"))).scalar_one()
-        meme = Meme(media_type=ContentKind.IMAGE, is_public=True, is_nsfw=False, like_count=7)
-        meme_file = MemeFile(
-            meme=meme,
-            status=ContentProcessingStatus.READY,
-            s3_original_key="admin/delete/original.jpg",
-            mime_type="image/jpeg",
-            quality_score=0.9,
-            is_primary=True,
+        meme, meme_file = _canonical_meme(
+            media_type=ContentKind.IMAGE,
+            is_public=True,
+            is_nsfw=False,
+            like_count=7,
+            file_key="admin/delete/original.jpg",
         )
+        await _persist_canonical_meme(session, meme, meme_file)
         collection = Collection(owner_id=admin.id, title="Admin saved memes")
         report = ModerationReport(meme=meme, reporter_user_id=admin.id, reason=ModerationReason.SPAM)
         decision = ModerationDecision(
@@ -718,9 +764,8 @@ async def test_admin_can_delete_meme_with_durable_destructive_audit(
             model_id="test-model",
             prompt_version="v1",
         )
-        session.add_all([admin, meme, meme_file, collection, report, decision, seo_page])
+        session.add_all([admin, collection, report, decision, seo_page])
         await session.flush()
-        meme.primary_file_id = meme_file.id
         session.add_all(
             [
                 CollectionMeme(collection=collection, meme=meme, added_by_user_id=admin.id),
@@ -783,8 +828,8 @@ async def test_admin_delete_requires_exact_confirmation_without_partial_delete(
     )
 
     async with postgres_session_factory() as session:
-        meme = Meme(media_type=ContentKind.IMAGE, is_public=True, is_nsfw=False)
-        session.add(meme)
+        meme, meme_file = _canonical_meme(media_type=ContentKind.IMAGE, is_public=True, is_nsfw=False)
+        await _persist_canonical_meme(session, meme, meme_file)
         await session.commit()
         meme_id = meme.id
 
@@ -824,41 +869,29 @@ async def test_admin_can_merge_meme_with_shared_lineage_transfer_and_audit(
 
     async with postgres_session_factory() as session:
         admin = (await session.execute(select(User).where(User.email == "admin-merge-meme@example.com"))).scalar_one()
-        source_meme = Meme(
+        source_meme, source_file = _canonical_meme(
             media_type=ContentKind.IMAGE,
             is_public=True,
             is_nsfw=False,
             like_count=2,
             popularity_score=4.0,
+            file_key="admin/merge/source.jpg",
+            file_quality=0.5,
         )
-        target_meme = Meme(
+        target_meme, target_file = _canonical_meme(
             media_type=ContentKind.IMAGE,
             is_public=True,
             is_nsfw=False,
             like_count=5,
             popularity_score=3.0,
-        )
-        source_file = MemeFile(
-            meme=source_meme,
-            status=ContentProcessingStatus.READY,
-            s3_original_key="admin/merge/source.jpg",
-            mime_type="image/jpeg",
-            quality_score=0.5,
-            is_primary=True,
-        )
-        target_file = MemeFile(
-            meme=target_meme,
-            status=ContentProcessingStatus.READY,
-            s3_original_key="admin/merge/target.jpg",
-            mime_type="image/jpeg",
-            quality_score=1.0,
-            is_primary=True,
+            file_key="admin/merge/target.jpg",
+            file_quality=1.0,
         )
         collection = Collection(owner_id=admin.id, title="Merge collection")
-        session.add_all([source_meme, target_meme, source_file, target_file, collection])
+        await _persist_canonical_meme(session, source_meme, source_file)
+        await _persist_canonical_meme(session, target_meme, target_file)
+        session.add(collection)
         await session.flush()
-        source_meme.primary_file_id = source_file.id
-        target_meme.primary_file_id = target_file.id
         session.add_all(
             [
                 CollectionMeme(collection=collection, meme=source_meme, added_by_user_id=admin.id),
@@ -910,7 +943,6 @@ async def test_admin_can_merge_meme_with_shared_lineage_transfer_and_audit(
         assert target.primary_file_id == target_file_id
         assert moved_file is not None
         assert moved_file.meme_id == target_meme_id
-        assert moved_file.is_primary is False
         assert collection_link is not None
         assert pin_link is not None
         assert audit_log is not None
@@ -936,8 +968,8 @@ async def test_admin_merge_self_is_blocked_without_partial_delete_or_audit(
     )
 
     async with postgres_session_factory() as session:
-        meme = Meme(media_type=ContentKind.IMAGE, is_public=True, is_nsfw=False)
-        session.add(meme)
+        meme, meme_file = _canonical_meme(media_type=ContentKind.IMAGE, is_public=True, is_nsfw=False)
+        await _persist_canonical_meme(session, meme, meme_file)
         await session.commit()
         meme_id = meme.id
 

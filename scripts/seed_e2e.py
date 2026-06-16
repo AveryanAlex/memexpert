@@ -450,6 +450,7 @@ async def seed_direct_corpus(
             meme = Meme(
                 id=meme_id,
                 media_type=spec.media_type,
+                primary_file_id=meme_file_id,
                 ocr_text=spec.ocr_text,
                 language=spec.language,
                 is_nsfw=spec.is_nsfw,
@@ -469,11 +470,9 @@ async def seed_direct_corpus(
                 mime_type="image/png",
                 s3_original_key=object_key,
                 quality_score=1.0,
-                is_primary=True,
             )
             session.add(meme_file)
             await session.flush()
-            meme.primary_file_id = meme_file_id
             session.add_all(
                 [
                     MemeSource(

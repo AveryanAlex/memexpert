@@ -185,8 +185,12 @@ async def _create_meme(
     height: int | None = None,
     blur_hash: str | None = None,
 ) -> Meme:
+    meme_id = uuid.uuid7()
+    file_id = uuid.uuid7()
     meme = Meme(
+        id=meme_id,
         media_type=media_type,
+        primary_file_id=file_id,
         language=language,
         tags=tags or [],
         is_nsfw=is_nsfw,
@@ -196,22 +200,20 @@ async def _create_meme(
         author_user_id=author_user_id,
         ocr_text=ocr_text,
     )
-    session.add(meme)
-    await session.flush()
     file = MemeFile(
-        meme_id=meme.id,
-        s3_original_key=s3_original_key or f"memes/{meme.id}.jpg",
+        id=file_id,
+        meme_id=meme_id,
+        s3_original_key=s3_original_key or f"memes/{meme_id}.jpg",
         s3_web_video_key=s3_web_video_key,
         mime_type=mime_type,
         width=width,
         height=height,
         blur_hash=blur_hash,
         quality_score=0.8,
-        is_primary=True,
     )
-    session.add(file)
+    session.add(meme)
     await session.flush()
-    meme.primary_file_id = file.id
+    session.add(file)
     await session.flush()
     return meme
 

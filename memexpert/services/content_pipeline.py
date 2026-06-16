@@ -1889,6 +1889,7 @@ class ContentPipelineService:
         meme = Meme(
             id=meme_id,
             media_type=media_type,
+            primary_file_id=meme_file_id,
             language=ContentLanguage.NONE,
             is_public=False,
             author_user_id=owner_user_id,
@@ -1907,12 +1908,10 @@ class ContentPipelineService:
             s3_original_key=prepared_upload.object_key,
             perceptual_hash=prepared_upload.perceptual_hash,
             blocked_perceptual_hash_id=blocked_hash.id,
-            is_primary=True,
         )
         self._session.add(meme_file)
         await self._session.flush()
 
-        meme.primary_file_id = meme_file_id
         self._session.add_all(
             [
                 PipelineStageJournal(
@@ -1960,6 +1959,7 @@ class ContentPipelineService:
         meme = Meme(
             id=meme_id,
             media_type=prepared_upload.media_type,
+            primary_file_id=meme_file_id,
             language=ContentLanguage.NONE,
             is_public=False,
         )
@@ -1976,12 +1976,10 @@ class ContentPipelineService:
             mime_type=prepared_upload.mime_type,
             s3_original_key=prepared_upload.object_key,
             perceptual_hash=prepared_upload.perceptual_hash,
-            is_primary=True,
         )
         self._session.add(meme_file)
         await self._session.flush()
 
-        meme.primary_file_id = meme_file_id
         new_source_row = MemeSource(
             file_id=meme_file_id,
             platform=raw_post.platform,
@@ -2034,6 +2032,7 @@ class ContentPipelineService:
         meme = Meme(
             id=meme_id,
             media_type=prepared_upload.media_type,
+            primary_file_id=meme_file_id,
             language=ContentLanguage.NONE,
             is_public=False,
             author_user_id=metadata.owner_user_id,
@@ -2051,12 +2050,10 @@ class ContentPipelineService:
             mime_type=prepared_upload.mime_type,
             s3_original_key=prepared_upload.object_key,
             perceptual_hash=prepared_upload.perceptual_hash,
-            is_primary=True,
         )
         self._session.add(meme_file)
         await self._session.flush()
 
-        meme.primary_file_id = meme_file_id
         self._session.add_all(
             [
                 MemeSource(
@@ -2113,7 +2110,6 @@ class ContentPipelineService:
                     mime_type=prepared_upload.mime_type,
                     s3_original_key=prepared_upload.object_key,
                     perceptual_hash=prepared_upload.perceptual_hash,
-                    is_primary=False,
                 ),
                 MemeSource(
                     file_id=meme_file_id,
@@ -2320,11 +2316,6 @@ class ContentPipelineService:
 
     async def _apply_canonical_primary_truth(self, meme: Meme) -> None:
         primary_file_id = meme.primary_file_id
-        if primary_file_id is None:
-            meme.ocr_text = None
-            meme.language = ContentLanguage.NONE
-            return
-
         result = await self._session.execute(
             select(MemeFileOCRResult).where(MemeFileOCRResult.meme_file_id == primary_file_id)
         )

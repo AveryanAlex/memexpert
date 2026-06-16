@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -32,7 +33,6 @@ from memexpert.services import UserService
 from tests.conftest import create_full_user_via_upgrade
 
 if TYPE_CHECKING:
-    import uuid
     from collections.abc import AsyncGenerator
 
     from aiogram import Bot, Dispatcher
@@ -387,25 +387,51 @@ async def seed_stats_data(session: AsyncSession, *, user_id: uuid.UUID) -> None:
             ),
         ]
     )
-    meme = Meme(media_type=ContentKind.IMAGE, language=ContentLanguage.EN, author_user_id=user_id, tags=["cats"])
-    second_meme = Meme(media_type=ContentKind.IMAGE, language=ContentLanguage.EN, tags=["cats", "dogs"])
+    meme_id = uuid.uuid7()
+    meme_file_id = uuid.uuid7()
+    second_meme_id = uuid.uuid7()
+    second_meme_file_id = uuid.uuid7()
+    meme = Meme(
+        id=meme_id,
+        media_type=ContentKind.IMAGE,
+        primary_file_id=meme_file_id,
+        language=ContentLanguage.EN,
+        author_user_id=user_id,
+        tags=["cats"],
+    )
+    second_meme = Meme(
+        id=second_meme_id,
+        media_type=ContentKind.IMAGE,
+        primary_file_id=second_meme_file_id,
+        language=ContentLanguage.EN,
+        tags=["cats", "dogs"],
+    )
     session.add_all([meme, second_meme])
     await session.flush()
-    session.add(
-        MemeFile(
-            meme_id=meme.id,
-            status=ContentProcessingStatus.READY,
-            width=100,
-            height=100,
-            file_size_bytes=5,
-            mime_type="image/png",
-            s3_original_key=f"pipeline/originals/{meme.id}/original.png",
-            perceptual_hash=f"hash-{meme.id}",
-            is_primary=True,
-        )
-    )
     session.add_all(
         [
+            MemeFile(
+                id=meme_file_id,
+                meme_id=meme_id,
+                status=ContentProcessingStatus.READY,
+                width=100,
+                height=100,
+                file_size_bytes=5,
+                mime_type="image/png",
+                s3_original_key=f"pipeline/originals/{meme_id}/original.png",
+                perceptual_hash=f"hash-{meme_id}",
+            ),
+            MemeFile(
+                id=second_meme_file_id,
+                meme_id=second_meme_id,
+                status=ContentProcessingStatus.READY,
+                width=100,
+                height=100,
+                file_size_bytes=5,
+                mime_type="image/png",
+                s3_original_key=f"pipeline/originals/{second_meme_id}/original.png",
+                perceptual_hash=f"hash-{second_meme_id}",
+            ),
             CollectionMeme(collection_id=favorites.id, meme_id=meme.id, added_by_user_id=user_id),
             CollectionMeme(collection_id=custom.id, meme_id=second_meme.id, added_by_user_id=user_id),
             PinnedMeme(user_id=user_id, meme_id=meme.id, position=1),
