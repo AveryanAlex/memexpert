@@ -12,13 +12,14 @@ from unicodedata import normalize
 
 from openai import AsyncOpenAI
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
-from pydantic_ai import Agent
+from pydantic_ai import Agent, BinaryContent
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from memexpert.core.config import Settings, get_settings
+from memexpert.core.storage import build_s3_client, download_object_bytes, get_pipeline_storage_settings
 from memexpert.models.base import utcnow
 from memexpert.models.content import Meme, MemeSeoPage, MemeTemplate
 
@@ -34,18 +35,21 @@ MAX_SLUG_LENGTH = 255
 MAX_PAGE_TITLE_LENGTH = 255
 MAX_PROMPT_VERSION_LENGTH = 64
 DEFAULT_PROMPT_VERSION = "meme-seo-v1"
+SUPPORTED_SEO_IMAGE_MEDIA_TYPES = frozenset({"image/jpeg", "image/png", "image/gif", "image/webp"})
 
 # Ported from the v0 Rust prompt baseline (`v0:prompts/meta.md`) and adapted to
-# the current backend fields. Unlike v0, this service currently has no image
-# bytes available during SEO generation, so the provider must stay grounded in
-# OCR text, existing tags, and current template metadata only.
+# the current backend fields. Live mode may attach primary image bytes when they
+# can be resolved safely; otherwise the provider must stay grounded in OCR text,
+# existing tags, and current template metadata only.
 SEO_PROMPT_BASELINE = """
 Role: experienced copywriter and SEO expert.
 
 Task: write structured SEO content for a meme web page using the provided meme metadata.
 
 Important constraints:
-- You do not have the image bytes. Only use the provided OCR text, existing tags, language, and template metadata.
+- The primary meme image may be attached as binary content when `image_input_status` is `attached`.
+- When no image is attached, only use the provided OCR text, existing tags, language, safe media metadata, and
+  template metadata.
 - If the metadata is insufficient to support a visual claim, stay generic and do not invent scene details.
 - Preserve searchable original phrases from OCR text when they are likely what users would search for.
 - Keep the language human, concise, and SEO-friendly.
@@ -175,6 +179,24 @@ class MemeSeoProviderProtocol(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class MemeSeoImageInput:
+    """Resolved primary image payload safe to pass to the model provider."""
+
+    data: bytes
+    media_type: str
+
+
+class MemeSeoImageInputResolverProtocol(Protocol):
+    """Fakeable boundary for optional SEO image inputs."""
+
+    async def resolve(self, meme: Meme) -> MemeSeoImageInput | None: ...
+
+
+class _StorageObjectBytesDownloader(Protocol):
+    async def __call__(self, client: Any, *, bucket: str, key: str) -> bytes: ...
+
+
+@dataclass(frozen=True, slots=True)
 class MemeSeoProviderResult:
     """Provider-authored SEO payload before storage normalization."""
 
@@ -188,6 +210,65 @@ class MemeSeoProviderResult:
     template_slug: str | None = None
     template_name: str | None = None
     template_description: str | None = None
+
+
+class S3MemeSeoImageInputResolver:
+    """Resolve primary meme images from object storage for live SEO generation."""
+
+    def __init__(
+        self,
+        *,
+        settings: Settings | None = None,
+        s3_client: Any | None = None,
+        downloader: _StorageObjectBytesDownloader = download_object_bytes,
+    ) -> None:
+        self._settings = settings or get_settings()
+        self._s3_client = s3_client
+        self._downloader = downloader
+
+    async def resolve(self, meme: Meme) -> MemeSeoImageInput | None:
+        try:
+            primary_file = meme.primary_file
+        except Exception:
+            logger.warning("Skipping SEO image input for meme %s because the primary file is unavailable.", meme.id)
+            return None
+
+        if primary_file is None:
+            return None
+
+        media_type = _supported_seo_image_media_type(primary_file.mime_type)
+        if media_type is None:
+            return None
+
+        max_bytes = self._settings.pipeline_seo_image_max_bytes
+        if primary_file.file_size_bytes is not None and primary_file.file_size_bytes > max_bytes:
+            logger.info("Skipping SEO image input for meme %s because the recorded file size exceeds the cap.", meme.id)
+            return None
+
+        object_key = primary_file.s3_original_key.strip()
+        if not object_key:
+            return None
+
+        try:
+            storage_settings = get_pipeline_storage_settings(self._settings)
+            s3_client = self._get_s3_client()
+            image_bytes = await self._downloader(s3_client, bucket=storage_settings.bucket, key=object_key)
+        except Exception:
+            logger.warning("Skipping SEO image input for meme %s because storage resolution failed.", meme.id)
+            return None
+
+        if not image_bytes:
+            return None
+        if len(image_bytes) > max_bytes:
+            logger.info("Skipping SEO image input for meme %s because downloaded bytes exceed the cap.", meme.id)
+            return None
+
+        return MemeSeoImageInput(data=image_bytes, media_type=media_type)
+
+    def _get_s3_client(self) -> Any:
+        if self._s3_client is None:
+            self._s3_client = build_s3_client(self._settings)
+        return self._s3_client
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,17 +307,57 @@ class StaticMemeSeoProvider:
 class PydanticAIMemeSeoProvider:
     """Live OpenAI-compatible SEO provider backed by a typed PydanticAI agent."""
 
-    def __init__(self, *, settings: Settings | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        settings: Settings | None = None,
+        image_input_resolver: MemeSeoImageInputResolverProtocol | None = None,
+        agent: Any | None = None,
+    ) -> None:
         self._settings = settings or get_settings()
         self.model_id = self._settings.pipeline_seo_model
         self.prompt_version = self._settings.pipeline_seo_prompt_version
-        self._agent: Any | None = None
+        self._image_input_resolver = image_input_resolver or S3MemeSeoImageInputResolver(settings=self._settings)
+        self._agent: Any | None = agent
 
     async def generate(self, meme: Meme) -> MemeSeoProviderResult:
         agent = self._get_agent()
-        result = await agent.run(_build_meme_seo_prompt(meme))
+        image_input = await self._resolve_image_input(meme)
+        text_prompt = _build_meme_seo_prompt(
+            meme,
+            image_input_status="attached" if image_input is not None else "not_attached",
+        )
+        user_prompt = (
+            [text_prompt, BinaryContent(data=image_input.data, media_type=image_input.media_type)]
+            if image_input is not None
+            else text_prompt
+        )
+        result = await agent.run(user_prompt)
         output = MemeSeoStructuredOutput.model_validate(result.output)
         return output.to_provider_result()
+
+    async def _resolve_image_input(self, meme: Meme) -> MemeSeoImageInput | None:
+        try:
+            image_input = await self._image_input_resolver.resolve(meme)
+        except Exception:
+            logger.warning("Skipping SEO image input for meme %s because image resolution failed.", meme.id)
+            return None
+
+        if image_input is None:
+            return None
+        media_type = _supported_seo_image_media_type(image_input.media_type)
+        if media_type is None:
+            logger.info(
+                "Skipping SEO image input for meme %s because the resolver returned unsupported media.",
+                meme.id,
+            )
+            return None
+        if not image_input.data:
+            return None
+        if len(image_input.data) > self._settings.pipeline_seo_image_max_bytes:
+            logger.info("Skipping SEO image input for meme %s because resolver bytes exceed the cap.", meme.id)
+            return None
+        return MemeSeoImageInput(data=image_input.data, media_type=media_type)
 
     def _get_agent(self) -> Any:
         if self._agent is None:
@@ -321,7 +442,7 @@ class MemeSeoGenerationService:
         meme = await self._session.scalar(
             select(Meme)
             .where(Meme.id == meme_id)
-            .options(selectinload(Meme.seo_page), selectinload(Meme.template)),
+            .options(selectinload(Meme.seo_page), selectinload(Meme.template), selectinload(Meme.primary_file)),
         )
         if meme is None:
             return MemeSeoGenerationResult(meme_id=meme_id, status="not_found", reason="meme_not_found")
@@ -449,13 +570,15 @@ class MemeSeoGenerationService:
             suffix += 1
 
 
-def _build_meme_seo_prompt(meme: Meme) -> str:
+def _build_meme_seo_prompt(meme: Meme, *, image_input_status: str = "not_attached") -> str:
     template = meme.template
     prompt_context = {
         "meme_id": str(meme.id),
         "language": getattr(meme.language, "value", str(meme.language)),
         "ocr_text": _optional_text(meme.ocr_text),
         "existing_tags": list(meme.tags),
+        "primary_media": _safe_primary_media_metadata(meme),
+        "image_input_status": image_input_status,
         "template": {
             "slug": template.slug,
             "name": template.name,
@@ -466,6 +589,28 @@ def _build_meme_seo_prompt(meme: Meme) -> str:
         else None,
     }
     return "Meme metadata:\n" + json.dumps(prompt_context, ensure_ascii=True, indent=2)
+
+
+def _supported_seo_image_media_type(value: str | None) -> str | None:
+    if value is None:
+        return None
+    media_type = value.strip().lower()
+    return media_type if media_type in SUPPORTED_SEO_IMAGE_MEDIA_TYPES else None
+
+
+def _safe_primary_media_metadata(meme: Meme) -> dict[str, object] | None:
+    try:
+        primary_file = meme.primary_file
+    except Exception:
+        return None
+
+    if primary_file is None:
+        return None
+    return {
+        "mime_type": _optional_text(primary_file.mime_type),
+        "width": primary_file.width,
+        "height": primary_file.height,
+    }
 
 
 def _validate_provider_payload(payload: object) -> MemeSeoStructuredOutput:
@@ -563,12 +708,16 @@ __all__ = [
     "DEFAULT_PROMPT_VERSION",
     "MemeSeoGenerationResult",
     "MemeSeoGenerationService",
+    "MemeSeoImageInput",
+    "MemeSeoImageInputResolverProtocol",
     "MemeSeoProviderError",
     "MemeSeoProviderProtocol",
     "MemeSeoProviderResult",
     "MemeSeoStructuredOutput",
     "PydanticAIMemeSeoProvider",
     "SEO_PROMPT_BASELINE",
+    "S3MemeSeoImageInputResolver",
     "StaticMemeSeoProvider",
+    "SUPPORTED_SEO_IMAGE_MEDIA_TYPES",
     "build_meme_seo_provider",
 ]

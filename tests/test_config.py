@@ -109,6 +109,14 @@ def test_settings_parse_pipeline_contract_and_normalize_object_prefixes() -> Non
     assert broker_settings.dead_letter_routing_key == "pipeline.dead_letter"
 
 
+def test_settings_seo_image_byte_cap_defaults_and_requires_positive_value() -> None:
+    settings = Settings()
+
+    assert settings.pipeline_seo_image_max_bytes == 5 * 1024 * 1024
+    with pytest.raises(ValidationError):
+        _ = Settings.model_validate({"pipeline_seo_image_max_bytes": 0})
+
+
 def test_settings_parse_scheduler_contracts() -> None:
     settings = Settings.model_validate(
         {

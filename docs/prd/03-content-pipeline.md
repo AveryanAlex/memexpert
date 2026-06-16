@@ -35,7 +35,7 @@ Every meme goes through:
 
 Async, prioritized by popularity. The MVP SEO generation path should be a typed POC using **PydanticAI** with prompts ported from the project's v0 Rust branch as the baseline. Prompt tuning is expected to continue after launch, but the pipeline must already validate structured outputs before persisting.
 
-Current POC quality caveat: the backend SEO generator currently works from OCR text, existing tags, language, and template metadata, not raw image bytes. The prompt and provider must stay grounded in those available facts until image-aware inputs are added later.
+Current POC quality caveat: live SEO generation attaches eligible primary image bytes when object storage can resolve them safely, while static/local generation remains text-only. If the primary image is missing, unsupported, oversized, or unreadable, the prompt and provider stay grounded in OCR text, existing tags, language, safe media metadata, and template metadata.
 
 Each generated meme receives:
 
@@ -74,7 +74,7 @@ Example: the meme template "Drake Hotline Bling" — a page at `/templates/drake
 
 ### How Templates Are Assigned
 
-AI assigns templates during SEO page content generation. The LLM sees the meme image and identifies whether it uses a known template. If recognized → linked. If the LLM identifies a new common template → creates a new template entity. Admins can manually curate, rename, merge, and manage templates.
+AI assigns templates during SEO page content generation. In live mode, the LLM sees eligible primary image bytes and identifies whether the meme uses a known template. If recognized → linked. If the LLM identifies a new common template → creates a new template entity. Admins can manually curate, rename, merge, and manage templates.
 
 ### Template Pages
 

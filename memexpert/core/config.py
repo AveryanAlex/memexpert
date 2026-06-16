@@ -131,6 +131,7 @@ class Settings(BaseSettings):
     pipeline_seo_api_key: SecretStr | None = None
     pipeline_seo_timeout_seconds: float = Field(default=30.0, gt=0.0, le=600.0)
     pipeline_seo_max_attempts: int = Field(default=2, ge=1, le=16)
+    pipeline_seo_image_max_bytes: int = Field(default=5 * 1024 * 1024, gt=0)
     pipeline_seo_prompt_version: str = Field(default="meme-seo-v1", min_length=1, max_length=64)
     pipeline_worker_fail_transcode_for_meme_file_id: str | None = None
     pipeline_worker_fail_embed_for_meme_file_id: str | None = None
