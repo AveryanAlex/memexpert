@@ -791,7 +791,7 @@ async def test_inline_skips_private_uncached_media_when_media_url_provider_is_un
 
 
 @pytest.mark.asyncio
-async def test_inline_empty_query_for_linked_user_returns_pins_and_is_personal(
+async def test_inline_empty_query_for_linked_user_returns_pins_then_popular_and_is_personal(
     migrated_db_session: AsyncSession,
     postgres_async_url: str,
     postgres_session_factory: async_sessionmaker[AsyncSession],
@@ -841,14 +841,17 @@ async def test_inline_empty_query_for_linked_user_returns_pins_and_is_personal(
     assert fake_service.calls == []
     answer = last_inline_answer(telegram_session)
     assert answer.is_personal is True
-    assert len(answer.results) == 1
-    result = answer.results[0]
-    assert isinstance(result, InlineQueryResultCachedPhoto)
-    assert result.photo_file_id == "cached-pinned-photo-id"
+    assert len(answer.results) == 2
+    first_result = answer.results[0]
+    second_result = answer.results[1]
+    assert isinstance(first_result, InlineQueryResultCachedPhoto)
+    assert isinstance(second_result, InlineQueryResultCachedPhoto)
+    assert first_result.photo_file_id == "cached-pinned-photo-id"
+    assert second_result.photo_file_id == "cached-popular-photo-id"
 
 
 @pytest.mark.asyncio
-async def test_inline_empty_query_for_linked_user_falls_back_to_recent_sends_when_no_pins(
+async def test_inline_empty_query_for_linked_user_returns_recent_then_popular_when_no_pins(
     migrated_db_session: AsyncSession,
     postgres_async_url: str,
     postgres_session_factory: async_sessionmaker[AsyncSession],
@@ -904,10 +907,13 @@ async def test_inline_empty_query_for_linked_user_falls_back_to_recent_sends_whe
     assert fake_service.calls == []
     answer = last_inline_answer(telegram_session)
     assert answer.is_personal is True
-    assert len(answer.results) == 1
-    result = answer.results[0]
-    assert isinstance(result, InlineQueryResultCachedPhoto)
-    assert result.photo_file_id == "cached-recent-photo-id"
+    assert len(answer.results) == 2
+    first_result = answer.results[0]
+    second_result = answer.results[1]
+    assert isinstance(first_result, InlineQueryResultCachedPhoto)
+    assert isinstance(second_result, InlineQueryResultCachedPhoto)
+    assert first_result.photo_file_id == "cached-recent-photo-id"
+    assert second_result.photo_file_id == "cached-popular-photo-id"
 
 
 @pytest.mark.asyncio
