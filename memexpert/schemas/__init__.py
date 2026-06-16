@@ -45,6 +45,16 @@ from memexpert.schemas.content_pipeline import (
     ContentPipelineUploadRead,
 )
 from memexpert.schemas.report import MemeReportCreateRequest, MemeReportRead
+from memexpert.schemas.seo import (
+    SeoCatalogMemePageRead,
+    SeoCatalogMemeRead,
+    SeoCatalogMemeTemplateRefRead,
+    SeoCatalogSummaryRead,
+    SeoCatalogTagPageRead,
+    SeoCatalogTagRead,
+    SeoCatalogTemplatePageRead,
+    SeoCatalogTemplateRead,
+)
 from memexpert.schemas.user import (
     AccountDeletionLogRead,
     AccountMergeLogRead,
@@ -99,6 +109,14 @@ __all__ = [
     "MemeReportCreateRequest",
     "MemeReportRead",
     "PinnedMemeRead",
+    "SeoCatalogMemePageRead",
+    "SeoCatalogMemeRead",
+    "SeoCatalogMemeTemplateRefRead",
+    "SeoCatalogSummaryRead",
+    "SeoCatalogTagPageRead",
+    "SeoCatalogTagRead",
+    "SeoCatalogTemplatePageRead",
+    "SeoCatalogTemplateRead",
     "UserRead",
     "WebCollectionSummaryRead",
 ]

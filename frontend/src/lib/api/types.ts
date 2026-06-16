@@ -364,6 +364,80 @@ export interface PublicMemeLandingRead {
   trend_summary: PublicTrendSummaryRead | null;
 }
 
+export interface SeoCatalogSummaryRead {
+  public_safe_meme_count: number;
+  tag_count: number;
+  template_count: number;
+  updated_at: string | null;
+}
+
+export interface SeoCatalogMemeTemplateRefRead {
+  slug: string;
+  name: string;
+  title: string;
+  description: string | null;
+}
+
+export interface SeoCatalogMemeRead {
+  id: string;
+  seo_slug: string | null;
+  title: string;
+  description: string | null;
+  alt_text: string;
+  caption: string | null;
+  tags: string[];
+  media_type: ContentKind;
+  language: ContentLanguage;
+  popularity_score: number;
+  like_count: number;
+  template: SeoCatalogMemeTemplateRefRead | null;
+  primary_file: PublicMemeFileRead | null;
+  files: PublicMemeFileRead[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SeoCatalogMemePageRead {
+  items: SeoCatalogMemeRead[];
+  limit: number;
+  offset: number;
+  total: number;
+  has_more: boolean;
+}
+
+export interface SeoCatalogTagRead {
+  slug: string;
+  title: string;
+  description: string | null;
+  meme_count: number;
+  updated_at: string | null;
+}
+
+export interface SeoCatalogTagPageRead {
+  items: SeoCatalogTagRead[];
+  limit: number;
+  offset: number;
+  total: number;
+  has_more: boolean;
+}
+
+export interface SeoCatalogTemplateRead {
+  slug: string;
+  name: string;
+  title: string;
+  description: string | null;
+  meme_count: number;
+  updated_at: string | null;
+}
+
+export interface SeoCatalogTemplatePageRead {
+  items: SeoCatalogTemplateRead[];
+  limit: number;
+  offset: number;
+  total: number;
+  has_more: boolean;
+}
+
 export interface AdminSessionRead {
   user: UserRead;
 }

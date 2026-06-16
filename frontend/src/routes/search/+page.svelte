@@ -99,6 +99,13 @@
   }
 </script>
 
+<svelte:head>
+  <link rel="canonical" href={data.seo.canonicalUrl} />
+  {#if data.seo.noindex}
+    <meta name="robots" content="noindex,follow" />
+  {/if}
+</svelte:head>
+
 <PageHeader title="Search MemeXpert." description="Find a meme by phrase, tag, format, language, and safe-content preferences. Every filter lives in the URL so results are shareable." badge="Public catalog" />
 
 <Card class="mb-6 grid gap-5" aria-labelledby="search-filters-title">
