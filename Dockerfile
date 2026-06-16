@@ -7,11 +7,11 @@ ARG UV_VERSION=0.11.19
 FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
 
 
-FROM python:${PYTHON_VERSION}-slim-${DEBIAN_VERSION} AS base
-
+FROM python:${PYTHON_VERSION}-slim-${DEBIAN_VERSION} AS runtime-base
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    HOME=/app \
     PYTHONPATH=/app \
     UV_LINK_MODE=copy \
     UV_PROJECT_ENVIRONMENT=/opt/venv \
@@ -25,19 +25,68 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
-        ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
-
-
-FROM base AS deps
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid 10001 app \
+    && useradd --system --uid 10001 --gid app --home-dir /app --shell /usr/sbin/nologin app \
+    && mkdir -p /app/.cache /app/.paddleocr /app/.paddlex /app/.telegram-sessions \
+    && chown app:app /app/.cache /app/.paddleocr /app/.paddlex /app/.telegram-sessions
 
 COPY pyproject.toml uv.lock ./
+
 RUN --mount=from=uv,source=/uv,target=/usr/local/bin/uv \
     --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked --no-dev --no-install-project
+    uv sync --locked --no-default-groups --no-install-project
 
 
-FROM deps AS app
+FROM runtime-base AS api-deps
+
+RUN --mount=from=uv,source=/uv,target=/usr/local/bin/uv \
+    --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-default-groups --group api --no-install-project
+
+
+FROM runtime-base AS bot-deps
+
+RUN --mount=from=uv,source=/uv,target=/usr/local/bin/uv \
+    --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-default-groups --group bot --no-install-project
+
+
+FROM runtime-base AS scheduler-deps
+
+RUN --mount=from=uv,source=/uv,target=/usr/local/bin/uv \
+    --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-default-groups --group scheduler --no-install-project
+
+
+FROM runtime-base AS worker-system
+
+ENV PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ffmpeg \
+        libgl1 \
+        libglib2.0-0 \
+        libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY docker/paddleocr-requirements.txt ./docker/paddleocr-requirements.txt
+
+RUN --mount=from=uv,source=/uv,target=/usr/local/bin/uv \
+    --mount=type=cache,target=/root/.cache/uv \
+    UV_PYTHON_DOWNLOADS=automatic uv venv --python 3.13 /opt/paddleocr-venv \
+    && UV_PYTHON_DOWNLOADS=automatic uv pip install --python /opt/paddleocr-venv/bin/python -r docker/paddleocr-requirements.txt
+
+
+FROM worker-system AS worker-deps
+
+RUN --mount=from=uv,source=/uv,target=/usr/local/bin/uv \
+    --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-default-groups --group worker --no-install-project
+
+
+FROM api-deps AS api-app
 
 COPY memexpert/ ./memexpert/
 COPY scripts/ ./scripts/
@@ -45,15 +94,43 @@ COPY alembic.ini ./
 COPY alembic/ ./alembic/
 RUN --mount=from=uv,source=/uv,target=/usr/local/bin/uv \
     --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked --no-dev --no-editable
+    uv sync --locked --no-default-groups --group api --no-editable
 
 
-FROM app AS runtime
+FROM bot-deps AS bot-app
 
-RUN mkdir -p /app/.telegram-sessions \
-    && groupadd --system --gid 10001 app \
-    && useradd --system --uid 10001 --gid app --home-dir /app --shell /usr/sbin/nologin app \
-    && chown app:app /app/.telegram-sessions
+COPY memexpert/ ./memexpert/
+COPY scripts/ ./scripts/
+COPY alembic.ini ./
+COPY alembic/ ./alembic/
+RUN --mount=from=uv,source=/uv,target=/usr/local/bin/uv \
+    --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-default-groups --group bot --no-editable
+
+
+FROM scheduler-deps AS scheduler-app
+
+COPY memexpert/ ./memexpert/
+COPY scripts/ ./scripts/
+COPY alembic.ini ./
+COPY alembic/ ./alembic/
+RUN --mount=from=uv,source=/uv,target=/usr/local/bin/uv \
+    --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-default-groups --group scheduler --no-editable
+
+
+FROM worker-deps AS worker-app
+
+COPY memexpert/ ./memexpert/
+COPY scripts/ ./scripts/
+COPY alembic.ini ./
+COPY alembic/ ./alembic/
+RUN --mount=from=uv,source=/uv,target=/usr/local/bin/uv \
+    --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-default-groups --group worker --no-editable
+
+
+FROM api-app AS api
 
 USER app
 
@@ -63,3 +140,31 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD curl -fsS http://127.0.0.1:8000/health || exit 1
 
 CMD ["memexpert-api"]
+
+
+FROM bot-app AS bot
+
+USER app
+
+CMD ["memexpert-bot"]
+
+
+FROM scheduler-app AS scheduler
+
+USER app
+
+CMD ["memexpert-scheduler"]
+
+
+FROM worker-app AS worker
+
+ENV MEMEXPERT_WORKER_IMAGE=1 \
+    PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True \
+    PIPELINE_OCR_PADDLE_COMMAND="/opt/paddleocr-venv/bin/python /app/scripts/paddleocr_json.py --input {input}"
+
+USER app
+
+CMD ["memexpert-workers"]
+
+
+FROM api AS runtime

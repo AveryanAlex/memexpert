@@ -543,7 +543,7 @@ def build_ocr_result(*, source_object_key: str) -> OCRExtractionResult:
 
     return OCRExtractionResult(
         engine="paddleocr",
-        fallback_engine="qwen2.5-vl-2b",
+        fallback_engine="ocr-command",
         fallback_used=True,
         low_confidence=True,
         confidence=0.41,
@@ -3255,7 +3255,7 @@ def _build_ready_item_detail(
         stages=stage_entries,
         ocr=ContentPipelineOCRDetail(
             engine="paddleocr",
-            fallback_engine="qwen2.5-vl-2b" if fallback_used else None,
+            fallback_engine="ocr-command" if fallback_used else None,
             fallback_used=fallback_used,
             low_confidence=low_confidence,
             confidence=0.42 if low_confidence else 0.91,

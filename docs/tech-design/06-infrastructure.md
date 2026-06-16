@@ -175,7 +175,7 @@ Integration tests run in CI with testcontainers — no shared test databases, no
 | Sync lag | Low | RabbitMQ retries via DLX. Full resync for recovery. Monitor sync delay. |
 | Qdrant memory at scale | Low | Scalar quantization halves memory. At 10M+ vectors consider cluster mode. |
 | Transcoding backlog | Medium | Monitor queue depth, scale workers independently. |
-| PaddleOCR accuracy on Cyrillic | Medium | Qwen2.5-VL fallback. Manual correction for important memes. |
+| PaddleOCR accuracy on Cyrillic | Medium | Tune preprocessing/model version, track low-confidence OCR, and use manual correction for important memes. No Qwen/VLM fallback is active in this slice. |
 | Guest account growth | Low/Medium | Guest histories are retained for personalization and conversion; monitor storage growth and keep event tables partitionable/archivable if needed. |
 | Account merge data loss | Medium | Audit log. Careful merge logic within transactions. |
 | JWT secret compromise | High | HttpOnly cookies, configurable TTL, token nonce revocation, secret rotation plan. |

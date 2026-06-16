@@ -100,7 +100,8 @@ class Settings(BaseSettings):
     pipeline_worker_prefetch_count: int = Field(default=1, ge=1, le=512)
     pipeline_storage_connection_timeout_seconds: float = Field(default=5.0, gt=0.0)
     pipeline_ocr_primary_engine: str = "paddleocr"
-    pipeline_ocr_fallback_engine: str = "qwen2.5-vl-2b"
+    pipeline_ocr_paddle_command: str | None = None
+    pipeline_ocr_fallback_engine: str | None = None
     pipeline_ocr_fallback_command: str | None = None
     pipeline_ocr_provider_mode: Literal["live", "fake"] = "live"
     pipeline_fake_ocr_text: str = "cat e2e smoke fake ocr text"
@@ -344,7 +345,6 @@ class Settings(BaseSettings):
 
     @field_validator(
         "pipeline_ocr_primary_engine",
-        "pipeline_ocr_fallback_engine",
         "pipeline_ffmpeg_binary",
         "pipeline_ffprobe_binary",
         "pipeline_voyage_model",
@@ -495,6 +495,8 @@ class Settings(BaseSettings):
     @field_validator(
         "auth_google_client_id",
         "auth_google_redirect_uri",
+        "pipeline_ocr_paddle_command",
+        "pipeline_ocr_fallback_engine",
         "pipeline_ocr_fallback_command",
         "pipeline_classification_api_url",
         mode="before",

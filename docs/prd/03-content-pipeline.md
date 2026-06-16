@@ -24,7 +24,7 @@ Users can suggest new channels for crawling via a form in the bot PM and on the 
 Every meme goes through:
 
 - **Deduplication** (perceptual hash + embedding similarity)
-- **OCR** (PaddleOCR PP-OCRv5 for Russian + English, Qwen2.5-VL-2B fallback for stylized text)
+- **OCR** (PaddleOCR for Russian + English; deterministic fake provider in CI/E2E; no active Qwen/VLM fallback in the current backend slice)
 - **NSFW detection** (filtered by default in search)
 - **Political content detection** (deferred — see [Deferred Features](10-deferred.md))
 - **Language detection** (ru / en / mixed / none)

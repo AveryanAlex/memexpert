@@ -235,7 +235,7 @@ def build_ocr_result(*, source_object_key: str) -> OCRExtractionResult:
 
     return OCRExtractionResult(
         engine="paddleocr",
-        fallback_engine="qwen2.5-vl-2b",
+        fallback_engine="ocr-command",
         fallback_used=True,
         low_confidence=True,
         confidence=0.41,
@@ -827,7 +827,7 @@ async def test_complete_ocr_stage_persists_durable_result_and_keeps_meme_unready
     assert persisted_meme.ocr_text is None
     assert persisted_meme.language is ContentLanguage.NONE
     assert persisted_ocr.engine == "paddleocr"
-    assert persisted_ocr.fallback_engine == "qwen2.5-vl-2b"
+    assert persisted_ocr.fallback_engine == "ocr-command"
     assert persisted_ocr.fallback_used is True
     assert persisted_ocr.low_confidence is True
     assert persisted_ocr.confidence == pytest.approx(0.41)
