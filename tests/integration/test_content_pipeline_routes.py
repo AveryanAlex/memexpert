@@ -217,7 +217,7 @@ def _ocr_result(*, fallback_used: bool, low_confidence: bool, confidence: float 
 
     return OCRExtractionResult(
         engine="paddleocr",
-        fallback_engine="qwen2.5-vl-2b" if fallback_used else None,
+        fallback_engine="ocr-command" if fallback_used else None,
         fallback_used=fallback_used,
         low_confidence=low_confidence,
         confidence=confidence,

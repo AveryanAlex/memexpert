@@ -117,7 +117,7 @@ SvelteKit handles server-side rendering for SEO and fast initial page loads. `+p
 | **CDN** | Cloudflare | Media delivery + imgproxy caching |
 | **Image Processing** | imgproxy, Pillow, FFmpeg | On-the-fly + batch transcoding |
 | **Embeddings** | Voyage AI (`voyage-multimodal-3.5`) | 1024-dim multimodal, Matryoshka support |
-| **OCR** | PaddleOCR PP-OCRv5 + Qwen2.5-VL-2B | Primary + VLM fallback for stylized text |
+| **OCR** | PaddleOCR helper | Worker-only Python 3.13 helper venv for Russian/English text; fake mode for deterministic CI/E2E |
 | **LLM/SEO** | PydanticAI provider boundary | Baseline prompts ported from v0 Rust branch; model configured per environment |
 | **Cache / rate limiting** | Redis | Rate limiting, hot caches, optional search candidate pools |
 | **Python Tooling** | uv (package manager), ruff (lint), ty (type check), pytest | Single `pyproject.toml`, uv for deps + virtualenv + scripts |
@@ -145,13 +145,15 @@ SvelteKit handles server-side rendering for SEO and fast initial page loads. `+p
 
 ```
 Server 1: FastAPI + SvelteKit + aiogram + Channel Bot + Scheduler + Crawlers + Redis + imgproxy
-Server 2: FastStream workers (transcode, OCR, embed, classify, sync, SEO) + PaddleOCR + Qwen2.5-VL
+Server 2: FastStream workers (transcode, OCR, embed, classify, sync, SEO) + worker-only FFmpeg + PaddleOCR helper
 Server 3 (or colocated with 1): Qdrant + Meilisearch + RabbitMQ (Docker)
 
 Managed: PostgreSQL, S3 (R2/B2), Cloudflare CDN
 ```
 
 Qdrant, Meilisearch, and RabbitMQ are lightweight enough to share a server with the API at initial scale. Split to dedicated nodes if latency becomes an issue.
+
+Backend containers are split by runtime target: API, bot, scheduler, and worker images install only their service dependency group plus common Python runtime dependencies. The worker image is intentionally heavier: it is the only Python app image with FFmpeg/FFprobe, Paddle/OpenCV system libraries, and the Python 3.13 PaddleOCR helper venv. PaddleOCR/PaddlePaddle are not installed into the main Python 3.14 app environment.
 
 ### Resource Estimates
 

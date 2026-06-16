@@ -1,5 +1,14 @@
-x-app-image: &app-image
-  image: ${MEMEXPERT_APP_IMAGE:-ghcr.io/averyanalex/memexpert/app:main}
+x-api-image: &api-image
+  image: ${MEMEXPERT_API_IMAGE:-ghcr.io/averyanalex/memexpert/api:main}
+
+x-worker-image: &worker-image
+  image: ${MEMEXPERT_WORKER_IMAGE:-ghcr.io/averyanalex/memexpert/worker:main}
+
+x-scheduler-image: &scheduler-image
+  image: ${MEMEXPERT_SCHEDULER_IMAGE:-ghcr.io/averyanalex/memexpert/scheduler:main}
+
+x-bot-image: &bot-image
+  image: ${MEMEXPERT_BOT_IMAGE:-ghcr.io/averyanalex/memexpert/bot:main}
 
 x-app-env: &app-env
   APP_HOST: 0.0.0.0
@@ -181,7 +190,7 @@ services:
       start_period: 10s
 
   migrate:
-    <<: *app-image
+    <<: *api-image
     restart: "no"
     command: ["alembic", "upgrade", "head"]
     environment: *app-env
@@ -204,7 +213,7 @@ services:
       disable: true
 
   api:
-    <<: *app-image
+    <<: *api-image
     restart: unless-stopped
     environment: *app-env
     ports:
@@ -214,10 +223,14 @@ services:
         condition: service_completed_successfully
 
   workers:
-    <<: *app-image
+    <<: *worker-image
     restart: unless-stopped
-    command: ["memexpert-workers"]
-    environment: *app-env
+    environment:
+      <<: *app-env
+      PIPELINE_OCR_PROVIDER_MODE: ${PIPELINE_OCR_PROVIDER_MODE:-live}
+      PIPELINE_OCR_PADDLE_COMMAND: ${PIPELINE_OCR_PADDLE_COMMAND:?set PIPELINE_OCR_PADDLE_COMMAND}
+      PIPELINE_OCR_FALLBACK_ENGINE: ${PIPELINE_OCR_FALLBACK_ENGINE:-}
+      PIPELINE_OCR_FALLBACK_COMMAND: ${PIPELINE_OCR_FALLBACK_COMMAND:-}
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -227,9 +240,8 @@ services:
       disable: true
 
   scheduler:
-    <<: *app-image
+    <<: *scheduler-image
     restart: unless-stopped
-    command: ["memexpert-scheduler"]
     environment: *app-env
     depends_on:
       migrate:
@@ -238,7 +250,7 @@ services:
       disable: true
 
   bot:
-    <<: *app-image
+    <<: *bot-image
     profiles: ["bot"]
     restart: unless-stopped
     command: ["sh", "-c", ": \"$${AUTH_TELEGRAM_BOT_TOKEN:?set AUTH_TELEGRAM_BOT_TOKEN when enabling the bot profile}\" && exec memexpert-bot"]

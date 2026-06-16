@@ -74,7 +74,7 @@ raw_meme ──→ [Ingest & pHash Dedup] ──→ meme_created
 | Queue | Resource Profile | Consumer |
 |-------|-----------------|----------|
 | `q.transcode` | CPU-bound (FFmpeg) | GIF→MP4, video transcode, blur hash, EXIF strip |
-| `q.ocr` | GPU-bound (PaddleOCR, Qwen2.5-VL) | Text extraction, language detection |
+| `q.ocr` | CPU/GPU-bound (PaddleOCR) | Text extraction, language detection |
 | `q.embed` | API-bound (Voyage AI) | Image embedding computation |
 | `q.classify` | CPU-light | NSFW detection, language classification from OCR text |
 | `q.sync.qdrant` | I/O-bound (Qdrant) | Vector + payload sync |
@@ -121,7 +121,7 @@ Guest TTL/deletion jobs are intentionally not part of the current product direct
 
 ### OCR Pipeline
 
-PaddleOCR PP-OCRv5 (`lang=cyrillic`) as primary engine. If confidence < 0.6 or empty result, falls back to Qwen2.5-VL-2B (VLM) for stylized/artistic text. Language detected from OCR output by Cyrillic character ratio.
+PaddleOCR is the live OCR engine for Russian/English meme text. The worker image keeps the main app on Python 3.14, but runs PaddleOCR from a separate Python 3.13 helper venv because PaddlePaddle does not currently publish CPython 3.14 wheels. The helper runs `PaddleOCR(lang="ru", use_doc_orientation_classify=False, use_doc_unwarping=False, use_textline_orientation=False)` and returns JSON across the `PIPELINE_OCR_PADDLE_COMMAND` boundary. `PIPELINE_OCR_PROVIDER_MODE=fake` remains the deterministic CI/E2E path. There is no active Qwen/VLM fallback in this implementation; optional fallback metadata/commands are blank unless a real command is configured.
 
 ### Embedding Pipeline
 

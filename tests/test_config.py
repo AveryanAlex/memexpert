@@ -109,6 +109,29 @@ def test_settings_parse_pipeline_contract_and_normalize_object_prefixes() -> Non
     assert broker_settings.dead_letter_routing_key == "pipeline.dead_letter"
 
 
+def test_settings_ocr_defaults_are_honest_about_missing_fallback() -> None:
+    settings = Settings()
+
+    assert settings.pipeline_ocr_primary_engine == "paddleocr"
+    assert settings.pipeline_ocr_paddle_command is None
+    assert settings.pipeline_ocr_fallback_engine is None
+    assert settings.pipeline_ocr_fallback_command is None
+
+
+def test_settings_normalize_blank_ocr_command_settings_to_none() -> None:
+    settings = Settings.model_validate(
+        {
+            "pipeline_ocr_paddle_command": "  ",
+            "pipeline_ocr_fallback_engine": "  ",
+            "pipeline_ocr_fallback_command": "  ",
+        }
+    )
+
+    assert settings.pipeline_ocr_paddle_command is None
+    assert settings.pipeline_ocr_fallback_engine is None
+    assert settings.pipeline_ocr_fallback_command is None
+
+
 def test_settings_parse_scheduler_contracts() -> None:
     settings = Settings.model_validate(
         {

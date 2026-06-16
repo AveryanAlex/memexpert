@@ -67,7 +67,7 @@ class OCRProcessorProtocol(Protocol):
 
 
 class PipelineOCRProcessor:
-    """OCR adapter that prefers PaddleOCR and can fall back to a local command boundary."""
+    """OCR adapter that prefers PaddleOCR and can use command boundaries."""
 
     def __init__(
         self,
@@ -157,7 +157,10 @@ class PipelineOCRProcessor:
         with tempfile.TemporaryDirectory(prefix="memexpert-ocr-primary-") as temp_dir:
             image_path = Path(temp_dir) / "preview.png"
             image_path.write_bytes(preview_frame_bytes)
-            return await asyncio.to_thread(self._predict_with_paddleocr, image_path)
+            try:
+                return await asyncio.to_thread(self._predict_with_paddleocr, image_path)
+            except OCRProviderUnavailableError:
+                return await self._run_paddle_command(image_path)
 
     def _predict_with_paddleocr(self, image_path: Path) -> _OCRCandidate:
         try:
@@ -174,6 +177,7 @@ class PipelineOCRProcessor:
         paddle_ocr = self._paddle_ocr
         if paddle_ocr is None:
             paddle_ocr = paddle_ocr_cls(
+                lang="ru",
                 use_doc_orientation_classify=False,
                 use_doc_unwarping=False,
                 use_textline_orientation=False,
@@ -187,6 +191,19 @@ class PipelineOCRProcessor:
 
         return _parse_paddle_result(result)
 
+    async def _run_paddle_command(self, image_path: Path) -> _OCRCandidate:
+        paddle_command = self._settings.pipeline_ocr_paddle_command
+        if paddle_command is None:
+            raise OCRProviderUnavailableError(
+                "PaddleOCR is not installed in this Python runtime, and no PaddleOCR command is configured."
+            )
+
+        return await self._run_ocr_command(
+            command=paddle_command,
+            image_path=image_path,
+            purpose="PaddleOCR command",
+        )
+
     async def _run_fallback(self, preview_frame_bytes: bytes) -> _OCRCandidate:
         fallback_command = self._settings.pipeline_ocr_fallback_command
         if fallback_command is None:
@@ -195,34 +212,41 @@ class PipelineOCRProcessor:
         with tempfile.TemporaryDirectory(prefix="memexpert-ocr-fallback-") as temp_dir:
             image_path = Path(temp_dir) / "preview.png"
             image_path.write_bytes(preview_frame_bytes)
-            command_args = _render_fallback_command(fallback_command, image_path)
-            process = await asyncio.create_subprocess_exec(
-                *command_args,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            return await self._run_ocr_command(
+                command=fallback_command,
+                image_path=image_path,
+                purpose="OCR fallback command",
             )
-            try:
-                async with asyncio.timeout(self._settings.pipeline_ocr_timeout_seconds):
-                    stdout, stderr = await process.communicate()
-            except TimeoutError as exc:
-                process.kill()
-                await process.wait()
-                raise OCRTimeoutError(
-                    f"Timed out after {self._settings.pipeline_ocr_timeout_seconds:.2f}s while running OCR fallback."
-                ) from exc
+
+    async def _run_ocr_command(self, *, command: str, image_path: Path, purpose: str) -> _OCRCandidate:
+        command_args = _render_ocr_command(command, image_path, purpose=purpose)
+        process = await asyncio.create_subprocess_exec(
+            *command_args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            async with asyncio.timeout(self._settings.pipeline_ocr_timeout_seconds):
+                stdout, stderr = await process.communicate()
+        except TimeoutError as exc:
+            process.kill()
+            await process.wait()
+            raise OCRTimeoutError(
+                f"Timed out after {self._settings.pipeline_ocr_timeout_seconds:.2f}s while running {purpose}."
+            ) from exc
 
         if process.returncode != 0:
             rendered_stderr = stderr.decode("utf-8", errors="replace").strip()
             if rendered_stderr:
-                raise OCRProcessingError(f"OCR fallback command failed: {rendered_stderr}")
-            raise OCRProcessingError("OCR fallback command failed.")
+                raise OCRProcessingError(f"{purpose} failed: {rendered_stderr}")
+            raise OCRProcessingError(f"{purpose} failed.")
 
         try:
             payload = json.loads(stdout.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise OCRMalformedOutputError("OCR fallback command returned malformed JSON.") from exc
+            raise OCRMalformedOutputError(f"{purpose} returned malformed JSON.") from exc
 
-        return _parse_fallback_payload(payload)
+        return _parse_command_payload(payload, purpose=purpose)
 
 
 class FakeOCRProcessor:
@@ -298,11 +322,11 @@ def _parse_paddle_result(payload: object) -> _OCRCandidate:
     )
 
 
-def _parse_fallback_payload(payload: object) -> _OCRCandidate:
+def _parse_command_payload(payload: object, *, purpose: str) -> _OCRCandidate:
     if not isinstance(payload, dict):
-        raise OCRMalformedOutputError("OCR fallback command returned malformed JSON.")
+        raise OCRMalformedOutputError(f"{purpose} returned malformed JSON.")
 
-    if isinstance(payload.get("text"), str) or payload.get("text") is None:
+    if isinstance(payload.get("text"), str) or (payload.get("text") is None and "lines" not in payload):
         return _OCRCandidate(
             extracted_text=cast("str | None", payload.get("text")),
             confidence=_normalize_confidence(payload.get("confidence")),
@@ -311,7 +335,7 @@ def _parse_fallback_payload(payload: object) -> _OCRCandidate:
 
     lines = payload.get("lines")
     if not isinstance(lines, list):
-        raise OCRMalformedOutputError("OCR fallback command did not return text or lines.")
+        raise OCRMalformedOutputError(f"{purpose} did not return text or lines.")
 
     extracted_lines: list[str] = []
     confidence_values: list[float] = []
@@ -333,10 +357,10 @@ def _parse_fallback_payload(payload: object) -> _OCRCandidate:
     )
 
 
-def _render_fallback_command(command: str, image_path: Path) -> tuple[str, ...]:
+def _render_ocr_command(command: str, image_path: Path, *, purpose: str) -> tuple[str, ...]:
     parts = shlex.split(command)
     if not parts:
-        raise OCRProviderUnavailableError("OCR fallback command must not be blank.")
+        raise OCRProviderUnavailableError(f"{purpose} must not be blank.")
     rendered = [part.format(input=str(image_path)) for part in parts]
     if all("{input}" not in part for part in parts):
         rendered.append(str(image_path))

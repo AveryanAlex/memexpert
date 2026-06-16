@@ -416,7 +416,7 @@ async def test_schema_handles_cycles_multi_invites_and_nullable_content_fields(
                 MemeFileOCRResult(
                     meme_file=file_one,
                     engine="paddleocr",
-                    fallback_engine="qwen2.5-vl-2b",
+                    fallback_engine="ocr-command",
                     fallback_used=False,
                     low_confidence=False,
                     confidence=0.93,

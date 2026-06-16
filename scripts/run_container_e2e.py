@@ -18,7 +18,8 @@ COMPOSE_FILE = ROOT / "docker-compose.e2e.yml"
 ARTIFACT_ROOT = ROOT / ".artifacts" / "e2e"
 PROJECT_PREFIX: Final = "memexpert-e2e"
 IMAGE_ENV_DEFAULTS: Final = {
-    "MEMEXPERT_APP_IMAGE": "memexpert-app:e2e-{run_id}",
+    "MEMEXPERT_API_IMAGE": "memexpert-api:e2e-{run_id}",
+    "MEMEXPERT_WORKER_IMAGE": "memexpert-worker:e2e-{run_id}",
     "MEMEXPERT_FRONTEND_IMAGE": "memexpert-frontend:e2e-{run_id}",
     "MEMEXPERT_E2E_RUNNER_IMAGE": "memexpert-e2e-runner:e2e-{run_id}",
 }
