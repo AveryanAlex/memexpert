@@ -26,6 +26,10 @@ import type {
   PublicTrendComparisonRead,
   PublicTrendSummaryRead,
   PublicTrendTimelinePageRead,
+  SeoCatalogMemePageRead,
+  SeoCatalogSummaryRead,
+  SeoCatalogTagPageRead,
+  SeoCatalogTemplatePageRead,
   MemeReportRead,
   ModerationReason,
   TelegramLinkStartRead,
@@ -138,6 +142,11 @@ export interface UserPreferencesUpdate {
 
 interface LandingRequest extends CatalogRequest {
   slug: string;
+  limit: number;
+  offset: number;
+}
+
+interface SeoCatalogPageRequest extends CatalogRequest {
   limit: number;
   offset: number;
 }
@@ -367,6 +376,26 @@ export async function fetchTemplateLanding(request: LandingRequest): Promise<Pub
   return fetchLanding(`/api/v1/memes/templates/${encodeURIComponent(request.slug)}`, request);
 }
 
+export async function fetchSeoSummary(request: CatalogRequest): Promise<SeoCatalogSummaryRead> {
+  return apiGet<SeoCatalogSummaryRead>('/api/v1/seo/summary', new URLSearchParams(), request);
+}
+
+export async function fetchSeoMemes(request: SeoCatalogPageRequest): Promise<SeoCatalogMemePageRead> {
+  return apiGet<SeoCatalogMemePageRead>('/api/v1/seo/memes', seoPageParams(request), request);
+}
+
+export async function fetchSeoTags(request: SeoCatalogPageRequest): Promise<SeoCatalogTagPageRead> {
+  return apiGet<SeoCatalogTagPageRead>('/api/v1/seo/tags', seoPageParams(request), request);
+}
+
+export async function fetchSeoTemplates(request: SeoCatalogPageRequest): Promise<SeoCatalogTemplatePageRead> {
+  return apiGet<SeoCatalogTemplatePageRead>('/api/v1/seo/templates', seoPageParams(request), request);
+}
+
+export async function fetchPinterestFeed(request: SeoCatalogPageRequest): Promise<SeoCatalogMemePageRead> {
+  return apiGet<SeoCatalogMemePageRead>('/api/v1/seo/pinterest-feed', seoPageParams(request), request);
+}
+
 export async function fetchAdminSession(request: CatalogRequest): Promise<AdminSessionRead> {
   return apiGet<AdminSessionRead>('/api/v1/admin/session', new URLSearchParams(), request);
 }
@@ -561,6 +590,10 @@ async function fetchLanding(path: string, request: LandingRequest): Promise<Publ
     new URLSearchParams({ limit: String(request.limit), offset: String(request.offset) }),
     request
   );
+}
+
+function seoPageParams(request: SeoCatalogPageRequest): URLSearchParams {
+  return new URLSearchParams({ limit: String(request.limit), offset: String(request.offset) });
 }
 
 async function apiGet<T>(path: string, params: URLSearchParams, request: CatalogRequest): Promise<T> {

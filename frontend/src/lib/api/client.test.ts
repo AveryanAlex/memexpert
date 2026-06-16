@@ -19,6 +19,11 @@ import {
   fetchMemeDetail,
   fetchMemePage,
   fetchMemePopularitySummary,
+  fetchPinterestFeed,
+  fetchSeoMemes,
+  fetchSeoSummary,
+  fetchSeoTags,
+  fetchSeoTemplates,
   fetchTagLanding,
   fetchTagTrendSummaries,
   fetchTemplateTrendSummaries,
@@ -219,6 +224,42 @@ describe('catalog API client', () => {
     });
 
     expect(mockFetch).toHaveBeenCalledOnce();
+  });
+
+  it('requests public SEO summary, sitemap pages, and Pinterest feed pages', async () => {
+    const calls: string[] = [];
+    const mockFetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      calls.push(`${url.pathname}?${url.searchParams.toString()}`);
+
+      if (url.pathname === '/api/v1/seo/summary') {
+        return jsonResponse({ public_safe_meme_count: 12, tag_count: 3, template_count: 2, updated_at: '2026-06-14T09:30:00Z' });
+      }
+
+      if (url.pathname === '/api/v1/seo/tags') {
+        return jsonResponse({ items: [], limit: 50000, offset: 0, total: 0, has_more: false });
+      }
+
+      if (url.pathname === '/api/v1/seo/templates') {
+        return jsonResponse({ items: [], limit: 50000, offset: 0, total: 0, has_more: false });
+      }
+
+      return jsonResponse({ items: [], limit: 10000, offset: 10000, total: 0, has_more: false });
+    }) satisfies ApiFetch;
+
+    await fetchSeoSummary({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test' });
+    await fetchSeoMemes({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', limit: 10000, offset: 10000 });
+    await fetchSeoTags({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', limit: 50000, offset: 0 });
+    await fetchSeoTemplates({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', limit: 50000, offset: 0 });
+    await fetchPinterestFeed({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', limit: 100, offset: 0 });
+
+    expect(calls).toEqual([
+      '/api/v1/seo/summary?',
+      '/api/v1/seo/memes?limit=10000&offset=10000',
+      '/api/v1/seo/tags?limit=50000&offset=0',
+      '/api/v1/seo/templates?limit=50000&offset=0',
+      '/api/v1/seo/pinterest-feed?limit=100&offset=0'
+    ]);
   });
 
   it('requests trend ranking pages, aggregate summaries, comparison, and timeline', async () => {

@@ -41,6 +41,7 @@ Important runtime variables:
 - `SECURITY_CORS_ALLOWED_ORIGINS`: comma-separated browser origins allowed to call the API.
 - `API_BASE_URL`: private backend URL used by the SvelteKit Node server.
 - `HOST`, `PORT`, `ORIGIN`: SvelteKit adapter-node server settings.
+- `FRONTEND_ORIGIN`: canonical public origin for frontend-generated SEO XML. Production should use `https://memexpert.net`; if unset, frontend XML falls back to `ORIGIN`, then `https://memexpert.net`.
 - `AUTH_TELEGRAM_BOT_TOKEN`: required only when running the optional bot profile.
 - `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_SESSION_DIR`: optional Telegram crawler session settings.
 - `SCHEDULER_*`: enable flags, interval seconds, and PostgreSQL advisory-lock settings for the scheduler process.
@@ -300,4 +301,5 @@ The default CI E2E path uses the operator upload pipeline plus fake providers. I
 - Worker transcode failures: verify `ffmpeg` and `ffprobe` are available with the image commands above.
 - Frontend shows catalog API errors: confirm `API_BASE_URL` points to the private API URL reachable from the SvelteKit container or Node process.
 - Browser auth/CORS issues: align `ORIGIN`, `SECURITY_CORS_ALLOWED_ORIGINS`, API cookie secure/domain settings, and the public reverse-proxy host.
+- SEO XML issues: confirm `FRONTEND_ORIGIN=https://memexpert.net` in production and that the frontend can reach `/api/v1/seo/summary`; Pinterest consumers should use `/feeds/pinterest.xml`.
 - MinIO upload failures: confirm the bucket named by `S3_BUCKET` exists. The production compose example includes a `minio-init` one-shot service to create it.
