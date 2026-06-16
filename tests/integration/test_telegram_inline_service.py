@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
@@ -21,8 +22,6 @@ from memexpert.models.user import AnalyticsEvent, User
 from memexpert.services.telegram_inline import TelegramInlineService
 
 if TYPE_CHECKING:
-    import uuid
-
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from memexpert.schemas.meme import MemeFileRead, MemeSearchPageRead
@@ -63,28 +62,30 @@ async def create_meme_file(
     author_user_id: uuid.UUID | None = None,
     s3_original_key: str | None = None,
 ) -> tuple[Meme, MemeFile]:
+    meme_id = uuid.uuid7()
+    file_id = uuid.uuid7()
     meme = Meme(
+        id=meme_id,
         media_type=media_type,
+        primary_file_id=file_id,
         language=ContentLanguage.EN,
         tags=[media_type.value],
         is_public=is_public,
         popularity_score=popularity_score,
         author_user_id=author_user_id,
     )
-    session.add(meme)
-    await session.flush()
     file = MemeFile(
-        meme_id=meme.id,
-        s3_original_key=s3_original_key or f"https://cdn.example.test/{meme.id}.jpg",
+        id=file_id,
+        meme_id=meme_id,
+        s3_original_key=s3_original_key or f"https://cdn.example.test/{meme_id}.jpg",
         mime_type=mime_type,
         width=640,
         height=480,
         quality_score=0.9,
-        is_primary=True,
     )
-    session.add(file)
+    session.add(meme)
     await session.flush()
-    meme.primary_file_id = file.id
+    session.add(file)
     await session.flush()
     return meme, file
 

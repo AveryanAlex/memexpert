@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
@@ -580,12 +580,10 @@ class AdminService:
             affected_snapshot=affected_snapshot,
         )
         self.session.add(audit_log)
-
-        # Avoid primary-file FK ordering surprises before ORM/database cascades remove file rows.
-        meme.primary_file_id = None
         await self.session.flush()
+
         audit_log_id = audit_log.id
-        await self.session.delete(meme)
+        await self.session.execute(delete(Meme).where(Meme.id == meme_id))
         await self.session.commit()
 
         return AdminMemeDestructiveActionRead(
@@ -845,7 +843,7 @@ class AdminService:
         return {
             "meme": {
                 "id": str(meme.id),
-                "primary_file_id": None if meme.primary_file_id is None else str(meme.primary_file_id),
+                "primary_file_id": str(meme.primary_file_id),
                 "media_type": meme.media_type.value,
                 "language": meme.language.value,
                 "is_public": meme.is_public,

@@ -36,7 +36,7 @@ class MergeOutcome:
     target_meme_id: uuid.UUID
     source_meme_id: uuid.UUID | None
     similarity_score: float | None
-    primary_file_id: uuid.UUID | None
+    primary_file_id: uuid.UUID
 
 
 class ContentMergeService:
@@ -224,7 +224,7 @@ class ContentMergeService:
         _ = await self._session.execute(
             update(MemeFile)
             .where(MemeFile.meme_id == source_meme_id)
-            .values(meme_id=target_meme_id, is_primary=False)
+            .values(meme_id=target_meme_id)
         )
         await self._session.flush()
         return moved_file_ids
@@ -304,34 +304,25 @@ class ContentMergeService:
         target_meme.popularity_score = max(target_meme.popularity_score, source_meme.popularity_score)
 
     async def _delete_source_meme(self, *, source_meme: Meme) -> None:
-        # The primary_file_id FK uses ON DELETE SET NULL, but we still clear it explicitly so
-        # the deletion does not race against the concurrent primary reselection query.
-        source_meme.primary_file_id = None
-        await self._session.flush()
         await self._session.delete(source_meme)
         await self._session.flush()
 
-    async def _reselect_primary_file(self, meme_id: uuid.UUID) -> uuid.UUID | None:
+    async def _reselect_primary_file(self, meme_id: uuid.UUID) -> uuid.UUID:
         files_result = await self._session.execute(
-            select(MemeFile).where(MemeFile.meme_id == meme_id)
+            select(MemeFile.id)
+            .where(MemeFile.meme_id == meme_id)
+            .order_by(MemeFile.quality_score.desc(), MemeFile.created_at.desc(), MemeFile.id.desc())
+            .limit(1)
         )
-        candidate_files = list(files_result.scalars().all())
-        if not candidate_files:
-            await self._session.execute(
-                update(Meme).where(Meme.id == meme_id).values(primary_file_id=None)
-            )
-            await self._session.flush()
-            return None
-
-        best_file = max(candidate_files, key=lambda row: (row.quality_score, row.created_at.timestamp()))
-        for file_row in candidate_files:
-            file_row.is_primary = file_row.id == best_file.id
+        best_file_id = files_result.scalar_one_or_none()
+        if best_file_id is None:
+            raise PipelineIngestError(f"Merged target meme {meme_id} has no files available for primary selection.")
 
         await self._session.execute(
-            update(Meme).where(Meme.id == meme_id).values(primary_file_id=best_file.id)
+            update(Meme).where(Meme.id == meme_id).values(primary_file_id=best_file_id)
         )
         await self._session.flush()
-        return best_file.id
+        return best_file_id
 
 __all__ = [
     "MERGE_REASON_ADMIN",

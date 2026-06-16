@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+import uuid
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -16,8 +17,8 @@ from sqlalchemy import func, select
 from memexpert.bot.main import build_bot, build_dispatcher
 from memexpert.core.config import Settings
 from memexpert.models.collection import Collection, CollectionMeme
-from memexpert.models.content import Meme
-from memexpert.models.enums import AccountType, AnalyticsEventType, CollectionKind, ContentKind
+from memexpert.models.content import Meme, MemeFile
+from memexpert.models.enums import AccountType, AnalyticsEventType, CollectionKind, ContentKind, ContentProcessingStatus
 from memexpert.models.user import AccountMergeLog, AnalyticsEvent, InlineUsageEvent, TelegramLinkCode, User
 from memexpert.services import (
     AccountLinkAlreadyCompletedError,
@@ -32,7 +33,6 @@ from memexpert.services import (
 from tests.conftest import create_full_user_via_upgrade
 
 if TYPE_CHECKING:
-    import uuid
     from collections.abc import AsyncGenerator
 
     from aiogram import Bot, Dispatcher
@@ -169,8 +169,18 @@ async def issue_link_code(session: AsyncSession, *, settings: Settings, guest_us
 
 
 async def create_meme(session: AsyncSession) -> Meme:
-    meme = Meme(media_type=ContentKind.IMAGE)
+    meme_id = uuid.uuid7()
+    meme_file_id = uuid.uuid7()
+    meme = Meme(id=meme_id, media_type=ContentKind.IMAGE, primary_file_id=meme_file_id)
+    meme_file = MemeFile(
+        id=meme_file_id,
+        meme_id=meme_id,
+        status=ContentProcessingStatus.READY,
+        s3_original_key=f"pipeline/originals/{meme_id}.jpg",
+    )
     session.add(meme)
+    await session.flush()
+    session.add(meme_file)
     await session.flush()
     return meme
 

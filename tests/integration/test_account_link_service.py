@@ -12,13 +12,14 @@ import pytest
 from sqlalchemy import func, select
 
 from memexpert.models.collection import Collection, CollectionMeme
-from memexpert.models.content import Meme
+from memexpert.models.content import Meme, MemeFile
 from memexpert.models.enums import (
     AccountStatus,
     AccountType,
     AnalyticsEventType,
     CollectionKind,
     ContentKind,
+    ContentProcessingStatus,
     UserLanguage,
 )
 from memexpert.models.user import AccountMergeLog, AnalyticsEvent, InlineUsageEvent, User
@@ -158,8 +159,18 @@ async def create_password_user(
 
 
 async def create_meme(session: AsyncSession) -> Meme:
-    meme = Meme(media_type=ContentKind.IMAGE)
+    meme_id = uuid.uuid7()
+    meme_file_id = uuid.uuid7()
+    meme = Meme(id=meme_id, media_type=ContentKind.IMAGE, primary_file_id=meme_file_id)
+    meme_file = MemeFile(
+        id=meme_file_id,
+        meme_id=meme_id,
+        status=ContentProcessingStatus.READY,
+        s3_original_key=f"pipeline/originals/{meme_id}.jpg",
+    )
     session.add(meme)
+    await session.flush()
+    session.add(meme_file)
     await session.flush()
     return meme
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
@@ -36,8 +37,6 @@ from memexpert.services import (
 from tests.conftest import create_full_user_via_upgrade
 
 if TYPE_CHECKING:
-    import uuid
-
     from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -50,27 +49,29 @@ async def _create_meme(
     s3_web_video_key: str | None = None,
     mime_type: str = "image/jpeg",
 ) -> Meme:
+    meme_id = uuid.uuid7()
+    file_id = uuid.uuid7()
     meme = Meme(
+        id=meme_id,
         media_type=ContentKind.IMAGE,
+        primary_file_id=file_id,
         language=ContentLanguage.EN,
         is_public=is_public,
         author_user_id=author_user_id,
     )
-    session.add(meme)
-    await session.flush()
     file = MemeFile(
-        meme_id=meme.id,
-        s3_original_key=s3_original_key or f"pipeline/originals/test/{meme.id}.jpg",
+        id=file_id,
+        meme_id=meme_id,
+        s3_original_key=s3_original_key or f"pipeline/originals/test/{meme_id}.jpg",
         s3_web_video_key=s3_web_video_key,
         mime_type=mime_type,
         width=640,
         height=480,
         quality_score=0.8,
-        is_primary=True,
     )
-    session.add(file)
+    session.add(meme)
     await session.flush()
-    meme.primary_file_id = file.id
+    session.add(file)
     await session.flush()
     return meme
 

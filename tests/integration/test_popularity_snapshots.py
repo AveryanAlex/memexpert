@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -23,8 +24,6 @@ from memexpert.services.popularity_snapshots import (
 from memexpert.services.public_trends import PublicTrendsService, refresh_public_trend_materialized_views
 
 if TYPE_CHECKING:
-    import uuid
-
     from fastapi import FastAPI
     from httpx import AsyncClient
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
@@ -217,25 +216,27 @@ async def _create_meme(
     tags: list[str] | None = None,
     is_public: bool = True,
 ) -> Meme:
+    meme_id = uuid.uuid7()
+    file_id = uuid.uuid7()
     meme = Meme(
+        id=meme_id,
         media_type=ContentKind.IMAGE,
+        primary_file_id=file_id,
         language=ContentLanguage.EN,
         tags=tags or [],
         is_public=is_public,
         popularity_score=0.0,
     )
-    session.add(meme)
-    await session.flush()
     file = MemeFile(
-        meme_id=meme.id,
-        s3_original_key=f"memes/{meme.id}.jpg",
+        id=file_id,
+        meme_id=meme_id,
+        s3_original_key=f"memes/{meme_id}.jpg",
         mime_type="image/jpeg",
         quality_score=1.0,
-        is_primary=True,
     )
-    session.add(file)
+    session.add(meme)
     await session.flush()
-    meme.primary_file_id = file.id
+    session.add(file)
     await session.flush()
     return meme
 

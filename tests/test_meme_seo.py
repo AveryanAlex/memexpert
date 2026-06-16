@@ -95,20 +95,24 @@ def _meme(
     file_size_bytes: int | None = 8,
     s3_original_key: str = "pipeline/originals/private-object-key/original.png",
 ) -> Meme:
+    meme_id = uuid.uuid4()
+    meme_file_id = uuid.uuid4()
     meme = Meme(
-        id=uuid.uuid4(),
+        id=meme_id,
         media_type=ContentKind.IMAGE,
+        primary_file_id=meme_file_id,
         language=ContentLanguage.EN,
         tags=["frog", "wizard"],
         ocr_text="frog wizard text",
         is_public=True,
     )
     if not primary_file:
+        meme.primary_file_id = meme_file_id
         return meme
 
     meme_file = MemeFile(
-        id=uuid.uuid4(),
-        meme_id=meme.id,
+        id=meme_file_id,
+        meme_id=meme_id,
         status=ContentProcessingStatus.READY,
         s3_original_key=s3_original_key,
         mime_type=mime_type,
@@ -116,9 +120,7 @@ def _meme(
         width=640,
         height=480,
         quality_score=0.9,
-        is_primary=True,
     )
-    meme.primary_file_id = meme_file.id
     meme.primary_file = meme_file
     return meme
 

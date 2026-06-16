@@ -28,7 +28,6 @@ def test_imgproxy_signed_image_urls_have_safe_shape_and_download_filename() -> N
         height=480,
         blur_hash="LEHV6nWB2yk8pyo0adR*.7kCMdnj",
         quality_score=0.9,
-        is_primary=True,
     )
 
     render = MediaRenderUrlService(settings).build_render(
@@ -68,7 +67,6 @@ def test_imgproxy_unsigned_dev_mode_only_when_key_and_salt_are_absent() -> None:
         s3_original_key="memes/dev.png",
         mime_type="image/png",
         quality_score=0.8,
-        is_primary=True,
     )
 
     render = MediaRenderUrlService(settings).build_render(
@@ -95,7 +93,6 @@ def test_web_video_uses_public_media_base_and_never_imgproxy() -> None:
         s3_web_video_key="pipeline/derived/secret/web.mp4",
         mime_type="video/mp4",
         quality_score=0.7,
-        is_primary=True,
     )
 
     render = MediaRenderUrlService(settings).build_render(
@@ -121,7 +118,6 @@ def test_web_video_returns_null_without_public_media_base() -> None:
         s3_web_video_key="pipeline/derived/secret/web.mp4",
         mime_type="video/mp4",
         quality_score=0.7,
-        is_primary=True,
     )
 
     render = MediaRenderUrlService(Settings()).build_render(
@@ -144,7 +140,6 @@ def test_private_image_render_uses_authenticated_api_variants() -> None:
         height=600,
         blur_hash="LEHV6nWB2yk8pyo0adR*.7kCMdnj",
         quality_score=0.8,
-        is_primary=True,
     )
 
     render = MediaRenderUrlService(Settings()).build_private_render(file)
@@ -174,7 +169,6 @@ def test_private_web_video_uses_authenticated_direct_variant_without_imgproxy() 
         s3_web_video_key="pipeline/derived/private/web.mp4",
         mime_type="video/mp4",
         quality_score=0.7,
-        is_primary=True,
     )
 
     render = MediaRenderUrlService(Settings.model_validate({"imgproxy_base_url": "https://img.memexpert.test"})).build_private_render(file)

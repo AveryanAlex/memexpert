@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
@@ -37,8 +38,12 @@ async def _create_meme(
     seo_alt_text: str | None = None,
     ocr_text: str | None = None,
 ) -> Meme:
+    meme_id = uuid.uuid7()
+    file_id = uuid.uuid7()
     meme_kwargs: dict[str, object] = {
+        "id": meme_id,
         "media_type": ContentKind.IMAGE,
+        "primary_file_id": file_id,
         "language": ContentLanguage.EN,
         "tags": tags or [],
         "is_public": is_public,
@@ -53,31 +58,28 @@ async def _create_meme(
     if updated_at is not None:
         meme_kwargs["updated_at"] = updated_at
     meme = Meme(**meme_kwargs)
-    session.add(meme)
-    await session.flush()
     file_kwargs: dict[str, object] = {
-        "meme_id": meme.id,
-        "s3_original_key": f"memes/{meme.id}.jpg",
+        "id": file_id,
+        "s3_original_key": f"memes/{meme_id}.jpg",
         "mime_type": "image/jpeg",
         "width": 640,
         "height": 480,
         "file_size_bytes": 12345,
         "blur_hash": "LKO2?U%2Tw=w]~RBVZRi};RPxuwH",
         "quality_score": 0.9,
-        "is_primary": True,
     }
     if created_at is not None:
         file_kwargs["created_at"] = created_at
     if updated_at is not None:
         file_kwargs["updated_at"] = updated_at
-    file = MemeFile(**file_kwargs)
-    session.add(file)
+    file = MemeFile(meme_id=meme_id, **file_kwargs)
+    session.add(meme)
     await session.flush()
-    meme.primary_file_id = file.id
+    session.add(file)
     if seo_slug is not None:
         session.add(
             MemeSeoPage(
-                meme_id=meme.id,
+                meme_id=meme_id,
                 slug=seo_slug,
                 page_title=seo_title or f"SEO title {seo_slug}",
                 meta_description=seo_description or f"SEO description {seo_slug}",

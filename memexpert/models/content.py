@@ -7,9 +7,20 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import CheckConstraint, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text
+from sqlalchemy import (
+    CheckConstraint,
+    Float,
+    ForeignKey,
+    ForeignKeyConstraint,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    and_,
+)
 from sqlalchemy.dialects.postgresql import ARRAY, BYTEA, JSONB
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, foreign, mapped_column, relationship
 
 from memexpert.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin, utcnow
 from memexpert.models.enums import (
@@ -40,6 +51,14 @@ class Meme(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     __tablename__ = "memes"
     __table_args__ = (
+        ForeignKeyConstraint(
+            ["id", "primary_file_id"],
+            ["meme_files.meme_id", "meme_files.id"],
+            name="fk_memes_primary_file_id_meme_files",
+            use_alter=True,
+            deferrable=True,
+            initially="DEFERRED",
+        ),
         Index("ix_memes_media_type_language", "media_type", "language"),
         Index("ix_memes_visibility_popularity_created_at", "is_public", "popularity_score", "created_at"),
         Index("ix_memes_author_user_id_created_at", "author_user_id", "created_at"),
@@ -49,10 +68,7 @@ class Meme(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         string_enum(ContentKind),
         nullable=False,
     )
-    primary_file_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("meme_files.id", ondelete="SET NULL", use_alter=True),
-        nullable=True,
-    )
+    primary_file_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
     ocr_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     language: Mapped[ContentLanguage] = mapped_column(
         string_enum(ContentLanguage),
@@ -75,15 +91,19 @@ class Meme(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     primary_file: Mapped["MemeFile | None"] = relationship(
         "MemeFile",
+        primaryjoin=lambda: and_(
+            Meme.id == MemeFile.meme_id,
+            foreign(Meme.primary_file_id) == MemeFile.id,
+        ),
         back_populates="primary_for_meme",
-        foreign_keys=[primary_file_id],
-        post_update=True,
+        foreign_keys=lambda: [Meme.primary_file_id],
         uselist=False,
     )
     files: Mapped[list["MemeFile"]] = relationship(
         "MemeFile",
+        primaryjoin=lambda: Meme.id == foreign(MemeFile.meme_id),
         back_populates="meme",
-        foreign_keys="MemeFile.meme_id",
+        foreign_keys=lambda: [MemeFile.meme_id],
         cascade="all, delete-orphan",
     )
     seo_page: Mapped["MemeSeoPage | None"] = relationship(
@@ -236,14 +256,9 @@ class MemeFile(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     __tablename__ = "meme_files"
     __table_args__ = (
+        UniqueConstraint("meme_id", "id", name="uq_meme_files_meme_id_id"),
         Index("ix_meme_files_meme_id_status", "meme_id", "status"),
         Index("ix_meme_files_perceptual_hash", "perceptual_hash"),
-        Index(
-            "uq_meme_files_single_primary_per_meme",
-            "meme_id",
-            unique=True,
-            postgresql_where=text("is_primary"),
-        ),
     )
 
     meme_id: Mapped[uuid.UUID] = mapped_column(
@@ -268,16 +283,20 @@ class MemeFile(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     quality_score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     blur_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    is_primary: Mapped[bool] = mapped_column(default=False, nullable=False)
 
     meme: Mapped["Meme"] = relationship(
         "Meme",
+        primaryjoin=lambda: foreign(MemeFile.meme_id) == Meme.id,
         back_populates="files",
-        foreign_keys=[meme_id],
+        foreign_keys=lambda: [MemeFile.meme_id],
     )
     primary_for_meme: Mapped["Meme | None"] = relationship(
         "Meme",
-        foreign_keys="Meme.primary_file_id",
+        primaryjoin=lambda: and_(
+            MemeFile.meme_id == Meme.id,
+            MemeFile.id == foreign(Meme.primary_file_id),
+        ),
+        foreign_keys=lambda: [Meme.primary_file_id],
         uselist=False,
         viewonly=True,
     )

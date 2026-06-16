@@ -586,15 +586,17 @@ def _seed_meme_and_file(
 ) -> MemeFile:
     """Create a minimal Meme + MemeFile pair ready for source + stage inserts."""
 
-    meme = Meme(media_type=ContentKind.IMAGE, language=ContentLanguage.NONE)
-    session.add(meme)
+    meme_id = uuid.uuid7()
+    file_id = uuid.uuid7()
+    meme = Meme(id=meme_id, media_type=ContentKind.IMAGE, primary_file_id=file_id, language=ContentLanguage.NONE)
     file_row = MemeFile(
-        meme=meme,
+        id=file_id,
+        meme_id=meme_id,
         status=ContentProcessingStatus.READY,
         s3_original_key=f"pipeline/originals/{source_id}.png",
         quality_score=0.5,
-        is_primary=True,
     )
+    session.add(meme)
     session.add(file_row)
     return file_row
 

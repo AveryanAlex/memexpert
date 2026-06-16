@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, cast
 
@@ -14,6 +15,7 @@ from alembic.config import Config
 from alembic.script import ScriptDirectory
 from alembic.util.exc import CommandError
 from sqlalchemy import inspect as sa_inspect, text
+from sqlalchemy.exc import IntegrityError
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable
@@ -78,6 +80,7 @@ class ForeignKeyInfo(TypedDict):
     name: str | None
     constrained_columns: list[str]
     referred_table: str
+    referred_columns: list[str]
 
 
 class ConstraintSnapshot(TypedDict):
@@ -188,6 +191,43 @@ async def _get_column_names(engine: AsyncEngine, table_name: str) -> set[str]:
         return {cast(str, column_name) for column_name in result.scalars()}
 
 
+async def _get_nullable_columns(engine: AsyncEngine, table_name: str) -> set[str]:
+    async with engine.connect() as connection:
+        result = await connection.execute(
+            text(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = :table_name
+                  AND is_nullable = 'YES'
+                ORDER BY ordinal_position
+                """
+            ),
+            {"table_name": table_name},
+        )
+        return {cast(str, column_name) for column_name in result.scalars()}
+
+
+async def _get_constraint_definitions(engine: AsyncEngine, table_name: str) -> dict[str, str]:
+    async with engine.connect() as connection:
+        result = await connection.execute(
+            text(
+                """
+                SELECT c.conname, pg_get_constraintdef(c.oid)
+                FROM pg_constraint c
+                JOIN pg_class t ON t.oid = c.conrelid
+                JOIN pg_namespace n ON n.oid = t.relnamespace
+                WHERE n.nspname = current_schema()
+                  AND t.relname = :table_name
+                ORDER BY c.conname
+                """
+            ),
+            {"table_name": table_name},
+        )
+        return {cast(str, name): cast(str, definition) for name, definition in result.all()}
+
+
 async def _get_varchar_length(engine: AsyncEngine, table_name: str, column_name: str) -> int | None:
     async with engine.connect() as connection:
         result = await connection.execute(
@@ -293,9 +333,9 @@ def test_initial_revision_metadata_is_present() -> None:
     revision = script_directory.get_revision("head")
 
     assert revision is not None
-    assert revision.revision == "0015"
-    assert revision.down_revision == "0014"
-    assert revision.doc == "derive account type from login identities"
+    assert revision.revision == "0016"
+    assert revision.down_revision == "0015"
+    assert revision.doc == "canonical primary file pointer"
 
 
 async def test_upgrade_head_creates_expected_schema_and_constraints(
@@ -308,7 +348,7 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
 
     table_names = await _get_table_names(engine)
     assert table_names == EXPECTED_TABLES | {"alembic_version"}
-    assert await _get_current_revision(engine) == "0015"
+    assert await _get_current_revision(engine) == "0016"
     assert await _get_materialized_view_names(engine) == EXPECTED_MATERIALIZED_VIEWS
 
     users_indexes = await _get_index_definitions(engine, "users")
@@ -325,6 +365,9 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
     public_tag_trends_indexes = await _get_index_definitions(engine, "public_tag_trends_mv")
     public_template_trends_indexes = await _get_index_definitions(engine, "public_template_trends_mv")
     meme_file_ocr_result_columns = await _get_column_names(engine, "meme_file_ocr_results")
+    memes_nullable_columns = await _get_nullable_columns(engine, "memes")
+    memes_constraint_definitions = await _get_constraint_definitions(engine, "memes")
+    meme_files_columns = await _get_column_names(engine, "meme_files")
     meme_merge_log_columns = await _get_column_names(engine, "meme_merge_logs")
     admin_meme_audit_columns = await _get_column_names(engine, "admin_meme_destructive_audit_logs")
     admin_meme_audit_indexes = await _get_index_definitions(engine, "admin_meme_destructive_audit_logs")
@@ -359,13 +402,38 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
         for foreign_key in constraints["users_fks"]
     )
 
-    assert "uq_meme_files_single_primary_per_meme" in meme_files_indexes
-    assert "is_primary" in meme_files_indexes["uq_meme_files_single_primary_per_meme"]
-    assert "blocked_perceptual_hash_id" in await _get_column_names(engine, "meme_files")
+    assert meme_files_columns == {
+        "blocked_perceptual_hash_id",
+        "blur_hash",
+        "created_at",
+        "file_size_bytes",
+        "height",
+        "id",
+        "meme_id",
+        "mime_type",
+        "perceptual_hash",
+        "quality_score",
+        "s3_original_key",
+        "s3_web_video_key",
+        "status",
+        "updated_at",
+        "width",
+    }
+    assert "uq_meme_files_single_primary_per_meme" not in meme_files_indexes
+    assert "uq_meme_files_meme_id_id" in meme_files_indexes
+    assert "meme_id" in meme_files_indexes["uq_meme_files_meme_id_id"]
+    assert "id" in meme_files_indexes["uq_meme_files_meme_id_id"]
+    assert "primary_file_id" not in memes_nullable_columns
+    primary_file_fk = memes_constraint_definitions["fk_memes_primary_file_id_meme_files"]
+    assert "FOREIGN KEY (id, primary_file_id)" in primary_file_fk
+    assert "REFERENCES meme_files(meme_id, id)" in primary_file_fk
+    assert "DEFERRABLE INITIALLY DEFERRED" in primary_file_fk
+    assert "blocked_perceptual_hash_id" in meme_files_columns
     assert any(
         foreign_key["name"] == "fk_memes_primary_file_id_meme_files"
-        and foreign_key["constrained_columns"] == ["primary_file_id"]
+        and foreign_key["constrained_columns"] == ["id", "primary_file_id"]
         and foreign_key["referred_table"] == "meme_files"
+        and foreign_key["referred_columns"] == ["meme_id", "id"]
         for foreign_key in constraints["memes_fks"]
     )
     assert constraints["meme_sources_uniques"] == {
@@ -547,6 +615,78 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
     assert "ix_public_template_trends_mv_trending" in public_template_trends_indexes
 
 
+async def test_primary_file_invariant_is_enforced_by_database(
+    migrated_database: tuple[AsyncEngine, str],
+) -> None:
+    engine, database_url = migrated_database
+    config = _build_alembic_config(database_url)
+
+    await _run_alembic_command(command.upgrade, config, "head")
+
+    with pytest.raises(IntegrityError):
+        async with engine.begin() as connection:
+            _ = await connection.execute(
+                text(
+                    """
+                    INSERT INTO memes (
+                        id, media_type, language, is_nsfw, popularity_score,
+                        like_count, tags, is_public
+                    ) VALUES (
+                        :meme_id, 'image', 'none', false, 0.0,
+                        0, ARRAY[]::varchar(64)[], true
+                    )
+                    """,
+                ),
+                {"meme_id": uuid.uuid7()},
+            )
+
+    source_meme_id = uuid.uuid7()
+    source_file_id = uuid.uuid7()
+    invalid_meme_id = uuid.uuid7()
+    invalid_file_id = uuid.uuid7()
+    with pytest.raises(IntegrityError):
+        async with engine.begin() as connection:
+            _ = await connection.execute(
+                text(
+                    """
+                    INSERT INTO memes (
+                        id, media_type, primary_file_id, language, is_nsfw,
+                        popularity_score, like_count, tags, is_public
+                    ) VALUES
+                        (
+                            :source_meme_id, 'image', :source_file_id, 'none', false,
+                            0.0, 0, ARRAY[]::varchar(64)[], true
+                        ),
+                        (
+                            :invalid_meme_id, 'image', :source_file_id, 'none', false,
+                            0.0, 0, ARRAY[]::varchar(64)[], true
+                        )
+                    """,
+                ),
+                {
+                    "source_meme_id": source_meme_id,
+                    "source_file_id": source_file_id,
+                    "invalid_meme_id": invalid_meme_id,
+                },
+            )
+            _ = await connection.execute(
+                text(
+                    """
+                    INSERT INTO meme_files (id, meme_id, status, s3_original_key, quality_score)
+                    VALUES
+                        (:source_file_id, :source_meme_id, 'ready', 'invariant/source.jpg', 1.0),
+                        (:invalid_file_id, :invalid_meme_id, 'ready', 'invariant/invalid.jpg', 1.0)
+                    """,
+                ),
+                {
+                    "source_file_id": source_file_id,
+                    "source_meme_id": source_meme_id,
+                    "invalid_file_id": invalid_file_id,
+                    "invalid_meme_id": invalid_meme_id,
+                },
+            )
+
+
 async def test_sync_target_snapshots_schema_is_created_with_expected_shape(
     migrated_database: tuple[AsyncEngine, str],
 ) -> None:
@@ -613,7 +753,7 @@ async def test_crawler_sources_migration_applies_and_reverses(
     config = _build_alembic_config(database_url)
 
     await _run_alembic_command(command.upgrade, config, "head")
-    assert await _get_current_revision(engine) == "0015"
+    assert await _get_current_revision(engine) == "0016"
 
     meme_sources_columns = await _get_column_names(engine, "meme_sources")
     source_channels_columns = await _get_column_names(engine, "source_channels")
@@ -709,7 +849,7 @@ async def test_repeated_fresh_database_upgrades_work_after_a_full_downgrade(
     await _run_alembic_command(command.downgrade, config, "base")
     await _run_alembic_command(command.upgrade, config, "head")
 
-    assert await _get_current_revision(engine) == "0015"
+    assert await _get_current_revision(engine) == "0016"
     assert EXPECTED_TABLES.issubset(await _get_table_names(engine))
 
 

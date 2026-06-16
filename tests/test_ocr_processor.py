@@ -56,7 +56,7 @@ class StaticPreviewMediaProcessor:
 
 
 @pytest.mark.asyncio
-async def test_paddle_command_is_primary_when_in_process_paddleocr_is_unavailable(
+async def test_paddle_command_is_preferred_when_in_process_paddleocr_is_unavailable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
