@@ -166,6 +166,13 @@ Duplicate production execution is guarded by the PostgreSQL advisory lock. Keep 
 
 ## Container Images
 
+The Docker Images workflow publishes production-ready images to GHCR after local image smoke checks on push, tag, and manual runs:
+
+- `ghcr.io/averyanalex/memexpert/app`
+- `ghcr.io/averyanalex/memexpert/frontend`
+
+Published tags include branch names such as `main`, Git tags, semver tags such as `1.2.3` and `1.2` when applicable, and immutable `sha-<short-sha>` tags. Prefer a release tag or immutable SHA tag for production pinning.
+
 Build the Python app image for API, workers, and bot:
 
 ```sh
@@ -226,16 +233,21 @@ Create a real env file from the placeholder template:
 cp .env.prod.example .env.prod
 ```
 
-Edit `.env.prod` and replace every `change-me` placeholder. Then validate the stack:
+Edit `.env.prod` and replace every `change-me` placeholder.
+
+The example env defaults `MEMEXPERT_APP_IMAGE` and `MEMEXPERT_FRONTEND_IMAGE` to the GHCR `:main` images. For production, pin them to a release tag or immutable `sha-<short-sha>` tag from the Docker Images workflow.
+
+Validate the stack:
 
 ```sh
 docker compose --env-file .env.prod -f docker-compose.prod.example.yml config
 ```
 
-Build and start the production-oriented stack:
+Pull the configured GHCR images and start the production-oriented stack:
 
 ```sh
-docker compose --env-file .env.prod -f docker-compose.prod.example.yml up -d --build
+docker compose --env-file .env.prod -f docker-compose.prod.example.yml pull
+docker compose --env-file .env.prod -f docker-compose.prod.example.yml up -d
 ```
 
 The production example starts exactly one `scheduler` service from the shared app image. If a second scheduler container is started accidentally, the PostgreSQL advisory lock remains the duplicate-run guard.
@@ -279,7 +291,7 @@ The default CI E2E path uses the operator upload pipeline plus fake providers. I
 
 `.github/workflows/ci.yml` runs backend lint/type/test checks, frontend checks/tests/builds, frontend mock smoke tests, and deterministic PRD E2E. On E2E failure, CI uploads `.artifacts/e2e/**`.
 
-`.github/workflows/docker-images.yml` validates the production compose example, builds the Python and frontend images with BuildKit/GitHub Actions cache, loads local CI tags, and performs lightweight API/frontend HTTP smoke checks without publishing images or requiring secrets.
+`.github/workflows/docker-images.yml` validates the production compose example, builds the Python and frontend images with BuildKit/GitHub Actions cache, loads local CI tags, and performs lightweight API/frontend HTTP smoke checks for PR and publish-capable events. After smoke checks pass, non-PR runs log in to GHCR and publish `ghcr.io/averyanalex/memexpert/app` and `ghcr.io/averyanalex/memexpert/frontend` with metadata labels plus branch, tag, semver, and `sha-<short-sha>` tags.
 
 ## Troubleshooting
 

@@ -1,8 +1,5 @@
 x-app-image: &app-image
-  image: ${MEMEXPERT_APP_IMAGE:-memexpert-app:prod}
-  build:
-    context: .
-    dockerfile: Dockerfile
+  image: ${MEMEXPERT_APP_IMAGE:-ghcr.io/averyanalex/memexpert/app:main}
 
 x-app-env: &app-env
   APP_HOST: 0.0.0.0
@@ -257,10 +254,7 @@ services:
       disable: true
 
   frontend:
-    image: ${MEMEXPERT_FRONTEND_IMAGE:-memexpert-frontend:prod}
-    build:
-      context: .
-      dockerfile: frontend/Dockerfile
+    image: ${MEMEXPERT_FRONTEND_IMAGE:-ghcr.io/averyanalex/memexpert/frontend:main}
     restart: unless-stopped
     environment:
       HOST: 0.0.0.0
