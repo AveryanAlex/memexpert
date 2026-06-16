@@ -132,6 +132,14 @@ def test_settings_normalize_blank_ocr_command_settings_to_none() -> None:
     assert settings.pipeline_ocr_fallback_command is None
 
 
+def test_settings_seo_image_byte_cap_defaults_and_requires_positive_value() -> None:
+    settings = Settings()
+
+    assert settings.pipeline_seo_image_max_bytes == 5 * 1024 * 1024
+    with pytest.raises(ValidationError):
+        _ = Settings.model_validate({"pipeline_seo_image_max_bytes": 0})
+
+
 def test_settings_parse_scheduler_contracts() -> None:
     settings = Settings.model_validate(
         {

@@ -41,7 +41,7 @@ Important runtime variables:
 - `PIPELINE_OCR_PADDLE_COMMAND`: optional primary PaddleOCR command. The worker image defaults it to `/opt/paddleocr-venv/bin/python /app/scripts/paddleocr_json.py --input {input}`.
 - `PIPELINE_OCR_FALLBACK_ENGINE`, `PIPELINE_OCR_FALLBACK_COMMAND`: optional command fallback metadata and command. Blank by default; there is no Qwen/VLM fallback in this code path.
 - `PIPELINE_SEO_PROVIDER_MODE`: `static` by default for safe local runs; switch to `live` to enable the PydanticAI/OpenAI-compatible SEO provider.
-- `PIPELINE_SEO_MODEL`, `PIPELINE_SEO_API_BASE_URL`, `PIPELINE_SEO_API_KEY`, `PIPELINE_SEO_TIMEOUT_SECONDS`, `PIPELINE_SEO_MAX_ATTEMPTS`, `PIPELINE_SEO_PROMPT_VERSION`: SEO structured-output provider settings.
+- `PIPELINE_SEO_MODEL`, `PIPELINE_SEO_API_BASE_URL`, `PIPELINE_SEO_API_KEY`, `PIPELINE_SEO_TIMEOUT_SECONDS`, `PIPELINE_SEO_MAX_ATTEMPTS`, `PIPELINE_SEO_IMAGE_MAX_BYTES`, `PIPELINE_SEO_PROMPT_VERSION`: SEO structured-output provider settings.
 - `AUTH_JWT_SECRET`: signing secret for auth cookies and tokens.
 - `SECURITY_CORS_ALLOWED_ORIGINS`: comma-separated browser origins allowed to call the API.
 - `API_BASE_URL`: private backend URL used by the SvelteKit Node server.
@@ -112,11 +112,13 @@ The backend SEO POC keeps local development secret-free by default:
 - `PIPELINE_SEO_PROVIDER_MODE=live` enables the OpenAI-compatible PydanticAI provider and requires `PIPELINE_SEO_API_KEY`.
 - `PIPELINE_SEO_API_BASE_URL` is optional; leave it blank to use the provider default, or set it for an OpenAI-compatible gateway.
 - `PIPELINE_SEO_MAX_ATTEMPTS` bounds transient provider retries at the service layer.
+- `PIPELINE_SEO_IMAGE_MAX_BYTES` caps optional live-provider image bytes at 5 MiB by default; oversized, missing, unsupported, or unreadable primary images are skipped and generation continues text-only.
 
 Prompt provenance notes:
 
 - The baseline prompt in `memexpert/services/meme_seo.py` is derived from the v0 Rust branch prompt at `v0:prompts/meta.md` and its structured schema in `v0:src/ai.rs`.
-- The current Python backend does not pass image bytes into SEO generation yet. Live generation only sees OCR text, existing tags, language, and current template metadata, so output quality is intentionally bounded until image-aware inputs are added in a later phase.
+- Live generation attaches eligible primary image bytes via PydanticAI `BinaryContent` when object storage can resolve them safely. It does not send S3 object keys, storage endpoints, signed URLs, or storage credentials to the model provider.
+- When image bytes are absent or skipped, live generation only sees OCR text, existing tags, language, safe media metadata, and current template metadata, so output quality remains bounded by those inputs.
 - Current DB provenance remains limited to `model_id`, `prompt_version`, `generated_at`, and `edited_at`; this POC does not add a richer provenance migration.
 
 Run the frontend locally:
