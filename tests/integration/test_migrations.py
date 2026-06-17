@@ -333,9 +333,9 @@ def test_initial_revision_metadata_is_present() -> None:
     revision = script_directory.get_revision("head")
 
     assert revision is not None
-    assert revision.revision == "0016"
-    assert revision.down_revision == "0015"
-    assert revision.doc == "canonical primary file pointer"
+    assert revision.revision == "0017"
+    assert revision.down_revision == "0016"
+    assert revision.doc == "ingest dedup metadata"
 
 
 async def test_upgrade_head_creates_expected_schema_and_constraints(
@@ -348,7 +348,7 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
 
     table_names = await _get_table_names(engine)
     assert table_names == EXPECTED_TABLES | {"alembic_version"}
-    assert await _get_current_revision(engine) == "0016"
+    assert await _get_current_revision(engine) == "0017"
     assert await _get_materialized_view_names(engine) == EXPECTED_MATERIALIZED_VIEWS
 
     users_indexes = await _get_index_definitions(engine, "users")
@@ -409,16 +409,25 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
         "file_size_bytes",
         "height",
         "id",
+        "ingest_origin",
+        "matched_meme_file_id",
         "meme_id",
         "mime_type",
         "perceptual_hash",
         "quality_score",
         "s3_original_key",
         "s3_web_video_key",
+        "sha256_hex",
         "status",
         "updated_at",
         "width",
     }
+    assert "uq_meme_files_sha256_hex" in meme_files_indexes
+    assert "sha256_hex" in meme_files_indexes["uq_meme_files_sha256_hex"]
+    assert "ix_meme_files_ingest_origin" in meme_files_indexes
+    assert "ingest_origin" in meme_files_indexes["ix_meme_files_ingest_origin"]
+    assert "ix_meme_files_matched_meme_file_id" in meme_files_indexes
+    assert "matched_meme_file_id" in meme_files_indexes["ix_meme_files_matched_meme_file_id"]
     assert "uq_meme_files_single_primary_per_meme" not in meme_files_indexes
     assert "uq_meme_files_meme_id_id" in meme_files_indexes
     assert "meme_id" in meme_files_indexes["uq_meme_files_meme_id_id"]
@@ -753,7 +762,7 @@ async def test_crawler_sources_migration_applies_and_reverses(
     config = _build_alembic_config(database_url)
 
     await _run_alembic_command(command.upgrade, config, "head")
-    assert await _get_current_revision(engine) == "0016"
+    assert await _get_current_revision(engine) == "0017"
 
     meme_sources_columns = await _get_column_names(engine, "meme_sources")
     source_channels_columns = await _get_column_names(engine, "source_channels")
@@ -770,6 +779,8 @@ async def test_crawler_sources_migration_applies_and_reverses(
         "published_at",
         "forwarded_from_source_id",
         "forwarded_from_post_id",
+        "attach_reason",
+        "matched_meme_file_id",
     }.issubset(meme_sources_columns)
     assert {
         "catchup_message_limit",
@@ -849,7 +860,7 @@ async def test_repeated_fresh_database_upgrades_work_after_a_full_downgrade(
     await _run_alembic_command(command.downgrade, config, "base")
     await _run_alembic_command(command.upgrade, config, "head")
 
-    assert await _get_current_revision(engine) == "0016"
+    assert await _get_current_revision(engine) == "0017"
     assert EXPECTED_TABLES.issubset(await _get_table_names(engine))
 
 

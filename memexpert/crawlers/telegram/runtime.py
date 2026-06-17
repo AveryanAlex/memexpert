@@ -240,6 +240,8 @@ class TelegramCrawlerRuntime:
                 # not an error the caller needs to see. Log at debug
                 # level so operators can still find it in the worker logs.
                 logger.debug("Live listener task for %s did not stop in time.", session_name)
+            finally:
+                await self.session.rollback()
 
         # Always update the session row whether or not a task was running
         # so the operator surface sees a consistent "stopped" state.
@@ -369,6 +371,11 @@ class TelegramCrawlerRuntime:
         re-attempting will keep failing the same way.
         """
 
+        predownload_result = await self._try_ingest_without_media(raw_message)
+        if predownload_result is not None:
+            self._tally_ingest_outcome(counters, predownload_result)
+            return
+
         try:
             media_bytes = await self.telegram_client.download_media(raw_message)
         except PipelineTelegramProviderUnavailableError as exc:
@@ -398,6 +405,19 @@ class TelegramCrawlerRuntime:
         ingest_result = await self.pipeline_service.create_crawler_ingest(raw_post)
         self._tally_ingest_outcome(counters, ingest_result)
 
+    async def _try_ingest_without_media(
+        self,
+        raw_message: RawTelegramMessage,
+    ) -> CrawlerIngestResult | None:
+        """Return a terminal ingest result that can be decided before media download."""
+
+        return await self.pipeline_service.try_crawler_ingest_without_media(
+            platform=SourcePlatform.TELEGRAM,
+            source_id=raw_message.channel_id,
+            post_id=raw_message.message_id,
+            published_at=raw_message.published_at,
+        )
+
     @staticmethod
     def _tally_ingest_outcome(
         counters: _CatchupCounters,
@@ -406,11 +426,15 @@ class TelegramCrawlerRuntime:
         """Update counters based on the service-side ingest outcome."""
 
         outcome = ingest_result.outcome
-        if outcome is CrawlerIngestOutcome.INGESTED:
+        if outcome in {
+            CrawlerIngestOutcome.INGESTED,
+            CrawlerIngestOutcome.PHASH_EXACT_NEW_FILE,
+            CrawlerIngestOutcome.BLOCKED_PERCEPTUAL_HASH,
+        }:
             counters.ingested += 1
         elif outcome in {
-            CrawlerIngestOutcome.DEDUPLICATED_EXACT,
-            CrawlerIngestOutcome.DEDUPLICATED_SIMILAR,
+            CrawlerIngestOutcome.SHA256_EXACT_EXISTING_FILE,
+            CrawlerIngestOutcome.BLOCKED_SHA256_EXISTING_FILE,
             CrawlerIngestOutcome.SKIPPED_DUPLICATE_POST_ID,
         }:
             counters.skipped_dedup += 1
@@ -437,6 +461,11 @@ class TelegramCrawlerRuntime:
             ):
                 if raw_message.media_type == "unsupported":
                     continue
+                predownload_result = await self._try_ingest_without_media(raw_message)
+                if predownload_result is not None:
+                    await self._record_live_heartbeat(session_name)
+                    continue
+
                 try:
                     media_bytes = await self.telegram_client.download_media(raw_message)
                 except PipelineTelegramProviderUnavailableError as exc:
@@ -468,9 +497,7 @@ class TelegramCrawlerRuntime:
                     continue
 
                 await self.pipeline_service.create_crawler_ingest(raw_post)
-                session_state = await self._load_session_state(session_name)
-                session_state.last_heartbeat_at = utcnow()
-                await self._commit_session_state_flush()
+                await self._record_live_heartbeat(session_name)
         except asyncio.CancelledError:
             raise
         except PipelineTelegramFloodWaitError as exc:
@@ -501,6 +528,11 @@ class TelegramCrawlerRuntime:
                 f"Session {session_name!r} is {state.status.value}, not active.",
             )
         return state
+
+    async def _record_live_heartbeat(self, session_name: str) -> None:
+        session_state = await self._load_session_state(session_name)
+        session_state.last_heartbeat_at = utcnow()
+        await self._commit_session_state_flush()
 
     async def _get_tracked_channel(self, channel_id: str) -> SourceChannel:
         """Return the ``SourceChannel`` row for a tracked Telegram channel or raise."""

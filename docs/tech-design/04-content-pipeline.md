@@ -9,29 +9,31 @@ Plugin interface per platform. All crawlers normalize output to a common `RawMem
 
 **Risk:** Telethon userbot accounts are subject to bans. Mitigation: multiple sessions, conservative rates, monitoring. Consider Bot API channel forwarding as a fallback read path.
 
-## Deduplication
+## Content Identity And Deduplication
 
-Two-phase dedup — fast pHash at ingestion, precise embedding-based merge after the embed stage.
+The content model has three separate owners of truth:
 
-### Phase 1: pHash at Ingestion (synchronous)
+- `Meme` is the conceptual meme. It owns public/private moderation state, popularity, collections, SEO page linkage, and the canonical `primary_file_id` pointer.
+- `MemeFile` is one physical media file. `sha256_hex` is the only exact same-bytes identity and is unique. File rows own physical metadata, S3 keys, pHash, ingest origin, and optional match lineage.
+- `MemeSource` is one provenance observation. Source rows preserve where a file or duplicate was observed and carry the attach reason plus any matched file id.
 
-Runs during ingestion before the file enters the processing pipeline. Uses perceptual hash only — no embedding needed.
+### Ingest-Time Identity
+
+SHA256 is computed immediately after bytes are available, before media inspection, blocked pHash checks, S3 writes, or pHash duplicate lookup.
 
 | Condition | Result |
 |-----------|--------|
-| pHash hamming distance ≤ 3 | Exact match. Add MemeSource to existing MemeFile. File does not enter pipeline. |
-| pHash hamming 4–8 | Similar match. Create new MemeFile, link to existing Meme. Update primary if better quality. File enters pipeline. |
-| No pHash match | New meme. Create Meme + MemeFile. File enters pipeline. |
+| SHA256 matches an existing non-blocked file | Do not inspect media, write S3, create a `MemeFile`, or dispatch the pipeline. Attach a `MemeSource` to the existing file with `attach_reason=sha256_exact_existing_file`. |
+| SHA256 matches an existing blocked/quarantined file | Do not inspect media, write S3, create a `MemeFile`, or dispatch the pipeline. Attach a `MemeSource` to the existing blocked file with `attach_reason=blocked_sha256_existing_file`. |
+| SHA miss and active blocked pHash matches | Create a new blocked `MemeFile` with `ingest_origin=blocked_perceptual_hash`, `blocked_perceptual_hash_id`, and failed ingest journal state. Preserve source attribution with `attach_reason=blocked_perceptual_hash_new_file`. Do not store the original or dispatch normal pipeline work. |
+| SHA miss and exact pHash matches an existing non-blocked file | Treat this as the same conceptual meme but a new physical file. Create a new `MemeFile` under the matched file's `Meme`, set `ingest_origin=phash_exact_existing_meme` and `matched_meme_file_id`, store the original, attach source with `attach_reason=phash_exact_new_file`, and dispatch the normal pipeline. Do not change `Meme.primary_file_id` in this branch. |
+| SHA miss and no pHash match | Create a new `Meme` plus primary `MemeFile` with `ingest_origin=new_meme`, attach source with `attach_reason=new_file`, store the original, and dispatch the normal pipeline. |
 
-### Phase 2: Embedding-Based Merge (post-embed)
+Crawler duplicate-post idempotency is separate from media identity: an already-seen `(platform, source_id, post_id)` returns the existing source row before service-owned media processing. Telegram `file_unique_id` is not a content identity and there is no separate unique media identity table.
 
-After the embed stage computes the file's embedding, a `meme_embedded` consumer queries Qdrant for cosine similarity > 0.92 against existing memes. If a match is found for a meme that was created as "new" in Phase 1 (pHash missed it), the memes are **auto-merged**: files, sources, collection memberships, and popularity data are consolidated into the older meme. The duplicate meme entity is deleted.
+### Post-Embed Semantic Merge
 
-This catches near-duplicates that pHash misses (significant crops, overlays, quality differences).
-
-### User Upload Dedup
-
-Incoming upload is checked against the public database (pHash first, then embedding after processing). If a match is found, the existing public meme is added to the user's collection instead of creating a duplicate. Private memes from other users are not cross-linked — a new private meme is created.
+After the embed stage computes a file embedding, semantic merge may query Qdrant for high cosine similarity and merge two `Meme` concepts. This is not exact-byte identity and not the exact-pHash same-meme ingest path. When semantic merge fires, files, sources, collection memberships, and popularity data are consolidated into the target meme and the duplicate meme entity is deleted according to the merge service's invariants.
 
 ### Admin Merge
 
@@ -44,7 +46,7 @@ Event-driven pipeline using **FastStream + RabbitMQ**. Each processing stage is 
 ### Event Topology
 
 ```
-raw_meme ──→ [Ingest & pHash Dedup] ──→ meme_created
+raw_meme ──→ [Ingest & Identity Checks] ──→ meme_created
                                              │
                                              ▼
                                        [Transcode] ──→ meme_transcoded
@@ -76,7 +78,7 @@ raw_meme ──→ [Ingest & pHash Dedup] ──→ meme_created
 | `q.transcode` | CPU-bound (FFmpeg) | GIF→MP4, video transcode, blur hash, EXIF strip |
 | `q.ocr` | CPU/GPU-bound (PaddleOCR) | Text extraction, language detection |
 | `q.embed` | API-bound (Voyage AI) | Image embedding computation |
-| `q.classify` | CPU-light | NSFW detection, language classification from OCR text |
+| `q.classify` | CPU-light | Conservative NSFW detection only |
 | `q.sync.qdrant` | I/O-bound (Qdrant) | Vector + payload sync |
 | `q.sync.meili` | I/O-bound (Meilisearch) | Document sync |
 | `q.seo` | API-bound (PydanticAI provider) | SEO page generation, tag/template assignment (prioritized by popularity) |
@@ -142,7 +144,9 @@ Only the original and transcoded video are stored. All image variants (resize, f
 
 ## Primary File Selection
 
-When multiple files belong to one meme, the primary file is selected by `quality_score` — a heuristic based on resolution and file size. Higher resolution wins. When primary changes, OCR text is re-evaluated from the new primary.
+`Meme.primary_file_id` is the single canonical primary truth. OCR text and language on `Meme` are derived from the current primary file's OCR result when classify completes or when merge/primary-selection code explicitly changes the primary. A duplicate or pHash-exact file finishing later must not overwrite canonical OCR/language unless it is the current primary.
+
+Classification owns only NSFW. NSFW updates are conservative: `Meme.is_nsfw` can move from false to true, but classify must not overwrite an existing true value with false. SEO text, tags, and template assignment are outside classify and ingest.
 
 ## SEO Generation
 

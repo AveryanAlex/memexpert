@@ -24,6 +24,8 @@ from memexpert.models.enums import (
     ContentPipelineStage,
     ContentPipelineStageStatus,
     ContentSourceKind,
+    IngestFileOrigin,
+    SourceAttachReason,
     SyncTargetKind,
     SyncTargetStatus,
     TelegramSessionStatus,
@@ -147,6 +149,12 @@ class ContentPipelineItemRead(BaseModel):
 
     meme_id: uuid.UUID
     meme_file_id: uuid.UUID
+    sha256_hex: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    ingest_origin: IngestFileOrigin | None = None
+    matched_meme_file_id: uuid.UUID | None = None
+    latest_source_id: uuid.UUID | None = None
+    latest_source_attach_reason: SourceAttachReason | None = None
+    latest_source_matched_meme_file_id: uuid.UUID | None = None
     current_stage: ContentPipelineStage
     current_status: ContentPipelineStageStatus
     original_object_key: str = Field(min_length=1, max_length=MAX_OBJECT_KEY_LENGTH)

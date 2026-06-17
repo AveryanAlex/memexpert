@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 
 from memexpert.core.config import Settings, get_settings
 from memexpert.core.storage import build_s3_client, get_pipeline_storage_settings
-from memexpert.models.enums import ContentPipelineStage, ContentPipelineStageStatus
+from memexpert.models.enums import ContentPipelineStage, ContentPipelineStageStatus, SourceAttachReason
 from memexpert.schemas.content_pipeline import (
     ContentPipelineErrorResponse,
     ContentPipelineItemFilter,
@@ -62,6 +62,12 @@ NATIVE_PROCESS_PATTERNS: Final[tuple[str, ...]] = (
     "memexpert-workers",
     "memexpert.workers.main",
 )
+EXISTING_FILE_SOURCE_ATTACH_REASONS: Final[frozenset[SourceAttachReason]] = frozenset(
+    {
+        SourceAttachReason.SHA256_EXACT_EXISTING_FILE,
+        SourceAttachReason.BLOCKED_SHA256_EXISTING_FILE,
+    },
+)
 
 
 class SmokeError(RuntimeError):
@@ -97,7 +103,7 @@ class RabbitManagementConfig:
 
 @dataclass(frozen=True, slots=True)
 class UploadAttempt:
-    """One upload attempt made while searching for a fresh non-duplicate file."""
+    """One upload attempt selected for the smoke flow."""
 
     dataset_file: DatasetFile
     item: ContentPipelineUploadRead
@@ -346,7 +352,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    """Run the complete upload → fail → inspect → duplicate → replay proof."""
+    """Run the complete upload → fail → inspect → SHA duplicate attach → replay proof."""
 
     args = parse_args()
     run_id = uuid.uuid7().hex[:12]
@@ -393,7 +399,7 @@ def main() -> None:
         timeout_seconds=args.api_timeout,
     )
 
-    skipped_duplicate_candidates: list[str] = []
+    skipped_upload_candidates: list[str] = []
     primary_attempt: UploadAttempt | None = None
     duplicate_attempt: UploadAttempt | None = None
     replay_result: ContentPipelineReplayAccepted | None = None
@@ -419,7 +425,7 @@ def main() -> None:
             client=pipeline_client,
             dataset_files=dataset_files,
             run_id=run_id,
-            skipped_duplicate_candidates=skipped_duplicate_candidates,
+            skipped_upload_candidates=skipped_upload_candidates,
             candidate_limit=args.candidate_limit,
         )
 
@@ -471,11 +477,6 @@ def main() -> None:
         )
         duplicate_attempt = UploadAttempt(dataset_file=primary_attempt.dataset_file, item=duplicate_upload_item)
         assert_duplicate_upload(duplicate_upload_item, primary_attempt.item.meme_file_id)
-        assert_item_present_in_filter(
-            client=pipeline_client,
-            filter_by=ContentPipelineItemFilter.DUPLICATE,
-            meme_file_id=duplicate_upload_item.meme_file_id,
-        )
 
         failure_worker.stop()
         failure_worker = None
@@ -529,7 +530,7 @@ def main() -> None:
             api_base_url=args.api_base_url,
             dataset_root=args.dataset_root,
             broker_routing_prefix=api_env["PIPELINE_BROKER_ROUTING_KEY_PREFIX"],
-            skipped_duplicate_candidates=skipped_duplicate_candidates,
+            skipped_upload_candidates=skipped_upload_candidates,
             primary_attempt=primary_attempt,
             duplicate_attempt=duplicate_attempt,
             failed_item=failed_item,
@@ -541,9 +542,9 @@ def main() -> None:
         print(f"Primary file: {primary_attempt.dataset_file.path}")
         print(f"Primary item: {primary_attempt.item.meme_file_id}")
         if duplicate_attempt is not None:
-            print(f"Duplicate item: {duplicate_attempt.item.meme_file_id}")
+            print(f"SHA duplicate attached to item: {duplicate_attempt.item.meme_file_id}")
         print(f"Replay event: {replay_result.replay_event_id}")
-        print("Smoke result: upload -> fail -> inspect -> duplicate -> replay succeeded.")
+        print("Smoke result: upload -> fail -> inspect -> SHA duplicate attach -> replay succeeded.")
     except SmokeError as exc:
         write_report(
             artifacts=artifacts,
@@ -551,7 +552,7 @@ def main() -> None:
             api_base_url=args.api_base_url,
             dataset_root=args.dataset_root,
             broker_routing_prefix=api_env["PIPELINE_BROKER_ROUTING_KEY_PREFIX"],
-            skipped_duplicate_candidates=skipped_duplicate_candidates,
+            skipped_upload_candidates=skipped_upload_candidates,
             primary_attempt=primary_attempt,
             duplicate_attempt=duplicate_attempt,
             failed_item=failed_item,
@@ -969,7 +970,7 @@ def find_fresh_upload_candidate(
     client: PipelineApiClient,
     dataset_files: list[DatasetFile],
     run_id: str,
-    skipped_duplicate_candidates: list[str],
+    skipped_upload_candidates: list[str],
     candidate_limit: int,
 ) -> UploadAttempt:
     """Upload deterministic files until one produces a real pending transcode item."""
@@ -984,15 +985,17 @@ def find_fresh_upload_candidate(
             post_id=f"runtime-smoke-post-{run_id}-{index:03d}",
             views=index,
         )
-        if item.current_status is ContentPipelineStageStatus.DUPLICATE:
-            skipped_duplicate_candidates.append(str(dataset_file.path))
+        skip_reason = fresh_pending_upload_skip_reason(item, dataset_file)
+        if skip_reason is not None:
+            skipped_upload_candidates.append(format_skipped_upload_candidate(dataset_file, item, skip_reason))
             continue
         return UploadAttempt(dataset_file=dataset_file, item=item)
 
     attempted_paths = "\n".join(f"- {dataset_file.path}" for dataset_file in dataset_files[:candidate_limit])
     raise SmokeError(
-        "Unable to find a fresh non-duplicate dataset file within the configured candidate limit. "
-        "The smoke script only trusts a file that creates a new pending transcode item. "
+        "Unable to find a fresh pending-transcode dataset file within the configured candidate limit. "
+        "The smoke script skips existing-file SHA attachments and only trusts an upload with "
+        "stage=transcode and status=pending. "
         f"Attempted files:\n{attempted_paths}",
     )
 
@@ -1000,19 +1003,50 @@ def find_fresh_upload_candidate(
 def assert_primary_upload_pending(item: ContentPipelineUploadRead, dataset_file: DatasetFile) -> None:
     """Require a real upload to land in the pending transcode state before the worker runs."""
 
+    skip_reason = fresh_pending_upload_skip_reason(item, dataset_file)
+    if skip_reason is not None:
+        raise SmokeError(
+            "Selected upload candidate did not satisfy the fresh pending-transcode contract: "
+            f"{dataset_file.path}: {skip_reason}; item={summarize_item(item)}",
+        )
+
+
+def fresh_pending_upload_skip_reason(item: ContentPipelineUploadRead, dataset_file: DatasetFile) -> str | None:
+    """Return why an upload response is not usable as the fresh pending transcode item."""
+
+    attach_reason = item.latest_source_attach_reason
+    if attach_reason in EXISTING_FILE_SOURCE_ATTACH_REASONS:
+        return f"source attached to an existing file via {render_source_attach_reason(attach_reason)}"
     if item.current_stage is not ContentPipelineStage.TRANSCODE:
-        raise SmokeError(
-            f"Fresh upload from {dataset_file.path} did not advance to transcode: {summarize_item(item)}",
-        )
+        return f"current stage is {item.current_stage.value}, not {ContentPipelineStage.TRANSCODE.value}"
     if item.current_status is not ContentPipelineStageStatus.PENDING:
-        raise SmokeError(
-            f"Fresh upload from {dataset_file.path} is not pending for transcode: {summarize_item(item)}",
-        )
-    if not item.original_object_key.endswith(dataset_file.path.suffix.lower()):
-        raise SmokeError(
-            "Fresh upload returned an unexpected original object key: "
-            f"file={dataset_file.path}, object_key={item.original_object_key}",
-        )
+        return f"current status is {item.current_status.value}, not {ContentPipelineStageStatus.PENDING.value}"
+    expected_suffix = dataset_file.path.suffix.lower()
+    if not item.original_object_key.endswith(expected_suffix):
+        return f"original object key {item.original_object_key!r} does not end with {expected_suffix!r}"
+    return None
+
+
+def format_skipped_upload_candidate(
+    dataset_file: DatasetFile,
+    item: ContentPipelineUploadRead,
+    skip_reason: str,
+) -> str:
+    """Render one skipped candidate with enough API state to diagnose dataset reuse."""
+
+    matched_file = item.latest_source_matched_meme_file_id
+    matched_file_fragment = f"; matched_meme_file_id={matched_file}" if matched_file is not None else ""
+    return (
+        f"{dataset_file.path}: {skip_reason}; meme_file_id={item.meme_file_id}; "
+        f"stage={item.current_stage.value}; status={item.current_status.value}; "
+        f"source_attach_reason={render_source_attach_reason(item.latest_source_attach_reason)}{matched_file_fragment}"
+    )
+
+
+def render_source_attach_reason(reason: SourceAttachReason | None) -> str:
+    """Render nullable source-attach reasons in reports and errors."""
+
+    return reason.value if reason is not None else "null"
 
 
 def wait_for_item_state(
@@ -1076,25 +1110,21 @@ def assert_item_absent_in_filter(
 
 
 def assert_duplicate_upload(duplicate_item: ContentPipelineUploadRead, primary_meme_file_id: uuid.UUID) -> None:
-    """Require that re-uploading the same dataset file returns the supported duplicate contract."""
+    """Require that re-uploading the same bytes attaches the source to the existing file."""
 
-    if duplicate_item.current_stage is not ContentPipelineStage.INGEST:
-        raise SmokeError(f"Duplicate upload did not remain on ingest: {summarize_item(duplicate_item)}")
-    if duplicate_item.current_status is not ContentPipelineStageStatus.DUPLICATE:
-        raise SmokeError(f"Duplicate upload did not report duplicate status: {summarize_item(duplicate_item)}")
-    if duplicate_item.normalized_reason != "duplicate_perceptual_hash":
+    if duplicate_item.meme_file_id != primary_meme_file_id:
         raise SmokeError(
-            "Duplicate upload reported the wrong normalized reason: "
+            "SHA duplicate upload did not resolve to the existing meme file: "
             f"{summarize_item(duplicate_item)}",
         )
-    if duplicate_item.last_error_text is None or str(primary_meme_file_id) not in duplicate_item.last_error_text:
+    if duplicate_item.latest_source_attach_reason is not SourceAttachReason.SHA256_EXACT_EXISTING_FILE:
         raise SmokeError(
-            "Duplicate upload did not explain which original item it matched: "
+            "SHA duplicate upload did not expose the expected source attachment: "
             f"{summarize_item(duplicate_item)}",
         )
-    if len(duplicate_item.stages) != 1 or duplicate_item.stages[0].status is not ContentPipelineStageStatus.DUPLICATE:
+    if duplicate_item.current_stage is ContentPipelineStage.INGEST:
         raise SmokeError(
-            "Duplicate upload returned an unexpected stage journal payload: "
+            "SHA duplicate unexpectedly created new ingest-stage duplicate rows: "
             f"{summarize_item(duplicate_item)}",
         )
 
@@ -1174,7 +1204,7 @@ def write_report(
     api_base_url: str,
     dataset_root: Path,
     broker_routing_prefix: str,
-    skipped_duplicate_candidates: list[str],
+    skipped_upload_candidates: list[str],
     primary_attempt: UploadAttempt | None,
     duplicate_attempt: UploadAttempt | None,
     failed_item: ContentPipelineItemRead | None,
@@ -1189,7 +1219,7 @@ def write_report(
         "api_base_url": api_base_url,
         "dataset_root": str(dataset_root),
         "broker_routing_prefix": broker_routing_prefix,
-        "skipped_duplicate_candidates": skipped_duplicate_candidates,
+        "skipped_upload_candidates": skipped_upload_candidates,
         "artifacts": {
             "api_log": str(artifacts.api_log),
             "bootstrap_worker_log": str(artifacts.bootstrap_worker_log),

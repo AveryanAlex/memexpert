@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -46,7 +47,10 @@ from memexpert.models.enums import (
     ContentProcessingStatus,
     ContentSourceKind,
     EmbeddingInputType,
+    IngestFileOrigin,
     ModerationAction,
+    SourceAttachReason,
+    SourcePlatform,
     SyncTargetKind,
     SyncTargetStatus,
 )
@@ -78,7 +82,7 @@ from memexpert.services.content_pipeline_crawler_queries import (
     attach_crawler_source_row_to_meme_file,
     find_existing_crawler_source_row,
     get_tracked_source_channel,
-    meme_file_has_first_source,
+    meme_has_first_source,
 )
 from memexpert.services.content_pipeline_helpers import (
     StageJournalSnapshot,
@@ -159,6 +163,7 @@ class PreparedUpload:
     width: int
     height: int
     perceptual_hash: str
+    sha256_hex: str
     object_key: str
 
 
@@ -247,12 +252,21 @@ class ContentPipelineService:
     ) -> ContentPipelineUploadRead:
         """Persist an operator upload durably, then publish downstream work exactly once."""
 
+        sha256_hex = self._sha256_hex(media_bytes)
+        sha_duplicate_item = await self._try_persist_sha_duplicate_upload(
+            metadata=metadata,
+            sha256_hex=sha256_hex,
+        )
+        if sha_duplicate_item is not None:
+            return ContentPipelineUploadRead.model_validate(sha_duplicate_item.model_dump(mode="python"))
+
         meme_file_id = uuid.uuid7()
         prepared_upload = await self._prepare_upload(
             meme_file_id=meme_file_id,
             filename=filename,
             content_type=content_type,
             media_bytes=media_bytes,
+            sha256_hex=sha256_hex,
         )
         blocked_match = await self._find_blocked_perceptual_hash_match(prepared_upload.perceptual_hash)
         if blocked_match is not None:
@@ -291,6 +305,33 @@ class ContentPipelineService:
 
         return ContentPipelineUploadRead.model_validate(item.model_dump(mode="python"))
 
+    async def try_crawler_ingest_without_media(
+        self,
+        *,
+        platform: SourcePlatform,
+        source_id: str,
+        post_id: str,
+        published_at: datetime | None,
+    ) -> CrawlerIngestResult | None:
+        """Return a terminal crawler result that does not require media bytes.
+
+        Runtime callers use this before ``download_media()`` so a known
+        ``(platform, source_id, post_id)`` redelivery can advance the crawler
+        checkpoint and return the existing source ids without downloading the
+        same Telegram media again. ``None`` means the caller still needs bytes
+        and must continue through ``create_crawler_ingest``.
+        """
+
+        received_at = utcnow()
+        _channel, result = await self._resolve_crawler_ingest_without_media(
+            platform=platform,
+            source_id=source_id,
+            post_id=post_id,
+            published_at=published_at,
+            received_at=received_at,
+        )
+        return result
+
     async def create_crawler_ingest(self, raw_post: RawCrawlerPost) -> CrawlerIngestResult:
         """Persist one crawler post durably, then publish downstream work exactly once.
 
@@ -321,48 +362,29 @@ class ContentPipelineService:
                 received_at=received_at,
             )
 
-        # Resolve the tracked channel. Curated channels MUST already exist as
-        # ``source_channels`` rows — silently accepting a stray crawler post
-        # would make the S04 curated-wave contract untrustworthy.
-        channel = await get_tracked_source_channel(
-            self._session,
-            platform=raw_post.platform,
-            source_id=raw_post.source_id,
-        )
-        if channel.is_paused:
-            return CrawlerIngestResult(
-                outcome=CrawlerIngestOutcome.SKIPPED_PAUSED_CHANNEL,
-                published_at=raw_post.published_at,
-                received_at=received_at,
-            )
-
-        # Idempotency guard: re-deliveries of the same Telegram message hit the
-        # existing unique ``(platform, source_id, post_id)`` tuple. We short-
-        # circuit with the existing row ids BEFORE touching S3 so replays stay
-        # cheap. Checkpoint advancement still happens below because advancing
-        # the checkpoint on a known post is correct — the message is durable.
-        existing_source_row = await find_existing_crawler_source_row(
-            self._session,
+        # Resolve the tracked channel and any media-free terminal outcomes.
+        # Direct service callers arrive here with bytes already available, but
+        # the source/post guard still stays before SHA, media inspection, S3,
+        # and dispatch work so the entrypoint remains idempotent on its own.
+        channel, short_circuit_result = await self._resolve_crawler_ingest_without_media(
             platform=raw_post.platform,
             source_id=raw_post.source_id,
             post_id=raw_post.post_id,
+            published_at=raw_post.published_at,
+            received_at=received_at,
         )
-        if existing_source_row is not None:
-            await advance_source_channel_checkpoint(
-                channel,
-                post_id=raw_post.post_id,
-                fetched_at=received_at,
-            )
-            await self._commit_stage_mutation(
-                "Failed to persist crawler checkpoint advancement on duplicate post.",
-            )
-            return CrawlerIngestResult(
-                meme_file_id=existing_source_row.file_id,
-                meme_source_id=existing_source_row.id,
-                outcome=CrawlerIngestOutcome.SKIPPED_DUPLICATE_POST_ID,
-                published_at=raw_post.published_at,
-                received_at=received_at,
-            )
+        if short_circuit_result is not None:
+            return short_circuit_result
+
+        sha256_hex = self._sha256_hex(raw_post.media_bytes)
+        sha_duplicate_result = await self._try_persist_sha_duplicate_crawler_ingest(
+            raw_post=raw_post,
+            sha256_hex=sha256_hex,
+            channel=channel,
+            received_at=received_at,
+        )
+        if sha_duplicate_result is not None:
+            return sha_duplicate_result
 
         meme_file_id = uuid.uuid7()
         prepared_upload = await self._prepare_upload(
@@ -370,6 +392,7 @@ class ContentPipelineService:
             filename=raw_post.filename or _consts.CRAWLER_MEDIA_DEFAULT_FILENAMES[raw_post.media_type],
             content_type=raw_post.content_type or _consts.CRAWLER_MEDIA_DEFAULT_CONTENT_TYPES[raw_post.media_type],
             media_bytes=raw_post.media_bytes,
+            sha256_hex=sha256_hex,
         )
         blocked_match = await self._find_blocked_perceptual_hash_match(prepared_upload.perceptual_hash)
         if blocked_match is not None:
@@ -519,6 +542,7 @@ class ContentPipelineService:
             select(MemeFile)
             .options(
                 selectinload(MemeFile.meme),
+                selectinload(MemeFile.sources),
                 selectinload(MemeFile.pipeline_stage_journal_entries),
             )
             .order_by(MemeFile.created_at.desc())
@@ -802,7 +826,7 @@ class ContentPipelineService:
         ensure_stage_attempt_is_current(stage_entry, attempt=attempt)
 
         target_meme = await self._get_canonical_meme(meme_file.meme_id)
-        target_meme.is_nsfw = classification_result.is_nsfw
+        target_meme.is_nsfw = target_meme.is_nsfw or classification_result.is_nsfw
         await self._apply_canonical_primary_truth(target_meme)
 
         await self._finalize_stage_success(
@@ -1541,6 +1565,7 @@ class ContentPipelineService:
         filename: str | None,
         content_type: str | None,
         media_bytes: bytes,
+        sha256_hex: str,
     ) -> PreparedUpload:
         normalized_filename = normalize_filename(filename)
         normalized_content_type = normalize_content_type(content_type)
@@ -1573,11 +1598,163 @@ class ContentPipelineService:
             width=inspected_media.width,
             height=inspected_media.height,
             perceptual_hash=inspected_media.perceptual_hash,
+            sha256_hex=sha256_hex,
             object_key=build_original_object_key(
                 meme_file_id,
                 normalized_filename,
                 settings=self._settings,
             ),
+        )
+
+    async def _try_persist_sha_duplicate_upload(
+        self,
+        *,
+        metadata: ContentPipelineUploadMetadata,
+        sha256_hex: str,
+    ) -> ContentPipelineItemRead | None:
+        try:
+            await self._ensure_source_identifier_is_available(metadata)
+            matched_file = await self._find_sha256_match(sha256_hex)
+            if matched_file is None:
+                return None
+
+            attach_reason = self._sha_match_attach_reason(matched_file)
+            matched_file_id = matched_file.id
+            self._session.add(
+                MemeSource(
+                    file_id=matched_file_id,
+                    platform=metadata.source_platform,
+                    source_id=metadata.source_id,
+                    post_id=metadata.post_id,
+                    views=metadata.views,
+                    reactions={},
+                    is_first_source=False,
+                    source_alive=True,
+                    attach_reason=attach_reason,
+                    matched_meme_file_id=matched_file_id,
+                )
+            )
+            await self._session.commit()
+        except PipelineSourceConflictError:
+            await self._session.rollback()
+            raise
+        except SQLAlchemyError as exc:
+            await self._session.rollback()
+            raise PipelineIngestError("Failed to persist SHA256 duplicate source attribution.") from exc
+
+        return await self.get_item(matched_file_id)
+
+    async def _resolve_crawler_ingest_without_media(
+        self,
+        *,
+        platform: SourcePlatform,
+        source_id: str,
+        post_id: str,
+        published_at: datetime | None,
+        received_at: datetime,
+    ) -> tuple[SourceChannel, CrawlerIngestResult | None]:
+        """Return the tracked channel plus any crawler result that does not need bytes."""
+
+        channel = await get_tracked_source_channel(
+            self._session,
+            platform=platform,
+            source_id=source_id,
+        )
+        if channel.is_paused:
+            return channel, CrawlerIngestResult(
+                outcome=CrawlerIngestOutcome.SKIPPED_PAUSED_CHANNEL,
+                published_at=published_at,
+                received_at=received_at,
+            )
+
+        existing_source_row = await find_existing_crawler_source_row(
+            self._session,
+            platform=platform,
+            source_id=source_id,
+            post_id=post_id,
+        )
+        if existing_source_row is None:
+            return channel, None
+
+        await advance_source_channel_checkpoint(
+            channel,
+            post_id=post_id,
+            fetched_at=received_at,
+        )
+        await self._commit_stage_mutation(
+            "Failed to persist crawler checkpoint advancement on duplicate post.",
+        )
+        return channel, self._build_duplicate_crawler_ingest_result(
+            existing_source_row,
+            published_at=published_at,
+            received_at=received_at,
+        )
+
+    @staticmethod
+    def _build_duplicate_crawler_ingest_result(
+        source_row: MemeSource,
+        *,
+        published_at: datetime | None,
+        received_at: datetime,
+    ) -> CrawlerIngestResult:
+        return CrawlerIngestResult(
+            meme_file_id=source_row.file_id,
+            meme_source_id=source_row.id,
+            outcome=CrawlerIngestOutcome.SKIPPED_DUPLICATE_POST_ID,
+            published_at=published_at,
+            received_at=received_at,
+        )
+
+    async def _try_persist_sha_duplicate_crawler_ingest(
+        self,
+        *,
+        raw_post: RawCrawlerPost,
+        sha256_hex: str,
+        channel: SourceChannel,
+        received_at: datetime,
+    ) -> CrawlerIngestResult | None:
+        try:
+            matched_file = await self._find_sha256_match(sha256_hex)
+            if matched_file is None:
+                return None
+
+            attach_reason = self._sha_match_attach_reason(matched_file)
+            any_existing_first_source = await meme_has_first_source(self._session, matched_file.meme_id)
+            should_claim_first_source = raw_post.forward is None and not any_existing_first_source
+            new_source_row = attach_crawler_source_row_to_meme_file(
+                self._session,
+                meme_file=matched_file,
+                raw_post=raw_post,
+                is_first_source=should_claim_first_source,
+                attach_reason=attach_reason,
+                matched_meme_file_id=matched_file.id,
+            )
+            await advance_source_channel_checkpoint(
+                channel,
+                post_id=raw_post.post_id,
+                fetched_at=received_at,
+            )
+            await self._session.commit()
+        except SQLAlchemyError as exc:
+            await self._session.rollback()
+            raise PipelineIngestError("Failed to persist crawler SHA256 duplicate source attribution.") from exc
+
+        await self._session.refresh(new_source_row)
+        outcome = (
+            CrawlerIngestOutcome.BLOCKED_SHA256_EXISTING_FILE
+            if attach_reason is SourceAttachReason.BLOCKED_SHA256_EXISTING_FILE
+            else CrawlerIngestOutcome.SHA256_EXACT_EXISTING_FILE
+        )
+        return CrawlerIngestResult(
+            meme_file_id=matched_file.id,
+            meme_source_id=new_source_row.id,
+            outcome=outcome,
+            duplicate_of_meme_id=matched_file.meme_id,
+            matched_meme_file_id=matched_file.id,
+            source_attach_reason=attach_reason,
+            sha256_hex=sha256_hex,
+            published_at=raw_post.published_at,
+            received_at=received_at,
         )
 
     async def _persist_upload(
@@ -1591,22 +1768,22 @@ class ContentPipelineService:
 
         try:
             await self._ensure_source_identifier_is_available(metadata)
-            duplicate_match = await self._find_duplicate_match(prepared_upload.perceptual_hash)
+            phash_match = await self._find_exact_phash_match(prepared_upload.perceptual_hash)
+            meme_id = uuid.uuid7() if phash_match is None else phash_match.meme_id
+            publish_event_id = uuid.uuid7()
+            dispatch_event = ContentPipelineDispatchEvent(
+                event_id=publish_event_id,
+                event_type=ContentPipelineEventType.MEME_CREATED,
+                meme_id=meme_id,
+                meme_file_id=meme_file_id,
+                stage=ContentPipelineStage.TRANSCODE,
+                source_kind=ContentSourceKind.MANUAL_UPLOAD,
+                original_object_key=prepared_upload.object_key,
+                attempt=1,
+                created_at=now,
+            )
 
-            if duplicate_match is None:
-                meme_id = uuid.uuid7()
-                publish_event_id = uuid.uuid7()
-                dispatch_event = ContentPipelineDispatchEvent(
-                    event_id=publish_event_id,
-                    event_type=ContentPipelineEventType.MEME_CREATED,
-                    meme_id=meme_id,
-                    meme_file_id=meme_file_id,
-                    stage=ContentPipelineStage.TRANSCODE,
-                    source_kind=ContentSourceKind.MANUAL_UPLOAD,
-                    original_object_key=prepared_upload.object_key,
-                    attempt=1,
-                    created_at=now,
-                )
+            if phash_match is None:
                 await self._create_new_upload_rows(
                     meme_id=meme_id,
                     meme_file_id=meme_file_id,
@@ -1616,12 +1793,12 @@ class ContentPipelineService:
                     created_at=now,
                 )
             else:
-                dispatch_event = None
-                await self._create_duplicate_upload_rows(
-                    duplicate_match=duplicate_match,
+                await self._create_phash_match_upload_rows(
+                    phash_match=phash_match,
                     meme_file_id=meme_file_id,
                     metadata=metadata,
                     prepared_upload=prepared_upload,
+                    publish_event_id=publish_event_id,
                     created_at=now,
                 )
 
@@ -1656,23 +1833,23 @@ class ContentPipelineService:
         """
 
         try:
-            duplicate_match = await self._find_duplicate_match(prepared_upload.perceptual_hash)
+            phash_match = await self._find_exact_phash_match(prepared_upload.perceptual_hash)
             is_forwarded = raw_post.forward is not None
+            meme_id = uuid.uuid7() if phash_match is None else phash_match.meme_id
+            publish_event_id = uuid.uuid7()
+            dispatch_event: ContentPipelineDispatchEvent | None = ContentPipelineDispatchEvent(
+                event_id=publish_event_id,
+                event_type=ContentPipelineEventType.MEME_CREATED,
+                meme_id=meme_id,
+                meme_file_id=meme_file_id,
+                stage=ContentPipelineStage.TRANSCODE,
+                source_kind=ContentSourceKind.TELEGRAM,
+                original_object_key=prepared_upload.object_key,
+                attempt=1,
+                created_at=received_at,
+            )
 
-            if duplicate_match is None:
-                meme_id = uuid.uuid7()
-                publish_event_id = uuid.uuid7()
-                dispatch_event: ContentPipelineDispatchEvent | None = ContentPipelineDispatchEvent(
-                    event_id=publish_event_id,
-                    event_type=ContentPipelineEventType.MEME_CREATED,
-                    meme_id=meme_id,
-                    meme_file_id=meme_file_id,
-                    stage=ContentPipelineStage.TRANSCODE,
-                    source_kind=ContentSourceKind.TELEGRAM,
-                    original_object_key=prepared_upload.object_key,
-                    attempt=1,
-                    created_at=received_at,
-                )
+            if phash_match is None:
                 new_source_row = await self._create_new_crawler_ingest_rows(
                     meme_id=meme_id,
                     meme_file_id=meme_file_id,
@@ -1684,28 +1861,28 @@ class ContentPipelineService:
                 )
                 outcome = CrawlerIngestOutcome.INGESTED
                 duplicate_of_meme_id: uuid.UUID | None = None
+                matched_meme_file_id: uuid.UUID | None = None
             else:
-                dispatch_event = None
-                # For the dedupe branch we do NOT create a new meme or stage
-                # journal; we only attach a new ``MemeSource`` row to the
-                # existing ``MemeFile`` and mark ``is_first_source`` based on
-                # whether this observation is a forwarded repost AND whether
-                # no existing row has claimed first-source status yet.
-                any_existing_first_source = await meme_file_has_first_source(
+                # Exact pHash after a SHA miss is the same meme but a new
+                # physical file, so the source points at the new file and keeps
+                # lineage to the pHash-matched file.
+                any_existing_first_source = await meme_has_first_source(
                     self._session,
-                    duplicate_match.id,
+                    phash_match.meme_id,
                 )
                 should_claim_first_source = (not is_forwarded) and not any_existing_first_source
-                new_source_row = attach_crawler_source_row_to_meme_file(
-                    self._session,
-                    meme_file=duplicate_match,
+                new_source_row = await self._create_phash_match_crawler_ingest_rows(
+                    phash_match=phash_match,
+                    meme_file_id=meme_file_id,
                     raw_post=raw_post,
+                    prepared_upload=prepared_upload,
+                    publish_event_id=publish_event_id,
+                    received_at=received_at,
                     is_first_source=should_claim_first_source,
                 )
-                meme_id = duplicate_match.meme_id
-                meme_file_id = duplicate_match.id
-                outcome = CrawlerIngestOutcome.DEDUPLICATED_EXACT
-                duplicate_of_meme_id = duplicate_match.meme_id
+                outcome = CrawlerIngestOutcome.PHASH_EXACT_NEW_FILE
+                duplicate_of_meme_id = phash_match.meme_id
+                matched_meme_file_id = phash_match.id
 
             await advance_source_channel_checkpoint(
                 channel,
@@ -1731,6 +1908,9 @@ class ContentPipelineService:
                 meme_source_id=new_source_row.id,
                 outcome=outcome,
                 duplicate_of_meme_id=duplicate_of_meme_id,
+                matched_meme_file_id=matched_meme_file_id,
+                source_attach_reason=new_source_row.attach_reason,
+                sha256_hex=prepared_upload.sha256_hex,
                 published_at=raw_post.published_at,
                 received_at=received_at,
             ),
@@ -1800,6 +1980,8 @@ class ContentPipelineService:
             meme_file_id=meme_file_id,
             meme_source_id=new_source_row.id,
             outcome=CrawlerIngestOutcome.BLOCKED_PERCEPTUAL_HASH,
+            source_attach_reason=SourceAttachReason.BLOCKED_PERCEPTUAL_HASH_NEW_FILE,
+            sha256_hex=prepared_upload.sha256_hex,
             published_at=raw_post.published_at,
             received_at=received_at,
         )
@@ -1833,6 +2015,7 @@ class ContentPipelineService:
                 reactions={},
                 is_first_source=True,
                 source_alive=True,
+                attach_reason=SourceAttachReason.BLOCKED_PERCEPTUAL_HASH_NEW_FILE,
             ),
         )
         await self._session.flush()
@@ -1868,6 +2051,7 @@ class ContentPipelineService:
             published_at=raw_post.published_at,
             forwarded_from_source_id=raw_post.forward.source_id if raw_post.forward is not None else None,
             forwarded_from_post_id=raw_post.forward.post_id if raw_post.forward is not None else None,
+            attach_reason=SourceAttachReason.BLOCKED_PERCEPTUAL_HASH_NEW_FILE,
         )
         self._session.add(new_source_row)
         await self._session.flush()
@@ -1907,6 +2091,8 @@ class ContentPipelineService:
             mime_type=prepared_upload.mime_type,
             s3_original_key=prepared_upload.object_key,
             perceptual_hash=prepared_upload.perceptual_hash,
+            sha256_hex=prepared_upload.sha256_hex,
+            ingest_origin=IngestFileOrigin.BLOCKED_PERCEPTUAL_HASH,
             blocked_perceptual_hash_id=blocked_hash.id,
         )
         self._session.add(meme_file)
@@ -1976,6 +2162,8 @@ class ContentPipelineService:
             mime_type=prepared_upload.mime_type,
             s3_original_key=prepared_upload.object_key,
             perceptual_hash=prepared_upload.perceptual_hash,
+            sha256_hex=prepared_upload.sha256_hex,
+            ingest_origin=IngestFileOrigin.NEW_MEME,
         )
         self._session.add(meme_file)
         await self._session.flush()
@@ -1992,6 +2180,7 @@ class ContentPipelineService:
             published_at=raw_post.published_at,
             forwarded_from_source_id=raw_post.forward.source_id if raw_post.forward is not None else None,
             forwarded_from_post_id=raw_post.forward.post_id if raw_post.forward is not None else None,
+            attach_reason=SourceAttachReason.NEW_FILE,
         )
         self._session.add_all(
             [
@@ -2050,6 +2239,8 @@ class ContentPipelineService:
             mime_type=prepared_upload.mime_type,
             s3_original_key=prepared_upload.object_key,
             perceptual_hash=prepared_upload.perceptual_hash,
+            sha256_hex=prepared_upload.sha256_hex,
+            ingest_origin=IngestFileOrigin.NEW_MEME,
         )
         self._session.add(meme_file)
         await self._session.flush()
@@ -2065,6 +2256,7 @@ class ContentPipelineService:
                     reactions={},
                     is_first_source=True,
                     source_alive=True,
+                    attach_reason=SourceAttachReason.NEW_FILE,
                 ),
                 PipelineStageJournal(
                     meme_file_id=meme_file_id,
@@ -2088,52 +2280,120 @@ class ContentPipelineService:
         )
         await self._session.flush()
 
-    async def _create_duplicate_upload_rows(
+    async def _create_phash_match_upload_rows(
         self,
         *,
-        duplicate_match: MemeFile,
+        phash_match: MemeFile,
         meme_file_id: uuid.UUID,
         metadata: ContentPipelineUploadMetadata,
         prepared_upload: PreparedUpload,
+        publish_event_id: uuid.UUID,
         created_at: datetime,
     ) -> None:
-        duplicate_event_id = uuid.uuid7()
+        await self._create_phash_match_file_and_stage_rows(
+            phash_match=phash_match,
+            meme_file_id=meme_file_id,
+            prepared_upload=prepared_upload,
+            publish_event_id=publish_event_id,
+            created_at=created_at,
+        )
+        self._session.add(
+            MemeSource(
+                file_id=meme_file_id,
+                platform=metadata.source_platform,
+                source_id=metadata.source_id,
+                post_id=metadata.post_id,
+                views=metadata.views,
+                reactions={},
+                is_first_source=False,
+                source_alive=True,
+                attach_reason=SourceAttachReason.PHASH_EXACT_NEW_FILE,
+                matched_meme_file_id=phash_match.id,
+            )
+        )
+        await self._session.flush()
+
+    async def _create_phash_match_crawler_ingest_rows(
+        self,
+        *,
+        phash_match: MemeFile,
+        meme_file_id: uuid.UUID,
+        raw_post: RawCrawlerPost,
+        prepared_upload: PreparedUpload,
+        publish_event_id: uuid.UUID,
+        received_at: datetime,
+        is_first_source: bool,
+    ) -> MemeSource:
+        await self._create_phash_match_file_and_stage_rows(
+            phash_match=phash_match,
+            meme_file_id=meme_file_id,
+            prepared_upload=prepared_upload,
+            publish_event_id=publish_event_id,
+            created_at=received_at,
+        )
+        new_source_row = MemeSource(
+            file_id=meme_file_id,
+            platform=raw_post.platform,
+            source_id=raw_post.source_id,
+            post_id=raw_post.post_id,
+            views=raw_post.views,
+            reactions=dict(raw_post.reactions),
+            is_first_source=is_first_source,
+            source_alive=True,
+            published_at=raw_post.published_at,
+            forwarded_from_source_id=raw_post.forward.source_id if raw_post.forward is not None else None,
+            forwarded_from_post_id=raw_post.forward.post_id if raw_post.forward is not None else None,
+            attach_reason=SourceAttachReason.PHASH_EXACT_NEW_FILE,
+            matched_meme_file_id=phash_match.id,
+        )
+        self._session.add(new_source_row)
+        await self._session.flush()
+        return new_source_row
+
+    async def _create_phash_match_file_and_stage_rows(
+        self,
+        *,
+        phash_match: MemeFile,
+        meme_file_id: uuid.UUID,
+        prepared_upload: PreparedUpload,
+        publish_event_id: uuid.UUID,
+        created_at: datetime,
+    ) -> None:
+        self._session.add(
+            MemeFile(
+                id=meme_file_id,
+                meme_id=phash_match.meme_id,
+                status=ContentProcessingStatus.PENDING,
+                width=prepared_upload.width,
+                height=prepared_upload.height,
+                file_size_bytes=prepared_upload.file_size_bytes,
+                mime_type=prepared_upload.mime_type,
+                s3_original_key=prepared_upload.object_key,
+                perceptual_hash=prepared_upload.perceptual_hash,
+                sha256_hex=prepared_upload.sha256_hex,
+                ingest_origin=IngestFileOrigin.PHASH_EXACT_EXISTING_MEME,
+                matched_meme_file_id=phash_match.id,
+            )
+        )
         self._session.add_all(
             [
-                MemeFile(
-                    id=meme_file_id,
-                    meme_id=duplicate_match.meme_id,
-                    status=ContentProcessingStatus.FAILED,
-                    width=prepared_upload.width,
-                    height=prepared_upload.height,
-                    file_size_bytes=prepared_upload.file_size_bytes,
-                    mime_type=prepared_upload.mime_type,
-                    s3_original_key=prepared_upload.object_key,
-                    perceptual_hash=prepared_upload.perceptual_hash,
-                ),
-                MemeSource(
-                    file_id=meme_file_id,
-                    platform=metadata.source_platform,
-                    source_id=metadata.source_id,
-                    post_id=metadata.post_id,
-                    views=metadata.views,
-                    reactions={},
-                    is_first_source=False,
-                    source_alive=True,
-                ),
                 PipelineStageJournal(
                     meme_file_id=meme_file_id,
                     stage=ContentPipelineStage.INGEST,
-                    status=ContentPipelineStageStatus.DUPLICATE,
+                    status=ContentPipelineStageStatus.SUCCEEDED,
                     attempt_count=1,
-                    last_event_id=duplicate_event_id,
-                    normalized_reason="duplicate_perceptual_hash",
-                    last_error_text=(
-                        f"Exact duplicate matched existing meme_file_id {duplicate_match.id}."
-                    ),
+                    last_event_id=publish_event_id,
                     is_retryable=False,
                     started_at=created_at,
                     finished_at=created_at,
+                ),
+                PipelineStageJournal(
+                    meme_file_id=meme_file_id,
+                    stage=ContentPipelineStage.TRANSCODE,
+                    status=ContentPipelineStageStatus.PENDING,
+                    attempt_count=0,
+                    last_event_id=publish_event_id,
+                    is_retryable=True,
                 ),
             ]
         )
@@ -2180,7 +2440,29 @@ class ContentPipelineService:
             f"{blocked_hash.reason.value}).{note_suffix}"
         )
 
-    async def _find_duplicate_match(self, perceptual_hash: str) -> MemeFile | None:
+    @staticmethod
+    def _sha256_hex(media_bytes: bytes) -> str:
+        return hashlib.sha256(media_bytes).hexdigest()
+
+    async def _find_sha256_match(self, sha256_hex: str) -> MemeFile | None:
+        result = await self._session.execute(
+            select(MemeFile)
+            .where(MemeFile.sha256_hex == sha256_hex)
+            .order_by(MemeFile.created_at.asc(), MemeFile.id.asc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
+    @staticmethod
+    def _sha_match_attach_reason(matched_file: MemeFile) -> SourceAttachReason:
+        if (
+            matched_file.status is ContentProcessingStatus.FAILED
+            and matched_file.blocked_perceptual_hash_id is not None
+        ):
+            return SourceAttachReason.BLOCKED_SHA256_EXISTING_FILE
+        return SourceAttachReason.SHA256_EXACT_EXISTING_FILE
+
+    async def _find_exact_phash_match(self, perceptual_hash: str) -> MemeFile | None:
         result = await self._session.execute(
             select(MemeFile)
             .where(
@@ -2296,6 +2578,7 @@ class ContentPipelineService:
             .options(
                 selectinload(MemeFile.meme),
                 selectinload(MemeFile.ocr_result),
+                selectinload(MemeFile.sources),
                 selectinload(MemeFile.pipeline_stage_journal_entries),
             )
             .where(MemeFile.id == meme_file_id)
@@ -2563,9 +2846,22 @@ class ContentPipelineService:
             raise PipelineIngestError(f"Pipeline item {meme_file.id} is missing journal state.")
 
         resolved_current_entry = current_entry or resolve_current_stage(resolved_stage_entries)
+        latest_source = max(
+            meme_file.sources,
+            key=lambda source: (source.created_at, source.id),
+            default=None,
+        )
         return ContentPipelineItemRead(
             meme_id=meme_file.meme_id,
             meme_file_id=meme_file.id,
+            sha256_hex=meme_file.sha256_hex,
+            ingest_origin=meme_file.ingest_origin,
+            matched_meme_file_id=meme_file.matched_meme_file_id,
+            latest_source_id=latest_source.id if latest_source is not None else None,
+            latest_source_attach_reason=latest_source.attach_reason if latest_source is not None else None,
+            latest_source_matched_meme_file_id=(
+                latest_source.matched_meme_file_id if latest_source is not None else None
+            ),
             current_stage=resolved_current_entry.stage,
             current_status=resolved_current_entry.status,
             original_object_key=meme_file.s3_original_key,
