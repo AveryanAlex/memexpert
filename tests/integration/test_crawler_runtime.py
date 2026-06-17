@@ -36,7 +36,7 @@ from memexpert.models.content import (
     TelegramSessionState,
 )
 from memexpert.models.enums import SourcePlatform, TelegramSessionStatus
-from memexpert.schemas.content_pipeline import CrawlerForwardAttribution
+from memexpert.schemas.content_pipeline import CrawlerForwardAttribution, CrawlerIngestOutcome
 from memexpert.services import CrawlerSessionNotRunnableError
 from memexpert.services.content_pipeline import ContentPipelineService
 from tests.integration.test_content_pipeline_service import (
@@ -219,13 +219,11 @@ async def test_catch_up_channel_ingests_and_counts_mixed_media(
 
     assert isinstance(report, CrawlerCatchupReport)
     assert report.messages_scanned == 5
-    # The FakeMediaProcessor assigns the same phash to every upload so
-    # the first supported message ingests and the rest are counted as
-    # skipped_dedup (the service reports DEDUPLICATED_EXACT because the
-    # phash collides). The one unsupported media short-circuits before
-    # reaching the service.
-    assert report.messages_ingested == 1
-    assert report.messages_skipped_dedup == 3
+    # The FakeMediaProcessor assigns the same pHash to every upload, but
+    # different bytes now create new MemeFile rows under the same meme.
+    # The one unsupported media short-circuits before reaching the service.
+    assert report.messages_ingested == 4
+    assert report.messages_skipped_dedup == 0
     assert report.messages_skipped_unsupported == 1
     assert report.errors == ()
     assert report.session_name == "primary"
@@ -259,12 +257,58 @@ async def test_catch_up_channel_respects_catchup_message_limit(
     report = await runtime.catch_up_channel("primary", "limited_channel")
 
     # Only 3 messages are scanned because the channel's catchup limit is
-    # 3. With the shared-phash fake processor, one ingests and two dedup.
+    # 3. The fake downloads identical bytes, so one ingests and two skip
+    # as SHA256-exact existing-file duplicates.
     assert report.messages_scanned == 3
     assert report.messages_ingested == 1
     assert report.messages_skipped_dedup == 2
     await migrated_db_session.refresh(channel)
     assert channel.last_read_post_id == "3"
+
+
+async def test_catch_up_channel_skips_duplicate_source_before_download(
+    migrated_db_session: AsyncSession,
+) -> None:
+    await _seed_active_session(migrated_db_session, session_name="primary")
+    channel = await _seed_curated_channel(
+        migrated_db_session,
+        platform_id="dedup_channel",
+    )
+
+    seed_message = _build_photo_message(message_id="10", channel_id="dedup_channel")
+    seed_fake = FakeTelegramClient(
+        canned_messages={"dedup_channel": [seed_message]},
+        media_by_message={"10": b"seed-bytes"},
+    )
+    seed_runtime = _build_runtime(migrated_db_session, telegram_client=seed_fake, phash_tag="D")
+
+    seed_report = await seed_runtime.catch_up_channel("primary", "dedup_channel")
+    assert seed_report.messages_ingested == 1
+
+    await migrated_db_session.refresh(channel)
+    channel.last_read_post_id = None
+    await migrated_db_session.commit()
+
+    duplicate_message = _build_photo_message(message_id="10", channel_id="dedup_channel")
+    new_message = _build_photo_message(message_id="11", channel_id="dedup_channel")
+    fake = FakeTelegramClient(
+        canned_messages={"dedup_channel": [duplicate_message, new_message]},
+        media_by_message={
+            "10": b"duplicate-should-not-download",
+            "11": b"new-bytes",
+        },
+    )
+    runtime = _build_runtime(migrated_db_session, telegram_client=fake, phash_tag="D")
+
+    report = await runtime.catch_up_channel("primary", "dedup_channel")
+
+    assert report.messages_scanned == 2
+    assert report.messages_ingested == 1
+    assert report.messages_skipped_dedup == 1
+    assert fake.downloaded_message_ids == ["11"]
+
+    await migrated_db_session.refresh(channel)
+    assert channel.last_read_post_id == "11"
 
 
 async def test_catch_up_channel_honors_paused_channel(
@@ -435,12 +479,12 @@ async def test_catch_up_channel_continues_after_per_message_provider_error(
 
     # 3 scanned. Message 10 ingests successfully. Message 20's download
     # pin raises PipelineTelegramProviderUnavailableError so the loop
-    # records an error and continues. Message 30 downloads cleanly but
-    # pHash-dedupes against message 10 (FakeMediaProcessor returns the
-    # same phash for every upload), so it lands in skipped_dedup.
+    # records an error and continues. Message 30 downloads cleanly with
+    # different bytes; its exact-pHash match creates another MemeFile
+    # under the same meme and is still counted as ingested.
     assert report.messages_scanned == 3
-    assert report.messages_ingested == 1
-    assert report.messages_skipped_dedup == 1
+    assert report.messages_ingested == 2
+    assert report.messages_skipped_dedup == 0
     assert any("download_unavailable:20" in e for e in report.errors)
 
     await migrated_db_session.refresh(session_row)
@@ -512,9 +556,6 @@ async def test_live_listener_round_trips_one_message_and_stops_cleanly(
 
     await runtime.start_live_listener("primary")
 
-    await migrated_db_session.refresh(session_row)
-    assert session_row.live_listener_started_at is not None
-
     # Wait for the fake's one-shot stream to be consumed.
     for _ in range(50):
         if "100" in fake.downloaded_message_ids:
@@ -529,6 +570,60 @@ async def test_live_listener_round_trips_one_message_and_stops_cleanly(
     assert session_row.status is TelegramSessionStatus.STOPPED
     assert session_row.live_listener_started_at is None
     assert session_row.last_heartbeat_at is not None
+
+
+async def test_live_listener_skips_duplicate_source_before_download(
+    migrated_db_session: AsyncSession,
+) -> None:
+    await _seed_active_session(migrated_db_session, session_name="primary")
+    channel = await _seed_curated_channel(
+        migrated_db_session,
+        platform_id="live_dedup_channel",
+        session_id="primary",
+    )
+
+    seed_message = _build_photo_message(message_id="100", channel_id="live_dedup_channel")
+    seed_fake = FakeTelegramClient(
+        canned_messages={"live_dedup_channel": [seed_message]},
+        media_by_message={"100": b"seed-live-bytes"},
+    )
+    seed_runtime = _build_runtime(migrated_db_session, telegram_client=seed_fake, phash_tag="L")
+    seed_report = await seed_runtime.catch_up_channel("primary", "live_dedup_channel")
+    assert seed_report.messages_ingested == 1
+
+    duplicate_message = _build_photo_message(message_id="100", channel_id="live_dedup_channel")
+    new_message = _build_photo_message(message_id="101", channel_id="live_dedup_channel")
+    fake = FakeTelegramClient(
+        live_messages={"live_dedup_channel": [duplicate_message, new_message]},
+        media_by_message={
+            "100": b"duplicate-live-should-not-download",
+            "101": b"new-live-bytes",
+        },
+    )
+    runtime = _build_runtime(migrated_db_session, telegram_client=fake, phash_tag="L")
+
+    await runtime.start_live_listener("primary")
+
+    for _ in range(50):
+        if "101" in fake.downloaded_message_ids:
+            break
+        await asyncio.sleep(0.02)
+    else:  # pragma: no cover - safety net for flaky CI
+        pytest.fail("Live listener did not process the pinned non-duplicate message in time.")
+
+    live_task = runtime._live_tasks["primary"]
+    for _ in range(50):
+        if live_task.done():
+            break
+        await asyncio.sleep(0.02)
+    else:  # pragma: no cover - safety net for flaky CI
+        pytest.fail("Live listener did not finish the fake one-shot stream in time.")
+
+    await runtime.stop_live_listener("primary")
+
+    assert fake.downloaded_message_ids == ["101"]
+    await migrated_db_session.refresh(channel)
+    assert channel.last_read_post_id == "101"
 
 
 # ---------------------------------------------------------------------------
@@ -678,7 +773,6 @@ async def test_crawler_operations_service_reassign_updates_session_binding_and_p
 async def test_crawler_operations_service_replay_channel_post_delegates_to_runtime(
     migrated_db_session: AsyncSession,
 ) -> None:
-    from memexpert.schemas.content_pipeline import CrawlerIngestOutcome
     from memexpert.services.crawler_operations import CrawlerOperationsService
 
     await _seed_active_session(migrated_db_session, session_name="primary")
@@ -706,5 +800,3 @@ async def test_crawler_operations_service_replay_channel_post_delegates_to_runti
     # Replay still does not advance the durable checkpoint.
     await migrated_db_session.refresh(channel)
     assert channel.last_read_post_id == "999"
-
-

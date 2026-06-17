@@ -132,6 +132,24 @@ class ContentProcessingStatus(StrEnum):
     READY = "ready"
 
 
+class IngestFileOrigin(StrEnum):
+    """Why a durable ``MemeFile`` row was created during ingest."""
+
+    NEW_MEME = "new_meme"
+    PHASH_EXACT_EXISTING_MEME = "phash_exact_existing_meme"
+    BLOCKED_PERCEPTUAL_HASH = "blocked_perceptual_hash"
+
+
+class SourceAttachReason(StrEnum):
+    """Why a source observation was attached to a meme file."""
+
+    NEW_FILE = "new_file"
+    SHA256_EXACT_EXISTING_FILE = "sha256_exact_existing_file"
+    PHASH_EXACT_NEW_FILE = "phash_exact_new_file"
+    BLOCKED_SHA256_EXISTING_FILE = "blocked_sha256_existing_file"
+    BLOCKED_PERCEPTUAL_HASH_NEW_FILE = "blocked_perceptual_hash_new_file"
+
+
 class ContentPipelineStage(StrEnum):
     """Pipeline stages recorded in the DB-backed journal."""
 
@@ -322,10 +340,12 @@ __all__ = [
     "ContentProcessingStatus",
     "ContentSourceKind",
     "EmbeddingInputType",
+    "IngestFileOrigin",
     "ModerationAction",
     "ModerationReason",
     "ModerationReportStatus",
     "SourcePlatform",
+    "SourceAttachReason",
     "SyncTargetKind",
     "SyncTargetStatus",
     "TelegramMediaFormat",

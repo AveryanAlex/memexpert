@@ -30,9 +30,11 @@ from memexpert.models.enums import (
     ContentPipelineStageStatus,
     ContentProcessingStatus,
     EmbeddingInputType,
+    IngestFileOrigin,
     ModerationAction,
     ModerationReason,
     ModerationReportStatus,
+    SourceAttachReason,
     SourcePlatform,
     SyncTargetKind,
     SyncTargetStatus,
@@ -257,7 +259,18 @@ class MemeFile(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "meme_files"
     __table_args__ = (
         UniqueConstraint("meme_id", "id", name="uq_meme_files_meme_id_id"),
+        UniqueConstraint("sha256_hex", name="uq_meme_files_sha256_hex"),
+        CheckConstraint(
+            "sha256_hex IS NULL OR sha256_hex = lower(sha256_hex)",
+            name="meme_files_sha256_hex_lowercase",
+        ),
+        CheckConstraint(
+            "sha256_hex IS NULL OR sha256_hex ~ '^[0-9a-f]{64}$'",
+            name="meme_files_sha256_hex_hex",
+        ),
         Index("ix_meme_files_meme_id_status", "meme_id", "status"),
+        Index("ix_meme_files_ingest_origin", "ingest_origin"),
+        Index("ix_meme_files_matched_meme_file_id", "matched_meme_file_id"),
         Index("ix_meme_files_perceptual_hash", "perceptual_hash"),
     )
 
@@ -277,6 +290,15 @@ class MemeFile(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     s3_original_key: Mapped[str] = mapped_column(Text, nullable=False)
     s3_web_video_key: Mapped[str | None] = mapped_column(Text, nullable=True)
     perceptual_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    sha256_hex: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    ingest_origin: Mapped[IngestFileOrigin | None] = mapped_column(
+        string_enum(IngestFileOrigin),
+        nullable=True,
+    )
+    matched_meme_file_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("meme_files.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     blocked_perceptual_hash_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("blocked_perceptual_hashes.id", ondelete="SET NULL"),
         nullable=True,
@@ -304,6 +326,12 @@ class MemeFile(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         "MemeSource",
         back_populates="file",
         cascade="all, delete-orphan",
+        foreign_keys=lambda: [MemeSource.file_id],
+    )
+    matched_meme_file: Mapped["MemeFile | None"] = relationship(
+        "MemeFile",
+        remote_side=lambda: [MemeFile.id],
+        foreign_keys=lambda: [MemeFile.matched_meme_file_id],
     )
     telegram_file_ids: Mapped[list["TelegramFileIdCache"]] = relationship(
         "TelegramFileIdCache",
@@ -552,6 +580,8 @@ class MemeSource(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __table_args__ = (
         UniqueConstraint("platform", "source_id", "post_id", name="uq_meme_sources_platform_source_post"),
         Index("ix_meme_sources_file_id_platform", "file_id", "platform"),
+        Index("ix_meme_sources_attach_reason", "attach_reason"),
+        Index("ix_meme_sources_matched_meme_file_id", "matched_meme_file_id"),
     )
 
     file_id: Mapped[uuid.UUID] = mapped_column(
@@ -579,8 +609,24 @@ class MemeSource(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # ``forward`` was absent on the underlying Telegram message.
     forwarded_from_source_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     forwarded_from_post_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    attach_reason: Mapped[SourceAttachReason | None] = mapped_column(
+        string_enum(SourceAttachReason),
+        nullable=True,
+    )
+    matched_meme_file_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("meme_files.id", ondelete="SET NULL"),
+        nullable=True,
+    )
 
-    file: Mapped["MemeFile"] = relationship("MemeFile", back_populates="sources")
+    file: Mapped["MemeFile"] = relationship(
+        "MemeFile",
+        back_populates="sources",
+        foreign_keys=[file_id],
+    )
+    matched_meme_file: Mapped["MemeFile | None"] = relationship(
+        "MemeFile",
+        foreign_keys=[matched_meme_file_id],
+    )
 
     @property
     def is_forwarded(self) -> bool:

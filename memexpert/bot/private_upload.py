@@ -16,7 +16,13 @@ from sqlalchemy import select
 from memexpert.core.config import Settings, get_settings
 from memexpert.core.database import get_async_session_factory
 from memexpert.models.content import Meme, MemeFile, MemeSource
-from memexpert.models.enums import AccountStatus, ContentKind, ContentPipelineStageStatus, SourcePlatform
+from memexpert.models.enums import (
+    AccountStatus,
+    ContentKind,
+    ContentPipelineStageStatus,
+    SourceAttachReason,
+    SourcePlatform,
+)
 from memexpert.models.user import User
 from memexpert.schemas.content_pipeline import ContentPipelineUploadMetadata, ContentPipelineUploadRead
 from memexpert.services import (
@@ -279,7 +285,11 @@ async def _save_upload_result(
         await message.answer(_pipeline_failure_message())
         return
 
-    if upload.current_status is ContentPipelineStageStatus.DUPLICATE:
+    is_exact_existing_file = upload.latest_source_attach_reason in {
+        SourceAttachReason.SHA256_EXACT_EXISTING_FILE,
+        SourceAttachReason.BLOCKED_SHA256_EXISTING_FILE,
+    }
+    if upload.current_status is ContentPipelineStageStatus.DUPLICATE or is_exact_existing_file:
         save_result = await _save_to_active_collection(collection_service, user_id=user.id, meme_id=upload.meme_id)
         if save_result == "saved" and meme.is_public:
             await message.answer(_public_duplicate_saved_message())

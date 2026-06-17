@@ -658,6 +658,12 @@ async def test_pipeline_routes_list_failed_items_and_reject_replay_guards_with_r
             {
                 "meme_id": str(item.meme_id),
                 "meme_file_id": str(item.meme_file_id),
+                "sha256_hex": detail_response.json()["sha256_hex"],
+                "ingest_origin": "new_meme",
+                "matched_meme_file_id": None,
+                "latest_source_id": detail_response.json()["latest_source_id"],
+                "latest_source_attach_reason": "new_file",
+                "latest_source_matched_meme_file_id": None,
                 "current_stage": "transcode",
                 "current_status": "failed",
                 "original_object_key": item.original_object_key,
@@ -706,7 +712,7 @@ async def _seed_detail_item(
         ),
         filename=f"{phash_tag}.png",
         content_type="image/png",
-        media_bytes=build_png_bytes(color=(255, 0, 0)),
+        media_bytes=f"detail-route-bytes:{source_id}:{post_id}:{phash_tag}".encode(),
     )
     return upload.meme_file_id
 

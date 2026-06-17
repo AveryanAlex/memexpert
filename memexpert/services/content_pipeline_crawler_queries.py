@@ -24,7 +24,7 @@ from memexpert.services.errors import CrawlerChannelNotTrackedError
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
-    from memexpert.models.enums import SourcePlatform
+    from memexpert.models.enums import SourceAttachReason, SourcePlatform
     from memexpert.schemas.content_pipeline import RawCrawlerPost
 
 
@@ -78,16 +78,17 @@ async def find_existing_crawler_source_row(
     return result.scalar_one_or_none()
 
 
-async def meme_file_has_first_source(
+async def meme_has_first_source(
     session: AsyncSession,
-    meme_file_id: uuid.UUID,
+    meme_id: uuid.UUID,
 ) -> bool:
-    """Return ``True`` iff some ``MemeSource`` row already claims first-source."""
+    """Return ``True`` iff any source row on a meme already claims first-source."""
 
     result = await session.execute(
         select(MemeSource.id)
+        .join(MemeFile, MemeFile.id == MemeSource.file_id)
         .where(
-            MemeSource.file_id == meme_file_id,
+            MemeFile.meme_id == meme_id,
             MemeSource.is_first_source.is_(True),
         )
         .limit(1)
@@ -120,13 +121,15 @@ def attach_crawler_source_row_to_meme_file(
     meme_file: MemeFile,
     raw_post: RawCrawlerPost,
     is_first_source: bool,
+    attach_reason: SourceAttachReason,
+    matched_meme_file_id: uuid.UUID | None = None,
 ) -> MemeSource:
-    """Add a new ``MemeSource`` row to an existing meme file on pHash dedup.
+    """Add a new ``MemeSource`` row to an existing file on SHA256 match.
 
-    The existing meme + meme_file + pipeline stage journal state is
-    intentionally untouched — dedupe reuses the durable state already in
-    place. The new row carries the repost's ``published_at``, its
-    forward-chain attribution, and its own ``is_first_source`` flag.
+    SHA256 identity means the crawler saw the same physical file, so no new
+    ``MemeFile`` or pipeline work is created. The new row carries the repost's
+    ``published_at``, its forward-chain attribution, and its own
+    ``is_first_source`` flag.
     """
 
     new_source_row = MemeSource(
@@ -141,6 +144,8 @@ def attach_crawler_source_row_to_meme_file(
         published_at=raw_post.published_at,
         forwarded_from_source_id=raw_post.forward.source_id if raw_post.forward is not None else None,
         forwarded_from_post_id=raw_post.forward.post_id if raw_post.forward is not None else None,
+        attach_reason=attach_reason,
+        matched_meme_file_id=matched_meme_file_id,
     )
     session.add(new_source_row)
     return new_source_row
@@ -151,5 +156,5 @@ __all__ = [
     "attach_crawler_source_row_to_meme_file",
     "find_existing_crawler_source_row",
     "get_tracked_source_channel",
-    "meme_file_has_first_source",
+    "meme_has_first_source",
 ]

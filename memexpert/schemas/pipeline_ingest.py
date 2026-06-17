@@ -18,7 +18,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
-from memexpert.models.enums import SourcePlatform
+from memexpert.models.enums import SourceAttachReason, SourcePlatform
 from memexpert.schemas.pipeline_base import (
     MAX_POST_ID_LENGTH,
     MAX_SOURCE_ID_LENGTH,
@@ -184,8 +184,9 @@ class CrawlerIngestOutcome(StrEnum):
     """
 
     INGESTED = "ingested"
-    DEDUPLICATED_EXACT = "deduplicated_exact"
-    DEDUPLICATED_SIMILAR = "deduplicated_similar"
+    SHA256_EXACT_EXISTING_FILE = "sha256_exact_existing_file"
+    BLOCKED_SHA256_EXISTING_FILE = "blocked_sha256_existing_file"
+    PHASH_EXACT_NEW_FILE = "phash_exact_new_file"
     BLOCKED_PERCEPTUAL_HASH = "blocked_perceptual_hash"
     SKIPPED_UNSUPPORTED_MEDIA = "skipped_unsupported_media"
     SKIPPED_PAUSED_CHANNEL = "skipped_paused_channel"
@@ -196,11 +197,11 @@ class CrawlerIngestOutcome(StrEnum):
 class CrawlerIngestResult(BaseModel):
     """Typed result returned by the crawler ingest entrypoint.
 
-    ``meme_file_id`` and ``meme_source_id`` are ``None`` only for
-    early-exit outcomes that do not touch the DB
-    (``SKIPPED_UNSUPPORTED_MEDIA``). ``duplicate_of_meme_id`` is populated
-    for the two ``DEDUPLICATED_*`` outcomes so operators can see which
-    existing meme absorbed the repost without a second lookup.
+    ``meme_file_id`` and ``meme_source_id`` are ``None`` for early-exit
+    outcomes that do not bind to a source row. ``duplicate_of_meme_id`` and
+    ``matched_meme_file_id`` are populated for SHA256 existing-file outcomes
+    and ``PHASH_EXACT_NEW_FILE`` so operators can see which existing meme/file
+    matched without a second lookup.
     ``published_at`` mirrors :class:`RawCrawlerPost.published_at` when the
     post was actually consumed, and ``received_at`` is the service-side
     clock for the ingest attempt (used by T04's freshness SLO harness).
@@ -212,6 +213,9 @@ class CrawlerIngestResult(BaseModel):
     meme_source_id: uuid.UUID | None = None
     outcome: CrawlerIngestOutcome
     duplicate_of_meme_id: uuid.UUID | None = None
+    matched_meme_file_id: uuid.UUID | None = None
+    source_attach_reason: SourceAttachReason | None = None
+    sha256_hex: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     published_at: datetime | None = None
     received_at: datetime
 
