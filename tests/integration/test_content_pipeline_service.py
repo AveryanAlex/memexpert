@@ -409,6 +409,25 @@ async def _seed_blocked_perceptual_hash(
     return blocked_hash
 
 
+def _force_initial_sha256_lookup_miss(
+    monkeypatch: MonkeyPatch,
+    service: ContentPipelineService,
+) -> None:
+    """Make a raced ingest miss the optimistic SHA precheck once."""
+
+    original_find_sha256_match = service._find_sha256_match
+    lookup_count = 0
+
+    async def first_miss_then_real_lookup(sha256_hex: str) -> MemeFile | None:
+        nonlocal lookup_count
+        lookup_count += 1
+        if lookup_count == 1:
+            return None
+        return await original_find_sha256_match(sha256_hex)
+
+    monkeypatch.setattr(service, "_find_sha256_match", first_miss_then_real_lookup)
+
+
 async def test_create_upload_persists_before_publish_and_exposes_pending_downstream_state(
     migrated_db_session: AsyncSession,
     postgres_session_factory: async_sessionmaker[AsyncSession],
@@ -530,6 +549,79 @@ async def test_create_upload_sha_duplicate_attaches_source_without_media_or_s3_o
     assert [source.source_id for source in sources] == ["sha-first-source", "sha-second-source"]
     assert sources[1].file_id == first_item.meme_file_id
     assert sources[1].attach_reason is SourceAttachReason.SHA256_EXACT_EXISTING_FILE
+
+
+async def test_create_upload_sha_duplicate_race_after_s3_cleans_up_and_returns_duplicate(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    media_bytes = b"manual-sha-race-same-bytes"
+    first_storage = FakeStorageClient()
+    first_publisher = RecordingPublisher()
+    first_service = ContentPipelineService(
+        migrated_db_session,
+        storage_client=first_storage,
+        publisher=first_publisher,
+        media_processor=FakeMediaProcessor(inspect_result=_make_distinct_upload_media_details(tag="a")),
+    )
+    first_item = await first_service.create_upload(
+        metadata=ContentPipelineUploadMetadata(
+            source_platform=SourcePlatform.TELEGRAM,
+            source_id="sha-race-manual-first",
+            post_id="1",
+            views=11,
+        ),
+        filename="sha-race-first.png",
+        content_type="image/png",
+        media_bytes=media_bytes,
+    )
+
+    raced_storage = FakeStorageClient()
+    raced_publisher = RecordingPublisher()
+    raced_service = ContentPipelineService(
+        migrated_db_session,
+        storage_client=raced_storage,
+        publisher=raced_publisher,
+        media_processor=FakeMediaProcessor(inspect_result=_make_distinct_upload_media_details(tag="b")),
+    )
+    _force_initial_sha256_lookup_miss(monkeypatch, raced_service)
+
+    raced_item = await raced_service.create_upload(
+        metadata=ContentPipelineUploadMetadata(
+            source_platform=SourcePlatform.TELEGRAM,
+            source_id="sha-race-manual-second",
+            post_id="2",
+            views=22,
+        ),
+        filename="sha-race-second.png",
+        content_type="image/png",
+        media_bytes=media_bytes,
+    )
+
+    assert raced_item.meme_file_id == first_item.meme_file_id
+    assert raced_item.meme_id == first_item.meme_id
+    assert raced_item.sha256_hex == hashlib.sha256(media_bytes).hexdigest()
+    assert raced_item.latest_source_attach_reason is SourceAttachReason.SHA256_EXACT_EXISTING_FILE
+    assert raced_item.latest_source_matched_meme_file_id == first_item.meme_file_id
+    assert len(first_publisher.events) == 1
+    assert raced_publisher.events == []
+    assert len(raced_storage.put_calls) == 1
+    assert len(raced_storage.delete_calls) == 1
+    assert raced_storage.delete_calls[0]["Bucket"] == raced_storage.put_calls[0]["Bucket"]
+    assert raced_storage.delete_calls[0]["Key"] == raced_storage.put_calls[0]["Key"]
+
+    async with postgres_session_factory() as session:
+        file_count = await session.scalar(select(func.count()).select_from(MemeFile))
+        sources = (
+            await session.execute(select(MemeSource).order_by(MemeSource.source_id.asc()))
+        ).scalars().all()
+
+    assert file_count == 1
+    assert [source.source_id for source in sources] == ["sha-race-manual-first", "sha-race-manual-second"]
+    assert sources[1].file_id == first_item.meme_file_id
+    assert sources[1].attach_reason is SourceAttachReason.SHA256_EXACT_EXISTING_FILE
+    assert sources[1].matched_meme_file_id == first_item.meme_file_id
 
 
 async def test_create_upload_quarantines_active_blocked_phash_before_s3_and_dispatch(
@@ -662,6 +754,82 @@ async def test_create_upload_sha_duplicate_of_blocked_file_preserves_source_with
 
     assert file_count == 1
     assert [source.source_id for source in sources] == ["blocked-sha-first", "blocked-sha-second"]
+    assert sources[1].attach_reason is SourceAttachReason.BLOCKED_SHA256_EXISTING_FILE
+    assert sources[1].matched_meme_file_id == blocked_item.meme_file_id
+
+
+async def test_create_upload_blocked_sha_duplicate_race_attaches_without_s3_or_dispatch(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    _ = await _seed_blocked_perceptual_hash(
+        migrated_db_session,
+        perceptual_hash="4444444444444444",
+        max_hamming_distance=0,
+    )
+    media_bytes = b"blocked-manual-sha-race-bytes"
+    first_storage = FakeStorageClient()
+    first_publisher = RecordingPublisher()
+    first_service = ContentPipelineService(
+        migrated_db_session,
+        storage_client=first_storage,
+        publisher=first_publisher,
+        media_processor=FakeMediaProcessor(inspect_result=_make_distinct_upload_media_details(tag="4")),
+    )
+    blocked_item = await first_service.create_upload(
+        metadata=ContentPipelineUploadMetadata(
+            source_platform=SourcePlatform.TELEGRAM,
+            source_id="blocked-race-first",
+            post_id="1",
+        ),
+        filename="blocked-race-first.png",
+        content_type="image/png",
+        media_bytes=media_bytes,
+    )
+    assert blocked_item.current_status is ContentPipelineStageStatus.FAILED
+    assert blocked_item.latest_source_attach_reason is SourceAttachReason.BLOCKED_PERCEPTUAL_HASH_NEW_FILE
+    assert first_storage.put_calls == []
+    assert first_publisher.events == []
+
+    raced_storage = FakeStorageClient()
+    raced_publisher = RecordingPublisher()
+    raced_service = ContentPipelineService(
+        migrated_db_session,
+        storage_client=raced_storage,
+        publisher=raced_publisher,
+        media_processor=FakeMediaProcessor(inspect_result=_make_distinct_upload_media_details(tag="4")),
+    )
+    _force_initial_sha256_lookup_miss(monkeypatch, raced_service)
+
+    raced_item = await raced_service.create_upload(
+        metadata=ContentPipelineUploadMetadata(
+            source_platform=SourcePlatform.TELEGRAM,
+            source_id="blocked-race-second",
+            post_id="2",
+        ),
+        filename="blocked-race-second.png",
+        content_type="image/png",
+        media_bytes=media_bytes,
+    )
+
+    assert raced_item.meme_file_id == blocked_item.meme_file_id
+    assert raced_item.current_status is ContentPipelineStageStatus.FAILED
+    assert raced_item.latest_source_attach_reason is SourceAttachReason.BLOCKED_SHA256_EXISTING_FILE
+    assert raced_item.latest_source_matched_meme_file_id == blocked_item.meme_file_id
+    assert raced_storage.put_calls == []
+    assert raced_storage.delete_calls == []
+    assert raced_publisher.events == []
+
+    async with postgres_session_factory() as session:
+        file_count = await session.scalar(select(func.count()).select_from(MemeFile))
+        sources = (
+            await session.execute(select(MemeSource).order_by(MemeSource.source_id.asc()))
+        ).scalars().all()
+
+    assert file_count == 1
+    assert [source.source_id for source in sources] == ["blocked-race-first", "blocked-race-second"]
+    assert sources[1].file_id == blocked_item.meme_file_id
     assert sources[1].attach_reason is SourceAttachReason.BLOCKED_SHA256_EXISTING_FILE
     assert sources[1].matched_meme_file_id == blocked_item.meme_file_id
 
@@ -3143,6 +3311,103 @@ async def test_create_crawler_ingest_blocked_sha_duplicate_is_explicit_without_d
     assert sources[1].attach_reason is SourceAttachReason.BLOCKED_SHA256_EXISTING_FILE
 
 
+async def test_create_crawler_ingest_blocked_sha_duplicate_race_attaches_without_s3_or_dispatch(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    primary_channel = await _seed_tracked_telegram_channel(
+        migrated_db_session,
+        platform_id="blocked_sha_race_primary",
+        title="Blocked SHA Race Primary",
+    )
+    secondary_channel = await _seed_tracked_telegram_channel(
+        migrated_db_session,
+        platform_id="blocked_sha_race_secondary",
+        title="Blocked SHA Race Secondary",
+    )
+    primary_channel_id = primary_channel.id
+    secondary_channel_id = secondary_channel.id
+    _ = await _seed_blocked_perceptual_hash(
+        migrated_db_session,
+        perceptual_hash="ffffffffffffffff",
+        max_hamming_distance=0,
+    )
+    media_bytes = b"blocked-crawler-sha-race"
+
+    first_storage = FakeStorageClient()
+    first_publisher = RecordingPublisher()
+    first_service = ContentPipelineService(
+        migrated_db_session,
+        storage_client=first_storage,
+        publisher=first_publisher,
+        media_processor=FakeMediaProcessor(inspect_result=_make_distinct_upload_media_details(tag="f")),
+    )
+    first = await first_service.create_crawler_ingest(
+        _build_raw_telegram_post(
+            source_id="blocked_sha_race_primary",
+            post_id="1",
+            media_bytes=media_bytes,
+        )
+    )
+    assert first.outcome is CrawlerIngestOutcome.BLOCKED_PERCEPTUAL_HASH
+    assert first_storage.put_calls == []
+    assert first_publisher.events == []
+
+    raced_storage = FakeStorageClient()
+    raced_publisher = RecordingPublisher()
+    raced_service = ContentPipelineService(
+        migrated_db_session,
+        storage_client=raced_storage,
+        publisher=raced_publisher,
+        media_processor=FakeMediaProcessor(inspect_result=_make_distinct_upload_media_details(tag="f")),
+    )
+    _force_initial_sha256_lookup_miss(monkeypatch, raced_service)
+
+    raced = await raced_service.create_crawler_ingest(
+        _build_raw_telegram_post(
+            source_id="blocked_sha_race_secondary",
+            post_id="2",
+            media_bytes=media_bytes,
+            views=17,
+        )
+    )
+
+    assert raced.outcome is CrawlerIngestOutcome.BLOCKED_SHA256_EXISTING_FILE
+    assert raced.meme_file_id == first.meme_file_id
+    assert raced.matched_meme_file_id == first.meme_file_id
+    assert raced.source_attach_reason is SourceAttachReason.BLOCKED_SHA256_EXISTING_FILE
+    assert raced.sha256_hex == hashlib.sha256(media_bytes).hexdigest()
+    assert raced_storage.put_calls == []
+    assert raced_storage.delete_calls == []
+    assert raced_publisher.events == []
+
+    async with postgres_session_factory() as session:
+        file_count = await session.scalar(select(func.count()).select_from(MemeFile))
+        sources = (
+            await session.execute(select(MemeSource).order_by(MemeSource.source_id.asc()))
+        ).scalars().all()
+        persisted_primary_channel = await session.scalar(
+            select(SourceChannel).where(SourceChannel.id == primary_channel_id)
+        )
+        persisted_secondary_channel = await session.scalar(
+            select(SourceChannel).where(SourceChannel.id == secondary_channel_id)
+        )
+
+    assert file_count == 1
+    assert [source.source_id for source in sources] == [
+        "blocked_sha_race_primary",
+        "blocked_sha_race_secondary",
+    ]
+    assert sources[1].file_id == first.meme_file_id
+    assert sources[1].attach_reason is SourceAttachReason.BLOCKED_SHA256_EXISTING_FILE
+    assert sources[1].matched_meme_file_id == first.meme_file_id
+    assert persisted_primary_channel is not None
+    assert persisted_primary_channel.last_read_post_id == "1"
+    assert persisted_secondary_channel is not None
+    assert persisted_secondary_channel.last_read_post_id == "2"
+
+
 async def test_create_crawler_ingest_skips_unsupported_media_without_side_effects(
     migrated_db_session: AsyncSession,
     postgres_session_factory: async_sessionmaker[AsyncSession],
@@ -3364,6 +3629,89 @@ async def test_create_crawler_ingest_sha_duplicate_attaches_source_to_existing_f
 
     assert file_count == 1
     assert [source.source_id for source in sources] == ["sha_primary", "sha_secondary"]
+    assert sources[1].file_id == first.meme_file_id
+    assert sources[1].attach_reason is SourceAttachReason.SHA256_EXACT_EXISTING_FILE
+    assert sources[1].matched_meme_file_id == first.meme_file_id
+
+
+async def test_create_crawler_ingest_sha_duplicate_race_after_s3_cleans_up_and_returns_duplicate(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: MonkeyPatch,
+) -> None:
+    await _seed_tracked_telegram_channel(
+        migrated_db_session,
+        platform_id="sha_race_crawler_primary",
+        title="SHA Race Crawler Primary",
+    )
+    await _seed_tracked_telegram_channel(
+        migrated_db_session,
+        platform_id="sha_race_crawler_secondary",
+        title="SHA Race Crawler Secondary",
+    )
+    media_bytes = b"crawler-sha-race-same-bytes"
+    first_storage = FakeStorageClient()
+    first_publisher = RecordingPublisher()
+    first_service = ContentPipelineService(
+        migrated_db_session,
+        storage_client=first_storage,
+        publisher=first_publisher,
+        media_processor=FakeMediaProcessor(inspect_result=_make_distinct_upload_media_details(tag="c")),
+    )
+    first = await first_service.create_crawler_ingest(
+        _build_raw_telegram_post(
+            source_id="sha_race_crawler_primary",
+            post_id="1",
+            media_bytes=media_bytes,
+        )
+    )
+    assert first.outcome is CrawlerIngestOutcome.INGESTED
+
+    raced_storage = FakeStorageClient()
+    raced_publisher = RecordingPublisher()
+    raced_service = ContentPipelineService(
+        migrated_db_session,
+        storage_client=raced_storage,
+        publisher=raced_publisher,
+        media_processor=FakeMediaProcessor(inspect_result=_make_distinct_upload_media_details(tag="d")),
+    )
+    _force_initial_sha256_lookup_miss(monkeypatch, raced_service)
+
+    raced = await raced_service.create_crawler_ingest(
+        _build_raw_telegram_post(
+            source_id="sha_race_crawler_secondary",
+            post_id="2",
+            media_bytes=media_bytes,
+            views=13,
+        )
+    )
+
+    assert raced.outcome is CrawlerIngestOutcome.SHA256_EXACT_EXISTING_FILE
+    assert raced.meme_file_id == first.meme_file_id
+    assert raced.matched_meme_file_id == first.meme_file_id
+    assert raced.source_attach_reason is SourceAttachReason.SHA256_EXACT_EXISTING_FILE
+    assert raced.sha256_hex == hashlib.sha256(media_bytes).hexdigest()
+    assert len(first_publisher.events) == 1
+    assert raced_publisher.events == []
+    assert len(raced_storage.put_calls) == 1
+    assert len(raced_storage.delete_calls) == 1
+    assert raced_storage.delete_calls[0]["Bucket"] == raced_storage.put_calls[0]["Bucket"]
+    assert raced_storage.delete_calls[0]["Key"] == raced_storage.put_calls[0]["Key"]
+
+    async with postgres_session_factory() as session:
+        first_file = await session.scalar(select(MemeFile).where(MemeFile.id == first.meme_file_id))
+        file_count = await session.scalar(select(func.count()).select_from(MemeFile))
+        sources = (
+            await session.execute(select(MemeSource).order_by(MemeSource.source_id.asc()))
+        ).scalars().all()
+
+    assert first_file is not None
+    assert raced.duplicate_of_meme_id == first_file.meme_id
+    assert file_count == 1
+    assert [source.source_id for source in sources] == [
+        "sha_race_crawler_primary",
+        "sha_race_crawler_secondary",
+    ]
     assert sources[1].file_id == first.meme_file_id
     assert sources[1].attach_reason is SourceAttachReason.SHA256_EXACT_EXISTING_FILE
     assert sources[1].matched_meme_file_id == first.meme_file_id

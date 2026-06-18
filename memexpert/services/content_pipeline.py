@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Protocol, Self, cast
 
 from sqlalchemy import select
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import selectinload
 
 from memexpert.core.broker import ensure_pipeline_broker_started, get_pipeline_broker_settings
@@ -119,6 +119,13 @@ from memexpert.services.errors import (
     PipelineSourceConflictError,
     PipelineStorageError,
 )
+
+_POSTGRES_UNIQUE_VIOLATION_SQLSTATE = "23505"
+_SHA256_UNIQUE_CONSTRAINT_NAME = "uq_meme_files_sha256_hex"
+
+
+class _Sha256UniqueRaceDetected(Exception):
+    """Internal marker for a raced SHA insert after the optimistic precheck missed."""
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -286,6 +293,17 @@ class ContentPipelineService:
                 metadata=metadata,
                 prepared_upload=prepared_upload,
             )
+        except _Sha256UniqueRaceDetected:
+            await self._cleanup_uploaded_object(prepared_upload.object_key)
+            item = await self._recover_sha_duplicate_upload_race(
+                metadata=metadata,
+                sha256_hex=prepared_upload.sha256_hex,
+                missing_winner_message=self._missing_sha_duplicate_race_winner_message(
+                    sha256_hex=prepared_upload.sha256_hex,
+                    source_kind="Manual upload",
+                ),
+            )
+            return ContentPipelineUploadRead.model_validate(item.model_dump(mode="python"))
         except Exception:
             await self._cleanup_uploaded_object(prepared_upload.object_key)
             raise
@@ -417,6 +435,17 @@ class ContentPipelineService:
                 prepared_upload=prepared_upload,
                 channel=channel,
                 received_at=received_at,
+            )
+        except _Sha256UniqueRaceDetected:
+            await self._cleanup_uploaded_object(prepared_upload.object_key)
+            return await self._recover_sha_duplicate_crawler_ingest_race(
+                raw_post=raw_post,
+                sha256_hex=prepared_upload.sha256_hex,
+                received_at=received_at,
+                missing_winner_message=self._missing_sha_duplicate_race_winner_message(
+                    sha256_hex=prepared_upload.sha256_hex,
+                    source_kind="Crawler ingest",
+                ),
             )
         except Exception:
             await self._cleanup_uploaded_object(prepared_upload.object_key)
@@ -1757,6 +1786,55 @@ class ContentPipelineService:
             received_at=received_at,
         )
 
+    async def _recover_sha_duplicate_upload_race(
+        self,
+        *,
+        metadata: ContentPipelineUploadMetadata,
+        sha256_hex: str,
+        missing_winner_message: str,
+    ) -> ContentPipelineItemRead:
+        duplicate_item = await self._try_persist_sha_duplicate_upload(
+            metadata=metadata,
+            sha256_hex=sha256_hex,
+        )
+        if duplicate_item is None:
+            raise PipelineIngestError(missing_winner_message)
+        return duplicate_item
+
+    async def _recover_sha_duplicate_crawler_ingest_race(
+        self,
+        *,
+        raw_post: RawCrawlerPost,
+        sha256_hex: str,
+        received_at: datetime,
+        missing_winner_message: str,
+    ) -> CrawlerIngestResult:
+        channel = await get_tracked_source_channel(
+            self._session,
+            platform=raw_post.platform,
+            source_id=raw_post.source_id,
+        )
+        duplicate_result = await self._try_persist_sha_duplicate_crawler_ingest(
+            raw_post=raw_post,
+            sha256_hex=sha256_hex,
+            channel=channel,
+            received_at=received_at,
+        )
+        if duplicate_result is None:
+            raise PipelineIngestError(missing_winner_message)
+        return duplicate_result
+
+    @staticmethod
+    def _missing_sha_duplicate_race_winner_message(
+        *,
+        sha256_hex: str,
+        source_kind: str,
+    ) -> str:
+        return (
+            f"{source_kind} hit the SHA256 unique constraint, but no winning MemeFile row "
+            f"was found for sha256_hex={sha256_hex} after rollback."
+        )
+
     async def _persist_upload(
         self,
         *,
@@ -1806,6 +1884,11 @@ class ContentPipelineService:
         except (PipelinePayloadValidationError, PipelineSourceConflictError):
             await self._session.rollback()
             raise
+        except IntegrityError as exc:
+            await self._session.rollback()
+            if self._is_sha256_unique_constraint_error(exc):
+                raise _Sha256UniqueRaceDetected from exc
+            raise PipelineIngestError("Failed to persist the upload and journal state.") from exc
         except SQLAlchemyError as exc:
             await self._session.rollback()
             raise PipelineIngestError("Failed to persist the upload and journal state.") from exc
@@ -1893,6 +1976,13 @@ class ContentPipelineService:
         except PipelinePayloadValidationError:
             await self._session.rollback()
             raise
+        except IntegrityError as exc:
+            await self._session.rollback()
+            if self._is_sha256_unique_constraint_error(exc):
+                raise _Sha256UniqueRaceDetected from exc
+            raise PipelineIngestError(
+                "Failed to persist the crawler ingest and journal state.",
+            ) from exc
         except SQLAlchemyError as exc:
             await self._session.rollback()
             raise PipelineIngestError(
@@ -1940,6 +2030,18 @@ class ContentPipelineService:
         except (PipelinePayloadValidationError, PipelineSourceConflictError):
             await self._session.rollback()
             raise
+        except IntegrityError as exc:
+            await self._session.rollback()
+            if not self._is_sha256_unique_constraint_error(exc):
+                raise PipelineIngestError("Failed to persist blocked upload quarantine state.") from exc
+            return await self._recover_sha_duplicate_upload_race(
+                metadata=metadata,
+                sha256_hex=prepared_upload.sha256_hex,
+                missing_winner_message=self._missing_sha_duplicate_race_winner_message(
+                    sha256_hex=prepared_upload.sha256_hex,
+                    source_kind="Blocked upload",
+                ),
+            )
         except SQLAlchemyError as exc:
             await self._session.rollback()
             raise PipelineIngestError("Failed to persist blocked upload quarantine state.") from exc
@@ -1971,6 +2073,19 @@ class ContentPipelineService:
                 fetched_at=received_at,
             )
             await self._session.commit()
+        except IntegrityError as exc:
+            await self._session.rollback()
+            if not self._is_sha256_unique_constraint_error(exc):
+                raise PipelineIngestError("Failed to persist blocked crawler quarantine state.") from exc
+            return await self._recover_sha_duplicate_crawler_ingest_race(
+                raw_post=raw_post,
+                sha256_hex=prepared_upload.sha256_hex,
+                received_at=received_at,
+                missing_winner_message=self._missing_sha_duplicate_race_winner_message(
+                    sha256_hex=prepared_upload.sha256_hex,
+                    source_kind="Blocked crawler ingest",
+                ),
+            )
         except SQLAlchemyError as exc:
             await self._session.rollback()
             raise PipelineIngestError("Failed to persist blocked crawler quarantine state.") from exc
@@ -2452,6 +2567,35 @@ class ContentPipelineService:
             .limit(1)
         )
         return result.scalar_one_or_none()
+
+    @staticmethod
+    def _is_sha256_unique_constraint_error(exc: IntegrityError) -> bool:
+        candidates = (
+            exc,
+            exc.orig,
+            getattr(exc.orig, "__cause__", None),
+            getattr(exc.orig, "__context__", None),
+        )
+        has_sha256_constraint = False
+        saw_sqlstate = False
+        sqlstate_is_unique_violation = False
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            sqlstate = getattr(candidate, "sqlstate", None) or getattr(candidate, "pgcode", None)
+            if sqlstate is not None:
+                saw_sqlstate = True
+                sqlstate_is_unique_violation = sqlstate_is_unique_violation or (
+                    sqlstate == _POSTGRES_UNIQUE_VIOLATION_SQLSTATE
+                )
+            if getattr(candidate, "constraint_name", None) == _SHA256_UNIQUE_CONSTRAINT_NAME:
+                has_sha256_constraint = True
+            diag = getattr(candidate, "diag", None)
+            if getattr(diag, "constraint_name", None) == _SHA256_UNIQUE_CONSTRAINT_NAME:
+                has_sha256_constraint = True
+            if _SHA256_UNIQUE_CONSTRAINT_NAME in str(candidate):
+                has_sha256_constraint = True
+        return has_sha256_constraint and (not saw_sqlstate or sqlstate_is_unique_violation)
 
     @staticmethod
     def _sha_match_attach_reason(matched_file: MemeFile) -> SourceAttachReason:
