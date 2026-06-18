@@ -94,6 +94,7 @@ async def search_memes(
         ),
         limit=limit,
         offset=offset,
+        surface="public_api_search",
     )
     await analytics_service.record_event(
         AnalyticsEventType.SEARCH_QUERY,
@@ -143,6 +144,7 @@ async def browse_memes(
         ),
         limit=limit,
         offset=offset,
+        surface="public_api_browse",
     )
     return page
 
@@ -184,6 +186,7 @@ async def trending_memes(
         tags=tuple(tag.strip() for tag in tags or () if tag.strip()),
         limit=limit,
         offset=offset,
+        surface="public_api_trending",
     )
     return _trend_page_to_search_page(page)
 
@@ -210,6 +213,7 @@ async def trend_rankings(
         tags=tuple(tag.strip() for tag in tags or () if tag.strip()),
         limit=limit,
         offset=offset,
+        surface="public_api_trends",
     )
 
 
@@ -504,6 +508,7 @@ async def browse_tag_landing(
         include_nsfw=_nsfw_allowed(current_user, include_nsfw),
         limit=limit,
         offset=offset,
+        surface="public_api_tag_landing",
     )
     return PublicMemeLandingRead(
         kind="tag",
@@ -533,6 +538,7 @@ async def browse_template_landing(
         include_nsfw=_nsfw_allowed(current_user, include_nsfw),
         limit=limit,
         offset=offset,
+        surface="public_api_template_landing",
     )
     if template is None:
         raise HTTPException(
@@ -655,11 +661,12 @@ def _normalized_collection_id_strings(collection_ids: list[uuid.UUID] | None) ->
 
 def _trend_page_to_search_page(page: PublicMemeTrendPageRead) -> PublicMemeSearchPageRead:
     return PublicMemeSearchPageRead(
-        items=[PublicMemeSearchResultRead(meme=item.meme) for item in page.items],
+        items=[PublicMemeSearchResultRead(meme=item.meme, attribution=item.attribution) for item in page.items],
         limit=page.limit,
         offset=page.offset,
         total=page.total,
         has_more=page.has_more,
+        request_id=page.request_id,
     )
 
 
