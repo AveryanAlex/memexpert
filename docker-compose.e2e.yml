@@ -1,9 +1,9 @@
-x-api-image: &api-image
-  image: ${MEMEXPERT_API_IMAGE:-memexpert-api:e2e}
+x-main-image: &main-image
+  image: ${MEMEXPERT_MAIN_IMAGE:-memexpert-main:e2e}
   build:
     context: .
     dockerfile: Dockerfile
-    target: api
+    target: main
 
 x-worker-image: &worker-image
   image: ${MEMEXPERT_WORKER_IMAGE:-memexpert-worker:e2e}
@@ -171,7 +171,7 @@ services:
       start_period: 10s
 
   migrate:
-    <<: *api-image
+    <<: *main-image
     restart: "no"
     command: ["alembic", "upgrade", "head"]
     environment: *app-env
@@ -194,7 +194,7 @@ services:
       disable: true
 
   api:
-    <<: *api-image
+    <<: *main-image
     environment: *app-env
     depends_on:
       migrate:
@@ -226,7 +226,7 @@ services:
         condition: service_healthy
 
   seed:
-    <<: *api-image
+    <<: *main-image
     restart: "no"
     command:
       [

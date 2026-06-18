@@ -28,8 +28,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 app \
     && useradd --system --uid 10001 --gid app --home-dir /app --shell /usr/sbin/nologin app \
-    && mkdir -p /app/.cache /app/.paddleocr /app/.paddlex /app/.telegram-sessions \
-    && chown app:app /app/.cache /app/.paddleocr /app/.paddlex /app/.telegram-sessions
+    && mkdir -p /app/.cache /app/.telegram-sessions \
+    && chown app:app /app/.cache /app/.telegram-sessions
 
 COPY pyproject.toml uv.lock ./
 
@@ -38,25 +38,42 @@ RUN --mount=from=uv,source=/uv,target=/usr/local/bin/uv \
     uv sync --locked --no-default-groups --no-install-project
 
 
-FROM runtime-base AS api-deps
+FROM runtime-base AS main-app
 
+COPY memexpert/ ./memexpert/
+COPY scripts/ ./scripts/
+COPY alembic.ini ./
+COPY alembic/ ./alembic/
 RUN --mount=from=uv,source=/uv,target=/usr/local/bin/uv \
     --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked --no-default-groups --group api --no-install-project
+    uv sync --locked --no-default-groups --no-editable
 
 
-FROM runtime-base AS bot-deps
+FROM main-app AS main
 
-RUN --mount=from=uv,source=/uv,target=/usr/local/bin/uv \
-    --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked --no-default-groups --group bot --no-install-project
+USER app
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:8000/health || exit 1
+
+CMD ["memexpert-api"]
 
 
-FROM runtime-base AS scheduler-deps
+FROM main AS api
 
-RUN --mount=from=uv,source=/uv,target=/usr/local/bin/uv \
-    --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked --no-default-groups --group scheduler --no-install-project
+CMD ["memexpert-api"]
+
+
+FROM main AS bot
+
+CMD ["memexpert-bot"]
+
+
+FROM main AS scheduler
+
+CMD ["memexpert-scheduler"]
 
 
 FROM runtime-base AS worker-system
@@ -69,7 +86,9 @@ RUN apt-get update \
         libgl1 \
         libglib2.0-0 \
         libgomp1 \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /app/.paddleocr /app/.paddlex \
+    && chown app:app /app/.paddleocr /app/.paddlex
 
 COPY docker/paddleocr-requirements.txt ./docker/paddleocr-requirements.txt
 
@@ -86,39 +105,6 @@ RUN --mount=from=uv,source=/uv,target=/usr/local/bin/uv \
     uv sync --locked --no-default-groups --group worker --no-install-project
 
 
-FROM api-deps AS api-app
-
-COPY memexpert/ ./memexpert/
-COPY scripts/ ./scripts/
-COPY alembic.ini ./
-COPY alembic/ ./alembic/
-RUN --mount=from=uv,source=/uv,target=/usr/local/bin/uv \
-    --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked --no-default-groups --group api --no-editable
-
-
-FROM bot-deps AS bot-app
-
-COPY memexpert/ ./memexpert/
-COPY scripts/ ./scripts/
-COPY alembic.ini ./
-COPY alembic/ ./alembic/
-RUN --mount=from=uv,source=/uv,target=/usr/local/bin/uv \
-    --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked --no-default-groups --group bot --no-editable
-
-
-FROM scheduler-deps AS scheduler-app
-
-COPY memexpert/ ./memexpert/
-COPY scripts/ ./scripts/
-COPY alembic.ini ./
-COPY alembic/ ./alembic/
-RUN --mount=from=uv,source=/uv,target=/usr/local/bin/uv \
-    --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked --no-default-groups --group scheduler --no-editable
-
-
 FROM worker-deps AS worker-app
 
 COPY memexpert/ ./memexpert/
@@ -128,32 +114,6 @@ COPY alembic/ ./alembic/
 RUN --mount=from=uv,source=/uv,target=/usr/local/bin/uv \
     --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-default-groups --group worker --no-editable
-
-
-FROM api-app AS api
-
-USER app
-
-EXPOSE 8000
-
-HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:8000/health || exit 1
-
-CMD ["memexpert-api"]
-
-
-FROM bot-app AS bot
-
-USER app
-
-CMD ["memexpert-bot"]
-
-
-FROM scheduler-app AS scheduler
-
-USER app
-
-CMD ["memexpert-scheduler"]
 
 
 FROM worker-app AS worker
@@ -167,4 +127,4 @@ USER app
 CMD ["memexpert-workers"]
 
 
-FROM api AS runtime
+FROM main AS runtime

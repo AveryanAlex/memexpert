@@ -62,10 +62,10 @@ docker compose up -d
 Install backend dependencies:
 
 ```sh
-uv sync --group dev --locked
+uv sync --locked
 ```
 
-Normal `uv sync --locked` also installs all default development and service dependency groups. Docker targets opt out with `--no-default-groups` and add only the service group they need. PaddleOCR/PaddlePaddle are not part of the Python 3.14 uv lock; worker live OCR uses `docker/paddleocr-requirements.txt` inside a Python 3.13 helper venv.
+Main API/bot/scheduler dependencies live in normal project dependencies. The `dev` and `worker` dependency groups are default groups, so `uv sync --locked` installs the full local/check environment including worker-only Python extras. Docker targets opt out of default groups with `--no-default-groups`: the `main` image installs normal dependencies only, and the `worker` image adds the worker group plus its heavier system/runtime tools. PaddleOCR/PaddlePaddle are not part of the Python 3.14 uv lock; worker live OCR uses `docker/paddleocr-requirements.txt` inside a Python 3.13 helper venv.
 
 Apply migrations:
 
@@ -185,27 +185,23 @@ Duplicate production execution is guarded by the PostgreSQL advisory lock. Keep 
 
 The Docker Images workflow publishes production-ready images to GHCR after local image smoke checks on push, tag, and manual runs:
 
-- `ghcr.io/averyanalex/memexpert/api`
+- `ghcr.io/averyanalex/memexpert/main`
 - `ghcr.io/averyanalex/memexpert/worker`
-- `ghcr.io/averyanalex/memexpert/scheduler`
-- `ghcr.io/averyanalex/memexpert/bot`
 - `ghcr.io/averyanalex/memexpert/frontend`
 
 Published tags include branch names such as `main`, Git tags, semver tags such as `1.2.3` and `1.2` when applicable, and immutable `sha-<short-sha>` tags. Prefer a release tag or immutable SHA tag for production pinning.
 
-Build the split Python images:
+Build the Python images:
 
 ```sh
-docker build --target api -t memexpert-api:local -f Dockerfile .
+docker build --target main -t memexpert-main:local -f Dockerfile .
 docker build --target worker -t memexpert-worker:local -f Dockerfile .
-docker build --target scheduler -t memexpert-scheduler:local -f Dockerfile .
-docker build --target bot -t memexpert-bot:local -f Dockerfile .
 ```
 
-Run the API image:
+Run the API from the main image:
 
 ```sh
-docker run --rm -p 8000:8000 --env-file .env.example memexpert-api:local
+docker run --rm -p 8000:8000 --env-file .env.example memexpert-main:local
 curl http://127.0.0.1:8000/health
 ```
 
@@ -215,16 +211,16 @@ Run the worker image:
 docker run --rm --env-file .env.example memexpert-worker:local
 ```
 
-Run the scheduler image:
+Run the scheduler from the main image:
 
 ```sh
-docker run --rm --env-file .env.example memexpert-scheduler:local
+docker run --rm --env-file .env.example memexpert-main:local memexpert-scheduler
 ```
 
-Run the bot image:
+Run the bot from the main image:
 
 ```sh
-docker run --rm --env-file .env.example -e AUTH_TELEGRAM_BOT_TOKEN=replace-me memexpert-bot:local
+docker run --rm --env-file .env.example -e AUTH_TELEGRAM_BOT_TOKEN=replace-me memexpert-main:local memexpert-bot
 ```
 
 Confirm worker-only media/OCR tools are present:
@@ -259,7 +255,7 @@ cp .env.prod.example .env.prod
 
 Edit `.env.prod` and replace every `change-me` placeholder.
 
-The example env defaults the split `MEMEXPERT_*_IMAGE` values to GHCR `:main` images. For production, pin them to release tags or immutable `sha-<short-sha>` tags from the Docker Images workflow.
+The example env defaults `MEMEXPERT_MAIN_IMAGE`, `MEMEXPERT_WORKER_IMAGE`, and `MEMEXPERT_FRONTEND_IMAGE` to GHCR `:main` images. For production, pin them to release tags or immutable `sha-<short-sha>` tags from the Docker Images workflow.
 
 Validate the stack:
 
@@ -274,7 +270,7 @@ docker compose --env-file .env.prod -f docker-compose.prod.example.yml pull
 docker compose --env-file .env.prod -f docker-compose.prod.example.yml up -d
 ```
 
-The production example uses split Python images: `MEMEXPERT_API_IMAGE`, `MEMEXPERT_WORKER_IMAGE`, `MEMEXPERT_SCHEDULER_IMAGE`, and `MEMEXPERT_BOT_IMAGE`. It starts exactly one `scheduler` service; if a second scheduler container is started accidentally, the PostgreSQL advisory lock remains the duplicate-run guard.
+The production example uses `MEMEXPERT_MAIN_IMAGE` for `migrate`, `api`, `scheduler`, and `bot`, and `MEMEXPERT_WORKER_IMAGE` for worker nodes with extra worker dependencies and media/OCR tooling. It starts exactly one `scheduler` service; if a second scheduler container is started accidentally, the PostgreSQL advisory lock remains the duplicate-run guard.
 
 Run the optional bot profile only when `AUTH_TELEGRAM_BOT_TOKEN` is configured:
 
@@ -303,9 +299,9 @@ Run the deterministic real-stack PRD E2E suite with one command:
 python scripts/run_container_e2e.py
 ```
 
-The runner creates a sanitized run id, sets per-run default API/worker/frontend/Playwright image tags, starts `docker-compose.e2e.yml` with `docker compose -p memexpert-e2e-<run-id>`, builds the split Python/frontend/Playwright images, runs `seed`, runs the in-network Playwright/API checks, collects Compose status/logs, and tears the stack down with volumes unless `E2E_KEEP_STACK=1` is set.
+The runner creates a sanitized run id, sets per-run default main/worker/frontend/Playwright image tags, starts `docker-compose.e2e.yml` with `docker compose -p memexpert-e2e-<run-id>`, builds the unified main image, worker image, frontend image, and Playwright image, runs `seed`, runs the in-network Playwright/API checks, collects Compose status/logs, and tears the stack down with volumes unless `E2E_KEEP_STACK=1` is set.
 
-The suite is parallel-safe by default: it uses no fixed host ports, no `container_name`, project-scoped named volumes, an absolute per-run artifact bind mount at `.artifacts/e2e/<run-id>/`, and run-scoped default API/worker/frontend/e2e-runner image tags. Set `E2E_RUN_ID=<id>` to choose a deterministic run id, or set `MEMEXPERT_API_IMAGE`, `MEMEXPERT_WORKER_IMAGE`, `MEMEXPERT_FRONTEND_IMAGE`, or `MEMEXPERT_E2E_RUNNER_IMAGE` to opt into explicit image tags.
+The suite is parallel-safe by default: it uses no fixed host ports, no `container_name`, project-scoped named volumes, an absolute per-run artifact bind mount at `.artifacts/e2e/<run-id>/`, and run-scoped default main/worker/frontend/e2e-runner image tags. Set `E2E_RUN_ID=<id>` to choose a deterministic run id, or set `MEMEXPERT_MAIN_IMAGE`, `MEMEXPERT_WORKER_IMAGE`, `MEMEXPERT_FRONTEND_IMAGE`, or `MEMEXPERT_E2E_RUNNER_IMAGE` to opt into explicit image tags.
 
 Default E2E provider policy is local and secret-free: OCR, Voyage embeddings, and classification run in fake mode, Voyage dimensions are reduced to `4`, auth cookies are non-secure for the Compose network, and security rate limiting is disabled for deterministic PRD coverage. CI does not call live Voyage, Telegram, Google, or other provider APIs.
 
@@ -315,7 +311,7 @@ The default CI E2E path uses the operator upload pipeline plus fake providers. I
 
 `.github/workflows/ci.yml` runs backend lint/type/test checks, frontend checks/tests/builds, frontend mock smoke tests, and deterministic PRD E2E. On E2E failure, CI uploads `.artifacts/e2e/**`.
 
-`.github/workflows/docker-images.yml` validates the production compose example, builds the split API/bot/worker/scheduler Python images and frontend image with BuildKit/GitHub Actions cache, loads local CI tags, and performs lightweight API/frontend HTTP smoke checks. It also verifies API/bot/scheduler do not import Paddle packages and the worker has FFmpeg/FFprobe plus a launchable Python 3.13 PaddleOCR helper. After smoke checks pass, non-PR runs publish `ghcr.io/averyanalex/memexpert/{api,bot,worker,scheduler,frontend}` with metadata labels plus branch, tag, semver, and `sha-<short-sha>` tags.
+`.github/workflows/docker-images.yml` validates the production compose example, builds the unified main Python image, worker Python image, and frontend image with BuildKit/GitHub Actions cache, loads local CI tags, and performs lightweight API/frontend HTTP smoke checks. It also verifies the main image exposes API/bot/scheduler console scripts without importing Paddle packages, and that the worker has FFmpeg/FFprobe plus a launchable Python 3.13 PaddleOCR helper. After smoke checks pass, non-PR runs publish `ghcr.io/averyanalex/memexpert/{main,worker,frontend}` with metadata labels plus branch, tag, semver, and `sha-<short-sha>` tags.
 
 Run the local real OCR smoke only when the worker image has been built and model downloads are acceptable:
 

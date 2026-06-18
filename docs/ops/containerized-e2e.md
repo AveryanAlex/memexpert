@@ -6,15 +6,15 @@ Run the real-stack PRD E2E suite from the repository root:
 python scripts/run_container_e2e.py
 ```
 
-The orchestrator creates `.artifacts/e2e/<run-id>/`, exports `E2E_RUN_ID` and `E2E_ARTIFACT_DIR`, sets per-run default API/worker/frontend/e2e-runner image tags, starts `docker-compose.e2e.yml` with `docker compose -p memexpert-e2e-<run-id>`, waits for service health, runs the seed proof, runs Playwright inside the Compose network, captures status/logs/metadata, and removes the stack with volumes unless `E2E_KEEP_STACK=1` is set.
+The orchestrator creates `.artifacts/e2e/<run-id>/`, exports `E2E_RUN_ID` and `E2E_ARTIFACT_DIR`, sets per-run default main/worker/frontend/e2e-runner image tags, starts `docker-compose.e2e.yml` with `docker compose -p memexpert-e2e-<run-id>`, waits for service health, runs the seed proof, runs Playwright inside the Compose network, captures status/logs/metadata, and removes the stack with volumes unless `E2E_KEEP_STACK=1` is set.
 
 ## Stack
 
-The E2E Compose file mirrors the production process split: `postgres`, `redis`, `rabbitmq`, `qdrant`, `meilisearch`, `minio`, `minio-init`, `imgproxy`, `migrate`, `api`, `workers`, `frontend`, `seed`, and `e2e-runner`. `api`/`migrate`/`seed` use the API image target; `workers` uses the worker image target.
+The E2E Compose file mirrors the production process split: `postgres`, `redis`, `rabbitmq`, `qdrant`, `meilisearch`, `minio`, `minio-init`, `imgproxy`, `migrate`, `api`, `workers`, `frontend`, `seed`, and `e2e-runner`. `api`/`migrate`/`seed` use the unified `main` image target; `workers` uses the worker image target with extra dependencies and media/OCR tooling.
 
 It deliberately has no fixed host ports, no `container_name`, and no fixed Compose project name. Named volumes are project-scoped by Compose, so concurrent runs are isolated by the `memexpert-e2e-<run-id>` project name.
 
-By default, the runner also sets `MEMEXPERT_API_IMAGE`, `MEMEXPERT_WORKER_IMAGE`, `MEMEXPERT_FRONTEND_IMAGE`, and `MEMEXPERT_E2E_RUNNER_IMAGE` to tags derived from the sanitized run id. This avoids concurrent runs racing on mutable global image tags. If you explicitly provide any of those variables, the runner honors your value and does not remove that image tag during cleanup.
+By default, the runner also sets `MEMEXPERT_MAIN_IMAGE`, `MEMEXPERT_WORKER_IMAGE`, `MEMEXPERT_FRONTEND_IMAGE`, and `MEMEXPERT_E2E_RUNNER_IMAGE` to tags derived from the sanitized run id. This avoids concurrent runs racing on mutable global image tags. If you explicitly provide any of those variables, the runner honors your value and does not remove that image tag during cleanup.
 
 ## Providers
 

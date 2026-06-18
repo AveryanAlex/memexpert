@@ -1,14 +1,8 @@
-x-api-image: &api-image
-  image: ${MEMEXPERT_API_IMAGE:-ghcr.io/averyanalex/memexpert/api:main}
+x-main-image: &main-image
+  image: ${MEMEXPERT_MAIN_IMAGE:-ghcr.io/averyanalex/memexpert/main:main}
 
 x-worker-image: &worker-image
   image: ${MEMEXPERT_WORKER_IMAGE:-ghcr.io/averyanalex/memexpert/worker:main}
-
-x-scheduler-image: &scheduler-image
-  image: ${MEMEXPERT_SCHEDULER_IMAGE:-ghcr.io/averyanalex/memexpert/scheduler:main}
-
-x-bot-image: &bot-image
-  image: ${MEMEXPERT_BOT_IMAGE:-ghcr.io/averyanalex/memexpert/bot:main}
 
 x-app-env: &app-env
   APP_HOST: 0.0.0.0
@@ -190,7 +184,7 @@ services:
       start_period: 10s
 
   migrate:
-    <<: *api-image
+    <<: *main-image
     restart: "no"
     command: ["alembic", "upgrade", "head"]
     environment: *app-env
@@ -213,7 +207,7 @@ services:
       disable: true
 
   api:
-    <<: *api-image
+    <<: *main-image
     restart: unless-stopped
     environment: *app-env
     ports:
@@ -240,8 +234,9 @@ services:
       disable: true
 
   scheduler:
-    <<: *scheduler-image
+    <<: *main-image
     restart: unless-stopped
+    command: ["memexpert-scheduler"]
     environment: *app-env
     depends_on:
       migrate:
@@ -250,7 +245,7 @@ services:
       disable: true
 
   bot:
-    <<: *bot-image
+    <<: *main-image
     profiles: ["bot"]
     restart: unless-stopped
     command: ["sh", "-c", ": \"$${AUTH_TELEGRAM_BOT_TOKEN:?set AUTH_TELEGRAM_BOT_TOKEN when enabling the bot profile}\" && exec memexpert-bot"]

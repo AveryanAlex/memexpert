@@ -22,27 +22,16 @@ jobs:
       - name: Validate production compose example
         run: docker compose --env-file .env.prod.example -f docker-compose.prod.example.yml config
 
-      - name: Build API image
+      - name: Build main image
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile
-          target: api
-          tags: memexpert-api:ci
+          target: main
+          tags: memexpert-main:ci
           load: true
-          cache-from: type=gha,scope=memexpert-api
-          cache-to: type=gha,scope=memexpert-api,mode=max
-
-      - name: Build bot image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile
-          target: bot
-          tags: memexpert-bot:ci
-          load: true
-          cache-from: type=gha,scope=memexpert-bot
-          cache-to: type=gha,scope=memexpert-bot,mode=max
+          cache-from: type=gha,scope=memexpert-main
+          cache-to: type=gha,scope=memexpert-main,mode=max
 
       - name: Build worker image
         uses: docker/build-push-action@v6
@@ -55,17 +44,6 @@ jobs:
           cache-from: type=gha,scope=memexpert-worker
           cache-to: type=gha,scope=memexpert-worker,mode=max
 
-      - name: Build scheduler image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile
-          target: scheduler
-          tags: memexpert-scheduler:ci
-          load: true
-          cache-from: type=gha,scope=memexpert-scheduler
-          cache-to: type=gha,scope=memexpert-scheduler,mode=max
-
       - name: Build frontend image
         uses: docker/build-push-action@v6
         with:
@@ -76,18 +54,18 @@ jobs:
           cache-from: type=gha,scope=memexpert-frontend
           cache-to: type=gha,scope=memexpert-frontend,mode=max
 
-      - name: Smoke test split images
+      - name: Smoke test app images
         run: |
           set -euo pipefail
 
           docker network create memexpert-smoke
           docker run -d --rm \
-            --name memexpert-api-smoke \
+            --name memexpert-main-smoke \
             --network memexpert-smoke \
             -e APP_HOST=0.0.0.0 \
             -e APP_PORT=8000 \
             -p 8000:8000 \
-            memexpert-api:ci
+            memexpert-main:ci
 
           for _ in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:8000/health; then
@@ -97,9 +75,7 @@ jobs:
           done
           curl -fsS http://127.0.0.1:8000/health
 
-          docker run --rm memexpert-api:ci sh -c 'command -v memexpert-api && python -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec(\"paddleocr\") is None and importlib.util.find_spec(\"paddle\") is None else 1)"'
-          docker run --rm memexpert-bot:ci sh -c 'command -v memexpert-bot && python -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec(\"paddleocr\") is None and importlib.util.find_spec(\"paddle\") is None else 1)"'
-          docker run --rm memexpert-scheduler:ci sh -c 'command -v memexpert-scheduler && python -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec(\"paddleocr\") is None and importlib.util.find_spec(\"paddle\") is None else 1)"'
+          docker run --rm memexpert-main:ci sh -c 'command -v memexpert-api && command -v memexpert-bot && command -v memexpert-scheduler && python -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec(\"paddleocr\") is None and importlib.util.find_spec(\"paddle\") is None else 1)"'
           docker run --rm memexpert-worker:ci sh -c 'command -v memexpert-workers && command -v ffmpeg && command -v ffprobe && python -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec(\"paddleocr\") is None and importlib.util.find_spec(\"paddle\") is None else 1)" && /opt/paddleocr-venv/bin/python -c "import paddle, paddleocr; print(\"paddleocr-helper-ok\")" && /opt/paddleocr-venv/bin/python /app/scripts/paddleocr_json.py --help >/dev/null'
           docker run --rm memexpert-worker:ci ffmpeg -version
           docker run --rm memexpert-worker:ci ffprobe -version
@@ -109,7 +85,7 @@ jobs:
             --network memexpert-smoke \
             -e HOST=0.0.0.0 \
             -e PORT=3000 \
-            -e API_BASE_URL=http://memexpert-api-smoke:8000 \
+            -e API_BASE_URL=http://memexpert-main-smoke:8000 \
             -p 3000:3000 \
             memexpert-frontend:ci
 
@@ -125,13 +101,13 @@ jobs:
         if: failure()
         run: |
           docker ps -a
-          docker logs memexpert-api-smoke || true
+          docker logs memexpert-main-smoke || true
           docker logs memexpert-frontend-smoke || true
 
       - name: Tear down smoke containers
         if: always()
         run: |
-          docker rm -f memexpert-frontend-smoke memexpert-api-smoke || true
+          docker rm -f memexpert-frontend-smoke memexpert-main-smoke || true
           docker network rm memexpert-smoke || true
 
       - name: Log in to GHCR
@@ -142,25 +118,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract API image metadata
+      - name: Extract main image metadata
         if: github.event_name != 'pull_request'
-        id: meta-api
+        id: meta-main
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/averyanalex/memexpert/api
-          tags: |
-            type=ref,event=branch
-            type=ref,event=tag
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha,prefix=sha-,format=short
-
-      - name: Extract bot image metadata
-        if: github.event_name != 'pull_request'
-        id: meta-bot
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/averyanalex/memexpert/bot
+          images: ghcr.io/averyanalex/memexpert/main
           tags: |
             type=ref,event=branch
             type=ref,event=tag
@@ -181,19 +144,6 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=sha,prefix=sha-,format=short
 
-      - name: Extract scheduler image metadata
-        if: github.event_name != 'pull_request'
-        id: meta-scheduler
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/averyanalex/memexpert/scheduler
-          tags: |
-            type=ref,event=branch
-            type=ref,event=tag
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha,prefix=sha-,format=short
-
       - name: Extract frontend image metadata
         if: github.event_name != 'pull_request'
         id: meta-frontend
@@ -207,31 +157,18 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=sha,prefix=sha-,format=short
 
-      - name: Build and push API image
+      - name: Build and push main image
         if: github.event_name != 'pull_request'
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile
-          target: api
+          target: main
           push: true
-          tags: ${{ steps.meta-api.outputs.tags }}
-          labels: ${{ steps.meta-api.outputs.labels }}
-          cache-from: type=gha,scope=memexpert-api
-          cache-to: type=gha,scope=memexpert-api,mode=max
-
-      - name: Build and push bot image
-        if: github.event_name != 'pull_request'
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile
-          target: bot
-          push: true
-          tags: ${{ steps.meta-bot.outputs.tags }}
-          labels: ${{ steps.meta-bot.outputs.labels }}
-          cache-from: type=gha,scope=memexpert-bot
-          cache-to: type=gha,scope=memexpert-bot,mode=max
+          tags: ${{ steps.meta-main.outputs.tags }}
+          labels: ${{ steps.meta-main.outputs.labels }}
+          cache-from: type=gha,scope=memexpert-main
+          cache-to: type=gha,scope=memexpert-main,mode=max
 
       - name: Build and push worker image
         if: github.event_name != 'pull_request'
@@ -245,19 +182,6 @@ jobs:
           labels: ${{ steps.meta-worker.outputs.labels }}
           cache-from: type=gha,scope=memexpert-worker
           cache-to: type=gha,scope=memexpert-worker,mode=max
-
-      - name: Build and push scheduler image
-        if: github.event_name != 'pull_request'
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile
-          target: scheduler
-          push: true
-          tags: ${{ steps.meta-scheduler.outputs.tags }}
-          labels: ${{ steps.meta-scheduler.outputs.labels }}
-          cache-from: type=gha,scope=memexpert-scheduler
-          cache-to: type=gha,scope=memexpert-scheduler,mode=max
 
       - name: Build and push frontend image
         if: github.event_name != 'pull_request'
