@@ -17,8 +17,6 @@ from sqlalchemy.orm import selectinload
 
 from memexpert.core.broker import ensure_pipeline_broker_started, get_pipeline_broker_settings
 from memexpert.core.config import Settings, get_settings
-from memexpert.core.media import NormalizedMediaResult, PipelineMediaProcessor, PipelineMediaProcessorProtocol
-from memexpert.core.ocr import OCRExtractionResult, OCRProcessorProtocol, build_pipeline_ocr_processor
 from memexpert.core.perceptual_hashes import (
     DEFAULT_PERCEPTUAL_HASH_ALGORITHM,
     hamming_distance_hex,
@@ -132,12 +130,14 @@ if TYPE_CHECKING:
 
     from memexpert.core.classification import ClassificationResult
     from memexpert.core.meilisearch import MeilisearchSyncClientProtocol
+    from memexpert.core.ocr import OCRExtractionResult, OCRProcessorProtocol
     from memexpert.core.qdrant import (
         QdrantSimilarityClientProtocol,
         QdrantSimilarityMatch,
         QdrantSyncClientProtocol,
     )
     from memexpert.core.voyage import VoyageEmbeddingResult
+    from memexpert.media.contracts import NormalizedMediaResult, PipelineMediaProcessorProtocol
 
 
 class ObjectStorageClient(Protocol):
@@ -221,11 +221,8 @@ class ContentPipelineService:
         self._broker_settings = get_pipeline_broker_settings(self._settings)
         self._storage_client = storage_client or cast("ObjectStorageClient", get_s3_client())
         self._publisher = publisher or self._publish_dispatch_event
-        self._media_processor = media_processor or PipelineMediaProcessor(settings=self._settings)
-        self._ocr_processor = ocr_processor or build_pipeline_ocr_processor(
-            settings=self._settings,
-            media_processor=self._media_processor,
-        )
+        self._media_processor: PipelineMediaProcessorProtocol | None = media_processor
+        self._ocr_processor: OCRProcessorProtocol | None = ocr_processor
 
     @classmethod
     def from_settings(
@@ -248,6 +245,23 @@ class ContentPipelineService:
             media_processor=media_processor,
             ocr_processor=ocr_processor,
         )
+
+    def _get_media_processor(self) -> PipelineMediaProcessorProtocol:
+        if self._media_processor is None:
+            from memexpert.media.inspect import PipelineMediaProcessor
+
+            self._media_processor = PipelineMediaProcessor(settings=self._settings)
+        return self._media_processor
+
+    def _get_ocr_processor(self) -> OCRProcessorProtocol:
+        if self._ocr_processor is None:
+            from memexpert.core.ocr import build_pipeline_ocr_processor
+
+            self._ocr_processor = build_pipeline_ocr_processor(
+                settings=self._settings,
+                media_processor=self._get_media_processor(),
+            )
+        return self._ocr_processor
 
     async def create_upload(
         self,
@@ -1603,7 +1617,7 @@ class ContentPipelineService:
             raise PipelinePayloadValidationError("Uploaded file is empty.")
 
         try:
-            inspected_media = await self._media_processor.inspect_upload(
+            inspected_media = await self._get_media_processor().inspect_upload(
                 filename=normalized_filename,
                 content_type=normalized_content_type,
                 media_bytes=media_bytes,

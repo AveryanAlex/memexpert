@@ -20,7 +20,6 @@ from memexpert.core.classification import (
     ClassificationProviderUnavailableError,
     ClassificationTimeoutError,
 )
-from memexpert.core.media import MediaTimeoutError, MediaValidationError
 from memexpert.core.meilisearch import (
     MeilisearchSyncConflictError,
     MeilisearchSyncMalformedResponseError,
@@ -43,6 +42,7 @@ from memexpert.core.voyage import (
     VoyageProviderUnavailableError,
     VoyageTimeoutError,
 )
+from memexpert.media.contracts import MediaTimeoutError, MediaValidationError
 from memexpert.models.enums import ContentPipelineStage
 from memexpert.schemas.content_pipeline import ContentPipelineDispatchEvent
 from memexpert.services import PipelineIngestError, PipelineMergeTransactionError

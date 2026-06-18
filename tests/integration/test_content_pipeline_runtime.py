@@ -23,7 +23,7 @@ from memexpert.core.classification import (
     ClassificationResult,
 )
 from memexpert.core.config import Settings
-from memexpert.core.media import (
+from memexpert.media.contracts import (
     NormalizedMediaResult,
     PipelineMediaProcessorProtocol,
     UploadMediaDetails,

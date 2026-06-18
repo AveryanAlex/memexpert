@@ -15,10 +15,6 @@ from memexpert.core.broker import PipelineBrokerSettings
 from memexpert.core.classification import ClassificationClientProtocol
 from memexpert.core.config import Settings
 from memexpert.core.database import AsyncSessionFactory
-from memexpert.core.media import (
-    MediaValidationError,
-    PipelineMediaProcessorProtocol,
-)
 from memexpert.core.meilisearch import (
     MeilisearchSyncClientProtocol,
     PipelineMeilisearchDocument,
@@ -36,6 +32,7 @@ from memexpert.core.storage import (
     upload_object_bytes,
 )
 from memexpert.core.voyage import VoyageClientProtocol
+from memexpert.media.contracts import MediaValidationError
 from memexpert.models.enums import ContentPipelineStage
 from memexpert.schemas.content_pipeline import ContentPipelineDispatchEvent
 from memexpert.services import (
@@ -70,10 +67,10 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from memexpert.core.classification import ClassificationResult
-    from memexpert.core.media import NormalizedMediaResult
     from memexpert.core.ocr import OCRExtractionResult
     from memexpert.core.qdrant import QdrantSimilarityMatch
     from memexpert.core.voyage import VoyageEmbeddingResult
+    from memexpert.media.contracts import NormalizedMediaResult, PipelineMediaProcessorProtocol
     from memexpert.services.content_merge import MergeOutcome
     from memexpert.services.content_pipeline import PipelineStageWorkContext
 

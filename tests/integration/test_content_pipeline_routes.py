@@ -19,7 +19,7 @@ from memexpert.api.dependencies.pipeline import (
 )
 from memexpert.core.classification import ClassificationResult
 from memexpert.core.config import get_settings
-from memexpert.core.media import NormalizedMediaResult, UploadMediaDetails
+from memexpert.media.contracts import NormalizedMediaResult, UploadMediaDetails
 from memexpert.core.ocr import OCRExtractionResult
 from memexpert.core.qdrant import QdrantSimilarityMatch
 from memexpert.core.voyage import VoyageEmbeddingResult

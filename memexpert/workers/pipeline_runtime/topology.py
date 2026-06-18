@@ -10,7 +10,7 @@ queue, and every routing-key binding used by the heavy-worker stages.
 
 from __future__ import annotations
 
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from faststream import AckPolicy
 from faststream.rabbit import ExchangeType, RabbitBroker, RabbitExchange, RabbitQueue
@@ -23,7 +23,6 @@ from memexpert.core.classification import (
 )
 from memexpert.core.config import Settings, get_settings
 from memexpert.core.database import AsyncSessionFactory, get_async_session_factory
-from memexpert.core.media import PipelineMediaProcessor, PipelineMediaProcessorProtocol
 from memexpert.core.meilisearch import (
     MeilisearchSyncClientProtocol,
     PipelineMeilisearchSyncClient,
@@ -37,12 +36,16 @@ from memexpert.core.qdrant import (
 )
 from memexpert.core.storage import get_s3_client
 from memexpert.core.voyage import VoyageClientProtocol, build_pipeline_voyage_client
+from memexpert.media.inspect import PipelineMediaProcessor
 from memexpert.models.enums import ContentPipelineStage
 from memexpert.workers.pipeline_runtime.runtime import (
     ObjectStorageClientLike,
     PipelineRuntime,
     RabbitMessageLike,
 )
+
+if TYPE_CHECKING:
+    from memexpert.media.contracts import PipelineMediaProcessorProtocol
 
 
 def _build_pipeline_exchange(broker_settings: PipelineBrokerSettings) -> RabbitExchange:

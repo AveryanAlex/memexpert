@@ -1,7 +1,7 @@
-"""Compatibility media exports that remain safe for API imports.
+"""Import-safe media contract surface.
 
-Use :mod:`memexpert.media.contracts` for import-safe contracts and
-:mod:`memexpert.media.inspect` for the worker-only implementation.
+The heavy worker implementation lives in :mod:`memexpert.media.inspect` and is
+loaded only when callers explicitly ask for it.
 """
 
 from __future__ import annotations
