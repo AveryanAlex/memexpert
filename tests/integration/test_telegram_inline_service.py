@@ -19,7 +19,7 @@ from memexpert.models.enums import (
     TelegramMediaFormat,
 )
 from memexpert.models.user import AnalyticsEvent, User
-from memexpert.services.telegram_inline import TelegramInlineService
+from memexpert.services.telegram_inline import TelegramInlineSearchPage, TelegramInlineService
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -41,8 +41,9 @@ class UnusedMemeSearchService:
         filters: MemeSearchFilters | None = None,
         limit: int = 20,
         offset: int = 0,
+        surface: str = "telegram_inline_search",
     ) -> MemeSearchPageRead:
-        _ = (query, viewer_user_id, filters, limit, offset)
+        _ = (query, viewer_user_id, filters, limit, offset, surface)
         raise AssertionError("Empty-query discovery should not call text search.")
 
 
@@ -117,6 +118,21 @@ def build_service(session: AsyncSession) -> TelegramInlineService:
     )
 
 
+def assert_inline_page_attribution(
+    page: TelegramInlineSearchPage,
+    *,
+    ranks: list[int],
+    source_algorithms: list[str],
+) -> None:
+    request_id = page.request_id
+    assert request_id.startswith("req_")
+    impressions = [item.attribution.impression_id for item in page.items]
+    assert len(impressions) == len(set(impressions))
+    assert [item.attribution.request_id for item in page.items] == [request_id] * len(page.items)
+    assert [item.attribution.rank for item in page.items] == ranks
+    assert [item.attribution.source_algorithm for item in page.items] == source_algorithms
+
+
 @pytest.mark.asyncio
 async def test_empty_query_orders_pins_recent_popular_dedupes_before_pagination(
     migrated_db_session: AsyncSession,
@@ -178,7 +194,13 @@ async def test_empty_query_orders_pins_recent_popular_dedupes_before_pagination(
     assert page.total == 4
     assert page.has_more is True
     assert [item.cached_file_id for item in page.items] == ["cached-pinned-only", "cached-recent-only"]
+    assert_inline_page_attribution(
+        page,
+        ranks=[2, 3],
+        source_algorithms=["personalized_discovery", "personalized_discovery"],
+    )
     assert [item.cached_file_id for item in next_page.items] == ["cached-popular-only"]
+    assert_inline_page_attribution(next_page, ranks=[4], source_algorithms=["popular"])
     assert next_page.total == 4
     assert next_page.has_more is False
 
@@ -209,6 +231,8 @@ async def test_empty_query_for_guest_and_inactive_user_returns_only_public_popul
     assert inactive_page.is_personal is False
     assert [item.meme.id for item in guest_page.items] == [public_meme.id]
     assert [item.meme.id for item in inactive_page.items] == [public_meme.id]
+    assert_inline_page_attribution(guest_page, ranks=[1], source_algorithms=["popular"])
+    assert_inline_page_attribution(inactive_page, ranks=[1], source_algorithms=["popular"])
     assert private_meme.id not in {item.meme.id for item in guest_page.items + inactive_page.items}
 
 
@@ -299,5 +323,10 @@ async def test_empty_query_filters_stale_pins_and_recent_events_by_visibility(
     assert page.is_personal is True
     assert page.total == 3
     assert [item.meme.id for item in page.items] == [authored_private.id, shared_private.id, public_meme.id]
+    assert_inline_page_attribution(
+        page,
+        ranks=[1, 2, 3],
+        source_algorithms=["personalized_discovery", "personalized_discovery", "popular"],
+    )
     assert stranger_private.id not in {item.meme.id for item in page.items}
     assert unauthorized_private.id not in {item.meme.id for item in page.items}

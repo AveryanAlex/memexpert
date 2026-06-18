@@ -38,6 +38,7 @@ from memexpert.models.user import AnalyticsEvent, InlineUsageEvent, User
 from memexpert.schemas.meme import (
     MemeCardRead,
     MemeFileRead,
+    MemeResultAttributionRead,
     MemeSearchPageRead,
     MemeSearchResultRead,
     MemeSearchScoreRead,
@@ -124,6 +125,7 @@ class FakeMemeSearchService:
         filters: MemeSearchFilters | None = None,
         limit: int = 20,
         offset: int = 0,
+        surface: str = "telegram_inline_search",
     ) -> MemeSearchPageRead:
         self.calls.append(
             {
@@ -133,6 +135,7 @@ class FakeMemeSearchService:
                 "include_nsfw": filters.include_nsfw if filters is not None else None,
                 "limit": limit,
                 "offset": offset,
+                "surface": surface,
             }
         )
         return self.page
@@ -214,8 +217,9 @@ def search_page_for(
     has_more: bool = False,
 ) -> MemeSearchPageRead:
     now = datetime.now(UTC)
+    request_id = "req_inline_test"
     items = []
-    for meme, file in entries:
+    for rank, (meme, file) in enumerate(entries, start=offset + 1):
         items.append(
             MemeSearchResultRead(
                 meme=MemeCardRead(
@@ -242,6 +246,16 @@ def search_page_for(
                     updated_at=meme.updated_at or now,
                 ),
                 score=MemeSearchScoreRead(semantic=1.0, text=1.0, popularity=1.0, total=1.0),
+                attribution=MemeResultAttributionRead(
+                    request_id=request_id,
+                    impression_id=f"imp_inline_{rank}",
+                    surface="telegram_inline_search",
+                    source_algorithm="hybrid_search",
+                    rank=rank,
+                    query="cats",
+                    score=1.0,
+                    score_components={"semantic": 1.0, "text": 1.0, "popularity": 1.0, "total": 1.0},
+                ),
             )
         )
     return MemeSearchPageRead(
@@ -250,6 +264,7 @@ def search_page_for(
         offset=offset,
         total=len(items) if total is None else total,
         has_more=has_more,
+        request_id=request_id,
     )
 
 
@@ -396,6 +411,7 @@ async def test_inline_plain_text_query_calls_shared_search_service_and_records_q
             "include_nsfw": False,
             "limit": 20,
             "offset": 0,
+            "surface": "telegram_inline_search",
         }
     ]
     answer = last_inline_answer(telegram_session)
@@ -404,6 +420,8 @@ async def test_inline_plain_text_query_calls_shared_search_service_and_records_q
     assert len(answer.results) == 1
     result = answer.results[0]
     assert isinstance(result, InlineQueryResultCachedPhoto)
+    assert result.id == f"p:{file.id.hex}:imp_inline_1"
+    assert len(result.id) <= 64
     assert result.photo_file_id == "cached-photo-id"
     assert result.reply_markup is not None
     assert [button.text for button in result.reply_markup.inline_keyboard[0]] == ["Favorite", "Save", "Pin"]
@@ -465,6 +483,7 @@ async def test_inline_plain_text_query_uses_linked_full_user_scope_and_nsfw_pref
             "include_nsfw": True,
             "limit": 20,
             "offset": 0,
+            "surface": "telegram_inline_search",
         }
     ]
     assert last_inline_answer(telegram_session).is_personal is True
@@ -507,6 +526,7 @@ async def test_inline_pagination_uses_offset_and_next_offset(
             "include_nsfw": False,
             "limit": 20,
             "offset": 20,
+            "surface": "telegram_inline_search",
         }
     ]
     assert last_inline_answer(telegram_session).next_offset == "40"
@@ -596,6 +616,8 @@ async def test_inline_filters_unsupported_media_and_reuses_cached_gif_file_id(
     assert len(answer.results) == 1
     result = answer.results[0]
     assert isinstance(result, InlineQueryResultCachedGif)
+    assert result.id == f"a:{gif_file.id.hex}:imp_inline_1"
+    assert len(result.id) <= 64
     assert result.gif_file_id == "cached-gif-id"
 
 
@@ -672,6 +694,7 @@ async def test_inline_uses_injected_media_url_provider_for_private_uncached_medi
     assert len(answer.results) == 1
     result = answer.results[0]
     assert isinstance(result, InlineQueryResultPhoto)
+    assert result.id == f"p:{private_file.id.hex}:imp_inline_1"
     assert str(result.photo_url) == "https://storage.example.test/private/original.jpg?sig=1"
 
 
@@ -965,6 +988,8 @@ async def test_inline_empty_query_for_linked_user_falls_back_to_popular_when_no_
     assert len(answer.results) == 1
     result = answer.results[0]
     assert isinstance(result, InlineQueryResultCachedPhoto)
+    assert result.id.startswith(f"p:{popular_file.id.hex}:imp_")
+    assert len(result.id) <= 64
     assert result.photo_file_id == "cached-linked-popular-photo-id"
 
 
@@ -1145,7 +1170,7 @@ async def test_chosen_inline_result_records_meme_send_analytics(
             MemeSearchPageRead(items=[], limit=20, offset=0, total=0, has_more=False)
         ),
     )
-    result_id = f"p:{file.id.hex}"
+    result_id = f"p:{file.id.hex}:imp_chosen_1"
 
     try:
         await dispatch_chosen_inline_result(dispatcher=dispatcher, bot=bot, result_id=result_id)
@@ -1161,6 +1186,7 @@ async def test_chosen_inline_result_records_meme_send_analytics(
     assert event.payload["meme_id"] == str(meme.id)
     assert event.payload["meme_file_id"] == str(file.id)
     assert event.payload["result_id"] == result_id
+    assert event.payload["impression_id"] == "imp_chosen_1"
     assert event.payload["telegram_user_hash"] == hashlib.sha256(f"telegram_user:{TELEGRAM_ID}".encode()).hexdigest()
     assert "telegram_user_id" not in event.payload
 

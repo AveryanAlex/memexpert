@@ -15,6 +15,8 @@ from sqlalchemy.orm import selectinload
 from memexpert.models.content import Meme, MemeSeoPage
 from memexpert.models.enums import ContentKind, ContentLanguage
 from memexpert.schemas.meme import (
+    MemeResultAttributionFiltersRead,
+    MemeResultAttributionRead,
     PublicMemePopularityPointRead,
     PublicMemePopularitySummaryRead,
     PublicMemeTrendPageRead,
@@ -28,6 +30,8 @@ from memexpert.schemas.meme import (
     PublicTrendTimelineMemeRead,
     PublicTrendTimelinePageRead,
     PublicTrendTimelinePeriodRead,
+    new_discovery_impression_id,
+    new_discovery_request_id,
 )
 from memexpert.services.media_render_urls import MediaRenderUrlService
 from memexpert.services.meme_search import _to_public_card_read
@@ -50,6 +54,7 @@ type PublicTrendTimelineGranularity = Literal["month", "year"]
 
 MAX_COMPARE_ITEMS = 6
 TIMELINE_TOP_MEMES_PER_PERIOD = 5
+PUBLIC_TRENDS_ALGORITHM_VERSION = "public_trends_mv_v1"
 
 
 class PublicTrendsService:
@@ -74,11 +79,13 @@ class PublicTrendsService:
         tags: tuple[str, ...] = (),
         limit: int = 20,
         offset: int = 0,
+        surface: str = "public_api_trends",
     ) -> PublicMemeTrendPageRead:
         """Return MV-ranked public memes for the requested ranking mode."""
 
         resolved_limit = _clamp_limit(limit)
         resolved_offset = max(0, offset)
+        request_id = new_discovery_request_id()
         normalized_tags = tuple(tag.strip().lower() for tag in tags if tag.strip())
         where_sql = _ranking_filters_sql()
         params = {
@@ -117,20 +124,45 @@ class PublicTrendsService:
         )
         rows = [dict(row) for row in result.mappings()]
         memes_by_id = await self._load_public_memes(tuple(cast("uuid.UUID", row["meme_id"]) for row in rows))
-        items = [
-            PublicMemeTrendRead(
-                meme=_to_public_card_read(meme, media_render_service=self._media_render_service),
-                trend=_trend_metrics_from_row(row),
+        filters = MemeResultAttributionFiltersRead(
+            language=language,
+            media_type=media_type,
+            include_nsfw=include_nsfw,
+            tags=list(normalized_tags),
+            scope="public",
+        )
+        items = []
+        for rank, row in enumerate(rows, start=resolved_offset + 1):
+            meme = memes_by_id.get(cast("uuid.UUID", row["meme_id"]))
+            if meme is None:
+                continue
+            items.append(
+                PublicMemeTrendRead(
+                    meme=_to_public_card_read(meme, media_render_service=self._media_render_service),
+                    trend=_trend_metrics_from_row(row),
+                    attribution=MemeResultAttributionRead(
+                        request_id=request_id,
+                        impression_id=new_discovery_impression_id(),
+                        surface=surface,
+                        source_algorithm=f"public_trends_mv_{ranking}",
+                        rank=rank,
+                        query=None,
+                        filters=filters,
+                        collection_scope="public",
+                        algorithm_version=PUBLIC_TRENDS_ALGORITHM_VERSION,
+                        score=_trend_score_from_row(row, ranking=ranking),
+                        score_components=_trend_score_components_from_row(row, ranking=ranking),
+                        reason=ranking,
+                    ),
+                )
             )
-            for row in rows
-            if (meme := memes_by_id.get(cast("uuid.UUID", row["meme_id"]))) is not None
-        ]
         return PublicMemeTrendPageRead(
             items=items,
             limit=resolved_limit,
             offset=resolved_offset,
             total=total or 0,
             has_more=resolved_offset + resolved_limit < (total or 0),
+            request_id=request_id,
         )
 
     async def meme_popularity_summary(
@@ -635,6 +667,52 @@ def _trend_metrics_from_row(row: dict[str, object]) -> PublicTrendMetricsRead:
         engagement_24h=_float(row.get("engagement_24h")),
         trending_score=_float(row.get("trending_score")),
         refreshed_at=cast("datetime | None", row.get("refreshed_at")),
+    )
+
+
+def _trend_score_from_row(row: dict[str, object], *, ranking: PublicTrendRanking) -> float:
+    components = _trend_score_components_from_row(row, ranking=ranking)
+    if ranking == "fastest_rising":
+        return components["delta"]
+    if ranking == "most_liked":
+        return components["recent_likes"]
+    return components["trending"]
+
+
+def _trend_score_components_from_row(row: dict[str, object], *, ranking: PublicTrendRanking) -> dict[str, float]:
+    trending = _float(row.get("trending_score"))
+    engagement = _float(row.get("engagement_24h"))
+    latest_popularity = _float(row.get("latest_popularity_score"))
+    if ranking == "fastest_rising":
+        recent_weighted = _weighted_trend_event_count(row, prefix="recent")
+        previous_weighted = _weighted_trend_event_count(row, prefix="previous")
+        return {
+            "recent_weighted": recent_weighted,
+            "previous_weighted": previous_weighted,
+            "delta": recent_weighted - previous_weighted,
+            "trending": trending,
+            "engagement_24h": engagement,
+        }
+    if ranking == "most_liked":
+        return {
+            "recent_likes": float(_int(row.get("recent_like_count"))),
+            "latest_platform_likes": float(_int(row.get("latest_platform_likes"))),
+            "trending": trending,
+        }
+    return {
+        "trending": trending,
+        "engagement_24h": engagement,
+        "latest_popularity": latest_popularity,
+    }
+
+
+def _weighted_trend_event_count(row: dict[str, object], *, prefix: Literal["recent", "previous"]) -> float:
+    return (
+        _float(row.get(f"{prefix}_view_count"))
+        + _float(row.get(f"{prefix}_send_count")) * 3.0
+        + _float(row.get(f"{prefix}_like_count")) * 5.0
+        + _float(row.get(f"{prefix}_save_count")) * 4.0
+        + _float(row.get(f"{prefix}_download_count")) * 2.0
     )
 
 

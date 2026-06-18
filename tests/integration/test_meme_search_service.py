@@ -280,6 +280,27 @@ def _user_read(user: User) -> UserRead:
     return UserRead.model_validate(user)
 
 
+def _assert_public_page_attribution(
+    payload: dict[str, Any],
+    *,
+    source_algorithm: str,
+    surface: str,
+    ranks: list[int] | None = None,
+) -> None:
+    request_id = payload["request_id"]
+    assert request_id.startswith("req_")
+    impressions = [item["attribution"]["impression_id"] for item in payload["items"]]
+    assert len(impressions) == len(set(impressions))
+    expected_ranks = ranks or list(range(payload["offset"] + 1, payload["offset"] + len(payload["items"]) + 1))
+    for item, rank in zip(payload["items"], expected_ranks, strict=True):
+        attribution = item["attribution"]
+        assert attribution["request_id"] == request_id
+        assert attribution["impression_id"].startswith("imp_")
+        assert attribution["source_algorithm"] == source_algorithm
+        assert attribution["surface"] == surface
+        assert attribution["rank"] == rank
+
+
 def _install_meme_route_overrides(
     app: FastAPI,
     session: AsyncSession,
@@ -345,6 +366,12 @@ async def test_hybrid_search_ranks_by_weighted_semantic_text_and_popularity(
     page = await service.search_memes("frog", query_vector=(0.1, 0.2), limit=10)
 
     assert [item.meme.id for item in page.items] == [semantic_meme.id, text_meme.id, popular_meme.id]
+    assert page.request_id.startswith("req_")
+    assert {item.attribution.request_id for item in page.items} == {page.request_id}
+    assert len({item.attribution.impression_id for item in page.items}) == 3
+    assert [item.attribution.rank for item in page.items] == [1, 2, 3]
+    assert page.items[0].attribution.source_algorithm == "hybrid_search"
+    assert page.items[0].attribution.algorithm_version == SEARCH_INDEX_ALGORITHM_VERSION
     assert page.items[0].score.semantic == 1.0
     assert page.items[1].score.text == 1.0
     assert page.items[0].score.total > page.items[1].score.total
@@ -441,6 +468,20 @@ async def test_search_route_uses_plain_text_semantic_path_with_overridden_fakes(
     assert response.status_code == 200
     payload = response.json()
     assert [item["meme"]["id"] for item in payload["items"]] == [str(semantic_meme.id), str(text_meme.id)]
+    _assert_public_page_attribution(payload, source_algorithm="hybrid_search", surface="public_api_search")
+    first_attribution = payload["items"][0]["attribution"]
+    assert first_attribution["query"] == "frog wizard"
+    assert first_attribution["algorithm_version"] == SEARCH_INDEX_ALGORITHM_VERSION
+    assert set(first_attribution["score_components"]) == {"semantic", "text", "popularity", "total"}
+    assert first_attribution["score"] == first_attribution["score_components"]["total"]
+    assert first_attribution["filters"] == {
+        "language": None,
+        "media_type": None,
+        "include_nsfw": False,
+        "tags": [],
+        "scope": "public",
+        "collection_ids": [],
+    }
     assert "score" not in payload["items"][0]
     assert "s3_original_key" not in payload["items"][0]["meme"]["primary_file"]
     assert embedding_client.calls == ["frog wizard"]
@@ -503,12 +544,30 @@ async def test_public_openapi_registers_catalog_routes_without_internal_surface(
     assert "query_vector" not in search_parameters
     assert "lookback_hours" in trending_parameters
     assert "ignores this value" in trending_parameters["lookback_hours"]["description"]
-    assert set(components["PublicMemeSearchResultRead"]["properties"]) == {"meme"}
+    assert set(components["PublicMemeSearchResultRead"]["properties"]) == {"meme", "attribution"}
+    assert "request_id" in components["PublicMemeSearchPageRead"]["properties"]
+    assert "MemeResultAttributionRead" in components
+    assert set(components["MemeResultAttributionRead"]["properties"]) >= {
+        "request_id",
+        "impression_id",
+        "surface",
+        "source_algorithm",
+        "rank",
+        "query",
+        "filters",
+        "collection_scope",
+        "collection_ids",
+        "source_meme_id",
+        "algorithm_version",
+        "score",
+        "score_components",
+        "reason",
+    }
     assert "viewer_has_favorited" in components["PublicMemeCardRead"]["properties"]
     assert "viewer_has_saved" in components["PublicMemeCardRead"]["properties"]
     assert "viewer_has_pinned" in components["PublicMemeCardRead"]["properties"]
     assert "MemeSearchScoreRead" not in components
-    assert set(components["PublicMemeTrendRead"]["properties"]) == {"meme", "trend"}
+    assert set(components["PublicMemeTrendRead"]["properties"]) == {"meme", "trend", "attribution"}
     assert set(components["PublicMemePopularitySummaryRead"]["properties"]) == {"meme_id", "trend", "sparkline"}
     assert "s3_original_key" not in components["PublicMemeFileRead"]["properties"]
     assert "s3_web_video_key" not in components["PublicMemeFileRead"]["properties"]
@@ -703,6 +762,8 @@ async def test_public_route_json_includes_render_contract_without_storage_leakag
     assert response.status_code == 200
     payload = response.json()
     assert [item["meme"]["id"] for item in payload["items"]] == [str(meme.id)]
+    _assert_public_page_attribution(payload, source_algorithm="popular", surface="public_api_browse")
+    assert payload["items"][0]["attribution"]["reason"] == "browse_popular"
     assert payload["items"][0]["meme"]["viewer_has_favorited"] is False
     assert payload["items"][0]["meme"]["viewer_has_saved"] is False
     assert payload["items"][0]["meme"]["viewer_has_pinned"] is False
@@ -788,6 +849,12 @@ async def test_search_route_scope_collections_returns_only_authorized_requested_
     assert response.status_code == 200
     payload = response.json()
     assert [item["meme"]["id"] for item in payload["items"]] == [str(authorized_private.id)]
+    _assert_public_page_attribution(payload, source_algorithm="fallback_popular", surface="public_api_search")
+    assert payload["items"][0]["attribution"]["collection_scope"] == "collections"
+    assert payload["items"][0]["attribution"]["collection_ids"] == [
+        str(authorized_collection.id),
+        str(unauthorized_collection.id),
+    ]
     assert payload["items"][0]["meme"]["primary_file"]["render"]["thumbnail_url"] == (
         f"/api/v1/media/files/{authorized_private.primary_file_id}/thumbnail"
     )
@@ -1757,6 +1824,12 @@ async def test_tag_and_template_landing_routes_return_public_pages(
     assert tag_payload["slug"] == "reaction"
     assert tag_payload["page"]["total"] == 2
     assert [item["meme"]["id"] for item in tag_payload["page"]["items"]] == [str(first.id), str(second.id)]
+    _assert_public_page_attribution(
+        tag_payload["page"],
+        source_algorithm="popular",
+        surface="public_api_tag_landing",
+    )
+    assert tag_payload["page"]["items"][0]["attribution"]["reason"] == "tag_popular"
     assert str(unrelated.id) not in tag_response.text
 
     assert template_response.status_code == 200
@@ -1765,6 +1838,12 @@ async def test_tag_and_template_landing_routes_return_public_pages(
     assert template_payload["title"] == "Drake Template memes"
     assert template_payload["page"]["total"] == 2
     assert [item["meme"]["id"] for item in template_payload["page"]["items"]] == [str(first.id), str(second.id)]
+    _assert_public_page_attribution(
+        template_payload["page"],
+        source_algorithm="popular",
+        surface="public_api_template_landing",
+    )
+    assert template_payload["page"]["items"][0]["attribution"]["reason"] == "template_popular"
     assert missing_template_response.status_code == 404
 
 
@@ -1818,6 +1897,7 @@ async def test_browse_route_filters_and_paginates_popular_catalog(
     assert payload["total"] == 2
     assert payload["has_more"] is False
     assert [item["meme"]["id"] for item in payload["items"]] == [str(second.id)]
+    _assert_public_page_attribution(payload, source_algorithm="popular", surface="public_api_browse", ranks=[2])
     assert str(first.id) != str(second.id)
 
 
@@ -1860,13 +1940,23 @@ async def test_trending_route_ranks_recent_events_snapshots_and_popularity_witho
 
     assert first_response.status_code == 200
     assert second_response.status_code == 200
-    assert first_response.json() == second_response.json()
     payload = first_response.json()
+    second_payload = second_response.json()
     assert [item["meme"]["id"] for item in payload["items"]] == [
         str(event_meme.id),
         str(snapshot_meme.id),
         str(popularity_meme.id),
     ]
+    assert [item["meme"]["id"] for item in second_payload["items"]] == [
+        str(event_meme.id),
+        str(snapshot_meme.id),
+        str(popularity_meme.id),
+    ]
+    _assert_public_page_attribution(
+        payload,
+        source_algorithm="public_trends_mv_trending",
+        surface="public_api_trending",
+    )
     assert str(private_meme.id) not in first_response.text
     assert "telegram_user_id" not in first_response.text
     assert "telegram_user_hash" not in first_response.text
@@ -1894,6 +1984,9 @@ async def test_trending_memes_uses_strict_interaction_event_refs_for_recent_scor
     )
 
     assert [item.meme.id for item in page.items] == [strict_event_meme.id, no_event_meme.id]
+    assert page.request_id.startswith("req_")
+    assert [item.attribution.source_algorithm for item in page.items] == ["legacy_trending", "legacy_trending"]
+    assert [item.attribution.rank for item in page.items] == [1, 2]
 
 
 async def test_public_trend_endpoints_rank_from_materialized_views_and_return_aggregates(
@@ -1978,11 +2071,27 @@ async def test_public_trend_endpoints_rank_from_materialized_views_and_return_ag
     assert trending_response.json()["items"][0]["meme"]["id"] == str(snapshot_meme.id)
     assert rising_response.json()["items"][0]["meme"]["id"] == str(rising_meme.id)
     assert liked_response.json()["items"][0]["meme"]["id"] == str(liked_meme.id)
+    _assert_public_page_attribution(
+        trending_response.json(),
+        source_algorithm="public_trends_mv_trending",
+        surface="public_api_trends",
+    )
+    _assert_public_page_attribution(
+        rising_response.json(),
+        source_algorithm="public_trends_mv_fastest_rising",
+        surface="public_api_trends",
+    )
+    _assert_public_page_attribution(
+        liked_response.json(),
+        source_algorithm="public_trends_mv_most_liked",
+        surface="public_api_trends",
+    )
+    assert trending_response.json()["items"][0]["attribution"]["score_components"]["trending"] > 0
     assert liked_response.json()["items"][0]["trend"]["recent"]["likes"] == 3
     assert liked_response.json()["items"][0]["trend"]["recent"]["downloads"] == 2
     assert liked_response.json()["items"][0]["trend"]["previous"]["downloads"] == 0
     assert "payload" not in trending_response.text
-    assert "query" not in trending_response.text
+    assert "telegram_user" not in trending_response.text
 
     tag_payload = tag_response.json()
     reaction_summary = next(summary for summary in tag_payload if summary["slug"] == "reaction")
@@ -2046,7 +2155,13 @@ async def test_public_trend_empty_states_are_honest(
         app.dependency_overrides.clear()
 
     assert trends_response.status_code == 200
-    assert trends_response.json() == {"items": [], "limit": 20, "offset": 0, "total": 0, "has_more": False}
+    trends_payload = trends_response.json()
+    assert trends_payload["items"] == []
+    assert trends_payload["limit"] == 20
+    assert trends_payload["offset"] == 0
+    assert trends_payload["total"] == 0
+    assert trends_payload["has_more"] is False
+    assert trends_payload["request_id"].startswith("req_")
     assert tags_response.status_code == 200
     assert tags_response.json() == []
     # Static trend routes must be matched before dynamic /{meme_id} detail routes.
@@ -2429,6 +2544,9 @@ async def test_provider_failures_fall_back_to_popular_without_raw_error_payload(
     assert "provider-secret" not in response.text
     payload = response.json()
     assert [item["meme"]["id"] for item in payload["items"]] == [str(popular_meme.id)]
+    _assert_public_page_attribution(payload, source_algorithm="fallback_popular", surface="public_api_search")
+    assert payload["items"][0]["attribution"]["reason"] == "provider_failure"
+    assert payload["items"][0]["attribution"]["query"] == "frog"
     assert text_client.calls == [
         {
             "query": "frog",

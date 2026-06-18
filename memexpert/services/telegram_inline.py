@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
 from urllib.parse import urlparse
 
@@ -16,16 +16,18 @@ from memexpert.models.collection import PinnedMeme
 from memexpert.models.content import Meme, MemeFile, TelegramFileIdCache
 from memexpert.models.enums import AccountStatus, AccountType, AnalyticsEventType, ContentKind, TelegramMediaFormat
 from memexpert.models.user import AnalyticsEvent, User
+from memexpert.schemas.meme import MemeResultAttributionRead, new_discovery_request_id
 from memexpert.services.meme_search import (
     MemeSearchFilters,
     MemeSearchScope,
     _apply_filters,
+    _build_result_attribution,
     _search_scope_meme_stmt,
     _to_card_read,
 )
 
 if TYPE_CHECKING:
-    from memexpert.schemas.meme import MemeCardRead, MemeFileRead, MemeSearchPageRead
+    from memexpert.schemas.meme import MemeCardRead, MemeFileRead, MemeSearchPageRead, MemeSearchResultRead
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +45,7 @@ class TelegramInlineMemeSearchService(Protocol):
         filters: MemeSearchFilters | None = None,
         limit: int = 20,
         offset: int = 0,
+        surface: str = "telegram_inline_search",
     ) -> MemeSearchPageRead: ...
 
 
@@ -61,6 +64,7 @@ class TelegramInlineMediaResult:
     media_format: TelegramMediaFormat
     cached_file_id: str | None
     media_url: str | None
+    attribution: MemeResultAttributionRead = field(default_factory=MemeResultAttributionRead)
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +77,7 @@ class TelegramInlineSearchPage:
     total: int
     has_more: bool
     is_personal: bool
+    request_id: str = field(default_factory=new_discovery_request_id)
 
 
 class TelegramInlineServiceProtocol(Protocol):
@@ -95,6 +100,22 @@ class _InlineCandidate:
     meme: MemeCardRead
     file: MemeFileRead
     media_format: TelegramMediaFormat
+    attribution: MemeResultAttributionRead
+
+
+@dataclass(slots=True)
+class _InlineAttributedMeme:
+    meme: MemeCardRead
+    attribution: MemeResultAttributionRead
+
+
+@dataclass(frozen=True, slots=True)
+class _InlineSourcedMeme:
+    meme: Meme
+    source_algorithm: str
+    reason: str
+    score: float | None = None
+    score_components: dict[str, float] = field(default_factory=dict)
 
 
 class TelegramInlineService:
@@ -150,17 +171,19 @@ class TelegramInlineService:
         limit: int,
         offset: int,
     ) -> TelegramInlineSearchPage:
+        filters = MemeSearchFilters(
+            include_nsfw=linked_user.nsfw_enabled if linked_user else False,
+            scope=MemeSearchScope.ALL if linked_user else MemeSearchScope.PUBLIC,
+        )
         page = await self._meme_search_service.search_memes(
             query,
             viewer_user_id=linked_user.id if linked_user else None,
-            filters=MemeSearchFilters(
-                include_nsfw=linked_user.nsfw_enabled if linked_user else False,
-                scope=MemeSearchScope.ALL if linked_user else MemeSearchScope.PUBLIC,
-            ),
+            filters=filters,
             limit=limit,
             offset=offset,
+            surface="telegram_inline_search",
         )
-        items = await self._build_sendable_results([item.meme for item in page.items])
+        items = await self._build_sendable_results(_inline_items_from_search_results(page.items))
         return TelegramInlineSearchPage(
             items=items,
             limit=page.limit,
@@ -168,6 +191,7 @@ class TelegramInlineService:
             total=page.total,
             has_more=page.has_more,
             is_personal=linked_user is not None,
+            request_id=page.request_id,
         )
 
     async def _search_empty_query(
@@ -177,8 +201,19 @@ class TelegramInlineService:
         limit: int,
         offset: int,
     ) -> TelegramInlineSearchPage:
+        request_id = new_discovery_request_id()
         if linked_user is None:
-            candidate_memes = await self._load_popular_memes(viewer_user_id=None, include_nsfw=False)
+            candidate_memes = [
+                _InlineSourcedMeme(
+                    meme=meme,
+                    source_algorithm="popular",
+                    reason="empty_query_public_popular",
+                    score=meme.popularity_score,
+                    score_components={"popularity": meme.popularity_score},
+                )
+                for meme in await self._load_popular_memes(viewer_user_id=None, include_nsfw=False)
+            ]
+            filters = MemeSearchFilters(include_nsfw=False, scope=MemeSearchScope.PUBLIC)
             is_personal = False
         else:
             pinned_memes = await self._load_pinned_memes(linked_user)
@@ -187,17 +222,67 @@ class TelegramInlineService:
                 viewer_user_id=linked_user.id,
                 include_nsfw=linked_user.nsfw_enabled,
             )
-            candidate_memes = _dedupe_memes(pinned_memes, recent_memes, popular_memes)
+            candidate_memes = _dedupe_sourced_memes(
+                (
+                    _InlineSourcedMeme(
+                        meme=meme,
+                        source_algorithm="personalized_discovery",
+                        reason="pinned",
+                    )
+                    for meme in pinned_memes
+                ),
+                (
+                    _InlineSourcedMeme(
+                        meme=meme,
+                        source_algorithm="personalized_discovery",
+                        reason="recent_send",
+                    )
+                    for meme in recent_memes
+                ),
+                (
+                    _InlineSourcedMeme(
+                        meme=meme,
+                        source_algorithm="popular",
+                        reason="empty_query_popular_fallback",
+                        score=meme.popularity_score,
+                        score_components={"popularity": meme.popularity_score},
+                    )
+                    for meme in popular_memes
+                ),
+            )
+            filters = MemeSearchFilters(
+                include_nsfw=linked_user.nsfw_enabled,
+                scope=MemeSearchScope.ALL,
+            )
             is_personal = True
 
         page_memes = candidate_memes[offset : offset + limit]
         return TelegramInlineSearchPage(
-            items=await self._build_sendable_results([_to_card_read(meme) for meme in page_memes]),
+            items=await self._build_sendable_results(
+                [
+                    _InlineAttributedMeme(
+                        meme=_to_card_read(item.meme),
+                        attribution=_build_result_attribution(
+                            request_id=request_id,
+                            surface="telegram_inline_empty_query",
+                            source_algorithm=item.source_algorithm,
+                            rank=rank,
+                            query=None,
+                            filters=filters,
+                            score=item.score,
+                            score_components=item.score_components,
+                            reason=item.reason,
+                        ),
+                    )
+                    for rank, item in enumerate(page_memes, start=offset + 1)
+                ]
+            ),
             limit=limit,
             offset=offset,
             total=len(candidate_memes),
             has_more=offset + limit < len(candidate_memes),
             is_personal=is_personal,
+            request_id=request_id,
         )
 
     async def _resolve_active_linked_user(self, *, telegram_user_id: int) -> User | None:
@@ -283,7 +368,7 @@ class TelegramInlineService:
         memes_by_id = {meme.id: meme for meme in result.scalars().unique().all()}
         return [memes_by_id[meme_id] for meme_id in meme_ids if meme_id in memes_by_id]
 
-    async def _build_sendable_results(self, memes: list[MemeCardRead]) -> list[TelegramInlineMediaResult]:
+    async def _build_sendable_results(self, memes: list[_InlineAttributedMeme]) -> list[TelegramInlineMediaResult]:
         candidates = [_to_inline_candidate(meme) for meme in memes]
         supported_candidates = [candidate for candidate in candidates if candidate is not None]
         cache = await self._load_file_id_cache(
@@ -303,6 +388,7 @@ class TelegramInlineService:
                     media_format=candidate.media_format,
                     cached_file_id=cached_file_id,
                     media_url=media_url,
+                    attribution=candidate.attribution,
                 )
             )
         return results
@@ -350,7 +436,8 @@ def _visible_meme_stmt(viewer_user_id: uuid.UUID | None, *, include_nsfw: bool):
     )
 
 
-def _to_inline_candidate(meme: MemeCardRead) -> _InlineCandidate | None:
+def _to_inline_candidate(item: _InlineAttributedMeme) -> _InlineCandidate | None:
+    meme = item.meme
     file = meme.primary_file
     if file is None:
         return None
@@ -358,7 +445,7 @@ def _to_inline_candidate(meme: MemeCardRead) -> _InlineCandidate | None:
     media_format = _resolve_telegram_media_format(meme=meme, file=file)
     if media_format is None:
         return None
-    return _InlineCandidate(meme=meme, file=file, media_format=media_format)
+    return _InlineCandidate(meme=meme, file=file, media_format=media_format, attribution=item.attribution)
 
 
 def _resolve_telegram_media_format(*, meme: MemeCardRead, file: MemeFileRead) -> TelegramMediaFormat | None:
@@ -378,15 +465,19 @@ def public_https_url(value: str | None) -> str | None:
     return None
 
 
-def _dedupe_memes(*buckets: list[Meme]) -> list[Meme]:
-    deduped: list[Meme] = []
+def _inline_items_from_search_results(items: list[MemeSearchResultRead]) -> list[_InlineAttributedMeme]:
+    return [_InlineAttributedMeme(meme=item.meme, attribution=item.attribution) for item in items]
+
+
+def _dedupe_sourced_memes(*buckets: Iterable[_InlineSourcedMeme]) -> list[_InlineSourcedMeme]:
+    deduped: list[_InlineSourcedMeme] = []
     seen: set[uuid.UUID] = set()
     for bucket in buckets:
-        for meme in bucket:
-            if meme.id in seen:
+        for item in bucket:
+            if item.meme.id in seen:
                 continue
-            seen.add(meme.id)
-            deduped.append(meme)
+            seen.add(item.meme.id)
+            deduped.append(item)
     return deduped
 
 

@@ -3,12 +3,59 @@
 
 from __future__ import annotations
 
+import secrets
 import uuid
 from datetime import datetime
 
 from pydantic import BaseModel, Field
 
 from memexpert.models.enums import ContentKind, ContentLanguage
+
+
+def _new_discovery_id(prefix: str) -> str:
+    return f"{prefix}_{secrets.token_urlsafe(8)}"
+
+
+def new_discovery_request_id() -> str:
+    """Return a compact public-safe discovery page/request identifier."""
+
+    return _new_discovery_id("req")
+
+
+def new_discovery_impression_id() -> str:
+    """Return a compact public-safe visible-result impression identifier."""
+
+    return _new_discovery_id("imp")
+
+
+class MemeResultAttributionFiltersRead(BaseModel):
+    """Safe normalized discovery filters echoed for later interaction events."""
+
+    language: ContentLanguage | None = None
+    media_type: ContentKind | None = None
+    include_nsfw: bool = False
+    tags: list[str] = Field(default_factory=list)
+    scope: str | None = None
+    collection_ids: list[str] = Field(default_factory=list)
+
+
+class MemeResultAttributionRead(BaseModel):
+    """Public-safe source metadata for one discoverable meme impression."""
+
+    request_id: str | None = None
+    impression_id: str = Field(default_factory=new_discovery_impression_id)
+    surface: str | None = None
+    source_algorithm: str | None = None
+    rank: int | None = None
+    query: str | None = None
+    filters: MemeResultAttributionFiltersRead = Field(default_factory=MemeResultAttributionFiltersRead)
+    collection_scope: str | None = None
+    collection_ids: list[str] = Field(default_factory=list)
+    source_meme_id: uuid.UUID | None = None
+    algorithm_version: str | None = None
+    score: float | None = None
+    score_components: dict[str, float] = Field(default_factory=dict)
+    reason: str | None = None
 
 
 class MemeFileRead(BaseModel):
@@ -81,6 +128,7 @@ class MemeSearchResultRead(BaseModel):
 
     meme: MemeCardRead
     score: MemeSearchScoreRead
+    attribution: MemeResultAttributionRead = Field(default_factory=MemeResultAttributionRead)
 
 
 class MemeSearchPageRead(BaseModel):
@@ -91,6 +139,7 @@ class MemeSearchPageRead(BaseModel):
     offset: int
     total: int
     has_more: bool
+    request_id: str = Field(default_factory=new_discovery_request_id)
 
 
 class PublicMemeFileRenderRead(BaseModel):
@@ -158,6 +207,7 @@ class PublicMemeSearchResultRead(BaseModel):
     """One public search result without internal ranking/debug components."""
 
     meme: PublicMemeCardRead
+    attribution: MemeResultAttributionRead = Field(default_factory=MemeResultAttributionRead)
 
 
 class PublicMemeSearchPageRead(BaseModel):
@@ -168,6 +218,7 @@ class PublicMemeSearchPageRead(BaseModel):
     offset: int
     total: int
     has_more: bool
+    request_id: str = Field(default_factory=new_discovery_request_id)
 
 
 class PublicTrendCountsRead(BaseModel):
@@ -204,6 +255,7 @@ class PublicMemeTrendRead(BaseModel):
 
     meme: PublicMemeCardRead
     trend: PublicTrendMetricsRead
+    attribution: MemeResultAttributionRead = Field(default_factory=MemeResultAttributionRead)
 
 
 class PublicMemeTrendPageRead(BaseModel):
@@ -214,6 +266,7 @@ class PublicMemeTrendPageRead(BaseModel):
     offset: int
     total: int
     has_more: bool
+    request_id: str = Field(default_factory=new_discovery_request_id)
 
 
 class PublicMemePopularityPointRead(BaseModel):
@@ -333,6 +386,8 @@ __all__ = [
     "MemeCardRead",
     "MemeDetailRead",
     "MemeFileRead",
+    "MemeResultAttributionFiltersRead",
+    "MemeResultAttributionRead",
     "MemeSlugRedirectRead",
     "MemeSearchPageRead",
     "MemeSearchResultRead",
@@ -357,4 +412,6 @@ __all__ = [
     "PublicTrendTimelineMemeRead",
     "PublicTrendTimelinePageRead",
     "PublicTrendTimelinePeriodRead",
+    "new_discovery_impression_id",
+    "new_discovery_request_id",
 ]

@@ -233,6 +233,7 @@ async def record_chosen_inline_result(
     """
 
     file_id = _parse_result_file_id(chosen_result.result_id)
+    impression_id = _parse_result_impression_id(chosen_result.result_id)
     async with session_factory() as session:
         meme_id = None
         if file_id is not None:
@@ -249,6 +250,7 @@ async def record_chosen_inline_result(
                 "result_id": chosen_result.result_id,
                 "meme_id": str(meme_id) if meme_id is not None else None,
                 "meme_file_id": str(file_id) if file_id is not None else None,
+                "impression_id": impression_id,
             },
         )
 
@@ -382,7 +384,11 @@ async def _resolve_active_linked_user_id(
     return user.id, False
 
 def _to_inline_result(candidate: TelegramInlineMediaResult) -> InlineResult | None:
-    result_id = _build_result_id(media_format=candidate.media_format, file_id=candidate.file.id)
+    result_id = _build_result_id(
+        media_format=candidate.media_format,
+        file_id=candidate.file.id,
+        impression_id=candidate.attribution.impression_id,
+    )
     title = _build_title(candidate.meme)
     reply_markup = _build_library_reply_markup(result_id)
 
@@ -482,17 +488,31 @@ def _parse_offset(value: str) -> int:
         return 0
 
 
-def _build_result_id(*, media_format: TelegramMediaFormat, file_id: uuid.UUID) -> str:
+def _build_result_id(*, media_format: TelegramMediaFormat, file_id: uuid.UUID, impression_id: str | None = None) -> str:
     prefix = "p" if media_format is TelegramMediaFormat.PHOTO else "a"
-    return f"{prefix}:{file_id.hex}"
+    if not impression_id:
+        return f"{prefix}:{file_id.hex}"
+    result_id = f"{prefix}:{file_id.hex}:{impression_id}"
+    if len(result_id) <= 64:
+        return result_id
+    compact_impression_id = "imp_" + hashlib.sha256(impression_id.encode("utf-8")).hexdigest()[:12]
+    return f"{prefix}:{file_id.hex}:{compact_impression_id}"
 
 
 def _parse_result_file_id(result_id: str) -> uuid.UUID | None:
     try:
-        _, raw_file_id = result_id.split(":", maxsplit=1)
+        _, raw_file_id, *_ = result_id.split(":")
         return uuid.UUID(hex=raw_file_id)
     except ValueError, AttributeError:
         return None
+
+
+def _parse_result_impression_id(result_id: str) -> str | None:
+    try:
+        _prefix, _raw_file_id, raw_impression_id = result_id.split(":", maxsplit=2)
+    except ValueError:
+        return None
+    return raw_impression_id or None
 
 
 def _build_library_callback_data(action: str, result_id: str) -> str:

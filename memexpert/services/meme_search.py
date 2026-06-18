@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import uuid
 from dataclasses import dataclass, replace
 from datetime import timedelta
@@ -25,6 +26,8 @@ from memexpert.schemas.meme import (
     MemeCardRead,
     MemeDetailRead,
     MemeFileRead,
+    MemeResultAttributionFiltersRead,
+    MemeResultAttributionRead,
     MemeSearchPageRead,
     MemeSearchResultRead,
     MemeSearchScoreRead,
@@ -34,6 +37,8 @@ from memexpert.schemas.meme import (
     PublicMemeFileRead,
     PublicMemeSearchPageRead,
     PublicMemeSearchResultRead,
+    new_discovery_impression_id,
+    new_discovery_request_id,
 )
 from memexpert.services.media_render_urls import MediaRenderUrlService, PublicMediaRenderContext
 from memexpert.services.search_index_sync import SEARCH_INDEX_ALGORITHM_VERSION
@@ -46,6 +51,8 @@ TRENDING_EVENT_WEIGHT = 0.55
 TRENDING_SNAPSHOT_WEIGHT = 0.25
 TRENDING_POPULARITY_WEIGHT = 0.15
 TRENDING_LIKE_WEIGHT = 0.05
+POPULAR_ALGORITHM_VERSION = "popular_v1"
+LEGACY_TRENDING_ALGORITHM_VERSION = "legacy_trending_v1"
 TRENDING_EVENT_WEIGHTS = {
     AnalyticsEventType.MEME_DOWNLOAD: 2.0,
     AnalyticsEventType.MEME_VIEW: 1.0,
@@ -125,6 +132,12 @@ class _CandidateScore:
 
 
 @dataclass(frozen=True, slots=True)
+class _CollectedCandidates:
+    candidates: dict[uuid.UUID, _CandidateScore]
+    fallback_reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class _ViewerMemeActionState:
     favorited_meme_ids: frozenset[uuid.UUID] = frozenset()
     saved_meme_ids: frozenset[uuid.UUID] = frozenset()
@@ -175,33 +188,52 @@ class MemeSearchService:
         filters: MemeSearchFilters | None = None,
         limit: int = 20,
         offset: int = 0,
+        surface: str = "service_search",
     ) -> MemeSearchPageRead:
         resolved_filters = _resolve_search_filters(filters, viewer_user_id=viewer_user_id)
         resolved_limit = _clamp_limit(limit)
         resolved_offset = max(0, offset)
+        request_id = new_discovery_request_id()
         candidate_limit = max(resolved_limit + resolved_offset, resolved_limit) * 4
 
         normalized_query = query.strip()
-        resolved_query_vector = await self._resolve_query_vector(normalized_query, query_vector=query_vector)
+        resolved_query_vector, query_vector_provider_failed = await self._resolve_query_vector(
+            normalized_query,
+            query_vector=query_vector,
+        )
         index_prefilter = _build_search_index_prefilter(resolved_filters, viewer_user_id=viewer_user_id)
-        candidates = await self._collect_index_candidates(
+        collected_candidates = await self._collect_index_candidates(
             normalized_query,
             query_vector=resolved_query_vector,
             prefilter=index_prefilter,
             limit=candidate_limit,
+            provider_failed=query_vector_provider_failed,
         )
+        candidates = collected_candidates.candidates
         if not candidates:
             return await self._popular_page(
                 viewer_user_id=viewer_user_id,
                 filters=resolved_filters,
                 limit=resolved_limit,
                 offset=resolved_offset,
+                request_id=request_id,
+                surface=surface,
+                source_algorithm="fallback_popular",
+                query=normalized_query,
+                reason=collected_candidates.fallback_reason or "index_candidates_empty",
             )
 
         await self._resolve_missing_meme_ids(candidates)
         candidates = {score.meme_id: score for score in candidates.values() if score.meme_id is not None}
         if not candidates:
-            return MemeSearchPageRead(items=[], limit=resolved_limit, offset=resolved_offset, total=0, has_more=False)
+            return MemeSearchPageRead(
+                items=[],
+                limit=resolved_limit,
+                offset=resolved_offset,
+                total=0,
+                has_more=False,
+                request_id=request_id,
+            )
 
         memes = await self._load_visible_memes(
             tuple(candidates),
@@ -218,13 +250,27 @@ class MemeSearchService:
         )
         total = len(ranked_memes)
         page_memes = ranked_memes[resolved_offset : resolved_offset + resolved_limit]
-        items = [
-            MemeSearchResultRead(
-                meme=_to_card_read(meme),
-                score=_to_score_read(visible_scores[meme.id]),
+        items = []
+        for rank, meme in enumerate(page_memes, start=resolved_offset + 1):
+            score = visible_scores[meme.id]
+            score_read = _to_score_read(score)
+            items.append(
+                MemeSearchResultRead(
+                    meme=_to_card_read(meme),
+                    score=score_read,
+                    attribution=_build_result_attribution(
+                        request_id=request_id,
+                        surface=surface,
+                        source_algorithm="hybrid_search",
+                        rank=rank,
+                        query=normalized_query,
+                        filters=resolved_filters,
+                        score=score_read.total,
+                        score_components=_score_components(score_read),
+                        algorithm_version=SEARCH_INDEX_ALGORITHM_VERSION,
+                    ),
+                )
             )
-            for meme in page_memes
-        ]
 
         return MemeSearchPageRead(
             items=items,
@@ -232,6 +278,7 @@ class MemeSearchService:
             offset=resolved_offset,
             total=total,
             has_more=resolved_offset + resolved_limit < total,
+            request_id=request_id,
         )
 
     async def search_public_memes(
@@ -242,6 +289,7 @@ class MemeSearchService:
         filters: MemeSearchFilters | None = None,
         limit: int = 20,
         offset: int = 0,
+        surface: str = "public_api_search",
     ) -> PublicMemeSearchPageRead:
         resolved_filters = _resolve_search_filters(
             filters,
@@ -254,6 +302,7 @@ class MemeSearchService:
             filters=resolved_filters,
             limit=limit,
             offset=offset,
+            surface=surface,
         )
         return await self._to_public_search_page(
             page,
@@ -411,14 +460,19 @@ class MemeSearchService:
         filters: MemeSearchFilters | None = None,
         limit: int = 20,
         offset: int = 0,
+        surface: str = "service_browse",
     ) -> MemeSearchPageRead:
         """Return a stable popular catalog page using the service fallback behavior."""
 
         return await self._popular_page(
             viewer_user_id=viewer_user_id,
-            filters=filters or MemeSearchFilters(),
+            filters=_resolve_search_filters(filters, viewer_user_id=viewer_user_id),
             limit=_clamp_limit(limit),
             offset=max(0, offset),
+            request_id=new_discovery_request_id(),
+            surface=surface,
+            source_algorithm="popular",
+            reason="browse_popular",
         )
 
     async def browse_public_memes(
@@ -428,6 +482,7 @@ class MemeSearchService:
         filters: MemeSearchFilters | None = None,
         limit: int = 20,
         offset: int = 0,
+        surface: str = "public_api_browse",
     ) -> PublicMemeSearchPageRead:
         resolved_filters = _resolve_search_filters(
             filters,
@@ -439,6 +494,7 @@ class MemeSearchService:
             filters=resolved_filters,
             limit=limit,
             offset=offset,
+            surface=surface,
         )
         return await self._to_public_search_page(
             page,
@@ -454,6 +510,7 @@ class MemeSearchService:
         limit: int = 20,
         offset: int = 0,
         lookback_hours: int = 168,
+        surface: str = "service_trending",
     ) -> MemeSearchPageRead:
         """Return a deterministic popular/trending catalog page.
 
@@ -466,16 +523,24 @@ class MemeSearchService:
         payloads are never returned; only public meme DTOs leave the service.
         """
 
-        resolved_filters = filters or MemeSearchFilters()
+        resolved_filters = _resolve_search_filters(filters, viewer_user_id=viewer_user_id)
         resolved_limit = _clamp_limit(limit)
         resolved_offset = max(0, offset)
+        request_id = new_discovery_request_id()
         since = utcnow() - timedelta(hours=max(1, lookback_hours))
 
         base_stmt = _apply_filters(_visible_meme_stmt(viewer_user_id), resolved_filters)
         result = await self._session.execute(base_stmt)
         memes = list(result.scalars().all())
         if not memes:
-            return MemeSearchPageRead(items=[], limit=resolved_limit, offset=resolved_offset, total=0, has_more=False)
+            return MemeSearchPageRead(
+                items=[],
+                limit=resolved_limit,
+                offset=resolved_offset,
+                total=0,
+                has_more=False,
+                request_id=request_id,
+            )
 
         meme_ids = {meme.id for meme in memes}
         recent_scores = await self._recent_event_scores(meme_ids, since=since)
@@ -518,14 +583,40 @@ class MemeSearchService:
             reverse=True,
         )
         page = ranked[resolved_offset : resolved_offset + resolved_limit]
+        items = []
+        for rank, (meme, score, likes) in enumerate(page, start=resolved_offset + 1):
+            score_read = _to_score_read(score)
+            items.append(
+                MemeSearchResultRead(
+                    meme=_to_card_read(meme),
+                    score=score_read,
+                    attribution=_build_result_attribution(
+                        request_id=request_id,
+                        surface=surface,
+                        source_algorithm="legacy_trending",
+                        rank=rank,
+                        query=None,
+                        filters=resolved_filters,
+                        score=score.total,
+                        score_components={
+                            "recent_events": score.semantic,
+                            "snapshot": score.text,
+                            "popularity": score.popularity,
+                            "likes": likes,
+                            "total": score.total,
+                        },
+                        algorithm_version=LEGACY_TRENDING_ALGORITHM_VERSION,
+                        reason="recent_activity_popularity",
+                    ),
+                )
+            )
         return MemeSearchPageRead(
-            items=[
-                MemeSearchResultRead(meme=_to_card_read(meme), score=_to_score_read(score)) for meme, score, _ in page
-            ],
+            items=items,
             limit=resolved_limit,
             offset=resolved_offset,
             total=len(ranked),
             has_more=resolved_offset + resolved_limit < len(ranked),
+            request_id=request_id,
         )
 
     async def trending_public_memes(
@@ -536,6 +627,7 @@ class MemeSearchService:
         limit: int = 20,
         offset: int = 0,
         lookback_hours: int = 168,
+        surface: str = "public_api_trending_legacy",
     ) -> PublicMemeSearchPageRead:
         resolved_filters = _resolve_search_filters(
             filters,
@@ -544,10 +636,11 @@ class MemeSearchService:
         )
         page = await self.trending_memes(
             viewer_user_id=None,
-            filters=filters,
+            filters=resolved_filters,
             limit=limit,
             offset=offset,
             lookback_hours=lookback_hours,
+            surface=surface,
         )
         return await self._to_public_search_page(
             page,
@@ -592,8 +685,10 @@ class MemeSearchService:
         include_nsfw: bool = False,
         limit: int = 20,
         offset: int = 0,
+        surface: str = "service_tag_browse",
     ) -> MemeSearchPageRead:
         normalized_tag = tag.strip().lower()
+        request_id = new_discovery_request_id()
         if not normalized_tag:
             return MemeSearchPageRead(
                 items=[],
@@ -601,12 +696,17 @@ class MemeSearchService:
                 offset=max(0, offset),
                 total=0,
                 has_more=False,
+                request_id=request_id,
             )
         return await self._popular_page(
             viewer_user_id=viewer_user_id,
             filters=MemeSearchFilters(include_nsfw=include_nsfw, tags=(normalized_tag,)),
             limit=_clamp_limit(limit),
             offset=max(0, offset),
+            request_id=request_id,
+            surface=surface,
+            source_algorithm="popular",
+            reason="tag_popular",
         )
 
     async def browse_public_tag(
@@ -617,6 +717,7 @@ class MemeSearchService:
         include_nsfw: bool = False,
         limit: int = 20,
         offset: int = 0,
+        surface: str = "public_api_tag_landing",
     ) -> PublicMemeSearchPageRead:
         resolved_filters = _resolve_search_filters(
             MemeSearchFilters(include_nsfw=include_nsfw, tags=(tag.strip().lower(),)),
@@ -629,6 +730,7 @@ class MemeSearchService:
             include_nsfw=include_nsfw,
             limit=limit,
             offset=offset,
+            surface=surface,
         )
         return await self._to_public_search_page(
             page,
@@ -644,16 +746,19 @@ class MemeSearchService:
         include_nsfw: bool = False,
         limit: int = 20,
         offset: int = 0,
+        surface: str = "service_template_browse",
     ) -> tuple[MemeTemplate | None, MemeSearchPageRead]:
         normalized_slug = template_slug.strip().lower()
         resolved_limit = _clamp_limit(limit)
         resolved_offset = max(0, offset)
+        request_id = new_discovery_request_id()
         empty_page = MemeSearchPageRead(
             items=[],
             limit=resolved_limit,
             offset=resolved_offset,
             total=0,
             has_more=False,
+            request_id=request_id,
         )
         if not normalized_slug:
             return None, empty_page
@@ -673,16 +778,39 @@ class MemeSearchService:
         memes = list(result.scalars().all())
         max_popularity = max((meme.popularity_score for meme in memes), default=0.0)
         items = []
-        for meme in memes:
+        filters = _resolve_search_filters(
+            MemeSearchFilters(include_nsfw=include_nsfw),
+            viewer_user_id=viewer_user_id,
+        )
+        for rank, meme in enumerate(memes, start=resolved_offset + 1):
             popularity = _normalize_value(meme.popularity_score, max_popularity)
             score = _CandidateScore(popularity=popularity, total=POPULARITY_WEIGHT * popularity)
-            items.append(MemeSearchResultRead(meme=_to_card_read(meme), score=_to_score_read(score)))
+            score_read = _to_score_read(score)
+            items.append(
+                MemeSearchResultRead(
+                    meme=_to_card_read(meme),
+                    score=score_read,
+                    attribution=_build_result_attribution(
+                        request_id=request_id,
+                        surface=surface,
+                        source_algorithm="popular",
+                        rank=rank,
+                        query=None,
+                        filters=filters,
+                        score=score_read.total,
+                        score_components=_score_components(score_read),
+                        algorithm_version=POPULAR_ALGORITHM_VERSION,
+                        reason="template_popular",
+                    ),
+                )
+            )
         return template, MemeSearchPageRead(
             items=items,
             limit=resolved_limit,
             offset=resolved_offset,
             total=total,
             has_more=resolved_offset + resolved_limit < total,
+            request_id=request_id,
         )
 
     async def browse_public_template(
@@ -693,6 +821,7 @@ class MemeSearchService:
         include_nsfw: bool = False,
         limit: int = 20,
         offset: int = 0,
+        surface: str = "public_api_template_landing",
     ) -> tuple[MemeTemplate | None, PublicMemeSearchPageRead]:
         resolved_filters = _resolve_search_filters(
             MemeSearchFilters(include_nsfw=include_nsfw),
@@ -705,6 +834,7 @@ class MemeSearchService:
             include_nsfw=include_nsfw,
             limit=limit,
             offset=offset,
+            surface=surface,
         )
         return template, await self._to_public_search_page(
             page,
@@ -717,16 +847,16 @@ class MemeSearchService:
         query: str,
         *,
         query_vector: tuple[float, ...] | None,
-    ) -> tuple[float, ...] | None:
+    ) -> tuple[tuple[float, ...] | None, bool]:
         if query_vector is not None or not query or self._query_embedding_client is None:
-            return query_vector
+            return query_vector, False
 
         try:
             vector = await self._query_embedding_client.embed_query(query)
         except Exception:
             logger.exception("Text query embedding failed; falling back to text-only meme search.")
-            return None
-        return vector or None
+            return None, True
+        return vector or None, False
 
     async def _collect_index_candidates(
         self,
@@ -735,7 +865,8 @@ class MemeSearchService:
         query_vector: tuple[float, ...] | None,
         prefilter: SearchIndexPrefilter,
         limit: int,
-    ) -> dict[uuid.UUID, _CandidateScore]:
+        provider_failed: bool = False,
+    ) -> _CollectedCandidates:
         candidates: dict[uuid.UUID, _CandidateScore] = {}
 
         if self._text_client is not None and query:
@@ -743,6 +874,7 @@ class MemeSearchService:
                 text_hits = await self._text_client.search(query, limit=limit, prefilter=prefilter)
             except Exception:
                 logger.exception("Text meme search failed; falling back to semantic/popular candidates.")
+                provider_failed = True
                 text_hits = []
             for rank, hit in enumerate(text_hits, start=1):
                 key = _candidate_key_from_hit(hit)
@@ -761,6 +893,7 @@ class MemeSearchService:
                 )
             except Exception:
                 logger.exception("Semantic meme search failed; falling back to text-only candidates.")
+                provider_failed = True
                 semantic_hits = ()
             for semantic_hit in semantic_hits:
                 key = semantic_hit.meme_id
@@ -768,7 +901,10 @@ class MemeSearchService:
                 candidate.meme_file_id = semantic_hit.meme_file_id
                 candidate.semantic_raw = max(candidate.semantic_raw, semantic_hit.semantic_score)
 
-        return candidates
+        fallback_reason = None
+        if not candidates:
+            fallback_reason = "provider_failure" if provider_failed else "index_candidates_empty"
+        return _CollectedCandidates(candidates=candidates, fallback_reason=fallback_reason)
 
     async def _resolve_missing_meme_ids(self, candidates: dict[uuid.UUID, _CandidateScore]) -> None:
         missing_file_ids = tuple(
@@ -878,6 +1014,7 @@ class MemeSearchService:
                 offset=page.offset,
                 total=page.total,
                 has_more=page.has_more,
+                request_id=page.request_id,
             )
         use_authorized_cards = viewer_user_id is not None and filters.scope is not MemeSearchScope.PUBLIC
         stmt = (
@@ -892,31 +1029,36 @@ class MemeSearchService:
         result = await self._session.execute(stmt.where(Meme.id.in_(meme_ids)))
         memes_by_id = {meme.id: meme for meme in result.scalars().all()}
         action_state = await self._load_viewer_action_state(meme_ids, viewer_user_id=viewer_user_id)
-        public_items = [
-            PublicMemeSearchResultRead(
-                meme=(
-                    _to_authorized_card_read(
-                        meme,
-                        media_render_service=self._media_render_service,
-                        viewer_action_state=action_state,
-                    )
-                    if use_authorized_cards
-                    else _to_public_card_read(
-                        meme,
-                        media_render_service=self._media_render_service,
-                        viewer_action_state=action_state,
-                    )
-                ),
+        public_items = []
+        for source_item in page.items:
+            meme = memes_by_id.get(source_item.meme.id)
+            if meme is None:
+                continue
+            public_items.append(
+                PublicMemeSearchResultRead(
+                    meme=(
+                        _to_authorized_card_read(
+                            meme,
+                            media_render_service=self._media_render_service,
+                            viewer_action_state=action_state,
+                        )
+                        if use_authorized_cards
+                        else _to_public_card_read(
+                            meme,
+                            media_render_service=self._media_render_service,
+                            viewer_action_state=action_state,
+                        )
+                    ),
+                    attribution=_with_request_id(source_item.attribution, page.request_id),
+                )
             )
-            for meme_id in meme_ids
-            if (meme := memes_by_id.get(meme_id)) is not None
-        ]
         return PublicMemeSearchPageRead(
             items=public_items,
             limit=page.limit,
             offset=page.offset,
             total=page.total,
             has_more=page.has_more,
+            request_id=page.request_id,
         )
 
     async def _load_viewer_action_state(
@@ -1017,14 +1159,20 @@ class MemeSearchService:
         filters: MemeSearchFilters,
         limit: int,
         offset: int,
+        request_id: str,
+        surface: str,
+        source_algorithm: str,
+        query: str | None = None,
+        reason: str | None = None,
     ) -> MemeSearchPageRead:
+        resolved_filters = _resolve_search_filters(filters, viewer_user_id=viewer_user_id)
         base_stmt = _apply_filters(
             _search_scope_meme_stmt(
                 viewer_user_id,
-                scope=filters.scope or _default_search_scope(viewer_user_id),
-                collection_ids=filters.collection_ids,
+                scope=resolved_filters.scope or _default_search_scope(viewer_user_id),
+                collection_ids=resolved_filters.collection_ids,
             ),
-            filters,
+            resolved_filters,
         )
         total = await self._session.scalar(select(func.count()).select_from(base_stmt.order_by(None).subquery())) or 0
         result = await self._session.execute(
@@ -1033,11 +1181,36 @@ class MemeSearchService:
         memes = list(result.scalars().all())
         max_popularity = max((meme.popularity_score for meme in memes), default=0.0)
         items = []
-        for meme in memes:
+        for rank, meme in enumerate(memes, start=offset + 1):
             popularity = _normalize_value(meme.popularity_score, max_popularity)
             score = _CandidateScore(popularity=popularity, total=POPULARITY_WEIGHT * popularity)
-            items.append(MemeSearchResultRead(meme=_to_card_read(meme), score=_to_score_read(score)))
-        return MemeSearchPageRead(items=items, limit=limit, offset=offset, total=total, has_more=offset + limit < total)
+            score_read = _to_score_read(score)
+            items.append(
+                MemeSearchResultRead(
+                    meme=_to_card_read(meme),
+                    score=score_read,
+                    attribution=_build_result_attribution(
+                        request_id=request_id,
+                        surface=surface,
+                        source_algorithm=source_algorithm,
+                        rank=rank,
+                        query=query,
+                        filters=resolved_filters,
+                        score=score_read.total,
+                        score_components=_score_components(score_read),
+                        algorithm_version=POPULAR_ALGORITHM_VERSION,
+                        reason=reason,
+                    ),
+                )
+            )
+        return MemeSearchPageRead(
+            items=items,
+            limit=limit,
+            offset=offset,
+            total=total,
+            has_more=offset + limit < total,
+            request_id=request_id,
+        )
 
     def _apply_normalized_scores(
         self,
@@ -1115,6 +1288,77 @@ def _default_search_scope(viewer_user_id: uuid.UUID | None) -> MemeSearchScope:
 
 def _normalize_collection_ids(collection_ids: tuple[uuid.UUID, ...]) -> tuple[uuid.UUID, ...]:
     return tuple(dict.fromkeys(collection_ids))
+
+
+def _build_result_attribution(
+    *,
+    request_id: str,
+    surface: str,
+    source_algorithm: str,
+    rank: int,
+    query: str | None,
+    filters: MemeSearchFilters,
+    score: float | None = None,
+    score_components: dict[str, float] | None = None,
+    algorithm_version: str | None = None,
+    source_meme_id: uuid.UUID | None = None,
+    reason: str | None = None,
+    impression_id: str | None = None,
+) -> MemeResultAttributionRead:
+    filter_read = _to_attribution_filters_read(filters)
+    return MemeResultAttributionRead(
+        request_id=request_id,
+        impression_id=impression_id or new_discovery_impression_id(),
+        surface=surface,
+        source_algorithm=source_algorithm,
+        rank=rank,
+        query=query or None,
+        filters=filter_read,
+        collection_scope=filter_read.scope,
+        collection_ids=list(filter_read.collection_ids),
+        source_meme_id=source_meme_id,
+        algorithm_version=algorithm_version,
+        score=_safe_float(score),
+        score_components=_safe_score_components(score_components or {}),
+        reason=reason,
+    )
+
+
+def _to_attribution_filters_read(filters: MemeSearchFilters) -> MemeResultAttributionFiltersRead:
+    return MemeResultAttributionFiltersRead(
+        language=filters.language,
+        media_type=filters.media_type,
+        include_nsfw=filters.include_nsfw,
+        tags=list(filters.tags),
+        scope=filters.scope.value if filters.scope is not None else None,
+        collection_ids=[str(collection_id) for collection_id in filters.collection_ids],
+    )
+
+
+def _score_components(score: MemeSearchScoreRead) -> dict[str, float]:
+    return {
+        "semantic": score.semantic,
+        "text": score.text,
+        "popularity": score.popularity,
+        "total": score.total,
+    }
+
+
+def _safe_score_components(values: dict[str, float]) -> dict[str, float]:
+    return {key: safe_value for key, value in values.items() if (safe_value := _safe_float(value)) is not None}
+
+
+def _safe_float(value: float | None) -> float | None:
+    if value is None:
+        return None
+    converted = float(value)
+    if not math.isfinite(converted):
+        return None
+    return converted
+
+
+def _with_request_id(attribution: MemeResultAttributionRead, request_id: str) -> MemeResultAttributionRead:
+    return attribution.model_copy(update={"request_id": attribution.request_id or request_id})
 
 
 def _build_search_index_prefilter(
