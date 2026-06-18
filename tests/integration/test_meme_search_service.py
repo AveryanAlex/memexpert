@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from memexpert.api.dependencies import PIPELINE_OPERATOR_TOKEN_HEADER_NAME
 from memexpert.api.dependencies.auth import get_optional_current_user
+from memexpert.api.dependencies.collection import get_collection_service
 from memexpert.api.dependencies.meme import get_analytics_service, get_meme_search_service, get_public_trends_service
 from memexpert.core.config import Settings, get_settings
 from memexpert.core.qdrant import QdrantUserSearchMatch
@@ -32,6 +33,7 @@ from memexpert.models.enums import (
 from memexpert.models.user import AccountMergeLog, AnalyticsEvent, User
 from memexpert.schemas.user import UserRead
 from memexpert.services.analytics import AnalyticsService, InteractionEventRefs, InteractionEventWrite
+from memexpert.services.collection_service import CollectionService
 from memexpert.services.media_render_urls import MediaRenderUrlService
 from memexpert.services.meme_search import MemeNotFoundError, MemeSearchFilters, MemeSearchScope, MemeSearchService
 from memexpert.services.meme_seo import MemeSeoGenerationService, MemeSeoProviderResult
@@ -301,6 +303,15 @@ def _assert_public_page_attribution(
         assert attribution["rank"] == rank
 
 
+def _array_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    if schema.get("type") == "array":
+        return schema
+    for option in schema.get("anyOf", []):
+        if option.get("type") == "array":
+            return option
+    raise AssertionError(f"Expected array schema in {schema!r}")
+
+
 def _install_meme_route_overrides(
     app: FastAPI,
     session: AsyncSession,
@@ -317,11 +328,15 @@ def _install_meme_route_overrides(
     def override_analytics_service() -> AnalyticsService:
         return AnalyticsService(session)
 
+    def override_collection_service() -> CollectionService:
+        return CollectionService(session)
+
     def override_public_trends_service() -> PublicTrendsService:
         return PublicTrendsService(session)
 
     app.dependency_overrides[get_meme_search_service] = override_meme_search_service
     app.dependency_overrides[get_analytics_service] = override_analytics_service
+    app.dependency_overrides[get_collection_service] = override_collection_service
     app.dependency_overrides[get_public_trends_service] = override_public_trends_service
     app.dependency_overrides[get_optional_current_user] = override_current_user
 
@@ -531,8 +546,10 @@ async def test_public_openapi_registers_catalog_routes_without_internal_surface(
     assert "/api/v1/memes/{meme_id}/canonical" in paths
     assert "/api/v1/memes/{meme_id}/popularity" in paths
     assert "/api/v1/memes/{meme_id}" in paths
-    search_parameters = {parameter["name"] for parameter in paths["/api/v1/memes/search"]["get"]["parameters"]}
-    browse_parameters = {parameter["name"] for parameter in paths["/api/v1/memes/browse"]["get"]["parameters"]}
+    search_parameter_list = paths["/api/v1/memes/search"]["get"]["parameters"]
+    browse_parameter_list = paths["/api/v1/memes/browse"]["get"]["parameters"]
+    search_parameters = {parameter["name"]: parameter for parameter in search_parameter_list}
+    browse_parameters = {parameter["name"]: parameter for parameter in browse_parameter_list}
     trending_parameters = {
         parameter["name"]: parameter for parameter in paths["/api/v1/memes/trending"]["get"]["parameters"]
     }
@@ -542,6 +559,33 @@ async def test_public_openapi_registers_catalog_routes_without_internal_surface(
     assert "scope" in browse_parameters
     assert "collection_ids" in browse_parameters
     assert "query_vector" not in search_parameters
+    search_scope_schema = search_parameters["scope"]["schema"]
+    browse_scope_schema = browse_parameters["scope"]["schema"]
+    search_scope_refs = [
+        search_scope_schema.get("$ref"),
+        *(item.get("$ref") for item in search_scope_schema.get("anyOf", [])),
+    ]
+    browse_scope_refs = [
+        browse_scope_schema.get("$ref"),
+        *(item.get("$ref") for item in browse_scope_schema.get("anyOf", [])),
+    ]
+    assert "#/components/schemas/MemeSearchScope" in search_scope_refs
+    assert "#/components/schemas/MemeSearchScope" in browse_scope_refs
+    assert search_parameters["scope"]["required"] is False
+    assert browse_parameters["scope"]["required"] is False
+    assert search_scope_schema.get("default") == "public"
+    assert browse_scope_schema.get("default") == "public"
+    assert "If omitted, requests use public results" in search_parameters["scope"]["description"]
+    assert "scope=private, scope=all, and scope=collections require a current user" in browse_parameters[
+        "scope"
+    ]["description"]
+    assert components["MemeSearchScope"]["enum"] == ["public", "private", "all", "collections"]
+    collection_ids_schema = _array_schema(search_parameters["collection_ids"]["schema"])
+    assert collection_ids_schema["items"] == {"type": "string", "format": "uuid"}
+    assert collection_ids_schema["type"] == "array"
+    assert _array_schema(browse_parameters["collection_ids"]["schema"]) == collection_ids_schema
+    assert "scope=collections only" in search_parameters["collection_ids"]["description"]
+    assert "deduplicated in request order" in browse_parameters["collection_ids"]["description"]
     assert "lookback_hours" in trending_parameters
     assert "ignores this value" in trending_parameters["lookback_hours"]["description"]
     assert set(components["PublicMemeSearchResultRead"]["properties"]) == {"meme", "attribution"}
@@ -566,6 +610,15 @@ async def test_public_openapi_registers_catalog_routes_without_internal_surface(
     assert "viewer_has_favorited" in components["PublicMemeCardRead"]["properties"]
     assert "viewer_has_saved" in components["PublicMemeCardRead"]["properties"]
     assert "viewer_has_pinned" in components["PublicMemeCardRead"]["properties"]
+    viewer_access_schema = components["PublicMemeCardRead"]["properties"]["viewer_access"]
+    assert viewer_access_schema["anyOf"] == [
+        {"$ref": "#/components/schemas/PublicMemeViewerAccessRead"},
+        {"type": "null"},
+    ]
+    assert components["PublicMemeViewerAccessRead"]["properties"]["visibility"] == {
+        "$ref": "#/components/schemas/PublicMemeViewerAccess"
+    }
+    assert components["PublicMemeViewerAccess"]["enum"] == ["public", "private", "shared"]
     assert "MemeSearchScoreRead" not in components
     assert set(components["PublicMemeTrendRead"]["properties"]) == {"meme", "trend", "attribution"}
     assert set(components["PublicMemePopularitySummaryRead"]["properties"]) == {"meme_id", "trend", "sparkline"}
@@ -767,6 +820,7 @@ async def test_public_route_json_includes_render_contract_without_storage_leakag
     assert payload["items"][0]["meme"]["viewer_has_favorited"] is False
     assert payload["items"][0]["meme"]["viewer_has_saved"] is False
     assert payload["items"][0]["meme"]["viewer_has_pinned"] is False
+    assert payload["items"][0]["meme"]["viewer_access"] is None
     assert str(private_meme.id) not in response.text
     primary_file = payload["items"][0]["meme"]["primary_file"]
     assert "s3_original_key" not in primary_file
@@ -789,7 +843,7 @@ async def test_public_route_json_includes_render_contract_without_storage_leakag
     assert "pipeline/originals/private/hidden.jpg" not in response.text
 
 
-async def test_search_route_scope_collections_returns_only_authorized_requested_collection_memes(
+async def test_search_and_browse_routes_scope_collections_reject_unauthorized_collection_ids(
     app: FastAPI,
     client: AsyncClient,
     migrated_db_session: AsyncSession,
@@ -832,14 +886,84 @@ async def test_search_route_scope_collections_returns_only_authorized_requested_
     )
     _install_meme_route_overrides(app, migrated_db_session, current_user=_user_read(viewer), service=service)
 
+    params: list[tuple[str, str | int | float | None]] = [
+        ("scope", "collections"),
+        ("collection_ids", str(authorized_collection.id)),
+        ("collection_ids", str(unauthorized_collection.id)),
+        ("collection_ids", str(authorized_collection.id)),
+        ("limit", "10"),
+    ]
+    try:
+        responses = [
+            await client.get("/api/v1/memes/search", params=params),
+            await client.get("/api/v1/memes/browse", params=params),
+        ]
+    finally:
+        app.dependency_overrides.clear()
+
+    for response in responses:
+        assert response.status_code == 404
+        assert "does not exist" in response.json()["detail"]
+
+    event = await migrated_db_session.scalar(select(AnalyticsEvent))
+    assert event is None
+
+
+async def test_search_route_scope_collections_returns_multiple_authorized_collections_with_markers(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    viewer = build_full_user()
+    owner = build_full_user()
+    migrated_db_session.add_all([viewer, owner])
+    await migrated_db_session.flush()
+    owned_private = await _create_meme(
+        migrated_db_session,
+        is_public=False,
+        author_user_id=viewer.id,
+        popularity_score=30.0,
+        s3_original_key="pipeline/originals/private/owned-collection-route.jpg",
+    )
+    shared_private = await _create_meme(
+        migrated_db_session,
+        is_public=False,
+        author_user_id=owner.id,
+        popularity_score=20.0,
+        s3_original_key="pipeline/originals/private/shared-collection-route.jpg",
+    )
+    public_meme = await _create_meme(migrated_db_session, popularity_score=10.0)
+    owned_collection = await _create_collection(
+        migrated_db_session,
+        owner=viewer,
+        title="Owned collection",
+        memes=[owned_private],
+    )
+    shared_collection = await _create_collection(
+        migrated_db_session,
+        owner=owner,
+        title="Shared collection",
+        memberships=[(viewer, CollectionMembershipRole.VIEWER)],
+        memes=[shared_private],
+    )
+    await migrated_db_session.commit()
+
+    service = MemeSearchService(
+        migrated_db_session,
+        media_render_service=MediaRenderUrlService(
+            Settings.model_validate({"imgproxy_base_url": "https://img.memexpert.test"})
+        ),
+    )
+    _install_meme_route_overrides(app, migrated_db_session, current_user=_user_read(viewer), service=service)
+
     try:
         response = await client.get(
             "/api/v1/memes/search",
             params=[
                 ("scope", "collections"),
-                ("collection_ids", str(authorized_collection.id)),
-                ("collection_ids", str(unauthorized_collection.id)),
-                ("collection_ids", str(authorized_collection.id)),
+                ("collection_ids", str(owned_collection.id)),
+                ("collection_ids", str(shared_collection.id)),
+                ("collection_ids", str(owned_collection.id)),
                 ("limit", "10"),
             ],
         )
@@ -848,26 +972,281 @@ async def test_search_route_scope_collections_returns_only_authorized_requested_
 
     assert response.status_code == 200
     payload = response.json()
-    assert [item["meme"]["id"] for item in payload["items"]] == [str(authorized_private.id)]
+    assert [item["meme"]["id"] for item in payload["items"]] == [str(owned_private.id), str(shared_private.id)]
     _assert_public_page_attribution(payload, source_algorithm="fallback_popular", surface="public_api_search")
     assert payload["items"][0]["attribution"]["collection_scope"] == "collections"
     assert payload["items"][0]["attribution"]["collection_ids"] == [
-        str(authorized_collection.id),
-        str(unauthorized_collection.id),
+        str(owned_collection.id),
+        str(shared_collection.id),
     ]
+    access_by_meme_id = {item["meme"]["id"]: item["meme"]["viewer_access"] for item in payload["items"]}
+    assert access_by_meme_id == {
+        str(owned_private.id): {"visibility": "private"},
+        str(shared_private.id): {"visibility": "shared"},
+    }
     assert payload["items"][0]["meme"]["primary_file"]["render"]["thumbnail_url"] == (
-        f"/api/v1/media/files/{authorized_private.primary_file_id}/thumbnail"
+        f"/api/v1/media/files/{owned_private.primary_file_id}/thumbnail"
     )
-    assert str(unauthorized_private.id) not in response.text
-    assert "authorized-search-route.jpg" not in response.text
-    assert "unauthorized-search-route.jpg" not in response.text
+    assert str(public_meme.id) not in response.text
+    assert "owned-collection-route.jpg" not in response.text
+    assert "shared-collection-route.jpg" not in response.text
 
     event = await migrated_db_session.scalar(
         select(AnalyticsEvent).where(AnalyticsEvent.event_type == AnalyticsEventType.SEARCH_QUERY)
     )
     assert event is not None
     assert event.payload["scope"] == "collections"
-    assert event.payload["collection_ids"] == [str(authorized_collection.id), str(unauthorized_collection.id)]
+    assert event.payload["collection_ids"] == [str(owned_collection.id), str(shared_collection.id)]
+
+
+async def test_search_and_browse_routes_validate_scope_auth_and_collection_ids(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    viewer = build_full_user()
+    migrated_db_session.add(viewer)
+    await migrated_db_session.flush()
+    public_meme = await _create_meme(migrated_db_session, popularity_score=20.0)
+    private_meme = await _create_meme(
+        migrated_db_session,
+        is_public=False,
+        author_user_id=viewer.id,
+        popularity_score=30.0,
+    )
+    await migrated_db_session.commit()
+    collection_id = uuid.uuid4()
+
+    _install_meme_route_overrides(app, migrated_db_session)
+    try:
+        anonymous_default = await client.get("/api/v1/memes/search", params={"limit": 10})
+        anonymous_public = await client.get("/api/v1/memes/search", params={"scope": "public", "limit": 10})
+        anonymous_private = await client.get("/api/v1/memes/search", params={"scope": "private", "limit": 10})
+        anonymous_all = await client.get("/api/v1/memes/browse", params={"scope": "all", "limit": 10})
+        anonymous_collections = await client.get(
+            "/api/v1/memes/search",
+            params={"scope": "collections", "collection_ids": str(collection_id), "limit": 10},
+        )
+        anonymous_public_with_collection_ids = await client.get(
+            "/api/v1/memes/browse",
+            params={"scope": "public", "collection_ids": str(collection_id), "limit": 10},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert anonymous_default.status_code == 200
+    anonymous_default_payload = anonymous_default.json()
+    assert [item["meme"]["id"] for item in anonymous_default_payload["items"]] == [str(public_meme.id)]
+    assert anonymous_default_payload["items"][0]["attribution"]["filters"]["scope"] == "public"
+    assert str(private_meme.id) not in anonymous_default.text
+
+    assert anonymous_public.status_code == 200
+    anonymous_public_payload = anonymous_public.json()
+    assert [item["meme"]["id"] for item in anonymous_public_payload["items"]] == [str(public_meme.id)]
+    assert anonymous_private.status_code == 403
+    assert anonymous_all.status_code == 403
+    assert anonymous_collections.status_code == 403
+    assert "Authentication is required" in anonymous_all.json()["detail"]
+    assert "Authentication is required" in anonymous_collections.json()["detail"]
+    assert anonymous_public_with_collection_ids.status_code == 422
+    assert "collection_ids are only valid" in anonymous_public_with_collection_ids.json()["detail"]
+
+    _install_meme_route_overrides(app, migrated_db_session, current_user=_user_read(viewer))
+    try:
+        missing_collection_ids = await client.get(
+            "/api/v1/memes/search",
+            params={"scope": "collections", "limit": 10},
+        )
+        invalid_private_collection_ids = await client.get(
+            "/api/v1/memes/browse",
+            params={"scope": "private", "collection_ids": str(collection_id), "limit": 10},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert missing_collection_ids.status_code == 422
+    assert "requires at least one" in missing_collection_ids.json()["detail"]
+    assert invalid_private_collection_ids.status_code == 422
+    assert "collection_ids are only valid" in invalid_private_collection_ids.json()["detail"]
+
+
+async def test_search_route_private_and_all_scopes_mark_access_and_paginate_fallback_results(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    viewer = build_full_user()
+    owner = build_full_user()
+    stranger = build_full_user()
+    migrated_db_session.add_all([viewer, owner, stranger])
+    await migrated_db_session.flush()
+    public_meme = await _create_meme(migrated_db_session, popularity_score=30.0)
+    owned_private = await _create_meme(
+        migrated_db_session,
+        is_public=False,
+        author_user_id=viewer.id,
+        popularity_score=20.0,
+    )
+    shared_private = await _create_meme(
+        migrated_db_session,
+        is_public=False,
+        author_user_id=owner.id,
+        popularity_score=10.0,
+    )
+    unauthorized_private = await _create_meme(
+        migrated_db_session,
+        is_public=False,
+        author_user_id=stranger.id,
+        popularity_score=40.0,
+    )
+    _ = await _create_collection(
+        migrated_db_session,
+        owner=owner,
+        title="Shared access",
+        memberships=[(viewer, CollectionMembershipRole.VIEWER)],
+        memes=[shared_private],
+    )
+    await migrated_db_session.commit()
+
+    service = MemeSearchService(migrated_db_session)
+    _install_meme_route_overrides(app, migrated_db_session, current_user=_user_read(viewer), service=service)
+
+    try:
+        public_response = await client.get("/api/v1/memes/search", params={"scope": "public", "limit": 10})
+        private_response = await client.get("/api/v1/memes/search", params={"scope": "private", "limit": 10})
+        all_response = await client.get("/api/v1/memes/search", params={"scope": "all", "limit": 10})
+        default_response = await client.get("/api/v1/memes/search", params={"limit": 10})
+        paged_all_response = await client.get(
+            "/api/v1/memes/search",
+            params={"scope": "all", "limit": 1, "offset": 1},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert public_response.status_code == 200
+    public_payload = public_response.json()
+    assert [item["meme"]["id"] for item in public_payload["items"]] == [str(public_meme.id)]
+    assert public_payload["items"][0]["attribution"]["filters"]["scope"] == "public"
+
+    assert private_response.status_code == 200
+    private_payload = private_response.json()
+    assert [item["meme"]["id"] for item in private_payload["items"]] == [
+        str(owned_private.id),
+        str(shared_private.id),
+    ]
+    _assert_public_page_attribution(private_payload, source_algorithm="fallback_popular", surface="public_api_search")
+    assert private_payload["items"][0]["attribution"]["filters"]["scope"] == "private"
+    assert {item["meme"]["viewer_access"]["visibility"] for item in private_payload["items"]} == {
+        "private",
+        "shared",
+    }
+    assert str(unauthorized_private.id) not in private_response.text
+
+    assert all_response.status_code == 200
+    all_payload = all_response.json()
+    assert [item["meme"]["id"] for item in all_payload["items"]] == [
+        str(public_meme.id),
+        str(owned_private.id),
+        str(shared_private.id),
+    ]
+    assert [item["meme"]["viewer_access"]["visibility"] for item in all_payload["items"]] == [
+        "public",
+        "private",
+        "shared",
+    ]
+    assert all_payload["items"][0]["attribution"]["filters"]["scope"] == "all"
+    assert str(unauthorized_private.id) not in all_response.text
+
+    assert default_response.status_code == 200
+    default_payload = default_response.json()
+    assert [item["meme"]["id"] for item in default_payload["items"]] == [str(public_meme.id)]
+    assert default_payload["items"][0]["attribution"]["filters"]["scope"] == "public"
+    assert default_payload["items"][0]["meme"]["viewer_access"] is None
+
+    assert paged_all_response.status_code == 200
+    paged_payload = paged_all_response.json()
+    assert [item["meme"]["id"] for item in paged_payload["items"]] == [str(owned_private.id)]
+    assert paged_payload["limit"] == 1
+    assert paged_payload["offset"] == 1
+    assert paged_payload["total"] == 3
+    assert paged_payload["has_more"] is True
+
+
+async def test_guest_search_route_collections_scope_allows_favorites(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    guest = User()
+    stranger = build_full_user()
+    migrated_db_session.add_all([guest, stranger])
+    await migrated_db_session.flush()
+    guest_private_upload = await _create_meme(
+        migrated_db_session,
+        is_public=False,
+        author_user_id=guest.id,
+        popularity_score=20.0,
+    )
+    guest_favorite_public = await _create_meme(migrated_db_session, popularity_score=30.0)
+    stranger_private = await _create_meme(
+        migrated_db_session,
+        is_public=False,
+        author_user_id=stranger.id,
+        popularity_score=40.0,
+    )
+    favorites = await _create_collection(
+        migrated_db_session,
+        owner=guest,
+        title="Favorites",
+        kind=CollectionKind.FAVORITES,
+        memes=[guest_favorite_public],
+    )
+    await migrated_db_session.commit()
+
+    service = MemeSearchService(migrated_db_session)
+    _install_meme_route_overrides(app, migrated_db_session, current_user=_user_read(guest), service=service)
+
+    try:
+        default_response = await client.get("/api/v1/memes/search", params={"limit": 10})
+        all_response = await client.get("/api/v1/memes/search", params={"scope": "all", "limit": 10})
+        collections_response = await client.get(
+            "/api/v1/memes/search",
+            params={"scope": "collections", "collection_ids": str(favorites.id), "limit": 10},
+        )
+        private_response = await client.get("/api/v1/memes/search", params={"scope": "private", "limit": 10})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert default_response.status_code == 200
+    default_payload = default_response.json()
+    assert [item["meme"]["id"] for item in default_payload["items"]] == [str(guest_favorite_public.id)]
+    assert default_payload["items"][0]["attribution"]["filters"]["scope"] == "public"
+    assert default_payload["items"][0]["meme"]["viewer_access"] is None
+
+    assert all_response.status_code == 200
+    all_payload = all_response.json()
+    assert [item["meme"]["id"] for item in all_payload["items"]] == [
+        str(guest_favorite_public.id),
+        str(guest_private_upload.id),
+    ]
+    assert all_payload["items"][0]["attribution"]["filters"]["scope"] == "all"
+
+    assert collections_response.status_code == 200
+    collections_payload = collections_response.json()
+    assert [item["meme"]["id"] for item in collections_payload["items"]] == [str(guest_favorite_public.id)]
+    assert collections_payload["items"][0]["meme"]["viewer_access"] == {"visibility": "public"}
+
+    assert private_response.status_code == 200
+    private_payload = private_response.json()
+    assert [item["meme"]["id"] for item in private_payload["items"]] == [
+        str(guest_favorite_public.id),
+        str(guest_private_upload.id),
+    ]
+    assert [item["meme"]["viewer_access"]["visibility"] for item in private_payload["items"]] == [
+        "public",
+        "private",
+    ]
+    assert str(stranger_private.id) not in private_response.text
 
 
 async def test_public_search_and_detail_do_not_emit_authenticated_private_media(
@@ -1282,11 +1661,17 @@ async def test_public_wrappers_stay_public_by_default_and_allow_authorized_scope
     )
 
     assert [item.meme.id for item in default_search_page.items] == [public_meme.id]
+    assert default_search_page.items[0].meme.viewer_access is None
     assert private_meme.id not in {item.meme.id for item in default_browse_page.items}
     assert {item.meme.id for item in expanded_search_page.items} == {public_meme.id, private_meme.id}
     assert {item.meme.id for item in expanded_browse_page.items} == {public_meme.id, private_meme.id}
 
+    public_card = next(item.meme for item in expanded_search_page.items if item.meme.id == public_meme.id)
+    assert public_card.viewer_access is not None
+    assert public_card.viewer_access.visibility == "public"
     private_card = next(item.meme for item in expanded_search_page.items if item.meme.id == private_meme.id)
+    assert private_card.viewer_access is not None
+    assert private_card.viewer_access.visibility == "private"
     assert private_card.primary_file is not None
     assert private_card.primary_file.render is not None
     assert private_card.primary_file.render.thumbnail_url == (

@@ -6,6 +6,7 @@ from __future__ import annotations
 import secrets
 import uuid
 from datetime import datetime
+from enum import StrEnum
 
 from pydantic import BaseModel, Field
 
@@ -169,6 +170,20 @@ class PublicMemeFileRead(BaseModel):
     render: PublicMemeFileRenderRead | None = None
 
 
+class PublicMemeViewerAccess(StrEnum):
+    """Safe viewer-relative visibility markers for expanded search scopes."""
+
+    PUBLIC = "public"
+    PRIVATE = "private"
+    SHARED = "shared"
+
+
+class PublicMemeViewerAccessRead(BaseModel):
+    """Viewer-relative result visibility without owner or collection metadata."""
+
+    visibility: PublicMemeViewerAccess
+
+
 class PublicMemeCardRead(BaseModel):
     """Safe public meme card for catalog search and browse responses."""
 
@@ -185,6 +200,7 @@ class PublicMemeCardRead(BaseModel):
     viewer_has_favorited: bool = False
     viewer_has_saved: bool = False
     viewer_has_pinned: bool = False
+    viewer_access: PublicMemeViewerAccessRead | None = None
     created_at: datetime
     updated_at: datetime
 

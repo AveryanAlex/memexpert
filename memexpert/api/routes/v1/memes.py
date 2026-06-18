@@ -38,6 +38,7 @@ from memexpert.schemas.meme import (
 from memexpert.schemas.report import MemeReportCreateRequest, MemeReportRead
 from memexpert.schemas.user import UserRead
 from memexpert.services import (
+    CollectionService,
     CollectionServiceError,
     InvalidPinnedMemeOrderError,
     PinLimitExceededError,
@@ -47,6 +48,16 @@ from memexpert.services.public_trends import PublicTrendRanking, PublicTrendTime
 from memexpert.services.report import MemeReportTargetNotVisibleError
 
 router = APIRouter(prefix="/memes", tags=["memes"])
+
+SEARCH_SCOPE_DESCRIPTION = (
+    "Optional search visibility scope. If omitted, requests use public results for HTTP public API "
+    "compatibility. scope=private, scope=all, and scope=collections require a current user."
+)
+COLLECTION_IDS_DESCRIPTION = (
+    "Repeated collection UUIDs for scope=collections only. At least one value is required for "
+    "scope=collections; values are deduplicated in request order and every collection must be readable "
+    "by the current user before search runs."
+)
 
 
 class ActiveSaveCollectionUpdateRequest(BaseModel):
@@ -65,12 +76,13 @@ class PinReorderRequest(BaseModel):
 async def search_memes(
     meme_search_service: MemeSearchServiceDep,
     analytics_service: AnalyticsServiceDep,
+    collection_service: CollectionServiceDep,
     current_user: OptionalCurrentUserDep,
     query: Annotated[str, Query(max_length=500)] = "",
     language: Annotated[ContentLanguage | None, Query()] = None,
     media_type: Annotated[ContentKind | None, Query()] = None,
-    scope: Annotated[MemeSearchScope, Query()] = MemeSearchScope.PUBLIC,
-    collection_ids: Annotated[list[uuid.UUID] | None, Query()] = None,
+    scope: Annotated[MemeSearchScope, Query(description=SEARCH_SCOPE_DESCRIPTION)] = MemeSearchScope.PUBLIC,
+    collection_ids: Annotated[list[uuid.UUID] | None, Query(description=COLLECTION_IDS_DESCRIPTION)] = None,
     include_nsfw: Annotated[bool, Query()] = False,
     tags: Annotated[list[str] | None, Query()] = None,
     limit: Annotated[int, Query(ge=1, le=100)] = 20,
@@ -81,17 +93,20 @@ async def search_memes(
     Plain text in ``query`` is embedded inside the service boundary before Qdrant search.
     """
 
+    filters = await _validated_search_filters(
+        collection_service=collection_service,
+        current_user=current_user,
+        language=language,
+        media_type=media_type,
+        scope=scope,
+        collection_ids=collection_ids,
+        include_nsfw=_nsfw_allowed(current_user, include_nsfw),
+        tags=tags,
+    )
     page = await meme_search_service.search_public_memes(
         query,
         viewer_user_id=current_user.id if current_user else None,
-        filters=_build_filters(
-            language=language,
-            media_type=media_type,
-            scope=scope,
-            collection_ids=collection_ids,
-            include_nsfw=_nsfw_allowed(current_user, include_nsfw),
-            tags=tags,
-        ),
+        filters=filters,
         limit=limit,
         offset=offset,
         surface="public_api_search",
@@ -104,10 +119,10 @@ async def search_memes(
             "query": query.strip(),
             "language": language.value if language is not None else None,
             "media_type": media_type.value if media_type is not None else None,
-            "scope": scope.value,
-            "collection_ids": _normalized_collection_id_strings(collection_ids),
-            "include_nsfw": _nsfw_allowed(current_user, include_nsfw),
-            "tags": [tag.strip() for tag in tags or [] if tag.strip()],
+            "scope": filters.scope.value if filters.scope is not None else None,
+            "collection_ids": _collection_id_strings(filters.collection_ids),
+            "include_nsfw": filters.include_nsfw,
+            "tags": list(filters.tags),
             "limit": limit,
             "offset": offset,
             "result_count": len(page.items),
@@ -120,11 +135,12 @@ async def search_memes(
 @router.get("/browse", response_model=PublicMemeSearchPageRead, summary="Browse popular memes")
 async def browse_memes(
     meme_search_service: MemeSearchServiceDep,
+    collection_service: CollectionServiceDep,
     current_user: OptionalCurrentUserDep,
     language: Annotated[ContentLanguage | None, Query()] = None,
     media_type: Annotated[ContentKind | None, Query()] = None,
-    scope: Annotated[MemeSearchScope, Query()] = MemeSearchScope.PUBLIC,
-    collection_ids: Annotated[list[uuid.UUID] | None, Query()] = None,
+    scope: Annotated[MemeSearchScope, Query(description=SEARCH_SCOPE_DESCRIPTION)] = MemeSearchScope.PUBLIC,
+    collection_ids: Annotated[list[uuid.UUID] | None, Query(description=COLLECTION_IDS_DESCRIPTION)] = None,
     include_nsfw: Annotated[bool, Query()] = False,
     tags: Annotated[list[str] | None, Query()] = None,
     limit: Annotated[int, Query(ge=1, le=100)] = 20,
@@ -132,16 +148,19 @@ async def browse_memes(
 ) -> PublicMemeSearchPageRead:
     """Return a stable popular catalog page with the same filters as search."""
 
+    filters = await _validated_search_filters(
+        collection_service=collection_service,
+        current_user=current_user,
+        language=language,
+        media_type=media_type,
+        scope=scope,
+        collection_ids=collection_ids,
+        include_nsfw=_nsfw_allowed(current_user, include_nsfw),
+        tags=tags,
+    )
     page = await meme_search_service.browse_public_memes(
         viewer_user_id=current_user.id if current_user else None,
-        filters=_build_filters(
-            language=language,
-            media_type=media_type,
-            scope=scope,
-            collection_ids=collection_ids,
-            include_nsfw=_nsfw_allowed(current_user, include_nsfw),
-            tags=tags,
-        ),
+        filters=filters,
         limit=limit,
         offset=offset,
         surface="public_api_browse",
@@ -632,8 +651,10 @@ async def get_meme_detail(
     return detail
 
 
-def _build_filters(
+async def _validated_search_filters(
     *,
+    collection_service: CollectionService,
+    current_user: UserRead | None,
     language: ContentLanguage | None,
     media_type: ContentKind | None,
     scope: MemeSearchScope,
@@ -641,11 +662,49 @@ def _build_filters(
     include_nsfw: bool,
     tags: list[str] | None,
 ) -> MemeSearchFilters:
+    normalized_collection_ids = _normalized_collection_ids(collection_ids)
+
+    if scope is not MemeSearchScope.COLLECTIONS and normalized_collection_ids:
+        raise _invalid_search_scope_http_error("collection_ids are only valid when scope=collections.")
+    if scope is not MemeSearchScope.PUBLIC and current_user is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Authentication is required for private, all, or collections meme search scopes.",
+        )
+    if scope is MemeSearchScope.COLLECTIONS:
+        if not normalized_collection_ids:
+            raise _invalid_search_scope_http_error("scope=collections requires at least one collection_ids value.")
+        assert current_user is not None
+        for collection_id in normalized_collection_ids:
+            try:
+                await collection_service.get_collection_for_user(collection_id=collection_id, user_id=current_user.id)
+            except CollectionServiceError as exc:
+                raise _collection_http_error(exc) from exc
+
+    return _build_filters(
+        language=language,
+        media_type=media_type,
+        scope=scope,
+        collection_ids=normalized_collection_ids,
+        include_nsfw=include_nsfw,
+        tags=tags,
+    )
+
+
+def _build_filters(
+    *,
+    language: ContentLanguage | None,
+    media_type: ContentKind | None,
+    scope: MemeSearchScope,
+    collection_ids: tuple[uuid.UUID, ...],
+    include_nsfw: bool,
+    tags: list[str] | None,
+) -> MemeSearchFilters:
     return MemeSearchFilters(
         language=language,
         media_type=media_type,
         scope=scope,
-        collection_ids=tuple(dict.fromkeys(collection_ids or [])),
+        collection_ids=collection_ids,
         include_nsfw=include_nsfw,
         tags=tuple(tag.strip() for tag in tags or () if tag.strip()),
     )
@@ -655,8 +714,16 @@ def _nsfw_allowed(current_user: UserRead | None, include_nsfw: bool) -> bool:
     return include_nsfw and bool(current_user and current_user.nsfw_enabled)
 
 
-def _normalized_collection_id_strings(collection_ids: list[uuid.UUID] | None) -> list[str]:
-    return [str(collection_id) for collection_id in dict.fromkeys(collection_ids or [])]
+def _normalized_collection_ids(collection_ids: list[uuid.UUID] | None) -> tuple[uuid.UUID, ...]:
+    return tuple(dict.fromkeys(collection_ids or []))
+
+
+def _collection_id_strings(collection_ids: tuple[uuid.UUID, ...]) -> list[str]:
+    return [str(collection_id) for collection_id in collection_ids]
+
+
+def _invalid_search_scope_http_error(detail: str) -> HTTPException:
+    return HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=detail)
 
 
 def _trend_page_to_search_page(page: PublicMemeTrendPageRead) -> PublicMemeSearchPageRead:

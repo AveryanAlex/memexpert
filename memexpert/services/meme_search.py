@@ -37,6 +37,8 @@ from memexpert.schemas.meme import (
     PublicMemeFileRead,
     PublicMemeSearchPageRead,
     PublicMemeSearchResultRead,
+    PublicMemeViewerAccess,
+    PublicMemeViewerAccessRead,
     new_discovery_impression_id,
     new_discovery_request_id,
 )
@@ -1029,6 +1031,11 @@ class MemeSearchService:
         result = await self._session.execute(stmt.where(Meme.id.in_(meme_ids)))
         memes_by_id = {meme.id: meme for meme in result.scalars().all()}
         action_state = await self._load_viewer_action_state(meme_ids, viewer_user_id=viewer_user_id)
+        access_markers = await self._load_viewer_access_markers(
+            tuple(memes_by_id.values()),
+            viewer_user_id=viewer_user_id,
+            filters=filters,
+        )
         public_items = []
         for source_item in page.items:
             meme = memes_by_id.get(source_item.meme.id)
@@ -1041,6 +1048,7 @@ class MemeSearchService:
                             meme,
                             media_render_service=self._media_render_service,
                             viewer_action_state=action_state,
+                            viewer_access=access_markers.get(meme.id),
                         )
                         if use_authorized_cards
                         else _to_public_card_read(
@@ -1124,6 +1132,67 @@ class MemeSearchService:
             saved_meme_ids=frozenset(saved_meme_ids),
             pinned_meme_ids=frozenset(pinned_meme_ids),
         )
+
+    async def _load_viewer_access_markers(
+        self,
+        memes: tuple[Meme, ...],
+        *,
+        viewer_user_id: uuid.UUID | None,
+        filters: MemeSearchFilters,
+    ) -> dict[uuid.UUID, PublicMemeViewerAccessRead]:
+        if viewer_user_id is None or not memes or filters.scope is MemeSearchScope.PUBLIC:
+            return {}
+
+        collection_access = await self._load_collection_access_markers(
+            tuple(meme.id for meme in memes),
+            viewer_user_id=viewer_user_id,
+            filters=filters,
+        )
+        markers: dict[uuid.UUID, PublicMemeViewerAccessRead] = {}
+        for meme in memes:
+            if meme.is_public:
+                visibility = PublicMemeViewerAccess.PUBLIC
+            elif meme.author_user_id == viewer_user_id:
+                visibility = PublicMemeViewerAccess.PRIVATE
+            else:
+                visibility = collection_access.get(meme.id, PublicMemeViewerAccess.PRIVATE)
+            markers[meme.id] = PublicMemeViewerAccessRead(visibility=visibility)
+        return markers
+
+    async def _load_collection_access_markers(
+        self,
+        meme_ids: tuple[uuid.UUID, ...],
+        *,
+        viewer_user_id: uuid.UUID,
+        filters: MemeSearchFilters,
+    ) -> dict[uuid.UUID, PublicMemeViewerAccess]:
+        stmt = (
+            select(CollectionMeme.meme_id, Collection.owner_id)
+            .select_from(CollectionMeme)
+            .join(Collection, Collection.id == CollectionMeme.collection_id)
+            .outerjoin(
+                CollectionMember,
+                and_(
+                    CollectionMember.collection_id == Collection.id,
+                    CollectionMember.user_id == viewer_user_id,
+                ),
+            )
+            .where(
+                CollectionMeme.meme_id.in_(meme_ids),
+                or_(Collection.owner_id == viewer_user_id, CollectionMember.user_id.is_not(None)),
+            )
+        )
+        if filters.scope is MemeSearchScope.COLLECTIONS:
+            stmt = stmt.where(Collection.id.in_(filters.collection_ids))
+
+        result = await self._session.execute(stmt)
+        markers: dict[uuid.UUID, PublicMemeViewerAccess] = {}
+        for meme_id, owner_id in result.all():
+            if owner_id == viewer_user_id:
+                markers[meme_id] = PublicMemeViewerAccess.PRIVATE
+            else:
+                markers.setdefault(meme_id, PublicMemeViewerAccess.SHARED)
+        return markers
 
     async def load_public_meme_cards(
         self,
@@ -1625,6 +1694,7 @@ def _to_authorized_card_read(
     *,
     media_render_service: MediaRenderUrlService,
     viewer_action_state: _ViewerMemeActionState | None = None,
+    viewer_access: PublicMemeViewerAccessRead | None = None,
 ) -> PublicMemeCardRead:
     seo_slug = meme.seo_page.slug if meme.seo_page else None
     caption = meme.seo_page.caption if meme.seo_page else None
@@ -1652,6 +1722,7 @@ def _to_authorized_card_read(
         viewer_has_favorited=viewer_action_state.has_favorited(meme.id) if viewer_action_state else False,
         viewer_has_saved=viewer_action_state.has_saved(meme.id) if viewer_action_state else False,
         viewer_has_pinned=viewer_action_state.has_pinned(meme.id) if viewer_action_state else False,
+        viewer_access=viewer_access,
         created_at=meme.created_at,
         updated_at=meme.updated_at,
     )
