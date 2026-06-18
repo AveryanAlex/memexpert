@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import uuid
@@ -523,6 +524,31 @@ def build_png_bytes(*, color: tuple[int, int, int]) -> bytes:
     return output.getvalue()
 
 
+def build_seeded_png_bytes(*, seed: str) -> bytes:
+    """Generate deterministic but byte-distinct PNG payloads for seeded uploads.
+
+    ``create_upload`` intentionally performs exact SHA-256 deduplication before
+    media inspection and pHash comparison. Runtime tests that seed independent
+    files must therefore vary the actual bytes, not just the fake pHash.
+    """
+
+    digest = hashlib.sha256(seed.encode("utf-8")).digest()
+    image = Image.new("RGB", (8, 8))
+    for pixel_index in range(8 * 8):
+        offset = (pixel_index * 3) % len(digest)
+        image.putpixel(
+            (pixel_index % 8, pixel_index // 8),
+            (
+                digest[offset],
+                digest[(offset + 1) % len(digest)],
+                digest[(offset + 2) % len(digest)],
+            ),
+        )
+    output = BytesIO()
+    image.save(output, format="PNG")
+    return output.getvalue()
+
+
 def build_normalized_media_result(meme_file_id: uuid.UUID) -> NormalizedMediaResult:
     """Create a stable normalized transcode artifact for runtime assertions."""
 
@@ -1030,6 +1056,7 @@ async def _seed_embed_pending_item(
 ) -> tuple[uuid.UUID, ContentPipelineDispatchEvent, NormalizedMediaResult]:
     """Create a pipeline item and drive it to the EMBED-pending state via the service."""
 
+    initial_event_count = len(publisher.events)
     media_processor: PipelineMediaProcessorProtocol | None = None
     if phash_tag is not None:
         media_processor = FakeMediaProcessor(
@@ -1050,7 +1077,9 @@ async def _seed_embed_pending_item(
         ),
         filename="embed-runtime.png",
         content_type="image/png",
-        media_bytes=build_png_bytes(color=(30, 40, 50)),
+        media_bytes=build_seeded_png_bytes(
+            seed=f"embed-runtime:{source_id}:{post_id}:{phash_tag or ''}",
+        ),
     )
     normalized = build_normalized_media_result(item.meme_file_id)
     storage_client.objects[normalized.web_video_object_key] = StoredObject(
@@ -1069,7 +1098,17 @@ async def _seed_embed_pending_item(
         event_id=uuid.uuid7(),
         result=build_ocr_result(source_object_key=normalized.web_video_object_key),
     )
-    return item.meme_file_id, publisher.events[-1], normalized
+    embed_event = next(
+        (
+            event
+            for event in reversed(publisher.events[initial_event_count:])
+            if event.meme_file_id == item.meme_file_id
+            and event.stage is ContentPipelineStage.EMBED
+        ),
+        None,
+    )
+    assert embed_event is not None, "seed upload must dispatch a fresh EMBED event"
+    return item.meme_file_id, embed_event, normalized
 
 
 async def _seed_classify_pending_item(
