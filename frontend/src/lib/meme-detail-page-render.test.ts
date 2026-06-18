@@ -1,12 +1,18 @@
 import { render } from 'svelte/server';
 import { describe, expect, it } from 'vitest';
 
-import type { PublicMemeCardRead, PublicMemeDetailRead, PublicMemePopularitySummaryRead, PublicTrendMetricsRead } from '$lib/api/types';
+import type {
+  PublicMemeCardRead,
+  PublicMemeDetailRead,
+  PublicMemePopularitySummaryRead,
+  PublicMemeSearchResultRead,
+  PublicTrendMetricsRead
+} from '$lib/api/types';
 import { buildRelatedDiscovery } from '$lib/meme-detail-view';
 import MemeDetailPage from '../routes/memes/[id]/+page.svelte';
 
 describe('/memes/[id] page', () => {
-  it('renders SEO content, public analytics, actions, media info, and tag discovery', () => {
+  it('renders SEO content, public analytics, actions, media info, and similar discovery', () => {
     const meme = memeDetail({
       seo_title: 'Launch day reaction meme',
       seo_description: 'A polished caption for sharing this launch reaction.',
@@ -24,7 +30,17 @@ describe('/memes/[id] page', () => {
           sessionError: null,
           meme,
           popularity: popularitySummary(meme.id),
-          relatedSource: { kind: 'tag', tag: 'reaction', memes: [meme, related] },
+          relatedSource: {
+            kind: 'similar',
+            page: {
+              items: [result(meme, 1, 'qdrant_similarity'), result(related, 2, 'qdrant_similarity')],
+              limit: 7,
+              offset: 0,
+              total: 2,
+              has_more: false,
+              request_id: 'req_detail'
+            }
+          },
           unavailableMessage: null
         },
         form: null
@@ -50,8 +66,10 @@ describe('/memes/[id] page', () => {
     expect(body).toContain('Like (4)');
     expect(body).toContain('Save');
     expect(body).toContain('Pin');
-    expect(body).toContain('More from #reaction');
-    expect(body).toContain('tag discovery, not a similarity ranking');
+    expect(body).toContain('Similar memes');
+    expect(body).toContain('source image embedding');
+    expect(body).toContain('data-discovery-source="qdrant_similarity"');
+    expect(body).toContain('data-discovery-request-id="req_detail"');
     expect(body).toContain('Another reaction meme');
   });
 
@@ -75,7 +93,10 @@ describe('/memes/[id] page', () => {
           sessionError: null,
           meme,
           popularity: null,
-          relatedSource: { kind: 'trending', memes: [memeCard('33333333-3333-4333-8333-333333333333', 'Trending fallback meme')] },
+          relatedSource: {
+            kind: 'trending',
+            items: [result(memeCard('33333333-3333-4333-8333-333333333333', 'Trending fallback meme'), 1, 'legacy_trending')]
+          },
           unavailableMessage: null
         },
         form: null
@@ -87,24 +108,59 @@ describe('/memes/[id] page', () => {
     expect(body).toContain('No public file metadata is available');
     expect(body).toContain('Popularity analytics are not available for this meme yet.');
     expect(body).toContain('Trending public memes');
-    expect(body).toContain('instead of similar results');
+    expect(body).toContain('similar-memes endpoint and tag fallback were unavailable');
     expect(body).toContain('Trending fallback meme');
   });
 
-  it('builds related discovery without labeling fallback results as similar', () => {
+  it('builds related discovery from attributed similar and fallback results', () => {
     const current = memeDetail({ tags: ['reaction'] });
     const related = memeCard('44444444-4444-4444-8444-444444444444', 'Different meme');
+    const backfill = memeCard('55555555-5555-4555-8555-555555555555', 'Backfill meme');
 
-    const tagDiscovery = buildRelatedDiscovery(current, { kind: 'tag', tag: 'reaction', memes: [current, related] });
-    const trendDiscovery = buildRelatedDiscovery(current, { kind: 'trending', memes: [current, related] });
+    const similarDiscovery = buildRelatedDiscovery(current, {
+      kind: 'similar',
+      page: { items: [result(related, 1, 'qdrant_similarity'), result(backfill, 2, 'fallback_tag', 'similarity_backfill')], limit: 7, offset: 0, total: 2, has_more: false, request_id: 'req_detail' }
+    });
+    const tagDiscovery = buildRelatedDiscovery(current, { kind: 'tag', tag: 'reaction', items: [result(current), result(related)] });
+    const trendDiscovery = buildRelatedDiscovery(current, { kind: 'trending', items: [result(current), result(related)] });
 
+    expect(similarDiscovery.heading).toBe('Similar memes');
+    expect(similarDiscovery.memes).toEqual([related, backfill]);
+    expect(similarDiscovery.attributions[backfill.id].source_algorithm).toBe('fallback_tag');
     expect(tagDiscovery.memes).toEqual([related]);
     expect(tagDiscovery.heading).toBe('More from #reaction');
-    expect(tagDiscovery.description).toContain('not a similarity ranking');
+    expect(tagDiscovery.description).toContain('similar-memes endpoint was unavailable');
     expect(trendDiscovery.memes).toEqual([related]);
-    expect(trendDiscovery.description).toContain('instead of similar results');
+    expect(trendDiscovery.description).toContain('tag fallback were unavailable');
   });
 });
+
+function result(
+  meme: PublicMemeCardRead,
+  rank = 1,
+  sourceAlgorithm = 'fallback_tag',
+  reason = sourceAlgorithm
+): PublicMemeSearchResultRead {
+  return {
+    meme,
+    attribution: {
+      request_id: 'req_detail',
+      impression_id: `imp_${rank}`,
+      surface: 'public_api_meme_similar',
+      source_algorithm: sourceAlgorithm,
+      rank,
+      query: null,
+      filters: { language: null, media_type: null, include_nsfw: false, tags: [], scope: 'public', collection_ids: [] },
+      collection_scope: 'public',
+      collection_ids: [],
+      source_meme_id: '11111111-1111-4111-8111-111111111111',
+      algorithm_version: 'test',
+      score: 0.9,
+      score_components: { total: 0.9 },
+      reason
+    }
+  };
+}
 
 function memeDetail(overrides: Partial<PublicMemeDetailRead> = {}): PublicMemeDetailRead {
   return {

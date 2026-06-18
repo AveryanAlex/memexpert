@@ -24,6 +24,7 @@ import {
   fetchSeoSummary,
   fetchSeoTags,
   fetchSeoTemplates,
+  fetchSimilarMemes,
   fetchTagLanding,
   fetchTagTrendSummaries,
   fetchTemplateTrendSummaries,
@@ -55,7 +56,8 @@ const page: PublicMemeSearchPageRead = {
   limit: 12,
   offset: 0,
   total: 0,
-  has_more: false
+  has_more: false,
+  request_id: 'req_test'
 };
 
 const trendPage: PublicMemeTrendPageRead = {
@@ -63,7 +65,8 @@ const trendPage: PublicMemeTrendPageRead = {
   limit: 12,
   offset: 0,
   total: 0,
-  has_more: false
+  has_more: false,
+  request_id: 'req_trend_test'
 };
 
 describe('catalog API client', () => {
@@ -193,6 +196,30 @@ describe('catalog API client', () => {
       fetch: mockFetch,
       baseUrl: 'https://api.memexpert.test',
       memeId
+    });
+
+    expect(mockFetch).toHaveBeenCalledOnce();
+  });
+
+  it('requests similar memes through the canonical id endpoint', async () => {
+    const memeId = '11111111-1111-4111-8111-111111111111';
+    const mockFetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+
+      expect(url.pathname).toBe(`/api/v1/memes/${memeId}/similar`);
+      expect(url.searchParams.get('include_nsfw')).toBe('false');
+      expect(url.searchParams.get('limit')).toBe('7');
+      expect(url.searchParams.get('offset')).toBe('0');
+
+      return jsonResponse(page);
+    }) satisfies ApiFetch;
+
+    await fetchSimilarMemes({
+      fetch: mockFetch,
+      baseUrl: 'https://api.memexpert.test',
+      memeId,
+      limit: 7,
+      offset: 0
     });
 
     expect(mockFetch).toHaveBeenCalledOnce();

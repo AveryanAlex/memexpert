@@ -618,6 +618,30 @@ async def get_meme_popularity_summary(
     return summary
 
 
+@router.get("/{meme_id}/similar", response_model=PublicMemeSearchPageRead, summary="Browse similar memes")
+async def get_similar_memes(
+    meme_search_service: MemeSearchServiceDep,
+    current_user: OptionalCurrentUserDep,
+    meme_id: Annotated[uuid.UUID, Path()],
+    include_nsfw: Annotated[bool, Query()] = False,
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> PublicMemeSearchPageRead:
+    """Return Qdrant-led similar public memes with explicit fallback attribution."""
+
+    try:
+        return await meme_search_service.get_public_similar_memes(
+            meme_id,
+            viewer_user_id=current_user.id if current_user else None,
+            include_nsfw=_nsfw_allowed(current_user, include_nsfw),
+            limit=limit,
+            offset=offset,
+            surface="public_api_meme_similar",
+        )
+    except MemeNotFoundError as exc:
+        raise _meme_not_found_http_error() from exc
+
+
 @router.get("/{meme_id}", response_model=PublicMemeDetailRead, summary="Read meme details")
 async def get_meme_detail(
     meme_search_service: MemeSearchServiceDep,

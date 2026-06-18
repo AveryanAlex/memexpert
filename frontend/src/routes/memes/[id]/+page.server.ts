@@ -6,6 +6,7 @@ import {
   fetchCurrentSession,
   fetchMemeDetail,
   fetchMemePopularitySummary,
+  fetchSimilarMemes,
   fetchTagLanding,
   fetchTrendPage
 } from '$lib/api/client';
@@ -75,6 +76,20 @@ async function fetchRelatedDiscoverySource(
   cookieHeader: string | undefined,
   meme: PublicMemeDetailRead
 ): Promise<MemeDetailRelatedSource> {
+  try {
+    const page = await fetchSimilarMemes({
+      fetch,
+      baseUrl: apiBaseUrl(),
+      memeId: meme.id,
+      limit: RELATED_LIMIT,
+      offset: 0,
+      cookieHeader
+    });
+    return { kind: 'similar', page };
+  } catch {
+    // Fall back only when the canonical similar endpoint is unavailable.
+  }
+
   const firstTag = meme.tags[0]?.trim();
 
   if (firstTag) {
@@ -87,7 +102,7 @@ async function fetchRelatedDiscoverySource(
         offset: 0,
         cookieHeader
       });
-      return { kind: 'tag', tag: firstTag, memes: landing.page.items.map((item) => item.meme) };
+      return { kind: 'tag', tag: firstTag, items: landing.page.items };
     } catch {
       // Fall through to public trends so tag API issues do not break detail pages.
     }
@@ -102,7 +117,7 @@ async function fetchRelatedDiscoverySource(
       offset: 0,
       cookieHeader
     });
-    return { kind: 'trending', memes: trends.items.map((item) => item.meme) };
+    return { kind: 'trending', items: trends.items.map((item) => ({ meme: item.meme, attribution: item.attribution })) };
   } catch {
     return null;
   }

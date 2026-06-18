@@ -65,6 +65,11 @@ interface DetailRequest extends CatalogRequest {
   memeId: string;
 }
 
+interface SimilarMemeRequest extends DetailRequest {
+  limit: number;
+  offset: number;
+}
+
 interface TrendRequest extends CatalogRequest {
   ranking?: 'trending' | 'fastest_rising' | 'most_liked';
   limit: number;
@@ -213,6 +218,14 @@ export async function fetchMemeDetail(request: DetailRequest): Promise<PublicMem
   return apiGet<PublicMemeDetailRead>(
     path,
     new URLSearchParams({ include_nsfw: 'false' }),
+    request
+  );
+}
+
+export async function fetchSimilarMemes(request: SimilarMemeRequest): Promise<PublicMemeSearchPageRead> {
+  return apiGet<PublicMemeSearchPageRead>(
+    `/api/v1/memes/${encodeURIComponent(request.memeId)}/similar`,
+    new URLSearchParams({ include_nsfw: 'false', limit: String(request.limit), offset: String(request.offset) }),
     request
   );
 }
@@ -766,7 +779,8 @@ export function emptyMemePage(limit: number, offset: number): PublicMemeSearchPa
     limit,
     offset,
     total: 0,
-    has_more: false
+    has_more: false,
+    request_id: 'req_empty'
   };
 }
 
@@ -776,7 +790,8 @@ export function emptyTrendPage(limit: number, offset: number): PublicMemeTrendPa
     limit,
     offset,
     total: 0,
-    has_more: false
+    has_more: false,
+    request_id: 'req_empty'
   };
 }
 

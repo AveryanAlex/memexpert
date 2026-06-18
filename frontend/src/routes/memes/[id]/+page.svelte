@@ -172,7 +172,7 @@
     </div>
 
     {#if related.memes.length > 0}
-      <MemeGrid memes={related.memes} label="Discovery memes" />
+      <MemeGrid memes={related.memes} attributions={related.attributions} label="Discovery memes" />
     {:else}
       <p class="m-0 text-muted">No additional public memes were returned for this discovery fallback.</p>
     {/if}

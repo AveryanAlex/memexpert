@@ -18,10 +18,11 @@ from memexpert.api.dependencies.auth import get_optional_current_user
 from memexpert.api.dependencies.collection import get_collection_service
 from memexpert.api.dependencies.meme import get_analytics_service, get_meme_search_service, get_public_trends_service
 from memexpert.core.config import Settings, get_settings
-from memexpert.core.qdrant import QdrantUserSearchMatch
+from memexpert.core.qdrant import QdrantSimilarityMatch, QdrantUserSearchMatch
 from memexpert.core.search_index_prefilter import SearchIndexPrefilter, SearchIndexPrefilterScope
+from memexpert.core.voyage import VoyageEmbeddingResult
 from memexpert.models.collection import Collection, CollectionMember, CollectionMeme, PinnedMeme
-from memexpert.models.content import Meme, MemeFile, MemePopularitySnapshot, MemeSeoPage, MemeTemplate
+from memexpert.models.content import EmbeddingCache, Meme, MemeFile, MemePopularitySnapshot, MemeSeoPage, MemeTemplate
 from memexpert.models.enums import (
     AnalyticsEventType,
     CollectionKind,
@@ -29,6 +30,7 @@ from memexpert.models.enums import (
     CollectionVisibility,
     ContentKind,
     ContentLanguage,
+    EmbeddingInputType,
 )
 from memexpert.models.user import AccountMergeLog, AnalyticsEvent, User
 from memexpert.schemas.user import UserRead
@@ -76,6 +78,25 @@ class FakeSemanticSearchClient:
         prefilter: SearchIndexPrefilter | None = None,
     ) -> tuple[QdrantUserSearchMatch, ...]:
         self.calls.append({"query_vector": query_vector, "limit": limit, "prefilter": prefilter})
+        return self._hits[:limit]
+
+
+class FakeSimilarityClient:
+    def __init__(self, hits: tuple[QdrantSimilarityMatch, ...] = (), *, failure: Exception | None = None) -> None:
+        self._hits = hits
+        self._failure = failure
+        self.calls: list[dict[str, Any]] = []
+
+    async def find_similar_memes(
+        self,
+        *,
+        vector: tuple[float, ...],
+        current_meme_file_id: uuid.UUID,
+        limit: int | None = None,
+    ) -> tuple[QdrantSimilarityMatch, ...]:
+        self.calls.append({"vector": vector, "current_meme_file_id": current_meme_file_id, "limit": limit})
+        if self._failure is not None:
+            raise self._failure
         return self._hits[:limit]
 
 
@@ -254,6 +275,28 @@ async def _create_collection(
 def _primary_file_id(meme: Meme) -> uuid.UUID:
     assert meme.primary_file_id is not None
     return meme.primary_file_id
+
+
+async def _add_image_embedding(
+    session: AsyncSession,
+    meme: Meme,
+    vector: tuple[float, ...] = (0.25, 0.75),
+) -> None:
+    session.add(
+        EmbeddingCache(
+            input_hash=f"test-{uuid.uuid4()}",
+            input_type=EmbeddingInputType.IMAGE,
+            embedding=VoyageEmbeddingResult(
+                model="test-voyage",
+                dimensions=len(vector),
+                vector=vector,
+                input_hash=f"test-{uuid.uuid4()}",
+            ).embedding_bytes,
+            model_version="test-voyage",
+            source_file_id=_primary_file_id(meme),
+        )
+    )
+    await session.flush()
 
 
 def _expected_prefilter(
@@ -545,6 +588,7 @@ async def test_public_openapi_registers_catalog_routes_without_internal_surface(
     assert "/api/v1/memes/templates/{template_slug}" in paths
     assert "/api/v1/memes/{meme_id}/canonical" in paths
     assert "/api/v1/memes/{meme_id}/popularity" in paths
+    assert "/api/v1/memes/{meme_id}/similar" in paths
     assert "/api/v1/memes/{meme_id}" in paths
     search_parameter_list = paths["/api/v1/memes/search"]["get"]["parameters"]
     browse_parameter_list = paths["/api/v1/memes/browse"]["get"]["parameters"]
@@ -552,6 +596,9 @@ async def test_public_openapi_registers_catalog_routes_without_internal_surface(
     browse_parameters = {parameter["name"]: parameter for parameter in browse_parameter_list}
     trending_parameters = {
         parameter["name"]: parameter for parameter in paths["/api/v1/memes/trending"]["get"]["parameters"]
+    }
+    similar_parameters = {
+        parameter["name"]: parameter for parameter in paths["/api/v1/memes/{meme_id}/similar"]["get"]["parameters"]
     }
     assert "query" in search_parameters
     assert "scope" in search_parameters
@@ -588,6 +635,7 @@ async def test_public_openapi_registers_catalog_routes_without_internal_surface(
     assert "deduplicated in request order" in browse_parameters["collection_ids"]["description"]
     assert "lookback_hours" in trending_parameters
     assert "ignores this value" in trending_parameters["lookback_hours"]["description"]
+    assert set(similar_parameters) >= {"meme_id", "include_nsfw", "limit", "offset"}
     assert set(components["PublicMemeSearchResultRead"]["properties"]) == {"meme", "attribution"}
     assert "request_id" in components["PublicMemeSearchPageRead"]["properties"]
     assert "MemeResultAttributionRead" in components
@@ -626,6 +674,183 @@ async def test_public_openapi_registers_catalog_routes_without_internal_surface(
     assert "s3_web_video_key" not in components["PublicMemeFileRead"]["properties"]
     assert "author_user_id" not in components["PublicMemeDetailRead"]["properties"]
     assert "is_public" not in components["PublicMemeDetailRead"]["properties"]
+
+
+async def test_similar_route_uses_qdrant_embedding_and_filters_private_and_self_matches(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    source = await _create_meme(migrated_db_session, tags=["frog"], popularity_score=30.0)
+    private_match = await _create_meme(
+        migrated_db_session,
+        is_public=False,
+        tags=["frog"],
+        popularity_score=100.0,
+        s3_original_key="pipeline/originals/private/similar-hidden.jpg",
+    )
+    first_match = await _create_meme(migrated_db_session, tags=["frog"], popularity_score=20.0)
+    second_match = await _create_meme(migrated_db_session, tags=["frog"], popularity_score=10.0)
+    await _add_image_embedding(migrated_db_session, source, (0.25, 0.75))
+    await migrated_db_session.commit()
+    similarity_client = FakeSimilarityClient(
+        (
+            QdrantSimilarityMatch(
+                meme_file_id=uuid.uuid4(),
+                meme_id=source.id,
+                similarity_score=0.99,
+            ),
+            QdrantSimilarityMatch(
+                meme_file_id=_primary_file_id(private_match),
+                meme_id=private_match.id,
+                similarity_score=0.98,
+            ),
+            QdrantSimilarityMatch(
+                meme_file_id=_primary_file_id(first_match),
+                meme_id=first_match.id,
+                similarity_score=0.91,
+            ),
+            QdrantSimilarityMatch(
+                meme_file_id=_primary_file_id(second_match),
+                meme_id=second_match.id,
+                similarity_score=0.82,
+            ),
+        )
+    )
+    service = MemeSearchService(
+        migrated_db_session,
+        similarity_client=similarity_client,
+        settings=Settings.model_validate({"pipeline_voyage_output_dimensions": 2}),
+    )
+    _install_meme_route_overrides(app, migrated_db_session, service=service)
+
+    try:
+        response = await client.get(f"/api/v1/memes/{source.id}/similar", params={"limit": 2})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [item["meme"]["id"] for item in payload["items"]] == [str(first_match.id), str(second_match.id)]
+    _assert_public_page_attribution(payload, source_algorithm="qdrant_similarity", surface="public_api_meme_similar")
+    first_attribution = payload["items"][0]["attribution"]
+    assert first_attribution["reason"] == "qdrant_similarity"
+    assert first_attribution["source_meme_id"] == str(source.id)
+    assert first_attribution["score"] == pytest.approx(0.91)
+    assert first_attribution["score_components"] == {"similarity": 0.91, "total": 0.91}
+    assert len(similarity_client.calls) == 1
+    assert similarity_client.calls[0]["vector"] == pytest.approx((0.25, 0.75))
+    assert similarity_client.calls[0]["current_meme_file_id"] == _primary_file_id(source)
+    assert similarity_client.calls[0]["limit"] == 20
+    assert str(private_match.id) not in response.text
+    assert "similar-hidden.jpg" not in response.text
+
+
+async def test_public_similar_memes_missing_embedding_falls_back_tag_template_then_popular(
+    migrated_db_session: AsyncSession,
+) -> None:
+    template = MemeTemplate(slug="frog-template", name="Frog Template")
+    migrated_db_session.add(template)
+    await migrated_db_session.flush()
+    source = await _create_meme(migrated_db_session, tags=["frog", "wizard"], popularity_score=50.0)
+    tag_match = await _create_meme(migrated_db_session, tags=["frog"], popularity_score=10.0)
+    template_match = await _create_meme(migrated_db_session, tags=["reaction"], popularity_score=100.0)
+    popular_match = await _create_meme(migrated_db_session, tags=["other"], popularity_score=200.0)
+    source.template_id = template.id
+    template_match.template_id = template.id
+    await migrated_db_session.commit()
+    similarity_client = FakeSimilarityClient()
+    service = MemeSearchService(
+        migrated_db_session,
+        similarity_client=similarity_client,
+        settings=Settings.model_validate({"pipeline_voyage_output_dimensions": 2}),
+    )
+
+    page = await service.get_public_similar_memes(source.id, limit=3)
+
+    assert [item.meme.id for item in page.items] == [tag_match.id, template_match.id, popular_match.id]
+    assert [item.attribution.source_algorithm for item in page.items] == [
+        "fallback_tag",
+        "fallback_template",
+        "fallback_popular",
+    ]
+    assert {item.attribution.reason for item in page.items} == {"missing_embedding"}
+    assert {item.attribution.source_meme_id for item in page.items} == {source.id}
+    assert page.items[0].attribution.score_components["tag_overlap"] == pytest.approx(0.5)
+    assert page.items[1].attribution.score_components["template_match"] == 1.0
+    assert similarity_client.calls == []
+
+
+async def test_public_similar_memes_qdrant_failure_falls_back_without_private_leakage(
+    migrated_db_session: AsyncSession,
+) -> None:
+    source = await _create_meme(migrated_db_session, tags=["frog"], popularity_score=10.0)
+    public_tag = await _create_meme(migrated_db_session, tags=["frog"], popularity_score=20.0)
+    private_tag = await _create_meme(
+        migrated_db_session,
+        is_public=False,
+        tags=["frog"],
+        popularity_score=100.0,
+        s3_original_key="pipeline/originals/private/qdrant-failure-hidden.jpg",
+    )
+    await _add_image_embedding(migrated_db_session, source, (0.4, 0.6))
+    await migrated_db_session.commit()
+    similarity_client = FakeSimilarityClient(failure=RuntimeError("qdrant unavailable secret"))
+    service = MemeSearchService(
+        migrated_db_session,
+        similarity_client=similarity_client,
+        settings=Settings.model_validate({"pipeline_voyage_output_dimensions": 2}),
+    )
+
+    page = await service.get_public_similar_memes(source.id, limit=2)
+
+    assert [item.meme.id for item in page.items] == [public_tag.id]
+    assert page.items[0].attribution.source_algorithm == "fallback_tag"
+    assert page.items[0].attribution.reason == "qdrant_failure"
+    serialized = page.model_dump_json()
+    assert str(private_tag.id) not in serialized
+    assert "qdrant-failure-hidden.jpg" not in serialized
+    assert len(similarity_client.calls) == 1
+    assert similarity_client.calls[0]["vector"] == pytest.approx((0.4, 0.6))
+    assert similarity_client.calls[0]["current_meme_file_id"] == _primary_file_id(source)
+    assert similarity_client.calls[0]["limit"] == 20
+
+
+async def test_public_similar_memes_filters_nsfw_unless_allowed(
+    migrated_db_session: AsyncSession,
+) -> None:
+    source = await _create_meme(migrated_db_session, popularity_score=10.0)
+    safe_match = await _create_meme(migrated_db_session, popularity_score=20.0)
+    nsfw_match = await _create_meme(migrated_db_session, is_nsfw=True, popularity_score=30.0)
+    await _add_image_embedding(migrated_db_session, source, (0.1, 0.9))
+    await migrated_db_session.commit()
+    similarity_client = FakeSimilarityClient(
+        (
+            QdrantSimilarityMatch(
+                meme_file_id=_primary_file_id(nsfw_match),
+                meme_id=nsfw_match.id,
+                similarity_score=0.96,
+            ),
+            QdrantSimilarityMatch(
+                meme_file_id=_primary_file_id(safe_match),
+                meme_id=safe_match.id,
+                similarity_score=0.86,
+            ),
+        )
+    )
+    service = MemeSearchService(
+        migrated_db_session,
+        similarity_client=similarity_client,
+        settings=Settings.model_validate({"pipeline_voyage_output_dimensions": 2}),
+    )
+
+    safe_page = await service.get_public_similar_memes(source.id, include_nsfw=False, limit=2)
+    nsfw_page = await service.get_public_similar_memes(source.id, include_nsfw=True, limit=2)
+
+    assert [item.meme.id for item in safe_page.items] == [safe_match.id]
+    assert [item.meme.id for item in nsfw_page.items] == [nsfw_match.id, safe_match.id]
+    assert safe_page.items[0].attribution.source_algorithm == "qdrant_similarity"
+    assert nsfw_page.items[0].meme.is_nsfw is True
 
 
 async def test_search_service_passes_conservative_prefilters_to_text_and_semantic_clients(

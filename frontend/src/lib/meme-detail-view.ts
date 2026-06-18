@@ -1,10 +1,22 @@
-import type { PublicMemeCardRead, PublicMemeDetailRead } from '$lib/api/types';
+import type {
+  MemeResultAttributionRead,
+  PublicMemeCardRead,
+  PublicMemeDetailRead,
+  PublicMemeSearchPageRead,
+  PublicMemeSearchResultRead
+} from '$lib/api/types';
 import { memeDownloadUrl, memeTitle } from '$lib/memeActions';
 
 export type MemeDetailRelatedSource =
-  | { kind: 'tag'; tag: string; memes: PublicMemeCardRead[] }
-  | { kind: 'trending'; memes: PublicMemeCardRead[] }
+  | { kind: 'similar'; page: PublicMemeSearchPageRead }
+  | { kind: 'tag'; tag: string; items: PublicMemeSearchResultRead[] }
+  | { kind: 'trending'; items: PublicMemeSearchResultRead[] }
   | null;
+
+export interface MemeDetailRelatedItem {
+  meme: PublicMemeCardRead;
+  attribution: MemeResultAttributionRead | null;
+}
 
 export interface MemeDetailViewModel {
   title: string;
@@ -23,7 +35,9 @@ export interface MemeDetailRelatedDiscovery {
   description: string;
   href: string;
   linkLabel: string;
+  items: MemeDetailRelatedItem[];
   memes: PublicMemeCardRead[];
+  attributions: Record<string, MemeResultAttributionRead>;
 }
 
 export function buildMemeDetailView(meme: PublicMemeDetailRead): MemeDetailViewModel {
@@ -47,23 +61,42 @@ export function buildRelatedDiscovery(
   meme: Pick<PublicMemeDetailRead, 'id'>,
   source: MemeDetailRelatedSource
 ): MemeDetailRelatedDiscovery {
+  if (source?.kind === 'similar') {
+    const items = withoutCurrentMeme(source.page.items, meme.id);
+    return {
+      heading: relatedHeading(items),
+      description: relatedDescription(items),
+      href: '/trends',
+      linkLabel: 'Browse trends',
+      items,
+      memes: items.map((item) => item.meme),
+      attributions: attributionMap(items)
+    };
+  }
+
   if (source?.kind === 'tag') {
+    const items = withoutCurrentMeme(source.items, meme.id);
     return {
       heading: `More from #${source.tag}`,
-      description: 'Public catalog results from this meme\'s first tag. This is tag discovery, not a similarity ranking.',
+      description: 'The similar-memes endpoint was unavailable, so this uses public tag discovery as a safe fallback.',
       href: `/tags/${encodeURIComponent(source.tag)}`,
       linkLabel: `Open #${source.tag}`,
-      memes: withoutCurrentMeme(source.memes, meme.id)
+      items,
+      memes: items.map((item) => item.meme),
+      attributions: attributionMap(items)
     };
   }
 
   if (source?.kind === 'trending') {
+    const items = withoutCurrentMeme(source.items, meme.id);
     return {
       heading: 'Trending public memes',
-      description: 'No tag fallback is available for this meme, so this shows public trending memes instead of similar results.',
+      description: 'The similar-memes endpoint and tag fallback were unavailable, so this shows public trending memes.',
       href: '/trends',
       linkLabel: 'Open trends',
-      memes: withoutCurrentMeme(source.memes, meme.id)
+      items,
+      memes: items.map((item) => item.meme),
+      attributions: attributionMap(items)
     };
   }
 
@@ -72,7 +105,9 @@ export function buildRelatedDiscovery(
     description: 'Discovery results are unavailable right now. The meme detail still works for sharing and downloading.',
     href: '/trends',
     linkLabel: 'Open trends',
-    memes: []
+    items: [],
+    memes: [],
+    attributions: {}
   };
 }
 
@@ -90,8 +125,39 @@ export function formatFileSize(bytes: number | null | undefined): string | null 
   return `${value >= 10 || unitIndex === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unitIndex]}`;
 }
 
-function withoutCurrentMeme(memes: PublicMemeCardRead[], memeId: string): PublicMemeCardRead[] {
-  return memes.filter((item) => item.id !== memeId).slice(0, 6);
+function withoutCurrentMeme(items: PublicMemeSearchResultRead[], memeId: string): MemeDetailRelatedItem[] {
+  return items.filter((item) => item.meme.id !== memeId).slice(0, 6);
+}
+
+function attributionMap(items: MemeDetailRelatedItem[]): Record<string, MemeResultAttributionRead> {
+  return Object.fromEntries(items.flatMap((item) => (item.attribution ? [[item.meme.id, item.attribution]] : [])));
+}
+
+function relatedHeading(items: MemeDetailRelatedItem[]): string {
+  const algorithms = new Set(items.map((item) => item.attribution?.source_algorithm));
+  if (algorithms.has('qdrant_similarity')) return 'Similar memes';
+  if (algorithms.has('fallback_tag')) return 'Related public memes';
+  if (algorithms.has('fallback_template')) return 'More from this template';
+  if (algorithms.has('fallback_popular')) return 'Popular public memes';
+  return 'Discover more memes';
+}
+
+function relatedDescription(items: MemeDetailRelatedItem[]): string {
+  const algorithms = new Set(items.map((item) => item.attribution?.source_algorithm));
+  const reason = items.find((item) => item.attribution?.reason)?.attribution?.reason;
+  if (algorithms.has('qdrant_similarity')) {
+    return 'Ranked from this meme\'s source image embedding, with safe public fallbacks appended when needed.';
+  }
+  if (reason === 'missing_embedding') {
+    return 'No source image embedding is available yet, so these are safe public fallback results.';
+  }
+  if (reason === 'qdrant_failure') {
+    return 'Similarity search is temporarily unavailable, so these are safe public fallback results.';
+  }
+  if (reason === 'similarity_empty') {
+    return 'Similarity search returned no accessible matches, so these are safe public fallback results.';
+  }
+  return 'Safe public fallback results from tags, templates, and popular memes.';
 }
 
 function fileFacts(file: PublicMemeDetailRead['primary_file']): string[] {
