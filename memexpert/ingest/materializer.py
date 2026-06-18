@@ -36,6 +36,12 @@ from memexpert.media.contracts import (
     PipelineMediaProcessorProtocol,
     UploadMediaDetails,
 )
+from memexpert.ingest.source_metadata import (
+    source_forward_ids,
+    source_is_forwarded,
+    source_published_at,
+    source_reactions,
+)
 from memexpert.models.base import utcnow
 from memexpert.models.content import (
     BlockedPerceptualHash,
@@ -439,6 +445,7 @@ class PipelineIngestMaterializer:
     ) -> None:
         blocked_hash = blocked_match.blocked_hash
         event_id = uuid.uuid7()
+        forwarded_from_source_id, forwarded_from_post_id = source_forward_ids(ingest_request.source_metadata)
         meme = Meme(
             id=meme_id,
             media_type=prepared.media_type,
@@ -474,9 +481,12 @@ class PipelineIngestMaterializer:
                     source_id=ingest_request.source_id,
                     post_id=ingest_request.post_id,
                     views=self._source_views(ingest_request),
-                    reactions={},
-                    is_first_source=True,
+                    reactions=source_reactions(ingest_request.source_metadata),
+                    is_first_source=not source_is_forwarded(ingest_request.source_metadata),
                     source_alive=True,
+                    published_at=source_published_at(ingest_request.source_metadata),
+                    forwarded_from_source_id=forwarded_from_source_id,
+                    forwarded_from_post_id=forwarded_from_post_id,
                     attach_reason=SourceAttachReason.BLOCKED_PERCEPTUAL_HASH_NEW_FILE,
                 ),
                 PipelineStageJournal(
@@ -518,6 +528,7 @@ class PipelineIngestMaterializer:
         publish_event_id: uuid.UUID,
         created_at: datetime,
     ) -> None:
+        forwarded_from_source_id, forwarded_from_post_id = source_forward_ids(ingest_request.source_metadata)
         meme = Meme(
             id=meme_id,
             media_type=prepared.media_type,
@@ -552,9 +563,12 @@ class PipelineIngestMaterializer:
                     source_id=ingest_request.source_id,
                     post_id=ingest_request.post_id,
                     views=self._source_views(ingest_request),
-                    reactions={},
-                    is_first_source=True,
+                    reactions=source_reactions(ingest_request.source_metadata),
+                    is_first_source=not source_is_forwarded(ingest_request.source_metadata),
                     source_alive=True,
+                    published_at=source_published_at(ingest_request.source_metadata),
+                    forwarded_from_source_id=forwarded_from_source_id,
+                    forwarded_from_post_id=forwarded_from_post_id,
                     attach_reason=SourceAttachReason.NEW_FILE,
                 ),
                 PipelineStageJournal(
@@ -589,6 +603,7 @@ class PipelineIngestMaterializer:
         publish_event_id: uuid.UUID,
         created_at: datetime,
     ) -> None:
+        forwarded_from_source_id, forwarded_from_post_id = source_forward_ids(ingest_request.source_metadata)
         self._session.add(
             MemeFile(
                 id=meme_file_id,
@@ -613,9 +628,12 @@ class PipelineIngestMaterializer:
                     source_id=ingest_request.source_id,
                     post_id=ingest_request.post_id,
                     views=self._source_views(ingest_request),
-                    reactions={},
+                    reactions=source_reactions(ingest_request.source_metadata),
                     is_first_source=False,
                     source_alive=True,
+                    published_at=source_published_at(ingest_request.source_metadata),
+                    forwarded_from_source_id=forwarded_from_source_id,
+                    forwarded_from_post_id=forwarded_from_post_id,
                     attach_reason=SourceAttachReason.PHASH_EXACT_NEW_FILE,
                     matched_meme_file_id=phash_match.id,
                 ),

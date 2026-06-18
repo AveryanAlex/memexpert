@@ -26,6 +26,7 @@ from memexpert.core.storage import (
     upload_object_bytes,
 )
 from memexpert.ingest.schemas import IngestAcceptOutcome, IngestAcceptResult, IngestAcceptSource, IngestRequestRead
+from memexpert.ingest.source_metadata import source_forward_ids, source_published_at, source_reactions
 from memexpert.models.content import MemeFile, MemeSource, PipelineIngestRequest
 from memexpert.models.enums import ContentProcessingStatus, PipelineIngestRequestStatus, SourceAttachReason
 from memexpert.pipeline.outbox import build_media_inspect_outbox_event
@@ -168,15 +169,19 @@ class PipelineIngestAcceptService:
             matched_meme_file_id=matched_file.id,
             source_attach_reason=attach_reason,
         )
+        forwarded_from_source_id, forwarded_from_post_id = source_forward_ids(source_metadata)
         source_row = MemeSource(
             file_id=matched_file.id,
             platform=source.source_platform,
             source_id=source.source_id,
             post_id=source.post_id,
             views=source.views,
-            reactions={},
+            reactions=source_reactions(source_metadata),
             is_first_source=False,
             source_alive=True,
+            published_at=source_published_at(source_metadata),
+            forwarded_from_source_id=forwarded_from_source_id,
+            forwarded_from_post_id=forwarded_from_post_id,
             attach_reason=attach_reason,
             matched_meme_file_id=matched_file.id,
         )

@@ -1,6 +1,7 @@
 """API-safe raw ingest request services and schemas."""
 
 from memexpert.ingest.accept_service import PipelineIngestAcceptService
+from memexpert.ingest.crawler_service import PipelineCrawlerIngestService
 from memexpert.ingest.read_service import PipelineIngestReadService
 from memexpert.ingest.schemas import (
     IngestAcceptOutcome,
@@ -15,5 +16,6 @@ __all__ = [
     "IngestAcceptSource",
     "IngestRequestRead",
     "PipelineIngestAcceptService",
+    "PipelineCrawlerIngestService",
     "PipelineIngestReadService",
 ]

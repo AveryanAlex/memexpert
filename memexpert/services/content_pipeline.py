@@ -271,7 +271,14 @@ class ContentPipelineService:
         content_type: str | None,
         media_bytes: bytes,
     ) -> ContentPipelineUploadRead:
-        """Persist an operator upload durably, then publish downstream work exactly once."""
+        """Deprecated legacy materializing upload entrypoint.
+
+        Runtime upload callers must use ``PipelineIngestAcceptService.accept_bytes``
+        so API/bot paths accept raw bytes without importing or running media
+        inspection. This method is retained only for historical service tests
+        and downstream helper coverage until the legacy write-side surface is
+        removed wholesale.
+        """
 
         sha256_hex = self._sha256_hex(media_bytes)
         sha_duplicate_item = await self._try_persist_sha_duplicate_upload(
@@ -345,13 +352,11 @@ class ContentPipelineService:
         post_id: str,
         published_at: datetime | None,
     ) -> CrawlerIngestResult | None:
-        """Return a terminal crawler result that does not require media bytes.
+        """Deprecated legacy crawler pre-download guard.
 
-        Runtime callers use this before ``download_media()`` so a known
-        ``(platform, source_id, post_id)`` redelivery can advance the crawler
-        checkpoint and return the existing source ids without downloading the
-        same Telegram media again. ``None`` means the caller still needs bytes
-        and must continue through ``create_crawler_ingest``.
+        Runtime callers now use ``PipelineCrawlerIngestService.try_accept_without_media``.
+        This method is retained only for historical service tests and legacy
+        helper coverage until the old crawler write-side surface is removed.
         """
 
         received_at = utcnow()
@@ -365,7 +370,13 @@ class ContentPipelineService:
         return result
 
     async def create_crawler_ingest(self, raw_post: RawCrawlerPost) -> CrawlerIngestResult:
-        """Persist one crawler post durably, then publish downstream work exactly once.
+        """Deprecated legacy materializing crawler entrypoint.
+
+        Runtime crawler callers must use ``PipelineCrawlerIngestService``, which
+        preserves crawler guards and delegates downloaded bytes to
+        ``PipelineIngestAcceptService.accept_bytes``. This method is retained
+        only for historical service tests and legacy helper coverage until the
+        old write-side surface is removed.
 
         Parallel to :meth:`create_upload` but sourced from the Telegram crawler.
         Reuses the media-inspection, S3 write, auto-dedup, stage-journal, and

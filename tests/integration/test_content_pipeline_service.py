@@ -28,6 +28,7 @@ from memexpert.core.qdrant import (
     QdrantSyncTimeoutError,
 )
 from memexpert.core.voyage import VoyageEmbeddingResult
+from memexpert.ingest.crawler_service import PipelineCrawlerIngestService
 from memexpert.media.contracts import NormalizedMediaResult, UploadMediaDetails
 from memexpert.models.content import (
     BlockedPerceptualHash,
@@ -4088,9 +4089,13 @@ async def test_crawler_operations_list_sessions_populates_owned_channel_count(
         channel.session_id = "primary"
     await migrated_db_session.commit()
 
-    pipeline_service = _build_crawler_service(migrated_db_session, phash_tag="O")
+    ingest_service = PipelineCrawlerIngestService.from_settings(
+        migrated_db_session,
+        settings=Settings(),
+        storage_client=FakeStorageClient(),
+    )
     runtime = TelegramCrawlerRuntime(
-        pipeline_service=pipeline_service,
+        ingest_service=ingest_service,
         telegram_client=FakeTelegramClient(),
         session=migrated_db_session,
         settings=Settings(),

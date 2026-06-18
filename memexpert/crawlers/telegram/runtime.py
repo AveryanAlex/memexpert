@@ -2,8 +2,8 @@
 """Single-session Telegram crawler runtime that drives catch-up + live listeners.
 
 T02 fills in the orchestration pieces T01 locked as signature-only stubs.
-The runtime composes a :class:`ContentPipelineService` (which owns the
-durable ingest entrypoint), a :class:`PipelineTelegramClientProtocol`
+The runtime composes a crawler ingest service (which owns Telegram-specific
+guards before delegating bytes to raw ingest), a :class:`PipelineTelegramClientProtocol`
 (real Telethon client or :class:`FakeTelegramClient`), a SQLAlchemy
 session (used for :class:`TelegramSessionState` + :class:`SourceChannel`
 mutations that do not belong to the ingest entrypoint), and the
@@ -18,7 +18,7 @@ import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
 from sqlalchemy import select
@@ -44,8 +44,7 @@ if TYPE_CHECKING:
 
     from memexpert.core.config import Settings
     from memexpert.crawlers.telegram.client import PipelineTelegramClientProtocol
-    from memexpert.schemas.content_pipeline import CrawlerIngestResult
-    from memexpert.services.content_pipeline import ContentPipelineService
+    from memexpert.schemas.content_pipeline import CrawlerIngestResult, RawCrawlerPost
 
 
 logger = logging.getLogger(__name__)
@@ -55,6 +54,25 @@ logger = logging.getLogger(__name__)
 # operators cannot render in the inspect surface; keeping the first few
 # errors gives enough diagnostic context while capping memory use.
 _MAX_CATCHUP_ERRORS = 16
+
+
+class CrawlerIngestServiceProtocol(Protocol):
+    async def try_accept_without_media(
+        self,
+        *,
+        platform: SourcePlatform,
+        source_id: str,
+        post_id: str,
+        published_at: datetime | None,
+        advance_checkpoint: bool = True,
+    ) -> CrawlerIngestResult | None: ...
+
+    async def accept_crawler_post(
+        self,
+        raw_post: RawCrawlerPost,
+        *,
+        advance_checkpoint: bool = True,
+    ) -> CrawlerIngestResult: ...
 
 
 class CrawlerCatchupReport(BaseModel):
@@ -103,14 +121,14 @@ class TelegramCrawlerRuntime:
     """Orchestrates catch-up + live listeners on top of the crawler service entrypoint.
 
     Composed from four injected collaborators so tests can swap the real
-    pieces for fakes: a :class:`ContentPipelineService`, a
+    pieces for fakes: a crawler ingest service, a
     :class:`PipelineTelegramClientProtocol`, a SQLAlchemy session, and
     the application :class:`Settings`. The runtime's background live
     listener task handles are tracked on the instance so
     :meth:`stop_live_listener` can cancel them cleanly.
     """
 
-    pipeline_service: ContentPipelineService
+    ingest_service: CrawlerIngestServiceProtocol
     telegram_client: PipelineTelegramClientProtocol
     session: AsyncSession
     settings: Settings
@@ -284,8 +302,8 @@ class TelegramCrawlerRuntime:
     ) -> CrawlerIngestResult:
         """Re-ingest one Telegram message by id without advancing the checkpoint.
 
-        Replay goes through the same ``create_crawler_ingest`` entrypoint
-        as the catch-up path, but the runtime never touches the
+        Replay goes through the same raw crawler accept entrypoint as the
+        catch-up path, but the runtime never touches the
         :class:`SourceChannel` checkpoint state: out-of-band replays must
         not regress (or advance) ``last_read_post_id``. Ingest errors
         propagate so the operator route can surface them as typed
@@ -296,12 +314,16 @@ class TelegramCrawlerRuntime:
             channel_id=channel_id,
             post_id=post_id,
         )
+        predownload_result = await self._try_accept_without_media(raw_message, advance_checkpoint=False)
+        if predownload_result is not None:
+            return predownload_result
+
         media_bytes = await self.telegram_client.download_media(raw_message)
         raw_post = PipelineTelegramMessageMapper.build_raw_crawler_post(
             raw_message,
             media_bytes,
         )
-        return await self.pipeline_service.create_crawler_ingest(raw_post)
+        return await self.ingest_service.accept_crawler_post(raw_post, advance_checkpoint=False)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -371,7 +393,7 @@ class TelegramCrawlerRuntime:
         re-attempting will keep failing the same way.
         """
 
-        predownload_result = await self._try_ingest_without_media(raw_message)
+        predownload_result = await self._try_accept_without_media(raw_message)
         if predownload_result is not None:
             self._tally_ingest_outcome(counters, predownload_result)
             return
@@ -402,20 +424,23 @@ class TelegramCrawlerRuntime:
             counters.skipped_unsupported += 1
             return
 
-        ingest_result = await self.pipeline_service.create_crawler_ingest(raw_post)
+        ingest_result = await self.ingest_service.accept_crawler_post(raw_post)
         self._tally_ingest_outcome(counters, ingest_result)
 
-    async def _try_ingest_without_media(
+    async def _try_accept_without_media(
         self,
         raw_message: RawTelegramMessage,
+        *,
+        advance_checkpoint: bool = True,
     ) -> CrawlerIngestResult | None:
         """Return a terminal ingest result that can be decided before media download."""
 
-        return await self.pipeline_service.try_crawler_ingest_without_media(
+        return await self.ingest_service.try_accept_without_media(
             platform=SourcePlatform.TELEGRAM,
             source_id=raw_message.channel_id,
             post_id=raw_message.message_id,
             published_at=raw_message.published_at,
+            advance_checkpoint=advance_checkpoint,
         )
 
     @staticmethod
@@ -461,7 +486,7 @@ class TelegramCrawlerRuntime:
             ):
                 if raw_message.media_type == "unsupported":
                     continue
-                predownload_result = await self._try_ingest_without_media(raw_message)
+                predownload_result = await self._try_accept_without_media(raw_message)
                 if predownload_result is not None:
                     await self._record_live_heartbeat(session_name)
                     continue
@@ -496,7 +521,7 @@ class TelegramCrawlerRuntime:
                     )
                     continue
 
-                await self.pipeline_service.create_crawler_ingest(raw_post)
+                await self.ingest_service.accept_crawler_post(raw_post)
                 await self._record_live_heartbeat(session_name)
         except asyncio.CancelledError:
             raise
@@ -675,6 +700,7 @@ class TelegramCrawlerRuntime:
 
 
 __all__ = [
+    "CrawlerIngestServiceProtocol",
     "CrawlerCatchupReport",
     "TelegramCrawlerRuntime",
 ]

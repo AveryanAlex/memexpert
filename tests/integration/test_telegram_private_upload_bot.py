@@ -16,24 +16,20 @@ from sqlalchemy import select
 from memexpert.bot.main import build_bot, build_dispatcher
 from memexpert.bot.private_upload import TelegramDownloadError
 from memexpert.core.config import Settings
+from memexpert.ingest.schemas import IngestAcceptOutcome, IngestAcceptResult, IngestAcceptSource, IngestRequestRead
 from memexpert.models.base import utcnow
 from memexpert.models.collection import CollectionMeme
-from memexpert.models.content import Meme, MemeFile, MemeSource
+from memexpert.models.content import Meme, MemeFile
 from memexpert.models.enums import (
     ContentKind,
     ContentLanguage,
-    ContentPipelineStage,
-    ContentPipelineStageStatus,
     ContentProcessingStatus,
+    PipelineIngestRequestStatus,
+    SourceAttachReason,
     SourcePlatform,
 )
 from memexpert.models.user import User
-from memexpert.schemas.content_pipeline import (
-    ContentPipelineStageJournalRead,
-    ContentPipelineUploadMetadata,
-    ContentPipelineUploadRead,
-)
-from memexpert.services import CollectionService, PipelineSourceConflictError, UserService
+from memexpert.services import CollectionService, UserService
 from tests.conftest import create_full_user_via_upgrade
 
 if TYPE_CHECKING:
@@ -114,31 +110,31 @@ class FakeTelegramFileDownloader:
 
 
 @dataclass(slots=True)
-class FakePrivateUploadPipelineService:
-    upload_result: ContentPipelineUploadRead | None = None
-    upload_error: Exception | None = None
+class FakePrivateUploadAcceptService:
+    accept_result: IngestAcceptResult | None = None
+    accept_error: Exception | None = None
     calls: list[dict[str, object]] = field(default_factory=list)
 
-    async def create_upload(
+    async def accept_bytes(
         self,
         *,
-        metadata: ContentPipelineUploadMetadata,
+        source: IngestAcceptSource,
         filename: str | None,
         content_type: str | None,
         media_bytes: bytes,
-    ) -> ContentPipelineUploadRead:
+    ) -> IngestAcceptResult:
         self.calls.append(
             {
-                "metadata": metadata,
+                "source": source,
                 "filename": filename,
                 "content_type": content_type,
                 "media_bytes": media_bytes,
             }
         )
-        if self.upload_error is not None:
-            raise self.upload_error
-        assert self.upload_result is not None
-        return self.upload_result
+        if self.accept_error is not None:
+            raise self.accept_error
+        assert self.accept_result is not None
+        return self.accept_result
 
 
 def build_bot_settings(database_url: str) -> Settings:
@@ -191,48 +187,49 @@ async def ensure_active_collection(session: AsyncSession, *, user_id: uuid.UUID)
     _ = await CollectionService(session).ensure_favorites_collection(user_id)
 
 
-def upload_read_for(
+def ingest_result_for(
     *,
-    meme_id: uuid.UUID,
+    outcome: IngestAcceptOutcome = IngestAcceptOutcome.ACCEPTED_ASYNC,
+    owner_user_id: uuid.UUID | None = None,
+    meme_id: uuid.UUID | None = None,
     meme_file_id: uuid.UUID | None = None,
-    status: ContentPipelineStageStatus = ContentPipelineStageStatus.PENDING,
-) -> ContentPipelineUploadRead:
+    source_attach_reason: SourceAttachReason | None = None,
+    source_id: str = f"telegram_pm:{TELEGRAM_ID}:{TELEGRAM_ID}",
+    post_id: str = "message:701:file:photo-unique-1",
+) -> IngestAcceptResult:
     now = utcnow()
-    resolved_meme_file_id = meme_file_id or uuid.uuid7()
-    current_stage = (
-        ContentPipelineStage.INGEST
-        if status is ContentPipelineStageStatus.DUPLICATE
-        else ContentPipelineStage.TRANSCODE
+    status = (
+        PipelineIngestRequestStatus.MEDIA_INSPECT_PENDING
+        if meme_id is None
+        else PipelineIngestRequestStatus.RESOLVED_SHA_DUPLICATE
     )
-    normalized_reason = "duplicate_perceptual_hash" if status is ContentPipelineStageStatus.DUPLICATE else None
-    return ContentPipelineUploadRead(
-        meme_id=meme_id,
-        meme_file_id=resolved_meme_file_id,
-        current_stage=current_stage,
-        current_status=status,
-        original_object_key=f"pipeline/originals/{resolved_meme_file_id}/original.png",
-        web_video_object_key=None,
-        last_event_id=uuid.uuid7(),
-        normalized_reason=normalized_reason,
-        last_error_text=None,
-        attempt_count=1 if status is ContentPipelineStageStatus.DUPLICATE else 0,
-        stages=(
-            ContentPipelineStageJournalRead(
-                id=uuid.uuid7(),
-                meme_file_id=resolved_meme_file_id,
-                stage=current_stage,
-                status=status,
-                attempt_count=1 if status is ContentPipelineStageStatus.DUPLICATE else 0,
-                last_event_id=uuid.uuid7(),
-                normalized_reason=normalized_reason,
-                last_error_text=None,
-                is_retryable=status is ContentPipelineStageStatus.PENDING,
-                retry_after=None,
-                started_at=now if status is ContentPipelineStageStatus.DUPLICATE else None,
-                finished_at=now if status is ContentPipelineStageStatus.DUPLICATE else None,
-                created_at=now,
-                updated_at=now,
-            ),
+    resolved_meme_file_id = meme_file_id if meme_id is not None else None
+    return IngestAcceptResult(
+        outcome=outcome,
+        ingest_request=IngestRequestRead(
+            id=uuid.uuid7(),
+            source_platform=SourcePlatform.TELEGRAM,
+            source_id=source_id,
+            post_id=post_id,
+            owner_user_id=owner_user_id,
+            user_metadata={},
+            source_metadata={"views": 0},
+            declared_filename="telegram-photo-701-photo-unique-1.jpg",
+            declared_content_type="image/jpeg",
+            temp_original_object_key="pipeline/temp-originals/fake/raw.jpg" if meme_id is None else None,
+            sha256_hex="a" * 64,
+            file_size_bytes=5,
+            status=status,
+            failure_code=None,
+            failure_detail=None,
+            attempt_count=0,
+            locked_at=None,
+            materialized_meme_id=meme_id,
+            materialized_meme_file_id=resolved_meme_file_id,
+            matched_meme_file_id=resolved_meme_file_id,
+            source_attach_reason=source_attach_reason,
+            created_at=now,
+            updated_at=now,
         ),
     )
 
@@ -241,13 +238,13 @@ def build_upload_dispatcher(
     *,
     settings: Settings,
     postgres_session_factory: async_sessionmaker[AsyncSession],
-    pipeline_service: FakePrivateUploadPipelineService,
+    accept_service: FakePrivateUploadAcceptService,
     downloader: FakeTelegramFileDownloader,
 ) -> Dispatcher:
     return build_dispatcher(
         settings=settings,
         session_factory=postgres_session_factory,
-        private_upload_pipeline_service_factory=lambda session: pipeline_service,
+        private_upload_accept_service_factory=lambda session: accept_service,
         telegram_file_downloader=downloader,
     )
 
@@ -351,7 +348,7 @@ def last_bot_text(session: RecordingTelegramSession) -> str:
 
 
 @pytest.mark.asyncio
-async def test_private_photo_upload_creates_private_meme_and_saves_active_collection(
+async def test_private_photo_upload_queues_raw_ingest_without_saving_active_collection(
     migrated_db_session: AsyncSession,
     postgres_session_factory: async_sessionmaker[AsyncSession],
     postgres_async_url: str,
@@ -359,10 +356,11 @@ async def test_private_photo_upload_creates_private_meme_and_saves_active_collec
     user_service = UserService(migrated_db_session)
     user = await create_full_user_via_upgrade(user_service, telegram_id=TELEGRAM_ID)
     await ensure_active_collection(migrated_db_session, user_id=user.id)
-    meme, _file = await seed_meme(migrated_db_session, is_public=False, author_user_id=user.id)
     await migrated_db_session.commit()
 
-    pipeline_service = FakePrivateUploadPipelineService(upload_result=upload_read_for(meme_id=meme.id))
+    accept_service = FakePrivateUploadAcceptService(
+        accept_result=ingest_result_for(owner_user_id=user.id),
+    )
     downloader = FakeTelegramFileDownloader(media_bytes=b"photo-bytes")
     settings = build_bot_settings(postgres_async_url)
     recording_session = RecordingTelegramSession()
@@ -370,28 +368,26 @@ async def test_private_photo_upload_creates_private_meme_and_saves_active_collec
     dispatcher = build_upload_dispatcher(
         settings=settings,
         postgres_session_factory=postgres_session_factory,
-        pipeline_service=pipeline_service,
+        accept_service=accept_service,
         downloader=downloader,
     )
 
     await dispatch_photo_upload(dispatcher=dispatcher, bot=bot)
 
     assert downloader.calls == ["photo-file-1"]
-    assert len(pipeline_service.calls) == 1
-    metadata = pipeline_service.calls[0]["metadata"]
-    assert isinstance(metadata, ContentPipelineUploadMetadata)
-    assert metadata.owner_user_id == user.id
-    assert metadata.source_platform is SourcePlatform.TELEGRAM
-    assert metadata.source_id == f"telegram_pm:{TELEGRAM_ID}:{TELEGRAM_ID}"
-    assert metadata.post_id == "message:701:file:photo-unique-1"
-    assert pipeline_service.calls[0]["filename"] == "telegram-photo-701-photo-unique-1.jpg"
-    assert pipeline_service.calls[0]["content_type"] == "image/jpeg"
-    assert pipeline_service.calls[0]["media_bytes"] == b"photo-bytes"
-    assert "Обработка запущена" in last_bot_text(recording_session)
-    saved_meme_id = await migrated_db_session.scalar(
-        select(CollectionMeme.meme_id).where(CollectionMeme.meme_id == meme.id)
-    )
-    assert saved_meme_id == meme.id
+    assert len(accept_service.calls) == 1
+    source = accept_service.calls[0]["source"]
+    assert isinstance(source, IngestAcceptSource)
+    assert source.owner_user_id == user.id
+    assert source.source_platform is SourcePlatform.TELEGRAM
+    assert source.source_id == f"telegram_pm:{TELEGRAM_ID}:{TELEGRAM_ID}"
+    assert source.post_id == "message:701:file:photo-unique-1"
+    assert source.views == 0
+    assert accept_service.calls[0]["filename"] == "telegram-photo-701-photo-unique-1.jpg"
+    assert accept_service.calls[0]["content_type"] == "image/jpeg"
+    assert accept_service.calls[0]["media_bytes"] == b"photo-bytes"
+    assert "Результат появится" in last_bot_text(recording_session)
+    assert await migrated_db_session.scalar(select(CollectionMeme.meme_id)) is None
 
 
 @pytest.mark.asyncio
@@ -403,11 +399,18 @@ async def test_private_upload_public_duplicate_saves_existing_public_meme(
     user_service = UserService(migrated_db_session)
     user = await create_full_user_via_upgrade(user_service, telegram_id=TELEGRAM_ID)
     await ensure_active_collection(migrated_db_session, user_id=user.id)
-    public_meme, _file = await seed_meme(migrated_db_session, is_public=True)
+    public_meme, file = await seed_meme(migrated_db_session, is_public=True)
     await migrated_db_session.commit()
 
-    pipeline_service = FakePrivateUploadPipelineService(
-        upload_result=upload_read_for(meme_id=public_meme.id, status=ContentPipelineStageStatus.DUPLICATE)
+    accept_service = FakePrivateUploadAcceptService(
+        accept_result=ingest_result_for(
+            outcome=IngestAcceptOutcome.RESOLVED_SHA_DUPLICATE,
+            owner_user_id=user.id,
+            meme_id=public_meme.id,
+            meme_file_id=file.id,
+            source_attach_reason=SourceAttachReason.SHA256_EXACT_EXISTING_FILE,
+            post_id="message:821:file:doc-unique-21",
+        )
     )
     downloader = FakeTelegramFileDownloader()
     settings = build_bot_settings(postgres_async_url)
@@ -416,7 +419,7 @@ async def test_private_upload_public_duplicate_saves_existing_public_meme(
     dispatcher = build_upload_dispatcher(
         settings=settings,
         postgres_session_factory=postgres_session_factory,
-        pipeline_service=pipeline_service,
+        accept_service=accept_service,
         downloader=downloader,
     )
 
@@ -438,11 +441,17 @@ async def test_private_duplicate_not_visible_is_not_reported_as_public_or_saved(
     user = await create_full_user_via_upgrade(user_service, telegram_id=TELEGRAM_ID)
     await ensure_active_collection(migrated_db_session, user_id=user.id)
     other_user = await create_full_user_via_upgrade(user_service, email="private-owner@example.com")
-    private_meme, _file = await seed_meme(migrated_db_session, is_public=False, author_user_id=other_user.id)
+    private_meme, file = await seed_meme(migrated_db_session, is_public=False, author_user_id=other_user.id)
     await migrated_db_session.commit()
 
-    pipeline_service = FakePrivateUploadPipelineService(
-        upload_result=upload_read_for(meme_id=private_meme.id, status=ContentPipelineStageStatus.DUPLICATE)
+    accept_service = FakePrivateUploadAcceptService(
+        accept_result=ingest_result_for(
+            outcome=IngestAcceptOutcome.RESOLVED_SHA_DUPLICATE,
+            owner_user_id=user.id,
+            meme_id=private_meme.id,
+            meme_file_id=file.id,
+            source_attach_reason=SourceAttachReason.SHA256_EXACT_EXISTING_FILE,
+        )
     )
     downloader = FakeTelegramFileDownloader()
     settings = build_bot_settings(postgres_async_url)
@@ -451,7 +460,7 @@ async def test_private_duplicate_not_visible_is_not_reported_as_public_or_saved(
     dispatcher = build_upload_dispatcher(
         settings=settings,
         postgres_session_factory=postgres_session_factory,
-        pipeline_service=pipeline_service,
+        accept_service=accept_service,
         downloader=downloader,
     )
 
@@ -474,21 +483,17 @@ async def test_private_upload_duplicate_source_replay_resolves_existing_source_a
     user = await create_full_user_via_upgrade(user_service, telegram_id=TELEGRAM_ID)
     await ensure_active_collection(migrated_db_session, user_id=user.id)
     meme, file = await seed_meme(migrated_db_session, is_public=True)
-    migrated_db_session.add(
-        MemeSource(
-            file_id=file.id,
-            platform=SourcePlatform.TELEGRAM,
-            source_id=f"telegram_pm:{TELEGRAM_ID}:{TELEGRAM_ID}",
-            post_id="message:701:file:photo-unique-1",
-            views=0,
-            reactions={},
-            is_first_source=True,
-            source_alive=True,
-        )
-    )
     await migrated_db_session.commit()
 
-    pipeline_service = FakePrivateUploadPipelineService(upload_error=PipelineSourceConflictError("duplicate source"))
+    accept_service = FakePrivateUploadAcceptService(
+        accept_result=ingest_result_for(
+            outcome=IngestAcceptOutcome.SOURCE_REPLAY,
+            owner_user_id=user.id,
+            meme_id=meme.id,
+            meme_file_id=file.id,
+            source_attach_reason=SourceAttachReason.SHA256_EXACT_EXISTING_FILE,
+        )
+    )
     downloader = FakeTelegramFileDownloader()
     settings = build_bot_settings(postgres_async_url)
     recording_session = RecordingTelegramSession()
@@ -496,7 +501,7 @@ async def test_private_upload_duplicate_source_replay_resolves_existing_source_a
     dispatcher = build_upload_dispatcher(
         settings=settings,
         postgres_session_factory=postgres_session_factory,
-        pipeline_service=pipeline_service,
+        accept_service=accept_service,
         downloader=downloader,
     )
 
@@ -510,6 +515,40 @@ async def test_private_upload_duplicate_source_replay_resolves_existing_source_a
 
 
 @pytest.mark.asyncio
+async def test_private_upload_source_replay_without_materialized_meme_reports_processing(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    postgres_async_url: str,
+) -> None:
+    user_service = UserService(migrated_db_session)
+    user = await create_full_user_via_upgrade(user_service, telegram_id=TELEGRAM_ID)
+    await ensure_active_collection(migrated_db_session, user_id=user.id)
+    await migrated_db_session.commit()
+
+    accept_service = FakePrivateUploadAcceptService(
+        accept_result=ingest_result_for(
+            outcome=IngestAcceptOutcome.SOURCE_REPLAY,
+            owner_user_id=user.id,
+        )
+    )
+    downloader = FakeTelegramFileDownloader()
+    settings = build_bot_settings(postgres_async_url)
+    recording_session = RecordingTelegramSession()
+    bot = build_bot(settings, session=recording_session)
+    dispatcher = build_upload_dispatcher(
+        settings=settings,
+        postgres_session_factory=postgres_session_factory,
+        accept_service=accept_service,
+        downloader=downloader,
+    )
+
+    await dispatch_photo_upload(dispatcher=dispatcher, bot=bot)
+
+    assert "уже в обработке" in last_bot_text(recording_session)
+    assert await migrated_db_session.scalar(select(CollectionMeme.meme_id)) is None
+
+
+@pytest.mark.asyncio
 async def test_private_upload_rejects_unsupported_document_without_download(
     migrated_db_session: AsyncSession,
     postgres_session_factory: async_sessionmaker[AsyncSession],
@@ -520,7 +559,7 @@ async def test_private_upload_rejects_unsupported_document_without_download(
     await ensure_active_collection(migrated_db_session, user_id=user.id)
     await migrated_db_session.commit()
 
-    pipeline_service = FakePrivateUploadPipelineService()
+    accept_service = FakePrivateUploadAcceptService()
     downloader = FakeTelegramFileDownloader()
     settings = build_bot_settings(postgres_async_url)
     recording_session = RecordingTelegramSession()
@@ -528,7 +567,7 @@ async def test_private_upload_rejects_unsupported_document_without_download(
     dispatcher = build_upload_dispatcher(
         settings=settings,
         postgres_session_factory=postgres_session_factory,
-        pipeline_service=pipeline_service,
+        accept_service=accept_service,
         downloader=downloader,
     )
 
@@ -536,7 +575,7 @@ async def test_private_upload_rejects_unsupported_document_without_download(
 
     assert "Поддерживаются только изображения" in last_bot_text(recording_session)
     assert downloader.calls == []
-    assert pipeline_service.calls == []
+    assert accept_service.calls == []
 
 
 @pytest.mark.asyncio
@@ -550,7 +589,7 @@ async def test_private_upload_rejects_oversize_animation_before_download(
     await ensure_active_collection(migrated_db_session, user_id=user.id)
     await migrated_db_session.commit()
 
-    pipeline_service = FakePrivateUploadPipelineService()
+    accept_service = FakePrivateUploadAcceptService()
     downloader = FakeTelegramFileDownloader()
     settings = build_bot_settings(postgres_async_url)
     recording_session = RecordingTelegramSession()
@@ -558,7 +597,7 @@ async def test_private_upload_rejects_oversize_animation_before_download(
     dispatcher = build_upload_dispatcher(
         settings=settings,
         postgres_session_factory=postgres_session_factory,
-        pipeline_service=pipeline_service,
+        accept_service=accept_service,
         downloader=downloader,
     )
 
@@ -566,7 +605,7 @@ async def test_private_upload_rejects_oversize_animation_before_download(
 
     assert "Файл слишком большой" in last_bot_text(recording_session)
     assert downloader.calls == []
-    assert pipeline_service.calls == []
+    assert accept_service.calls == []
 
 
 @pytest.mark.asyncio
@@ -576,7 +615,7 @@ async def test_private_upload_unlinked_user_is_rejected_before_download(
     postgres_async_url: str,
 ) -> None:
     _ = migrated_db_session
-    pipeline_service = FakePrivateUploadPipelineService()
+    accept_service = FakePrivateUploadAcceptService()
     downloader = FakeTelegramFileDownloader()
     settings = build_bot_settings(postgres_async_url)
     recording_session = RecordingTelegramSession()
@@ -584,7 +623,7 @@ async def test_private_upload_unlinked_user_is_rejected_before_download(
     dispatcher = build_upload_dispatcher(
         settings=settings,
         postgres_session_factory=postgres_session_factory,
-        pipeline_service=pipeline_service,
+        accept_service=accept_service,
         downloader=downloader,
     )
 
@@ -592,7 +631,7 @@ async def test_private_upload_unlinked_user_is_rejected_before_download(
 
     assert "Сначала привяжите Telegram" in last_bot_text(recording_session)
     assert downloader.calls == []
-    assert pipeline_service.calls == []
+    assert accept_service.calls == []
 
 
 @pytest.mark.asyncio
@@ -605,7 +644,7 @@ async def test_private_upload_missing_active_collection_is_rejected_before_downl
     _user = await create_full_user_via_upgrade(user_service, telegram_id=TELEGRAM_ID)
     await migrated_db_session.commit()
 
-    pipeline_service = FakePrivateUploadPipelineService()
+    accept_service = FakePrivateUploadAcceptService()
     downloader = FakeTelegramFileDownloader()
     settings = build_bot_settings(postgres_async_url)
     recording_session = RecordingTelegramSession()
@@ -613,7 +652,7 @@ async def test_private_upload_missing_active_collection_is_rejected_before_downl
     dispatcher = build_upload_dispatcher(
         settings=settings,
         postgres_session_factory=postgres_session_factory,
-        pipeline_service=pipeline_service,
+        accept_service=accept_service,
         downloader=downloader,
     )
 
@@ -621,7 +660,7 @@ async def test_private_upload_missing_active_collection_is_rejected_before_downl
 
     assert "активную коллекцию" in last_bot_text(recording_session)
     assert downloader.calls == []
-    assert pipeline_service.calls == []
+    assert accept_service.calls == []
 
 
 @pytest.mark.asyncio
@@ -635,7 +674,7 @@ async def test_private_upload_reports_download_failure_without_pipeline_call(
     await ensure_active_collection(migrated_db_session, user_id=user.id)
     await migrated_db_session.commit()
 
-    pipeline_service = FakePrivateUploadPipelineService()
+    accept_service = FakePrivateUploadAcceptService()
     downloader = FakeTelegramFileDownloader(error=TelegramDownloadError("boom"))
     settings = build_bot_settings(postgres_async_url)
     recording_session = RecordingTelegramSession()
@@ -643,7 +682,7 @@ async def test_private_upload_reports_download_failure_without_pipeline_call(
     dispatcher = build_upload_dispatcher(
         settings=settings,
         postgres_session_factory=postgres_session_factory,
-        pipeline_service=pipeline_service,
+        accept_service=accept_service,
         downloader=downloader,
     )
 
@@ -651,7 +690,7 @@ async def test_private_upload_reports_download_failure_without_pipeline_call(
 
     assert "Не удалось скачать файл" in last_bot_text(recording_session)
     assert downloader.calls == ["photo-file-1"]
-    assert pipeline_service.calls == []
+    assert accept_service.calls == []
 
 
 @pytest.mark.asyncio
@@ -670,14 +709,14 @@ async def test_private_upload_reports_pipeline_factory_setup_failure_before_down
     recording_session = RecordingTelegramSession()
     bot = build_bot(settings, session=recording_session)
 
-    def raising_pipeline_factory(session: AsyncSession) -> FakePrivateUploadPipelineService:
+    def raising_accept_factory(session: AsyncSession) -> FakePrivateUploadAcceptService:
         _ = session
         raise RuntimeError("pipeline config is unavailable")
 
     dispatcher = build_dispatcher(
         settings=settings,
         session_factory=postgres_session_factory,
-        private_upload_pipeline_service_factory=raising_pipeline_factory,
+        private_upload_accept_service_factory=raising_accept_factory,
         telegram_file_downloader=downloader,
     )
 
@@ -698,13 +737,21 @@ async def test_private_upload_reports_active_collection_save_failure(
     user = await create_full_user_via_upgrade(user_service, telegram_id=TELEGRAM_ID)
     other_user = await create_full_user_via_upgrade(user_service, email="collection-owner@example.com")
     other_collection = await collection_service.create_custom_collection(owner_user_id=other_user.id, title="Other")
-    meme, _file = await seed_meme(migrated_db_session, is_public=False, author_user_id=user.id)
+    meme, file = await seed_meme(migrated_db_session, is_public=False, author_user_id=user.id)
     persisted_user = await migrated_db_session.scalar(select(User).where(User.id == user.id))
     assert persisted_user is not None
     persisted_user.active_save_collection_id = other_collection.id
     await migrated_db_session.commit()
 
-    pipeline_service = FakePrivateUploadPipelineService(upload_result=upload_read_for(meme_id=meme.id))
+    accept_service = FakePrivateUploadAcceptService(
+        accept_result=ingest_result_for(
+            outcome=IngestAcceptOutcome.RESOLVED_SHA_DUPLICATE,
+            owner_user_id=user.id,
+            meme_id=meme.id,
+            meme_file_id=file.id,
+            source_attach_reason=SourceAttachReason.SHA256_EXACT_EXISTING_FILE,
+        )
+    )
     downloader = FakeTelegramFileDownloader()
     settings = build_bot_settings(postgres_async_url)
     recording_session = RecordingTelegramSession()
@@ -712,7 +759,7 @@ async def test_private_upload_reports_active_collection_save_failure(
     dispatcher = build_upload_dispatcher(
         settings=settings,
         postgres_session_factory=postgres_session_factory,
-        pipeline_service=pipeline_service,
+        accept_service=accept_service,
         downloader=downloader,
     )
 
