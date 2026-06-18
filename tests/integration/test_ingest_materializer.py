@@ -39,6 +39,7 @@ from memexpert.models.enums import (
     SourceAttachReason,
     SourcePlatform,
 )
+from memexpert.models.user import User
 from memexpert.pipeline.outbox import PipelineOutboxPublisher
 from memexpert.schemas.content_pipeline import ContentPipelineEventType
 from memexpert.services import PipelineIngestError
@@ -178,6 +179,8 @@ async def _seed_raw_request(
     source_id: str = "materializer-source",
     post_id: str = "1",
     views: int = 12,
+    owner_user_id: uuid.UUID | None = None,
+    source_metadata: dict[str, object] | None = None,
 ) -> PipelineIngestRequest:
     ingest_request_id = uuid.uuid7()
     temp_key = build_temp_original_object_key(ingest_request_id, "raw.png", settings=Settings())
@@ -187,7 +190,8 @@ async def _seed_raw_request(
         source_platform=SourcePlatform.TELEGRAM,
         source_id=source_id,
         post_id=post_id,
-        source_metadata={"views": views},
+        owner_user_id=owner_user_id,
+        source_metadata=source_metadata or {"views": views},
         declared_filename="raw.png",
         declared_content_type="image/png",
         temp_original_object_key=temp_key,
@@ -323,6 +327,61 @@ async def test_materializer_phash_duplicate_creates_new_file_under_existing_meme
     assert new_source.attach_reason is SourceAttachReason.PHASH_EXACT_NEW_FILE
     assert new_source.matched_meme_file_id == existing_file.id
     assert outbox_count == 1
+
+
+async def test_materializer_persists_source_attribution_from_raw_request_metadata(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    storage_client = FakeStorageClient()
+    owner = User()
+    migrated_db_session.add(owner)
+    await migrated_db_session.flush()
+    owner_user_id = owner.id
+    published_at = utcnow()
+    ingest_request = await _seed_raw_request(
+        migrated_db_session,
+        storage_client,
+        source_id="attribution-source",
+        post_id="source-post",
+        owner_user_id=owner_user_id,
+        source_metadata={
+            "views": 41,
+            "published_at": published_at.isoformat(),
+            "reactions": {"like": 5, "fire": 2},
+            "forward": {
+                "source_id": "original-source",
+                "post_id": "original-post",
+                "channel_username": None,
+                "channel_title": "Original",
+            },
+        },
+    )
+    media_processor = FakeMediaProcessor(inspect_result=_upload_details(perceptual_hash="7" * 16))
+
+    result = await PipelineIngestMaterializer(
+        migrated_db_session,
+        settings=Settings(),
+        storage_client=storage_client,
+        media_processor=media_processor,
+    ).materialize(ingest_request.id)
+
+    async with postgres_session_factory() as session:
+        meme = await session.get(Meme, result.materialized_meme_id)
+        source = await session.scalar(select(MemeSource).where(MemeSource.source_id == "attribution-source"))
+
+    assert result.status is PipelineIngestRequestStatus.MATERIALIZED
+    assert meme is not None
+    assert meme.author_user_id == owner_user_id
+    assert source is not None
+    assert source.file_id == result.materialized_meme_file_id
+    assert source.views == 41
+    assert source.reactions == {"like": 5, "fire": 2}
+    assert source.is_first_source is False
+    assert source.published_at == published_at
+    assert source.forwarded_from_source_id == "original-source"
+    assert source.forwarded_from_post_id == "original-post"
+    assert source.attach_reason is SourceAttachReason.NEW_FILE
 
 
 async def test_materializer_blocked_phash_creates_failed_audit_rows_and_no_transcode_outbox(

@@ -13,11 +13,19 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from memexpert.ingest.accept_service import PipelineIngestAcceptService
 from memexpert.ingest.schemas import IngestAcceptOutcome, IngestAcceptSource
-from memexpert.models.content import Meme, MemeFile, MemeSource, PipelineIngestRequest, PipelineOutboxEvent
+from memexpert.models.content import (
+    BlockedPerceptualHash,
+    Meme,
+    MemeFile,
+    MemeSource,
+    PipelineIngestRequest,
+    PipelineOutboxEvent,
+)
 from memexpert.models.enums import (
     ContentKind,
     ContentLanguage,
     ContentProcessingStatus,
+    ModerationReason,
     PipelineIngestRequestStatus,
     PipelineOutboxEventStatus,
     SourceAttachReason,
@@ -76,6 +84,7 @@ async def _seed_meme_file(
     session: AsyncSession,
     *,
     sha256_hex: str,
+    blocked_perceptual_hash_id: uuid.UUID | None = None,
 ) -> tuple[Meme, MemeFile]:
     meme_id = uuid.uuid7()
     meme_file_id = uuid.uuid7()
@@ -89,11 +98,16 @@ async def _seed_meme_file(
     meme_file = MemeFile(
         id=meme_file_id,
         meme_id=meme_id,
-        status=ContentProcessingStatus.PENDING,
+        status=(
+            ContentProcessingStatus.FAILED
+            if blocked_perceptual_hash_id is not None
+            else ContentProcessingStatus.PENDING
+        ),
         file_size_bytes=128,
         mime_type="image/png",
         s3_original_key=f"pipeline/originals/{meme_file_id}/original.png",
         sha256_hex=sha256_hex,
+        blocked_perceptual_hash_id=blocked_perceptual_hash_id,
     )
     session.add(meme)
     await session.flush()
@@ -189,6 +203,53 @@ async def test_accept_sha_duplicate_resolves_synchronously_and_does_not_enqueue_
     assert sources[0].file_id == meme_file.id
     assert sources[0].attach_reason is SourceAttachReason.SHA256_EXACT_EXISTING_FILE
     assert sources[0].matched_meme_file_id == meme_file.id
+
+
+async def test_accept_sha_duplicate_of_blocked_file_preserves_blocked_source_reason(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    media_bytes = b"same-blocked-sha-bytes"
+    sha256_hex = hashlib.sha256(media_bytes).hexdigest()
+    blocked_hash = BlockedPerceptualHash(
+        perceptual_hash="b" * 16,
+        hash_algorithm="phash",
+        hash_size=64,
+        max_hamming_distance=0,
+        reason=ModerationReason.SPAM,
+        is_active=True,
+    )
+    migrated_db_session.add(blocked_hash)
+    await migrated_db_session.flush()
+    _meme, meme_file = await _seed_meme_file(
+        migrated_db_session,
+        sha256_hex=sha256_hex,
+        blocked_perceptual_hash_id=blocked_hash.id,
+    )
+    storage_client = FakeStorageClient()
+    service = PipelineIngestAcceptService(migrated_db_session, storage_client=storage_client)
+
+    result = await service.accept_bytes(
+        source=_source(source_id="blocked-sha-source", post_id="blocked-sha-post"),
+        filename="blocked-duplicate.png",
+        content_type="image/png",
+        media_bytes=media_bytes,
+    )
+
+    assert result.outcome is IngestAcceptOutcome.RESOLVED_SHA_DUPLICATE
+    assert result.ingest_request.materialized_meme_file_id == meme_file.id
+    assert result.ingest_request.source_attach_reason is SourceAttachReason.BLOCKED_SHA256_EXISTING_FILE
+    assert storage_client.put_calls == []
+
+    async with postgres_session_factory() as session:
+        source = await session.scalar(select(MemeSource).where(MemeSource.source_id == "blocked-sha-source"))
+        file_count = await session.scalar(select(func.count()).select_from(MemeFile))
+
+    assert file_count == 1
+    assert source is not None
+    assert source.file_id == meme_file.id
+    assert source.attach_reason is SourceAttachReason.BLOCKED_SHA256_EXISTING_FILE
+    assert source.matched_meme_file_id == meme_file.id
 
 
 async def test_accept_source_replay_returns_existing_request_without_duplicate_work(

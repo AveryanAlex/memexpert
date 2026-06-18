@@ -1342,8 +1342,8 @@ def test_telegram_session_status_values_are_locked_and_stable() -> None:
 
 
 def test_meme_source_exposes_forward_attribution_columns_and_helper() -> None:
-    # The forward-chain columns must exist on the ORM model so create_crawler_ingest
-    # can populate them; ``is_forwarded`` is the ergonomic helper that keeps the
+    # The forward-chain columns must exist on the ORM model so crawler ingest can
+    # populate them; ``is_forwarded`` is the ergonomic helper that keeps the
     # reposter-detection logic out of every caller.
     columns = MemeSource.__table__.c
     assert "published_at" in columns

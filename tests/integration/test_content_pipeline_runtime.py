@@ -50,7 +50,6 @@ from memexpert.core.voyage import (
 )
 from memexpert.media.contracts import (
     NormalizedMediaResult,
-    PipelineMediaProcessorProtocol,
     UploadMediaDetails,
 )
 from memexpert.models.base import utcnow
@@ -79,7 +78,9 @@ from memexpert.models.enums import (
     ContentPipelineStageStatus,
     ContentProcessingStatus,
     ContentSourceKind,
+    IngestFileOrigin,
     PipelineIngestRequestStatus,
+    SourceAttachReason,
     SourcePlatform,
     SyncTargetKind,
     SyncTargetStatus,
@@ -99,7 +100,6 @@ from memexpert.schemas.content_pipeline import (
     ContentPipelineReadyEventSummary,
     ContentPipelineStageJournalRead,
     ContentPipelineSyncTargetPreview,
-    ContentPipelineUploadMetadata,
     PerTargetSyncStatus,
 )
 from memexpert.services import ContentPipelineService, PipelineIngestError, PipelinePublishError
@@ -533,12 +533,7 @@ def build_png_bytes(*, color: tuple[int, int, int]) -> bytes:
 
 
 def build_seeded_png_bytes(*, seed: str) -> bytes:
-    """Generate deterministic but byte-distinct PNG payloads for seeded uploads.
-
-    ``create_upload`` intentionally performs exact SHA-256 deduplication before
-    media inspection and pHash comparison. Runtime tests that seed independent
-    files must therefore vary the actual bytes, not just the fake pHash.
-    """
+    """Generate deterministic but byte-distinct PNG payloads for seeded files."""
 
     digest = hashlib.sha256(seed.encode("utf-8")).digest()
     image = Image.new("RGB", (8, 8))
@@ -585,6 +580,94 @@ async def seed_raw_ingest_request_for_runtime(
     session.add(ingest_request)
     await session.commit()
     return ingest_request
+
+
+async def _seed_transcode_pending_item(
+    session: AsyncSession,
+    storage_client: FakeStorageClient,
+    *,
+    source_id: str,
+    post_id: str,
+    filename: str,
+    media_bytes: bytes,
+    phash_tag: str = "a",
+) -> tuple[ContentPipelineItemRead, ContentPipelineDispatchEvent]:
+    details = _make_distinct_upload_media_details(tag=phash_tag)
+    meme_id = uuid.uuid7()
+    meme_file_id = uuid.uuid7()
+    event_id = uuid.uuid7()
+    now = utcnow()
+    original_object_key = f"pipeline/originals/{meme_file_id}/original.{filename.rsplit('.', 1)[-1]}"
+    storage_client.objects[original_object_key] = StoredObject(body=media_bytes, content_type="image/png")
+    dispatch_event = ContentPipelineDispatchEvent(
+        event_id=event_id,
+        event_type=ContentPipelineEventType.MEME_CREATED,
+        meme_id=meme_id,
+        meme_file_id=meme_file_id,
+        stage=ContentPipelineStage.TRANSCODE,
+        source_kind=ContentSourceKind.MANUAL_UPLOAD,
+        original_object_key=original_object_key,
+        attempt=1,
+        created_at=now,
+    )
+    session.add(
+        Meme(
+            id=meme_id,
+            media_type=details.media_type,
+            primary_file_id=meme_file_id,
+            language=ContentLanguage.NONE,
+            is_public=False,
+        )
+    )
+    await session.flush()
+    session.add_all(
+        [
+            MemeFile(
+                id=meme_file_id,
+                meme_id=meme_id,
+                status=ContentProcessingStatus.PENDING,
+                width=details.width,
+                height=details.height,
+                file_size_bytes=len(media_bytes),
+                mime_type="image/png",
+                s3_original_key=original_object_key,
+                perceptual_hash=details.perceptual_hash,
+                sha256_hex=hashlib.sha256(media_bytes).hexdigest(),
+                ingest_origin=IngestFileOrigin.NEW_MEME,
+            ),
+            MemeSource(
+                file_id=meme_file_id,
+                platform=SourcePlatform.TELEGRAM,
+                source_id=source_id,
+                post_id=post_id,
+                views=9,
+                reactions={},
+                is_first_source=True,
+                source_alive=True,
+                attach_reason=SourceAttachReason.NEW_FILE,
+            ),
+            PipelineStageJournal(
+                meme_file_id=meme_file_id,
+                stage=ContentPipelineStage.INGEST,
+                status=ContentPipelineStageStatus.SUCCEEDED,
+                attempt_count=1,
+                last_event_id=event_id,
+                is_retryable=False,
+                started_at=now,
+                finished_at=now,
+            ),
+            PipelineStageJournal(
+                meme_file_id=meme_file_id,
+                stage=ContentPipelineStage.TRANSCODE,
+                status=ContentPipelineStageStatus.PENDING,
+                attempt_count=0,
+                last_event_id=event_id,
+                is_retryable=True,
+            ),
+        ]
+    )
+    await session.commit()
+    return await ContentPipelineService(session).get_item(meme_file_id), dispatch_event
 
 
 def build_normalized_media_result(meme_file_id: uuid.UUID) -> NormalizedMediaResult:
@@ -634,21 +717,17 @@ async def _seed_ocr_pending_item(
     storage_client: FakeStorageClient,
     publisher: RecordingPublisher,
 ) -> tuple[uuid.UUID, ContentPipelineDispatchEvent, NormalizedMediaResult]:
+    item, _ = await _seed_transcode_pending_item(
+        session,
+        storage_client,
+        source_id="ocr-runtime-source",
+        post_id="8001",
+        filename="ocr-runtime.png",
+        media_bytes=build_png_bytes(color=(60, 70, 80)),
+    )
     service = ContentPipelineService(
         session,
-        storage_client=storage_client,
         publisher=publisher,
-    )
-    item = await service.create_upload(
-        metadata=ContentPipelineUploadMetadata(
-            source_platform=SourcePlatform.TELEGRAM,
-            source_id="ocr-runtime-source",
-            post_id="8001",
-            views=11,
-        ),
-        filename="ocr-runtime.png",
-        content_type="image/png",
-        media_bytes=build_png_bytes(color=(60, 70, 80)),
     )
     normalized = build_normalized_media_result(item.meme_file_id)
     storage_client.objects[normalized.web_video_object_key] = StoredObject(
@@ -1023,24 +1102,14 @@ async def test_pipeline_runtime_forced_transcode_failure_then_replay_then_succes
     monkeypatch: MonkeyPatch,
 ) -> None:
     storage_client = FakeStorageClient()
-    initial_publisher = RecordingPublisher()
-    setup_service = ContentPipelineService(
+    item, initial_event = await _seed_transcode_pending_item(
         migrated_db_session,
-        storage_client=storage_client,
-        publisher=initial_publisher,
-    )
-    item = await setup_service.create_upload(
-        metadata=ContentPipelineUploadMetadata(
-            source_platform=SourcePlatform.TELEGRAM,
-            source_id="runtime-channel",
-            post_id="7001",
-            views=5,
-        ),
+        storage_client,
+        source_id="runtime-channel",
+        post_id="7001",
         filename="runtime.png",
-        content_type="image/png",
         media_bytes=build_png_bytes(color=(255, 0, 0)),
     )
-    initial_event = initial_publisher.events[0]
 
     failing_settings = Settings.model_validate(
         {"pipeline_worker_fail_transcode_for_meme_file_id": str(item.meme_file_id)}
@@ -1071,7 +1140,6 @@ async def test_pipeline_runtime_forced_transcode_failure_then_replay_then_succes
         replay_service = ContentPipelineService(
             replay_session,
             settings=failing_settings,
-            storage_client=storage_client,
             publisher=replay_publisher,
         )
         first_replay = await replay_service.replay_item(item.meme_file_id)
@@ -1206,7 +1274,6 @@ async def test_pipeline_runtime_ocr_failure_then_replay_then_success(
     async with postgres_session_factory() as replay_session:
         replay_service = ContentPipelineService(
             replay_session,
-            storage_client=storage_client,
             publisher=replay_publisher,
         )
         replay_response = await replay_service.replay_item(meme_file_id, stage=ContentPipelineStage.OCR)
@@ -1246,20 +1313,12 @@ async def test_pipeline_runtime_dead_letters_malformed_dispatch_payloads_and_mar
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     storage_client = FakeStorageClient()
-    setup_publisher = RecordingPublisher()
-    setup_service = ContentPipelineService(
+    item, _ = await _seed_transcode_pending_item(
         migrated_db_session,
-        storage_client=storage_client,
-        publisher=setup_publisher,
-    )
-    item = await setup_service.create_upload(
-        metadata=ContentPipelineUploadMetadata(
-            source_platform=SourcePlatform.TELEGRAM,
-            source_id="runtime-malformed-channel",
-            post_id="7002",
-        ),
+        storage_client,
+        source_id="runtime-malformed-channel",
+        post_id="7002",
         filename="runtime-malformed.png",
-        content_type="image/png",
         media_bytes=build_png_bytes(color=(0, 255, 0)),
     )
 
@@ -1353,7 +1412,7 @@ def build_classification_result(*, is_nsfw: bool = False, nsfw_score: float = 0.
 
 
 def _make_distinct_upload_media_details(*, tag: str) -> UploadMediaDetails:
-    """Build unique upload metadata so repeated ingests get distinct perceptual hashes."""
+    """Build unique media metadata so repeated seed rows get distinct perceptual hashes."""
 
     perceptual_hash = (tag * 16)[:16]
     return UploadMediaDetails(
@@ -1378,29 +1437,20 @@ async def _seed_embed_pending_item(
     """Create a pipeline item and drive it to the EMBED-pending state via the service."""
 
     initial_event_count = len(publisher.events)
-    media_processor: PipelineMediaProcessorProtocol | None = None
-    if phash_tag is not None:
-        media_processor = FakeMediaProcessor(
-            inspect_result=_make_distinct_upload_media_details(tag=phash_tag),
-        )
-    service = ContentPipelineService(
+    item, _ = await _seed_transcode_pending_item(
         session,
-        storage_client=storage_client,
-        publisher=publisher,
-        media_processor=media_processor,
-    )
-    item = await service.create_upload(
-        metadata=ContentPipelineUploadMetadata(
-            source_platform=SourcePlatform.TELEGRAM,
-            source_id=source_id,
-            post_id=post_id,
-            views=13,
-        ),
+        storage_client,
+        source_id=source_id,
+        post_id=post_id,
         filename="embed-runtime.png",
-        content_type="image/png",
         media_bytes=build_seeded_png_bytes(
             seed=f"embed-runtime:{source_id}:{post_id}:{phash_tag or ''}",
         ),
+        phash_tag=phash_tag or "a",
+    )
+    service = ContentPipelineService(
+        session,
+        publisher=publisher,
     )
     normalized = build_normalized_media_result(item.meme_file_id)
     storage_client.objects[normalized.web_video_object_key] = StoredObject(
@@ -1428,7 +1478,7 @@ async def _seed_embed_pending_item(
         ),
         None,
     )
-    assert embed_event is not None, "seed upload must dispatch a fresh EMBED event"
+    assert embed_event is not None, "seed item must dispatch a fresh EMBED event"
     return item.meme_file_id, embed_event, normalized
 
 
@@ -1451,7 +1501,6 @@ async def _seed_classify_pending_item(
     )
     service = ContentPipelineService(
         session,
-        storage_client=storage_client,
         publisher=publisher,
     )
     _ = await service.complete_embed_stage(
@@ -1483,7 +1532,6 @@ async def _seed_sync_qdrant_pending_item(
     )
     service = ContentPipelineService(
         session,
-        storage_client=storage_client,
         publisher=publisher,
     )
     await service.complete_classify_stage(
@@ -1523,7 +1571,6 @@ async def _seed_sync_meili_pending_item(
     )
     service = ContentPipelineService(
         session,
-        storage_client=storage_client,
         publisher=publisher,
     )
     await service.complete_classify_stage(
@@ -1866,7 +1913,6 @@ async def test_pipeline_runtime_embed_merge_transaction_failure_keeps_stage_repl
     async with postgres_session_factory() as stash_session:
         older_service = ContentPipelineService(
             stash_session,
-            storage_client=storage_client,
             publisher=seed_publisher,
         )
         _ = await older_service.complete_embed_stage(
@@ -2001,7 +2047,6 @@ async def test_pipeline_runtime_embed_merge_transaction_failure_keeps_stage_repl
     async with postgres_session_factory() as replay_session:
         replay_service = ContentPipelineService(
             replay_session,
-            storage_client=storage_client,
             publisher=replay_publisher,
         )
         replay_response = await replay_service.replay_item(
@@ -3250,7 +3295,6 @@ async def test_classify_completion_fans_out_both_sync_stages_and_publishes_both_
     )
     service = ContentPipelineService(
         migrated_db_session,
-        storage_client=storage_client,
         publisher=publisher,
     )
 
@@ -3316,7 +3360,6 @@ async def test_classify_completion_fan_out_publish_failure_rolls_back_both_stage
 
     fail_service = ContentPipelineService(
         migrated_db_session,
-        storage_client=storage_client,
         publisher=_publisher,
     )
 
@@ -3377,7 +3420,6 @@ async def test_outcome_partially_searchable_when_exactly_one_target_synced(
     )
     service = ContentPipelineService(
         migrated_db_session,
-        storage_client=storage_client,
         publisher=publisher,
     )
     await service.complete_classify_stage(
@@ -3404,7 +3446,6 @@ async def test_outcome_partially_searchable_when_exactly_one_target_synced(
     async with postgres_session_factory() as read_session:
         read_service = ContentPipelineService(
             read_session,
-            storage_client=storage_client,
             publisher=publisher,
         )
         detail = await read_service.get_item_detail(meme_file_id)
@@ -3446,7 +3487,6 @@ async def test_outcome_ready_when_both_targets_synced(
     )
     service = ContentPipelineService(
         migrated_db_session,
-        storage_client=storage_client,
         publisher=publisher,
     )
     await service.complete_classify_stage(
@@ -3471,7 +3511,6 @@ async def test_outcome_ready_when_both_targets_synced(
     async with postgres_session_factory() as read_session:
         read_service = ContentPipelineService(
             read_session,
-            storage_client=storage_client,
             publisher=publisher,
         )
         detail = await read_service.get_item_detail(meme_file_id)
@@ -4007,7 +4046,6 @@ async def test_forced_sync_qdrant_failure_produces_partially_searchable_outcome(
     )
     service = ContentPipelineService(
         migrated_db_session,
-        storage_client=storage_client,
         publisher=publisher,
     )
     await service.complete_classify_stage(
@@ -4034,7 +4072,6 @@ async def test_forced_sync_qdrant_failure_produces_partially_searchable_outcome(
     async with postgres_session_factory() as read_session:
         read_service = ContentPipelineService(
             read_session,
-            storage_client=storage_client,
             publisher=publisher,
         )
         detail = await read_service.get_item_detail(meme_file_id)
@@ -4092,7 +4129,6 @@ async def test_run_summary_reflects_k_of_n_forced_qdrant_failures(
         )
         service = ContentPipelineService(
             migrated_db_session,
-            storage_client=storage_client,
             publisher=publisher,
         )
         _ = await service.complete_embed_stage(
@@ -4137,7 +4173,6 @@ async def test_run_summary_reflects_k_of_n_forced_qdrant_failures(
         async with postgres_session_factory() as read_session:
             read_service = ContentPipelineService(
                 read_session,
-                storage_client=storage_client,
                 publisher=publisher,
             )
             details.append(await read_service.get_item_detail(meme_file_id))
