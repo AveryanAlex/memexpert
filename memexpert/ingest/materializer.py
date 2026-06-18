@@ -30,17 +30,17 @@ from memexpert.core.storage import (
     get_s3_client,
     upload_object_bytes,
 )
-from memexpert.media.contracts import (
-    MediaProcessingError,
-    MediaValidationError,
-    PipelineMediaProcessorProtocol,
-    UploadMediaDetails,
-)
 from memexpert.ingest.source_metadata import (
     source_forward_ids,
     source_is_forwarded,
     source_published_at,
     source_reactions,
+)
+from memexpert.media.contracts import (
+    MediaProcessingError,
+    MediaValidationError,
+    PipelineMediaProcessorProtocol,
+    UploadMediaDetails,
 )
 from memexpert.models.base import utcnow
 from memexpert.models.content import (
