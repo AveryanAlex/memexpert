@@ -974,9 +974,6 @@ class PipelineRuntime:
         return ContentPipelineService(
             session,
             settings=self.settings,
-            storage_client=self.storage_client,
-            media_processor=self.media_processor,
-            ocr_processor=self.ocr_processor,
         )
 
     async def run(self, *, stop_event: asyncio.Event | None = None) -> None:

@@ -7,8 +7,7 @@ import time: the fake client is pure-Python in-memory state, and the real
 adapter will follow the same protocol in T02. The
 :class:`PipelineTelegramMessageMapper` is a pure function that converts a
 typed raw message + its downloaded bytes into a
-:class:`RawCrawlerPost` that ``ContentPipelineService.create_crawler_ingest``
-consumes verbatim.
+:class:`RawCrawlerPost` consumed by the crawler ingest service.
 """
 
 from __future__ import annotations
