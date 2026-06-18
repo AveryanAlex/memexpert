@@ -154,8 +154,11 @@ class Settings(BaseSettings):
     scheduler_motd_interval_seconds: float = Field(default=86400.0, gt=0.0)
     scheduler_search_index_sync_enabled: bool = True
     scheduler_search_index_sync_interval_seconds: float = Field(default=600.0, gt=0.0)
+    scheduler_search_index_sync_batch_size: int = Field(default=50, ge=1, le=1000)
+    scheduler_search_index_sync_processing_timeout_seconds: float = Field(default=900.0, gt=0.0)
     scheduler_seo_backlog_batches_enabled: bool = True
     scheduler_seo_backlog_batches_interval_seconds: float = Field(default=900.0, gt=0.0)
+    scheduler_seo_backlog_batch_size: int = Field(default=25, ge=1, le=500)
     scheduler_advisory_lock_enabled: bool = True
     scheduler_advisory_lock_key: Annotated[tuple[int, int], NoDecode] = (0, 0)
     # --- S04: curated Telethon crawler + freshness SLO -----------------

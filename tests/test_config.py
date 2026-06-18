@@ -154,7 +154,10 @@ def test_settings_parse_scheduler_contracts() -> None:
             "scheduler_popularity_platform_like_weight": 7.5,
             "scheduler_motd_interval_seconds": 300.0,
             "scheduler_search_index_sync_interval_seconds": 180.0,
+            "scheduler_search_index_sync_batch_size": 7,
+            "scheduler_search_index_sync_processing_timeout_seconds": 45.0,
             "scheduler_seo_backlog_batches_interval_seconds": 240.0,
+            "scheduler_seo_backlog_batch_size": 9,
             "scheduler_advisory_lock_enabled": False,
             "scheduler_advisory_lock_key": "123, 456",
         }
@@ -171,7 +174,10 @@ def test_settings_parse_scheduler_contracts() -> None:
     assert settings.scheduler_popularity_platform_like_weight == 7.5
     assert settings.scheduler_motd_interval_seconds == 300.0
     assert settings.scheduler_search_index_sync_interval_seconds == 180.0
+    assert settings.scheduler_search_index_sync_batch_size == 7
+    assert settings.scheduler_search_index_sync_processing_timeout_seconds == 45.0
     assert settings.scheduler_seo_backlog_batches_interval_seconds == 240.0
+    assert settings.scheduler_seo_backlog_batch_size == 9
     assert settings.scheduler_advisory_lock_enabled is False
     assert settings.scheduler_advisory_lock_key == (123, 456)
 
@@ -189,6 +195,14 @@ def test_settings_scheduler_popularity_defaults_match_design() -> None:
     assert settings.scheduler_popularity_platform_like_weight == 5.0
 
 
+def test_settings_scheduler_batch_job_defaults_match_design() -> None:
+    settings = Settings()
+
+    assert settings.scheduler_search_index_sync_batch_size == 50
+    assert settings.scheduler_search_index_sync_processing_timeout_seconds == 900.0
+    assert settings.scheduler_seo_backlog_batch_size == 25
+
+
 @pytest.mark.parametrize(
     "field_name",
     [
@@ -204,6 +218,19 @@ def test_settings_scheduler_popularity_defaults_match_design() -> None:
 def test_settings_reject_negative_scheduler_popularity_weights(field_name: str) -> None:
     with pytest.raises(ValidationError):
         _ = Settings.model_validate({field_name: -0.1})
+
+
+@pytest.mark.parametrize(
+    "field_name,bad_value",
+    [
+        ("scheduler_search_index_sync_batch_size", 0),
+        ("scheduler_search_index_sync_processing_timeout_seconds", 0.0),
+        ("scheduler_seo_backlog_batch_size", 0),
+    ],
+)
+def test_settings_reject_invalid_scheduler_batch_job_settings(field_name: str, bad_value: object) -> None:
+    with pytest.raises(ValidationError):
+        _ = Settings.model_validate({field_name: bad_value})
 
 
 def test_settings_require_imgproxy_key_and_salt_together() -> None:

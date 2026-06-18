@@ -47,6 +47,10 @@ bot = [
 ]
 scheduler = [
     "apscheduler>=3.11.0",
+    "boto3>=1.42.83",
+    "meilisearch-python-sdk>=7.1.2",
+    "pydantic-ai-slim[openai]>=1.107.0",
+    "qdrant-client>=1.17.1",
 ]
 worker = [
     "aio-pika>=9.6.2",

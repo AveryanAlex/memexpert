@@ -30,6 +30,7 @@ from memexpert.scheduler.locking import (
     SchedulerInstanceLockError,
 )
 from memexpert.scheduler.runtime import run_scheduler_runtime
+from memexpert.services.scheduler_batch_jobs import SearchIndexBatchJobResult, SeoBacklogBatchJobResult
 
 
 class FakeResult:
@@ -263,6 +264,98 @@ async def test_popularity_snapshots_job_uses_scheduler_engine_session_and_settin
     assert called == {"engine": engine, "session": session, "settings": settings}
     assert session_context.enter_calls == 1
     assert session_context.exit_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_search_index_sync_job_calls_batch_service_and_logs_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = Settings.model_validate({"scheduler_search_index_sync_enabled": True})
+    engine = cast("AsyncEngine", object())
+    session_factory = object()
+    called: dict[str, object] = {}
+    info_calls: list[tuple[str, dict[str, object] | None]] = []
+
+    def fake_build_session_factory(bound_engine: object) -> object:
+        called["engine"] = bound_engine
+        return session_factory
+
+    async def fake_run_batch(session_factory_arg: object, *, settings: Settings) -> SearchIndexBatchJobResult:
+        called["session_factory"] = session_factory_arg
+        called["settings"] = settings
+        return SearchIndexBatchJobResult(scanned=3, updated=2, failed=1, skipped=0, duration_seconds=0.25)
+
+    def fake_info(message: str, *args: object, extra: dict[str, object] | None = None, **kwargs: object) -> None:
+        del args, kwargs
+        info_calls.append((message, extra))
+
+    monkeypatch.setattr("memexpert.scheduler.jobs.build_async_session_factory", fake_build_session_factory)
+    monkeypatch.setattr("memexpert.scheduler.jobs.run_scheduler_search_index_sync_batch", fake_run_batch)
+    monkeypatch.setattr("memexpert.scheduler.jobs.logger.info", fake_info)
+
+    definition = build_scheduler_job_definitions(settings, engine=engine)[3]
+    await definition.action()
+
+    assert definition.id == JOB_ID_SEARCH_INDEX_SYNC
+    assert called == {"engine": engine, "session_factory": session_factory, "settings": settings}
+    assert info_calls == [
+        (
+            "scheduler_job_batch_result",
+            {
+                "event": "scheduler_job_batch_result",
+                "job_id": JOB_ID_SEARCH_INDEX_SYNC,
+                "scanned": 3,
+                "updated": 2,
+                "failed": 1,
+                "skipped": 0,
+                "duration_seconds": 0.25,
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_seo_backlog_job_calls_batch_service_and_logs_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = Settings.model_validate({"scheduler_seo_backlog_batches_enabled": True})
+    engine = cast("AsyncEngine", object())
+    session_factory = object()
+    called: dict[str, object] = {}
+    info_calls: list[tuple[str, dict[str, object] | None]] = []
+
+    def fake_build_session_factory(bound_engine: object) -> object:
+        called["engine"] = bound_engine
+        return session_factory
+
+    async def fake_run_batch(session_factory_arg: object, *, settings: Settings) -> SeoBacklogBatchJobResult:
+        called["session_factory"] = session_factory_arg
+        called["settings"] = settings
+        return SeoBacklogBatchJobResult(scanned=4, updated=3, failed=0, skipped=1, duration_seconds=0.5)
+
+    def fake_info(message: str, *args: object, extra: dict[str, object] | None = None, **kwargs: object) -> None:
+        del args, kwargs
+        info_calls.append((message, extra))
+
+    monkeypatch.setattr("memexpert.scheduler.jobs.build_async_session_factory", fake_build_session_factory)
+    monkeypatch.setattr("memexpert.scheduler.jobs.run_scheduler_seo_backlog_batch", fake_run_batch)
+    monkeypatch.setattr("memexpert.scheduler.jobs.logger.info", fake_info)
+
+    definition = build_scheduler_job_definitions(settings, engine=engine)[4]
+    await definition.action()
+
+    assert definition.id == JOB_ID_SEO_BACKLOG_BATCHES
+    assert called == {"engine": engine, "session_factory": session_factory, "settings": settings}
+    assert info_calls == [
+        (
+            "scheduler_job_batch_result",
+            {
+                "event": "scheduler_job_batch_result",
+                "job_id": JOB_ID_SEO_BACKLOG_BATCHES,
+                "scanned": 4,
+                "updated": 3,
+                "failed": 0,
+                "skipped": 1,
+                "duration_seconds": 0.5,
+            },
+        )
+    ]
 
 
 @pytest.mark.asyncio

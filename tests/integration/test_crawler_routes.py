@@ -579,7 +579,7 @@ async def test_replay_channel_post_returns_404_for_unknown_channel_id(
 # ---------------------------------------------------------------------------
 
 
-def _seed_meme_and_file(
+async def _seed_meme_and_file(
     session: AsyncSession,
     *,
     source_id: str,
@@ -597,7 +597,9 @@ def _seed_meme_and_file(
         quality_score=0.5,
     )
     session.add(meme)
+    await session.flush()
     session.add(file_row)
+    await session.flush()
     return file_row
 
 
@@ -611,8 +613,7 @@ async def _seed_freshness_item(
     qdrant_finished_at: datetime | None,
     meili_finished_at: datetime | None,
 ) -> MemeFile:
-    file_row = _seed_meme_and_file(session, source_id=f"{source_id}-{post_id}")
-    await session.flush()
+    file_row = await _seed_meme_and_file(session, source_id=f"{source_id}-{post_id}")
     meme_source = MemeSource(
         file_id=file_row.id,
         platform=SourcePlatform.TELEGRAM,
@@ -862,8 +863,7 @@ async def test_freshness_snapshot_surfaces_blocked_stage_and_target_reason(
         title="Blocked Channel",
     )
     published_at = _now() - timedelta(minutes=2)
-    file_row = _seed_meme_and_file(migrated_db_session, source_id="blocked-item")
-    await migrated_db_session.flush()
+    file_row = await _seed_meme_and_file(migrated_db_session, source_id="blocked-item")
     meme_source = MemeSource(
         file_id=file_row.id,
         platform=SourcePlatform.TELEGRAM,

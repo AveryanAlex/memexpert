@@ -11,6 +11,11 @@ from typing import TYPE_CHECKING
 from memexpert.core.database import build_async_session_factory
 from memexpert.services.popularity_snapshots import capture_popularity_snapshots
 from memexpert.services.public_trends import refresh_public_trend_materialized_views
+from memexpert.services.scheduler_batch_jobs import (
+    run_scheduler_search_index_sync_batch,
+    run_scheduler_seo_backlog_batch,
+    scheduler_batch_result_log_extra,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncEngine
@@ -63,14 +68,14 @@ def build_scheduler_job_definitions(settings: Settings, engine: AsyncEngine) -> 
         SchedulerJobDefinition(
             id=JOB_ID_SEARCH_INDEX_SYNC,
             trigger_seconds=settings.scheduler_search_index_sync_interval_seconds,
-            action=_build_placeholder_job_action(JOB_ID_SEARCH_INDEX_SYNC),
+            action=_build_search_index_sync_job_action(settings, engine),
             enabled=settings.scheduler_search_index_sync_enabled,
             description="Sync the search index.",
         ),
         SchedulerJobDefinition(
             id=JOB_ID_SEO_BACKLOG_BATCHES,
             trigger_seconds=settings.scheduler_seo_backlog_batches_interval_seconds,
-            action=_build_placeholder_job_action(JOB_ID_SEO_BACKLOG_BATCHES),
+            action=_build_seo_backlog_batches_job_action(settings, engine),
             enabled=settings.scheduler_seo_backlog_batches_enabled,
             description="Process SEO backlog batches.",
         ),
@@ -125,6 +130,30 @@ def _build_popularity_snapshots_job_action(settings: Settings, engine: AsyncEngi
         session_factory = build_async_session_factory(engine)
         async with session_factory() as session:
             _ = await capture_popularity_snapshots(session, settings=settings)
+
+    return _action
+
+
+def _build_search_index_sync_job_action(settings: Settings, engine: AsyncEngine) -> SchedulerJobAction:
+    async def _action() -> None:
+        session_factory = build_async_session_factory(engine)
+        result = await run_scheduler_search_index_sync_batch(session_factory, settings=settings)
+        logger.info(
+            "scheduler_job_batch_result",
+            extra=scheduler_batch_result_log_extra(JOB_ID_SEARCH_INDEX_SYNC, result),
+        )
+
+    return _action
+
+
+def _build_seo_backlog_batches_job_action(settings: Settings, engine: AsyncEngine) -> SchedulerJobAction:
+    async def _action() -> None:
+        session_factory = build_async_session_factory(engine)
+        result = await run_scheduler_seo_backlog_batch(session_factory, settings=settings)
+        logger.info(
+            "scheduler_job_batch_result",
+            extra=scheduler_batch_result_log_extra(JOB_ID_SEO_BACKLOG_BATCHES, result),
+        )
 
     return _action
 
