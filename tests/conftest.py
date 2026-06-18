@@ -10,9 +10,15 @@ import pytest
 import pytest_asyncio
 from alembic.config import Config
 from httpx import ASGITransport, AsyncClient
+from redis import Redis
+from redis.exceptions import RedisError
 from sqlalchemy import text
+from testcontainers.core.container import DockerContainer  # pyright: ignore[reportMissingTypeStubs]
+from testcontainers.core.waiting_utils import (  # pyright: ignore[reportMissingTypeStubs]
+    WaitStrategy,
+    WaitStrategyTarget,
+)
 from testcontainers.postgres import PostgresContainer  # pyright: ignore[reportMissingTypeStubs]
-from testcontainers.redis import RedisContainer  # pyright: ignore[reportMissingTypeStubs]
 
 from alembic import command
 from memexpert.api.app import create_app
@@ -41,6 +47,9 @@ if TYPE_CHECKING:
 
 TEST_POSTGRES_IMAGE: Final = "postgres:16"
 TEST_POSTGRES_CONNECT_TIMEOUT_SECONDS: Final = 10.0
+TEST_REDIS_IMAGE: Final = "redis:7"
+TEST_REDIS_PORT: Final = 6379
+TEST_REDIS_CONNECT_TIMEOUT_SECONDS: Final = 1.0
 ALEMBIC_COMMAND_TIMEOUT_SECONDS: Final = 20.0
 PROJECT_ROOT: Final = Path(__file__).resolve().parents[1]
 ALEMBIC_INI_PATH: Final = PROJECT_ROOT / "alembic.ini"
@@ -72,6 +81,41 @@ AUTH_TEST_GOOGLE_REDIRECT_URI: Final = "https://testserver/auth/google/callback"
 AUTH_TEST_GOOGLE_TOKEN_URL: Final = "https://google.test/token"
 AUTH_TEST_GOOGLE_USERINFO_URL: Final = "https://google.test/userinfo"
 AUTH_TEST_GOOGLE_TIMEOUT_SECONDS: Final = 5.0
+
+
+class RedisPingWaitStrategy(WaitStrategy):
+    """Wait for Redis with the structured testcontainers wait-strategy API.
+
+    ``testcontainers.redis.RedisContainer`` still relies on the deprecated
+    ``@wait_container_is_ready`` decorator at import time, which emits a warning
+    for every pytest run. The generic container plus this ping strategy keeps the
+    fixture behavior equivalent without importing the deprecated Redis wrapper.
+    """
+
+    def __init__(self, *, port: int = TEST_REDIS_PORT) -> None:
+        super().__init__()
+        self._port = port
+        self.with_transient_exceptions(RedisError, OSError)
+
+    def wait_until_ready(self, container: WaitStrategyTarget) -> None:
+        """Block until the mapped Redis port accepts PING."""
+
+        def can_ping() -> bool:
+            client = Redis(
+                host=container.get_container_host_ip(),
+                port=container.get_exposed_port(self._port),
+                socket_connect_timeout=TEST_REDIS_CONNECT_TIMEOUT_SECONDS,
+                socket_timeout=TEST_REDIS_CONNECT_TIMEOUT_SECONDS,
+            )
+            try:
+                return bool(client.ping())
+            finally:
+                client.close()
+
+        if not self._poll(can_ping):
+            raise TimeoutError(
+                "Redis testcontainer did not become ready before the startup timeout elapsed.",
+            )
 
 
 def _build_alembic_config(database_url: str) -> Config:
@@ -444,11 +488,11 @@ async def unavailable_security_client(unavailable_security_app: FastAPI) -> Asyn
         yield async_client
 
 
-def _build_redis_url(container: RedisContainer) -> str:
+def _build_redis_url(container: DockerContainer) -> str:
     """Construct a redis:// URL from a started Redis testcontainer."""
 
     host = container.get_container_host_ip()
-    port = container.get_exposed_port(6379)
+    port = container.get_exposed_port(TEST_REDIS_PORT)
     return f"redis://{host}:{port}/0"
 
 
@@ -456,5 +500,7 @@ def _build_redis_url(container: RedisContainer) -> str:
 def redis_container_url() -> Iterator[str]:
     """Yield a Redis connection URL for future integration tests."""
 
-    with RedisContainer("redis:7") as redis:
-        yield _build_redis_url(redis)
+    with DockerContainer(TEST_REDIS_IMAGE).with_exposed_ports(TEST_REDIS_PORT).waiting_for(
+        RedisPingWaitStrategy(),
+    ) as redis_container:
+        yield _build_redis_url(redis_container)
