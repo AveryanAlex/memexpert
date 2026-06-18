@@ -148,10 +148,14 @@ pnpm build
 | Public trend materialized-view refresh | `SCHEDULER_MATERIALIZED_VIEW_REFRESH_ENABLED` | `SCHEDULER_MATERIALIZED_VIEW_REFRESH_INTERVAL_SECONDS` | `300` seconds |
 | Popularity snapshots | `SCHEDULER_POPULARITY_SNAPSHOTS_ENABLED` | `SCHEDULER_POPULARITY_SNAPSHOTS_INTERVAL_SECONDS` | `21600` seconds |
 | Meme of the Day placeholder | `SCHEDULER_MOTD_ENABLED` | `SCHEDULER_MOTD_INTERVAL_SECONDS` | `86400` seconds |
-| Search-index sync placeholder | `SCHEDULER_SEARCH_INDEX_SYNC_ENABLED` | `SCHEDULER_SEARCH_INDEX_SYNC_INTERVAL_SECONDS` | `600` seconds |
-| SEO backlog batches placeholder | `SCHEDULER_SEO_BACKLOG_BATCHES_ENABLED` | `SCHEDULER_SEO_BACKLOG_BATCHES_INTERVAL_SECONDS` | `900` seconds |
+| Search-index sync batches | `SCHEDULER_SEARCH_INDEX_SYNC_ENABLED` | `SCHEDULER_SEARCH_INDEX_SYNC_INTERVAL_SECONDS` | `600` seconds |
+| SEO backlog batches | `SCHEDULER_SEO_BACKLOG_BATCHES_ENABLED` | `SCHEDULER_SEO_BACKLOG_BATCHES_INTERVAL_SECONDS` | `900` seconds |
 
-The public trend materialized-view refresh and popularity snapshot capture perform real business work. MOTD, search-index sync, and SEO backlog batches remain deliberate no-op placeholders so the scheduler infrastructure, observability, and deployment wiring can ship before those business behaviors land.
+The public trend materialized-view refresh, popularity snapshot capture, search-index sync batches, and SEO backlog batches perform real business work. MOTD remains a deliberate no-op placeholder so the scheduler registry keeps its five-job contract while the product behavior is deferred.
+
+Search-index sync batches process up to `SCHEDULER_SEARCH_INDEX_SYNC_BATCH_SIZE=50` rows per target per run. The job claims `meme_file_sync_target_snapshots` rows for both Qdrant and Meilisearch, commits the `processing` claim before external writes, retries failed rows, reclaims stale `processing` rows after `SCHEDULER_SEARCH_INDEX_SYNC_PROCESSING_TIMEOUT_SECONDS=900`, and reprocesses synced rows when canonical meme/search metadata is newer than `last_success_at`.
+
+SEO backlog batches process up to `SCHEDULER_SEO_BACKLOG_BATCH_SIZE=25` memes per run. The job prioritizes public, non-NSFW memes missing SEO pages, then stale auto-generated pages whose `prompt_version` differs from `PIPELINE_SEO_PROMPT_VERSION`; manually edited pages are skipped.
 
 Popularity snapshots use `log1p`-scaled cumulative metrics from persisted tables only. Current metrics are source views, summed source reactions, forwarded/reposted source rows, platform views (`meme_view`/`view`), platform sends (`meme_send`/`share`), platform saves (`meme_save`/`save`), and platform likes (`meme_like`/`favorite`). Snapshot columns for impressions/downloads are deferred, so they are not part of the static popularity score in this stage.
 
@@ -164,11 +168,14 @@ The scheduler emits structured stdout logs by default. Operators should watch fo
 - `scheduler_runtime_started` and `scheduler_runtime_stopped` for process lifecycle.
 - `scheduler_stop_requested` when the process receives `SIGINT` or `SIGTERM`.
 - `scheduler_job_started`, `scheduler_job_succeeded`, and `scheduler_job_failed` with `job_id` and `duration_seconds` for each run.
+- `scheduler_job_batch_result` with `job_id`, `scanned`, `updated`, `failed`, `skipped`, and `duration_seconds` for search-index and SEO batch runs.
 - `popularity_snapshot_capture_started` and `popularity_snapshot_capture_succeeded` with `captured_at` and row counts for snapshot runs.
 - `public_trend_mv_concurrent_refresh_fallback` with `view_name` when a concurrent materialized-view refresh cannot run and the scheduler retries without `CONCURRENTLY`.
-- `scheduler_job_placeholder_completed` for the remaining no-op jobs.
+- `scheduler_job_placeholder_completed` for MOTD.
 - `scheduler_instance_lock_unavailable` if another scheduler instance already holds the advisory lock.
 - `scheduler_advisory_lock_disabled` only when `SCHEDULER_ADVISORY_LOCK_ENABLED=false`.
+
+Detailed run/replay/inspection guidance for the two backend batch jobs lives in `docs/ops/scheduler-batch-jobs.md`.
 
 Graceful shutdown is built into `memexpert-scheduler`: on `SIGINT` or `SIGTERM`, APScheduler stops accepting new work, waits for in-flight jobs to finish, releases the PostgreSQL advisory lock, and then exits.
 
