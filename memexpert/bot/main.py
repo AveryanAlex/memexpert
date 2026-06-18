@@ -16,7 +16,7 @@ from memexpert.bot.private_library import (
 from memexpert.bot.private_retention import build_private_retention_router
 from memexpert.bot.private_upload import (
     CollectionServiceFactory,
-    PrivateUploadPipelineServiceFactory,
+    PrivateUploadAcceptServiceFactory,
     TelegramFileDownloader,
     build_private_upload_router,
 )
@@ -44,7 +44,7 @@ def build_dispatcher(
     account_link_service_factory: AccountLinkServiceFactory | None = None,
     meme_search_service_factory: MemeSearchServiceFactory | None = None,
     inline_media_url_provider: InlineMediaUrlProvider | None = None,
-    private_upload_pipeline_service_factory: PrivateUploadPipelineServiceFactory | None = None,
+    private_upload_accept_service_factory: PrivateUploadAcceptServiceFactory | None = None,
     private_upload_collection_service_factory: CollectionServiceFactory | None = None,
     private_library_collection_service_factory: PrivateLibraryCollectionServiceFactory | None = None,
     telegram_file_downloader: TelegramFileDownloader | None = None,
@@ -85,7 +85,7 @@ def build_dispatcher(
         build_private_upload_router(
             settings=resolved_settings,
             session_factory=session_factory,
-            pipeline_service_factory=private_upload_pipeline_service_factory,
+            accept_service_factory=private_upload_accept_service_factory,
             collection_service_factory=private_upload_collection_service_factory,
             telegram_file_downloader=telegram_file_downloader,
         )

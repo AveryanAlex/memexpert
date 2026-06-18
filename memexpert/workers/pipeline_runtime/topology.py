@@ -10,7 +10,7 @@ queue, and every routing-key binding used by the heavy-worker stages.
 
 from __future__ import annotations
 
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from faststream import AckPolicy
 from faststream.rabbit import ExchangeType, RabbitBroker, RabbitExchange, RabbitQueue
@@ -23,7 +23,6 @@ from memexpert.core.classification import (
 )
 from memexpert.core.config import Settings, get_settings
 from memexpert.core.database import AsyncSessionFactory, get_async_session_factory
-from memexpert.core.media import PipelineMediaProcessor, PipelineMediaProcessorProtocol
 from memexpert.core.meilisearch import (
     MeilisearchSyncClientProtocol,
     PipelineMeilisearchSyncClient,
@@ -37,12 +36,16 @@ from memexpert.core.qdrant import (
 )
 from memexpert.core.storage import get_s3_client
 from memexpert.core.voyage import VoyageClientProtocol, build_pipeline_voyage_client
+from memexpert.media.inspect import PipelineMediaProcessor
 from memexpert.models.enums import ContentPipelineStage
 from memexpert.workers.pipeline_runtime.runtime import (
     ObjectStorageClientLike,
     PipelineRuntime,
     RabbitMessageLike,
 )
+
+if TYPE_CHECKING:
+    from memexpert.media.contracts import PipelineMediaProcessorProtocol
 
 
 def _build_pipeline_exchange(broker_settings: PipelineBrokerSettings) -> RabbitExchange:
@@ -153,6 +156,7 @@ def build_pipeline_runtime(
     classify_retry_queue_name = f"{resolved_broker_settings.classify_queue}.retry"
     sync_qdrant_retry_queue_name = f"{resolved_broker_settings.sync_qdrant_queue}.retry"
     sync_meili_retry_queue_name = f"{resolved_broker_settings.sync_meili_queue}.retry"
+    media_inspect_retry_queue_name = f"{resolved_broker_settings.media_inspect_queue}.retry"
     embed_retry_request_routing_key = resolved_broker_settings.retry_queue_routing_key_for_stage(
         ContentPipelineStage.EMBED,
     )
@@ -186,6 +190,12 @@ def build_pipeline_runtime(
         pipeline_exchange=_build_pipeline_exchange(resolved_broker_settings),
         retry_exchange=_build_retry_exchange(resolved_broker_settings),
         dead_letter_exchange=_build_dead_letter_exchange(resolved_broker_settings),
+        media_inspect_queue=_build_stage_queue(
+            queue_name=resolved_broker_settings.media_inspect_queue,
+            routing_key=resolved_broker_settings.media_inspect_routing_key,
+            retry_request_routing_key=resolved_broker_settings.media_inspect_retry_request_routing_key,
+            retry_exchange=resolved_broker_settings.retry_exchange,
+        ),
         transcode_queue=_build_stage_queue(
             queue_name=resolved_broker_settings.transcode_queue,
             routing_key=resolved_broker_settings.meme_created_routing_key,
@@ -221,6 +231,12 @@ def build_pipeline_runtime(
             routing_key=resolved_broker_settings.sync_meili_routing_key,
             retry_request_routing_key=sync_meili_retry_request_routing_key,
             retry_exchange=resolved_broker_settings.retry_exchange,
+        ),
+        media_inspect_retry_queue=_build_retry_queue(
+            queue_name=media_inspect_retry_queue_name,
+            retry_backoff_milliseconds=resolved_broker_settings.retry_backoff_milliseconds,
+            exchange=resolved_broker_settings.exchange,
+            retry_return_routing_key=resolved_broker_settings.media_inspect_retry_routing_key,
         ),
         transcode_retry_queue=_build_retry_queue(
             queue_name=transcode_retry_queue_name,
@@ -268,6 +284,15 @@ def build_pipeline_runtime(
         meilisearch_sync_client=resolved_meilisearch_sync_client,
         classification_client=resolved_classification_client,
     )
+
+    @resolved_broker.subscriber(
+        runtime.media_inspect_queue,
+        runtime.pipeline_exchange,
+        ack_policy=AckPolicy.MANUAL,
+    )
+    async def _consume_media_inspect(payload: object, message: RabbitMessage) -> None:
+        rabbit_message = cast("RabbitMessageLike", cast("object", message))
+        await runtime.handle_media_inspect_message(payload, rabbit_message)
 
     @resolved_broker.subscriber(
         runtime.transcode_queue,

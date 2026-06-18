@@ -34,6 +34,8 @@ from memexpert.models.enums import (
     ModerationAction,
     ModerationReason,
     ModerationReportStatus,
+    PipelineIngestRequestStatus,
+    PipelineOutboxEventStatus,
     SourceAttachReason,
     SourcePlatform,
     SyncTargetKind,
@@ -476,6 +478,118 @@ class PipelineStageJournal(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     finished_at: Mapped[datetime | None] = mapped_column(nullable=True)
 
     meme_file: Mapped["MemeFile"] = relationship("MemeFile", back_populates="pipeline_stage_journal_entries")
+
+
+class PipelineIngestRequest(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """Raw upload/source request accepted before worker media materialization."""
+
+    __tablename__ = "pipeline_ingest_requests"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_platform",
+            "source_id",
+            "post_id",
+            name="uq_pipeline_ingest_requests_source_identity",
+        ),
+        CheckConstraint(
+            "sha256_hex IS NULL OR sha256_hex = lower(sha256_hex)",
+            name="pipeline_ingest_requests_sha256_hex_lowercase",
+        ),
+        CheckConstraint(
+            "sha256_hex IS NULL OR sha256_hex ~ '^[0-9a-f]{64}$'",
+            name="pipeline_ingest_requests_sha256_hex_hex",
+        ),
+        CheckConstraint(
+            "file_size_bytes IS NULL OR file_size_bytes >= 0",
+            name="pipeline_ingest_requests_file_size_non_negative",
+        ),
+        CheckConstraint("attempt_count >= 0", name="pipeline_ingest_requests_attempt_count_non_negative"),
+        Index("ix_pipeline_ingest_requests_sha256_hex", "sha256_hex"),
+        Index("ix_pipeline_ingest_requests_status_created_at", "status", "created_at"),
+        Index("ix_pipeline_ingest_requests_materialized_meme_id", "materialized_meme_id"),
+        Index("ix_pipeline_ingest_requests_materialized_meme_file_id", "materialized_meme_file_id"),
+        Index("ix_pipeline_ingest_requests_matched_meme_file_id", "matched_meme_file_id"),
+    )
+
+    source_platform: Mapped[SourcePlatform] = mapped_column(
+        string_enum(SourcePlatform),
+        nullable=False,
+    )
+    source_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    post_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    owner_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    user_metadata: Mapped[dict[str, object]] = mapped_column(JSONB, default=dict, nullable=False)
+    source_metadata: Mapped[dict[str, object]] = mapped_column(JSONB, default=dict, nullable=False)
+    declared_filename: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    declared_content_type: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    temp_original_object_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sha256_hex: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    file_size_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    status: Mapped[PipelineIngestRequestStatus] = mapped_column(
+        string_enum(PipelineIngestRequestStatus),
+        default=PipelineIngestRequestStatus.ACCEPTED,
+        nullable=False,
+    )
+    failure_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    failure_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    locked_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    materialized_meme_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("memes.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    materialized_meme_file_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("meme_files.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    matched_meme_file_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("meme_files.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    source_attach_reason: Mapped[SourceAttachReason | None] = mapped_column(
+        string_enum(SourceAttachReason),
+        nullable=True,
+    )
+
+    materialized_meme: Mapped["Meme | None"] = relationship("Meme", foreign_keys=[materialized_meme_id])
+    materialized_meme_file: Mapped["MemeFile | None"] = relationship(
+        "MemeFile",
+        foreign_keys=[materialized_meme_file_id],
+    )
+    matched_meme_file: Mapped["MemeFile | None"] = relationship("MemeFile", foreign_keys=[matched_meme_file_id])
+
+
+class PipelineOutboxEvent(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """Transactional publish record written with ingest state changes."""
+
+    __tablename__ = "pipeline_outbox_events"
+    __table_args__ = (
+        CheckConstraint("attempt_count >= 0", name="pipeline_outbox_events_attempt_count_non_negative"),
+        CheckConstraint("aggregate_type <> ''", name="pipeline_outbox_events_aggregate_type_not_blank"),
+        CheckConstraint("event_type <> ''", name="pipeline_outbox_events_event_type_not_blank"),
+        CheckConstraint("routing_key <> ''", name="pipeline_outbox_events_routing_key_not_blank"),
+        Index("ix_pipeline_outbox_events_status_retry_created", "status", "next_retry_at", "created_at"),
+        Index("ix_pipeline_outbox_events_aggregate", "aggregate_type", "aggregate_id"),
+        Index("ix_pipeline_outbox_events_event_type_status", "event_type", "status"),
+    )
+
+    aggregate_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    aggregate_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
+    event_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    routing_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    payload: Mapped[dict[str, object]] = mapped_column(JSONB, default=dict, nullable=False)
+    status: Mapped[PipelineOutboxEventStatus] = mapped_column(
+        string_enum(PipelineOutboxEventStatus),
+        default=PipelineOutboxEventStatus.PENDING,
+        nullable=False,
+    )
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    next_retry_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    published_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    last_error_text: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class MemeFileSyncTargetSnapshot(UUIDPrimaryKeyMixin, TimestampMixin, Base):

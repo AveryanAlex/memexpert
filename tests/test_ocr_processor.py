@@ -19,7 +19,7 @@ from memexpert.models.enums import ContentLanguage
 if TYPE_CHECKING:
     import uuid
 
-    from memexpert.core.media import NormalizedMediaResult, UploadMediaDetails
+    from memexpert.media.contracts import NormalizedMediaResult, UploadMediaDetails
 
 ROOT = Path(__file__).resolve().parents[1]
 LIVE_OCR_FIXTURE = ROOT / "tests" / "fixtures" / "ocr" / "ocr-russian-office-cat-meme.png"

@@ -2,8 +2,7 @@
 
 These tests wire the runtime against a real migrated PostgreSQL session
 (provided by :func:`migrated_db_session`) and the in-process
-``FakeTelegramClient`` + fake storage/publisher doubles borrowed from
-:mod:`tests.integration.test_content_pipeline_service`. No test in this
+``FakeTelegramClient`` + a fake raw-ingest storage double. No test in this
 module imports :mod:`telethon` — the adapter's translation layer is
 exercised only by the pure-Python mapper tests.
 """
@@ -15,7 +14,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from memexpert.core.config import Settings
 from memexpert.crawlers.telegram.client import (
@@ -30,21 +29,18 @@ from memexpert.crawlers.telegram.runtime import (
     CrawlerCatchupReport,
     TelegramCrawlerRuntime,
 )
+from memexpert.ingest.crawler_service import PipelineCrawlerIngestService
 from memexpert.models.content import (
-    MemeSource,
+    MemeFile,
+    PipelineIngestRequest,
+    PipelineOutboxEvent,
     SourceChannel,
     TelegramSessionState,
 )
 from memexpert.models.enums import SourcePlatform, TelegramSessionStatus
 from memexpert.schemas.content_pipeline import CrawlerForwardAttribution, CrawlerIngestOutcome
 from memexpert.services import CrawlerSessionNotRunnableError
-from memexpert.services.content_pipeline import ContentPipelineService
-from tests.integration.test_content_pipeline_service import (
-    FakeMediaProcessor,
-    FakeStorageClient,
-    RecordingPublisher,
-    _make_distinct_upload_media_details,
-)
+from tests.integration.test_content_pipeline_service import FakeStorageClient
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -143,17 +139,16 @@ def _build_runtime(
     *,
     telegram_client: FakeTelegramClient,
     phash_tag: str = "R",
+    storage_client: FakeStorageClient | None = None,
 ) -> TelegramCrawlerRuntime:
-    service = ContentPipelineService(
+    _ = phash_tag
+    service = PipelineCrawlerIngestService.from_settings(
         session,
-        storage_client=FakeStorageClient(),
-        publisher=RecordingPublisher(),
-        media_processor=FakeMediaProcessor(
-            inspect_result=_make_distinct_upload_media_details(tag=phash_tag),
-        ),
+        settings=Settings(),
+        storage_client=storage_client or FakeStorageClient(),
     )
     return TelegramCrawlerRuntime(
-        pipeline_service=service,
+        ingest_service=service,
         telegram_client=telegram_client,
         session=session,
         settings=Settings(),
@@ -213,15 +208,15 @@ async def test_catch_up_channel_ingests_and_counts_mixed_media(
         },
         media_by_message={m.message_id: b"bytes-" + m.message_id.encode() for m in messages[:4]},
     )
-    runtime = _build_runtime(migrated_db_session, telegram_client=fake)
+    storage_client = FakeStorageClient()
+    runtime = _build_runtime(migrated_db_session, telegram_client=fake, storage_client=storage_client)
 
     report = await runtime.catch_up_channel("primary", "curated_channel")
 
     assert isinstance(report, CrawlerCatchupReport)
     assert report.messages_scanned == 5
-    # The FakeMediaProcessor assigns the same pHash to every upload, but
-    # different bytes now create new MemeFile rows under the same meme.
-    # The one unsupported media short-circuits before reaching the service.
+    # New crawler media now lands as raw ingest requests. The unsupported
+    # media short-circuits before download or raw accept.
     assert report.messages_ingested == 4
     assert report.messages_skipped_dedup == 0
     assert report.messages_skipped_unsupported == 1
@@ -235,6 +230,10 @@ async def test_catch_up_channel_ingests_and_counts_mixed_media(
     # Channel metadata refresh should have updated subscriber_count from
     # the fake resolve_channel response.
     assert channel.subscriber_count == 100
+    assert len(storage_client.put_calls) == 4
+    assert await migrated_db_session.scalar(select(func.count()).select_from(PipelineIngestRequest)) == 4
+    assert await migrated_db_session.scalar(select(func.count()).select_from(PipelineOutboxEvent)) == 4
+    assert await migrated_db_session.scalar(select(func.count()).select_from(MemeFile)) == 0
 
 
 async def test_catch_up_channel_respects_catchup_message_limit(
@@ -256,12 +255,12 @@ async def test_catch_up_channel_respects_catchup_message_limit(
 
     report = await runtime.catch_up_channel("primary", "limited_channel")
 
-    # Only 3 messages are scanned because the channel's catchup limit is
-    # 3. The fake downloads identical bytes, so one ingests and two skip
-    # as SHA256-exact existing-file duplicates.
+    # Only 3 messages are scanned because the channel's catchup limit is 3.
+    # They all accept asynchronously because no materialized MemeFile exists
+    # yet for SHA duplicate resolution.
     assert report.messages_scanned == 3
-    assert report.messages_ingested == 1
-    assert report.messages_skipped_dedup == 2
+    assert report.messages_ingested == 3
+    assert report.messages_skipped_dedup == 0
     await migrated_db_session.refresh(channel)
     assert channel.last_read_post_id == "3"
 
@@ -479,9 +478,8 @@ async def test_catch_up_channel_continues_after_per_message_provider_error(
 
     # 3 scanned. Message 10 ingests successfully. Message 20's download
     # pin raises PipelineTelegramProviderUnavailableError so the loop
-    # records an error and continues. Message 30 downloads cleanly with
-    # different bytes; its exact-pHash match creates another MemeFile
-    # under the same meme and is still counted as ingested.
+    # records an error and continues. Message 30 downloads cleanly and is
+    # accepted as a second raw ingest request.
     assert report.messages_scanned == 3
     assert report.messages_ingested == 2
     assert report.messages_skipped_dedup == 0
@@ -491,7 +489,7 @@ async def test_catch_up_channel_continues_after_per_message_provider_error(
     assert session_row.status is TelegramSessionStatus.ACTIVE
 
 
-async def test_catch_up_channel_preserves_forward_attribution_on_ingested_row(
+async def test_catch_up_channel_preserves_forward_attribution_on_raw_request(
     migrated_db_session: AsyncSession,
 ) -> None:
     await _seed_active_session(migrated_db_session, session_name="primary")
@@ -523,13 +521,14 @@ async def test_catch_up_channel_preserves_forward_attribution_on_ingested_row(
     report = await runtime.catch_up_channel("primary", "reposter_channel")
     assert report.messages_ingested == 1
 
-    result = await migrated_db_session.execute(
-        select(MemeSource).where(MemeSource.source_id == "reposter_channel"),
-    )
-    source_row = result.scalar_one()
-    assert source_row.forwarded_from_source_id == "origin_channel"
-    assert source_row.forwarded_from_post_id == "99"
-    assert source_row.is_first_source is False
+    request = (
+        await migrated_db_session.execute(
+            select(PipelineIngestRequest).where(PipelineIngestRequest.source_id == "reposter_channel"),
+        )
+    ).scalar_one()
+    assert request.source_metadata["forward"] == forward.model_dump(mode="json")
+    assert request.source_metadata["reactions"] == {"heart": 3}
+    assert request.source_metadata["published_at"] == message.published_at.isoformat()
 
 
 # ---------------------------------------------------------------------------
@@ -652,7 +651,8 @@ async def test_replay_post_does_not_advance_checkpoint(
     runtime = _build_runtime(migrated_db_session, telegram_client=fake, phash_tag="Y")
 
     result = await runtime.replay_post("replay_channel", "42")
-    assert result.meme_file_id is not None
+    assert result.meme_file_id is None
+    assert result.outcome is CrawlerIngestOutcome.INGESTED
     assert result.published_at is not None
 
     await migrated_db_session.refresh(channel)
@@ -795,7 +795,7 @@ async def test_crawler_operations_service_replay_channel_post_delegates_to_runti
 
     result = await service.replay_channel_post(channel.id, post_id="42")
     assert result.outcome is CrawlerIngestOutcome.INGESTED
-    assert result.meme_file_id is not None
+    assert result.meme_file_id is None
 
     # Replay still does not advance the durable checkpoint.
     await migrated_db_session.refresh(channel)

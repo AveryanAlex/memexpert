@@ -9,26 +9,35 @@ from io import BytesIO
 from typing import TYPE_CHECKING
 
 from PIL import Image
+from sqlalchemy import func, select
 
 from memexpert.api.dependencies.pipeline import (
     PIPELINE_OPERATOR_TOKEN_HEADER_NAME,
     get_content_pipeline_service,
     get_meilisearch_sync_client,
+    get_pipeline_ingest_accept_service,
+    get_pipeline_ingest_read_service,
     get_qdrant_similarity_client,
     get_qdrant_sync_client,
 )
 from memexpert.core.classification import ClassificationResult
 from memexpert.core.config import get_settings
-from memexpert.core.media import NormalizedMediaResult, UploadMediaDetails
 from memexpert.core.ocr import OCRExtractionResult
 from memexpert.core.qdrant import QdrantSimilarityMatch
 from memexpert.core.voyage import VoyageEmbeddingResult
+from memexpert.ingest.accept_service import PipelineIngestAcceptService
+from memexpert.ingest.read_service import PipelineIngestReadService
+from memexpert.ingest.schemas import IngestAcceptOutcome, IngestAcceptResult, IngestAcceptSource, IngestRequestRead
+from memexpert.media.contracts import NormalizedMediaResult, UploadMediaDetails
 from memexpert.models.base import utcnow
+from memexpert.models.content import Meme, MemeFile, PipelineIngestRequest, PipelineOutboxEvent
 from memexpert.models.enums import (
     ContentKind,
     ContentLanguage,
     ContentPipelineStage,
     ContentPipelineStageStatus,
+    PipelineIngestRequestStatus,
+    PipelineOutboxEventStatus,
     SourcePlatform,
 )
 from memexpert.schemas.content_pipeline import (
@@ -130,6 +139,58 @@ class StubPipelineService:
             raise self.replay_error
         assert self.replay_result is not None
         return self.replay_result
+
+
+@dataclass(slots=True)
+class StubIngestAcceptService:
+    """Async service double for the raw upload accept route."""
+
+    result: IngestAcceptResult | None = None
+    error: Exception | None = None
+    calls: list[dict[str, object]] = field(default_factory=list)
+
+    async def accept_bytes(
+        self,
+        *,
+        source: IngestAcceptSource,
+        filename: str | None,
+        content_type: str | None,
+        media_bytes: bytes,
+    ) -> IngestAcceptResult:
+        self.calls.append(
+            {
+                "source": source,
+                "filename": filename,
+                "content_type": content_type,
+                "media_bytes": media_bytes,
+            }
+        )
+        if self.error is not None:
+            raise self.error
+        assert self.result is not None
+        return self.result
+
+
+@dataclass(slots=True)
+class StubIngestReadService:
+    """Async service double for raw ingest-request read routes."""
+
+    request: IngestRequestRead
+    list_calls: list[dict[str, object]] = field(default_factory=list)
+    detail_calls: list[uuid.UUID] = field(default_factory=list)
+
+    async def list_requests(
+        self,
+        *,
+        status: PipelineIngestRequestStatus | None,
+        limit: int,
+    ) -> tuple[IngestRequestRead, ...]:
+        self.list_calls.append({"status": status, "limit": limit})
+        return (self.request,)
+
+    async def get_request(self, ingest_request_id: uuid.UUID) -> IngestRequestRead:
+        self.detail_calls.append(ingest_request_id)
+        return self.request
 
 
 @dataclass(slots=True)
@@ -334,16 +395,55 @@ def build_item() -> ContentPipelineItemRead:
     )
 
 
+def build_ingest_request(
+    *,
+    request_id: uuid.UUID | None = None,
+    status: PipelineIngestRequestStatus = PipelineIngestRequestStatus.MEDIA_INSPECT_PENDING,
+) -> IngestRequestRead:
+    """Construct a stable raw ingest-request payload for route assertions."""
+
+    now = utcnow()
+    resolved_request_id = request_id or uuid.uuid7()
+    return IngestRequestRead(
+        id=resolved_request_id,
+        source_platform=SourcePlatform.TELEGRAM,
+        source_id="channel-one",
+        post_id="101",
+        owner_user_id=None,
+        user_metadata={},
+        source_metadata={"views": 7},
+        declared_filename="sample.png",
+        declared_content_type="image/png",
+        temp_original_object_key=f"pipeline/temp-originals/{resolved_request_id}/original.png",
+        sha256_hex="a" * 64,
+        file_size_bytes=128,
+        status=status,
+        failure_code=None,
+        failure_detail=None,
+        attempt_count=0,
+        locked_at=None,
+        materialized_meme_id=None,
+        materialized_meme_file_id=None,
+        matched_meme_file_id=None,
+        source_attach_reason=None,
+        created_at=now,
+        updated_at=now,
+    )
+
+
 async def test_pipeline_routes_require_operator_token_and_accept_real_multipart_uploads(
     app: FastAPI,
     client: AsyncClient,
 ) -> None:
-    item = build_item()
-    stub_service = StubPipelineService(
-        upload_result=ContentPipelineUploadRead.model_validate(item.model_dump(mode="python"))
+    ingest_request = build_ingest_request()
+    stub_service = StubIngestAcceptService(
+        result=IngestAcceptResult(
+            ingest_request=ingest_request,
+            outcome=IngestAcceptOutcome.ACCEPTED_ASYNC,
+        )
     )
     operator_token = get_settings().pipeline_operator_token.get_secret_value()
-    app.dependency_overrides[get_content_pipeline_service] = lambda: stub_service
+    app.dependency_overrides[get_pipeline_ingest_accept_service] = lambda: stub_service
 
     try:
         rejected_response = await client.post(
@@ -387,16 +487,18 @@ async def test_pipeline_routes_require_operator_token_and_accept_real_multipart_
         assert blank_header_response.status_code == 401
         assert blank_header_response.json()["code"] == "invalid_operator_token"
 
-        assert created_response.status_code == 201
-        assert created_response.json()["meme_file_id"] == str(item.meme_file_id)
-        assert len(stub_service.upload_calls) == 1
-        upload_call = stub_service.upload_calls[0]
-        metadata = upload_call["metadata"]
-        assert isinstance(metadata, ContentPipelineUploadMetadata)
-        assert metadata.source_platform.value == "telegram"
-        assert metadata.source_id == "channel-one"
-        assert metadata.post_id == "101"
-        assert metadata.views == 7
+        assert created_response.status_code == 202
+        assert created_response.json()["id"] == str(ingest_request.id)
+        assert created_response.json()["status"] == "media_inspect_pending"
+        assert "meme_file_id" not in created_response.json()
+        assert len(stub_service.calls) == 1
+        upload_call = stub_service.calls[0]
+        source = upload_call["source"]
+        assert isinstance(source, IngestAcceptSource)
+        assert source.source_platform.value == "telegram"
+        assert source.source_id == "channel-one"
+        assert source.post_id == "101"
+        assert source.views == 7
         assert upload_call["filename"] == "sample.png"
         assert upload_call["content_type"] == "image/png"
         assert upload_call["media_bytes"] == build_png_bytes()
@@ -404,11 +506,46 @@ async def test_pipeline_routes_require_operator_token_and_accept_real_multipart_
         app.dependency_overrides.clear()
 
 
+async def test_pipeline_upload_route_returns_ok_for_source_replay(
+    app: FastAPI,
+    client: AsyncClient,
+) -> None:
+    ingest_request = build_ingest_request(status=PipelineIngestRequestStatus.RESOLVED_SHA_DUPLICATE)
+    stub_service = StubIngestAcceptService(
+        result=IngestAcceptResult(
+            ingest_request=ingest_request,
+            outcome=IngestAcceptOutcome.SOURCE_REPLAY,
+        )
+    )
+    operator_token = get_settings().pipeline_operator_token.get_secret_value()
+    app.dependency_overrides[get_pipeline_ingest_accept_service] = lambda: stub_service
+
+    try:
+        response = await client.post(
+            "/api/v1/pipeline/uploads",
+            headers={PIPELINE_OPERATOR_TOKEN_HEADER_NAME: operator_token},
+            data={
+                "source_platform": "telegram",
+                "source_id": "channel-one",
+                "post_id": "101",
+                "views": "7",
+            },
+            files={"file": ("sample.png", build_png_bytes(), "image/png")},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()["id"] == str(ingest_request.id)
+    assert response.json()["status"] == "resolved_sha_duplicate"
+
+
 async def test_pipeline_routes_expose_list_detail_replay_and_openapi_registration(
     app: FastAPI,
     client: AsyncClient,
 ) -> None:
     item = build_item()
+    ingest_request = build_ingest_request()
     replay_result = ContentPipelineReplayAccepted(
         meme_file_id=item.meme_file_id,
         replay_event_id=uuid.uuid7(),
@@ -416,15 +553,25 @@ async def test_pipeline_routes_expose_list_detail_replay_and_openapi_registratio
         attempt=2,
     )
     stub_service = StubPipelineService(
-        upload_result=ContentPipelineUploadRead.model_validate(item.model_dump(mode="python")),
         item_result=item,
         list_result=(item,),
         replay_result=replay_result,
     )
+    stub_ingest_read_service = StubIngestReadService(request=ingest_request)
     operator_token = get_settings().pipeline_operator_token.get_secret_value()
     app.dependency_overrides[get_content_pipeline_service] = lambda: stub_service
+    app.dependency_overrides[get_pipeline_ingest_read_service] = lambda: stub_ingest_read_service
 
     try:
+        ingest_list_response = await client.get(
+            "/api/v1/pipeline/ingest-requests",
+            headers={PIPELINE_OPERATOR_TOKEN_HEADER_NAME: operator_token},
+            params={"status": "media_inspect_pending", "limit": 25},
+        )
+        ingest_detail_response = await client.get(
+            f"/api/v1/pipeline/ingest-requests/{ingest_request.id}",
+            headers={PIPELINE_OPERATOR_TOKEN_HEADER_NAME: operator_token},
+        )
         list_response = await client.get(
             "/api/v1/pipeline/items",
             headers={PIPELINE_OPERATOR_TOKEN_HEADER_NAME: operator_token},
@@ -442,9 +589,20 @@ async def test_pipeline_routes_expose_list_detail_replay_and_openapi_registratio
         openapi_response = await client.get("/openapi.json")
 
         paths = openapi_response.json()["paths"]
+        ingest_list_parameters = paths["/api/v1/pipeline/ingest-requests"]["get"]["parameters"]
+        ingest_detail_parameters = paths["/api/v1/pipeline/ingest-requests/{ingest_request_id}"]["get"]["parameters"]
         list_parameters = paths["/api/v1/pipeline/items"]["get"]["parameters"]
         detail_parameters = paths["/api/v1/pipeline/items/{meme_file_id}"]["get"]["parameters"]
         replay_parameters = paths["/api/v1/pipeline/items/{meme_file_id}/replay"]["post"]["parameters"]
+
+        assert ingest_list_response.status_code == 200
+        assert ingest_list_response.json()[0]["id"] == str(ingest_request.id)
+        assert ingest_detail_response.status_code == 200
+        assert ingest_detail_response.json()["status"] == "media_inspect_pending"
+        assert stub_ingest_read_service.list_calls == [
+            {"status": PipelineIngestRequestStatus.MEDIA_INSPECT_PENDING, "limit": 25}
+        ]
+        assert stub_ingest_read_service.detail_calls == [ingest_request.id]
 
         assert list_response.status_code == 200
         assert list_response.json()[0]["meme_id"] == str(item.meme_id)
@@ -472,6 +630,16 @@ async def test_pipeline_routes_expose_list_detail_replay_and_openapi_registratio
         assert "/api/v1/pipeline/items" in paths
         assert "/api/v1/pipeline/items/{meme_file_id}" in paths
         assert "/api/v1/pipeline/items/{meme_file_id}/replay" in paths
+        assert "/api/v1/pipeline/ingest-requests" in paths
+        assert "/api/v1/pipeline/ingest-requests/{ingest_request_id}" in paths
+        assert any(
+            parameter["name"] == PIPELINE_OPERATOR_TOKEN_HEADER_NAME and parameter["in"] == "header"
+            for parameter in ingest_list_parameters
+        )
+        assert any(
+            parameter["name"] == PIPELINE_OPERATOR_TOKEN_HEADER_NAME and parameter["in"] == "header"
+            for parameter in ingest_detail_parameters
+        )
         assert any(
             parameter["name"] == PIPELINE_OPERATOR_TOKEN_HEADER_NAME and parameter["in"] == "header"
             for parameter in list_parameters
@@ -492,11 +660,9 @@ async def test_pipeline_upload_route_rejects_missing_file_and_blank_provenance_b
     app: FastAPI,
     client: AsyncClient,
 ) -> None:
-    stub_service = StubPipelineService(
-        upload_result=ContentPipelineUploadRead.model_validate(build_item().model_dump(mode="python"))
-    )
+    stub_service = StubIngestAcceptService()
     operator_token = get_settings().pipeline_operator_token.get_secret_value()
-    app.dependency_overrides[get_content_pipeline_service] = lambda: stub_service
+    app.dependency_overrides[get_pipeline_ingest_accept_service] = lambda: stub_service
 
     try:
         missing_file_response = await client.post(
@@ -525,7 +691,7 @@ async def test_pipeline_upload_route_rejects_missing_file_and_blank_provenance_b
             "code": "pipeline_payload_invalid",
             "detail": "Value error, source provenance fields must not be blank.",
         }
-        assert stub_service.upload_calls == []
+        assert stub_service.calls == []
     finally:
         app.dependency_overrides.clear()
 
@@ -537,11 +703,14 @@ async def test_pipeline_routes_map_service_errors_to_typed_http_payloads(
     operator_token = get_settings().pipeline_operator_token.get_secret_value()
     item_id = uuid.uuid7()
     stub_service = StubPipelineService(
-        upload_error=PipelineUnsupportedMediaTypeError("Uploaded media type is not supported."),
         item_error=PipelineItemNotFoundError(f"Pipeline item {item_id} does not exist."),
         replay_error=PipelineReplayNotAllowedError("No failed retryable stage exists for this pipeline item."),
     )
+    stub_ingest_accept_service = StubIngestAcceptService(
+        error=PipelineUnsupportedMediaTypeError("Uploaded media type is not supported."),
+    )
     app.dependency_overrides[get_content_pipeline_service] = lambda: stub_service
+    app.dependency_overrides[get_pipeline_ingest_accept_service] = lambda: stub_ingest_accept_service
 
     try:
         upload_response = await client.post(
@@ -581,6 +750,74 @@ async def test_pipeline_routes_map_service_errors_to_typed_http_payloads(
         }
     finally:
         app.dependency_overrides.clear()
+
+
+async def test_pipeline_upload_route_creates_raw_ingest_request_separate_from_items(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    operator_token = get_settings().pipeline_operator_token.get_secret_value()
+    storage_client = FakeStorageClient()
+    accept_service = PipelineIngestAcceptService(migrated_db_session, storage_client=storage_client)
+    read_service = PipelineIngestReadService(migrated_db_session)
+    item_service = ContentPipelineService(
+        migrated_db_session,
+        storage_client=FakeStorageClient(),
+        publisher=RecordingPublisher(),
+    )
+    app.dependency_overrides[get_pipeline_ingest_accept_service] = lambda: accept_service
+    app.dependency_overrides[get_pipeline_ingest_read_service] = lambda: read_service
+    app.dependency_overrides[get_content_pipeline_service] = lambda: item_service
+
+    try:
+        upload_response = await client.post(
+            "/api/v1/pipeline/uploads",
+            headers={PIPELINE_OPERATOR_TOKEN_HEADER_NAME: operator_token},
+            data={
+                "source_platform": "telegram",
+                "source_id": "raw-route-channel",
+                "post_id": "1701",
+                "views": "7",
+            },
+            files={"file": ("raw-route.png", build_png_bytes(color=(1, 2, 3)), "image/png")},
+        )
+        ingest_list_response = await client.get(
+            "/api/v1/pipeline/ingest-requests",
+            headers={PIPELINE_OPERATOR_TOKEN_HEADER_NAME: operator_token},
+        )
+        items_response = await client.get(
+            "/api/v1/pipeline/items",
+            headers={PIPELINE_OPERATOR_TOKEN_HEADER_NAME: operator_token},
+            params={"filter": "all"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert upload_response.status_code == 202
+    upload_body = upload_response.json()
+    assert upload_body["status"] == "media_inspect_pending"
+    assert upload_body["source_id"] == "raw-route-channel"
+    assert upload_body["temp_original_object_key"].startswith("pipeline/temp-originals/")
+    assert "meme_file_id" not in upload_body
+    assert len(storage_client.put_calls) == 1
+    assert storage_client.put_calls[0]["Key"] == upload_body["temp_original_object_key"]
+    assert storage_client.delete_calls == []
+    assert ingest_list_response.status_code == 200
+    assert ingest_list_response.json()[0]["id"] == upload_body["id"]
+    assert items_response.status_code == 200
+    assert items_response.json() == []
+
+    meme_count = await migrated_db_session.scalar(select(func.count()).select_from(Meme))
+    meme_file_count = await migrated_db_session.scalar(select(func.count()).select_from(MemeFile))
+    request_count = await migrated_db_session.scalar(select(func.count()).select_from(PipelineIngestRequest))
+    outbox = await migrated_db_session.scalar(select(PipelineOutboxEvent))
+    assert meme_count == 0
+    assert meme_file_count == 0
+    assert request_count == 1
+    assert outbox is not None
+    assert outbox.status is PipelineOutboxEventStatus.PENDING
+    assert outbox.aggregate_id == uuid.UUID(upload_body["id"])
 
 
 async def test_pipeline_routes_list_failed_items_and_reject_replay_guards_with_real_service(

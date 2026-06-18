@@ -75,7 +75,7 @@ def trim_error_text(last_error_text: str) -> str:
 def translate_media_processing_error(exc: Exception) -> PipelinePayloadValidationError:
     """Translate a ``PipelineMediaProcessor`` exception to a service-layer payload error."""
 
-    from memexpert.core.media import MediaProcessingError, MediaTimeoutError, MediaValidationError
+    from memexpert.media.contracts import MediaProcessingError, MediaTimeoutError, MediaValidationError
 
     if isinstance(exc, MediaTimeoutError):
         return PipelinePayloadValidationError(str(exc))

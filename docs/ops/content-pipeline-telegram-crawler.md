@@ -2,7 +2,7 @@
 
 This runbook covers the operator proof loop for milestone **M002 / slice S04**:
 the curated Telegram crawler chain (Telethon catch-up + live listener →
-`ContentPipelineService.create_crawler_ingest` → transcode → ocr → embed →
+raw ingest accept → media-inspect materialization → transcode → ocr → embed →
 classify → sync_qdrant + sync_meili) plus the freshness SLO proof harness
 that measures end-to-end p50/p95 against the numbers configured in
 `memexpert.core.config.Settings`.
@@ -54,8 +54,9 @@ passes iff the final snapshot proves `slo_p50_pass=True` AND
 - Alembic head applied: `uv run alembic upgrade head`.
 - The native API running on `http://127.0.0.1:8000`: `uv run memexpert-api`.
 - The S02/S03 heavy workers running: `uv run memexpert-workers`. These
-  process the `transcode → ocr → embed → classify → sync_qdrant →
-  sync_meili` chain that the crawler ingest entrypoint feeds.
+  process both `media_inspect_requested` events from raw crawler accept and
+  the later `transcode → ocr → embed → classify → sync_qdrant → sync_meili`
+  chain that materialized crawler content feeds.
 - Environment variables (all prefixed with `MEMEXPERT_` in `.env`):
   - `PIPELINE_OPERATOR_TOKEN` — same token the S02/S03 harnesses use.
     The S04 harness reads it from `get_settings()` when
@@ -179,12 +180,12 @@ from memexpert.core.config import get_settings
 from memexpert.core.database import get_db_session_context
 from memexpert.crawlers.telegram.runtime import TelegramCrawlerRuntime
 from memexpert.crawlers.telegram.telethon_adapter import PipelineTelethonClient
-from memexpert.services.content_pipeline import ContentPipelineService
+from memexpert.ingest.crawler_service import PipelineCrawlerIngestService
 
 async def main() -> None:
     settings = get_settings()
     async with get_db_session_context() as session:
-        pipeline_service = ContentPipelineService.from_settings(session)
+        ingest_service = PipelineCrawlerIngestService.from_settings(session, settings=settings)
         telegram_client = PipelineTelethonClient(
             session_name="primary",
             api_id=int(settings.telegram_api_id),
@@ -192,13 +193,13 @@ async def main() -> None:
             session_dir=settings.telegram_session_dir,
         )
         runtime = TelegramCrawlerRuntime(
-            pipeline_service=pipeline_service,
+            ingest_service=ingest_service,
             telegram_client=telegram_client,
             session=session,
             settings=settings,
         )
-        await runtime.catch_up_channel("@example_memes_en")
-        await runtime.start_live_listener(["@example_memes_en"])
+        await runtime.catch_up_channel("primary", "@example_memes_en")
+        await runtime.start_live_listener("primary")
         # Leave the listener running until the operator stops the script.
         await asyncio.Event().wait()
 

@@ -81,9 +81,11 @@ class Settings(BaseSettings):
     pipeline_ffmpeg_binary: str = "ffmpeg"
     pipeline_ffprobe_binary: str = "ffprobe"
     pipeline_s3_original_prefix: str = "pipeline/originals"
+    pipeline_s3_temp_original_prefix: str = "pipeline/temp-originals"
     pipeline_s3_derivative_prefix: str = "pipeline/derived"
     pipeline_broker_exchange: str = "memexpert.pipeline"
     pipeline_broker_routing_key_prefix: str = "pipeline"
+    pipeline_broker_media_inspect_queue: str = "pipeline.media_inspect"
     pipeline_broker_transcode_queue: str = "pipeline.transcode"
     pipeline_broker_ocr_queue: str = "pipeline.ocr"
     pipeline_broker_embed_queue: str = "pipeline.embed"
@@ -306,6 +308,7 @@ class Settings(BaseSettings):
     @field_validator(
         "pipeline_broker_exchange",
         "pipeline_broker_routing_key_prefix",
+        "pipeline_broker_media_inspect_queue",
         "pipeline_broker_transcode_queue",
         "pipeline_broker_ocr_queue",
         "pipeline_broker_embed_queue",
@@ -332,7 +335,12 @@ class Settings(BaseSettings):
             )
         return normalized_value
 
-    @field_validator("pipeline_s3_original_prefix", "pipeline_s3_derivative_prefix", mode="before")
+    @field_validator(
+        "pipeline_s3_original_prefix",
+        "pipeline_s3_temp_original_prefix",
+        "pipeline_s3_derivative_prefix",
+        mode="before",
+    )
     @classmethod
     def _normalize_pipeline_object_prefix(cls, value: object) -> object:
         if not isinstance(value, str):

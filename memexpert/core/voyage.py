@@ -5,13 +5,11 @@ from __future__ import annotations
 import array
 import base64
 import hashlib
-import io
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
 
 import httpx
-from PIL import Image, UnidentifiedImageError
 
 from memexpert.core.config import Settings, get_settings
 
@@ -283,6 +281,13 @@ def _detect_fake_text_marker(text: str) -> _FakeMarker:
 
 
 def _detect_fake_image_marker(image_bytes: bytes) -> _FakeMarker:
+    import io
+
+    try:
+        from PIL import Image, UnidentifiedImageError
+    except ImportError:
+        return _FakeMarker.UNKNOWN
+
     try:
         with Image.open(io.BytesIO(image_bytes)) as image:
             rgb_image = image.convert("RGB").resize((1, 1))

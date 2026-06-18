@@ -40,6 +40,7 @@ class PipelineStorageSettings:
     bucket: str
     region: str
     original_prefix: str
+    temp_original_prefix: str
     derivative_prefix: str
     connection_timeout: float
 
@@ -144,6 +145,10 @@ def get_pipeline_storage_settings(settings: Settings | None = None) -> PipelineS
             resolved_settings.pipeline_s3_original_prefix,
             field_name="pipeline_s3_original_prefix",
         ),
+        temp_original_prefix=normalize_object_key_prefix(
+            resolved_settings.pipeline_s3_temp_original_prefix,
+            field_name="pipeline_s3_temp_original_prefix",
+        ),
         derivative_prefix=normalize_object_key_prefix(
             resolved_settings.pipeline_s3_derivative_prefix,
             field_name="pipeline_s3_derivative_prefix",
@@ -204,6 +209,19 @@ def build_original_object_key(
     storage_settings = get_pipeline_storage_settings(settings)
     normalized_extension = _normalize_extension(original_filename)
     return f"{storage_settings.original_prefix}/{meme_file_id}/original.{normalized_extension}"
+
+
+def build_temp_original_object_key(
+    ingest_request_id: uuid.UUID,
+    original_filename: str,
+    *,
+    settings: Settings | None = None,
+) -> str:
+    """Build the temporary key used for raw originals awaiting worker inspection."""
+
+    storage_settings = get_pipeline_storage_settings(settings)
+    normalized_extension = _normalize_extension(original_filename)
+    return f"{storage_settings.temp_original_prefix}/{ingest_request_id}/original.{normalized_extension}"
 
 
 def build_web_video_object_key(
@@ -337,6 +355,7 @@ __all__ = [
     "StorageConnectionError",
     "build_original_object_key",
     "build_s3_client",
+    "build_temp_original_object_key",
     "build_web_video_object_key",
     "delete_object_if_present",
     "download_object_bytes",

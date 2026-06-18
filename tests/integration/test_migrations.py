@@ -52,6 +52,8 @@ EXPECTED_TABLES = {
     "moderation_decisions",
     "moderation_reports",
     "pinned_memes",
+    "pipeline_ingest_requests",
+    "pipeline_outbox_events",
     "pipeline_stage_journal",
     "source_channels",
     "telegram_file_id_cache",
@@ -333,9 +335,9 @@ def test_initial_revision_metadata_is_present() -> None:
     revision = script_directory.get_revision("head")
 
     assert revision is not None
-    assert revision.revision == "0017"
-    assert revision.down_revision == "0016"
-    assert revision.doc == "ingest dedup metadata"
+    assert revision.revision == "0018"
+    assert revision.down_revision == "0017"
+    assert revision.doc == "pipeline ingest requests and outbox"
 
 
 async def test_upgrade_head_creates_expected_schema_and_constraints(
@@ -348,7 +350,7 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
 
     table_names = await _get_table_names(engine)
     assert table_names == EXPECTED_TABLES | {"alembic_version"}
-    assert await _get_current_revision(engine) == "0017"
+    assert await _get_current_revision(engine) == "0018"
     assert await _get_materialized_view_names(engine) == EXPECTED_MATERIALIZED_VIEWS
 
     users_indexes = await _get_index_definitions(engine, "users")
@@ -358,6 +360,8 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
     meme_file_ocr_result_indexes = await _get_index_definitions(engine, "meme_file_ocr_results")
     meme_merge_log_indexes = await _get_index_definitions(engine, "meme_merge_logs")
     pipeline_stage_journal_indexes = await _get_index_definitions(engine, "pipeline_stage_journal")
+    pipeline_ingest_request_indexes = await _get_index_definitions(engine, "pipeline_ingest_requests")
+    pipeline_outbox_event_indexes = await _get_index_definitions(engine, "pipeline_outbox_events")
     telegram_indexes = await _get_index_definitions(engine, "telegram_file_id_cache")
     telegram_link_indexes = await _get_index_definitions(engine, "telegram_link_codes")
     telegram_link_columns = await _get_column_names(engine, "telegram_link_codes")
@@ -376,6 +380,10 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
     blocked_hash_audit_columns = await _get_column_names(engine, "blocked_perceptual_hash_audit_logs")
     blocked_hash_audit_indexes = await _get_index_definitions(engine, "blocked_perceptual_hash_audit_logs")
     pipeline_stage_journal_columns = await _get_column_names(engine, "pipeline_stage_journal")
+    pipeline_ingest_request_columns = await _get_column_names(engine, "pipeline_ingest_requests")
+    pipeline_outbox_event_columns = await _get_column_names(engine, "pipeline_outbox_events")
+    pipeline_ingest_request_constraints = await _get_constraint_definitions(engine, "pipeline_ingest_requests")
+    pipeline_outbox_event_constraints = await _get_constraint_definitions(engine, "pipeline_outbox_events")
     analytics_event_type_length = await _get_varchar_length(engine, "analytics_events", "event_type")
     analytics_event_checks = await _get_check_constraint_sql(engine, "analytics_events")
     constraints = await _inspect_constraints(engine)
@@ -523,6 +531,75 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
         "status",
         "updated_at",
     }
+    assert pipeline_ingest_request_columns == {
+        "attempt_count",
+        "created_at",
+        "declared_content_type",
+        "declared_filename",
+        "failure_code",
+        "failure_detail",
+        "file_size_bytes",
+        "id",
+        "locked_at",
+        "materialized_meme_file_id",
+        "materialized_meme_id",
+        "matched_meme_file_id",
+        "owner_user_id",
+        "post_id",
+        "sha256_hex",
+        "source_attach_reason",
+        "source_id",
+        "source_metadata",
+        "source_platform",
+        "status",
+        "temp_original_object_key",
+        "updated_at",
+        "user_metadata",
+    }
+    assert "uq_pipeline_ingest_requests_source_identity" in pipeline_ingest_request_constraints
+    source_identity_constraint = pipeline_ingest_request_constraints["uq_pipeline_ingest_requests_source_identity"]
+    assert "source_platform" in source_identity_constraint
+    assert "source_id" in source_identity_constraint
+    assert "post_id" in source_identity_constraint
+    ingest_request_checks = " ".join(pipeline_ingest_request_constraints.values()).lower()
+    assert "sha256_hex" in ingest_request_checks
+    assert "lower" in ingest_request_checks
+    assert "[0-9a-f]{64}" in ingest_request_checks
+    assert "attempt_count >= 0" in ingest_request_checks
+    assert "ix_pipeline_ingest_requests_sha256_hex" in pipeline_ingest_request_indexes
+    assert "ix_pipeline_ingest_requests_status_created_at" in pipeline_ingest_request_indexes
+    assert "status" in pipeline_ingest_request_indexes["ix_pipeline_ingest_requests_status_created_at"]
+    assert "created_at" in pipeline_ingest_request_indexes["ix_pipeline_ingest_requests_status_created_at"]
+    assert "ix_pipeline_ingest_requests_materialized_meme_id" in pipeline_ingest_request_indexes
+    assert "ix_pipeline_ingest_requests_materialized_meme_file_id" in pipeline_ingest_request_indexes
+    assert "ix_pipeline_ingest_requests_matched_meme_file_id" in pipeline_ingest_request_indexes
+    assert pipeline_outbox_event_columns == {
+        "aggregate_id",
+        "aggregate_type",
+        "attempt_count",
+        "created_at",
+        "event_type",
+        "id",
+        "last_error_text",
+        "next_retry_at",
+        "payload",
+        "published_at",
+        "routing_key",
+        "status",
+        "updated_at",
+    }
+    outbox_checks = " ".join(pipeline_outbox_event_constraints.values()).lower()
+    assert "attempt_count >= 0" in outbox_checks
+    assert "aggregate_type" in outbox_checks
+    assert "event_type" in outbox_checks
+    assert "routing_key" in outbox_checks
+    assert "ix_pipeline_outbox_events_status_retry_created" in pipeline_outbox_event_indexes
+    assert "status" in pipeline_outbox_event_indexes["ix_pipeline_outbox_events_status_retry_created"]
+    assert "next_retry_at" in pipeline_outbox_event_indexes["ix_pipeline_outbox_events_status_retry_created"]
+    assert "created_at" in pipeline_outbox_event_indexes["ix_pipeline_outbox_events_status_retry_created"]
+    assert "ix_pipeline_outbox_events_aggregate" in pipeline_outbox_event_indexes
+    assert "aggregate_type" in pipeline_outbox_event_indexes["ix_pipeline_outbox_events_aggregate"]
+    assert "aggregate_id" in pipeline_outbox_event_indexes["ix_pipeline_outbox_events_aggregate"]
     assert "uq_meme_file_ocr_results_meme_file_id" in meme_file_ocr_result_indexes
     assert "UNIQUE INDEX uq_meme_file_ocr_results_meme_file_id" in meme_file_ocr_result_indexes[
         "uq_meme_file_ocr_results_meme_file_id"
@@ -762,7 +839,7 @@ async def test_crawler_sources_migration_applies_and_reverses(
     config = _build_alembic_config(database_url)
 
     await _run_alembic_command(command.upgrade, config, "head")
-    assert await _get_current_revision(engine) == "0017"
+    assert await _get_current_revision(engine) == "0018"
 
     meme_sources_columns = await _get_column_names(engine, "meme_sources")
     source_channels_columns = await _get_column_names(engine, "source_channels")
@@ -860,7 +937,7 @@ async def test_repeated_fresh_database_upgrades_work_after_a_full_downgrade(
     await _run_alembic_command(command.downgrade, config, "base")
     await _run_alembic_command(command.upgrade, config, "head")
 
-    assert await _get_current_revision(engine) == "0017"
+    assert await _get_current_revision(engine) == "0018"
     assert EXPECTED_TABLES.issubset(await _get_table_names(engine))
 
 
