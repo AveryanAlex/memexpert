@@ -103,6 +103,7 @@ export interface PublicMemeCardRead {
   viewer_has_favorited: boolean;
   viewer_has_saved: boolean;
   viewer_has_pinned: boolean;
+  viewer_access?: PublicMemeViewerAccessRead | null;
 }
 
 export interface PublicMemeDetailRead extends PublicMemeCardRead {
@@ -118,8 +119,41 @@ export interface PublicMemeDetailRead extends PublicMemeCardRead {
   files: PublicMemeFileRead[];
 }
 
+export interface MemeResultAttributionFiltersRead {
+  language: ContentLanguage | null;
+  media_type: ContentKind | null;
+  include_nsfw: boolean;
+  tags: string[];
+  scope: string | null;
+  collection_ids: string[];
+}
+
+export interface MemeResultAttributionRead {
+  request_id: string | null;
+  impression_id: string;
+  surface: string | null;
+  source_algorithm: string | null;
+  rank: number | null;
+  query: string | null;
+  filters: MemeResultAttributionFiltersRead;
+  collection_scope: string | null;
+  collection_ids: string[];
+  source_meme_id: string | null;
+  algorithm_version: string | null;
+  score: number | null;
+  score_components: Record<string, number>;
+  reason: string | null;
+}
+
+export type PublicMemeViewerAccess = 'public' | 'private' | 'shared';
+
+export interface PublicMemeViewerAccessRead {
+  visibility: PublicMemeViewerAccess;
+}
+
 export interface PublicMemeSearchResultRead {
   meme: PublicMemeCardRead;
+  attribution: MemeResultAttributionRead;
 }
 
 export interface PublicMemeSearchPageRead {
@@ -128,6 +162,7 @@ export interface PublicMemeSearchPageRead {
   offset: number;
   total: number;
   has_more: boolean;
+  request_id: string;
 }
 
 export interface CollectionSummaryRead {
@@ -217,6 +252,7 @@ export interface PublicTrendMetricsRead {
 export interface PublicMemeTrendRead {
   meme: PublicMemeCardRead;
   trend: PublicTrendMetricsRead;
+  attribution: MemeResultAttributionRead;
 }
 
 export interface PublicMemeTrendPageRead {
@@ -225,6 +261,7 @@ export interface PublicMemeTrendPageRead {
   offset: number;
   total: number;
   has_more: boolean;
+  request_id: string;
 }
 
 export interface PublicMemePopularityPointRead {

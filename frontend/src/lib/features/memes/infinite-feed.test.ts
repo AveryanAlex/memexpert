@@ -32,7 +32,7 @@ describe('infinite meme feed helpers', () => {
   });
 
   it('advances by backend limit for the next offset', () => {
-    const page: PublicMemeSearchPageRead = { items: [result('a')], limit: 12, offset: 24, total: 50, has_more: true };
+    const page: PublicMemeSearchPageRead = { items: [result('a')], limit: 12, offset: 24, total: 50, has_more: true, request_id: 'req_test' };
 
     expect(nextMemePageOffset(page)).toBe(36);
   });
@@ -63,7 +63,25 @@ describe('infinite meme feed helpers', () => {
 });
 
 function result(id: string): PublicMemeSearchResultRead {
-  return { meme: meme(id) };
+  return {
+    meme: meme(id),
+    attribution: {
+      request_id: 'req_test',
+      impression_id: `imp_${id}`,
+      surface: 'test',
+      source_algorithm: 'hybrid_search',
+      rank: null,
+      query: null,
+      filters: { language: null, media_type: null, include_nsfw: false, tags: [], scope: 'public', collection_ids: [] },
+      collection_scope: 'public',
+      collection_ids: [],
+      source_meme_id: null,
+      algorithm_version: 'test',
+      score: null,
+      score_components: {},
+      reason: null
+    }
+  };
 }
 
 function meme(id: string): PublicMemeCardRead {

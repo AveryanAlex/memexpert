@@ -13,14 +13,15 @@ describe('/ page', () => {
   it('renders SSR feed results through the home infinite feed without page links', () => {
     const page: PublicMemeSearchPageRead = {
       items: [
-        { meme: memeCard('11111111-1111-4111-8111-111111111111', 'SSR cat reaction') },
-        { meme: memeCard('22222222-2222-4222-8222-222222222222', 'SSR launch mood') },
-        { meme: videoMemeCard('33333333-3333-4333-8333-333333333333', 'SSR video mood') }
+        { meme: memeCard('11111111-1111-4111-8111-111111111111', 'SSR cat reaction'), attribution: attribution(1) },
+        { meme: memeCard('22222222-2222-4222-8222-222222222222', 'SSR launch mood'), attribution: attribution(2) },
+        { meme: videoMemeCard('33333333-3333-4333-8333-333333333333', 'SSR video mood'), attribution: attribution(3) }
       ],
       limit: 3,
       offset: 0,
       total: 8,
-      has_more: true
+      has_more: true,
+      request_id: 'req_home'
     };
 
     const { body } = render(HomePage, {
@@ -57,6 +58,25 @@ describe('/ page', () => {
     expect(body).not.toContain('Next page');
   });
 });
+
+function attribution(rank: number) {
+  return {
+    request_id: 'req_home',
+    impression_id: `imp_${rank}`,
+    surface: 'test',
+    source_algorithm: 'hybrid_search',
+    rank,
+    query: null,
+    filters: { language: null, media_type: null, include_nsfw: false, tags: [], scope: 'public', collection_ids: [] },
+    collection_scope: 'public',
+    collection_ids: [],
+    source_meme_id: null,
+    algorithm_version: 'test',
+    score: null,
+    score_components: {},
+    reason: null
+  };
+}
 
 function fullSession(): CurrentSessionRead {
   return {
