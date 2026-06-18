@@ -53,6 +53,7 @@ from memexpert.media.contracts import (
     PipelineMediaProcessorProtocol,
     UploadMediaDetails,
 )
+from memexpert.models.base import utcnow
 from memexpert.models.collection import Collection, CollectionMember, CollectionMeme
 from memexpert.models.content import (
     EmbeddingCache,
@@ -65,6 +66,8 @@ from memexpert.models.content import (
     MemeSeoPage,
     MemeSource,
     MemeTemplate,
+    PipelineIngestRequest,
+    PipelineOutboxEvent,
     PipelineStageJournal,
 )
 from memexpert.models.enums import (
@@ -75,11 +78,13 @@ from memexpert.models.enums import (
     ContentPipelineStage,
     ContentPipelineStageStatus,
     ContentProcessingStatus,
+    PipelineIngestRequestStatus,
     SourcePlatform,
     SyncTargetKind,
     SyncTargetStatus,
 )
 from memexpert.models.user import User
+from memexpert.pipeline.events import build_media_inspect_requested_payload
 from memexpert.schemas.content_pipeline import (
     ContentPipelineCanonicalContext,
     ContentPipelineClassificationDetail,
@@ -117,6 +122,7 @@ from memexpert.workers.pipeline_runtime import (
     PIPELINE_REASON_FORCED_SYNC_QDRANT_FAILURE,
     PIPELINE_REASON_FORCED_TRANSCODE_FAILURE,
     PIPELINE_REASON_MALFORMED_EVENT,
+    PIPELINE_REASON_MEDIA_INSPECT_FAILED,
     PIPELINE_REASON_OCR_TIMEOUT,
     PIPELINE_REASON_SYNC_MEILI_CONFLICT,
     PIPELINE_REASON_SYNC_MEILI_MALFORMED_PAYLOAD,
@@ -549,6 +555,36 @@ def build_seeded_png_bytes(*, seed: str) -> bytes:
     return output.getvalue()
 
 
+async def seed_raw_ingest_request_for_runtime(
+    session: AsyncSession,
+    storage_client: FakeStorageClient,
+    *,
+    media_bytes: bytes,
+    source_id: str,
+    post_id: str,
+) -> PipelineIngestRequest:
+    ingest_request_id = uuid.uuid7()
+    temp_key = f"pipeline/temp-originals/{ingest_request_id}/original.png"
+    storage_client.objects[temp_key] = StoredObject(body=media_bytes, content_type="image/png")
+    ingest_request = PipelineIngestRequest(
+        id=ingest_request_id,
+        source_platform=SourcePlatform.TELEGRAM,
+        source_id=source_id,
+        post_id=post_id,
+        source_metadata={"views": 9},
+        declared_filename="runtime-raw.png",
+        declared_content_type="image/png",
+        temp_original_object_key=temp_key,
+        sha256_hex=hashlib.sha256(media_bytes).hexdigest(),
+        file_size_bytes=len(media_bytes),
+        status=PipelineIngestRequestStatus.MEDIA_INSPECT_PENDING,
+        attempt_count=0,
+    )
+    session.add(ingest_request)
+    await session.commit()
+    return ingest_request
+
+
 def build_normalized_media_result(meme_file_id: uuid.UUID) -> NormalizedMediaResult:
     """Create a stable normalized transcode artifact for runtime assertions."""
 
@@ -663,19 +699,34 @@ async def test_pipeline_runtime_declares_explicit_retry_and_dlx_topology() -> No
         runtime.retry_exchange.name,
         runtime.dead_letter_exchange.name,
     ]
+    media_inspect_queue_arguments = declared_queue_arguments[runtime.media_inspect_queue.name] or {}
     transcode_queue_arguments = declared_queue_arguments[runtime.transcode_queue.name] or {}
     ocr_queue_arguments = declared_queue_arguments[runtime.ocr_queue.name] or {}
+    media_inspect_retry_queue_arguments = declared_queue_arguments[runtime.media_inspect_retry_queue.name] or {}
     transcode_retry_queue_arguments = declared_queue_arguments[runtime.transcode_retry_queue.name] or {}
     ocr_retry_queue_arguments = declared_queue_arguments[runtime.ocr_retry_queue.name] or {}
 
+    assert (
+        media_inspect_queue_arguments["x-dead-letter-routing-key"]
+        == runtime.broker_settings.media_inspect_retry_request_routing_key
+    )
     assert transcode_queue_arguments["x-dead-letter-routing-key"] == runtime.broker_settings.retry_routing_key
     assert ocr_queue_arguments["x-dead-letter-routing-key"] == runtime.broker_settings.ocr_retry_request_routing_key
+    assert media_inspect_retry_queue_arguments["x-message-ttl"] == runtime.broker_settings.retry_backoff_milliseconds
+    assert (
+        media_inspect_retry_queue_arguments["x-dead-letter-routing-key"]
+        == runtime.broker_settings.media_inspect_retry_routing_key
+    )
     assert transcode_retry_queue_arguments["x-message-ttl"] == runtime.broker_settings.retry_backoff_milliseconds
     assert (
         transcode_retry_queue_arguments["x-dead-letter-routing-key"]
         == runtime.broker_settings.transcode_retry_routing_key
     )
     assert ocr_retry_queue_arguments["x-dead-letter-routing-key"] == runtime.broker_settings.ocr_retry_routing_key
+    assert recorded_queues[runtime.media_inspect_queue.name].bindings == [
+        (runtime.pipeline_exchange.name, runtime.broker_settings.media_inspect_routing_key),
+        (runtime.pipeline_exchange.name, runtime.broker_settings.media_inspect_retry_routing_key),
+    ]
     assert recorded_queues[runtime.transcode_queue.name].bindings == [
         (runtime.pipeline_exchange.name, runtime.broker_settings.meme_created_routing_key),
         (runtime.pipeline_exchange.name, runtime.broker_settings.stage_replay_routing_key),
@@ -684,6 +735,9 @@ async def test_pipeline_runtime_declares_explicit_retry_and_dlx_topology() -> No
     assert recorded_queues[runtime.ocr_queue.name].bindings == [
         (runtime.pipeline_exchange.name, runtime.broker_settings.ocr_routing_key),
         (runtime.pipeline_exchange.name, runtime.broker_settings.ocr_retry_routing_key),
+    ]
+    assert recorded_queues[runtime.media_inspect_retry_queue.name].bindings == [
+        (runtime.retry_exchange.name, runtime.broker_settings.media_inspect_retry_request_routing_key),
     ]
     assert recorded_queues[runtime.transcode_retry_queue.name].bindings == [
         (runtime.retry_exchange.name, runtime.broker_settings.retry_routing_key),
@@ -694,6 +748,211 @@ async def test_pipeline_runtime_declares_explicit_retry_and_dlx_topology() -> No
     assert recorded_queues[runtime.dead_letter_queue.name].bindings == [
         (runtime.dead_letter_exchange.name, runtime.broker_settings.dead_letter_routing_key),
     ]
+
+
+async def test_pipeline_runtime_media_inspect_handler_materializes_and_acks(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    settings = Settings()
+    storage_client = FakeStorageClient()
+    raw_bytes = b"runtime-media-inspect-success"
+    ingest_request = await seed_raw_ingest_request_for_runtime(
+        migrated_db_session,
+        storage_client,
+        media_bytes=raw_bytes,
+        source_id="runtime-media-inspect-source",
+        post_id="9001",
+    )
+    broker = build_pipeline_broker(settings)
+    runtime = build_pipeline_runtime(
+        settings=settings,
+        broker=broker,
+        session_factory=postgres_session_factory,
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(
+            inspect_result=UploadMediaDetails(
+                media_type=ContentKind.IMAGE,
+                mime_type="image/png",
+                width=8,
+                height=8,
+                file_size_bytes=len(raw_bytes),
+                perceptual_hash="9" * 16,
+            )
+        ),
+        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key="unused")),
+    )
+    event_id = uuid.uuid7()
+    message = FakeRabbitMessage(message_id=str(event_id))
+    payload = build_media_inspect_requested_payload(
+        event_id=event_id,
+        ingest_request_id=ingest_request.id,
+        source_platform=ingest_request.source_platform,
+        sha256_hex=ingest_request.sha256_hex or "0" * 64,
+        created_at=utcnow(),
+    )
+
+    await runtime.handle_media_inspect_message(payload, message)
+
+    assert message.ack_count == 1
+    assert message.reject_calls == []
+    assert message.nack_calls == []
+    assert ingest_request.temp_original_object_key not in storage_client.objects
+
+    async with postgres_session_factory() as session:
+        request = await session.get(PipelineIngestRequest, ingest_request.id)
+        outbox_rows = (await session.execute(select(PipelineOutboxEvent))).scalars().all()
+
+    assert request is not None
+    assert request.status is PipelineIngestRequestStatus.MATERIALIZED
+    assert request.materialized_meme_file_id is not None
+    assert len(outbox_rows) == 1
+    assert outbox_rows[0].event_type == ContentPipelineEventType.MEME_CREATED.value
+    assert outbox_rows[0].routing_key == runtime.broker_settings.transcode_routing_key
+
+
+async def test_pipeline_runtime_media_inspect_handler_dead_letters_malformed_payload() -> None:
+    settings = Settings()
+    broker = build_pipeline_broker(settings)
+    runtime = build_pipeline_runtime(
+        settings=settings,
+        broker=broker,
+        storage_client=FakeStorageClient(),
+        media_processor=FakeMediaProcessor(inspect_result=None),
+        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key="unused")),
+    )
+    dead_letters: list[Any] = []
+
+    async def publish_dead_letter(
+        payload: object,
+        _queue: object = "",
+        exchange: object | None = None,
+        *,
+        routing_key: str = "",
+        headers: dict[str, object] | None = None,
+        **_: object,
+    ) -> None:
+        dead_letters.append(
+            {
+                "payload": payload,
+                "exchange": getattr(exchange, "name", exchange),
+                "routing_key": routing_key,
+                "headers": headers,
+            }
+        )
+
+    cast("Any", broker).publish = publish_dead_letter
+    message = FakeRabbitMessage(message_id="bad-media-inspect")
+
+    await runtime.handle_media_inspect_message({"bad": "payload"}, message)
+
+    assert message.ack_count == 1
+    assert message.reject_calls == []
+    assert message.nack_calls == []
+    assert dead_letters == [
+        {
+            "payload": json.dumps({"bad": "payload"}, sort_keys=True),
+            "exchange": runtime.dead_letter_exchange.name,
+            "routing_key": runtime.broker_settings.dead_letter_routing_key,
+            "headers": {"x-memexpert-failure-reason": PIPELINE_REASON_MALFORMED_EVENT},
+        }
+    ]
+
+
+async def test_pipeline_runtime_media_inspect_retries_and_dead_letters_transient_failures(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    settings = Settings.model_validate({"pipeline_broker_retry_max_attempts": 2})
+    storage_client = FakeStorageClient()
+    ingest_request = await seed_raw_ingest_request_for_runtime(
+        migrated_db_session,
+        storage_client,
+        media_bytes=b"runtime-media-inspect-missing-temp",
+        source_id="runtime-media-inspect-retry-source",
+        post_id="9002",
+    )
+    storage_client.objects.clear()
+    broker = build_pipeline_broker(settings)
+    runtime = build_pipeline_runtime(
+        settings=settings,
+        broker=broker,
+        session_factory=postgres_session_factory,
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(inspect_result=None),
+        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key="unused")),
+    )
+    event_id = uuid.uuid7()
+    payload = build_media_inspect_requested_payload(
+        event_id=event_id,
+        ingest_request_id=ingest_request.id,
+        source_platform=ingest_request.source_platform,
+        sha256_hex=ingest_request.sha256_hex or "0" * 64,
+        created_at=utcnow(),
+    )
+    first_message = FakeRabbitMessage(message_id=str(event_id))
+
+    await runtime.handle_media_inspect_message(payload, first_message)
+
+    assert first_message.ack_count == 0
+    assert first_message.reject_calls == [False]
+    dead_letters: list[Any] = []
+
+    async def publish_dead_letter(
+        payload: object,
+        _queue: object = "",
+        exchange: object | None = None,
+        *,
+        routing_key: str = "",
+        headers: dict[str, object] | None = None,
+        **_: object,
+    ) -> None:
+        dead_letters.append(
+            {
+                "payload": payload,
+                "exchange": getattr(exchange, "name", exchange),
+                "routing_key": routing_key,
+                "headers": headers,
+            }
+        )
+
+    cast("Any", broker).publish = publish_dead_letter
+    exhausted_message = FakeRabbitMessage(
+        headers={
+            "x-death": [
+                {
+                    "queue": runtime.media_inspect_retry_queue.name,
+                    "reason": "expired",
+                    "count": 1,
+                }
+            ]
+        },
+        message_id=str(event_id),
+    )
+
+    await runtime.handle_media_inspect_message(payload, exhausted_message)
+
+    assert exhausted_message.ack_count == 1
+    assert exhausted_message.reject_calls == []
+    assert exhausted_message.nack_calls == []
+    assert len(dead_letters) == 1
+    dead_letter = dead_letters[0]
+    assert dead_letter["exchange"] == runtime.dead_letter_exchange.name
+    assert dead_letter["routing_key"] == runtime.broker_settings.dead_letter_routing_key
+    assert dead_letter["headers"] == {
+        "x-death": [
+            {
+                "queue": runtime.media_inspect_retry_queue.name,
+                "reason": "expired",
+                "count": 1,
+            }
+        ],
+        "x-memexpert-failure-reason": PIPELINE_REASON_MEDIA_INSPECT_FAILED,
+    }
+    decoded_payload = json.loads(dead_letter["payload"])
+    assert decoded_payload["event_id"] == str(event_id)
+    assert decoded_payload["ingest_request_id"] == str(ingest_request.id)
+    assert decoded_payload["event_type"] == "media_inspect_requested"
 
 
 async def test_pipeline_runtime_forced_transcode_failure_then_replay_then_success(

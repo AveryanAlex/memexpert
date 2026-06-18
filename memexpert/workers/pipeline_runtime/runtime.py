@@ -10,6 +10,7 @@ from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any, Protocol
 
 from faststream.rabbit import RabbitBroker, RabbitExchange, RabbitQueue
+from pydantic import ValidationError
 
 from memexpert.core.broker import PipelineBrokerSettings
 from memexpert.core.classification import ClassificationClientProtocol
@@ -32,8 +33,10 @@ from memexpert.core.storage import (
     upload_object_bytes,
 )
 from memexpert.core.voyage import VoyageClientProtocol
+from memexpert.ingest.materializer import PipelineIngestMaterializer
 from memexpert.media.contracts import MediaValidationError
 from memexpert.models.enums import ContentPipelineStage
+from memexpert.pipeline.events import MediaInspectRequestedEvent
 from memexpert.schemas.content_pipeline import ContentPipelineDispatchEvent
 from memexpert.services import (
     ContentPipelineService,
@@ -47,6 +50,7 @@ from memexpert.services.search_index_sync import (
 )
 from memexpert.workers.pipeline_runtime.constants import (
     PIPELINE_REASON_MALFORMED_EVENT,
+    PIPELINE_REASON_MEDIA_INSPECT_FAILED,
     PIPELINE_REASON_UNSUPPORTED_STAGE,
 )
 from memexpert.workers.pipeline_runtime.errors import (
@@ -133,12 +137,14 @@ class PipelineRuntime:
     pipeline_exchange: RabbitExchange
     retry_exchange: RabbitExchange
     dead_letter_exchange: RabbitExchange
+    media_inspect_queue: RabbitQueue
     transcode_queue: RabbitQueue
     ocr_queue: RabbitQueue
     embed_queue: RabbitQueue
     classify_queue: RabbitQueue
     sync_qdrant_queue: RabbitQueue
     sync_meili_queue: RabbitQueue
+    media_inspect_retry_queue: RabbitQueue
     transcode_retry_queue: RabbitQueue
     ocr_retry_queue: RabbitQueue
     embed_retry_queue: RabbitQueue
@@ -161,12 +167,14 @@ class PipelineRuntime:
         exchange = await self.broker.declare_exchange(self.pipeline_exchange)
         retry_exchange = await self.broker.declare_exchange(self.retry_exchange)
         dead_letter_exchange = await self.broker.declare_exchange(self.dead_letter_exchange)
+        media_inspect_queue = await self.broker.declare_queue(self.media_inspect_queue)
         transcode_queue = await self.broker.declare_queue(self.transcode_queue)
         ocr_queue = await self.broker.declare_queue(self.ocr_queue)
         embed_queue = await self.broker.declare_queue(self.embed_queue)
         classify_queue = await self.broker.declare_queue(self.classify_queue)
         sync_qdrant_queue = await self.broker.declare_queue(self.sync_qdrant_queue)
         sync_meili_queue = await self.broker.declare_queue(self.sync_meili_queue)
+        media_inspect_retry_queue = await self.broker.declare_queue(self.media_inspect_retry_queue)
         transcode_retry_queue = await self.broker.declare_queue(self.transcode_retry_queue)
         ocr_retry_queue = await self.broker.declare_queue(self.ocr_retry_queue)
         embed_retry_queue = await self.broker.declare_queue(self.embed_retry_queue)
@@ -200,6 +208,8 @@ class PipelineRuntime:
             ContentPipelineStage.SYNC_MEILI,
         )
 
+        _ = await media_inspect_queue.bind(exchange, routing_key=self.broker_settings.media_inspect_routing_key)
+        _ = await media_inspect_queue.bind(exchange, routing_key=self.broker_settings.media_inspect_retry_routing_key)
         _ = await transcode_queue.bind(exchange, routing_key=self.broker_settings.meme_created_routing_key)
         _ = await transcode_queue.bind(exchange, routing_key=self.broker_settings.stage_replay_routing_key)
         _ = await transcode_queue.bind(exchange, routing_key=self.broker_settings.transcode_retry_routing_key)
@@ -213,6 +223,10 @@ class PipelineRuntime:
         _ = await sync_qdrant_queue.bind(exchange, routing_key=sync_qdrant_retry_return_routing_key)
         _ = await sync_meili_queue.bind(exchange, routing_key=self.broker_settings.sync_meili_routing_key)
         _ = await sync_meili_queue.bind(exchange, routing_key=sync_meili_retry_return_routing_key)
+        _ = await media_inspect_retry_queue.bind(
+            retry_exchange,
+            routing_key=self.broker_settings.media_inspect_retry_request_routing_key,
+        )
         _ = await transcode_retry_queue.bind(retry_exchange, routing_key=self.broker_settings.retry_routing_key)
         _ = await ocr_retry_queue.bind(retry_exchange, routing_key=self.broker_settings.ocr_retry_request_routing_key)
         _ = await embed_retry_queue.bind(retry_exchange, routing_key=embed_retry_request_routing_key)
@@ -223,6 +237,43 @@ class PipelineRuntime:
             dead_letter_exchange,
             routing_key=self.broker_settings.dead_letter_routing_key,
         )
+
+    async def handle_media_inspect_message(self, payload: object, message: RabbitMessageLike) -> None:
+        """Consume one raw-ingest media-inspect request and materialize content state."""
+
+        try:
+            inspect_event = MediaInspectRequestedEvent.model_validate(payload)
+        except ValidationError:
+            await self._dead_letter_or_requeue(
+                coerce_dead_letter_payload(payload),
+                message=message,
+                normalized_reason=PIPELINE_REASON_MALFORMED_EVENT,
+            )
+            return
+
+        effective_attempt = self._media_inspect_effective_attempt(message)
+        try:
+            async with self.session_factory() as session:
+                materializer = PipelineIngestMaterializer(
+                    session,
+                    settings=self.settings,
+                    storage_client=self.storage_client,
+                    media_processor=self.media_processor,
+                )
+                _ = await materializer.materialize(inspect_event.ingest_request_id)
+        except Exception:
+            if effective_attempt < self.broker_settings.retry_max_attempts:
+                await message.reject(requeue=False)
+                return
+
+            await self._dead_letter_or_requeue(
+                coerce_dead_letter_payload(inspect_event.model_dump(mode="json")),
+                message=message,
+                normalized_reason=PIPELINE_REASON_MEDIA_INSPECT_FAILED,
+            )
+            return
+
+        await message.ack()
 
     async def handle_transcode_message(self, payload: object, message: RabbitMessageLike) -> None:
         """Consume one transcode-stage dispatch, persisting durable stage truth as it changes."""
@@ -1045,6 +1096,9 @@ class PipelineRuntime:
             return self.sync_meili_retry_queue.name
         return None
 
+    def _media_inspect_effective_attempt(self, message: RabbitMessageLike) -> int:
+        return max(1 + self._retry_cycle_count_for_queue(self.media_inspect_retry_queue.name, message.headers), 1)
+
     def _retry_cycle_count(self, stage: ContentPipelineStage, headers: dict[str, Any]) -> int:
         raw_x_death = headers.get("x-death")
         if not isinstance(raw_x_death, list):
@@ -1053,6 +1107,14 @@ class PipelineRuntime:
         retry_queue_name = self._retry_queue_name_for_stage(stage)
         if retry_queue_name is None:
             return 0
+        return self._retry_cycle_count_for_queue(retry_queue_name, headers)
+
+    @staticmethod
+    def _retry_cycle_count_for_queue(retry_queue_name: str, headers: dict[str, Any]) -> int:
+        raw_x_death = headers.get("x-death")
+        if not isinstance(raw_x_death, list):
+            return 0
+
         for death_entry in raw_x_death:
             if not isinstance(death_entry, dict):
                 continue

@@ -110,6 +110,7 @@ class PipelineIngestAcceptService:
         sha256_hex = hashlib.sha256(media_bytes).hexdigest()
         user_metadata = self._normalize_metadata(source.user_metadata, field_name="user_metadata")
         source_metadata = self._normalize_metadata(source.source_metadata, field_name="source_metadata")
+        source_metadata["views"] = source.views
 
         matched_file = await self._find_sha256_match(sha256_hex)
         if matched_file is not None:
