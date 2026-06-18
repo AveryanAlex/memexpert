@@ -6,20 +6,23 @@ from __future__ import annotations
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Body, Depends, File, Form, Path, Query, UploadFile, status
+from fastapi import APIRouter, Body, Depends, File, Form, Path, Query, Response, UploadFile, status
 from pydantic import ValidationError
 
 from memexpert.api.dependencies.meme import AnalyticsServiceDep
 from memexpert.api.dependencies.pipeline import (
     PIPELINE_ERROR_RESPONSES,
     MeilisearchSyncClientDep,
+    PipelineIngestAcceptServiceDep,
+    PipelineIngestReadServiceDep,
     PipelineServiceDep,
     QdrantSimilarityClientDep,
     QdrantSyncClientDep,
     require_pipeline_operator_token,
     to_pipeline_http_error,
 )
-from memexpert.models.enums import ContentPipelineStage, SourcePlatform, SyncTargetKind
+from memexpert.ingest.schemas import IngestAcceptOutcome, IngestAcceptSource, IngestRequestRead
+from memexpert.models.enums import ContentPipelineStage, PipelineIngestRequestStatus, SourcePlatform, SyncTargetKind
 from memexpert.schemas.content_pipeline import (
     ContentPipelineItemDetail,
     ContentPipelineItemFilter,
@@ -28,8 +31,6 @@ from memexpert.schemas.content_pipeline import (
     ContentPipelineReplayRequest,
     ContentPipelineSearchSmokeRequest,
     ContentPipelineSyncReplayBatchRequest,
-    ContentPipelineUploadMetadata,
-    ContentPipelineUploadRead,
     PerTargetSyncStatus,
     SmokeProofResult,
 )
@@ -60,23 +61,24 @@ async def read_launch_kpis(
 
 @router.post(
     "/uploads",
-    response_model=ContentPipelineUploadRead,
+    response_model=IngestRequestRead,
     responses=PIPELINE_ERROR_RESPONSES,
-    status_code=status.HTTP_201_CREATED,
-    summary="Upload an original asset into the manual operator ingest path",
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Accept a raw original asset into the async ingest-request path",
 )
 async def create_pipeline_upload(
-    pipeline_service: PipelineServiceDep,
+    response: Response,
+    ingest_accept_service: PipelineIngestAcceptServiceDep,
     source_platform: Annotated[SourcePlatform, Form()],
     source_id: Annotated[str, Form(min_length=1)],
     post_id: Annotated[str, Form(min_length=1)],
     file: Annotated[UploadFile, File()],
     views: Annotated[int, Form(ge=0)] = 0,
-) -> ContentPipelineUploadRead:
-    """Persist one uploaded original before any downstream publish is attempted."""
+) -> IngestRequestRead:
+    """Accept raw bytes without synchronous media inspection or materialization."""
 
     try:
-        metadata = ContentPipelineUploadMetadata(
+        source = IngestAcceptSource(
             source_platform=source_platform,
             source_id=source_id,
             post_id=post_id,
@@ -89,16 +91,57 @@ async def create_pipeline_upload(
 
     try:
         media_bytes = await file.read()
-        return await pipeline_service.create_upload(
-            metadata=metadata,
+        result = await ingest_accept_service.accept_bytes(
+            source=source,
             filename=file.filename,
             content_type=file.content_type,
             media_bytes=media_bytes,
         )
+        if result.outcome is not IngestAcceptOutcome.ACCEPTED_ASYNC:
+            response.status_code = status.HTTP_200_OK
+        return result.ingest_request
     except PipelineServiceError as exc:
         raise to_pipeline_http_error(exc) from exc
     finally:
         await file.close()
+
+
+@router.get(
+    "/ingest-requests",
+    response_model=list[IngestRequestRead],
+    responses=PIPELINE_ERROR_RESPONSES,
+    summary="List raw ingest requests awaiting or after worker materialization",
+)
+async def list_pipeline_ingest_requests(
+    ingest_read_service: PipelineIngestReadServiceDep,
+    request_status: Annotated[PipelineIngestRequestStatus | None, Query(alias="status")] = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+) -> list[IngestRequestRead]:
+    """Return raw pre-content ingest requests, separate from materialized items."""
+
+    try:
+        requests = await ingest_read_service.list_requests(status=request_status, limit=limit)
+    except PipelineServiceError as exc:
+        raise to_pipeline_http_error(exc) from exc
+    return list(requests)
+
+
+@router.get(
+    "/ingest-requests/{ingest_request_id}",
+    response_model=IngestRequestRead,
+    responses=PIPELINE_ERROR_RESPONSES,
+    summary="Read one raw ingest request",
+)
+async def read_pipeline_ingest_request(
+    ingest_request_id: Annotated[uuid.UUID, Path()],
+    ingest_read_service: PipelineIngestReadServiceDep,
+) -> IngestRequestRead:
+    """Return raw ingest-request state without querying materialized item details."""
+
+    try:
+        return await ingest_read_service.get_request(ingest_request_id)
+    except PipelineServiceError as exc:
+        raise to_pipeline_http_error(exc) from exc
 
 
 @router.get(

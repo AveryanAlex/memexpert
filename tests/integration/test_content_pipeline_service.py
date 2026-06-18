@@ -16,7 +16,6 @@ from sqlalchemy.exc import SQLAlchemyError
 import memexpert.services.content_pipeline as content_pipeline_module
 from memexpert.core.classification import ClassificationResult
 from memexpert.core.config import Settings
-from memexpert.media.contracts import NormalizedMediaResult, UploadMediaDetails
 from memexpert.core.meilisearch import (
     MeilisearchSyncMalformedResponseError,
     MeilisearchSyncTimeoutError,
@@ -29,6 +28,7 @@ from memexpert.core.qdrant import (
     QdrantSyncTimeoutError,
 )
 from memexpert.core.voyage import VoyageEmbeddingResult
+from memexpert.media.contracts import NormalizedMediaResult, UploadMediaDetails
 from memexpert.models.content import (
     BlockedPerceptualHash,
     EmbeddingCache,

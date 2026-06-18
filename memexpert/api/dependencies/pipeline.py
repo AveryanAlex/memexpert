@@ -33,6 +33,8 @@ from memexpert.crawlers.telegram.client import (
     PipelineTelegramSessionBannedError,
 )
 from memexpert.crawlers.telegram.runtime import TelegramCrawlerRuntime
+from memexpert.ingest.accept_service import PipelineIngestAcceptService
+from memexpert.ingest.read_service import PipelineIngestReadService
 from memexpert.schemas.content_pipeline import ContentPipelineErrorCode, ContentPipelineErrorResponse
 from memexpert.services import (
     ContentPipelineService,
@@ -180,6 +182,22 @@ def get_content_pipeline_service(
     return ContentPipelineService.from_settings(session)
 
 
+def get_pipeline_ingest_accept_service(
+    session: Annotated[AsyncSession, Depends(get_db_session)],
+) -> PipelineIngestAcceptService:
+    """Build the API-safe raw ingest accept service for one request."""
+
+    return PipelineIngestAcceptService.from_settings(session)
+
+
+def get_pipeline_ingest_read_service(
+    session: Annotated[AsyncSession, Depends(get_db_session)],
+) -> PipelineIngestReadService:
+    """Build the raw ingest-request read service for one request."""
+
+    return PipelineIngestReadService(session=session)
+
+
 def get_qdrant_sync_client() -> QdrantSyncClientProtocol:
     """Return the lazy Qdrant sync adapter used by the smoke-proof route.
 
@@ -248,6 +266,14 @@ def get_crawler_operations_service(
 
 
 PipelineServiceDep = Annotated[ContentPipelineService, Depends(get_content_pipeline_service)]
+PipelineIngestAcceptServiceDep = Annotated[
+    PipelineIngestAcceptService,
+    Depends(get_pipeline_ingest_accept_service),
+]
+PipelineIngestReadServiceDep = Annotated[
+    PipelineIngestReadService,
+    Depends(get_pipeline_ingest_read_service),
+]
 OperatorTokenDep = Annotated[None, Depends(require_pipeline_operator_token)]
 QdrantSyncClientDep = Annotated[QdrantSyncClientProtocol, Depends(get_qdrant_sync_client)]
 QdrantSimilarityClientDep = Annotated[
@@ -370,6 +396,8 @@ __all__ = [
     "PIPELINE_ERROR_STATUS_CODES",
     "PIPELINE_OPERATOR_TOKEN_HEADER_NAME",
     "PipelineHTTPError",
+    "PipelineIngestAcceptServiceDep",
+    "PipelineIngestReadServiceDep",
     "PipelineServiceDep",
     "PipelineTelegramClientDep",
     "QdrantSimilarityClientDep",
@@ -378,6 +406,8 @@ __all__ = [
     "get_crawler_operations_service",
     "get_crawler_runtime",
     "get_meilisearch_sync_client",
+    "get_pipeline_ingest_accept_service",
+    "get_pipeline_ingest_read_service",
     "get_pipeline_telegram_client",
     "get_qdrant_similarity_client",
     "get_qdrant_sync_client",

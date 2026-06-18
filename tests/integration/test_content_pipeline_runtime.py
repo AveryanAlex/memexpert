@@ -23,11 +23,6 @@ from memexpert.core.classification import (
     ClassificationResult,
 )
 from memexpert.core.config import Settings
-from memexpert.media.contracts import (
-    NormalizedMediaResult,
-    PipelineMediaProcessorProtocol,
-    UploadMediaDetails,
-)
 from memexpert.core.meilisearch import (
     MeilisearchSyncConflictError,
     MeilisearchSyncMalformedResponseError,
@@ -52,6 +47,11 @@ from memexpert.core.voyage import (
     VoyageMalformedResponseError,
     VoyageProviderUnavailableError,
     VoyageTimeoutError,
+)
+from memexpert.media.contracts import (
+    NormalizedMediaResult,
+    PipelineMediaProcessorProtocol,
+    UploadMediaDetails,
 )
 from memexpert.models.collection import Collection, CollectionMember, CollectionMeme
 from memexpert.models.content import (

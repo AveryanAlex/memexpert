@@ -4,6 +4,12 @@ This runbook covers the operator proof loop for milestone **M002 / slice S02**:
 the real heavy-worker chain (`transcode → ocr → embed → classify → meme_ready`)
 running against the live local stack plus `/home/alex/Documents/MemeDataset`.
 
+Stage 2 of the ingest-request refactor moves manual uploads to raw
+`pipeline_ingest_requests` plus `pipeline_outbox_events`. New uploads no longer
+create `MemeFile` rows synchronously, so the heavy-worker proof below applies
+only to already-materialized fixtures until the next stage implements the
+media-inspect/materialization worker that consumes `media_inspect_requested`.
+
 The S01 runbook (`docs/ops/content-pipeline-smoke.md`) still applies for the
 upload → replay → duplicate proof. S02 layers the heavy chain on top and adds
 a machine-readable run summary that operators read *first* before trusting
@@ -42,7 +48,8 @@ What the harness does:
 
 1. Walks the dataset root deterministically and picks the first
    `--candidate-limit` supported files (default 8).
-2. Uploads each file through the real operator route.
+2. Uses materialized pipeline items or, after the next stage, uploads each file
+   through the real operator route and waits for materialization.
 3. Polls the enriched `GET /api/v1/pipeline/items/{id}/detail` surface until
    every uploaded item reaches a terminal state (`meme_ready` emitted,
    duplicate, or failed) or the `--stage-timeout` elapses.
