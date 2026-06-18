@@ -78,6 +78,7 @@ from memexpert.models.enums import (
     ContentPipelineStage,
     ContentPipelineStageStatus,
     ContentProcessingStatus,
+    ContentSourceKind,
     PipelineIngestRequestStatus,
     SourcePlatform,
     SyncTargetKind,
@@ -101,7 +102,7 @@ from memexpert.schemas.content_pipeline import (
     ContentPipelineUploadMetadata,
     PerTargetSyncStatus,
 )
-from memexpert.services import ContentPipelineService, PipelinePublishError
+from memexpert.services import ContentPipelineService, PipelineIngestError, PipelinePublishError
 from memexpert.services.content_pipeline_reporting import (
     OUTCOME_BLOCKED,
     OUTCOME_READY,
@@ -134,6 +135,7 @@ from memexpert.workers.pipeline_runtime import (
     PIPELINE_REASON_SYNC_QDRANT_TIMEOUT,
     build_pipeline_runtime,
 )
+from memexpert.workers.pipeline_runtime.stage_registry import PIPELINE_STAGE_HANDLERS, RUNNABLE_DOWNSTREAM_STAGES
 
 if TYPE_CHECKING:
     from pytest import MonkeyPatch
@@ -748,6 +750,66 @@ async def test_pipeline_runtime_declares_explicit_retry_and_dlx_topology() -> No
     assert recorded_queues[runtime.dead_letter_queue.name].bindings == [
         (runtime.dead_letter_exchange.name, runtime.broker_settings.dead_letter_routing_key),
     ]
+
+
+def test_pipeline_runtime_stage_registry_covers_all_downstream_stages() -> None:
+    expected_stages = frozenset(ContentPipelineStage) - {ContentPipelineStage.INGEST}
+
+    assert frozenset(RUNNABLE_DOWNSTREAM_STAGES) == expected_stages
+    assert frozenset(PIPELINE_STAGE_HANDLERS) == expected_stages
+    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.TRANSCODE].implementation_method_name == "_run_transcode_stage"
+    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.TRANSCODE].failure_hook_method_name == (
+        "_maybe_force_transcode_failure"
+    )
+    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.OCR].implementation_method_name == "_run_ocr_stage"
+    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.OCR].failure_hook_method_name is None
+    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.EMBED].implementation_method_name == "_run_embed_stage"
+    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.EMBED].failure_hook_method_name == "_maybe_force_embed_failure"
+    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.CLASSIFY].implementation_method_name == "_run_classify_stage"
+    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.CLASSIFY].failure_hook_method_name == (
+        "_maybe_force_classify_failure"
+    )
+    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.SYNC_QDRANT].implementation_method_name == (
+        "_run_sync_qdrant_stage"
+    )
+    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.SYNC_QDRANT].failure_hook_method_name == (
+        "_maybe_force_sync_qdrant_failure"
+    )
+    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.SYNC_MEILI].implementation_method_name == (
+        "_run_sync_meili_stage"
+    )
+    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.SYNC_MEILI].failure_hook_method_name == (
+        "_maybe_force_sync_meili_failure"
+    )
+
+
+async def test_pipeline_runtime_stage_dispatch_rejects_unsupported_stage() -> None:
+    settings = Settings()
+    runtime = build_pipeline_runtime(
+        settings=settings,
+        broker=build_pipeline_broker(settings),
+        storage_client=FakeStorageClient(),
+        media_processor=FakeMediaProcessor(),
+        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key="unused")),
+    )
+    dispatch_event = ContentPipelineDispatchEvent.model_construct(
+        event_id=uuid.uuid7(),
+        event_type=ContentPipelineEventType.STAGE_REPLAY_REQUESTED,
+        meme_id=uuid.uuid7(),
+        meme_file_id=uuid.uuid7(),
+        stage=ContentPipelineStage.INGEST,
+        source_kind=ContentSourceKind.TELEGRAM,
+        original_object_key="pipeline/original/unsupported.png",
+        attempt=1,
+        created_at=datetime.now(UTC),
+    )
+
+    with pytest.raises(PipelineIngestError, match="Pipeline runtime cannot execute work for stage 'ingest'."):
+        await runtime._run_stage_for(
+            dispatch_event=dispatch_event,
+            stage_context=cast("Any", object()),
+            attempt=1,
+        )
 
 
 async def test_pipeline_runtime_media_inspect_handler_materializes_and_acks(

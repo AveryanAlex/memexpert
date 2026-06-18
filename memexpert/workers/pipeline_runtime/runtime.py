@@ -66,6 +66,7 @@ from memexpert.workers.pipeline_runtime.errors import (
     render_error_text,
     validate_event_payload,
 )
+from memexpert.workers.pipeline_runtime.stage_registry import get_stage_handler
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -411,53 +412,16 @@ class PipelineRuntime:
         stage_context: PipelineStageWorkContext,
         attempt: int,
     ) -> None:
-        if dispatch_event.stage is ContentPipelineStage.TRANSCODE:
-            self._maybe_force_transcode_failure(dispatch_event)
-            await self._run_transcode_stage(
+        stage_handler = get_stage_handler(dispatch_event.stage)
+        if stage_handler is not None:
+            await stage_handler.run(
+                self,
                 dispatch_event=dispatch_event,
                 stage_context=stage_context,
                 attempt=attempt,
             )
             return
-        if dispatch_event.stage is ContentPipelineStage.OCR:
-            await self._run_ocr_stage(
-                dispatch_event=dispatch_event,
-                stage_context=stage_context,
-                attempt=attempt,
-            )
-            return
-        if dispatch_event.stage is ContentPipelineStage.EMBED:
-            self._maybe_force_embed_failure(dispatch_event)
-            await self._run_embed_stage(
-                dispatch_event=dispatch_event,
-                stage_context=stage_context,
-                attempt=attempt,
-            )
-            return
-        if dispatch_event.stage is ContentPipelineStage.CLASSIFY:
-            self._maybe_force_classify_failure(dispatch_event)
-            await self._run_classify_stage(
-                dispatch_event=dispatch_event,
-                stage_context=stage_context,
-                attempt=attempt,
-            )
-            return
-        if dispatch_event.stage is ContentPipelineStage.SYNC_QDRANT:
-            self._maybe_force_sync_qdrant_failure(dispatch_event)
-            await self._run_sync_qdrant_stage(
-                dispatch_event=dispatch_event,
-                stage_context=stage_context,
-                attempt=attempt,
-            )
-            return
-        if dispatch_event.stage is ContentPipelineStage.SYNC_MEILI:
-            self._maybe_force_sync_meili_failure(dispatch_event)
-            await self._run_sync_meili_stage(
-                dispatch_event=dispatch_event,
-                stage_context=stage_context,
-                attempt=attempt,
-            )
-            return
+
         raise PipelineIngestError(
             f"Pipeline runtime cannot execute work for stage {dispatch_event.stage.value!r}.",
         )
