@@ -4,7 +4,7 @@ This runbook covers the backend scheduler jobs that perform deferred, bounded wo
 
 - `search-index-sync` updates Qdrant and Meilisearch from canonical PostgreSQL state.
 - `seo-backlog-batches` generates or refreshes public-safe meme SEO pages.
-- `pipeline-outbox-publisher` publishes durable ingest/materialization events to RabbitMQ.
+- `rabbitmq-outbox-publisher` publishes durable RabbitMQ outbox messages.
 
 ## Run The Scheduler
 
@@ -41,14 +41,14 @@ SEO backlog job:
 | `PIPELINE_SEO_PROMPT_VERSION` | `meme-seo-v1` | Stale auto-generated pages are regenerated when their stored prompt version differs. |
 | `PIPELINE_SEO_API_BASE_URL`, `PIPELINE_SEO_API_KEY`, `PIPELINE_SEO_MODEL`, `PIPELINE_SEO_TIMEOUT_SECONDS`, `PIPELINE_SEO_MAX_ATTEMPTS` | see config | Live SEO provider settings. |
 
-Pipeline outbox publisher job:
+RabbitMQ outbox publisher job:
 
 | variable | default | meaning |
 |---|---:|---|
-| `SCHEDULER_PIPELINE_OUTBOX_PUBLISHER_ENABLED` | `true` | Enables the scheduled transactional outbox publisher. |
-| `SCHEDULER_PIPELINE_OUTBOX_PUBLISHER_INTERVAL_SECONDS` | `5` | APScheduler interval. |
-| `SCHEDULER_PIPELINE_OUTBOX_PUBLISHER_BATCH_SIZE` | `100` | Maximum due outbox rows claimed per run. |
-| `SCHEDULER_PIPELINE_OUTBOX_PUBLISHER_STALE_TIMEOUT_SECONDS` | `300` | Lease timeout before an old `publishing` outbox row is recovered. |
+| `SCHEDULER_RABBITMQ_OUTBOX_PUBLISHER_ENABLED` | `true` | Enables the scheduled transactional RabbitMQ outbox publisher. |
+| `SCHEDULER_RABBITMQ_OUTBOX_PUBLISHER_INTERVAL_SECONDS` | `5` | APScheduler interval. |
+| `SCHEDULER_RABBITMQ_OUTBOX_PUBLISHER_BATCH_SIZE` | `100` | Maximum due outbox rows claimed per run. |
+| `SCHEDULER_RABBITMQ_OUTBOX_PUBLISHER_STALE_TIMEOUT_SECONDS` | `300` | Lease timeout before an old `publishing` outbox row is recovered. |
 
 ## Result Logs
 
@@ -64,17 +64,17 @@ Search-index and SEO jobs emit:
 | `skipped` | Claimed items that could not be finalized because another run changed the row, or SEO generation returned a non-write skip result. |
 | `duration_seconds` | Wall-clock seconds spent inside the job action. |
 
-The outbox publisher emits the same `event=scheduler_job_batch_result` with `job_id=pipeline-outbox-publisher`, `recovered`, `claimed`, `published`, `failed`, and `duration_seconds` fields.
+The outbox publisher emits the same `event=scheduler_job_batch_result` with `job_id=rabbitmq-outbox-publisher`, `recovered`, `claimed`, `published`, `failed`, and `duration_seconds` fields.
 
 The generic wrapper still emits `scheduler_job_started`, `scheduler_job_succeeded`, and `scheduler_job_failed`. A non-zero `failed` count inside `scheduler_job_batch_result` does not make the scheduler action fail; failures are durable backlog state and are retried by later runs where appropriate.
 
-## Pipeline Outbox Work Selection
+## RabbitMQ Outbox Work Selection
 
-The durable work table is `pipeline_outbox_events`. API raw-upload acceptance writes `media_inspect_requested` rows in the same transaction as `pipeline_ingest_requests`; worker materialization writes post-materialization transcode dispatch rows in the same transaction as `meme_files` and stage-journal state.
+The durable work table is `rabbitmq_outbox_messages`. API raw-upload acceptance writes `media_inspect_requested` rows in the same transaction as `pipeline_ingest_requests`; worker materialization and stage services write dispatch/replay/sync-success messages in the same transaction as `meme_files` and stage-journal state.
 
-Each publisher run opens a scheduler DB session, starts or reuses the RabbitMQ pipeline broker, recovers stale rows where `status='publishing'` and `updated_at` is older than `SCHEDULER_PIPELINE_OUTBOX_PUBLISHER_STALE_TIMEOUT_SECONDS`, then claims due rows where `status in ('pending', 'failed')` and `next_retry_at IS NULL OR next_retry_at <= now()`. Claims are locked with `FOR UPDATE SKIP LOCKED`, set to `publishing`, and committed before the broker publish.
+Each publisher run opens a scheduler DB session, starts or reuses the RabbitMQ pipeline broker, recovers stale rows where `status='publishing'` and `locked_at` is older than `SCHEDULER_RABBITMQ_OUTBOX_PUBLISHER_STALE_TIMEOUT_SECONDS`, then claims due rows where `status in ('pending', 'failed')` and `next_retry_at IS NULL OR next_retry_at <= now()`. Claims are locked with `FOR UPDATE SKIP LOCKED`, set to `publishing` with `locked_at`/`lock_owner`, and committed before the broker publish.
 
-The publisher sends the stored JSON payload to `PIPELINE_BROKER_EXCHANGE` using the row's stored `routing_key`; it does not branch on event type. Successful publishes set `status='published'`, `published_at`, and clear retry metadata. Broker failures set `status='failed'`, incremented attempt metadata is preserved, `last_error_text` is recorded, and `next_retry_at` is scheduled from `PIPELINE_BROKER_RETRY_BACKOFF_SECONDS`.
+The publisher sends the stored JSON payload to the row's stored `exchange` and `routing_key` with stored headers, content type, and stable `message_id`; it does not branch on event type. Successful publishes set `status='published'`, `published_at`, and clear retry/lease metadata. Broker failures set `status='failed'`, incremented attempt metadata is preserved, `last_error_text` is recorded, and `next_retry_at` is scheduled from `PIPELINE_BROKER_RETRY_BACKOFF_SECONDS`.
 
 ## Search-Index Work Selection
 
@@ -145,12 +145,12 @@ Outbox backlog and failures:
 
 ```sql
 SELECT status, count(*)
-FROM pipeline_outbox_events
+FROM rabbitmq_outbox_messages
 GROUP BY status
 ORDER BY status;
 
-SELECT id, event_type, routing_key, status, attempt_count, next_retry_at, left(last_error_text, 500) AS last_error_sample
-FROM pipeline_outbox_events
+SELECT id, event_type, exchange, routing_key, status, attempt_count, next_retry_at, left(last_error_text, 500) AS last_error_sample
+FROM rabbitmq_outbox_messages
 WHERE status IN ('pending', 'failed', 'publishing')
 ORDER BY created_at
 LIMIT 100;
@@ -189,8 +189,8 @@ Automatic replay:
 - Leave failed search-index snapshots in `failed`; the scheduler will retry them in later bounded runs.
 - Leave stale `synced` snapshots alone; the scheduler detects canonical drift and reprocesses them.
 - Leave crashed `processing` rows alone unless an operator has confirmed the lease timeout is too high; the scheduler reclaims them after `SCHEDULER_SEARCH_INDEX_SYNC_PROCESSING_TIMEOUT_SECONDS`.
-- Leave failed outbox rows in `failed`; the `pipeline-outbox-publisher` job retries them when `next_retry_at` is due.
-- Leave stale outbox `publishing` rows alone unless an operator has confirmed the lease timeout is too high; the scheduler recovers them after `SCHEDULER_PIPELINE_OUTBOX_PUBLISHER_STALE_TIMEOUT_SECONDS`.
+- Leave failed outbox rows in `failed`; the `rabbitmq-outbox-publisher` job retries them when `next_retry_at` is due.
+- Leave stale outbox `publishing` rows alone unless an operator has confirmed the lease timeout is too high; the scheduler recovers them after `SCHEDULER_RABBITMQ_OUTBOX_PUBLISHER_STALE_TIMEOUT_SECONDS`.
 
 Manual per-file/per-target replay remains the existing operator API path documented in `docs/ops/content-pipeline-search-sync.md`:
 

@@ -53,8 +53,8 @@ EXPECTED_TABLES = {
     "moderation_reports",
     "pinned_memes",
     "pipeline_ingest_requests",
-    "pipeline_outbox_events",
     "pipeline_stage_journal",
+    "rabbitmq_outbox_messages",
     "source_channels",
     "telegram_file_id_cache",
     "telegram_link_codes",
@@ -337,16 +337,16 @@ def test_initial_revision_metadata_is_present() -> None:
     config = _build_alembic_config()
     script_directory = ScriptDirectory.from_config(config)
     revision = script_directory.get_revision("head")
-    previous_revision = script_directory.get_revision("0019")
+    previous_revision = script_directory.get_revision("0020")
 
     assert revision is not None
-    assert revision.revision == "0020"
-    assert revision.down_revision == "0019"
-    assert revision.doc == "public trend aggregate history points"
+    assert revision.revision == "0021"
+    assert revision.down_revision == "0020"
+    assert revision.doc == "generic RabbitMQ outbox messages"
     assert previous_revision is not None
-    assert previous_revision.revision == "0019"
-    assert previous_revision.down_revision == "0018"
-    assert previous_revision.doc == "allow owner-scoped private upload sha duplicates"
+    assert previous_revision.revision == "0020"
+    assert previous_revision.down_revision == "0019"
+    assert previous_revision.doc == "public trend aggregate history points"
 
 
 async def test_upgrade_head_creates_expected_schema_and_constraints(
@@ -359,7 +359,7 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
 
     table_names = await _get_table_names(engine)
     assert table_names == EXPECTED_TABLES | {"alembic_version"}
-    assert await _get_current_revision(engine) == "0020"
+    assert await _get_current_revision(engine) == "0021"
     assert await _get_materialized_view_names(engine) == EXPECTED_MATERIALIZED_VIEWS
 
     users_indexes = await _get_index_definitions(engine, "users")
@@ -370,7 +370,7 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
     meme_merge_log_indexes = await _get_index_definitions(engine, "meme_merge_logs")
     pipeline_stage_journal_indexes = await _get_index_definitions(engine, "pipeline_stage_journal")
     pipeline_ingest_request_indexes = await _get_index_definitions(engine, "pipeline_ingest_requests")
-    pipeline_outbox_event_indexes = await _get_index_definitions(engine, "pipeline_outbox_events")
+    rabbitmq_outbox_message_indexes = await _get_index_definitions(engine, "rabbitmq_outbox_messages")
     telegram_indexes = await _get_index_definitions(engine, "telegram_file_id_cache")
     telegram_link_indexes = await _get_index_definitions(engine, "telegram_link_codes")
     telegram_link_columns = await _get_column_names(engine, "telegram_link_codes")
@@ -392,9 +392,9 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
     blocked_hash_audit_indexes = await _get_index_definitions(engine, "blocked_perceptual_hash_audit_logs")
     pipeline_stage_journal_columns = await _get_column_names(engine, "pipeline_stage_journal")
     pipeline_ingest_request_columns = await _get_column_names(engine, "pipeline_ingest_requests")
-    pipeline_outbox_event_columns = await _get_column_names(engine, "pipeline_outbox_events")
+    rabbitmq_outbox_message_columns = await _get_column_names(engine, "rabbitmq_outbox_messages")
     pipeline_ingest_request_constraints = await _get_constraint_definitions(engine, "pipeline_ingest_requests")
-    pipeline_outbox_event_constraints = await _get_constraint_definitions(engine, "pipeline_outbox_events")
+    rabbitmq_outbox_message_constraints = await _get_constraint_definitions(engine, "rabbitmq_outbox_messages")
     analytics_event_type_length = await _get_varchar_length(engine, "analytics_events", "event_type")
     analytics_event_checks = await _get_check_constraint_sql(engine, "analytics_events")
     constraints = await _inspect_constraints(engine)
@@ -585,33 +585,48 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
     assert "ix_pipeline_ingest_requests_materialized_meme_id" in pipeline_ingest_request_indexes
     assert "ix_pipeline_ingest_requests_materialized_meme_file_id" in pipeline_ingest_request_indexes
     assert "ix_pipeline_ingest_requests_matched_meme_file_id" in pipeline_ingest_request_indexes
-    assert pipeline_outbox_event_columns == {
+    assert rabbitmq_outbox_message_columns == {
         "aggregate_id",
         "aggregate_type",
         "attempt_count",
         "created_at",
+        "content_type",
         "event_type",
+        "exchange",
+        "headers",
         "id",
         "last_error_text",
+        "locked_at",
+        "lock_owner",
+        "message_id",
         "next_retry_at",
+        "ordering_key",
         "payload",
         "published_at",
         "routing_key",
         "status",
         "updated_at",
     }
-    outbox_checks = " ".join(pipeline_outbox_event_constraints.values()).lower()
+    outbox_checks = " ".join(rabbitmq_outbox_message_constraints.values()).lower()
     assert "attempt_count >= 0" in outbox_checks
+    assert "aggregate_id" in outbox_checks
     assert "aggregate_type" in outbox_checks
+    assert "content_type" in outbox_checks
     assert "event_type" in outbox_checks
+    assert "exchange" in outbox_checks
+    assert "message_id" in outbox_checks
     assert "routing_key" in outbox_checks
-    assert "ix_pipeline_outbox_events_status_retry_created" in pipeline_outbox_event_indexes
-    assert "status" in pipeline_outbox_event_indexes["ix_pipeline_outbox_events_status_retry_created"]
-    assert "next_retry_at" in pipeline_outbox_event_indexes["ix_pipeline_outbox_events_status_retry_created"]
-    assert "created_at" in pipeline_outbox_event_indexes["ix_pipeline_outbox_events_status_retry_created"]
-    assert "ix_pipeline_outbox_events_aggregate" in pipeline_outbox_event_indexes
-    assert "aggregate_type" in pipeline_outbox_event_indexes["ix_pipeline_outbox_events_aggregate"]
-    assert "aggregate_id" in pipeline_outbox_event_indexes["ix_pipeline_outbox_events_aggregate"]
+    assert "ix_rabbitmq_outbox_messages_status_retry_created" in rabbitmq_outbox_message_indexes
+    assert "status" in rabbitmq_outbox_message_indexes["ix_rabbitmq_outbox_messages_status_retry_created"]
+    assert "next_retry_at" in rabbitmq_outbox_message_indexes["ix_rabbitmq_outbox_messages_status_retry_created"]
+    assert "created_at" in rabbitmq_outbox_message_indexes["ix_rabbitmq_outbox_messages_status_retry_created"]
+    assert "ix_rabbitmq_outbox_messages_aggregate" in rabbitmq_outbox_message_indexes
+    assert "aggregate_type" in rabbitmq_outbox_message_indexes["ix_rabbitmq_outbox_messages_aggregate"]
+    assert "aggregate_id" in rabbitmq_outbox_message_indexes["ix_rabbitmq_outbox_messages_aggregate"]
+    assert "uq_rabbitmq_outbox_messages_message_id" in rabbitmq_outbox_message_indexes
+    assert "message_id" in rabbitmq_outbox_message_indexes["uq_rabbitmq_outbox_messages_message_id"]
+    assert "ix_rabbitmq_outbox_messages_lease" in rabbitmq_outbox_message_indexes
+    assert "locked_at" in rabbitmq_outbox_message_indexes["ix_rabbitmq_outbox_messages_lease"]
     assert "uq_meme_file_ocr_results_meme_file_id" in meme_file_ocr_result_indexes
     assert "UNIQUE INDEX uq_meme_file_ocr_results_meme_file_id" in meme_file_ocr_result_indexes[
         "uq_meme_file_ocr_results_meme_file_id"
@@ -879,7 +894,7 @@ async def test_crawler_sources_migration_applies_and_reverses(
     config = _build_alembic_config(database_url)
 
     await _run_alembic_command(command.upgrade, config, "head")
-    assert await _get_current_revision(engine) == "0020"
+    assert await _get_current_revision(engine) == "0021"
 
     meme_sources_columns = await _get_column_names(engine, "meme_sources")
     source_channels_columns = await _get_column_names(engine, "source_channels")
@@ -977,7 +992,7 @@ async def test_repeated_fresh_database_upgrades_work_after_a_full_downgrade(
     await _run_alembic_command(command.downgrade, config, "base")
     await _run_alembic_command(command.upgrade, config, "head")
 
-    assert await _get_current_revision(engine) == "0020"
+    assert await _get_current_revision(engine) == "0021"
     assert EXPECTED_TABLES.issubset(await _get_table_names(engine))
 
 

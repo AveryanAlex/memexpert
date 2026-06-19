@@ -8,6 +8,7 @@ inspection.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Self
 
 from sqlalchemy.exc import SQLAlchemyError
@@ -35,6 +36,7 @@ from memexpert.ingest.materialization.requests import (
     mark_materialization_attempt_started,
 )
 from memexpert.media.contracts import MediaProcessingError
+from memexpert.messaging.rabbitmq_outbox import relay_rabbitmq_outbox_messages_best_effort
 from memexpert.models.base import utcnow
 from memexpert.services.errors import PipelineIngestError, PipelinePayloadTooLargeError
 
@@ -45,6 +47,9 @@ if TYPE_CHECKING:
 
     from memexpert.core.config import Settings
     from memexpert.media.contracts import PipelineMediaProcessorProtocol
+    from memexpert.messaging.rabbitmq_outbox import RabbitBrokerProtocol
+
+logger = logging.getLogger(__name__)
 
 
 class PipelineIngestMaterializer:
@@ -57,9 +62,11 @@ class PipelineIngestMaterializer:
         media_processor: PipelineMediaProcessorProtocol,
         settings: Settings | None = None,
         storage_client: ObjectStorageClient | None = None,
+        broker: RabbitBrokerProtocol | None = None,
     ) -> None:
         self._session = session
         self._settings = settings or get_settings()
+        self._broker = broker
         self._objects = MaterializationObjectStore(settings=self._settings, storage_client=storage_client)
         self._media_preparer = MaterializationMediaPreparer(
             settings=self._settings,
@@ -74,6 +81,7 @@ class PipelineIngestMaterializer:
         media_processor: PipelineMediaProcessorProtocol,
         settings: Settings | None = None,
         storage_client: ObjectStorageClient | None = None,
+        broker: RabbitBrokerProtocol | None = None,
     ) -> Self:
         """Build the worker-only materializer from shared settings."""
 
@@ -82,6 +90,7 @@ class PipelineIngestMaterializer:
             media_processor=media_processor,
             settings=settings,
             storage_client=storage_client,
+            broker=broker,
         )
 
     async def materialize(self, ingest_request_id: uuid.UUID) -> PipelineIngestMaterializationResult:
@@ -138,9 +147,9 @@ class PipelineIngestMaterializer:
                     blocked_match=blocked_match,
                     created_at=now,
                 )
-                outbox_event = None
+                outbox_message_id = None
             else:
-                outbox_event = await materialize_transcodable_request(
+                outbox_message_id = await materialize_transcodable_request(
                     self._session,
                     ingest_request=ingest_request,
                     prepared=prepared,
@@ -158,7 +167,15 @@ class PipelineIngestMaterializer:
             raise
 
         await self._objects.cleanup_temp_original(temp_object_key)
-        return build_materialization_result(ingest_request, outbox_event=outbox_event)
+        if outbox_message_id is not None:
+            _ = await relay_rabbitmq_outbox_messages_best_effort(
+                self._session,
+                (outbox_message_id,),
+                settings=self._settings,
+                broker=self._broker,
+                logger=logger,
+            )
+        return build_materialization_result(ingest_request, outbox_message_id=outbox_message_id)
 
 
 __all__ = [

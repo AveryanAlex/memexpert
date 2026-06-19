@@ -21,6 +21,7 @@ async def run_media_inspect_stage(
             settings=context.settings,
             storage_client=context.storage_client,
             media_processor=context.media_processor,
+            broker=context.broker,
         )
         _ = await materializer.materialize(inspect_event.ingest_request_id)
 

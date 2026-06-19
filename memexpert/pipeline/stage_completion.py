@@ -8,8 +8,6 @@ from collections.abc import Mapping
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
-from sqlalchemy.exc import SQLAlchemyError
-
 from memexpert.models.base import utcnow
 from memexpert.models.content import MemeFile, MemeFileOCRResult, PipelineStageJournal
 from memexpert.models.enums import (
@@ -22,7 +20,6 @@ from memexpert.models.enums import (
 )
 from memexpert.pipeline import constants as _consts
 from memexpert.pipeline.dispatch import (
-    DownstreamStageDispatch,
     PipelineDispatchingService,
     PipelineStageWorkContext,
     prepare_downstream_dispatches,
@@ -43,9 +40,7 @@ from memexpert.schemas.content_pipeline import (
 from memexpert.services.content_merge import ContentMergeService
 from memexpert.services.errors import (
     PipelineIngestError,
-    PipelineItemNotFoundError,
     PipelineMergeTransactionError,
-    PipelinePublishError,
 )
 
 if TYPE_CHECKING:
@@ -315,33 +310,39 @@ class PipelineStageCompletionService(PipelineDispatchingService):
             record_success=True,
         )
 
+        sync_success_event = (
+            self._build_sync_success_event(
+                meme_file=meme_file,
+                stage_entry=stage_entry,
+                event_type=_consts.SYNC_SUCCESS_EVENT_TYPE_BY_TARGET[target],
+                stage=stage,
+                attempt=attempt,
+            )
+            if not already_succeeded
+            else None
+        )
+
         await self._finalize_stage_success(
             meme_file=meme_file,
             stage_entry=stage_entry,
             stage=stage,
             attempt=attempt,
             event_id=event_id,
+            extra_dispatch_events=(sync_success_event,) if sync_success_event is not None else (),
         )
-
-        if not already_succeeded:
-            await self._publish_sync_success_event(
-                meme_file=meme_file,
-                stage_entry=stage_entry,
-                event_type=_consts.SYNC_SUCCESS_EVENT_TYPE_BY_TARGET[target],
-                stage=stage,
-            )
 
         return await load_sync_target_status(self._session, meme_file_id, target)
 
-    async def _publish_sync_success_event(
+    def _build_sync_success_event(
         self,
         *,
         meme_file: MemeFile,
         stage_entry: PipelineStageJournal,
         event_type: ContentPipelineEventType,
         stage: ContentPipelineStage,
-    ) -> None:
-        dispatch_event = ContentPipelineDispatchEvent(
+        attempt: int,
+    ) -> ContentPipelineDispatchEvent:
+        return ContentPipelineDispatchEvent(
             event_id=uuid.uuid7(),
             event_type=event_type,
             meme_id=meme_file.meme_id,
@@ -349,44 +350,9 @@ class PipelineStageCompletionService(PipelineDispatchingService):
             stage=stage,
             source_kind=ContentSourceKind.MANUAL_UPLOAD,
             original_object_key=meme_file.s3_original_key,
-            attempt=max(stage_entry.attempt_count, 1),
+            attempt=max(stage_entry.attempt_count, attempt, 1),
             created_at=utcnow(),
         )
-        try:
-            await self._publisher(dispatch_event)
-        except Exception as exc:
-            await self._mark_sync_success_publish_failure(
-                meme_file_id=meme_file.id,
-                stage=stage,
-                attempt=dispatch_event.attempt,
-                event_id=dispatch_event.event_id,
-                error=exc,
-            )
-            raise PipelinePublishError(
-                f"Sync target {stage.value} succeeded, but the status notification dispatch failed.",
-            ) from exc
-
-    async def _mark_sync_success_publish_failure(
-        self,
-        *,
-        meme_file_id: uuid.UUID,
-        stage: ContentPipelineStage,
-        attempt: int,
-        event_id: uuid.UUID,
-        error: Exception,
-    ) -> None:
-        try:
-            await self.mark_stage_failed(
-                meme_file_id=meme_file_id,
-                stage=stage,
-                attempt=attempt,
-                event_id=event_id,
-                normalized_reason=_consts.PIPELINE_REASON_PUBLISH_FAILED,
-                last_error_text=str(error),
-                retryable=True,
-            )
-        except (PipelineIngestError, PipelineItemNotFoundError):
-            return
 
     async def fail_sync_qdrant_stage(
         self,
@@ -516,6 +482,7 @@ class PipelineStageCompletionService(PipelineDispatchingService):
         stage: ContentPipelineStage,
         attempt: int,
         event_id: uuid.UUID,
+        extra_dispatch_events: tuple[ContentPipelineDispatchEvent, ...] = (),
     ) -> None:
         finished_at = utcnow()
 
@@ -540,63 +507,13 @@ class PipelineStageCompletionService(PipelineDispatchingService):
         elif stage not in {ContentPipelineStage.SYNC_QDRANT, ContentPipelineStage.SYNC_MEILI}:
             meme_file.status = ContentProcessingStatus.PROCESSING
 
-        if stage is ContentPipelineStage.CLASSIFY and downstream_dispatches:
-            await self._atomic_publish_then_commit_fan_out(
-                downstream_dispatches=downstream_dispatches,
-            )
-            return
+        outbox_message_ids = []
+        dispatch_events = tuple(dispatch.event for dispatch in downstream_dispatches) + extra_dispatch_events
+        for dispatch_event in dispatch_events:
+            outbox_message_ids.append(await self._enqueue_dispatch_event(dispatch_event))
 
         await self._commit_stage_mutation("Failed to persist successful stage state.")
-
-        for dispatch in downstream_dispatches:
-            try:
-                await self._publisher(dispatch.event)
-            except Exception as exc:
-                await self._mark_publish_failure_for_downstream_stage(dispatch=dispatch, error=exc)
-                raise PipelinePublishError("Stage success was stored, but downstream dispatch failed.") from exc
-
-    async def _atomic_publish_then_commit_fan_out(
-        self,
-        *,
-        downstream_dispatches: tuple[DownstreamStageDispatch, ...],
-    ) -> None:
-        try:
-            await self._session.flush()
-        except SQLAlchemyError as exc:
-            await self._session.rollback()
-            raise PipelineIngestError(
-                "Failed to flush fan-out stage rows before publish.",
-            ) from exc
-
-        for dispatch in downstream_dispatches:
-            try:
-                await self._publisher(dispatch.event)
-            except Exception as exc:
-                await self._session.rollback()
-                raise PipelinePublishError(
-                    "Classify fan-out publish failed; rolled back both sync stage rows.",
-                ) from exc
-
-        await self._commit_stage_mutation("Failed to persist successful stage state.")
-
-    async def _mark_publish_failure_for_downstream_stage(
-        self,
-        *,
-        dispatch: DownstreamStageDispatch,
-        error: Exception,
-    ) -> None:
-        try:
-            await self.mark_stage_failed(
-                meme_file_id=dispatch.stage_entry.meme_file_id,
-                stage=dispatch.stage_entry.stage,
-                attempt=dispatch.event.attempt,
-                event_id=dispatch.event.event_id,
-                normalized_reason=_consts.PIPELINE_REASON_PUBLISH_FAILED,
-                last_error_text=str(error),
-                retryable=True,
-            )
-        except (PipelineIngestError, PipelineItemNotFoundError):
-            return
+        await self._relay_outbox_messages_after_commit(tuple(outbox_message_ids))
 
 
 __all__ = ["PipelineStageCompletionService"]

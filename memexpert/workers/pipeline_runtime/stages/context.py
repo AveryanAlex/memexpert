@@ -16,6 +16,7 @@ from memexpert.core.qdrant import QdrantSimilarityClientProtocol, QdrantSyncClie
 from memexpert.core.storage import download_object_bytes, get_pipeline_storage_settings
 from memexpert.core.voyage import VoyageClientProtocol
 from memexpert.media.contracts import PipelineMediaProcessorProtocol
+from memexpert.messaging.rabbitmq_outbox import RabbitBrokerProtocol
 from memexpert.pipeline.dispatch import PipelineStageWorkContext
 from memexpert.services import PipelineIngestError
 
@@ -52,6 +53,7 @@ class PipelineStageHandlerContext:
     qdrant_sync_client: QdrantSyncClientProtocol
     meilisearch_sync_client: MeilisearchSyncClientProtocol
     classification_client: ClassificationClientProtocol
+    broker: RabbitBrokerProtocol | None = None
 
 
 async def load_preview_frame(

@@ -40,8 +40,8 @@ from memexpert.models.content import (
     MemeFile,
     MemeSource,
     PipelineIngestRequest,
-    PipelineOutboxEvent,
     PipelineStageJournal,
+    RabbitMQOutboxMessage,
 )
 from memexpert.models.enums import (
     ContentKind,
@@ -51,7 +51,7 @@ from memexpert.models.enums import (
     ContentProcessingStatus,
     IngestFileOrigin,
     PipelineIngestRequestStatus,
-    PipelineOutboxEventStatus,
+    RabbitMQOutboxMessageStatus,
     SourceAttachReason,
     SourcePlatform,
 )
@@ -76,6 +76,9 @@ from memexpert.services import (
 )
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
+    from aio_pika.abc import HeadersType
     from fastapi import FastAPI
     from httpx import AsyncClient
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -209,12 +212,12 @@ def _override_real_pipeline_services(
     app: FastAPI,
     session: AsyncSession,
     *,
-    publisher: RecordingPublisher | None = None,
+    broker: RecordingBroker | None = None,
 ) -> None:
     _override_focused_pipeline_services(
         app,
         item_read_service=PipelineItemReadService(session),
-        replay_service=PipelineReplayService(session, publisher=publisher),
+        replay_service=PipelineReplayService(session, broker=broker),
         sync_status_service=PipelineSyncStatusService(session),
         smoke_proof_service=PipelineSmokeProofService(session),
     )
@@ -253,13 +256,43 @@ class FakeStorageClient:
 
 
 @dataclass(slots=True)
-class RecordingPublisher:
-    """Async publisher double used to observe route-driven replay dispatches."""
+class RecordingBroker:
+    """Broker double used to observe route-driven replay dispatches."""
 
     events: list[ContentPipelineDispatchEvent] = field(default_factory=list)
+    publish_calls: list[dict[str, object]] = field(default_factory=list)
 
-    async def __call__(self, event: ContentPipelineDispatchEvent) -> None:
-        self.events.append(event)
+    async def publish(
+        self,
+        message: object,
+        /,
+        queue: str = "",
+        exchange: str | None = None,
+        *,
+        routing_key: str = "",
+        mandatory: bool = True,
+        persist: bool = False,
+        content_type: str | None = None,
+        headers: HeadersType | None = None,
+        message_id: str | None = None,
+        timestamp: datetime | None = None,
+    ) -> object:
+        self.publish_calls.append(
+            {
+                "payload": message,
+                "queue": queue,
+                "exchange": exchange,
+                "routing_key": routing_key,
+                "mandatory": mandatory,
+                "persist": persist,
+                "content_type": content_type,
+                "headers": headers,
+                "message_id": message_id,
+                "timestamp": timestamp,
+            }
+        )
+        self.events.append(ContentPipelineDispatchEvent.model_validate(message))
+        return None
 
 
 def build_png_bytes(*, color: tuple[int, int, int] = (255, 128, 0)) -> bytes:
@@ -899,13 +932,13 @@ async def test_pipeline_upload_route_creates_raw_ingest_request_separate_from_it
     meme_count = await migrated_db_session.scalar(select(func.count()).select_from(Meme))
     meme_file_count = await migrated_db_session.scalar(select(func.count()).select_from(MemeFile))
     request_count = await migrated_db_session.scalar(select(func.count()).select_from(PipelineIngestRequest))
-    outbox = await migrated_db_session.scalar(select(PipelineOutboxEvent))
+    outbox = await migrated_db_session.scalar(select(RabbitMQOutboxMessage))
     assert meme_count == 0
     assert meme_file_count == 0
     assert request_count == 1
     assert outbox is not None
-    assert outbox.status is PipelineOutboxEventStatus.PENDING
-    assert outbox.aggregate_id == uuid.UUID(upload_body["id"])
+    assert outbox.status is RabbitMQOutboxMessageStatus.PENDING
+    assert outbox.aggregate_id == upload_body["id"]
 
 
 async def test_pipeline_routes_list_failed_items_and_reject_replay_guards_with_real_service(
@@ -914,12 +947,12 @@ async def test_pipeline_routes_list_failed_items_and_reject_replay_guards_with_r
     migrated_db_session: AsyncSession,
 ) -> None:
     operator_token = get_settings().pipeline_operator_token.get_secret_value()
-    publisher = RecordingPublisher()
+    broker = RecordingBroker()
     service = PipelineStageCompletionService(
         migrated_db_session,
-        publisher=publisher,
+        broker=broker,
     )
-    _override_real_pipeline_services(app, migrated_db_session, publisher=publisher)
+    _override_real_pipeline_services(app, migrated_db_session, broker=broker)
 
     try:
         item = await _seed_pipeline_item(
@@ -1006,14 +1039,14 @@ async def _seed_detail_item(
     session: AsyncSession,
     *,
     storage_client: FakeStorageClient,
-    publisher: RecordingPublisher,
+    broker: RecordingBroker,
     source_id: str,
     post_id: str,
     phash_tag: str,
 ) -> uuid.UUID:
     """Create a pipeline item with a unique perceptual hash for detail-route tests."""
 
-    _ = (storage_client, publisher)
+    _ = (storage_client, broker)
     item = await _seed_pipeline_item(
         session,
         source_id=source_id,
@@ -1033,8 +1066,8 @@ async def test_pipeline_detail_route_returns_empty_projections_before_ocr(
     """Items that have not reached OCR must expose no stub OCR/classify text."""
 
     operator_token = get_settings().pipeline_operator_token.get_secret_value()
-    publisher = RecordingPublisher()
-    _override_real_pipeline_services(app, migrated_db_session, publisher=publisher)
+    broker = RecordingBroker()
+    _override_real_pipeline_services(app, migrated_db_session, broker=broker)
 
     try:
         item = await _seed_pipeline_item(
@@ -1083,12 +1116,12 @@ async def test_pipeline_detail_route_returns_ocr_and_unknown_classification_afte
     """A file past OCR but before classify must expose OCR truth but never fake is_nsfw."""
 
     operator_token = get_settings().pipeline_operator_token.get_secret_value()
-    publisher = RecordingPublisher()
+    broker = RecordingBroker()
     service = PipelineStageCompletionService(
         migrated_db_session,
-        publisher=publisher,
+        broker=broker,
     )
-    _override_real_pipeline_services(app, migrated_db_session, publisher=publisher)
+    _override_real_pipeline_services(app, migrated_db_session, broker=broker)
 
     try:
         item = await _seed_pipeline_item(
@@ -1147,20 +1180,20 @@ async def test_pipeline_detail_route_reports_merge_and_classify_and_ready(
 
     operator_token = get_settings().pipeline_operator_token.get_secret_value()
     storage_client = FakeStorageClient()
-    publisher = RecordingPublisher()
+    broker = RecordingBroker()
 
     # Seed the older canonical item and drive it through the heavy chain.
     older_meme_file_id = await _seed_detail_item(
         migrated_db_session,
         storage_client=storage_client,
-        publisher=publisher,
+        broker=broker,
         source_id="detail-merge-older",
         post_id="9200",
         phash_tag="o",
     )
     older_service = PipelineStageCompletionService(
         migrated_db_session,
-        publisher=publisher,
+        broker=broker,
     )
     older_meme = (
         await PipelineItemReadService(migrated_db_session).get_item(older_meme_file_id)
@@ -1199,14 +1232,14 @@ async def test_pipeline_detail_route_reports_merge_and_classify_and_ready(
     newer_meme_file_id = await _seed_detail_item(
         migrated_db_session,
         storage_client=storage_client,
-        publisher=publisher,
+        broker=broker,
         source_id="detail-merge-newer",
         post_id="9201",
         phash_tag="n",
     )
     newer_service = PipelineStageCompletionService(
         migrated_db_session,
-        publisher=publisher,
+        broker=broker,
     )
     await newer_service.complete_transcode_stage(
         meme_file_id=newer_meme_file_id,
@@ -1245,7 +1278,7 @@ async def test_pipeline_detail_route_reports_merge_and_classify_and_ready(
         ),
     )
 
-    _override_real_pipeline_services(app, migrated_db_session, publisher=publisher)
+    _override_real_pipeline_services(app, migrated_db_session, broker=broker)
 
     try:
         detail_response = await client.get(
@@ -1306,12 +1339,12 @@ async def test_pipeline_detail_route_reports_blocked_items_without_defaulted_cla
     """A blocked embed item must stay visible and expose the failure surface honestly."""
 
     operator_token = get_settings().pipeline_operator_token.get_secret_value()
-    publisher = RecordingPublisher()
+    broker = RecordingBroker()
     service = PipelineStageCompletionService(
         migrated_db_session,
-        publisher=publisher,
+        broker=broker,
     )
-    _override_real_pipeline_services(app, migrated_db_session, publisher=publisher)
+    _override_real_pipeline_services(app, migrated_db_session, broker=broker)
 
     try:
         item = await _seed_pipeline_item(
@@ -1402,7 +1435,7 @@ async def _drive_item_to_classify_succeeded(
     session: AsyncSession,
     *,
     storage_client: FakeStorageClient,
-    publisher: RecordingPublisher,
+    broker: RecordingBroker,
     source_id: str,
     post_id: str,
     phash_tag: str,
@@ -1413,12 +1446,12 @@ async def _drive_item_to_classify_succeeded(
     meme_file_id = await _seed_detail_item(
         session,
         storage_client=storage_client,
-        publisher=publisher,
+        broker=broker,
         source_id=source_id,
         post_id=post_id,
         phash_tag=phash_tag,
     )
-    service = PipelineStageCompletionService(session, publisher=publisher)
+    service = PipelineStageCompletionService(session, broker=broker)
     await service.complete_transcode_stage(
         meme_file_id=meme_file_id,
         attempt=1,
@@ -1460,11 +1493,11 @@ async def test_pipeline_qdrant_sync_status_route_returns_404_when_snapshot_missi
 
     operator_token = get_settings().pipeline_operator_token.get_secret_value()
     storage_client = FakeStorageClient()
-    publisher = RecordingPublisher()
+    broker = RecordingBroker()
     meme_file_id = await _drive_item_to_classify_succeeded(
         migrated_db_session,
         storage_client=storage_client,
-        publisher=publisher,
+        broker=broker,
         source_id="sync-status-missing",
         post_id="9500",
         phash_tag="x",
@@ -1496,17 +1529,17 @@ async def test_pipeline_qdrant_sync_status_route_returns_synced_row(
 
     operator_token = get_settings().pipeline_operator_token.get_secret_value()
     storage_client = FakeStorageClient()
-    publisher = RecordingPublisher()
+    broker = RecordingBroker()
     meme_file_id = await _drive_item_to_classify_succeeded(
         migrated_db_session,
         storage_client=storage_client,
-        publisher=publisher,
+        broker=broker,
         source_id="sync-status-synced",
         post_id="9501",
         phash_tag="y",
         input_hash_seed="y",
     )
-    service = PipelineStageCompletionService(migrated_db_session, publisher=publisher)
+    service = PipelineStageCompletionService(migrated_db_session, broker=broker)
     sync_event = uuid.uuid7()
     _ = await service.complete_sync_qdrant_stage(
         meme_file_id=meme_file_id,
@@ -1556,17 +1589,17 @@ async def test_pipeline_qdrant_sync_replay_route_happy_path(
 
     operator_token = get_settings().pipeline_operator_token.get_secret_value()
     storage_client = FakeStorageClient()
-    publisher = RecordingPublisher()
+    broker = RecordingBroker()
     meme_file_id = await _drive_item_to_classify_succeeded(
         migrated_db_session,
         storage_client=storage_client,
-        publisher=publisher,
+        broker=broker,
         source_id="sync-replay-happy",
         post_id="9502",
         phash_tag="z",
         input_hash_seed="z",
     )
-    replay_service = PipelineReplayService(migrated_db_session, publisher=publisher)
+    replay_service = PipelineReplayService(migrated_db_session, broker=broker)
     _override_focused_pipeline_services(app, replay_service=replay_service)
 
     try:
@@ -1592,16 +1625,16 @@ async def test_pipeline_qdrant_sync_replay_route_rejects_not_ready_items(
 
     operator_token = get_settings().pipeline_operator_token.get_secret_value()
     storage_client = FakeStorageClient()
-    publisher = RecordingPublisher()
+    broker = RecordingBroker()
     meme_file_id = await _seed_detail_item(
         migrated_db_session,
         storage_client=storage_client,
-        publisher=publisher,
+        broker=broker,
         source_id="sync-replay-not-ready",
         post_id="9503",
         phash_tag="w",
     )
-    replay_service = PipelineReplayService(migrated_db_session, publisher=publisher)
+    replay_service = PipelineReplayService(migrated_db_session, broker=broker)
     _override_focused_pipeline_services(app, replay_service=replay_service)
 
     try:
@@ -1625,11 +1658,11 @@ async def test_pipeline_qdrant_sync_replay_batch_route_happy_path(
 
     operator_token = get_settings().pipeline_operator_token.get_secret_value()
     storage_client = FakeStorageClient()
-    publisher = RecordingPublisher()
+    broker = RecordingBroker()
     first = await _drive_item_to_classify_succeeded(
         migrated_db_session,
         storage_client=storage_client,
-        publisher=publisher,
+        broker=broker,
         source_id="sync-batch-one",
         post_id="9504",
         phash_tag="a",
@@ -1638,13 +1671,13 @@ async def test_pipeline_qdrant_sync_replay_batch_route_happy_path(
     second = await _drive_item_to_classify_succeeded(
         migrated_db_session,
         storage_client=storage_client,
-        publisher=publisher,
+        broker=broker,
         source_id="sync-batch-two",
         post_id="9505",
         phash_tag="b",
         input_hash_seed="2",
     )
-    replay_service = PipelineReplayService(migrated_db_session, publisher=publisher)
+    replay_service = PipelineReplayService(migrated_db_session, broker=broker)
     _override_focused_pipeline_services(app, replay_service=replay_service)
 
     try:
@@ -1673,17 +1706,17 @@ async def test_pipeline_qdrant_sync_replay_batch_route_rejects_oversize_batches(
 
     operator_token = get_settings().pipeline_operator_token.get_secret_value()
     storage_client = FakeStorageClient()
-    publisher = RecordingPublisher()
+    broker = RecordingBroker()
     meme_file_id = await _drive_item_to_classify_succeeded(
         migrated_db_session,
         storage_client=storage_client,
-        publisher=publisher,
+        broker=broker,
         source_id="sync-batch-oversize",
         post_id="9506",
         phash_tag="c",
         input_hash_seed="3",
     )
-    service = PipelineReplayService(migrated_db_session, publisher=publisher)
+    service = PipelineReplayService(migrated_db_session, broker=broker)
     _override_focused_pipeline_services(app, replay_service=service)
     oversized_batch = [str(meme_file_id)] * (SYNC_REPLAY_BATCH_MAX + 1)
 
@@ -1750,11 +1783,11 @@ async def test_pipeline_meili_sync_status_route_returns_404_when_snapshot_missin
 
     operator_token = get_settings().pipeline_operator_token.get_secret_value()
     storage_client = FakeStorageClient()
-    publisher = RecordingPublisher()
+    broker = RecordingBroker()
     meme_file_id = await _drive_item_to_classify_succeeded(
         migrated_db_session,
         storage_client=storage_client,
-        publisher=publisher,
+        broker=broker,
         source_id="meili-status-missing",
         post_id="9600",
         phash_tag="1",
@@ -1786,17 +1819,17 @@ async def test_pipeline_meili_sync_status_route_returns_synced_row(
 
     operator_token = get_settings().pipeline_operator_token.get_secret_value()
     storage_client = FakeStorageClient()
-    publisher = RecordingPublisher()
+    broker = RecordingBroker()
     meme_file_id = await _drive_item_to_classify_succeeded(
         migrated_db_session,
         storage_client=storage_client,
-        publisher=publisher,
+        broker=broker,
         source_id="meili-status-synced",
         post_id="9601",
         phash_tag="2",
         input_hash_seed="2",
     )
-    service = PipelineStageCompletionService(migrated_db_session, publisher=publisher)
+    service = PipelineStageCompletionService(migrated_db_session, broker=broker)
     sync_event = uuid.uuid7()
     _ = await service.complete_sync_meili_stage(
         meme_file_id=meme_file_id,
@@ -1846,17 +1879,17 @@ async def test_pipeline_meili_sync_replay_route_happy_path(
 
     operator_token = get_settings().pipeline_operator_token.get_secret_value()
     storage_client = FakeStorageClient()
-    publisher = RecordingPublisher()
+    broker = RecordingBroker()
     meme_file_id = await _drive_item_to_classify_succeeded(
         migrated_db_session,
         storage_client=storage_client,
-        publisher=publisher,
+        broker=broker,
         source_id="meili-replay-happy",
         post_id="9602",
         phash_tag="3",
         input_hash_seed="3",
     )
-    service = PipelineReplayService(migrated_db_session, publisher=publisher)
+    service = PipelineReplayService(migrated_db_session, broker=broker)
     _override_focused_pipeline_services(app, replay_service=service)
 
     try:
@@ -1882,16 +1915,16 @@ async def test_pipeline_meili_sync_replay_route_rejects_not_ready_items(
 
     operator_token = get_settings().pipeline_operator_token.get_secret_value()
     storage_client = FakeStorageClient()
-    publisher = RecordingPublisher()
+    broker = RecordingBroker()
     meme_file_id = await _seed_detail_item(
         migrated_db_session,
         storage_client=storage_client,
-        publisher=publisher,
+        broker=broker,
         source_id="meili-replay-not-ready",
         post_id="9603",
         phash_tag="4",
     )
-    service = PipelineReplayService(migrated_db_session, publisher=publisher)
+    service = PipelineReplayService(migrated_db_session, broker=broker)
     _override_focused_pipeline_services(app, replay_service=service)
 
     try:
@@ -1915,11 +1948,11 @@ async def test_pipeline_meili_sync_replay_batch_route_happy_path(
 
     operator_token = get_settings().pipeline_operator_token.get_secret_value()
     storage_client = FakeStorageClient()
-    publisher = RecordingPublisher()
+    broker = RecordingBroker()
     first = await _drive_item_to_classify_succeeded(
         migrated_db_session,
         storage_client=storage_client,
-        publisher=publisher,
+        broker=broker,
         source_id="meili-batch-one",
         post_id="9604",
         phash_tag="5",
@@ -1928,13 +1961,13 @@ async def test_pipeline_meili_sync_replay_batch_route_happy_path(
     second = await _drive_item_to_classify_succeeded(
         migrated_db_session,
         storage_client=storage_client,
-        publisher=publisher,
+        broker=broker,
         source_id="meili-batch-two",
         post_id="9605",
         phash_tag="6",
         input_hash_seed="6",
     )
-    service = PipelineReplayService(migrated_db_session, publisher=publisher)
+    service = PipelineReplayService(migrated_db_session, broker=broker)
     _override_focused_pipeline_services(app, replay_service=service)
 
     try:
@@ -1963,17 +1996,17 @@ async def test_pipeline_meili_sync_replay_batch_route_rejects_oversize_batches(
 
     operator_token = get_settings().pipeline_operator_token.get_secret_value()
     storage_client = FakeStorageClient()
-    publisher = RecordingPublisher()
+    broker = RecordingBroker()
     meme_file_id = await _drive_item_to_classify_succeeded(
         migrated_db_session,
         storage_client=storage_client,
-        publisher=publisher,
+        broker=broker,
         source_id="meili-batch-oversize",
         post_id="9606",
         phash_tag="7",
         input_hash_seed="7",
     )
-    service = PipelineReplayService(migrated_db_session, publisher=publisher)
+    service = PipelineReplayService(migrated_db_session, broker=broker)
     _override_focused_pipeline_services(app, replay_service=service)
     oversized_batch = [str(meme_file_id)] * (SYNC_REPLAY_BATCH_MAX + 1)
 
@@ -2019,11 +2052,11 @@ async def test_pipeline_item_detail_preserves_pre_s03_byte_compatibility(
 
     operator_token = get_settings().pipeline_operator_token.get_secret_value()
     storage_client = FakeStorageClient()
-    publisher = RecordingPublisher()
+    broker = RecordingBroker()
     meme_file_id = await _seed_detail_item(
         migrated_db_session,
         storage_client=storage_client,
-        publisher=publisher,
+        broker=broker,
         source_id="detail-bytecompat",
         post_id="9607",
         phash_tag="8",
@@ -2177,20 +2210,20 @@ async def _drive_to_dual_synced(
     phash_tag: str,
     input_hash_seed: str,
     storage_client: FakeStorageClient,
-    publisher: RecordingPublisher,
+    broker: RecordingBroker,
 ) -> uuid.UUID:
     """Drive one pipeline item all the way through dual-target SYNCED state."""
 
     meme_file_id = await _drive_item_to_classify_succeeded(
         session,
         storage_client=storage_client,
-        publisher=publisher,
+        broker=broker,
         source_id=source_id,
         post_id=post_id,
         phash_tag=phash_tag,
         input_hash_seed=input_hash_seed,
     )
-    service = PipelineStageCompletionService(session, publisher=publisher)
+    service = PipelineStageCompletionService(session, broker=broker)
     _ = await service.complete_sync_qdrant_stage(
         meme_file_id=meme_file_id,
         attempt=1,
@@ -2215,7 +2248,7 @@ async def test_pipeline_search_smoke_route_happy_path_returns_both_searchable(
 
     operator_token = get_settings().pipeline_operator_token.get_secret_value()
     storage_client = FakeStorageClient()
-    publisher = RecordingPublisher()
+    broker = RecordingBroker()
     meme_file_id = await _drive_to_dual_synced(
         migrated_db_session,
         source_id="smoke-route-happy",
@@ -2223,7 +2256,7 @@ async def test_pipeline_search_smoke_route_happy_path_returns_both_searchable(
         phash_tag="h",
         input_hash_seed="h",
         storage_client=storage_client,
-        publisher=publisher,
+        broker=broker,
     )
     service = PipelineSmokeProofService(migrated_db_session)
 
@@ -2275,7 +2308,7 @@ async def test_pipeline_search_smoke_route_returns_200_when_qdrant_point_missing
 
     operator_token = get_settings().pipeline_operator_token.get_secret_value()
     storage_client = FakeStorageClient()
-    publisher = RecordingPublisher()
+    broker = RecordingBroker()
     meme_file_id = await _drive_to_dual_synced(
         migrated_db_session,
         source_id="smoke-route-missing-qdrant",
@@ -2283,7 +2316,7 @@ async def test_pipeline_search_smoke_route_returns_200_when_qdrant_point_missing
         phash_tag="q",
         input_hash_seed="q",
         storage_client=storage_client,
-        publisher=publisher,
+        broker=broker,
     )
     service = PipelineSmokeProofService(migrated_db_session)
 
@@ -2328,7 +2361,7 @@ async def test_pipeline_search_smoke_route_returns_200_when_both_targets_missing
 
     operator_token = get_settings().pipeline_operator_token.get_secret_value()
     storage_client = FakeStorageClient()
-    publisher = RecordingPublisher()
+    broker = RecordingBroker()
     meme_file_id = await _drive_to_dual_synced(
         migrated_db_session,
         source_id="smoke-route-both-missing",
@@ -2336,7 +2369,7 @@ async def test_pipeline_search_smoke_route_returns_200_when_both_targets_missing
         phash_tag="b",
         input_hash_seed="b",
         storage_client=storage_client,
-        publisher=publisher,
+        broker=broker,
     )
     service = PipelineSmokeProofService(migrated_db_session)
 
@@ -2491,7 +2524,7 @@ async def test_pipeline_search_smoke_route_query_only_resolves_top_hit(
 
     operator_token = get_settings().pipeline_operator_token.get_secret_value()
     storage_client = FakeStorageClient()
-    publisher = RecordingPublisher()
+    broker = RecordingBroker()
     meme_file_id = await _drive_to_dual_synced(
         migrated_db_session,
         source_id="smoke-route-query-only",
@@ -2499,7 +2532,7 @@ async def test_pipeline_search_smoke_route_query_only_resolves_top_hit(
         phash_tag="y",
         input_hash_seed="y",
         storage_client=storage_client,
-        publisher=publisher,
+        broker=broker,
     )
     service = PipelineSmokeProofService(migrated_db_session)
 

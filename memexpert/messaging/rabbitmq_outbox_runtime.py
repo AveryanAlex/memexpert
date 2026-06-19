@@ -1,4 +1,4 @@
-"""Scheduler-owned runtime wrapper for publishing pipeline outbox rows."""
+"""Scheduler-owned runtime wrapper for publishing RabbitMQ outbox rows."""
 
 from __future__ import annotations
 
@@ -9,16 +9,16 @@ from typing import TYPE_CHECKING
 
 from memexpert.core.broker import ensure_pipeline_broker_started
 from memexpert.core.config import Settings, get_settings
+from memexpert.messaging.rabbitmq_outbox import RabbitBrokerProtocol, RabbitOutboxRelay
 from memexpert.models.base import utcnow
-from memexpert.pipeline.outbox import OutboxBrokerProtocol, PipelineOutboxPublisher
 
 if TYPE_CHECKING:
     from memexpert.core.database import AsyncSessionFactory
 
 
 @dataclass(frozen=True, slots=True)
-class PipelineOutboxPublisherBatchResult:
-    """Aggregate outcome for one scheduler outbox publisher sweep."""
+class RabbitMQOutboxPublisherBatchResult:
+    """Aggregate outcome for one scheduler RabbitMQ outbox publisher sweep."""
 
     recovered: int
     claimed: int
@@ -27,13 +27,13 @@ class PipelineOutboxPublisherBatchResult:
     duration_seconds: float
 
 
-async def run_pipeline_outbox_publisher_batch(
+async def run_rabbitmq_outbox_publisher_batch(
     session_factory: AsyncSessionFactory,
     *,
     settings: Settings | None = None,
-    broker: OutboxBrokerProtocol | None = None,
-) -> PipelineOutboxPublisherBatchResult:
-    """Recover stale claims, publish one bounded outbox batch, and return counts."""
+    broker: RabbitBrokerProtocol | None = None,
+) -> RabbitMQOutboxPublisherBatchResult:
+    """Recover stale leases, publish one bounded outbox batch, and return counts."""
 
     start_seconds = time.perf_counter()
     resolved_settings = settings or get_settings()
@@ -42,16 +42,16 @@ async def run_pipeline_outbox_publisher_batch(
         resolved_broker = await ensure_pipeline_broker_started(settings=resolved_settings)
 
     stale_before = utcnow() - timedelta(
-        seconds=resolved_settings.scheduler_pipeline_outbox_publisher_stale_timeout_seconds,
+        seconds=resolved_settings.scheduler_rabbitmq_outbox_publisher_stale_timeout_seconds,
     )
     async with session_factory() as session:
-        publisher = PipelineOutboxPublisher(session, broker=resolved_broker, settings=resolved_settings)
-        recovered = await publisher.recover_stale_publishing(stale_before=stale_before)
-        result = await publisher.publish_batch(
-            limit=resolved_settings.scheduler_pipeline_outbox_publisher_batch_size,
+        relay = RabbitOutboxRelay(session, broker=resolved_broker, settings=resolved_settings)
+        recovered = await relay.recover_stale_publishing(stale_before=stale_before)
+        result = await relay.publish_batch(
+            limit=resolved_settings.scheduler_rabbitmq_outbox_publisher_batch_size,
         )
 
-    return PipelineOutboxPublisherBatchResult(
+    return RabbitMQOutboxPublisherBatchResult(
         recovered=recovered,
         claimed=result.claimed,
         published=result.published,
@@ -60,11 +60,11 @@ async def run_pipeline_outbox_publisher_batch(
     )
 
 
-def pipeline_outbox_publisher_result_log_extra(
+def rabbitmq_outbox_publisher_result_log_extra(
     job_id: str,
-    result: PipelineOutboxPublisherBatchResult,
+    result: RabbitMQOutboxPublisherBatchResult,
 ) -> dict[str, object]:
-    """Return structured scheduler log fields for one outbox publisher run."""
+    """Return structured scheduler log fields for one RabbitMQ outbox publisher run."""
 
     return {
         "event": "scheduler_job_batch_result",
@@ -78,7 +78,7 @@ def pipeline_outbox_publisher_result_log_extra(
 
 
 __all__ = [
-    "PipelineOutboxPublisherBatchResult",
-    "pipeline_outbox_publisher_result_log_extra",
-    "run_pipeline_outbox_publisher_batch",
+    "RabbitMQOutboxPublisherBatchResult",
+    "rabbitmq_outbox_publisher_result_log_extra",
+    "run_rabbitmq_outbox_publisher_batch",
 ]

@@ -21,7 +21,7 @@ from memexpert.models.content import (
     MemeFile,
     MemeSource,
     PipelineIngestRequest,
-    PipelineOutboxEvent,
+    RabbitMQOutboxMessage,
 )
 from memexpert.models.enums import (
     CollectionMembershipRole,
@@ -30,7 +30,7 @@ from memexpert.models.enums import (
     ContentProcessingStatus,
     ModerationReason,
     PipelineIngestRequestStatus,
-    PipelineOutboxEventStatus,
+    RabbitMQOutboxMessageStatus,
     SourceAttachReason,
     SourcePlatform,
 )
@@ -171,7 +171,7 @@ async def test_accept_new_upload_creates_raw_ingest_request_and_pending_outbox_o
         meme_file_count = await session.scalar(select(func.count()).select_from(MemeFile))
         source_count = await session.scalar(select(func.count()).select_from(MemeSource))
         persisted_request = await session.get(PipelineIngestRequest, ingest_request.id)
-        outbox_rows = (await session.execute(select(PipelineOutboxEvent))).scalars().all()
+        outbox_rows = (await session.execute(select(RabbitMQOutboxMessage))).scalars().all()
 
     assert meme_count == 0
     assert meme_file_count == 0
@@ -179,8 +179,8 @@ async def test_accept_new_upload_creates_raw_ingest_request_and_pending_outbox_o
     assert persisted_request is not None
     assert persisted_request.status is PipelineIngestRequestStatus.MEDIA_INSPECT_PENDING
     assert len(outbox_rows) == 1
-    assert outbox_rows[0].status is PipelineOutboxEventStatus.PENDING
-    assert outbox_rows[0].aggregate_id == ingest_request.id
+    assert outbox_rows[0].status is RabbitMQOutboxMessageStatus.PENDING
+    assert outbox_rows[0].aggregate_id == str(ingest_request.id)
     assert outbox_rows[0].event_type == "media_inspect_requested"
     assert outbox_rows[0].payload["ingest_request_id"] == str(ingest_request.id)
 
@@ -213,7 +213,7 @@ async def test_accept_sha_duplicate_resolves_synchronously_and_does_not_enqueue_
     assert storage_client.delete_calls == []
 
     async with postgres_session_factory() as session:
-        outbox_count = await session.scalar(select(func.count()).select_from(PipelineOutboxEvent))
+        outbox_count = await session.scalar(select(func.count()).select_from(RabbitMQOutboxMessage))
         sources = (await session.execute(select(MemeSource))).scalars().all()
         request_count = await session.scalar(select(func.count()).select_from(PipelineIngestRequest))
         file_count = await session.scalar(select(func.count()).select_from(MemeFile))
@@ -472,7 +472,7 @@ async def test_accept_source_replay_returns_existing_request_without_duplicate_w
 
     async with postgres_session_factory() as session:
         request_count = await session.scalar(select(func.count()).select_from(PipelineIngestRequest))
-        outbox_count = await session.scalar(select(func.count()).select_from(PipelineOutboxEvent))
+        outbox_count = await session.scalar(select(func.count()).select_from(RabbitMQOutboxMessage))
 
     assert request_count == 1
     assert outbox_count == 1

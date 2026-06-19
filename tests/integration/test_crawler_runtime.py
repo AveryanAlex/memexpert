@@ -33,7 +33,7 @@ from memexpert.ingest.crawler_service import PipelineCrawlerIngestService
 from memexpert.models.content import (
     MemeFile,
     PipelineIngestRequest,
-    PipelineOutboxEvent,
+    RabbitMQOutboxMessage,
     SourceChannel,
     TelegramSessionState,
 )
@@ -232,7 +232,7 @@ async def test_catch_up_channel_ingests_and_counts_mixed_media(
     assert channel.subscriber_count == 100
     assert len(storage_client.put_calls) == 4
     assert await migrated_db_session.scalar(select(func.count()).select_from(PipelineIngestRequest)) == 4
-    assert await migrated_db_session.scalar(select(func.count()).select_from(PipelineOutboxEvent)) == 4
+    assert await migrated_db_session.scalar(select(func.count()).select_from(RabbitMQOutboxMessage)) == 4
     assert await migrated_db_session.scalar(select(func.count()).select_from(MemeFile)) == 0
 
 

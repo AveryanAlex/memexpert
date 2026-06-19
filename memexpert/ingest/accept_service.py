@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import uuid
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Protocol, Self, cast
@@ -36,13 +37,14 @@ from memexpert.ingest.target_collection_metadata import (
     TargetCollectionMetadataError,
     parse_target_collection_id,
 )
+from memexpert.messaging.rabbitmq_outbox import RabbitPublisher, relay_rabbitmq_outbox_messages_best_effort
 from memexpert.models.content import Meme, MemeFile, MemeSource, PipelineIngestRequest
 from memexpert.models.enums import (
     ContentProcessingStatus,
     PipelineIngestRequestStatus,
     SourceAttachReason,
 )
-from memexpert.pipeline.outbox import build_media_inspect_outbox_event
+from memexpert.pipeline.events import build_media_inspect_message_spec
 from memexpert.schemas.pipeline_base import MAX_TELEGRAM_CONTENT_TYPE_LENGTH, MAX_TELEGRAM_FILENAME_LENGTH
 from memexpert.services.errors import (
     PipelineIngestError,
@@ -55,6 +57,10 @@ from memexpert.services.errors import (
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
+
+    from memexpert.messaging.rabbitmq_outbox import RabbitBrokerProtocol
+
+logger = logging.getLogger(__name__)
 
 
 class ObjectStorageClient(Protocol):
@@ -82,11 +88,14 @@ class PipelineIngestAcceptService:
         *,
         settings: Settings | None = None,
         storage_client: ObjectStorageClient | None = None,
+        broker: RabbitBrokerProtocol | None = None,
     ) -> None:
         self._session = session
         self._settings = settings or get_settings()
+        self._broker = broker
         self._storage_settings: PipelineStorageSettings = get_pipeline_storage_settings(self._settings)
         self._storage_client = storage_client or cast("ObjectStorageClient", get_s3_client())
+        self._rabbit_publisher = RabbitPublisher(broker=broker, settings=self._settings)
 
     @classmethod
     def from_settings(
@@ -95,10 +104,11 @@ class PipelineIngestAcceptService:
         *,
         settings: Settings | None = None,
         storage_client: ObjectStorageClient | None = None,
+        broker: RabbitBrokerProtocol | None = None,
     ) -> Self:
         """Build the API-safe ingest accept service from shared settings."""
 
-        return cls(session, settings=settings, storage_client=storage_client)
+        return cls(session, settings=settings, storage_client=storage_client, broker=broker)
 
     async def accept_bytes(
         self,
@@ -273,10 +283,12 @@ class PipelineIngestAcceptService:
             status=PipelineIngestRequestStatus.MEDIA_INSPECT_PENDING,
             attempt_count=0,
         )
-        outbox_event = build_media_inspect_outbox_event(ingest_request, settings=self._settings)
-
         try:
-            self._session.add_all([ingest_request, outbox_event])
+            self._session.add(ingest_request)
+            outbox_message_id = await self._rabbit_publisher.publish(
+                build_media_inspect_message_spec(ingest_request, settings=self._settings),
+                session=self._session,
+            )
             await self._session.commit()
         except IntegrityError as exc:
             await self._session.rollback()
@@ -293,7 +305,18 @@ class PipelineIngestAcceptService:
             await self._session.rollback()
             await self._cleanup_temp_object(temp_object_key)
             raise PipelineIngestError("Failed to persist raw ingest request and outbox event.") from exc
+        except Exception as exc:
+            await self._session.rollback()
+            await self._cleanup_temp_object(temp_object_key)
+            raise PipelineIngestError("Failed to persist raw ingest request and outbox event.") from exc
 
+        _ = await relay_rabbitmq_outbox_messages_best_effort(
+            self._session,
+            (outbox_message_id,),
+            settings=self._settings,
+            broker=self._broker,
+            logger=logger,
+        )
         return self._result(ingest_request, IngestAcceptOutcome.ACCEPTED_ASYNC)
 
     async def _find_existing_request(self, source: IngestAcceptSource) -> PipelineIngestRequest | None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 import pytest
@@ -36,6 +37,7 @@ from memexpert.models.content import (
     MemePopularitySnapshot,
     MemeSource,
     PipelineStageJournal,
+    RabbitMQOutboxMessage,
     SourceChannel,
 )
 from memexpert.models.enums import (
@@ -45,6 +47,7 @@ from memexpert.models.enums import (
     ContentPipelineStageStatus,
     ContentProcessingStatus,
     IngestFileOrigin,
+    RabbitMQOutboxMessageStatus,
     SourceAttachReason,
     SourcePlatform,
     SyncTargetKind,
@@ -63,7 +66,6 @@ from memexpert.schemas.content_pipeline import (
 from memexpert.services import (
     PipelineIngestError,
     PipelineMergeTransactionError,
-    PipelinePublishError,
     PipelineReplayNotAllowedError,
 )
 from memexpert.services.content_merge import MERGE_REASON_HIGH_SIMILARITY
@@ -71,6 +73,7 @@ from memexpert.services.content_merge import MERGE_REASON_HIGH_SIMILARITY
 if TYPE_CHECKING:
     from datetime import datetime
 
+    from aio_pika.abc import HeadersType
     from pytest import MonkeyPatch
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -114,16 +117,32 @@ class FakeStorageClient:
 
 
 @dataclass(slots=True)
-class RecordingPublisher:
-    """Async publisher double that verifies DB durability before publish is attempted."""
+class RecordingBroker:
+    """Broker double that verifies DB durability before publish is attempted."""
 
     session_factory: async_sessionmaker[AsyncSession] | None = None
     fail_with: Exception | None = None
     events: list[ContentPipelineDispatchEvent] = field(default_factory=list)
+    publish_calls: list[dict[str, object]] = field(default_factory=list)
     file_visible_at_publish: list[bool] = field(default_factory=list)
     transcode_visible_at_publish: list[bool] = field(default_factory=list)
 
-    async def __call__(self, event: ContentPipelineDispatchEvent) -> None:
+    async def publish(
+        self,
+        message: object,
+        /,
+        queue: str = "",
+        exchange: str | None = None,
+        *,
+        routing_key: str = "",
+        mandatory: bool = True,
+        persist: bool = False,
+        content_type: str | None = None,
+        headers: HeadersType | None = None,
+        message_id: str | None = None,
+        timestamp: datetime | None = None,
+    ) -> object:
+        event = ContentPipelineDispatchEvent.model_validate(message)
         if self.session_factory is not None:
             async with self.session_factory() as session:
                 file_result = await session.execute(select(MemeFile).where(MemeFile.id == event.meme_file_id))
@@ -139,7 +158,22 @@ class RecordingPublisher:
         if self.fail_with is not None:
             raise self.fail_with
 
+        self.publish_calls.append(
+            {
+                "payload": message,
+                "queue": queue,
+                "exchange": exchange,
+                "routing_key": routing_key,
+                "mandatory": mandatory,
+                "persist": persist,
+                "content_type": content_type,
+                "headers": headers,
+                "message_id": message_id,
+                "timestamp": timestamp,
+            }
+        )
         self.events.append(event)
+        return None
 
 
 def build_normalized_media_result(meme_file_id: uuid.UUID) -> NormalizedMediaResult:
@@ -219,14 +253,14 @@ def _build_service_with_distinct_phash(
     session: AsyncSession,
     *,
     phash_tag: str,
-    publisher: RecordingPublisher | None = None,
+    broker: RecordingBroker | None = None,
 ) -> PipelineStageCompletionService:
     """Return a stage completion service while seed rows own their pHash."""
 
     _ = phash_tag
     return PipelineStageCompletionService(
         session,
-        publisher=publisher or RecordingPublisher(),
+        broker=broker or RecordingBroker(),
     )
 
 
@@ -236,9 +270,9 @@ async def _drive_to_embed_pending(
     source_id: str,
     post_id: str,
     phash_tag: str,
-    publisher: RecordingPublisher | None = None,
+    broker: RecordingBroker | None = None,
     filename: str = "embed-ready.png",
-    ) -> tuple[uuid.UUID, NormalizedMediaResult, PipelineStageCompletionService]:
+) -> tuple[uuid.UUID, NormalizedMediaResult, PipelineStageCompletionService]:
     """Create + transcode + OCR a pipeline item up to the embed-pending state."""
 
     meme_file_id = await _seed_pending_pipeline_item(
@@ -253,7 +287,7 @@ async def _drive_to_embed_pending(
     service = _build_service_with_distinct_phash(
         session,
         phash_tag=phash_tag,
-        publisher=publisher,
+        broker=broker,
     )
     normalized = build_normalized_media_result(meme_file_id)
     await service.complete_transcode_stage(
@@ -350,10 +384,10 @@ async def test_complete_transcode_stage_persists_derivative_metadata_and_queues_
     migrated_db_session: AsyncSession,
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    publisher = RecordingPublisher()
+    broker = RecordingBroker()
     service = PipelineStageCompletionService(
         migrated_db_session,
-        publisher=publisher,
+        broker=broker,
     )
 
     meme_file_id = await _seed_pending_pipeline_item(
@@ -378,8 +412,8 @@ async def test_complete_transcode_stage_persists_derivative_metadata_and_queues_
     assert after_transcode.current_stage is ContentPipelineStage.OCR
     assert after_transcode.current_status is ContentPipelineStageStatus.PENDING
     assert after_transcode.web_video_object_key == normalized.web_video_object_key
-    assert publisher.events[-1].event_type is ContentPipelineEventType.MEME_TRANSCODED
-    assert publisher.events[-1].stage is ContentPipelineStage.OCR
+    assert broker.events[-1].event_type is ContentPipelineEventType.MEME_TRANSCODED
+    assert broker.events[-1].stage is ContentPipelineStage.OCR
 
     async with postgres_session_factory() as session:
         persisted_file = await session.scalar(select(MemeFile).where(MemeFile.id == meme_file_id))
@@ -399,10 +433,10 @@ async def test_complete_ocr_stage_persists_durable_result_and_keeps_meme_unready
     migrated_db_session: AsyncSession,
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    publisher = RecordingPublisher()
+    broker = RecordingBroker()
     service = PipelineStageCompletionService(
         migrated_db_session,
-        publisher=publisher,
+        broker=broker,
     )
 
     meme_file_id = await _seed_pending_pipeline_item(
@@ -432,8 +466,8 @@ async def test_complete_ocr_stage_persists_durable_result_and_keeps_meme_unready
 
     assert after_ocr.current_stage is ContentPipelineStage.EMBED
     assert after_ocr.current_status is ContentPipelineStageStatus.PENDING
-    assert publisher.events[-1].event_type is ContentPipelineEventType.MEME_OCR_DONE
-    assert publisher.events[-1].stage is ContentPipelineStage.EMBED
+    assert broker.events[-1].event_type is ContentPipelineEventType.MEME_OCR_DONE
+    assert broker.events[-1].stage is ContentPipelineStage.EMBED
 
     async with postgres_session_factory() as session:
         persisted_file = await session.scalar(select(MemeFile).where(MemeFile.id == meme_file_id))
@@ -457,7 +491,7 @@ async def test_complete_ocr_stage_persists_durable_result_and_keeps_meme_unready
     assert persisted_ocr.source_object_key == normalized.web_video_object_key
 
 
-async def test_mark_stage_success_publish_failure_marks_next_stage_failed_and_keeps_file_not_ready(
+async def test_mark_stage_success_publish_failure_leaves_retryable_outbox_and_keeps_business_state(
     migrated_db_session: AsyncSession,
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -473,16 +507,15 @@ async def test_mark_stage_success_publish_failure_marks_next_stage_failed_and_ke
 
     failing_service = PipelineStageCompletionService(
         migrated_db_session,
-        publisher=RecordingPublisher(fail_with=RuntimeError("broker unavailable")),
+        broker=RecordingBroker(fail_with=RuntimeError("broker unavailable")),
     )
 
-    with pytest.raises(PipelinePublishError, match="downstream dispatch failed"):
-        await failing_service.complete_transcode_stage(
-            meme_file_id=meme_file_id,
-            attempt=1,
-            event_id=uuid.uuid7(),
-            result=build_normalized_media_result(meme_file_id),
-        )
+    await failing_service.complete_transcode_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        result=build_normalized_media_result(meme_file_id),
+    )
 
     async with postgres_session_factory() as session:
         persisted_file = await session.scalar(select(MemeFile).where(MemeFile.id == meme_file_id))
@@ -491,6 +524,12 @@ async def test_mark_stage_success_publish_failure_marks_next_stage_failed_and_ke
                 select(PipelineStageJournal).where(PipelineStageJournal.meme_file_id == meme_file_id)
             )
         ).scalars().all()
+        outbox_message = await session.scalar(
+            select(RabbitMQOutboxMessage).where(
+                RabbitMQOutboxMessage.aggregate_id == str(meme_file_id),
+                RabbitMQOutboxMessage.event_type == ContentPipelineEventType.MEME_TRANSCODED.value,
+            )
+        )
 
     sorted_rows = sorted(
         persisted_rows,
@@ -502,12 +541,16 @@ async def test_mark_stage_success_publish_failure_marks_next_stage_failed_and_ke
     )
 
     assert persisted_file is not None
-    assert persisted_file.status is ContentProcessingStatus.FAILED
+    assert persisted_file.status is ContentProcessingStatus.PROCESSING
     assert tuple((row.stage, row.status, row.normalized_reason) for row in sorted_rows) == (
         (ContentPipelineStage.INGEST, ContentPipelineStageStatus.SUCCEEDED, None),
         (ContentPipelineStage.TRANSCODE, ContentPipelineStageStatus.SUCCEEDED, None),
-        (ContentPipelineStage.OCR, ContentPipelineStageStatus.FAILED, "publish_failed"),
+        (ContentPipelineStage.OCR, ContentPipelineStageStatus.PENDING, None),
     )
+    assert outbox_message is not None
+    assert outbox_message.status is RabbitMQOutboxMessageStatus.FAILED
+    assert outbox_message.next_retry_at is not None
+    assert "broker unavailable" in (outbox_message.last_error_text or "")
 
 
 async def test_replay_item_rejects_stage_that_has_not_been_dispatched_yet(
@@ -515,7 +558,7 @@ async def test_replay_item_rejects_stage_that_has_not_been_dispatched_yet(
 ) -> None:
     service = PipelineReplayService(
         migrated_db_session,
-        publisher=RecordingPublisher(),
+        broker=RecordingBroker(),
     )
     meme_file_id = await _seed_pending_pipeline_item(
         migrated_db_session,
@@ -531,13 +574,13 @@ async def test_replay_item_rejects_stage_that_has_not_been_dispatched_yet(
         _ = await service.replay_item(meme_file_id, stage=ContentPipelineStage.EMBED)
 
 
-async def test_replay_publish_failure_restores_previous_failed_stage_snapshot(
+async def test_replay_publish_failure_keeps_reservation_and_retryable_outbox(
     migrated_db_session: AsyncSession,
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     service = PipelineStageCompletionService(
         migrated_db_session,
-        publisher=RecordingPublisher(),
+        broker=RecordingBroker(),
     )
     meme_file_id = await _seed_pending_pipeline_item(
         migrated_db_session,
@@ -561,34 +604,44 @@ async def test_replay_publish_failure_restores_previous_failed_stage_snapshot(
 
     failing_replay_service = PipelineReplayService(
         migrated_db_session,
-        publisher=RecordingPublisher(fail_with=RuntimeError("republish failed")),
+        broker=RecordingBroker(fail_with=RuntimeError("republish failed")),
     )
 
-    with pytest.raises(PipelinePublishError, match="Replay was reserved"):
-        _ = await failing_replay_service.replay_item(meme_file_id, stage=ContentPipelineStage.TRANSCODE)
+    replay = await failing_replay_service.replay_item(meme_file_id, stage=ContentPipelineStage.TRANSCODE)
 
     async with postgres_session_factory() as session:
-        restored_item = await PipelineItemReadService(session).get_item(meme_file_id)
+        reserved_item = await PipelineItemReadService(session).get_item(meme_file_id)
+        outbox_message = await session.scalar(
+            select(RabbitMQOutboxMessage).where(
+                RabbitMQOutboxMessage.aggregate_id == str(meme_file_id),
+                RabbitMQOutboxMessage.event_type == ContentPipelineEventType.STAGE_REPLAY_REQUESTED.value,
+            )
+        )
 
-    transcode_stage = next(stage for stage in restored_item.stages if stage.stage is ContentPipelineStage.TRANSCODE)
-    assert restored_item.current_stage is ContentPipelineStage.TRANSCODE
-    assert restored_item.current_status is ContentPipelineStageStatus.FAILED
-    assert transcode_stage.attempt_count == 1
-    assert transcode_stage.last_event_id == failed_event_id
-    assert transcode_stage.normalized_reason == "forced_failure"
+    transcode_stage = next(stage for stage in reserved_item.stages if stage.stage is ContentPipelineStage.TRANSCODE)
+    assert reserved_item.current_stage is ContentPipelineStage.TRANSCODE
+    assert reserved_item.current_status is ContentPipelineStageStatus.PENDING
+    assert transcode_stage.attempt_count == 2
+    assert transcode_stage.last_event_id == replay.replay_event_id
+    assert transcode_stage.last_event_id != failed_event_id
+    assert transcode_stage.normalized_reason == "replay_requested"
+    assert outbox_message is not None
+    assert outbox_message.status is RabbitMQOutboxMessageStatus.FAILED
+    assert outbox_message.next_retry_at is not None
+    assert "republish failed" in (outbox_message.last_error_text or "")
 
 
 async def test_complete_embed_stage_without_matches_persists_embedding_and_queues_classify(
     migrated_db_session: AsyncSession,
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    publisher = RecordingPublisher()
+    broker = RecordingBroker()
     meme_file_id, _, service = await _drive_to_embed_pending(
         migrated_db_session,
         source_id="embed-no-match",
         post_id="9001",
         phash_tag="a",
-        publisher=publisher,
+        broker=broker,
     )
     embedding_result = build_voyage_embedding_result(input_hash="1" * 64)
 
@@ -604,8 +657,8 @@ async def test_complete_embed_stage_without_matches_persists_embedding_and_queue
     after_embed = await PipelineItemReadService(migrated_db_session).get_item(meme_file_id)
     assert after_embed.current_stage is ContentPipelineStage.CLASSIFY
     assert after_embed.current_status is ContentPipelineStageStatus.PENDING
-    assert publisher.events[-1].event_type is ContentPipelineEventType.MEME_EMBEDDED
-    assert publisher.events[-1].stage is ContentPipelineStage.CLASSIFY
+    assert broker.events[-1].event_type is ContentPipelineEventType.MEME_EMBEDDED
+    assert broker.events[-1].stage is ContentPipelineStage.CLASSIFY
 
     async with postgres_session_factory() as session:
         persisted_cache_row = await session.scalar(
@@ -662,13 +715,13 @@ async def test_complete_embed_stage_auto_merges_high_similarity_into_older_meme(
     migrated_db_session: AsyncSession,
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    publisher = RecordingPublisher()
+    broker = RecordingBroker()
     older_meme_file_id, older_normalized, older_service = await _drive_to_embed_pending(
         migrated_db_session,
         source_id="merge-older",
         post_id="9100",
         phash_tag="c",
-        publisher=publisher,
+        broker=broker,
         filename="older.png",
     )
     _ = await older_service.complete_embed_stage(
@@ -707,7 +760,7 @@ async def test_complete_embed_stage_auto_merges_high_similarity_into_older_meme(
         source_id="merge-newer",
         post_id="9101",
         phash_tag="d",
-        publisher=publisher,
+        broker=broker,
         filename="newer.png",
     )
 
@@ -851,13 +904,13 @@ async def test_complete_classify_stage_makes_meme_ready_with_truthful_ocr_and_ns
     migrated_db_session: AsyncSession,
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    publisher = RecordingPublisher()
+    broker = RecordingBroker()
     meme_file_id, _, service = await _drive_to_embed_pending(
         migrated_db_session,
         source_id="classify-truth",
         post_id="9300",
         phash_tag="h",
-        publisher=publisher,
+        broker=broker,
     )
     _ = await service.complete_embed_stage(
         meme_file_id=meme_file_id,
@@ -884,7 +937,7 @@ async def test_complete_classify_stage_makes_meme_ready_with_truthful_ocr_and_ns
         ContentPipelineStage.SYNC_MEILI,
     }
     meme_ready_events = [
-        event for event in publisher.events if event.event_type is ContentPipelineEventType.MEME_READY
+        event for event in broker.events if event.event_type is ContentPipelineEventType.MEME_READY
     ]
     assert {event.stage for event in meme_ready_events} == {
         ContentPipelineStage.SYNC_QDRANT,
@@ -1050,7 +1103,7 @@ async def test_complete_classify_stage_follows_primary_file_change_after_merge(
     assert stale_meme is None
 
 
-async def test_complete_embed_stage_publish_failure_marks_classify_failed(
+async def test_complete_embed_stage_publish_failure_leaves_classify_pending_and_retryable_outbox(
     migrated_db_session: AsyncSession,
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -1063,16 +1116,15 @@ async def test_complete_embed_stage_publish_failure_marks_classify_failed(
 
     failing_service = PipelineStageCompletionService(
         migrated_db_session,
-        publisher=RecordingPublisher(fail_with=RuntimeError("broker unavailable")),
+        broker=RecordingBroker(fail_with=RuntimeError("broker unavailable")),
     )
-    with pytest.raises(PipelinePublishError, match="downstream dispatch failed"):
-        _ = await failing_service.complete_embed_stage(
-            meme_file_id=meme_file_id,
-            attempt=1,
-            event_id=uuid.uuid7(),
-            embedding_result=build_voyage_embedding_result(input_hash="a" * 64),
-            similarity_matches=(),
-        )
+    _ = await failing_service.complete_embed_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        embedding_result=build_voyage_embedding_result(input_hash="a" * 64),
+        similarity_matches=(),
+    )
 
     async with postgres_session_factory() as session:
         persisted_rows = (
@@ -1080,11 +1132,21 @@ async def test_complete_embed_stage_publish_failure_marks_classify_failed(
                 select(PipelineStageJournal).where(PipelineStageJournal.meme_file_id == meme_file_id)
             )
         ).scalars().all()
+        outbox_message = await session.scalar(
+            select(RabbitMQOutboxMessage).where(
+                RabbitMQOutboxMessage.aggregate_id == str(meme_file_id),
+                RabbitMQOutboxMessage.event_type == ContentPipelineEventType.MEME_EMBEDDED.value,
+            )
+        )
 
     stage_rows = {row.stage: row for row in persisted_rows}
     assert stage_rows[ContentPipelineStage.EMBED].status is ContentPipelineStageStatus.SUCCEEDED
-    assert stage_rows[ContentPipelineStage.CLASSIFY].status is ContentPipelineStageStatus.FAILED
-    assert stage_rows[ContentPipelineStage.CLASSIFY].normalized_reason == "publish_failed"
+    assert stage_rows[ContentPipelineStage.CLASSIFY].status is ContentPipelineStageStatus.PENDING
+    assert stage_rows[ContentPipelineStage.CLASSIFY].normalized_reason is None
+    assert outbox_message is not None
+    assert outbox_message.status is RabbitMQOutboxMessageStatus.FAILED
+    assert outbox_message.next_retry_at is not None
+    assert "broker unavailable" in (outbox_message.last_error_text or "")
 
 
 async def test_complete_embed_stage_rolls_back_partial_merge_and_keeps_embed_replayable(
@@ -1254,7 +1316,7 @@ async def test_meili_sync_methods_persist_snapshot_and_emit_synced_event(
     async with postgres_session_factory() as replay_session:
         replay_service = PipelineStageCompletionService(
             replay_session,
-            publisher=RecordingPublisher(),
+            broker=RecordingBroker(),
         )
         second = await replay_service.complete_sync_meili_stage(
             meme_file_id=meme_file_id,
@@ -1278,7 +1340,7 @@ async def test_replay_sync_target_rejects_items_without_classify_success(
     )
 
     with pytest.raises(PipelineReplayNotAllowedError, match="cannot replay sync targets"):
-        replay_service = PipelineReplayService(migrated_db_session, publisher=RecordingPublisher())
+        replay_service = PipelineReplayService(migrated_db_session, broker=RecordingBroker())
         _ = await replay_service.replay_sync_target(meme_file_id, SyncTargetKind.QDRANT)
     with pytest.raises(PipelineReplayNotAllowedError, match="cannot replay sync targets"):
         _ = await replay_service.replay_sync_target_batch([meme_file_id], SyncTargetKind.MEILISEARCH)
@@ -1300,7 +1362,7 @@ async def test_replay_sync_target_meili_reserves_independent_dispatch(
 
     accepted = await PipelineReplayService(
         migrated_db_session,
-        publisher=RecordingPublisher(),
+        broker=RecordingBroker(),
     ).replay_sync_target(meme_file_id, SyncTargetKind.MEILISEARCH)
     assert accepted.stage is ContentPipelineStage.SYNC_MEILI
 
@@ -1330,7 +1392,7 @@ async def test_replay_sync_target_batch_refuses_batches_beyond_the_max(
     with pytest.raises(PipelineReplayNotAllowedError, match="exceeds the configured maximum"):
         _ = await PipelineReplayService(
             migrated_db_session,
-            publisher=RecordingPublisher(),
+            broker=RecordingBroker(),
         ).replay_sync_target_batch(oversized_batch, SyncTargetKind.QDRANT)
 
 
@@ -1367,7 +1429,7 @@ async def test_complete_sync_qdrant_stage_persists_snapshot_and_is_idempotent(
     async with postgres_session_factory() as replay_session:
         replay_service = PipelineStageCompletionService(
             replay_session,
-            publisher=RecordingPublisher(),
+            broker=RecordingBroker(),
         )
         second = await replay_service.complete_sync_qdrant_stage(
             meme_file_id=meme_file_id,
@@ -1411,14 +1473,14 @@ async def test_fail_sync_qdrant_stage_preserves_prior_success_timestamps(
     async with postgres_session_factory() as replay_session:
         replay_service = PipelineReplayService(
             replay_session,
-            publisher=RecordingPublisher(),
+            broker=RecordingBroker(),
         )
         accepted = await replay_service.replay_sync_target(meme_file_id, SyncTargetKind.QDRANT)
 
     async with postgres_session_factory() as fail_session:
         fail_service = PipelineStageCompletionService(
             fail_session,
-            publisher=RecordingPublisher(),
+            broker=RecordingBroker(),
         )
         failure = await fail_service.fail_sync_qdrant_stage(
             meme_file_id=meme_file_id,
@@ -1473,7 +1535,7 @@ async def test_replay_sync_target_qdrant_leaves_meili_row_untouched(
 
     accepted = await PipelineReplayService(
         migrated_db_session,
-        publisher=RecordingPublisher(),
+        broker=RecordingBroker(),
     ).replay_sync_target(meme_file_id, SyncTargetKind.QDRANT)
     assert accepted.stage is ContentPipelineStage.SYNC_QDRANT
 
@@ -1586,14 +1648,14 @@ async def test_fail_sync_meili_stage_preserves_prior_success_timestamps(
     async with postgres_session_factory() as replay_session:
         replay_service = PipelineReplayService(
             replay_session,
-            publisher=RecordingPublisher(),
+            broker=RecordingBroker(),
         )
         accepted = await replay_service.replay_sync_target(meme_file_id, SyncTargetKind.MEILISEARCH)
 
     async with postgres_session_factory() as fail_session:
         fail_service = PipelineStageCompletionService(
             fail_session,
-            publisher=RecordingPublisher(),
+            broker=RecordingBroker(),
         )
         failure = await fail_service.fail_sync_meili_stage(
             meme_file_id=meme_file_id,
@@ -1648,7 +1710,7 @@ async def test_replay_sync_target_meili_leaves_qdrant_row_byte_identical(
     async with postgres_session_factory() as replay_session:
         replay_service = PipelineReplayService(
             replay_session,
-            publisher=RecordingPublisher(),
+            broker=RecordingBroker(),
         )
         accepted = await replay_service.replay_sync_target(meme_file_id, SyncTargetKind.MEILISEARCH)
     assert accepted.stage is ContentPipelineStage.SYNC_MEILI
@@ -1699,7 +1761,7 @@ async def test_replay_sync_target_qdrant_leaves_meili_row_byte_identical(
     async with postgres_session_factory() as replay_session:
         replay_service = PipelineReplayService(
             replay_session,
-            publisher=RecordingPublisher(),
+            broker=RecordingBroker(),
         )
         accepted = await replay_service.replay_sync_target(meme_file_id, SyncTargetKind.QDRANT)
     assert accepted.stage is ContentPipelineStage.SYNC_QDRANT
@@ -1733,7 +1795,7 @@ async def test_replay_sync_target_batch_meili_cap_enforced(
     with pytest.raises(PipelineReplayNotAllowedError, match="exceeds the configured maximum"):
         _ = await PipelineReplayService(
             migrated_db_session,
-            publisher=RecordingPublisher(),
+            broker=RecordingBroker(),
         ).replay_sync_target_batch(oversized_batch, SyncTargetKind.MEILISEARCH)
 
 

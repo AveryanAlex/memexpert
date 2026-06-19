@@ -3,14 +3,20 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Self
 
-from memexpert.core.broker import ensure_pipeline_broker_started, get_pipeline_broker_settings
+from memexpert.core.broker import get_pipeline_broker_settings
 from memexpert.core.config import Settings
+from memexpert.messaging.rabbitmq_outbox import (
+    RabbitBrokerProtocol,
+    RabbitMessageSpec,
+    RabbitPublisher,
+    relay_rabbitmq_outbox_messages_best_effort,
+)
 from memexpert.models.content import PipelineStageJournal
 from memexpert.models.enums import (
     ContentPipelineStage,
@@ -18,6 +24,7 @@ from memexpert.models.enums import (
     ContentSourceKind,
 )
 from memexpert.pipeline import constants as _consts
+from memexpert.pipeline.events import PIPELINE_MEME_FILE_AGGREGATE_TYPE
 from memexpert.pipeline.state import PipelineDatabaseService
 from memexpert.schemas.content_pipeline import ContentPipelineDispatchEvent, ContentPipelineEventType
 
@@ -27,8 +34,7 @@ if TYPE_CHECKING:
     from memexpert.core.broker import PipelineBrokerSettings
     from memexpert.models.content import MemeFile
 
-
-DispatchEventPublisher = Callable[[ContentPipelineDispatchEvent], Awaitable[None]]
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,11 +65,12 @@ class PipelineDispatchingService(PipelineDatabaseService):
         session: AsyncSession,
         *,
         settings: Settings | None = None,
-        publisher: DispatchEventPublisher | None = None,
+        broker: RabbitBrokerProtocol | None = None,
     ) -> None:
         super().__init__(session, settings=settings)
         self._broker_settings = get_pipeline_broker_settings(self._settings)
-        self._publisher = publisher or self._publish_dispatch_event
+        self._broker = broker
+        self._rabbit_publisher = RabbitPublisher(broker=broker, settings=self._settings)
 
     @classmethod
     def from_settings(
@@ -71,29 +78,50 @@ class PipelineDispatchingService(PipelineDatabaseService):
         session: AsyncSession,
         *,
         settings: Settings | None = None,
-        publisher: DispatchEventPublisher | None = None,
+        broker: RabbitBrokerProtocol | None = None,
     ) -> Self:
         """Build the dispatching service from shared runtime settings."""
 
         return cls(
             session,
             settings=settings,
-            publisher=publisher,
+            broker=broker,
         )
 
-    async def _publish_dispatch_event(self, event: ContentPipelineDispatchEvent) -> None:
-        broker = await ensure_pipeline_broker_started(settings=self._settings)
-        payload = event.model_dump(mode="json")
-        _ = await broker.publish(
-            payload,
-            exchange=self._broker_settings.exchange,
-            routing_key=resolve_routing_key_for_event(event, broker_settings=self._broker_settings),
-            persist=True,
-            content_type="application/json",
-            message_id=str(event.event_id),
-            timestamp=event.created_at,
-            mandatory=True,
+    async def _enqueue_dispatch_event(self, event: ContentPipelineDispatchEvent) -> uuid.UUID:
+        return await self._rabbit_publisher.publish(
+            build_pipeline_dispatch_message_spec(event, broker_settings=self._broker_settings),
+            session=self._session,
         )
+
+    async def _relay_outbox_messages_after_commit(self, message_ids: tuple[uuid.UUID, ...]) -> None:
+        _ = await relay_rabbitmq_outbox_messages_best_effort(
+            self._session,
+            message_ids,
+            settings=self._settings,
+            broker=self._broker,
+            logger=logger,
+        )
+
+
+def build_pipeline_dispatch_message_spec(
+    event: ContentPipelineDispatchEvent,
+    *,
+    broker_settings: PipelineBrokerSettings,
+) -> RabbitMessageSpec:
+    """Build the generic RabbitMQ outbox spec for one pipeline dispatch event."""
+
+    return RabbitMessageSpec(
+        exchange=broker_settings.exchange,
+        routing_key=resolve_routing_key_for_event(event, broker_settings=broker_settings),
+        payload=event.model_dump(mode="json"),
+        message_id=str(event.event_id),
+        event_type=event.event_type.value,
+        aggregate_type=PIPELINE_MEME_FILE_AGGREGATE_TYPE,
+        aggregate_id=event.meme_file_id,
+        ordering_key=str(event.meme_file_id),
+        created_at=event.created_at,
+    )
 
 
 def resolve_routing_key_for_event(
@@ -208,10 +236,10 @@ def _build_downstream_dispatch(
 
 
 __all__ = [
-    "DispatchEventPublisher",
     "DownstreamStageDispatch",
     "PipelineDispatchingService",
     "PipelineStageWorkContext",
+    "build_pipeline_dispatch_message_spec",
     "prepare_downstream_dispatches",
     "resolve_routing_key_for_event",
 ]

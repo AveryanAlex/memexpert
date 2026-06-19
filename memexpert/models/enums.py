@@ -185,8 +185,8 @@ class PipelineIngestRequestStatus(StrEnum):
     PUBLISH_FAILED = "publish_failed"
 
 
-class PipelineOutboxEventStatus(StrEnum):
-    """Lifecycle states for transactional pipeline outbox events."""
+class RabbitMQOutboxMessageStatus(StrEnum):
+    """Lifecycle states for durable RabbitMQ outbox messages."""
 
     PENDING = "pending"
     PUBLISHING = "publishing"
