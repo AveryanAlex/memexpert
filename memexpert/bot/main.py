@@ -14,6 +14,7 @@ from memexpert.bot.private_library import (
     build_private_library_router,
 )
 from memexpert.bot.private_retention import build_private_retention_router
+from memexpert.bot.private_search import build_private_search_router
 from memexpert.bot.private_upload import (
     CollectionServiceFactory,
     PrivateUploadAcceptServiceFactory,
@@ -66,6 +67,13 @@ def build_dispatcher(
             session_factory=session_factory,
             meme_search_service_factory=meme_search_service_factory,
             inline_media_url_provider=inline_media_url_provider,
+        )
+    )
+    _ = dispatcher.include_router(
+        build_private_search_router(
+            settings=resolved_settings,
+            session_factory=session_factory,
+            meme_search_service_factory=meme_search_service_factory,
         )
     )
     _ = dispatcher.include_router(

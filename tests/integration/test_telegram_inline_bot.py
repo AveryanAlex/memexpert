@@ -25,11 +25,13 @@ from memexpert.bot import inline as inline_module
 from memexpert.bot.inline import S3PresignedInlineMediaUrlProvider
 from memexpert.bot.main import build_bot, build_dispatcher
 from memexpert.core.config import Settings
-from memexpert.models.collection import CollectionMeme, PinnedMeme
+from memexpert.models.collection import Collection, CollectionMember, CollectionMeme, PinnedMeme
 from memexpert.models.content import Meme, MemeFile, TelegramFileIdCache
 from memexpert.models.enums import (
     AccountStatus,
+    AccountType,
     AnalyticsEventType,
+    CollectionMembershipRole,
     ContentKind,
     ContentLanguage,
     TelegramMediaFormat,
@@ -44,7 +46,7 @@ from memexpert.schemas.meme import (
     MemeSearchScoreRead,
 )
 from memexpert.services import UserService
-from memexpert.services.meme_search import MemeSearchFilters, MemeSearchScope
+from memexpert.services.meme_search import MemeSearchFilters, MemeSearchScope, MemeSearchService
 from tests.conftest import create_full_user_via_upgrade
 
 if TYPE_CHECKING:
@@ -188,6 +190,8 @@ async def create_meme_file(
     *,
     media_type: ContentKind,
     mime_type: str,
+    is_public: bool = True,
+    author_user_id: uuid.UUID | None = None,
     s3_original_key: str | None = None,
 ) -> tuple[Meme, MemeFile]:
     meme_id = uuid.uuid7()
@@ -199,6 +203,8 @@ async def create_meme_file(
         language=ContentLanguage.EN,
         tags=[media_type.value],
         popularity_score=42.0,
+        is_public=is_public,
+        author_user_id=author_user_id,
     )
     file = MemeFile(
         id=file_id,
@@ -299,6 +305,7 @@ async def dispatch_inline_query(
     dispatcher: Dispatcher,
     bot: Bot,
     query: str,
+    telegram_user_id: int = TELEGRAM_ID,
     offset: str = "",
     update_id: int = 1,
 ) -> None:
@@ -309,7 +316,7 @@ async def dispatch_inline_query(
             "inline_query": {
                 "id": f"inline-{update_id}",
                 "from": {
-                    "id": TELEGRAM_ID,
+                    "id": telegram_user_id,
                     "is_bot": False,
                     "first_name": "Inline",
                     "username": "inline_user",
@@ -411,19 +418,8 @@ async def test_inline_plain_text_query_calls_shared_search_service_and_records_q
     finally:
         await bot.session.close()
 
-    assert fake_service.calls == [
-        {
-            "query": "grumpy cat",
-            "viewer_user_id": None,
-            "scope": MemeSearchScope.PUBLIC,
-            "include_nsfw": False,
-            "limit": 20,
-            "offset": 0,
-            "surface": "telegram_inline_search",
-        }
-    ]
     answer = last_inline_answer(telegram_session)
-    assert answer.is_personal is False
+    assert answer.is_personal is True
     assert answer.next_offset == ""
     assert len(answer.results) == 1
     result = answer.results[0]
@@ -435,6 +431,7 @@ async def test_inline_plain_text_query_calls_shared_search_service_and_records_q
     assert [button.text for button in result.reply_markup.inline_keyboard[0]] == ["Favorite", "Save", "Pin"]
 
     async with postgres_session_factory() as session:
+        created_user = await session.scalar(select(User).where(User.telegram_id == TELEGRAM_ID))
         inline_event = await session.scalar(
             select(AnalyticsEvent).where(AnalyticsEvent.event_type == AnalyticsEventType.INLINE_QUERY)
         )
@@ -442,7 +439,23 @@ async def test_inline_plain_text_query_calls_shared_search_service_and_records_q
             select(AnalyticsEvent).where(AnalyticsEvent.event_type == AnalyticsEventType.INLINE_SERVED)
         )
         inline_usage_events = await session.scalar(select(func.count()).select_from(InlineUsageEvent))
+    assert created_user is not None
+    assert created_user.account_type is AccountType.FULL
+    assert created_user.status is AccountStatus.ACTIVE
+    assert created_user.nsfw_enabled is False
+    assert fake_service.calls == [
+        {
+            "query": "grumpy cat",
+            "viewer_user_id": created_user.id,
+            "scope": MemeSearchScope.ALL,
+            "include_nsfw": False,
+            "limit": 20,
+            "offset": 0,
+            "surface": "telegram_inline_search",
+        }
+    ]
     assert inline_event is not None
+    assert inline_event.user_id == created_user.id
     inline_properties = _analytics_properties(inline_event)
     assert inline_event.payload["surface"] == "telegram_inline"
     assert inline_event.payload["query"] == "grumpy cat"
@@ -456,6 +469,7 @@ async def test_inline_plain_text_query_calls_shared_search_service_and_records_q
     )
     assert "telegram_user_id" not in inline_properties
     assert served_event is not None
+    assert served_event.user_id == created_user.id
     served_properties = _analytics_properties(served_event)
     served_refs = _analytics_refs(served_event)
     assert served_event.payload["surface"] == "telegram_inline_search"
@@ -465,7 +479,7 @@ async def test_inline_plain_text_query_calls_shared_search_service_and_records_q
     assert served_event.payload["source_algorithm"] == "hybrid_search"
     assert served_event.payload["rank"] == 1
     assert served_properties["media_format"] == "photo"
-    assert served_properties["is_personal"] is False
+    assert served_properties["is_personal"] is True
     assert inline_usage_events == 0
 
 
@@ -516,6 +530,121 @@ async def test_inline_plain_text_query_uses_linked_full_user_scope_and_nsfw_pref
         }
     ]
     assert last_inline_answer(telegram_session).is_personal is True
+
+
+@pytest.mark.asyncio
+async def test_inline_plain_text_query_shows_private_and_shared_memes_only_to_authorized_user(
+    migrated_db_session: AsyncSession,
+    postgres_async_url: str,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    viewer = User(telegram_id=TELEGRAM_ID)
+    stranger = User(email="inline-bot-stranger@example.com")
+    migrated_db_session.add_all([viewer, stranger])
+    await migrated_db_session.flush()
+    public_meme, public_file = await create_meme_file(
+        migrated_db_session,
+        media_type=ContentKind.IMAGE,
+        mime_type="image/jpeg",
+    )
+    authored_private, authored_file = await create_meme_file(
+        migrated_db_session,
+        media_type=ContentKind.IMAGE,
+        mime_type="image/jpeg",
+        is_public=False,
+        author_user_id=viewer.id,
+    )
+    shared_private, shared_file = await create_meme_file(
+        migrated_db_session,
+        media_type=ContentKind.IMAGE,
+        mime_type="image/jpeg",
+        is_public=False,
+        author_user_id=stranger.id,
+    )
+    unauthorized_private, unauthorized_file = await create_meme_file(
+        migrated_db_session,
+        media_type=ContentKind.IMAGE,
+        mime_type="image/jpeg",
+        is_public=False,
+        author_user_id=stranger.id,
+    )
+    authored_private.popularity_score = 30.0
+    shared_private.popularity_score = 20.0
+    public_meme.popularity_score = 10.0
+    unauthorized_private.popularity_score = 100.0
+    shared_collection = Collection(owner_id=stranger.id, title="Inline bot shared search")
+    unauthorized_collection = Collection(owner_id=stranger.id, title="Inline bot unauthorized search")
+    migrated_db_session.add_all([shared_collection, unauthorized_collection])
+    await migrated_db_session.flush()
+    migrated_db_session.add_all(
+        [
+            CollectionMember(
+                collection_id=shared_collection.id,
+                user_id=viewer.id,
+                role=CollectionMembershipRole.VIEWER,
+            ),
+            CollectionMeme(collection_id=shared_collection.id, meme_id=shared_private.id, added_by_user_id=stranger.id),
+            CollectionMeme(
+                collection_id=unauthorized_collection.id,
+                meme_id=unauthorized_private.id,
+                added_by_user_id=stranger.id,
+            ),
+        ]
+    )
+    for file, cached_id in [
+        (authored_file, "cached-inline-bot-authored"),
+        (shared_file, "cached-inline-bot-shared"),
+        (public_file, "cached-inline-bot-public"),
+        (unauthorized_file, "cached-inline-bot-unauthorized"),
+    ]:
+        await add_file_id_cache(
+            migrated_db_session,
+            file=file,
+            media_format=TelegramMediaFormat.PHOTO,
+            telegram_file_id=cached_id,
+        )
+    await migrated_db_session.commit()
+
+    telegram_session = RecordingTelegramSession()
+    bot = build_bot(build_bot_settings(postgres_async_url), session=telegram_session)
+    dispatcher = build_dispatcher(
+        settings=build_bot_settings(postgres_async_url),
+        session_factory=postgres_session_factory,
+        meme_search_service_factory=lambda session: MemeSearchService(session),
+    )
+
+    try:
+        await dispatch_inline_query(dispatcher=dispatcher, bot=bot, query="private", update_id=101)
+        authorized_answer = last_inline_answer(telegram_session)
+        await dispatch_inline_query(
+            dispatcher=dispatcher,
+            bot=bot,
+            query="private",
+            telegram_user_id=TELEGRAM_ID + 1,
+            update_id=102,
+        )
+        unauthorized_answer = last_inline_answer(telegram_session)
+    finally:
+        await bot.session.close()
+
+    assert authorized_answer.is_personal is True
+    authorized_file_ids = [
+        result.photo_file_id
+        for result in authorized_answer.results
+        if isinstance(result, InlineQueryResultCachedPhoto)
+    ]
+    assert authorized_file_ids == [
+        "cached-inline-bot-authored",
+        "cached-inline-bot-shared",
+        "cached-inline-bot-public",
+    ]
+    assert unauthorized_answer.is_personal is True
+    unauthorized_file_ids = [
+        result.photo_file_id
+        for result in unauthorized_answer.results
+        if isinstance(result, InlineQueryResultCachedPhoto)
+    ]
+    assert unauthorized_file_ids == ["cached-inline-bot-public"]
 
 
 @pytest.mark.asyncio
@@ -603,18 +732,24 @@ async def test_inline_pagination_uses_offset_and_next_offset(
     finally:
         await bot.session.close()
 
+    async with postgres_session_factory() as session:
+        created_user = await session.scalar(select(User).where(User.telegram_id == TELEGRAM_ID))
+
+    assert created_user is not None
     assert fake_service.calls == [
         {
             "query": "cats",
-            "viewer_user_id": None,
-            "scope": MemeSearchScope.PUBLIC,
+            "viewer_user_id": created_user.id,
+            "scope": MemeSearchScope.ALL,
             "include_nsfw": False,
             "limit": 20,
             "offset": 20,
             "surface": "telegram_inline_search",
         }
     ]
-    assert last_inline_answer(telegram_session).next_offset == "40"
+    answer = last_inline_answer(telegram_session)
+    assert answer.is_personal is True
+    assert answer.next_offset == "40"
 
 
 @pytest.mark.asyncio
@@ -1247,7 +1382,7 @@ async def test_inline_empty_query_treats_ineligible_linked_users_as_guests(
 
 
 @pytest.mark.asyncio
-async def test_inline_empty_query_for_guest_returns_popular_public_memes_non_personal(
+async def test_inline_empty_query_for_new_user_returns_popular_public_memes_personal(
     migrated_db_session: AsyncSession,
     postgres_async_url: str,
     postgres_session_factory: async_sessionmaker[AsyncSession],
@@ -1293,8 +1428,15 @@ async def test_inline_empty_query_for_guest_returns_popular_public_memes_non_per
         await bot.session.close()
 
     assert fake_service.calls == []
+    async with postgres_session_factory() as session:
+        created_user = await session.scalar(select(User).where(User.telegram_id == TELEGRAM_ID))
+
+    assert created_user is not None
+    assert created_user.account_type is AccountType.FULL
+    assert created_user.status is AccountStatus.ACTIVE
+    assert created_user.nsfw_enabled is False
     answer = last_inline_answer(telegram_session)
-    assert answer.is_personal is False
+    assert answer.is_personal is True
     assert len(answer.results) == 2
     first_result = answer.results[0]
     assert isinstance(first_result, InlineQueryResultCachedPhoto)
@@ -1394,6 +1536,47 @@ async def test_chosen_inline_result_records_linked_telegram_user(
         )
     assert event is not None
     assert event.user_id == linked_user.id
+
+
+@pytest.mark.asyncio
+async def test_chosen_inline_result_after_inline_auto_create_records_created_user(
+    migrated_db_session: AsyncSession,
+    postgres_async_url: str,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    meme, file = await create_meme_file(migrated_db_session, media_type=ContentKind.IMAGE, mime_type="image/jpeg")
+    await add_file_id_cache(
+        migrated_db_session,
+        file=file,
+        media_format=TelegramMediaFormat.PHOTO,
+        telegram_file_id="cached-auto-created-chosen-photo-id",
+    )
+    await migrated_db_session.commit()
+
+    fake_service = FakeMemeSearchService(search_page_for([(meme, file)]))
+    telegram_session = RecordingTelegramSession()
+    bot = build_bot(build_bot_settings(postgres_async_url), session=telegram_session)
+    dispatcher = build_dispatcher(
+        settings=build_bot_settings(postgres_async_url),
+        session_factory=postgres_session_factory,
+        meme_search_service_factory=lambda session: fake_service,
+    )
+
+    try:
+        await dispatch_inline_query(dispatcher=dispatcher, bot=bot, query="cats")
+        answer = last_inline_answer(telegram_session)
+        await dispatch_chosen_inline_result(dispatcher=dispatcher, bot=bot, result_id=answer.results[0].id)
+    finally:
+        await bot.session.close()
+
+    async with postgres_session_factory() as session:
+        created_user = await session.scalar(select(User).where(User.telegram_id == TELEGRAM_ID))
+        event = await session.scalar(
+            select(AnalyticsEvent).where(AnalyticsEvent.event_type == AnalyticsEventType.MEME_SEND)
+        )
+    assert created_user is not None
+    assert event is not None
+    assert event.user_id == created_user.id
 
 
 @pytest.mark.asyncio

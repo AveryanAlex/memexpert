@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from memexpert.models.collection import PinnedMeme
 from memexpert.models.content import Meme, MemeFile, TelegramFileIdCache
-from memexpert.models.enums import AccountStatus, AccountType, AnalyticsEventType, ContentKind, TelegramMediaFormat
+from memexpert.models.enums import AnalyticsEventType, ContentKind, TelegramMediaFormat
 from memexpert.models.user import AnalyticsEvent, User
 from memexpert.schemas.meme import MemeResultAttributionRead, new_discovery_request_id
 from memexpert.services.meme_search import (
@@ -25,6 +25,7 @@ from memexpert.services.meme_search import (
     _search_scope_meme_stmt,
     _to_card_read,
 )
+from memexpert.services.telegram_accounts import resolve_or_create_active_telegram_user
 
 if TYPE_CHECKING:
     from memexpert.schemas.meme import MemeCardRead, MemeFileRead, MemeSearchPageRead, MemeSearchResultRead
@@ -146,7 +147,11 @@ class TelegramInlineService:
 
         resolved_limit = _clamp_limit(limit)
         resolved_offset = max(0, offset)
-        linked_user = await self._resolve_active_linked_user(telegram_user_id=telegram_user_id)
+        account_resolution = await resolve_or_create_active_telegram_user(
+            self._session,
+            telegram_user_id=telegram_user_id,
+        )
+        linked_user = account_resolution.user if account_resolution.is_active else None
         normalized_query = query.strip()
 
         if normalized_query:
@@ -284,16 +289,6 @@ class TelegramInlineService:
             is_personal=is_personal,
             request_id=request_id,
         )
-
-    async def _resolve_active_linked_user(self, *, telegram_user_id: int) -> User | None:
-        user: User | None = await self._session.scalar(
-            select(User).where(
-                User.telegram_id == telegram_user_id,
-                User.account_type == AccountType.FULL,
-                User.status == AccountStatus.ACTIVE,
-            )
-        )
-        return user
 
     async def _load_pinned_memes(self, user: User) -> list[Meme]:
         stmt = (
