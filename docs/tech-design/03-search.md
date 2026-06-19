@@ -175,7 +175,11 @@ Recommendation service builds a short-term user preference vector/candidate requ
 - medium positives: detail view, repeated view, collection add
 - weak/neutral signals: impression without click, later used for evaluation/reranking
 
-The service calls Qdrant recommend/search APIs using recent positive examples, filters access/NSFW, excludes already-seen or recently-impressed memes where practical, and falls back to trending for cold start.
+The service calls the shared `MemeSearchService.recommendation_candidates(...)` path, which returns the generic `MemeSearchPageRead` discovery DTO rather than a home-feed-specific shape. It loads recent positive meme embeddings from PostgreSQL `EmbeddingCache`, computes a weighted centroid/preference vector, and asks the existing Qdrant user-search adapter for a bounded candidate pool. Qdrant/index payload filters are a conservative prefilter only; PostgreSQL access, collection scope, and NSFW filters remain the final authority before returning candidates.
+
+Positive signal weights, positive-signal lookback, recent-impression lookback, positive row cap, and Qdrant candidate cap are `Settings` fields. They are tunable algorithm inputs for iteration, not final product truth. Current conservative defaults treat likes/pins as strongest, saves/favorites as strong, Telegram sends/inline selections as medium-strong, collection adds/downloads as medium, and views/detail clicks as weaker positives.
+
+Data-volume and performance assumptions for this stage are intentionally bounded: load only recent/capped positive analytics and durable rows, load only primary image embeddings for those source memes, request only a capped Qdrant candidate pool, then perform final DB filtering/deduplication in PostgreSQL. Source positive memes and recent impression memes are excluded where practical. Cold start, missing embeddings, missing Qdrant client, Qdrant failure, or an empty DB-filtered candidate set falls back to trending/popular candidates with attribution reason metadata.
 
 Personalized recommendations are used:
 

@@ -66,8 +66,9 @@ class FakeTextSearchClient:
 
 
 class FakeSemanticSearchClient:
-    def __init__(self, hits: tuple[QdrantUserSearchMatch, ...]) -> None:
+    def __init__(self, hits: tuple[QdrantUserSearchMatch, ...], *, failure: Exception | None = None) -> None:
         self._hits = hits
+        self._failure = failure
         self.calls: list[dict[str, Any]] = []
 
     async def search_memes_by_vector(
@@ -78,6 +79,8 @@ class FakeSemanticSearchClient:
         prefilter: SearchIndexPrefilter | None = None,
     ) -> tuple[QdrantUserSearchMatch, ...]:
         self.calls.append({"query_vector": query_vector, "limit": limit, "prefilter": prefilter})
+        if self._failure is not None:
+            raise self._failure
         return self._hits[:limit]
 
 
@@ -853,6 +856,318 @@ async def test_public_similar_memes_filters_nsfw_unless_allowed(
     assert [item.meme.id for item in nsfw_page.items] == [nsfw_match.id, safe_match.id]
     assert safe_page.items[0].attribution.source_algorithm == "qdrant_similarity"
     assert nsfw_page.items[0].meme.is_nsfw is True
+
+
+async def test_recommendation_candidates_build_weighted_centroid_from_positive_signals(
+    migrated_db_session: AsyncSession,
+) -> None:
+    viewer = build_full_user()
+    migrated_db_session.add(viewer)
+    await migrated_db_session.flush()
+    source_like = await _create_meme(migrated_db_session, popularity_score=1.0)
+    source_pin = await _create_meme(migrated_db_session, popularity_score=1.0)
+    source_collection = await _create_meme(migrated_db_session, popularity_score=1.0)
+    first_candidate = await _create_meme(migrated_db_session, popularity_score=10.0)
+    second_candidate = await _create_meme(migrated_db_session, popularity_score=10.0)
+    collection = await _create_collection(
+        migrated_db_session,
+        owner=viewer,
+        title="Recommendation sources",
+        memes=[source_collection],
+    )
+    migrated_db_session.add(PinnedMeme(user_id=viewer.id, meme_id=source_pin.id, position=1))
+    migrated_db_session.add_all(
+        [
+            AnalyticsEvent(
+                user_id=viewer.id,
+                event_type=AnalyticsEventType.MEME_LIKE,
+                payload={"refs": {"meme_id": str(source_like.id)}},
+            ),
+            AnalyticsEvent(
+                user_id=viewer.id,
+                event_type=AnalyticsEventType.COLLECTION_ACTION,
+                payload={
+                    "refs": {"collection_id": str(collection.id), "meme_id": str(source_collection.id)},
+                    "properties": {"action": "add"},
+                },
+            ),
+        ]
+    )
+    await _add_image_embedding(migrated_db_session, source_like, (1.0, 0.0))
+    await _add_image_embedding(migrated_db_session, source_pin, (0.0, 1.0))
+    await _add_image_embedding(migrated_db_session, source_collection, (0.0, 1.0))
+    await migrated_db_session.commit()
+    semantic_client = FakeSemanticSearchClient(
+        (
+            QdrantUserSearchMatch(
+                meme_file_id=_primary_file_id(source_like),
+                meme_id=source_like.id,
+                semantic_score=0.99,
+            ),
+            QdrantUserSearchMatch(
+                meme_file_id=_primary_file_id(first_candidate),
+                meme_id=first_candidate.id,
+                semantic_score=0.9,
+            ),
+            QdrantUserSearchMatch(
+                meme_file_id=_primary_file_id(second_candidate),
+                meme_id=second_candidate.id,
+                semantic_score=0.8,
+            ),
+        )
+    )
+    service = MemeSearchService(
+        migrated_db_session,
+        semantic_client=semantic_client,
+        settings=Settings.model_validate(
+            {
+                "pipeline_voyage_output_dimensions": 2,
+                "recommendation_qdrant_candidate_limit": 7,
+                "recommendation_signal_like_weight": 6.0,
+                "recommendation_signal_durable_pin_weight": 3.0,
+                "recommendation_signal_durable_collection_weight": 1.0,
+                "recommendation_signal_collection_add_weight": 2.0,
+            }
+        ),
+    )
+
+    page = await service.recommendation_candidates(
+        viewer_user_id=viewer.id,
+        limit=2,
+        surface="test_recommendations",
+    )
+
+    assert [item.meme.id for item in page.items] == [first_candidate.id, second_candidate.id]
+    assert len(semantic_client.calls) == 1
+    assert semantic_client.calls[0]["query_vector"] == pytest.approx((0.5, 0.5))
+    assert semantic_client.calls[0]["limit"] == 7
+    assert semantic_client.calls[0]["prefilter"] == _expected_prefilter(
+        scope=SearchIndexPrefilterScope.ALL,
+        viewer_user_id=viewer.id,
+    )
+    first_attribution = page.items[0].attribution
+    assert first_attribution.source_algorithm == "personalized_recommendations"
+    assert first_attribution.surface == "test_recommendations"
+    assert first_attribution.reason == "qdrant_preference_vector"
+    assert first_attribution.algorithm_version is not None
+    assert first_attribution.algorithm_version.endswith("personalized_v1")
+    assert first_attribution.score_components["positive_source_count"] == 3.0
+    assert source_like.id not in {item.meme.id for item in page.items}
+
+
+async def test_recommendation_candidates_cold_start_falls_back_to_trending(
+    migrated_db_session: AsyncSession,
+) -> None:
+    viewer = build_full_user()
+    migrated_db_session.add(viewer)
+    await migrated_db_session.flush()
+    first = await _create_meme(migrated_db_session, popularity_score=30.0)
+    second = await _create_meme(migrated_db_session, popularity_score=10.0)
+    await migrated_db_session.commit()
+    service = MemeSearchService(migrated_db_session)
+
+    page = await service.recommendation_candidates(viewer_user_id=viewer.id, limit=2)
+
+    assert [item.meme.id for item in page.items] == [first.id, second.id]
+    assert {item.attribution.source_algorithm for item in page.items} == {"fallback_trending"}
+    assert {item.attribution.reason for item in page.items} == {"cold_start_no_positive_signals"}
+
+
+async def test_recommendation_candidates_qdrant_failure_falls_back_to_trending(
+    migrated_db_session: AsyncSession,
+) -> None:
+    viewer = build_full_user()
+    migrated_db_session.add(viewer)
+    await migrated_db_session.flush()
+    source = await _create_meme(migrated_db_session, popularity_score=1.0)
+    fallback = await _create_meme(migrated_db_session, popularity_score=100.0)
+    migrated_db_session.add(
+        AnalyticsEvent(
+            user_id=viewer.id,
+            event_type=AnalyticsEventType.MEME_LIKE,
+            payload={"refs": {"meme_id": str(source.id)}},
+        )
+    )
+    await _add_image_embedding(migrated_db_session, source, (1.0, 0.0))
+    await migrated_db_session.commit()
+    semantic_client = FakeSemanticSearchClient((), failure=RuntimeError("qdrant unavailable secret"))
+    service = MemeSearchService(
+        migrated_db_session,
+        semantic_client=semantic_client,
+        settings=Settings.model_validate({"pipeline_voyage_output_dimensions": 2}),
+    )
+
+    page = await service.recommendation_candidates(viewer_user_id=viewer.id, limit=1)
+
+    assert [item.meme.id for item in page.items] == [fallback.id]
+    assert page.items[0].attribution.source_algorithm == "fallback_trending"
+    assert page.items[0].attribution.reason == "qdrant_failure"
+    assert len(semantic_client.calls) == 1
+    assert semantic_client.calls[0]["query_vector"] == pytest.approx((1.0, 0.0))
+
+
+async def test_recommendation_candidates_postgres_filters_qdrant_private_candidates(
+    migrated_db_session: AsyncSession,
+) -> None:
+    viewer = build_full_user()
+    stranger = build_full_user()
+    migrated_db_session.add_all([viewer, stranger])
+    await migrated_db_session.flush()
+    source = await _create_meme(migrated_db_session, popularity_score=1.0)
+    visible_match = await _create_meme(migrated_db_session, popularity_score=10.0)
+    hidden_match = await _create_meme(
+        migrated_db_session,
+        is_public=False,
+        author_user_id=stranger.id,
+        popularity_score=100.0,
+        s3_original_key="pipeline/originals/private/recommendation-hidden.jpg",
+    )
+    migrated_db_session.add(
+        AnalyticsEvent(
+            user_id=viewer.id,
+            event_type=AnalyticsEventType.MEME_LIKE,
+            payload={"refs": {"meme_id": str(source.id)}},
+        )
+    )
+    await _add_image_embedding(migrated_db_session, source, (1.0, 0.0))
+    await migrated_db_session.commit()
+    service = MemeSearchService(
+        migrated_db_session,
+        semantic_client=FakeSemanticSearchClient(
+            (
+                QdrantUserSearchMatch(
+                    meme_file_id=_primary_file_id(hidden_match),
+                    meme_id=hidden_match.id,
+                    semantic_score=0.99,
+                ),
+                QdrantUserSearchMatch(
+                    meme_file_id=_primary_file_id(visible_match),
+                    meme_id=visible_match.id,
+                    semantic_score=0.9,
+                ),
+            )
+        ),
+        settings=Settings.model_validate({"pipeline_voyage_output_dimensions": 2}),
+    )
+
+    page = await service.recommendation_candidates(viewer_user_id=viewer.id, limit=10)
+
+    assert [item.meme.id for item in page.items] == [visible_match.id]
+    serialized = page.model_dump_json()
+    assert str(hidden_match.id) not in serialized
+    assert "recommendation-hidden.jpg" not in serialized
+
+
+async def test_recommendation_candidates_filters_nsfw_unless_allowed(
+    migrated_db_session: AsyncSession,
+) -> None:
+    viewer = build_full_user()
+    migrated_db_session.add(viewer)
+    await migrated_db_session.flush()
+    source = await _create_meme(migrated_db_session, popularity_score=1.0)
+    safe_match = await _create_meme(migrated_db_session, popularity_score=10.0)
+    nsfw_match = await _create_meme(migrated_db_session, is_nsfw=True, popularity_score=10.0)
+    migrated_db_session.add(
+        AnalyticsEvent(
+            user_id=viewer.id,
+            event_type=AnalyticsEventType.MEME_LIKE,
+            payload={"refs": {"meme_id": str(source.id)}},
+        )
+    )
+    await _add_image_embedding(migrated_db_session, source, (1.0, 0.0))
+    await migrated_db_session.commit()
+    semantic_client = FakeSemanticSearchClient(
+        (
+            QdrantUserSearchMatch(
+                meme_file_id=_primary_file_id(nsfw_match),
+                meme_id=nsfw_match.id,
+                semantic_score=0.95,
+            ),
+            QdrantUserSearchMatch(
+                meme_file_id=_primary_file_id(safe_match),
+                meme_id=safe_match.id,
+                semantic_score=0.8,
+            ),
+        )
+    )
+    service = MemeSearchService(
+        migrated_db_session,
+        semantic_client=semantic_client,
+        settings=Settings.model_validate({"pipeline_voyage_output_dimensions": 2}),
+    )
+
+    safe_page = await service.recommendation_candidates(viewer_user_id=viewer.id, limit=10)
+    nsfw_page = await service.recommendation_candidates(
+        viewer_user_id=viewer.id,
+        filters=MemeSearchFilters(include_nsfw=True),
+        limit=10,
+    )
+
+    assert [item.meme.id for item in safe_page.items] == [safe_match.id]
+    assert [item.meme.id for item in nsfw_page.items] == [nsfw_match.id, safe_match.id]
+    assert nsfw_page.items[0].meme.is_nsfw is True
+
+
+async def test_recommendation_candidates_exclude_positive_sources_recent_impressions_and_duplicates(
+    migrated_db_session: AsyncSession,
+) -> None:
+    viewer = build_full_user()
+    migrated_db_session.add(viewer)
+    await migrated_db_session.flush()
+    source = await _create_meme(migrated_db_session, popularity_score=1.0)
+    impressed = await _create_meme(migrated_db_session, popularity_score=10.0)
+    fresh = await _create_meme(migrated_db_session, popularity_score=10.0)
+    migrated_db_session.add_all(
+        [
+            AnalyticsEvent(
+                user_id=viewer.id,
+                event_type=AnalyticsEventType.MEME_LIKE,
+                payload={"refs": {"meme_id": str(source.id)}},
+            ),
+            AnalyticsEvent(
+                user_id=viewer.id,
+                event_type=AnalyticsEventType.MEME_IMPRESSION,
+                payload={"refs": {"meme_id": str(impressed.id)}},
+            ),
+        ]
+    )
+    await _add_image_embedding(migrated_db_session, source, (1.0, 0.0))
+    await migrated_db_session.commit()
+    service = MemeSearchService(
+        migrated_db_session,
+        semantic_client=FakeSemanticSearchClient(
+            (
+                QdrantUserSearchMatch(
+                    meme_file_id=_primary_file_id(source),
+                    meme_id=source.id,
+                    semantic_score=0.99,
+                ),
+                QdrantUserSearchMatch(
+                    meme_file_id=_primary_file_id(impressed),
+                    meme_id=impressed.id,
+                    semantic_score=0.95,
+                ),
+                QdrantUserSearchMatch(
+                    meme_file_id=_primary_file_id(fresh),
+                    meme_id=fresh.id,
+                    semantic_score=0.9,
+                ),
+                QdrantUserSearchMatch(
+                    meme_file_id=_primary_file_id(fresh),
+                    meme_id=fresh.id,
+                    semantic_score=0.8,
+                ),
+            )
+        ),
+        settings=Settings.model_validate({"pipeline_voyage_output_dimensions": 2}),
+    )
+
+    page = await service.recommendation_candidates(viewer_user_id=viewer.id, limit=10)
+
+    assert [item.meme.id for item in page.items] == [fresh.id]
+    assert page.total == 1
+    assert source.id not in {item.meme.id for item in page.items}
+    assert impressed.id not in {item.meme.id for item in page.items}
 
 
 async def test_search_service_passes_conservative_prefilters_to_text_and_semantic_clients(
