@@ -307,13 +307,26 @@ class PublicMemePopularitySummaryRead(BaseModel):
     sparkline: list[PublicMemePopularityPointRead] = Field(default_factory=list)
 
 
-class PublicTrendComparisonPointRead(BaseModel):
-    """One real trend comparison point for a meme or current aggregate."""
+class PublicTrendAggregatePointRead(BaseModel):
+    """One real aggregate trend point for public tag/template history."""
 
     observed_at: datetime | None = None
     value: float
     metric: str
     label: str
+    meme_count: int = 0
+    snapshot_count: int = 0
+    source_views: int = 0
+    source_reactions: int = 0
+    source_reposts: int = 0
+    platform_views: int = 0
+    platform_sends: int = 0
+    platform_saves: int = 0
+    platform_likes: int = 0
+
+
+class PublicTrendComparisonPointRead(PublicTrendAggregatePointRead):
+    """One real trend comparison point for a meme or aggregate series."""
 
 
 class PublicTrendComparisonSeriesRead(BaseModel):
@@ -328,6 +341,7 @@ class PublicTrendComparisonSeriesRead(BaseModel):
     points: list[PublicTrendComparisonPointRead] = Field(default_factory=list)
     insufficient_history: bool = False
     no_data_reason: str | None = None
+    current_only_reason: str | None = None
 
 
 class PublicTrendComparisonRead(BaseModel):
@@ -347,6 +361,10 @@ class PublicTrendSummaryRead(BaseModel):
     description: str | None = None
     meme_count: int
     trend: PublicTrendMetricsRead
+    points: list[PublicTrendAggregatePointRead] = Field(default_factory=list)
+    insufficient_history: bool = False
+    no_data_reason: str | None = None
+    current_only_reason: str | None = None
 
 
 class PublicTrendTimelineMemeRead(BaseModel):
@@ -415,6 +433,7 @@ __all__ = [
     "PublicMemeLandingRead",
     "PublicMemePopularityPointRead",
     "PublicMemePopularitySummaryRead",
+    "PublicTrendAggregatePointRead",
     "PublicTrendComparisonPointRead",
     "PublicTrendComparisonRead",
     "PublicTrendComparisonSeriesRead",

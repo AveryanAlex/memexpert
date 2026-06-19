@@ -39,7 +39,11 @@ from memexpert.services.collection_service import CollectionService
 from memexpert.services.media_render_urls import MediaRenderUrlService
 from memexpert.services.meme_search import MemeNotFoundError, MemeSearchFilters, MemeSearchScope, MemeSearchService
 from memexpert.services.meme_seo import MemeSeoGenerationService, MemeSeoProviderResult
-from memexpert.services.public_trends import PublicTrendsService, refresh_public_trend_materialized_views
+from memexpert.services.public_trends import (
+    TREND_MATERIALIZED_VIEWS,
+    PublicTrendsService,
+    refresh_public_trend_materialized_views,
+)
 from memexpert.services.search_index_sync import SEARCH_INDEX_ALGORITHM_VERSION
 from tests.factories import build_full_user
 
@@ -388,9 +392,8 @@ def _install_meme_route_overrides(
 
 
 async def _refresh_trend_views(session: AsyncSession) -> None:
-    await session.execute(text("REFRESH MATERIALIZED VIEW public_meme_trends_mv"))
-    await session.execute(text("REFRESH MATERIALIZED VIEW public_tag_trends_mv"))
-    await session.execute(text("REFRESH MATERIALIZED VIEW public_template_trends_mv"))
+    for view_name in TREND_MATERIALIZED_VIEWS:
+        await session.execute(text(f"REFRESH MATERIALIZED VIEW {view_name}"))
 
 
 async def test_hybrid_search_ranks_by_weighted_semantic_text_and_popularity(
@@ -3032,6 +3035,11 @@ async def test_public_trend_endpoints_rank_from_materialized_views_and_return_ag
     snapshot_meme.template_id = template.id
     liked_meme = await _create_meme(migrated_db_session, tags=["reaction"], popularity_score=1.0)
     rising_meme = await _create_meme(migrated_db_session, tags=["reaction"], popularity_score=1.0)
+    single_history_meme = await _create_meme(
+        migrated_db_session,
+        tags=["single-snapshot"],
+        popularity_score=1.0,
+    )
     analytics_service = AnalyticsService(migrated_db_session)
     await analytics_service.record_interaction_event(
         InteractionEventWrite(
@@ -3049,7 +3057,7 @@ async def test_public_trend_endpoints_rank_from_materialized_views_and_return_ag
             properties={"chat_hash": "hashed-chat-2"},
         )
     )
-    now = datetime.now(UTC)
+    history_start = datetime(2026, 1, 1, tzinfo=UTC)
     migrated_db_session.add_all(
         [
             *[
@@ -3062,17 +3070,23 @@ async def test_public_trend_endpoints_rank_from_materialized_views_and_return_ag
             ],
             MemePopularitySnapshot(
                 meme_id=snapshot_meme.id,
-                captured_at=now - timedelta(hours=2),
+                captured_at=history_start,
                 source_views=10,
                 popularity_score=100.0,
             ),
             MemePopularitySnapshot(
                 meme_id=snapshot_meme.id,
-                captured_at=now,
+                captured_at=history_start + timedelta(days=1),
                 source_views=20,
                 source_reactions=4,
                 source_reposts=1,
                 popularity_score=200.0,
+            ),
+            MemePopularitySnapshot(
+                meme_id=single_history_meme.id,
+                captured_at=history_start + timedelta(days=2),
+                source_views=5,
+                popularity_score=5.0,
             ),
         ]
     )
@@ -3130,12 +3144,30 @@ async def test_public_trend_endpoints_rank_from_materialized_views_and_return_ag
     assert reaction_summary["trend"]["recent"]["sends"] == 7
     assert reaction_summary["trend"]["recent"]["likes"] == 3
     assert reaction_summary["trend"]["recent"]["downloads"] == 2
+    assert reaction_summary["insufficient_history"] is False
+    assert reaction_summary["current_only_reason"] is None
+    assert [point["value"] for point in reaction_summary["points"]] == [100.0, 200.0]
+    assert [point["metric"] for point in reaction_summary["points"]] == [
+        "aggregate_popularity_score",
+        "aggregate_popularity_score",
+    ]
+    assert [point["meme_count"] for point in reaction_summary["points"]] == [1, 1]
+    assert [point["snapshot_count"] for point in reaction_summary["points"]] == [1, 1]
+    assert [point["source_views"] for point in reaction_summary["points"]] == [10, 20]
+
+    single_summary = next(summary for summary in tag_payload if summary["slug"] == "single-snapshot")
+    assert single_summary["insufficient_history"] is True
+    assert single_summary["current_only_reason"] is None
+    assert [point["value"] for point in single_summary["points"]] == [5.0]
 
     template_payload = template_response.json()
     assert template_payload[0]["slug"] == "frog-template"
     assert template_payload[0]["meme_count"] == 1
     assert template_payload[0]["trend"]["latest_source_views"] == 20
     assert template_payload[0]["trend"]["recent"]["downloads"] == 0
+    assert template_payload[0]["insufficient_history"] is False
+    assert [point["value"] for point in template_payload[0]["points"]] == [100.0, 200.0]
+    assert [point["source_reactions"] for point in template_payload[0]["points"]] == [0, 4]
 
     popularity_payload = popularity_response.json()
     assert popularity_payload["meme_id"] == str(snapshot_meme.id)
@@ -3152,12 +3184,36 @@ async def test_public_trend_views_count_strict_writer_nested_meme_refs(
     analytics_service = AnalyticsService(migrated_db_session)
     await analytics_service.record_interaction_event(
         InteractionEventWrite(
+            event_type=AnalyticsEventType.MEME_VIEW,
+            surface="public_api",
+            refs=InteractionEventRefs(meme_id=meme.id),
+            properties={"chat_hash": "hashed-chat-view"},
+        )
+    )
+    await analytics_service.record_interaction_event(
+        InteractionEventWrite(
+            event_type=AnalyticsEventType.INLINE_SENT,
+            surface="telegram_inline",
+            refs=InteractionEventRefs(meme_id=meme.id),
+            properties={"chat_hash": "hashed-chat-inline"},
+        )
+    )
+    await analytics_service.record_interaction_event(
+        InteractionEventWrite(
             event_type=AnalyticsEventType.MEME_DOWNLOAD,
             surface="public_api",
             refs=InteractionEventRefs(meme_id=meme.id),
             properties={"chat_hash": "hashed-chat"},
         )
     )
+    migrated_db_session.add_all(
+        [
+            AnalyticsEvent(event_type=AnalyticsEventType.VIEW, payload={"meme_id": str(meme.id)}),
+            AnalyticsEvent(event_type=AnalyticsEventType.SHARE, payload={"meme_id": str(meme.id)}),
+            AnalyticsEvent(event_type=AnalyticsEventType.MEME_SHARE, payload={"meme_id": str(meme.id)}),
+        ]
+    )
+    await migrated_db_session.flush()
     await _refresh_trend_views(migrated_db_session)
     _install_meme_route_overrides(app, migrated_db_session)
 
@@ -3167,7 +3223,11 @@ async def test_public_trend_views_count_strict_writer_nested_meme_refs(
         app.dependency_overrides.clear()
 
     assert response.status_code == 200
-    assert response.json()["trend"]["recent"]["downloads"] == 1
+    trend = response.json()["trend"]
+    assert trend["recent"]["views"] == 2
+    assert trend["recent"]["sends"] == 3
+    assert trend["recent"]["downloads"] == 1
+    assert trend["engagement_24h"] == 13.0
 
 
 async def test_public_trend_empty_states_are_honest(
@@ -3221,10 +3281,17 @@ async def test_public_trend_compare_returns_real_series_and_insufficient_history
     migrated_db_session: AsyncSession,
 ) -> None:
     template = MemeTemplate(slug="frog-template", name="Frog Template", description="Frog format")
-    migrated_db_session.add(template)
+    current_only_template = MemeTemplate(
+        slug="current-only-template",
+        name="Current Only Template",
+        description="No history yet",
+    )
+    migrated_db_session.add_all([template, current_only_template])
     await migrated_db_session.flush()
     meme = await _create_meme(migrated_db_session, tags=["reaction"], popularity_score=1.0)
     meme.template_id = template.id
+    current_only_meme = await _create_meme(migrated_db_session, tags=["current-only"], popularity_score=10.0)
+    current_only_meme.template_id = current_only_template.id
     migrated_db_session.add(
         MemeSeoPage(
             meme_id=meme.id,
@@ -3263,6 +3330,8 @@ async def test_public_trend_compare_returns_real_series_and_insufficient_history
                 ("item", "meme:launch-reaction"),
                 ("item", "tag:reaction"),
                 ("item", "template:frog-template"),
+                ("item", "tag:current-only"),
+                ("item", "template:current-only-template"),
                 ("item", "bad-spec"),
             ],
         )
@@ -3272,7 +3341,14 @@ async def test_public_trend_compare_returns_real_series_and_insufficient_history
     assert response.status_code == 200
     payload = response.json()
     assert payload["max_items"] == 6
-    assert payload["requested_items"] == ["meme:launch-reaction", "tag:reaction", "template:frog-template", "bad-spec"]
+    assert payload["requested_items"] == [
+        "meme:launch-reaction",
+        "tag:reaction",
+        "template:frog-template",
+        "tag:current-only",
+        "template:current-only-template",
+        "bad-spec",
+    ]
 
     meme_series = payload["items"][0]
     assert meme_series["kind"] == "meme"
@@ -3283,16 +3359,51 @@ async def test_public_trend_compare_returns_real_series_and_insufficient_history
 
     tag_series = payload["items"][1]
     assert tag_series["kind"] == "tag"
-    assert tag_series["insufficient_history"] is True
-    assert tag_series["points"][0]["metric"] == "trending_score"
-    assert tag_series["points"][0]["value"] > 0
+    assert tag_series["insufficient_history"] is False
+    assert [point["metric"] for point in tag_series["points"]] == [
+        "aggregate_popularity_score",
+        "aggregate_popularity_score",
+    ]
+    assert [point["value"] for point in tag_series["points"]] == [10.0, 15.0]
+    assert [point["source_views"] for point in tag_series["points"]] == [10, 15]
 
     template_series = payload["items"][2]
     assert template_series["kind"] == "template"
-    assert template_series["insufficient_history"] is True
-    assert template_series["points"][0]["metric"] == "trending_score"
+    assert template_series["insufficient_history"] is False
+    assert [point["value"] for point in template_series["points"]] == [10.0, 15.0]
+    assert {point["metric"] for point in template_series["points"]} == {"aggregate_popularity_score"}
 
-    invalid_series = payload["items"][3]
+    current_tag_series = payload["items"][3]
+    assert current_tag_series["kind"] == "tag"
+    assert current_tag_series["insufficient_history"] is True
+    assert current_tag_series["current_only_reason"].startswith("No historical aggregate snapshot points")
+    assert current_tag_series["points"] == [
+        {
+            "observed_at": current_tag_series["points"][0]["observed_at"],
+            "value": current_tag_series["points"][0]["value"],
+            "metric": "trending_score",
+            "label": "Current public trend window",
+            "meme_count": 1,
+            "snapshot_count": 0,
+            "source_views": 0,
+            "source_reactions": 0,
+            "source_reposts": 0,
+            "platform_views": 0,
+            "platform_sends": 0,
+            "platform_saves": 0,
+            "platform_likes": 0,
+        }
+    ]
+    assert current_tag_series["points"][0]["value"] > 0
+
+    current_template_series = payload["items"][4]
+    assert current_template_series["kind"] == "template"
+    assert current_template_series["insufficient_history"] is True
+    assert current_template_series["current_only_reason"].startswith("No historical aggregate snapshot points")
+    assert current_template_series["points"][0]["metric"] == "trending_score"
+    assert current_template_series["points"][0]["label"] == "Current public trend window"
+
+    invalid_series = payload["items"][5]
     assert invalid_series["kind"] == "unknown"
     assert invalid_series["points"] == []
     assert invalid_series["no_data_reason"].startswith("Use item specs")

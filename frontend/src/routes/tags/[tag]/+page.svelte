@@ -1,5 +1,6 @@
 <script lang="ts">
   import MemeGrid from '$lib/features/memes/MemeGrid.svelte';
+  import TrendAggregateHistory from '$lib/features/trends/TrendAggregateHistory.svelte';
   import TrendSummary from '$lib/features/trends/TrendSummary.svelte';
   import { ActionLink, Card, EmptyState, PageHeader } from '$lib/ui';
   import type { PageData } from './$types';
@@ -31,6 +32,7 @@
     {#if data.landing.trend_summary}
       <p class="m-0 text-muted">{data.landing.trend_summary.meme_count} public memes in this aggregate.</p>
       <TrendSummary trend={data.landing.trend_summary.trend} />
+      <TrendAggregateHistory summary={data.landing.trend_summary} />
     {:else}
       <p class="m-0 text-muted">No materialized trend data for this tag yet.</p>
     {/if}

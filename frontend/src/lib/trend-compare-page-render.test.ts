@@ -5,13 +5,13 @@ import type { PublicTrendComparisonRead, PublicTrendMetricsRead } from '$lib/api
 import TrendComparePage from '../routes/trends/compare/+page.svelte';
 
 describe('/trends/compare page', () => {
-  it('renders shareable item inputs, chart/table data, and insufficient-history notice', () => {
+  it('renders shareable item inputs, aggregate history copy, and current-only notice', () => {
     const { body } = render(TrendComparePage, {
       props: {
         data: {
           session: null,
           sessionError: null,
-          items: ['meme:launch-reaction', 'tag:reaction'],
+          items: ['meme:launch-reaction', 'tag:reaction', 'template:current-only-template'],
           comparison: comparisonPayload(),
           errorMessage: null
         }
@@ -19,14 +19,19 @@ describe('/trends/compare page', () => {
     });
 
     expect(body).toContain('Compare public trends.');
+    expect(body).toContain('Meme series use per-meme popularity snapshots');
     expect(body).toContain('meme:launch-reaction');
     expect(body).toContain('tag:reaction');
+    expect(body).toContain('template:current-only-template');
     expect(body).toContain('Trend comparison line chart');
     expect(body).toContain('Launch reaction meme');
     expect(body).toContain('Reaction memes');
+    expect(body).toContain('Current Only Template memes');
     expect(body).toContain('15.0');
-    expect(body).toContain('Insufficient history');
-    expect(body).toContain('Tags and templates do not have historical snapshot series yet');
+    expect(body).toContain('Aggregate history points');
+    expect(body).toContain('Current-window aggregate fallback');
+    expect(body).toContain('No historical aggregate snapshot points exist; using the current public trend window only.');
+    expect(body).not.toContain('Tags and templates do not have historical snapshot series yet');
   });
 
   it('renders the empty starter state without fabricated examples', () => {
@@ -70,14 +75,65 @@ function comparisonPayload(): PublicTrendComparisonRead {
         kind: 'tag',
         value: 'reaction',
         title: 'Reaction memes',
+        description: 'Aggregate public trend activity for reaction memes.',
+        meme: null,
+        trend: trendMetrics(),
+        insufficient_history: false,
+        no_data_reason: null,
+        current_only_reason: null,
+        points: [
+          aggregatePoint({ observed_at: '2026-01-01T00:00:00Z', value: 10 }),
+          aggregatePoint({ observed_at: '2026-01-02T00:00:00Z', value: 22, source_views: 15 })
+        ]
+      },
+      {
+        kind: 'template',
+        value: 'current-only-template',
+        title: 'Current Only Template memes',
         description: 'Current-window aggregate only.',
         meme: null,
         trend: trendMetrics(),
         insufficient_history: true,
         no_data_reason: null,
-        points: [{ observed_at: '2026-01-02T00:00:00Z', value: 22, metric: 'trending_score', label: 'Current public trend window' }]
+        current_only_reason: 'No historical aggregate snapshot points exist; using the current public trend window only.',
+        points: [
+          {
+            observed_at: '2026-01-02T00:00:00Z',
+            value: 22,
+            metric: 'trending_score',
+            label: 'Current public trend window',
+            meme_count: 1,
+            snapshot_count: 0,
+            source_views: 0,
+            source_reactions: 0,
+            source_reposts: 0,
+            platform_views: 0,
+            platform_sends: 0,
+            platform_saves: 0,
+            platform_likes: 0
+          }
+        ]
       }
     ]
+  };
+}
+
+function aggregatePoint(overrides: Partial<PublicTrendComparisonRead['items'][number]['points'][number]> = {}): PublicTrendComparisonRead['items'][number]['points'][number] {
+  return {
+    observed_at: '2026-01-01T00:00:00Z',
+    value: 10,
+    metric: 'aggregate_popularity_score',
+    label: 'Aggregate popularity score',
+    meme_count: 1,
+    snapshot_count: 1,
+    source_views: 10,
+    source_reactions: 2,
+    source_reposts: 1,
+    platform_views: 6,
+    platform_sends: 1,
+    platform_saves: 0,
+    platform_likes: 2,
+    ...overrides
   };
 }
 

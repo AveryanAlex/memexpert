@@ -310,12 +310,23 @@ export interface PublicMemePopularitySummaryRead {
   sparkline: PublicMemePopularityPointRead[];
 }
 
-export interface PublicTrendComparisonPointRead {
+export interface PublicTrendAggregatePointRead {
   observed_at: string | null;
   value: number;
   metric: string;
   label: string;
+  meme_count?: number;
+  snapshot_count?: number;
+  source_views?: number;
+  source_reactions?: number;
+  source_reposts?: number;
+  platform_views?: number;
+  platform_sends?: number;
+  platform_saves?: number;
+  platform_likes?: number;
 }
+
+export interface PublicTrendComparisonPointRead extends PublicTrendAggregatePointRead {}
 
 export interface PublicTrendComparisonSeriesRead {
   kind: 'meme' | 'tag' | 'template' | 'unknown' | string;
@@ -327,6 +338,7 @@ export interface PublicTrendComparisonSeriesRead {
   points: PublicTrendComparisonPointRead[];
   insufficient_history: boolean;
   no_data_reason: string | null;
+  current_only_reason?: string | null;
 }
 
 export interface PublicTrendComparisonRead {
@@ -342,6 +354,10 @@ export interface PublicTrendSummaryRead {
   description: string | null;
   meme_count: number;
   trend: PublicTrendMetricsRead;
+  points?: PublicTrendAggregatePointRead[];
+  insufficient_history?: boolean;
+  no_data_reason?: string | null;
+  current_only_reason?: string | null;
 }
 
 export interface PublicTrendTimelineMemeRead {

@@ -1,6 +1,7 @@
 <script lang="ts">
   import MemeCard from '$lib/features/memes/MemeCard.svelte';
   import TrendSummary from '$lib/features/trends/TrendSummary.svelte';
+  import type { PublicTrendSummaryRead } from '$lib/api/types';
   import { ActionLink, Card, EmptyState, Notice, PageHeader } from '$lib/ui';
   import type { PageData } from './$types';
 
@@ -17,6 +18,14 @@
       params.set('offset', String(offset));
     }
     return `/trends?${params.toString()}`;
+  }
+
+  function aggregateStatus(summary: PublicTrendSummaryRead): string {
+    const pointCount = summary.points?.length ?? 0;
+    if (pointCount >= 2) return `${pointCount} history points`;
+    if (summary.current_only_reason) return 'current window only';
+    if (summary.insufficient_history) return 'insufficient history';
+    return 'current score';
   }
 </script>
 
@@ -69,7 +78,7 @@
       {#each data.tagSummaries as summary}
         <a class="flex items-center justify-between gap-3 rounded-[18px] border border-line bg-paper px-4 py-3 font-extrabold no-underline" href={`/tags/${summary.slug}`}>
           <span>{summary.title}</span>
-          <small class="text-muted">{summary.meme_count} memes · {summary.trend.trending_score.toFixed(1)} score</small>
+          <small class="text-muted">{summary.meme_count} memes · {summary.trend.trending_score.toFixed(1)} score · {aggregateStatus(summary)}</small>
         </a>
       {/each}
     {:else}
@@ -82,7 +91,7 @@
       {#each data.templateSummaries as summary}
         <a class="flex items-center justify-between gap-3 rounded-[18px] border border-line bg-paper px-4 py-3 font-extrabold no-underline" href={`/templates/${summary.slug}`}>
           <span>{summary.title}</span>
-          <small class="text-muted">{summary.meme_count} memes · {summary.trend.trending_score.toFixed(1)} score</small>
+          <small class="text-muted">{summary.meme_count} memes · {summary.trend.trending_score.toFixed(1)} score · {aggregateStatus(summary)}</small>
         </a>
       {/each}
     {:else}

@@ -12,7 +12,14 @@ from memexpert.core.config import Settings
 from memexpert.core.voyage import VoyageEmbeddingResult
 from memexpert.models.base import utcnow
 from memexpert.models.collection import Collection, CollectionInvite, CollectionMember
-from memexpert.models.content import EmbeddingCache, Meme, MemeFile, MemeFileOCRResult, MemeFileSyncTargetSnapshot
+from memexpert.models.content import (
+    EmbeddingCache,
+    Meme,
+    MemeFile,
+    MemeFileOCRResult,
+    MemeFileSyncTargetSnapshot,
+    MemeTemplate,
+)
 from memexpert.models.enums import (
     AccountStatus,
     CollectionInviteChannel,
@@ -265,6 +272,128 @@ def test_collection_management_fixture_payload_is_deterministic_private_and_e2e_
     assert [item["category"] for item in payload["saved_memes"]] == ["cat", "dog"]
     assert [item["category"] for item in payload["pinned_memes"]] == ["cat", "dog"]
     assert payload["collection"]["visibility"] != "public"
+
+
+def test_public_trends_artifact_payload_is_deterministic_and_url_ready() -> None:
+    cat = seeded_meme("cat")
+    dog = seeded_meme("dog")
+    frog = seeded_meme("frog")
+
+    payload = seed_e2e.build_public_trends_artifact([cat, dog, frog])
+
+    assert payload["trend_path"] == "/trends"
+    assert payload["tag"] == {
+        "slug": seed_e2e.E2E_PUBLIC_TRENDS_TAG_SLUG,
+        "title": "E2E Prd Trends memes",
+        "path": "/tags/e2e-prd-trends",
+        "history_points": seed_e2e.build_public_trend_aggregate_history_points_payload(),
+    }
+    assert payload["template"] == {
+        "slug": seed_e2e.E2E_PUBLIC_TRENDS_TEMPLATE_SLUG,
+        "title": "E2E PRD Template memes",
+        "path": "/templates/e2e-prd-template",
+        "history_points": seed_e2e.build_public_trend_aggregate_history_points_payload(),
+    }
+    assert payload["compare"] == {
+        "items": ["meme:e2e-prd-cat-search", "tag:e2e-prd-trends", "template:e2e-prd-template"],
+        "path": (
+            "/trends/compare?item=meme%3Ae2e-prd-cat-search&item=tag%3Ae2e-prd-trends"
+            "&item=template%3Ae2e-prd-template"
+        ),
+    }
+    assert payload["timeline"] == {
+        "path": "/trends/timeline?granularity=month",
+        "granularity": "month",
+        "period": "2026-01",
+        "period_label": "January 2026",
+        "snapshot_count": 6,
+    }
+    assert payload["representative_meme"] == {
+        "category": "cat",
+        "slug": "e2e-prd-cat-search",
+        "title": "Deterministic cat search meme",
+    }
+
+
+def test_public_trend_template_and_snapshot_helpers_are_deterministic() -> None:
+    meme_id = seed_e2e._stable_uuid("cat:meme")
+    template = seed_e2e.build_public_trends_template()
+    rows = seed_e2e.build_public_trend_snapshot_rows(meme_id=meme_id, category="cat")
+
+    assert isinstance(template, MemeTemplate)
+    assert template.id == seed_e2e._stable_uuid("public-trends:template")
+    assert template.slug == seed_e2e.E2E_PUBLIC_TRENDS_TEMPLATE_SLUG
+    assert template.name == seed_e2e.E2E_PUBLIC_TRENDS_TEMPLATE_NAME
+    assert template.description == seed_e2e.E2E_PUBLIC_TRENDS_TEMPLATE_DESCRIPTION
+    assert template.is_curated is True
+
+    assert [row.id for row in rows] == [
+        seed_e2e._stable_uuid("cat:public-trend-snapshot:1"),
+        seed_e2e._stable_uuid("cat:public-trend-snapshot:2"),
+    ]
+    assert [row.meme_id for row in rows] == [meme_id, meme_id]
+    assert [row.captured_at.isoformat() for row in rows] == [
+        "2026-01-05T12:00:00+00:00",
+        "2026-01-12T12:00:00+00:00",
+    ]
+    assert [row.source_views for row in rows] == [120, 180]
+    assert [row.platform_likes for row in rows] == [7, 12]
+    assert [row.popularity_score for row in rows] == [40.0, 80.5]
+    assert seed_e2e.build_public_trend_snapshot_rows(meme_id=meme_id, category="cat-nsfw") == []
+
+
+def test_public_trend_aggregate_history_points_payload_uses_real_seed_snapshots() -> None:
+    points = seed_e2e.build_public_trend_aggregate_history_points_payload()
+
+    assert points == [
+        {
+            "observed_at": "2026-01-05T00:00:00+00:00",
+            "value": 90.0,
+            "metric": "aggregate_popularity_score",
+            "label": "Aggregate popularity score",
+            "meme_count": 3,
+            "snapshot_count": 3,
+            "source_views": 280,
+            "source_reactions": 28,
+            "source_reposts": 9,
+            "platform_views": 105,
+            "platform_sends": 6,
+            "platform_saves": 12,
+            "platform_likes": 18,
+        },
+        {
+            "observed_at": "2026-01-12T00:00:00+00:00",
+            "value": 181.5,
+            "metric": "aggregate_popularity_score",
+            "label": "Aggregate popularity score",
+            "meme_count": 3,
+            "snapshot_count": 3,
+            "source_views": 420,
+            "source_reactions": 42,
+            "source_reposts": 13,
+            "platform_views": 155,
+            "platform_sends": 12,
+            "platform_saves": 19,
+            "platform_likes": 29,
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cleanup_public_trends_template_rows_removes_deterministic_template(
+    migrated_db_session: AsyncSession,
+) -> None:
+    template = seed_e2e.build_public_trends_template()
+    migrated_db_session.add(template)
+    await migrated_db_session.flush()
+
+    await seed_e2e.cleanup_public_trends_template_rows(migrated_db_session)
+
+    assert await migrated_db_session.get(MemeTemplate, template.id) is None
+    template_count = await migrated_db_session.scalar(
+        select(func.count()).select_from(MemeTemplate).where(MemeTemplate.slug == template.slug),
+    )
+    assert template_count == 0
 
 
 @pytest.mark.asyncio

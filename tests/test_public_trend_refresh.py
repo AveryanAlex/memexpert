@@ -92,8 +92,10 @@ async def test_public_trend_refresh_logs_and_falls_back_when_concurrent_refresh_
     assert connection.calls == [
         f"REFRESH MATERIALIZED VIEW CONCURRENTLY {TREND_MATERIALIZED_VIEWS[0]}",
         f"REFRESH MATERIALIZED VIEW {TREND_MATERIALIZED_VIEWS[0]}",
-        f"REFRESH MATERIALIZED VIEW CONCURRENTLY {TREND_MATERIALIZED_VIEWS[1]}",
-        f"REFRESH MATERIALIZED VIEW CONCURRENTLY {TREND_MATERIALIZED_VIEWS[2]}",
+        *[
+            f"REFRESH MATERIALIZED VIEW CONCURRENTLY {view_name}"
+            for view_name in TREND_MATERIALIZED_VIEWS[1:]
+        ],
     ]
     assert connection.rollback_calls == 1
     assert warning_calls == [
