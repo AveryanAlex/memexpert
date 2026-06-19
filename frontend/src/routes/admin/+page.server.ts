@@ -12,11 +12,13 @@ import {
   fetchAdminDashboard,
   markSourceChannelDead,
   mergeMemeTemplate,
+  regenerateMemeSeoPage,
   reviewChannelSuggestion,
   resolveModerationReport,
   setSourceChannelPaused,
   updateMemeModeration,
   updateBlockedPerceptualHash,
+  updateMemeSeoPage,
   updateMemeTemplate
 } from '$lib/api/client';
 import { buildBlockedPhashPayload } from '$lib/admin/blockedPhash';
@@ -36,6 +38,7 @@ export const load: PageServerLoad = async ({ fetch, request }) => {
         templates: [],
         blockedPerceptualHashes: [],
         memes: [],
+        seoReviews: [],
         reports: [],
         decisions: []
       },
@@ -102,7 +105,8 @@ export const actions: Actions = {
     return runAction(async () => {
       await markSourceChannelDead(
         { fetch, baseUrl: apiBaseUrl(), cookieHeader: request.headers.get('cookie') ?? undefined },
-        readRequired(data, 'channel_id')
+        readRequired(data, 'channel_id'),
+        readRequired(data, 'confirmation')
       );
       return { message: 'Source channel marked dead; crawler checkpoint state was preserved.' };
     });
@@ -257,6 +261,37 @@ export const actions: Actions = {
       return { message: 'Meme moderation flags updated and audited.' };
     });
   },
+  updateSeoPage: async ({ fetch, request }) => {
+    const data = await request.formData();
+    return runAction(async () => {
+      await updateMemeSeoPage(
+        {
+          fetch,
+          baseUrl: apiBaseUrl(),
+          cookieHeader: request.headers.get('cookie') ?? undefined,
+          body: seoPagePayloadFromForm(data)
+        },
+        readRequired(data, 'meme_id')
+      );
+      return { message: 'SEO page saved.' };
+    });
+  },
+  regenerateSeoPage: async ({ fetch, request }) => {
+    const data = await request.formData();
+    const memeId = readRequired(data, 'meme_id');
+    return runAction(async () => {
+      await regenerateMemeSeoPage(
+        {
+          fetch,
+          baseUrl: apiBaseUrl(),
+          cookieHeader: request.headers.get('cookie') ?? undefined,
+          body: { confirmation: readRequired(data, 'confirmation') }
+        },
+        memeId
+      );
+      return { message: 'SEO page regenerated and manual edits were overwritten.' };
+    });
+  },
   resolveModerationReport: async ({ fetch, request }) => {
     const data = await request.formData();
     return runAction(async () => {
@@ -325,6 +360,18 @@ function blockedPhashPayloadFromForm(data: FormData) {
     note: readOptional(data, 'note'),
     isActive: data.get('is_active') === 'on'
   });
+}
+
+function seoPagePayloadFromForm(data: FormData) {
+  return {
+    slug: readOptional(data, 'slug'),
+    page_title: readOptional(data, 'page_title'),
+    meta_description: readOptional(data, 'meta_description'),
+    alt_text: readOptional(data, 'alt_text'),
+    caption: readOptional(data, 'caption'),
+    body_text: readOptional(data, 'body_text'),
+    tags: readOptional(data, 'tags')
+  };
 }
 
 function apiBaseUrl(): string {

@@ -4,6 +4,8 @@ import type {
   AdminMemeDestructiveActionRead,
   AdminMemeDetailRead,
   AdminMemeRead,
+  AdminMemeSeoPageRead,
+  AdminMemeSeoReviewRowRead,
   AdminMemeTemplateActionRead,
   AdminMemeTemplateRead,
   AdminModerationDecisionRead,
@@ -513,20 +515,22 @@ export async function fetchAdminDashboard(request: CatalogRequest): Promise<{
   templates: AdminMemeTemplateRead[];
   blockedPerceptualHashes: AdminBlockedPerceptualHashRead[];
   memes: AdminMemeRead[];
+  seoReviews: AdminMemeSeoReviewRowRead[];
   reports: AdminModerationReportRead[];
   decisions: AdminModerationDecisionRead[];
 }> {
-  const [suggestions, sourceChannels, templates, blockedPerceptualHashes, memes, reports, decisions] = await Promise.all([
+  const [suggestions, sourceChannels, templates, blockedPerceptualHashes, memes, seoReviews, reports, decisions] = await Promise.all([
     apiGet<ChannelSuggestionRead[]>('/api/v1/admin/channel-suggestions', new URLSearchParams(), request),
     apiGet<AdminSourceChannelRead[]>('/api/v1/admin/source-channels', new URLSearchParams(), request),
     apiGet<AdminMemeTemplateRead[]>('/api/v1/admin/meme-templates', new URLSearchParams(), request),
     apiGet<AdminBlockedPerceptualHashRead[]>('/api/v1/admin/blocked-perceptual-hashes', new URLSearchParams(), request),
     apiGet<AdminMemeRead[]>('/api/v1/admin/memes', new URLSearchParams({ limit: '20' }), request),
+    apiGet<AdminMemeSeoReviewRowRead[]>('/api/v1/admin/seo-pages', new URLSearchParams({ limit: '20' }), request),
     apiGet<AdminModerationReportRead[]>('/api/v1/admin/moderation-reports', new URLSearchParams({ limit: '20' }), request),
     apiGet<AdminModerationDecisionRead[]>('/api/v1/admin/moderation-decisions', new URLSearchParams({ limit: '20' }), request)
   ]);
 
-  return { suggestions, sourceChannels, templates, blockedPerceptualHashes, memes, reports, decisions };
+  return { suggestions, sourceChannels, templates, blockedPerceptualHashes, memes, seoReviews, reports, decisions };
 }
 
 export async function fetchAdminMemeDetail(request: CatalogRequest, memeId: string): Promise<AdminMemeDetailRead> {
@@ -567,10 +571,27 @@ export async function setSourceChannelPaused(
 
 export async function markSourceChannelDead(
   request: CatalogRequest,
-  channelId: string
+  channelId: string,
+  confirmation: string
 ): Promise<AdminSourceChannelRead> {
   return apiWrite<AdminSourceChannelRead>(
     `/api/v1/admin/source-channels/${encodeURIComponent(channelId)}/mark-dead`,
+    'POST',
+    { ...request, body: { confirmation } }
+  );
+}
+
+export async function updateMemeSeoPage(request: JsonMutationRequest, memeId: string): Promise<AdminMemeSeoPageRead> {
+  return apiWrite<AdminMemeSeoPageRead>(
+    `/api/v1/admin/memes/${encodeURIComponent(memeId)}/seo-page`,
+    'PATCH',
+    request
+  );
+}
+
+export async function regenerateMemeSeoPage(request: JsonMutationRequest, memeId: string): Promise<AdminMemeSeoPageRead> {
+  return apiWrite<AdminMemeSeoPageRead>(
+    `/api/v1/admin/memes/${encodeURIComponent(memeId)}/seo-page/regenerate`,
     'POST',
     request
   );
