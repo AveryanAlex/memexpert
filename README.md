@@ -183,7 +183,7 @@ Duplicate production execution is guarded by the PostgreSQL advisory lock. Keep 
 
 ## Container Images
 
-The Docker Images workflow publishes production-ready images to GHCR after local image smoke checks on push, tag, and manual runs:
+The CI workflow publishes production-ready images to GHCR after local image smoke checks and containerized E2E pass on push, tag, and manual runs:
 
 - `ghcr.io/averyanalex/memexpert/main`
 - `ghcr.io/averyanalex/memexpert/worker`
@@ -255,7 +255,7 @@ cp .env.prod.example .env.prod
 
 Edit `.env.prod` and replace every `change-me` placeholder.
 
-The example env defaults `MEMEXPERT_MAIN_IMAGE`, `MEMEXPERT_WORKER_IMAGE`, and `MEMEXPERT_FRONTEND_IMAGE` to GHCR `:main` images. For production, pin them to release tags or immutable `sha-<short-sha>` tags from the Docker Images workflow.
+The example env defaults `MEMEXPERT_MAIN_IMAGE`, `MEMEXPERT_WORKER_IMAGE`, and `MEMEXPERT_FRONTEND_IMAGE` to GHCR `:main` images. For production, pin them to release tags or immutable `sha-<short-sha>` tags from the CI workflow image-publish path.
 
 Validate the stack:
 
@@ -299,7 +299,7 @@ Run the deterministic real-stack PRD E2E suite with one command:
 python scripts/run_container_e2e.py
 ```
 
-The runner creates a sanitized run id, sets per-run default main/worker/frontend/Playwright image tags, starts `docker-compose.e2e.yml` with `docker compose -p memexpert-e2e-<run-id>`, builds the unified main image, worker image, frontend image, and Playwright image, runs `seed`, runs the in-network Playwright/API checks, collects Compose status/logs, and tears the stack down with volumes unless `E2E_KEEP_STACK=1` is set.
+The runner creates a sanitized run id, sets per-run default main/worker/frontend/Playwright image tags, starts `docker-compose.e2e.yml` with `docker compose -p memexpert-e2e-<run-id>`, builds the unified main image, worker image, frontend image, and Playwright image, runs `seed`, runs the in-network Playwright/API checks, collects Compose status/logs, and tears the stack down with volumes unless `E2E_KEEP_STACK=1` is set. CI prebuilds those four images once, passes their explicit tags to the runner, and sets `E2E_SKIP_IMAGE_BUILD=1` so Compose reuses the loaded images instead of rebuilding them during E2E.
 
 The suite is parallel-safe by default: it uses no fixed host ports, no `container_name`, project-scoped named volumes, an absolute per-run artifact bind mount at `.artifacts/e2e/<run-id>/`, and run-scoped default main/worker/frontend/e2e-runner image tags. Set `E2E_RUN_ID=<id>` to choose a deterministic run id, or set `MEMEXPERT_MAIN_IMAGE`, `MEMEXPERT_WORKER_IMAGE`, `MEMEXPERT_FRONTEND_IMAGE`, or `MEMEXPERT_E2E_RUNNER_IMAGE` to opt into explicit image tags.
 
@@ -309,9 +309,7 @@ The default CI E2E path uses the operator upload pipeline plus fake providers. I
 
 ## CI
 
-`.github/workflows/ci.yml` runs backend lint/type/test checks, frontend checks/tests/builds, frontend mock smoke tests, and deterministic PRD E2E. On E2E failure, CI uploads `.artifacts/e2e/**`.
-
-`.github/workflows/docker-images.yml` validates the production compose example, builds the unified main Python image, worker Python image, and frontend image with BuildKit/GitHub Actions cache, loads local CI tags, and performs lightweight API/frontend HTTP smoke checks. It also verifies the main image exposes API/bot/scheduler console scripts without importing Paddle packages, and that the worker has FFmpeg/FFprobe plus a launchable Python 3.13 PaddleOCR helper. After smoke checks pass, non-PR runs publish `ghcr.io/averyanalex/memexpert/{main,worker,frontend}` with metadata labels plus branch, tag, semver, and `sha-<short-sha>` tags.
+`.github/workflows/ci.yml` runs backend lint/type/test checks, frontend checks/tests/builds, frontend mock smoke tests, production compose validation, Docker image builds, image smoke checks, and deterministic PRD E2E. The E2E job builds and loads the unified main Python image, worker Python image, frontend image, and E2E runner image with BuildKit/GitHub Actions cache, then runs E2E with `E2E_SKIP_IMAGE_BUILD=1` so it reuses those loaded tags. On E2E failure, CI uploads `.artifacts/e2e/**`. After smoke checks and E2E pass, non-PR runs publish `ghcr.io/averyanalex/memexpert/{main,worker,frontend}` with metadata labels plus branch, tag, semver, and `sha-<short-sha>` tags.
 
 Run the local real OCR smoke only when the worker image has been built and model downloads are acceptable:
 

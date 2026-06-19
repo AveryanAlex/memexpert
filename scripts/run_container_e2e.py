@@ -23,6 +23,7 @@ IMAGE_ENV_DEFAULTS: Final = {
     "MEMEXPERT_FRONTEND_IMAGE": "memexpert-frontend:e2e-{run_id}",
     "MEMEXPERT_E2E_RUNNER_IMAGE": "memexpert-e2e-runner:e2e-{run_id}",
 }
+TRUTHY_VALUES: Final = {"1", "true", "yes", "on"}
 WAITED_LONG_LIVED_SERVICES: Final = ("api", "frontend")
 NON_HEALTHCHECKED_LONG_LIVED_SERVICES: Final = ("workers",)
 LOG_SERVICES: Final = (
@@ -56,6 +57,7 @@ def main() -> int:
     env["E2E_RUN_ID"] = run_id
     env["E2E_ARTIFACT_DIR"] = str(artifact_dir)
     defaulted_images = apply_default_image_tags(env, run_id=run_id)
+    skip_image_build = is_truthy(env.get("E2E_SKIP_IMAGE_BUILD"))
 
     compose = ["docker", "compose", "-p", project_name, "-f", str(COMPOSE_FILE)]
     started_at = datetime.now(tz=UTC)
@@ -67,6 +69,7 @@ def main() -> int:
             "compose_file": str(COMPOSE_FILE),
             "artifact_dir": str(artifact_dir),
             "images": {key: env[key] for key in IMAGE_ENV_DEFAULTS},
+            "skip_image_build": skip_image_build,
             "started_at": started_at.isoformat(),
         },
     )
@@ -74,14 +77,30 @@ def main() -> int:
     exit_code = 0
     try:
         print(f"Starting {project_name}; artifacts: {artifact_dir}", flush=True)
+        if skip_image_build:
+            assert_images_exist([env[key] for key in IMAGE_ENV_DEFAULTS], env=env)
         run_checked(
-            [*compose, "up", "--detach", "--build", "--wait", "--wait-timeout", "420", *WAITED_LONG_LIVED_SERVICES],
+            compose_up_command(
+                compose,
+                skip_image_build=skip_image_build,
+                wait=True,
+                services=WAITED_LONG_LIVED_SERVICES,
+            ),
             env=env,
         )
-        run_checked([*compose, "up", "--detach", "--no-deps", *NON_HEALTHCHECKED_LONG_LIVED_SERVICES], env=env)
+        run_checked(
+            compose_up_command(
+                compose,
+                skip_image_build=skip_image_build,
+                no_deps=True,
+                services=NON_HEALTHCHECKED_LONG_LIVED_SERVICES,
+            ),
+            env=env,
+        )
         for service in NON_HEALTHCHECKED_LONG_LIVED_SERVICES:
             assert_service_running(compose, service=service, env=env)
-        run_checked([*compose, "build", "e2e-runner"], env=env)
+        if not skip_image_build:
+            run_checked([*compose, "build", "e2e-runner"], env=env)
         run_checked([*compose, "run", "--rm", "--no-deps", "seed"], env=env)
         run_checked([*compose, "run", "--rm", "--no-deps", "e2e-runner"], env=env)
     except subprocess.CalledProcessError as exc:
@@ -122,6 +141,42 @@ def apply_default_image_tags(env: dict[str, str], *, run_id: str) -> list[str]:
         env[key] = image
         defaulted_images.append(image)
     return defaulted_images
+
+
+def is_truthy(value: str | None) -> bool:
+    return value is not None and value.strip().lower() in TRUTHY_VALUES
+
+
+def compose_up_command(
+    compose: list[str],
+    *,
+    skip_image_build: bool,
+    services: tuple[str, ...],
+    wait: bool = False,
+    no_deps: bool = False,
+) -> list[str]:
+    command = [*compose, "up", "--detach"]
+    if no_deps:
+        command.append("--no-deps")
+    command.append("--no-build" if skip_image_build else "--build")
+    if wait:
+        command.extend(["--wait", "--wait-timeout", "420"])
+    command.extend(services)
+    return command
+
+
+def assert_images_exist(images: list[str], *, env: dict[str, str]) -> None:
+    missing_images = [image for image in dict.fromkeys(images) if not image_exists(image, env=env)]
+    if not missing_images:
+        return
+    formatted_images = ", ".join(missing_images)
+    message = f"E2E_SKIP_IMAGE_BUILD=1 but required Docker images are missing: {formatted_images}"
+    print(message, file=sys.stderr, flush=True)
+    raise subprocess.CalledProcessError(
+        1,
+        ["docker", "image", "inspect", *missing_images],
+        stderr=message,
+    )
 
 
 def run_checked(command: list[str], *, env: dict[str, str]) -> None:

@@ -3,6 +3,10 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   lint:
@@ -97,6 +101,9 @@ jobs:
 
   e2e:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -104,7 +111,114 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Run PRD E2E
+      - name: Validate production compose example
+        run: docker compose --env-file .env.prod.example -f docker-compose.prod.example.yml config
+
+      - name: Build main image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          target: main
+          tags: memexpert-main:ci
+          load: true
+          cache-from: type=gha,scope=memexpert-main
+          cache-to: type=gha,scope=memexpert-main,mode=max
+
+      - name: Build worker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          target: worker
+          tags: memexpert-worker:ci
+          load: true
+          cache-from: type=gha,scope=memexpert-worker
+          cache-to: type=gha,scope=memexpert-worker,mode=max
+
+      - name: Build frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: frontend/Dockerfile
+          tags: memexpert-frontend:ci
+          load: true
+          cache-from: type=gha,scope=memexpert-frontend
+          cache-to: type=gha,scope=memexpert-frontend,mode=max
+
+      - name: Build E2E runner image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: e2e/Dockerfile
+          tags: memexpert-e2e-runner:ci
+          load: true
+          cache-from: type=gha,scope=memexpert-e2e-runner
+          cache-to: type=gha,scope=memexpert-e2e-runner,mode=max
+
+      - name: Smoke test app images
+        run: |
+          set -euo pipefail
+
+          docker network create memexpert-smoke
+          docker run -d --rm \
+            --name memexpert-main-smoke \
+            --network memexpert-smoke \
+            -e APP_HOST=0.0.0.0 \
+            -e APP_PORT=8000 \
+            -p 8000:8000 \
+            memexpert-main:ci
+
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8000/health; then
+              break
+            fi
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:8000/health
+
+          docker run --rm memexpert-main:ci sh -c 'command -v memexpert-api && command -v memexpert-bot && command -v memexpert-scheduler && python -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec(\"paddleocr\") is None and importlib.util.find_spec(\"paddle\") is None else 1)"'
+          docker run --rm memexpert-worker:ci sh -c 'command -v memexpert-workers && command -v ffmpeg && command -v ffprobe && python -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec(\"paddleocr\") is None and importlib.util.find_spec(\"paddle\") is None else 1)" && /opt/paddleocr-venv/bin/python -c "import paddle, paddleocr; print(\"paddleocr-helper-ok\")" && /opt/paddleocr-venv/bin/python /app/scripts/paddleocr_json.py --help >/dev/null'
+          docker run --rm memexpert-worker:ci ffmpeg -version
+          docker run --rm memexpert-worker:ci ffprobe -version
+
+          docker run -d --rm \
+            --name memexpert-frontend-smoke \
+            --network memexpert-smoke \
+            -e HOST=0.0.0.0 \
+            -e PORT=3000 \
+            -e API_BASE_URL=http://memexpert-main-smoke:8000 \
+            -p 3000:3000 \
+            memexpert-frontend:ci
+
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:3000/ >/dev/null; then
+              break
+            fi
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:3000/ >/dev/null
+
+      - name: Show smoke logs on failure
+        if: failure()
+        run: |
+          docker ps -a
+          docker logs memexpert-main-smoke || true
+          docker logs memexpert-frontend-smoke || true
+
+      - name: Tear down smoke containers
+        if: always()
+        run: |
+          docker rm -f memexpert-frontend-smoke memexpert-main-smoke || true
+          docker network rm memexpert-smoke || true
+
+      - name: Run PRD E2E with prebuilt images
+        env:
+          E2E_SKIP_IMAGE_BUILD: "1"
+          MEMEXPERT_MAIN_IMAGE: memexpert-main:ci
+          MEMEXPERT_WORKER_IMAGE: memexpert-worker:ci
+          MEMEXPERT_FRONTEND_IMAGE: memexpert-frontend:ci
+          MEMEXPERT_E2E_RUNNER_IMAGE: memexpert-e2e-runner:ci
         run: python scripts/run_container_e2e.py
 
       - name: Upload E2E artifacts on failure
@@ -114,3 +228,88 @@ jobs:
           name: e2e-artifacts
           path: .artifacts/e2e/**
           if-no-files-found: ignore
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract main image metadata
+        if: github.event_name != 'pull_request'
+        id: meta-main
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/averyanalex/memexpert/main
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-,format=short
+
+      - name: Extract worker image metadata
+        if: github.event_name != 'pull_request'
+        id: meta-worker
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/averyanalex/memexpert/worker
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-,format=short
+
+      - name: Extract frontend image metadata
+        if: github.event_name != 'pull_request'
+        id: meta-frontend
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/averyanalex/memexpert/frontend
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-,format=short
+
+      - name: Build and push main image
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          target: main
+          push: true
+          tags: ${{ steps.meta-main.outputs.tags }}
+          labels: ${{ steps.meta-main.outputs.labels }}
+          cache-from: type=gha,scope=memexpert-main
+          cache-to: type=gha,scope=memexpert-main,mode=max
+
+      - name: Build and push worker image
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          target: worker
+          push: true
+          tags: ${{ steps.meta-worker.outputs.tags }}
+          labels: ${{ steps.meta-worker.outputs.labels }}
+          cache-from: type=gha,scope=memexpert-worker
+          cache-to: type=gha,scope=memexpert-worker,mode=max
+
+      - name: Build and push frontend image
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: frontend/Dockerfile
+          push: true
+          tags: ${{ steps.meta-frontend.outputs.tags }}
+          labels: ${{ steps.meta-frontend.outputs.labels }}
+          cache-from: type=gha,scope=memexpert-frontend
+          cache-to: type=gha,scope=memexpert-frontend,mode=max

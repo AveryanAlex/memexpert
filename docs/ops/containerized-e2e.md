@@ -16,6 +16,17 @@ It deliberately has no fixed host ports, no `container_name`, and no fixed Compo
 
 By default, the runner also sets `MEMEXPERT_MAIN_IMAGE`, `MEMEXPERT_WORKER_IMAGE`, `MEMEXPERT_FRONTEND_IMAGE`, and `MEMEXPERT_E2E_RUNNER_IMAGE` to tags derived from the sanitized run id. This avoids concurrent runs racing on mutable global image tags. If you explicitly provide any of those variables, the runner honors your value and does not remove that image tag during cleanup.
 
+Set `E2E_SKIP_IMAGE_BUILD=1` only when all four configured images already exist in the local Docker daemon. In that mode the runner validates the tags up front, uses `docker compose up --no-build`, and skips the separate E2E runner build. CI uses this mode to reuse the images it just built and loaded:
+
+```sh
+MEMEXPERT_MAIN_IMAGE=memexpert-main:ci \
+MEMEXPERT_WORKER_IMAGE=memexpert-worker:ci \
+MEMEXPERT_FRONTEND_IMAGE=memexpert-frontend:ci \
+MEMEXPERT_E2E_RUNNER_IMAGE=memexpert-e2e-runner:ci \
+E2E_SKIP_IMAGE_BUILD=1 \
+python scripts/run_container_e2e.py
+```
+
 ## Providers
 
 Default CI and local E2E runs are deterministic and secret-free:
