@@ -17,6 +17,7 @@ from memexpert.core.storage import build_temp_original_object_key
 from memexpert.ingest.materializer import PipelineIngestMaterializer
 from memexpert.ingest.target_collection_metadata import user_metadata_with_target_collection
 from memexpert.media.contracts import MediaValidationError, NormalizedMediaResult, UploadMediaDetails
+from memexpert.messaging.rabbitmq_outbox_runtime import run_rabbitmq_outbox_publisher_batch
 from memexpert.models.base import utcnow
 from memexpert.models.collection import Collection, CollectionMember, CollectionMeme
 from memexpert.models.content import (
@@ -25,8 +26,8 @@ from memexpert.models.content import (
     MemeFile,
     MemeSource,
     PipelineIngestRequest,
-    PipelineOutboxEvent,
     PipelineStageJournal,
+    RabbitMQOutboxMessage,
 )
 from memexpert.models.enums import (
     CollectionMembershipRole,
@@ -38,17 +39,17 @@ from memexpert.models.enums import (
     IngestFileOrigin,
     ModerationReason,
     PipelineIngestRequestStatus,
-    PipelineOutboxEventStatus,
+    RabbitMQOutboxMessageStatus,
     SourceAttachReason,
     SourcePlatform,
 )
 from memexpert.models.user import User
-from memexpert.pipeline.outbox_runtime import run_pipeline_outbox_publisher_batch
 from memexpert.schemas.content_pipeline import ContentPipelineEventType
 from memexpert.services import PipelineIngestError
 from memexpert.services.search_index_sync import build_qdrant_sync_payload, load_search_index_state
 
 if TYPE_CHECKING:
+    from aio_pika.abc import HeadersType
     from pytest import MonkeyPatch
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -167,6 +168,7 @@ class FakeBroker:
         mandatory: bool = True,
         persist: bool = False,
         content_type: str | None = None,
+        headers: HeadersType | None = None,
         message_id: str | None = None,
         timestamp: object | None = None,
     ) -> object:
@@ -179,6 +181,7 @@ class FakeBroker:
                 "mandatory": mandatory,
                 "persist": persist,
                 "content_type": content_type,
+                "headers": headers,
                 "message_id": message_id,
                 "timestamp": timestamp,
             }
@@ -319,7 +322,7 @@ async def test_materializer_new_content_creates_content_rows_outbox_and_cleans_t
 
     assert result.status is PipelineIngestRequestStatus.MATERIALIZED
     assert result.materialized_meme_file_id is not None
-    assert result.outbox_event_id is not None
+    assert result.outbox_message_id is not None
     assert media_processor.inspect_calls == 1
     assert ingest_request.temp_original_object_key not in storage_client.objects
     assert any(call["Key"] == ingest_request.temp_original_object_key for call in storage_client.delete_calls)
@@ -329,7 +332,7 @@ async def test_materializer_new_content_creates_content_rows_outbox_and_cleans_t
         meme_file = await session.get(MemeFile, result.materialized_meme_file_id)
         sources = (await session.execute(select(MemeSource))).scalars().all()
         stage_rows = (await session.execute(select(PipelineStageJournal))).scalars().all()
-        outbox_rows = (await session.execute(select(PipelineOutboxEvent))).scalars().all()
+        outbox_rows = (await session.execute(select(RabbitMQOutboxMessage))).scalars().all()
 
     assert request is not None
     assert request.status is PipelineIngestRequestStatus.MATERIALIZED
@@ -430,7 +433,7 @@ async def test_materializer_phash_duplicate_creates_new_file_under_existing_meme
         new_source = (
             await session.execute(select(MemeSource).where(MemeSource.file_id == result.materialized_meme_file_id))
         ).scalar_one()
-        outbox_count = await session.scalar(select(func.count()).select_from(PipelineOutboxEvent))
+        outbox_count = await session.scalar(select(func.count()).select_from(RabbitMQOutboxMessage))
 
     assert new_file is not None
     assert new_file.meme_id == existing_file.meme_id
@@ -658,7 +661,7 @@ async def test_materializer_blocked_phash_creates_failed_audit_rows_and_no_trans
     async with postgres_session_factory() as session:
         request = await session.get(PipelineIngestRequest, ingest_request.id)
         meme_file = await session.get(MemeFile, result.materialized_meme_file_id)
-        outbox_count = await session.scalar(select(func.count()).select_from(PipelineOutboxEvent))
+        outbox_count = await session.scalar(select(func.count()).select_from(RabbitMQOutboxMessage))
         collection_meme_count = await session.scalar(select(func.count()).select_from(CollectionMeme))
 
     assert request is not None
@@ -699,7 +702,7 @@ async def test_materializer_invalid_media_marks_request_and_retains_temp_object(
     async with postgres_session_factory() as session:
         request = await session.get(PipelineIngestRequest, ingest_request.id)
         meme_file_count = await session.scalar(select(func.count()).select_from(MemeFile))
-        outbox_count = await session.scalar(select(func.count()).select_from(PipelineOutboxEvent))
+        outbox_count = await session.scalar(select(func.count()).select_from(RabbitMQOutboxMessage))
 
     assert request is not None
     assert request.status is PipelineIngestRequestStatus.FAILED_INVALID_MEDIA
@@ -746,46 +749,65 @@ async def test_outbox_batch_runner_publishes_generically_and_recovers_stale_clai
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     now = utcnow()
-    media_inspect = PipelineOutboxEvent(
+    media_inspect_id = uuid.uuid7()
+    transcode_id = uuid.uuid7()
+    stale_id = uuid.uuid7()
+    media_inspect = RabbitMQOutboxMessage(
+        id=media_inspect_id,
+        exchange="memexpert.pipeline",
         aggregate_type="test",
-        aggregate_id=uuid.uuid7(),
+        aggregate_id=str(uuid.uuid7()),
         event_type="media_inspect_requested",
         routing_key="pipeline.media_inspect",
         payload={"event_type": "media_inspect_requested", "ok": True},
-        status=PipelineOutboxEventStatus.PENDING,
+        headers={},
+        content_type="application/json",
+        message_id=str(media_inspect_id),
+        status=RabbitMQOutboxMessageStatus.PENDING,
         next_retry_at=now,
         created_at=now - timedelta(minutes=3),
     )
-    transcode = PipelineOutboxEvent(
+    transcode = RabbitMQOutboxMessage(
+        id=transcode_id,
+        exchange="memexpert.pipeline",
         aggregate_type="test",
-        aggregate_id=uuid.uuid7(),
+        aggregate_id=str(uuid.uuid7()),
         event_type=ContentPipelineEventType.MEME_CREATED.value,
         routing_key="pipeline.transcode",
         payload={"event_type": ContentPipelineEventType.MEME_CREATED.value, "ok": False},
-        status=PipelineOutboxEventStatus.PENDING,
+        headers={},
+        content_type="application/json",
+        message_id=str(transcode_id),
+        status=RabbitMQOutboxMessageStatus.PENDING,
         next_retry_at=now,
         created_at=now - timedelta(minutes=2),
     )
-    stale = PipelineOutboxEvent(
+    stale = RabbitMQOutboxMessage(
+        id=stale_id,
+        exchange="memexpert.pipeline",
         aggregate_type="test",
-        aggregate_id=uuid.uuid7(),
+        aggregate_id=str(uuid.uuid7()),
         event_type="test_event",
         routing_key="pipeline.stale",
         payload={},
-        status=PipelineOutboxEventStatus.PUBLISHING,
-        updated_at=now - timedelta(hours=1),
+        headers={},
+        content_type="application/json",
+        message_id=str(stale_id),
+        status=RabbitMQOutboxMessageStatus.PUBLISHING,
+        locked_at=now - timedelta(hours=1),
+        lock_owner="stale-test",
         created_at=now - timedelta(minutes=1),
     )
     migrated_db_session.add_all([media_inspect, transcode, stale])
     await migrated_db_session.commit()
 
     broker = FakeBroker(fail_routing_keys={"pipeline.transcode"})
-    result = await run_pipeline_outbox_publisher_batch(
+    result = await run_rabbitmq_outbox_publisher_batch(
         postgres_session_factory,
         settings=Settings.model_validate(
             {
-                "scheduler_pipeline_outbox_publisher_batch_size": 2,
-                "scheduler_pipeline_outbox_publisher_stale_timeout_seconds": 600.0,
+                "scheduler_rabbitmq_outbox_publisher_batch_size": 2,
+                "scheduler_rabbitmq_outbox_publisher_stale_timeout_seconds": 600.0,
             }
         ),
         broker=broker,
@@ -800,19 +822,19 @@ async def test_outbox_batch_runner_publishes_generically_and_recovers_stale_clai
     assert broker.publish_calls[1]["payload"] == transcode.payload
 
     async with postgres_session_factory() as session:
-        published_row = await session.get(PipelineOutboxEvent, media_inspect.id)
-        failed_row = await session.get(PipelineOutboxEvent, transcode.id)
-        recovered_row = await session.get(PipelineOutboxEvent, stale.id)
+        published_row = await session.get(RabbitMQOutboxMessage, media_inspect.id)
+        failed_row = await session.get(RabbitMQOutboxMessage, transcode.id)
+        recovered_row = await session.get(RabbitMQOutboxMessage, stale.id)
 
     assert published_row is not None
-    assert published_row.status is PipelineOutboxEventStatus.PUBLISHED
+    assert published_row.status is RabbitMQOutboxMessageStatus.PUBLISHED
     assert published_row.attempt_count == 1
     assert published_row.published_at is not None
     assert failed_row is not None
-    assert failed_row.status is PipelineOutboxEventStatus.FAILED
+    assert failed_row.status is RabbitMQOutboxMessageStatus.FAILED
     assert failed_row.attempt_count == 1
     assert failed_row.next_retry_at is not None
     assert recovered_row is not None
-    assert recovered_row.status is PipelineOutboxEventStatus.FAILED
+    assert recovered_row.status is RabbitMQOutboxMessageStatus.FAILED
     assert recovered_row.next_retry_at is not None
-    assert recovered_row.last_error_text == "Outbox event was recovered from a stale publishing claim."
+    assert recovered_row.last_error_text == "RabbitMQ outbox message was recovered from a stale publishing lease."

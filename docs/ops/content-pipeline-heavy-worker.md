@@ -5,7 +5,7 @@ the real heavy-worker chain (`transcode → ocr → embed → classify → meme_
 running against the live local stack plus `/home/alex/Documents/MemeDataset`.
 
 Stage 3a of the ingest-request refactor moves manual uploads through raw
-`pipeline_ingest_requests` plus `pipeline_outbox_events`. New uploads first land
+`pipeline_ingest_requests` plus `rabbitmq_outbox_messages`. New uploads first land
 as temp originals, then the worker consumes `media_inspect_requested`, runs the
 worker-only media inspector/pHash checks, materializes `Meme`/`MemeFile` state,
 and writes the downstream transcode event back to the transactional outbox.
@@ -139,11 +139,11 @@ Operational rules:
 3. `materialized` and `failed_blocked_phash` should have a canonical original
    under `pipeline/originals/<meme_file_id>/...`; their temp object is safe to
    delete and the worker does this idempotently after commit.
-4. `pipeline_outbox_events.status=failed` is retryable when `next_retry_at` is
-   due. The `pipeline-outbox-publisher` job in `memexpert-scheduler` claims
+4. `rabbitmq_outbox_messages.status=failed` is retryable when `next_retry_at` is
+   due. The `rabbitmq-outbox-publisher` job in `memexpert-scheduler` claims
    pending/failed rows generically and does not care whether the event is
    `media_inspect_requested` or `meme_created`.
-5. `pipeline_outbox_events.status=publishing` older than the publisher lease
+5. `rabbitmq_outbox_messages.status=publishing` older than the publisher lease
    window indicates a crashed publisher. Each scheduler publisher run first
    recovers those rows to `failed` with `next_retry_at=now`, then claims a
    bounded publish batch.
@@ -175,8 +175,8 @@ rm -rf .artifacts/s02-runtime-smoke
   replay a non-retryable failure.
 - **Uploads stay `media_inspect_pending`**: the transactional outbox publisher
   is not running or cannot publish to RabbitMQ. Confirm `memexpert-scheduler`
-  has the `pipeline-outbox-publisher` job enabled, inspect
-  `pipeline_outbox_events` for due `pending`/`failed` rows, and check
+  has the `rabbitmq-outbox-publisher` job enabled, inspect
+  `rabbitmq_outbox_messages` for due `pending`/`failed` rows, and check
   `scheduler_job_batch_result` logs for `claimed`, `published`, `failed`, and
   `recovered` counts.
 - **Uploads stay `media_inspecting`**: a media-inspect worker likely died while

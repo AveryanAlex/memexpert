@@ -32,6 +32,10 @@ from memexpert.core.qdrant import PipelineQdrantSyncClient
 from memexpert.core.storage import get_pipeline_storage_settings, get_s3_client
 from memexpert.core.voyage import build_pipeline_voyage_client
 from memexpert.ingest.schemas import IngestRequestRead
+from memexpert.messaging.rabbitmq_outbox_runtime import (
+    RabbitMQOutboxPublisherBatchResult,
+    run_rabbitmq_outbox_publisher_batch,
+)
 from memexpert.models.base import utcnow
 from memexpert.models.collection import Collection, CollectionInvite, CollectionMember, CollectionMeme, PinnedMeme
 from memexpert.models.content import (
@@ -65,7 +69,6 @@ from memexpert.models.enums import (
     SyncTargetStatus,
 )
 from memexpert.models.user import User
-from memexpert.pipeline.outbox_runtime import PipelineOutboxPublisherBatchResult, run_pipeline_outbox_publisher_batch
 from memexpert.schemas.content_pipeline import (
     ContentPipelineErrorResponse,
     ContentPipelineItemDetail,
@@ -1497,9 +1500,9 @@ async def wait_for_ingest_materialized_meme_file(
 ) -> tuple[IngestRequestRead, uuid.UUID]:
     deadline = time.monotonic() + timeout_seconds
     last_request: IngestRequestRead | None = None
-    last_outbox_result: PipelineOutboxPublisherBatchResult | None = None
+    last_outbox_result: RabbitMQOutboxPublisherBatchResult | None = None
     while time.monotonic() < deadline:
-        last_outbox_result = await publish_pending_pipeline_outbox(
+        last_outbox_result = await publish_pending_rabbitmq_outbox(
             settings=settings,
             session_factory=session_factory,
         )
@@ -1531,9 +1534,9 @@ async def wait_for_dual_synced(
 ) -> ContentPipelineItemDetail:
     deadline = time.monotonic() + timeout_seconds
     last_detail: ContentPipelineItemDetail | None = None
-    last_outbox_result: PipelineOutboxPublisherBatchResult | None = None
+    last_outbox_result: RabbitMQOutboxPublisherBatchResult | None = None
     while time.monotonic() < deadline:
-        last_outbox_result = await publish_pending_pipeline_outbox(
+        last_outbox_result = await publish_pending_rabbitmq_outbox(
             settings=settings,
             session_factory=session_factory,
         )
@@ -1556,15 +1559,15 @@ async def wait_for_dual_synced(
     )
 
 
-async def publish_pending_pipeline_outbox(
+async def publish_pending_rabbitmq_outbox(
     *,
     settings: Settings,
     session_factory: AsyncSessionFactory,
-) -> PipelineOutboxPublisherBatchResult:
-    return await run_pipeline_outbox_publisher_batch(session_factory, settings=settings)
+) -> RabbitMQOutboxPublisherBatchResult:
+    return await run_rabbitmq_outbox_publisher_batch(session_factory, settings=settings)
 
 
-def _outbox_result_snapshot(result: PipelineOutboxPublisherBatchResult | None) -> dict[str, int | float] | None:
+def _outbox_result_snapshot(result: RabbitMQOutboxPublisherBatchResult | None) -> dict[str, int | float] | None:
     if result is None:
         return None
     return {

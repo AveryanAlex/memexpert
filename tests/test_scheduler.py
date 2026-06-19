@@ -15,12 +15,12 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncEngine
 
 from memexpert.core.config import Settings
-from memexpert.pipeline.outbox_runtime import PipelineOutboxPublisherBatchResult
+from memexpert.messaging.rabbitmq_outbox_runtime import RabbitMQOutboxPublisherBatchResult
 from memexpert.scheduler.jobs import (
     JOB_ID_MATERIALIZED_VIEW_REFRESH,
     JOB_ID_MOTD,
-    JOB_ID_PIPELINE_OUTBOX_PUBLISHER,
     JOB_ID_POPULARITY_SNAPSHOTS,
+    JOB_ID_RABBITMQ_OUTBOX_PUBLISHER,
     JOB_ID_SEARCH_INDEX_SYNC,
     JOB_ID_SEO_BACKLOG_BATCHES,
     build_scheduler_job_definitions,
@@ -197,7 +197,7 @@ def test_scheduler_job_definitions_register_expected_ids() -> None:
         JOB_ID_MOTD,
         JOB_ID_SEARCH_INDEX_SYNC,
         JOB_ID_SEO_BACKLOG_BATCHES,
-        JOB_ID_PIPELINE_OUTBOX_PUBLISHER,
+        JOB_ID_RABBITMQ_OUTBOX_PUBLISHER,
     ]
 
 
@@ -209,7 +209,7 @@ def test_enabled_scheduler_jobs_filters_disabled_jobs() -> None:
             "scheduler_motd_enabled": False,
             "scheduler_search_index_sync_enabled": True,
             "scheduler_seo_backlog_batches_enabled": False,
-            "scheduler_pipeline_outbox_publisher_enabled": False,
+            "scheduler_rabbitmq_outbox_publisher_enabled": False,
         }
     )
 
@@ -363,8 +363,8 @@ async def test_seo_backlog_job_calls_batch_service_and_logs_result(monkeypatch: 
 
 
 @pytest.mark.asyncio
-async def test_pipeline_outbox_publisher_job_calls_runtime_and_logs_result(monkeypatch: pytest.MonkeyPatch) -> None:
-    settings = Settings.model_validate({"scheduler_pipeline_outbox_publisher_enabled": True})
+async def test_rabbitmq_outbox_publisher_job_calls_runtime_and_logs_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = Settings.model_validate({"scheduler_rabbitmq_outbox_publisher_enabled": True})
     engine = cast("AsyncEngine", object())
     session_factory = object()
     called: dict[str, object] = {}
@@ -378,10 +378,10 @@ async def test_pipeline_outbox_publisher_job_calls_runtime_and_logs_result(monke
         session_factory_arg: object,
         *,
         settings: Settings,
-    ) -> PipelineOutboxPublisherBatchResult:
+    ) -> RabbitMQOutboxPublisherBatchResult:
         called["session_factory"] = session_factory_arg
         called["settings"] = settings
-        return PipelineOutboxPublisherBatchResult(
+        return RabbitMQOutboxPublisherBatchResult(
             recovered=1,
             claimed=3,
             published=2,
@@ -394,20 +394,20 @@ async def test_pipeline_outbox_publisher_job_calls_runtime_and_logs_result(monke
         info_calls.append((message, extra))
 
     monkeypatch.setattr("memexpert.scheduler.jobs.build_async_session_factory", fake_build_session_factory)
-    monkeypatch.setattr("memexpert.scheduler.jobs.run_pipeline_outbox_publisher_batch", fake_run_batch)
+    monkeypatch.setattr("memexpert.scheduler.jobs.run_rabbitmq_outbox_publisher_batch", fake_run_batch)
     monkeypatch.setattr("memexpert.scheduler.jobs.logger.info", fake_info)
 
     definition = build_scheduler_job_definitions(settings, engine=engine)[5]
     await definition.action()
 
-    assert definition.id == JOB_ID_PIPELINE_OUTBOX_PUBLISHER
+    assert definition.id == JOB_ID_RABBITMQ_OUTBOX_PUBLISHER
     assert called == {"engine": engine, "session_factory": session_factory, "settings": settings}
     assert info_calls == [
         (
             "scheduler_job_batch_result",
             {
                 "event": "scheduler_job_batch_result",
-                "job_id": JOB_ID_PIPELINE_OUTBOX_PUBLISHER,
+                "job_id": JOB_ID_RABBITMQ_OUTBOX_PUBLISHER,
                 "recovered": 1,
                 "claimed": 3,
                 "published": 2,
@@ -498,7 +498,7 @@ async def test_scheduler_runtime_registers_enabled_jobs_and_shuts_down_gracefull
             "scheduler_motd_enabled": True,
             "scheduler_search_index_sync_enabled": False,
             "scheduler_seo_backlog_batches_enabled": True,
-            "scheduler_pipeline_outbox_publisher_enabled": False,
+            "scheduler_rabbitmq_outbox_publisher_enabled": False,
             "scheduler_advisory_lock_enabled": False,
         }
     )
@@ -537,7 +537,7 @@ async def test_scheduler_runtime_skips_disabled_jobs() -> None:
             "scheduler_motd_enabled": False,
             "scheduler_search_index_sync_enabled": False,
             "scheduler_seo_backlog_batches_enabled": False,
-            "scheduler_pipeline_outbox_publisher_enabled": False,
+            "scheduler_rabbitmq_outbox_publisher_enabled": False,
             "scheduler_advisory_lock_enabled": False,
         }
     )

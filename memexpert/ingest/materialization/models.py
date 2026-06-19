@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Protocol
 if TYPE_CHECKING:
     import uuid
 
-    from memexpert.models.content import BlockedPerceptualHash, PipelineIngestRequest, PipelineOutboxEvent
+    from memexpert.models.content import BlockedPerceptualHash, PipelineIngestRequest
     from memexpert.models.enums import ContentKind, PipelineIngestRequestStatus
 
 
@@ -67,13 +67,13 @@ class PipelineIngestMaterializationResult:
     materialized_meme_id: uuid.UUID | None = None
     materialized_meme_file_id: uuid.UUID | None = None
     matched_meme_file_id: uuid.UUID | None = None
-    outbox_event_id: uuid.UUID | None = None
+    outbox_message_id: uuid.UUID | None = None
 
 
 def build_materialization_result(
     ingest_request: PipelineIngestRequest,
     *,
-    outbox_event: PipelineOutboxEvent | None = None,
+    outbox_message_id: uuid.UUID | None = None,
 ) -> PipelineIngestMaterializationResult:
     """Build the public result from persisted ingest-request state."""
 
@@ -83,7 +83,7 @@ def build_materialization_result(
         materialized_meme_id=ingest_request.materialized_meme_id,
         materialized_meme_file_id=ingest_request.materialized_meme_file_id,
         matched_meme_file_id=ingest_request.matched_meme_file_id,
-        outbox_event_id=outbox_event.id if outbox_event is not None else None,
+        outbox_message_id=outbox_message_id,
     )
 
 

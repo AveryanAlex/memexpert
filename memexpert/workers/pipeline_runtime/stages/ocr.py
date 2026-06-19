@@ -40,7 +40,7 @@ async def run_ocr_stage(
         source_object_key=source_object_key,
     )
     async with context.session_factory() as session:
-        service = PipelineStageCompletionService(session, settings=context.settings)
+        service = PipelineStageCompletionService(session, settings=context.settings, broker=context.broker)
         await service.complete_ocr_stage(
             meme_file_id=dispatch_event.meme_file_id,
             attempt=attempt,

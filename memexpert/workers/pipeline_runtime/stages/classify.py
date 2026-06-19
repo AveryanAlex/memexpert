@@ -26,7 +26,7 @@ async def run_classify_stage(
         mime_type="image/png",
     )
     async with context.session_factory() as session:
-        service = PipelineStageCompletionService(session, settings=context.settings)
+        service = PipelineStageCompletionService(session, settings=context.settings, broker=context.broker)
         await service.complete_classify_stage(
             meme_file_id=dispatch_event.meme_file_id,
             attempt=attempt,

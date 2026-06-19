@@ -150,15 +150,15 @@ pnpm build
 | Meme of the Day placeholder | `SCHEDULER_MOTD_ENABLED` | `SCHEDULER_MOTD_INTERVAL_SECONDS` | `86400` seconds |
 | Search-index sync batches | `SCHEDULER_SEARCH_INDEX_SYNC_ENABLED` | `SCHEDULER_SEARCH_INDEX_SYNC_INTERVAL_SECONDS` | `600` seconds |
 | SEO backlog batches | `SCHEDULER_SEO_BACKLOG_BATCHES_ENABLED` | `SCHEDULER_SEO_BACKLOG_BATCHES_INTERVAL_SECONDS` | `900` seconds |
-| Pipeline outbox publisher | `SCHEDULER_PIPELINE_OUTBOX_PUBLISHER_ENABLED` | `SCHEDULER_PIPELINE_OUTBOX_PUBLISHER_INTERVAL_SECONDS` | `5` seconds |
+| RabbitMQ outbox publisher | `SCHEDULER_RABBITMQ_OUTBOX_PUBLISHER_ENABLED` | `SCHEDULER_RABBITMQ_OUTBOX_PUBLISHER_INTERVAL_SECONDS` | `5` seconds |
 
-The public trend materialized-view refresh, popularity snapshot capture, search-index sync batches, SEO backlog batches, and pipeline outbox publisher perform real business work. MOTD remains a deliberate no-op placeholder while the product behavior is deferred.
+The public trend materialized-view refresh, popularity snapshot capture, search-index sync batches, SEO backlog batches, and RabbitMQ outbox publisher perform real business work. MOTD remains a deliberate no-op placeholder while the product behavior is deferred.
 
 Search-index sync batches process up to `SCHEDULER_SEARCH_INDEX_SYNC_BATCH_SIZE=50` rows per target per run. The job claims `meme_file_sync_target_snapshots` rows for both Qdrant and Meilisearch, commits the `processing` claim before external writes, retries failed rows, reclaims stale `processing` rows after `SCHEDULER_SEARCH_INDEX_SYNC_PROCESSING_TIMEOUT_SECONDS=900`, and reprocesses synced rows when canonical meme/search metadata is newer than `last_success_at`.
 
 SEO backlog batches process up to `SCHEDULER_SEO_BACKLOG_BATCH_SIZE=25` memes per run. The job prioritizes public, non-NSFW memes missing SEO pages, then stale auto-generated pages whose `prompt_version` differs from `PIPELINE_SEO_PROMPT_VERSION`; manually edited pages are skipped.
 
-Pipeline outbox publisher runs every `SCHEDULER_PIPELINE_OUTBOX_PUBLISHER_INTERVAL_SECONDS=5` seconds by default. Each run starts or reuses the RabbitMQ pipeline broker, recovers `pipeline_outbox_events.status='publishing'` rows older than `SCHEDULER_PIPELINE_OUTBOX_PUBLISHER_STALE_TIMEOUT_SECONDS=300`, then publishes up to `SCHEDULER_PIPELINE_OUTBOX_PUBLISHER_BATCH_SIZE=100` due `pending`/`failed` rows by their stored `routing_key` and JSON payload. This is the production path for both accepted raw-upload `media_inspect_requested` events and post-materialization transcode dispatches.
+RabbitMQ outbox publisher runs every `SCHEDULER_RABBITMQ_OUTBOX_PUBLISHER_INTERVAL_SECONDS=5` seconds by default. Each run starts or reuses the RabbitMQ pipeline broker, recovers `rabbitmq_outbox_messages.status='publishing'` rows whose `locked_at` is older than `SCHEDULER_RABBITMQ_OUTBOX_PUBLISHER_STALE_TIMEOUT_SECONDS=300`, then publishes up to `SCHEDULER_RABBITMQ_OUTBOX_PUBLISHER_BATCH_SIZE=100` due `pending`/`failed` rows by their stored `exchange`, `routing_key`, JSON payload, headers, and stable `message_id`. This is the production path for accepted raw-upload `media_inspect_requested` events, post-materialization transcode dispatches, stage fan-out, replay, and sync-success notifications.
 
 Popularity snapshots use `log1p`-scaled cumulative metrics from persisted tables only. Current metrics are source views, summed source reactions, forwarded/reposted source rows, platform views (`meme_view`/`view`), platform sends (`meme_send`/`share`), platform saves (`meme_save`/`save`), and platform likes (`meme_like`/`favorite`). Snapshot columns for impressions/downloads are deferred, so they are not part of the static popularity score in this stage.
 

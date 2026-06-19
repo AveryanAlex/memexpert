@@ -84,7 +84,7 @@ async def run_sync_meili_stage(
 
     try:
         async with context.session_factory() as session:
-            service = PipelineStageCompletionService(session, settings=context.settings)
+            service = PipelineStageCompletionService(session, settings=context.settings, broker=context.broker)
             _ = await service.complete_sync_meili_stage(
                 meme_file_id=dispatch_event.meme_file_id,
                 attempt=attempt,
@@ -127,7 +127,7 @@ async def _record_sync_meili_failure(
     last_error_text = render_error_text(exc)
     try:
         async with context.session_factory() as session:
-            service = PipelineStageCompletionService(session, settings=context.settings)
+            service = PipelineStageCompletionService(session, settings=context.settings, broker=context.broker)
             _ = await service.fail_sync_meili_stage(
                 meme_file_id=dispatch_event.meme_file_id,
                 attempt=attempt,

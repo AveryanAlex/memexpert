@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import uuid
+import ast
 from datetime import timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 import pytest
@@ -33,8 +35,8 @@ from memexpert.models.content import (
     ModerationDecision,
     ModerationReport,
     PipelineIngestRequest,
-    PipelineOutboxEvent,
     PipelineStageJournal,
+    RabbitMQOutboxMessage,
     SourceChannel,
     TelegramFileIdCache,
     TelegramSessionState,
@@ -117,14 +119,54 @@ EXPECTED_TABLES = {
     "moderation_reports",
     "pinned_memes",
     "pipeline_ingest_requests",
-    "pipeline_outbox_events",
     "pipeline_stage_journal",
+    "rabbitmq_outbox_messages",
     "source_channels",
     "telegram_file_id_cache",
     "telegram_link_codes",
     "telegram_session_states",
     "users",
 }
+REPO_ROOT = Path(__file__).resolve().parents[2]
+ALLOWED_DIRECT_BROKER_PUBLISH_CALLS = {
+    ("memexpert/messaging/rabbitmq_outbox.py", "publish_rabbit_message_direct"),
+    ("memexpert/workers/pipeline_runtime/runtime.py", "_dead_letter_or_requeue"),
+}
+
+
+class _BrokerPublishCallVisitor(ast.NodeVisitor):
+    def __init__(self) -> None:
+        self.function_stack: list[str] = []
+        self.calls: list[tuple[str, int]] = []
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self.function_stack.append(node.name)
+        self.generic_visit(node)
+        _ = self.function_stack.pop()
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self.function_stack.append(node.name)
+        self.generic_visit(node)
+        _ = self.function_stack.pop()
+
+    def visit_Call(self, node: ast.Call) -> None:
+        if _is_direct_broker_publish_call(node):
+            self.calls.append((self.function_stack[-1] if self.function_stack else "<module>", node.lineno))
+        self.generic_visit(node)
+
+
+def _is_direct_broker_publish_call(node: ast.Call) -> bool:
+    if not isinstance(node.func, ast.Attribute) or node.func.attr != "publish":
+        return False
+    return _receiver_references_broker(node.func.value)
+
+
+def _receiver_references_broker(node: ast.expr) -> bool:
+    if isinstance(node, ast.Name):
+        return "broker" in node.id
+    if isinstance(node, ast.Attribute):
+        return "broker" in node.attr or _receiver_references_broker(node.value)
+    return False
 
 
 @pytest_asyncio.fixture
@@ -214,7 +256,9 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
     assert pipeline_ingest_request_relationships["materialized_meme"].mapper.class_ is Meme
     assert pipeline_ingest_request_relationships["materialized_meme_file"].mapper.class_ is MemeFile
     assert pipeline_ingest_request_relationships["matched_meme_file"].mapper.class_ is MemeFile
-    assert sa_inspect(PipelineOutboxEvent).columns["aggregate_id"] is not None
+    rabbitmq_outbox_columns = sa_inspect(RabbitMQOutboxMessage).columns
+    assert rabbitmq_outbox_columns["aggregate_id"] is not None
+    assert rabbitmq_outbox_columns["message_id"] is not None
     assert metadata.tables["admin_meme_destructive_audit_logs"].c["admin_user_id"].foreign_keys
     assert metadata.tables["blocked_perceptual_hashes"].c["created_by_admin_user_id"].foreign_keys
     assert metadata.tables["blocked_perceptual_hash_audit_logs"].c["admin_user_id"].foreign_keys
@@ -227,6 +271,17 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
     assert meme_file_relationships["sync_target_snapshots"].mapper.class_ is MemeFileSyncTargetSnapshot
     assert meme_file_relationships["blocked_perceptual_hash"].mapper.class_ is BlockedPerceptualHash
     assert sa_inspect(BlockedPerceptualHashAuditLog).columns["blocked_perceptual_hash_id"] is not None
+
+
+def test_direct_broker_publish_calls_stay_grep_auditable() -> None:
+    direct_publish_calls: set[tuple[str, str]] = set()
+    for path in sorted((REPO_ROOT / "memexpert").rglob("*.py")):
+        relative_path = path.relative_to(REPO_ROOT).as_posix()
+        visitor = _BrokerPublishCallVisitor()
+        visitor.visit(ast.parse(path.read_text(), filename=str(path)))
+        direct_publish_calls.update((relative_path, function_name) for function_name, _ in visitor.calls)
+
+    assert direct_publish_calls == ALLOWED_DIRECT_BROKER_PUBLISH_CALLS
 
 
 async def test_metadata_creates_full_schema_on_postgres(postgres_async_engine: AsyncEngine) -> None:

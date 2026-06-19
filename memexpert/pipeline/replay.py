@@ -19,14 +19,14 @@ from memexpert.models.enums import (
 )
 from memexpert.pipeline import constants as _consts
 from memexpert.pipeline.dispatch import PipelineDispatchingService
-from memexpert.pipeline.helpers import is_replay_reserved, reserve_replay, snapshot_stage, sorted_stage_entries
+from memexpert.pipeline.helpers import is_replay_reserved, reserve_replay, sorted_stage_entries
 from memexpert.pipeline.sync_status import ensure_sync_replay_allowed, upsert_sync_target_snapshot
 from memexpert.schemas.content_pipeline import (
     ContentPipelineDispatchEvent,
     ContentPipelineEventType,
     ContentPipelineReplayAccepted,
 )
-from memexpert.services.errors import PipelineIngestError, PipelinePublishError, PipelineReplayNotAllowedError
+from memexpert.services.errors import PipelineIngestError, PipelineReplayNotAllowedError
 
 
 class PipelineReplayService(PipelineDispatchingService):
@@ -71,20 +71,15 @@ class PipelineReplayService(PipelineDispatchingService):
             attempt=replay_attempt,
             created_at=utcnow(),
         )
-        snapshot = snapshot_stage(target_entry)
-
         reserve_replay(target_entry, replay_event)
+        outbox_message_id = await self._enqueue_dispatch_event(replay_event)
         try:
             await self._session.commit()
         except SQLAlchemyError as exc:
             await self._session.rollback()
             raise PipelineIngestError("Failed to persist replay reservation state.") from exc
 
-        try:
-            await self._publisher(replay_event)
-        except Exception as exc:
-            await self._restore_stage_snapshot(target_entry.id, snapshot)
-            raise PipelinePublishError("Replay was reserved, but downstream dispatch failed.") from exc
+        await self._relay_outbox_messages_after_commit((outbox_message_id,))
 
         return ContentPipelineReplayAccepted(
             meme_file_id=meme_file.id,
@@ -167,7 +162,6 @@ class PipelineReplayService(PipelineDispatchingService):
             attempt=replay_attempt,
             created_at=utcnow(),
         )
-        snapshot = snapshot_stage(stage_entry)
         reserve_replay(stage_entry, replay_event)
 
         await upsert_sync_target_snapshot(
@@ -182,6 +176,7 @@ class PipelineReplayService(PipelineDispatchingService):
             bump_attempt=False,
             record_success=False,
         )
+        outbox_message_id = await self._enqueue_dispatch_event(replay_event)
         try:
             await self._session.commit()
         except SQLAlchemyError as exc:
@@ -190,13 +185,7 @@ class PipelineReplayService(PipelineDispatchingService):
                 f"Failed to persist sync replay reservation state for {target.value}.",
             ) from exc
 
-        try:
-            await self._publisher(replay_event)
-        except Exception as exc:
-            await self._restore_stage_snapshot(stage_entry.id, snapshot)
-            raise PipelinePublishError(
-                f"Sync replay was reserved, but downstream dispatch for {target.value} failed.",
-            ) from exc
+        await self._relay_outbox_messages_after_commit((outbox_message_id,))
 
         return ContentPipelineReplayAccepted(
             meme_file_id=meme_file.id,

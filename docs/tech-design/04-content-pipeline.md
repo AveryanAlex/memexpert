@@ -27,7 +27,7 @@ SHA256 is computed immediately after bytes are available, before media inspectio
 | Source identity `(platform, source_id, post_id)` already has a raw ingest request | Return the existing `PipelineIngestRequest`; do not upload or enqueue again. |
 | SHA256 matches an existing non-blocked file | Create/update the ingest request as `resolved_sha_duplicate`, do not inspect media or enqueue media-inspect. Attach a `MemeSource` to the existing file with `attach_reason=sha256_exact_existing_file`. |
 | SHA256 matches an existing blocked/quarantined file | Create/update the ingest request as `resolved_sha_duplicate`, do not inspect media or enqueue media-inspect. Attach a `MemeSource` to the existing blocked file with `attach_reason=blocked_sha256_existing_file`. |
-| SHA miss | Store bytes under the temporary-original prefix, create a `PipelineIngestRequest` with `status=media_inspect_pending`, and write a `pipeline_outbox_events` row in the same DB transaction for a media-inspect worker event carrying `ingest_request_id`. |
+| SHA miss | Store bytes under the temporary-original prefix, create a `PipelineIngestRequest` with `status=media_inspect_pending`, and write a `rabbitmq_outbox_messages` row in the same DB transaction for a media-inspect worker event carrying `ingest_request_id`. |
 | Worker cannot inspect/read media | Mark the ingest request `failed_invalid_media`, record failure code/detail, create no `Meme`/`MemeFile`, and retain the temporary object for operator retention/debugging. No downstream event is written. |
 | Worker finds active blocked pHash | Promote the original to the canonical key, create hidden failed `Meme`/`MemeFile`/`MemeSource` audit rows, mark the ingest request `failed_blocked_phash`, clean the temporary object, and write no normal transcode event. |
 | Worker finds exact pHash match | Treat this as the same conceptual meme but a new physical file. Promote the original to the canonical key, create a new `MemeFile` under the matched file's `Meme`, set `ingest_origin=phash_exact_existing_meme` and `matched_meme_file_id`, attach source with `attach_reason=phash_exact_new_file`, mark the request `materialized`, and write a downstream transcode outbox event transactionally. |
@@ -121,7 +121,7 @@ class MemeTranscoded(BaseModel):
 
 RabbitMQ dead letter exchanges (DLX) handle worker-consume failures. Messages exceeding max retries (5, with exponential backoff) are routed to a dead letter queue (`dlq.*`) for inspection and manual replay. No message is silently lost.
 
-Pipeline entrypoints and the media materializer use a transactional outbox instead of commit-then-publish. `pipeline_outbox_events` rows are written in the same DB transaction as ingest/materialization state, then the `pipeline-outbox-publisher` job in `memexpert-scheduler` starts or reuses the RabbitMQ pipeline broker, recovers stale `publishing` rows, claims due `pending`/`failed` rows with row locks, publishes by stored `routing_key` and JSON payload, and marks rows `published` or `failed` with retry metadata. This generic path handles both raw-upload `media_inspect_requested` events and post-materialization transcode dispatches.
+Pipeline entrypoints, the media materializer, and stage transition services use a generic RabbitMQ transactional outbox instead of commit-then-publish. `rabbitmq_outbox_messages` rows are written in the same DB transaction as ingest/materialization/stage state, then the `rabbitmq-outbox-publisher` job in `memexpert-scheduler` starts or reuses the RabbitMQ pipeline broker, recovers stale `publishing` leases, claims due `pending`/`failed` rows with row locks, publishes by stored `exchange`, `routing_key`, JSON payload, headers, and stable `message_id`, and marks rows `published` or `failed` with retry metadata. This path handles raw-upload `media_inspect_requested` events, post-materialization transcode dispatches, stage fan-out, replay, and sync-success notifications.
 
 ### Periodic Tasks
 
@@ -130,11 +130,11 @@ Tasks that run on a schedule (not event-driven) are managed by APScheduler in a 
 - Public trend materialized-view refresh (e.g. every 5 min or adaptive)
 - Popularity snapshot computation (initially every 6h; tune after observing traffic)
 - Search-index sync (batched, not per-like)
-- Transactional pipeline outbox publishing for ingest/materialization events
+- Generic RabbitMQ transactional outbox publishing for ingest/materialization/stage events
 - Meme of the Day selection/cache refresh
 - Scheduled SEO generation batches prioritized by popularity/backlog
 
-The current implementation registers these scheduler jobs with independent enable and interval settings. Public trend materialized-view refresh, popularity snapshot computation, search-index sync, SEO backlog batches, and pipeline outbox publishing contain production behavior; Meme of the Day remains a lightweight placeholder until its product behavior is implemented.
+The current implementation registers these scheduler jobs with independent enable and interval settings. Public trend materialized-view refresh, popularity snapshot computation, search-index sync, SEO backlog batches, and RabbitMQ outbox publishing contain production behavior; Meme of the Day remains a lightweight placeholder until its product behavior is implemented.
 
 Guest TTL/deletion jobs are intentionally not part of the current product direction.
 

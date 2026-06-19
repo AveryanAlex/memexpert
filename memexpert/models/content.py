@@ -35,7 +35,7 @@ from memexpert.models.enums import (
     ModerationReason,
     ModerationReportStatus,
     PipelineIngestRequestStatus,
-    PipelineOutboxEventStatus,
+    RabbitMQOutboxMessageStatus,
     SourceAttachReason,
     SourcePlatform,
     SyncTargetKind,
@@ -562,32 +562,46 @@ class PipelineIngestRequest(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     matched_meme_file: Mapped["MemeFile | None"] = relationship("MemeFile", foreign_keys=[matched_meme_file_id])
 
 
-class PipelineOutboxEvent(UUIDPrimaryKeyMixin, TimestampMixin, Base):
-    """Transactional publish record written with ingest state changes."""
+class RabbitMQOutboxMessage(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """Durable RabbitMQ publish intent written with business state changes."""
 
-    __tablename__ = "pipeline_outbox_events"
+    __tablename__ = "rabbitmq_outbox_messages"
     __table_args__ = (
-        CheckConstraint("attempt_count >= 0", name="pipeline_outbox_events_attempt_count_non_negative"),
-        CheckConstraint("aggregate_type <> ''", name="pipeline_outbox_events_aggregate_type_not_blank"),
-        CheckConstraint("event_type <> ''", name="pipeline_outbox_events_event_type_not_blank"),
-        CheckConstraint("routing_key <> ''", name="pipeline_outbox_events_routing_key_not_blank"),
-        Index("ix_pipeline_outbox_events_status_retry_created", "status", "next_retry_at", "created_at"),
-        Index("ix_pipeline_outbox_events_aggregate", "aggregate_type", "aggregate_id"),
-        Index("ix_pipeline_outbox_events_event_type_status", "event_type", "status"),
+        UniqueConstraint("message_id", name="uq_rabbitmq_outbox_messages_message_id"),
+        CheckConstraint("attempt_count >= 0", name="rabbitmq_outbox_messages_attempt_count_non_negative"),
+        CheckConstraint("aggregate_id <> ''", name="rabbitmq_outbox_messages_aggregate_id_not_blank"),
+        CheckConstraint("aggregate_type <> ''", name="rabbitmq_outbox_messages_aggregate_type_not_blank"),
+        CheckConstraint("content_type <> ''", name="rabbitmq_outbox_messages_content_type_not_blank"),
+        CheckConstraint("event_type <> ''", name="rabbitmq_outbox_messages_event_type_not_blank"),
+        CheckConstraint("exchange <> ''", name="rabbitmq_outbox_messages_exchange_not_blank"),
+        CheckConstraint("message_id <> ''", name="rabbitmq_outbox_messages_message_id_not_blank"),
+        CheckConstraint("routing_key <> ''", name="rabbitmq_outbox_messages_routing_key_not_blank"),
+        Index("ix_rabbitmq_outbox_messages_status_retry_created", "status", "next_retry_at", "created_at"),
+        Index("ix_rabbitmq_outbox_messages_aggregate", "aggregate_type", "aggregate_id", "created_at"),
+        Index("ix_rabbitmq_outbox_messages_event_status", "event_type", "status"),
+        Index("ix_rabbitmq_outbox_messages_lease", "status", "locked_at"),
+        Index("ix_rabbitmq_outbox_messages_ordering_key_created", "ordering_key", "created_at"),
     )
 
-    aggregate_type: Mapped[str] = mapped_column(String(64), nullable=False)
-    aggregate_id: Mapped[uuid.UUID] = mapped_column(nullable=False)
-    event_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    exchange: Mapped[str] = mapped_column(String(255), nullable=False)
     routing_key: Mapped[str] = mapped_column(String(255), nullable=False)
     payload: Mapped[dict[str, object]] = mapped_column(JSONB, default=dict, nullable=False)
-    status: Mapped[PipelineOutboxEventStatus] = mapped_column(
-        string_enum(PipelineOutboxEventStatus),
-        default=PipelineOutboxEventStatus.PENDING,
+    headers: Mapped[dict[str, object]] = mapped_column(JSONB, default=dict, nullable=False)
+    content_type: Mapped[str] = mapped_column(String(128), default="application/json", nullable=False)
+    message_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    aggregate_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    aggregate_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    ordering_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    status: Mapped[RabbitMQOutboxMessageStatus] = mapped_column(
+        string_enum(RabbitMQOutboxMessageStatus),
+        default=RabbitMQOutboxMessageStatus.PENDING,
         nullable=False,
     )
     attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     next_retry_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    locked_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    lock_owner: Mapped[str | None] = mapped_column(String(255), nullable=True)
     published_at: Mapped[datetime | None] = mapped_column(nullable=True)
     last_error_text: Mapped[str | None] = mapped_column(Text, nullable=True)
 

@@ -2,7 +2,7 @@
 
 This is the historical repeatable operator proof for milestone M002 / slice S01.
 
-Stage 2 of the ingest-request refactor changes `POST /api/v1/pipeline/uploads` to return a raw `IngestRequestRead` and enqueue `media_inspect_requested` in `pipeline_outbox_events`. The old upload-to-`MemeFile` smoke flow is not valid until the next worker materialization stage consumes those outbox events. During this stage, operators should verify raw acceptance with `GET /api/v1/pipeline/ingest-requests` and keep `/api/v1/pipeline/items` for already-materialized `MemeFile` rows only.
+Stage 2 of the ingest-request refactor changes `POST /api/v1/pipeline/uploads` to return a raw `IngestRequestRead` and enqueue `media_inspect_requested` in `rabbitmq_outbox_messages`. The old upload-to-`MemeFile` smoke flow is not valid until the next worker materialization stage consumes those outbox messages. During this stage, operators should verify raw acceptance with `GET /api/v1/pipeline/ingest-requests` and keep `/api/v1/pipeline/items` for already-materialized `MemeFile` rows only.
 
 It uses the real local dataset at `/home/alex/Documents/MemeDataset`, the live Docker Compose infrastructure, and native API/worker processes. It does **not** copy dataset files into the repo.
 

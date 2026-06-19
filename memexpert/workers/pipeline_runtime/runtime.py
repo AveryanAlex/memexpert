@@ -373,6 +373,7 @@ class PipelineRuntime:
             qdrant_sync_client=self.qdrant_sync_client,
             meilisearch_sync_client=self.meilisearch_sync_client,
             classification_client=self.classification_client,
+            broker=self.broker,
         )
 
     async def _start_stage_processing(
@@ -422,6 +423,7 @@ class PipelineRuntime:
         return PipelineStageCompletionService(
             session,
             settings=self.settings,
+            broker=self.broker,
         )
 
     async def run(self, *, stop_event: asyncio.Event | None = None) -> None:
@@ -542,6 +544,7 @@ class PipelineRuntime:
         normalized_reason: str,
     ) -> None:
         try:
+            # Direct publish exception: keep the original delivery unacked until DLX transfer succeeds.
             _ = await self.broker.publish(
                 payload,
                 exchange=self.dead_letter_exchange,
