@@ -32,6 +32,7 @@ from memexpert.models.content import (
     MemeTemplate,
 )
 from memexpert.models.enums import (
+    AccountType,
     AnalyticsEventType,
     CollectionKind,
     CollectionMembershipRole,
@@ -58,6 +59,7 @@ from memexpert.services.public_trends import (
 )
 from memexpert.services.search_index_sync import SEARCH_INDEX_ALGORITHM_VERSION
 from tests.factories import build_full_user
+from tests.integration.test_auth_routes import ACCESS_COOKIE_NAME
 
 pytestmark = pytest.mark.asyncio
 
@@ -647,6 +649,219 @@ async def test_search_route_uses_plain_text_semantic_path_with_overridden_fakes(
     }
 
 
+async def test_home_feed_route_returns_public_personalized_recommendations(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    viewer = build_full_user()
+    migrated_db_session.add(viewer)
+    await migrated_db_session.flush()
+    source = await _create_meme(migrated_db_session, popularity_score=1.0)
+    public_candidate = await _create_meme(migrated_db_session, popularity_score=10.0)
+    private_candidate = await _create_meme(
+        migrated_db_session,
+        is_public=False,
+        author_user_id=viewer.id,
+        popularity_score=100.0,
+        s3_original_key="pipeline/originals/private/home-feed-personalized-hidden.jpg",
+    )
+    migrated_db_session.add(
+        AnalyticsEvent(
+            user_id=viewer.id,
+            event_type=AnalyticsEventType.MEME_LIKE,
+            payload={"refs": {"meme_id": str(source.id)}},
+        )
+    )
+    await _add_image_embedding(migrated_db_session, source, (1.0, 0.0))
+    await migrated_db_session.commit()
+    semantic_client = FakeSemanticSearchClient(
+        (
+            QdrantUserSearchMatch(
+                meme_file_id=_primary_file_id(private_candidate),
+                meme_id=private_candidate.id,
+                semantic_score=0.99,
+            ),
+            QdrantUserSearchMatch(
+                meme_file_id=_primary_file_id(public_candidate),
+                meme_id=public_candidate.id,
+                semantic_score=0.9,
+            ),
+        )
+    )
+    service = MemeSearchService(
+        migrated_db_session,
+        semantic_client=semantic_client,
+        settings=Settings.model_validate(
+            {"pipeline_voyage_output_dimensions": 2, "recommendation_qdrant_candidate_limit": 5}
+        ),
+    )
+    _install_meme_route_overrides(app, migrated_db_session, current_user=_user_read(viewer), service=service)
+
+    try:
+        response = await client.get("/api/v1/memes/home-feed", params={"limit": 10})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert str(private_candidate.id) not in response.text
+    assert "home-feed-personalized-hidden.jpg" not in response.text
+    payload = response.json()
+    assert [item["meme"]["id"] for item in payload["items"]] == [str(public_candidate.id)]
+    _assert_public_page_attribution(
+        payload,
+        source_algorithm="personalized_recommendations",
+        surface="public_api_home_feed",
+    )
+    attribution = payload["items"][0]["attribution"]
+    assert attribution["reason"] == "qdrant_preference_vector"
+    assert attribution["filters"]["scope"] == "public"
+    assert attribution["collection_scope"] == "public"
+    assert attribution["query"] is None
+    assert "score" not in payload["items"][0]
+    assert "s3_original_key" not in payload["items"][0]["meme"]["primary_file"]
+    assert semantic_client.calls == [
+        {
+            "query_vector": (1.0, 0.0),
+            "limit": 5,
+            "prefilter": _expected_prefilter(scope=SearchIndexPrefilterScope.PUBLIC, viewer_user_id=viewer.id),
+        }
+    ]
+
+
+async def test_home_feed_route_cold_start_falls_back_to_public_trending(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    viewer = build_full_user()
+    migrated_db_session.add(viewer)
+    await migrated_db_session.flush()
+    public_meme = await _create_meme(migrated_db_session, popularity_score=10.0)
+    private_meme = await _create_meme(
+        migrated_db_session,
+        is_public=False,
+        author_user_id=viewer.id,
+        popularity_score=100.0,
+        s3_original_key="pipeline/originals/private/home-feed-fallback-hidden.jpg",
+    )
+    await migrated_db_session.commit()
+    service = MemeSearchService(migrated_db_session)
+    _install_meme_route_overrides(app, migrated_db_session, current_user=_user_read(viewer), service=service)
+
+    try:
+        response = await client.get("/api/v1/memes/home-feed", params={"limit": 10})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert str(private_meme.id) not in response.text
+    assert "home-feed-fallback-hidden.jpg" not in response.text
+    payload = response.json()
+    assert [item["meme"]["id"] for item in payload["items"]] == [str(public_meme.id)]
+    _assert_public_page_attribution(payload, source_algorithm="fallback_trending", surface="public_api_home_feed")
+    attribution = payload["items"][0]["attribution"]
+    assert attribution["reason"] == "cold_start_no_positive_signals"
+    assert attribution["filters"]["scope"] == "public"
+    assert attribution["collection_scope"] == "public"
+    assert "score" not in payload["items"][0]
+    assert "s3_original_key" not in payload["items"][0]["meme"]["primary_file"]
+
+
+async def test_home_feed_route_gates_include_nsfw_by_user_preference(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    nsfw_enabled_viewer = build_full_user(nsfw_enabled=True)
+    nsfw_disabled_viewer = build_full_user(nsfw_enabled=False)
+    migrated_db_session.add_all([nsfw_enabled_viewer, nsfw_disabled_viewer])
+    await migrated_db_session.flush()
+    safe_meme = await _create_meme(migrated_db_session, popularity_score=10.0)
+    nsfw_meme = await _create_meme(migrated_db_session, is_nsfw=True, popularity_score=100.0)
+    await migrated_db_session.commit()
+    service = MemeSearchService(migrated_db_session)
+
+    _install_meme_route_overrides(
+        app,
+        migrated_db_session,
+        current_user=_user_read(nsfw_disabled_viewer),
+        service=service,
+    )
+    try:
+        disabled_response = await client.get(
+            "/api/v1/memes/home-feed",
+            params={"include_nsfw": True, "limit": 10},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    _install_meme_route_overrides(
+        app,
+        migrated_db_session,
+        current_user=_user_read(nsfw_enabled_viewer),
+        service=service,
+    )
+    try:
+        enabled_response = await client.get(
+            "/api/v1/memes/home-feed",
+            params={"include_nsfw": True, "limit": 10},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert disabled_response.status_code == 200
+    disabled_payload = disabled_response.json()
+    assert [item["meme"]["id"] for item in disabled_payload["items"]] == [str(safe_meme.id)]
+    assert disabled_payload["items"][0]["attribution"]["filters"]["include_nsfw"] is False
+    assert str(nsfw_meme.id) not in disabled_response.text
+
+    assert enabled_response.status_code == 200
+    enabled_payload = enabled_response.json()
+    assert [item["meme"]["id"] for item in enabled_payload["items"]] == [str(nsfw_meme.id), str(safe_meme.id)]
+    assert enabled_payload["items"][0]["attribution"]["filters"]["include_nsfw"] is True
+
+
+async def test_home_feed_no_cookie_bootstraps_and_reuses_guest_session(
+    auth_app: FastAPI,
+    auth_client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    public_meme = await _create_meme(migrated_db_session, popularity_score=10.0)
+    await migrated_db_session.commit()
+    service = MemeSearchService(migrated_db_session)
+
+    def override_meme_search_service() -> MemeSearchService:
+        return service
+
+    auth_app.dependency_overrides[get_meme_search_service] = override_meme_search_service
+    try:
+        first_response = await auth_client.get("/api/v1/memes/home-feed", params={"limit": 1})
+        second_response = await auth_client.get("/api/v1/memes/home-feed", params={"limit": 1})
+    finally:
+        auth_app.dependency_overrides.clear()
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    set_cookie_header = first_response.headers["set-cookie"]
+    assert f"{ACCESS_COOKIE_NAME}=" in set_cookie_header
+    assert "HttpOnly" in set_cookie_header
+    assert auth_client.cookies.get(ACCESS_COOKIE_NAME)
+    first_payload = first_response.json()
+    assert [item["meme"]["id"] for item in first_payload["items"]] == [str(public_meme.id)]
+    _assert_public_page_attribution(
+        first_payload,
+        source_algorithm="fallback_trending",
+        surface="public_api_home_feed",
+    )
+    assert first_payload["items"][0]["attribution"]["reason"] == "cold_start_no_positive_signals"
+
+    users = (await migrated_db_session.execute(select(User))).scalars().all()
+    assert len(users) == 1
+    assert users[0].account_type is AccountType.GUEST
+    assert "set-cookie" not in second_response.headers
+
+
 async def test_public_openapi_registers_catalog_routes_without_internal_surface(app: FastAPI) -> None:
     schema = app.openapi()
     paths = schema["paths"]
@@ -654,6 +869,7 @@ async def test_public_openapi_registers_catalog_routes_without_internal_surface(
 
     assert "/api/v1/memes/search" in paths
     assert "/api/v1/memes/browse" in paths
+    assert "/api/v1/memes/home-feed" in paths
     assert "/api/v1/memes/trending" in paths
     assert "/api/v1/memes/trends" in paths
     assert "/api/v1/memes/trends/tags" in paths
@@ -669,8 +885,10 @@ async def test_public_openapi_registers_catalog_routes_without_internal_surface(
     assert "/api/v1/memes/{meme_id}" in paths
     search_parameter_list = paths["/api/v1/memes/search"]["get"]["parameters"]
     browse_parameter_list = paths["/api/v1/memes/browse"]["get"]["parameters"]
+    home_feed_parameter_list = paths["/api/v1/memes/home-feed"]["get"]["parameters"]
     search_parameters = {parameter["name"]: parameter for parameter in search_parameter_list}
     browse_parameters = {parameter["name"]: parameter for parameter in browse_parameter_list}
+    home_feed_parameters = {parameter["name"]: parameter for parameter in home_feed_parameter_list}
     trending_parameters = {
         parameter["name"]: parameter for parameter in paths["/api/v1/memes/trending"]["get"]["parameters"]
     }
@@ -682,6 +900,9 @@ async def test_public_openapi_registers_catalog_routes_without_internal_surface(
     assert "collection_ids" in search_parameters
     assert "scope" in browse_parameters
     assert "collection_ids" in browse_parameters
+    assert set(home_feed_parameters) >= {"language", "media_type", "include_nsfw", "tags", "limit", "offset"}
+    assert "scope" not in home_feed_parameters
+    assert "collection_ids" not in home_feed_parameters
     assert "query_vector" not in search_parameters
     search_scope_schema = search_parameters["scope"]["schema"]
     browse_scope_schema = browse_parameters["scope"]["schema"]

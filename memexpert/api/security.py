@@ -189,7 +189,7 @@ def _is_search_feed_path(segments: tuple[str, ...]) -> bool:
         return False
 
     first_segment = memes_path[0]
-    if first_segment in {"search", "browse", "trending"} and len(memes_path) == 1:
+    if first_segment in {"search", "browse", "home-feed", "trending"} and len(memes_path) == 1:
         return True
     return first_segment == "trends"
 
