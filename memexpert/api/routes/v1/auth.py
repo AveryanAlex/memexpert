@@ -32,6 +32,7 @@ from memexpert.schemas.auth import (
     GoogleAuthRequest,
     GuestBootstrapRequest,
     LinkedProvidersRead,
+    ProfileStatsRead,
     TelegramLinkStartRead,
     TelegramMiniAppAuthRequest,
     TelegramWidgetAuthRequest,
@@ -128,6 +129,21 @@ async def read_current_session(
         ) from exc
 
     return _build_current_session_read(current_user, linked_providers)
+
+
+@router.get(
+    "/profile-stats",
+    response_model=ProfileStatsRead,
+    responses=AUTH_ERROR_RESPONSES,
+    summary="Read profile interaction stats",
+)
+async def read_profile_stats(
+    current_user: AutoGuestUserDep,
+    analytics_service: AnalyticsServiceDep,
+) -> ProfileStatsRead:
+    """Return profile stats derived from the caller's persisted analytics events."""
+
+    return await analytics_service.profile_stats(user_id=current_user.id)
 
 
 @router.post(
