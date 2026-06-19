@@ -1,6 +1,6 @@
 <script lang="ts">
   import { browser } from '$app/environment';
-  import { DEFAULT_PAGE_SIZE, fetchMemePage } from '$lib/api/client';
+  import { DEFAULT_PAGE_SIZE, fetchHomeFeed, fetchMemePage } from '$lib/api/client';
   import type { PublicMemeSearchPageRead } from '$lib/api/types';
   import { Button, EmptyState, LoadingState, Notice } from '$lib/ui';
   import type { Snippet } from 'svelte';
@@ -12,7 +12,8 @@
     memeFeedKey,
     nextMemePageOffset,
     uniqueMemeResults,
-    type MemeFeedFilters
+    type MemeFeedFilters,
+    type MemeFeedSource
   } from './infinite-feed';
   import MemeGrid from './MemeGrid.svelte';
 
@@ -20,6 +21,7 @@
     initialPage,
     filters,
     initialError = null,
+    source = 'catalog',
     label = 'Meme results',
     emptyTitle = 'No memes found',
     emptyMessage = 'Try a shorter phrase, a different synonym, or clear the filters to browse.',
@@ -30,6 +32,7 @@
     initialPage: PublicMemeSearchPageRead;
     filters: MemeFeedFilters;
     initialError?: string | null;
+    source?: MemeFeedSource;
     label?: string;
     emptyTitle?: string;
     emptyMessage?: string;
@@ -52,7 +55,7 @@
   let activeController: AbortController | null = null;
   let loadToken = 0;
 
-  const currentFeedKey = $derived(memeFeedKey(filters));
+  const currentFeedKey = $derived(`${source}:${memeFeedKey(filters)}`);
   const items = $derived(loadedItems ?? uniqueMemeResults(initialPage.items));
   const total = $derived(loadedTotal ?? initialPage.total);
   const limit = $derived(loadedLimit ?? (initialPage.limit || DEFAULT_PAGE_SIZE));
@@ -129,19 +132,24 @@
     loadedErrorMessage = null;
 
     try {
-      const page = await fetchMemePage({
-        fetch: (input, init) => fetch(input, { ...init, signal: controller.signal }),
+      const fetchRequest = {
+        fetch: (input: RequestInfo | URL, init?: RequestInit) => fetch(input, { ...init, signal: controller.signal }),
         baseUrl: window.location.origin,
-        query: filters.query,
         tags: filters.tags,
         includeNsfw: filters.includeNsfw,
         mediaType: filters.mediaType,
         language: filters.language,
-        scope: filters.scope,
-        collectionIds: filters.collectionIds,
         limit,
         offset
-      });
+      };
+      const page = source === 'home' && !filters.query.trim()
+        ? await fetchHomeFeed(fetchRequest)
+        : await fetchMemePage({
+            ...fetchRequest,
+            query: filters.query,
+            scope: filters.scope,
+            collectionIds: filters.collectionIds
+          });
 
       if (token !== loadToken) return;
 

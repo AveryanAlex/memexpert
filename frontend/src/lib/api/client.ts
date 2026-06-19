@@ -58,16 +58,21 @@ interface CatalogRequest {
   onResponse?: (response: Response) => void;
 }
 
-interface PageRequest extends CatalogRequest {
-  query: string;
+interface MemePageFilterParams {
   tags?: string[];
   includeNsfw?: boolean;
   mediaType?: ContentKind | null;
   language?: ContentLanguage | null;
-  scope?: MemeSearchScope | null;
-  collectionIds?: string[];
   limit: number;
   offset: number;
+}
+
+interface HomeFeedRequest extends CatalogRequest, MemePageFilterParams {}
+
+interface PageRequest extends CatalogRequest, MemePageFilterParams {
+  query: string;
+  scope?: MemeSearchScope | null;
+  collectionIds?: string[];
 }
 
 interface DetailRequest extends CatalogRequest {
@@ -192,29 +197,7 @@ export class ApiError extends Error {
 
 export async function fetchMemePage(request: PageRequest): Promise<PublicMemeSearchPageRead> {
   const query = request.query.trim();
-  const params = new URLSearchParams({
-    limit: String(request.limit),
-    offset: String(request.offset)
-  });
-
-  for (const tag of request.tags ?? []) {
-    const normalized = tag.trim();
-    if (normalized) {
-      params.append('tags', normalized);
-    }
-  }
-
-  if (request.includeNsfw !== undefined) {
-    params.set('include_nsfw', String(request.includeNsfw));
-  }
-
-  if (request.mediaType) {
-    params.set('media_type', request.mediaType);
-  }
-
-  if (request.language) {
-    params.set('language', request.language);
-  }
+  const params = memePageParams(request);
 
   if (request.scope) {
     params.set('scope', request.scope);
@@ -235,6 +218,10 @@ export async function fetchMemePage(request: PageRequest): Promise<PublicMemeSea
   }
 
   return apiGet<PublicMemeSearchPageRead>('/api/v1/memes/browse', params, request);
+}
+
+export async function fetchHomeFeed(request: HomeFeedRequest): Promise<PublicMemeSearchPageRead> {
+  return apiGet<PublicMemeSearchPageRead>('/api/v1/memes/home-feed', memePageParams(request), request);
 }
 
 export async function fetchCurrentSession(request: CatalogRequest): Promise<CurrentSessionRead> {
@@ -701,6 +688,34 @@ async function fetchLanding(path: string, request: LandingRequest): Promise<Publ
 
 function seoPageParams(request: SeoCatalogPageRequest): URLSearchParams {
   return new URLSearchParams({ limit: String(request.limit), offset: String(request.offset) });
+}
+
+function memePageParams(request: MemePageFilterParams): URLSearchParams {
+  const params = new URLSearchParams({
+    limit: String(request.limit),
+    offset: String(request.offset)
+  });
+
+  for (const tag of request.tags ?? []) {
+    const normalized = tag.trim();
+    if (normalized) {
+      params.append('tags', normalized);
+    }
+  }
+
+  if (request.includeNsfw !== undefined) {
+    params.set('include_nsfw', String(request.includeNsfw));
+  }
+
+  if (request.mediaType) {
+    params.set('media_type', request.mediaType);
+  }
+
+  if (request.language) {
+    params.set('language', request.language);
+  }
+
+  return params;
 }
 
 async function apiGet<T>(path: string, params: URLSearchParams, request: CatalogRequest): Promise<T> {

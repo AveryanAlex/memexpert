@@ -1,24 +1,36 @@
 import { fail } from '@sveltejs/kit';
 import type { Actions, PageServerLoad } from './$types';
-import { DEFAULT_PAGE_SIZE, ApiError, createCollection, emptyMemePage, fetchCollections, fetchMemePage } from '$lib/api/client';
-import { apiBaseUrl, forwardBackendAccessCookie } from '$lib/server/backend';
+import { DEFAULT_PAGE_SIZE, ApiError, createCollection, emptyMemePage, fetchCollections, fetchHomeFeed, fetchMemePage } from '$lib/api/client';
+import { ACCESS_COOKIE_NAME, apiBaseUrl, cookieHeaderWithAccessToken, forwardBackendAccessCookie } from '$lib/server/backend';
 
 export const load: PageServerLoad = async ({ cookies, fetch, parent, request, url }) => {
   const query = (url.searchParams.get('q') ?? '').trim();
   const offset = readOffset(url.searchParams.get('offset'));
-  const cookieHeader = request.headers.get('cookie') ?? undefined;
   const { session } = await parent();
+  const cookieHeader = cookieHeaderWithAccessToken(
+    request.headers.get('cookie') ?? undefined,
+    cookies.get(ACCESS_COOKIE_NAME) ?? null
+  );
+  const feedSource = query ? 'catalog' : 'home';
 
   try {
     const [page, collections] = await Promise.all([
-      fetchMemePage({
-        fetch,
-        baseUrl: apiBaseUrl(),
-        query,
-        limit: DEFAULT_PAGE_SIZE,
-        offset,
-        cookieHeader
-      }),
+      feedSource === 'home'
+        ? fetchHomeFeed({
+            fetch,
+            baseUrl: apiBaseUrl(),
+            limit: DEFAULT_PAGE_SIZE,
+            offset,
+            cookieHeader
+          })
+        : fetchMemePage({
+            fetch,
+            baseUrl: apiBaseUrl(),
+            query,
+            limit: DEFAULT_PAGE_SIZE,
+            offset,
+            cookieHeader
+          }),
       session
         ? fetchCollections({
             fetch,
@@ -31,7 +43,7 @@ export const load: PageServerLoad = async ({ cookies, fetch, parent, request, ur
         : Promise.resolve(null)
     ]);
 
-    return { page, collections, query, offset, errorMessage: null };
+    return { page, collections, query, offset, feedSource, errorMessage: null };
   } catch (error) {
     if (error instanceof ApiError) {
       return {
@@ -39,6 +51,7 @@ export const load: PageServerLoad = async ({ cookies, fetch, parent, request, ur
         collections: null,
         query,
         offset,
+        feedSource,
         errorMessage: error.message
       };
     }
@@ -48,6 +61,7 @@ export const load: PageServerLoad = async ({ cookies, fetch, parent, request, ur
       collections: null,
       query,
       offset,
+      feedSource,
       errorMessage: 'Could not reach the meme catalog API.'
     };
   }
