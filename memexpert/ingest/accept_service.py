@@ -11,6 +11,7 @@ import hashlib
 import json
 import logging
 import uuid
+from datetime import datetime
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Protocol, Self, cast
 
@@ -32,17 +33,25 @@ from memexpert.ingest.collection_targets import (
     visible_meme_clause,
 )
 from memexpert.ingest.schemas import IngestAcceptOutcome, IngestAcceptResult, IngestAcceptSource, IngestRequestRead
-from memexpert.ingest.source_metadata import source_forward_ids, source_published_at, source_reactions
+from memexpert.ingest.source_metadata import (
+    source_engagement_metrics,
+    source_forward_ids,
+    source_published_at,
+    source_reactions,
+    source_view_count,
+)
 from memexpert.ingest.target_collection_metadata import (
     TargetCollectionMetadataError,
     parse_target_collection_id,
 )
 from memexpert.messaging.rabbitmq_outbox import RabbitPublisher, relay_rabbitmq_outbox_messages_best_effort
+from memexpert.models.base import utcnow
 from memexpert.models.content import Meme, MemeFile, MemeSource, PipelineIngestRequest
 from memexpert.models.enums import (
     ContentProcessingStatus,
     PipelineIngestRequestStatus,
     SourceAttachReason,
+    SourceEngagementCommentsState,
 )
 from memexpert.pipeline.events import build_media_inspect_message_spec
 from memexpert.schemas.pipeline_base import MAX_TELEGRAM_CONTENT_TYPE_LENGTH, MAX_TELEGRAM_FILENAME_LENGTH
@@ -54,6 +63,7 @@ from memexpert.services.errors import (
     PipelineStorageError,
     PipelineUnsupportedMediaTypeError,
 )
+from memexpert.services.source_engagement import add_initial_source_engagement_snapshot
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -134,7 +144,13 @@ class PipelineIngestAcceptService:
         sha256_hex = hashlib.sha256(media_bytes).hexdigest()
         user_metadata = self._normalize_metadata(source.user_metadata, field_name="user_metadata")
         source_metadata = self._normalize_metadata(source.source_metadata, field_name="source_metadata")
-        source_metadata["views"] = source.views
+        self._merge_source_engagement_metadata(
+            source_metadata,
+            view_count=source.view_count,
+            forward_count=source.forward_count,
+            comment_count=source.comment_count,
+            comments_state=source.comments_state,
+        )
         target_collection_id = self._parse_target_collection_id(user_metadata)
         await validate_target_collection_write(
             self._session,
@@ -154,6 +170,7 @@ class PipelineIngestAcceptService:
                 user_metadata=user_metadata,
                 source_metadata=source_metadata,
                 target_collection_id=target_collection_id,
+                accepted_at=utcnow(),
             )
 
         return await self._accept_new_bytes(
@@ -179,6 +196,7 @@ class PipelineIngestAcceptService:
         user_metadata: dict[str, object],
         source_metadata: dict[str, object],
         target_collection_id: uuid.UUID | None,
+        accepted_at: datetime,
     ) -> IngestAcceptResult:
         attach_reason = self._sha_match_attach_reason(matched_file)
         ingest_request = PipelineIngestRequest(
@@ -206,7 +224,7 @@ class PipelineIngestAcceptService:
             platform=source.source_platform,
             source_id=source.source_id,
             post_id=source.post_id,
-            views=source.views,
+            views=source_view_count(source_metadata) or 0,
             reactions=source_reactions(source_metadata),
             is_first_source=False,
             source_alive=True,
@@ -219,6 +237,12 @@ class PipelineIngestAcceptService:
 
         try:
             self._session.add_all([ingest_request, source_row])
+            await add_initial_source_engagement_snapshot(
+                self._session,
+                source_row,
+                source_engagement_metrics(source_metadata),
+                captured_at=accepted_at,
+            )
             if attach_reason is SourceAttachReason.SHA256_EXACT_EXISTING_FILE:
                 await save_meme_to_target_collection(
                     self._session,
@@ -426,6 +450,31 @@ class PipelineIngestAcceptService:
             return cast("dict[str, object]", json.loads(json.dumps(value)))
         except (TypeError, ValueError) as exc:
             raise PipelinePayloadValidationError(f"{field_name} must be JSON-serializable.") from exc
+
+    @staticmethod
+    def _merge_source_engagement_metadata(
+        source_metadata: dict[str, object],
+        *,
+        view_count: int | None,
+        forward_count: int | None,
+        comment_count: int | None,
+        comments_state: SourceEngagementCommentsState,
+    ) -> None:
+        if view_count is not None:
+            source_metadata["view_count"] = view_count
+        elif "view_count" not in source_metadata and "views" in source_metadata:
+            source_metadata["view_count"] = source_view_count(source_metadata)
+        elif "view_count" not in source_metadata:
+            source_metadata["view_count"] = None
+        if forward_count is not None:
+            source_metadata["forward_count"] = forward_count
+        if comment_count is not None:
+            source_metadata["comment_count"] = comment_count
+        if "comments_state" not in source_metadata or comments_state is not SourceEngagementCommentsState.UNKNOWN:
+            source_metadata["comments_state"] = comments_state.value
+        # Transitional legacy column/read-model compatibility only. Canonical
+        # engagement snapshots use ``view_count`` and preserve ``None``.
+        source_metadata["views"] = source_view_count(source_metadata) or 0
 
     @staticmethod
     def _sha_match_attach_reason(matched_file: MemeFile) -> SourceAttachReason:

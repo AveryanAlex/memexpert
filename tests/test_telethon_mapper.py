@@ -20,6 +20,7 @@ from memexpert.crawlers.telegram.client import (
     RawTelegramMessage,
 )
 from memexpert.crawlers.telegram.telethon_mapper import TelethonMessageNormalizer
+from memexpert.models.enums import SourceEngagementCommentsState
 from memexpert.schemas.content_pipeline import CrawlerForwardAttribution
 
 if TYPE_CHECKING:
@@ -73,6 +74,12 @@ class _FakeMessageReactions:
 
 
 @dataclass
+class _FakeMessageReplies:
+    replies: int | None = None
+    comments: bool | None = None
+
+
+@dataclass
 class _FakeDocument:
     mime_type: str | None
 
@@ -84,6 +91,8 @@ class _FakeMessage:
     photo: object | None = None
     document: _FakeDocument | None = None
     views: int | None = None
+    forwards: int | None = None
+    replies: _FakeMessageReplies | None = None
     reactions: _FakeMessageReactions | None = None
     fwd_from: _FakeMessageFwdHeader | None = None
 
@@ -98,6 +107,8 @@ def test_normalizer_builds_photo_projection_with_preserved_raw_payload() -> None
         date=_now(),
         photo=object(),
         views=150,
+        forwards=12,
+        replies=_FakeMessageReplies(replies=5, comments=True),
         reactions=_FakeMessageReactions(
             results=[
                 _FakeReactionCount(reaction=_FakeReactionEmoji(emoticon="heart"), count=7),
@@ -119,7 +130,10 @@ def test_normalizer_builds_photo_projection_with_preserved_raw_payload() -> None
     assert result.channel_title == "Memes Channel"
     assert result.channel_username == "memes"
     assert result.media_type == "photo"
-    assert result.views == 150
+    assert result.view_count == 150
+    assert result.forward_count == 12
+    assert result.comment_count == 5
+    assert result.comments_state is SourceEngagementCommentsState.ENABLED
     assert result.reactions == {"heart": 7, "fire": 3}
     assert result.forward is None
     # raw_payload MUST be preserved so the adapter can hand it back to
@@ -288,7 +302,7 @@ def test_normalizer_rejects_message_without_date() -> None:
         )
 
 
-def test_normalizer_defaults_views_to_zero_when_missing() -> None:
+def test_normalizer_preserves_missing_stats_as_unknown() -> None:
     message = _FakeMessage(id=16, date=_now(), photo=object(), views=None)
     result = TelethonMessageNormalizer.build(
         message=_as_message(message),
@@ -296,7 +310,52 @@ def test_normalizer_defaults_views_to_zero_when_missing() -> None:
         channel_title="C",
         channel_username=None,
     )
-    assert result.views == 0
+    assert result.view_count is None
+    assert result.forward_count is None
+    assert result.comment_count is None
+    assert result.comments_state is SourceEngagementCommentsState.NOT_EXPOSED
+    assert result.reactions is None
+
+
+def test_normalizer_preserves_exposed_empty_reactions_as_known_zero() -> None:
+    message = _FakeMessage(
+        id=18,
+        date=_now(),
+        photo=object(),
+        reactions=_FakeMessageReactions(results=[]),
+    )
+
+    result = TelethonMessageNormalizer.build(
+        message=_as_message(message),
+        channel_id="c",
+        channel_title="C",
+        channel_username=None,
+    )
+
+    assert result.reactions == {}
+
+
+def test_normalizer_maps_disabled_comments_separately_from_missing_stats() -> None:
+    message = _FakeMessage(
+        id=19,
+        date=_now(),
+        photo=object(),
+        views=0,
+        forwards=0,
+        replies=_FakeMessageReplies(replies=0, comments=False),
+    )
+
+    result = TelethonMessageNormalizer.build(
+        message=_as_message(message),
+        channel_id="c",
+        channel_title="C",
+        channel_username=None,
+    )
+
+    assert result.view_count == 0
+    assert result.forward_count == 0
+    assert result.comment_count == 0
+    assert result.comments_state is SourceEngagementCommentsState.DISABLED
 
 
 def test_normalizer_skips_malformed_reactions_without_raising() -> None:

@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Literal, Protocol, runtime_checkable
 
-from memexpert.models.enums import SourcePlatform
+from memexpert.models.enums import SourceEngagementCommentsState, SourcePlatform
 from memexpert.schemas.content_pipeline import (
     CrawlerForwardAttribution,
     RawCrawlerPost,
@@ -86,7 +86,7 @@ class RawTelegramChannel:
     subscriber_count: int | None
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class RawTelegramMessage:
     """Typed adapter-level projection of one Telegram channel message.
 
@@ -103,10 +103,51 @@ class RawTelegramMessage:
     channel_title: str
     published_at: datetime
     media_type: Literal["photo", "gif", "video", "unsupported"] | None
-    views: int
-    reactions: dict[str, int] = field(default_factory=dict)
-    forward: CrawlerForwardAttribution | None = None
-    raw_payload: object = None
+    view_count: int | None
+    reactions: dict[str, int] | None
+    forward: CrawlerForwardAttribution | None
+    forward_count: int | None
+    comment_count: int | None
+    comments_state: SourceEngagementCommentsState
+    raw_payload: object
+
+    def __init__(
+        self,
+        *,
+        message_id: str,
+        channel_id: str,
+        channel_username: str | None,
+        channel_title: str,
+        published_at: datetime,
+        media_type: Literal["photo", "gif", "video", "unsupported"] | None,
+        view_count: int | None = None,
+        views: int | None = None,
+        reactions: dict[str, int] | None = None,
+        forward: CrawlerForwardAttribution | None = None,
+        forward_count: int | None = None,
+        comment_count: int | None = None,
+        comments_state: SourceEngagementCommentsState = SourceEngagementCommentsState.UNKNOWN,
+        raw_payload: object = None,
+    ) -> None:
+        object.__setattr__(self, "message_id", message_id)
+        object.__setattr__(self, "channel_id", channel_id)
+        object.__setattr__(self, "channel_username", channel_username)
+        object.__setattr__(self, "channel_title", channel_title)
+        object.__setattr__(self, "published_at", published_at)
+        object.__setattr__(self, "media_type", media_type)
+        object.__setattr__(self, "view_count", view_count if view_count is not None else views)
+        object.__setattr__(self, "reactions", None if reactions is None else dict(reactions))
+        object.__setattr__(self, "forward", forward)
+        object.__setattr__(self, "forward_count", forward_count)
+        object.__setattr__(self, "comment_count", comment_count)
+        object.__setattr__(self, "comments_state", comments_state)
+        object.__setattr__(self, "raw_payload", raw_payload)
+
+    @property
+    def views(self) -> int | None:
+        """Legacy metric accessor; new code should use ``view_count``."""
+
+        return self.view_count
 
 
 @runtime_checkable
@@ -211,9 +252,12 @@ class PipelineTelegramMessageMapper:
             media_bytes=media_bytes,
             filename=None,
             content_type=None,
-            views=message.views,
-            reactions=dict(message.reactions),
+            view_count=message.view_count,
+            reactions=None if message.reactions is None else dict(message.reactions),
             forward=message.forward,
+            forward_count=message.forward_count,
+            comment_count=message.comment_count,
+            comments_state=message.comments_state,
         )
 
 

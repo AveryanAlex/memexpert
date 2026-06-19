@@ -122,6 +122,10 @@ def attach_crawler_source_row_to_meme_file(
     ``MemeFile`` or pipeline work is created. The new row carries the repost's
     ``published_at``, its forward-chain attribution, and its own
     ``is_first_source`` flag.
+
+    This helper is not currently used by crawler ingest. If it is reintroduced,
+    callers must also add the corresponding initial engagement snapshot in the
+    same transaction.
     """
 
     new_source_row = MemeSource(
@@ -129,8 +133,8 @@ def attach_crawler_source_row_to_meme_file(
         platform=raw_post.platform,
         source_id=raw_post.source_id,
         post_id=raw_post.post_id,
-        views=raw_post.views,
-        reactions=dict(raw_post.reactions),
+        views=raw_post.view_count or 0,
+        reactions=dict(raw_post.reactions or {}),
         is_first_source=is_first_source,
         source_alive=True,
         published_at=raw_post.published_at,

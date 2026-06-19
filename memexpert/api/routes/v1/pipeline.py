@@ -92,7 +92,7 @@ async def create_pipeline_upload(
             post_id=post_id,
             owner_user_id=owner_user_id,
             user_metadata=user_metadata_with_target_collection(target_collection_id=target_collection_id),
-            views=views,
+            view_count=views,
         )
     except PipelinePayloadValidationError as exc:
         raise to_pipeline_http_error(exc) from exc

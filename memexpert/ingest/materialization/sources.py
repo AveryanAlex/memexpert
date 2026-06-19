@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from memexpert.ingest.source_metadata import source_view_count
+
 if TYPE_CHECKING:
     from memexpert.models.content import PipelineIngestRequest
 
@@ -11,10 +13,7 @@ if TYPE_CHECKING:
 def source_views(ingest_request: PipelineIngestRequest) -> int:
     """Normalize source view counts for persisted source rows."""
 
-    raw_views = ingest_request.source_metadata.get("views")
-    if isinstance(raw_views, int) and raw_views >= 0:
-        return raw_views
-    return 0
+    return source_view_count(ingest_request.source_metadata) or 0
 
 
 __all__ = ["source_views"]

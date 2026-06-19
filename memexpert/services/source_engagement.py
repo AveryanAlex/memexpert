@@ -150,6 +150,26 @@ async def add_source_engagement_snapshot(
     return snapshot
 
 
+async def add_initial_source_engagement_snapshot(
+    session: AsyncSession,
+    source: MemeSource,
+    metrics: SourceEngagementMetrics,
+    *,
+    captured_at: datetime | None = None,
+) -> MemeSourceEngagementSnapshot:
+    """Add the canonical initial engagement snapshot for a newly attached source."""
+
+    return await add_source_engagement_snapshot(
+        session,
+        source,
+        metrics,
+        capture_reason=SourceEngagementCaptureReason.INGEST_INITIAL,
+        fetch_status=SourceEngagementFetchStatus.SUCCESS,
+        captured_at=captured_at,
+        schedule_label=SourceEngagementScheduleLabel.INGEST_INITIAL,
+    )
+
+
 def _as_utc(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         return value.replace(tzinfo=UTC)
@@ -177,6 +197,7 @@ def _non_negative_or_none(name: str, value: int | None) -> int | None:
 __all__ = [
     "SourceEngagementMetrics",
     "SourceEngagementScheduleSlot",
+    "add_initial_source_engagement_snapshot",
     "add_source_engagement_snapshot",
     "next_source_engagement_schedule_slot",
     "reaction_count_from_reactions",

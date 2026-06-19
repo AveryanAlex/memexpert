@@ -278,7 +278,10 @@ class PipelineCrawlerIngestService:
             source_platform=SourcePlatform.TELEGRAM,
             source_id=raw_post.source_id,
             post_id=raw_post.post_id,
-            views=raw_post.views,
+            view_count=raw_post.view_count,
+            forward_count=raw_post.forward_count,
+            comment_count=raw_post.comment_count,
+            comments_state=raw_post.comments_state,
             source_metadata=_crawler_source_metadata(raw_post),
         )
 
@@ -361,7 +364,11 @@ def _crawler_source_metadata(raw_post: RawCrawlerPost) -> dict[str, object]:
         "channel_title": raw_post.channel_title,
         "media_type": raw_post.media_type,
         "published_at": raw_post.published_at.isoformat(),
-        "reactions": dict(raw_post.reactions),
+        "view_count": raw_post.view_count,
+        "reactions": None if raw_post.reactions is None else dict(raw_post.reactions),
+        "forward_count": raw_post.forward_count,
+        "comment_count": raw_post.comment_count,
+        "comments_state": raw_post.comments_state.value,
     }
     if raw_post.forward is not None:
         metadata["forward"] = raw_post.forward.model_dump(mode="json")

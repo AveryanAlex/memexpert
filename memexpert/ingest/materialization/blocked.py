@@ -20,6 +20,7 @@ from memexpert.ingest.materialization.models import (
 from memexpert.ingest.materialization.objects import meme_file_id_from_original_key
 from memexpert.ingest.materialization.sources import source_views
 from memexpert.ingest.source_metadata import (
+    source_engagement_metrics,
     source_forward_ids,
     source_is_forwarded,
     source_published_at,
@@ -45,6 +46,7 @@ from memexpert.models.enums import (
 )
 from memexpert.pipeline import constants as _consts
 from memexpert.pipeline.helpers import trim_error_text
+from memexpert.services.source_engagement import add_initial_source_engagement_snapshot
 
 if TYPE_CHECKING:
     from datetime import datetime
@@ -133,6 +135,20 @@ async def _create_blocked_rows(
     error_text = blocked_hash_error_text(blocked_match)
     event_id = uuid.uuid7()
     forwarded_from_source_id, forwarded_from_post_id = source_forward_ids(ingest_request.source_metadata)
+    source_row = MemeSource(
+        file_id=meme_file_id,
+        platform=ingest_request.source_platform,
+        source_id=ingest_request.source_id,
+        post_id=ingest_request.post_id,
+        views=source_views(ingest_request),
+        reactions=source_reactions(ingest_request.source_metadata),
+        is_first_source=not source_is_forwarded(ingest_request.source_metadata),
+        source_alive=True,
+        published_at=source_published_at(ingest_request.source_metadata),
+        forwarded_from_source_id=forwarded_from_source_id,
+        forwarded_from_post_id=forwarded_from_post_id,
+        attach_reason=SourceAttachReason.BLOCKED_PERCEPTUAL_HASH_NEW_FILE,
+    )
     meme = Meme(
         id=meme_id,
         media_type=prepared.media_type,
@@ -162,20 +178,7 @@ async def _create_blocked_rows(
     )
     session.add_all(
         [
-            MemeSource(
-                file_id=meme_file_id,
-                platform=ingest_request.source_platform,
-                source_id=ingest_request.source_id,
-                post_id=ingest_request.post_id,
-                views=source_views(ingest_request),
-                reactions=source_reactions(ingest_request.source_metadata),
-                is_first_source=not source_is_forwarded(ingest_request.source_metadata),
-                source_alive=True,
-                published_at=source_published_at(ingest_request.source_metadata),
-                forwarded_from_source_id=forwarded_from_source_id,
-                forwarded_from_post_id=forwarded_from_post_id,
-                attach_reason=SourceAttachReason.BLOCKED_PERCEPTUAL_HASH_NEW_FILE,
-            ),
+            source_row,
             PipelineStageJournal(
                 meme_file_id=meme_file_id,
                 stage=ContentPipelineStage.INGEST,
@@ -202,6 +205,12 @@ async def _create_blocked_rows(
                 new_template_id=None,
             ),
         ]
+    )
+    await add_initial_source_engagement_snapshot(
+        session,
+        source_row,
+        source_engagement_metrics(ingest_request.source_metadata),
+        captured_at=created_at,
     )
     await session.flush()
 

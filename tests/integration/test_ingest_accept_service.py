@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import uuid
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import pytest
@@ -20,6 +21,7 @@ from memexpert.models.content import (
     Meme,
     MemeFile,
     MemeSource,
+    MemeSourceEngagementSnapshot,
     PipelineIngestRequest,
     RabbitMQOutboxMessage,
 )
@@ -32,10 +34,15 @@ from memexpert.models.enums import (
     PipelineIngestRequestStatus,
     RabbitMQOutboxMessageStatus,
     SourceAttachReason,
+    SourceEngagementCaptureReason,
+    SourceEngagementCommentsState,
+    SourceEngagementFetchStatus,
+    SourceEngagementScheduleLabel,
     SourcePlatform,
 )
 from memexpert.models.user import User
 from memexpert.services import PipelineIngestError
+from memexpert.services.source_engagement import next_source_engagement_schedule_slot
 
 if TYPE_CHECKING:
     from pytest import MonkeyPatch
@@ -79,7 +86,7 @@ def _source(*, source_id: str = "raw-source", post_id: str = "1") -> IngestAccep
         source_platform=SourcePlatform.TELEGRAM,
         source_id=source_id,
         post_id=post_id,
-        views=7,
+        view_count=7,
         source_metadata={"channel_title": "Raw Source"},
     )
 
@@ -225,6 +232,62 @@ async def test_accept_sha_duplicate_resolves_synchronously_and_does_not_enqueue_
     assert sources[0].file_id == meme_file.id
     assert sources[0].attach_reason is SourceAttachReason.SHA256_EXACT_EXISTING_FILE
     assert sources[0].matched_meme_file_id == meme_file.id
+
+
+async def test_accept_sha_duplicate_creates_initial_engagement_snapshot(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    media_bytes = b"same-sha-engagement-bytes"
+    sha256_hex = hashlib.sha256(media_bytes).hexdigest()
+    _meme, meme_file = await _seed_meme_file(migrated_db_session, sha256_hex=sha256_hex, is_public=True)
+    published_at = datetime(2020, 1, 15, 10, 30, tzinfo=UTC)
+    storage_client = FakeStorageClient()
+    service = PipelineIngestAcceptService(migrated_db_session, storage_client=storage_client)
+
+    result = await service.accept_bytes(
+        source=IngestAcceptSource(
+            source_platform=SourcePlatform.TELEGRAM,
+            source_id="sha-engagement-source",
+            post_id="engagement-post",
+            source_metadata={
+                "published_at": published_at.isoformat(),
+                "forward_count": 0,
+                "comment_count": 3,
+                "comments_state": SourceEngagementCommentsState.ENABLED.value,
+            },
+        ),
+        filename="duplicate.png",
+        content_type="image/png",
+        media_bytes=media_bytes,
+    )
+
+    assert result.outcome is IngestAcceptOutcome.RESOLVED_SHA_DUPLICATE
+
+    async with postgres_session_factory() as session:
+        source = await session.scalar(select(MemeSource).where(MemeSource.source_id == "sha-engagement-source"))
+        snapshots = (await session.execute(select(MemeSourceEngagementSnapshot))).scalars().all()
+
+    assert source is not None
+    assert source.file_id == meme_file.id
+    assert source.views == 0
+    assert len(snapshots) == 1
+    snapshot = snapshots[0]
+    assert snapshot.meme_source_id == source.id
+    assert snapshot.capture_reason is SourceEngagementCaptureReason.INGEST_INITIAL
+    assert snapshot.schedule_label is SourceEngagementScheduleLabel.INGEST_INITIAL
+    assert snapshot.fetch_status is SourceEngagementFetchStatus.SUCCESS
+    assert snapshot.view_count is None
+    assert snapshot.reactions is None
+    assert snapshot.reaction_count is None
+    assert snapshot.forward_count == 0
+    assert snapshot.comment_count == 3
+    assert snapshot.comments_state is SourceEngagementCommentsState.ENABLED
+    assert source.last_engagement_check_at == snapshot.captured_at
+    expected_slot = next_source_engagement_schedule_slot(published_at, now=snapshot.captured_at)
+    assert expected_slot is not None
+    assert expected_slot.label is SourceEngagementScheduleLabel.MONTHLY
+    assert source.next_engagement_check_at == expected_slot.scheduled_for
 
 
 async def test_accept_sha_duplicate_public_match_saves_target_collection(
