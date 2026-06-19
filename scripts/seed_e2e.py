@@ -1192,8 +1192,7 @@ def build_public_trend_aggregate_history_points_payload() -> list[dict[str, str 
     totals_by_observed_at: dict[datetime, dict[str, float | int]] = {}
     meme_categories_by_observed_at: dict[datetime, set[str]] = {}
     for category in E2E_PUBLIC_TRENDS_MEME_CATEGORIES:
-        for spec in PUBLIC_TREND_SNAPSHOT_SPECS_BY_CATEGORY[category]:
-            observed_at = _public_trend_observed_at(spec)
+        for observed_at, metrics in _public_trend_daily_metrics(category).items():
             totals = totals_by_observed_at.setdefault(
                 observed_at,
                 {
@@ -1209,15 +1208,15 @@ def build_public_trend_aggregate_history_points_payload() -> list[dict[str, str 
                 },
             )
             meme_categories_by_observed_at.setdefault(observed_at, set()).add(category)
-            totals["snapshot_count"] += 1
-            totals["source_views"] += spec.source_views
-            totals["source_reactions"] += spec.source_reactions
-            totals["source_reposts"] += spec.source_reposts
-            totals["platform_views"] += spec.platform_views
-            totals["platform_sends"] += spec.platform_sends
-            totals["platform_saves"] += spec.platform_saves
-            totals["platform_likes"] += spec.platform_likes
-            totals["value"] += _public_trend_snapshot_popularity_score(spec)
+            totals["snapshot_count"] += metrics["snapshot_count"]
+            totals["source_views"] += metrics["source_views"]
+            totals["source_reactions"] += metrics["source_reactions"]
+            totals["source_reposts"] += metrics["source_reposts"]
+            totals["platform_views"] += metrics["platform_views"]
+            totals["platform_sends"] += metrics["platform_sends"]
+            totals["platform_saves"] += metrics["platform_saves"]
+            totals["platform_likes"] += metrics["platform_likes"]
+            totals["value"] += _public_trend_popularity_score(metrics)
 
     return [
         {
@@ -1237,6 +1236,81 @@ def build_public_trend_aggregate_history_points_payload() -> list[dict[str, str 
         }
         for observed_at in sorted(totals_by_observed_at)
     ]
+
+
+def _public_trend_daily_metrics(category: str) -> dict[datetime, dict[str, int]]:
+    metrics_by_observed_at: dict[datetime, dict[str, int]] = {}
+    previous_source_views: int | None = None
+    previous_source_reactions: int | None = None
+    previous_source_reposts: int | None = None
+
+    # The MV counts all successful source snapshots, including the zero baseline
+    # row used to turn cumulative source counters into first-day deltas.
+    for row in sorted(
+        build_public_trend_snapshot_rows(meme_source_id=_stable_uuid(f"{category}:source"), category=category),
+        key=lambda item: (item.captured_at, str(item.id)),
+    ):
+        observed_at = _public_trend_observed_at(row.captured_at)
+        metrics = metrics_by_observed_at.setdefault(observed_at, _empty_public_trend_daily_metrics())
+        metrics["snapshot_count"] += 1
+
+        current_source_views = _optional_int(row.view_count)
+        current_source_reactions = _optional_int(row.reaction_count)
+        current_source_reposts = _optional_int(row.forward_count)
+        metrics["source_views"] += _non_negative_delta(current_source_views, previous_source_views)
+        metrics["source_reactions"] += _non_negative_delta(current_source_reactions, previous_source_reactions)
+        metrics["source_reposts"] += _non_negative_delta(current_source_reposts, previous_source_reposts)
+        previous_source_views = current_source_views
+        previous_source_reactions = current_source_reactions
+        previous_source_reposts = current_source_reposts
+
+    for spec in PUBLIC_TREND_SNAPSHOT_SPECS_BY_CATEGORY.get(category, ()):
+        observed_at = _public_trend_observed_at(spec.captured_at)
+        metrics = metrics_by_observed_at.setdefault(observed_at, _empty_public_trend_daily_metrics())
+        metrics["platform_views"] += spec.platform_views
+        metrics["platform_sends"] += spec.platform_sends
+        metrics["platform_saves"] += spec.platform_saves
+        metrics["platform_likes"] += spec.platform_likes
+
+    return {
+        observed_at: metrics
+        for observed_at, metrics in metrics_by_observed_at.items()
+        if any(
+            metrics[key] > 0
+            for key in (
+                "source_views",
+                "source_reactions",
+                "source_reposts",
+                "platform_views",
+                "platform_sends",
+                "platform_saves",
+                "platform_likes",
+            )
+        )
+    }
+
+
+def _empty_public_trend_daily_metrics() -> dict[str, int]:
+    return {
+        "snapshot_count": 0,
+        "source_views": 0,
+        "source_reactions": 0,
+        "source_reposts": 0,
+        "platform_views": 0,
+        "platform_sends": 0,
+        "platform_saves": 0,
+        "platform_likes": 0,
+    }
+
+
+def _optional_int(value: int | None) -> int | None:
+    return None if value is None else int(value)
+
+
+def _non_negative_delta(current: int | None, previous: int | None) -> int:
+    if current is None or previous is None:
+        return 0
+    return max(current - previous, 0)
 
 
 def _seed_spec_has_public_trends(spec: SeedSpec) -> bool:
@@ -1288,20 +1362,20 @@ def _public_trend_platform_events(
     )
 
 
-def _public_trend_snapshot_popularity_score(spec: PublicTrendSnapshotSpec) -> float:
+def _public_trend_popularity_score(metrics: dict[str, int]) -> float:
     return (
-        math.log1p(max(spec.source_views, 0)) * 1.0
-        + math.log1p(max(spec.source_reactions, 0)) * 2.0
-        + math.log1p(max(spec.source_reposts, 0)) * 3.0
-        + math.log1p(max(spec.platform_views, 0)) * 1.0
-        + math.log1p(max(spec.platform_sends, 0)) * 3.0
-        + math.log1p(max(spec.platform_saves, 0)) * 4.0
-        + math.log1p(max(spec.platform_likes, 0)) * 5.0
+        math.log1p(max(metrics["source_views"], 0)) * 1.0
+        + math.log1p(max(metrics["source_reactions"], 0)) * 2.0
+        + math.log1p(max(metrics["source_reposts"], 0)) * 3.0
+        + math.log1p(max(metrics["platform_views"], 0)) * 1.0
+        + math.log1p(max(metrics["platform_sends"], 0)) * 3.0
+        + math.log1p(max(metrics["platform_saves"], 0)) * 4.0
+        + math.log1p(max(metrics["platform_likes"], 0)) * 5.0
     )
 
 
-def _public_trend_observed_at(spec: PublicTrendSnapshotSpec) -> datetime:
-    return datetime(spec.captured_at.year, spec.captured_at.month, spec.captured_at.day, tzinfo=UTC)
+def _public_trend_observed_at(captured_at: datetime) -> datetime:
+    return datetime(captured_at.year, captured_at.month, captured_at.day, tzinfo=UTC)
 
 
 def _public_tag_title(tag: str) -> str:

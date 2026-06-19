@@ -308,7 +308,7 @@ def test_public_trends_artifact_payload_is_deterministic_and_url_ready() -> None
         "granularity": "month",
         "period": "2026-01",
         "period_label": "January 2026",
-        "snapshot_count": 6,
+        "snapshot_count": 9,
     }
     assert payload["representative_meme"] == {
         "category": "cat",
@@ -389,7 +389,7 @@ def test_public_trend_aggregate_history_points_payload_uses_real_seed_snapshots(
             "metric": "aggregate_popularity_score",
             "label": "Aggregate popularity score",
             "meme_count": 3,
-            "snapshot_count": 3,
+            "snapshot_count": 6,
             "source_views": 280,
             "source_reactions": 28,
             "source_reposts": 9,
@@ -414,6 +414,13 @@ def test_public_trend_aggregate_history_points_payload_uses_real_seed_snapshots(
             "platform_likes": 29,
         },
     ]
+
+
+def test_public_trend_point_validation_accepts_current_helper_payload() -> None:
+    seed_e2e._assert_expected_public_trend_points(
+        seed_e2e.build_public_trend_aggregate_history_points_payload(),
+        label="current helper payload",
+    )
 
 
 @pytest.mark.asyncio
