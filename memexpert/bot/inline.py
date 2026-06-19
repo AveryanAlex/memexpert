@@ -25,18 +25,14 @@ from aiogram.types import (
 from sqlalchemy import select
 
 from memexpert.bot.analytics import record_telegram_interaction_event, telegram_user_hash
+from memexpert.bot.meme_search_factory import build_default_meme_search_service_factory
 from memexpert.core.config import Settings, get_settings
 from memexpert.core.database import get_async_session_factory
-from memexpert.core.meilisearch import PipelineMeilisearchSyncClient
-from memexpert.core.qdrant import PipelineQdrantUserSearchClient
 from memexpert.core.storage import StorageConfigurationError, build_s3_client, get_pipeline_storage_settings
-from memexpert.core.voyage import PipelineVoyageClient
 from memexpert.models.content import MemeFile
 from memexpert.models.enums import AccountStatus, AccountType, AnalyticsEventType, TelegramMediaFormat
 from memexpert.models.user import User
 from memexpert.services import CollectionService, CollectionServiceError, ProviderNotConfiguredError
-from memexpert.services.meme_search import MemeSearchService
-from memexpert.services.query_embedding import CachedTextQueryEmbeddingService
 from memexpert.services.telegram_inline import (
     MPEG4_GIF_MIME_TYPE,
     MemeSearchServiceFactory,
@@ -116,7 +112,9 @@ def build_inline_router(
 
     resolved_settings = settings or get_settings()
     resolved_session_factory = session_factory or get_async_session_factory()
-    resolved_service_factory = meme_search_service_factory or _build_default_search_service_factory(resolved_settings)
+    resolved_service_factory = meme_search_service_factory or build_default_meme_search_service_factory(
+        resolved_settings,
+    )
     resolved_media_url_provider = inline_media_url_provider or S3PresignedInlineMediaUrlProvider(resolved_settings)
     bot_scope = _build_bot_scope(resolved_settings)
     resolved_inline_service_factory = _build_default_inline_service_factory(
@@ -349,23 +347,6 @@ async def handle_inline_library_callback(
         )
 
     await callback_query.answer(text)
-
-
-def _build_default_search_service_factory(settings: Settings) -> MemeSearchServiceFactory:
-    def factory(session: AsyncSession) -> MemeSearchService:
-        return MemeSearchService(
-            session,
-            text_client=PipelineMeilisearchSyncClient(),
-            semantic_client=PipelineQdrantUserSearchClient(),
-            query_embedding_client=CachedTextQueryEmbeddingService(
-                session,
-                provider=PipelineVoyageClient(),
-                cache_session_factory=get_async_session_factory(),
-                settings=settings,
-            ),
-        )
-
-    return factory
 
 
 def _build_default_inline_service_factory(
