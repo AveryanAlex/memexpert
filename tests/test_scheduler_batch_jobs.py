@@ -23,8 +23,8 @@ from memexpert.models.enums import (
     SyncTargetKind,
     SyncTargetStatus,
 )
-from memexpert.services.content_pipeline_helpers import build_sync_preview_model
-from memexpert.services.content_pipeline_reporting import decode_sync_preview
+from memexpert.pipeline.helpers import build_sync_preview_model
+from memexpert.pipeline.reporting import decode_sync_preview
 from memexpert.services.meme_seo import MemeSeoProviderResult
 from memexpert.services.scheduler_batch_jobs import (
     SearchIndexBatchJobService,

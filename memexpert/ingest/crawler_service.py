@@ -12,16 +12,16 @@ from memexpert.ingest.schemas import IngestAcceptOutcome, IngestAcceptResult, In
 from memexpert.models.base import utcnow
 from memexpert.models.content import MemeSource, PipelineIngestRequest, SourceChannel
 from memexpert.models.enums import SourceAttachReason, SourcePlatform
-from memexpert.schemas.content_pipeline import CrawlerIngestOutcome, CrawlerIngestResult, RawCrawlerPost
-from memexpert.services.content_pipeline_constants import (
+from memexpert.pipeline.constants import (
     CRAWLER_MEDIA_DEFAULT_CONTENT_TYPES,
     CRAWLER_MEDIA_DEFAULT_FILENAMES,
 )
-from memexpert.services.content_pipeline_crawler_queries import (
+from memexpert.pipeline.crawler_queries import (
     advance_source_channel_checkpoint,
     find_existing_crawler_source_row,
     get_tracked_source_channel,
 )
+from memexpert.schemas.content_pipeline import CrawlerIngestOutcome, CrawlerIngestResult, RawCrawlerPost
 from memexpert.services.errors import PipelineIngestError, PipelineSourceConflictError
 
 if TYPE_CHECKING:

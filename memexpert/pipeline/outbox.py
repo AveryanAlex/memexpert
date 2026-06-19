@@ -24,8 +24,8 @@ from memexpert.pipeline.events import (
     build_meme_created_transcode_dispatch_event,
     build_stage_routing_key,
 )
+from memexpert.pipeline.helpers import trim_error_text
 from memexpert.schemas.content_pipeline import ContentPipelineEventType
-from memexpert.services.content_pipeline_helpers import trim_error_text
 from memexpert.services.errors import PipelineIngestError
 
 if TYPE_CHECKING:
@@ -35,7 +35,20 @@ if TYPE_CHECKING:
 class OutboxBrokerProtocol(Protocol):
     """Minimal async broker surface used by the transactional-outbox publisher."""
 
-    async def publish(self, payload: object, **kwargs: object) -> object: ...
+    async def publish(
+        self,
+        message: object,
+        /,
+        queue: str = "",
+        exchange: str | None = None,
+        *,
+        routing_key: str = "",
+        mandatory: bool = True,
+        persist: bool = False,
+        content_type: str | None = None,
+        message_id: str | None = None,
+        timestamp: datetime | None = None,
+    ) -> object: ...
 
 
 @dataclass(frozen=True, slots=True)

@@ -140,11 +140,13 @@ Operational rules:
    under `pipeline/originals/<meme_file_id>/...`; their temp object is safe to
    delete and the worker does this idempotently after commit.
 4. `pipeline_outbox_events.status=failed` is retryable when `next_retry_at` is
-   due. The outbox publisher can claim pending/failed rows generically and does
-   not care whether the event is `media_inspect_requested` or `meme_created`.
+   due. The `pipeline-outbox-publisher` job in `memexpert-scheduler` claims
+   pending/failed rows generically and does not care whether the event is
+   `media_inspect_requested` or `meme_created`.
 5. `pipeline_outbox_events.status=publishing` older than the publisher lease
-   window indicates a crashed publisher. Run the recovery path to mark those
-   rows failed with `next_retry_at=now`, then resume the publisher.
+   window indicates a crashed publisher. Each scheduler publisher run first
+   recovers those rows to `failed` with `next_retry_at=now`, then claims a
+   bounded publish batch.
 
 ## Wiping the artifact directory
 
@@ -172,8 +174,11 @@ rm -rf .artifacts/s02-runtime-smoke
   `outcome: failed` (not `blocked`) because the heavy chain refuses to
   replay a non-retryable failure.
 - **Uploads stay `media_inspect_pending`**: the transactional outbox publisher
-  is not running or cannot publish to RabbitMQ. Inspect `pipeline_outbox_events`
-  for due `pending`/`failed` rows and restart the publisher/recovery loop.
+  is not running or cannot publish to RabbitMQ. Confirm `memexpert-scheduler`
+  has the `pipeline-outbox-publisher` job enabled, inspect
+  `pipeline_outbox_events` for due `pending`/`failed` rows, and check
+  `scheduler_job_batch_result` logs for `claimed`, `published`, `failed`, and
+  `recovered` counts.
 - **Uploads stay `media_inspecting`**: a media-inspect worker likely died while
   holding work. Confirm no worker is still processing the temp object, then
   reset/requeue according to the incident runbook.
@@ -187,7 +192,7 @@ rm -rf .artifacts/s02-runtime-smoke
 ## Related references
 
 - `scripts/verify_s02_runtime.py` — the harness implementation.
-- `memexpert/services/content_pipeline_reporting.py` — the aggregation and
+- `memexpert/pipeline/reporting.py` — the aggregation and
   rendering helpers the harness (and tests) share.
 - `memexpert/schemas/content_pipeline.py` — authoritative schemas for the
   enriched detail projections and run summary payload.

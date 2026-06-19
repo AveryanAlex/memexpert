@@ -42,12 +42,12 @@ class MergeOutcome:
 class ContentMergeService:
     """Apply auto-merge rules to embed-completed meme files.
 
-    The merge path is deliberately transactional: the caller (``ContentPipelineService``)
-    opens one durable commit after stage-row truth changes, and the merge writes the
-    entire lineage transfer (files, sources, collection membership, pins, popularity,
-    merge-audit row) plus the canonical-primary reselection into that same session.
-    Any failure raises ``PipelineIngestError`` so the enclosing commit is rolled back
-    and the ``embed`` stage stays replayable.
+    The merge path is deliberately transactional: the stage completion service
+    opens one durable commit after stage-row truth changes, and the merge writes
+    the entire lineage transfer (files, sources, collection membership, pins,
+    popularity, merge-audit row) plus the canonical-primary reselection into
+    that same session. Any failure raises ``PipelineIngestError`` so the
+    enclosing commit is rolled back and the ``embed`` stage stays replayable.
     """
 
     def __init__(

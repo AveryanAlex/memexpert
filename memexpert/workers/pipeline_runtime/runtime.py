@@ -6,7 +6,6 @@ from __future__ import annotations
 import asyncio
 import uuid
 from dataclasses import dataclass
-from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any, Protocol
 
 from faststream.rabbit import RabbitBroker, RabbitExchange, RabbitQueue
@@ -16,49 +15,25 @@ from memexpert.core.broker import PipelineBrokerSettings
 from memexpert.core.classification import ClassificationClientProtocol
 from memexpert.core.config import Settings
 from memexpert.core.database import AsyncSessionFactory
-from memexpert.core.meilisearch import (
-    MeilisearchSyncClientProtocol,
-    PipelineMeilisearchDocument,
-)
-from memexpert.core.ocr import OCRProcessingError, OCRProcessorProtocol
+from memexpert.core.meilisearch import MeilisearchSyncClientProtocol
+from memexpert.core.ocr import OCRProcessorProtocol
 from memexpert.core.qdrant import (
     QdrantSimilarityClientProtocol,
     QdrantSyncClientProtocol,
-    QdrantSyncPayload,
-)
-from memexpert.core.storage import (
-    delete_object_if_present,
-    download_object_bytes,
-    get_pipeline_storage_settings,
-    upload_object_bytes,
 )
 from memexpert.core.voyage import VoyageClientProtocol
-from memexpert.ingest.materializer import PipelineIngestMaterializer
-from memexpert.media.contracts import MediaValidationError
 from memexpert.models.enums import ContentPipelineStage
+from memexpert.pipeline.dispatch import PipelineStageWorkContext
 from memexpert.pipeline.events import MediaInspectRequestedEvent
+from memexpert.pipeline.stage_completion import PipelineStageCompletionService
 from memexpert.schemas.content_pipeline import ContentPipelineDispatchEvent
-from memexpert.services import (
-    ContentPipelineService,
-    PipelineIngestError,
-    PipelinePublishError,
-)
-from memexpert.services.search_index_sync import (
-    build_meilisearch_document,
-    build_qdrant_sync_payload,
-    load_search_index_state,
-)
+from memexpert.services import PipelineIngestError
 from memexpert.workers.pipeline_runtime.constants import (
     PIPELINE_REASON_MALFORMED_EVENT,
     PIPELINE_REASON_MEDIA_INSPECT_FAILED,
     PIPELINE_REASON_UNSUPPORTED_STAGE,
 )
 from memexpert.workers.pipeline_runtime.errors import (
-    ForcedClassifyFailure,
-    ForcedEmbedFailure,
-    ForcedSyncMeiliFailure,
-    ForcedSyncQdrantFailure,
-    ForcedTranscodeFailure,
     coerce_dead_letter_payload,
     extract_event_reference,
     is_replayable_failure,
@@ -67,17 +42,14 @@ from memexpert.workers.pipeline_runtime.errors import (
     validate_event_payload,
 )
 from memexpert.workers.pipeline_runtime.stage_registry import get_stage_handler
+from memexpert.workers.pipeline_runtime.stages.context import PipelineStageHandlerContext
+from memexpert.workers.pipeline_runtime.stages.media_inspect import run_media_inspect_stage
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
-    from memexpert.core.classification import ClassificationResult
-    from memexpert.core.ocr import OCRExtractionResult
-    from memexpert.core.qdrant import QdrantSimilarityMatch
-    from memexpert.core.voyage import VoyageEmbeddingResult
-    from memexpert.media.contracts import NormalizedMediaResult, PipelineMediaProcessorProtocol
-    from memexpert.services.content_merge import MergeOutcome
-    from memexpert.services.content_pipeline import PipelineStageWorkContext
+    from memexpert.media.contracts import PipelineMediaProcessorProtocol
+    from memexpert.workers.pipeline_runtime.stages.context import ObjectStorageClientLike
 
 
 class RabbitMessageLike(Protocol):
@@ -92,39 +64,6 @@ class RabbitMessageLike(Protocol):
     async def nack(self, multiple: bool = False, requeue: bool = True) -> None: ...
 
     async def reject(self, requeue: bool = False) -> None: ...
-
-
-class ObjectStorageClientLike(Protocol):
-    """Small S3-compatible surface used by the runtime."""
-
-    def get_object(self, *, Bucket: str, Key: str) -> object: ...
-
-    def put_object(
-        self,
-        *,
-        Bucket: str,
-        Key: str,
-        Body: bytes,
-        ContentType: str,
-        ContentLength: int,
-    ) -> object: ...
-
-    def delete_object(self, *, Bucket: str, Key: str) -> object: ...
-
-
-@dataclass(slots=True)
-class SyncQdrantInputs:
-    """Compact bundle of the canonical state the sync_qdrant stage needs per attempt."""
-
-    payload: QdrantSyncPayload
-    vector: tuple[float, ...]
-
-
-@dataclass(slots=True)
-class SyncMeiliInputs:
-    """Compact bundle of the canonical state the sync_meili stage needs per attempt."""
-
-    document: PipelineMeilisearchDocument
 
 
 @dataclass(slots=True)
@@ -254,14 +193,10 @@ class PipelineRuntime:
 
         effective_attempt = self._media_inspect_effective_attempt(message)
         try:
-            async with self.session_factory() as session:
-                materializer = PipelineIngestMaterializer(
-                    session,
-                    settings=self.settings,
-                    storage_client=self.storage_client,
-                    media_processor=self.media_processor,
-                )
-                _ = await materializer.materialize(inspect_event.ingest_request_id)
+            await run_media_inspect_stage(
+                self._stage_handler_context(),
+                inspect_event=inspect_event,
+            )
         except Exception:
             if effective_attempt < self.broker_settings.retry_max_attempts:
                 await message.reject(requeue=False)
@@ -414,8 +349,8 @@ class PipelineRuntime:
     ) -> None:
         stage_handler = get_stage_handler(dispatch_event.stage)
         if stage_handler is not None:
-            await stage_handler.run(
-                self,
+            await stage_handler(
+                self._stage_handler_context(),
                 dispatch_event=dispatch_event,
                 stage_context=stage_context,
                 attempt=attempt,
@@ -426,305 +361,18 @@ class PipelineRuntime:
             f"Pipeline runtime cannot execute work for stage {dispatch_event.stage.value!r}.",
         )
 
-    async def _run_transcode_stage(
-        self,
-        *,
-        dispatch_event: ContentPipelineDispatchEvent,
-        stage_context: PipelineStageWorkContext,
-        attempt: int,
-    ) -> None:
-        resolved_context = stage_context
-        if resolved_context.mime_type is None:
-            raise MediaValidationError("Pipeline item is missing the original media type required for transcode.")
-
-        storage_settings = get_pipeline_storage_settings(self.settings)
-        original_bytes = await download_object_bytes(
-            self.storage_client,
-            bucket=storage_settings.bucket,
-            key=resolved_context.original_object_key,
-        )
-        normalized = await self.media_processor.normalize_for_web(
-            meme_file_id=dispatch_event.meme_file_id,
-            filename=PurePosixPath(resolved_context.original_object_key).name,
-            content_type=resolved_context.mime_type,
-            media_bytes=original_bytes,
-        )
-        await upload_object_bytes(
-            self.storage_client,
-            bucket=storage_settings.bucket,
-            key=normalized.web_video_object_key,
-            body=normalized.web_video_bytes,
-            content_type=normalized.mime_type,
-        )
-        try:
-            await self._complete_transcode_stage(
-                meme_file_id=dispatch_event.meme_file_id,
-                attempt=attempt,
-                event_id=dispatch_event.event_id,
-                normalized=normalized,
-            )
-        except Exception:
-            await delete_object_if_present(
-                self.storage_client,
-                bucket=storage_settings.bucket,
-                key=normalized.web_video_object_key,
-            )
-            raise
-
-    async def _run_ocr_stage(
-        self,
-        *,
-        dispatch_event: ContentPipelineDispatchEvent,
-        stage_context: PipelineStageWorkContext,
-        attempt: int,
-    ) -> None:
-        resolved_context = stage_context
-        source_object_key = resolved_context.web_video_object_key or resolved_context.original_object_key
-        source_mime_type = resolved_context.mime_type
-        if source_mime_type is None:
-            raise OCRProcessingError("Pipeline item is missing the media type required for OCR.")
-
-        storage_settings = get_pipeline_storage_settings(self.settings)
-        source_bytes = await download_object_bytes(
-            self.storage_client,
-            bucket=storage_settings.bucket,
-            key=source_object_key,
-        )
-        ocr_result = await self.ocr_processor.extract_text(
-            filename=PurePosixPath(source_object_key).name,
-            mime_type=source_mime_type,
-            media_bytes=source_bytes,
-            source_object_key=source_object_key,
-        )
-        await self._complete_ocr_stage(
-            meme_file_id=dispatch_event.meme_file_id,
-            attempt=attempt,
-            event_id=dispatch_event.event_id,
-            ocr_result=ocr_result,
-        )
-
-    async def _run_embed_stage(
-        self,
-        *,
-        dispatch_event: ContentPipelineDispatchEvent,
-        stage_context: PipelineStageWorkContext,
-        attempt: int,
-    ) -> None:
-        preview_frame_bytes = await self._load_preview_frame(stage_context)
-        embedding_result = await self.voyage_client.embed_image(
-            image_bytes=preview_frame_bytes,
-            mime_type="image/png",
-        )
-        similarity_matches = await self.qdrant_client.find_similar_memes(
-            vector=embedding_result.vector,
-            current_meme_file_id=dispatch_event.meme_file_id,
-        )
-        _ = await self._complete_embed_stage(
-            meme_file_id=dispatch_event.meme_file_id,
-            attempt=attempt,
-            event_id=dispatch_event.event_id,
-            embedding_result=embedding_result,
-            similarity_matches=similarity_matches,
-        )
-
-    async def _run_sync_qdrant_stage(
-        self,
-        *,
-        dispatch_event: ContentPipelineDispatchEvent,
-        stage_context: PipelineStageWorkContext,
-        attempt: int,
-    ) -> None:
-        """Load canonical state, upsert to Qdrant, and record per-target sync truth.
-
-        Failures from the adapter bubble up so ``_handle_stage_message`` can
-        run the shared normalize-and-classify path; before re-raising, we
-        always call :meth:`ContentPipelineService.fail_sync_qdrant_stage` so
-        the per-target snapshot row stays truthful even when the stage-journal
-        path is about to dead-letter.
-        """
-
-        _ = stage_context
-        try:
-            sync_inputs = await self._load_sync_qdrant_inputs(dispatch_event.meme_file_id)
-        except Exception:
-            await self._record_sync_qdrant_failure(
-                dispatch_event=dispatch_event,
-                attempt=attempt,
-                exc=PipelineIngestError(
-                    f"Canonical state for {dispatch_event.meme_file_id} "
-                    f"is missing or unreadable for sync_qdrant.",
-                ),
-            )
-            raise
-
-        try:
-            await self.qdrant_sync_client.upsert_meme_point(
-                payload=sync_inputs.payload,
-                vector=sync_inputs.vector,
-            )
-        except Exception as exc:
-            await self._record_sync_qdrant_failure(
-                dispatch_event=dispatch_event,
-                attempt=attempt,
-                exc=exc,
-            )
-            raise
-
-        # Best-effort preview refresh — if the post-upsert read fails we log
-        # and proceed: the sync itself already succeeded and the snapshot row
-        # must reflect that. Callers see ``last_preview=None`` until the next
-        # successful sync.
-        preview_payload: dict[str, object] = {}
-        try:
-            fetched_preview = await self.qdrant_sync_client.fetch_meme_point(dispatch_event.meme_file_id)
-        except Exception as exc:  # noqa: BLE001 - best-effort, any failure degrades to empty preview.
-            import logging
-
-            logging.getLogger(__name__).warning(
-                "qdrant sync preview fetch failed for %s: %s",
-                dispatch_event.meme_file_id,
-                exc,
-            )
-            fetched_preview = None
-
-        if fetched_preview is not None:
-            preview_payload = dict(fetched_preview.preview_fields)
-
-        try:
-            await self._complete_sync_qdrant_stage(
-                meme_file_id=dispatch_event.meme_file_id,
-                attempt=attempt,
-                event_id=dispatch_event.event_id,
-                payload_preview=preview_payload,
-            )
-        except PipelinePublishError:
-            # Publish failure of the MEME_QDRANT_SYNCED notification is
-            # classified and re-raised so the standard dispatcher records a
-            # publish_failed stage reason and keeps the stage replayable.
-            raise
-        except Exception as exc:
-            await self._record_sync_qdrant_failure(
-                dispatch_event=dispatch_event,
-                attempt=attempt,
-                exc=exc,
-            )
-            raise
-
-    async def _run_sync_meili_stage(
-        self,
-        *,
-        dispatch_event: ContentPipelineDispatchEvent,
-        stage_context: PipelineStageWorkContext,
-        attempt: int,
-    ) -> None:
-        """Load canonical state, upsert to Meilisearch, and record per-target sync truth.
-
-        Mirrors :meth:`_run_sync_qdrant_stage` exactly: every failure branch
-        calls :meth:`ContentPipelineService.fail_sync_meili_stage` so the
-        per-target snapshot row is truthful before the dispatcher runs the
-        shared normalize-and-classify path. The post-upsert preview fetch is
-        best-effort — a fetch failure must never fail the stage because the
-        upsert already succeeded.
-        """
-
-        _ = stage_context
-        try:
-            sync_inputs = await self._load_sync_meili_inputs(dispatch_event.meme_file_id)
-        except Exception:
-            await self._record_sync_meili_failure(
-                dispatch_event=dispatch_event,
-                attempt=attempt,
-                exc=PipelineIngestError(
-                    f"Canonical state for {dispatch_event.meme_file_id} "
-                    f"is missing or unreadable for sync_meili.",
-                ),
-            )
-            raise
-
-        try:
-            await self.meilisearch_sync_client.upsert_document(sync_inputs.document)
-        except Exception as exc:
-            await self._record_sync_meili_failure(
-                dispatch_event=dispatch_event,
-                attempt=attempt,
-                exc=exc,
-            )
-            raise
-
-        # Best-effort preview refresh — same contract as the Qdrant path: a
-        # failed retrieve must not fail the stage because the upsert already
-        # landed. Callers see ``last_preview=None`` until the next successful
-        # sync attempt refreshes the snapshot.
-        preview_payload: dict[str, object] = {}
-        try:
-            fetched_preview = await self.meilisearch_sync_client.fetch_document(
-                dispatch_event.meme_file_id,
-            )
-        except Exception as exc:  # noqa: BLE001 - best-effort, any failure degrades to empty preview.
-            import logging
-
-            logging.getLogger(__name__).warning(
-                "meilisearch sync preview fetch failed for %s: %s",
-                dispatch_event.meme_file_id,
-                exc,
-            )
-            fetched_preview = None
-
-        if fetched_preview is not None:
-            preview_payload = dict(fetched_preview.preview_fields)
-
-        try:
-            await self._complete_sync_meili_stage(
-                meme_file_id=dispatch_event.meme_file_id,
-                attempt=attempt,
-                event_id=dispatch_event.event_id,
-                payload_preview=preview_payload,
-            )
-        except PipelinePublishError:
-            raise
-        except Exception as exc:
-            await self._record_sync_meili_failure(
-                dispatch_event=dispatch_event,
-                attempt=attempt,
-                exc=exc,
-            )
-            raise
-
-    async def _run_classify_stage(
-        self,
-        *,
-        dispatch_event: ContentPipelineDispatchEvent,
-        stage_context: PipelineStageWorkContext,
-        attempt: int,
-    ) -> None:
-        preview_frame_bytes = await self._load_preview_frame(stage_context)
-        classification_result = await self.classification_client.classify_image(
-            image_bytes=preview_frame_bytes,
-            mime_type="image/png",
-        )
-        await self._complete_classify_stage(
-            meme_file_id=dispatch_event.meme_file_id,
-            attempt=attempt,
-            event_id=dispatch_event.event_id,
-            classification_result=classification_result,
-        )
-
-    async def _load_preview_frame(self, stage_context: PipelineStageWorkContext) -> bytes:
-        source_object_key = stage_context.web_video_object_key or stage_context.original_object_key
-        source_mime_type = stage_context.mime_type
-        if source_mime_type is None:
-            raise PipelineIngestError("Pipeline item is missing the media type required for embed/classify work.")
-
-        storage_settings = get_pipeline_storage_settings(self.settings)
-        source_bytes = await download_object_bytes(
-            self.storage_client,
-            bucket=storage_settings.bucket,
-            key=source_object_key,
-        )
-        return await self.media_processor.extract_preview_frame(
-            filename=PurePosixPath(source_object_key).name,
-            content_type=source_mime_type,
-            media_bytes=source_bytes,
+    def _stage_handler_context(self) -> PipelineStageHandlerContext:
+        return PipelineStageHandlerContext(
+            settings=self.settings,
+            session_factory=self.session_factory,
+            storage_client=self.storage_client,
+            media_processor=self.media_processor,
+            ocr_processor=self.ocr_processor,
+            voyage_client=self.voyage_client,
+            qdrant_client=self.qdrant_client,
+            qdrant_sync_client=self.qdrant_sync_client,
+            meilisearch_sync_client=self.meilisearch_sync_client,
+            classification_client=self.classification_client,
         )
 
     async def _start_stage_processing(
@@ -736,213 +384,13 @@ class PipelineRuntime:
         event_id: uuid.UUID,
     ) -> PipelineStageWorkContext:
         async with self.session_factory() as session:
-            service = self._build_service(session)
+            service = self._build_stage_completion_service(session)
             return await service.start_stage_processing(
                 meme_file_id=meme_file_id,
                 stage=stage,
                 attempt=attempt,
                 event_id=event_id,
             )
-
-    async def _complete_transcode_stage(
-        self,
-        *,
-        meme_file_id: uuid.UUID,
-        attempt: int,
-        event_id: uuid.UUID,
-        normalized: NormalizedMediaResult,
-    ) -> None:
-        async with self.session_factory() as session:
-            service = self._build_service(session)
-            await service.complete_transcode_stage(
-                meme_file_id=meme_file_id,
-                attempt=attempt,
-                event_id=event_id,
-                result=normalized,
-            )
-
-    async def _complete_ocr_stage(
-        self,
-        *,
-        meme_file_id: uuid.UUID,
-        attempt: int,
-        event_id: uuid.UUID,
-        ocr_result: OCRExtractionResult,
-    ) -> None:
-        async with self.session_factory() as session:
-            service = self._build_service(session)
-            await service.complete_ocr_stage(
-                meme_file_id=meme_file_id,
-                attempt=attempt,
-                event_id=event_id,
-                result=ocr_result,
-            )
-
-    async def _complete_embed_stage(
-        self,
-        *,
-        meme_file_id: uuid.UUID,
-        attempt: int,
-        event_id: uuid.UUID,
-        embedding_result: VoyageEmbeddingResult,
-        similarity_matches: tuple[QdrantSimilarityMatch, ...],
-    ) -> MergeOutcome:
-        async with self.session_factory() as session:
-            service = self._build_service(session)
-            return await service.complete_embed_stage(
-                meme_file_id=meme_file_id,
-                attempt=attempt,
-                event_id=event_id,
-                embedding_result=embedding_result,
-                similarity_matches=similarity_matches,
-            )
-
-    async def _complete_classify_stage(
-        self,
-        *,
-        meme_file_id: uuid.UUID,
-        attempt: int,
-        event_id: uuid.UUID,
-        classification_result: ClassificationResult,
-    ) -> None:
-        async with self.session_factory() as session:
-            service = self._build_service(session)
-            await service.complete_classify_stage(
-                meme_file_id=meme_file_id,
-                attempt=attempt,
-                event_id=event_id,
-                classification_result=classification_result,
-            )
-
-    async def _complete_sync_qdrant_stage(
-        self,
-        *,
-        meme_file_id: uuid.UUID,
-        attempt: int,
-        event_id: uuid.UUID,
-        payload_preview: dict[str, object],
-    ) -> None:
-        async with self.session_factory() as session:
-            service = self._build_service(session)
-            _ = await service.complete_sync_qdrant_stage(
-                meme_file_id=meme_file_id,
-                attempt=attempt,
-                event_id=event_id,
-                payload_preview=payload_preview,
-            )
-
-    async def _complete_sync_meili_stage(
-        self,
-        *,
-        meme_file_id: uuid.UUID,
-        attempt: int,
-        event_id: uuid.UUID,
-        payload_preview: dict[str, object],
-    ) -> None:
-        async with self.session_factory() as session:
-            service = self._build_service(session)
-            _ = await service.complete_sync_meili_stage(
-                meme_file_id=meme_file_id,
-                attempt=attempt,
-                event_id=event_id,
-                payload_preview=payload_preview,
-            )
-
-    async def _load_sync_qdrant_inputs(
-        self,
-        meme_file_id: uuid.UUID,
-    ) -> SyncQdrantInputs:
-        """Load canonical meme + embedding vector + primary-file OCR text for sync_qdrant."""
-
-        async with self.session_factory() as session:
-            loaded_state = await load_search_index_state(
-                session,
-                meme_file_id,
-                vector_dimensions=self.settings.pipeline_voyage_output_dimensions,
-            )
-        if loaded_state.vector is None:
-            raise PipelineIngestError(
-                f"Sync_qdrant consumer could not decode an embedding vector for {meme_file_id}.",
-            )
-        return SyncQdrantInputs(
-            payload=build_qdrant_sync_payload(loaded_state.canonical),
-            vector=loaded_state.vector,
-        )
-
-    async def _record_sync_qdrant_failure(
-        self,
-        *,
-        dispatch_event: ContentPipelineDispatchEvent,
-        attempt: int,
-        exc: Exception,
-    ) -> None:
-        """Mark the per-target snapshot row as failed before re-raising to the dispatcher.
-
-        The runtime's ``_handle_stage_message`` already records the stage-row
-        failure via ``mark_stage_failed``; this helper adds the per-target
-        snapshot row so operators see the sync truth alongside the journal.
-        """
-
-        normalized_reason = normalize_failure_reason(ContentPipelineStage.SYNC_QDRANT, exc)
-        last_error_text = render_error_text(exc)
-        try:
-            async with self.session_factory() as session:
-                service = self._build_service(session)
-                _ = await service.fail_sync_qdrant_stage(
-                    meme_file_id=dispatch_event.meme_file_id,
-                    attempt=attempt,
-                    event_id=dispatch_event.event_id,
-                    normalized_reason=normalized_reason,
-                    last_error_text=last_error_text,
-                )
-        except Exception:  # noqa: BLE001 - snapshot upsert is best-effort before re-raise.
-            return
-
-    async def _load_sync_meili_inputs(
-        self,
-        meme_file_id: uuid.UUID,
-    ) -> SyncMeiliInputs:
-        """Load canonical meme + primary-file OCR text for sync_meili.
-
-        The Meilisearch document is derived from the same canonical meme
-        truth as the Qdrant payload — every field the reporting + smoke
-        route surfaces should be present. We deliberately omit the embedding
-        vector because Meilisearch uses its own text index; only the ocr
-        text and the tag/language/nsfw metadata travel over.
-        """
-
-        async with self.session_factory() as session:
-            loaded_state = await load_search_index_state(session, meme_file_id)
-        return SyncMeiliInputs(document=build_meilisearch_document(loaded_state.canonical))
-
-    async def _record_sync_meili_failure(
-        self,
-        *,
-        dispatch_event: ContentPipelineDispatchEvent,
-        attempt: int,
-        exc: Exception,
-    ) -> None:
-        """Mark the per-target snapshot row as failed before re-raising to the dispatcher.
-
-        Mirrors :meth:`_record_sync_qdrant_failure` so the two sync paths
-        share the same "snapshot row stays truthful" invariant across the
-        dispatcher's normalize-and-classify step.
-        """
-
-        normalized_reason = normalize_failure_reason(ContentPipelineStage.SYNC_MEILI, exc)
-        last_error_text = render_error_text(exc)
-        try:
-            async with self.session_factory() as session:
-                service = self._build_service(session)
-                _ = await service.fail_sync_meili_stage(
-                    meme_file_id=dispatch_event.meme_file_id,
-                    attempt=attempt,
-                    event_id=dispatch_event.event_id,
-                    normalized_reason=normalized_reason,
-                    last_error_text=last_error_text,
-                )
-        except Exception:  # noqa: BLE001 - snapshot upsert is best-effort before re-raise.
-            return
 
     async def _mark_stage_failed(
         self,
@@ -957,7 +405,7 @@ class PipelineRuntime:
     ) -> None:
         try:
             async with self.session_factory() as session:
-                service = self._build_service(session)
+                service = self._build_stage_completion_service(session)
                 await service.mark_stage_failed(
                     meme_file_id=meme_file_id,
                     stage=stage,
@@ -970,8 +418,8 @@ class PipelineRuntime:
         except Exception:
             return
 
-    def _build_service(self, session: AsyncSession) -> ContentPipelineService:
-        return ContentPipelineService(
+    def _build_stage_completion_service(self, session: AsyncSession) -> PipelineStageCompletionService:
+        return PipelineStageCompletionService(
             session,
             settings=self.settings,
         )
@@ -986,53 +434,6 @@ class PipelineRuntime:
             await resolved_stop_event.wait()
         finally:
             await self.broker.stop()
-
-    def _maybe_force_transcode_failure(self, dispatch_event: ContentPipelineDispatchEvent) -> None:
-        forced_target = self.settings.pipeline_worker_fail_transcode_for_meme_file_id
-        if forced_target is None:
-            return
-        if forced_target == str(dispatch_event.meme_file_id):
-            raise ForcedTranscodeFailure(
-                "Forced transcode failure requested by pipeline_worker_fail_transcode_for_meme_file_id.",
-            )
-
-    def _maybe_force_embed_failure(self, dispatch_event: ContentPipelineDispatchEvent) -> None:
-        forced_target = self.settings.pipeline_worker_fail_embed_for_meme_file_id
-        if forced_target is None:
-            return
-        if forced_target == str(dispatch_event.meme_file_id):
-            raise ForcedEmbedFailure(
-                "Forced embed failure requested by pipeline_worker_fail_embed_for_meme_file_id.",
-            )
-
-    def _maybe_force_classify_failure(self, dispatch_event: ContentPipelineDispatchEvent) -> None:
-        forced_target = self.settings.pipeline_worker_fail_classify_for_meme_file_id
-        if forced_target is None:
-            return
-        if forced_target == str(dispatch_event.meme_file_id):
-            raise ForcedClassifyFailure(
-                "Forced classify failure requested by pipeline_worker_fail_classify_for_meme_file_id.",
-            )
-
-    def _maybe_force_sync_qdrant_failure(self, dispatch_event: ContentPipelineDispatchEvent) -> None:
-        forced_target = self.settings.pipeline_worker_fail_sync_qdrant_for_meme_file_id
-        if forced_target is None:
-            return
-        if forced_target == str(dispatch_event.meme_file_id):
-            raise ForcedSyncQdrantFailure(
-                "Forced sync_qdrant failure requested by "
-                "pipeline_worker_fail_sync_qdrant_for_meme_file_id.",
-            )
-
-    def _maybe_force_sync_meili_failure(self, dispatch_event: ContentPipelineDispatchEvent) -> None:
-        forced_target = self.settings.pipeline_worker_fail_sync_meili_for_meme_file_id
-        if forced_target is None:
-            return
-        if forced_target == str(dispatch_event.meme_file_id):
-            raise ForcedSyncMeiliFailure(
-                "Forced sync_meili failure requested by "
-                "pipeline_worker_fail_sync_meili_for_meme_file_id.",
-            )
 
     def _effective_attempt(
         self,
@@ -1162,9 +563,6 @@ class PipelineRuntime:
 
 
 __all__ = [
-    "ObjectStorageClientLike",
     "PipelineRuntime",
     "RabbitMessageLike",
-    "SyncMeiliInputs",
-    "SyncQdrantInputs",
 ]

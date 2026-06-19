@@ -38,14 +38,11 @@ from memexpert.core.storage import get_s3_client
 from memexpert.core.voyage import VoyageClientProtocol, build_pipeline_voyage_client
 from memexpert.media.inspect import PipelineMediaProcessor
 from memexpert.models.enums import ContentPipelineStage
-from memexpert.workers.pipeline_runtime.runtime import (
-    ObjectStorageClientLike,
-    PipelineRuntime,
-    RabbitMessageLike,
-)
+from memexpert.workers.pipeline_runtime.runtime import PipelineRuntime, RabbitMessageLike
 
 if TYPE_CHECKING:
     from memexpert.media.contracts import PipelineMediaProcessorProtocol
+    from memexpert.workers.pipeline_runtime.stages.context import ObjectStorageClientLike
 
 
 def _build_pipeline_exchange(broker_settings: PipelineBrokerSettings) -> RabbitExchange:

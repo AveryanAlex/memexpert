@@ -16,7 +16,7 @@ import pytest
 from PIL import Image
 from sqlalchemy import select
 
-import memexpert.services.content_pipeline as content_pipeline_module
+import memexpert.pipeline.dispatch as pipeline_dispatch_module
 from memexpert.core.broker import build_pipeline_broker
 from memexpert.core.classification import (
     ClassificationProviderUnavailableError,
@@ -87,6 +87,15 @@ from memexpert.models.enums import (
 )
 from memexpert.models.user import User
 from memexpert.pipeline.events import build_media_inspect_requested_payload
+from memexpert.pipeline.items import PipelineItemReadService
+from memexpert.pipeline.replay import PipelineReplayService
+from memexpert.pipeline.reporting import (
+    OUTCOME_BLOCKED,
+    OUTCOME_READY,
+    render_markdown_report,
+    summarize_run,
+)
+from memexpert.pipeline.stage_completion import PipelineStageCompletionService
 from memexpert.schemas.content_pipeline import (
     ContentPipelineCanonicalContext,
     ContentPipelineClassificationDetail,
@@ -102,13 +111,7 @@ from memexpert.schemas.content_pipeline import (
     ContentPipelineSyncTargetPreview,
     PerTargetSyncStatus,
 )
-from memexpert.services import ContentPipelineService, PipelineIngestError, PipelinePublishError
-from memexpert.services.content_pipeline_reporting import (
-    OUTCOME_BLOCKED,
-    OUTCOME_READY,
-    render_markdown_report,
-    summarize_run,
-)
+from memexpert.services import PipelineIngestError, PipelinePublishError
 from memexpert.services.search_index_sync import SEARCH_INDEX_ALGORITHM_VERSION
 from memexpert.workers.pipeline_runtime import (
     PIPELINE_REASON_CLASSIFY_PROVIDER_BLOCKED,
@@ -136,6 +139,12 @@ from memexpert.workers.pipeline_runtime import (
     build_pipeline_runtime,
 )
 from memexpert.workers.pipeline_runtime.stage_registry import PIPELINE_STAGE_HANDLERS, RUNNABLE_DOWNSTREAM_STAGES
+from memexpert.workers.pipeline_runtime.stages.classify import run_classify_stage
+from memexpert.workers.pipeline_runtime.stages.embed import run_embed_stage
+from memexpert.workers.pipeline_runtime.stages.ocr import run_ocr_stage
+from memexpert.workers.pipeline_runtime.stages.sync_meili import run_sync_meili_stage
+from memexpert.workers.pipeline_runtime.stages.sync_qdrant import run_sync_qdrant_stage
+from memexpert.workers.pipeline_runtime.stages.transcode import run_transcode_stage
 
 if TYPE_CHECKING:
     from pytest import MonkeyPatch
@@ -667,7 +676,7 @@ async def _seed_transcode_pending_item(
         ]
     )
     await session.commit()
-    return await ContentPipelineService(session).get_item(meme_file_id), dispatch_event
+    return await PipelineItemReadService(session).get_item(meme_file_id), dispatch_event
 
 
 def build_normalized_media_result(meme_file_id: uuid.UUID) -> NormalizedMediaResult:
@@ -707,7 +716,7 @@ async def _fetch_item(
     settings: Settings | None = None,
 ) -> ContentPipelineItemRead:
     async with session_factory() as session:
-        service = ContentPipelineService(session, settings=settings)
+        service = PipelineItemReadService(session, settings=settings)
         return await service.get_item(meme_file_id)
 
 
@@ -725,7 +734,7 @@ async def _seed_ocr_pending_item(
         filename="ocr-runtime.png",
         media_bytes=build_png_bytes(color=(60, 70, 80)),
     )
-    service = ContentPipelineService(
+    service = PipelineStageCompletionService(
         session,
         publisher=publisher,
     )
@@ -836,30 +845,12 @@ def test_pipeline_runtime_stage_registry_covers_all_downstream_stages() -> None:
 
     assert frozenset(RUNNABLE_DOWNSTREAM_STAGES) == expected_stages
     assert frozenset(PIPELINE_STAGE_HANDLERS) == expected_stages
-    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.TRANSCODE].implementation_method_name == "_run_transcode_stage"
-    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.TRANSCODE].failure_hook_method_name == (
-        "_maybe_force_transcode_failure"
-    )
-    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.OCR].implementation_method_name == "_run_ocr_stage"
-    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.OCR].failure_hook_method_name is None
-    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.EMBED].implementation_method_name == "_run_embed_stage"
-    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.EMBED].failure_hook_method_name == "_maybe_force_embed_failure"
-    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.CLASSIFY].implementation_method_name == "_run_classify_stage"
-    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.CLASSIFY].failure_hook_method_name == (
-        "_maybe_force_classify_failure"
-    )
-    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.SYNC_QDRANT].implementation_method_name == (
-        "_run_sync_qdrant_stage"
-    )
-    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.SYNC_QDRANT].failure_hook_method_name == (
-        "_maybe_force_sync_qdrant_failure"
-    )
-    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.SYNC_MEILI].implementation_method_name == (
-        "_run_sync_meili_stage"
-    )
-    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.SYNC_MEILI].failure_hook_method_name == (
-        "_maybe_force_sync_meili_failure"
-    )
+    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.TRANSCODE] is run_transcode_stage
+    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.OCR] is run_ocr_stage
+    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.EMBED] is run_embed_stage
+    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.CLASSIFY] is run_classify_stage
+    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.SYNC_QDRANT] is run_sync_qdrant_stage
+    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.SYNC_MEILI] is run_sync_meili_stage
 
 
 async def test_pipeline_runtime_stage_dispatch_rejects_unsupported_stage() -> None:
@@ -1137,7 +1128,7 @@ async def test_pipeline_runtime_forced_transcode_failure_then_replay_then_succes
 
     replay_publisher = RecordingPublisher()
     async with postgres_session_factory() as replay_session:
-        replay_service = ContentPipelineService(
+        replay_service = PipelineReplayService(
             replay_session,
             settings=failing_settings,
             publisher=replay_publisher,
@@ -1157,7 +1148,7 @@ async def test_pipeline_runtime_forced_transcode_failure_then_replay_then_succes
     async def fake_ensure_pipeline_broker_started(*_: object, **__: object) -> object:
         return downstream_broker
 
-    monkeypatch.setattr(content_pipeline_module, "ensure_pipeline_broker_started", fake_ensure_pipeline_broker_started)
+    monkeypatch.setattr(pipeline_dispatch_module, "ensure_pipeline_broker_started", fake_ensure_pipeline_broker_started)
 
     normalized = build_normalized_media_result(item.meme_file_id)
     successful_runtime = build_pipeline_runtime(
@@ -1203,7 +1194,7 @@ async def test_pipeline_runtime_ocr_success_persists_fallback_result_and_dispatc
     async def fake_ensure_pipeline_broker_started(*_: object, **__: object) -> object:
         return downstream_broker
 
-    monkeypatch.setattr(content_pipeline_module, "ensure_pipeline_broker_started", fake_ensure_pipeline_broker_started)
+    monkeypatch.setattr(pipeline_dispatch_module, "ensure_pipeline_broker_started", fake_ensure_pipeline_broker_started)
 
     runtime = build_pipeline_runtime(
         settings=Settings(),
@@ -1272,7 +1263,7 @@ async def test_pipeline_runtime_ocr_failure_then_replay_then_success(
 
     replay_publisher = RecordingPublisher()
     async with postgres_session_factory() as replay_session:
-        replay_service = ContentPipelineService(
+        replay_service = PipelineReplayService(
             replay_session,
             publisher=replay_publisher,
         )
@@ -1287,7 +1278,7 @@ async def test_pipeline_runtime_ocr_failure_then_replay_then_success(
     async def fake_ensure_pipeline_broker_started(*_: object, **__: object) -> object:
         return downstream_broker
 
-    monkeypatch.setattr(content_pipeline_module, "ensure_pipeline_broker_started", fake_ensure_pipeline_broker_started)
+    monkeypatch.setattr(pipeline_dispatch_module, "ensure_pipeline_broker_started", fake_ensure_pipeline_broker_started)
 
     successful_runtime = build_pipeline_runtime(
         settings=Settings(),
@@ -1448,7 +1439,7 @@ async def _seed_embed_pending_item(
         ),
         phash_tag=phash_tag or "a",
     )
-    service = ContentPipelineService(
+    service = PipelineStageCompletionService(
         session,
         publisher=publisher,
     )
@@ -1499,7 +1490,7 @@ async def _seed_classify_pending_item(
         source_id=source_id,
         post_id=post_id,
     )
-    service = ContentPipelineService(
+    service = PipelineStageCompletionService(
         session,
         publisher=publisher,
     )
@@ -1530,7 +1521,7 @@ async def _seed_sync_qdrant_pending_item(
         source_id=source_id,
         post_id=post_id,
     )
-    service = ContentPipelineService(
+    service = PipelineStageCompletionService(
         session,
         publisher=publisher,
     )
@@ -1569,7 +1560,7 @@ async def _seed_sync_meili_pending_item(
         source_id=source_id,
         post_id=post_id,
     )
-    service = ContentPipelineService(
+    service = PipelineStageCompletionService(
         session,
         publisher=publisher,
     )
@@ -1651,7 +1642,7 @@ async def test_pipeline_runtime_embed_success_persists_cache_and_dispatches_clas
     async def fake_ensure_pipeline_broker_started(*_: object, **__: object) -> object:
         return downstream_broker
 
-    monkeypatch.setattr(content_pipeline_module, "ensure_pipeline_broker_started", fake_ensure_pipeline_broker_started)
+    monkeypatch.setattr(pipeline_dispatch_module, "ensure_pipeline_broker_started", fake_ensure_pipeline_broker_started)
 
     embedding_result = build_voyage_embedding_result(input_hash="e" * 64)
     voyage_client = FakeVoyageClient(result=embedding_result)
@@ -1803,7 +1794,7 @@ async def test_pipeline_runtime_classify_success_emits_meme_ready_and_marks_file
     async def fake_ensure_pipeline_broker_started(*_: object, **__: object) -> object:
         return downstream_broker
 
-    monkeypatch.setattr(content_pipeline_module, "ensure_pipeline_broker_started", fake_ensure_pipeline_broker_started)
+    monkeypatch.setattr(pipeline_dispatch_module, "ensure_pipeline_broker_started", fake_ensure_pipeline_broker_started)
 
     runtime = build_pipeline_runtime(
         settings=Settings(),
@@ -1911,7 +1902,7 @@ async def test_pipeline_runtime_embed_merge_transaction_failure_keeps_stage_repl
         phash_tag="o",
     )
     async with postgres_session_factory() as stash_session:
-        older_service = ContentPipelineService(
+        older_service = PipelineStageCompletionService(
             stash_session,
             publisher=seed_publisher,
         )
@@ -2045,7 +2036,7 @@ async def test_pipeline_runtime_embed_merge_transaction_failure_keeps_stage_repl
 
     replay_publisher = RecordingPublisher()
     async with postgres_session_factory() as replay_session:
-        replay_service = ContentPipelineService(
+        replay_service = PipelineReplayService(
             replay_session,
             publisher=replay_publisher,
         )
@@ -2355,7 +2346,7 @@ async def test_pipeline_runtime_sync_qdrant_success_records_snapshot_and_publish
         return downstream_broker
 
     monkeypatch.setattr(
-        content_pipeline_module,
+        pipeline_dispatch_module,
         "ensure_pipeline_broker_started",
         fake_ensure_pipeline_broker_started,
     )
@@ -2485,7 +2476,7 @@ async def test_pipeline_runtime_sync_qdrant_rebuilds_collection_aware_payload_fr
         return downstream_broker
 
     monkeypatch.setattr(
-        content_pipeline_module,
+        pipeline_dispatch_module,
         "ensure_pipeline_broker_started",
         fake_ensure_pipeline_broker_started,
     )
@@ -2788,7 +2779,7 @@ async def test_pipeline_runtime_sync_qdrant_best_effort_preview_fetch_failure_st
         return downstream_broker
 
     monkeypatch.setattr(
-        content_pipeline_module,
+        pipeline_dispatch_module,
         "ensure_pipeline_broker_started",
         fake_ensure_pipeline_broker_started,
     )
@@ -2846,7 +2837,7 @@ async def test_pipeline_runtime_sync_meili_success_records_snapshot_and_publishe
         return downstream_broker
 
     monkeypatch.setattr(
-        content_pipeline_module,
+        pipeline_dispatch_module,
         "ensure_pipeline_broker_started",
         fake_ensure_pipeline_broker_started,
     )
@@ -2973,7 +2964,7 @@ async def test_pipeline_runtime_sync_meili_rebuilds_collection_aware_document_fr
         return downstream_broker
 
     monkeypatch.setattr(
-        content_pipeline_module,
+        pipeline_dispatch_module,
         "ensure_pipeline_broker_started",
         fake_ensure_pipeline_broker_started,
     )
@@ -3293,7 +3284,7 @@ async def test_classify_completion_fans_out_both_sync_stages_and_publishes_both_
         source_id="classify-fanout-happy",
         post_id="9000",
     )
-    service = ContentPipelineService(
+    service = PipelineStageCompletionService(
         migrated_db_session,
         publisher=publisher,
     )
@@ -3358,7 +3349,7 @@ async def test_classify_completion_fan_out_publish_failure_rolls_back_both_stage
         if event.stage is ContentPipelineStage.SYNC_MEILI:
             raise RuntimeError("simulated meili publish failure")
 
-    fail_service = ContentPipelineService(
+    fail_service = PipelineStageCompletionService(
         migrated_db_session,
         publisher=_publisher,
     )
@@ -3418,7 +3409,7 @@ async def test_outcome_partially_searchable_when_exactly_one_target_synced(
         source_id="outcome-partial",
         post_id="9100",
     )
-    service = ContentPipelineService(
+    service = PipelineStageCompletionService(
         migrated_db_session,
         publisher=publisher,
     )
@@ -3444,10 +3435,7 @@ async def test_outcome_partially_searchable_when_exactly_one_target_synced(
     )
 
     async with postgres_session_factory() as read_session:
-        read_service = ContentPipelineService(
-            read_session,
-            publisher=publisher,
-        )
+        read_service = PipelineItemReadService(read_session)
         detail = await read_service.get_item_detail(meme_file_id)
 
     summary = summarize_run(
@@ -3485,7 +3473,7 @@ async def test_outcome_ready_when_both_targets_synced(
         source_id="outcome-ready",
         post_id="9101",
     )
-    service = ContentPipelineService(
+    service = PipelineStageCompletionService(
         migrated_db_session,
         publisher=publisher,
     )
@@ -3509,10 +3497,7 @@ async def test_outcome_ready_when_both_targets_synced(
     )
 
     async with postgres_session_factory() as read_session:
-        read_service = ContentPipelineService(
-            read_session,
-            publisher=publisher,
-        )
+        read_service = PipelineItemReadService(read_session)
         detail = await read_service.get_item_detail(meme_file_id)
 
     summary = summarize_run(
@@ -4044,7 +4029,7 @@ async def test_forced_sync_qdrant_failure_produces_partially_searchable_outcome(
         source_id="t04-partial-outcome",
         post_id="9901",
     )
-    service = ContentPipelineService(
+    service = PipelineStageCompletionService(
         migrated_db_session,
         publisher=publisher,
     )
@@ -4070,10 +4055,7 @@ async def test_forced_sync_qdrant_failure_produces_partially_searchable_outcome(
     )
 
     async with postgres_session_factory() as read_session:
-        read_service = ContentPipelineService(
-            read_session,
-            publisher=publisher,
-        )
+        read_service = PipelineItemReadService(read_session)
         detail = await read_service.get_item_detail(meme_file_id)
 
     summary = summarize_run(
@@ -4107,10 +4089,6 @@ async def test_run_summary_reflects_k_of_n_forced_qdrant_failures(
     seed so the heavy chain does not dedup them.
     """
 
-    from memexpert.services.content_pipeline_constants import (
-        PIPELINE_REASON_SYNC_QDRANT_MALFORMED_PAYLOAD,
-    )
-
     storage_client = FakeStorageClient()
     publisher = RecordingPublisher()
     total = 3
@@ -4127,7 +4105,7 @@ async def test_run_summary_reflects_k_of_n_forced_qdrant_failures(
             post_id=f"99{index:02d}",
             phash_tag=phash_tags[index],
         )
-        service = ContentPipelineService(
+        service = PipelineStageCompletionService(
             migrated_db_session,
             publisher=publisher,
         )
@@ -4171,10 +4149,7 @@ async def test_run_summary_reflects_k_of_n_forced_qdrant_failures(
                 payload_preview={"id": meme_file_id.hex},
             )
         async with postgres_session_factory() as read_session:
-            read_service = ContentPipelineService(
-                read_session,
-                publisher=publisher,
-            )
+            read_service = PipelineItemReadService(read_session)
             details.append(await read_service.get_item_detail(meme_file_id))
 
     summary = summarize_run(

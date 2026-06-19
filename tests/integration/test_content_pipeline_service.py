@@ -50,13 +50,17 @@ from memexpert.models.enums import (
     SyncTargetKind,
     SyncTargetStatus,
 )
+from memexpert.pipeline.constants import SYNC_REPLAY_BATCH_MAX
+from memexpert.pipeline.items import PipelineItemReadService
+from memexpert.pipeline.replay import PipelineReplayService
+from memexpert.pipeline.smoke_proof import PipelineSmokeProofService
+from memexpert.pipeline.stage_completion import PipelineStageCompletionService
 from memexpert.schemas.content_pipeline import (
     ContentPipelineDispatchEvent,
     ContentPipelineEventType,
     ContentPipelineSyncTargetPreview,
 )
 from memexpert.services import (
-    ContentPipelineService,
     PipelineIngestError,
     PipelineMergeTransactionError,
     PipelinePublishError,
@@ -216,11 +220,11 @@ def _build_service_with_distinct_phash(
     *,
     phash_tag: str,
     publisher: RecordingPublisher | None = None,
-) -> ContentPipelineService:
-    """Return a service with a publisher while seed rows own their pHash."""
+) -> PipelineStageCompletionService:
+    """Return a stage completion service while seed rows own their pHash."""
 
     _ = phash_tag
-    return ContentPipelineService(
+    return PipelineStageCompletionService(
         session,
         publisher=publisher or RecordingPublisher(),
     )
@@ -234,7 +238,7 @@ async def _drive_to_embed_pending(
     phash_tag: str,
     publisher: RecordingPublisher | None = None,
     filename: str = "embed-ready.png",
-) -> tuple[uuid.UUID, NormalizedMediaResult, ContentPipelineService]:
+    ) -> tuple[uuid.UUID, NormalizedMediaResult, PipelineStageCompletionService]:
     """Create + transcode + OCR a pipeline item up to the embed-pending state."""
 
     meme_file_id = await _seed_pending_pipeline_item(
@@ -347,7 +351,7 @@ async def test_complete_transcode_stage_persists_derivative_metadata_and_queues_
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     publisher = RecordingPublisher()
-    service = ContentPipelineService(
+    service = PipelineStageCompletionService(
         migrated_db_session,
         publisher=publisher,
     )
@@ -369,7 +373,7 @@ async def test_complete_transcode_stage_persists_derivative_metadata_and_queues_
         event_id=uuid.uuid7(),
         result=normalized,
     )
-    after_transcode = await service.get_item(meme_file_id)
+    after_transcode = await PipelineItemReadService(migrated_db_session).get_item(meme_file_id)
 
     assert after_transcode.current_stage is ContentPipelineStage.OCR
     assert after_transcode.current_status is ContentPipelineStageStatus.PENDING
@@ -396,7 +400,7 @@ async def test_complete_ocr_stage_persists_durable_result_and_keeps_meme_unready
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     publisher = RecordingPublisher()
-    service = ContentPipelineService(
+    service = PipelineStageCompletionService(
         migrated_db_session,
         publisher=publisher,
     )
@@ -424,7 +428,7 @@ async def test_complete_ocr_stage_persists_durable_result_and_keeps_meme_unready
         event_id=uuid.uuid7(),
         result=build_ocr_result(source_object_key=normalized.web_video_object_key),
     )
-    after_ocr = await service.get_item(meme_file_id)
+    after_ocr = await PipelineItemReadService(migrated_db_session).get_item(meme_file_id)
 
     assert after_ocr.current_stage is ContentPipelineStage.EMBED
     assert after_ocr.current_status is ContentPipelineStageStatus.PENDING
@@ -467,7 +471,7 @@ async def test_mark_stage_success_publish_failure_marks_next_stage_failed_and_ke
         phash_tag="p",
     )
 
-    failing_service = ContentPipelineService(
+    failing_service = PipelineStageCompletionService(
         migrated_db_session,
         publisher=RecordingPublisher(fail_with=RuntimeError("broker unavailable")),
     )
@@ -509,7 +513,7 @@ async def test_mark_stage_success_publish_failure_marks_next_stage_failed_and_ke
 async def test_replay_item_rejects_stage_that_has_not_been_dispatched_yet(
     migrated_db_session: AsyncSession,
 ) -> None:
-    service = ContentPipelineService(
+    service = PipelineReplayService(
         migrated_db_session,
         publisher=RecordingPublisher(),
     )
@@ -531,7 +535,7 @@ async def test_replay_publish_failure_restores_previous_failed_stage_snapshot(
     migrated_db_session: AsyncSession,
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    service = ContentPipelineService(
+    service = PipelineStageCompletionService(
         migrated_db_session,
         publisher=RecordingPublisher(),
     )
@@ -555,7 +559,7 @@ async def test_replay_publish_failure_restores_previous_failed_stage_snapshot(
         retryable=True,
     )
 
-    failing_replay_service = ContentPipelineService(
+    failing_replay_service = PipelineReplayService(
         migrated_db_session,
         publisher=RecordingPublisher(fail_with=RuntimeError("republish failed")),
     )
@@ -564,7 +568,7 @@ async def test_replay_publish_failure_restores_previous_failed_stage_snapshot(
         _ = await failing_replay_service.replay_item(meme_file_id, stage=ContentPipelineStage.TRANSCODE)
 
     async with postgres_session_factory() as session:
-        restored_item = await ContentPipelineService(session).get_item(meme_file_id)
+        restored_item = await PipelineItemReadService(session).get_item(meme_file_id)
 
     transcode_stage = next(stage for stage in restored_item.stages if stage.stage is ContentPipelineStage.TRANSCODE)
     assert restored_item.current_stage is ContentPipelineStage.TRANSCODE
@@ -597,7 +601,7 @@ async def test_complete_embed_stage_without_matches_persists_embedding_and_queue
     )
 
     assert merge_outcome.merged is False
-    after_embed = await service.get_item(meme_file_id)
+    after_embed = await PipelineItemReadService(migrated_db_session).get_item(meme_file_id)
     assert after_embed.current_stage is ContentPipelineStage.CLASSIFY
     assert after_embed.current_status is ContentPipelineStageStatus.PENDING
     assert publisher.events[-1].event_type is ContentPipelineEventType.MEME_EMBEDDED
@@ -870,7 +874,7 @@ async def test_complete_classify_stage_makes_meme_ready_with_truthful_ocr_and_ns
         classification_result=build_classification_result(is_nsfw=True, nsfw_score=0.88),
     )
 
-    after_classify = await service.get_item(meme_file_id)
+    after_classify = await PipelineItemReadService(migrated_db_session).get_item(meme_file_id)
     # T03: classify fans out to both sync stages in one atomic commit.
     # ``current_stage`` reflects whichever sync row the stage-ordering helper
     # picks first, but both must exist and both MEME_READY publishes must
@@ -1057,7 +1061,7 @@ async def test_complete_embed_stage_publish_failure_marks_classify_failed(
         phash_tag="k",
     )
 
-    failing_service = ContentPipelineService(
+    failing_service = PipelineStageCompletionService(
         migrated_db_session,
         publisher=RecordingPublisher(fail_with=RuntimeError("broker unavailable")),
     )
@@ -1193,7 +1197,7 @@ async def _drive_to_classify_succeeded(
     post_id: str,
     phash_tag: str,
     input_hash_seed: str,
-) -> tuple[uuid.UUID, ContentPipelineService]:
+) -> tuple[uuid.UUID, PipelineStageCompletionService]:
     """Drive a pipeline item end-to-end through classify success for sync replay tests."""
 
     meme_file_id, _, service = await _drive_to_embed_pending(
@@ -1248,7 +1252,7 @@ async def test_meili_sync_methods_persist_snapshot_and_emit_synced_event(
 
     # Idempotent re-run keeps the attempt count stable and reuses the event id.
     async with postgres_session_factory() as replay_session:
-        replay_service = ContentPipelineService(
+        replay_service = PipelineStageCompletionService(
             replay_session,
             publisher=RecordingPublisher(),
         )
@@ -1274,9 +1278,10 @@ async def test_replay_sync_target_rejects_items_without_classify_success(
     )
 
     with pytest.raises(PipelineReplayNotAllowedError, match="cannot replay sync targets"):
-        _ = await service.replay_sync_target(meme_file_id, SyncTargetKind.QDRANT)
+        replay_service = PipelineReplayService(migrated_db_session, publisher=RecordingPublisher())
+        _ = await replay_service.replay_sync_target(meme_file_id, SyncTargetKind.QDRANT)
     with pytest.raises(PipelineReplayNotAllowedError, match="cannot replay sync targets"):
-        _ = await service.replay_sync_target_batch([meme_file_id], SyncTargetKind.MEILISEARCH)
+        _ = await replay_service.replay_sync_target_batch([meme_file_id], SyncTargetKind.MEILISEARCH)
 
 
 async def test_replay_sync_target_meili_reserves_independent_dispatch(
@@ -1293,7 +1298,10 @@ async def test_replay_sync_target_meili_reserves_independent_dispatch(
         input_hash_seed="a",
     )
 
-    accepted = await service.replay_sync_target(meme_file_id, SyncTargetKind.MEILISEARCH)
+    accepted = await PipelineReplayService(
+        migrated_db_session,
+        publisher=RecordingPublisher(),
+    ).replay_sync_target(meme_file_id, SyncTargetKind.MEILISEARCH)
     assert accepted.stage is ContentPipelineStage.SYNC_MEILI
 
     async with postgres_session_factory() as read_session:
@@ -1310,8 +1318,6 @@ async def test_replay_sync_target_meili_reserves_independent_dispatch(
 async def test_replay_sync_target_batch_refuses_batches_beyond_the_max(
     migrated_db_session: AsyncSession,
 ) -> None:
-    from memexpert.services.content_pipeline import SYNC_REPLAY_BATCH_MAX
-
     meme_file_id, service = await _drive_to_classify_succeeded(
         migrated_db_session,
         source_id="batch-max",
@@ -1322,7 +1328,10 @@ async def test_replay_sync_target_batch_refuses_batches_beyond_the_max(
     oversized_batch = [meme_file_id] * (SYNC_REPLAY_BATCH_MAX + 1)
 
     with pytest.raises(PipelineReplayNotAllowedError, match="exceeds the configured maximum"):
-        _ = await service.replay_sync_target_batch(oversized_batch, SyncTargetKind.QDRANT)
+        _ = await PipelineReplayService(
+            migrated_db_session,
+            publisher=RecordingPublisher(),
+        ).replay_sync_target_batch(oversized_batch, SyncTargetKind.QDRANT)
 
 
 async def test_complete_sync_qdrant_stage_persists_snapshot_and_is_idempotent(
@@ -1356,7 +1365,7 @@ async def test_complete_sync_qdrant_stage_persists_snapshot_and_is_idempotent(
     # Re-running with the same event id must not bump attempts or reset
     # last_success_at to a new timestamp — the publish path is idempotent.
     async with postgres_session_factory() as replay_session:
-        replay_service = ContentPipelineService(
+        replay_service = PipelineStageCompletionService(
             replay_session,
             publisher=RecordingPublisher(),
         )
@@ -1400,14 +1409,14 @@ async def test_fail_sync_qdrant_stage_preserves_prior_success_timestamps(
     # through replay_sync_target so both the snapshot row and the journal row
     # are in the right state for a transient failure.
     async with postgres_session_factory() as replay_session:
-        replay_service = ContentPipelineService(
+        replay_service = PipelineReplayService(
             replay_session,
             publisher=RecordingPublisher(),
         )
         accepted = await replay_service.replay_sync_target(meme_file_id, SyncTargetKind.QDRANT)
 
     async with postgres_session_factory() as fail_session:
-        fail_service = ContentPipelineService(
+        fail_service = PipelineStageCompletionService(
             fail_session,
             publisher=RecordingPublisher(),
         )
@@ -1462,7 +1471,10 @@ async def test_replay_sync_target_qdrant_leaves_meili_row_untouched(
         await seed_session.commit()
         meili_updated_at = meili_row.updated_at
 
-    accepted = await service.replay_sync_target(meme_file_id, SyncTargetKind.QDRANT)
+    accepted = await PipelineReplayService(
+        migrated_db_session,
+        publisher=RecordingPublisher(),
+    ).replay_sync_target(meme_file_id, SyncTargetKind.QDRANT)
     assert accepted.stage is ContentPipelineStage.SYNC_QDRANT
 
     async with postgres_session_factory() as verify_session:
@@ -1493,7 +1505,7 @@ async def test_item_detail_projects_per_target_sync_status_from_snapshot_rows(
 
     # First, the empty default: the item detail must already expose an empty
     # mapping before any snapshot rows exist.
-    empty_detail = await service.get_item_detail(meme_file_id)
+    empty_detail = await PipelineItemReadService(migrated_db_session).get_item_detail(meme_file_id)
     assert empty_detail.sync_targets == {}
 
     from memexpert.models.base import utcnow as _utcnow
@@ -1531,10 +1543,7 @@ async def test_item_detail_projects_per_target_sync_status_from_snapshot_rows(
         await write_session.commit()
 
     async with postgres_session_factory() as read_session:
-        read_service = ContentPipelineService(
-            read_session,
-            publisher=RecordingPublisher(),
-        )
+        read_service = PipelineItemReadService(read_session)
         detail = await read_service.get_item_detail(meme_file_id)
 
     assert set(detail.sync_targets) == {SyncTargetKind.QDRANT, SyncTargetKind.MEILISEARCH}
@@ -1575,14 +1584,14 @@ async def test_fail_sync_meili_stage_preserves_prior_success_timestamps(
     assert first_preview is not None
 
     async with postgres_session_factory() as replay_session:
-        replay_service = ContentPipelineService(
+        replay_service = PipelineReplayService(
             replay_session,
             publisher=RecordingPublisher(),
         )
         accepted = await replay_service.replay_sync_target(meme_file_id, SyncTargetKind.MEILISEARCH)
 
     async with postgres_session_factory() as fail_session:
-        fail_service = ContentPipelineService(
+        fail_service = PipelineStageCompletionService(
             fail_session,
             publisher=RecordingPublisher(),
         )
@@ -1637,7 +1646,7 @@ async def test_replay_sync_target_meili_leaves_qdrant_row_byte_identical(
     qdrant_before_snapshot = _snapshot_row_to_dict(qdrant_before)
 
     async with postgres_session_factory() as replay_session:
-        replay_service = ContentPipelineService(
+        replay_service = PipelineReplayService(
             replay_session,
             publisher=RecordingPublisher(),
         )
@@ -1688,7 +1697,7 @@ async def test_replay_sync_target_qdrant_leaves_meili_row_byte_identical(
     meili_before_snapshot = _snapshot_row_to_dict(meili_before)
 
     async with postgres_session_factory() as replay_session:
-        replay_service = ContentPipelineService(
+        replay_service = PipelineReplayService(
             replay_session,
             publisher=RecordingPublisher(),
         )
@@ -1713,8 +1722,6 @@ async def test_replay_sync_target_batch_meili_cap_enforced(
 ) -> None:
     """T03: the Meilisearch batch-replay path honors the same cap as the Qdrant batch."""
 
-    from memexpert.services.content_pipeline import SYNC_REPLAY_BATCH_MAX
-
     meme_file_id, service = await _drive_to_classify_succeeded(
         migrated_db_session,
         source_id="meili-batch-cap",
@@ -1724,7 +1731,10 @@ async def test_replay_sync_target_batch_meili_cap_enforced(
     )
     oversized_batch = [meme_file_id] * (SYNC_REPLAY_BATCH_MAX + 1)
     with pytest.raises(PipelineReplayNotAllowedError, match="exceeds the configured maximum"):
-        _ = await service.replay_sync_target_batch(oversized_batch, SyncTargetKind.MEILISEARCH)
+        _ = await PipelineReplayService(
+            migrated_db_session,
+            publisher=RecordingPublisher(),
+        ).replay_sync_target_batch(oversized_batch, SyncTargetKind.MEILISEARCH)
 
 
 def _snapshot_row_to_dict(row: MemeFileSyncTargetSnapshot) -> dict[str, object]:
@@ -1937,7 +1947,7 @@ async def test_run_smoke_proof_reports_both_targets_searchable(
         search_hits=[{"id": meme_file_id.hex}],
     )
 
-    result = await service.run_search_smoke_proof(
+    result = await PipelineSmokeProofService(migrated_db_session).run_search_smoke_proof(
         qdrant_sync_client=qdrant_sync,
         qdrant_similarity_client=similarity,
         meilisearch_sync_client=meili,
@@ -1987,7 +1997,7 @@ async def test_run_smoke_proof_reports_point_not_found_when_qdrant_missing(
         search_hits=[{"id": meme_file_id.hex}],
     )
 
-    result = await service.run_search_smoke_proof(
+    result = await PipelineSmokeProofService(migrated_db_session).run_search_smoke_proof(
         qdrant_sync_client=qdrant_sync,
         qdrant_similarity_client=similarity,
         meilisearch_sync_client=meili,
@@ -2041,7 +2051,7 @@ async def test_run_smoke_proof_reports_document_not_found_when_meili_missing(
     )
     meili = _FakeMeilisearchSyncClient(fetch_preview=None)
 
-    result = await service.run_search_smoke_proof(
+    result = await PipelineSmokeProofService(migrated_db_session).run_search_smoke_proof(
         qdrant_sync_client=qdrant_sync,
         qdrant_similarity_client=similarity,
         meilisearch_sync_client=meili,
@@ -2092,7 +2102,7 @@ async def test_run_smoke_proof_reports_qdrant_timeout_while_proving_meili(
         search_hits=[{"id": meme_file_id.hex}],
     )
 
-    result = await service.run_search_smoke_proof(
+    result = await PipelineSmokeProofService(migrated_db_session).run_search_smoke_proof(
         qdrant_sync_client=qdrant_sync,
         qdrant_similarity_client=similarity,
         meilisearch_sync_client=meili,
@@ -2148,7 +2158,7 @@ async def test_run_smoke_proof_reports_meili_malformed_while_proving_qdrant(
         fetch_error=MeilisearchSyncMalformedResponseError("bad payload"),
     )
 
-    result = await service.run_search_smoke_proof(
+    result = await PipelineSmokeProofService(migrated_db_session).run_search_smoke_proof(
         qdrant_sync_client=qdrant_sync,
         qdrant_similarity_client=similarity,
         meilisearch_sync_client=meili,
@@ -2205,7 +2215,7 @@ async def test_run_smoke_proof_uses_meili_search_timeout_reason_on_query_step(
         search_error=MeilisearchSyncTimeoutError("slow"),
     )
 
-    result = await service.run_search_smoke_proof(
+    result = await PipelineSmokeProofService(migrated_db_session).run_search_smoke_proof(
         qdrant_sync_client=qdrant_sync,
         qdrant_similarity_client=similarity,
         meilisearch_sync_client=meili,

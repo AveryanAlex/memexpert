@@ -14,10 +14,13 @@ from sqlalchemy import func, select
 
 from memexpert.api.dependencies.pipeline import (
     PIPELINE_OPERATOR_TOKEN_HEADER_NAME,
-    get_content_pipeline_service,
     get_meilisearch_sync_client,
     get_pipeline_ingest_accept_service,
     get_pipeline_ingest_read_service,
+    get_pipeline_item_read_service,
+    get_pipeline_replay_service,
+    get_pipeline_smoke_proof_service,
+    get_pipeline_sync_status_service,
     get_qdrant_similarity_client,
     get_qdrant_sync_client,
 )
@@ -51,6 +54,12 @@ from memexpert.models.enums import (
     SourceAttachReason,
     SourcePlatform,
 )
+from memexpert.pipeline.constants import SYNC_REPLAY_BATCH_MAX
+from memexpert.pipeline.items import PipelineItemReadService
+from memexpert.pipeline.replay import PipelineReplayService
+from memexpert.pipeline.smoke_proof import PipelineSmokeProofService
+from memexpert.pipeline.stage_completion import PipelineStageCompletionService
+from memexpert.pipeline.sync_status import PipelineSyncStatusService
 from memexpert.schemas.content_pipeline import (
     ContentPipelineDispatchEvent,
     ContentPipelineItemDetail,
@@ -60,7 +69,6 @@ from memexpert.schemas.content_pipeline import (
     ContentPipelineStageJournalRead,
 )
 from memexpert.services import (
-    ContentPipelineService,
     PipelineItemNotFoundError,
     PipelineReplayNotAllowedError,
     PipelineUnsupportedMediaTypeError,
@@ -176,6 +184,39 @@ class StubIngestReadService:
     async def get_request(self, ingest_request_id: uuid.UUID) -> IngestRequestRead:
         self.detail_calls.append(ingest_request_id)
         return self.request
+
+
+def _override_focused_pipeline_services(
+    app: FastAPI,
+    *,
+    item_read_service: object | None = None,
+    replay_service: object | None = None,
+    sync_status_service: object | None = None,
+    smoke_proof_service: object | None = None,
+) -> None:
+    if item_read_service is not None:
+        app.dependency_overrides[get_pipeline_item_read_service] = lambda: item_read_service
+    if replay_service is not None:
+        app.dependency_overrides[get_pipeline_replay_service] = lambda: replay_service
+    if sync_status_service is not None:
+        app.dependency_overrides[get_pipeline_sync_status_service] = lambda: sync_status_service
+    if smoke_proof_service is not None:
+        app.dependency_overrides[get_pipeline_smoke_proof_service] = lambda: smoke_proof_service
+
+
+def _override_real_pipeline_services(
+    app: FastAPI,
+    session: AsyncSession,
+    *,
+    publisher: RecordingPublisher | None = None,
+) -> None:
+    _override_focused_pipeline_services(
+        app,
+        item_read_service=PipelineItemReadService(session),
+        replay_service=PipelineReplayService(session, publisher=publisher),
+        sync_status_service=PipelineSyncStatusService(session),
+        smoke_proof_service=PipelineSmokeProofService(session),
+    )
 
 
 @dataclass(slots=True)
@@ -315,7 +356,7 @@ async def _seed_pipeline_item(
         ]
     )
     await session.commit()
-    return await ContentPipelineService(session).get_item(meme_file_id)
+    return await PipelineItemReadService(session).get_item(meme_file_id)
 
 
 def _normalized_media_result(meme_file_id: uuid.UUID) -> NormalizedMediaResult:
@@ -577,7 +618,11 @@ async def test_pipeline_routes_expose_list_detail_replay_and_openapi_registratio
     )
     stub_ingest_read_service = StubIngestReadService(request=ingest_request)
     operator_token = get_settings().pipeline_operator_token.get_secret_value()
-    app.dependency_overrides[get_content_pipeline_service] = lambda: stub_service
+    _override_focused_pipeline_services(
+        app,
+        item_read_service=stub_service,
+        replay_service=stub_service,
+    )
     app.dependency_overrides[get_pipeline_ingest_read_service] = lambda: stub_ingest_read_service
 
     try:
@@ -727,7 +772,11 @@ async def test_pipeline_routes_map_service_errors_to_typed_http_payloads(
     stub_ingest_accept_service = StubIngestAcceptService(
         error=PipelineUnsupportedMediaTypeError("Uploaded media type is not supported."),
     )
-    app.dependency_overrides[get_content_pipeline_service] = lambda: stub_service
+    _override_focused_pipeline_services(
+        app,
+        item_read_service=stub_service,
+        replay_service=stub_service,
+    )
     app.dependency_overrides[get_pipeline_ingest_accept_service] = lambda: stub_ingest_accept_service
 
     try:
@@ -779,13 +828,10 @@ async def test_pipeline_upload_route_creates_raw_ingest_request_separate_from_it
     storage_client = FakeStorageClient()
     accept_service = PipelineIngestAcceptService(migrated_db_session, storage_client=storage_client)
     read_service = PipelineIngestReadService(migrated_db_session)
-    item_service = ContentPipelineService(
-        migrated_db_session,
-        publisher=RecordingPublisher(),
-    )
+    item_service = PipelineItemReadService(migrated_db_session)
     app.dependency_overrides[get_pipeline_ingest_accept_service] = lambda: accept_service
     app.dependency_overrides[get_pipeline_ingest_read_service] = lambda: read_service
-    app.dependency_overrides[get_content_pipeline_service] = lambda: item_service
+    _override_focused_pipeline_services(app, item_read_service=item_service)
 
     try:
         upload_response = await client.post(
@@ -844,11 +890,11 @@ async def test_pipeline_routes_list_failed_items_and_reject_replay_guards_with_r
 ) -> None:
     operator_token = get_settings().pipeline_operator_token.get_secret_value()
     publisher = RecordingPublisher()
-    service = ContentPipelineService(
+    service = PipelineStageCompletionService(
         migrated_db_session,
         publisher=publisher,
     )
-    app.dependency_overrides[get_content_pipeline_service] = lambda: service
+    _override_real_pipeline_services(app, migrated_db_session, publisher=publisher)
 
     try:
         item = await _seed_pipeline_item(
@@ -963,11 +1009,7 @@ async def test_pipeline_detail_route_returns_empty_projections_before_ocr(
 
     operator_token = get_settings().pipeline_operator_token.get_secret_value()
     publisher = RecordingPublisher()
-    service = ContentPipelineService(
-        migrated_db_session,
-        publisher=publisher,
-    )
-    app.dependency_overrides[get_content_pipeline_service] = lambda: service
+    _override_real_pipeline_services(app, migrated_db_session, publisher=publisher)
 
     try:
         item = await _seed_pipeline_item(
@@ -1017,11 +1059,11 @@ async def test_pipeline_detail_route_returns_ocr_and_unknown_classification_afte
 
     operator_token = get_settings().pipeline_operator_token.get_secret_value()
     publisher = RecordingPublisher()
-    service = ContentPipelineService(
+    service = PipelineStageCompletionService(
         migrated_db_session,
         publisher=publisher,
     )
-    app.dependency_overrides[get_content_pipeline_service] = lambda: service
+    _override_real_pipeline_services(app, migrated_db_session, publisher=publisher)
 
     try:
         item = await _seed_pipeline_item(
@@ -1091,12 +1133,12 @@ async def test_pipeline_detail_route_reports_merge_and_classify_and_ready(
         post_id="9200",
         phash_tag="o",
     )
-    older_service = ContentPipelineService(
+    older_service = PipelineStageCompletionService(
         migrated_db_session,
         publisher=publisher,
     )
     older_meme = (
-        await older_service.get_item(older_meme_file_id)
+        await PipelineItemReadService(migrated_db_session).get_item(older_meme_file_id)
     ).meme_id
     await older_service.complete_transcode_stage(
         meme_file_id=older_meme_file_id,
@@ -1137,7 +1179,7 @@ async def test_pipeline_detail_route_reports_merge_and_classify_and_ready(
         post_id="9201",
         phash_tag="n",
     )
-    newer_service = ContentPipelineService(
+    newer_service = PipelineStageCompletionService(
         migrated_db_session,
         publisher=publisher,
     )
@@ -1178,11 +1220,7 @@ async def test_pipeline_detail_route_reports_merge_and_classify_and_ready(
         ),
     )
 
-    service = ContentPipelineService(
-        migrated_db_session,
-        publisher=publisher,
-    )
-    app.dependency_overrides[get_content_pipeline_service] = lambda: service
+    _override_real_pipeline_services(app, migrated_db_session, publisher=publisher)
 
     try:
         detail_response = await client.get(
@@ -1244,11 +1282,11 @@ async def test_pipeline_detail_route_reports_blocked_items_without_defaulted_cla
 
     operator_token = get_settings().pipeline_operator_token.get_secret_value()
     publisher = RecordingPublisher()
-    service = ContentPipelineService(
+    service = PipelineStageCompletionService(
         migrated_db_session,
         publisher=publisher,
     )
-    app.dependency_overrides[get_content_pipeline_service] = lambda: service
+    _override_real_pipeline_services(app, migrated_db_session, publisher=publisher)
 
     try:
         item = await _seed_pipeline_item(
@@ -1311,8 +1349,8 @@ async def test_pipeline_detail_route_returns_404_for_unknown_item_and_registers_
     """The detail route must reject unknown ids and appear in the OpenAPI schema."""
 
     operator_token = get_settings().pipeline_operator_token.get_secret_value()
-    service = ContentPipelineService(migrated_db_session)
-    app.dependency_overrides[get_content_pipeline_service] = lambda: service
+    service = PipelineItemReadService(migrated_db_session)
+    _override_focused_pipeline_services(app, item_read_service=service)
     unknown_id = uuid.uuid7()
 
     try:
@@ -1355,7 +1393,7 @@ async def _drive_item_to_classify_succeeded(
         post_id=post_id,
         phash_tag=phash_tag,
     )
-    service = ContentPipelineService(session, publisher=publisher)
+    service = PipelineStageCompletionService(session, publisher=publisher)
     await service.complete_transcode_stage(
         meme_file_id=meme_file_id,
         attempt=1,
@@ -1407,8 +1445,10 @@ async def test_pipeline_qdrant_sync_status_route_returns_404_when_snapshot_missi
         phash_tag="x",
         input_hash_seed="x",
     )
-    service = ContentPipelineService(migrated_db_session, publisher=publisher)
-    app.dependency_overrides[get_content_pipeline_service] = lambda: service
+    _override_focused_pipeline_services(
+        app,
+        sync_status_service=PipelineSyncStatusService(migrated_db_session),
+    )
 
     try:
         response = await client.get(
@@ -1441,7 +1481,7 @@ async def test_pipeline_qdrant_sync_status_route_returns_synced_row(
         phash_tag="y",
         input_hash_seed="y",
     )
-    service = ContentPipelineService(migrated_db_session, publisher=publisher)
+    service = PipelineStageCompletionService(migrated_db_session, publisher=publisher)
     sync_event = uuid.uuid7()
     _ = await service.complete_sync_qdrant_stage(
         meme_file_id=meme_file_id,
@@ -1449,7 +1489,10 @@ async def test_pipeline_qdrant_sync_status_route_returns_synced_row(
         event_id=sync_event,
         payload_preview={"point_id": str(meme_file_id), "tags": []},
     )
-    app.dependency_overrides[get_content_pipeline_service] = lambda: service
+    _override_focused_pipeline_services(
+        app,
+        sync_status_service=PipelineSyncStatusService(migrated_db_session),
+    )
 
     try:
         response = await client.get(
@@ -1498,8 +1541,8 @@ async def test_pipeline_qdrant_sync_replay_route_happy_path(
         phash_tag="z",
         input_hash_seed="z",
     )
-    service = ContentPipelineService(migrated_db_session, publisher=publisher)
-    app.dependency_overrides[get_content_pipeline_service] = lambda: service
+    replay_service = PipelineReplayService(migrated_db_session, publisher=publisher)
+    _override_focused_pipeline_services(app, replay_service=replay_service)
 
     try:
         response = await client.post(
@@ -1533,8 +1576,8 @@ async def test_pipeline_qdrant_sync_replay_route_rejects_not_ready_items(
         post_id="9503",
         phash_tag="w",
     )
-    service = ContentPipelineService(migrated_db_session, publisher=publisher)
-    app.dependency_overrides[get_content_pipeline_service] = lambda: service
+    replay_service = PipelineReplayService(migrated_db_session, publisher=publisher)
+    _override_focused_pipeline_services(app, replay_service=replay_service)
 
     try:
         response = await client.post(
@@ -1576,8 +1619,8 @@ async def test_pipeline_qdrant_sync_replay_batch_route_happy_path(
         phash_tag="b",
         input_hash_seed="2",
     )
-    service = ContentPipelineService(migrated_db_session, publisher=publisher)
-    app.dependency_overrides[get_content_pipeline_service] = lambda: service
+    replay_service = PipelineReplayService(migrated_db_session, publisher=publisher)
+    _override_focused_pipeline_services(app, replay_service=replay_service)
 
     try:
         response = await client.post(
@@ -1603,8 +1646,6 @@ async def test_pipeline_qdrant_sync_replay_batch_route_rejects_oversize_batches(
 ) -> None:
     """The batch endpoint must reject requests larger than SYNC_REPLAY_BATCH_MAX."""
 
-    from memexpert.services.content_pipeline import SYNC_REPLAY_BATCH_MAX
-
     operator_token = get_settings().pipeline_operator_token.get_secret_value()
     storage_client = FakeStorageClient()
     publisher = RecordingPublisher()
@@ -1617,8 +1658,8 @@ async def test_pipeline_qdrant_sync_replay_batch_route_rejects_oversize_batches(
         phash_tag="c",
         input_hash_seed="3",
     )
-    service = ContentPipelineService(migrated_db_session, publisher=publisher)
-    app.dependency_overrides[get_content_pipeline_service] = lambda: service
+    service = PipelineReplayService(migrated_db_session, publisher=publisher)
+    _override_focused_pipeline_services(app, replay_service=service)
     oversized_batch = [str(meme_file_id)] * (SYNC_REPLAY_BATCH_MAX + 1)
 
     try:
@@ -1694,8 +1735,10 @@ async def test_pipeline_meili_sync_status_route_returns_404_when_snapshot_missin
         phash_tag="1",
         input_hash_seed="1",
     )
-    service = ContentPipelineService(migrated_db_session, publisher=publisher)
-    app.dependency_overrides[get_content_pipeline_service] = lambda: service
+    _override_focused_pipeline_services(
+        app,
+        sync_status_service=PipelineSyncStatusService(migrated_db_session),
+    )
 
     try:
         response = await client.get(
@@ -1728,7 +1771,7 @@ async def test_pipeline_meili_sync_status_route_returns_synced_row(
         phash_tag="2",
         input_hash_seed="2",
     )
-    service = ContentPipelineService(migrated_db_session, publisher=publisher)
+    service = PipelineStageCompletionService(migrated_db_session, publisher=publisher)
     sync_event = uuid.uuid7()
     _ = await service.complete_sync_meili_stage(
         meme_file_id=meme_file_id,
@@ -1736,7 +1779,10 @@ async def test_pipeline_meili_sync_status_route_returns_synced_row(
         event_id=sync_event,
         payload_preview={"id": meme_file_id.hex, "tags": []},
     )
-    app.dependency_overrides[get_content_pipeline_service] = lambda: service
+    _override_focused_pipeline_services(
+        app,
+        sync_status_service=PipelineSyncStatusService(migrated_db_session),
+    )
 
     try:
         response = await client.get(
@@ -1785,8 +1831,8 @@ async def test_pipeline_meili_sync_replay_route_happy_path(
         phash_tag="3",
         input_hash_seed="3",
     )
-    service = ContentPipelineService(migrated_db_session, publisher=publisher)
-    app.dependency_overrides[get_content_pipeline_service] = lambda: service
+    service = PipelineReplayService(migrated_db_session, publisher=publisher)
+    _override_focused_pipeline_services(app, replay_service=service)
 
     try:
         response = await client.post(
@@ -1820,8 +1866,8 @@ async def test_pipeline_meili_sync_replay_route_rejects_not_ready_items(
         post_id="9603",
         phash_tag="4",
     )
-    service = ContentPipelineService(migrated_db_session, publisher=publisher)
-    app.dependency_overrides[get_content_pipeline_service] = lambda: service
+    service = PipelineReplayService(migrated_db_session, publisher=publisher)
+    _override_focused_pipeline_services(app, replay_service=service)
 
     try:
         response = await client.post(
@@ -1863,8 +1909,8 @@ async def test_pipeline_meili_sync_replay_batch_route_happy_path(
         phash_tag="6",
         input_hash_seed="6",
     )
-    service = ContentPipelineService(migrated_db_session, publisher=publisher)
-    app.dependency_overrides[get_content_pipeline_service] = lambda: service
+    service = PipelineReplayService(migrated_db_session, publisher=publisher)
+    _override_focused_pipeline_services(app, replay_service=service)
 
     try:
         response = await client.post(
@@ -1890,8 +1936,6 @@ async def test_pipeline_meili_sync_replay_batch_route_rejects_oversize_batches(
 ) -> None:
     """The Meilisearch batch endpoint must reject requests > SYNC_REPLAY_BATCH_MAX."""
 
-    from memexpert.services.content_pipeline import SYNC_REPLAY_BATCH_MAX
-
     operator_token = get_settings().pipeline_operator_token.get_secret_value()
     storage_client = FakeStorageClient()
     publisher = RecordingPublisher()
@@ -1904,8 +1948,8 @@ async def test_pipeline_meili_sync_replay_batch_route_rejects_oversize_batches(
         phash_tag="7",
         input_hash_seed="7",
     )
-    service = ContentPipelineService(migrated_db_session, publisher=publisher)
-    app.dependency_overrides[get_content_pipeline_service] = lambda: service
+    service = PipelineReplayService(migrated_db_session, publisher=publisher)
+    _override_focused_pipeline_services(app, replay_service=service)
     oversized_batch = [str(meme_file_id)] * (SYNC_REPLAY_BATCH_MAX + 1)
 
     try:
@@ -1959,8 +2003,10 @@ async def test_pipeline_item_detail_preserves_pre_s03_byte_compatibility(
         post_id="9607",
         phash_tag="8",
     )
-    service = ContentPipelineService(migrated_db_session, publisher=publisher)
-    app.dependency_overrides[get_content_pipeline_service] = lambda: service
+    _override_focused_pipeline_services(
+        app,
+        item_read_service=PipelineItemReadService(migrated_db_session),
+    )
 
     try:
         response = await client.get(
@@ -2119,7 +2165,7 @@ async def _drive_to_dual_synced(
         phash_tag=phash_tag,
         input_hash_seed=input_hash_seed,
     )
-    service = ContentPipelineService(session, publisher=publisher)
+    service = PipelineStageCompletionService(session, publisher=publisher)
     _ = await service.complete_sync_qdrant_stage(
         meme_file_id=meme_file_id,
         attempt=1,
@@ -2154,7 +2200,7 @@ async def test_pipeline_search_smoke_route_happy_path_returns_both_searchable(
         storage_client=storage_client,
         publisher=publisher,
     )
-    service = ContentPipelineService(migrated_db_session, publisher=publisher)
+    service = PipelineSmokeProofService(migrated_db_session)
 
     qdrant_sync = _RouteFakeQdrantSyncClient(fetch_preview=_build_qdrant_route_preview(meme_file_id))
     similarity = _RouteFakeQdrantSimilarityClient(
@@ -2171,7 +2217,7 @@ async def test_pipeline_search_smoke_route_happy_path_returns_both_searchable(
         search_hits=[{"id": meme_file_id.hex}],
     )
 
-    app.dependency_overrides[get_content_pipeline_service] = lambda: service
+    _override_focused_pipeline_services(app, smoke_proof_service=service)
     app.dependency_overrides[get_qdrant_sync_client] = lambda: qdrant_sync
     app.dependency_overrides[get_qdrant_similarity_client] = lambda: similarity
     app.dependency_overrides[get_meilisearch_sync_client] = lambda: meili
@@ -2214,7 +2260,7 @@ async def test_pipeline_search_smoke_route_returns_200_when_qdrant_point_missing
         storage_client=storage_client,
         publisher=publisher,
     )
-    service = ContentPipelineService(migrated_db_session, publisher=publisher)
+    service = PipelineSmokeProofService(migrated_db_session)
 
     qdrant_sync = _RouteFakeQdrantSyncClient(fetch_preview=None)
     similarity = _RouteFakeQdrantSimilarityClient()
@@ -2223,7 +2269,7 @@ async def test_pipeline_search_smoke_route_returns_200_when_qdrant_point_missing
         search_hits=[{"id": meme_file_id.hex}],
     )
 
-    app.dependency_overrides[get_content_pipeline_service] = lambda: service
+    _override_focused_pipeline_services(app, smoke_proof_service=service)
     app.dependency_overrides[get_qdrant_sync_client] = lambda: qdrant_sync
     app.dependency_overrides[get_qdrant_similarity_client] = lambda: similarity
     app.dependency_overrides[get_meilisearch_sync_client] = lambda: meili
@@ -2267,13 +2313,13 @@ async def test_pipeline_search_smoke_route_returns_200_when_both_targets_missing
         storage_client=storage_client,
         publisher=publisher,
     )
-    service = ContentPipelineService(migrated_db_session, publisher=publisher)
+    service = PipelineSmokeProofService(migrated_db_session)
 
     qdrant_sync = _RouteFakeQdrantSyncClient(fetch_preview=None)
     similarity = _RouteFakeQdrantSimilarityClient()
     meili = _RouteFakeMeilisearchSyncClient(fetch_preview=None)
 
-    app.dependency_overrides[get_content_pipeline_service] = lambda: service
+    _override_focused_pipeline_services(app, smoke_proof_service=service)
     app.dependency_overrides[get_qdrant_sync_client] = lambda: qdrant_sync
     app.dependency_overrides[get_qdrant_similarity_client] = lambda: similarity
     app.dependency_overrides[get_meilisearch_sync_client] = lambda: meili
@@ -2356,13 +2402,13 @@ async def test_pipeline_search_smoke_route_returns_404_for_unknown_meme_file_id(
     """Unknown meme_file_id → 404 pipeline_item_not_found."""
 
     operator_token = get_settings().pipeline_operator_token.get_secret_value()
-    service = ContentPipelineService(migrated_db_session)
+    service = PipelineSmokeProofService(migrated_db_session)
     qdrant_sync = _RouteFakeQdrantSyncClient()
     similarity = _RouteFakeQdrantSimilarityClient()
     meili = _RouteFakeMeilisearchSyncClient()
     unknown_id = uuid.uuid7()
 
-    app.dependency_overrides[get_content_pipeline_service] = lambda: service
+    _override_focused_pipeline_services(app, smoke_proof_service=service)
     app.dependency_overrides[get_qdrant_sync_client] = lambda: qdrant_sync
     app.dependency_overrides[get_qdrant_similarity_client] = lambda: similarity
     app.dependency_overrides[get_meilisearch_sync_client] = lambda: meili
@@ -2430,7 +2476,7 @@ async def test_pipeline_search_smoke_route_query_only_resolves_top_hit(
         storage_client=storage_client,
         publisher=publisher,
     )
-    service = ContentPipelineService(migrated_db_session, publisher=publisher)
+    service = PipelineSmokeProofService(migrated_db_session)
 
     qdrant_sync = _RouteFakeQdrantSyncClient(fetch_preview=_build_qdrant_route_preview(meme_file_id))
     similarity = _RouteFakeQdrantSimilarityClient(
@@ -2451,7 +2497,7 @@ async def test_pipeline_search_smoke_route_query_only_resolves_top_hit(
         search_hits=[{"id": meme_file_id.hex}],
     )
 
-    app.dependency_overrides[get_content_pipeline_service] = lambda: service
+    _override_focused_pipeline_services(app, smoke_proof_service=service)
     app.dependency_overrides[get_qdrant_sync_client] = lambda: qdrant_sync
     app.dependency_overrides[get_qdrant_similarity_client] = lambda: similarity
     app.dependency_overrides[get_meilisearch_sync_client] = lambda: meili
@@ -2483,12 +2529,12 @@ async def test_pipeline_search_smoke_route_query_only_returns_404_on_no_hits(
     """Query-only with no Meilisearch hits → 404 pipeline_item_not_found."""
 
     operator_token = get_settings().pipeline_operator_token.get_secret_value()
-    service = ContentPipelineService(migrated_db_session)
+    service = PipelineSmokeProofService(migrated_db_session)
     qdrant_sync = _RouteFakeQdrantSyncClient()
     similarity = _RouteFakeQdrantSimilarityClient()
     meili = _RouteFakeMeilisearchSyncClient(search_hits=[])
 
-    app.dependency_overrides[get_content_pipeline_service] = lambda: service
+    _override_focused_pipeline_services(app, smoke_proof_service=service)
     app.dependency_overrides[get_qdrant_sync_client] = lambda: qdrant_sync
     app.dependency_overrides[get_qdrant_similarity_client] = lambda: similarity
     app.dependency_overrides[get_meilisearch_sync_client] = lambda: meili

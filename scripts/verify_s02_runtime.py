@@ -29,13 +29,13 @@ from pydantic import BaseModel, ValidationError
 
 from memexpert.core.config import get_settings
 from memexpert.models.enums import ContentPipelineStageStatus
+from memexpert.pipeline.reporting import render_markdown_report, summarize_run
 from memexpert.schemas.content_pipeline import (
     ContentPipelineErrorResponse,
     ContentPipelineItemDetail,
     ContentPipelineRunSummary,
     ContentPipelineUploadRead,
 )
-from memexpert.services.content_pipeline_reporting import render_markdown_report, summarize_run
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
