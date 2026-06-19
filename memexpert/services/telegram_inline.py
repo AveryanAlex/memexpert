@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Protocol
 from urllib.parse import urlparse
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from memexpert.models.collection import PinnedMeme
@@ -146,7 +147,7 @@ class TelegramInlineService:
 
         resolved_limit = _clamp_limit(limit)
         resolved_offset = max(0, offset)
-        linked_user = await self._resolve_active_linked_user(telegram_user_id=telegram_user_id)
+        linked_user = await self._resolve_or_create_active_telegram_user(telegram_user_id=telegram_user_id)
         normalized_query = query.strip()
 
         if normalized_query:
@@ -285,15 +286,29 @@ class TelegramInlineService:
             request_id=request_id,
         )
 
-    async def _resolve_active_linked_user(self, *, telegram_user_id: int) -> User | None:
-        user: User | None = await self._session.scalar(
-            select(User).where(
-                User.telegram_id == telegram_user_id,
-                User.account_type == AccountType.FULL,
-                User.status == AccountStatus.ACTIVE,
-            )
+    async def _resolve_or_create_active_telegram_user(self, *, telegram_user_id: int) -> User | None:
+        user = await self._load_telegram_user(telegram_user_id=telegram_user_id)
+        if user is not None:
+            return user if _is_active_full_user(user) else None
+
+        user = User(
+            telegram_id=telegram_user_id,
+            status=AccountStatus.ACTIVE,
+            nsfw_enabled=False,
         )
+        self._session.add(user)
+        try:
+            await self._session.commit()
+        except IntegrityError:
+            await self._session.rollback()
+            user = await self._load_telegram_user(telegram_user_id=telegram_user_id)
+            if user is None:
+                raise
+            return user if _is_active_full_user(user) else None
         return user
+
+    async def _load_telegram_user(self, *, telegram_user_id: int) -> User | None:
+        return await self._session.scalar(select(User).where(User.telegram_id == telegram_user_id))
 
     async def _load_pinned_memes(self, user: User) -> list[Meme]:
         stmt = (
@@ -437,6 +452,10 @@ def _visible_meme_stmt(viewer_user_id: uuid.UUID | None, *, include_nsfw: bool):
         _search_scope_meme_stmt(viewer_user_id, scope=scope),
         MemeSearchFilters(include_nsfw=include_nsfw, scope=scope),
     )
+
+
+def _is_active_full_user(user: User) -> bool:
+    return user.account_type is AccountType.FULL and user.status is AccountStatus.ACTIVE
 
 
 def _to_inline_candidate(item: _InlineAttributedMeme) -> _InlineCandidate | None:
