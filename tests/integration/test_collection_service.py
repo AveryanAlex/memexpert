@@ -43,6 +43,18 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
 
+class FakeStorageClient:
+    def __init__(self) -> None:
+        self.delete_calls: list[dict[str, object]] = []
+        self.fail_deletes = False
+
+    def delete_object(self, *, Bucket: str, Key: str) -> object:
+        self.delete_calls.append({"Bucket": Bucket, "Key": Key})
+        if self.fail_deletes:
+            raise RuntimeError("forced delete failure")
+        return {"DeleteMarker": True}
+
+
 async def _create_meme(
     session: AsyncSession,
     *,
@@ -383,6 +395,180 @@ async def test_save_uses_guest_favorites_or_full_active_custom_collection(
 
     with pytest.raises(GuestCollectionAccessError, match="Guest accounts can only use Favorites"):
         _ = await collection_service.update_active_save_collection(user_id=guest.id, collection_id=custom.id)
+
+
+async def test_private_cleanup_deletes_only_unreferenced_private_storage_and_rows(
+    migrated_db_session: AsyncSession,
+) -> None:
+    user_service = UserService(migrated_db_session)
+    storage_client = FakeStorageClient()
+    collection_service = CollectionService(migrated_db_session, storage_client=storage_client)
+    owner = await create_full_user_via_upgrade(user_service, email="cleanup-owner@example.com")
+    primary_collection = await collection_service.create_custom_collection(owner_user_id=owner.id, title="Primary")
+    shared_collection = await collection_service.create_custom_collection(owner_user_id=owner.id, title="Shared ref")
+    private_meme = await _create_meme(
+        migrated_db_session,
+        is_public=False,
+        author_user_id=owner.id,
+        s3_original_key="pipeline/originals/private/cleanup-original.png",
+        s3_web_video_key="pipeline/derived/private/cleanup-web.mp4",
+        mime_type="image/png",
+    )
+    public_meme = await _create_meme(
+        migrated_db_session,
+        is_public=True,
+        s3_original_key="pipeline/originals/public/keep-original.png",
+        s3_web_video_key="pipeline/derived/public/keep-web.mp4",
+    )
+    await migrated_db_session.commit()
+
+    _ = await collection_service.save_meme_to_collection(
+        collection_id=primary_collection.id,
+        user_id=owner.id,
+        meme_id=private_meme.id,
+    )
+    _ = await collection_service.save_meme_to_collection(
+        collection_id=shared_collection.id,
+        user_id=owner.id,
+        meme_id=private_meme.id,
+    )
+    _ = await collection_service.save_meme_to_collection(
+        collection_id=primary_collection.id,
+        user_id=owner.id,
+        meme_id=public_meme.id,
+    )
+
+    assert await collection_service.remove_meme_from_collection(
+        collection_id=primary_collection.id,
+        user_id=owner.id,
+        meme_id=public_meme.id,
+    ) is True
+    assert await migrated_db_session.get(Meme, public_meme.id) is not None
+    assert storage_client.delete_calls == []
+
+    assert await collection_service.remove_meme_from_collection(
+        collection_id=primary_collection.id,
+        user_id=owner.id,
+        meme_id=private_meme.id,
+    ) is True
+    assert await migrated_db_session.get(Meme, private_meme.id) is not None
+    assert storage_client.delete_calls == []
+
+    assert await collection_service.remove_meme_from_collection(
+        collection_id=shared_collection.id,
+        user_id=owner.id,
+        meme_id=private_meme.id,
+    ) is True
+    assert await migrated_db_session.get(Meme, private_meme.id) is None
+    assert await migrated_db_session.scalar(
+        select(func.count()).select_from(MemeFile).where(MemeFile.meme_id == private_meme.id)
+    ) == 0
+    assert {call["Key"] for call in storage_client.delete_calls} == {
+        "pipeline/originals/private/cleanup-original.png",
+        "pipeline/derived/private/cleanup-web.mp4",
+    }
+    delete_call_count = len(storage_client.delete_calls)
+
+    assert await collection_service.remove_meme_from_collection(
+        collection_id=shared_collection.id,
+        user_id=owner.id,
+        meme_id=private_meme.id,
+    ) is False
+    assert len(storage_client.delete_calls) == delete_call_count
+
+
+async def test_private_cleanup_runs_for_active_collection_and_unfavorite_paths(
+    migrated_db_session: AsyncSession,
+) -> None:
+    user_service = UserService(migrated_db_session)
+    storage_client = FakeStorageClient()
+    storage_client.fail_deletes = True
+    collection_service = CollectionService(migrated_db_session, storage_client=storage_client)
+    owner = await create_full_user_via_upgrade(user_service, email="cleanup-active-owner@example.com")
+    _ = await collection_service.ensure_favorites_collection(owner.id)
+    custom = await collection_service.create_custom_collection(owner_user_id=owner.id, title="Active cleanup")
+    _ = await collection_service.update_active_save_collection(user_id=owner.id, collection_id=custom.id)
+    active_meme = await _create_meme(
+        migrated_db_session,
+        is_public=False,
+        author_user_id=owner.id,
+        s3_original_key="pipeline/originals/private/active-cleanup.png",
+        s3_web_video_key="pipeline/derived/private/active-cleanup.mp4",
+    )
+    favorite_meme = await _create_meme(
+        migrated_db_session,
+        is_public=False,
+        author_user_id=owner.id,
+        s3_original_key="pipeline/originals/private/favorite-cleanup.png",
+    )
+    active_meme_id = active_meme.id
+    favorite_meme_id = favorite_meme.id
+    await migrated_db_session.commit()
+
+    _ = await collection_service.save_meme_to_active_collection(user_id=owner.id, meme_id=active_meme_id)
+    _ = await collection_service.favorite_meme(user_id=owner.id, meme_id=favorite_meme_id)
+
+    assert await collection_service.remove_meme_from_active_collection(user_id=owner.id, meme_id=active_meme_id) is True
+    assert await collection_service.unfavorite_meme(user_id=owner.id, meme_id=favorite_meme_id) is True
+
+    assert await migrated_db_session.get(Meme, active_meme_id) is None
+    assert await migrated_db_session.get(Meme, favorite_meme_id) is None
+    assert {call["Key"] for call in storage_client.delete_calls} == {
+        "pipeline/originals/private/active-cleanup.png",
+        "pipeline/derived/private/active-cleanup.mp4",
+        "pipeline/originals/private/favorite-cleanup.png",
+    }
+
+
+async def test_custom_collection_delete_cleans_orphans_and_pinned_private_memes(
+    migrated_db_session: AsyncSession,
+) -> None:
+    user_service = UserService(migrated_db_session)
+    storage_client = FakeStorageClient()
+    collection_service = CollectionService(migrated_db_session, storage_client=storage_client)
+    owner = await create_full_user_via_upgrade(user_service, email="cleanup-delete-owner@example.com")
+    custom = await collection_service.create_custom_collection(owner_user_id=owner.id, title="Delete cleanup")
+    orphan_meme = await _create_meme(
+        migrated_db_session,
+        is_public=False,
+        author_user_id=owner.id,
+        s3_original_key="pipeline/originals/private/delete-orphan.png",
+        s3_web_video_key="pipeline/derived/private/delete-orphan.mp4",
+    )
+    pinned_meme = await _create_meme(
+        migrated_db_session,
+        is_public=False,
+        author_user_id=owner.id,
+        s3_original_key="pipeline/originals/private/delete-pinned.png",
+        s3_web_video_key="pipeline/derived/private/delete-pinned.mp4",
+    )
+    orphan_meme_id = orphan_meme.id
+    pinned_meme_id = pinned_meme.id
+    await migrated_db_session.commit()
+
+    _ = await collection_service.save_meme_to_collection(
+        collection_id=custom.id,
+        user_id=owner.id,
+        meme_id=orphan_meme_id,
+    )
+    _ = await collection_service.save_meme_to_collection(
+        collection_id=custom.id,
+        user_id=owner.id,
+        meme_id=pinned_meme_id,
+    )
+    _ = await collection_service.pin_meme(user_id=owner.id, meme_id=pinned_meme_id)
+
+    assert await collection_service.delete_custom_collection(collection_id=custom.id, user_id=owner.id) is True
+
+    assert await migrated_db_session.get(Meme, orphan_meme_id) is None
+    assert await migrated_db_session.get(Meme, pinned_meme_id) is None
+    assert await migrated_db_session.get(PinnedMeme, (owner.id, pinned_meme_id)) is None
+    assert {call["Key"] for call in storage_client.delete_calls} == {
+        "pipeline/originals/private/delete-orphan.png",
+        "pipeline/derived/private/delete-orphan.mp4",
+        "pipeline/originals/private/delete-pinned.png",
+        "pipeline/derived/private/delete-pinned.mp4",
+    }
 
 
 async def test_pins_require_full_account_enforce_limit_and_reorder(

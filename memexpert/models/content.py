@@ -261,7 +261,6 @@ class MemeFile(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "meme_files"
     __table_args__ = (
         UniqueConstraint("meme_id", "id", name="uq_meme_files_meme_id_id"),
-        UniqueConstraint("sha256_hex", name="uq_meme_files_sha256_hex"),
         CheckConstraint(
             "sha256_hex IS NULL OR sha256_hex = lower(sha256_hex)",
             name="meme_files_sha256_hex_lowercase",
@@ -274,6 +273,7 @@ class MemeFile(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         Index("ix_meme_files_ingest_origin", "ingest_origin"),
         Index("ix_meme_files_matched_meme_file_id", "matched_meme_file_id"),
         Index("ix_meme_files_perceptual_hash", "perceptual_hash"),
+        Index("ix_meme_files_sha256_hex", "sha256_hex"),
     )
 
     meme_id: Mapped[uuid.UUID] = mapped_column(

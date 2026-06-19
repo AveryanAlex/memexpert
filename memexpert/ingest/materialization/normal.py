@@ -5,7 +5,11 @@ from __future__ import annotations
 import uuid
 from typing import TYPE_CHECKING
 
-from memexpert.ingest.materialization.duplicates import create_phash_duplicate_rows, find_exact_phash_match
+from memexpert.ingest.materialization.duplicates import (
+    attach_target_collection_if_requested,
+    create_phash_duplicate_rows,
+    find_exact_phash_match,
+)
 from memexpert.ingest.materialization.new_content import create_new_content_rows
 from memexpert.ingest.materialization.objects import meme_file_id_from_original_key
 from memexpert.ingest.materialization.outbox import create_transcode_outbox_event
@@ -31,7 +35,11 @@ async def materialize_transcodable_request(
 ) -> PipelineOutboxEvent:
     """Materialize new or exact-pHash-duplicate content and enqueue transcode work."""
 
-    phash_match = await find_exact_phash_match(session, prepared.perceptual_hash)
+    phash_match = await find_exact_phash_match(
+        session,
+        prepared.perceptual_hash,
+        owner_user_id=ingest_request.owner_user_id,
+    )
     meme_file_id = meme_file_id_from_original_key(prepared.object_key)
     event_id = uuid.uuid7()
     if phash_match is None:
@@ -61,6 +69,7 @@ async def materialize_transcodable_request(
         source_attach_reason = SourceAttachReason.PHASH_EXACT_NEW_FILE
         matched_meme_file_id = phash_match.id
 
+    await attach_target_collection_if_requested(session, ingest_request=ingest_request, meme_id=meme_id)
     outbox_event = await create_transcode_outbox_event(
         session,
         meme_file_id=meme_file_id,

@@ -25,10 +25,23 @@ from memexpert.core.storage import (
     get_s3_client,
     upload_object_bytes,
 )
+from memexpert.ingest.collection_targets import (
+    save_meme_to_target_collection,
+    validate_target_collection_write,
+    visible_meme_clause,
+)
 from memexpert.ingest.schemas import IngestAcceptOutcome, IngestAcceptResult, IngestAcceptSource, IngestRequestRead
 from memexpert.ingest.source_metadata import source_forward_ids, source_published_at, source_reactions
-from memexpert.models.content import MemeFile, MemeSource, PipelineIngestRequest
-from memexpert.models.enums import ContentProcessingStatus, PipelineIngestRequestStatus, SourceAttachReason
+from memexpert.ingest.target_collection_metadata import (
+    TargetCollectionMetadataError,
+    parse_target_collection_id,
+)
+from memexpert.models.content import Meme, MemeFile, MemeSource, PipelineIngestRequest
+from memexpert.models.enums import (
+    ContentProcessingStatus,
+    PipelineIngestRequestStatus,
+    SourceAttachReason,
+)
 from memexpert.pipeline.outbox import build_media_inspect_outbox_event
 from memexpert.schemas.pipeline_base import MAX_TELEGRAM_CONTENT_TYPE_LENGTH, MAX_TELEGRAM_FILENAME_LENGTH
 from memexpert.services.errors import (
@@ -112,8 +125,14 @@ class PipelineIngestAcceptService:
         user_metadata = self._normalize_metadata(source.user_metadata, field_name="user_metadata")
         source_metadata = self._normalize_metadata(source.source_metadata, field_name="source_metadata")
         source_metadata["views"] = source.views
+        target_collection_id = self._parse_target_collection_id(user_metadata)
+        await validate_target_collection_write(
+            self._session,
+            owner_user_id=source.owner_user_id,
+            target_collection_id=target_collection_id,
+        )
 
-        matched_file = await self._find_sha256_match(sha256_hex)
+        matched_file = await self._find_sha256_match(sha256_hex, owner_user_id=source.owner_user_id)
         if matched_file is not None:
             return await self._accept_sha_duplicate(
                 source=source,
@@ -124,6 +143,7 @@ class PipelineIngestAcceptService:
                 matched_file=matched_file,
                 user_metadata=user_metadata,
                 source_metadata=source_metadata,
+                target_collection_id=target_collection_id,
             )
 
         return await self._accept_new_bytes(
@@ -148,6 +168,7 @@ class PipelineIngestAcceptService:
         matched_file: MemeFile,
         user_metadata: dict[str, object],
         source_metadata: dict[str, object],
+        target_collection_id: uuid.UUID | None,
     ) -> IngestAcceptResult:
         attach_reason = self._sha_match_attach_reason(matched_file)
         ingest_request = PipelineIngestRequest(
@@ -188,6 +209,13 @@ class PipelineIngestAcceptService:
 
         try:
             self._session.add_all([ingest_request, source_row])
+            if attach_reason is SourceAttachReason.SHA256_EXACT_EXISTING_FILE:
+                await save_meme_to_target_collection(
+                    self._session,
+                    owner_user_id=source.owner_user_id,
+                    target_collection_id=target_collection_id,
+                    meme_id=matched_file.meme_id,
+                )
             await self._session.commit()
         except IntegrityError as exc:
             await self._session.rollback()
@@ -286,14 +314,23 @@ class PipelineIngestAcceptService:
             return None
         return self._result(existing_request, IngestAcceptOutcome.SOURCE_REPLAY)
 
-    async def _find_sha256_match(self, sha256_hex: str) -> MemeFile | None:
+    async def _find_sha256_match(self, sha256_hex: str, *, owner_user_id: uuid.UUID | None) -> MemeFile | None:
         result = await self._session.execute(
             select(MemeFile)
+            .join(Meme, Meme.id == MemeFile.meme_id)
             .where(MemeFile.sha256_hex == sha256_hex)
-            .order_by(MemeFile.created_at.asc(), MemeFile.id.asc())
+            .where(visible_meme_clause(owner_user_id))
+            .order_by(Meme.is_public.desc(), MemeFile.created_at.asc(), MemeFile.id.asc())
             .limit(1)
         )
         return result.scalar_one_or_none()
+
+    @staticmethod
+    def _parse_target_collection_id(user_metadata: dict[str, object]) -> uuid.UUID | None:
+        try:
+            return parse_target_collection_id(user_metadata)
+        except TargetCollectionMetadataError as exc:
+            raise PipelinePayloadValidationError(str(exc)) from exc
 
     async def _put_temp_object(self, *, key: str, body: bytes, content_type: str) -> None:
         try:

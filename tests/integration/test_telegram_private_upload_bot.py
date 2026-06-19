@@ -17,6 +17,7 @@ from memexpert.bot.main import build_bot, build_dispatcher
 from memexpert.bot.private_upload import TelegramDownloadError
 from memexpert.core.config import Settings
 from memexpert.ingest.schemas import IngestAcceptOutcome, IngestAcceptResult, IngestAcceptSource, IngestRequestRead
+from memexpert.ingest.target_collection_metadata import TARGET_COLLECTION_ID_METADATA_KEY
 from memexpert.models.base import utcnow
 from memexpert.models.collection import CollectionMeme
 from memexpert.models.content import Meme, MemeFile
@@ -357,7 +358,7 @@ def last_bot_text(session: RecordingTelegramSession) -> str:
 
 
 @pytest.mark.asyncio
-async def test_private_photo_upload_queues_raw_ingest_without_saving_active_collection(
+async def test_private_photo_upload_queues_raw_ingest_with_active_collection_metadata(
     migrated_db_session: AsyncSession,
     postgres_session_factory: async_sessionmaker[AsyncSession],
     postgres_async_url: str,
@@ -388,6 +389,11 @@ async def test_private_photo_upload_queues_raw_ingest_without_saving_active_coll
     source = accept_service.calls[0]["source"]
     assert isinstance(source, IngestAcceptSource)
     assert source.owner_user_id == user.id
+    active_collection_id = await migrated_db_session.scalar(
+        select(User.active_save_collection_id).where(User.id == user.id)
+    )
+    assert active_collection_id is not None
+    assert source.user_metadata[TARGET_COLLECTION_ID_METADATA_KEY] == str(active_collection_id)
     assert source.source_platform is SourcePlatform.TELEGRAM
     assert source.source_id == f"telegram_pm:{TELEGRAM_ID}:{TELEGRAM_ID}"
     assert source.post_id == "message:701:file:photo-unique-1"
@@ -401,14 +407,16 @@ async def test_private_photo_upload_queues_raw_ingest_without_saving_active_coll
         event = await session.scalar(
             select(AnalyticsEvent).where(AnalyticsEvent.event_type == AnalyticsEventType.COLLECTION_ACTION)
         )
-        active_collection_id = await session.scalar(select(User.active_save_collection_id).where(User.id == user.id))
+        persisted_active_collection_id = await session.scalar(
+            select(User.active_save_collection_id).where(User.id == user.id)
+        )
     assert event is not None
     assert event.user_id == user.id
     assert event.payload["surface"] == "telegram_pm_upload"
-    assert active_collection_id is not None
     refs = _analytics_refs(event)
     properties = _analytics_properties(event)
-    assert refs["collection_id"] == str(active_collection_id)
+    assert persisted_active_collection_id is not None
+    assert refs["collection_id"] == str(persisted_active_collection_id)
     assert properties["action"] == "upload_queued"
     assert properties["media_kind"] == "image"
     assert properties["content_type"] == "image/jpeg"

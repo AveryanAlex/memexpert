@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, Protocol, cast
 
 from sqlalchemy import and_, case, delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
+from memexpert.core.config import Settings, get_settings
+from memexpert.core.storage import delete_object_if_present, get_pipeline_storage_settings, get_s3_client
 from memexpert.models.collection import Collection, CollectionInvite, CollectionMember, CollectionMeme, PinnedMeme
-from memexpert.models.content import Meme
+from memexpert.models.content import Meme, MemeFile
 from memexpert.models.enums import (
     AccountType,
     CollectionInviteChannel,
@@ -58,6 +60,12 @@ if TYPE_CHECKING:
 
     from memexpert.schemas.meme import PublicMemeCardRead
 
+
+class CollectionStorageClient(Protocol):
+    """Minimal S3-compatible client surface used by collection orphan cleanup."""
+
+    def delete_object(self, *, Bucket: str, Key: str) -> object: ...
+
 MAX_COLLECTION_TITLE_LENGTH: Final = 120
 MAX_COLLECTION_LABEL_LENGTH: Final = 120
 MAX_INVITE_TOKEN_HASH_LENGTH: Final = 64
@@ -69,9 +77,18 @@ WRITE_ROLES: Final = frozenset({CollectionMembershipRole.OWNER, CollectionMember
 class CollectionService:
     """Service-layer helpers for custom collections, memberships, invites, and active-save state."""
 
-    def __init__(self, session: AsyncSession, *, media_render_service: MediaRenderUrlService | None = None) -> None:
+    def __init__(
+        self,
+        session: AsyncSession,
+        *,
+        media_render_service: MediaRenderUrlService | None = None,
+        settings: Settings | None = None,
+        storage_client: CollectionStorageClient | None = None,
+    ) -> None:
         self._session: AsyncSession = session
         self._media_render_service = media_render_service or MediaRenderUrlService()
+        self._settings = settings
+        self._storage_client = storage_client
 
     async def get_collection(self, collection_id: object) -> CollectionRead | None:
         """Return a collection with memberships and invites if it exists."""
@@ -281,6 +298,7 @@ class CollectionService:
 
         user, collection = await self._get_collection_for_read(collection_id=collection_id, user_id=user_id)
         self._ensure_owner_can_manage_custom_collection(user, collection)
+        object_keys_to_delete = await self._delete_private_memes_orphaned_by_collection_delete(collection.id)
         await self._session.execute(
             update(User).where(User.active_save_collection_id == collection.id).values(active_save_collection_id=None)
         )
@@ -291,6 +309,7 @@ class CollectionService:
         except IntegrityError as exc:
             await self._session.rollback()
             raise CollectionServiceError("Failed to delete the collection.") from exc
+        await self._delete_storage_objects_after_commit(object_keys_to_delete)
         return True
 
     async def save_meme_to_collection(
@@ -333,12 +352,14 @@ class CollectionService:
             return False
         if collection.kind is CollectionKind.FAVORITES:
             await self._decrement_like_count(meme_id)
+        object_keys_to_delete = await self._delete_orphan_private_meme_if_unreferenced(meme_id)
 
         try:
             await self._session.commit()
         except IntegrityError as exc:
             await self._session.rollback()
             raise CollectionServiceError("Failed to remove the meme from the collection.") from exc
+        await self._delete_storage_objects_after_commit(object_keys_to_delete)
         return True
 
     async def favorite_meme(self, *, user_id: object, meme_id: object) -> CollectionMemeRead:
@@ -377,12 +398,14 @@ class CollectionService:
             return False
 
         await self._decrement_like_count(meme_id)
+        object_keys_to_delete = await self._delete_orphan_private_meme_if_unreferenced(meme_id)
 
         try:
             await self._session.commit()
         except IntegrityError as exc:
             await self._session.rollback()
             raise CollectionServiceError("Failed to unfavorite the meme.") from exc
+        await self._delete_storage_objects_after_commit(object_keys_to_delete)
         return True
 
     async def list_favorite_memes(self, *, user_id: object) -> list[CollectionMemeRead]:
@@ -479,11 +502,13 @@ class CollectionService:
 
         if collection.kind is CollectionKind.FAVORITES:
             await self._decrement_like_count(meme_id)
+        object_keys_to_delete = await self._delete_orphan_private_meme_if_unreferenced(meme_id)
         try:
             await self._session.commit()
         except IntegrityError as exc:
             await self._session.rollback()
             raise CollectionServiceError("Failed to remove the meme from the active collection.") from exc
+        await self._delete_storage_objects_after_commit(object_keys_to_delete)
         return True
 
     async def list_pinned_memes(self, *, user_id: object) -> list[PinnedMemeRead]:
@@ -1069,6 +1094,61 @@ class CollectionService:
         )
         return result.scalar_one_or_none() is not None
 
+    async def _delete_orphan_private_meme_if_unreferenced(self, meme_id: object) -> tuple[str, ...]:
+        meme = await self._session.scalar(
+            select(Meme).options(selectinload(Meme.files)).where(Meme.id == meme_id)
+        )
+        if meme is None or meme.is_public:
+            return ()
+        if await self._meme_has_collection_references(meme.id):
+            return ()
+
+        object_keys = _object_keys_for_meme_files(meme.files)
+        await self._session.execute(delete(Meme).where(Meme.id == meme.id))
+        return object_keys
+
+    async def _delete_private_memes_orphaned_by_collection_delete(self, collection_id: object) -> tuple[str, ...]:
+        result = await self._session.execute(
+            select(Meme)
+            .options(selectinload(Meme.files))
+            .join(CollectionMeme, CollectionMeme.meme_id == Meme.id)
+            .where(CollectionMeme.collection_id == collection_id, Meme.is_public.is_(False))
+        )
+        memes = list(result.scalars().unique())
+        object_keys: list[str] = []
+        for meme in memes:
+            if await self._meme_has_other_collection_references(meme.id, collection_id=collection_id):
+                continue
+            object_keys.extend(_object_keys_for_meme_files(meme.files))
+            await self._session.execute(delete(Meme).where(Meme.id == meme.id))
+        return tuple(dict.fromkeys(object_keys))
+
+    async def _meme_has_collection_references(self, meme_id: object) -> bool:
+        count = await self._session.scalar(
+            select(func.count()).select_from(CollectionMeme).where(CollectionMeme.meme_id == meme_id)
+        )
+        return bool(count)
+
+    async def _meme_has_other_collection_references(self, meme_id: object, *, collection_id: object) -> bool:
+        count = await self._session.scalar(
+            select(func.count())
+            .select_from(CollectionMeme)
+            .where(CollectionMeme.meme_id == meme_id, CollectionMeme.collection_id != collection_id)
+        )
+        return bool(count)
+
+    async def _delete_storage_objects_after_commit(self, object_keys: tuple[str, ...]) -> None:
+        if not object_keys:
+            return
+        try:
+            settings = self._settings or get_settings()
+            storage_settings = get_pipeline_storage_settings(settings)
+            storage_client = self._storage_client or cast("CollectionStorageClient", get_s3_client())
+            for object_key in object_keys:
+                await delete_object_if_present(storage_client, bucket=storage_settings.bucket, key=object_key)
+        except Exception:
+            return
+
     async def _get_meme_model(self, meme_id: object) -> Meme | None:
         result = await self._session.execute(select(Meme).where(Meme.id == meme_id))
         return result.scalar_one_or_none()
@@ -1175,6 +1255,15 @@ def _normalize_collection_title(title: str) -> str:
             f"Collection title must be at most {MAX_COLLECTION_TITLE_LENGTH} characters long.",
         )
     return normalized_title
+
+
+def _object_keys_for_meme_files(files: list[MemeFile]) -> tuple[str, ...]:
+    object_keys: list[str] = []
+    for file in files:
+        object_keys.append(file.s3_original_key)
+        if file.s3_web_video_key is not None:
+            object_keys.append(file.s3_web_video_key)
+    return tuple(dict.fromkeys(object_keys))
 
 
 def _normalize_optional_text(value: str | None) -> str | None:

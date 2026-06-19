@@ -13,6 +13,8 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from memexpert.ingest.accept_service import PipelineIngestAcceptService
 from memexpert.ingest.schemas import IngestAcceptOutcome, IngestAcceptSource
+from memexpert.ingest.target_collection_metadata import user_metadata_with_target_collection
+from memexpert.models.collection import Collection, CollectionMember, CollectionMeme
 from memexpert.models.content import (
     BlockedPerceptualHash,
     Meme,
@@ -22,6 +24,7 @@ from memexpert.models.content import (
     PipelineOutboxEvent,
 )
 from memexpert.models.enums import (
+    CollectionMembershipRole,
     ContentKind,
     ContentLanguage,
     ContentProcessingStatus,
@@ -31,6 +34,7 @@ from memexpert.models.enums import (
     SourceAttachReason,
     SourcePlatform,
 )
+from memexpert.models.user import User
 from memexpert.services import PipelineIngestError
 
 if TYPE_CHECKING:
@@ -85,6 +89,8 @@ async def _seed_meme_file(
     *,
     sha256_hex: str,
     blocked_perceptual_hash_id: uuid.UUID | None = None,
+    is_public: bool = True,
+    author_user_id: uuid.UUID | None = None,
 ) -> tuple[Meme, MemeFile]:
     meme_id = uuid.uuid7()
     meme_file_id = uuid.uuid7()
@@ -93,7 +99,8 @@ async def _seed_meme_file(
         media_type=ContentKind.IMAGE,
         primary_file_id=meme_file_id,
         language=ContentLanguage.NONE,
-        is_public=False,
+        is_public=is_public,
+        author_user_id=author_user_id,
     )
     meme_file = MemeFile(
         id=meme_file_id,
@@ -114,6 +121,21 @@ async def _seed_meme_file(
     session.add(meme_file)
     await session.flush()
     return meme, meme_file
+
+
+async def _seed_writable_collection(session: AsyncSession, *, owner: User) -> Collection:
+    collection = Collection(owner_id=owner.id, title="Uploads")
+    session.add(collection)
+    await session.flush()
+    session.add(
+        CollectionMember(
+            collection_id=collection.id,
+            user_id=owner.id,
+            role=CollectionMembershipRole.OWNER,
+        )
+    )
+    await session.flush()
+    return collection
 
 
 async def test_accept_new_upload_creates_raw_ingest_request_and_pending_outbox_only(
@@ -169,7 +191,7 @@ async def test_accept_sha_duplicate_resolves_synchronously_and_does_not_enqueue_
 ) -> None:
     media_bytes = b"same-sha-bytes"
     sha256_hex = hashlib.sha256(media_bytes).hexdigest()
-    _meme, meme_file = await _seed_meme_file(migrated_db_session, sha256_hex=sha256_hex)
+    _meme, meme_file = await _seed_meme_file(migrated_db_session, sha256_hex=sha256_hex, is_public=True)
     storage_client = FakeStorageClient()
     service = PipelineIngestAcceptService(migrated_db_session, storage_client=storage_client)
 
@@ -205,6 +227,171 @@ async def test_accept_sha_duplicate_resolves_synchronously_and_does_not_enqueue_
     assert sources[0].matched_meme_file_id == meme_file.id
 
 
+async def test_accept_sha_duplicate_public_match_saves_target_collection(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    owner = User(email="target-sha-owner@example.com")
+    migrated_db_session.add(owner)
+    await migrated_db_session.flush()
+    target_collection = await _seed_writable_collection(migrated_db_session, owner=owner)
+    media_bytes = b"same-public-target-sha-bytes"
+    sha256_hex = hashlib.sha256(media_bytes).hexdigest()
+    public_meme, meme_file = await _seed_meme_file(
+        migrated_db_session,
+        sha256_hex=sha256_hex,
+        is_public=True,
+    )
+    storage_client = FakeStorageClient()
+    service = PipelineIngestAcceptService(migrated_db_session, storage_client=storage_client)
+
+    result = await service.accept_bytes(
+        source=_source(source_id="sha-target-source", post_id="target-post").model_copy(
+            update={
+                "owner_user_id": owner.id,
+                "user_metadata": user_metadata_with_target_collection(
+                    target_collection_id=target_collection.id,
+                ),
+            }
+        ),
+        filename="duplicate.png",
+        content_type="image/png",
+        media_bytes=media_bytes,
+    )
+
+    assert result.outcome is IngestAcceptOutcome.RESOLVED_SHA_DUPLICATE
+    assert result.ingest_request.materialized_meme_id == public_meme.id
+    assert result.ingest_request.user_metadata["target_collection_id"] == str(target_collection.id)
+    assert storage_client.put_calls == []
+
+    async with postgres_session_factory() as session:
+        saved = await session.get(CollectionMeme, (target_collection.id, public_meme.id))
+        request = await session.get(PipelineIngestRequest, result.ingest_request.id)
+        source = await session.scalar(select(MemeSource).where(MemeSource.source_id == "sha-target-source"))
+
+    assert saved is not None
+    assert saved.added_by_user_id == owner.id
+    assert request is not None
+    assert request.owner_user_id == owner.id
+    assert request.user_metadata["target_collection_id"] == str(target_collection.id)
+    assert source is not None
+    assert source.file_id == meme_file.id
+
+
+async def test_accept_sha_duplicate_does_not_cross_user_dedupe_private_files(
+    migrated_db_session: AsyncSession,
+) -> None:
+    owner = User(email="sha-owner@example.com")
+    other_owner = User(email="sha-other@example.com")
+    migrated_db_session.add_all([owner, other_owner])
+    await migrated_db_session.flush()
+    target_collection = await _seed_writable_collection(migrated_db_session, owner=owner)
+    media_bytes = b"same-other-private-sha-bytes"
+    sha256_hex = hashlib.sha256(media_bytes).hexdigest()
+    other_meme, _other_file = await _seed_meme_file(
+        migrated_db_session,
+        sha256_hex=sha256_hex,
+        is_public=False,
+        author_user_id=other_owner.id,
+    )
+    shared_private_collection = await _seed_writable_collection(migrated_db_session, owner=other_owner)
+    migrated_db_session.add(
+        CollectionMember(
+            collection_id=shared_private_collection.id,
+            user_id=owner.id,
+            role=CollectionMembershipRole.VIEWER,
+        )
+    )
+    migrated_db_session.add(
+        CollectionMeme(
+            collection_id=shared_private_collection.id,
+            meme_id=other_meme.id,
+            added_by_user_id=other_owner.id,
+        )
+    )
+    await migrated_db_session.flush()
+    storage_client = FakeStorageClient()
+    service = PipelineIngestAcceptService(migrated_db_session, storage_client=storage_client)
+
+    result = await service.accept_bytes(
+        source=_source(source_id="private-sha-owner", post_id="private-sha-post").model_copy(
+            update={
+                "owner_user_id": owner.id,
+                "user_metadata": user_metadata_with_target_collection(
+                    target_collection_id=target_collection.id,
+                ),
+            }
+        ),
+        filename="private-duplicate.png",
+        content_type="image/png",
+        media_bytes=media_bytes,
+    )
+
+    assert result.outcome is IngestAcceptOutcome.ACCEPTED_ASYNC
+    assert result.ingest_request.status is PipelineIngestRequestStatus.MEDIA_INSPECT_PENDING
+    assert result.ingest_request.matched_meme_file_id is None
+    assert len(storage_client.put_calls) == 1
+    assert await migrated_db_session.scalar(
+        select(func.count()).select_from(CollectionMeme).where(CollectionMeme.collection_id == target_collection.id)
+    ) == 0
+
+
+async def test_accept_sha_duplicate_does_not_cross_user_dedupe_private_files_for_editor(
+    migrated_db_session: AsyncSession,
+) -> None:
+    owner = User(email="sha-editor@example.com")
+    other_owner = User(email="sha-editor-source-owner@example.com")
+    migrated_db_session.add_all([owner, other_owner])
+    await migrated_db_session.flush()
+    target_collection = await _seed_writable_collection(migrated_db_session, owner=owner)
+    media_bytes = b"same-editor-private-sha-bytes"
+    sha256_hex = hashlib.sha256(media_bytes).hexdigest()
+    other_meme, _other_file = await _seed_meme_file(
+        migrated_db_session,
+        sha256_hex=sha256_hex,
+        is_public=False,
+        author_user_id=other_owner.id,
+    )
+    shared_private_collection = await _seed_writable_collection(migrated_db_session, owner=other_owner)
+    migrated_db_session.add_all(
+        [
+            CollectionMember(
+                collection_id=shared_private_collection.id,
+                user_id=owner.id,
+                role=CollectionMembershipRole.EDITOR,
+            ),
+            CollectionMeme(
+                collection_id=shared_private_collection.id,
+                meme_id=other_meme.id,
+                added_by_user_id=other_owner.id,
+            ),
+        ]
+    )
+    await migrated_db_session.flush()
+    storage_client = FakeStorageClient()
+    service = PipelineIngestAcceptService(migrated_db_session, storage_client=storage_client)
+
+    result = await service.accept_bytes(
+        source=_source(source_id="private-sha-editor", post_id="private-sha-editor-post").model_copy(
+            update={
+                "owner_user_id": owner.id,
+                "user_metadata": user_metadata_with_target_collection(
+                    target_collection_id=target_collection.id,
+                ),
+            }
+        ),
+        filename="private-editor-duplicate.png",
+        content_type="image/png",
+        media_bytes=media_bytes,
+    )
+
+    assert result.outcome is IngestAcceptOutcome.ACCEPTED_ASYNC
+    assert result.ingest_request.status is PipelineIngestRequestStatus.MEDIA_INSPECT_PENDING
+    assert result.ingest_request.matched_meme_file_id is None
+    assert await migrated_db_session.get(CollectionMeme, (target_collection.id, other_meme.id)) is None
+    assert len(storage_client.put_calls) == 1
+
+
 async def test_accept_sha_duplicate_of_blocked_file_preserves_blocked_source_reason(
     migrated_db_session: AsyncSession,
     postgres_session_factory: async_sessionmaker[AsyncSession],
@@ -220,11 +407,15 @@ async def test_accept_sha_duplicate_of_blocked_file_preserves_blocked_source_rea
         is_active=True,
     )
     migrated_db_session.add(blocked_hash)
+    blocked_owner = User(email="blocked-sha-owner@example.com")
+    migrated_db_session.add(blocked_owner)
     await migrated_db_session.flush()
     _meme, meme_file = await _seed_meme_file(
         migrated_db_session,
         sha256_hex=sha256_hex,
         blocked_perceptual_hash_id=blocked_hash.id,
+        is_public=True,
+        author_user_id=blocked_owner.id,
     )
     storage_client = FakeStorageClient()
     service = PipelineIngestAcceptService(migrated_db_session, storage_client=storage_client)
