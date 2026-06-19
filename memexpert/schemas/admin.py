@@ -72,8 +72,11 @@ class AdminSourceChannelRead(ORMSchema):
     is_active: bool
     is_paused: bool
     catchup_enabled: bool
+    live_enabled: bool
+    engagement_enabled: bool
     catchup_message_limit: int
-    session_id: str | None
+    telegram_session_id: uuid.UUID | None
+    telegram_session_name: str | None
     last_read_post_id: str | None
     last_fetched_at: datetime | None
     operational_status: Literal["active", "inactive", "paused"]
@@ -93,8 +96,10 @@ class AdminSourceChannelCreateRequest(BaseModel):
     username: str | None = Field(default=None, max_length=MAX_SOURCE_USERNAME_LENGTH)
     title: str = Field(min_length=1, max_length=MAX_SOURCE_TITLE_LENGTH)
     subscriber_count: int | None = Field(default=None, ge=0)
-    session_id: str | None = Field(default=None, max_length=255)
+    telegram_session_name: str | None = Field(default=None, max_length=255)
     catchup_enabled: StrictBool = True
+    live_enabled: StrictBool = True
+    engagement_enabled: StrictBool = True
     catchup_message_limit: StrictInt = Field(default=500, ge=1, le=10000)
 
     @field_validator("platform_id", "title")
@@ -102,7 +107,7 @@ class AdminSourceChannelCreateRequest(BaseModel):
     def _normalize_required_text(cls, value: str) -> str:
         return normalize_required_text(value)
 
-    @field_validator("username", "session_id")
+    @field_validator("username", "telegram_session_name")
     @classmethod
     def _normalize_optional_text(cls, value: str | None) -> str | None:
         return normalize_optional_text(value)

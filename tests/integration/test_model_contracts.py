@@ -39,7 +39,7 @@ from memexpert.models.content import (
     RabbitMQOutboxMessage,
     SourceChannel,
     TelegramFileIdCache,
-    TelegramSessionState,
+    TelegramSession,
 )
 from memexpert.models.enums import (
     AccountDeletionAction,
@@ -128,7 +128,7 @@ EXPECTED_TABLES = {
     "source_channels",
     "telegram_file_id_cache",
     "telegram_link_codes",
-    "telegram_session_states",
+    "telegram_sessions",
     "users",
 }
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -251,6 +251,8 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
     meme_file_relationships = sa_inspect(MemeFile).relationships
     meme_source_relationships = sa_inspect(MemeSource).relationships
     meme_source_columns = sa_inspect(MemeSource).columns
+    source_channel_relationships = sa_inspect(SourceChannel).relationships
+    telegram_session_relationships = sa_inspect(TelegramSession).relationships
     pipeline_ingest_request_relationships = sa_inspect(PipelineIngestRequest).relationships
 
     assert user_relationships["active_save_collection"].mapper.class_ is Collection
@@ -279,6 +281,10 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
     assert meme_file_relationships["sync_target_snapshots"].mapper.class_ is MemeFileSyncTargetSnapshot
     assert meme_file_relationships["blocked_perceptual_hash"].mapper.class_ is BlockedPerceptualHash
     assert meme_source_relationships["engagement_snapshots"].mapper.class_ is MemeSourceEngagementSnapshot
+    assert source_channel_relationships["telegram_session"].mapper.class_ is TelegramSession
+    assert telegram_session_relationships["source_channels"].mapper.class_ is SourceChannel
+    assert metadata.tables["source_channels"].c["telegram_session_id"].foreign_keys
+    assert "session_id" not in metadata.tables["source_channels"].c
     assert "views" not in meme_source_columns
     assert "reactions" not in meme_source_columns
     assert sa_inspect(BlockedPerceptualHashAuditLog).columns["blocked_perceptual_hash_id"] is not None
@@ -699,7 +705,6 @@ async def test_schema_handles_cycles_multi_invites_and_nullable_content_fields(
                     subscriber_count=1500,
                     is_active=True,
                     last_read_post_id="12345",
-                    session_id="crawler-1",
                 ),
             ]
         )
@@ -1392,18 +1397,20 @@ async def test_sync_target_snapshot_orm_persists_and_enforces_uniqueness(
 
 
 def test_telegram_session_status_values_are_locked_and_stable() -> None:
-    # Enum values are wire-visible: the durable session-state row stores them
+    # Enum values are wire-visible: the durable session registry row stores them
     # verbatim and the operator surface serializes them into the admin API
     # response payload. Locking the tuple order here protects T02/T03/T04
     # against accidental reordering or renames.
     assert tuple(TelegramSessionStatus) == (
         TelegramSessionStatus.ACTIVE,
+        TelegramSessionStatus.AUTH_REQUIRED,
         TelegramSessionStatus.FLOOD_WAIT,
         TelegramSessionStatus.QUARANTINED,
         TelegramSessionStatus.STOPPED,
     )
     assert [member.value for member in TelegramSessionStatus] == [
         "active",
+        "auth_required",
         "flood_wait",
         "quarantined",
         "stopped",
@@ -1537,8 +1544,12 @@ def test_source_engagement_snapshot_model_contract() -> None:
 
 def test_source_channel_exposes_crawler_checkpoint_columns() -> None:
     columns = SourceChannel.__table__.c
+    assert "telegram_session_id" in columns
+    assert "session_id" not in columns
     assert "catchup_message_limit" in columns
     assert "catchup_enabled" in columns
+    assert "live_enabled" in columns
+    assert "engagement_enabled" in columns
     assert "is_paused" in columns
     assert "last_fetched_at" in columns
     # Defaults live on the column descriptors because SQLAlchemy resolves
@@ -1546,7 +1557,14 @@ def test_source_channel_exposes_crawler_checkpoint_columns() -> None:
     # column keeps this a pure unit test that does not need a session.
     assert columns["catchup_message_limit"].default.arg == 500
     assert columns["catchup_enabled"].default.arg is True
+    assert columns["live_enabled"].default.arg is True
+    assert columns["engagement_enabled"].default.arg is True
     assert columns["is_paused"].default.arg is False
+
+    index_names = {index.name for index in SourceChannel.__table__.indexes}
+    assert "ix_source_channels_telegram_session_id" in index_names
+    assert "ix_source_channels_session_live" in index_names
+    assert "ix_source_channels_session_engagement" in index_names
 
 
 def test_meme_source_unique_platform_source_post_still_holds() -> None:
@@ -1565,35 +1583,64 @@ def test_meme_source_unique_platform_source_post_still_holds() -> None:
     }
 
 
-async def test_telegram_session_state_orm_persists_and_enforces_uniqueness(
+async def test_telegram_session_orm_persists_projects_safely_and_enforces_uniqueness(
     model_contract_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
+    from memexpert.schemas.content_pipeline import TelegramSessionRead
+
     async with model_contract_session_factory() as session:
-        row = TelegramSessionState(
-            session_name="primary",
+        row = TelegramSession(
+            name="primary",
+            display_name="Primary Session",
+            encrypted_string_session="encrypted-secret-material",
+            account_user_id=123456789,
+            account_username="meme_admin",
+            account_phone_hint="***1234",
             status=TelegramSessionStatus.ACTIVE,
+            enabled=True,
             last_heartbeat_at=utcnow(),
         )
+        channel = SourceChannel(
+            platform=SourcePlatform.TELEGRAM,
+            platform_id="session-owned-channel",
+            title="Session Owned Channel",
+            telegram_session=row,
+        )
         session.add(row)
+        session.add(channel)
         await session.commit()
 
         persisted = await session.scalar(
-            select(TelegramSessionState).where(
-                TelegramSessionState.session_name == "primary",
+            select(TelegramSession).where(
+                TelegramSession.name == "primary",
             )
         )
         assert persisted is not None
         assert persisted.status is TelegramSessionStatus.ACTIVE
+        assert persisted.account_user_id == 123456789
+        projection = TelegramSessionRead.model_validate(persisted)
+        assert projection.name == "primary"
+        assert projection.account_username == "meme_admin"
+        assert "encrypted_string_session" not in projection.model_dump(mode="python")
+
+        await session.delete(persisted)
+        await session.commit()
+        await session.refresh(channel)
+        orphaned_channel = await session.get(SourceChannel, channel.id)
+        assert orphaned_channel is not None
+        assert orphaned_channel.telegram_session_id is None
 
     async with model_contract_session_factory() as session:
         session.add_all(
             [
-                TelegramSessionState(
-                    session_name="duplicate",
+                TelegramSession(
+                    name="duplicate",
+                    display_name="Duplicate One",
                     status=TelegramSessionStatus.STOPPED,
                 ),
-                TelegramSessionState(
-                    session_name="duplicate",
+                TelegramSession(
+                    name="duplicate",
+                    display_name="Duplicate Two",
                     status=TelegramSessionStatus.ACTIVE,
                 ),
             ]

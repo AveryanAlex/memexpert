@@ -290,12 +290,11 @@ class CrawlerPublishError(PipelineIngestError):
 class CrawlerSessionNotRunnableError(PipelineIngestError):
     """Raised when the crawler runtime is asked to work a non-runnable session.
 
-    A session is "runnable" only when its durable ``TelegramSessionState``
-    row is in the ``active`` status. Stopped, flood-waiting, and
-    quarantined sessions must not accept catch-up or live-listener work —
-    the operator surface is responsible for re-arming the session after a
-    cooldown or ban clears. Raising this error (instead of silently
-    skipping) makes mis-routed catch-up calls a loud configuration bug.
+    A session is "runnable" only when its durable ``TelegramSession`` row is
+    enabled and in the ``active`` status. Stopped, auth-required,
+    flood-waiting, and quarantined sessions must not accept catch-up or
+    live-listener work. Raising this error (instead of silently skipping)
+    makes mis-routed catch-up calls a loud configuration bug.
     """
 
     error_code: ClassVar[str] = "crawler_session_not_runnable"
@@ -323,7 +322,7 @@ class CrawlerInvalidSessionError(PipelineIngestError):
     fires when a session is known but is in a flood-wait, stopped, or
     quarantined state; this one fires when the operator points the
     reassignment call at a session name that has no
-    :class:`memexpert.models.content.TelegramSessionState` row at all.
+    :class:`memexpert.models.content.TelegramSession` row at all.
     Operator tooling relies on the distinction because the recovery path
     differs: "unknown target" is a typo, "not runnable" is a cooldown.
     """

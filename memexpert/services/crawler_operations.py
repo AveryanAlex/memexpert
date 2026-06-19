@@ -21,10 +21,11 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from sqlalchemy import func, select
+from sqlalchemy.orm import selectinload
 
-from memexpert.models.content import SourceChannel, TelegramSessionState
+from memexpert.models.content import SourceChannel, TelegramSession
 from memexpert.models.enums import SourcePlatform
-from memexpert.schemas.content_pipeline import TelegramSessionStateRead
+from memexpert.schemas.content_pipeline import TelegramSessionRead
 from memexpert.schemas.crawler import (
     CrawlerChannelRead,
     CrawlerFreshnessSnapshot,
@@ -52,29 +53,28 @@ class CrawlerOperationsService:
     session: AsyncSession
     runtime: TelegramCrawlerRuntime
 
-    async def list_sessions(self) -> list[TelegramSessionStateRead]:
+    async def list_sessions(self) -> list[TelegramSessionRead]:
         """Return every Telegram session row with its owned channel count.
 
         The owned-channel count is derived from a dedicated ``SELECT
-        session_id, COUNT(*)`` grouping over ``source_channels`` (filtered
-        to Telegram, matching whatever ``session_id`` the session row
-        advertises). Sessions with no channels still appear in the result
-        with ``owned_channel_count=0`` so operators can see orphaned
+        telegram_session_id, COUNT(*)`` grouping over Telegram
+        ``source_channels``. Sessions with no channels still appear in the
+        result with ``owned_channel_count=0`` so operators can see idle
         sessions at a glance.
         """
 
         session_rows = (
             await self.session.execute(
-                select(TelegramSessionState).order_by(TelegramSessionState.session_name),
+                select(TelegramSession).order_by(TelegramSession.name),
             )
         ).scalars().all()
         counts_by_session = await self._count_channels_by_session()
-        projections: list[TelegramSessionStateRead] = []
+        projections: list[TelegramSessionRead] = []
         for row in session_rows:
-            base = TelegramSessionStateRead.model_validate(row)
+            base = TelegramSessionRead.model_validate(row)
             projections.append(
                 base.model_copy(
-                    update={"owned_channel_count": counts_by_session.get(row.session_name, 0)},
+                    update={"owned_channel_count": counts_by_session.get(row.id, 0)},
                 ),
             )
         return projections
@@ -88,11 +88,11 @@ class CrawlerOperationsService:
     ) -> list[CrawlerChannelRead]:
         """Return the tracked source channels filtered by platform + session + paused flag."""
 
-        stmt = select(SourceChannel).order_by(SourceChannel.title)
+        stmt = select(SourceChannel).options(selectinload(SourceChannel.telegram_session)).order_by(SourceChannel.title)
         if platform is not None:
             stmt = stmt.where(SourceChannel.platform == platform)
         if session_name is not None:
-            stmt = stmt.where(SourceChannel.session_id == session_name)
+            stmt = stmt.join(SourceChannel.telegram_session).where(TelegramSession.name == session_name)
         if not include_paused:
             stmt = stmt.where(SourceChannel.is_paused.is_(False))
         rows = (await self.session.execute(stmt)).scalars().all()
@@ -105,8 +105,7 @@ class CrawlerOperationsService:
         if not channel.is_paused:
             channel.is_paused = True
             await self.session.commit()
-            await self.session.refresh(channel)
-        return CrawlerChannelRead.model_validate(channel)
+        return CrawlerChannelRead.model_validate(await self._get_channel_or_raise(channel.id))
 
     async def resume_channel(self, source_channel_id: uuid.UUID) -> CrawlerChannelRead:
         """Set ``is_paused=False`` for one channel; idempotent on re-resume."""
@@ -115,8 +114,7 @@ class CrawlerOperationsService:
         if channel.is_paused:
             channel.is_paused = False
             await self.session.commit()
-            await self.session.refresh(channel)
-        return CrawlerChannelRead.model_validate(channel)
+        return CrawlerChannelRead.model_validate(await self._get_channel_or_raise(channel.id))
 
     async def reassign_channel(
         self,
@@ -147,8 +145,7 @@ class CrawlerOperationsService:
             # above, so the only remaining cause is "unknown target"
             # and that deserves the distinct operator error code.
             raise CrawlerInvalidSessionError(str(exc)) from exc
-        await self.session.refresh(channel)
-        return CrawlerChannelRead.model_validate(channel)
+        return CrawlerChannelRead.model_validate(await self._get_channel_or_raise(channel.id))
 
     async def replay_channel_post(
         self,
@@ -186,26 +183,32 @@ class CrawlerOperationsService:
     async def _get_channel_or_raise(self, source_channel_id: uuid.UUID) -> SourceChannel:
         """Load one ``SourceChannel`` row or raise :class:`CrawlerChannelNotFoundError`."""
 
-        row = await self.session.get(SourceChannel, source_channel_id)
+        row = await self.session.scalar(
+            select(SourceChannel)
+            .options(selectinload(SourceChannel.telegram_session))
+            .where(SourceChannel.id == source_channel_id)
+            .execution_options(populate_existing=True)
+            .limit(1),
+        )
         if row is None:
             raise CrawlerChannelNotFoundError(
                 f"Source channel {source_channel_id} does not exist.",
             )
         return row
 
-    async def _count_channels_by_session(self) -> dict[str, int]:
-        """Return ``{session_name: count}`` for every Telegram channel with a session."""
+    async def _count_channels_by_session(self) -> dict[uuid.UUID, int]:
+        """Return ``{telegram_session_id: count}`` for every Telegram channel with a session."""
 
         stmt = (
-            select(SourceChannel.session_id, func.count(SourceChannel.id))
+            select(SourceChannel.telegram_session_id, func.count(SourceChannel.id))
             .where(
                 SourceChannel.platform == SourcePlatform.TELEGRAM,
-                SourceChannel.session_id.is_not(None),
+                SourceChannel.telegram_session_id.is_not(None),
             )
-            .group_by(SourceChannel.session_id)
+            .group_by(SourceChannel.telegram_session_id)
         )
         rows = (await self.session.execute(stmt)).all()
-        return {session_name: count for session_name, count in rows if session_name is not None}
+        return {telegram_session_id: count for telegram_session_id, count in rows if telegram_session_id is not None}
 
 
 __all__ = [

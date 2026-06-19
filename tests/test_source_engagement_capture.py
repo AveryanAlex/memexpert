@@ -22,6 +22,7 @@ from memexpert.models.content import (
     MemeSourceEngagementSnapshot,
     RabbitMQOutboxMessage,
     SourceChannel,
+    TelegramSession,
 )
 from memexpert.models.enums import (
     ContentKind,
@@ -32,6 +33,7 @@ from memexpert.models.enums import (
     SourceEngagementFetchStatus,
     SourceEngagementScheduleLabel,
     SourcePlatform,
+    TelegramSessionStatus,
 )
 from memexpert.pipeline.events import (
     PIPELINE_MEME_SOURCE_AGGREGATE_TYPE,
@@ -88,13 +90,20 @@ async def test_source_engagement_scheduler_claims_due_sources_and_writes_outbox(
         scheduled_for=datetime(2026, 1, 1, 13, 0, tzinfo=UTC),
         locked_at=now - timedelta(minutes=5),
     )
+    telegram_session = TelegramSession(
+        name="session-a",
+        display_name="Session A",
+        status=TelegramSessionStatus.ACTIVE,
+    )
+    migrated_db_session.add(telegram_session)
+    await migrated_db_session.flush()
     migrated_db_session.add(
         SourceChannel(
             platform=SourcePlatform.TELEGRAM,
             platform_id="due-channel",
             username="due",
             title="Due Channel",
-            session_id="session-a",
+            telegram_session_id=telegram_session.id,
         )
     )
     await migrated_db_session.commit()
@@ -140,6 +149,76 @@ async def test_source_engagement_scheduler_claims_due_sources_and_writes_outbox(
     assert payload.scheduled_for == datetime(2026, 1, 1, 13, 0, tzinfo=UTC)
     assert payload.schedule_label is SourceEngagementScheduleLabel.PLUS_1H
     assert payload.session_name == "session-a"
+
+
+async def test_source_engagement_scheduler_skips_orphan_and_engagement_disabled_channels(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    now = datetime(2026, 1, 1, 14, 0, tzinfo=UTC)
+    orphan = await _create_meme_source(
+        migrated_db_session,
+        source_id="orphan-channel",
+        post_id="200",
+        published_at=datetime(2026, 1, 1, 12, 0, tzinfo=UTC),
+        scheduled_for=datetime(2026, 1, 1, 13, 0, tzinfo=UTC),
+    )
+    disabled = await _create_meme_source(
+        migrated_db_session,
+        source_id="disabled-engagement-channel",
+        post_id="201",
+        published_at=datetime(2026, 1, 1, 12, 0, tzinfo=UTC),
+        scheduled_for=datetime(2026, 1, 1, 13, 0, tzinfo=UTC),
+    )
+    telegram_session = TelegramSession(
+        name="session-a",
+        display_name="Session A",
+        status=TelegramSessionStatus.ACTIVE,
+    )
+    migrated_db_session.add(telegram_session)
+    await migrated_db_session.flush()
+    migrated_db_session.add_all(
+        [
+            SourceChannel(
+                platform=SourcePlatform.TELEGRAM,
+                platform_id="orphan-channel",
+                title="Orphan Channel",
+            ),
+            SourceChannel(
+                platform=SourcePlatform.TELEGRAM,
+                platform_id="disabled-engagement-channel",
+                title="Disabled Engagement Channel",
+                telegram_session_id=telegram_session.id,
+                engagement_enabled=False,
+            ),
+        ]
+    )
+    await migrated_db_session.commit()
+
+    result = await run_scheduler_source_engagement_capture_batch(
+        postgres_session_factory,
+        settings=Settings.model_validate(
+            {
+                "scheduler_source_engagement_capture_batch_size": 10,
+                "scheduler_source_engagement_capture_lease_timeout_seconds": 1800.0,
+            }
+        ),
+        now=now,
+        lock_owner="test-scheduler",
+    )
+
+    assert result.claimed == 0
+    assert result.enqueued == 0
+    async with postgres_session_factory() as session:
+        orphan_source = await session.get(MemeSource, orphan.source.id)
+        disabled_source = await session.get(MemeSource, disabled.source.id)
+        outbox_count = len((await session.execute(select(RabbitMQOutboxMessage))).scalars().all())
+
+    assert orphan_source is not None
+    assert orphan_source.engagement_check_locked_at is None
+    assert disabled_source is not None
+    assert disabled_source.engagement_check_locked_at is None
+    assert outbox_count == 0
 
 
 async def test_source_engagement_capture_success_appends_scheduled_snapshot_and_advances_monthly(

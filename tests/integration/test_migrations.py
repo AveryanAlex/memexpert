@@ -58,7 +58,7 @@ EXPECTED_TABLES = {
     "source_channels",
     "telegram_file_id_cache",
     "telegram_link_codes",
-    "telegram_session_states",
+    "telegram_sessions",
     "users",
 }
 EXPECTED_CURRENT_TREND_MATERIALIZED_VIEWS = {
@@ -337,16 +337,16 @@ def test_initial_revision_metadata_is_present() -> None:
     config = _build_alembic_config()
     script_directory = ScriptDirectory.from_config(config)
     revision = script_directory.get_revision("head")
-    previous_revision = script_directory.get_revision("0022")
+    previous_revision = script_directory.get_revision("0023")
 
     assert revision is not None
-    assert revision.revision == "0023"
-    assert revision.down_revision == "0022"
-    assert revision.doc == "source engagement public read models"
+    assert revision.revision == "0024"
+    assert revision.down_revision == "0023"
+    assert revision.doc == "telegram session registry"
     assert previous_revision is not None
-    assert previous_revision.revision == "0022"
-    assert previous_revision.down_revision == "0021"
-    assert previous_revision.doc == "source engagement history"
+    assert previous_revision.revision == "0023"
+    assert previous_revision.down_revision == "0022"
+    assert previous_revision.doc == "source engagement public read models"
 
 
 async def test_upgrade_head_creates_expected_schema_and_constraints(
@@ -360,7 +360,7 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
     table_names = await _get_table_names(engine)
     assert table_names == EXPECTED_TABLES | {"alembic_version"}
     assert "meme_popularity_snapshots" not in table_names
-    assert await _get_current_revision(engine) == "0023"
+    assert await _get_current_revision(engine) == "0024"
     assert await _get_materialized_view_names(engine) == EXPECTED_MATERIALIZED_VIEWS
 
     users_indexes = await _get_index_definitions(engine, "users")
@@ -978,13 +978,13 @@ async def test_crawler_sources_migration_applies_and_reverses(
     config = _build_alembic_config(database_url)
 
     await _run_alembic_command(command.upgrade, config, "head")
-    assert await _get_current_revision(engine) == "0023"
+    assert await _get_current_revision(engine) == "0024"
 
     meme_sources_columns = await _get_column_names(engine, "meme_sources")
     source_channels_columns = await _get_column_names(engine, "source_channels")
-    telegram_session_states_columns = await _get_column_names(
+    telegram_sessions_columns = await _get_column_names(
         engine,
-        "telegram_session_states",
+        "telegram_sessions",
     )
 
     assert {
@@ -1003,43 +1003,64 @@ async def test_crawler_sources_migration_applies_and_reverses(
         "catchup_enabled",
         "is_paused",
         "last_fetched_at",
+        "telegram_session_id",
+        "live_enabled",
+        "engagement_enabled",
     }.issubset(source_channels_columns)
-    assert telegram_session_states_columns == {
+    assert "session_id" not in source_channels_columns
+    assert telegram_sessions_columns == {
+        "account_phone_hint",
+        "account_user_id",
+        "account_username",
+        "catchup_enabled",
+        "created_at",
+        "display_name",
+        "enabled",
+        "encrypted_string_session",
+        "engagement_enabled",
+        "flood_wait_until",
         "id",
-        "session_name",
-        "status",
         "last_error_class",
         "last_error_text",
-        "flood_wait_until",
-        "live_listener_started_at",
         "last_heartbeat_at",
+        "live_enabled",
+        "live_listener_started_at",
+        "max_requests_per_second",
+        "name",
         "quarantined_at",
-        "created_at",
+        "status",
         "updated_at",
     }
 
     telegram_session_indexes = await _get_index_definitions(
         engine,
-        "telegram_session_states",
+        "telegram_sessions",
     )
-    assert "uq_telegram_session_states_session_name" in telegram_session_indexes
-    assert "session_name" in telegram_session_indexes[
-        "uq_telegram_session_states_session_name"
+    assert "uq_telegram_sessions_name" in telegram_session_indexes
+    assert "name" in telegram_session_indexes[
+        "uq_telegram_sessions_name"
     ]
     assert "UNIQUE" in telegram_session_indexes[
-        "uq_telegram_session_states_session_name"
+        "uq_telegram_sessions_name"
     ].upper()
-    assert "ix_telegram_session_states_status_updated_at" in telegram_session_indexes
+    assert "ix_telegram_sessions_status_updated_at" in telegram_session_indexes
     status_updated_index = telegram_session_indexes[
-        "ix_telegram_session_states_status_updated_at"
+        "ix_telegram_sessions_status_updated_at"
     ]
     assert "status" in status_updated_index
     assert "updated_at" in status_updated_index
+    assert "ix_telegram_sessions_enabled_status" in telegram_session_indexes
+
+    source_channel_indexes = await _get_index_definitions(engine, "source_channels")
+    assert "ix_source_channels_telegram_session_id" in source_channel_indexes
+    assert "ix_source_channels_session_live" in source_channel_indexes
+    assert "ix_source_channels_session_engagement" in source_channel_indexes
 
     await _run_alembic_command(command.downgrade, config, "0005")
     assert await _get_current_revision(engine) == "0005"
 
     downgraded_tables = await _get_table_names(engine)
+    assert "telegram_sessions" not in downgraded_tables
     assert "telegram_session_states" not in downgraded_tables
 
     downgraded_meme_sources_columns = await _get_column_names(engine, "meme_sources")
@@ -1051,6 +1072,7 @@ async def test_crawler_sources_migration_applies_and_reverses(
     assert "catchup_enabled" not in downgraded_source_channels_columns
     assert "is_paused" not in downgraded_source_channels_columns
     assert "last_fetched_at" not in downgraded_source_channels_columns
+    assert "telegram_session_id" not in downgraded_source_channels_columns
 
 
 async def test_downgrade_base_reverses_the_schema_cleanly(
@@ -1076,7 +1098,7 @@ async def test_repeated_fresh_database_upgrades_work_after_a_full_downgrade(
     await _run_alembic_command(command.downgrade, config, "base")
     await _run_alembic_command(command.upgrade, config, "head")
 
-    assert await _get_current_revision(engine) == "0023"
+    assert await _get_current_revision(engine) == "0024"
     assert EXPECTED_TABLES.issubset(await _get_table_names(engine))
 
 

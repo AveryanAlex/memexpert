@@ -347,6 +347,7 @@ class TelegramSessionStatus(StrEnum):
     """
 
     ACTIVE = "active"
+    AUTH_REQUIRED = "auth_required"
     FLOOD_WAIT = "flood_wait"
     QUARANTINED = "quarantined"
     STOPPED = "stopped"

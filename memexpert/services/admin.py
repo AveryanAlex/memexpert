@@ -29,6 +29,7 @@ from memexpert.models.content import (
     PipelineStageJournal,
     SourceChannel,
     TelegramFileIdCache,
+    TelegramSession,
 )
 from memexpert.models.enums import ModerationAction, ModerationReportStatus
 from memexpert.models.user import ChannelSuggestion
@@ -123,20 +124,27 @@ class AdminService:
 
     async def list_source_channels(self) -> list[AdminSourceChannelRead]:
         rows = (
-            await self.session.execute(select(SourceChannel).order_by(SourceChannel.title.asc()))
+            await self.session.execute(
+                select(SourceChannel)
+                .options(selectinload(SourceChannel.telegram_session))
+                .order_by(SourceChannel.title.asc())
+            )
         ).scalars().all()
         now = utcnow()
         return [self._source_channel_read(row, now=now) for row in rows]
 
     async def add_source_channel(self, request: AdminSourceChannelCreateRequest) -> AdminSourceChannelRead:
+        telegram_session = await self._get_telegram_session_by_name(request.telegram_session_name)
         channel = SourceChannel(
             platform=request.platform,
             platform_id=request.platform_id,
             username=request.username,
             title=request.title,
             subscriber_count=request.subscriber_count,
-            session_id=request.session_id,
+            telegram_session_id=None if telegram_session is None else telegram_session.id,
             catchup_enabled=request.catchup_enabled,
+            live_enabled=request.live_enabled,
+            engagement_enabled=request.engagement_enabled,
             catchup_message_limit=request.catchup_message_limit,
         )
         self.session.add(channel)
@@ -148,7 +156,7 @@ class AdminService:
                 f"Source channel {request.platform.value}:{request.platform_id} already exists.",
             ) from exc
         await self.session.refresh(channel)
-        return self._source_channel_read(channel)
+        return self._source_channel_read(await self._get_source_channel_for_read(channel.id))
 
     async def set_source_channel_paused(self, channel_id: uuid.UUID, *, is_paused: bool) -> AdminSourceChannelRead:
         channel = await self.session.get(SourceChannel, channel_id)
@@ -159,8 +167,7 @@ class AdminService:
         if channel.is_paused != is_paused:
             channel.is_paused = is_paused
             await self.session.commit()
-            await self.session.refresh(channel)
-        return self._source_channel_read(channel)
+        return self._source_channel_read(await self._get_source_channel_for_read(channel.id))
 
     async def mark_source_channel_dead(self, channel_id: uuid.UUID) -> AdminSourceChannelRead:
         channel = await self.session.get(SourceChannel, channel_id)
@@ -172,8 +179,7 @@ class AdminService:
         channel.is_active = False
         channel.is_paused = True
         await self.session.commit()
-        await self.session.refresh(channel)
-        return self._source_channel_read(channel)
+        return self._source_channel_read(await self._get_source_channel_for_read(channel.id))
 
     async def list_meme_templates(self) -> list[AdminMemeTemplateRead]:
         rows = (
@@ -1017,8 +1023,11 @@ class AdminService:
             is_active=channel.is_active,
             is_paused=channel.is_paused,
             catchup_enabled=channel.catchup_enabled,
+            live_enabled=channel.live_enabled,
+            engagement_enabled=channel.engagement_enabled,
             catchup_message_limit=channel.catchup_message_limit,
-            session_id=channel.session_id,
+            telegram_session_id=channel.telegram_session_id,
+            telegram_session_name=channel.telegram_session_name,
             last_read_post_id=channel.last_read_post_id,
             last_fetched_at=channel.last_fetched_at,
             operational_status=operational_status,
@@ -1027,6 +1036,30 @@ class AdminService:
             created_at=channel.created_at,
             updated_at=channel.updated_at,
         )
+
+    async def _get_source_channel_for_read(self, channel_id: uuid.UUID) -> SourceChannel:
+        channel = await self.session.scalar(
+            select(SourceChannel)
+            .options(selectinload(SourceChannel.telegram_session))
+            .where(SourceChannel.id == channel_id)
+            .execution_options(populate_existing=True)
+            .limit(1),
+        )
+        if channel is None:
+            raise AdminNotFoundError(f"Source channel {channel_id} does not exist.")
+        return channel
+
+    async def _get_telegram_session_by_name(self, name: str | None) -> TelegramSession | None:
+        if name is None:
+            return None
+        telegram_session = await self.session.scalar(
+            select(TelegramSession)
+            .where(TelegramSession.name == name)
+            .limit(1),
+        )
+        if telegram_session is None:
+            raise AdminConflictError(f"Telegram session {name!r} does not exist.")
+        return telegram_session
 
 
 __all__ = ["AdminConflictError", "AdminNotFoundError", "AdminService", "AdminServiceError"]

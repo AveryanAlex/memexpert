@@ -35,7 +35,7 @@ from memexpert.models.content import (
     PipelineIngestRequest,
     RabbitMQOutboxMessage,
     SourceChannel,
-    TelegramSessionState,
+    TelegramSession,
 )
 from memexpert.models.enums import SourcePlatform, TelegramSessionStatus
 from memexpert.schemas.content_pipeline import CrawlerForwardAttribution, CrawlerIngestOutcome
@@ -94,10 +94,13 @@ async def _seed_active_session(
     session: AsyncSession,
     *,
     session_name: str,
-) -> TelegramSessionState:
-    row = TelegramSessionState(
-        session_name=session_name,
+    enabled: bool = True,
+) -> TelegramSession:
+    row = TelegramSession(
+        name=session_name,
+        display_name=session_name.title(),
         status=TelegramSessionStatus.ACTIVE,
+        enabled=enabled,
         last_heartbeat_at=_now(),
     )
     session.add(row)
@@ -113,10 +116,18 @@ async def _seed_curated_channel(
     title: str = "Curated Channel",
     catchup_message_limit: int = 500,
     catchup_enabled: bool = True,
+    live_enabled: bool = True,
+    engagement_enabled: bool = True,
     is_paused: bool = False,
-    session_id: str | None = None,
+    session_name: str | None = "primary",
     last_read_post_id: str | None = None,
 ) -> SourceChannel:
+    telegram_session_id = None
+    if session_name is not None:
+        telegram_session_id = await session.scalar(
+            select(TelegramSession.id).where(TelegramSession.name == session_name),
+        )
+        assert telegram_session_id is not None
     channel = SourceChannel(
         platform=SourcePlatform.TELEGRAM,
         platform_id=platform_id,
@@ -125,7 +136,9 @@ async def _seed_curated_channel(
         is_paused=is_paused,
         catchup_message_limit=catchup_message_limit,
         catchup_enabled=catchup_enabled,
-        session_id=session_id,
+        live_enabled=live_enabled,
+        engagement_enabled=engagement_enabled,
+        telegram_session_id=telegram_session_id,
         last_read_post_id=last_read_post_id,
     )
     session.add(channel)
@@ -356,6 +369,38 @@ async def test_catch_up_channel_honors_catchup_disabled(
     assert "catchup_disabled" in report.errors[0]
 
 
+async def test_catch_up_channel_rejects_orphan_and_differently_assigned_channels(
+    migrated_db_session: AsyncSession,
+) -> None:
+    await _seed_active_session(migrated_db_session, session_name="primary")
+    await _seed_active_session(migrated_db_session, session_name="secondary")
+    await _seed_curated_channel(
+        migrated_db_session,
+        platform_id="orphan_channel",
+        session_name=None,
+    )
+    await _seed_curated_channel(
+        migrated_db_session,
+        platform_id="secondary_channel",
+        session_name="secondary",
+    )
+    fake = FakeTelegramClient(
+        canned_messages={
+            "orphan_channel": [_build_photo_message(message_id="1", channel_id="orphan_channel")],
+            "secondary_channel": [_build_photo_message(message_id="1", channel_id="secondary_channel")],
+        },
+        media_by_message={"1": b"img"},
+    )
+    runtime = _build_runtime(migrated_db_session, telegram_client=fake, phash_tag="O")
+
+    with pytest.raises(CrawlerSessionNotRunnableError):
+        _ = await runtime.catch_up_channel("primary", "orphan_channel")
+    with pytest.raises(CrawlerSessionNotRunnableError):
+        _ = await runtime.catch_up_channel("primary", "secondary_channel")
+
+    assert fake.downloaded_message_ids == []
+
+
 # ---------------------------------------------------------------------------
 # Error + session-state paths
 # ---------------------------------------------------------------------------
@@ -543,7 +588,6 @@ async def test_live_listener_round_trips_one_message_and_stops_cleanly(
     await _seed_curated_channel(
         migrated_db_session,
         platform_id="live_channel",
-        session_id="primary",
     )
 
     live_message = _build_photo_message(message_id="100", channel_id="live_channel")
@@ -578,7 +622,6 @@ async def test_live_listener_skips_duplicate_source_before_download(
     channel = await _seed_curated_channel(
         migrated_db_session,
         platform_id="live_dedup_channel",
-        session_id="primary",
     )
 
     seed_message = _build_photo_message(message_id="100", channel_id="live_dedup_channel")
@@ -625,6 +668,35 @@ async def test_live_listener_skips_duplicate_source_before_download(
     assert channel.last_read_post_id == "101"
 
 
+async def test_live_listener_ignores_orphan_and_live_disabled_channels(
+    migrated_db_session: AsyncSession,
+) -> None:
+    await _seed_active_session(migrated_db_session, session_name="primary")
+    await _seed_curated_channel(
+        migrated_db_session,
+        platform_id="orphan_live_channel",
+        session_name=None,
+    )
+    await _seed_curated_channel(
+        migrated_db_session,
+        platform_id="disabled_live_channel",
+        live_enabled=False,
+    )
+    fake = FakeTelegramClient(
+        live_messages={
+            "orphan_live_channel": [_build_photo_message(message_id="100", channel_id="orphan_live_channel")],
+            "disabled_live_channel": [_build_photo_message(message_id="101", channel_id="disabled_live_channel")],
+        },
+        media_by_message={"100": b"orphan", "101": b"disabled"},
+    )
+    runtime = _build_runtime(migrated_db_session, telegram_client=fake, phash_tag="N")
+
+    await runtime.start_live_listener("primary")
+
+    assert "primary" not in runtime._live_tasks
+    assert fake.downloaded_message_ids == []
+
+
 # ---------------------------------------------------------------------------
 # replay_post + reassign_channel
 # ---------------------------------------------------------------------------
@@ -660,6 +732,30 @@ async def test_replay_post_does_not_advance_checkpoint(
     assert channel.last_read_post_id == "500"
 
 
+async def test_replay_post_rejects_orphan_channel(
+    migrated_db_session: AsyncSession,
+) -> None:
+    await _seed_active_session(migrated_db_session, session_name="primary")
+    await _seed_curated_channel(
+        migrated_db_session,
+        platform_id="orphan_replay_channel",
+        session_name=None,
+    )
+    fake = FakeTelegramClient()
+    fake.pin_single_message(
+        channel_id="orphan_replay_channel",
+        post_id="42",
+        message=_build_photo_message(message_id="42", channel_id="orphan_replay_channel"),
+        media=b"orphan-replay-bytes",
+    )
+    runtime = _build_runtime(migrated_db_session, telegram_client=fake, phash_tag="O")
+
+    with pytest.raises(CrawlerSessionNotRunnableError):
+        _ = await runtime.replay_post("orphan_replay_channel", "42")
+
+    assert fake.downloaded_message_ids == []
+
+
 async def test_reassign_channel_updates_session_binding(
     migrated_db_session: AsyncSession,
 ) -> None:
@@ -668,7 +764,6 @@ async def test_reassign_channel_updates_session_binding(
     channel = await _seed_curated_channel(
         migrated_db_session,
         platform_id="movable_channel",
-        session_id="primary",
     )
 
     fake = FakeTelegramClient()
@@ -677,7 +772,9 @@ async def test_reassign_channel_updates_session_binding(
     await runtime.reassign_channel("movable_channel", "secondary")
 
     await migrated_db_session.refresh(channel)
-    assert channel.session_id == "secondary"
+    assert channel.telegram_session_id == (
+        await migrated_db_session.scalar(select(TelegramSession.id).where(TelegramSession.name == "secondary"))
+    )
 
 
 async def test_reassign_channel_rejects_unknown_session(
@@ -687,7 +784,6 @@ async def test_reassign_channel_rejects_unknown_session(
     await _seed_curated_channel(
         migrated_db_session,
         platform_id="guarded_channel",
-        session_id="primary",
     )
 
     fake = FakeTelegramClient()
@@ -710,8 +806,9 @@ async def test_catch_up_channel_refuses_non_active_session(
     migrated_db_session: AsyncSession,
     status: TelegramSessionStatus,
 ) -> None:
-    row = TelegramSessionState(
-        session_name="idle",
+    row = TelegramSession(
+        name="idle",
+        display_name="Idle",
         status=status,
         last_heartbeat_at=_now(),
     )
@@ -720,6 +817,7 @@ async def test_catch_up_channel_refuses_non_active_session(
     await _seed_curated_channel(
         migrated_db_session,
         platform_id="some_channel",
+        session_name="idle",
     )
 
     fake = FakeTelegramClient()
@@ -727,6 +825,21 @@ async def test_catch_up_channel_refuses_non_active_session(
 
     with pytest.raises(CrawlerSessionNotRunnableError):
         _ = await runtime.catch_up_channel("idle", "some_channel")
+
+
+async def test_catch_up_channel_refuses_disabled_session(
+    migrated_db_session: AsyncSession,
+) -> None:
+    await _seed_active_session(migrated_db_session, session_name="disabled", enabled=False)
+    await _seed_curated_channel(
+        migrated_db_session,
+        platform_id="disabled_session_channel",
+        session_name="disabled",
+    )
+    runtime = _build_runtime(migrated_db_session, telegram_client=FakeTelegramClient(), phash_tag="E")
+
+    with pytest.raises(CrawlerSessionNotRunnableError):
+        _ = await runtime.catch_up_channel("disabled", "disabled_session_channel")
 
 
 # ---------------------------------------------------------------------------
@@ -745,7 +858,6 @@ async def test_crawler_operations_service_reassign_updates_session_binding_and_p
     channel = await _seed_curated_channel(
         migrated_db_session,
         platform_id="service_movable",
-        session_id="primary",
     )
     runtime = _build_runtime(
         migrated_db_session,
@@ -758,12 +870,14 @@ async def test_crawler_operations_service_reassign_updates_session_binding_and_p
         channel.id,
         new_session_name="secondary",
     )
-    assert projection.session_id == "secondary"
+    assert projection.telegram_session_name == "secondary"
     assert projection.id == channel.id
 
     # The durable row actually moved to the new binding.
     await migrated_db_session.refresh(channel)
-    assert channel.session_id == "secondary"
+    assert channel.telegram_session_id == (
+        await migrated_db_session.scalar(select(TelegramSession.id).where(TelegramSession.name == "secondary"))
+    )
 
     # Unknown target session surfaces as the distinct typed error.
     with pytest.raises(CrawlerInvalidSessionError):
@@ -779,7 +893,6 @@ async def test_crawler_operations_service_replay_channel_post_delegates_to_runti
     channel = await _seed_curated_channel(
         migrated_db_session,
         platform_id="service_replay",
-        session_id="primary",
         last_read_post_id="999",
     )
 

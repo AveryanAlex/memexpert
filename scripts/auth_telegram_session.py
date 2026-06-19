@@ -9,14 +9,14 @@ Usage:
       uv run python scripts/auth_telegram_session.py --session-name primary
 
   The script will prompt for a phone number, one-time password, and
-  optional 2FA password, then upsert a ``telegram_session_states`` row
+  optional 2FA password, then upsert a ``telegram_sessions`` row
   with status ``active`` so the crawler runtime can pick the session up.
 
 The script exits with status ``1`` if API credentials are missing so
 operators cannot accidentally auth against a half-configured environment.
 It deliberately has no tests: the flow is interactive and the work it
-does is already covered by the runtime's ``_load_session_state`` unit
-tests plus the :class:`TelegramSessionState` model contract.
+does is already covered by the runtime's session-loading unit
+tests plus the :class:`TelegramSession` model contract.
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 from memexpert.core.config import get_settings
 from memexpert.core.database import build_async_engine, build_async_session_factory
 from memexpert.models.base import utcnow
-from memexpert.models.content import TelegramSessionState
+from memexpert.models.content import TelegramSession
 from memexpert.models.enums import TelegramSessionStatus
 
 _EXIT_MISSING_CREDENTIALS: Final = 1
@@ -59,7 +59,7 @@ def _parse_args() -> argparse.Namespace:
 
 
 async def _upsert_active_session_row(session_name: str) -> None:
-    """Ensure ``telegram_session_states`` has an ``active`` row for ``session_name``."""
+    """Ensure ``telegram_sessions`` has an ``active`` row for ``session_name``."""
 
     settings = get_settings()
     engine = build_async_engine(settings.database_url)
@@ -67,16 +67,17 @@ async def _upsert_active_session_row(session_name: str) -> None:
     try:
         async with session_factory() as db_session:
             result = await db_session.execute(
-                select(TelegramSessionState)
-                .where(TelegramSessionState.session_name == session_name)
+                select(TelegramSession)
+                .where(TelegramSession.name == session_name)
                 .limit(1)
             )
             row = result.scalar_one_or_none()
             now = utcnow()
             if row is None:
-                row = TelegramSessionState(
+                row = TelegramSession(
                     id=uuid.uuid7(),
-                    session_name=session_name,
+                    name=session_name,
+                    display_name=session_name,
                     status=TelegramSessionStatus.ACTIVE,
                     last_heartbeat_at=now,
                 )
@@ -134,7 +135,7 @@ async def _run(session_name: str) -> None:
     await _authorize_session_file(session_name, settings.telegram_session_dir)
     await _upsert_active_session_row(session_name)
     sys.stdout.write(
-        f"Session {session_name!r} marked active in telegram_session_states.\n",
+        f"Session {session_name!r} marked active in telegram_sessions.\n",
     )
 
 

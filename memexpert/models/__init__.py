@@ -23,7 +23,7 @@ from memexpert.models.content import (
     RabbitMQOutboxMessage,
     SourceChannel,
     TelegramFileIdCache,
-    TelegramSessionState,
+    TelegramSession,
 )
 from memexpert.models.enums import (
     AccountDeletionAction,
@@ -139,7 +139,7 @@ __all__ = [
     "TelegramFileIdCache",
     "TelegramLinkCode",
     "TelegramMediaFormat",
-    "TelegramSessionState",
+    "TelegramSession",
     "TelegramSessionStatus",
     "TimestampMixin",
     "UUIDPrimaryKeyMixin",

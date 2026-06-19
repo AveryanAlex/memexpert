@@ -40,7 +40,7 @@ class PipelineTelegramFloodWaitError(PipelineTelegramError):
 
     ``wait_seconds`` is the server-side cooldown Telegram tells us to
     respect before retrying. T02 persists it on the
-    :class:`memexpert.models.content.TelegramSessionState` row so the
+    :class:`memexpert.models.content.TelegramSession` row so the
     session distributor can quarantine sessions that are flooding.
     """
 
