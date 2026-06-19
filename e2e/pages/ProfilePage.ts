@@ -17,4 +17,11 @@ export class ProfilePage {
     await expect(this.page.getByText('NSFW stays hidden.')).toBeVisible();
     await expect(this.page.getByText('NSFW is hidden again.')).toBeVisible();
   }
+
+  async moveFirstPinDownAndExpectSaved() {
+    await this.goto();
+    await expect(this.page.getByRole('heading', { name: 'Pin order' })).toBeVisible();
+    await this.page.getByRole('button', { name: 'Down' }).first().click();
+    await expect(this.page.getByText('Pin order saved.')).toBeVisible();
+  }
 }

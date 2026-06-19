@@ -23,12 +23,15 @@ from memexpert.models.enums import (
 )
 from memexpert.models.user import User
 from memexpert.services import (
+    CollectionNotFoundError,
     CollectionService,
     CollectionVerificationRequiredError,
     CollectionWriteAccessError,
     DuplicateCollectionInviteError,
     GuestCollectionAccessError,
     InvalidCollectionInviteError,
+    InvalidCollectionMembershipError,
+    InvalidCollectionTitleError,
     InvalidPinnedMemeOrderError,
     MemeNotFoundError,
     PinLimitExceededError,
@@ -151,6 +154,33 @@ async def test_full_user_can_create_custom_collection_with_owner_membership(
     persisted_collection = result.scalar_one()
     assert persisted_collection.owner_id == owner.id
     assert [membership.role for membership in persisted_collection.memberships] == [CollectionMembershipRole.OWNER]
+
+
+async def test_custom_collections_do_not_allow_public_visibility_at_launch(
+    migrated_db_session: AsyncSession,
+) -> None:
+    user_service = UserService(migrated_db_session)
+    collection_service = CollectionService(migrated_db_session)
+    owner = await create_full_user_via_upgrade(user_service, email="visibility-owner@example.com")
+
+    with pytest.raises(InvalidCollectionTitleError, match="Public collections"):
+        _ = await collection_service.create_custom_collection(
+            owner_user_id=owner.id,
+            title="Public board",
+            visibility=CollectionVisibility.PUBLIC,
+        )
+
+    private_collection = await collection_service.create_custom_collection(
+        owner_user_id=owner.id,
+        title="Private board",
+    )
+    with pytest.raises(InvalidCollectionTitleError, match="Public collections"):
+        _ = await collection_service.update_custom_collection(
+            collection_id=private_collection.id,
+            user_id=owner.id,
+            title="Still private",
+            visibility=CollectionVisibility.PUBLIC,
+        )
 
 
 async def test_active_save_collection_switching_persists_across_transactions(
@@ -416,6 +446,131 @@ async def test_library_writes_reject_private_memes_not_visible_to_user(
     assert await migrated_db_session.scalar(select(func.count()).select_from(PinnedMeme)) == 0
     assert await migrated_db_session.scalar(select(Meme.like_count).where(Meme.id == private_meme.id)) == 0
 
+
+async def test_owner_manages_member_roles_and_write_permissions(
+    migrated_db_session: AsyncSession,
+) -> None:
+    user_service = UserService(migrated_db_session)
+    collection_service = CollectionService(migrated_db_session)
+    owner = await create_full_user_via_upgrade(user_service, email="member-owner@example.com")
+    editor = await create_full_user_via_upgrade(user_service, email="member-editor@example.com")
+    viewer = await create_full_user_via_upgrade(user_service, email="member-viewer@example.com")
+    outsider = await create_full_user_via_upgrade(user_service, email="member-outsider@example.com")
+    shared_collection = await collection_service.create_custom_collection(
+        owner_user_id=owner.id,
+        title="Member roles",
+    )
+    _ = await collection_service.ensure_member(
+        collection_id=shared_collection.id,
+        user_id=editor.id,
+        role=CollectionMembershipRole.EDITOR,
+    )
+    _ = await collection_service.ensure_member(
+        collection_id=shared_collection.id,
+        user_id=viewer.id,
+        role=CollectionMembershipRole.VIEWER,
+    )
+    meme = await _create_meme(migrated_db_session)
+    await migrated_db_session.commit()
+
+    _ = await collection_service.save_meme_to_collection(
+        collection_id=shared_collection.id,
+        user_id=editor.id,
+        meme_id=meme.id,
+    )
+    assert await collection_service.remove_meme_from_collection(
+        collection_id=shared_collection.id,
+        user_id=editor.id,
+        meme_id=meme.id,
+    ) is True
+    with pytest.raises(CollectionWriteAccessError):
+        _ = await collection_service.save_meme_to_collection(
+            collection_id=shared_collection.id,
+            user_id=viewer.id,
+            meme_id=meme.id,
+        )
+    with pytest.raises(CollectionNotFoundError):
+        _ = await collection_service.save_meme_to_collection(
+            collection_id=shared_collection.id,
+            user_id=outsider.id,
+            meme_id=meme.id,
+        )
+
+    promoted = await collection_service.update_member_role(
+        collection_id=shared_collection.id,
+        acting_user_id=owner.id,
+        member_user_id=viewer.id,
+        role=CollectionMembershipRole.EDITOR,
+    )
+    assert promoted.role is CollectionMembershipRole.EDITOR
+    _ = await collection_service.save_meme_to_collection(
+        collection_id=shared_collection.id,
+        user_id=viewer.id,
+        meme_id=meme.id,
+    )
+    demoted = await collection_service.update_member_role(
+        collection_id=shared_collection.id,
+        acting_user_id=owner.id,
+        member_user_id=viewer.id,
+        role=CollectionMembershipRole.VIEWER,
+    )
+    assert demoted.role is CollectionMembershipRole.VIEWER
+
+    with pytest.raises(CollectionWriteAccessError, match="Only the owner"):
+        _ = await collection_service.update_member_role(
+            collection_id=shared_collection.id,
+            acting_user_id=editor.id,
+            member_user_id=viewer.id,
+            role=CollectionMembershipRole.EDITOR,
+        )
+    with pytest.raises(CollectionWriteAccessError, match="Only the owner"):
+        _ = await collection_service.remove_member(
+            collection_id=shared_collection.id,
+            acting_user_id=viewer.id,
+            member_user_id=editor.id,
+        )
+    with pytest.raises(CollectionNotFoundError):
+        _ = await collection_service.update_member_role(
+            collection_id=shared_collection.id,
+            acting_user_id=outsider.id,
+            member_user_id=viewer.id,
+            role=CollectionMembershipRole.EDITOR,
+        )
+    with pytest.raises(InvalidCollectionMembershipError, match="ownership cannot be transferred"):
+        _ = await collection_service.update_member_role(
+            collection_id=shared_collection.id,
+            acting_user_id=owner.id,
+            member_user_id=viewer.id,
+            role=CollectionMembershipRole.OWNER,
+        )
+    with pytest.raises(InvalidCollectionMembershipError, match="owner role cannot be changed"):
+        _ = await collection_service.update_member_role(
+            collection_id=shared_collection.id,
+            acting_user_id=owner.id,
+            member_user_id=owner.id,
+            role=CollectionMembershipRole.VIEWER,
+        )
+    with pytest.raises(InvalidCollectionMembershipError, match="owner cannot be removed"):
+        _ = await collection_service.remove_member(
+            collection_id=shared_collection.id,
+            acting_user_id=owner.id,
+            member_user_id=owner.id,
+        )
+
+    assert await collection_service.remove_member(
+        collection_id=shared_collection.id,
+        acting_user_id=owner.id,
+        member_user_id=viewer.id,
+    ) is True
+    assert await collection_service.remove_member(
+        collection_id=shared_collection.id,
+        acting_user_id=owner.id,
+        member_user_id=viewer.id,
+    ) is False
+    with pytest.raises(CollectionNotFoundError):
+        _ = await collection_service.get_collection_for_user(collection_id=shared_collection.id, user_id=viewer.id)
+
+
 async def test_create_invite_rejects_unverified_email_only_accounts_without_persisting_invites(
     migrated_db_session: AsyncSession,
 ) -> None:
@@ -598,3 +753,107 @@ async def test_create_invite_persists_valid_payload_and_rejects_malformed_inputs
 
     invite_count_result = await migrated_db_session.execute(select(func.count()).select_from(CollectionInvite))
     assert invite_count_result.scalar_one() == 1
+
+
+async def test_invite_join_terminal_statuses_persist_and_revoked_invites_cannot_join(
+    migrated_db_session: AsyncSession,
+) -> None:
+    user_service = UserService(migrated_db_session)
+    collection_service = CollectionService(migrated_db_session)
+    owner = await create_full_user_via_upgrade(
+        user_service,
+        email="invite-owner@example.com",
+        email_verified_at=datetime.now(UTC),
+    )
+    editor = await create_full_user_via_upgrade(user_service, telegram_id=9001)
+    viewer = await create_full_user_via_upgrade(user_service, telegram_id=9002)
+    joiner = await create_full_user_via_upgrade(user_service, email="invite-joiner@example.com")
+    second_joiner = await create_full_user_via_upgrade(user_service, email="invite-second@example.com")
+    expired_joiner = await create_full_user_via_upgrade(user_service, email="invite-expired@example.com")
+    revoked_joiner = await create_full_user_via_upgrade(user_service, email="invite-revoked@example.com")
+    shared_collection = await collection_service.create_custom_collection(
+        owner_user_id=owner.id,
+        title="Invite lifecycle",
+    )
+    _ = await collection_service.ensure_member(
+        collection_id=shared_collection.id,
+        user_id=editor.id,
+        role=CollectionMembershipRole.EDITOR,
+    )
+    _ = await collection_service.ensure_member(
+        collection_id=shared_collection.id,
+        user_id=viewer.id,
+        role=CollectionMembershipRole.VIEWER,
+    )
+
+    one_use_invite = await collection_service.create_invite(
+        collection_id=shared_collection.id,
+        created_by_user_id=owner.id,
+        token_hash="j" * 64,
+        max_uses=1,
+    )
+    joined_collection = await collection_service.join_invite(token_hash="j" * 64, user_id=joiner.id)
+    assert any(member.user_id == joiner.id for member in joined_collection.memberships)
+    persisted_one_use = await migrated_db_session.scalar(
+        select(CollectionInvite).where(CollectionInvite.id == one_use_invite.id)
+    )
+    assert persisted_one_use is not None
+    assert persisted_one_use.use_count == 1
+    assert persisted_one_use.status is CollectionInviteStatus.ACCEPTED
+    with pytest.raises(InvalidCollectionInviteError):
+        _ = await collection_service.join_invite(token_hash="j" * 64, user_id=second_joiner.id)
+
+    expiring_invite = await collection_service.create_invite(
+        collection_id=shared_collection.id,
+        created_by_user_id=owner.id,
+        token_hash="k" * 64,
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    expiring_row = await migrated_db_session.scalar(
+        select(CollectionInvite).where(CollectionInvite.id == expiring_invite.id)
+    )
+    assert expiring_row is not None
+    expiring_row.expires_at = datetime.now(UTC) - timedelta(minutes=1)
+    await migrated_db_session.commit()
+    with pytest.raises(InvalidCollectionInviteError):
+        _ = await collection_service.join_invite(token_hash="k" * 64, user_id=expired_joiner.id)
+    persisted_expired = await migrated_db_session.scalar(
+        select(CollectionInvite).where(CollectionInvite.id == expiring_invite.id)
+    )
+    assert persisted_expired is not None
+    assert persisted_expired.status is CollectionInviteStatus.EXPIRED
+
+    revoked_invite = await collection_service.create_invite(
+        collection_id=shared_collection.id,
+        created_by_user_id=editor.id,
+        token_hash="l" * 64,
+        max_uses=2,
+    )
+    revoked = await collection_service.revoke_invite(
+        collection_id=shared_collection.id,
+        invite_id=revoked_invite.id,
+        user_id=editor.id,
+    )
+    assert revoked.status is CollectionInviteStatus.REVOKED
+    assert revoked.revoked_at is not None
+    with pytest.raises(InvalidCollectionInviteError):
+        _ = await collection_service.join_invite(token_hash="l" * 64, user_id=revoked_joiner.id)
+
+    viewer_invite = await collection_service.create_invite(
+        collection_id=shared_collection.id,
+        created_by_user_id=owner.id,
+        token_hash="m" * 64,
+    )
+    with pytest.raises(CollectionWriteAccessError):
+        _ = await collection_service.revoke_invite(
+            collection_id=shared_collection.id,
+            invite_id=viewer_invite.id,
+            user_id=viewer.id,
+        )
+
+    detail = await collection_service.get_collection_for_user(collection_id=shared_collection.id, user_id=owner.id)
+    invites_by_id = {invite.id: invite for invite in detail.invites}
+    assert invites_by_id[one_use_invite.id].status is CollectionInviteStatus.ACCEPTED
+    assert invites_by_id[expiring_invite.id].status is CollectionInviteStatus.EXPIRED
+    assert invites_by_id[revoked_invite.id].status is CollectionInviteStatus.REVOKED
+    assert invites_by_id[revoked_invite.id].revoked_at is not None

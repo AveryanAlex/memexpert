@@ -8,6 +8,9 @@
   import {
     activeCollectionId,
     libraryEmptyText,
+    movePinnedMemeId,
+    movePinnedMemeIdToTarget,
+    orderPinnedMemesByIds,
     profileCapabilities,
     profilePreferences,
     profileStats,
@@ -23,6 +26,10 @@
   let selectorMessage = $state<string | null>(null);
   let nsfwPending = $state(false);
   let nsfwMessage = $state<string | null>(null);
+  let pinOrderIds = $state<string[]>([]);
+  let pinOrderPending = $state(false);
+  let pinOrderMessage = $state<string | null>(null);
+  let draggedPinId = $state<string | null>(null);
 
   const capabilities = $derived(profileCapabilities(data.session ?? null));
   const providerLabels = $derived(connectedProviderLabels(data.session?.linked_providers ?? null));
@@ -32,9 +39,15 @@
   const stats = $derived(profileStats(data.library));
   const preferences = $derived(profilePreferences(data.session?.user ?? null));
   const bulkGuidance = $derived(bulkGuidanceFromSessionAndCollections(data.session ?? null, bulkOptions));
+  const libraryPinIds = $derived(data.library?.pinned_memes.map((meme) => meme.id) ?? []);
+  const orderedPinnedMemes = $derived(orderPinnedMemesByIds(data.library?.pinned_memes ?? [], pinOrderIds));
 
   $effect(() => {
     selectedCollectionId = activeCollectionId(data.library);
+  });
+
+  $effect(() => {
+    pinOrderIds = libraryPinIds;
   });
 
   async function changeActiveCollection(event: Event) {
@@ -83,6 +96,48 @@
       nsfwMessage = error instanceof ApiError || error instanceof Error ? error.message : 'Could not update NSFW preference.';
     } finally {
       nsfwPending = false;
+    }
+  }
+
+  async function movePin(memeId: string, direction: -1 | 1) {
+    await savePinOrder(movePinnedMemeId(pinOrderIds, memeId, direction));
+  }
+
+  async function dropPin(targetMemeId: string) {
+    if (!draggedPinId) return;
+    const sourceId = draggedPinId;
+    draggedPinId = null;
+    await savePinOrder(movePinnedMemeIdToTarget(pinOrderIds, sourceId, targetMemeId));
+  }
+
+  async function savePinOrder(nextIds: string[]) {
+    if (pinOrderPending || nextIds.join('|') === pinOrderIds.join('|')) return;
+
+    const previousIds = pinOrderIds;
+    pinOrderIds = nextIds;
+    pinOrderPending = true;
+    pinOrderMessage = 'Saving pin order...';
+
+    try {
+      const response = await fetch('/api/v1/memes/pins/reorder', {
+        method: 'PUT',
+        credentials: 'include',
+        headers: { accept: 'application/json', 'content-type': 'application/json', 'x-requested-with': 'XMLHttpRequest' },
+        body: JSON.stringify({ meme_ids: nextIds })
+      });
+
+      if (!response.ok) {
+        const payload = await response.json().catch(() => null);
+        throw new Error(typeof payload?.detail === 'string' ? payload.detail : 'Could not reorder pinned memes.');
+      }
+
+      pinOrderMessage = 'Pin order saved.';
+      await invalidateAll();
+    } catch (error) {
+      pinOrderIds = previousIds;
+      pinOrderMessage = error instanceof Error ? error.message : 'Could not reorder pinned memes.';
+    } finally {
+      pinOrderPending = false;
     }
   }
 </script>
@@ -227,8 +282,39 @@
 
   <LibrarySection title="Pinned memes" count={`${data.library.pinned_memes.length} pinned`}>
     {#if data.library.pinned_memes.length > 0}
+      <Card class="mb-4 grid gap-3 shadow-none" aria-labelledby="pin-order-title">
+        <div>
+          <h3 id="pin-order-title" class="m-0 text-xl font-black tracking-[-0.03em]">Pin order</h3>
+          <p class="m-0 text-muted">Use Up/Down controls for keyboard-safe ordering, or drag rows onto a new position.</p>
+        </div>
+        <div class="grid gap-2" aria-live="polite" aria-busy={pinOrderPending}>
+          {#each orderedPinnedMemes as meme, index (meme.id)}
+            <article
+              class="grid gap-2 rounded-[18px] border border-line bg-paper p-3 sm:grid-cols-[auto_minmax(0,1fr)_auto] sm:items-center"
+              draggable="true"
+              ondragstart={() => (draggedPinId = meme.id)}
+              ondragend={() => (draggedPinId = null)}
+              ondragover={(event) => event.preventDefault()}
+              ondrop={() => dropPin(meme.id)}
+            >
+              <span class="rounded-full border border-line bg-soft px-3 py-1 text-sm font-black text-muted" aria-hidden="true">Drag</span>
+              <div>
+                <p class="m-0 font-black">{meme.caption || meme.tags[0] || `Pinned meme ${index + 1}`}</p>
+                <p class="m-0 text-sm text-muted">Position {index + 1} of {orderedPinnedMemes.length}</p>
+              </div>
+              <div class="flex flex-wrap gap-2 sm:justify-end">
+                <Button size="compact" variant="secondary" type="button" onclick={() => movePin(meme.id, -1)} disabled={pinOrderPending || index === 0}>Up</Button>
+                <Button size="compact" variant="secondary" type="button" onclick={() => movePin(meme.id, 1)} disabled={pinOrderPending || index === orderedPinnedMemes.length - 1}>Down</Button>
+              </div>
+            </article>
+          {/each}
+        </div>
+        {#if pinOrderMessage}
+          <p class="m-0 text-sm text-muted" role="status">{pinOrderMessage}</p>
+        {/if}
+      </Card>
       <MemeGrid
-        memes={data.library.pinned_memes}
+        memes={orderedPinnedMemes}
         label="Pinned memes"
         bulk={{ enabled: true, saveEnabled: true, collectionOptions: bulkOptions, guidance: bulkGuidance }}
       />

@@ -77,6 +77,8 @@ class CollectionService:
         """Return a collection with memberships and invites if it exists."""
 
         collection = await self._get_collection_model(collection_id)
+        if collection is not None and await self._persist_terminal_invite_statuses(collection.invites):
+            collection = await self._get_collection_model(collection_id)
         return None if collection is None else CollectionRead.model_validate(collection)
 
     async def ensure_favorites_collection(
@@ -207,14 +209,32 @@ class CollectionService:
             .join(CollectionMember, CollectionMember.collection_id == Collection.id)
             .where(CollectionMember.user_id == user.id)
             .order_by(Collection.kind.asc(), Collection.updated_at.desc(), Collection.title.asc())
+            .execution_options(populate_existing=True)
         )
-        return [CollectionRead.model_validate(collection) for collection in result.scalars().unique()]
+        collections = list(result.scalars().unique())
+        if await self._persist_terminal_invite_statuses(
+            [invite for collection in collections for invite in collection.invites],
+        ):
+            result = await self._session.execute(
+                select(Collection)
+                .options(selectinload(Collection.memberships), selectinload(Collection.invites))
+                .join(CollectionMember, CollectionMember.collection_id == Collection.id)
+                .where(CollectionMember.user_id == user.id)
+                .order_by(Collection.kind.asc(), Collection.updated_at.desc(), Collection.title.asc())
+                .execution_options(populate_existing=True)
+            )
+            collections = list(result.scalars().unique())
+        return [CollectionRead.model_validate(collection) for collection in collections]
 
     async def get_collection_for_user(self, *, collection_id: object, user_id: object) -> CollectionRead:
         """Return a collection only when the user has member-level read access."""
 
         user, collection = await self._get_collection_for_read(collection_id=collection_id, user_id=user_id)
         _ = user
+        if await self._persist_terminal_invite_statuses(collection.invites):
+            collection = await self._get_collection_model(collection.id)
+            if collection is None:  # pragma: no cover - defensive branch
+                raise CollectionServiceError("Collection could not be reloaded after invite status refresh.")
         return CollectionRead.model_validate(collection)
 
     async def list_collection_memes(self, *, collection_id: object, user_id: object) -> list[CollectionMemeRead]:
@@ -618,6 +638,73 @@ class CollectionService:
 
         return CollectionMemberRead.model_validate(membership)
 
+    async def update_member_role(
+        self,
+        *,
+        collection_id: object,
+        acting_user_id: object,
+        member_user_id: object,
+        role: CollectionMembershipRole | str,
+    ) -> CollectionMemberRead:
+        """Owner-only role management for non-owner custom collection members."""
+
+        actor, collection = await self._get_collection_for_read(collection_id=collection_id, user_id=acting_user_id)
+        self._ensure_owner_can_manage_custom_collection(actor, collection)
+
+        resolved_role = _resolve_membership_role(role)
+        if resolved_role is CollectionMembershipRole.OWNER:
+            raise InvalidCollectionMembershipError("Collection ownership cannot be transferred through member roles.")
+        if collection.owner_id == member_user_id:
+            raise InvalidCollectionMembershipError("The collection owner role cannot be changed.")
+
+        membership = await self._get_member_model(collection_id=collection.id, user_id=member_user_id)
+        if membership is None:
+            raise InvalidCollectionMembershipError("Collection membership does not exist.")
+        if membership.role is CollectionMembershipRole.OWNER:
+            raise InvalidCollectionMembershipError("The collection owner role cannot be changed.")
+
+        membership.role = resolved_role
+        try:
+            await self._session.commit()
+        except IntegrityError as exc:
+            await self._session.rollback()
+            raise CollectionServiceError("Failed to update the collection membership.") from exc
+        return CollectionMemberRead.model_validate(membership)
+
+    async def remove_member(
+        self,
+        *,
+        collection_id: object,
+        acting_user_id: object,
+        member_user_id: object,
+    ) -> bool:
+        """Owner-only removal for non-owner custom collection members."""
+
+        actor, collection = await self._get_collection_for_read(collection_id=collection_id, user_id=acting_user_id)
+        self._ensure_owner_can_manage_custom_collection(actor, collection)
+
+        if collection.owner_id == member_user_id:
+            raise InvalidCollectionMembershipError("The collection owner cannot be removed.")
+
+        membership = await self._get_member_model(collection_id=collection.id, user_id=member_user_id)
+        if membership is None:
+            return False
+        if membership.role is CollectionMembershipRole.OWNER:
+            raise InvalidCollectionMembershipError("The collection owner cannot be removed.")
+
+        await self._session.execute(
+            update(User)
+            .where(User.id == member_user_id, User.active_save_collection_id == collection.id)
+            .values(active_save_collection_id=None)
+        )
+        await self._session.delete(membership)
+        try:
+            await self._session.commit()
+        except IntegrityError as exc:
+            await self._session.rollback()
+            raise CollectionServiceError("Failed to remove the collection membership.") from exc
+        return True
+
     async def create_invite(
         self,
         *,
@@ -693,6 +780,32 @@ class CollectionService:
 
         return CollectionInviteRead.model_validate(invite)
 
+    async def revoke_invite(
+        self,
+        *,
+        collection_id: object,
+        invite_id: object,
+        user_id: object,
+    ) -> CollectionInviteRead:
+        """Revoke an invite for a custom collection when the caller can manage invites."""
+
+        user, collection = await self._get_collection_for_read(collection_id=collection_id, user_id=user_id)
+        self._ensure_can_manage_invites(user, collection)
+
+        invite = await self._get_invite_model(collection_id=collection.id, invite_id=invite_id)
+        if invite is None:
+            raise InvalidCollectionInviteError("Collection invite does not exist.")
+        if invite.revoked_at is None:
+            invite.revoked_at = datetime.now(UTC)
+        invite.status = CollectionInviteStatus.REVOKED
+
+        try:
+            await self._session.commit()
+        except IntegrityError as exc:
+            await self._session.rollback()
+            raise CollectionServiceError("Failed to revoke the collection invite.") from exc
+        return CollectionInviteRead.model_validate(invite)
+
     async def join_invite(self, *, token_hash: str, user_id: object) -> CollectionRead:
         """Redeem a direct-link invite for a full account and return the joined collection."""
 
@@ -704,6 +817,8 @@ class CollectionService:
 
         invite = await self._get_invite_by_token_hash(token_hash)
         if invite is None:
+            raise InvalidCollectionInviteError("Invite link is invalid or expired.")
+        if await self._persist_terminal_invite_statuses([invite]):
             raise InvalidCollectionInviteError("Invite link is invalid or expired.")
         _ensure_invite_can_be_used(invite)
 
@@ -780,6 +895,7 @@ class CollectionService:
                 selectinload(Collection.invites),
             )
             .where(Collection.id == collection_id)
+            .execution_options(populate_existing=True)
         )
         return result.scalar_one_or_none()
 
@@ -876,11 +992,44 @@ class CollectionService:
         )
         return result.scalar_one_or_none()
 
+    async def _get_invite_model(self, *, collection_id: object, invite_id: object) -> CollectionInvite | None:
+        result = await self._session.execute(
+            select(CollectionInvite).where(
+                CollectionInvite.collection_id == collection_id,
+                CollectionInvite.id == invite_id,
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def _get_member_model(self, *, collection_id: object, user_id: object) -> CollectionMember | None:
+        result = await self._session.execute(
+            select(CollectionMember).where(
+                CollectionMember.collection_id == collection_id,
+                CollectionMember.user_id == user_id,
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def _persist_terminal_invite_statuses(self, invites: list[CollectionInvite]) -> bool:
+        changed = False
+        for invite in invites:
+            changed = _apply_invite_terminal_status(invite) or changed
+        if not changed:
+            return False
+
+        try:
+            await self._session.commit()
+        except IntegrityError as exc:
+            await self._session.rollback()
+            raise CollectionServiceError("Failed to refresh collection invite status.") from exc
+        return True
+
     async def _get_favorites_collection_model(self, user_id: object) -> Collection | None:
         result = await self._session.execute(
             select(Collection)
             .options(selectinload(Collection.memberships), selectinload(Collection.invites))
             .where(Collection.owner_id == user_id, Collection.kind == CollectionKind.FAVORITES)
+            .execution_options(populate_existing=True)
         )
         return result.scalar_one_or_none()
 
@@ -1004,6 +1153,14 @@ class CollectionService:
                 f"Only the owner can manage collection {collection.id}.",
             )
 
+    def _ensure_can_manage_invites(self, user: User, collection: Collection) -> None:
+        if collection.kind is not CollectionKind.CUSTOM:
+            raise CollectionWriteAccessError("Favorites collections cannot be shared by invite.")
+        if not _user_can_write_collection(user.id, collection):
+            raise CollectionWriteAccessError(
+                f"User {user.id} cannot manage invites for collection {collection.id}.",
+            )
+
     async def _get_user_model(self, user_id: object) -> User | None:
         result = await self._session.execute(select(User).where(User.id == user_id))
         return result.scalar_one_or_none()
@@ -1059,9 +1216,14 @@ def _normalize_max_uses(max_uses: int | None) -> int | None:
 
 def _resolve_visibility(visibility: CollectionVisibility | str) -> CollectionVisibility:
     try:
-        return visibility if isinstance(visibility, CollectionVisibility) else CollectionVisibility(visibility)
+        resolved_visibility = (
+            visibility if isinstance(visibility, CollectionVisibility) else CollectionVisibility(visibility)
+        )
     except ValueError as exc:
         raise InvalidCollectionTitleError(f"Unsupported collection visibility {visibility!r}.") from exc
+    if resolved_visibility is CollectionVisibility.PUBLIC:
+        raise InvalidCollectionTitleError("Public collections are not available at launch.")
+    return resolved_visibility
 
 
 def _resolve_membership_role(role: CollectionMembershipRole | str) -> CollectionMembershipRole:
@@ -1101,11 +1263,30 @@ def _ensure_invite_can_be_used(invite: CollectionInvite) -> None:
         if expires_at.tzinfo is None:
             expires_at = expires_at.replace(tzinfo=UTC)
         if expires_at <= now:
-            invite.status = CollectionInviteStatus.EXPIRED
             raise InvalidCollectionInviteError("Invite link is invalid or expired.")
     if invite.max_uses is not None and invite.use_count >= invite.max_uses:
-        invite.status = CollectionInviteStatus.ACCEPTED
         raise InvalidCollectionInviteError("Invite link is invalid or expired.")
+
+
+def _apply_invite_terminal_status(invite: CollectionInvite) -> bool:
+    if invite.revoked_at is not None and invite.status is not CollectionInviteStatus.REVOKED:
+        invite.status = CollectionInviteStatus.REVOKED
+        return True
+    if invite.status is not CollectionInviteStatus.PENDING:
+        return False
+
+    now = datetime.now(UTC)
+    expires_at = invite.expires_at
+    if expires_at is not None:
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=UTC)
+        if expires_at <= now:
+            invite.status = CollectionInviteStatus.EXPIRED
+            return True
+    if invite.max_uses is not None and invite.use_count >= invite.max_uses:
+        invite.status = CollectionInviteStatus.ACCEPTED
+        return True
+    return False
 
 
 def _user_can_write_collection(user_id: object, collection: Collection) -> bool:

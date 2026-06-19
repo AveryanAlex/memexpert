@@ -18,6 +18,7 @@
   const href = $derived(memeHref(meme, attribution));
   const title = $derived(memeTitle(meme));
   const titleId = $derived(`meme-card-title-${meme.id}`);
+  const accessVisibility = $derived(meme.viewer_access?.visibility ?? 'public');
 </script>
 
 <article
@@ -34,6 +35,9 @@
       <div class="flex flex-wrap gap-2" aria-label="Meme metadata">
         <Badge>{meme.language}</Badge>
         <Badge>{meme.like_count} likes</Badge>
+        {#if accessVisibility !== 'public'}
+          <Badge>{accessVisibility === 'shared' ? 'Shared' : 'Private'}</Badge>
+        {/if}
         {#if meme.primary_file?.width && meme.primary_file.height}
           <Badge>{meme.primary_file.width}x{meme.primary_file.height}</Badge>
         {/if}

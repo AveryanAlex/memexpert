@@ -1224,6 +1224,99 @@ async def test_search_route_scope_collections_returns_multiple_authorized_collec
     assert event.payload["collection_ids"] == [str(owned_collection.id), str(shared_collection.id)]
 
 
+async def test_meme_detail_routes_return_authorized_private_and_shared_memes_with_markers(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    viewer = build_full_user()
+    owner = build_full_user()
+    stranger = build_full_user()
+    migrated_db_session.add_all([viewer, owner, stranger])
+    await migrated_db_session.flush()
+    owned_private = await _create_meme(
+        migrated_db_session,
+        is_public=False,
+        author_user_id=viewer.id,
+        s3_original_key="pipeline/originals/private/detail-owned.jpg",
+    )
+    shared_private = await _create_meme(
+        migrated_db_session,
+        is_public=False,
+        author_user_id=owner.id,
+        s3_original_key="pipeline/originals/private/detail-shared.jpg",
+    )
+    unauthorized_private = await _create_meme(
+        migrated_db_session,
+        is_public=False,
+        author_user_id=stranger.id,
+        s3_original_key="pipeline/originals/private/detail-hidden.jpg",
+    )
+    migrated_db_session.add(
+        MemeSeoPage(
+            meme_id=shared_private.id,
+            slug="shared-private-detail",
+            page_title="Shared Private Detail",
+            meta_description="Shared private detail.",
+            alt_text="Shared private image",
+            caption="Shared private",
+            tags=["private"],
+            model_id="test",
+            prompt_version="test-v1",
+            generated_at=datetime.now(UTC),
+        )
+    )
+    _ = await _create_collection(
+        migrated_db_session,
+        owner=owner,
+        title="Shared detail collection",
+        memberships=[(viewer, CollectionMembershipRole.VIEWER)],
+        memes=[shared_private],
+    )
+    await migrated_db_session.commit()
+    service = MemeSearchService(
+        migrated_db_session,
+        media_render_service=MediaRenderUrlService(
+            Settings.model_validate({"imgproxy_base_url": "https://img.memexpert.test"})
+        ),
+    )
+
+    _install_meme_route_overrides(app, migrated_db_session, current_user=_user_read(viewer), service=service)
+    try:
+        owned_response = await client.get(f"/api/v1/memes/{owned_private.id}")
+        shared_slug_response = await client.get("/api/v1/memes/slug/shared-private-detail")
+        hidden_response = await client.get(f"/api/v1/memes/{unauthorized_private.id}")
+    finally:
+        app.dependency_overrides.clear()
+
+    _install_meme_route_overrides(app, migrated_db_session, service=service)
+    try:
+        anonymous_shared_response = await client.get("/api/v1/memes/slug/shared-private-detail")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert owned_response.status_code == 200
+    owned_payload = owned_response.json()
+    assert owned_payload["id"] == str(owned_private.id)
+    assert owned_payload["viewer_access"] == {"visibility": "private"}
+    assert owned_payload["primary_file"]["render"]["thumbnail_url"] == (
+        f"/api/v1/media/files/{owned_private.primary_file_id}/thumbnail"
+    )
+    assert "detail-owned.jpg" not in owned_response.text
+
+    assert shared_slug_response.status_code == 200
+    shared_payload = shared_slug_response.json()
+    assert shared_payload["id"] == str(shared_private.id)
+    assert shared_payload["viewer_access"] == {"visibility": "shared"}
+    assert shared_payload["primary_file"]["render"]["preview_url"] == (
+        f"/api/v1/media/files/{shared_private.primary_file_id}/preview"
+    )
+    assert "detail-shared.jpg" not in shared_slug_response.text
+    assert hidden_response.status_code == 404
+    assert "detail-hidden.jpg" not in hidden_response.text
+    assert anonymous_shared_response.status_code == 404
+
+
 async def test_search_and_browse_routes_validate_scope_auth_and_collection_ids(
     app: FastAPI,
     client: AsyncClient,
@@ -1474,7 +1567,7 @@ async def test_guest_search_route_collections_scope_allows_favorites(
     assert str(stranger_private.id) not in private_response.text
 
 
-async def test_public_search_and_detail_do_not_emit_authenticated_private_media(
+async def test_public_search_defaults_public_but_authenticated_detail_can_return_owned_private_media(
     migrated_db_session: AsyncSession,
 ) -> None:
     owner = build_full_user()
@@ -1510,18 +1603,29 @@ async def test_public_search_and_detail_do_not_emit_authenticated_private_media(
     search_page = await service.search_public_memes("owner private", viewer_user_id=owner.id, limit=10)
     browse_page = await service.browse_public_memes(viewer_user_id=owner.id, limit=10)
     public_detail = await service.get_public_meme_detail(public_meme.id, viewer_user_id=owner.id)
+    private_detail = await service.get_public_meme_detail(private_meme.id, viewer_user_id=owner.id)
 
     assert [item.meme.id for item in search_page.items] == [public_meme.id]
     assert private_meme.id not in {item.meme.id for item in browse_page.items}
     assert public_detail.primary_file is not None
     assert public_detail.primary_file.id == public_meme.primary_file_id
+    assert public_detail.viewer_access is None
+    assert private_detail.primary_file is not None
+    assert private_detail.primary_file.id == private_meme.primary_file_id
+    assert private_detail.primary_file.render is not None
+    assert private_detail.primary_file.render.thumbnail_url == (
+        f"/api/v1/media/files/{private_meme.primary_file_id}/thumbnail"
+    )
+    assert private_detail.viewer_access is not None
+    assert private_detail.viewer_access.visibility == "private"
     with pytest.raises(MemeNotFoundError):
-        _ = await service.get_public_meme_detail(private_meme.id, viewer_user_id=owner.id)
+        _ = await service.get_public_meme_detail(private_meme.id)
 
     serialized = search_page.model_dump_json() + browse_page.model_dump_json()
     assert str(private_meme.id) not in serialized
     assert str(private_meme.primary_file_id) not in serialized
     assert "authenticated-owner.jpg" not in serialized
+    assert "authenticated-owner.jpg" not in private_detail.model_dump_json()
 
 
 async def test_search_scopes_filter_db_candidates_memberships_and_nsfw(
@@ -3037,24 +3141,40 @@ async def test_detail_route_returns_not_found_for_missing_private_or_nsfw_withou
     stranger = build_full_user(nsfw_enabled=True)
     migrated_db_session.add_all([author, stranger])
     await migrated_db_session.flush()
-    private_meme = await _create_meme(migrated_db_session, is_public=False, author_user_id=author.id)
+    private_meme = await _create_meme(
+        migrated_db_session,
+        is_public=False,
+        author_user_id=author.id,
+        s3_original_key="pipeline/originals/private/detail-author-private.jpg",
+    )
     nsfw_meme = await _create_meme(migrated_db_session, is_nsfw=True)
     missing_id = uuid.uuid4()
 
-    async def detail_status(meme_id: uuid.UUID, current_user: UserRead | None, include_nsfw: bool = False) -> int:
+    async def detail_response(meme_id: uuid.UUID, current_user: UserRead | None, include_nsfw: bool = False):
         _install_meme_route_overrides(app, migrated_db_session, current_user=current_user)
         try:
             response = await client.get(f"/api/v1/memes/{meme_id}", params={"include_nsfw": include_nsfw})
         finally:
             app.dependency_overrides.clear()
-        return response.status_code
+        return response
 
-    assert await detail_status(missing_id, None) == 404
-    assert await detail_status(private_meme.id, None) == 404
-    assert await detail_status(private_meme.id, _user_read(stranger)) == 404
-    assert await detail_status(private_meme.id, _user_read(author)) == 404
-    assert await detail_status(nsfw_meme.id, _user_read(author)) == 404
-    assert await detail_status(nsfw_meme.id, _user_read(author), include_nsfw=True) == 200
+    assert (await detail_response(missing_id, None)).status_code == 404
+    assert (await detail_response(private_meme.id, None)).status_code == 404
+    assert (await detail_response(private_meme.id, _user_read(stranger))).status_code == 404
+
+    owner_private_response = await detail_response(private_meme.id, _user_read(author))
+    assert owner_private_response.status_code == 200
+    owner_private_payload = owner_private_response.json()
+    assert owner_private_payload["id"] == str(private_meme.id)
+    assert owner_private_payload["viewer_access"] == {"visibility": "private"}
+    assert owner_private_payload["primary_file"]["render"]["thumbnail_url"] == (
+        f"/api/v1/media/files/{private_meme.primary_file_id}/thumbnail"
+    )
+    assert "detail-author-private.jpg" not in owner_private_response.text
+    assert "s3_original_key" not in owner_private_response.text
+
+    assert (await detail_response(nsfw_meme.id, _user_read(author))).status_code == 404
+    assert (await detail_response(nsfw_meme.id, _user_read(author), include_nsfw=True)).status_code == 200
 
     event = await migrated_db_session.scalar(
         select(AnalyticsEvent)

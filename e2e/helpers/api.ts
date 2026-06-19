@@ -1,4 +1,7 @@
-import { expect, type APIRequestContext } from '@playwright/test';
+import { expect, type APIRequestContext, type Page } from '@playwright/test';
+import type { SeededE2EUser } from './seed';
+
+const ACCESS_COOKIE_NAME = 'memexpert_access_token';
 
 export interface SearchItem {
   meme: { id: string; seo_page_slug: string | null; is_nsfw: boolean };
@@ -52,4 +55,51 @@ export class E2EApi {
     await expect(response).toBeOK();
     expect(await response.json()).toEqual(expect.objectContaining({ both_targets_searchable: true }));
   }
+}
+
+export async function loginViaEmail(page: Page, apiBaseUrl: string, user: SeededE2EUser) {
+  const response = await page.request.post(`${apiBaseUrl}/api/v1/auth/email/login`, {
+    data: { email: user.email, password: user.password }
+  });
+  await expect(response).toBeOK();
+
+  const accessToken = parseAccessTokenCookie(response.headers()['set-cookie']);
+  if (!accessToken) throw new Error('Email login did not return an access cookie.');
+
+  const frontendBaseUrl = process.env.E2E_FRONTEND_BASE_URL ?? 'http://frontend:3000';
+  const frontendOrigin = new URL(frontendBaseUrl).origin;
+  const origins = [...new Set([new URL(apiBaseUrl).origin, frontendOrigin])];
+  await page.context().addCookies(
+    origins.map((origin) => ({
+      name: ACCESS_COOKIE_NAME,
+      value: accessToken,
+      url: origin,
+      httpOnly: true,
+      secure: origin.startsWith('https://'),
+      sameSite: 'Lax'
+    }))
+  );
+}
+
+export async function removeCollectionMemberViaApi(
+  page: Page,
+  apiBaseUrl: string,
+  input: { collectionId: string; memberUserId: string }
+) {
+  const response = await page.request.delete(
+    `${apiBaseUrl}/api/v1/collections/${input.collectionId}/members/${input.memberUserId}`
+  );
+  await expect(response).toBeOK();
+}
+
+function parseAccessTokenCookie(setCookie: string | undefined): string | null {
+  if (!setCookie) return null;
+  const cookie = setCookie
+    .split(/,(?=\s*[^;,]+=)/)
+    .find((part) => part.trim().startsWith(`${ACCESS_COOKIE_NAME}=`));
+  if (!cookie) return null;
+
+  const firstPart = cookie.split(';', 1)[0].trim();
+  const value = firstPart.slice(ACCESS_COOKIE_NAME.length + 1);
+  return value.startsWith('"') && value.endsWith('"') ? value.slice(1, -1) : value;
 }

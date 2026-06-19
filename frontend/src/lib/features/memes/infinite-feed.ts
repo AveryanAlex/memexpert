@@ -1,4 +1,4 @@
-import type { ContentKind, ContentLanguage, PublicMemeSearchPageRead, PublicMemeSearchResultRead } from '$lib/api/types';
+import type { ContentKind, ContentLanguage, MemeSearchScope, PublicMemeSearchPageRead, PublicMemeSearchResultRead } from '$lib/api/types';
 
 export interface MemeFeedFilters {
   query: string;
@@ -6,6 +6,8 @@ export interface MemeFeedFilters {
   includeNsfw?: boolean;
   mediaType?: ContentKind | null;
   language?: ContentLanguage | null;
+  scope?: MemeSearchScope | null;
+  collectionIds?: string[];
 }
 
 export const INFINITE_FEED_OBSERVER_ROOT_MARGIN = '420px 0px';
@@ -53,6 +55,8 @@ export function memeFeedKey(filters: MemeFeedFilters): string {
     tags: filters.tags ?? [],
     includeNsfw: filters.includeNsfw,
     mediaType: filters.mediaType ?? null,
-    language: filters.language ?? null
+    language: filters.language ?? null,
+    scope: filters.scope ?? 'public',
+    collectionIds: filters.collectionIds ?? []
   });
 }

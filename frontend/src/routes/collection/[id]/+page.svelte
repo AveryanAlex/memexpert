@@ -11,6 +11,8 @@
 
   let { data, form }: { data: PageData; form?: ActionData } = $props();
 
+  let copyMessage = $state<string | null>(null);
+
   const detail = $derived(data.detail);
   const collection = $derived(detail?.collection ?? null);
   const capabilities = $derived(detail?.capabilities ?? null);
@@ -24,6 +26,16 @@
 
   function formatDate(value: string): string {
     return new Intl.DateTimeFormat('en', { dateStyle: 'medium' }).format(new Date(value));
+  }
+
+  async function copyInviteUrl(value: string) {
+    copyMessage = null;
+    try {
+      await navigator.clipboard.writeText(value);
+      copyMessage = 'Invite URL copied.';
+    } catch {
+      copyMessage = 'Could not copy automatically. Select the URL and copy it manually.';
+    }
   }
 </script>
 
@@ -72,7 +84,13 @@
     <Card class="my-4 grid gap-2" aria-labelledby="invite-created-title">
       <h2 id="invite-created-title" class="m-0 text-2xl font-black tracking-[-0.04em]">Invite link ready</h2>
       <p class="m-0 text-muted">Share this link with a full MemeXpert account. It is shown once.</p>
-      <Input value={form.inviteUrl} readonly aria-label="Invite link" />
+      <div class="grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto]">
+        <Input value={form.inviteUrl} readonly aria-label="Invite link" />
+        <Button type="button" variant="secondary" onclick={() => copyInviteUrl(form.inviteUrl)}>Copy</Button>
+      </div>
+      {#if copyMessage}
+        <p class="m-0 text-sm text-muted" role="status">{copyMessage}</p>
+      {/if}
     </Card>
   {/if}
 
@@ -131,7 +149,7 @@
         <h2 id="members-title" class="m-0 text-2xl font-black tracking-[-0.04em]">Members</h2>
         <Badge>{memberRows.length} total</Badge>
       </div>
-      <p class="m-0 text-muted">Roles reflect the existing collection access model. Role changes/removal are not exposed by the current API.</p>
+      <p class="m-0 text-muted">{capabilities.can_manage_members ? 'Owners can update non-owner roles or remove non-owner members.' : managementNotice}</p>
       {#if memberRows.length > 0}
         <div class="grid gap-2">
           {#each memberRows as member (member.id)}
@@ -140,9 +158,29 @@
                 <p class="m-0 font-black">{member.label}</p>
                 <p class="m-0 text-sm text-muted">Joined {member.joined}</p>
               </div>
-              <div class="flex flex-wrap gap-2 sm:justify-end">
-                <Badge>{member.role}</Badge>
-                {#if member.isOwner}<Badge tone="success">Owner</Badge>{/if}
+              <div class="grid gap-2 sm:justify-items-end">
+                <div class="flex flex-wrap gap-2 sm:justify-end">
+                  <Badge>{member.role}</Badge>
+                  {#if member.isOwner}<Badge tone="success">Owner</Badge>{/if}
+                </div>
+                {#if capabilities.can_manage_members && !member.isOwner}
+                  <div class="flex flex-wrap gap-2 sm:justify-end">
+                    <form class="flex flex-wrap gap-2" method="POST" action="?/updateMemberRole">
+                      <input type="hidden" name="member_user_id" value={member.id} />
+                      <Select class="min-w-[120px]" name="role" value={member.role} aria-label={`Role for ${member.label}`}>
+                        <option value="viewer">Viewer</option>
+                        <option value="editor">Editor</option>
+                      </Select>
+                      <Button size="compact" variant="secondary" type="submit">Update role</Button>
+                    </form>
+                    <form method="POST" action="?/removeMember">
+                      <input type="hidden" name="member_user_id" value={member.id} />
+                      <Button size="compact" variant="danger" type="submit">Remove</Button>
+                    </form>
+                  </div>
+                {:else if capabilities.can_manage_members && member.isOwner}
+                  <p class="m-0 text-sm text-muted">Owner transfer and owner removal are not available here.</p>
+                {/if}
               </div>
             </article>
           {/each}
@@ -157,7 +195,7 @@
         <h2 id="invites-title" class="m-0 text-2xl font-black tracking-[-0.04em]">Invites</h2>
         <Badge>{inviteRows.length} total</Badge>
       </div>
-      <p class="m-0 text-muted">Invite links can be created here when allowed. Revoking, resending, and role edits are not backed by current APIs.</p>
+      <p class="m-0 text-muted">{capabilities.can_revoke_invites ? 'Pending direct-link invites can be revoked. Accepted, revoked, and expired rows are final.' : managementNotice}</p>
       {#if inviteRows.length > 0}
         <div class="grid gap-2">
           {#each inviteRows as invite (invite.id)}
@@ -166,10 +204,20 @@
                 <p class="m-0 font-black">{invite.label}</p>
                 <div class="flex flex-wrap gap-2">
                   <Badge>{invite.role}</Badge>
-                  <Badge>{invite.status}</Badge>
+                  <Badge>{invite.statusLabel}</Badge>
                 </div>
               </div>
-              <p class="m-0 text-sm text-muted">{invite.usage} · Expires {invite.expires} · Created {invite.created}</p>
+              <div class="grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center">
+                <p class="m-0 text-sm text-muted">{invite.usage} · Expires {invite.expires} · Created {invite.created}</p>
+                {#if capabilities.can_revoke_invites && !invite.isTerminal}
+                  <form method="POST" action="?/revokeInvite">
+                    <input type="hidden" name="invite_id" value={invite.id} />
+                    <Button size="compact" variant="danger" type="submit">Revoke</Button>
+                  </form>
+                {:else if invite.isTerminal}
+                  <p class="m-0 text-sm font-extrabold text-muted">No further action</p>
+                {/if}
+              </div>
             </article>
           {/each}
         </div>

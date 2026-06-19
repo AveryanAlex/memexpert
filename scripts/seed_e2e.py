@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import sys
 import time
@@ -21,7 +22,7 @@ from PIL import Image, PngImagePlugin
 from pydantic import BaseModel, ValidationError
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.http.models import Distance, VectorParams
-from sqlalchemy import select
+from sqlalchemy import delete, or_, select, update
 
 from memexpert.core.config import Settings, get_settings
 from memexpert.core.database import get_async_session_factory
@@ -31,6 +32,7 @@ from memexpert.core.storage import get_pipeline_storage_settings, get_s3_client
 from memexpert.core.voyage import build_pipeline_voyage_client
 from memexpert.ingest.schemas import IngestRequestRead
 from memexpert.models.base import utcnow
+from memexpert.models.collection import Collection, CollectionInvite, CollectionMember, CollectionMeme, PinnedMeme
 from memexpert.models.content import (
     EmbeddingCache,
     Meme,
@@ -42,6 +44,12 @@ from memexpert.models.content import (
     PipelineStageJournal,
 )
 from memexpert.models.enums import (
+    AccountStatus,
+    CollectionInviteChannel,
+    CollectionInviteStatus,
+    CollectionKind,
+    CollectionMembershipRole,
+    CollectionVisibility,
     ContentKind,
     ContentLanguage,
     ContentPipelineStage,
@@ -53,6 +61,7 @@ from memexpert.models.enums import (
     SyncTargetKind,
     SyncTargetStatus,
 )
+from memexpert.models.user import User
 from memexpert.pipeline.outbox_runtime import PipelineOutboxPublisherBatchResult, run_pipeline_outbox_publisher_batch
 from memexpert.schemas.content_pipeline import (
     ContentPipelineErrorResponse,
@@ -81,6 +90,13 @@ E2E_SOURCE_ID: Final = "e2e-prd-seed"
 E2E_UPLOAD_SOURCE_ID: Final = "e2e-prd-upload"
 E2E_MODEL_ID: Final = "e2e-prd-seed"
 E2E_PROMPT_VERSION: Final = "e2e-prd-v1"
+E2E_ACCOUNT_PASSWORD: Final = "memexpert-e2e-password"
+E2E_ACCOUNT_PASSWORD_HASH: Final = "$2b$12$C6UzMDM.H6dfI/f/IKcEe.TaORhf.fwRuC9z.8O1TWVf5KG9lIYBS"
+E2E_OWNER_EMAIL: Final = "collection.owner.e2e@memexpert.test"
+E2E_MEMBER_EMAIL: Final = "collection.member.e2e@memexpert.test"
+E2E_COLLECTION_TITLE: Final = "Launch E2E Collection"
+E2E_COLLECTION_DESCRIPTION: Final = "Private launch fixture for collection-management E2E."
+E2E_COLLECTION_INVITE_TOKEN: Final = "memexpert-e2e-collection-invite-token"
 UUID_NAMESPACE: Final = uuid.UUID("176f5e31-6e5d-5e43-80aa-1f7aa3aa0d4b")
 TERMINAL_INGEST_FAILURE_STATUSES: Final = frozenset(
     {
@@ -123,6 +139,32 @@ class SeededMeme:
     is_nsfw: bool
     language: ContentLanguage
     media_type: ContentKind
+
+
+@dataclass(frozen=True, slots=True)
+class SeededE2EUser:
+    label: str
+    user_id: uuid.UUID
+    email: str
+    password: str
+
+
+@dataclass(frozen=True, slots=True)
+class SeededCollectionManagementFixture:
+    owner: SeededE2EUser
+    member: SeededE2EUser
+    collection_id: uuid.UUID
+    title: str
+    description: str
+    visibility: CollectionVisibility
+    saved_memes: tuple[SeededMeme, ...]
+    pinned_memes: tuple[SeededMeme, ...]
+    invite_id: uuid.UUID
+    invite_token: str
+
+    @property
+    def invite_path(self) -> str:
+        return f"/collection/invite/{self.invite_token}"
 
 
 class PipelineApiClient:
@@ -336,6 +378,17 @@ async def _run(args: argparse.Namespace) -> None:
         )
         print(f"Seeded deterministic public corpus: {', '.join(item.category for item in seeded)}")
 
+        collection_fixture = await seed_collection_management_fixture(
+            settings=settings,
+            qdrant_sync_client=qdrant_sync_client,
+            meili_client=meili_client,
+            seeded=seeded,
+        )
+        print(
+            "Seeded deterministic private collection fixture: "
+            f"collection_id={collection_fixture.collection_id} owner={collection_fixture.owner.email}",
+        )
+
         assert_created_is_distinct(created_meme_id=detail.meme_id, seeded=seeded)
         created_search_payload = api_client.public_search("cat")
         assert_public_search_contains(created_search_payload, meme_id=detail.meme_id)
@@ -351,22 +404,8 @@ async def _run(args: argparse.Namespace) -> None:
             "classification": settings.pipeline_classification_provider_mode,
             "voyage_dimensions": settings.pipeline_voyage_output_dimensions,
         },
-        "seeded_memes": [
-            {
-                "category": item.category,
-                "meme_id": str(item.meme_id),
-                "meme_file_id": str(item.meme_file_id),
-                "slug": item.slug,
-                "query": item.query,
-                "object_key": item.object_key,
-                "title": item.title,
-                "tags": list(item.tags),
-                "is_nsfw": item.is_nsfw,
-                "language": item.language.value,
-                "media_type": item.media_type.value,
-            }
-            for item in seeded
-        ],
+        "seeded_memes": [_seeded_meme_payload(item) for item in seeded],
+        "collection_management": build_collection_management_fixture_payload(collection_fixture),
         "created_meme": {
             "meme_id": str(detail.meme_id),
             "meme_file_id": str(meme_file_id),
@@ -607,6 +646,254 @@ async def seed_direct_corpus(
     return seeded
 
 
+def build_collection_management_fixture(seeded: list[SeededMeme]) -> SeededCollectionManagementFixture:
+    """Build the deterministic full-account collection fixture descriptor."""
+
+    cat = _require_seeded_category(seeded, "cat")
+    dog = _require_seeded_category(seeded, "dog")
+    return SeededCollectionManagementFixture(
+        owner=SeededE2EUser(
+            label="owner",
+            user_id=_stable_uuid("collection-management:owner:user"),
+            email=E2E_OWNER_EMAIL,
+            password=E2E_ACCOUNT_PASSWORD,
+        ),
+        member=SeededE2EUser(
+            label="member",
+            user_id=_stable_uuid("collection-management:member:user"),
+            email=E2E_MEMBER_EMAIL,
+            password=E2E_ACCOUNT_PASSWORD,
+        ),
+        collection_id=_stable_uuid("collection-management:launch:collection"),
+        title=E2E_COLLECTION_TITLE,
+        description=E2E_COLLECTION_DESCRIPTION,
+        visibility=CollectionVisibility.PRIVATE,
+        saved_memes=(cat, dog),
+        pinned_memes=(cat, dog),
+        invite_id=_stable_uuid("collection-management:launch:viewer-invite"),
+        invite_token=E2E_COLLECTION_INVITE_TOKEN,
+    )
+
+
+async def seed_collection_management_fixture(
+    *,
+    settings: Settings,
+    qdrant_sync_client: QdrantSyncClientProtocol,
+    meili_client: MeilisearchSyncClientProtocol,
+    seeded: list[SeededMeme],
+) -> SeededCollectionManagementFixture:
+    """Persist full-account users, a private collection, an invite, saves, and pins."""
+
+    fixture = build_collection_management_fixture(seeded)
+    session_factory = get_async_session_factory()
+    async with session_factory() as session:
+        await seed_collection_management_fixture_in_session(
+            session,
+            settings=settings,
+            qdrant_sync_client=qdrant_sync_client,
+            meili_client=meili_client,
+            fixture=fixture,
+        )
+        await session.commit()
+    return fixture
+
+
+async def seed_collection_management_fixture_in_session(
+    session: AsyncSession,
+    *,
+    settings: Settings,
+    qdrant_sync_client: QdrantSyncClientProtocol,
+    meili_client: MeilisearchSyncClientProtocol,
+    fixture: SeededCollectionManagementFixture,
+) -> None:
+    now = utcnow()
+    owner = User(
+        id=fixture.owner.user_id,
+        status=AccountStatus.ACTIVE,
+        email=fixture.owner.email,
+        email_verified_at=now,
+        password_hash=E2E_ACCOUNT_PASSWORD_HASH,
+        nsfw_enabled=False,
+    )
+    member = User(
+        id=fixture.member.user_id,
+        status=AccountStatus.ACTIVE,
+        email=fixture.member.email,
+        email_verified_at=now,
+        password_hash=E2E_ACCOUNT_PASSWORD_HASH,
+        nsfw_enabled=False,
+    )
+    session.add_all([owner, member])
+    await session.flush()
+
+    collection = Collection(
+        id=fixture.collection_id,
+        owner_id=fixture.owner.user_id,
+        title=fixture.title,
+        description=fixture.description,
+        kind=CollectionKind.CUSTOM,
+        visibility=fixture.visibility,
+    )
+    session.add(collection)
+    await session.flush()
+    owner.active_save_collection_id = collection.id
+
+    session.add_all(
+        [
+            CollectionMember(
+                collection_id=collection.id,
+                user_id=fixture.owner.user_id,
+                role=CollectionMembershipRole.OWNER,
+            ),
+            CollectionInvite(
+                id=fixture.invite_id,
+                collection_id=collection.id,
+                created_by_user_id=fixture.owner.user_id,
+                token_hash=_collection_invite_token_hash(fixture.invite_token),
+                role=CollectionMembershipRole.VIEWER,
+                channel=CollectionInviteChannel.DIRECT_LINK,
+                label="E2E viewer invite",
+                status=CollectionInviteStatus.PENDING,
+                max_uses=None,
+                use_count=0,
+                expires_at=None,
+            ),
+            *(
+                CollectionMeme(
+                    collection_id=collection.id,
+                    meme_id=meme.meme_id,
+                    added_by_user_id=fixture.owner.user_id,
+                    added_at=now,
+                )
+                for meme in fixture.saved_memes
+            ),
+            *(
+                PinnedMeme(
+                    user_id=fixture.owner.user_id,
+                    meme_id=meme.meme_id,
+                    position=index,
+                    pinned_at=now,
+                )
+                for index, meme in enumerate(fixture.pinned_memes, start=1)
+            ),
+        ],
+    )
+    await session.flush()
+
+    for meme in fixture.saved_memes:
+        await _resync_seeded_meme_indexes_for_collection_fixture(
+            session,
+            settings=settings,
+            qdrant_sync_client=qdrant_sync_client,
+            meili_client=meili_client,
+            meme=meme,
+            now=now,
+        )
+
+
+async def _resync_seeded_meme_indexes_for_collection_fixture(
+    session: AsyncSession,
+    *,
+    settings: Settings,
+    qdrant_sync_client: QdrantSyncClientProtocol,
+    meili_client: MeilisearchSyncClientProtocol,
+    meme: SeededMeme,
+    now: datetime,
+) -> None:
+    loaded_index_state = await load_search_index_state(
+        session,
+        meme.meme_file_id,
+        vector_dimensions=settings.pipeline_voyage_output_dimensions,
+    )
+    if loaded_index_state.vector is None:
+        raise E2ESeedError(f"Seeded collection meme file {meme.meme_file_id} has no embedding vector.")
+
+    qdrant_payload = build_qdrant_sync_payload(loaded_index_state.canonical)
+    meili_document = build_meilisearch_document(loaded_index_state.canonical)
+    await qdrant_sync_client.upsert_meme_point(qdrant_payload, loaded_index_state.vector)
+    await meili_client.upsert_document(meili_document)
+    await _upsert_sync_snapshot(
+        session,
+        meme_file_id=meme.meme_file_id,
+        target=SyncTargetKind.QDRANT,
+        preview={
+            "meme_id": str(qdrant_payload.meme_id),
+            "search_index_algorithm_version": qdrant_payload.search_index_algorithm_version,
+            "is_public": qdrant_payload.is_public,
+            "collection_ids": list(qdrant_payload.collection_ids),
+        },
+        now=now,
+    )
+    await _upsert_sync_snapshot(
+        session,
+        meme_file_id=meme.meme_file_id,
+        target=SyncTargetKind.MEILISEARCH,
+        preview={
+            "id": meili_document.id,
+            "search_index_algorithm_version": meili_document.search_index_algorithm_version,
+            "is_public": meili_document.is_public,
+            "collection_ids": list(meili_document.collection_ids),
+        },
+        now=now,
+    )
+
+
+def build_collection_management_fixture_payload(fixture: SeededCollectionManagementFixture) -> dict[str, Any]:
+    return {
+        "owner": _seeded_e2e_user_payload(fixture.owner),
+        "member": _seeded_e2e_user_payload(fixture.member),
+        "collection": {
+            "id": str(fixture.collection_id),
+            "title": fixture.title,
+            "description": fixture.description,
+            "visibility": fixture.visibility.value,
+        },
+        "invite": {
+            "id": str(fixture.invite_id),
+            "token": fixture.invite_token,
+            "join_path": fixture.invite_path,
+        },
+        "saved_memes": [_seeded_meme_payload(item) for item in fixture.saved_memes],
+        "pinned_memes": [_seeded_meme_payload(item) for item in fixture.pinned_memes],
+    }
+
+
+def _seeded_e2e_user_payload(user: SeededE2EUser) -> dict[str, str]:
+    return {
+        "label": user.label,
+        "user_id": str(user.user_id),
+        "email": user.email,
+        "password": user.password,
+    }
+
+
+def _seeded_meme_payload(item: SeededMeme) -> dict[str, object]:
+    return {
+        "category": item.category,
+        "meme_id": str(item.meme_id),
+        "meme_file_id": str(item.meme_file_id),
+        "slug": item.slug,
+        "query": item.query,
+        "object_key": item.object_key,
+        "title": item.title,
+        "tags": list(item.tags),
+        "is_nsfw": item.is_nsfw,
+        "language": item.language.value,
+        "media_type": item.media_type.value,
+    }
+
+
+def _require_seeded_category(seeded: list[SeededMeme], category: str) -> SeededMeme:
+    for item in seeded:
+        if item.category == category:
+            return item
+    raise E2ESeedError(f"Seeded corpus did not include required {category!r} fixture.")
+
+
+def _collection_invite_token_hash(token: str) -> str:
+    return hashlib.sha256(token.strip().encode("utf-8")).hexdigest()
+
+
 def build_seed_specs() -> list[SeedSpec]:
     return [
         SeedSpec(
@@ -661,6 +948,8 @@ async def cleanup_e2e_rows(*, settings: Settings, specs: list[SeedSpec]) -> None
 
 
 async def cleanup_seed_rows(session: AsyncSession, *, settings: Settings, specs: list[SeedSpec]) -> None:
+    await cleanup_collection_management_fixture_rows(session)
+
     source_result = await session.execute(
         select(MemeSource).where(MemeSource.source_id.in_([E2E_SOURCE_ID, E2E_UPLOAD_SOURCE_ID])),
     )
@@ -695,6 +984,43 @@ async def cleanup_seed_rows(session: AsyncSession, *, settings: Settings, specs:
         )
         for cache_row in result.scalars():
             await session.delete(cache_row)
+    await session.flush()
+
+
+async def cleanup_collection_management_fixture_rows(session: AsyncSession) -> None:
+    user_ids = [
+        _stable_uuid("collection-management:owner:user"),
+        _stable_uuid("collection-management:member:user"),
+    ]
+    collection_id = _stable_uuid("collection-management:launch:collection")
+    collection_ids_result = await session.execute(
+        select(Collection.id).where(or_(Collection.id == collection_id, Collection.owner_id.in_(user_ids))),
+    )
+    collection_ids = list(collection_ids_result.scalars())
+
+    await session.execute(
+        update(User)
+        .where(
+            or_(
+                User.id.in_(user_ids),
+                User.email.in_([E2E_OWNER_EMAIL, E2E_MEMBER_EMAIL]),
+                User.active_save_collection_id.in_(collection_ids),
+            ),
+        )
+        .values(active_save_collection_id=None),
+    )
+    await session.execute(delete(PinnedMeme).where(PinnedMeme.user_id.in_(user_ids)))
+
+    collections_result = await session.execute(select(Collection).where(Collection.id.in_(collection_ids)))
+    for collection in collections_result.scalars():
+        await session.delete(collection)
+    await session.flush()
+
+    users_result = await session.execute(
+        select(User).where(or_(User.id.in_(user_ids), User.email.in_([E2E_OWNER_EMAIL, E2E_MEMBER_EMAIL]))),
+    )
+    for user in users_result.scalars():
+        await session.delete(user)
     await session.flush()
 
 

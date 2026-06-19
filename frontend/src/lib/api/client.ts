@@ -12,12 +12,16 @@ import type {
   AdminSourceChannelRead,
   ChannelSuggestionRead,
   CollectionInviteLinkRead,
+  CollectionInviteRead,
+  CollectionMemberRead,
   CollectionMembershipRole,
   CollectionVisibility,
   ContentKind,
   ContentLanguage,
   CurrentSessionRead,
   MemeLibraryRead,
+  MemeSearchScope,
+  PinnedMemeRead,
   PublicMemeDetailRead,
   PublicMemeLandingRead,
   PublicMemePopularitySummaryRead,
@@ -59,6 +63,8 @@ interface PageRequest extends CatalogRequest {
   includeNsfw?: boolean;
   mediaType?: ContentKind | null;
   language?: ContentLanguage | null;
+  scope?: MemeSearchScope | null;
+  collectionIds?: string[];
   limit: number;
   offset: number;
 }
@@ -148,6 +154,14 @@ export interface CollectionInvitePayload {
   expires_in_hours?: number | null;
 }
 
+export interface CollectionMemberRolePayload {
+  role: Exclude<CollectionMembershipRole, 'owner'>;
+}
+
+export interface PinReorderPayload {
+  meme_ids: string[];
+}
+
 export interface UserPreferencesUpdate {
   nsfw_enabled?: boolean;
   language?: UserLanguage;
@@ -198,6 +212,19 @@ export async function fetchMemePage(request: PageRequest): Promise<PublicMemeSea
 
   if (request.language) {
     params.set('language', request.language);
+  }
+
+  if (request.scope) {
+    params.set('scope', request.scope);
+  }
+
+  if (request.scope === 'collections') {
+    for (const collectionId of request.collectionIds ?? []) {
+      const normalized = collectionId.trim();
+      if (normalized) {
+        params.append('collection_ids', normalized);
+      }
+    }
   }
 
   if (query) {
@@ -360,6 +387,32 @@ export async function createCollectionInvite(
   return apiWrite<CollectionInviteLinkRead>(`/api/v1/collections/${encodeURIComponent(request.collectionId)}/invites`, 'POST', request);
 }
 
+export async function revokeCollectionInvite(request: CatalogRequest & { collectionId: string; inviteId: string }): Promise<CollectionInviteRead> {
+  return apiWrite<CollectionInviteRead>(
+    `/api/v1/collections/${encodeURIComponent(request.collectionId)}/invites/${encodeURIComponent(request.inviteId)}`,
+    'DELETE',
+    request
+  );
+}
+
+export async function updateCollectionMemberRole(
+  request: CatalogRequest & { collectionId: string; memberUserId: string; body: CollectionMemberRolePayload }
+): Promise<CollectionMemberRead> {
+  return apiWrite<CollectionMemberRead>(
+    `/api/v1/collections/${encodeURIComponent(request.collectionId)}/members/${encodeURIComponent(request.memberUserId)}`,
+    'PATCH',
+    request
+  );
+}
+
+export async function removeCollectionMember(request: CatalogRequest & { collectionId: string; memberUserId: string }): Promise<RemoveActionResponse> {
+  return apiWrite<RemoveActionResponse>(
+    `/api/v1/collections/${encodeURIComponent(request.collectionId)}/members/${encodeURIComponent(request.memberUserId)}`,
+    'DELETE',
+    request
+  );
+}
+
 export async function joinCollectionInvite(request: CatalogRequest & { token: string }): Promise<WebCollectionSummaryRead> {
   return apiWrite<WebCollectionSummaryRead>(`/api/v1/collections/invites/${encodeURIComponent(request.token)}/join`, 'POST', request);
 }
@@ -385,6 +438,10 @@ export async function pinMeme(request: MemeActionRequest): Promise<unknown> {
 
 export async function unpinMeme(request: MemeActionRequest): Promise<RemoveActionResponse> {
   return apiMutation(`/api/v1/memes/${encodeURIComponent(request.memeId)}/pin`, 'DELETE', request);
+}
+
+export async function reorderPins(request: CatalogRequest & { body: PinReorderPayload }): Promise<PinnedMemeRead[]> {
+  return apiWrite<PinnedMemeRead[]>('/api/v1/memes/pins/reorder', 'PUT', request);
 }
 
 export async function reportMeme(request: MemeReportRequest): Promise<MemeReportRead> {

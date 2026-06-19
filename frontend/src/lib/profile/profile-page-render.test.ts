@@ -65,6 +65,10 @@ describe('/profile page', () => {
 
     expect(body).toContain('Favorite reaction');
     expect(body).toContain('Pinned reply');
+    expect(body).toContain('Pin order');
+    expect(body).toContain('Up');
+    expect(body).toContain('Down');
+    expect(body).toContain('Bulk actions');
     expect(body).toContain('Team saves');
     expect(body).toContain('Shared jokes');
     expect(body).toContain('Active save');

@@ -374,12 +374,18 @@ class MemeSearchService:
         viewer_user_id: uuid.UUID | None = None,
         include_nsfw: bool = False,
     ) -> PublicMemeDetailRead:
-        meme = await self._load_public_meme_by_id(meme_id, include_nsfw=include_nsfw)
+        meme = await self._load_public_or_authorized_meme_by_id(
+            meme_id,
+            viewer_user_id=viewer_user_id,
+            include_nsfw=include_nsfw,
+        )
         action_state = await self._load_viewer_action_state((meme.id,), viewer_user_id=viewer_user_id)
-        return _to_public_detail_read(
+        viewer_access = await self._load_detail_viewer_access_marker(meme, viewer_user_id=viewer_user_id)
+        return _to_authorized_detail_read(
             meme,
             media_render_service=self._media_render_service,
             viewer_action_state=action_state,
+            viewer_access=viewer_access,
         )
 
     async def get_public_meme_detail_by_slug(
@@ -389,15 +395,18 @@ class MemeSearchService:
         viewer_user_id: uuid.UUID | None = None,
         include_nsfw: bool = False,
     ) -> PublicMemeDetailRead:
-        meme = await self._load_public_meme_by_slug(
+        meme = await self._load_public_or_authorized_meme_by_slug(
             slug,
+            viewer_user_id=viewer_user_id,
             include_nsfw=include_nsfw,
         )
         action_state = await self._load_viewer_action_state((meme.id,), viewer_user_id=viewer_user_id)
-        return _to_public_detail_read(
+        viewer_access = await self._load_detail_viewer_access_marker(meme, viewer_user_id=viewer_user_id)
+        return _to_authorized_detail_read(
             meme,
             media_render_service=self._media_render_service,
             viewer_action_state=action_state,
+            viewer_access=viewer_access,
         )
 
     async def get_public_similar_memes(
@@ -1090,6 +1099,21 @@ class MemeSearchService:
             raise MemeNotFoundError("Meme was not found or is not publicly visible.")
         return meme
 
+    async def _load_public_or_authorized_meme_by_id(
+        self,
+        meme_id: uuid.UUID,
+        *,
+        viewer_user_id: uuid.UUID | None,
+        include_nsfw: bool,
+    ) -> Meme:
+        if viewer_user_id is None:
+            return await self._load_public_meme_by_id(meme_id, include_nsfw=include_nsfw)
+        return await self._load_visible_meme_by_id(
+            meme_id,
+            viewer_user_id=viewer_user_id,
+            include_nsfw=include_nsfw,
+        )
+
     async def _load_public_meme_by_slug(
         self,
         slug: str,
@@ -1104,6 +1128,21 @@ class MemeSearchService:
         if meme is None:
             raise MemeNotFoundError("Meme slug was not found or is not publicly visible.")
         return meme
+
+    async def _load_public_or_authorized_meme_by_slug(
+        self,
+        slug: str,
+        *,
+        viewer_user_id: uuid.UUID | None,
+        include_nsfw: bool,
+    ) -> Meme:
+        if viewer_user_id is None:
+            return await self._load_public_meme_by_slug(slug, include_nsfw=include_nsfw)
+        return await self._load_visible_meme_by_slug(
+            slug,
+            viewer_user_id=viewer_user_id,
+            include_nsfw=include_nsfw,
+        )
 
     async def _qdrant_similar_candidates(
         self,
@@ -1438,6 +1477,21 @@ class MemeSearchService:
                 visibility = collection_access.get(meme.id, PublicMemeViewerAccess.PRIVATE)
             markers[meme.id] = PublicMemeViewerAccessRead(visibility=visibility)
         return markers
+
+    async def _load_detail_viewer_access_marker(
+        self,
+        meme: Meme,
+        *,
+        viewer_user_id: uuid.UUID | None,
+    ) -> PublicMemeViewerAccessRead | None:
+        if viewer_user_id is None or meme.is_public:
+            return None
+        markers = await self._load_viewer_access_markers(
+            (meme,),
+            viewer_user_id=viewer_user_id,
+            filters=MemeSearchFilters(scope=MemeSearchScope.ALL),
+        )
+        return markers.get(meme.id)
 
     async def _load_collection_access_markers(
         self,
@@ -2092,6 +2146,44 @@ def _to_public_detail_read(
         seo_generated_at=meme.seo_page.generated_at if meme.seo_page else None,
         files=[
             _to_public_file_read(file, context=context, media_render_service=media_render_service)
+            for file in meme.files
+        ],
+    )
+
+
+def _to_authorized_detail_read(
+    meme: Meme,
+    *,
+    media_render_service: MediaRenderUrlService,
+    viewer_action_state: _ViewerMemeActionState | None = None,
+    viewer_access: PublicMemeViewerAccessRead | None = None,
+) -> PublicMemeDetailRead:
+    card = _to_authorized_card_read(
+        meme,
+        media_render_service=media_render_service,
+        viewer_action_state=viewer_action_state,
+        viewer_access=viewer_access,
+    )
+    seo_slug = meme.seo_page.slug if meme.seo_page else None
+    caption = meme.seo_page.caption if meme.seo_page else None
+    context = PublicMediaRenderContext(meme_id=meme.id, seo_slug=seo_slug, caption=caption)
+    return PublicMemeDetailRead(
+        **card.model_dump(),
+        ocr_text=meme.ocr_text,
+        seo_title=meme.seo_page.page_title if meme.seo_page else None,
+        seo_description=meme.seo_page.meta_description if meme.seo_page else None,
+        seo_alt_text=meme.seo_page.alt_text if meme.seo_page else None,
+        seo_body_text=meme.seo_page.body_text if meme.seo_page else None,
+        seo_model_id=meme.seo_page.model_id if meme.seo_page else None,
+        seo_prompt_version=meme.seo_page.prompt_version if meme.seo_page else None,
+        seo_generated_at=meme.seo_page.generated_at if meme.seo_page else None,
+        files=[
+            _to_authorized_file_read(
+                file,
+                context=context,
+                media_render_service=media_render_service,
+                is_public_meme=meme.is_public,
+            )
             for file in meme.files
         ],
     )

@@ -146,6 +146,8 @@ function collectionList(): WebCollectionListRead {
         can_rename: collection.role === 'owner',
         can_delete: collection.role === 'owner',
         can_create_invites: collection.role === 'owner',
+        can_revoke_invites: collection.can_write,
+        can_manage_members: collection.role === 'owner',
         can_set_active_save: collection.can_write
       },
       active_save_collection_id: favorite.id
