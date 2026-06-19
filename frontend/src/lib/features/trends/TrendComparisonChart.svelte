@@ -30,7 +30,7 @@
 
   const plottedSeries: TrendComparisonSeries[] = $derived(
     series
-      .filter((item) => item.points.length > 0)
+      .filter((item) => item.points.length >= 2)
       .map((item, seriesIndex) => ({
         ...item,
         color: chartSeriesPalette[seriesIndex % chartSeriesPalette.length],
@@ -75,8 +75,8 @@
   label="Trend comparison line chart"
   description="Compare available real trend points across the selected memes, tags, and templates."
   empty={plottedSeries.length === 0}
-  emptyTitle="No comparison points yet"
-  emptyMessage="No real comparison points are available for the selected items yet."
+  emptyTitle="No comparable history yet"
+  emptyMessage="Full comparison lines require at least two real points per item. Current-only aggregate fallbacks remain available in the table."
   size="tall"
   footer={plottedSeries.length > 0 ? footer : undefined}
 >
