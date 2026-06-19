@@ -95,9 +95,14 @@ test('guest explores seeded public trend aggregates, comparison, and timeline', 
 
   await page.goto(trends.timeline.path);
   await expect(page.getByRole('heading', { name: 'Meme timeline.' })).toBeVisible();
-  await expect(page.getByRole('heading', { name: trends.timeline.period_label })).toBeVisible();
-  await expect(page.getByText(`${trends.timeline.snapshot_count} real snapshots`)).toBeVisible();
-  await expect(page.getByText(trends.timeline.period, { exact: true })).toBeVisible();
+  const timelinePeriod = page
+    .getByRole('region', { name: 'Timeline periods' })
+    .locator('section')
+    .filter({ has: page.getByRole('heading', { name: trends.timeline.period_label }) });
+  await expect(timelinePeriod).toHaveCount(1);
+  await expect(timelinePeriod.getByRole('heading', { name: trends.timeline.period_label })).toBeVisible();
+  await expect(timelinePeriod.getByText(new RegExp(`\\b${trends.timeline.snapshot_count} source checks\\b`))).toBeVisible();
+  await expect(timelinePeriod.getByText(trends.timeline.period, { exact: true })).toBeVisible();
   await expect(page.getByRole('link', { name: `Open ${representative.title}` }).first()).toBeVisible();
 });
 
