@@ -83,6 +83,7 @@
   initialError={data.errorMessage}
   emptyMessage="Try a shorter phrase, a different synonym, or clear the search box to browse."
   bulk={{ enabled: true, saveEnabled: true, collectionOptions: bulkOptions, guidance: bulkGuidance }}
+  showAccessMarkers={Boolean(data.session)}
 >
   {#snippet summary()}
     <p class="m-0 text-muted">

@@ -26,16 +26,22 @@
   let pendingSearchHref = $state<string | null>(null);
   let nsfwGatePending = $state(false);
   let nsfwGateMessage = $state<string | null>(null);
+  let selectedScopeOverride = $state<MemeSearchScope | null>(null);
+  let syncedScope = $state<MemeSearchScope | null>(null);
 
   const bulkOptions = $derived(collectionListBulkOptions(data.collections));
   const bulkGuidance = $derived(bulkGuidanceFromSessionAndCollections(data.session ?? null, bulkOptions));
   const searchCollectionOptions = $derived(data.collections?.collections.filter((item) => item.capabilities.can_view) ?? []);
   const selectedCollectionSet = $derived(new Set(data.filters.collectionIds));
+  const selectedScope = $derived(selectedScopeOverride ?? data.filters.scope);
+  const collectionScopeActive = $derived(selectedScope === 'collections');
   const selectedCollectionTitles = $derived(
     searchCollectionOptions
       .filter((item) => selectedCollectionSet.has(item.collection.id))
       .map((item) => item.collection.title)
   );
+  const selectedCollectionCount = $derived(data.filters.scope === 'collections' ? data.filters.collectionIds.length : 0);
+  const unknownSelectedCollectionCount = $derived(Math.max(0, selectedCollectionCount - selectedCollectionTitles.length));
   const loadingSearch = $derived(navigating.to?.url.pathname === '/search');
   const shouldConfirmNsfw = $derived(data.session?.user.nsfw_enabled === false);
   const nsfwRequestedButDisabled = $derived(data.filters.includeNsfw && data.session?.user.nsfw_enabled !== true);
@@ -47,6 +53,13 @@
       (data.filters.scope !== 'public' ? 1 : 0) +
       (data.filters.scope === 'collections' ? data.filters.collectionIds.length : 0)
   );
+
+  $effect(() => {
+    if (syncedScope !== data.filters.scope) {
+      syncedScope = data.filters.scope;
+      selectedScopeOverride = null;
+    }
+  });
 
   function tagHref(tag: string): string {
     const selected = data.filters.tags.includes(tag);
@@ -173,41 +186,76 @@
         <option value="true">Include NSFW</option>
       </Select>
     </FormRow>
-    <FormRow label="Tags / categories" class="md:col-span-4">
+    <FormRow label="Tags / categories" class="md:col-span-5">
       <Input name="tags" placeholder="reaction, wholesome, work" value={data.filters.tags.join(', ')} />
     </FormRow>
-    <FormRow label="Search scope" class="md:col-span-2">
-      <Select name="scope" value={data.filters.scope}>
+    <fieldset class="grid gap-3 md:col-span-5" aria-describedby="search-scope-help">
+      <legend class="font-extrabold text-chiptext">Search scope</legend>
+      <p id="search-scope-help" class="m-0 text-sm text-muted">Choose which accessible meme pool this URL should search.</p>
+      <div class="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
         {#each SEARCH_SCOPE_OPTIONS as option}
-          <option value={option.value}>{option.label}</option>
+          <label class={selectedScope === option.value ? 'grid grid-cols-[auto_minmax(0,1fr)] gap-3 rounded-[22px] border border-ink bg-soft p-3 text-ink shadow-warm' : 'grid grid-cols-[auto_minmax(0,1fr)] gap-3 rounded-[22px] border border-line bg-paper p-3 text-ink'}>
+            <input class="mt-1 accent-ink" type="radio" name="scope" value={option.value} checked={selectedScope === option.value} onchange={() => (selectedScopeOverride = option.value)} />
+            <span class="grid gap-1">
+              <span class="font-extrabold leading-tight">{option.label}</span>
+              <span class="text-sm font-normal leading-snug text-muted">{option.description}</span>
+            </span>
+          </label>
         {/each}
-      </Select>
-    </FormRow>
-    <div class="grid gap-2 md:col-span-3">
-      <p class="m-0 text-sm font-extrabold text-chiptext">Specific collections</p>
+      </div>
+    </fieldset>
+
+    <fieldset class={collectionScopeActive ? 'grid gap-3 rounded-[24px] border border-line bg-cream/70 p-4 md:col-span-5' : 'grid gap-3 rounded-[24px] border border-line bg-paper p-4 md:col-span-5'} aria-describedby="collection-filter-help collection-filter-state">
+      <legend class="px-1 text-sm font-extrabold text-chiptext">Specific collections</legend>
+      <p id="collection-filter-help" class="m-0 text-sm text-muted">These checkboxes submit as <code>collection_ids</code> and apply only with the Specific collections scope.</p>
+
+      {#if data.collectionErrorMessage}
+        <Notice tone="danger" role="status" class="my-0">{data.collectionErrorMessage}</Notice>
+      {/if}
+
       {#if searchCollectionOptions.length > 0}
-        <div class="flex flex-wrap gap-2" aria-label="Collection filters">
+        <div class="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
           {#each searchCollectionOptions as item (item.collection.id)}
-            <label class="inline-flex items-center gap-2 rounded-full border border-line bg-paper px-4 py-2 text-sm font-extrabold text-ink">
+            {@const metaId = `collection-filter-${item.collection.id}-meta`}
+            <label class={selectedCollectionSet.has(item.collection.id) ? 'grid grid-cols-[auto_minmax(0,1fr)] gap-2 rounded-[18px] border border-ink bg-soft px-3 py-2 text-sm text-ink' : 'grid grid-cols-[auto_minmax(0,1fr)] gap-2 rounded-[18px] border border-line bg-paper px-3 py-2 text-sm text-ink'}>
               <input
+                class="mt-1 accent-ink"
                 type="checkbox"
                 name="collection_ids"
                 value={item.collection.id}
                 checked={selectedCollectionSet.has(item.collection.id)}
+                aria-describedby={metaId}
               />
-              {item.collection.title}
-              <span class="text-muted">{item.viewer_role}</span>
+              <span class="grid min-w-0 gap-0.5">
+                <span class="truncate font-extrabold">{item.collection.title}</span>
+                <span id={metaId} class="text-xs font-normal uppercase tracking-[0.12em] text-muted">{item.collection.kind} · {item.viewer_role}</span>
+              </span>
             </label>
           {/each}
         </div>
-        <p class="m-0 text-sm text-muted">Collection selections apply when Search scope is set to Specific collections.</p>
-      {:else if data.session}
-        <p class="m-0 text-sm text-muted">Readable collections will appear here after your collection list loads.</p>
+        <p id="collection-filter-state" class="m-0 text-sm text-muted">
+          {#if collectionScopeActive}
+            {selectedCollectionCount > 0 ? `${selectedCollectionCount} selected from the current URL. Update selections, then Search.` : 'Select one or more readable collections, then Search.'}
+          {:else}
+            Choose Specific collections above to enable collection filters.
+          {/if}
+        </p>
       {:else}
-        <p class="m-0 text-sm text-muted">Sign in or keep browsing public memes. Collection filters require an account session.</p>
+        <p id="collection-filter-state" class="m-0 text-sm text-muted">
+          {#if data.collectionErrorMessage}
+            Collection choices could not load; text, tag, scope, media, language, and NSFW filters still work.
+          {:else if data.session && data.collections}
+            No readable collections are available for this session yet.
+          {:else if data.session}
+            Collection choices are unavailable right now. Search public/private/all scopes or retry shortly.
+          {:else}
+            Sign in to load collection choices. Public search remains available.
+          {/if}
+        </p>
       {/if}
-    </div>
-    <div class="flex items-end">
+    </fieldset>
+
+    <div class="flex items-end md:col-span-5 md:justify-end">
       <Button class="w-full" type="submit">Search</Button>
     </div>
   </form>
@@ -262,6 +310,7 @@
   label="Search results"
   emptyMessage="Try a shorter phrase, remove a tag, or broaden media and language filters."
   bulk={{ enabled: true, saveEnabled: true, collectionOptions: bulkOptions, guidance: bulkGuidance }}
+  showAccessMarkers={Boolean(data.session)}
 >
   {#snippet summary()}
     {#if data.filters.query}
@@ -280,6 +329,9 @@
       {#each selectedCollectionTitles as title}
         <Badge>{title}</Badge>
       {/each}
+      {#if unknownSelectedCollectionCount > 0}
+        <Badge>{unknownSelectedCollectionCount} selected collection{unknownSelectedCollectionCount === 1 ? '' : 's'}</Badge>
+      {/if}
     {/if}
   {/snippet}
   {#snippet emptyAction()}

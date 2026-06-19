@@ -53,7 +53,7 @@
   <section class="grid grid-cols-1 gap-4 md:grid-cols-3" aria-label="Trend ranked memes">
     {#each data.page.items as item (item.meme.id)}
       <Card class="grid gap-3 p-4 shadow-none">
-        <MemeCard meme={item.meme} />
+        <MemeCard meme={item.meme} showAccessMarkers={Boolean(data.session)} />
         <TrendSummary trend={item.trend} />
       </Card>
     {/each}

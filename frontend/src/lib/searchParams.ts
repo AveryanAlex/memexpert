@@ -12,10 +12,10 @@ export interface SearchRouteState {
 }
 
 export const SEARCH_SCOPE_OPTIONS: Array<{ value: MemeSearchScope; label: string; description: string }> = [
-  { value: 'public', label: 'Public catalog', description: 'Only public memes.' },
-  { value: 'private', label: 'My private saves', description: 'Private memes visible to this account.' },
-  { value: 'all', label: 'All I can access', description: 'Public, private, and shared memes visible to this account.' },
-  { value: 'collections', label: 'Specific collections', description: 'Limit results to selected readable collections.' }
+  { value: 'public', label: 'Public catalog', description: 'Search only memes anyone can open.' },
+  { value: 'private', label: 'My private saves', description: 'Search private memes attached to this session.' },
+  { value: 'all', label: 'All I can access', description: 'Blend public results with private and shared memes you can view.' },
+  { value: 'collections', label: 'Specific collections', description: 'Search only memes saved in the readable collections selected below.' }
 ];
 
 export const MEDIA_TYPE_OPTIONS: Array<{ value: ContentKind; label: string }> = [

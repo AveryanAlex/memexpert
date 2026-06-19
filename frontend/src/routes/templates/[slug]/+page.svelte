@@ -39,7 +39,7 @@
   </Card>
 
   {#if page.items.length > 0}
-    <MemeGrid {memes} label="Template memes" />
+    <MemeGrid {memes} label="Template memes" showAccessMarkers={Boolean(data.session)} />
   {:else}
     <EmptyState title="No public memes yet" message="This template exists, but there are no visible memes on this page." />
   {/if}

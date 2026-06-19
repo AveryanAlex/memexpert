@@ -19,12 +19,14 @@
     memes,
     label = 'Meme results',
     attributions = {},
-    bulk = { enabled: false }
+    bulk = { enabled: false },
+    showAccessMarkers = false
   }: {
     memes: PublicMemeCardRead[];
     label?: string;
     attributions?: Record<string, MemeResultAttributionRead | null | undefined>;
     bulk?: MemeGridBulkOptions;
+    showAccessMarkers?: boolean;
   } = $props();
 
   let selectedIds = $state<string[]>([]);
@@ -269,7 +271,7 @@
               Select
             </label>
           {/if}
-          <MemeCard {meme} {attribution} position={memePositions.get(meme.id)} total={memes.length} />
+          <MemeCard {meme} {attribution} position={memePositions.get(meme.id)} total={memes.length} {showAccessMarkers} />
         </div>
       {/each}
     </div>

@@ -1,5 +1,8 @@
 import { expect, test } from '@playwright/test';
 
+const seededCollectionId = 'smoke-private-team-saves';
+const seededCollectionQuery = 'vault reaction';
+
 test.describe('public masonry feed smoke', () => {
   test('desktop feed keeps keyboard order and accessible Load more', async ({ page }) => {
     await page.setViewportSize({ width: 1280, height: 900 });
@@ -68,6 +71,46 @@ test('search result opens detail with media and actions', async ({ page }) => {
   await expect(page.getByRole('button', { name: 'Pin', exact: true })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Meme actions' })).toBeVisible();
 });
+
+test.describe('collection-scoped search smoke', () => {
+  test('authorized user can search a seeded private shared collection', async ({ baseURL, page }) => {
+    await page.context().addCookies([
+      {
+        name: 'memexpert_access_token',
+        value: 'miniapp-full',
+        url: baseURL ?? 'http://127.0.0.1:4174',
+        httpOnly: true,
+        sameSite: 'Lax'
+      }
+    ]);
+
+    await page.goto(collectionSearchPath());
+
+    await expect(page.getByRole('radio', { name: /Specific collections/ })).toBeChecked();
+    await expect(page.getByRole('checkbox', { name: /Smoke private team saves/ })).toBeChecked();
+    await expect(page.getByText('1 selected from the current URL')).toBeVisible();
+    await expect(page.getByRole('link', { name: 'Open Smoke test vault reaction' })).toBeVisible();
+    await expect(page.getByText('Shared', { exact: true })).toBeVisible();
+  });
+
+  test('anonymous user cannot see the same seeded collection result', async ({ page }) => {
+    await page.goto(collectionSearchPath());
+
+    await expect(page.getByRole('link', { name: 'Open Smoke test vault reaction' })).toHaveCount(0);
+    await expect(page.getByText('Sign in with access to this collection to search it.')).toBeVisible();
+    await expect(page.getByText('Sign in to load collection choices. Public search remains available.')).toBeVisible();
+    await expect(page.getByText('Showing 0 of 0')).toBeVisible();
+  });
+});
+
+function collectionSearchPath() {
+  const params = new URLSearchParams({
+    scope: 'collections',
+    collection_ids: seededCollectionId,
+    q: seededCollectionQuery
+  });
+  return `/search?${params.toString()}`;
+}
 
 async function tabUntilFocused(page: import('@playwright/test').Page, locator: import('@playwright/test').Locator) {
   for (let attempt = 0; attempt < 20; attempt += 1) {
