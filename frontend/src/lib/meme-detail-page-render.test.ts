@@ -28,6 +28,7 @@ describe('/memes/[id] page', () => {
         data: {
           session: null,
           sessionError: null,
+          attribution: null,
           meme,
           popularity: popularitySummary(meme.id),
           relatedSource: {
@@ -57,6 +58,7 @@ describe('/memes/[id] page', () => {
     expect(body).toContain('Media and file info');
     expect(body).toContain('image/jpeg');
     expect(body).toContain('Direct media download');
+    expect(body).toContain('href="https://cdn.example.test/memes/launch.jpg"');
     expect(body).toContain('Public popularity');
     expect(body).toContain('34 views');
     expect(body).toContain('Share to Telegram');
@@ -70,6 +72,8 @@ describe('/memes/[id] page', () => {
     expect(body).toContain('source image embedding');
     expect(body).toContain('data-discovery-source="qdrant_similarity"');
     expect(body).toContain('data-discovery-request-id="req_detail"');
+    expect(body).toContain('attribution_request_id=req_detail');
+    expect(body).toContain('attribution_source_algorithm=qdrant_similarity');
     expect(body).toContain('Another reaction meme');
   });
 
@@ -91,6 +95,7 @@ describe('/memes/[id] page', () => {
         data: {
           session: null,
           sessionError: null,
+          attribution: null,
           meme,
           popularity: null,
           relatedSource: {

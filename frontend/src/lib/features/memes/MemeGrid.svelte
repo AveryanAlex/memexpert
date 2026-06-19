@@ -243,7 +243,7 @@
               Select
             </label>
           {/if}
-          <MemeCard {meme} position={memePositions.get(meme.id)} total={memes.length} />
+          <MemeCard {meme} {attribution} position={memePositions.get(meme.id)} total={memes.length} />
         </div>
       {/each}
     </div>

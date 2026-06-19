@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { PublicMemeCardRead } from '$lib/api/types';
+  import type { MemeResultAttributionRead, PublicMemeCardRead } from '$lib/api/types';
   import { memeHref, memeTitle } from '$lib/memeActions';
   import Badge from '$lib/ui/Badge.svelte';
   import { cn, focusRing } from '$lib/ui/styles';
@@ -8,13 +8,14 @@
 
   interface Props {
     meme: PublicMemeCardRead;
+    attribution?: MemeResultAttributionRead | null;
     position?: number;
     total?: number;
   }
 
-  let { meme, position, total }: Props = $props();
+  let { meme, attribution = null, position, total }: Props = $props();
 
-  const href = $derived(memeHref(meme));
+  const href = $derived(memeHref(meme, attribution));
   const title = $derived(memeTitle(meme));
   const titleId = $derived(`meme-card-title-${meme.id}`);
 </script>
@@ -47,6 +48,6 @@
     </div>
   </a>
   <div class="absolute right-3 top-3 z-10">
-    <MemeActionMenu {meme} {href} compact />
+    <MemeActionMenu {meme} {href} {attribution} compact />
   </div>
 </article>

@@ -39,6 +39,8 @@ import type {
   WebCollectionListRead,
   WebCollectionSummaryRead
 } from './types';
+import { memeAttributionSearchParams } from '$lib/memeActions';
+import type { MemeActionAttribution } from '$lib/memeActions';
 
 export const DEFAULT_PAGE_SIZE = 12;
 
@@ -63,6 +65,7 @@ interface PageRequest extends CatalogRequest {
 
 interface DetailRequest extends CatalogRequest {
   memeId: string;
+  attribution?: MemeActionAttribution | null;
 }
 
 interface SimilarMemeRequest extends DetailRequest {
@@ -92,6 +95,7 @@ interface MemeActionRequest {
   cookieHeader?: string;
   onResponse?: (response: Response) => void;
   memeId: string;
+  body?: unknown;
 }
 
 interface MemeReportRequest extends MemeActionRequest {
@@ -113,6 +117,10 @@ interface PreferenceMutationRequest {
 
 export interface RemoveActionResponse {
   removed?: boolean;
+}
+
+export interface MemeInteractionRecordedResponse {
+  ok: boolean;
 }
 
 interface JsonMutationRequest extends CatalogRequest {
@@ -215,9 +223,14 @@ export async function startTelegramLink(request: CatalogRequest): Promise<Telegr
 export async function fetchMemeDetail(request: DetailRequest): Promise<PublicMemeDetailRead> {
   const encoded = encodeURIComponent(request.memeId);
   const path = isUuid(request.memeId) ? `/api/v1/memes/${encoded}` : `/api/v1/memes/slug/${encoded}`;
+  const params = new URLSearchParams({ include_nsfw: 'false' });
+  const attributionParams = memeAttributionSearchParams(request.attribution);
+  for (const [key, value] of attributionParams) {
+    params.append(key, value);
+  }
   return apiGet<PublicMemeDetailRead>(
     path,
-    new URLSearchParams({ include_nsfw: 'false' }),
+    params,
     request
   );
 }
@@ -375,10 +388,20 @@ export async function unpinMeme(request: MemeActionRequest): Promise<RemoveActio
 }
 
 export async function reportMeme(request: MemeReportRequest): Promise<MemeReportRead> {
+  const attribution = readActionAttribution(request.body);
   return apiJsonWrite<MemeReportRead>(`/api/v1/memes/${encodeURIComponent(request.memeId)}/report`, 'POST', request, {
     reason: request.reason,
-    note: request.note ?? null
+    note: request.note ?? null,
+    ...(attribution === undefined ? {} : { attribution })
   });
+}
+
+export async function recordMemeShare(request: MemeActionRequest): Promise<MemeInteractionRecordedResponse> {
+  return apiMutation<MemeInteractionRecordedResponse>(`/api/v1/memes/${encodeURIComponent(request.memeId)}/share`, 'POST', request);
+}
+
+export async function recordMemeDownload(request: MemeActionRequest): Promise<MemeInteractionRecordedResponse> {
+  return apiMutation<MemeInteractionRecordedResponse>(`/api/v1/memes/${encodeURIComponent(request.memeId)}/download`, 'POST', request);
 }
 
 export async function fetchTagLanding(request: LandingRequest): Promise<PublicMemeLandingRead> {
@@ -642,6 +665,10 @@ async function apiJson<T>(
 
 async function apiMutation<T>(path: string, method: 'DELETE' | 'POST', request: MemeActionRequest): Promise<T> {
   const headers = new Headers({ accept: 'application/json', 'x-requested-with': 'XMLHttpRequest' });
+  const body = method === 'POST' ? request.body : undefined;
+  if (body !== undefined) {
+    headers.set('content-type', 'application/json');
+  }
   if (request.cookieHeader) {
     headers.set('cookie', request.cookieHeader);
   }
@@ -649,7 +676,8 @@ async function apiMutation<T>(path: string, method: 'DELETE' | 'POST', request: 
   const response = await request.fetch(buildApiInput(path, request.baseUrl), {
     method,
     headers,
-    credentials: 'include'
+    credentials: 'include',
+    body: body === undefined ? undefined : JSON.stringify(body)
   });
   request.onResponse?.(response);
   const payload = await readJson(response);
@@ -749,6 +777,13 @@ async function apiJsonWrite<T>(
 
 function buildApiInput(path: string, baseUrl: string | undefined): RequestInfo | URL {
   return baseUrl ? new URL(path, baseUrl) : path;
+}
+
+function readActionAttribution(body: unknown): unknown | undefined {
+  if (!body || typeof body !== 'object' || !('attribution' in body)) {
+    return undefined;
+  }
+  return body.attribution;
 }
 
 async function readJson(response: Response): Promise<unknown> {

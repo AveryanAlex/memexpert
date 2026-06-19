@@ -32,6 +32,8 @@ import {
   fetchTrendTimeline,
   fetchTrendPage,
   pinMeme,
+  recordMemeDownload,
+  recordMemeShare,
   refreshCurrentSession,
   removeMemeFromCollection,
   removeSavedMeme,
@@ -49,6 +51,7 @@ import {
   updateUserPreferences,
   type ApiFetch
 } from './client';
+import type { MemeActionAttribution } from '$lib/memeActions';
 import type { CurrentSessionRead, MemeLibraryRead, PublicMemeSearchPageRead, PublicMemeTrendPageRead } from './types';
 
 const page: PublicMemeSearchPageRead = {
@@ -169,6 +172,10 @@ describe('catalog API client', () => {
 
       expect(url.pathname).toBe('/api/v1/memes/slug/frog-wizard');
       expect(url.searchParams.get('include_nsfw')).toBe('false');
+      expect(url.searchParams.get('attribution_request_id')).toBe('req-action-1');
+      expect(url.searchParams.get('attribution_impression_id')).toBe('imp-action-1');
+      expect(url.searchParams.get('attribution_source_algorithm')).toBe('qdrant_similarity');
+      expect(JSON.parse(url.searchParams.get('attribution_score_components') ?? '{}')).toEqual({ total: 0.92 });
 
       return jsonResponse(memeDetail({ id: 'meme-123', seo_page_slug: 'frog-wizard' }));
     }) satisfies ApiFetch;
@@ -176,7 +183,8 @@ describe('catalog API client', () => {
     await fetchMemeDetail({
       fetch: mockFetch,
       baseUrl: 'https://api.memexpert.test',
-      memeId: 'frog-wizard'
+      memeId: 'frog-wizard',
+      attribution: actionAttribution()
     });
 
     expect(mockFetch).toHaveBeenCalledOnce();
@@ -418,6 +426,35 @@ describe('catalog API client', () => {
     ]);
   });
 
+  it('posts action attribution bodies for mutations and telemetry-only actions', async () => {
+    const paths: string[] = [];
+    const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const headers = new Headers(init?.headers);
+      paths.push(url.pathname);
+
+      expect(init?.method).toBe('POST');
+      expect(headers.get('content-type')).toBe('application/json');
+      expect(JSON.parse(String(init?.body))).toEqual({ attribution: actionAttribution() });
+
+      return jsonResponse(url.pathname.endsWith('/share') || url.pathname.endsWith('/download') ? { ok: true } : { id: 'action-row-1' });
+    }) satisfies ApiFetch;
+
+    await favoriteMeme({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', memeId: 'meme-123', body: { attribution: actionAttribution() } });
+    await saveMeme({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', memeId: 'meme-123', body: { attribution: actionAttribution() } });
+    await pinMeme({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', memeId: 'meme-123', body: { attribution: actionAttribution() } });
+    await recordMemeShare({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', memeId: 'meme-123', body: { attribution: actionAttribution() } });
+    await recordMemeDownload({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', memeId: 'meme-123', body: { attribution: actionAttribution() } });
+
+    expect(paths).toEqual([
+      '/api/v1/memes/meme-123/favorite',
+      '/api/v1/memes/meme-123/save',
+      '/api/v1/memes/meme-123/pin',
+      '/api/v1/memes/meme-123/share',
+      '/api/v1/memes/meme-123/download'
+    ]);
+  });
+
   it('submits meme reports with JSON body and CSRF-compatible request header', async () => {
     const memeId = '11111111-1111-4111-8111-111111111111';
     const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -453,6 +490,40 @@ describe('catalog API client', () => {
     });
 
     expect(report.status).toBe('pending');
+    expect(mockFetch).toHaveBeenCalledOnce();
+  });
+
+  it('adds action attribution to meme report payloads when provided', async () => {
+    const memeId = '11111111-1111-4111-8111-111111111111';
+    const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+
+      expect(url.pathname).toBe(`/api/v1/memes/${memeId}/report`);
+      expect(JSON.parse(String(init?.body))).toEqual({
+        reason: 'spam',
+        note: null,
+        attribution: actionAttribution()
+      });
+
+      return jsonResponse({
+        id: '22222222-2222-4222-8222-222222222222',
+        meme_id: memeId,
+        status: 'pending',
+        reason: 'spam',
+        note: null,
+        created_at: '2026-01-01T00:00:00Z',
+        updated_at: '2026-01-01T00:00:00Z'
+      });
+    }) satisfies ApiFetch;
+
+    await reportMeme({
+      fetch: mockFetch,
+      baseUrl: 'https://api.memexpert.test',
+      memeId,
+      reason: 'spam',
+      body: { attribution: actionAttribution() }
+    });
+
     expect(mockFetch).toHaveBeenCalledOnce();
   });
 
@@ -1033,6 +1104,25 @@ function libraryPayload(): MemeLibraryRead {
     pinned_memes: [pinned],
     collections: [collection],
     active_save_collection: collection
+  };
+}
+
+function actionAttribution(): MemeActionAttribution {
+  return {
+    request_id: 'req-action-1',
+    impression_id: 'imp-action-1',
+    surface: 'public_api_meme_similar',
+    source_algorithm: 'qdrant_similarity',
+    rank: 2,
+    query: 'frog',
+    filters: { language: 'en', media_type: 'image', include_nsfw: false, tags: ['frog'], scope: 'public', collection_ids: [] },
+    collection_scope: 'public',
+    collection_ids: ['collection-1'],
+    source_meme_id: '11111111-1111-4111-8111-111111111111',
+    algorithm_version: 'similar-v1',
+    score: 0.92,
+    score_components: { total: 0.92 },
+    reason: 'similarity_match'
   };
 }
 

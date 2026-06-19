@@ -13,23 +13,27 @@ import {
 import type { ApiFetch } from '$lib/api/client';
 import type { PublicMemeDetailRead } from '$lib/api/types';
 import type { MemeDetailRelatedSource } from '$lib/meme-detail-view';
+import { parseMemeAttributionSearchParams } from '$lib/memeActions';
 import { apiBaseUrl, cookieHeaderWithAccessToken, forwardBackendAccessCookie } from '$lib/server/backend';
 
 const RELATED_LIMIT = 7;
 
-export const load: PageServerLoad = async ({ fetch, params, request }) => {
+export const load: PageServerLoad = async ({ fetch, params, request, url }) => {
   const cookieHeader = request.headers.get('cookie') ?? undefined;
+  const attribution = parseMemeAttributionSearchParams(url.searchParams);
   let meme: Awaited<ReturnType<typeof fetchMemeDetail>>;
   try {
     meme = await fetchMemeDetail({
       fetch,
       baseUrl: apiBaseUrl(),
       memeId: params.id,
+      attribution,
       cookieHeader
     });
   } catch (error) {
     if (error instanceof ApiError && error.status === 404) {
       return {
+        attribution,
         meme: null,
         popularity: null,
         relatedSource: null,
@@ -39,6 +43,7 @@ export const load: PageServerLoad = async ({ fetch, params, request }) => {
 
     if (error instanceof ApiError && error.status === 422) {
       return {
+        attribution,
         meme: null,
         popularity: null,
         relatedSource: null,
@@ -47,6 +52,7 @@ export const load: PageServerLoad = async ({ fetch, params, request }) => {
     }
 
     return {
+      attribution,
       meme: null,
       popularity: null,
       relatedSource: null,
@@ -55,7 +61,7 @@ export const load: PageServerLoad = async ({ fetch, params, request }) => {
   }
 
   if (meme.seo_page_slug && params.id !== meme.seo_page_slug) {
-    throw redirect(308, `/memes/${meme.seo_page_slug}`);
+    throw redirect(308, `/memes/${meme.seo_page_slug}${url.search}`);
   }
 
   const [popularity, relatedSource] = await Promise.all([
@@ -68,7 +74,7 @@ export const load: PageServerLoad = async ({ fetch, params, request }) => {
     fetchRelatedDiscoverySource(fetch, cookieHeader, meme)
   ]);
 
-  return { meme, popularity, relatedSource, unavailableMessage: null };
+  return { attribution, meme, popularity, relatedSource, unavailableMessage: null };
 };
 
 async function fetchRelatedDiscoverySource(
