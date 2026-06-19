@@ -9,6 +9,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from memexpert.core.database import build_async_session_factory
+from memexpert.pipeline.outbox_runtime import (
+    pipeline_outbox_publisher_result_log_extra,
+    run_pipeline_outbox_publisher_batch,
+)
 from memexpert.services.popularity_snapshots import capture_popularity_snapshots
 from memexpert.services.public_trends import refresh_public_trend_materialized_views
 from memexpert.services.scheduler_batch_jobs import (
@@ -29,6 +33,7 @@ JOB_ID_POPULARITY_SNAPSHOTS = "popularity-snapshots"
 JOB_ID_MOTD = "motd"
 JOB_ID_SEARCH_INDEX_SYNC = "search-index-sync"
 JOB_ID_SEO_BACKLOG_BATCHES = "seo-backlog-batches"
+JOB_ID_PIPELINE_OUTBOX_PUBLISHER = "pipeline-outbox-publisher"
 
 SchedulerJobAction = Callable[[], Awaitable[None]]
 
@@ -78,6 +83,13 @@ def build_scheduler_job_definitions(settings: Settings, engine: AsyncEngine) -> 
             action=_build_seo_backlog_batches_job_action(settings, engine),
             enabled=settings.scheduler_seo_backlog_batches_enabled,
             description="Process SEO backlog batches.",
+        ),
+        SchedulerJobDefinition(
+            id=JOB_ID_PIPELINE_OUTBOX_PUBLISHER,
+            trigger_seconds=settings.scheduler_pipeline_outbox_publisher_interval_seconds,
+            action=_build_pipeline_outbox_publisher_job_action(settings, engine),
+            enabled=settings.scheduler_pipeline_outbox_publisher_enabled,
+            description="Publish durable pipeline outbox events.",
         ),
     )
 
@@ -158,9 +170,22 @@ def _build_seo_backlog_batches_job_action(settings: Settings, engine: AsyncEngin
     return _action
 
 
+def _build_pipeline_outbox_publisher_job_action(settings: Settings, engine: AsyncEngine) -> SchedulerJobAction:
+    async def _action() -> None:
+        session_factory = build_async_session_factory(engine)
+        result = await run_pipeline_outbox_publisher_batch(session_factory, settings=settings)
+        logger.info(
+            "scheduler_job_batch_result",
+            extra=pipeline_outbox_publisher_result_log_extra(JOB_ID_PIPELINE_OUTBOX_PUBLISHER, result),
+        )
+
+    return _action
+
+
 __all__ = [
     "JOB_ID_MATERIALIZED_VIEW_REFRESH",
     "JOB_ID_MOTD",
+    "JOB_ID_PIPELINE_OUTBOX_PUBLISHER",
     "JOB_ID_POPULARITY_SNAPSHOTS",
     "JOB_ID_SEARCH_INDEX_SYNC",
     "JOB_ID_SEO_BACKLOG_BATCHES",

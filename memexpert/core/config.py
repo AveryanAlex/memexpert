@@ -161,6 +161,10 @@ class Settings(BaseSettings):
     scheduler_seo_backlog_batches_enabled: bool = True
     scheduler_seo_backlog_batches_interval_seconds: float = Field(default=900.0, gt=0.0)
     scheduler_seo_backlog_batch_size: int = Field(default=25, ge=1, le=500)
+    scheduler_pipeline_outbox_publisher_enabled: bool = True
+    scheduler_pipeline_outbox_publisher_interval_seconds: float = Field(default=5.0, gt=0.0)
+    scheduler_pipeline_outbox_publisher_batch_size: int = Field(default=100, ge=1, le=1000)
+    scheduler_pipeline_outbox_publisher_stale_timeout_seconds: float = Field(default=300.0, gt=0.0)
     scheduler_advisory_lock_enabled: bool = True
     scheduler_advisory_lock_key: Annotated[tuple[int, int], NoDecode] = (0, 0)
     # --- S04: curated Telethon crawler + freshness SLO -----------------

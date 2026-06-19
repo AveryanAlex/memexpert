@@ -121,7 +121,7 @@ class MemeTranscoded(BaseModel):
 
 RabbitMQ dead letter exchanges (DLX) handle worker-consume failures. Messages exceeding max retries (5, with exponential backoff) are routed to a dead letter queue (`dlq.*`) for inspection and manual replay. No message is silently lost.
 
-Pipeline entrypoints and the media materializer use a transactional outbox instead of commit-then-publish. `pipeline_outbox_events` rows are written in the same DB transaction as ingest/materialization state, then a generic publisher claims due `pending`/`failed` rows with row locks, publishes by stored `routing_key`, and marks rows `published` or `failed` with retry metadata. Stale `publishing` claims are recoverable by moving them back to `failed` with `next_retry_at` set.
+Pipeline entrypoints and the media materializer use a transactional outbox instead of commit-then-publish. `pipeline_outbox_events` rows are written in the same DB transaction as ingest/materialization state, then the `pipeline-outbox-publisher` job in `memexpert-scheduler` starts or reuses the RabbitMQ pipeline broker, recovers stale `publishing` rows, claims due `pending`/`failed` rows with row locks, publishes by stored `routing_key` and JSON payload, and marks rows `published` or `failed` with retry metadata. This generic path handles both raw-upload `media_inspect_requested` events and post-materialization transcode dispatches.
 
 ### Periodic Tasks
 
@@ -130,10 +130,11 @@ Tasks that run on a schedule (not event-driven) are managed by APScheduler in a 
 - Public trend materialized-view refresh (e.g. every 5 min or adaptive)
 - Popularity snapshot computation (initially every 6h; tune after observing traffic)
 - Search-index sync (batched, not per-like)
+- Transactional pipeline outbox publishing for ingest/materialization events
 - Meme of the Day selection/cache refresh
 - Scheduled SEO generation batches prioritized by popularity/backlog
 
-The current implementation registers exactly these five jobs. Public trend materialized-view refresh and popularity snapshot computation contain real business logic; Meme of the Day, search-index sync, and SEO backlog batches are intentionally lightweight placeholders until their production behavior is implemented.
+The current implementation registers these scheduler jobs with independent enable and interval settings. Public trend materialized-view refresh, popularity snapshot computation, search-index sync, SEO backlog batches, and pipeline outbox publishing contain production behavior; Meme of the Day remains a lightweight placeholder until its product behavior is implemented.
 
 Guest TTL/deletion jobs are intentionally not part of the current product direction.
 

@@ -40,7 +40,7 @@ from memexpert.models.enums import (
     SourcePlatform,
 )
 from memexpert.models.user import User
-from memexpert.pipeline.outbox import PipelineOutboxPublisher
+from memexpert.pipeline.outbox_runtime import run_pipeline_outbox_publisher_batch
 from memexpert.schemas.content_pipeline import ContentPipelineEventType
 from memexpert.services import PipelineIngestError
 
@@ -503,28 +503,30 @@ async def test_materializer_deletes_canonical_object_on_db_failure_after_promoti
     assert temp_object_key in storage_client.objects
 
 
-async def test_outbox_publisher_claims_publishes_and_records_failed_retry(
+async def test_outbox_batch_runner_publishes_generically_and_recovers_stale_claims(
     migrated_db_session: AsyncSession,
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     now = utcnow()
-    publishable = PipelineOutboxEvent(
+    media_inspect = PipelineOutboxEvent(
         aggregate_type="test",
         aggregate_id=uuid.uuid7(),
-        event_type="test_event",
-        routing_key="pipeline.ok",
-        payload={"ok": True},
+        event_type="media_inspect_requested",
+        routing_key="pipeline.media_inspect",
+        payload={"event_type": "media_inspect_requested", "ok": True},
         status=PipelineOutboxEventStatus.PENDING,
         next_retry_at=now,
+        created_at=now - timedelta(minutes=3),
     )
-    failing = PipelineOutboxEvent(
+    transcode = PipelineOutboxEvent(
         aggregate_type="test",
         aggregate_id=uuid.uuid7(),
-        event_type="test_event",
-        routing_key="pipeline.fail",
-        payload={"ok": False},
+        event_type=ContentPipelineEventType.MEME_CREATED.value,
+        routing_key="pipeline.transcode",
+        payload={"event_type": ContentPipelineEventType.MEME_CREATED.value, "ok": False},
         status=PipelineOutboxEventStatus.PENDING,
         next_retry_at=now,
+        created_at=now - timedelta(minutes=2),
     )
     stale = PipelineOutboxEvent(
         aggregate_type="test",
@@ -534,25 +536,34 @@ async def test_outbox_publisher_claims_publishes_and_records_failed_retry(
         payload={},
         status=PipelineOutboxEventStatus.PUBLISHING,
         updated_at=now - timedelta(hours=1),
+        created_at=now - timedelta(minutes=1),
     )
-    migrated_db_session.add_all([publishable, failing, stale])
+    migrated_db_session.add_all([media_inspect, transcode, stale])
     await migrated_db_session.commit()
 
-    broker = FakeBroker(fail_routing_keys={"pipeline.fail"})
-    publisher = PipelineOutboxPublisher(migrated_db_session, broker=broker, settings=Settings())
-
-    result = await publisher.publish_batch(limit=10)
-    recovered = await publisher.recover_stale_publishing(stale_before=now - timedelta(minutes=10))
+    broker = FakeBroker(fail_routing_keys={"pipeline.transcode"})
+    result = await run_pipeline_outbox_publisher_batch(
+        postgres_session_factory,
+        settings=Settings.model_validate(
+            {
+                "scheduler_pipeline_outbox_publisher_batch_size": 2,
+                "scheduler_pipeline_outbox_publisher_stale_timeout_seconds": 600.0,
+            }
+        ),
+        broker=broker,
+    )
 
     assert result.claimed == 2
     assert result.published == 1
     assert result.failed == 1
-    assert recovered == 1
-    assert [call["routing_key"] for call in broker.publish_calls] == ["pipeline.ok", "pipeline.fail"]
+    assert result.recovered == 1
+    assert [call["routing_key"] for call in broker.publish_calls] == ["pipeline.media_inspect", "pipeline.transcode"]
+    assert broker.publish_calls[0]["payload"] == media_inspect.payload
+    assert broker.publish_calls[1]["payload"] == transcode.payload
 
     async with postgres_session_factory() as session:
-        published_row = await session.get(PipelineOutboxEvent, publishable.id)
-        failed_row = await session.get(PipelineOutboxEvent, failing.id)
+        published_row = await session.get(PipelineOutboxEvent, media_inspect.id)
+        failed_row = await session.get(PipelineOutboxEvent, transcode.id)
         recovered_row = await session.get(PipelineOutboxEvent, stale.id)
 
     assert published_row is not None
@@ -565,3 +576,5 @@ async def test_outbox_publisher_claims_publishes_and_records_failed_retry(
     assert failed_row.next_retry_at is not None
     assert recovered_row is not None
     assert recovered_row.status is PipelineOutboxEventStatus.FAILED
+    assert recovered_row.next_retry_at is not None
+    assert recovered_row.last_error_text == "Outbox event was recovered from a stale publishing claim."
