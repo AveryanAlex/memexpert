@@ -406,10 +406,10 @@ class AdminService:
             .offset(offset)
         )
         memes = (await self.session.execute(stmt)).scalars().all()
-        await self._attach_admin_popularity_scores(memes)
+        popularity_scores = await self._load_admin_popularity_scores(memes)
         return [
             AdminMemeSeoReviewRowRead(
-                meme=AdminMemeRead.model_validate(meme),
+                meme=self._admin_meme_read(meme, popularity_score=popularity_scores.get(meme.id, 0.0)),
                 seo_page=self._seo_page_read(meme.seo_page),
                 status=self._seo_review_status(meme.seo_page),
             )
@@ -671,8 +671,8 @@ class AdminService:
         if is_public is not None:
             stmt = stmt.where(Meme.is_public.is_(is_public))
         rows = (await self.session.execute(stmt)).scalars().all()
-        await self._attach_admin_popularity_scores(rows)
-        return [AdminMemeRead.model_validate(row) for row in rows]
+        popularity_scores = await self._load_admin_popularity_scores(rows)
+        return [self._admin_meme_read(row, popularity_score=popularity_scores.get(row.id, 0.0)) for row in rows]
 
     async def get_meme_detail(self, meme_id: uuid.UUID) -> AdminMemeDetailRead:
         meme = await self.session.get(Meme, meme_id)
@@ -695,11 +695,12 @@ class AdminService:
                 .limit(100),
             )
         ).scalars().all()
-        await self._attach_admin_popularity_scores([meme])
+        popularity_scores = await self._load_admin_popularity_scores([meme])
+        meme_read = self._admin_meme_read(meme, popularity_score=popularity_scores.get(meme.id, 0.0))
 
         return AdminMemeDetailRead(
-            meme=AdminMemeRead.model_validate(meme),
-            reports=[AdminModerationReportRead.model_validate(report) for report in reports],
+            meme=meme_read,
+            reports=[self._admin_moderation_report_read(report, meme_read=meme_read) for report in reports],
             decisions=[AdminModerationDecisionRead.model_validate(decision) for decision in decisions],
         )
 
@@ -856,8 +857,8 @@ class AdminService:
             )
         await self.session.commit()
         await self.session.refresh(meme)
-        await self._attach_admin_popularity_scores([meme])
-        return AdminMemeRead.model_validate(meme)
+        popularity_scores = await self._load_admin_popularity_scores([meme])
+        return self._admin_meme_read(meme, popularity_score=popularity_scores.get(meme.id, 0.0))
 
     async def list_moderation_reports(
         self,
@@ -882,8 +883,14 @@ class AdminService:
         else:
             stmt = stmt.where(ModerationReport.status == report_status)
         rows = (await self.session.execute(stmt)).scalars().all()
-        await self._attach_admin_popularity_scores([row.meme for row in rows])
-        return [AdminModerationReportRead.model_validate(row) for row in rows]
+        popularity_scores = await self._load_admin_popularity_scores([row.meme for row in rows])
+        return [
+            self._admin_moderation_report_read(
+                row,
+                meme_read=self._admin_meme_read(row.meme, popularity_score=popularity_scores.get(row.meme.id, 0.0)),
+            )
+            for row in rows
+        ]
 
     async def resolve_moderation_report(
         self,
@@ -941,8 +948,14 @@ class AdminService:
         )
         if refreshed is None:
             raise AdminNotFoundError(f"Moderation report {report_id} does not exist.")
-        await self._attach_admin_popularity_scores([refreshed.meme])
-        return AdminModerationReportRead.model_validate(refreshed)
+        popularity_scores = await self._load_admin_popularity_scores([refreshed.meme])
+        return self._admin_moderation_report_read(
+            refreshed,
+            meme_read=self._admin_meme_read(
+                refreshed.meme,
+                popularity_score=popularity_scores.get(refreshed.meme.id, 0.0),
+            ),
+        )
 
     async def list_moderation_decisions(
         self,
@@ -1026,14 +1039,48 @@ class AdminService:
             **file_bound_counts,
         }
 
-    async def _attach_admin_popularity_scores(self, memes: Iterable[Meme]) -> None:
-        meme_list = list(memes)
-        scores = await load_derived_popularity_scores(
+    async def _load_admin_popularity_scores(self, memes: Iterable[Meme]) -> dict[uuid.UUID, float]:
+        return await load_derived_popularity_scores(
             self.session,
-            tuple(dict.fromkeys(meme.id for meme in meme_list)),
+            tuple(dict.fromkeys(meme.id for meme in memes)),
         )
-        for meme in meme_list:
-            meme.popularity_score = scores.get(meme.id, 0.0)
+
+    @staticmethod
+    def _admin_meme_read(meme: Meme, *, popularity_score: float) -> AdminMemeRead:
+        return AdminMemeRead(
+            id=meme.id,
+            media_type=meme.media_type,
+            language=meme.language,
+            is_nsfw=meme.is_nsfw,
+            is_public=meme.is_public,
+            popularity_score=popularity_score,
+            like_count=meme.like_count,
+            tags=list(meme.tags),
+            template_id=meme.template_id,
+            author_user_id=meme.author_user_id,
+            created_at=meme.created_at,
+            updated_at=meme.updated_at,
+        )
+
+    @staticmethod
+    def _admin_moderation_report_read(
+        report: ModerationReport,
+        *,
+        meme_read: AdminMemeRead,
+    ) -> AdminModerationReportRead:
+        return AdminModerationReportRead(
+            id=report.id,
+            meme_id=report.meme_id,
+            reporter_user_id=report.reporter_user_id,
+            status=report.status,
+            reason=report.reason,
+            note=report.note,
+            resolved_by_admin_user_id=report.resolved_by_admin_user_id,
+            resolved_at=report.resolved_at,
+            created_at=report.created_at,
+            updated_at=report.updated_at,
+            meme=meme_read,
+        )
 
     async def _count_blocked_hash_matches(self, blocked_hash_id: uuid.UUID) -> int:
         return await self.session.scalar(
