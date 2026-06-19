@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Protocol
 
-from sqlalchemy import Select, and_, any_, false, func, literal, or_, select
+from sqlalchemy import Select, and_, any_, bindparam, false, func, literal, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -26,7 +26,7 @@ from memexpert.core.search_index_prefilter import SearchIndexPrefilter, SearchIn
 from memexpert.core.voyage import VoyageEmbeddingError, decode_embedding_bytes
 from memexpert.models.base import utcnow
 from memexpert.models.collection import Collection, CollectionMember, CollectionMeme, PinnedMeme
-from memexpert.models.content import EmbeddingCache, Meme, MemeFile, MemePopularitySnapshot, MemeSeoPage, MemeTemplate
+from memexpert.models.content import EmbeddingCache, Meme, MemeFile, MemeSeoPage, MemeTemplate
 from memexpert.models.enums import AnalyticsEventType, CollectionKind, ContentKind, ContentLanguage, EmbeddingInputType
 from memexpert.models.user import AnalyticsEvent, User
 from memexpert.schemas.meme import (
@@ -49,6 +49,7 @@ from memexpert.schemas.meme import (
     new_discovery_impression_id,
     new_discovery_request_id,
 )
+from memexpert.services.engagement_read_model import load_derived_popularity_scores
 from memexpert.services.media_render_urls import MediaRenderUrlService, PublicMediaRenderContext
 from memexpert.services.search_index_sync import SEARCH_INDEX_ALGORITHM_VERSION
 
@@ -61,7 +62,7 @@ TRENDING_SNAPSHOT_WEIGHT = 0.25
 TRENDING_POPULARITY_WEIGHT = 0.15
 TRENDING_LIKE_WEIGHT = 0.05
 POPULAR_ALGORITHM_VERSION = "popular_v1"
-LEGACY_TRENDING_ALGORITHM_VERSION = "legacy_trending_v1"
+LEGACY_TRENDING_ALGORITHM_VERSION = "source_engagement_trending_v1"
 QDRANT_SIMILARITY_ALGORITHM_VERSION = SEARCH_INDEX_ALGORITHM_VERSION
 PERSONALIZED_RECOMMENDATION_ALGORITHM_VERSION = f"{SEARCH_INDEX_ALGORITHM_VERSION}_personalized_v1"
 TRENDING_EVENT_WEIGHTS = {
@@ -75,6 +76,7 @@ TRENDING_EVENT_WEIGHTS = {
 }
 
 logger = logging.getLogger(__name__)
+_DERIVED_POPULARITY_ATTR = "_derived_popularity_score"
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -273,11 +275,12 @@ class MemeSearchService:
             filters=resolved_filters,
         )
         visible_scores = {meme.id: candidates[meme.id] for meme in memes}
-        self._apply_normalized_scores(visible_scores, {meme.id: meme.popularity_score for meme in memes})
+        popularity_by_meme_id = await self._attach_derived_popularity_scores(memes)
+        self._apply_normalized_scores(visible_scores, popularity_by_meme_id)
 
         ranked_memes = sorted(
             memes,
-            key=lambda meme: (visible_scores[meme.id].total, meme.popularity_score, meme.created_at),
+            key=lambda meme: (visible_scores[meme.id].total, popularity_by_meme_id.get(meme.id, 0.0), meme.created_at),
             reverse=True,
         )
         total = len(ranked_memes)
@@ -477,7 +480,8 @@ class MemeSearchService:
             filters=resolved_filters,
         )
         memes_by_id = {meme.id: meme for meme in memes}
-        max_popularity = max((meme.popularity_score for meme in memes), default=0.0)
+        popularity_by_meme_id = await self._attach_derived_popularity_scores(memes)
+        max_popularity = max(popularity_by_meme_id.values(), default=0.0)
         candidates: list[_RecommendationCandidate] = []
         for match in ordered_matches:
             meme = memes_by_id.get(match.meme_id)
@@ -486,7 +490,7 @@ class MemeSearchService:
             semantic_score = _safe_float(match.semantic_score)
             if semantic_score is None:
                 continue
-            popularity = _normalize_value(meme.popularity_score, max_popularity)
+            popularity = _normalize_value(popularity_by_meme_id.get(meme.id, 0.0), max_popularity)
             total_score = 0.85 * semantic_score + 0.15 * popularity
             candidates.append(
                 _RecommendationCandidate(
@@ -512,7 +516,7 @@ class MemeSearchService:
             key=lambda candidate: (
                 candidate.total_score,
                 candidate.semantic_score,
-                candidate.meme.popularity_score,
+                popularity_by_meme_id.get(candidate.meme.id, 0.0),
                 candidate.meme.created_at,
                 str(candidate.meme.id),
             ),
@@ -521,7 +525,7 @@ class MemeSearchService:
         page_candidates = candidates[resolved_offset : resolved_offset + resolved_limit]
         items: list[MemeSearchResultRead] = []
         for rank, candidate in enumerate(page_candidates, start=resolved_offset + 1):
-            popularity = _normalize_value(candidate.meme.popularity_score, max_popularity)
+            popularity = _normalize_value(popularity_by_meme_id.get(candidate.meme.id, 0.0), max_popularity)
             score_read = MemeSearchScoreRead(
                 semantic=candidate.semantic_score,
                 text=0.0,
@@ -575,6 +579,7 @@ class MemeSearchService:
         meme = await self._session.scalar(stmt)
         if meme is None:
             raise MemeNotFoundError("Meme was not found or is not visible to this caller.")
+        await self._attach_derived_popularity_scores([meme])
         return _to_detail_read(meme)
 
     async def get_meme_detail_by_slug(
@@ -592,6 +597,7 @@ class MemeSearchService:
         meme = await self._session.scalar(stmt)
         if meme is None:
             raise MemeNotFoundError("Meme slug was not found or is not visible to this caller.")
+        await self._attach_derived_popularity_scores([meme])
         return _to_detail_read(meme)
 
     async def get_public_meme_detail(
@@ -606,6 +612,7 @@ class MemeSearchService:
             viewer_user_id=viewer_user_id,
             include_nsfw=include_nsfw,
         )
+        await self._attach_derived_popularity_scores([meme])
         action_state = await self._load_viewer_action_state((meme.id,), viewer_user_id=viewer_user_id)
         viewer_access = await self._load_detail_viewer_access_marker(meme, viewer_user_id=viewer_user_id)
         return _to_authorized_detail_read(
@@ -627,6 +634,7 @@ class MemeSearchService:
             viewer_user_id=viewer_user_id,
             include_nsfw=include_nsfw,
         )
+        await self._attach_derived_popularity_scores([meme])
         action_state = await self._load_viewer_action_state((meme.id,), viewer_user_id=viewer_user_id)
         viewer_access = await self._load_detail_viewer_access_marker(meme, viewer_user_id=viewer_user_id)
         return _to_authorized_detail_read(
@@ -735,6 +743,7 @@ class MemeSearchService:
             stmt = stmt.where(Meme.is_nsfw.is_(False))
         result = await self._session.execute(stmt)
         memes_by_id = {meme.id: meme for meme in result.scalars().unique()}
+        await self._attach_derived_popularity_scores(tuple(memes_by_id.values()))
         action_state = await self._load_viewer_action_state(meme_ids, viewer_user_id=viewer_user_id)
         return [
             _to_public_card_read(
@@ -763,6 +772,7 @@ class MemeSearchService:
             stmt = stmt.where(Meme.is_nsfw.is_(False))
         result = await self._session.execute(stmt)
         memes_by_id = {meme.id: meme for meme in result.scalars().unique()}
+        await self._attach_derived_popularity_scores(tuple(memes_by_id.values()))
         action_state = await self._load_viewer_action_state(meme_ids, viewer_user_id=viewer_user_id)
         return [
             _to_authorized_card_read(
@@ -860,13 +870,10 @@ class MemeSearchService:
     ) -> MemeSearchPageRead:
         """Return a deterministic popular/trending catalog page.
 
-        Scoring is intentionally simple and explainable: 55% normalized recent
-        platform event weight (views, sends, saves, likes), 25% latest
-        ``MemePopularitySnapshot.popularity_score`` in the lookback window, 15%
-        current ``Meme.popularity_score``, and 5% current ``Meme.like_count``.
-        Ties are broken by the raw components, creation time, and UUID so the
-        same data always returns the same order. Private identifiers in event
-        payloads are never returned; only public meme DTOs leave the service.
+        Scoring is intentionally simple and explainable: recent platform event
+        weight plus source engagement snapshot deltas in the lookback window,
+        current derived engagement popularity, and durable in-app likes. Baseline
+        source snapshots contribute no invented delta.
         """
 
         resolved_filters = _resolve_search_filters(filters, viewer_user_id=viewer_user_id)
@@ -892,17 +899,18 @@ class MemeSearchService:
 
         meme_ids = {meme.id for meme in memes}
         recent_scores = await self._recent_event_scores(meme_ids, since=since)
-        snapshot_scores = await self._latest_snapshot_scores(meme_ids, since=since)
+        snapshot_scores = await self._source_delta_scores(meme_ids, since=since)
+        popularity_by_meme_id = await self._attach_derived_popularity_scores(memes)
         max_recent = max(recent_scores.values(), default=0.0)
         max_snapshot = max(snapshot_scores.values(), default=0.0)
-        max_popularity = max((meme.popularity_score for meme in memes), default=0.0)
+        max_popularity = max(popularity_by_meme_id.values(), default=0.0)
         max_likes = max((meme.like_count for meme in memes), default=0)
 
         ranked: list[tuple[Meme, _CandidateScore, float]] = []
         for meme in memes:
             recent = _normalize_value(recent_scores.get(meme.id, 0.0), max_recent)
             snapshot = _normalize_value(snapshot_scores.get(meme.id, 0.0), max_snapshot)
-            popularity = _normalize_value(meme.popularity_score, max_popularity)
+            popularity = _normalize_value(popularity_by_meme_id.get(meme.id, 0.0), max_popularity)
             likes = _normalize_value(float(meme.like_count), float(max_likes))
             total_score = (
                 TRENDING_EVENT_WEIGHT * recent
@@ -1011,19 +1019,63 @@ class MemeSearchService:
             scores[meme_id] = scores.get(meme_id, 0.0) + TRENDING_EVENT_WEIGHTS[event.event_type]
         return scores
 
-    async def _latest_snapshot_scores(self, meme_ids: set[uuid.UUID], *, since: object) -> dict[uuid.UUID, float]:
+    async def _source_delta_scores(self, meme_ids: set[uuid.UUID], *, since: object) -> dict[uuid.UUID, float]:
+        if not meme_ids:
+            return {}
         result = await self._session.execute(
-            select(MemePopularitySnapshot)
-            .where(
-                MemePopularitySnapshot.meme_id.in_(tuple(meme_ids)),
-                MemePopularitySnapshot.captured_at >= since,
-            )
-            .order_by(MemePopularitySnapshot.meme_id, MemePopularitySnapshot.captured_at.desc())
+            text(
+                """
+                WITH successful AS (
+                    SELECT
+                        mf.meme_id,
+                        ses.meme_source_id,
+                        ses.id,
+                        ses.captured_at,
+                        ses.view_count,
+                        ses.reaction_count,
+                        ses.forward_count,
+                        lag(ses.view_count) OVER (
+                            PARTITION BY ses.meme_source_id
+                            ORDER BY ses.captured_at, ses.id
+                        ) AS previous_view_count,
+                        lag(ses.reaction_count) OVER (
+                            PARTITION BY ses.meme_source_id
+                            ORDER BY ses.captured_at, ses.id
+                        ) AS previous_reaction_count,
+                        lag(ses.forward_count) OVER (
+                            PARTITION BY ses.meme_source_id
+                            ORDER BY ses.captured_at, ses.id
+                        ) AS previous_forward_count
+                    FROM meme_source_engagement_snapshots ses
+                    JOIN meme_sources ms ON ms.id = ses.meme_source_id
+                    JOIN meme_files mf ON mf.id = ms.file_id
+                    WHERE ses.fetch_status::text = 'success'
+                      AND mf.meme_id IN :meme_ids
+                )
+                SELECT
+                    meme_id,
+                    sum(
+                        CASE
+                            WHEN previous_view_count IS NULL OR view_count IS NULL THEN 0
+                            ELSE GREATEST(view_count - previous_view_count, 0)
+                        END * 1.0
+                        + CASE
+                            WHEN previous_reaction_count IS NULL OR reaction_count IS NULL THEN 0
+                            ELSE GREATEST(reaction_count - previous_reaction_count, 0)
+                        END * 2.0
+                        + CASE
+                            WHEN previous_forward_count IS NULL OR forward_count IS NULL THEN 0
+                            ELSE GREATEST(forward_count - previous_forward_count, 0)
+                        END * 3.0
+                    )::double precision AS score
+                FROM successful
+                WHERE captured_at >= :since
+                GROUP BY meme_id
+                """
+            ).bindparams(bindparam("meme_ids", expanding=True)),
+            {"meme_ids": tuple(meme_ids), "since": since},
         )
-        scores: dict[uuid.UUID, float] = {}
-        for snapshot in result.scalars():
-            scores.setdefault(snapshot.meme_id, snapshot.popularity_score)
-        return scores
+        return {meme_id: float(score or 0.0) for meme_id, score in result.all()}
 
     async def _recommendation_fallback_page(
         self,
@@ -1304,20 +1356,23 @@ class MemeSearchService:
         base_stmt = _visible_meme_stmt(viewer_user_id).where(Meme.template_id == template.id)
         base_stmt = _apply_filters(base_stmt, MemeSearchFilters(include_nsfw=include_nsfw))
         total = await self._session.scalar(select(func.count()).select_from(base_stmt.order_by(None).subquery())) or 0
-        result = await self._session.execute(
-            base_stmt.order_by(Meme.popularity_score.desc(), Meme.created_at.desc())
-            .limit(resolved_limit)
-            .offset(resolved_offset),
+        result = await self._session.execute(base_stmt)
+        all_memes = list(result.scalars().all())
+        popularity_by_meme_id = await self._attach_derived_popularity_scores(all_memes)
+        sorted_memes = sorted(
+            all_memes,
+            key=lambda meme: (popularity_by_meme_id.get(meme.id, 0.0), meme.created_at, str(meme.id)),
+            reverse=True,
         )
-        memes = list(result.scalars().all())
-        max_popularity = max((meme.popularity_score for meme in memes), default=0.0)
+        memes = sorted_memes[resolved_offset : resolved_offset + resolved_limit]
+        max_popularity = max((popularity_by_meme_id.get(meme.id, 0.0) for meme in memes), default=0.0)
         items = []
         filters = _resolve_search_filters(
             MemeSearchFilters(include_nsfw=include_nsfw),
             viewer_user_id=viewer_user_id,
         )
         for rank, meme in enumerate(memes, start=resolved_offset + 1):
-            popularity = _normalize_value(meme.popularity_score, max_popularity)
+            popularity = _normalize_value(popularity_by_meme_id.get(meme.id, 0.0), max_popularity)
             score = _CandidateScore(popularity=popularity, total=POPULARITY_WEIGHT * popularity)
             score_read = _to_score_read(score)
             items.append(
@@ -1600,6 +1655,7 @@ class MemeSearchService:
             viewer_user_id=None,
             filters=filters,
         )
+        await self._attach_derived_popularity_scores(memes)
         memes_by_id = {meme.id: meme for meme in memes}
         candidates: list[_SimilarCandidate] = []
         for match in ordered_matches:
@@ -1710,17 +1766,21 @@ class MemeSearchService:
 
         if seen_meme_ids:
             stmt = stmt.where(~Meme.id.in_(tuple(seen_meme_ids)))
-        result = await self._session.execute(
-            stmt.order_by(Meme.popularity_score.desc(), Meme.created_at.desc()).limit(remaining)
-        )
-        memes = list(result.scalars().all())
-        max_popularity = max((meme.popularity_score for meme in memes), default=0.0)
+        result = await self._session.execute(stmt)
+        all_memes = list(result.scalars().all())
+        popularity_by_meme_id = await self._attach_derived_popularity_scores(all_memes)
+        memes = sorted(
+            all_memes,
+            key=lambda meme: (popularity_by_meme_id.get(meme.id, 0.0), meme.created_at, str(meme.id)),
+            reverse=True,
+        )[:remaining]
+        max_popularity = max((popularity_by_meme_id.get(meme.id, 0.0) for meme in memes), default=0.0)
         candidates: list[_SimilarCandidate] = []
         for meme in memes:
             if meme.id in seen_meme_ids:
                 continue
             seen_meme_ids.add(meme.id)
-            popularity = _normalize_value(meme.popularity_score, max_popularity)
+            popularity = _normalize_value(popularity_by_meme_id.get(meme.id, 0.0), max_popularity)
             score = POPULARITY_WEIGHT * popularity
             score_components = {"popularity": popularity, "total": score}
             if source_tags is not None:
@@ -1768,6 +1828,9 @@ class MemeSearchService:
         )
         result = await self._session.execute(stmt.where(Meme.id.in_(meme_ids)))
         memes_by_id = {meme.id: meme for meme in result.scalars().all()}
+        for source_item in page.items:
+            if meme := memes_by_id.get(source_item.meme.id):
+                setattr(meme, _DERIVED_POPULARITY_ATTR, source_item.meme.popularity_score)
         action_state = await self._load_viewer_action_state(meme_ids, viewer_user_id=viewer_user_id)
         access_markers = await self._load_viewer_access_markers(
             tuple(memes_by_id.values()),
@@ -1963,6 +2026,7 @@ class MemeSearchService:
             _public_meme_stmt().where(Meme.id.in_(unique_meme_ids)),
         )
         memes_by_id = {meme.id: meme for meme in result.scalars().all()}
+        await self._attach_derived_popularity_scores(tuple(memes_by_id.values()))
         action_state = await self._load_viewer_action_state(unique_meme_ids, viewer_user_id=viewer_user_id)
         return [
             _to_public_card_read(
@@ -1997,14 +2061,19 @@ class MemeSearchService:
             resolved_filters,
         )
         total = await self._session.scalar(select(func.count()).select_from(base_stmt.order_by(None).subquery())) or 0
-        result = await self._session.execute(
-            base_stmt.order_by(Meme.popularity_score.desc(), Meme.created_at.desc()).limit(limit).offset(offset),
+        result = await self._session.execute(base_stmt)
+        all_memes = list(result.scalars().all())
+        popularity_by_meme_id = await self._attach_derived_popularity_scores(all_memes)
+        sorted_memes = sorted(
+            all_memes,
+            key=lambda meme: (popularity_by_meme_id.get(meme.id, 0.0), meme.created_at, str(meme.id)),
+            reverse=True,
         )
-        memes = list(result.scalars().all())
-        max_popularity = max((meme.popularity_score for meme in memes), default=0.0)
+        memes = sorted_memes[offset : offset + limit]
+        max_popularity = max((popularity_by_meme_id.get(meme.id, 0.0) for meme in memes), default=0.0)
         items = []
         for rank, meme in enumerate(memes, start=offset + 1):
-            popularity = _normalize_value(meme.popularity_score, max_popularity)
+            popularity = _normalize_value(popularity_by_meme_id.get(meme.id, 0.0), max_popularity)
             score = _CandidateScore(popularity=popularity, total=POPULARITY_WEIGHT * popularity)
             score_read = _to_score_read(score)
             items.append(
@@ -2033,6 +2102,13 @@ class MemeSearchService:
             has_more=offset + limit < total,
             request_id=request_id,
         )
+
+    async def _attach_derived_popularity_scores(self, memes: Sequence[Meme]) -> dict[uuid.UUID, float]:
+        meme_ids = tuple(dict.fromkeys(meme.id for meme in memes))
+        scores = await load_derived_popularity_scores(self._session, meme_ids)
+        for meme in memes:
+            setattr(meme, _DERIVED_POPULARITY_ATTR, scores.get(meme.id, 0.0))
+        return scores
 
     def _apply_normalized_scores(
         self,
@@ -2444,6 +2520,11 @@ def _normalize_value(value: float, max_value: float) -> float:
     return max(0.0, min(1.0, value / max_value))
 
 
+def _derived_popularity_score(meme: Meme) -> float:
+    raw_value = getattr(meme, _DERIVED_POPULARITY_ATTR, 0.0)
+    return float(raw_value or 0.0)
+
+
 def _clamp_limit(limit: int) -> int:
     return min(100, max(1, limit))
 
@@ -2510,7 +2591,7 @@ def _to_card_read(meme: Meme) -> MemeCardRead:
         media_type=meme.media_type,
         language=meme.language,
         is_nsfw=meme.is_nsfw,
-        popularity_score=meme.popularity_score,
+        popularity_score=_derived_popularity_score(meme),
         like_count=meme.like_count,
         tags=list(meme.tags),
         primary_file=_to_file_read(meme.primary_file) if meme.primary_file else None,
@@ -2535,7 +2616,7 @@ def _to_public_card_read(
         media_type=meme.media_type,
         language=meme.language,
         is_nsfw=meme.is_nsfw,
-        popularity_score=meme.popularity_score,
+        popularity_score=_derived_popularity_score(meme),
         like_count=meme.like_count,
         tags=list(meme.tags),
         primary_file=(
@@ -2572,7 +2653,7 @@ def _to_authorized_card_read(
         media_type=meme.media_type,
         language=meme.language,
         is_nsfw=meme.is_nsfw,
-        popularity_score=meme.popularity_score,
+        popularity_score=_derived_popularity_score(meme),
         like_count=meme.like_count,
         tags=list(meme.tags),
         primary_file=(

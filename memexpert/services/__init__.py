@@ -93,6 +93,8 @@ _EXPORTS: dict[str, str] = {
     "SEO_PROMPT_BASELINE": "memexpert.services.meme_seo",
     "ServiceError": "memexpert.services.errors",
     "ServiceValidationError": "memexpert.services.errors",
+    "SourceEngagementMetrics": "memexpert.services.source_engagement",
+    "SourceEngagementScheduleSlot": "memexpert.services.source_engagement",
     "StaticMemeSeoProvider": "memexpert.services.meme_seo",
     "TelegramInlineMediaResult": "memexpert.services.telegram_inline",
     "TelegramInlineMediaUrlProvider": "memexpert.services.telegram_inline",
@@ -103,8 +105,11 @@ _EXPORTS: dict[str, str] = {
     "UserNotFoundError": "memexpert.services.errors",
     "UserService": "memexpert.services.user_service",
     "UserServiceError": "memexpert.services.errors",
+    "add_source_engagement_snapshot": "memexpert.services.source_engagement",
     "build_meme_seo_provider": "memexpert.services.meme_seo",
+    "next_source_engagement_schedule_slot": "memexpert.services.source_engagement",
     "normalize_channel_suggestion": "memexpert.services.channel_suggestion_service",
+    "reaction_count_from_reactions": "memexpert.services.source_engagement",
 }
 
 

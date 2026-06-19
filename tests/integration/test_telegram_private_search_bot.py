@@ -51,6 +51,7 @@ BOT_USERNAME = "memexpertbot"
 RETURN_URL = "https://memexpert.test/link/telegram/complete"
 JWT_SECRET = "private-search-test-auth-secret-with-32-byte-minimum"
 TELEGRAM_ID = 870_220_330
+_DERIVED_POPULARITY_ATTR = "_derived_popularity_score"
 
 
 class RecordingTelegramSession(BaseSession):
@@ -185,10 +186,10 @@ async def create_meme_file(
         primary_file_id=file_id,
         language=ContentLanguage.EN,
         tags=tags or ["search"],
-        popularity_score=popularity_score,
         is_public=is_public,
         author_user_id=author_user_id,
     )
+    setattr(meme, _DERIVED_POPULARITY_ATTR, popularity_score)
     file = MemeFile(
         id=file_id,
         meme_id=meme_id,
@@ -230,7 +231,7 @@ def search_page_for(entries: list[tuple[Meme, MemeFile]]) -> MemeSearchPageRead:
                     media_type=meme.media_type,
                     language=meme.language,
                     is_nsfw=meme.is_nsfw,
-                    popularity_score=meme.popularity_score,
+                    popularity_score=float(getattr(meme, "_derived_popularity_score", 0.0)),
                     like_count=meme.like_count,
                     tags=list(meme.tags),
                     primary_file=MemeFileRead(

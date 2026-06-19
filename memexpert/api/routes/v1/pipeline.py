@@ -79,7 +79,7 @@ async def create_pipeline_upload(
     file: Annotated[UploadFile, File()],
     owner_user_id: Annotated[uuid.UUID | None, Form()] = None,
     target_collection_id: Annotated[uuid.UUID | None, Form()] = None,
-    views: Annotated[int, Form(ge=0)] = 0,
+    view_count: Annotated[int | None, Form(ge=0)] = None,
 ) -> IngestRequestRead:
     """Accept raw bytes without synchronous media inspection or materialization."""
 
@@ -92,7 +92,7 @@ async def create_pipeline_upload(
             post_id=post_id,
             owner_user_id=owner_user_id,
             user_metadata=user_metadata_with_target_collection(target_collection_id=target_collection_id),
-            views=views,
+            view_count=view_count,
         )
     except PipelinePayloadValidationError as exc:
         raise to_pipeline_http_error(exc) from exc

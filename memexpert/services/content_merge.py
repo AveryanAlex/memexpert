@@ -15,7 +15,6 @@ from memexpert.models.content import (
     Meme,
     MemeFile,
     MemeMergeLog,
-    MemePopularitySnapshot,
 )
 from memexpert.services.errors import PipelineIngestError
 
@@ -45,7 +44,7 @@ class ContentMergeService:
     The merge path is deliberately transactional: the stage completion service
     opens one durable commit after stage-row truth changes, and the merge writes
     the entire lineage transfer (files, sources, collection membership, pins,
-    popularity, merge-audit row) plus the canonical-primary reselection into
+    collection membership, pins, merge-audit row) plus the canonical-primary reselection into
     that same session. Any failure raises ``PipelineIngestError`` so the
     enclosing commit is rolled back and the ``embed`` stage stays replayable.
     """
@@ -175,11 +174,7 @@ class ContentMergeService:
         moved_file_ids = await self._transfer_meme_files(source_meme_id=source_meme.id, target_meme_id=target_meme.id)
         await self._transfer_collection_memberships(source_meme_id=source_meme.id, target_meme_id=target_meme.id)
         await self._transfer_pins(source_meme_id=source_meme.id, target_meme_id=target_meme.id)
-        await self._transfer_popularity_snapshots(
-            source_meme_id=source_meme.id,
-            target_meme_id=target_meme.id,
-        )
-        self._accumulate_popularity(source_meme=source_meme, target_meme=target_meme)
+        self._accumulate_like_count(source_meme=source_meme, target_meme=target_meme)
         await self._delete_source_meme(source_meme=source_meme)
 
         primary_file_id = await self._reselect_primary_file(target_meme.id)
@@ -273,35 +268,9 @@ class ContentMergeService:
                 pin.meme_id = target_meme_id
         await self._session.flush()
 
-    async def _transfer_popularity_snapshots(
-        self,
-        *,
-        source_meme_id: uuid.UUID,
-        target_meme_id: uuid.UUID,
-    ) -> None:
-        # Snapshots are uniquely scoped by (meme_id, captured_at). Preserve existing target
-        # snapshots by deleting source rows whose captured_at collides, then re-point the rest.
-        target_captured_at_result = await self._session.execute(
-            select(MemePopularitySnapshot.captured_at).where(
-                MemePopularitySnapshot.meme_id == target_meme_id
-            )
-        )
-        target_captured_at_values = {value for value in target_captured_at_result.scalars().all()}
-
-        source_snapshots_result = await self._session.execute(
-            select(MemePopularitySnapshot).where(MemePopularitySnapshot.meme_id == source_meme_id)
-        )
-        for snapshot in source_snapshots_result.scalars().all():
-            if snapshot.captured_at in target_captured_at_values:
-                await self._session.delete(snapshot)
-            else:
-                snapshot.meme_id = target_meme_id
-        await self._session.flush()
-
     @staticmethod
-    def _accumulate_popularity(*, source_meme: Meme, target_meme: Meme) -> None:
+    def _accumulate_like_count(*, source_meme: Meme, target_meme: Meme) -> None:
         target_meme.like_count += source_meme.like_count
-        target_meme.popularity_score = max(target_meme.popularity_score, source_meme.popularity_score)
 
     async def _delete_source_meme(self, *, source_meme: Meme) -> None:
         await self._session.delete(source_meme)

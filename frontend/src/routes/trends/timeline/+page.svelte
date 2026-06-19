@@ -20,8 +20,8 @@
 
 <PageHeader
   title="Meme timeline."
-  description="Browse months or years with real captured popularity snapshots. Period rankings use actual snapshot scores and counts only."
-  badge="Real snapshots"
+  description="Browse months or years with derived source-engagement and platform-event points. Period rankings use real deltas and event counts only."
+  badge="Real engagement"
 >
   <ActionLink href="/trends" variant="secondary">Back to trends</ActionLink>
   <ActionLink href="/trends/compare" variant="secondary">Compare trends</ActionLink>
@@ -43,7 +43,7 @@
         <div class="flex flex-wrap items-end justify-between gap-3">
           <div>
             <h2 class="m-0 text-3xl font-black tracking-[-0.05em]">{periodLabel(period.period_start, data.granularity)}</h2>
-            <p class="m-0 text-muted">{period.meme_count} memes · {period.snapshot_count} real snapshots</p>
+            <p class="m-0 text-muted">{period.meme_count} memes · {period.snapshot_count} source checks</p>
           </div>
           <span class="rounded-full border border-line bg-soft px-3 py-2 text-sm font-extrabold">{period.period}</span>
         </div>
@@ -81,7 +81,7 @@
     {/each}
   </section>
 {:else if !data.errorMessage}
-  <EmptyState title="No timeline data yet" message="No public meme popularity snapshots are available. The timeline only appears after real snapshots have been captured." />
+  <EmptyState title="No timeline data yet" message="No public engagement points are available. The timeline only appears after source deltas or platform events have been captured." />
 {/if}
 
 <nav class="mt-6 flex flex-wrap gap-2" aria-label="Timeline pagination">

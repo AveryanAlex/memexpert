@@ -9,8 +9,15 @@ from typing import TYPE_CHECKING
 import pytest
 
 from memexpert.api.dependencies.meme import get_seo_catalog_service
-from memexpert.models.content import Meme, MemeFile, MemeSeoPage, MemeTemplate
-from memexpert.models.enums import ContentKind, ContentLanguage
+from memexpert.models.content import Meme, MemeFile, MemeSeoPage, MemeSource, MemeSourceEngagementSnapshot, MemeTemplate
+from memexpert.models.enums import (
+    ContentKind,
+    ContentLanguage,
+    SourceEngagementCaptureReason,
+    SourceEngagementCommentsState,
+    SourceEngagementFetchStatus,
+    SourcePlatform,
+)
 from memexpert.services.seo_catalog import SeoCatalogService
 
 if TYPE_CHECKING:
@@ -48,7 +55,6 @@ async def _create_meme(
         "tags": tags or [],
         "is_public": is_public,
         "is_nsfw": is_nsfw,
-        "popularity_score": popularity_score,
         "like_count": like_count,
         "template_id": template.id if template is not None else None,
         "ocr_text": ocr_text,
@@ -76,6 +82,32 @@ async def _create_meme(
     session.add(meme)
     await session.flush()
     session.add(file)
+    if popularity_score > 0.0:
+        source = MemeSource(
+            file_id=file_id,
+            platform=SourcePlatform.TELEGRAM,
+            source_id=f"seo-catalog-{meme_id.hex}",
+            post_id="1",
+            is_first_source=True,
+            source_alive=True,
+        )
+        session.add(source)
+        await session.flush()
+        session.add(
+            MemeSourceEngagementSnapshot(
+                meme_source_id=source.id,
+                capture_reason=SourceEngagementCaptureReason.MANUAL_REFRESH,
+                view_count=max(1, int(popularity_score)),
+                reactions={},
+                reaction_count=0,
+                comment_count=None,
+                forward_count=0,
+                comments_state=SourceEngagementCommentsState.UNKNOWN,
+                fetch_status=SourceEngagementFetchStatus.SUCCESS,
+                source_alive=True,
+                raw_metrics={"test": True},
+            )
+        )
     if seo_slug is not None:
         session.add(
             MemeSeoPage(

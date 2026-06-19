@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, cast
 import pytest
 import pytest_asyncio
 from pydantic import ValidationError
-from sqlalchemy import Table, UniqueConstraint, inspect as sa_inspect, select
+from sqlalchemy import CheckConstraint, Table, UniqueConstraint, inspect as sa_inspect, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import configure_mappers, selectinload
 
@@ -28,9 +28,9 @@ from memexpert.models.content import (
     MemeFileOCRResult,
     MemeFileSyncTargetSnapshot,
     MemeMergeLog,
-    MemePopularitySnapshot,
     MemeSeoPage,
     MemeSource,
+    MemeSourceEngagementSnapshot,
     MemeTemplate,
     ModerationDecision,
     ModerationReport,
@@ -60,6 +60,10 @@ from memexpert.models.enums import (
     ModerationAction,
     ModerationReason,
     ModerationReportStatus,
+    SourceEngagementCaptureReason,
+    SourceEngagementCommentsState,
+    SourceEngagementFetchStatus,
+    SourceEngagementScheduleLabel,
     SourcePlatform,
     SyncTargetKind,
     SyncTargetStatus,
@@ -110,8 +114,8 @@ EXPECTED_TABLES = {
     "login_events",
     "meme_files",
     "meme_merge_logs",
-    "meme_popularity_snapshots",
     "meme_seo_pages",
+    "meme_source_engagement_snapshots",
     "meme_sources",
     "meme_templates",
     "memes",
@@ -216,6 +220,7 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
     assert metadata.tables["users"].c["active_save_collection_id"].foreign_keys
     assert metadata.tables["collections"].c["owner_id"].foreign_keys
     assert not memes_table.c["primary_file_id"].nullable
+    assert "popularity_score" not in memes_table.c
     assert meme_files_table.c["meme_id"].foreign_keys
     assert pipeline_ingest_requests_table.c["owner_user_id"].foreign_keys
     assert pipeline_ingest_requests_table.c["materialized_meme_id"].foreign_keys
@@ -244,6 +249,8 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
     user_relationships = sa_inspect(User).relationships
     meme_relationships = sa_inspect(Meme).relationships
     meme_file_relationships = sa_inspect(MemeFile).relationships
+    meme_source_relationships = sa_inspect(MemeSource).relationships
+    meme_source_columns = sa_inspect(MemeSource).columns
     pipeline_ingest_request_relationships = sa_inspect(PipelineIngestRequest).relationships
 
     assert user_relationships["active_save_collection"].mapper.class_ is Collection
@@ -251,6 +258,7 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
     assert user_relationships["telegram_link_codes"].mapper.class_ is TelegramLinkCode
     assert meme_relationships["files"].mapper.class_ is MemeFile
     assert meme_relationships["primary_file"].mapper.class_ is MemeFile
+    assert "popularity_snapshots" not in meme_relationships
     assert meme_relationships["moderation_reports"].mapper.class_ is ModerationReport
     assert meme_relationships["moderation_decisions"].mapper.class_ is ModerationDecision
     assert pipeline_ingest_request_relationships["materialized_meme"].mapper.class_ is Meme
@@ -270,6 +278,9 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
     assert meme_file_relationships["ocr_result"].mapper.class_ is MemeFileOCRResult
     assert meme_file_relationships["sync_target_snapshots"].mapper.class_ is MemeFileSyncTargetSnapshot
     assert meme_file_relationships["blocked_perceptual_hash"].mapper.class_ is BlockedPerceptualHash
+    assert meme_source_relationships["engagement_snapshots"].mapper.class_ is MemeSourceEngagementSnapshot
+    assert "views" not in meme_source_columns
+    assert "reactions" not in meme_source_columns
     assert sa_inspect(BlockedPerceptualHashAuditLog).columns["blocked_perceptual_hash_id"] is not None
 
 
@@ -503,19 +514,22 @@ async def test_schema_handles_cycles_multi_invites_and_nullable_content_fields(
                     platform=SourcePlatform.TELEGRAM,
                     source_id="memes_channel",
                     post_id="12345",
-                    views=321,
-                    reactions={"like": 10},
                     is_first_source=True,
-                ),
-                MemePopularitySnapshot(
-                    meme=meme,
-                    source_views=100,
-                    source_reactions=12,
-                    platform_views=50,
-                    platform_sends=5,
-                    platform_saves=3,
-                    platform_likes=7,
-                    popularity_score=1.25,
+                    engagement_snapshots=[
+                        MemeSourceEngagementSnapshot(
+                            captured_at=utcnow(),
+                            capture_reason=SourceEngagementCaptureReason.INGEST_INITIAL,
+                            view_count=321,
+                            reactions={"like": 10},
+                            reaction_count=10,
+                            comment_count=None,
+                            forward_count=4,
+                            comments_state=SourceEngagementCommentsState.UNKNOWN,
+                            fetch_status=SourceEngagementFetchStatus.SUCCESS,
+                            source_alive=True,
+                            raw_metrics={"source": "contract"},
+                        )
+                    ],
                 ),
                 TelegramFileIdCache(
                     meme_file=file_one,
@@ -1396,6 +1410,37 @@ def test_telegram_session_status_values_are_locked_and_stable() -> None:
     ]
 
 
+def test_source_engagement_enum_values_are_locked_and_stable() -> None:
+    assert [member.value for member in SourceEngagementCaptureReason] == [
+        "ingest_initial",
+        "scheduled",
+        "manual_refresh",
+    ]
+    assert [member.value for member in SourceEngagementScheduleLabel] == [
+        "ingest_initial",
+        "plus_1h",
+        "plus_3h",
+        "plus_12h",
+        "plus_1d",
+        "plus_3d",
+        "plus_7d",
+        "plus_1month",
+        "monthly",
+    ]
+    assert [member.value for member in SourceEngagementFetchStatus] == [
+        "success",
+        "not_found",
+        "not_accessible",
+        "failed",
+    ]
+    assert [member.value for member in SourceEngagementCommentsState] == [
+        "unknown",
+        "enabled",
+        "disabled",
+        "not_exposed",
+    ]
+
+
 def test_meme_source_exposes_forward_attribution_columns_and_helper() -> None:
     # The forward-chain columns must exist on the ORM model so crawler ingest can
     # populate them; ``is_forwarded`` is the ergonomic helper that keeps the
@@ -1404,6 +1449,13 @@ def test_meme_source_exposes_forward_attribution_columns_and_helper() -> None:
     assert "published_at" in columns
     assert "forwarded_from_source_id" in columns
     assert "forwarded_from_post_id" in columns
+    assert "last_engagement_check_at" in columns
+    assert "next_engagement_check_at" in columns
+    assert "engagement_check_locked_at" in columns
+    assert "engagement_check_lock_owner" in columns
+    assert "engagement_check_attempt_count" in columns
+    assert "last_engagement_error_code" in columns
+    assert columns["engagement_check_attempt_count"].default.arg == 0
 
     plain = MemeSource(
         file_id=uuid.uuid7(),
@@ -1422,6 +1474,65 @@ def test_meme_source_exposes_forward_attribution_columns_and_helper() -> None:
         forwarded_from_post_id="7",
     )
     assert reposter.is_forwarded is True
+
+
+def test_source_engagement_snapshot_model_contract() -> None:
+    table = cast("Table", MemeSourceEngagementSnapshot.__table__)
+
+    assert set(table.c.keys()) == {
+        "captured_at",
+        "capture_reason",
+        "comment_count",
+        "comments_state",
+        "created_at",
+        "error_code",
+        "fetch_status",
+        "forward_count",
+        "id",
+        "meme_source_id",
+        "raw_metrics",
+        "reaction_count",
+        "reactions",
+        "scheduled_for",
+        "schedule_label",
+        "source_alive",
+        "updated_at",
+        "view_count",
+    }
+    assert table.c["meme_source_id"].foreign_keys
+    assert table.c["view_count"].nullable
+    assert table.c["reactions"].nullable
+    assert table.c["reaction_count"].nullable
+    assert not table.c["raw_metrics"].nullable
+
+    unique_constraints = {
+        constraint.name: tuple(column.name for column in constraint.columns)
+        for constraint in table.constraints
+        if isinstance(constraint, UniqueConstraint)
+    }
+    assert unique_constraints == {
+        "uq_meme_source_engagement_snapshots_source_captured_at": ("meme_source_id", "captured_at"),
+        "uq_meme_source_engagement_snapshots_source_schedule": (
+            "meme_source_id",
+            "scheduled_for",
+            "schedule_label",
+        ),
+    }
+
+    check_constraint_sql = " ".join(
+        str(constraint.sqltext).lower()
+        for constraint in table.constraints
+        if isinstance(constraint, CheckConstraint)
+    )
+    assert "view_count" in check_constraint_sql
+    assert "reaction_count" in check_constraint_sql
+    assert "comment_count" in check_constraint_sql
+    assert "forward_count" in check_constraint_sql
+    assert ">= 0" in check_constraint_sql
+
+    index_names = {index.name for index in table.indexes}
+    assert "ix_meme_source_engagement_snapshots_source_captured_desc" in index_names
+    assert "ix_meme_source_engagement_snapshots_label_status_captured" in index_names
 
 
 def test_source_channel_exposes_crawler_checkpoint_columns() -> None:

@@ -223,7 +223,7 @@ def ingest_result_for(
             post_id=post_id,
             owner_user_id=owner_user_id,
             user_metadata={},
-            source_metadata={"views": 0},
+            source_metadata={"view_count": 0},
             declared_filename="telegram-photo-701-photo-unique-1.jpg",
             declared_content_type="image/jpeg",
             temp_original_object_key="pipeline/temp-originals/fake/raw.jpg" if meme_id is None else None,
@@ -397,7 +397,7 @@ async def test_private_photo_upload_queues_raw_ingest_with_active_collection_met
     assert source.source_platform is SourcePlatform.TELEGRAM
     assert source.source_id == f"telegram_pm:{TELEGRAM_ID}:{TELEGRAM_ID}"
     assert source.post_id == "message:701:file:photo-unique-1"
-    assert source.views == 0
+    assert source.view_count == 0
     assert accept_service.calls[0]["filename"] == "telegram-photo-701-photo-unique-1.jpg"
     assert accept_service.calls[0]["content_type"] == "image/jpeg"
     assert accept_service.calls[0]["media_bytes"] == b"photo-bytes"

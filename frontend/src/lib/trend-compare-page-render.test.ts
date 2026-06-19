@@ -19,7 +19,7 @@ describe('/trends/compare page', () => {
     });
 
     expect(body).toContain('Compare public trends.');
-    expect(body).toContain('Meme series use per-meme popularity snapshots');
+    expect(body).toContain('Meme series use source-delta and platform-event engagement points');
     expect(body).toContain('meme:launch-reaction');
     expect(body).toContain('tag:reaction');
     expect(body).toContain('template:current-only-template');

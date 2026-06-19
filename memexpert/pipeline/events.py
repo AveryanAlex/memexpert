@@ -12,15 +12,22 @@ from pydantic import BaseModel, ConfigDict, Field
 from memexpert.core.config import Settings
 from memexpert.messaging.rabbitmq_outbox import RabbitMessageSpec
 from memexpert.models.base import utcnow
-from memexpert.models.enums import ContentPipelineStage, ContentSourceKind, SourcePlatform
+from memexpert.models.enums import (
+    ContentPipelineStage,
+    ContentSourceKind,
+    SourceEngagementScheduleLabel,
+    SourcePlatform,
+)
 from memexpert.schemas.content_pipeline import ContentPipelineDispatchEvent, ContentPipelineEventType
 
 if TYPE_CHECKING:
-    from memexpert.models.content import MemeFile, PipelineIngestRequest
+    from memexpert.models.content import MemeFile, MemeSource, PipelineIngestRequest
 
 PIPELINE_INGEST_REQUEST_AGGREGATE_TYPE: Final = "pipeline_ingest_request"
 PIPELINE_MEME_FILE_AGGREGATE_TYPE: Final = "meme_file"
+PIPELINE_MEME_SOURCE_AGGREGATE_TYPE: Final = "meme_source"
 MEDIA_INSPECT_REQUESTED_EVENT_TYPE: Final = "media_inspect_requested"
+SOURCE_ENGAGEMENT_CAPTURE_REQUESTED_EVENT_TYPE: Final = "source_engagement_capture_requested"
 
 
 class MediaInspectRequestedEvent(BaseModel):
@@ -36,10 +43,33 @@ class MediaInspectRequestedEvent(BaseModel):
     created_at: datetime
 
 
+class SourceEngagementCaptureRequestedEvent(BaseModel):
+    """Validated payload consumed by the source-engagement capture worker."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    event_id: uuid.UUID
+    event_type: Literal["source_engagement_capture_requested"]
+    meme_source_id: uuid.UUID
+    source_platform: SourcePlatform
+    source_id: str = Field(min_length=1, max_length=255)
+    post_id: str = Field(min_length=1, max_length=255)
+    scheduled_for: datetime
+    schedule_label: SourceEngagementScheduleLabel
+    session_name: str | None = Field(default=None, min_length=1, max_length=64)
+    created_at: datetime
+
+
 def build_media_inspect_routing_key(settings: Settings) -> str:
     """Return the future media-inspect worker routing key."""
 
     return f"{settings.pipeline_broker_routing_key_prefix}.media_inspect"
+
+
+def build_source_engagement_capture_routing_key(settings: Settings) -> str:
+    """Return the worker routing key for source engagement capture work."""
+
+    return f"{settings.pipeline_broker_routing_key_prefix}.source_engagement_capture"
 
 
 def build_stage_routing_key(settings: Settings, stage: ContentPipelineStage) -> str:
@@ -95,6 +125,69 @@ def build_media_inspect_message_spec(
         aggregate_type=PIPELINE_INGEST_REQUEST_AGGREGATE_TYPE,
         aggregate_id=ingest_request.id,
         ordering_key=str(ingest_request.id),
+        created_at=created_at,
+    )
+
+
+def build_source_engagement_capture_requested_payload(
+    *,
+    event_id: uuid.UUID,
+    meme_source_id: uuid.UUID,
+    source_platform: SourcePlatform,
+    source_id: str,
+    post_id: str,
+    scheduled_for: datetime,
+    schedule_label: SourceEngagementScheduleLabel,
+    session_name: str | None,
+    created_at: datetime,
+) -> dict[str, object]:
+    """Build the JSONB payload for a scheduled source engagement capture request."""
+
+    return SourceEngagementCaptureRequestedEvent(
+        event_id=event_id,
+        event_type=SOURCE_ENGAGEMENT_CAPTURE_REQUESTED_EVENT_TYPE,
+        meme_source_id=meme_source_id,
+        source_platform=source_platform,
+        source_id=source_id,
+        post_id=post_id,
+        scheduled_for=scheduled_for,
+        schedule_label=schedule_label,
+        session_name=session_name,
+        created_at=created_at,
+    ).model_dump(mode="json")
+
+
+def build_source_engagement_capture_message_spec(
+    source: MemeSource,
+    *,
+    scheduled_for: datetime,
+    schedule_label: SourceEngagementScheduleLabel,
+    settings: Settings,
+    session_name: str | None = None,
+) -> RabbitMessageSpec:
+    """Return a durable RabbitMQ message spec for scheduled source engagement capture."""
+
+    event_id = uuid.uuid7()
+    created_at = utcnow()
+    return RabbitMessageSpec(
+        exchange=settings.pipeline_broker_exchange,
+        routing_key=build_source_engagement_capture_routing_key(settings),
+        payload=build_source_engagement_capture_requested_payload(
+            event_id=event_id,
+            meme_source_id=source.id,
+            source_platform=source.platform,
+            source_id=source.source_id,
+            post_id=source.post_id,
+            scheduled_for=scheduled_for,
+            schedule_label=schedule_label,
+            session_name=session_name,
+            created_at=created_at,
+        ),
+        message_id=str(event_id),
+        event_type=SOURCE_ENGAGEMENT_CAPTURE_REQUESTED_EVENT_TYPE,
+        aggregate_type=PIPELINE_MEME_SOURCE_AGGREGATE_TYPE,
+        aggregate_id=source.id,
+        ordering_key=str(source.id),
         created_at=created_at,
     )
 
@@ -155,11 +248,17 @@ __all__ = [
     "MEDIA_INSPECT_REQUESTED_EVENT_TYPE",
     "PIPELINE_INGEST_REQUEST_AGGREGATE_TYPE",
     "PIPELINE_MEME_FILE_AGGREGATE_TYPE",
+    "PIPELINE_MEME_SOURCE_AGGREGATE_TYPE",
+    "SOURCE_ENGAGEMENT_CAPTURE_REQUESTED_EVENT_TYPE",
     "MediaInspectRequestedEvent",
+    "SourceEngagementCaptureRequestedEvent",
     "build_media_inspect_message_spec",
     "build_meme_created_transcode_dispatch_event",
     "build_meme_created_transcode_message_spec",
     "build_media_inspect_requested_payload",
     "build_media_inspect_routing_key",
+    "build_source_engagement_capture_message_spec",
+    "build_source_engagement_capture_requested_payload",
+    "build_source_engagement_capture_routing_key",
     "build_stage_routing_key",
 ]

@@ -150,6 +150,46 @@ class SourceAttachReason(StrEnum):
     BLOCKED_PERCEPTUAL_HASH_NEW_FILE = "blocked_perceptual_hash_new_file"
 
 
+class SourceEngagementCaptureReason(StrEnum):
+    """Why a source engagement snapshot was captured."""
+
+    INGEST_INITIAL = "ingest_initial"
+    SCHEDULED = "scheduled"
+    MANUAL_REFRESH = "manual_refresh"
+
+
+class SourceEngagementScheduleLabel(StrEnum):
+    """Canonical source engagement schedule slots."""
+
+    INGEST_INITIAL = "ingest_initial"
+    PLUS_1H = "plus_1h"
+    PLUS_3H = "plus_3h"
+    PLUS_12H = "plus_12h"
+    PLUS_1D = "plus_1d"
+    PLUS_3D = "plus_3d"
+    PLUS_7D = "plus_7d"
+    PLUS_1MONTH = "plus_1month"
+    MONTHLY = "monthly"
+
+
+class SourceEngagementFetchStatus(StrEnum):
+    """Normalized outcomes from upstream source engagement fetches."""
+
+    SUCCESS = "success"
+    NOT_FOUND = "not_found"
+    NOT_ACCESSIBLE = "not_accessible"
+    FAILED = "failed"
+
+
+class SourceEngagementCommentsState(StrEnum):
+    """How much comment availability is exposed by the upstream source."""
+
+    UNKNOWN = "unknown"
+    ENABLED = "enabled"
+    DISABLED = "disabled"
+    NOT_EXPOSED = "not_exposed"
+
+
 class ContentPipelineStage(StrEnum):
     """Pipeline stages recorded in the DB-backed journal."""
 
@@ -366,6 +406,10 @@ __all__ = [
     "ModerationAction",
     "ModerationReason",
     "ModerationReportStatus",
+    "SourceEngagementCaptureReason",
+    "SourceEngagementCommentsState",
+    "SourceEngagementFetchStatus",
+    "SourceEngagementScheduleLabel",
     "SourcePlatform",
     "SourceAttachReason",
     "SyncTargetKind",

@@ -28,7 +28,7 @@ from memexpert.crawlers.telegram.runtime import (
     TelegramCrawlerRuntime,
 )
 from memexpert.models.content import TelegramSessionState
-from memexpert.models.enums import SourcePlatform, TelegramSessionStatus
+from memexpert.models.enums import SourceEngagementCommentsState, SourcePlatform, TelegramSessionStatus
 from memexpert.schemas.content_pipeline import (
     CrawlerForwardAttribution,
     CrawlerIngestOutcome,
@@ -62,9 +62,12 @@ def _build_message(
         channel_title="Memes Channel",
         published_at=_now(),
         media_type=cast("_TelegramMediaType", media_type),
-        views=11,
+        view_count=11,
         reactions={"heart": 3},
         forward=forward,
+        forward_count=4,
+        comment_count=2,
+        comments_state=SourceEngagementCommentsState.ENABLED,
     )
 
 
@@ -84,6 +87,10 @@ def test_pipeline_telegram_message_mapper_builds_raw_crawler_post_with_forward()
     assert raw_post.post_id == "42"
     assert raw_post.media_type == "photo"
     assert raw_post.media_bytes == b"image-bytes"
+    assert raw_post.view_count == 11
+    assert raw_post.forward_count == 4
+    assert raw_post.comment_count == 2
+    assert raw_post.comments_state is SourceEngagementCommentsState.ENABLED
     assert raw_post.forward == forward
     assert raw_post.published_at == message.published_at
     # Filename + content_type are intentionally None — the service fills in
@@ -117,7 +124,7 @@ def test_raw_crawler_post_rejects_non_telegram_platforms() -> None:
             media_bytes=b"bytes",
             filename=None,
             content_type=None,
-            views=0,
+            view_count=None,
             reactions={},
             forward=None,
         )

@@ -10,8 +10,11 @@ from memexpert.ingest.collection_targets import (
     save_meme_to_target_collection,
     visible_meme_clause,
 )
-from memexpert.ingest.materialization.sources import source_views
-from memexpert.ingest.source_metadata import source_forward_ids, source_published_at, source_reactions
+from memexpert.ingest.source_metadata import (
+    source_engagement_metrics,
+    source_forward_ids,
+    source_published_at,
+)
 from memexpert.ingest.target_collection_metadata import TargetCollectionMetadataError, parse_target_collection_id
 from memexpert.models.content import Meme, MemeFile, MemeSource, PipelineStageJournal
 from memexpert.models.enums import (
@@ -22,6 +25,7 @@ from memexpert.models.enums import (
     SourceAttachReason,
 )
 from memexpert.services.errors import PipelinePayloadValidationError
+from memexpert.services.source_engagement import add_initial_source_engagement_snapshot
 
 if TYPE_CHECKING:
     import uuid
@@ -68,6 +72,19 @@ async def create_phash_duplicate_rows(
     """Create a new file/source under an existing meme for an exact pHash match."""
 
     forwarded_from_source_id, forwarded_from_post_id = source_forward_ids(ingest_request.source_metadata)
+    source_row = MemeSource(
+        file_id=meme_file_id,
+        platform=ingest_request.source_platform,
+        source_id=ingest_request.source_id,
+        post_id=ingest_request.post_id,
+        is_first_source=False,
+        source_alive=True,
+        published_at=source_published_at(ingest_request.source_metadata),
+        forwarded_from_source_id=forwarded_from_source_id,
+        forwarded_from_post_id=forwarded_from_post_id,
+        attach_reason=SourceAttachReason.PHASH_EXACT_NEW_FILE,
+        matched_meme_file_id=phash_match.id,
+    )
     session.add(
         MemeFile(
             id=meme_file_id,
@@ -86,21 +103,7 @@ async def create_phash_duplicate_rows(
     )
     session.add_all(
         [
-            MemeSource(
-                file_id=meme_file_id,
-                platform=ingest_request.source_platform,
-                source_id=ingest_request.source_id,
-                post_id=ingest_request.post_id,
-                views=source_views(ingest_request),
-                reactions=source_reactions(ingest_request.source_metadata),
-                is_first_source=False,
-                source_alive=True,
-                published_at=source_published_at(ingest_request.source_metadata),
-                forwarded_from_source_id=forwarded_from_source_id,
-                forwarded_from_post_id=forwarded_from_post_id,
-                attach_reason=SourceAttachReason.PHASH_EXACT_NEW_FILE,
-                matched_meme_file_id=phash_match.id,
-            ),
+            source_row,
             PipelineStageJournal(
                 meme_file_id=meme_file_id,
                 stage=ContentPipelineStage.INGEST,
@@ -120,6 +123,12 @@ async def create_phash_duplicate_rows(
                 is_retryable=True,
             ),
         ]
+    )
+    await add_initial_source_engagement_snapshot(
+        session,
+        source_row,
+        source_engagement_metrics(ingest_request.source_metadata),
+        captured_at=created_at,
     )
     await session.flush()
 

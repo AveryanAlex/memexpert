@@ -23,6 +23,7 @@ from memexpert.crawlers.telegram.client import (
     PipelineTelegramMalformedMessageError,
     RawTelegramMessage,
 )
+from memexpert.models.enums import SourceEngagementCommentsState
 from memexpert.schemas.content_pipeline import CrawlerForwardAttribution
 
 if TYPE_CHECKING:
@@ -69,6 +70,14 @@ class _MessageReactionsLike(Protocol):
 
 
 @runtime_checkable
+class _MessageRepliesLike(Protocol):
+    """Minimal duck-typing shape for ``MessageReplies``."""
+
+    replies: int | None
+    comments: bool | None
+
+
+@runtime_checkable
 class _TelethonMessageLike(Protocol):
     """Minimal duck-typing shape for a Telethon ``Message`` object.
 
@@ -82,7 +91,6 @@ class _TelethonMessageLike(Protocol):
     date: datetime | None
     photo: object | None
     document: object | None
-    views: int | None
     reactions: _MessageReactionsLike | None
     fwd_from: _MessageFwdHeaderLike | None
 
@@ -159,8 +167,8 @@ def _coerce_aware_datetime(value: datetime | None, *, field_name: str) -> dateti
 
 def _extract_reactions(
     reactions: _MessageReactionsLike | None,
-) -> dict[str, int]:
-    """Return a ``{reaction_key: count}`` dict from a Telethon reactions payload.
+) -> dict[str, int] | None:
+    """Return canonical reactions from a Telethon reactions payload.
 
     Telethon models emoji reactions and custom-emoji reactions with two
     distinct subclasses (``ReactionEmoji`` and ``ReactionCustomEmoji``).
@@ -168,21 +176,46 @@ def _extract_reactions(
     emoticon (for emoji) or the string form of the custom-emoji document
     id so the service layer's dict-based contract stays stable. Invalid
     entries are skipped instead of raising because reactions are
-    informational and should never block ingest.
+    informational and should never block ingest. ``None`` means Telegram did
+    not expose reaction data; an exposed empty results list maps to ``{}``.
     """
 
     if reactions is None:
-        return {}
+        return None
     collected: dict[str, int] = {}
     results = getattr(reactions, "results", None)
     if not isinstance(results, list):
-        return collected
+        return None
     for item in _iter_reaction_items(results):
         reaction_key = _reaction_key(item.reaction)
         if reaction_key is None:
             continue
         collected[reaction_key] = collected.get(reaction_key, 0) + int(item.count)
     return collected
+
+
+def _extract_non_negative_stat(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _extract_comment_metrics(
+    replies: object,
+) -> tuple[int | None, SourceEngagementCommentsState]:
+    """Return ``(comment_count, comments_state)`` from a Telegram replies payload."""
+
+    if replies is None:
+        return None, SourceEngagementCommentsState.NOT_EXPOSED
+
+    raw_count = getattr(replies, "replies", None)
+    comment_count = _extract_non_negative_stat(raw_count)
+    raw_comments = getattr(replies, "comments", None)
+    if raw_comments is True:
+        return comment_count, SourceEngagementCommentsState.ENABLED
+    if raw_comments is False:
+        return comment_count, SourceEngagementCommentsState.DISABLED
+    return comment_count, SourceEngagementCommentsState.UNKNOWN
 
 
 def _iter_reaction_items(
@@ -314,9 +347,11 @@ class TelethonMessageNormalizer:
             )
         published_at = _coerce_aware_datetime(message.date, field_name="date")
         media_type: _MediaType = _classify_media(message)
-        views = message.views if isinstance(message.views, int) else 0
-        reactions = _extract_reactions(message.reactions)
-        forward = _extract_forward_attribution(message.fwd_from)
+        view_count = _extract_non_negative_stat(getattr(message, "views", None))
+        forward_count = _extract_non_negative_stat(getattr(message, "forwards", None))
+        comment_count, comments_state = _extract_comment_metrics(getattr(message, "replies", None))
+        reactions = _extract_reactions(getattr(message, "reactions", None))
+        forward = _extract_forward_attribution(getattr(message, "fwd_from", None))
 
         return RawTelegramMessage(
             message_id=str(message.id),
@@ -325,9 +360,12 @@ class TelethonMessageNormalizer:
             channel_title=channel_title,
             published_at=published_at,
             media_type=media_type,
-            views=views,
+            view_count=view_count,
             reactions=reactions,
             forward=forward,
+            forward_count=forward_count,
+            comment_count=comment_count,
+            comments_state=comments_state,
             raw_payload=message,
         )
 

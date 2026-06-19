@@ -5,13 +5,19 @@ from __future__ import annotations
 import uuid
 from typing import TYPE_CHECKING
 
+from sqlalchemy import select
+
 from memexpert.models.collection import Collection, CollectionMember, CollectionMeme
-from memexpert.models.content import Meme, MemeFile, MemeSeoPage, MemeTemplate
+from memexpert.models.content import Meme, MemeFile, MemeSeoPage, MemeSource, MemeSourceEngagementSnapshot, MemeTemplate
 from memexpert.models.enums import (
     CollectionMembershipRole,
     CollectionVisibility,
     ContentKind,
     ContentLanguage,
+    SourceEngagementCaptureReason,
+    SourceEngagementCommentsState,
+    SourceEngagementFetchStatus,
+    SourcePlatform,
 )
 from memexpert.models.user import User
 from memexpert.services.search_index_sync import (
@@ -49,7 +55,6 @@ async def _create_meme_with_primary_file(
         tags=tags or [],
         is_public=is_public,
         is_nsfw=is_nsfw,
-        popularity_score=popularity_score,
         like_count=like_count,
         author_user_id=author_user_id,
         ocr_text=ocr_text,
@@ -66,7 +71,40 @@ async def _create_meme_with_primary_file(
     await session.flush()
     session.add(meme_file)
     await session.flush()
+    if popularity_score > 0.0:
+        await _set_source_engagement_score(session, meme_file.id, source_views=max(1, int(popularity_score)))
     return meme, meme_file
+
+
+async def _set_source_engagement_score(session: AsyncSession, meme_file_id: uuid.UUID, *, source_views: int) -> None:
+    source = await session.scalar(select(MemeSource).where(MemeSource.file_id == meme_file_id))
+    if source is None:
+        source = MemeSource(
+            file_id=meme_file_id,
+            platform=SourcePlatform.TELEGRAM,
+            source_id=f"search-index-{meme_file_id.hex}",
+            post_id="1",
+            is_first_source=True,
+            source_alive=True,
+        )
+        session.add(source)
+        await session.flush()
+    session.add(
+        MemeSourceEngagementSnapshot(
+            meme_source_id=source.id,
+            capture_reason=SourceEngagementCaptureReason.MANUAL_REFRESH,
+            view_count=source_views,
+            reactions={},
+            reaction_count=0,
+            comment_count=None,
+            forward_count=0,
+            comments_state=SourceEngagementCommentsState.UNKNOWN,
+            fetch_status=SourceEngagementFetchStatus.SUCCESS,
+            source_alive=True,
+            raw_metrics={"test": True},
+        )
+    )
+    await session.flush()
 
 
 async def test_search_index_state_builds_collection_aware_public_crawled_payloads(
@@ -155,7 +193,7 @@ async def test_search_index_state_builds_collection_aware_public_crawled_payload
     assert qdrant_payload.template_id == str(template.id)
     assert qdrant_payload.template_slug == "frog-template"
     assert qdrant_payload.seo_page_slug == "frog-wizard"
-    assert qdrant_payload.popularity_score == 12.5
+    assert qdrant_payload.popularity_score > 0.0
     assert qdrant_payload.like_count == 3
     assert qdrant_payload.quality_score == 0.91
     assert qdrant_payload.ocr_snippet == "frog wizard caption"
@@ -210,7 +248,8 @@ async def test_search_index_state_rebuild_reflects_visibility_collection_tag_and
     assert initial_payload.collection_ids == []
     assert initial_payload.tags == ["old-tag"]
     assert initial_payload.template_id is None
-    assert initial_payload.popularity_score == 1.0
+    initial_popularity_score = initial_payload.popularity_score
+    assert initial_popularity_score > 0.0
     assert initial_payload.like_count == 1
 
     template = MemeTemplate(slug="fresh-template", name="Fresh Template")
@@ -224,7 +263,7 @@ async def test_search_index_state_rebuild_reflects_visibility_collection_tag_and
 
     meme.tags = ["fresh-tag", "shared"]
     meme.template_id = template.id
-    meme.popularity_score = 42.0
+    await _set_source_engagement_score(migrated_db_session, meme_file.id, source_views=42)
     meme.like_count = 7
     meme.is_public = True
     migrated_db_session.add(
@@ -260,7 +299,7 @@ async def test_search_index_state_rebuild_reflects_visibility_collection_tag_and
     assert rebuilt_payload.template_id == str(template.id)
     assert rebuilt_payload.template_slug == "fresh-template"
     assert rebuilt_payload.seo_page_slug == "fresh-upload"
-    assert rebuilt_payload.popularity_score == 42.0
+    assert rebuilt_payload.popularity_score > initial_popularity_score
     assert rebuilt_payload.like_count == 7
     assert rebuilt_payload.collection_ids == [str(shared_collection.id)]
     assert rebuilt_payload.public_collection_ids == []
@@ -271,5 +310,5 @@ async def test_search_index_state_rebuild_reflects_visibility_collection_tag_and
     assert rebuilt_payload.collection_member_user_ids == [str(collaborator.id)]
     assert rebuilt_document.is_public is True
     assert rebuilt_document.collection_ids == [str(shared_collection.id)]
-    assert rebuilt_document.popularity_score == 42.0
+    assert rebuilt_document.popularity_score == rebuilt_payload.popularity_score
     assert rebuilt_document.like_count == 7

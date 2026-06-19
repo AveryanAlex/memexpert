@@ -146,13 +146,15 @@ pnpm build
 | Job | Enable variable | Interval variable | Default interval |
 |---|---|---|---|
 | Public trend materialized-view refresh | `SCHEDULER_MATERIALIZED_VIEW_REFRESH_ENABLED` | `SCHEDULER_MATERIALIZED_VIEW_REFRESH_INTERVAL_SECONDS` | `300` seconds |
-| Popularity snapshots | `SCHEDULER_POPULARITY_SNAPSHOTS_ENABLED` | `SCHEDULER_POPULARITY_SNAPSHOTS_INTERVAL_SECONDS` | `21600` seconds |
+| Source engagement capture dispatch | `SCHEDULER_SOURCE_ENGAGEMENT_CAPTURE_ENABLED` | `SCHEDULER_SOURCE_ENGAGEMENT_CAPTURE_INTERVAL_SECONDS` | `21600` seconds |
 | Meme of the Day placeholder | `SCHEDULER_MOTD_ENABLED` | `SCHEDULER_MOTD_INTERVAL_SECONDS` | `86400` seconds |
 | Search-index sync batches | `SCHEDULER_SEARCH_INDEX_SYNC_ENABLED` | `SCHEDULER_SEARCH_INDEX_SYNC_INTERVAL_SECONDS` | `600` seconds |
 | SEO backlog batches | `SCHEDULER_SEO_BACKLOG_BATCHES_ENABLED` | `SCHEDULER_SEO_BACKLOG_BATCHES_INTERVAL_SECONDS` | `900` seconds |
 | RabbitMQ outbox publisher | `SCHEDULER_RABBITMQ_OUTBOX_PUBLISHER_ENABLED` | `SCHEDULER_RABBITMQ_OUTBOX_PUBLISHER_INTERVAL_SECONDS` | `5` seconds |
 
-The public trend materialized-view refresh, popularity snapshot capture, search-index sync batches, SEO backlog batches, and RabbitMQ outbox publisher perform real business work. MOTD remains a deliberate no-op placeholder while the product behavior is deferred.
+The public trend materialized-view refresh, source engagement capture dispatch, search-index sync batches, SEO backlog batches, and RabbitMQ outbox publisher perform real business work. MOTD remains a deliberate no-op placeholder while the product behavior is deferred.
+
+Source engagement capture is split between PostgreSQL scheduling and RabbitMQ execution. `meme_sources.next_engagement_check_at` stores the durable due time; the scheduler claims due Telegram sources, writes `source_engagement_capture_requested` outbox rows, and the worker consumes RabbitMQ messages to fetch Telegram counters and append or update `meme_source_engagement_snapshots`. Follow-up cadence is anchored to the Telegram post date: `+1h`, `+3h`, `+12h`, `+1d`, `+3d`, `+7d`, `+1month`, then monthly. The scheduler processes up to `SCHEDULER_SOURCE_ENGAGEMENT_CAPTURE_BATCH_SIZE=100` due sources per run and reclaims stale claims after `SCHEDULER_SOURCE_ENGAGEMENT_CAPTURE_LEASE_TIMEOUT_SECONDS=1800`.
 
 Search-index sync batches process up to `SCHEDULER_SEARCH_INDEX_SYNC_BATCH_SIZE=50` rows per target per run. The job claims `meme_file_sync_target_snapshots` rows for both Qdrant and Meilisearch, commits the `processing` claim before external writes, retries failed rows, reclaims stale `processing` rows after `SCHEDULER_SEARCH_INDEX_SYNC_PROCESSING_TIMEOUT_SECONDS=900`, and reprocesses synced rows when canonical meme/search metadata is newer than `last_success_at`.
 
@@ -160,9 +162,7 @@ SEO backlog batches process up to `SCHEDULER_SEO_BACKLOG_BATCH_SIZE=25` memes pe
 
 RabbitMQ outbox publisher runs every `SCHEDULER_RABBITMQ_OUTBOX_PUBLISHER_INTERVAL_SECONDS=5` seconds by default. Each run starts or reuses the RabbitMQ pipeline broker, recovers `rabbitmq_outbox_messages.status='publishing'` rows whose `locked_at` is older than `SCHEDULER_RABBITMQ_OUTBOX_PUBLISHER_STALE_TIMEOUT_SECONDS=300`, then publishes up to `SCHEDULER_RABBITMQ_OUTBOX_PUBLISHER_BATCH_SIZE=100` due `pending`/`failed` rows by their stored `exchange`, `routing_key`, JSON payload, headers, and stable `message_id`. This is the production path for accepted raw-upload `media_inspect_requested` events, post-materialization transcode dispatches, stage fan-out, replay, and sync-success notifications.
 
-Popularity snapshots use `log1p`-scaled cumulative metrics from persisted tables only. Current metrics are source views, summed source reactions, forwarded/reposted source rows, platform views (`meme_view`/`view`), platform sends (`meme_send`/`share`), platform saves (`meme_save`/`save`), and platform likes (`meme_like`/`favorite`). Snapshot columns for impressions/downloads are deferred, so they are not part of the static popularity score in this stage.
-
-Popularity weights are configurable with flat scheduler settings: `SCHEDULER_POPULARITY_SOURCE_VIEW_WEIGHT=1.0`, `SCHEDULER_POPULARITY_SOURCE_REACTION_WEIGHT=2.0`, `SCHEDULER_POPULARITY_SOURCE_REPOST_WEIGHT=3.0`, `SCHEDULER_POPULARITY_PLATFORM_VIEW_WEIGHT=1.0`, `SCHEDULER_POPULARITY_PLATFORM_SEND_WEIGHT=3.0`, `SCHEDULER_POPULARITY_PLATFORM_SAVE_WEIGHT=4.0`, and `SCHEDULER_POPULARITY_PLATFORM_LIKE_WEIGHT=5.0`.
+Public trend, search, and `popularity_score` read-model fields are derived from source engagement snapshots plus `analytics_events`; there is no canonical popularity snapshot table or stored meme/source metric column. The first source snapshot is a baseline and contributes no invented historical delta. Later public chart points use only real source deltas and platform events. Snapshot `NULL` means Telegram did not expose a counter; public read models may coalesce unknown to `0` for ranking/output, but canonical storage preserves NULL-vs-zero. Telegram `forward_count` is the public forward/repost counter that feeds `latest_source_reposts`; forwarded-message attribution (`forwarded_from_*`) records where a repost originated and is not an engagement count.
 
 For local no-op/startup testing, disable some or all jobs with the `*_ENABLED=false` flags and still run the scheduler process. Disabling every job is a supported way to validate startup, advisory-lock acquisition, and graceful shutdown without executing business work.
 
@@ -172,7 +172,7 @@ The scheduler emits structured stdout logs by default. Operators should watch fo
 - `scheduler_stop_requested` when the process receives `SIGINT` or `SIGTERM`.
 - `scheduler_job_started`, `scheduler_job_succeeded`, and `scheduler_job_failed` with `job_id` and `duration_seconds` for each run.
 - `scheduler_job_batch_result` with `job_id`, `scanned`, `updated`, `failed`, `skipped`, and `duration_seconds` for search-index and SEO batch runs; the outbox publisher uses the same event with `recovered`, `claimed`, `published`, `failed`, and `duration_seconds`.
-- `popularity_snapshot_capture_started` and `popularity_snapshot_capture_succeeded` with `captured_at` and row counts for snapshot runs.
+- `scheduler_job_batch_result` with `job_id=source-engagement-capture`, `claimed`, and `enqueued` for source engagement dispatch runs.
 - `public_trend_mv_concurrent_refresh_fallback` with `view_name` when a concurrent materialized-view refresh cannot run and the scheduler retries without `CONCURRENTLY`.
 - `scheduler_job_placeholder_completed` for MOTD.
 - `scheduler_instance_lock_unavailable` if another scheduler instance already holds the advisory lock.

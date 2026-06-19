@@ -363,8 +363,6 @@ async def _seed_pipeline_item(
                 platform=SourcePlatform.TELEGRAM,
                 source_id=source_id,
                 post_id=post_id,
-                views=1,
-                reactions={},
                 is_first_source=True,
                 source_alive=True,
                 attach_reason=SourceAttachReason.NEW_FILE,
@@ -504,7 +502,7 @@ def build_ingest_request(
         post_id="101",
         owner_user_id=None,
         user_metadata={},
-        source_metadata={"views": 7},
+        source_metadata={"view_count": 7},
         declared_filename="sample.png",
         declared_content_type="image/png",
         temp_original_object_key=f"pipeline/temp-originals/{resolved_request_id}/original.png",
@@ -549,7 +547,7 @@ async def test_pipeline_routes_require_operator_token_and_accept_real_multipart_
                 "post_id": "101",
                 "owner_user_id": str(owner_user_id),
                 "target_collection_id": str(target_collection_id),
-                "views": "7",
+                "view_count": "7",
             },
             files={"file": ("sample.png", build_png_bytes(), "image/png")},
         )
@@ -560,7 +558,7 @@ async def test_pipeline_routes_require_operator_token_and_accept_real_multipart_
                 "source_platform": "telegram",
                 "source_id": "channel-one",
                 "post_id": "101",
-                "views": "7",
+                "view_count": "7",
             },
             files={"file": ("sample.png", build_png_bytes(), "image/png")},
         )
@@ -573,7 +571,7 @@ async def test_pipeline_routes_require_operator_token_and_accept_real_multipart_
                 "post_id": "101",
                 "owner_user_id": str(owner_user_id),
                 "target_collection_id": str(target_collection_id),
-                "views": "7",
+                "view_count": "7",
             },
             files={"file": ("sample.png", build_png_bytes(), "image/png")},
         )
@@ -599,7 +597,7 @@ async def test_pipeline_routes_require_operator_token_and_accept_real_multipart_
         assert source.post_id == "101"
         assert source.owner_user_id == owner_user_id
         assert source.user_metadata[TARGET_COLLECTION_ID_METADATA_KEY] == str(target_collection_id)
-        assert source.views == 7
+        assert source.view_count == 7
         assert upload_call["filename"] == "sample.png"
         assert upload_call["content_type"] == "image/png"
         assert upload_call["media_bytes"] == build_png_bytes()
@@ -629,7 +627,7 @@ async def test_pipeline_upload_route_returns_ok_for_source_replay(
                 "source_platform": "telegram",
                 "source_id": "channel-one",
                 "post_id": "101",
-                "views": "7",
+                "view_count": "7",
             },
             files={"file": ("sample.png", build_png_bytes(), "image/png")},
         )
@@ -899,7 +897,7 @@ async def test_pipeline_upload_route_creates_raw_ingest_request_separate_from_it
                 "source_platform": "telegram",
                 "source_id": "raw-route-channel",
                 "post_id": "1701",
-                "views": "7",
+                "view_count": "7",
             },
             files={"file": ("raw-route.png", build_png_bytes(color=(1, 2, 3)), "image/png")},
         )

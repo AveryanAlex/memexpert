@@ -10,7 +10,7 @@ import pytest
 from sqlalchemy import select
 
 from memexpert.models.collection import Collection, CollectionMember, CollectionMeme, PinnedMeme
-from memexpert.models.content import Meme, MemeFile, TelegramFileIdCache
+from memexpert.models.content import Meme, MemeFile, MemeSource, MemeSourceEngagementSnapshot, TelegramFileIdCache
 from memexpert.models.enums import (
     AccountStatus,
     AccountType,
@@ -18,6 +18,10 @@ from memexpert.models.enums import (
     CollectionMembershipRole,
     ContentKind,
     ContentLanguage,
+    SourceEngagementCaptureReason,
+    SourceEngagementCommentsState,
+    SourceEngagementFetchStatus,
+    SourcePlatform,
     TelegramMediaFormat,
 )
 from memexpert.models.user import AnalyticsEvent, User
@@ -114,7 +118,6 @@ async def create_meme_file(
         language=ContentLanguage.EN,
         tags=[media_type.value],
         is_public=is_public,
-        popularity_score=popularity_score,
         author_user_id=author_user_id,
     )
     file = MemeFile(
@@ -130,6 +133,33 @@ async def create_meme_file(
     await session.flush()
     session.add(file)
     await session.flush()
+    if popularity_score > 0.0:
+        source = MemeSource(
+            file_id=file_id,
+            platform=SourcePlatform.TELEGRAM,
+            source_id=f"inline-service-{meme_id.hex}",
+            post_id="1",
+            is_first_source=True,
+            source_alive=True,
+        )
+        session.add(source)
+        await session.flush()
+        session.add(
+            MemeSourceEngagementSnapshot(
+                meme_source_id=source.id,
+                capture_reason=SourceEngagementCaptureReason.MANUAL_REFRESH,
+                view_count=max(1, int(popularity_score)),
+                reactions={},
+                reaction_count=0,
+                comment_count=None,
+                forward_count=0,
+                comments_state=SourceEngagementCommentsState.UNKNOWN,
+                fetch_status=SourceEngagementFetchStatus.SUCCESS,
+                source_alive=True,
+                raw_metrics={"test": True},
+            )
+        )
+        await session.flush()
     return meme, file
 
 

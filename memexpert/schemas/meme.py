@@ -286,7 +286,7 @@ class PublicMemeTrendPageRead(BaseModel):
 
 
 class PublicMemePopularityPointRead(BaseModel):
-    """One real captured popularity snapshot for a public meme sparkline."""
+    """One derived public engagement point for a meme sparkline."""
 
     captured_at: datetime
     source_views: int

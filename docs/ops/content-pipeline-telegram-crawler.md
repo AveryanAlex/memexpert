@@ -428,6 +428,33 @@ Malformed or unknown post ids surface as HTTP 422 with the
 `telegram_malformed_message` code; the runtime classifies them as
 non-retryable so they do not poison the stage journal.
 
+### Source engagement snapshots
+
+When Telegram content is accepted, stable provenance is stored on
+`meme_sources` and the first observed Telegram counters are stored in an
+`ingest_initial` `meme_source_engagement_snapshots` row. Replays may refresh
+that baseline for the same source/post slot, but volatile counters are never
+written back to `meme_sources`.
+
+Scheduled engagement refresh is split between PostgreSQL and RabbitMQ.
+`meme_sources.next_engagement_check_at` is the durable DB schedule and lease
+source; `memexpert-scheduler` claims due rows and writes
+`source_engagement_capture_requested` messages through the transactional
+outbox; worker-side RabbitMQ consumers fetch Telegram metadata and append or
+update the scheduled snapshot.
+
+The cadence is anchored to the Telegram post date (`published_at`), not to the
+time MemeXpert first ingested the post: `+1h`, `+3h`, `+12h`, `+1d`, `+3d`,
+`+7d`, `+1month`, then monthly. Historical public trends use `lag()` between
+successful snapshots for the same `meme_source_id`, so a baseline or old post
+with missed intervals contributes no invented delta.
+
+Snapshot `NULL` values mean Telegram did not expose that counter; known zero is
+stored as `0`. Public trend/search read models may coalesce unknown to zero for
+ranking. Telegram `forward_count` is the public forward/repost counter and maps
+to `latest_source_reposts`; it is separate from `forwarded_from_*` provenance on
+forwarded messages.
+
 ## Flood-wait recovery
 
 When Telegram returns a `FloodWaitError`, the Telethon adapter raises

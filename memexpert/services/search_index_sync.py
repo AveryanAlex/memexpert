@@ -15,6 +15,7 @@ from memexpert.core.qdrant import QdrantSyncPayload
 from memexpert.models.collection import Collection, CollectionMember, CollectionMeme
 from memexpert.models.content import EmbeddingCache, Meme, MemeFile, MemeSeoPage
 from memexpert.models.enums import CollectionVisibility, EmbeddingInputType
+from memexpert.services.engagement_read_model import load_derived_popularity_score
 from memexpert.services.errors import PipelineIngestError
 
 if TYPE_CHECKING:
@@ -121,6 +122,7 @@ async def load_search_index_state(
     collection_rows = cast("list[CollectionHintRow]", [tuple(row) for row in raw_collection_rows])
 
     seo_page = canonical_meme.seo_page
+    popularity_score = await load_derived_popularity_score(session, canonical_meme.id)
     canonical = CanonicalSearchIndexState(
         meme_id=canonical_meme.id,
         meme_file_id=meme_file.id,
@@ -134,7 +136,7 @@ async def load_search_index_state(
         seo_page_slug=seo_page.slug if seo_page is not None else None,
         template_id=_stringify_uuid(canonical_meme.template_id),
         template_slug=canonical_meme.template.slug if canonical_meme.template is not None else None,
-        popularity_score=float(canonical_meme.popularity_score),
+        popularity_score=popularity_score,
         like_count=canonical_meme.like_count,
         created_at=canonical_meme.created_at,
         updated_at=_resolve_search_index_updated_at(

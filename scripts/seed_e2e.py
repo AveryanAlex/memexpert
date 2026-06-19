@@ -11,7 +11,7 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
@@ -44,9 +44,9 @@ from memexpert.models.content import (
     MemeFile,
     MemeFileOCRResult,
     MemeFileSyncTargetSnapshot,
-    MemePopularitySnapshot,
     MemeSeoPage,
     MemeSource,
+    MemeSourceEngagementSnapshot,
     MemeTemplate,
     PipelineStageJournal,
 )
@@ -64,6 +64,10 @@ from memexpert.models.enums import (
     ContentProcessingStatus,
     EmbeddingInputType,
     PipelineIngestRequestStatus,
+    SourceEngagementCaptureReason,
+    SourceEngagementCommentsState,
+    SourceEngagementFetchStatus,
+    SourceEngagementScheduleLabel,
     SourcePlatform,
     SyncTargetKind,
     SyncTargetStatus,
@@ -303,7 +307,7 @@ class PipelineApiClient:
                 "source_platform": SourcePlatform.TELEGRAM.value,
                 "source_id": E2E_UPLOAD_SOURCE_ID,
                 "post_id": run_id,
-                "views": "1",
+                "view_count": "1",
             },
             files={"file": ("e2e-prd-cat.png", image_bytes, "image/png")},
         )
@@ -688,15 +692,15 @@ async def seed_direct_corpus(
             )
             session.add(meme_file)
             await session.flush()
+            source_id = _stable_uuid(f"{spec.category}:source")
             session.add_all(
                 [
                     MemeSource(
+                        id=source_id,
                         file_id=meme_file_id,
                         platform=SourcePlatform.TELEGRAM,
                         source_id=E2E_SOURCE_ID,
                         post_id=spec.category,
-                        views=1,
-                        reactions={},
                         is_first_source=True,
                         source_alive=True,
                     ),
@@ -731,7 +735,7 @@ async def seed_direct_corpus(
                         prompt_version=E2E_PROMPT_VERSION,
                         generated_at=now,
                     ),
-                    *build_public_trend_snapshot_rows(meme_id=meme_id, category=spec.category),
+                    *build_public_trend_snapshot_rows(meme_source_id=source_id, category=spec.category),
                     *_build_succeeded_stage_rows(
                         meme_file_id=meme_file_id,
                         event_id=_stable_uuid(f"{spec.category}:event"),
@@ -1044,23 +1048,59 @@ def build_public_trends_template() -> MemeTemplate:
     )
 
 
-def build_public_trend_snapshot_rows(*, meme_id: uuid.UUID, category: str) -> list[MemePopularitySnapshot]:
-    return [
-        MemePopularitySnapshot(
-            id=_stable_uuid(f"{category}:public-trend-snapshot:{index}"),
-            meme_id=meme_id,
-            captured_at=spec.captured_at,
-            source_views=spec.source_views,
-            source_reactions=spec.source_reactions,
-            source_reposts=spec.source_reposts,
-            platform_views=spec.platform_views,
-            platform_sends=spec.platform_sends,
-            platform_saves=spec.platform_saves,
-            platform_likes=spec.platform_likes,
-            popularity_score=spec.popularity_score,
+def build_public_trend_snapshot_rows(
+    *,
+    meme_source_id: uuid.UUID,
+    category: str,
+) -> list[MemeSourceEngagementSnapshot]:
+    specs = PUBLIC_TREND_SNAPSHOT_SPECS_BY_CATEGORY.get(category, ())
+    if not specs:
+        return []
+
+    rows = [
+        MemeSourceEngagementSnapshot(
+            id=_stable_uuid(f"{category}:source-engagement-baseline"),
+            meme_source_id=meme_source_id,
+            captured_at=specs[0].captured_at - timedelta(seconds=1),
+            capture_reason=SourceEngagementCaptureReason.INGEST_INITIAL,
+            schedule_label=SourceEngagementScheduleLabel.INGEST_INITIAL,
+            view_count=0,
+            reactions={},
+            reaction_count=0,
+            comment_count=None,
+            forward_count=0,
+            comments_state=SourceEngagementCommentsState.UNKNOWN,
+            fetch_status=SourceEngagementFetchStatus.SUCCESS,
+            source_alive=True,
+            raw_metrics={"seed": "baseline"},
         )
-        for index, spec in enumerate(PUBLIC_TREND_SNAPSHOT_SPECS_BY_CATEGORY.get(category, ()), start=1)
     ]
+    source_views = 0
+    source_reactions = 0
+    source_reposts = 0
+    for index, spec in enumerate(specs, start=1):
+        source_views += spec.source_views
+        source_reactions += spec.source_reactions
+        source_reposts += spec.source_reposts
+        rows.append(
+            MemeSourceEngagementSnapshot(
+                id=_stable_uuid(f"{category}:source-engagement-snapshot:{index}"),
+                meme_source_id=meme_source_id,
+                captured_at=spec.captured_at,
+                capture_reason=SourceEngagementCaptureReason.SCHEDULED,
+                schedule_label=SourceEngagementScheduleLabel.PLUS_1D,
+                view_count=source_views,
+                reactions={"like": source_reactions} if source_reactions else {},
+                reaction_count=source_reactions,
+                comment_count=None,
+                forward_count=source_reposts,
+                comments_state=SourceEngagementCommentsState.UNKNOWN,
+                fetch_status=SourceEngagementFetchStatus.SUCCESS,
+                source_alive=True,
+                raw_metrics={"seed": "public_trends"},
+            )
+        )
+    return rows
 
 
 def build_public_trends_artifact(seeded: list[SeededMeme]) -> dict[str, object]:

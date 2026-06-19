@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import uuid
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import pytest
@@ -25,6 +25,7 @@ from memexpert.models.content import (
     Meme,
     MemeFile,
     MemeSource,
+    MemeSourceEngagementSnapshot,
     PipelineIngestRequest,
     PipelineStageJournal,
     RabbitMQOutboxMessage,
@@ -41,12 +42,17 @@ from memexpert.models.enums import (
     PipelineIngestRequestStatus,
     RabbitMQOutboxMessageStatus,
     SourceAttachReason,
+    SourceEngagementCaptureReason,
+    SourceEngagementCommentsState,
+    SourceEngagementFetchStatus,
+    SourceEngagementScheduleLabel,
     SourcePlatform,
 )
 from memexpert.models.user import User
 from memexpert.schemas.content_pipeline import ContentPipelineEventType
 from memexpert.services import PipelineIngestError
 from memexpert.services.search_index_sync import build_qdrant_sync_payload, load_search_index_state
+from memexpert.services.source_engagement import next_source_engagement_schedule_slot
 
 if TYPE_CHECKING:
     from aio_pika.abc import HeadersType
@@ -209,7 +215,7 @@ async def _seed_raw_request(
     media_bytes: bytes = b"raw-materializer-bytes",
     source_id: str = "materializer-source",
     post_id: str = "1",
-    views: int = 12,
+    view_count: int = 12,
     owner_user_id: uuid.UUID | None = None,
     user_metadata: dict[str, object] | None = None,
     source_metadata: dict[str, object] | None = None,
@@ -224,7 +230,7 @@ async def _seed_raw_request(
         post_id=post_id,
         owner_user_id=owner_user_id,
         user_metadata=user_metadata or {},
-        source_metadata=source_metadata or {"views": views},
+        source_metadata=source_metadata or {"view_count": view_count},
         declared_filename="raw.png",
         declared_content_type="image/png",
         temp_original_object_key=temp_key,
@@ -310,7 +316,19 @@ async def test_materializer_new_content_creates_content_rows_outbox_and_cleans_t
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     storage_client = FakeStorageClient()
-    ingest_request = await _seed_raw_request(migrated_db_session, storage_client, views=15)
+    published_at = datetime(2020, 1, 15, 10, 30, tzinfo=UTC)
+    ingest_request = await _seed_raw_request(
+        migrated_db_session,
+        storage_client,
+        source_metadata={
+            "view_count": 15,
+            "published_at": published_at.isoformat(),
+            "reactions": {},
+            "forward_count": 2,
+            "comment_count": 0,
+            "comments_state": SourceEngagementCommentsState.DISABLED.value,
+        },
+    )
     media_processor = FakeMediaProcessor(inspect_result=_upload_details(perceptual_hash="1" * 16))
 
     result = await PipelineIngestMaterializer(
@@ -332,6 +350,7 @@ async def test_materializer_new_content_creates_content_rows_outbox_and_cleans_t
         meme_file = await session.get(MemeFile, result.materialized_meme_file_id)
         sources = (await session.execute(select(MemeSource))).scalars().all()
         stage_rows = (await session.execute(select(PipelineStageJournal))).scalars().all()
+        snapshots = (await session.execute(select(MemeSourceEngagementSnapshot))).scalars().all()
         outbox_rows = (await session.execute(select(RabbitMQOutboxMessage))).scalars().all()
 
     assert request is not None
@@ -340,8 +359,26 @@ async def test_materializer_new_content_creates_content_rows_outbox_and_cleans_t
     assert meme_file.ingest_origin is IngestFileOrigin.NEW_MEME
     assert meme_file.s3_original_key in storage_client.objects
     assert sources[0].file_id == meme_file.id
-    assert sources[0].views == 15
     assert sources[0].attach_reason is SourceAttachReason.NEW_FILE
+    assert len(snapshots) == 1
+    snapshot = snapshots[0]
+    assert snapshot.meme_source_id == sources[0].id
+    assert snapshot.capture_reason is SourceEngagementCaptureReason.INGEST_INITIAL
+    assert snapshot.schedule_label is SourceEngagementScheduleLabel.INGEST_INITIAL
+    assert snapshot.fetch_status is SourceEngagementFetchStatus.SUCCESS
+    ingest_started_at = next(row.started_at for row in stage_rows if row.stage is ContentPipelineStage.INGEST)
+    assert snapshot.captured_at == ingest_started_at
+    assert snapshot.view_count == 15
+    assert snapshot.reactions == {}
+    assert snapshot.reaction_count == 0
+    assert snapshot.forward_count == 2
+    assert snapshot.comment_count == 0
+    assert snapshot.comments_state is SourceEngagementCommentsState.DISABLED
+    assert sources[0].last_engagement_check_at == snapshot.captured_at
+    expected_slot = next_source_engagement_schedule_slot(published_at, now=snapshot.captured_at)
+    assert expected_slot is not None
+    assert expected_slot.label is SourceEngagementScheduleLabel.MONTHLY
+    assert sources[0].next_engagement_check_at == expected_slot.scheduled_for
     assert {(row.stage, row.status) for row in stage_rows} == {
         (ContentPipelineStage.INGEST, ContentPipelineStageStatus.SUCCEEDED),
         (ContentPipelineStage.TRANSCODE, ContentPipelineStageStatus.PENDING),
@@ -433,6 +470,7 @@ async def test_materializer_phash_duplicate_creates_new_file_under_existing_meme
         new_source = (
             await session.execute(select(MemeSource).where(MemeSource.file_id == result.materialized_meme_file_id))
         ).scalar_one()
+        snapshots = (await session.execute(select(MemeSourceEngagementSnapshot))).scalars().all()
         outbox_count = await session.scalar(select(func.count()).select_from(RabbitMQOutboxMessage))
 
     assert new_file is not None
@@ -441,6 +479,15 @@ async def test_materializer_phash_duplicate_creates_new_file_under_existing_meme
     assert new_file.matched_meme_file_id == existing_file.id
     assert new_source.attach_reason is SourceAttachReason.PHASH_EXACT_NEW_FILE
     assert new_source.matched_meme_file_id == existing_file.id
+    assert len(snapshots) == 1
+    assert snapshots[0].meme_source_id == new_source.id
+    assert snapshots[0].capture_reason is SourceEngagementCaptureReason.INGEST_INITIAL
+    assert snapshots[0].schedule_label is SourceEngagementScheduleLabel.INGEST_INITIAL
+    assert snapshots[0].fetch_status is SourceEngagementFetchStatus.SUCCESS
+    assert snapshots[0].view_count == 12
+    assert snapshots[0].reactions is None
+    assert snapshots[0].reaction_count is None
+    assert new_source.last_engagement_check_at == snapshots[0].captured_at
     assert outbox_count == 1
 
 
@@ -579,7 +626,7 @@ async def test_materializer_persists_source_attribution_from_raw_request_metadat
         post_id="source-post",
         owner_user_id=owner_user_id,
         source_metadata={
-            "views": 41,
+            "view_count": 41,
             "published_at": published_at.isoformat(),
             "reactions": {"like": 5, "fire": 2},
             "forward": {
@@ -602,14 +649,21 @@ async def test_materializer_persists_source_attribution_from_raw_request_metadat
     async with postgres_session_factory() as session:
         meme = await session.get(Meme, result.materialized_meme_id)
         source = await session.scalar(select(MemeSource).where(MemeSource.source_id == "attribution-source"))
+        snapshot = await session.scalar(
+            select(MemeSourceEngagementSnapshot)
+            .join(MemeSource)
+            .where(MemeSource.source_id == "attribution-source")
+        )
 
     assert result.status is PipelineIngestRequestStatus.MATERIALIZED
     assert meme is not None
     assert meme.author_user_id == owner_user_id
     assert source is not None
     assert source.file_id == result.materialized_meme_file_id
-    assert source.views == 41
-    assert source.reactions == {"like": 5, "fire": 2}
+    assert snapshot is not None
+    assert snapshot.view_count == 41
+    assert snapshot.reactions == {"like": 5, "fire": 2}
+    assert snapshot.reaction_count == 7
     assert source.is_first_source is False
     assert source.published_at == published_at
     assert source.forwarded_from_source_id == "original-source"

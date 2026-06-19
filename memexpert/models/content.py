@@ -1,5 +1,5 @@
 # ruff: noqa: F821,TC003,UP037
-"""Content, SEO, source, popularity, and cache ORM models."""
+"""Content, SEO, source engagement, and cache ORM models."""
 
 from __future__ import annotations
 
@@ -37,6 +37,10 @@ from memexpert.models.enums import (
     PipelineIngestRequestStatus,
     RabbitMQOutboxMessageStatus,
     SourceAttachReason,
+    SourceEngagementCaptureReason,
+    SourceEngagementCommentsState,
+    SourceEngagementFetchStatus,
+    SourceEngagementScheduleLabel,
     SourcePlatform,
     SyncTargetKind,
     SyncTargetStatus,
@@ -64,7 +68,7 @@ class Meme(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             initially="DEFERRED",
         ),
         Index("ix_memes_media_type_language", "media_type", "language"),
-        Index("ix_memes_visibility_popularity_created_at", "is_public", "popularity_score", "created_at"),
+        Index("ix_memes_visibility_created_at", "is_public", "created_at"),
         Index("ix_memes_author_user_id_created_at", "author_user_id", "created_at"),
     )
 
@@ -80,7 +84,6 @@ class Meme(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         nullable=False,
     )
     is_nsfw: Mapped[bool] = mapped_column(default=False, nullable=False)
-    popularity_score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     like_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     tags: Mapped[list[str]] = mapped_column(ARRAY(String(64)), default=list, nullable=False)
     template_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -121,11 +124,6 @@ class Meme(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         "User",
         back_populates="authored_memes",
         foreign_keys=[author_user_id],
-    )
-    popularity_snapshots: Mapped[list["MemePopularitySnapshot"]] = relationship(
-        "MemePopularitySnapshot",
-        back_populates="meme",
-        cascade="all, delete-orphan",
     )
     saved_in_collections: Mapped[list["CollectionMeme"]] = relationship(
         "CollectionMeme",
@@ -707,9 +705,14 @@ class MemeSource(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "meme_sources"
     __table_args__ = (
         UniqueConstraint("platform", "source_id", "post_id", name="uq_meme_sources_platform_source_post"),
+        CheckConstraint(
+            "engagement_check_attempt_count >= 0",
+            name="meme_sources_engagement_check_attempt_count_non_negative",
+        ),
         Index("ix_meme_sources_file_id_platform", "file_id", "platform"),
         Index("ix_meme_sources_attach_reason", "attach_reason"),
         Index("ix_meme_sources_matched_meme_file_id", "matched_meme_file_id"),
+        Index("ix_meme_sources_engagement_due_lease", "next_engagement_check_at", "engagement_check_locked_at"),
     )
 
     file_id: Mapped[uuid.UUID] = mapped_column(
@@ -722,14 +725,18 @@ class MemeSource(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     source_id: Mapped[str] = mapped_column(String(255), nullable=False)
     post_id: Mapped[str] = mapped_column(String(255), nullable=False)
-    views: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    reactions: Mapped[dict[str, int]] = mapped_column(JSONB, default=dict, nullable=False)
     is_first_source: Mapped[bool] = mapped_column(default=False, nullable=False)
     source_alive: Mapped[bool] = mapped_column(default=True, nullable=False)
     # The Telegram publish timestamp captured by the crawler; left NULL for
     # operator uploads and backfilled rows because they have no upstream
     # publish time the freshness SLO could measure against.
     published_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    last_engagement_check_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    next_engagement_check_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    engagement_check_locked_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    engagement_check_lock_owner: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    engagement_check_attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_engagement_error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
     # Forward-chain attribution: when the crawler saw a reposter channel, the
     # ``source_id``/``post_id`` pair still records the channel where the post
     # was seen. These two columns preserve the original author pair so the
@@ -755,6 +762,11 @@ class MemeSource(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         "MemeFile",
         foreign_keys=[matched_meme_file_id],
     )
+    engagement_snapshots: Mapped[list["MemeSourceEngagementSnapshot"]] = relationship(
+        "MemeSourceEngagementSnapshot",
+        back_populates="source",
+        cascade="all, delete-orphan",
+    )
 
     @property
     def is_forwarded(self) -> bool:
@@ -766,6 +778,88 @@ class MemeSource(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         """
 
         return self.forwarded_from_source_id is not None
+
+
+class MemeSourceEngagementSnapshot(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """Append-only upstream engagement metrics captured for one source post."""
+
+    __tablename__ = "meme_source_engagement_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "meme_source_id",
+            "captured_at",
+            name="uq_meme_source_engagement_snapshots_source_captured_at",
+        ),
+        UniqueConstraint(
+            "meme_source_id",
+            "scheduled_for",
+            "schedule_label",
+            name="uq_meme_source_engagement_snapshots_source_schedule",
+        ),
+        CheckConstraint(
+            "view_count IS NULL OR view_count >= 0",
+            name="meme_source_engagement_snapshots_view_count_non_negative",
+        ),
+        CheckConstraint(
+            "reaction_count IS NULL OR reaction_count >= 0",
+            name="meme_source_engagement_snapshots_reaction_count_non_negative",
+        ),
+        CheckConstraint(
+            "comment_count IS NULL OR comment_count >= 0",
+            name="meme_source_engagement_snapshots_comment_count_non_negative",
+        ),
+        CheckConstraint(
+            "forward_count IS NULL OR forward_count >= 0",
+            name="meme_source_engagement_snapshots_forward_count_non_negative",
+        ),
+        Index(
+            "ix_meme_source_engagement_snapshots_label_status_captured",
+            "schedule_label",
+            "fetch_status",
+            "captured_at",
+        ),
+    )
+
+    meme_source_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("meme_sources.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    captured_at: Mapped[datetime] = mapped_column(default=utcnow, nullable=False)
+    scheduled_for: Mapped[datetime | None] = mapped_column(nullable=True)
+    capture_reason: Mapped[SourceEngagementCaptureReason] = mapped_column(
+        string_enum(SourceEngagementCaptureReason),
+        nullable=False,
+    )
+    schedule_label: Mapped[SourceEngagementScheduleLabel | None] = mapped_column(
+        string_enum(SourceEngagementScheduleLabel),
+        nullable=True,
+    )
+    view_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reactions: Mapped[dict[str, int] | None] = mapped_column(JSONB, nullable=True)
+    reaction_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    comment_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    forward_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    comments_state: Mapped[SourceEngagementCommentsState] = mapped_column(
+        string_enum(SourceEngagementCommentsState),
+        default=SourceEngagementCommentsState.UNKNOWN,
+        nullable=False,
+    )
+    fetch_status: Mapped[SourceEngagementFetchStatus] = mapped_column(
+        string_enum(SourceEngagementFetchStatus),
+        nullable=False,
+    )
+    source_alive: Mapped[bool] = mapped_column(default=True, nullable=False)
+    error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    raw_metrics: Mapped[dict[str, object]] = mapped_column(JSONB, default=dict, nullable=False)
+
+    source: Mapped["MemeSource"] = relationship("MemeSource", back_populates="engagement_snapshots")
+
+
+Index(
+    "ix_meme_source_engagement_snapshots_source_captured_desc",
+    MemeSourceEngagementSnapshot.__table__.c.meme_source_id,
+    MemeSourceEngagementSnapshot.__table__.c.captured_at.desc(),
+)
 
 
 class MemeSeoPage(Base):
@@ -813,32 +907,6 @@ class MemeTemplate(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     text_regions: Mapped[list[dict[str, object]] | None] = mapped_column(JSONB, nullable=True)
 
     memes: Mapped[list["Meme"]] = relationship("Meme", back_populates="template")
-
-
-class MemePopularitySnapshot(UUIDPrimaryKeyMixin, Base):
-    """Historical popularity metrics captured on a schedule."""
-
-    __tablename__ = "meme_popularity_snapshots"
-    __table_args__ = (
-        UniqueConstraint("meme_id", "captured_at", name="uq_meme_popularity_snapshots_meme_id_captured_at"),
-        Index("ix_meme_popularity_snapshots_meme_id_captured_at", "meme_id", "captured_at"),
-    )
-
-    meme_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("memes.id", ondelete="CASCADE"),
-        nullable=False,
-    )
-    captured_at: Mapped[datetime] = mapped_column(default=utcnow, nullable=False)
-    source_views: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    source_reactions: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    source_reposts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    platform_views: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    platform_sends: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    platform_saves: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    platform_likes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    popularity_score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
-
-    meme: Mapped["Meme"] = relationship("Meme", back_populates="popularity_snapshots")
 
 
 class SourceChannel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -1022,9 +1090,9 @@ __all__ = [
     "MemeFileOCRResult",
     "MemeFileSyncTargetSnapshot",
     "MemeMergeLog",
-    "MemePopularitySnapshot",
     "MemeSeoPage",
     "MemeSource",
+    "MemeSourceEngagementSnapshot",
     "MemeTemplate",
     "ModerationDecision",
     "ModerationReport",

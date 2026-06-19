@@ -25,7 +25,7 @@
   }
 
   function seriesBasis(item: PublicTrendComparisonSeriesRead): string {
-    if (item.kind === 'meme') return 'Per-meme snapshots';
+    if (item.kind === 'meme') return 'Per-meme engagement points';
     if (isAggregateSeries(item)) {
       return item.current_only_reason ? 'Current-window aggregate fallback' : 'Aggregate history points';
     }
@@ -36,12 +36,12 @@
     if (item.no_data_reason) return item.no_data_reason;
     if (item.current_only_reason) return item.current_only_reason;
     if (item.insufficient_history) {
-      if (item.kind === 'meme') return 'Insufficient history; at least two per-meme snapshots are needed.';
+      if (item.kind === 'meme') return 'Insufficient history; at least two per-meme engagement points are needed.';
       if (isAggregateSeries(item) && item.points.length === 1) return 'Insufficient history; one real aggregate point is available.';
       if (isAggregateSeries(item)) return 'Insufficient aggregate history; no line is drawn.';
       return 'Insufficient history; no line is drawn.';
     }
-    if (item.kind === 'meme') return 'Real per-meme snapshot history.';
+    if (item.kind === 'meme') return 'Real per-meme engagement history.';
     if (isAggregateSeries(item)) return 'Real aggregate history points.';
     return 'Real trend points.';
   }
@@ -49,7 +49,7 @@
 
 <PageHeader
   title="Compare public trends."
-  description="Share a URL with meme, tag, and template specs. Meme series use per-meme popularity snapshots. Tag and template series use aggregate history points when available, or an explicit current-window fallback when history is missing."
+  description="Share a URL with meme, tag, and template specs. Meme series use source-delta and platform-event engagement points. Tag and template series use aggregate history points when available, or an explicit current-window fallback when history is missing."
   badge="Shareable URL"
 >
   <ActionLink href="/trends" variant="secondary">Back to trends</ActionLink>

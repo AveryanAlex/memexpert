@@ -106,6 +106,8 @@ def test_settings_parse_pipeline_contract_and_normalize_object_prefixes() -> Non
     broker_settings = get_pipeline_broker_settings(settings)
     assert broker_settings.meme_created_routing_key == "pipeline.transcode"
     assert broker_settings.ocr_queue == "pipeline.ocr"
+    assert broker_settings.source_engagement_capture_queue == "pipeline.source_engagement_capture"
+    assert broker_settings.source_engagement_capture_routing_key == "pipeline.source_engagement_capture"
     assert broker_settings.dead_letter_routing_key == "pipeline.dead_letter"
 
 
@@ -144,14 +146,10 @@ def test_settings_parse_scheduler_contracts() -> None:
     settings = Settings.model_validate(
         {
             "scheduler_materialized_view_refresh_enabled": False,
-            "scheduler_popularity_snapshots_interval_seconds": 120.0,
-            "scheduler_popularity_source_view_weight": 1.5,
-            "scheduler_popularity_source_reaction_weight": 2.5,
-            "scheduler_popularity_source_repost_weight": 3.5,
-            "scheduler_popularity_platform_view_weight": 4.5,
-            "scheduler_popularity_platform_send_weight": 5.5,
-            "scheduler_popularity_platform_save_weight": 6.5,
-            "scheduler_popularity_platform_like_weight": 7.5,
+            "scheduler_source_engagement_capture_enabled": False,
+            "scheduler_source_engagement_capture_interval_seconds": 120.0,
+            "scheduler_source_engagement_capture_batch_size": 7,
+            "scheduler_source_engagement_capture_lease_timeout_seconds": 45.0,
             "scheduler_motd_interval_seconds": 300.0,
             "scheduler_search_index_sync_interval_seconds": 180.0,
             "scheduler_search_index_sync_batch_size": 7,
@@ -164,14 +162,10 @@ def test_settings_parse_scheduler_contracts() -> None:
     )
 
     assert settings.scheduler_materialized_view_refresh_enabled is False
-    assert settings.scheduler_popularity_snapshots_interval_seconds == 120.0
-    assert settings.scheduler_popularity_source_view_weight == 1.5
-    assert settings.scheduler_popularity_source_reaction_weight == 2.5
-    assert settings.scheduler_popularity_source_repost_weight == 3.5
-    assert settings.scheduler_popularity_platform_view_weight == 4.5
-    assert settings.scheduler_popularity_platform_send_weight == 5.5
-    assert settings.scheduler_popularity_platform_save_weight == 6.5
-    assert settings.scheduler_popularity_platform_like_weight == 7.5
+    assert settings.scheduler_source_engagement_capture_enabled is False
+    assert settings.scheduler_source_engagement_capture_interval_seconds == 120.0
+    assert settings.scheduler_source_engagement_capture_batch_size == 7
+    assert settings.scheduler_source_engagement_capture_lease_timeout_seconds == 45.0
     assert settings.scheduler_motd_interval_seconds == 300.0
     assert settings.scheduler_search_index_sync_interval_seconds == 180.0
     assert settings.scheduler_search_index_sync_batch_size == 7
@@ -182,17 +176,13 @@ def test_settings_parse_scheduler_contracts() -> None:
     assert settings.scheduler_advisory_lock_key == (123, 456)
 
 
-def test_settings_scheduler_popularity_defaults_match_design() -> None:
+def test_settings_scheduler_source_engagement_defaults_match_design() -> None:
     settings = Settings()
 
-    assert settings.scheduler_popularity_snapshots_interval_seconds == 21600.0
-    assert settings.scheduler_popularity_source_view_weight == 1.0
-    assert settings.scheduler_popularity_source_reaction_weight == 2.0
-    assert settings.scheduler_popularity_source_repost_weight == 3.0
-    assert settings.scheduler_popularity_platform_view_weight == 1.0
-    assert settings.scheduler_popularity_platform_send_weight == 3.0
-    assert settings.scheduler_popularity_platform_save_weight == 4.0
-    assert settings.scheduler_popularity_platform_like_weight == 5.0
+    assert settings.scheduler_source_engagement_capture_enabled is True
+    assert settings.scheduler_source_engagement_capture_interval_seconds == 21600.0
+    assert settings.scheduler_source_engagement_capture_batch_size == 100
+    assert settings.scheduler_source_engagement_capture_lease_timeout_seconds == 1800.0
 
 
 def test_settings_scheduler_batch_job_defaults_match_design() -> None:
@@ -201,23 +191,6 @@ def test_settings_scheduler_batch_job_defaults_match_design() -> None:
     assert settings.scheduler_search_index_sync_batch_size == 50
     assert settings.scheduler_search_index_sync_processing_timeout_seconds == 900.0
     assert settings.scheduler_seo_backlog_batch_size == 25
-
-
-@pytest.mark.parametrize(
-    "field_name",
-    [
-        "scheduler_popularity_source_view_weight",
-        "scheduler_popularity_source_reaction_weight",
-        "scheduler_popularity_source_repost_weight",
-        "scheduler_popularity_platform_view_weight",
-        "scheduler_popularity_platform_send_weight",
-        "scheduler_popularity_platform_save_weight",
-        "scheduler_popularity_platform_like_weight",
-    ],
-)
-def test_settings_reject_negative_scheduler_popularity_weights(field_name: str) -> None:
-    with pytest.raises(ValidationError):
-        _ = Settings.model_validate({field_name: -0.1})
 
 
 @pytest.mark.parametrize(

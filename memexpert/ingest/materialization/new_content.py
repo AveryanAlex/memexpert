@@ -4,12 +4,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from memexpert.ingest.materialization.sources import source_views
 from memexpert.ingest.source_metadata import (
+    source_engagement_metrics,
     source_forward_ids,
     source_is_forwarded,
     source_published_at,
-    source_reactions,
 )
 from memexpert.models.content import Meme, MemeFile, MemeSource, PipelineStageJournal
 from memexpert.models.enums import (
@@ -20,6 +19,7 @@ from memexpert.models.enums import (
     IngestFileOrigin,
     SourceAttachReason,
 )
+from memexpert.services.source_engagement import add_initial_source_engagement_snapshot
 
 if TYPE_CHECKING:
     import uuid
@@ -55,6 +55,19 @@ async def create_new_content_rows(
     session.add(meme)
     await session.flush()
 
+    source_row = MemeSource(
+        file_id=meme_file_id,
+        platform=ingest_request.source_platform,
+        source_id=ingest_request.source_id,
+        post_id=ingest_request.post_id,
+        is_first_source=not source_is_forwarded(ingest_request.source_metadata),
+        source_alive=True,
+        published_at=source_published_at(ingest_request.source_metadata),
+        forwarded_from_source_id=forwarded_from_source_id,
+        forwarded_from_post_id=forwarded_from_post_id,
+        attach_reason=SourceAttachReason.NEW_FILE,
+    )
+
     session.add(
         MemeFile(
             id=meme_file_id,
@@ -72,20 +85,7 @@ async def create_new_content_rows(
     )
     session.add_all(
         [
-            MemeSource(
-                file_id=meme_file_id,
-                platform=ingest_request.source_platform,
-                source_id=ingest_request.source_id,
-                post_id=ingest_request.post_id,
-                views=source_views(ingest_request),
-                reactions=source_reactions(ingest_request.source_metadata),
-                is_first_source=not source_is_forwarded(ingest_request.source_metadata),
-                source_alive=True,
-                published_at=source_published_at(ingest_request.source_metadata),
-                forwarded_from_source_id=forwarded_from_source_id,
-                forwarded_from_post_id=forwarded_from_post_id,
-                attach_reason=SourceAttachReason.NEW_FILE,
-            ),
+            source_row,
             PipelineStageJournal(
                 meme_file_id=meme_file_id,
                 stage=ContentPipelineStage.INGEST,
@@ -105,6 +105,12 @@ async def create_new_content_rows(
                 is_retryable=True,
             ),
         ]
+    )
+    await add_initial_source_engagement_snapshot(
+        session,
+        source_row,
+        source_engagement_metrics(ingest_request.source_metadata),
+        captured_at=created_at,
     )
     await session.flush()
 

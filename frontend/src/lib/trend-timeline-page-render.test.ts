@@ -23,7 +23,7 @@ describe('/trends/timeline page', () => {
     expect(body).toContain('href="/trends/timeline?granularity=month"');
     expect(body).toContain('href="/trends/timeline?granularity=year"');
     expect(body).toContain('No timeline data yet');
-    expect(body).toContain('real snapshots have been captured');
+    expect(body).toContain('source deltas or platform events have been captured');
     expect(body).not.toContain('Next periods');
   });
 
@@ -69,7 +69,7 @@ describe('/trends/timeline page', () => {
     });
 
     expect(body).toContain('January 2026');
-    expect(body).toContain('1 memes · 2 real snapshots');
+    expect(body).toContain('1 memes · 2 source checks');
     expect(body).toContain('Timeline reaction');
     expect(body).toContain('Popularity');
     expect(body).toContain('17.5');

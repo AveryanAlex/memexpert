@@ -437,7 +437,7 @@ async def public_trend_timeline(
     limit: Annotated[int, Query(ge=1, le=100)] = 12,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> PublicTrendTimelinePageRead:
-    """Return month/year timeline periods from real public popularity snapshots."""
+    """Return month/year timeline periods from derived public engagement points."""
 
     return await public_trends_service.timeline_periods(
         granularity=granularity,
