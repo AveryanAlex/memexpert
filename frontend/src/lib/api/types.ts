@@ -40,6 +40,33 @@ export interface CurrentSessionRead {
   linked_providers: LinkedProvidersRead;
 }
 
+export interface ProfileStatsTagRead {
+  tag: string;
+  count: number;
+}
+
+export interface ProfileStatsTemplateRead {
+  template_id: string;
+  slug: string;
+  name: string;
+  count: number;
+}
+
+export interface ProfileStatsMetadataRead {
+  notes: string[];
+}
+
+export interface ProfileStatsRead {
+  viewed: number;
+  sent: number;
+  saved: number;
+  downloaded: number;
+  days_active: number;
+  top_tags: ProfileStatsTagRead[];
+  top_templates: ProfileStatsTemplateRead[];
+  metadata: ProfileStatsMetadataRead;
+}
+
 export interface TelegramLinkStartRead {
   code: string;
   deep_link_url: string;

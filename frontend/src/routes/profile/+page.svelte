@@ -1,7 +1,7 @@
 <script lang="ts">
   import { invalidateAll } from '$app/navigation';
   import { ApiError, updateUserPreferences } from '$lib/api/client';
-  import { connectedProviderLabels } from '$lib/account/view-model';
+  import type { UserLanguage } from '$lib/api/types';
   import { bulkCollectionOptions, bulkGuidanceFromSessionAndCollections } from '$lib/features/memes/bulk-view-model';
   import MemeGrid from '$lib/features/memes/MemeGrid.svelte';
   import LibrarySection from '$lib/features/profile/LibrarySection.svelte';
@@ -12,6 +12,7 @@
     movePinnedMemeIdToTarget,
     orderPinnedMemesByIds,
     profileCapabilities,
+    profileProviderStatuses,
     profilePreferences,
     profileStats,
     writableCollectionOptions
@@ -26,17 +27,29 @@
   let selectorMessage = $state<string | null>(null);
   let nsfwPending = $state(false);
   let nsfwMessage = $state<string | null>(null);
+  let selectedLanguage = $state<UserLanguage>('any');
+  let languagePending = $state(false);
+  let languageMessage = $state<string | null>(null);
   let pinOrderIds = $state<string[]>([]);
   let pinOrderPending = $state(false);
   let pinOrderMessage = $state<string | null>(null);
   let draggedPinId = $state<string | null>(null);
 
+  const LANGUAGE_OPTIONS: Array<{ value: UserLanguage; label: string }> = [
+    { value: 'any', label: 'Any language' },
+    { value: 'en', label: 'English' },
+    { value: 'ru', label: 'Russian' }
+  ];
+
   const capabilities = $derived(profileCapabilities(data.session ?? null));
-  const providerLabels = $derived(connectedProviderLabels(data.session?.linked_providers ?? null));
+  const providerStatuses = $derived(profileProviderStatuses(data.session ?? null));
   const collectionOptions = $derived(writableCollectionOptions(data.library));
   const bulkOptions = $derived(bulkCollectionOptions(data.library?.collections));
   const hasMultipleCollections = $derived(collectionOptions.length > 1);
-  const stats = $derived(profileStats(data.library));
+  const stats = $derived(profileStats(data.profileStats));
+  const profileNotes = $derived(data.profileStats?.metadata.notes.filter((note) => note.trim()) ?? []);
+  const topTags = $derived(data.profileStats?.top_tags ?? []);
+  const topTemplates = $derived(data.profileStats?.top_templates ?? []);
   const preferences = $derived(profilePreferences(data.session?.user ?? null));
   const bulkGuidance = $derived(bulkGuidanceFromSessionAndCollections(data.session ?? null, bulkOptions));
   const libraryPinIds = $derived(data.library?.pinned_memes.map((meme) => meme.id) ?? []);
@@ -48,6 +61,10 @@
 
   $effect(() => {
     pinOrderIds = libraryPinIds;
+  });
+
+  $effect(() => {
+    selectedLanguage = data.session?.user.language ?? 'any';
   });
 
   async function changeActiveCollection(event: Event) {
@@ -99,6 +116,34 @@
     }
   }
 
+  async function changeLanguage(event: Event) {
+    const nextLanguage = (event.currentTarget as HTMLSelectElement).value;
+    if (!isUserLanguage(nextLanguage)) {
+      selectedLanguage = data.session?.user.language ?? 'any';
+      return;
+    }
+
+    if (!data.session || nextLanguage === data.session.user.language) {
+      selectedLanguage = nextLanguage;
+      return;
+    }
+
+    languagePending = true;
+    languageMessage = null;
+    selectedLanguage = nextLanguage;
+
+    try {
+      await updateUserPreferences({ fetch, body: { language: nextLanguage } });
+      languageMessage = `Language preference updated to ${languageOptionLabel(nextLanguage)}.`;
+      await invalidateAll();
+    } catch (error) {
+      selectedLanguage = data.session.user.language;
+      languageMessage = error instanceof ApiError || error instanceof Error ? error.message : 'Could not update language preference.';
+    } finally {
+      languagePending = false;
+    }
+  }
+
   async function movePin(memeId: string, direction: -1 | 1) {
     await savePinOrder(movePinnedMemeId(pinOrderIds, memeId, direction));
   }
@@ -140,6 +185,14 @@
       pinOrderPending = false;
     }
   }
+
+  function isUserLanguage(value: string): value is UserLanguage {
+    return LANGUAGE_OPTIONS.some((option) => option.value === value);
+  }
+
+  function languageOptionLabel(value: UserLanguage): string {
+    return LANGUAGE_OPTIONS.find((option) => option.value === value)?.label ?? value;
+  }
 </script>
 
 <section class="mb-5 grid items-stretch gap-6 md:grid-cols-[minmax(0,1fr)_minmax(280px,0.55fr)]" aria-labelledby="profile-title">
@@ -153,11 +206,17 @@
     <p class="m-0 text-sm text-muted">{capabilities.persistenceText}</p>
     <p class="m-0 text-sm text-muted">{capabilities.pinText}</p>
     <p class="m-0 text-sm text-muted">{capabilities.collectionText}</p>
-    {#if providerLabels.length > 0}
-      <p class="m-0 text-sm text-muted">Connected: {providerLabels.join(', ')}</p>
-    {:else if data.session}
-      <p class="m-0 text-sm text-muted">Connected: none yet</p>
-    {/if}
+    <div class="mt-2 grid gap-2">
+      {#each providerStatuses as provider}
+        <article class="rounded-[18px] border border-success-line/70 bg-paper/70 p-3">
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <p class="m-0 text-sm font-extrabold text-muted">{provider.label}</p>
+            <Badge tone={provider.value === 'Connected' || provider.value === 'Verified' || provider.value === 'Password set' ? 'success' : 'neutral'}>{provider.value}</Badge>
+          </div>
+          <p class="m-0 mt-1 text-sm text-muted">{provider.detail}</p>
+        </article>
+      {/each}
+    </div>
     {#if capabilities.showConnectTelegram}
       <ActionLink size="compact" href="/account/telegram?returnTo=/profile">Connect Telegram</ActionLink>
     {:else if data.session?.linked_providers.telegram_linked}
@@ -169,9 +228,12 @@
 <section class="my-4 grid gap-4 md:grid-cols-2" aria-label="Profile settings and stats">
   <Card class="grid gap-3 shadow-none" aria-labelledby="profile-stats-title">
     <div>
-      <h2 id="profile-stats-title" class="m-0 text-2xl font-black tracking-[-0.04em]">Library stats</h2>
-      <p class="m-0 text-muted">Counts come from the loaded library payload when available.</p>
+      <h2 id="profile-stats-title" class="m-0 text-2xl font-black tracking-[-0.04em]">Interaction stats</h2>
+      <p class="m-0 text-muted">Counts come from your recorded meme interaction history.</p>
     </div>
+    {#if data.profileStatsError}
+      <Notice>{data.profileStatsError}</Notice>
+    {/if}
     <div class="grid gap-2 sm:grid-cols-2">
       {#each stats as stat}
         <article class="rounded-[20px] border border-line p-4">
@@ -181,6 +243,46 @@
         </article>
       {/each}
     </div>
+    {#if profileNotes.length > 0}
+      <div class="rounded-[20px] border border-line bg-soft/50 p-4" aria-label="Profile stats notes">
+        <p class="m-0 font-black">Stats notes</p>
+        <ul class="m-0 mt-2 grid gap-1 pl-5 text-sm text-muted">
+          {#each profileNotes as note}
+            <li>{note}</li>
+          {/each}
+        </ul>
+      </div>
+    {/if}
+    {#if topTags.length > 0 || topTemplates.length > 0}
+      <div class="grid gap-3 lg:grid-cols-2">
+        {#if topTags.length > 0}
+          <section class="rounded-[20px] border border-line p-4" aria-labelledby="profile-top-tags-title">
+            <h3 id="profile-top-tags-title" class="m-0 text-lg font-black tracking-[-0.03em]">Top tags from your history</h3>
+            <div class="mt-3 grid gap-2">
+              {#each topTags as tag}
+                <a class="flex items-center justify-between gap-3 rounded-[16px] border border-line bg-paper px-3 py-2 font-extrabold text-inherit no-underline hover:bg-soft" href={`/tags/${encodeURIComponent(tag.tag)}`}>
+                  <span>#{tag.tag}</span>
+                  <span class="text-muted">{tag.count}</span>
+                </a>
+              {/each}
+            </div>
+          </section>
+        {/if}
+        {#if topTemplates.length > 0}
+          <section class="rounded-[20px] border border-line p-4" aria-labelledby="profile-top-templates-title">
+            <h3 id="profile-top-templates-title" class="m-0 text-lg font-black tracking-[-0.03em]">Top templates from your history</h3>
+            <div class="mt-3 grid gap-2">
+              {#each topTemplates as template}
+                <a class="flex items-center justify-between gap-3 rounded-[16px] border border-line bg-paper px-3 py-2 font-extrabold text-inherit no-underline hover:bg-soft" href={`/templates/${encodeURIComponent(template.slug)}`}>
+                  <span>{template.name}</span>
+                  <span class="text-muted">{template.count}</span>
+                </a>
+              {/each}
+            </div>
+          </section>
+        {/if}
+      </div>
+    {/if}
   </Card>
 
   <Card class="grid gap-3 shadow-none" aria-labelledby="profile-settings-title">
@@ -196,6 +298,21 @@
           <p class="m-0 text-sm text-muted">{preference.detail}</p>
         </article>
       {/each}
+    </div>
+    <div class="rounded-[20px] border border-line bg-soft/50 p-4">
+      <p class="m-0 font-black">Language preference</p>
+      <p class="m-0 mb-3 text-sm text-muted">Choose the account language used by account-aware surfaces when supported.</p>
+      <label class="grid max-w-[420px] gap-2 font-extrabold text-chiptext">
+        <span>Profile language</span>
+        <Select bind:value={selectedLanguage} onchange={changeLanguage} disabled={!data.session || languagePending}>
+          {#each LANGUAGE_OPTIONS as option}
+            <option value={option.value}>{option.label}</option>
+          {/each}
+        </Select>
+      </label>
+      {#if languageMessage}
+        <p class="m-0 mt-3 text-sm text-muted" role="status">{languageMessage}</p>
+      {/if}
     </div>
     <div class="rounded-[20px] border border-line bg-soft/50 p-4">
       {#if data.session?.user.nsfw_enabled}

@@ -1,28 +1,38 @@
 import type { PageServerLoad } from './$types';
-import { ApiError, fetchMemeLibrary } from '$lib/api/client';
+import { ApiError, fetchMemeLibrary, fetchProfileStats } from '$lib/api/client';
 import { ACCESS_COOKIE_NAME, apiBaseUrl, cookieHeaderWithAccessToken, forwardBackendAccessCookie } from '$lib/server/backend';
 
 export const load: PageServerLoad = async ({ cookies, fetch, parent, request }) => {
   await parent();
 
-  try {
-    const library = await fetchMemeLibrary({
-      fetch,
-      baseUrl: apiBaseUrl(),
-      cookieHeader: cookieHeaderWithAccessToken(
-        request.headers.get('cookie') ?? undefined,
-        cookies.get(ACCESS_COOKIE_NAME) ?? null
-      ),
-      onResponse: (response) => {
-        forwardBackendAccessCookie(response, cookies);
-      }
-    });
+  const backendRequest = {
+    fetch,
+    baseUrl: apiBaseUrl(),
+    cookieHeader: cookieHeaderWithAccessToken(
+      request.headers.get('cookie') ?? undefined,
+      cookies.get(ACCESS_COOKIE_NAME) ?? null
+    ),
+    onResponse: (response: Response) => {
+      forwardBackendAccessCookie(response, cookies);
+    }
+  };
 
-    return { library, libraryError: null };
-  } catch (error) {
-    return {
-      library: null,
-      libraryError: error instanceof ApiError ? error.message : 'Could not reach the meme library API.'
-    };
-  }
+  const [libraryResult, profileStatsResult] = await Promise.allSettled([
+    fetchMemeLibrary(backendRequest),
+    fetchProfileStats(backendRequest)
+  ]);
+
+  return {
+    library: libraryResult.status === 'fulfilled' ? libraryResult.value : null,
+    libraryError: libraryResult.status === 'rejected' ? loadErrorMessage(libraryResult.reason, 'Could not reach the meme library API.') : null,
+    profileStats: profileStatsResult.status === 'fulfilled' ? profileStatsResult.value : null,
+    profileStatsError:
+      profileStatsResult.status === 'rejected'
+        ? loadErrorMessage(profileStatsResult.reason, 'Could not reach the profile stats API.')
+        : null
+  };
 };
+
+function loadErrorMessage(error: unknown, fallback: string): string {
+  return error instanceof ApiError ? error.message : fallback;
+}
