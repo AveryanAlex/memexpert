@@ -87,7 +87,7 @@ test('guest explores seeded public trend aggregates, comparison, and timeline', 
   await expect(page.getByRole('heading', { name: 'Data table' })).toBeVisible();
   const comparisonTable = page.getByRole('table');
   await expect(comparisonTable).toBeVisible();
-  await expectComparisonRow(comparisonTable, representative.title, 'meme', 'Per-meme snapshots', 'Real per-meme snapshot history.');
+  await expectComparisonRow(comparisonTable, representative.title, 'meme', 'Per-meme engagement points', 'Real per-meme engagement history.');
   await expectComparisonRow(comparisonTable, trends.tag.title, 'tag', 'Aggregate history points', 'Real aggregate history points.');
   await expectComparisonRow(comparisonTable, trends.template.title, 'template', 'Aggregate history points', 'Real aggregate history points.');
   await expect(page.getByText('Current-window aggregate fallback')).toHaveCount(0);
