@@ -21,6 +21,7 @@ from memexpert.models.base import utcnow
 from memexpert.models.collection import CollectionMeme
 from memexpert.models.content import Meme, MemeFile
 from memexpert.models.enums import (
+    AnalyticsEventType,
     ContentKind,
     ContentLanguage,
     ContentProcessingStatus,
@@ -28,7 +29,7 @@ from memexpert.models.enums import (
     SourceAttachReason,
     SourcePlatform,
 )
-from memexpert.models.user import User
+from memexpert.models.user import AnalyticsEvent, User
 from memexpert.services import CollectionService, UserService
 from tests.conftest import create_full_user_via_upgrade
 
@@ -388,6 +389,19 @@ async def test_private_photo_upload_queues_raw_ingest_without_saving_active_coll
     assert accept_service.calls[0]["media_bytes"] == b"photo-bytes"
     assert "Результат появится" in last_bot_text(recording_session)
     assert await migrated_db_session.scalar(select(CollectionMeme.meme_id)) is None
+    async with postgres_session_factory() as session:
+        event = await session.scalar(
+            select(AnalyticsEvent).where(AnalyticsEvent.event_type == AnalyticsEventType.COLLECTION_ACTION)
+        )
+        active_collection_id = await session.scalar(select(User.active_save_collection_id).where(User.id == user.id))
+    assert event is not None
+    assert event.user_id == user.id
+    assert event.payload["surface"] == "telegram_pm_upload"
+    assert active_collection_id is not None
+    assert event.payload["refs"]["collection_id"] == str(active_collection_id)
+    assert event.payload["properties"]["action"] == "upload_queued"
+    assert event.payload["properties"]["media_kind"] == "image"
+    assert event.payload["properties"]["content_type"] == "image/jpeg"
 
 
 @pytest.mark.asyncio
@@ -429,6 +443,19 @@ async def test_private_upload_public_duplicate_saves_existing_public_meme(
     assert await migrated_db_session.scalar(
         select(CollectionMeme.meme_id).where(CollectionMeme.meme_id == public_meme.id)
     ) == public_meme.id
+    async with postgres_session_factory() as session:
+        event = await session.scalar(
+            select(AnalyticsEvent).where(AnalyticsEvent.event_type == AnalyticsEventType.MEME_SAVE)
+        )
+        active_collection_id = await session.scalar(select(User.active_save_collection_id).where(User.id == user.id))
+    assert event is not None
+    assert event.user_id == user.id
+    assert event.payload["surface"] == "telegram_pm_upload"
+    assert event.payload["refs"]["meme_id"] == str(public_meme.id)
+    assert active_collection_id is not None
+    assert event.payload["refs"]["collection_id"] == str(active_collection_id)
+    assert event.payload["properties"]["action"] == "duplicate_saved"
+    assert event.payload["properties"]["outcome"] == "resolved_sha_duplicate"
 
 
 @pytest.mark.asyncio

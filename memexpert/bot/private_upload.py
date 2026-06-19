@@ -13,6 +13,7 @@ from aiogram import F, Router
 from pydantic import ValidationError
 from sqlalchemy import select
 
+from memexpert.bot.analytics import record_telegram_interaction_event, telegram_user_hash
 from memexpert.core.config import Settings, get_settings
 from memexpert.core.database import get_async_session_factory
 from memexpert.ingest.accept_service import PipelineIngestAcceptService
@@ -20,6 +21,7 @@ from memexpert.ingest.schemas import IngestAcceptOutcome, IngestAcceptResult, In
 from memexpert.models.content import Meme, MemeFile, MemeSource
 from memexpert.models.enums import (
     AccountStatus,
+    AnalyticsEventType,
     ContentKind,
     SourceAttachReason,
     SourcePlatform,
@@ -238,6 +240,8 @@ async def handle_private_upload_message(
                 session=session,
                 collection_service=collection_service,
                 user=linked_user,
+                media=media,
+                telegram_user_id=telegram_user_id,
                 source=source,
             )
             return
@@ -263,6 +267,8 @@ async def handle_private_upload_message(
             session=session,
             collection_service=collection_service,
             user=linked_user,
+            media=media,
+            telegram_user_id=telegram_user_id,
             result=accept_result,
         )
 
@@ -273,11 +279,22 @@ async def _handle_accept_result(
     session: AsyncSession,
     collection_service: ActiveCollectionSaver,
     user: User,
+    media: TelegramUploadMedia,
+    telegram_user_id: int,
     result: IngestAcceptResult,
 ) -> None:
     ingest_request = result.ingest_request
     if result.outcome is IngestAcceptOutcome.ACCEPTED_ASYNC:
         await message.answer(_private_upload_queued_message())
+        await _record_upload_event(
+            session,
+            _upload_collection_event(
+                user=user,
+                telegram_user_id=telegram_user_id,
+                action="upload_queued",
+                media=media,
+            ),
+        )
         return
 
     if ingest_request.materialized_meme_id is None:
@@ -297,6 +314,17 @@ async def _handle_accept_result(
         )
         if save_result == "saved":
             await message.answer(_source_replay_saved_message())
+            await _record_upload_event(
+                session,
+                _upload_meme_save_event(
+                    user=user,
+                    telegram_user_id=telegram_user_id,
+                    action="source_replay_saved",
+                    outcome=result.outcome.value,
+                    meme_id=ingest_request.materialized_meme_id,
+                    media=media,
+                ),
+            )
             return
         if save_result == "not_visible":
             await message.answer(_private_duplicate_not_visible_message())
@@ -316,9 +344,33 @@ async def _handle_accept_result(
         )
         if save_result == "saved" and meme.is_public:
             await message.answer(_public_duplicate_saved_message())
+            await _record_upload_event(
+                session,
+                _upload_meme_save_event(
+                    user=user,
+                    telegram_user_id=telegram_user_id,
+                    action="duplicate_saved",
+                    outcome=result.outcome.value,
+                    meme_id=ingest_request.materialized_meme_id,
+                    media=media,
+                    extra_properties={"visibility": "public"},
+                ),
+            )
             return
         if save_result == "saved":
             await message.answer(_private_duplicate_saved_message())
+            await _record_upload_event(
+                session,
+                _upload_meme_save_event(
+                    user=user,
+                    telegram_user_id=telegram_user_id,
+                    action="duplicate_saved",
+                    outcome=result.outcome.value,
+                    meme_id=ingest_request.materialized_meme_id,
+                    media=media,
+                    extra_properties={"visibility": "private"},
+                ),
+            )
             return
         if save_result == "collection_error":
             await message.answer(_collection_save_failure_message())
@@ -335,6 +387,8 @@ async def _handle_duplicate_source_replay(
     session: AsyncSession,
     collection_service: ActiveCollectionSaver,
     user: User,
+    media: TelegramUploadMedia,
+    telegram_user_id: int,
     source: IngestAcceptSource,
 ) -> None:
     meme_id = await _resolve_meme_id_for_source(session, source=source)
@@ -345,6 +399,17 @@ async def _handle_duplicate_source_replay(
     save_result = await _save_to_active_collection(collection_service, user_id=user.id, meme_id=meme_id)
     if save_result == "saved":
         await message.answer(_source_replay_saved_message())
+        await _record_upload_event(
+            session,
+            _upload_meme_save_event(
+                user=user,
+                telegram_user_id=telegram_user_id,
+                action="duplicate_source_replay_saved",
+                outcome="saved",
+                meme_id=meme_id,
+                media=media,
+            ),
+        )
         return
     if save_result == "not_visible":
         await message.answer(_private_duplicate_not_visible_message())
@@ -405,6 +470,71 @@ async def _resolve_meme_id_for_source(
         .limit(1)
     )
     return result.scalar_one_or_none()
+
+
+async def _record_upload_event(session: AsyncSession, event: dict[str, object]) -> None:
+    refs = event.get("refs")
+    if not isinstance(refs, dict):
+        refs = {}
+    event_type = event.get("event_type")
+    await record_telegram_interaction_event(
+        session,
+        event,
+        log_context={
+            "analytics_event_type": getattr(event_type, "value", str(event_type)),
+            "surface": event.get("surface"),
+            "user_id": str(event.get("user_id")) if event.get("user_id") else None,
+            "collection_id": str(refs.get("collection_id")) if refs.get("collection_id") else None,
+            "meme_id": str(refs.get("meme_id")) if refs.get("meme_id") else None,
+        },
+    )
+
+
+def _upload_collection_event(
+    *,
+    user: User,
+    telegram_user_id: int,
+    action: str,
+    media: TelegramUploadMedia,
+) -> dict[str, object]:
+    return {
+        "event_type": AnalyticsEventType.COLLECTION_ACTION,
+        "user_id": user.id,
+        "surface": "telegram_pm_upload",
+        "refs": {"collection_id": user.active_save_collection_id},
+        "properties": {
+            "action": action,
+            "telegram_user_hash": telegram_user_hash(telegram_user_id),
+            "media_kind": media.limit_kind.value,
+            "content_type": media.content_type,
+        },
+    }
+
+
+def _upload_meme_save_event(
+    *,
+    user: User,
+    telegram_user_id: int,
+    action: str,
+    outcome: str,
+    meme_id: object,
+    media: TelegramUploadMedia,
+    extra_properties: dict[str, object] | None = None,
+) -> dict[str, object]:
+    return {
+        "event_type": AnalyticsEventType.MEME_SAVE,
+        "user_id": user.id,
+        "surface": "telegram_pm_upload",
+        "refs": {"collection_id": user.active_save_collection_id, "meme_id": meme_id},
+        "properties": {
+            "action": action,
+            "outcome": outcome,
+            "telegram_user_hash": telegram_user_hash(telegram_user_id),
+            "media_kind": media.limit_kind.value,
+            "content_type": media.content_type,
+            **(extra_properties or {}),
+        },
+    }
 
 
 def _extract_upload_media(message: Message) -> TelegramUploadMedia | None:

@@ -20,6 +20,7 @@ from memexpert.models.base import utcnow
 from memexpert.models.collection import Collection, CollectionMember, CollectionMeme, PinnedMeme
 from memexpert.models.content import Meme, MemeFile
 from memexpert.models.enums import (
+    AnalyticsEventType,
     CollectionKind,
     CollectionMembershipRole,
     ContentKind,
@@ -28,7 +29,7 @@ from memexpert.models.enums import (
     SourcePlatform,
     UserLanguage,
 )
-from memexpert.models.user import ChannelSuggestion, InlineUsageEvent, User
+from memexpert.models.user import AnalyticsEvent, ChannelSuggestion, InlineUsageEvent, User
 from memexpert.services import UserService
 from tests.conftest import create_full_user_via_upgrade
 
@@ -209,6 +210,14 @@ async def test_settings_callbacks_persist_nsfw_and_language(
     assert "Настройки MemeXpert" in str(last_message(telegram_session).text)
     assert "NSFW по умолчанию: включено" in str(last_edit(telegram_session).text)
     assert "Язык контента: Русский" in str(last_edit(telegram_session).text)
+    async with postgres_session_factory() as session:
+        events = (
+            await session.execute(select(AnalyticsEvent).where(AnalyticsEvent.event_type == AnalyticsEventType.CLICK))
+        ).scalars().all()
+    events_by_value = {event.payload["properties"]["value"]: event for event in events}
+    assert events_by_value["1"].payload["surface"] == "telegram_pm_settings"
+    assert events_by_value["1"].payload["properties"]["action"] == "nsfw"
+    assert events_by_value["ru"].payload["properties"]["action"] == "lang"
 
 
 @pytest.mark.asyncio
@@ -245,6 +254,15 @@ async def test_suggest_channel_writes_pending_row_and_reports_duplicates(
     assert suggestions[0].channel_url == "https://t.me/memexpert_source"
     assert "Канал отправлен на проверку" in sent_texts[0]
     assert "Такой канал уже есть" in sent_texts[1]
+    async with postgres_session_factory() as session:
+        event = await session.scalar(
+            select(AnalyticsEvent).where(AnalyticsEvent.event_type == AnalyticsEventType.CHANNEL_SUGGEST)
+        )
+    assert event is not None
+    assert event.payload["surface"] == "telegram_pm_settings"
+    assert event.payload["refs"]["channel_suggestion_id"] == str(suggestions[0].id)
+    assert event.payload["properties"]["action"] == "suggest_channel"
+    assert event.payload["properties"]["platform"] == "telegram"
 
 
 @pytest.mark.asyncio
@@ -307,6 +325,13 @@ async def test_account_status_and_miniapp_links_include_provider_state_and_entry
     button_urls = [button.url for row in miniapp_message.reply_markup.inline_keyboard for button in row]
     assert f"https://t.me/{BOT_USERNAME}/app?startapp=collections" in button_urls
     assert f"https://t.me/{BOT_USERNAME}/app?startapp=invite" in button_urls
+    async with postgres_session_factory() as session:
+        event = await session.scalar(
+            select(AnalyticsEvent).where(AnalyticsEvent.event_type == AnalyticsEventType.MINIAPP_OPEN)
+        )
+    assert event is not None
+    assert event.payload["surface"] == "telegram_pm_miniapp"
+    assert event.payload["properties"]["action"] == "link_display"
 
 
 @pytest.mark.asyncio

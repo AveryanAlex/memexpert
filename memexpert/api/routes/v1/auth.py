@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Annotated
+import logging
+from typing import TYPE_CHECKING, Annotated
 
 from fastapi import APIRouter, Body, Request, status
 from fastapi.responses import Response
@@ -11,6 +12,7 @@ from memexpert.api.cookies import delete_access_cookie, set_access_cookie
 from memexpert.api.dependencies import (
     AUTH_ERROR_RESPONSES,
     AccountLinkServiceDep,
+    AnalyticsServiceDep,
     AuthServiceDep,
     AutoGuestUserDep,
     CurrentUserDep,
@@ -21,6 +23,7 @@ from memexpert.api.dependencies import (
     OptionalGuestUserDep,
     to_auth_http_error,
 )
+from memexpert.models.enums import AnalyticsEventType
 from memexpert.schemas.auth import (
     AuthSessionRead,
     CurrentSessionRead,
@@ -43,8 +46,13 @@ from memexpert.services import (
     UserNotFoundError,
     UserService,
 )
+from memexpert.services.analytics import AnalyticsService, hash_external_identifier
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+logger = logging.getLogger(__name__)
 
 
 def _extract_client_ip(request: Request) -> str | None:
@@ -339,6 +347,8 @@ async def login_with_telegram_miniapp(
     optional_guest: OptionalGuestUserDep,
     account_link_service: AccountLinkServiceDep,
     auth_service: AuthServiceDep,
+    analytics_service: AnalyticsServiceDep,
+    session: DbSessionDep,
     credentials: Annotated[TelegramMiniAppAuthRequest, Body()],
 ) -> AuthSessionRead:
     """Validate Telegram Mini App initData via the unified writer path."""
@@ -357,6 +367,7 @@ async def login_with_telegram_miniapp(
     except AuthServiceError as exc:
         raise to_auth_http_error(exc) from exc
 
+    await _record_telegram_miniapp_open(analytics_service, session, auth_session)
     return _issue_session_response(response, auth_session)
 
 
@@ -488,6 +499,49 @@ def _build_linked_providers_read(linked_providers: LinkedProvidersProjection) ->
         google_linked=linked_providers.google_linked,
         telegram_linked=linked_providers.telegram_linked,
     )
+
+
+async def _record_telegram_miniapp_open(
+    analytics_service: AnalyticsService,
+    session: AsyncSession,
+    auth_session: AuthSession,
+) -> None:
+    telegram_id = auth_session.user.telegram_id
+    properties: dict[str, object] = {"action": "auth_session_issued"}
+    if telegram_id is not None:
+        properties["telegram_user_hash"] = hash_external_identifier("telegram_user", telegram_id)
+    try:
+        await analytics_service.record_interaction_event(
+            {
+                "event_type": AnalyticsEventType.MINIAPP_OPEN,
+                "user_id": auth_session.user.id,
+                "surface": "telegram_miniapp_auth",
+                "properties": properties,
+            }
+        )
+    except Exception:
+        if session.in_transaction():
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "Telegram Mini App auth analytics rollback failed.",
+                    extra={
+                        "event": "telegram_analytics_rollback_failed",
+                        "analytics_event_type": AnalyticsEventType.MINIAPP_OPEN.value,
+                        "surface": "telegram_miniapp_auth",
+                        "user_id": str(auth_session.user.id),
+                    },
+                )
+        logger.exception(
+            "Telegram Mini App auth analytics write failed.",
+            extra={
+                "event": "telegram_analytics_write_failed",
+                "analytics_event_type": AnalyticsEventType.MINIAPP_OPEN.value,
+                "surface": "telegram_miniapp_auth",
+                "user_id": str(auth_session.user.id),
+            },
+        )
 
 
 __all__ = ["router"]
