@@ -7,6 +7,7 @@ import hashlib
 import secrets
 import uuid
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Path, status
@@ -23,13 +24,14 @@ from memexpert.models.enums import (
     CollectionInviteChannel,
     CollectionKind,
     CollectionMembershipRole,
-    CollectionVisibility,
 )
 from memexpert.schemas.collection import (
     CollectionCapabilitiesRead,
     CollectionDetailRead,
     CollectionInviteLinkRead,
+    CollectionInviteRead,
     CollectionListRead,
+    CollectionMemberRead,
     CollectionRead,
     CollectionSavedMemeRead,
     WebCollectionSummaryRead,
@@ -46,12 +48,19 @@ from memexpert.services.meme_search import MemeNotFoundError
 router = APIRouter(prefix="/collections", tags=["collections"])
 
 
+class CollectionWriteVisibility(StrEnum):
+    """Launch-supported collection visibility values for create/update requests."""
+
+    PRIVATE = "private"
+    UNLISTED = "unlisted"
+
+
 class CollectionCreateRequest(BaseModel):
     """Payload for creating a custom collection."""
 
     title: str = Field(min_length=1, max_length=120)
     description: str | None = None
-    visibility: CollectionVisibility = CollectionVisibility.PRIVATE
+    visibility: CollectionWriteVisibility = CollectionWriteVisibility.PRIVATE
 
 
 class CollectionUpdateRequest(CollectionCreateRequest):
@@ -65,6 +74,12 @@ class CollectionInviteCreateRequest(BaseModel):
     label: str | None = Field(default=None, max_length=120)
     max_uses: int | None = Field(default=1, ge=1)
     expires_in_hours: int | None = Field(default=168, ge=1, le=24 * 30)
+
+
+class CollectionMemberRoleUpdateRequest(BaseModel):
+    """Payload for owner-managed member role changes."""
+
+    role: CollectionMembershipRole
 
 
 class ActiveSaveUpdateResponse(BaseModel):
@@ -312,6 +327,78 @@ async def create_collection_invite(
     return CollectionInviteLinkRead(invite=invite, token=token, join_path=f"/collection/invite/{token}")
 
 
+@router.delete(
+    "/{collection_id}/invites/{invite_id}",
+    response_model=CollectionInviteRead,
+    summary="Revoke collection invite",
+)
+async def revoke_collection_invite(
+    collection_service: CollectionServiceDep,
+    current_user: FullAccountUserDep,
+    collection_id: Annotated[uuid.UUID, Path()],
+    invite_id: Annotated[uuid.UUID, Path()],
+) -> CollectionInviteRead:
+    """Revoke a direct-link invite for owner/editor-managed custom collections."""
+
+    try:
+        return await collection_service.revoke_invite(
+            collection_id=collection_id,
+            invite_id=invite_id,
+            user_id=current_user.id,
+        )
+    except CollectionServiceError as exc:
+        raise _collection_http_error(exc) from exc
+
+
+@router.patch(
+    "/{collection_id}/members/{member_user_id}",
+    response_model=CollectionMemberRead,
+    summary="Update collection member role",
+)
+async def update_collection_member_role(
+    collection_service: CollectionServiceDep,
+    current_user: FullAccountUserDep,
+    collection_id: Annotated[uuid.UUID, Path()],
+    member_user_id: Annotated[uuid.UUID, Path()],
+    payload: CollectionMemberRoleUpdateRequest,
+) -> CollectionMemberRead:
+    """Owner-only role management for non-owner custom collection members."""
+
+    try:
+        return await collection_service.update_member_role(
+            collection_id=collection_id,
+            acting_user_id=current_user.id,
+            member_user_id=member_user_id,
+            role=payload.role,
+        )
+    except CollectionServiceError as exc:
+        raise _collection_http_error(exc) from exc
+
+
+@router.delete(
+    "/{collection_id}/members/{member_user_id}",
+    response_model=dict[str, bool],
+    summary="Remove collection member",
+)
+async def remove_collection_member(
+    collection_service: CollectionServiceDep,
+    current_user: FullAccountUserDep,
+    collection_id: Annotated[uuid.UUID, Path()],
+    member_user_id: Annotated[uuid.UUID, Path()],
+) -> dict[str, bool]:
+    """Owner-only removal for non-owner custom collection members."""
+
+    try:
+        removed = await collection_service.remove_member(
+            collection_id=collection_id,
+            acting_user_id=current_user.id,
+            member_user_id=member_user_id,
+        )
+    except CollectionServiceError as exc:
+        raise _collection_http_error(exc) from exc
+    return {"removed": removed}
+
+
 def _summary(
     collection: CollectionRead,
     current_user: UserRead,
@@ -351,6 +438,7 @@ def _capabilities(
         )
     )
     can_invite = can_write and collection.kind is CollectionKind.CUSTOM and has_collaboration_identity
+    can_revoke_invites = can_write and collection.kind is CollectionKind.CUSTOM
     return CollectionCapabilitiesRead(
         can_view=True,
         can_add_memes=can_write,
@@ -358,6 +446,8 @@ def _capabilities(
         can_rename=is_owner_custom,
         can_delete=is_owner_custom,
         can_create_invites=can_invite,
+        can_revoke_invites=can_revoke_invites,
+        can_manage_members=is_owner_custom,
         can_set_active_save=can_write,
     )
 

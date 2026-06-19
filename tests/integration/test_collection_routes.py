@@ -5,15 +5,19 @@ from __future__ import annotations
 import uuid
 from typing import TYPE_CHECKING, cast
 
+from sqlalchemy import select
+
 from memexpert.api.dependencies.auth import get_optional_current_user
 from memexpert.api.dependencies.collection import get_collection_service
-from memexpert.api.dependencies.meme import get_meme_search_service
+from memexpert.api.dependencies.meme import get_analytics_service, get_meme_search_service
 from memexpert.api.routes.v1 import media as media_routes
 from memexpert.core.database import get_db_session
+from memexpert.models.collection import PinnedMeme
 from memexpert.models.content import Meme, MemeFile
 from memexpert.models.enums import ContentKind, ContentLanguage
 from memexpert.schemas.user import UserRead
 from memexpert.services import CollectionService, MemeSearchService, UserService
+from memexpert.services.analytics import AnalyticsService
 from tests.conftest import create_full_user_via_upgrade
 
 if TYPE_CHECKING:
@@ -150,6 +154,179 @@ async def test_collection_routes_crud_detail_remove_active_and_invites(
     assert remove_response.json()["removed"] is True
     assert delete_response.status_code == 200
     assert delete_response.json()["deleted"] is True
+
+
+async def test_collection_routes_member_management_invite_revoke_and_capabilities(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    user_service = UserService(migrated_db_session)
+    owner = await create_full_user_via_upgrade(user_service, telegram_id=3001, email="route-owner@example.com")
+    member = await create_full_user_via_upgrade(user_service, telegram_id=3002, email="route-member@example.com")
+    outsider = await create_full_user_via_upgrade(user_service, telegram_id=3003, email="route-outsider@example.com")
+    await migrated_db_session.commit()
+
+    current_user = UserRead.model_validate(owner)
+
+    def override_collection_service() -> CollectionService:
+        return CollectionService(migrated_db_session)
+
+    async def override_current_user() -> UserRead | None:
+        return current_user
+
+    app.dependency_overrides[get_collection_service] = override_collection_service
+    app.dependency_overrides[get_optional_current_user] = override_current_user
+    try:
+        create_response = await client.post("/api/v1/collections", json={"title": "Managed"})
+        collection_id = create_response.json()["collection"]["id"]
+        owner_invite_response = await client.post(
+            f"/api/v1/collections/{collection_id}/invites",
+            json={"role": "viewer", "max_uses": 5, "expires_in_hours": 24},
+        )
+
+        current_user = UserRead.model_validate(member)
+        join_response = await client.post(
+            f"/api/v1/collections/invites/{owner_invite_response.json()['token']}/join"
+        )
+        viewer_detail_response = await client.get(f"/api/v1/collections/{collection_id}")
+        viewer_revoke_response = await client.delete(
+            f"/api/v1/collections/{collection_id}/invites/{owner_invite_response.json()['invite']['id']}"
+        )
+        viewer_manage_response = await client.patch(
+            f"/api/v1/collections/{collection_id}/members/{member.id}",
+            json={"role": "editor"},
+        )
+
+        current_user = UserRead.model_validate(owner)
+        promote_response = await client.patch(
+            f"/api/v1/collections/{collection_id}/members/{member.id}",
+            json={"role": "editor"},
+        )
+        owner_transfer_response = await client.patch(
+            f"/api/v1/collections/{collection_id}/members/{owner.id}",
+            json={"role": "viewer"},
+        )
+        owner_remove_response = await client.delete(f"/api/v1/collections/{collection_id}/members/{owner.id}")
+
+        current_user = UserRead.model_validate(member)
+        editor_detail_response = await client.get(f"/api/v1/collections/{collection_id}")
+        editor_invite_response = await client.post(
+            f"/api/v1/collections/{collection_id}/invites",
+            json={"role": "viewer", "max_uses": 1, "expires_in_hours": 24},
+        )
+        editor_revoke_response = await client.delete(
+            f"/api/v1/collections/{collection_id}/invites/{editor_invite_response.json()['invite']['id']}"
+        )
+
+        current_user = UserRead.model_validate(outsider)
+        revoked_join_response = await client.post(
+            f"/api/v1/collections/invites/{editor_invite_response.json()['token']}/join"
+        )
+        outsider_manage_response = await client.patch(
+            f"/api/v1/collections/{collection_id}/members/{member.id}",
+            json={"role": "viewer"},
+        )
+
+        current_user = UserRead.model_validate(owner)
+        owner_list_response = await client.get("/api/v1/collections")
+        owner_detail_response = await client.get(f"/api/v1/collections/{collection_id}")
+        demote_response = await client.patch(
+            f"/api/v1/collections/{collection_id}/members/{member.id}",
+            json={"role": "viewer"},
+        )
+        remove_response = await client.delete(f"/api/v1/collections/{collection_id}/members/{member.id}")
+
+        current_user = UserRead.model_validate(member)
+        removed_detail_response = await client.get(f"/api/v1/collections/{collection_id}")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert create_response.status_code == 201
+    assert create_response.json()["capabilities"]["can_manage_members"] is True
+    assert create_response.json()["capabilities"]["can_revoke_invites"] is True
+    assert owner_invite_response.status_code == 200
+    assert join_response.status_code == 200
+    assert viewer_detail_response.status_code == 200
+    assert viewer_detail_response.json()["viewer_role"] == "viewer"
+    assert viewer_detail_response.json()["capabilities"]["can_manage_members"] is False
+    assert viewer_detail_response.json()["capabilities"]["can_revoke_invites"] is False
+    assert viewer_revoke_response.status_code == 403
+    assert viewer_manage_response.status_code == 403
+
+    assert promote_response.status_code == 200
+    assert promote_response.json()["role"] == "editor"
+    assert owner_transfer_response.status_code == 409
+    assert owner_remove_response.status_code == 409
+    assert editor_detail_response.status_code == 200
+    assert editor_detail_response.json()["viewer_role"] == "editor"
+    assert editor_detail_response.json()["capabilities"]["can_revoke_invites"] is True
+    assert editor_detail_response.json()["capabilities"]["can_manage_members"] is False
+    assert editor_invite_response.status_code == 200
+    assert editor_revoke_response.status_code == 200
+    assert editor_revoke_response.json()["status"] == "revoked"
+    assert editor_revoke_response.json()["revoked_at"] is not None
+    assert revoked_join_response.status_code == 400
+    assert outsider_manage_response.status_code == 404
+
+    assert owner_list_response.status_code == 200
+    listed_collections = owner_list_response.json()["collections"]
+    listed_collection = next(item for item in listed_collections if item["collection"]["id"] == collection_id)
+    listed_invites = {invite["id"]: invite for invite in listed_collection["collection"]["invites"]}
+    assert listed_invites[editor_invite_response.json()["invite"]["id"]]["status"] == "revoked"
+    assert listed_invites[editor_invite_response.json()["invite"]["id"]]["revoked_at"] is not None
+    assert owner_detail_response.status_code == 200
+    detail_invites = {invite["id"]: invite for invite in owner_detail_response.json()["collection"]["invites"]}
+    assert detail_invites[editor_invite_response.json()["invite"]["id"]]["status"] == "revoked"
+    assert demote_response.status_code == 200
+    assert demote_response.json()["role"] == "viewer"
+    assert remove_response.status_code == 200
+    assert remove_response.json()["removed"] is True
+    assert removed_detail_response.status_code == 404
+
+
+async def test_meme_pin_reorder_route_persists_display_order(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    user_service = UserService(migrated_db_session)
+    full_user = await create_full_user_via_upgrade(user_service, email="pin-route@example.com")
+    first_meme = await _create_meme(migrated_db_session)
+    second_meme = await _create_meme(migrated_db_session)
+    await migrated_db_session.commit()
+    current_user = UserRead.model_validate(full_user)
+
+    def override_collection_service() -> CollectionService:
+        return CollectionService(migrated_db_session)
+
+    def override_analytics_service() -> AnalyticsService:
+        return AnalyticsService(migrated_db_session)
+
+    async def override_current_user() -> UserRead | None:
+        return current_user
+
+    app.dependency_overrides[get_collection_service] = override_collection_service
+    app.dependency_overrides[get_analytics_service] = override_analytics_service
+    app.dependency_overrides[get_optional_current_user] = override_current_user
+    try:
+        first_pin_response = await client.post(f"/api/v1/memes/{first_meme.id}/pin")
+        second_pin_response = await client.post(f"/api/v1/memes/{second_meme.id}/pin")
+        reorder_response = await client.put(
+            "/api/v1/memes/pins/reorder",
+            json={"meme_ids": [str(second_meme.id), str(first_meme.id)]},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert first_pin_response.status_code == 200
+    assert second_pin_response.status_code == 200
+    assert reorder_response.status_code == 200
+    assert [pin["meme_id"] for pin in reorder_response.json()] == [str(second_meme.id), str(first_meme.id)]
+    persisted_positions = await migrated_db_session.scalars(
+        select(PinnedMeme.meme_id).where(PinnedMeme.user_id == full_user.id).order_by(PinnedMeme.position.asc())
+    )
+    assert list(persisted_positions) == [second_meme.id, first_meme.id]
 
 
 async def test_collection_detail_and_media_route_authorize_private_saved_media(
