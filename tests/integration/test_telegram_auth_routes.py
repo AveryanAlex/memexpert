@@ -5,9 +5,10 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, cast
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, urlencode
 
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select
@@ -17,6 +18,8 @@ from memexpert.core.config import get_settings
 from memexpert.core.database import reset_async_database_state
 from memexpert.models.enums import AccountType, AnalyticsEventType
 from memexpert.models.user import AccountMergeLog, AnalyticsEvent, LoginEvent, User
+from memexpert.services import UserService
+from tests.conftest import create_full_user_via_upgrade
 
 if TYPE_CHECKING:
     from pytest import MonkeyPatch
@@ -55,9 +58,7 @@ def build_miniapp_init_data(
     if raw_user_overrides is not None:
         if not isinstance(raw_user_overrides, dict):
             raise TypeError("Mini App user overrides must be a mapping.")
-        typed_user_overrides: dict[str, object] = {
-            str(key): value for key, value in raw_user_overrides.items()
-        }
+        typed_user_overrides: dict[str, object] = {str(key): value for key, value in raw_user_overrides.items()}
         user_payload.update(typed_user_overrides)
 
     fields: dict[str, str] = {
@@ -73,6 +74,17 @@ def build_miniapp_init_data(
     data_check_string = "\n".join(f"{key}={value}" for key, value in sorted(fields.items()))
     secret_key = hmac.new(b"WebAppData", token.encode("utf-8"), hashlib.sha256).digest()
     fields["hash"] = hmac.new(secret_key, data_check_string.encode("utf-8"), hashlib.sha256).hexdigest()
+    return urlencode(fields)
+
+
+def tamper_miniapp_init_data(init_data: str, **user_overrides: object) -> str:
+    fields = dict(parse_qsl(init_data, keep_blank_values=True))
+    user_payload = json.loads(fields["user"])
+    if not isinstance(user_payload, dict):
+        raise TypeError("Mini App user payload must be a mapping.")
+
+    user_payload.update(user_overrides)
+    fields["user"] = json.dumps(user_payload, separators=(",", ":"), ensure_ascii=False)
     return urlencode(fields)
 
 
@@ -109,9 +121,7 @@ async def test_telegram_widget_route_returns_session_and_records_login_event(
         persisted_user = persisted_user_result.scalar_one()
         assert persisted_user.email is None
 
-        login_event_result = await session.execute(
-            select(LoginEvent).where(LoginEvent.user_id == persisted_user.id)
-        )
+        login_event_result = await session.execute(select(LoginEvent).where(LoginEvent.user_id == persisted_user.id))
         login_event_row = login_event_result.scalar_one()
         assert login_event_row.user_agent == "Telegram Widget Browser"
 
@@ -146,6 +156,10 @@ async def test_telegram_miniapp_route_first_open_creates_exactly_one_full_user_n
     payload = response.json()
     assert payload["user"]["account_type"] == "full"
     assert payload["user"]["telegram_id"] == 303030303
+    assert "access_token" not in payload
+    assert "memexpert_access_token=" in response.headers["set-cookie"]
+    assert "httponly" in response.headers["set-cookie"].lower()
+    assert auth_client.cookies.get("memexpert_access_token")
 
     async with postgres_session_factory() as session:
         user_count_result = await session.execute(select(func.count()).select_from(User))
@@ -167,6 +181,65 @@ async def test_telegram_miniapp_route_first_open_creates_exactly_one_full_user_n
         assert "telegram_user_hash" in properties
         assert "initData" not in event.payload
         assert "init_data" not in event.payload
+
+
+async def test_telegram_miniapp_route_replay_same_init_data_reissues_session_without_duplicates(
+    auth_client: AsyncClient,
+    auth_settings_overrides: dict[str, str],
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    init_data = build_miniapp_init_data(
+        telegram_id=303030304,
+        token=auth_settings_overrides["AUTH_TELEGRAM_BOT_TOKEN"],
+    )
+
+    first_response = await auth_client.post(
+        "/api/v1/auth/telegram-miniapp",
+        headers={"User-Agent": "Telegram Mini App first open"},
+        json={"initData": init_data},
+    )
+    second_response = await auth_client.post(
+        "/api/v1/auth/telegram-miniapp",
+        headers={"User-Agent": "Telegram Mini App replay"},
+        json={"initData": init_data},
+    )
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    first_payload = first_response.json()
+    second_payload = second_response.json()
+    assert second_payload["user"]["id"] == first_payload["user"]["id"]
+    assert second_payload["user"]["telegram_id"] == 303030304
+    assert "access_token" not in second_payload
+    assert "memexpert_access_token=" in second_response.headers["set-cookie"]
+    assert "httponly" in second_response.headers["set-cookie"].lower()
+
+    async with postgres_session_factory() as session:
+        user_count_result = await session.execute(select(func.count()).select_from(User))
+        telegram_user_count_result = await session.execute(
+            select(func.count()).select_from(User).where(User.telegram_id == 303030304)
+        )
+        merge_log_count_result = await session.execute(select(func.count()).select_from(AccountMergeLog))
+        login_event_result = await session.execute(
+            select(LoginEvent)
+            .where(LoginEvent.user_id == uuid.UUID(first_payload["user"]["id"]))
+            .order_by(LoginEvent.occurred_at.asc())
+        )
+        miniapp_event_count_result = await session.execute(
+            select(func.count())
+            .select_from(AnalyticsEvent)
+            .where(AnalyticsEvent.event_type == AnalyticsEventType.MINIAPP_OPEN)
+        )
+
+        login_events = login_event_result.scalars().all()
+        assert user_count_result.scalar_one() == 1
+        assert telegram_user_count_result.scalar_one() == 1
+        assert merge_log_count_result.scalar_one() == 0
+        assert [event.user_agent for event in login_events] == [
+            "Telegram Mini App first open",
+            "Telegram Mini App replay",
+        ]
+        assert miniapp_event_count_result.scalar_one() == 2
 
 
 async def test_telegram_miniapp_route_reuses_existing_telegram_account_across_surfaces(
@@ -223,6 +296,61 @@ async def test_telegram_miniapp_route_reuses_existing_telegram_account_across_su
         assert login_event_count_result.scalar_one() == 2
 
 
+async def test_telegram_miniapp_route_merges_guest_cookie_into_existing_telegram_account(
+    auth_client: AsyncClient,
+    auth_settings_overrides: dict[str, str],
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    telegram_id = 444555667
+    async with postgres_session_factory() as session:
+        full_user = await create_full_user_via_upgrade(
+            UserService(session),
+            telegram_id=telegram_id,
+        )
+        full_user_id = str(full_user.id)
+
+    guest_response = await auth_client.post("/api/v1/auth/guest")
+    guest_user_id = guest_response.json()["user"]["id"]
+
+    miniapp_response = await auth_client.post(
+        "/api/v1/auth/telegram-miniapp",
+        headers={"User-Agent": "Telegram Mini App guest merge"},
+        json={
+            "initData": build_miniapp_init_data(
+                telegram_id=telegram_id,
+                token=auth_settings_overrides["AUTH_TELEGRAM_BOT_TOKEN"],
+            )
+        },
+    )
+    current_response = await auth_client.get("/api/v1/auth/session")
+
+    assert miniapp_response.status_code == 200
+    assert miniapp_response.json()["user"]["id"] == full_user_id
+    assert miniapp_response.json()["user"]["telegram_id"] == telegram_id
+    assert "memexpert_access_token=" in miniapp_response.headers["set-cookie"]
+    assert "httponly" in miniapp_response.headers["set-cookie"].lower()
+    assert current_response.status_code == 200
+    assert current_response.json()["user"]["id"] == full_user_id
+    assert current_response.json()["linked_providers"]["telegram_linked"] is True
+
+    async with postgres_session_factory() as session:
+        deleted_guest = await session.scalar(select(User).where(User.id == uuid.UUID(guest_user_id)))
+        telegram_user_count_result = await session.execute(
+            select(func.count()).select_from(User).where(User.telegram_id == telegram_id)
+        )
+        merge_log = await session.scalar(select(AccountMergeLog))
+        login_event_count_result = await session.execute(
+            select(func.count()).select_from(LoginEvent).where(LoginEvent.user_id == uuid.UUID(full_user_id))
+        )
+
+        assert deleted_guest is None
+        assert telegram_user_count_result.scalar_one() == 1
+        assert merge_log is not None
+        assert str(merge_log.guest_account_id) == guest_user_id
+        assert str(merge_log.target_account_id) == full_user_id
+        assert login_event_count_result.scalar_one() == 1
+
+
 async def test_telegram_routes_return_typed_provider_errors_for_tampered_and_expired_payloads(
     auth_client: AsyncClient,
     auth_settings_overrides: dict[str, str],
@@ -239,6 +367,14 @@ async def test_telegram_routes_return_typed_provider_errors_for_tampered_and_exp
     tampered_payload["first_name"] = "Mallory"
 
     invalid_response = await auth_client.post("/api/v1/auth/telegram", json=tampered_payload)
+    valid_miniapp_init_data = build_miniapp_init_data(
+        telegram_id=777888998,
+        token=auth_settings_overrides["AUTH_TELEGRAM_BOT_TOKEN"],
+    )
+    invalid_miniapp_response = await auth_client.post(
+        "/api/v1/auth/telegram-miniapp",
+        json={"initData": tamper_miniapp_init_data(valid_miniapp_init_data, username="mallory")},
+    )
     expired_response = await auth_client.post(
         "/api/v1/auth/telegram-miniapp",
         json={
@@ -252,14 +388,18 @@ async def test_telegram_routes_return_typed_provider_errors_for_tampered_and_exp
 
     assert invalid_response.status_code == 401
     assert invalid_response.json()["code"] == "provider_payload_invalid"
+    assert invalid_miniapp_response.status_code == 401
+    assert invalid_miniapp_response.json()["code"] == "provider_payload_invalid"
     assert expired_response.status_code == 401
     assert expired_response.json()["code"] == "provider_payload_expired"
 
     async with postgres_session_factory() as session:
         user_count_result = await session.execute(select(func.count()).select_from(User))
         login_event_count_result = await session.execute(select(func.count()).select_from(LoginEvent))
+        analytics_event_count_result = await session.execute(select(func.count()).select_from(AnalyticsEvent))
         assert user_count_result.scalar_one() == 0
         assert login_event_count_result.scalar_one() == 0
+        assert analytics_event_count_result.scalar_one() == 0
 
 
 async def test_telegram_routes_return_provider_not_configured_when_bot_token_missing(

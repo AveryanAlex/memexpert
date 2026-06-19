@@ -7,7 +7,7 @@ import hmac
 import json
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, urlencode
 
 import pytest
 from sqlalchemy import func, select
@@ -141,9 +141,7 @@ def build_miniapp_init_data(
     if raw_user_overrides is not None:
         if not isinstance(raw_user_overrides, dict):
             raise TypeError("Mini App user overrides must be a mapping.")
-        typed_user_overrides: dict[str, object] = {
-            str(key): value for key, value in raw_user_overrides.items()
-        }
+        typed_user_overrides: dict[str, object] = {str(key): value for key, value in raw_user_overrides.items()}
         user_payload.update(typed_user_overrides)
 
     fields: dict[str, str] = {
@@ -162,6 +160,17 @@ def build_miniapp_init_data(
     return urlencode(fields)
 
 
+def tamper_miniapp_init_data(init_data: str, **user_overrides: object) -> str:
+    fields = dict(parse_qsl(init_data, keep_blank_values=True))
+    user_payload = json.loads(fields["user"])
+    if not isinstance(user_payload, dict):
+        raise TypeError("Mini App user payload must be a mapping.")
+
+    user_payload.update(user_overrides)
+    fields["user"] = json.dumps(user_payload, separators=(",", ":"), ensure_ascii=False)
+    return urlencode(fields)
+
+
 async def test_telegram_auth_reuses_same_account_across_widget_and_miniapp_without_email_merge(
     migrated_db_session: AsyncSession,
 ) -> None:
@@ -174,14 +183,18 @@ async def test_telegram_auth_reuses_same_account_across_widget_and_miniapp_witho
         payload=build_widget_request(telegram_id=987654321),
     )
     widget_session = await _issue_session_for(
-        migrated_db_session, widget_link, user_agent="Telegram Widget",
+        migrated_db_session,
+        widget_link,
+        user_agent="Telegram Widget",
     )
     miniapp_link = await link_service.link_guest_with_telegram_miniapp(
         guest_user_id=None,
         init_data=build_miniapp_init_data(telegram_id=987654321),
     )
     miniapp_session = await _issue_session_for(
-        migrated_db_session, miniapp_link, user_agent="Telegram Mini App",
+        migrated_db_session,
+        miniapp_link,
+        user_agent="Telegram Mini App",
     )
 
     assert widget_session.user.account_type is AccountType.FULL
@@ -212,9 +225,7 @@ async def test_telegram_auth_reuses_same_account_across_widget_and_miniapp_witho
     assert favorites_count_result.scalar_one() == 0
 
     refresh_tokens_result = await migrated_db_session.execute(
-        select(LoginEvent)
-        .where(LoginEvent.user_id == widget_session.user.id)
-        .order_by(LoginEvent.created_at.asc())
+        select(LoginEvent).where(LoginEvent.user_id == widget_session.user.id).order_by(LoginEvent.created_at.asc())
     )
     refresh_tokens = refresh_tokens_result.scalars().all()
     assert len(refresh_tokens) == 2
@@ -235,12 +246,14 @@ async def test_telegram_auth_rejects_blank_widget_hash_and_malformed_miniapp_bef
 
     with pytest.raises(ProviderPayloadInvalidError, match="missing hash"):
         _ = await link_service.link_guest_with_telegram_widget(
-            guest_user_id=None, payload=blank_hash_request,
+            guest_user_id=None,
+            payload=blank_hash_request,
         )
 
     with pytest.raises(ProviderPayloadInvalidError, match="invalid"):
         _ = await link_service.link_guest_with_telegram_miniapp(
-            guest_user_id=None, init_data="not-a-valid-query-string",
+            guest_user_id=None,
+            init_data="not-a-valid-query-string",
         )
 
     user_count_result = await migrated_db_session.execute(select(func.count()).select_from(User))
@@ -276,13 +289,24 @@ async def test_telegram_auth_maps_tampered_and_expired_payloads_to_typed_failure
             payload=TelegramWidgetAuthRequest.model_validate(tampered_widget_payload),
         )
 
+    tampered_init_data = tamper_miniapp_init_data(
+        build_miniapp_init_data(telegram_id=222333443),
+        username="mallory",
+    )
+    with pytest.raises(ProviderPayloadInvalidError, match="invalid"):
+        _ = await link_service.link_guest_with_telegram_miniapp(
+            guest_user_id=None,
+            init_data=tampered_init_data,
+        )
+
     expired_init_data = build_miniapp_init_data(
         telegram_id=222333444,
         auth_date=int((datetime.now(UTC) - timedelta(minutes=5)).timestamp()),
     )
     with pytest.raises(ProviderPayloadExpiredError, match="expired"):
         _ = await expired_link_service.link_guest_with_telegram_miniapp(
-            guest_user_id=None, init_data=expired_init_data,
+            guest_user_id=None,
+            init_data=expired_init_data,
         )
 
     user_count_result = await migrated_db_session.execute(select(func.count()).select_from(User))

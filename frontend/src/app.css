@@ -38,6 +38,22 @@ body {
   min-width: 320px;
 }
 
+html.telegram-miniapp {
+  background: var(--tg-theme-secondary-bg-color, var(--tg-theme-bg-color, #f7f3eb));
+  color: var(--tg-theme-text-color, #17212f);
+}
+
+html.telegram-miniapp body {
+  min-height: var(--tg-viewport-stable-height, var(--tg-viewport-height, 100vh));
+  background: var(--tg-theme-secondary-bg-color, var(--tg-theme-bg-color, #f7f3eb));
+}
+
+html.telegram-miniapp .telegram-miniapp-shell {
+  min-height: var(--tg-viewport-stable-height, var(--tg-viewport-height, 100vh));
+  padding-top: max(1.25rem, env(safe-area-inset-top));
+  padding-bottom: max(1.75rem, env(safe-area-inset-bottom));
+}
+
 a {
   color: inherit;
 }
