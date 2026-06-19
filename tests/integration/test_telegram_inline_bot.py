@@ -6,7 +6,7 @@ import hashlib
 import uuid
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from aiogram.client.session.base import BaseSession
@@ -173,6 +173,14 @@ def build_bot_settings(database_url: str) -> Settings:
 
 def bot_scope() -> str:
     return hashlib.sha256(BOT_TOKEN.encode("utf-8")).hexdigest()
+
+
+def _analytics_properties(event: AnalyticsEvent) -> dict[str, object]:
+    return cast("dict[str, object]", event.payload["properties"])
+
+
+def _analytics_refs(event: AnalyticsEvent) -> dict[str, object]:
+    return cast("dict[str, object]", event.payload["refs"])
 
 
 async def create_meme_file(
@@ -435,26 +443,29 @@ async def test_inline_plain_text_query_calls_shared_search_service_and_records_q
         )
         inline_usage_events = await session.scalar(select(func.count()).select_from(InlineUsageEvent))
     assert inline_event is not None
+    inline_properties = _analytics_properties(inline_event)
     assert inline_event.payload["surface"] == "telegram_inline"
     assert inline_event.payload["query"] == "grumpy cat"
-    assert inline_event.payload["properties"]["result_count"] == 1
-    assert inline_event.payload["properties"]["offset"] == 0
-    assert inline_event.payload["properties"]["has_more"] is False
-    assert inline_event.payload["properties"]["chat_type"] == "sender"
+    assert inline_properties["result_count"] == 1
+    assert inline_properties["offset"] == 0
+    assert inline_properties["has_more"] is False
+    assert inline_properties["chat_type"] == "sender"
     assert (
-        inline_event.payload["properties"]["telegram_user_hash"]
+        inline_properties["telegram_user_hash"]
         == hashlib.sha256(f"telegram_user:{TELEGRAM_ID}".encode()).hexdigest()
     )
-    assert "telegram_user_id" not in inline_event.payload["properties"]
+    assert "telegram_user_id" not in inline_properties
     assert served_event is not None
+    served_properties = _analytics_properties(served_event)
+    served_refs = _analytics_refs(served_event)
     assert served_event.payload["surface"] == "telegram_inline_search"
-    assert served_event.payload["refs"] == {"meme_file_id": str(file.id), "meme_id": str(meme.id)}
+    assert served_refs == {"meme_file_id": str(file.id), "meme_id": str(meme.id)}
     assert served_event.payload["request_id"] == "req_inline_test"
     assert served_event.payload["impression_id"] == "imp_inline_1"
     assert served_event.payload["source_algorithm"] == "hybrid_search"
     assert served_event.payload["rank"] == 1
-    assert served_event.payload["properties"]["media_format"] == "photo"
-    assert served_event.payload["properties"]["is_personal"] is False
+    assert served_properties["media_format"] == "photo"
+    assert served_properties["is_personal"] is False
     assert inline_usage_events == 0
 
 
@@ -535,7 +546,7 @@ async def test_inline_analytics_failure_keeps_answer_and_logs_structured_context
         _ = (message, args)
         extra = kwargs.get("extra")
         if isinstance(extra, dict):
-            logged_extras.append(extra)
+            logged_extras.append(cast("dict[str, object]", extra))
 
     monkeypatch.setattr(
         "memexpert.services.analytics.AnalyticsService.record_interaction_event",
@@ -1337,16 +1348,18 @@ async def test_chosen_inline_result_records_strict_chosen_sent_and_recent_send_e
     }
     for event in events_by_type.values():
         assert event.user_id is None
+        properties = _analytics_properties(event)
+        refs = _analytics_refs(event)
         assert event.payload["surface"] == "telegram_inline"
-        assert event.payload["refs"] == {"meme_file_id": str(file.id), "meme_id": str(meme.id)}
+        assert refs == {"meme_file_id": str(file.id), "meme_id": str(meme.id)}
         assert event.payload["query"] == "cats"
         assert event.payload["impression_id"] == "imp_chosen_1"
-        assert event.payload["properties"]["result_id"] == result_id
+        assert properties["result_id"] == result_id
         assert (
-            event.payload["properties"]["telegram_user_hash"]
+            properties["telegram_user_hash"]
             == hashlib.sha256(f"telegram_user:{TELEGRAM_ID}".encode()).hexdigest()
         )
-        assert "telegram_user_id" not in event.payload["properties"]
+        assert "telegram_user_id" not in properties
 
 
 @pytest.mark.asyncio
@@ -1452,11 +1465,14 @@ async def test_inline_library_callbacks_call_collection_service_paths(
     assert list(pinned_meme_ids) == [favorite_meme.id]
     assert like_count == 1
     events_by_type = {event.event_type: event for event in events}
+    like_event = events_by_type[AnalyticsEventType.MEME_LIKE]
+    save_event = events_by_type[AnalyticsEventType.MEME_SAVE]
+    pin_event = events_by_type[AnalyticsEventType.MEME_PIN]
     assert events_by_type[AnalyticsEventType.MEME_LIKE].payload["surface"] == "telegram_inline_library"
-    assert events_by_type[AnalyticsEventType.MEME_LIKE].payload["refs"]["meme_id"] == str(favorite_meme.id)
-    assert events_by_type[AnalyticsEventType.MEME_LIKE].payload["properties"]["action"] == "fav"
-    assert events_by_type[AnalyticsEventType.MEME_SAVE].payload["refs"]["meme_id"] == str(save_meme.id)
-    assert events_by_type[AnalyticsEventType.MEME_PIN].payload["refs"]["meme_id"] == str(favorite_meme.id)
+    assert _analytics_refs(like_event)["meme_id"] == str(favorite_meme.id)
+    assert _analytics_properties(like_event)["action"] == "fav"
+    assert _analytics_refs(save_event)["meme_id"] == str(save_meme.id)
+    assert _analytics_refs(pin_event)["meme_id"] == str(favorite_meme.id)
 
 
 @pytest.mark.asyncio

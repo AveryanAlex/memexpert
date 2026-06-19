@@ -318,6 +318,14 @@ def _as_uuid(value: object) -> uuid.UUID:
     return cast("uuid.UUID", value)
 
 
+def _analytics_properties(event: AnalyticsEvent) -> dict[str, object]:
+    return cast("dict[str, object]", event.payload["properties"])
+
+
+def _analytics_refs(event: AnalyticsEvent) -> dict[str, object]:
+    return cast("dict[str, object]", event.payload["refs"])
+
+
 def _summary_for(collection: CollectionRead) -> CollectionSummaryRead:
     return CollectionSummaryRead(
         id=collection.id,
@@ -655,10 +663,10 @@ async def test_private_library_create_set_active_and_delete_collections_keep_fav
     assert active_collection_id is None
     assert favorites_exists == favorites.id
     assert custom_exists is None
-    events_by_action = {event.payload["properties"]["action"]: event for event in analytics_events}
-    assert events_by_action["collection_create"].payload["refs"]["collection_id"] == str(custom_id)
-    assert events_by_action["set_active_collection"].payload["refs"]["collection_id"] == str(custom_id)
-    assert events_by_action["collection_delete"].payload["refs"]["collection_id"] == str(custom_id)
+    events_by_action = {_analytics_properties(event)["action"]: event for event in analytics_events}
+    assert _analytics_refs(events_by_action["collection_create"])["collection_id"] == str(custom_id)
+    assert _analytics_refs(events_by_action["set_active_collection"])["collection_id"] == str(custom_id)
+    assert _analytics_refs(events_by_action["collection_delete"])["collection_id"] == str(custom_id)
     assert events_by_action["collection_create"].payload["surface"] == "telegram_pm_library"
     assert any(
         isinstance(method, EditMessageText) and "Favorites нельзя удалить" in str(method.text)

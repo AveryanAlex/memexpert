@@ -6,7 +6,7 @@ import hashlib
 import hmac
 import json
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 from urllib.parse import urlencode
 
 from httpx import ASGITransport, AsyncClient
@@ -21,6 +21,10 @@ from memexpert.models.user import AccountMergeLog, AnalyticsEvent, LoginEvent, U
 if TYPE_CHECKING:
     from pytest import MonkeyPatch
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+
+def _analytics_properties(event: AnalyticsEvent) -> dict[str, object]:
+    return cast("dict[str, object]", event.payload["properties"])
 
 
 def sign_telegram_widget_payload(
@@ -157,9 +161,10 @@ async def test_telegram_miniapp_route_first_open_creates_exactly_one_full_user_n
         assert full_count_result.scalar_one() == 1
         assert merge_log_count_result.scalar_one() == 0
         assert event is not None
+        properties = _analytics_properties(event)
         assert event.payload["surface"] == "telegram_miniapp_auth"
-        assert event.payload["properties"]["action"] == "auth_session_issued"
-        assert "telegram_user_hash" in event.payload["properties"]
+        assert properties["action"] == "auth_session_issued"
+        assert "telegram_user_hash" in properties
         assert "initData" not in event.payload
         assert "init_data" not in event.payload
 

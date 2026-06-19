@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from aiogram.client.session.base import BaseSession
@@ -38,6 +38,14 @@ if TYPE_CHECKING:
 
     from aiogram import Bot, Dispatcher
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+
+def _analytics_properties(event: AnalyticsEvent) -> dict[str, object]:
+    return cast("dict[str, object]", event.payload["properties"])
+
+
+def _analytics_refs(event: AnalyticsEvent) -> dict[str, object]:
+    return cast("dict[str, object]", event.payload["refs"])
 
 
 BOT_TOKEN = "123456:telegram-upload-test-bot-token"
@@ -398,10 +406,12 @@ async def test_private_photo_upload_queues_raw_ingest_without_saving_active_coll
     assert event.user_id == user.id
     assert event.payload["surface"] == "telegram_pm_upload"
     assert active_collection_id is not None
-    assert event.payload["refs"]["collection_id"] == str(active_collection_id)
-    assert event.payload["properties"]["action"] == "upload_queued"
-    assert event.payload["properties"]["media_kind"] == "image"
-    assert event.payload["properties"]["content_type"] == "image/jpeg"
+    refs = _analytics_refs(event)
+    properties = _analytics_properties(event)
+    assert refs["collection_id"] == str(active_collection_id)
+    assert properties["action"] == "upload_queued"
+    assert properties["media_kind"] == "image"
+    assert properties["content_type"] == "image/jpeg"
 
 
 @pytest.mark.asyncio
@@ -451,11 +461,13 @@ async def test_private_upload_public_duplicate_saves_existing_public_meme(
     assert event is not None
     assert event.user_id == user.id
     assert event.payload["surface"] == "telegram_pm_upload"
-    assert event.payload["refs"]["meme_id"] == str(public_meme.id)
+    refs = _analytics_refs(event)
+    properties = _analytics_properties(event)
+    assert refs["meme_id"] == str(public_meme.id)
     assert active_collection_id is not None
-    assert event.payload["refs"]["collection_id"] == str(active_collection_id)
-    assert event.payload["properties"]["action"] == "duplicate_saved"
-    assert event.payload["properties"]["outcome"] == "resolved_sha_duplicate"
+    assert refs["collection_id"] == str(active_collection_id)
+    assert properties["action"] == "duplicate_saved"
+    assert properties["outcome"] == "resolved_sha_duplicate"
 
 
 @pytest.mark.asyncio

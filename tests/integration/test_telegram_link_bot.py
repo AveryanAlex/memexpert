@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 import uuid
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from aiogram.client.session.base import BaseSession
@@ -39,6 +39,11 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
     from memexpert.services.provider_auth_service import TelegramIdentity
+
+
+def _analytics_properties(event: AnalyticsEvent) -> dict[str, object]:
+    return cast("dict[str, object]", event.payload["properties"])
+
 
 BOT_TOKEN = "123456:telegram-route-test-bot-token"
 BOT_USERNAME = "memexpertbot"
@@ -344,9 +349,10 @@ async def test_start_link_upgrades_guest_in_place_and_returns_return_url(
         )
         assert event is not None
         assert event.user_id == guest_user.id
+        properties = _analytics_properties(event)
         assert event.payload["surface"] == "telegram_pm_start"
-        assert event.payload["properties"]["action"] == "telegram_link_redeemed"
-        assert event.payload["properties"]["merge_performed"] is False
+        assert properties["action"] == "telegram_link_redeemed"
+        assert properties["merge_performed"] is False
 
 
 @pytest.mark.asyncio
@@ -611,9 +617,10 @@ async def test_start_link_malformed_inputs_do_not_mutate_guest_or_redeem_code(
         assert link_code.redeemed_by_telegram_id is None
         assert merge_log_count_result.scalar_one() == 0
         assert click_event is not None
+        properties = _analytics_properties(click_event)
         assert click_event.payload["surface"] == "telegram_pm_start"
-        assert click_event.payload["properties"]["action"] == "help_display"
-        assert click_event.payload["properties"]["has_start_argument"] is True
+        assert properties["action"] == "help_display"
+        assert properties["has_start_argument"] is True
 
 
 @pytest.mark.asyncio

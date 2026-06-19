@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from aiogram.client.session.base import BaseSession
@@ -38,6 +38,14 @@ if TYPE_CHECKING:
 
     from aiogram import Bot, Dispatcher
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+
+def _analytics_properties(event: AnalyticsEvent) -> dict[str, object]:
+    return cast("dict[str, object]", event.payload["properties"])
+
+
+def _analytics_refs(event: AnalyticsEvent) -> dict[str, object]:
+    return cast("dict[str, object]", event.payload["refs"])
 
 
 BOT_TOKEN = "123456:telegram-retention-test-bot-token"
@@ -214,10 +222,10 @@ async def test_settings_callbacks_persist_nsfw_and_language(
         events = (
             await session.execute(select(AnalyticsEvent).where(AnalyticsEvent.event_type == AnalyticsEventType.CLICK))
         ).scalars().all()
-    events_by_value = {event.payload["properties"]["value"]: event for event in events}
+    events_by_value = {_analytics_properties(event)["value"]: event for event in events}
     assert events_by_value["1"].payload["surface"] == "telegram_pm_settings"
-    assert events_by_value["1"].payload["properties"]["action"] == "nsfw"
-    assert events_by_value["ru"].payload["properties"]["action"] == "lang"
+    assert _analytics_properties(events_by_value["1"])["action"] == "nsfw"
+    assert _analytics_properties(events_by_value["ru"])["action"] == "lang"
 
 
 @pytest.mark.asyncio
@@ -259,10 +267,12 @@ async def test_suggest_channel_writes_pending_row_and_reports_duplicates(
             select(AnalyticsEvent).where(AnalyticsEvent.event_type == AnalyticsEventType.CHANNEL_SUGGEST)
         )
     assert event is not None
+    properties = _analytics_properties(event)
+    refs = _analytics_refs(event)
     assert event.payload["surface"] == "telegram_pm_settings"
-    assert event.payload["refs"]["channel_suggestion_id"] == str(suggestions[0].id)
-    assert event.payload["properties"]["action"] == "suggest_channel"
-    assert event.payload["properties"]["platform"] == "telegram"
+    assert refs["channel_suggestion_id"] == str(suggestions[0].id)
+    assert properties["action"] == "suggest_channel"
+    assert properties["platform"] == "telegram"
 
 
 @pytest.mark.asyncio
@@ -330,8 +340,9 @@ async def test_account_status_and_miniapp_links_include_provider_state_and_entry
             select(AnalyticsEvent).where(AnalyticsEvent.event_type == AnalyticsEventType.MINIAPP_OPEN)
         )
     assert event is not None
+    properties = _analytics_properties(event)
     assert event.payload["surface"] == "telegram_pm_miniapp"
-    assert event.payload["properties"]["action"] == "link_display"
+    assert properties["action"] == "link_display"
 
 
 @pytest.mark.asyncio
