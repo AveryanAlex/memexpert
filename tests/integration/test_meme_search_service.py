@@ -3062,8 +3062,9 @@ async def test_detail_route_returns_not_found_for_missing_private_or_nsfw_withou
         .order_by(AnalyticsEvent.occurred_at.desc())
     )
     assert event is not None
-    assert event.payload["surface"] == "public_api"
-    assert event.payload["meme_id"] == str(nsfw_meme.id)
+    assert event.payload["surface"] == "public_api_meme_detail"
+    refs = cast("dict[str, object]", event.payload["refs"])
+    assert refs["meme_id"] == str(nsfw_meme.id)
 
 
 async def test_operator_launch_kpis_count_events_source_metrics_and_conversions(

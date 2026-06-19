@@ -1,4 +1,5 @@
 import { expect, type Page } from '@playwright/test';
+import { expectedAttributionFromHref, type ExpectedMemeAttribution } from '../helpers/attribution';
 import type { SeededMeme } from '../helpers/seed';
 
 export class SearchPage {
@@ -69,5 +70,12 @@ export class SearchPage {
 
   async openResult(meme: SeededMeme | { title: string }) {
     await this.page.getByRole('link', { name: `Open ${meme.title}` }).first().click();
+  }
+
+  async attributionForResult(meme: SeededMeme | { title: string }): Promise<ExpectedMemeAttribution> {
+    const link = this.page.getByRole('link', { name: `Open ${meme.title}` }).first();
+    const href = await link.getAttribute('href');
+    if (!href) throw new Error(`Search result for ${meme.title} did not include a detail href.`);
+    return expectedAttributionFromHref(href, this.page.url());
   }
 }
