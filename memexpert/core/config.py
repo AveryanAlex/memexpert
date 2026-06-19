@@ -120,6 +120,25 @@ class Settings(BaseSettings):
     pipeline_qdrant_timeout_seconds: float = Field(default=10.0, gt=0.0, le=600.0)
     pipeline_meilisearch_index_name: str = "memexpert-memes"
     pipeline_meilisearch_timeout_seconds: float = Field(default=10.0, gt=0.0, le=600.0)
+    recommendation_positive_lookback_hours: int = Field(default=168, ge=1, le=2160)
+    recommendation_impression_lookback_hours: int = Field(default=72, ge=1, le=720)
+    recommendation_positive_signal_limit: int = Field(default=50, ge=1, le=500)
+    recommendation_qdrant_candidate_limit: int = Field(default=80, ge=1, le=500)
+    # Tunable personalized-recommendation inputs. These are conservative starter
+    # weights for short-term positive signals, not final product truth.
+    recommendation_signal_favorite_weight: float = Field(default=4.0, ge=0.0, le=1000.0)
+    recommendation_signal_like_weight: float = Field(default=5.0, ge=0.0, le=1000.0)
+    recommendation_signal_save_weight: float = Field(default=4.0, ge=0.0, le=1000.0)
+    recommendation_signal_pin_weight: float = Field(default=5.0, ge=0.0, le=1000.0)
+    recommendation_signal_download_weight: float = Field(default=2.0, ge=0.0, le=1000.0)
+    recommendation_signal_telegram_send_weight: float = Field(default=3.0, ge=0.0, le=1000.0)
+    recommendation_signal_telegram_chosen_inline_weight: float = Field(default=3.0, ge=0.0, le=1000.0)
+    recommendation_signal_telegram_sent_weight: float = Field(default=3.0, ge=0.0, le=1000.0)
+    recommendation_signal_detail_view_weight: float = Field(default=1.5, ge=0.0, le=1000.0)
+    recommendation_signal_view_weight: float = Field(default=0.75, ge=0.0, le=1000.0)
+    recommendation_signal_collection_add_weight: float = Field(default=3.0, ge=0.0, le=1000.0)
+    recommendation_signal_durable_pin_weight: float = Field(default=4.0, ge=0.0, le=1000.0)
+    recommendation_signal_durable_collection_weight: float = Field(default=2.5, ge=0.0, le=1000.0)
     pipeline_merge_similarity_threshold: float = Field(default=0.92, ge=0.0, le=1.0)
     pipeline_classification_api_url: str | None = None
     pipeline_classification_api_key: SecretStr | None = None

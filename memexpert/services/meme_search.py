@@ -7,7 +7,7 @@ import logging
 import math
 import uuid
 from dataclasses import dataclass, replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -63,6 +63,7 @@ TRENDING_LIKE_WEIGHT = 0.05
 POPULAR_ALGORITHM_VERSION = "popular_v1"
 LEGACY_TRENDING_ALGORITHM_VERSION = "legacy_trending_v1"
 QDRANT_SIMILARITY_ALGORITHM_VERSION = SEARCH_INDEX_ALGORITHM_VERSION
+PERSONALIZED_RECOMMENDATION_ALGORITHM_VERSION = f"{SEARCH_INDEX_ALGORITHM_VERSION}_personalized_v1"
 TRENDING_EVENT_WEIGHTS = {
     AnalyticsEventType.MEME_DOWNLOAD: 2.0,
     AnalyticsEventType.MEME_VIEW: 1.0,
@@ -155,6 +156,13 @@ class _SimilarCandidate:
     score: float | None = None
     score_components: dict[str, float] | None = None
     algorithm_version: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _RecommendationCandidate:
+    meme: Meme
+    semantic_score: float
+    total_score: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -332,6 +340,225 @@ class MemeSearchService:
             page,
             viewer_user_id=viewer_user_id,
             filters=resolved_filters,
+        )
+
+    async def recommendation_candidates(
+        self,
+        *,
+        viewer_user_id: uuid.UUID | None = None,
+        filters: MemeSearchFilters | None = None,
+        limit: int = 20,
+        offset: int = 0,
+        surface: str = "service_recommendation_candidates",
+    ) -> MemeSearchPageRead:
+        """Return reusable personalized meme candidates from short-term positive signals.
+
+        The recommendation path keeps data volume intentionally bounded: recent
+        positive rows are capped by settings, Qdrant returns a capped candidate
+        pool, and PostgreSQL access/NSFW filtering is the final authority.
+        """
+
+        resolved_filters = _resolve_search_filters(filters, viewer_user_id=viewer_user_id)
+        resolved_limit = _clamp_limit(limit)
+        resolved_offset = max(0, offset)
+        request_id = new_discovery_request_id()
+
+        if viewer_user_id is None:
+            return await self._recommendation_fallback_page(
+                viewer_user_id=viewer_user_id,
+                filters=resolved_filters,
+                limit=resolved_limit,
+                offset=resolved_offset,
+                request_id=request_id,
+                surface=surface,
+                reason="cold_start_no_viewer",
+            )
+
+        positive_since = utcnow() - timedelta(hours=max(1, self._settings.recommendation_positive_lookback_hours))
+        positive_weights = await self._load_recommendation_positive_weights(
+            viewer_user_id=viewer_user_id,
+            since=positive_since,
+        )
+        if not positive_weights:
+            excluded_meme_ids = await self._load_recommendation_excluded_meme_ids(
+                viewer_user_id=viewer_user_id,
+                positive_meme_ids=set(),
+            )
+            return await self._recommendation_fallback_page(
+                viewer_user_id=viewer_user_id,
+                filters=resolved_filters,
+                limit=resolved_limit,
+                offset=resolved_offset,
+                request_id=request_id,
+                surface=surface,
+                reason="cold_start_no_positive_signals",
+                exclude_meme_ids=excluded_meme_ids,
+            )
+
+        weighted_vectors = await self._load_weighted_signal_embedding_vectors(positive_weights)
+        preference_vector = _weighted_centroid(weighted_vectors)
+        if preference_vector is None:
+            excluded_meme_ids = await self._load_recommendation_excluded_meme_ids(
+                viewer_user_id=viewer_user_id,
+                positive_meme_ids=set(positive_weights),
+            )
+            return await self._recommendation_fallback_page(
+                viewer_user_id=viewer_user_id,
+                filters=resolved_filters,
+                limit=resolved_limit,
+                offset=resolved_offset,
+                request_id=request_id,
+                surface=surface,
+                reason="cold_start_no_signal_embeddings",
+                exclude_meme_ids=excluded_meme_ids,
+            )
+
+        if self._semantic_client is None:
+            logger.warning("Qdrant user search client is not configured; using trending recommendation fallback.")
+            excluded_meme_ids = await self._load_recommendation_excluded_meme_ids(
+                viewer_user_id=viewer_user_id,
+                positive_meme_ids=set(positive_weights),
+            )
+            return await self._recommendation_fallback_page(
+                viewer_user_id=viewer_user_id,
+                filters=resolved_filters,
+                limit=resolved_limit,
+                offset=resolved_offset,
+                request_id=request_id,
+                surface=surface,
+                reason="qdrant_failure",
+                exclude_meme_ids=excluded_meme_ids,
+            )
+
+        candidate_limit = max(1, self._settings.recommendation_qdrant_candidate_limit)
+        try:
+            matches = await self._semantic_client.search_memes_by_vector(
+                query_vector=preference_vector,
+                limit=candidate_limit,
+                prefilter=_build_search_index_prefilter(resolved_filters, viewer_user_id=viewer_user_id),
+            )
+        except Exception:
+            logger.exception("Qdrant personalized recommendation lookup failed; using trending fallback.")
+            excluded_meme_ids = await self._load_recommendation_excluded_meme_ids(
+                viewer_user_id=viewer_user_id,
+                positive_meme_ids=set(positive_weights),
+            )
+            return await self._recommendation_fallback_page(
+                viewer_user_id=viewer_user_id,
+                filters=resolved_filters,
+                limit=resolved_limit,
+                offset=resolved_offset,
+                request_id=request_id,
+                surface=surface,
+                reason="qdrant_failure",
+                exclude_meme_ids=excluded_meme_ids,
+            )
+
+        excluded_meme_ids = await self._load_recommendation_excluded_meme_ids(
+            viewer_user_id=viewer_user_id,
+            positive_meme_ids=set(positive_weights),
+        )
+        ordered_matches = _dedupe_user_search_matches(matches, excluded_meme_ids=excluded_meme_ids)
+        if not ordered_matches:
+            return await self._recommendation_fallback_page(
+                viewer_user_id=viewer_user_id,
+                filters=resolved_filters,
+                limit=resolved_limit,
+                offset=resolved_offset,
+                request_id=request_id,
+                surface=surface,
+                reason="recommendation_candidates_empty",
+                exclude_meme_ids=excluded_meme_ids,
+            )
+
+        memes = await self._load_visible_memes(
+            tuple(match.meme_id for match in ordered_matches),
+            viewer_user_id=viewer_user_id,
+            filters=resolved_filters,
+        )
+        memes_by_id = {meme.id: meme for meme in memes}
+        max_popularity = max((meme.popularity_score for meme in memes), default=0.0)
+        candidates: list[_RecommendationCandidate] = []
+        for match in ordered_matches:
+            meme = memes_by_id.get(match.meme_id)
+            if meme is None:
+                continue
+            semantic_score = _safe_float(match.semantic_score)
+            if semantic_score is None:
+                continue
+            popularity = _normalize_value(meme.popularity_score, max_popularity)
+            total_score = 0.85 * semantic_score + 0.15 * popularity
+            candidates.append(
+                _RecommendationCandidate(
+                    meme=meme,
+                    semantic_score=semantic_score,
+                    total_score=total_score,
+                )
+            )
+
+        if not candidates:
+            return await self._recommendation_fallback_page(
+                viewer_user_id=viewer_user_id,
+                filters=resolved_filters,
+                limit=resolved_limit,
+                offset=resolved_offset,
+                request_id=request_id,
+                surface=surface,
+                reason="postgres_filters_empty",
+                exclude_meme_ids=excluded_meme_ids,
+            )
+
+        candidates.sort(
+            key=lambda candidate: (
+                candidate.total_score,
+                candidate.semantic_score,
+                candidate.meme.popularity_score,
+                candidate.meme.created_at,
+                str(candidate.meme.id),
+            ),
+            reverse=True,
+        )
+        page_candidates = candidates[resolved_offset : resolved_offset + resolved_limit]
+        items: list[MemeSearchResultRead] = []
+        for rank, candidate in enumerate(page_candidates, start=resolved_offset + 1):
+            popularity = _normalize_value(candidate.meme.popularity_score, max_popularity)
+            score_read = MemeSearchScoreRead(
+                semantic=candidate.semantic_score,
+                text=0.0,
+                popularity=popularity,
+                total=candidate.total_score,
+            )
+            items.append(
+                MemeSearchResultRead(
+                    meme=_to_card_read(candidate.meme),
+                    score=score_read,
+                    attribution=_build_result_attribution(
+                        request_id=request_id,
+                        surface=surface,
+                        source_algorithm="personalized_recommendations",
+                        rank=rank,
+                        query=None,
+                        filters=resolved_filters,
+                        score=score_read.total,
+                        score_components={
+                            "semantic": score_read.semantic,
+                            "popularity": score_read.popularity,
+                            "positive_source_count": float(len(weighted_vectors)),
+                            "total": score_read.total,
+                        },
+                        algorithm_version=PERSONALIZED_RECOMMENDATION_ALGORITHM_VERSION,
+                        reason="qdrant_preference_vector",
+                    ),
+                )
+            )
+
+        return MemeSearchPageRead(
+            items=items,
+            limit=resolved_limit,
+            offset=resolved_offset,
+            total=len(candidates),
+            has_more=resolved_offset + resolved_limit < len(candidates),
+            request_id=request_id,
         )
 
     async def get_meme_detail(
@@ -626,6 +853,10 @@ class MemeSearchService:
         offset: int = 0,
         lookback_hours: int = 168,
         surface: str = "service_trending",
+        source_algorithm: str = "legacy_trending",
+        reason: str = "recent_activity_popularity",
+        request_id: str | None = None,
+        exclude_meme_ids: set[uuid.UUID] | None = None,
     ) -> MemeSearchPageRead:
         """Return a deterministic popular/trending catalog page.
 
@@ -641,10 +872,12 @@ class MemeSearchService:
         resolved_filters = _resolve_search_filters(filters, viewer_user_id=viewer_user_id)
         resolved_limit = _clamp_limit(limit)
         resolved_offset = max(0, offset)
-        request_id = new_discovery_request_id()
+        request_id = request_id or new_discovery_request_id()
         since = utcnow() - timedelta(hours=max(1, lookback_hours))
 
         base_stmt = _apply_filters(_visible_meme_stmt(viewer_user_id), resolved_filters)
+        if exclude_meme_ids:
+            base_stmt = base_stmt.where(~Meme.id.in_(tuple(exclude_meme_ids)))
         result = await self._session.execute(base_stmt)
         memes = list(result.scalars().all())
         if not memes:
@@ -708,7 +941,7 @@ class MemeSearchService:
                     attribution=_build_result_attribution(
                         request_id=request_id,
                         surface=surface,
-                        source_algorithm="legacy_trending",
+                        source_algorithm=source_algorithm,
                         rank=rank,
                         query=None,
                         filters=resolved_filters,
@@ -721,7 +954,7 @@ class MemeSearchService:
                             "total": score.total,
                         },
                         algorithm_version=LEGACY_TRENDING_ALGORITHM_VERSION,
-                        reason="recent_activity_popularity",
+                        reason=reason,
                     ),
                 )
             )
@@ -791,6 +1024,192 @@ class MemeSearchService:
         for snapshot in result.scalars():
             scores.setdefault(snapshot.meme_id, snapshot.popularity_score)
         return scores
+
+    async def _recommendation_fallback_page(
+        self,
+        *,
+        viewer_user_id: uuid.UUID | None,
+        filters: MemeSearchFilters,
+        limit: int,
+        offset: int,
+        request_id: str,
+        surface: str,
+        reason: str,
+        exclude_meme_ids: set[uuid.UUID] | None = None,
+    ) -> MemeSearchPageRead:
+        return await self.trending_memes(
+            viewer_user_id=viewer_user_id,
+            filters=filters,
+            limit=limit,
+            offset=offset,
+            lookback_hours=self._settings.recommendation_positive_lookback_hours,
+            surface=surface,
+            source_algorithm="fallback_trending",
+            reason=reason,
+            request_id=request_id,
+            exclude_meme_ids=exclude_meme_ids,
+        )
+
+    async def _load_recommendation_excluded_meme_ids(
+        self,
+        *,
+        viewer_user_id: uuid.UUID,
+        positive_meme_ids: set[uuid.UUID],
+    ) -> set[uuid.UUID]:
+        impression_since = utcnow() - timedelta(hours=max(1, self._settings.recommendation_impression_lookback_hours))
+        excluded_meme_ids = set(positive_meme_ids)
+        excluded_meme_ids.update(
+            await self._load_recent_impression_meme_ids(
+                viewer_user_id=viewer_user_id,
+                since=impression_since,
+            )
+        )
+        return excluded_meme_ids
+
+    async def _load_recommendation_positive_weights(
+        self,
+        *,
+        viewer_user_id: uuid.UUID,
+        since: datetime,
+    ) -> dict[uuid.UUID, float]:
+        weights: dict[uuid.UUID, float] = {}
+        event_weights = self._recommendation_event_weights()
+        result = await self._session.execute(
+            select(AnalyticsEvent)
+            .where(
+                AnalyticsEvent.user_id == viewer_user_id,
+                AnalyticsEvent.event_type.in_((*event_weights, AnalyticsEventType.COLLECTION_ACTION)),
+                AnalyticsEvent.occurred_at >= since,
+            )
+            .order_by(AnalyticsEvent.occurred_at.desc())
+            .limit(self._settings.recommendation_positive_signal_limit)
+        )
+        for event in result.scalars():
+            meme_id = _analytics_event_meme_id(event.payload)
+            if meme_id is None:
+                continue
+            weight = event_weights.get(event.event_type)
+            if event.event_type == AnalyticsEventType.COLLECTION_ACTION:
+                weight = (
+                    self._settings.recommendation_signal_collection_add_weight
+                    if _is_collection_add_event(event.payload)
+                    else None
+                )
+            if weight is None or weight <= 0.0:
+                continue
+            weights[meme_id] = weights.get(meme_id, 0.0) + weight
+
+        pinned_result = await self._session.execute(
+            select(PinnedMeme.meme_id)
+            .where(PinnedMeme.user_id == viewer_user_id, PinnedMeme.pinned_at >= since)
+            .order_by(PinnedMeme.pinned_at.desc())
+            .limit(self._settings.recommendation_positive_signal_limit)
+        )
+        for meme_id in pinned_result.scalars():
+            _add_positive_weight(weights, meme_id, self._settings.recommendation_signal_durable_pin_weight)
+
+        collection_result = await self._session.execute(
+            select(CollectionMeme.meme_id)
+            .join(Collection, Collection.id == CollectionMeme.collection_id)
+            .where(
+                or_(Collection.owner_id == viewer_user_id, CollectionMeme.added_by_user_id == viewer_user_id),
+                CollectionMeme.added_at >= since,
+            )
+            .order_by(CollectionMeme.added_at.desc())
+            .limit(self._settings.recommendation_positive_signal_limit)
+        )
+        for meme_id in collection_result.scalars():
+            _add_positive_weight(weights, meme_id, self._settings.recommendation_signal_durable_collection_weight)
+
+        return dict(
+            sorted(
+                weights.items(),
+                key=lambda item: (item[1], str(item[0])),
+                reverse=True,
+            )[: self._settings.recommendation_positive_signal_limit]
+        )
+
+    def _recommendation_event_weights(self) -> dict[AnalyticsEventType, float]:
+        return {
+            AnalyticsEventType.FAVORITE: self._settings.recommendation_signal_favorite_weight,
+            AnalyticsEventType.MEME_LIKE: self._settings.recommendation_signal_like_weight,
+            AnalyticsEventType.MEME_SAVE: self._settings.recommendation_signal_save_weight,
+            AnalyticsEventType.SAVE: self._settings.recommendation_signal_save_weight,
+            AnalyticsEventType.MEME_PIN: self._settings.recommendation_signal_pin_weight,
+            AnalyticsEventType.MEME_DOWNLOAD: self._settings.recommendation_signal_download_weight,
+            AnalyticsEventType.MEME_SEND: self._settings.recommendation_signal_telegram_send_weight,
+            AnalyticsEventType.INLINE_CHOSEN: self._settings.recommendation_signal_telegram_chosen_inline_weight,
+            AnalyticsEventType.INLINE_SENT: self._settings.recommendation_signal_telegram_sent_weight,
+            AnalyticsEventType.MEME_DETAIL_CLICK: self._settings.recommendation_signal_detail_view_weight,
+            AnalyticsEventType.MEME_VIEW: self._settings.recommendation_signal_view_weight,
+            AnalyticsEventType.VIEW: self._settings.recommendation_signal_view_weight,
+        }
+
+    async def _load_weighted_signal_embedding_vectors(
+        self,
+        positive_weights: dict[uuid.UUID, float],
+    ) -> list[tuple[tuple[float, ...], float]]:
+        if not positive_weights:
+            return []
+
+        result = await self._session.execute(
+            select(Meme.id, Meme.primary_file_id, EmbeddingCache.embedding)
+            .join(
+                EmbeddingCache,
+                and_(
+                    EmbeddingCache.source_file_id == Meme.primary_file_id,
+                    EmbeddingCache.input_type == EmbeddingInputType.IMAGE,
+                ),
+            )
+            .where(Meme.id.in_(tuple(positive_weights)))
+            .order_by(EmbeddingCache.source_file_id, EmbeddingCache.created_at.desc())
+        )
+
+        seen_file_ids: set[uuid.UUID] = set()
+        weighted_vectors: list[tuple[tuple[float, ...], float]] = []
+        for meme_id, file_id, embedding in result.all():
+            if file_id in seen_file_ids:
+                continue
+            seen_file_ids.add(file_id)
+            try:
+                vector = decode_embedding_bytes(
+                    embedding,
+                    dimensions=self._settings.pipeline_voyage_output_dimensions,
+                )
+            except VoyageEmbeddingError:
+                logger.exception("Stored recommendation signal embedding could not be decoded; skipping signal.")
+                continue
+            weight = positive_weights.get(meme_id, 0.0)
+            if weight > 0.0:
+                weighted_vectors.append((vector, weight))
+        return weighted_vectors
+
+    async def _load_recent_impression_meme_ids(
+        self,
+        *,
+        viewer_user_id: uuid.UUID,
+        since: datetime,
+    ) -> set[uuid.UUID]:
+        result = await self._session.execute(
+            select(AnalyticsEvent)
+            .where(
+                AnalyticsEvent.user_id == viewer_user_id,
+                AnalyticsEvent.event_type.in_((AnalyticsEventType.MEME_IMPRESSION, AnalyticsEventType.IMPRESSION)),
+                AnalyticsEvent.occurred_at >= since,
+            )
+            .order_by(AnalyticsEvent.occurred_at.desc())
+            .limit(
+                max(
+                    self._settings.recommendation_positive_signal_limit,
+                    self._settings.recommendation_qdrant_candidate_limit,
+                )
+            )
+        )
+        return {
+            meme_id
+            for event in result.scalars()
+            if (meme_id := _analytics_event_meme_id(event.payload)) is not None
+        }
 
     async def browse_tag(
         self,
@@ -1835,6 +2254,52 @@ def _dedupe_similarity_matches(
     return ordered_matches
 
 
+def _dedupe_user_search_matches(
+    matches: Sequence[QdrantUserSearchMatch],
+    *,
+    excluded_meme_ids: set[uuid.UUID],
+) -> list[QdrantUserSearchMatch]:
+    seen_meme_ids = set(excluded_meme_ids)
+    ordered_matches: list[QdrantUserSearchMatch] = []
+    for match in matches:
+        if match.meme_id in seen_meme_ids or _safe_float(match.semantic_score) is None:
+            continue
+        seen_meme_ids.add(match.meme_id)
+        ordered_matches.append(match)
+    return ordered_matches
+
+
+def _add_positive_weight(weights: dict[uuid.UUID, float], meme_id: uuid.UUID, weight: float) -> None:
+    if weight <= 0.0:
+        return
+    weights[meme_id] = weights.get(meme_id, 0.0) + weight
+
+
+def _weighted_centroid(weighted_vectors: list[tuple[tuple[float, ...], float]]) -> tuple[float, ...] | None:
+    sums: list[float] | None = None
+    total_weight = 0.0
+    for vector, weight in weighted_vectors:
+        if weight <= 0.0 or not vector:
+            continue
+        safe_vector = tuple(float(value) for value in vector)
+        if any(not math.isfinite(value) for value in safe_vector):
+            continue
+        if sums is None:
+            sums = [0.0 for _ in safe_vector]
+        if len(safe_vector) != len(sums):
+            continue
+        for index, value in enumerate(safe_vector):
+            sums[index] += value * weight
+        total_weight += weight
+
+    if sums is None or total_weight <= 0.0:
+        return None
+    centroid = tuple(value / total_weight for value in sums)
+    if all(value == 0.0 for value in centroid):
+        return None
+    return centroid
+
+
 def _tag_overlap_score(source_tags: frozenset[str], candidate_tags: Sequence[str]) -> float:
     if not source_tags:
         return 0.0
@@ -1942,6 +2407,35 @@ def _analytics_event_meme_id(payload: object) -> uuid.UUID | None:
     if not isinstance(refs, dict):
         return None
     return _parse_uuid(refs.get("meme_id"))
+
+
+def _is_collection_add_event(payload: object) -> bool:
+    action = _analytics_event_action(payload)
+    if action is None:
+        return False
+    normalized_action = action.strip().lower().replace("-", "_")
+    return normalized_action in {
+        "add",
+        "added",
+        "add_meme",
+        "collection_add",
+        "meme_add",
+        "meme_save",
+        "save",
+        "saved",
+    }
+
+
+def _analytics_event_action(payload: object) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    properties = payload.get("properties")
+    if isinstance(properties, dict):
+        action = properties.get("action")
+        if isinstance(action, str):
+            return action
+    action = payload.get("action")
+    return action if isinstance(action, str) else None
 
 
 def _normalize_value(value: float, max_value: float) -> float:
