@@ -29,6 +29,7 @@ from memexpert.core.meilisearch import PipelineMeilisearchSyncClient
 from memexpert.core.qdrant import PipelineQdrantSyncClient
 from memexpert.core.storage import get_pipeline_storage_settings, get_s3_client
 from memexpert.core.voyage import build_pipeline_voyage_client
+from memexpert.ingest.schemas import IngestRequestRead
 from memexpert.models.base import utcnow
 from memexpert.models.content import (
     EmbeddingCache,
@@ -47,14 +48,15 @@ from memexpert.models.enums import (
     ContentPipelineStageStatus,
     ContentProcessingStatus,
     EmbeddingInputType,
+    PipelineIngestRequestStatus,
     SourcePlatform,
     SyncTargetKind,
     SyncTargetStatus,
 )
+from memexpert.pipeline.outbox_runtime import PipelineOutboxPublisherBatchResult, run_pipeline_outbox_publisher_batch
 from memexpert.schemas.content_pipeline import (
     ContentPipelineErrorResponse,
     ContentPipelineItemDetail,
-    ContentPipelineUploadRead,
     SmokeProofResult,
 )
 from memexpert.services.search_index_sync import (
@@ -66,6 +68,7 @@ from memexpert.services.search_index_sync import (
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
+    from memexpert.core.database import AsyncSessionFactory
     from memexpert.core.meilisearch import MeilisearchSyncClientProtocol
     from memexpert.core.qdrant import QdrantSyncClientProtocol
 
@@ -79,6 +82,13 @@ E2E_UPLOAD_SOURCE_ID: Final = "e2e-prd-upload"
 E2E_MODEL_ID: Final = "e2e-prd-seed"
 E2E_PROMPT_VERSION: Final = "e2e-prd-v1"
 UUID_NAMESPACE: Final = uuid.UUID("176f5e31-6e5d-5e43-80aa-1f7aa3aa0d4b")
+TERMINAL_INGEST_FAILURE_STATUSES: Final = frozenset(
+    {
+        PipelineIngestRequestStatus.FAILED_BLOCKED_PHASH,
+        PipelineIngestRequestStatus.FAILED_INVALID_MEDIA,
+        PipelineIngestRequestStatus.PUBLISH_FAILED,
+    }
+)
 
 
 class E2ESeedError(RuntimeError):
@@ -141,7 +151,7 @@ class PipelineApiClient:
                 f"GET /health returned unexpected status {response.status_code}: {response.text!r}",
             )
 
-    def upload_cat_png(self, *, image_bytes: bytes, run_id: str) -> ContentPipelineUploadRead:
+    def upload_cat_png(self, *, image_bytes: bytes, run_id: str) -> IngestRequestRead:
         response = self._client.post(
             "/api/v1/pipeline/uploads",
             data={
@@ -152,7 +162,11 @@ class PipelineApiClient:
             },
             files={"file": ("e2e-prd-cat.png", image_bytes, "image/png")},
         )
-        return _validate_response(response, expected_status=201, model=ContentPipelineUploadRead)
+        return _validate_response(response, expected_status=(200, 202), model=IngestRequestRead)
+
+    def get_ingest_request(self, ingest_request_id: uuid.UUID) -> IngestRequestRead:
+        response = self._client.get(f"/api/v1/pipeline/ingest-requests/{ingest_request_id}")
+        return _validate_response(response, expected_status=200, model=IngestRequestRead)
 
     def get_item_detail(self, meme_file_id: uuid.UUID) -> ContentPipelineItemDetail:
         response = self._client.get(f"/api/v1/pipeline/items/{meme_file_id}/detail")
@@ -256,6 +270,7 @@ async def _run(args: argparse.Namespace) -> None:
     await meili_client.ensure_index()
 
     qdrant_sync_client = PipelineQdrantSyncClient(settings=settings)
+    session_factory = get_async_session_factory()
     specs = build_seed_specs()
     await cleanup_e2e_rows(settings=settings, specs=specs)
 
@@ -268,16 +283,25 @@ async def _run(args: argparse.Namespace) -> None:
     ) as api_client:
         api_client.healthcheck()
         print("Uploading generated cat PNG through /api/v1/pipeline/uploads")
-        upload = api_client.upload_cat_png(image_bytes=cat_png, run_id=run_id)
-        detail = wait_for_dual_synced(
+        ingest_request = api_client.upload_cat_png(image_bytes=cat_png, run_id=run_id)
+        materialized_request, meme_file_id = await wait_for_ingest_materialized_meme_file(
             api_client,
-            meme_file_id=upload.meme_file_id,
+            ingest_request_id=ingest_request.id,
+            settings=settings,
+            session_factory=session_factory,
             timeout_seconds=args.timeout_seconds,
         )
-        print(f"Uploaded item dual-synced: meme_file_id={upload.meme_file_id}")
+        detail = await wait_for_dual_synced(
+            api_client,
+            meme_file_id=meme_file_id,
+            settings=settings,
+            session_factory=session_factory,
+            timeout_seconds=args.timeout_seconds,
+        )
+        print(f"Uploaded item dual-synced: ingest_request_id={ingest_request.id} meme_file_id={meme_file_id}")
         dual_index_result = wait_for_dual_index_proof(
             api_client,
-            meme_file_id=upload.meme_file_id,
+            meme_file_id=meme_file_id,
             timeout_seconds=args.timeout_seconds,
         )
         slug = await publish_created_meme(
@@ -287,7 +311,7 @@ async def _run(args: argparse.Namespace) -> None:
         )
         await resync_created_public_meme_indexes(
             settings=settings,
-            meme_file_id=upload.meme_file_id,
+            meme_file_id=meme_file_id,
             qdrant_sync_client=qdrant_sync_client,
             meili_client=meili_client,
         )
@@ -345,7 +369,9 @@ async def _run(args: argparse.Namespace) -> None:
         ],
         "created_meme": {
             "meme_id": str(detail.meme_id),
-            "meme_file_id": str(upload.meme_file_id),
+            "meme_file_id": str(meme_file_id),
+            "ingest_request_id": str(materialized_request.id),
+            "ingest_request_status": materialized_request.status.value,
             "slug": slug,
             "query": "cat",
             "title": "Created cat pipeline meme",
@@ -821,15 +847,56 @@ def wait_for_public_search_contains(
     )
 
 
-def wait_for_dual_synced(
+async def wait_for_ingest_materialized_meme_file(
+    client: PipelineApiClient,
+    *,
+    ingest_request_id: uuid.UUID,
+    settings: Settings,
+    session_factory: AsyncSessionFactory,
+    timeout_seconds: float,
+) -> tuple[IngestRequestRead, uuid.UUID]:
+    deadline = time.monotonic() + timeout_seconds
+    last_request: IngestRequestRead | None = None
+    last_outbox_result: PipelineOutboxPublisherBatchResult | None = None
+    while time.monotonic() < deadline:
+        last_outbox_result = await publish_pending_pipeline_outbox(
+            settings=settings,
+            session_factory=session_factory,
+        )
+        ingest_request = client.get_ingest_request(ingest_request_id)
+        last_request = ingest_request
+        if ingest_request.status in TERMINAL_INGEST_FAILURE_STATUSES:
+            raise E2ESeedError(
+                f"Ingest request {ingest_request_id} reached terminal failure status "
+                f"{ingest_request.status.value}: {ingest_request.failure_code} - {ingest_request.failure_detail}",
+            )
+        if ingest_request.materialized_meme_file_id is not None:
+            return ingest_request, ingest_request.materialized_meme_file_id
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+    snapshot = last_request.model_dump(mode="json") if last_request is not None else None
+    raise E2ESeedError(
+        f"Timed out waiting for ingest request {ingest_request_id} to materialize a meme file. "
+        f"Last request: {snapshot}; last outbox publish: {_outbox_result_snapshot(last_outbox_result)}",
+    )
+
+
+async def wait_for_dual_synced(
     client: PipelineApiClient,
     *,
     meme_file_id: uuid.UUID,
+    settings: Settings,
+    session_factory: AsyncSessionFactory,
     timeout_seconds: float,
 ) -> ContentPipelineItemDetail:
     deadline = time.monotonic() + timeout_seconds
     last_detail: ContentPipelineItemDetail | None = None
+    last_outbox_result: PipelineOutboxPublisherBatchResult | None = None
     while time.monotonic() < deadline:
+        last_outbox_result = await publish_pending_pipeline_outbox(
+            settings=settings,
+            session_factory=session_factory,
+        )
         detail = client.get_item_detail(meme_file_id)
         last_detail = detail
         qdrant_status = detail.sync_targets.get(SyncTargetKind.QDRANT)
@@ -841,11 +908,32 @@ def wait_for_dual_synced(
             and meili_status.status is SyncTargetStatus.SYNCED
         ):
             return detail
-        time.sleep(POLL_INTERVAL_SECONDS)
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
     snapshot = last_detail.model_dump(mode="json") if last_detail is not None else None
     raise E2ESeedError(
-        f"Timed out waiting for {meme_file_id} to dual-sync. Last detail: {snapshot}",
+        f"Timed out waiting for {meme_file_id} to dual-sync. Last detail: {snapshot}; "
+        f"last outbox publish: {_outbox_result_snapshot(last_outbox_result)}",
     )
+
+
+async def publish_pending_pipeline_outbox(
+    *,
+    settings: Settings,
+    session_factory: AsyncSessionFactory,
+) -> PipelineOutboxPublisherBatchResult:
+    return await run_pipeline_outbox_publisher_batch(session_factory, settings=settings)
+
+
+def _outbox_result_snapshot(result: PipelineOutboxPublisherBatchResult | None) -> dict[str, int | float] | None:
+    if result is None:
+        return None
+    return {
+        "recovered": result.recovered,
+        "claimed": result.claimed,
+        "published": result.published,
+        "failed": result.failed,
+        "duration_seconds": result.duration_seconds,
+    }
 
 
 def wait_for_dual_index_proof(
@@ -1090,7 +1178,7 @@ def _stable_uuid(name: str) -> uuid.UUID:
 def _validate_response[ModelT: BaseModel](
     response: httpx.Response,
     *,
-    expected_status: int,
+    expected_status: int | tuple[int, ...],
     model: type[ModelT],
 ) -> ModelT:
     payload = _validate_json_response(response, expected_status=expected_status)
@@ -1102,7 +1190,7 @@ def _validate_response[ModelT: BaseModel](
         ) from exc
 
 
-def _validate_json_response(response: httpx.Response, *, expected_status: int) -> dict[str, Any]:
+def _validate_json_response(response: httpx.Response, *, expected_status: int | tuple[int, ...]) -> dict[str, Any]:
     try:
         payload = response.json()
     except json.JSONDecodeError as exc:
@@ -1111,7 +1199,8 @@ def _validate_json_response(response: httpx.Response, *, expected_status: int) -
             f"{exc}; body={response.text!r}",
         ) from exc
 
-    if response.status_code != expected_status:
+    expected_statuses = (expected_status,) if isinstance(expected_status, int) else expected_status
+    if response.status_code not in expected_statuses:
         try:
             error_payload = ContentPipelineErrorResponse.model_validate(payload)
         except ValidationError:

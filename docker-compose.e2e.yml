@@ -226,7 +226,7 @@ services:
         condition: service_healthy
 
   seed:
-    <<: *main-image
+    <<: *worker-image
     restart: "no"
     command:
       [
