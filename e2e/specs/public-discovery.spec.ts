@@ -2,11 +2,27 @@ import type { Locator, Page } from '@playwright/test';
 import { expect, test } from '../fixtures/app';
 import { publicTrendsFixture, seededByCategory, type SeededPublicTrendsFixture } from '../helpers/seed';
 
+test('guest home feed API bootstraps cold-start fallback from seeded public memes', async ({ api, seed }) => {
+  await api.expectNoAccessCookieStored();
+  const seededHomeFeedParams = { limit: '10', tags: 'e2e-prd' };
+
+  const first = await api.homeFeed(seededHomeFeedParams);
+  const accessToken = api.expectAccessCookieSet(first.response);
+  await api.expectAccessCookieStored(accessToken);
+  api.expectHomeFeedFallback(first.payload, seed.seeded_memes);
+
+  const second = await api.homeFeed(seededHomeFeedParams);
+  api.expectAccessCookieNotSet(second.response);
+  await api.expectAccessCookieStored(accessToken);
+  api.expectHomeFeedFallback(second.payload, seed.seeded_memes);
+});
+
 test('guest discovers a public meme with URL-backed filters and imgproxy media', async ({ app, seed }) => {
   const cat = seededByCategory(seed, 'cat');
   const nsfwCat = seededByCategory(seed, 'cat-nsfw');
 
   await app.home.goto();
+  await app.home.expectGuestHomeFeedFallback(seed.seeded_memes);
   await app.home.searchFor(cat.query);
 
   await app.search.expectResultVisible(cat);
