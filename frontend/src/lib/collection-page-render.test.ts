@@ -14,7 +14,14 @@ describe('/collection/[id] page', () => {
         can_rename: true,
         can_delete: true,
         can_create_invites: true,
+        can_revoke_invites: true,
+        can_manage_members: true,
         can_set_active_save: true
+      },
+      collection: {
+        ...baseCollection(),
+        memberships: [ownerMember(), editorMember()],
+        invites: [pendingInvite()]
       },
       saved_memes: [
         {
@@ -30,12 +37,19 @@ describe('/collection/[id] page', () => {
     });
 
     const { body } = render(CollectionPage, {
-      props: { data: { session: null, sessionError: null, detail, errorMessage: null } }
+      props: {
+        data: { session: null, sessionError: null, detail, errorMessage: null },
+        form: { successMessage: 'Invite link created.', inviteUrl: 'https://memexpert.test/collection/invite/token' }
+      }
     });
 
     expect(body).toContain('Launch saves');
     expect(body).toContain('Collection details');
     expect(body).toContain('Invite link');
+    expect(body).toContain('Copy');
+    expect(body).toContain('Revoke');
+    expect(body).toContain('Update role');
+    expect(body).toContain('Owner transfer and owner removal are not available here.');
     expect(body).toContain('Danger zone');
     expect(body).toContain('Launch reaction');
     expect(body).toContain('Remove');
@@ -51,6 +65,8 @@ describe('/collection/[id] page', () => {
         can_rename: false,
         can_delete: false,
         can_create_invites: false,
+        can_revoke_invites: false,
+        can_manage_members: false,
         can_set_active_save: false
       },
       saved_memes: []
@@ -64,6 +80,40 @@ describe('/collection/[id] page', () => {
     expect(body).toContain('viewer');
     expect(body).not.toContain('Danger zone');
     expect(body).not.toContain('Create invite');
+    expect(body).not.toContain('Update role');
+    expect(body).not.toContain('Revoke');
+  });
+
+  it('renders editor invite controls without member management', () => {
+    const detail = collectionDetail({
+      viewer_role: 'editor',
+      capabilities: {
+        can_view: true,
+        can_add_memes: true,
+        can_remove_memes: true,
+        can_rename: false,
+        can_delete: false,
+        can_create_invites: true,
+        can_revoke_invites: true,
+        can_manage_members: false,
+        can_set_active_save: true
+      },
+      collection: {
+        ...baseCollection(),
+        memberships: [ownerMember(), editorMember()],
+        invites: [pendingInvite()]
+      }
+    });
+
+    const { body } = render(CollectionPage, {
+      props: { data: { session: null, sessionError: null, detail, errorMessage: null } }
+    });
+
+    expect(body).toContain('Create invite');
+    expect(body).toContain('Revoke');
+    expect(body).not.toContain('Collection details');
+    expect(body).not.toContain('Update role');
+    expect(body).not.toContain('Danger zone');
   });
 
   it('renders unavailable state gracefully', () => {
@@ -80,25 +130,7 @@ describe('/collection/[id] page', () => {
 
 function collectionDetail(overrides: Partial<WebCollectionDetailRead> = {}): WebCollectionDetailRead {
   return {
-    collection: {
-      id: '11111111-1111-4111-8111-111111111111',
-      owner_id: '33333333-3333-4333-8333-333333333333',
-      title: 'Launch saves',
-      description: 'For launch prep',
-      kind: 'custom',
-      visibility: 'private',
-      memberships: [
-        {
-          collection_id: '11111111-1111-4111-8111-111111111111',
-          user_id: '33333333-3333-4333-8333-333333333333',
-          role: 'owner',
-          joined_at: '2026-01-01T00:00:00Z'
-        }
-      ],
-      invites: [],
-      created_at: '2026-01-01T00:00:00Z',
-      updated_at: '2026-01-03T00:00:00Z'
-    },
+    collection: baseCollection(),
     viewer_role: 'owner',
     capabilities: {
       can_view: true,
@@ -107,11 +139,66 @@ function collectionDetail(overrides: Partial<WebCollectionDetailRead> = {}): Web
       can_rename: true,
       can_delete: true,
       can_create_invites: true,
+      can_revoke_invites: true,
+      can_manage_members: true,
       can_set_active_save: true
     },
     active_save_collection_id: '11111111-1111-4111-8111-111111111111',
     saved_memes: [],
     ...overrides
+  };
+}
+
+function baseCollection(): WebCollectionDetailRead['collection'] {
+  return {
+    id: '11111111-1111-4111-8111-111111111111',
+    owner_id: '33333333-3333-4333-8333-333333333333',
+    title: 'Launch saves',
+    description: 'For launch prep',
+    kind: 'custom',
+    visibility: 'private',
+    memberships: [ownerMember()],
+    invites: [],
+    created_at: '2026-01-01T00:00:00Z',
+    updated_at: '2026-01-03T00:00:00Z'
+  };
+}
+
+function ownerMember(): WebCollectionDetailRead['collection']['memberships'][number] {
+  return {
+    collection_id: '11111111-1111-4111-8111-111111111111',
+    user_id: '33333333-3333-4333-8333-333333333333',
+    role: 'owner',
+    joined_at: '2026-01-01T00:00:00Z'
+  };
+}
+
+function editorMember(): WebCollectionDetailRead['collection']['memberships'][number] {
+  return {
+    collection_id: '11111111-1111-4111-8111-111111111111',
+    user_id: '44444444-4444-4444-8444-444444444444',
+    role: 'editor',
+    joined_at: '2026-01-02T00:00:00Z'
+  };
+}
+
+function pendingInvite(): WebCollectionDetailRead['collection']['invites'][number] {
+  return {
+    id: '55555555-5555-4555-8555-555555555555',
+    collection_id: '11111111-1111-4111-8111-111111111111',
+    created_by_user_id: '33333333-3333-4333-8333-333333333333',
+    role: 'viewer',
+    channel: 'direct_link',
+    label: 'Launch invite',
+    status: 'pending',
+    max_uses: 1,
+    use_count: 0,
+    expires_at: '2099-01-08T00:00:00Z',
+    last_used_at: null,
+    revoked_at: null,
+    recipient_email: null,
+    created_at: '2026-01-01T00:00:00Z',
+    updated_at: '2026-01-01T00:00:00Z'
   };
 }
 

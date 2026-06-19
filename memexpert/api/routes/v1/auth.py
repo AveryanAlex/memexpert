@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Annotated
+import logging
+from typing import TYPE_CHECKING, Annotated
 
 from fastapi import APIRouter, Body, Request, status
 from fastapi.responses import Response
@@ -11,6 +12,7 @@ from memexpert.api.cookies import delete_access_cookie, set_access_cookie
 from memexpert.api.dependencies import (
     AUTH_ERROR_RESPONSES,
     AccountLinkServiceDep,
+    AnalyticsServiceDep,
     AuthServiceDep,
     AutoGuestUserDep,
     CurrentUserDep,
@@ -18,9 +20,12 @@ from memexpert.api.dependencies import (
     ForbidFullAccountCallerDep,
     GuestUserDep,
     OptionalAccessTokenDep,
+    OptionalCurrentUserDep,
     OptionalGuestUserDep,
+    ProviderAuthServiceDep,
     to_auth_http_error,
 )
+from memexpert.models.enums import AccountType, AnalyticsEventType
 from memexpert.schemas.auth import (
     AuthSessionRead,
     CurrentSessionRead,
@@ -29,6 +34,7 @@ from memexpert.schemas.auth import (
     GoogleAuthRequest,
     GuestBootstrapRequest,
     LinkedProvidersRead,
+    ProfileStatsRead,
     TelegramLinkStartRead,
     TelegramMiniAppAuthRequest,
     TelegramWidgetAuthRequest,
@@ -39,12 +45,18 @@ from memexpert.services import (
     AuthenticatedUserNotFoundError,
     AuthServiceError,
     AuthSession,
+    GuestAccountRequiredError,
     LinkedProvidersProjection,
     UserNotFoundError,
     UserService,
 )
+from memexpert.services.analytics import AnalyticsService, hash_external_identifier
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+logger = logging.getLogger(__name__)
 
 
 def _extract_client_ip(request: Request) -> str | None:
@@ -120,6 +132,21 @@ async def read_current_session(
         ) from exc
 
     return _build_current_session_read(current_user, linked_providers)
+
+
+@router.get(
+    "/profile-stats",
+    response_model=ProfileStatsRead,
+    responses=AUTH_ERROR_RESPONSES,
+    summary="Read profile interaction stats",
+)
+async def read_profile_stats(
+    current_user: AutoGuestUserDep,
+    analytics_service: AnalyticsServiceDep,
+) -> ProfileStatsRead:
+    """Return profile stats derived from the caller's persisted analytics events."""
+
+    return await analytics_service.profile_stats(user_id=current_user.id)
 
 
 @router.post(
@@ -335,28 +362,46 @@ async def login_with_telegram_widget(
 async def login_with_telegram_miniapp(
     request: Request,
     response: Response,
-    _guard: ForbidFullAccountCallerDep,
+    current_user: OptionalCurrentUserDep,
     optional_guest: OptionalGuestUserDep,
     account_link_service: AccountLinkServiceDep,
+    provider_auth_service: ProviderAuthServiceDep,
     auth_service: AuthServiceDep,
+    analytics_service: AnalyticsServiceDep,
+    session: DbSessionDep,
     credentials: Annotated[TelegramMiniAppAuthRequest, Body()],
 ) -> AuthSessionRead:
     """Validate Telegram Mini App initData via the unified writer path."""
 
     try:
-        link_result = await account_link_service.link_guest_with_telegram_miniapp(
-            guest_user_id=optional_guest.id if optional_guest else None,
-            init_data=credentials.init_data,
-        )
-        auth_session = await auth_service.issue_session_for_user(
-            link_result.user,
-            ip_address=_extract_client_ip(request),
-            user_agent=request.headers.get("user-agent"),
-            reload_user=False,
-        )
+        if current_user is not None and current_user.account_type is AccountType.FULL:
+            identity = provider_auth_service.resolve_telegram_miniapp_identity(credentials.init_data)
+            if current_user.telegram_id != identity.telegram_id:
+                raise GuestAccountRequiredError(
+                    "This endpoint rejects authenticated full-account callers for a different Telegram account; "
+                    "sign out first.",
+                )
+            auth_session = await auth_service.issue_session_for_user(
+                current_user,
+                ip_address=_extract_client_ip(request),
+                user_agent=request.headers.get("user-agent"),
+                reload_user=False,
+            )
+        else:
+            link_result = await account_link_service.link_guest_with_telegram_miniapp(
+                guest_user_id=optional_guest.id if optional_guest else None,
+                init_data=credentials.init_data,
+            )
+            auth_session = await auth_service.issue_session_for_user(
+                link_result.user,
+                ip_address=_extract_client_ip(request),
+                user_agent=request.headers.get("user-agent"),
+                reload_user=False,
+            )
     except AuthServiceError as exc:
         raise to_auth_http_error(exc) from exc
 
+    await _record_telegram_miniapp_open(analytics_service, session, auth_session)
     return _issue_session_response(response, auth_session)
 
 
@@ -488,6 +533,49 @@ def _build_linked_providers_read(linked_providers: LinkedProvidersProjection) ->
         google_linked=linked_providers.google_linked,
         telegram_linked=linked_providers.telegram_linked,
     )
+
+
+async def _record_telegram_miniapp_open(
+    analytics_service: AnalyticsService,
+    session: AsyncSession,
+    auth_session: AuthSession,
+) -> None:
+    telegram_id = auth_session.user.telegram_id
+    properties: dict[str, object] = {"action": "auth_session_issued"}
+    if telegram_id is not None:
+        properties["telegram_user_hash"] = hash_external_identifier("telegram_user", telegram_id)
+    try:
+        await analytics_service.record_interaction_event(
+            {
+                "event_type": AnalyticsEventType.MINIAPP_OPEN,
+                "user_id": auth_session.user.id,
+                "surface": "telegram_miniapp_auth",
+                "properties": properties,
+            }
+        )
+    except Exception:
+        if session.in_transaction():
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "Telegram Mini App auth analytics rollback failed.",
+                    extra={
+                        "event": "telegram_analytics_rollback_failed",
+                        "analytics_event_type": AnalyticsEventType.MINIAPP_OPEN.value,
+                        "surface": "telegram_miniapp_auth",
+                        "user_id": str(auth_session.user.id),
+                    },
+                )
+        logger.exception(
+            "Telegram Mini App auth analytics write failed.",
+            extra={
+                "event": "telegram_analytics_write_failed",
+                "analytics_event_type": AnalyticsEventType.MINIAPP_OPEN.value,
+                "surface": "telegram_miniapp_auth",
+                "user_id": str(auth_session.user.id),
+            },
+        )
 
 
 __all__ = ["router"]

@@ -17,7 +17,6 @@ from typing import TYPE_CHECKING
 
 from memexpert.api.dependencies.pipeline import (
     PIPELINE_OPERATOR_TOKEN_HEADER_NAME,
-    get_content_pipeline_service,
     get_crawler_operations_service,
     get_crawler_runtime,
     get_pipeline_telegram_client,
@@ -29,6 +28,7 @@ from memexpert.crawlers.telegram.client import (
     RawTelegramMessage,
 )
 from memexpert.crawlers.telegram.runtime import TelegramCrawlerRuntime
+from memexpert.ingest.crawler_service import PipelineCrawlerIngestService
 from memexpert.models.content import (
     Meme,
     MemeFile,
@@ -49,14 +49,8 @@ from memexpert.models.enums import (
     SyncTargetStatus,
     TelegramSessionStatus,
 )
-from memexpert.services.content_pipeline import ContentPipelineService
 from memexpert.services.crawler_operations import CrawlerOperationsService
-from tests.integration.test_content_pipeline_service import (
-    FakeMediaProcessor,
-    FakeStorageClient,
-    RecordingPublisher,
-    _make_distinct_upload_media_details,
-)
+from tests.integration.test_ingest_accept_service import FakeStorageClient
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
@@ -74,16 +68,14 @@ def _build_real_operations_service(
     telegram_client: FakeTelegramClient,
     phash_tag: str = "R",
 ) -> CrawlerOperationsService:
-    pipeline_service = ContentPipelineService(
+    _ = phash_tag
+    ingest_service = PipelineCrawlerIngestService.from_settings(
         session,
         storage_client=FakeStorageClient(),
-        publisher=RecordingPublisher(),
-        media_processor=FakeMediaProcessor(
-            inspect_result=_make_distinct_upload_media_details(tag=phash_tag),
-        ),
+        settings=Settings(),
     )
     runtime = TelegramCrawlerRuntime(
-        pipeline_service=pipeline_service,
+        ingest_service=ingest_service,
         telegram_client=telegram_client,
         session=session,
         settings=Settings(),
@@ -108,7 +100,6 @@ def _install_operations_service_override(
     app.dependency_overrides[get_crawler_operations_service] = lambda: service
     app.dependency_overrides[get_crawler_runtime] = lambda: service.runtime
     app.dependency_overrides[get_pipeline_telegram_client] = lambda: service.runtime.telegram_client
-    app.dependency_overrides[get_content_pipeline_service] = lambda: service.runtime.pipeline_service
 
 
 async def _seed_session(
@@ -507,7 +498,7 @@ async def test_replay_channel_post_ingests_pinned_message_without_advancing_chec
     assert response.status_code == 200
     body = response.json()
     assert body["outcome"] == "ingested"
-    assert body["meme_file_id"] is not None
+    assert body["meme_file_id"] is None
     assert body["received_at"] is not None
 
     refreshed = await migrated_db_session.get(SourceChannel, channel.id)

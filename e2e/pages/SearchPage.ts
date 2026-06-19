@@ -1,5 +1,8 @@
-import { expect, type Page } from '@playwright/test';
+import { expect, type Page, type Request } from '@playwright/test';
+import { expectRequestAttribution, expectedAttributionFromHref, type ExpectedMemeAttribution } from '../helpers/attribution';
 import type { SeededMeme } from '../helpers/seed';
+
+type SearchResultTelemetryAction = 'detail-click' | 'impression';
 
 export class SearchPage {
   constructor(private page: Page) {}
@@ -13,6 +16,17 @@ export class SearchPage {
       include_nsfw: String(input.includeNsfw)
     });
     await this.page.goto(`/search?${params.toString()}`);
+  }
+
+  async searchCollections(input: { query: string; collectionTitles: string[] }) {
+    await this.page.goto('/search');
+    const searchForm = this.page.locator('form').filter({ has: this.page.getByLabel('Search text') });
+    await searchForm.getByLabel('Search text').fill(input.query);
+    await this.page.getByLabel('Search scope').selectOption('collections');
+    for (const title of input.collectionTitles) {
+      await this.page.locator('label').filter({ hasText: title }).getByRole('checkbox').check();
+    }
+    await searchForm.getByRole('button', { name: 'Search', exact: true }).click();
   }
 
   async applyFilters(input: { query: string; tag: string; mediaType: string; language: string; includeNsfw: boolean }) {
@@ -59,6 +73,19 @@ export class SearchPage {
     });
   }
 
+  async expectCollectionScopeUrl(input: { query: string; requiredCollectionId: string; minimumCollectionIds: number }) {
+    await expect(this.page).toHaveURL((url) => {
+      const collectionIds = url.searchParams.getAll('collection_ids');
+      return (
+        url.pathname === '/search' &&
+        url.searchParams.get('q') === input.query &&
+        url.searchParams.get('scope') === 'collections' &&
+        collectionIds.includes(input.requiredCollectionId) &&
+        collectionIds.length >= input.minimumCollectionIds
+      );
+    });
+  }
+
   async expectResultVisible(meme: SeededMeme | { title: string }) {
     await expect(this.page.getByRole('link', { name: `Open ${meme.title}` }).first()).toBeVisible();
   }
@@ -69,5 +96,39 @@ export class SearchPage {
 
   async openResult(meme: SeededMeme | { title: string }) {
     await this.page.getByRole('link', { name: `Open ${meme.title}` }).first().click();
+  }
+
+  async scrollResultIntoView(meme: SeededMeme | { title: string }) {
+    await this.page.getByRole('link', { name: `Open ${meme.title}` }).first().scrollIntoViewIfNeeded();
+  }
+
+  waitForResultImpressionPost(meme: SeededMeme): Promise<Request> {
+    return this.waitForResultTelemetryPost(meme, 'impression');
+  }
+
+  waitForResultDetailClickPost(meme: SeededMeme): Promise<Request> {
+    return this.waitForResultTelemetryPost(meme, 'detail-click');
+  }
+
+  async expectResultImpressionAttribution(request: Promise<Request>, expected: ExpectedMemeAttribution) {
+    expectRequestAttribution(await request, expected, 'search result impression');
+  }
+
+  async expectResultDetailClickAttribution(request: Promise<Request>, expected: ExpectedMemeAttribution) {
+    expectRequestAttribution(await request, expected, 'search result detail-click');
+  }
+
+  async attributionForResult(meme: SeededMeme | { title: string }): Promise<ExpectedMemeAttribution> {
+    const link = this.page.getByRole('link', { name: `Open ${meme.title}` }).first();
+    const href = await link.getAttribute('href');
+    if (!href) throw new Error(`Search result for ${meme.title} did not include a detail href.`);
+    return expectedAttributionFromHref(href, this.page.url());
+  }
+
+  private waitForResultTelemetryPost(meme: SeededMeme, action: SearchResultTelemetryAction): Promise<Request> {
+    return this.page.waitForRequest((request) => {
+      const url = new URL(request.url());
+      return request.method() === 'POST' && url.pathname === `/api/v1/memes/${meme.meme_id}/${action}`;
+    });
   }
 }

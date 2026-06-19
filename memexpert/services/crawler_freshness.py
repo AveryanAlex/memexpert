@@ -4,7 +4,7 @@
 The helper computes a :class:`CrawlerFreshnessSnapshot` from real
 ``meme_sources`` + ``pipeline_stage_journal`` rows. It is kept in its
 own module (instead of adding to
-``memexpert.services.content_pipeline_reporting``) because the reporting
+``memexpert.pipeline.reporting``) because the reporting
 file already carries the S02/S03 inspect-detail + run-summary helpers
 and the freshness math is conceptually separate from the sync-truth
 reporting path.
@@ -44,13 +44,13 @@ from memexpert.models.enums import (
     SyncTargetKind,
     SyncTargetStatus,
 )
+from memexpert.pipeline.constants import ACTIVE_STAGE_STATUSES, STAGE_ORDER
 from memexpert.schemas.crawler import (
     MAX_FRESHNESS_SAMPLE_ITEMS,
     CrawlerFreshnessChannelBreakdown,
     CrawlerFreshnessSampleItem,
     CrawlerFreshnessSnapshot,
 )
-from memexpert.services.content_pipeline_constants import ACTIVE_STAGE_STATUSES, STAGE_ORDER
 
 if TYPE_CHECKING:
     import uuid
@@ -537,7 +537,7 @@ def _percentile(sorted_values: Sequence[float], fraction: float) -> float:
     """Linear-interpolation percentile matching numpy's ``linear`` method.
 
     Duplicated (rather than imported) from
-    :mod:`memexpert.services.content_pipeline_reporting` so the crawler
+    :mod:`memexpert.pipeline.reporting` so the crawler
     freshness surface does not reach into another module's private
     helper. The math is tiny and intentionally held in sync by the
     shared doc wording above.

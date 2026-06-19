@@ -9,27 +9,40 @@ import {
 } from './view-model';
 
 describe('collection management view model', () => {
-  it('maps member and invite rows without unsupported mutations', () => {
+  it('maps member and invite rows with terminal invite state', () => {
     const detail = collectionDetail();
 
     expect(collectionMemberRows(detail).map((member) => [member.label, member.role, member.isOwner])).toEqual([
       ['owner-us...0001', 'owner', true],
       ['editor-u...0002', 'editor', false]
     ]);
-    expect(collectionInviteRows(detail.collection.invites).map((invite) => [invite.label, invite.role, invite.usage])).toEqual([
-      ['Launch team', 'editor', '0/2 used']
+    expect(collectionInviteRows(detail.collection.invites).map((invite) => [invite.label, invite.role, invite.statusLabel, invite.usage, invite.isTerminal])).toEqual([
+      ['Launch team', 'editor', 'pending', '0/2 used', false],
+      ['Used invite', 'viewer', 'accepted', '1/1 used', true]
     ]);
   });
 
   it('explains collaboration boundaries based on role and account state', () => {
     const detail = collectionDetail();
 
-    expect(collectionManagementNotice(detail, sessionPayload('full'))).toContain('Create direct invite links');
+    expect(collectionManagementNotice(detail, sessionPayload('full'))).toContain('Owners can update collection details');
     expect(collectionAccessSummary(detail)).toContain('private custom collection');
+
+    const editor = collectionDetail({
+      viewer_role: 'editor',
+      capabilities: { ...detail.capabilities, can_manage_members: false, can_rename: false, can_delete: false }
+    });
+    expect(collectionManagementNotice(editor, sessionPayload('full'))).toContain('Editors can create and revoke');
 
     const viewOnly = collectionDetail({
       viewer_role: 'viewer',
-      capabilities: { ...detail.capabilities, can_add_memes: false, can_create_invites: false }
+      capabilities: {
+        ...detail.capabilities,
+        can_add_memes: false,
+        can_create_invites: false,
+        can_revoke_invites: false,
+        can_manage_members: false
+      }
     });
     expect(collectionManagementNotice(viewOnly, sessionPayload('guest'))).toContain('Connect Telegram');
   });
@@ -59,12 +72,29 @@ function collectionDetail(overrides: Partial<WebCollectionDetailRead> = {}): Web
           status: 'pending',
           max_uses: 2,
           use_count: 0,
-          expires_at: '2026-01-08T00:00:00Z',
+          expires_at: '2099-01-08T00:00:00Z',
           last_used_at: null,
           revoked_at: null,
           recipient_email: null,
           created_at: '2026-01-01T00:00:00Z',
           updated_at: '2026-01-01T00:00:00Z'
+        },
+        {
+          id: 'accepted-invite-id',
+          collection_id: 'collection-id',
+          created_by_user_id: 'owner-user-0001',
+          role: 'viewer',
+          channel: 'direct_link',
+          label: 'Used invite',
+          status: 'accepted',
+          max_uses: 1,
+          use_count: 1,
+          expires_at: null,
+          last_used_at: '2026-01-02T00:00:00Z',
+          revoked_at: null,
+          recipient_email: null,
+          created_at: '2026-01-01T00:00:00Z',
+          updated_at: '2026-01-02T00:00:00Z'
         }
       ],
       created_at: '2026-01-01T00:00:00Z',
@@ -78,6 +108,8 @@ function collectionDetail(overrides: Partial<WebCollectionDetailRead> = {}): Web
       can_rename: true,
       can_delete: true,
       can_create_invites: true,
+      can_revoke_invites: true,
+      can_manage_members: true,
       can_set_active_save: true
     },
     active_save_collection_id: 'collection-id',

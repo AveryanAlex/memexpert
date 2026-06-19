@@ -13,21 +13,25 @@ Plugin interface per platform. All crawlers normalize output to a common `RawMem
 
 The content model has three separate owners of truth:
 
+- `PipelineIngestRequest` is the pre-content raw-ingest source of truth. API-safe entrypoints create this row after stdlib SHA256/idempotency checks and temporary original-object upload. Heavy workers later inspect media and either materialize `Meme`/`MemeFile` rows or mark a terminal failure.
 - `Meme` is the conceptual meme. It owns public/private moderation state, popularity, collections, SEO page linkage, and the canonical `primary_file_id` pointer.
 - `MemeFile` is one physical media file. `sha256_hex` is the only exact same-bytes identity and is unique. File rows own physical metadata, S3 keys, pHash, ingest origin, and optional match lineage.
 - `MemeSource` is one provenance observation. Source rows preserve where a file or duplicate was observed and carry the attach reason plus any matched file id.
 
 ### Ingest-Time Identity
 
-SHA256 is computed immediately after bytes are available, before media inspection, blocked pHash checks, S3 writes, or pHash duplicate lookup.
+SHA256 is computed immediately after bytes are available, before media inspection, blocked pHash checks, canonical S3 writes, or pHash duplicate lookup.
 
 | Condition | Result |
 |-----------|--------|
-| SHA256 matches an existing non-blocked file | Do not inspect media, write S3, create a `MemeFile`, or dispatch the pipeline. Attach a `MemeSource` to the existing file with `attach_reason=sha256_exact_existing_file`. |
-| SHA256 matches an existing blocked/quarantined file | Do not inspect media, write S3, create a `MemeFile`, or dispatch the pipeline. Attach a `MemeSource` to the existing blocked file with `attach_reason=blocked_sha256_existing_file`. |
-| SHA miss and active blocked pHash matches | Create a new blocked `MemeFile` with `ingest_origin=blocked_perceptual_hash`, `blocked_perceptual_hash_id`, and failed ingest journal state. Preserve source attribution with `attach_reason=blocked_perceptual_hash_new_file`. Do not store the original or dispatch normal pipeline work. |
-| SHA miss and exact pHash matches an existing non-blocked file | Treat this as the same conceptual meme but a new physical file. Create a new `MemeFile` under the matched file's `Meme`, set `ingest_origin=phash_exact_existing_meme` and `matched_meme_file_id`, store the original, attach source with `attach_reason=phash_exact_new_file`, and dispatch the normal pipeline. Do not change `Meme.primary_file_id` in this branch. |
-| SHA miss and no pHash match | Create a new `Meme` plus primary `MemeFile` with `ingest_origin=new_meme`, attach source with `attach_reason=new_file`, store the original, and dispatch the normal pipeline. |
+| Source identity `(platform, source_id, post_id)` already has a raw ingest request | Return the existing `PipelineIngestRequest`; do not upload or enqueue again. |
+| SHA256 matches an existing non-blocked file | Create/update the ingest request as `resolved_sha_duplicate`, do not inspect media or enqueue media-inspect. Attach a `MemeSource` to the existing file with `attach_reason=sha256_exact_existing_file`. |
+| SHA256 matches an existing blocked/quarantined file | Create/update the ingest request as `resolved_sha_duplicate`, do not inspect media or enqueue media-inspect. Attach a `MemeSource` to the existing blocked file with `attach_reason=blocked_sha256_existing_file`. |
+| SHA miss | Store bytes under the temporary-original prefix, create a `PipelineIngestRequest` with `status=media_inspect_pending`, and write a `pipeline_outbox_events` row in the same DB transaction for a media-inspect worker event carrying `ingest_request_id`. |
+| Worker cannot inspect/read media | Mark the ingest request `failed_invalid_media`, record failure code/detail, create no `Meme`/`MemeFile`, and retain the temporary object for operator retention/debugging. No downstream event is written. |
+| Worker finds active blocked pHash | Promote the original to the canonical key, create hidden failed `Meme`/`MemeFile`/`MemeSource` audit rows, mark the ingest request `failed_blocked_phash`, clean the temporary object, and write no normal transcode event. |
+| Worker finds exact pHash match | Treat this as the same conceptual meme but a new physical file. Promote the original to the canonical key, create a new `MemeFile` under the matched file's `Meme`, set `ingest_origin=phash_exact_existing_meme` and `matched_meme_file_id`, attach source with `attach_reason=phash_exact_new_file`, mark the request `materialized`, and write a downstream transcode outbox event transactionally. |
+| Worker finds no pHash match | Promote the original to the canonical key, create a new `Meme` plus primary `MemeFile` with `ingest_origin=new_meme`, attach source with `attach_reason=new_file`, mark the request `materialized`, and write a downstream transcode outbox event transactionally. |
 
 Crawler duplicate-post idempotency is separate from media identity: an already-seen `(platform, source_id, post_id)` returns the existing source row before service-owned media processing. Telegram `file_unique_id` is not a content identity and there is no separate unique media identity table.
 
@@ -46,7 +50,16 @@ Event-driven pipeline using **FastStream + RabbitMQ**. Each processing stage is 
 ### Event Topology
 
 ```
-raw_meme ──→ [Ingest & Identity Checks] ──→ meme_created
+raw_meme ──→ [API Accept: ingest_request + outbox] ──→ [Outbox Publisher] ──→ media_inspect_requested
+                                                                   │
+                                                                   ▼
+                                                          [Media Inspect/Materialize]
+                                                                   │
+                                                                   ▼
+                                                          [Outbox Publisher]
+                                                                   │
+                                                                   ▼
+                                                              meme_created
                                              │
                                              ▼
                                        [Transcode] ──→ meme_transcoded
@@ -75,6 +88,7 @@ raw_meme ──→ [Ingest & Identity Checks] ──→ meme_created
 
 | Queue | Resource Profile | Consumer |
 |-------|-----------------|----------|
+| `pipeline.media_inspect` | CPU-light to CPU-bound (Pillow/ImageHash/ffprobe) | Raw temp-object inspection, pHash duplicate/blocked checks, content materialization |
 | `q.transcode` | CPU-bound (FFmpeg) | GIF→MP4, video transcode, blur hash, EXIF strip |
 | `q.ocr` | CPU/GPU-bound (PaddleOCR) | Text extraction, language detection |
 | `q.embed` | API-bound (Voyage AI) | Image embedding computation |
@@ -105,7 +119,9 @@ class MemeTranscoded(BaseModel):
 
 ### Retry & Dead Letter
 
-RabbitMQ dead letter exchanges (DLX) handle failures. Messages exceeding max retries (5, with exponential backoff) are routed to a dead letter queue (`dlq.*`) for inspection and manual replay. No message is silently lost.
+RabbitMQ dead letter exchanges (DLX) handle worker-consume failures. Messages exceeding max retries (5, with exponential backoff) are routed to a dead letter queue (`dlq.*`) for inspection and manual replay. No message is silently lost.
+
+Pipeline entrypoints and the media materializer use a transactional outbox instead of commit-then-publish. `pipeline_outbox_events` rows are written in the same DB transaction as ingest/materialization state, then the `pipeline-outbox-publisher` job in `memexpert-scheduler` starts or reuses the RabbitMQ pipeline broker, recovers stale `publishing` rows, claims due `pending`/`failed` rows with row locks, publishes by stored `routing_key` and JSON payload, and marks rows `published` or `failed` with retry metadata. This generic path handles both raw-upload `media_inspect_requested` events and post-materialization transcode dispatches.
 
 ### Periodic Tasks
 
@@ -114,10 +130,11 @@ Tasks that run on a schedule (not event-driven) are managed by APScheduler in a 
 - Public trend materialized-view refresh (e.g. every 5 min or adaptive)
 - Popularity snapshot computation (initially every 6h; tune after observing traffic)
 - Search-index sync (batched, not per-like)
+- Transactional pipeline outbox publishing for ingest/materialization events
 - Meme of the Day selection/cache refresh
 - Scheduled SEO generation batches prioritized by popularity/backlog
 
-The current implementation registers exactly these five jobs. Public trend materialized-view refresh and popularity snapshot computation contain real business logic; Meme of the Day, search-index sync, and SEO backlog batches are intentionally lightweight placeholders until their production behavior is implemented.
+The current implementation registers these scheduler jobs with independent enable and interval settings. Public trend materialized-view refresh, popularity snapshot computation, search-index sync, SEO backlog batches, and pipeline outbox publishing contain production behavior; Meme of the Day remains a lightweight placeholder until its product behavior is implemented.
 
 Guest TTL/deletion jobs are intentionally not part of the current product direction.
 
@@ -131,12 +148,15 @@ Voyage AI `voyage-multimodal-3.5` for both image and text embeddings. 1024 dimen
 
 ## Media Storage
 
-S3 (Cloudflare R2 or Backblaze B2), keyed by MemeFile ID:
+S3 (Cloudflare R2 or Backblaze B2). API-safe acceptance first writes raw bytes under the temporary-original prefix, keyed by `PipelineIngestRequest.id`. Worker materialization later copies valid originals into canonical keys keyed by `MemeFile.id` and then deletes the temp object after successful normal or blocked materialization:
 
 ```
+/temp-originals/{ingest_request_id}/original.{ext}
 /files/{meme_file_id}/original.{ext}
 /files/{meme_file_id}/web_video.mp4   (H.264, GIF/video only)
 ```
+
+Invalid/unreadable media is the exception: the temporary object is intentionally retained when the request is marked `failed_invalid_media` so operators have a bounded retention/debugging target. Retention/lifecycle policy should expire `pipeline/temp-originals/*` objects after the ops-approved window, not immediately on invalid media.
 
 Only the original and transcoded video are stored. All image variants (resize, format conversion, thumbnails) are generated on-the-fly by **imgproxy** from the original, CDN-cached by URL with immutable headers. Video transcoding (GIF→MP4, re-encode) is still done at ingest time since it's expensive to do on-the-fly.
 

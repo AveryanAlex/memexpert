@@ -1,10 +1,7 @@
-"""Stage ordering, routing maps, and normalized reason strings for the ingest service.
+"""Stage ordering, routing maps, and normalized reason strings for the pipeline.
 
-The content-pipeline service and its sibling modules (reporting, smoke,
-runtime callbacks) all share the same stage graph and the same set of
-normalized reason strings. Keeping these in a dedicated constants module
-lets every sibling import them without re-declaring and keeps the main
-service module free of top-of-file routing-table noise.
+Focused pipeline services, reporting helpers, smoke proof, and runtime
+callbacks all share the same stage graph and normalized reason strings.
 """
 
 from __future__ import annotations

@@ -34,7 +34,6 @@ _EXPORTS: dict[str, str] = {
     "CollectionServiceError": "memexpert.services.errors",
     "CollectionVerificationRequiredError": "memexpert.services.errors",
     "CollectionWriteAccessError": "memexpert.services.errors",
-    "ContentPipelineService": "memexpert.services.content_pipeline",
     "CrawlerChannelNotFoundError": "memexpert.services.errors",
     "CrawlerChannelNotTrackedError": "memexpert.services.errors",
     "CrawlerInvalidSessionError": "memexpert.services.errors",

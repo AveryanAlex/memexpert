@@ -2,12 +2,21 @@
   import { goto } from '$app/navigation';
   import { navigating } from '$app/state';
   import { ApiError, updateUserPreferences } from '$lib/api/client';
-  import type { ContentKind, ContentLanguage } from '$lib/api/types';
+  import type { ContentKind, ContentLanguage, MemeSearchScope } from '$lib/api/types';
   import { bulkGuidanceFromSessionAndCollections, collectionListBulkOptions } from '$lib/features/memes/bulk-view-model';
   import InfiniteMemeFeed from '$lib/features/memes/InfiniteMemeFeed.svelte';
   import { ActionLink, Badge, Button, Card, FormRow, Input, LoadingState, Notice, PageHeader, Select } from '$lib/ui';
   import * as Dialog from '$lib/ui/dialog';
-  import { buildSearchHref, LANGUAGE_OPTIONS, MEDIA_TYPE_OPTIONS, normalizeTags, QUICK_SEARCH_TAGS, type SearchRouteState } from '$lib/searchParams';
+  import {
+    buildSearchHref,
+    LANGUAGE_OPTIONS,
+    MEDIA_TYPE_OPTIONS,
+    normalizeCollectionIds,
+    normalizeTags,
+    QUICK_SEARCH_TAGS,
+    SEARCH_SCOPE_OPTIONS,
+    type SearchRouteState
+  } from '$lib/searchParams';
   import type { PageData } from './$types';
 
   let { data }: { data: PageData } = $props();
@@ -20,6 +29,13 @@
 
   const bulkOptions = $derived(collectionListBulkOptions(data.collections));
   const bulkGuidance = $derived(bulkGuidanceFromSessionAndCollections(data.session ?? null, bulkOptions));
+  const searchCollectionOptions = $derived(data.collections?.collections.filter((item) => item.capabilities.can_view) ?? []);
+  const selectedCollectionSet = $derived(new Set(data.filters.collectionIds));
+  const selectedCollectionTitles = $derived(
+    searchCollectionOptions
+      .filter((item) => selectedCollectionSet.has(item.collection.id))
+      .map((item) => item.collection.title)
+  );
   const loadingSearch = $derived(navigating.to?.url.pathname === '/search');
   const shouldConfirmNsfw = $derived(data.session?.user.nsfw_enabled === false);
   const nsfwRequestedButDisabled = $derived(data.filters.includeNsfw && data.session?.user.nsfw_enabled !== true);
@@ -27,7 +43,9 @@
     data.filters.tags.length +
       (data.filters.includeNsfw ? 1 : 0) +
       (data.filters.mediaType ? 1 : 0) +
-      (data.filters.language ? 1 : 0)
+      (data.filters.language ? 1 : 0) +
+      (data.filters.scope !== 'public' ? 1 : 0) +
+      (data.filters.scope === 'collections' ? data.filters.collectionIds.length : 0)
   );
 
   function tagHref(tag: string): string {
@@ -43,12 +61,14 @@
   function handleSearchSubmit(event: SubmitEvent) {
     const form = event.currentTarget as HTMLFormElement;
     const nextFilters = searchStateFromForm(form);
+    event.preventDefault();
+    const href = buildSearchHref(nextFilters, { offset: 0 });
     if (!nextFilters.includeNsfw || !shouldConfirmNsfw) {
+      void goto(href);
       return;
     }
 
-    event.preventDefault();
-    pendingSearchHref = buildSearchHref(nextFilters, { offset: 0 });
+    pendingSearchHref = href;
     nsfwGateMessage = null;
     nsfwGateOpen = true;
   }
@@ -87,6 +107,8 @@
     const formData = new FormData(form);
     const rawMediaType = String(formData.get('media_type') ?? '');
     const rawLanguage = String(formData.get('language') ?? '');
+    const rawScope = String(formData.get('scope') ?? 'public');
+    const scope = SEARCH_SCOPE_OPTIONS.some((option) => option.value === rawScope) ? (rawScope as MemeSearchScope) : 'public';
 
     return {
       query: String(formData.get('q') ?? '').trim(),
@@ -94,8 +116,14 @@
       includeNsfw: String(formData.get('include_nsfw') ?? 'false') === 'true',
       mediaType: MEDIA_TYPE_OPTIONS.some((option) => option.value === rawMediaType) ? (rawMediaType as ContentKind) : null,
       language: LANGUAGE_OPTIONS.some((option) => option.value === rawLanguage) ? (rawLanguage as ContentLanguage) : null,
+      scope,
+      collectionIds: scope === 'collections' ? normalizeCollectionIds(formData.getAll('collection_ids').map(String)) : [],
       offset: 0
     };
+  }
+
+  function scopeSummary(scope: MemeSearchScope): string {
+    return SEARCH_SCOPE_OPTIONS.find((option) => option.value === scope)?.label ?? scope;
   }
 </script>
 
@@ -106,7 +134,7 @@
   {/if}
 </svelte:head>
 
-<PageHeader title="Search MemeXpert." description="Find a meme by phrase, tag, format, language, and safe-content preferences. Every filter lives in the URL so results are shareable." badge="Public catalog" />
+<PageHeader title="Search MemeXpert." description="Find a meme by phrase, tag, format, language, collection access, and safe-content preferences. Every filter lives in the URL so results are shareable." badge="Catalog search" />
 
 <Card class="mb-6 grid gap-5" aria-labelledby="search-filters-title">
   <div class="flex flex-wrap items-start justify-between gap-3">
@@ -148,6 +176,37 @@
     <FormRow label="Tags / categories" class="md:col-span-4">
       <Input name="tags" placeholder="reaction, wholesome, work" value={data.filters.tags.join(', ')} />
     </FormRow>
+    <FormRow label="Search scope" class="md:col-span-2">
+      <Select name="scope" value={data.filters.scope}>
+        {#each SEARCH_SCOPE_OPTIONS as option}
+          <option value={option.value}>{option.label}</option>
+        {/each}
+      </Select>
+    </FormRow>
+    <div class="grid gap-2 md:col-span-3">
+      <p class="m-0 text-sm font-extrabold text-chiptext">Specific collections</p>
+      {#if searchCollectionOptions.length > 0}
+        <div class="flex flex-wrap gap-2" aria-label="Collection filters">
+          {#each searchCollectionOptions as item (item.collection.id)}
+            <label class="inline-flex items-center gap-2 rounded-full border border-line bg-paper px-4 py-2 text-sm font-extrabold text-ink">
+              <input
+                type="checkbox"
+                name="collection_ids"
+                value={item.collection.id}
+                checked={selectedCollectionSet.has(item.collection.id)}
+              />
+              {item.collection.title}
+              <span class="text-muted">{item.viewer_role}</span>
+            </label>
+          {/each}
+        </div>
+        <p class="m-0 text-sm text-muted">Collection selections apply when Search scope is set to Specific collections.</p>
+      {:else if data.session}
+        <p class="m-0 text-sm text-muted">Readable collections will appear here after your collection list loads.</p>
+      {:else}
+        <p class="m-0 text-sm text-muted">Sign in or keep browsing public memes. Collection filters require an account session.</p>
+      {/if}
+    </div>
     <div class="flex items-end">
       <Button class="w-full" type="submit">Search</Button>
     </div>
@@ -195,7 +254,9 @@
     tags: data.filters.tags,
     includeNsfw: data.filters.includeNsfw,
     mediaType: data.filters.mediaType,
-    language: data.filters.language
+    language: data.filters.language,
+    scope: data.filters.scope,
+    collectionIds: data.filters.collectionIds
   }}
   initialError={data.errorMessage}
   label="Search results"
@@ -206,7 +267,7 @@
     {#if data.filters.query}
       <p class="m-0 text-muted">Results for “{data.filters.query}”</p>
     {:else}
-      <p class="m-0 text-muted">Browsing public memes</p>
+      <p class="m-0 text-muted">Browsing {scopeSummary(data.filters.scope).toLowerCase()}</p>
     {/if}
     {#each data.filters.tags as tag}
       <a class="no-underline" href={removeTagHref(tag)} aria-label={`Remove ${tag} filter`}><Badge>#{tag} x</Badge></a>
@@ -214,6 +275,12 @@
     {#if data.filters.mediaType}<Badge>{data.filters.mediaType}</Badge>{/if}
     {#if data.filters.language}<Badge>{data.filters.language}</Badge>{/if}
     {#if data.filters.includeNsfw}<Badge>NSFW included</Badge>{/if}
+    {#if data.filters.scope !== 'public'}<Badge>{scopeSummary(data.filters.scope)}</Badge>{/if}
+    {#if data.filters.scope === 'collections'}
+      {#each selectedCollectionTitles as title}
+        <Badge>{title}</Badge>
+      {/each}
+    {/if}
   {/snippet}
   {#snippet emptyAction()}
     {#if activeFilterCount > 0 || data.filters.query}

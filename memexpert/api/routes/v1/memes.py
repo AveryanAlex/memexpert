@@ -3,11 +3,14 @@
 
 from __future__ import annotations
 
+import json
+import logging
+import math
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Path, Query, status
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Body, Depends, HTTPException, Path, Query, status
+from pydantic import BaseModel, ConfigDict, Field
 
 from memexpert.api.dependencies import (
     AnalyticsServiceDep,
@@ -43,11 +46,13 @@ from memexpert.services import (
     InvalidPinnedMemeOrderError,
     PinLimitExceededError,
 )
+from memexpert.services.analytics import AnalyticsService, InteractionEventRefs, InteractionEventWrite
 from memexpert.services.meme_search import MemeNotFoundError, MemeSearchFilters, MemeSearchScope
 from memexpert.services.public_trends import PublicTrendRanking, PublicTrendTimelineGranularity
 from memexpert.services.report import MemeReportTargetNotVisibleError
 
 router = APIRouter(prefix="/memes", tags=["memes"])
+logger = logging.getLogger(__name__)
 
 SEARCH_SCOPE_DESCRIPTION = (
     "Optional search visibility scope. If omitted, requests use public results for HTTP public API "
@@ -70,6 +75,153 @@ class PinReorderRequest(BaseModel):
     """Request body containing the complete desired pin order."""
 
     meme_ids: list[uuid.UUID] = Field(max_length=20)
+
+
+class MemeInteractionAttributionFiltersRequest(BaseModel):
+    """Public-safe discovery filters forwarded into interaction analytics properties."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    language: ContentLanguage | None = None
+    media_type: ContentKind | None = None
+    include_nsfw: bool | None = None
+    tags: list[str] = Field(default_factory=list)
+    scope: str | None = Field(default=None, max_length=120)
+    collection_ids: list[str] = Field(default_factory=list)
+
+
+class MemeInteractionAttributionRequest(BaseModel):
+    """Strict event attribution fields accepted from detail links and action bodies."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: str | None = Field(default=None, max_length=255)
+    impression_id: str | None = Field(default=None, max_length=255)
+    surface: str | None = Field(default=None, max_length=120)
+    source_algorithm: str | None = Field(default=None, max_length=120)
+    rank: int | None = Field(default=None, ge=0)
+    query: str | None = Field(default=None, max_length=500)
+    filters: MemeInteractionAttributionFiltersRequest | None = None
+    collection_scope: str | None = Field(default=None, max_length=120)
+    collection_ids: list[str] = Field(default_factory=list)
+    source_meme_id: uuid.UUID | None = None
+    algorithm_version: str | None = Field(default=None, max_length=120)
+    score: float | None = None
+    score_components: dict[str, float] = Field(default_factory=dict)
+    reason: str | None = Field(default=None, max_length=255)
+
+
+class MemeActionAttributionRequest(BaseModel):
+    """Optional action body wrapper for discovery attribution."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    attribution: MemeInteractionAttributionRequest | None = None
+
+
+class MemeReportCreateWithAttributionRequest(MemeReportCreateRequest):
+    """Report payload plus optional discovery attribution for telemetry."""
+
+    attribution: MemeInteractionAttributionRequest | None = None
+
+
+class MemeInteractionRecordedRead(BaseModel):
+    """Small acknowledgement for action-only telemetry endpoints."""
+
+    ok: bool = True
+
+
+def _query_attribution(
+    request_id: Annotated[str | None, Query(alias="attribution_request_id", max_length=255)] = None,
+    impression_id: Annotated[str | None, Query(alias="attribution_impression_id", max_length=255)] = None,
+    surface: Annotated[str | None, Query(alias="attribution_surface", max_length=120)] = None,
+    source_algorithm: Annotated[str | None, Query(alias="attribution_source_algorithm", max_length=120)] = None,
+    rank: Annotated[int | None, Query(alias="attribution_rank", ge=0)] = None,
+    query: Annotated[str | None, Query(alias="attribution_query", max_length=500)] = None,
+    filters: Annotated[str | None, Query(alias="attribution_filters", max_length=4096)] = None,
+    collection_scope: Annotated[str | None, Query(alias="attribution_collection_scope", max_length=120)] = None,
+    collection_ids: Annotated[list[str] | None, Query(alias="attribution_collection_id")] = None,
+    score: Annotated[float | None, Query(alias="attribution_score")] = None,
+    score_components: Annotated[str | None, Query(alias="attribution_score_components", max_length=4096)] = None,
+    source_meme_id: Annotated[uuid.UUID | None, Query(alias="attribution_source_meme_id")] = None,
+    algorithm_version: Annotated[str | None, Query(alias="attribution_algorithm_version", max_length=120)] = None,
+    reason: Annotated[str | None, Query(alias="attribution_reason", max_length=255)] = None,
+) -> MemeInteractionAttributionRequest | None:
+    """Parse public-safe detail-link attribution query params."""
+
+    if not any(
+        value is not None
+        for value in (
+            request_id,
+            impression_id,
+            surface,
+            source_algorithm,
+            rank,
+            query,
+            filters,
+            collection_scope,
+            *(collection_ids or ()),
+            score,
+            score_components,
+            source_meme_id,
+            algorithm_version,
+            reason,
+        )
+    ):
+        return None
+    return MemeInteractionAttributionRequest(
+        request_id=request_id,
+        impression_id=impression_id,
+        surface=surface,
+        source_algorithm=source_algorithm,
+        rank=rank,
+        query=query,
+        filters=_parse_query_attribution_filters(filters),
+        collection_scope=collection_scope,
+        collection_ids=collection_ids or [],
+        score=score,
+        score_components=_parse_query_score_components(score_components),
+        source_meme_id=source_meme_id,
+        algorithm_version=algorithm_version,
+        reason=reason,
+    )
+
+
+MemeAttributionQueryDep = Annotated[MemeInteractionAttributionRequest | None, Depends(_query_attribution)]
+
+
+def _parse_query_attribution_filters(value: str | None) -> MemeInteractionAttributionFiltersRequest | None:
+    if not value:
+        return None
+    try:
+        decoded = json.loads(value)
+        return MemeInteractionAttributionFiltersRequest.model_validate(decoded)
+    except ValueError as exc:
+        raise _invalid_attribution_http_error("attribution_filters must be a valid attribution filter object.") from exc
+
+
+def _parse_query_score_components(value: str | None) -> dict[str, float]:
+    if not value:
+        return {}
+    try:
+        decoded = json.loads(value)
+    except ValueError as exc:
+        raise _invalid_attribution_http_error("attribution_score_components must be a valid JSON object.") from exc
+    if not isinstance(decoded, dict):
+        raise _invalid_attribution_http_error("attribution_score_components must be a valid JSON object.")
+    components: dict[str, float] = {}
+    for key, component_value in decoded.items():
+        if not isinstance(key, str) or not isinstance(component_value, int | float):
+            raise _invalid_attribution_http_error("attribution_score_components values must be numeric.")
+        converted = float(component_value)
+        if not math.isfinite(converted):
+            raise _invalid_attribution_http_error("attribution_score_components values must be finite.")
+        components[key] = converted
+    return components
+
+
+def _invalid_attribution_http_error(detail: str) -> HTTPException:
+    return HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=detail)
 
 
 @router.get("/search", response_model=PublicMemeSearchPageRead, summary="Search memes")
@@ -321,17 +473,30 @@ async def get_meme_library(
 @router.post("/{meme_id}/favorite", response_model=CollectionMemeRead, summary="Favorite a meme")
 async def favorite_meme(
     collection_service: CollectionServiceDep,
+    analytics_service: AnalyticsServiceDep,
     current_user: AutoGuestUserDep,
     meme_id: Annotated[uuid.UUID, Path()],
+    payload: Annotated[MemeActionAttributionRequest | None, Body()] = None,
 ) -> CollectionMemeRead:
     """Save a meme to Favorites; the first save increments the meme like count."""
 
     try:
-        return await collection_service.favorite_meme(user_id=current_user.id, meme_id=meme_id)
+        favorite = await collection_service.favorite_meme(user_id=current_user.id, meme_id=meme_id)
     except MemeNotFoundError as exc:
         raise _meme_not_found_http_error() from exc
     except CollectionServiceError as exc:
         raise _collection_http_error(exc) from exc
+    await _record_meme_interaction(
+        analytics_service,
+        AnalyticsEventType.MEME_LIKE,
+        meme_id=meme_id,
+        current_user=current_user,
+        attribution=_payload_attribution(payload),
+        default_surface="public_api_meme_action",
+        collection_id=favorite.collection_id,
+        properties={"action": "favorite"},
+    )
+    return favorite
 
 
 @router.delete("/{meme_id}/favorite", response_model=dict[str, bool], summary="Unfavorite a meme")
@@ -352,17 +517,30 @@ async def unfavorite_meme(
 @router.post("/{meme_id}/save", response_model=CollectionMemeRead, summary="Save a meme")
 async def save_meme_to_active_collection(
     collection_service: CollectionServiceDep,
+    analytics_service: AnalyticsServiceDep,
     current_user: AutoGuestUserDep,
     meme_id: Annotated[uuid.UUID, Path()],
+    payload: Annotated[MemeActionAttributionRequest | None, Body()] = None,
 ) -> CollectionMemeRead:
     """Save a meme into the caller's active collection, defaulting guests to Favorites."""
 
     try:
-        return await collection_service.save_meme_to_active_collection(user_id=current_user.id, meme_id=meme_id)
+        saved_meme = await collection_service.save_meme_to_active_collection(user_id=current_user.id, meme_id=meme_id)
     except MemeNotFoundError as exc:
         raise _meme_not_found_http_error() from exc
     except CollectionServiceError as exc:
         raise _collection_http_error(exc) from exc
+    await _record_meme_interaction(
+        analytics_service,
+        AnalyticsEventType.MEME_SAVE,
+        meme_id=meme_id,
+        current_user=current_user,
+        attribution=_payload_attribution(payload),
+        default_surface="public_api_meme_action",
+        collection_id=saved_meme.collection_id,
+        properties={"action": "save"},
+    )
+    return saved_meme
 
 
 @router.delete("/{meme_id}/save", response_model=dict[str, bool], summary="Remove a saved meme")
@@ -423,17 +601,29 @@ async def list_pins(
 @router.post("/{meme_id}/pin", response_model=PinnedMemeRead, summary="Pin a meme")
 async def pin_meme(
     collection_service: CollectionServiceDep,
+    analytics_service: AnalyticsServiceDep,
     current_user: FullAccountUserDep,
     meme_id: Annotated[uuid.UUID, Path()],
+    payload: Annotated[MemeActionAttributionRequest | None, Body()] = None,
 ) -> PinnedMemeRead:
     """Append a meme to the caller's full-account pins."""
 
     try:
-        return await collection_service.pin_meme(user_id=current_user.id, meme_id=meme_id)
+        pinned_meme = await collection_service.pin_meme(user_id=current_user.id, meme_id=meme_id)
     except MemeNotFoundError as exc:
         raise _meme_not_found_http_error() from exc
     except CollectionServiceError as exc:
         raise _collection_http_error(exc) from exc
+    await _record_meme_interaction(
+        analytics_service,
+        AnalyticsEventType.MEME_PIN,
+        meme_id=meme_id,
+        current_user=current_user,
+        attribution=_payload_attribution(payload),
+        default_surface="public_api_meme_action",
+        properties={"action": "pin", "position": pinned_meme.position},
+    )
+    return pinned_meme
 
 
 @router.delete("/{meme_id}/pin", response_model=dict[str, bool], summary="Unpin a meme")
@@ -468,14 +658,15 @@ async def reorder_pins(
 @router.post("/{meme_id}/report", response_model=MemeReportRead, summary="Report a meme")
 async def report_meme(
     report_service: MemeReportServiceDep,
+    analytics_service: AnalyticsServiceDep,
     current_user: FullAccountUserDep,
     meme_id: Annotated[uuid.UUID, Path()],
-    payload: MemeReportCreateRequest,
+    payload: MemeReportCreateWithAttributionRequest,
 ) -> MemeReportRead:
     """Create or reuse the caller's open moderation report for a visible meme."""
 
     try:
-        return await report_service.report_meme(
+        report = await report_service.report_meme(
             meme_id,
             reporter_user_id=current_user.id,
             reporter_nsfw_enabled=current_user.nsfw_enabled,
@@ -483,13 +674,150 @@ async def report_meme(
         )
     except MemeReportTargetNotVisibleError as exc:
         raise _meme_not_found_http_error() from exc
+    await _record_meme_interaction(
+        analytics_service,
+        AnalyticsEventType.MEME_REPORT,
+        meme_id=meme_id,
+        current_user=current_user,
+        attribution=payload.attribution,
+        default_surface="public_api_meme_action",
+        report_id=report.id,
+        properties={"action": "report", "reason": report.reason.value, "status": report.status.value},
+    )
+    return report
+
+
+@router.post("/{meme_id}/share", response_model=MemeInteractionRecordedRead, summary="Record meme share intent")
+async def share_meme(
+    meme_search_service: MemeSearchServiceDep,
+    analytics_service: AnalyticsServiceDep,
+    current_user: OptionalCurrentUserDep,
+    meme_id: Annotated[uuid.UUID, Path()],
+    payload: Annotated[MemeActionAttributionRequest | None, Body()] = None,
+    include_nsfw: Annotated[bool, Query()] = False,
+) -> MemeInteractionRecordedRead:
+    """Record a visible meme share action without serving media or redirecting."""
+
+    await _ensure_visible_meme_for_interaction(
+        meme_search_service,
+        meme_id=meme_id,
+        current_user=current_user,
+        include_nsfw=include_nsfw,
+    )
+    await _record_meme_interaction(
+        analytics_service,
+        AnalyticsEventType.MEME_SHARE,
+        meme_id=meme_id,
+        current_user=current_user,
+        attribution=_payload_attribution(payload),
+        default_surface="public_api_meme_action",
+        properties={
+            "action": "share",
+            "channel": "telegram",
+            "include_nsfw": _nsfw_allowed(current_user, include_nsfw),
+        },
+    )
+    return MemeInteractionRecordedRead()
+
+
+@router.post("/{meme_id}/impression", response_model=MemeInteractionRecordedRead, summary="Record meme card impression")
+async def record_meme_impression(
+    meme_search_service: MemeSearchServiceDep,
+    analytics_service: AnalyticsServiceDep,
+    current_user: OptionalCurrentUserDep,
+    meme_id: Annotated[uuid.UUID, Path()],
+    payload: Annotated[MemeActionAttributionRequest | None, Body()] = None,
+    include_nsfw: Annotated[bool, Query()] = False,
+) -> MemeInteractionRecordedRead:
+    """Record a visible list-card impression without changing meme state."""
+
+    await _ensure_visible_meme_for_interaction(
+        meme_search_service,
+        meme_id=meme_id,
+        current_user=current_user,
+        include_nsfw=include_nsfw,
+    )
+    await _record_meme_interaction(
+        analytics_service,
+        AnalyticsEventType.MEME_IMPRESSION,
+        meme_id=meme_id,
+        current_user=current_user,
+        attribution=_payload_attribution(payload),
+        default_surface="public_api_meme_card",
+        properties={"action": "impression", "include_nsfw": _nsfw_allowed(current_user, include_nsfw)},
+    )
+    return MemeInteractionRecordedRead()
+
+
+@router.post(
+    "/{meme_id}/detail-click",
+    response_model=MemeInteractionRecordedRead,
+    summary="Record meme card detail click",
+)
+async def record_meme_detail_click(
+    meme_search_service: MemeSearchServiceDep,
+    analytics_service: AnalyticsServiceDep,
+    current_user: OptionalCurrentUserDep,
+    meme_id: Annotated[uuid.UUID, Path()],
+    payload: Annotated[MemeActionAttributionRequest | None, Body()] = None,
+    include_nsfw: Annotated[bool, Query()] = False,
+) -> MemeInteractionRecordedRead:
+    """Record a visible list-card click before the caller navigates to detail."""
+
+    await _ensure_visible_meme_for_interaction(
+        meme_search_service,
+        meme_id=meme_id,
+        current_user=current_user,
+        include_nsfw=include_nsfw,
+    )
+    await _record_meme_interaction(
+        analytics_service,
+        AnalyticsEventType.MEME_DETAIL_CLICK,
+        meme_id=meme_id,
+        current_user=current_user,
+        attribution=_payload_attribution(payload),
+        default_surface="public_api_meme_card",
+        properties={"action": "detail_click", "include_nsfw": _nsfw_allowed(current_user, include_nsfw)},
+    )
+    return MemeInteractionRecordedRead()
+
+
+@router.post("/{meme_id}/download", response_model=MemeInteractionRecordedRead, summary="Record meme download intent")
+async def download_meme(
+    meme_search_service: MemeSearchServiceDep,
+    analytics_service: AnalyticsServiceDep,
+    current_user: OptionalCurrentUserDep,
+    meme_id: Annotated[uuid.UUID, Path()],
+    payload: Annotated[MemeActionAttributionRequest | None, Body()] = None,
+    include_nsfw: Annotated[bool, Query()] = False,
+) -> MemeInteractionRecordedRead:
+    """Record a visible meme download action without serving or signing media."""
+
+    await _ensure_visible_meme_for_interaction(
+        meme_search_service,
+        meme_id=meme_id,
+        current_user=current_user,
+        include_nsfw=include_nsfw,
+    )
+    await _record_meme_interaction(
+        analytics_service,
+        AnalyticsEventType.MEME_DOWNLOAD,
+        meme_id=meme_id,
+        current_user=current_user,
+        attribution=_payload_attribution(payload),
+        default_surface="public_api_meme_action",
+        properties={"action": "download", "include_nsfw": _nsfw_allowed(current_user, include_nsfw)},
+    )
+    return MemeInteractionRecordedRead()
 
 
 @router.get("/slug/{slug}", response_model=PublicMemeDetailRead, summary="Read meme details by SEO slug")
 async def get_meme_detail_by_slug(
     meme_search_service: MemeSearchServiceDep,
+    analytics_service: AnalyticsServiceDep,
     current_user: OptionalCurrentUserDep,
     slug: Annotated[str, Path(min_length=1, max_length=255)],
+    attribution: MemeAttributionQueryDep,
     include_nsfw: Annotated[bool, Query()] = False,
 ) -> PublicMemeDetailRead:
     """Resolve a visible meme detail DTO from its canonical SEO slug."""
@@ -505,6 +833,15 @@ async def get_meme_detail_by_slug(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Meme was not found.",
         ) from exc
+    await _record_meme_interaction(
+        analytics_service,
+        AnalyticsEventType.MEME_VIEW,
+        meme_id=detail.id,
+        current_user=current_user,
+        attribution=attribution,
+        default_surface="public_api_meme_detail",
+        properties={"include_nsfw": _nsfw_allowed(current_user, include_nsfw)},
+    )
     return detail
 
 
@@ -618,12 +955,37 @@ async def get_meme_popularity_summary(
     return summary
 
 
+@router.get("/{meme_id}/similar", response_model=PublicMemeSearchPageRead, summary="Browse similar memes")
+async def get_similar_memes(
+    meme_search_service: MemeSearchServiceDep,
+    current_user: OptionalCurrentUserDep,
+    meme_id: Annotated[uuid.UUID, Path()],
+    include_nsfw: Annotated[bool, Query()] = False,
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> PublicMemeSearchPageRead:
+    """Return Qdrant-led similar public memes with explicit fallback attribution."""
+
+    try:
+        return await meme_search_service.get_public_similar_memes(
+            meme_id,
+            viewer_user_id=current_user.id if current_user else None,
+            include_nsfw=_nsfw_allowed(current_user, include_nsfw),
+            limit=limit,
+            offset=offset,
+            surface="public_api_meme_similar",
+        )
+    except MemeNotFoundError as exc:
+        raise _meme_not_found_http_error() from exc
+
+
 @router.get("/{meme_id}", response_model=PublicMemeDetailRead, summary="Read meme details")
 async def get_meme_detail(
     meme_search_service: MemeSearchServiceDep,
     analytics_service: AnalyticsServiceDep,
     current_user: OptionalCurrentUserDep,
     meme_id: Annotated[uuid.UUID, Path()],
+    attribution: MemeAttributionQueryDep,
     include_nsfw: Annotated[bool, Query()] = False,
 ) -> PublicMemeDetailRead:
     """Return a detail DTO for a visible meme."""
@@ -639,16 +1001,107 @@ async def get_meme_detail(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Meme was not found.",
         ) from exc
-    await analytics_service.record_event(
+    await _record_meme_interaction(
+        analytics_service,
         AnalyticsEventType.MEME_VIEW,
-        user_id=current_user.id if current_user else None,
-        payload={
-            "surface": "public_api",
-            "meme_id": str(detail.id),
-            "include_nsfw": _nsfw_allowed(current_user, include_nsfw),
-        },
+        meme_id=detail.id,
+        current_user=current_user,
+        attribution=attribution,
+        default_surface="public_api_meme_detail",
+        properties={"include_nsfw": _nsfw_allowed(current_user, include_nsfw)},
     )
     return detail
+
+
+async def _ensure_visible_meme_for_interaction(
+    meme_search_service,
+    *,
+    meme_id: uuid.UUID,
+    current_user: UserRead | None,
+    include_nsfw: bool,
+) -> None:
+    try:
+        await meme_search_service.get_meme_detail(
+            meme_id,
+            viewer_user_id=current_user.id if current_user else None,
+            include_nsfw=_nsfw_allowed(current_user, include_nsfw),
+        )
+    except MemeNotFoundError as exc:
+        raise _meme_not_found_http_error() from exc
+
+
+async def _record_meme_interaction(
+    analytics_service: AnalyticsService,
+    event_type: AnalyticsEventType,
+    *,
+    meme_id: uuid.UUID,
+    current_user: UserRead | None,
+    attribution: MemeInteractionAttributionRequest | None,
+    default_surface: str,
+    properties: dict[str, object] | None = None,
+    collection_id: uuid.UUID | None = None,
+    report_id: uuid.UUID | None = None,
+) -> None:
+    attribution_properties = _attribution_properties(attribution)
+    user_id = current_user.id if current_user else None
+    surface = attribution.surface if attribution and attribution.surface else default_surface
+    try:
+        await analytics_service.record_interaction_event(
+            InteractionEventWrite(
+                event_type=event_type,
+                user_id=user_id,
+                surface=surface,
+                refs=InteractionEventRefs(
+                    collection_id=collection_id,
+                    meme_id=meme_id,
+                    report_id=report_id,
+                    source_meme_id=attribution.source_meme_id if attribution else None,
+                ),
+                request_id=attribution.request_id if attribution else None,
+                impression_id=attribution.impression_id if attribution else None,
+                source_algorithm=attribution.source_algorithm if attribution else None,
+                query=attribution.query if attribution else None,
+                rank=attribution.rank if attribution else None,
+                score=attribution.score if attribution else None,
+                score_components=attribution.score_components if attribution else {},
+                reason=attribution.reason if attribution else None,
+                properties={**(properties or {}), **attribution_properties},
+            )
+        )
+    except Exception:
+        logger.exception(
+            "Meme interaction analytics write failed.",
+            extra={
+                "analytics_event_type": event_type.value,
+                "meme_id": str(meme_id),
+                "user_id": str(user_id) if user_id else None,
+                "request_id": attribution.request_id if attribution else None,
+                "impression_id": attribution.impression_id if attribution else None,
+                "surface": surface,
+            },
+        )
+
+
+def _payload_attribution(
+    payload: MemeActionAttributionRequest | None,
+) -> MemeInteractionAttributionRequest | None:
+    return payload.attribution if payload else None
+
+
+def _attribution_properties(attribution: MemeInteractionAttributionRequest | None) -> dict[str, object]:
+    if attribution is None:
+        return {}
+
+    properties: dict[str, object] = {}
+    if attribution.algorithm_version:
+        properties["algorithm_version"] = attribution.algorithm_version
+    if attribution.filters is not None:
+        properties["filters"] = attribution.filters.model_dump(mode="json", exclude_none=True)
+    if attribution.collection_scope:
+        properties["collection_scope"] = attribution.collection_scope
+    if attribution.collection_ids:
+        properties["collection_ids"] = list(attribution.collection_ids)
+    return properties
 
 
 async def _validated_search_filters(

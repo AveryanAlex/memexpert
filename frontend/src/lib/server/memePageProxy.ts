@@ -31,6 +31,8 @@ export async function proxyMemePage({ fetch, request, cookies, apiBaseUrl, mode 
       includeNsfw: params.has('include_nsfw') ? filters.includeNsfw : undefined,
       mediaType: filters.mediaType,
       language: filters.language,
+      scope: filters.scope,
+      collectionIds: filters.collectionIds,
       limit: readPositiveInt(params.get('limit'), DEFAULT_PAGE_SIZE),
       offset: filters.offset,
       cookieHeader: request.headers.get('cookie') ?? undefined,

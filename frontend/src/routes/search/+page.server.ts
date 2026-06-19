@@ -23,6 +23,8 @@ export const load: PageServerLoad = async ({ cookies, fetch, parent, request, ur
         includeNsfw: filters.includeNsfw,
         mediaType: filters.mediaType,
         language: filters.language,
+        scope: filters.scope,
+        collectionIds: filters.collectionIds,
         limit: DEFAULT_PAGE_SIZE,
         offset: filters.offset,
         cookieHeader

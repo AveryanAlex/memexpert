@@ -32,6 +32,8 @@ from memexpert.models.content import (
     MemeTemplate,
     ModerationDecision,
     ModerationReport,
+    PipelineIngestRequest,
+    PipelineOutboxEvent,
     PipelineStageJournal,
     SourceChannel,
     TelegramFileIdCache,
@@ -114,6 +116,8 @@ EXPECTED_TABLES = {
     "moderation_decisions",
     "moderation_reports",
     "pinned_memes",
+    "pipeline_ingest_requests",
+    "pipeline_outbox_events",
     "pipeline_stage_journal",
     "source_channels",
     "telegram_file_id_cache",
@@ -165,11 +169,16 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
     assert set(metadata.tables) == EXPECTED_TABLES
     memes_table = metadata.tables["memes"]
     meme_files_table = metadata.tables["meme_files"]
+    pipeline_ingest_requests_table = metadata.tables["pipeline_ingest_requests"]
     assert "invite_link" not in metadata.tables["collections"].c
     assert metadata.tables["users"].c["active_save_collection_id"].foreign_keys
     assert metadata.tables["collections"].c["owner_id"].foreign_keys
     assert not memes_table.c["primary_file_id"].nullable
     assert meme_files_table.c["meme_id"].foreign_keys
+    assert pipeline_ingest_requests_table.c["owner_user_id"].foreign_keys
+    assert pipeline_ingest_requests_table.c["materialized_meme_id"].foreign_keys
+    assert pipeline_ingest_requests_table.c["materialized_meme_file_id"].foreign_keys
+    assert pipeline_ingest_requests_table.c["matched_meme_file_id"].foreign_keys
     assert any(
         isinstance(constraint, UniqueConstraint)
         and constraint.name == "uq_meme_files_meme_id_id"
@@ -193,6 +202,7 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
     user_relationships = sa_inspect(User).relationships
     meme_relationships = sa_inspect(Meme).relationships
     meme_file_relationships = sa_inspect(MemeFile).relationships
+    pipeline_ingest_request_relationships = sa_inspect(PipelineIngestRequest).relationships
 
     assert user_relationships["active_save_collection"].mapper.class_ is Collection
     assert user_relationships["owned_collections"].mapper.class_ is Collection
@@ -201,6 +211,10 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
     assert meme_relationships["primary_file"].mapper.class_ is MemeFile
     assert meme_relationships["moderation_reports"].mapper.class_ is ModerationReport
     assert meme_relationships["moderation_decisions"].mapper.class_ is ModerationDecision
+    assert pipeline_ingest_request_relationships["materialized_meme"].mapper.class_ is Meme
+    assert pipeline_ingest_request_relationships["materialized_meme_file"].mapper.class_ is MemeFile
+    assert pipeline_ingest_request_relationships["matched_meme_file"].mapper.class_ is MemeFile
+    assert sa_inspect(PipelineOutboxEvent).columns["aggregate_id"] is not None
     assert metadata.tables["admin_meme_destructive_audit_logs"].c["admin_user_id"].foreign_keys
     assert metadata.tables["blocked_perceptual_hashes"].c["created_by_admin_user_id"].foreign_keys
     assert metadata.tables["blocked_perceptual_hash_audit_logs"].c["admin_user_id"].foreign_keys
@@ -1328,8 +1342,8 @@ def test_telegram_session_status_values_are_locked_and_stable() -> None:
 
 
 def test_meme_source_exposes_forward_attribution_columns_and_helper() -> None:
-    # The forward-chain columns must exist on the ORM model so create_crawler_ingest
-    # can populate them; ``is_forwarded`` is the ergonomic helper that keeps the
+    # The forward-chain columns must exist on the ORM model so crawler ingest can
+    # populate them; ``is_forwarded`` is the ergonomic helper that keeps the
     # reposter-detection logic out of every caller.
     columns = MemeSource.__table__.c
     assert "published_at" in columns

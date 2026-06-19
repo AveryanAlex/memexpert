@@ -1,4 +1,4 @@
-import type { ContentKind, ContentLanguage } from '$lib/api/types';
+import type { ContentKind, ContentLanguage, MemeSearchScope } from '$lib/api/types';
 
 export interface SearchRouteState {
   query: string;
@@ -6,8 +6,17 @@ export interface SearchRouteState {
   includeNsfw: boolean;
   mediaType: ContentKind | null;
   language: ContentLanguage | null;
+  scope: MemeSearchScope;
+  collectionIds: string[];
   offset: number;
 }
+
+export const SEARCH_SCOPE_OPTIONS: Array<{ value: MemeSearchScope; label: string; description: string }> = [
+  { value: 'public', label: 'Public catalog', description: 'Only public memes.' },
+  { value: 'private', label: 'My private saves', description: 'Private memes visible to this account.' },
+  { value: 'all', label: 'All I can access', description: 'Public, private, and shared memes visible to this account.' },
+  { value: 'collections', label: 'Specific collections', description: 'Limit results to selected readable collections.' }
+];
 
 export const MEDIA_TYPE_OPTIONS: Array<{ value: ContentKind; label: string }> = [
   { value: 'image', label: 'Images' },
@@ -28,12 +37,15 @@ export const LANGUAGE_OPTIONS: Array<{ value: ContentLanguage; label: string }> 
 export const QUICK_SEARCH_TAGS = ['reaction', 'cat', 'wholesome', 'anime', 'gaming', 'politics', 'work', 'sports'];
 
 export function parseSearchParams(params: URLSearchParams): SearchRouteState {
+  const scope = readScope(params.get('scope'));
   return {
     query: (params.get('q') ?? '').trim(),
     tags: normalizeTags([...params.getAll('tags'), ...params.getAll('category'), ...params.getAll('categories')]),
     includeNsfw: readBoolean(params.get('include_nsfw')),
     mediaType: readMediaType(params.get('media_type')),
     language: readLanguage(params.get('language')),
+    scope,
+    collectionIds: scope === 'collections' ? normalizeCollectionIds(params.getAll('collection_ids')) : [],
     offset: readOffset(params.get('offset'))
   };
 }
@@ -61,6 +73,14 @@ export function buildSearchHref(state: SearchRouteState, changes: Partial<Search
     params.set('language', next.language);
   }
 
+  params.set('scope', next.scope);
+
+  if (next.scope === 'collections') {
+    for (const collectionId of normalizeCollectionIds(next.collectionIds)) {
+      params.append('collection_ids', collectionId);
+    }
+  }
+
   if (next.offset > 0) {
     params.set('offset', String(next.offset));
   }
@@ -86,6 +106,23 @@ export function normalizeTags(rawTags: Iterable<string>): string[] {
   return tags;
 }
 
+export function normalizeCollectionIds(rawIds: Iterable<string>): string[] {
+  const ids: string[] = [];
+  const seen = new Set<string>();
+
+  for (const raw of rawIds) {
+    for (const part of raw.split(',')) {
+      const id = part.trim();
+      if (id && !seen.has(id)) {
+        ids.push(id);
+        seen.add(id);
+      }
+    }
+  }
+
+  return ids;
+}
+
 function readBoolean(raw: string | null): boolean {
   return raw === 'true' || raw === '1' || raw === 'on';
 }
@@ -101,4 +138,8 @@ function readMediaType(raw: string | null): ContentKind | null {
 
 function readLanguage(raw: string | null): ContentLanguage | null {
   return LANGUAGE_OPTIONS.some((option) => option.value === raw) ? (raw as ContentLanguage) : null;
+}
+
+function readScope(raw: string | null): MemeSearchScope {
+  return SEARCH_SCOPE_OPTIONS.some((option) => option.value === raw) ? (raw as MemeSearchScope) : 'public';
 }

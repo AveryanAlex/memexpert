@@ -13,29 +13,29 @@ from aiogram import F, Router
 from pydantic import ValidationError
 from sqlalchemy import select
 
+from memexpert.bot.analytics import record_telegram_interaction_event, telegram_user_hash
 from memexpert.core.config import Settings, get_settings
 from memexpert.core.database import get_async_session_factory
+from memexpert.ingest.accept_service import PipelineIngestAcceptService
+from memexpert.ingest.schemas import IngestAcceptOutcome, IngestAcceptResult, IngestAcceptSource
 from memexpert.models.content import Meme, MemeFile, MemeSource
 from memexpert.models.enums import (
     AccountStatus,
+    AnalyticsEventType,
     ContentKind,
-    ContentPipelineStageStatus,
     SourceAttachReason,
     SourcePlatform,
 )
 from memexpert.models.user import User
-from memexpert.schemas.content_pipeline import ContentPipelineUploadMetadata, ContentPipelineUploadRead
 from memexpert.services import (
     CollectionNotFoundError,
     CollectionService,
     CollectionServiceError,
     CollectionWriteAccessError,
-    ContentPipelineService,
     GuestCollectionAccessError,
     MemeNotFoundError,
     PipelinePayloadTooLargeError,
     PipelinePayloadValidationError,
-    PipelinePublishError,
     PipelineServiceError,
     PipelineSourceConflictError,
     PipelineStorageError,
@@ -59,15 +59,15 @@ _SUPPORTED_GIF_MIME_TYPES = frozenset({"image/gif", "video/mp4"})
 type ActiveCollectionSaveResult = Literal["saved", "not_visible", "collection_error"]
 
 
-class PrivateUploadPipelineService(Protocol):
-    async def create_upload(
+class PrivateUploadAcceptService(Protocol):
+    async def accept_bytes(
         self,
         *,
-        metadata: ContentPipelineUploadMetadata,
+        source: IngestAcceptSource,
         filename: str | None,
         content_type: str | None,
         media_bytes: bytes,
-    ) -> ContentPipelineUploadRead: ...
+    ) -> IngestAcceptResult: ...
 
 
 class ActiveCollectionSaver(Protocol):
@@ -78,7 +78,7 @@ class TelegramFileDownloader(Protocol):
     async def download_file(self, bot: Bot, *, file_id: str) -> bytes: ...
 
 
-type PrivateUploadPipelineServiceFactory = Callable[[AsyncSession], PrivateUploadPipelineService]
+type PrivateUploadAcceptServiceFactory = Callable[[AsyncSession], PrivateUploadAcceptService]
 type CollectionServiceFactory = Callable[[AsyncSession], ActiveCollectionSaver]
 
 
@@ -118,7 +118,7 @@ def build_private_upload_router(
     *,
     settings: Settings | None = None,
     session_factory: AsyncSessionFactory | None = None,
-    pipeline_service_factory: PrivateUploadPipelineServiceFactory | None = None,
+    accept_service_factory: PrivateUploadAcceptServiceFactory | None = None,
     collection_service_factory: CollectionServiceFactory | None = None,
     telegram_file_downloader: TelegramFileDownloader | None = None,
 ) -> Router:
@@ -126,8 +126,8 @@ def build_private_upload_router(
 
     resolved_settings = settings or get_settings()
     resolved_session_factory = session_factory or get_async_session_factory()
-    resolved_pipeline_factory = pipeline_service_factory or (
-        lambda session: ContentPipelineService.from_settings(session, settings=resolved_settings)
+    resolved_accept_factory = accept_service_factory or (
+        lambda session: PipelineIngestAcceptService.from_settings(session, settings=resolved_settings)
     )
     resolved_collection_factory = collection_service_factory or (lambda session: CollectionService(session))
     resolved_downloader = telegram_file_downloader or AiogramTelegramFileDownloader()
@@ -141,7 +141,7 @@ def build_private_upload_router(
             bot=bot,
             settings=resolved_settings,
             session_factory=resolved_session_factory,
-            pipeline_service_factory=resolved_pipeline_factory,
+            accept_service_factory=resolved_accept_factory,
             collection_service_factory=resolved_collection_factory,
             telegram_file_downloader=resolved_downloader,
         )
@@ -153,7 +153,7 @@ def build_private_upload_router(
             bot=bot,
             settings=resolved_settings,
             session_factory=resolved_session_factory,
-            pipeline_service_factory=resolved_pipeline_factory,
+            accept_service_factory=resolved_accept_factory,
             collection_service_factory=resolved_collection_factory,
             telegram_file_downloader=resolved_downloader,
         )
@@ -165,7 +165,7 @@ def build_private_upload_router(
             bot=bot,
             settings=resolved_settings,
             session_factory=resolved_session_factory,
-            pipeline_service_factory=resolved_pipeline_factory,
+            accept_service_factory=resolved_accept_factory,
             collection_service_factory=resolved_collection_factory,
             telegram_file_downloader=resolved_downloader,
         )
@@ -179,7 +179,7 @@ async def handle_private_upload_message(
     bot: Bot,
     settings: Settings,
     session_factory: AsyncSessionFactory,
-    pipeline_service_factory: PrivateUploadPipelineServiceFactory,
+    accept_service_factory: PrivateUploadAcceptServiceFactory,
     collection_service_factory: CollectionServiceFactory,
     telegram_file_downloader: TelegramFileDownloader,
 ) -> None:
@@ -207,14 +207,14 @@ async def handle_private_upload_message(
             await message.answer(_missing_active_collection_message())
             return
 
-        metadata = _build_upload_metadata(
+        source = _build_upload_source(
             message=message,
             media=media,
             telegram_user_id=telegram_user_id,
             owner_user_id=linked_user.id,
         )
         try:
-            pipeline_service = pipeline_service_factory(session)
+            accept_service = accept_service_factory(session)
             collection_service = collection_service_factory(session)
         except Exception:
             logger.exception("Telegram private upload service setup failed for user_id=%s.", linked_user.id)
@@ -228,8 +228,8 @@ async def handle_private_upload_message(
             return
 
         try:
-            upload = await pipeline_service.create_upload(
-                metadata=metadata,
+            accept_result = await accept_service.accept_bytes(
+                source=source,
                 filename=media.filename,
                 content_type=media.content_type,
                 media_bytes=media_bytes,
@@ -240,7 +240,9 @@ async def handle_private_upload_message(
                 session=session,
                 collection_service=collection_service,
                 user=linked_user,
-                metadata=metadata,
+                media=media,
+                telegram_user_id=telegram_user_id,
+                source=source,
             )
             return
         except PipelinePayloadTooLargeError:
@@ -252,9 +254,6 @@ async def handle_private_upload_message(
         except PipelineStorageError:
             await message.answer(_storage_failure_message())
             return
-        except PipelinePublishError:
-            await message.answer(_publish_failure_message())
-            return
         except PipelinePayloadValidationError:
             await message.answer(_invalid_media_message())
             return
@@ -263,39 +262,115 @@ async def handle_private_upload_message(
             await message.answer(_pipeline_failure_message())
             return
 
-        await _save_upload_result(
+        await _handle_accept_result(
             message=message,
             session=session,
             collection_service=collection_service,
             user=linked_user,
-            upload=upload,
+            media=media,
+            telegram_user_id=telegram_user_id,
+            result=accept_result,
         )
 
 
-async def _save_upload_result(
+async def _handle_accept_result(
     *,
     message: Message,
     session: AsyncSession,
     collection_service: ActiveCollectionSaver,
     user: User,
-    upload: ContentPipelineUploadRead,
+    media: TelegramUploadMedia,
+    telegram_user_id: int,
+    result: IngestAcceptResult,
 ) -> None:
-    meme = await _get_meme(session, upload.meme_id)
-    if meme is None:
-        await message.answer(_pipeline_failure_message())
+    ingest_request = result.ingest_request
+    if result.outcome is IngestAcceptOutcome.ACCEPTED_ASYNC:
+        await message.answer(_private_upload_queued_message())
+        await _record_upload_event(
+            session,
+            _upload_collection_event(
+                user=user,
+                telegram_user_id=telegram_user_id,
+                action="upload_queued",
+                media=media,
+            ),
+        )
         return
 
-    is_exact_existing_file = upload.latest_source_attach_reason in {
+    if ingest_request.materialized_meme_id is None:
+        await message.answer(_source_replay_queued_message())
+        return
+
+    meme = await _get_meme(session, ingest_request.materialized_meme_id)
+    if meme is None:
+        await message.answer(_source_replay_unknown_message())
+        return
+
+    if result.outcome is IngestAcceptOutcome.SOURCE_REPLAY:
+        save_result = await _save_to_active_collection(
+            collection_service,
+            user_id=user.id,
+            meme_id=ingest_request.materialized_meme_id,
+        )
+        if save_result == "saved":
+            await message.answer(_source_replay_saved_message())
+            await _record_upload_event(
+                session,
+                _upload_meme_save_event(
+                    user=user,
+                    telegram_user_id=telegram_user_id,
+                    action="source_replay_saved",
+                    outcome=result.outcome.value,
+                    meme_id=ingest_request.materialized_meme_id,
+                    media=media,
+                ),
+            )
+            return
+        if save_result == "not_visible":
+            await message.answer(_private_duplicate_not_visible_message())
+            return
+        await message.answer(_source_replay_not_saved_message())
+        return
+
+    is_exact_existing_file = ingest_request.source_attach_reason in {
         SourceAttachReason.SHA256_EXACT_EXISTING_FILE,
         SourceAttachReason.BLOCKED_SHA256_EXISTING_FILE,
     }
-    if upload.current_status is ContentPipelineStageStatus.DUPLICATE or is_exact_existing_file:
-        save_result = await _save_to_active_collection(collection_service, user_id=user.id, meme_id=upload.meme_id)
+    if result.outcome is IngestAcceptOutcome.RESOLVED_SHA_DUPLICATE or is_exact_existing_file:
+        save_result = await _save_to_active_collection(
+            collection_service,
+            user_id=user.id,
+            meme_id=ingest_request.materialized_meme_id,
+        )
         if save_result == "saved" and meme.is_public:
             await message.answer(_public_duplicate_saved_message())
+            await _record_upload_event(
+                session,
+                _upload_meme_save_event(
+                    user=user,
+                    telegram_user_id=telegram_user_id,
+                    action="duplicate_saved",
+                    outcome=result.outcome.value,
+                    meme_id=ingest_request.materialized_meme_id,
+                    media=media,
+                    extra_properties={"visibility": "public"},
+                ),
+            )
             return
         if save_result == "saved":
             await message.answer(_private_duplicate_saved_message())
+            await _record_upload_event(
+                session,
+                _upload_meme_save_event(
+                    user=user,
+                    telegram_user_id=telegram_user_id,
+                    action="duplicate_saved",
+                    outcome=result.outcome.value,
+                    meme_id=ingest_request.materialized_meme_id,
+                    media=media,
+                    extra_properties={"visibility": "private"},
+                ),
+            )
             return
         if save_result == "collection_error":
             await message.answer(_collection_save_failure_message())
@@ -303,11 +378,7 @@ async def _save_upload_result(
         await message.answer(_private_duplicate_not_visible_message())
         return
 
-    if await _save_to_active_collection(collection_service, user_id=user.id, meme_id=upload.meme_id) == "saved":
-        await message.answer(_new_private_upload_saved_message())
-        return
-
-    await message.answer(_collection_save_failure_message())
+    await message.answer(_private_upload_queued_message())
 
 
 async def _handle_duplicate_source_replay(
@@ -316,9 +387,11 @@ async def _handle_duplicate_source_replay(
     session: AsyncSession,
     collection_service: ActiveCollectionSaver,
     user: User,
-    metadata: ContentPipelineUploadMetadata,
+    media: TelegramUploadMedia,
+    telegram_user_id: int,
+    source: IngestAcceptSource,
 ) -> None:
-    meme_id = await _resolve_meme_id_for_source(session, metadata=metadata)
+    meme_id = await _resolve_meme_id_for_source(session, source=source)
     if meme_id is None:
         await message.answer(_source_replay_unknown_message())
         return
@@ -326,6 +399,17 @@ async def _handle_duplicate_source_replay(
     save_result = await _save_to_active_collection(collection_service, user_id=user.id, meme_id=meme_id)
     if save_result == "saved":
         await message.answer(_source_replay_saved_message())
+        await _record_upload_event(
+            session,
+            _upload_meme_save_event(
+                user=user,
+                telegram_user_id=telegram_user_id,
+                action="duplicate_source_replay_saved",
+                outcome="saved",
+                meme_id=meme_id,
+                media=media,
+            ),
+        )
         return
     if save_result == "not_visible":
         await message.answer(_private_duplicate_not_visible_message())
@@ -373,19 +457,84 @@ async def _get_meme(session: AsyncSession, meme_id: object) -> Meme | None:
 async def _resolve_meme_id_for_source(
     session: AsyncSession,
     *,
-    metadata: ContentPipelineUploadMetadata,
+    source: IngestAcceptSource,
 ) -> object | None:
     result = await session.execute(
         select(MemeFile.meme_id)
         .join(MemeSource, MemeSource.file_id == MemeFile.id)
         .where(
-            MemeSource.platform == metadata.source_platform,
-            MemeSource.source_id == metadata.source_id,
-            MemeSource.post_id == metadata.post_id,
+            MemeSource.platform == source.source_platform,
+            MemeSource.source_id == source.source_id,
+            MemeSource.post_id == source.post_id,
         )
         .limit(1)
     )
     return result.scalar_one_or_none()
+
+
+async def _record_upload_event(session: AsyncSession, event: dict[str, object]) -> None:
+    refs = event.get("refs")
+    if not isinstance(refs, dict):
+        refs = {}
+    event_type = event.get("event_type")
+    await record_telegram_interaction_event(
+        session,
+        event,
+        log_context={
+            "analytics_event_type": getattr(event_type, "value", str(event_type)),
+            "surface": event.get("surface"),
+            "user_id": str(event.get("user_id")) if event.get("user_id") else None,
+            "collection_id": str(refs.get("collection_id")) if refs.get("collection_id") else None,
+            "meme_id": str(refs.get("meme_id")) if refs.get("meme_id") else None,
+        },
+    )
+
+
+def _upload_collection_event(
+    *,
+    user: User,
+    telegram_user_id: int,
+    action: str,
+    media: TelegramUploadMedia,
+) -> dict[str, object]:
+    return {
+        "event_type": AnalyticsEventType.COLLECTION_ACTION,
+        "user_id": user.id,
+        "surface": "telegram_pm_upload",
+        "refs": {"collection_id": user.active_save_collection_id},
+        "properties": {
+            "action": action,
+            "telegram_user_hash": telegram_user_hash(telegram_user_id),
+            "media_kind": media.limit_kind.value,
+            "content_type": media.content_type,
+        },
+    }
+
+
+def _upload_meme_save_event(
+    *,
+    user: User,
+    telegram_user_id: int,
+    action: str,
+    outcome: str,
+    meme_id: object,
+    media: TelegramUploadMedia,
+    extra_properties: dict[str, object] | None = None,
+) -> dict[str, object]:
+    return {
+        "event_type": AnalyticsEventType.MEME_SAVE,
+        "user_id": user.id,
+        "surface": "telegram_pm_upload",
+        "refs": {"collection_id": user.active_save_collection_id, "meme_id": meme_id},
+        "properties": {
+            "action": action,
+            "outcome": outcome,
+            "telegram_user_hash": telegram_user_hash(telegram_user_id),
+            "media_kind": media.limit_kind.value,
+            "content_type": media.content_type,
+            **(extra_properties or {}),
+        },
+    }
 
 
 def _extract_upload_media(message: Message) -> TelegramUploadMedia | None:
@@ -455,15 +604,15 @@ def _media_from_document(document: Document, *, message_id: int) -> TelegramUplo
     )
 
 
-def _build_upload_metadata(
+def _build_upload_source(
     *,
     message: Message,
     media: TelegramUploadMedia,
     telegram_user_id: int,
     owner_user_id: uuid.UUID,
-) -> ContentPipelineUploadMetadata:
+) -> IngestAcceptSource:
     try:
-        return ContentPipelineUploadMetadata(
+        return IngestAcceptSource(
             source_platform=SourcePlatform.TELEGRAM,
             source_id=f"telegram_pm:{telegram_user_id}:{message.chat.id}",
             post_id=f"message:{message.message_id}:file:{media.file_unique_id}",
@@ -544,10 +693,6 @@ def _storage_failure_message() -> str:
     return "Не удалось сохранить оригинал файла в хранилище. Попробуйте позже."
 
 
-def _publish_failure_message() -> str:
-    return "Файл сохранён, но очередь обработки сейчас недоступна. Обработка не была запущена автоматически."
-
-
 def _pipeline_failure_message() -> str:
     return "Не удалось поставить файл в обработку из-за временной ошибки сервиса. Попробуйте позже."
 
@@ -560,8 +705,8 @@ def _collection_save_failure_message() -> str:
     return "Файл загружен, но сохранить мем в активную коллекцию не удалось. Проверьте доступ к коллекции."
 
 
-def _new_private_upload_saved_message() -> str:
-    return "Загрузил приватный мем в активную коллекцию. Обработка запущена, результат появится после пайплайна."
+def _private_upload_queued_message() -> str:
+    return "Поставил файл в обработку. Результат появится в MemeXpert после пайплайна."
 
 
 def _public_duplicate_saved_message() -> str:
@@ -584,6 +729,10 @@ def _source_replay_unknown_message() -> str:
     return "Это сообщение уже было обработано ранее, но связанный мем не удалось найти."
 
 
+def _source_replay_queued_message() -> str:
+    return "Это сообщение уже в обработке. Результат появится после пайплайна."
+
+
 def _source_replay_not_saved_message() -> str:
     return "Это сообщение уже было обработано ранее, но сохранить найденный мем в активную коллекцию не удалось."
 
@@ -592,7 +741,7 @@ def _source_replay_not_saved_message() -> str:
 __all__ = [
     "AiogramTelegramFileDownloader",
     "CollectionServiceFactory",
-    "PrivateUploadPipelineServiceFactory",
+    "PrivateUploadAcceptServiceFactory",
     "TelegramDownloadError",
     "TelegramFileDownloader",
     "build_private_upload_router",

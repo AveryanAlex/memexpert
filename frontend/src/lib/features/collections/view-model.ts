@@ -1,8 +1,8 @@
-import type { CollectionInviteRead, CurrentSessionRead, WebCollectionDetailRead } from '$lib/api/types';
+import type { CollectionInviteRead, CollectionInviteStatus, CollectionMembershipRole, CurrentSessionRead, WebCollectionDetailRead } from '$lib/api/types';
 
 export interface CollectionMemberView {
   id: string;
-  role: string;
+  role: CollectionMembershipRole;
   joined: string;
   isOwner: boolean;
   label: string;
@@ -11,8 +11,10 @@ export interface CollectionMemberView {
 export interface CollectionInviteView {
   id: string;
   label: string;
-  role: string;
-  status: string;
+  role: CollectionMembershipRole;
+  status: CollectionInviteStatus;
+  statusLabel: string;
+  isTerminal: boolean;
   usage: string;
   expires: string;
   created: string;
@@ -34,6 +36,8 @@ export function collectionInviteRows(invites: CollectionInviteRead[]): Collectio
     label: invite.label?.trim() || 'Direct invite link',
     role: invite.role,
     status: invite.status,
+    statusLabel: inviteStatusLabel(invite),
+    isTerminal: invite.status !== 'pending' || isExpired(invite),
     usage: invite.max_uses === null ? `${invite.use_count} used` : `${invite.use_count}/${invite.max_uses} used`,
     expires: invite.expires_at ? formatDate(invite.expires_at) : 'No expiry',
     created: formatDate(invite.created_at)
@@ -41,8 +45,20 @@ export function collectionInviteRows(invites: CollectionInviteRead[]): Collectio
 }
 
 export function collectionManagementNotice(detail: WebCollectionDetailRead, session: CurrentSessionRead | null): string {
-  if (detail.capabilities.can_create_invites) {
-    return 'Create direct invite links here. Existing member removal, invite revocation, and role changes are not exposed by the current API.';
+  if (detail.capabilities.can_manage_members && detail.capabilities.can_create_invites) {
+    return 'Owners can update collection details, create or revoke invite links, and manage non-owner members.';
+  }
+
+  if (detail.capabilities.can_manage_members) {
+    return 'Owners can update collection details, revoke pending invite links, and manage non-owner members. Creating invites requires a connected collaboration identity.';
+  }
+
+  if (detail.capabilities.can_create_invites && detail.capabilities.can_revoke_invites) {
+    return 'Editors can create and revoke invite links. Member role changes and removals require owner access.';
+  }
+
+  if (detail.capabilities.can_revoke_invites) {
+    return 'Editors can revoke pending invite links. Creating invites requires a connected collaboration identity, and member changes require owner access.';
   }
 
   if (session?.user.account_type === 'guest') {
@@ -71,4 +87,16 @@ function shortId(value: string): string {
 
 function formatDate(value: string): string {
   return new Intl.DateTimeFormat('en', { dateStyle: 'medium' }).format(new Date(value));
+}
+
+function inviteStatusLabel(invite: CollectionInviteRead): string {
+  if (invite.status === 'pending' && isExpired(invite)) {
+    return 'expired';
+  }
+
+  return invite.status;
+}
+
+function isExpired(invite: CollectionInviteRead): boolean {
+  return invite.expires_at !== null && new Date(invite.expires_at).getTime() <= Date.now();
 }

@@ -1,6 +1,7 @@
 import { test as base } from '@playwright/test';
 import { E2EApi } from '../helpers/api';
 import { readSeedArtifact, type SeedArtifact } from '../helpers/seed';
+import { CollectionPage } from '../pages/CollectionPage';
 import { HomePage } from '../pages/HomePage';
 import { MemeDetailPage } from '../pages/MemeDetailPage';
 import { ProfilePage } from '../pages/ProfilePage';
@@ -16,6 +17,7 @@ type AppFixtures = {
     search: SearchPage;
     detail: MemeDetailPage;
     profile: ProfilePage;
+    collection: CollectionPage;
   };
 };
 
@@ -33,7 +35,8 @@ export const test = base.extend<AppFixtures>({
       home: new HomePage(page),
       search: new SearchPage(page),
       detail: new MemeDetailPage(page),
-      profile: new ProfilePage(page)
+      profile: new ProfilePage(page),
+      collection: new CollectionPage(page)
     });
   }
 });

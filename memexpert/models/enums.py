@@ -172,6 +172,28 @@ class ContentPipelineStageStatus(StrEnum):
     DUPLICATE = "duplicate"
 
 
+class PipelineIngestRequestStatus(StrEnum):
+    """Lifecycle states for raw ingest requests before content materialization."""
+
+    ACCEPTED = "accepted"
+    MEDIA_INSPECT_PENDING = "media_inspect_pending"
+    MEDIA_INSPECTING = "media_inspecting"
+    MATERIALIZED = "materialized"
+    RESOLVED_SHA_DUPLICATE = "resolved_sha_duplicate"
+    FAILED_INVALID_MEDIA = "failed_invalid_media"
+    FAILED_BLOCKED_PHASH = "failed_blocked_phash"
+    PUBLISH_FAILED = "publish_failed"
+
+
+class PipelineOutboxEventStatus(StrEnum):
+    """Lifecycle states for transactional pipeline outbox events."""
+
+    PENDING = "pending"
+    PUBLISHING = "publishing"
+    PUBLISHED = "published"
+    FAILED = "failed"
+
+
 class ContentSourceKind(StrEnum):
     """Origin channels tracked for discovered content."""
 

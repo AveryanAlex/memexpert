@@ -4,6 +4,12 @@ This runbook covers the operator proof loop for milestone **M002 / slice S02**:
 the real heavy-worker chain (`transcode → ocr → embed → classify → meme_ready`)
 running against the live local stack plus `/home/alex/Documents/MemeDataset`.
 
+Stage 3a of the ingest-request refactor moves manual uploads through raw
+`pipeline_ingest_requests` plus `pipeline_outbox_events`. New uploads first land
+as temp originals, then the worker consumes `media_inspect_requested`, runs the
+worker-only media inspector/pHash checks, materializes `Meme`/`MemeFile` state,
+and writes the downstream transcode event back to the transactional outbox.
+
 The S01 runbook (`docs/ops/content-pipeline-smoke.md`) still applies for the
 upload → replay → duplicate proof. S02 layers the heavy chain on top and adds
 a machine-readable run summary that operators read *first* before trusting
@@ -42,7 +48,8 @@ What the harness does:
 
 1. Walks the dataset root deterministically and picks the first
    `--candidate-limit` supported files (default 8).
-2. Uploads each file through the real operator route.
+2. Uploads each file through the real operator route and waits for the
+   media-inspect/materializer worker to create the `MemeFile` state.
 3. Polls the enriched `GET /api/v1/pipeline/items/{id}/detail` surface until
    every uploaded item reaches a terminal state (`meme_ready` emitted,
    duplicate, or failed) or the `--stage-timeout` elapses.
@@ -115,6 +122,32 @@ curl -sS -X POST \
 Replace `embed` with the blocked stage reported in `item_reports[*].terminal_stage`.
 The enriched detail route will reflect the new attempt within a poll interval.
 
+## Raw ingest, temp storage, and outbox recovery
+
+The first worker hop is `pipeline.media_inspect`. It consumes
+`media_inspect_requested` events and is separate from materialized stage events
+such as `meme_created` or `meme_transcoded`.
+
+Operational rules:
+
+1. `pipeline_ingest_requests.status=media_inspect_pending` means the API has
+   accepted bytes and an outbox row should publish a media-inspect event.
+2. `failed_invalid_media` keeps the temp object under
+   `pipeline/temp-originals/<ingest_request_id>/...` for retention/debugging.
+   Do not manually delete these before the agreed lifecycle window unless ops
+   has captured enough evidence.
+3. `materialized` and `failed_blocked_phash` should have a canonical original
+   under `pipeline/originals/<meme_file_id>/...`; their temp object is safe to
+   delete and the worker does this idempotently after commit.
+4. `pipeline_outbox_events.status=failed` is retryable when `next_retry_at` is
+   due. The `pipeline-outbox-publisher` job in `memexpert-scheduler` claims
+   pending/failed rows generically and does not care whether the event is
+   `media_inspect_requested` or `meme_created`.
+5. `pipeline_outbox_events.status=publishing` older than the publisher lease
+   window indicates a crashed publisher. Each scheduler publisher run first
+   recovers those rows to `failed` with `next_retry_at=now`, then claims a
+   bounded publish batch.
+
 ## Wiping the artifact directory
 
 Each run creates a new `<run-id>` subdirectory, so old runs do not overwrite
@@ -140,6 +173,18 @@ rm -rf .artifacts/s02-runtime-smoke
   structurally malformed response. The run summary marks these as
   `outcome: failed` (not `blocked`) because the heavy chain refuses to
   replay a non-retryable failure.
+- **Uploads stay `media_inspect_pending`**: the transactional outbox publisher
+  is not running or cannot publish to RabbitMQ. Confirm `memexpert-scheduler`
+  has the `pipeline-outbox-publisher` job enabled, inspect
+  `pipeline_outbox_events` for due `pending`/`failed` rows, and check
+  `scheduler_job_batch_result` logs for `claimed`, `published`, `failed`, and
+  `recovered` counts.
+- **Uploads stay `media_inspecting`**: a media-inspect worker likely died while
+  holding work. Confirm no worker is still processing the temp object, then
+  reset/requeue according to the incident runbook.
+- **Invalid media temp objects accumulate**: this is expected until the storage
+  lifecycle policy expires retained invalid uploads. Verify the failed request
+  has `failure_code=invalid_media` before deleting early.
 - **`stage_counts.merge_count` is unexpectedly high**: similarity threshold
   drift or a corrupted embedding cache. Inspect `MemeMergeLog` and the
   enriched detail route's `merge` projection before bumping the threshold.
@@ -147,7 +192,7 @@ rm -rf .artifacts/s02-runtime-smoke
 ## Related references
 
 - `scripts/verify_s02_runtime.py` — the harness implementation.
-- `memexpert/services/content_pipeline_reporting.py` — the aggregation and
+- `memexpert/pipeline/reporting.py` — the aggregation and
   rendering helpers the harness (and tests) share.
 - `memexpert/schemas/content_pipeline.py` — authoritative schemas for the
   enriched detail projections and run summary payload.

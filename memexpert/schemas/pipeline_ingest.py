@@ -1,12 +1,10 @@
 # ruff: noqa: TC001,TC003
 """Typed crawler ingest request/response schemas and operator upload metadata.
 
-S01 introduced the operator upload metadata that rides alongside a manual
-file upload. S04 added the crawler entrypoint: a second ``create_ingest``
-call that consumes the Telegram crawler feed. Both contracts live here so
-callers can import the S01/S04 ingest surface without pulling in the full
-content-pipeline read-model surface. ``memexpert.schemas.content_pipeline``
-re-exports every public name below for backward compatibility.
+The crawler and operator ingest boundary schemas live here so callers can
+import ingest-facing types without pulling in the full content-pipeline
+read-model surface. ``memexpert.schemas.content_pipeline`` re-exports every
+public name below for backward compatibility.
 """
 
 from __future__ import annotations
@@ -110,13 +108,12 @@ class CrawlerForwardAttribution(BaseModel):
 
 
 class RawCrawlerPost(BaseModel):
-    """Typed raw Telegram post fed into the content pipeline crawler entrypoint.
+    """Typed raw Telegram post fed into the crawler ingest entrypoint.
 
-    The service layer consumes this struct verbatim inside
-    ``ContentPipelineService.create_crawler_ingest``. Every field is required
-    by the ingest contract unless explicitly marked optional here.
+    The crawler ingest layer consumes this struct verbatim. Every field is
+    required by the ingest contract unless explicitly marked optional here.
     ``media_bytes`` carries the already-downloaded media payload so the
-    service does not need to own the Telethon client; T02's real adapter
+    ingest service does not need to own the Telethon client; T02's real adapter
     materializes it before calling the service.
     """
 
@@ -174,7 +171,7 @@ class RawCrawlerPost(BaseModel):
 
 
 class CrawlerIngestOutcome(StrEnum):
-    """Terminal outcomes returned by ``ContentPipelineService.create_crawler_ingest``.
+    """Terminal outcomes returned by the crawler ingest service.
 
     The service caller uses these to decide whether the crawler should bump
     its checkpoint, log a no-op, or abort. Both ``SKIPPED_DUPLICATE_POST_ID``

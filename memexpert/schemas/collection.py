@@ -115,6 +115,8 @@ class CollectionCapabilitiesRead(ORMSchema):
     can_rename: bool
     can_delete: bool
     can_create_invites: bool
+    can_revoke_invites: bool
+    can_manage_members: bool
     can_set_active_save: bool
 
 

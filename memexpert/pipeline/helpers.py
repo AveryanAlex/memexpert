@@ -1,13 +1,5 @@
 # ruff: noqa: TC001,TC003
-"""Pure helper functions and the stage-journal snapshot dataclass.
-
-Split out of ``content_pipeline.py`` so every caller of a stateless
-helper (trimmers, filename normalizers, stage-journal ordering, replay
-reservation) can import the helper directly without pulling in the
-full 2700-line service class. Every function below either operates on
-an argument or on a stateless container and never touches
-``ContentPipelineService`` state.
-"""
+"""Pure helper functions and the stage-journal snapshot dataclass."""
 
 from __future__ import annotations
 
@@ -23,17 +15,17 @@ from memexpert.models.enums import (
     ContentPipelineStageStatus,
     SyncTargetKind,
 )
+from memexpert.pipeline.constants import (
+    ACTIVE_STAGE_STATUSES,
+    PIPELINE_REASON_REPLAY_REQUESTED,
+    STAGE_ORDER,
+)
 from memexpert.schemas.content_pipeline import (
     MAX_PIPELINE_ERROR_LENGTH,
     MAX_PIPELINE_REASON_LENGTH,
     ContentPipelineDispatchEvent,
     ContentPipelineItemFilter,
     ContentPipelineSyncTargetPreview,
-)
-from memexpert.services.content_pipeline_constants import (
-    ACTIVE_STAGE_STATUSES,
-    PIPELINE_REASON_REPLAY_REQUESTED,
-    STAGE_ORDER,
 )
 from memexpert.services.errors import (
     PipelineIngestError,
@@ -75,7 +67,7 @@ def trim_error_text(last_error_text: str) -> str:
 def translate_media_processing_error(exc: Exception) -> PipelinePayloadValidationError:
     """Translate a ``PipelineMediaProcessor`` exception to a service-layer payload error."""
 
-    from memexpert.core.media import MediaProcessingError, MediaTimeoutError, MediaValidationError
+    from memexpert.media.contracts import MediaProcessingError, MediaTimeoutError, MediaValidationError
 
     if isinstance(exc, MediaTimeoutError):
         return PipelinePayloadValidationError(str(exc))

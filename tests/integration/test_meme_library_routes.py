@@ -2,18 +2,25 @@
 
 from __future__ import annotations
 
+import json
 import uuid
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from sqlalchemy import func, select
 
 from memexpert.api.dependencies.auth import get_optional_current_user
 from memexpert.api.dependencies.collection import get_collection_service
+from memexpert.api.dependencies.meme import get_analytics_service, get_meme_report_service, get_meme_search_service
+from memexpert.api.routes.v1 import memes as meme_routes
 from memexpert.models.collection import CollectionMeme, PinnedMeme
 from memexpert.models.content import Meme, MemeFile
-from memexpert.models.enums import ContentKind, ContentLanguage, ContentProcessingStatus
+from memexpert.models.enums import AnalyticsEventType, ContentKind, ContentLanguage, ContentProcessingStatus
+from memexpert.models.user import AnalyticsEvent
 from memexpert.schemas.user import UserRead
 from memexpert.services import CollectionService, UserService
+from memexpert.services.analytics import AnalyticsService
+from memexpert.services.meme_search import MemeSearchService
+from memexpert.services.report import MemeReportService
 from tests.conftest import create_full_user_via_upgrade
 
 if TYPE_CHECKING:
@@ -26,6 +33,7 @@ async def _create_meme(
     session: AsyncSession,
     *,
     is_public: bool = True,
+    is_nsfw: bool = False,
     author_user_id: uuid.UUID | None = None,
 ) -> Meme:
     meme_id = uuid.uuid7()
@@ -36,6 +44,7 @@ async def _create_meme(
         primary_file_id=meme_file_id,
         language=ContentLanguage.EN,
         is_public=is_public,
+        is_nsfw=is_nsfw,
         author_user_id=author_user_id,
     )
     meme_file = MemeFile(
@@ -49,6 +58,51 @@ async def _create_meme(
     session.add(meme_file)
     await session.flush()
     return meme
+
+
+def _attribution_payload(source_meme_id: uuid.UUID) -> dict[str, object]:
+    return {
+        "request_id": "req-route-attribution",
+        "impression_id": "imp-route-attribution",
+        "surface": "public_api_meme_similar",
+        "source_algorithm": "qdrant_similarity",
+        "rank": 4,
+        "query": "frog",
+        "filters": {
+            "language": "en",
+            "media_type": "image",
+            "include_nsfw": False,
+            "tags": ["frog"],
+            "scope": "public",
+            "collection_ids": [],
+        },
+        "collection_scope": "public",
+        "collection_ids": [],
+        "source_meme_id": str(source_meme_id),
+        "algorithm_version": "similar-v1",
+        "score": 0.88,
+        "score_components": {"similarity": 0.88, "total": 0.88},
+        "reason": "similarity_match",
+    }
+
+
+def _attribution_query_params(source_meme_id: uuid.UUID) -> dict[str, str]:
+    payload = _attribution_payload(source_meme_id)
+    return {
+        "attribution_request_id": str(payload["request_id"]),
+        "attribution_impression_id": str(payload["impression_id"]),
+        "attribution_surface": str(payload["surface"]),
+        "attribution_source_algorithm": str(payload["source_algorithm"]),
+        "attribution_rank": str(payload["rank"]),
+        "attribution_query": str(payload["query"]),
+        "attribution_filters": json.dumps(payload["filters"]),
+        "attribution_collection_scope": str(payload["collection_scope"]),
+        "attribution_source_meme_id": str(source_meme_id),
+        "attribution_algorithm_version": str(payload["algorithm_version"]),
+        "attribution_score": str(payload["score"]),
+        "attribution_score_components": json.dumps(payload["score_components"]),
+        "attribution_reason": str(payload["reason"]),
+    }
 
 
 async def test_favorite_save_routes_auto_bootstrap_guest_session(
@@ -106,10 +160,14 @@ async def test_full_account_routes_update_active_collection_and_manage_pins(
     def override_collection_service() -> CollectionService:
         return CollectionService(migrated_db_session)
 
+    def override_analytics_service() -> AnalyticsService:
+        return AnalyticsService(migrated_db_session)
+
     async def override_current_user() -> UserRead | None:
         return current_user
 
     app.dependency_overrides[get_collection_service] = override_collection_service
+    app.dependency_overrides[get_analytics_service] = override_analytics_service
     app.dependency_overrides[get_optional_current_user] = override_current_user
     try:
         active_response = await client.put(
@@ -146,6 +204,218 @@ async def test_full_account_routes_update_active_collection_and_manage_pins(
         select(PinnedMeme.meme_id).where(PinnedMeme.user_id == full_user.id).order_by(PinnedMeme.position.asc())
     )
     assert list(persisted_positions) == [second_meme.id, first_meme.id]
+
+
+async def test_detail_and_successful_actions_persist_strict_attribution_events(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    user_service = UserService(migrated_db_session)
+    full_user = await create_full_user_via_upgrade(user_service, email="attribution-actions@example.com")
+    source_meme = await _create_meme(migrated_db_session)
+    target_meme = await _create_meme(migrated_db_session)
+    await migrated_db_session.commit()
+
+    current_user = full_user
+
+    def override_collection_service() -> CollectionService:
+        return CollectionService(migrated_db_session)
+
+    def override_analytics_service() -> AnalyticsService:
+        return AnalyticsService(migrated_db_session)
+
+    def override_meme_search_service() -> MemeSearchService:
+        return MemeSearchService(migrated_db_session)
+
+    def override_report_service() -> MemeReportService:
+        return MemeReportService(session=migrated_db_session)
+
+    async def override_current_user() -> UserRead | None:
+        return current_user
+
+    action_payload = {"attribution": _attribution_payload(source_meme.id)}
+    app.dependency_overrides[get_collection_service] = override_collection_service
+    app.dependency_overrides[get_analytics_service] = override_analytics_service
+    app.dependency_overrides[get_meme_search_service] = override_meme_search_service
+    app.dependency_overrides[get_meme_report_service] = override_report_service
+    app.dependency_overrides[get_optional_current_user] = override_current_user
+    try:
+        detail_response = await client.get(
+            f"/api/v1/memes/{target_meme.id}",
+            params=_attribution_query_params(source_meme.id),
+        )
+        impression_response = await client.post(f"/api/v1/memes/{target_meme.id}/impression", json=action_payload)
+        detail_click_response = await client.post(f"/api/v1/memes/{target_meme.id}/detail-click", json=action_payload)
+        favorite_response = await client.post(f"/api/v1/memes/{target_meme.id}/favorite", json=action_payload)
+        save_response = await client.post(f"/api/v1/memes/{target_meme.id}/save", json=action_payload)
+        pin_response = await client.post(f"/api/v1/memes/{target_meme.id}/pin", json=action_payload)
+        report_response = await client.post(
+            f"/api/v1/memes/{target_meme.id}/report",
+            json={"reason": "spam", "attribution": action_payload["attribution"]},
+        )
+        share_response = await client.post(f"/api/v1/memes/{target_meme.id}/share", json=action_payload)
+        download_response = await client.post(f"/api/v1/memes/{target_meme.id}/download", json=action_payload)
+    finally:
+        app.dependency_overrides.clear()
+
+    assert detail_response.status_code == 200
+    assert impression_response.json() == {"ok": True}
+    assert detail_click_response.json() == {"ok": True}
+    assert favorite_response.status_code == 200
+    assert save_response.status_code == 200
+    assert pin_response.status_code == 200
+    assert report_response.status_code == 200
+    assert share_response.json() == {"ok": True}
+    assert download_response.json() == {"ok": True}
+
+    events = list(
+        (
+            await migrated_db_session.execute(
+                select(AnalyticsEvent).order_by(AnalyticsEvent.occurred_at.asc(), AnalyticsEvent.id.asc())
+            )
+        ).scalars()
+    )
+    assert [event.event_type for event in events] == [
+        AnalyticsEventType.MEME_VIEW,
+        AnalyticsEventType.MEME_IMPRESSION,
+        AnalyticsEventType.MEME_DETAIL_CLICK,
+        AnalyticsEventType.MEME_LIKE,
+        AnalyticsEventType.MEME_SAVE,
+        AnalyticsEventType.MEME_PIN,
+        AnalyticsEventType.MEME_REPORT,
+        AnalyticsEventType.MEME_SHARE,
+        AnalyticsEventType.MEME_DOWNLOAD,
+    ]
+    for event in events:
+        assert event.user_id == full_user.id
+        assert event.payload["request_id"] == "req-route-attribution"
+        assert event.payload["impression_id"] == "imp-route-attribution"
+        assert event.payload["surface"] == "public_api_meme_similar"
+        assert event.payload["source_algorithm"] == "qdrant_similarity"
+        assert event.payload["rank"] == 4
+        assert event.payload["score"] == 0.88
+        assert event.payload["score_components"] == {"similarity": 0.88, "total": 0.88}
+        assert event.payload["reason"] == "similarity_match"
+        refs = cast("dict[str, object]", event.payload["refs"])
+        properties = cast("dict[str, object]", event.payload["properties"])
+        assert refs["meme_id"] == str(target_meme.id)
+        assert refs["source_meme_id"] == str(source_meme.id)
+        assert properties["algorithm_version"] == "similar-v1"
+        assert properties["filters"] == {
+            "language": "en",
+            "media_type": "image",
+            "include_nsfw": False,
+            "tags": ["frog"],
+            "scope": "public",
+            "collection_ids": [],
+        }
+
+
+async def test_share_download_telemetry_respects_private_and_nsfw_visibility(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    user_service = UserService(migrated_db_session)
+    author = await create_full_user_via_upgrade(user_service, email="telemetry-author@example.com")
+    stranger = await create_full_user_via_upgrade(user_service, email="telemetry-stranger@example.com")
+    private_meme = await _create_meme(migrated_db_session, is_public=False, author_user_id=author.id)
+    nsfw_meme = await _create_meme(migrated_db_session, is_nsfw=True)
+    await migrated_db_session.commit()
+
+    current_user = stranger
+
+    def override_analytics_service() -> AnalyticsService:
+        return AnalyticsService(migrated_db_session)
+
+    def override_meme_search_service() -> MemeSearchService:
+        return MemeSearchService(migrated_db_session)
+
+    async def override_current_user() -> UserRead | None:
+        return current_user
+
+    app.dependency_overrides[get_analytics_service] = override_analytics_service
+    app.dependency_overrides[get_meme_search_service] = override_meme_search_service
+    app.dependency_overrides[get_optional_current_user] = override_current_user
+    try:
+        private_share_response = await client.post(f"/api/v1/memes/{private_meme.id}/share", json={})
+        private_impression_response = await client.post(f"/api/v1/memes/{private_meme.id}/impression", json={})
+        private_detail_click_response = await client.post(f"/api/v1/memes/{private_meme.id}/detail-click", json={})
+        private_download_response = await client.post(f"/api/v1/memes/{private_meme.id}/download", json={})
+        nsfw_share_response = await client.post(f"/api/v1/memes/{nsfw_meme.id}/share", json={})
+        nsfw_impression_response = await client.post(f"/api/v1/memes/{nsfw_meme.id}/impression", json={})
+        nsfw_detail_click_response = await client.post(f"/api/v1/memes/{nsfw_meme.id}/detail-click", json={})
+        nsfw_download_response = await client.post(f"/api/v1/memes/{nsfw_meme.id}/download", json={})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert private_share_response.status_code == 404
+    assert private_impression_response.status_code == 404
+    assert private_detail_click_response.status_code == 404
+    assert private_download_response.status_code == 404
+    assert nsfw_share_response.status_code == 404
+    assert nsfw_impression_response.status_code == 404
+    assert nsfw_detail_click_response.status_code == 404
+    assert nsfw_download_response.status_code == 404
+    assert await migrated_db_session.scalar(select(func.count()).select_from(AnalyticsEvent)) == 0
+
+
+async def test_action_succeeds_when_analytics_writer_fails(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+    monkeypatch,
+) -> None:
+    user_service = UserService(migrated_db_session)
+    full_user = await create_full_user_via_upgrade(user_service, email="analytics-failure-action@example.com")
+    meme = await _create_meme(migrated_db_session)
+    await migrated_db_session.commit()
+
+    class FailingAnalyticsService:
+        async def record_interaction_event(self, _event: object) -> None:
+            raise RuntimeError("analytics writer unavailable")
+
+    def override_collection_service() -> CollectionService:
+        return CollectionService(migrated_db_session)
+
+    def override_analytics_service() -> FailingAnalyticsService:
+        return FailingAnalyticsService()
+
+    async def override_current_user() -> UserRead | None:
+        return full_user
+
+    log_calls: list[dict[str, object]] = []
+
+    def capture_exception(_message: str, *, extra: dict[str, object]) -> None:
+        log_calls.append(extra)
+
+    monkeypatch.setattr(meme_routes.logger, "exception", capture_exception)
+    app.dependency_overrides[get_collection_service] = override_collection_service
+    app.dependency_overrides[get_analytics_service] = override_analytics_service
+    app.dependency_overrides[get_optional_current_user] = override_current_user
+    try:
+        response = await client.post(
+            f"/api/v1/memes/{meme.id}/save",
+            json={"attribution": _attribution_payload(meme.id)},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert await migrated_db_session.scalar(select(func.count()).select_from(CollectionMeme)) == 1
+    assert await migrated_db_session.scalar(select(func.count()).select_from(AnalyticsEvent)) == 0
+
+    assert log_calls == [
+        {
+            "analytics_event_type": AnalyticsEventType.MEME_SAVE.value,
+            "meme_id": str(meme.id),
+            "user_id": str(full_user.id),
+            "request_id": "req-route-attribution",
+            "impression_id": "imp-route-attribution",
+            "surface": "public_api_meme_similar",
+        }
+    ]
 
 
 async def test_library_route_returns_cards_collections_and_active_save_state(
@@ -201,10 +471,14 @@ async def test_library_routes_reject_private_memes_not_visible_to_user(
     def override_collection_service() -> CollectionService:
         return CollectionService(migrated_db_session)
 
+    def override_analytics_service() -> AnalyticsService:
+        return AnalyticsService(migrated_db_session)
+
     async def override_current_user() -> UserRead | None:
         return UserRead.model_validate(stranger)
 
     app.dependency_overrides[get_collection_service] = override_collection_service
+    app.dependency_overrides[get_analytics_service] = override_analytics_service
     app.dependency_overrides[get_optional_current_user] = override_current_user
     try:
         favorite_response = await client.post(f"/api/v1/memes/{private_meme.id}/favorite")

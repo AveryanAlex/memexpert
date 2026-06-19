@@ -1,13 +1,5 @@
 # ruff: noqa: TC003
-"""Crawler-side SELECT/UPDATE helpers shared by the content-pipeline service.
-
-Extracted from :mod:`content_pipeline` so the S04 crawler ingest surface can
-be read without scrolling through the S01-S03 upload/stage/inspect surfaces.
-Every function takes the SQLAlchemy session explicitly instead of relying on
-``self._session`` because that's how the service now delegates work to pure
-helpers — the service itself owns the transaction boundary and simply forwards
-its session to these helpers.
-"""
+"""Crawler-side SELECT/UPDATE helpers shared by pipeline ingest code."""
 
 from __future__ import annotations
 
@@ -18,7 +10,7 @@ from typing import TYPE_CHECKING
 from sqlalchemy import select
 
 from memexpert.models.content import MemeFile, MemeSource, SourceChannel
-from memexpert.services.content_pipeline_helpers import compare_telegram_post_ids
+from memexpert.pipeline.helpers import compare_telegram_post_ids
 from memexpert.services.errors import CrawlerChannelNotTrackedError
 
 if TYPE_CHECKING:

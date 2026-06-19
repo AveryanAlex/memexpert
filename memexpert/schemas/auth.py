@@ -89,6 +89,41 @@ class CurrentSessionRead(BaseModel):
     linked_providers: LinkedProvidersRead
 
 
+class ProfileStatsTagRead(BaseModel):
+    """One real tag ranked by the caller's persisted interaction events."""
+
+    tag: str
+    count: int = Field(ge=0)
+
+
+class ProfileStatsTemplateRead(BaseModel):
+    """One real meme template ranked by the caller's persisted interaction events."""
+
+    template_id: uuid.UUID
+    slug: str
+    name: str
+    count: int = Field(ge=0)
+
+
+class ProfileStatsMetadataRead(BaseModel):
+    """Explain why profile stats or rankings may be empty or partial."""
+
+    notes: list[str] = Field(default_factory=list)
+
+
+class ProfileStatsRead(BaseModel):
+    """Profile interaction stats derived from persisted analytics events."""
+
+    viewed: int = Field(ge=0)
+    sent: int = Field(ge=0)
+    saved: int = Field(ge=0)
+    downloaded: int = Field(ge=0)
+    days_active: int = Field(ge=0)
+    top_tags: list[ProfileStatsTagRead] = Field(default_factory=list)
+    top_templates: list[ProfileStatsTemplateRead] = Field(default_factory=list)
+    metadata: ProfileStatsMetadataRead = Field(default_factory=ProfileStatsMetadataRead)
+
+
 class UserPreferencesUpdateRequest(BaseModel):
     """Partial authenticated update for user-controlled preferences."""
 
@@ -250,6 +285,10 @@ __all__ = [
     "GoogleAuthRequest",
     "GuestBootstrapRequest",
     "LinkedProvidersRead",
+    "ProfileStatsMetadataRead",
+    "ProfileStatsRead",
+    "ProfileStatsTagRead",
+    "ProfileStatsTemplateRead",
     "TelegramLinkStartRead",
     "TelegramMiniAppAuthRequest",
     "TelegramWidgetAuthRequest",

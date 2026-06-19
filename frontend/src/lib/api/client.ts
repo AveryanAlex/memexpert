@@ -12,12 +12,17 @@ import type {
   AdminSourceChannelRead,
   ChannelSuggestionRead,
   CollectionInviteLinkRead,
+  CollectionInviteRead,
+  CollectionMemberRead,
   CollectionMembershipRole,
   CollectionVisibility,
   ContentKind,
   ContentLanguage,
   CurrentSessionRead,
   MemeLibraryRead,
+  MemeSearchScope,
+  PinnedMemeRead,
+  ProfileStatsRead,
   PublicMemeDetailRead,
   PublicMemeLandingRead,
   PublicMemePopularitySummaryRead,
@@ -39,6 +44,8 @@ import type {
   WebCollectionListRead,
   WebCollectionSummaryRead
 } from './types';
+import { memeAttributionSearchParams } from '$lib/memeActions';
+import type { MemeActionAttribution } from '$lib/memeActions';
 
 export const DEFAULT_PAGE_SIZE = 12;
 
@@ -57,12 +64,20 @@ interface PageRequest extends CatalogRequest {
   includeNsfw?: boolean;
   mediaType?: ContentKind | null;
   language?: ContentLanguage | null;
+  scope?: MemeSearchScope | null;
+  collectionIds?: string[];
   limit: number;
   offset: number;
 }
 
 interface DetailRequest extends CatalogRequest {
   memeId: string;
+  attribution?: MemeActionAttribution | null;
+}
+
+interface SimilarMemeRequest extends DetailRequest {
+  limit: number;
+  offset: number;
 }
 
 interface TrendRequest extends CatalogRequest {
@@ -87,6 +102,8 @@ interface MemeActionRequest {
   cookieHeader?: string;
   onResponse?: (response: Response) => void;
   memeId: string;
+  body?: unknown;
+  keepalive?: boolean;
 }
 
 interface MemeReportRequest extends MemeActionRequest {
@@ -108,6 +125,10 @@ interface PreferenceMutationRequest {
 
 export interface RemoveActionResponse {
   removed?: boolean;
+}
+
+export interface MemeInteractionRecordedResponse {
+  ok: boolean;
 }
 
 interface JsonMutationRequest extends CatalogRequest {
@@ -133,6 +154,14 @@ export interface CollectionInvitePayload {
   label?: string | null;
   max_uses?: number | null;
   expires_in_hours?: number | null;
+}
+
+export interface CollectionMemberRolePayload {
+  role: Exclude<CollectionMembershipRole, 'owner'>;
+}
+
+export interface PinReorderPayload {
+  meme_ids: string[];
 }
 
 export interface UserPreferencesUpdate {
@@ -187,6 +216,19 @@ export async function fetchMemePage(request: PageRequest): Promise<PublicMemeSea
     params.set('language', request.language);
   }
 
+  if (request.scope) {
+    params.set('scope', request.scope);
+  }
+
+  if (request.scope === 'collections') {
+    for (const collectionId of request.collectionIds ?? []) {
+      const normalized = collectionId.trim();
+      if (normalized) {
+        params.append('collection_ids', normalized);
+      }
+    }
+  }
+
   if (query) {
     params.set('query', query);
     return apiGet<PublicMemeSearchPageRead>('/api/v1/memes/search', params, request);
@@ -197,6 +239,10 @@ export async function fetchMemePage(request: PageRequest): Promise<PublicMemeSea
 
 export async function fetchCurrentSession(request: CatalogRequest): Promise<CurrentSessionRead> {
   return apiJson<CurrentSessionRead>('/api/v1/auth/session', undefined, request);
+}
+
+export async function fetchProfileStats(request: CatalogRequest): Promise<ProfileStatsRead> {
+  return apiGet<ProfileStatsRead>('/api/v1/auth/profile-stats', new URLSearchParams(), request);
 }
 
 export async function refreshCurrentSession(request: CatalogRequest): Promise<CurrentSessionRead> {
@@ -210,9 +256,22 @@ export async function startTelegramLink(request: CatalogRequest): Promise<Telegr
 export async function fetchMemeDetail(request: DetailRequest): Promise<PublicMemeDetailRead> {
   const encoded = encodeURIComponent(request.memeId);
   const path = isUuid(request.memeId) ? `/api/v1/memes/${encoded}` : `/api/v1/memes/slug/${encoded}`;
+  const params = new URLSearchParams({ include_nsfw: 'false' });
+  const attributionParams = memeAttributionSearchParams(request.attribution);
+  for (const [key, value] of attributionParams) {
+    params.append(key, value);
+  }
   return apiGet<PublicMemeDetailRead>(
     path,
-    new URLSearchParams({ include_nsfw: 'false' }),
+    params,
+    request
+  );
+}
+
+export async function fetchSimilarMemes(request: SimilarMemeRequest): Promise<PublicMemeSearchPageRead> {
+  return apiGet<PublicMemeSearchPageRead>(
+    `/api/v1/memes/${encodeURIComponent(request.memeId)}/similar`,
+    new URLSearchParams({ include_nsfw: 'false', limit: String(request.limit), offset: String(request.offset) }),
     request
   );
 }
@@ -334,6 +393,32 @@ export async function createCollectionInvite(
   return apiWrite<CollectionInviteLinkRead>(`/api/v1/collections/${encodeURIComponent(request.collectionId)}/invites`, 'POST', request);
 }
 
+export async function revokeCollectionInvite(request: CatalogRequest & { collectionId: string; inviteId: string }): Promise<CollectionInviteRead> {
+  return apiWrite<CollectionInviteRead>(
+    `/api/v1/collections/${encodeURIComponent(request.collectionId)}/invites/${encodeURIComponent(request.inviteId)}`,
+    'DELETE',
+    request
+  );
+}
+
+export async function updateCollectionMemberRole(
+  request: CatalogRequest & { collectionId: string; memberUserId: string; body: CollectionMemberRolePayload }
+): Promise<CollectionMemberRead> {
+  return apiWrite<CollectionMemberRead>(
+    `/api/v1/collections/${encodeURIComponent(request.collectionId)}/members/${encodeURIComponent(request.memberUserId)}`,
+    'PATCH',
+    request
+  );
+}
+
+export async function removeCollectionMember(request: CatalogRequest & { collectionId: string; memberUserId: string }): Promise<RemoveActionResponse> {
+  return apiWrite<RemoveActionResponse>(
+    `/api/v1/collections/${encodeURIComponent(request.collectionId)}/members/${encodeURIComponent(request.memberUserId)}`,
+    'DELETE',
+    request
+  );
+}
+
 export async function joinCollectionInvite(request: CatalogRequest & { token: string }): Promise<WebCollectionSummaryRead> {
   return apiWrite<WebCollectionSummaryRead>(`/api/v1/collections/invites/${encodeURIComponent(request.token)}/join`, 'POST', request);
 }
@@ -361,11 +446,33 @@ export async function unpinMeme(request: MemeActionRequest): Promise<RemoveActio
   return apiMutation(`/api/v1/memes/${encodeURIComponent(request.memeId)}/pin`, 'DELETE', request);
 }
 
+export async function reorderPins(request: CatalogRequest & { body: PinReorderPayload }): Promise<PinnedMemeRead[]> {
+  return apiWrite<PinnedMemeRead[]>('/api/v1/memes/pins/reorder', 'PUT', request);
+}
+
 export async function reportMeme(request: MemeReportRequest): Promise<MemeReportRead> {
+  const attribution = readActionAttribution(request.body);
   return apiJsonWrite<MemeReportRead>(`/api/v1/memes/${encodeURIComponent(request.memeId)}/report`, 'POST', request, {
     reason: request.reason,
-    note: request.note ?? null
+    note: request.note ?? null,
+    ...(attribution === undefined ? {} : { attribution })
   });
+}
+
+export async function recordMemeShare(request: MemeActionRequest): Promise<MemeInteractionRecordedResponse> {
+  return apiMutation<MemeInteractionRecordedResponse>(`/api/v1/memes/${encodeURIComponent(request.memeId)}/share`, 'POST', request);
+}
+
+export async function recordMemeImpression(request: MemeActionRequest): Promise<MemeInteractionRecordedResponse> {
+  return apiMutation<MemeInteractionRecordedResponse>(`/api/v1/memes/${encodeURIComponent(request.memeId)}/impression`, 'POST', request);
+}
+
+export async function recordMemeDetailClick(request: MemeActionRequest): Promise<MemeInteractionRecordedResponse> {
+  return apiMutation<MemeInteractionRecordedResponse>(`/api/v1/memes/${encodeURIComponent(request.memeId)}/detail-click`, 'POST', request);
+}
+
+export async function recordMemeDownload(request: MemeActionRequest): Promise<MemeInteractionRecordedResponse> {
+  return apiMutation<MemeInteractionRecordedResponse>(`/api/v1/memes/${encodeURIComponent(request.memeId)}/download`, 'POST', request);
 }
 
 export async function fetchTagLanding(request: LandingRequest): Promise<PublicMemeLandingRead> {
@@ -629,6 +736,10 @@ async function apiJson<T>(
 
 async function apiMutation<T>(path: string, method: 'DELETE' | 'POST', request: MemeActionRequest): Promise<T> {
   const headers = new Headers({ accept: 'application/json', 'x-requested-with': 'XMLHttpRequest' });
+  const body = method === 'POST' ? request.body : undefined;
+  if (body !== undefined) {
+    headers.set('content-type', 'application/json');
+  }
   if (request.cookieHeader) {
     headers.set('cookie', request.cookieHeader);
   }
@@ -636,7 +747,9 @@ async function apiMutation<T>(path: string, method: 'DELETE' | 'POST', request: 
   const response = await request.fetch(buildApiInput(path, request.baseUrl), {
     method,
     headers,
-    credentials: 'include'
+    credentials: 'include',
+    keepalive: request.keepalive,
+    body: body === undefined ? undefined : JSON.stringify(body)
   });
   request.onResponse?.(response);
   const payload = await readJson(response);
@@ -738,6 +851,13 @@ function buildApiInput(path: string, baseUrl: string | undefined): RequestInfo |
   return baseUrl ? new URL(path, baseUrl) : path;
 }
 
+function readActionAttribution(body: unknown): unknown | undefined {
+  if (!body || typeof body !== 'object' || !('attribution' in body)) {
+    return undefined;
+  }
+  return body.attribution;
+}
+
 async function readJson(response: Response): Promise<unknown> {
   const text = await response.text();
   if (!text) {
@@ -766,7 +886,8 @@ export function emptyMemePage(limit: number, offset: number): PublicMemeSearchPa
     limit,
     offset,
     total: 0,
-    has_more: false
+    has_more: false,
+    request_id: 'req_empty'
   };
 }
 
@@ -776,7 +897,8 @@ export function emptyTrendPage(limit: number, offset: number): PublicMemeTrendPa
     limit,
     offset,
     total: 0,
-    has_more: false
+    has_more: false,
+    request_id: 'req_empty'
   };
 }
 

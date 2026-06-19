@@ -1,11 +1,9 @@
 """Normalized failure-reason codes and dead-letter payload type for the pipeline runtime.
 
 These constants mirror (intentionally) the ``PIPELINE_REASON_*`` strings the
-service layer writes into ``PipelineStageJournal.normalized_reason``. We keep
-the mirror separate from :mod:`memexpert.services.content_pipeline` to avoid a
-cyclical worker → service → worker import chain. Any reason string added here
-must also be recognised by the service layer's replay allow-list if it should
-be treated as retryable.
+stage completion service writes into ``PipelineStageJournal.normalized_reason``.
+Any reason string added here must also be recognised by the pipeline replay
+allow-list if it should be treated as retryable.
 """
 
 from __future__ import annotations
@@ -28,6 +26,7 @@ PIPELINE_REASON_FORCED_SYNC_MEILI_FAILURE = "forced_sync_meili_failure"
 PIPELINE_REASON_FORCED_SYNC_QDRANT_FAILURE = "forced_sync_qdrant_failure"
 PIPELINE_REASON_FORCED_TRANSCODE_FAILURE = "forced_transcode_failure"
 PIPELINE_REASON_MALFORMED_EVENT = "malformed_dispatch_event"
+PIPELINE_REASON_MEDIA_INSPECT_FAILED = "media_inspect_failed"
 PIPELINE_REASON_OCR_FAILED = "ocr_stage_failed"
 PIPELINE_REASON_OCR_PROVIDER_BLOCKED = "ocr_provider_blocked"
 PIPELINE_REASON_OCR_TIMEOUT = "ocr_timeout"

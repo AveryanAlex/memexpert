@@ -1,11 +1,13 @@
 <script lang="ts">
   import { page } from '$app/state';
+  import { recordMemeDownload } from '$lib/api/client';
   import MemeActionMenu from '$lib/features/memes/MemeActionMenu.svelte';
   import MemeGrid from '$lib/features/memes/MemeGrid.svelte';
   import MemeMedia from '$lib/features/memes/MemeMedia.svelte';
   import TrendSparkline from '$lib/features/trends/TrendSparkline.svelte';
   import TrendSummary from '$lib/features/trends/TrendSummary.svelte';
   import { buildMemeDetailView, buildRelatedDiscovery, formatFileSize } from '$lib/meme-detail-view';
+  import { memeActionAttributionBody } from '$lib/memeActions';
   import { ActionLink, Badge, Card, EmptyState, Notice } from '$lib/ui';
   import type { ActionData, PageData } from './$types';
 
@@ -17,6 +19,11 @@
 
   function tagHref(tag: string): string {
     return `/tags/${encodeURIComponent(tag)}`;
+  }
+
+  function recordDirectDownload() {
+    if (!data.meme) return;
+    void recordMemeDownload({ fetch, memeId: data.meme.id, body: memeActionAttributionBody(data.attribution) }).catch(() => undefined);
   }
 </script>
 
@@ -74,7 +81,7 @@
         {/if}
 
         {#if detail.downloadUrl}
-          <ActionLink variant="secondary" size="compact" href={detail.downloadUrl} download>Direct media download</ActionLink>
+          <ActionLink variant="secondary" size="compact" href={detail.downloadUrl} download onclick={recordDirectDownload}>Direct media download</ActionLink>
         {:else}
           <p class="m-0 text-muted">Download is unavailable until the catalog exposes a media download URL.</p>
         {/if}
@@ -104,7 +111,7 @@
           <h2 class="m-0 text-2xl font-black tracking-[-0.04em]">Share, save, or report</h2>
           <p class="m-0 text-muted">Use the public action surface for likes, favorites, active saves, pins, sharing, downloads, and moderation reports.</p>
         </div>
-        <MemeActionMenu meme={data.meme} showPrimary showSharing />
+        <MemeActionMenu meme={data.meme} attribution={data.attribution} showPrimary showSharing />
       </Card>
 
       {#if detail.bodyText || detail.detectedText}
@@ -172,7 +179,7 @@
     </div>
 
     {#if related.memes.length > 0}
-      <MemeGrid memes={related.memes} label="Discovery memes" />
+      <MemeGrid memes={related.memes} attributions={related.attributions} label="Discovery memes" />
     {:else}
       <p class="m-0 text-muted">No additional public memes were returned for this discovery fallback.</p>
     {/if}

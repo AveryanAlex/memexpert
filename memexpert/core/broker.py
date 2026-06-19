@@ -29,6 +29,7 @@ class PipelineBrokerSettings:
     url: str
     exchange: str
     routing_key_prefix: str
+    media_inspect_queue: str
     transcode_queue: str
     ocr_queue: str
     embed_queue: str
@@ -42,6 +43,24 @@ class PipelineBrokerSettings:
     retry_max_attempts: int
     retry_backoff_seconds: float
     connection_timeout: float
+
+    @property
+    def media_inspect_routing_key(self) -> str:
+        """Return the routing key used to dispatch raw media inspection work."""
+
+        return f"{self.routing_key_prefix}.media_inspect"
+
+    @property
+    def media_inspect_retry_request_routing_key(self) -> str:
+        """Return the retry-exchange routing key used by media-inspect failures."""
+
+        return f"{self.routing_key_prefix}.retry.media_inspect"
+
+    @property
+    def media_inspect_retry_routing_key(self) -> str:
+        """Return the routing key used when retried media-inspect work returns."""
+
+        return f"{self.routing_key_prefix}.media_inspect_retry"
 
     @property
     def transcode_routing_key(self) -> str:
@@ -267,6 +286,10 @@ def get_pipeline_broker_settings(settings: Settings | None = None) -> PipelineBr
             resolved_settings.pipeline_broker_routing_key_prefix,
             field_name="pipeline_broker_routing_key_prefix",
         ),
+        media_inspect_queue=_normalize_topology_name(
+            resolved_settings.pipeline_broker_media_inspect_queue,
+            field_name="pipeline_broker_media_inspect_queue",
+        ),
         transcode_queue=_normalize_topology_name(
             resolved_settings.pipeline_broker_transcode_queue,
             field_name="pipeline_broker_transcode_queue",
@@ -406,6 +429,14 @@ async def verify_pipeline_broker(
                     ExchangeType.TOPIC,
                     durable=True,
                 )
+                media_inspect_queue = await channel.declare_queue(
+                    broker_settings.media_inspect_queue,
+                    durable=True,
+                    arguments={
+                        "x-dead-letter-exchange": broker_settings.retry_exchange,
+                        "x-dead-letter-routing-key": broker_settings.media_inspect_retry_request_routing_key,
+                    },
+                )
                 transcode_queue = await channel.declare_queue(
                     broker_settings.transcode_queue,
                     durable=True,
@@ -423,13 +454,31 @@ async def verify_pipeline_broker(
                         "x-dead-letter-routing-key": broker_settings.transcode_retry_routing_key,
                     },
                 )
+                media_inspect_retry_queue = await channel.declare_queue(
+                    f"{broker_settings.media_inspect_queue}.retry",
+                    durable=True,
+                    arguments={
+                        "x-message-ttl": broker_settings.retry_backoff_milliseconds,
+                        "x-dead-letter-exchange": broker_settings.exchange,
+                        "x-dead-letter-routing-key": broker_settings.media_inspect_retry_routing_key,
+                    },
+                )
                 dead_letter_queue = await channel.declare_queue(
                     broker_settings.dead_letter_queue,
                     durable=True,
                 )
+                _ = await media_inspect_queue.bind(exchange, routing_key=broker_settings.media_inspect_routing_key)
+                _ = await media_inspect_queue.bind(
+                    exchange,
+                    routing_key=broker_settings.media_inspect_retry_routing_key,
+                )
                 _ = await transcode_queue.bind(exchange, routing_key=broker_settings.meme_created_routing_key)
                 _ = await transcode_queue.bind(exchange, routing_key=broker_settings.stage_replay_routing_key)
                 _ = await transcode_queue.bind(exchange, routing_key=broker_settings.transcode_retry_routing_key)
+                _ = await media_inspect_retry_queue.bind(
+                    retry_exchange,
+                    routing_key=broker_settings.media_inspect_retry_request_routing_key,
+                )
                 _ = await retry_queue.bind(retry_exchange, routing_key=broker_settings.retry_routing_key)
                 _ = await dead_letter_queue.bind(
                     dead_letter_exchange,

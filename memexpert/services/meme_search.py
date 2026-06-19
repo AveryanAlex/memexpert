@@ -15,12 +15,19 @@ from sqlalchemy import Select, and_, any_, false, func, literal, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from memexpert.core.qdrant import QdrantUserSearchClientProtocol, QdrantUserSearchMatch
+from memexpert.core.config import Settings, get_settings
+from memexpert.core.qdrant import (
+    QdrantSimilarityClientProtocol,
+    QdrantSimilarityMatch,
+    QdrantUserSearchClientProtocol,
+    QdrantUserSearchMatch,
+)
 from memexpert.core.search_index_prefilter import SearchIndexPrefilter, SearchIndexPrefilterScope
+from memexpert.core.voyage import VoyageEmbeddingError, decode_embedding_bytes
 from memexpert.models.base import utcnow
 from memexpert.models.collection import Collection, CollectionMember, CollectionMeme, PinnedMeme
-from memexpert.models.content import Meme, MemeFile, MemePopularitySnapshot, MemeSeoPage, MemeTemplate
-from memexpert.models.enums import AnalyticsEventType, CollectionKind, ContentKind, ContentLanguage
+from memexpert.models.content import EmbeddingCache, Meme, MemeFile, MemePopularitySnapshot, MemeSeoPage, MemeTemplate
+from memexpert.models.enums import AnalyticsEventType, CollectionKind, ContentKind, ContentLanguage, EmbeddingInputType
 from memexpert.models.user import AnalyticsEvent, User
 from memexpert.schemas.meme import (
     MemeCardRead,
@@ -55,6 +62,7 @@ TRENDING_POPULARITY_WEIGHT = 0.15
 TRENDING_LIKE_WEIGHT = 0.05
 POPULAR_ALGORITHM_VERSION = "popular_v1"
 LEGACY_TRENDING_ALGORITHM_VERSION = "legacy_trending_v1"
+QDRANT_SIMILARITY_ALGORITHM_VERSION = SEARCH_INDEX_ALGORITHM_VERSION
 TRENDING_EVENT_WEIGHTS = {
     AnalyticsEventType.MEME_DOWNLOAD: 2.0,
     AnalyticsEventType.MEME_VIEW: 1.0,
@@ -140,6 +148,16 @@ class _CollectedCandidates:
 
 
 @dataclass(frozen=True, slots=True)
+class _SimilarCandidate:
+    meme: Meme
+    source_algorithm: str
+    reason: str
+    score: float | None = None
+    score_components: dict[str, float] | None = None
+    algorithm_version: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class _ViewerMemeActionState:
     favorited_meme_ids: frozenset[uuid.UUID] = frozenset()
     saved_meme_ids: frozenset[uuid.UUID] = frozenset()
@@ -172,14 +190,18 @@ class MemeSearchService:
         *,
         text_client: MemeTextSearchClientProtocol | None = None,
         semantic_client: QdrantUserSearchClientProtocol | None = None,
+        similarity_client: QdrantSimilarityClientProtocol | None = None,
         query_embedding_client: MemeQueryEmbeddingClientProtocol | None = None,
         media_render_service: MediaRenderUrlService | None = None,
+        settings: Settings | None = None,
     ) -> None:
         self._session = session
         self._text_client = text_client
         self._semantic_client = semantic_client
+        self._similarity_client = similarity_client
         self._query_embedding_client = query_embedding_client
         self._media_render_service = media_render_service or MediaRenderUrlService()
+        self._settings = settings or get_settings()
 
     async def search_memes(
         self,
@@ -352,12 +374,18 @@ class MemeSearchService:
         viewer_user_id: uuid.UUID | None = None,
         include_nsfw: bool = False,
     ) -> PublicMemeDetailRead:
-        meme = await self._load_public_meme_by_id(meme_id, include_nsfw=include_nsfw)
+        meme = await self._load_public_or_authorized_meme_by_id(
+            meme_id,
+            viewer_user_id=viewer_user_id,
+            include_nsfw=include_nsfw,
+        )
         action_state = await self._load_viewer_action_state((meme.id,), viewer_user_id=viewer_user_id)
-        return _to_public_detail_read(
+        viewer_access = await self._load_detail_viewer_access_marker(meme, viewer_user_id=viewer_user_id)
+        return _to_authorized_detail_read(
             meme,
             media_render_service=self._media_render_service,
             viewer_action_state=action_state,
+            viewer_access=viewer_access,
         )
 
     async def get_public_meme_detail_by_slug(
@@ -367,15 +395,100 @@ class MemeSearchService:
         viewer_user_id: uuid.UUID | None = None,
         include_nsfw: bool = False,
     ) -> PublicMemeDetailRead:
-        meme = await self._load_public_meme_by_slug(
+        meme = await self._load_public_or_authorized_meme_by_slug(
             slug,
+            viewer_user_id=viewer_user_id,
             include_nsfw=include_nsfw,
         )
         action_state = await self._load_viewer_action_state((meme.id,), viewer_user_id=viewer_user_id)
-        return _to_public_detail_read(
+        viewer_access = await self._load_detail_viewer_access_marker(meme, viewer_user_id=viewer_user_id)
+        return _to_authorized_detail_read(
             meme,
             media_render_service=self._media_render_service,
             viewer_action_state=action_state,
+            viewer_access=viewer_access,
+        )
+
+    async def get_public_similar_memes(
+        self,
+        meme_id: uuid.UUID,
+        *,
+        viewer_user_id: uuid.UUID | None = None,
+        include_nsfw: bool = False,
+        limit: int = 20,
+        offset: int = 0,
+        surface: str = "public_api_meme_similar",
+    ) -> PublicMemeSearchPageRead:
+        """Return public memes related to a source meme, led by Qdrant visual similarity.
+
+        Qdrant is treated only as a candidate source. PostgreSQL remains the access
+        and NSFW authority before any public card leaves the service.
+        """
+
+        source_meme = await self._load_public_meme_by_id(meme_id, include_nsfw=include_nsfw)
+        resolved_filters = _resolve_search_filters(
+            MemeSearchFilters(include_nsfw=include_nsfw, scope=MemeSearchScope.PUBLIC),
+            viewer_user_id=viewer_user_id,
+            default_scope=MemeSearchScope.PUBLIC,
+        )
+        resolved_limit = _clamp_limit(limit)
+        resolved_offset = max(0, offset)
+        request_id = new_discovery_request_id()
+        target_count = resolved_offset + resolved_limit + 1
+
+        candidates, fallback_reason = await self._qdrant_similar_candidates(
+            source_meme,
+            filters=resolved_filters,
+            target_count=target_count,
+        )
+        seen_meme_ids = {source_meme.id, *(candidate.meme.id for candidate in candidates)}
+        if len(candidates) < target_count:
+            candidates.extend(
+                await self._similar_fallback_candidates(
+                    source_meme,
+                    filters=resolved_filters,
+                    seen_meme_ids=seen_meme_ids,
+                    target_count=target_count,
+                    reason=fallback_reason or "similarity_backfill",
+                )
+            )
+
+        page_candidates = candidates[resolved_offset : resolved_offset + resolved_limit]
+        items: list[MemeSearchResultRead] = []
+        for rank, candidate in enumerate(page_candidates, start=resolved_offset + 1):
+            score_read = _similar_candidate_score_read(candidate)
+            items.append(
+                MemeSearchResultRead(
+                    meme=_to_card_read(candidate.meme),
+                    score=score_read,
+                    attribution=_build_result_attribution(
+                        request_id=request_id,
+                        surface=surface,
+                        source_algorithm=candidate.source_algorithm,
+                        rank=rank,
+                        query=None,
+                        filters=resolved_filters,
+                        score=candidate.score,
+                        score_components=candidate.score_components or {},
+                        algorithm_version=candidate.algorithm_version,
+                        source_meme_id=source_meme.id,
+                        reason=candidate.reason,
+                    ),
+                )
+            )
+
+        page = MemeSearchPageRead(
+            items=items,
+            limit=resolved_limit,
+            offset=resolved_offset,
+            total=len(candidates),
+            has_more=len(candidates) > resolved_offset + resolved_limit,
+            request_id=request_id,
+        )
+        return await self._to_public_search_page(
+            page,
+            viewer_user_id=viewer_user_id,
+            filters=resolved_filters,
         )
 
     async def get_public_meme_cards_by_ids(
@@ -986,6 +1099,21 @@ class MemeSearchService:
             raise MemeNotFoundError("Meme was not found or is not publicly visible.")
         return meme
 
+    async def _load_public_or_authorized_meme_by_id(
+        self,
+        meme_id: uuid.UUID,
+        *,
+        viewer_user_id: uuid.UUID | None,
+        include_nsfw: bool,
+    ) -> Meme:
+        if viewer_user_id is None:
+            return await self._load_public_meme_by_id(meme_id, include_nsfw=include_nsfw)
+        return await self._load_visible_meme_by_id(
+            meme_id,
+            viewer_user_id=viewer_user_id,
+            include_nsfw=include_nsfw,
+        )
+
     async def _load_public_meme_by_slug(
         self,
         slug: str,
@@ -1000,6 +1128,197 @@ class MemeSearchService:
         if meme is None:
             raise MemeNotFoundError("Meme slug was not found or is not publicly visible.")
         return meme
+
+    async def _load_public_or_authorized_meme_by_slug(
+        self,
+        slug: str,
+        *,
+        viewer_user_id: uuid.UUID | None,
+        include_nsfw: bool,
+    ) -> Meme:
+        if viewer_user_id is None:
+            return await self._load_public_meme_by_slug(slug, include_nsfw=include_nsfw)
+        return await self._load_visible_meme_by_slug(
+            slug,
+            viewer_user_id=viewer_user_id,
+            include_nsfw=include_nsfw,
+        )
+
+    async def _qdrant_similar_candidates(
+        self,
+        source_meme: Meme,
+        *,
+        filters: MemeSearchFilters,
+        target_count: int,
+    ) -> tuple[list[_SimilarCandidate], str | None]:
+        if source_meme.primary_file_id is None:
+            return [], "missing_embedding"
+
+        vector = await self._load_primary_image_embedding_vector(source_meme.primary_file_id)
+        if vector is None:
+            return [], "missing_embedding"
+
+        if self._similarity_client is None:
+            logger.warning("Qdrant similarity client is not configured; using public fallback recommendations.")
+            return [], "qdrant_failure"
+
+        try:
+            matches = await self._similarity_client.find_similar_memes(
+                vector=vector,
+                current_meme_file_id=source_meme.primary_file_id,
+                limit=max(20, target_count * 4),
+            )
+        except Exception:
+            logger.exception("Qdrant meme similarity lookup failed; using public fallback recommendations.")
+            return [], "qdrant_failure"
+
+        ordered_matches = _dedupe_similarity_matches(matches, source_meme_id=source_meme.id)
+        if not ordered_matches:
+            return [], "similarity_empty"
+
+        memes = await self._load_visible_memes(
+            tuple(match.meme_id for match in ordered_matches),
+            viewer_user_id=None,
+            filters=filters,
+        )
+        memes_by_id = {meme.id: meme for meme in memes}
+        candidates: list[_SimilarCandidate] = []
+        for match in ordered_matches:
+            meme = memes_by_id.get(match.meme_id)
+            if meme is None:
+                continue
+            candidates.append(
+                _SimilarCandidate(
+                    meme=meme,
+                    source_algorithm="qdrant_similarity",
+                    reason="qdrant_similarity",
+                    score=match.similarity_score,
+                    score_components={"similarity": match.similarity_score, "total": match.similarity_score},
+                    algorithm_version=QDRANT_SIMILARITY_ALGORITHM_VERSION,
+                )
+            )
+            if len(candidates) >= target_count:
+                break
+
+        return (candidates, None) if candidates else ([], "similarity_empty")
+
+    async def _load_primary_image_embedding_vector(self, meme_file_id: uuid.UUID) -> tuple[float, ...] | None:
+        cache_row = await self._session.scalar(
+            select(EmbeddingCache)
+            .where(
+                EmbeddingCache.source_file_id == meme_file_id,
+                EmbeddingCache.input_type == EmbeddingInputType.IMAGE,
+            )
+            .order_by(EmbeddingCache.created_at.desc())
+            .limit(1)
+        )
+        if cache_row is None:
+            return None
+
+        try:
+            return decode_embedding_bytes(
+                cache_row.embedding,
+                dimensions=self._settings.pipeline_voyage_output_dimensions,
+            )
+        except VoyageEmbeddingError:
+            logger.exception("Stored meme image embedding could not be decoded; using public fallback recommendations.")
+            return None
+
+    async def _similar_fallback_candidates(
+        self,
+        source_meme: Meme,
+        *,
+        filters: MemeSearchFilters,
+        seen_meme_ids: set[uuid.UUID],
+        target_count: int,
+        reason: str,
+    ) -> list[_SimilarCandidate]:
+        candidates: list[_SimilarCandidate] = []
+        source_tags = frozenset(tag.strip().lower() for tag in source_meme.tags if tag.strip())
+
+        if source_tags:
+            tag_predicate = or_(*(literal(tag) == any_(Meme.tags) for tag in source_tags))
+            candidates.extend(
+                await self._fallback_candidate_rows(
+                    _apply_filters(_public_meme_stmt(), filters).where(tag_predicate),
+                    seen_meme_ids=seen_meme_ids,
+                    target_count=target_count,
+                    source_algorithm="fallback_tag",
+                    reason=reason,
+                    source_tags=source_tags,
+                )
+            )
+
+        if source_meme.template_id is not None and len(seen_meme_ids) - 1 < target_count:
+            candidates.extend(
+                await self._fallback_candidate_rows(
+                    _apply_filters(_public_meme_stmt(), filters).where(Meme.template_id == source_meme.template_id),
+                    seen_meme_ids=seen_meme_ids,
+                    target_count=target_count,
+                    source_algorithm="fallback_template",
+                    reason=reason,
+                    template_match=True,
+                )
+            )
+
+        if len(seen_meme_ids) - 1 < target_count:
+            candidates.extend(
+                await self._fallback_candidate_rows(
+                    _apply_filters(_public_meme_stmt(), filters),
+                    seen_meme_ids=seen_meme_ids,
+                    target_count=target_count,
+                    source_algorithm="fallback_popular",
+                    reason=reason,
+                )
+            )
+
+        return candidates
+
+    async def _fallback_candidate_rows(
+        self,
+        stmt: Select[tuple[Meme]],
+        *,
+        seen_meme_ids: set[uuid.UUID],
+        target_count: int,
+        source_algorithm: str,
+        reason: str,
+        source_tags: frozenset[str] | None = None,
+        template_match: bool = False,
+    ) -> list[_SimilarCandidate]:
+        remaining = target_count - (len(seen_meme_ids) - 1)
+        if remaining <= 0:
+            return []
+
+        if seen_meme_ids:
+            stmt = stmt.where(~Meme.id.in_(tuple(seen_meme_ids)))
+        result = await self._session.execute(
+            stmt.order_by(Meme.popularity_score.desc(), Meme.created_at.desc()).limit(remaining)
+        )
+        memes = list(result.scalars().all())
+        max_popularity = max((meme.popularity_score for meme in memes), default=0.0)
+        candidates: list[_SimilarCandidate] = []
+        for meme in memes:
+            if meme.id in seen_meme_ids:
+                continue
+            seen_meme_ids.add(meme.id)
+            popularity = _normalize_value(meme.popularity_score, max_popularity)
+            score = POPULARITY_WEIGHT * popularity
+            score_components = {"popularity": popularity, "total": score}
+            if source_tags is not None:
+                score_components["tag_overlap"] = _tag_overlap_score(source_tags, meme.tags)
+            if template_match:
+                score_components["template_match"] = 1.0
+            candidates.append(
+                _SimilarCandidate(
+                    meme=meme,
+                    source_algorithm=source_algorithm,
+                    reason=reason,
+                    score=score,
+                    score_components=score_components,
+                    algorithm_version=POPULAR_ALGORITHM_VERSION,
+                )
+            )
+        return candidates
 
     async def _to_public_search_page(
         self,
@@ -1158,6 +1477,21 @@ class MemeSearchService:
                 visibility = collection_access.get(meme.id, PublicMemeViewerAccess.PRIVATE)
             markers[meme.id] = PublicMemeViewerAccessRead(visibility=visibility)
         return markers
+
+    async def _load_detail_viewer_access_marker(
+        self,
+        meme: Meme,
+        *,
+        viewer_user_id: uuid.UUID | None,
+    ) -> PublicMemeViewerAccessRead | None:
+        if viewer_user_id is None or meme.is_public:
+            return None
+        markers = await self._load_viewer_access_markers(
+            (meme,),
+            viewer_user_id=viewer_user_id,
+            filters=MemeSearchFilters(scope=MemeSearchScope.ALL),
+        )
+        return markers.get(meme.id)
 
     async def _load_collection_access_markers(
         self,
@@ -1413,6 +1747,24 @@ def _score_components(score: MemeSearchScoreRead) -> dict[str, float]:
     }
 
 
+def _similar_candidate_score_read(candidate: _SimilarCandidate) -> MemeSearchScoreRead:
+    components = candidate.score_components or {}
+    similarity = _safe_float(components.get("similarity")) or 0.0
+    relationship = (
+        _safe_float(components.get("tag_overlap"))
+        or _safe_float(components.get("template_match"))
+        or 0.0
+    )
+    popularity = _safe_float(components.get("popularity")) or 0.0
+    total = _safe_float(candidate.score) or _safe_float(components.get("total")) or 0.0
+    return MemeSearchScoreRead(
+        semantic=similarity,
+        text=relationship,
+        popularity=popularity,
+        total=total,
+    )
+
+
 def _safe_score_components(values: dict[str, float]) -> dict[str, float]:
     return {key: safe_value for key, value in values.items() if (safe_value := _safe_float(value)) is not None}
 
@@ -1466,6 +1818,28 @@ def _search_index_prefilter_scope(
     if scope is MemeSearchScope.COLLECTIONS:
         return SearchIndexPrefilterScope.COLLECTIONS
     raise ValueError(f"Unsupported meme search scope: {scope!r}")
+
+
+def _dedupe_similarity_matches(
+    matches: Sequence[QdrantSimilarityMatch],
+    *,
+    source_meme_id: uuid.UUID,
+) -> list[QdrantSimilarityMatch]:
+    seen_meme_ids = {source_meme_id}
+    ordered_matches: list[QdrantSimilarityMatch] = []
+    for match in matches:
+        if match.meme_id in seen_meme_ids:
+            continue
+        seen_meme_ids.add(match.meme_id)
+        ordered_matches.append(match)
+    return ordered_matches
+
+
+def _tag_overlap_score(source_tags: frozenset[str], candidate_tags: Sequence[str]) -> float:
+    if not source_tags:
+        return 0.0
+    normalized_candidate_tags = {tag.strip().lower() for tag in candidate_tags if tag.strip()}
+    return len(source_tags & normalized_candidate_tags) / len(source_tags)
 
 
 def _meme_access_predicate(
@@ -1777,6 +2151,44 @@ def _to_public_detail_read(
     )
 
 
+def _to_authorized_detail_read(
+    meme: Meme,
+    *,
+    media_render_service: MediaRenderUrlService,
+    viewer_action_state: _ViewerMemeActionState | None = None,
+    viewer_access: PublicMemeViewerAccessRead | None = None,
+) -> PublicMemeDetailRead:
+    card = _to_authorized_card_read(
+        meme,
+        media_render_service=media_render_service,
+        viewer_action_state=viewer_action_state,
+        viewer_access=viewer_access,
+    )
+    seo_slug = meme.seo_page.slug if meme.seo_page else None
+    caption = meme.seo_page.caption if meme.seo_page else None
+    context = PublicMediaRenderContext(meme_id=meme.id, seo_slug=seo_slug, caption=caption)
+    return PublicMemeDetailRead(
+        **card.model_dump(),
+        ocr_text=meme.ocr_text,
+        seo_title=meme.seo_page.page_title if meme.seo_page else None,
+        seo_description=meme.seo_page.meta_description if meme.seo_page else None,
+        seo_alt_text=meme.seo_page.alt_text if meme.seo_page else None,
+        seo_body_text=meme.seo_page.body_text if meme.seo_page else None,
+        seo_model_id=meme.seo_page.model_id if meme.seo_page else None,
+        seo_prompt_version=meme.seo_page.prompt_version if meme.seo_page else None,
+        seo_generated_at=meme.seo_page.generated_at if meme.seo_page else None,
+        files=[
+            _to_authorized_file_read(
+                file,
+                context=context,
+                media_render_service=media_render_service,
+                is_public_meme=meme.is_public,
+            )
+            for file in meme.files
+        ],
+    )
+
+
 def _to_score_read(score: _CandidateScore) -> MemeSearchScoreRead:
     return MemeSearchScoreRead(
         semantic=score.semantic,
@@ -1793,5 +2205,6 @@ __all__ = [
     "MemeSearchService",
     "MemeQueryEmbeddingClientProtocol",
     "MemeTextSearchClientProtocol",
+    "QdrantSimilarityMatch",
     "QdrantUserSearchMatch",
 ]

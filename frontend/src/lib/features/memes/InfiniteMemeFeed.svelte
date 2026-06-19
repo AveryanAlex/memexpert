@@ -61,6 +61,7 @@
   const hasMore = $derived(loadedHasMore ?? initialPage.has_more);
   const errorMessage = $derived(loadedErrorMessage === undefined ? initialError : loadedErrorMessage);
   const memes = $derived(items.map((item) => item.meme));
+  const attributions = $derived(Object.fromEntries(items.map((item) => [item.meme.id, item.attribution])));
   const firstLoading = $derived(loading && items.length === 0);
   const nextLoading = $derived(loading && items.length > 0);
   const showingCount = $derived(items.length);
@@ -136,6 +137,8 @@
         includeNsfw: filters.includeNsfw,
         mediaType: filters.mediaType,
         language: filters.language,
+        scope: filters.scope,
+        collectionIds: filters.collectionIds,
         limit,
         offset
       });
@@ -176,7 +179,7 @@
     {#if emptyAction}{@render emptyAction()}{/if}
   </EmptyState>
 {:else}
-  <MemeGrid {memes} {label} {bulk} />
+  <MemeGrid {memes} {label} {attributions} {bulk} />
 {/if}
 
 <div bind:this={sentinel} aria-hidden="true" class="h-1"></div>

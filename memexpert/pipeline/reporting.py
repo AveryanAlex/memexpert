@@ -1,10 +1,8 @@
 # ruff: noqa: TC003
-"""Inspect enrichment and run-summary helpers for the S02 operator surface.
+"""Inspect enrichment and run-summary helpers for the operator surface.
 
-These helpers live outside ``content_pipeline.py`` because the core ingest
-service already exceeds its soft-cap size, and because the aggregation math
-used by the S02 proof harness must stay import-safe and pure so unit tests can
-exercise it without a live RabbitMQ, Voyage, or Qdrant stack.
+The aggregation math used by the proof harness stays import-safe and pure so
+unit tests can exercise it without a live RabbitMQ, Voyage, or Qdrant stack.
 
 The detail builder fills in the optional projections on
 :class:`ContentPipelineItemDetail` only when the underlying audit state exists.
@@ -86,10 +84,10 @@ async def build_item_detail(
 ) -> ContentPipelineItemDetail:
     """Enrich a base item read with OCR, merge, classify, and ready-event truth.
 
-    The caller is responsible for producing ``base`` through the normal
-    ``ContentPipelineService.get_item`` path with the ``meme_file`` already
-    loaded alongside its pipeline stage journal and OCR result relationship.
-    This function only performs read queries; it never mutates durable state.
+    The caller is responsible for producing ``base`` through the normal item
+    read path with the ``meme_file`` already loaded alongside its pipeline
+    stage journal and OCR result relationship. This function only performs
+    read queries; it never mutates durable state.
     """
 
     canonical_meme = await _load_canonical_meme(session, meme_file.meme_id)
@@ -137,13 +135,7 @@ async def _load_sync_target_snapshots(
     session: AsyncSession,
     meme_file_id: uuid.UUID,
 ) -> dict[SyncTargetKind, MemeFileSyncTargetSnapshot]:
-    """Read-only loader mirroring ``ContentPipelineService._load_sync_target_snapshots``.
-
-    The reporting layer intentionally keeps its own copy so the detail builder
-    can be exercised from tests without constructing a full service instance.
-    Both loaders return the same shape so the projection logic stays in one
-    place.
-    """
+    """Read-only loader for item-detail sync target projections."""
 
     result = await session.execute(
         select(MemeFileSyncTargetSnapshot).where(
@@ -191,9 +183,8 @@ def decode_sync_preview(
     Returns ``None`` when the stored dict is empty or shaped in a way that
     would not round-trip through :class:`ContentPipelineSyncTargetPreview`.
     The inspect surface treats malformed or empty previews as "no preview
-    known" rather than crashing the detail build. This is the single
-    canonical decode path the service layer, the reporting layer, and the
-    inspect route all share — there must be no second copy.
+    known" rather than crashing the detail build. This is the single decode
+    path the pipeline services, reporting layer, and inspect route all share.
     """
 
     if not isinstance(raw_preview, dict) or not raw_preview:

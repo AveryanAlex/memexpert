@@ -891,9 +891,7 @@ dependencies = [
     { name = "fastapi" },
     { name = "faststream", extra = ["rabbit"] },
     { name = "httpx" },
-    { name = "imagehash" },
     { name = "meilisearch-python-sdk" },
-    { name = "pillow" },
     { name = "pydantic-ai-slim", extra = ["openai"] },
     { name = "pydantic-settings" },
     { name = "pyjwt" },
@@ -914,6 +912,8 @@ dev = [
     { name = "ty" },
 ]
 worker = [
+    { name = "imagehash" },
+    { name = "pillow" },
     { name = "telethon" },
 ]
 
@@ -929,9 +929,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.135.3" },
     { name = "faststream", extras = ["rabbit"], specifier = ">=0.6.7" },
     { name = "httpx", specifier = ">=0.28.1" },
-    { name = "imagehash", specifier = ">=4.3.2" },
     { name = "meilisearch-python-sdk", specifier = ">=7.1.2" },
-    { name = "pillow", specifier = ">=12.2.0" },
     { name = "pydantic-ai-slim", extras = ["openai"], specifier = ">=1.107.0" },
     { name = "pydantic-settings", specifier = ">=2.13.1" },
     { name = "pyjwt", specifier = ">=2.12.1" },
@@ -951,7 +949,11 @@ dev = [
     { name = "testcontainers", extras = ["postgres", "redis"], specifier = ">=4.14.2" },
     { name = "ty", specifier = ">=0.0.49" },
 ]
-worker = [{ name = "telethon", specifier = ">=1.43.0" }]
+worker = [
+    { name = "imagehash", specifier = ">=4.3.2" },
+    { name = "pillow", specifier = ">=12.2.0" },
+    { name = "telethon", specifier = ">=1.43.0" },
+]
 
 [[package]]
 name = "multidict"

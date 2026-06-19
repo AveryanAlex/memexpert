@@ -318,12 +318,15 @@ class TelegramInlineService:
         for payload in result.scalars():
             if not isinstance(payload, dict):
                 continue
-            meme_id = _parse_payload_uuid(payload.get("meme_id"))
+            refs = payload.get("refs")
+            if not isinstance(refs, dict):
+                refs = {}
+            meme_id = _parse_payload_uuid(payload.get("meme_id")) or _parse_payload_uuid(refs.get("meme_id"))
             if meme_id is not None:
                 _append_unique(meme_ids, meme_id)
                 continue
 
-            file_id = _parse_payload_uuid(payload.get("meme_file_id"))
+            file_id = _parse_payload_uuid(payload.get("meme_file_id")) or _parse_payload_uuid(refs.get("meme_file_id"))
             if file_id is not None:
                 _append_unique(file_ids, file_id)
 

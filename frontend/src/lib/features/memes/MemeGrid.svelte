@@ -1,7 +1,9 @@
 <script lang="ts">
   import { browser } from '$app/environment';
   import { invalidateAll } from '$app/navigation';
-  import type { PublicMemeCardRead } from '$lib/api/types';
+  import { recordMemeDownload } from '$lib/api/client';
+  import type { MemeResultAttributionRead, PublicMemeCardRead } from '$lib/api/types';
+  import { memeActionAttributionBody } from '$lib/memeActions';
   import { Button, Select } from '$lib/ui';
   import { Download } from '@lucide/svelte';
   import {
@@ -16,8 +18,14 @@
   let {
     memes,
     label = 'Meme results',
+    attributions = {},
     bulk = { enabled: false }
-  }: { memes: PublicMemeCardRead[]; label?: string; bulk?: MemeGridBulkOptions } = $props();
+  }: {
+    memes: PublicMemeCardRead[];
+    label?: string;
+    attributions?: Record<string, MemeResultAttributionRead | null | undefined>;
+    bulk?: MemeGridBulkOptions;
+  } = $props();
 
   let selectedIds = $state<string[]>([]);
   let targetCollectionId = $state('');
@@ -84,7 +92,11 @@
 
   async function saveSelectedToActive() {
     await runBulkAction('save', 'Saving selected memes...', async () => {
-      await mutateSelected((meme) => `/api/v1/memes/${encodeURIComponent(meme.id)}/save`, 'POST');
+      await mutateSelected(
+        (meme) => `/api/v1/memes/${encodeURIComponent(meme.id)}/save`,
+        'POST',
+        (meme) => memeActionAttributionBody(attributions[meme.id])
+      );
       statusMessage = `${selected.length} selected meme${selected.length === 1 ? '' : 's'} saved to the active collection.`;
     });
   }
@@ -123,6 +135,7 @@
     }
 
     for (const item of downloadable) {
+      recordBulkDownloadTelemetry(item.id);
       const link = document.createElement('a');
       link.href = item.url;
       link.download = downloadName(item.title);
@@ -149,12 +162,22 @@
     }
   }
 
-  async function mutateSelected(urlForMeme: (meme: PublicMemeCardRead) => string, method: 'DELETE' | 'POST') {
+  async function mutateSelected(
+    urlForMeme: (meme: PublicMemeCardRead) => string,
+    method: 'DELETE' | 'POST',
+    bodyForMeme?: (meme: PublicMemeCardRead) => unknown | undefined
+  ) {
     for (const meme of selected) {
+      const body = bodyForMeme?.(meme);
+      const headers = new Headers({ accept: 'application/json', 'x-requested-with': 'XMLHttpRequest' });
+      if (body !== undefined) {
+        headers.set('content-type', 'application/json');
+      }
       const response = await fetch(urlForMeme(meme), {
         method,
         credentials: 'include',
-        headers: { accept: 'application/json', 'x-requested-with': 'XMLHttpRequest' }
+        headers,
+        body: body === undefined ? undefined : JSON.stringify(body)
       });
 
       if (!response.ok) {
@@ -163,6 +186,15 @@
         throw new Error(`Could not update ${meme.caption || meme.tags[0] || 'selected meme'}: ${detail}`);
       }
     }
+  }
+
+  function recordBulkDownloadTelemetry(memeId: string) {
+    void recordMemeDownload({
+      fetch,
+      memeId,
+      body: memeActionAttributionBody(attributions[memeId]),
+      keepalive: true
+    }).catch((error: unknown) => console.warn('Bulk meme download telemetry failed.', { memeId, error }));
   }
 
   function downloadName(title: string): string {
@@ -220,14 +252,24 @@
   {#each masonryColumns as column (column.id)}
     <div class="grid min-w-0 flex-1 content-start gap-4" role="presentation">
       {#each column.items as meme (meme.id)}
-        <div class="relative" role="presentation">
+        {@const attribution = attributions[meme.id]}
+        <div
+          class="relative"
+          role="presentation"
+          data-discovery-source={attribution?.source_algorithm ?? undefined}
+          data-discovery-reason={attribution?.reason ?? undefined}
+          data-discovery-request-id={attribution?.request_id ?? undefined}
+          data-discovery-impression-id={attribution?.impression_id ?? undefined}
+          data-discovery-source-meme-id={attribution?.source_meme_id ?? undefined}
+          data-discovery-score={attribution?.score ?? undefined}
+        >
           {#if bulkEnabled}
             <label class="absolute left-3 top-3 z-20 inline-flex items-center gap-2 rounded-full border border-line bg-paper/95 px-3 py-2 text-sm font-extrabold shadow-warm">
               <input type="checkbox" checked={selectedIds.includes(meme.id)} onchange={() => toggleSelection(meme.id)} aria-label={`Select ${meme.caption || meme.tags[0] || 'meme'}`} />
               Select
             </label>
           {/if}
-          <MemeCard {meme} position={memePositions.get(meme.id)} total={memes.length} />
+          <MemeCard {meme} {attribution} position={memePositions.get(meme.id)} total={memes.length} />
         </div>
       {/each}
     </div>

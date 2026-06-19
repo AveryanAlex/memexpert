@@ -33,6 +33,13 @@ from pydantic import BaseModel, ValidationError
 
 from memexpert.core.config import get_settings
 from memexpert.models.enums import SyncTargetKind, SyncTargetStatus
+from memexpert.pipeline.reporting import (
+    OUTCOME_BLOCKED,
+    OUTCOME_PARTIALLY_SEARCHABLE,
+    OUTCOME_READY,
+    _classify_outcome,  # noqa: PLC2701 - reuse the canonical outcome classifier.
+)
+from memexpert.pipeline.smoke_proof import render_s03_markdown_report
 from memexpert.schemas.content_pipeline import (
     ContentPipelineErrorResponse,
     ContentPipelineItemDetail,
@@ -42,13 +49,6 @@ from memexpert.schemas.content_pipeline import (
     SmokeProofResult,
     SmokeProofTargetResult,
 )
-from memexpert.services.content_pipeline_reporting import (
-    OUTCOME_BLOCKED,
-    OUTCOME_PARTIALLY_SEARCHABLE,
-    OUTCOME_READY,
-    _classify_outcome,  # noqa: PLC2701 - reuse the canonical outcome classifier.
-)
-from memexpert.services.content_pipeline_smoke import render_s03_markdown_report
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence

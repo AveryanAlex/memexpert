@@ -3,6 +3,8 @@
   import {
     favoriteMeme,
     pinMeme,
+    recordMemeDownload,
+    recordMemeShare,
     reportMeme,
     removeSavedMeme,
     saveMeme,
@@ -14,10 +16,12 @@
   import {
     actionFailureMessage,
     canonicalMemeUrl,
+    memeActionAttributionBody,
     memeDownloadUrl,
     memeHref,
     memeTitle,
     telegramShareUrl,
+    type MemeActionAttribution,
     type MemeActionKind
   } from '$lib/memeActions';
   import { Button, Select, Textarea } from '$lib/ui';
@@ -28,12 +32,13 @@
   interface Props {
     meme: PublicMemeCardRead | PublicMemeDetailRead;
     href?: string;
+    attribution?: MemeActionAttribution | null;
     showPrimary?: boolean;
     showSharing?: boolean;
     compact?: boolean;
   }
 
-  let { meme, href = memeHref(meme), showPrimary = false, showSharing = false, compact = false }: Props = $props();
+  let { meme, href = memeHref(meme), attribution = null, showPrimary = false, showSharing = false, compact = false }: Props = $props();
 
   const viewerCapabilities = readViewerCapabilities();
 
@@ -61,7 +66,8 @@
   const downloadUrl = $derived(memeDownloadUrl(meme));
   const canDownload = $derived(Boolean(downloadUrl));
   const canPin = $derived(viewerCapabilities().canPinMemes);
-  const actionRequest = $derived({ fetch, memeId: meme.id });
+  const actionBody = $derived(memeActionAttributionBody(attribution));
+  const actionRequest = $derived({ fetch, memeId: meme.id, body: actionBody });
 
   syncStateFromMeme();
 
@@ -117,26 +123,32 @@
     });
   }
 
-  function shareTelegram() {
-    if (!browser) return;
-    window.open(telegramShareUrl(canonicalUrl, title), '_blank', 'noopener,noreferrer');
-    statusMessage = 'Opened Telegram share.';
+  async function shareTelegram() {
+    await runAction('telegram', async () => {
+      if (!browser) return;
+      void recordMemeShare(actionRequest).catch(() => undefined);
+      window.open(telegramShareUrl(canonicalUrl, title), '_blank', 'noopener,noreferrer');
+      statusMessage = 'Opened Telegram share.';
+    });
   }
 
-  function downloadMeme() {
+  async function downloadMeme() {
     if (!browser || !downloadUrl) {
       statusMessage = actionFailureMessage('download', null);
       return;
     }
 
-    const link = document.createElement('a');
-    link.href = downloadUrl;
-    link.download = `${title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'meme'}`;
-    link.rel = 'noopener noreferrer';
-    document.body.append(link);
-    link.click();
-    link.remove();
-    statusMessage = 'Download started.';
+    await runAction('download', async () => {
+      void recordMemeDownload(actionRequest).catch(() => undefined);
+      const link = document.createElement('a');
+      link.href = downloadUrl;
+      link.download = `${title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'meme'}`;
+      link.rel = 'noopener noreferrer';
+      document.body.append(link);
+      link.click();
+      link.remove();
+      statusMessage = 'Download started.';
+    });
   }
 
   function openReportForm() {

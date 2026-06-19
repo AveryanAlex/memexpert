@@ -9,11 +9,13 @@ import tempfile
 from dataclasses import dataclass
 from importlib import import_module
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from memexpert.core.config import Settings, get_settings
-from memexpert.core.media import PipelineMediaProcessor, PipelineMediaProcessorProtocol
 from memexpert.models.enums import ContentLanguage
+
+if TYPE_CHECKING:
+    from memexpert.media.contracts import PipelineMediaProcessorProtocol
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,7 +78,11 @@ class PipelineOCRProcessor:
         media_processor: PipelineMediaProcessorProtocol | None = None,
     ) -> None:
         self._settings = settings or get_settings()
-        self._media_processor = media_processor or PipelineMediaProcessor(settings=self._settings)
+        if media_processor is None:
+            from memexpert.media.inspect import PipelineMediaProcessor
+
+            media_processor = PipelineMediaProcessor(settings=self._settings)
+        self._media_processor = media_processor
         self._paddle_ocr: Any | None = None
 
     async def extract_text(

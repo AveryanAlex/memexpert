@@ -174,11 +174,13 @@ def test_meme_search_dependency_wires_lazy_text_semantic_and_embedding_clients()
     assert isinstance(service, MemeSearchService)
     assert isinstance(service._text_client, PipelineMeilisearchSyncClient)
     assert isinstance(service._semantic_client, PipelineQdrantUserSearchClient)
+    assert isinstance(service._similarity_client, PipelineQdrantClient)
     assert isinstance(service._query_embedding_client, CachedTextQueryEmbeddingService)
     assert isinstance(service._query_embedding_client._provider, PipelineVoyageClient)
     assert service._query_embedding_client._cache_session_factory is not None
     assert service._text_client._client is None
     assert service._semantic_client._client is None
+    assert service._similarity_client._client is None
 
 
 def test_qdrant_sync_payload_serializer_and_preview_include_collection_metadata() -> None:

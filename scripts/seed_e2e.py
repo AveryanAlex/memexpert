@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import sys
 import time
@@ -21,7 +22,7 @@ from PIL import Image, PngImagePlugin
 from pydantic import BaseModel, ValidationError
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.http.models import Distance, VectorParams
-from sqlalchemy import select
+from sqlalchemy import delete, or_, select, update
 
 from memexpert.core.config import Settings, get_settings
 from memexpert.core.database import get_async_session_factory
@@ -29,7 +30,9 @@ from memexpert.core.meilisearch import PipelineMeilisearchSyncClient
 from memexpert.core.qdrant import PipelineQdrantSyncClient
 from memexpert.core.storage import get_pipeline_storage_settings, get_s3_client
 from memexpert.core.voyage import build_pipeline_voyage_client
+from memexpert.ingest.schemas import IngestRequestRead
 from memexpert.models.base import utcnow
+from memexpert.models.collection import Collection, CollectionInvite, CollectionMember, CollectionMeme, PinnedMeme
 from memexpert.models.content import (
     EmbeddingCache,
     Meme,
@@ -41,20 +44,28 @@ from memexpert.models.content import (
     PipelineStageJournal,
 )
 from memexpert.models.enums import (
+    AccountStatus,
+    CollectionInviteChannel,
+    CollectionInviteStatus,
+    CollectionKind,
+    CollectionMembershipRole,
+    CollectionVisibility,
     ContentKind,
     ContentLanguage,
     ContentPipelineStage,
     ContentPipelineStageStatus,
     ContentProcessingStatus,
     EmbeddingInputType,
+    PipelineIngestRequestStatus,
     SourcePlatform,
     SyncTargetKind,
     SyncTargetStatus,
 )
+from memexpert.models.user import User
+from memexpert.pipeline.outbox_runtime import PipelineOutboxPublisherBatchResult, run_pipeline_outbox_publisher_batch
 from memexpert.schemas.content_pipeline import (
     ContentPipelineErrorResponse,
     ContentPipelineItemDetail,
-    ContentPipelineUploadRead,
     SmokeProofResult,
 )
 from memexpert.services.search_index_sync import (
@@ -66,6 +77,7 @@ from memexpert.services.search_index_sync import (
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
+    from memexpert.core.database import AsyncSessionFactory
     from memexpert.core.meilisearch import MeilisearchSyncClientProtocol
     from memexpert.core.qdrant import QdrantSyncClientProtocol
 
@@ -78,7 +90,21 @@ E2E_SOURCE_ID: Final = "e2e-prd-seed"
 E2E_UPLOAD_SOURCE_ID: Final = "e2e-prd-upload"
 E2E_MODEL_ID: Final = "e2e-prd-seed"
 E2E_PROMPT_VERSION: Final = "e2e-prd-v1"
+E2E_ACCOUNT_PASSWORD: Final = "memexpert-e2e-password"
+E2E_ACCOUNT_PASSWORD_HASH: Final = "$2b$12$C6UzMDM.H6dfI/f/IKcEe.TaORhf.fwRuC9z.8O1TWVf5KG9lIYBS"
+E2E_OWNER_EMAIL: Final = "collection.owner.e2e@memexpert.test"
+E2E_MEMBER_EMAIL: Final = "collection.member.e2e@memexpert.test"
+E2E_COLLECTION_TITLE: Final = "Launch E2E Collection"
+E2E_COLLECTION_DESCRIPTION: Final = "Private launch fixture for collection-management E2E."
+E2E_COLLECTION_INVITE_TOKEN: Final = "memexpert-e2e-collection-invite-token"
 UUID_NAMESPACE: Final = uuid.UUID("176f5e31-6e5d-5e43-80aa-1f7aa3aa0d4b")
+TERMINAL_INGEST_FAILURE_STATUSES: Final = frozenset(
+    {
+        PipelineIngestRequestStatus.FAILED_BLOCKED_PHASH,
+        PipelineIngestRequestStatus.FAILED_INVALID_MEDIA,
+        PipelineIngestRequestStatus.PUBLISH_FAILED,
+    }
+)
 
 
 class E2ESeedError(RuntimeError):
@@ -115,6 +141,32 @@ class SeededMeme:
     media_type: ContentKind
 
 
+@dataclass(frozen=True, slots=True)
+class SeededE2EUser:
+    label: str
+    user_id: uuid.UUID
+    email: str
+    password: str
+
+
+@dataclass(frozen=True, slots=True)
+class SeededCollectionManagementFixture:
+    owner: SeededE2EUser
+    member: SeededE2EUser
+    collection_id: uuid.UUID
+    title: str
+    description: str
+    visibility: CollectionVisibility
+    saved_memes: tuple[SeededMeme, ...]
+    pinned_memes: tuple[SeededMeme, ...]
+    invite_id: uuid.UUID
+    invite_token: str
+
+    @property
+    def invite_path(self) -> str:
+        return f"/collection/invite/{self.invite_token}"
+
+
 class PipelineApiClient:
     """Typed HTTP client wrapper for the operator and public proof routes."""
 
@@ -141,7 +193,7 @@ class PipelineApiClient:
                 f"GET /health returned unexpected status {response.status_code}: {response.text!r}",
             )
 
-    def upload_cat_png(self, *, image_bytes: bytes, run_id: str) -> ContentPipelineUploadRead:
+    def upload_cat_png(self, *, image_bytes: bytes, run_id: str) -> IngestRequestRead:
         response = self._client.post(
             "/api/v1/pipeline/uploads",
             data={
@@ -152,7 +204,11 @@ class PipelineApiClient:
             },
             files={"file": ("e2e-prd-cat.png", image_bytes, "image/png")},
         )
-        return _validate_response(response, expected_status=201, model=ContentPipelineUploadRead)
+        return _validate_response(response, expected_status=(200, 202), model=IngestRequestRead)
+
+    def get_ingest_request(self, ingest_request_id: uuid.UUID) -> IngestRequestRead:
+        response = self._client.get(f"/api/v1/pipeline/ingest-requests/{ingest_request_id}")
+        return _validate_response(response, expected_status=200, model=IngestRequestRead)
 
     def get_item_detail(self, meme_file_id: uuid.UUID) -> ContentPipelineItemDetail:
         response = self._client.get(f"/api/v1/pipeline/items/{meme_file_id}/detail")
@@ -256,6 +312,7 @@ async def _run(args: argparse.Namespace) -> None:
     await meili_client.ensure_index()
 
     qdrant_sync_client = PipelineQdrantSyncClient(settings=settings)
+    session_factory = get_async_session_factory()
     specs = build_seed_specs()
     await cleanup_e2e_rows(settings=settings, specs=specs)
 
@@ -268,16 +325,25 @@ async def _run(args: argparse.Namespace) -> None:
     ) as api_client:
         api_client.healthcheck()
         print("Uploading generated cat PNG through /api/v1/pipeline/uploads")
-        upload = api_client.upload_cat_png(image_bytes=cat_png, run_id=run_id)
-        detail = wait_for_dual_synced(
+        ingest_request = api_client.upload_cat_png(image_bytes=cat_png, run_id=run_id)
+        materialized_request, meme_file_id = await wait_for_ingest_materialized_meme_file(
             api_client,
-            meme_file_id=upload.meme_file_id,
+            ingest_request_id=ingest_request.id,
+            settings=settings,
+            session_factory=session_factory,
             timeout_seconds=args.timeout_seconds,
         )
-        print(f"Uploaded item dual-synced: meme_file_id={upload.meme_file_id}")
+        detail = await wait_for_dual_synced(
+            api_client,
+            meme_file_id=meme_file_id,
+            settings=settings,
+            session_factory=session_factory,
+            timeout_seconds=args.timeout_seconds,
+        )
+        print(f"Uploaded item dual-synced: ingest_request_id={ingest_request.id} meme_file_id={meme_file_id}")
         dual_index_result = wait_for_dual_index_proof(
             api_client,
-            meme_file_id=upload.meme_file_id,
+            meme_file_id=meme_file_id,
             timeout_seconds=args.timeout_seconds,
         )
         slug = await publish_created_meme(
@@ -287,7 +353,7 @@ async def _run(args: argparse.Namespace) -> None:
         )
         await resync_created_public_meme_indexes(
             settings=settings,
-            meme_file_id=upload.meme_file_id,
+            meme_file_id=meme_file_id,
             qdrant_sync_client=qdrant_sync_client,
             meili_client=meili_client,
         )
@@ -312,6 +378,17 @@ async def _run(args: argparse.Namespace) -> None:
         )
         print(f"Seeded deterministic public corpus: {', '.join(item.category for item in seeded)}")
 
+        collection_fixture = await seed_collection_management_fixture(
+            settings=settings,
+            qdrant_sync_client=qdrant_sync_client,
+            meili_client=meili_client,
+            seeded=seeded,
+        )
+        print(
+            "Seeded deterministic private collection fixture: "
+            f"collection_id={collection_fixture.collection_id} owner={collection_fixture.owner.email}",
+        )
+
         assert_created_is_distinct(created_meme_id=detail.meme_id, seeded=seeded)
         created_search_payload = api_client.public_search("cat")
         assert_public_search_contains(created_search_payload, meme_id=detail.meme_id)
@@ -327,25 +404,13 @@ async def _run(args: argparse.Namespace) -> None:
             "classification": settings.pipeline_classification_provider_mode,
             "voyage_dimensions": settings.pipeline_voyage_output_dimensions,
         },
-        "seeded_memes": [
-            {
-                "category": item.category,
-                "meme_id": str(item.meme_id),
-                "meme_file_id": str(item.meme_file_id),
-                "slug": item.slug,
-                "query": item.query,
-                "object_key": item.object_key,
-                "title": item.title,
-                "tags": list(item.tags),
-                "is_nsfw": item.is_nsfw,
-                "language": item.language.value,
-                "media_type": item.media_type.value,
-            }
-            for item in seeded
-        ],
+        "seeded_memes": [_seeded_meme_payload(item) for item in seeded],
+        "collection_management": build_collection_management_fixture_payload(collection_fixture),
         "created_meme": {
             "meme_id": str(detail.meme_id),
-            "meme_file_id": str(upload.meme_file_id),
+            "meme_file_id": str(meme_file_id),
+            "ingest_request_id": str(materialized_request.id),
+            "ingest_request_status": materialized_request.status.value,
             "slug": slug,
             "query": "cat",
             "title": "Created cat pipeline meme",
@@ -581,6 +646,254 @@ async def seed_direct_corpus(
     return seeded
 
 
+def build_collection_management_fixture(seeded: list[SeededMeme]) -> SeededCollectionManagementFixture:
+    """Build the deterministic full-account collection fixture descriptor."""
+
+    cat = _require_seeded_category(seeded, "cat")
+    dog = _require_seeded_category(seeded, "dog")
+    return SeededCollectionManagementFixture(
+        owner=SeededE2EUser(
+            label="owner",
+            user_id=_stable_uuid("collection-management:owner:user"),
+            email=E2E_OWNER_EMAIL,
+            password=E2E_ACCOUNT_PASSWORD,
+        ),
+        member=SeededE2EUser(
+            label="member",
+            user_id=_stable_uuid("collection-management:member:user"),
+            email=E2E_MEMBER_EMAIL,
+            password=E2E_ACCOUNT_PASSWORD,
+        ),
+        collection_id=_stable_uuid("collection-management:launch:collection"),
+        title=E2E_COLLECTION_TITLE,
+        description=E2E_COLLECTION_DESCRIPTION,
+        visibility=CollectionVisibility.PRIVATE,
+        saved_memes=(cat, dog),
+        pinned_memes=(cat, dog),
+        invite_id=_stable_uuid("collection-management:launch:viewer-invite"),
+        invite_token=E2E_COLLECTION_INVITE_TOKEN,
+    )
+
+
+async def seed_collection_management_fixture(
+    *,
+    settings: Settings,
+    qdrant_sync_client: QdrantSyncClientProtocol,
+    meili_client: MeilisearchSyncClientProtocol,
+    seeded: list[SeededMeme],
+) -> SeededCollectionManagementFixture:
+    """Persist full-account users, a private collection, an invite, saves, and pins."""
+
+    fixture = build_collection_management_fixture(seeded)
+    session_factory = get_async_session_factory()
+    async with session_factory() as session:
+        await seed_collection_management_fixture_in_session(
+            session,
+            settings=settings,
+            qdrant_sync_client=qdrant_sync_client,
+            meili_client=meili_client,
+            fixture=fixture,
+        )
+        await session.commit()
+    return fixture
+
+
+async def seed_collection_management_fixture_in_session(
+    session: AsyncSession,
+    *,
+    settings: Settings,
+    qdrant_sync_client: QdrantSyncClientProtocol,
+    meili_client: MeilisearchSyncClientProtocol,
+    fixture: SeededCollectionManagementFixture,
+) -> None:
+    now = utcnow()
+    owner = User(
+        id=fixture.owner.user_id,
+        status=AccountStatus.ACTIVE,
+        email=fixture.owner.email,
+        email_verified_at=now,
+        password_hash=E2E_ACCOUNT_PASSWORD_HASH,
+        nsfw_enabled=False,
+    )
+    member = User(
+        id=fixture.member.user_id,
+        status=AccountStatus.ACTIVE,
+        email=fixture.member.email,
+        email_verified_at=now,
+        password_hash=E2E_ACCOUNT_PASSWORD_HASH,
+        nsfw_enabled=False,
+    )
+    session.add_all([owner, member])
+    await session.flush()
+
+    collection = Collection(
+        id=fixture.collection_id,
+        owner_id=fixture.owner.user_id,
+        title=fixture.title,
+        description=fixture.description,
+        kind=CollectionKind.CUSTOM,
+        visibility=fixture.visibility,
+    )
+    session.add(collection)
+    await session.flush()
+    owner.active_save_collection_id = collection.id
+
+    session.add_all(
+        [
+            CollectionMember(
+                collection_id=collection.id,
+                user_id=fixture.owner.user_id,
+                role=CollectionMembershipRole.OWNER,
+            ),
+            CollectionInvite(
+                id=fixture.invite_id,
+                collection_id=collection.id,
+                created_by_user_id=fixture.owner.user_id,
+                token_hash=_collection_invite_token_hash(fixture.invite_token),
+                role=CollectionMembershipRole.VIEWER,
+                channel=CollectionInviteChannel.DIRECT_LINK,
+                label="E2E viewer invite",
+                status=CollectionInviteStatus.PENDING,
+                max_uses=None,
+                use_count=0,
+                expires_at=None,
+            ),
+            *(
+                CollectionMeme(
+                    collection_id=collection.id,
+                    meme_id=meme.meme_id,
+                    added_by_user_id=fixture.owner.user_id,
+                    added_at=now,
+                )
+                for meme in fixture.saved_memes
+            ),
+            *(
+                PinnedMeme(
+                    user_id=fixture.owner.user_id,
+                    meme_id=meme.meme_id,
+                    position=index,
+                    pinned_at=now,
+                )
+                for index, meme in enumerate(fixture.pinned_memes, start=1)
+            ),
+        ],
+    )
+    await session.flush()
+
+    for meme in fixture.saved_memes:
+        await _resync_seeded_meme_indexes_for_collection_fixture(
+            session,
+            settings=settings,
+            qdrant_sync_client=qdrant_sync_client,
+            meili_client=meili_client,
+            meme=meme,
+            now=now,
+        )
+
+
+async def _resync_seeded_meme_indexes_for_collection_fixture(
+    session: AsyncSession,
+    *,
+    settings: Settings,
+    qdrant_sync_client: QdrantSyncClientProtocol,
+    meili_client: MeilisearchSyncClientProtocol,
+    meme: SeededMeme,
+    now: datetime,
+) -> None:
+    loaded_index_state = await load_search_index_state(
+        session,
+        meme.meme_file_id,
+        vector_dimensions=settings.pipeline_voyage_output_dimensions,
+    )
+    if loaded_index_state.vector is None:
+        raise E2ESeedError(f"Seeded collection meme file {meme.meme_file_id} has no embedding vector.")
+
+    qdrant_payload = build_qdrant_sync_payload(loaded_index_state.canonical)
+    meili_document = build_meilisearch_document(loaded_index_state.canonical)
+    await qdrant_sync_client.upsert_meme_point(qdrant_payload, loaded_index_state.vector)
+    await meili_client.upsert_document(meili_document)
+    await _upsert_sync_snapshot(
+        session,
+        meme_file_id=meme.meme_file_id,
+        target=SyncTargetKind.QDRANT,
+        preview={
+            "meme_id": str(qdrant_payload.meme_id),
+            "search_index_algorithm_version": qdrant_payload.search_index_algorithm_version,
+            "is_public": qdrant_payload.is_public,
+            "collection_ids": list(qdrant_payload.collection_ids),
+        },
+        now=now,
+    )
+    await _upsert_sync_snapshot(
+        session,
+        meme_file_id=meme.meme_file_id,
+        target=SyncTargetKind.MEILISEARCH,
+        preview={
+            "id": meili_document.id,
+            "search_index_algorithm_version": meili_document.search_index_algorithm_version,
+            "is_public": meili_document.is_public,
+            "collection_ids": list(meili_document.collection_ids),
+        },
+        now=now,
+    )
+
+
+def build_collection_management_fixture_payload(fixture: SeededCollectionManagementFixture) -> dict[str, Any]:
+    return {
+        "owner": _seeded_e2e_user_payload(fixture.owner),
+        "member": _seeded_e2e_user_payload(fixture.member),
+        "collection": {
+            "id": str(fixture.collection_id),
+            "title": fixture.title,
+            "description": fixture.description,
+            "visibility": fixture.visibility.value,
+        },
+        "invite": {
+            "id": str(fixture.invite_id),
+            "token": fixture.invite_token,
+            "join_path": fixture.invite_path,
+        },
+        "saved_memes": [_seeded_meme_payload(item) for item in fixture.saved_memes],
+        "pinned_memes": [_seeded_meme_payload(item) for item in fixture.pinned_memes],
+    }
+
+
+def _seeded_e2e_user_payload(user: SeededE2EUser) -> dict[str, str]:
+    return {
+        "label": user.label,
+        "user_id": str(user.user_id),
+        "email": user.email,
+        "password": user.password,
+    }
+
+
+def _seeded_meme_payload(item: SeededMeme) -> dict[str, object]:
+    return {
+        "category": item.category,
+        "meme_id": str(item.meme_id),
+        "meme_file_id": str(item.meme_file_id),
+        "slug": item.slug,
+        "query": item.query,
+        "object_key": item.object_key,
+        "title": item.title,
+        "tags": list(item.tags),
+        "is_nsfw": item.is_nsfw,
+        "language": item.language.value,
+        "media_type": item.media_type.value,
+    }
+
+
+def _require_seeded_category(seeded: list[SeededMeme], category: str) -> SeededMeme:
+    for item in seeded:
+        if item.category == category:
+            return item
+    raise E2ESeedError(f"Seeded corpus did not include required {category!r} fixture.")
+
+
+def _collection_invite_token_hash(token: str) -> str:
+    return hashlib.sha256(token.strip().encode("utf-8")).hexdigest()
+
+
 def build_seed_specs() -> list[SeedSpec]:
     return [
         SeedSpec(
@@ -635,6 +948,8 @@ async def cleanup_e2e_rows(*, settings: Settings, specs: list[SeedSpec]) -> None
 
 
 async def cleanup_seed_rows(session: AsyncSession, *, settings: Settings, specs: list[SeedSpec]) -> None:
+    await cleanup_collection_management_fixture_rows(session)
+
     source_result = await session.execute(
         select(MemeSource).where(MemeSource.source_id.in_([E2E_SOURCE_ID, E2E_UPLOAD_SOURCE_ID])),
     )
@@ -669,6 +984,43 @@ async def cleanup_seed_rows(session: AsyncSession, *, settings: Settings, specs:
         )
         for cache_row in result.scalars():
             await session.delete(cache_row)
+    await session.flush()
+
+
+async def cleanup_collection_management_fixture_rows(session: AsyncSession) -> None:
+    user_ids = [
+        _stable_uuid("collection-management:owner:user"),
+        _stable_uuid("collection-management:member:user"),
+    ]
+    collection_id = _stable_uuid("collection-management:launch:collection")
+    collection_ids_result = await session.execute(
+        select(Collection.id).where(or_(Collection.id == collection_id, Collection.owner_id.in_(user_ids))),
+    )
+    collection_ids = list(collection_ids_result.scalars())
+
+    await session.execute(
+        update(User)
+        .where(
+            or_(
+                User.id.in_(user_ids),
+                User.email.in_([E2E_OWNER_EMAIL, E2E_MEMBER_EMAIL]),
+                User.active_save_collection_id.in_(collection_ids),
+            ),
+        )
+        .values(active_save_collection_id=None),
+    )
+    await session.execute(delete(PinnedMeme).where(PinnedMeme.user_id.in_(user_ids)))
+
+    collections_result = await session.execute(select(Collection).where(Collection.id.in_(collection_ids)))
+    for collection in collections_result.scalars():
+        await session.delete(collection)
+    await session.flush()
+
+    users_result = await session.execute(
+        select(User).where(or_(User.id.in_(user_ids), User.email.in_([E2E_OWNER_EMAIL, E2E_MEMBER_EMAIL]))),
+    )
+    for user in users_result.scalars():
+        await session.delete(user)
     await session.flush()
 
 
@@ -821,15 +1173,56 @@ def wait_for_public_search_contains(
     )
 
 
-def wait_for_dual_synced(
+async def wait_for_ingest_materialized_meme_file(
+    client: PipelineApiClient,
+    *,
+    ingest_request_id: uuid.UUID,
+    settings: Settings,
+    session_factory: AsyncSessionFactory,
+    timeout_seconds: float,
+) -> tuple[IngestRequestRead, uuid.UUID]:
+    deadline = time.monotonic() + timeout_seconds
+    last_request: IngestRequestRead | None = None
+    last_outbox_result: PipelineOutboxPublisherBatchResult | None = None
+    while time.monotonic() < deadline:
+        last_outbox_result = await publish_pending_pipeline_outbox(
+            settings=settings,
+            session_factory=session_factory,
+        )
+        ingest_request = client.get_ingest_request(ingest_request_id)
+        last_request = ingest_request
+        if ingest_request.status in TERMINAL_INGEST_FAILURE_STATUSES:
+            raise E2ESeedError(
+                f"Ingest request {ingest_request_id} reached terminal failure status "
+                f"{ingest_request.status.value}: {ingest_request.failure_code} - {ingest_request.failure_detail}",
+            )
+        if ingest_request.materialized_meme_file_id is not None:
+            return ingest_request, ingest_request.materialized_meme_file_id
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+    snapshot = last_request.model_dump(mode="json") if last_request is not None else None
+    raise E2ESeedError(
+        f"Timed out waiting for ingest request {ingest_request_id} to materialize a meme file. "
+        f"Last request: {snapshot}; last outbox publish: {_outbox_result_snapshot(last_outbox_result)}",
+    )
+
+
+async def wait_for_dual_synced(
     client: PipelineApiClient,
     *,
     meme_file_id: uuid.UUID,
+    settings: Settings,
+    session_factory: AsyncSessionFactory,
     timeout_seconds: float,
 ) -> ContentPipelineItemDetail:
     deadline = time.monotonic() + timeout_seconds
     last_detail: ContentPipelineItemDetail | None = None
+    last_outbox_result: PipelineOutboxPublisherBatchResult | None = None
     while time.monotonic() < deadline:
+        last_outbox_result = await publish_pending_pipeline_outbox(
+            settings=settings,
+            session_factory=session_factory,
+        )
         detail = client.get_item_detail(meme_file_id)
         last_detail = detail
         qdrant_status = detail.sync_targets.get(SyncTargetKind.QDRANT)
@@ -841,11 +1234,32 @@ def wait_for_dual_synced(
             and meili_status.status is SyncTargetStatus.SYNCED
         ):
             return detail
-        time.sleep(POLL_INTERVAL_SECONDS)
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
     snapshot = last_detail.model_dump(mode="json") if last_detail is not None else None
     raise E2ESeedError(
-        f"Timed out waiting for {meme_file_id} to dual-sync. Last detail: {snapshot}",
+        f"Timed out waiting for {meme_file_id} to dual-sync. Last detail: {snapshot}; "
+        f"last outbox publish: {_outbox_result_snapshot(last_outbox_result)}",
     )
+
+
+async def publish_pending_pipeline_outbox(
+    *,
+    settings: Settings,
+    session_factory: AsyncSessionFactory,
+) -> PipelineOutboxPublisherBatchResult:
+    return await run_pipeline_outbox_publisher_batch(session_factory, settings=settings)
+
+
+def _outbox_result_snapshot(result: PipelineOutboxPublisherBatchResult | None) -> dict[str, int | float] | None:
+    if result is None:
+        return None
+    return {
+        "recovered": result.recovered,
+        "claimed": result.claimed,
+        "published": result.published,
+        "failed": result.failed,
+        "duration_seconds": result.duration_seconds,
+    }
 
 
 def wait_for_dual_index_proof(
@@ -1090,7 +1504,7 @@ def _stable_uuid(name: str) -> uuid.UUID:
 def _validate_response[ModelT: BaseModel](
     response: httpx.Response,
     *,
-    expected_status: int,
+    expected_status: int | tuple[int, ...],
     model: type[ModelT],
 ) -> ModelT:
     payload = _validate_json_response(response, expected_status=expected_status)
@@ -1102,7 +1516,7 @@ def _validate_response[ModelT: BaseModel](
         ) from exc
 
 
-def _validate_json_response(response: httpx.Response, *, expected_status: int) -> dict[str, Any]:
+def _validate_json_response(response: httpx.Response, *, expected_status: int | tuple[int, ...]) -> dict[str, Any]:
     try:
         payload = response.json()
     except json.JSONDecodeError as exc:
@@ -1111,7 +1525,8 @@ def _validate_json_response(response: httpx.Response, *, expected_status: int) -
             f"{exc}; body={response.text!r}",
         ) from exc
 
-    if response.status_code != expected_status:
+    expected_statuses = (expected_status,) if isinstance(expected_status, int) else expected_status
+    if response.status_code not in expected_statuses:
         try:
             error_payload = ContentPipelineErrorResponse.model_validate(payload)
         except ValidationError:

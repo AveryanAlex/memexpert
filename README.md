@@ -141,7 +141,7 @@ pnpm build
 
 ## Scheduler
 
-`memexpert-scheduler` is the dedicated APScheduler process for periodic jobs. The current registry is intentionally limited to five jobs:
+`memexpert-scheduler` is the dedicated APScheduler process for periodic jobs. The current registry includes these jobs:
 
 | Job | Enable variable | Interval variable | Default interval |
 |---|---|---|---|
@@ -150,32 +150,35 @@ pnpm build
 | Meme of the Day placeholder | `SCHEDULER_MOTD_ENABLED` | `SCHEDULER_MOTD_INTERVAL_SECONDS` | `86400` seconds |
 | Search-index sync batches | `SCHEDULER_SEARCH_INDEX_SYNC_ENABLED` | `SCHEDULER_SEARCH_INDEX_SYNC_INTERVAL_SECONDS` | `600` seconds |
 | SEO backlog batches | `SCHEDULER_SEO_BACKLOG_BATCHES_ENABLED` | `SCHEDULER_SEO_BACKLOG_BATCHES_INTERVAL_SECONDS` | `900` seconds |
+| Pipeline outbox publisher | `SCHEDULER_PIPELINE_OUTBOX_PUBLISHER_ENABLED` | `SCHEDULER_PIPELINE_OUTBOX_PUBLISHER_INTERVAL_SECONDS` | `5` seconds |
 
-The public trend materialized-view refresh, popularity snapshot capture, search-index sync batches, and SEO backlog batches perform real business work. MOTD remains a deliberate no-op placeholder so the scheduler registry keeps its five-job contract while the product behavior is deferred.
+The public trend materialized-view refresh, popularity snapshot capture, search-index sync batches, SEO backlog batches, and pipeline outbox publisher perform real business work. MOTD remains a deliberate no-op placeholder while the product behavior is deferred.
 
 Search-index sync batches process up to `SCHEDULER_SEARCH_INDEX_SYNC_BATCH_SIZE=50` rows per target per run. The job claims `meme_file_sync_target_snapshots` rows for both Qdrant and Meilisearch, commits the `processing` claim before external writes, retries failed rows, reclaims stale `processing` rows after `SCHEDULER_SEARCH_INDEX_SYNC_PROCESSING_TIMEOUT_SECONDS=900`, and reprocesses synced rows when canonical meme/search metadata is newer than `last_success_at`.
 
 SEO backlog batches process up to `SCHEDULER_SEO_BACKLOG_BATCH_SIZE=25` memes per run. The job prioritizes public, non-NSFW memes missing SEO pages, then stale auto-generated pages whose `prompt_version` differs from `PIPELINE_SEO_PROMPT_VERSION`; manually edited pages are skipped.
 
+Pipeline outbox publisher runs every `SCHEDULER_PIPELINE_OUTBOX_PUBLISHER_INTERVAL_SECONDS=5` seconds by default. Each run starts or reuses the RabbitMQ pipeline broker, recovers `pipeline_outbox_events.status='publishing'` rows older than `SCHEDULER_PIPELINE_OUTBOX_PUBLISHER_STALE_TIMEOUT_SECONDS=300`, then publishes up to `SCHEDULER_PIPELINE_OUTBOX_PUBLISHER_BATCH_SIZE=100` due `pending`/`failed` rows by their stored `routing_key` and JSON payload. This is the production path for both accepted raw-upload `media_inspect_requested` events and post-materialization transcode dispatches.
+
 Popularity snapshots use `log1p`-scaled cumulative metrics from persisted tables only. Current metrics are source views, summed source reactions, forwarded/reposted source rows, platform views (`meme_view`/`view`), platform sends (`meme_send`/`share`), platform saves (`meme_save`/`save`), and platform likes (`meme_like`/`favorite`). Snapshot columns for impressions/downloads are deferred, so they are not part of the static popularity score in this stage.
 
 Popularity weights are configurable with flat scheduler settings: `SCHEDULER_POPULARITY_SOURCE_VIEW_WEIGHT=1.0`, `SCHEDULER_POPULARITY_SOURCE_REACTION_WEIGHT=2.0`, `SCHEDULER_POPULARITY_SOURCE_REPOST_WEIGHT=3.0`, `SCHEDULER_POPULARITY_PLATFORM_VIEW_WEIGHT=1.0`, `SCHEDULER_POPULARITY_PLATFORM_SEND_WEIGHT=3.0`, `SCHEDULER_POPULARITY_PLATFORM_SAVE_WEIGHT=4.0`, and `SCHEDULER_POPULARITY_PLATFORM_LIKE_WEIGHT=5.0`.
 
-For local no-op/startup testing, disable some or all jobs with the `*_ENABLED=false` flags and still run the scheduler process. Disabling all five jobs is a supported way to validate startup, advisory-lock acquisition, and graceful shutdown without executing business work.
+For local no-op/startup testing, disable some or all jobs with the `*_ENABLED=false` flags and still run the scheduler process. Disabling every job is a supported way to validate startup, advisory-lock acquisition, and graceful shutdown without executing business work.
 
 The scheduler emits structured stdout logs by default. Operators should watch for these event names:
 
 - `scheduler_runtime_started` and `scheduler_runtime_stopped` for process lifecycle.
 - `scheduler_stop_requested` when the process receives `SIGINT` or `SIGTERM`.
 - `scheduler_job_started`, `scheduler_job_succeeded`, and `scheduler_job_failed` with `job_id` and `duration_seconds` for each run.
-- `scheduler_job_batch_result` with `job_id`, `scanned`, `updated`, `failed`, `skipped`, and `duration_seconds` for search-index and SEO batch runs.
+- `scheduler_job_batch_result` with `job_id`, `scanned`, `updated`, `failed`, `skipped`, and `duration_seconds` for search-index and SEO batch runs; the outbox publisher uses the same event with `recovered`, `claimed`, `published`, `failed`, and `duration_seconds`.
 - `popularity_snapshot_capture_started` and `popularity_snapshot_capture_succeeded` with `captured_at` and row counts for snapshot runs.
 - `public_trend_mv_concurrent_refresh_fallback` with `view_name` when a concurrent materialized-view refresh cannot run and the scheduler retries without `CONCURRENTLY`.
 - `scheduler_job_placeholder_completed` for MOTD.
 - `scheduler_instance_lock_unavailable` if another scheduler instance already holds the advisory lock.
 - `scheduler_advisory_lock_disabled` only when `SCHEDULER_ADVISORY_LOCK_ENABLED=false`.
 
-Detailed run/replay/inspection guidance for the two backend batch jobs lives in `docs/ops/scheduler-batch-jobs.md`.
+Detailed run/replay/inspection guidance for scheduler batch and outbox jobs lives in `docs/ops/scheduler-batch-jobs.md`.
 
 Graceful shutdown is built into `memexpert-scheduler`: on `SIGINT` or `SIGTERM`, APScheduler stops accepting new work, waits for in-flight jobs to finish, releases the PostgreSQL advisory lock, and then exits.
 

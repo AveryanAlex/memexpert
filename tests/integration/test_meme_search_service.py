@@ -18,10 +18,11 @@ from memexpert.api.dependencies.auth import get_optional_current_user
 from memexpert.api.dependencies.collection import get_collection_service
 from memexpert.api.dependencies.meme import get_analytics_service, get_meme_search_service, get_public_trends_service
 from memexpert.core.config import Settings, get_settings
-from memexpert.core.qdrant import QdrantUserSearchMatch
+from memexpert.core.qdrant import QdrantSimilarityMatch, QdrantUserSearchMatch
 from memexpert.core.search_index_prefilter import SearchIndexPrefilter, SearchIndexPrefilterScope
+from memexpert.core.voyage import VoyageEmbeddingResult
 from memexpert.models.collection import Collection, CollectionMember, CollectionMeme, PinnedMeme
-from memexpert.models.content import Meme, MemeFile, MemePopularitySnapshot, MemeSeoPage, MemeTemplate
+from memexpert.models.content import EmbeddingCache, Meme, MemeFile, MemePopularitySnapshot, MemeSeoPage, MemeTemplate
 from memexpert.models.enums import (
     AnalyticsEventType,
     CollectionKind,
@@ -29,6 +30,7 @@ from memexpert.models.enums import (
     CollectionVisibility,
     ContentKind,
     ContentLanguage,
+    EmbeddingInputType,
 )
 from memexpert.models.user import AccountMergeLog, AnalyticsEvent, User
 from memexpert.schemas.user import UserRead
@@ -76,6 +78,25 @@ class FakeSemanticSearchClient:
         prefilter: SearchIndexPrefilter | None = None,
     ) -> tuple[QdrantUserSearchMatch, ...]:
         self.calls.append({"query_vector": query_vector, "limit": limit, "prefilter": prefilter})
+        return self._hits[:limit]
+
+
+class FakeSimilarityClient:
+    def __init__(self, hits: tuple[QdrantSimilarityMatch, ...] = (), *, failure: Exception | None = None) -> None:
+        self._hits = hits
+        self._failure = failure
+        self.calls: list[dict[str, Any]] = []
+
+    async def find_similar_memes(
+        self,
+        *,
+        vector: tuple[float, ...],
+        current_meme_file_id: uuid.UUID,
+        limit: int | None = None,
+    ) -> tuple[QdrantSimilarityMatch, ...]:
+        self.calls.append({"vector": vector, "current_meme_file_id": current_meme_file_id, "limit": limit})
+        if self._failure is not None:
+            raise self._failure
         return self._hits[:limit]
 
 
@@ -254,6 +275,28 @@ async def _create_collection(
 def _primary_file_id(meme: Meme) -> uuid.UUID:
     assert meme.primary_file_id is not None
     return meme.primary_file_id
+
+
+async def _add_image_embedding(
+    session: AsyncSession,
+    meme: Meme,
+    vector: tuple[float, ...] = (0.25, 0.75),
+) -> None:
+    session.add(
+        EmbeddingCache(
+            input_hash=f"test-{uuid.uuid4()}",
+            input_type=EmbeddingInputType.IMAGE,
+            embedding=VoyageEmbeddingResult(
+                model="test-voyage",
+                dimensions=len(vector),
+                vector=vector,
+                input_hash=f"test-{uuid.uuid4()}",
+            ).embedding_bytes,
+            model_version="test-voyage",
+            source_file_id=_primary_file_id(meme),
+        )
+    )
+    await session.flush()
 
 
 def _expected_prefilter(
@@ -545,6 +588,9 @@ async def test_public_openapi_registers_catalog_routes_without_internal_surface(
     assert "/api/v1/memes/templates/{template_slug}" in paths
     assert "/api/v1/memes/{meme_id}/canonical" in paths
     assert "/api/v1/memes/{meme_id}/popularity" in paths
+    assert "/api/v1/memes/{meme_id}/similar" in paths
+    assert "/api/v1/memes/{meme_id}/impression" in paths
+    assert "/api/v1/memes/{meme_id}/detail-click" in paths
     assert "/api/v1/memes/{meme_id}" in paths
     search_parameter_list = paths["/api/v1/memes/search"]["get"]["parameters"]
     browse_parameter_list = paths["/api/v1/memes/browse"]["get"]["parameters"]
@@ -552,6 +598,9 @@ async def test_public_openapi_registers_catalog_routes_without_internal_surface(
     browse_parameters = {parameter["name"]: parameter for parameter in browse_parameter_list}
     trending_parameters = {
         parameter["name"]: parameter for parameter in paths["/api/v1/memes/trending"]["get"]["parameters"]
+    }
+    similar_parameters = {
+        parameter["name"]: parameter for parameter in paths["/api/v1/memes/{meme_id}/similar"]["get"]["parameters"]
     }
     assert "query" in search_parameters
     assert "scope" in search_parameters
@@ -588,6 +637,7 @@ async def test_public_openapi_registers_catalog_routes_without_internal_surface(
     assert "deduplicated in request order" in browse_parameters["collection_ids"]["description"]
     assert "lookback_hours" in trending_parameters
     assert "ignores this value" in trending_parameters["lookback_hours"]["description"]
+    assert set(similar_parameters) >= {"meme_id", "include_nsfw", "limit", "offset"}
     assert set(components["PublicMemeSearchResultRead"]["properties"]) == {"meme", "attribution"}
     assert "request_id" in components["PublicMemeSearchPageRead"]["properties"]
     assert "MemeResultAttributionRead" in components
@@ -626,6 +676,183 @@ async def test_public_openapi_registers_catalog_routes_without_internal_surface(
     assert "s3_web_video_key" not in components["PublicMemeFileRead"]["properties"]
     assert "author_user_id" not in components["PublicMemeDetailRead"]["properties"]
     assert "is_public" not in components["PublicMemeDetailRead"]["properties"]
+
+
+async def test_similar_route_uses_qdrant_embedding_and_filters_private_and_self_matches(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    source = await _create_meme(migrated_db_session, tags=["frog"], popularity_score=30.0)
+    private_match = await _create_meme(
+        migrated_db_session,
+        is_public=False,
+        tags=["frog"],
+        popularity_score=100.0,
+        s3_original_key="pipeline/originals/private/similar-hidden.jpg",
+    )
+    first_match = await _create_meme(migrated_db_session, tags=["frog"], popularity_score=20.0)
+    second_match = await _create_meme(migrated_db_session, tags=["frog"], popularity_score=10.0)
+    await _add_image_embedding(migrated_db_session, source, (0.25, 0.75))
+    await migrated_db_session.commit()
+    similarity_client = FakeSimilarityClient(
+        (
+            QdrantSimilarityMatch(
+                meme_file_id=uuid.uuid4(),
+                meme_id=source.id,
+                similarity_score=0.99,
+            ),
+            QdrantSimilarityMatch(
+                meme_file_id=_primary_file_id(private_match),
+                meme_id=private_match.id,
+                similarity_score=0.98,
+            ),
+            QdrantSimilarityMatch(
+                meme_file_id=_primary_file_id(first_match),
+                meme_id=first_match.id,
+                similarity_score=0.91,
+            ),
+            QdrantSimilarityMatch(
+                meme_file_id=_primary_file_id(second_match),
+                meme_id=second_match.id,
+                similarity_score=0.82,
+            ),
+        )
+    )
+    service = MemeSearchService(
+        migrated_db_session,
+        similarity_client=similarity_client,
+        settings=Settings.model_validate({"pipeline_voyage_output_dimensions": 2}),
+    )
+    _install_meme_route_overrides(app, migrated_db_session, service=service)
+
+    try:
+        response = await client.get(f"/api/v1/memes/{source.id}/similar", params={"limit": 2})
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [item["meme"]["id"] for item in payload["items"]] == [str(first_match.id), str(second_match.id)]
+    _assert_public_page_attribution(payload, source_algorithm="qdrant_similarity", surface="public_api_meme_similar")
+    first_attribution = payload["items"][0]["attribution"]
+    assert first_attribution["reason"] == "qdrant_similarity"
+    assert first_attribution["source_meme_id"] == str(source.id)
+    assert first_attribution["score"] == pytest.approx(0.91)
+    assert first_attribution["score_components"] == {"similarity": 0.91, "total": 0.91}
+    assert len(similarity_client.calls) == 1
+    assert similarity_client.calls[0]["vector"] == pytest.approx((0.25, 0.75))
+    assert similarity_client.calls[0]["current_meme_file_id"] == _primary_file_id(source)
+    assert similarity_client.calls[0]["limit"] == 20
+    assert str(private_match.id) not in response.text
+    assert "similar-hidden.jpg" not in response.text
+
+
+async def test_public_similar_memes_missing_embedding_falls_back_tag_template_then_popular(
+    migrated_db_session: AsyncSession,
+) -> None:
+    template = MemeTemplate(slug="frog-template", name="Frog Template")
+    migrated_db_session.add(template)
+    await migrated_db_session.flush()
+    source = await _create_meme(migrated_db_session, tags=["frog", "wizard"], popularity_score=50.0)
+    tag_match = await _create_meme(migrated_db_session, tags=["frog"], popularity_score=10.0)
+    template_match = await _create_meme(migrated_db_session, tags=["reaction"], popularity_score=100.0)
+    popular_match = await _create_meme(migrated_db_session, tags=["other"], popularity_score=200.0)
+    source.template_id = template.id
+    template_match.template_id = template.id
+    await migrated_db_session.commit()
+    similarity_client = FakeSimilarityClient()
+    service = MemeSearchService(
+        migrated_db_session,
+        similarity_client=similarity_client,
+        settings=Settings.model_validate({"pipeline_voyage_output_dimensions": 2}),
+    )
+
+    page = await service.get_public_similar_memes(source.id, limit=3)
+
+    assert [item.meme.id for item in page.items] == [tag_match.id, template_match.id, popular_match.id]
+    assert [item.attribution.source_algorithm for item in page.items] == [
+        "fallback_tag",
+        "fallback_template",
+        "fallback_popular",
+    ]
+    assert {item.attribution.reason for item in page.items} == {"missing_embedding"}
+    assert {item.attribution.source_meme_id for item in page.items} == {source.id}
+    assert page.items[0].attribution.score_components["tag_overlap"] == pytest.approx(0.5)
+    assert page.items[1].attribution.score_components["template_match"] == 1.0
+    assert similarity_client.calls == []
+
+
+async def test_public_similar_memes_qdrant_failure_falls_back_without_private_leakage(
+    migrated_db_session: AsyncSession,
+) -> None:
+    source = await _create_meme(migrated_db_session, tags=["frog"], popularity_score=10.0)
+    public_tag = await _create_meme(migrated_db_session, tags=["frog"], popularity_score=20.0)
+    private_tag = await _create_meme(
+        migrated_db_session,
+        is_public=False,
+        tags=["frog"],
+        popularity_score=100.0,
+        s3_original_key="pipeline/originals/private/qdrant-failure-hidden.jpg",
+    )
+    await _add_image_embedding(migrated_db_session, source, (0.4, 0.6))
+    await migrated_db_session.commit()
+    similarity_client = FakeSimilarityClient(failure=RuntimeError("qdrant unavailable secret"))
+    service = MemeSearchService(
+        migrated_db_session,
+        similarity_client=similarity_client,
+        settings=Settings.model_validate({"pipeline_voyage_output_dimensions": 2}),
+    )
+
+    page = await service.get_public_similar_memes(source.id, limit=2)
+
+    assert [item.meme.id for item in page.items] == [public_tag.id]
+    assert page.items[0].attribution.source_algorithm == "fallback_tag"
+    assert page.items[0].attribution.reason == "qdrant_failure"
+    serialized = page.model_dump_json()
+    assert str(private_tag.id) not in serialized
+    assert "qdrant-failure-hidden.jpg" not in serialized
+    assert len(similarity_client.calls) == 1
+    assert similarity_client.calls[0]["vector"] == pytest.approx((0.4, 0.6))
+    assert similarity_client.calls[0]["current_meme_file_id"] == _primary_file_id(source)
+    assert similarity_client.calls[0]["limit"] == 20
+
+
+async def test_public_similar_memes_filters_nsfw_unless_allowed(
+    migrated_db_session: AsyncSession,
+) -> None:
+    source = await _create_meme(migrated_db_session, popularity_score=10.0)
+    safe_match = await _create_meme(migrated_db_session, popularity_score=20.0)
+    nsfw_match = await _create_meme(migrated_db_session, is_nsfw=True, popularity_score=30.0)
+    await _add_image_embedding(migrated_db_session, source, (0.1, 0.9))
+    await migrated_db_session.commit()
+    similarity_client = FakeSimilarityClient(
+        (
+            QdrantSimilarityMatch(
+                meme_file_id=_primary_file_id(nsfw_match),
+                meme_id=nsfw_match.id,
+                similarity_score=0.96,
+            ),
+            QdrantSimilarityMatch(
+                meme_file_id=_primary_file_id(safe_match),
+                meme_id=safe_match.id,
+                similarity_score=0.86,
+            ),
+        )
+    )
+    service = MemeSearchService(
+        migrated_db_session,
+        similarity_client=similarity_client,
+        settings=Settings.model_validate({"pipeline_voyage_output_dimensions": 2}),
+    )
+
+    safe_page = await service.get_public_similar_memes(source.id, include_nsfw=False, limit=2)
+    nsfw_page = await service.get_public_similar_memes(source.id, include_nsfw=True, limit=2)
+
+    assert [item.meme.id for item in safe_page.items] == [safe_match.id]
+    assert [item.meme.id for item in nsfw_page.items] == [nsfw_match.id, safe_match.id]
+    assert safe_page.items[0].attribution.source_algorithm == "qdrant_similarity"
+    assert nsfw_page.items[0].meme.is_nsfw is True
 
 
 async def test_search_service_passes_conservative_prefilters_to_text_and_semantic_clients(
@@ -999,6 +1226,99 @@ async def test_search_route_scope_collections_returns_multiple_authorized_collec
     assert event.payload["collection_ids"] == [str(owned_collection.id), str(shared_collection.id)]
 
 
+async def test_meme_detail_routes_return_authorized_private_and_shared_memes_with_markers(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    viewer = build_full_user()
+    owner = build_full_user()
+    stranger = build_full_user()
+    migrated_db_session.add_all([viewer, owner, stranger])
+    await migrated_db_session.flush()
+    owned_private = await _create_meme(
+        migrated_db_session,
+        is_public=False,
+        author_user_id=viewer.id,
+        s3_original_key="pipeline/originals/private/detail-owned.jpg",
+    )
+    shared_private = await _create_meme(
+        migrated_db_session,
+        is_public=False,
+        author_user_id=owner.id,
+        s3_original_key="pipeline/originals/private/detail-shared.jpg",
+    )
+    unauthorized_private = await _create_meme(
+        migrated_db_session,
+        is_public=False,
+        author_user_id=stranger.id,
+        s3_original_key="pipeline/originals/private/detail-hidden.jpg",
+    )
+    migrated_db_session.add(
+        MemeSeoPage(
+            meme_id=shared_private.id,
+            slug="shared-private-detail",
+            page_title="Shared Private Detail",
+            meta_description="Shared private detail.",
+            alt_text="Shared private image",
+            caption="Shared private",
+            tags=["private"],
+            model_id="test",
+            prompt_version="test-v1",
+            generated_at=datetime.now(UTC),
+        )
+    )
+    _ = await _create_collection(
+        migrated_db_session,
+        owner=owner,
+        title="Shared detail collection",
+        memberships=[(viewer, CollectionMembershipRole.VIEWER)],
+        memes=[shared_private],
+    )
+    await migrated_db_session.commit()
+    service = MemeSearchService(
+        migrated_db_session,
+        media_render_service=MediaRenderUrlService(
+            Settings.model_validate({"imgproxy_base_url": "https://img.memexpert.test"})
+        ),
+    )
+
+    _install_meme_route_overrides(app, migrated_db_session, current_user=_user_read(viewer), service=service)
+    try:
+        owned_response = await client.get(f"/api/v1/memes/{owned_private.id}")
+        shared_slug_response = await client.get("/api/v1/memes/slug/shared-private-detail")
+        hidden_response = await client.get(f"/api/v1/memes/{unauthorized_private.id}")
+    finally:
+        app.dependency_overrides.clear()
+
+    _install_meme_route_overrides(app, migrated_db_session, service=service)
+    try:
+        anonymous_shared_response = await client.get("/api/v1/memes/slug/shared-private-detail")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert owned_response.status_code == 200
+    owned_payload = owned_response.json()
+    assert owned_payload["id"] == str(owned_private.id)
+    assert owned_payload["viewer_access"] == {"visibility": "private"}
+    assert owned_payload["primary_file"]["render"]["thumbnail_url"] == (
+        f"/api/v1/media/files/{owned_private.primary_file_id}/thumbnail"
+    )
+    assert "detail-owned.jpg" not in owned_response.text
+
+    assert shared_slug_response.status_code == 200
+    shared_payload = shared_slug_response.json()
+    assert shared_payload["id"] == str(shared_private.id)
+    assert shared_payload["viewer_access"] == {"visibility": "shared"}
+    assert shared_payload["primary_file"]["render"]["preview_url"] == (
+        f"/api/v1/media/files/{shared_private.primary_file_id}/preview"
+    )
+    assert "detail-shared.jpg" not in shared_slug_response.text
+    assert hidden_response.status_code == 404
+    assert "detail-hidden.jpg" not in hidden_response.text
+    assert anonymous_shared_response.status_code == 404
+
+
 async def test_search_and_browse_routes_validate_scope_auth_and_collection_ids(
     app: FastAPI,
     client: AsyncClient,
@@ -1249,7 +1569,7 @@ async def test_guest_search_route_collections_scope_allows_favorites(
     assert str(stranger_private.id) not in private_response.text
 
 
-async def test_public_search_and_detail_do_not_emit_authenticated_private_media(
+async def test_public_search_defaults_public_but_authenticated_detail_can_return_owned_private_media(
     migrated_db_session: AsyncSession,
 ) -> None:
     owner = build_full_user()
@@ -1285,18 +1605,29 @@ async def test_public_search_and_detail_do_not_emit_authenticated_private_media(
     search_page = await service.search_public_memes("owner private", viewer_user_id=owner.id, limit=10)
     browse_page = await service.browse_public_memes(viewer_user_id=owner.id, limit=10)
     public_detail = await service.get_public_meme_detail(public_meme.id, viewer_user_id=owner.id)
+    private_detail = await service.get_public_meme_detail(private_meme.id, viewer_user_id=owner.id)
 
     assert [item.meme.id for item in search_page.items] == [public_meme.id]
     assert private_meme.id not in {item.meme.id for item in browse_page.items}
     assert public_detail.primary_file is not None
     assert public_detail.primary_file.id == public_meme.primary_file_id
+    assert public_detail.viewer_access is None
+    assert private_detail.primary_file is not None
+    assert private_detail.primary_file.id == private_meme.primary_file_id
+    assert private_detail.primary_file.render is not None
+    assert private_detail.primary_file.render.thumbnail_url == (
+        f"/api/v1/media/files/{private_meme.primary_file_id}/thumbnail"
+    )
+    assert private_detail.viewer_access is not None
+    assert private_detail.viewer_access.visibility == "private"
     with pytest.raises(MemeNotFoundError):
-        _ = await service.get_public_meme_detail(private_meme.id, viewer_user_id=owner.id)
+        _ = await service.get_public_meme_detail(private_meme.id)
 
     serialized = search_page.model_dump_json() + browse_page.model_dump_json()
     assert str(private_meme.id) not in serialized
     assert str(private_meme.primary_file_id) not in serialized
     assert "authenticated-owner.jpg" not in serialized
+    assert "authenticated-owner.jpg" not in private_detail.model_dump_json()
 
 
 async def test_search_scopes_filter_db_candidates_memberships_and_nsfw(
@@ -2812,24 +3143,40 @@ async def test_detail_route_returns_not_found_for_missing_private_or_nsfw_withou
     stranger = build_full_user(nsfw_enabled=True)
     migrated_db_session.add_all([author, stranger])
     await migrated_db_session.flush()
-    private_meme = await _create_meme(migrated_db_session, is_public=False, author_user_id=author.id)
+    private_meme = await _create_meme(
+        migrated_db_session,
+        is_public=False,
+        author_user_id=author.id,
+        s3_original_key="pipeline/originals/private/detail-author-private.jpg",
+    )
     nsfw_meme = await _create_meme(migrated_db_session, is_nsfw=True)
     missing_id = uuid.uuid4()
 
-    async def detail_status(meme_id: uuid.UUID, current_user: UserRead | None, include_nsfw: bool = False) -> int:
+    async def detail_response(meme_id: uuid.UUID, current_user: UserRead | None, include_nsfw: bool = False):
         _install_meme_route_overrides(app, migrated_db_session, current_user=current_user)
         try:
             response = await client.get(f"/api/v1/memes/{meme_id}", params={"include_nsfw": include_nsfw})
         finally:
             app.dependency_overrides.clear()
-        return response.status_code
+        return response
 
-    assert await detail_status(missing_id, None) == 404
-    assert await detail_status(private_meme.id, None) == 404
-    assert await detail_status(private_meme.id, _user_read(stranger)) == 404
-    assert await detail_status(private_meme.id, _user_read(author)) == 404
-    assert await detail_status(nsfw_meme.id, _user_read(author)) == 404
-    assert await detail_status(nsfw_meme.id, _user_read(author), include_nsfw=True) == 200
+    assert (await detail_response(missing_id, None)).status_code == 404
+    assert (await detail_response(private_meme.id, None)).status_code == 404
+    assert (await detail_response(private_meme.id, _user_read(stranger))).status_code == 404
+
+    owner_private_response = await detail_response(private_meme.id, _user_read(author))
+    assert owner_private_response.status_code == 200
+    owner_private_payload = owner_private_response.json()
+    assert owner_private_payload["id"] == str(private_meme.id)
+    assert owner_private_payload["viewer_access"] == {"visibility": "private"}
+    assert owner_private_payload["primary_file"]["render"]["thumbnail_url"] == (
+        f"/api/v1/media/files/{private_meme.primary_file_id}/thumbnail"
+    )
+    assert "detail-author-private.jpg" not in owner_private_response.text
+    assert "s3_original_key" not in owner_private_response.text
+
+    assert (await detail_response(nsfw_meme.id, _user_read(author))).status_code == 404
+    assert (await detail_response(nsfw_meme.id, _user_read(author), include_nsfw=True)).status_code == 200
 
     event = await migrated_db_session.scalar(
         select(AnalyticsEvent)
@@ -2837,8 +3184,9 @@ async def test_detail_route_returns_not_found_for_missing_private_or_nsfw_withou
         .order_by(AnalyticsEvent.occurred_at.desc())
     )
     assert event is not None
-    assert event.payload["surface"] == "public_api"
-    assert event.payload["meme_id"] == str(nsfw_meme.id)
+    assert event.payload["surface"] == "public_api_meme_detail"
+    refs = cast("dict[str, object]", event.payload["refs"])
+    assert refs["meme_id"] == str(nsfw_meme.id)
 
 
 async def test_operator_launch_kpis_count_events_source_metrics_and_conversions(

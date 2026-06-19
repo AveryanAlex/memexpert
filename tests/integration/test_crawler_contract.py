@@ -40,8 +40,6 @@ from memexpert.schemas.content_pipeline import (
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
-    from memexpert.services.content_pipeline import ContentPipelineService
-
 
 def _now() -> datetime:
     return datetime.now(tz=UTC)
@@ -257,12 +255,30 @@ def test_pipeline_telegram_errors_form_a_taxonomy() -> None:
 
 
 @dataclass(slots=True)
-class _StubPipelineService:
-    """Minimal ContentPipelineService double for runtime stub tests."""
+class _StubCrawlerIngestService:
+    """Minimal crawler ingest double for runtime stub tests."""
 
     calls: list[RawCrawlerPost] = field(default_factory=list)
 
-    async def create_crawler_ingest(self, raw_post: RawCrawlerPost) -> CrawlerIngestResult:
+    async def try_accept_without_media(
+        self,
+        *,
+        platform: SourcePlatform,
+        source_id: str,
+        post_id: str,
+        published_at: datetime | None,
+        advance_checkpoint: bool = True,
+    ) -> CrawlerIngestResult | None:
+        _ = (platform, source_id, post_id, published_at, advance_checkpoint)
+        return None
+
+    async def accept_crawler_post(
+        self,
+        raw_post: RawCrawlerPost,
+        *,
+        advance_checkpoint: bool = True,
+    ) -> CrawlerIngestResult:
+        _ = advance_checkpoint
         self.calls.append(raw_post)
         return CrawlerIngestResult(
             outcome=CrawlerIngestOutcome.INGESTED,
@@ -273,10 +289,10 @@ class _StubPipelineService:
 async def test_telegram_crawler_runtime_load_session_state_creates_and_returns_rows(
     migrated_db_session: AsyncSession,
 ) -> None:
-    service = cast("ContentPipelineService", cast("object", _StubPipelineService()))
+    service = _StubCrawlerIngestService()
     client = FakeTelegramClient()
     runtime = TelegramCrawlerRuntime(
-        pipeline_service=service,
+        ingest_service=service,
         telegram_client=client,
         session=migrated_db_session,
         settings=Settings(),
@@ -332,10 +348,10 @@ async def test_telegram_crawler_runtime_accepts_async_mock_clients(
     so make sure T01's contract keeps those drop-in replacements usable.
     """
 
-    service = cast("ContentPipelineService", cast("object", _StubPipelineService()))
+    service = _StubCrawlerIngestService()
     mock_client = cast("PipelineTelegramClientProtocol", AsyncMock())
     runtime = TelegramCrawlerRuntime(
-        pipeline_service=service,
+        ingest_service=service,
         telegram_client=mock_client,
         session=migrated_db_session,
         settings=Settings(),

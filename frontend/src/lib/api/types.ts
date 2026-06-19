@@ -7,6 +7,7 @@ export type CollectionVisibility = 'private' | 'public' | 'unlisted';
 export type CollectionMembershipRole = 'editor' | 'owner' | 'viewer';
 export type CollectionInviteChannel = 'direct_link' | 'email' | 'telegram';
 export type CollectionInviteStatus = 'accepted' | 'expired' | 'pending' | 'revoked';
+export type MemeSearchScope = 'all' | 'collections' | 'private' | 'public';
 
 export interface UserRead {
   id: string;
@@ -37,6 +38,33 @@ export interface LinkedProvidersRead {
 export interface CurrentSessionRead {
   user: UserRead;
   linked_providers: LinkedProvidersRead;
+}
+
+export interface ProfileStatsTagRead {
+  tag: string;
+  count: number;
+}
+
+export interface ProfileStatsTemplateRead {
+  template_id: string;
+  slug: string;
+  name: string;
+  count: number;
+}
+
+export interface ProfileStatsMetadataRead {
+  notes: string[];
+}
+
+export interface ProfileStatsRead {
+  viewed: number;
+  sent: number;
+  saved: number;
+  downloaded: number;
+  days_active: number;
+  top_tags: ProfileStatsTagRead[];
+  top_templates: ProfileStatsTemplateRead[];
+  metadata: ProfileStatsMetadataRead;
 }
 
 export interface TelegramLinkStartRead {
@@ -103,6 +131,7 @@ export interface PublicMemeCardRead {
   viewer_has_favorited: boolean;
   viewer_has_saved: boolean;
   viewer_has_pinned: boolean;
+  viewer_access?: PublicMemeViewerAccessRead | null;
 }
 
 export interface PublicMemeDetailRead extends PublicMemeCardRead {
@@ -118,8 +147,41 @@ export interface PublicMemeDetailRead extends PublicMemeCardRead {
   files: PublicMemeFileRead[];
 }
 
+export interface MemeResultAttributionFiltersRead {
+  language: ContentLanguage | null;
+  media_type: ContentKind | null;
+  include_nsfw: boolean;
+  tags: string[];
+  scope: string | null;
+  collection_ids: string[];
+}
+
+export interface MemeResultAttributionRead {
+  request_id: string | null;
+  impression_id: string;
+  surface: string | null;
+  source_algorithm: string | null;
+  rank: number | null;
+  query: string | null;
+  filters: MemeResultAttributionFiltersRead;
+  collection_scope: string | null;
+  collection_ids: string[];
+  source_meme_id: string | null;
+  algorithm_version: string | null;
+  score: number | null;
+  score_components: Record<string, number>;
+  reason: string | null;
+}
+
+export type PublicMemeViewerAccess = 'public' | 'private' | 'shared';
+
+export interface PublicMemeViewerAccessRead {
+  visibility: PublicMemeViewerAccess;
+}
+
 export interface PublicMemeSearchResultRead {
   meme: PublicMemeCardRead;
+  attribution: MemeResultAttributionRead;
 }
 
 export interface PublicMemeSearchPageRead {
@@ -128,6 +190,7 @@ export interface PublicMemeSearchPageRead {
   offset: number;
   total: number;
   has_more: boolean;
+  request_id: string;
 }
 
 export interface CollectionSummaryRead {
@@ -217,6 +280,7 @@ export interface PublicTrendMetricsRead {
 export interface PublicMemeTrendRead {
   meme: PublicMemeCardRead;
   trend: PublicTrendMetricsRead;
+  attribution: MemeResultAttributionRead;
 }
 
 export interface PublicMemeTrendPageRead {
@@ -225,6 +289,7 @@ export interface PublicMemeTrendPageRead {
   offset: number;
   total: number;
   has_more: boolean;
+  request_id: string;
 }
 
 export interface PublicMemePopularityPointRead {
@@ -318,7 +383,16 @@ export interface CollectionCapabilitiesRead {
   can_rename: boolean;
   can_delete: boolean;
   can_create_invites: boolean;
+  can_revoke_invites: boolean;
+  can_manage_members: boolean;
   can_set_active_save: boolean;
+}
+
+export interface PinnedMemeRead {
+  user_id: string;
+  meme_id: string;
+  position: number;
+  pinned_at: string;
 }
 
 export interface WebCollectionSummaryRead {

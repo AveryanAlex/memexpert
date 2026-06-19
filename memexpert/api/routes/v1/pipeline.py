@@ -6,20 +6,26 @@ from __future__ import annotations
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Body, Depends, File, Form, Path, Query, UploadFile, status
+from fastapi import APIRouter, Body, Depends, File, Form, Path, Query, Response, UploadFile, status
 from pydantic import ValidationError
 
 from memexpert.api.dependencies.meme import AnalyticsServiceDep
 from memexpert.api.dependencies.pipeline import (
     PIPELINE_ERROR_RESPONSES,
     MeilisearchSyncClientDep,
-    PipelineServiceDep,
+    PipelineIngestAcceptServiceDep,
+    PipelineIngestReadServiceDep,
+    PipelineItemReadServiceDep,
+    PipelineReplayServiceDep,
+    PipelineSmokeProofServiceDep,
+    PipelineSyncStatusServiceDep,
     QdrantSimilarityClientDep,
     QdrantSyncClientDep,
     require_pipeline_operator_token,
     to_pipeline_http_error,
 )
-from memexpert.models.enums import ContentPipelineStage, SourcePlatform, SyncTargetKind
+from memexpert.ingest.schemas import IngestAcceptOutcome, IngestAcceptSource, IngestRequestRead
+from memexpert.models.enums import ContentPipelineStage, PipelineIngestRequestStatus, SourcePlatform, SyncTargetKind
 from memexpert.schemas.content_pipeline import (
     ContentPipelineItemDetail,
     ContentPipelineItemFilter,
@@ -28,8 +34,6 @@ from memexpert.schemas.content_pipeline import (
     ContentPipelineReplayRequest,
     ContentPipelineSearchSmokeRequest,
     ContentPipelineSyncReplayBatchRequest,
-    ContentPipelineUploadMetadata,
-    ContentPipelineUploadRead,
     PerTargetSyncStatus,
     SmokeProofResult,
 )
@@ -60,23 +64,24 @@ async def read_launch_kpis(
 
 @router.post(
     "/uploads",
-    response_model=ContentPipelineUploadRead,
+    response_model=IngestRequestRead,
     responses=PIPELINE_ERROR_RESPONSES,
-    status_code=status.HTTP_201_CREATED,
-    summary="Upload an original asset into the manual operator ingest path",
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Accept a raw original asset into the async ingest-request path",
 )
 async def create_pipeline_upload(
-    pipeline_service: PipelineServiceDep,
+    response: Response,
+    ingest_accept_service: PipelineIngestAcceptServiceDep,
     source_platform: Annotated[SourcePlatform, Form()],
     source_id: Annotated[str, Form(min_length=1)],
     post_id: Annotated[str, Form(min_length=1)],
     file: Annotated[UploadFile, File()],
     views: Annotated[int, Form(ge=0)] = 0,
-) -> ContentPipelineUploadRead:
-    """Persist one uploaded original before any downstream publish is attempted."""
+) -> IngestRequestRead:
+    """Accept raw bytes without synchronous media inspection or materialization."""
 
     try:
-        metadata = ContentPipelineUploadMetadata(
+        source = IngestAcceptSource(
             source_platform=source_platform,
             source_id=source_id,
             post_id=post_id,
@@ -89,16 +94,57 @@ async def create_pipeline_upload(
 
     try:
         media_bytes = await file.read()
-        return await pipeline_service.create_upload(
-            metadata=metadata,
+        result = await ingest_accept_service.accept_bytes(
+            source=source,
             filename=file.filename,
             content_type=file.content_type,
             media_bytes=media_bytes,
         )
+        if result.outcome is not IngestAcceptOutcome.ACCEPTED_ASYNC:
+            response.status_code = status.HTTP_200_OK
+        return result.ingest_request
     except PipelineServiceError as exc:
         raise to_pipeline_http_error(exc) from exc
     finally:
         await file.close()
+
+
+@router.get(
+    "/ingest-requests",
+    response_model=list[IngestRequestRead],
+    responses=PIPELINE_ERROR_RESPONSES,
+    summary="List raw ingest requests awaiting or after worker materialization",
+)
+async def list_pipeline_ingest_requests(
+    ingest_read_service: PipelineIngestReadServiceDep,
+    request_status: Annotated[PipelineIngestRequestStatus | None, Query(alias="status")] = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+) -> list[IngestRequestRead]:
+    """Return raw pre-content ingest requests, separate from materialized items."""
+
+    try:
+        requests = await ingest_read_service.list_requests(status=request_status, limit=limit)
+    except PipelineServiceError as exc:
+        raise to_pipeline_http_error(exc) from exc
+    return list(requests)
+
+
+@router.get(
+    "/ingest-requests/{ingest_request_id}",
+    response_model=IngestRequestRead,
+    responses=PIPELINE_ERROR_RESPONSES,
+    summary="Read one raw ingest request",
+)
+async def read_pipeline_ingest_request(
+    ingest_request_id: Annotated[uuid.UUID, Path()],
+    ingest_read_service: PipelineIngestReadServiceDep,
+) -> IngestRequestRead:
+    """Return raw ingest-request state without querying materialized item details."""
+
+    try:
+        return await ingest_read_service.get_request(ingest_request_id)
+    except PipelineServiceError as exc:
+        raise to_pipeline_http_error(exc) from exc
 
 
 @router.get(
@@ -108,7 +154,7 @@ async def create_pipeline_upload(
     summary="List failed, stuck, duplicate, or all pipeline items",
 )
 async def list_pipeline_items(
-    pipeline_service: PipelineServiceDep,
+    item_read_service: PipelineItemReadServiceDep,
     filter_by: Annotated[ContentPipelineItemFilter, Query(alias="filter")] = ContentPipelineItemFilter.FAILED,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     stuck_after_seconds: Annotated[int, Query(ge=1, le=86_400)] = 60,
@@ -116,7 +162,7 @@ async def list_pipeline_items(
     """Return operator-facing pipeline items filtered by the current durable stage state."""
 
     try:
-        items = await pipeline_service.list_items(
+        items = await item_read_service.list_items(
             filter_by=filter_by,
             limit=limit,
             stuck_after_seconds=stuck_after_seconds,
@@ -135,12 +181,12 @@ async def list_pipeline_items(
 )
 async def read_pipeline_item(
     meme_file_id: Annotated[uuid.UUID, Path()],
-    pipeline_service: PipelineServiceDep,
+    item_read_service: PipelineItemReadServiceDep,
 ) -> ContentPipelineItemRead:
     """Return durable inspect state for one uploaded or duplicate-short-circuited file."""
 
     try:
-        return await pipeline_service.get_item(meme_file_id)
+        return await item_read_service.get_item(meme_file_id)
     except PipelineServiceError as exc:
         raise to_pipeline_http_error(exc) from exc
 
@@ -153,7 +199,7 @@ async def read_pipeline_item(
 )
 async def read_pipeline_item_detail(
     meme_file_id: Annotated[uuid.UUID, Path()],
-    pipeline_service: PipelineServiceDep,
+    item_read_service: PipelineItemReadServiceDep,
 ) -> ContentPipelineItemDetail:
     """Return the operator-facing enriched projection for one pipeline item.
 
@@ -166,7 +212,7 @@ async def read_pipeline_item_detail(
     """
 
     try:
-        return await pipeline_service.get_item_detail(meme_file_id)
+        return await item_read_service.get_item_detail(meme_file_id)
     except PipelineServiceError as exc:
         raise to_pipeline_http_error(exc) from exc
 
@@ -180,7 +226,7 @@ async def read_pipeline_item_detail(
 )
 async def replay_pipeline_item(
     meme_file_id: Annotated[uuid.UUID, Path()],
-    pipeline_service: PipelineServiceDep,
+    replay_service: PipelineReplayServiceDep,
     payload: Annotated[ContentPipelineReplayRequest | None, Body()] = None,
 ) -> ContentPipelineReplayAccepted:
     """Republish one failed stage without re-uploading the original durable ingest state."""
@@ -193,14 +239,14 @@ async def replay_pipeline_item(
         )
 
     try:
-        return await pipeline_service.replay_item(meme_file_id, stage=requested_stage)
+        return await replay_service.replay_item(meme_file_id, stage=requested_stage)
     except PipelineServiceError as exc:
         raise to_pipeline_http_error(exc) from exc
 
 
 async def _read_sync_target_status(
     *,
-    pipeline_service: PipelineServiceDep,
+    sync_status_service: PipelineSyncStatusServiceDep,
     meme_file_id: uuid.UUID,
     target: SyncTargetKind,
 ) -> PerTargetSyncStatus:
@@ -211,28 +257,28 @@ async def _read_sync_target_status(
     """
 
     try:
-        return await pipeline_service.get_sync_target_status(meme_file_id, target)
+        return await sync_status_service.get_sync_target_status(meme_file_id, target)
     except PipelineServiceError as exc:
         raise to_pipeline_http_error(exc) from exc
 
 
 async def _replay_sync_target(
     *,
-    pipeline_service: PipelineServiceDep,
+    replay_service: PipelineReplayServiceDep,
     meme_file_id: uuid.UUID,
     target: SyncTargetKind,
 ) -> ContentPipelineReplayAccepted:
     """Shared POST helper used by both per-target single-item replay routes."""
 
     try:
-        return await pipeline_service.replay_sync_target(meme_file_id, target)
+        return await replay_service.replay_sync_target(meme_file_id, target)
     except PipelineServiceError as exc:
         raise to_pipeline_http_error(exc) from exc
 
 
 async def _replay_sync_target_batch(
     *,
-    pipeline_service: PipelineServiceDep,
+    replay_service: PipelineReplayServiceDep,
     payload: ContentPipelineSyncReplayBatchRequest,
     target: SyncTargetKind,
 ) -> list[ContentPipelineReplayAccepted]:
@@ -243,7 +289,7 @@ async def _replay_sync_target_batch(
     """
 
     try:
-        accepted = await pipeline_service.replay_sync_target_batch(
+        accepted = await replay_service.replay_sync_target_batch(
             payload.meme_file_ids,
             target,
         )
@@ -260,7 +306,7 @@ async def _replay_sync_target_batch(
 )
 async def read_pipeline_item_qdrant_sync_status(
     meme_file_id: Annotated[uuid.UUID, Path()],
-    pipeline_service: PipelineServiceDep,
+    sync_status_service: PipelineSyncStatusServiceDep,
 ) -> PerTargetSyncStatus:
     """Return the durable Qdrant sync snapshot row for one pipeline item.
 
@@ -270,7 +316,7 @@ async def read_pipeline_item_qdrant_sync_status(
     """
 
     return await _read_sync_target_status(
-        pipeline_service=pipeline_service,
+        sync_status_service=sync_status_service,
         meme_file_id=meme_file_id,
         target=SyncTargetKind.QDRANT,
     )
@@ -285,7 +331,7 @@ async def read_pipeline_item_qdrant_sync_status(
 )
 async def replay_pipeline_item_qdrant_sync(
     meme_file_id: Annotated[uuid.UUID, Path()],
-    pipeline_service: PipelineServiceDep,
+    replay_service: PipelineReplayServiceDep,
 ) -> ContentPipelineReplayAccepted:
     """Reserve and republish the Qdrant sync stage for one pipeline item.
 
@@ -295,7 +341,7 @@ async def replay_pipeline_item_qdrant_sync(
     """
 
     return await _replay_sync_target(
-        pipeline_service=pipeline_service,
+        replay_service=replay_service,
         meme_file_id=meme_file_id,
         target=SyncTargetKind.QDRANT,
     )
@@ -309,7 +355,7 @@ async def replay_pipeline_item_qdrant_sync(
     summary="Replay the Qdrant sync stage for a bounded batch of pipeline items",
 )
 async def replay_pipeline_items_qdrant_sync_batch(
-    pipeline_service: PipelineServiceDep,
+    replay_service: PipelineReplayServiceDep,
     payload: Annotated[ContentPipelineSyncReplayBatchRequest, Body()],
 ) -> list[ContentPipelineReplayAccepted]:
     """Reserve and republish the Qdrant sync stage for every item in a bounded batch.
@@ -320,7 +366,7 @@ async def replay_pipeline_items_qdrant_sync_batch(
     """
 
     return await _replay_sync_target_batch(
-        pipeline_service=pipeline_service,
+        replay_service=replay_service,
         payload=payload,
         target=SyncTargetKind.QDRANT,
     )
@@ -334,7 +380,7 @@ async def replay_pipeline_items_qdrant_sync_batch(
 )
 async def read_pipeline_item_meili_sync_status(
     meme_file_id: Annotated[uuid.UUID, Path()],
-    pipeline_service: PipelineServiceDep,
+    sync_status_service: PipelineSyncStatusServiceDep,
 ) -> PerTargetSyncStatus:
     """Return the durable Meilisearch sync snapshot row for one pipeline item.
 
@@ -345,7 +391,7 @@ async def read_pipeline_item_meili_sync_status(
     """
 
     return await _read_sync_target_status(
-        pipeline_service=pipeline_service,
+        sync_status_service=sync_status_service,
         meme_file_id=meme_file_id,
         target=SyncTargetKind.MEILISEARCH,
     )
@@ -360,7 +406,7 @@ async def read_pipeline_item_meili_sync_status(
 )
 async def replay_pipeline_item_meili_sync(
     meme_file_id: Annotated[uuid.UUID, Path()],
-    pipeline_service: PipelineServiceDep,
+    replay_service: PipelineReplayServiceDep,
 ) -> ContentPipelineReplayAccepted:
     """Reserve and republish the Meilisearch sync stage for one pipeline item.
 
@@ -370,7 +416,7 @@ async def replay_pipeline_item_meili_sync(
     """
 
     return await _replay_sync_target(
-        pipeline_service=pipeline_service,
+        replay_service=replay_service,
         meme_file_id=meme_file_id,
         target=SyncTargetKind.MEILISEARCH,
     )
@@ -384,7 +430,7 @@ async def replay_pipeline_item_meili_sync(
     summary="Replay the Meilisearch sync stage for a bounded batch of pipeline items",
 )
 async def replay_pipeline_items_meili_sync_batch(
-    pipeline_service: PipelineServiceDep,
+    replay_service: PipelineReplayServiceDep,
     payload: Annotated[ContentPipelineSyncReplayBatchRequest, Body()],
 ) -> list[ContentPipelineReplayAccepted]:
     """Reserve and republish the Meilisearch sync stage for every item in a bounded batch.
@@ -394,7 +440,7 @@ async def replay_pipeline_items_meili_sync_batch(
     """
 
     return await _replay_sync_target_batch(
-        pipeline_service=pipeline_service,
+        replay_service=replay_service,
         payload=payload,
         target=SyncTargetKind.MEILISEARCH,
     )
@@ -408,7 +454,7 @@ async def replay_pipeline_items_meili_sync_batch(
     summary="Prove one pipeline item is searchable across BOTH sync targets",
 )
 async def run_pipeline_search_smoke(
-    pipeline_service: PipelineServiceDep,
+    smoke_proof_service: PipelineSmokeProofServiceDep,
     qdrant_sync_client: QdrantSyncClientDep,
     qdrant_similarity_client: QdrantSimilarityClientDep,
     meilisearch_sync_client: MeilisearchSyncClientDep,
@@ -423,12 +469,12 @@ async def run_pipeline_search_smoke(
     """
 
     meme_file_id = await _resolve_smoke_proof_target(
-        pipeline_service=pipeline_service,
+        smoke_proof_service=smoke_proof_service,
         meilisearch_sync_client=meilisearch_sync_client,
         payload=payload,
     )
     try:
-        return await pipeline_service.run_search_smoke_proof(
+        return await smoke_proof_service.run_search_smoke_proof(
             qdrant_sync_client=qdrant_sync_client,
             qdrant_similarity_client=qdrant_similarity_client,
             meilisearch_sync_client=meilisearch_sync_client,
@@ -441,7 +487,7 @@ async def run_pipeline_search_smoke(
 
 async def _resolve_smoke_proof_target(
     *,
-    pipeline_service: PipelineServiceDep,
+    smoke_proof_service: PipelineSmokeProofServiceDep,
     meilisearch_sync_client: MeilisearchSyncClientDep,
     payload: ContentPipelineSearchSmokeRequest,
 ) -> uuid.UUID:
@@ -457,7 +503,7 @@ async def _resolve_smoke_proof_target(
         return payload.meme_file_id
     assert payload.query is not None  # enforced by ContentPipelineSearchSmokeRequest.
     try:
-        return await pipeline_service.resolve_meme_file_id_from_query(
+        return await smoke_proof_service.resolve_meme_file_id_from_query(
             meilisearch_sync_client=meilisearch_sync_client,
             query=payload.query,
         )

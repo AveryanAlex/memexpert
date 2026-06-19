@@ -1,6 +1,6 @@
 import { passthroughUpstreamResponse, type ProxyFetch } from './proxyResponse';
 
-export type MemeProxyAction = 'favorite' | 'pin' | 'report' | 'save';
+export type MemeProxyAction = 'detail-click' | 'download' | 'favorite' | 'impression' | 'pin' | 'report' | 'save' | 'share';
 export type MemeProxyMethod = 'DELETE' | 'POST';
 export type { ProxyFetch };
 

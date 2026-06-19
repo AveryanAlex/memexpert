@@ -32,7 +32,7 @@ describe('infinite meme feed helpers', () => {
   });
 
   it('advances by backend limit for the next offset', () => {
-    const page: PublicMemeSearchPageRead = { items: [result('a')], limit: 12, offset: 24, total: 50, has_more: true };
+    const page: PublicMemeSearchPageRead = { items: [result('a')], limit: 12, offset: 24, total: 50, has_more: true, request_id: 'req_test' };
 
     expect(nextMemePageOffset(page)).toBe(36);
   });
@@ -44,9 +44,25 @@ describe('infinite meme feed helpers', () => {
         tags: ['reaction', 'cat'],
         includeNsfw: false,
         mediaType: 'gif',
-        language: 'en'
+        language: 'en',
+        scope: 'collections',
+        collectionIds: ['team']
       })
-    ).toBe(memeFeedKey({ query: 'cats', tags: ['reaction', 'cat'], includeNsfw: false, mediaType: 'gif', language: 'en' }));
+    ).toBe(
+      memeFeedKey({
+        query: 'cats',
+        tags: ['reaction', 'cat'],
+        includeNsfw: false,
+        mediaType: 'gif',
+        language: 'en',
+        scope: 'collections',
+        collectionIds: ['team']
+      })
+    );
+
+    expect(memeFeedKey({ query: 'cats', scope: 'collections', collectionIds: ['team'] })).not.toBe(
+      memeFeedKey({ query: 'cats', scope: 'collections', collectionIds: ['shared'] })
+    );
   });
 
   it('only allows observer or Load more fetching in a stable ready state', () => {
@@ -63,7 +79,25 @@ describe('infinite meme feed helpers', () => {
 });
 
 function result(id: string): PublicMemeSearchResultRead {
-  return { meme: meme(id) };
+  return {
+    meme: meme(id),
+    attribution: {
+      request_id: 'req_test',
+      impression_id: `imp_${id}`,
+      surface: 'test',
+      source_algorithm: 'hybrid_search',
+      rank: null,
+      query: null,
+      filters: { language: null, media_type: null, include_nsfw: false, tags: [], scope: 'public', collection_ids: [] },
+      collection_scope: 'public',
+      collection_ids: [],
+      source_meme_id: null,
+      algorithm_version: 'test',
+      score: null,
+      score_components: {},
+      reason: null
+    }
+  };
 }
 
 function meme(id: string): PublicMemeCardRead {

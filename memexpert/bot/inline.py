@@ -24,6 +24,7 @@ from aiogram.types import (
 )
 from sqlalchemy import select
 
+from memexpert.bot.analytics import record_telegram_interaction_event, telegram_user_hash
 from memexpert.core.config import Settings, get_settings
 from memexpert.core.database import get_async_session_factory
 from memexpert.core.meilisearch import PipelineMeilisearchSyncClient
@@ -34,7 +35,6 @@ from memexpert.models.content import MemeFile
 from memexpert.models.enums import AccountStatus, AccountType, AnalyticsEventType, TelegramMediaFormat
 from memexpert.models.user import User
 from memexpert.services import CollectionService, CollectionServiceError, ProviderNotConfiguredError
-from memexpert.services.analytics import AnalyticsService, hash_external_identifier
 from memexpert.services.meme_search import MemeSearchService
 from memexpert.services.query_embedding import CachedTextQueryEmbeddingService
 from memexpert.services.telegram_inline import (
@@ -188,7 +188,14 @@ async def answer_inline_query(
                 limit=INLINE_SEARCH_LIMIT,
                 offset=offset,
             )
-            results = [result for item in page.items if (result := _to_inline_result(item)) is not None]
+            served_items: list[TelegramInlineMediaResult] = []
+            results: list[InlineResult] = []
+            for item in page.items:
+                result = _to_inline_result(item)
+                if result is None:
+                    continue
+                served_items.append(item)
+                results.append(result)
         except Exception:
             logger.exception("Telegram inline meme search failed; returning an empty inline answer.")
             page = TelegramInlineSearchPage(
@@ -199,6 +206,7 @@ async def answer_inline_query(
                 has_more=False,
                 is_personal=False,
             )
+            served_items = []
             results = []
         # Search pagination is offset-based, but inline conversion may filter out
         # unsupported/private-storage items. Do not ask Telegram for another page
@@ -217,6 +225,14 @@ async def answer_inline_query(
             offset=offset,
             result_count=len(results),
             has_more=page.has_more,
+        )
+        await _record_inline_served_events(
+            session,
+            inline_query=inline_query,
+            items=served_items,
+            offset=offset,
+            result_count=len(results),
+            is_personal=page.is_personal,
         )
 
 
@@ -240,19 +256,23 @@ async def record_chosen_inline_result(
             meme_id = await session.scalar(select(MemeFile.meme_id).where(MemeFile.id == file_id))
 
         user_id = await _resolve_linked_user_id(session, telegram_user_id=chosen_result.from_user.id)
-        await AnalyticsService(session).record_event(
+        if file_id is None or meme_id is None:
+            return
+
+        for event_type in (
+            AnalyticsEventType.INLINE_CHOSEN,
+            AnalyticsEventType.INLINE_SENT,
             AnalyticsEventType.MEME_SEND,
-            user_id=user_id,
-            payload={
-                "surface": "telegram_inline",
-                "telegram_user_hash": hash_external_identifier("telegram_user", chosen_result.from_user.id),
-                "query": chosen_result.query,
-                "result_id": chosen_result.result_id,
-                "meme_id": str(meme_id) if meme_id is not None else None,
-                "meme_file_id": str(file_id) if file_id is not None else None,
-                "impression_id": impression_id,
-            },
-        )
+        ):
+            await _record_chosen_inline_event(
+                session,
+                event_type=event_type,
+                user_id=user_id,
+                meme_id=meme_id,
+                file_id=file_id,
+                chosen_result=chosen_result,
+                impression_id=impression_id,
+            )
 
 
 async def handle_inline_library_callback(
@@ -287,14 +307,20 @@ async def handle_inline_library_callback(
         service = CollectionService(session)
         try:
             if action == "fav":
-                _ = await service.favorite_meme(user_id=user_id, meme_id=meme_id)
+                favorite = await service.favorite_meme(user_id=user_id, meme_id=meme_id)
                 text = "Added to Favorites."
+                event_type = AnalyticsEventType.MEME_LIKE
+                collection_id = favorite.collection_id
             elif action == "save":
-                _ = await service.save_meme_to_active_collection(user_id=user_id, meme_id=meme_id)
+                save = await service.save_meme_to_active_collection(user_id=user_id, meme_id=meme_id)
                 text = "Saved to active collection."
+                event_type = AnalyticsEventType.MEME_SAVE
+                collection_id = save.collection_id
             elif action == "pin":
                 _ = await service.pin_meme(user_id=user_id, meme_id=meme_id)
                 text = "Pinned."
+                event_type = AnalyticsEventType.MEME_PIN
+                collection_id = None
             else:
                 await callback_query.answer("This meme action is no longer supported.", show_alert=True)
                 return
@@ -302,6 +328,25 @@ async def handle_inline_library_callback(
             logger.info("Telegram inline library callback rejected: %s", exc)
             await callback_query.answer(str(exc), show_alert=True)
             return
+        await record_telegram_interaction_event(
+            session,
+            {
+                "event_type": event_type,
+                "user_id": user_id,
+                "surface": "telegram_inline_library",
+                "refs": {"collection_id": collection_id, "meme_id": meme_id},
+                "properties": {
+                    "action": action,
+                    "telegram_user_hash": telegram_user_hash(callback_query.from_user.id),
+                },
+            },
+            log_context={
+                "analytics_event_type": event_type.value,
+                "surface": "telegram_inline_library",
+                "meme_id": str(meme_id),
+                "user_id": str(user_id),
+            },
+        )
 
     await callback_query.answer(text)
 
@@ -349,17 +394,113 @@ async def _record_inline_query_event(
     has_more: bool,
 ) -> None:
     user_id = await _resolve_linked_user_id(session, telegram_user_id=inline_query.from_user.id)
-    await AnalyticsService(session).record_event(
-        AnalyticsEventType.INLINE_QUERY,
-        user_id=user_id,
-        payload={
+    await record_telegram_interaction_event(
+        session,
+        {
+            "event_type": AnalyticsEventType.INLINE_QUERY,
+            "user_id": user_id,
             "surface": "telegram_inline",
-            "telegram_user_hash": hash_external_identifier("telegram_user", inline_query.from_user.id),
             "query": inline_query.query.strip(),
-            "offset": offset,
-            "result_count": result_count,
-            "has_more": has_more,
-            "chat_type": inline_query.chat_type,
+            "properties": {
+                "telegram_user_hash": telegram_user_hash(inline_query.from_user.id),
+                "offset": offset,
+                "result_count": result_count,
+                "has_more": has_more,
+                "chat_type": inline_query.chat_type,
+            },
+        },
+        log_context={
+            "analytics_event_type": AnalyticsEventType.INLINE_QUERY.value,
+            "surface": "telegram_inline",
+            "user_id": str(user_id) if user_id else None,
+        },
+    )
+
+
+async def _record_inline_served_events(
+    session: AsyncSession,
+    *,
+    inline_query: InlineQuery,
+    items: list[TelegramInlineMediaResult],
+    offset: int,
+    result_count: int,
+    is_personal: bool,
+) -> None:
+    if not items:
+        return
+
+    user_id = await _resolve_linked_user_id(session, telegram_user_id=inline_query.from_user.id)
+    user_hash = telegram_user_hash(inline_query.from_user.id)
+    for item in items:
+        attribution = item.attribution
+        surface = attribution.surface or "telegram_inline"
+        await record_telegram_interaction_event(
+            session,
+            {
+                "event_type": AnalyticsEventType.INLINE_SERVED,
+                "user_id": user_id,
+                "surface": surface,
+                "refs": {"meme_id": item.meme.id, "meme_file_id": item.file.id},
+                "request_id": attribution.request_id,
+                "impression_id": attribution.impression_id,
+                "source_algorithm": attribution.source_algorithm,
+                "query": attribution.query,
+                "rank": attribution.rank,
+                "score": attribution.score,
+                "score_components": attribution.score_components,
+                "reason": attribution.reason,
+                "properties": {
+                    "telegram_user_hash": user_hash,
+                    "chat_type": inline_query.chat_type,
+                    "offset": offset,
+                    "result_count": result_count,
+                    "media_format": item.media_format.value,
+                    "is_personal": is_personal,
+                },
+            },
+            log_context={
+                "analytics_event_type": AnalyticsEventType.INLINE_SERVED.value,
+                "surface": surface,
+                "meme_id": str(item.meme.id),
+                "meme_file_id": str(item.file.id),
+                "request_id": attribution.request_id,
+                "impression_id": attribution.impression_id,
+                "user_id": str(user_id) if user_id else None,
+            },
+        )
+
+
+async def _record_chosen_inline_event(
+    session: AsyncSession,
+    *,
+    event_type: AnalyticsEventType,
+    user_id: uuid.UUID | None,
+    meme_id: uuid.UUID,
+    file_id: uuid.UUID,
+    chosen_result: ChosenInlineResult,
+    impression_id: str | None,
+) -> None:
+    await record_telegram_interaction_event(
+        session,
+        {
+            "event_type": event_type,
+            "user_id": user_id,
+            "surface": "telegram_inline",
+            "refs": {"meme_id": meme_id, "meme_file_id": file_id},
+            "impression_id": impression_id,
+            "query": chosen_result.query,
+            "properties": {
+                "telegram_user_hash": telegram_user_hash(chosen_result.from_user.id),
+                "result_id": chosen_result.result_id,
+            },
+        },
+        log_context={
+            "analytics_event_type": event_type.value,
+            "surface": "telegram_inline",
+            "meme_id": str(meme_id),
+            "meme_file_id": str(file_id),
+            "impression_id": impression_id,
+            "user_id": str(user_id) if user_id else None,
         },
     )
 

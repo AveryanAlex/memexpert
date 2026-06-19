@@ -16,18 +16,13 @@ import pytest
 from PIL import Image
 from sqlalchemy import select
 
-import memexpert.services.content_pipeline as content_pipeline_module
+import memexpert.pipeline.dispatch as pipeline_dispatch_module
 from memexpert.core.broker import build_pipeline_broker
 from memexpert.core.classification import (
     ClassificationProviderUnavailableError,
     ClassificationResult,
 )
 from memexpert.core.config import Settings
-from memexpert.core.media import (
-    NormalizedMediaResult,
-    PipelineMediaProcessorProtocol,
-    UploadMediaDetails,
-)
 from memexpert.core.meilisearch import (
     MeilisearchSyncConflictError,
     MeilisearchSyncMalformedResponseError,
@@ -53,6 +48,11 @@ from memexpert.core.voyage import (
     VoyageProviderUnavailableError,
     VoyageTimeoutError,
 )
+from memexpert.media.contracts import (
+    NormalizedMediaResult,
+    UploadMediaDetails,
+)
+from memexpert.models.base import utcnow
 from memexpert.models.collection import Collection, CollectionMember, CollectionMeme
 from memexpert.models.content import (
     EmbeddingCache,
@@ -65,6 +65,8 @@ from memexpert.models.content import (
     MemeSeoPage,
     MemeSource,
     MemeTemplate,
+    PipelineIngestRequest,
+    PipelineOutboxEvent,
     PipelineStageJournal,
 )
 from memexpert.models.enums import (
@@ -75,11 +77,25 @@ from memexpert.models.enums import (
     ContentPipelineStage,
     ContentPipelineStageStatus,
     ContentProcessingStatus,
+    ContentSourceKind,
+    IngestFileOrigin,
+    PipelineIngestRequestStatus,
+    SourceAttachReason,
     SourcePlatform,
     SyncTargetKind,
     SyncTargetStatus,
 )
 from memexpert.models.user import User
+from memexpert.pipeline.events import build_media_inspect_requested_payload
+from memexpert.pipeline.items import PipelineItemReadService
+from memexpert.pipeline.replay import PipelineReplayService
+from memexpert.pipeline.reporting import (
+    OUTCOME_BLOCKED,
+    OUTCOME_READY,
+    render_markdown_report,
+    summarize_run,
+)
+from memexpert.pipeline.stage_completion import PipelineStageCompletionService
 from memexpert.schemas.content_pipeline import (
     ContentPipelineCanonicalContext,
     ContentPipelineClassificationDetail,
@@ -93,16 +109,9 @@ from memexpert.schemas.content_pipeline import (
     ContentPipelineReadyEventSummary,
     ContentPipelineStageJournalRead,
     ContentPipelineSyncTargetPreview,
-    ContentPipelineUploadMetadata,
     PerTargetSyncStatus,
 )
-from memexpert.services import ContentPipelineService, PipelinePublishError
-from memexpert.services.content_pipeline_reporting import (
-    OUTCOME_BLOCKED,
-    OUTCOME_READY,
-    render_markdown_report,
-    summarize_run,
-)
+from memexpert.services import PipelineIngestError, PipelinePublishError
 from memexpert.services.search_index_sync import SEARCH_INDEX_ALGORITHM_VERSION
 from memexpert.workers.pipeline_runtime import (
     PIPELINE_REASON_CLASSIFY_PROVIDER_BLOCKED,
@@ -117,6 +126,7 @@ from memexpert.workers.pipeline_runtime import (
     PIPELINE_REASON_FORCED_SYNC_QDRANT_FAILURE,
     PIPELINE_REASON_FORCED_TRANSCODE_FAILURE,
     PIPELINE_REASON_MALFORMED_EVENT,
+    PIPELINE_REASON_MEDIA_INSPECT_FAILED,
     PIPELINE_REASON_OCR_TIMEOUT,
     PIPELINE_REASON_SYNC_MEILI_CONFLICT,
     PIPELINE_REASON_SYNC_MEILI_MALFORMED_PAYLOAD,
@@ -128,6 +138,13 @@ from memexpert.workers.pipeline_runtime import (
     PIPELINE_REASON_SYNC_QDRANT_TIMEOUT,
     build_pipeline_runtime,
 )
+from memexpert.workers.pipeline_runtime.stage_registry import PIPELINE_STAGE_HANDLERS, RUNNABLE_DOWNSTREAM_STAGES
+from memexpert.workers.pipeline_runtime.stages.classify import run_classify_stage
+from memexpert.workers.pipeline_runtime.stages.embed import run_embed_stage
+from memexpert.workers.pipeline_runtime.stages.ocr import run_ocr_stage
+from memexpert.workers.pipeline_runtime.stages.sync_meili import run_sync_meili_stage
+from memexpert.workers.pipeline_runtime.stages.sync_qdrant import run_sync_qdrant_stage
+from memexpert.workers.pipeline_runtime.stages.transcode import run_transcode_stage
 
 if TYPE_CHECKING:
     from pytest import MonkeyPatch
@@ -525,12 +542,7 @@ def build_png_bytes(*, color: tuple[int, int, int]) -> bytes:
 
 
 def build_seeded_png_bytes(*, seed: str) -> bytes:
-    """Generate deterministic but byte-distinct PNG payloads for seeded uploads.
-
-    ``create_upload`` intentionally performs exact SHA-256 deduplication before
-    media inspection and pHash comparison. Runtime tests that seed independent
-    files must therefore vary the actual bytes, not just the fake pHash.
-    """
+    """Generate deterministic but byte-distinct PNG payloads for seeded files."""
 
     digest = hashlib.sha256(seed.encode("utf-8")).digest()
     image = Image.new("RGB", (8, 8))
@@ -547,6 +559,124 @@ def build_seeded_png_bytes(*, seed: str) -> bytes:
     output = BytesIO()
     image.save(output, format="PNG")
     return output.getvalue()
+
+
+async def seed_raw_ingest_request_for_runtime(
+    session: AsyncSession,
+    storage_client: FakeStorageClient,
+    *,
+    media_bytes: bytes,
+    source_id: str,
+    post_id: str,
+) -> PipelineIngestRequest:
+    ingest_request_id = uuid.uuid7()
+    temp_key = f"pipeline/temp-originals/{ingest_request_id}/original.png"
+    storage_client.objects[temp_key] = StoredObject(body=media_bytes, content_type="image/png")
+    ingest_request = PipelineIngestRequest(
+        id=ingest_request_id,
+        source_platform=SourcePlatform.TELEGRAM,
+        source_id=source_id,
+        post_id=post_id,
+        source_metadata={"views": 9},
+        declared_filename="runtime-raw.png",
+        declared_content_type="image/png",
+        temp_original_object_key=temp_key,
+        sha256_hex=hashlib.sha256(media_bytes).hexdigest(),
+        file_size_bytes=len(media_bytes),
+        status=PipelineIngestRequestStatus.MEDIA_INSPECT_PENDING,
+        attempt_count=0,
+    )
+    session.add(ingest_request)
+    await session.commit()
+    return ingest_request
+
+
+async def _seed_transcode_pending_item(
+    session: AsyncSession,
+    storage_client: FakeStorageClient,
+    *,
+    source_id: str,
+    post_id: str,
+    filename: str,
+    media_bytes: bytes,
+    phash_tag: str = "a",
+) -> tuple[ContentPipelineItemRead, ContentPipelineDispatchEvent]:
+    details = _make_distinct_upload_media_details(tag=phash_tag)
+    meme_id = uuid.uuid7()
+    meme_file_id = uuid.uuid7()
+    event_id = uuid.uuid7()
+    now = utcnow()
+    original_object_key = f"pipeline/originals/{meme_file_id}/original.{filename.rsplit('.', 1)[-1]}"
+    storage_client.objects[original_object_key] = StoredObject(body=media_bytes, content_type="image/png")
+    dispatch_event = ContentPipelineDispatchEvent(
+        event_id=event_id,
+        event_type=ContentPipelineEventType.MEME_CREATED,
+        meme_id=meme_id,
+        meme_file_id=meme_file_id,
+        stage=ContentPipelineStage.TRANSCODE,
+        source_kind=ContentSourceKind.MANUAL_UPLOAD,
+        original_object_key=original_object_key,
+        attempt=1,
+        created_at=now,
+    )
+    session.add(
+        Meme(
+            id=meme_id,
+            media_type=details.media_type,
+            primary_file_id=meme_file_id,
+            language=ContentLanguage.NONE,
+            is_public=False,
+        )
+    )
+    await session.flush()
+    session.add_all(
+        [
+            MemeFile(
+                id=meme_file_id,
+                meme_id=meme_id,
+                status=ContentProcessingStatus.PENDING,
+                width=details.width,
+                height=details.height,
+                file_size_bytes=len(media_bytes),
+                mime_type="image/png",
+                s3_original_key=original_object_key,
+                perceptual_hash=details.perceptual_hash,
+                sha256_hex=hashlib.sha256(media_bytes).hexdigest(),
+                ingest_origin=IngestFileOrigin.NEW_MEME,
+            ),
+            MemeSource(
+                file_id=meme_file_id,
+                platform=SourcePlatform.TELEGRAM,
+                source_id=source_id,
+                post_id=post_id,
+                views=9,
+                reactions={},
+                is_first_source=True,
+                source_alive=True,
+                attach_reason=SourceAttachReason.NEW_FILE,
+            ),
+            PipelineStageJournal(
+                meme_file_id=meme_file_id,
+                stage=ContentPipelineStage.INGEST,
+                status=ContentPipelineStageStatus.SUCCEEDED,
+                attempt_count=1,
+                last_event_id=event_id,
+                is_retryable=False,
+                started_at=now,
+                finished_at=now,
+            ),
+            PipelineStageJournal(
+                meme_file_id=meme_file_id,
+                stage=ContentPipelineStage.TRANSCODE,
+                status=ContentPipelineStageStatus.PENDING,
+                attempt_count=0,
+                last_event_id=event_id,
+                is_retryable=True,
+            ),
+        ]
+    )
+    await session.commit()
+    return await PipelineItemReadService(session).get_item(meme_file_id), dispatch_event
 
 
 def build_normalized_media_result(meme_file_id: uuid.UUID) -> NormalizedMediaResult:
@@ -586,7 +716,7 @@ async def _fetch_item(
     settings: Settings | None = None,
 ) -> ContentPipelineItemRead:
     async with session_factory() as session:
-        service = ContentPipelineService(session, settings=settings)
+        service = PipelineItemReadService(session, settings=settings)
         return await service.get_item(meme_file_id)
 
 
@@ -596,21 +726,17 @@ async def _seed_ocr_pending_item(
     storage_client: FakeStorageClient,
     publisher: RecordingPublisher,
 ) -> tuple[uuid.UUID, ContentPipelineDispatchEvent, NormalizedMediaResult]:
-    service = ContentPipelineService(
+    item, _ = await _seed_transcode_pending_item(
         session,
-        storage_client=storage_client,
-        publisher=publisher,
-    )
-    item = await service.create_upload(
-        metadata=ContentPipelineUploadMetadata(
-            source_platform=SourcePlatform.TELEGRAM,
-            source_id="ocr-runtime-source",
-            post_id="8001",
-            views=11,
-        ),
+        storage_client,
+        source_id="ocr-runtime-source",
+        post_id="8001",
         filename="ocr-runtime.png",
-        content_type="image/png",
         media_bytes=build_png_bytes(color=(60, 70, 80)),
+    )
+    service = PipelineStageCompletionService(
+        session,
+        publisher=publisher,
     )
     normalized = build_normalized_media_result(item.meme_file_id)
     storage_client.objects[normalized.web_video_object_key] = StoredObject(
@@ -663,19 +789,34 @@ async def test_pipeline_runtime_declares_explicit_retry_and_dlx_topology() -> No
         runtime.retry_exchange.name,
         runtime.dead_letter_exchange.name,
     ]
+    media_inspect_queue_arguments = declared_queue_arguments[runtime.media_inspect_queue.name] or {}
     transcode_queue_arguments = declared_queue_arguments[runtime.transcode_queue.name] or {}
     ocr_queue_arguments = declared_queue_arguments[runtime.ocr_queue.name] or {}
+    media_inspect_retry_queue_arguments = declared_queue_arguments[runtime.media_inspect_retry_queue.name] or {}
     transcode_retry_queue_arguments = declared_queue_arguments[runtime.transcode_retry_queue.name] or {}
     ocr_retry_queue_arguments = declared_queue_arguments[runtime.ocr_retry_queue.name] or {}
 
+    assert (
+        media_inspect_queue_arguments["x-dead-letter-routing-key"]
+        == runtime.broker_settings.media_inspect_retry_request_routing_key
+    )
     assert transcode_queue_arguments["x-dead-letter-routing-key"] == runtime.broker_settings.retry_routing_key
     assert ocr_queue_arguments["x-dead-letter-routing-key"] == runtime.broker_settings.ocr_retry_request_routing_key
+    assert media_inspect_retry_queue_arguments["x-message-ttl"] == runtime.broker_settings.retry_backoff_milliseconds
+    assert (
+        media_inspect_retry_queue_arguments["x-dead-letter-routing-key"]
+        == runtime.broker_settings.media_inspect_retry_routing_key
+    )
     assert transcode_retry_queue_arguments["x-message-ttl"] == runtime.broker_settings.retry_backoff_milliseconds
     assert (
         transcode_retry_queue_arguments["x-dead-letter-routing-key"]
         == runtime.broker_settings.transcode_retry_routing_key
     )
     assert ocr_retry_queue_arguments["x-dead-letter-routing-key"] == runtime.broker_settings.ocr_retry_routing_key
+    assert recorded_queues[runtime.media_inspect_queue.name].bindings == [
+        (runtime.pipeline_exchange.name, runtime.broker_settings.media_inspect_routing_key),
+        (runtime.pipeline_exchange.name, runtime.broker_settings.media_inspect_retry_routing_key),
+    ]
     assert recorded_queues[runtime.transcode_queue.name].bindings == [
         (runtime.pipeline_exchange.name, runtime.broker_settings.meme_created_routing_key),
         (runtime.pipeline_exchange.name, runtime.broker_settings.stage_replay_routing_key),
@@ -684,6 +825,9 @@ async def test_pipeline_runtime_declares_explicit_retry_and_dlx_topology() -> No
     assert recorded_queues[runtime.ocr_queue.name].bindings == [
         (runtime.pipeline_exchange.name, runtime.broker_settings.ocr_routing_key),
         (runtime.pipeline_exchange.name, runtime.broker_settings.ocr_retry_routing_key),
+    ]
+    assert recorded_queues[runtime.media_inspect_retry_queue.name].bindings == [
+        (runtime.retry_exchange.name, runtime.broker_settings.media_inspect_retry_request_routing_key),
     ]
     assert recorded_queues[runtime.transcode_retry_queue.name].bindings == [
         (runtime.retry_exchange.name, runtime.broker_settings.retry_routing_key),
@@ -696,30 +840,267 @@ async def test_pipeline_runtime_declares_explicit_retry_and_dlx_topology() -> No
     ]
 
 
+def test_pipeline_runtime_stage_registry_covers_all_downstream_stages() -> None:
+    expected_stages = frozenset(ContentPipelineStage) - {ContentPipelineStage.INGEST}
+
+    assert frozenset(RUNNABLE_DOWNSTREAM_STAGES) == expected_stages
+    assert frozenset(PIPELINE_STAGE_HANDLERS) == expected_stages
+    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.TRANSCODE] is run_transcode_stage
+    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.OCR] is run_ocr_stage
+    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.EMBED] is run_embed_stage
+    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.CLASSIFY] is run_classify_stage
+    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.SYNC_QDRANT] is run_sync_qdrant_stage
+    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.SYNC_MEILI] is run_sync_meili_stage
+
+
+async def test_pipeline_runtime_stage_dispatch_rejects_unsupported_stage() -> None:
+    settings = Settings()
+    runtime = build_pipeline_runtime(
+        settings=settings,
+        broker=build_pipeline_broker(settings),
+        storage_client=FakeStorageClient(),
+        media_processor=FakeMediaProcessor(),
+        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key="unused")),
+    )
+    dispatch_event = ContentPipelineDispatchEvent.model_construct(
+        event_id=uuid.uuid7(),
+        event_type=ContentPipelineEventType.STAGE_REPLAY_REQUESTED,
+        meme_id=uuid.uuid7(),
+        meme_file_id=uuid.uuid7(),
+        stage=ContentPipelineStage.INGEST,
+        source_kind=ContentSourceKind.TELEGRAM,
+        original_object_key="pipeline/original/unsupported.png",
+        attempt=1,
+        created_at=datetime.now(UTC),
+    )
+
+    with pytest.raises(PipelineIngestError, match="Pipeline runtime cannot execute work for stage 'ingest'."):
+        await runtime._run_stage_for(
+            dispatch_event=dispatch_event,
+            stage_context=cast("Any", object()),
+            attempt=1,
+        )
+
+
+async def test_pipeline_runtime_media_inspect_handler_materializes_and_acks(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    settings = Settings()
+    storage_client = FakeStorageClient()
+    raw_bytes = b"runtime-media-inspect-success"
+    ingest_request = await seed_raw_ingest_request_for_runtime(
+        migrated_db_session,
+        storage_client,
+        media_bytes=raw_bytes,
+        source_id="runtime-media-inspect-source",
+        post_id="9001",
+    )
+    broker = build_pipeline_broker(settings)
+    runtime = build_pipeline_runtime(
+        settings=settings,
+        broker=broker,
+        session_factory=postgres_session_factory,
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(
+            inspect_result=UploadMediaDetails(
+                media_type=ContentKind.IMAGE,
+                mime_type="image/png",
+                width=8,
+                height=8,
+                file_size_bytes=len(raw_bytes),
+                perceptual_hash="9" * 16,
+            )
+        ),
+        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key="unused")),
+    )
+    event_id = uuid.uuid7()
+    message = FakeRabbitMessage(message_id=str(event_id))
+    payload = build_media_inspect_requested_payload(
+        event_id=event_id,
+        ingest_request_id=ingest_request.id,
+        source_platform=ingest_request.source_platform,
+        sha256_hex=ingest_request.sha256_hex or "0" * 64,
+        created_at=utcnow(),
+    )
+
+    await runtime.handle_media_inspect_message(payload, message)
+
+    assert message.ack_count == 1
+    assert message.reject_calls == []
+    assert message.nack_calls == []
+    assert ingest_request.temp_original_object_key not in storage_client.objects
+
+    async with postgres_session_factory() as session:
+        request = await session.get(PipelineIngestRequest, ingest_request.id)
+        outbox_rows = (await session.execute(select(PipelineOutboxEvent))).scalars().all()
+
+    assert request is not None
+    assert request.status is PipelineIngestRequestStatus.MATERIALIZED
+    assert request.materialized_meme_file_id is not None
+    assert len(outbox_rows) == 1
+    assert outbox_rows[0].event_type == ContentPipelineEventType.MEME_CREATED.value
+    assert outbox_rows[0].routing_key == runtime.broker_settings.transcode_routing_key
+
+
+async def test_pipeline_runtime_media_inspect_handler_dead_letters_malformed_payload() -> None:
+    settings = Settings()
+    broker = build_pipeline_broker(settings)
+    runtime = build_pipeline_runtime(
+        settings=settings,
+        broker=broker,
+        storage_client=FakeStorageClient(),
+        media_processor=FakeMediaProcessor(inspect_result=None),
+        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key="unused")),
+    )
+    dead_letters: list[Any] = []
+
+    async def publish_dead_letter(
+        payload: object,
+        _queue: object = "",
+        exchange: object | None = None,
+        *,
+        routing_key: str = "",
+        headers: dict[str, object] | None = None,
+        **_: object,
+    ) -> None:
+        dead_letters.append(
+            {
+                "payload": payload,
+                "exchange": getattr(exchange, "name", exchange),
+                "routing_key": routing_key,
+                "headers": headers,
+            }
+        )
+
+    cast("Any", broker).publish = publish_dead_letter
+    message = FakeRabbitMessage(message_id="bad-media-inspect")
+
+    await runtime.handle_media_inspect_message({"bad": "payload"}, message)
+
+    assert message.ack_count == 1
+    assert message.reject_calls == []
+    assert message.nack_calls == []
+    assert dead_letters == [
+        {
+            "payload": json.dumps({"bad": "payload"}, sort_keys=True),
+            "exchange": runtime.dead_letter_exchange.name,
+            "routing_key": runtime.broker_settings.dead_letter_routing_key,
+            "headers": {"x-memexpert-failure-reason": PIPELINE_REASON_MALFORMED_EVENT},
+        }
+    ]
+
+
+async def test_pipeline_runtime_media_inspect_retries_and_dead_letters_transient_failures(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    settings = Settings.model_validate({"pipeline_broker_retry_max_attempts": 2})
+    storage_client = FakeStorageClient()
+    ingest_request = await seed_raw_ingest_request_for_runtime(
+        migrated_db_session,
+        storage_client,
+        media_bytes=b"runtime-media-inspect-missing-temp",
+        source_id="runtime-media-inspect-retry-source",
+        post_id="9002",
+    )
+    storage_client.objects.clear()
+    broker = build_pipeline_broker(settings)
+    runtime = build_pipeline_runtime(
+        settings=settings,
+        broker=broker,
+        session_factory=postgres_session_factory,
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(inspect_result=None),
+        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key="unused")),
+    )
+    event_id = uuid.uuid7()
+    payload = build_media_inspect_requested_payload(
+        event_id=event_id,
+        ingest_request_id=ingest_request.id,
+        source_platform=ingest_request.source_platform,
+        sha256_hex=ingest_request.sha256_hex or "0" * 64,
+        created_at=utcnow(),
+    )
+    first_message = FakeRabbitMessage(message_id=str(event_id))
+
+    await runtime.handle_media_inspect_message(payload, first_message)
+
+    assert first_message.ack_count == 0
+    assert first_message.reject_calls == [False]
+    dead_letters: list[Any] = []
+
+    async def publish_dead_letter(
+        payload: object,
+        _queue: object = "",
+        exchange: object | None = None,
+        *,
+        routing_key: str = "",
+        headers: dict[str, object] | None = None,
+        **_: object,
+    ) -> None:
+        dead_letters.append(
+            {
+                "payload": payload,
+                "exchange": getattr(exchange, "name", exchange),
+                "routing_key": routing_key,
+                "headers": headers,
+            }
+        )
+
+    cast("Any", broker).publish = publish_dead_letter
+    exhausted_message = FakeRabbitMessage(
+        headers={
+            "x-death": [
+                {
+                    "queue": runtime.media_inspect_retry_queue.name,
+                    "reason": "expired",
+                    "count": 1,
+                }
+            ]
+        },
+        message_id=str(event_id),
+    )
+
+    await runtime.handle_media_inspect_message(payload, exhausted_message)
+
+    assert exhausted_message.ack_count == 1
+    assert exhausted_message.reject_calls == []
+    assert exhausted_message.nack_calls == []
+    assert len(dead_letters) == 1
+    dead_letter = dead_letters[0]
+    assert dead_letter["exchange"] == runtime.dead_letter_exchange.name
+    assert dead_letter["routing_key"] == runtime.broker_settings.dead_letter_routing_key
+    assert dead_letter["headers"] == {
+        "x-death": [
+            {
+                "queue": runtime.media_inspect_retry_queue.name,
+                "reason": "expired",
+                "count": 1,
+            }
+        ],
+        "x-memexpert-failure-reason": PIPELINE_REASON_MEDIA_INSPECT_FAILED,
+    }
+    decoded_payload = json.loads(dead_letter["payload"])
+    assert decoded_payload["event_id"] == str(event_id)
+    assert decoded_payload["ingest_request_id"] == str(ingest_request.id)
+    assert decoded_payload["event_type"] == "media_inspect_requested"
+
+
 async def test_pipeline_runtime_forced_transcode_failure_then_replay_then_success(
     migrated_db_session: AsyncSession,
     postgres_session_factory: async_sessionmaker[AsyncSession],
     monkeypatch: MonkeyPatch,
 ) -> None:
     storage_client = FakeStorageClient()
-    initial_publisher = RecordingPublisher()
-    setup_service = ContentPipelineService(
+    item, initial_event = await _seed_transcode_pending_item(
         migrated_db_session,
-        storage_client=storage_client,
-        publisher=initial_publisher,
-    )
-    item = await setup_service.create_upload(
-        metadata=ContentPipelineUploadMetadata(
-            source_platform=SourcePlatform.TELEGRAM,
-            source_id="runtime-channel",
-            post_id="7001",
-            views=5,
-        ),
+        storage_client,
+        source_id="runtime-channel",
+        post_id="7001",
         filename="runtime.png",
-        content_type="image/png",
         media_bytes=build_png_bytes(color=(255, 0, 0)),
     )
-    initial_event = initial_publisher.events[0]
 
     failing_settings = Settings.model_validate(
         {"pipeline_worker_fail_transcode_for_meme_file_id": str(item.meme_file_id)}
@@ -747,10 +1128,9 @@ async def test_pipeline_runtime_forced_transcode_failure_then_replay_then_succes
 
     replay_publisher = RecordingPublisher()
     async with postgres_session_factory() as replay_session:
-        replay_service = ContentPipelineService(
+        replay_service = PipelineReplayService(
             replay_session,
             settings=failing_settings,
-            storage_client=storage_client,
             publisher=replay_publisher,
         )
         first_replay = await replay_service.replay_item(item.meme_file_id)
@@ -768,7 +1148,7 @@ async def test_pipeline_runtime_forced_transcode_failure_then_replay_then_succes
     async def fake_ensure_pipeline_broker_started(*_: object, **__: object) -> object:
         return downstream_broker
 
-    monkeypatch.setattr(content_pipeline_module, "ensure_pipeline_broker_started", fake_ensure_pipeline_broker_started)
+    monkeypatch.setattr(pipeline_dispatch_module, "ensure_pipeline_broker_started", fake_ensure_pipeline_broker_started)
 
     normalized = build_normalized_media_result(item.meme_file_id)
     successful_runtime = build_pipeline_runtime(
@@ -814,7 +1194,7 @@ async def test_pipeline_runtime_ocr_success_persists_fallback_result_and_dispatc
     async def fake_ensure_pipeline_broker_started(*_: object, **__: object) -> object:
         return downstream_broker
 
-    monkeypatch.setattr(content_pipeline_module, "ensure_pipeline_broker_started", fake_ensure_pipeline_broker_started)
+    monkeypatch.setattr(pipeline_dispatch_module, "ensure_pipeline_broker_started", fake_ensure_pipeline_broker_started)
 
     runtime = build_pipeline_runtime(
         settings=Settings(),
@@ -883,9 +1263,8 @@ async def test_pipeline_runtime_ocr_failure_then_replay_then_success(
 
     replay_publisher = RecordingPublisher()
     async with postgres_session_factory() as replay_session:
-        replay_service = ContentPipelineService(
+        replay_service = PipelineReplayService(
             replay_session,
-            storage_client=storage_client,
             publisher=replay_publisher,
         )
         replay_response = await replay_service.replay_item(meme_file_id, stage=ContentPipelineStage.OCR)
@@ -899,7 +1278,7 @@ async def test_pipeline_runtime_ocr_failure_then_replay_then_success(
     async def fake_ensure_pipeline_broker_started(*_: object, **__: object) -> object:
         return downstream_broker
 
-    monkeypatch.setattr(content_pipeline_module, "ensure_pipeline_broker_started", fake_ensure_pipeline_broker_started)
+    monkeypatch.setattr(pipeline_dispatch_module, "ensure_pipeline_broker_started", fake_ensure_pipeline_broker_started)
 
     successful_runtime = build_pipeline_runtime(
         settings=Settings(),
@@ -925,20 +1304,12 @@ async def test_pipeline_runtime_dead_letters_malformed_dispatch_payloads_and_mar
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     storage_client = FakeStorageClient()
-    setup_publisher = RecordingPublisher()
-    setup_service = ContentPipelineService(
+    item, _ = await _seed_transcode_pending_item(
         migrated_db_session,
-        storage_client=storage_client,
-        publisher=setup_publisher,
-    )
-    item = await setup_service.create_upload(
-        metadata=ContentPipelineUploadMetadata(
-            source_platform=SourcePlatform.TELEGRAM,
-            source_id="runtime-malformed-channel",
-            post_id="7002",
-        ),
+        storage_client,
+        source_id="runtime-malformed-channel",
+        post_id="7002",
         filename="runtime-malformed.png",
-        content_type="image/png",
         media_bytes=build_png_bytes(color=(0, 255, 0)),
     )
 
@@ -1032,7 +1403,7 @@ def build_classification_result(*, is_nsfw: bool = False, nsfw_score: float = 0.
 
 
 def _make_distinct_upload_media_details(*, tag: str) -> UploadMediaDetails:
-    """Build unique upload metadata so repeated ingests get distinct perceptual hashes."""
+    """Build unique media metadata so repeated seed rows get distinct perceptual hashes."""
 
     perceptual_hash = (tag * 16)[:16]
     return UploadMediaDetails(
@@ -1057,29 +1428,20 @@ async def _seed_embed_pending_item(
     """Create a pipeline item and drive it to the EMBED-pending state via the service."""
 
     initial_event_count = len(publisher.events)
-    media_processor: PipelineMediaProcessorProtocol | None = None
-    if phash_tag is not None:
-        media_processor = FakeMediaProcessor(
-            inspect_result=_make_distinct_upload_media_details(tag=phash_tag),
-        )
-    service = ContentPipelineService(
+    item, _ = await _seed_transcode_pending_item(
         session,
-        storage_client=storage_client,
-        publisher=publisher,
-        media_processor=media_processor,
-    )
-    item = await service.create_upload(
-        metadata=ContentPipelineUploadMetadata(
-            source_platform=SourcePlatform.TELEGRAM,
-            source_id=source_id,
-            post_id=post_id,
-            views=13,
-        ),
+        storage_client,
+        source_id=source_id,
+        post_id=post_id,
         filename="embed-runtime.png",
-        content_type="image/png",
         media_bytes=build_seeded_png_bytes(
             seed=f"embed-runtime:{source_id}:{post_id}:{phash_tag or ''}",
         ),
+        phash_tag=phash_tag or "a",
+    )
+    service = PipelineStageCompletionService(
+        session,
+        publisher=publisher,
     )
     normalized = build_normalized_media_result(item.meme_file_id)
     storage_client.objects[normalized.web_video_object_key] = StoredObject(
@@ -1107,7 +1469,7 @@ async def _seed_embed_pending_item(
         ),
         None,
     )
-    assert embed_event is not None, "seed upload must dispatch a fresh EMBED event"
+    assert embed_event is not None, "seed item must dispatch a fresh EMBED event"
     return item.meme_file_id, embed_event, normalized
 
 
@@ -1128,9 +1490,8 @@ async def _seed_classify_pending_item(
         source_id=source_id,
         post_id=post_id,
     )
-    service = ContentPipelineService(
+    service = PipelineStageCompletionService(
         session,
-        storage_client=storage_client,
         publisher=publisher,
     )
     _ = await service.complete_embed_stage(
@@ -1160,9 +1521,8 @@ async def _seed_sync_qdrant_pending_item(
         source_id=source_id,
         post_id=post_id,
     )
-    service = ContentPipelineService(
+    service = PipelineStageCompletionService(
         session,
-        storage_client=storage_client,
         publisher=publisher,
     )
     await service.complete_classify_stage(
@@ -1200,9 +1560,8 @@ async def _seed_sync_meili_pending_item(
         source_id=source_id,
         post_id=post_id,
     )
-    service = ContentPipelineService(
+    service = PipelineStageCompletionService(
         session,
-        storage_client=storage_client,
         publisher=publisher,
     )
     await service.complete_classify_stage(
@@ -1283,7 +1642,7 @@ async def test_pipeline_runtime_embed_success_persists_cache_and_dispatches_clas
     async def fake_ensure_pipeline_broker_started(*_: object, **__: object) -> object:
         return downstream_broker
 
-    monkeypatch.setattr(content_pipeline_module, "ensure_pipeline_broker_started", fake_ensure_pipeline_broker_started)
+    monkeypatch.setattr(pipeline_dispatch_module, "ensure_pipeline_broker_started", fake_ensure_pipeline_broker_started)
 
     embedding_result = build_voyage_embedding_result(input_hash="e" * 64)
     voyage_client = FakeVoyageClient(result=embedding_result)
@@ -1435,7 +1794,7 @@ async def test_pipeline_runtime_classify_success_emits_meme_ready_and_marks_file
     async def fake_ensure_pipeline_broker_started(*_: object, **__: object) -> object:
         return downstream_broker
 
-    monkeypatch.setattr(content_pipeline_module, "ensure_pipeline_broker_started", fake_ensure_pipeline_broker_started)
+    monkeypatch.setattr(pipeline_dispatch_module, "ensure_pipeline_broker_started", fake_ensure_pipeline_broker_started)
 
     runtime = build_pipeline_runtime(
         settings=Settings(),
@@ -1543,9 +1902,8 @@ async def test_pipeline_runtime_embed_merge_transaction_failure_keeps_stage_repl
         phash_tag="o",
     )
     async with postgres_session_factory() as stash_session:
-        older_service = ContentPipelineService(
+        older_service = PipelineStageCompletionService(
             stash_session,
-            storage_client=storage_client,
             publisher=seed_publisher,
         )
         _ = await older_service.complete_embed_stage(
@@ -1678,9 +2036,8 @@ async def test_pipeline_runtime_embed_merge_transaction_failure_keeps_stage_repl
 
     replay_publisher = RecordingPublisher()
     async with postgres_session_factory() as replay_session:
-        replay_service = ContentPipelineService(
+        replay_service = PipelineReplayService(
             replay_session,
-            storage_client=storage_client,
             publisher=replay_publisher,
         )
         replay_response = await replay_service.replay_item(
@@ -1989,7 +2346,7 @@ async def test_pipeline_runtime_sync_qdrant_success_records_snapshot_and_publish
         return downstream_broker
 
     monkeypatch.setattr(
-        content_pipeline_module,
+        pipeline_dispatch_module,
         "ensure_pipeline_broker_started",
         fake_ensure_pipeline_broker_started,
     )
@@ -2119,7 +2476,7 @@ async def test_pipeline_runtime_sync_qdrant_rebuilds_collection_aware_payload_fr
         return downstream_broker
 
     monkeypatch.setattr(
-        content_pipeline_module,
+        pipeline_dispatch_module,
         "ensure_pipeline_broker_started",
         fake_ensure_pipeline_broker_started,
     )
@@ -2422,7 +2779,7 @@ async def test_pipeline_runtime_sync_qdrant_best_effort_preview_fetch_failure_st
         return downstream_broker
 
     monkeypatch.setattr(
-        content_pipeline_module,
+        pipeline_dispatch_module,
         "ensure_pipeline_broker_started",
         fake_ensure_pipeline_broker_started,
     )
@@ -2480,7 +2837,7 @@ async def test_pipeline_runtime_sync_meili_success_records_snapshot_and_publishe
         return downstream_broker
 
     monkeypatch.setattr(
-        content_pipeline_module,
+        pipeline_dispatch_module,
         "ensure_pipeline_broker_started",
         fake_ensure_pipeline_broker_started,
     )
@@ -2607,7 +2964,7 @@ async def test_pipeline_runtime_sync_meili_rebuilds_collection_aware_document_fr
         return downstream_broker
 
     monkeypatch.setattr(
-        content_pipeline_module,
+        pipeline_dispatch_module,
         "ensure_pipeline_broker_started",
         fake_ensure_pipeline_broker_started,
     )
@@ -2927,9 +3284,8 @@ async def test_classify_completion_fans_out_both_sync_stages_and_publishes_both_
         source_id="classify-fanout-happy",
         post_id="9000",
     )
-    service = ContentPipelineService(
+    service = PipelineStageCompletionService(
         migrated_db_session,
-        storage_client=storage_client,
         publisher=publisher,
     )
 
@@ -2993,9 +3349,8 @@ async def test_classify_completion_fan_out_publish_failure_rolls_back_both_stage
         if event.stage is ContentPipelineStage.SYNC_MEILI:
             raise RuntimeError("simulated meili publish failure")
 
-    fail_service = ContentPipelineService(
+    fail_service = PipelineStageCompletionService(
         migrated_db_session,
-        storage_client=storage_client,
         publisher=_publisher,
     )
 
@@ -3054,9 +3409,8 @@ async def test_outcome_partially_searchable_when_exactly_one_target_synced(
         source_id="outcome-partial",
         post_id="9100",
     )
-    service = ContentPipelineService(
+    service = PipelineStageCompletionService(
         migrated_db_session,
-        storage_client=storage_client,
         publisher=publisher,
     )
     await service.complete_classify_stage(
@@ -3081,11 +3435,7 @@ async def test_outcome_partially_searchable_when_exactly_one_target_synced(
     )
 
     async with postgres_session_factory() as read_session:
-        read_service = ContentPipelineService(
-            read_session,
-            storage_client=storage_client,
-            publisher=publisher,
-        )
+        read_service = PipelineItemReadService(read_session)
         detail = await read_service.get_item_detail(meme_file_id)
 
     summary = summarize_run(
@@ -3123,9 +3473,8 @@ async def test_outcome_ready_when_both_targets_synced(
         source_id="outcome-ready",
         post_id="9101",
     )
-    service = ContentPipelineService(
+    service = PipelineStageCompletionService(
         migrated_db_session,
-        storage_client=storage_client,
         publisher=publisher,
     )
     await service.complete_classify_stage(
@@ -3148,11 +3497,7 @@ async def test_outcome_ready_when_both_targets_synced(
     )
 
     async with postgres_session_factory() as read_session:
-        read_service = ContentPipelineService(
-            read_session,
-            storage_client=storage_client,
-            publisher=publisher,
-        )
+        read_service = PipelineItemReadService(read_session)
         detail = await read_service.get_item_detail(meme_file_id)
 
     summary = summarize_run(
@@ -3684,9 +4029,8 @@ async def test_forced_sync_qdrant_failure_produces_partially_searchable_outcome(
         source_id="t04-partial-outcome",
         post_id="9901",
     )
-    service = ContentPipelineService(
+    service = PipelineStageCompletionService(
         migrated_db_session,
-        storage_client=storage_client,
         publisher=publisher,
     )
     await service.complete_classify_stage(
@@ -3711,11 +4055,7 @@ async def test_forced_sync_qdrant_failure_produces_partially_searchable_outcome(
     )
 
     async with postgres_session_factory() as read_session:
-        read_service = ContentPipelineService(
-            read_session,
-            storage_client=storage_client,
-            publisher=publisher,
-        )
+        read_service = PipelineItemReadService(read_session)
         detail = await read_service.get_item_detail(meme_file_id)
 
     summary = summarize_run(
@@ -3749,10 +4089,6 @@ async def test_run_summary_reflects_k_of_n_forced_qdrant_failures(
     seed so the heavy chain does not dedup them.
     """
 
-    from memexpert.services.content_pipeline_constants import (
-        PIPELINE_REASON_SYNC_QDRANT_MALFORMED_PAYLOAD,
-    )
-
     storage_client = FakeStorageClient()
     publisher = RecordingPublisher()
     total = 3
@@ -3769,9 +4105,8 @@ async def test_run_summary_reflects_k_of_n_forced_qdrant_failures(
             post_id=f"99{index:02d}",
             phash_tag=phash_tags[index],
         )
-        service = ContentPipelineService(
+        service = PipelineStageCompletionService(
             migrated_db_session,
-            storage_client=storage_client,
             publisher=publisher,
         )
         _ = await service.complete_embed_stage(
@@ -3814,11 +4149,7 @@ async def test_run_summary_reflects_k_of_n_forced_qdrant_failures(
                 payload_preview={"id": meme_file_id.hex},
             )
         async with postgres_session_factory() as read_session:
-            read_service = ContentPipelineService(
-                read_session,
-                storage_client=storage_client,
-                publisher=publisher,
-            )
+            read_service = PipelineItemReadService(read_session)
             details.append(await read_service.get_item_detail(meme_file_id))
 
     summary = summarize_run(
