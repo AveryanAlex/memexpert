@@ -21,6 +21,7 @@ from memexpert.schemas.meme import (
     PublicMemePopularitySummaryRead,
     PublicMemeTrendPageRead,
     PublicMemeTrendRead,
+    PublicTrendAggregatePointRead,
     PublicTrendComparisonPointRead,
     PublicTrendComparisonRead,
     PublicTrendComparisonSeriesRead,
@@ -47,6 +48,8 @@ TREND_MATERIALIZED_VIEWS = (
     "public_meme_trends_mv",
     "public_tag_trends_mv",
     "public_template_trends_mv",
+    "public_tag_trend_points_mv",
+    "public_template_trend_points_mv",
 )
 
 type PublicTrendRanking = Literal["trending", "fastest_rising", "most_liked"]
@@ -228,7 +231,12 @@ class PublicTrendsService:
             ),
             {"limit": _clamp_limit(limit), "offset": max(0, offset)},
         )
-        return [_tag_summary_from_row(dict(row)) for row in result.mappings()]
+        rows = [dict(row) for row in result.mappings()]
+        points_by_tag = await self._load_tag_history_points(tuple(str(row["tag"]) for row in rows))
+        return [
+            _tag_summary_from_row(row, points=points_by_tag.get(str(row["tag"]).strip().lower(), []))
+            for row in rows
+        ]
 
     async def template_summaries(self, *, limit: int = 20, offset: int = 0) -> list[PublicTrendSummaryRead]:
         """Return top safe public template trend summaries."""
@@ -244,7 +252,17 @@ class PublicTrendsService:
             ),
             {"limit": _clamp_limit(limit), "offset": max(0, offset)},
         )
-        return [_template_summary_from_row(dict(row)) for row in result.mappings()]
+        rows = [dict(row) for row in result.mappings()]
+        points_by_slug = await self._load_template_history_points(
+            tuple(str(row["template_slug"]) for row in rows)
+        )
+        return [
+            _template_summary_from_row(
+                row,
+                points=points_by_slug.get(str(row["template_slug"]).strip().lower(), []),
+            )
+            for row in rows
+        ]
 
     async def tag_summary(self, tag: str) -> PublicTrendSummaryRead | None:
         """Return one safe public tag trend summary."""
@@ -257,7 +275,10 @@ class PublicTrendsService:
             {"tag": normalized_tag},
         )
         row = result.mappings().first()
-        return _tag_summary_from_row(dict(row)) if row is not None else None
+        if row is None:
+            return None
+        points_by_tag = await self._load_tag_history_points((normalized_tag,))
+        return _tag_summary_from_row(dict(row), points=points_by_tag.get(normalized_tag, []))
 
     async def template_summary(self, template_slug: str) -> PublicTrendSummaryRead | None:
         """Return one safe public template trend summary."""
@@ -270,7 +291,10 @@ class PublicTrendsService:
             {"template_slug": normalized_slug},
         )
         row = result.mappings().first()
-        return _template_summary_from_row(dict(row)) if row is not None else None
+        if row is None:
+            return None
+        points_by_slug = await self._load_template_history_points((normalized_slug,))
+        return _template_summary_from_row(dict(row), points=points_by_slug.get(normalized_slug, []))
 
     async def compare_items(
         self,
@@ -461,6 +485,82 @@ class PublicTrendsService:
             has_more=resolved_offset + resolved_limit < (total or 0),
         )
 
+    async def _load_tag_history_points(
+        self,
+        tags: tuple[str, ...],
+    ) -> dict[str, list[PublicTrendAggregatePointRead]]:
+        normalized_tags = tuple(dict.fromkeys(tag.strip().lower() for tag in tags if tag.strip()))
+        if not normalized_tags:
+            return {}
+
+        result = await self._session.execute(
+            _tag_history_text(
+                """
+                SELECT
+                    tag,
+                    observed_at,
+                    meme_count,
+                    snapshot_count,
+                    source_views,
+                    source_reactions,
+                    source_reposts,
+                    platform_views,
+                    platform_sends,
+                    platform_saves,
+                    platform_likes,
+                    aggregate_value
+                FROM public_tag_trend_points_mv
+                WHERE tag = ANY(CAST(:tags AS varchar[]))
+                ORDER BY tag ASC, observed_at ASC
+                """
+            ),
+            {"tags": list(normalized_tags)},
+        )
+        points_by_tag: dict[str, list[PublicTrendAggregatePointRead]] = {}
+        for row in result.mappings():
+            row_dict = dict(row)
+            points_by_tag.setdefault(str(row_dict["tag"]), []).append(_aggregate_point_from_row(row_dict))
+        return points_by_tag
+
+    async def _load_template_history_points(
+        self,
+        template_slugs: tuple[str, ...],
+    ) -> dict[str, list[PublicTrendAggregatePointRead]]:
+        normalized_slugs = tuple(dict.fromkeys(slug.strip().lower() for slug in template_slugs if slug.strip()))
+        if not normalized_slugs:
+            return {}
+
+        result = await self._session.execute(
+            _template_history_text(
+                """
+                SELECT
+                    template_slug,
+                    observed_at,
+                    meme_count,
+                    snapshot_count,
+                    source_views,
+                    source_reactions,
+                    source_reposts,
+                    platform_views,
+                    platform_sends,
+                    platform_saves,
+                    platform_likes,
+                    aggregate_value
+                FROM public_template_trend_points_mv
+                WHERE template_slug = ANY(CAST(:template_slugs AS varchar[]))
+                ORDER BY template_slug ASC, observed_at ASC
+                """
+            ),
+            {"template_slugs": list(normalized_slugs)},
+        )
+        points_by_slug: dict[str, list[PublicTrendAggregatePointRead]] = {}
+        for row in result.mappings():
+            row_dict = dict(row)
+            points_by_slug.setdefault(str(row_dict["template_slug"]), []).append(
+                _aggregate_point_from_row(row_dict)
+            )
+        return points_by_slug
+
     async def _load_public_memes(self, meme_ids: tuple[uuid.UUID, ...]) -> dict[uuid.UUID, Meme]:
         if not meme_ids:
             return {}
@@ -639,6 +739,14 @@ def _typed_text(sql: str) -> TextClause:
     return text(sql).bindparams(bindparam("tags", type_=ARRAY(String)))
 
 
+def _tag_history_text(sql: str) -> TextClause:
+    return text(sql).bindparams(bindparam("tags", type_=ARRAY(String)))
+
+
+def _template_history_text(sql: str) -> TextClause:
+    return text(sql).bindparams(bindparam("template_slugs", type_=ARRAY(String)))
+
+
 def _trend_metrics_from_row(row: dict[str, object]) -> PublicTrendMetricsRead:
     return PublicTrendMetricsRead(
         recent=PublicTrendCountsRead(
@@ -716,8 +824,31 @@ def _weighted_trend_event_count(row: dict[str, object], *, prefix: Literal["rece
     )
 
 
-def _tag_summary_from_row(row: dict[str, object]) -> PublicTrendSummaryRead:
+def _aggregate_point_from_row(row: dict[str, object]) -> PublicTrendAggregatePointRead:
+    return PublicTrendAggregatePointRead(
+        observed_at=cast("datetime", row["observed_at"]),
+        value=_float(row.get("aggregate_value")),
+        metric="aggregate_popularity_score",
+        label="Aggregate popularity score",
+        meme_count=_int(row.get("meme_count")),
+        snapshot_count=_int(row.get("snapshot_count")),
+        source_views=_int(row.get("source_views")),
+        source_reactions=_int(row.get("source_reactions")),
+        source_reposts=_int(row.get("source_reposts")),
+        platform_views=_int(row.get("platform_views")),
+        platform_sends=_int(row.get("platform_sends")),
+        platform_saves=_int(row.get("platform_saves")),
+        platform_likes=_int(row.get("platform_likes")),
+    )
+
+
+def _tag_summary_from_row(
+    row: dict[str, object],
+    *,
+    points: list[PublicTrendAggregatePointRead],
+) -> PublicTrendSummaryRead:
     tag = str(row["tag"])
+    insufficient_history, current_only_reason = _summary_history_state(points)
     return PublicTrendSummaryRead(
         kind="tag",
         slug=tag,
@@ -725,10 +856,18 @@ def _tag_summary_from_row(row: dict[str, object]) -> PublicTrendSummaryRead:
         description=f"Aggregate public trend activity for memes tagged {tag}.",
         meme_count=_int(row.get("meme_count")),
         trend=_trend_metrics_from_row(row),
+        points=points,
+        insufficient_history=insufficient_history,
+        current_only_reason=current_only_reason,
     )
 
 
-def _template_summary_from_row(row: dict[str, object]) -> PublicTrendSummaryRead:
+def _template_summary_from_row(
+    row: dict[str, object],
+    *,
+    points: list[PublicTrendAggregatePointRead],
+) -> PublicTrendSummaryRead:
+    insufficient_history, current_only_reason = _summary_history_state(points)
     return PublicTrendSummaryRead(
         kind="template",
         slug=str(row["template_slug"]),
@@ -736,29 +875,60 @@ def _template_summary_from_row(row: dict[str, object]) -> PublicTrendSummaryRead
         description=cast("str | None", row.get("template_description")),
         meme_count=_int(row.get("meme_count")),
         trend=_trend_metrics_from_row(row),
+        points=points,
+        insufficient_history=insufficient_history,
+        current_only_reason=current_only_reason,
     )
+
+
+def _summary_history_state(points: list[PublicTrendAggregatePointRead]) -> tuple[bool, str | None]:
+    if len(points) >= 2:
+        return False, None
+    if points:
+        return True, None
+    return True, "No historical aggregate snapshot points exist; using the current public trend window only."
+
+
+def _current_window_point_from_summary(summary: PublicTrendSummaryRead) -> PublicTrendComparisonPointRead:
+    return PublicTrendComparisonPointRead(
+        observed_at=summary.trend.refreshed_at or summary.trend.latest_snapshot_at,
+        value=summary.trend.trending_score,
+        metric="trending_score",
+        label="Current public trend window",
+        meme_count=summary.meme_count,
+        source_views=summary.trend.latest_source_views,
+        source_reactions=summary.trend.latest_source_reactions,
+        source_reposts=summary.trend.latest_source_reposts,
+        platform_views=summary.trend.latest_platform_views,
+        platform_sends=summary.trend.latest_platform_sends,
+        platform_saves=summary.trend.latest_platform_saves,
+        platform_likes=summary.trend.latest_platform_likes,
+    )
+
+
+def _comparison_point_from_aggregate_point(point: PublicTrendAggregatePointRead) -> PublicTrendComparisonPointRead:
+    return PublicTrendComparisonPointRead(**point.model_dump())
 
 
 def _summary_comparison_series(summary: PublicTrendSummaryRead, *, value: str) -> PublicTrendComparisonSeriesRead:
-    description = (
-        f"{summary.description or ''} Current-window aggregate only; "
-        "historical tag/template snapshots are not available yet."
-    )
+    points = [_comparison_point_from_aggregate_point(point) for point in summary.points]
+    current_only_reason = summary.current_only_reason
+    description = summary.description
+    if not points:
+        points = [_current_window_point_from_summary(summary)]
+        current_only_reason = current_only_reason or (
+            "No historical aggregate snapshot points exist; using the current public trend window only."
+        )
+        description = f"{summary.description or ''} Current-window aggregate only.".strip()
     return PublicTrendComparisonSeriesRead(
         kind=summary.kind,
         value=value,
         title=summary.title,
         description=description,
         trend=summary.trend,
-        points=[
-            PublicTrendComparisonPointRead(
-                observed_at=summary.trend.refreshed_at or summary.trend.latest_snapshot_at,
-                value=summary.trend.trending_score,
-                metric="trending_score",
-                label="Current public trend window",
-            )
-        ],
-        insufficient_history=True,
+        points=points,
+        insufficient_history=len(summary.points) < 2,
+        current_only_reason=current_only_reason,
     )
 
 

@@ -61,10 +61,14 @@ EXPECTED_TABLES = {
     "telegram_session_states",
     "users",
 }
-EXPECTED_MATERIALIZED_VIEWS = {
+EXPECTED_CURRENT_TREND_MATERIALIZED_VIEWS = {
     "public_meme_trends_mv",
     "public_tag_trends_mv",
     "public_template_trends_mv",
+}
+EXPECTED_MATERIALIZED_VIEWS = EXPECTED_CURRENT_TREND_MATERIALIZED_VIEWS | {
+    "public_tag_trend_points_mv",
+    "public_template_trend_points_mv",
 }
 ALEMBIC_TIMEOUT_SECONDS = 20.0
 
@@ -335,9 +339,9 @@ def test_initial_revision_metadata_is_present() -> None:
     revision = script_directory.get_revision("head")
 
     assert revision is not None
-    assert revision.revision == "0018"
-    assert revision.down_revision == "0017"
-    assert revision.doc == "pipeline ingest requests and outbox"
+    assert revision.revision == "0019"
+    assert revision.down_revision == "0018"
+    assert revision.doc == "public trend aggregate history points"
 
 
 async def test_upgrade_head_creates_expected_schema_and_constraints(
@@ -350,7 +354,7 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
 
     table_names = await _get_table_names(engine)
     assert table_names == EXPECTED_TABLES | {"alembic_version"}
-    assert await _get_current_revision(engine) == "0018"
+    assert await _get_current_revision(engine) == "0019"
     assert await _get_materialized_view_names(engine) == EXPECTED_MATERIALIZED_VIEWS
 
     users_indexes = await _get_index_definitions(engine, "users")
@@ -367,7 +371,9 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
     telegram_link_columns = await _get_column_names(engine, "telegram_link_codes")
     public_meme_trends_indexes = await _get_index_definitions(engine, "public_meme_trends_mv")
     public_tag_trends_indexes = await _get_index_definitions(engine, "public_tag_trends_mv")
+    public_tag_trend_points_indexes = await _get_index_definitions(engine, "public_tag_trend_points_mv")
     public_template_trends_indexes = await _get_index_definitions(engine, "public_template_trends_mv")
+    public_template_trend_points_indexes = await _get_index_definitions(engine, "public_template_trend_points_mv")
     meme_file_ocr_result_columns = await _get_column_names(engine, "meme_file_ocr_results")
     memes_nullable_columns = await _get_nullable_columns(engine, "memes")
     memes_constraint_definitions = await _get_constraint_definitions(engine, "memes")
@@ -696,9 +702,22 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
     assert "USING gin" in public_meme_trends_indexes["ix_public_meme_trends_mv_tags"]
     assert "uq_public_tag_trends_mv_tag" in public_tag_trends_indexes
     assert "ix_public_tag_trends_mv_trending" in public_tag_trends_indexes
+    assert "uq_public_tag_trend_points_mv_tag_observed_at" in public_tag_trend_points_indexes
+    assert "UNIQUE" in public_tag_trend_points_indexes[
+        "uq_public_tag_trend_points_mv_tag_observed_at"
+    ].upper()
+    assert "ix_public_tag_trend_points_mv_observed_at" in public_tag_trend_points_indexes
+    assert "ix_public_tag_trend_points_mv_value" in public_tag_trend_points_indexes
     assert "uq_public_template_trends_mv_template_id" in public_template_trends_indexes
     assert "uq_public_template_trends_mv_template_slug" in public_template_trends_indexes
     assert "ix_public_template_trends_mv_trending" in public_template_trends_indexes
+    assert "uq_public_template_trend_points_mv_template_observed_at" in public_template_trend_points_indexes
+    assert "UNIQUE" in public_template_trend_points_indexes[
+        "uq_public_template_trend_points_mv_template_observed_at"
+    ].upper()
+    assert "ix_public_template_trend_points_mv_slug_observed_at" in public_template_trend_points_indexes
+    assert "ix_public_template_trend_points_mv_observed_at" in public_template_trend_points_indexes
+    assert "ix_public_template_trend_points_mv_value" in public_template_trend_points_indexes
 
 
 async def test_primary_file_invariant_is_enforced_by_database(
@@ -773,6 +792,21 @@ async def test_primary_file_invariant_is_enforced_by_database(
             )
 
 
+async def test_public_trend_points_migration_downgrade_keeps_existing_trend_views(
+    migrated_database: tuple[AsyncEngine, str],
+) -> None:
+    engine, database_url = migrated_database
+    config = _build_alembic_config(database_url)
+
+    await _run_alembic_command(command.upgrade, config, "head")
+    assert await _get_materialized_view_names(engine) == EXPECTED_MATERIALIZED_VIEWS
+
+    await _run_alembic_command(command.downgrade, config, "0018")
+
+    assert await _get_current_revision(engine) == "0018"
+    assert await _get_materialized_view_names(engine) == EXPECTED_CURRENT_TREND_MATERIALIZED_VIEWS
+
+
 async def test_sync_target_snapshots_schema_is_created_with_expected_shape(
     migrated_database: tuple[AsyncEngine, str],
 ) -> None:
@@ -839,7 +873,7 @@ async def test_crawler_sources_migration_applies_and_reverses(
     config = _build_alembic_config(database_url)
 
     await _run_alembic_command(command.upgrade, config, "head")
-    assert await _get_current_revision(engine) == "0018"
+    assert await _get_current_revision(engine) == "0019"
 
     meme_sources_columns = await _get_column_names(engine, "meme_sources")
     source_channels_columns = await _get_column_names(engine, "source_channels")
@@ -937,7 +971,7 @@ async def test_repeated_fresh_database_upgrades_work_after_a_full_downgrade(
     await _run_alembic_command(command.downgrade, config, "base")
     await _run_alembic_command(command.upgrade, config, "head")
 
-    assert await _get_current_revision(engine) == "0018"
+    assert await _get_current_revision(engine) == "0019"
     assert EXPECTED_TABLES.issubset(await _get_table_names(engine))
 
 
