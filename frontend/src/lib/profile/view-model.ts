@@ -1,4 +1,4 @@
-import type { CollectionSummaryRead, CurrentSessionRead, MemeLibraryRead, PublicMemeCardRead, UserRead } from '$lib/api/types';
+import type { CollectionSummaryRead, CurrentSessionRead, MemeLibraryRead, ProfileStatsRead, PublicMemeCardRead, UserRead } from '$lib/api/types';
 
 export interface ProfileCapabilityView {
   accountLabel: string;
@@ -9,6 +9,12 @@ export interface ProfileCapabilityView {
 }
 
 export interface ProfileStatView {
+  label: string;
+  value: string;
+  detail: string;
+}
+
+export interface ProfileProviderStatusView {
   label: string;
   value: string;
   detail: string;
@@ -50,6 +56,45 @@ export function profileCapabilities(session: CurrentSessionRead | null): Profile
   };
 }
 
+export function profileProviderStatuses(session: CurrentSessionRead | null): ProfileProviderStatusView[] {
+  if (!session) {
+    return ['Telegram', 'Google', 'Email', 'Password'].map((label) => ({
+      label,
+      value: 'Unavailable',
+      detail: 'Provider status loads with the account session.'
+    }));
+  }
+
+  const providers = session.linked_providers;
+
+  return [
+    {
+      label: 'Telegram',
+      value: providers.telegram_linked ? 'Connected' : 'Not connected',
+      detail: providers.telegram_linked
+        ? 'Telegram is linked for cross-device account access.'
+        : session.user.account_type === 'guest'
+          ? 'Connect Telegram to keep this guest library across devices.'
+          : 'Telegram is not linked to this account.'
+    },
+    {
+      label: 'Google',
+      value: providers.google_linked ? 'Connected' : 'Not connected',
+      detail: providers.google_linked ? 'Google is linked to this account.' : 'Google linking is not available from Profile yet.'
+    },
+    {
+      label: 'Email',
+      value: providers.email ? (providers.email_verified_at ? 'Verified' : 'Unverified') : 'No email on file',
+      detail: providers.email ?? 'Email linking is not available from Profile yet.'
+    },
+    {
+      label: 'Password',
+      value: providers.has_password ? 'Password set' : 'Password not set',
+      detail: providers.has_password ? 'Password sign-in is enabled for this account.' : 'Password setup is not available from Profile yet.'
+    }
+  ];
+}
+
 export function writableCollectionOptions(library: MemeLibraryRead | null): CollectionSummaryRead[] {
   return library?.collections.filter((collection) => collection.can_write) ?? [];
 }
@@ -68,44 +113,42 @@ export function libraryEmptyText(section: 'favorites' | 'pins', session: Current
     : 'Connect Telegram to unlock pinned memes for your profile.';
 }
 
-export function profileStats(library: MemeLibraryRead | null): ProfileStatView[] {
-  if (!library) {
+export function profileStats(stats: ProfileStatsRead | null): ProfileStatView[] {
+  if (!stats) {
     return [
       {
-        label: 'Library data',
+        label: 'Interaction stats',
         value: 'Unavailable',
-        detail: 'Stats load after the library API responds.'
+        detail: 'Stats load after the profile stats API responds.'
       }
     ];
   }
 
-  const customCollections = library.collections.filter((collection) => collection.kind === 'custom');
-  const writableCollections = library.collections.filter((collection) => collection.can_write);
-  const savedTotal = library.collections.reduce((total, collection) => total + collection.saved_meme_count, 0);
-
   return [
     {
-      label: 'Favorites',
-      value: String(library.favorites.length),
-      detail: library.favorites.length > 0 ? 'Memes you liked or saved to Favorites.' : 'No favorite meme rows yet.'
+      label: 'Viewed',
+      value: String(stats.viewed),
+      detail: stats.viewed > 0 ? 'Views and detail opens recorded from interaction events.' : 'No viewed meme interactions recorded yet.'
     },
     {
-      label: 'Pins',
-      value: String(library.pinned_memes.length),
-      detail: library.pinned_memes.length > 0 ? 'Quick-access memes on this profile.' : 'No pinned memes yet.'
+      label: 'Sent',
+      value: String(stats.sent),
+      detail: stats.sent > 0 ? 'Share and send events from this account.' : 'No sent meme interactions recorded yet.'
     },
     {
-      label: 'Collections',
-      value: String(library.collections.length),
-      detail:
-        customCollections.length > 0
-          ? `${customCollections.length} custom, ${writableCollections.length} writable.`
-          : 'Only Favorites is available until a custom collection exists.'
+      label: 'Saved',
+      value: String(stats.saved),
+      detail: stats.saved > 0 ? 'Save and favorite events from this account.' : 'No saved meme interactions recorded yet.'
     },
     {
-      label: 'Saved rows',
-      value: String(savedTotal),
-      detail: savedTotal > 0 ? 'Total saved meme rows across collections.' : 'No saved collection rows yet.'
+      label: 'Downloaded',
+      value: String(stats.downloaded),
+      detail: stats.downloaded > 0 ? 'Download events from this account.' : 'No downloaded meme interactions recorded yet.'
+    },
+    {
+      label: 'Days active',
+      value: String(stats.days_active),
+      detail: stats.days_active > 0 ? 'Distinct calendar days with recorded interactions.' : 'No active interaction days recorded yet.'
     }
   ];
 }
@@ -174,7 +217,7 @@ export function orderPinnedMemesByIds(memes: PublicMemeCardRead[], memeIds: stri
   return [...ordered, ...memes.filter((meme) => !orderedIds.has(meme.id))];
 }
 
-function languageLabel(language: UserRead['language']): string {
+export function languageLabel(language: UserRead['language']): string {
   switch (language) {
     case 'any':
       return 'Any language';

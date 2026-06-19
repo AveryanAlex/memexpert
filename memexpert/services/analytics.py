@@ -7,6 +7,7 @@ import hashlib
 import logging
 import math
 import uuid
+from collections import Counter
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -16,9 +17,15 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from sqlalchemy import func, select
 
 from memexpert.models.base import utcnow
-from memexpert.models.content import MemePopularitySnapshot
+from memexpert.models.content import Meme, MemePopularitySnapshot, MemeTemplate
 from memexpert.models.enums import AccountType, AnalyticsEventType
 from memexpert.models.user import AccountMergeLog, AnalyticsEvent, User
+from memexpert.schemas.auth import (
+    ProfileStatsMetadataRead,
+    ProfileStatsRead,
+    ProfileStatsTagRead,
+    ProfileStatsTemplateRead,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -68,6 +75,27 @@ _MEME_REF_EVENT_TYPES = frozenset(
         AnalyticsEventType.SAVE,
     }
 )
+_PROFILE_VIEW_EVENT_TYPES = frozenset({AnalyticsEventType.MEME_VIEW, AnalyticsEventType.VIEW})
+_PROFILE_SENT_EVENT_TYPES = frozenset(
+    {
+        AnalyticsEventType.MEME_SEND,
+        AnalyticsEventType.INLINE_SENT,
+        AnalyticsEventType.SHARE,
+    }
+)
+_PROFILE_SAVED_EVENT_TYPES = frozenset(
+    {
+        AnalyticsEventType.MEME_SAVE,
+        AnalyticsEventType.SAVE,
+        AnalyticsEventType.FAVORITE,
+    }
+)
+_PROFILE_DOWNLOADED_EVENT_TYPES = frozenset({AnalyticsEventType.MEME_DOWNLOAD})
+_PROFILE_NO_INTERACTIONS_NOTE = "No interactions yet; stats are zero until this user interacts with memes."
+_PROFILE_TAGS_REQUIREMENTS_NOTE = "Top tags require analytics events with payload.refs.meme_id and tagged meme rows."
+_PROFILE_TEMPLATES_REQUIREMENTS_NOTE = (
+    "Top templates require analytics events with payload.refs.meme_id and classified template ids."
+)
 
 
 def _normalize_payload_key(key: str) -> str:
@@ -102,6 +130,21 @@ def _normalize_utc(value: datetime | None) -> datetime:
     if resolved.tzinfo is None:
         return resolved.replace(tzinfo=UTC)
     return resolved.astimezone(UTC)
+
+
+def _strict_payload_meme_ref(payload: Mapping[str, object]) -> uuid.UUID | None:
+    refs = payload.get("refs")
+    if not isinstance(refs, Mapping):
+        return None
+
+    meme_id = refs.get("meme_id")
+    if not isinstance(meme_id, str):
+        return None
+
+    try:
+        return uuid.UUID(meme_id)
+    except ValueError:
+        return None
 
 
 class InteractionEventRefs(BaseModel):
@@ -254,7 +297,7 @@ class LaunchKPIRead(BaseModel):
 
 
 class AnalyticsService:
-    """Write product events without making user-facing paths depend on analytics health."""
+    """Read and write product analytics without inventing user-facing metrics."""
 
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
@@ -385,6 +428,89 @@ class AnalyticsService:
             source_reactions=source_reactions,
             source_reposts=source_reposts,
         )
+
+    async def profile_stats(self, *, user_id: uuid.UUID, top_limit: int = 5) -> ProfileStatsRead:
+        """Return one user's profile stats from persisted analytics events only."""
+
+        events = list(
+            (
+                await self._session.execute(
+                    select(AnalyticsEvent)
+                    .where(AnalyticsEvent.user_id == user_id)
+                    .order_by(AnalyticsEvent.occurred_at.asc(), AnalyticsEvent.id.asc())
+                )
+            ).scalars()
+        )
+        event_counts = Counter(event.event_type for event in events)
+        active_days = {_normalize_utc(event.occurred_at).date() for event in events}
+        meme_event_counts: Counter[uuid.UUID] = Counter()
+        for event in events:
+            meme_id = _strict_payload_meme_ref(event.payload)
+            if meme_id is not None:
+                meme_event_counts[meme_id] += 1
+
+        top_tags, top_templates = await self._top_profile_interaction_metadata(
+            meme_event_counts,
+            limit=top_limit,
+        )
+        notes: list[str] = []
+        if not events:
+            notes.append(_PROFILE_NO_INTERACTIONS_NOTE)
+        notes.extend([_PROFILE_TAGS_REQUIREMENTS_NOTE, _PROFILE_TEMPLATES_REQUIREMENTS_NOTE])
+
+        return ProfileStatsRead(
+            viewed=sum(event_counts[event_type] for event_type in _PROFILE_VIEW_EVENT_TYPES),
+            sent=sum(event_counts[event_type] for event_type in _PROFILE_SENT_EVENT_TYPES),
+            saved=sum(event_counts[event_type] for event_type in _PROFILE_SAVED_EVENT_TYPES),
+            downloaded=sum(event_counts[event_type] for event_type in _PROFILE_DOWNLOADED_EVENT_TYPES),
+            days_active=len(active_days),
+            top_tags=top_tags,
+            top_templates=top_templates,
+            metadata=ProfileStatsMetadataRead(notes=notes),
+        )
+
+    async def _top_profile_interaction_metadata(
+        self,
+        meme_event_counts: Counter[uuid.UUID],
+        *,
+        limit: int,
+    ) -> tuple[list[ProfileStatsTagRead], list[ProfileStatsTemplateRead]]:
+        if not meme_event_counts or limit <= 0:
+            return [], []
+
+        result = await self._session.execute(
+            select(Meme.id, Meme.tags, Meme.template_id, MemeTemplate.slug, MemeTemplate.name)
+            .outerjoin(MemeTemplate, Meme.template_id == MemeTemplate.id)
+            .where(Meme.id.in_(list(meme_event_counts)))
+        )
+        tag_counts: Counter[str] = Counter()
+        template_counts: Counter[uuid.UUID] = Counter()
+        template_labels: dict[uuid.UUID, tuple[str, str]] = {}
+        for meme_id, tags, template_id, template_slug, template_name in result.all():
+            event_count = meme_event_counts[meme_id]
+            for tag in dict.fromkeys(tag.strip() for tag in tags or [] if tag.strip()):
+                tag_counts[tag] += event_count
+            if template_id is not None and template_slug is not None and template_name is not None:
+                template_counts[template_id] += event_count
+                template_labels[template_id] = (template_slug, template_name)
+
+        top_tags = [
+            ProfileStatsTagRead(tag=tag, count=count)
+            for tag, count in sorted(tag_counts.items(), key=lambda item: (-item[1], item[0]))[:limit]
+        ]
+        top_templates = [
+            ProfileStatsTemplateRead(
+                template_id=template_id,
+                slug=template_labels[template_id][0],
+                name=template_labels[template_id][1],
+                count=count,
+            )
+            for template_id, count in sorted(
+                template_counts.items(),
+                key=lambda item: (-item[1], template_labels[item[0]][1], str(item[0])),
+            )[:limit]
+        ]
+        return top_tags, top_templates
 
     async def _event_counts_since(self, since: datetime) -> dict[AnalyticsEventType, int]:
         result = await self._session.execute(

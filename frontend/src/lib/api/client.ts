@@ -22,6 +22,7 @@ import type {
   MemeLibraryRead,
   MemeSearchScope,
   PinnedMemeRead,
+  ProfileStatsRead,
   PublicMemeDetailRead,
   PublicMemeLandingRead,
   PublicMemePopularitySummaryRead,
@@ -238,6 +239,10 @@ export async function fetchMemePage(request: PageRequest): Promise<PublicMemeSea
 
 export async function fetchCurrentSession(request: CatalogRequest): Promise<CurrentSessionRead> {
   return apiJson<CurrentSessionRead>('/api/v1/auth/session', undefined, request);
+}
+
+export async function fetchProfileStats(request: CatalogRequest): Promise<ProfileStatsRead> {
+  return apiGet<ProfileStatsRead>('/api/v1/auth/profile-stats', new URLSearchParams(), request);
 }
 
 export async function refreshCurrentSession(request: CatalogRequest): Promise<CurrentSessionRead> {

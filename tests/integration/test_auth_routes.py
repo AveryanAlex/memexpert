@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import UTC, datetime, timedelta
 
 import jwt
@@ -14,6 +15,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from memexpert.api.app import create_app
 from memexpert.api.dependencies import FullAccountUserDep
+from memexpert.models.content import Meme, MemeFile
+from memexpert.models.enums import ContentKind, ContentLanguage, ContentProcessingStatus
 from memexpert.models.user import LoginEvent, User
 from memexpert.schemas.user import UserRead
 from memexpert.services import AuthService, UserService
@@ -24,6 +27,29 @@ ACCESS_TOKEN_TTL = timedelta(days=30)
 ACCESS_COOKIE_NAME = "memexpert_access_token"
 
 full_only_probe_router = APIRouter()
+
+
+async def create_auth_route_test_meme(session: AsyncSession) -> Meme:
+    meme_id = uuid.uuid7()
+    meme_file_id = uuid.uuid7()
+    meme = Meme(
+        id=meme_id,
+        media_type=ContentKind.IMAGE,
+        primary_file_id=meme_file_id,
+        language=ContentLanguage.EN,
+        is_public=True,
+    )
+    meme_file = MemeFile(
+        id=meme_file_id,
+        meme_id=meme_id,
+        status=ContentProcessingStatus.READY,
+        s3_original_key=f"auth-route/originals/{meme_id}.jpg",
+    )
+    session.add(meme)
+    await session.flush()
+    session.add(meme_file)
+    await session.flush()
+    return meme
 
 
 @full_only_probe_router.get(FULL_ONLY_PROBE_PATH, response_model=UserRead, tags=["test-auth"])
@@ -179,6 +205,53 @@ async def test_current_session_auto_bootstraps_guest_and_returns_linked_provider
         assert user_count_result.scalar_one().account_type.value == "guest"
 
 
+async def test_profile_stats_route_auto_bootstraps_guest_and_returns_empty_history(
+    auth_client: AsyncClient,
+) -> None:
+    response = await auth_client.get("/api/v1/auth/profile-stats")
+
+    assert response.status_code == 200
+    assert f"{ACCESS_COOKIE_NAME}=" in response.headers["set-cookie"]
+    payload = response.json()
+    assert payload["viewed"] == 0
+    assert payload["sent"] == 0
+    assert payload["saved"] == 0
+    assert payload["downloaded"] == 0
+    assert payload["days_active"] == 0
+    assert payload["top_tags"] == []
+    assert payload["top_templates"] == []
+    assert any("No interactions yet" in note for note in payload["metadata"]["notes"])
+    assert any("Top tags require" in note for note in payload["metadata"]["notes"])
+    assert any("Top templates require" in note for note in payload["metadata"]["notes"])
+
+
+async def test_profile_stats_route_reflects_real_download_interaction(
+    auth_client: AsyncClient,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    _ = await auth_client.post("/api/v1/auth/guest")
+    async with postgres_session_factory() as session:
+        meme = await create_auth_route_test_meme(session)
+        meme_id = meme.id
+        await session.commit()
+
+    before_response = await auth_client.get("/api/v1/auth/profile-stats")
+    download_response = await auth_client.post(f"/api/v1/memes/{meme_id}/download", json={})
+    after_response = await auth_client.get("/api/v1/auth/profile-stats")
+
+    assert before_response.status_code == 200
+    assert before_response.json()["downloaded"] == 0
+    assert download_response.status_code == 200
+    assert download_response.json() == {"ok": True}
+    payload = after_response.json()
+    assert after_response.status_code == 200
+    assert payload["viewed"] == 0
+    assert payload["sent"] == 0
+    assert payload["saved"] == 0
+    assert payload["downloaded"] == 1
+    assert payload["days_active"] == 1
+
+
 async def test_me_route_accepts_cookie_only_caller_and_rejects_expired_tokens(
     auth_client: AsyncClient,
     auth_settings_overrides: dict[str, str],
@@ -264,6 +337,12 @@ async def test_preferences_route_updates_and_persists_current_user_preferences(
     assert response.json()["nsfw_enabled"] is True
     assert response.json()["language"] == "ru"
     assert "access_token" not in response.json()
+
+    session_response = await auth_client.get("/api/v1/auth/session")
+    assert session_response.status_code == 200
+    assert session_response.json()["user"]["id"] == guest_user_id
+    assert session_response.json()["user"]["nsfw_enabled"] is True
+    assert session_response.json()["user"]["language"] == "ru"
 
     async with postgres_session_factory() as session:
         persisted_user_result = await session.execute(select(User).where(User.id == guest_user_id))

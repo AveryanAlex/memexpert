@@ -19,6 +19,7 @@ import {
   fetchMemeDetail,
   fetchMemePage,
   fetchMemePopularitySummary,
+  fetchProfileStats,
   fetchPinterestFeed,
   fetchSeoMemes,
   fetchSeoSummary,
@@ -656,6 +657,45 @@ describe('catalog API client', () => {
     expect(library.favorites[0].viewer_has_favorited).toBe(true);
     expect(library.pinned_memes[0].viewer_has_pinned).toBe(true);
     expect(library.active_save_collection?.title).toBe('Favorites');
+    expect(mockFetch).toHaveBeenCalledOnce();
+  });
+
+  it('loads profile interaction stats with SSR cookie forwarding', async () => {
+    const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const headers = new Headers(init?.headers);
+
+      expect(url.pathname).toBe('/api/v1/auth/profile-stats');
+      expect(headers.get('cookie')).toBe('memexpert_access_token=guest');
+
+      return jsonResponse({
+        viewed: 12,
+        sent: 3,
+        saved: 4,
+        downloaded: 2,
+        days_active: 5,
+        top_tags: [{ tag: 'frog', count: 7 }],
+        top_templates: [
+          {
+            template_id: '44444444-4444-4444-8444-444444444444',
+            slug: 'frog-template',
+            name: 'Frog Template',
+            count: 5
+          }
+        ],
+        metadata: { notes: ['Top tags require analytics events with payload.refs.meme_id and tagged meme rows.'] }
+      });
+    }) satisfies ApiFetch;
+
+    const stats = await fetchProfileStats({
+      fetch: mockFetch,
+      baseUrl: 'https://api.memexpert.test',
+      cookieHeader: 'memexpert_access_token=guest'
+    });
+
+    expect(stats.viewed).toBe(12);
+    expect(stats.top_tags[0]).toEqual({ tag: 'frog', count: 7 });
+    expect(stats.top_templates[0]?.slug).toBe('frog-template');
     expect(mockFetch).toHaveBeenCalledOnce();
   });
 
