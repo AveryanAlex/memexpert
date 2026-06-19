@@ -24,6 +24,10 @@ from memexpert.schemas.admin import (
     AdminMemeMergeRequest,
     AdminMemeModerationUpdateRequest,
     AdminMemeRead,
+    AdminMemeSeoEditRequest,
+    AdminMemeSeoPageRead,
+    AdminMemeSeoRegenerateRequest,
+    AdminMemeSeoReviewRowRead,
     AdminMemeTemplateActionRead,
     AdminMemeTemplateCreateRequest,
     AdminMemeTemplateDeleteRequest,
@@ -35,6 +39,7 @@ from memexpert.schemas.admin import (
     AdminModerationReportResolveRequest,
     AdminSessionRead,
     AdminSourceChannelCreateRequest,
+    AdminSourceChannelMarkDeadRequest,
     AdminSourceChannelRead,
 )
 from memexpert.schemas.user import ChannelSuggestionRead
@@ -181,9 +186,10 @@ async def mark_source_channel_dead(
     _admin: AdminUserDep,
     admin_service: AdminServiceDep,
     channel_id: Annotated[uuid.UUID, Path()],
+    request: Annotated[AdminSourceChannelMarkDeadRequest, Body()],
 ) -> AdminSourceChannelRead:
     try:
-        return await admin_service.mark_source_channel_dead(channel_id)
+        return await admin_service.mark_source_channel_dead(channel_id, request)
     except (AdminNotFoundError, AdminConflictError) as exc:
         raise _map_admin_error(exc) from exc
 
@@ -383,6 +389,16 @@ async def list_moderation_memes(
     )
 
 
+@router.get("/seo-pages", response_model=list[AdminMemeSeoReviewRowRead], summary="List SEO review rows")
+async def list_seo_review_rows(
+    _admin: AdminUserDep,
+    admin_service: AdminServiceDep,
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> list[AdminMemeSeoReviewRowRead]:
+    return await admin_service.list_seo_review_rows(limit=limit, offset=offset)
+
+
 @router.get("/memes/{meme_id}", response_model=AdminMemeDetailRead, summary="Read admin meme detail")
 async def get_admin_meme_detail(
     _admin: AdminUserDep,
@@ -391,6 +407,40 @@ async def get_admin_meme_detail(
 ) -> AdminMemeDetailRead:
     try:
         return await admin_service.get_meme_detail(meme_id)
+    except (AdminNotFoundError, AdminConflictError) as exc:
+        raise _map_admin_error(exc) from exc
+
+
+@router.patch(
+    "/memes/{meme_id}/seo-page",
+    response_model=AdminMemeSeoPageRead,
+    summary="Manually edit or create a meme SEO page",
+)
+async def edit_admin_meme_seo_page(
+    _admin: AdminUserDep,
+    admin_service: AdminServiceDep,
+    meme_id: Annotated[uuid.UUID, Path()],
+    request: Annotated[AdminMemeSeoEditRequest, Body()],
+) -> AdminMemeSeoPageRead:
+    try:
+        return await admin_service.edit_meme_seo_page(meme_id, request)
+    except (AdminNotFoundError, AdminConflictError) as exc:
+        raise _map_admin_error(exc) from exc
+
+
+@router.post(
+    "/memes/{meme_id}/seo-page/regenerate",
+    response_model=AdminMemeSeoPageRead,
+    summary="Regenerate a meme SEO page with exact confirmation",
+)
+async def regenerate_admin_meme_seo_page(
+    _admin: AdminUserDep,
+    admin_service: AdminServiceDep,
+    meme_id: Annotated[uuid.UUID, Path()],
+    request: Annotated[AdminMemeSeoRegenerateRequest, Body()],
+) -> AdminMemeSeoPageRead:
+    try:
+        return await admin_service.regenerate_meme_seo_page(meme_id, request)
     except (AdminNotFoundError, AdminConflictError) as exc:
         raise _map_admin_error(exc) from exc
 

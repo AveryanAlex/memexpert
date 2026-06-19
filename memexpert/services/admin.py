@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import case, delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
@@ -45,6 +45,10 @@ from memexpert.schemas.admin import (
     AdminMemeMergeRequest,
     AdminMemeModerationUpdateRequest,
     AdminMemeRead,
+    AdminMemeSeoEditRequest,
+    AdminMemeSeoPageRead,
+    AdminMemeSeoRegenerateRequest,
+    AdminMemeSeoReviewRowRead,
     AdminMemeTemplateActionRead,
     AdminMemeTemplateCreateRequest,
     AdminMemeTemplateDeleteRequest,
@@ -55,10 +59,13 @@ from memexpert.schemas.admin import (
     AdminModerationReportRead,
     AdminModerationReportResolveRequest,
     AdminSourceChannelCreateRequest,
+    AdminSourceChannelMarkDeadRequest,
     AdminSourceChannelRead,
 )
 from memexpert.schemas.user import ChannelSuggestionRead
 from memexpert.services.content_merge import ContentMergeService
+from memexpert.services.engagement_read_model import load_derived_popularity_scores
+from memexpert.services.meme_seo import MemeSeoGenerationService
 
 if TYPE_CHECKING:
     import uuid
@@ -72,6 +79,8 @@ if TYPE_CHECKING:
 
 
 MAX_AUDIT_SNAPSHOT_IDS = 25
+ADMIN_MANUAL_SEO_PROVENANCE = "admin-manual"
+MAX_SEO_TAG_LENGTH = 64
 
 
 class AdminServiceError(Exception):
@@ -162,10 +171,16 @@ class AdminService:
             await self.session.refresh(channel)
         return self._source_channel_read(channel)
 
-    async def mark_source_channel_dead(self, channel_id: uuid.UUID) -> AdminSourceChannelRead:
+    async def mark_source_channel_dead(
+        self,
+        channel_id: uuid.UUID,
+        request: AdminSourceChannelMarkDeadRequest,
+    ) -> AdminSourceChannelRead:
         channel = await self.session.get(SourceChannel, channel_id)
         if channel is None:
             raise AdminNotFoundError(f"Source channel {channel_id} does not exist.")
+        if request.confirmation != str(channel_id):
+            raise AdminConflictError("Source channel mark-dead confirmation must exactly match the channel id.")
         if not channel.is_active:
             raise AdminConflictError(f"Source channel {channel_id} is already marked dead.")
 
@@ -373,6 +388,136 @@ class AdminService:
         await self.session.refresh(blocked_hash)
         return AdminBlockedPerceptualHashRead.model_validate(blocked_hash)
 
+    async def list_seo_review_rows(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[AdminMemeSeoReviewRowRead]:
+        missing_first = case((MemeSeoPage.meme_id.is_(None), 0), else_=1)
+        newest_activity = func.coalesce(MemeSeoPage.edited_at, MemeSeoPage.generated_at, Meme.created_at)
+        stmt = (
+            select(Meme)
+            .outerjoin(MemeSeoPage, MemeSeoPage.meme_id == Meme.id)
+            .options(selectinload(Meme.seo_page))
+            .where(Meme.is_public.is_(True), Meme.is_nsfw.is_(False))
+            .order_by(missing_first.asc(), newest_activity.desc(), Meme.created_at.desc(), Meme.id.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        memes = (await self.session.execute(stmt)).scalars().all()
+        await self._attach_admin_popularity_scores(memes)
+        return [
+            AdminMemeSeoReviewRowRead(
+                meme=AdminMemeRead.model_validate(meme),
+                seo_page=self._seo_page_read(meme.seo_page),
+                status=self._seo_review_status(meme.seo_page),
+            )
+            for meme in memes
+        ]
+
+    async def edit_meme_seo_page(
+        self,
+        meme_id: uuid.UUID,
+        request: AdminMemeSeoEditRequest,
+    ) -> AdminMemeSeoPageRead:
+        meme = await self.session.scalar(
+            select(Meme)
+            .where(Meme.id == meme_id)
+            .options(selectinload(Meme.seo_page))
+            .with_for_update(),
+        )
+        if meme is None:
+            raise AdminNotFoundError(f"Meme {meme_id} does not exist.")
+
+        now = utcnow()
+        seo_page = meme.seo_page
+        if seo_page is None:
+            missing_fields = [
+                field_name
+                for field_name in ("slug", "page_title", "meta_description", "alt_text")
+                if getattr(request, field_name) is None
+            ]
+            if missing_fields:
+                raise AdminConflictError(
+                    "Creating an SEO page requires slug, page_title, meta_description, and alt_text.",
+                )
+            seo_page = MemeSeoPage(
+                meme_id=meme.id,
+                slug=request.slug or "",
+                page_title=request.page_title or "",
+                meta_description=request.meta_description or "",
+                alt_text=request.alt_text or "",
+                caption=request.caption,
+                body_text=request.body_text,
+                tags=self._clean_seo_tags(request.tags or []),
+                model_id=ADMIN_MANUAL_SEO_PROVENANCE,
+                prompt_version=ADMIN_MANUAL_SEO_PROVENANCE,
+                generated_at=now,
+                edited_at=now,
+            )
+            meme.seo_page = seo_page
+            self.session.add(seo_page)
+        else:
+            if "slug" in request.model_fields_set and request.slug is not None:
+                seo_page.slug = request.slug
+            if "page_title" in request.model_fields_set and request.page_title is not None:
+                seo_page.page_title = request.page_title
+            if "meta_description" in request.model_fields_set and request.meta_description is not None:
+                seo_page.meta_description = request.meta_description
+            if "alt_text" in request.model_fields_set and request.alt_text is not None:
+                seo_page.alt_text = request.alt_text
+            if "caption" in request.model_fields_set:
+                seo_page.caption = request.caption
+            if "body_text" in request.model_fields_set:
+                seo_page.body_text = request.body_text
+            if "tags" in request.model_fields_set:
+                seo_page.tags = self._clean_seo_tags(request.tags or [])
+            seo_page.edited_at = now
+
+        if "tags" in request.model_fields_set:
+            meme.tags = self._clean_seo_tags(request.tags or [])
+
+        try:
+            await self.session.commit()
+        except IntegrityError as exc:
+            await self.session.rollback()
+            raise AdminConflictError("SEO page slug already exists.") from exc
+        await self.session.refresh(seo_page)
+        return AdminMemeSeoPageRead.model_validate(seo_page)
+
+    async def regenerate_meme_seo_page(
+        self,
+        meme_id: uuid.UUID,
+        request: AdminMemeSeoRegenerateRequest,
+    ) -> AdminMemeSeoPageRead:
+        if request.confirmation != str(meme_id):
+            raise AdminConflictError("SEO regeneration confirmation must exactly match the meme id.")
+
+        generation_service = MemeSeoGenerationService(self.session)
+        try:
+            result = await generation_service.generate_for_meme_id(meme_id, force=True, commit=False)
+        except IntegrityError as exc:
+            await self.session.rollback()
+            raise AdminConflictError("SEO page slug already exists.") from exc
+
+        if result.status == "not_found":
+            await self.session.rollback()
+            raise AdminNotFoundError(f"Meme {meme_id} does not exist.")
+        if result.status != "generated":
+            await self.session.rollback()
+            reason = f": {result.reason}" if result.reason else ""
+            raise AdminConflictError(f"SEO regeneration {result.status}{reason}.")
+
+        seo_page = await self.session.get(MemeSeoPage, meme_id)
+        if seo_page is None:
+            await self.session.rollback()
+            raise AdminConflictError("SEO regeneration did not create an SEO page.")
+        seo_page.edited_at = None
+        await self.session.commit()
+        await self.session.refresh(seo_page)
+        return AdminMemeSeoPageRead.model_validate(seo_page)
+
     async def update_blocked_perceptual_hash(
         self,
         blocked_hash_id: uuid.UUID,
@@ -526,6 +671,7 @@ class AdminService:
         if is_public is not None:
             stmt = stmt.where(Meme.is_public.is_(is_public))
         rows = (await self.session.execute(stmt)).scalars().all()
+        await self._attach_admin_popularity_scores(rows)
         return [AdminMemeRead.model_validate(row) for row in rows]
 
     async def get_meme_detail(self, meme_id: uuid.UUID) -> AdminMemeDetailRead:
@@ -549,6 +695,7 @@ class AdminService:
                 .limit(100),
             )
         ).scalars().all()
+        await self._attach_admin_popularity_scores([meme])
 
         return AdminMemeDetailRead(
             meme=AdminMemeRead.model_validate(meme),
@@ -709,6 +856,7 @@ class AdminService:
             )
         await self.session.commit()
         await self.session.refresh(meme)
+        await self._attach_admin_popularity_scores([meme])
         return AdminMemeRead.model_validate(meme)
 
     async def list_moderation_reports(
@@ -734,6 +882,7 @@ class AdminService:
         else:
             stmt = stmt.where(ModerationReport.status == report_status)
         rows = (await self.session.execute(stmt)).scalars().all()
+        await self._attach_admin_popularity_scores([row.meme for row in rows])
         return [AdminModerationReportRead.model_validate(row) for row in rows]
 
     async def resolve_moderation_report(
@@ -792,6 +941,7 @@ class AdminService:
         )
         if refreshed is None:
             raise AdminNotFoundError(f"Moderation report {report_id} does not exist.")
+        await self._attach_admin_popularity_scores([refreshed.meme])
         return AdminModerationReportRead.model_validate(refreshed)
 
     async def list_moderation_decisions(
@@ -876,6 +1026,15 @@ class AdminService:
             **file_bound_counts,
         }
 
+    async def _attach_admin_popularity_scores(self, memes: Iterable[Meme]) -> None:
+        meme_list = list(memes)
+        scores = await load_derived_popularity_scores(
+            self.session,
+            tuple(dict.fromkeys(meme.id for meme in meme_list)),
+        )
+        for meme in meme_list:
+            meme.popularity_score = scores.get(meme.id, 0.0)
+
     async def _count_blocked_hash_matches(self, blocked_hash_id: uuid.UUID) -> int:
         return await self.session.scalar(
             select(func.count()).select_from(MemeFile).where(MemeFile.blocked_perceptual_hash_id == blocked_hash_id),
@@ -917,6 +1076,29 @@ class AdminService:
                 None if blocked_hash.created_by_admin_user_id is None else str(blocked_hash.created_by_admin_user_id)
             ),
         }
+
+    @staticmethod
+    def _seo_page_read(seo_page: MemeSeoPage | None) -> AdminMemeSeoPageRead | None:
+        if seo_page is None:
+            return None
+        return AdminMemeSeoPageRead.model_validate(seo_page)
+
+    @staticmethod
+    def _seo_review_status(seo_page: MemeSeoPage | None) -> Literal["missing", "generated", "edited"]:
+        if seo_page is None:
+            return "missing"
+        return "edited" if seo_page.edited_at is not None else "generated"
+
+    @staticmethod
+    def _clean_seo_tags(tags: Iterable[str]) -> list[str]:
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for tag in tags:
+            normalized = "-".join(tag.strip().lower().split())[:MAX_SEO_TAG_LENGTH]
+            if normalized and normalized not in seen:
+                cleaned.append(normalized)
+                seen.add(normalized)
+        return cleaned
 
     async def _snapshot_file_bound_counts(
         self,
