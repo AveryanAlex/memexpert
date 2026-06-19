@@ -103,7 +103,28 @@ const server = createServer((request, response) => {
   }
 
   if (url.pathname === '/api/v1/auth/session') {
+    if ((request.headers.cookie ?? '').includes('memexpert_access_token=miniapp-full')) {
+      sendJson(response, 200, sessionPayload('full'));
+      return;
+    }
+
     sendJson(response, 401, { detail: 'Smoke test runs as a guest browser.' });
+    return;
+  }
+
+  if (url.pathname === '/api/v1/auth/telegram-miniapp') {
+    readRequestJson(request).then((body) => {
+      if (!body || typeof body.initData !== 'string' || !body.initData.includes('smoke-miniapp-init-data')) {
+        sendJson(response, 401, { detail: 'Invalid smoke Telegram initData.' });
+        return;
+      }
+
+      sendJson(response, 200, sessionPayload('full'), {
+        'set-cookie': 'memexpert_access_token=miniapp-full; Path=/; HttpOnly; SameSite=Lax'
+      });
+    }).catch(() => {
+      sendJson(response, 400, { detail: 'Invalid JSON body.' });
+    });
     return;
   }
 
@@ -154,12 +175,60 @@ server.listen(port, '127.0.0.1', () => {
   process.stdout.write(`Smoke API listening on http://127.0.0.1:${port}\n`);
 });
 
-function sendJson(response, status, payload) {
+function sendJson(response, status, payload, headers = {}) {
   response.writeHead(status, {
     'content-type': 'application/json',
-    'cache-control': 'no-store'
+    'cache-control': 'no-store',
+    ...headers
   });
   response.end(JSON.stringify(payload));
+}
+
+function readRequestJson(request) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    request.setEncoding('utf8');
+    request.on('data', (chunk) => {
+      body += chunk;
+    });
+    request.on('end', () => {
+      try {
+        resolve(body ? JSON.parse(body) : null);
+      } catch (error) {
+        reject(error);
+      }
+    });
+    request.on('error', reject);
+  });
+}
+
+function sessionPayload(accountType) {
+  return {
+    user: {
+      id: accountType === 'full' ? 'smoke-full-user' : 'smoke-guest-user',
+      account_type: accountType,
+      telegram_id: accountType === 'full' ? 303030303 : null,
+      google_id: null,
+      email: null,
+      email_verified_at: null,
+      language: 'any',
+      nsfw_enabled: false,
+      token_nonce: 0,
+      status: 'active',
+      guest_expires_at: accountType === 'guest' ? '2026-07-12T00:00:00Z' : null,
+      active_save_collection_id: null,
+      is_admin: false,
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z'
+    },
+    linked_providers: {
+      email: null,
+      email_verified_at: null,
+      has_password: false,
+      google_linked: false,
+      telegram_linked: accountType === 'full'
+    }
+  };
 }
 
 function svgImage() {

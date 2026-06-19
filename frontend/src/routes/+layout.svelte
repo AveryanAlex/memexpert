@@ -1,6 +1,7 @@
 <script lang="ts">
   import '../app.css';
   import { accountBenefitText, accountStatusLabel, connectedProviderLabels } from '$lib/account/view-model';
+  import TelegramMiniAppBootstrap from '$lib/TelegramMiniAppBootstrap.svelte';
   import { ActionLink, Badge, PageShell } from '$lib/ui';
   import TooltipProvider from '$lib/ui/tooltip/Provider.svelte';
   import { provideViewerCapabilities, viewerCapabilitiesFromSession } from '$lib/viewer-capabilities';
@@ -17,8 +18,10 @@
   );
 </script>
 
+<TelegramMiniAppBootstrap />
+
 <TooltipProvider delayDuration={500}>
-  <PageShell>
+  <PageShell class="telegram-miniapp-shell">
     <header class="mb-9 flex flex-col items-start justify-between gap-4 md:flex-row md:items-center">
       <div class="flex flex-wrap items-center gap-3">
         <a class="text-[clamp(1.6rem,5vw,2.45rem)] font-black tracking-[-0.05em] no-underline" href="/">MemeXpert</a>
