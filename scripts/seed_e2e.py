@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import math
 import sys
 import time
 import uuid
@@ -52,6 +53,7 @@ from memexpert.models.content import (
 )
 from memexpert.models.enums import (
     AccountStatus,
+    AnalyticsEventType,
     CollectionInviteChannel,
     CollectionInviteStatus,
     CollectionKind,
@@ -72,7 +74,7 @@ from memexpert.models.enums import (
     SyncTargetKind,
     SyncTargetStatus,
 )
-from memexpert.models.user import User
+from memexpert.models.user import AnalyticsEvent, User
 from memexpert.schemas.content_pipeline import (
     ContentPipelineErrorResponse,
     ContentPipelineItemDetail,
@@ -154,7 +156,6 @@ class PublicTrendSnapshotSpec:
     platform_sends: int
     platform_saves: int
     platform_likes: int
-    popularity_score: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,7 +210,6 @@ PUBLIC_TREND_SNAPSHOT_SPECS_BY_CATEGORY: Final[dict[str, tuple[PublicTrendSnapsh
             platform_sends=3,
             platform_saves=5,
             platform_likes=7,
-            popularity_score=40.0,
         ),
         PublicTrendSnapshotSpec(
             captured_at=datetime(2026, 1, 12, 12, 0, tzinfo=UTC),
@@ -220,7 +220,6 @@ PUBLIC_TREND_SNAPSHOT_SPECS_BY_CATEGORY: Final[dict[str, tuple[PublicTrendSnapsh
             platform_sends=5,
             platform_saves=8,
             platform_likes=12,
-            popularity_score=80.5,
         ),
     ),
     "dog": (
@@ -233,7 +232,6 @@ PUBLIC_TREND_SNAPSHOT_SPECS_BY_CATEGORY: Final[dict[str, tuple[PublicTrendSnapsh
             platform_sends=2,
             platform_saves=4,
             platform_likes=6,
-            popularity_score=30.0,
         ),
         PublicTrendSnapshotSpec(
             captured_at=datetime(2026, 1, 12, 12, 0, tzinfo=UTC),
@@ -244,7 +242,6 @@ PUBLIC_TREND_SNAPSHOT_SPECS_BY_CATEGORY: Final[dict[str, tuple[PublicTrendSnapsh
             platform_sends=4,
             platform_saves=6,
             platform_likes=9,
-            popularity_score=55.5,
         ),
     ),
     "frog": (
@@ -257,7 +254,6 @@ PUBLIC_TREND_SNAPSHOT_SPECS_BY_CATEGORY: Final[dict[str, tuple[PublicTrendSnapsh
             platform_sends=1,
             platform_saves=3,
             platform_likes=5,
-            popularity_score=20.0,
         ),
         PublicTrendSnapshotSpec(
             captured_at=datetime(2026, 1, 12, 12, 0, tzinfo=UTC),
@@ -268,7 +264,6 @@ PUBLIC_TREND_SNAPSHOT_SPECS_BY_CATEGORY: Final[dict[str, tuple[PublicTrendSnapsh
             platform_sends=3,
             platform_saves=5,
             platform_likes=8,
-            popularity_score=45.5,
         ),
     ),
 }
@@ -633,6 +628,27 @@ async def ensure_qdrant_collection(*, settings: Settings) -> None:
         await client.close()
 
 
+def build_seed_meme(
+    *,
+    spec: SeedSpec,
+    meme_id: uuid.UUID,
+    meme_file_id: uuid.UUID,
+    public_trends_template_id: uuid.UUID,
+) -> Meme:
+    return Meme(
+        id=meme_id,
+        media_type=spec.media_type,
+        primary_file_id=meme_file_id,
+        ocr_text=spec.ocr_text,
+        language=spec.language,
+        is_nsfw=spec.is_nsfw,
+        is_public=True,
+        like_count=_public_trend_like_count(spec.category),
+        tags=list(spec.tags),
+        template_id=public_trends_template_id if _seed_spec_has_public_trends(spec) else None,
+    )
+
+
 async def seed_direct_corpus(
     *,
     settings: Settings,
@@ -665,17 +681,11 @@ async def seed_direct_corpus(
             now = utcnow()
             meme_id = _stable_uuid(f"{spec.category}:meme")
             meme_file_id = _stable_uuid(f"{spec.category}:file")
-            meme = Meme(
-                id=meme_id,
-                media_type=spec.media_type,
-                primary_file_id=meme_file_id,
-                ocr_text=spec.ocr_text,
-                language=spec.language,
-                is_nsfw=spec.is_nsfw,
-                is_public=True,
-                popularity_score=_latest_public_trend_popularity_score(spec.category) or 10.0,
-                tags=list(spec.tags),
-                template_id=public_trends_template.id if _seed_spec_has_public_trends(spec) else None,
+            meme = build_seed_meme(
+                spec=spec,
+                meme_id=meme_id,
+                meme_file_id=meme_file_id,
+                public_trends_template_id=public_trends_template.id,
             )
             session.add(meme)
             await session.flush()
@@ -736,6 +746,7 @@ async def seed_direct_corpus(
                         generated_at=now,
                     ),
                     *build_public_trend_snapshot_rows(meme_source_id=source_id, category=spec.category),
+                    *build_public_trend_analytics_event_rows(meme_id=meme_id, category=spec.category),
                     *_build_succeeded_stage_rows(
                         meme_file_id=meme_file_id,
                         event_id=_stable_uuid(f"{spec.category}:event"),
@@ -1103,6 +1114,35 @@ def build_public_trend_snapshot_rows(
     return rows
 
 
+def build_public_trend_analytics_event_rows(*, meme_id: uuid.UUID, category: str) -> list[AnalyticsEvent]:
+    rows: list[AnalyticsEvent] = []
+    specs = PUBLIC_TREND_SNAPSHOT_SPECS_BY_CATEGORY.get(category, ())
+    for snapshot_index, spec in enumerate(specs, start=1):
+        for metric, event_type, count in _public_trend_platform_events(spec):
+            for event_index in range(1, count + 1):
+                rows.append(
+                    AnalyticsEvent(
+                        id=_public_trend_analytics_event_id(
+                            category=category,
+                            snapshot_index=snapshot_index,
+                            metric=metric,
+                            event_index=event_index,
+                        ),
+                        user_id=None,
+                        event_type=event_type,
+                        payload={
+                            "meme_id": str(meme_id),
+                            "seed": "e2e-prd-public-trends",
+                            "category": category,
+                            "metric": metric,
+                            "snapshot_index": snapshot_index,
+                        },
+                        occurred_at=spec.captured_at,
+                    )
+                )
+    return rows
+
+
 def build_public_trends_artifact(seeded: list[SeededMeme]) -> dict[str, object]:
     representative = _require_seeded_category(seeded, "cat")
     compare_items = [
@@ -1177,7 +1217,7 @@ def build_public_trend_aggregate_history_points_payload() -> list[dict[str, str 
             totals["platform_sends"] += spec.platform_sends
             totals["platform_saves"] += spec.platform_saves
             totals["platform_likes"] += spec.platform_likes
-            totals["value"] += spec.popularity_score
+            totals["value"] += _public_trend_snapshot_popularity_score(spec)
 
     return [
         {
@@ -1203,11 +1243,61 @@ def _seed_spec_has_public_trends(spec: SeedSpec) -> bool:
     return not spec.is_nsfw and spec.category in PUBLIC_TREND_SNAPSHOT_SPECS_BY_CATEGORY
 
 
-def _latest_public_trend_popularity_score(category: str) -> float | None:
+def _public_trend_like_count(category: str) -> int:
     specs = PUBLIC_TREND_SNAPSHOT_SPECS_BY_CATEGORY.get(category)
     if not specs:
-        return None
-    return max(specs, key=lambda spec: spec.captured_at).popularity_score
+        return 0
+    return sum(spec.platform_likes for spec in specs)
+
+
+def _public_trend_analytics_event_ids(category: str) -> list[uuid.UUID]:
+    event_ids: list[uuid.UUID] = []
+    specs = PUBLIC_TREND_SNAPSHOT_SPECS_BY_CATEGORY.get(category, ())
+    for snapshot_index, spec in enumerate(specs, start=1):
+        for metric, _, count in _public_trend_platform_events(spec):
+            event_ids.extend(
+                _public_trend_analytics_event_id(
+                    category=category,
+                    snapshot_index=snapshot_index,
+                    metric=metric,
+                    event_index=event_index,
+                )
+                for event_index in range(1, count + 1)
+            )
+    return event_ids
+
+
+def _public_trend_analytics_event_id(
+    *,
+    category: str,
+    snapshot_index: int,
+    metric: str,
+    event_index: int,
+) -> uuid.UUID:
+    return _stable_uuid(f"{category}:public-trend-event:{snapshot_index}:{metric}:{event_index}")
+
+
+def _public_trend_platform_events(
+    spec: PublicTrendSnapshotSpec,
+) -> tuple[tuple[str, AnalyticsEventType, int], ...]:
+    return (
+        ("platform_views", AnalyticsEventType.MEME_VIEW, spec.platform_views),
+        ("platform_sends", AnalyticsEventType.MEME_SEND, spec.platform_sends),
+        ("platform_saves", AnalyticsEventType.MEME_SAVE, spec.platform_saves),
+        ("platform_likes", AnalyticsEventType.MEME_LIKE, spec.platform_likes),
+    )
+
+
+def _public_trend_snapshot_popularity_score(spec: PublicTrendSnapshotSpec) -> float:
+    return (
+        math.log1p(max(spec.source_views, 0)) * 1.0
+        + math.log1p(max(spec.source_reactions, 0)) * 2.0
+        + math.log1p(max(spec.source_reposts, 0)) * 3.0
+        + math.log1p(max(spec.platform_views, 0)) * 1.0
+        + math.log1p(max(spec.platform_sends, 0)) * 3.0
+        + math.log1p(max(spec.platform_saves, 0)) * 4.0
+        + math.log1p(max(spec.platform_likes, 0)) * 5.0
+    )
 
 
 def _public_trend_observed_at(spec: PublicTrendSnapshotSpec) -> datetime:
@@ -1289,6 +1379,14 @@ async def cleanup_e2e_rows(*, settings: Settings, specs: list[SeedSpec]) -> None
 
 async def cleanup_seed_rows(session: AsyncSession, *, settings: Settings, specs: list[SeedSpec]) -> None:
     await cleanup_collection_management_fixture_rows(session)
+
+    analytics_event_ids = [
+        event_id
+        for spec in specs
+        for event_id in _public_trend_analytics_event_ids(spec.category)
+    ]
+    if analytics_event_ids:
+        await session.execute(delete(AnalyticsEvent).where(AnalyticsEvent.id.in_(analytics_event_ids)))
 
     source_result = await session.execute(
         select(MemeSource).where(MemeSource.source_id.in_([E2E_SOURCE_ID, E2E_UPLOAD_SOURCE_ID])),
@@ -1821,7 +1919,8 @@ def _assert_expected_public_trend_points(points: list[Any], *, label: str) -> No
         if point is None:
             raise E2ESeedError(f"Public trend {label} missing expected point day {observed_day}: {points}")
         for key in ("value", "meme_count", "snapshot_count", "source_views", "platform_views", "platform_likes"):
-            if point.get(key) != expected[key]:
+            actual_value = round(float(point.get(key) or 0.0), 1) if key == "value" else point.get(key)
+            if actual_value != expected[key]:
                 raise E2ESeedError(
                     f"Public trend {label} point {observed_day} returned {key}={point.get(key)!r}, "
                     f"expected {expected[key]!r}; point={point}",
