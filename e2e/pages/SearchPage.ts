@@ -1,6 +1,8 @@
-import { expect, type Page } from '@playwright/test';
-import { expectedAttributionFromHref, type ExpectedMemeAttribution } from '../helpers/attribution';
+import { expect, type Page, type Request } from '@playwright/test';
+import { expectRequestAttribution, expectedAttributionFromHref, type ExpectedMemeAttribution } from '../helpers/attribution';
 import type { SeededMeme } from '../helpers/seed';
+
+type SearchResultTelemetryAction = 'detail-click' | 'impression';
 
 export class SearchPage {
   constructor(private page: Page) {}
@@ -96,10 +98,37 @@ export class SearchPage {
     await this.page.getByRole('link', { name: `Open ${meme.title}` }).first().click();
   }
 
+  async scrollResultIntoView(meme: SeededMeme | { title: string }) {
+    await this.page.getByRole('link', { name: `Open ${meme.title}` }).first().scrollIntoViewIfNeeded();
+  }
+
+  waitForResultImpressionPost(meme: SeededMeme): Promise<Request> {
+    return this.waitForResultTelemetryPost(meme, 'impression');
+  }
+
+  waitForResultDetailClickPost(meme: SeededMeme): Promise<Request> {
+    return this.waitForResultTelemetryPost(meme, 'detail-click');
+  }
+
+  async expectResultImpressionAttribution(request: Promise<Request>, expected: ExpectedMemeAttribution) {
+    expectRequestAttribution(await request, expected, 'search result impression');
+  }
+
+  async expectResultDetailClickAttribution(request: Promise<Request>, expected: ExpectedMemeAttribution) {
+    expectRequestAttribution(await request, expected, 'search result detail-click');
+  }
+
   async attributionForResult(meme: SeededMeme | { title: string }): Promise<ExpectedMemeAttribution> {
     const link = this.page.getByRole('link', { name: `Open ${meme.title}` }).first();
     const href = await link.getAttribute('href');
     if (!href) throw new Error(`Search result for ${meme.title} did not include a detail href.`);
     return expectedAttributionFromHref(href, this.page.url());
+  }
+
+  private waitForResultTelemetryPost(meme: SeededMeme, action: SearchResultTelemetryAction): Promise<Request> {
+    return this.page.waitForRequest((request) => {
+      const url = new URL(request.url());
+      return request.method() === 'POST' && url.pathname === `/api/v1/memes/${meme.meme_id}/${action}`;
+    });
   }
 }

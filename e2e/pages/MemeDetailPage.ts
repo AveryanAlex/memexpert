@@ -1,5 +1,5 @@
-import { expect, type Page, type Request } from '@playwright/test';
-import type { ExpectedMemeAttribution } from '../helpers/attribution';
+import { expect, type Page } from '@playwright/test';
+import { expectRequestAttribution, type ExpectedMemeAttribution } from '../helpers/attribution';
 import type { SeededMeme } from '../helpers/seed';
 
 export class MemeDetailPage {
@@ -20,8 +20,8 @@ export class MemeDetailPage {
         url.searchParams.get('attribution_request_id') === attribution.requestId &&
         url.searchParams.get('attribution_impression_id') === attribution.impressionId &&
         url.searchParams.get('attribution_source_algorithm') === attribution.sourceAlgorithm &&
-        (!attribution.surface || url.searchParams.get('attribution_surface') === attribution.surface) &&
-        (!attribution.rank || url.searchParams.get('attribution_rank') === attribution.rank)
+        url.searchParams.get('attribution_surface') === attribution.surface &&
+        url.searchParams.get('attribution_rank') === String(attribution.rank)
       );
     });
   }
@@ -46,7 +46,7 @@ export class MemeDetailPage {
   async likeAndExpectAttribution(meme: SeededMeme, attribution: ExpectedMemeAttribution) {
     const requestPromise = this.waitForActionPost(meme.meme_id, 'favorite');
     await this.page.getByRole('button', { name: /^Like \(/ }).click();
-    this.expectActionRequestAttribution(await requestPromise, attribution);
+    expectRequestAttribution(await requestPromise, attribution, 'favorite action');
 
     await expect(this.page.getByRole('button', { name: /^Unlike \(/ })).toBeVisible();
     await expect(this.page.getByRole('status')).toHaveText('Liked.');
@@ -55,7 +55,7 @@ export class MemeDetailPage {
   async saveAndExpectAttribution(meme: SeededMeme, attribution: ExpectedMemeAttribution) {
     const requestPromise = this.waitForActionPost(meme.meme_id, 'save');
     await this.page.getByRole('button', { name: 'Save', exact: true }).click();
-    this.expectActionRequestAttribution(await requestPromise, attribution);
+    expectRequestAttribution(await requestPromise, attribution, 'save action');
 
     await expect(this.page.getByRole('button', { name: 'Saved', exact: true })).toBeVisible();
     await expect(this.page.getByRole('status')).toHaveText('Saved to your active collection.');
@@ -66,7 +66,7 @@ export class MemeDetailPage {
 
     const requestPromise = this.waitForActionPost(meme.meme_id, 'download');
     await this.page.getByRole('button', { name: 'Download', exact: true }).click();
-    this.expectActionRequestAttribution(await requestPromise, attribution);
+    expectRequestAttribution(await requestPromise, attribution, 'download action');
 
     await expect(this.page.getByRole('status')).toHaveText('Download started.');
     const downloadHref = await this.lastDownloadHref();
@@ -78,7 +78,7 @@ export class MemeDetailPage {
 
     const requestPromise = this.waitForActionPost(meme.meme_id, 'share');
     await this.page.getByRole('button', { name: 'Share to Telegram' }).click();
-    this.expectActionRequestAttribution(await requestPromise, attribution);
+    expectRequestAttribution(await requestPromise, attribution, 'share action');
 
     await expect(this.page.getByRole('status')).toHaveText('Opened Telegram share.');
     const shareUrl = await this.lastOpenedUrl();
@@ -96,23 +96,6 @@ export class MemeDetailPage {
       const url = new URL(request.url());
       return request.method() === 'POST' && url.pathname === `/api/v1/memes/${memeId}/${action}`;
     });
-  }
-
-  private expectActionRequestAttribution(request: Request, expected: ExpectedMemeAttribution) {
-    const postData = request.postData();
-    if (!postData) throw new Error(`Expected ${request.url()} to include action attribution JSON.`);
-
-    const payload = JSON.parse(postData) as { attribution?: Record<string, unknown> };
-    const attribution = payload.attribution;
-    expect(attribution).toEqual(
-      expect.objectContaining({
-        request_id: expected.requestId,
-        impression_id: expected.impressionId,
-        source_algorithm: expected.sourceAlgorithm
-      })
-    );
-    if (expected.surface) expect(attribution?.surface).toBe(expected.surface);
-    if (expected.rank) expect(attribution?.rank).toBe(Number(expected.rank));
   }
 
   private async stubWindowOpen() {
