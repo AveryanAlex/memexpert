@@ -152,10 +152,34 @@ class FakeBroker:
     fail_routing_keys: set[str] = field(default_factory=set)
     publish_calls: list[dict[str, object]] = field(default_factory=list)
 
-    async def publish(self, payload: object, **kwargs: object) -> object:
-        self.publish_calls.append({"payload": payload, **kwargs})
-        routing_key = kwargs.get("routing_key")
-        if isinstance(routing_key, str) and routing_key in self.fail_routing_keys:
+    async def publish(
+        self,
+        message: object,
+        /,
+        queue: object = "",
+        exchange: object | None = None,
+        *,
+        routing_key: str = "",
+        mandatory: bool = True,
+        persist: bool = False,
+        content_type: str | None = None,
+        message_id: str | None = None,
+        timestamp: object | None = None,
+    ) -> object:
+        self.publish_calls.append(
+            {
+                "payload": message,
+                "queue": queue,
+                "exchange": exchange,
+                "routing_key": routing_key,
+                "mandatory": mandatory,
+                "persist": persist,
+                "content_type": content_type,
+                "message_id": message_id,
+                "timestamp": timestamp,
+            }
+        )
+        if routing_key in self.fail_routing_keys:
             raise RuntimeError(f"forced publish failure for {routing_key}")
         return None
 

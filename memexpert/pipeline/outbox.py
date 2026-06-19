@@ -35,7 +35,20 @@ if TYPE_CHECKING:
 class OutboxBrokerProtocol(Protocol):
     """Minimal async broker surface used by the transactional-outbox publisher."""
 
-    async def publish(self, payload: object, **kwargs: object) -> object: ...
+    async def publish(
+        self,
+        message: object,
+        /,
+        queue: str = "",
+        exchange: str | None = None,
+        *,
+        routing_key: str = "",
+        mandatory: bool = True,
+        persist: bool = False,
+        content_type: str | None = None,
+        message_id: str | None = None,
+        timestamp: datetime | None = None,
+    ) -> object: ...
 
 
 @dataclass(frozen=True, slots=True)
