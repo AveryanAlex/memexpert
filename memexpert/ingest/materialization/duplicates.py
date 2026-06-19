@@ -6,9 +6,14 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import select
 
+from memexpert.ingest.collection_targets import (
+    save_meme_to_target_collection,
+    visible_meme_clause,
+)
 from memexpert.ingest.materialization.sources import source_views
 from memexpert.ingest.source_metadata import source_forward_ids, source_published_at, source_reactions
-from memexpert.models.content import MemeFile, MemeSource, PipelineStageJournal
+from memexpert.ingest.target_collection_metadata import TargetCollectionMetadataError, parse_target_collection_id
+from memexpert.models.content import Meme, MemeFile, MemeSource, PipelineStageJournal
 from memexpert.models.enums import (
     ContentPipelineStage,
     ContentPipelineStageStatus,
@@ -16,6 +21,7 @@ from memexpert.models.enums import (
     IngestFileOrigin,
     SourceAttachReason,
 )
+from memexpert.services.errors import PipelinePayloadValidationError
 
 if TYPE_CHECKING:
     import uuid
@@ -27,16 +33,23 @@ if TYPE_CHECKING:
     from memexpert.models.content import PipelineIngestRequest
 
 
-async def find_exact_phash_match(session: AsyncSession, perceptual_hash: str) -> MemeFile | None:
+async def find_exact_phash_match(
+    session: AsyncSession,
+    perceptual_hash: str,
+    *,
+    owner_user_id: uuid.UUID | None,
+) -> MemeFile | None:
     """Find the earliest non-blocked file with the same perceptual hash."""
 
     result = await session.execute(
         select(MemeFile)
+        .join(Meme, Meme.id == MemeFile.meme_id)
         .where(
             MemeFile.perceptual_hash == perceptual_hash,
             MemeFile.blocked_perceptual_hash_id.is_(None),
+            visible_meme_clause(owner_user_id),
         )
-        .order_by(MemeFile.created_at.asc(), MemeFile.id.asc())
+        .order_by(Meme.is_public.desc(), MemeFile.created_at.asc(), MemeFile.id.asc())
         .limit(1)
     )
     return result.scalar_one_or_none()
@@ -111,4 +124,25 @@ async def create_phash_duplicate_rows(
     await session.flush()
 
 
-__all__ = ["create_phash_duplicate_rows", "find_exact_phash_match"]
+async def attach_target_collection_if_requested(
+    session: AsyncSession,
+    *,
+    ingest_request: PipelineIngestRequest,
+    meme_id: uuid.UUID,
+) -> None:
+    """Attach a materialized meme to the requested target collection, if any."""
+
+    try:
+        target_collection_id = parse_target_collection_id(ingest_request.user_metadata)
+    except TargetCollectionMetadataError as exc:
+        raise PipelinePayloadValidationError(str(exc)) from exc
+    await save_meme_to_target_collection(
+        session,
+        owner_user_id=ingest_request.owner_user_id,
+        target_collection_id=target_collection_id,
+        meme_id=meme_id,
+    )
+    await session.flush()
+
+
+__all__ = ["attach_target_collection_if_requested", "create_phash_duplicate_rows", "find_exact_phash_match"]

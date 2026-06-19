@@ -335,9 +335,9 @@ def test_initial_revision_metadata_is_present() -> None:
     revision = script_directory.get_revision("head")
 
     assert revision is not None
-    assert revision.revision == "0018"
-    assert revision.down_revision == "0017"
-    assert revision.doc == "pipeline ingest requests and outbox"
+    assert revision.revision == "0019"
+    assert revision.down_revision == "0018"
+    assert revision.doc == "allow owner-scoped private upload sha duplicates"
 
 
 async def test_upgrade_head_creates_expected_schema_and_constraints(
@@ -350,7 +350,7 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
 
     table_names = await _get_table_names(engine)
     assert table_names == EXPECTED_TABLES | {"alembic_version"}
-    assert await _get_current_revision(engine) == "0018"
+    assert await _get_current_revision(engine) == "0019"
     assert await _get_materialized_view_names(engine) == EXPECTED_MATERIALIZED_VIEWS
 
     users_indexes = await _get_index_definitions(engine, "users")
@@ -430,8 +430,9 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
         "updated_at",
         "width",
     }
-    assert "uq_meme_files_sha256_hex" in meme_files_indexes
-    assert "sha256_hex" in meme_files_indexes["uq_meme_files_sha256_hex"]
+    assert "uq_meme_files_sha256_hex" not in meme_files_indexes
+    assert "ix_meme_files_sha256_hex" in meme_files_indexes
+    assert "sha256_hex" in meme_files_indexes["ix_meme_files_sha256_hex"]
     assert "ix_meme_files_ingest_origin" in meme_files_indexes
     assert "ingest_origin" in meme_files_indexes["ix_meme_files_ingest_origin"]
     assert "ix_meme_files_matched_meme_file_id" in meme_files_indexes
@@ -839,7 +840,7 @@ async def test_crawler_sources_migration_applies_and_reverses(
     config = _build_alembic_config(database_url)
 
     await _run_alembic_command(command.upgrade, config, "head")
-    assert await _get_current_revision(engine) == "0018"
+    assert await _get_current_revision(engine) == "0019"
 
     meme_sources_columns = await _get_column_names(engine, "meme_sources")
     source_channels_columns = await _get_column_names(engine, "source_channels")
@@ -937,7 +938,7 @@ async def test_repeated_fresh_database_upgrades_work_after_a_full_downgrade(
     await _run_alembic_command(command.downgrade, config, "base")
     await _run_alembic_command(command.upgrade, config, "head")
 
-    assert await _get_current_revision(engine) == "0018"
+    assert await _get_current_revision(engine) == "0019"
     assert EXPECTED_TABLES.issubset(await _get_table_names(engine))
 
 

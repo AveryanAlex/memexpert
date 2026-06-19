@@ -32,6 +32,7 @@ from memexpert.core.voyage import VoyageEmbeddingResult
 from memexpert.ingest.accept_service import PipelineIngestAcceptService
 from memexpert.ingest.read_service import PipelineIngestReadService
 from memexpert.ingest.schemas import IngestAcceptOutcome, IngestAcceptResult, IngestAcceptSource, IngestRequestRead
+from memexpert.ingest.target_collection_metadata import TARGET_COLLECTION_ID_METADATA_KEY
 from memexpert.media.contracts import NormalizedMediaResult, UploadMediaDetails
 from memexpert.models.base import utcnow
 from memexpert.models.content import (
@@ -495,6 +496,8 @@ async def test_pipeline_routes_require_operator_token_and_accept_real_multipart_
     client: AsyncClient,
 ) -> None:
     ingest_request = build_ingest_request()
+    owner_user_id = uuid.uuid7()
+    target_collection_id = uuid.uuid7()
     stub_service = StubIngestAcceptService(
         result=IngestAcceptResult(
             ingest_request=ingest_request,
@@ -511,6 +514,8 @@ async def test_pipeline_routes_require_operator_token_and_accept_real_multipart_
                 "source_platform": "telegram",
                 "source_id": "channel-one",
                 "post_id": "101",
+                "owner_user_id": str(owner_user_id),
+                "target_collection_id": str(target_collection_id),
                 "views": "7",
             },
             files={"file": ("sample.png", build_png_bytes(), "image/png")},
@@ -533,6 +538,8 @@ async def test_pipeline_routes_require_operator_token_and_accept_real_multipart_
                 "source_platform": "telegram",
                 "source_id": "channel-one",
                 "post_id": "101",
+                "owner_user_id": str(owner_user_id),
+                "target_collection_id": str(target_collection_id),
                 "views": "7",
             },
             files={"file": ("sample.png", build_png_bytes(), "image/png")},
@@ -557,6 +564,8 @@ async def test_pipeline_routes_require_operator_token_and_accept_real_multipart_
         assert source.source_platform.value == "telegram"
         assert source.source_id == "channel-one"
         assert source.post_id == "101"
+        assert source.owner_user_id == owner_user_id
+        assert source.user_metadata[TARGET_COLLECTION_ID_METADATA_KEY] == str(target_collection_id)
         assert source.views == 7
         assert upload_call["filename"] == "sample.png"
         assert upload_call["content_type"] == "image/png"
@@ -747,12 +756,28 @@ async def test_pipeline_upload_route_rejects_missing_file_and_blank_provenance_b
             },
             files={"file": ("sample.png", build_png_bytes(), "image/png")},
         )
+        missing_owner_response = await client.post(
+            "/api/v1/pipeline/uploads",
+            headers={PIPELINE_OPERATOR_TOKEN_HEADER_NAME: operator_token},
+            data={
+                "source_platform": "telegram",
+                "source_id": "channel-one",
+                "post_id": "101",
+                "target_collection_id": str(uuid.uuid7()),
+            },
+            files={"file": ("sample.png", build_png_bytes(), "image/png")},
+        )
 
         assert missing_file_response.status_code == 422
         assert blank_provenance_response.status_code == 400
         assert blank_provenance_response.json() == {
             "code": "pipeline_payload_invalid",
             "detail": "Value error, source provenance fields must not be blank.",
+        }
+        assert missing_owner_response.status_code == 400
+        assert missing_owner_response.json() == {
+            "code": "pipeline_payload_invalid",
+            "detail": "owner_user_id is required when target_collection_id is provided.",
         }
         assert stub_service.calls == []
     finally:

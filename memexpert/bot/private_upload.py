@@ -18,6 +18,7 @@ from memexpert.core.config import Settings, get_settings
 from memexpert.core.database import get_async_session_factory
 from memexpert.ingest.accept_service import PipelineIngestAcceptService
 from memexpert.ingest.schemas import IngestAcceptOutcome, IngestAcceptResult, IngestAcceptSource
+from memexpert.ingest.target_collection_metadata import user_metadata_with_target_collection
 from memexpert.models.content import Meme, MemeFile, MemeSource
 from memexpert.models.enums import (
     AccountStatus,
@@ -206,12 +207,14 @@ async def handle_private_upload_message(
         if linked_user.active_save_collection_id is None:
             await message.answer(_missing_active_collection_message())
             return
+        target_collection_id = linked_user.active_save_collection_id
 
         source = _build_upload_source(
             message=message,
             media=media,
             telegram_user_id=telegram_user_id,
             owner_user_id=linked_user.id,
+            target_collection_id=target_collection_id,
         )
         try:
             accept_service = accept_service_factory(session)
@@ -610,6 +613,7 @@ def _build_upload_source(
     media: TelegramUploadMedia,
     telegram_user_id: int,
     owner_user_id: uuid.UUID,
+    target_collection_id: uuid.UUID,
 ) -> IngestAcceptSource:
     try:
         return IngestAcceptSource(
@@ -617,6 +621,7 @@ def _build_upload_source(
             source_id=f"telegram_pm:{telegram_user_id}:{message.chat.id}",
             post_id=f"message:{message.message_id}:file:{media.file_unique_id}",
             owner_user_id=owner_user_id,
+            user_metadata=user_metadata_with_target_collection(target_collection_id=target_collection_id),
             views=0,
         )
     except ValidationError as exc:  # pragma: no cover - defensive; constructed from Bot API bounded fields.

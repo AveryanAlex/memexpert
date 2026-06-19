@@ -25,6 +25,7 @@ from memexpert.api.dependencies.pipeline import (
     to_pipeline_http_error,
 )
 from memexpert.ingest.schemas import IngestAcceptOutcome, IngestAcceptSource, IngestRequestRead
+from memexpert.ingest.target_collection_metadata import user_metadata_with_target_collection
 from memexpert.models.enums import ContentPipelineStage, PipelineIngestRequestStatus, SourcePlatform, SyncTargetKind
 from memexpert.schemas.content_pipeline import (
     ContentPipelineItemDetail,
@@ -76,17 +77,25 @@ async def create_pipeline_upload(
     source_id: Annotated[str, Form(min_length=1)],
     post_id: Annotated[str, Form(min_length=1)],
     file: Annotated[UploadFile, File()],
+    owner_user_id: Annotated[uuid.UUID | None, Form()] = None,
+    target_collection_id: Annotated[uuid.UUID | None, Form()] = None,
     views: Annotated[int, Form(ge=0)] = 0,
 ) -> IngestRequestRead:
     """Accept raw bytes without synchronous media inspection or materialization."""
 
     try:
+        if target_collection_id is not None and owner_user_id is None:
+            raise PipelinePayloadValidationError("owner_user_id is required when target_collection_id is provided.")
         source = IngestAcceptSource(
             source_platform=source_platform,
             source_id=source_id,
             post_id=post_id,
+            owner_user_id=owner_user_id,
+            user_metadata=user_metadata_with_target_collection(target_collection_id=target_collection_id),
             views=views,
         )
+    except PipelinePayloadValidationError as exc:
+        raise to_pipeline_http_error(exc) from exc
     except ValidationError as exc:
         first_error = exc.errors()[0]
         detail = str(first_error.get("msg", "Uploaded provenance metadata is invalid."))
