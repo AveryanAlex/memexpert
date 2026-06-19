@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime, timedelta, timezone
+from typing import cast
 
 import pytest
 from pydantic import ValidationError
@@ -23,6 +24,20 @@ from memexpert.services.analytics import (
 from tests.factories import build_full_user
 
 pytestmark = pytest.mark.asyncio
+
+
+class FailingAnalyticsSession:
+    def __init__(self) -> None:
+        self.rollback_calls = 0
+
+    def add(self, _value: object) -> None:
+        return None
+
+    async def commit(self) -> None:
+        raise RuntimeError("analytics db unavailable secret")
+
+    async def rollback(self) -> None:
+        self.rollback_calls += 1
 
 
 async def _create_profile_stats_meme(
@@ -242,6 +257,48 @@ async def test_record_interaction_event_rejects_unsafe_payloads_before_insert(
 
     events = list((await migrated_db_session.execute(select(AnalyticsEvent))).scalars())
     assert events == []
+
+
+async def test_record_event_write_failure_logs_safe_payload_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failing_session = FailingAnalyticsSession()
+    service = AnalyticsService(cast("AsyncSession", failing_session))
+    user_id = uuid.uuid7()
+    exception_calls: list[tuple[str, bool | None, dict[str, object] | None]] = []
+
+    def fake_exception(
+        message: str,
+        *args: object,
+        exc_info: bool | None = True,
+        extra: dict[str, object] | None = None,
+        **kwargs: object,
+    ) -> None:
+        del args, kwargs
+        exception_calls.append((message, exc_info, extra))
+
+    monkeypatch.setattr("memexpert.services.analytics.logger.exception", fake_exception)
+
+    await service.record_event(
+        AnalyticsEventType.SEARCH_QUERY,
+        user_id=user_id,
+        payload={"safe_context": "raw-secret-value", "result_count": 3},
+    )
+
+    assert failing_session.rollback_calls == 1
+    assert len(exception_calls) == 1
+    message, exc_info, extra = exception_calls[0]
+    assert message == "analytics_event_write_failed"
+    assert exc_info is False
+    assert extra is not None
+    assert extra["event"] == "analytics_event_write_failed"
+    assert extra["event_type"] == "search_query"
+    assert extra["user_id"] == str(user_id)
+    assert extra["payload_key_count"] == 2
+    assert extra["payload_keys"] == ["result_count", "safe_context"]
+    assert extra["exception_type"] == "RuntimeError"
+    assert "raw-secret-value" not in repr(exception_calls)
+    assert "analytics db unavailable secret" not in repr(exception_calls)
 
 
 async def test_record_interaction_event_requires_meme_ref_for_inline_result_events(

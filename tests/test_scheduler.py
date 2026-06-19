@@ -179,14 +179,24 @@ def test_configure_scheduler_logging_uses_stdout_when_bootstrapping(monkeypatch:
         record.snapshot_count = 7
         record.updated_meme_count = 7
         record.view_name = "public_meme_trends_mv"
+        record.event_type = "search_query"
+        record.payload_key_count = 2
+        record.payload_keys = ["result_count", "safe_context"]
+        record.language = "en"
+        record.media_type = "image"
 
         payload = json.loads(handler.format(record))
         assert payload["event"] == "popularity_snapshot_capture_succeeded"
+        assert payload["event_type"] == "search_query"
         assert payload["captured_at"] == "2026-03-01T12:00:00+00:00"
         assert payload["public_meme_count"] == 7
         assert payload["snapshot_count"] == 7
         assert payload["updated_meme_count"] == 7
         assert payload["view_name"] == "public_meme_trends_mv"
+        assert payload["payload_key_count"] == 2
+        assert payload["payload_keys"] == ["result_count", "safe_context"]
+        assert payload["language"] == "en"
+        assert payload["media_type"] == "image"
     finally:
         root_logger.handlers.clear()
         root_logger.setLevel(logging.NOTSET)
@@ -292,6 +302,8 @@ async def test_source_engagement_capture_job_calls_batch_service_and_logs_result
             {
                 "event": "scheduler_job_batch_result",
                 "job_id": JOB_ID_SOURCE_ENGAGEMENT_CAPTURE,
+                "status": "completed",
+                "degraded_mode": False,
                 "claimed": 2,
                 "enqueued": 2,
                 "meme_source_ids": ["00000000-0000-0000-0000-000000000001"],
@@ -384,7 +396,17 @@ async def test_search_index_sync_job_calls_batch_service_and_logs_result(monkeyp
     async def fake_run_batch(session_factory_arg: object, *, settings: Settings) -> SearchIndexBatchJobResult:
         called["session_factory"] = session_factory_arg
         called["settings"] = settings
-        return SearchIndexBatchJobResult(scanned=3, updated=2, failed=1, skipped=0, duration_seconds=0.25)
+        return SearchIndexBatchJobResult(
+            scanned=3,
+            updated=2,
+            failed=1,
+            skipped=0,
+            duration_seconds=0.25,
+            index_sync_unsynced_count=7,
+            index_sync_failed_count=2,
+            index_sync_processing_count=1,
+            index_sync_oldest_lag_seconds=120.0,
+        )
 
     def fake_info(message: str, *args: object, extra: dict[str, object] | None = None, **kwargs: object) -> None:
         del args, kwargs
@@ -405,11 +427,17 @@ async def test_search_index_sync_job_calls_batch_service_and_logs_result(monkeyp
             {
                 "event": "scheduler_job_batch_result",
                 "job_id": JOB_ID_SEARCH_INDEX_SYNC,
+                "status": "completed",
+                "degraded_mode": True,
                 "scanned": 3,
                 "updated": 2,
                 "failed": 1,
                 "skipped": 0,
                 "duration_seconds": 0.25,
+                "index_sync_unsynced_count": 7,
+                "index_sync_failed_count": 2,
+                "index_sync_processing_count": 1,
+                "index_sync_oldest_lag_seconds": 120.0,
             },
         )
     ]
@@ -451,6 +479,8 @@ async def test_seo_backlog_job_calls_batch_service_and_logs_result(monkeypatch: 
             {
                 "event": "scheduler_job_batch_result",
                 "job_id": JOB_ID_SEO_BACKLOG_BATCHES,
+                "status": "completed",
+                "degraded_mode": False,
                 "scanned": 4,
                 "updated": 3,
                 "failed": 0,
@@ -486,6 +516,11 @@ async def test_rabbitmq_outbox_publisher_job_calls_runtime_and_logs_result(monke
             published=2,
             failed=1,
             duration_seconds=0.75,
+            outbox_due_count=5,
+            outbox_pending_count=4,
+            outbox_failed_count=1,
+            outbox_publishing_count=2,
+            outbox_oldest_due_age_seconds=30.0,
         )
 
     def fake_info(message: str, *args: object, extra: dict[str, object] | None = None, **kwargs: object) -> None:
@@ -507,11 +542,18 @@ async def test_rabbitmq_outbox_publisher_job_calls_runtime_and_logs_result(monke
             {
                 "event": "scheduler_job_batch_result",
                 "job_id": JOB_ID_RABBITMQ_OUTBOX_PUBLISHER,
+                "status": "completed",
+                "degraded_mode": True,
                 "recovered": 1,
                 "claimed": 3,
                 "published": 2,
                 "failed": 1,
                 "duration_seconds": 0.75,
+                "outbox_due_count": 5,
+                "outbox_pending_count": 4,
+                "outbox_failed_count": 1,
+                "outbox_publishing_count": 2,
+                "outbox_oldest_due_age_seconds": 30.0,
             },
         )
     ]
@@ -543,6 +585,8 @@ async def test_run_logged_job_catches_and_logs_failure(monkeypatch: pytest.Monke
     assert extra is not None
     assert extra.get("event") == "scheduler_job_failed"
     assert extra.get("job_id") == "test-job"
+    assert extra.get("status") == "failed"
+    assert extra.get("degraded_mode") is True
     duration_seconds = extra.get("duration_seconds")
     assert isinstance(duration_seconds, float)
     assert duration_seconds >= 0

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
@@ -148,6 +149,11 @@ class _CandidateScore:
 class _CollectedCandidates:
     candidates: dict[uuid.UUID, _CandidateScore]
     fallback_reason: str | None = None
+    degraded_reason: str | None = None
+    text_latency_seconds: float = 0.0
+    semantic_latency_seconds: float = 0.0
+    text_candidate_count: int = 0
+    semantic_candidate_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,6 +230,7 @@ class MemeSearchService:
         offset: int = 0,
         surface: str = "service_search",
     ) -> MemeSearchPageRead:
+        started_seconds = time.perf_counter()
         resolved_filters = _resolve_search_filters(filters, viewer_user_id=viewer_user_id)
         resolved_limit = _clamp_limit(limit)
         resolved_offset = max(0, offset)
@@ -231,21 +238,36 @@ class MemeSearchService:
         candidate_limit = max(resolved_limit + resolved_offset, resolved_limit) * 4
 
         normalized_query = query.strip()
+        embedding_started_seconds = time.perf_counter()
         resolved_query_vector, query_vector_provider_failed = await self._resolve_query_vector(
             normalized_query,
             query_vector=query_vector,
+            request_id=request_id,
+            surface=surface,
+            viewer_user_id=viewer_user_id,
+            filters=resolved_filters,
         )
+        embedding_latency_seconds = time.perf_counter() - embedding_started_seconds
         index_prefilter = _build_search_index_prefilter(resolved_filters, viewer_user_id=viewer_user_id)
+        index_started_seconds = time.perf_counter()
         collected_candidates = await self._collect_index_candidates(
             normalized_query,
             query_vector=resolved_query_vector,
             prefilter=index_prefilter,
             limit=candidate_limit,
             provider_failed=query_vector_provider_failed,
+            request_id=request_id,
+            surface=surface,
+            viewer_user_id=viewer_user_id,
+            filters=resolved_filters,
         )
+        index_latency_seconds = time.perf_counter() - index_started_seconds
         candidates = collected_candidates.candidates
+        index_candidate_count = len(candidates)
         if not candidates:
-            return await self._popular_page(
+            fallback_reason = collected_candidates.fallback_reason or "index_candidates_empty"
+            db_started_seconds = time.perf_counter()
+            page = await self._popular_page(
                 viewer_user_id=viewer_user_id,
                 filters=resolved_filters,
                 limit=resolved_limit,
@@ -254,13 +276,43 @@ class MemeSearchService:
                 surface=surface,
                 source_algorithm="fallback_popular",
                 query=normalized_query,
-                reason=collected_candidates.fallback_reason or "index_candidates_empty",
+                reason=fallback_reason,
             )
+            db_latency_seconds = time.perf_counter() - db_started_seconds
+            _log_discovery_completed(
+                event="meme_search_completed",
+                request_id=request_id,
+                surface=surface,
+                viewer_user_id=viewer_user_id,
+                filters=resolved_filters,
+                query=normalized_query,
+                source_algorithm="fallback_popular",
+                algorithm_version=POPULAR_ALGORITHM_VERSION,
+                degraded_mode=True,
+                reason=fallback_reason,
+                fallback_reason=fallback_reason,
+                limit=resolved_limit,
+                offset=resolved_offset,
+                candidate_count=0,
+                text_candidate_count=collected_candidates.text_candidate_count,
+                semantic_candidate_count=collected_candidates.semantic_candidate_count,
+                visible_count=page.total,
+                result_count=len(page.items),
+                total=page.total,
+                embedding_latency_seconds=embedding_latency_seconds,
+                text_latency_seconds=collected_candidates.text_latency_seconds,
+                semantic_latency_seconds=collected_candidates.semantic_latency_seconds,
+                index_latency_seconds=index_latency_seconds,
+                db_latency_seconds=db_latency_seconds,
+                total_latency_seconds=time.perf_counter() - started_seconds,
+            )
+            return page
 
+        db_started_seconds = time.perf_counter()
         await self._resolve_missing_meme_ids(candidates)
         candidates = {score.meme_id: score for score in candidates.values() if score.meme_id is not None}
         if not candidates:
-            return MemeSearchPageRead(
+            page = MemeSearchPageRead(
                 items=[],
                 limit=resolved_limit,
                 offset=resolved_offset,
@@ -268,6 +320,33 @@ class MemeSearchService:
                 has_more=False,
                 request_id=request_id,
             )
+            _log_discovery_completed(
+                event="meme_search_completed",
+                request_id=request_id,
+                surface=surface,
+                viewer_user_id=viewer_user_id,
+                filters=resolved_filters,
+                query=normalized_query,
+                source_algorithm="hybrid_search",
+                algorithm_version=SEARCH_INDEX_ALGORITHM_VERSION,
+                degraded_mode=collected_candidates.degraded_reason is not None,
+                reason=collected_candidates.degraded_reason,
+                limit=resolved_limit,
+                offset=resolved_offset,
+                candidate_count=index_candidate_count,
+                text_candidate_count=collected_candidates.text_candidate_count,
+                semantic_candidate_count=collected_candidates.semantic_candidate_count,
+                visible_count=0,
+                result_count=0,
+                total=0,
+                embedding_latency_seconds=embedding_latency_seconds,
+                text_latency_seconds=collected_candidates.text_latency_seconds,
+                semantic_latency_seconds=collected_candidates.semantic_latency_seconds,
+                index_latency_seconds=index_latency_seconds,
+                db_latency_seconds=time.perf_counter() - db_started_seconds,
+                total_latency_seconds=time.perf_counter() - started_seconds,
+            )
+            return page
 
         memes = await self._load_visible_memes(
             tuple(candidates),
@@ -307,7 +386,7 @@ class MemeSearchService:
                 )
             )
 
-        return MemeSearchPageRead(
+        page = MemeSearchPageRead(
             items=items,
             limit=resolved_limit,
             offset=resolved_offset,
@@ -315,6 +394,33 @@ class MemeSearchService:
             has_more=resolved_offset + resolved_limit < total,
             request_id=request_id,
         )
+        _log_discovery_completed(
+            event="meme_search_completed",
+            request_id=request_id,
+            surface=surface,
+            viewer_user_id=viewer_user_id,
+            filters=resolved_filters,
+            query=normalized_query,
+            source_algorithm="hybrid_search",
+            algorithm_version=SEARCH_INDEX_ALGORITHM_VERSION,
+            degraded_mode=collected_candidates.degraded_reason is not None,
+            reason=collected_candidates.degraded_reason,
+            limit=resolved_limit,
+            offset=resolved_offset,
+            candidate_count=index_candidate_count,
+            text_candidate_count=collected_candidates.text_candidate_count,
+            semantic_candidate_count=collected_candidates.semantic_candidate_count,
+            visible_count=len(memes),
+            result_count=len(items),
+            total=total,
+            embedding_latency_seconds=embedding_latency_seconds,
+            text_latency_seconds=collected_candidates.text_latency_seconds,
+            semantic_latency_seconds=collected_candidates.semantic_latency_seconds,
+            index_latency_seconds=index_latency_seconds,
+            db_latency_seconds=time.perf_counter() - db_started_seconds,
+            total_latency_seconds=time.perf_counter() - started_seconds,
+        )
+        return page
 
     async def search_public_memes(
         self,
@@ -361,6 +467,7 @@ class MemeSearchService:
         pool, and PostgreSQL access/NSFW filtering is the final authority.
         """
 
+        started_seconds = time.perf_counter()
         resolved_filters = _resolve_search_filters(filters, viewer_user_id=viewer_user_id)
         resolved_limit = _clamp_limit(limit)
         resolved_offset = max(0, offset)
@@ -375,6 +482,7 @@ class MemeSearchService:
                 request_id=request_id,
                 surface=surface,
                 reason="cold_start_no_viewer",
+                started_seconds=started_seconds,
             )
 
         positive_since = utcnow() - timedelta(hours=max(1, self._settings.recommendation_positive_lookback_hours))
@@ -396,6 +504,7 @@ class MemeSearchService:
                 surface=surface,
                 reason="cold_start_no_positive_signals",
                 exclude_meme_ids=excluded_meme_ids,
+                started_seconds=started_seconds,
             )
 
         weighted_vectors = await self._load_weighted_signal_embedding_vectors(positive_weights)
@@ -414,10 +523,21 @@ class MemeSearchService:
                 surface=surface,
                 reason="cold_start_no_signal_embeddings",
                 exclude_meme_ids=excluded_meme_ids,
+                started_seconds=started_seconds,
             )
 
         if self._semantic_client is None:
-            logger.warning("Qdrant user search client is not configured; using trending recommendation fallback.")
+            _log_discovery_degraded(
+                event="meme_recommendation_provider_failure",
+                request_id=request_id,
+                surface=surface,
+                viewer_user_id=viewer_user_id,
+                filters=resolved_filters,
+                source_algorithm="personalized_recommendations",
+                algorithm_version=PERSONALIZED_RECOMMENDATION_ALGORITHM_VERSION,
+                reason="qdrant_client_not_configured",
+                fallback_reason="qdrant_failure",
+            )
             excluded_meme_ids = await self._load_recommendation_excluded_meme_ids(
                 viewer_user_id=viewer_user_id,
                 positive_meme_ids=set(positive_weights),
@@ -431,17 +551,32 @@ class MemeSearchService:
                 surface=surface,
                 reason="qdrant_failure",
                 exclude_meme_ids=excluded_meme_ids,
+                started_seconds=started_seconds,
             )
 
         candidate_limit = max(1, self._settings.recommendation_qdrant_candidate_limit)
+        semantic_started_seconds = time.perf_counter()
         try:
             matches = await self._semantic_client.search_memes_by_vector(
                 query_vector=preference_vector,
                 limit=candidate_limit,
                 prefilter=_build_search_index_prefilter(resolved_filters, viewer_user_id=viewer_user_id),
             )
-        except Exception:
-            logger.exception("Qdrant personalized recommendation lookup failed; using trending fallback.")
+        except Exception as exc:
+            semantic_latency_seconds = time.perf_counter() - semantic_started_seconds
+            _log_discovery_degraded(
+                event="meme_recommendation_provider_failure",
+                request_id=request_id,
+                surface=surface,
+                viewer_user_id=viewer_user_id,
+                filters=resolved_filters,
+                source_algorithm="personalized_recommendations",
+                algorithm_version=PERSONALIZED_RECOMMENDATION_ALGORITHM_VERSION,
+                reason="qdrant_lookup_failed",
+                fallback_reason="qdrant_failure",
+                semantic_latency_seconds=semantic_latency_seconds,
+                exception_type=type(exc).__name__,
+            )
             excluded_meme_ids = await self._load_recommendation_excluded_meme_ids(
                 viewer_user_id=viewer_user_id,
                 positive_meme_ids=set(positive_weights),
@@ -455,7 +590,10 @@ class MemeSearchService:
                 surface=surface,
                 reason="qdrant_failure",
                 exclude_meme_ids=excluded_meme_ids,
+                started_seconds=started_seconds,
+                semantic_latency_seconds=semantic_latency_seconds,
             )
+        semantic_latency_seconds = time.perf_counter() - semantic_started_seconds
 
         excluded_meme_ids = await self._load_recommendation_excluded_meme_ids(
             viewer_user_id=viewer_user_id,
@@ -472,8 +610,11 @@ class MemeSearchService:
                 surface=surface,
                 reason="recommendation_candidates_empty",
                 exclude_meme_ids=excluded_meme_ids,
+                started_seconds=started_seconds,
+                semantic_latency_seconds=semantic_latency_seconds,
             )
 
+        db_started_seconds = time.perf_counter()
         memes = await self._load_visible_memes(
             tuple(match.meme_id for match in ordered_matches),
             viewer_user_id=viewer_user_id,
@@ -510,6 +651,8 @@ class MemeSearchService:
                 surface=surface,
                 reason="postgres_filters_empty",
                 exclude_meme_ids=excluded_meme_ids,
+                started_seconds=started_seconds,
+                semantic_latency_seconds=semantic_latency_seconds,
             )
 
         candidates.sort(
@@ -556,7 +699,7 @@ class MemeSearchService:
                 )
             )
 
-        return MemeSearchPageRead(
+        page = MemeSearchPageRead(
             items=items,
             limit=resolved_limit,
             offset=resolved_offset,
@@ -564,6 +707,29 @@ class MemeSearchService:
             has_more=resolved_offset + resolved_limit < len(candidates),
             request_id=request_id,
         )
+        _log_discovery_completed(
+            event="meme_recommendation_completed",
+            request_id=request_id,
+            surface=surface,
+            viewer_user_id=viewer_user_id,
+            filters=resolved_filters,
+            query=None,
+            source_algorithm="personalized_recommendations",
+            algorithm_version=PERSONALIZED_RECOMMENDATION_ALGORITHM_VERSION,
+            degraded_mode=False,
+            reason="qdrant_preference_vector",
+            limit=resolved_limit,
+            offset=resolved_offset,
+            candidate_count=len(candidates),
+            semantic_candidate_count=len(ordered_matches),
+            visible_count=len(memes),
+            result_count=len(items),
+            total=len(candidates),
+            semantic_latency_seconds=semantic_latency_seconds,
+            db_latency_seconds=time.perf_counter() - db_started_seconds,
+            total_latency_seconds=time.perf_counter() - started_seconds,
+        )
+        return page
 
     async def home_feed_public_memes(
         self,
@@ -687,6 +853,7 @@ class MemeSearchService:
         and NSFW authority before any public card leaves the service.
         """
 
+        started_seconds = time.perf_counter()
         source_meme = await self._load_public_meme_by_id(meme_id, include_nsfw=include_nsfw)
         resolved_filters = _resolve_search_filters(
             MemeSearchFilters(include_nsfw=include_nsfw, scope=MemeSearchScope.PUBLIC),
@@ -702,6 +869,9 @@ class MemeSearchService:
             source_meme,
             filters=resolved_filters,
             target_count=target_count,
+            request_id=request_id,
+            surface=surface,
+            viewer_user_id=viewer_user_id,
         )
         seen_meme_ids = {source_meme.id, *(candidate.meme.id for candidate in candidates)}
         if len(candidates) < target_count:
@@ -746,6 +916,27 @@ class MemeSearchService:
             total=len(candidates),
             has_more=len(candidates) > resolved_offset + resolved_limit,
             request_id=request_id,
+        )
+        _log_discovery_completed(
+            event="meme_similar_completed",
+            request_id=request_id,
+            surface=surface,
+            viewer_user_id=viewer_user_id,
+            filters=resolved_filters,
+            query=None,
+            source_algorithm="qdrant_similarity" if fallback_reason is None else "fallback_public_recommendations",
+            algorithm_version=(
+                QDRANT_SIMILARITY_ALGORITHM_VERSION if fallback_reason is None else POPULAR_ALGORITHM_VERSION
+            ),
+            degraded_mode=fallback_reason is not None,
+            reason=fallback_reason,
+            fallback_reason=fallback_reason,
+            limit=resolved_limit,
+            offset=resolved_offset,
+            candidate_count=len(candidates),
+            result_count=len(items),
+            total=len(candidates),
+            total_latency_seconds=time.perf_counter() - started_seconds,
         )
         return await self._to_public_search_page(
             page,
@@ -1122,8 +1313,11 @@ class MemeSearchService:
         surface: str,
         reason: str,
         exclude_meme_ids: set[uuid.UUID] | None = None,
+        started_seconds: float | None = None,
+        semantic_latency_seconds: float | None = None,
     ) -> MemeSearchPageRead:
-        return await self.trending_memes(
+        db_started_seconds = time.perf_counter()
+        page = await self.trending_memes(
             viewer_user_id=viewer_user_id,
             filters=filters,
             limit=limit,
@@ -1135,6 +1329,30 @@ class MemeSearchService:
             request_id=request_id,
             exclude_meme_ids=exclude_meme_ids,
         )
+        total_latency_seconds = time.perf_counter() - started_seconds if started_seconds is not None else None
+        _log_discovery_completed(
+            event="meme_recommendation_completed",
+            request_id=request_id,
+            surface=surface,
+            viewer_user_id=viewer_user_id,
+            filters=filters,
+            query=None,
+            source_algorithm="fallback_trending",
+            algorithm_version=LEGACY_TRENDING_ALGORITHM_VERSION,
+            degraded_mode=True,
+            reason=reason,
+            fallback_reason=reason,
+            limit=limit,
+            offset=offset,
+            candidate_count=page.total,
+            visible_count=page.total,
+            result_count=len(page.items),
+            total=page.total,
+            semantic_latency_seconds=semantic_latency_seconds,
+            db_latency_seconds=time.perf_counter() - db_started_seconds,
+            total_latency_seconds=total_latency_seconds,
+        )
+        return page
 
     async def _load_recommendation_excluded_meme_ids(
         self,
@@ -1470,14 +1688,31 @@ class MemeSearchService:
         query: str,
         *,
         query_vector: tuple[float, ...] | None,
+        request_id: str,
+        surface: str,
+        viewer_user_id: uuid.UUID | None,
+        filters: MemeSearchFilters,
     ) -> tuple[tuple[float, ...] | None, bool]:
         if query_vector is not None or not query or self._query_embedding_client is None:
             return query_vector, False
 
         try:
             vector = await self._query_embedding_client.embed_query(query)
-        except Exception:
-            logger.exception("Text query embedding failed; falling back to text-only meme search.")
+        except Exception as exc:
+            _log_discovery_degraded(
+                event="meme_search_provider_failure",
+                request_id=request_id,
+                surface=surface,
+                viewer_user_id=viewer_user_id,
+                filters=filters,
+                query=query,
+                source_algorithm="hybrid_search",
+                algorithm_version=SEARCH_INDEX_ALGORITHM_VERSION,
+                degraded_component="embedding",
+                reason="query_embedding_failed",
+                fallback_reason="text_only_search",
+                exception_type=type(exc).__name__,
+            )
             return None, True
         return vector or None, False
 
@@ -1488,17 +1723,44 @@ class MemeSearchService:
         query_vector: tuple[float, ...] | None,
         prefilter: SearchIndexPrefilter,
         limit: int,
+        request_id: str,
+        surface: str,
+        viewer_user_id: uuid.UUID | None,
+        filters: MemeSearchFilters,
         provider_failed: bool = False,
     ) -> _CollectedCandidates:
         candidates: dict[uuid.UUID, _CandidateScore] = {}
+        text_latency_seconds = 0.0
+        semantic_latency_seconds = 0.0
+        text_candidate_count = 0
+        semantic_candidate_count = 0
 
         if self._text_client is not None and query:
+            text_started_seconds = time.perf_counter()
             try:
                 text_hits = await self._text_client.search(query, limit=limit, prefilter=prefilter)
-            except Exception:
-                logger.exception("Text meme search failed; falling back to semantic/popular candidates.")
+            except Exception as exc:
+                text_latency_seconds = time.perf_counter() - text_started_seconds
+                _log_discovery_degraded(
+                    event="meme_search_provider_failure",
+                    request_id=request_id,
+                    surface=surface,
+                    viewer_user_id=viewer_user_id,
+                    filters=filters,
+                    query=query,
+                    source_algorithm="hybrid_search",
+                    algorithm_version=SEARCH_INDEX_ALGORITHM_VERSION,
+                    degraded_component="text",
+                    reason="text_search_failed",
+                    fallback_reason="semantic_or_popular_candidates",
+                    exception_type=type(exc).__name__,
+                    text_latency_seconds=text_latency_seconds,
+                )
                 provider_failed = True
                 text_hits = []
+            else:
+                text_latency_seconds = time.perf_counter() - text_started_seconds
+            text_candidate_count = len(text_hits)
             for rank, hit in enumerate(text_hits, start=1):
                 key = _candidate_key_from_hit(hit)
                 if key is None:
@@ -1508,16 +1770,35 @@ class MemeSearchService:
                 candidate.text_raw = max(candidate.text_raw, _text_score_from_hit(hit, rank))
 
         if self._semantic_client is not None and query_vector is not None:
+            semantic_started_seconds = time.perf_counter()
             try:
                 semantic_hits = await self._semantic_client.search_memes_by_vector(
                     query_vector=query_vector,
                     limit=limit,
                     prefilter=prefilter,
                 )
-            except Exception:
-                logger.exception("Semantic meme search failed; falling back to text-only candidates.")
+            except Exception as exc:
+                semantic_latency_seconds = time.perf_counter() - semantic_started_seconds
+                _log_discovery_degraded(
+                    event="meme_search_provider_failure",
+                    request_id=request_id,
+                    surface=surface,
+                    viewer_user_id=viewer_user_id,
+                    filters=filters,
+                    query=query,
+                    source_algorithm="hybrid_search",
+                    algorithm_version=SEARCH_INDEX_ALGORITHM_VERSION,
+                    degraded_component="semantic",
+                    reason="semantic_search_failed",
+                    fallback_reason="text_only_candidates",
+                    exception_type=type(exc).__name__,
+                    semantic_latency_seconds=semantic_latency_seconds,
+                )
                 provider_failed = True
                 semantic_hits = ()
+            else:
+                semantic_latency_seconds = time.perf_counter() - semantic_started_seconds
+            semantic_candidate_count = len(semantic_hits)
             for semantic_hit in semantic_hits:
                 key = semantic_hit.meme_id
                 candidate = candidates.setdefault(key, _CandidateScore(meme_id=semantic_hit.meme_id))
@@ -1527,7 +1808,15 @@ class MemeSearchService:
         fallback_reason = None
         if not candidates:
             fallback_reason = "provider_failure" if provider_failed else "index_candidates_empty"
-        return _CollectedCandidates(candidates=candidates, fallback_reason=fallback_reason)
+        return _CollectedCandidates(
+            candidates=candidates,
+            fallback_reason=fallback_reason,
+            degraded_reason="provider_failure" if provider_failed else None,
+            text_latency_seconds=text_latency_seconds,
+            semantic_latency_seconds=semantic_latency_seconds,
+            text_candidate_count=text_candidate_count,
+            semantic_candidate_count=semantic_candidate_count,
+        )
 
     async def _resolve_missing_meme_ids(self, candidates: dict[uuid.UUID, _CandidateScore]) -> None:
         missing_file_ids = tuple(
@@ -1658,26 +1947,59 @@ class MemeSearchService:
         *,
         filters: MemeSearchFilters,
         target_count: int,
+        request_id: str,
+        surface: str,
+        viewer_user_id: uuid.UUID | None,
     ) -> tuple[list[_SimilarCandidate], str | None]:
         if source_meme.primary_file_id is None:
             return [], "missing_embedding"
 
-        vector = await self._load_primary_image_embedding_vector(source_meme.primary_file_id)
+        vector = await self._load_primary_image_embedding_vector(
+            source_meme.primary_file_id,
+            request_id=request_id,
+            surface=surface,
+            viewer_user_id=viewer_user_id,
+            filters=filters,
+        )
         if vector is None:
             return [], "missing_embedding"
 
         if self._similarity_client is None:
-            logger.warning("Qdrant similarity client is not configured; using public fallback recommendations.")
+            _log_discovery_degraded(
+                event="meme_similar_provider_failure",
+                request_id=request_id,
+                surface=surface,
+                viewer_user_id=viewer_user_id,
+                filters=filters,
+                source_algorithm="qdrant_similarity",
+                algorithm_version=QDRANT_SIMILARITY_ALGORITHM_VERSION,
+                reason="qdrant_client_not_configured",
+                fallback_reason="qdrant_failure",
+            )
             return [], "qdrant_failure"
 
+        semantic_started_seconds = time.perf_counter()
         try:
             matches = await self._similarity_client.find_similar_memes(
                 vector=vector,
                 current_meme_file_id=source_meme.primary_file_id,
                 limit=max(20, target_count * 4),
             )
-        except Exception:
-            logger.exception("Qdrant meme similarity lookup failed; using public fallback recommendations.")
+        except Exception as exc:
+            semantic_latency_seconds = time.perf_counter() - semantic_started_seconds
+            _log_discovery_degraded(
+                event="meme_similar_provider_failure",
+                request_id=request_id,
+                surface=surface,
+                viewer_user_id=viewer_user_id,
+                filters=filters,
+                source_algorithm="qdrant_similarity",
+                algorithm_version=QDRANT_SIMILARITY_ALGORITHM_VERSION,
+                reason="qdrant_lookup_failed",
+                fallback_reason="qdrant_failure",
+                exception_type=type(exc).__name__,
+                semantic_latency_seconds=semantic_latency_seconds,
+            )
             return [], "qdrant_failure"
 
         ordered_matches = _dedupe_similarity_matches(matches, source_meme_id=source_meme.id)
@@ -1711,7 +2033,15 @@ class MemeSearchService:
 
         return (candidates, None) if candidates else ([], "similarity_empty")
 
-    async def _load_primary_image_embedding_vector(self, meme_file_id: uuid.UUID) -> tuple[float, ...] | None:
+    async def _load_primary_image_embedding_vector(
+        self,
+        meme_file_id: uuid.UUID,
+        *,
+        request_id: str,
+        surface: str,
+        viewer_user_id: uuid.UUID | None,
+        filters: MemeSearchFilters,
+    ) -> tuple[float, ...] | None:
         cache_row = await self._session.scalar(
             select(EmbeddingCache)
             .where(
@@ -1730,7 +2060,19 @@ class MemeSearchService:
                 dimensions=self._settings.pipeline_voyage_output_dimensions,
             )
         except VoyageEmbeddingError:
-            logger.exception("Stored meme image embedding could not be decoded; using public fallback recommendations.")
+            _log_discovery_degraded(
+                event="meme_similar_provider_failure",
+                request_id=request_id,
+                surface=surface,
+                viewer_user_id=viewer_user_id,
+                filters=filters,
+                source_algorithm="qdrant_similarity",
+                algorithm_version=QDRANT_SIMILARITY_ALGORITHM_VERSION,
+                degraded_component="embedding",
+                reason="stored_image_embedding_decode_failed",
+                fallback_reason="missing_embedding",
+                exception_type=VoyageEmbeddingError.__name__,
+            )
             return None
 
     async def _similar_fallback_candidates(
@@ -2220,6 +2562,193 @@ def _default_search_scope(viewer_user_id: uuid.UUID | None) -> MemeSearchScope:
 
 def _normalize_collection_ids(collection_ids: tuple[uuid.UUID, ...]) -> tuple[uuid.UUID, ...]:
     return tuple(dict.fromkeys(collection_ids))
+
+
+def _log_discovery_completed(
+    *,
+    event: str,
+    request_id: str,
+    surface: str,
+    viewer_user_id: uuid.UUID | None,
+    filters: MemeSearchFilters,
+    query: str | None,
+    source_algorithm: str,
+    algorithm_version: str | None,
+    degraded_mode: bool,
+    reason: str | None = None,
+    fallback_reason: str | None = None,
+    limit: int | None = None,
+    offset: int | None = None,
+    candidate_count: int | None = None,
+    text_candidate_count: int | None = None,
+    semantic_candidate_count: int | None = None,
+    visible_count: int | None = None,
+    result_count: int | None = None,
+    total: int | None = None,
+    embedding_latency_seconds: float | None = None,
+    text_latency_seconds: float | None = None,
+    semantic_latency_seconds: float | None = None,
+    index_latency_seconds: float | None = None,
+    db_latency_seconds: float | None = None,
+    total_latency_seconds: float | None = None,
+) -> None:
+    logger.info(
+        event,
+        extra=_discovery_log_extra(
+            event=event,
+            request_id=request_id,
+            surface=surface,
+            viewer_user_id=viewer_user_id,
+            filters=filters,
+            query=query,
+            source_algorithm=source_algorithm,
+            algorithm_version=algorithm_version,
+            degraded_mode=degraded_mode,
+            reason=reason,
+            fallback_reason=fallback_reason,
+            limit=limit,
+            offset=offset,
+            candidate_count=candidate_count,
+            text_candidate_count=text_candidate_count,
+            semantic_candidate_count=semantic_candidate_count,
+            visible_count=visible_count,
+            result_count=result_count,
+            total=total,
+            embedding_latency_seconds=embedding_latency_seconds,
+            text_latency_seconds=text_latency_seconds,
+            semantic_latency_seconds=semantic_latency_seconds,
+            index_latency_seconds=index_latency_seconds,
+            db_latency_seconds=db_latency_seconds,
+            total_latency_seconds=total_latency_seconds,
+        ),
+    )
+
+
+def _log_discovery_degraded(
+    *,
+    event: str,
+    request_id: str,
+    surface: str,
+    viewer_user_id: uuid.UUID | None,
+    filters: MemeSearchFilters,
+    source_algorithm: str,
+    algorithm_version: str | None,
+    query: str | None = None,
+    degraded_component: str | None = None,
+    reason: str | None = None,
+    fallback_reason: str | None = None,
+    exception_type: str | None = None,
+    embedding_latency_seconds: float | None = None,
+    text_latency_seconds: float | None = None,
+    semantic_latency_seconds: float | None = None,
+) -> None:
+    extra = _discovery_log_extra(
+        event=event,
+        request_id=request_id,
+        surface=surface,
+        viewer_user_id=viewer_user_id,
+        filters=filters,
+        query=query,
+        source_algorithm=source_algorithm,
+        algorithm_version=algorithm_version,
+        degraded_mode=True,
+        reason=reason,
+        fallback_reason=fallback_reason,
+        embedding_latency_seconds=embedding_latency_seconds,
+        text_latency_seconds=text_latency_seconds,
+        semantic_latency_seconds=semantic_latency_seconds,
+    )
+    if degraded_component is not None:
+        extra["degraded_component"] = degraded_component
+    if exception_type is not None:
+        extra["exception_type"] = exception_type
+    logger.warning(event, extra=extra)
+
+
+def _discovery_log_extra(
+    *,
+    event: str,
+    request_id: str,
+    surface: str,
+    viewer_user_id: uuid.UUID | None,
+    filters: MemeSearchFilters,
+    query: str | None,
+    source_algorithm: str,
+    algorithm_version: str | None,
+    degraded_mode: bool,
+    reason: str | None = None,
+    fallback_reason: str | None = None,
+    limit: int | None = None,
+    offset: int | None = None,
+    candidate_count: int | None = None,
+    text_candidate_count: int | None = None,
+    semantic_candidate_count: int | None = None,
+    visible_count: int | None = None,
+    result_count: int | None = None,
+    total: int | None = None,
+    embedding_latency_seconds: float | None = None,
+    text_latency_seconds: float | None = None,
+    semantic_latency_seconds: float | None = None,
+    index_latency_seconds: float | None = None,
+    db_latency_seconds: float | None = None,
+    total_latency_seconds: float | None = None,
+) -> dict[str, object]:
+    extra: dict[str, object] = {
+        "event": event,
+        "request_id": request_id,
+        "surface": surface,
+        "source_algorithm": source_algorithm,
+        "degraded_mode": degraded_mode,
+        "query_present": bool(query),
+        "query_length": len(query or ""),
+        "scope": filters.scope.value if filters.scope is not None else None,
+        "include_nsfw": filters.include_nsfw,
+        "tag_count": len(filters.tags),
+        "collection_count": len(filters.collection_ids),
+        "filter_count": _search_filter_count(filters),
+    }
+    if viewer_user_id is not None:
+        extra["user_id"] = str(viewer_user_id)
+    if filters.language is not None:
+        extra["language"] = filters.language.value
+    if filters.media_type is not None:
+        extra["media_type"] = filters.media_type.value
+    _add_optional_log_field(extra, "algorithm_version", algorithm_version)
+    _add_optional_log_field(extra, "reason", reason)
+    _add_optional_log_field(extra, "fallback_reason", fallback_reason)
+    _add_optional_log_field(extra, "limit", limit)
+    _add_optional_log_field(extra, "offset", offset)
+    _add_optional_log_field(extra, "candidate_count", candidate_count)
+    _add_optional_log_field(extra, "text_candidate_count", text_candidate_count)
+    _add_optional_log_field(extra, "semantic_candidate_count", semantic_candidate_count)
+    _add_optional_log_field(extra, "visible_count", visible_count)
+    _add_optional_log_field(extra, "result_count", result_count)
+    _add_optional_log_field(extra, "total", total)
+    _add_optional_log_field(extra, "embedding_latency_seconds", embedding_latency_seconds)
+    _add_optional_log_field(extra, "text_latency_seconds", text_latency_seconds)
+    _add_optional_log_field(extra, "semantic_latency_seconds", semantic_latency_seconds)
+    _add_optional_log_field(extra, "index_latency_seconds", index_latency_seconds)
+    _add_optional_log_field(extra, "db_latency_seconds", db_latency_seconds)
+    _add_optional_log_field(extra, "total_latency_seconds", total_latency_seconds)
+    return extra
+
+
+def _add_optional_log_field(extra: dict[str, object], field_name: str, value: object | None) -> None:
+    if value is not None:
+        extra[field_name] = value
+
+
+def _search_filter_count(filters: MemeSearchFilters) -> int:
+    return sum(
+        (
+            filters.language is not None,
+            filters.media_type is not None,
+            filters.include_nsfw,
+            bool(filters.tags),
+            filters.scope is not None,
+            bool(filters.collection_ids),
+        )
+    )
 
 
 def _build_result_attribution(

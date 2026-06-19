@@ -183,11 +183,12 @@ The scheduler emits structured stdout logs by default. Operators should watch fo
 - `scheduler_job_batch_result` with `job_id`, `scanned`, `updated`, `failed`, `skipped`, and `duration_seconds` for search-index and SEO batch runs; the outbox publisher uses the same event with `recovered`, `claimed`, `published`, `failed`, and `duration_seconds`.
 - `scheduler_job_batch_result` with `job_id=source-engagement-capture`, `claimed`, and `enqueued` for source engagement dispatch runs.
 - `scheduler_job_batch_result` with `job_id=motd`, `candidate_count`, `selected_meme_id`, `reason`, `algorithm_version`, and `refreshed_at` for Meme of the Day refresh runs.
+- `scheduler_job_batch_result` backlog fields such as `index_sync_unsynced_count`, `index_sync_oldest_lag_seconds`, `outbox_due_count`, and `outbox_oldest_due_age_seconds` for launch operations.
 - `public_trend_mv_concurrent_refresh_fallback` with `view_name` when a concurrent materialized-view refresh cannot run and the scheduler retries without `CONCURRENTLY`.
 - `scheduler_instance_lock_unavailable` if another scheduler instance already holds the advisory lock.
 - `scheduler_advisory_lock_disabled` only when `SCHEDULER_ADVISORY_LOCK_ENABLED=false`.
 
-Detailed run/replay/inspection guidance for scheduler batch and outbox jobs lives in `docs/ops/scheduler-batch-jobs.md`.
+Detailed run/replay/inspection guidance for scheduler batch and outbox jobs lives in `docs/ops/scheduler-batch-jobs.md`. The launch observability mini-runbook lives in `docs/ops/launch-observability.md`.
 
 Graceful shutdown is built into `memexpert-scheduler`: on `SIGINT` or `SIGTERM`, APScheduler stops accepting new work, waits for in-flight jobs to finish, releases the PostgreSQL advisory lock, and then exits.
 

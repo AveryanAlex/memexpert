@@ -367,8 +367,19 @@ class AnalyticsService:
                 )
             )
             await self._session.commit()
-        except Exception:
-            logger.exception("Analytics event write failed.")
+        except Exception as exc:
+            logger.exception(
+                "analytics_event_write_failed",
+                exc_info=False,
+                extra={
+                    "event": "analytics_event_write_failed",
+                    "event_type": event_type.value,
+                    "user_id": str(user_id) if user_id is not None else None,
+                    "payload_key_count": len(payload or {}),
+                    "payload_keys": sorted((payload or {}).keys()),
+                    "exception_type": type(exc).__name__,
+                },
+            )
             await self._session.rollback()
 
     async def _resolve_actor_context(

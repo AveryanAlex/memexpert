@@ -91,6 +91,10 @@ class SearchIndexBatchJobResult:
     failed: int
     skipped: int
     duration_seconds: float
+    index_sync_unsynced_count: int = 0
+    index_sync_failed_count: int = 0
+    index_sync_processing_count: int = 0
+    index_sync_oldest_lag_seconds: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +106,14 @@ class SeoBacklogBatchJobResult:
     failed: int
     skipped: int
     duration_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
+class _SearchIndexBacklogSnapshot:
+    index_sync_unsynced_count: int
+    index_sync_failed_count: int
+    index_sync_processing_count: int
+    index_sync_oldest_lag_seconds: float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,12 +165,52 @@ class SearchIndexBatchJobService:
                 else:
                     skipped += 1
 
+        backlog = await self._load_backlog_snapshot()
         return SearchIndexBatchJobResult(
             scanned=scanned,
             updated=updated,
             failed=failed,
             skipped=skipped,
             duration_seconds=time.perf_counter() - start_seconds,
+            index_sync_unsynced_count=backlog.index_sync_unsynced_count,
+            index_sync_failed_count=backlog.index_sync_failed_count,
+            index_sync_processing_count=backlog.index_sync_processing_count,
+            index_sync_oldest_lag_seconds=backlog.index_sync_oldest_lag_seconds,
+        )
+
+    async def _load_backlog_snapshot(self) -> _SearchIndexBacklogSnapshot:
+        lag_statuses = (SyncTargetStatus.PENDING, SyncTargetStatus.FAILED, SyncTargetStatus.PROCESSING)
+        stmt = select(
+            func.coalesce(
+                func.sum(case((MemeFileSyncTargetSnapshot.status.in_(lag_statuses), 1), else_=0)),
+                0,
+            ),
+            func.coalesce(
+                func.sum(case((MemeFileSyncTargetSnapshot.status == SyncTargetStatus.FAILED, 1), else_=0)),
+                0,
+            ),
+            func.coalesce(
+                func.sum(case((MemeFileSyncTargetSnapshot.status == SyncTargetStatus.PROCESSING, 1), else_=0)),
+                0,
+            ),
+            func.min(
+                case(
+                    (MemeFileSyncTargetSnapshot.status.in_(lag_statuses), MemeFileSyncTargetSnapshot.updated_at),
+                    else_=None,
+                )
+            ),
+        )
+        async with self._session_factory() as session:
+            unsynced_count, failed_count, processing_count, oldest_updated_at = (await session.execute(stmt)).one()
+
+        oldest_lag_seconds = None
+        if isinstance(oldest_updated_at, datetime):
+            oldest_lag_seconds = max((utcnow() - oldest_updated_at).total_seconds(), 0.0)
+        return _SearchIndexBacklogSnapshot(
+            index_sync_unsynced_count=int(unsynced_count or 0),
+            index_sync_failed_count=int(failed_count or 0),
+            index_sync_processing_count=int(processing_count or 0),
+            index_sync_oldest_lag_seconds=oldest_lag_seconds,
         )
 
     async def _claim_target_batch(self, target: SyncTargetKind) -> list[_ClaimedSyncTarget]:
@@ -527,15 +579,27 @@ async def run_scheduler_seo_backlog_batch(
 
 
 def scheduler_batch_result_log_extra(job_id: str, result: _BatchResultProtocol) -> dict[str, object]:
-    return {
+    extra: dict[str, object] = {
         "event": "scheduler_job_batch_result",
         "job_id": job_id,
+        "status": "completed",
+        "degraded_mode": result.failed > 0,
         "scanned": result.scanned,
         "updated": result.updated,
         "failed": result.failed,
         "skipped": result.skipped,
         "duration_seconds": result.duration_seconds,
     }
+    for field_name in (
+        "index_sync_unsynced_count",
+        "index_sync_failed_count",
+        "index_sync_processing_count",
+        "index_sync_oldest_lag_seconds",
+    ):
+        field_value = getattr(result, field_name, None)
+        if field_value is not None:
+            extra[field_name] = field_value
+    return extra
 
 
 def _canonical_search_index_clock_expr() -> object:
