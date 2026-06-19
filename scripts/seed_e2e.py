@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
+from urllib.parse import urlencode
 
 import httpx
 from botocore.exceptions import ClientError
@@ -25,7 +26,7 @@ from qdrant_client.http.models import Distance, VectorParams
 from sqlalchemy import delete, or_, select, update
 
 from memexpert.core.config import Settings, get_settings
-from memexpert.core.database import get_async_session_factory
+from memexpert.core.database import get_async_engine, get_async_session_factory
 from memexpert.core.meilisearch import PipelineMeilisearchSyncClient
 from memexpert.core.qdrant import PipelineQdrantSyncClient
 from memexpert.core.storage import get_pipeline_storage_settings, get_s3_client
@@ -39,8 +40,10 @@ from memexpert.models.content import (
     MemeFile,
     MemeFileOCRResult,
     MemeFileSyncTargetSnapshot,
+    MemePopularitySnapshot,
     MemeSeoPage,
     MemeSource,
+    MemeTemplate,
     PipelineStageJournal,
 )
 from memexpert.models.enums import (
@@ -68,6 +71,7 @@ from memexpert.schemas.content_pipeline import (
     ContentPipelineItemDetail,
     SmokeProofResult,
 )
+from memexpert.services.public_trends import refresh_public_trend_materialized_views
 from memexpert.services.search_index_sync import (
     build_meilisearch_document,
     build_qdrant_sync_payload,
@@ -97,6 +101,13 @@ E2E_MEMBER_EMAIL: Final = "collection.member.e2e@memexpert.test"
 E2E_COLLECTION_TITLE: Final = "Launch E2E Collection"
 E2E_COLLECTION_DESCRIPTION: Final = "Private launch fixture for collection-management E2E."
 E2E_COLLECTION_INVITE_TOKEN: Final = "memexpert-e2e-collection-invite-token"
+E2E_PUBLIC_TRENDS_TAG_SLUG: Final = "e2e-prd-trends"
+E2E_PUBLIC_TRENDS_TEMPLATE_SLUG: Final = "e2e-prd-template"
+E2E_PUBLIC_TRENDS_TEMPLATE_NAME: Final = "E2E PRD Template"
+E2E_PUBLIC_TRENDS_TEMPLATE_DESCRIPTION: Final = "Deterministic template fixture for public trends E2E."
+E2E_PUBLIC_TRENDS_TIMELINE_GRANULARITY: Final = "month"
+E2E_PUBLIC_TRENDS_TIMELINE_PERIOD: Final = "2026-01"
+E2E_PUBLIC_TRENDS_MEME_CATEGORIES: Final = ("cat", "dog", "frog")
 UUID_NAMESPACE: Final = uuid.UUID("176f5e31-6e5d-5e43-80aa-1f7aa3aa0d4b")
 TERMINAL_INGEST_FAILURE_STATUSES: Final = frozenset(
     {
@@ -124,6 +135,19 @@ class SeedSpec:
     is_nsfw: bool = False
     language: ContentLanguage = ContentLanguage.EN
     media_type: ContentKind = ContentKind.IMAGE
+
+
+@dataclass(frozen=True, slots=True)
+class PublicTrendSnapshotSpec:
+    captured_at: datetime
+    source_views: int
+    source_reactions: int
+    source_reposts: int
+    platform_views: int
+    platform_sends: int
+    platform_saves: int
+    platform_likes: int
+    popularity_score: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,6 +189,82 @@ class SeededCollectionManagementFixture:
     @property
     def invite_path(self) -> str:
         return f"/collection/invite/{self.invite_token}"
+
+
+PUBLIC_TREND_SNAPSHOT_SPECS_BY_CATEGORY: Final[dict[str, tuple[PublicTrendSnapshotSpec, ...]]] = {
+    "cat": (
+        PublicTrendSnapshotSpec(
+            captured_at=datetime(2026, 1, 5, 12, 0, tzinfo=UTC),
+            source_views=120,
+            source_reactions=12,
+            source_reposts=4,
+            platform_views=40,
+            platform_sends=3,
+            platform_saves=5,
+            platform_likes=7,
+            popularity_score=40.0,
+        ),
+        PublicTrendSnapshotSpec(
+            captured_at=datetime(2026, 1, 12, 12, 0, tzinfo=UTC),
+            source_views=180,
+            source_reactions=18,
+            source_reposts=6,
+            platform_views=60,
+            platform_sends=5,
+            platform_saves=8,
+            platform_likes=12,
+            popularity_score=80.5,
+        ),
+    ),
+    "dog": (
+        PublicTrendSnapshotSpec(
+            captured_at=datetime(2026, 1, 5, 12, 0, tzinfo=UTC),
+            source_views=90,
+            source_reactions=9,
+            source_reposts=3,
+            platform_views=35,
+            platform_sends=2,
+            platform_saves=4,
+            platform_likes=6,
+            popularity_score=30.0,
+        ),
+        PublicTrendSnapshotSpec(
+            captured_at=datetime(2026, 1, 12, 12, 0, tzinfo=UTC),
+            source_views=130,
+            source_reactions=13,
+            source_reposts=4,
+            platform_views=50,
+            platform_sends=4,
+            platform_saves=6,
+            platform_likes=9,
+            popularity_score=55.5,
+        ),
+    ),
+    "frog": (
+        PublicTrendSnapshotSpec(
+            captured_at=datetime(2026, 1, 5, 12, 0, tzinfo=UTC),
+            source_views=70,
+            source_reactions=7,
+            source_reposts=2,
+            platform_views=30,
+            platform_sends=1,
+            platform_saves=3,
+            platform_likes=5,
+            popularity_score=20.0,
+        ),
+        PublicTrendSnapshotSpec(
+            captured_at=datetime(2026, 1, 12, 12, 0, tzinfo=UTC),
+            source_views=110,
+            source_reactions=11,
+            source_reposts=3,
+            platform_views=45,
+            platform_sends=3,
+            platform_saves=5,
+            platform_likes=8,
+            popularity_score=45.5,
+        ),
+    ),
+}
 
 
 class PipelineApiClient:
@@ -251,6 +351,40 @@ class PipelineApiClient:
                 f"GET /api/v1/memes/slug/{slug} returned non-object JSON: {type(payload).__name__}",
             )
         return response.status_code, payload
+
+    def public_trend_page(self, *, limit: int = 20) -> dict[str, Any]:
+        response = self._client.get("/api/v1/memes/trends", params={"limit": str(limit), "offset": "0"})
+        return _validate_json_response(response, expected_status=200)
+
+    def public_tag_trend_summaries(self, *, limit: int = 20) -> list[dict[str, Any]]:
+        response = self._client.get("/api/v1/memes/trends/tags", params={"limit": str(limit), "offset": "0"})
+        return _validate_json_list_response(response, expected_status=200)
+
+    def public_template_trend_summaries(self, *, limit: int = 20) -> list[dict[str, Any]]:
+        response = self._client.get("/api/v1/memes/trends/templates", params={"limit": str(limit), "offset": "0"})
+        return _validate_json_list_response(response, expected_status=200)
+
+    def public_trend_comparison(self, items: list[str]) -> dict[str, Any]:
+        response = self._client.get("/api/v1/memes/trends/compare", params=[("item", item) for item in items])
+        return _validate_json_response(response, expected_status=200)
+
+    def public_trend_timeline(self, *, granularity: str = "month", limit: int = 12) -> dict[str, Any]:
+        response = self._client.get(
+            "/api/v1/memes/trends/timeline",
+            params={"granularity": granularity, "limit": str(limit), "offset": "0"},
+        )
+        return _validate_json_response(response, expected_status=200)
+
+    def public_tag_landing(self, tag_slug: str) -> dict[str, Any]:
+        response = self._client.get(f"/api/v1/memes/tags/{tag_slug}", params={"limit": "20", "offset": "0"})
+        return _validate_json_response(response, expected_status=200)
+
+    def public_template_landing(self, template_slug: str) -> dict[str, Any]:
+        response = self._client.get(
+            f"/api/v1/memes/templates/{template_slug}",
+            params={"limit": "20", "offset": "0"},
+        )
+        return _validate_json_response(response, expected_status=200)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -377,6 +511,9 @@ async def _run(args: argparse.Namespace) -> None:
             specs=specs,
         )
         print(f"Seeded deterministic public corpus: {', '.join(item.category for item in seeded)}")
+        print("Refreshing public trend materialized views")
+        await refresh_public_trend_materialized_views(get_async_engine(), concurrently=True)
+        public_trends_artifact = build_public_trends_artifact(seeded)
 
         collection_fixture = await seed_collection_management_fixture(
             settings=settings,
@@ -393,6 +530,10 @@ async def _run(args: argparse.Namespace) -> None:
         created_search_payload = api_client.public_search("cat")
         assert_public_search_contains(created_search_payload, meme_id=detail.meme_id)
         seeded_proofs = prove_seeded_public_corpus(api_client, seeded=seeded)
+        public_trends_proof = prove_seeded_public_trends(
+            api_client,
+            seeded=seeded,
+        )
 
     artifact_payload = {
         "run_id": run_id,
@@ -406,6 +547,7 @@ async def _run(args: argparse.Namespace) -> None:
         },
         "seeded_memes": [_seeded_meme_payload(item) for item in seeded],
         "collection_management": build_collection_management_fixture_payload(collection_fixture),
+        "public_trends": public_trends_artifact,
         "created_meme": {
             "meme_id": str(detail.meme_id),
             "meme_file_id": str(meme_file_id),
@@ -425,6 +567,7 @@ async def _run(args: argparse.Namespace) -> None:
             ],
             "public_detail_id": created_detail_payload.get("id"),
             "seeded_detail_ids_by_slug": seeded_proofs,
+            "public_trends": public_trends_proof,
         },
     }
     seed_path = artifacts_dir / "seed.json"
@@ -497,6 +640,9 @@ async def seed_direct_corpus(
 
     async with session_factory() as session:
         seeded: list[SeededMeme] = []
+        public_trends_template = build_public_trends_template()
+        session.add(public_trends_template)
+        await session.flush()
         for spec in specs:
             image_bytes = build_seed_png_bytes(spec)
             object_key = f"{storage_settings.original_prefix}/e2e-prd/{spec.category}.png"
@@ -520,8 +666,9 @@ async def seed_direct_corpus(
                 language=spec.language,
                 is_nsfw=spec.is_nsfw,
                 is_public=True,
-                popularity_score=10.0,
+                popularity_score=_latest_public_trend_popularity_score(spec.category) or 10.0,
                 tags=list(spec.tags),
+                template_id=public_trends_template.id if _seed_spec_has_public_trends(spec) else None,
             )
             session.add(meme)
             await session.flush()
@@ -581,6 +728,7 @@ async def seed_direct_corpus(
                         prompt_version=E2E_PROMPT_VERSION,
                         generated_at=now,
                     ),
+                    *build_public_trend_snapshot_rows(meme_id=meme_id, category=spec.category),
                     *_build_succeeded_stage_rows(
                         meme_file_id=meme_file_id,
                         event_id=_stable_uuid(f"{spec.category}:event"),
@@ -883,6 +1031,155 @@ def _seeded_meme_payload(item: SeededMeme) -> dict[str, object]:
     }
 
 
+def build_public_trends_template() -> MemeTemplate:
+    return MemeTemplate(
+        id=_stable_uuid("public-trends:template"),
+        slug=E2E_PUBLIC_TRENDS_TEMPLATE_SLUG,
+        name=E2E_PUBLIC_TRENDS_TEMPLATE_NAME,
+        description=E2E_PUBLIC_TRENDS_TEMPLATE_DESCRIPTION,
+        is_curated=True,
+    )
+
+
+def build_public_trend_snapshot_rows(*, meme_id: uuid.UUID, category: str) -> list[MemePopularitySnapshot]:
+    return [
+        MemePopularitySnapshot(
+            id=_stable_uuid(f"{category}:public-trend-snapshot:{index}"),
+            meme_id=meme_id,
+            captured_at=spec.captured_at,
+            source_views=spec.source_views,
+            source_reactions=spec.source_reactions,
+            source_reposts=spec.source_reposts,
+            platform_views=spec.platform_views,
+            platform_sends=spec.platform_sends,
+            platform_saves=spec.platform_saves,
+            platform_likes=spec.platform_likes,
+            popularity_score=spec.popularity_score,
+        )
+        for index, spec in enumerate(PUBLIC_TREND_SNAPSHOT_SPECS_BY_CATEGORY.get(category, ()), start=1)
+    ]
+
+
+def build_public_trends_artifact(seeded: list[SeededMeme]) -> dict[str, object]:
+    representative = _require_seeded_category(seeded, "cat")
+    compare_items = [
+        f"meme:{representative.slug}",
+        f"tag:{E2E_PUBLIC_TRENDS_TAG_SLUG}",
+        f"template:{E2E_PUBLIC_TRENDS_TEMPLATE_SLUG}",
+    ]
+    aggregate_history_points = build_public_trend_aggregate_history_points_payload()
+    timeline_snapshot_count = sum(int(point["snapshot_count"]) for point in aggregate_history_points)
+    return {
+        "trend_path": "/trends",
+        "tag": {
+            "slug": E2E_PUBLIC_TRENDS_TAG_SLUG,
+            "title": _public_tag_title(E2E_PUBLIC_TRENDS_TAG_SLUG),
+            "path": f"/tags/{E2E_PUBLIC_TRENDS_TAG_SLUG}",
+            "history_points": [dict(point) for point in aggregate_history_points],
+        },
+        "template": {
+            "slug": E2E_PUBLIC_TRENDS_TEMPLATE_SLUG,
+            "title": f"{E2E_PUBLIC_TRENDS_TEMPLATE_NAME} memes",
+            "path": f"/templates/{E2E_PUBLIC_TRENDS_TEMPLATE_SLUG}",
+            "history_points": [dict(point) for point in aggregate_history_points],
+        },
+        "compare": {
+            "items": compare_items,
+            "path": _query_path("/trends/compare", [("item", item) for item in compare_items]),
+        },
+        "timeline": {
+            "path": _query_path(
+                "/trends/timeline",
+                [("granularity", E2E_PUBLIC_TRENDS_TIMELINE_GRANULARITY)],
+            ),
+            "granularity": E2E_PUBLIC_TRENDS_TIMELINE_GRANULARITY,
+            "period": E2E_PUBLIC_TRENDS_TIMELINE_PERIOD,
+            "period_label": "January 2026",
+            "snapshot_count": timeline_snapshot_count,
+        },
+        "representative_meme": {
+            "category": representative.category,
+            "slug": representative.slug,
+            "title": representative.title,
+        },
+    }
+
+
+def build_public_trend_aggregate_history_points_payload() -> list[dict[str, str | int | float]]:
+    totals_by_observed_at: dict[datetime, dict[str, float | int]] = {}
+    meme_categories_by_observed_at: dict[datetime, set[str]] = {}
+    for category in E2E_PUBLIC_TRENDS_MEME_CATEGORIES:
+        for spec in PUBLIC_TREND_SNAPSHOT_SPECS_BY_CATEGORY[category]:
+            observed_at = _public_trend_observed_at(spec)
+            totals = totals_by_observed_at.setdefault(
+                observed_at,
+                {
+                    "snapshot_count": 0,
+                    "source_views": 0,
+                    "source_reactions": 0,
+                    "source_reposts": 0,
+                    "platform_views": 0,
+                    "platform_sends": 0,
+                    "platform_saves": 0,
+                    "platform_likes": 0,
+                    "value": 0.0,
+                },
+            )
+            meme_categories_by_observed_at.setdefault(observed_at, set()).add(category)
+            totals["snapshot_count"] += 1
+            totals["source_views"] += spec.source_views
+            totals["source_reactions"] += spec.source_reactions
+            totals["source_reposts"] += spec.source_reposts
+            totals["platform_views"] += spec.platform_views
+            totals["platform_sends"] += spec.platform_sends
+            totals["platform_saves"] += spec.platform_saves
+            totals["platform_likes"] += spec.platform_likes
+            totals["value"] += spec.popularity_score
+
+    return [
+        {
+            "observed_at": observed_at.isoformat(),
+            "value": round(float(totals_by_observed_at[observed_at]["value"]), 1),
+            "metric": "aggregate_popularity_score",
+            "label": "Aggregate popularity score",
+            "meme_count": len(meme_categories_by_observed_at[observed_at]),
+            "snapshot_count": totals_by_observed_at[observed_at]["snapshot_count"],
+            "source_views": totals_by_observed_at[observed_at]["source_views"],
+            "source_reactions": totals_by_observed_at[observed_at]["source_reactions"],
+            "source_reposts": totals_by_observed_at[observed_at]["source_reposts"],
+            "platform_views": totals_by_observed_at[observed_at]["platform_views"],
+            "platform_sends": totals_by_observed_at[observed_at]["platform_sends"],
+            "platform_saves": totals_by_observed_at[observed_at]["platform_saves"],
+            "platform_likes": totals_by_observed_at[observed_at]["platform_likes"],
+        }
+        for observed_at in sorted(totals_by_observed_at)
+    ]
+
+
+def _seed_spec_has_public_trends(spec: SeedSpec) -> bool:
+    return not spec.is_nsfw and spec.category in PUBLIC_TREND_SNAPSHOT_SPECS_BY_CATEGORY
+
+
+def _latest_public_trend_popularity_score(category: str) -> float | None:
+    specs = PUBLIC_TREND_SNAPSHOT_SPECS_BY_CATEGORY.get(category)
+    if not specs:
+        return None
+    return max(specs, key=lambda spec: spec.captured_at).popularity_score
+
+
+def _public_trend_observed_at(spec: PublicTrendSnapshotSpec) -> datetime:
+    return datetime(spec.captured_at.year, spec.captured_at.month, spec.captured_at.day, tzinfo=UTC)
+
+
+def _public_tag_title(tag: str) -> str:
+    return f"{tag.replace('-', ' ').title()} memes"
+
+
+def _query_path(path: str, params: list[tuple[str, str]]) -> str:
+    query = urlencode(params)
+    return f"{path}?{query}" if query else path
+
+
 def _require_seeded_category(seeded: list[SeededMeme], category: str) -> SeededMeme:
     for item in seeded:
         if item.category == category:
@@ -904,7 +1201,7 @@ def build_seed_specs() -> list[SeedSpec]:
             caption="Deterministic cat search meme",
             alt_text="Red square cat PRD E2E meme fixture",
             query="cat",
-            tags=("cat", "e2e-prd"),
+            tags=("cat", "e2e-prd", E2E_PUBLIC_TRENDS_TAG_SLUG),
         ),
         SeedSpec(
             category="dog",
@@ -914,7 +1211,7 @@ def build_seed_specs() -> list[SeedSpec]:
             caption="Deterministic dog search meme",
             alt_text="Blue square dog PRD E2E meme fixture",
             query="dog",
-            tags=("dog", "e2e-prd"),
+            tags=("dog", "e2e-prd", E2E_PUBLIC_TRENDS_TAG_SLUG),
         ),
         SeedSpec(
             category="frog",
@@ -924,7 +1221,7 @@ def build_seed_specs() -> list[SeedSpec]:
             caption="Deterministic frog search meme",
             alt_text="Green square frog PRD E2E meme fixture",
             query="frog",
-            tags=("frog", "e2e-prd"),
+            tags=("frog", "e2e-prd", E2E_PUBLIC_TRENDS_TAG_SLUG),
         ),
         SeedSpec(
             category="cat-nsfw",
@@ -967,11 +1264,14 @@ async def cleanup_seed_rows(session: AsyncSession, *, settings: Settings, specs:
     )
     for seo_page in slug_result.scalars():
         meme_ids.add(seo_page.meme_id)
+    meme_ids.update(_stable_uuid(f"{spec.category}:meme") for spec in specs)
 
     for meme_id in meme_ids:
         meme = await session.get(Meme, meme_id)
         if meme is not None:
             await session.delete(meme)
+    await session.flush()
+    await cleanup_public_trends_template_rows(session)
 
     voyage_client = build_pipeline_voyage_client(settings=settings)
     for spec in specs:
@@ -984,6 +1284,20 @@ async def cleanup_seed_rows(session: AsyncSession, *, settings: Settings, specs:
         )
         for cache_row in result.scalars():
             await session.delete(cache_row)
+    await session.flush()
+
+
+async def cleanup_public_trends_template_rows(session: AsyncSession) -> None:
+    result = await session.execute(
+        select(MemeTemplate).where(
+            or_(
+                MemeTemplate.id == _stable_uuid("public-trends:template"),
+                MemeTemplate.slug == E2E_PUBLIC_TRENDS_TEMPLATE_SLUG,
+            ),
+        ),
+    )
+    for template in result.scalars():
+        await session.delete(template)
     await session.flush()
 
 
@@ -1355,6 +1669,191 @@ def prove_seeded_public_corpus(client: PipelineApiClient, *, seeded: list[Seeded
     return proof
 
 
+def prove_seeded_public_trends(client: PipelineApiClient, *, seeded: list[SeededMeme]) -> dict[str, object]:
+    representative = _require_seeded_category(seeded, "cat")
+
+    trend_page = client.public_trend_page(limit=20)
+    trend_ids = [
+        item.get("meme", {}).get("id")
+        for item in trend_page.get("items", [])
+        if isinstance(item, dict)
+    ]
+    if str(representative.meme_id) not in trend_ids:
+        raise E2ESeedError(
+            f"Public trends page did not include seeded representative meme {representative.meme_id}; "
+            f"trend_ids={trend_ids}",
+        )
+
+    tag_summary = _assert_public_trend_summary(
+        _find_public_trend_summary(
+            client.public_tag_trend_summaries(limit=20),
+            slug=E2E_PUBLIC_TRENDS_TAG_SLUG,
+            label="tag summaries",
+        ),
+        slug=E2E_PUBLIC_TRENDS_TAG_SLUG,
+        title=_public_tag_title(E2E_PUBLIC_TRENDS_TAG_SLUG),
+    )
+    template_summary = _assert_public_trend_summary(
+        _find_public_trend_summary(
+            client.public_template_trend_summaries(limit=20),
+            slug=E2E_PUBLIC_TRENDS_TEMPLATE_SLUG,
+            label="template summaries",
+        ),
+        slug=E2E_PUBLIC_TRENDS_TEMPLATE_SLUG,
+        title=f"{E2E_PUBLIC_TRENDS_TEMPLATE_NAME} memes",
+    )
+
+    tag_landing = client.public_tag_landing(E2E_PUBLIC_TRENDS_TAG_SLUG)
+    _assert_landing_trend_summary(tag_landing, slug=E2E_PUBLIC_TRENDS_TAG_SLUG, label="tag landing")
+    template_landing = client.public_template_landing(E2E_PUBLIC_TRENDS_TEMPLATE_SLUG)
+    _assert_landing_trend_summary(
+        template_landing,
+        slug=E2E_PUBLIC_TRENDS_TEMPLATE_SLUG,
+        label="template landing",
+    )
+
+    comparison_items = [
+        f"meme:{representative.slug}",
+        f"tag:{E2E_PUBLIC_TRENDS_TAG_SLUG}",
+        f"template:{E2E_PUBLIC_TRENDS_TEMPLATE_SLUG}",
+    ]
+    comparison = client.public_trend_comparison(comparison_items)
+    comparison_proof = _assert_public_trend_comparison(comparison, representative=representative)
+
+    timeline = client.public_trend_timeline(granularity=E2E_PUBLIC_TRENDS_TIMELINE_GRANULARITY, limit=12)
+    timeline_proof = _assert_public_trend_timeline(timeline, representative=representative)
+
+    return {
+        "trend_hit_ids": trend_ids,
+        "tag_points": len(tag_summary["points"]),
+        "template_points": len(template_summary["points"]),
+        "comparison": comparison_proof,
+        "timeline": timeline_proof,
+    }
+
+
+def _find_public_trend_summary(
+    summaries: list[dict[str, Any]],
+    *,
+    slug: str,
+    label: str,
+) -> dict[str, Any]:
+    for summary in summaries:
+        if summary.get("slug") == slug:
+            return summary
+    raise E2ESeedError(f"Public trend {label} did not include slug {slug!r}: {summaries}")
+
+
+def _assert_public_trend_summary(summary: dict[str, Any], *, slug: str, title: str) -> dict[str, Any]:
+    if summary.get("slug") != slug:
+        raise E2ESeedError(f"Public trend summary resolved slug {summary.get('slug')!r}, expected {slug!r}.")
+    if summary.get("title") != title:
+        raise E2ESeedError(f"Public trend summary {slug!r} title {summary.get('title')!r}, expected {title!r}.")
+    points = summary.get("points")
+    if not isinstance(points, list) or len(points) < 2:
+        raise E2ESeedError(f"Public trend summary {slug!r} must expose at least two real points: {summary}")
+    if summary.get("insufficient_history") is not False:
+        raise E2ESeedError(f"Public trend summary {slug!r} unexpectedly marked insufficient_history: {summary}")
+    _assert_expected_public_trend_points(points, label=f"summary {slug}")
+    return summary
+
+
+def _assert_landing_trend_summary(landing: dict[str, Any], *, slug: str, label: str) -> None:
+    trend_summary = landing.get("trend_summary")
+    if not isinstance(trend_summary, dict):
+        raise E2ESeedError(f"Public {label} did not include trend_summary: {landing}")
+    _assert_public_trend_summary(trend_summary, slug=slug, title=str(landing.get("title")))
+
+
+def _assert_expected_public_trend_points(points: list[Any], *, label: str) -> None:
+    expected_points = build_public_trend_aggregate_history_points_payload()
+    points_by_day = {
+        str(point.get("observed_at", ""))[:10]: point
+        for point in points
+        if isinstance(point, dict)
+    }
+    for expected in expected_points:
+        observed_day = str(expected["observed_at"])[:10]
+        point = points_by_day.get(observed_day)
+        if point is None:
+            raise E2ESeedError(f"Public trend {label} missing expected point day {observed_day}: {points}")
+        for key in ("value", "meme_count", "snapshot_count", "source_views", "platform_views", "platform_likes"):
+            if point.get(key) != expected[key]:
+                raise E2ESeedError(
+                    f"Public trend {label} point {observed_day} returned {key}={point.get(key)!r}, "
+                    f"expected {expected[key]!r}; point={point}",
+                )
+
+
+def _assert_public_trend_comparison(
+    comparison: dict[str, Any],
+    *,
+    representative: SeededMeme,
+) -> dict[str, object]:
+    items = comparison.get("items")
+    if not isinstance(items, list):
+        raise E2ESeedError(f"Public trend comparison returned malformed items: {comparison}")
+    series_by_kind = {
+        item.get("kind"): item
+        for item in items
+        if isinstance(item, dict) and item.get("kind") in {"meme", "tag", "template"}
+    }
+    for kind in ("meme", "tag", "template"):
+        if kind not in series_by_kind:
+            raise E2ESeedError(f"Public trend comparison missing {kind} series: {comparison}")
+
+    meme_series = series_by_kind["meme"]
+    if meme_series.get("title") != representative.title:
+        raise E2ESeedError(
+            f"Public trend comparison meme title {meme_series.get('title')!r}, expected {representative.title!r}.",
+        )
+    for kind in ("meme", "tag", "template"):
+        points = series_by_kind[kind].get("points")
+        if not isinstance(points, list) or len(points) < 2:
+            raise E2ESeedError(f"Public trend comparison {kind} series lacks real history points: {comparison}")
+        if series_by_kind[kind].get("insufficient_history") is not False:
+            raise E2ESeedError(f"Public trend comparison {kind} series marked insufficient history: {comparison}")
+    return {"series_count": len(items), "requested_items": comparison.get("requested_items", [])}
+
+
+def _assert_public_trend_timeline(
+    timeline: dict[str, Any],
+    *,
+    representative: SeededMeme,
+) -> dict[str, object]:
+    periods = timeline.get("periods")
+    if not isinstance(periods, list):
+        raise E2ESeedError(f"Public trend timeline returned malformed periods: {timeline}")
+    period = next(
+        (
+            item
+            for item in periods
+            if isinstance(item, dict) and item.get("period") == E2E_PUBLIC_TRENDS_TIMELINE_PERIOD
+        ),
+        None,
+    )
+    if period is None:
+        raise E2ESeedError(f"Public trend timeline missing period {E2E_PUBLIC_TRENDS_TIMELINE_PERIOD}: {timeline}")
+    expected_snapshot_count = sum(
+        int(point["snapshot_count"])
+        for point in build_public_trend_aggregate_history_points_payload()
+    )
+    if period.get("snapshot_count") != expected_snapshot_count:
+        raise E2ESeedError(
+            f"Public trend timeline period {E2E_PUBLIC_TRENDS_TIMELINE_PERIOD} snapshot_count="
+            f"{period.get('snapshot_count')!r}, expected {expected_snapshot_count}.",
+        )
+    top_memes = period.get("top_memes")
+    if not isinstance(top_memes, list) or not top_memes:
+        raise E2ESeedError(f"Public trend timeline period has no top memes: {period}")
+    first_meme = top_memes[0].get("meme", {}) if isinstance(top_memes[0], dict) else {}
+    if first_meme.get("id") != str(representative.meme_id):
+        raise E2ESeedError(
+            f"Public trend timeline top meme {first_meme.get('id')!r}, expected {representative.meme_id}.",
+        )
+    return {"period": period.get("period"), "snapshot_count": period.get("snapshot_count")}
+
+
 def assert_public_detail_resolves(
     client: PipelineApiClient,
     *,
@@ -1543,6 +2042,34 @@ def _validate_json_response(response: httpx.Response, *, expected_status: int | 
     if not isinstance(payload, dict):
         raise E2ESeedError(
             f"{response.request.method} {response.request.url.path} returned non-object JSON: {type(payload).__name__}",
+        )
+    return payload
+
+
+def _validate_json_list_response(
+    response: httpx.Response,
+    *,
+    expected_status: int | tuple[int, ...],
+) -> list[dict[str, Any]]:
+    try:
+        payload = response.json()
+    except json.JSONDecodeError as exc:
+        raise E2ESeedError(
+            f"{response.request.method} {response.request.url.path} returned non-JSON output: "
+            f"{exc}; body={response.text!r}",
+        ) from exc
+
+    expected_statuses = (expected_status,) if isinstance(expected_status, int) else expected_status
+    if response.status_code not in expected_statuses:
+        rendered = json.dumps(payload, sort_keys=True) if isinstance(payload, dict | list) else repr(payload)
+        raise E2ESeedError(
+            f"{response.request.method} {response.request.url.path} failed with HTTP "
+            f"{response.status_code}: {rendered}",
+        )
+    if not isinstance(payload, list) or not all(isinstance(item, dict) for item in payload):
+        raise E2ESeedError(
+            f"{response.request.method} {response.request.url.path} returned malformed JSON list: "
+            f"{type(payload).__name__}",
         )
     return payload
 
