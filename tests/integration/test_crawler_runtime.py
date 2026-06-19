@@ -40,7 +40,7 @@ from memexpert.models.content import (
 from memexpert.models.enums import SourcePlatform, TelegramSessionStatus
 from memexpert.schemas.content_pipeline import CrawlerForwardAttribution, CrawlerIngestOutcome
 from memexpert.services import CrawlerSessionNotRunnableError
-from tests.integration.test_content_pipeline_service import FakeStorageClient
+from tests.integration.test_ingest_accept_service import FakeStorageClient
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator

@@ -24,8 +24,8 @@ from memexpert.pipeline.events import (
     build_meme_created_transcode_dispatch_event,
     build_stage_routing_key,
 )
+from memexpert.pipeline.helpers import trim_error_text
 from memexpert.schemas.content_pipeline import ContentPipelineEventType
-from memexpert.services.content_pipeline_helpers import trim_error_text
 from memexpert.services.errors import PipelineIngestError
 
 if TYPE_CHECKING:

@@ -34,7 +34,7 @@ from memexpert.models.base import utcnow
 from memexpert.models.collection import Collection, CollectionMember, CollectionMeme
 from memexpert.models.content import Meme, MemeFile, MemeFileSyncTargetSnapshot, MemeSeoPage, MemeTemplate
 from memexpert.models.enums import ContentProcessingStatus, SyncTargetKind, SyncTargetStatus
-from memexpert.services.content_pipeline_helpers import build_sync_preview_model, trim_error_text, trim_reason
+from memexpert.pipeline.helpers import build_sync_preview_model, trim_error_text, trim_reason
 from memexpert.services.errors import PipelineIngestError
 from memexpert.services.meme_seo import MemeSeoGenerationService, MemeSeoProviderProtocol, build_meme_seo_provider
 from memexpert.services.search_index_sync import (

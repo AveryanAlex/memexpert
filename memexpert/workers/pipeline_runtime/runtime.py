@@ -36,10 +36,11 @@ from memexpert.core.voyage import VoyageClientProtocol
 from memexpert.ingest.materializer import PipelineIngestMaterializer
 from memexpert.media.contracts import MediaValidationError
 from memexpert.models.enums import ContentPipelineStage
+from memexpert.pipeline.dispatch import PipelineStageWorkContext
 from memexpert.pipeline.events import MediaInspectRequestedEvent
+from memexpert.pipeline.stage_completion import PipelineStageCompletionService
 from memexpert.schemas.content_pipeline import ContentPipelineDispatchEvent
 from memexpert.services import (
-    ContentPipelineService,
     PipelineIngestError,
     PipelinePublishError,
 )
@@ -77,7 +78,6 @@ if TYPE_CHECKING:
     from memexpert.core.voyage import VoyageEmbeddingResult
     from memexpert.media.contracts import NormalizedMediaResult, PipelineMediaProcessorProtocol
     from memexpert.services.content_merge import MergeOutcome
-    from memexpert.services.content_pipeline import PipelineStageWorkContext
 
 
 class RabbitMessageLike(Protocol):
@@ -538,7 +538,7 @@ class PipelineRuntime:
 
         Failures from the adapter bubble up so ``_handle_stage_message`` can
         run the shared normalize-and-classify path; before re-raising, we
-        always call :meth:`ContentPipelineService.fail_sync_qdrant_stage` so
+        always record ``fail_sync_qdrant_stage`` so
         the per-target snapshot row stays truthful even when the stage-journal
         path is about to dead-letter.
         """
@@ -620,7 +620,7 @@ class PipelineRuntime:
         """Load canonical state, upsert to Meilisearch, and record per-target sync truth.
 
         Mirrors :meth:`_run_sync_qdrant_stage` exactly: every failure branch
-        calls :meth:`ContentPipelineService.fail_sync_meili_stage` so the
+        records ``fail_sync_meili_stage`` so the
         per-target snapshot row is truthful before the dispatcher runs the
         shared normalize-and-classify path. The post-upsert preview fetch is
         best-effort — a fetch failure must never fail the stage because the
@@ -736,7 +736,7 @@ class PipelineRuntime:
         event_id: uuid.UUID,
     ) -> PipelineStageWorkContext:
         async with self.session_factory() as session:
-            service = self._build_service(session)
+            service = self._build_stage_completion_service(session)
             return await service.start_stage_processing(
                 meme_file_id=meme_file_id,
                 stage=stage,
@@ -753,7 +753,7 @@ class PipelineRuntime:
         normalized: NormalizedMediaResult,
     ) -> None:
         async with self.session_factory() as session:
-            service = self._build_service(session)
+            service = self._build_stage_completion_service(session)
             await service.complete_transcode_stage(
                 meme_file_id=meme_file_id,
                 attempt=attempt,
@@ -770,7 +770,7 @@ class PipelineRuntime:
         ocr_result: OCRExtractionResult,
     ) -> None:
         async with self.session_factory() as session:
-            service = self._build_service(session)
+            service = self._build_stage_completion_service(session)
             await service.complete_ocr_stage(
                 meme_file_id=meme_file_id,
                 attempt=attempt,
@@ -788,7 +788,7 @@ class PipelineRuntime:
         similarity_matches: tuple[QdrantSimilarityMatch, ...],
     ) -> MergeOutcome:
         async with self.session_factory() as session:
-            service = self._build_service(session)
+            service = self._build_stage_completion_service(session)
             return await service.complete_embed_stage(
                 meme_file_id=meme_file_id,
                 attempt=attempt,
@@ -806,7 +806,7 @@ class PipelineRuntime:
         classification_result: ClassificationResult,
     ) -> None:
         async with self.session_factory() as session:
-            service = self._build_service(session)
+            service = self._build_stage_completion_service(session)
             await service.complete_classify_stage(
                 meme_file_id=meme_file_id,
                 attempt=attempt,
@@ -823,7 +823,7 @@ class PipelineRuntime:
         payload_preview: dict[str, object],
     ) -> None:
         async with self.session_factory() as session:
-            service = self._build_service(session)
+            service = self._build_stage_completion_service(session)
             _ = await service.complete_sync_qdrant_stage(
                 meme_file_id=meme_file_id,
                 attempt=attempt,
@@ -840,7 +840,7 @@ class PipelineRuntime:
         payload_preview: dict[str, object],
     ) -> None:
         async with self.session_factory() as session:
-            service = self._build_service(session)
+            service = self._build_stage_completion_service(session)
             _ = await service.complete_sync_meili_stage(
                 meme_file_id=meme_file_id,
                 attempt=attempt,
@@ -887,7 +887,7 @@ class PipelineRuntime:
         last_error_text = render_error_text(exc)
         try:
             async with self.session_factory() as session:
-                service = self._build_service(session)
+                service = self._build_stage_completion_service(session)
                 _ = await service.fail_sync_qdrant_stage(
                     meme_file_id=dispatch_event.meme_file_id,
                     attempt=attempt,
@@ -933,7 +933,7 @@ class PipelineRuntime:
         last_error_text = render_error_text(exc)
         try:
             async with self.session_factory() as session:
-                service = self._build_service(session)
+                service = self._build_stage_completion_service(session)
                 _ = await service.fail_sync_meili_stage(
                     meme_file_id=dispatch_event.meme_file_id,
                     attempt=attempt,
@@ -957,7 +957,7 @@ class PipelineRuntime:
     ) -> None:
         try:
             async with self.session_factory() as session:
-                service = self._build_service(session)
+                service = self._build_stage_completion_service(session)
                 await service.mark_stage_failed(
                     meme_file_id=meme_file_id,
                     stage=stage,
@@ -970,8 +970,8 @@ class PipelineRuntime:
         except Exception:
             return
 
-    def _build_service(self, session: AsyncSession) -> ContentPipelineService:
-        return ContentPipelineService(
+    def _build_stage_completion_service(self, session: AsyncSession) -> PipelineStageCompletionService:
+        return PipelineStageCompletionService(
             session,
             settings=self.settings,
         )

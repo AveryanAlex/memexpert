@@ -1,7 +1,7 @@
 # ruff: noqa: TC003
 """Dual-target search-sync smoke proof used by the S03 operator surface.
 
-This module lives alongside :mod:`content_pipeline_reporting` because the
+This module lives alongside :mod:`memexpert.pipeline.reporting` because the
 reporting file already carries detail enrichment, outcome classification, run
 summaries, and Markdown rendering — adding the smoke-proof runner on top
 would push it well past the soft-cap size. The smoke proof consults:
@@ -41,11 +41,12 @@ from memexpert.core.qdrant import (
 from memexpert.models.base import utcnow
 from memexpert.models.content import EmbeddingCache, Meme, MemeFile
 from memexpert.models.enums import EmbeddingInputType, SyncTargetKind
+from memexpert.pipeline.state import PipelineDatabaseService
 from memexpert.schemas.content_pipeline import (
     SmokeProofResult,
     SmokeProofTargetResult,
 )
-from memexpert.services.errors import PipelineIngestError, PipelineItemNotFoundError
+from memexpert.services.errors import PipelineIngestError, PipelineItemNotFoundError, PipelinePayloadValidationError
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -69,6 +70,56 @@ SMOKE_REASON_EMBEDDING_MISSING = "embedding_missing"
 # accidentally surface in a rare top-20 result but large enough to tolerate
 # near-duplicate embeddings the auto-merge layer has not yet collapsed.
 SMOKE_TOP_K = 20
+
+
+class PipelineSmokeProofService(PipelineDatabaseService):
+    """Run dual-target smoke proof and resolve query-only proof targets."""
+
+    async def run_search_smoke_proof(
+        self,
+        *,
+        qdrant_sync_client: QdrantSyncClientProtocol,
+        qdrant_similarity_client: QdrantSimilarityClientProtocol,
+        meilisearch_sync_client: MeilisearchSyncClientProtocol,
+        meme_file_id: uuid.UUID,
+        query: str | None,
+    ) -> SmokeProofResult:
+        return await run_smoke_proof(
+            self._session,
+            qdrant_sync_client=qdrant_sync_client,
+            qdrant_similarity_client=qdrant_similarity_client,
+            meilisearch_sync_client=meilisearch_sync_client,
+            meme_file_id=meme_file_id,
+            query=query,
+        )
+
+    async def resolve_meme_file_id_from_query(
+        self,
+        *,
+        meilisearch_sync_client: MeilisearchSyncClientProtocol,
+        query: str,
+    ) -> uuid.UUID:
+        stripped_query = query.strip()
+        if not stripped_query:
+            raise PipelinePayloadValidationError(
+                "Smoke proof query must not be blank.",
+            )
+        hits = await meilisearch_sync_client.search(stripped_query, limit=1)
+        if not hits:
+            raise PipelineItemNotFoundError(
+                f"Smoke proof query '{stripped_query}' returned no Meilisearch hits.",
+            )
+        raw_id = hits[0].get("id") if isinstance(hits[0], dict) else None
+        if not isinstance(raw_id, str):
+            raise PipelineItemNotFoundError(
+                f"Smoke proof query '{stripped_query}' returned a malformed top hit id.",
+            )
+        try:
+            return uuid.UUID(raw_id)
+        except ValueError as exc:
+            raise PipelineItemNotFoundError(
+                f"Smoke proof query '{stripped_query}' returned a malformed top hit id.",
+            ) from exc
 
 
 async def run_smoke_proof(
@@ -598,6 +649,7 @@ def _render_replay_drilldown_for_target(
 
 
 __all__ = [
+    "PipelineSmokeProofService",
     "SMOKE_REASON_DOCUMENT_NOT_FOUND",
     "SMOKE_REASON_EMBEDDING_MISSING",
     "SMOKE_REASON_MALFORMED_RESPONSE",

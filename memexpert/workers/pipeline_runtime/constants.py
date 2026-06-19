@@ -1,11 +1,9 @@
 """Normalized failure-reason codes and dead-letter payload type for the pipeline runtime.
 
 These constants mirror (intentionally) the ``PIPELINE_REASON_*`` strings the
-service layer writes into ``PipelineStageJournal.normalized_reason``. We keep
-the mirror separate from :mod:`memexpert.services.content_pipeline` to avoid a
-cyclical worker → service → worker import chain. Any reason string added here
-must also be recognised by the service layer's replay allow-list if it should
-be treated as retryable.
+stage completion service writes into ``PipelineStageJournal.normalized_reason``.
+Any reason string added here must also be recognised by the pipeline replay
+allow-list if it should be treated as retryable.
 """
 
 from __future__ import annotations

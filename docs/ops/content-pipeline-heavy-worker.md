@@ -187,7 +187,7 @@ rm -rf .artifacts/s02-runtime-smoke
 ## Related references
 
 - `scripts/verify_s02_runtime.py` — the harness implementation.
-- `memexpert/services/content_pipeline_reporting.py` — the aggregation and
+- `memexpert/pipeline/reporting.py` — the aggregation and
   rendering helpers the harness (and tests) share.
 - `memexpert/schemas/content_pipeline.py` — authoritative schemas for the
   enriched detail projections and run summary payload.

@@ -50,7 +50,7 @@ from memexpert.models.enums import (
     TelegramSessionStatus,
 )
 from memexpert.services.crawler_operations import CrawlerOperationsService
-from tests.integration.test_content_pipeline_service import FakeStorageClient
+from tests.integration.test_ingest_accept_service import FakeStorageClient
 
 if TYPE_CHECKING:
     from fastapi import FastAPI

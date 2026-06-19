@@ -11,8 +11,8 @@ from memexpert.models.enums import ContentPipelineStage
 if TYPE_CHECKING:
     from collections.abc import Awaitable
 
+    from memexpert.pipeline.dispatch import PipelineStageWorkContext
     from memexpert.schemas.content_pipeline import ContentPipelineDispatchEvent
-    from memexpert.services.content_pipeline import PipelineStageWorkContext
 
 
 class StageImplementation(Protocol):

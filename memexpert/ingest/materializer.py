@@ -64,9 +64,9 @@ from memexpert.models.enums import (
     PipelineIngestRequestStatus,
     SourceAttachReason,
 )
+from memexpert.pipeline import constants as _consts
+from memexpert.pipeline.helpers import trim_error_text
 from memexpert.pipeline.outbox import build_meme_created_transcode_outbox_event
-from memexpert.services import content_pipeline_constants as _consts
-from memexpert.services.content_pipeline_helpers import trim_error_text
 from memexpert.services.errors import PipelineIngestError, PipelinePayloadTooLargeError, PipelineStorageError
 
 if TYPE_CHECKING:

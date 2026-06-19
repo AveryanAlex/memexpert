@@ -36,9 +36,12 @@ from memexpert.crawlers.telegram.runtime import TelegramCrawlerRuntime
 from memexpert.ingest.accept_service import PipelineIngestAcceptService
 from memexpert.ingest.crawler_service import PipelineCrawlerIngestService
 from memexpert.ingest.read_service import PipelineIngestReadService
+from memexpert.pipeline.items import PipelineItemReadService
+from memexpert.pipeline.replay import PipelineReplayService
+from memexpert.pipeline.smoke_proof import PipelineSmokeProofService
+from memexpert.pipeline.sync_status import PipelineSyncStatusService
 from memexpert.schemas.content_pipeline import ContentPipelineErrorCode, ContentPipelineErrorResponse
 from memexpert.services import (
-    ContentPipelineService,
     CrawlerChannelNotFoundError,
     CrawlerChannelNotTrackedError,
     CrawlerInvalidSessionError,
@@ -175,12 +178,36 @@ def require_pipeline_operator_token(operator_token: OperatorTokenHeaderDep = Non
         )
 
 
-def get_content_pipeline_service(
+def get_pipeline_item_read_service(
     session: Annotated[AsyncSession, Depends(get_db_session)],
-) -> ContentPipelineService:
-    """Build the operator ingest service from the current request session."""
+) -> PipelineItemReadService:
+    """Build the materialized item read service for one request."""
 
-    return ContentPipelineService.from_settings(session)
+    return PipelineItemReadService.from_settings(session)
+
+
+def get_pipeline_replay_service(
+    session: Annotated[AsyncSession, Depends(get_db_session)],
+) -> PipelineReplayService:
+    """Build the operator replay service for one request."""
+
+    return PipelineReplayService.from_settings(session)
+
+
+def get_pipeline_sync_status_service(
+    session: Annotated[AsyncSession, Depends(get_db_session)],
+) -> PipelineSyncStatusService:
+    """Build the per-target sync status read service for one request."""
+
+    return PipelineSyncStatusService.from_settings(session)
+
+
+def get_pipeline_smoke_proof_service(
+    session: Annotated[AsyncSession, Depends(get_db_session)],
+) -> PipelineSmokeProofService:
+    """Build the search smoke-proof service for one request."""
+
+    return PipelineSmokeProofService.from_settings(session)
 
 
 def get_pipeline_ingest_accept_service(
@@ -274,7 +301,16 @@ def get_crawler_operations_service(
     return CrawlerOperationsService(session=session, runtime=runtime)
 
 
-PipelineServiceDep = Annotated[ContentPipelineService, Depends(get_content_pipeline_service)]
+PipelineItemReadServiceDep = Annotated[PipelineItemReadService, Depends(get_pipeline_item_read_service)]
+PipelineReplayServiceDep = Annotated[PipelineReplayService, Depends(get_pipeline_replay_service)]
+PipelineSyncStatusServiceDep = Annotated[
+    PipelineSyncStatusService,
+    Depends(get_pipeline_sync_status_service),
+]
+PipelineSmokeProofServiceDep = Annotated[
+    PipelineSmokeProofService,
+    Depends(get_pipeline_smoke_proof_service),
+]
 PipelineIngestAcceptServiceDep = Annotated[
     PipelineIngestAcceptService,
     Depends(get_pipeline_ingest_accept_service),
@@ -412,17 +448,23 @@ __all__ = [
     "PipelineCrawlerIngestServiceDep",
     "PipelineIngestAcceptServiceDep",
     "PipelineIngestReadServiceDep",
-    "PipelineServiceDep",
+    "PipelineItemReadServiceDep",
+    "PipelineReplayServiceDep",
+    "PipelineSmokeProofServiceDep",
+    "PipelineSyncStatusServiceDep",
     "PipelineTelegramClientDep",
     "QdrantSimilarityClientDep",
     "QdrantSyncClientDep",
-    "get_content_pipeline_service",
     "get_crawler_operations_service",
     "get_crawler_runtime",
     "get_meilisearch_sync_client",
+    "get_pipeline_item_read_service",
     "get_pipeline_ingest_accept_service",
     "get_pipeline_crawler_ingest_service",
     "get_pipeline_ingest_read_service",
+    "get_pipeline_replay_service",
+    "get_pipeline_smoke_proof_service",
+    "get_pipeline_sync_status_service",
     "get_pipeline_telegram_client",
     "get_qdrant_similarity_client",
     "get_qdrant_sync_client",
