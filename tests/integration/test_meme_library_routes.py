@@ -11,6 +11,7 @@ from sqlalchemy import func, select
 from memexpert.api.dependencies.auth import get_optional_current_user
 from memexpert.api.dependencies.collection import get_collection_service
 from memexpert.api.dependencies.meme import get_analytics_service, get_meme_report_service, get_meme_search_service
+from memexpert.api.routes.v1 import memes as meme_routes
 from memexpert.models.collection import CollectionMeme, PinnedMeme
 from memexpert.models.content import Meme, MemeFile
 from memexpert.models.enums import AnalyticsEventType, ContentKind, ContentLanguage, ContentProcessingStatus
@@ -244,6 +245,8 @@ async def test_detail_and_successful_actions_persist_strict_attribution_events(
             f"/api/v1/memes/{target_meme.id}",
             params=_attribution_query_params(source_meme.id),
         )
+        impression_response = await client.post(f"/api/v1/memes/{target_meme.id}/impression", json=action_payload)
+        detail_click_response = await client.post(f"/api/v1/memes/{target_meme.id}/detail-click", json=action_payload)
         favorite_response = await client.post(f"/api/v1/memes/{target_meme.id}/favorite", json=action_payload)
         save_response = await client.post(f"/api/v1/memes/{target_meme.id}/save", json=action_payload)
         pin_response = await client.post(f"/api/v1/memes/{target_meme.id}/pin", json=action_payload)
@@ -257,6 +260,8 @@ async def test_detail_and_successful_actions_persist_strict_attribution_events(
         app.dependency_overrides.clear()
 
     assert detail_response.status_code == 200
+    assert impression_response.json() == {"ok": True}
+    assert detail_click_response.json() == {"ok": True}
     assert favorite_response.status_code == 200
     assert save_response.status_code == 200
     assert pin_response.status_code == 200
@@ -273,6 +278,8 @@ async def test_detail_and_successful_actions_persist_strict_attribution_events(
     )
     assert [event.event_type for event in events] == [
         AnalyticsEventType.MEME_VIEW,
+        AnalyticsEventType.MEME_IMPRESSION,
+        AnalyticsEventType.MEME_DETAIL_CLICK,
         AnalyticsEventType.MEME_LIKE,
         AnalyticsEventType.MEME_SAVE,
         AnalyticsEventType.MEME_PIN,
@@ -333,17 +340,82 @@ async def test_share_download_telemetry_respects_private_and_nsfw_visibility(
     app.dependency_overrides[get_optional_current_user] = override_current_user
     try:
         private_share_response = await client.post(f"/api/v1/memes/{private_meme.id}/share", json={})
+        private_impression_response = await client.post(f"/api/v1/memes/{private_meme.id}/impression", json={})
+        private_detail_click_response = await client.post(f"/api/v1/memes/{private_meme.id}/detail-click", json={})
         private_download_response = await client.post(f"/api/v1/memes/{private_meme.id}/download", json={})
         nsfw_share_response = await client.post(f"/api/v1/memes/{nsfw_meme.id}/share", json={})
+        nsfw_impression_response = await client.post(f"/api/v1/memes/{nsfw_meme.id}/impression", json={})
+        nsfw_detail_click_response = await client.post(f"/api/v1/memes/{nsfw_meme.id}/detail-click", json={})
         nsfw_download_response = await client.post(f"/api/v1/memes/{nsfw_meme.id}/download", json={})
     finally:
         app.dependency_overrides.clear()
 
     assert private_share_response.status_code == 404
+    assert private_impression_response.status_code == 404
+    assert private_detail_click_response.status_code == 404
     assert private_download_response.status_code == 404
     assert nsfw_share_response.status_code == 404
+    assert nsfw_impression_response.status_code == 404
+    assert nsfw_detail_click_response.status_code == 404
     assert nsfw_download_response.status_code == 404
     assert await migrated_db_session.scalar(select(func.count()).select_from(AnalyticsEvent)) == 0
+
+
+async def test_action_succeeds_when_analytics_writer_fails(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+    monkeypatch,
+) -> None:
+    user_service = UserService(migrated_db_session)
+    full_user = await create_full_user_via_upgrade(user_service, email="analytics-failure-action@example.com")
+    meme = await _create_meme(migrated_db_session)
+    await migrated_db_session.commit()
+
+    class FailingAnalyticsService:
+        async def record_interaction_event(self, _event: object) -> None:
+            raise RuntimeError("analytics writer unavailable")
+
+    def override_collection_service() -> CollectionService:
+        return CollectionService(migrated_db_session)
+
+    def override_analytics_service() -> FailingAnalyticsService:
+        return FailingAnalyticsService()
+
+    async def override_current_user() -> UserRead | None:
+        return full_user
+
+    log_calls: list[dict[str, object]] = []
+
+    def capture_exception(_message: str, *, extra: dict[str, object]) -> None:
+        log_calls.append(extra)
+
+    monkeypatch.setattr(meme_routes.logger, "exception", capture_exception)
+    app.dependency_overrides[get_collection_service] = override_collection_service
+    app.dependency_overrides[get_analytics_service] = override_analytics_service
+    app.dependency_overrides[get_optional_current_user] = override_current_user
+    try:
+        response = await client.post(
+            f"/api/v1/memes/{meme.id}/save",
+            json={"attribution": _attribution_payload(meme.id)},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert await migrated_db_session.scalar(select(func.count()).select_from(CollectionMeme)) == 1
+    assert await migrated_db_session.scalar(select(func.count()).select_from(AnalyticsEvent)) == 0
+
+    assert log_calls == [
+        {
+            "analytics_event_type": AnalyticsEventType.MEME_SAVE.value,
+            "meme_id": str(meme.id),
+            "user_id": str(full_user.id),
+            "request_id": "req-route-attribution",
+            "impression_id": "imp-route-attribution",
+            "surface": "public_api_meme_similar",
+        }
+    ]
 
 
 async def test_library_route_returns_cards_collections_and_active_save_state(

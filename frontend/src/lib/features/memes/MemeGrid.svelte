@@ -1,7 +1,9 @@
 <script lang="ts">
   import { browser } from '$app/environment';
   import { invalidateAll } from '$app/navigation';
+  import { recordMemeDownload } from '$lib/api/client';
   import type { MemeResultAttributionRead, PublicMemeCardRead } from '$lib/api/types';
+  import { memeActionAttributionBody } from '$lib/memeActions';
   import { Button, Select } from '$lib/ui';
   import { Download } from '@lucide/svelte';
   import {
@@ -90,7 +92,11 @@
 
   async function saveSelectedToActive() {
     await runBulkAction('save', 'Saving selected memes...', async () => {
-      await mutateSelected((meme) => `/api/v1/memes/${encodeURIComponent(meme.id)}/save`, 'POST');
+      await mutateSelected(
+        (meme) => `/api/v1/memes/${encodeURIComponent(meme.id)}/save`,
+        'POST',
+        (meme) => memeActionAttributionBody(attributions[meme.id])
+      );
       statusMessage = `${selected.length} selected meme${selected.length === 1 ? '' : 's'} saved to the active collection.`;
     });
   }
@@ -129,6 +135,7 @@
     }
 
     for (const item of downloadable) {
+      recordBulkDownloadTelemetry(item.id);
       const link = document.createElement('a');
       link.href = item.url;
       link.download = downloadName(item.title);
@@ -155,12 +162,22 @@
     }
   }
 
-  async function mutateSelected(urlForMeme: (meme: PublicMemeCardRead) => string, method: 'DELETE' | 'POST') {
+  async function mutateSelected(
+    urlForMeme: (meme: PublicMemeCardRead) => string,
+    method: 'DELETE' | 'POST',
+    bodyForMeme?: (meme: PublicMemeCardRead) => unknown | undefined
+  ) {
     for (const meme of selected) {
+      const body = bodyForMeme?.(meme);
+      const headers = new Headers({ accept: 'application/json', 'x-requested-with': 'XMLHttpRequest' });
+      if (body !== undefined) {
+        headers.set('content-type', 'application/json');
+      }
       const response = await fetch(urlForMeme(meme), {
         method,
         credentials: 'include',
-        headers: { accept: 'application/json', 'x-requested-with': 'XMLHttpRequest' }
+        headers,
+        body: body === undefined ? undefined : JSON.stringify(body)
       });
 
       if (!response.ok) {
@@ -169,6 +186,15 @@
         throw new Error(`Could not update ${meme.caption || meme.tags[0] || 'selected meme'}: ${detail}`);
       }
     }
+  }
+
+  function recordBulkDownloadTelemetry(memeId: string) {
+    void recordMemeDownload({
+      fetch,
+      memeId,
+      body: memeActionAttributionBody(attributions[memeId]),
+      keepalive: true
+    }).catch((error: unknown) => console.warn('Bulk meme download telemetry failed.', { memeId, error }));
   }
 
   function downloadName(title: string): string {

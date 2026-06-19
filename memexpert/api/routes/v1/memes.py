@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import uuid
 from typing import Annotated
@@ -51,6 +52,7 @@ from memexpert.services.public_trends import PublicTrendRanking, PublicTrendTime
 from memexpert.services.report import MemeReportTargetNotVisibleError
 
 router = APIRouter(prefix="/memes", tags=["memes"])
+logger = logging.getLogger(__name__)
 
 SEARCH_SCOPE_DESCRIPTION = (
     "Optional search visibility scope. If omitted, requests use public results for HTTP public API "
@@ -718,6 +720,68 @@ async def share_meme(
     return MemeInteractionRecordedRead()
 
 
+@router.post("/{meme_id}/impression", response_model=MemeInteractionRecordedRead, summary="Record meme card impression")
+async def record_meme_impression(
+    meme_search_service: MemeSearchServiceDep,
+    analytics_service: AnalyticsServiceDep,
+    current_user: OptionalCurrentUserDep,
+    meme_id: Annotated[uuid.UUID, Path()],
+    payload: Annotated[MemeActionAttributionRequest | None, Body()] = None,
+    include_nsfw: Annotated[bool, Query()] = False,
+) -> MemeInteractionRecordedRead:
+    """Record a visible list-card impression without changing meme state."""
+
+    await _ensure_visible_meme_for_interaction(
+        meme_search_service,
+        meme_id=meme_id,
+        current_user=current_user,
+        include_nsfw=include_nsfw,
+    )
+    await _record_meme_interaction(
+        analytics_service,
+        AnalyticsEventType.MEME_IMPRESSION,
+        meme_id=meme_id,
+        current_user=current_user,
+        attribution=_payload_attribution(payload),
+        default_surface="public_api_meme_card",
+        properties={"action": "impression", "include_nsfw": _nsfw_allowed(current_user, include_nsfw)},
+    )
+    return MemeInteractionRecordedRead()
+
+
+@router.post(
+    "/{meme_id}/detail-click",
+    response_model=MemeInteractionRecordedRead,
+    summary="Record meme card detail click",
+)
+async def record_meme_detail_click(
+    meme_search_service: MemeSearchServiceDep,
+    analytics_service: AnalyticsServiceDep,
+    current_user: OptionalCurrentUserDep,
+    meme_id: Annotated[uuid.UUID, Path()],
+    payload: Annotated[MemeActionAttributionRequest | None, Body()] = None,
+    include_nsfw: Annotated[bool, Query()] = False,
+) -> MemeInteractionRecordedRead:
+    """Record a visible list-card click before the caller navigates to detail."""
+
+    await _ensure_visible_meme_for_interaction(
+        meme_search_service,
+        meme_id=meme_id,
+        current_user=current_user,
+        include_nsfw=include_nsfw,
+    )
+    await _record_meme_interaction(
+        analytics_service,
+        AnalyticsEventType.MEME_DETAIL_CLICK,
+        meme_id=meme_id,
+        current_user=current_user,
+        attribution=_payload_attribution(payload),
+        default_surface="public_api_meme_card",
+        properties={"action": "detail_click", "include_nsfw": _nsfw_allowed(current_user, include_nsfw)},
+    )
+    return MemeInteractionRecordedRead()
+
+
 @router.post("/{meme_id}/download", response_model=MemeInteractionRecordedRead, summary="Record meme download intent")
 async def download_meme(
     meme_search_service: MemeSearchServiceDep,
@@ -979,28 +1043,43 @@ async def _record_meme_interaction(
     report_id: uuid.UUID | None = None,
 ) -> None:
     attribution_properties = _attribution_properties(attribution)
-    await analytics_service.record_interaction_event(
-        InteractionEventWrite(
-            event_type=event_type,
-            user_id=current_user.id if current_user else None,
-            surface=attribution.surface if attribution and attribution.surface else default_surface,
-            refs=InteractionEventRefs(
-                collection_id=collection_id,
-                meme_id=meme_id,
-                report_id=report_id,
-                source_meme_id=attribution.source_meme_id if attribution else None,
-            ),
-            request_id=attribution.request_id if attribution else None,
-            impression_id=attribution.impression_id if attribution else None,
-            source_algorithm=attribution.source_algorithm if attribution else None,
-            query=attribution.query if attribution else None,
-            rank=attribution.rank if attribution else None,
-            score=attribution.score if attribution else None,
-            score_components=attribution.score_components if attribution else {},
-            reason=attribution.reason if attribution else None,
-            properties={**(properties or {}), **attribution_properties},
+    user_id = current_user.id if current_user else None
+    surface = attribution.surface if attribution and attribution.surface else default_surface
+    try:
+        await analytics_service.record_interaction_event(
+            InteractionEventWrite(
+                event_type=event_type,
+                user_id=user_id,
+                surface=surface,
+                refs=InteractionEventRefs(
+                    collection_id=collection_id,
+                    meme_id=meme_id,
+                    report_id=report_id,
+                    source_meme_id=attribution.source_meme_id if attribution else None,
+                ),
+                request_id=attribution.request_id if attribution else None,
+                impression_id=attribution.impression_id if attribution else None,
+                source_algorithm=attribution.source_algorithm if attribution else None,
+                query=attribution.query if attribution else None,
+                rank=attribution.rank if attribution else None,
+                score=attribution.score if attribution else None,
+                score_components=attribution.score_components if attribution else {},
+                reason=attribution.reason if attribution else None,
+                properties={**(properties or {}), **attribution_properties},
+            )
         )
-    )
+    except Exception:
+        logger.exception(
+            "Meme interaction analytics write failed.",
+            extra={
+                "analytics_event_type": event_type.value,
+                "meme_id": str(meme_id),
+                "user_id": str(user_id) if user_id else None,
+                "request_id": attribution.request_id if attribution else None,
+                "impression_id": attribution.impression_id if attribution else None,
+                "surface": surface,
+            },
+        )
 
 
 def _payload_attribution(
