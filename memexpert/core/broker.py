@@ -30,6 +30,7 @@ class PipelineBrokerSettings:
     exchange: str
     routing_key_prefix: str
     media_inspect_queue: str
+    source_engagement_capture_queue: str
     transcode_queue: str
     ocr_queue: str
     embed_queue: str
@@ -61,6 +62,24 @@ class PipelineBrokerSettings:
         """Return the routing key used when retried media-inspect work returns."""
 
         return f"{self.routing_key_prefix}.media_inspect_retry"
+
+    @property
+    def source_engagement_capture_routing_key(self) -> str:
+        """Return the routing key used to dispatch scheduled source engagement work."""
+
+        return f"{self.routing_key_prefix}.source_engagement_capture"
+
+    @property
+    def source_engagement_capture_retry_request_routing_key(self) -> str:
+        """Return the retry-exchange routing key used by source-engagement failures."""
+
+        return f"{self.routing_key_prefix}.retry.source_engagement_capture"
+
+    @property
+    def source_engagement_capture_retry_routing_key(self) -> str:
+        """Return the routing key used when retried source-engagement work returns."""
+
+        return f"{self.routing_key_prefix}.source_engagement_capture_retry"
 
     @property
     def transcode_routing_key(self) -> str:
@@ -290,6 +309,10 @@ def get_pipeline_broker_settings(settings: Settings | None = None) -> PipelineBr
             resolved_settings.pipeline_broker_media_inspect_queue,
             field_name="pipeline_broker_media_inspect_queue",
         ),
+        source_engagement_capture_queue=_normalize_topology_name(
+            resolved_settings.pipeline_broker_source_engagement_capture_queue,
+            field_name="pipeline_broker_source_engagement_capture_queue",
+        ),
         transcode_queue=_normalize_topology_name(
             resolved_settings.pipeline_broker_transcode_queue,
             field_name="pipeline_broker_transcode_queue",
@@ -437,6 +460,16 @@ async def verify_pipeline_broker(
                         "x-dead-letter-routing-key": broker_settings.media_inspect_retry_request_routing_key,
                     },
                 )
+                source_engagement_capture_queue = await channel.declare_queue(
+                    broker_settings.source_engagement_capture_queue,
+                    durable=True,
+                    arguments={
+                        "x-dead-letter-exchange": broker_settings.retry_exchange,
+                        "x-dead-letter-routing-key": (
+                            broker_settings.source_engagement_capture_retry_request_routing_key
+                        ),
+                    },
+                )
                 transcode_queue = await channel.declare_queue(
                     broker_settings.transcode_queue,
                     durable=True,
@@ -463,6 +496,15 @@ async def verify_pipeline_broker(
                         "x-dead-letter-routing-key": broker_settings.media_inspect_retry_routing_key,
                     },
                 )
+                source_engagement_capture_retry_queue = await channel.declare_queue(
+                    f"{broker_settings.source_engagement_capture_queue}.retry",
+                    durable=True,
+                    arguments={
+                        "x-message-ttl": broker_settings.retry_backoff_milliseconds,
+                        "x-dead-letter-exchange": broker_settings.exchange,
+                        "x-dead-letter-routing-key": broker_settings.source_engagement_capture_retry_routing_key,
+                    },
+                )
                 dead_letter_queue = await channel.declare_queue(
                     broker_settings.dead_letter_queue,
                     durable=True,
@@ -472,12 +514,24 @@ async def verify_pipeline_broker(
                     exchange,
                     routing_key=broker_settings.media_inspect_retry_routing_key,
                 )
+                _ = await source_engagement_capture_queue.bind(
+                    exchange,
+                    routing_key=broker_settings.source_engagement_capture_routing_key,
+                )
+                _ = await source_engagement_capture_queue.bind(
+                    exchange,
+                    routing_key=broker_settings.source_engagement_capture_retry_routing_key,
+                )
                 _ = await transcode_queue.bind(exchange, routing_key=broker_settings.meme_created_routing_key)
                 _ = await transcode_queue.bind(exchange, routing_key=broker_settings.stage_replay_routing_key)
                 _ = await transcode_queue.bind(exchange, routing_key=broker_settings.transcode_retry_routing_key)
                 _ = await media_inspect_retry_queue.bind(
                     retry_exchange,
                     routing_key=broker_settings.media_inspect_retry_request_routing_key,
+                )
+                _ = await source_engagement_capture_retry_queue.bind(
+                    retry_exchange,
+                    routing_key=broker_settings.source_engagement_capture_retry_request_routing_key,
                 )
                 _ = await retry_queue.bind(retry_exchange, routing_key=broker_settings.retry_routing_key)
                 _ = await dead_letter_queue.bind(

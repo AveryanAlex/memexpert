@@ -523,6 +523,14 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
     assert "meme_source_id" in source_captured_unique
     assert "captured_at" in source_captured_unique
     assert "UNIQUE" in source_captured_unique.upper()
+    assert "uq_meme_source_engagement_snapshots_source_schedule" in meme_source_engagement_snapshot_indexes
+    source_schedule_unique = meme_source_engagement_snapshot_indexes[
+        "uq_meme_source_engagement_snapshots_source_schedule"
+    ]
+    assert "meme_source_id" in source_schedule_unique
+    assert "scheduled_for" in source_schedule_unique
+    assert "schedule_label" in source_schedule_unique
+    assert "UNIQUE" in source_schedule_unique.upper()
     assert "ix_meme_source_engagement_snapshots_source_captured_desc" in meme_source_engagement_snapshot_indexes
     source_captured_desc = meme_source_engagement_snapshot_indexes[
         "ix_meme_source_engagement_snapshots_source_captured_desc"

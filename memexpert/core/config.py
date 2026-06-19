@@ -86,6 +86,7 @@ class Settings(BaseSettings):
     pipeline_broker_exchange: str = "memexpert.pipeline"
     pipeline_broker_routing_key_prefix: str = "pipeline"
     pipeline_broker_media_inspect_queue: str = "pipeline.media_inspect"
+    pipeline_broker_source_engagement_capture_queue: str = "pipeline.source_engagement_capture"
     pipeline_broker_transcode_queue: str = "pipeline.transcode"
     pipeline_broker_ocr_queue: str = "pipeline.ocr"
     pipeline_broker_embed_queue: str = "pipeline.embed"
@@ -162,8 +163,10 @@ class Settings(BaseSettings):
     pipeline_worker_fail_sync_meili_for_meme_file_id: str | None = None
     scheduler_materialized_view_refresh_enabled: bool = True
     scheduler_materialized_view_refresh_interval_seconds: float = Field(default=300.0, gt=0.0)
-    scheduler_popularity_snapshots_enabled: bool = True
-    scheduler_popularity_snapshots_interval_seconds: float = Field(default=21600.0, gt=0.0)
+    scheduler_source_engagement_capture_enabled: bool = True
+    scheduler_source_engagement_capture_interval_seconds: float = Field(default=21600.0, gt=0.0)
+    scheduler_source_engagement_capture_batch_size: int = Field(default=100, ge=1, le=1000)
+    scheduler_source_engagement_capture_lease_timeout_seconds: float = Field(default=1800.0, gt=0.0)
     scheduler_popularity_source_view_weight: float = Field(default=1.0, ge=0.0, le=1000.0)
     scheduler_popularity_source_reaction_weight: float = Field(default=2.0, ge=0.0, le=1000.0)
     scheduler_popularity_source_repost_weight: float = Field(default=3.0, ge=0.0, le=1000.0)
@@ -332,6 +335,7 @@ class Settings(BaseSettings):
         "pipeline_broker_exchange",
         "pipeline_broker_routing_key_prefix",
         "pipeline_broker_media_inspect_queue",
+        "pipeline_broker_source_engagement_capture_queue",
         "pipeline_broker_transcode_queue",
         "pipeline_broker_ocr_queue",
         "pipeline_broker_embed_queue",

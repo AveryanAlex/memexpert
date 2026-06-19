@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
+import uuid
 from typing import TYPE_CHECKING, cast
 
 import pytest
@@ -19,10 +20,10 @@ from memexpert.messaging.rabbitmq_outbox_runtime import RabbitMQOutboxPublisherB
 from memexpert.scheduler.jobs import (
     JOB_ID_MATERIALIZED_VIEW_REFRESH,
     JOB_ID_MOTD,
-    JOB_ID_POPULARITY_SNAPSHOTS,
     JOB_ID_RABBITMQ_OUTBOX_PUBLISHER,
     JOB_ID_SEARCH_INDEX_SYNC,
     JOB_ID_SEO_BACKLOG_BATCHES,
+    JOB_ID_SOURCE_ENGAGEMENT_CAPTURE,
     build_scheduler_job_definitions,
     enabled_scheduler_jobs,
     run_logged_job,
@@ -33,6 +34,7 @@ from memexpert.scheduler.locking import (
 )
 from memexpert.scheduler.runtime import run_scheduler_runtime
 from memexpert.services.scheduler_batch_jobs import SearchIndexBatchJobResult, SeoBacklogBatchJobResult
+from memexpert.services.source_engagement_scheduler import SourceEngagementCaptureSchedulerResult
 
 
 class FakeResult:
@@ -193,7 +195,7 @@ def test_scheduler_job_definitions_register_expected_ids() -> None:
 
     assert [definition.id for definition in definitions] == [
         JOB_ID_MATERIALIZED_VIEW_REFRESH,
-        JOB_ID_POPULARITY_SNAPSHOTS,
+        JOB_ID_SOURCE_ENGAGEMENT_CAPTURE,
         JOB_ID_MOTD,
         JOB_ID_SEARCH_INDEX_SYNC,
         JOB_ID_SEO_BACKLOG_BATCHES,
@@ -205,7 +207,7 @@ def test_enabled_scheduler_jobs_filters_disabled_jobs() -> None:
     settings = Settings.model_validate(
         {
             "scheduler_materialized_view_refresh_enabled": False,
-            "scheduler_popularity_snapshots_enabled": True,
+            "scheduler_source_engagement_capture_enabled": True,
             "scheduler_motd_enabled": False,
             "scheduler_search_index_sync_enabled": True,
             "scheduler_seo_backlog_batches_enabled": False,
@@ -218,7 +220,7 @@ def test_enabled_scheduler_jobs_filters_disabled_jobs() -> None:
         for definition in enabled_scheduler_jobs(settings, engine=cast("AsyncEngine", object()))
     ]
 
-    assert enabled_job_ids == [JOB_ID_POPULARITY_SNAPSHOTS, JOB_ID_SEARCH_INDEX_SYNC]
+    assert enabled_job_ids == [JOB_ID_SOURCE_ENGAGEMENT_CAPTURE, JOB_ID_SEARCH_INDEX_SYNC]
 
 
 @pytest.mark.asyncio
@@ -240,34 +242,61 @@ async def test_materialized_view_job_calls_refresh_helper(monkeypatch: pytest.Mo
 
 
 @pytest.mark.asyncio
-async def test_popularity_snapshots_job_uses_scheduler_engine_session_and_settings(
+async def test_source_engagement_capture_job_calls_batch_service_and_logs_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    settings = Settings.model_validate({"scheduler_popularity_snapshots_enabled": True})
+    settings = Settings.model_validate({"scheduler_source_engagement_capture_enabled": True})
     engine = cast("AsyncEngine", object())
-    session = object()
-    session_context = FakeSessionContext(session)
+    session_factory = object()
     called: dict[str, object] = {}
+    info_calls: list[tuple[str, dict[str, object] | None]] = []
 
     def fake_build_session_factory(bound_engine: object) -> object:
         called["engine"] = bound_engine
-        return lambda: session_context
+        return session_factory
 
-    async def fake_capture(session_arg: object, *, settings: Settings) -> object:
-        called["session"] = session_arg
+    async def fake_run_batch(
+        session_factory_arg: object,
+        *,
+        settings: Settings,
+    ) -> SourceEngagementCaptureSchedulerResult:
+        called["session_factory"] = session_factory_arg
         called["settings"] = settings
-        return object()
+        return SourceEngagementCaptureSchedulerResult(
+            claimed=2,
+            enqueued=2,
+            meme_source_ids=(uuid.UUID("00000000-0000-0000-0000-000000000001"),),
+            outbox_message_ids=(uuid.UUID("00000000-0000-0000-0000-000000000002"),),
+            duration_seconds=0.25,
+        )
+
+    def fake_info(message: str, *args: object, extra: dict[str, object] | None = None, **kwargs: object) -> None:
+        del args, kwargs
+        info_calls.append((message, extra))
 
     monkeypatch.setattr("memexpert.scheduler.jobs.build_async_session_factory", fake_build_session_factory)
-    monkeypatch.setattr("memexpert.scheduler.jobs.capture_popularity_snapshots", fake_capture)
+    monkeypatch.setattr("memexpert.scheduler.jobs.run_scheduler_source_engagement_capture_batch", fake_run_batch)
+    monkeypatch.setattr("memexpert.scheduler.jobs.logger.info", fake_info)
 
     definition = build_scheduler_job_definitions(settings, engine=engine)[1]
     await definition.action()
 
-    assert definition.id == JOB_ID_POPULARITY_SNAPSHOTS
-    assert called == {"engine": engine, "session": session, "settings": settings}
-    assert session_context.enter_calls == 1
-    assert session_context.exit_calls == 1
+    assert definition.id == JOB_ID_SOURCE_ENGAGEMENT_CAPTURE
+    assert called == {"engine": engine, "session_factory": session_factory, "settings": settings}
+    assert info_calls == [
+        (
+            "scheduler_job_batch_result",
+            {
+                "event": "scheduler_job_batch_result",
+                "job_id": JOB_ID_SOURCE_ENGAGEMENT_CAPTURE,
+                "claimed": 2,
+                "enqueued": 2,
+                "meme_source_ids": ["00000000-0000-0000-0000-000000000001"],
+                "outbox_message_ids": ["00000000-0000-0000-0000-000000000002"],
+                "duration_seconds": 0.25,
+            },
+        )
+    ]
 
 
 @pytest.mark.asyncio
@@ -494,7 +523,7 @@ async def test_scheduler_runtime_registers_enabled_jobs_and_shuts_down_gracefull
     settings = Settings.model_validate(
         {
             "scheduler_materialized_view_refresh_enabled": True,
-            "scheduler_popularity_snapshots_enabled": False,
+            "scheduler_source_engagement_capture_enabled": False,
             "scheduler_motd_enabled": True,
             "scheduler_search_index_sync_enabled": False,
             "scheduler_seo_backlog_batches_enabled": True,
@@ -533,7 +562,7 @@ async def test_scheduler_runtime_skips_disabled_jobs() -> None:
     settings = Settings.model_validate(
         {
             "scheduler_materialized_view_refresh_enabled": False,
-            "scheduler_popularity_snapshots_enabled": False,
+            "scheduler_source_engagement_capture_enabled": False,
             "scheduler_motd_enabled": False,
             "scheduler_search_index_sync_enabled": False,
             "scheduler_seo_backlog_batches_enabled": False,

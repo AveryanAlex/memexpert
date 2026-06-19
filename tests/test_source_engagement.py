@@ -10,6 +10,7 @@ from memexpert.models.enums import SourceEngagementScheduleLabel
 from memexpert.services.source_engagement import (
     next_source_engagement_schedule_slot,
     reaction_count_from_reactions,
+    source_engagement_schedule_label_for,
 )
 
 
@@ -74,3 +75,13 @@ def test_next_source_engagement_schedule_slot_returns_next_monthly_slot_for_old_
 
 def test_next_source_engagement_schedule_slot_handles_missing_published_at() -> None:
     assert next_source_engagement_schedule_slot(None, now=datetime(2026, 1, 1, tzinfo=UTC)) is None
+
+
+def test_source_engagement_schedule_label_for_persisted_monthly_slot() -> None:
+    published_at = datetime(2025, 1, 15, 10, 30, tzinfo=UTC)
+    scheduled_for = datetime(2026, 7, 15, 10, 30, tzinfo=UTC)
+
+    assert (
+        source_engagement_schedule_label_for(published_at, scheduled_for)
+        is SourceEngagementScheduleLabel.MONTHLY
+    )

@@ -1506,6 +1506,11 @@ def test_source_engagement_snapshot_model_contract() -> None:
     }
     assert unique_constraints == {
         "uq_meme_source_engagement_snapshots_source_captured_at": ("meme_source_id", "captured_at"),
+        "uq_meme_source_engagement_snapshots_source_schedule": (
+            "meme_source_id",
+            "scheduled_for",
+            "schedule_label",
+        ),
     }
 
     check_constraint_sql = " ".join(

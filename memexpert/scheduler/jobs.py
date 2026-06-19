@@ -13,12 +13,15 @@ from memexpert.messaging.rabbitmq_outbox_runtime import (
     rabbitmq_outbox_publisher_result_log_extra,
     run_rabbitmq_outbox_publisher_batch,
 )
-from memexpert.services.popularity_snapshots import capture_popularity_snapshots
 from memexpert.services.public_trends import refresh_public_trend_materialized_views
 from memexpert.services.scheduler_batch_jobs import (
     run_scheduler_search_index_sync_batch,
     run_scheduler_seo_backlog_batch,
     scheduler_batch_result_log_extra,
+)
+from memexpert.services.source_engagement_scheduler import (
+    run_scheduler_source_engagement_capture_batch,
+    source_engagement_capture_scheduler_result_log_extra,
 )
 
 if TYPE_CHECKING:
@@ -29,7 +32,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 JOB_ID_MATERIALIZED_VIEW_REFRESH = "materialized-view-refresh"
-JOB_ID_POPULARITY_SNAPSHOTS = "popularity-snapshots"
+JOB_ID_SOURCE_ENGAGEMENT_CAPTURE = "source-engagement-capture"
 JOB_ID_MOTD = "motd"
 JOB_ID_SEARCH_INDEX_SYNC = "search-index-sync"
 JOB_ID_SEO_BACKLOG_BATCHES = "seo-backlog-batches"
@@ -57,11 +60,11 @@ def build_scheduler_job_definitions(settings: Settings, engine: AsyncEngine) -> 
             description="Refresh public trend materialized views.",
         ),
         SchedulerJobDefinition(
-            id=JOB_ID_POPULARITY_SNAPSHOTS,
-            trigger_seconds=settings.scheduler_popularity_snapshots_interval_seconds,
-            action=_build_popularity_snapshots_job_action(settings, engine),
-            enabled=settings.scheduler_popularity_snapshots_enabled,
-            description="Capture popularity snapshots.",
+            id=JOB_ID_SOURCE_ENGAGEMENT_CAPTURE,
+            trigger_seconds=settings.scheduler_source_engagement_capture_interval_seconds,
+            action=_build_source_engagement_capture_job_action(settings, engine),
+            enabled=settings.scheduler_source_engagement_capture_enabled,
+            description="Enqueue due source engagement capture work.",
         ),
         SchedulerJobDefinition(
             id=JOB_ID_MOTD,
@@ -137,11 +140,17 @@ def _build_placeholder_job_action(job_id: str) -> SchedulerJobAction:
     return _action
 
 
-def _build_popularity_snapshots_job_action(settings: Settings, engine: AsyncEngine) -> SchedulerJobAction:
+def _build_source_engagement_capture_job_action(settings: Settings, engine: AsyncEngine) -> SchedulerJobAction:
     async def _action() -> None:
         session_factory = build_async_session_factory(engine)
-        async with session_factory() as session:
-            _ = await capture_popularity_snapshots(session, settings=settings)
+        result = await run_scheduler_source_engagement_capture_batch(session_factory, settings=settings)
+        logger.info(
+            "scheduler_job_batch_result",
+            extra=source_engagement_capture_scheduler_result_log_extra(
+                JOB_ID_SOURCE_ENGAGEMENT_CAPTURE,
+                result,
+            ),
+        )
 
     return _action
 
@@ -185,10 +194,10 @@ def _build_rabbitmq_outbox_publisher_job_action(settings: Settings, engine: Asyn
 __all__ = [
     "JOB_ID_MATERIALIZED_VIEW_REFRESH",
     "JOB_ID_MOTD",
-    "JOB_ID_POPULARITY_SNAPSHOTS",
     "JOB_ID_RABBITMQ_OUTBOX_PUBLISHER",
     "JOB_ID_SEARCH_INDEX_SYNC",
     "JOB_ID_SEO_BACKLOG_BATCHES",
+    "JOB_ID_SOURCE_ENGAGEMENT_CAPTURE",
     "SchedulerJobDefinition",
     "build_scheduler_job_definitions",
     "enabled_scheduler_jobs",

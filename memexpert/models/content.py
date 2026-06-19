@@ -798,6 +798,12 @@ class MemeSourceEngagementSnapshot(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             "captured_at",
             name="uq_meme_source_engagement_snapshots_source_captured_at",
         ),
+        UniqueConstraint(
+            "meme_source_id",
+            "scheduled_for",
+            "schedule_label",
+            name="uq_meme_source_engagement_snapshots_source_schedule",
+        ),
         CheckConstraint(
             "view_count IS NULL OR view_count >= 0",
             name="meme_source_engagement_snapshots_view_count_non_negative",

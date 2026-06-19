@@ -97,6 +97,34 @@ def next_source_engagement_schedule_slot(
     )
 
 
+def source_engagement_schedule_label_for(
+    published_at: datetime | None,
+    scheduled_for: datetime | None,
+) -> SourceEngagementScheduleLabel | None:
+    """Return the canonical label for a persisted engagement schedule slot."""
+
+    if published_at is None or scheduled_for is None:
+        return None
+
+    published_at_utc = _as_utc(published_at)
+    scheduled_for_utc = _as_utc(scheduled_for)
+
+    for label, offset in _EARLY_SCHEDULE_OFFSETS:
+        if published_at_utc + offset == scheduled_for_utc:
+            return label
+
+    first_monthly_slot = _add_months(published_at_utc, 1)
+    if first_monthly_slot == scheduled_for_utc:
+        return SourceEngagementScheduleLabel.PLUS_1MONTH
+
+    month_count = max(1, _calendar_month_delta(published_at_utc, scheduled_for_utc))
+    if month_count <= 1:
+        return None
+    if _add_months(published_at_utc, month_count) == scheduled_for_utc:
+        return SourceEngagementScheduleLabel.MONTHLY
+    return None
+
+
 async def add_source_engagement_snapshot(
     session: AsyncSession,
     source: MemeSource,
@@ -113,41 +141,95 @@ async def add_source_engagement_snapshot(
 
     resolved_captured_at = _as_utc(captured_at or utcnow())
     resolved_scheduled_for = None if scheduled_for is None else _as_utc(scheduled_for)
-    reaction_count = metrics.reaction_count
-    if reaction_count is None:
-        reaction_count = reaction_count_from_reactions(metrics.reactions)
-
     snapshot = MemeSourceEngagementSnapshot(
         source=source,
+    )
+    _apply_snapshot_metrics(
+        snapshot,
+        metrics,
+        capture_reason=capture_reason,
+        fetch_status=fetch_status,
         captured_at=resolved_captured_at,
         scheduled_for=resolved_scheduled_for,
-        capture_reason=capture_reason,
         schedule_label=schedule_label,
-        view_count=_non_negative_or_none("view_count", metrics.view_count),
-        reactions=metrics.reactions,
-        reaction_count=_non_negative_or_none("reaction_count", reaction_count),
-        comment_count=_non_negative_or_none("comment_count", metrics.comment_count),
-        forward_count=_non_negative_or_none("forward_count", metrics.forward_count),
-        comments_state=metrics.comments_state,
-        fetch_status=fetch_status,
-        source_alive=metrics.source_alive,
-        error_code=metrics.error_code,
-        raw_metrics=metrics.raw_metrics,
     )
     session.add(snapshot)
 
     if update_source_schedule:
-        source.last_engagement_check_at = resolved_captured_at
-        next_slot = next_source_engagement_schedule_slot(source.published_at, now=resolved_captured_at)
-        source.next_engagement_check_at = None if next_slot is None else next_slot.scheduled_for
-        source.engagement_check_locked_at = None
-        source.engagement_check_lock_owner = None
-        source.last_engagement_error_code = (
-            None if fetch_status is SourceEngagementFetchStatus.SUCCESS else metrics.error_code
+        update_source_after_engagement_capture(
+            source,
+            metrics,
+            fetch_status=fetch_status,
+            captured_at=resolved_captured_at,
+            scheduled_for=resolved_scheduled_for,
         )
 
     await session.flush()
     return snapshot
+
+
+async def update_source_engagement_snapshot(
+    session: AsyncSession,
+    snapshot: MemeSourceEngagementSnapshot,
+    source: MemeSource,
+    metrics: SourceEngagementMetrics,
+    *,
+    capture_reason: SourceEngagementCaptureReason,
+    fetch_status: SourceEngagementFetchStatus,
+    captured_at: datetime | None = None,
+    scheduled_for: datetime | None = None,
+    schedule_label: SourceEngagementScheduleLabel | None = None,
+    update_source_schedule: bool = True,
+) -> MemeSourceEngagementSnapshot:
+    """Update an existing schedule-slot snapshot, then flush without committing."""
+
+    resolved_captured_at = _as_utc(captured_at or utcnow())
+    resolved_scheduled_for = None if scheduled_for is None else _as_utc(scheduled_for)
+    snapshot.source = source
+    _apply_snapshot_metrics(
+        snapshot,
+        metrics,
+        capture_reason=capture_reason,
+        fetch_status=fetch_status,
+        captured_at=resolved_captured_at,
+        scheduled_for=resolved_scheduled_for,
+        schedule_label=schedule_label,
+    )
+    if update_source_schedule:
+        update_source_after_engagement_capture(
+            source,
+            metrics,
+            fetch_status=fetch_status,
+            captured_at=resolved_captured_at,
+            scheduled_for=resolved_scheduled_for,
+        )
+
+    await session.flush()
+    return snapshot
+
+
+def update_source_after_engagement_capture(
+    source: MemeSource,
+    metrics: SourceEngagementMetrics,
+    *,
+    fetch_status: SourceEngagementFetchStatus,
+    captured_at: datetime,
+    scheduled_for: datetime | None,
+) -> None:
+    """Apply source-level engagement schedule/lease state after a capture attempt."""
+
+    source.source_alive = metrics.source_alive
+    source.last_engagement_check_at = captured_at
+    if fetch_status is SourceEngagementFetchStatus.FAILED:
+        source.next_engagement_check_at = scheduled_for or source.next_engagement_check_at
+    else:
+        next_slot = next_source_engagement_schedule_slot(source.published_at, now=captured_at)
+        source.next_engagement_check_at = None if next_slot is None else next_slot.scheduled_for
+    source.engagement_check_locked_at = None
+    source.engagement_check_lock_owner = None
+    source.last_engagement_error_code = (
+        None if fetch_status is SourceEngagementFetchStatus.SUCCESS else metrics.error_code
+    )
 
 
 async def add_initial_source_engagement_snapshot(
@@ -188,6 +270,36 @@ def _calendar_month_delta(start: datetime, end: datetime) -> int:
     return (end.year - start.year) * 12 + end.month - start.month
 
 
+def _apply_snapshot_metrics(
+    snapshot: MemeSourceEngagementSnapshot,
+    metrics: SourceEngagementMetrics,
+    *,
+    capture_reason: SourceEngagementCaptureReason,
+    fetch_status: SourceEngagementFetchStatus,
+    captured_at: datetime,
+    scheduled_for: datetime | None,
+    schedule_label: SourceEngagementScheduleLabel | None,
+) -> None:
+    reaction_count = metrics.reaction_count
+    if reaction_count is None:
+        reaction_count = reaction_count_from_reactions(metrics.reactions)
+
+    snapshot.captured_at = captured_at
+    snapshot.scheduled_for = scheduled_for
+    snapshot.capture_reason = capture_reason
+    snapshot.schedule_label = schedule_label
+    snapshot.view_count = _non_negative_or_none("view_count", metrics.view_count)
+    snapshot.reactions = metrics.reactions
+    snapshot.reaction_count = _non_negative_or_none("reaction_count", reaction_count)
+    snapshot.comment_count = _non_negative_or_none("comment_count", metrics.comment_count)
+    snapshot.forward_count = _non_negative_or_none("forward_count", metrics.forward_count)
+    snapshot.comments_state = metrics.comments_state
+    snapshot.fetch_status = fetch_status
+    snapshot.source_alive = metrics.source_alive
+    snapshot.error_code = metrics.error_code
+    snapshot.raw_metrics = metrics.raw_metrics
+
+
 def _non_negative_or_none(name: str, value: int | None) -> int | None:
     if value is not None and value < 0:
         raise ValueError(f"{name} must be non-negative when provided")
@@ -201,4 +313,7 @@ __all__ = [
     "add_source_engagement_snapshot",
     "next_source_engagement_schedule_slot",
     "reaction_count_from_reactions",
+    "source_engagement_schedule_label_for",
+    "update_source_after_engagement_capture",
+    "update_source_engagement_snapshot",
 ]

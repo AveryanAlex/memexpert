@@ -47,6 +47,7 @@ from memexpert.core.voyage import (
     VoyageProviderUnavailableError,
     VoyageTimeoutError,
 )
+from memexpert.crawlers.telegram.client import FakeTelegramClient, RawTelegramMessage
 from memexpert.media.contracts import (
     NormalizedMediaResult,
     UploadMediaDetails,
@@ -63,6 +64,7 @@ from memexpert.models.content import (
     MemePopularitySnapshot,
     MemeSeoPage,
     MemeSource,
+    MemeSourceEngagementSnapshot,
     MemeTemplate,
     PipelineIngestRequest,
     PipelineStageJournal,
@@ -81,12 +83,15 @@ from memexpert.models.enums import (
     PipelineIngestRequestStatus,
     RabbitMQOutboxMessageStatus,
     SourceAttachReason,
+    SourceEngagementCommentsState,
+    SourceEngagementFetchStatus,
+    SourceEngagementScheduleLabel,
     SourcePlatform,
     SyncTargetKind,
     SyncTargetStatus,
 )
 from memexpert.models.user import User
-from memexpert.pipeline.events import build_media_inspect_requested_payload
+from memexpert.pipeline.events import SourceEngagementCaptureRequestedEvent, build_media_inspect_requested_payload
 from memexpert.pipeline.items import PipelineItemReadService
 from memexpert.pipeline.replay import PipelineReplayService
 from memexpert.pipeline.reporting import (
@@ -831,9 +836,13 @@ async def test_pipeline_runtime_declares_explicit_retry_and_dlx_topology() -> No
         runtime.dead_letter_exchange.name,
     ]
     media_inspect_queue_arguments = declared_queue_arguments[runtime.media_inspect_queue.name] or {}
+    source_engagement_queue_arguments = declared_queue_arguments[runtime.source_engagement_capture_queue.name] or {}
     transcode_queue_arguments = declared_queue_arguments[runtime.transcode_queue.name] or {}
     ocr_queue_arguments = declared_queue_arguments[runtime.ocr_queue.name] or {}
     media_inspect_retry_queue_arguments = declared_queue_arguments[runtime.media_inspect_retry_queue.name] or {}
+    source_engagement_retry_queue_arguments = declared_queue_arguments[
+        runtime.source_engagement_capture_retry_queue.name
+    ] or {}
     transcode_retry_queue_arguments = declared_queue_arguments[runtime.transcode_retry_queue.name] or {}
     ocr_retry_queue_arguments = declared_queue_arguments[runtime.ocr_retry_queue.name] or {}
 
@@ -841,12 +850,24 @@ async def test_pipeline_runtime_declares_explicit_retry_and_dlx_topology() -> No
         media_inspect_queue_arguments["x-dead-letter-routing-key"]
         == runtime.broker_settings.media_inspect_retry_request_routing_key
     )
+    assert (
+        source_engagement_queue_arguments["x-dead-letter-routing-key"]
+        == runtime.broker_settings.source_engagement_capture_retry_request_routing_key
+    )
     assert transcode_queue_arguments["x-dead-letter-routing-key"] == runtime.broker_settings.retry_routing_key
     assert ocr_queue_arguments["x-dead-letter-routing-key"] == runtime.broker_settings.ocr_retry_request_routing_key
     assert media_inspect_retry_queue_arguments["x-message-ttl"] == runtime.broker_settings.retry_backoff_milliseconds
     assert (
         media_inspect_retry_queue_arguments["x-dead-letter-routing-key"]
         == runtime.broker_settings.media_inspect_retry_routing_key
+    )
+    assert (
+        source_engagement_retry_queue_arguments["x-message-ttl"]
+        == runtime.broker_settings.retry_backoff_milliseconds
+    )
+    assert (
+        source_engagement_retry_queue_arguments["x-dead-letter-routing-key"]
+        == runtime.broker_settings.source_engagement_capture_retry_routing_key
     )
     assert transcode_retry_queue_arguments["x-message-ttl"] == runtime.broker_settings.retry_backoff_milliseconds
     assert (
@@ -857,6 +878,10 @@ async def test_pipeline_runtime_declares_explicit_retry_and_dlx_topology() -> No
     assert recorded_queues[runtime.media_inspect_queue.name].bindings == [
         (runtime.pipeline_exchange.name, runtime.broker_settings.media_inspect_routing_key),
         (runtime.pipeline_exchange.name, runtime.broker_settings.media_inspect_retry_routing_key),
+    ]
+    assert recorded_queues[runtime.source_engagement_capture_queue.name].bindings == [
+        (runtime.pipeline_exchange.name, runtime.broker_settings.source_engagement_capture_routing_key),
+        (runtime.pipeline_exchange.name, runtime.broker_settings.source_engagement_capture_retry_routing_key),
     ]
     assert recorded_queues[runtime.transcode_queue.name].bindings == [
         (runtime.pipeline_exchange.name, runtime.broker_settings.meme_created_routing_key),
@@ -869,6 +894,9 @@ async def test_pipeline_runtime_declares_explicit_retry_and_dlx_topology() -> No
     ]
     assert recorded_queues[runtime.media_inspect_retry_queue.name].bindings == [
         (runtime.retry_exchange.name, runtime.broker_settings.media_inspect_retry_request_routing_key),
+    ]
+    assert recorded_queues[runtime.source_engagement_capture_retry_queue.name].bindings == [
+        (runtime.retry_exchange.name, runtime.broker_settings.source_engagement_capture_retry_request_routing_key),
     ]
     assert recorded_queues[runtime.transcode_retry_queue.name].bindings == [
         (runtime.retry_exchange.name, runtime.broker_settings.retry_routing_key),
@@ -982,6 +1010,104 @@ async def test_pipeline_runtime_media_inspect_handler_materializes_and_acks(
     assert len(outbox_rows) == 1
     assert outbox_rows[0].event_type == ContentPipelineEventType.MEME_CREATED.value
     assert outbox_rows[0].routing_key == runtime.broker_settings.transcode_routing_key
+
+
+async def test_pipeline_runtime_source_engagement_capture_handler_fetches_stats_only_and_acks(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    settings = Settings()
+    published_at = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+    scheduled_for = datetime(2026, 1, 1, 13, 0, tzinfo=UTC)
+    meme_id = uuid.uuid7()
+    meme_file_id = uuid.uuid7()
+    source_id = uuid.uuid7()
+    migrated_db_session.add(Meme(id=meme_id, media_type=ContentKind.IMAGE, primary_file_id=meme_file_id))
+    await migrated_db_session.flush()
+    migrated_db_session.add_all(
+        [
+            MemeFile(
+                id=meme_file_id,
+                meme_id=meme_id,
+                status=ContentProcessingStatus.READY,
+                s3_original_key=f"pipeline/originals/{meme_file_id}/original.png",
+            ),
+            MemeSource(
+                id=source_id,
+                file_id=meme_file_id,
+                platform=SourcePlatform.TELEGRAM,
+                source_id="runtime-engagement-channel",
+                post_id="9101",
+                views=0,
+                reactions={},
+                source_alive=True,
+                published_at=published_at,
+                next_engagement_check_at=scheduled_for,
+                engagement_check_locked_at=scheduled_for,
+                engagement_check_lock_owner="runtime-test",
+            ),
+        ]
+    )
+    await migrated_db_session.commit()
+    fake = FakeTelegramClient()
+    fake.pin_single_message(
+        channel_id="runtime-engagement-channel",
+        post_id="9101",
+        message=RawTelegramMessage(
+            message_id="9101",
+            channel_id="runtime-engagement-channel",
+            channel_username="runtime_engagement",
+            channel_title="Runtime Engagement",
+            published_at=published_at,
+            media_type="photo",
+            view_count=77,
+            reactions={},
+            forward_count=0,
+            comment_count=0,
+            comments_state=SourceEngagementCommentsState.ENABLED,
+        ),
+        media=b"must-not-download",
+    )
+    broker = build_pipeline_broker(settings)
+    runtime = build_pipeline_runtime(
+        settings=settings,
+        broker=broker,
+        session_factory=postgres_session_factory,
+        storage_client=FakeStorageClient(),
+        media_processor=FakeMediaProcessor(),
+        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key="unused")),
+        source_engagement_telegram_client_factory=lambda _event: fake,
+    )
+    event = SourceEngagementCaptureRequestedEvent(
+        event_id=uuid.uuid7(),
+        event_type="source_engagement_capture_requested",
+        meme_source_id=source_id,
+        source_platform=SourcePlatform.TELEGRAM,
+        source_id="runtime-engagement-channel",
+        post_id="9101",
+        scheduled_for=scheduled_for,
+        schedule_label=SourceEngagementScheduleLabel.PLUS_1H,
+        session_name="session-a",
+        created_at=utcnow(),
+    )
+    message = FakeRabbitMessage(message_id=str(event.event_id))
+
+    await runtime.handle_source_engagement_capture_message(event.model_dump(mode="json"), message)
+
+    assert message.ack_count == 1
+    assert message.reject_calls == []
+    assert message.nack_calls == []
+    assert fake.downloaded_message_ids == []
+    async with postgres_session_factory() as session:
+        source = await session.get(MemeSource, source_id)
+        snapshot = await session.scalar(select(MemeSourceEngagementSnapshot))
+
+    assert source is not None
+    assert source.engagement_check_locked_at is None
+    assert snapshot is not None
+    assert snapshot.fetch_status is SourceEngagementFetchStatus.SUCCESS
+    assert snapshot.view_count == 77
+    assert snapshot.reaction_count == 0
 
 
 async def test_pipeline_runtime_media_inspect_handler_dead_letters_malformed_payload() -> None:

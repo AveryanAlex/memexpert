@@ -146,6 +146,12 @@ def upgrade() -> None:
             "captured_at",
             name="uq_meme_source_engagement_snapshots_source_captured_at",
         ),
+        sa.UniqueConstraint(
+            "meme_source_id",
+            "scheduled_for",
+            "schedule_label",
+            name="uq_meme_source_engagement_snapshots_source_schedule",
+        ),
     )
     op.execute(
         "CREATE INDEX ix_meme_source_engagement_snapshots_source_captured_desc "

@@ -38,10 +38,12 @@ from memexpert.core.storage import get_s3_client
 from memexpert.core.voyage import VoyageClientProtocol, build_pipeline_voyage_client
 from memexpert.media.inspect import PipelineMediaProcessor
 from memexpert.models.enums import ContentPipelineStage
+from memexpert.services.source_engagement_capture import build_pipeline_source_engagement_telegram_client_factory
 from memexpert.workers.pipeline_runtime.runtime import PipelineRuntime, RabbitMessageLike
 
 if TYPE_CHECKING:
     from memexpert.media.contracts import PipelineMediaProcessorProtocol
+    from memexpert.services.source_engagement_capture import SourceEngagementTelegramClientFactory
     from memexpert.workers.pipeline_runtime.stages.context import ObjectStorageClientLike
 
 
@@ -125,6 +127,7 @@ def build_pipeline_runtime(
     qdrant_sync_client: QdrantSyncClientProtocol | None = None,
     meilisearch_sync_client: MeilisearchSyncClientProtocol | None = None,
     classification_client: ClassificationClientProtocol | None = None,
+    source_engagement_telegram_client_factory: SourceEngagementTelegramClientFactory | None = None,
 ) -> PipelineRuntime:
     """Build the RabbitMQ heavy-worker runtime and register its FastStream subscribers."""
 
@@ -147,7 +150,12 @@ def build_pipeline_runtime(
     resolved_classification_client = classification_client or build_pipeline_classification_client(
         settings=resolved_settings,
     )
+    resolved_source_engagement_telegram_client_factory = (
+        source_engagement_telegram_client_factory
+        or build_pipeline_source_engagement_telegram_client_factory(resolved_settings)
+    )
     transcode_retry_queue_name = f"{resolved_broker_settings.transcode_queue}.retry"
+    source_engagement_capture_retry_queue_name = f"{resolved_broker_settings.source_engagement_capture_queue}.retry"
     ocr_retry_queue_name = f"{resolved_broker_settings.ocr_queue}.retry"
     embed_retry_queue_name = f"{resolved_broker_settings.embed_queue}.retry"
     classify_retry_queue_name = f"{resolved_broker_settings.classify_queue}.retry"
@@ -193,6 +201,12 @@ def build_pipeline_runtime(
             retry_request_routing_key=resolved_broker_settings.media_inspect_retry_request_routing_key,
             retry_exchange=resolved_broker_settings.retry_exchange,
         ),
+        source_engagement_capture_queue=_build_stage_queue(
+            queue_name=resolved_broker_settings.source_engagement_capture_queue,
+            routing_key=resolved_broker_settings.source_engagement_capture_routing_key,
+            retry_request_routing_key=resolved_broker_settings.source_engagement_capture_retry_request_routing_key,
+            retry_exchange=resolved_broker_settings.retry_exchange,
+        ),
         transcode_queue=_build_stage_queue(
             queue_name=resolved_broker_settings.transcode_queue,
             routing_key=resolved_broker_settings.meme_created_routing_key,
@@ -234,6 +248,12 @@ def build_pipeline_runtime(
             retry_backoff_milliseconds=resolved_broker_settings.retry_backoff_milliseconds,
             exchange=resolved_broker_settings.exchange,
             retry_return_routing_key=resolved_broker_settings.media_inspect_retry_routing_key,
+        ),
+        source_engagement_capture_retry_queue=_build_retry_queue(
+            queue_name=source_engagement_capture_retry_queue_name,
+            retry_backoff_milliseconds=resolved_broker_settings.retry_backoff_milliseconds,
+            exchange=resolved_broker_settings.exchange,
+            retry_return_routing_key=resolved_broker_settings.source_engagement_capture_retry_routing_key,
         ),
         transcode_retry_queue=_build_retry_queue(
             queue_name=transcode_retry_queue_name,
@@ -280,6 +300,7 @@ def build_pipeline_runtime(
         qdrant_sync_client=resolved_qdrant_sync_client,
         meilisearch_sync_client=resolved_meilisearch_sync_client,
         classification_client=resolved_classification_client,
+        source_engagement_telegram_client_factory=resolved_source_engagement_telegram_client_factory,
     )
 
     @resolved_broker.subscriber(
@@ -290,6 +311,15 @@ def build_pipeline_runtime(
     async def _consume_media_inspect(payload: object, message: RabbitMessage) -> None:
         rabbit_message = cast("RabbitMessageLike", cast("object", message))
         await runtime.handle_media_inspect_message(payload, rabbit_message)
+
+    @resolved_broker.subscriber(
+        runtime.source_engagement_capture_queue,
+        runtime.pipeline_exchange,
+        ack_policy=AckPolicy.MANUAL,
+    )
+    async def _consume_source_engagement_capture(payload: object, message: RabbitMessage) -> None:
+        rabbit_message = cast("RabbitMessageLike", cast("object", message))
+        await runtime.handle_source_engagement_capture_message(payload, rabbit_message)
 
     @resolved_broker.subscriber(
         runtime.transcode_queue,

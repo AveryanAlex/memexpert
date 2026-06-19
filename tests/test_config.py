@@ -106,6 +106,8 @@ def test_settings_parse_pipeline_contract_and_normalize_object_prefixes() -> Non
     broker_settings = get_pipeline_broker_settings(settings)
     assert broker_settings.meme_created_routing_key == "pipeline.transcode"
     assert broker_settings.ocr_queue == "pipeline.ocr"
+    assert broker_settings.source_engagement_capture_queue == "pipeline.source_engagement_capture"
+    assert broker_settings.source_engagement_capture_routing_key == "pipeline.source_engagement_capture"
     assert broker_settings.dead_letter_routing_key == "pipeline.dead_letter"
 
 
@@ -144,7 +146,9 @@ def test_settings_parse_scheduler_contracts() -> None:
     settings = Settings.model_validate(
         {
             "scheduler_materialized_view_refresh_enabled": False,
-            "scheduler_popularity_snapshots_interval_seconds": 120.0,
+            "scheduler_source_engagement_capture_interval_seconds": 120.0,
+            "scheduler_source_engagement_capture_batch_size": 7,
+            "scheduler_source_engagement_capture_lease_timeout_seconds": 45.0,
             "scheduler_popularity_source_view_weight": 1.5,
             "scheduler_popularity_source_reaction_weight": 2.5,
             "scheduler_popularity_source_repost_weight": 3.5,
@@ -164,7 +168,9 @@ def test_settings_parse_scheduler_contracts() -> None:
     )
 
     assert settings.scheduler_materialized_view_refresh_enabled is False
-    assert settings.scheduler_popularity_snapshots_interval_seconds == 120.0
+    assert settings.scheduler_source_engagement_capture_interval_seconds == 120.0
+    assert settings.scheduler_source_engagement_capture_batch_size == 7
+    assert settings.scheduler_source_engagement_capture_lease_timeout_seconds == 45.0
     assert settings.scheduler_popularity_source_view_weight == 1.5
     assert settings.scheduler_popularity_source_reaction_weight == 2.5
     assert settings.scheduler_popularity_source_repost_weight == 3.5
@@ -182,10 +188,12 @@ def test_settings_parse_scheduler_contracts() -> None:
     assert settings.scheduler_advisory_lock_key == (123, 456)
 
 
-def test_settings_scheduler_popularity_defaults_match_design() -> None:
+def test_settings_scheduler_source_engagement_defaults_match_design() -> None:
     settings = Settings()
 
-    assert settings.scheduler_popularity_snapshots_interval_seconds == 21600.0
+    assert settings.scheduler_source_engagement_capture_interval_seconds == 21600.0
+    assert settings.scheduler_source_engagement_capture_batch_size == 100
+    assert settings.scheduler_source_engagement_capture_lease_timeout_seconds == 1800.0
     assert settings.scheduler_popularity_source_view_weight == 1.0
     assert settings.scheduler_popularity_source_reaction_weight == 2.0
     assert settings.scheduler_popularity_source_repost_weight == 3.0
