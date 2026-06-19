@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Literal, cast
 
 from sqlalchemy import String, TextClause, bindparam, select, text
 from sqlalchemy.dialects.postgresql import ARRAY
+from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import selectinload
 
@@ -35,7 +36,7 @@ from memexpert.schemas.meme import (
     new_discovery_request_id,
 )
 from memexpert.services.media_render_urls import MediaRenderUrlService
-from memexpert.services.meme_search import _to_public_card_read
+from memexpert.services.meme_search import _DERIVED_POPULARITY_ATTR, _to_public_card_read
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +128,7 @@ class PublicTrendsService:
         )
         rows = [dict(row) for row in result.mappings()]
         memes_by_id = await self._load_public_memes(tuple(cast("uuid.UUID", row["meme_id"]) for row in rows))
+        _attach_row_popularity_scores(memes_by_id, rows)
         filters = MemeResultAttributionFiltersRead(
             language=language,
             media_type=media_type,
@@ -187,8 +189,9 @@ class PublicTrendsService:
         )
         trend = trend_row.mappings().first()
         snapshots = await self._session.execute(
-            text(
-                """
+            _meme_daily_points_text(
+                f"""
+                {_MEME_DAILY_POINT_CTES}
                 SELECT
                     captured_at,
                     source_views,
@@ -199,13 +202,12 @@ class PublicTrendsService:
                     platform_saves,
                     platform_likes,
                     popularity_score
-                FROM meme_popularity_snapshots
-                WHERE meme_id = :meme_id
+                FROM scored_meme_daily
                 ORDER BY captured_at DESC
                 LIMIT :limit
                 """
             ),
-            {"meme_id": meme_id, "limit": max(1, min(120, snapshot_limit))},
+            {"meme_ids": [meme_id], "meme_id_count": 1, "limit": max(1, min(120, snapshot_limit))},
         )
         points = [
             PublicMemePopularityPointRead(**dict(row))
@@ -343,34 +345,36 @@ class PublicTrendsService:
         limit: int = 12,
         offset: int = 0,
     ) -> PublicTrendTimelinePageRead:
-        """Return month/year timeline periods from real public meme popularity snapshots."""
+        """Return month/year timeline periods from derived source/platform points."""
 
         resolved_granularity = granularity if granularity in ("month", "year") else "month"
         resolved_limit = _clamp_limit(limit)
         resolved_offset = max(0, offset)
-        period_expr = f"date_trunc('{resolved_granularity}', s.captured_at)"
+        period_expr = f"date_trunc('{resolved_granularity}', d.captured_at)"
         total = await self._session.scalar(
-            text(
+            _meme_daily_points_text(
                 f"""
+                {_MEME_DAILY_POINT_CTES}
                 SELECT count(*)
                 FROM (
                     SELECT {period_expr} AS period_start
-                    FROM meme_popularity_snapshots s
-                    JOIN memes m ON m.id = s.meme_id
+                    FROM scored_meme_daily d
+                    JOIN memes m ON m.id = d.meme_id
                     WHERE m.is_public IS TRUE AND (:include_nsfw OR m.is_nsfw IS FALSE)
                     GROUP BY period_start
                 ) periods
                 """
             ),
-            {"include_nsfw": include_nsfw},
+            {"include_nsfw": include_nsfw, "meme_ids": [], "meme_id_count": 0},
         )
         result = await self._session.execute(
-            text(
+            _meme_daily_points_text(
                 f"""
-                WITH period_page AS (
+                {_MEME_DAILY_POINT_CTES}
+                , period_page AS (
                     SELECT {period_expr} AS period_start
-                    FROM meme_popularity_snapshots s
-                    JOIN memes m ON m.id = s.meme_id
+                    FROM scored_meme_daily d
+                    JOIN memes m ON m.id = d.meme_id
                     WHERE m.is_public IS TRUE AND (:include_nsfw OR m.is_nsfw IS FALSE)
                     GROUP BY period_start
                     ORDER BY period_start DESC
@@ -379,23 +383,23 @@ class PublicTrendsService:
                 period_meme AS (
                     SELECT
                         pp.period_start,
-                        s.meme_id,
-                        max(s.popularity_score)::double precision AS popularity_score,
-                        count(*)::integer AS snapshot_count,
-                        min(s.captured_at) AS first_captured_at,
-                        max(s.captured_at) AS last_captured_at,
-                        max(s.source_views)::integer AS source_views,
-                        max(s.source_reactions)::integer AS source_reactions,
-                        max(s.source_reposts)::integer AS source_reposts,
-                        max(s.platform_views)::integer AS platform_views,
-                        max(s.platform_sends)::integer AS platform_sends,
-                        max(s.platform_saves)::integer AS platform_saves,
-                        max(s.platform_likes)::integer AS platform_likes
+                        d.meme_id,
+                        sum(d.popularity_score)::double precision AS popularity_score,
+                        sum(d.snapshot_count)::integer AS snapshot_count,
+                        min(d.captured_at) AS first_captured_at,
+                        max(d.captured_at) AS last_captured_at,
+                        sum(d.source_views)::integer AS source_views,
+                        sum(d.source_reactions)::integer AS source_reactions,
+                        sum(d.source_reposts)::integer AS source_reposts,
+                        sum(d.platform_views)::integer AS platform_views,
+                        sum(d.platform_sends)::integer AS platform_sends,
+                        sum(d.platform_saves)::integer AS platform_saves,
+                        sum(d.platform_likes)::integer AS platform_likes
                     FROM period_page pp
-                    JOIN meme_popularity_snapshots s ON {period_expr} = pp.period_start
-                    JOIN memes m ON m.id = s.meme_id
+                    JOIN scored_meme_daily d ON {period_expr} = pp.period_start
+                    JOIN memes m ON m.id = d.meme_id
                     WHERE m.is_public IS TRUE AND (:include_nsfw OR m.is_nsfw IS FALSE)
-                    GROUP BY pp.period_start, s.meme_id
+                    GROUP BY pp.period_start, d.meme_id
                 ),
                 period_totals AS (
                     SELECT
@@ -426,6 +430,8 @@ class PublicTrendsService:
             ),
             {
                 "include_nsfw": include_nsfw,
+                "meme_ids": [],
+                "meme_id_count": 0,
                 "limit": resolved_limit,
                 "offset": resolved_offset,
                 "top_limit": TIMELINE_TOP_MEMES_PER_PERIOD,
@@ -433,6 +439,7 @@ class PublicTrendsService:
         )
         rows = [dict(row) for row in result.mappings()]
         memes_by_id = await self._load_public_memes(tuple(cast("uuid.UUID", row["meme_id"]) for row in rows))
+        _attach_period_popularity_scores(memes_by_id, rows)
         period_order: list[datetime] = []
         period_rows: dict[datetime, list[dict[str, object]]] = {}
         for row in rows:
@@ -591,17 +598,19 @@ class PublicTrendsService:
             {"meme_id": meme.id},
         )
         trend = trend_row.mappings().first()
+        if trend is not None:
+            setattr(meme, _DERIVED_POPULARITY_ATTR, _float(dict(trend).get("latest_popularity_score")))
         snapshots = await self._session.execute(
-            text(
-                """
+            _meme_daily_points_text(
+                f"""
+                {_MEME_DAILY_POINT_CTES}
                 SELECT captured_at, popularity_score
-                FROM meme_popularity_snapshots
-                WHERE meme_id = :meme_id
+                FROM scored_meme_daily
                 ORDER BY captured_at DESC
                 LIMIT :limit
                 """
             ),
-            {"meme_id": meme.id, "limit": max(1, min(365, snapshot_limit))},
+            {"meme_ids": [meme.id], "meme_id_count": 1, "limit": max(1, min(365, snapshot_limit))},
         )
         snapshot_rows = list(reversed(list(snapshots.mappings())))
         card = _to_public_card_read(meme, media_render_service=self._media_render_service)
@@ -613,7 +622,7 @@ class PublicTrendsService:
                 if meme.seo_page is not None
                 else (card.caption or f"Meme {str(meme.id)[:8]}")
             ),
-            description="Popularity score from real captured meme snapshots.",
+            description="Derived popularity score from source engagement deltas and platform events.",
             meme=card,
             trend=_trend_metrics_from_row(dict(trend)) if trend is not None else None,
             points=[
@@ -626,7 +635,9 @@ class PublicTrendsService:
                 for row in snapshot_rows
             ],
             insufficient_history=len(snapshot_rows) < 2,
-            no_data_reason="No real popularity snapshots exist for this meme yet." if not snapshot_rows else None,
+            no_data_reason=(
+                "No source engagement or platform event points exist for this meme yet." if not snapshot_rows else None
+            ),
         )
 
     async def _compare_tag(self, value: str) -> PublicTrendComparisonSeriesRead:
@@ -745,6 +756,170 @@ def _tag_history_text(sql: str) -> TextClause:
 
 def _template_history_text(sql: str) -> TextClause:
     return text(sql).bindparams(bindparam("template_slugs", type_=ARRAY(String)))
+
+
+def _meme_daily_points_text(sql: str) -> TextClause:
+    return text(sql).bindparams(bindparam("meme_ids", type_=ARRAY(PGUUID(as_uuid=True))))
+
+
+def _attach_row_popularity_scores(memes_by_id: dict[uuid.UUID, Meme], rows: list[dict[str, object]]) -> None:
+    for row in rows:
+        meme = memes_by_id.get(cast("uuid.UUID", row.get("meme_id")))
+        if meme is not None:
+            setattr(meme, _DERIVED_POPULARITY_ATTR, _float(row.get("latest_popularity_score")))
+
+
+def _attach_period_popularity_scores(memes_by_id: dict[uuid.UUID, Meme], rows: list[dict[str, object]]) -> None:
+    scores: dict[uuid.UUID, float] = {}
+    for row in rows:
+        meme_id = cast("uuid.UUID", row.get("meme_id"))
+        scores[meme_id] = max(scores.get(meme_id, 0.0), _float(row.get("popularity_score")))
+    for meme_id, score in scores.items():
+        if meme := memes_by_id.get(meme_id):
+            setattr(meme, _DERIVED_POPULARITY_ATTR, score)
+
+
+_POINT_SCORE_EXPR = """
+    ln(1.0 + GREATEST(COALESCE(source_views, 0), 0)) * 1.0
+    + ln(1.0 + GREATEST(COALESCE(source_reactions, 0), 0)) * 2.0
+    + ln(1.0 + GREATEST(COALESCE(source_reposts, 0), 0)) * 3.0
+    + ln(1.0 + GREATEST(COALESCE(platform_views, 0), 0)) * 1.0
+    + ln(1.0 + GREATEST(COALESCE(platform_sends, 0), 0)) * 3.0
+    + ln(1.0 + GREATEST(COALESCE(platform_saves, 0), 0)) * 4.0
+    + ln(1.0 + GREATEST(COALESCE(platform_likes, 0), 0)) * 5.0
+"""
+
+
+_MEME_DAILY_POINT_CTES = """
+WITH requested AS (
+    SELECT unnest(CAST(:meme_ids AS uuid[])) AS meme_id
+),
+safe_events AS (
+    SELECT
+        CASE
+            WHEN jsonb_typeof(payload -> 'meme_id') = 'string'
+            AND payload ->> 'meme_id' ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+            THEN (payload ->> 'meme_id')::uuid
+            WHEN jsonb_typeof(payload -> 'refs' -> 'meme_id') = 'string'
+            AND payload -> 'refs' ->> 'meme_id' ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+            THEN (payload -> 'refs' ->> 'meme_id')::uuid
+            ELSE NULL
+        END AS meme_id,
+        event_type::text AS event_type,
+        occurred_at
+    FROM analytics_events
+    WHERE event_type::text IN (
+        'meme_view',
+        'view',
+        'meme_send',
+        'share',
+        'meme_share',
+        'inline_sent',
+        'meme_like',
+        'favorite',
+        'meme_save',
+        'save'
+    )
+),
+event_daily AS (
+    SELECT
+        se.meme_id,
+        date_trunc('day', se.occurred_at) AS captured_at,
+        count(*) FILTER (WHERE se.event_type IN ('meme_view', 'view'))::integer AS platform_views,
+        count(*) FILTER (
+            WHERE se.event_type IN ('meme_send', 'share', 'meme_share', 'inline_sent')
+        )::integer AS platform_sends,
+        count(*) FILTER (WHERE se.event_type IN ('meme_save', 'save'))::integer AS platform_saves,
+        count(*) FILTER (WHERE se.event_type IN ('meme_like', 'favorite'))::integer AS platform_likes
+    FROM safe_events se
+    LEFT JOIN requested r ON r.meme_id = se.meme_id
+    WHERE se.meme_id IS NOT NULL
+      AND (:meme_id_count = 0 OR r.meme_id IS NOT NULL)
+    GROUP BY se.meme_id, date_trunc('day', se.occurred_at)
+),
+successful_source_snapshots AS (
+    SELECT
+        mf.meme_id,
+        ses.meme_source_id,
+        ses.id,
+        ses.captured_at,
+        ses.view_count,
+        ses.reaction_count,
+        ses.forward_count,
+        lag(ses.view_count) OVER (
+            PARTITION BY ses.meme_source_id
+            ORDER BY ses.captured_at, ses.id
+        ) AS previous_view_count,
+        lag(ses.reaction_count) OVER (
+            PARTITION BY ses.meme_source_id
+            ORDER BY ses.captured_at, ses.id
+        ) AS previous_reaction_count,
+        lag(ses.forward_count) OVER (
+            PARTITION BY ses.meme_source_id
+            ORDER BY ses.captured_at, ses.id
+        ) AS previous_forward_count
+    FROM meme_source_engagement_snapshots ses
+    JOIN meme_sources ms ON ms.id = ses.meme_source_id
+    JOIN meme_files mf ON mf.id = ms.file_id
+    LEFT JOIN requested r ON r.meme_id = mf.meme_id
+    WHERE ses.fetch_status::text = 'success'
+      AND (:meme_id_count = 0 OR r.meme_id IS NOT NULL)
+),
+source_daily AS (
+    SELECT
+        meme_id,
+        date_trunc('day', captured_at) AS captured_at,
+        count(*)::integer AS snapshot_count,
+        sum(
+            CASE
+                WHEN previous_view_count IS NULL OR view_count IS NULL THEN 0
+                ELSE GREATEST(view_count - previous_view_count, 0)
+            END
+        )::integer AS source_views,
+        sum(
+            CASE
+                WHEN previous_reaction_count IS NULL OR reaction_count IS NULL THEN 0
+                ELSE GREATEST(reaction_count - previous_reaction_count, 0)
+            END
+        )::integer AS source_reactions,
+        sum(
+            CASE
+                WHEN previous_forward_count IS NULL OR forward_count IS NULL THEN 0
+                ELSE GREATEST(forward_count - previous_forward_count, 0)
+            END
+        )::integer AS source_reposts
+    FROM successful_source_snapshots
+    GROUP BY meme_id, date_trunc('day', captured_at)
+),
+meme_daily AS (
+    SELECT
+        COALESCE(sd.meme_id, ed.meme_id) AS meme_id,
+        COALESCE(sd.captured_at, ed.captured_at) AS captured_at,
+        COALESCE(sd.snapshot_count, 0)::integer AS snapshot_count,
+        COALESCE(sd.source_views, 0)::integer AS source_views,
+        COALESCE(sd.source_reactions, 0)::integer AS source_reactions,
+        COALESCE(sd.source_reposts, 0)::integer AS source_reposts,
+        COALESCE(ed.platform_views, 0)::integer AS platform_views,
+        COALESCE(ed.platform_sends, 0)::integer AS platform_sends,
+        COALESCE(ed.platform_saves, 0)::integer AS platform_saves,
+        COALESCE(ed.platform_likes, 0)::integer AS platform_likes
+    FROM source_daily sd
+    FULL OUTER JOIN event_daily ed ON ed.meme_id = sd.meme_id AND ed.captured_at = sd.captured_at
+),
+scored_meme_daily AS (
+    SELECT
+        *,
+        (__POINT_SCORE_EXPR__)::double precision AS popularity_score
+    FROM meme_daily
+    WHERE source_views > 0
+       OR source_reactions > 0
+       OR source_reposts > 0
+       OR platform_views > 0
+       OR platform_sends > 0
+       OR platform_saves > 0
+       OR platform_likes > 0
+)
+""".replace("__POINT_SCORE_EXPR__", _POINT_SCORE_EXPR)
 
 
 def _trend_metrics_from_row(row: dict[str, object]) -> PublicTrendMetricsRead:

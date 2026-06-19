@@ -2,6 +2,8 @@
 
 This runbook covers the backend scheduler jobs that perform deferred, bounded work outside user request paths:
 
+- `source-engagement-capture` claims due Telegram source posts and enqueues metric refresh work.
+- `materialized-view-refresh` refreshes public trend materialized views derived from source engagement snapshots and analytics events.
 - `search-index-sync` updates Qdrant and Meilisearch from canonical PostgreSQL state.
 - `seo-backlog-batches` generates or refreshes public-safe meme SEO pages.
 - `rabbitmq-outbox-publisher` publishes durable RabbitMQ outbox messages.
@@ -30,6 +32,18 @@ Search-index job:
 | `QDRANT_URL`, `PIPELINE_QDRANT_COLLECTION_NAME`, `PIPELINE_QDRANT_TIMEOUT_SECONDS` | see config | Qdrant write target. |
 | `MEILISEARCH_URL`, `MEILISEARCH_MASTER_KEY`, `PIPELINE_MEILISEARCH_INDEX_NAME`, `PIPELINE_MEILISEARCH_TIMEOUT_SECONDS` | see config | Meilisearch write target. |
 
+Source engagement and public trend jobs:
+
+| variable | default | meaning |
+|---|---:|---|
+| `SCHEDULER_SOURCE_ENGAGEMENT_CAPTURE_ENABLED` | `true` | Enables the due-source enqueue job. |
+| `SCHEDULER_SOURCE_ENGAGEMENT_CAPTURE_INTERVAL_SECONDS` | `21600` | APScheduler interval for scanning due source posts. Due times are stored on `meme_sources.next_engagement_check_at`. |
+| `SCHEDULER_SOURCE_ENGAGEMENT_CAPTURE_BATCH_SIZE` | `100` | Maximum due `meme_sources` rows claimed per run. |
+| `SCHEDULER_SOURCE_ENGAGEMENT_CAPTURE_LEASE_TIMEOUT_SECONDS` | `1800` | Lease timeout before an old source-engagement claim can be reclaimed. |
+| `PIPELINE_BROKER_SOURCE_ENGAGEMENT_CAPTURE_QUEUE` | `pipeline.source_engagement_capture` | RabbitMQ queue used by worker-side metric fetchers. |
+| `SCHEDULER_MATERIALIZED_VIEW_REFRESH_ENABLED` | `true` | Enables the public trend MV refresh job. |
+| `SCHEDULER_MATERIALIZED_VIEW_REFRESH_INTERVAL_SECONDS` | `300` | Refresh cadence for the derived public trend read models. |
+
 SEO backlog job:
 
 | variable | default | meaning |
@@ -52,19 +66,19 @@ RabbitMQ outbox publisher job:
 
 ## Result Logs
 
-Search-index and SEO jobs emit:
+Search-index, source-engagement, and SEO jobs emit:
 
 | field | meaning |
 |---|---|
 | `event` | Always `scheduler_job_batch_result`. |
-| `job_id` | `search-index-sync` or `seo-backlog-batches`. |
+| `job_id` | `search-index-sync`, `source-engagement-capture`, or `seo-backlog-batches`. |
 | `scanned` | Work rows or memes claimed by this run. |
 | `updated` | External index updates or SEO page writes that succeeded. |
 | `failed` | Claimed items that ended in a recorded failure. |
 | `skipped` | Claimed items that could not be finalized because another run changed the row, or SEO generation returned a non-write skip result. |
 | `duration_seconds` | Wall-clock seconds spent inside the job action. |
 
-The outbox publisher emits the same `event=scheduler_job_batch_result` with `job_id=rabbitmq-outbox-publisher`, `recovered`, `claimed`, `published`, `failed`, and `duration_seconds` fields.
+The source-engagement job uses `claimed` for due source rows and `enqueued` for RabbitMQ outbox messages written. The outbox publisher emits the same `event=scheduler_job_batch_result` with `job_id=rabbitmq-outbox-publisher`, `recovered`, `claimed`, `published`, `failed`, and `duration_seconds` fields.
 
 The generic wrapper still emits `scheduler_job_started`, `scheduler_job_succeeded`, and `scheduler_job_failed`. A non-zero `failed` count inside `scheduler_job_batch_result` does not make the scheduler action fail; failures are durable backlog state and are retried by later runs where appropriate.
 
@@ -75,6 +89,16 @@ The durable work table is `rabbitmq_outbox_messages`. API raw-upload acceptance 
 Each publisher run opens a scheduler DB session, starts or reuses the RabbitMQ pipeline broker, recovers stale rows where `status='publishing'` and `locked_at` is older than `SCHEDULER_RABBITMQ_OUTBOX_PUBLISHER_STALE_TIMEOUT_SECONDS`, then claims due rows where `status in ('pending', 'failed')` and `next_retry_at IS NULL OR next_retry_at <= now()`. Claims are locked with `FOR UPDATE SKIP LOCKED`, set to `publishing` with `locked_at`/`lock_owner`, and committed before the broker publish.
 
 The publisher sends the stored JSON payload to the row's stored `exchange` and `routing_key` with stored headers, content type, and stable `message_id`; it does not branch on event type. Successful publishes set `status='published'`, `published_at`, and clear retry/lease metadata. Broker failures set `status='failed'`, incremented attempt metadata is preserved, `last_error_text` is recorded, and `next_retry_at` is scheduled from `PIPELINE_BROKER_RETRY_BACKOFF_SECONDS`.
+
+## Source Engagement Work Selection
+
+The canonical volatile source counters live in append-only `meme_source_engagement_snapshots`. `meme_sources` stores provenance and scheduling state only: platform identity, `published_at`, `next_engagement_check_at`, lease fields, and source liveness. It does not store Telegram view/reaction/forward totals.
+
+Initial ingest writes an `ingest_initial` snapshot as the baseline. Later captures are scheduled from the Telegram post date, not ingest time: `+1h`, `+3h`, `+12h`, `+1d`, `+3d`, `+7d`, `+1month`, then monthly. A missed old interval is not backfilled with invented deltas; the first observed snapshot for a source contributes zero historical delta because there is no previous snapshot to compare.
+
+Each scheduler run claims due, alive Telegram `meme_sources` rows with `FOR UPDATE SKIP LOCKED`, sets the source engagement lease fields, and writes a `source_engagement_capture_requested` message through the generic RabbitMQ outbox in the same DB transaction. Worker execution happens later from RabbitMQ; that worker fetches Telegram metadata and appends or updates the scheduled snapshot row.
+
+Snapshot NULLs mean "Telegram did not expose this counter" and are preserved in canonical storage. Public trend/read-model queries may coalesce unknown to 0 for ranking and summaries only. `forward_count` is Telegram's public forward/repost count and maps to public `latest_source_reposts`; it is unrelated to `forwarded_from_*` attribution on forwarded messages.
 
 ## Search-Index Work Selection
 
@@ -87,7 +111,7 @@ Claimable work includes:
 - `processing` rows whose `last_attempt_at` is older than `SCHEDULER_SEARCH_INDEX_SYNC_PROCESSING_TIMEOUT_SECONDS`.
 - `synced` rows whose canonical search-index clock is newer than `last_success_at`.
 
-The canonical clock includes `memes.updated_at`, `meme_files.updated_at`, SEO generated/edited timestamps, template updates, collection updates, collection membership rows, and collection-meme membership timestamps. This matches the payload fields that include popularity, tags, template, SEO slug, and collection access hints.
+The canonical clock includes `memes.updated_at`, `meme_files.updated_at`, SEO generated/edited timestamps, template updates, collection updates, collection membership rows, and collection-meme membership timestamps. Search payload `popularity_score` is derived at rebuild time from source engagement snapshots plus `analytics_events`; it is not a stored canonical meme column.
 
 Each claimed row is set to `processing`, `last_attempt_at` is refreshed, and `attempt_count` is incremented before the scheduler calls Qdrant or Meilisearch. The claim transaction commits before the external write so overlapping scheduler runs skip the same target row. Successful writes set `status='synced'`, clear error fields, refresh `last_success_at`, and store a bounded typed preview compatible with the pipeline inspect decoder. Failed writes set `status='failed'`, `normalized_reason`, `last_error_text`, and `last_attempt_at` while preserving the last known good `last_success_at` and preview.
 
@@ -99,7 +123,7 @@ Priority order:
 
 1. Public, non-NSFW memes with no `meme_seo_pages` row.
 2. Public, non-NSFW memes with an auto-generated SEO page whose `prompt_version` differs from `PIPELINE_SEO_PROMPT_VERSION` and `edited_at IS NULL`.
-3. Within each class, higher `popularity_score` first, then stable creation/id tie-breakers.
+3. Within each class, stable creation/id tie-breakers keep claims deterministic.
 
 Manual pages (`edited_at IS NOT NULL`) are intentionally skipped. For stale auto-generated pages, the job calls `MemeSeoGenerationService` with `force=True`; missing pages use the default non-force path.
 

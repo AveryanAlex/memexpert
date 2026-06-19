@@ -8,12 +8,6 @@ from memexpert.models.enums import SourceEngagementCommentsState
 from memexpert.services.source_engagement import SourceEngagementMetrics
 
 
-def source_reactions(source_metadata: dict[str, object]) -> dict[str, int]:
-    """Return reactions for legacy non-null ``MemeSource.reactions`` columns."""
-
-    return source_engagement_reactions(source_metadata) or {}
-
-
 def source_engagement_reactions(source_metadata: dict[str, object]) -> dict[str, int] | None:
     """Return canonical source reactions while preserving unknown-vs-known-zero."""
 
@@ -38,9 +32,7 @@ def source_engagement_reactions(source_metadata: dict[str, object]) -> dict[str,
 def source_view_count(source_metadata: dict[str, object]) -> int | None:
     """Return the canonical source view count while preserving unknown-vs-zero."""
 
-    if "view_count" in source_metadata:
-        return _non_negative_int_or_none(source_metadata.get("view_count"))
-    return _non_negative_int_or_none(source_metadata.get("views"))
+    return _non_negative_int_or_none(source_metadata.get("view_count"))
 
 
 def source_forward_count(source_metadata: dict[str, object]) -> int | None:
@@ -132,8 +124,6 @@ def _source_raw_metrics(
         "forward_count": source_forward_count(source_metadata),
         "comments_state": comments_state.value,
     }
-    if "views" in source_metadata and "view_count" not in source_metadata:
-        raw_metrics["legacy_views"] = source_view_count(source_metadata)
     return raw_metrics
 
 
@@ -146,6 +136,5 @@ __all__ = [
     "source_forward_count",
     "source_is_forwarded",
     "source_published_at",
-    "source_reactions",
     "source_view_count",
 ]

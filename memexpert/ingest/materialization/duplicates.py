@@ -10,12 +10,10 @@ from memexpert.ingest.collection_targets import (
     save_meme_to_target_collection,
     visible_meme_clause,
 )
-from memexpert.ingest.materialization.sources import source_views
 from memexpert.ingest.source_metadata import (
     source_engagement_metrics,
     source_forward_ids,
     source_published_at,
-    source_reactions,
 )
 from memexpert.ingest.target_collection_metadata import TargetCollectionMetadataError, parse_target_collection_id
 from memexpert.models.content import Meme, MemeFile, MemeSource, PipelineStageJournal
@@ -79,8 +77,6 @@ async def create_phash_duplicate_rows(
         platform=ingest_request.source_platform,
         source_id=ingest_request.source_id,
         post_id=ingest_request.post_id,
-        views=source_views(ingest_request),
-        reactions=source_reactions(ingest_request.source_metadata),
         is_first_source=False,
         source_alive=True,
         published_at=source_published_at(ingest_request.source_metadata),

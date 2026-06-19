@@ -78,7 +78,7 @@ Every process is a thin entry point over `services/`. The service layer owns DB 
 | **SvelteKit** | SSR, public website, admin UI, and Mini App frontend shell. Server-side rendering for SEO and initial page loads. | HTTP → FastAPI |
 | **FastStream Workers** | Event-driven processing. Separate consumer groups by resource profile (see Content Pipeline). | RabbitMQ → Services → PG, S3, external APIs |
 | **Crawlers** | Long-running listeners per platform (Telethon for Telegram). Listen to channel updates in real-time, catch up from `last_read_post_id` on startup. Publish `raw_meme` events to RabbitMQ. | RabbitMQ, PG, S3 |
-| **Scheduler** | APScheduler process for periodic tasks: materialized-view refresh, popularity snapshots, search-index sync, Meme of the Day, and scheduled SEO batches. | Services → PG, Redis, RabbitMQ |
+| **Scheduler** | APScheduler process for periodic tasks: source-engagement capture enqueueing, materialized-view refresh, search-index sync, Meme of the Day, and scheduled SEO batches. | Services → PG, Redis, RabbitMQ |
 | **Channel Bot** | Separate aiogram bot for themed MemeXpert-owned channels. Acts as a virtual user — has its own recommendation profile per channel, selects memes by tag + popularity + novelty, posts 2–4×/day. Monitors subscriber feedback (reactions, views, forwards) to refine per-channel selection. | Services → PG, Telegram Bot API |
 | **imgproxy** | On-the-fly image transforms (resize, WebP/AVIF). CDN-cached. | S3 (source), CDN (delivery) |
 
@@ -112,7 +112,7 @@ SvelteKit handles server-side rendering for SEO and fast initial page loads. `+p
 | **Text Search** | Meilisearch | Typo-tolerant, faceted, Russian morphology |
 | **Message Broker** | RabbitMQ | Durable event streaming for content pipeline |
 | **Event Framework** | FastStream | Async event-driven workers with Pydantic message schemas |
-| **Scheduler** | APScheduler | Periodic tasks (MV refresh, popularity snapshots, MOTD, batch sync, scheduled SEO) |
+| **Scheduler** | APScheduler | Periodic tasks (source-engagement capture, MV refresh, MOTD, batch sync, scheduled SEO) |
 | **Object Storage** | Cloudflare R2 / Backblaze B2 | S3-compatible |
 | **CDN** | Cloudflare | Media delivery + imgproxy caching |
 | **Image Processing** | imgproxy, Pillow, FFmpeg | On-the-fly + batch transcoding |

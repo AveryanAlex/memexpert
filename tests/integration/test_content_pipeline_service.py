@@ -34,7 +34,6 @@ from memexpert.models.content import (
     MemeFileOCRResult,
     MemeFileSyncTargetSnapshot,
     MemeMergeLog,
-    MemePopularitySnapshot,
     MemeSource,
     PipelineStageJournal,
     RabbitMQOutboxMessage,
@@ -350,8 +349,6 @@ async def _seed_pending_pipeline_item(
                 platform=SourcePlatform.TELEGRAM,
                 source_id=source_id,
                 post_id=post_id,
-                views=42,
-                reactions={},
                 is_first_source=True,
                 source_alive=True,
                 attach_reason=SourceAttachReason.NEW_FILE,
@@ -736,22 +733,8 @@ async def test_complete_embed_stage_auto_merges_high_similarity_into_older_meme(
     assert older_file is not None
     older_meme_id = older_file.meme_id
     older_file.quality_score = 0.99
-    migrated_db_session.add(
-        MemePopularitySnapshot(
-            meme_id=older_meme_id,
-            source_views=120,
-            source_reactions=10,
-            source_reposts=1,
-            platform_views=60,
-            platform_sends=2,
-            platform_saves=3,
-            platform_likes=4,
-            popularity_score=1.5,
-        )
-    )
     older_meme = await migrated_db_session.scalar(select(Meme).where(Meme.id == older_meme_id))
     assert older_meme is not None
-    older_meme.popularity_score = 0.5
     older_meme.like_count = 3
     await migrated_db_session.commit()
 
@@ -798,11 +781,6 @@ async def test_complete_embed_stage_auto_merges_high_similarity_into_older_meme(
         target_meme = await session.scalar(select(Meme).where(Meme.id == older_meme_id))
         source_meme = await session.scalar(select(Meme).where(Meme.id == newer_meme_id))
         moved_file = await session.scalar(select(MemeFile).where(MemeFile.id == newer_meme_file_id))
-        moved_popularity_rows = (
-            await session.execute(
-                select(MemePopularitySnapshot).where(MemePopularitySnapshot.meme_id == older_meme_id)
-            )
-        ).scalars().all()
         merge_log = await session.scalar(
             select(MemeMergeLog).where(MemeMergeLog.source_meme_file_id == newer_meme_file_id)
         )
@@ -814,7 +792,6 @@ async def test_complete_embed_stage_auto_merges_high_similarity_into_older_meme(
     assert moved_file is not None
     assert moved_file.meme_id == older_meme_id
     assert target_meme.primary_file_id == older_meme_file_id
-    assert len(moved_popularity_rows) == 1
     assert merge_log is not None
     assert merge_log.merge_reason == MERGE_REASON_HIGH_SIMILARITY
     assert merge_log.similarity_score == pytest.approx(0.97)

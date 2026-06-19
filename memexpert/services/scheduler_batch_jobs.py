@@ -487,7 +487,7 @@ class SeoBacklogBatchJobService:
                     ),
                 ),
             )
-            .order_by(backlog_rank, Meme.popularity_score.desc(), Meme.created_at, Meme.id)
+            .order_by(backlog_rank, Meme.created_at, Meme.id)
             .limit(1)
             .with_for_update(of=Meme, skip_locked=True)
         )

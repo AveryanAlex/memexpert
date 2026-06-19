@@ -29,7 +29,7 @@
   }
 </script>
 
-<PageHeader title="Public meme trends." description="Aggregate launch-scope analytics from MemeXpert activity and source popularity snapshots." badge="No per-user data">
+<PageHeader title="Public meme trends." description="Aggregate launch-scope analytics from MemeXpert activity, source engagement deltas, and latest source totals." badge="No per-user data">
   <ActionLink href="/trends/compare" variant="secondary">Compare trends</ActionLink>
   <ActionLink href="/trends/timeline" variant="secondary">Timeline</ActionLink>
 </PageHeader>

@@ -874,7 +874,6 @@ async def test_admin_can_merge_meme_with_shared_lineage_transfer_and_audit(
             is_public=True,
             is_nsfw=False,
             like_count=2,
-            popularity_score=4.0,
             file_key="admin/merge/source.jpg",
             file_quality=0.5,
         )
@@ -883,7 +882,6 @@ async def test_admin_can_merge_meme_with_shared_lineage_transfer_and_audit(
             is_public=True,
             is_nsfw=False,
             like_count=5,
-            popularity_score=3.0,
             file_key="admin/merge/target.jpg",
             file_quality=1.0,
         )
@@ -939,7 +937,6 @@ async def test_admin_can_merge_meme_with_shared_lineage_transfer_and_audit(
         assert deleted_source is None
         assert target is not None
         assert target.like_count == 7
-        assert target.popularity_score == 4.0
         assert target.primary_file_id == target_file_id
         assert moved_file is not None
         assert moved_file.meme_id == target_meme_id

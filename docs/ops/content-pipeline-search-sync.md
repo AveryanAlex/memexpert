@@ -55,9 +55,9 @@ Fields intentionally carried into both indexes:
   `public_collection_ids`, `unlisted_collection_ids`,
   `private_collection_ids`, `shared_collection_ids`,
   `collection_owner_user_ids`, `collection_member_user_ids`.
-- Canonical ranking metadata: `search_index_algorithm_version`, `media_type`,
+- Ranking metadata: `search_index_algorithm_version`, `media_type`,
   `language`, `is_nsfw`, `tags`, `template_id`, `template_slug`,
-  `popularity_score`, `like_count`, `created_at`, `updated_at`,
+  derived `popularity_score`, `like_count`, `created_at`, `updated_at`,
   `quality_score`.
 - Safe content hints already used by the search sync path: `meme_id`,
   `meme_file_id`/`id`, `seo_page_slug`, and OCR text/snippet.
@@ -239,15 +239,15 @@ successful sync and the search indexes need to catch up. Typical triggers:
 - A meme was added to or removed from a collection.
 - Collection visibility changed between `private`, `unlisted`, and `public`.
 - Tags, template assignment, template slug, or SEO slug changed.
-- `like_count`, `popularity_score`, or `quality_score` changed enough to matter
-  for ranking.
+- `like_count`, derived source-engagement popularity, or `quality_score` changed
+  enough to matter for ranking.
 
 Operational guidance:
 
 1. Replay **only the affected target** when one engine is stale and the other
    is already correct.
 2. Use the batch replay endpoints for many affected ids after a moderation,
-   collection, template, or popularity backfill.
+   collection, template, or source-engagement/read-model repair.
 3. For a full rebuild, enumerate every ready `meme_file_id` and feed the same
    per-target batch endpoints in bounded chunks until the whole corpus has been
    re-queued. The payload/document is rebuilt from PostgreSQL on every consume,

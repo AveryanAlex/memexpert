@@ -18,6 +18,7 @@ from memexpert.models.content import (
     MemeFile,
     MemeFileOCRResult,
     MemeFileSyncTargetSnapshot,
+    MemeSourceEngagementSnapshot,
     MemeTemplate,
 )
 from memexpert.models.enums import (
@@ -315,10 +316,10 @@ def test_public_trends_artifact_payload_is_deterministic_and_url_ready() -> None
     }
 
 
-def test_public_trend_template_and_snapshot_helpers_are_deterministic() -> None:
-    meme_id = seed_e2e._stable_uuid("cat:meme")
+def test_public_trend_template_and_source_snapshot_helpers_are_deterministic() -> None:
+    meme_source_id = seed_e2e._stable_uuid("cat:source")
     template = seed_e2e.build_public_trends_template()
-    rows = seed_e2e.build_public_trend_snapshot_rows(meme_id=meme_id, category="cat")
+    rows = seed_e2e.build_public_trend_snapshot_rows(meme_source_id=meme_source_id, category="cat")
 
     assert isinstance(template, MemeTemplate)
     assert template.id == seed_e2e._stable_uuid("public-trends:template")
@@ -327,19 +328,22 @@ def test_public_trend_template_and_snapshot_helpers_are_deterministic() -> None:
     assert template.description == seed_e2e.E2E_PUBLIC_TRENDS_TEMPLATE_DESCRIPTION
     assert template.is_curated is True
 
+    assert all(isinstance(row, MemeSourceEngagementSnapshot) for row in rows)
     assert [row.id for row in rows] == [
-        seed_e2e._stable_uuid("cat:public-trend-snapshot:1"),
-        seed_e2e._stable_uuid("cat:public-trend-snapshot:2"),
+        seed_e2e._stable_uuid("cat:source-engagement-baseline"),
+        seed_e2e._stable_uuid("cat:source-engagement-snapshot:1"),
+        seed_e2e._stable_uuid("cat:source-engagement-snapshot:2"),
     ]
-    assert [row.meme_id for row in rows] == [meme_id, meme_id]
+    assert [row.meme_source_id for row in rows] == [meme_source_id, meme_source_id, meme_source_id]
     assert [row.captured_at.isoformat() for row in rows] == [
+        "2026-01-05T11:59:59+00:00",
         "2026-01-05T12:00:00+00:00",
         "2026-01-12T12:00:00+00:00",
     ]
-    assert [row.source_views for row in rows] == [120, 180]
-    assert [row.platform_likes for row in rows] == [7, 12]
-    assert [row.popularity_score for row in rows] == [40.0, 80.5]
-    assert seed_e2e.build_public_trend_snapshot_rows(meme_id=meme_id, category="cat-nsfw") == []
+    assert [row.view_count for row in rows] == [0, 120, 300]
+    assert [row.reaction_count for row in rows] == [0, 12, 30]
+    assert [row.forward_count for row in rows] == [0, 4, 10]
+    assert seed_e2e.build_public_trend_snapshot_rows(meme_source_id=meme_source_id, category="cat-nsfw") == []
 
 
 def test_public_trend_aggregate_history_points_payload_uses_real_seed_snapshots() -> None:

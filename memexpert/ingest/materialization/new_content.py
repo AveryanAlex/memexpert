@@ -4,13 +4,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from memexpert.ingest.materialization.sources import source_views
 from memexpert.ingest.source_metadata import (
     source_engagement_metrics,
     source_forward_ids,
     source_is_forwarded,
     source_published_at,
-    source_reactions,
 )
 from memexpert.models.content import Meme, MemeFile, MemeSource, PipelineStageJournal
 from memexpert.models.enums import (
@@ -62,8 +60,6 @@ async def create_new_content_rows(
         platform=ingest_request.source_platform,
         source_id=ingest_request.source_id,
         post_id=ingest_request.post_id,
-        views=source_views(ingest_request),
-        reactions=source_reactions(ingest_request.source_metadata),
         is_first_source=not source_is_forwarded(ingest_request.source_metadata),
         source_alive=True,
         published_at=source_published_at(ingest_request.source_metadata),

@@ -17,7 +17,9 @@ from memexpert.models.content import Meme, MemeFile, TelegramFileIdCache
 from memexpert.models.enums import AnalyticsEventType, ContentKind, TelegramMediaFormat
 from memexpert.models.user import AnalyticsEvent, User
 from memexpert.schemas.meme import MemeResultAttributionRead, new_discovery_request_id
+from memexpert.services.engagement_read_model import load_derived_popularity_scores
 from memexpert.services.meme_search import (
+    _DERIVED_POPULARITY_ATTR,
     MemeSearchFilters,
     MemeSearchScope,
     _apply_filters,
@@ -213,8 +215,8 @@ class TelegramInlineService:
                     meme=meme,
                     source_algorithm="popular",
                     reason="empty_query_public_popular",
-                    score=meme.popularity_score,
-                    score_components={"popularity": meme.popularity_score},
+                    score=_derived_popularity_score(meme),
+                    score_components={"popularity": _derived_popularity_score(meme)},
                 )
                 for meme in await self._load_popular_memes(viewer_user_id=None, include_nsfw=False)
             ]
@@ -249,8 +251,8 @@ class TelegramInlineService:
                         meme=meme,
                         source_algorithm="popular",
                         reason="empty_query_popular_fallback",
-                        score=meme.popularity_score,
-                        score_components={"popularity": meme.popularity_score},
+                        score=_derived_popularity_score(meme),
+                        score_components={"popularity": _derived_popularity_score(meme)},
                     )
                     for meme in popular_memes
                 ),
@@ -298,7 +300,9 @@ class TelegramInlineService:
             .order_by(PinnedMeme.position.asc(), PinnedMeme.pinned_at.desc(), Meme.id.asc())
         )
         result = await self._session.execute(stmt)
-        return list(result.scalars().unique().all())
+        memes = list(result.scalars().unique().all())
+        await self._attach_derived_popularity_scores(memes)
+        return memes
 
     async def _load_recent_send_memes(self, user: User) -> list[Meme]:
         result = await self._session.execute(
@@ -342,13 +346,15 @@ class TelegramInlineService:
         )
 
     async def _load_popular_memes(self, *, viewer_user_id: uuid.UUID | None, include_nsfw: bool) -> list[Meme]:
-        stmt = _visible_meme_stmt(viewer_user_id, include_nsfw=include_nsfw).order_by(
-            Meme.popularity_score.desc(),
-            Meme.created_at.desc(),
-            Meme.id.asc(),
-        )
+        stmt = _visible_meme_stmt(viewer_user_id, include_nsfw=include_nsfw)
         result = await self._session.execute(stmt)
-        return list(result.scalars().unique().all())
+        memes = list(result.scalars().unique().all())
+        scores = await self._attach_derived_popularity_scores(memes)
+        return sorted(
+            memes,
+            key=lambda meme: (scores.get(meme.id, 0.0), meme.created_at, str(meme.id)),
+            reverse=True,
+        )
 
     async def _load_visible_memes_by_ids(
         self,
@@ -364,7 +370,15 @@ class TelegramInlineService:
             _visible_meme_stmt(viewer_user_id, include_nsfw=include_nsfw).where(Meme.id.in_(meme_ids))
         )
         memes_by_id = {meme.id: meme for meme in result.scalars().unique().all()}
+        await self._attach_derived_popularity_scores(list(memes_by_id.values()))
         return [memes_by_id[meme_id] for meme_id in meme_ids if meme_id in memes_by_id]
+
+    async def _attach_derived_popularity_scores(self, memes: list[Meme]) -> dict[uuid.UUID, float]:
+        meme_ids = tuple(dict.fromkeys(meme.id for meme in memes))
+        scores = await load_derived_popularity_scores(self._session, meme_ids)
+        for meme in memes:
+            setattr(meme, _DERIVED_POPULARITY_ATTR, scores.get(meme.id, 0.0))
+        return scores
 
     async def _build_sendable_results(self, memes: list[_InlineAttributedMeme]) -> list[TelegramInlineMediaResult]:
         candidates = [_to_inline_candidate(meme) for meme in memes]
@@ -491,6 +505,11 @@ def _parse_payload_uuid(value: object) -> uuid.UUID | None:
         return uuid.UUID(value)
     except ValueError:
         return None
+
+
+def _derived_popularity_score(meme: Meme) -> float:
+    raw_value = getattr(meme, _DERIVED_POPULARITY_ATTR, 0.0)
+    return float(raw_value or 0.0)
 
 
 def _clamp_limit(limit: int) -> int:

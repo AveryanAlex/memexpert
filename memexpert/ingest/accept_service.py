@@ -37,8 +37,6 @@ from memexpert.ingest.source_metadata import (
     source_engagement_metrics,
     source_forward_ids,
     source_published_at,
-    source_reactions,
-    source_view_count,
 )
 from memexpert.ingest.target_collection_metadata import (
     TargetCollectionMetadataError,
@@ -224,8 +222,6 @@ class PipelineIngestAcceptService:
             platform=source.source_platform,
             source_id=source.source_id,
             post_id=source.post_id,
-            views=source_view_count(source_metadata) or 0,
-            reactions=source_reactions(source_metadata),
             is_first_source=False,
             source_alive=True,
             published_at=source_published_at(source_metadata),
@@ -462,8 +458,6 @@ class PipelineIngestAcceptService:
     ) -> None:
         if view_count is not None:
             source_metadata["view_count"] = view_count
-        elif "view_count" not in source_metadata and "views" in source_metadata:
-            source_metadata["view_count"] = source_view_count(source_metadata)
         elif "view_count" not in source_metadata:
             source_metadata["view_count"] = None
         if forward_count is not None:
@@ -472,10 +466,6 @@ class PipelineIngestAcceptService:
             source_metadata["comment_count"] = comment_count
         if "comments_state" not in source_metadata or comments_state is not SourceEngagementCommentsState.UNKNOWN:
             source_metadata["comments_state"] = comments_state.value
-        # Transitional legacy column/read-model compatibility only. Canonical
-        # engagement snapshots use ``view_count`` and preserve ``None``.
-        source_metadata["views"] = source_view_count(source_metadata) or 0
-
     @staticmethod
     def _sha_match_attach_reason(matched_file: MemeFile) -> SourceAttachReason:
         if (

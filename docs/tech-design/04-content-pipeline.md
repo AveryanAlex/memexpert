@@ -37,11 +37,11 @@ Crawler duplicate-post idempotency is separate from media identity: an already-s
 
 ### Post-Embed Semantic Merge
 
-After the embed stage computes a file embedding, semantic merge may query Qdrant for high cosine similarity and merge two `Meme` concepts. This is not exact-byte identity and not the exact-pHash same-meme ingest path. When semantic merge fires, files, sources, collection memberships, and popularity data are consolidated into the target meme and the duplicate meme entity is deleted according to the merge service's invariants.
+After the embed stage computes a file embedding, semantic merge may query Qdrant for high cosine similarity and merge two `Meme` concepts. This is not exact-byte identity and not the exact-pHash same-meme ingest path. When semantic merge fires, files, sources, collection memberships, pins, and like counts are consolidated into the target meme and the duplicate meme entity is deleted according to the merge service's invariants. Public popularity is derived later from the moved source rows and analytics events.
 
 ### Admin Merge
 
-When admins merge memes manually, all files, collection memberships, pins, and popularity snapshots are moved to the primary meme. Qdrant payloads are updated for moved files, deleted memes are removed from Meilisearch.
+When admins merge memes manually, all files, sources, collection memberships, pins, and like counts are moved to the primary meme. Qdrant payloads are updated for moved files, deleted memes are removed from Meilisearch, and public popularity is recomputed from the moved source rows and analytics events.
 
 ## Processing
 
@@ -128,13 +128,15 @@ Pipeline entrypoints, the media materializer, and stage transition services use 
 Tasks that run on a schedule (not event-driven) are managed by APScheduler in a dedicated process:
 
 - Public trend materialized-view refresh (e.g. every 5 min or adaptive)
-- Popularity snapshot computation (initially every 6h; tune after observing traffic)
+- Source engagement capture enqueueing for due Telegram source posts
 - Search-index sync (batched, not per-like)
 - Generic RabbitMQ transactional outbox publishing for ingest/materialization/stage events
 - Meme of the Day selection/cache refresh
-- Scheduled SEO generation batches prioritized by popularity/backlog
+- Scheduled SEO generation batches prioritized by backlog class and stable tie-breakers
 
-The current implementation registers these scheduler jobs with independent enable and interval settings. Public trend materialized-view refresh, popularity snapshot computation, search-index sync, SEO backlog batches, and RabbitMQ outbox publishing contain production behavior; Meme of the Day remains a lightweight placeholder until its product behavior is implemented.
+The current implementation registers these scheduler jobs with independent enable and interval settings. Source engagement capture, public trend materialized-view refresh, search-index sync, SEO backlog batches, and RabbitMQ outbox publishing contain production behavior; Meme of the Day remains a lightweight placeholder until its product behavior is implemented.
+
+Source engagement scheduling is stored in PostgreSQL on `meme_sources` and anchored to the Telegram post date. The scheduler only claims due rows and writes `source_engagement_capture_requested` messages through the transactional outbox; worker-side RabbitMQ consumers perform the Telegram fetch and append `meme_source_engagement_snapshots`. Public trends/search popularity are derived from those snapshots plus `analytics_events`, so no pipeline stage writes canonical popularity counters back to `memes` or `meme_sources`.
 
 Guest TTL/deletion jobs are intentionally not part of the current product direction.
 
@@ -202,11 +204,11 @@ Memes with SEO content → `/memes/{slug}` (indexed). Without → `/memes/{id}` 
 
 LLM identifies known templates from image during SEO generation. Fuzzy-matched against existing templates — linked or new template created. Admins curate uncurated templates.
 
-## Popularity Scoring
+## Popularity Read Models
 
-### Static Popularity
+### Derived Popularity
 
-A baseline score reflecting a meme's cumulative engagement. Computed on a schedule and stored as snapshots/materialized aggregates for historical charts. Updated scores synced to Qdrant and Meilisearch in batch.
+Public `popularity_score` fields are derived read-model/index payload values, not canonical meme columns. They are recomputed from the latest successful source engagement snapshots plus platform interaction events and synced to Qdrant/Meilisearch in batch.
 
 ```text
 popularity = log(1 + source_views) × source_view_weight
@@ -219,7 +221,9 @@ popularity = log(1 + source_views) × source_view_weight
            + log(1 + platform_views) × view_weight
 ```
 
-Logarithmic scaling prevents viral outliers from dominating. Weights are tunable configuration, not product truth. The current snapshot table intentionally includes only source views, summed source reactions, source repost rows, platform views, sends, saves, and likes. Impression/download snapshot columns and their weights are deferred until a schema stage adds those persisted fields.
+Logarithmic scaling prevents viral outliers from dominating. Source totals come from the latest successful `meme_source_engagement_snapshots` row per source post. Historical charts and velocity windows use snapshot-to-snapshot deltas; the first source snapshot is only a baseline and contributes no invented delta. Platform metrics come from `analytics_events`.
+
+Snapshot `NULL` means Telegram did not expose a counter and is preserved in canonical storage. Public read models may coalesce unknown to `0` for ranking/output. Telegram `forward_count` is the public forward/repost counter that feeds derived source repost metrics; forwarded-message provenance (`forwarded_from_*`) is attribution, not engagement.
 
 ### Trending Score
 

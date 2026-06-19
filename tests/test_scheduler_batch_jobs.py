@@ -414,7 +414,6 @@ async def _create_ready_meme_file(
         tags=["frog"],
         is_public=is_public,
         is_nsfw=is_nsfw,
-        popularity_score=popularity_score,
         like_count=int(popularity_score),
         ocr_text="frog text",
     )

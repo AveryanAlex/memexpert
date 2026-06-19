@@ -23,6 +23,7 @@ from memexpert.schemas.seo import (
     SeoCatalogTemplatePageRead,
     SeoCatalogTemplateRead,
 )
+from memexpert.services.engagement_read_model import load_derived_popularity_scores
 from memexpert.services.media_render_urls import MediaRenderUrlService, PublicMediaRenderContext
 
 DEFAULT_CATALOG_LIMIT = 1_000
@@ -32,6 +33,7 @@ MAX_PINTEREST_FEED_LIMIT = 500
 _TITLE_MAX_LENGTH = 160
 _DESCRIPTION_MAX_LENGTH = 320
 _ALT_TEXT_MAX_LENGTH = 250
+_DERIVED_POPULARITY_ATTR = "_derived_popularity_score"
 
 
 class SeoCatalogService:
@@ -89,7 +91,6 @@ class SeoCatalogService:
             offset=offset,
             order_by=(
                 Meme.updated_at.desc(),
-                Meme.popularity_score.desc(),
                 Meme.created_at.desc(),
                 Meme.id.desc(),
             ),
@@ -170,10 +171,9 @@ class SeoCatalogService:
         result = await self._session.execute(
             _public_safe_meme_stmt().order_by(*order_by).limit(resolved_limit).offset(resolved_offset),
         )
-        items = [
-            _to_meme_read(meme, media_render_service=self._media_render_service)
-            for meme in result.scalars().unique()
-        ]
+        memes = list(result.scalars().unique())
+        await self._attach_derived_popularity_scores(memes)
+        items = [_to_meme_read(meme, media_render_service=self._media_render_service) for meme in memes]
         return SeoCatalogMemePageRead(
             items=items,
             limit=resolved_limit,
@@ -184,6 +184,11 @@ class SeoCatalogService:
 
     async def _scalar_int(self, stmt: Select[tuple[int]]) -> int:
         return int(await self._session.scalar(stmt) or 0)
+
+    async def _attach_derived_popularity_scores(self, memes: list[Meme]) -> None:
+        scores = await load_derived_popularity_scores(self._session, tuple(dict.fromkeys(meme.id for meme in memes)))
+        for meme in memes:
+            setattr(meme, _DERIVED_POPULARITY_ATTR, scores.get(meme.id, 0.0))
 
     async def _latest_seo_updated_at(self) -> datetime | None:
         seo_updated_at = func.greatest(
@@ -296,7 +301,7 @@ def _to_meme_read(meme: Meme, *, media_render_service: MediaRenderUrlService) ->
         tags=tags,
         media_type=meme.media_type,
         language=meme.language,
-        popularity_score=meme.popularity_score,
+        popularity_score=_derived_popularity_score(meme),
         like_count=meme.like_count,
         template=_template_ref_read(meme.template) if meme.template is not None else None,
         primary_file=(
@@ -352,6 +357,11 @@ def _ordered_files(meme: Meme) -> list[MemeFile]:
     if meme.primary_file is not None:
         by_id[meme.primary_file.id] = meme.primary_file
     return sorted(by_id.values(), key=lambda file: (file.id != meme.primary_file_id, str(file.id)))
+
+
+def _derived_popularity_score(meme: Meme) -> float:
+    raw_value = getattr(meme, _DERIVED_POPULARITY_ATTR, 0.0)
+    return float(raw_value or 0.0)
 
 
 def _tag_slugs(tags: list[str]) -> list[str]:

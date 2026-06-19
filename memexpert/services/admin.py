@@ -21,7 +21,6 @@ from memexpert.models.content import (
     MemeFile,
     MemeFileOCRResult,
     MemeFileSyncTargetSnapshot,
-    MemePopularitySnapshot,
     MemeSeoPage,
     MemeSource,
     MemeTemplate,
@@ -839,7 +838,7 @@ class AdminService:
         ).all()
         seo_slug = await self.session.scalar(select(MemeSeoPage.slug).where(MemeSeoPage.meme_id == meme.id))
 
-        file_bound_counts = await self._snapshot_file_bound_counts(meme.id, file_ids)
+        file_bound_counts = await self._snapshot_file_bound_counts(file_ids)
         return {
             "meme": {
                 "id": str(meme.id),
@@ -851,7 +850,6 @@ class AdminService:
                 "template_id": None if meme.template_id is None else str(meme.template_id),
                 "author_user_id": None if meme.author_user_id is None else str(meme.author_user_id),
                 "like_count": meme.like_count,
-                "popularity_score": meme.popularity_score,
                 "tags": list(meme.tags[:MAX_AUDIT_SNAPSHOT_IDS]),
             },
             "meme_files": {"count": len(file_ids), "ids": self._bounded_uuid_strings(file_ids)},
@@ -922,18 +920,13 @@ class AdminService:
 
     async def _snapshot_file_bound_counts(
         self,
-        meme_id: uuid.UUID,
         file_ids: tuple[uuid.UUID, ...],
     ) -> dict[str, object]:
-        popularity_count = await self.session.scalar(
-            select(func.count()).select_from(MemePopularitySnapshot).where(MemePopularitySnapshot.meme_id == meme_id),
-        )
         if not file_ids:
             return {
                 "meme_sources": {"count": 0},
                 "ocr_results": {"count": 0},
                 "pipeline_stage_journal": {"count": 0},
-                "popularity_snapshots": {"count": popularity_count or 0},
                 "sync_target_snapshots": {"count": 0, "by_target": {}},
                 "telegram_file_id_cache": {"count": 0},
                 "embedding_cache_source_links": {"count": 0},
@@ -966,7 +959,6 @@ class AdminService:
             "meme_sources": {"count": source_count or 0},
             "ocr_results": {"count": ocr_count or 0},
             "pipeline_stage_journal": {"count": stage_count or 0},
-            "popularity_snapshots": {"count": popularity_count or 0},
             "sync_target_snapshots": {
                 "count": sum(count for _, count in sync_rows),
                 "by_target": {target.value: count for target, count in sync_rows},

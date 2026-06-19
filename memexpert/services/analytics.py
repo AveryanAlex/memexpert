@@ -14,10 +14,10 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 
 from memexpert.models.base import utcnow
-from memexpert.models.content import Meme, MemePopularitySnapshot, MemeTemplate
+from memexpert.models.content import Meme, MemeTemplate
 from memexpert.models.enums import AccountType, AnalyticsEventType
 from memexpert.models.user import AccountMergeLog, AnalyticsEvent, User
 from memexpert.schemas.auth import (
@@ -397,8 +397,8 @@ class AnalyticsService:
         """Return launch KPI counts for a bounded recent window.
 
         Event counts come from ``AnalyticsEvent``. Source counters use the latest
-        ``MemePopularitySnapshot`` per meme captured in the same window so source
-        crawler metrics can be compared with platform activity.
+        successful source engagement snapshot per source post captured in the
+        same window so crawler metrics can be compared with platform activity.
         """
 
         resolved_hours = max(1, lookback_hours)
@@ -522,18 +522,30 @@ class AnalyticsService:
 
     async def _latest_source_metric_totals_since(self, since: datetime) -> tuple[int, int, int]:
         result = await self._session.execute(
-            select(MemePopularitySnapshot)
-            .where(MemePopularitySnapshot.captured_at >= since)
-            .order_by(MemePopularitySnapshot.meme_id, MemePopularitySnapshot.captured_at.desc())
+            text(
+                """
+                WITH latest AS (
+                    SELECT DISTINCT ON (meme_source_id)
+                        meme_source_id,
+                        view_count,
+                        reaction_count,
+                        forward_count
+                    FROM meme_source_engagement_snapshots
+                    WHERE fetch_status::text = 'success'
+                      AND captured_at >= :since
+                    ORDER BY meme_source_id, captured_at DESC, id DESC
+                )
+                SELECT
+                    COALESCE(sum(COALESCE(view_count, 0)), 0)::integer AS source_views,
+                    COALESCE(sum(COALESCE(reaction_count, 0)), 0)::integer AS source_reactions,
+                    COALESCE(sum(COALESCE(forward_count, 0)), 0)::integer AS source_reposts
+                FROM latest
+                """
+            ),
+            {"since": since},
         )
-        latest_by_meme: dict[uuid.UUID, MemePopularitySnapshot] = {}
-        for snapshot in result.scalars():
-            latest_by_meme.setdefault(snapshot.meme_id, snapshot)
-        return (
-            sum(snapshot.source_views for snapshot in latest_by_meme.values()),
-            sum(snapshot.source_reactions for snapshot in latest_by_meme.values()),
-            sum(snapshot.source_reposts for snapshot in latest_by_meme.values()),
-        )
+        row = result.mappings().one()
+        return int(row["source_views"] or 0), int(row["source_reactions"] or 0), int(row["source_reposts"] or 0)
 
 
 def hash_external_identifier(namespace: str, value: object) -> str:

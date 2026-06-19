@@ -28,7 +28,6 @@ from memexpert.models.content import (
     MemeFileOCRResult,
     MemeFileSyncTargetSnapshot,
     MemeMergeLog,
-    MemePopularitySnapshot,
     MemeSeoPage,
     MemeSource,
     MemeSourceEngagementSnapshot,
@@ -115,7 +114,6 @@ EXPECTED_TABLES = {
     "login_events",
     "meme_files",
     "meme_merge_logs",
-    "meme_popularity_snapshots",
     "meme_seo_pages",
     "meme_source_engagement_snapshots",
     "meme_sources",
@@ -222,6 +220,7 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
     assert metadata.tables["users"].c["active_save_collection_id"].foreign_keys
     assert metadata.tables["collections"].c["owner_id"].foreign_keys
     assert not memes_table.c["primary_file_id"].nullable
+    assert "popularity_score" not in memes_table.c
     assert meme_files_table.c["meme_id"].foreign_keys
     assert pipeline_ingest_requests_table.c["owner_user_id"].foreign_keys
     assert pipeline_ingest_requests_table.c["materialized_meme_id"].foreign_keys
@@ -251,6 +250,7 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
     meme_relationships = sa_inspect(Meme).relationships
     meme_file_relationships = sa_inspect(MemeFile).relationships
     meme_source_relationships = sa_inspect(MemeSource).relationships
+    meme_source_columns = sa_inspect(MemeSource).columns
     pipeline_ingest_request_relationships = sa_inspect(PipelineIngestRequest).relationships
 
     assert user_relationships["active_save_collection"].mapper.class_ is Collection
@@ -258,6 +258,7 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
     assert user_relationships["telegram_link_codes"].mapper.class_ is TelegramLinkCode
     assert meme_relationships["files"].mapper.class_ is MemeFile
     assert meme_relationships["primary_file"].mapper.class_ is MemeFile
+    assert "popularity_snapshots" not in meme_relationships
     assert meme_relationships["moderation_reports"].mapper.class_ is ModerationReport
     assert meme_relationships["moderation_decisions"].mapper.class_ is ModerationDecision
     assert pipeline_ingest_request_relationships["materialized_meme"].mapper.class_ is Meme
@@ -278,6 +279,8 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
     assert meme_file_relationships["sync_target_snapshots"].mapper.class_ is MemeFileSyncTargetSnapshot
     assert meme_file_relationships["blocked_perceptual_hash"].mapper.class_ is BlockedPerceptualHash
     assert meme_source_relationships["engagement_snapshots"].mapper.class_ is MemeSourceEngagementSnapshot
+    assert "views" not in meme_source_columns
+    assert "reactions" not in meme_source_columns
     assert sa_inspect(BlockedPerceptualHashAuditLog).columns["blocked_perceptual_hash_id"] is not None
 
 
@@ -511,19 +514,22 @@ async def test_schema_handles_cycles_multi_invites_and_nullable_content_fields(
                     platform=SourcePlatform.TELEGRAM,
                     source_id="memes_channel",
                     post_id="12345",
-                    views=321,
-                    reactions={"like": 10},
                     is_first_source=True,
-                ),
-                MemePopularitySnapshot(
-                    meme=meme,
-                    source_views=100,
-                    source_reactions=12,
-                    platform_views=50,
-                    platform_sends=5,
-                    platform_saves=3,
-                    platform_likes=7,
-                    popularity_score=1.25,
+                    engagement_snapshots=[
+                        MemeSourceEngagementSnapshot(
+                            captured_at=utcnow(),
+                            capture_reason=SourceEngagementCaptureReason.INGEST_INITIAL,
+                            view_count=321,
+                            reactions={"like": 10},
+                            reaction_count=10,
+                            comment_count=None,
+                            forward_count=4,
+                            comments_state=SourceEngagementCommentsState.UNKNOWN,
+                            fetch_status=SourceEngagementFetchStatus.SUCCESS,
+                            source_alive=True,
+                            raw_metrics={"source": "contract"},
+                        )
+                    ],
                 ),
                 TelegramFileIdCache(
                     meme_file=file_one,

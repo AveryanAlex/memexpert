@@ -133,8 +133,6 @@ def attach_crawler_source_row_to_meme_file(
         platform=raw_post.platform,
         source_id=raw_post.source_id,
         post_id=raw_post.post_id,
-        views=raw_post.view_count or 0,
-        reactions=dict(raw_post.reactions or {}),
         is_first_source=is_first_source,
         source_alive=True,
         published_at=raw_post.published_at,

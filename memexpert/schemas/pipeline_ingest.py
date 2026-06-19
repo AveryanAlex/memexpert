@@ -14,7 +14,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, StrictInt, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
 from memexpert.models.enums import SourceAttachReason, SourceEngagementCommentsState, SourcePlatform
 from memexpert.schemas.pipeline_base import (
@@ -36,17 +36,7 @@ class ContentPipelineUploadMetadata(BaseModel):
     source_id: str = Field(min_length=1, max_length=MAX_SOURCE_ID_LENGTH)
     post_id: str = Field(min_length=1, max_length=MAX_POST_ID_LENGTH)
     owner_user_id: uuid.UUID | None = None
-    view_count: StrictInt | None = Field(
-        default=None,
-        ge=0,
-        validation_alias=AliasChoices("view_count", "views"),
-    )
-
-    @property
-    def views(self) -> int:
-        """Legacy upload-form compatibility; new code should use ``view_count``."""
-
-        return self.view_count or 0
+    view_count: StrictInt | None = Field(default=None, ge=0)
 
     @field_validator("source_id", "post_id")
     @classmethod
@@ -145,22 +135,12 @@ class RawCrawlerPost(BaseModel):
     media_bytes: bytes
     filename: str | None = Field(default=None, max_length=MAX_TELEGRAM_FILENAME_LENGTH)
     content_type: str | None = Field(default=None, max_length=MAX_TELEGRAM_CONTENT_TYPE_LENGTH)
-    view_count: StrictInt | None = Field(
-        default=None,
-        ge=0,
-        validation_alias=AliasChoices("view_count", "views"),
-    )
+    view_count: StrictInt | None = Field(default=None, ge=0)
     reactions: dict[str, int] | None = None
     forward: CrawlerForwardAttribution | None = None
     forward_count: StrictInt | None = Field(default=None, ge=0)
     comment_count: StrictInt | None = Field(default=None, ge=0)
     comments_state: SourceEngagementCommentsState = SourceEngagementCommentsState.UNKNOWN
-
-    @property
-    def views(self) -> int | None:
-        """Legacy metric accessor; new code should use ``view_count``."""
-
-        return self.view_count
 
     @field_validator("platform")
     @classmethod

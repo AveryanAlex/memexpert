@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime
 from enum import StrEnum
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, StrictInt, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
 from memexpert.models.enums import (
     PipelineIngestRequestStatus,
@@ -44,22 +44,12 @@ class IngestAcceptSource(BaseModel):
     source_id: str = Field(min_length=1, max_length=MAX_SOURCE_ID_LENGTH)
     post_id: str = Field(min_length=1, max_length=MAX_POST_ID_LENGTH)
     owner_user_id: uuid.UUID | None = None
-    view_count: StrictInt | None = Field(
-        default=None,
-        ge=0,
-        validation_alias=AliasChoices("view_count", "views"),
-    )
+    view_count: StrictInt | None = Field(default=None, ge=0)
     forward_count: StrictInt | None = Field(default=None, ge=0)
     comment_count: StrictInt | None = Field(default=None, ge=0)
     comments_state: SourceEngagementCommentsState = SourceEngagementCommentsState.UNKNOWN
     user_metadata: dict[str, object] = Field(default_factory=dict)
     source_metadata: dict[str, object] = Field(default_factory=dict)
-
-    @property
-    def views(self) -> int:
-        """Legacy upload-form compatibility; new code should use ``view_count``."""
-
-        return self.view_count or 0
 
     @field_validator("source_id", "post_id")
     @classmethod

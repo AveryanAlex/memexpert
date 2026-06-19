@@ -378,8 +378,6 @@ async def _create_meme_source(
         platform=platform,
         source_id=source_id,
         post_id=post_id,
-        views=0,
-        reactions={},
         source_alive=source_alive,
         published_at=published_at,
         next_engagement_check_at=scheduled_for,

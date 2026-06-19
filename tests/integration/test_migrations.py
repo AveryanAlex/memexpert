@@ -44,7 +44,6 @@ EXPECTED_TABLES = {
     "meme_file_sync_target_snapshots",
     "meme_files",
     "meme_merge_logs",
-    "meme_popularity_snapshots",
     "meme_seo_pages",
     "meme_source_engagement_snapshots",
     "meme_sources",
@@ -338,16 +337,16 @@ def test_initial_revision_metadata_is_present() -> None:
     config = _build_alembic_config()
     script_directory = ScriptDirectory.from_config(config)
     revision = script_directory.get_revision("head")
-    previous_revision = script_directory.get_revision("0021")
+    previous_revision = script_directory.get_revision("0022")
 
     assert revision is not None
-    assert revision.revision == "0022"
-    assert revision.down_revision == "0021"
-    assert revision.doc == "source engagement history"
+    assert revision.revision == "0023"
+    assert revision.down_revision == "0022"
+    assert revision.doc == "source engagement public read models"
     assert previous_revision is not None
-    assert previous_revision.revision == "0021"
-    assert previous_revision.down_revision == "0020"
-    assert previous_revision.doc == "generic RabbitMQ outbox messages"
+    assert previous_revision.revision == "0022"
+    assert previous_revision.down_revision == "0021"
+    assert previous_revision.doc == "source engagement history"
 
 
 async def test_upgrade_head_creates_expected_schema_and_constraints(
@@ -360,7 +359,8 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
 
     table_names = await _get_table_names(engine)
     assert table_names == EXPECTED_TABLES | {"alembic_version"}
-    assert await _get_current_revision(engine) == "0022"
+    assert "meme_popularity_snapshots" not in table_names
+    assert await _get_current_revision(engine) == "0023"
     assert await _get_materialized_view_names(engine) == EXPECTED_MATERIALIZED_VIEWS
 
     users_indexes = await _get_index_definitions(engine, "users")
@@ -386,6 +386,7 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
     public_template_trends_indexes = await _get_index_definitions(engine, "public_template_trends_mv")
     public_template_trend_points_indexes = await _get_index_definitions(engine, "public_template_trend_points_mv")
     meme_file_ocr_result_columns = await _get_column_names(engine, "meme_file_ocr_results")
+    memes_columns = await _get_column_names(engine, "memes")
     memes_nullable_columns = await _get_nullable_columns(engine, "memes")
     memes_constraint_definitions = await _get_constraint_definitions(engine, "memes")
     meme_files_columns = await _get_column_names(engine, "meme_files")
@@ -468,6 +469,7 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
     assert "meme_id" in meme_files_indexes["uq_meme_files_meme_id_id"]
     assert "id" in meme_files_indexes["uq_meme_files_meme_id_id"]
     assert "primary_file_id" not in memes_nullable_columns
+    assert "popularity_score" not in memes_columns
     primary_file_fk = memes_constraint_definitions["fk_memes_primary_file_id_meme_files"]
     assert "FOREIGN KEY (id, primary_file_id)" in primary_file_fk
     assert "REFERENCES meme_files(meme_id, id)" in primary_file_fk
@@ -484,8 +486,6 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
         "uq_meme_sources_platform_source_post": ["platform", "source_id", "post_id"],
     }
     assert {
-        "views",
-        "reactions",
         "last_engagement_check_at",
         "next_engagement_check_at",
         "engagement_check_locked_at",
@@ -493,6 +493,8 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
         "engagement_check_attempt_count",
         "last_engagement_error_code",
     }.issubset(meme_sources_columns)
+    assert "views" not in meme_sources_columns
+    assert "reactions" not in meme_sources_columns
     assert "ix_meme_sources_engagement_due_lease" in meme_sources_indexes
     assert "next_engagement_check_at" in meme_sources_indexes["ix_meme_sources_engagement_due_lease"]
     assert "engagement_check_locked_at" in meme_sources_indexes["ix_meme_sources_engagement_due_lease"]
@@ -837,10 +839,10 @@ async def test_primary_file_invariant_is_enforced_by_database(
                 text(
                     """
                     INSERT INTO memes (
-                        id, media_type, language, is_nsfw, popularity_score,
+                        id, media_type, language, is_nsfw,
                         like_count, tags, is_public
                     ) VALUES (
-                        :meme_id, 'image', 'none', false, 0.0,
+                        :meme_id, 'image', 'none', false,
                         0, ARRAY[]::varchar(64)[], true
                     )
                     """,
@@ -859,15 +861,15 @@ async def test_primary_file_invariant_is_enforced_by_database(
                     """
                     INSERT INTO memes (
                         id, media_type, primary_file_id, language, is_nsfw,
-                        popularity_score, like_count, tags, is_public
+                        like_count, tags, is_public
                     ) VALUES
                         (
                             :source_meme_id, 'image', :source_file_id, 'none', false,
-                            0.0, 0, ARRAY[]::varchar(64)[], true
+                            0, ARRAY[]::varchar(64)[], true
                         ),
                         (
                             :invalid_meme_id, 'image', :source_file_id, 'none', false,
-                            0.0, 0, ARRAY[]::varchar(64)[], true
+                            0, ARRAY[]::varchar(64)[], true
                         )
                     """,
                 ),
@@ -976,7 +978,7 @@ async def test_crawler_sources_migration_applies_and_reverses(
     config = _build_alembic_config(database_url)
 
     await _run_alembic_command(command.upgrade, config, "head")
-    assert await _get_current_revision(engine) == "0022"
+    assert await _get_current_revision(engine) == "0023"
 
     meme_sources_columns = await _get_column_names(engine, "meme_sources")
     source_channels_columns = await _get_column_names(engine, "source_channels")
@@ -1074,7 +1076,7 @@ async def test_repeated_fresh_database_upgrades_work_after_a_full_downgrade(
     await _run_alembic_command(command.downgrade, config, "base")
     await _run_alembic_command(command.upgrade, config, "head")
 
-    assert await _get_current_revision(engine) == "0022"
+    assert await _get_current_revision(engine) == "0023"
     assert EXPECTED_TABLES.issubset(await _get_table_names(engine))
 
 

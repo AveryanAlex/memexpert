@@ -215,7 +215,7 @@ async def _seed_raw_request(
     media_bytes: bytes = b"raw-materializer-bytes",
     source_id: str = "materializer-source",
     post_id: str = "1",
-    views: int = 12,
+    view_count: int = 12,
     owner_user_id: uuid.UUID | None = None,
     user_metadata: dict[str, object] | None = None,
     source_metadata: dict[str, object] | None = None,
@@ -230,7 +230,7 @@ async def _seed_raw_request(
         post_id=post_id,
         owner_user_id=owner_user_id,
         user_metadata=user_metadata or {},
-        source_metadata=source_metadata or {"views": views},
+        source_metadata=source_metadata or {"view_count": view_count},
         declared_filename="raw.png",
         declared_content_type="image/png",
         temp_original_object_key=temp_key,
@@ -359,7 +359,6 @@ async def test_materializer_new_content_creates_content_rows_outbox_and_cleans_t
     assert meme_file.ingest_origin is IngestFileOrigin.NEW_MEME
     assert meme_file.s3_original_key in storage_client.objects
     assert sources[0].file_id == meme_file.id
-    assert sources[0].views == 15
     assert sources[0].attach_reason is SourceAttachReason.NEW_FILE
     assert len(snapshots) == 1
     snapshot = snapshots[0]
@@ -627,7 +626,7 @@ async def test_materializer_persists_source_attribution_from_raw_request_metadat
         post_id="source-post",
         owner_user_id=owner_user_id,
         source_metadata={
-            "views": 41,
+            "view_count": 41,
             "published_at": published_at.isoformat(),
             "reactions": {"like": 5, "fire": 2},
             "forward": {
@@ -650,14 +649,21 @@ async def test_materializer_persists_source_attribution_from_raw_request_metadat
     async with postgres_session_factory() as session:
         meme = await session.get(Meme, result.materialized_meme_id)
         source = await session.scalar(select(MemeSource).where(MemeSource.source_id == "attribution-source"))
+        snapshot = await session.scalar(
+            select(MemeSourceEngagementSnapshot)
+            .join(MemeSource)
+            .where(MemeSource.source_id == "attribution-source")
+        )
 
     assert result.status is PipelineIngestRequestStatus.MATERIALIZED
     assert meme is not None
     assert meme.author_user_id == owner_user_id
     assert source is not None
     assert source.file_id == result.materialized_meme_file_id
-    assert source.views == 41
-    assert source.reactions == {"like": 5, "fire": 2}
+    assert snapshot is not None
+    assert snapshot.view_count == 41
+    assert snapshot.reactions == {"like": 5, "fire": 2}
+    assert snapshot.reaction_count == 7
     assert source.is_first_source is False
     assert source.published_at == published_at
     assert source.forwarded_from_source_id == "original-source"

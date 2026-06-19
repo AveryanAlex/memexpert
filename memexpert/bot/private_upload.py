@@ -622,7 +622,7 @@ def _build_upload_source(
             post_id=f"message:{message.message_id}:file:{media.file_unique_id}",
             owner_user_id=owner_user_id,
             user_metadata=user_metadata_with_target_collection(target_collection_id=target_collection_id),
-            views=0,
+            view_count=0,
         )
     except ValidationError as exc:  # pragma: no cover - defensive; constructed from Bot API bounded fields.
         raise PipelinePayloadValidationError("Telegram upload source metadata is invalid.") from exc

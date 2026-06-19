@@ -90,7 +90,7 @@ classified and synced.
 - **Payload:** safe PostgreSQL-derived metadata for candidate prefiltering and
   ranking: `meme_id`, `meme_file_id`, `search_index_algorithm_version`,
   `is_public`, `author_user_id`, `media_type`, `language`, `is_nsfw`, `tags`,
-  `template_id`, `template_slug`, `seo_page_slug`, `popularity_score`,
+  `template_id`, `template_slug`, `seo_page_slug`, derived `popularity_score`,
   `like_count`, `quality_score`, `created_at`, `updated_at`, collection id
   buckets by visibility, shared collection ids, collection owner ids, and
   collection member ids.
@@ -114,7 +114,7 @@ share the same file identity.
   by visibility, shared collection ids, collection owner ids, and collection
   member ids. Collection roles are deliberately not indexed; PostgreSQL applies
   the final permission predicate.
-- **Sortable/ranking hints:** `popularity_score`, `like_count`, `quality_score`,
+- **Sortable/ranking hints:** derived `popularity_score`, `like_count`, `quality_score`,
   `created_at`, `updated_at`, and `search_index_algorithm_version`.
 - **Russian stop words** configured
 - **Typo tolerance** enabled (min 4 chars for 1 typo, 8 for 2)
@@ -130,13 +130,14 @@ Redis search/candidate caching is optional for MVP. If enabled, cache keys must 
 **Event-driven:** The content pipeline publishes sync dispatch events to RabbitMQ. Qdrant and Meilisearch sync consumers each bind their own queue, processing independently with retries via dead letter exchanges.
 
 - `classify` success → Qdrant consumer syncs embedding + payload; Meilisearch consumer syncs a text document
-- Meme-level field changes (popularity, likes, tags, access/publicity) → API publishes update event → both sync consumers update
-- Like count and popularity changes → batched sync via Scheduler (not per-like)
+- Meme-level field changes (likes, tags, access/publicity) → API publishes update event → both sync consumers update
+- Source engagement captures and analytics events update derived popularity/read-model values; search payload rebuilds compute `popularity_score` from those sources instead of reading a `memes.popularity_score` column
+- Like count changes → batched sync via Scheduler (not per-like)
 
 Every sync attempt rebuilds its payload/document from PostgreSQL at consume time
 via `load_search_index_state`; event payloads carry routing identity, not access
 or ranking truth. This keeps public/private flips, collection membership or
-visibility changes, SEO slug/template edits, and popularity/like updates safe to
+visibility changes, SEO slug/template edits, and derived popularity/like updates safe to
 replay without trusting stale snapshot JSON.
 
 **Full resync/payload rebuild today:** enumerate ready `meme_file_id` values and
@@ -189,7 +190,7 @@ Personalized recommendations are used:
 
 ### Trending
 
-Uses materialized-view backed public trend rankings and popularity snapshots. Default feed for users without interaction history.
+Uses materialized-view backed public trend rankings derived from source engagement snapshots and `analytics_events`. Default feed for users without interaction history.
 
 ## Interaction Attribution
 

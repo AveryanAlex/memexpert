@@ -167,13 +167,6 @@ class Settings(BaseSettings):
     scheduler_source_engagement_capture_interval_seconds: float = Field(default=21600.0, gt=0.0)
     scheduler_source_engagement_capture_batch_size: int = Field(default=100, ge=1, le=1000)
     scheduler_source_engagement_capture_lease_timeout_seconds: float = Field(default=1800.0, gt=0.0)
-    scheduler_popularity_source_view_weight: float = Field(default=1.0, ge=0.0, le=1000.0)
-    scheduler_popularity_source_reaction_weight: float = Field(default=2.0, ge=0.0, le=1000.0)
-    scheduler_popularity_source_repost_weight: float = Field(default=3.0, ge=0.0, le=1000.0)
-    scheduler_popularity_platform_view_weight: float = Field(default=1.0, ge=0.0, le=1000.0)
-    scheduler_popularity_platform_send_weight: float = Field(default=3.0, ge=0.0, le=1000.0)
-    scheduler_popularity_platform_save_weight: float = Field(default=4.0, ge=0.0, le=1000.0)
-    scheduler_popularity_platform_like_weight: float = Field(default=5.0, ge=0.0, le=1000.0)
     scheduler_motd_enabled: bool = True
     scheduler_motd_interval_seconds: float = Field(default=86400.0, gt=0.0)
     scheduler_search_index_sync_enabled: bool = True

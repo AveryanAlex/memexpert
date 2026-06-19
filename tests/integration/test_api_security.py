@@ -96,7 +96,7 @@ async def _post_operator_upload(client: AsyncClient) -> Response:
             "source_platform": "telegram",
             "source_id": "channel-1",
             "post_id": "post-1",
-            "views": "0",
+            "view_count": "0",
         },
         files={"file": ("upload.png", b"fake-image-bytes", "image/png")},
     )

@@ -1,5 +1,5 @@
 # ruff: noqa: F821,TC003,UP037
-"""Content, SEO, source, popularity, and cache ORM models."""
+"""Content, SEO, source engagement, and cache ORM models."""
 
 from __future__ import annotations
 
@@ -68,7 +68,7 @@ class Meme(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             initially="DEFERRED",
         ),
         Index("ix_memes_media_type_language", "media_type", "language"),
-        Index("ix_memes_visibility_popularity_created_at", "is_public", "popularity_score", "created_at"),
+        Index("ix_memes_visibility_created_at", "is_public", "created_at"),
         Index("ix_memes_author_user_id_created_at", "author_user_id", "created_at"),
     )
 
@@ -84,7 +84,6 @@ class Meme(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         nullable=False,
     )
     is_nsfw: Mapped[bool] = mapped_column(default=False, nullable=False)
-    popularity_score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     like_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     tags: Mapped[list[str]] = mapped_column(ARRAY(String(64)), default=list, nullable=False)
     template_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -125,11 +124,6 @@ class Meme(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         "User",
         back_populates="authored_memes",
         foreign_keys=[author_user_id],
-    )
-    popularity_snapshots: Mapped[list["MemePopularitySnapshot"]] = relationship(
-        "MemePopularitySnapshot",
-        back_populates="meme",
-        cascade="all, delete-orphan",
     )
     saved_in_collections: Mapped[list["CollectionMeme"]] = relationship(
         "CollectionMeme",
@@ -731,8 +725,6 @@ class MemeSource(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     source_id: Mapped[str] = mapped_column(String(255), nullable=False)
     post_id: Mapped[str] = mapped_column(String(255), nullable=False)
-    views: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    reactions: Mapped[dict[str, int]] = mapped_column(JSONB, default=dict, nullable=False)
     is_first_source: Mapped[bool] = mapped_column(default=False, nullable=False)
     source_alive: Mapped[bool] = mapped_column(default=True, nullable=False)
     # The Telegram publish timestamp captured by the crawler; left NULL for
@@ -917,32 +909,6 @@ class MemeTemplate(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     memes: Mapped[list["Meme"]] = relationship("Meme", back_populates="template")
 
 
-class MemePopularitySnapshot(UUIDPrimaryKeyMixin, Base):
-    """Historical popularity metrics captured on a schedule."""
-
-    __tablename__ = "meme_popularity_snapshots"
-    __table_args__ = (
-        UniqueConstraint("meme_id", "captured_at", name="uq_meme_popularity_snapshots_meme_id_captured_at"),
-        Index("ix_meme_popularity_snapshots_meme_id_captured_at", "meme_id", "captured_at"),
-    )
-
-    meme_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("memes.id", ondelete="CASCADE"),
-        nullable=False,
-    )
-    captured_at: Mapped[datetime] = mapped_column(default=utcnow, nullable=False)
-    source_views: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    source_reactions: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    source_reposts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    platform_views: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    platform_sends: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    platform_saves: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    platform_likes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    popularity_score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
-
-    meme: Mapped["Meme"] = relationship("Meme", back_populates="popularity_snapshots")
-
-
 class SourceChannel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     """Tracked source channels and crawler checkpoint state."""
 
@@ -1124,7 +1090,6 @@ __all__ = [
     "MemeFileOCRResult",
     "MemeFileSyncTargetSnapshot",
     "MemeMergeLog",
-    "MemePopularitySnapshot",
     "MemeSeoPage",
     "MemeSource",
     "MemeSourceEngagementSnapshot",

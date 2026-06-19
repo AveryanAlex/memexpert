@@ -12,7 +12,7 @@ MemeFile 2 (1080x810 PNG, from @funny_pics)        ──┼── Meme "Drake -
 MemeFile 3 (900x675 JPEG with border, from Reddit) ──┘     ↑ primary_file = File 1
 ```
 
-**On Meme:** media type, OCR text, language, NSFW flag, popularity score, like count, template link, public/private flag.
+**On Meme:** media type, OCR text, language, NSFW flag, like count, template link, public/private flag.
 **On MemeFile:** dimensions, format, file size, S3 URLs for all variants, perceptual hash, quality score, blur hash, processing status.
 
 Embeddings live in a separate cache table, not on MemeFile. This decouples embedding computation from the relational model.
@@ -29,7 +29,7 @@ Deletion-related fields may exist as schema placeholders, but user-initiated acc
 
 ### Meme
 
-The conceptual meme entity. Key fields: `media_type` (image/gif/video), `primary_file_id` (FK → MemeFile, best quality), `ocr_text`, `language` (ru/en/mixed/none), `is_nsfw`, `popularity_score`, `like_count` (denormalized), `tags` (text array — assigned by LLM during SEO generation, used for filtering and tag pages), `template_id`, `author_user_id` (set if user-uploaded), `is_public`.
+The conceptual meme entity. Key fields: `media_type` (image/gif/video), `primary_file_id` (FK → MemeFile, best quality), `ocr_text`, `language` (ru/en/mixed/none), `is_nsfw`, `like_count` (denormalized), `tags` (text array — assigned by LLM during SEO generation, used for filtering and tag pages), `template_id`, `author_user_id` (set if user-uploaded), `is_public`.
 
 ### MemeFile
 
@@ -43,15 +43,27 @@ A specific media file belonging to a meme. Key fields: `meme_id` (FK → Meme), 
 
 Template label (V1 — no editor, but schema is V2-ready). Key fields: `slug` (unique), `name`, `description`, `is_curated`, `base_image_url` (nullable — unused in V1), `text_regions` (nullable JSON array — unused in V1, each region: `{x, y, width, height, default_font_size, alignment}`). V2 populates these fields to power the meme editor — no schema migration needed.
 
-### MemePopularitySnapshot
-
-Periodic snapshots for historical charts and materialized-view refreshes. Key fields: `meme_id`, `timestamp`, source metrics (views, reactions, source_count), platform metrics (impressions, views, sends, saves, downloads, likes), `popularity_score`.
-
 ### MemeSource
 
-Linked to **MemeFile**, not Meme. Tracks where a specific file was found. Key fields: `file_id` (FK → MemeFile), `platform` (telegram/reddit/vk), `source_id`, `post_id`, `views`, `reactions` (JSON), `is_first_source`, `source_alive`.
+Linked to **MemeFile**, not Meme. Tracks where a specific file was found. Key fields: `file_id` (FK → MemeFile), `platform` (telegram/reddit/vk), `source_id`, `post_id`, `published_at`, `is_first_source`, `source_alive`, and source-engagement scheduling state (`last_engagement_check_at`, `next_engagement_check_at`, lease owner/time, attempt count, last error). Stable provenance stays here; volatile Telegram counters do not.
 
 Unique constraint: `(platform, source_id, post_id)`.
+
+### MemeSourceEngagementSnapshot
+
+Append-only source metric observations for a `MemeSource`. Key fields: `meme_source_id`, `captured_at`, `scheduled_for`, `capture_reason`, `schedule_label`, `view_count`, `reactions`, `reaction_count`, `comment_count`, `forward_count`, `comments_state`, `fetch_status`, `source_alive`, `error_code`, and `raw_metrics`.
+
+`NULL` counters are meaningful: they mean the source did not expose the counter. A known zero remains `0`. Public ranking/read models may coalesce unknown to zero for presentation, but canonical snapshots preserve the distinction.
+
+Initial ingestion writes an `ingest_initial` baseline snapshot. Historical source deltas are computed with `lag()` per `meme_source_id`; the first snapshot contributes no invented delta. Follow-up schedule slots are anchored to the Telegram post date (`+1h`, `+3h`, `+12h`, `+1d`, `+3d`, `+7d`, `+1month`, then monthly), not to ingest time.
+
+`forward_count` is Telegram's public forward/repost count and feeds derived public `latest_source_reposts`. It is unrelated to forwarded-message provenance such as `forwarded_from_*`.
+
+### Public Trend Read Models
+
+`public_meme_trends_mv`, `public_tag_trends_mv`, `public_template_trends_mv`, `public_tag_trend_points_mv`, and `public_template_trend_points_mv` are derived-cached read models. They are rebuildable from `meme_source_engagement_snapshots`, `analytics_events`, and current meme/template metadata. Current source totals use the latest successful snapshot per source post; historical/window metrics use snapshot-to-snapshot deltas; internal platform metrics come from `analytics_events`.
+
+The public DTO names remain stable (`latest_source_views`, `latest_source_reactions`, `latest_source_reposts`, `latest_popularity_score`), but these values are derived read-model metrics. There is no canonical `memes.popularity_score` column and no `meme_popularity_snapshots` table.
 
 ### SourceChannel
 

@@ -270,7 +270,6 @@ async def test_accept_sha_duplicate_creates_initial_engagement_snapshot(
 
     assert source is not None
     assert source.file_id == meme_file.id
-    assert source.views == 0
     assert len(snapshots) == 1
     snapshot = snapshots[0]
     assert snapshot.meme_source_id == source.id

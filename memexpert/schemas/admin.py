@@ -376,7 +376,6 @@ class AdminMemeRead(ORMSchema):
     language: ContentLanguage
     is_nsfw: bool
     is_public: bool
-    popularity_score: float
     like_count: int
     tags: list[str]
     template_id: uuid.UUID | None

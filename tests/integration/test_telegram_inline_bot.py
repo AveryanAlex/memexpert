@@ -26,7 +26,7 @@ from memexpert.bot.inline import S3PresignedInlineMediaUrlProvider
 from memexpert.bot.main import build_bot, build_dispatcher
 from memexpert.core.config import Settings
 from memexpert.models.collection import Collection, CollectionMember, CollectionMeme, PinnedMeme
-from memexpert.models.content import Meme, MemeFile, TelegramFileIdCache
+from memexpert.models.content import Meme, MemeFile, MemeSource, MemeSourceEngagementSnapshot, TelegramFileIdCache
 from memexpert.models.enums import (
     AccountStatus,
     AccountType,
@@ -34,6 +34,10 @@ from memexpert.models.enums import (
     CollectionMembershipRole,
     ContentKind,
     ContentLanguage,
+    SourceEngagementCaptureReason,
+    SourceEngagementCommentsState,
+    SourceEngagementFetchStatus,
+    SourcePlatform,
     TelegramMediaFormat,
 )
 from memexpert.models.user import AnalyticsEvent, InlineUsageEvent, User
@@ -60,6 +64,7 @@ BOT_USERNAME = "memexpertbot"
 RETURN_URL = "https://memexpert.test/link/telegram/complete"
 JWT_SECRET = "inline-test-auth-secret-with-32-byte-minimum"
 TELEGRAM_ID = 810_220_330
+_DERIVED_POPULARITY_ATTR = "_derived_popularity_score"
 
 
 class RecordingTelegramSession(BaseSession):
@@ -202,10 +207,10 @@ async def create_meme_file(
         primary_file_id=file_id,
         language=ContentLanguage.EN,
         tags=[media_type.value],
-        popularity_score=42.0,
         is_public=is_public,
         author_user_id=author_user_id,
     )
+    setattr(meme, _DERIVED_POPULARITY_ATTR, 42.0)
     file = MemeFile(
         id=file_id,
         meme_id=meme_id,
@@ -220,6 +225,40 @@ async def create_meme_file(
     session.add(file)
     await session.flush()
     return meme, file
+
+
+async def set_source_popularity_score(
+    session: AsyncSession,
+    *,
+    meme_file: MemeFile,
+    score: float,
+) -> None:
+    source = MemeSource(
+        file_id=meme_file.id,
+        platform=SourcePlatform.TELEGRAM,
+        source_id=f"inline-bot-{meme_file.id.hex}",
+        post_id="1",
+        is_first_source=True,
+        source_alive=True,
+    )
+    session.add(source)
+    await session.flush()
+    session.add(
+        MemeSourceEngagementSnapshot(
+            meme_source_id=source.id,
+            capture_reason=SourceEngagementCaptureReason.MANUAL_REFRESH,
+            view_count=max(1, int(score)),
+            reactions={},
+            reaction_count=0,
+            comment_count=None,
+            forward_count=0,
+            comments_state=SourceEngagementCommentsState.UNKNOWN,
+            fetch_status=SourceEngagementFetchStatus.SUCCESS,
+            source_alive=True,
+            raw_metrics={"test": True},
+        )
+    )
+    await session.flush()
 
 
 def search_page_for(
@@ -241,7 +280,7 @@ def search_page_for(
                     media_type=meme.media_type,
                     language=meme.language,
                     is_nsfw=meme.is_nsfw,
-                    popularity_score=meme.popularity_score,
+                    popularity_score=float(getattr(meme, "_derived_popularity_score", 0.0)),
                     like_count=meme.like_count,
                     tags=list(meme.tags),
                     primary_file=MemeFileRead(
@@ -568,10 +607,10 @@ async def test_inline_plain_text_query_shows_private_and_shared_memes_only_to_au
         is_public=False,
         author_user_id=stranger.id,
     )
-    authored_private.popularity_score = 30.0
-    shared_private.popularity_score = 20.0
-    public_meme.popularity_score = 10.0
-    unauthorized_private.popularity_score = 100.0
+    await set_source_popularity_score(migrated_db_session, meme_file=authored_file, score=30.0)
+    await set_source_popularity_score(migrated_db_session, meme_file=shared_file, score=20.0)
+    await set_source_popularity_score(migrated_db_session, meme_file=public_file, score=10.0)
+    await set_source_popularity_score(migrated_db_session, meme_file=unauthorized_file, score=100.0)
     shared_collection = Collection(owner_id=stranger.id, title="Inline bot shared search")
     unauthorized_collection = Collection(owner_id=stranger.id, title="Inline bot unauthorized search")
     migrated_db_session.add_all([shared_collection, unauthorized_collection])
@@ -1058,7 +1097,7 @@ async def test_inline_empty_query_for_linked_user_returns_pins_then_popular_and_
         media_type=ContentKind.IMAGE,
         mime_type="image/jpeg",
     )
-    popular_meme.popularity_score = 900.0
+    await set_source_popularity_score(migrated_db_session, meme_file=popular_file, score=900.0)
     migrated_db_session.add(PinnedMeme(user=user, meme=pinned_meme, position=1))
     await add_file_id_cache(
         migrated_db_session,
@@ -1118,7 +1157,7 @@ async def test_inline_empty_query_for_linked_user_returns_recent_then_popular_wh
         media_type=ContentKind.IMAGE,
         mime_type="image/jpeg",
     )
-    popular_meme.popularity_score = 900.0
+    await set_source_popularity_score(migrated_db_session, meme_file=popular_file, score=900.0)
     migrated_db_session.add(
         AnalyticsEvent(
             user=user,
@@ -1184,7 +1223,7 @@ async def test_inline_empty_query_recent_send_personalization_reads_strict_refs(
         media_type=ContentKind.IMAGE,
         mime_type="image/jpeg",
     )
-    popular_meme.popularity_score = 900.0
+    await set_source_popularity_score(migrated_db_session, meme_file=popular_file, score=900.0)
     migrated_db_session.add(
         AnalyticsEvent(
             user=user,
@@ -1243,7 +1282,7 @@ async def test_inline_empty_query_for_linked_user_falls_back_to_popular_when_no_
         media_type=ContentKind.IMAGE,
         mime_type="image/jpeg",
     )
-    popular_meme.popularity_score = 900.0
+    await set_source_popularity_score(migrated_db_session, meme_file=popular_file, score=900.0)
     await add_file_id_cache(
         migrated_db_session,
         file=popular_file,
@@ -1295,7 +1334,7 @@ async def test_inline_empty_query_skips_unsendable_pin_and_uses_later_popular_fa
         media_type=ContentKind.IMAGE,
         mime_type="image/jpeg",
     )
-    popular_meme.popularity_score = 900.0
+    await set_source_popularity_score(migrated_db_session, meme_file=popular_file, score=900.0)
     migrated_db_session.add(PinnedMeme(user=user, meme=video_meme, position=1))
     await add_file_id_cache(
         migrated_db_session,
@@ -1349,7 +1388,7 @@ async def test_inline_empty_query_treats_ineligible_linked_users_as_guests(
         media_type=ContentKind.IMAGE,
         mime_type="image/jpeg",
     )
-    popular_meme.popularity_score = 900.0
+    await set_source_popularity_score(migrated_db_session, meme_file=popular_file, score=900.0)
     await add_file_id_cache(
         migrated_db_session,
         file=popular_file,
@@ -1392,13 +1431,13 @@ async def test_inline_empty_query_for_new_user_returns_popular_public_memes_pers
         media_type=ContentKind.IMAGE,
         mime_type="image/jpeg",
     )
-    less_popular_meme.popularity_score = 10.0
+    await set_source_popularity_score(migrated_db_session, meme_file=less_popular_file, score=10.0)
     more_popular_meme, more_popular_file = await create_meme_file(
         migrated_db_session,
         media_type=ContentKind.IMAGE,
         mime_type="image/jpeg",
     )
-    more_popular_meme.popularity_score = 99.0
+    await set_source_popularity_score(migrated_db_session, meme_file=more_popular_file, score=99.0)
     await add_file_id_cache(
         migrated_db_session,
         file=less_popular_file,

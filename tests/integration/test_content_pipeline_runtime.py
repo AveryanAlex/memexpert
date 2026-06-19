@@ -61,7 +61,6 @@ from memexpert.models.content import (
     MemeFileOCRResult,
     MemeFileSyncTargetSnapshot,
     MemeMergeLog,
-    MemePopularitySnapshot,
     MemeSeoPage,
     MemeSource,
     MemeSourceEngagementSnapshot,
@@ -83,6 +82,7 @@ from memexpert.models.enums import (
     PipelineIngestRequestStatus,
     RabbitMQOutboxMessageStatus,
     SourceAttachReason,
+    SourceEngagementCaptureReason,
     SourceEngagementCommentsState,
     SourceEngagementFetchStatus,
     SourceEngagementScheduleLabel,
@@ -623,7 +623,7 @@ async def seed_raw_ingest_request_for_runtime(
         source_platform=SourcePlatform.TELEGRAM,
         source_id=source_id,
         post_id=post_id,
-        source_metadata={"views": 9},
+        source_metadata={"view_count": 9},
         declared_filename="runtime-raw.png",
         declared_content_type="image/png",
         temp_original_object_key=temp_key,
@@ -695,8 +695,6 @@ async def _seed_transcode_pending_item(
                 platform=SourcePlatform.TELEGRAM,
                 source_id=source_id,
                 post_id=post_id,
-                views=9,
-                reactions={},
                 is_first_source=True,
                 source_alive=True,
                 attach_reason=SourceAttachReason.NEW_FILE,
@@ -1038,8 +1036,6 @@ async def test_pipeline_runtime_source_engagement_capture_handler_fetches_stats_
                 platform=SourcePlatform.TELEGRAM,
                 source_id="runtime-engagement-channel",
                 post_id="9101",
-                views=0,
-                reactions={},
                 source_alive=True,
                 published_at=published_at,
                 next_engagement_check_at=scheduled_for,
@@ -2056,7 +2052,7 @@ async def test_pipeline_runtime_embed_merge_transaction_failure_keeps_stage_repl
         assert older_file_row is not None
         older_meme_id = older_file_row.meme_id
 
-    # Baseline snapshot: files, sources, merge-log, popularity for the older meme
+    # Baseline snapshot: files, sources, merge-log, and source engagement rows for the older meme
     # should remain unchanged after the merge rollback on the newer file.
     async with postgres_session_factory() as baseline_session:
         baseline_files = (
@@ -2071,9 +2067,11 @@ async def test_pipeline_runtime_embed_merge_transaction_failure_keeps_stage_repl
         baseline_merge_logs = (
             await baseline_session.execute(select(MemeMergeLog))
         ).scalars().all()
-        baseline_popularity = (
+        baseline_source_snapshot_ids = (
             await baseline_session.execute(
-                select(MemePopularitySnapshot).where(MemePopularitySnapshot.meme_id == older_meme_id)
+                select(MemeSourceEngagementSnapshot.id).where(
+                    MemeSourceEngagementSnapshot.meme_source_id.in_([source.id for source in baseline_sources])
+                )
             )
         ).scalars().all()
 
@@ -2135,7 +2133,7 @@ async def test_pipeline_runtime_embed_merge_transaction_failure_keeps_stage_repl
     assert message.ack_count == 0
 
     # The source (older) meme must remain bit-for-bit intact: same files, same
-    # sources, no merge-log emitted, popularity rows untouched.
+    # sources, no merge-log emitted, source engagement rows untouched.
     async with postgres_session_factory() as verify_session:
         post_files = (
             await verify_session.execute(select(MemeFile).where(MemeFile.meme_id == older_meme_id))
@@ -2149,9 +2147,11 @@ async def test_pipeline_runtime_embed_merge_transaction_failure_keeps_stage_repl
         post_merge_logs = (
             await verify_session.execute(select(MemeMergeLog))
         ).scalars().all()
-        post_popularity = (
+        post_source_snapshot_ids = (
             await verify_session.execute(
-                select(MemePopularitySnapshot).where(MemePopularitySnapshot.meme_id == older_meme_id)
+                select(MemeSourceEngagementSnapshot.id).where(
+                    MemeSourceEngagementSnapshot.meme_source_id.in_([source.id for source in post_sources])
+                )
             )
         ).scalars().all()
         # The embed cache row for the newer file must have been rolled back so
@@ -2165,7 +2165,7 @@ async def test_pipeline_runtime_embed_merge_transaction_failure_keeps_stage_repl
     assert post_file_ids == baseline_file_ids
     assert {row.id for row in post_sources} == {row.id for row in baseline_sources}
     assert {row.id for row in post_merge_logs} == {row.id for row in baseline_merge_logs}
-    assert {row.id for row in post_popularity} == {row.id for row in baseline_popularity}
+    assert set(post_source_snapshot_ids) == set(baseline_source_snapshot_ids)
     assert post_cache_rows == []
 
     # Undo the monkeypatch so replay_item can execute a normal transaction path.
@@ -2567,8 +2567,24 @@ async def test_pipeline_runtime_sync_qdrant_rebuilds_collection_aware_payload_fr
     canonical_meme.is_public = True
     canonical_meme.tags = ["runtime", "fresh"]
     canonical_meme.like_count = 9
-    canonical_meme.popularity_score = 18.5
     canonical_meme.template_id = template.id
+    source = await migrated_db_session.scalar(select(MemeSource).where(MemeSource.file_id == meme_file_id))
+    assert source is not None
+    migrated_db_session.add(
+        MemeSourceEngagementSnapshot(
+            meme_source_id=source.id,
+            capture_reason=SourceEngagementCaptureReason.MANUAL_REFRESH,
+            view_count=18,
+            reactions={},
+            reaction_count=0,
+            comment_count=None,
+            forward_count=0,
+            comments_state=SourceEngagementCommentsState.UNKNOWN,
+            fetch_status=SourceEngagementFetchStatus.SUCCESS,
+            source_alive=True,
+            raw_metrics={"test": True},
+        )
+    )
     migrated_db_session.add(
         MemeSeoPage(
             meme_id=canonical_meme.id,
@@ -2618,6 +2634,8 @@ async def test_pipeline_runtime_sync_qdrant_rebuilds_collection_aware_payload_fr
 
     assert message.ack_count == 1
     assert len(qdrant_sync_client.upsert_calls) == 1
+    qdrant_popularity_score = cast("float", qdrant_sync_client.upsert_calls[0]["popularity_score"])
+    assert qdrant_popularity_score > 0.0
     assert qdrant_sync_client.upsert_calls[0] == {
         "meme_file_id": meme_file_id,
         "meme_id": canonical_meme.id,
@@ -2629,7 +2647,7 @@ async def test_pipeline_runtime_sync_qdrant_rebuilds_collection_aware_payload_fr
         "tags": ["runtime", "fresh"],
         "is_nsfw": False,
         "template_slug": "runtime-frog-template",
-        "popularity_score": 18.5,
+        "popularity_score": qdrant_popularity_score,
         "like_count": 9,
         "collection_ids": [str(collection.id)],
         "public_collection_ids": [],
@@ -3025,8 +3043,24 @@ async def test_pipeline_runtime_sync_meili_rebuilds_collection_aware_document_fr
     canonical_meme.is_public = False
     canonical_meme.tags = ["meili", "updated"]
     canonical_meme.like_count = 5
-    canonical_meme.popularity_score = 33.0
     canonical_meme.template_id = template.id
+    source = await migrated_db_session.scalar(select(MemeSource).where(MemeSource.file_id == meme_file_id))
+    assert source is not None
+    migrated_db_session.add(
+        MemeSourceEngagementSnapshot(
+            meme_source_id=source.id,
+            capture_reason=SourceEngagementCaptureReason.MANUAL_REFRESH,
+            view_count=33,
+            reactions={},
+            reaction_count=0,
+            comment_count=None,
+            forward_count=0,
+            comments_state=SourceEngagementCommentsState.UNKNOWN,
+            fetch_status=SourceEngagementFetchStatus.SUCCESS,
+            source_alive=True,
+            raw_metrics={"test": True},
+        )
+    )
     migrated_db_session.add(
         MemeSeoPage(
             meme_id=canonical_meme.id,
@@ -3077,6 +3111,8 @@ async def test_pipeline_runtime_sync_meili_rebuilds_collection_aware_document_fr
 
     assert message.ack_count == 1
     assert len(meili_sync_client.upsert_calls) == 1
+    meili_popularity_score = cast("float", meili_sync_client.upsert_calls[0]["popularity_score"])
+    assert meili_popularity_score > 0.0
     assert meili_sync_client.upsert_calls[0] == {
         "id": meme_file_id.hex,
         "meme_id": str(canonical_meme.id),
@@ -3089,7 +3125,7 @@ async def test_pipeline_runtime_sync_meili_rebuilds_collection_aware_document_fr
         "is_nsfw": False,
         "language": ContentLanguage.EN.value,
         "template_slug": "runtime-meili-template",
-        "popularity_score": 33.0,
+        "popularity_score": meili_popularity_score,
         "like_count": 5,
         "collection_ids": [str(collection.id)],
         "public_collection_ids": [str(collection.id)],
