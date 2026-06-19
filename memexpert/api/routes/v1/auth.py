@@ -20,10 +20,12 @@ from memexpert.api.dependencies import (
     ForbidFullAccountCallerDep,
     GuestUserDep,
     OptionalAccessTokenDep,
+    OptionalCurrentUserDep,
     OptionalGuestUserDep,
+    ProviderAuthServiceDep,
     to_auth_http_error,
 )
-from memexpert.models.enums import AnalyticsEventType
+from memexpert.models.enums import AccountType, AnalyticsEventType
 from memexpert.schemas.auth import (
     AuthSessionRead,
     CurrentSessionRead,
@@ -43,6 +45,7 @@ from memexpert.services import (
     AuthenticatedUserNotFoundError,
     AuthServiceError,
     AuthSession,
+    GuestAccountRequiredError,
     LinkedProvidersProjection,
     UserNotFoundError,
     UserService,
@@ -359,9 +362,10 @@ async def login_with_telegram_widget(
 async def login_with_telegram_miniapp(
     request: Request,
     response: Response,
-    _guard: ForbidFullAccountCallerDep,
+    current_user: OptionalCurrentUserDep,
     optional_guest: OptionalGuestUserDep,
     account_link_service: AccountLinkServiceDep,
+    provider_auth_service: ProviderAuthServiceDep,
     auth_service: AuthServiceDep,
     analytics_service: AnalyticsServiceDep,
     session: DbSessionDep,
@@ -370,16 +374,30 @@ async def login_with_telegram_miniapp(
     """Validate Telegram Mini App initData via the unified writer path."""
 
     try:
-        link_result = await account_link_service.link_guest_with_telegram_miniapp(
-            guest_user_id=optional_guest.id if optional_guest else None,
-            init_data=credentials.init_data,
-        )
-        auth_session = await auth_service.issue_session_for_user(
-            link_result.user,
-            ip_address=_extract_client_ip(request),
-            user_agent=request.headers.get("user-agent"),
-            reload_user=False,
-        )
+        if current_user is not None and current_user.account_type is AccountType.FULL:
+            identity = provider_auth_service.resolve_telegram_miniapp_identity(credentials.init_data)
+            if current_user.telegram_id != identity.telegram_id:
+                raise GuestAccountRequiredError(
+                    "This endpoint rejects authenticated full-account callers for a different Telegram account; "
+                    "sign out first.",
+                )
+            auth_session = await auth_service.issue_session_for_user(
+                current_user,
+                ip_address=_extract_client_ip(request),
+                user_agent=request.headers.get("user-agent"),
+                reload_user=False,
+            )
+        else:
+            link_result = await account_link_service.link_guest_with_telegram_miniapp(
+                guest_user_id=optional_guest.id if optional_guest else None,
+                init_data=credentials.init_data,
+            )
+            auth_session = await auth_service.issue_session_for_user(
+                link_result.user,
+                ip_address=_extract_client_ip(request),
+                user_agent=request.headers.get("user-agent"),
+                reload_user=False,
+            )
     except AuthServiceError as exc:
         raise to_auth_http_error(exc) from exc
 
