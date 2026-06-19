@@ -16,6 +16,16 @@ export class SearchPage {
     await this.page.goto(`/search?${params.toString()}`);
   }
 
+  async searchCollections(input: { query: string; collectionTitles: string[] }) {
+    await this.page.goto('/search');
+    await this.page.getByLabel('Search text').fill(input.query);
+    await this.page.getByLabel('Search scope').selectOption('collections');
+    for (const title of input.collectionTitles) {
+      await this.page.locator('label').filter({ hasText: title }).getByRole('checkbox').check();
+    }
+    await this.page.getByRole('button', { name: 'Search' }).click();
+  }
+
   async applyFilters(input: { query: string; tag: string; mediaType: string; language: string; includeNsfw: boolean }) {
     const searchInput = this.page.getByLabel('Search text');
     await searchInput.fill(input.query);
@@ -56,6 +66,19 @@ export class SearchPage {
         url.searchParams.get('media_type') === input.mediaType &&
         url.searchParams.get('language') === input.language &&
         url.searchParams.get('include_nsfw') === String(input.includeNsfw)
+      );
+    });
+  }
+
+  async expectCollectionScopeUrl(input: { query: string; requiredCollectionId: string; minimumCollectionIds: number }) {
+    await expect(this.page).toHaveURL((url) => {
+      const collectionIds = url.searchParams.getAll('collection_ids');
+      return (
+        url.pathname === '/search' &&
+        url.searchParams.get('q') === input.query &&
+        url.searchParams.get('scope') === 'collections' &&
+        collectionIds.includes(input.requiredCollectionId) &&
+        collectionIds.length >= input.minimumCollectionIds
       );
     });
   }

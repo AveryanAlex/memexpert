@@ -11,8 +11,15 @@ from sqlalchemy import func, select
 from memexpert.core.config import Settings
 from memexpert.core.voyage import VoyageEmbeddingResult
 from memexpert.models.base import utcnow
+from memexpert.models.collection import Collection, CollectionInvite, CollectionMember
 from memexpert.models.content import EmbeddingCache, Meme, MemeFile, MemeFileOCRResult, MemeFileSyncTargetSnapshot
 from memexpert.models.enums import (
+    AccountStatus,
+    CollectionInviteChannel,
+    CollectionInviteStatus,
+    CollectionKind,
+    CollectionMembershipRole,
+    CollectionVisibility,
     ContentKind,
     ContentLanguage,
     ContentProcessingStatus,
@@ -20,6 +27,7 @@ from memexpert.models.enums import (
     SyncTargetKind,
     SyncTargetStatus,
 )
+from memexpert.models.user import User
 from scripts import seed_e2e
 
 if TYPE_CHECKING:
@@ -222,3 +230,121 @@ def test_wait_for_public_search_contains_polls_public_api_until_created_meme_vis
 
     assert result == {"items": [{"meme": {"id": str(meme_id)}}]}
     assert client.queries == ["cat", "cat"]
+
+
+def test_collection_management_fixture_payload_is_deterministic_private_and_e2e_only() -> None:
+    cat = seeded_meme("cat")
+    dog = seeded_meme("dog")
+
+    fixture = seed_e2e.build_collection_management_fixture([cat, dog])
+    payload = seed_e2e.build_collection_management_fixture_payload(fixture)
+
+    assert payload["owner"] == {
+        "label": "owner",
+        "user_id": str(seed_e2e._stable_uuid("collection-management:owner:user")),
+        "email": seed_e2e.E2E_OWNER_EMAIL,
+        "password": seed_e2e.E2E_ACCOUNT_PASSWORD,
+    }
+    assert payload["member"] == {
+        "label": "member",
+        "user_id": str(seed_e2e._stable_uuid("collection-management:member:user")),
+        "email": seed_e2e.E2E_MEMBER_EMAIL,
+        "password": seed_e2e.E2E_ACCOUNT_PASSWORD,
+    }
+    assert payload["collection"] == {
+        "id": str(seed_e2e._stable_uuid("collection-management:launch:collection")),
+        "title": seed_e2e.E2E_COLLECTION_TITLE,
+        "description": seed_e2e.E2E_COLLECTION_DESCRIPTION,
+        "visibility": "private",
+    }
+    assert payload["invite"] == {
+        "id": str(seed_e2e._stable_uuid("collection-management:launch:viewer-invite")),
+        "token": seed_e2e.E2E_COLLECTION_INVITE_TOKEN,
+        "join_path": f"/collection/invite/{seed_e2e.E2E_COLLECTION_INVITE_TOKEN}",
+    }
+    assert [item["category"] for item in payload["saved_memes"]] == ["cat", "dog"]
+    assert [item["category"] for item in payload["pinned_memes"]] == ["cat", "dog"]
+    assert payload["collection"]["visibility"] != "public"
+
+
+@pytest.mark.asyncio
+async def test_cleanup_collection_management_fixture_rows_removes_seeded_accounts_and_collection(
+    migrated_db_session: AsyncSession,
+) -> None:
+    now = utcnow()
+    owner_id = seed_e2e._stable_uuid("collection-management:owner:user")
+    member_id = seed_e2e._stable_uuid("collection-management:member:user")
+    collection_id = seed_e2e._stable_uuid("collection-management:launch:collection")
+    invite_id = seed_e2e._stable_uuid("collection-management:launch:viewer-invite")
+
+    owner = User(
+        id=owner_id,
+        status=AccountStatus.ACTIVE,
+        email=seed_e2e.E2E_OWNER_EMAIL,
+        email_verified_at=now,
+        password_hash=seed_e2e.E2E_ACCOUNT_PASSWORD_HASH,
+    )
+    member = User(
+        id=member_id,
+        status=AccountStatus.ACTIVE,
+        email=seed_e2e.E2E_MEMBER_EMAIL,
+        email_verified_at=now,
+        password_hash=seed_e2e.E2E_ACCOUNT_PASSWORD_HASH,
+    )
+    migrated_db_session.add_all([owner, member])
+    await migrated_db_session.flush()
+
+    migrated_db_session.add(
+        Collection(
+            id=collection_id,
+            owner_id=owner_id,
+            title=seed_e2e.E2E_COLLECTION_TITLE,
+            kind=CollectionKind.CUSTOM,
+            visibility=CollectionVisibility.PRIVATE,
+        ),
+    )
+    await migrated_db_session.flush()
+    owner.active_save_collection_id = collection_id
+    migrated_db_session.add_all(
+        [
+            CollectionMember(collection_id=collection_id, user_id=owner_id, role=CollectionMembershipRole.OWNER),
+            CollectionInvite(
+                id=invite_id,
+                collection_id=collection_id,
+                created_by_user_id=owner_id,
+                token_hash=seed_e2e._collection_invite_token_hash(seed_e2e.E2E_COLLECTION_INVITE_TOKEN),
+                role=CollectionMembershipRole.VIEWER,
+                channel=CollectionInviteChannel.DIRECT_LINK,
+                label="E2E viewer invite",
+                status=CollectionInviteStatus.PENDING,
+                max_uses=None,
+            ),
+        ],
+    )
+    await migrated_db_session.flush()
+
+    await seed_e2e.cleanup_collection_management_fixture_rows(migrated_db_session)
+
+    assert await migrated_db_session.get(Collection, collection_id) is None
+    assert await migrated_db_session.get(User, owner_id) is None
+    assert await migrated_db_session.get(User, member_id) is None
+    invite_count = await migrated_db_session.scalar(
+        select(func.count()).select_from(CollectionInvite).where(CollectionInvite.id == invite_id),
+    )
+    assert invite_count == 0
+
+
+def seeded_meme(category: str) -> seed_e2e.SeededMeme:
+    return seed_e2e.SeededMeme(
+        category=category,
+        meme_id=seed_e2e._stable_uuid(f"test:{category}:meme"),
+        meme_file_id=seed_e2e._stable_uuid(f"test:{category}:file"),
+        slug=f"e2e-prd-{category}-search",
+        query=category,
+        object_key=f"pipeline/originals/e2e-prd/{category}.png",
+        title=f"Deterministic {category} search meme",
+        tags=(category, "e2e-prd"),
+        is_nsfw=False,
+        language=ContentLanguage.EN,
+        media_type=ContentKind.IMAGE,
+    )
