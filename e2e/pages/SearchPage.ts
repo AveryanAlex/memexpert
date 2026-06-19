@@ -18,12 +18,13 @@ export class SearchPage {
 
   async searchCollections(input: { query: string; collectionTitles: string[] }) {
     await this.page.goto('/search');
-    await this.page.getByLabel('Search text').fill(input.query);
+    const searchForm = this.page.locator('form').filter({ has: this.page.getByLabel('Search text') });
+    await searchForm.getByLabel('Search text').fill(input.query);
     await this.page.getByLabel('Search scope').selectOption('collections');
     for (const title of input.collectionTitles) {
       await this.page.locator('label').filter({ hasText: title }).getByRole('checkbox').check();
     }
-    await this.page.getByRole('button', { name: 'Search' }).click();
+    await searchForm.getByRole('button', { name: 'Search', exact: true }).click();
   }
 
   async applyFilters(input: { query: string; tag: string; mediaType: string; language: string; includeNsfw: boolean }) {
