@@ -21,13 +21,11 @@ from memexpert.ingest.schemas import IngestAcceptOutcome, IngestAcceptResult, In
 from memexpert.ingest.target_collection_metadata import user_metadata_with_target_collection
 from memexpert.models.content import Meme, MemeFile, MemeSource
 from memexpert.models.enums import (
-    AccountStatus,
     AnalyticsEventType,
     ContentKind,
     SourceAttachReason,
     SourcePlatform,
 )
-from memexpert.models.user import User
 from memexpert.services import (
     CollectionNotFoundError,
     CollectionService,
@@ -43,6 +41,7 @@ from memexpert.services import (
     PipelineUnsupportedMediaTypeError,
     UserNotFoundError,
 )
+from memexpert.services.telegram_accounts import resolve_or_create_active_telegram_user
 
 if TYPE_CHECKING:
     import uuid
@@ -52,6 +51,8 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from memexpert.core.database import AsyncSessionFactory
+    from memexpert.models.user import User
+    from memexpert.schemas import CollectionRead
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +73,8 @@ class PrivateUploadAcceptService(Protocol):
 
 
 class ActiveCollectionSaver(Protocol):
+    async def get_active_save_collection(self, *, user_id: object) -> CollectionRead: ...
+
     async def save_meme_to_active_collection(self, *, user_id: object, meme_id: object) -> object: ...
 
 
@@ -200,29 +203,35 @@ async def handle_private_upload_message(
         return
 
     async with session_factory() as session:
-        linked_user = await _resolve_active_linked_user(session, telegram_user_id=telegram_user_id)
-        if linked_user is None:
-            await message.answer(_unlinked_message())
+        account_resolution = await resolve_or_create_active_telegram_user(
+            session,
+            telegram_user_id=telegram_user_id,
+        )
+        if not account_resolution.is_active:
+            await message.answer(_account_unavailable_message())
             return
-        if linked_user.active_save_collection_id is None:
-            await message.answer(_missing_active_collection_message())
+        linked_user = account_resolution.user
+        assert linked_user is not None
+
+        try:
+            accept_service = accept_service_factory(session)
+            collection_service = collection_service_factory(session)
+            target_collection = await collection_service.get_active_save_collection(user_id=linked_user.id)
+        except (CollectionServiceError, UserNotFoundError):
+            await message.answer(_collection_setup_failure_message())
             return
-        target_collection_id = linked_user.active_save_collection_id
+        except Exception:
+            logger.exception("Telegram private upload service setup failed for user_id=%s.", linked_user.id)
+            await message.answer(_pipeline_setup_failure_message())
+            return
 
         source = _build_upload_source(
             message=message,
             media=media,
             telegram_user_id=telegram_user_id,
             owner_user_id=linked_user.id,
-            target_collection_id=target_collection_id,
+            target_collection_id=target_collection.id,
         )
-        try:
-            accept_service = accept_service_factory(session)
-            collection_service = collection_service_factory(session)
-        except Exception:
-            logger.exception("Telegram private upload service setup failed for user_id=%s.", linked_user.id)
-            await message.answer(_pipeline_setup_failure_message())
-            return
 
         try:
             media_bytes = await telegram_file_downloader.download_file(bot, file_id=media.file_id)
@@ -442,16 +451,6 @@ async def _save_to_active_collection(
     return "saved"
 
 
-async def _resolve_active_linked_user(session: AsyncSession, *, telegram_user_id: int) -> User | None:
-    result = await session.execute(
-        select(User).where(
-            User.telegram_id == telegram_user_id,
-            User.status == AccountStatus.ACTIVE,
-        )
-    )
-    return result.scalar_one_or_none()
-
-
 async def _get_meme(session: AsyncSession, meme_id: object) -> Meme | None:
     result = await session.execute(select(Meme).where(Meme.id == meme_id))
     return result.scalar_one_or_none()
@@ -669,12 +668,12 @@ def _missing_identity_message() -> str:
     return "Не удалось определить ваш Telegram-профиль. Отправьте файл из личного чата с ботом."
 
 
-def _unlinked_message() -> str:
-    return "Сначала привяжите Telegram к аккаунту MemeXpert, затем отправьте изображение или GIF ещё раз."
+def _account_unavailable_message() -> str:
+    return "Telegram аккаунт MemeXpert недоступен или неактивен. Проверьте статус аккаунта и попробуйте снова."
 
 
-def _missing_active_collection_message() -> str:
-    return "Сначала выберите активную коллекцию для сохранения в MemeXpert, затем отправьте файл ещё раз."
+def _collection_setup_failure_message() -> str:
+    return "Не удалось подготовить активную коллекцию для сохранения. Проверьте статус аккаунта и попробуйте снова."
 
 
 def _unsupported_media_message() -> str:

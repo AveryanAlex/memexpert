@@ -2,40 +2,56 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import secrets
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Protocol
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
-from sqlalchemy import select
 
 from memexpert.bot.analytics import record_telegram_interaction_event, telegram_user_hash
 from memexpert.core.config import Settings, get_settings
 from memexpert.core.database import get_async_session_factory
-from memexpert.models.enums import AccountStatus, AccountType, AnalyticsEventType, CollectionKind
-from memexpert.models.user import User
+from memexpert.models.enums import (
+    AnalyticsEventType,
+    CollectionInviteChannel,
+    CollectionKind,
+    CollectionMembershipRole,
+)
 from memexpert.services import (
+    CollectionNotFoundError,
     CollectionService,
     CollectionServiceError,
     CollectionWriteAccessError,
     GuestCollectionAccessError,
+    InvalidCollectionInviteError,
     InvalidCollectionTitleError,
     InvalidPinnedMemeOrderError,
     MemeNotFoundError,
     PinLimitExceededError,
     UserNotFoundError,
 )
+from memexpert.services.telegram_accounts import resolve_or_create_active_telegram_user
 
 if TYPE_CHECKING:
     from aiogram.types import MaybeInaccessibleMessage
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from memexpert.core.database import AsyncSessionFactory
-    from memexpert.schemas import CollectionMemeRead, CollectionRead, MemeLibraryRead, PinnedMemeRead
+    from memexpert.models.user import User
+    from memexpert.schemas import (
+        CollectionInviteRead,
+        CollectionMemeRead,
+        CollectionRead,
+        MemeLibraryRead,
+        PinnedMemeRead,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +86,22 @@ class PrivateLibraryCollectionService(Protocol):
 
     async def update_active_save_collection(self, *, user_id: object, collection_id: object) -> object: ...
 
+    async def create_invite(
+        self,
+        *,
+        collection_id: object,
+        token_hash: str,
+        created_by_user_id: object | None = None,
+        role: CollectionMembershipRole | str = CollectionMembershipRole.VIEWER,
+        channel: CollectionInviteChannel | str = CollectionInviteChannel.DIRECT_LINK,
+        label: str | None = None,
+        max_uses: int | None = None,
+        expires_at: datetime | None = None,
+        recipient_email: str | None = None,
+    ) -> CollectionInviteRead: ...
+
+    async def join_invite(self, *, token_hash: str, user_id: object) -> CollectionRead: ...
+
 
 type PrivateLibraryCollectionServiceFactory = Callable[[AsyncSession], PrivateLibraryCollectionService]
 
@@ -89,7 +121,7 @@ def build_private_library_router(
 ) -> Router:
     """Build the private-message library management router."""
 
-    _ = settings or get_settings()
+    resolved_settings = settings or get_settings()
     resolved_session_factory = session_factory or get_async_session_factory()
     resolved_service_factory = collection_service_factory or (lambda session: CollectionService(session))
 
@@ -148,10 +180,20 @@ def build_private_library_router(
             collection_service_factory=resolved_service_factory,
         )
 
+    @router.message(F.chat.type == "private", Command("invite_accept"))
+    async def handle_invite_accept(message: Message, command: CommandObject) -> None:
+        await accept_invite(
+            message=message,
+            token=(command.args or "").strip(),
+            session_factory=resolved_session_factory,
+            collection_service_factory=resolved_service_factory,
+        )
+
     @router.callback_query(lambda callback_query: _has_private_library_callback(callback_query.data))
     async def handle_private_library_callback(callback_query: CallbackQuery) -> None:
         await handle_library_callback(
             callback_query=callback_query,
+            settings=resolved_settings,
             session_factory=resolved_session_factory,
             collection_service_factory=resolved_service_factory,
         )
@@ -295,6 +337,7 @@ async def create_collection(
 async def handle_library_callback(
     *,
     callback_query: CallbackQuery,
+    settings: Settings,
     session_factory: AsyncSessionFactory,
     collection_service_factory: PrivateLibraryCollectionServiceFactory,
 ) -> None:
@@ -315,6 +358,7 @@ async def handle_library_callback(
             result = await _handle_callback_action(
                 service=service,
                 user=user,
+                settings=settings,
                 action=action,
                 args=args,
                 telegram_user_hash_value=_callback_telegram_user_hash(callback_query),
@@ -365,10 +409,48 @@ async def _send_listing(
     await message.answer(text, reply_markup=keyboard)
 
 
+async def accept_invite(
+    *,
+    message: Message,
+    token: str,
+    session_factory: AsyncSessionFactory,
+    collection_service_factory: PrivateLibraryCollectionServiceFactory,
+) -> None:
+    if not token:
+        await message.answer("Используйте: /invite_accept <token>")
+        return
+
+    user = await _resolve_user_for_message(message, session_factory=session_factory)
+    if user is None:
+        await message.answer(_unlinked_message())
+        return
+
+    async with session_factory() as session:
+        service = collection_service_factory(session)
+        try:
+            collection = await service.join_invite(token_hash=_hash_invite_token(token), user_id=user.id)
+        except (CollectionServiceError, MemeNotFoundError, UserNotFoundError) as exc:
+            await message.answer(_service_error_message(exc))
+            return
+        await _record_library_event(
+            session,
+            _library_collection_event(
+                user_id=user.id,
+                telegram_user_hash_value=_message_telegram_user_hash(message),
+                action="invite_accept",
+                collection_id=collection.id,
+            ),
+        )
+
+    role = _collection_role_for_user(collection, user_id=user.id)
+    await message.answer(f"Вы присоединились к коллекции: {collection.title}\nРоль: {role.value}")
+
+
 async def _handle_callback_action(
     *,
     service: PrivateLibraryCollectionService,
     user: User,
+    settings: Settings,
     action: str,
     args: list[str],
     telegram_user_hash_value: str | None,
@@ -520,6 +602,37 @@ async def _handle_callback_action(
                 collection_id=collection_id,
             ),
         )
+    if action == "ic":
+        collection_id = _parse_uuid_arg(args, 0)
+        page = _parse_page(args[1:])
+        if collection_id is None:
+            return _stale_callback_result()
+        collections = await service.list_collections_for_user(user_id=user.id)
+        collection = next((item for item in collections if item.id == collection_id), None)
+        if collection is None:
+            return _callback_result("Коллекция не найдена.", _single_button_keyboard("Коллекции", _callback("c", page)))
+        token = secrets.token_urlsafe(32)
+        _ = await service.create_invite(
+            collection_id=collection_id,
+            token_hash=_hash_invite_token(token),
+            created_by_user_id=user.id,
+            role=CollectionMembershipRole.VIEWER,
+            channel=CollectionInviteChannel.DIRECT_LINK,
+            label="Telegram PM",
+            max_uses=1,
+            expires_at=datetime.now(UTC) + timedelta(days=7),
+        )
+        text, keyboard = _render_invite_created(collection=collection, token=token, settings=settings, page=page)
+        return _callback_result(
+            text,
+            keyboard,
+            _library_collection_event(
+                user_id=user.id,
+                telegram_user_hash_value=telegram_user_hash_value,
+                action="invite_create",
+                collection_id=collection_id,
+            ),
+        )
     if action == "cd":
         collection_id = _parse_uuid_arg(args, 0)
         page = _parse_page(args[1:])
@@ -532,7 +645,7 @@ async def _handle_callback_action(
         if collection.kind is CollectionKind.FAVORITES:
             return _callback_result(
                 "Favorites нельзя удалить.",
-                _collections_keyboard(collections, active_collection_id=None, page=page),
+                _collections_keyboard(collections, active_collection_id=None, user_id=user.id, page=page),
             )
         _ = await service.delete_custom_collection(collection_id=collection_id, user_id=user.id)
         text, keyboard = await _render_section(service=service, user_id=user.id, section="collections", page=page)
@@ -578,7 +691,7 @@ async def _render_section(
         library = await service.get_meme_library(user_id=user_id)
         collections = await service.list_collections_for_user(user_id=user_id)
         active_collection_id = library.active_save_collection.id if library.active_save_collection else None
-        return _render_collections(collections, active_collection_id=active_collection_id, page=page)
+        return _render_collections(collections, active_collection_id=active_collection_id, user_id=user_id, page=page)
     return _stale_button_response()
 
 
@@ -720,7 +833,8 @@ async def _resolve_user_for_message(
     if telegram_user is None or telegram_user.id <= 0:
         return None
     async with session_factory() as session:
-        return await _resolve_active_full_linked_user(session, telegram_user_id=telegram_user.id)
+        account_resolution = await resolve_or_create_active_telegram_user(session, telegram_user_id=telegram_user.id)
+        return account_resolution.user if account_resolution.is_active else None
 
 
 async def _resolve_user_for_callback(
@@ -731,18 +845,11 @@ async def _resolve_user_for_callback(
     if callback_query.from_user.id <= 0:
         return None
     async with session_factory() as session:
-        return await _resolve_active_full_linked_user(session, telegram_user_id=callback_query.from_user.id)
-
-
-async def _resolve_active_full_linked_user(session: AsyncSession, *, telegram_user_id: int) -> User | None:
-    user: User | None = await session.scalar(
-        select(User).where(
-            User.telegram_id == telegram_user_id,
-            User.account_type == AccountType.FULL,
-            User.status == AccountStatus.ACTIVE,
+        account_resolution = await resolve_or_create_active_telegram_user(
+            session,
+            telegram_user_id=callback_query.from_user.id,
         )
-    )
-    return user
+        return account_resolution.user if account_resolution.is_active else None
 
 
 def _render_menu(library: MemeLibraryRead) -> str:
@@ -807,6 +914,7 @@ def _render_collections(
     items: list[CollectionRead],
     *,
     active_collection_id: uuid.UUID | None,
+    user_id: uuid.UUID,
     page: int,
 ) -> tuple[str, InlineKeyboardMarkup]:
     page_items, normalized_page, total_pages = _page(items, page=page)
@@ -821,9 +929,28 @@ def _render_collections(
     return "\n".join(lines), _collections_keyboard(
         page_items,
         active_collection_id=active_collection_id,
+        user_id=user_id,
         page=normalized_page,
         total_pages=total_pages,
     )
+
+
+def _render_invite_created(
+    *,
+    collection: CollectionRead,
+    token: str,
+    settings: Settings,
+    page: int,
+) -> tuple[str, InlineKeyboardMarkup]:
+    lines = [
+        f"Приглашение создано для коллекции: {collection.title}",
+        "Действует 7 дней и сработает один раз.",
+    ]
+    bot_username = _bot_username(settings)
+    if bot_username is not None:
+        lines.append(f"Mini App: https://t.me/{bot_username}/app?startapp=invite_{token}")
+    lines.append(f"Fallback: /invite_accept {token}")
+    return "\n".join(lines), _single_button_keyboard("Коллекции", _callback("c", page))
 
 
 def _menu_keyboard() -> InlineKeyboardMarkup:
@@ -904,6 +1031,7 @@ def _collections_keyboard(
     items: list[CollectionRead],
     *,
     active_collection_id: uuid.UUID | None,
+    user_id: uuid.UUID,
     page: int,
     total_pages: int = 1,
 ) -> InlineKeyboardMarkup:
@@ -918,6 +1046,13 @@ def _collections_keyboard(
                 )
             )
         if item.kind is not CollectionKind.FAVORITES:
+            if _collection_can_write(item, user_id=user_id):
+                row.append(
+                    InlineKeyboardButton(
+                        text=f"Invite: {item.title[:20]}",
+                        callback_data=_callback("ic", item.id.hex, page),
+                    )
+                )
             row.append(
                 InlineKeyboardButton(
                     text=f"Delete: {item.title[:20]}",
@@ -1055,12 +1190,35 @@ def _action_for_section(section: str) -> str:
     }.get(section, "m")
 
 
+def _hash_invite_token(token: str) -> str:
+    return hashlib.sha256(token.strip().encode("utf-8")).hexdigest()
+
+
+def _bot_username(settings: Settings) -> str | None:
+    username = settings.auth_telegram_bot_username
+    return username.strip().lstrip("@") if username else None
+
+
+def _collection_can_write(collection: CollectionRead, *, user_id: uuid.UUID) -> bool:
+    return _collection_role_for_user(collection, user_id=user_id) in {
+        CollectionMembershipRole.OWNER,
+        CollectionMembershipRole.EDITOR,
+    }
+
+
+def _collection_role_for_user(collection: CollectionRead, *, user_id: uuid.UUID) -> CollectionMembershipRole:
+    if collection.owner_id == user_id:
+        return CollectionMembershipRole.OWNER
+    membership = next((item for item in collection.memberships if item.user_id == user_id), None)
+    return membership.role if membership is not None else CollectionMembershipRole.VIEWER
+
+
 def _stale_button_response() -> tuple[str, InlineKeyboardMarkup]:
     return "Эта кнопка устарела. Откройте меню заново.", _menu_keyboard()
 
 
 def _unlinked_message() -> str:
-    return "Сначала привяжите Telegram к полному аккаунту MemeXpert, затем откройте /library."
+    return "Telegram аккаунт MemeXpert недоступен или неактивен. Проверьте статус аккаунта и попробуйте снова."
 
 
 def _service_error_message(exc: Exception) -> str:
@@ -1069,9 +1227,11 @@ def _service_error_message(exc: Exception) -> str:
         (
             CollectionWriteAccessError,
             GuestCollectionAccessError,
+            InvalidCollectionInviteError,
             InvalidCollectionTitleError,
             InvalidPinnedMemeOrderError,
             PinLimitExceededError,
+            CollectionNotFoundError,
         ),
     ):
         return str(exc)
@@ -1084,6 +1244,7 @@ def _service_error_message(exc: Exception) -> str:
 
 __all__ = [
     "PrivateLibraryCollectionServiceFactory",
+    "accept_invite",
     "build_private_library_router",
     "handle_library_callback",
     "show_library_menu",

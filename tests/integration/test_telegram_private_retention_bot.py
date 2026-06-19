@@ -17,19 +17,18 @@ from sqlalchemy import select
 from memexpert.bot.main import build_bot, build_dispatcher
 from memexpert.core.config import Settings
 from memexpert.models.base import utcnow
-from memexpert.models.collection import Collection, CollectionMember, CollectionMeme, PinnedMeme
-from memexpert.models.content import Meme, MemeFile
+from memexpert.models.content import Meme, MemeFile, MemeTemplate
 from memexpert.models.enums import (
+    AccountStatus,
+    AccountType,
     AnalyticsEventType,
-    CollectionKind,
-    CollectionMembershipRole,
     ContentKind,
     ContentLanguage,
     ContentProcessingStatus,
     SourcePlatform,
     UserLanguage,
 )
-from memexpert.models.user import AnalyticsEvent, ChannelSuggestion, InlineUsageEvent, User
+from memexpert.models.user import AnalyticsEvent, ChannelSuggestion, User
 from memexpert.services import UserService
 from tests.conftest import create_full_user_via_upgrade
 
@@ -346,6 +345,32 @@ async def test_account_status_and_miniapp_links_include_provider_state_and_entry
 
 
 @pytest.mark.asyncio
+async def test_account_status_auto_creates_telegram_user(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    postgres_async_url: str,
+) -> None:
+    _ = migrated_db_session
+    settings = build_bot_settings(postgres_async_url)
+    telegram_session = RecordingTelegramSession()
+    bot = build_bot(settings, session=telegram_session)
+    dispatcher = build_retention_dispatcher(settings=settings, postgres_session_factory=postgres_session_factory)
+
+    try:
+        await dispatch_private_message(dispatcher=dispatcher, bot=bot, text="/account")
+    finally:
+        await bot.session.close()
+
+    assert "Аккаунт MemeXpert" in str(last_message(telegram_session).text)
+    assert "Telegram: привязан" in str(last_message(telegram_session).text)
+    async with postgres_session_factory() as session:
+        created_user = await session.scalar(select(User).where(User.telegram_id == TELEGRAM_ID))
+    assert created_user is not None
+    assert created_user.account_type is AccountType.FULL
+    assert created_user.status is AccountStatus.ACTIVE
+
+
+@pytest.mark.asyncio
 async def test_stats_show_persisted_counts_and_no_data_state(
     migrated_db_session: AsyncSession,
     postgres_session_factory: async_sessionmaker[AsyncSession],
@@ -366,14 +391,13 @@ async def test_stats_show_persisted_counts_and_no_data_state(
         await bot.session.close()
 
     stats_text = str(last_message(telegram_session).text)
-    assert "Favorites: 1" in stats_text
-    assert "Сохранений в коллекциях: 2" in stats_text
-    assert "Pins: 1" in stats_text
-    assert "Коллекций: 2" in stats_text
-    assert "Загрузок/авторских мемов: 1" in stats_text
-    assert "Inline sends/events: 1" in stats_text
-    assert "Предложений каналов: 1 (1 pending)" in stats_text
-    assert "Топ тег по сохранениям: cats" in stats_text
+    assert "Viewed: 1" in stats_text
+    assert "Sent: 1" in stats_text
+    assert "Saved: 1" in stats_text
+    assert "Downloaded: 1" in stats_text
+    assert "Days active: 2" in stats_text
+    assert "Top tags: cats (4), dogs (1)" in stats_text
+    assert "Top templates: Reaction Template (4)" in stats_text
 
 
 @pytest.mark.asyncio
@@ -382,9 +406,7 @@ async def test_stats_show_honest_no_data_state(
     postgres_session_factory: async_sessionmaker[AsyncSession],
     postgres_async_url: str,
 ) -> None:
-    user_service = UserService(migrated_db_session)
-    await create_full_user_via_upgrade(user_service, telegram_id=TELEGRAM_ID)
-    await migrated_db_session.commit()
+    _ = migrated_db_session
     settings = build_bot_settings(postgres_async_url)
     telegram_session = RecordingTelegramSession()
     bot = build_bot(settings, session=telegram_session)
@@ -396,33 +418,45 @@ async def test_stats_show_honest_no_data_state(
         await bot.session.close()
 
     stats_text = str(last_message(telegram_session).text)
-    assert "Favorites: 0" in stats_text
+    assert "Viewed: 0" in stats_text
+    assert "Days active: 0" in stats_text
     assert "Пока мало данных" in stats_text
+    assert "Notes:" in stats_text
+    async with postgres_session_factory() as session:
+        created_user = await session.scalar(select(User).where(User.telegram_id == TELEGRAM_ID))
+    assert created_user is not None
+    assert created_user.account_type is AccountType.FULL
+
+
+@pytest.mark.asyncio
+async def test_retention_rejects_deletion_pending_telegram_user_without_duplicate(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    postgres_async_url: str,
+) -> None:
+    migrated_db_session.add(User(telegram_id=TELEGRAM_ID, status=AccountStatus.DELETION_PENDING))
+    await migrated_db_session.commit()
+    settings = build_bot_settings(postgres_async_url)
+    telegram_session = RecordingTelegramSession()
+    bot = build_bot(settings, session=telegram_session)
+    dispatcher = build_retention_dispatcher(settings=settings, postgres_session_factory=postgres_session_factory)
+
+    try:
+        await dispatch_private_message(dispatcher=dispatcher, bot=bot, text="/settings")
+    finally:
+        await bot.session.close()
+
+    assert "недоступен или неактивен" in str(last_message(telegram_session).text)
+    async with postgres_session_factory() as session:
+        users = list(await session.scalars(select(User).where(User.telegram_id == TELEGRAM_ID)))
+    assert len(users) == 1
+    assert users[0].status is AccountStatus.DELETION_PENDING
 
 
 async def seed_stats_data(session: AsyncSession, *, user_id: uuid.UUID) -> None:
-    user = await session.get(User, user_id)
-    assert user is not None
-    user.created_at = utcnow() - timedelta(days=4)
-    user.last_active_at = utcnow()
-    favorites = Collection(owner_id=user_id, title="Favorites", kind=CollectionKind.FAVORITES)
-    custom = Collection(owner_id=user_id, title="Custom", kind=CollectionKind.CUSTOM)
-    session.add_all([favorites, custom])
+    template = MemeTemplate(slug="reaction-template", name="Reaction Template")
+    session.add(template)
     await session.flush()
-    session.add_all(
-        [
-            CollectionMember(
-                collection_id=favorites.id,
-                user_id=user_id,
-                role=CollectionMembershipRole.OWNER,
-            ),
-            CollectionMember(
-                collection_id=custom.id,
-                user_id=user_id,
-                role=CollectionMembershipRole.OWNER,
-            ),
-        ]
-    )
     meme_id = uuid.uuid7()
     meme_file_id = uuid.uuid7()
     second_meme_id = uuid.uuid7()
@@ -432,7 +466,7 @@ async def seed_stats_data(session: AsyncSession, *, user_id: uuid.UUID) -> None:
         media_type=ContentKind.IMAGE,
         primary_file_id=meme_file_id,
         language=ContentLanguage.EN,
-        author_user_id=user_id,
+        template_id=template.id,
         tags=["cats"],
     )
     second_meme = Meme(
@@ -440,7 +474,7 @@ async def seed_stats_data(session: AsyncSession, *, user_id: uuid.UUID) -> None:
         media_type=ContentKind.IMAGE,
         primary_file_id=second_meme_file_id,
         language=ContentLanguage.EN,
-        tags=["cats", "dogs"],
+        tags=["dogs"],
     )
     session.add_all([meme, second_meme])
     await session.flush()
@@ -468,10 +502,50 @@ async def seed_stats_data(session: AsyncSession, *, user_id: uuid.UUID) -> None:
                 s3_original_key=f"pipeline/originals/{second_meme_id}/original.png",
                 perceptual_hash=f"hash-{second_meme_id}",
             ),
-            CollectionMeme(collection_id=favorites.id, meme_id=meme.id, added_by_user_id=user_id),
-            CollectionMeme(collection_id=custom.id, meme_id=second_meme.id, added_by_user_id=user_id),
-            PinnedMeme(user_id=user_id, meme_id=meme.id, position=1),
-            InlineUsageEvent(user_id=user_id, group_hash="feedbeef1234"),
-            ChannelSuggestion(user_id=user_id, platform=SourcePlatform.TELEGRAM, channel_url="https://t.me/cats"),
+            _profile_event(
+                user_id=user_id,
+                event_type=AnalyticsEventType.MEME_VIEW,
+                meme_id=meme.id,
+                occurred_at=utcnow() - timedelta(days=1),
+            ),
+            _profile_event(
+                user_id=user_id,
+                event_type=AnalyticsEventType.MEME_SEND,
+                meme_id=meme.id,
+                occurred_at=utcnow(),
+            ),
+            _profile_event(
+                user_id=user_id,
+                event_type=AnalyticsEventType.MEME_SAVE,
+                meme_id=meme.id,
+                occurred_at=utcnow(),
+            ),
+            _profile_event(
+                user_id=user_id,
+                event_type=AnalyticsEventType.MEME_DOWNLOAD,
+                meme_id=meme.id,
+                occurred_at=utcnow(),
+            ),
+            _profile_event(
+                user_id=user_id,
+                event_type=AnalyticsEventType.CLICK,
+                meme_id=second_meme.id,
+                occurred_at=utcnow(),
+            ),
         ]
+    )
+
+
+def _profile_event(
+    *,
+    user_id: uuid.UUID,
+    event_type: AnalyticsEventType,
+    meme_id: uuid.UUID,
+    occurred_at: datetime,
+) -> AnalyticsEvent:
+    return AnalyticsEvent(
+        user_id=user_id,
+        event_type=event_type,
+        payload={"surface": "telegram_pm_stats_test", "refs": {"meme_id": str(meme_id)}, "properties": {}},
+        occurred_at=occurred_at,
     )
