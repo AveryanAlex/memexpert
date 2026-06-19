@@ -37,6 +37,10 @@ from memexpert.models.enums import (
     PipelineIngestRequestStatus,
     RabbitMQOutboxMessageStatus,
     SourceAttachReason,
+    SourceEngagementCaptureReason,
+    SourceEngagementCommentsState,
+    SourceEngagementFetchStatus,
+    SourceEngagementScheduleLabel,
     SourcePlatform,
     SyncTargetKind,
     SyncTargetStatus,
@@ -707,9 +711,14 @@ class MemeSource(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "meme_sources"
     __table_args__ = (
         UniqueConstraint("platform", "source_id", "post_id", name="uq_meme_sources_platform_source_post"),
+        CheckConstraint(
+            "engagement_check_attempt_count >= 0",
+            name="meme_sources_engagement_check_attempt_count_non_negative",
+        ),
         Index("ix_meme_sources_file_id_platform", "file_id", "platform"),
         Index("ix_meme_sources_attach_reason", "attach_reason"),
         Index("ix_meme_sources_matched_meme_file_id", "matched_meme_file_id"),
+        Index("ix_meme_sources_engagement_due_lease", "next_engagement_check_at", "engagement_check_locked_at"),
     )
 
     file_id: Mapped[uuid.UUID] = mapped_column(
@@ -730,6 +739,12 @@ class MemeSource(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # operator uploads and backfilled rows because they have no upstream
     # publish time the freshness SLO could measure against.
     published_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    last_engagement_check_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    next_engagement_check_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    engagement_check_locked_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    engagement_check_lock_owner: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    engagement_check_attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_engagement_error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
     # Forward-chain attribution: when the crawler saw a reposter channel, the
     # ``source_id``/``post_id`` pair still records the channel where the post
     # was seen. These two columns preserve the original author pair so the
@@ -755,6 +770,11 @@ class MemeSource(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         "MemeFile",
         foreign_keys=[matched_meme_file_id],
     )
+    engagement_snapshots: Mapped[list["MemeSourceEngagementSnapshot"]] = relationship(
+        "MemeSourceEngagementSnapshot",
+        back_populates="source",
+        cascade="all, delete-orphan",
+    )
 
     @property
     def is_forwarded(self) -> bool:
@@ -766,6 +786,82 @@ class MemeSource(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         """
 
         return self.forwarded_from_source_id is not None
+
+
+class MemeSourceEngagementSnapshot(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """Append-only upstream engagement metrics captured for one source post."""
+
+    __tablename__ = "meme_source_engagement_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "meme_source_id",
+            "captured_at",
+            name="uq_meme_source_engagement_snapshots_source_captured_at",
+        ),
+        CheckConstraint(
+            "view_count IS NULL OR view_count >= 0",
+            name="meme_source_engagement_snapshots_view_count_non_negative",
+        ),
+        CheckConstraint(
+            "reaction_count IS NULL OR reaction_count >= 0",
+            name="meme_source_engagement_snapshots_reaction_count_non_negative",
+        ),
+        CheckConstraint(
+            "comment_count IS NULL OR comment_count >= 0",
+            name="meme_source_engagement_snapshots_comment_count_non_negative",
+        ),
+        CheckConstraint(
+            "forward_count IS NULL OR forward_count >= 0",
+            name="meme_source_engagement_snapshots_forward_count_non_negative",
+        ),
+        Index(
+            "ix_meme_source_engagement_snapshots_label_status_captured",
+            "schedule_label",
+            "fetch_status",
+            "captured_at",
+        ),
+    )
+
+    meme_source_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("meme_sources.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    captured_at: Mapped[datetime] = mapped_column(default=utcnow, nullable=False)
+    scheduled_for: Mapped[datetime | None] = mapped_column(nullable=True)
+    capture_reason: Mapped[SourceEngagementCaptureReason] = mapped_column(
+        string_enum(SourceEngagementCaptureReason),
+        nullable=False,
+    )
+    schedule_label: Mapped[SourceEngagementScheduleLabel | None] = mapped_column(
+        string_enum(SourceEngagementScheduleLabel),
+        nullable=True,
+    )
+    view_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reactions: Mapped[dict[str, int] | None] = mapped_column(JSONB, nullable=True)
+    reaction_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    comment_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    forward_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    comments_state: Mapped[SourceEngagementCommentsState] = mapped_column(
+        string_enum(SourceEngagementCommentsState),
+        default=SourceEngagementCommentsState.UNKNOWN,
+        nullable=False,
+    )
+    fetch_status: Mapped[SourceEngagementFetchStatus] = mapped_column(
+        string_enum(SourceEngagementFetchStatus),
+        nullable=False,
+    )
+    source_alive: Mapped[bool] = mapped_column(default=True, nullable=False)
+    error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    raw_metrics: Mapped[dict[str, object]] = mapped_column(JSONB, default=dict, nullable=False)
+
+    source: Mapped["MemeSource"] = relationship("MemeSource", back_populates="engagement_snapshots")
+
+
+Index(
+    "ix_meme_source_engagement_snapshots_source_captured_desc",
+    MemeSourceEngagementSnapshot.__table__.c.meme_source_id,
+    MemeSourceEngagementSnapshot.__table__.c.captured_at.desc(),
+)
 
 
 class MemeSeoPage(Base):
@@ -1025,6 +1121,7 @@ __all__ = [
     "MemePopularitySnapshot",
     "MemeSeoPage",
     "MemeSource",
+    "MemeSourceEngagementSnapshot",
     "MemeTemplate",
     "ModerationDecision",
     "ModerationReport",
