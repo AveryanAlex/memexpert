@@ -6,7 +6,7 @@ import hashlib
 import hmac
 import json
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 from urllib.parse import urlencode
 
 from httpx import ASGITransport, AsyncClient
@@ -15,12 +15,16 @@ from sqlalchemy import func, select
 from memexpert.api.app import create_app
 from memexpert.core.config import get_settings
 from memexpert.core.database import reset_async_database_state
-from memexpert.models.enums import AccountType
-from memexpert.models.user import AccountMergeLog, LoginEvent, User
+from memexpert.models.enums import AccountType, AnalyticsEventType
+from memexpert.models.user import AccountMergeLog, AnalyticsEvent, LoginEvent, User
 
 if TYPE_CHECKING:
     from pytest import MonkeyPatch
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+
+def _analytics_properties(event: AnalyticsEvent) -> dict[str, object]:
+    return cast("dict[str, object]", event.payload["properties"])
 
 
 def sign_telegram_widget_payload(
@@ -149,10 +153,20 @@ async def test_telegram_miniapp_route_first_open_creates_exactly_one_full_user_n
             select(func.count()).select_from(User).where(User.account_type == AccountType.FULL)
         )
         merge_log_count_result = await session.execute(select(func.count()).select_from(AccountMergeLog))
+        event = await session.scalar(
+            select(AnalyticsEvent).where(AnalyticsEvent.event_type == AnalyticsEventType.MINIAPP_OPEN)
+        )
 
         assert user_count_result.scalar_one() == 1
         assert full_count_result.scalar_one() == 1
         assert merge_log_count_result.scalar_one() == 0
+        assert event is not None
+        properties = _analytics_properties(event)
+        assert event.payload["surface"] == "telegram_miniapp_auth"
+        assert properties["action"] == "auth_session_issued"
+        assert "telegram_user_hash" in properties
+        assert "initData" not in event.payload
+        assert "init_data" not in event.payload
 
 
 async def test_telegram_miniapp_route_reuses_existing_telegram_account_across_surfaces(

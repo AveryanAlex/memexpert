@@ -6,7 +6,7 @@ import hashlib
 import uuid
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from aiogram.client.session.base import BaseSession
@@ -173,6 +173,14 @@ def build_bot_settings(database_url: str) -> Settings:
 
 def bot_scope() -> str:
     return hashlib.sha256(BOT_TOKEN.encode("utf-8")).hexdigest()
+
+
+def _analytics_properties(event: AnalyticsEvent) -> dict[str, object]:
+    return cast("dict[str, object]", event.payload["properties"])
+
+
+def _analytics_refs(event: AnalyticsEvent) -> dict[str, object]:
+    return cast("dict[str, object]", event.payload["refs"])
 
 
 async def create_meme_file(
@@ -430,13 +438,34 @@ async def test_inline_plain_text_query_calls_shared_search_service_and_records_q
         inline_event = await session.scalar(
             select(AnalyticsEvent).where(AnalyticsEvent.event_type == AnalyticsEventType.INLINE_QUERY)
         )
+        served_event = await session.scalar(
+            select(AnalyticsEvent).where(AnalyticsEvent.event_type == AnalyticsEventType.INLINE_SERVED)
+        )
         inline_usage_events = await session.scalar(select(func.count()).select_from(InlineUsageEvent))
     assert inline_event is not None
+    inline_properties = _analytics_properties(inline_event)
+    assert inline_event.payload["surface"] == "telegram_inline"
+    assert inline_event.payload["query"] == "grumpy cat"
+    assert inline_properties["result_count"] == 1
+    assert inline_properties["offset"] == 0
+    assert inline_properties["has_more"] is False
+    assert inline_properties["chat_type"] == "sender"
     assert (
-        inline_event.payload["telegram_user_hash"]
+        inline_properties["telegram_user_hash"]
         == hashlib.sha256(f"telegram_user:{TELEGRAM_ID}".encode()).hexdigest()
     )
-    assert "telegram_user_id" not in inline_event.payload
+    assert "telegram_user_id" not in inline_properties
+    assert served_event is not None
+    served_properties = _analytics_properties(served_event)
+    served_refs = _analytics_refs(served_event)
+    assert served_event.payload["surface"] == "telegram_inline_search"
+    assert served_refs == {"meme_file_id": str(file.id), "meme_id": str(meme.id)}
+    assert served_event.payload["request_id"] == "req_inline_test"
+    assert served_event.payload["impression_id"] == "imp_inline_1"
+    assert served_event.payload["source_algorithm"] == "hybrid_search"
+    assert served_event.payload["rank"] == 1
+    assert served_properties["media_format"] == "photo"
+    assert served_properties["is_personal"] is False
     assert inline_usage_events == 0
 
 
@@ -487,6 +516,62 @@ async def test_inline_plain_text_query_uses_linked_full_user_scope_and_nsfw_pref
         }
     ]
     assert last_inline_answer(telegram_session).is_personal is True
+
+
+@pytest.mark.asyncio
+async def test_inline_analytics_failure_keeps_answer_and_logs_structured_context(
+    migrated_db_session: AsyncSession,
+    postgres_async_url: str,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    meme, file = await create_meme_file(migrated_db_session, media_type=ContentKind.IMAGE, mime_type="image/jpeg")
+    await add_file_id_cache(
+        migrated_db_session,
+        file=file,
+        media_format=TelegramMediaFormat.PHOTO,
+        telegram_file_id="cached-failure-photo-id",
+    )
+    await migrated_db_session.commit()
+
+    writer_calls: list[object] = []
+    logged_extras: list[dict[str, object]] = []
+
+    async def fail_record_interaction_event(self: object, event: object) -> object:
+        _ = (self, event)
+        writer_calls.append(event)
+        raise RuntimeError("analytics database is unavailable")
+
+    def record_log_exception(message: str, *args: object, **kwargs: object) -> None:
+        _ = (message, args)
+        extra = kwargs.get("extra")
+        if isinstance(extra, dict):
+            logged_extras.append(cast("dict[str, object]", extra))
+
+    monkeypatch.setattr(
+        "memexpert.services.analytics.AnalyticsService.record_interaction_event",
+        fail_record_interaction_event,
+    )
+    monkeypatch.setattr("memexpert.bot.analytics.logger.exception", record_log_exception)
+    fake_service = FakeMemeSearchService(search_page_for([(meme, file)]))
+    telegram_session = RecordingTelegramSession()
+    bot = build_bot(build_bot_settings(postgres_async_url), session=telegram_session)
+    dispatcher = build_dispatcher(
+        settings=build_bot_settings(postgres_async_url),
+        session_factory=postgres_session_factory,
+        meme_search_service_factory=lambda session: fake_service,
+    )
+
+    try:
+        await dispatch_inline_query(dispatcher=dispatcher, bot=bot, query="still answer")
+    finally:
+        await bot.session.close()
+
+    answer = last_inline_answer(telegram_session)
+    assert len(answer.results) == 1
+    assert writer_calls
+    assert any(extra.get("event") == "telegram_analytics_write_failed" for extra in logged_extras)
+    assert any(extra.get("analytics_event_type") == "inline_served" for extra in logged_extras)
 
 
 @pytest.mark.asyncio
@@ -947,6 +1032,70 @@ async def test_inline_empty_query_for_linked_user_returns_recent_then_popular_wh
 
 
 @pytest.mark.asyncio
+async def test_inline_empty_query_recent_send_personalization_reads_strict_refs(
+    migrated_db_session: AsyncSession,
+    postgres_async_url: str,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    user = User(telegram_id=TELEGRAM_ID)
+    migrated_db_session.add(user)
+    recent_meme, recent_file = await create_meme_file(
+        migrated_db_session,
+        media_type=ContentKind.IMAGE,
+        mime_type="image/jpeg",
+    )
+    popular_meme, popular_file = await create_meme_file(
+        migrated_db_session,
+        media_type=ContentKind.IMAGE,
+        mime_type="image/jpeg",
+    )
+    popular_meme.popularity_score = 900.0
+    migrated_db_session.add(
+        AnalyticsEvent(
+            user=user,
+            event_type=AnalyticsEventType.MEME_SEND,
+            payload={
+                "surface": "telegram_inline",
+                "refs": {"meme_id": str(recent_meme.id), "meme_file_id": str(recent_file.id)},
+            },
+        )
+    )
+    await add_file_id_cache(
+        migrated_db_session,
+        file=recent_file,
+        media_format=TelegramMediaFormat.PHOTO,
+        telegram_file_id="cached-strict-recent-photo-id",
+    )
+    await add_file_id_cache(
+        migrated_db_session,
+        file=popular_file,
+        media_format=TelegramMediaFormat.PHOTO,
+        telegram_file_id="cached-strict-popular-photo-id",
+    )
+    await migrated_db_session.commit()
+
+    fake_service = FakeMemeSearchService(MemeSearchPageRead(items=[], limit=20, offset=0, total=0, has_more=False))
+    telegram_session = RecordingTelegramSession()
+    bot = build_bot(build_bot_settings(postgres_async_url), session=telegram_session)
+    dispatcher = build_dispatcher(
+        settings=build_bot_settings(postgres_async_url),
+        session_factory=postgres_session_factory,
+        meme_search_service_factory=lambda session: fake_service,
+    )
+
+    try:
+        await dispatch_inline_query(dispatcher=dispatcher, bot=bot, query="")
+    finally:
+        await bot.session.close()
+
+    answer = last_inline_answer(telegram_session)
+    assert len(answer.results) == 2
+    first_result = answer.results[0]
+    assert isinstance(first_result, InlineQueryResultCachedPhoto)
+    assert first_result.photo_file_id == "cached-strict-recent-photo-id"
+
+
+@pytest.mark.asyncio
 async def test_inline_empty_query_for_linked_user_falls_back_to_popular_when_no_pins_or_recents(
     migrated_db_session: AsyncSession,
     postgres_async_url: str,
@@ -1153,7 +1302,7 @@ async def test_inline_empty_query_for_guest_returns_popular_public_memes_non_per
 
 
 @pytest.mark.asyncio
-async def test_chosen_inline_result_records_meme_send_analytics(
+async def test_chosen_inline_result_records_strict_chosen_sent_and_recent_send_events(
     migrated_db_session: AsyncSession,
     postgres_async_url: str,
     postgres_session_factory: async_sessionmaker[AsyncSession],
@@ -1178,17 +1327,39 @@ async def test_chosen_inline_result_records_meme_send_analytics(
         await bot.session.close()
 
     async with postgres_session_factory() as session:
-        event = await session.scalar(
-            select(AnalyticsEvent).where(AnalyticsEvent.event_type == AnalyticsEventType.MEME_SEND)
+        events = (
+            await session.execute(
+                select(AnalyticsEvent).where(
+                    AnalyticsEvent.event_type.in_(
+                        [
+                            AnalyticsEventType.INLINE_CHOSEN,
+                            AnalyticsEventType.INLINE_SENT,
+                            AnalyticsEventType.MEME_SEND,
+                        ]
+                    )
+                )
+            )
+        ).scalars().all()
+    events_by_type = {event.event_type: event for event in events}
+    assert set(events_by_type) == {
+        AnalyticsEventType.INLINE_CHOSEN,
+        AnalyticsEventType.INLINE_SENT,
+        AnalyticsEventType.MEME_SEND,
+    }
+    for event in events_by_type.values():
+        assert event.user_id is None
+        properties = _analytics_properties(event)
+        refs = _analytics_refs(event)
+        assert event.payload["surface"] == "telegram_inline"
+        assert refs == {"meme_file_id": str(file.id), "meme_id": str(meme.id)}
+        assert event.payload["query"] == "cats"
+        assert event.payload["impression_id"] == "imp_chosen_1"
+        assert properties["result_id"] == result_id
+        assert (
+            properties["telegram_user_hash"]
+            == hashlib.sha256(f"telegram_user:{TELEGRAM_ID}".encode()).hexdigest()
         )
-    assert event is not None
-    assert event.user_id is None
-    assert event.payload["meme_id"] == str(meme.id)
-    assert event.payload["meme_file_id"] == str(file.id)
-    assert event.payload["result_id"] == result_id
-    assert event.payload["impression_id"] == "imp_chosen_1"
-    assert event.payload["telegram_user_hash"] == hashlib.sha256(f"telegram_user:{TELEGRAM_ID}".encode()).hexdigest()
-    assert "telegram_user_id" not in event.payload
+        assert "telegram_user_id" not in properties
 
 
 @pytest.mark.asyncio
@@ -1280,10 +1451,28 @@ async def test_inline_library_callbacks_call_collection_service_paths(
         saved_meme_ids = await session.scalars(select(CollectionMeme.meme_id).order_by(CollectionMeme.meme_id.asc()))
         pinned_meme_ids = await session.scalars(select(PinnedMeme.meme_id).where(PinnedMeme.user_id == linked_user.id))
         like_count = await session.scalar(select(Meme.like_count).where(Meme.id == favorite_meme.id))
+        events = (
+            await session.execute(
+                select(AnalyticsEvent).where(
+                    AnalyticsEvent.event_type.in_(
+                        [AnalyticsEventType.MEME_LIKE, AnalyticsEventType.MEME_SAVE, AnalyticsEventType.MEME_PIN]
+                    )
+                )
+            )
+        ).scalars().all()
 
     assert set(saved_meme_ids) == {favorite_meme.id, save_meme.id}
     assert list(pinned_meme_ids) == [favorite_meme.id]
     assert like_count == 1
+    events_by_type = {event.event_type: event for event in events}
+    like_event = events_by_type[AnalyticsEventType.MEME_LIKE]
+    save_event = events_by_type[AnalyticsEventType.MEME_SAVE]
+    pin_event = events_by_type[AnalyticsEventType.MEME_PIN]
+    assert events_by_type[AnalyticsEventType.MEME_LIKE].payload["surface"] == "telegram_inline_library"
+    assert _analytics_refs(like_event)["meme_id"] == str(favorite_meme.id)
+    assert _analytics_properties(like_event)["action"] == "fav"
+    assert _analytics_refs(save_event)["meme_id"] == str(save_meme.id)
+    assert _analytics_refs(pin_event)["meme_id"] == str(favorite_meme.id)
 
 
 @pytest.mark.asyncio

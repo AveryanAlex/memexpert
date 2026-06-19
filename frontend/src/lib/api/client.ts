@@ -102,6 +102,7 @@ interface MemeActionRequest {
   onResponse?: (response: Response) => void;
   memeId: string;
   body?: unknown;
+  keepalive?: boolean;
 }
 
 interface MemeReportRequest extends MemeActionRequest {
@@ -457,6 +458,14 @@ export async function recordMemeShare(request: MemeActionRequest): Promise<MemeI
   return apiMutation<MemeInteractionRecordedResponse>(`/api/v1/memes/${encodeURIComponent(request.memeId)}/share`, 'POST', request);
 }
 
+export async function recordMemeImpression(request: MemeActionRequest): Promise<MemeInteractionRecordedResponse> {
+  return apiMutation<MemeInteractionRecordedResponse>(`/api/v1/memes/${encodeURIComponent(request.memeId)}/impression`, 'POST', request);
+}
+
+export async function recordMemeDetailClick(request: MemeActionRequest): Promise<MemeInteractionRecordedResponse> {
+  return apiMutation<MemeInteractionRecordedResponse>(`/api/v1/memes/${encodeURIComponent(request.memeId)}/detail-click`, 'POST', request);
+}
+
 export async function recordMemeDownload(request: MemeActionRequest): Promise<MemeInteractionRecordedResponse> {
   return apiMutation<MemeInteractionRecordedResponse>(`/api/v1/memes/${encodeURIComponent(request.memeId)}/download`, 'POST', request);
 }
@@ -734,6 +743,7 @@ async function apiMutation<T>(path: string, method: 'DELETE' | 'POST', request: 
     method,
     headers,
     credentials: 'include',
+    keepalive: request.keepalive,
     body: body === undefined ? undefined : JSON.stringify(body)
   });
   request.onResponse?.(response);

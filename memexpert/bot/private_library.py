@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
 from aiogram import F, Router
@@ -12,9 +13,10 @@ from aiogram.filters import Command, CommandObject
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from sqlalchemy import select
 
+from memexpert.bot.analytics import record_telegram_interaction_event, telegram_user_hash
 from memexpert.core.config import Settings, get_settings
 from memexpert.core.database import get_async_session_factory
-from memexpert.models.enums import AccountStatus, AccountType, CollectionKind
+from memexpert.models.enums import AccountStatus, AccountType, AnalyticsEventType, CollectionKind
 from memexpert.models.user import User
 from memexpert.services import (
     CollectionService,
@@ -70,6 +72,13 @@ class PrivateLibraryCollectionService(Protocol):
 
 
 type PrivateLibraryCollectionServiceFactory = Callable[[AsyncSession], PrivateLibraryCollectionService]
+
+
+@dataclass(frozen=True, slots=True)
+class _CallbackActionResult:
+    text: str
+    keyboard: InlineKeyboardMarkup
+    analytics_event: dict[str, object] | None = None
 
 
 def build_private_library_router(
@@ -168,6 +177,14 @@ async def show_library_menu(
         except (CollectionServiceError, MemeNotFoundError, UserNotFoundError) as exc:
             await message.answer(_service_error_message(exc))
             return
+        await _record_library_event(
+            session,
+            _library_click_event(
+                user_id=user.id,
+                telegram_user_hash_value=_message_telegram_user_hash(message),
+                action="menu",
+            ),
+        )
 
     await message.answer(_render_menu(library), reply_markup=_menu_keyboard())
 
@@ -259,6 +276,15 @@ async def create_collection(
         except (CollectionServiceError, MemeNotFoundError, UserNotFoundError) as exc:
             await message.answer(_service_error_message(exc))
             return
+        await _record_library_event(
+            session,
+            _library_collection_event(
+                user_id=user.id,
+                telegram_user_hash_value=_message_telegram_user_hash(message),
+                action="collection_create",
+                collection_id=collection.id,
+            ),
+        )
 
     await message.answer(
         f"Коллекция создана: {collection.title}",
@@ -286,13 +312,21 @@ async def handle_library_callback(
     async with session_factory() as session:
         service = collection_service_factory(session)
         try:
-            text, keyboard = await _handle_callback_action(service=service, user=user, action=action, args=args)
+            result = await _handle_callback_action(
+                service=service,
+                user=user,
+                action=action,
+                args=args,
+                telegram_user_hash_value=_callback_telegram_user_hash(callback_query),
+            )
         except (CollectionServiceError, MemeNotFoundError, UserNotFoundError) as exc:
             logger.info("Telegram private library callback rejected: %s", exc)
             await callback_query.answer(_service_error_message(exc), show_alert=True)
             return
+        if result.analytics_event is not None:
+            await _record_library_event(session, result.analytics_event)
 
-    callback_answered = await _edit_or_answer_callback(callback_query, text=text, reply_markup=keyboard)
+    callback_answered = await _edit_or_answer_callback(callback_query, text=result.text, reply_markup=result.keyboard)
     if not callback_answered:
         await callback_query.answer()
 
@@ -317,6 +351,16 @@ async def _send_listing(
         except (CollectionServiceError, MemeNotFoundError, UserNotFoundError) as exc:
             await message.answer(_service_error_message(exc))
             return
+        await _record_library_event(
+            session,
+            _library_click_event(
+                user_id=user.id,
+                telegram_user_hash_value=_message_telegram_user_hash(message),
+                action="list",
+                section=section,
+                page=page,
+            ),
+        )
 
     await message.answer(text, reply_markup=keyboard)
 
@@ -327,73 +371,182 @@ async def _handle_callback_action(
     user: User,
     action: str,
     args: list[str],
-) -> tuple[str, InlineKeyboardMarkup]:
+    telegram_user_hash_value: str | None,
+) -> _CallbackActionResult:
     if action == "m":
         library = await service.get_meme_library(user_id=user.id)
-        return _render_menu(library), _menu_keyboard()
+        return _callback_result(
+            _render_menu(library),
+            _menu_keyboard(),
+            _library_click_event(
+                user_id=user.id,
+                telegram_user_hash_value=telegram_user_hash_value,
+                action="menu",
+            ),
+        )
     if action in {"f", "p", "a", "c"}:
-        return await _render_section(
+        section = _section_for_action(action)
+        page = _parse_page(args)
+        text, keyboard = await _render_section(
             service=service,
             user_id=user.id,
-            section=_section_for_action(action),
-            page=_parse_page(args),
+            section=section,
+            page=page,
+        )
+        return _callback_result(
+            text,
+            keyboard,
+            _library_click_event(
+                user_id=user.id,
+                telegram_user_hash_value=telegram_user_hash_value,
+                action="list",
+                section=section,
+                page=page,
+            ),
         )
     if action == "uf":
         meme_id = _parse_uuid_arg(args, 0)
         page = _parse_page(args[1:])
         if meme_id is None:
-            return _stale_button_response()
+            return _stale_callback_result()
         _ = await service.unfavorite_meme(user_id=user.id, meme_id=meme_id)
-        return await _render_section(service=service, user_id=user.id, section="favorites", page=page)
+        text, keyboard = await _render_section(service=service, user_id=user.id, section="favorites", page=page)
+        return _callback_result(
+            text,
+            keyboard,
+            _library_meme_event(
+                event_type=AnalyticsEventType.MEME_LIKE,
+                user_id=user.id,
+                telegram_user_hash_value=telegram_user_hash_value,
+                action="unfavorite",
+                meme_id=meme_id,
+            ),
+        )
     if action == "rs":
         meme_id = _parse_uuid_arg(args, 0)
         page = _parse_page(args[1:])
         if meme_id is None:
-            return _stale_button_response()
+            return _stale_callback_result()
         _ = await service.remove_meme_from_active_collection(user_id=user.id, meme_id=meme_id)
-        return await _render_section(service=service, user_id=user.id, section="active", page=page)
+        text, keyboard = await _render_section(service=service, user_id=user.id, section="active", page=page)
+        return _callback_result(
+            text,
+            keyboard,
+            _library_meme_event(
+                event_type=AnalyticsEventType.MEME_SAVE,
+                user_id=user.id,
+                telegram_user_hash_value=telegram_user_hash_value,
+                action="remove_save",
+                meme_id=meme_id,
+                collection_id=user.active_save_collection_id,
+            ),
+        )
     if action == "pn":
         meme_id = _parse_uuid_arg(args, 0)
         section, page = _parse_return_target(args[1:])
         if meme_id is None:
-            return _stale_button_response()
+            return _stale_callback_result()
         _ = await service.pin_meme(user_id=user.id, meme_id=meme_id)
-        return await _render_section(service=service, user_id=user.id, section=section, page=page)
+        text, keyboard = await _render_section(service=service, user_id=user.id, section=section, page=page)
+        return _callback_result(
+            text,
+            keyboard,
+            _library_meme_event(
+                event_type=AnalyticsEventType.MEME_PIN,
+                user_id=user.id,
+                telegram_user_hash_value=telegram_user_hash_value,
+                action="pin",
+                meme_id=meme_id,
+            ),
+        )
     if action == "up":
         meme_id = _parse_uuid_arg(args, 0)
         section, page = _parse_return_target(args[1:])
         if meme_id is None:
-            return _stale_button_response()
+            return _stale_callback_result()
         _ = await service.unpin_meme(user_id=user.id, meme_id=meme_id)
-        return await _render_section(service=service, user_id=user.id, section=section, page=page)
+        text, keyboard = await _render_section(service=service, user_id=user.id, section=section, page=page)
+        return _callback_result(
+            text,
+            keyboard,
+            _library_meme_event(
+                event_type=AnalyticsEventType.MEME_PIN,
+                user_id=user.id,
+                telegram_user_hash_value=telegram_user_hash_value,
+                action="unpin",
+                meme_id=meme_id,
+            ),
+        )
     if action in {"pu", "pd"}:
         meme_id = _parse_uuid_arg(args, 0)
         page = _parse_page(args[1:])
         if meme_id is None:
-            return _stale_button_response()
-        await _move_pin(service=service, user_id=user.id, meme_id=meme_id, direction=-1 if action == "pu" else 1)
-        return await _render_section(service=service, user_id=user.id, section="pins", page=page)
+            return _stale_callback_result()
+        moved = await _move_pin(
+            service=service,
+            user_id=user.id,
+            meme_id=meme_id,
+            direction=-1 if action == "pu" else 1,
+        )
+        text, keyboard = await _render_section(service=service, user_id=user.id, section="pins", page=page)
+        return _callback_result(
+            text,
+            keyboard,
+            _library_meme_event(
+                event_type=AnalyticsEventType.MEME_PIN,
+                user_id=user.id,
+                telegram_user_hash_value=telegram_user_hash_value,
+                action="reorder_pin",
+                meme_id=meme_id,
+                extra_properties={"direction": "up" if action == "pu" else "down"},
+            )
+            if moved
+            else None,
+        )
     if action == "as":
         collection_id = _parse_uuid_arg(args, 0)
         page = _parse_page(args[1:])
         if collection_id is None:
-            return _stale_button_response()
+            return _stale_callback_result()
         _ = await service.update_active_save_collection(user_id=user.id, collection_id=collection_id)
-        return await _render_section(service=service, user_id=user.id, section="collections", page=page)
+        text, keyboard = await _render_section(service=service, user_id=user.id, section="collections", page=page)
+        return _callback_result(
+            text,
+            keyboard,
+            _library_collection_event(
+                user_id=user.id,
+                telegram_user_hash_value=telegram_user_hash_value,
+                action="set_active_collection",
+                collection_id=collection_id,
+            ),
+        )
     if action == "cd":
         collection_id = _parse_uuid_arg(args, 0)
         page = _parse_page(args[1:])
         if collection_id is None:
-            return _stale_button_response()
+            return _stale_callback_result()
         collections = await service.list_collections_for_user(user_id=user.id)
         collection = next((item for item in collections if item.id == collection_id), None)
         if collection is None:
-            return "Коллекция не найдена.", _single_button_keyboard("Коллекции", _callback("c", page))
+            return _callback_result("Коллекция не найдена.", _single_button_keyboard("Коллекции", _callback("c", page)))
         if collection.kind is CollectionKind.FAVORITES:
-            return "Favorites нельзя удалить.", _collections_keyboard(collections, active_collection_id=None, page=page)
+            return _callback_result(
+                "Favorites нельзя удалить.",
+                _collections_keyboard(collections, active_collection_id=None, page=page),
+            )
         _ = await service.delete_custom_collection(collection_id=collection_id, user_id=user.id)
-        return await _render_section(service=service, user_id=user.id, section="collections", page=page)
-    return _stale_button_response()
+        text, keyboard = await _render_section(service=service, user_id=user.id, section="collections", page=page)
+        return _callback_result(
+            text,
+            keyboard,
+            _library_collection_event(
+                user_id=user.id,
+                telegram_user_hash_value=telegram_user_hash_value,
+                action="collection_delete",
+                collection_id=collection_id,
+            ),
+        )
+    return _stale_callback_result()
 
 
 async def _render_section(
@@ -435,18 +588,127 @@ async def _move_pin(
     user_id: uuid.UUID,
     meme_id: uuid.UUID,
     direction: int,
-) -> None:
+) -> bool:
     pins = await service.list_pinned_memes(user_id=user_id)
     meme_ids = [pin.meme_id for pin in pins]
     try:
         index = meme_ids.index(meme_id)
     except ValueError:
-        return
+        return False
     target_index = index + direction
     if target_index < 0 or target_index >= len(meme_ids):
-        return
+        return False
     meme_ids[index], meme_ids[target_index] = meme_ids[target_index], meme_ids[index]
     _ = await service.reorder_pins(user_id=user_id, meme_ids=meme_ids)
+    return True
+
+
+async def _record_library_event(session: AsyncSession, event: dict[str, object]) -> None:
+    refs = event.get("refs")
+    if not isinstance(refs, dict):
+        refs = {}
+    event_type = event.get("event_type")
+    await record_telegram_interaction_event(
+        session,
+        event,
+        log_context={
+            "analytics_event_type": getattr(event_type, "value", str(event_type)),
+            "surface": event.get("surface"),
+            "user_id": str(event.get("user_id")) if event.get("user_id") else None,
+            "collection_id": str(refs.get("collection_id")) if refs.get("collection_id") else None,
+            "meme_id": str(refs.get("meme_id")) if refs.get("meme_id") else None,
+        },
+    )
+
+
+def _callback_result(
+    text: str,
+    keyboard: InlineKeyboardMarkup,
+    analytics_event: dict[str, object] | None = None,
+) -> _CallbackActionResult:
+    return _CallbackActionResult(text=text, keyboard=keyboard, analytics_event=analytics_event)
+
+
+def _stale_callback_result() -> _CallbackActionResult:
+    text, keyboard = _stale_button_response()
+    return _callback_result(text, keyboard)
+
+
+def _message_telegram_user_hash(message: Message) -> str | None:
+    telegram_user = message.from_user
+    if telegram_user is None or telegram_user.id <= 0:
+        return None
+    return telegram_user_hash(telegram_user.id)
+
+
+def _callback_telegram_user_hash(callback_query: CallbackQuery) -> str | None:
+    if callback_query.from_user.id <= 0:
+        return None
+    return telegram_user_hash(callback_query.from_user.id)
+
+
+def _library_click_event(
+    *,
+    user_id: uuid.UUID,
+    telegram_user_hash_value: str | None,
+    action: str,
+    section: str | None = None,
+    page: int | None = None,
+) -> dict[str, object]:
+    properties: dict[str, object] = {"action": action}
+    if telegram_user_hash_value is not None:
+        properties["telegram_user_hash"] = telegram_user_hash_value
+    if section is not None:
+        properties["section"] = section
+    if page is not None:
+        properties["page"] = page
+    return {
+        "event_type": AnalyticsEventType.CLICK,
+        "user_id": user_id,
+        "surface": "telegram_pm_library",
+        "properties": properties,
+    }
+
+
+def _library_collection_event(
+    *,
+    user_id: uuid.UUID,
+    telegram_user_hash_value: str | None,
+    action: str,
+    collection_id: uuid.UUID,
+) -> dict[str, object]:
+    properties: dict[str, object] = {"action": action}
+    if telegram_user_hash_value is not None:
+        properties["telegram_user_hash"] = telegram_user_hash_value
+    return {
+        "event_type": AnalyticsEventType.COLLECTION_ACTION,
+        "user_id": user_id,
+        "surface": "telegram_pm_library",
+        "refs": {"collection_id": collection_id},
+        "properties": properties,
+    }
+
+
+def _library_meme_event(
+    *,
+    event_type: AnalyticsEventType,
+    user_id: uuid.UUID,
+    telegram_user_hash_value: str | None,
+    action: str,
+    meme_id: uuid.UUID,
+    collection_id: uuid.UUID | None = None,
+    extra_properties: dict[str, object] | None = None,
+) -> dict[str, object]:
+    properties: dict[str, object] = {"action": action, **(extra_properties or {})}
+    if telegram_user_hash_value is not None:
+        properties["telegram_user_hash"] = telegram_user_hash_value
+    return {
+        "event_type": event_type,
+        "user_id": user_id,
+        "surface": "telegram_pm_library",
+        "refs": {"collection_id": collection_id, "meme_id": meme_id},
+        "properties": properties,
+    }
 
 
 async def _resolve_user_for_message(

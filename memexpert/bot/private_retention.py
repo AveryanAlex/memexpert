@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections import Counter
 from collections.abc import Callable
 from typing import TYPE_CHECKING
@@ -11,12 +12,19 @@ from aiogram.filters import Command, CommandObject
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from sqlalchemy import func, select
 
+from memexpert.bot.analytics import record_telegram_interaction_event, telegram_user_hash
 from memexpert.core.config import Settings, get_settings
 from memexpert.core.database import get_async_session_factory
 from memexpert.models.base import utcnow
 from memexpert.models.collection import Collection, CollectionMeme, PinnedMeme
 from memexpert.models.content import Meme
-from memexpert.models.enums import AccountStatus, ChannelSuggestionStatus, CollectionKind, UserLanguage
+from memexpert.models.enums import (
+    AccountStatus,
+    AnalyticsEventType,
+    ChannelSuggestionStatus,
+    CollectionKind,
+    UserLanguage,
+)
 from memexpert.models.user import ChannelSuggestion, InlineUsageEvent, User
 from memexpert.services import (
     ChannelSuggestionService,
@@ -34,6 +42,7 @@ if TYPE_CHECKING:
     from memexpert.schemas.user import UserRead
 
 CALLBACK_PREFIX = "pmr"
+logger = logging.getLogger(__name__)
 
 type ChannelSuggestionServiceFactory = Callable[[AsyncSession], ChannelSuggestionService]
 type UserServiceFactory = Callable[[AsyncSession], UserService]
@@ -91,7 +100,7 @@ def build_private_retention_router(
 
     @router.message(F.chat.type == "private", Command("miniapp"))
     async def handle_miniapp(message: Message) -> None:
-        await show_miniapp_links(message=message, settings=resolved_settings)
+        await show_miniapp_links(message=message, settings=resolved_settings, session_factory=resolved_session_factory)
 
     @router.message(F.chat.type == "private", Command("stats"))
     async def handle_stats(message: Message) -> None:
@@ -136,6 +145,15 @@ async def handle_settings_callback(
             else:
                 await callback_query.answer("Эта кнопка устарела.", show_alert=True)
                 return
+            await _record_retention_event(
+                session,
+                _settings_click_event(
+                    user_id=user.id,
+                    telegram_user_id=callback_query.from_user.id,
+                    action=action,
+                    value=value,
+                ),
+            )
     except ValueError:
         await callback_query.answer("Эта кнопка устарела.", show_alert=True)
         return
@@ -192,6 +210,22 @@ async def suggest_channel(
             f"URL: {suggestion.channel_url}\n"
             f"Текущий статус: {suggestion.status.value}"
         )
+    await _record_retention_event_with_factory(
+        session_factory,
+        {
+            "event_type": AnalyticsEventType.CHANNEL_SUGGEST,
+            "user_id": user.id,
+            "surface": "telegram_pm_settings",
+            "refs": {"channel_suggestion_id": suggestion.id},
+            "properties": {
+                "action": "suggest_channel",
+                "status": suggestion.status.value,
+                "platform": suggestion.platform.value,
+                "created": result.created,
+                "telegram_user_hash": _message_telegram_user_hash(message),
+            },
+        },
+    )
 
 
 async def show_account_status(
@@ -211,12 +245,23 @@ async def show_account_status(
     await message.answer(_render_account_status(user, settings=settings), reply_markup=_miniapp_keyboard(settings))
 
 
-async def show_miniapp_links(*, message: Message, settings: Settings) -> None:
+async def show_miniapp_links(*, message: Message, settings: Settings, session_factory: AsyncSessionFactory) -> None:
     bot_username = _bot_username(settings)
     if bot_username is None:
         await message.answer("Mini App ссылки недоступны: auth_telegram_bot_username не настроен.")
         return
     await message.answer(_render_miniapp_links(bot_username), reply_markup=_miniapp_keyboard(settings))
+    await _record_retention_event_with_factory(
+        session_factory,
+        {
+            "event_type": AnalyticsEventType.MINIAPP_OPEN,
+            "surface": "telegram_pm_miniapp",
+            "properties": {
+                "action": "link_display",
+                "telegram_user_hash": _message_telegram_user_hash(message),
+            },
+        },
+    )
 
 
 async def show_stats(*, message: Message, session_factory: AsyncSessionFactory) -> None:
@@ -325,6 +370,63 @@ async def _load_stats(session: AsyncSession, *, user: User) -> dict[str, object]
 async def _count(session: AsyncSession, stmt: Executable) -> int:
     value = await session.scalar(stmt)
     return int(value or 0)
+
+
+async def _record_retention_event_with_factory(
+    session_factory: AsyncSessionFactory,
+    event: dict[str, object],
+) -> None:
+    try:
+        async with session_factory() as session:
+            await _record_retention_event(session, event)
+    except Exception:
+        logger.exception(
+            "Telegram retention telemetry setup failed.",
+            extra={
+                "event": "telegram_analytics_session_failed",
+                "surface": event.get("surface"),
+                "analytics_event_type": getattr(event.get("event_type"), "value", str(event.get("event_type"))),
+            },
+        )
+
+
+async def _record_retention_event(session: AsyncSession, event: dict[str, object]) -> None:
+    refs = event.get("refs")
+    if not isinstance(refs, dict):
+        refs = {}
+    event_type = event.get("event_type")
+    await record_telegram_interaction_event(
+        session,
+        event,
+        log_context={
+            "analytics_event_type": getattr(event_type, "value", str(event_type)),
+            "surface": event.get("surface"),
+            "user_id": str(event.get("user_id")) if event.get("user_id") else None,
+            "channel_suggestion_id": (
+                str(refs.get("channel_suggestion_id")) if refs.get("channel_suggestion_id") else None
+            ),
+        },
+    )
+
+
+def _settings_click_event(*, user_id: object, telegram_user_id: int, action: str, value: str) -> dict[str, object]:
+    return {
+        "event_type": AnalyticsEventType.CLICK,
+        "user_id": user_id,
+        "surface": "telegram_pm_settings",
+        "properties": {
+            "action": action,
+            "value": value,
+            "telegram_user_hash": telegram_user_hash(telegram_user_id),
+        },
+    }
+
+
+def _message_telegram_user_hash(message: Message) -> str | None:
+    telegram_user = message.from_user
+    if telegram_user is None or telegram_user.id <= 0:
+        return None
+    return telegram_user_hash(telegram_user.id)
 
 
 def _render_settings(user: User | UserRead) -> str:

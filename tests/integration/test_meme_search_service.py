@@ -589,6 +589,8 @@ async def test_public_openapi_registers_catalog_routes_without_internal_surface(
     assert "/api/v1/memes/{meme_id}/canonical" in paths
     assert "/api/v1/memes/{meme_id}/popularity" in paths
     assert "/api/v1/memes/{meme_id}/similar" in paths
+    assert "/api/v1/memes/{meme_id}/impression" in paths
+    assert "/api/v1/memes/{meme_id}/detail-click" in paths
     assert "/api/v1/memes/{meme_id}" in paths
     search_parameter_list = paths["/api/v1/memes/search"]["get"]["parameters"]
     browse_parameter_list = paths["/api/v1/memes/browse"]["get"]["parameters"]

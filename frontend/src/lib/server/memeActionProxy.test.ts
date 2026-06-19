@@ -98,4 +98,40 @@ describe('meme action proxy', () => {
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toEqual({ id: 'report-1' });
   });
+
+  it('forwards list-card telemetry attribution bodies', async () => {
+    const calls: Array<{ path: string; body: unknown; contentType: string | null }> = [];
+    const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const headers = new Headers(init?.headers);
+      calls.push({ path: url.pathname, body: JSON.parse(String(init?.body)), contentType: headers.get('content-type') });
+
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' }
+      });
+    }) satisfies ProxyFetch;
+    const body = { attribution: { request_id: 'req-list', impression_id: 'imp-list', rank: 3 } };
+
+    for (const action of ['impression', 'detail-click'] as const) {
+      const response = await proxyMemeAction({
+        fetch: mockFetch,
+        request: new Request(`https://web.memexpert.test/api/v1/memes/meme-123/${action}`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body)
+        }),
+        apiBaseUrl: 'https://api.memexpert.test',
+        memeId: 'meme-123',
+        action,
+        method: 'POST'
+      });
+      expect(response.status).toBe(200);
+    }
+
+    expect(calls).toEqual([
+      { path: '/api/v1/memes/meme-123/impression', body, contentType: 'application/json' },
+      { path: '/api/v1/memes/meme-123/detail-click', body, contentType: 'application/json' }
+    ]);
+  });
 });

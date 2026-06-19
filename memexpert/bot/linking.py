@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from aiogram import Router
 from aiogram.filters import CommandObject, CommandStart
 
+from memexpert.bot.analytics import record_telegram_interaction_event, telegram_user_hash
 from memexpert.core.config import Settings, get_settings
 from memexpert.core.database import get_async_session_factory
 from memexpert.models.base import utcnow
+from memexpert.models.enums import AnalyticsEventType
 from memexpert.services import (
     AccountLinkAlreadyCompletedError,
     AccountLinkInvariantError,
@@ -33,6 +36,7 @@ if TYPE_CHECKING:
 type AccountLinkServiceFactory = Callable[[AsyncSession], AccountLinkService]
 
 BOT_LINK_REDEMPTION_TIMEOUT_SECONDS = 10.0
+logger = logging.getLogger(__name__)
 
 
 def build_linking_router(
@@ -82,6 +86,18 @@ async def handle_start_command(
     normalized_argument = (start_argument or "").strip()
     if not normalized_argument or not normalized_argument.startswith(TELEGRAM_LINK_START_PREFIX):
         await message.answer(_build_help_message(return_url=return_url))
+        await _record_start_event_with_factory(
+            session_factory,
+            {
+                "event_type": AnalyticsEventType.CLICK,
+                "surface": "telegram_pm_start",
+                "properties": {
+                    "action": "help_display",
+                    "has_start_argument": bool(normalized_argument),
+                    "telegram_user_hash": _message_telegram_user_hash(message),
+                },
+            },
+        )
         return
 
     telegram_id = _extract_telegram_id(message)
@@ -113,6 +129,24 @@ async def handle_start_command(
         return
 
     await message.answer(_build_success_message(link_result=link_result, return_url=return_url))
+    await _record_start_event_with_factory(
+        session_factory,
+        {
+            "event_type": AnalyticsEventType.AUTH_EVENT,
+            "user_id": link_result.canonical_user_id,
+            "surface": "telegram_pm_start",
+            "refs": {
+                "account_merge_log_id": link_result.merge_log_id,
+                "source_user_id": link_result.guest_user_id,
+                "target_user_id": link_result.canonical_user_id,
+            },
+            "properties": {
+                "action": "telegram_link_redeemed",
+                "merge_performed": link_result.merge_performed,
+                "telegram_user_hash": telegram_user_hash(telegram_id),
+            },
+        },
+    )
 
 
 def _extract_telegram_id(message: Message) -> int | None:
@@ -120,6 +154,48 @@ def _extract_telegram_id(message: Message) -> int | None:
     if telegram_user is None or telegram_user.id <= 0:
         return None
     return telegram_user.id
+
+
+async def _record_start_event_with_factory(
+    session_factory: AsyncSessionFactory,
+    event: dict[str, object],
+) -> None:
+    try:
+        async with session_factory() as session:
+            await _record_start_event(session, event)
+    except Exception:
+        logger.exception(
+            "Telegram start telemetry setup failed.",
+            extra={
+                "event": "telegram_analytics_session_failed",
+                "surface": event.get("surface"),
+                "analytics_event_type": getattr(event.get("event_type"), "value", str(event.get("event_type"))),
+            },
+        )
+
+
+async def _record_start_event(session: AsyncSession, event: dict[str, object]) -> None:
+    refs = event.get("refs")
+    if not isinstance(refs, dict):
+        refs = {}
+    event_type = event.get("event_type")
+    await record_telegram_interaction_event(
+        session,
+        event,
+        log_context={
+            "analytics_event_type": getattr(event_type, "value", str(event_type)),
+            "surface": event.get("surface"),
+            "user_id": str(event.get("user_id")) if event.get("user_id") else None,
+            "account_merge_log_id": str(refs.get("account_merge_log_id")) if refs.get("account_merge_log_id") else None,
+        },
+    )
+
+
+def _message_telegram_user_hash(message: Message) -> str | None:
+    telegram_id = _extract_telegram_id(message)
+    if telegram_id is None:
+        return None
+    return telegram_user_hash(telegram_id)
 
 
 def _build_help_message(*, return_url: str) -> str:

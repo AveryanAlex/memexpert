@@ -20,6 +20,7 @@ from memexpert.models.collection import Collection, CollectionMeme, PinnedMeme
 from memexpert.models.content import Meme, MemeFile
 from memexpert.models.enums import (
     AccountStatus,
+    AnalyticsEventType,
     CollectionKind,
     CollectionMembershipRole,
     CollectionVisibility,
@@ -27,7 +28,7 @@ from memexpert.models.enums import (
     ContentLanguage,
     ContentProcessingStatus,
 )
-from memexpert.models.user import User
+from memexpert.models.user import AnalyticsEvent, User
 from memexpert.schemas import CollectionMemeRead, CollectionRead, CollectionSummaryRead, MemeLibraryRead, PinnedMemeRead
 from memexpert.services import CollectionService, CollectionWriteAccessError, UserService
 from tests.conftest import create_full_user_via_upgrade
@@ -315,6 +316,14 @@ def collection_read(
 
 def _as_uuid(value: object) -> uuid.UUID:
     return cast("uuid.UUID", value)
+
+
+def _analytics_properties(event: AnalyticsEvent) -> dict[str, object]:
+    return cast("dict[str, object]", event.payload["properties"])
+
+
+def _analytics_refs(event: AnalyticsEvent) -> dict[str, object]:
+    return cast("dict[str, object]", event.payload["refs"])
 
 
 def _summary_for(collection: CollectionRead) -> CollectionSummaryRead:
@@ -644,11 +653,21 @@ async def test_private_library_create_set_active_and_delete_collections_keep_fav
         )
         favorites_exists = await session.scalar(select(Collection.id).where(Collection.id == favorites.id))
         custom_exists = await session.scalar(select(Collection.id).where(Collection.id == custom_id))
+        analytics_events = (
+            await session.execute(
+                select(AnalyticsEvent).where(AnalyticsEvent.event_type == AnalyticsEventType.COLLECTION_ACTION)
+            )
+        ).scalars().all()
 
     assert "Коллекция создана: Bot saves" in str(last_message(telegram_session).text)
     assert active_collection_id is None
     assert favorites_exists == favorites.id
     assert custom_exists is None
+    events_by_action = {_analytics_properties(event)["action"]: event for event in analytics_events}
+    assert _analytics_refs(events_by_action["collection_create"])["collection_id"] == str(custom_id)
+    assert _analytics_refs(events_by_action["set_active_collection"])["collection_id"] == str(custom_id)
+    assert _analytics_refs(events_by_action["collection_delete"])["collection_id"] == str(custom_id)
+    assert events_by_action["collection_create"].payload["surface"] == "telegram_pm_library"
     assert any(
         isinstance(method, EditMessageText) and "Favorites нельзя удалить" in str(method.text)
         for method in telegram_session.sent_methods

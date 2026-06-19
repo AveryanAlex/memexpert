@@ -31,11 +31,16 @@ test('guest discovers a public meme with URL-backed filters and imgproxy media',
 test('guest opens an attributed search result and exercises detail actions', async ({ app, seed }) => {
   const cat = seededByCategory(seed, 'cat');
 
+  const impressionRequest = app.search.waitForResultImpressionPost(cat);
   await app.search.gotoFilters({ query: cat.query, tag: 'e2e-prd', mediaType: 'image', language: 'en', includeNsfw: false });
   await app.search.expectResultVisible(cat);
   const attribution = await app.search.attributionForResult(cat);
+  await app.search.scrollResultIntoView(cat);
+  await app.search.expectResultImpressionAttribution(impressionRequest, attribution);
 
+  const detailClickRequest = app.search.waitForResultDetailClickPost(cat);
   await app.search.openResult(cat);
+  await app.search.expectResultDetailClickAttribution(detailClickRequest, attribution);
   await app.detail.expectOpen(cat);
   await app.detail.expectAttributionQuery(attribution);
 

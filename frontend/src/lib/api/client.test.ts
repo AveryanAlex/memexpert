@@ -32,7 +32,9 @@ import {
   fetchTrendTimeline,
   fetchTrendPage,
   pinMeme,
+  recordMemeDetailClick,
   recordMemeDownload,
+  recordMemeImpression,
   recordMemeShare,
   refreshCurrentSession,
   removeCollectionMember,
@@ -447,12 +449,14 @@ describe('catalog API client', () => {
       expect(headers.get('content-type')).toBe('application/json');
       expect(JSON.parse(String(init?.body))).toEqual({ attribution: actionAttribution() });
 
-      return jsonResponse(url.pathname.endsWith('/share') || url.pathname.endsWith('/download') ? { ok: true } : { id: 'action-row-1' });
+      return jsonResponse(isTelemetryActionPath(url.pathname) ? { ok: true } : { id: 'action-row-1' });
     }) satisfies ApiFetch;
 
     await favoriteMeme({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', memeId: 'meme-123', body: { attribution: actionAttribution() } });
     await saveMeme({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', memeId: 'meme-123', body: { attribution: actionAttribution() } });
     await pinMeme({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', memeId: 'meme-123', body: { attribution: actionAttribution() } });
+    await recordMemeImpression({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', memeId: 'meme-123', body: { attribution: actionAttribution() } });
+    await recordMemeDetailClick({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', memeId: 'meme-123', body: { attribution: actionAttribution() } });
     await recordMemeShare({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', memeId: 'meme-123', body: { attribution: actionAttribution() } });
     await recordMemeDownload({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', memeId: 'meme-123', body: { attribution: actionAttribution() } });
 
@@ -460,9 +464,27 @@ describe('catalog API client', () => {
       '/api/v1/memes/meme-123/favorite',
       '/api/v1/memes/meme-123/save',
       '/api/v1/memes/meme-123/pin',
+      '/api/v1/memes/meme-123/impression',
+      '/api/v1/memes/meme-123/detail-click',
       '/api/v1/memes/meme-123/share',
       '/api/v1/memes/meme-123/download'
     ]);
+  });
+
+  it('passes keepalive through best-effort meme telemetry calls', async () => {
+    const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input), 'https://web.memexpert.test');
+
+      expect(url.pathname).toBe('/api/v1/memes/meme-123/impression');
+      expect(init?.method).toBe('POST');
+      expect(init?.keepalive).toBe(true);
+
+      return jsonResponse({ ok: true });
+    }) satisfies ApiFetch;
+
+    await recordMemeImpression({ fetch: mockFetch, memeId: 'meme-123', keepalive: true });
+
+    expect(mockFetch).toHaveBeenCalledOnce();
   });
 
   it('submits meme reports with JSON body and CSRF-compatible request header', async () => {
@@ -1179,6 +1201,10 @@ function actionAttribution(): MemeActionAttribution {
     score_components: { total: 0.92 },
     reason: 'similarity_match'
   };
+}
+
+function isTelemetryActionPath(pathname: string): boolean {
+  return ['/detail-click', '/download', '/impression', '/share'].some((suffix) => pathname.endsWith(suffix));
 }
 
 function memeCard(id: string, flags: Partial<MemeLibraryRead['favorites'][number]>): MemeLibraryRead['favorites'][number] {

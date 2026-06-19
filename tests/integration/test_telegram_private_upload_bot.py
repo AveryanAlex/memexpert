@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from aiogram.client.session.base import BaseSession
@@ -21,6 +21,7 @@ from memexpert.models.base import utcnow
 from memexpert.models.collection import CollectionMeme
 from memexpert.models.content import Meme, MemeFile
 from memexpert.models.enums import (
+    AnalyticsEventType,
     ContentKind,
     ContentLanguage,
     ContentProcessingStatus,
@@ -28,7 +29,7 @@ from memexpert.models.enums import (
     SourceAttachReason,
     SourcePlatform,
 )
-from memexpert.models.user import User
+from memexpert.models.user import AnalyticsEvent, User
 from memexpert.services import CollectionService, UserService
 from tests.conftest import create_full_user_via_upgrade
 
@@ -37,6 +38,14 @@ if TYPE_CHECKING:
 
     from aiogram import Bot, Dispatcher
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+
+def _analytics_properties(event: AnalyticsEvent) -> dict[str, object]:
+    return cast("dict[str, object]", event.payload["properties"])
+
+
+def _analytics_refs(event: AnalyticsEvent) -> dict[str, object]:
+    return cast("dict[str, object]", event.payload["refs"])
 
 
 BOT_TOKEN = "123456:telegram-upload-test-bot-token"
@@ -388,6 +397,21 @@ async def test_private_photo_upload_queues_raw_ingest_without_saving_active_coll
     assert accept_service.calls[0]["media_bytes"] == b"photo-bytes"
     assert "Результат появится" in last_bot_text(recording_session)
     assert await migrated_db_session.scalar(select(CollectionMeme.meme_id)) is None
+    async with postgres_session_factory() as session:
+        event = await session.scalar(
+            select(AnalyticsEvent).where(AnalyticsEvent.event_type == AnalyticsEventType.COLLECTION_ACTION)
+        )
+        active_collection_id = await session.scalar(select(User.active_save_collection_id).where(User.id == user.id))
+    assert event is not None
+    assert event.user_id == user.id
+    assert event.payload["surface"] == "telegram_pm_upload"
+    assert active_collection_id is not None
+    refs = _analytics_refs(event)
+    properties = _analytics_properties(event)
+    assert refs["collection_id"] == str(active_collection_id)
+    assert properties["action"] == "upload_queued"
+    assert properties["media_kind"] == "image"
+    assert properties["content_type"] == "image/jpeg"
 
 
 @pytest.mark.asyncio
@@ -429,6 +453,21 @@ async def test_private_upload_public_duplicate_saves_existing_public_meme(
     assert await migrated_db_session.scalar(
         select(CollectionMeme.meme_id).where(CollectionMeme.meme_id == public_meme.id)
     ) == public_meme.id
+    async with postgres_session_factory() as session:
+        event = await session.scalar(
+            select(AnalyticsEvent).where(AnalyticsEvent.event_type == AnalyticsEventType.MEME_SAVE)
+        )
+        active_collection_id = await session.scalar(select(User.active_save_collection_id).where(User.id == user.id))
+    assert event is not None
+    assert event.user_id == user.id
+    assert event.payload["surface"] == "telegram_pm_upload"
+    refs = _analytics_refs(event)
+    properties = _analytics_properties(event)
+    assert refs["meme_id"] == str(public_meme.id)
+    assert active_collection_id is not None
+    assert refs["collection_id"] == str(active_collection_id)
+    assert properties["action"] == "duplicate_saved"
+    assert properties["outcome"] == "resolved_sha_duplicate"
 
 
 @pytest.mark.asyncio
