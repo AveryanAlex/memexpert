@@ -139,6 +139,12 @@ from memexpert.workers.pipeline_runtime import (
     build_pipeline_runtime,
 )
 from memexpert.workers.pipeline_runtime.stage_registry import PIPELINE_STAGE_HANDLERS, RUNNABLE_DOWNSTREAM_STAGES
+from memexpert.workers.pipeline_runtime.stages.classify import run_classify_stage
+from memexpert.workers.pipeline_runtime.stages.embed import run_embed_stage
+from memexpert.workers.pipeline_runtime.stages.ocr import run_ocr_stage
+from memexpert.workers.pipeline_runtime.stages.sync_meili import run_sync_meili_stage
+from memexpert.workers.pipeline_runtime.stages.sync_qdrant import run_sync_qdrant_stage
+from memexpert.workers.pipeline_runtime.stages.transcode import run_transcode_stage
 
 if TYPE_CHECKING:
     from pytest import MonkeyPatch
@@ -839,30 +845,12 @@ def test_pipeline_runtime_stage_registry_covers_all_downstream_stages() -> None:
 
     assert frozenset(RUNNABLE_DOWNSTREAM_STAGES) == expected_stages
     assert frozenset(PIPELINE_STAGE_HANDLERS) == expected_stages
-    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.TRANSCODE].implementation_method_name == "_run_transcode_stage"
-    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.TRANSCODE].failure_hook_method_name == (
-        "_maybe_force_transcode_failure"
-    )
-    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.OCR].implementation_method_name == "_run_ocr_stage"
-    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.OCR].failure_hook_method_name is None
-    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.EMBED].implementation_method_name == "_run_embed_stage"
-    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.EMBED].failure_hook_method_name == "_maybe_force_embed_failure"
-    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.CLASSIFY].implementation_method_name == "_run_classify_stage"
-    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.CLASSIFY].failure_hook_method_name == (
-        "_maybe_force_classify_failure"
-    )
-    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.SYNC_QDRANT].implementation_method_name == (
-        "_run_sync_qdrant_stage"
-    )
-    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.SYNC_QDRANT].failure_hook_method_name == (
-        "_maybe_force_sync_qdrant_failure"
-    )
-    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.SYNC_MEILI].implementation_method_name == (
-        "_run_sync_meili_stage"
-    )
-    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.SYNC_MEILI].failure_hook_method_name == (
-        "_maybe_force_sync_meili_failure"
-    )
+    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.TRANSCODE] is run_transcode_stage
+    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.OCR] is run_ocr_stage
+    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.EMBED] is run_embed_stage
+    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.CLASSIFY] is run_classify_stage
+    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.SYNC_QDRANT] is run_sync_qdrant_stage
+    assert PIPELINE_STAGE_HANDLERS[ContentPipelineStage.SYNC_MEILI] is run_sync_meili_stage
 
 
 async def test_pipeline_runtime_stage_dispatch_rejects_unsupported_stage() -> None:

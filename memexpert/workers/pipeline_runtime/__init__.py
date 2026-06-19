@@ -1,11 +1,8 @@
 """Public surface for the heavy-worker content-pipeline runtime package.
 
-The package is split so that constants, stateless failure classification,
-RabbitMQ topology, and the orchestrator class each live in their own
-modules — but every name previously exposed by the flat
-``memexpert.workers.pipeline_runtime`` module is re-exported here so
-existing callers (tests, ``memexpert.workers.main``, harness scripts)
-keep working without code changes.
+Constants, stateless failure classification, RabbitMQ topology, the runtime
+orchestrator, and focused stage handlers live in separate modules so callers
+can import only the boundary they need.
 """
 
 from __future__ import annotations
@@ -54,11 +51,8 @@ from memexpert.workers.pipeline_runtime.errors import (
     ForcedTranscodeFailure,
 )
 from memexpert.workers.pipeline_runtime.runtime import (
-    ObjectStorageClientLike,
     PipelineRuntime,
     RabbitMessageLike,
-    SyncMeiliInputs,
-    SyncQdrantInputs,
 )
 from memexpert.workers.pipeline_runtime.topology import (
     build_pipeline_runtime,
@@ -105,11 +99,8 @@ __all__ = [
     "ForcedSyncMeiliFailure",
     "ForcedSyncQdrantFailure",
     "ForcedTranscodeFailure",
-    "ObjectStorageClientLike",
     "PipelineRuntime",
     "RabbitMessageLike",
-    "SyncMeiliInputs",
-    "SyncQdrantInputs",
     "build_pipeline_runtime",
     "run_pipeline_runtime",
 ]
