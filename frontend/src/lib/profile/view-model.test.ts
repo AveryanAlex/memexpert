@@ -3,6 +3,9 @@ import { describe, expect, it } from 'vitest';
 import {
   activeCollectionId,
   libraryEmptyText,
+  movePinnedMemeId,
+  movePinnedMemeIdToTarget,
+  orderPinnedMemesByIds,
   profileCapabilities,
   profilePreferences,
   profileStats,
@@ -62,6 +65,13 @@ describe('profile view model', () => {
     expect(nsfwPreference?.value).toBe('Hidden by default');
     expect(nsfwPreference?.detail).toContain('Enable from the Search NSFW filter confirmation');
   });
+
+  it('reorders pinned meme ids for button and drag controls', () => {
+    expect(movePinnedMemeId(['a', 'b', 'c'], 'b', -1)).toEqual(['b', 'a', 'c']);
+    expect(movePinnedMemeId(['a', 'b', 'c'], 'a', -1)).toEqual(['a', 'b', 'c']);
+    expect(movePinnedMemeIdToTarget(['a', 'b', 'c'], 'c', 'a')).toEqual(['c', 'a', 'b']);
+    expect(orderPinnedMemesByIds([meme('a'), meme('b'), meme('c')], ['c', 'a']).map((item) => item.id)).toEqual(['c', 'a', 'b']);
+  });
 });
 
 function sessionPayload(accountType: 'full' | 'guest'): CurrentSessionRead {
@@ -114,6 +124,26 @@ function collection(id: string, title: string, canWrite: boolean): MemeLibraryRe
     role: canWrite ? 'owner' : 'viewer',
     can_write: canWrite,
     saved_meme_count: 0,
+    created_at: '2026-01-01T00:00:00Z',
+    updated_at: '2026-01-01T00:00:00Z'
+  };
+}
+
+function meme(id: string): MemeLibraryRead['pinned_memes'][number] {
+  return {
+    id,
+    media_type: 'image',
+    language: 'en',
+    is_nsfw: false,
+    popularity_score: 1,
+    like_count: 0,
+    tags: [],
+    primary_file: null,
+    caption: id,
+    seo_page_slug: null,
+    viewer_has_favorited: false,
+    viewer_has_saved: false,
+    viewer_has_pinned: true,
     created_at: '2026-01-01T00:00:00Z',
     updated_at: '2026-01-01T00:00:00Z'
   };

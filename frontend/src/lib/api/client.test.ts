@@ -35,10 +35,13 @@ import {
   recordMemeDownload,
   recordMemeShare,
   refreshCurrentSession,
+  removeCollectionMember,
   removeMemeFromCollection,
   removeSavedMeme,
+  reorderPins,
   reportMeme,
   resolveModerationReport,
+  revokeCollectionInvite,
   reviewChannelSuggestion,
   saveMeme,
   setActiveSaveCollection,
@@ -47,6 +50,7 @@ import {
   unpinMeme,
   updateActiveSaveCollection,
   updateBlockedPerceptualHash,
+  updateCollectionMemberRole,
   updateMemeModeration,
   updateUserPreferences,
   type ApiFetch
@@ -133,6 +137,8 @@ describe('catalog API client', () => {
       expect(url.searchParams.get('include_nsfw')).toBe('true');
       expect(url.searchParams.get('media_type')).toBe('gif');
       expect(url.searchParams.get('language')).toBe('mixed');
+      expect(url.searchParams.get('scope')).toBe('collections');
+      expect(url.searchParams.getAll('collection_ids')).toEqual(['team', 'shared']);
 
       return jsonResponse(page);
     }) satisfies ApiFetch;
@@ -145,6 +151,8 @@ describe('catalog API client', () => {
       includeNsfw: true,
       mediaType: 'gif',
       language: 'mixed',
+      scope: 'collections',
+      collectionIds: ['team', 'shared'],
       limit: 12,
       offset: 0
     });
@@ -156,13 +164,15 @@ describe('catalog API client', () => {
       includeNsfw: true,
       mediaType: 'gif',
       language: 'mixed',
+      scope: 'collections',
+      collectionIds: ['team', 'shared'],
       limit: 12,
       offset: 12
     });
 
     expect(calls).toEqual([
-      '/api/v1/memes/search?limit=12&offset=0&tags=reaction&tags=cat&include_nsfw=true&media_type=gif&language=mixed&query=frog',
-      '/api/v1/memes/browse?limit=12&offset=12&tags=reaction&tags=cat&include_nsfw=true&media_type=gif&language=mixed'
+      '/api/v1/memes/search?limit=12&offset=0&tags=reaction&tags=cat&include_nsfw=true&media_type=gif&language=mixed&scope=collections&collection_ids=team&collection_ids=shared&query=frog',
+      '/api/v1/memes/browse?limit=12&offset=12&tags=reaction&tags=cat&include_nsfw=true&media_type=gif&language=mixed&scope=collections&collection_ids=team&collection_ids=shared'
     ]);
   });
 
@@ -685,6 +695,8 @@ describe('catalog API client', () => {
   it('uses collection list, detail, mutation, active-save, remove, and invite endpoints', async () => {
     const collectionId = '11111111-1111-4111-8111-111111111111';
     const memeId = '22222222-2222-4222-8222-222222222222';
+    const inviteId = '33333333-3333-4333-8333-333333333333';
+    const memberUserId = '44444444-4444-4444-8444-444444444444';
     const calls: Array<{ method: string; path: string; body: unknown }> = [];
     const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = new URL(String(input));
@@ -698,6 +710,12 @@ describe('catalog API client', () => {
       }
       if (url.pathname === `/api/v1/collections/${collectionId}/invites`) {
         return jsonResponse({ invite: collectionInvite(collectionId), token: 'invite-token', join_path: '/collection/invite/invite-token' });
+      }
+      if (url.pathname === `/api/v1/collections/${collectionId}/invites/${inviteId}`) {
+        return jsonResponse({ ...collectionInvite(collectionId), id: inviteId, status: 'revoked' });
+      }
+      if (url.pathname === `/api/v1/collections/${collectionId}/members/${memberUserId}`) {
+        return jsonResponse(init?.method === 'DELETE' ? { removed: true } : { collection_id: collectionId, user_id: memberUserId, role: 'viewer', joined_at: '2026-01-02T00:00:00Z' });
       }
       if (url.pathname.endsWith('/active-save')) {
         return jsonResponse({ active_save_collection_id: collectionId });
@@ -717,6 +735,9 @@ describe('catalog API client', () => {
     await setActiveSaveCollection({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', collectionId });
     await removeMemeFromCollection({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', collectionId, memeId });
     await createCollectionInvite({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', collectionId, body: { role: 'viewer', max_uses: 1 } });
+    await revokeCollectionInvite({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', collectionId, inviteId });
+    await updateCollectionMemberRole({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', collectionId, memberUserId, body: { role: 'viewer' } });
+    await removeCollectionMember({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', collectionId, memberUserId });
     await deleteCollection({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', collectionId });
 
     expect(calls.map((call) => [call.method, call.path])).toEqual([
@@ -726,10 +747,42 @@ describe('catalog API client', () => {
       ['PUT', `/api/v1/collections/${collectionId}/active-save`],
       ['DELETE', `/api/v1/collections/${collectionId}/memes/${memeId}`],
       ['POST', `/api/v1/collections/${collectionId}/invites`],
+      ['DELETE', `/api/v1/collections/${collectionId}/invites/${inviteId}`],
+      ['PATCH', `/api/v1/collections/${collectionId}/members/${memberUserId}`],
+      ['DELETE', `/api/v1/collections/${collectionId}/members/${memberUserId}`],
       ['DELETE', `/api/v1/collections/${collectionId}`]
     ]);
     expect(calls[2].body).toEqual({ title: 'Launch', visibility: 'private' });
     expect(calls[5].body).toEqual({ role: 'viewer', max_uses: 1 });
+    expect(calls[7].body).toEqual({ role: 'viewer' });
+  });
+
+  it('reorders pins with the full ordered id list', async () => {
+    const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const headers = new Headers(init?.headers);
+
+      expect(url.pathname).toBe('/api/v1/memes/pins/reorder');
+      expect(init?.method).toBe('PUT');
+      expect(headers.get('cookie')).toBe('memexpert_access_token=full');
+      expect(headers.get('content-type')).toBe('application/json');
+      expect(JSON.parse(String(init?.body))).toEqual({ meme_ids: ['meme-2', 'meme-1'] });
+
+      return jsonResponse([
+        { user_id: 'user-id', meme_id: 'meme-2', position: 1, pinned_at: '2026-01-02T00:00:00Z' },
+        { user_id: 'user-id', meme_id: 'meme-1', position: 2, pinned_at: '2026-01-01T00:00:00Z' }
+      ]);
+    }) satisfies ApiFetch;
+
+    const pins = await reorderPins({
+      fetch: mockFetch,
+      baseUrl: 'https://api.memexpert.test',
+      cookieHeader: 'memexpert_access_token=full',
+      body: { meme_ids: ['meme-2', 'meme-1'] }
+    });
+
+    expect(pins.map((pin) => pin.meme_id)).toEqual(['meme-2', 'meme-1']);
+    expect(mockFetch).toHaveBeenCalledOnce();
   });
 });
 
@@ -1019,6 +1072,8 @@ function collectionSummary(collectionId: string) {
       can_rename: true,
       can_delete: true,
       can_create_invites: true,
+      can_revoke_invites: true,
+      can_manage_members: true,
       can_set_active_save: true
     },
     active_save_collection_id: null

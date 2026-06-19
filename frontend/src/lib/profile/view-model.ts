@@ -1,4 +1,4 @@
-import type { CollectionSummaryRead, CurrentSessionRead, MemeLibraryRead, UserRead } from '$lib/api/types';
+import type { CollectionSummaryRead, CurrentSessionRead, MemeLibraryRead, PublicMemeCardRead, UserRead } from '$lib/api/types';
 
 export interface ProfileCapabilityView {
   accountLabel: string;
@@ -140,6 +140,38 @@ export function profilePreferences(user: UserRead | null): ProfilePreferenceView
       detail: user.guest_expires_at ? `Guest session expires ${formatDate(user.guest_expires_at)}.` : `Created ${formatDate(user.created_at)}.`
     }
   ];
+}
+
+export function movePinnedMemeId(memeIds: string[], memeId: string, direction: -1 | 1): string[] {
+  const index = memeIds.indexOf(memeId);
+  const nextIndex = index + direction;
+  if (index < 0 || nextIndex < 0 || nextIndex >= memeIds.length) {
+    return memeIds;
+  }
+
+  const next = [...memeIds];
+  [next[index], next[nextIndex]] = [next[nextIndex], next[index]];
+  return next;
+}
+
+export function movePinnedMemeIdToTarget(memeIds: string[], memeId: string, targetMemeId: string): string[] {
+  if (memeId === targetMemeId || !memeIds.includes(memeId) || !memeIds.includes(targetMemeId)) {
+    return memeIds;
+  }
+
+  const next = memeIds.filter((id) => id !== memeId);
+  next.splice(next.indexOf(targetMemeId), 0, memeId);
+  return next;
+}
+
+export function orderPinnedMemesByIds(memes: PublicMemeCardRead[], memeIds: string[]): PublicMemeCardRead[] {
+  const byId = new Map(memes.map((meme) => [meme.id, meme]));
+  const ordered = memeIds.flatMap((id) => {
+    const meme = byId.get(id);
+    return meme ? [meme] : [];
+  });
+  const orderedIds = new Set(ordered.map((meme) => meme.id));
+  return [...ordered, ...memes.filter((meme) => !orderedIds.has(meme.id))];
 }
 
 function languageLabel(language: UserRead['language']): string {

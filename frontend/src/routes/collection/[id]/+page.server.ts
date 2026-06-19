@@ -5,8 +5,11 @@ import {
   createCollectionInvite,
   deleteCollection,
   fetchCollectionDetail,
+  removeCollectionMember,
   removeMemeFromCollection,
+  revokeCollectionInvite,
   setActiveSaveCollection,
+  updateCollectionMemberRole,
   updateCollection,
   type CollectionFormPayload,
   type CollectionInvitePayload
@@ -132,6 +135,80 @@ export const actions: Actions = {
     } catch (error) {
       return fail(readStatus(error), { errorMessage: readErrorMessage(error) });
     }
+  },
+  revokeInvite: async ({ cookies, fetch, params, request }) => {
+    const form = await request.formData();
+    const inviteId = String(form.get('invite_id') ?? '').trim();
+    if (!inviteId) {
+      return fail(400, { errorMessage: 'Missing invite id.' });
+    }
+
+    try {
+      await revokeCollectionInvite({
+        fetch,
+        baseUrl: apiBaseUrl(),
+        collectionId: params.id,
+        inviteId,
+        cookieHeader: request.headers.get('cookie') ?? undefined,
+        onResponse: (response) => {
+          forwardBackendAccessCookie(response, cookies);
+        }
+      });
+    } catch (error) {
+      return fail(readStatus(error), { errorMessage: readErrorMessage(error) });
+    }
+
+    return { successMessage: 'Invite revoked.' };
+  },
+  updateMemberRole: async ({ cookies, fetch, params, request }) => {
+    const form = await request.formData();
+    const memberUserId = String(form.get('member_user_id') ?? '').trim();
+    const role = form.get('role') === 'editor' ? 'editor' : 'viewer';
+    if (!memberUserId) {
+      return fail(400, { errorMessage: 'Missing member id.' });
+    }
+
+    try {
+      await updateCollectionMemberRole({
+        fetch,
+        baseUrl: apiBaseUrl(),
+        collectionId: params.id,
+        memberUserId,
+        cookieHeader: request.headers.get('cookie') ?? undefined,
+        body: { role },
+        onResponse: (response) => {
+          forwardBackendAccessCookie(response, cookies);
+        }
+      });
+    } catch (error) {
+      return fail(readStatus(error), { errorMessage: readErrorMessage(error) });
+    }
+
+    return { successMessage: 'Member role updated.' };
+  },
+  removeMember: async ({ cookies, fetch, params, request }) => {
+    const form = await request.formData();
+    const memberUserId = String(form.get('member_user_id') ?? '').trim();
+    if (!memberUserId) {
+      return fail(400, { errorMessage: 'Missing member id.' });
+    }
+
+    try {
+      await removeCollectionMember({
+        fetch,
+        baseUrl: apiBaseUrl(),
+        collectionId: params.id,
+        memberUserId,
+        cookieHeader: request.headers.get('cookie') ?? undefined,
+        onResponse: (response) => {
+          forwardBackendAccessCookie(response, cookies);
+        }
+      });
+    } catch (error) {
+      return fail(readStatus(error), { errorMessage: readErrorMessage(error) });
+    }
+
+    return { successMessage: 'Member removed.' };
   }
 };
 

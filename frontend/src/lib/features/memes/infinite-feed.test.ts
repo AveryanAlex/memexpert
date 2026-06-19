@@ -44,9 +44,25 @@ describe('infinite meme feed helpers', () => {
         tags: ['reaction', 'cat'],
         includeNsfw: false,
         mediaType: 'gif',
-        language: 'en'
+        language: 'en',
+        scope: 'collections',
+        collectionIds: ['team']
       })
-    ).toBe(memeFeedKey({ query: 'cats', tags: ['reaction', 'cat'], includeNsfw: false, mediaType: 'gif', language: 'en' }));
+    ).toBe(
+      memeFeedKey({
+        query: 'cats',
+        tags: ['reaction', 'cat'],
+        includeNsfw: false,
+        mediaType: 'gif',
+        language: 'en',
+        scope: 'collections',
+        collectionIds: ['team']
+      })
+    );
+
+    expect(memeFeedKey({ query: 'cats', scope: 'collections', collectionIds: ['team'] })).not.toBe(
+      memeFeedKey({ query: 'cats', scope: 'collections', collectionIds: ['shared'] })
+    );
   });
 
   it('only allows observer or Load more fetching in a stable ready state', () => {

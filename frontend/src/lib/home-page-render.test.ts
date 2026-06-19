@@ -134,6 +134,8 @@ function collectionList(): WebCollectionListRead {
           can_rename: false,
           can_delete: false,
           can_create_invites: false,
+          can_revoke_invites: false,
+          can_manage_members: false,
           can_set_active_save: true
         },
         active_save_collection_id: collection.id

@@ -7,6 +7,7 @@ export type CollectionVisibility = 'private' | 'public' | 'unlisted';
 export type CollectionMembershipRole = 'editor' | 'owner' | 'viewer';
 export type CollectionInviteChannel = 'direct_link' | 'email' | 'telegram';
 export type CollectionInviteStatus = 'accepted' | 'expired' | 'pending' | 'revoked';
+export type MemeSearchScope = 'all' | 'collections' | 'private' | 'public';
 
 export interface UserRead {
   id: string;
@@ -355,7 +356,16 @@ export interface CollectionCapabilitiesRead {
   can_rename: boolean;
   can_delete: boolean;
   can_create_invites: boolean;
+  can_revoke_invites: boolean;
+  can_manage_members: boolean;
   can_set_active_save: boolean;
+}
+
+export interface PinnedMemeRead {
+  user_id: string;
+  meme_id: string;
+  position: number;
+  pinned_at: string;
 }
 
 export interface WebCollectionSummaryRead {

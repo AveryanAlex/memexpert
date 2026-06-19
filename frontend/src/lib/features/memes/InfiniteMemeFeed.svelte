@@ -137,6 +137,8 @@
         includeNsfw: filters.includeNsfw,
         mediaType: filters.mediaType,
         language: filters.language,
+        scope: filters.scope,
+        collectionIds: filters.collectionIds,
         limit,
         offset
       });
