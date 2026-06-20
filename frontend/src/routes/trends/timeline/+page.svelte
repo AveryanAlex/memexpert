@@ -52,7 +52,7 @@
           <div class="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
             {#each period.top_memes as item (`${period.period}:${item.meme.id}`)}
               <div class="grid gap-3 rounded-[28px] border border-line bg-cream/60 p-3">
-                <MemeCard meme={item.meme} />
+                <MemeCard meme={item.meme} showAccessMarkers={Boolean(data.session)} />
                 <dl class="m-0 grid grid-cols-2 gap-2 text-sm">
                   <div class="rounded-[16px] bg-paper p-3">
                     <dt class="text-muted">Popularity</dt>

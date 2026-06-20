@@ -131,6 +131,7 @@
   emptyTitle={isHomeFeed ? 'No home feed memes yet' : 'No memes found'}
   emptyMessage={isHomeFeed ? 'Try Search or check back after the public catalog has more memes.' : 'Try a shorter phrase, a different synonym, or clear the search box to browse.'}
   bulk={{ enabled: true, saveEnabled: true, collectionOptions: bulkOptions, guidance: bulkGuidance }}
+  showAccessMarkers={Boolean(data.session)}
 >
   {#snippet summary()}
     {#if data.query}

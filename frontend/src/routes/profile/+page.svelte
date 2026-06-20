@@ -389,6 +389,7 @@
         memes={data.library.favorites}
         label="Favorite memes"
         bulk={{ enabled: true, saveEnabled: true, collectionOptions: bulkOptions, guidance: bulkGuidance }}
+        showAccessMarkers={Boolean(data.session)}
       />
     {:else}
       <EmptyState title="No favorites yet" message={libraryEmptyText('favorites', data.session ?? null)}>
@@ -434,6 +435,7 @@
         memes={orderedPinnedMemes}
         label="Pinned memes"
         bulk={{ enabled: true, saveEnabled: true, collectionOptions: bulkOptions, guidance: bulkGuidance }}
+        showAccessMarkers={Boolean(data.session)}
       />
     {:else}
       <EmptyState title="No pinned memes yet" message={libraryEmptyText('pins', data.session ?? null)}>

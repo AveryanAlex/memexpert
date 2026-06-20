@@ -5,11 +5,13 @@ import type { PublicMemeCardRead } from '$lib/api/types';
 import MemeCard from './MemeCard.svelte';
 
 describe('MemeCard', () => {
-  it('renders a shared/private visibility badge without labeling public cards', () => {
-    const shared = render(MemeCard, { props: { meme: memeCard({ viewer_access: { visibility: 'shared' } }) } });
-    const privateCard = render(MemeCard, { props: { meme: memeCard({ viewer_access: { visibility: 'private' } }) } });
-    const publicCard = render(MemeCard, { props: { meme: memeCard() } });
+  it('only renders shared/private visibility badges when explicitly enabled', () => {
+    const hiddenShared = render(MemeCard, { props: { meme: memeCard({ viewer_access: { visibility: 'shared' } }) } });
+    const shared = render(MemeCard, { props: { meme: memeCard({ viewer_access: { visibility: 'shared' } }), showAccessMarkers: true } });
+    const privateCard = render(MemeCard, { props: { meme: memeCard({ viewer_access: { visibility: 'private' } }), showAccessMarkers: true } });
+    const publicCard = render(MemeCard, { props: { meme: memeCard(), showAccessMarkers: true } });
 
+    expect(hiddenShared.body).not.toContain('Shared');
     expect(shared.body).toContain('Shared');
     expect(privateCard.body).toContain('Private');
     expect(publicCard.body).not.toContain('Shared');

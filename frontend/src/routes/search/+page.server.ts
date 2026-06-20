@@ -17,7 +17,7 @@ export const load: PageServerLoad = async ({ cookies, fetch, parent, request, ur
   };
 
   try {
-    const [page, collections] = await Promise.all([
+    const [page, collectionState] = await Promise.all([
       fetchMemePage({
         fetch,
         baseUrl: apiBaseUrl(),
@@ -40,18 +40,24 @@ export const load: PageServerLoad = async ({ cookies, fetch, parent, request, ur
             onResponse: (response) => {
               forwardBackendAccessCookie(response, cookies);
             }
-          }).catch(() => null)
-        : Promise.resolve(null)
+          })
+            .then((collections) => ({ collections, collectionErrorMessage: null }))
+            .catch((error) => ({
+              collections: null,
+              collectionErrorMessage: error instanceof ApiError ? error.message : 'Collection filters are unavailable right now.'
+            }))
+        : Promise.resolve({ collections: null, collectionErrorMessage: null })
     ]);
 
-    return { page, collections, filters, seo, errorMessage: null };
+    return { page, collections: collectionState.collections, filters, seo, errorMessage: null, collectionErrorMessage: collectionState.collectionErrorMessage };
   } catch (error) {
     return {
       page: emptyMemePage(DEFAULT_PAGE_SIZE, filters.offset),
       collections: null,
       filters,
       seo,
-      errorMessage: error instanceof ApiError ? error.message : 'Could not reach the meme catalog API.'
+      errorMessage: error instanceof ApiError ? error.message : 'Could not reach the meme catalog API.',
+      collectionErrorMessage: null
     };
   }
 };
