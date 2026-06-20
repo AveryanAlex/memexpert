@@ -21,6 +21,7 @@ from memexpert.services.meme_search import _DERIVED_POPULARITY_ATTR, _to_public_
 
 if TYPE_CHECKING:
     import uuid
+    from collections.abc import Mapping
 
     from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -329,7 +330,7 @@ def _novelty_score(created_at: datetime, *, window_start: datetime, window_end: 
     return max(0.0, min(1.0, elapsed_seconds / total_seconds))
 
 
-def _score_components(values: dict[str, object]) -> dict[str, float]:
+def _score_components(values: Mapping[str, object]) -> dict[str, float]:
     return {str(key): converted for key, value in values.items() if (converted := _finite_float(value)) is not None}
 
 
