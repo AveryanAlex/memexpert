@@ -24,7 +24,7 @@ The Python containers are split by service target (`api`, `worker`, `scheduler`,
 ## Environment Files
 
 - `.env.example` is for local development defaults.
-- `.env.prod.example` is a production compose template with placeholders only. Copy it to an untracked file and replace every `change-me` value before running a production-like stack.
+- `.env.prod.example` is a production compose template with placeholders only. Copy it to an untracked file and replace every `change-me` value and every blank live-provider/auth secret before running a production-like stack.
 - `docker-compose.yml` is local infrastructure only. It intentionally does not run the app containers.
 - `docker-compose.prod.example.yml` is the production-oriented app plus infrastructure example.
 
@@ -41,14 +41,18 @@ Important runtime variables:
 - `PIPELINE_OCR_PROVIDER_MODE`: `live` runs PaddleOCR; `fake` returns deterministic text for CI/E2E.
 - `PIPELINE_OCR_PADDLE_COMMAND`: optional primary PaddleOCR command. The worker image defaults it to `/opt/paddleocr-venv/bin/python /app/scripts/paddleocr_json.py --input {input}`.
 - `PIPELINE_OCR_FALLBACK_ENGINE`, `PIPELINE_OCR_FALLBACK_COMMAND`: optional command fallback metadata and command. Blank by default; there is no Qwen/VLM fallback in this code path.
+- `PIPELINE_VOYAGE_PROVIDER_MODE`, `PIPELINE_VOYAGE_MODEL`, `PIPELINE_VOYAGE_OUTPUT_DIMENSIONS`, `PIPELINE_VOYAGE_API_URL`, `PIPELINE_VOYAGE_API_KEY`, `PIPELINE_VOYAGE_TIMEOUT_SECONDS`: embedding provider settings. `live` requires a real Voyage API key.
+- `PIPELINE_CLASSIFICATION_PROVIDER_MODE`, `PIPELINE_CLASSIFICATION_API_URL`, `PIPELINE_CLASSIFICATION_API_KEY`, `PIPELINE_CLASSIFICATION_MODEL`, `PIPELINE_CLASSIFICATION_TIMEOUT_SECONDS`, `PIPELINE_CLASSIFICATION_NSFW_THRESHOLD`: image classification provider settings. `live` requires the configured classification endpoint and any required API key.
 - `PIPELINE_SEO_PROVIDER_MODE`: `static` by default for safe local runs; switch to `live` to enable the PydanticAI/OpenAI-compatible SEO provider.
 - `PIPELINE_SEO_MODEL`, `PIPELINE_SEO_API_BASE_URL`, `PIPELINE_SEO_API_KEY`, `PIPELINE_SEO_TIMEOUT_SECONDS`, `PIPELINE_SEO_MAX_ATTEMPTS`, `PIPELINE_SEO_IMAGE_MAX_BYTES`, `PIPELINE_SEO_PROMPT_VERSION`: SEO structured-output provider settings.
 - `AUTH_JWT_SECRET`: signing secret for auth cookies and tokens.
+- `AUTH_ACCESS_COOKIE_*` and `AUTH_ACCESS_TOKEN_TTL_SECONDS`: access-cookie transport and token lifetime settings for browser sessions.
+- `AUTH_GOOGLE_*`: Google provider-auth settings. Replace blank client id/secret/redirect URI before enabling Google sign-in.
+- `AUTH_TELEGRAM_BOT_USERNAME`, `AUTH_TELEGRAM_BOT_TOKEN`, `AUTH_TELEGRAM_LINK_RETURN_URL`, and related `AUTH_TELEGRAM_*_SECONDS` values: Telegram widget/Mini App/link settings. Replace blanks before enabling Telegram auth; the bot token is also required for the optional bot runtime.
 - `SECURITY_CORS_ALLOWED_ORIGINS`: comma-separated browser origins allowed to call the API.
 - `API_BASE_URL`: private backend URL used by the SvelteKit Node server.
 - `HOST`, `PORT`, `ORIGIN`: SvelteKit adapter-node server settings.
 - `FRONTEND_ORIGIN`: canonical public origin for frontend-generated SEO XML. Production should use `https://memexpert.net`; if unset, frontend XML falls back to `ORIGIN`, then `https://memexpert.net`.
-- `AUTH_TELEGRAM_BOT_TOKEN`: required only when running the optional bot profile.
 - `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_SESSION_ENCRYPTION_SECRET`: Telegram crawler settings. Production must set the API credentials and a high-entropy encryption secret before importing DB-backed Telethon StringSessions or running `memexpert-telegram-crawler`.
 - `SCHEDULER_*`: enable flags, interval seconds, and PostgreSQL advisory-lock settings for the scheduler process.
 
@@ -272,14 +276,22 @@ Create a real env file from the placeholder template:
 cp .env.prod.example .env.prod
 ```
 
-Edit `.env.prod` and replace every `change-me` placeholder.
+Edit `.env.prod` and replace every `change-me` placeholder. Blank live-provider/auth secrets such as `PIPELINE_VOYAGE_API_KEY`, `PIPELINE_CLASSIFICATION_API_URL`, `PIPELINE_CLASSIFICATION_API_KEY`, `PIPELINE_SEO_API_KEY`, `AUTH_GOOGLE_CLIENT_SECRET`, `AUTH_TELEGRAM_BOT_TOKEN`, and provider redirect/return URLs must also be filled before enabling the corresponding live provider or auth flow.
 
 The example env defaults `MEMEXPERT_MAIN_IMAGE`, `MEMEXPERT_WORKER_IMAGE`, and `MEMEXPERT_FRONTEND_IMAGE` to GHCR `:main` images. For production, pin them to release tags or immutable `sha-<short-sha>` tags from the CI workflow image-publish path.
+
+The production Compose template forwards the provider/auth variables from `.env.prod` into the app containers through the shared app environment used by `migrate`, `api`, `workers`, `telegram-crawler`, `scheduler`, and `bot`. Services that do not use a specific provider ignore those settings, but `api`, `workers`, and `scheduler` still receive them so live auth, embedding/classification, and SEO work can run with the same production env file.
 
 Validate the stack:
 
 ```sh
 docker compose --env-file .env.prod -f docker-compose.prod.example.yml config
+```
+
+Validate the committed production template still renders the expected app-service env keys:
+
+```sh
+python3 scripts/validate_prod_compose_env.py
 ```
 
 Pull the configured GHCR images and start the production-oriented stack:
@@ -328,7 +340,7 @@ The default CI E2E path uses the operator upload pipeline plus fake providers. I
 
 ## CI
 
-`.github/workflows/ci.yml` runs backend lint/type/test checks, frontend checks/tests/builds, frontend mock smoke tests, production compose validation, Docker image builds, image smoke checks, and deterministic PRD E2E. The E2E job builds and loads the unified main Python image, worker Python image, frontend image, and E2E runner image with BuildKit/GitHub Actions cache, then runs E2E with `E2E_SKIP_IMAGE_BUILD=1` so it reuses those loaded tags. On E2E failure, CI uploads `.artifacts/e2e/**`. After smoke checks and E2E pass, non-PR runs publish `ghcr.io/averyanalex/memexpert/{main,worker,frontend}` with metadata labels plus branch, tag, semver, and `sha-<short-sha>` tags.
+`.github/workflows/ci.yml` runs backend lint/type/test checks, frontend checks/tests/builds, frontend mock smoke tests, production compose validation, production app-env propagation validation, Docker image builds, image smoke checks, and deterministic PRD E2E. The E2E job builds and loads the unified main Python image, worker Python image, frontend image, and E2E runner image with BuildKit/GitHub Actions cache, then runs E2E with `E2E_SKIP_IMAGE_BUILD=1` so it reuses those loaded tags. On E2E failure, CI uploads `.artifacts/e2e/**`. After smoke checks and E2E pass, non-PR runs publish `ghcr.io/averyanalex/memexpert/{main,worker,frontend}` with metadata labels plus branch, tag, semver, and `sha-<short-sha>` tags.
 
 Run the local real OCR smoke only when the worker image has been built and model downloads are acceptable:
 
