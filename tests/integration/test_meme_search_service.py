@@ -1268,6 +1268,7 @@ async def test_recommendation_candidates_cold_start_falls_back_to_trending(
 
 async def test_recommendation_candidates_qdrant_failure_falls_back_to_trending(
     migrated_db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     viewer = build_full_user()
     migrated_db_session.add(viewer)
@@ -1284,6 +1285,19 @@ async def test_recommendation_candidates_qdrant_failure_falls_back_to_trending(
     await _add_image_embedding(migrated_db_session, source, (1.0, 0.0))
     await migrated_db_session.commit()
     semantic_client = FakeSemanticSearchClient((), failure=RuntimeError("qdrant unavailable secret"))
+    info_calls: list[tuple[str, dict[str, object] | None]] = []
+    warning_calls: list[tuple[str, dict[str, object] | None]] = []
+
+    def fake_info(message: str, *args: object, extra: dict[str, object] | None = None, **kwargs: object) -> None:
+        del args, kwargs
+        info_calls.append((message, extra))
+
+    def fake_warning(message: str, *args: object, extra: dict[str, object] | None = None, **kwargs: object) -> None:
+        del args, kwargs
+        warning_calls.append((message, extra))
+
+    monkeypatch.setattr("memexpert.services.meme_search.logger.info", fake_info)
+    monkeypatch.setattr("memexpert.services.meme_search.logger.warning", fake_warning)
     service = MemeSearchService(
         migrated_db_session,
         semantic_client=semantic_client,
@@ -1297,6 +1311,25 @@ async def test_recommendation_candidates_qdrant_failure_falls_back_to_trending(
     assert page.items[0].attribution.reason == "qdrant_failure"
     assert len(semantic_client.calls) == 1
     assert semantic_client.calls[0]["query_vector"] == pytest.approx((1.0, 0.0))
+    completion_extra = next(extra for message, extra in info_calls if message == "meme_recommendation_completed")
+    assert completion_extra is not None
+    assert completion_extra["request_id"] == page.request_id
+    assert completion_extra["degraded_mode"] is True
+    assert completion_extra["reason"] == "qdrant_failure"
+    assert completion_extra["fallback_reason"] == "qdrant_failure"
+    assert completion_extra["source_algorithm"] == "fallback_trending"
+    assert "query" not in completion_extra
+    warning_extra = next(extra for message, extra in warning_calls if message == "meme_recommendation_provider_failure")
+    assert warning_extra is not None
+    assert warning_extra["event"] == "meme_recommendation_provider_failure"
+    assert warning_extra["degraded_mode"] is True
+    assert warning_extra["reason"] == "qdrant_lookup_failed"
+    assert warning_extra["fallback_reason"] == "qdrant_failure"
+    assert warning_extra["exception_type"] == "RuntimeError"
+    assert "query" not in warning_extra
+    serialized_log_values = repr((info_calls, warning_calls))
+    assert "qdrant unavailable secret" not in serialized_log_values
+    assert "secret" not in serialized_log_values
 
 
 async def test_recommendation_candidates_postgres_filters_qdrant_private_candidates(
@@ -3999,10 +4032,24 @@ async def test_provider_failures_fall_back_to_popular_without_raw_error_payload(
     app: FastAPI,
     client: AsyncClient,
     migrated_db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     popular_meme = await _create_meme(migrated_db_session, popularity_score=100.0)
     text_client = FailingTextSearchClient()
     embedding_client = FailingQueryEmbeddingClient()
+    info_calls: list[tuple[str, dict[str, object] | None]] = []
+    warning_calls: list[tuple[str, dict[str, object] | None]] = []
+
+    def fake_info(message: str, *args: object, extra: dict[str, object] | None = None, **kwargs: object) -> None:
+        del args, kwargs
+        info_calls.append((message, extra))
+
+    def fake_warning(message: str, *args: object, extra: dict[str, object] | None = None, **kwargs: object) -> None:
+        del args, kwargs
+        warning_calls.append((message, extra))
+
+    monkeypatch.setattr("memexpert.services.meme_search.logger.info", fake_info)
+    monkeypatch.setattr("memexpert.services.meme_search.logger.warning", fake_warning)
     service = MemeSearchService(
         migrated_db_session,
         text_client=text_client,
@@ -4022,6 +4069,19 @@ async def test_provider_failures_fall_back_to_popular_without_raw_error_payload(
     _assert_public_page_attribution(payload, source_algorithm="fallback_popular", surface="public_api_search")
     assert payload["items"][0]["attribution"]["reason"] == "provider_failure"
     assert payload["items"][0]["attribution"]["query"] == "frog"
+    completion_extra = next(extra for message, extra in info_calls if message == "meme_search_completed")
+    assert completion_extra is not None
+    assert completion_extra["request_id"] == payload["request_id"]
+    assert completion_extra["degraded_mode"] is True
+    assert completion_extra["fallback_reason"] == "provider_failure"
+    assert completion_extra["query_present"] is True
+    assert completion_extra["query_length"] == len("frog")
+    assert "query" not in completion_extra
+    provider_extras = [extra for message, extra in warning_calls if message == "meme_search_provider_failure"]
+    assert {extra["degraded_component"] for extra in provider_extras if extra is not None} == {"embedding", "text"}
+    serialized_log_values = repr((info_calls, warning_calls))
+    assert "provider-secret" not in serialized_log_values
+    assert "frog" not in serialized_log_values
     assert text_client.calls == [
         {
             "query": "frog",

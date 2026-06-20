@@ -9,7 +9,8 @@ from httpx import ASGITransport, AsyncClient, Response
 from sqlalchemy import func, select
 from starlette.requests import Request
 
-from memexpert.api.security import SecurityRouteTier, classify_security_route
+from memexpert.api.security import SecurityRouteTier, classify_security_route, ensure_security_runtime_available
+from memexpert.core.config import Settings
 from memexpert.core.redis import get_async_redis, is_async_redis_initialized, reset_async_redis_state
 from memexpert.models.user import LoginEvent, User
 from memexpert.services import AccountLinkService, AuthService, UserService
@@ -219,6 +220,34 @@ def test_classify_security_route_matches_documented_tiers(
     request = _build_request(method, path)
 
     assert classify_security_route(request) is expected_tier
+
+
+async def test_rate_limit_fail_open_logs_degraded_without_subject_details(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _build_request("POST", "/api/v1/auth/guest")
+    settings = Settings.model_validate({"security_rate_limit_fail_closed": False})
+    warning_calls: list[tuple[str, dict[str, object] | None]] = []
+
+    def fake_warning(message: str, *args: object, extra: dict[str, object] | None = None, **kwargs: object) -> None:
+        del args, kwargs
+        warning_calls.append((message, extra))
+
+    monkeypatch.setattr("memexpert.api.security.logger.warning", fake_warning)
+
+    route_tier = await ensure_security_runtime_available(request, settings=settings)
+
+    assert route_tier is SecurityRouteTier.AUTH_WRITE
+    assert len(warning_calls) == 1
+    message, extra = warning_calls[0]
+    assert message == "security_rate_limit_degraded"
+    assert extra is not None
+    assert extra["event"] == "security_rate_limit_degraded"
+    assert extra["route_tier"] == "auth_write"
+    assert extra["rate_limit_tier"] == "auth_write"
+    assert extra["degraded_mode"] is True
+    assert extra["reason"] == "SecuritySubjectResolutionError"
+    assert "security:rate_limit" not in repr(warning_calls)
 
 
 async def test_auth_write_rate_limit_returns_retry_metadata_and_skips_safe_reads(

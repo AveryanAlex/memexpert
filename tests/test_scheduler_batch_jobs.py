@@ -261,6 +261,10 @@ async def test_search_index_batch_records_failure_and_preserves_last_good_previe
 
     assert result.scanned == 1
     assert result.failed == 1
+    assert result.index_sync_unsynced_count == 2
+    assert result.index_sync_failed_count == 1
+    assert result.index_sync_processing_count == 1
+    assert result.index_sync_oldest_lag_seconds is not None
     assert [payload.meme_file_id for payload, _ in qdrant_client.upserts] == [retry_fixture.meme_file.id]
     snapshots = await _load_snapshots(migrated_db_session, retry_fixture.meme_file.id)
     retry_snapshot = next(snapshot for snapshot in snapshots if snapshot.sync_target is SyncTargetKind.QDRANT)

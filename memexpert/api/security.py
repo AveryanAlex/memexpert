@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -41,6 +42,8 @@ RATE_LIMIT_LIMIT_HEADER: Final = "X-RateLimit-Limit"
 RATE_LIMIT_REMAINING_HEADER: Final = "X-RateLimit-Remaining"
 RATE_LIMIT_RESET_HEADER: Final = "X-RateLimit-Reset"
 RATE_LIMIT_TIER_HEADER: Final = "X-RateLimit-Tier"
+
+logger = logging.getLogger(__name__)
 
 SECURITY_ERROR_STATUS_CODES: Final[dict[ApiErrorCode, int]] = {
     ApiErrorCode.RATE_LIMITER_UNAVAILABLE: int(HTTPStatus.SERVICE_UNAVAILABLE),
@@ -511,6 +514,16 @@ async def ensure_security_runtime_available(
         )
     except (RedisConfigurationError, RedisConnectionError, SecuritySubjectResolutionError) as exc:
         if not resolved_settings.security_rate_limit_fail_closed:
+            logger.warning(
+                "security_rate_limit_degraded",
+                extra={
+                    "event": "security_rate_limit_degraded",
+                    "route_tier": route_tier.value,
+                    "rate_limit_tier": policy.tier.value,
+                    "degraded_mode": True,
+                    "reason": type(exc).__name__,
+                },
+            )
             return route_tier
 
         raise build_security_http_error(

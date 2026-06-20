@@ -107,7 +107,10 @@ def enabled_scheduler_jobs(settings: Settings, engine: AsyncEngine) -> tuple[Sch
 
 async def run_logged_job(job_id: str, action: SchedulerJobAction) -> None:
     start_seconds = time.perf_counter()
-    logger.info("scheduler_job_started", extra={"event": "scheduler_job_started", "job_id": job_id})
+    logger.info(
+        "scheduler_job_started",
+        extra={"event": "scheduler_job_started", "job_id": job_id, "status": "started", "degraded_mode": False},
+    )
 
     try:
         await action()
@@ -118,7 +121,9 @@ async def run_logged_job(job_id: str, action: SchedulerJobAction) -> None:
             extra={
                 "event": "scheduler_job_failed",
                 "job_id": job_id,
+                "status": "failed",
                 "duration_seconds": duration_seconds,
+                "degraded_mode": True,
             },
         )
         return
@@ -129,7 +134,9 @@ async def run_logged_job(job_id: str, action: SchedulerJobAction) -> None:
         extra={
             "event": "scheduler_job_succeeded",
             "job_id": job_id,
+            "status": "succeeded",
             "duration_seconds": duration_seconds,
+            "degraded_mode": False,
         },
     )
 

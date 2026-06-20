@@ -66,6 +66,8 @@ def source_engagement_capture_scheduler_result_log_extra(
     return {
         "event": "scheduler_job_batch_result",
         "job_id": job_id,
+        "status": "completed",
+        "degraded_mode": False,
         "claimed": result.claimed,
         "enqueued": result.enqueued,
         "meme_source_ids": [str(source_id) for source_id in result.meme_source_ids],
