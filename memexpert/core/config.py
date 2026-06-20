@@ -7,7 +7,9 @@ import re
 import uuid
 from datetime import timedelta
 from functools import lru_cache
+from ipaddress import ip_address
 from typing import Annotated, ClassVar, Literal, cast
+from urllib.parse import urlsplit
 
 from pydantic import AnyHttpUrl, Field, SecretStr, TypeAdapter, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -66,6 +68,7 @@ class Settings(BaseSettings):
     s3_bucket: str = "memexpert"
     s3_region: str = "us-east-1"
     imgproxy_base_url: str = "http://localhost:8080"
+    imgproxy_public_base_url: str | None = None
     imgproxy_key: SecretStr | None = None
     imgproxy_salt: SecretStr | None = None
     media_public_base_url: str | None = None
@@ -311,7 +314,7 @@ class Settings(BaseSettings):
             raise ValueError("telegram_session_encryption_secret must not be blank.")
         return normalized_value
 
-    @field_validator("media_public_base_url", "pipeline_seo_api_base_url", mode="before")
+    @field_validator("imgproxy_public_base_url", "media_public_base_url", "pipeline_seo_api_base_url", mode="before")
     @classmethod
     def _normalize_optional_base_url_or_path(cls, value: object) -> object:
         if value is None:
@@ -326,6 +329,8 @@ class Settings(BaseSettings):
     def _validate_imgproxy_signature_pair(self) -> Settings:
         if (self.imgproxy_key is None) != (self.imgproxy_salt is None):
             raise ValueError("imgproxy_key and imgproxy_salt must be configured together.")
+        if self.imgproxy_key is not None and self.imgproxy_salt is not None:
+            _validate_browser_reachable_imgproxy_base_url(self.imgproxy_render_base_url)
         return self
 
     @field_validator("pipeline_operator_token", mode="before")
@@ -675,10 +680,49 @@ class Settings(BaseSettings):
         raise TypeError("security sequence settings must be provided as text or a sequence.")
 
     @property
+    def imgproxy_render_base_url(self) -> str:
+        """Return the public imgproxy URL base used in rendered image contracts."""
+
+        return self.imgproxy_public_base_url or self.imgproxy_base_url
+
+    @property
     def auth_access_token_ttl(self) -> timedelta:
         """Return the configured access-token lifetime as a timedelta."""
 
         return timedelta(seconds=self.auth_access_token_ttl_seconds)
+
+
+def _validate_browser_reachable_imgproxy_base_url(value: str) -> None:
+    error_message = (
+        "IMGPROXY_PUBLIC_BASE_URL or IMGPROXY_BASE_URL must be an absolute browser-reachable http(s) URL "
+        "when IMGPROXY_KEY and IMGPROXY_SALT are configured."
+    )
+    try:
+        parsed = urlsplit(value)
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError(error_message) from exc
+
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.hostname is None:
+        raise ValueError(error_message)
+
+    hostname = parsed.hostname.strip().lower().rstrip(".")
+    if not hostname:
+        raise ValueError(error_message)
+
+    if hostname == "localhost" or hostname.startswith("localhost.") or hostname.endswith(".localhost"):
+        raise ValueError(error_message)
+
+    try:
+        host_ip = ip_address(hostname)
+    except ValueError:
+        labels = hostname.split(".")
+        if len(labels) < 2 or any(not label or label == "*" for label in labels):
+            raise ValueError(error_message) from None
+        return
+
+    if host_ip.is_loopback or host_ip.is_unspecified or host_ip.is_private or host_ip.is_link_local:
+        raise ValueError(error_message)
 
 
 @lru_cache(maxsize=1)

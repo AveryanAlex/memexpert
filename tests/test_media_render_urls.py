@@ -9,11 +9,12 @@ from memexpert.models.content import MemeFile
 from memexpert.services.media_render_urls import MediaRenderUrlService, PublicMediaRenderContext
 
 
-def test_imgproxy_signed_image_urls_have_safe_shape_and_download_filename() -> None:
+def test_imgproxy_signed_image_urls_use_public_base_and_have_safe_shape() -> None:
     file_id = uuid.UUID("11111111-1111-4111-8111-111111111111")
     settings = Settings.model_validate(
         {
-            "imgproxy_base_url": "https://img.memexpert.test/",
+            "imgproxy_base_url": "http://imgproxy:8080",
+            "imgproxy_public_base_url": "https://img.memexpert.net/",
             "imgproxy_key": "00112233445566778899aabbccddeeff",
             "imgproxy_salt": "ffeeddccbbaa99887766554433221100",
             "s3_bucket": "private-media-bucket",
@@ -39,7 +40,7 @@ def test_imgproxy_signed_image_urls_have_safe_shape_and_download_filename() -> N
     )
 
     assert render.thumbnail_url is not None
-    assert render.thumbnail_url.startswith("https://img.memexpert.test/")
+    assert render.thumbnail_url.startswith("https://img.memexpert.net/")
     assert "/unsafe/" not in render.thumbnail_url
     assert "/rs:fill:360:360/" in render.thumbnail_url
     assert render.thumbnail_url.endswith(".webp")
@@ -55,6 +56,7 @@ def test_imgproxy_signed_image_urls_have_safe_shape_and_download_filename() -> N
         for url in [render.thumbnail_url, render.preview_url, render.original_url, render.download_url]
         if url is not None
     )
+    assert "imgproxy:8080" not in serialized_urls
     assert "private-media-bucket" not in serialized_urls
     assert "pipeline/originals/secret/raw-object.jpg" not in serialized_urls
 

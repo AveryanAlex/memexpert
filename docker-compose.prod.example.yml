@@ -19,6 +19,7 @@ x-app-env: &app-env
   S3_BUCKET: ${S3_BUCKET:?set S3_BUCKET}
   S3_REGION: ${S3_REGION:-us-east-1}
   IMGPROXY_BASE_URL: http://imgproxy:8080
+  IMGPROXY_PUBLIC_BASE_URL: ${IMGPROXY_PUBLIC_BASE_URL:?set IMGPROXY_PUBLIC_BASE_URL}
   IMGPROXY_KEY: ${IMGPROXY_KEY:?set IMGPROXY_KEY}
   IMGPROXY_SALT: ${IMGPROXY_SALT:?set IMGPROXY_SALT}
   MEDIA_PUBLIC_BASE_URL: ${MEDIA_PUBLIC_BASE_URL:-}
@@ -180,6 +181,8 @@ services:
     depends_on:
       minio:
         condition: service_healthy
+    ports:
+      - "${IMGPROXY_BIND_ADDRESS:-127.0.0.1}:${IMGPROXY_PORT:-8080}:8080"
     healthcheck:
       test: ["CMD", "imgproxy", "health"]
       interval: 10s

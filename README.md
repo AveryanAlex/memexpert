@@ -36,7 +36,11 @@ Important runtime variables:
 - `QDRANT_URL` and `MEILISEARCH_URL`: search backends.
 - `MEILISEARCH_MASTER_KEY`: Meilisearch key. Use a strong production value.
 - `S3_ENDPOINT`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_BUCKET`, `S3_REGION`: object storage.
-- `IMGPROXY_BASE_URL`, `IMGPROXY_KEY`, `IMGPROXY_SALT`: media URL generation and imgproxy signing.
+- `IMGPROXY_BASE_URL`: internal/local imgproxy origin. In production Compose this should stay `http://imgproxy:8080`; the backend uses it as a local/dev fallback for generated public image URLs only when `IMGPROXY_PUBLIC_BASE_URL` is unset.
+- `IMGPROXY_PUBLIC_BASE_URL`: browser/CDN/reverse-proxy imgproxy origin for generated public image URLs, for example `https://img.memexpert.net`. Signed production-style image URLs require this effective rendered base to be absolute and browser-reachable, not a Compose-only hostname.
+- `IMGPROXY_BIND_ADDRESS`, `IMGPROXY_PORT`: host bind/port used by the production Compose imgproxy service so a reverse proxy or CDN can reach it. Keep the bind on loopback unless the host network policy requires otherwise.
+- `IMGPROXY_KEY`, `IMGPROXY_SALT`: imgproxy signing secrets. Configure both together in production.
+- `MEDIA_PUBLIC_BASE_URL`: browser-reachable public file-id CDN/API base for web-video MP4 URLs, for example `https://media.memexpert.net/files`.
 - `PIPELINE_OPERATOR_TOKEN`: backend operator token for pipeline admin/smoke endpoints.
 - `PIPELINE_OCR_PROVIDER_MODE`: `live` runs PaddleOCR; `fake` returns deterministic text for CI/E2E.
 - `PIPELINE_OCR_PADDLE_COMMAND`: optional primary PaddleOCR command. The worker image defaults it to `/opt/paddleocr-venv/bin/python /app/scripts/paddleocr_json.py --input {input}`.
