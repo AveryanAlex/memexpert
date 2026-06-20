@@ -24,19 +24,20 @@ S03 is additive to S02:
   both `sync_qdrant` and `sync_meili` queues; check the logs for a
   `sync_qdrant consumer started` / `sync_meili consumer started` line.
 - Environment variables:
-  - `MEMEXPERT_PIPELINE_OPERATOR_TOKEN` — read from
+  - `PIPELINE_OPERATOR_TOKEN` — read from
     `memexpert.core.config.get_settings` in the proof harness, so the same
     token the API accepts is used by both the harness and operator curl.
-  - `MEMEXPERT_PIPELINE_VOYAGE_API_KEY` — required for the real embed stage
+  - `PIPELINE_VOYAGE_API_KEY` — required for the real embed stage
     (sync_qdrant re-uses the cached embedding, so a missing key blocks the
     whole S03 chain at the embed stage upstream).
-  - `MEMEXPERT_PIPELINE_CLASSIFICATION_API_URL` / token — required for the
-    classify stage (refer to `memexpert/core/classification.py`).
-  - `MEMEXPERT_PIPELINE_MEILISEARCH_INDEX_NAME` — defaults to
+  - `PIPELINE_CLASSIFICATION_API_URL` / `PIPELINE_CLASSIFICATION_API_KEY` —
+    required for the classify stage (refer to
+    `memexpert/core/classification.py`).
+  - `PIPELINE_MEILISEARCH_INDEX_NAME` — defaults to
     `memexpert-memes`. Override when running against a scratch index.
-  - `MEMEXPERT_QDRANT_URL` — defaults to the local Qdrant docker port.
-  - `MEMEXPERT_MEILISEARCH_URL` / `MEMEXPERT_MEILISEARCH_MASTER_KEY` —
-    required for the real Meilisearch client.
+  - `QDRANT_URL` — defaults to the local Qdrant docker port.
+  - `MEILISEARCH_URL` / `MEILISEARCH_MASTER_KEY` — required for the real
+    Meilisearch client.
 
 If any search engine is unreachable the harness will still run, but items will
 stall at the corresponding sync stage and the run summary will tag them as
@@ -202,11 +203,11 @@ the Meilisearch snapshot and vice versa.
 ```bash
 # Replay only Qdrant for one item:
 curl -X POST "http://127.0.0.1:8000/api/v1/pipeline/items/<meme_file_id>/sync/qdrant/replay" \
-  -H "X-Memexpert-Operator-Token: $MEMEXPERT_PIPELINE_OPERATOR_TOKEN"
+  -H "X-Memexpert-Operator-Token: $PIPELINE_OPERATOR_TOKEN"
 
 # Replay only Meilisearch for one item:
 curl -X POST "http://127.0.0.1:8000/api/v1/pipeline/items/<meme_file_id>/sync/meili/replay" \
-  -H "X-Memexpert-Operator-Token: $MEMEXPERT_PIPELINE_OPERATOR_TOKEN"
+  -H "X-Memexpert-Operator-Token: $PIPELINE_OPERATOR_TOKEN"
 ```
 
 ### Bounded batch replay
@@ -214,13 +215,13 @@ curl -X POST "http://127.0.0.1:8000/api/v1/pipeline/items/<meme_file_id>/sync/me
 ```bash
 # Qdrant batch:
 curl -X POST "http://127.0.0.1:8000/api/v1/pipeline/sync/qdrant/replay-batch" \
-  -H "X-Memexpert-Operator-Token: $MEMEXPERT_PIPELINE_OPERATOR_TOKEN" \
+  -H "X-Memexpert-Operator-Token: $PIPELINE_OPERATOR_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"meme_file_ids": ["<id1>", "<id2>", "<id3>"]}'
 
 # Meilisearch batch:
 curl -X POST "http://127.0.0.1:8000/api/v1/pipeline/sync/meili/replay-batch" \
-  -H "X-Memexpert-Operator-Token: $MEMEXPERT_PIPELINE_OPERATOR_TOKEN" \
+  -H "X-Memexpert-Operator-Token: $PIPELINE_OPERATOR_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"meme_file_ids": ["<id1>", "<id2>", "<id3>"]}'
 ```
@@ -260,13 +261,13 @@ Operational guidance:
 ```bash
 # Prove one item by id:
 curl -X POST "http://127.0.0.1:8000/api/v1/pipeline/search/smoke" \
-  -H "X-Memexpert-Operator-Token: $MEMEXPERT_PIPELINE_OPERATOR_TOKEN" \
+  -H "X-Memexpert-Operator-Token: $PIPELINE_OPERATOR_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"meme_file_id": "<meme_file_id>"}'
 
 # Prove whichever item surfaces for a natural-language query:
 curl -X POST "http://127.0.0.1:8000/api/v1/pipeline/search/smoke" \
-  -H "X-Memexpert-Operator-Token: $MEMEXPERT_PIPELINE_OPERATOR_TOKEN" \
+  -H "X-Memexpert-Operator-Token: $PIPELINE_OPERATOR_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"query": "crying cat drinking water"}'
 ```

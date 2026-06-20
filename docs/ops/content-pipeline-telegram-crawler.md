@@ -447,7 +447,7 @@ pause/resume automation, replay, and freshness inspection. Pass the operator
 token in the `X-Memexpert-Operator-Token` header.
 
 ```bash
-export TOKEN="$MEMEXPERT_PIPELINE_OPERATOR_TOKEN"
+export TOKEN="$PIPELINE_OPERATOR_TOKEN"
 export BASE="http://127.0.0.1:8000"
 
 # List Telegram sessions with owned channel counts.

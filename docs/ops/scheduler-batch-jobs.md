@@ -232,7 +232,7 @@ For API-level inspect, use the existing pipeline item detail endpoint:
 
 ```bash
 curl "http://127.0.0.1:8000/api/v1/pipeline/items/<meme_file_id>/detail" \
-  -H "X-Memexpert-Operator-Token: $MEMEXPERT_PIPELINE_OPERATOR_TOKEN"
+  -H "X-Memexpert-Operator-Token: $PIPELINE_OPERATOR_TOKEN"
 ```
 
 ## Replay And Full Resync Paths
@@ -249,10 +249,10 @@ Manual per-file/per-target replay remains the existing operator API path documen
 
 ```bash
 curl -X POST "http://127.0.0.1:8000/api/v1/pipeline/items/<meme_file_id>/sync/qdrant/replay" \
-  -H "X-Memexpert-Operator-Token: $MEMEXPERT_PIPELINE_OPERATOR_TOKEN"
+  -H "X-Memexpert-Operator-Token: $PIPELINE_OPERATOR_TOKEN"
 
 curl -X POST "http://127.0.0.1:8000/api/v1/pipeline/items/<meme_file_id>/sync/meili/replay" \
-  -H "X-Memexpert-Operator-Token: $MEMEXPERT_PIPELINE_OPERATOR_TOKEN"
+  -H "X-Memexpert-Operator-Token: $PIPELINE_OPERATOR_TOKEN"
 ```
 
 Those endpoints still queue the pipeline worker per-target replay path; the scheduler job does not remove or replace them.
