@@ -10,6 +10,18 @@ import type {
   AdminModerationReportRead,
   AdminSessionRead,
   AdminSourceChannelRead,
+  AdminTelegramChannelAssignPayload,
+  AdminTelegramChannelCreatePayload,
+  AdminTelegramChannelGroupRead,
+  AdminTelegramChannelOrphanPayload,
+  AdminTelegramChannelUpdatePayload,
+  AdminTelegramSessionActionRead,
+  AdminTelegramSessionCreatePayload,
+  AdminTelegramSessionDeletePayload,
+  AdminTelegramSessionRead,
+  AdminTelegramSessionUpdatePayload,
+  AdminTelegramSessionValidatePayload,
+  AdminTelegramSessionValidateRead,
   ChannelSuggestionRead,
   CollectionInviteLinkRead,
   CollectionInviteRead,
@@ -522,6 +534,101 @@ export async function fetchAdminMemeDetail(request: CatalogRequest, memeId: stri
 
 export async function fetchAdminMemeTemplates(request: CatalogRequest): Promise<AdminMemeTemplateRead[]> {
   return apiGet<AdminMemeTemplateRead[]>('/api/v1/admin/meme-templates', new URLSearchParams(), request);
+}
+
+export async function fetchAdminTelegramSessions(request: CatalogRequest): Promise<AdminTelegramSessionRead[]> {
+  return apiGet<AdminTelegramSessionRead[]>('/api/v1/admin/telegram/sessions', new URLSearchParams(), request);
+}
+
+export async function createAdminTelegramSession(request: CatalogRequest & { body: AdminTelegramSessionCreatePayload }): Promise<AdminTelegramSessionRead> {
+  return apiWrite<AdminTelegramSessionRead>('/api/v1/admin/telegram/sessions', 'POST', request);
+}
+
+export async function updateAdminTelegramSession(
+  request: CatalogRequest & { body: AdminTelegramSessionUpdatePayload },
+  sessionId: string
+): Promise<AdminTelegramSessionRead> {
+  return apiWrite<AdminTelegramSessionRead>(
+    `/api/v1/admin/telegram/sessions/${encodeURIComponent(sessionId)}`,
+    'PATCH',
+    request
+  );
+}
+
+export async function validateAdminTelegramSession(
+  request: CatalogRequest & { body?: AdminTelegramSessionValidatePayload },
+  sessionId: string
+): Promise<AdminTelegramSessionValidateRead> {
+  return apiWrite<AdminTelegramSessionValidateRead>(
+    `/api/v1/admin/telegram/sessions/${encodeURIComponent(sessionId)}/validate`,
+    'POST',
+    request
+  );
+}
+
+export async function deleteAdminTelegramSession(
+  request: CatalogRequest & { body: AdminTelegramSessionDeletePayload },
+  sessionId: string
+): Promise<AdminTelegramSessionActionRead> {
+  return apiWrite<AdminTelegramSessionActionRead>(
+    `/api/v1/admin/telegram/sessions/${encodeURIComponent(sessionId)}`,
+    'DELETE',
+    request
+  );
+}
+
+export async function fetchAdminTelegramChannels(
+  request: CatalogRequest & { telegramSessionId?: string | null; orphaned?: boolean | null }
+): Promise<AdminSourceChannelRead[]> {
+  const params = new URLSearchParams();
+  if (request.telegramSessionId) {
+    params.set('telegram_session_id', request.telegramSessionId);
+  }
+  if (request.orphaned !== undefined && request.orphaned !== null) {
+    params.set('orphaned', String(request.orphaned));
+  }
+  return apiGet<AdminSourceChannelRead[]>('/api/v1/admin/telegram/channels', params, request);
+}
+
+export async function fetchAdminTelegramChannelGroups(request: CatalogRequest): Promise<AdminTelegramChannelGroupRead[]> {
+  return apiGet<AdminTelegramChannelGroupRead[]>('/api/v1/admin/telegram/channels/grouped', new URLSearchParams(), request);
+}
+
+export async function addAdminTelegramChannel(request: CatalogRequest & { body: AdminTelegramChannelCreatePayload }): Promise<AdminSourceChannelRead> {
+  return apiWrite<AdminSourceChannelRead>('/api/v1/admin/telegram/channels', 'POST', request);
+}
+
+export async function updateAdminTelegramChannel(
+  request: CatalogRequest & { body: AdminTelegramChannelUpdatePayload },
+  channelId: string
+): Promise<AdminSourceChannelRead> {
+  return apiWrite<AdminSourceChannelRead>(
+    `/api/v1/admin/telegram/channels/${encodeURIComponent(channelId)}`,
+    'PATCH',
+    request
+  );
+}
+
+export async function assignAdminTelegramChannel(
+  request: CatalogRequest & { body: AdminTelegramChannelAssignPayload },
+  channelId: string
+): Promise<AdminSourceChannelRead> {
+  return apiWrite<AdminSourceChannelRead>(
+    `/api/v1/admin/telegram/channels/${encodeURIComponent(channelId)}/assign`,
+    'POST',
+    request
+  );
+}
+
+export async function orphanAdminTelegramChannel(
+  request: CatalogRequest & { body?: AdminTelegramChannelOrphanPayload },
+  channelId: string
+): Promise<AdminSourceChannelRead> {
+  return apiWrite<AdminSourceChannelRead>(
+    `/api/v1/admin/telegram/channels/${encodeURIComponent(channelId)}/orphan`,
+    'POST',
+    request
+  );
 }
 
 export async function reviewChannelSuggestion(

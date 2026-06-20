@@ -78,7 +78,7 @@ export const actions: Actions = {
           platform_id: readRequired(data, 'platform_id'),
           username: readOptional(data, 'username'),
           title: readRequired(data, 'title'),
-          telegram_session_name: readOptional(data, 'telegram_session_name'),
+          orphaned: true,
           catchup_message_limit: readInt(data, 'catchup_message_limit', 500),
           catchup_enabled: data.get('catchup_enabled') === 'on',
           live_enabled: data.get('live_enabled') === 'on',

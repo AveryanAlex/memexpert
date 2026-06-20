@@ -79,7 +79,10 @@
     {/if}
   </AdminPanel>
 
-  <AdminPanel title="Add Source Channel">
+  <AdminPanel title="Add Orphaned Source Channel">
+    <p class="m-0 text-sm text-muted">
+      This shortcut creates an explicit orphaned source channel with crawler/indexing controls forced off. Assign Telegram channels to DB-backed sessions from <ActionLink href="/admin/telegram" variant="ghost" size="compact">Telegram admin</ActionLink>.
+    </p>
     <form method="POST" action="?/addSourceChannel" class="grid gap-3">
       <Select name="platform" aria-label="Platform">
         <option value="telegram">Telegram</option>
@@ -89,12 +92,12 @@
       <Input name="platform_id" placeholder="platform id" required />
       <Input name="title" placeholder="title" required />
       <Input name="username" placeholder="username" />
-      <Input name="telegram_session_name" placeholder="Telegram session name" />
+      <input type="hidden" name="orphaned" value="true" />
       <Input name="catchup_message_limit" type="number" min="1" max="10000" value="500" />
-      <label class="inline-flex items-center gap-2 text-chiptext"><input name="catchup_enabled" type="checkbox" checked /> Catch-up enabled</label>
-      <label class="inline-flex items-center gap-2 text-chiptext"><input name="live_enabled" type="checkbox" checked /> Live enabled</label>
-      <label class="inline-flex items-center gap-2 text-chiptext"><input name="engagement_enabled" type="checkbox" checked /> Engagement enabled</label>
-      <Button type="submit">Add channel</Button>
+      <label class="inline-flex items-center gap-2 text-chiptext"><input name="catchup_enabled" type="checkbox" disabled /> Catch-up disabled while orphaned</label>
+      <label class="inline-flex items-center gap-2 text-chiptext"><input name="live_enabled" type="checkbox" disabled /> Live disabled while orphaned</label>
+      <label class="inline-flex items-center gap-2 text-chiptext"><input name="engagement_enabled" type="checkbox" disabled /> Engagement disabled while orphaned</label>
+      <Button type="submit">Add orphaned channel</Button>
     </form>
   </AdminPanel>
 </div>
@@ -112,10 +115,13 @@
               {channel.platform}:{channel.platform_id} · {channel.operational_status} · {freshnessCopy(channel)}
             </p>
             <p class="m-0 text-muted">
-              {channel.username ?? 'no username'} · session {channel.telegram_session_name ?? 'unassigned'} · catch-up {channel.catchup_enabled ? 'on' : 'off'} / {channel.catchup_message_limit} · live {channel.live_enabled ? 'on' : 'off'} · engagement {channel.engagement_enabled ? 'on' : 'off'}
+              {channel.username ?? 'no username'} · {channel.telegram_session_id ? 'assigned Telegram channel' : 'orphaned channel'} · indexable {channel.is_indexable ? 'yes' : 'no'} · catch-up {channel.catchup_enabled ? 'on' : 'off'} / {channel.catchup_message_limit} · live {channel.live_enabled ? 'on' : 'off'} · engagement {channel.engagement_enabled ? 'on' : 'off'}
             </p>
           </div>
           <div class="flex flex-wrap justify-end gap-2">
+            {#if channel.platform === 'telegram'}
+              <ActionLink href="/admin/telegram" variant="secondary" size="compact">Manage assignment</ActionLink>
+            {/if}
             {#if channel.is_active}
               <form method="POST" action="?/toggleSourceChannel">
                 <input type="hidden" name="channel_id" value={channel.id} />
