@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import secrets
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from enum import StrEnum
 
 from pydantic import BaseModel, Field
@@ -226,6 +226,20 @@ class PublicMemeSearchResultRead(BaseModel):
     attribution: MemeResultAttributionRead = Field(default_factory=MemeResultAttributionRead)
 
 
+class PublicMemeOfTheDayRead(BaseModel):
+    """Daily public-safe MOTD cache response for homepage rendering."""
+
+    meme: PublicMemeCardRead | None = None
+    selected_for: date
+    refreshed_at: datetime
+    algorithm_version: str
+    score: float | None = None
+    score_components: dict[str, float] = Field(default_factory=dict)
+    reason: str
+    candidate_count: int
+    attribution: MemeResultAttributionRead | None = None
+
+
 class PublicMemeSearchPageRead(BaseModel):
     """Offset pagination envelope for public meme catalog responses."""
 
@@ -431,6 +445,7 @@ __all__ = [
     "PublicMemeFileRead",
     "PublicMemeFileRenderRead",
     "PublicMemeLandingRead",
+    "PublicMemeOfTheDayRead",
     "PublicMemePopularityPointRead",
     "PublicMemePopularitySummaryRead",
     "PublicTrendAggregatePointRead",

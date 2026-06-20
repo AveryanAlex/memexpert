@@ -44,6 +44,7 @@ EXPECTED_TABLES = {
     "meme_file_sync_target_snapshots",
     "meme_files",
     "meme_merge_logs",
+    "meme_of_the_day_selections",
     "meme_seo_pages",
     "meme_source_engagement_snapshots",
     "meme_sources",
@@ -337,16 +338,16 @@ def test_initial_revision_metadata_is_present() -> None:
     config = _build_alembic_config()
     script_directory = ScriptDirectory.from_config(config)
     revision = script_directory.get_revision("head")
-    previous_revision = script_directory.get_revision("0023")
+    previous_revision = script_directory.get_revision("0024")
 
     assert revision is not None
-    assert revision.revision == "0024"
-    assert revision.down_revision == "0023"
-    assert revision.doc == "telegram session registry"
+    assert revision.revision == "0025"
+    assert revision.down_revision == "0024"
+    assert revision.doc == "meme of the day cache"
     assert previous_revision is not None
-    assert previous_revision.revision == "0023"
-    assert previous_revision.down_revision == "0022"
-    assert previous_revision.doc == "source engagement public read models"
+    assert previous_revision.revision == "0024"
+    assert previous_revision.down_revision == "0023"
+    assert previous_revision.doc == "telegram session registry"
 
 
 async def test_upgrade_head_creates_expected_schema_and_constraints(
@@ -360,7 +361,7 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
     table_names = await _get_table_names(engine)
     assert table_names == EXPECTED_TABLES | {"alembic_version"}
     assert "meme_popularity_snapshots" not in table_names
-    assert await _get_current_revision(engine) == "0024"
+    assert await _get_current_revision(engine) == "0025"
     assert await _get_materialized_view_names(engine) == EXPECTED_MATERIALIZED_VIEWS
 
     users_indexes = await _get_index_definitions(engine, "users")
@@ -370,6 +371,7 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
     meme_file_ocr_result_indexes = await _get_index_definitions(engine, "meme_file_ocr_results")
     meme_merge_log_indexes = await _get_index_definitions(engine, "meme_merge_logs")
     meme_sources_indexes = await _get_index_definitions(engine, "meme_sources")
+    motd_indexes = await _get_index_definitions(engine, "meme_of_the_day_selections")
     meme_source_engagement_snapshot_indexes = await _get_index_definitions(
         engine,
         "meme_source_engagement_snapshots",
@@ -392,6 +394,8 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
     meme_files_columns = await _get_column_names(engine, "meme_files")
     meme_merge_log_columns = await _get_column_names(engine, "meme_merge_logs")
     meme_sources_columns = await _get_column_names(engine, "meme_sources")
+    motd_columns = await _get_column_names(engine, "meme_of_the_day_selections")
+    motd_constraints = await _get_constraint_definitions(engine, "meme_of_the_day_selections")
     meme_source_engagement_snapshot_columns = await _get_column_names(
         engine,
         "meme_source_engagement_snapshots",
@@ -485,6 +489,28 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
     assert constraints["meme_sources_uniques"] == {
         "uq_meme_sources_platform_source_post": ["platform", "source_id", "post_id"],
     }
+    assert motd_columns == {
+        "algorithm_version",
+        "candidate_count",
+        "created_at",
+        "id",
+        "meme_id",
+        "reason",
+        "refreshed_at",
+        "score",
+        "score_components",
+        "selected_for",
+        "updated_at",
+    }
+    assert "uq_motd_selected_for_algorithm_version" in motd_constraints
+    assert "selected_for" in motd_constraints["uq_motd_selected_for_algorithm_version"]
+    assert "algorithm_version" in motd_constraints["uq_motd_selected_for_algorithm_version"]
+    motd_check_sql = " ".join(motd_constraints.values()).lower()
+    assert "candidate_count >= 0" in motd_check_sql
+    assert "algorithm_version" in motd_check_sql
+    assert "reason" in motd_check_sql
+    assert "ix_meme_of_the_day_selections_selected_for" in motd_indexes
+    assert "ix_meme_of_the_day_selections_meme_id" in motd_indexes
     assert {
         "last_engagement_check_at",
         "next_engagement_check_at",
@@ -978,7 +1004,7 @@ async def test_crawler_sources_migration_applies_and_reverses(
     config = _build_alembic_config(database_url)
 
     await _run_alembic_command(command.upgrade, config, "head")
-    assert await _get_current_revision(engine) == "0024"
+    assert await _get_current_revision(engine) == "0025"
 
     meme_sources_columns = await _get_column_names(engine, "meme_sources")
     source_channels_columns = await _get_column_names(engine, "source_channels")
@@ -1098,7 +1124,7 @@ async def test_repeated_fresh_database_upgrades_work_after_a_full_downgrade(
     await _run_alembic_command(command.downgrade, config, "base")
     await _run_alembic_command(command.upgrade, config, "head")
 
-    assert await _get_current_revision(engine) == "0024"
+    assert await _get_current_revision(engine) == "0025"
     assert EXPECTED_TABLES.issubset(await _get_table_names(engine))
 
 

@@ -13,6 +13,7 @@ from memexpert.core.meilisearch import PipelineMeilisearchSyncClient
 from memexpert.core.qdrant import PipelineQdrantClient, PipelineQdrantUserSearchClient
 from memexpert.core.voyage import build_pipeline_voyage_client
 from memexpert.services.analytics import AnalyticsService
+from memexpert.services.meme_of_the_day import MemeOfTheDayService
 from memexpert.services.meme_search import MemeSearchService
 from memexpert.services.public_trends import PublicTrendsService
 from memexpert.services.query_embedding import CachedTextQueryEmbeddingService
@@ -53,6 +54,12 @@ def get_public_trends_service(session: Annotated[AsyncSession, Depends(get_db_se
     return PublicTrendsService(session)
 
 
+def get_meme_of_the_day_service(session: Annotated[AsyncSession, Depends(get_db_session)]) -> MemeOfTheDayService:
+    """Build the durable Meme of the Day service for request handlers."""
+
+    return MemeOfTheDayService(session)
+
+
 def get_meme_report_service(session: Annotated[AsyncSession, Depends(get_db_session)]) -> MemeReportService:
     """Build the user-facing meme report service for request handlers."""
 
@@ -66,6 +73,7 @@ def get_seo_catalog_service(session: Annotated[AsyncSession, Depends(get_db_sess
 
 
 AnalyticsServiceDep = Annotated[AnalyticsService, Depends(get_analytics_service)]
+MemeOfTheDayServiceDep = Annotated[MemeOfTheDayService, Depends(get_meme_of_the_day_service)]
 MemeReportServiceDep = Annotated[MemeReportService, Depends(get_meme_report_service)]
 MemeSearchServiceDep = Annotated[MemeSearchService, Depends(get_meme_search_service)]
 PublicTrendsServiceDep = Annotated[PublicTrendsService, Depends(get_public_trends_service)]
@@ -74,11 +82,13 @@ SeoCatalogServiceDep = Annotated[SeoCatalogService, Depends(get_seo_catalog_serv
 
 __all__ = [
     "AnalyticsServiceDep",
+    "MemeOfTheDayServiceDep",
     "MemeReportServiceDep",
     "MemeSearchServiceDep",
     "PublicTrendsServiceDep",
     "SeoCatalogServiceDep",
     "get_analytics_service",
+    "get_meme_of_the_day_service",
     "get_meme_search_service",
     "get_meme_report_service",
     "get_public_trends_service",

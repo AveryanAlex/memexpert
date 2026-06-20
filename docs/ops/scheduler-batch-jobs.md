@@ -4,6 +4,7 @@ This runbook covers the backend scheduler jobs that perform deferred, bounded wo
 
 - `source-engagement-capture` claims due Telegram source posts and enqueues metric refresh work.
 - `materialized-view-refresh` refreshes public trend materialized views derived from source engagement snapshots and analytics events.
+- `motd` refreshes the deterministic Meme of the Day cache row for the current UTC date.
 - `search-index-sync` updates Qdrant and Meilisearch from canonical PostgreSQL state.
 - `seo-backlog-batches` generates or refreshes public-safe meme SEO pages.
 - `rabbitmq-outbox-publisher` publishes durable RabbitMQ outbox messages.
@@ -44,6 +45,23 @@ Source engagement and public trend jobs:
 | `SCHEDULER_MATERIALIZED_VIEW_REFRESH_ENABLED` | `true` | Enables the public trend MV refresh job. |
 | `SCHEDULER_MATERIALIZED_VIEW_REFRESH_INTERVAL_SECONDS` | `300` | Refresh cadence for the derived public trend read models. |
 
+Meme of the Day job and API refresh:
+
+| variable | default | meaning |
+|---|---:|---|
+| `SCHEDULER_MOTD_ENABLED` | `true` | Enables the scheduled MOTD cache refresh job. |
+| `SCHEDULER_MOTD_INTERVAL_SECONDS` | `86400` | APScheduler interval. The selection key is still the UTC date plus `MOTD_ALGORITHM_VERSION`. |
+| `MOTD_ALGORITHM_VERSION` | `motd_v1` | Cache key and attribution algorithm version for the deterministic selector. |
+| `MOTD_CANDIDATE_LOOKBACK_DAYS` | `30` | Recent-candidate window. Today's UTC selection ends at current UTC time; past/future requested dates end at the requested UTC date's next midnight. |
+| `MOTD_CANDIDATE_LIMIT` | `50` | Maximum candidate rows scored per refresh. |
+| `MOTD_MIN_QUALITY_SCORE` | `0.5` | Minimum `meme_files.quality_score` on the meme's primary file. |
+| `MOTD_POPULARITY_WEIGHT` | `0.35` | Weight for `public_meme_trends_mv.latest_popularity_score` after log scaling. |
+| `MOTD_TRENDING_GROWTH_WEIGHT` | `0.30` | Weight for positive recent-vs-previous trend growth from `public_meme_trends_mv` event-count columns after log scaling. |
+| `MOTD_NOVELTY_WEIGHT` | `0.20` | Weight for recency within the configured lookback window. |
+| `MOTD_QUALITY_WEIGHT` | `0.15` | Weight for primary-file quality. |
+
+`GET /api/v1/memes/meme-of-the-day` is public and returns today's cached row, lazily refreshing when the row is missing. `POST /api/v1/memes/meme-of-the-day/refresh` requires `AdminUserDep` and recomputes the deterministic row; it is manual refresh only, not manual/admin override. Admin override remains deferred and no override model or endpoint exists.
+
 SEO backlog job:
 
 | variable | default | meaning |
@@ -78,9 +96,19 @@ Search-index, source-engagement, and SEO jobs emit:
 | `skipped` | Claimed items that could not be finalized because another run changed the row, or SEO generation returned a non-write skip result. |
 | `duration_seconds` | Wall-clock seconds spent inside the job action. |
 
-The source-engagement job uses `claimed` for due source rows and `enqueued` for RabbitMQ outbox messages written. The outbox publisher emits the same `event=scheduler_job_batch_result` with `job_id=rabbitmq-outbox-publisher`, `recovered`, `claimed`, `published`, `failed`, and `duration_seconds` fields.
+The source-engagement job uses `claimed` for due source rows and `enqueued` for RabbitMQ outbox messages written. The MOTD job emits the same `event=scheduler_job_batch_result` with `job_id=motd`, `candidate_count`, `selected_meme_id`, `reason`, `algorithm_version`, and `refreshed_at`. The outbox publisher emits the same event with `job_id=rabbitmq-outbox-publisher`, `recovered`, `claimed`, `published`, `failed`, and `duration_seconds` fields.
 
 The generic wrapper still emits `scheduler_job_started`, `scheduler_job_succeeded`, and `scheduler_job_failed`. A non-zero `failed` count inside `scheduler_job_batch_result` does not make the scheduler action fail; failures are durable backlog state and are retried by later runs where appropriate.
+
+## Meme Of The Day Work Selection
+
+The durable cache table is `meme_of_the_day_selections`, unique on `(selected_for, algorithm_version)`. Refreshes upsert the current UTC date for scheduled runs, or the requested date for service/API callers.
+
+Candidate filters are intentionally public-safe: `memes.is_public IS TRUE`, `memes.is_nsfw IS FALSE`, primary file quality at or above `MOTD_MIN_QUALITY_SCORE`, and `memes.created_at` inside the configured lookback window. For the current UTC date, the upper bound is current UTC time so future-created rows cannot win today's MOTD; past and future requested dates use the deterministic full UTC date window. The selector left-joins `public_meme_trends_mv`; candidates without an MV row remain eligible with popularity/trend inputs treated as `0`.
+
+Scoring uses weighted popularity, positive trending growth, recency/novelty, and quality. Selection is deterministic: score descending, then newest `created_at`, then meme id. No random selection is used. If no candidate qualifies, the job stores a fallback row with `meme_id=NULL`, `candidate_count=0`, and `reason='no_candidates'`; the public API returns `meme: null` and no attribution for that row.
+
+When a meme is selected, the API response includes `MemeResultAttributionRead` with `source_algorithm='motd'`, `surface='web_home'`, `rank=1`, `algorithm_version`, `score`, `score_components`, and `reason`. Frontend impression/click/action telemetry should forward this attribution unchanged.
 
 ## RabbitMQ Outbox Work Selection
 

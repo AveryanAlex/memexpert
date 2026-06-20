@@ -4,12 +4,13 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from typing import TYPE_CHECKING
 
 from sqlalchemy import (
     BigInteger,
     CheckConstraint,
+    Date,
     Float,
     ForeignKey,
     ForeignKeyConstraint,
@@ -146,6 +147,39 @@ class Meme(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         back_populates="meme",
         cascade="all, delete-orphan",
     )
+    motd_selections: Mapped[list["MemeOfTheDaySelection"]] = relationship(
+        "MemeOfTheDaySelection",
+        back_populates="meme",
+        passive_deletes=True,
+    )
+
+
+class MemeOfTheDaySelection(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """Durable daily MOTD cache row keyed by date and algorithm version."""
+
+    __tablename__ = "meme_of_the_day_selections"
+    __table_args__ = (
+        UniqueConstraint("selected_for", "algorithm_version", name="uq_motd_selected_for_algorithm_version"),
+        CheckConstraint("candidate_count >= 0", name="meme_of_the_day_candidate_count_non_negative"),
+        CheckConstraint("algorithm_version <> ''", name="meme_of_the_day_algorithm_version_not_blank"),
+        CheckConstraint("reason <> ''", name="meme_of_the_day_reason_not_blank"),
+        Index("ix_meme_of_the_day_selections_selected_for", "selected_for"),
+        Index("ix_meme_of_the_day_selections_meme_id", "meme_id"),
+    )
+
+    selected_for: Mapped[date] = mapped_column(Date, nullable=False)
+    algorithm_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    meme_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("memes.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    score_components: Mapped[dict[str, float]] = mapped_column(JSONB, default=dict, nullable=False)
+    reason: Mapped[str] = mapped_column(String(128), nullable=False)
+    candidate_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    refreshed_at: Mapped[datetime] = mapped_column(default=utcnow, nullable=False)
+
+    meme: Mapped["Meme | None"] = relationship("Meme", back_populates="motd_selections")
 
 
 class ModerationReport(UUIDPrimaryKeyMixin, TimestampMixin, Base):
