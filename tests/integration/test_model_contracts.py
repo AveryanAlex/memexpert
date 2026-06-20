@@ -1561,7 +1561,7 @@ def test_source_channel_exposes_crawler_checkpoint_columns() -> None:
     assert columns["engagement_enabled"].default.arg is True
     assert columns["is_paused"].default.arg is False
 
-    index_names = {index.name for index in SourceChannel.__table__.indexes}
+    index_names = {index.name for index in cast("Table", SourceChannel.__table__).indexes}
     assert "ix_source_channels_telegram_session_id" in index_names
     assert "ix_source_channels_session_live" in index_names
     assert "ix_source_channels_session_engagement" in index_names

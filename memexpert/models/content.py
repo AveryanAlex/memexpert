@@ -996,8 +996,8 @@ class TelegramSession(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     name: Mapped[str] = mapped_column(String(64), nullable=False)
     display_name: Mapped[str] = mapped_column(String(255), nullable=False)
-    # TODO(t_941f280c-stage2): wire the encryption helper before writing
-    # Telethon StringSession material. API read schemas must never expose this.
+    # Telethon StringSession material encrypted with the runtime secret. API
+    # read schemas must never expose this column.
     encrypted_string_session: Mapped[str | None] = mapped_column(Text, nullable=True)
     account_user_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     account_username: Mapped[str | None] = mapped_column(String(255), nullable=True)

@@ -57,16 +57,16 @@ passes iff the final snapshot proves `slo_p50_pass=True` AND
   process both `media_inspect_requested` events from raw crawler accept and
   the later `transcode → ocr → embed → classify → sync_qdrant → sync_meili`
   chain that materialized crawler content feeds.
-- Environment variables (all prefixed with `MEMEXPERT_` in `.env`):
+- Environment variables loaded through the project `.env` / `Settings` surface:
   - `PIPELINE_OPERATOR_TOKEN` — same token the S02/S03 harnesses use.
     The S04 harness reads it from `get_settings()` when
     `--operator-token` is not passed on the CLI.
   - `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` — the Telethon app
     credentials. These are per-environment secrets; never commit them.
-  - `TELEGRAM_SESSION_DIR` — defaults to `.telegram-sessions` in the
-    repo root. The directory holds the `*.session` files Telethon
-    persists; the `.telegram-sessions/.gitkeep` placeholder is tracked
-    but every `*.session` file is excluded via `.gitignore`.
+  - `TELEGRAM_SESSION_ENCRYPTION_SECRET` — high-entropy secret used to
+    encrypt/decrypt DB-backed Telethon `StringSession` values in
+    `telegram_sessions.encrypted_string_session`. Production must set a
+    real value and keep it stable across deploys.
   - `CRAWLER_FRESHNESS_SLO_P50_SECONDS` / `CRAWLER_FRESHNESS_SLO_P95_SECONDS`
     — override the defaults when running against a slower or faster
     stack profile.
@@ -81,22 +81,25 @@ passes iff the final snapshot proves `slo_p50_pass=True` AND
     to `false` in environments where catch-up is the only sanctioned
     mode.
 
-### Telethon session auth
+### Telethon StringSession import
 
-Before the harness can prove freshness, the operator must authenticate
-each Telethon session the fixture references. Use
-`scripts/auth_telegram_session.py`:
+Before the harness can prove freshness, the operator must import an already
+authorized Telethon `StringSession` for each session the fixture references.
+The helper validates the session with Telegram, encrypts it with
+`TELEGRAM_SESSION_ENCRYPTION_SECRET`, and stores only the encrypted value plus
+account projection fields in `telegram_sessions`:
 
 ```bash
 uv run python scripts/auth_telegram_session.py \
   --session-name primary \
-  --api-id $MEMEXPERT_TELEGRAM_API_ID \
-  --api-hash $MEMEXPERT_TELEGRAM_API_HASH
+  --display-name "Primary crawler" \
+  --string-session-file /run/secrets/telegram_string_session
 ```
 
-The script performs the interactive Telegram login and writes
-`.telegram-sessions/primary.session`. Repeat for every session name
-listed in the fixture.
+You can also provide the existing StringSession through `--string-session` or
+`TELEGRAM_STRING_SESSION`. The helper never creates `.session` files and never
+prints the StringSession value. Repeat for every session name listed in the
+fixture.
 
 Inspect which sessions are currently known via the operator surface:
 
@@ -105,9 +108,10 @@ curl -s "http://127.0.0.1:8000/api/v1/crawler/sessions" \
   -H "X-Memexpert-Operator-Token: $MEMEXPERT_PIPELINE_OPERATOR_TOKEN" | jq
 ```
 
-The response enumerates each `telegram_session_state` row with its
+The response enumerates each `telegram_sessions` row with its
 `status`, `last_heartbeat_at`, `flood_wait_until`, and
-`owned_channel_count`.
+`owned_channel_count`. The encrypted StringSession column is deliberately not
+included in API responses.
 
 ## Seeding curated channels
 
@@ -130,7 +134,7 @@ INSERT INTO source_channels (
     is_paused,
     catchup_enabled,
     catchup_message_limit,
-    session_id,
+    telegram_session_id,
     created_at,
     updated_at
 )
@@ -144,11 +148,16 @@ VALUES (
     FALSE,
     TRUE,
     500,
-    'primary',                  -- must match telegram_session_state.session_name
+    (SELECT id FROM telegram_sessions WHERE name = 'primary'),
     NOW(),
     NOW()
 );
 ```
+
+`source_channels.telegram_session_id` is nullable with `ON DELETE SET NULL`.
+If a session row is removed, its channels become orphans: they remain visible
+to operators, but catch-up/live/engagement workers skip or reject them until an
+operator reassigns them to an active session.
 
 Then copy the example fixture and point the harness at your edited copy:
 
@@ -177,31 +186,31 @@ uv run python - <<'PY'
 import asyncio
 
 from memexpert.core.config import get_settings
-from memexpert.core.database import get_db_session_context
+from memexpert.core.database import build_async_engine, build_async_session_factory
 from memexpert.crawlers.telegram.runtime import TelegramCrawlerRuntime
 from memexpert.crawlers.telegram.telethon_adapter import PipelineTelethonClient
 from memexpert.ingest.crawler_service import PipelineCrawlerIngestService
 
 async def main() -> None:
     settings = get_settings()
-    async with get_db_session_context() as session:
-        ingest_service = PipelineCrawlerIngestService.from_settings(session, settings=settings)
-        telegram_client = PipelineTelethonClient(
-            session_name="primary",
-            api_id=int(settings.telegram_api_id),
-            api_hash=settings.telegram_api_hash.get_secret_value(),
-            session_dir=settings.telegram_session_dir,
-        )
-        runtime = TelegramCrawlerRuntime(
-            ingest_service=ingest_service,
-            telegram_client=telegram_client,
-            session=session,
-            settings=settings,
-        )
-        await runtime.catch_up_channel("primary", "@example_memes_en")
-        await runtime.start_live_listener("primary")
-        # Leave the listener running until the operator stops the script.
-        await asyncio.Event().wait()
+    engine = build_async_engine(settings.database_url)
+    session_factory = build_async_session_factory(engine)
+    try:
+        async with session_factory() as session:
+            ingest_service = PipelineCrawlerIngestService.from_settings(session, settings=settings)
+            telegram_client = PipelineTelethonClient.create(settings=settings, session_name="primary")
+            runtime = TelegramCrawlerRuntime(
+                ingest_service=ingest_service,
+                telegram_client=telegram_client,
+                session=session,
+                settings=settings,
+            )
+            await runtime.catch_up_channel("primary", "@example_memes_en")
+            await runtime.start_live_listener("primary")
+            # Leave the listener running until the operator stops the script.
+            await asyncio.Event().wait()
+    finally:
+        await engine.dispose()
 
 asyncio.run(main())
 PY
@@ -465,7 +474,7 @@ When Telegram returns a `FloodWaitError`, the Telethon adapter raises
 - `code=telegram_flood_wait`
 - `Retry-After: <seconds>` header
 
-The affected `telegram_session_state` row transitions into
+The affected `telegram_sessions` row transitions into
 `status=flood_wait` and `flood_wait_until` is set to
 `now() + wait_seconds`. The runtime refuses to start a listener or
 catch-up sweep for a channel bound to a flood-waited session until the
@@ -481,32 +490,38 @@ Recovery steps:
    `active` on the next successful call. The T04 harness picks up the
    recovery automatically on the next poll.
 
-If the flood-wait keeps recurring, lower `CRAWLER_MAX_REQUESTS_PER_SECOND`
-and restart the ad-hoc driver.
+If the flood-wait keeps recurring, lower the session row's
+`max_requests_per_second` (preferred) or `CRAWLER_MAX_REQUESTS_PER_SECOND`
+fallback and restart the ad-hoc driver.
 
-## Session ban recovery
+## Session auth/ban recovery
 
 A permanent ban surfaces as `PipelineTelegramSessionBannedError` →
 `telegram_session_banned` / HTTP 503. The session row transitions into
-`status=banned` and the runtime refuses to use it for any further work.
-The only recoveries are:
+`status=quarantined` and the runtime refuses to use it for any further work.
+An unauthorized imported StringSession surfaces as
+`PipelineTelegramSessionAuthRequiredError` / `crawler_session_not_runnable`; the
+row is marked `status=auth_required`, not quarantined. Recovery options are:
 
 1. **Reassign affected channels** to another session via
    `POST /channels/{id}/reassign`. The reassign route explicitly
    distinguishes `crawler_invalid_session` (unknown target) from
    `crawler_session_not_runnable` (known target that is parked or
-   banned), so operator tooling can pick the next healthy session.
-2. **Re-authenticate** the banned session. Delete
-   `.telegram-sessions/<session-name>.session`, rerun
-   `scripts/auth_telegram_session.py --session-name <name>`, and
-   reset the session row via SQL:
+    quarantined), so operator tooling can pick the next healthy session.
+2. **Import a new StringSession** for the same registry row:
+   `scripts/auth_telegram_session.py --session-name <name> --string-session-file <path>`.
+   The helper validates Telegram authorization, replaces
+   `encrypted_string_session`, clears error fields, and sets `status='active'`.
+   If you must repair manually, update the row without ever exposing the secret:
    ```sql
-   UPDATE telegram_session_state
+   UPDATE telegram_sessions
       SET status = 'active',
-          flood_wait_until = NULL,
-          last_ban_reason = NULL,
-          last_heartbeat_at = NOW()
-    WHERE session_name = '<session-name>';
+           flood_wait_until = NULL,
+           quarantined_at = NULL,
+           last_error_class = NULL,
+           last_error_text = NULL,
+           last_heartbeat_at = NOW()
+    WHERE name = '<session-name>';
    ```
 3. **Re-run the harness** to confirm freshness recovers.
 
@@ -534,6 +549,9 @@ The only recoveries are:
   not seen any messages yet will produce an empty snapshot. Wait for the
   live listener to accumulate at least `--candidate-limit` posts, or
   lower `--candidate-limit` for the first proof run.
+- **`crawler_session_not_runnable` for Telegram.** The `telegram_sessions` row
+  is missing, disabled, not `active`, auth-required, or lacks encrypted
+  StringSession material. Import a valid StringSession or reassign the channel.
 - **Channels without `published_at`.** Legacy `MemeSource` rows without
   `published_at` populated are invisible to the freshness query — they
   do not contribute to or block the SLO. This is deliberate; see
@@ -597,7 +615,7 @@ When the harness reports `slo_p95_pass=False`, work top-down:
   known session via `GET /api/v1/crawler/sessions`; the limitation is in
   the driver, not in the surface.
 - **No runtime channel rebind without restart** — `POST /reassign`
-  updates the `source_channels.session_id` column but the in-process
+  updates the `source_channels.telegram_session_id` column but the in-process
   listener does NOT pick up the change on the fly. Restart the ad-hoc
   driver (or the future worker entrypoint) to pick up a fresh binding.
 - **Catch-up is worker-driven** — the operator API surface cannot

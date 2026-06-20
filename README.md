@@ -48,7 +48,7 @@ Important runtime variables:
 - `HOST`, `PORT`, `ORIGIN`: SvelteKit adapter-node server settings.
 - `FRONTEND_ORIGIN`: canonical public origin for frontend-generated SEO XML. Production should use `https://memexpert.net`; if unset, frontend XML falls back to `ORIGIN`, then `https://memexpert.net`.
 - `AUTH_TELEGRAM_BOT_TOKEN`: required only when running the optional bot profile.
-- `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_SESSION_DIR`: optional Telegram crawler session settings.
+- `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_SESSION_ENCRYPTION_SECRET`: optional Telegram crawler settings. Production must set a high-entropy encryption secret before importing DB-backed Telethon StringSessions.
 - `SCHEDULER_*`: enable flags, interval seconds, and PostgreSQL advisory-lock settings for the scheduler process.
 
 ## Local Development

@@ -62,6 +62,14 @@ class PipelineTelegramSessionBannedError(PipelineTelegramError):
     """
 
 
+class PipelineTelegramSessionNotRunnableError(PipelineTelegramError):
+    """Raised when durable session state cannot run a Telethon client."""
+
+
+class PipelineTelegramSessionAuthRequiredError(PipelineTelegramSessionNotRunnableError):
+    """Raised when a stored StringSession exists but is not authorized."""
+
+
 class PipelineTelegramMalformedMessageError(PipelineTelegramError):
     """Raised when Telethon returns a message the adapter cannot type-check.
 
@@ -395,7 +403,9 @@ __all__ = [
     "PipelineTelegramMalformedMessageError",
     "PipelineTelegramMessageMapper",
     "PipelineTelegramProviderUnavailableError",
+    "PipelineTelegramSessionAuthRequiredError",
     "PipelineTelegramSessionBannedError",
+    "PipelineTelegramSessionNotRunnableError",
     "RawTelegramChannel",
     "RawTelegramMessage",
 ]

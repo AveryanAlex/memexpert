@@ -32,6 +32,7 @@ from memexpert.schemas.user import ChannelSuggestionRead, UserRead
 MAX_SOURCE_ID_LENGTH = 255
 MAX_SOURCE_TITLE_LENGTH = 255
 MAX_SOURCE_USERNAME_LENGTH = 255
+MAX_TELEGRAM_SESSION_NAME_LENGTH = 64
 MAX_ADMIN_NOTE_LENGTH = 2048
 MAX_TEMPLATE_SLUG_LENGTH = 255
 MAX_TEMPLATE_NAME_LENGTH = 255
@@ -96,7 +97,7 @@ class AdminSourceChannelCreateRequest(BaseModel):
     username: str | None = Field(default=None, max_length=MAX_SOURCE_USERNAME_LENGTH)
     title: str = Field(min_length=1, max_length=MAX_SOURCE_TITLE_LENGTH)
     subscriber_count: int | None = Field(default=None, ge=0)
-    telegram_session_name: str | None = Field(default=None, max_length=255)
+    telegram_session_name: str | None = Field(default=None, max_length=MAX_TELEGRAM_SESSION_NAME_LENGTH)
     catchup_enabled: StrictBool = True
     live_enabled: StrictBool = True
     engagement_enabled: StrictBool = True

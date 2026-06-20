@@ -12,14 +12,19 @@
 #     - platform_id: "@channel_handle"    # must match source_channels.platform_id
 #       username: "channel_handle"          # optional, Telegram handle without @
 #       title: "Human-readable title"       # operator-facing label for reports
-#       session_name: "primary"              # Telethon session row name
+#       session_name: "primary"              # must match telegram_sessions.name
 #
 # Notes:
 # * ``platform_id`` is the ``source_channels.platform_id`` value the crawler
 #   runtime was bound to. For Telegram channels we conventionally prefix
 #   with ``@`` so the operator curl examples in the runbook line up.
-# * ``session_name`` must point at a row in ``telegram_session_state`` that
-#   is already authenticated via ``scripts/auth_telegram_session.py``.
+# * ``session_name`` must point at ``telegram_sessions.name``. The row must
+#   already contain encrypted imported Telethon StringSession material from
+#   ``scripts/auth_telegram_session.py``.
+# * ``source_channels`` rows bind to sessions through the nullable
+#   ``telegram_session_id`` FK. If a Telegram session row is deleted,
+#   ``ON DELETE SET NULL`` leaves affected channels orphaned until an
+#   operator reassigns them to another active session.
 # * The harness does NOT seed rows automatically — operators must insert
 #   the ``source_channels`` rows ahead of time (see the runbook for the
 #   copy-pasteable SQL template).
