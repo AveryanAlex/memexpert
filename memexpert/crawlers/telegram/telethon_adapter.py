@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 from io import BytesIO
 from typing import TYPE_CHECKING, Any, cast
 
+from pydantic import SecretStr
+from sqlalchemy import select
 from telethon import TelegramClient, events
 from telethon.errors import (
     AuthKeyUnregisteredError,
@@ -24,36 +26,44 @@ from telethon.errors import (
     SessionRevokedError,
     UserDeactivatedError,
 )
+from telethon.sessions import StringSession
 from telethon.tl.types import Channel, InputPeerChannel
 from telethon.tl.types import Message as TelethonMessage
 
+from memexpert.core.database import build_async_engine, build_async_session_factory
 from memexpert.crawlers.telegram.client import (
     PipelineTelegramClientProtocol,
     PipelineTelegramError,
     PipelineTelegramFloodWaitError,
     PipelineTelegramMalformedMessageError,
     PipelineTelegramProviderUnavailableError,
+    PipelineTelegramSessionAuthRequiredError,
     PipelineTelegramSessionBannedError,
+    PipelineTelegramSessionNotRunnableError,
     RawTelegramChannel,
     RawTelegramMessage,
 )
+from memexpert.crawlers.telegram.session_crypto import (
+    TelegramStringSessionCipher,
+    TelegramStringSessionDecryptError,
+)
 from memexpert.crawlers.telegram.telethon_mapper import TelethonMessageNormalizer
+from memexpert.models.content import TelegramSession
+from memexpert.models.enums import TelegramSessionStatus
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Sequence
-    from pathlib import Path
 
+    from sqlalchemy.ext.asyncio import AsyncEngine
     from telethon.events import NewMessage
 
     from memexpert.core.config import Settings
+    from memexpert.core.database import AsyncSessionFactory
 
 
-# Telethon's AUTH-level failures cover three distinct "this session is
-# dead" variants. Group them into one tuple so the translation layer
-# can hand them to a single except branch and map the lot onto
-# :class:`PipelineTelegramSessionBannedError`.
+# Telethon's AUTH-level failures that indicate actual account/session
+# revocation are permanent until an operator rotates the registry row.
 _SESSION_BANNED_EXCEPTIONS: tuple[type[BaseException], ...] = (
-    AuthKeyUnregisteredError,
     UserDeactivatedError,
     SessionRevokedError,
 )
@@ -66,8 +76,10 @@ def _translate_telethon_error(exc: BaseException) -> PipelineTelegramError:
 
     * ``FloodWaitError`` carries ``exc.seconds`` — preserve it so the
       runtime can park the session for the correct cooldown.
-    * ``AuthKey`` / ``UserDeactivated`` / ``SessionRevoked`` are all
-      permanent session failures; quarantine without retry.
+    * ``AuthKeyUnregisteredError`` means the stored StringSession is no
+      longer authorized; require re-import without treating it as a ban.
+    * ``UserDeactivated`` / ``SessionRevoked`` are permanent session failures;
+      quarantine without retry.
     * ``RPCError`` (everything else Telegram sends back) + generic
       ``ConnectionError`` / ``TimeoutError`` / ``OSError`` are transient
       provider failures — the runtime will log and continue.
@@ -80,6 +92,10 @@ def _translate_telethon_error(exc: BaseException) -> PipelineTelegramError:
             f"Telegram flood-waited this session for {wait_seconds}s.",
             wait_seconds=wait_seconds,
         )
+    if isinstance(exc, AuthKeyUnregisteredError):
+        return PipelineTelegramSessionAuthRequiredError(
+            "Telegram rejected the stored StringSession auth key; import a valid StringSession.",
+        )
     if isinstance(exc, _SESSION_BANNED_EXCEPTIONS):
         return PipelineTelegramSessionBannedError(
             f"Telegram marked this session as unusable: {exc.__class__.__name__}.",
@@ -91,50 +107,85 @@ def _translate_telethon_error(exc: BaseException) -> PipelineTelegramError:
     raise exc  # pragma: no cover - propagate unknown types for visibility
 
 
+@dataclass(frozen=True, slots=True)
+class _LoadedTelegramSessionConfig:
+    name: str
+    string_session: SecretStr = field(repr=False)
+    max_requests_per_second: float
+
+
 @dataclass(slots=True)
 class TelethonClientFactory:
     """Lazy factory that returns a connected :class:`TelegramClient`.
 
-    Reads ``telegram_api_id`` / ``telegram_api_hash`` / ``telegram_session_dir``
-    from :class:`memexpert.core.config.Settings` and opens the session
-    only on the first :meth:`get_client` call. Subsequent calls return
-    the cached client so the runtime does not reconnect on every
-    catch-up sweep.
+    Reads ``telegram_api_id`` / ``telegram_api_hash`` from settings and the
+    encrypted Telethon ``StringSession`` from ``telegram_sessions`` only on the
+    first :meth:`get_client` call. Subsequent calls return the cached client so
+    the runtime does not reconnect on every catch-up sweep.
     """
 
     settings: Settings
     session_name: str
+    session_factory: AsyncSessionFactory | None = None
     _client: TelegramClient | None = field(default=None, init=False, repr=False)
+    _engine: AsyncEngine | None = field(default=None, init=False, repr=False)
+    _session_factory: AsyncSessionFactory | None = field(default=None, init=False, repr=False)
+    _max_requests_per_second: float | None = field(default=None, init=False, repr=False)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
+
+    @property
+    def max_requests_per_second(self) -> float | None:
+        """Return the DB-loaded session rate limit, if a row has been loaded."""
+
+        return self._max_requests_per_second
 
     async def get_client(self) -> TelegramClient:
         """Return the connected Telethon client, building it on first use.
 
         Connection, start() (which would prompt for auth) are intentionally
-        NOT called here — the caller is expected to have already
-        authenticated the session via ``scripts/auth_telegram_session.py``.
-        We call ``connect()`` and refuse to proceed if the session is not
-        authorized so the runtime surfaces a clear error instead of
-        blocking on an interactive prompt.
+        NOT called here. Operators import an already-authorized Telethon
+        ``StringSession`` via ``scripts/auth_telegram_session.py``. We call
+        ``connect()`` and refuse to proceed if the stored StringSession is not
+        authorized so the runtime surfaces a clear error instead of blocking on
+        an interactive prompt.
         """
 
         async with self._lock:
             if self._client is not None and self._client.is_connected():
                 return self._client
-            self._client = self._build_client()
+            session_config = await self._load_session_config()
+            self._max_requests_per_second = session_config.max_requests_per_second
+            self._client = self._build_client(session_config.string_session)
             try:
                 await self._client.connect()
             except Exception as exc:  # narrow: rewrap and re-raise as typed error
-                raise _translate_telethon_error(exc) from exc
+                translated_error = _translate_telethon_error(exc)
+                if isinstance(translated_error, PipelineTelegramSessionAuthRequiredError):
+                    with suppress(Exception):
+                        await self._mark_auth_required(
+                            error_class=type(translated_error).__name__,
+                            error_text=str(translated_error),
+                        )
+                raise translated_error from exc
             if not await self._client.is_user_authorized():
-                raise PipelineTelegramSessionBannedError(
+                message = (
                     f"Telegram session {self.session_name!r} is not authorized; "
-                    "run scripts/auth_telegram_session.py first.",
+                    "import a valid Telethon StringSession with scripts/auth_telegram_session.py."
                 )
+                with suppress(Exception):
+                    await self._mark_auth_required(
+                        error_class=PipelineTelegramSessionAuthRequiredError.__name__,
+                        error_text=message,
+                    )
+                with suppress(Exception):
+                    disconnect_result: object = self._client.disconnect()
+                    if inspect.isawaitable(disconnect_result):
+                        await disconnect_result
+                raise PipelineTelegramSessionAuthRequiredError(message)
             return self._client
 
-    def _build_client(self) -> TelegramClient:
-        """Construct the ``TelegramClient`` bound to this session's ``.session`` file."""
+    def _build_client(self, string_session: SecretStr) -> TelegramClient:
+        """Construct the ``TelegramClient`` bound to this DB-backed StringSession."""
 
         api_id = self.settings.telegram_api_id
         api_hash_secret = self.settings.telegram_api_hash
@@ -143,25 +194,88 @@ class TelethonClientFactory:
                 "Telegram API credentials are not configured; "
                 "set TELEGRAM_API_ID and TELEGRAM_API_HASH.",
             )
-        session_path = self._resolve_session_path()
         return TelegramClient(
-            session=str(session_path),
+            session=StringSession(string_session.get_secret_value()),
             api_id=api_id,
             api_hash=api_hash_secret.get_secret_value(),
         )
 
-    def _resolve_session_path(self) -> Path:
-        """Return the ``<telegram_session_dir>/<session_name>.session`` path.
+    async def _load_session_config(self) -> _LoadedTelegramSessionConfig:
+        """Load and validate the DB-backed StringSession for this factory."""
 
-        The directory is created on demand so the first connection does
-        not fail on a fresh checkout. Telethon appends its own
-        ``.session`` suffix when it sees a path without one, but passing
-        the explicit file keeps the runtime's log lines deterministic.
-        """
+        session_factory = self._get_session_factory()
+        async with session_factory() as db_session:
+            row = await db_session.scalar(
+                select(TelegramSession)
+                .where(TelegramSession.name == self.session_name)
+                .limit(1),
+            )
+            if row is None:
+                raise PipelineTelegramSessionNotRunnableError(
+                    f"Telegram session {self.session_name!r} does not exist.",
+                )
+            if not row.enabled:
+                raise PipelineTelegramSessionNotRunnableError(
+                    f"Telegram session {self.session_name!r} is disabled.",
+                )
+            if row.status is TelegramSessionStatus.AUTH_REQUIRED:
+                raise PipelineTelegramSessionAuthRequiredError(
+                    f"Telegram session {self.session_name!r} requires authentication.",
+                )
+            if row.status is not TelegramSessionStatus.ACTIVE:
+                raise PipelineTelegramSessionNotRunnableError(
+                    f"Telegram session {self.session_name!r} is {row.status.value}, not active.",
+                )
+            encrypted_string_session = (row.encrypted_string_session or "").strip()
+            if not encrypted_string_session:
+                raise PipelineTelegramSessionAuthRequiredError(
+                    f"Telegram session {self.session_name!r} has no stored StringSession material.",
+                )
+            cipher = TelegramStringSessionCipher(self.settings.telegram_session_encryption_secret)
+            try:
+                string_session = cipher.decrypt(SecretStr(encrypted_string_session))
+            except TelegramStringSessionDecryptError as exc:
+                raise PipelineTelegramSessionNotRunnableError(
+                    f"Telegram session {self.session_name!r} StringSession material cannot be decrypted.",
+                ) from exc
+            return _LoadedTelegramSessionConfig(
+                name=row.name,
+                string_session=string_session,
+                max_requests_per_second=row.max_requests_per_second,
+            )
 
-        directory = self.settings.telegram_session_dir
-        directory.mkdir(parents=True, exist_ok=True)
-        return directory / f"{self.session_name}.session"
+    async def _mark_auth_required(self, *, error_class: str, error_text: str) -> None:
+        """Persist the auth-required state after Telethon rejects the StringSession."""
+
+        session_factory = self._get_session_factory()
+        async with session_factory() as db_session:
+            row = await db_session.scalar(
+                select(TelegramSession)
+                .where(TelegramSession.name == self.session_name)
+                .limit(1),
+            )
+            if row is None:
+                return
+            row.status = TelegramSessionStatus.AUTH_REQUIRED
+            row.last_error_class = error_class[:128]
+            row.last_error_text = error_text[:4000]
+            await db_session.commit()
+
+    def _get_session_factory(self) -> AsyncSessionFactory:
+        if self.session_factory is not None:
+            return self.session_factory
+        if self._session_factory is None:
+            self._engine = build_async_engine(self.settings.database_url)
+            self._session_factory = build_async_session_factory(self._engine)
+        return self._session_factory
+
+    async def close(self) -> None:
+        """Dispose any engine this factory created for DB-backed session loading."""
+
+        if self._engine is not None:
+            await self._engine.dispose()
+            self._engine = None
+            self._session_factory = None
 
 
 class _RateLimiter:
@@ -182,6 +296,13 @@ class _RateLimiter:
         self._min_interval_seconds = 1.0 / max_requests_per_second
         self._lock = asyncio.Lock()
         self._next_allowed_at: float = 0.0
+
+    def update_max_requests_per_second(self, *, max_requests_per_second: float) -> None:
+        """Update the limiter from the loaded session row's policy."""
+
+        if max_requests_per_second <= 0:
+            raise ValueError("max_requests_per_second must be strictly positive.")
+        self._min_interval_seconds = 1.0 / max_requests_per_second
 
     async def acquire(self) -> None:
         """Sleep just enough to keep the outbound rate below the configured cap."""
@@ -234,6 +355,17 @@ class PipelineTelethonClient(PipelineTelegramClientProtocol):
             ),
         )
 
+    async def _get_client(self) -> TelegramClient:
+        """Return a connected client and apply the DB-loaded rate limit."""
+
+        client = await self.factory.get_client()
+        max_requests_per_second = self.factory.max_requests_per_second
+        if max_requests_per_second is not None:
+            self.rate_limiter.update_max_requests_per_second(
+                max_requests_per_second=max_requests_per_second,
+            )
+        return client
+
     async def _resolve_entity(self, channel_id_or_username: str) -> Channel:
         """Return the cached :class:`Channel` entity for a channel identifier.
 
@@ -246,7 +378,7 @@ class PipelineTelethonClient(PipelineTelegramClientProtocol):
         cached = self._entity_cache.get(channel_id_or_username)
         if cached is not None:
             return cached
-        client = await self.factory.get_client()
+        client = await self._get_client()
         await self.rate_limiter.acquire()
         try:
             entity = await client.get_entity(channel_id_or_username)
@@ -268,7 +400,7 @@ class PipelineTelethonClient(PipelineTelegramClientProtocol):
     ) -> AsyncIterator[RawTelegramMessage]:
         """Yield messages newer than ``min_message_id`` in oldest-first order."""
 
-        client = await self.factory.get_client()
+        client = await self._get_client()
         entity = await self._resolve_entity(channel_id)
         channel_title = getattr(entity, "title", None) or channel_id
         channel_username = getattr(entity, "username", None)
@@ -305,7 +437,7 @@ class PipelineTelethonClient(PipelineTelegramClientProtocol):
         projection on the queue; the async iterator just drains it.
         """
 
-        client = await self.factory.get_client()
+        client = await self._get_client()
         entities: list[Channel] = []
         channel_lookup: dict[int, tuple[str, str, str | None]] = {}
         for channel_id in channel_ids:
@@ -361,7 +493,7 @@ class PipelineTelethonClient(PipelineTelegramClientProtocol):
     async def download_media(self, message: RawTelegramMessage) -> bytes:
         """Download the media bytes for one normalized message via Telethon."""
 
-        client = await self.factory.get_client()
+        client = await self._get_client()
         raw_payload = message.raw_payload
         if not isinstance(raw_payload, TelethonMessage):
             raise PipelineTelegramMalformedMessageError(
@@ -400,7 +532,7 @@ class PipelineTelethonClient(PipelineTelegramClientProtocol):
     ) -> RawTelegramMessage:
         """Return one message by id without advancing any checkpoint state."""
 
-        client = await self.factory.get_client()
+        client = await self._get_client()
         entity = await self._resolve_entity(channel_id)
         channel_title = getattr(entity, "title", None) or channel_id
         channel_username = getattr(entity, "username", None)
@@ -449,6 +581,7 @@ class PipelineTelethonClient(PipelineTelegramClientProtocol):
                 disconnect_result: object = client.disconnect()
                 if inspect.isawaitable(disconnect_result):
                     await disconnect_result
+        await self.factory.close()
 
 
 __all__ = [

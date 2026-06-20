@@ -69,14 +69,14 @@ def test_shared_required_text_normalization_keeps_schema_behavior() -> None:
         platform_id="  channel-id  ",
         title="  Source Title  ",
         username="  source_username  ",
-        session_id="   ",
+        telegram_session_name="   ",
     )
     delete_request = AdminMemeDeleteRequest(confirmation="  meme-id  ", note="  remove duplicate  ")
 
     assert source.platform_id == "channel-id"
     assert source.title == "Source Title"
     assert source.username == "source_username"
-    assert source.session_id is None
+    assert source.telegram_session_name is None
     assert delete_request.confirmation == "meme-id"
     assert delete_request.note == "remove duplicate"
 

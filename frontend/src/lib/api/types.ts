@@ -554,8 +554,11 @@ export interface AdminSourceChannelRead {
   is_active: boolean;
   is_paused: boolean;
   catchup_enabled: boolean;
+  live_enabled: boolean;
+  engagement_enabled: boolean;
   catchup_message_limit: number;
-  session_id: string | null;
+  telegram_session_id: string | null;
+  telegram_session_name: string | null;
   last_read_post_id: string | null;
   last_fetched_at: string | null;
   operational_status: 'active' | 'inactive' | 'paused';

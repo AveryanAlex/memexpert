@@ -5,7 +5,7 @@ T02 fills in the orchestration pieces T01 locked as signature-only stubs.
 The runtime composes a crawler ingest service (which owns Telegram-specific
 guards before delegating bytes to raw ingest), a :class:`PipelineTelegramClientProtocol`
 (real Telethon client or :class:`FakeTelegramClient`), a SQLAlchemy
-session (used for :class:`TelegramSessionState` + :class:`SourceChannel`
+session (used for :class:`TelegramSession` + :class:`SourceChannel`
 mutations that do not belong to the ingest entrypoint), and the
 application settings. T03 will layer a multi-session distributor on top
 of this contract; T04 will add the freshness SLO proof harness.
@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Protocol
@@ -34,7 +33,7 @@ from memexpert.crawlers.telegram.client import (
     RawTelegramMessage,
 )
 from memexpert.models.base import utcnow
-from memexpert.models.content import SourceChannel, TelegramSessionState
+from memexpert.models.content import SourceChannel, TelegramSession
 from memexpert.models.enums import SourcePlatform, TelegramSessionStatus
 from memexpert.schemas.content_pipeline import CrawlerIngestOutcome
 from memexpert.services.errors import CrawlerSessionNotRunnableError
@@ -158,11 +157,17 @@ class TelegramCrawlerRuntime:
         """
 
         started_at = utcnow()
-        session_state = await self._require_runnable_session(session_name)
-        channel_row = await self._get_tracked_channel(channel_id)
+        telegram_session = await self._require_runnable_session(session_name)
+        channel_row = await self._get_owned_channel_or_raise(channel_id, telegram_session)
 
-        if channel_row.is_paused or not channel_row.catchup_enabled:
-            reason = "paused" if channel_row.is_paused else "catchup_disabled"
+        if channel_row.is_paused or not channel_row.catchup_enabled or not telegram_session.catchup_enabled:
+            reason = (
+                "paused"
+                if channel_row.is_paused
+                else "catchup_disabled"
+                if not channel_row.catchup_enabled
+                else "session_catchup_disabled"
+            )
             return CrawlerCatchupReport(
                 session_name=session_name,
                 channel_id=channel_id,
@@ -186,17 +191,17 @@ class TelegramCrawlerRuntime:
                 channel_id=channel_id,
                 min_message_id=min_message_id,
                 limit=limit,
-                session_state=session_state,
+                telegram_session=telegram_session,
             )
         except PipelineTelegramSessionBannedError as exc:
             await self._quarantine_session(
-                session_state,
+                telegram_session,
                 error_class=type(exc).__name__,
                 error_text=str(exc),
             )
             raise
 
-        await self._commit_session_state_flush()
+        await self._commit_runtime_state()
         return CrawlerCatchupReport(
             session_name=session_name,
             channel_id=channel_id,
@@ -224,8 +229,14 @@ class TelegramCrawlerRuntime:
         if existing_task is not None and not existing_task.done():
             return
 
-        session_state = await self._require_runnable_session(session_name)
-        channel_ids = await self._channel_ids_for_session(session_name)
+        telegram_session = await self._require_runnable_session(session_name)
+        if not telegram_session.live_enabled:
+            logger.info(
+                "Telegram session %s has live listening disabled; skipping listener start.",
+                session_name,
+            )
+            return
+        channel_ids = await self._channel_ids_for_session(telegram_session)
         if not channel_ids:
             logger.info(
                 "No active channels bound to session %s; skipping live listener start.",
@@ -233,9 +244,9 @@ class TelegramCrawlerRuntime:
             )
             return
 
-        session_state.live_listener_started_at = utcnow()
-        session_state.last_heartbeat_at = utcnow()
-        await self._commit_session_state_flush()
+        telegram_session.live_listener_started_at = utcnow()
+        telegram_session.last_heartbeat_at = utcnow()
+        await self._commit_runtime_state()
 
         self._live_tasks[session_name] = asyncio.create_task(
             self._run_live_listener(
@@ -263,10 +274,10 @@ class TelegramCrawlerRuntime:
 
         # Always update the session row whether or not a task was running
         # so the operator surface sees a consistent "stopped" state.
-        session_state = await self._load_session_state(session_name)
-        session_state.status = TelegramSessionStatus.STOPPED
-        session_state.live_listener_started_at = None
-        await self._commit_session_state_flush()
+        telegram_session = await self._load_session(session_name)
+        telegram_session.status = TelegramSessionStatus.STOPPED
+        telegram_session.live_listener_started_at = None
+        await self._commit_runtime_state()
 
     async def reassign_channel(
         self,
@@ -282,18 +293,10 @@ class TelegramCrawlerRuntime:
         the new assignment.
         """
 
-        target_row = await self.session.execute(
-            select(TelegramSessionState)
-            .where(TelegramSessionState.session_name == new_session_name)
-            .limit(1)
-        )
-        if target_row.scalar_one_or_none() is None:
-            raise CrawlerSessionNotRunnableError(
-                f"Cannot reassign channel to unknown session {new_session_name!r}.",
-            )
+        target_session = await self._load_session(new_session_name)
         channel_row = await self._get_tracked_channel(channel_id)
-        channel_row.session_id = new_session_name
-        await self._commit_session_state_flush()
+        channel_row.telegram_session_id = target_session.id
+        await self._commit_runtime_state()
 
     async def replay_post(
         self,
@@ -309,6 +312,21 @@ class TelegramCrawlerRuntime:
         propagate so the operator route can surface them as typed
         failures.
         """
+
+        channel = await self._get_tracked_channel(channel_id)
+        if channel.telegram_session_id is None:
+            raise CrawlerSessionNotRunnableError(
+                f"Cannot replay Telegram channel {channel_id!r} because it is not assigned to a session.",
+            )
+        assigned_session = await self.session.get(TelegramSession, channel.telegram_session_id)
+        if assigned_session is None:
+            raise CrawlerSessionNotRunnableError(
+                f"Cannot replay Telegram channel {channel_id!r} because its session is missing.",
+            )
+        if not assigned_session.enabled or assigned_session.status is not TelegramSessionStatus.ACTIVE:
+            raise CrawlerSessionNotRunnableError(
+                f"Cannot replay Telegram channel {channel_id!r} because its session is not runnable.",
+            )
 
         raw_message = await self.telegram_client.fetch_single_message(
             channel_id=channel_id,
@@ -337,7 +355,7 @@ class TelegramCrawlerRuntime:
         channel_id: str,
         min_message_id: int | None,
         limit: int,
-        session_state: TelegramSessionState,
+        telegram_session: TelegramSession,
     ) -> None:
         """Iterate the adapter stream and ingest each message through the service."""
 
@@ -365,7 +383,7 @@ class TelegramCrawlerRuntime:
         except PipelineTelegramFloodWaitError as exc:
             counters.record_error(f"flood_wait:{exc.wait_seconds}s")
             self._park_session_on_flood_wait(
-                session_state,
+                telegram_session,
                 wait_seconds=exc.wait_seconds,
                 error_class=type(exc).__name__,
                 error_text=str(exc),
@@ -526,28 +544,32 @@ class TelegramCrawlerRuntime:
         except asyncio.CancelledError:
             raise
         except PipelineTelegramFloodWaitError as exc:
-            session_state = await self._load_session_state(session_name)
+            telegram_session = await self._load_session(session_name)
             self._park_session_on_flood_wait(
-                session_state,
+                telegram_session,
                 wait_seconds=exc.wait_seconds,
                 error_class=type(exc).__name__,
                 error_text=str(exc),
             )
-            await self._commit_session_state_flush()
+            await self._commit_runtime_state()
         except PipelineTelegramSessionBannedError as exc:
-            session_state = await self._load_session_state(session_name)
+            telegram_session = await self._load_session(session_name)
             await self._quarantine_session(
-                session_state,
+                telegram_session,
                 error_class=type(exc).__name__,
                 error_text=str(exc),
             )
         except PipelineTelegramError as exc:
             logger.warning("Live listener for %s hit a provider error: %s", session_name, exc)
 
-    async def _require_runnable_session(self, session_name: str) -> TelegramSessionState:
-        """Return the session state row when it is ``active``, else raise."""
+    async def _require_runnable_session(self, session_name: str) -> TelegramSession:
+        """Return the enabled active session row, else raise."""
 
-        state = await self._load_session_state(session_name)
+        state = await self._load_session(session_name)
+        if not state.enabled:
+            raise CrawlerSessionNotRunnableError(
+                f"Session {session_name!r} is disabled.",
+            )
         if state.status is not TelegramSessionStatus.ACTIVE:
             raise CrawlerSessionNotRunnableError(
                 f"Session {session_name!r} is {state.status.value}, not active.",
@@ -555,9 +577,21 @@ class TelegramCrawlerRuntime:
         return state
 
     async def _record_live_heartbeat(self, session_name: str) -> None:
-        session_state = await self._load_session_state(session_name)
-        session_state.last_heartbeat_at = utcnow()
-        await self._commit_session_state_flush()
+        telegram_session = await self._load_session(session_name)
+        telegram_session.last_heartbeat_at = utcnow()
+        await self._commit_runtime_state()
+
+    async def _get_owned_channel_or_raise(
+        self,
+        channel_id: str,
+        telegram_session: TelegramSession,
+    ) -> SourceChannel:
+        channel = await self._get_tracked_channel(channel_id)
+        if channel.telegram_session_id != telegram_session.id:
+            raise CrawlerSessionNotRunnableError(
+                f"Telegram channel {channel_id!r} is not assigned to session {telegram_session.name!r}.",
+            )
+        return channel
 
     async def _get_tracked_channel(self, channel_id: str) -> SourceChannel:
         """Return the ``SourceChannel`` row for a tracked Telegram channel or raise."""
@@ -603,7 +637,7 @@ class TelegramCrawlerRuntime:
         if resolved.subscriber_count is not None:
             channel_row.subscriber_count = resolved.subscriber_count
 
-    async def _channel_ids_for_session(self, session_name: str) -> list[str]:
+    async def _channel_ids_for_session(self, telegram_session: TelegramSession) -> list[str]:
         """Return the active channel ids owned by this session."""
 
         result = await self.session.execute(
@@ -612,14 +646,15 @@ class TelegramCrawlerRuntime:
                 SourceChannel.platform == SourcePlatform.TELEGRAM,
                 SourceChannel.is_active.is_(True),
                 SourceChannel.is_paused.is_(False),
-                SourceChannel.session_id == session_name,
+                SourceChannel.live_enabled.is_(True),
+                SourceChannel.telegram_session_id == telegram_session.id,
             )
         )
         return [row.platform_id for row in result.scalars().all()]
 
     def _park_session_on_flood_wait(
         self,
-        session_state: TelegramSessionState,
+        telegram_session: TelegramSession,
         *,
         wait_seconds: int,
         error_class: str,
@@ -627,14 +662,14 @@ class TelegramCrawlerRuntime:
     ) -> None:
         """Mark the session as ``flood_wait`` and persist the cooldown."""
 
-        session_state.status = TelegramSessionStatus.FLOOD_WAIT
-        session_state.flood_wait_until = utcnow() + timedelta(seconds=wait_seconds)
-        session_state.last_error_class = error_class
-        session_state.last_error_text = error_text[: 4000]
+        telegram_session.status = TelegramSessionStatus.FLOOD_WAIT
+        telegram_session.flood_wait_until = utcnow() + timedelta(seconds=wait_seconds)
+        telegram_session.last_error_class = error_class
+        telegram_session.last_error_text = error_text[: 4000]
 
     async def _quarantine_session(
         self,
-        session_state: TelegramSessionState,
+        telegram_session: TelegramSession,
         *,
         error_class: str,
         error_text: str,
@@ -642,14 +677,14 @@ class TelegramCrawlerRuntime:
         """Mark the session as ``quarantined`` and persist the failure metadata."""
 
         now = utcnow()
-        session_state.status = TelegramSessionStatus.QUARANTINED
-        session_state.quarantined_at = now
-        session_state.last_error_class = error_class
-        session_state.last_error_text = error_text[: 4000]
-        await self._commit_session_state_flush()
+        telegram_session.status = TelegramSessionStatus.QUARANTINED
+        telegram_session.quarantined_at = now
+        telegram_session.last_error_class = error_class
+        telegram_session.last_error_text = error_text[: 4000]
+        await self._commit_runtime_state()
 
-    async def _commit_session_state_flush(self) -> None:
-        """Commit any pending runtime-side mutations to the durable session state."""
+    async def _commit_runtime_state(self) -> None:
+        """Commit any pending runtime-side mutations to durable crawler state."""
 
         try:
             await self.session.commit()
@@ -670,33 +705,21 @@ class TelegramCrawlerRuntime:
         except ValueError:
             return None
 
-    async def _load_session_state(self, session_name: str) -> TelegramSessionState:
-        """Return the durable session-state row for ``session_name``, creating it if missing.
-
-        A fresh row is created in the ``STOPPED`` status because the
-        runtime has not yet proved the session is connected. This is the
-        one helper T01 ships with real behavior; T02 extends the runtime
-        to mutate the row on every state transition.
-        """
+    async def _load_session(self, session_name: str) -> TelegramSession:
+        """Return the durable session row for ``session_name`` or raise."""
 
         result = await self.session.execute(
-            select(TelegramSessionState)
-            .where(TelegramSessionState.session_name == session_name)
+            select(TelegramSession)
+            .where(TelegramSession.name == session_name)
             .limit(1)
         )
         existing = result.scalar_one_or_none()
         if existing is not None:
             return existing
 
-        row = TelegramSessionState(
-            id=uuid.uuid7(),
-            session_name=session_name,
-            status=TelegramSessionStatus.STOPPED,
-            last_heartbeat_at=utcnow(),
+        raise CrawlerSessionNotRunnableError(
+            f"Telegram session {session_name!r} does not exist.",
         )
-        self.session.add(row)
-        await self.session.flush()
-        return row
 
 
 __all__ = [

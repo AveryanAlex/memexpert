@@ -120,6 +120,17 @@ def test_settings_ocr_defaults_are_honest_about_missing_fallback() -> None:
     assert settings.pipeline_ocr_fallback_command is None
 
 
+def test_settings_include_telegram_session_encryption_secret_without_session_dir() -> None:
+    settings = Settings.model_validate(
+        {"telegram_session_encryption_secret": "  test-telegram-session-encryption-secret  "},
+    )
+
+    assert settings.telegram_session_encryption_secret.get_secret_value() == "test-telegram-session-encryption-secret"
+    assert not hasattr(settings, "telegram_session_dir")
+    with pytest.raises(ValidationError, match="telegram_session_encryption_secret"):
+        _ = Settings.model_validate({"telegram_session_encryption_secret": "  "})
+
+
 def test_settings_normalize_blank_ocr_command_settings_to_none() -> None:
     settings = Settings.model_validate(
         {

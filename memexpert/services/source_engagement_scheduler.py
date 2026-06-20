@@ -15,8 +15,8 @@ from sqlalchemy import and_, or_, select
 from memexpert.core.config import Settings, get_settings
 from memexpert.messaging.rabbitmq_outbox import RabbitPublisher
 from memexpert.models.base import utcnow
-from memexpert.models.content import MemeSource, SourceChannel
-from memexpert.models.enums import SourcePlatform
+from memexpert.models.content import MemeSource, SourceChannel, TelegramSession
+from memexpert.models.enums import SourcePlatform, TelegramSessionStatus
 from memexpert.pipeline.events import build_source_engagement_capture_message_spec
 from memexpert.services.source_engagement import source_engagement_schedule_label_for
 
@@ -100,17 +100,23 @@ class SourceEngagementCaptureScheduler:
         async with self._session_factory() as session, session.begin():
             rows = (
                 await session.execute(
-                    select(MemeSource, SourceChannel.session_id)
-                    .outerjoin(
+                    select(MemeSource, TelegramSession.name)
+                    .join(
                         SourceChannel,
                         and_(
                             SourceChannel.platform == SourcePlatform.TELEGRAM,
                             SourceChannel.platform_id == MemeSource.source_id,
                         ),
                     )
+                    .join(TelegramSession, TelegramSession.id == SourceChannel.telegram_session_id)
                     .where(
                         MemeSource.platform == SourcePlatform.TELEGRAM,
                         MemeSource.source_alive.is_(True),
+                        SourceChannel.is_active.is_(True),
+                        SourceChannel.engagement_enabled.is_(True),
+                        TelegramSession.enabled.is_(True),
+                        TelegramSession.status == TelegramSessionStatus.ACTIVE,
+                        TelegramSession.engagement_enabled.is_(True),
                         MemeSource.next_engagement_check_at.is_not(None),
                         MemeSource.next_engagement_check_at <= captured_now,
                         or_(

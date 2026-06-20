@@ -78,9 +78,11 @@ export const actions: Actions = {
           platform_id: readRequired(data, 'platform_id'),
           username: readOptional(data, 'username'),
           title: readRequired(data, 'title'),
-          session_id: readOptional(data, 'session_id'),
+          telegram_session_name: readOptional(data, 'telegram_session_name'),
           catchup_message_limit: readInt(data, 'catchup_message_limit', 500),
-          catchup_enabled: data.get('catchup_enabled') === 'on'
+          catchup_enabled: data.get('catchup_enabled') === 'on',
+          live_enabled: data.get('live_enabled') === 'on',
+          engagement_enabled: data.get('engagement_enabled') === 'on'
         }
       });
       return { message: 'Source channel added.' };

@@ -2307,19 +2307,21 @@ async def test_crawler_operations_list_sessions_populates_owned_channel_count(
 
     from memexpert.crawlers.telegram.client import FakeTelegramClient
     from memexpert.crawlers.telegram.runtime import TelegramCrawlerRuntime
-    from memexpert.models.content import TelegramSessionState
+    from memexpert.models.content import TelegramSession
     from memexpert.models.enums import TelegramSessionStatus
     from memexpert.services.crawler_operations import CrawlerOperationsService
 
     migrated_db_session.add(
-        TelegramSessionState(
-            session_name="primary",
+        TelegramSession(
+            name="primary",
+            display_name="Primary",
             status=TelegramSessionStatus.ACTIVE,
         )
     )
     migrated_db_session.add(
-        TelegramSessionState(
-            session_name="empty",
+        TelegramSession(
+            name="empty",
+            display_name="Empty",
             status=TelegramSessionStatus.STOPPED,
         )
     )
@@ -2337,13 +2339,17 @@ async def test_crawler_operations_list_sessions_populates_owned_channel_count(
     )
     # Bind both channels to the primary session so the operations surface
     # can count them.
+    primary_session_id = await migrated_db_session.scalar(
+        select(TelegramSession.id).where(TelegramSession.name == "primary"),
+    )
+    assert primary_session_id is not None
     primary_channels = (
         await migrated_db_session.execute(
-            select(SourceChannel).where(SourceChannel.platform_id.in_(["owned_one", "owned_two"]))
+            select(SourceChannel).where(SourceChannel.platform_id.in_(["owned_one", "owned_two"])),
         )
     ).scalars().all()
     for channel in primary_channels:
-        channel.session_id = "primary"
+        channel.telegram_session_id = primary_session_id
     await migrated_db_session.commit()
 
     ingest_service = PipelineCrawlerIngestService.from_settings(
@@ -2359,6 +2365,6 @@ async def test_crawler_operations_list_sessions_populates_owned_channel_count(
     )
     service = CrawlerOperationsService(session=migrated_db_session, runtime=runtime)
 
-    sessions_by_name = {row.session_name: row for row in await service.list_sessions()}
+    sessions_by_name = {row.name: row for row in await service.list_sessions()}
     assert sessions_by_name["primary"].owned_channel_count == 2
     assert sessions_by_name["empty"].owned_channel_count == 0

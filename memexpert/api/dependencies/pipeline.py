@@ -31,6 +31,7 @@ from memexpert.crawlers.telegram.client import (
     PipelineTelegramMalformedMessageError,
     PipelineTelegramProviderUnavailableError,
     PipelineTelegramSessionBannedError,
+    PipelineTelegramSessionNotRunnableError,
 )
 from memexpert.crawlers.telegram.runtime import TelegramCrawlerRuntime
 from memexpert.ingest.accept_service import PipelineIngestAcceptService
@@ -423,6 +424,8 @@ def _telegram_error_to_http(error: PipelineTelegramError) -> PipelineHTTPError:
         headers = {"Retry-After": str(max(0, int(error.wait_seconds)))}
     elif isinstance(error, PipelineTelegramSessionBannedError):
         error_code = ContentPipelineErrorCode.TELEGRAM_SESSION_BANNED
+    elif isinstance(error, PipelineTelegramSessionNotRunnableError):
+        error_code = ContentPipelineErrorCode.CRAWLER_SESSION_NOT_RUNNABLE
     elif isinstance(error, PipelineTelegramProviderUnavailableError):
         error_code = ContentPipelineErrorCode.TELEGRAM_PROVIDER_UNAVAILABLE
     elif isinstance(error, PipelineTelegramMalformedMessageError):

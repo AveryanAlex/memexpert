@@ -24,6 +24,7 @@ from memexpert.models.content import (
     ModerationDecision,
     ModerationReport,
     SourceChannel,
+    TelegramSession,
 )
 from memexpert.models.enums import (
     ContentKind,
@@ -32,6 +33,7 @@ from memexpert.models.enums import (
     ModerationReason,
     ModerationReportStatus,
     SourcePlatform,
+    TelegramSessionStatus,
 )
 from memexpert.models.user import ChannelSuggestion, User
 from memexpert.services import AuthService, UserService
@@ -716,6 +718,69 @@ async def test_admin_source_channel_health_and_mark_dead_conflicts(
         assert persisted_stale_channel is not None
         assert persisted_stale_channel.is_active is False
         assert persisted_stale_channel.is_paused is True
+
+
+async def test_admin_create_source_channel_resolves_telegram_session_name(
+    auth_app: FastAPI,
+    auth_settings_overrides: dict[str, str],
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    admin_token = await _issue_user_cookie(
+        postgres_session_factory,
+        auth_settings_overrides,
+        email="admin-source-create@example.com",
+        is_admin=True,
+    )
+
+    async with postgres_session_factory() as session:
+        telegram_session = TelegramSession(
+            name="session-a",
+            display_name="Session A",
+            status=TelegramSessionStatus.ACTIVE,
+        )
+        session.add(telegram_session)
+        await session.commit()
+        telegram_session_id = telegram_session.id
+
+    transport = ASGITransport(app=auth_app)
+    async with AsyncClient(transport=transport, base_url="https://testserver") as admin_client:
+        admin_client.cookies.set(ACCESS_COOKIE_NAME, admin_token)
+        created_response = await admin_client.post(
+            "/api/v1/admin/source-channels",
+            json={
+                "platform": "telegram",
+                "platform_id": "admin-created-source",
+                "title": "Admin Created Source",
+                "telegram_session_name": "session-a",
+                "live_enabled": False,
+                "engagement_enabled": False,
+            },
+        )
+        unknown_session_response = await admin_client.post(
+            "/api/v1/admin/source-channels",
+            json={
+                "platform": "telegram",
+                "platform_id": "admin-created-source-unknown",
+                "title": "Unknown Session Source",
+                "telegram_session_name": "missing-session",
+            },
+        )
+
+    assert created_response.status_code == 201
+    payload = created_response.json()
+    assert payload["telegram_session_id"] == str(telegram_session_id)
+    assert payload["telegram_session_name"] == "session-a"
+    assert payload["live_enabled"] is False
+    assert payload["engagement_enabled"] is False
+    assert unknown_session_response.status_code == 409
+    assert "missing-session" in unknown_session_response.json()["detail"]
+
+    async with postgres_session_factory() as session:
+        persisted = await session.scalar(
+            select(SourceChannel).where(SourceChannel.platform_id == "admin-created-source"),
+        )
+        assert persisted is not None
+        assert persisted.telegram_session_id == telegram_session_id
 
 
 async def test_admin_can_delete_meme_with_durable_destructive_audit(

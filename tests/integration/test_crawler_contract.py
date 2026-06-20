@@ -27,14 +27,14 @@ from memexpert.crawlers.telegram.runtime import (
     CrawlerCatchupReport,
     TelegramCrawlerRuntime,
 )
-from memexpert.models.content import TelegramSessionState
+from memexpert.models.content import TelegramSession
 from memexpert.models.enums import SourceEngagementCommentsState, SourcePlatform, TelegramSessionStatus
 from memexpert.schemas.content_pipeline import (
     CrawlerForwardAttribution,
     CrawlerIngestOutcome,
     CrawlerIngestResult,
     RawCrawlerPost,
-    TelegramSessionStateRead,
+    TelegramSessionRead,
 )
 
 if TYPE_CHECKING:
@@ -293,7 +293,7 @@ class _StubCrawlerIngestService:
         )
 
 
-async def test_telegram_crawler_runtime_load_session_state_creates_and_returns_rows(
+async def test_telegram_crawler_runtime_load_session_requires_existing_registry_row(
     migrated_db_session: AsyncSession,
 ) -> None:
     service = _StubCrawlerIngestService()
@@ -305,19 +305,30 @@ async def test_telegram_crawler_runtime_load_session_state_creates_and_returns_r
         settings=Settings(),
     )
 
-    row = await runtime._load_session_state("primary")
-    assert isinstance(row, TelegramSessionState)
-    assert row.session_name == "primary"
-    assert row.status is TelegramSessionStatus.STOPPED
+    registry_row = TelegramSession(
+        name="primary",
+        display_name="Primary",
+        status=TelegramSessionStatus.ACTIVE,
+        encrypted_string_session="encrypted-secret-material",
+    )
+    migrated_db_session.add(registry_row)
+    await migrated_db_session.commit()
+
+    row = await runtime._load_session("primary")
+    assert isinstance(row, TelegramSession)
+    assert row.name == "primary"
+    assert row.status is TelegramSessionStatus.ACTIVE
 
     # Calling again returns the existing row instead of inserting a duplicate.
-    same_row = await runtime._load_session_state("primary")
+    same_row = await runtime._load_session("primary")
     assert same_row.id == row.id
 
-    # The read projection serializes the row shape operator surfaces rely on.
-    projection = TelegramSessionStateRead.model_validate(row)
-    assert projection.session_name == "primary"
-    assert projection.status is TelegramSessionStatus.STOPPED
+    # The read projection serializes the row shape operator surfaces rely on,
+    # without exposing the encrypted StringSession material.
+    projection = TelegramSessionRead.model_validate(row)
+    assert projection.name == "primary"
+    assert projection.status is TelegramSessionStatus.ACTIVE
+    assert "encrypted_string_session" not in projection.model_dump(mode="python")
 
 
 def test_crawler_catchup_report_is_extra_forbid_and_defaults_counters_to_zero() -> None:
@@ -364,5 +375,13 @@ async def test_telegram_crawler_runtime_accepts_async_mock_clients(
         settings=Settings(),
     )
 
-    row = await runtime._load_session_state("mock_session")
-    assert row.session_name == "mock_session"
+    row = TelegramSession(
+        name="mock_session",
+        display_name="Mock Session",
+        status=TelegramSessionStatus.ACTIVE,
+    )
+    migrated_db_session.add(row)
+    await migrated_db_session.commit()
+
+    loaded = await runtime._load_session("mock_session")
+    assert loaded.name == "mock_session"

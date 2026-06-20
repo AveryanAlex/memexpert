@@ -18,6 +18,7 @@ from memexpert.crawlers.telegram.client import (
     PipelineTelegramMalformedMessageError,
     PipelineTelegramProviderUnavailableError,
     PipelineTelegramSessionBannedError,
+    PipelineTelegramSessionNotRunnableError,
     RawTelegramMessage,
 )
 from memexpert.models.base import utcnow
@@ -322,7 +323,10 @@ def _fetch_status_for_capture_error(exc: Exception) -> SourceEngagementFetchStat
         return SourceEngagementFetchStatus.NOT_ACCESSIBLE
     if isinstance(
         exc,
-        PipelineTelegramFloodWaitError | PipelineTelegramProviderUnavailableError | PipelineTelegramError,
+        PipelineTelegramFloodWaitError
+        | PipelineTelegramProviderUnavailableError
+        | PipelineTelegramSessionNotRunnableError
+        | PipelineTelegramError,
     ):
         return SourceEngagementFetchStatus.FAILED
     return SourceEngagementFetchStatus.FAILED

@@ -1,22 +1,18 @@
 #!/usr/bin/env python3
-"""One-time interactive Telegram session authorizer for curated crawler sessions.
+"""Import an existing Telethon StringSession into the Telegram session registry.
 
-Usage:
+Examples:
 
-  Set ``TELEGRAM_API_ID`` and ``TELEGRAM_API_HASH`` in the environment (or
-  the project's ``.env`` file) before running this script, then run::
+    uv run python scripts/auth_telegram_session.py --session-name primary \
+        --string-session-file /run/secrets/telegram_string_session
 
-      uv run python scripts/auth_telegram_session.py --session-name primary
+    TELEGRAM_STRING_SESSION=... uv run python scripts/auth_telegram_session.py \
+        --session-name primary --display-name "Primary crawler"
 
-  The script will prompt for a phone number, one-time password, and
-  optional 2FA password, then upsert a ``telegram_session_states`` row
-  with status ``active`` so the crawler runtime can pick the session up.
-
-The script exits with status ``1`` if API credentials are missing so
-operators cannot accidentally auth against a half-configured environment.
-It deliberately has no tests: the flow is interactive and the work it
-does is already covered by the runtime's ``_load_session_state`` unit
-tests plus the :class:`TelegramSessionState` model contract.
+The helper validates the provided StringSession against Telegram, then writes
+only encrypted StringSession material plus account projection fields to the
+``telegram_sessions`` table. It never creates Telethon filesystem sessions and
+never prints the provided StringSession value.
 """
 
 from __future__ import annotations
@@ -24,65 +20,205 @@ from __future__ import annotations
 import argparse
 import asyncio
 import inspect
+import os
 import sys
 import uuid
-from typing import TYPE_CHECKING, Final
+from pathlib import Path
+from typing import Final
 
+from pydantic import SecretStr
 from sqlalchemy import select
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 from memexpert.core.config import get_settings
 from memexpert.core.database import build_async_engine, build_async_session_factory
+from memexpert.crawlers.telegram.session_crypto import TelegramStringSessionCipher
 from memexpert.models.base import utcnow
-from memexpert.models.content import TelegramSessionState
+from memexpert.models.content import TelegramSession
 from memexpert.models.enums import TelegramSessionStatus
 
 _EXIT_MISSING_CREDENTIALS: Final = 1
+_EXIT_MISSING_STRING_SESSION: Final = 2
+_EXIT_INVALID_STRING_SESSION: Final = 3
+_EXIT_INVALID_INPUT: Final = 4
+
+
+class _ValidatedTelegramAccount:
+    def __init__(
+        self,
+        *,
+        user_id: int | None,
+        username: str | None,
+        phone_hint: str | None,
+    ) -> None:
+        self.user_id = user_id
+        self.username = username
+        self.phone_hint = phone_hint
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="auth_telegram_session",
-        description=(
-            "Interactively authorize a Telethon session file for the curated "
-            "Telegram crawler and mark the session as active in the database."
-        ),
+        description="Validate and import a Telethon StringSession into telegram_sessions.",
     )
     parser.add_argument(
         "--session-name",
         required=True,
-        help="Short identifier for this session (e.g. 'primary').",
+        help="Short registry identifier for this session (for example, 'primary').",
+    )
+    parser.add_argument(
+        "--display-name",
+        default=None,
+        help="Human-readable display name. Defaults to the existing display name or session name.",
+    )
+    parser.add_argument(
+        "--string-session",
+        default=None,
+        help="Existing Telethon StringSession value. Prefer env/file mechanisms in shared shells.",
+    )
+    parser.add_argument(
+        "--string-session-file",
+        type=Path,
+        default=None,
+        help="Path to a text file containing the existing Telethon StringSession value.",
     )
     return parser.parse_args()
 
 
-async def _upsert_active_session_row(session_name: str) -> None:
-    """Ensure ``telegram_session_states`` has an ``active`` row for ``session_name``."""
+def _normalize_required_text(value: str, *, label: str) -> str:
+    normalized = value.strip()
+    if not normalized:
+        sys.stderr.write(f"error: {label} must not be blank.\n")
+        raise SystemExit(_EXIT_INVALID_INPUT)
+    return normalized
 
+
+def _load_string_session(args: argparse.Namespace) -> SecretStr:
+    provided_sources = [
+        source
+        for source in (
+            args.string_session,
+            args.string_session_file,
+            os.environ.get("TELEGRAM_STRING_SESSION"),
+        )
+        if source is not None
+    ]
+    if len(provided_sources) > 1:
+        sys.stderr.write(
+            "error: provide StringSession material through exactly one of "
+            "--string-session, --string-session-file, or TELEGRAM_STRING_SESSION.\n",
+        )
+        raise SystemExit(_EXIT_INVALID_INPUT)
+    if args.string_session is not None:
+        raw_value = args.string_session
+    elif args.string_session_file is not None:
+        try:
+            raw_value = args.string_session_file.read_text(encoding="utf-8")
+        except OSError as exc:
+            sys.stderr.write(f"error: unable to read --string-session-file ({type(exc).__name__}).\n")
+            raise SystemExit(_EXIT_INVALID_INPUT) from exc
+    else:
+        raw_value = os.environ.get("TELEGRAM_STRING_SESSION")
+    if raw_value is None or not raw_value.strip():
+        sys.stderr.write(
+            "error: provide an existing Telethon StringSession via --string-session, "
+            "--string-session-file, or TELEGRAM_STRING_SESSION.\n",
+        )
+        raise SystemExit(_EXIT_MISSING_STRING_SESSION)
+    return SecretStr(raw_value.strip())
+
+
+async def _validate_string_session(string_session: SecretStr) -> _ValidatedTelegramAccount:
     settings = get_settings()
+    api_id = settings.telegram_api_id
+    api_hash = settings.telegram_api_hash
+    if api_id is None or api_hash is None:
+        sys.stderr.write(
+            "error: TELEGRAM_API_ID and TELEGRAM_API_HASH must be set before importing a session.\n",
+        )
+        raise SystemExit(_EXIT_MISSING_CREDENTIALS)
+
+    from telethon import TelegramClient  # noqa: PLC0415
+    from telethon.sessions import StringSession  # noqa: PLC0415
+
+    try:
+        client = TelegramClient(
+            StringSession(string_session.get_secret_value()),
+            api_id,
+            api_hash.get_secret_value(),
+        )
+    except Exception:
+        sys.stderr.write("error: provided Telegram StringSession is invalid.\n")
+        raise SystemExit(_EXIT_INVALID_STRING_SESSION) from None
+
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            sys.stderr.write("error: provided Telegram StringSession is not authorized.\n")
+            raise SystemExit(_EXIT_INVALID_STRING_SESSION)
+        me = await client.get_me()
+    except SystemExit:
+        raise
+    except Exception as exc:
+        sys.stderr.write(f"error: unable to validate Telegram StringSession ({type(exc).__name__}).\n")
+        raise SystemExit(_EXIT_INVALID_STRING_SESSION) from exc
+    finally:
+        disconnect_result = client.disconnect()
+        if inspect.isawaitable(disconnect_result):
+            await disconnect_result
+
+    user_id = getattr(me, "id", None)
+    username = getattr(me, "username", None)
+    phone = getattr(me, "phone", None)
+    return _ValidatedTelegramAccount(
+        user_id=user_id if isinstance(user_id, int) else None,
+        username=username.strip() if isinstance(username, str) and username.strip() else None,
+        phone_hint=_phone_hint(phone if isinstance(phone, str) else None),
+    )
+
+
+async def _upsert_session_row(
+    *,
+    session_name: str,
+    display_name: str | None,
+    string_session: SecretStr,
+    account: _ValidatedTelegramAccount,
+) -> None:
+    settings = get_settings()
+    encrypted_string_session = TelegramStringSessionCipher(settings.telegram_session_encryption_secret).encrypt(
+        string_session,
+    )
     engine = build_async_engine(settings.database_url)
     session_factory = build_async_session_factory(engine)
     try:
         async with session_factory() as db_session:
-            result = await db_session.execute(
-                select(TelegramSessionState)
-                .where(TelegramSessionState.session_name == session_name)
-                .limit(1)
+            row = await db_session.scalar(
+                select(TelegramSession)
+                .where(TelegramSession.name == session_name)
+                .limit(1),
             )
-            row = result.scalar_one_or_none()
             now = utcnow()
             if row is None:
-                row = TelegramSessionState(
+                row = TelegramSession(
                     id=uuid.uuid7(),
-                    session_name=session_name,
+                    name=session_name,
+                    display_name=display_name or session_name,
                     status=TelegramSessionStatus.ACTIVE,
+                    enabled=True,
+                    encrypted_string_session=encrypted_string_session.get_secret_value(),
+                    account_user_id=account.user_id,
+                    account_username=account.username,
+                    account_phone_hint=account.phone_hint,
                     last_heartbeat_at=now,
                 )
                 db_session.add(row)
             else:
+                row.display_name = display_name or row.display_name or session_name
                 row.status = TelegramSessionStatus.ACTIVE
+                row.enabled = True
+                row.encrypted_string_session = encrypted_string_session.get_secret_value()
+                row.account_user_id = account.user_id
+                row.account_username = account.username
+                row.account_phone_hint = account.phone_hint
                 row.last_heartbeat_at = now
                 row.last_error_class = None
                 row.last_error_text = None
@@ -93,56 +229,41 @@ async def _upsert_active_session_row(session_name: str) -> None:
         await engine.dispose()
 
 
-async def _authorize_session_file(session_name: str, session_dir: Path) -> None:
-    """Build a Telethon client and run its interactive ``start()`` flow."""
+def _phone_hint(phone: str | None) -> str | None:
+    if phone is None:
+        return None
+    digits = "".join(character for character in phone if character.isdigit())
+    if len(digits) < 4:
+        return None
+    return f"ending-{digits[-4:]}"
 
-    # Importing Telethon inside the function keeps the CLI entry point
-    # import-safe: ``--help`` must work even in environments without the
-    # SDK installed (the project ships with it, but this keeps parity
-    # with the crawler-client import boundary).
-    from telethon import TelegramClient  # noqa: PLC0415
 
-    settings = get_settings()
-    api_id = settings.telegram_api_id
-    api_hash = settings.telegram_api_hash
-    if api_id is None or api_hash is None:
-        sys.stderr.write(
-            "error: TELEGRAM_API_ID and TELEGRAM_API_HASH must be set before "
-            "running this script.\n",
-        )
-        raise SystemExit(_EXIT_MISSING_CREDENTIALS)
-
-    session_dir.mkdir(parents=True, exist_ok=True)
-    session_path = session_dir / f"{session_name}.session"
-    client = TelegramClient(
-        session=str(session_path),
-        api_id=api_id,
-        api_hash=api_hash.get_secret_value(),
+async def _run(args: argparse.Namespace) -> None:
+    session_name = _normalize_required_text(args.session_name, label="session-name")
+    display_name = (
+        None
+        if args.display_name is None
+        else _normalize_required_text(args.display_name, label="display-name")
     )
-    async with client:
-        start_result: object = client.start()
-        if inspect.isawaitable(start_result):
-            await start_result
-        me = await client.get_me()
-        sys.stdout.write(
-            f"Authorized session {session_name!r} as {getattr(me, 'username', None) or me!r}.\n",
-        )
-
-
-async def _run(session_name: str) -> None:
-    settings = get_settings()
-    await _authorize_session_file(session_name, settings.telegram_session_dir)
-    await _upsert_active_session_row(session_name)
+    string_session = _load_string_session(args)
+    account = await _validate_string_session(string_session)
+    await _upsert_session_row(
+        session_name=session_name,
+        display_name=display_name,
+        string_session=string_session,
+        account=account,
+    )
+    account_label = f" user_id={account.user_id}" if account.user_id is not None else ""
+    username_label = f" username=@{account.username}" if account.username else ""
     sys.stdout.write(
-        f"Session {session_name!r} marked active in telegram_session_states.\n",
+        f"Imported Telegram session {session_name!r}{account_label}{username_label}.\n",
     )
 
 
 def main() -> None:
     """Entry point used by ``python scripts/auth_telegram_session.py``."""
 
-    args = _parse_args()
-    asyncio.run(_run(args.session_name))
+    asyncio.run(_run(_parse_args()))
 
 
 if __name__ == "__main__":
