@@ -42,6 +42,7 @@ if TYPE_CHECKING:
 
     from sqlalchemy.ext.asyncio import AsyncSession
 
+    from memexpert.crawlers.telegram.manager import TelegramSessionManager
     from memexpert.crawlers.telegram.runtime import TelegramCrawlerRuntime
     from memexpert.schemas.content_pipeline import CrawlerIngestResult
 
@@ -52,6 +53,7 @@ class CrawlerOperationsService:
 
     session: AsyncSession
     runtime: TelegramCrawlerRuntime
+    manager: TelegramSessionManager | None = None
 
     async def list_sessions(self) -> list[TelegramSessionRead]:
         """Return every Telegram session row with its owned channel count.
@@ -156,6 +158,8 @@ class CrawlerOperationsService:
         """Resolve the channel and delegate to :meth:`TelegramCrawlerRuntime.replay_post`."""
 
         channel = await self._get_channel_or_raise(source_channel_id)
+        if self.manager is not None:
+            return await self.manager.replay_post(channel.platform_id, post_id)
         return await self.runtime.replay_post(channel.platform_id, post_id)
 
     async def get_crawler_freshness_snapshot(

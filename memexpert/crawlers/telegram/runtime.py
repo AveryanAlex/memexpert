@@ -29,6 +29,7 @@ from memexpert.crawlers.telegram.client import (
     PipelineTelegramMalformedMessageError,
     PipelineTelegramMessageMapper,
     PipelineTelegramProviderUnavailableError,
+    PipelineTelegramSessionAuthRequiredError,
     PipelineTelegramSessionBannedError,
     RawTelegramMessage,
 )
@@ -160,9 +161,16 @@ class TelegramCrawlerRuntime:
         telegram_session = await self._require_runnable_session(session_name)
         channel_row = await self._get_owned_channel_or_raise(channel_id, telegram_session)
 
-        if channel_row.is_paused or not channel_row.catchup_enabled or not telegram_session.catchup_enabled:
+        if (
+            not channel_row.is_active
+            or channel_row.is_paused
+            or not channel_row.catchup_enabled
+            or not telegram_session.catchup_enabled
+        ):
             reason = (
-                "paused"
+                "inactive"
+                if not channel_row.is_active
+                else "paused"
                 if channel_row.is_paused
                 else "catchup_disabled"
                 if not channel_row.catchup_enabled
@@ -176,7 +184,6 @@ class TelegramCrawlerRuntime:
                 errors=(f"catch_up skipped: {reason}",),
             )
 
-        await self._refresh_channel_metadata(channel_row)
         limit = min(
             channel_row.catchup_message_limit,
             self.settings.crawler_default_catchup_message_limit,
@@ -185,6 +192,7 @@ class TelegramCrawlerRuntime:
 
         counters = _CatchupCounters()
         try:
+            await self._refresh_channel_metadata(channel_row)
             await self._drive_catchup_loop(
                 counters=counters,
                 channel_row=channel_row,
@@ -193,8 +201,23 @@ class TelegramCrawlerRuntime:
                 limit=limit,
                 telegram_session=telegram_session,
             )
+        except PipelineTelegramFloodWaitError as exc:
+            counters.record_error(f"flood_wait:{exc.wait_seconds}s")
+            self._park_session_on_flood_wait(
+                telegram_session,
+                wait_seconds=exc.wait_seconds,
+                error_class=type(exc).__name__,
+                error_text=str(exc),
+            )
         except PipelineTelegramSessionBannedError as exc:
             await self._quarantine_session(
+                telegram_session,
+                error_class=type(exc).__name__,
+                error_text=str(exc),
+            )
+            raise
+        except PipelineTelegramSessionAuthRequiredError as exc:
+            await self._mark_session_auth_required(
                 telegram_session,
                 error_class=type(exc).__name__,
                 error_text=str(exc),
@@ -256,7 +279,7 @@ class TelegramCrawlerRuntime:
             name=f"crawler-live-{session_name}",
         )
 
-    async def stop_live_listener(self, session_name: str) -> None:
+    async def stop_live_listener(self, session_name: str, *, mark_stopped: bool = True) -> None:
         """Cancel the background live listener for ``session_name`` if running."""
 
         task = self._live_tasks.pop(session_name, None)
@@ -273,9 +296,10 @@ class TelegramCrawlerRuntime:
                 await self.session.rollback()
 
         # Always update the session row whether or not a task was running
-        # so the operator surface sees a consistent "stopped" state.
+        # so the operator surface sees a consistent stopped-listener state.
         telegram_session = await self._load_session(session_name)
-        telegram_session.status = TelegramSessionStatus.STOPPED
+        if mark_stopped:
+            telegram_session.status = TelegramSessionStatus.STOPPED
         telegram_session.live_listener_started_at = None
         await self._commit_runtime_state()
 
@@ -314,6 +338,11 @@ class TelegramCrawlerRuntime:
         """
 
         channel = await self._get_tracked_channel(channel_id)
+        if not channel.is_active or channel.is_paused:
+            reason = "inactive" if not channel.is_active else "paused"
+            raise CrawlerSessionNotRunnableError(
+                f"Cannot replay Telegram channel {channel_id!r} because it is {reason}.",
+            )
         if channel.telegram_session_id is None:
             raise CrawlerSessionNotRunnableError(
                 f"Cannot replay Telegram channel {channel_id!r} because it is not assigned to a session.",
@@ -328,20 +357,49 @@ class TelegramCrawlerRuntime:
                 f"Cannot replay Telegram channel {channel_id!r} because its session is not runnable.",
             )
 
-        raw_message = await self.telegram_client.fetch_single_message(
-            channel_id=channel_id,
-            post_id=post_id,
-        )
-        predownload_result = await self._try_accept_without_media(raw_message, advance_checkpoint=False)
-        if predownload_result is not None:
-            return predownload_result
+        try:
+            raw_message = await self.telegram_client.fetch_single_message(
+                channel_id=channel_id,
+                post_id=post_id,
+            )
+            if raw_message.channel_id != channel_id:
+                raise PipelineTelegramMalformedMessageError(
+                    "Telegram replay returned message for channel "
+                    f"{raw_message.channel_id!r}, expected {channel_id!r}.",
+                )
+            predownload_result = await self._try_accept_without_media(raw_message, advance_checkpoint=False)
+            if predownload_result is not None:
+                return predownload_result
 
-        media_bytes = await self.telegram_client.download_media(raw_message)
-        raw_post = PipelineTelegramMessageMapper.build_raw_crawler_post(
-            raw_message,
-            media_bytes,
-        )
-        return await self.ingest_service.accept_crawler_post(raw_post, advance_checkpoint=False)
+            media_bytes = await self.telegram_client.download_media(raw_message)
+            raw_post = PipelineTelegramMessageMapper.build_raw_crawler_post(
+                raw_message,
+                media_bytes,
+            )
+            return await self.ingest_service.accept_crawler_post(raw_post, advance_checkpoint=False)
+        except PipelineTelegramFloodWaitError as exc:
+            self._park_session_on_flood_wait(
+                assigned_session,
+                wait_seconds=exc.wait_seconds,
+                error_class=type(exc).__name__,
+                error_text=str(exc),
+            )
+            await self._commit_runtime_state()
+            raise
+        except PipelineTelegramSessionBannedError as exc:
+            await self._quarantine_session(
+                assigned_session,
+                error_class=type(exc).__name__,
+                error_text=str(exc),
+            )
+            raise
+        except PipelineTelegramSessionAuthRequiredError as exc:
+            await self._mark_session_auth_required(
+                assigned_session,
+                error_class=type(exc).__name__,
+                error_text=str(exc),
+            )
+            raise
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -499,9 +557,18 @@ class TelegramCrawlerRuntime:
         """Drain ``listen_live`` and ingest each message until cancelled."""
 
         try:
+            bound_channel_ids = set(channel_ids)
             async for raw_message in self.telegram_client.listen_live(
                 channel_ids=channel_ids,
             ):
+                if raw_message.channel_id not in bound_channel_ids:
+                    logger.warning(
+                        "Live listener for %s ignored message %s from unbound channel %s.",
+                        session_name,
+                        raw_message.message_id,
+                        raw_message.channel_id,
+                    )
+                    continue
                 if raw_message.media_type == "unsupported":
                     continue
                 predownload_result = await self._try_accept_without_media(raw_message)
@@ -555,6 +622,13 @@ class TelegramCrawlerRuntime:
         except PipelineTelegramSessionBannedError as exc:
             telegram_session = await self._load_session(session_name)
             await self._quarantine_session(
+                telegram_session,
+                error_class=type(exc).__name__,
+                error_text=str(exc),
+            )
+        except PipelineTelegramSessionAuthRequiredError as exc:
+            telegram_session = await self._load_session(session_name)
+            await self._mark_session_auth_required(
                 telegram_session,
                 error_class=type(exc).__name__,
                 error_text=str(exc),
@@ -623,6 +697,12 @@ class TelegramCrawlerRuntime:
 
         try:
             resolved = await self.telegram_client.resolve_channel(channel_row.platform_id)
+        except (
+            PipelineTelegramFloodWaitError,
+            PipelineTelegramSessionBannedError,
+            PipelineTelegramSessionAuthRequiredError,
+        ):
+            raise
         except PipelineTelegramError as exc:
             logger.warning(
                 "Failed to refresh channel metadata for %s: %s",
@@ -681,6 +761,21 @@ class TelegramCrawlerRuntime:
         telegram_session.quarantined_at = now
         telegram_session.last_error_class = error_class
         telegram_session.last_error_text = error_text[: 4000]
+        await self._commit_runtime_state()
+
+    async def _mark_session_auth_required(
+        self,
+        telegram_session: TelegramSession,
+        *,
+        error_class: str,
+        error_text: str,
+    ) -> None:
+        """Mark the session auth-required after Telegram rejects stored credentials."""
+
+        telegram_session.status = TelegramSessionStatus.AUTH_REQUIRED
+        telegram_session.live_listener_started_at = None
+        telegram_session.last_error_class = error_class[:128]
+        telegram_session.last_error_text = error_text[:4000]
         await self._commit_runtime_state()
 
     async def _commit_runtime_state(self) -> None:

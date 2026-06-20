@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
 import pytest
@@ -36,9 +37,17 @@ class _FakeStringSession:
         self.value = value
 
 
+@dataclass(frozen=True, slots=True)
+class _FakeAccount:
+    id: int = 123456
+    username: str = "primary_account"
+    phone: str = "+15551234567"
+
+
 class _FakeTelegramClient:
     instances: ClassVar[list[_FakeTelegramClient]] = []
     authorized: ClassVar[bool] = True
+    account: ClassVar[_FakeAccount | None] = _FakeAccount()
 
     def __init__(self, *, session: object, api_id: int, api_hash: str) -> None:
         self.session = session
@@ -57,6 +66,9 @@ class _FakeTelegramClient:
     async def is_user_authorized(self) -> bool:
         return self.authorized
 
+    async def get_me(self) -> _FakeAccount | None:
+        return self.account
+
     def disconnect(self) -> None:
         self.disconnected = True
         self.connected = False
@@ -66,6 +78,7 @@ class _FakeTelegramClient:
 def _reset_fake_telethon_client() -> None:
     _FakeTelegramClient.instances = []
     _FakeTelegramClient.authorized = True
+    _FakeTelegramClient.account = _FakeAccount()
 
 
 def _settings() -> Settings:
@@ -134,6 +147,14 @@ async def test_telethon_factory_passes_db_string_session_to_telegram_client(
     assert settings.telegram_api_hash is not None
     assert client.api_hash == settings.telegram_api_hash.get_secret_value()
     assert factory.max_requests_per_second == 2.5
+
+    async with postgres_session_factory() as verify_session:
+        row = await verify_session.scalar(select(TelegramSession).where(TelegramSession.name == "primary"))
+    assert row is not None
+    assert row.last_heartbeat_at is not None
+    assert row.account_user_id == 123456
+    assert row.account_username == "primary_account"
+    assert row.account_phone_hint == "ending-4567"
 
 
 async def test_telethon_client_updates_limiter_from_loaded_db_session(
