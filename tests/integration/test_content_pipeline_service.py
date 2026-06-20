@@ -1939,6 +1939,24 @@ def _build_meili_preview(meme_file_id: uuid.UUID) -> ContentPipelineSyncTargetPr
     )
 
 
+async def _complete_search_sync_targets(
+    service: PipelineStageCompletionService,
+    meme_file_id: uuid.UUID,
+) -> None:
+    await service.complete_sync_qdrant_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        payload_preview={"point_id": str(meme_file_id)},
+    )
+    await service.complete_sync_meili_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        payload_preview={"id": meme_file_id.hex},
+    )
+
+
 def utcnow_for_tests() -> datetime:
     from datetime import UTC
     from datetime import datetime as _datetime
@@ -1958,18 +1976,7 @@ async def test_run_smoke_proof_reports_both_targets_searchable(
         phash_tag="h",
         input_hash_seed="h",
     )
-    _ = await service.complete_sync_qdrant_stage(
-        meme_file_id=meme_file_id,
-        attempt=1,
-        event_id=uuid.uuid7(),
-        payload_preview={"point_id": str(meme_file_id)},
-    )
-    _ = await service.complete_sync_meili_stage(
-        meme_file_id=meme_file_id,
-        attempt=1,
-        event_id=uuid.uuid7(),
-        payload_preview={"id": meme_file_id.hex},
-    )
+    await _complete_search_sync_targets(service, meme_file_id)
 
     qdrant_sync = _FakeQdrantSyncClient(fetch_preview=_build_qdrant_preview(meme_file_id))
     similarity = _FakeQdrantSimilarityClient(
@@ -2016,18 +2023,7 @@ async def test_run_smoke_proof_reports_point_not_found_when_qdrant_missing(
         phash_tag="m",
         input_hash_seed="m",
     )
-    _ = await service.complete_sync_qdrant_stage(
-        meme_file_id=meme_file_id,
-        attempt=1,
-        event_id=uuid.uuid7(),
-        payload_preview={"point_id": str(meme_file_id)},
-    )
-    _ = await service.complete_sync_meili_stage(
-        meme_file_id=meme_file_id,
-        attempt=1,
-        event_id=uuid.uuid7(),
-        payload_preview={"id": meme_file_id.hex},
-    )
+    await _complete_search_sync_targets(service, meme_file_id)
 
     qdrant_sync = _FakeQdrantSyncClient(fetch_preview=None)
     similarity = _FakeQdrantSimilarityClient()
@@ -2065,18 +2061,7 @@ async def test_run_smoke_proof_reports_document_not_found_when_meili_missing(
         phash_tag="d",
         input_hash_seed="d",
     )
-    _ = await service.complete_sync_qdrant_stage(
-        meme_file_id=meme_file_id,
-        attempt=1,
-        event_id=uuid.uuid7(),
-        payload_preview={"point_id": str(meme_file_id)},
-    )
-    _ = await service.complete_sync_meili_stage(
-        meme_file_id=meme_file_id,
-        attempt=1,
-        event_id=uuid.uuid7(),
-        payload_preview={"id": meme_file_id.hex},
-    )
+    await _complete_search_sync_targets(service, meme_file_id)
 
     qdrant_sync = _FakeQdrantSyncClient(fetch_preview=_build_qdrant_preview(meme_file_id))
     similarity = _FakeQdrantSimilarityClient(
@@ -2119,18 +2104,7 @@ async def test_run_smoke_proof_reports_qdrant_timeout_while_proving_meili(
         phash_tag="t",
         input_hash_seed="t",
     )
-    _ = await service.complete_sync_qdrant_stage(
-        meme_file_id=meme_file_id,
-        attempt=1,
-        event_id=uuid.uuid7(),
-        payload_preview={"point_id": str(meme_file_id)},
-    )
-    _ = await service.complete_sync_meili_stage(
-        meme_file_id=meme_file_id,
-        attempt=1,
-        event_id=uuid.uuid7(),
-        payload_preview={"id": meme_file_id.hex},
-    )
+    await _complete_search_sync_targets(service, meme_file_id)
 
     qdrant_sync = _FakeQdrantSyncClient(
         fetch_error=QdrantSyncTimeoutError("qdrant fetch_meme_point timed out"),
@@ -2170,18 +2144,7 @@ async def test_run_smoke_proof_reports_meili_malformed_while_proving_qdrant(
         phash_tag="f",
         input_hash_seed="f",
     )
-    _ = await service.complete_sync_qdrant_stage(
-        meme_file_id=meme_file_id,
-        attempt=1,
-        event_id=uuid.uuid7(),
-        payload_preview={"point_id": str(meme_file_id)},
-    )
-    _ = await service.complete_sync_meili_stage(
-        meme_file_id=meme_file_id,
-        attempt=1,
-        event_id=uuid.uuid7(),
-        payload_preview={"id": meme_file_id.hex},
-    )
+    await _complete_search_sync_targets(service, meme_file_id)
 
     qdrant_sync = _FakeQdrantSyncClient(fetch_preview=_build_qdrant_preview(meme_file_id))
     similarity = _FakeQdrantSimilarityClient(
@@ -2226,18 +2189,7 @@ async def test_run_smoke_proof_uses_meili_search_timeout_reason_on_query_step(
         phash_tag="g",
         input_hash_seed="g",
     )
-    _ = await service.complete_sync_qdrant_stage(
-        meme_file_id=meme_file_id,
-        attempt=1,
-        event_id=uuid.uuid7(),
-        payload_preview={"point_id": str(meme_file_id)},
-    )
-    _ = await service.complete_sync_meili_stage(
-        meme_file_id=meme_file_id,
-        attempt=1,
-        event_id=uuid.uuid7(),
-        payload_preview={"id": meme_file_id.hex},
-    )
+    await _complete_search_sync_targets(service, meme_file_id)
 
     qdrant_sync = _FakeQdrantSyncClient(fetch_preview=_build_qdrant_preview(meme_file_id))
     similarity = _FakeQdrantSimilarityClient(
