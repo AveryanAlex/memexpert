@@ -275,6 +275,44 @@ def test_settings_require_imgproxy_key_and_salt_together() -> None:
         _ = Settings.model_validate({"imgproxy_key": "001122"})
 
 
+def test_settings_allows_signed_imgproxy_internal_base_with_public_override() -> None:
+    settings = Settings.model_validate(
+        {
+            "imgproxy_base_url": "http://imgproxy:8080",
+            "imgproxy_public_base_url": " https://img.memexpert.net/ ",
+            "imgproxy_key": "00112233445566778899aabbccddeeff",
+            "imgproxy_salt": "ffeeddccbbaa99887766554433221100",
+        }
+    )
+
+    assert settings.imgproxy_base_url == "http://imgproxy:8080"
+    assert settings.imgproxy_public_base_url == "https://img.memexpert.net"
+    assert settings.imgproxy_render_base_url == "https://img.memexpert.net"
+
+
+@pytest.mark.parametrize(
+    "imgproxy_base_url",
+    [
+        "http://imgproxy:8080",
+        "http://localhost:8080",
+        "http://127.0.0.1:8080",
+        "http://0.0.0.0:8080",
+        "http://192.168.1.10:8080",
+        "http://169.254.1.1:8080",
+        "img.memexpert.net",
+    ],
+)
+def test_settings_reject_signed_imgproxy_without_browser_reachable_base(imgproxy_base_url: str) -> None:
+    with pytest.raises(ValidationError, match="browser-reachable"):
+        _ = Settings.model_validate(
+            {
+                "imgproxy_base_url": imgproxy_base_url,
+                "imgproxy_key": "00112233445566778899aabbccddeeff",
+                "imgproxy_salt": "ffeeddccbbaa99887766554433221100",
+            }
+        )
+
+
 def test_settings_trim_and_validate_auth_access_cookie_fields() -> None:
     settings = Settings.model_validate(
         {

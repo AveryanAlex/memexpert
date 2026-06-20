@@ -40,7 +40,7 @@ class MediaRenderUrlService:
 
     def __init__(self, settings: Settings | None = None) -> None:
         self._settings = settings or get_settings()
-        self._imgproxy_base_url = self._settings.imgproxy_base_url.rstrip("/")
+        self._imgproxy_base_url = self._settings.imgproxy_render_base_url.rstrip("/")
         self._imgproxy_key = _decode_secret_bytes(self._settings.imgproxy_key)
         self._imgproxy_salt = _decode_secret_bytes(self._settings.imgproxy_salt)
         self._public_media_base_url = (
