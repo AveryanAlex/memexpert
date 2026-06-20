@@ -8,9 +8,11 @@ from typing import TYPE_CHECKING, cast
 from uuid import UUID, uuid7
 
 from httpx import ASGITransport, AsyncClient
+from pydantic import SecretStr
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+import memexpert.services.admin as admin_service_module
 from memexpert.models.collection import Collection, CollectionMeme, PinnedMeme
 from memexpert.models.content import (
     AdminMemeDestructiveAuditLog,
@@ -24,6 +26,8 @@ from memexpert.models.content import (
     ModerationDecision,
     ModerationReport,
     SourceChannel,
+    TelegramAdminAuditLog,
+    TelegramSession,
 )
 from memexpert.models.enums import (
     ContentKind,
@@ -32,6 +36,7 @@ from memexpert.models.enums import (
     ModerationReason,
     ModerationReportStatus,
     SourcePlatform,
+    TelegramSessionStatus,
 )
 from memexpert.models.user import ChannelSuggestion, User
 from memexpert.services import AuthService, UserService
@@ -98,6 +103,7 @@ async def test_admin_routes_require_session_cookie_admin_flag_and_ignore_operato
 
     async with AsyncClient(transport=transport, base_url="https://testserver") as anonymous_client:
         anonymous_session_response = await anonymous_client.get("/api/v1/admin/session")
+        anonymous_telegram_sessions_response = await anonymous_client.get("/api/v1/admin/telegram/sessions")
         anonymous_detail_response = await anonymous_client.get(f"/api/v1/admin/memes/{meme_id}")
         anonymous_override_response = await anonymous_client.patch(
             f"/api/v1/admin/memes/{meme_id}/moderation",
@@ -153,6 +159,11 @@ async def test_admin_routes_require_session_cookie_admin_flag_and_ignore_operato
             f"/api/v1/admin/memes/{meme_id}/seo-page/regenerate",
             json={"confirmation": meme_id},
         )
+        forbidden_telegram_session_create_response = await non_admin_client.post(
+            "/api/v1/admin/telegram/sessions",
+            json={"name": "permission-test", "display_name": "Permission Test"},
+        )
+        forbidden_telegram_channels_response = await non_admin_client.get("/api/v1/admin/telegram/channels")
         forbidden_reports_response = await non_admin_client.get("/api/v1/admin/moderation-reports")
         forbidden_blocked_hashes_response = await non_admin_client.get("/api/v1/admin/blocked-perceptual-hashes")
 
@@ -175,8 +186,13 @@ async def test_admin_routes_require_session_cookie_admin_flag_and_ignore_operato
             "/api/v1/admin/seo-pages",
             headers={"X-Pipeline-Operator-Token": "anything"},
         )
+        operator_telegram_sessions_response = await operator_header_client.get(
+            "/api/v1/admin/telegram/sessions",
+            headers={"X-Pipeline-Operator-Token": "anything"},
+        )
 
     assert anonymous_session_response.status_code == 401
+    assert anonymous_telegram_sessions_response.status_code == 401
     assert anonymous_detail_response.status_code == 401
     assert anonymous_override_response.status_code == 401
     assert anonymous_seo_pages_response.status_code == 401
@@ -192,6 +208,8 @@ async def test_admin_routes_require_session_cookie_admin_flag_and_ignore_operato
     assert forbidden_seo_pages_response.status_code == 403
     assert forbidden_seo_edit_response.status_code == 403
     assert forbidden_seo_regenerate_response.status_code == 403
+    assert forbidden_telegram_session_create_response.status_code == 403
+    assert forbidden_telegram_channels_response.status_code == 403
     assert forbidden_reports_response.status_code == 403
     assert forbidden_blocked_hashes_response.status_code == 403
     assert forbidden_session_response.json()["code"] == "admin_required"
@@ -201,6 +219,7 @@ async def test_admin_routes_require_session_cookie_admin_flag_and_ignore_operato
     assert operator_detail_response.status_code == 401
     assert operator_delete_response.status_code == 401
     assert operator_seo_pages_response.status_code == 401
+    assert operator_telegram_sessions_response.status_code == 401
 
 
 async def test_admin_can_approve_channel_suggestion_through_cookie_session(
@@ -910,14 +929,16 @@ async def test_admin_source_channel_health_and_mark_dead_conflicts(
     auth_settings_overrides: dict[str, str],
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
+    admin_email = "admin-source-health@example.com"
     admin_token = await _issue_user_cookie(
         postgres_session_factory,
         auth_settings_overrides,
-        email="admin-source-health@example.com",
+        email=admin_email,
         is_admin=True,
     )
 
     async with postgres_session_factory() as session:
+        admin_user = (await session.execute(select(User).where(User.email == admin_email))).scalar_one()
         stale_channel = SourceChannel(
             platform=SourcePlatform.TELEGRAM,
             platform_id="source-health-stale",
@@ -935,6 +956,7 @@ async def test_admin_source_channel_health_and_mark_dead_conflicts(
         )
         session.add_all([stale_channel, checkpoint_channel])
         await session.commit()
+        admin_user_id = admin_user.id
         stale_channel_id = stale_channel.id
         checkpoint_channel_id = checkpoint_channel.id
 
@@ -971,9 +993,493 @@ async def test_admin_source_channel_health_and_mark_dead_conflicts(
 
     async with postgres_session_factory() as session:
         persisted_stale_channel = await session.get(SourceChannel, stale_channel_id)
+        audit_row = (
+            await session.execute(
+                select(TelegramAdminAuditLog).where(
+                    TelegramAdminAuditLog.source_channel_id == stale_channel_id,
+                    TelegramAdminAuditLog.action == "channel_mark_dead",
+                ),
+            )
+        ).scalar_one()
         assert persisted_stale_channel is not None
         assert persisted_stale_channel.is_active is False
         assert persisted_stale_channel.is_paused is True
+        assert audit_row.admin_user_id == admin_user_id
+        assert audit_row.previous_values["is_active"] is True
+        assert audit_row.new_values["is_active"] is False
+
+
+async def test_admin_create_source_channel_uses_telegram_session_id_and_rejects_unknown_target(
+    auth_app: FastAPI,
+    auth_settings_overrides: dict[str, str],
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    admin_token = await _issue_user_cookie(
+        postgres_session_factory,
+        auth_settings_overrides,
+        email="admin-source-create@example.com",
+        is_admin=True,
+    )
+
+    async with postgres_session_factory() as session:
+        telegram_session = TelegramSession(
+            name="session-a",
+            display_name="Session A",
+            status=TelegramSessionStatus.ACTIVE,
+        )
+        session.add(telegram_session)
+        await session.commit()
+        telegram_session_id = telegram_session.id
+
+    transport = ASGITransport(app=auth_app)
+    async with AsyncClient(transport=transport, base_url="https://testserver") as admin_client:
+        admin_client.cookies.set(ACCESS_COOKIE_NAME, admin_token)
+        created_response = await admin_client.post(
+            "/api/v1/admin/source-channels",
+            json={
+                "platform": "telegram",
+                "platform_id": "admin-created-source",
+                "title": "Admin Created Source",
+                "telegram_session_id": str(telegram_session_id),
+                "live_enabled": False,
+                "engagement_enabled": False,
+            },
+        )
+        unknown_session_response = await admin_client.post(
+            "/api/v1/admin/source-channels",
+            json={
+                "platform": "telegram",
+                "platform_id": "admin-created-source-unknown",
+                "title": "Unknown Session Source",
+                "telegram_session_id": str(uuid7()),
+            },
+        )
+
+    assert created_response.status_code == 201
+    payload = created_response.json()
+    assert payload["telegram_session_id"] == str(telegram_session_id)
+    assert payload["telegram_session_name"] == "session-a"
+    assert payload["is_orphaned"] is False
+    assert payload["live_enabled"] is False
+    assert payload["engagement_enabled"] is False
+    assert unknown_session_response.status_code == 404
+    assert "Telegram session" in unknown_session_response.json()["detail"]
+
+    async with postgres_session_factory() as session:
+        persisted = await session.scalar(
+            select(SourceChannel).where(SourceChannel.platform_id == "admin-created-source"),
+        )
+        assert persisted is not None
+        assert persisted.telegram_session_id == telegram_session_id
+
+
+async def test_admin_telegram_session_lifecycle_validates_without_leaking_string_session(
+    auth_app: FastAPI,
+    auth_settings_overrides: dict[str, str],
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch,
+) -> None:
+    admin_token = await _issue_user_cookie(
+        postgres_session_factory,
+        auth_settings_overrides,
+        email="admin-telegram-session@example.com",
+        is_admin=True,
+    )
+    raw_string_session = "raw-string-session-secret-for-admin-test"
+    checked_channel_references: list[str | None] = []
+
+    async def fake_validate_admin_telegram_string_session(
+        *,
+        settings: object,
+        string_session: SecretStr,
+        channel_reference: str | None = None,
+    ) -> admin_service_module.AdminTelegramValidationResult:
+        _ = settings
+        assert hasattr(string_session, "get_secret_value")
+        assert string_session.get_secret_value() == raw_string_session
+        checked_channel_references.append(channel_reference)
+        return admin_service_module.AdminTelegramValidationResult(
+            account=admin_service_module.AdminTelegramAccountProjection(
+                user_id=777000,
+                username="validated_admin_session",
+                phone_hint="ending-7000",
+            ),
+            channel_reference=channel_reference,
+        )
+
+    monkeypatch.setattr(
+        admin_service_module,
+        "validate_admin_telegram_string_session",
+        fake_validate_admin_telegram_string_session,
+    )
+
+    transport = ASGITransport(app=auth_app)
+    async with AsyncClient(transport=transport, base_url="https://testserver") as admin_client:
+        admin_client.cookies.set(ACCESS_COOKIE_NAME, admin_token)
+        create_response = await admin_client.post(
+            "/api/v1/admin/telegram/sessions",
+            json={
+                "name": "primary-admin-session",
+                "display_name": "Primary Admin Session",
+                "string_session": raw_string_session,
+                "account_user_id": 12345,
+                "account_username": "seeded_username",
+                "account_phone_hint": "ending-2345",
+                "max_requests_per_second": 2.5,
+            },
+        )
+        create_auth_required_response = await admin_client.post(
+            "/api/v1/admin/telegram/sessions",
+            json={"name": "auth-required-session", "display_name": "Auth Required Session"},
+        )
+        session_id = create_response.json()["id"]
+        patch_response = await admin_client.patch(
+            f"/api/v1/admin/telegram/sessions/{session_id}",
+            json={
+                "status": "quarantined",
+                "enabled": False,
+                "last_error_class": "ManualPark",
+                "last_error_text": "Parked by test admin",
+                "note": "park for maintenance",
+            },
+        )
+        clear_response = await admin_client.patch(
+            f"/api/v1/admin/telegram/sessions/{session_id}",
+            json={"status": "active", "enabled": True, "clear_error": True},
+        )
+        channel_response = await admin_client.post(
+            "/api/v1/admin/telegram/channels",
+            json={
+                "platform": "telegram",
+                "platform_id": "validated-channel-id",
+                "username": "validated_channel",
+                "title": "Validated Channel",
+                "telegram_session_id": session_id,
+            },
+        )
+        validate_response = await admin_client.post(
+            f"/api/v1/admin/telegram/sessions/{session_id}/validate",
+            json={"source_channel_id": channel_response.json()["id"]},
+        )
+        list_response = await admin_client.get("/api/v1/admin/telegram/sessions")
+
+    assert create_response.status_code == 201
+    create_payload = create_response.json()
+    assert create_payload["status"] == "active"
+    assert create_payload["has_string_session"] is True
+    assert create_payload["account_user_id"] == 12345
+    assert create_payload["owned_channel_count"] == 0
+    assert raw_string_session not in create_response.text
+    assert "encrypted_string_session" not in create_response.text
+
+    assert create_auth_required_response.status_code == 201
+    auth_required_payload = create_auth_required_response.json()
+    assert auth_required_payload["status"] == "auth_required"
+    assert auth_required_payload["has_string_session"] is False
+
+    assert patch_response.status_code == 200
+    patch_payload = patch_response.json()
+    assert patch_payload["status"] == "quarantined"
+    assert patch_payload["enabled"] is False
+    assert patch_payload["last_error_class"] == "ManualPark"
+    assert patch_payload["quarantined_at"] is not None
+    assert raw_string_session not in patch_response.text
+
+    assert clear_response.status_code == 200
+    assert clear_response.json()["status"] == "active"
+    assert clear_response.json()["last_error_class"] is None
+    assert clear_response.json()["last_error_text"] is None
+
+    assert channel_response.status_code == 201
+    assert channel_response.json()["is_indexable"] is True
+    assert validate_response.status_code == 200
+    validate_payload = validate_response.json()
+    assert validate_payload["channel_checked"] is True
+    assert validate_payload["channel_reference"] == "@validated_channel"
+    assert validate_payload["telegram_session"]["account_user_id"] == 777000
+    assert validate_payload["telegram_session"]["account_username"] == "validated_admin_session"
+    assert raw_string_session not in validate_response.text
+    assert checked_channel_references == ["@validated_channel"]
+
+    assert list_response.status_code == 200
+    list_payload = {item["name"]: item for item in list_response.json()}
+    assert list_payload["primary-admin-session"]["owned_channel_count"] == 1
+    assert list_payload["primary-admin-session"]["has_string_session"] is True
+    assert list_payload["auth-required-session"]["has_string_session"] is False
+    assert raw_string_session not in list_response.text
+    assert "encrypted_string_session" not in list_response.text
+
+    async with postgres_session_factory() as session:
+        persisted = await session.get(TelegramSession, UUID(session_id))
+        audit_rows = (
+            await session.execute(
+                select(TelegramAdminAuditLog).order_by(TelegramAdminAuditLog.created_at.asc()),
+            )
+        ).scalars().all()
+
+    assert persisted is not None
+    assert persisted.encrypted_string_session is not None
+    assert persisted.encrypted_string_session != raw_string_session
+    assert persisted.account_user_id == 777000
+    assert persisted.account_username == "validated_admin_session"
+    assert [row.action for row in audit_rows if row.telegram_session_id == persisted.id] == [
+        "session_create",
+        "session_patch",
+        "session_patch",
+        "channel_create",
+    ]
+    for row in audit_rows:
+        audit_text = f"{row.previous_values} {row.new_values}"
+        assert raw_string_session not in audit_text
+        assert "encrypted_string_session" not in audit_text
+
+
+async def test_admin_telegram_channel_assignment_orphan_filters_and_audit(
+    auth_app: FastAPI,
+    auth_settings_overrides: dict[str, str],
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    admin_token = await _issue_user_cookie(
+        postgres_session_factory,
+        auth_settings_overrides,
+        email="admin-telegram-channel@example.com",
+        is_admin=True,
+    )
+
+    async with postgres_session_factory() as session:
+        telegram_session = TelegramSession(
+            name="assignment-session",
+            display_name="Assignment Session",
+            status=TelegramSessionStatus.ACTIVE,
+        )
+        session.add(telegram_session)
+        await session.commit()
+        telegram_session_id = telegram_session.id
+
+    transport = ASGITransport(app=auth_app)
+    async with AsyncClient(transport=transport, base_url="https://testserver") as admin_client:
+        admin_client.cookies.set(ACCESS_COOKIE_NAME, admin_token)
+        missing_target_response = await admin_client.post(
+            "/api/v1/admin/telegram/channels",
+            json={"platform": "telegram", "platform_id": "missing-target", "title": "Missing Target"},
+        )
+        unknown_target_response = await admin_client.post(
+            "/api/v1/admin/telegram/channels",
+            json={
+                "platform": "telegram",
+                "platform_id": "unknown-target",
+                "title": "Unknown Target",
+                "telegram_session_id": str(uuid7()),
+            },
+        )
+        orphan_create_response = await admin_client.post(
+            "/api/v1/admin/telegram/channels",
+            json={
+                "platform": "telegram",
+                "platform_id": "orphan-create",
+                "title": "Orphan Create",
+                "orphaned": True,
+                "catchup_enabled": True,
+                "live_enabled": True,
+                "engagement_enabled": True,
+            },
+        )
+        channel_id = orphan_create_response.json()["id"]
+        enable_orphan_response = await admin_client.patch(
+            f"/api/v1/admin/telegram/channels/{channel_id}",
+            json={"catchup_enabled": True},
+        )
+        assign_unknown_response = await admin_client.post(
+            f"/api/v1/admin/telegram/channels/{channel_id}/assign",
+            json={"telegram_session_id": str(uuid7())},
+        )
+        assign_response = await admin_client.post(
+            f"/api/v1/admin/telegram/channels/{channel_id}/assign",
+            json={"telegram_session_id": str(telegram_session_id), "note": "move to live session"},
+        )
+        update_response = await admin_client.patch(
+            f"/api/v1/admin/telegram/channels/{channel_id}",
+            json={
+                "catchup_enabled": True,
+                "live_enabled": True,
+                "engagement_enabled": True,
+                "catchup_message_limit": 123,
+            },
+        )
+        by_session_response = await admin_client.get(
+            f"/api/v1/admin/telegram/channels?telegram_session_id={telegram_session_id}",
+        )
+        grouped_response = await admin_client.get("/api/v1/admin/telegram/channels/grouped")
+        orphan_response = await admin_client.post(
+            f"/api/v1/admin/telegram/channels/{channel_id}/orphan",
+            json={"note": "explicit orphan"},
+        )
+        orphaned_list_response = await admin_client.get("/api/v1/admin/telegram/channels?orphaned=true")
+
+    assert missing_target_response.status_code == 409
+    assert "telegram_session_id or orphaned=true" in missing_target_response.json()["detail"]
+    assert unknown_target_response.status_code == 404
+
+    assert orphan_create_response.status_code == 201
+    orphan_payload = orphan_create_response.json()
+    assert orphan_payload["telegram_session_id"] is None
+    assert orphan_payload["is_orphaned"] is True
+    assert orphan_payload["is_indexable"] is False
+    assert orphan_payload["catchup_enabled"] is False
+    assert orphan_payload["live_enabled"] is False
+    assert orphan_payload["engagement_enabled"] is False
+
+    assert enable_orphan_response.status_code == 409
+    assert "Orphaned source channels" in enable_orphan_response.json()["detail"]
+    assert assign_unknown_response.status_code == 404
+
+    assert assign_response.status_code == 200
+    assert assign_response.json()["telegram_session_id"] == str(telegram_session_id)
+    assert assign_response.json()["is_orphaned"] is False
+    assert assign_response.json()["is_indexable"] is False
+
+    assert update_response.status_code == 200
+    update_payload = update_response.json()
+    assert update_payload["catchup_message_limit"] == 123
+    assert update_payload["is_indexable"] is True
+
+    assert by_session_response.status_code == 200
+    assert [item["id"] for item in by_session_response.json()] == [channel_id]
+
+    assert grouped_response.status_code == 200
+    session_groups = {group["telegram_session"]["id"] for group in grouped_response.json() if group["telegram_session"]}
+    assert str(telegram_session_id) in session_groups
+
+    assert orphan_response.status_code == 200
+    orphan_after_assign_payload = orphan_response.json()
+    assert orphan_after_assign_payload["telegram_session_id"] is None
+    assert orphan_after_assign_payload["catchup_enabled"] is False
+    assert orphan_after_assign_payload["live_enabled"] is False
+    assert orphan_after_assign_payload["engagement_enabled"] is False
+    assert orphan_after_assign_payload["is_indexable"] is False
+
+    assert orphaned_list_response.status_code == 200
+    assert channel_id in {item["id"] for item in orphaned_list_response.json()}
+
+    async with postgres_session_factory() as session:
+        persisted = await session.get(SourceChannel, UUID(channel_id))
+        audit_actions = (
+            await session.execute(
+                select(TelegramAdminAuditLog.action)
+                .where(TelegramAdminAuditLog.source_channel_id == UUID(channel_id))
+                .order_by(TelegramAdminAuditLog.created_at.asc()),
+            )
+        ).scalars().all()
+
+    assert persisted is not None
+    assert persisted.telegram_session_id is None
+    assert persisted.catchup_enabled is False
+    assert persisted.live_enabled is False
+    assert persisted.engagement_enabled is False
+    assert audit_actions == ["channel_create", "channel_assign", "channel_update", "channel_orphan"]
+
+
+async def test_admin_delete_telegram_session_orphans_channels_and_audits_delete(
+    auth_app: FastAPI,
+    auth_settings_overrides: dict[str, str],
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    admin_token = await _issue_user_cookie(
+        postgres_session_factory,
+        auth_settings_overrides,
+        email="admin-delete-telegram-session@example.com",
+        is_admin=True,
+    )
+
+    async with postgres_session_factory() as session:
+        telegram_session = TelegramSession(
+            name="delete-session",
+            display_name="Delete Session",
+            status=TelegramSessionStatus.ACTIVE,
+            encrypted_string_session="encrypted-not-raw",
+        )
+        keep_session = TelegramSession(
+            name="keep-session",
+            display_name="Keep Session",
+            status=TelegramSessionStatus.ACTIVE,
+        )
+        first_channel = SourceChannel(
+            platform=SourcePlatform.TELEGRAM,
+            platform_id="delete-session-first",
+            title="Delete Session First",
+            telegram_session=telegram_session,
+            catchup_enabled=True,
+            live_enabled=True,
+            engagement_enabled=True,
+        )
+        second_channel = SourceChannel(
+            platform=SourcePlatform.TELEGRAM,
+            platform_id="delete-session-second",
+            title="Delete Session Second",
+            telegram_session=telegram_session,
+            catchup_enabled=True,
+            live_enabled=True,
+            engagement_enabled=True,
+        )
+        keep_channel = SourceChannel(
+            platform=SourcePlatform.TELEGRAM,
+            platform_id="keep-session-channel",
+            title="Keep Session Channel",
+            telegram_session=keep_session,
+        )
+        session.add_all([telegram_session, keep_session, first_channel, second_channel, keep_channel])
+        await session.commit()
+        session_id = telegram_session.id
+        first_channel_id = first_channel.id
+        second_channel_id = second_channel.id
+        keep_channel_id = keep_channel.id
+        keep_session_id = keep_session.id
+
+    transport = ASGITransport(app=auth_app)
+    async with AsyncClient(transport=transport, base_url="https://testserver") as admin_client:
+        admin_client.cookies.set(ACCESS_COOKIE_NAME, admin_token)
+        bad_confirmation_response = await admin_client.request(
+            "DELETE",
+            f"/api/v1/admin/telegram/sessions/{session_id}",
+            json={"confirmation": str(uuid7()), "note": "try wrong delete"},
+        )
+        delete_response = await admin_client.request(
+            "DELETE",
+            f"/api/v1/admin/telegram/sessions/{session_id}",
+            json={"confirmation": str(session_id), "note": "retire account"},
+        )
+
+    assert bad_confirmation_response.status_code == 409
+    assert delete_response.status_code == 200
+    assert delete_response.json()["orphaned_source_channel_count"] == 2
+
+    async with postgres_session_factory() as session:
+        deleted_session = await session.get(TelegramSession, session_id)
+        first_channel = await session.get(SourceChannel, first_channel_id)
+        second_channel = await session.get(SourceChannel, second_channel_id)
+        keep_channel = await session.get(SourceChannel, keep_channel_id)
+        audit_rows = (
+            await session.execute(
+                select(TelegramAdminAuditLog)
+                .where(TelegramAdminAuditLog.telegram_session_id == session_id)
+                .order_by(TelegramAdminAuditLog.created_at.asc()),
+            )
+        ).scalars().all()
+
+    assert deleted_session is None
+    assert first_channel is not None
+    assert second_channel is not None
+    for channel in (first_channel, second_channel):
+        assert channel.telegram_session_id is None
+        assert channel.catchup_enabled is False
+        assert channel.live_enabled is False
+        assert channel.engagement_enabled is False
+    assert keep_channel is not None
+    assert keep_channel.telegram_session_id == keep_session_id
+    assert [row.action for row in audit_rows] == ["channel_orphan", "channel_orphan", "session_delete"]
+    delete_audit = audit_rows[-1]
+    assert delete_audit.note == "retire account"
+    assert "encrypted_string_session" not in str(delete_audit.previous_values)
 
 
 async def test_admin_can_delete_meme_with_durable_destructive_audit(

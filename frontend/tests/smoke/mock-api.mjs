@@ -1,6 +1,7 @@
 import { createServer } from 'node:http';
 
 const port = Number(process.env.PORT ?? 8787);
+const seededCollectionId = 'smoke-private-team-saves';
 
 const meme = {
   id: 'smoke-meme-1',
@@ -68,6 +69,49 @@ const nextMeme = {
   }
 };
 
+const collectionMeme = {
+  ...meme,
+  id: 'smoke-meme-collection-1',
+  caption: 'Smoke test vault reaction',
+  seo_page_slug: 'smoke-test-vault-reaction',
+  tags: ['vault', 'reaction', 'collection'],
+  primary_file: {
+    ...meme.primary_file,
+    id: 'smoke-file-collection-1'
+  },
+  viewer_access: { visibility: 'shared' }
+};
+
+const seededCollection = {
+  id: seededCollectionId,
+  owner_id: 'smoke-owner-user',
+  title: 'Smoke private team saves',
+  description: 'Deterministic collection used by browser smoke tests.',
+  kind: 'custom',
+  visibility: 'private',
+  memberships: [],
+  invites: [],
+  created_at: '2026-01-01T00:00:00Z',
+  updated_at: '2026-01-01T00:00:00Z'
+};
+
+const seededCollectionSummary = {
+  collection: seededCollection,
+  viewer_role: 'viewer',
+  capabilities: {
+    can_view: true,
+    can_add_memes: false,
+    can_remove_memes: false,
+    can_rename: false,
+    can_delete: false,
+    can_create_invites: false,
+    can_revoke_invites: false,
+    can_manage_members: false,
+    can_set_active_save: true
+  },
+  active_save_collection_id: seededCollectionId
+};
+
 const trend = {
   recent: { views: 120, sends: 8, likes: 7, saves: 4, downloads: 3 },
   previous: { views: 90, sends: 5, likes: 4, saves: 2, downloads: 1 },
@@ -84,6 +128,10 @@ const trend = {
   trending_score: 42.5,
   refreshed_at: '2026-01-01T00:00:00Z'
 };
+
+const motdAlgorithmVersion = 'motd-smoke-v1';
+const motdScoreComponents = { popularity: 0.42, quality: 0.55 };
+const motdScore = 0.97;
 
 const server = createServer((request, response) => {
   const url = new URL(request.url ?? '/', `http://${request.headers.host ?? `127.0.0.1:${port}`}`);
@@ -103,7 +151,7 @@ const server = createServer((request, response) => {
   }
 
   if (url.pathname === '/api/v1/auth/session') {
-    if ((request.headers.cookie ?? '').includes('memexpert_access_token=miniapp-full')) {
+    if (hasFullAccess(request)) {
       sendJson(response, 200, sessionPayload('full'));
       return;
     }
@@ -128,7 +176,45 @@ const server = createServer((request, response) => {
     return;
   }
 
+  if (url.pathname === '/api/v1/collections') {
+    if (!hasFullAccess(request)) {
+      sendJson(response, 401, { detail: 'Sign in to load collection choices.' });
+      return;
+    }
+
+    sendJson(response, 200, {
+      collections: [seededCollectionSummary],
+      active_save_collection_id: seededCollectionId
+    });
+    return;
+  }
+
+  if (url.pathname === '/api/v1/memes/meme-of-the-day') {
+    sendJson(response, 200, {
+      meme,
+      selected_for: '2026-01-01',
+      refreshed_at: '2026-01-01T00:00:00Z',
+      algorithm_version: motdAlgorithmVersion,
+      score: motdScore,
+      score_components: motdScoreComponents,
+      reason: 'Smoke MOTD selection',
+      candidate_count: 2,
+      attribution: motdAttribution()
+    });
+    return;
+  }
+
   if (url.pathname === '/api/v1/memes/search') {
+    if (isSeededCollectionSearch(url)) {
+      if (!hasFullAccess(request)) {
+        sendJson(response, 403, { detail: 'Sign in with access to this collection to search it.' });
+        return;
+      }
+
+      sendJson(response, 200, searchPage([{ meme: collectionMeme, attribution: attributionFor(url, collectionMeme.id) }], url, 'req_smoke_collection'));
+      return;
+    }
+
     sendJson(response, 200, {
       items: [{ meme }],
       limit: Number(url.searchParams.get('limit') ?? 12),
@@ -139,7 +225,7 @@ const server = createServer((request, response) => {
     return;
   }
 
-  if (url.pathname === '/api/v1/memes/browse') {
+  if (url.pathname === '/api/v1/memes/home-feed' || url.pathname === '/api/v1/memes/browse') {
     const offset = Number(url.searchParams.get('offset') ?? 0);
     sendJson(response, 200, {
       items: [{ meme: offset > 0 ? nextMeme : meme }],
@@ -165,6 +251,11 @@ const server = createServer((request, response) => {
         { captured_at: '2026-01-01T01:00:00Z', source_views: 120, source_reactions: 7, source_reposts: 8, platform_views: 120, platform_sends: 8, platform_saves: 4, platform_likes: 7, popularity_score: 42.5 }
       ]
     });
+    return;
+  }
+
+  if (/^\/api\/v1\/memes\/[^/]+\/(?:detail-click|download|impression|share)$/.test(url.pathname)) {
+    sendJson(response, 200, { ok: true });
     return;
   }
 
@@ -200,6 +291,77 @@ function readRequestJson(request) {
     });
     request.on('error', reject);
   });
+}
+
+function hasFullAccess(request) {
+  return (request.headers.cookie ?? '').includes('memexpert_access_token=miniapp-full');
+}
+
+function isSeededCollectionSearch(url) {
+  return url.searchParams.get('scope') === 'collections' && url.searchParams.getAll('collection_ids').includes(seededCollectionId);
+}
+
+function searchPage(items, url, requestId) {
+  return {
+    items,
+    limit: Number(url.searchParams.get('limit') ?? 12),
+    offset: Number(url.searchParams.get('offset') ?? 0),
+    total: items.length,
+    has_more: false,
+    request_id: requestId
+  };
+}
+
+function attributionFor(url, memeId) {
+  return {
+    request_id: 'req_smoke_collection',
+    impression_id: `imp_${memeId}`,
+    surface: 'search',
+    source_algorithm: 'smoke-collection-seed',
+    rank: 1,
+    query: url.searchParams.get('query') ?? null,
+    filters: {
+      language: url.searchParams.get('language'),
+      media_type: url.searchParams.get('media_type'),
+      include_nsfw: url.searchParams.get('include_nsfw') === 'true',
+      tags: url.searchParams.getAll('tags'),
+      scope: url.searchParams.get('scope'),
+      collection_ids: url.searchParams.getAll('collection_ids')
+    },
+    collection_scope: 'collections',
+    collection_ids: url.searchParams.getAll('collection_ids'),
+    source_meme_id: null,
+    algorithm_version: 'smoke-v1',
+    score: 1,
+    score_components: { collection_match: 1 },
+    reason: 'Seeded readable collection result'
+  };
+}
+
+function motdAttribution() {
+  return {
+    request_id: 'req_smoke_motd',
+    impression_id: 'imp_smoke_motd',
+    surface: 'web_home',
+    source_algorithm: 'motd',
+    rank: 1,
+    query: null,
+    filters: {
+      language: null,
+      media_type: null,
+      include_nsfw: false,
+      tags: [],
+      scope: null,
+      collection_ids: []
+    },
+    collection_scope: null,
+    collection_ids: [],
+    source_meme_id: null,
+    algorithm_version: motdAlgorithmVersion,
+    score: motdScore,
+    score_components: motdScoreComponents,
+    reason: 'Smoke MOTD selection'
+  };
 }
 
 function sessionPayload(accountType) {

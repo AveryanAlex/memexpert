@@ -15,6 +15,8 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
+from sqlalchemy import select
+
 from memexpert.api.dependencies.pipeline import (
     PIPELINE_OPERATOR_TOKEN_HEADER_NAME,
     get_crawler_operations_service,
@@ -27,6 +29,7 @@ from memexpert.crawlers.telegram.client import (
     RawTelegramChannel,
     RawTelegramMessage,
 )
+from memexpert.crawlers.telegram.manager import TelegramSessionManager
 from memexpert.crawlers.telegram.runtime import TelegramCrawlerRuntime
 from memexpert.ingest.crawler_service import PipelineCrawlerIngestService
 from memexpert.models.content import (
@@ -36,7 +39,7 @@ from memexpert.models.content import (
     MemeSource,
     PipelineStageJournal,
     SourceChannel,
-    TelegramSessionState,
+    TelegramSession,
 )
 from memexpert.models.enums import (
     ContentKind,
@@ -55,7 +58,7 @@ from tests.integration.test_ingest_accept_service import FakeStorageClient
 if TYPE_CHECKING:
     from fastapi import FastAPI
     from httpx import AsyncClient
-    from sqlalchemy.ext.asyncio import AsyncSession
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 
 def _now() -> datetime:
@@ -107,10 +110,13 @@ async def _seed_session(
     *,
     session_name: str,
     status: TelegramSessionStatus = TelegramSessionStatus.ACTIVE,
-) -> TelegramSessionState:
-    row = TelegramSessionState(
-        session_name=session_name,
+    encrypted_string_session: str | None = "encrypted-string-session",
+) -> TelegramSession:
+    row = TelegramSession(
+        name=session_name,
+        display_name=session_name.title(),
         status=status,
+        encrypted_string_session=encrypted_string_session,
         last_heartbeat_at=_now(),
     )
     session.add(row)
@@ -125,12 +131,20 @@ async def _seed_channel(
     platform_id: str,
     title: str = "Curated Channel",
     username: str | None = None,
-    session_id: str | None = None,
+    session_name: str | None = "primary",
     is_paused: bool = False,
     catchup_enabled: bool = True,
+    live_enabled: bool = True,
+    engagement_enabled: bool = True,
     catchup_message_limit: int = 500,
     last_read_post_id: str | None = None,
 ) -> SourceChannel:
+    telegram_session_id = None
+    if session_name is not None:
+        telegram_session_id = await session.scalar(
+            select(TelegramSession.id).where(TelegramSession.name == session_name),
+        )
+        assert telegram_session_id is not None
     row = SourceChannel(
         platform=SourcePlatform.TELEGRAM,
         platform_id=platform_id,
@@ -139,8 +153,10 @@ async def _seed_channel(
         is_active=True,
         is_paused=is_paused,
         catchup_enabled=catchup_enabled,
+        live_enabled=live_enabled,
+        engagement_enabled=engagement_enabled,
         catchup_message_limit=catchup_message_limit,
-        session_id=session_id,
+        telegram_session_id=telegram_session_id,
         last_read_post_id=last_read_post_id,
     )
     session.add(row)
@@ -216,19 +232,17 @@ async def test_list_sessions_returns_owned_channel_counts(
         migrated_db_session,
         platform_id="chan_a",
         title="Channel A",
-        session_id="primary",
     )
     await _seed_channel(
         migrated_db_session,
         platform_id="chan_b",
         title="Channel B",
-        session_id="primary",
     )
     await _seed_channel(
         migrated_db_session,
         platform_id="chan_c",
         title="Channel C",
-        session_id="secondary",
+        session_name="secondary",
     )
 
     operations_service = _build_real_operations_service(
@@ -243,7 +257,7 @@ async def test_list_sessions_returns_owned_channel_counts(
         app.dependency_overrides.clear()
 
     assert response.status_code == 200
-    sessions = {row["session_name"]: row for row in response.json()}
+    sessions = {row["name"]: row for row in response.json()}
     assert sessions["primary"]["owned_channel_count"] == 2
     assert sessions["secondary"]["owned_channel_count"] == 1
     assert sessions["primary"]["status"] == "active"
@@ -255,24 +269,23 @@ async def test_list_channels_supports_platform_session_and_paused_filters(
     migrated_db_session: AsyncSession,
 ) -> None:
     await _seed_session(migrated_db_session, session_name="primary")
+    await _seed_session(migrated_db_session, session_name="secondary")
     await _seed_channel(
         migrated_db_session,
         platform_id="active_chan",
         title="Active",
-        session_id="primary",
     )
     await _seed_channel(
         migrated_db_session,
         platform_id="paused_chan",
         title="Paused",
-        session_id="primary",
         is_paused=True,
     )
     await _seed_channel(
         migrated_db_session,
         platform_id="secondary_chan",
         title="Secondary",
-        session_id="secondary",
+        session_name="secondary",
     )
 
     operations_service = _build_real_operations_service(
@@ -338,7 +351,6 @@ async def test_pause_and_resume_channel_is_idempotent_and_404s_on_unknown_id(
     channel = await _seed_channel(
         migrated_db_session,
         platform_id="toggle_chan",
-        session_id="primary",
     )
 
     operations_service = _build_real_operations_service(
@@ -400,7 +412,6 @@ async def test_reassign_channel_updates_session_and_rejects_unknown_target(
     channel = await _seed_channel(
         migrated_db_session,
         platform_id="movable_chan",
-        session_id="primary",
     )
 
     operations_service = _build_real_operations_service(
@@ -424,7 +435,7 @@ async def test_reassign_channel_updates_session_and_rejects_unknown_target(
         app.dependency_overrides.clear()
 
     assert success.status_code == 200
-    assert success.json()["session_id"] == "secondary"
+    assert success.json()["telegram_session_name"] == "secondary"
 
     assert unknown_target.status_code == 409
     assert unknown_target.json()["code"] == "crawler_invalid_session"
@@ -432,7 +443,9 @@ async def test_reassign_channel_updates_session_and_rejects_unknown_target(
     # Confirm the DB row actually updated to the new session binding.
     refreshed = await migrated_db_session.get(SourceChannel, channel.id)
     assert refreshed is not None
-    assert refreshed.session_id == "secondary"
+    assert refreshed.telegram_session_id == await migrated_db_session.scalar(
+        select(TelegramSession.id).where(TelegramSession.name == "secondary"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -473,7 +486,6 @@ async def test_replay_channel_post_ingests_pinned_message_without_advancing_chec
     channel = await _seed_channel(
         migrated_db_session,
         platform_id="replay_chan",
-        session_id="primary",
         last_read_post_id="500",
     )
     fake = FakeTelegramClient()
@@ -508,6 +520,64 @@ async def test_replay_channel_post_ingests_pinned_message_without_advancing_chec
     assert refreshed.last_read_post_id == "500"
 
 
+async def test_replay_channel_post_uses_manager_assigned_session_client(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _seed_session(migrated_db_session, session_name="primary")
+    await _seed_session(migrated_db_session, session_name="secondary")
+    channel = await _seed_channel(
+        migrated_db_session,
+        platform_id="manager_replay_chan",
+        session_name="secondary",
+        last_read_post_id="500",
+    )
+    primary_fake = FakeTelegramClient()
+    secondary_fake = FakeTelegramClient()
+    _pin_photo_message(fake=secondary_fake, channel_id="manager_replay_chan", post_id="42")
+    fallback_operations_service = _build_real_operations_service(
+        migrated_db_session,
+        telegram_client=primary_fake,
+        phash_tag="M",
+    )
+    manager = TelegramSessionManager(
+        settings=Settings(),
+        session_factory=postgres_session_factory,
+        telegram_client_factory=lambda row: {"primary": primary_fake, "secondary": secondary_fake}[row.name],
+        ingest_service_factory=lambda db_session: PipelineCrawlerIngestService.from_settings(
+            db_session,
+            storage_client=FakeStorageClient(),
+            settings=Settings(),
+        ),
+    )
+    operations_service = CrawlerOperationsService(
+        session=migrated_db_session,
+        runtime=fallback_operations_service.runtime,
+        manager=manager,
+    )
+    _install_operations_service_override(app, operations_service)
+
+    try:
+        response = await client.post(
+            f"/api/v1/crawler/channels/{channel.id}/replay-post",
+            headers=_operator_headers(),
+            json={"post_id": "42"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+        await manager.shutdown()
+
+    assert response.status_code == 200
+    assert response.json()["outcome"] == "ingested"
+    assert secondary_fake.downloaded_message_ids == ["42"]
+    assert primary_fake.downloaded_message_ids == []
+    refreshed = await migrated_db_session.get(SourceChannel, channel.id)
+    assert refreshed is not None
+    assert refreshed.last_read_post_id == "500"
+
+
 async def test_replay_channel_post_surfaces_malformed_for_unpinned_post_id(
     app: FastAPI,
     client: AsyncClient,
@@ -517,7 +587,6 @@ async def test_replay_channel_post_surfaces_malformed_for_unpinned_post_id(
     channel = await _seed_channel(
         migrated_db_session,
         platform_id="empty_chan",
-        session_id="primary",
     )
     fake = FakeTelegramClient()
 

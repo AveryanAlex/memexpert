@@ -7,7 +7,6 @@ import re
 import uuid
 from datetime import timedelta
 from functools import lru_cache
-from pathlib import Path
 from typing import Annotated, ClassVar, Literal, cast
 
 from pydantic import AnyHttpUrl, Field, SecretStr, TypeAdapter, ValidationError, field_validator, model_validator
@@ -169,6 +168,14 @@ class Settings(BaseSettings):
     scheduler_source_engagement_capture_lease_timeout_seconds: float = Field(default=1800.0, gt=0.0)
     scheduler_motd_enabled: bool = True
     scheduler_motd_interval_seconds: float = Field(default=86400.0, gt=0.0)
+    motd_algorithm_version: str = Field(default="motd_v1", min_length=1, max_length=64)
+    motd_candidate_lookback_days: int = Field(default=30, ge=1, le=365)
+    motd_candidate_limit: int = Field(default=50, ge=1, le=500)
+    motd_min_quality_score: float = Field(default=0.5, ge=0.0, le=1.0)
+    motd_popularity_weight: float = Field(default=0.35, ge=0.0, le=1000.0)
+    motd_trending_growth_weight: float = Field(default=0.30, ge=0.0, le=1000.0)
+    motd_novelty_weight: float = Field(default=0.20, ge=0.0, le=1000.0)
+    motd_quality_weight: float = Field(default=0.15, ge=0.0, le=1000.0)
     scheduler_search_index_sync_enabled: bool = True
     scheduler_search_index_sync_interval_seconds: float = Field(default=600.0, gt=0.0)
     scheduler_search_index_sync_batch_size: int = Field(default=50, ge=1, le=1000)
@@ -183,15 +190,15 @@ class Settings(BaseSettings):
     scheduler_advisory_lock_enabled: bool = True
     scheduler_advisory_lock_key: Annotated[tuple[int, int], NoDecode] = (0, 0)
     # --- S04: curated Telethon crawler + freshness SLO -----------------
-    # ``telegram_api_id`` / ``telegram_api_hash`` are deliberately optional at
-    # T01 so the pipeline service and the ``FakeTelegramClient`` stay
-    # side-effect free; T02 consumes them when the real Telethon adapter
-    # lands. ``telegram_session_dir`` documents where T02 will persist
-    # ``.session`` files; the directory is neither created nor read at
-    # import time.
+    # ``telegram_api_id`` / ``telegram_api_hash`` are deliberately optional so
+    # the pipeline service and the ``FakeTelegramClient`` stay side-effect free;
+    # the real Telethon adapter validates them only when a DB-backed session is
+    # loaded.
     telegram_api_id: int | None = None
     telegram_api_hash: SecretStr | None = None
-    telegram_session_dir: Path = Path("./.telegram-sessions")
+    telegram_session_encryption_secret: SecretStr = SecretStr(
+        "memexpert-dev-telegram-session-encryption-secret-change-me",
+    )
     # Conservative crawler rate: the Telethon docs and the tech design both
     # cap user-bot sessions at 30 req/s. T04's SLO proof harness measures
     # freshness under this limit; T02's real adapter enforces it.
@@ -290,6 +297,18 @@ class Settings(BaseSettings):
             return value
         normalized_value = raw_value.strip()
         return normalized_value or None
+
+    @field_validator("telegram_session_encryption_secret", mode="before")
+    @classmethod
+    def _normalize_required_secret_text(cls, value: object) -> object:
+        raw_value = value.get_secret_value() if isinstance(value, SecretStr) else value
+        if not isinstance(raw_value, str):
+            return value
+
+        normalized_value = raw_value.strip()
+        if not normalized_value:
+            raise ValueError("telegram_session_encryption_secret must not be blank.")
+        return normalized_value
 
     @field_validator("media_public_base_url", "pipeline_seo_api_base_url", mode="before")
     @classmethod
@@ -475,6 +494,17 @@ class Settings(BaseSettings):
             raise ValueError("scheduler_advisory_lock_key must contain only integers.") from exc
 
         return normalized_key
+
+    @field_validator("motd_algorithm_version", mode="before")
+    @classmethod
+    def _normalize_motd_algorithm_version(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+
+        normalized_value = value.strip()
+        if not normalized_value:
+            raise ValueError("motd_algorithm_version must not be blank.")
+        return normalized_value
 
     @field_validator("auth_telegram_bot_username", mode="before")
     @classmethod

@@ -59,30 +59,37 @@ from memexpert.schemas.pipeline_ingest import (
 )
 
 
-class TelegramSessionStateRead(ORMSchema):
-    """Read projection of ``TelegramSessionState`` rows for T03 operator routes.
+class TelegramSessionRead(ORMSchema):
+    """Read projection of ``TelegramSession`` rows for operator routes.
 
-    Kept in the schemas module so the operator-facing routes introduced in
-    T03 can serialize the state without re-exporting SQLAlchemy models to
-    the API layer. The projection is intentionally 1:1 with the ORM row so
-    operators see the full session-health surface.
+    The encrypted StringSession column is deliberately absent from this
+    projection. Operators can see account and health metadata, but never the
+    Telethon session secret itself.
 
     ``owned_channel_count`` is additive — it defaults to ``0`` so callers
-    that validate a raw ORM row (for tests and pre-T03 fixtures) still
-    round-trip cleanly without providing the count. The T03
-    ``CrawlerOperationsService.list_sessions`` method computes the value
+    that validate a raw ORM row still round-trip cleanly without providing
+    the count. ``CrawlerOperationsService.list_sessions`` computes the value
     from a second query and passes it explicitly.
     """
 
     id: uuid.UUID
-    session_name: str = Field(min_length=1, max_length=MAX_TELEGRAM_SESSION_NAME_LENGTH)
+    name: str = Field(min_length=1, max_length=MAX_TELEGRAM_SESSION_NAME_LENGTH)
+    display_name: str = Field(min_length=1, max_length=255)
+    account_user_id: int | None = None
+    account_username: str | None = Field(default=None, max_length=255)
+    account_phone_hint: str | None = Field(default=None, max_length=64)
     status: TelegramSessionStatus
+    enabled: bool
     last_error_class: str | None = Field(default=None, max_length=128)
     last_error_text: str | None = Field(default=None, max_length=MAX_PIPELINE_ERROR_LENGTH)
     flood_wait_until: datetime | None = None
     live_listener_started_at: datetime | None = None
     last_heartbeat_at: datetime | None = None
     quarantined_at: datetime | None = None
+    live_enabled: bool
+    catchup_enabled: bool
+    engagement_enabled: bool
+    max_requests_per_second: float = Field(gt=0)
     created_at: datetime
     updated_at: datetime
     owned_channel_count: StrictInt = Field(default=0, ge=0)
@@ -630,6 +637,6 @@ __all__ = [
     "RawCrawlerPost",
     "SmokeProofResult",
     "SmokeProofTargetResult",
-    "TelegramSessionStateRead",
+    "TelegramSessionRead",
     "_PIPELINE_EVENT_ALLOWED_STAGES",
 ]

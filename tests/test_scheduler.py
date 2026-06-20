@@ -6,6 +6,7 @@ import json
 import logging
 import sys
 import uuid
+from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING, cast
 
 import pytest
@@ -17,6 +18,7 @@ if TYPE_CHECKING:
 
 from memexpert.core.config import Settings
 from memexpert.messaging.rabbitmq_outbox_runtime import RabbitMQOutboxPublisherBatchResult
+from memexpert.models.enums import ContentKind, ContentLanguage
 from memexpert.scheduler.jobs import (
     JOB_ID_MATERIALIZED_VIEW_REFRESH,
     JOB_ID_MOTD,
@@ -33,6 +35,7 @@ from memexpert.scheduler.locking import (
     SchedulerInstanceLockError,
 )
 from memexpert.scheduler.runtime import run_scheduler_runtime
+from memexpert.schemas.meme import PublicMemeCardRead, PublicMemeOfTheDayRead
 from memexpert.services.scheduler_batch_jobs import SearchIndexBatchJobResult, SeoBacklogBatchJobResult
 from memexpert.services.source_engagement_scheduler import SourceEngagementCaptureSchedulerResult
 
@@ -294,6 +297,73 @@ async def test_source_engagement_capture_job_calls_batch_service_and_logs_result
                 "meme_source_ids": ["00000000-0000-0000-0000-000000000001"],
                 "outbox_message_ids": ["00000000-0000-0000-0000-000000000002"],
                 "duration_seconds": 0.25,
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_motd_job_calls_refresh_service_and_logs_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = Settings.model_validate({"scheduler_motd_enabled": True})
+    engine = cast("AsyncEngine", object())
+    session_factory = object()
+    selected_meme_id = uuid.UUID("00000000-0000-0000-0000-000000000101")
+    called: dict[str, object] = {}
+    info_calls: list[tuple[str, dict[str, object] | None]] = []
+
+    def fake_build_session_factory(bound_engine: object) -> object:
+        called["engine"] = bound_engine
+        return session_factory
+
+    async def fake_refresh(session_factory_arg: object, *, settings: Settings) -> PublicMemeOfTheDayRead:
+        called["session_factory"] = session_factory_arg
+        called["settings"] = settings
+        return PublicMemeOfTheDayRead(
+            meme=PublicMemeCardRead(
+                id=selected_meme_id,
+                media_type=ContentKind.IMAGE,
+                language=ContentLanguage.EN,
+                is_nsfw=False,
+                popularity_score=1.0,
+                like_count=0,
+                primary_file=None,
+                caption=None,
+                created_at=datetime(2026, 6, 20, 11, 0, tzinfo=UTC),
+                updated_at=datetime(2026, 6, 20, 11, 0, tzinfo=UTC),
+            ),
+            selected_for=date(2026, 6, 20),
+            refreshed_at=datetime(2026, 6, 20, 12, 0, tzinfo=UTC),
+            algorithm_version="motd_v1",
+            score=1.0,
+            score_components={"total": 1.0},
+            reason="selected",
+            candidate_count=3,
+        )
+
+    def fake_info(message: str, *args: object, extra: dict[str, object] | None = None, **kwargs: object) -> None:
+        del args, kwargs
+        info_calls.append((message, extra))
+
+    monkeypatch.setattr("memexpert.scheduler.jobs.build_async_session_factory", fake_build_session_factory)
+    monkeypatch.setattr("memexpert.scheduler.jobs.run_scheduler_meme_of_the_day_refresh", fake_refresh)
+    monkeypatch.setattr("memexpert.scheduler.jobs.logger.info", fake_info)
+
+    definition = build_scheduler_job_definitions(settings, engine=engine)[2]
+    await definition.action()
+
+    assert definition.id == JOB_ID_MOTD
+    assert called == {"engine": engine, "session_factory": session_factory, "settings": settings}
+    assert info_calls == [
+        (
+            "scheduler_job_batch_result",
+            {
+                "event": "scheduler_job_batch_result",
+                "job_id": JOB_ID_MOTD,
+                "candidate_count": 3,
+                "selected_meme_id": str(selected_meme_id),
+                "reason": "selected",
+                "algorithm_version": "motd_v1",
+                "refreshed_at": "2026-06-20T12:00:00+00:00",
             },
         )
     ]

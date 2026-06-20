@@ -69,11 +69,11 @@ class CrawlerChannelRead(ORMSchema):
     is_active: bool
     is_paused: bool
     catchup_enabled: bool
+    live_enabled: bool
+    engagement_enabled: bool
     catchup_message_limit: StrictInt = Field(ge=1)
-    session_id: str | None = Field(
-        default=None,
-        max_length=MAX_TELEGRAM_SESSION_NAME_LENGTH,
-    )
+    telegram_session_id: uuid.UUID | None = None
+    telegram_session_name: str | None = Field(default=None, max_length=MAX_TELEGRAM_SESSION_NAME_LENGTH)
     last_read_post_id: str | None = Field(
         default=None,
         max_length=MAX_POST_ID_LENGTH,

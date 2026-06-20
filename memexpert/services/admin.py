@@ -2,14 +2,22 @@
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from pydantic import SecretStr
 from sqlalchemy import case, delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
+from memexpert.core.config import get_settings
 from memexpert.core.perceptual_hashes import perceptual_hash_bit_size
+from memexpert.crawlers.telegram.session_crypto import (
+    TelegramStringSessionCipher,
+    TelegramStringSessionDecryptError,
+    TelegramStringSessionSecretError,
+)
 from memexpert.models.base import utcnow
 from memexpert.models.collection import CollectionMeme, PinnedMeme
 from memexpert.models.content import (
@@ -28,9 +36,11 @@ from memexpert.models.content import (
     ModerationReport,
     PipelineStageJournal,
     SourceChannel,
+    TelegramAdminAuditLog,
     TelegramFileIdCache,
+    TelegramSession,
 )
-from memexpert.models.enums import ModerationAction, ModerationReportStatus
+from memexpert.models.enums import ModerationAction, ModerationReportStatus, SourcePlatform, TelegramSessionStatus
 from memexpert.models.user import ChannelSuggestion
 from memexpert.schemas.admin import (
     AdminBlockedPerceptualHashActionRead,
@@ -58,9 +68,20 @@ from memexpert.schemas.admin import (
     AdminModerationDecisionRead,
     AdminModerationReportRead,
     AdminModerationReportResolveRequest,
+    AdminSourceChannelAssignRequest,
     AdminSourceChannelCreateRequest,
     AdminSourceChannelMarkDeadRequest,
+    AdminSourceChannelOrphanRequest,
     AdminSourceChannelRead,
+    AdminSourceChannelUpdateRequest,
+    AdminTelegramChannelGroupRead,
+    AdminTelegramSessionActionRead,
+    AdminTelegramSessionCreateRequest,
+    AdminTelegramSessionDeleteRequest,
+    AdminTelegramSessionRead,
+    AdminTelegramSessionUpdateRequest,
+    AdminTelegramSessionValidateRead,
+    AdminTelegramSessionValidateRequest,
 )
 from memexpert.schemas.user import ChannelSuggestionRead
 from memexpert.services.content_merge import ContentMergeService
@@ -74,13 +95,16 @@ if TYPE_CHECKING:
     from typing import Literal
 
     from sqlalchemy.ext.asyncio import AsyncSession
+    from sqlalchemy.sql.elements import ColumnElement
 
+    from memexpert.core.config import Settings
     from memexpert.models.enums import ChannelSuggestionStatus
 
 
 MAX_AUDIT_SNAPSHOT_IDS = 25
 ADMIN_MANUAL_SEO_PROVENANCE = "admin-manual"
 MAX_SEO_TAG_LENGTH = 64
+MAX_TELEGRAM_ERROR_TEXT_LENGTH = 4000
 
 
 class AdminServiceError(Exception):
@@ -93,6 +117,111 @@ class AdminNotFoundError(AdminServiceError):
 
 class AdminConflictError(AdminServiceError):
     """Raised when an admin mutation violates a durable uniqueness rule."""
+
+
+class AdminTelegramValidationError(AdminServiceError):
+    """Raised when a Telethon validation attempt cannot prove a session is usable."""
+
+    def __init__(self, *, error_class: str, error_text: str) -> None:
+        super().__init__(error_text)
+        self.error_class = error_class[:128]
+        self.error_text = error_text[:MAX_TELEGRAM_ERROR_TEXT_LENGTH]
+
+
+@dataclass(frozen=True, slots=True)
+class AdminTelegramAccountProjection:
+    """Safe account fields extracted from Telegram ``get_me``."""
+
+    user_id: int | None
+    username: str | None
+    phone_hint: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class AdminTelegramValidationResult:
+    """Secret-free validation result for a Telethon StringSession."""
+
+    account: AdminTelegramAccountProjection
+    channel_reference: str | None = None
+
+
+async def validate_admin_telegram_string_session(
+    *,
+    settings: Settings,
+    string_session: SecretStr,
+    channel_reference: str | None = None,
+) -> AdminTelegramValidationResult:
+    """Validate StringSession material with Telethon without exposing the secret.
+
+    The function is intentionally small and top-level so route/service tests can
+    monkeypatch it instead of opening a real Telegram connection.
+    """
+
+    api_id = settings.telegram_api_id
+    api_hash = settings.telegram_api_hash
+    if api_id is None or api_hash is None:
+        raise AdminTelegramValidationError(
+            error_class="TelegramConfigurationError",
+            error_text="Telegram API credentials are not configured; set TELEGRAM_API_ID and TELEGRAM_API_HASH.",
+        )
+
+    from telethon import TelegramClient  # noqa: PLC0415
+    from telethon.sessions import StringSession  # noqa: PLC0415
+
+    try:
+        client = TelegramClient(
+            StringSession(string_session.get_secret_value()),
+            api_id,
+            api_hash.get_secret_value(),
+        )
+    except Exception as exc:
+        raise AdminTelegramValidationError(
+            error_class=type(exc).__name__,
+            error_text="Provided Telegram StringSession material could not be loaded.",
+        ) from exc
+
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            raise AdminTelegramValidationError(
+                error_class="TelegramUnauthorizedError",
+                error_text="Stored Telegram StringSession is not authorized.",
+            )
+        me = await client.get_me()
+        if channel_reference is not None:
+            await client.get_entity(channel_reference)
+    except AdminTelegramValidationError:
+        raise
+    except Exception as exc:
+        raise AdminTelegramValidationError(
+            error_class=type(exc).__name__,
+            error_text=f"Telegram validation failed with {type(exc).__name__}.",
+        ) from exc
+    finally:
+        disconnect_result = client.disconnect()
+        if inspect.isawaitable(disconnect_result):
+            await disconnect_result
+
+    user_id = getattr(me, "id", None)
+    username = getattr(me, "username", None)
+    phone = getattr(me, "phone", None)
+    return AdminTelegramValidationResult(
+        account=AdminTelegramAccountProjection(
+            user_id=user_id if isinstance(user_id, int) else None,
+            username=username.strip() if isinstance(username, str) and username.strip() else None,
+            phone_hint=_phone_hint(phone if isinstance(phone, str) else None),
+        ),
+        channel_reference=channel_reference,
+    )
+
+
+def _phone_hint(phone: str | None) -> str | None:
+    if phone is None:
+        return None
+    digits = "".join(character for character in phone if character.isdigit())
+    if len(digits) < 4:
+        return None
+    return f"ending-{digits[-4:]}"
 
 
 @dataclass(slots=True)
@@ -130,26 +259,378 @@ class AdminService:
         await self.session.refresh(suggestion)
         return ChannelSuggestionRead.model_validate(suggestion)
 
-    async def list_source_channels(self) -> list[AdminSourceChannelRead]:
+    async def list_telegram_sessions(self) -> list[AdminTelegramSessionRead]:
         rows = (
-            await self.session.execute(select(SourceChannel).order_by(SourceChannel.title.asc()))
+            await self.session.execute(
+                select(TelegramSession).order_by(TelegramSession.name.asc()),
+            )
+        ).scalars().all()
+        counts_by_session = await self._count_source_channels_by_session()
+        return [
+            self._telegram_session_read(row, owned_channel_count=counts_by_session.get(row.id, 0))
+            for row in rows
+        ]
+
+    async def create_telegram_session(
+        self,
+        request: AdminTelegramSessionCreateRequest,
+        *,
+        admin_user_id: uuid.UUID,
+    ) -> AdminTelegramSessionRead:
+        if request.validate_session and request.string_session is None:
+            raise AdminConflictError("A string_session is required when validate=true.")
+
+        encrypted_string_session: str | None = None
+        account_user_id = request.account_user_id
+        account_username = request.account_username
+        account_phone_hint = request.account_phone_hint
+        status = TelegramSessionStatus.AUTH_REQUIRED
+        last_heartbeat_at = None
+
+        if request.string_session is not None:
+            if request.validate_session:
+                try:
+                    validation = await validate_admin_telegram_string_session(
+                        settings=get_settings(),
+                        string_session=request.string_session,
+                    )
+                except AdminTelegramValidationError as exc:
+                    raise AdminConflictError(
+                        f"Telegram session validation failed: {exc.error_class}.",
+                    ) from exc
+                account_user_id = validation.account.user_id
+                account_username = validation.account.username
+                account_phone_hint = validation.account.phone_hint
+                last_heartbeat_at = utcnow()
+            encrypted_string_session = self._encrypt_string_session(request.string_session)
+            status = TelegramSessionStatus.ACTIVE
+
+        row = TelegramSession(
+            name=request.name,
+            display_name=request.display_name or request.name,
+            encrypted_string_session=encrypted_string_session,
+            account_user_id=account_user_id,
+            account_username=account_username,
+            account_phone_hint=account_phone_hint,
+            status=status,
+            enabled=request.enabled,
+            live_enabled=request.live_enabled,
+            catchup_enabled=request.catchup_enabled,
+            engagement_enabled=request.engagement_enabled,
+            max_requests_per_second=request.max_requests_per_second,
+            last_heartbeat_at=last_heartbeat_at,
+        )
+        self.session.add(row)
+        try:
+            await self.session.flush()
+            self._add_telegram_admin_audit(
+                admin_user_id=admin_user_id,
+                action="session_create",
+                telegram_session_id=row.id,
+                source_channel_id=None,
+                previous_values={},
+                new_values=self._telegram_session_snapshot(row, owned_channel_count=0),
+                note=request.note,
+            )
+            await self.session.commit()
+        except IntegrityError as exc:
+            await self.session.rollback()
+            raise AdminConflictError(f"Telegram session {request.name!r} already exists.") from exc
+        await self.session.refresh(row)
+        return self._telegram_session_read(row, owned_channel_count=0)
+
+    async def update_telegram_session(
+        self,
+        session_id: uuid.UUID,
+        request: AdminTelegramSessionUpdateRequest,
+        *,
+        admin_user_id: uuid.UUID,
+    ) -> AdminTelegramSessionRead:
+        row = await self.session.scalar(
+            select(TelegramSession).where(TelegramSession.id == session_id).with_for_update(),
+        )
+        if row is None:
+            raise AdminNotFoundError(f"Telegram session {session_id} does not exist.")
+
+        previous_values = self._telegram_session_snapshot(row)
+        for field_name in (
+            "display_name",
+            "enabled",
+            "status",
+            "live_enabled",
+            "catchup_enabled",
+            "engagement_enabled",
+            "max_requests_per_second",
+        ):
+            if field_name in request.model_fields_set:
+                setattr(row, field_name, getattr(request, field_name))
+        if "flood_wait_until" in request.model_fields_set:
+            row.flood_wait_until = request.flood_wait_until
+        if "last_error_class" in request.model_fields_set:
+            row.last_error_class = request.last_error_class
+        if "last_error_text" in request.model_fields_set:
+            row.last_error_text = request.last_error_text
+        if request.clear_error:
+            row.last_error_class = None
+            row.last_error_text = None
+            row.flood_wait_until = None
+        if "status" in request.model_fields_set:
+            if request.status is TelegramSessionStatus.ACTIVE:
+                row.last_error_class = None
+                row.last_error_text = None
+                row.flood_wait_until = None
+                row.quarantined_at = None
+            elif request.status is TelegramSessionStatus.QUARANTINED and row.quarantined_at is None:
+                row.quarantined_at = utcnow()
+            elif request.status is not TelegramSessionStatus.QUARANTINED:
+                row.quarantined_at = None
+
+        self._add_telegram_admin_audit(
+            admin_user_id=admin_user_id,
+            action="session_patch",
+            telegram_session_id=row.id,
+            source_channel_id=None,
+            previous_values=previous_values,
+            new_values=self._telegram_session_snapshot(row),
+            note=request.note,
+        )
+        await self.session.commit()
+        await self.session.refresh(row)
+        counts_by_session = await self._count_source_channels_by_session()
+        return self._telegram_session_read(row, owned_channel_count=counts_by_session.get(row.id, 0))
+
+    async def validate_telegram_session(
+        self,
+        session_id: uuid.UUID,
+        request: AdminTelegramSessionValidateRequest,
+    ) -> AdminTelegramSessionValidateRead:
+        row = await self.session.scalar(
+            select(TelegramSession).where(TelegramSession.id == session_id).with_for_update(),
+        )
+        if row is None:
+            raise AdminNotFoundError(f"Telegram session {session_id} does not exist.")
+        if not row.encrypted_string_session:
+            row.status = TelegramSessionStatus.AUTH_REQUIRED
+            row.last_error_class = "TelegramSessionMissingSecretError"
+            row.last_error_text = "Telegram session has no stored StringSession material."
+            await self.session.commit()
+            raise AdminConflictError("Telegram session has no stored StringSession material.")
+
+        channel_reference: str | None = None
+        if request.source_channel_id is not None:
+            channel = await self.session.get(SourceChannel, request.source_channel_id)
+            if channel is None:
+                raise AdminNotFoundError(f"Source channel {request.source_channel_id} does not exist.")
+            if channel.platform is not SourcePlatform.TELEGRAM:
+                raise AdminConflictError("Only Telegram source channels can be validated with Telegram sessions.")
+            channel_reference = self._telegram_channel_reference(channel)
+
+        try:
+            string_session = self._decrypt_string_session(row.encrypted_string_session)
+            validation = await validate_admin_telegram_string_session(
+                settings=get_settings(),
+                string_session=string_session,
+                channel_reference=channel_reference,
+            )
+        except (TelegramStringSessionDecryptError, AdminTelegramValidationError) as exc:
+            row.status = TelegramSessionStatus.AUTH_REQUIRED
+            if isinstance(exc, AdminTelegramValidationError):
+                row.last_error_class = exc.error_class
+                row.last_error_text = exc.error_text[:MAX_TELEGRAM_ERROR_TEXT_LENGTH]
+            else:
+                row.last_error_class = type(exc).__name__
+                row.last_error_text = str(exc)[:MAX_TELEGRAM_ERROR_TEXT_LENGTH]
+            await self.session.commit()
+            raise AdminConflictError(f"Telegram session validation failed: {row.last_error_class}.") from exc
+
+        row.account_user_id = validation.account.user_id
+        row.account_username = validation.account.username
+        row.account_phone_hint = validation.account.phone_hint
+        row.status = TelegramSessionStatus.ACTIVE
+        row.last_error_class = None
+        row.last_error_text = None
+        row.flood_wait_until = None
+        row.quarantined_at = None
+        row.last_heartbeat_at = utcnow()
+        await self.session.commit()
+        await self.session.refresh(row)
+        counts_by_session = await self._count_source_channels_by_session()
+        return AdminTelegramSessionValidateRead(
+            telegram_session=self._telegram_session_read(row, owned_channel_count=counts_by_session.get(row.id, 0)),
+            channel_checked=channel_reference is not None,
+            channel_reference=channel_reference,
+        )
+
+    async def delete_telegram_session(
+        self,
+        session_id: uuid.UUID,
+        request: AdminTelegramSessionDeleteRequest,
+        *,
+        admin_user_id: uuid.UUID,
+    ) -> AdminTelegramSessionActionRead:
+        row = await self.session.scalar(
+            select(TelegramSession).where(TelegramSession.id == session_id).with_for_update(),
+        )
+        if row is None:
+            raise AdminNotFoundError(f"Telegram session {session_id} does not exist.")
+        if request.confirmation != str(session_id):
+            raise AdminConflictError("Telegram session deletion confirmation must exactly match the session id.")
+
+        previous_session_values = self._telegram_session_snapshot(row)
+        channels = (
+            await self.session.execute(
+                select(SourceChannel)
+                .where(SourceChannel.telegram_session_id == session_id)
+                .order_by(SourceChannel.title.asc())
+                .with_for_update(),
+            )
+        ).scalars().all()
+        for channel in channels:
+            previous_channel_values = self._source_channel_snapshot(channel)
+            self._force_orphaned_channel_disabled(channel)
+            self._add_telegram_admin_audit(
+                admin_user_id=admin_user_id,
+                action="channel_orphan",
+                telegram_session_id=session_id,
+                source_channel_id=channel.id,
+                previous_values=previous_channel_values,
+                new_values=self._source_channel_snapshot(channel),
+                note="Orphaned by Telegram session deletion.",
+            )
+        self._add_telegram_admin_audit(
+            admin_user_id=admin_user_id,
+            action="session_delete",
+            telegram_session_id=session_id,
+            source_channel_id=None,
+            previous_values={
+                **previous_session_values,
+                "orphaned_source_channel_ids": [str(channel.id) for channel in channels],
+            },
+            new_values={},
+            note=request.note,
+        )
+        await self.session.delete(row)
+        await self.session.commit()
+        return AdminTelegramSessionActionRead(
+            action="delete",
+            telegram_session_id=session_id,
+            orphaned_source_channel_count=len(channels),
+            message="Telegram session deleted and assigned source channels orphaned.",
+        )
+
+    async def list_source_channels(
+        self,
+        *,
+        platform: SourcePlatform | None = None,
+        telegram_session_id: uuid.UUID | None = None,
+        orphaned: bool | None = None,
+    ) -> list[AdminSourceChannelRead]:
+        if telegram_session_id is not None and await self.session.get(TelegramSession, telegram_session_id) is None:
+            raise AdminNotFoundError(f"Telegram session {telegram_session_id} does not exist.")
+        rows = (
+            await self.session.execute(
+                select(SourceChannel)
+                .options(selectinload(SourceChannel.telegram_session))
+                .where(
+                    *self._source_channel_filters(
+                        platform=platform,
+                        telegram_session_id=telegram_session_id,
+                        orphaned=orphaned,
+                    ),
+                )
+                .order_by(SourceChannel.title.asc())
+            )
         ).scalars().all()
         now = utcnow()
         return [self._source_channel_read(row, now=now) for row in rows]
 
-    async def add_source_channel(self, request: AdminSourceChannelCreateRequest) -> AdminSourceChannelRead:
+    async def list_telegram_channel_groups(self) -> list[AdminTelegramChannelGroupRead]:
+        sessions = (
+            await self.session.execute(select(TelegramSession).order_by(TelegramSession.name.asc()))
+        ).scalars().all()
+        channels = (
+            await self.session.execute(
+                select(SourceChannel)
+                .options(selectinload(SourceChannel.telegram_session))
+                .where(SourceChannel.platform == SourcePlatform.TELEGRAM)
+                .order_by(SourceChannel.title.asc()),
+            )
+        ).scalars().all()
+        counts_by_session = await self._count_source_channels_by_session()
+        now = utcnow()
+        channels_by_session: dict[uuid.UUID, list[AdminSourceChannelRead]] = {row.id: [] for row in sessions}
+        orphaned_channels: list[AdminSourceChannelRead] = []
+        for channel in channels:
+            channel_read = self._source_channel_read(channel, now=now)
+            if channel.telegram_session_id is None:
+                orphaned_channels.append(channel_read)
+            else:
+                channels_by_session.setdefault(channel.telegram_session_id, []).append(channel_read)
+        groups = [
+            AdminTelegramChannelGroupRead(
+                telegram_session=self._telegram_session_read(
+                    row,
+                    owned_channel_count=counts_by_session.get(row.id, 0),
+                ),
+                is_orphaned=False,
+                channels=channels_by_session.get(row.id, []),
+            )
+            for row in sessions
+        ]
+        groups.append(
+            AdminTelegramChannelGroupRead(
+                telegram_session=None,
+                is_orphaned=True,
+                channels=orphaned_channels,
+            ),
+        )
+        return groups
+
+    async def add_source_channel(
+        self,
+        request: AdminSourceChannelCreateRequest,
+        *,
+        admin_user_id: uuid.UUID,
+    ) -> AdminSourceChannelRead:
+        telegram_session = await self._resolve_telegram_session_target(
+            telegram_session_id=request.telegram_session_id,
+            telegram_session_name=request.telegram_session_name,
+        )
+        if telegram_session is not None and request.platform is not SourcePlatform.TELEGRAM:
+            raise AdminConflictError("Only Telegram source channels can be assigned to Telegram sessions.")
+        if telegram_session is None and not request.orphaned:
+            raise AdminConflictError("Source channel creation requires telegram_session_id or orphaned=true.")
+        catchup_enabled = request.catchup_enabled
+        live_enabled = request.live_enabled
+        engagement_enabled = request.engagement_enabled
+        if request.orphaned:
+            catchup_enabled = False
+            live_enabled = False
+            engagement_enabled = False
         channel = SourceChannel(
             platform=request.platform,
             platform_id=request.platform_id,
             username=request.username,
             title=request.title,
             subscriber_count=request.subscriber_count,
-            session_id=request.session_id,
-            catchup_enabled=request.catchup_enabled,
+            telegram_session_id=None if telegram_session is None else telegram_session.id,
+            catchup_enabled=catchup_enabled,
+            live_enabled=live_enabled,
+            engagement_enabled=engagement_enabled,
             catchup_message_limit=request.catchup_message_limit,
         )
         self.session.add(channel)
         try:
+            await self.session.flush()
+            self._add_telegram_admin_audit(
+                admin_user_id=admin_user_id,
+                action="channel_create",
+                telegram_session_id=channel.telegram_session_id,
+                source_channel_id=channel.id,
+                previous_values={},
+                new_values=self._source_channel_snapshot(channel),
+                note=None,
+            )
             await self.session.commit()
         except IntegrityError as exc:
             await self.session.rollback()
@@ -157,24 +638,132 @@ class AdminService:
                 f"Source channel {request.platform.value}:{request.platform_id} already exists.",
             ) from exc
         await self.session.refresh(channel)
-        return self._source_channel_read(channel)
+        return self._source_channel_read(await self._get_source_channel_for_read(channel.id))
 
-    async def set_source_channel_paused(self, channel_id: uuid.UUID, *, is_paused: bool) -> AdminSourceChannelRead:
+    async def assign_source_channel(
+        self,
+        channel_id: uuid.UUID,
+        request: AdminSourceChannelAssignRequest,
+        *,
+        admin_user_id: uuid.UUID,
+    ) -> AdminSourceChannelRead:
+        telegram_session = await self.session.get(TelegramSession, request.telegram_session_id)
+        if telegram_session is None:
+            raise AdminNotFoundError(f"Telegram session {request.telegram_session_id} does not exist.")
+        channel = await self.session.scalar(
+            select(SourceChannel).where(SourceChannel.id == channel_id).with_for_update(),
+        )
+        if channel is None:
+            raise AdminNotFoundError(f"Source channel {channel_id} does not exist.")
+        if channel.platform is not SourcePlatform.TELEGRAM:
+            raise AdminConflictError("Only Telegram source channels can be assigned to Telegram sessions.")
+        previous_values = self._source_channel_snapshot(channel)
+        channel.telegram_session_id = telegram_session.id
+        self._add_telegram_admin_audit(
+            admin_user_id=admin_user_id,
+            action="channel_assign",
+            telegram_session_id=telegram_session.id,
+            source_channel_id=channel.id,
+            previous_values=previous_values,
+            new_values=self._source_channel_snapshot(channel),
+            note=request.note,
+        )
+        await self.session.commit()
+        return self._source_channel_read(await self._get_source_channel_for_read(channel.id))
+
+    async def orphan_source_channel(
+        self,
+        channel_id: uuid.UUID,
+        request: AdminSourceChannelOrphanRequest,
+        *,
+        admin_user_id: uuid.UUID,
+    ) -> AdminSourceChannelRead:
+        channel = await self.session.scalar(
+            select(SourceChannel).where(SourceChannel.id == channel_id).with_for_update(),
+        )
+        if channel is None:
+            raise AdminNotFoundError(f"Source channel {channel_id} does not exist.")
+        previous_session_id = channel.telegram_session_id
+        previous_values = self._source_channel_snapshot(channel)
+        self._force_orphaned_channel_disabled(channel)
+        self._add_telegram_admin_audit(
+            admin_user_id=admin_user_id,
+            action="channel_orphan",
+            telegram_session_id=previous_session_id,
+            source_channel_id=channel.id,
+            previous_values=previous_values,
+            new_values=self._source_channel_snapshot(channel),
+            note=request.note,
+        )
+        await self.session.commit()
+        return self._source_channel_read(await self._get_source_channel_for_read(channel.id))
+
+    async def update_source_channel(
+        self,
+        channel_id: uuid.UUID,
+        request: AdminSourceChannelUpdateRequest,
+        *,
+        admin_user_id: uuid.UUID,
+    ) -> AdminSourceChannelRead:
+        channel = await self.session.scalar(
+            select(SourceChannel).where(SourceChannel.id == channel_id).with_for_update(),
+        )
+        if channel is None:
+            raise AdminNotFoundError(f"Source channel {channel_id} does not exist.")
+        if channel.telegram_session_id is None and any(
+            getattr(request, field_name) is True
+            for field_name in ("catchup_enabled", "live_enabled", "engagement_enabled")
+            if field_name in request.model_fields_set
+        ):
+            raise AdminConflictError("Orphaned source channels cannot enable crawling or indexing controls.")
+        previous_values = self._source_channel_snapshot(channel)
+        for field_name in request.model_fields_set:
+            setattr(channel, field_name, getattr(request, field_name))
+        self._add_telegram_admin_audit(
+            admin_user_id=admin_user_id,
+            action="channel_update",
+            telegram_session_id=channel.telegram_session_id,
+            source_channel_id=channel.id,
+            previous_values=previous_values,
+            new_values=self._source_channel_snapshot(channel),
+            note=None,
+        )
+        await self.session.commit()
+        return self._source_channel_read(await self._get_source_channel_for_read(channel.id))
+
+    async def set_source_channel_paused(
+        self,
+        channel_id: uuid.UUID,
+        *,
+        is_paused: bool,
+        admin_user_id: uuid.UUID,
+    ) -> AdminSourceChannelRead:
         channel = await self.session.get(SourceChannel, channel_id)
         if channel is None:
             raise AdminNotFoundError(f"Source channel {channel_id} does not exist.")
         if not channel.is_active:
             raise AdminConflictError(f"Source channel {channel_id} is marked dead and cannot be paused or resumed.")
         if channel.is_paused != is_paused:
+            previous_values = self._source_channel_snapshot(channel)
             channel.is_paused = is_paused
+            self._add_telegram_admin_audit(
+                admin_user_id=admin_user_id,
+                action="channel_pause" if is_paused else "channel_resume",
+                telegram_session_id=channel.telegram_session_id,
+                source_channel_id=channel.id,
+                previous_values=previous_values,
+                new_values=self._source_channel_snapshot(channel),
+                note=None,
+            )
             await self.session.commit()
-            await self.session.refresh(channel)
-        return self._source_channel_read(channel)
+        return self._source_channel_read(await self._get_source_channel_for_read(channel.id))
 
     async def mark_source_channel_dead(
         self,
         channel_id: uuid.UUID,
         request: AdminSourceChannelMarkDeadRequest,
+        *,
+        admin_user_id: uuid.UUID,
     ) -> AdminSourceChannelRead:
         channel = await self.session.get(SourceChannel, channel_id)
         if channel is None:
@@ -184,11 +773,20 @@ class AdminService:
         if not channel.is_active:
             raise AdminConflictError(f"Source channel {channel_id} is already marked dead.")
 
+        previous_values = self._source_channel_snapshot(channel)
         channel.is_active = False
         channel.is_paused = True
+        self._add_telegram_admin_audit(
+            admin_user_id=admin_user_id,
+            action="channel_mark_dead",
+            telegram_session_id=channel.telegram_session_id,
+            source_channel_id=channel.id,
+            previous_values=previous_values,
+            new_values=self._source_channel_snapshot(channel),
+            note=None,
+        )
         await self.session.commit()
-        await self.session.refresh(channel)
-        return self._source_channel_read(channel)
+        return self._source_channel_read(await self._get_source_channel_for_read(channel.id))
 
     async def list_meme_templates(self) -> list[AdminMemeTemplateRead]:
         rows = (
@@ -1227,6 +1825,13 @@ class AdminService:
         operational_status: Literal["active", "inactive", "paused"] = (
             "inactive" if not channel.is_active else "paused" if channel.is_paused else "active"
         )
+        is_orphaned = channel.telegram_session_id is None
+        is_indexable = (
+            not is_orphaned
+            and channel.is_active
+            and not channel.is_paused
+            and (channel.catchup_enabled or channel.live_enabled or channel.engagement_enabled)
+        )
         seconds_since_last_fetch: int | None = None
         if channel.last_fetched_at is None:
             freshness_status: Literal["checkpoint_only", "fresh", "never_fetched", "stale"] = (
@@ -1246,8 +1851,13 @@ class AdminService:
             is_active=channel.is_active,
             is_paused=channel.is_paused,
             catchup_enabled=channel.catchup_enabled,
+            live_enabled=channel.live_enabled,
+            engagement_enabled=channel.engagement_enabled,
             catchup_message_limit=channel.catchup_message_limit,
-            session_id=channel.session_id,
+            telegram_session_id=channel.telegram_session_id,
+            telegram_session_name=channel.telegram_session_name,
+            is_orphaned=is_orphaned,
+            is_indexable=is_indexable,
             last_read_post_id=channel.last_read_post_id,
             last_fetched_at=channel.last_fetched_at,
             operational_status=operational_status,
@@ -1257,5 +1867,217 @@ class AdminService:
             updated_at=channel.updated_at,
         )
 
+    async def _get_source_channel_for_read(self, channel_id: uuid.UUID) -> SourceChannel:
+        channel = await self.session.scalar(
+            select(SourceChannel)
+            .options(selectinload(SourceChannel.telegram_session))
+            .where(SourceChannel.id == channel_id)
+            .execution_options(populate_existing=True)
+            .limit(1),
+        )
+        if channel is None:
+            raise AdminNotFoundError(f"Source channel {channel_id} does not exist.")
+        return channel
 
-__all__ = ["AdminConflictError", "AdminNotFoundError", "AdminService", "AdminServiceError"]
+    async def _count_source_channels_by_session(self) -> dict[uuid.UUID, int]:
+        rows = (
+            await self.session.execute(
+                select(SourceChannel.telegram_session_id, func.count(SourceChannel.id))
+                .where(
+                    SourceChannel.platform == SourcePlatform.TELEGRAM,
+                    SourceChannel.telegram_session_id.is_not(None),
+                )
+                .group_by(SourceChannel.telegram_session_id),
+            )
+        ).all()
+        return {telegram_session_id: count for telegram_session_id, count in rows if telegram_session_id is not None}
+
+    @staticmethod
+    def _source_channel_filters(
+        *,
+        platform: SourcePlatform | None,
+        telegram_session_id: uuid.UUID | None,
+        orphaned: bool | None,
+    ) -> tuple[ColumnElement[bool], ...]:
+        filters: list[ColumnElement[bool]] = []
+        if platform is not None:
+            filters.append(SourceChannel.platform == platform)
+        if telegram_session_id is not None:
+            filters.append(SourceChannel.telegram_session_id == telegram_session_id)
+        if orphaned is True:
+            filters.append(SourceChannel.telegram_session_id.is_(None))
+        elif orphaned is False:
+            filters.append(SourceChannel.telegram_session_id.is_not(None))
+        return tuple(filters)
+
+    async def _resolve_telegram_session_target(
+        self,
+        *,
+        telegram_session_id: uuid.UUID | None,
+        telegram_session_name: str | None,
+    ) -> TelegramSession | None:
+        if telegram_session_id is not None:
+            telegram_session = await self.session.get(TelegramSession, telegram_session_id)
+            if telegram_session is None:
+                raise AdminNotFoundError(f"Telegram session {telegram_session_id} does not exist.")
+            return telegram_session
+        return await self._get_telegram_session_by_name(telegram_session_name)
+
+    async def _get_telegram_session_by_name(self, name: str | None) -> TelegramSession | None:
+        if name is None:
+            return None
+        telegram_session = await self.session.scalar(
+            select(TelegramSession)
+            .where(TelegramSession.name == name)
+            .limit(1),
+        )
+        if telegram_session is None:
+            raise AdminConflictError(f"Telegram session {name!r} does not exist.")
+        return telegram_session
+
+    @staticmethod
+    def _telegram_session_read(
+        row: TelegramSession,
+        *,
+        owned_channel_count: int,
+    ) -> AdminTelegramSessionRead:
+        return AdminTelegramSessionRead(
+            id=row.id,
+            name=row.name,
+            display_name=row.display_name,
+            owned_channel_count=owned_channel_count,
+            status=row.status,
+            enabled=row.enabled,
+            flood_wait_until=row.flood_wait_until,
+            live_listener_started_at=row.live_listener_started_at,
+            last_heartbeat_at=row.last_heartbeat_at,
+            last_error_class=row.last_error_class,
+            last_error_text=row.last_error_text,
+            quarantined_at=row.quarantined_at,
+            live_enabled=row.live_enabled,
+            catchup_enabled=row.catchup_enabled,
+            engagement_enabled=row.engagement_enabled,
+            max_requests_per_second=row.max_requests_per_second,
+            account_user_id=row.account_user_id,
+            account_username=row.account_username,
+            account_phone_hint=row.account_phone_hint,
+            has_string_session=bool((row.encrypted_string_session or "").strip()),
+            created_at=row.created_at,
+            updated_at=row.updated_at,
+        )
+
+    @staticmethod
+    def _telegram_session_snapshot(
+        row: TelegramSession,
+        *,
+        owned_channel_count: int | None = None,
+    ) -> dict[str, object]:
+        snapshot: dict[str, object] = {
+            "id": str(row.id),
+            "name": row.name,
+            "display_name": row.display_name,
+            "account_user_id": row.account_user_id,
+            "account_username": row.account_username,
+            "account_phone_hint": row.account_phone_hint,
+            "status": row.status.value,
+            "enabled": row.enabled,
+            "last_error_class": row.last_error_class,
+            "last_error_text": row.last_error_text,
+            "flood_wait_until": None if row.flood_wait_until is None else row.flood_wait_until.isoformat(),
+            "live_listener_started_at": (
+                None if row.live_listener_started_at is None else row.live_listener_started_at.isoformat()
+            ),
+            "last_heartbeat_at": None if row.last_heartbeat_at is None else row.last_heartbeat_at.isoformat(),
+            "quarantined_at": None if row.quarantined_at is None else row.quarantined_at.isoformat(),
+            "live_enabled": row.live_enabled,
+            "catchup_enabled": row.catchup_enabled,
+            "engagement_enabled": row.engagement_enabled,
+            "max_requests_per_second": row.max_requests_per_second,
+            "has_string_session": bool((row.encrypted_string_session or "").strip()),
+        }
+        if owned_channel_count is not None:
+            snapshot["owned_channel_count"] = owned_channel_count
+        return snapshot
+
+    @staticmethod
+    def _source_channel_snapshot(channel: SourceChannel) -> dict[str, object]:
+        return {
+            "id": str(channel.id),
+            "platform": channel.platform.value,
+            "platform_id": channel.platform_id,
+            "username": channel.username,
+            "title": channel.title,
+            "subscriber_count": channel.subscriber_count,
+            "is_active": channel.is_active,
+            "is_paused": channel.is_paused,
+            "catchup_enabled": channel.catchup_enabled,
+            "live_enabled": channel.live_enabled,
+            "engagement_enabled": channel.engagement_enabled,
+            "catchup_message_limit": channel.catchup_message_limit,
+            "telegram_session_id": None if channel.telegram_session_id is None else str(channel.telegram_session_id),
+            "is_orphaned": channel.telegram_session_id is None,
+            "last_read_post_id": channel.last_read_post_id,
+            "last_fetched_at": None if channel.last_fetched_at is None else channel.last_fetched_at.isoformat(),
+        }
+
+    @staticmethod
+    def _force_orphaned_channel_disabled(channel: SourceChannel) -> None:
+        channel.telegram_session_id = None
+        channel.catchup_enabled = False
+        channel.live_enabled = False
+        channel.engagement_enabled = False
+
+    @staticmethod
+    def _telegram_channel_reference(channel: SourceChannel) -> str:
+        username = (channel.username or "").strip()
+        if username:
+            return username if username.startswith("@") else f"@{username}"
+        return channel.platform_id
+
+    def _encrypt_string_session(self, string_session: SecretStr) -> str:
+        try:
+            return TelegramStringSessionCipher(get_settings().telegram_session_encryption_secret).encrypt(
+                string_session,
+            ).get_secret_value()
+        except TelegramStringSessionSecretError as exc:
+            raise AdminConflictError("Telegram StringSession material could not be encrypted.") from exc
+
+    def _decrypt_string_session(self, encrypted_string_session: str) -> SecretStr:
+        return TelegramStringSessionCipher(get_settings().telegram_session_encryption_secret).decrypt(
+            SecretStr(encrypted_string_session),
+        )
+
+    def _add_telegram_admin_audit(
+        self,
+        *,
+        admin_user_id: uuid.UUID,
+        action: str,
+        telegram_session_id: uuid.UUID | None,
+        source_channel_id: uuid.UUID | None,
+        previous_values: dict[str, object],
+        new_values: dict[str, object],
+        note: str | None,
+    ) -> None:
+        self.session.add(
+            TelegramAdminAuditLog(
+                admin_user_id=admin_user_id,
+                action=action,
+                telegram_session_id=telegram_session_id,
+                source_channel_id=source_channel_id,
+                previous_values=previous_values,
+                new_values=new_values,
+                note=note,
+            ),
+        )
+
+
+__all__ = [
+    "AdminConflictError",
+    "AdminNotFoundError",
+    "AdminService",
+    "AdminServiceError",
+    "AdminTelegramAccountProjection",
+    "AdminTelegramValidationError",
+    "AdminTelegramValidationResult",
+    "validate_admin_telegram_string_session",
+]

@@ -1,6 +1,6 @@
 import { json, type Cookies } from '@sveltejs/kit';
 
-import { DEFAULT_PAGE_SIZE, ApiError, fetchMemePage, type ApiFetch } from '$lib/api/client';
+import { DEFAULT_PAGE_SIZE, ApiError, fetchHomeFeed, fetchMemePage, type ApiFetch } from '$lib/api/client';
 import { parseSearchParams } from '$lib/searchParams';
 import { forwardBackendAccessCookie } from './backend';
 
@@ -9,7 +9,7 @@ interface MemePageProxyRequest {
   request: Request;
   cookies: Cookies;
   apiBaseUrl: string;
-  mode: 'browse' | 'search';
+  mode: 'browse' | 'home-feed' | 'search';
 }
 
 export async function proxyMemePage({ fetch, request, cookies, apiBaseUrl, mode }: MemePageProxyRequest): Promise<Response> {
@@ -23,23 +23,28 @@ export async function proxyMemePage({ fetch, request, cookies, apiBaseUrl, mode 
   const filters = parseSearchParams(params);
 
   try {
-    const page = await fetchMemePage({
+    const commonRequest = {
       fetch,
       baseUrl: apiBaseUrl,
-      query,
       tags: filters.tags,
       includeNsfw: params.has('include_nsfw') ? filters.includeNsfw : undefined,
       mediaType: filters.mediaType,
       language: filters.language,
-      scope: filters.scope,
-      collectionIds: filters.collectionIds,
       limit: readPositiveInt(params.get('limit'), DEFAULT_PAGE_SIZE),
       offset: filters.offset,
       cookieHeader: request.headers.get('cookie') ?? undefined,
-      onResponse: (response) => {
+      onResponse: (response: Response) => {
         forwardBackendAccessCookie(response, cookies);
       }
-    });
+    };
+    const page = mode === 'home-feed'
+      ? await fetchHomeFeed(commonRequest)
+      : await fetchMemePage({
+          ...commonRequest,
+          query,
+          scope: filters.scope,
+          collectionIds: filters.collectionIds
+        });
 
     return json(page);
   } catch (error) {

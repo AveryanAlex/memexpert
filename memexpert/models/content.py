@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from typing import TYPE_CHECKING
 
 from sqlalchemy import (
+    BigInteger,
     CheckConstraint,
+    Date,
     Float,
     ForeignKey,
     ForeignKeyConstraint,
@@ -145,6 +147,39 @@ class Meme(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         back_populates="meme",
         cascade="all, delete-orphan",
     )
+    motd_selections: Mapped[list["MemeOfTheDaySelection"]] = relationship(
+        "MemeOfTheDaySelection",
+        back_populates="meme",
+        passive_deletes=True,
+    )
+
+
+class MemeOfTheDaySelection(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """Durable daily MOTD cache row keyed by date and algorithm version."""
+
+    __tablename__ = "meme_of_the_day_selections"
+    __table_args__ = (
+        UniqueConstraint("selected_for", "algorithm_version", name="uq_motd_selected_for_algorithm_version"),
+        CheckConstraint("candidate_count >= 0", name="meme_of_the_day_candidate_count_non_negative"),
+        CheckConstraint("algorithm_version <> ''", name="meme_of_the_day_algorithm_version_not_blank"),
+        CheckConstraint("reason <> ''", name="meme_of_the_day_reason_not_blank"),
+        Index("ix_meme_of_the_day_selections_selected_for", "selected_for"),
+        Index("ix_meme_of_the_day_selections_meme_id", "meme_id"),
+    )
+
+    selected_for: Mapped[date] = mapped_column(Date, nullable=False)
+    algorithm_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    meme_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("memes.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    score_components: Mapped[dict[str, float]] = mapped_column(JSONB, default=dict, nullable=False)
+    reason: Mapped[str] = mapped_column(String(128), nullable=False)
+    candidate_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    refreshed_at: Mapped[datetime] = mapped_column(default=utcnow, nullable=False)
+
+    meme: Mapped["Meme | None"] = relationship("Meme", back_populates="motd_selections")
 
 
 class ModerationReport(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -916,6 +951,19 @@ class SourceChannel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __table_args__ = (
         UniqueConstraint("platform", "platform_id", name="uq_source_channels_platform_platform_id"),
         Index("ix_source_channels_is_active_platform", "is_active", "platform"),
+        Index("ix_source_channels_telegram_session_id", "telegram_session_id"),
+        Index(
+            "ix_source_channels_session_live",
+            "telegram_session_id",
+            "is_active",
+            "is_paused",
+            "live_enabled",
+        ),
+        Index(
+            "ix_source_channels_session_engagement",
+            "telegram_session_id",
+            "engagement_enabled",
+        ),
     )
 
     platform: Mapped[SourcePlatform] = mapped_column(
@@ -928,7 +976,10 @@ class SourceChannel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     subscriber_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     is_active: Mapped[bool] = mapped_column(default=True, nullable=False)
     last_read_post_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    session_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    telegram_session_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("telegram_sessions.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     # Bounded number of messages to consume during initial catch-up. Prevents
     # a brand new curated channel from drowning the crawler by fetching years
     # of history the first time it is added.
@@ -937,6 +988,8 @@ class SourceChannel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # startup and after reconnects. Operators can freeze catch-up without
     # disabling the live listener by setting this to ``False``.
     catchup_enabled: Mapped[bool] = mapped_column(default=True, nullable=False)
+    live_enabled: Mapped[bool] = mapped_column(default=True, nullable=False)
+    engagement_enabled: Mapped[bool] = mapped_column(default=True, nullable=False)
     # When ``True`` the crawler skips this channel entirely (catch-up AND
     # live listener). Operators use this to pause a problematic channel
     # without losing its checkpoint state.
@@ -946,37 +999,89 @@ class SourceChannel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # tracking this separately lets operators see staleness.
     last_fetched_at: Mapped[datetime | None] = mapped_column(nullable=True)
 
-
-class TelegramSessionState(UUIDPrimaryKeyMixin, TimestampMixin, Base):
-    """Durable per-session health and cooldown truth for Telethon userbot sessions.
-
-    T02 populates this row when a real Telethon client connects; T01 creates
-    the contract so the crawler runtime, operator surfaces, and the session
-    distributor all agree on the same persisted shape before any real network
-    work lands. Operators see at most one row per ``session_name`` so the
-    table doubles as a session registry. ``status`` uses
-    :class:`TelegramSessionStatus` (separate from sync-target statuses) so
-    session health never collides with any pipeline-stage lifecycle.
-    """
-
-    __tablename__ = "telegram_session_states"
-    __table_args__ = (
-        UniqueConstraint("session_name", name="uq_telegram_session_states_session_name"),
-        Index("ix_telegram_session_states_status_updated_at", "status", "updated_at"),
+    telegram_session: Mapped["TelegramSession | None"] = relationship(
+        "TelegramSession",
+        back_populates="source_channels",
     )
 
-    session_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    @property
+    def telegram_session_name(self) -> str | None:
+        """Return the eagerly-loaded session name projection, if present."""
+
+        telegram_session = self.__dict__.get("telegram_session")
+        if telegram_session is None:
+            return None
+        return telegram_session.name
+
+
+class TelegramSession(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """Canonical Telegram StringSession registry and runtime policy state."""
+
+    __tablename__ = "telegram_sessions"
+    __table_args__ = (
+        UniqueConstraint("name", name="uq_telegram_sessions_name"),
+        CheckConstraint(
+            "max_requests_per_second > 0",
+            name="ck_telegram_sessions_max_requests_per_second_positive",
+        ),
+        Index("ix_telegram_sessions_status_updated_at", "status", "updated_at"),
+        Index("ix_telegram_sessions_enabled_status", "enabled", "status"),
+    )
+
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
+    display_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Telethon StringSession material encrypted with the runtime secret. API
+    # read schemas must never expose this column.
+    encrypted_string_session: Mapped[str | None] = mapped_column(Text, nullable=True)
+    account_user_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    account_username: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    account_phone_hint: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[TelegramSessionStatus] = mapped_column(
         string_enum(TelegramSessionStatus),
-        default=TelegramSessionStatus.STOPPED,
+        default=TelegramSessionStatus.AUTH_REQUIRED,
         nullable=False,
     )
+    enabled: Mapped[bool] = mapped_column(default=True, nullable=False)
     last_error_class: Mapped[str | None] = mapped_column(String(128), nullable=True)
     last_error_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     flood_wait_until: Mapped[datetime | None] = mapped_column(nullable=True)
     live_listener_started_at: Mapped[datetime | None] = mapped_column(nullable=True)
     last_heartbeat_at: Mapped[datetime | None] = mapped_column(nullable=True)
     quarantined_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    live_enabled: Mapped[bool] = mapped_column(default=True, nullable=False)
+    catchup_enabled: Mapped[bool] = mapped_column(default=True, nullable=False)
+    engagement_enabled: Mapped[bool] = mapped_column(default=True, nullable=False)
+    max_requests_per_second: Mapped[float] = mapped_column(Float, default=1.0, nullable=False)
+
+    source_channels: Mapped[list["SourceChannel"]] = relationship(
+        "SourceChannel",
+        back_populates="telegram_session",
+        passive_deletes=True,
+    )
+
+
+class TelegramAdminAuditLog(UUIDPrimaryKeyMixin, Base):
+    """Immutable browser-admin history for Telegram sessions and channel assignment."""
+
+    __tablename__ = "telegram_admin_audit_logs"
+    __table_args__ = (
+        Index("ix_telegram_admin_audit_logs_admin_created_at", "admin_user_id", "created_at"),
+        Index("ix_telegram_admin_audit_logs_action_created_at", "action", "created_at"),
+        Index("ix_telegram_admin_audit_logs_session_created_at", "telegram_session_id", "created_at"),
+        Index("ix_telegram_admin_audit_logs_channel_created_at", "source_channel_id", "created_at"),
+    )
+
+    admin_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    action: Mapped[str] = mapped_column(String(64), nullable=False)
+    telegram_session_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
+    source_channel_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
+    previous_values: Mapped[dict[str, object]] = mapped_column(JSONB, default=dict, nullable=False)
+    new_values: Mapped[dict[str, object]] = mapped_column(JSONB, default=dict, nullable=False)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow, nullable=False)
 
 
 class TelegramFileIdCache(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -1098,6 +1203,7 @@ __all__ = [
     "ModerationReport",
     "PipelineStageJournal",
     "SourceChannel",
+    "TelegramAdminAuditLog",
     "TelegramFileIdCache",
-    "TelegramSessionState",
+    "TelegramSession",
 ]

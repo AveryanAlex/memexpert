@@ -246,6 +246,7 @@
             ? 'Guests can browse and favorite. Connect Telegram for collection collaboration actions.'
             : 'Your role can view this collection but cannot remove saved memes.'
       }}
+      showAccessMarkers={Boolean(data.session)}
     />
   {:else}
     <EmptyState title="No saved memes yet" message={isActive ? 'Browse the catalog and use Save to add memes here.' : 'Set this collection active, then browse and save memes into it.'}>

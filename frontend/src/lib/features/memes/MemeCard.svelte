@@ -13,9 +13,10 @@
     attribution?: MemeResultAttributionRead | null;
     position?: number;
     total?: number;
+    showAccessMarkers?: boolean;
   }
 
-  let { meme, attribution = null, position, total }: Props = $props();
+  let { meme, attribution = null, position, total, showAccessMarkers = false }: Props = $props();
   let cardElement = $state<HTMLElement>();
   let recordedImpressionFor = $state<string | null>(null);
 
@@ -71,8 +72,8 @@
       <div class="flex flex-wrap gap-2" aria-label="Meme metadata">
         <Badge>{meme.language}</Badge>
         <Badge>{meme.like_count} likes</Badge>
-        {#if accessVisibility !== 'public'}
-          <Badge>{accessVisibility === 'shared' ? 'Shared' : 'Private'}</Badge>
+        {#if showAccessMarkers && accessVisibility !== 'public'}
+          <Badge class="bg-paper/80 text-muted">{accessVisibility === 'shared' ? 'Shared' : 'Private'}</Badge>
         {/if}
         {#if meme.primary_file?.width && meme.primary_file.height}
           <Badge>{meme.primary_file.width}x{meme.primary_file.height}</Badge>

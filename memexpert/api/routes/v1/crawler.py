@@ -19,7 +19,7 @@ from memexpert.crawlers.telegram.client import PipelineTelegramError
 from memexpert.models.enums import SourcePlatform
 from memexpert.schemas.content_pipeline import (
     CrawlerIngestResult,
-    TelegramSessionStateRead,
+    TelegramSessionRead,
 )
 from memexpert.schemas.crawler import (
     CrawlerChannelRead,
@@ -38,13 +38,13 @@ router = APIRouter(
 
 @router.get(
     "/sessions",
-    response_model=list[TelegramSessionStateRead],
+    response_model=list[TelegramSessionRead],
     responses=PIPELINE_ERROR_RESPONSES,
     summary="List Telegram sessions with owned channel counts",
 )
 async def list_crawler_sessions(
     operations_service: CrawlerOperationsServiceDep,
-) -> list[TelegramSessionStateRead]:
+) -> list[TelegramSessionRead]:
     """Return every tracked Telegram session with its owned channel count."""
 
     try:

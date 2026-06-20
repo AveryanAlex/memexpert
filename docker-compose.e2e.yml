@@ -43,7 +43,7 @@ x-app-env: &app-env
   AUTH_ACCESS_COOKIE_SECURE: "false"
   SECURITY_CORS_ALLOWED_ORIGINS: http://frontend:3000,http://localhost:3000,http://127.0.0.1:3000
   SECURITY_RATE_LIMIT_ENABLED: "false"
-  TELEGRAM_SESSION_DIR: /app/.telegram-sessions
+  TELEGRAM_SESSION_ENCRYPTION_SECRET: ${TELEGRAM_SESSION_ENCRYPTION_SECRET:-memexpert-e2e-telegram-session-encryption-secret}
 
 services:
   postgres:

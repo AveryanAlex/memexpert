@@ -3,42 +3,36 @@
 from __future__ import annotations
 
 import logging
-from collections import Counter
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
-from sqlalchemy import func, select
 
 from memexpert.bot.analytics import record_telegram_interaction_event, telegram_user_hash
 from memexpert.core.config import Settings, get_settings
 from memexpert.core.database import get_async_session_factory
-from memexpert.models.base import utcnow
-from memexpert.models.collection import Collection, CollectionMeme, PinnedMeme
-from memexpert.models.content import Meme
 from memexpert.models.enums import (
-    AccountStatus,
     AnalyticsEventType,
-    ChannelSuggestionStatus,
-    CollectionKind,
     UserLanguage,
 )
-from memexpert.models.user import ChannelSuggestion, InlineUsageEvent, User
 from memexpert.services import (
     ChannelSuggestionService,
     InvalidChannelSuggestionError,
     UserNotFoundError,
     UserService,
 )
+from memexpert.services.analytics import AnalyticsService
+from memexpert.services.telegram_accounts import resolve_or_create_active_telegram_user
 
 if TYPE_CHECKING:
     from aiogram.types import MaybeInaccessibleMessage
     from sqlalchemy.ext.asyncio import AsyncSession
-    from sqlalchemy.sql import Executable
 
     from memexpert.core.database import AsyncSessionFactory
+    from memexpert.models.user import User
+    from memexpert.schemas.auth import ProfileStatsRead
     from memexpert.schemas.user import UserRead
 
 CALLBACK_PREFIX = "pmr"
@@ -271,8 +265,8 @@ async def show_stats(*, message: Message, session_factory: AsyncSessionFactory) 
         return
 
     async with session_factory() as session:
-        stats = await _load_stats(session, user=user)
-    await message.answer(_render_stats(user, stats))
+        stats = await AnalyticsService(session).profile_stats(user_id=user.id)
+    await message.answer(_render_stats(stats))
 
 
 async def _resolve_user_for_message(message: Message, *, session_factory: AsyncSessionFactory) -> User | None:
@@ -280,7 +274,8 @@ async def _resolve_user_for_message(message: Message, *, session_factory: AsyncS
     if telegram_user is None or telegram_user.id <= 0:
         return None
     async with session_factory() as session:
-        return await _resolve_active_telegram_user(session, telegram_user_id=telegram_user.id)
+        account_resolution = await resolve_or_create_active_telegram_user(session, telegram_user_id=telegram_user.id)
+        return account_resolution.user if account_resolution.is_active else None
 
 
 async def _resolve_user_for_callback(
@@ -291,85 +286,11 @@ async def _resolve_user_for_callback(
     if callback_query.from_user.id <= 0:
         return None
     async with session_factory() as session:
-        return await _resolve_active_telegram_user(session, telegram_user_id=callback_query.from_user.id)
-
-
-async def _resolve_active_telegram_user(session: AsyncSession, *, telegram_user_id: int) -> User | None:
-    user: User | None = await session.scalar(
-        select(User).where(
-            User.telegram_id == telegram_user_id,
-            User.status == AccountStatus.ACTIVE,
+        account_resolution = await resolve_or_create_active_telegram_user(
+            session,
+            telegram_user_id=callback_query.from_user.id,
         )
-    )
-    return user
-
-
-async def _load_stats(session: AsyncSession, *, user: User) -> dict[str, object]:
-    favorites_count = await _count(
-        session,
-        select(func.count())
-        .select_from(CollectionMeme)
-        .join(Collection, Collection.id == CollectionMeme.collection_id)
-        .where(Collection.owner_id == user.id, Collection.kind == CollectionKind.FAVORITES),
-    )
-    saves_count = await _count(
-        session,
-        select(func.count())
-        .select_from(CollectionMeme)
-        .join(Collection, Collection.id == CollectionMeme.collection_id)
-        .where(Collection.owner_id == user.id),
-    )
-    pins_count = await _count(
-        session,
-        select(func.count()).select_from(PinnedMeme).where(PinnedMeme.user_id == user.id),
-    )
-    collections_count = await _count(
-        session,
-        select(func.count()).select_from(Collection).where(Collection.owner_id == user.id),
-    )
-    uploads_count = await _count(session, select(func.count()).select_from(Meme).where(Meme.author_user_id == user.id))
-    inline_count = await _count(
-        session,
-        select(func.count()).select_from(InlineUsageEvent).where(InlineUsageEvent.user_id == user.id),
-    )
-    suggestions_count = await _count(
-        session,
-        select(func.count()).select_from(ChannelSuggestion).where(ChannelSuggestion.user_id == user.id),
-    )
-    pending_suggestions_count = await _count(
-        session,
-        select(func.count()).select_from(ChannelSuggestion).where(
-            ChannelSuggestion.user_id == user.id,
-            ChannelSuggestion.status == ChannelSuggestionStatus.PENDING,
-        ),
-    )
-    tag_rows = (
-        await session.execute(
-            select(Meme.tags)
-            .join(CollectionMeme, CollectionMeme.meme_id == Meme.id)
-            .join(Collection, Collection.id == CollectionMeme.collection_id)
-            .where(Collection.owner_id == user.id)
-            .limit(200)
-        )
-    ).scalars()
-    tag_counts = Counter(tag for tags in tag_rows for tag in tags)
-    top_tag = tag_counts.most_common(1)[0][0] if tag_counts else None
-    return {
-        "favorites_count": favorites_count,
-        "saves_count": saves_count,
-        "pins_count": pins_count,
-        "collections_count": collections_count,
-        "uploads_count": uploads_count,
-        "inline_count": inline_count,
-        "suggestions_count": suggestions_count,
-        "pending_suggestions_count": pending_suggestions_count,
-        "top_tag": top_tag,
-    }
-
-
-async def _count(session: AsyncSession, stmt: Executable) -> int:
-    value = await session.scalar(stmt)
-    return int(value or 0)
+        return account_resolution.user if account_resolution.is_active else None
 
 
 async def _record_retention_event_with_factory(
@@ -490,30 +411,34 @@ def _render_miniapp_links(bot_username: str) -> str:
     )
 
 
-def _render_stats(user: User, stats: dict[str, object]) -> str:
-    account_age_days = max(0, (utcnow() - user.created_at).days)
-    last_active = user.last_active_at.strftime("%Y-%m-%d") if user.last_active_at is not None else "нет данных"
-    top_tag = stats["top_tag"] or "нет данных"
-    count_values = [value for key, value in stats.items() if key.endswith("_count")]
-    no_data_line = (
-        "\nПока мало данных: сохраняйте, пиньте и отправляйте мемы через inline-бота."
-        if not any(count_values)
-        else ""
-    )
-    return (
-        "Статистика MemeXpert\n"
-        f"Дней с аккаунтом: {account_age_days}\n"
-        f"Последняя активность: {last_active}\n"
-        f"Favorites: {stats['favorites_count']}\n"
-        f"Сохранений в коллекциях: {stats['saves_count']}\n"
-        f"Pins: {stats['pins_count']}\n"
-        f"Коллекций: {stats['collections_count']}\n"
-        f"Загрузок/авторских мемов: {stats['uploads_count']}\n"
-        f"Inline sends/events: {stats['inline_count']}\n"
-        f"Предложений каналов: {stats['suggestions_count']} ({stats['pending_suggestions_count']} pending)\n"
-        f"Топ тег по сохранениям: {top_tag}"
-        f"{no_data_line}"
-    )
+def _render_stats(stats: ProfileStatsRead) -> str:
+    lines = [
+        "Статистика MemeXpert",
+        f"Viewed: {stats.viewed}",
+        f"Sent: {stats.sent}",
+        f"Saved: {stats.saved}",
+        f"Downloaded: {stats.downloaded}",
+        f"Days active: {stats.days_active}",
+        f"Top tags: {_format_top_tags(stats)}",
+        f"Top templates: {_format_top_templates(stats)}",
+    ]
+    if stats.viewed == 0 and stats.sent == 0 and stats.saved == 0 and stats.downloaded == 0:
+        lines.append("Пока мало данных: взаимодействуйте с мемами, чтобы заполнить статистику.")
+    if stats.metadata.notes:
+        lines.append("Notes: " + " | ".join(stats.metadata.notes))
+    return "\n".join(lines)
+
+
+def _format_top_tags(stats: ProfileStatsRead) -> str:
+    if not stats.top_tags:
+        return "нет данных"
+    return ", ".join(f"{item.tag} ({item.count})" for item in stats.top_tags)
+
+
+def _format_top_templates(stats: ProfileStatsRead) -> str:
+    if not stats.top_templates:
+        return "нет данных"
+    return ", ".join(f"{item.name} ({item.count})" for item in stats.top_templates)
 
 
 def _miniapp_keyboard(settings: Settings) -> InlineKeyboardMarkup | None:
@@ -594,7 +519,7 @@ def _parse_callback(data: str | None) -> tuple[str, str] | None:
 
 
 def _unlinked_message(command: str) -> str:
-    return f"Сначала привяжите Telegram к аккаунту MemeXpert, затем откройте /{command}."
+    return f"Telegram аккаунт MemeXpert недоступен или неактивен. Проверьте статус аккаунта, затем откройте /{command}."
 
 
 __all__ = [

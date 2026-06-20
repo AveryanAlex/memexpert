@@ -22,9 +22,9 @@ export class SearchPage {
     await this.page.goto('/search');
     const searchForm = this.page.locator('form').filter({ has: this.page.getByLabel('Search text') });
     await searchForm.getByLabel('Search text').fill(input.query);
-    await this.page.getByLabel('Search scope').selectOption('collections');
+    await searchForm.getByRole('radio', { name: /Specific collections/i }).check();
     for (const title of input.collectionTitles) {
-      await this.page.locator('label').filter({ hasText: title }).getByRole('checkbox').check();
+      await searchForm.locator('label').filter({ hasText: title }).getByRole('checkbox').check();
     }
     await searchForm.getByRole('button', { name: 'Search', exact: true }).click();
   }

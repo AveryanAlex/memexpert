@@ -40,7 +40,7 @@ class PipelineTelegramFloodWaitError(PipelineTelegramError):
 
     ``wait_seconds`` is the server-side cooldown Telegram tells us to
     respect before retrying. T02 persists it on the
-    :class:`memexpert.models.content.TelegramSessionState` row so the
+    :class:`memexpert.models.content.TelegramSession` row so the
     session distributor can quarantine sessions that are flooding.
     """
 
@@ -60,6 +60,14 @@ class PipelineTelegramSessionBannedError(PipelineTelegramError):
     banned session is permanent until an operator rotates it — the
     runtime must not retry automatically.
     """
+
+
+class PipelineTelegramSessionNotRunnableError(PipelineTelegramError):
+    """Raised when durable session state cannot run a Telethon client."""
+
+
+class PipelineTelegramSessionAuthRequiredError(PipelineTelegramSessionNotRunnableError):
+    """Raised when a stored StringSession exists but is not authorized."""
 
 
 class PipelineTelegramMalformedMessageError(PipelineTelegramError):
@@ -395,7 +403,9 @@ __all__ = [
     "PipelineTelegramMalformedMessageError",
     "PipelineTelegramMessageMapper",
     "PipelineTelegramProviderUnavailableError",
+    "PipelineTelegramSessionAuthRequiredError",
     "PipelineTelegramSessionBannedError",
+    "PipelineTelegramSessionNotRunnableError",
     "RawTelegramChannel",
     "RawTelegramMessage",
 ]

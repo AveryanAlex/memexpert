@@ -10,6 +10,8 @@ export interface MemeFeedFilters {
   collectionIds?: string[];
 }
 
+export type MemeFeedSource = 'catalog' | 'home';
+
 export const INFINITE_FEED_OBSERVER_ROOT_MARGIN = '420px 0px';
 
 export interface MemeFeedLoadState {

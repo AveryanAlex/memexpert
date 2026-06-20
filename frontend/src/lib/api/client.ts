@@ -12,6 +12,18 @@ import type {
   AdminModerationReportRead,
   AdminSessionRead,
   AdminSourceChannelRead,
+  AdminTelegramChannelAssignPayload,
+  AdminTelegramChannelCreatePayload,
+  AdminTelegramChannelGroupRead,
+  AdminTelegramChannelOrphanPayload,
+  AdminTelegramChannelUpdatePayload,
+  AdminTelegramSessionActionRead,
+  AdminTelegramSessionCreatePayload,
+  AdminTelegramSessionDeletePayload,
+  AdminTelegramSessionRead,
+  AdminTelegramSessionUpdatePayload,
+  AdminTelegramSessionValidatePayload,
+  AdminTelegramSessionValidateRead,
   ChannelSuggestionRead,
   CollectionInviteLinkRead,
   CollectionInviteRead,
@@ -26,6 +38,7 @@ import type {
   PinnedMemeRead,
   ProfileStatsRead,
   PublicMemeDetailRead,
+  PublicMemeOfTheDayRead,
   PublicMemeLandingRead,
   PublicMemePopularitySummaryRead,
   PublicMemeSearchPageRead,
@@ -60,16 +73,21 @@ interface CatalogRequest {
   onResponse?: (response: Response) => void;
 }
 
-interface PageRequest extends CatalogRequest {
-  query: string;
+interface MemePageFilterParams {
   tags?: string[];
   includeNsfw?: boolean;
   mediaType?: ContentKind | null;
   language?: ContentLanguage | null;
-  scope?: MemeSearchScope | null;
-  collectionIds?: string[];
   limit: number;
   offset: number;
+}
+
+interface HomeFeedRequest extends CatalogRequest, MemePageFilterParams {}
+
+interface PageRequest extends CatalogRequest, MemePageFilterParams {
+  query: string;
+  scope?: MemeSearchScope | null;
+  collectionIds?: string[];
 }
 
 interface DetailRequest extends CatalogRequest {
@@ -194,29 +212,7 @@ export class ApiError extends Error {
 
 export async function fetchMemePage(request: PageRequest): Promise<PublicMemeSearchPageRead> {
   const query = request.query.trim();
-  const params = new URLSearchParams({
-    limit: String(request.limit),
-    offset: String(request.offset)
-  });
-
-  for (const tag of request.tags ?? []) {
-    const normalized = tag.trim();
-    if (normalized) {
-      params.append('tags', normalized);
-    }
-  }
-
-  if (request.includeNsfw !== undefined) {
-    params.set('include_nsfw', String(request.includeNsfw));
-  }
-
-  if (request.mediaType) {
-    params.set('media_type', request.mediaType);
-  }
-
-  if (request.language) {
-    params.set('language', request.language);
-  }
+  const params = memePageParams(request);
 
   if (request.scope) {
     params.set('scope', request.scope);
@@ -237,6 +233,14 @@ export async function fetchMemePage(request: PageRequest): Promise<PublicMemeSea
   }
 
   return apiGet<PublicMemeSearchPageRead>('/api/v1/memes/browse', params, request);
+}
+
+export async function fetchHomeFeed(request: HomeFeedRequest): Promise<PublicMemeSearchPageRead> {
+  return apiGet<PublicMemeSearchPageRead>('/api/v1/memes/home-feed', memePageParams(request), request);
+}
+
+export async function fetchMemeOfTheDay(request: CatalogRequest): Promise<PublicMemeOfTheDayRead> {
+  return apiGet<PublicMemeOfTheDayRead>('/api/v1/memes/meme-of-the-day', new URLSearchParams(), request);
 }
 
 export async function fetchCurrentSession(request: CatalogRequest): Promise<CurrentSessionRead> {
@@ -541,6 +545,101 @@ export async function fetchAdminMemeTemplates(request: CatalogRequest): Promise<
   return apiGet<AdminMemeTemplateRead[]>('/api/v1/admin/meme-templates', new URLSearchParams(), request);
 }
 
+export async function fetchAdminTelegramSessions(request: CatalogRequest): Promise<AdminTelegramSessionRead[]> {
+  return apiGet<AdminTelegramSessionRead[]>('/api/v1/admin/telegram/sessions', new URLSearchParams(), request);
+}
+
+export async function createAdminTelegramSession(request: CatalogRequest & { body: AdminTelegramSessionCreatePayload }): Promise<AdminTelegramSessionRead> {
+  return apiWrite<AdminTelegramSessionRead>('/api/v1/admin/telegram/sessions', 'POST', request);
+}
+
+export async function updateAdminTelegramSession(
+  request: CatalogRequest & { body: AdminTelegramSessionUpdatePayload },
+  sessionId: string
+): Promise<AdminTelegramSessionRead> {
+  return apiWrite<AdminTelegramSessionRead>(
+    `/api/v1/admin/telegram/sessions/${encodeURIComponent(sessionId)}`,
+    'PATCH',
+    request
+  );
+}
+
+export async function validateAdminTelegramSession(
+  request: CatalogRequest & { body?: AdminTelegramSessionValidatePayload },
+  sessionId: string
+): Promise<AdminTelegramSessionValidateRead> {
+  return apiWrite<AdminTelegramSessionValidateRead>(
+    `/api/v1/admin/telegram/sessions/${encodeURIComponent(sessionId)}/validate`,
+    'POST',
+    request
+  );
+}
+
+export async function deleteAdminTelegramSession(
+  request: CatalogRequest & { body: AdminTelegramSessionDeletePayload },
+  sessionId: string
+): Promise<AdminTelegramSessionActionRead> {
+  return apiWrite<AdminTelegramSessionActionRead>(
+    `/api/v1/admin/telegram/sessions/${encodeURIComponent(sessionId)}`,
+    'DELETE',
+    request
+  );
+}
+
+export async function fetchAdminTelegramChannels(
+  request: CatalogRequest & { telegramSessionId?: string | null; orphaned?: boolean | null }
+): Promise<AdminSourceChannelRead[]> {
+  const params = new URLSearchParams();
+  if (request.telegramSessionId) {
+    params.set('telegram_session_id', request.telegramSessionId);
+  }
+  if (request.orphaned !== undefined && request.orphaned !== null) {
+    params.set('orphaned', String(request.orphaned));
+  }
+  return apiGet<AdminSourceChannelRead[]>('/api/v1/admin/telegram/channels', params, request);
+}
+
+export async function fetchAdminTelegramChannelGroups(request: CatalogRequest): Promise<AdminTelegramChannelGroupRead[]> {
+  return apiGet<AdminTelegramChannelGroupRead[]>('/api/v1/admin/telegram/channels/grouped', new URLSearchParams(), request);
+}
+
+export async function addAdminTelegramChannel(request: CatalogRequest & { body: AdminTelegramChannelCreatePayload }): Promise<AdminSourceChannelRead> {
+  return apiWrite<AdminSourceChannelRead>('/api/v1/admin/telegram/channels', 'POST', request);
+}
+
+export async function updateAdminTelegramChannel(
+  request: CatalogRequest & { body: AdminTelegramChannelUpdatePayload },
+  channelId: string
+): Promise<AdminSourceChannelRead> {
+  return apiWrite<AdminSourceChannelRead>(
+    `/api/v1/admin/telegram/channels/${encodeURIComponent(channelId)}`,
+    'PATCH',
+    request
+  );
+}
+
+export async function assignAdminTelegramChannel(
+  request: CatalogRequest & { body: AdminTelegramChannelAssignPayload },
+  channelId: string
+): Promise<AdminSourceChannelRead> {
+  return apiWrite<AdminSourceChannelRead>(
+    `/api/v1/admin/telegram/channels/${encodeURIComponent(channelId)}/assign`,
+    'POST',
+    request
+  );
+}
+
+export async function orphanAdminTelegramChannel(
+  request: CatalogRequest & { body?: AdminTelegramChannelOrphanPayload },
+  channelId: string
+): Promise<AdminSourceChannelRead> {
+  return apiWrite<AdminSourceChannelRead>(
+    `/api/v1/admin/telegram/channels/${encodeURIComponent(channelId)}/orphan`,
+    'POST',
+    request
+  );
+}
+
 export async function reviewChannelSuggestion(
   request: JsonMutationRequest,
   suggestionId: string,
@@ -722,6 +821,34 @@ async function fetchLanding(path: string, request: LandingRequest): Promise<Publ
 
 function seoPageParams(request: SeoCatalogPageRequest): URLSearchParams {
   return new URLSearchParams({ limit: String(request.limit), offset: String(request.offset) });
+}
+
+function memePageParams(request: MemePageFilterParams): URLSearchParams {
+  const params = new URLSearchParams({
+    limit: String(request.limit),
+    offset: String(request.offset)
+  });
+
+  for (const tag of request.tags ?? []) {
+    const normalized = tag.trim();
+    if (normalized) {
+      params.append('tags', normalized);
+    }
+  }
+
+  if (request.includeNsfw !== undefined) {
+    params.set('include_nsfw', String(request.includeNsfw));
+  }
+
+  if (request.mediaType) {
+    params.set('media_type', request.mediaType);
+  }
+
+  if (request.language) {
+    params.set('language', request.language);
+  }
+
+  return params;
 }
 
 async function apiGet<T>(path: string, params: URLSearchParams, request: CatalogRequest): Promise<T> {

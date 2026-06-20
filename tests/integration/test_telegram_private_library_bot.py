@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -16,11 +17,14 @@ from sqlalchemy import func, select
 
 from memexpert.bot.main import build_bot, build_dispatcher
 from memexpert.core.config import Settings
-from memexpert.models.collection import Collection, CollectionMeme, PinnedMeme
+from memexpert.models.collection import Collection, CollectionInvite, CollectionMember, CollectionMeme, PinnedMeme
 from memexpert.models.content import Meme, MemeFile
 from memexpert.models.enums import (
     AccountStatus,
+    AccountType,
     AnalyticsEventType,
+    CollectionInviteChannel,
+    CollectionInviteStatus,
     CollectionKind,
     CollectionMembershipRole,
     CollectionVisibility,
@@ -29,7 +33,14 @@ from memexpert.models.enums import (
     ContentProcessingStatus,
 )
 from memexpert.models.user import AnalyticsEvent, User
-from memexpert.schemas import CollectionMemeRead, CollectionRead, CollectionSummaryRead, MemeLibraryRead, PinnedMemeRead
+from memexpert.schemas import (
+    CollectionInviteRead,
+    CollectionMemeRead,
+    CollectionRead,
+    CollectionSummaryRead,
+    MemeLibraryRead,
+    PinnedMemeRead,
+)
 from memexpert.services import CollectionService, CollectionWriteAccessError, UserService
 from tests.conftest import create_full_user_via_upgrade
 
@@ -103,6 +114,7 @@ class FakePrivateLibraryCollectionService:
     collections: list[CollectionRead] = field(default_factory=list)
     active_collection_id: uuid.UUID | None = None
     update_active_error: Exception | None = None
+    invite_error: Exception | None = None
     calls: list[tuple[str, dict[str, object]]] = field(default_factory=list)
 
     async def get_meme_library(self, *, user_id: object) -> MemeLibraryRead:
@@ -184,6 +196,63 @@ class FakePrivateLibraryCollectionService:
         self.active_collection_id = _as_uuid(collection_id)
         return object()
 
+    async def create_invite(
+        self,
+        *,
+        collection_id: object,
+        token_hash: str,
+        created_by_user_id: object | None = None,
+        role: CollectionMembershipRole | str = CollectionMembershipRole.VIEWER,
+        channel: CollectionInviteChannel | str = CollectionInviteChannel.DIRECT_LINK,
+        label: str | None = None,
+        max_uses: int | None = None,
+        expires_at: datetime | None = None,
+        recipient_email: str | None = None,
+    ) -> CollectionInviteRead:
+        self.calls.append(
+            (
+                "create_invite",
+                {
+                    "collection_id": collection_id,
+                    "created_by_user_id": created_by_user_id,
+                    "role": role,
+                    "channel": channel,
+                    "label": label,
+                    "max_uses": max_uses,
+                    "expires_at": expires_at,
+                    "recipient_email": recipient_email,
+                    "token_hash_length": len(token_hash),
+                },
+            )
+        )
+        if self.invite_error is not None:
+            raise self.invite_error
+        now = datetime.now(UTC)
+        return CollectionInviteRead(
+            id=uuid.uuid7(),
+            collection_id=_as_uuid(collection_id),
+            created_by_user_id=cast("uuid.UUID | None", created_by_user_id),
+            role=CollectionMembershipRole(role),
+            channel=CollectionInviteChannel(channel),
+            label=label,
+            status=CollectionInviteStatus.PENDING,
+            max_uses=max_uses,
+            use_count=0,
+            expires_at=expires_at,
+            last_used_at=None,
+            revoked_at=None,
+            recipient_email=recipient_email,
+            created_at=now,
+            updated_at=now,
+        )
+
+    async def join_invite(self, *, token_hash: str, user_id: object) -> CollectionRead:
+        self.calls.append(("join_invite", {"token_hash_length": len(token_hash), "user_id": user_id}))
+        if self.invite_error is not None:
+            raise self.invite_error
+        assert self.collections
+        return self.collections[0]
+
 
 def build_bot_settings(database_url: str) -> Settings:
     return Settings(
@@ -213,6 +282,7 @@ async def dispatch_private_message(
     dispatcher: Dispatcher,
     bot: Bot,
     text: str,
+    telegram_user_id: int = TELEGRAM_ID,
     update_id: int = 1,
 ) -> None:
     await dispatcher.feed_raw_update(
@@ -222,8 +292,8 @@ async def dispatch_private_message(
             "message": {
                 "message_id": 700 + update_id,
                 "date": 1_700_000_000,
-                "chat": {"id": TELEGRAM_ID, "type": "private", "first_name": "Library"},
-                "from": {"id": TELEGRAM_ID, "is_bot": False, "first_name": "Library"},
+                "chat": {"id": telegram_user_id, "type": "private", "first_name": "Library"},
+                "from": {"id": telegram_user_id, "is_bot": False, "first_name": "Library"},
                 "text": text,
                 "entities": [{"type": "bot_command", "offset": 0, "length": len(text.split(maxsplit=1)[0])}],
             },
@@ -675,23 +745,44 @@ async def test_private_library_create_set_active_and_delete_collections_keep_fav
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("user_kwargs", "expected_user_count"),
-    [
-        (None, 0),
-        ({"status": AccountStatus.ACTIVE}, 1),
-        ({"status": AccountStatus.DELETION_PENDING, "telegram_id": TELEGRAM_ID}, 1),
-    ],
-)
-async def test_private_library_requires_active_full_linked_telegram_user_without_creating_guests(
+async def test_private_library_auto_creates_telegram_user_and_favorites_for_library(
     migrated_db_session: AsyncSession,
     postgres_session_factory: async_sessionmaker[AsyncSession],
     postgres_async_url: str,
-    user_kwargs: dict[str, object] | None,
-    expected_user_count: int,
 ) -> None:
-    if user_kwargs is not None:
-        migrated_db_session.add(User(**user_kwargs))
+    _ = migrated_db_session
+
+    settings = build_bot_settings(postgres_async_url)
+    telegram_session = RecordingTelegramSession()
+    bot = build_bot(settings, session=telegram_session)
+    dispatcher = build_library_dispatcher(settings=settings, postgres_session_factory=postgres_session_factory)
+
+    try:
+        await dispatch_private_message(dispatcher=dispatcher, bot=bot, text="/library")
+    finally:
+        await bot.session.close()
+
+    assert "Библиотека MemeXpert" in str(last_message(telegram_session).text)
+    assert "Favorites: 0" in str(last_message(telegram_session).text)
+    async with postgres_session_factory() as session:
+        user = await session.scalar(select(User).where(User.telegram_id == TELEGRAM_ID))
+        assert user is not None
+        assert user.account_type is AccountType.FULL
+        assert user.status is AccountStatus.ACTIVE
+        favorites = await session.scalar(
+            select(Collection).where(Collection.owner_id == user.id, Collection.kind == CollectionKind.FAVORITES)
+        )
+        assert favorites is not None
+        assert user.active_save_collection_id == favorites.id
+
+
+@pytest.mark.asyncio
+async def test_private_library_rejects_deletion_pending_telegram_user_without_duplicate(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    postgres_async_url: str,
+) -> None:
+    migrated_db_session.add(User(telegram_id=TELEGRAM_ID, status=AccountStatus.DELETION_PENDING))
     await migrated_db_session.commit()
     fake_service = FakePrivateLibraryCollectionService()
 
@@ -709,7 +800,181 @@ async def test_private_library_requires_active_full_linked_telegram_user_without
     finally:
         await bot.session.close()
 
-    assert "Сначала привяжите Telegram" in str(last_message(telegram_session).text)
+    assert "недоступен или неактивен" in str(last_message(telegram_session).text)
     assert fake_service.calls == []
     async with postgres_session_factory() as session:
-        assert await session.scalar(select(func.count()).select_from(User)) == expected_user_count
+        assert await session.scalar(select(func.count()).select_from(User).where(User.telegram_id == TELEGRAM_ID)) == 1
+
+
+@pytest.mark.asyncio
+async def test_private_library_invite_create_callback_persists_direct_link_and_analytics(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    postgres_async_url: str,
+) -> None:
+    user_service = UserService(migrated_db_session)
+    collection_service = CollectionService(migrated_db_session)
+    linked_user = await create_full_user_via_upgrade(user_service, telegram_id=TELEGRAM_ID)
+    custom = await collection_service.create_custom_collection(owner_user_id=linked_user.id, title="Share me")
+    await migrated_db_session.commit()
+
+    settings = build_bot_settings(postgres_async_url)
+    telegram_session = RecordingTelegramSession()
+    bot = build_bot(settings, session=telegram_session)
+    dispatcher = build_library_dispatcher(settings=settings, postgres_session_factory=postgres_session_factory)
+
+    try:
+        await dispatch_private_callback(dispatcher=dispatcher, bot=bot, data=f"pml:ic:{custom.id.hex}:0")
+    finally:
+        await bot.session.close()
+
+    edit_text = str(last_edit(telegram_session).text)
+    token = _fallback_invite_token(edit_text)
+    assert "Приглашение создано" in edit_text
+    assert f"https://t.me/{BOT_USERNAME}/app?startapp=invite_{token}" in edit_text
+    assert f"/invite_accept {token}" in edit_text
+    async with postgres_session_factory() as session:
+        invite = await session.scalar(select(CollectionInvite).where(CollectionInvite.collection_id == custom.id))
+        event = await session.scalar(
+            select(AnalyticsEvent).where(
+                AnalyticsEvent.event_type == AnalyticsEventType.COLLECTION_ACTION,
+                AnalyticsEvent.user_id == linked_user.id,
+            )
+        )
+    assert invite is not None
+    assert invite.created_by_user_id == linked_user.id
+    assert invite.role is CollectionMembershipRole.VIEWER
+    assert invite.channel is CollectionInviteChannel.DIRECT_LINK
+    assert invite.label == "Telegram PM"
+    assert invite.max_uses == 1
+    assert invite.expires_at is not None
+    assert invite.use_count == 0
+    assert event is not None
+    assert _analytics_properties(event)["action"] == "invite_create"
+    assert _analytics_refs(event)["collection_id"] == str(custom.id)
+
+
+@pytest.mark.asyncio
+async def test_private_library_invite_accept_auto_creates_telegram_user_and_membership(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    postgres_async_url: str,
+) -> None:
+    owner_service = UserService(migrated_db_session)
+    collection_service = CollectionService(migrated_db_session)
+    owner = await create_full_user_via_upgrade(
+        owner_service,
+        email="owner@example.com",
+        email_verified_at=datetime.now(UTC),
+    )
+    custom = await collection_service.create_custom_collection(owner_user_id=owner.id, title="Shared PM")
+    token = "telegram-accept-token"
+    _ = await collection_service.create_invite(
+        collection_id=custom.id,
+        token_hash=_hash_invite_token(token),
+        created_by_user_id=owner.id,
+        role=CollectionMembershipRole.VIEWER,
+        channel=CollectionInviteChannel.DIRECT_LINK,
+        label="Telegram PM",
+        max_uses=1,
+    )
+    await migrated_db_session.commit()
+
+    settings = build_bot_settings(postgres_async_url)
+    telegram_session = RecordingTelegramSession()
+    bot = build_bot(settings, session=telegram_session)
+    dispatcher = build_library_dispatcher(settings=settings, postgres_session_factory=postgres_session_factory)
+    invitee_telegram_id = TELEGRAM_ID + 1
+
+    try:
+        await dispatch_private_message(
+            dispatcher=dispatcher,
+            bot=bot,
+            text=f"/invite_accept {token}",
+            telegram_user_id=invitee_telegram_id,
+        )
+    finally:
+        await bot.session.close()
+
+    assert "Вы присоединились к коллекции: Shared PM" in str(last_message(telegram_session).text)
+    assert "Роль: viewer" in str(last_message(telegram_session).text)
+    async with postgres_session_factory() as session:
+        invitee = await session.scalar(select(User).where(User.telegram_id == invitee_telegram_id))
+        assert invitee is not None
+        member_role = await session.scalar(
+            select(CollectionMember.role).where(
+                CollectionMember.collection_id == custom.id,
+                CollectionMember.user_id == invitee.id,
+            )
+        )
+        invite = await session.scalar(select(CollectionInvite).where(CollectionInvite.collection_id == custom.id))
+        event = await session.scalar(
+            select(AnalyticsEvent).where(
+                AnalyticsEvent.event_type == AnalyticsEventType.COLLECTION_ACTION,
+                AnalyticsEvent.user_id == invitee.id,
+            )
+        )
+    assert member_role is CollectionMembershipRole.VIEWER
+    assert invite is not None
+    assert invite.use_count == 1
+    assert invite.status is CollectionInviteStatus.ACCEPTED
+    assert event is not None
+    assert _analytics_properties(event)["action"] == "invite_accept"
+    assert _analytics_refs(event)["collection_id"] == str(custom.id)
+
+
+@pytest.mark.asyncio
+async def test_private_library_invite_accept_reports_invalid_token(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    postgres_async_url: str,
+) -> None:
+    _ = migrated_db_session
+    settings = build_bot_settings(postgres_async_url)
+    telegram_session = RecordingTelegramSession()
+    bot = build_bot(settings, session=telegram_session)
+    dispatcher = build_library_dispatcher(settings=settings, postgres_session_factory=postgres_session_factory)
+
+    try:
+        await dispatch_private_message(dispatcher=dispatcher, bot=bot, text="/invite_accept nope")
+    finally:
+        await bot.session.close()
+
+    assert "Invite link is invalid or expired" in str(last_message(telegram_session).text)
+
+
+@pytest.mark.asyncio
+async def test_private_library_favorites_invite_callback_surfaces_service_error(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    postgres_async_url: str,
+) -> None:
+    user_service = UserService(migrated_db_session)
+    collection_service = CollectionService(migrated_db_session)
+    linked_user = await create_full_user_via_upgrade(user_service, telegram_id=TELEGRAM_ID)
+    favorites = await collection_service.ensure_favorites_collection(linked_user.id)
+    await migrated_db_session.commit()
+
+    settings = build_bot_settings(postgres_async_url)
+    telegram_session = RecordingTelegramSession()
+    bot = build_bot(settings, session=telegram_session)
+    dispatcher = build_library_dispatcher(settings=settings, postgres_session_factory=postgres_session_factory)
+
+    try:
+        await dispatch_private_callback(dispatcher=dispatcher, bot=bot, data=f"pml:ic:{favorites.id.hex}:0")
+    finally:
+        await bot.session.close()
+
+    answer = last_callback_answer(telegram_session)
+    assert answer.show_alert is True
+    assert answer.text == "Favorites collections cannot be shared by invite."
+
+
+def _fallback_invite_token(text: str) -> str:
+    prefix = "Fallback: /invite_accept "
+    line = next(line for line in text.splitlines() if line.startswith(prefix))
+    return line.removeprefix(prefix).strip()
+
+
+def _hash_invite_token(token: str) -> str:
+    return hashlib.sha256(token.strip().encode("utf-8")).hexdigest()

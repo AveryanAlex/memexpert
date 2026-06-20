@@ -2,11 +2,27 @@ import type { Locator, Page } from '@playwright/test';
 import { expect, test } from '../fixtures/app';
 import { publicTrendsFixture, seededByCategory, type SeededPublicTrendsFixture } from '../helpers/seed';
 
+test('guest home feed API bootstraps cold-start fallback from seeded public memes', async ({ api, seed }) => {
+  await api.expectNoAccessCookieStored();
+  const seededHomeFeedParams = { limit: '10', tags: 'e2e-prd' };
+
+  const first = await api.homeFeed(seededHomeFeedParams);
+  const accessToken = api.expectAccessCookieSet(first.response);
+  await api.expectAccessCookieStored(accessToken);
+  api.expectHomeFeedFallback(first.payload, seed.seeded_memes);
+
+  const second = await api.homeFeed(seededHomeFeedParams);
+  api.expectAccessCookieNotSet(second.response);
+  await api.expectAccessCookieStored(accessToken);
+  api.expectHomeFeedFallback(second.payload, seed.seeded_memes);
+});
+
 test('guest discovers a public meme with URL-backed filters and imgproxy media', async ({ app, seed }) => {
   const cat = seededByCategory(seed, 'cat');
   const nsfwCat = seededByCategory(seed, 'cat-nsfw');
 
   await app.home.goto();
+  await app.home.expectGuestHomeFeedFallback(seed.seeded_memes);
   await app.home.searchFor(cat.query);
 
   await app.search.expectResultVisible(cat);
@@ -71,7 +87,7 @@ test('guest explores seeded public trend aggregates, comparison, and timeline', 
   await expect(page.getByRole('heading', { name: 'Data table' })).toBeVisible();
   const comparisonTable = page.getByRole('table');
   await expect(comparisonTable).toBeVisible();
-  await expectComparisonRow(comparisonTable, representative.title, 'meme', 'Per-meme snapshots', 'Real per-meme snapshot history.');
+  await expectComparisonRow(comparisonTable, representative.title, 'meme', 'Per-meme engagement points', 'Real per-meme engagement history.');
   await expectComparisonRow(comparisonTable, trends.tag.title, 'tag', 'Aggregate history points', 'Real aggregate history points.');
   await expectComparisonRow(comparisonTable, trends.template.title, 'template', 'Aggregate history points', 'Real aggregate history points.');
   await expect(page.getByText('Current-window aggregate fallback')).toHaveCount(0);
@@ -79,9 +95,14 @@ test('guest explores seeded public trend aggregates, comparison, and timeline', 
 
   await page.goto(trends.timeline.path);
   await expect(page.getByRole('heading', { name: 'Meme timeline.' })).toBeVisible();
-  await expect(page.getByRole('heading', { name: trends.timeline.period_label })).toBeVisible();
-  await expect(page.getByText(`${trends.timeline.snapshot_count} real snapshots`)).toBeVisible();
-  await expect(page.getByText(trends.timeline.period, { exact: true })).toBeVisible();
+  const timelinePeriod = page
+    .getByRole('region', { name: 'Timeline periods' })
+    .locator('section')
+    .filter({ has: page.getByRole('heading', { name: trends.timeline.period_label }) });
+  await expect(timelinePeriod).toHaveCount(1);
+  await expect(timelinePeriod.getByRole('heading', { name: trends.timeline.period_label })).toBeVisible();
+  await expect(timelinePeriod.getByText(new RegExp(`\\b${trends.timeline.snapshot_count} source checks\\b`))).toBeVisible();
+  await expect(timelinePeriod.getByText(trends.timeline.period, { exact: true })).toBeVisible();
   await expect(page.getByRole('link', { name: `Open ${representative.title}` }).first()).toBeVisible();
 });
 

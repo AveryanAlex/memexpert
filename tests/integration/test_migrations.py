@@ -44,6 +44,7 @@ EXPECTED_TABLES = {
     "meme_file_sync_target_snapshots",
     "meme_files",
     "meme_merge_logs",
+    "meme_of_the_day_selections",
     "meme_seo_pages",
     "meme_source_engagement_snapshots",
     "meme_sources",
@@ -56,9 +57,10 @@ EXPECTED_TABLES = {
     "pipeline_stage_journal",
     "rabbitmq_outbox_messages",
     "source_channels",
+    "telegram_admin_audit_logs",
     "telegram_file_id_cache",
     "telegram_link_codes",
-    "telegram_session_states",
+    "telegram_sessions",
     "users",
 }
 EXPECTED_CURRENT_TREND_MATERIALIZED_VIEWS = {
@@ -337,16 +339,21 @@ def test_initial_revision_metadata_is_present() -> None:
     config = _build_alembic_config()
     script_directory = ScriptDirectory.from_config(config)
     revision = script_directory.get_revision("head")
-    previous_revision = script_directory.get_revision("0022")
+    previous_revision = script_directory.get_revision("0025")
+    telegram_session_revision = script_directory.get_revision("0024")
 
     assert revision is not None
-    assert revision.revision == "0023"
-    assert revision.down_revision == "0022"
-    assert revision.doc == "source engagement public read models"
+    assert revision.revision == "0026"
+    assert revision.down_revision == "0025"
+    assert revision.doc == "telegram admin audit"
     assert previous_revision is not None
-    assert previous_revision.revision == "0022"
-    assert previous_revision.down_revision == "0021"
-    assert previous_revision.doc == "source engagement history"
+    assert previous_revision.revision == "0025"
+    assert previous_revision.down_revision == "0024"
+    assert previous_revision.doc == "meme of the day cache"
+    assert telegram_session_revision is not None
+    assert telegram_session_revision.revision == "0024"
+    assert telegram_session_revision.down_revision == "0023"
+    assert telegram_session_revision.doc == "telegram session registry"
 
 
 async def test_upgrade_head_creates_expected_schema_and_constraints(
@@ -360,7 +367,7 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
     table_names = await _get_table_names(engine)
     assert table_names == EXPECTED_TABLES | {"alembic_version"}
     assert "meme_popularity_snapshots" not in table_names
-    assert await _get_current_revision(engine) == "0023"
+    assert await _get_current_revision(engine) == "0026"
     assert await _get_materialized_view_names(engine) == EXPECTED_MATERIALIZED_VIEWS
 
     users_indexes = await _get_index_definitions(engine, "users")
@@ -370,6 +377,7 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
     meme_file_ocr_result_indexes = await _get_index_definitions(engine, "meme_file_ocr_results")
     meme_merge_log_indexes = await _get_index_definitions(engine, "meme_merge_logs")
     meme_sources_indexes = await _get_index_definitions(engine, "meme_sources")
+    motd_indexes = await _get_index_definitions(engine, "meme_of_the_day_selections")
     meme_source_engagement_snapshot_indexes = await _get_index_definitions(
         engine,
         "meme_source_engagement_snapshots",
@@ -392,6 +400,8 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
     meme_files_columns = await _get_column_names(engine, "meme_files")
     meme_merge_log_columns = await _get_column_names(engine, "meme_merge_logs")
     meme_sources_columns = await _get_column_names(engine, "meme_sources")
+    motd_columns = await _get_column_names(engine, "meme_of_the_day_selections")
+    motd_constraints = await _get_constraint_definitions(engine, "meme_of_the_day_selections")
     meme_source_engagement_snapshot_columns = await _get_column_names(
         engine,
         "meme_source_engagement_snapshots",
@@ -406,6 +416,8 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
     blocked_hash_indexes = await _get_index_definitions(engine, "blocked_perceptual_hashes")
     blocked_hash_audit_columns = await _get_column_names(engine, "blocked_perceptual_hash_audit_logs")
     blocked_hash_audit_indexes = await _get_index_definitions(engine, "blocked_perceptual_hash_audit_logs")
+    telegram_admin_audit_columns = await _get_column_names(engine, "telegram_admin_audit_logs")
+    telegram_admin_audit_indexes = await _get_index_definitions(engine, "telegram_admin_audit_logs")
     pipeline_stage_journal_columns = await _get_column_names(engine, "pipeline_stage_journal")
     pipeline_ingest_request_columns = await _get_column_names(engine, "pipeline_ingest_requests")
     rabbitmq_outbox_message_columns = await _get_column_names(engine, "rabbitmq_outbox_messages")
@@ -485,6 +497,28 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
     assert constraints["meme_sources_uniques"] == {
         "uq_meme_sources_platform_source_post": ["platform", "source_id", "post_id"],
     }
+    assert motd_columns == {
+        "algorithm_version",
+        "candidate_count",
+        "created_at",
+        "id",
+        "meme_id",
+        "reason",
+        "refreshed_at",
+        "score",
+        "score_components",
+        "selected_for",
+        "updated_at",
+    }
+    assert "uq_motd_selected_for_algorithm_version" in motd_constraints
+    assert "selected_for" in motd_constraints["uq_motd_selected_for_algorithm_version"]
+    assert "algorithm_version" in motd_constraints["uq_motd_selected_for_algorithm_version"]
+    motd_check_sql = " ".join(motd_constraints.values()).lower()
+    assert "candidate_count >= 0" in motd_check_sql
+    assert "algorithm_version" in motd_check_sql
+    assert "reason" in motd_check_sql
+    assert "ix_meme_of_the_day_selections_selected_for" in motd_indexes
+    assert "ix_meme_of_the_day_selections_meme_id" in motd_indexes
     assert {
         "last_engagement_check_at",
         "next_engagement_check_at",
@@ -611,6 +645,25 @@ async def test_upgrade_head_creates_expected_schema_and_constraints(
         "previous_values",
     }
     assert "ix_blocked_perceptual_hash_audit_logs_hash_created_at" in blocked_hash_audit_indexes
+    assert telegram_admin_audit_columns == {
+        "action",
+        "admin_user_id",
+        "created_at",
+        "id",
+        "new_values",
+        "note",
+        "previous_values",
+        "source_channel_id",
+        "telegram_session_id",
+    }
+    assert "ix_telegram_admin_audit_logs_admin_created_at" in telegram_admin_audit_indexes
+    assert "admin_user_id" in telegram_admin_audit_indexes["ix_telegram_admin_audit_logs_admin_created_at"]
+    assert "ix_telegram_admin_audit_logs_action_created_at" in telegram_admin_audit_indexes
+    assert "action" in telegram_admin_audit_indexes["ix_telegram_admin_audit_logs_action_created_at"]
+    assert "ix_telegram_admin_audit_logs_session_created_at" in telegram_admin_audit_indexes
+    assert "telegram_session_id" in telegram_admin_audit_indexes["ix_telegram_admin_audit_logs_session_created_at"]
+    assert "ix_telegram_admin_audit_logs_channel_created_at" in telegram_admin_audit_indexes
+    assert "source_channel_id" in telegram_admin_audit_indexes["ix_telegram_admin_audit_logs_channel_created_at"]
     assert pipeline_stage_journal_columns == {
         "attempt_count",
         "created_at",
@@ -978,13 +1031,13 @@ async def test_crawler_sources_migration_applies_and_reverses(
     config = _build_alembic_config(database_url)
 
     await _run_alembic_command(command.upgrade, config, "head")
-    assert await _get_current_revision(engine) == "0023"
+    assert await _get_current_revision(engine) == "0026"
 
     meme_sources_columns = await _get_column_names(engine, "meme_sources")
     source_channels_columns = await _get_column_names(engine, "source_channels")
-    telegram_session_states_columns = await _get_column_names(
+    telegram_sessions_columns = await _get_column_names(
         engine,
-        "telegram_session_states",
+        "telegram_sessions",
     )
 
     assert {
@@ -1003,43 +1056,64 @@ async def test_crawler_sources_migration_applies_and_reverses(
         "catchup_enabled",
         "is_paused",
         "last_fetched_at",
+        "telegram_session_id",
+        "live_enabled",
+        "engagement_enabled",
     }.issubset(source_channels_columns)
-    assert telegram_session_states_columns == {
+    assert "session_id" not in source_channels_columns
+    assert telegram_sessions_columns == {
+        "account_phone_hint",
+        "account_user_id",
+        "account_username",
+        "catchup_enabled",
+        "created_at",
+        "display_name",
+        "enabled",
+        "encrypted_string_session",
+        "engagement_enabled",
+        "flood_wait_until",
         "id",
-        "session_name",
-        "status",
         "last_error_class",
         "last_error_text",
-        "flood_wait_until",
-        "live_listener_started_at",
         "last_heartbeat_at",
+        "live_enabled",
+        "live_listener_started_at",
+        "max_requests_per_second",
+        "name",
         "quarantined_at",
-        "created_at",
+        "status",
         "updated_at",
     }
 
     telegram_session_indexes = await _get_index_definitions(
         engine,
-        "telegram_session_states",
+        "telegram_sessions",
     )
-    assert "uq_telegram_session_states_session_name" in telegram_session_indexes
-    assert "session_name" in telegram_session_indexes[
-        "uq_telegram_session_states_session_name"
+    assert "uq_telegram_sessions_name" in telegram_session_indexes
+    assert "name" in telegram_session_indexes[
+        "uq_telegram_sessions_name"
     ]
     assert "UNIQUE" in telegram_session_indexes[
-        "uq_telegram_session_states_session_name"
+        "uq_telegram_sessions_name"
     ].upper()
-    assert "ix_telegram_session_states_status_updated_at" in telegram_session_indexes
+    assert "ix_telegram_sessions_status_updated_at" in telegram_session_indexes
     status_updated_index = telegram_session_indexes[
-        "ix_telegram_session_states_status_updated_at"
+        "ix_telegram_sessions_status_updated_at"
     ]
     assert "status" in status_updated_index
     assert "updated_at" in status_updated_index
+    assert "ix_telegram_sessions_enabled_status" in telegram_session_indexes
+
+    source_channel_indexes = await _get_index_definitions(engine, "source_channels")
+    assert "ix_source_channels_telegram_session_id" in source_channel_indexes
+    assert "ix_source_channels_session_live" in source_channel_indexes
+    assert "ix_source_channels_session_engagement" in source_channel_indexes
 
     await _run_alembic_command(command.downgrade, config, "0005")
     assert await _get_current_revision(engine) == "0005"
 
     downgraded_tables = await _get_table_names(engine)
+    assert "telegram_sessions" not in downgraded_tables
     assert "telegram_session_states" not in downgraded_tables
 
     downgraded_meme_sources_columns = await _get_column_names(engine, "meme_sources")
@@ -1051,6 +1125,7 @@ async def test_crawler_sources_migration_applies_and_reverses(
     assert "catchup_enabled" not in downgraded_source_channels_columns
     assert "is_paused" not in downgraded_source_channels_columns
     assert "last_fetched_at" not in downgraded_source_channels_columns
+    assert "telegram_session_id" not in downgraded_source_channels_columns
 
 
 async def test_downgrade_base_reverses_the_schema_cleanly(
@@ -1076,7 +1151,7 @@ async def test_repeated_fresh_database_upgrades_work_after_a_full_downgrade(
     await _run_alembic_command(command.downgrade, config, "base")
     await _run_alembic_command(command.upgrade, config, "head")
 
-    assert await _get_current_revision(engine) == "0023"
+    assert await _get_current_revision(engine) == "0026"
     assert EXPECTED_TABLES.issubset(await _get_table_names(engine))
 
 

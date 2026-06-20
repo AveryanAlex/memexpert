@@ -19,10 +19,13 @@ from memexpert.core.config import Settings
 from memexpert.ingest.schemas import IngestAcceptOutcome, IngestAcceptResult, IngestAcceptSource, IngestRequestRead
 from memexpert.ingest.target_collection_metadata import TARGET_COLLECTION_ID_METADATA_KEY
 from memexpert.models.base import utcnow
-from memexpert.models.collection import CollectionMeme
+from memexpert.models.collection import Collection, CollectionMeme
 from memexpert.models.content import Meme, MemeFile
 from memexpert.models.enums import (
+    AccountStatus,
+    AccountType,
     AnalyticsEventType,
+    CollectionKind,
     ContentKind,
     ContentLanguage,
     ContentProcessingStatus,
@@ -656,13 +659,13 @@ async def test_private_upload_rejects_oversize_animation_before_download(
 
 
 @pytest.mark.asyncio
-async def test_private_upload_unlinked_user_is_rejected_before_download(
+async def test_private_upload_auto_creates_user_and_favorites_before_ingest(
     migrated_db_session: AsyncSession,
     postgres_session_factory: async_sessionmaker[AsyncSession],
     postgres_async_url: str,
 ) -> None:
     _ = migrated_db_session
-    accept_service = FakePrivateUploadAcceptService()
+    accept_service = FakePrivateUploadAcceptService(accept_result=ingest_result_for())
     downloader = FakeTelegramFileDownloader()
     settings = build_bot_settings(postgres_async_url)
     recording_session = RecordingTelegramSession()
@@ -676,19 +679,75 @@ async def test_private_upload_unlinked_user_is_rejected_before_download(
 
     await dispatch_photo_upload(dispatcher=dispatcher, bot=bot)
 
-    assert "Сначала привяжите Telegram" in last_bot_text(recording_session)
-    assert downloader.calls == []
-    assert accept_service.calls == []
+    assert "Результат появится" in last_bot_text(recording_session)
+    assert downloader.calls == ["photo-file-1"]
+    assert len(accept_service.calls) == 1
+    source = accept_service.calls[0]["source"]
+    assert isinstance(source, IngestAcceptSource)
+    async with postgres_session_factory() as session:
+        created_user = await session.scalar(select(User).where(User.telegram_id == TELEGRAM_ID))
+        assert created_user is not None
+        favorites = await session.scalar(
+            select(Collection).where(
+                Collection.owner_id == created_user.id,
+                Collection.kind == CollectionKind.FAVORITES,
+            )
+        )
+    assert created_user.account_type is AccountType.FULL
+    assert created_user.status is AccountStatus.ACTIVE
+    assert favorites is not None
+    assert created_user.active_save_collection_id == favorites.id
+    assert source.owner_user_id == created_user.id
+    assert source.user_metadata[TARGET_COLLECTION_ID_METADATA_KEY] == str(favorites.id)
 
 
 @pytest.mark.asyncio
-async def test_private_upload_missing_active_collection_is_rejected_before_download(
+async def test_private_upload_existing_user_without_active_collection_defaults_to_favorites(
     migrated_db_session: AsyncSession,
     postgres_session_factory: async_sessionmaker[AsyncSession],
     postgres_async_url: str,
 ) -> None:
     user_service = UserService(migrated_db_session)
-    _user = await create_full_user_via_upgrade(user_service, telegram_id=TELEGRAM_ID)
+    user = await create_full_user_via_upgrade(user_service, telegram_id=TELEGRAM_ID)
+    await migrated_db_session.commit()
+
+    accept_service = FakePrivateUploadAcceptService(accept_result=ingest_result_for(owner_user_id=user.id))
+    downloader = FakeTelegramFileDownloader()
+    settings = build_bot_settings(postgres_async_url)
+    recording_session = RecordingTelegramSession()
+    bot = build_bot(settings, session=recording_session)
+    dispatcher = build_upload_dispatcher(
+        settings=settings,
+        postgres_session_factory=postgres_session_factory,
+        accept_service=accept_service,
+        downloader=downloader,
+    )
+
+    await dispatch_photo_upload(dispatcher=dispatcher, bot=bot)
+
+    assert "Результат появится" in last_bot_text(recording_session)
+    assert downloader.calls == ["photo-file-1"]
+    assert len(accept_service.calls) == 1
+    source = accept_service.calls[0]["source"]
+    assert isinstance(source, IngestAcceptSource)
+    async with postgres_session_factory() as session:
+        persisted_user = await session.scalar(select(User).where(User.id == user.id))
+        favorites = await session.scalar(
+            select(Collection).where(Collection.owner_id == user.id, Collection.kind == CollectionKind.FAVORITES)
+        )
+    assert persisted_user is not None
+    assert favorites is not None
+    assert persisted_user.active_save_collection_id == favorites.id
+    assert source.user_metadata[TARGET_COLLECTION_ID_METADATA_KEY] == str(favorites.id)
+
+
+@pytest.mark.asyncio
+async def test_private_upload_deletion_pending_user_is_rejected_before_download(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    postgres_async_url: str,
+) -> None:
+    migrated_db_session.add(User(telegram_id=TELEGRAM_ID, status=AccountStatus.DELETION_PENDING))
     await migrated_db_session.commit()
 
     accept_service = FakePrivateUploadAcceptService()
@@ -705,9 +764,13 @@ async def test_private_upload_missing_active_collection_is_rejected_before_downl
 
     await dispatch_photo_upload(dispatcher=dispatcher, bot=bot)
 
-    assert "активную коллекцию" in last_bot_text(recording_session)
+    assert "недоступен или неактивен" in last_bot_text(recording_session)
     assert downloader.calls == []
     assert accept_service.calls == []
+    async with postgres_session_factory() as session:
+        users = list(await session.scalars(select(User).where(User.telegram_id == TELEGRAM_ID)))
+    assert len(users) == 1
+    assert users[0].status is AccountStatus.DELETION_PENDING
 
 
 @pytest.mark.asyncio

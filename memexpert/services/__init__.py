@@ -59,6 +59,7 @@ _EXPORTS: dict[str, str] = {
     "InvalidTokenError": "memexpert.services.errors",
     "LinkedProvidersProjection": "memexpert.services.account_link_service",
     "MemeNotFoundError": "memexpert.services.meme_search",
+    "MemeOfTheDayService": "memexpert.services.meme_of_the_day",
     "MemeReportService": "memexpert.services.report",
     "MemeReportServiceError": "memexpert.services.report",
     "MemeReportTargetNotVisibleError": "memexpert.services.report",

@@ -28,8 +28,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 app \
     && useradd --system --uid 10001 --gid app --home-dir /app --shell /usr/sbin/nologin app \
-    && mkdir -p /app/.cache /app/.telegram-sessions \
-    && chown app:app /app/.cache /app/.telegram-sessions
+    && mkdir -p /app/.cache \
+    && chown app:app /app/.cache
 
 COPY pyproject.toml uv.lock ./
 

@@ -65,9 +65,13 @@ Initial ingestion writes an `ingest_initial` baseline snapshot. Historical sourc
 
 The public DTO names remain stable (`latest_source_views`, `latest_source_reactions`, `latest_source_reposts`, `latest_popularity_score`), but these values are derived read-model metrics. There is no canonical `memes.popularity_score` column and no `meme_popularity_snapshots` table.
 
+### TelegramSession
+
+Canonical registry for Telethon userbot sessions. Key fields: `name`, `display_name`, encrypted `encrypted_string_session`, account projection fields (`account_user_id`, `account_username`, `account_phone_hint`), `status`, `enabled`, per-session feature flags, and `max_requests_per_second`. API read schemas deliberately omit `encrypted_string_session`; runtime code decrypts it only when constructing `TelegramClient(StringSession(...))`.
+
 ### SourceChannel
 
-Channels being crawled. Key fields: `platform`, `platform_id`, `username`, `title`, `subscriber_count`, `is_active`, `last_read_post_id` (platform-specific, e.g. Telegram message ID — used to resume on restart), `session_id` (which crawler session handles this channel).
+Channels being crawled. Key fields: `platform`, `platform_id`, `username`, `title`, `subscriber_count`, `is_active`, `last_read_post_id` (platform-specific, e.g. Telegram message ID — used to resume on restart), `telegram_session_id` (nullable FK to the `telegram_sessions` row that handles this channel), and live/catch-up/engagement flags. If a Telegram session is deleted, `ON DELETE SET NULL` leaves the source channel as an orphan; it remains visible for operator repair but is not runnable until reassigned.
 
 ### ChannelSuggestion
 

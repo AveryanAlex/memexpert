@@ -2,6 +2,8 @@
   import CollectionChip from '$lib/features/collections/CollectionChip.svelte';
   import { bulkGuidanceFromSessionAndCollections, collectionListBulkOptions } from '$lib/features/memes/bulk-view-model';
   import InfiniteMemeFeed from '$lib/features/memes/InfiniteMemeFeed.svelte';
+  import type { MemeFeedSource } from '$lib/features/memes/infinite-feed';
+  import MemeOfTheDayPanel from '$lib/features/memes/MemeOfTheDayPanel.svelte';
   import { ActionLink, Button, Card, Input, Notice, PageHeader, Select } from '$lib/ui';
   import type { ActionData, PageData } from './$types';
 
@@ -9,9 +11,54 @@
 
   const bulkOptions = $derived(collectionListBulkOptions(data.collections));
   const bulkGuidance = $derived(bulkGuidanceFromSessionAndCollections(data.session ?? null, bulkOptions));
+  const feedSource = $derived(toMemeFeedSource(data.feedSource));
+  const isHomeFeed = $derived(feedSource === 'home' && !data.query.trim());
+  const homeFeedCopy = $derived(homeFeedSummary(data));
+
+  function toMemeFeedSource(value: PageData['feedSource']): MemeFeedSource {
+    return value === 'home' ? 'home' : 'catalog';
+  }
+
+  function homeFeedSummary(pageData: PageData): { title: string; message: string } {
+    const attribution = pageData.page.items[0]?.attribution;
+    const source = attribution?.source_algorithm;
+    const reason = attribution?.reason ?? '';
+    const isFull = pageData.session?.user.account_type === 'full';
+
+    if (source === 'personalized_recommendations') {
+      return {
+        title: 'Personalized for you',
+        message: 'Based on your recent MemeXpert likes, saves, sends, and detail views.'
+      };
+    }
+
+    if (source === 'fallback_trending' && reason.startsWith('cold_start')) {
+      return isFull
+        ? {
+            title: 'Trending while we learn your taste',
+            message: 'Like, save, or open memes to turn this cold-start feed into personal recommendations.'
+          }
+        : {
+            title: 'Trending for guests',
+            message: 'A cold-start feed from public activity while this guest session has little history.'
+          };
+    }
+
+    if (source === 'fallback_trending') {
+      return {
+        title: 'Trending fallback',
+        message: 'Recommendations are temporarily degraded, so the backend is serving trending memes.'
+      };
+    }
+
+    return {
+      title: isFull ? 'Recommended home feed' : 'Guest home feed',
+      message: isFull ? 'Your home feed updates as you interact with memes.' : 'Browse trending public memes, then connect Telegram when you want a full profile.'
+    };
+  }
 </script>
 
-<PageHeader title="Find the right meme fast." description="Search the public MemeXpert catalog with plain text, or browse what is already popular." badge="Guest access enabled" />
+<PageHeader title="Find the right meme fast." description="Search the public MemeXpert catalog with plain text, or browse a home feed that adapts as you use it." badge="Guest access enabled" />
 
 <form class="mb-6 flex flex-col gap-2 rounded-3xl border border-line bg-paper p-2 shadow-warm-lg md:flex-row" method="GET" action="/search">
   <Input
@@ -29,6 +76,8 @@
   <ActionLink variant="secondary" size="compact" href="/search">Advanced search</ActionLink>
   <ActionLink variant="ghost" size="compact" href="/search?tags=reaction&include_nsfw=false">Browse reactions</ActionLink>
 </div>
+
+<MemeOfTheDayPanel memeOfTheDay={data.memeOfTheDay} initialError={data.memeOfTheDayErrorMessage} showAccessMarkers={Boolean(data.session)} />
 
 <Card class="my-6 grid gap-4" aria-labelledby="collections-title">
   <div>
@@ -80,17 +129,28 @@
 <InfiniteMemeFeed
   initialPage={data.page}
   filters={{ query: data.query }}
+  source={feedSource}
   initialError={data.errorMessage}
-  emptyMessage="Try a shorter phrase, a different synonym, or clear the search box to browse."
+  emptyTitle={isHomeFeed ? 'No home feed memes yet' : 'No memes found'}
+  emptyMessage={isHomeFeed ? 'Try Search or check back after the public catalog has more memes.' : 'Try a shorter phrase, a different synonym, or clear the search box to browse.'}
   bulk={{ enabled: true, saveEnabled: true, collectionOptions: bulkOptions, guidance: bulkGuidance }}
+  showAccessMarkers={Boolean(data.session)}
 >
   {#snippet summary()}
-    <p class="m-0 text-muted">
-      {#if data.query}
+    {#if data.query}
+      <p class="m-0 text-muted">
         Results for “{data.query}”
-      {:else}
-        Browsing public memes
-      {/if}
-    </p>
+      </p>
+    {:else}
+      <div class="grid gap-1">
+        <p class="m-0 font-extrabold text-ink">{homeFeedCopy.title}</p>
+        <p class="m-0 text-sm text-muted">{homeFeedCopy.message}</p>
+      </div>
+    {/if}
+  {/snippet}
+  {#snippet emptyAction()}
+    {#if isHomeFeed}
+      <ActionLink href="/search">Open search</ActionLink>
+    {/if}
   {/snippet}
 </InfiniteMemeFeed>

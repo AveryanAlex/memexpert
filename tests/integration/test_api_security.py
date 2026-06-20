@@ -201,6 +201,7 @@ async def test_safe_read_routes_stay_available_when_redis_unavailable(
     [
         ("GET", "/api/v1/memes/search", SecurityRouteTier.SEARCH_FEED),
         ("GET", "/api/v1/memes/browse", SecurityRouteTier.SEARCH_FEED),
+        ("GET", "/api/v1/memes/home-feed", SecurityRouteTier.SEARCH_FEED),
         ("GET", "/api/v1/memes/trending", SecurityRouteTier.SEARCH_FEED),
         ("GET", "/api/v1/memes/trends", SecurityRouteTier.SEARCH_FEED),
         ("GET", "/api/v1/memes/trends/tags", SecurityRouteTier.SEARCH_FEED),
