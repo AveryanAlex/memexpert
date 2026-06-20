@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from memexpert.core.config import get_settings
-from memexpert.core.database import get_db_session
+from memexpert.core.database import get_async_session_factory, get_db_session
 from memexpert.core.meilisearch import (
     MeilisearchSyncClientProtocol,
     PipelineMeilisearchSyncClient,
@@ -33,6 +33,7 @@ from memexpert.crawlers.telegram.client import (
     PipelineTelegramSessionBannedError,
     PipelineTelegramSessionNotRunnableError,
 )
+from memexpert.crawlers.telegram.manager import TelegramSessionManager
 from memexpert.crawlers.telegram.runtime import TelegramCrawlerRuntime
 from memexpert.ingest.accept_service import PipelineIngestAcceptService
 from memexpert.ingest.crawler_service import PipelineCrawlerIngestService
@@ -293,13 +294,29 @@ def get_crawler_runtime(
     )
 
 
+_telegram_session_manager: TelegramSessionManager | None = None
+
+
+def get_telegram_session_manager() -> TelegramSessionManager:
+    """Return the process-local multi-session Telegram manager."""
+
+    global _telegram_session_manager
+    if _telegram_session_manager is None:
+        _telegram_session_manager = TelegramSessionManager(
+            settings=get_settings(),
+            session_factory=get_async_session_factory(),
+        )
+    return _telegram_session_manager
+
+
 def get_crawler_operations_service(
     session: Annotated[AsyncSession, Depends(get_db_session)],
     runtime: Annotated[TelegramCrawlerRuntime, Depends(get_crawler_runtime)],
+    manager: Annotated[TelegramSessionManager, Depends(get_telegram_session_manager)],
 ) -> CrawlerOperationsService:
     """Return the operator crawler-operations service for one request."""
 
-    return CrawlerOperationsService(session=session, runtime=runtime)
+    return CrawlerOperationsService(session=session, runtime=runtime, manager=manager)
 
 
 PipelineItemReadServiceDep = Annotated[PipelineItemReadService, Depends(get_pipeline_item_read_service)]
@@ -339,6 +356,7 @@ PipelineTelegramClientDep = Annotated[
     Depends(get_pipeline_telegram_client),
 ]
 CrawlerRuntimeDep = Annotated[TelegramCrawlerRuntime, Depends(get_crawler_runtime)]
+TelegramSessionManagerDep = Annotated[TelegramSessionManager, Depends(get_telegram_session_manager)]
 CrawlerOperationsServiceDep = Annotated[
     CrawlerOperationsService,
     Depends(get_crawler_operations_service),
@@ -460,6 +478,7 @@ __all__ = [
     "QdrantSyncClientDep",
     "get_crawler_operations_service",
     "get_crawler_runtime",
+    "get_telegram_session_manager",
     "get_meilisearch_sync_client",
     "get_pipeline_item_read_service",
     "get_pipeline_ingest_accept_service",
@@ -474,4 +493,5 @@ __all__ = [
     "pipeline_http_exception_handler",
     "require_pipeline_operator_token",
     "to_pipeline_http_error",
+    "TelegramSessionManagerDep",
 ]

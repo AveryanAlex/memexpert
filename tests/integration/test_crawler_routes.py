@@ -29,6 +29,7 @@ from memexpert.crawlers.telegram.client import (
     RawTelegramChannel,
     RawTelegramMessage,
 )
+from memexpert.crawlers.telegram.manager import TelegramSessionManager
 from memexpert.crawlers.telegram.runtime import TelegramCrawlerRuntime
 from memexpert.ingest.crawler_service import PipelineCrawlerIngestService
 from memexpert.models.content import (
@@ -57,7 +58,7 @@ from tests.integration.test_ingest_accept_service import FakeStorageClient
 if TYPE_CHECKING:
     from fastapi import FastAPI
     from httpx import AsyncClient
-    from sqlalchemy.ext.asyncio import AsyncSession
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 
 def _now() -> datetime:
@@ -109,11 +110,13 @@ async def _seed_session(
     *,
     session_name: str,
     status: TelegramSessionStatus = TelegramSessionStatus.ACTIVE,
+    encrypted_string_session: str | None = "encrypted-string-session",
 ) -> TelegramSession:
     row = TelegramSession(
         name=session_name,
         display_name=session_name.title(),
         status=status,
+        encrypted_string_session=encrypted_string_session,
         last_heartbeat_at=_now(),
     )
     session.add(row)
@@ -514,6 +517,64 @@ async def test_replay_channel_post_ingests_pinned_message_without_advancing_chec
     assert refreshed is not None
     # Replay must NOT advance last_read_post_id, even when a higher post_id
     # is re-ingested out of band.
+    assert refreshed.last_read_post_id == "500"
+
+
+async def test_replay_channel_post_uses_manager_assigned_session_client(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _seed_session(migrated_db_session, session_name="primary")
+    await _seed_session(migrated_db_session, session_name="secondary")
+    channel = await _seed_channel(
+        migrated_db_session,
+        platform_id="manager_replay_chan",
+        session_name="secondary",
+        last_read_post_id="500",
+    )
+    primary_fake = FakeTelegramClient()
+    secondary_fake = FakeTelegramClient()
+    _pin_photo_message(fake=secondary_fake, channel_id="manager_replay_chan", post_id="42")
+    fallback_operations_service = _build_real_operations_service(
+        migrated_db_session,
+        telegram_client=primary_fake,
+        phash_tag="M",
+    )
+    manager = TelegramSessionManager(
+        settings=Settings(),
+        session_factory=postgres_session_factory,
+        telegram_client_factory=lambda row: {"primary": primary_fake, "secondary": secondary_fake}[row.name],
+        ingest_service_factory=lambda db_session: PipelineCrawlerIngestService.from_settings(
+            db_session,
+            storage_client=FakeStorageClient(),
+            settings=Settings(),
+        ),
+    )
+    operations_service = CrawlerOperationsService(
+        session=migrated_db_session,
+        runtime=fallback_operations_service.runtime,
+        manager=manager,
+    )
+    _install_operations_service_override(app, operations_service)
+
+    try:
+        response = await client.post(
+            f"/api/v1/crawler/channels/{channel.id}/replay-post",
+            headers=_operator_headers(),
+            json={"post_id": "42"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+        await manager.shutdown()
+
+    assert response.status_code == 200
+    assert response.json()["outcome"] == "ingested"
+    assert secondary_fake.downloaded_message_ids == ["42"]
+    assert primary_fake.downloaded_message_ids == []
+    refreshed = await migrated_db_session.get(SourceChannel, channel.id)
+    assert refreshed is not None
     assert refreshed.last_read_post_id == "500"
 
 

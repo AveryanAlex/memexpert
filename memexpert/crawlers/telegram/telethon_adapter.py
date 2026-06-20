@@ -48,6 +48,7 @@ from memexpert.crawlers.telegram.session_crypto import (
     TelegramStringSessionDecryptError,
 )
 from memexpert.crawlers.telegram.telethon_mapper import TelethonMessageNormalizer
+from memexpert.models.base import utcnow
 from memexpert.models.content import TelegramSession
 from memexpert.models.enums import TelegramSessionStatus
 
@@ -182,6 +183,7 @@ class TelethonClientFactory:
                     if inspect.isawaitable(disconnect_result):
                         await disconnect_result
                 raise PipelineTelegramSessionAuthRequiredError(message)
+            await self._mark_authorized(client=self._client)
             return self._client
 
     def _build_client(self, string_session: SecretStr) -> TelegramClient:
@@ -259,6 +261,39 @@ class TelethonClientFactory:
             row.status = TelegramSessionStatus.AUTH_REQUIRED
             row.last_error_class = error_class[:128]
             row.last_error_text = error_text[:4000]
+            await db_session.commit()
+
+    async def _mark_authorized(self, *, client: TelegramClient) -> None:
+        """Persist heartbeat and safe account projection fields after authorization."""
+
+        account = None
+        get_me = getattr(client, "get_me", None)
+        if get_me is not None:
+            try:
+                account = await get_me()
+            except Exception:
+                account = None
+        session_factory = self._get_session_factory()
+        async with session_factory() as db_session:
+            row = await db_session.scalar(
+                select(TelegramSession)
+                .where(TelegramSession.name == self.session_name)
+                .limit(1),
+            )
+            if row is None:
+                return
+            row.last_heartbeat_at = utcnow()
+            row.last_error_class = None
+            row.last_error_text = None
+            if account is not None:
+                account_user_id = getattr(account, "id", None)
+                account_username = getattr(account, "username", None)
+                account_phone = getattr(account, "phone", None)
+                row.account_user_id = account_user_id if isinstance(account_user_id, int) else None
+                row.account_username = (
+                    account_username.strip() if isinstance(account_username, str) and account_username.strip() else None
+                )
+                row.account_phone_hint = _phone_hint(account_phone if isinstance(account_phone, str) else None)
             await db_session.commit()
 
     def _get_session_factory(self) -> AsyncSessionFactory:
@@ -595,3 +630,12 @@ __all__ = [
 # deliberate so type-checkers that resolve ``events.NewMessage(chats=...)``
 # through the Telethon stubs do not complain about the peer discriminant.
 _ = InputPeerChannel
+
+
+def _phone_hint(phone: str | None) -> str | None:
+    if phone is None:
+        return None
+    digits = "".join(character for character in phone if character.isdigit())
+    if len(digits) < 4:
+        return None
+    return f"ending-{digits[-4:]}"
