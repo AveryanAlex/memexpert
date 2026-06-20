@@ -134,7 +134,7 @@ Tasks that run on a schedule (not event-driven) are managed by APScheduler in a 
 - Meme of the Day selection/cache refresh
 - Scheduled SEO generation batches prioritized by backlog class and stable tie-breakers
 
-The current implementation registers these scheduler jobs with independent enable and interval settings. Source engagement capture, public trend materialized-view refresh, search-index sync, SEO backlog batches, and RabbitMQ outbox publishing contain production behavior; Meme of the Day remains a lightweight placeholder until its product behavior is implemented.
+The current implementation registers these scheduler jobs with independent enable and interval settings. Source engagement capture, public trend materialized-view refresh, Meme of the Day cache refresh, search-index sync, SEO backlog batches, and RabbitMQ outbox publishing contain production behavior.
 
 Source engagement scheduling is stored in PostgreSQL on `meme_sources` and anchored to the Telegram post date. The scheduler only claims due rows and writes `source_engagement_capture_requested` messages through the transactional outbox; worker-side RabbitMQ consumers perform the Telegram fetch and append `meme_source_engagement_snapshots`. Public trends/search popularity are derived from those snapshots plus `analytics_events`, so no pipeline stage writes canonical popularity counters back to `memes` or `meme_sources`.
 

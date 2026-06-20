@@ -147,18 +147,20 @@ pnpm build
 |---|---|---|---|
 | Public trend materialized-view refresh | `SCHEDULER_MATERIALIZED_VIEW_REFRESH_ENABLED` | `SCHEDULER_MATERIALIZED_VIEW_REFRESH_INTERVAL_SECONDS` | `300` seconds |
 | Source engagement capture dispatch | `SCHEDULER_SOURCE_ENGAGEMENT_CAPTURE_ENABLED` | `SCHEDULER_SOURCE_ENGAGEMENT_CAPTURE_INTERVAL_SECONDS` | `21600` seconds |
-| Meme of the Day placeholder | `SCHEDULER_MOTD_ENABLED` | `SCHEDULER_MOTD_INTERVAL_SECONDS` | `86400` seconds |
+| Meme of the Day cache refresh | `SCHEDULER_MOTD_ENABLED` | `SCHEDULER_MOTD_INTERVAL_SECONDS` | `86400` seconds |
 | Search-index sync batches | `SCHEDULER_SEARCH_INDEX_SYNC_ENABLED` | `SCHEDULER_SEARCH_INDEX_SYNC_INTERVAL_SECONDS` | `600` seconds |
 | SEO backlog batches | `SCHEDULER_SEO_BACKLOG_BATCHES_ENABLED` | `SCHEDULER_SEO_BACKLOG_BATCHES_INTERVAL_SECONDS` | `900` seconds |
 | RabbitMQ outbox publisher | `SCHEDULER_RABBITMQ_OUTBOX_PUBLISHER_ENABLED` | `SCHEDULER_RABBITMQ_OUTBOX_PUBLISHER_INTERVAL_SECONDS` | `5` seconds |
 
-The public trend materialized-view refresh, source engagement capture dispatch, search-index sync batches, SEO backlog batches, and RabbitMQ outbox publisher perform real business work. MOTD remains a deliberate no-op placeholder while the product behavior is deferred.
+The public trend materialized-view refresh, source engagement capture dispatch, Meme of the Day refresh, search-index sync batches, SEO backlog batches, and RabbitMQ outbox publisher perform real business work.
 
 Source engagement capture is split between PostgreSQL scheduling and RabbitMQ execution. `meme_sources.next_engagement_check_at` stores the durable due time; the scheduler claims due Telegram sources, writes `source_engagement_capture_requested` outbox rows, and the worker consumes RabbitMQ messages to fetch Telegram counters and append or update `meme_source_engagement_snapshots`. Follow-up cadence is anchored to the Telegram post date: `+1h`, `+3h`, `+12h`, `+1d`, `+3d`, `+7d`, `+1month`, then monthly. The scheduler processes up to `SCHEDULER_SOURCE_ENGAGEMENT_CAPTURE_BATCH_SIZE=100` due sources per run and reclaims stale claims after `SCHEDULER_SOURCE_ENGAGEMENT_CAPTURE_LEASE_TIMEOUT_SECONDS=1800`.
 
 Search-index sync batches process up to `SCHEDULER_SEARCH_INDEX_SYNC_BATCH_SIZE=50` rows per target per run. The job claims `meme_file_sync_target_snapshots` rows for both Qdrant and Meilisearch, commits the `processing` claim before external writes, retries failed rows, reclaims stale `processing` rows after `SCHEDULER_SEARCH_INDEX_SYNC_PROCESSING_TIMEOUT_SECONDS=900`, and reprocesses synced rows when canonical meme/search metadata is newer than `last_success_at`.
 
 SEO backlog batches process up to `SCHEDULER_SEO_BACKLOG_BATCH_SIZE=25` memes per run. The job prioritizes public, non-NSFW memes missing SEO pages, then stale auto-generated pages whose `prompt_version` differs from `PIPELINE_SEO_PROMPT_VERSION`; manually edited pages are skipped.
+
+Meme of the Day refresh writes one row per UTC date and `MOTD_ALGORITHM_VERSION` in `meme_of_the_day_selections`. `GET /api/v1/memes/meme-of-the-day` is public and lazily refreshes only when today's cache row is missing. `POST /api/v1/memes/meme-of-the-day/refresh` requires an admin user and recomputes the same deterministic selection; it is not a manual override. Candidate tuning is settings-backed: `MOTD_ALGORITHM_VERSION=motd_v1`, `MOTD_CANDIDATE_LOOKBACK_DAYS=30`, `MOTD_CANDIDATE_LIMIT=50`, `MOTD_MIN_QUALITY_SCORE=0.5`, and the score weights `MOTD_POPULARITY_WEIGHT=0.35`, `MOTD_TRENDING_GROWTH_WEIGHT=0.30`, `MOTD_NOVELTY_WEIGHT=0.20`, `MOTD_QUALITY_WEIGHT=0.15`. If no public non-NSFW recent high-quality candidate exists, the cache stores a safe fallback row with `meme_id=NULL`, `candidate_count=0`, and `reason=no_candidates`. Manual/admin override remains deferred and is not implemented.
 
 RabbitMQ outbox publisher runs every `SCHEDULER_RABBITMQ_OUTBOX_PUBLISHER_INTERVAL_SECONDS=5` seconds by default. Each run starts or reuses the RabbitMQ pipeline broker, recovers `rabbitmq_outbox_messages.status='publishing'` rows whose `locked_at` is older than `SCHEDULER_RABBITMQ_OUTBOX_PUBLISHER_STALE_TIMEOUT_SECONDS=300`, then publishes up to `SCHEDULER_RABBITMQ_OUTBOX_PUBLISHER_BATCH_SIZE=100` due `pending`/`failed` rows by their stored `exchange`, `routing_key`, JSON payload, headers, and stable `message_id`. This is the production path for accepted raw-upload `media_inspect_requested` events, post-materialization transcode dispatches, stage fan-out, replay, and sync-success notifications.
 
@@ -173,8 +175,8 @@ The scheduler emits structured stdout logs by default. Operators should watch fo
 - `scheduler_job_started`, `scheduler_job_succeeded`, and `scheduler_job_failed` with `job_id` and `duration_seconds` for each run.
 - `scheduler_job_batch_result` with `job_id`, `scanned`, `updated`, `failed`, `skipped`, and `duration_seconds` for search-index and SEO batch runs; the outbox publisher uses the same event with `recovered`, `claimed`, `published`, `failed`, and `duration_seconds`.
 - `scheduler_job_batch_result` with `job_id=source-engagement-capture`, `claimed`, and `enqueued` for source engagement dispatch runs.
+- `scheduler_job_batch_result` with `job_id=motd`, `candidate_count`, `selected_meme_id`, `reason`, `algorithm_version`, and `refreshed_at` for Meme of the Day refresh runs.
 - `public_trend_mv_concurrent_refresh_fallback` with `view_name` when a concurrent materialized-view refresh cannot run and the scheduler retries without `CONCURRENTLY`.
-- `scheduler_job_placeholder_completed` for MOTD.
 - `scheduler_instance_lock_unavailable` if another scheduler instance already holds the advisory lock.
 - `scheduler_advisory_lock_disabled` only when `SCHEDULER_ADVISORY_LOCK_ENABLED=false`.
 

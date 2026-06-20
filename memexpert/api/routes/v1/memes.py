@@ -13,11 +13,13 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Path, Query, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from memexpert.api.dependencies import (
+    AdminUserDep,
     AnalyticsServiceDep,
     AutoGuestUserDep,
     CollectionServiceDep,
     CurrentUserDep,
     FullAccountUserDep,
+    MemeOfTheDayServiceDep,
     MemeReportServiceDep,
     MemeSearchServiceDep,
     OptionalCurrentUserDep,
@@ -30,6 +32,7 @@ from memexpert.schemas.meme import (
     MemeSlugRedirectRead,
     PublicMemeDetailRead,
     PublicMemeLandingRead,
+    PublicMemeOfTheDayRead,
     PublicMemePopularitySummaryRead,
     PublicMemeSearchPageRead,
     PublicMemeSearchResultRead,
@@ -348,6 +351,29 @@ async def home_feed_memes(
         offset=offset,
         surface="public_api_home_feed",
     )
+
+
+@router.get("/meme-of-the-day", response_model=PublicMemeOfTheDayRead, summary="Read Meme of the Day")
+async def get_meme_of_the_day(
+    meme_of_the_day_service: MemeOfTheDayServiceDep,
+) -> PublicMemeOfTheDayRead:
+    """Return today's public safe Meme of the Day, refreshing the cache on miss."""
+
+    return await meme_of_the_day_service.get_today(surface="web_home")
+
+
+@router.post(
+    "/meme-of-the-day/refresh",
+    response_model=PublicMemeOfTheDayRead,
+    summary="Refresh Meme of the Day",
+)
+async def refresh_meme_of_the_day(
+    meme_of_the_day_service: MemeOfTheDayServiceDep,
+    _admin_user: AdminUserDep,
+) -> PublicMemeOfTheDayRead:
+    """Force a deterministic MOTD recompute without any manual override."""
+
+    return await meme_of_the_day_service.refresh(surface="web_home")
 
 
 @router.get("/trending", response_model=PublicMemeSearchPageRead, summary="Browse trending memes")

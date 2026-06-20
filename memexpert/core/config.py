@@ -168,6 +168,14 @@ class Settings(BaseSettings):
     scheduler_source_engagement_capture_lease_timeout_seconds: float = Field(default=1800.0, gt=0.0)
     scheduler_motd_enabled: bool = True
     scheduler_motd_interval_seconds: float = Field(default=86400.0, gt=0.0)
+    motd_algorithm_version: str = Field(default="motd_v1", min_length=1, max_length=64)
+    motd_candidate_lookback_days: int = Field(default=30, ge=1, le=365)
+    motd_candidate_limit: int = Field(default=50, ge=1, le=500)
+    motd_min_quality_score: float = Field(default=0.5, ge=0.0, le=1.0)
+    motd_popularity_weight: float = Field(default=0.35, ge=0.0, le=1000.0)
+    motd_trending_growth_weight: float = Field(default=0.30, ge=0.0, le=1000.0)
+    motd_novelty_weight: float = Field(default=0.20, ge=0.0, le=1000.0)
+    motd_quality_weight: float = Field(default=0.15, ge=0.0, le=1000.0)
     scheduler_search_index_sync_enabled: bool = True
     scheduler_search_index_sync_interval_seconds: float = Field(default=600.0, gt=0.0)
     scheduler_search_index_sync_batch_size: int = Field(default=50, ge=1, le=1000)
@@ -486,6 +494,17 @@ class Settings(BaseSettings):
             raise ValueError("scheduler_advisory_lock_key must contain only integers.") from exc
 
         return normalized_key
+
+    @field_validator("motd_algorithm_version", mode="before")
+    @classmethod
+    def _normalize_motd_algorithm_version(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+
+        normalized_value = value.strip()
+        if not normalized_value:
+            raise ValueError("motd_algorithm_version must not be blank.")
+        return normalized_value
 
     @field_validator("auth_telegram_bot_username", mode="before")
     @classmethod

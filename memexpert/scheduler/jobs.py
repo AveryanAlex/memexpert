@@ -13,6 +13,10 @@ from memexpert.messaging.rabbitmq_outbox_runtime import (
     rabbitmq_outbox_publisher_result_log_extra,
     run_rabbitmq_outbox_publisher_batch,
 )
+from memexpert.services.meme_of_the_day import (
+    meme_of_the_day_result_log_extra,
+    run_scheduler_meme_of_the_day_refresh,
+)
 from memexpert.services.public_trends import refresh_public_trend_materialized_views
 from memexpert.services.scheduler_batch_jobs import (
     run_scheduler_search_index_sync_batch,
@@ -69,9 +73,9 @@ def build_scheduler_job_definitions(settings: Settings, engine: AsyncEngine) -> 
         SchedulerJobDefinition(
             id=JOB_ID_MOTD,
             trigger_seconds=settings.scheduler_motd_interval_seconds,
-            action=_build_placeholder_job_action(JOB_ID_MOTD),
+            action=_build_motd_job_action(settings, engine),
             enabled=settings.scheduler_motd_enabled,
-            description="Refresh the message of the day.",
+            description="Refresh Meme of the Day selection.",
         ),
         SchedulerJobDefinition(
             id=JOB_ID_SEARCH_INDEX_SYNC,
@@ -130,16 +134,6 @@ async def run_logged_job(job_id: str, action: SchedulerJobAction) -> None:
     )
 
 
-def _build_placeholder_job_action(job_id: str) -> SchedulerJobAction:
-    async def _action() -> None:
-        logger.info(
-            "scheduler_job_placeholder_completed",
-            extra={"event": "scheduler_job_placeholder_completed", "job_id": job_id},
-        )
-
-    return _action
-
-
 def _build_source_engagement_capture_job_action(settings: Settings, engine: AsyncEngine) -> SchedulerJobAction:
     async def _action() -> None:
         session_factory = build_async_session_factory(engine)
@@ -150,6 +144,18 @@ def _build_source_engagement_capture_job_action(settings: Settings, engine: Asyn
                 JOB_ID_SOURCE_ENGAGEMENT_CAPTURE,
                 result,
             ),
+        )
+
+    return _action
+
+
+def _build_motd_job_action(settings: Settings, engine: AsyncEngine) -> SchedulerJobAction:
+    async def _action() -> None:
+        session_factory = build_async_session_factory(engine)
+        result = await run_scheduler_meme_of_the_day_refresh(session_factory, settings=settings)
+        logger.info(
+            "scheduler_job_batch_result",
+            extra=meme_of_the_day_result_log_extra(JOB_ID_MOTD, result),
         )
 
     return _action

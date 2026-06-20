@@ -162,6 +162,14 @@ def test_settings_parse_scheduler_contracts() -> None:
             "scheduler_source_engagement_capture_batch_size": 7,
             "scheduler_source_engagement_capture_lease_timeout_seconds": 45.0,
             "scheduler_motd_interval_seconds": 300.0,
+            "motd_algorithm_version": " motd_test_v2 ",
+            "motd_candidate_lookback_days": 14,
+            "motd_candidate_limit": 25,
+            "motd_min_quality_score": 0.75,
+            "motd_popularity_weight": 0.4,
+            "motd_trending_growth_weight": 0.3,
+            "motd_novelty_weight": 0.2,
+            "motd_quality_weight": 0.1,
             "scheduler_search_index_sync_interval_seconds": 180.0,
             "scheduler_search_index_sync_batch_size": 7,
             "scheduler_search_index_sync_processing_timeout_seconds": 45.0,
@@ -178,6 +186,14 @@ def test_settings_parse_scheduler_contracts() -> None:
     assert settings.scheduler_source_engagement_capture_batch_size == 7
     assert settings.scheduler_source_engagement_capture_lease_timeout_seconds == 45.0
     assert settings.scheduler_motd_interval_seconds == 300.0
+    assert settings.motd_algorithm_version == "motd_test_v2"
+    assert settings.motd_candidate_lookback_days == 14
+    assert settings.motd_candidate_limit == 25
+    assert settings.motd_min_quality_score == 0.75
+    assert settings.motd_popularity_weight == 0.4
+    assert settings.motd_trending_growth_weight == 0.3
+    assert settings.motd_novelty_weight == 0.2
+    assert settings.motd_quality_weight == 0.1
     assert settings.scheduler_search_index_sync_interval_seconds == 180.0
     assert settings.scheduler_search_index_sync_batch_size == 7
     assert settings.scheduler_search_index_sync_processing_timeout_seconds == 45.0
@@ -199,6 +215,14 @@ def test_settings_scheduler_source_engagement_defaults_match_design() -> None:
 def test_settings_scheduler_batch_job_defaults_match_design() -> None:
     settings = Settings()
 
+    assert settings.motd_algorithm_version == "motd_v1"
+    assert settings.motd_candidate_lookback_days == 30
+    assert settings.motd_candidate_limit == 50
+    assert settings.motd_min_quality_score == 0.5
+    assert settings.motd_popularity_weight == 0.35
+    assert settings.motd_trending_growth_weight == 0.30
+    assert settings.motd_novelty_weight == 0.20
+    assert settings.motd_quality_weight == 0.15
     assert settings.scheduler_search_index_sync_batch_size == 50
     assert settings.scheduler_search_index_sync_processing_timeout_seconds == 900.0
     assert settings.scheduler_seo_backlog_batch_size == 25
@@ -210,11 +234,20 @@ def test_settings_scheduler_batch_job_defaults_match_design() -> None:
         ("scheduler_search_index_sync_batch_size", 0),
         ("scheduler_search_index_sync_processing_timeout_seconds", 0.0),
         ("scheduler_seo_backlog_batch_size", 0),
+        ("motd_candidate_lookback_days", 0),
+        ("motd_candidate_limit", 0),
+        ("motd_min_quality_score", -0.1),
+        ("motd_popularity_weight", -0.1),
     ],
 )
 def test_settings_reject_invalid_scheduler_batch_job_settings(field_name: str, bad_value: object) -> None:
     with pytest.raises(ValidationError):
         _ = Settings.model_validate({field_name: bad_value})
+
+
+def test_settings_reject_blank_motd_algorithm_version() -> None:
+    with pytest.raises(ValidationError, match="motd_algorithm_version"):
+        _ = Settings.model_validate({"motd_algorithm_version": "   "})
 
 
 def test_settings_require_imgproxy_key_and_salt_together() -> None:
