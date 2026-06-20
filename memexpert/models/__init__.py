@@ -23,6 +23,7 @@ from memexpert.models.content import (
     PipelineStageJournal,
     RabbitMQOutboxMessage,
     SourceChannel,
+    TelegramAdminAuditLog,
     TelegramFileIdCache,
     TelegramSession,
 )
@@ -138,6 +139,7 @@ __all__ = [
     "SourcePlatform",
     "SyncTargetKind",
     "SyncTargetStatus",
+    "TelegramAdminAuditLog",
     "TelegramFileIdCache",
     "TelegramLinkCode",
     "TelegramMediaFormat",

@@ -2,16 +2,23 @@ import { describe, expect, it, vi } from 'vitest';
 
 import {
   addSourceChannel,
+  addAdminTelegramChannel,
+  assignAdminTelegramChannel,
   ApiError,
   createBlockedPerceptualHash,
+  createAdminTelegramSession,
   createCollection,
   createCollectionInvite,
   deactivateBlockedPerceptualHash,
+  deleteAdminTelegramSession,
   deleteBlockedPerceptualHash,
   deleteCollection,
   favoriteMeme,
   fetchAdminDashboard,
   fetchAdminSession,
+  fetchAdminTelegramChannelGroups,
+  fetchAdminTelegramChannels,
+  fetchAdminTelegramSessions,
   fetchCollectionDetail,
   fetchCollections,
   fetchCurrentSession,
@@ -42,6 +49,7 @@ import {
   removeCollectionMember,
   removeMemeFromCollection,
   removeSavedMeme,
+  orphanAdminTelegramChannel,
   reorderPins,
   reportMeme,
   resolveModerationReport,
@@ -53,10 +61,13 @@ import {
   unfavoriteMeme,
   unpinMeme,
   updateActiveSaveCollection,
+  updateAdminTelegramChannel,
+  updateAdminTelegramSession,
   updateBlockedPerceptualHash,
   updateCollectionMemberRole,
   updateMemeModeration,
   updateUserPreferences,
+  validateAdminTelegramSession,
   type ApiFetch
 } from './client';
 import type { MemeActionAttribution } from '$lib/memeActions';
@@ -974,6 +985,94 @@ describe('admin API client', () => {
     expect(mockFetch).toHaveBeenCalledOnce();
   });
 
+  it('uses DB-backed Telegram session and channel admin endpoints', async () => {
+    const sessionId = '11111111-1111-4111-8111-111111111111';
+    const channelId = '22222222-2222-4222-8222-222222222222';
+    const calls: Array<{ method: string; path: string; search: string; body: unknown; requestedWith: string | null }> = [];
+    const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const headers = new Headers(init?.headers);
+      calls.push({
+        method: init?.method ?? 'GET',
+        path: url.pathname,
+        search: url.searchParams.toString(),
+        body: init?.body ? JSON.parse(String(init.body)) : null,
+        requestedWith: headers.get('x-requested-with')
+      });
+
+      if (url.pathname === '/api/v1/admin/telegram/sessions' && (init?.method ?? 'GET') === 'GET') {
+        return jsonResponse([telegramSessionPayload(sessionId)]);
+      }
+      if (url.pathname === '/api/v1/admin/telegram/sessions' && init?.method === 'POST') {
+        return jsonResponse(telegramSessionPayload(sessionId), 201);
+      }
+      if (url.pathname.endsWith('/validate')) {
+        return jsonResponse({ telegram_session: telegramSessionPayload(sessionId), channel_checked: true, channel_reference: '@source' });
+      }
+      if (url.pathname === `/api/v1/admin/telegram/sessions/${sessionId}` && init?.method === 'DELETE') {
+        return jsonResponse({ action: 'delete', telegram_session_id: sessionId, orphaned_source_channel_count: 1, message: 'deleted' });
+      }
+      if (url.pathname === `/api/v1/admin/telegram/sessions/${sessionId}`) {
+        return jsonResponse(telegramSessionPayload(sessionId));
+      }
+      if (url.pathname === '/api/v1/admin/telegram/channels/grouped') {
+        return jsonResponse([{ telegram_session: telegramSessionPayload(sessionId), is_orphaned: false, channels: [telegramChannelPayload(channelId, sessionId)] }]);
+      }
+      if (url.pathname === '/api/v1/admin/telegram/channels' && (init?.method ?? 'GET') === 'GET') {
+        expect(url.searchParams.get('telegram_session_id')).toBe(sessionId);
+        expect(url.searchParams.get('orphaned')).toBe('false');
+        return jsonResponse([telegramChannelPayload(channelId, sessionId)]);
+      }
+      return jsonResponse(telegramChannelPayload(channelId, sessionId));
+    }) satisfies ApiFetch;
+
+    await fetchAdminTelegramSessions({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', cookieHeader: 'memexpert_access_token=token' });
+    await createAdminTelegramSession({
+      fetch: mockFetch,
+      baseUrl: 'https://api.memexpert.test',
+      body: { name: 'primary', string_session: 'secret-session', validate: true, enabled: true, live_enabled: true, catchup_enabled: true, engagement_enabled: true, max_requests_per_second: 1 }
+    });
+    await updateAdminTelegramSession(
+      { fetch: mockFetch, baseUrl: 'https://api.memexpert.test', body: { enabled: false, status: 'quarantined', max_requests_per_second: 0.5, clear_error: true, note: 'pause' } },
+      sessionId
+    );
+    await validateAdminTelegramSession({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', body: { source_channel_id: channelId, note: 'check' } }, sessionId);
+    await deleteAdminTelegramSession({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', body: { confirmation: sessionId, note: 'remove' } }, sessionId);
+    await fetchAdminTelegramChannels({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', telegramSessionId: sessionId, orphaned: false });
+    await fetchAdminTelegramChannelGroups({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test' });
+    await addAdminTelegramChannel({
+      fetch: mockFetch,
+      baseUrl: 'https://api.memexpert.test',
+      body: { platform: 'telegram', platform_id: '-1001', title: 'Source', telegram_session_id: sessionId, catchup_enabled: true, live_enabled: true, engagement_enabled: true, catchup_message_limit: 500 }
+    });
+    await updateAdminTelegramChannel({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', body: { catchup_enabled: false, live_enabled: true, engagement_enabled: false, catchup_message_limit: 250 } }, channelId);
+    await assignAdminTelegramChannel({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', body: { telegram_session_id: sessionId, note: 'move' } }, channelId);
+    await orphanAdminTelegramChannel({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', body: { note: 'orphan' } }, channelId);
+
+    expect(calls.map((call) => [call.method, call.path, call.search])).toEqual([
+      ['GET', '/api/v1/admin/telegram/sessions', ''],
+      ['POST', '/api/v1/admin/telegram/sessions', ''],
+      ['PATCH', `/api/v1/admin/telegram/sessions/${sessionId}`, ''],
+      ['POST', `/api/v1/admin/telegram/sessions/${sessionId}/validate`, ''],
+      ['DELETE', `/api/v1/admin/telegram/sessions/${sessionId}`, ''],
+      ['GET', '/api/v1/admin/telegram/channels', `telegram_session_id=${sessionId}&orphaned=false`],
+      ['GET', '/api/v1/admin/telegram/channels/grouped', ''],
+      ['POST', '/api/v1/admin/telegram/channels', ''],
+      ['PATCH', `/api/v1/admin/telegram/channels/${channelId}`, ''],
+      ['POST', `/api/v1/admin/telegram/channels/${channelId}/assign`, ''],
+      ['POST', `/api/v1/admin/telegram/channels/${channelId}/orphan`, '']
+    ]);
+    expect(calls[0].requestedWith).toBe(null);
+    expect([1, 2, 3, 4, 7, 8, 9, 10].every((index) => calls[index]?.requestedWith === 'XMLHttpRequest')).toBe(true);
+    expect(calls[5].requestedWith).toBe(null);
+    expect(calls[6].requestedWith).toBe(null);
+    expect(calls[1].body).toMatchObject({ name: 'primary', string_session: 'secret-session', validate: true });
+    expect(calls[4].body).toEqual({ confirmation: sessionId, note: 'remove' });
+    expect(calls[7].body).toMatchObject({ platform: 'telegram', telegram_session_id: sessionId });
+    expect(calls[9].body).toEqual({ telegram_session_id: sessionId, note: 'move' });
+    expect(calls[10].body).toEqual({ note: 'orphan' });
+  });
+
   it('loads moderation reports and decision history with the admin dashboard', async () => {
     const calls: string[] = [];
     const mockFetch = vi.fn(async (input: RequestInfo | URL) => {
@@ -1360,6 +1459,61 @@ function blockedPhashPayload(overrides: { id: string }) {
     note: null,
     is_active: true,
     created_by_admin_user_id: '11111111-1111-4111-8111-111111111111',
+    created_at: '2026-01-01T00:00:00Z',
+    updated_at: '2026-01-01T00:00:00Z'
+  };
+}
+
+function telegramSessionPayload(id: string) {
+  return {
+    id,
+    name: 'primary',
+    display_name: 'Primary ingest',
+    owned_channel_count: 1,
+    status: 'active',
+    enabled: true,
+    flood_wait_until: null,
+    live_listener_started_at: '2026-01-01T00:00:00Z',
+    last_heartbeat_at: '2026-01-01T00:05:00Z',
+    last_error_class: null,
+    last_error_text: null,
+    quarantined_at: null,
+    live_enabled: true,
+    catchup_enabled: true,
+    engagement_enabled: true,
+    max_requests_per_second: 1,
+    account_user_id: 123,
+    account_username: 'primary_user',
+    account_phone_hint: '+1***1234',
+    has_string_session: true,
+    created_at: '2026-01-01T00:00:00Z',
+    updated_at: '2026-01-01T00:00:00Z'
+  };
+}
+
+function telegramChannelPayload(id: string, sessionId: string | null) {
+  return {
+    id,
+    platform: 'telegram',
+    platform_id: '-1001',
+    username: 'source',
+    title: 'Source',
+    subscriber_count: 1000,
+    is_active: true,
+    is_paused: false,
+    catchup_enabled: sessionId !== null,
+    live_enabled: sessionId !== null,
+    engagement_enabled: sessionId !== null,
+    catchup_message_limit: 500,
+    telegram_session_id: sessionId,
+    telegram_session_name: sessionId === null ? null : 'primary',
+    is_orphaned: sessionId === null,
+    is_indexable: sessionId !== null,
+    last_read_post_id: null,
+    last_fetched_at: null,
+    operational_status: 'active',
+    freshness_status: 'never_fetched',
+    seconds_since_last_fetch: null,
     created_at: '2026-01-01T00:00:00Z',
     updated_at: '2026-01-01T00:00:00Z'
   };

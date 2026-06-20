@@ -76,6 +76,7 @@ export interface TelegramLinkStartRead {
 }
 export type SourcePlatform = 'reddit' | 'telegram' | 'vk';
 export type ChannelSuggestionStatus = 'approved' | 'pending' | 'rejected';
+export type TelegramSessionStatus = 'active' | 'auth_required' | 'flood_wait' | 'quarantined' | 'stopped';
 export type ModerationReportStatus = 'pending' | 'in_review' | 'resolved' | 'dismissed';
 export type ModerationReason = 'copyright' | 'harassment' | 'illegal' | 'nsfw' | 'other' | 'spam';
 export type ModerationAction =
@@ -571,6 +572,8 @@ export interface AdminSourceChannelRead {
   catchup_message_limit: number;
   telegram_session_id: string | null;
   telegram_session_name: string | null;
+  is_orphaned: boolean;
+  is_indexable: boolean;
   last_read_post_id: string | null;
   last_fetched_at: string | null;
   operational_status: 'active' | 'inactive' | 'paused';
@@ -578,6 +581,121 @@ export interface AdminSourceChannelRead {
   seconds_since_last_fetch: number | null;
   created_at: string;
   updated_at: string;
+}
+
+export interface AdminTelegramSessionRead {
+  id: string;
+  name: string;
+  display_name: string;
+  owned_channel_count: number;
+  status: TelegramSessionStatus;
+  enabled: boolean;
+  flood_wait_until: string | null;
+  live_listener_started_at: string | null;
+  last_heartbeat_at: string | null;
+  last_error_class: string | null;
+  last_error_text: string | null;
+  quarantined_at: string | null;
+  live_enabled: boolean;
+  catchup_enabled: boolean;
+  engagement_enabled: boolean;
+  max_requests_per_second: number;
+  account_user_id: number | null;
+  account_username: string | null;
+  account_phone_hint: string | null;
+  has_string_session: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AdminTelegramChannelGroupRead {
+  telegram_session: AdminTelegramSessionRead | null;
+  is_orphaned: boolean;
+  channels: AdminSourceChannelRead[];
+}
+
+export interface AdminTelegramSessionCreatePayload {
+  name: string;
+  display_name?: string | null;
+  string_session?: string | null;
+  validate?: boolean;
+  enabled: boolean;
+  live_enabled: boolean;
+  catchup_enabled: boolean;
+  engagement_enabled: boolean;
+  max_requests_per_second: number;
+  account_user_id?: number | null;
+  account_username?: string | null;
+  account_phone_hint?: string | null;
+  note?: string | null;
+}
+
+export interface AdminTelegramSessionUpdatePayload {
+  display_name?: string;
+  enabled?: boolean;
+  status?: TelegramSessionStatus;
+  live_enabled?: boolean;
+  catchup_enabled?: boolean;
+  engagement_enabled?: boolean;
+  max_requests_per_second?: number;
+  flood_wait_until?: string | null;
+  last_error_class?: string | null;
+  last_error_text?: string | null;
+  clear_error?: boolean;
+  note?: string | null;
+}
+
+export interface AdminTelegramSessionValidatePayload {
+  source_channel_id?: string | null;
+  note?: string | null;
+}
+
+export interface AdminTelegramSessionValidateRead {
+  telegram_session: AdminTelegramSessionRead;
+  channel_checked: boolean;
+  channel_reference: string | null;
+}
+
+export interface AdminTelegramSessionDeletePayload {
+  confirmation: string;
+  note?: string | null;
+}
+
+export interface AdminTelegramSessionActionRead {
+  action: 'delete';
+  telegram_session_id: string;
+  orphaned_source_channel_count: number;
+  message: string;
+}
+
+export interface AdminTelegramChannelCreatePayload {
+  platform: 'telegram';
+  platform_id: string;
+  username?: string | null;
+  title: string;
+  subscriber_count?: number | null;
+  telegram_session_id?: string | null;
+  orphaned?: boolean;
+  catchup_enabled: boolean;
+  live_enabled: boolean;
+  engagement_enabled: boolean;
+  catchup_message_limit: number;
+}
+
+export interface AdminTelegramChannelUpdatePayload {
+  catchup_enabled?: boolean;
+  live_enabled?: boolean;
+  engagement_enabled?: boolean;
+  catchup_message_limit?: number;
+}
+
+export interface AdminTelegramChannelAssignPayload {
+  telegram_session_id: string;
+  note?: string | null;
+}
+
+export interface AdminTelegramChannelOrphanPayload {
+  note?: string | null;
 }
 
 export interface AdminMemeTemplateRead {

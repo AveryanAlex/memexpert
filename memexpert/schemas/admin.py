@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, StrictBool, StrictInt, field_validator, model_validator
 
 from memexpert.core.perceptual_hashes import (
     DEFAULT_PERCEPTUAL_HASH_ALGORITHM,
@@ -24,6 +24,7 @@ from memexpert.models.enums import (
     ModerationReason,
     ModerationReportStatus,
     SourcePlatform,
+    TelegramSessionStatus,
 )
 from memexpert.schemas._text import normalize_optional_text, normalize_required_text
 from memexpert.schemas.base import ORMSchema
@@ -38,6 +39,10 @@ MAX_TEMPLATE_SLUG_LENGTH = 255
 MAX_TEMPLATE_NAME_LENGTH = 255
 MAX_DESTRUCTIVE_CONFIRMATION_LENGTH = 128
 MAX_HASH_ALGORITHM_LENGTH = 32
+MAX_TELEGRAM_ACCOUNT_USERNAME_LENGTH = 255
+MAX_TELEGRAM_ACCOUNT_PHONE_HINT_LENGTH = 64
+MAX_ADMIN_TELEGRAM_ERROR_CLASS_LENGTH = 128
+MAX_ADMIN_TELEGRAM_ERROR_TEXT_LENGTH = 4000
 
 
 class AdminSessionRead(BaseModel):
@@ -78,6 +83,8 @@ class AdminSourceChannelRead(ORMSchema):
     catchup_message_limit: int
     telegram_session_id: uuid.UUID | None
     telegram_session_name: str | None
+    is_orphaned: bool
+    is_indexable: bool
     last_read_post_id: str | None
     last_fetched_at: datetime | None
     operational_status: Literal["active", "inactive", "paused"]
@@ -97,7 +104,9 @@ class AdminSourceChannelCreateRequest(BaseModel):
     username: str | None = Field(default=None, max_length=MAX_SOURCE_USERNAME_LENGTH)
     title: str = Field(min_length=1, max_length=MAX_SOURCE_TITLE_LENGTH)
     subscriber_count: int | None = Field(default=None, ge=0)
+    telegram_session_id: uuid.UUID | None = None
     telegram_session_name: str | None = Field(default=None, max_length=MAX_TELEGRAM_SESSION_NAME_LENGTH)
+    orphaned: StrictBool = False
     catchup_enabled: StrictBool = True
     live_enabled: StrictBool = True
     engagement_enabled: StrictBool = True
@@ -112,6 +121,233 @@ class AdminSourceChannelCreateRequest(BaseModel):
     @classmethod
     def _normalize_optional_text(cls, value: str | None) -> str | None:
         return normalize_optional_text(value)
+
+    @model_validator(mode="after")
+    def _check_assignment_shape(self) -> AdminSourceChannelCreateRequest:
+        if self.orphaned and (self.telegram_session_id is not None or self.telegram_session_name is not None):
+            raise ValueError("orphaned source channels cannot also specify a Telegram session target.")
+        if self.telegram_session_id is not None and self.telegram_session_name is not None:
+            raise ValueError("Specify telegram_session_id or telegram_session_name, not both.")
+        return self
+
+
+class AdminSourceChannelUpdateRequest(BaseModel):
+    """Patch source-channel crawling/indexing controls."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    catchup_enabled: StrictBool | None = None
+    live_enabled: StrictBool | None = None
+    engagement_enabled: StrictBool | None = None
+    catchup_message_limit: StrictInt | None = Field(default=None, ge=1, le=10000)
+
+    @model_validator(mode="after")
+    def _require_patch_field(self) -> AdminSourceChannelUpdateRequest:
+        if not self.model_fields_set:
+            raise ValueError("At least one source-channel field must be supplied.")
+        return self
+
+
+class AdminSourceChannelAssignRequest(BaseModel):
+    """Move one source channel to a concrete DB-backed Telegram session."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    telegram_session_id: uuid.UUID
+    note: str | None = Field(default=None, max_length=MAX_ADMIN_NOTE_LENGTH)
+
+    @field_validator("note")
+    @classmethod
+    def _normalize_note(cls, value: str | None) -> str | None:
+        return normalize_optional_text(value)
+
+
+class AdminSourceChannelOrphanRequest(BaseModel):
+    """Explicitly orphan a source channel and disable all crawler controls."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    note: str | None = Field(default=None, max_length=MAX_ADMIN_NOTE_LENGTH)
+
+    @field_validator("note")
+    @classmethod
+    def _normalize_note(cls, value: str | None) -> str | None:
+        return normalize_optional_text(value)
+
+
+class AdminTelegramSessionRead(ORMSchema):
+    """Secret-free admin projection for DB-backed Telegram sessions."""
+
+    model_config = ConfigDict(extra="forbid", from_attributes=True)
+
+    id: uuid.UUID
+    name: str
+    display_name: str
+    owned_channel_count: int = Field(ge=0)
+    status: TelegramSessionStatus
+    enabled: bool
+    flood_wait_until: datetime | None
+    live_listener_started_at: datetime | None
+    last_heartbeat_at: datetime | None
+    last_error_class: str | None
+    last_error_text: str | None
+    quarantined_at: datetime | None
+    live_enabled: bool
+    catchup_enabled: bool
+    engagement_enabled: bool
+    max_requests_per_second: float = Field(gt=0)
+    account_user_id: int | None
+    account_username: str | None
+    account_phone_hint: str | None
+    has_string_session: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+class AdminTelegramSessionCreateRequest(BaseModel):
+    """Create/import a DB-backed Telegram session row without returning secret material."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    name: str = Field(min_length=1, max_length=MAX_TELEGRAM_SESSION_NAME_LENGTH)
+    display_name: str | None = Field(default=None, max_length=MAX_SOURCE_TITLE_LENGTH)
+    string_session: SecretStr | None = None
+    validate_session: StrictBool = Field(default=False, alias="validate")
+    enabled: StrictBool = True
+    live_enabled: StrictBool = True
+    catchup_enabled: StrictBool = True
+    engagement_enabled: StrictBool = True
+    max_requests_per_second: float = Field(default=1.0, gt=0)
+    account_user_id: int | None = Field(default=None, ge=1)
+    account_username: str | None = Field(default=None, max_length=MAX_TELEGRAM_ACCOUNT_USERNAME_LENGTH)
+    account_phone_hint: str | None = Field(default=None, max_length=MAX_TELEGRAM_ACCOUNT_PHONE_HINT_LENGTH)
+    note: str | None = Field(default=None, max_length=MAX_ADMIN_NOTE_LENGTH)
+
+    @field_validator("name")
+    @classmethod
+    def _normalize_name(cls, value: str) -> str:
+        return normalize_required_text(value)
+
+    @field_validator("display_name")
+    @classmethod
+    def _normalize_display_name(cls, value: str | None) -> str | None:
+        return normalize_optional_text(value)
+
+    @field_validator("account_username", "account_phone_hint", "note")
+    @classmethod
+    def _normalize_optional_text(cls, value: str | None) -> str | None:
+        return normalize_optional_text(value)
+
+    @field_validator("string_session")
+    @classmethod
+    def _normalize_string_session(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is None:
+            return None
+        raw_value = value.get_secret_value().strip()
+        if not raw_value:
+            raise ValueError("string_session must not be blank when provided.")
+        return SecretStr(raw_value)
+
+
+class AdminTelegramSessionUpdateRequest(BaseModel):
+    """Patch session status and crawler policy toggles."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    display_name: str | None = Field(default=None, max_length=MAX_SOURCE_TITLE_LENGTH)
+    enabled: StrictBool | None = None
+    status: TelegramSessionStatus | None = None
+    live_enabled: StrictBool | None = None
+    catchup_enabled: StrictBool | None = None
+    engagement_enabled: StrictBool | None = None
+    max_requests_per_second: float | None = Field(default=None, gt=0)
+    flood_wait_until: datetime | None = None
+    last_error_class: str | None = Field(default=None, max_length=MAX_ADMIN_TELEGRAM_ERROR_CLASS_LENGTH)
+    last_error_text: str | None = Field(default=None, max_length=MAX_ADMIN_TELEGRAM_ERROR_TEXT_LENGTH)
+    clear_error: StrictBool = False
+    note: str | None = Field(default=None, max_length=MAX_ADMIN_NOTE_LENGTH)
+
+    @field_validator("display_name")
+    @classmethod
+    def _normalize_display_name(cls, value: str | None) -> str | None:
+        return normalize_optional_text(value)
+
+    @field_validator("last_error_class", "last_error_text", "note")
+    @classmethod
+    def _normalize_optional_text(cls, value: str | None) -> str | None:
+        return normalize_optional_text(value)
+
+    @model_validator(mode="after")
+    def _require_patch_field(self) -> AdminTelegramSessionUpdateRequest:
+        if not (self.model_fields_set - {"note"}):
+            raise ValueError("At least one Telegram session field must be supplied.")
+        if "display_name" in self.model_fields_set and self.display_name is None:
+            raise ValueError("display_name cannot be null.")
+        return self
+
+
+class AdminTelegramSessionValidateRequest(BaseModel):
+    """Validate a stored Telegram StringSession and optionally check a source channel."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source_channel_id: uuid.UUID | None = None
+    note: str | None = Field(default=None, max_length=MAX_ADMIN_NOTE_LENGTH)
+
+    @field_validator("note")
+    @classmethod
+    def _normalize_note(cls, value: str | None) -> str | None:
+        return normalize_optional_text(value)
+
+
+class AdminTelegramSessionValidateRead(BaseModel):
+    """Result of a successful stored-session validation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    telegram_session: AdminTelegramSessionRead
+    channel_checked: bool
+    channel_reference: str | None = None
+
+
+class AdminTelegramSessionDeleteRequest(BaseModel):
+    """Explicit confirmation payload for deleting a Telegram session."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    confirmation: str = Field(min_length=1, max_length=MAX_DESTRUCTIVE_CONFIRMATION_LENGTH)
+    note: str | None = Field(default=None, max_length=MAX_ADMIN_NOTE_LENGTH)
+
+    @field_validator("confirmation")
+    @classmethod
+    def _normalize_confirmation(cls, value: str) -> str:
+        return normalize_required_text(value)
+
+    @field_validator("note")
+    @classmethod
+    def _normalize_note(cls, value: str | None) -> str | None:
+        return normalize_optional_text(value)
+
+
+class AdminTelegramSessionActionRead(BaseModel):
+    """Result of a Telegram session destructive/admin action."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["delete"]
+    telegram_session_id: uuid.UUID
+    orphaned_source_channel_count: int = Field(ge=0)
+    message: str
+
+
+class AdminTelegramChannelGroupRead(BaseModel):
+    """Channels grouped by assigned Telegram session plus the orphaned group."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    telegram_session: AdminTelegramSessionRead | None
+    is_orphaned: bool
+    channels: list[AdminSourceChannelRead]
 
 
 class AdminMemeTemplateRead(ORMSchema):
@@ -543,8 +779,19 @@ __all__ = [
     "AdminModerationReportRead",
     "AdminModerationReportResolveRequest",
     "AdminSessionRead",
+    "AdminSourceChannelAssignRequest",
     "AdminSourceChannelCreateRequest",
+    "AdminSourceChannelOrphanRequest",
     "AdminSourceChannelRead",
+    "AdminSourceChannelUpdateRequest",
+    "AdminTelegramChannelGroupRead",
+    "AdminTelegramSessionActionRead",
+    "AdminTelegramSessionCreateRequest",
+    "AdminTelegramSessionDeleteRequest",
+    "AdminTelegramSessionRead",
+    "AdminTelegramSessionUpdateRequest",
+    "AdminTelegramSessionValidateRead",
+    "AdminTelegramSessionValidateRequest",
     "ChannelSuggestionRead",
     "ChannelSuggestionStatus",
 ]
