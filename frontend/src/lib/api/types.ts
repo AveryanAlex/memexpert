@@ -184,6 +184,18 @@ export interface PublicMemeSearchResultRead {
   attribution: MemeResultAttributionRead;
 }
 
+export interface PublicMemeOfTheDayRead {
+  meme: PublicMemeCardRead | null;
+  selected_for: string;
+  refreshed_at: string;
+  algorithm_version: string;
+  score: number | null;
+  score_components: Record<string, number>;
+  reason: string;
+  candidate_count: number;
+  attribution: MemeResultAttributionRead | null;
+}
+
 export interface PublicMemeSearchPageRead {
   items: PublicMemeSearchResultRead[];
   limit: number;

@@ -3,6 +3,7 @@
   import { bulkGuidanceFromSessionAndCollections, collectionListBulkOptions } from '$lib/features/memes/bulk-view-model';
   import InfiniteMemeFeed from '$lib/features/memes/InfiniteMemeFeed.svelte';
   import type { MemeFeedSource } from '$lib/features/memes/infinite-feed';
+  import MemeOfTheDayPanel from '$lib/features/memes/MemeOfTheDayPanel.svelte';
   import { ActionLink, Button, Card, Input, Notice, PageHeader, Select } from '$lib/ui';
   import type { ActionData, PageData } from './$types';
 
@@ -75,6 +76,8 @@
   <ActionLink variant="secondary" size="compact" href="/search">Advanced search</ActionLink>
   <ActionLink variant="ghost" size="compact" href="/search?tags=reaction&include_nsfw=false">Browse reactions</ActionLink>
 </div>
+
+<MemeOfTheDayPanel memeOfTheDay={data.memeOfTheDay} initialError={data.memeOfTheDayErrorMessage} showAccessMarkers={Boolean(data.session)} />
 
 <Card class="my-6 grid gap-4" aria-labelledby="collections-title">
   <div>

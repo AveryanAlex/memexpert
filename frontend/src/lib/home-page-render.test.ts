@@ -3,7 +3,9 @@ import { describe, expect, it } from 'vitest';
 
 import type {
   CurrentSessionRead,
+  MemeResultAttributionRead,
   PublicMemeCardRead,
+  PublicMemeOfTheDayRead,
   PublicMemeSearchPageRead,
   WebCollectionListRead
 } from '$lib/api/types';
@@ -34,7 +36,9 @@ describe('/ page', () => {
           query: '',
           offset: 0,
           feedSource: 'home',
-          errorMessage: null
+          errorMessage: null,
+          memeOfTheDay: null,
+          memeOfTheDayErrorMessage: null
         },
         form: null
       }
@@ -58,6 +62,51 @@ describe('/ page', () => {
     expect(body).toContain('Actions for SSR cat reaction');
     expect(body).not.toContain('Previous');
     expect(body).not.toContain('Next page');
+  });
+
+  it('renders a selected Meme of the Day panel on SSR', () => {
+    const body = renderHome(homePageWithAttribution('personalized_recommendations', 'qdrant_preference_vector'), fullSession(), {
+      memeOfTheDay: memeOfTheDay()
+    });
+
+    expect(body).toContain('Meme of the Day');
+    expect(body).toContain('Daily pick reaction');
+    expect(body).toContain('Selected 2026-06-20');
+    expect(body).toContain('12 candidates');
+    expect(body).toContain('Algorithm motd-v1');
+  });
+
+  it('keeps MOTD attribution in rendered meme links for telemetry handoff', () => {
+    const body = renderHome(homePageWithAttribution('personalized_recommendations', 'qdrant_preference_vector'), fullSession(), {
+      memeOfTheDay: memeOfTheDay()
+    });
+
+    expect(body).toContain('attribution_source_algorithm=motd');
+    expect(body).toContain('attribution_surface=web_home');
+    expect(body).toContain('attribution_rank=1');
+    expect(body).toContain('data-discovery-source="motd"');
+  });
+
+  it('renders an empty Meme of the Day state when no candidate is selected', () => {
+    const body = renderHome(homePageWithAttribution('personalized_recommendations', 'qdrant_preference_vector'), guestSession(), {
+      memeOfTheDay: memeOfTheDay({ meme: null, attribution: null, candidate_count: 0, reason: 'no_candidates' })
+    });
+
+    expect(body).toContain('Meme of the Day');
+    expect(body).toContain('No Meme of the Day yet');
+    expect(body).toContain('did not find an eligible public meme for 2026-06-20');
+    expect(body).toContain('0 candidates');
+  });
+
+  it('renders a separate Meme of the Day error state', () => {
+    const body = renderHome(homePageWithAttribution('personalized_recommendations', 'qdrant_preference_vector'), guestSession(), {
+      memeOfTheDayErrorMessage: 'Could not load today\'s pick.'
+    });
+
+    expect(body).toContain('Meme of the Day');
+    expect(body).toContain('Could not load today\'s pick.');
+    expect(body).toContain('Retry');
+    expect(body).toContain('SSR fallback reaction');
   });
 
   it('renders distinct cold-start trending copy for full and guest sessions', () => {
@@ -98,7 +147,12 @@ describe('/ page', () => {
   });
 });
 
-function renderHome(page: PublicMemeSearchPageRead, session: CurrentSessionRead): string {
+interface HomeRenderOptions {
+  memeOfTheDay?: PublicMemeOfTheDayRead | null;
+  memeOfTheDayErrorMessage?: string | null;
+}
+
+function renderHome(page: PublicMemeSearchPageRead, session: CurrentSessionRead, options: HomeRenderOptions = {}): string {
   const { body } = render(HomePage, {
     props: {
       data: {
@@ -109,7 +163,9 @@ function renderHome(page: PublicMemeSearchPageRead, session: CurrentSessionRead)
         query: '',
         offset: 0,
         feedSource: 'home',
-        errorMessage: null
+        errorMessage: null,
+        memeOfTheDay: options.memeOfTheDay ?? null,
+        memeOfTheDayErrorMessage: options.memeOfTheDayErrorMessage ?? null
       },
       form: null
     }
@@ -134,7 +190,34 @@ function homePageWithAttribution(sourceAlgorithm: string, reason: string): Publi
   };
 }
 
-function attribution(rank: number, sourceAlgorithm: string, reason: string) {
+function memeOfTheDay(overrides: Partial<PublicMemeOfTheDayRead> = {}): PublicMemeOfTheDayRead {
+  return {
+    meme: memeCard('55555555-5555-4555-8555-555555555555', 'Daily pick reaction'),
+    selected_for: '2026-06-20',
+    refreshed_at: '2026-06-20T08:00:00Z',
+    algorithm_version: 'motd-v1',
+    score: 0.91,
+    score_components: { freshness: 0.3, quality: 0.61 },
+    reason: 'daily_selection',
+    candidate_count: 12,
+    attribution: motdAttribution(),
+    ...overrides
+  };
+}
+
+function motdAttribution(): MemeResultAttributionRead {
+  return {
+    ...attribution(1, 'motd', 'daily_selection'),
+    request_id: 'req_motd',
+    impression_id: 'imp_motd',
+    surface: 'web_home',
+    algorithm_version: 'motd-v1',
+    score: 0.91,
+    score_components: { freshness: 0.3, quality: 0.61 }
+  };
+}
+
+function attribution(rank: number, sourceAlgorithm: string, reason: string): MemeResultAttributionRead {
   return {
     request_id: 'req_home',
     impression_id: `imp_${rank}`,
