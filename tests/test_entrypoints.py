@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import inspect
+import tomllib
+from pathlib import Path
 from unittest.mock import patch
 
 from memexpert.api.main import main as api_main
 from memexpert.bot.main import main as bot_main
 from memexpert.core.config import Settings
+from memexpert.crawlers.telegram.main import main as telegram_crawler_main
 from memexpert.scheduler.main import main as scheduler_main
 from memexpert.workers.main import main as workers_main
 from scripts.analytics import main as analytics_main
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_api_main_runs_uvicorn_with_factory_settings() -> None:
@@ -56,6 +61,22 @@ def test_scheduler_main_runs_async_scheduler_runtime() -> None:
     coroutine = asyncio_run.call_args.args[0]
     assert inspect.iscoroutine(coroutine)
     coroutine.close()
+
+
+def test_telegram_crawler_main_runs_async_crawler_runtime() -> None:
+    with patch("memexpert.crawlers.telegram.main.asyncio.run") as asyncio_run:
+        telegram_crawler_main()
+
+    asyncio_run.assert_called_once()
+    coroutine = asyncio_run.call_args.args[0]
+    assert inspect.iscoroutine(coroutine)
+    coroutine.close()
+
+
+def test_telegram_crawler_console_script_is_registered() -> None:
+    pyproject = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text())
+
+    assert pyproject["project"]["scripts"]["memexpert-telegram-crawler"] == "memexpert.crawlers.telegram.main:main"
 
 
 def test_analytics_main_runs_refresh_trends_command() -> None:

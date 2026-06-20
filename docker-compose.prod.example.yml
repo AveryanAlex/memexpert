@@ -237,6 +237,20 @@ services:
     healthcheck:
       disable: true
 
+  telegram-crawler:
+    <<: *worker-image
+    restart: unless-stopped
+    command: ["memexpert-telegram-crawler"]
+    environment:
+      <<: *app-env
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID:?set TELEGRAM_API_ID}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:?set TELEGRAM_API_HASH}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      disable: true
+
   scheduler:
     <<: *main-image
     restart: unless-stopped

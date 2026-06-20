@@ -11,10 +11,10 @@ grammar across the three slices.
 
 Live mode semantics:
 
-1. The harness assumes the operator has already started the crawler
-   runtime (catch-up + live listener) out-of-band. The runbook at
-   ``docs/ops/content-pipeline-telegram-crawler.md`` documents the ad-hoc
-   driver path used until the worker entrypoint is wired.
+1. The harness assumes the operator has already started the dedicated
+   ``memexpert-telegram-crawler`` process (catch-up + live listener)
+   out-of-band. The runbook at
+   ``docs/ops/content-pipeline-telegram-crawler.md`` documents that runtime.
 2. The harness then polls ``GET /api/v1/crawler/freshness`` on a
    configurable interval, captures the final snapshot once the budget
    expires, and writes a JSON + Markdown artifact pair under

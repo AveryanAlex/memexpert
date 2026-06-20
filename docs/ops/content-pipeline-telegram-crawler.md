@@ -209,12 +209,32 @@ instead of a silently-empty freshness snapshot.
 
 ## Starting the crawler runtime
 
-`TelegramSessionManager` is now the runtime abstraction for the crawler process.
-It supervises many DB-backed Telegram sessions in one process while
-`TelegramCrawlerRuntime` remains the per-session executor underneath. There is
-still no dedicated production crawler console script in `pyproject.toml`; until
-worker wiring exists, run the manager from whichever entrypoint owns it, or from
-an ad-hoc script.
+Run the dedicated Telegram crawler process before starting the freshness harness:
+
+```bash
+uv run memexpert-telegram-crawler
+```
+
+The command resolves normal project settings, builds its own async database
+engine/session factory, constructs `TelegramSessionManager`, runs
+`catch_up_all()`, then starts live listeners with `start_live_all()`. It stays in
+the foreground until stopped.
+
+Signal behavior:
+
+- `SIGHUP` calls `manager.reload()` and then continues waiting. Send this after
+  browser-admin session/channel assignment or policy changes that should affect
+  live listeners without a full restart.
+- `SIGINT` / `SIGTERM` request shutdown. The process closes signal handlers,
+  calls `manager.shutdown()`, disposes its owned SQLAlchemy engine, and exits.
+
+Production compose runs the same command as the first-class `telegram-crawler`
+service from the worker image, because Telethon lives in the worker dependency
+group.
+
+`TelegramSessionManager` supervises many DB-backed Telegram sessions in one
+process while `TelegramCrawlerRuntime` remains the per-session executor
+underneath.
 
 Manager discovery rules:
 
@@ -235,66 +255,19 @@ Manager discovery rules:
 - Flood-wait, auth-required, or quarantine state affects only the failing
   session. Healthy sessions continue catch-up/live work in the same manager
   process.
-- Use `reload()` after admin disable/delete/assignment changes to close stale
-  clients/listeners and rebuild live listeners from current DB state. Use
-  `invalidate_session()` for one changed session and `shutdown()` on worker or
-  script stop.
+- Send `SIGHUP` after admin disable/delete/assignment changes to close stale
+  clients/listeners and rebuild live listeners from current DB state.
 
-Minimal manager driver template:
+Watch for these structured lifecycle events in crawler logs:
 
-```bash
-uv run python - <<'PY'
-import asyncio
-import signal
+- `telegram_crawler_runtime_starting`, `telegram_crawler_catchup_completed`,
+  `telegram_crawler_runtime_started`, and `telegram_crawler_runtime_stopped`.
+- `telegram_crawler_reload_requested`, `telegram_crawler_reload_started`, and
+  `telegram_crawler_reload_completed` when `SIGHUP` is received.
+- `telegram_crawler_stop_requested` when `SIGINT` or `SIGTERM` is received.
 
-from memexpert.core.config import get_settings
-from memexpert.core.database import build_async_engine, build_async_session_factory
-from memexpert.crawlers.telegram.manager import TelegramSessionManager
-
-async def main() -> None:
-    settings = get_settings()
-    engine = build_async_engine(settings.database_url)
-    session_factory = build_async_session_factory(engine)
-    manager = TelegramSessionManager(settings=settings, session_factory=session_factory)
-
-    stop_requested = asyncio.Event()
-    reload_requested = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    loop.add_signal_handler(signal.SIGHUP, reload_requested.set)
-    loop.add_signal_handler(signal.SIGINT, stop_requested.set)
-    loop.add_signal_handler(signal.SIGTERM, stop_requested.set)
-
-    try:
-        await manager.catch_up_all()
-        await manager.start_live_all()
-        while not stop_requested.is_set():
-            stop_task = asyncio.create_task(stop_requested.wait())
-            reload_task = asyncio.create_task(reload_requested.wait())
-            done, pending = await asyncio.wait(
-                {stop_task, reload_task},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
-            if stop_task in done or stop_requested.is_set():
-                break
-            if reload_task in done:
-                reload_requested.clear()
-                await manager.reload()
-    finally:
-        await manager.shutdown()
-        await engine.dispose()
-
-asyncio.run(main())
-PY
-```
-
-Start the manager driver or worker-owned entrypoint **before** running the
-freshness harness. The harness only observes freshness - it does not trigger
-catch-up itself. Send `SIGHUP` to the example script, or call `reload()` from the
-owning entrypoint, after browser-admin changes that should affect live listeners
-without stopping the process.
+The freshness harness only observes freshness - it does not trigger catch-up or
+start the crawler runtime.
 
 ## Running `scripts/verify_s04_runtime.py`
 
@@ -353,9 +326,9 @@ uv run python scripts/verify_s04_runtime.py \
 
 Catch-up-only mode skips the resume + live-duration polling loop. The
 harness only takes one freshness snapshot after healthchecking the API,
-then writes the artifact pair. Use this when the manager driver or worker-owned
-entrypoint is still running catch-up in another shell and you just want a single
-observation window.
+then writes the artifact pair. Use this when `memexpert-telegram-crawler` is
+still running catch-up in another shell and you just want a single observation
+window.
 
 ### Dry-run mode
 
@@ -554,8 +527,9 @@ The affected `telegram_sessions` row transitions into
 `status=flood_wait` and `flood_wait_until` is set to
 `now() + wait_seconds`. Only that session becomes non-runnable; healthy sessions
 continue running. The affected session is not runnable again until it is
-`active` and `flood_wait_until` is no longer in the future, and a stale cached
-client/listener should be closed with `invalidate_session()` or `reload()`.
+`active` and `flood_wait_until` is no longer in the future, and stale cached
+clients/listeners should be closed by sending `SIGHUP` to
+`memexpert-telegram-crawler`.
 
 Recovery steps:
 
@@ -566,14 +540,14 @@ Recovery steps:
    cooldown if the client keeps hitting it.
 4. Once the window expires, patch the session back to `active` and clear errors
    in `/admin/telegram`, or validate access if secret material changed.
-5. Call `reload()` or `invalidate_session()` from the manager owner so any stale
-   client/listener is closed. The S04 harness picks up recovery on the next poll.
+5. Send `SIGHUP` to `memexpert-telegram-crawler` so stale clients/listeners are
+   closed and live listeners are rebuilt. The S04 harness picks up recovery on
+   the next poll.
 
 If the flood-wait keeps recurring, lower the session row's
 `max_requests_per_second` in `/admin/telegram` (preferred) or the
-`CRAWLER_MAX_REQUESTS_PER_SECOND` fallback, then call `invalidate_session()` for
-that session or `reload()` for the manager. Restart the owning process only if it
-does not expose a reload path yet.
+`CRAWLER_MAX_REQUESTS_PER_SECOND` fallback, then send `SIGHUP` to reload the
+crawler process.
 
 ## Session auth/ban recovery
 
@@ -597,8 +571,8 @@ row is marked `status=auth_required`, not quarantined. Recovery options are:
    the helper validates Telegram authorization, replaces `encrypted_string_session`,
    clears error fields, and sets `status='active'`.
 3. **Validate and prove recovery.** Use `/admin/telegram` "Validate access"
-   with an optional channel check, call `reload()` or `invalidate_session()` in
-   the manager owner, then re-run the harness to confirm freshness recovers.
+   with an optional channel check, send `SIGHUP` to `memexpert-telegram-crawler`,
+   then re-run the harness to confirm freshness recovers.
 
 ## Common failure modes
 
@@ -662,7 +636,7 @@ When the harness reports `slo_p95_pass=False`, work top-down:
 1. **Check per-channel p95 in the report.** If one channel dominates,
    focus there first. Stalled channels show up in
    `stalled_channels` — chase those via the session state surface.
-2. **Is Telegram fetch the bottleneck?** Look at the manager driver or worker
+2. **Is Telegram fetch the bottleneck?** Look at `memexpert-telegram-crawler`
    logs for flood-wait or provider-unavailable errors. If the listener is
    hitting the token-bucket ceiling, lower
    `CRAWLER_DEFAULT_CATCHUP_MESSAGE_LIMIT` or raise
@@ -685,13 +659,10 @@ When the harness reports `slo_p95_pass=False`, work top-down:
 
 ## Known limitations
 
-- **No dedicated crawler worker CLI yet** — `uv run memexpert-workers` does not
-  start the crawler runtime today. Drive `TelegramSessionManager` from the
-  entrypoint or script documented above until production worker wiring exists.
 - **No automatic admin-to-runtime reload hook yet** — assigning or moving a
   channel in `/admin/telegram` updates `source_channels.telegram_session_id`, but
-  a live in-process manager only observes the new binding after `reload()`,
-  `invalidate_session()`, or process restart.
+  a live crawler process only observes the new binding after `SIGHUP` or process
+  restart.
 - **Catch-up is manager-driven** — neither browser admin nor the operator API can
   trigger a catch-up sweep on demand. The S04 harness only observes the
   freshness the running manager has already produced.
