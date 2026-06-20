@@ -565,6 +565,33 @@ class MemeSearchService:
             request_id=request_id,
         )
 
+    async def home_feed_public_memes(
+        self,
+        *,
+        viewer_user_id: uuid.UUID | None = None,
+        filters: MemeSearchFilters | None = None,
+        limit: int = 20,
+        offset: int = 0,
+        surface: str = "public_api_home_feed",
+    ) -> PublicMemeSearchPageRead:
+        resolved_filters = _resolve_search_filters(
+            filters,
+            viewer_user_id=viewer_user_id,
+            default_scope=MemeSearchScope.PUBLIC,
+        )
+        page = await self.recommendation_candidates(
+            viewer_user_id=viewer_user_id,
+            filters=resolved_filters,
+            limit=limit,
+            offset=offset,
+            surface=surface,
+        )
+        return await self._to_public_search_page(
+            page,
+            viewer_user_id=viewer_user_id,
+            filters=resolved_filters,
+        )
+
     async def get_meme_detail(
         self,
         meme_id: uuid.UUID,
@@ -882,7 +909,14 @@ class MemeSearchService:
         request_id = request_id or new_discovery_request_id()
         since = utcnow() - timedelta(hours=max(1, lookback_hours))
 
-        base_stmt = _apply_filters(_visible_meme_stmt(viewer_user_id), resolved_filters)
+        base_stmt = _apply_filters(
+            _search_scope_meme_stmt(
+                viewer_user_id,
+                scope=resolved_filters.scope or _default_search_scope(viewer_user_id),
+                collection_ids=resolved_filters.collection_ids,
+            ),
+            resolved_filters,
+        )
         if exclude_meme_ids:
             base_stmt = base_stmt.where(~Meme.id.in_(tuple(exclude_meme_ids)))
         result = await self._session.execute(base_stmt)

@@ -15,6 +15,7 @@ import {
   fetchCollectionDetail,
   fetchCollections,
   fetchCurrentSession,
+  fetchHomeFeed,
   fetchMemeLibrary,
   fetchMemeDetail,
   fetchMemePage,
@@ -125,6 +126,33 @@ describe('catalog API client', () => {
       query: '',
       limit: 12,
       offset: 0
+    });
+
+    expect(mockFetch).toHaveBeenCalledOnce();
+  });
+
+  it('uses home feed endpoint with cookies and pagination for home no-query pages', async () => {
+    const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const headers = new Headers(init?.headers);
+
+      expect(url.pathname).toBe('/api/v1/memes/home-feed');
+      expect(url.searchParams.has('query')).toBe(false);
+      expect(url.searchParams.get('limit')).toBe('12');
+      expect(url.searchParams.get('offset')).toBe('24');
+      expect(url.searchParams.has('scope')).toBe(false);
+      expect(url.searchParams.has('collection_ids')).toBe(false);
+      expect(headers.get('cookie')).toBe('memexpert_access_token=guest');
+
+      return jsonResponse(page);
+    }) satisfies ApiFetch;
+
+    await fetchHomeFeed({
+      fetch: mockFetch,
+      baseUrl: 'https://api.memexpert.test',
+      limit: 12,
+      offset: 24,
+      cookieHeader: 'memexpert_access_token=guest'
     });
 
     expect(mockFetch).toHaveBeenCalledOnce();

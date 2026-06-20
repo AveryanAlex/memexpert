@@ -23,6 +23,7 @@ from memexpert.models.content import (
 )
 from memexpert.models.enums import (
     AccountStatus,
+    AnalyticsEventType,
     CollectionInviteChannel,
     CollectionInviteStatus,
     CollectionKind,
@@ -35,7 +36,7 @@ from memexpert.models.enums import (
     SyncTargetKind,
     SyncTargetStatus,
 )
-from memexpert.models.user import User
+from memexpert.models.user import AnalyticsEvent, User
 from scripts import seed_e2e
 
 if TYPE_CHECKING:
@@ -307,7 +308,7 @@ def test_public_trends_artifact_payload_is_deterministic_and_url_ready() -> None
         "granularity": "month",
         "period": "2026-01",
         "period_label": "January 2026",
-        "snapshot_count": 6,
+        "snapshot_count": 9,
     }
     assert payload["representative_meme"] == {
         "category": "cat",
@@ -346,17 +347,49 @@ def test_public_trend_template_and_source_snapshot_helpers_are_deterministic() -
     assert seed_e2e.build_public_trend_snapshot_rows(meme_source_id=meme_source_id, category="cat-nsfw") == []
 
 
+def test_seed_meme_and_platform_event_helpers_use_current_read_model_inputs() -> None:
+    cat_spec = next(spec for spec in seed_e2e.build_seed_specs() if spec.category == "cat")
+    meme_id = seed_e2e._stable_uuid("cat:meme")
+    meme_file_id = seed_e2e._stable_uuid("cat:file")
+    template_id = seed_e2e._stable_uuid("public-trends:template")
+
+    meme = seed_e2e.build_seed_meme(
+        spec=cat_spec,
+        meme_id=meme_id,
+        meme_file_id=meme_file_id,
+        public_trends_template_id=template_id,
+    )
+    events = seed_e2e.build_public_trend_analytics_event_rows(meme_id=meme_id, category="cat")
+
+    assert isinstance(meme, Meme)
+    assert not hasattr(meme, "popularity_score")
+    assert meme.like_count == 19
+    assert meme.template_id == template_id
+    assert len(events) == 140
+    assert all(isinstance(event, AnalyticsEvent) for event in events)
+    assert events[0].id == seed_e2e._stable_uuid("cat:public-trend-event:1:platform_views:1")
+    assert events[0].event_type is AnalyticsEventType.MEME_VIEW
+    assert events[0].payload["meme_id"] == str(meme_id)
+    assert events[0].payload["seed"] == "e2e-prd-public-trends"
+    assert events[0].occurred_at.isoformat() == "2026-01-05T12:00:00+00:00"
+    assert sum(1 for event in events if event.event_type is AnalyticsEventType.MEME_VIEW) == 100
+    assert sum(1 for event in events if event.event_type is AnalyticsEventType.MEME_SEND) == 8
+    assert sum(1 for event in events if event.event_type is AnalyticsEventType.MEME_SAVE) == 13
+    assert sum(1 for event in events if event.event_type is AnalyticsEventType.MEME_LIKE) == 19
+    assert seed_e2e.build_public_trend_analytics_event_rows(meme_id=meme_id, category="cat-nsfw") == []
+
+
 def test_public_trend_aggregate_history_points_payload_uses_real_seed_snapshots() -> None:
     points = seed_e2e.build_public_trend_aggregate_history_points_payload()
 
     assert points == [
         {
             "observed_at": "2026-01-05T00:00:00+00:00",
-            "value": 90.0,
+            "value": 108.2,
             "metric": "aggregate_popularity_score",
             "label": "Aggregate popularity score",
             "meme_count": 3,
-            "snapshot_count": 3,
+            "snapshot_count": 6,
             "source_views": 280,
             "source_reactions": 28,
             "source_reposts": 9,
@@ -367,7 +400,7 @@ def test_public_trend_aggregate_history_points_payload_uses_real_seed_snapshots(
         },
         {
             "observed_at": "2026-01-12T00:00:00+00:00",
-            "value": 181.5,
+            "value": 131.0,
             "metric": "aggregate_popularity_score",
             "label": "Aggregate popularity score",
             "meme_count": 3,
@@ -381,6 +414,13 @@ def test_public_trend_aggregate_history_points_payload_uses_real_seed_snapshots(
             "platform_likes": 29,
         },
     ]
+
+
+def test_public_trend_point_validation_accepts_current_helper_payload() -> None:
+    seed_e2e._assert_expected_public_trend_points(
+        seed_e2e.build_public_trend_aggregate_history_points_payload(),
+        label="current helper payload",
+    )
 
 
 @pytest.mark.asyncio

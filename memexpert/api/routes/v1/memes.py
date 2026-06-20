@@ -320,6 +320,36 @@ async def browse_memes(
     return page
 
 
+@router.get("/home-feed", response_model=PublicMemeSearchPageRead, summary="Read personalized home feed")
+async def home_feed_memes(
+    meme_search_service: MemeSearchServiceDep,
+    current_user: AutoGuestUserDep,
+    language: Annotated[ContentLanguage | None, Query()] = None,
+    media_type: Annotated[ContentKind | None, Query()] = None,
+    include_nsfw: Annotated[bool, Query()] = False,
+    tags: Annotated[list[str] | None, Query()] = None,
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> PublicMemeSearchPageRead:
+    """Return a public-catalog home feed personalized to the current cookie user."""
+
+    filters = _build_filters(
+        language=language,
+        media_type=media_type,
+        scope=MemeSearchScope.PUBLIC,
+        collection_ids=(),
+        include_nsfw=_nsfw_allowed(current_user, include_nsfw),
+        tags=tags,
+    )
+    return await meme_search_service.home_feed_public_memes(
+        viewer_user_id=current_user.id,
+        filters=filters,
+        limit=limit,
+        offset=offset,
+        surface="public_api_home_feed",
+    )
+
+
 @router.get("/trending", response_model=PublicMemeSearchPageRead, summary="Browse trending memes")
 async def trending_memes(
     public_trends_service: PublicTrendsServiceDep,

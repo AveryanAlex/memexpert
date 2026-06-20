@@ -1,13 +1,16 @@
 import type { PageServerLoad } from './$types';
 import { DEFAULT_PAGE_SIZE, ApiError, emptyMemePage, fetchCollections, fetchMemePage } from '$lib/api/client';
-import { apiBaseUrl, forwardBackendAccessCookie } from '$lib/server/backend';
+import { ACCESS_COOKIE_NAME, apiBaseUrl, cookieHeaderWithAccessToken, forwardBackendAccessCookie } from '$lib/server/backend';
 import { canonicalPublicOrigin } from '$lib/server/canonicalOrigin';
 import { parseSearchParams } from '$lib/searchParams';
 
 export const load: PageServerLoad = async ({ cookies, fetch, parent, request, url }) => {
   const filters = parseSearchParams(url.searchParams);
-  const cookieHeader = request.headers.get('cookie') ?? undefined;
   const { session } = await parent();
+  const cookieHeader = cookieHeaderWithAccessToken(
+    request.headers.get('cookie') ?? undefined,
+    cookies.get(ACCESS_COOKIE_NAME) ?? null
+  );
   const seo = {
     canonicalUrl: `${canonicalPublicOrigin()}/search`,
     noindex: Boolean(filters.query)
