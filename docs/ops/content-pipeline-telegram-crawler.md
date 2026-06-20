@@ -21,13 +21,14 @@ S04 is additive to S02 + S03:
 S04 ships six operator-facing pieces:
 
 1. **Telethon adapter** (`memexpert/crawlers/telegram/telethon_adapter.py`)
-   bound to one curated session at a time. Flood-wait, session ban,
-   provider-unavailable, and malformed-message failures all land in the
-   typed crawler-error taxonomy.
-2. **Crawler runtime** (`memexpert/crawlers/telegram/runtime.py`) driving
-   catch-up and live-listener paths. Catch-up sweeps the configured
-   message window; the live listener streams new messages into the
-   ingest entrypoint.
+   bound to DB-backed Telethon `StringSession` material. Flood-wait, session
+   ban, auth-required, provider-unavailable, and malformed-message failures all
+   land in the typed crawler-error taxonomy.
+2. **Crawler manager/runtime** (`memexpert/crawlers/telegram/manager.py` plus
+   `runtime.py`) supervising all runnable Telegram sessions in one process.
+   The manager discovers runnable DB rows, keeps one cached client/rate limiter
+   per session, and delegates each session's catch-up, live listener, and replay
+   work to the per-session runtime executor.
 3. **Browser-admin Telegram surface** (`/admin/telegram` plus
    `/api/v1/admin/telegram/*`) for cookie-authenticated session CRUD,
    StringSession import/validation, and channel assignment management.
@@ -86,8 +87,9 @@ passes iff the final snapshot proves `slo_p50_pass=True` AND
     message window the runtime consumes when a channel row does not
     override it. Keep it bounded — the runtime will refuse to walk more
     than the configured limit per sweep.
-  - `CRAWLER_MAX_REQUESTS_PER_SECOND` — token-bucket ceiling applied by
-    the runtime to all Telethon reads. Lower this before raising
+  - `CRAWLER_MAX_REQUESTS_PER_SECOND` — fallback token-bucket ceiling applied
+    by each Telethon adapter until the session row's `max_requests_per_second`
+    policy is loaded. Lower this before raising
     `CRAWLER_DEFAULT_CATCHUP_MESSAGE_LIMIT`.
   - `CRAWLER_LIVE_MODE_ENABLED` — guards the live listener start-up. Set
     to `false` in environments where catch-up is the only sanctioned
@@ -102,7 +104,7 @@ admin browser cookie from SvelteKit to the API.
 ### Sessions
 
 Before the harness can prove freshness, create or import one DB-backed
-Telegram session for each session used by the runtime driver. In the
+Telegram session for each account the manager should run. In the
 "Import or Create Session" panel:
 
 - Create a metadata-only session by leaving `StringSession` blank; the row will
@@ -153,7 +155,8 @@ Use the "Add Telegram Channel" panel instead of SQL data setup:
   is too high, lower it before raising session or global request rate limits.
 - Orphaned channels are visible in the orphaned group but are non-indexable.
   Browser admin and the API force catch-up, live, and engagement off while a
-  channel is orphaned.
+  channel is orphaned, and the manager skips orphaned channels for catch-up,
+  live listening, and replay.
 - Use "Assign or move" to attach a channel to a session. If the channel was
   orphaned, explicitly save channel controls after assignment when indexing
   should resume.
@@ -206,50 +209,92 @@ instead of a silently-empty freshness snapshot.
 
 ## Starting the crawler runtime
 
-**Known limitation (T04):** the crawler runtime is not wired into the
-`memexpert-workers` console script yet. Operators drive it ad-hoc from a
-Python shell until a dedicated entrypoint ships in T05 / M003.
+`TelegramSessionManager` is now the runtime abstraction for the crawler process.
+It supervises many DB-backed Telegram sessions in one process while
+`TelegramCrawlerRuntime` remains the per-session executor underneath. There is
+still no dedicated production crawler console script in `pyproject.toml`; until
+worker wiring exists, run the manager from whichever entrypoint owns it, or from
+an ad-hoc script.
 
-Ad-hoc driver template:
+Manager discovery rules:
+
+- Runnable sessions come from `telegram_sessions` rows that are `enabled`,
+  `status='active'`, not future flood-waited, and have nonblank
+  `encrypted_string_session` material. `catch_up_all()` additionally requires
+  `catchup_enabled=true`; `start_live_all()` additionally requires
+  `live_enabled=true` and global `CRAWLER_LIVE_MODE_ENABLED=true`.
+- Channels are processed only when the `SourceChannel.telegram_session_id`
+  assignment points at the runnable session, the channel is active, the channel
+  is not paused, and the relevant workload toggle is enabled.
+- Orphaned channels remain visible in `/admin/telegram` and the crawler API, but
+  they are non-indexable and are skipped by catch-up, live listening, and
+  replay.
+- The manager keeps one cached Telethon client and one rate limiter per runnable
+  session. Sessions are loaded from encrypted DB `StringSession` material; no
+  filesystem `.session` files are created or read.
+- Flood-wait, auth-required, or quarantine state affects only the failing
+  session. Healthy sessions continue catch-up/live work in the same manager
+  process.
+- Use `reload()` after admin disable/delete/assignment changes to close stale
+  clients/listeners and rebuild live listeners from current DB state. Use
+  `invalidate_session()` for one changed session and `shutdown()` on worker or
+  script stop.
+
+Minimal manager driver template:
 
 ```bash
 uv run python - <<'PY'
 import asyncio
+import signal
 
 from memexpert.core.config import get_settings
 from memexpert.core.database import build_async_engine, build_async_session_factory
-from memexpert.crawlers.telegram.runtime import TelegramCrawlerRuntime
-from memexpert.crawlers.telegram.telethon_adapter import PipelineTelethonClient
-from memexpert.ingest.crawler_service import PipelineCrawlerIngestService
+from memexpert.crawlers.telegram.manager import TelegramSessionManager
 
 async def main() -> None:
     settings = get_settings()
     engine = build_async_engine(settings.database_url)
     session_factory = build_async_session_factory(engine)
+    manager = TelegramSessionManager(settings=settings, session_factory=session_factory)
+
+    stop_requested = asyncio.Event()
+    reload_requested = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    loop.add_signal_handler(signal.SIGHUP, reload_requested.set)
+    loop.add_signal_handler(signal.SIGINT, stop_requested.set)
+    loop.add_signal_handler(signal.SIGTERM, stop_requested.set)
+
     try:
-        async with session_factory() as session:
-            ingest_service = PipelineCrawlerIngestService.from_settings(session, settings=settings)
-            telegram_client = PipelineTelethonClient.create(settings=settings, session_name="primary")
-            runtime = TelegramCrawlerRuntime(
-                ingest_service=ingest_service,
-                telegram_client=telegram_client,
-                session=session,
-                settings=settings,
+        await manager.catch_up_all()
+        await manager.start_live_all()
+        while not stop_requested.is_set():
+            stop_task = asyncio.create_task(stop_requested.wait())
+            reload_task = asyncio.create_task(reload_requested.wait())
+            done, pending = await asyncio.wait(
+                {stop_task, reload_task},
+                return_when=asyncio.FIRST_COMPLETED,
             )
-            await runtime.catch_up_channel("primary", "@example_memes_en")
-            await runtime.start_live_listener("primary")
-            # Leave the listener running until the operator stops the script.
-            await asyncio.Event().wait()
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            if stop_task in done or stop_requested.is_set():
+                break
+            if reload_task in done:
+                reload_requested.clear()
+                await manager.reload()
     finally:
+        await manager.shutdown()
         await engine.dispose()
 
 asyncio.run(main())
 PY
 ```
 
-Operators are expected to start this driver (or the S05 worker
-entrypoint once it ships) **before** running the freshness harness. The
-harness only observes freshness — it does not trigger catch-up itself.
+Start the manager driver or worker-owned entrypoint **before** running the
+freshness harness. The harness only observes freshness - it does not trigger
+catch-up itself. Send `SIGHUP` to the example script, or call `reload()` from the
+owning entrypoint, after browser-admin changes that should affect live listeners
+without stopping the process.
 
 ## Running `scripts/verify_s04_runtime.py`
 
@@ -308,9 +353,9 @@ uv run python scripts/verify_s04_runtime.py \
 
 Catch-up-only mode skips the resume + live-duration polling loop. The
 harness only takes one freshness snapshot after healthchecking the API,
-then writes the artifact pair. Use this when the operator driver is
-still running the catch-up sweep in another shell and you just want a
-single observation window.
+then writes the artifact pair. Use this when the manager driver or worker-owned
+entrypoint is still running catch-up in another shell and you just want a single
+observation window.
 
 ### Dry-run mode
 
@@ -415,7 +460,7 @@ items in the snapshot window. Causes, in priority order:
    runnable session and enable the intended catch-up/live/engagement controls.
 3. **Channel paused.** Check `is_paused` on the channel row via
    `GET /api/v1/crawler/channels`. Resume with `POST /channels/{id}/resume`.
-4. **Ad-hoc driver not started.** The T04 harness only observes; it
+4. **Crawler manager not started.** The S04 harness only observes; it
    does not start the runtime. Re-read the "Starting the crawler
    runtime" section above.
 5. **Empty channel.** If the Telegram channel genuinely had no new
@@ -437,7 +482,7 @@ curl -s "$BASE/api/v1/crawler/sessions" \
   -H "X-Memexpert-Operator-Token: $TOKEN" | jq
 
 # List tracked channels (filter by session + paused flag as needed).
-curl -s "$BASE/api/v1/crawler/channels?session_name=primary&include_paused=true" \
+curl -s "$BASE/api/v1/crawler/channels?session_name=<session-name>&include_paused=true" \
   -H "X-Memexpert-Operator-Token: $TOKEN" | jq
 
 # Pause one channel (idempotent).
@@ -454,7 +499,7 @@ curl -s -X POST "$BASE/api/v1/crawler/channels/<source_channel_id>/replay-post" 
   -H "Content-Type: application/json" \
   -d '{"post_id": "12345"}' | jq
 
-# Read the bounded freshness snapshot the T04 harness consumes.
+# Read the bounded freshness snapshot the S04 harness consumes.
 curl -s "$BASE/api/v1/crawler/freshness?limit_per_channel=100" \
   -H "X-Memexpert-Operator-Token: $TOKEN" | jq
 ```
@@ -507,9 +552,10 @@ When Telegram returns a `FloodWaitError`, the Telethon adapter raises
 
 The affected `telegram_sessions` row transitions into
 `status=flood_wait` and `flood_wait_until` is set to
-`now() + wait_seconds`. The runtime refuses to start a listener or
-catch-up sweep for a channel bound to a flood-waited session until the
-clock advances past `flood_wait_until`.
+`now() + wait_seconds`. Only that session becomes non-runnable; healthy sessions
+continue running. The affected session is not runnable again until it is
+`active` and `flood_wait_until` is no longer in the future, and a stale cached
+client/listener should be closed with `invalidate_session()` or `reload()`.
 
 Recovery steps:
 
@@ -518,17 +564,22 @@ Recovery steps:
 2. Confirm `flood_wait_until` is in the future.
 3. Wait it out. Do not try to bypass — Telegram will escalate the
    cooldown if the client keeps hitting it.
-4. Once the window expires, the runtime will reset the session to
-   `active` on the next successful call. The T04 harness picks up the
-   recovery automatically on the next poll.
+4. Once the window expires, patch the session back to `active` and clear errors
+   in `/admin/telegram`, or validate access if secret material changed.
+5. Call `reload()` or `invalidate_session()` from the manager owner so any stale
+   client/listener is closed. The S04 harness picks up recovery on the next poll.
 
 If the flood-wait keeps recurring, lower the session row's
 `max_requests_per_second` in `/admin/telegram` (preferred) or the
-`CRAWLER_MAX_REQUESTS_PER_SECOND` fallback and restart the ad-hoc driver.
+`CRAWLER_MAX_REQUESTS_PER_SECOND` fallback, then call `invalidate_session()` for
+that session or `reload()` for the manager. Restart the owning process only if it
+does not expose a reload path yet.
 
 ## Session auth/ban recovery
 
-A permanent ban surfaces as `PipelineTelegramSessionBannedError` →
+Flood-wait, auth-required, and quarantine failures are session-scoped: the
+affected session is marked non-runnable while healthy sessions continue. A
+permanent ban surfaces as `PipelineTelegramSessionBannedError` →
 `telegram_session_banned` / HTTP 503. The session row transitions into
 `status=quarantined` and the runtime refuses to use it for any further work.
 An unauthorized imported StringSession surfaces as
@@ -546,15 +597,16 @@ row is marked `status=auth_required`, not quarantined. Recovery options are:
    the helper validates Telegram authorization, replaces `encrypted_string_session`,
    clears error fields, and sets `status='active'`.
 3. **Validate and prove recovery.** Use `/admin/telegram` "Validate access"
-   with an optional channel check, then re-run the harness to confirm freshness
-   recovers.
+   with an optional channel check, call `reload()` or `invalidate_session()` in
+   the manager owner, then re-run the harness to confirm freshness recovers.
 
 ## Common failure modes
 
 - **`telegram_flood_wait` cascade.** Every catch-up tick hits the same
   cooldown. Root cause is usually an oversized
   `catchup_message_limit` combined with a too-high
-  `CRAWLER_MAX_REQUESTS_PER_SECOND`. Lower both and restart the driver.
+  `CRAWLER_MAX_REQUESTS_PER_SECOND`. Lower both and reload or invalidate the
+  affected session.
 - **`telegram_provider_unavailable`.** Telegram is reachable but refused
   the request. Transient; the runtime reports the stage as retryable and
   the worker will requeue it.
@@ -597,7 +649,7 @@ The harness uses `mkdir(parents=True, exist_ok=True)` so it can safely
 write into a pre-existing tree, and each run lives under its own
 `<run-id>` subdirectory. Delete the whole tree only when you want to
 wipe historical proof runs — individual run directories are the audit
-trail for T04 sign-off.
+trail for S04 sign-off.
 
 The directory is already listed in `.gitignore` so artifacts never leak
 into a commit. Verify with `git status .artifacts/` before running the
@@ -610,8 +662,8 @@ When the harness reports `slo_p95_pass=False`, work top-down:
 1. **Check per-channel p95 in the report.** If one channel dominates,
    focus there first. Stalled channels show up in
    `stalled_channels` — chase those via the session state surface.
-2. **Is Telegram fetch the bottleneck?** Look at the ad-hoc driver logs
-   for flood-wait or provider-unavailable errors. If the listener is
+2. **Is Telegram fetch the bottleneck?** Look at the manager driver or worker
+   logs for flood-wait or provider-unavailable errors. If the listener is
    hitting the token-bucket ceiling, lower
    `CRAWLER_DEFAULT_CATCHUP_MESSAGE_LIMIT` or raise
    `CRAWLER_MAX_REQUESTS_PER_SECOND` (but never both in the same run).
@@ -633,23 +685,18 @@ When the harness reports `slo_p95_pass=False`, work top-down:
 
 ## Known limitations
 
-- **Single Telethon session** — S04 only runs one session at a time per
-  ad-hoc driver invocation. Multi-session orchestration is tracked as a
-  follow-up for T05 / M003. Browser admin and the crawler operator API already
-  list every known session; the limitation is in the driver, not in the
-  management surfaces.
-- **No runtime channel rebind without restart** — assigning or moving a channel
-  in `/admin/telegram` updates `source_channels.telegram_session_id`, but the
-  in-process listener does NOT pick up the change on the fly. Restart the
-  ad-hoc driver (or the future worker entrypoint) to pick up a fresh binding.
-- **Catch-up is worker-driven** — neither browser admin nor the operator API can
-  trigger a catch-up sweep on demand. The T04 harness only observes the
-  freshness the worker has already produced.
+- **No dedicated crawler worker CLI yet** — `uv run memexpert-workers` does not
+  start the crawler runtime today. Drive `TelegramSessionManager` from the
+  entrypoint or script documented above until production worker wiring exists.
+- **No automatic admin-to-runtime reload hook yet** — assigning or moving a
+  channel in `/admin/telegram` updates `source_channels.telegram_session_id`, but
+  a live in-process manager only observes the new binding after `reload()`,
+  `invalidate_session()`, or process restart.
+- **Catch-up is manager-driven** — neither browser admin nor the operator API can
+  trigger a catch-up sweep on demand. The S04 harness only observes the
+  freshness the running manager has already produced.
 - **Freshness is measured on live items** — `MemeSource.published_at`
   must be set for the freshness query to score the item. Catch-up items
   backfilled from a historical window are NOT scored by the SLO; that
   is by design because their freshness is a function of the backfill
   job, not the live pipeline.
-- **Worker entrypoint not yet wired** — `uv run memexpert-workers` does
-  not start the crawler runtime today. Use the ad-hoc driver documented
-  above until T05 / M003 closes the gap.
