@@ -23,11 +23,12 @@ any green output.
 - The native API running on `http://127.0.0.1:8000`: `uv run memexpert-api`.
 - The native workers running: `uv run memexpert-workers`.
 - Environment variables:
-  - `MEMEXPERT_PIPELINE_OPERATOR_TOKEN` — read from `memexpert.core.config.get_settings`
+  - `PIPELINE_OPERATOR_TOKEN` — read from `memexpert.core.config.get_settings`
     in the proof harness, so the same token the API accepts is used.
-  - `MEMEXPERT_PIPELINE_VOYAGE_API_KEY` — required for the real embed stage.
-  - `MEMEXPERT_PIPELINE_CLASSIFICATION_API_URL` / token — required for the
-    classify stage (refer to `memexpert/core/classification.py`).
+  - `PIPELINE_VOYAGE_API_KEY` — required for the real embed stage.
+  - `PIPELINE_CLASSIFICATION_API_URL` / `PIPELINE_CLASSIFICATION_API_KEY` —
+    required for the classify stage (refer to
+    `memexpert/core/classification.py`).
   - Qdrant + MinIO + RabbitMQ credentials are already wired by Docker Compose.
 
 The heavy chain needs real Voyage and classification credentials. If either is
@@ -113,7 +114,7 @@ For each entry in `blocked_item_ids`:
 
 ```bash
 curl -sS -X POST \
-  -H "X-Memexpert-Operator-Token: $MEMEXPERT_PIPELINE_OPERATOR_TOKEN" \
+  -H "X-Memexpert-Operator-Token: $PIPELINE_OPERATOR_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"stage": "embed"}' \
   http://127.0.0.1:8000/api/v1/pipeline/items/<meme_file_id>/replay
