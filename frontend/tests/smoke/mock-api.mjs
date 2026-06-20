@@ -139,7 +139,7 @@ const server = createServer((request, response) => {
     return;
   }
 
-  if (url.pathname === '/api/v1/memes/browse') {
+  if (url.pathname === '/api/v1/memes/home-feed' || url.pathname === '/api/v1/memes/browse') {
     const offset = Number(url.searchParams.get('offset') ?? 0);
     sendJson(response, 200, {
       items: [{ meme: offset > 0 ? nextMeme : meme }],
