@@ -1026,6 +1026,30 @@ class TelegramSession(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
 
 
+class TelegramAdminAuditLog(UUIDPrimaryKeyMixin, Base):
+    """Immutable browser-admin history for Telegram sessions and channel assignment."""
+
+    __tablename__ = "telegram_admin_audit_logs"
+    __table_args__ = (
+        Index("ix_telegram_admin_audit_logs_admin_created_at", "admin_user_id", "created_at"),
+        Index("ix_telegram_admin_audit_logs_action_created_at", "action", "created_at"),
+        Index("ix_telegram_admin_audit_logs_session_created_at", "telegram_session_id", "created_at"),
+        Index("ix_telegram_admin_audit_logs_channel_created_at", "source_channel_id", "created_at"),
+    )
+
+    admin_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    action: Mapped[str] = mapped_column(String(64), nullable=False)
+    telegram_session_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
+    source_channel_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
+    previous_values: Mapped[dict[str, object]] = mapped_column(JSONB, default=dict, nullable=False)
+    new_values: Mapped[dict[str, object]] = mapped_column(JSONB, default=dict, nullable=False)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow, nullable=False)
+
+
 class TelegramFileIdCache(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     """Telegram Bot API file_id cache scoped by bot token and delivery format."""
 
@@ -1145,6 +1169,7 @@ __all__ = [
     "ModerationReport",
     "PipelineStageJournal",
     "SourceChannel",
+    "TelegramAdminAuditLog",
     "TelegramFileIdCache",
     "TelegramSession",
 ]

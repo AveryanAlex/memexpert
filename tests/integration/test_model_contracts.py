@@ -38,6 +38,7 @@ from memexpert.models.content import (
     PipelineStageJournal,
     RabbitMQOutboxMessage,
     SourceChannel,
+    TelegramAdminAuditLog,
     TelegramFileIdCache,
     TelegramSession,
 )
@@ -126,6 +127,7 @@ EXPECTED_TABLES = {
     "pipeline_stage_journal",
     "rabbitmq_outbox_messages",
     "source_channels",
+    "telegram_admin_audit_logs",
     "telegram_file_id_cache",
     "telegram_link_codes",
     "telegram_sessions",
@@ -270,6 +272,7 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
     assert rabbitmq_outbox_columns["aggregate_id"] is not None
     assert rabbitmq_outbox_columns["message_id"] is not None
     assert metadata.tables["admin_meme_destructive_audit_logs"].c["admin_user_id"].foreign_keys
+    assert metadata.tables["telegram_admin_audit_logs"].c["admin_user_id"].foreign_keys
     assert metadata.tables["blocked_perceptual_hashes"].c["created_by_admin_user_id"].foreign_keys
     assert metadata.tables["blocked_perceptual_hash_audit_logs"].c["admin_user_id"].foreign_keys
     assert metadata.tables["meme_files"].c["blocked_perceptual_hash_id"].foreign_keys
@@ -288,6 +291,7 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
     assert "views" not in meme_source_columns
     assert "reactions" not in meme_source_columns
     assert sa_inspect(BlockedPerceptualHashAuditLog).columns["blocked_perceptual_hash_id"] is not None
+    assert sa_inspect(TelegramAdminAuditLog).columns["telegram_session_id"] is not None
 
 
 def test_direct_broker_publish_calls_stay_grep_auditable() -> None:

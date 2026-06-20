@@ -9,7 +9,7 @@ from typing import Annotated
 from fastapi import APIRouter, Body, Depends, HTTPException, Path, Query, status
 
 from memexpert.api.dependencies import AdminUserDep, DbSessionDep
-from memexpert.models.enums import ChannelSuggestionStatus, ModerationReportStatus
+from memexpert.models.enums import ChannelSuggestionStatus, ModerationReportStatus, SourcePlatform
 from memexpert.schemas.admin import (
     AdminBlockedPerceptualHashActionRead,
     AdminBlockedPerceptualHashAuditRead,
@@ -34,8 +34,19 @@ from memexpert.schemas.admin import (
     AdminModerationReportRead,
     AdminModerationReportResolveRequest,
     AdminSessionRead,
+    AdminSourceChannelAssignRequest,
     AdminSourceChannelCreateRequest,
+    AdminSourceChannelOrphanRequest,
     AdminSourceChannelRead,
+    AdminSourceChannelUpdateRequest,
+    AdminTelegramChannelGroupRead,
+    AdminTelegramSessionActionRead,
+    AdminTelegramSessionCreateRequest,
+    AdminTelegramSessionDeleteRequest,
+    AdminTelegramSessionRead,
+    AdminTelegramSessionUpdateRequest,
+    AdminTelegramSessionValidateRead,
+    AdminTelegramSessionValidateRequest,
 )
 from memexpert.schemas.user import ChannelSuggestionRead
 from memexpert.services.admin import AdminConflictError, AdminNotFoundError, AdminService
@@ -118,9 +129,128 @@ async def reject_channel_suggestion(
         raise _map_admin_error(exc) from exc
 
 
+@router.get("/telegram/sessions", response_model=list[AdminTelegramSessionRead], summary="List Telegram sessions")
+async def list_telegram_sessions(
+    _admin: AdminUserDep,
+    admin_service: AdminServiceDep,
+) -> list[AdminTelegramSessionRead]:
+    return await admin_service.list_telegram_sessions()
+
+
+@router.post(
+    "/telegram/sessions",
+    response_model=AdminTelegramSessionRead,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create or import a DB-backed Telegram session",
+)
+async def create_telegram_session(
+    admin_user: AdminUserDep,
+    admin_service: AdminServiceDep,
+    request: Annotated[AdminTelegramSessionCreateRequest, Body()],
+) -> AdminTelegramSessionRead:
+    try:
+        return await admin_service.create_telegram_session(request, admin_user_id=admin_user.id)
+    except (AdminNotFoundError, AdminConflictError) as exc:
+        raise _map_admin_error(exc) from exc
+
+
+@router.patch(
+    "/telegram/sessions/{session_id}",
+    response_model=AdminTelegramSessionRead,
+    summary="Patch Telegram session policy and status",
+)
+async def update_telegram_session(
+    admin_user: AdminUserDep,
+    admin_service: AdminServiceDep,
+    session_id: Annotated[uuid.UUID, Path()],
+    request: Annotated[AdminTelegramSessionUpdateRequest, Body()],
+) -> AdminTelegramSessionRead:
+    try:
+        return await admin_service.update_telegram_session(session_id, request, admin_user_id=admin_user.id)
+    except (AdminNotFoundError, AdminConflictError) as exc:
+        raise _map_admin_error(exc) from exc
+
+
+@router.post(
+    "/telegram/sessions/{session_id}/validate",
+    response_model=AdminTelegramSessionValidateRead,
+    summary="Validate a stored Telegram session without exposing secret material",
+)
+async def validate_telegram_session(
+    _admin: AdminUserDep,
+    admin_service: AdminServiceDep,
+    session_id: Annotated[uuid.UUID, Path()],
+    request: Annotated[AdminTelegramSessionValidateRequest | None, Body()] = None,
+) -> AdminTelegramSessionValidateRead:
+    try:
+        return await admin_service.validate_telegram_session(
+            session_id,
+            request or AdminTelegramSessionValidateRequest(),
+        )
+    except (AdminNotFoundError, AdminConflictError) as exc:
+        raise _map_admin_error(exc) from exc
+
+
+@router.delete(
+    "/telegram/sessions/{session_id}",
+    response_model=AdminTelegramSessionActionRead,
+    summary="Delete a Telegram session and orphan assigned channels",
+)
+async def delete_telegram_session(
+    admin_user: AdminUserDep,
+    admin_service: AdminServiceDep,
+    session_id: Annotated[uuid.UUID, Path()],
+    request: Annotated[AdminTelegramSessionDeleteRequest, Body()],
+) -> AdminTelegramSessionActionRead:
+    try:
+        return await admin_service.delete_telegram_session(session_id, request, admin_user_id=admin_user.id)
+    except (AdminNotFoundError, AdminConflictError) as exc:
+        raise _map_admin_error(exc) from exc
+
+
 @router.get("/source-channels", response_model=list[AdminSourceChannelRead], summary="List source channels")
-async def list_source_channels(_admin: AdminUserDep, admin_service: AdminServiceDep) -> list[AdminSourceChannelRead]:
-    return await admin_service.list_source_channels()
+async def list_source_channels(
+    _admin: AdminUserDep,
+    admin_service: AdminServiceDep,
+    telegram_session_id: Annotated[uuid.UUID | None, Query()] = None,
+    orphaned: Annotated[bool | None, Query()] = None,
+) -> list[AdminSourceChannelRead]:
+    try:
+        return await admin_service.list_source_channels(
+            telegram_session_id=telegram_session_id,
+            orphaned=orphaned,
+        )
+    except (AdminNotFoundError, AdminConflictError) as exc:
+        raise _map_admin_error(exc) from exc
+
+
+@router.get("/telegram/channels", response_model=list[AdminSourceChannelRead], summary="List Telegram source channels")
+async def list_telegram_source_channels(
+    _admin: AdminUserDep,
+    admin_service: AdminServiceDep,
+    telegram_session_id: Annotated[uuid.UUID | None, Query()] = None,
+    orphaned: Annotated[bool | None, Query()] = None,
+) -> list[AdminSourceChannelRead]:
+    try:
+        return await admin_service.list_source_channels(
+            platform=SourcePlatform.TELEGRAM,
+            telegram_session_id=telegram_session_id,
+            orphaned=orphaned,
+        )
+    except (AdminNotFoundError, AdminConflictError) as exc:
+        raise _map_admin_error(exc) from exc
+
+
+@router.get(
+    "/telegram/channels/grouped",
+    response_model=list[AdminTelegramChannelGroupRead],
+    summary="List Telegram source channels grouped by session",
+)
+async def list_telegram_channel_groups(
+    _admin: AdminUserDep,
+    admin_service: AdminServiceDep,
+) -> list[AdminTelegramChannelGroupRead]:
+    return await admin_service.list_telegram_channel_groups()
 
 
 @router.post(
@@ -130,12 +260,89 @@ async def list_source_channels(_admin: AdminUserDep, admin_service: AdminService
     summary="Add a source channel",
 )
 async def add_source_channel(
-    _admin: AdminUserDep,
+    admin_user: AdminUserDep,
     admin_service: AdminServiceDep,
     request: Annotated[AdminSourceChannelCreateRequest, Body()],
 ) -> AdminSourceChannelRead:
     try:
-        return await admin_service.add_source_channel(request)
+        return await admin_service.add_source_channel(request, admin_user_id=admin_user.id)
+    except (AdminNotFoundError, AdminConflictError) as exc:
+        raise _map_admin_error(exc) from exc
+
+
+@router.post(
+    "/telegram/channels",
+    response_model=AdminSourceChannelRead,
+    status_code=status.HTTP_201_CREATED,
+    summary="Add a Telegram source channel",
+)
+async def add_telegram_source_channel(
+    admin_user: AdminUserDep,
+    admin_service: AdminServiceDep,
+    request: Annotated[AdminSourceChannelCreateRequest, Body()],
+) -> AdminSourceChannelRead:
+    if request.platform is not SourcePlatform.TELEGRAM:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The Telegram channel admin route only accepts platform='telegram'.",
+        )
+    try:
+        return await admin_service.add_source_channel(request, admin_user_id=admin_user.id)
+    except (AdminNotFoundError, AdminConflictError) as exc:
+        raise _map_admin_error(exc) from exc
+
+
+@router.patch(
+    "/telegram/channels/{channel_id}",
+    response_model=AdminSourceChannelRead,
+    summary="Patch source-channel crawler controls",
+)
+async def update_telegram_source_channel(
+    admin_user: AdminUserDep,
+    admin_service: AdminServiceDep,
+    channel_id: Annotated[uuid.UUID, Path()],
+    request: Annotated[AdminSourceChannelUpdateRequest, Body()],
+) -> AdminSourceChannelRead:
+    try:
+        return await admin_service.update_source_channel(channel_id, request, admin_user_id=admin_user.id)
+    except (AdminNotFoundError, AdminConflictError) as exc:
+        raise _map_admin_error(exc) from exc
+
+
+@router.post(
+    "/telegram/channels/{channel_id}/assign",
+    response_model=AdminSourceChannelRead,
+    summary="Assign a source channel to a Telegram session",
+)
+async def assign_telegram_source_channel(
+    admin_user: AdminUserDep,
+    admin_service: AdminServiceDep,
+    channel_id: Annotated[uuid.UUID, Path()],
+    request: Annotated[AdminSourceChannelAssignRequest, Body()],
+) -> AdminSourceChannelRead:
+    try:
+        return await admin_service.assign_source_channel(channel_id, request, admin_user_id=admin_user.id)
+    except (AdminNotFoundError, AdminConflictError) as exc:
+        raise _map_admin_error(exc) from exc
+
+
+@router.post(
+    "/telegram/channels/{channel_id}/orphan",
+    response_model=AdminSourceChannelRead,
+    summary="Orphan a source channel and disable crawler controls",
+)
+async def orphan_telegram_source_channel(
+    admin_user: AdminUserDep,
+    admin_service: AdminServiceDep,
+    channel_id: Annotated[uuid.UUID, Path()],
+    request: Annotated[AdminSourceChannelOrphanRequest | None, Body()] = None,
+) -> AdminSourceChannelRead:
+    try:
+        return await admin_service.orphan_source_channel(
+            channel_id,
+            request or AdminSourceChannelOrphanRequest(),
+            admin_user_id=admin_user.id,
+        )
     except (AdminNotFoundError, AdminConflictError) as exc:
         raise _map_admin_error(exc) from exc
 
@@ -146,12 +353,16 @@ async def add_source_channel(
     summary="Pause a source channel",
 )
 async def pause_source_channel(
-    _admin: AdminUserDep,
+    admin_user: AdminUserDep,
     admin_service: AdminServiceDep,
     channel_id: Annotated[uuid.UUID, Path()],
 ) -> AdminSourceChannelRead:
     try:
-        return await admin_service.set_source_channel_paused(channel_id, is_paused=True)
+        return await admin_service.set_source_channel_paused(
+            channel_id,
+            is_paused=True,
+            admin_user_id=admin_user.id,
+        )
     except (AdminNotFoundError, AdminConflictError) as exc:
         raise _map_admin_error(exc) from exc
 
@@ -162,12 +373,16 @@ async def pause_source_channel(
     summary="Resume a source channel",
 )
 async def resume_source_channel(
-    _admin: AdminUserDep,
+    admin_user: AdminUserDep,
     admin_service: AdminServiceDep,
     channel_id: Annotated[uuid.UUID, Path()],
 ) -> AdminSourceChannelRead:
     try:
-        return await admin_service.set_source_channel_paused(channel_id, is_paused=False)
+        return await admin_service.set_source_channel_paused(
+            channel_id,
+            is_paused=False,
+            admin_user_id=admin_user.id,
+        )
     except (AdminNotFoundError, AdminConflictError) as exc:
         raise _map_admin_error(exc) from exc
 
@@ -178,12 +393,12 @@ async def resume_source_channel(
     summary="Mark a source channel dead without deleting checkpoint state",
 )
 async def mark_source_channel_dead(
-    _admin: AdminUserDep,
+    admin_user: AdminUserDep,
     admin_service: AdminServiceDep,
     channel_id: Annotated[uuid.UUID, Path()],
 ) -> AdminSourceChannelRead:
     try:
-        return await admin_service.mark_source_channel_dead(channel_id)
+        return await admin_service.mark_source_channel_dead(channel_id, admin_user_id=admin_user.id)
     except (AdminNotFoundError, AdminConflictError) as exc:
         raise _map_admin_error(exc) from exc
 
