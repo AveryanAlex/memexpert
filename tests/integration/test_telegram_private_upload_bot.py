@@ -262,6 +262,41 @@ def build_upload_dispatcher(
     )
 
 
+@dataclass(slots=True)
+class _UploadBotContext:
+    settings: Settings
+    recording_session: RecordingTelegramSession
+    bot: Bot
+    dispatcher: Dispatcher
+    downloader: FakeTelegramFileDownloader
+
+
+def _build_upload_bot_context(
+    *,
+    database_url: str,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    accept_service: FakePrivateUploadAcceptService,
+    downloader: FakeTelegramFileDownloader | None = None,
+) -> _UploadBotContext:
+    settings = build_bot_settings(database_url)
+    recording_session = RecordingTelegramSession()
+    bot = build_bot(settings, session=recording_session)
+    resolved_downloader = downloader if downloader is not None else FakeTelegramFileDownloader()
+    dispatcher = build_upload_dispatcher(
+        settings=settings,
+        postgres_session_factory=postgres_session_factory,
+        accept_service=accept_service,
+        downloader=resolved_downloader,
+    )
+    return _UploadBotContext(
+        settings=settings,
+        recording_session=recording_session,
+        bot=bot,
+        dispatcher=dispatcher,
+        downloader=resolved_downloader,
+    )
+
+
 async def dispatch_photo_upload(
     *,
     dispatcher: Dispatcher,
@@ -374,20 +409,16 @@ async def test_private_photo_upload_queues_raw_ingest_with_active_collection_met
     accept_service = FakePrivateUploadAcceptService(
         accept_result=ingest_result_for(owner_user_id=user.id),
     )
-    downloader = FakeTelegramFileDownloader(media_bytes=b"photo-bytes")
-    settings = build_bot_settings(postgres_async_url)
-    recording_session = RecordingTelegramSession()
-    bot = build_bot(settings, session=recording_session)
-    dispatcher = build_upload_dispatcher(
-        settings=settings,
+    upload_bot = _build_upload_bot_context(
+        database_url=postgres_async_url,
         postgres_session_factory=postgres_session_factory,
         accept_service=accept_service,
-        downloader=downloader,
+        downloader=FakeTelegramFileDownloader(media_bytes=b"photo-bytes"),
     )
 
-    await dispatch_photo_upload(dispatcher=dispatcher, bot=bot)
+    await dispatch_photo_upload(dispatcher=upload_bot.dispatcher, bot=upload_bot.bot)
 
-    assert downloader.calls == ["photo-file-1"]
+    assert upload_bot.downloader.calls == ["photo-file-1"]
     assert len(accept_service.calls) == 1
     source = accept_service.calls[0]["source"]
     assert isinstance(source, IngestAcceptSource)
@@ -404,7 +435,7 @@ async def test_private_photo_upload_queues_raw_ingest_with_active_collection_met
     assert accept_service.calls[0]["filename"] == "telegram-photo-701-photo-unique-1.jpg"
     assert accept_service.calls[0]["content_type"] == "image/jpeg"
     assert accept_service.calls[0]["media_bytes"] == b"photo-bytes"
-    assert "Результат появится" in last_bot_text(recording_session)
+    assert "Результат появится" in last_bot_text(upload_bot.recording_session)
     assert await migrated_db_session.scalar(select(CollectionMeme.meme_id)) is None
     async with postgres_session_factory() as session:
         event = await session.scalar(
@@ -447,20 +478,15 @@ async def test_private_upload_public_duplicate_saves_existing_public_meme(
             post_id="message:821:file:doc-unique-21",
         )
     )
-    downloader = FakeTelegramFileDownloader()
-    settings = build_bot_settings(postgres_async_url)
-    recording_session = RecordingTelegramSession()
-    bot = build_bot(settings, session=recording_session)
-    dispatcher = build_upload_dispatcher(
-        settings=settings,
+    upload_bot = _build_upload_bot_context(
+        database_url=postgres_async_url,
         postgres_session_factory=postgres_session_factory,
         accept_service=accept_service,
-        downloader=downloader,
     )
 
-    await dispatch_document_upload(dispatcher=dispatcher, bot=bot, mime_type="image/gif")
+    await dispatch_document_upload(dispatcher=upload_bot.dispatcher, bot=upload_bot.bot, mime_type="image/gif")
 
-    assert "публичным мемом" in last_bot_text(recording_session)
+    assert "публичным мемом" in last_bot_text(upload_bot.recording_session)
     assert await migrated_db_session.scalar(
         select(CollectionMeme.meme_id).where(CollectionMeme.meme_id == public_meme.id)
     ) == public_meme.id
@@ -503,20 +529,15 @@ async def test_private_duplicate_not_visible_is_not_reported_as_public_or_saved(
             source_attach_reason=SourceAttachReason.SHA256_EXACT_EXISTING_FILE,
         )
     )
-    downloader = FakeTelegramFileDownloader()
-    settings = build_bot_settings(postgres_async_url)
-    recording_session = RecordingTelegramSession()
-    bot = build_bot(settings, session=recording_session)
-    dispatcher = build_upload_dispatcher(
-        settings=settings,
+    upload_bot = _build_upload_bot_context(
+        database_url=postgres_async_url,
         postgres_session_factory=postgres_session_factory,
         accept_service=accept_service,
-        downloader=downloader,
     )
 
-    await dispatch_photo_upload(dispatcher=dispatcher, bot=bot)
+    await dispatch_photo_upload(dispatcher=upload_bot.dispatcher, bot=upload_bot.bot)
 
-    bot_text = last_bot_text(recording_session)
+    bot_text = last_bot_text(upload_bot.recording_session)
     assert "доступной версии" in bot_text
     assert "приват" not in bot_text
     assert "публичным" not in bot_text
@@ -544,20 +565,15 @@ async def test_private_upload_duplicate_source_replay_resolves_existing_source_a
             source_attach_reason=SourceAttachReason.SHA256_EXACT_EXISTING_FILE,
         )
     )
-    downloader = FakeTelegramFileDownloader()
-    settings = build_bot_settings(postgres_async_url)
-    recording_session = RecordingTelegramSession()
-    bot = build_bot(settings, session=recording_session)
-    dispatcher = build_upload_dispatcher(
-        settings=settings,
+    upload_bot = _build_upload_bot_context(
+        database_url=postgres_async_url,
         postgres_session_factory=postgres_session_factory,
         accept_service=accept_service,
-        downloader=downloader,
     )
 
-    await dispatch_photo_upload(dispatcher=dispatcher, bot=bot)
+    await dispatch_photo_upload(dispatcher=upload_bot.dispatcher, bot=upload_bot.bot)
 
-    assert "уже было обработано" in last_bot_text(recording_session)
+    assert "уже было обработано" in last_bot_text(upload_bot.recording_session)
     saved_meme_id = await migrated_db_session.scalar(
         select(CollectionMeme.meme_id).where(CollectionMeme.meme_id == meme.id)
     )
@@ -581,20 +597,15 @@ async def test_private_upload_source_replay_without_materialized_meme_reports_pr
             owner_user_id=user.id,
         )
     )
-    downloader = FakeTelegramFileDownloader()
-    settings = build_bot_settings(postgres_async_url)
-    recording_session = RecordingTelegramSession()
-    bot = build_bot(settings, session=recording_session)
-    dispatcher = build_upload_dispatcher(
-        settings=settings,
+    upload_bot = _build_upload_bot_context(
+        database_url=postgres_async_url,
         postgres_session_factory=postgres_session_factory,
         accept_service=accept_service,
-        downloader=downloader,
     )
 
-    await dispatch_photo_upload(dispatcher=dispatcher, bot=bot)
+    await dispatch_photo_upload(dispatcher=upload_bot.dispatcher, bot=upload_bot.bot)
 
-    assert "уже в обработке" in last_bot_text(recording_session)
+    assert "уже в обработке" in last_bot_text(upload_bot.recording_session)
     assert await migrated_db_session.scalar(select(CollectionMeme.meme_id)) is None
 
 
@@ -610,21 +621,16 @@ async def test_private_upload_rejects_unsupported_document_without_download(
     await migrated_db_session.commit()
 
     accept_service = FakePrivateUploadAcceptService()
-    downloader = FakeTelegramFileDownloader()
-    settings = build_bot_settings(postgres_async_url)
-    recording_session = RecordingTelegramSession()
-    bot = build_bot(settings, session=recording_session)
-    dispatcher = build_upload_dispatcher(
-        settings=settings,
+    upload_bot = _build_upload_bot_context(
+        database_url=postgres_async_url,
         postgres_session_factory=postgres_session_factory,
         accept_service=accept_service,
-        downloader=downloader,
     )
 
-    await dispatch_document_upload(dispatcher=dispatcher, bot=bot, mime_type="video/mp4")
+    await dispatch_document_upload(dispatcher=upload_bot.dispatcher, bot=upload_bot.bot, mime_type="video/mp4")
 
-    assert "Поддерживаются только изображения" in last_bot_text(recording_session)
-    assert downloader.calls == []
+    assert "Поддерживаются только изображения" in last_bot_text(upload_bot.recording_session)
+    assert upload_bot.downloader.calls == []
     assert accept_service.calls == []
 
 
@@ -640,21 +646,16 @@ async def test_private_upload_rejects_oversize_animation_before_download(
     await migrated_db_session.commit()
 
     accept_service = FakePrivateUploadAcceptService()
-    downloader = FakeTelegramFileDownloader()
-    settings = build_bot_settings(postgres_async_url)
-    recording_session = RecordingTelegramSession()
-    bot = build_bot(settings, session=recording_session)
-    dispatcher = build_upload_dispatcher(
-        settings=settings,
+    upload_bot = _build_upload_bot_context(
+        database_url=postgres_async_url,
         postgres_session_factory=postgres_session_factory,
         accept_service=accept_service,
-        downloader=downloader,
     )
 
-    await dispatch_animation_upload(dispatcher=dispatcher, bot=bot, file_size=21)
+    await dispatch_animation_upload(dispatcher=upload_bot.dispatcher, bot=upload_bot.bot, file_size=21)
 
-    assert "Файл слишком большой" in last_bot_text(recording_session)
-    assert downloader.calls == []
+    assert "Файл слишком большой" in last_bot_text(upload_bot.recording_session)
+    assert upload_bot.downloader.calls == []
     assert accept_service.calls == []
 
 
@@ -666,21 +667,16 @@ async def test_private_upload_auto_creates_user_and_favorites_before_ingest(
 ) -> None:
     _ = migrated_db_session
     accept_service = FakePrivateUploadAcceptService(accept_result=ingest_result_for())
-    downloader = FakeTelegramFileDownloader()
-    settings = build_bot_settings(postgres_async_url)
-    recording_session = RecordingTelegramSession()
-    bot = build_bot(settings, session=recording_session)
-    dispatcher = build_upload_dispatcher(
-        settings=settings,
+    upload_bot = _build_upload_bot_context(
+        database_url=postgres_async_url,
         postgres_session_factory=postgres_session_factory,
         accept_service=accept_service,
-        downloader=downloader,
     )
 
-    await dispatch_photo_upload(dispatcher=dispatcher, bot=bot)
+    await dispatch_photo_upload(dispatcher=upload_bot.dispatcher, bot=upload_bot.bot)
 
-    assert "Результат появится" in last_bot_text(recording_session)
-    assert downloader.calls == ["photo-file-1"]
+    assert "Результат появится" in last_bot_text(upload_bot.recording_session)
+    assert upload_bot.downloader.calls == ["photo-file-1"]
     assert len(accept_service.calls) == 1
     source = accept_service.calls[0]["source"]
     assert isinstance(source, IngestAcceptSource)
@@ -712,21 +708,16 @@ async def test_private_upload_existing_user_without_active_collection_defaults_t
     await migrated_db_session.commit()
 
     accept_service = FakePrivateUploadAcceptService(accept_result=ingest_result_for(owner_user_id=user.id))
-    downloader = FakeTelegramFileDownloader()
-    settings = build_bot_settings(postgres_async_url)
-    recording_session = RecordingTelegramSession()
-    bot = build_bot(settings, session=recording_session)
-    dispatcher = build_upload_dispatcher(
-        settings=settings,
+    upload_bot = _build_upload_bot_context(
+        database_url=postgres_async_url,
         postgres_session_factory=postgres_session_factory,
         accept_service=accept_service,
-        downloader=downloader,
     )
 
-    await dispatch_photo_upload(dispatcher=dispatcher, bot=bot)
+    await dispatch_photo_upload(dispatcher=upload_bot.dispatcher, bot=upload_bot.bot)
 
-    assert "Результат появится" in last_bot_text(recording_session)
-    assert downloader.calls == ["photo-file-1"]
+    assert "Результат появится" in last_bot_text(upload_bot.recording_session)
+    assert upload_bot.downloader.calls == ["photo-file-1"]
     assert len(accept_service.calls) == 1
     source = accept_service.calls[0]["source"]
     assert isinstance(source, IngestAcceptSource)
@@ -751,21 +742,16 @@ async def test_private_upload_deletion_pending_user_is_rejected_before_download(
     await migrated_db_session.commit()
 
     accept_service = FakePrivateUploadAcceptService()
-    downloader = FakeTelegramFileDownloader()
-    settings = build_bot_settings(postgres_async_url)
-    recording_session = RecordingTelegramSession()
-    bot = build_bot(settings, session=recording_session)
-    dispatcher = build_upload_dispatcher(
-        settings=settings,
+    upload_bot = _build_upload_bot_context(
+        database_url=postgres_async_url,
         postgres_session_factory=postgres_session_factory,
         accept_service=accept_service,
-        downloader=downloader,
     )
 
-    await dispatch_photo_upload(dispatcher=dispatcher, bot=bot)
+    await dispatch_photo_upload(dispatcher=upload_bot.dispatcher, bot=upload_bot.bot)
 
-    assert "недоступен или неактивен" in last_bot_text(recording_session)
-    assert downloader.calls == []
+    assert "недоступен или неактивен" in last_bot_text(upload_bot.recording_session)
+    assert upload_bot.downloader.calls == []
     assert accept_service.calls == []
     async with postgres_session_factory() as session:
         users = list(await session.scalars(select(User).where(User.telegram_id == TELEGRAM_ID)))
@@ -785,21 +771,17 @@ async def test_private_upload_reports_download_failure_without_pipeline_call(
     await migrated_db_session.commit()
 
     accept_service = FakePrivateUploadAcceptService()
-    downloader = FakeTelegramFileDownloader(error=TelegramDownloadError("boom"))
-    settings = build_bot_settings(postgres_async_url)
-    recording_session = RecordingTelegramSession()
-    bot = build_bot(settings, session=recording_session)
-    dispatcher = build_upload_dispatcher(
-        settings=settings,
+    upload_bot = _build_upload_bot_context(
+        database_url=postgres_async_url,
         postgres_session_factory=postgres_session_factory,
         accept_service=accept_service,
-        downloader=downloader,
+        downloader=FakeTelegramFileDownloader(error=TelegramDownloadError("boom")),
     )
 
-    await dispatch_photo_upload(dispatcher=dispatcher, bot=bot)
+    await dispatch_photo_upload(dispatcher=upload_bot.dispatcher, bot=upload_bot.bot)
 
-    assert "Не удалось скачать файл" in last_bot_text(recording_session)
-    assert downloader.calls == ["photo-file-1"]
+    assert "Не удалось скачать файл" in last_bot_text(upload_bot.recording_session)
+    assert upload_bot.downloader.calls == ["photo-file-1"]
     assert accept_service.calls == []
 
 
@@ -862,18 +844,13 @@ async def test_private_upload_reports_active_collection_save_failure(
             source_attach_reason=SourceAttachReason.SHA256_EXACT_EXISTING_FILE,
         )
     )
-    downloader = FakeTelegramFileDownloader()
-    settings = build_bot_settings(postgres_async_url)
-    recording_session = RecordingTelegramSession()
-    bot = build_bot(settings, session=recording_session)
-    dispatcher = build_upload_dispatcher(
-        settings=settings,
+    upload_bot = _build_upload_bot_context(
+        database_url=postgres_async_url,
         postgres_session_factory=postgres_session_factory,
         accept_service=accept_service,
-        downloader=downloader,
     )
 
-    await dispatch_photo_upload(dispatcher=dispatcher, bot=bot)
+    await dispatch_photo_upload(dispatcher=upload_bot.dispatcher, bot=upload_bot.bot)
 
-    assert "сохранить мем в активную коллекцию не удалось" in last_bot_text(recording_session)
+    assert "сохранить мем в активную коллекцию не удалось" in last_bot_text(upload_bot.recording_session)
     assert await migrated_db_session.scalar(select(CollectionMeme.meme_id)) is None
