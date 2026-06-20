@@ -6,12 +6,13 @@ MemeExpert is a meme catalog and content-pipeline service. The backend is a Fast
 
 - `memexpert-api`: FastAPI HTTP API. It exposes `/health` on port `8000` and the application routes under `/api/v1`.
 - `memexpert-workers`: RabbitMQ-backed content-pipeline workers for transcode, OCR, embedding, classification, and search-index sync.
+- `memexpert-telegram-crawler`: Dedicated Telegram crawler process. It runs DB-backed multi-session catch-up, starts live listeners, handles `SIGHUP` reload, and exits gracefully on `SIGINT`/`SIGTERM`.
 - `memexpert-scheduler`: APScheduler runtime for periodic jobs and scheduler-only operational logs.
 - `memexpert-bot`: Optional Telegram bot process using the same backend services and database.
 - `frontend`: SvelteKit Node server. It serves adapter-node output on port `3000` and uses `API_BASE_URL` for private SSR API calls.
 - Infrastructure: PostgreSQL, Redis, RabbitMQ, Qdrant, Meilisearch, MinIO/S3, and imgproxy.
 
-The Python containers are split by service target (`api`, `worker`, `scheduler`, `bot`). API/bot/scheduler images install only the project common dependencies plus their service group; the worker image is the only Python image with FFmpeg/FFprobe and the separate Python 3.13 PaddleOCR helper venv.
+The Python containers are split by service target (`api`, `worker`, `scheduler`, `bot`). API/bot/scheduler images install only the project common dependencies plus their service group; the worker image is the only Python image with FFmpeg/FFprobe, Telethon crawler dependencies, and the separate Python 3.13 PaddleOCR helper venv.
 
 ## Prerequisites
 
@@ -48,7 +49,7 @@ Important runtime variables:
 - `HOST`, `PORT`, `ORIGIN`: SvelteKit adapter-node server settings.
 - `FRONTEND_ORIGIN`: canonical public origin for frontend-generated SEO XML. Production should use `https://memexpert.net`; if unset, frontend XML falls back to `ORIGIN`, then `https://memexpert.net`.
 - `AUTH_TELEGRAM_BOT_TOKEN`: required only when running the optional bot profile.
-- `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_SESSION_ENCRYPTION_SECRET`: optional Telegram crawler settings. Production must set a high-entropy encryption secret before importing DB-backed Telethon StringSessions.
+- `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_SESSION_ENCRYPTION_SECRET`: Telegram crawler settings. Production must set the API credentials and a high-entropy encryption secret before importing DB-backed Telethon StringSessions or running `memexpert-telegram-crawler`.
 - `SCHEDULER_*`: enable flags, interval seconds, and PostgreSQL advisory-lock settings for the scheduler process.
 
 ## Local Development
@@ -83,6 +84,12 @@ Run the workers:
 
 ```sh
 uv run memexpert-workers
+```
+
+Run the dedicated Telegram crawler after configuring `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, and `TELEGRAM_SESSION_ENCRYPTION_SECRET`:
+
+```sh
+uv run memexpert-telegram-crawler
 ```
 
 Run the scheduler:
@@ -216,6 +223,12 @@ Run the worker image:
 docker run --rm --env-file .env.example memexpert-worker:local
 ```
 
+Run the Telegram crawler from the worker image, which includes Telethon:
+
+```sh
+docker run --rm --env-file .env.example memexpert-worker:local memexpert-telegram-crawler
+```
+
 Run the scheduler from the main image:
 
 ```sh
@@ -275,7 +288,7 @@ docker compose --env-file .env.prod -f docker-compose.prod.example.yml pull
 docker compose --env-file .env.prod -f docker-compose.prod.example.yml up -d
 ```
 
-The production example uses `MEMEXPERT_MAIN_IMAGE` for `migrate`, `api`, `scheduler`, and `bot`, and `MEMEXPERT_WORKER_IMAGE` for worker nodes with extra worker dependencies and media/OCR tooling. It starts exactly one `scheduler` service; if a second scheduler container is started accidentally, the PostgreSQL advisory lock remains the duplicate-run guard.
+The production example uses `MEMEXPERT_MAIN_IMAGE` for `migrate`, `api`, `scheduler`, and `bot`, and `MEMEXPERT_WORKER_IMAGE` for `workers` plus `telegram-crawler` because the crawler needs Telethon from the worker dependency group. It starts exactly one `scheduler` service; if a second scheduler container is started accidentally, the PostgreSQL advisory lock remains the duplicate-run guard.
 
 Run the optional bot profile only when `AUTH_TELEGRAM_BOT_TOKEN` is configured:
 
@@ -293,7 +306,7 @@ Check status and logs:
 
 ```sh
 docker compose --env-file .env.prod -f docker-compose.prod.example.yml ps
-docker compose --env-file .env.prod -f docker-compose.prod.example.yml logs -f api workers scheduler frontend
+docker compose --env-file .env.prod -f docker-compose.prod.example.yml logs -f api workers telegram-crawler scheduler frontend
 ```
 
 ## Containerized PRD E2E
