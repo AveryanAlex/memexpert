@@ -114,6 +114,9 @@ jobs:
       - name: Validate production compose example
         run: docker compose --env-file .env.prod.example -f docker-compose.prod.example.yml config
 
+      - name: Validate production compose app environment
+        run: python3 scripts/validate_prod_compose_env.py
+
       - name: Build main image
         uses: docker/build-push-action@v6
         with:
