@@ -108,6 +108,22 @@ def test_settings_parse_pipeline_contract_and_normalize_object_prefixes() -> Non
     assert broker_settings.ocr_queue == "pipeline.ocr"
     assert broker_settings.source_engagement_capture_queue == "pipeline.source_engagement_capture"
     assert broker_settings.source_engagement_capture_routing_key == "pipeline.source_engagement_capture"
+    assert broker_settings.source_engagement_capture_binding_key == "pipeline.source_engagement_capture.#"
+    assert broker_settings.source_engagement_capture_queue_for_session("session-a.abc123") == (
+        "pipeline.source_engagement_capture.session-a.abc123"
+    )
+    assert broker_settings.source_engagement_capture_retry_queue_for_session("session-a.abc123") == (
+        "pipeline.source_engagement_capture.session-a.abc123.retry"
+    )
+    assert broker_settings.source_engagement_capture_binding_key_for_session("session-a.abc123") == (
+        "pipeline.source_engagement_capture.session-a.abc123"
+    )
+    assert broker_settings.source_engagement_capture_retry_request_routing_key_for_session("session-a.abc123") == (
+        "pipeline.retry.source_engagement_capture.session-a.abc123"
+    )
+    assert broker_settings.source_engagement_capture_retry_routing_key_for_session("session-a.abc123") == (
+        "pipeline.source_engagement_capture_retry.session-a.abc123"
+    )
     assert broker_settings.dead_letter_routing_key == "pipeline.dead_letter"
 
 
@@ -160,6 +176,7 @@ def test_settings_parse_scheduler_contracts() -> None:
             "scheduler_source_engagement_capture_enabled": False,
             "scheduler_source_engagement_capture_interval_seconds": 120.0,
             "scheduler_source_engagement_capture_batch_size": 7,
+            "scheduler_source_engagement_capture_per_session_batch_size": 3,
             "scheduler_source_engagement_capture_lease_timeout_seconds": 45.0,
             "scheduler_motd_interval_seconds": 300.0,
             "motd_algorithm_version": " motd_test_v2 ",
@@ -184,6 +201,7 @@ def test_settings_parse_scheduler_contracts() -> None:
     assert settings.scheduler_source_engagement_capture_enabled is False
     assert settings.scheduler_source_engagement_capture_interval_seconds == 120.0
     assert settings.scheduler_source_engagement_capture_batch_size == 7
+    assert settings.scheduler_source_engagement_capture_per_session_batch_size == 3
     assert settings.scheduler_source_engagement_capture_lease_timeout_seconds == 45.0
     assert settings.scheduler_motd_interval_seconds == 300.0
     assert settings.motd_algorithm_version == "motd_test_v2"
@@ -209,6 +227,7 @@ def test_settings_scheduler_source_engagement_defaults_match_design() -> None:
     assert settings.scheduler_source_engagement_capture_enabled is True
     assert settings.scheduler_source_engagement_capture_interval_seconds == 21600.0
     assert settings.scheduler_source_engagement_capture_batch_size == 100
+    assert settings.scheduler_source_engagement_capture_per_session_batch_size == 20
     assert settings.scheduler_source_engagement_capture_lease_timeout_seconds == 1800.0
 
 
@@ -232,6 +251,7 @@ def test_settings_scheduler_batch_job_defaults_match_design() -> None:
     "field_name,bad_value",
     [
         ("scheduler_search_index_sync_batch_size", 0),
+        ("scheduler_source_engagement_capture_per_session_batch_size", 0),
         ("scheduler_search_index_sync_processing_timeout_seconds", 0.0),
         ("scheduler_seo_backlog_batch_size", 0),
         ("motd_candidate_lookback_days", 0),

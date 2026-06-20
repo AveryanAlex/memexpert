@@ -10,6 +10,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, cast
 
 from sqlalchemy import func, or_, select
@@ -19,6 +20,7 @@ from memexpert.crawlers.telegram.client import (
     PipelineTelegramFloodWaitError,
     PipelineTelegramSessionAuthRequiredError,
     PipelineTelegramSessionBannedError,
+    PipelineTelegramSessionNotRunnableError,
 )
 from memexpert.crawlers.telegram.runtime import CrawlerCatchupReport, TelegramCrawlerRuntime
 from memexpert.ingest.crawler_service import PipelineCrawlerIngestService
@@ -33,6 +35,7 @@ if TYPE_CHECKING:
 
     from memexpert.core.config import Settings
     from memexpert.core.database import AsyncSessionFactory
+    from memexpert.pipeline.events import SourceEngagementCaptureRequestedEvent
     from memexpert.schemas.content_pipeline import CrawlerIngestResult
 
 
@@ -128,6 +131,35 @@ class TelegramSessionManager:
             ):
                 await self.invalidate_session(session_id=session_state.id)
                 raise
+
+    async def source_engagement_client_for_event(
+        self,
+        event: SourceEngagementCaptureRequestedEvent,
+    ) -> PipelineTelegramClientProtocol:
+        """Return the cached runnable client for a source-engagement stats fetch event."""
+
+        async with self.session_factory() as db_session:
+            session_state = await db_session.get(TelegramSession, event.telegram_session_id)
+            if session_state is None:
+                raise PipelineTelegramSessionNotRunnableError(
+                    f"Telegram session {event.telegram_session_id} does not exist.",
+                )
+            if session_state.name != event.session_name:
+                raise PipelineTelegramSessionNotRunnableError(
+                    f"Telegram session {event.telegram_session_id} is named {session_state.name!r}, "
+                    f"not {event.session_name!r}.",
+                )
+            if self._is_session_flood_waited(session_state):
+                wait_seconds = self._remaining_flood_wait_seconds(session_state)
+                raise PipelineTelegramFloodWaitError(
+                    f"Telegram session {session_state.name!r} is flood-waited for {wait_seconds}s.",
+                    wait_seconds=wait_seconds,
+                )
+            try:
+                self._assert_runnable_session(session_state, workload="engagement")
+            except CrawlerSessionNotRunnableError as exc:
+                raise PipelineTelegramSessionNotRunnableError(str(exc)) from exc
+            return await self._get_cached_client(session_state)
 
     async def start_live_all(self) -> None:
         """Start one listener for each runnable live-enabled session and stop stale ones."""
@@ -325,7 +357,7 @@ class TelegramSessionManager:
             raise CrawlerSessionNotRunnableError(
                 f"Telegram session {session_state.name!r} is {session_state.status.value}, not active.",
             )
-        if session_state.flood_wait_until is not None and session_state.flood_wait_until > now:
+        if session_state.flood_wait_until is not None and self._as_utc(session_state.flood_wait_until) > now:
             raise CrawlerSessionNotRunnableError(
                 f"Telegram session {session_state.name!r} is flood-waited until {session_state.flood_wait_until}.",
             )
@@ -338,6 +370,10 @@ class TelegramSessionManager:
         if workload == "live" and not session_state.live_enabled:
             raise CrawlerSessionNotRunnableError(
                 f"Telegram session {session_state.name!r} has live listening disabled.",
+            )
+        if workload == "engagement" and not session_state.engagement_enabled:
+            raise CrawlerSessionNotRunnableError(
+                f"Telegram session {session_state.name!r} has source engagement disabled.",
             )
 
     def _runnable_filters(self, *, workload: str) -> Sequence[ColumnElement[bool]]:
@@ -352,7 +388,30 @@ class TelegramSessionManager:
             filters.append(TelegramSession.catchup_enabled.is_(True))
         elif workload == "live":
             filters.append(TelegramSession.live_enabled.is_(True))
+        elif workload == "engagement":
+            filters.append(TelegramSession.engagement_enabled.is_(True))
         return filters
+
+    def _is_session_flood_waited(self, session_state: TelegramSession) -> bool:
+        if session_state.status is TelegramSessionStatus.FLOOD_WAIT:
+            return True
+        return bool(
+            session_state.flood_wait_until is not None
+            and self._as_utc(session_state.flood_wait_until) > utcnow()
+        )
+
+    def _remaining_flood_wait_seconds(self, session_state: TelegramSession) -> int:
+        if session_state.flood_wait_until is None:
+            return 1
+        flood_wait_until = self._as_utc(session_state.flood_wait_until)
+        remaining = (flood_wait_until - utcnow()).total_seconds()
+        return max(int(remaining), 1)
+
+    @staticmethod
+    def _as_utc(value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
 
     async def _channel_ids_for_session(
         self,

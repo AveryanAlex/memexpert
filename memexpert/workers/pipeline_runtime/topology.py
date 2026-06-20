@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, cast
 from faststream import AckPolicy
 from faststream.rabbit import ExchangeType, RabbitBroker, RabbitExchange, RabbitQueue
 from faststream.rabbit.annotations import RabbitMessage
+from sqlalchemy import select
 
 from memexpert.core.broker import PipelineBrokerSettings, get_pipeline_broker, get_pipeline_broker_settings
 from memexpert.core.classification import (
@@ -36,12 +37,19 @@ from memexpert.core.qdrant import (
 )
 from memexpert.core.storage import get_s3_client
 from memexpert.core.voyage import VoyageClientProtocol, build_pipeline_voyage_client
+from memexpert.crawlers.telegram.manager import TelegramSessionManager
 from memexpert.media.inspect import PipelineMediaProcessor
+from memexpert.models.content import TelegramSession
 from memexpert.models.enums import ContentPipelineStage
-from memexpert.services.source_engagement_capture import build_pipeline_source_engagement_telegram_client_factory
+from memexpert.pipeline.events import build_source_engagement_session_key
+from memexpert.services.source_engagement_capture import (
+    build_pipeline_source_engagement_telegram_client_factory,
+)
 from memexpert.workers.pipeline_runtime.runtime import PipelineRuntime, RabbitMessageLike
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from memexpert.media.contracts import PipelineMediaProcessorProtocol
     from memexpert.services.source_engagement_capture import SourceEngagementTelegramClientFactory
     from memexpert.workers.pipeline_runtime.stages.context import ObjectStorageClientLike
@@ -89,6 +97,25 @@ def _build_stage_queue(
     )
 
 
+def _build_source_engagement_capture_queue(
+    *,
+    queue_name: str,
+    routing_key: str,
+    retry_request_routing_key: str,
+    retry_exchange: str,
+) -> RabbitQueue:
+    return RabbitQueue(
+        queue_name,
+        durable=True,
+        routing_key=routing_key,
+        arguments={
+            "x-single-active-consumer": True,
+            "x-dead-letter-exchange": retry_exchange,
+            "x-dead-letter-routing-key": retry_request_routing_key,
+        },
+    )
+
+
 def _build_retry_queue(
     *,
     queue_name: str,
@@ -128,6 +155,9 @@ def build_pipeline_runtime(
     meilisearch_sync_client: MeilisearchSyncClientProtocol | None = None,
     classification_client: ClassificationClientProtocol | None = None,
     source_engagement_telegram_client_factory: SourceEngagementTelegramClientFactory | None = None,
+    source_engagement_close_telegram_client_after_capture: bool | None = None,
+    source_engagement_telegram_session_manager: TelegramSessionManager | None = None,
+    source_engagement_session_keys: Sequence[str] = (),
 ) -> PipelineRuntime:
     """Build the RabbitMQ heavy-worker runtime and register its FastStream subscribers."""
 
@@ -150,12 +180,26 @@ def build_pipeline_runtime(
     resolved_classification_client = classification_client or build_pipeline_classification_client(
         settings=resolved_settings,
     )
-    resolved_source_engagement_telegram_client_factory = (
-        source_engagement_telegram_client_factory
-        or build_pipeline_source_engagement_telegram_client_factory(resolved_settings)
-    )
+    if source_engagement_telegram_client_factory is None:
+        resolved_source_engagement_telegram_session_manager = (
+            source_engagement_telegram_session_manager
+            or TelegramSessionManager(settings=resolved_settings, session_factory=resolved_session_factory)
+        )
+        resolved_source_engagement_telegram_client_factory = build_pipeline_source_engagement_telegram_client_factory(
+            resolved_settings,
+            session_manager=resolved_source_engagement_telegram_session_manager,
+        )
+        resolved_source_engagement_close_telegram_client_after_capture = False
+    else:
+        resolved_source_engagement_telegram_session_manager = source_engagement_telegram_session_manager
+        resolved_source_engagement_telegram_client_factory = source_engagement_telegram_client_factory
+        resolved_source_engagement_close_telegram_client_after_capture = True
+    if source_engagement_close_telegram_client_after_capture is not None:
+        resolved_source_engagement_close_telegram_client_after_capture = (
+            source_engagement_close_telegram_client_after_capture
+        )
+    resolved_source_engagement_session_keys = tuple(dict.fromkeys(source_engagement_session_keys))
     transcode_retry_queue_name = f"{resolved_broker_settings.transcode_queue}.retry"
-    source_engagement_capture_retry_queue_name = f"{resolved_broker_settings.source_engagement_capture_queue}.retry"
     ocr_retry_queue_name = f"{resolved_broker_settings.ocr_queue}.retry"
     embed_retry_queue_name = f"{resolved_broker_settings.embed_queue}.retry"
     classify_retry_queue_name = f"{resolved_broker_settings.classify_queue}.retry"
@@ -201,11 +245,16 @@ def build_pipeline_runtime(
             retry_request_routing_key=resolved_broker_settings.media_inspect_retry_request_routing_key,
             retry_exchange=resolved_broker_settings.retry_exchange,
         ),
-        source_engagement_capture_queue=_build_stage_queue(
-            queue_name=resolved_broker_settings.source_engagement_capture_queue,
-            routing_key=resolved_broker_settings.source_engagement_capture_routing_key,
-            retry_request_routing_key=resolved_broker_settings.source_engagement_capture_retry_request_routing_key,
-            retry_exchange=resolved_broker_settings.retry_exchange,
+        source_engagement_capture_queues=tuple(
+            _build_source_engagement_capture_queue(
+                queue_name=resolved_broker_settings.source_engagement_capture_queue_for_session(session_key),
+                routing_key=resolved_broker_settings.source_engagement_capture_binding_key_for_session(session_key),
+                retry_request_routing_key=(
+                    resolved_broker_settings.source_engagement_capture_retry_request_routing_key_for_session(session_key)
+                ),
+                retry_exchange=resolved_broker_settings.retry_exchange,
+            )
+            for session_key in resolved_source_engagement_session_keys
         ),
         transcode_queue=_build_stage_queue(
             queue_name=resolved_broker_settings.transcode_queue,
@@ -249,11 +298,16 @@ def build_pipeline_runtime(
             exchange=resolved_broker_settings.exchange,
             retry_return_routing_key=resolved_broker_settings.media_inspect_retry_routing_key,
         ),
-        source_engagement_capture_retry_queue=_build_retry_queue(
-            queue_name=source_engagement_capture_retry_queue_name,
-            retry_backoff_milliseconds=resolved_broker_settings.retry_backoff_milliseconds,
-            exchange=resolved_broker_settings.exchange,
-            retry_return_routing_key=resolved_broker_settings.source_engagement_capture_retry_routing_key,
+        source_engagement_capture_retry_queues=tuple(
+            _build_retry_queue(
+                queue_name=resolved_broker_settings.source_engagement_capture_retry_queue_for_session(session_key),
+                retry_backoff_milliseconds=resolved_broker_settings.retry_backoff_milliseconds,
+                exchange=resolved_broker_settings.exchange,
+                retry_return_routing_key=(
+                    resolved_broker_settings.source_engagement_capture_retry_routing_key_for_session(session_key)
+                ),
+            )
+            for session_key in resolved_source_engagement_session_keys
         ),
         transcode_retry_queue=_build_retry_queue(
             queue_name=transcode_retry_queue_name,
@@ -301,6 +355,10 @@ def build_pipeline_runtime(
         meilisearch_sync_client=resolved_meilisearch_sync_client,
         classification_client=resolved_classification_client,
         source_engagement_telegram_client_factory=resolved_source_engagement_telegram_client_factory,
+        source_engagement_close_telegram_client_after_capture=(
+            resolved_source_engagement_close_telegram_client_after_capture
+        ),
+        source_engagement_telegram_session_manager=resolved_source_engagement_telegram_session_manager,
     )
 
     @resolved_broker.subscriber(
@@ -312,14 +370,16 @@ def build_pipeline_runtime(
         rabbit_message = cast("RabbitMessageLike", cast("object", message))
         await runtime.handle_media_inspect_message(payload, rabbit_message)
 
-    @resolved_broker.subscriber(
-        runtime.source_engagement_capture_queue,
-        runtime.pipeline_exchange,
-        ack_policy=AckPolicy.MANUAL,
-    )
-    async def _consume_source_engagement_capture(payload: object, message: RabbitMessage) -> None:
-        rabbit_message = cast("RabbitMessageLike", cast("object", message))
-        await runtime.handle_source_engagement_capture_message(payload, rabbit_message)
+    for source_engagement_capture_queue in runtime.source_engagement_capture_queues:
+
+        @resolved_broker.subscriber(
+            source_engagement_capture_queue,
+            runtime.pipeline_exchange,
+            ack_policy=AckPolicy.MANUAL,
+        )
+        async def _consume_source_engagement_capture(payload: object, message: RabbitMessage) -> None:
+            rabbit_message = cast("RabbitMessageLike", cast("object", message))
+            await runtime.handle_source_engagement_capture_message(payload, rabbit_message)
 
     @resolved_broker.subscriber(
         runtime.transcode_queue,
@@ -378,10 +438,32 @@ def build_pipeline_runtime(
     return runtime
 
 
+async def _load_source_engagement_session_keys(session_factory: AsyncSessionFactory) -> tuple[str, ...]:
+    async with session_factory() as session:
+        result = await session.execute(
+            select(TelegramSession.id, TelegramSession.name)
+            .where(
+                TelegramSession.enabled.is_(True),
+                TelegramSession.engagement_enabled.is_(True),
+            )
+            .order_by(TelegramSession.name.asc(), TelegramSession.id.asc())
+        )
+        return tuple(
+            build_source_engagement_session_key(session_id, session_name)
+            for session_id, session_name in result.all()
+        )
+
+
 async def run_pipeline_runtime(*, settings: Settings | None = None) -> None:
     """Start the real RabbitMQ-backed content-pipeline worker runtime."""
 
-    runtime = build_pipeline_runtime(settings=settings)
+    session_factory = get_async_session_factory()
+    source_engagement_session_keys = await _load_source_engagement_session_keys(session_factory)
+    runtime = build_pipeline_runtime(
+        settings=settings,
+        session_factory=session_factory,
+        source_engagement_session_keys=source_engagement_session_keys,
+    )
     await runtime.run()
 
 

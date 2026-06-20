@@ -53,6 +53,7 @@ from memexpert.workers.pipeline_runtime.stages.media_inspect import run_media_in
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
+    from memexpert.crawlers.telegram.manager import TelegramSessionManager
     from memexpert.media.contracts import PipelineMediaProcessorProtocol
     from memexpert.workers.pipeline_runtime.stages.context import ObjectStorageClientLike
 
@@ -83,7 +84,7 @@ class PipelineRuntime:
     retry_exchange: RabbitExchange
     dead_letter_exchange: RabbitExchange
     media_inspect_queue: RabbitQueue
-    source_engagement_capture_queue: RabbitQueue
+    source_engagement_capture_queues: tuple[RabbitQueue, ...]
     transcode_queue: RabbitQueue
     ocr_queue: RabbitQueue
     embed_queue: RabbitQueue
@@ -91,7 +92,7 @@ class PipelineRuntime:
     sync_qdrant_queue: RabbitQueue
     sync_meili_queue: RabbitQueue
     media_inspect_retry_queue: RabbitQueue
-    source_engagement_capture_retry_queue: RabbitQueue
+    source_engagement_capture_retry_queues: tuple[RabbitQueue, ...]
     transcode_retry_queue: RabbitQueue
     ocr_retry_queue: RabbitQueue
     embed_retry_queue: RabbitQueue
@@ -108,6 +109,8 @@ class PipelineRuntime:
     meilisearch_sync_client: MeilisearchSyncClientProtocol
     classification_client: ClassificationClientProtocol
     source_engagement_telegram_client_factory: SourceEngagementTelegramClientFactory
+    source_engagement_close_telegram_client_after_capture: bool
+    source_engagement_telegram_session_manager: TelegramSessionManager | None = None
 
     async def declare_topology(self) -> None:
         """Declare the heavy-worker queues, retry queues, and DLQ topology explicitly."""
@@ -116,7 +119,9 @@ class PipelineRuntime:
         retry_exchange = await self.broker.declare_exchange(self.retry_exchange)
         dead_letter_exchange = await self.broker.declare_exchange(self.dead_letter_exchange)
         media_inspect_queue = await self.broker.declare_queue(self.media_inspect_queue)
-        source_engagement_capture_queue = await self.broker.declare_queue(self.source_engagement_capture_queue)
+        source_engagement_capture_queues = [
+            await self.broker.declare_queue(queue) for queue in self.source_engagement_capture_queues
+        ]
         transcode_queue = await self.broker.declare_queue(self.transcode_queue)
         ocr_queue = await self.broker.declare_queue(self.ocr_queue)
         embed_queue = await self.broker.declare_queue(self.embed_queue)
@@ -124,9 +129,9 @@ class PipelineRuntime:
         sync_qdrant_queue = await self.broker.declare_queue(self.sync_qdrant_queue)
         sync_meili_queue = await self.broker.declare_queue(self.sync_meili_queue)
         media_inspect_retry_queue = await self.broker.declare_queue(self.media_inspect_retry_queue)
-        source_engagement_capture_retry_queue = await self.broker.declare_queue(
-            self.source_engagement_capture_retry_queue,
-        )
+        source_engagement_capture_retry_queues = [
+            await self.broker.declare_queue(queue) for queue in self.source_engagement_capture_retry_queues
+        ]
         transcode_retry_queue = await self.broker.declare_queue(self.transcode_retry_queue)
         ocr_retry_queue = await self.broker.declare_queue(self.ocr_retry_queue)
         embed_retry_queue = await self.broker.declare_queue(self.embed_retry_queue)
@@ -162,14 +167,16 @@ class PipelineRuntime:
 
         _ = await media_inspect_queue.bind(exchange, routing_key=self.broker_settings.media_inspect_routing_key)
         _ = await media_inspect_queue.bind(exchange, routing_key=self.broker_settings.media_inspect_retry_routing_key)
-        _ = await source_engagement_capture_queue.bind(
-            exchange,
-            routing_key=self.broker_settings.source_engagement_capture_routing_key,
-        )
-        _ = await source_engagement_capture_queue.bind(
-            exchange,
-            routing_key=self.broker_settings.source_engagement_capture_retry_routing_key,
-        )
+        for source_engagement_capture_queue in source_engagement_capture_queues:
+            session_key = self._source_engagement_session_key_for_queue(source_engagement_capture_queue.name)
+            _ = await source_engagement_capture_queue.bind(
+                exchange,
+                routing_key=self.broker_settings.source_engagement_capture_binding_key_for_session(session_key),
+            )
+            _ = await source_engagement_capture_queue.bind(
+                exchange,
+                routing_key=self.broker_settings.source_engagement_capture_retry_routing_key_for_session(session_key),
+            )
         _ = await transcode_queue.bind(exchange, routing_key=self.broker_settings.meme_created_routing_key)
         _ = await transcode_queue.bind(exchange, routing_key=self.broker_settings.stage_replay_routing_key)
         _ = await transcode_queue.bind(exchange, routing_key=self.broker_settings.transcode_retry_routing_key)
@@ -187,10 +194,16 @@ class PipelineRuntime:
             retry_exchange,
             routing_key=self.broker_settings.media_inspect_retry_request_routing_key,
         )
-        _ = await source_engagement_capture_retry_queue.bind(
-            retry_exchange,
-            routing_key=self.broker_settings.source_engagement_capture_retry_request_routing_key,
-        )
+        for source_engagement_capture_retry_queue in source_engagement_capture_retry_queues:
+            session_key = self._source_engagement_session_key_for_retry_queue(
+                source_engagement_capture_retry_queue.name,
+            )
+            _ = await source_engagement_capture_retry_queue.bind(
+                retry_exchange,
+                routing_key=self.broker_settings.source_engagement_capture_retry_request_routing_key_for_session(
+                    session_key,
+                ),
+            )
         _ = await transcode_retry_queue.bind(retry_exchange, routing_key=self.broker_settings.retry_routing_key)
         _ = await ocr_retry_queue.bind(retry_exchange, routing_key=self.broker_settings.ocr_retry_request_routing_key)
         _ = await embed_retry_queue.bind(retry_exchange, routing_key=embed_retry_request_routing_key)
@@ -253,9 +266,10 @@ class PipelineRuntime:
                 self.session_factory,
                 capture_event,
                 telegram_client_factory=self.source_engagement_telegram_client_factory,
+                close_telegram_client_after_capture=self.source_engagement_close_telegram_client_after_capture,
             )
         except Exception:
-            effective_attempt = self._source_engagement_capture_effective_attempt(message)
+            effective_attempt = self._source_engagement_capture_effective_attempt(capture_event, message)
             if effective_attempt < self.broker_settings.retry_max_attempts:
                 await message.reject(requeue=False)
                 return
@@ -493,7 +507,11 @@ class PipelineRuntime:
             await self.declare_topology()
             await resolved_stop_event.wait()
         finally:
-            await self.broker.stop()
+            try:
+                if self.source_engagement_telegram_session_manager is not None:
+                    await self.source_engagement_telegram_session_manager.shutdown()
+            finally:
+                await self.broker.stop()
 
     def _effective_attempt(
         self,
@@ -521,11 +539,31 @@ class PipelineRuntime:
     def _media_inspect_effective_attempt(self, message: RabbitMessageLike) -> int:
         return max(1 + self._retry_cycle_count_for_queue(self.media_inspect_retry_queue.name, message.headers), 1)
 
-    def _source_engagement_capture_effective_attempt(self, message: RabbitMessageLike) -> int:
+    def _source_engagement_capture_effective_attempt(
+        self,
+        capture_event: SourceEngagementCaptureRequestedEvent,
+        message: RabbitMessageLike,
+    ) -> int:
+        retry_queue_name = self.broker_settings.source_engagement_capture_retry_queue_for_session(
+            capture_event.session_key,
+        )
         return max(
-            1 + self._retry_cycle_count_for_queue(self.source_engagement_capture_retry_queue.name, message.headers),
+            1 + self._retry_cycle_count_for_queue(retry_queue_name, message.headers),
             1,
         )
+
+    def _source_engagement_session_key_for_queue(self, queue_name: str) -> str:
+        prefix = f"{self.broker_settings.source_engagement_capture_queue}."
+        if not queue_name.startswith(prefix):
+            raise ValueError(f"Unexpected source engagement queue name {queue_name!r}.")
+        return queue_name.removeprefix(prefix)
+
+    def _source_engagement_session_key_for_retry_queue(self, queue_name: str) -> str:
+        prefix = f"{self.broker_settings.source_engagement_capture_queue}."
+        suffix = ".retry"
+        if not queue_name.startswith(prefix) or not queue_name.endswith(suffix):
+            raise ValueError(f"Unexpected source engagement retry queue name {queue_name!r}.")
+        return queue_name.removeprefix(prefix).removesuffix(suffix)
 
     def _retry_cycle_count(self, stage: ContentPipelineStage, headers: dict[str, Any]) -> int:
         raw_x_death = headers.get("x-death")
