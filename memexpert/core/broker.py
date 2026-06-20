@@ -6,7 +6,7 @@ import asyncio
 import inspect
 import re
 from dataclasses import dataclass
-from typing import Final, cast
+from typing import TYPE_CHECKING, Final, cast
 from urllib.parse import urlparse, urlunparse
 
 import aio_pika
@@ -16,6 +16,9 @@ from faststream.rabbit import RabbitBroker
 from memexpert.core.config import Settings, get_settings
 from memexpert.models.enums import ContentPipelineStage
 from memexpert.schemas.content_pipeline import ContentPipelineEventType
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 DEFAULT_RABBITMQ_CONNECTION_TIMEOUT_SECONDS: Final = 5.0
 SUPPORTED_RABBITMQ_SCHEMES: Final[frozenset[str]] = frozenset({"amqp", "amqps"})
@@ -65,9 +68,36 @@ class PipelineBrokerSettings:
 
     @property
     def source_engagement_capture_routing_key(self) -> str:
-        """Return the routing key used to dispatch scheduled source engagement work."""
+        """Return the source engagement routing-key prefix before the per-session suffix."""
 
         return f"{self.routing_key_prefix}.source_engagement_capture"
+
+    @property
+    def source_engagement_capture_binding_key(self) -> str:
+        """Return the legacy wildcard binding key for all source engagement work."""
+
+        return f"{self.source_engagement_capture_routing_key}.#"
+
+    def source_engagement_capture_queue_for_session(self, session_key: str) -> str:
+        """Return the stable main queue name for one source-engagement Telegram session."""
+
+        return f"{self.source_engagement_capture_queue}.{self._normalize_source_engagement_session_key(session_key)}"
+
+    def source_engagement_capture_retry_queue_for_session(self, session_key: str) -> str:
+        """Return the stable retry queue name for one source-engagement Telegram session."""
+
+        return f"{self.source_engagement_capture_queue_for_session(session_key)}.retry"
+
+    def source_engagement_capture_routing_key_for_session(self, session_key: str) -> str:
+        """Return the main-exchange routing key for one source-engagement Telegram session."""
+
+        normalized_session_key = self._normalize_source_engagement_session_key(session_key)
+        return f"{self.source_engagement_capture_routing_key}.{normalized_session_key}"
+
+    def source_engagement_capture_binding_key_for_session(self, session_key: str) -> str:
+        """Return the main queue binding key for one source-engagement Telegram session."""
+
+        return self.source_engagement_capture_routing_key_for_session(session_key)
 
     @property
     def source_engagement_capture_retry_request_routing_key(self) -> str:
@@ -75,11 +105,27 @@ class PipelineBrokerSettings:
 
         return f"{self.routing_key_prefix}.retry.source_engagement_capture"
 
+    def source_engagement_capture_retry_request_routing_key_for_session(self, session_key: str) -> str:
+        """Return the retry-exchange routing key for one source-engagement Telegram session."""
+
+        return (
+            f"{self.source_engagement_capture_retry_request_routing_key}."
+            f"{self._normalize_source_engagement_session_key(session_key)}"
+        )
+
     @property
     def source_engagement_capture_retry_routing_key(self) -> str:
         """Return the routing key used when retried source-engagement work returns."""
 
         return f"{self.routing_key_prefix}.source_engagement_capture_retry"
+
+    def source_engagement_capture_retry_routing_key_for_session(self, session_key: str) -> str:
+        """Return the main-exchange retry return key for one source-engagement Telegram session."""
+
+        return (
+            f"{self.source_engagement_capture_retry_routing_key}."
+            f"{self._normalize_source_engagement_session_key(session_key)}"
+        )
 
     @property
     def transcode_routing_key(self) -> str:
@@ -224,6 +270,10 @@ class PipelineBrokerSettings:
         if event_type is ContentPipelineEventType.STAGE_REPLAY_REQUESTED:
             return self.stage_replay_routing_key
         return self.meme_created_routing_key
+
+    @staticmethod
+    def _normalize_source_engagement_session_key(session_key: str) -> str:
+        return _normalize_topology_name(session_key, field_name="source_engagement_session_key")
 
 
 class BrokerConfigurationError(ValueError):
@@ -421,6 +471,7 @@ async def ensure_pipeline_broker_started(
 async def verify_pipeline_broker(
     settings: Settings | None = None,
     *,
+    source_engagement_session_keys: Sequence[str] = (),
     timeout: float | None = None,
 ) -> PipelineBrokerSettings:
     """Verify RabbitMQ connectivity and durable topology declaration with a bounded timeout."""
@@ -460,16 +511,23 @@ async def verify_pipeline_broker(
                         "x-dead-letter-routing-key": broker_settings.media_inspect_retry_request_routing_key,
                     },
                 )
-                source_engagement_capture_queue = await channel.declare_queue(
-                    broker_settings.source_engagement_capture_queue,
-                    durable=True,
-                    arguments={
-                        "x-dead-letter-exchange": broker_settings.retry_exchange,
-                        "x-dead-letter-routing-key": (
-                            broker_settings.source_engagement_capture_retry_request_routing_key
-                        ),
-                    },
-                )
+                source_engagement_capture_queues = []
+                for session_key in source_engagement_session_keys:
+                    source_engagement_capture_queues.append(
+                        await channel.declare_queue(
+                            broker_settings.source_engagement_capture_queue_for_session(session_key),
+                            durable=True,
+                            arguments={
+                                "x-single-active-consumer": True,
+                                "x-dead-letter-exchange": broker_settings.retry_exchange,
+                                "x-dead-letter-routing-key": (
+                                    broker_settings.source_engagement_capture_retry_request_routing_key_for_session(
+                                        session_key,
+                                    )
+                                ),
+                            },
+                        )
+                    )
                 transcode_queue = await channel.declare_queue(
                     broker_settings.transcode_queue,
                     durable=True,
@@ -496,15 +554,21 @@ async def verify_pipeline_broker(
                         "x-dead-letter-routing-key": broker_settings.media_inspect_retry_routing_key,
                     },
                 )
-                source_engagement_capture_retry_queue = await channel.declare_queue(
-                    f"{broker_settings.source_engagement_capture_queue}.retry",
-                    durable=True,
-                    arguments={
-                        "x-message-ttl": broker_settings.retry_backoff_milliseconds,
-                        "x-dead-letter-exchange": broker_settings.exchange,
-                        "x-dead-letter-routing-key": broker_settings.source_engagement_capture_retry_routing_key,
-                    },
-                )
+                source_engagement_capture_retry_queues = []
+                for session_key in source_engagement_session_keys:
+                    source_engagement_capture_retry_queues.append(
+                        await channel.declare_queue(
+                            broker_settings.source_engagement_capture_retry_queue_for_session(session_key),
+                            durable=True,
+                            arguments={
+                                "x-message-ttl": broker_settings.retry_backoff_milliseconds,
+                                "x-dead-letter-exchange": broker_settings.exchange,
+                                "x-dead-letter-routing-key": (
+                                    broker_settings.source_engagement_capture_retry_routing_key_for_session(session_key)
+                                ),
+                            },
+                        )
+                    )
                 dead_letter_queue = await channel.declare_queue(
                     broker_settings.dead_letter_queue,
                     durable=True,
@@ -514,14 +578,19 @@ async def verify_pipeline_broker(
                     exchange,
                     routing_key=broker_settings.media_inspect_retry_routing_key,
                 )
-                _ = await source_engagement_capture_queue.bind(
-                    exchange,
-                    routing_key=broker_settings.source_engagement_capture_routing_key,
-                )
-                _ = await source_engagement_capture_queue.bind(
-                    exchange,
-                    routing_key=broker_settings.source_engagement_capture_retry_routing_key,
-                )
+                for source_engagement_capture_queue, session_key in zip(
+                    source_engagement_capture_queues,
+                    source_engagement_session_keys,
+                    strict=True,
+                ):
+                    _ = await source_engagement_capture_queue.bind(
+                        exchange,
+                        routing_key=broker_settings.source_engagement_capture_binding_key_for_session(session_key),
+                    )
+                    _ = await source_engagement_capture_queue.bind(
+                        exchange,
+                        routing_key=broker_settings.source_engagement_capture_retry_routing_key_for_session(session_key),
+                    )
                 _ = await transcode_queue.bind(exchange, routing_key=broker_settings.meme_created_routing_key)
                 _ = await transcode_queue.bind(exchange, routing_key=broker_settings.stage_replay_routing_key)
                 _ = await transcode_queue.bind(exchange, routing_key=broker_settings.transcode_retry_routing_key)
@@ -529,10 +598,17 @@ async def verify_pipeline_broker(
                     retry_exchange,
                     routing_key=broker_settings.media_inspect_retry_request_routing_key,
                 )
-                _ = await source_engagement_capture_retry_queue.bind(
-                    retry_exchange,
-                    routing_key=broker_settings.source_engagement_capture_retry_request_routing_key,
-                )
+                for source_engagement_capture_retry_queue, session_key in zip(
+                    source_engagement_capture_retry_queues,
+                    source_engagement_session_keys,
+                    strict=True,
+                ):
+                    _ = await source_engagement_capture_retry_queue.bind(
+                        retry_exchange,
+                        routing_key=broker_settings.source_engagement_capture_retry_request_routing_key_for_session(
+                            session_key,
+                        ),
+                    )
                 _ = await retry_queue.bind(retry_exchange, routing_key=broker_settings.retry_routing_key)
                 _ = await dead_letter_queue.bind(
                     dead_letter_exchange,

@@ -165,6 +165,7 @@ class Settings(BaseSettings):
     scheduler_source_engagement_capture_enabled: bool = True
     scheduler_source_engagement_capture_interval_seconds: float = Field(default=21600.0, gt=0.0)
     scheduler_source_engagement_capture_batch_size: int = Field(default=100, ge=1, le=1000)
+    scheduler_source_engagement_capture_per_session_batch_size: int = Field(default=20, ge=1, le=1000)
     scheduler_source_engagement_capture_lease_timeout_seconds: float = Field(default=1800.0, gt=0.0)
     scheduler_motd_enabled: bool = True
     scheduler_motd_interval_seconds: float = Field(default=86400.0, gt=0.0)

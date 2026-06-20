@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import re
 import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING, Final, Literal
@@ -28,6 +30,9 @@ PIPELINE_MEME_FILE_AGGREGATE_TYPE: Final = "meme_file"
 PIPELINE_MEME_SOURCE_AGGREGATE_TYPE: Final = "meme_source"
 MEDIA_INSPECT_REQUESTED_EVENT_TYPE: Final = "media_inspect_requested"
 SOURCE_ENGAGEMENT_CAPTURE_REQUESTED_EVENT_TYPE: Final = "source_engagement_capture_requested"
+_SOURCE_ENGAGEMENT_SESSION_KEY_RE: Final = re.compile(r"^[A-Za-z0-9._-]+$")
+_SOURCE_ENGAGEMENT_SESSION_KEY_PREFIX_MAX_LENGTH: Final = 48
+_SOURCE_ENGAGEMENT_SESSION_KEY_HASH_LENGTH: Final = 12
 
 
 class MediaInspectRequestedEvent(BaseModel):
@@ -56,7 +61,9 @@ class SourceEngagementCaptureRequestedEvent(BaseModel):
     post_id: str = Field(min_length=1, max_length=255)
     scheduled_for: datetime
     schedule_label: SourceEngagementScheduleLabel
-    session_name: str | None = Field(default=None, min_length=1, max_length=64)
+    telegram_session_id: uuid.UUID
+    session_name: str = Field(min_length=1, max_length=64)
+    session_key: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._-]+$")
     created_at: datetime
 
 
@@ -66,10 +73,32 @@ def build_media_inspect_routing_key(settings: Settings) -> str:
     return f"{settings.pipeline_broker_routing_key_prefix}.media_inspect"
 
 
-def build_source_engagement_capture_routing_key(settings: Settings) -> str:
+def build_source_engagement_session_key(telegram_session_id: uuid.UUID, session_name: str) -> str:
+    """Return the stable RabbitMQ-safe source engagement suffix for one Telegram session."""
+
+    normalized_name = session_name.strip()
+    if not normalized_name:
+        raise ValueError("source engagement session key requires a non-blank session_name.")
+
+    sanitized_name = re.sub(r"[^A-Za-z0-9._-]+", "-", normalized_name).strip("._-")
+    if not sanitized_name:
+        sanitized_name = "session"
+    sanitized_name = sanitized_name[:_SOURCE_ENGAGEMENT_SESSION_KEY_PREFIX_MAX_LENGTH].strip("._-") or "session"
+    session_hash = hashlib.sha256(str(telegram_session_id).encode("ascii")).hexdigest()[
+        :_SOURCE_ENGAGEMENT_SESSION_KEY_HASH_LENGTH
+    ]
+    return f"{sanitized_name}.{session_hash}"
+
+
+def build_source_engagement_capture_routing_key(settings: Settings, *, session_key: str) -> str:
     """Return the worker routing key for source engagement capture work."""
 
-    return f"{settings.pipeline_broker_routing_key_prefix}.source_engagement_capture"
+    normalized_session_key = session_key.strip()
+    if _SOURCE_ENGAGEMENT_SESSION_KEY_RE.fullmatch(normalized_session_key) is None:
+        raise ValueError(
+            "source engagement session_key may contain only letters, numbers, dots, underscores, and hyphens.",
+        )
+    return f"{settings.pipeline_broker_routing_key_prefix}.source_engagement_capture.{normalized_session_key}"
 
 
 def build_stage_routing_key(settings: Settings, stage: ContentPipelineStage) -> str:
@@ -138,10 +167,13 @@ def build_source_engagement_capture_requested_payload(
     post_id: str,
     scheduled_for: datetime,
     schedule_label: SourceEngagementScheduleLabel,
-    session_name: str | None,
+    telegram_session_id: uuid.UUID,
+    session_name: str,
     created_at: datetime,
 ) -> dict[str, object]:
     """Build the JSONB payload for a scheduled source engagement capture request."""
+
+    session_key = build_source_engagement_session_key(telegram_session_id, session_name)
 
     return SourceEngagementCaptureRequestedEvent(
         event_id=event_id,
@@ -152,7 +184,9 @@ def build_source_engagement_capture_requested_payload(
         post_id=post_id,
         scheduled_for=scheduled_for,
         schedule_label=schedule_label,
+        telegram_session_id=telegram_session_id,
         session_name=session_name,
+        session_key=session_key,
         created_at=created_at,
     ).model_dump(mode="json")
 
@@ -163,26 +197,29 @@ def build_source_engagement_capture_message_spec(
     scheduled_for: datetime,
     schedule_label: SourceEngagementScheduleLabel,
     settings: Settings,
-    session_name: str | None = None,
+    telegram_session_id: uuid.UUID,
+    session_name: str,
 ) -> RabbitMessageSpec:
     """Return a durable RabbitMQ message spec for scheduled source engagement capture."""
 
     event_id = uuid.uuid7()
     created_at = utcnow()
+    payload = build_source_engagement_capture_requested_payload(
+        event_id=event_id,
+        meme_source_id=source.id,
+        source_platform=source.platform,
+        source_id=source.source_id,
+        post_id=source.post_id,
+        scheduled_for=scheduled_for,
+        schedule_label=schedule_label,
+        telegram_session_id=telegram_session_id,
+        session_name=session_name,
+        created_at=created_at,
+    )
     return RabbitMessageSpec(
         exchange=settings.pipeline_broker_exchange,
-        routing_key=build_source_engagement_capture_routing_key(settings),
-        payload=build_source_engagement_capture_requested_payload(
-            event_id=event_id,
-            meme_source_id=source.id,
-            source_platform=source.platform,
-            source_id=source.source_id,
-            post_id=source.post_id,
-            scheduled_for=scheduled_for,
-            schedule_label=schedule_label,
-            session_name=session_name,
-            created_at=created_at,
-        ),
+        routing_key=build_source_engagement_capture_routing_key(settings, session_key=str(payload["session_key"])),
+        payload=payload,
         message_id=str(event_id),
         event_type=SOURCE_ENGAGEMENT_CAPTURE_REQUESTED_EVENT_TYPE,
         aggregate_type=PIPELINE_MEME_SOURCE_AGGREGATE_TYPE,
@@ -260,5 +297,6 @@ __all__ = [
     "build_source_engagement_capture_message_spec",
     "build_source_engagement_capture_requested_payload",
     "build_source_engagement_capture_routing_key",
+    "build_source_engagement_session_key",
     "build_stage_routing_key",
 ]

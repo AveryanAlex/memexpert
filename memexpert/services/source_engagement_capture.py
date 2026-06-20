@@ -6,7 +6,7 @@ import inspect
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, cast
 
 from sqlalchemy import select
@@ -22,12 +22,13 @@ from memexpert.crawlers.telegram.client import (
     RawTelegramMessage,
 )
 from memexpert.models.base import utcnow
-from memexpert.models.content import MemeSource, MemeSourceEngagementSnapshot
+from memexpert.models.content import MemeSource, MemeSourceEngagementSnapshot, TelegramSession
 from memexpert.models.enums import (
     SourceEngagementCaptureReason,
     SourceEngagementCommentsState,
     SourceEngagementFetchStatus,
     SourcePlatform,
+    TelegramSessionStatus,
 )
 from memexpert.pipeline.events import SourceEngagementCaptureRequestedEvent
 from memexpert.services.source_engagement import (
@@ -65,30 +66,44 @@ async def capture_source_engagement_request(
     event: SourceEngagementCaptureRequestedEvent,
     *,
     telegram_client_factory: SourceEngagementTelegramClientFactory,
+    close_telegram_client_after_capture: bool = True,
 ) -> SourceEngagementCaptureResult:
     """Fetch Telegram stats-only metadata and persist the scheduled source engagement snapshot."""
 
     service = SourceEngagementCaptureService(
         session_factory,
         telegram_client_factory=telegram_client_factory,
+        close_telegram_client_after_capture=close_telegram_client_after_capture,
     )
     return await service.capture(event)
 
 
 def build_pipeline_source_engagement_telegram_client_factory(
     settings: Settings,
+    *,
+    session_manager: object | None = None,
 ) -> SourceEngagementTelegramClientFactory:
     """Build the real runtime Telegram client factory without importing Telethon eagerly."""
 
-    def _factory(event: SourceEngagementCaptureRequestedEvent) -> PipelineTelegramClientProtocol:
-        if event.session_name is None:
+    if session_manager is None:
+        from memexpert.core.database import get_async_session_factory
+        from memexpert.crawlers.telegram.manager import TelegramSessionManager
+
+        session_manager = TelegramSessionManager(settings=settings, session_factory=get_async_session_factory())
+
+    typed_session_manager = cast("object", session_manager)
+
+    async def _factory(event: SourceEngagementCaptureRequestedEvent) -> PipelineTelegramClientProtocol:
+        client_method = getattr(typed_session_manager, "source_engagement_client_for_event", None)
+        if client_method is None:
             raise PipelineTelegramProviderUnavailableError(
-                "Source engagement capture requires a Telegram session_name on the request.",
+                "Source engagement capture requires a TelegramSessionManager-backed client factory.",
             )
 
-        from memexpert.crawlers.telegram.telethon_adapter import PipelineTelethonClient
-
-        return PipelineTelethonClient.create(settings=settings, session_name=event.session_name)
+        client = client_method(event)
+        if inspect.isawaitable(client):
+            return cast("PipelineTelegramClientProtocol", await client)
+        return cast("PipelineTelegramClientProtocol", client)
 
     return _factory
 
@@ -101,16 +116,21 @@ class SourceEngagementCaptureService:
         session_factory: AsyncSessionFactory,
         *,
         telegram_client_factory: SourceEngagementTelegramClientFactory,
+        close_telegram_client_after_capture: bool = True,
     ) -> None:
         self._session_factory = session_factory
         self._telegram_client_factory = telegram_client_factory
+        self._close_telegram_client_after_capture = close_telegram_client_after_capture
 
     async def capture(self, event: SourceEngagementCaptureRequestedEvent) -> SourceEngagementCaptureResult:
         existing_result = await self._short_circuit_existing_terminal_snapshot(event)
         if existing_result is not None:
             return existing_result
 
-        metrics, fetch_status = await self._fetch_metrics(event)
+        try:
+            metrics, fetch_status = await self._fetch_metrics(event)
+        except PipelineTelegramFloodWaitError as exc:
+            return await self._handle_flood_wait(event, exc)
         captured_at = utcnow()
 
         async with self._session_factory() as session, session.begin():
@@ -254,12 +274,52 @@ class SourceEngagementCaptureService:
             client = await _maybe_await(self._telegram_client_factory(event))
             message = await client.fetch_single_message(channel_id=event.source_id, post_id=event.post_id)
             return source_engagement_metrics_from_telegram_message(message), SourceEngagementFetchStatus.SUCCESS
+        except PipelineTelegramFloodWaitError:
+            raise
         except Exception as exc:  # noqa: BLE001 - every Telegram/provider failure becomes a handled snapshot.
             return _metrics_for_capture_error(exc), _fetch_status_for_capture_error(exc)
         finally:
-            if client is not None:
+            if client is not None and self._close_telegram_client_after_capture:
                 with suppress(Exception):
                     await client.close()
+
+    async def _handle_flood_wait(
+        self,
+        event: SourceEngagementCaptureRequestedEvent,
+        exc: PipelineTelegramFloodWaitError,
+    ) -> SourceEngagementCaptureResult:
+        captured_at = utcnow()
+        flood_wait_until = captured_at + timedelta(seconds=max(exc.wait_seconds, 0))
+        async with self._session_factory() as session, session.begin():
+            telegram_session = await session.scalar(
+                select(TelegramSession)
+                .where(
+                    TelegramSession.id == event.telegram_session_id,
+                    TelegramSession.name == event.session_name,
+                )
+                .with_for_update(of=TelegramSession)
+            )
+            if telegram_session is not None:
+                telegram_session.status = TelegramSessionStatus.FLOOD_WAIT
+                telegram_session.flood_wait_until = flood_wait_until
+                telegram_session.last_error_class = type(exc).__name__[:128]
+                telegram_session.last_error_text = str(exc)[:4000]
+
+            source = await session.scalar(
+                select(MemeSource)
+                .where(MemeSource.id == event.meme_source_id)
+                .with_for_update(of=MemeSource)
+            )
+            if source is not None and _event_matches_source(event, source):
+                _clear_matching_lease(source, event)
+
+        return SourceEngagementCaptureResult(
+            meme_source_id=event.meme_source_id,
+            fetch_status=None,
+            snapshot_id=None,
+            duplicate=False,
+            error_code=type(exc).__name__,
+        )
 
 
 def source_engagement_metrics_from_telegram_message(message: RawTelegramMessage) -> SourceEngagementMetrics:

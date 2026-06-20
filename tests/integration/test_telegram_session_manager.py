@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
@@ -17,12 +18,14 @@ from memexpert.crawlers.telegram.client import (
     PipelineTelegramProviderUnavailableError,
     PipelineTelegramSessionAuthRequiredError,
     PipelineTelegramSessionBannedError,
+    PipelineTelegramSessionNotRunnableError,
     RawTelegramMessage,
 )
 from memexpert.crawlers.telegram.manager import TelegramSessionManager
 from memexpert.ingest.crawler_service import PipelineCrawlerIngestService
 from memexpert.models.content import PipelineIngestRequest, SourceChannel, TelegramSession
-from memexpert.models.enums import SourcePlatform, TelegramSessionStatus
+from memexpert.models.enums import SourceEngagementScheduleLabel, SourcePlatform, TelegramSessionStatus
+from memexpert.pipeline.events import SourceEngagementCaptureRequestedEvent, build_source_engagement_session_key
 from memexpert.schemas.content_pipeline import CrawlerIngestOutcome
 from memexpert.services import CrawlerSessionNotRunnableError
 from tests.integration.test_ingest_accept_service import FakeStorageClient
@@ -61,6 +64,7 @@ async def _seed_session(
     flood_wait_until: datetime | None = None,
     catchup_enabled: bool = True,
     live_enabled: bool = True,
+    engagement_enabled: bool = True,
 ) -> TelegramSession:
     row = TelegramSession(
         name=session_name,
@@ -71,6 +75,7 @@ async def _seed_session(
         flood_wait_until=flood_wait_until,
         catchup_enabled=catchup_enabled,
         live_enabled=live_enabled,
+        engagement_enabled=engagement_enabled,
         last_heartbeat_at=_now(),
     )
     session.add(row)
@@ -136,6 +141,28 @@ def _build_manager(
             settings=Settings(),
             storage_client=storage,
         ),
+    )
+
+
+def _source_engagement_event_for_session(
+    row: TelegramSession,
+    *,
+    session_name: str | None = None,
+) -> SourceEngagementCaptureRequestedEvent:
+    resolved_session_name = session_name or row.name
+    return SourceEngagementCaptureRequestedEvent(
+        event_id=uuid.uuid7(),
+        event_type="source_engagement_capture_requested",
+        meme_source_id=uuid.uuid7(),
+        source_platform=SourcePlatform.TELEGRAM,
+        source_id="stats-channel",
+        post_id="100",
+        scheduled_for=_now(),
+        schedule_label=SourceEngagementScheduleLabel.PLUS_1H,
+        telegram_session_id=row.id,
+        session_name=resolved_session_name,
+        session_key=build_source_engagement_session_key(row.id, resolved_session_name),
+        created_at=_now(),
     )
 
 
@@ -212,6 +239,64 @@ async def test_manager_catch_up_all_uses_one_cached_client_per_runnable_session(
     assert beta.downloaded_message_ids == ["501"]
     assert skipped.downloaded_message_ids == []
     assert await migrated_db_session.scalar(select(func.count()).select_from(PipelineIngestRequest)) == 3
+
+
+async def test_manager_source_engagement_client_for_event_reuses_cached_client_and_validates_session(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    session_a = await _seed_session(migrated_db_session, session_name="session-a")
+    session_b = await _seed_session(migrated_db_session, session_name="session-b")
+    engagement_disabled = await _seed_session(
+        migrated_db_session,
+        session_name="engagement-disabled",
+        engagement_enabled=False,
+    )
+    flood_waited = await _seed_session(
+        migrated_db_session,
+        session_name="flood-waited",
+        status=TelegramSessionStatus.FLOOD_WAIT,
+        flood_wait_until=_now() + timedelta(minutes=10),
+    )
+    session_a_client = FakeTelegramClient()
+    session_b_client = FakeTelegramClient()
+    skipped = FakeTelegramClient()
+    created_for: list[str] = []
+    manager = _build_manager(
+        postgres_session_factory,
+        clients_by_name={
+            "session-a": session_a_client,
+            "session-b": session_b_client,
+            "engagement-disabled": skipped,
+            "flood-waited": skipped,
+        },
+        created_for=created_for,
+    )
+
+    first = await manager.source_engagement_client_for_event(_source_engagement_event_for_session(session_a))
+    second = await manager.source_engagement_client_for_event(_source_engagement_event_for_session(session_a))
+    other_session = await manager.source_engagement_client_for_event(_source_engagement_event_for_session(session_b))
+
+    assert first is session_a_client
+    assert second is session_a_client
+    assert other_session is session_b_client
+    assert created_for == ["session-a", "session-b"]
+    assert session_a_client.closed is False
+    assert session_b_client.closed is False
+
+    with pytest.raises(PipelineTelegramSessionNotRunnableError):
+        _ = await manager.source_engagement_client_for_event(
+            _source_engagement_event_for_session(session_a, session_name="renamed-session"),
+        )
+    with pytest.raises(PipelineTelegramSessionNotRunnableError):
+        _ = await manager.source_engagement_client_for_event(_source_engagement_event_for_session(engagement_disabled))
+    with pytest.raises(PipelineTelegramFloodWaitError):
+        _ = await manager.source_engagement_client_for_event(_source_engagement_event_for_session(flood_waited))
+
+    assert skipped.closed is False
+    await manager.shutdown()
+    assert session_a_client.closed is True
+    assert session_b_client.closed is True
 
 
 async def test_manager_flood_wait_parks_one_session_and_continues_healthy_session(
