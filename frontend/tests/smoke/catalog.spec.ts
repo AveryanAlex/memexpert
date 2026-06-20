@@ -9,12 +9,16 @@ test.describe('public masonry feed smoke', () => {
     await disableIntersectionObserver(page);
     await page.goto('/');
 
+    const motd = page.getByRole('region', { name: 'Meme of the Day' });
+    await expect(motd).toBeVisible();
+    await expect(motd.getByRole('link', { name: 'Open Smoke test cat reaction' })).toBeVisible();
+
     const feed = page.getByRole('list', { name: 'Meme results' });
     await expect(feed).toBeVisible();
     await expect(feed).toHaveAttribute('data-column-count', /^[2-4]$/);
 
-    const firstCardLink = page.getByRole('link', { name: 'Open Smoke test cat reaction' });
-    const firstCardMenu = page.getByRole('button', { name: 'Actions for Smoke test cat reaction' });
+    const firstCardLink = feed.getByRole('link', { name: 'Open Smoke test cat reaction' });
+    const firstCardMenu = feed.getByRole('button', { name: 'Actions for Smoke test cat reaction' });
     await expect(firstCardLink).toBeVisible();
     await expect(firstCardMenu).toBeVisible();
 
@@ -42,8 +46,8 @@ test.describe('public masonry feed smoke', () => {
     const feed = page.getByRole('list', { name: 'Meme results' });
     await expect(feed).toBeVisible();
     await expect(feed).toHaveAttribute('data-column-count', '1');
-    await expect(page.getByRole('link', { name: 'Open Smoke test cat reaction' })).toBeVisible();
-    await expect(page.getByRole('button', { name: 'Actions for Smoke test cat reaction' })).toBeVisible();
+    await expect(feed.getByRole('link', { name: 'Open Smoke test cat reaction' })).toBeVisible();
+    await expect(feed.getByRole('button', { name: 'Actions for Smoke test cat reaction' })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Load more' })).toBeVisible();
   });
 });

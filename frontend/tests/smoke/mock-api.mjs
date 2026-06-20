@@ -129,6 +129,10 @@ const trend = {
   refreshed_at: '2026-01-01T00:00:00Z'
 };
 
+const motdAlgorithmVersion = 'motd-smoke-v1';
+const motdScoreComponents = { popularity: 0.42, quality: 0.55 };
+const motdScore = 0.97;
+
 const server = createServer((request, response) => {
   const url = new URL(request.url ?? '/', `http://${request.headers.host ?? `127.0.0.1:${port}`}`);
 
@@ -181,6 +185,21 @@ const server = createServer((request, response) => {
     sendJson(response, 200, {
       collections: [seededCollectionSummary],
       active_save_collection_id: seededCollectionId
+    });
+    return;
+  }
+
+  if (url.pathname === '/api/v1/memes/meme-of-the-day') {
+    sendJson(response, 200, {
+      meme,
+      selected_for: '2026-01-01',
+      refreshed_at: '2026-01-01T00:00:00Z',
+      algorithm_version: motdAlgorithmVersion,
+      score: motdScore,
+      score_components: motdScoreComponents,
+      reason: 'Smoke MOTD selection',
+      candidate_count: 2,
+      attribution: motdAttribution()
     });
     return;
   }
@@ -316,6 +335,32 @@ function attributionFor(url, memeId) {
     score: 1,
     score_components: { collection_match: 1 },
     reason: 'Seeded readable collection result'
+  };
+}
+
+function motdAttribution() {
+  return {
+    request_id: 'req_smoke_motd',
+    impression_id: 'imp_smoke_motd',
+    surface: 'web_home',
+    source_algorithm: 'motd',
+    rank: 1,
+    query: null,
+    filters: {
+      language: null,
+      media_type: null,
+      include_nsfw: false,
+      tags: [],
+      scope: null,
+      collection_ids: []
+    },
+    collection_scope: null,
+    collection_ids: [],
+    source_meme_id: null,
+    algorithm_version: motdAlgorithmVersion,
+    score: motdScore,
+    score_components: motdScoreComponents,
+    reason: 'Smoke MOTD selection'
   };
 }
 
