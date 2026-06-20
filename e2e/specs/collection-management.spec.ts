@@ -20,6 +20,7 @@ test('full accounts can join, manage roles, search a collection, and reorder pin
     collectionId,
     memberUserId: fixture.member.user_id
   });
+  await app.profile.expectFullAccountProfileState(fixture);
 
   await app.collection.goto(collectionId);
   await app.collection.expectOwnerControls(fixture);
