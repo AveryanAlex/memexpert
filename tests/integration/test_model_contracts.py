@@ -28,6 +28,7 @@ from memexpert.models.content import (
     MemeFileOCRResult,
     MemeFileSyncTargetSnapshot,
     MemeMergeLog,
+    MemeOfTheDaySelection,
     MemeSeoPage,
     MemeSource,
     MemeSourceEngagementSnapshot,
@@ -114,6 +115,7 @@ EXPECTED_TABLES = {
     "login_events",
     "meme_files",
     "meme_merge_logs",
+    "meme_of_the_day_selections",
     "meme_seo_pages",
     "meme_source_engagement_snapshots",
     "meme_sources",
@@ -215,6 +217,7 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
     assert set(metadata.tables) == EXPECTED_TABLES
     memes_table = metadata.tables["memes"]
     meme_files_table = metadata.tables["meme_files"]
+    motd_table = metadata.tables["meme_of_the_day_selections"]
     pipeline_ingest_requests_table = metadata.tables["pipeline_ingest_requests"]
     assert "invite_link" not in metadata.tables["collections"].c
     assert metadata.tables["users"].c["active_save_collection_id"].foreign_keys
@@ -232,6 +235,21 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
         and [column.name for column in constraint.columns] == ["meme_id", "id"]
         for constraint in meme_files_table.constraints
     )
+    assert any(
+        isinstance(constraint, UniqueConstraint)
+        and constraint.name == "uq_motd_selected_for_algorithm_version"
+        and [column.name for column in constraint.columns] == ["selected_for", "algorithm_version"]
+        for constraint in motd_table.constraints
+    )
+    assert any(
+        isinstance(constraint, CheckConstraint) and "candidate_count >= 0" in str(constraint.sqltext)
+        for constraint in motd_table.constraints
+    )
+    assert motd_table.c["meme_id"].nullable
+    motd_meme_fk = next(iter(motd_table.c["meme_id"].foreign_keys))
+    assert motd_meme_fk.column.table.name == "memes"
+    assert motd_meme_fk.column.name == "id"
+    assert motd_meme_fk.ondelete == "SET NULL"
     primary_file_fk = next(
         constraint
         for constraint in memes_table.foreign_key_constraints
@@ -249,6 +267,7 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
     user_relationships = sa_inspect(User).relationships
     meme_relationships = sa_inspect(Meme).relationships
     meme_file_relationships = sa_inspect(MemeFile).relationships
+    motd_relationships = sa_inspect(MemeOfTheDaySelection).relationships
     meme_source_relationships = sa_inspect(MemeSource).relationships
     meme_source_columns = sa_inspect(MemeSource).columns
     source_channel_relationships = sa_inspect(SourceChannel).relationships
@@ -263,6 +282,8 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
     assert "popularity_snapshots" not in meme_relationships
     assert meme_relationships["moderation_reports"].mapper.class_ is ModerationReport
     assert meme_relationships["moderation_decisions"].mapper.class_ is ModerationDecision
+    assert meme_relationships["motd_selections"].mapper.class_ is MemeOfTheDaySelection
+    assert motd_relationships["meme"].mapper.class_ is Meme
     assert pipeline_ingest_request_relationships["materialized_meme"].mapper.class_ is Meme
     assert pipeline_ingest_request_relationships["materialized_meme_file"].mapper.class_ is MemeFile
     assert pipeline_ingest_request_relationships["matched_meme_file"].mapper.class_ is MemeFile
