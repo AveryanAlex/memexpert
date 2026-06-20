@@ -230,7 +230,7 @@ export const actions: Actions = {
     const confirmation = readRequired(data, 'confirmation');
     return runAction(async () => {
       requireConfirmation(confirmation, channelId, 'Paste the source channel id to mark it dead.');
-      await markSourceChannelDead(apiRequest(fetch, request), channelId);
+      await markSourceChannelDead(apiRequest(fetch, request), channelId, confirmation);
       return { message: 'Telegram channel marked dead; crawler checkpoint state was preserved.' };
     });
   }

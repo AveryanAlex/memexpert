@@ -109,6 +109,15 @@ async def test_admin_routes_require_session_cookie_admin_flag_and_ignore_operato
             f"/api/v1/admin/memes/{meme_id}/moderation",
             json={"is_nsfw": True},
         )
+        anonymous_seo_pages_response = await anonymous_client.get("/api/v1/admin/seo-pages")
+        anonymous_seo_edit_response = await anonymous_client.patch(
+            f"/api/v1/admin/memes/{meme_id}/seo-page",
+            json={"slug": "permission", "title": "Permission", "meta": "Permission", "alt": "Permission"},
+        )
+        anonymous_seo_regenerate_response = await anonymous_client.post(
+            f"/api/v1/admin/memes/{meme_id}/seo-page/regenerate",
+            json={"confirmation": meme_id},
+        )
 
     non_admin_token = await _issue_user_cookie(
         postgres_session_factory,
@@ -139,6 +148,16 @@ async def test_admin_routes_require_session_cookie_admin_flag_and_ignore_operato
         )
         forbidden_source_mark_dead_response = await non_admin_client.post(
             f"/api/v1/admin/source-channels/{meme_id}/mark-dead",
+            json={"confirmation": meme_id},
+        )
+        forbidden_seo_pages_response = await non_admin_client.get("/api/v1/admin/seo-pages")
+        forbidden_seo_edit_response = await non_admin_client.patch(
+            f"/api/v1/admin/memes/{meme_id}/seo-page",
+            json={"slug": "permission", "title": "Permission", "meta": "Permission", "alt": "Permission"},
+        )
+        forbidden_seo_regenerate_response = await non_admin_client.post(
+            f"/api/v1/admin/memes/{meme_id}/seo-page/regenerate",
+            json={"confirmation": meme_id},
         )
         forbidden_telegram_session_create_response = await non_admin_client.post(
             "/api/v1/admin/telegram/sessions",
@@ -163,6 +182,10 @@ async def test_admin_routes_require_session_cookie_admin_flag_and_ignore_operato
             headers={"X-Pipeline-Operator-Token": "anything"},
             json={"confirmation": meme_id, "note": "test"},
         )
+        operator_seo_pages_response = await operator_header_client.get(
+            "/api/v1/admin/seo-pages",
+            headers={"X-Pipeline-Operator-Token": "anything"},
+        )
         operator_telegram_sessions_response = await operator_header_client.get(
             "/api/v1/admin/telegram/sessions",
             headers={"X-Pipeline-Operator-Token": "anything"},
@@ -172,6 +195,9 @@ async def test_admin_routes_require_session_cookie_admin_flag_and_ignore_operato
     assert anonymous_telegram_sessions_response.status_code == 401
     assert anonymous_detail_response.status_code == 401
     assert anonymous_override_response.status_code == 401
+    assert anonymous_seo_pages_response.status_code == 401
+    assert anonymous_seo_edit_response.status_code == 401
+    assert anonymous_seo_regenerate_response.status_code == 401
     assert forbidden_session_response.status_code == 403
     assert forbidden_detail_response.status_code == 403
     assert forbidden_override_response.status_code == 403
@@ -179,6 +205,9 @@ async def test_admin_routes_require_session_cookie_admin_flag_and_ignore_operato
     assert forbidden_merge_response.status_code == 403
     assert forbidden_template_create_response.status_code == 403
     assert forbidden_source_mark_dead_response.status_code == 403
+    assert forbidden_seo_pages_response.status_code == 403
+    assert forbidden_seo_edit_response.status_code == 403
+    assert forbidden_seo_regenerate_response.status_code == 403
     assert forbidden_telegram_session_create_response.status_code == 403
     assert forbidden_telegram_channels_response.status_code == 403
     assert forbidden_reports_response.status_code == 403
@@ -189,6 +218,7 @@ async def test_admin_routes_require_session_cookie_admin_flag_and_ignore_operato
     assert operator_session_response.status_code == 401
     assert operator_detail_response.status_code == 401
     assert operator_delete_response.status_code == 401
+    assert operator_seo_pages_response.status_code == 401
     assert operator_telegram_sessions_response.status_code == 401
 
 
@@ -670,7 +700,7 @@ async def test_admin_template_delete_only_allows_unreferenced_templates(
         assert deleted_unreferenced_template is None
 
 
-async def test_admin_source_channel_health_and_mark_dead_conflicts(
+async def test_admin_manual_seo_edit_creates_updates_and_rejects_slug_conflict(
     auth_app: FastAPI,
     auth_settings_overrides: dict[str, str],
     postgres_session_factory: async_sessionmaker[AsyncSession],
@@ -678,11 +708,237 @@ async def test_admin_source_channel_health_and_mark_dead_conflicts(
     admin_token = await _issue_user_cookie(
         postgres_session_factory,
         auth_settings_overrides,
-        email="admin-source-health@example.com",
+        email="admin-manual-seo@example.com",
         is_admin=True,
     )
 
     async with postgres_session_factory() as session:
+        meme, meme_file = _canonical_meme(
+            media_type=ContentKind.IMAGE,
+            is_public=True,
+            is_nsfw=False,
+            tags=["original"],
+        )
+        conflict_meme, conflict_file = _canonical_meme(
+            media_type=ContentKind.IMAGE,
+            is_public=True,
+            is_nsfw=False,
+        )
+        await _persist_canonical_meme(session, meme, meme_file)
+        await _persist_canonical_meme(session, conflict_meme, conflict_file)
+        session.add(
+            MemeSeoPage(
+                meme=conflict_meme,
+                slug="taken-slug",
+                page_title="Taken slug",
+                meta_description="Taken slug",
+                alt_text="Taken slug",
+                tags=["taken"],
+                model_id="test-model",
+                prompt_version="test-version",
+            ),
+        )
+        await session.commit()
+        meme_id = meme.id
+        conflict_meme_id = conflict_meme.id
+
+    transport = ASGITransport(app=auth_app)
+    async with AsyncClient(transport=transport, base_url="https://testserver") as admin_client:
+        admin_client.cookies.set(ACCESS_COOKIE_NAME, admin_token)
+        create_response = await admin_client.patch(
+            f"/api/v1/admin/memes/{meme_id}/seo-page",
+            json={
+                "slug": " Launch Slug! ",
+                "title": " Launch Title ",
+                "meta": " Launch meta description ",
+                "alt": " Launch alt text ",
+                "caption": " Launch caption ",
+                "body": " Launch body text ",
+                "tags": "Funny, FUNNY, Reaction Tag",
+            },
+        )
+        list_response = await admin_client.get("/api/v1/admin/seo-pages?limit=10")
+        update_response = await admin_client.patch(
+            f"/api/v1/admin/memes/{meme_id}/seo-page",
+            json={"caption": "Updated caption", "tags": ["Reaction Tag", "new tag", "reaction tag"]},
+        )
+        conflict_response = await admin_client.patch(
+            f"/api/v1/admin/memes/{meme_id}/seo-page",
+            json={"slug": "taken-slug"},
+        )
+
+    assert create_response.status_code == 200
+    create_payload = create_response.json()
+    assert create_payload["slug"] == "launch-slug"
+    assert create_payload["page_title"] == "Launch Title"
+    assert create_payload["meta_description"] == "Launch meta description"
+    assert create_payload["alt_text"] == "Launch alt text"
+    assert create_payload["caption"] == "Launch caption"
+    assert create_payload["body_text"] == "Launch body text"
+    assert create_payload["tags"] == ["funny", "reaction-tag"]
+    assert create_payload["model_id"] == "admin-manual"
+    assert create_payload["prompt_version"] == "admin-manual"
+    assert create_payload["generated_at"] is not None
+    assert create_payload["edited_at"] is not None
+
+    assert list_response.status_code == 200
+    review_rows = {item["meme"]["id"]: item for item in list_response.json()}
+    assert review_rows[str(meme_id)]["status"] == "edited"
+    assert review_rows[str(meme_id)]["seo_page"]["slug"] == "launch-slug"
+    assert review_rows[str(meme_id)]["meme"]["popularity_score"] == 0.0
+    assert review_rows[str(conflict_meme_id)]["status"] == "generated"
+
+    assert update_response.status_code == 200
+    update_payload = update_response.json()
+    assert update_payload["slug"] == "launch-slug"
+    assert update_payload["caption"] == "Updated caption"
+    assert update_payload["tags"] == ["reaction-tag", "new-tag"]
+    assert update_payload["edited_at"] is not None
+    assert conflict_response.status_code == 409
+    assert "slug" in conflict_response.json()["detail"]
+
+    async with postgres_session_factory() as session:
+        persisted_page = await session.get(MemeSeoPage, meme_id)
+        persisted_meme = await session.get(Meme, meme_id)
+        assert persisted_page is not None
+        assert persisted_page.slug == "launch-slug"
+        assert persisted_page.caption == "Updated caption"
+        assert persisted_page.tags == ["reaction-tag", "new-tag"]
+        assert persisted_page.edited_at is not None
+        assert persisted_meme is not None
+        assert persisted_meme.tags == ["reaction-tag", "new-tag"]
+
+
+async def test_admin_seo_regenerate_uses_static_provider_and_clears_edited_at(
+    auth_app: FastAPI,
+    auth_settings_overrides: dict[str, str],
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    admin_token = await _issue_user_cookie(
+        postgres_session_factory,
+        auth_settings_overrides,
+        email="admin-regenerate-seo@example.com",
+        is_admin=True,
+    )
+
+    async with postgres_session_factory() as session:
+        meme, meme_file = _canonical_meme(
+            media_type=ContentKind.IMAGE,
+            is_public=True,
+            is_nsfw=False,
+            tags=["regen tag"],
+            ocr_text="Regenerate this meme text",
+        )
+        await _persist_canonical_meme(session, meme, meme_file)
+        session.add(
+            MemeSeoPage(
+                meme=meme,
+                slug="manual-regenerate",
+                page_title="Manual title",
+                meta_description="Manual meta",
+                alt_text="Manual alt",
+                caption="Manual caption",
+                body_text="Manual body",
+                tags=["manual"],
+                model_id="admin-manual",
+                prompt_version="admin-manual",
+                edited_at=datetime.now(UTC) - timedelta(days=1),
+            ),
+        )
+        await session.commit()
+        meme_id = meme.id
+
+    transport = ASGITransport(app=auth_app)
+    async with AsyncClient(transport=transport, base_url="https://testserver") as admin_client:
+        admin_client.cookies.set(ACCESS_COOKIE_NAME, admin_token)
+        wrong_confirmation_response = await admin_client.post(
+            f"/api/v1/admin/memes/{meme_id}/seo-page/regenerate",
+            json={"confirmation": "wrong-id"},
+        )
+        regenerate_response = await admin_client.post(
+            f"/api/v1/admin/memes/{meme_id}/seo-page/regenerate",
+            json={"confirmation": str(meme_id)},
+        )
+
+    assert wrong_confirmation_response.status_code == 409
+    assert "confirmation" in wrong_confirmation_response.json()["detail"]
+    assert regenerate_response.status_code == 200
+    payload = regenerate_response.json()
+    assert payload["slug"] == "regen-tag"
+    assert payload["page_title"] == "Regen Tag meme"
+    assert payload["model_id"] == "static-local"
+    assert payload["prompt_version"] == "meme-seo-v1"
+    assert payload["edited_at"] is None
+
+    async with postgres_session_factory() as session:
+        persisted_page = await session.get(MemeSeoPage, meme_id)
+        persisted_meme = await session.get(Meme, meme_id)
+        assert persisted_page is not None
+        assert persisted_page.model_id == "static-local"
+        assert persisted_page.edited_at is None
+        assert persisted_page.tags == ["regen-tag"]
+        assert persisted_meme is not None
+        assert persisted_meme.tags == ["regen-tag"]
+
+
+async def test_admin_source_channel_mark_dead_requires_exact_confirmation_without_mutation(
+    auth_app: FastAPI,
+    auth_settings_overrides: dict[str, str],
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    admin_token = await _issue_user_cookie(
+        postgres_session_factory,
+        auth_settings_overrides,
+        email="admin-source-confirmation@example.com",
+        is_admin=True,
+    )
+
+    async with postgres_session_factory() as session:
+        channel = SourceChannel(
+            platform=SourcePlatform.TELEGRAM,
+            platform_id="source-confirmation",
+            username="source_confirmation",
+            title="Source Confirmation",
+        )
+        session.add(channel)
+        await session.commit()
+        channel_id = channel.id
+
+    transport = ASGITransport(app=auth_app)
+    async with AsyncClient(transport=transport, base_url="https://testserver") as admin_client:
+        admin_client.cookies.set(ACCESS_COOKIE_NAME, admin_token)
+        missing_body_response = await admin_client.post(f"/api/v1/admin/source-channels/{channel_id}/mark-dead")
+        wrong_confirmation_response = await admin_client.post(
+            f"/api/v1/admin/source-channels/{channel_id}/mark-dead",
+            json={"confirmation": "wrong-id"},
+        )
+
+    assert missing_body_response.status_code == 422
+    assert wrong_confirmation_response.status_code == 409
+    assert "confirmation" in wrong_confirmation_response.json()["detail"]
+
+    async with postgres_session_factory() as session:
+        persisted_channel = await session.get(SourceChannel, channel_id)
+        assert persisted_channel is not None
+        assert persisted_channel.is_active is True
+        assert persisted_channel.is_paused is False
+
+
+async def test_admin_source_channel_health_and_mark_dead_conflicts(
+    auth_app: FastAPI,
+    auth_settings_overrides: dict[str, str],
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    admin_email = "admin-source-health@example.com"
+    admin_token = await _issue_user_cookie(
+        postgres_session_factory,
+        auth_settings_overrides,
+        email=admin_email,
+        is_admin=True,
+    )
+
+    async with postgres_session_factory() as session:
+        admin_user = (await session.execute(select(User).where(User.email == admin_email))).scalar_one()
         stale_channel = SourceChannel(
             platform=SourcePlatform.TELEGRAM,
             platform_id="source-health-stale",
@@ -700,6 +956,7 @@ async def test_admin_source_channel_health_and_mark_dead_conflicts(
         )
         session.add_all([stale_channel, checkpoint_channel])
         await session.commit()
+        admin_user_id = admin_user.id
         stale_channel_id = stale_channel.id
         checkpoint_channel_id = checkpoint_channel.id
 
@@ -707,10 +964,14 @@ async def test_admin_source_channel_health_and_mark_dead_conflicts(
     async with AsyncClient(transport=transport, base_url="https://testserver") as admin_client:
         admin_client.cookies.set(ACCESS_COOKIE_NAME, admin_token)
         list_response = await admin_client.get("/api/v1/admin/source-channels")
-        mark_dead_response = await admin_client.post(f"/api/v1/admin/source-channels/{stale_channel_id}/mark-dead")
+        mark_dead_response = await admin_client.post(
+            f"/api/v1/admin/source-channels/{stale_channel_id}/mark-dead",
+            json={"confirmation": str(stale_channel_id)},
+        )
         resume_dead_response = await admin_client.post(f"/api/v1/admin/source-channels/{stale_channel_id}/resume")
         mark_dead_again_response = await admin_client.post(
             f"/api/v1/admin/source-channels/{stale_channel_id}/mark-dead",
+            json={"confirmation": str(stale_channel_id)},
         )
 
     assert list_response.status_code == 200
@@ -732,9 +993,20 @@ async def test_admin_source_channel_health_and_mark_dead_conflicts(
 
     async with postgres_session_factory() as session:
         persisted_stale_channel = await session.get(SourceChannel, stale_channel_id)
+        audit_row = (
+            await session.execute(
+                select(TelegramAdminAuditLog).where(
+                    TelegramAdminAuditLog.source_channel_id == stale_channel_id,
+                    TelegramAdminAuditLog.action == "channel_mark_dead",
+                ),
+            )
+        ).scalar_one()
         assert persisted_stale_channel is not None
         assert persisted_stale_channel.is_active is False
         assert persisted_stale_channel.is_paused is True
+        assert audit_row.admin_user_id == admin_user_id
+        assert audit_row.previous_values["is_active"] is True
+        assert audit_row.new_values["is_active"] is False
 
 
 async def test_admin_create_source_channel_uses_telegram_session_id_and_rejects_unknown_target(

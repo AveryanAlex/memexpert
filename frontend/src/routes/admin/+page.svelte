@@ -39,6 +39,26 @@
   function templateTargets(templateId: string): PageData['dashboard']['templates'] {
     return data.dashboard.templates.filter((template) => template.id !== templateId);
   }
+
+  function seoStatusTone(status: PageData['dashboard']['seoReviews'][number]['status']): 'neutral' | 'success' | 'trend' {
+    if (status === 'edited') return 'success';
+    if (status === 'generated') return 'trend';
+    return 'neutral';
+  }
+
+  function seoTags(row: PageData['dashboard']['seoReviews'][number]): string {
+    return row.seo_page ? row.seo_page.tags.join(', ') : row.meme.tags.join(', ');
+  }
+
+  function seoValue(value: string | null | undefined): string {
+    return value?.trim() || 'Not set';
+  }
+
+  function seoActivity(row: PageData['dashboard']['seoReviews'][number]): string {
+    if (!row.seo_page) return 'No SEO page yet';
+    if (row.seo_page.edited_at) return `Edited ${row.seo_page.edited_at}`;
+    return `Generated ${row.seo_page.generated_at}`;
+  }
 </script>
 
 <section>
@@ -128,14 +148,84 @@
                 <input type="hidden" name="paused" value={channel.is_paused ? 'false' : 'true'} />
                 <Button type="submit">{channel.is_paused ? 'Resume' : 'Pause'}</Button>
               </form>
-              <form method="POST" action="?/markSourceChannelDead">
+              <form method="POST" action="?/markSourceChannelDead" class="grid gap-2 sm:min-w-[18rem]">
                 <input type="hidden" name="channel_id" value={channel.id} />
-                <Button type="submit" variant="secondary">Mark dead</Button>
+                <Input name="confirmation" placeholder="paste channel id to confirm" aria-label="Confirm source channel id" required />
+                <Button type="submit" variant="danger">Mark dead</Button>
               </form>
             {:else}
               <Badge>Removed from crawl</Badge>
             {/if}
           </div>
+        </article>
+      {/each}
+    {/if}
+  </div>
+</AdminPanel>
+
+<AdminPanel title="SEO Review">
+  <p class="m-0 text-muted">Review public safe meme SEO pages. Manual saves mark rows edited; regenerate overwrites SEO text after exact meme id confirmation.</p>
+  <div class="grid gap-3">
+    {#if data.dashboard.seoReviews.length === 0}
+      <EmptyState title="No SEO review rows" message="Public safe memes with SEO review state will appear here." />
+    {:else}
+      {#each data.dashboard.seoReviews as row (row.meme.id)}
+        <article class="grid gap-3 rounded-2xl border border-line bg-paper p-3">
+          <div class="grid gap-3 lg:grid-cols-[minmax(0,1fr)_auto]">
+            <div>
+              <div class="mb-2 flex flex-wrap items-center gap-2">
+                <Badge tone={seoStatusTone(row.status)}>{row.status}</Badge>
+                <strong class="break-all">{row.meme.id}</strong>
+              </div>
+              <p class="m-0 text-muted">
+                {row.meme.media_type} · {row.meme.language} · public {row.meme.is_public ? 'yes' : 'no'} · nsfw {row.meme.is_nsfw ? 'yes' : 'no'} · score {row.meme.popularity_score.toFixed(1)} · likes {row.meme.like_count}
+              </p>
+              <p class="m-0 text-xs text-muted">{seoActivity(row)} · template {row.meme.template_id ?? 'none'}</p>
+            </div>
+            <ActionLink size="compact" variant="secondary" href={`/admin/memes/${row.meme.id}`}>Open detail</ActionLink>
+          </div>
+
+          {#if row.seo_page}
+            <div class="grid gap-2 rounded-2xl border border-line bg-soft/40 p-3 text-sm lg:grid-cols-2">
+              <p class="m-0"><strong>Slug:</strong> {row.seo_page.slug}</p>
+              <p class="m-0"><strong>Title:</strong> {row.seo_page.page_title}</p>
+              <p class="m-0"><strong>Meta:</strong> {row.seo_page.meta_description}</p>
+              <p class="m-0"><strong>Alt:</strong> {row.seo_page.alt_text}</p>
+              <p class="m-0"><strong>Caption:</strong> {seoValue(row.seo_page.caption)}</p>
+              <p class="m-0"><strong>Tags:</strong> {seoValue(row.seo_page.tags.join(', '))}</p>
+              <p class="m-0 lg:col-span-2"><strong>Body:</strong> {seoValue(row.seo_page.body_text)}</p>
+              <p class="m-0 text-xs text-muted lg:col-span-2">{row.seo_page.model_id} · prompt {row.seo_page.prompt_version}</p>
+            </div>
+          {:else}
+            <div class="rounded-2xl border border-line bg-soft/40 p-3 text-sm text-muted">
+              Missing durable SEO metadata. Fill slug, title, meta description, and alt text to create one, or regenerate with the exact meme id.
+            </div>
+          {/if}
+
+          <form method="POST" action="?/updateSeoPage" class="grid gap-3">
+            <input type="hidden" name="meme_id" value={row.meme.id} />
+            <div class="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+              <FormRow label="Slug"><Input name="slug" value={row.seo_page?.slug ?? ''} placeholder="meme-seo-slug" required={row.status === 'missing'} /></FormRow>
+              <FormRow label="Page title"><Input name="page_title" value={row.seo_page?.page_title ?? ''} placeholder="Search title" required={row.status === 'missing'} /></FormRow>
+              <FormRow label="Alt text"><Input name="alt_text" value={row.seo_page?.alt_text ?? ''} placeholder="Accessible image text" required={row.status === 'missing'} /></FormRow>
+              <FormRow label="Tags"><Input name="tags" value={seoTags(row)} placeholder="reaction, launch" /></FormRow>
+            </div>
+            <div class="grid gap-3 lg:grid-cols-3">
+              <FormRow label="Meta description"><Textarea name="meta_description" rows={3} value={row.seo_page?.meta_description ?? ''} placeholder="SERP description" required={row.status === 'missing'} /></FormRow>
+              <FormRow label="Caption"><Textarea name="caption" rows={3} value={row.seo_page?.caption ?? ''} placeholder="Optional caption" /></FormRow>
+              <FormRow label="Body text"><Textarea name="body_text" rows={3} value={row.seo_page?.body_text ?? ''} placeholder="Optional body copy" /></FormRow>
+            </div>
+            <div class="flex flex-wrap items-center gap-2">
+              <Button type="submit">Save SEO page</Button>
+              <span class="text-xs text-muted">For new pages, slug, title, meta, and alt text are required.</span>
+            </div>
+          </form>
+
+          <form method="POST" action="?/regenerateSeoPage" class="grid gap-2 rounded-2xl border border-line bg-soft/40 p-3 sm:grid-cols-[minmax(0,1fr)_auto]">
+            <input type="hidden" name="meme_id" value={row.meme.id} />
+            <Input name="confirmation" placeholder="paste meme id to regenerate" aria-label="Confirm meme id for SEO regeneration" required />
+            <Button type="submit" variant="danger">Regenerate SEO</Button>
+          </form>
         </article>
       {/each}
     {/if}

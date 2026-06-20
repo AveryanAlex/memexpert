@@ -40,11 +40,13 @@ import {
   fetchTrendComparison,
   fetchTrendTimeline,
   fetchTrendPage,
+  markSourceChannelDead,
   pinMeme,
   recordMemeDetailClick,
   recordMemeDownload,
   recordMemeImpression,
   recordMemeShare,
+  regenerateMemeSeoPage,
   refreshCurrentSession,
   removeCollectionMember,
   removeMemeFromCollection,
@@ -66,6 +68,7 @@ import {
   updateBlockedPerceptualHash,
   updateCollectionMemberRole,
   updateMemeModeration,
+  updateMemeSeoPage,
   updateUserPreferences,
   validateAdminTelegramSession,
   type ApiFetch
@@ -985,6 +988,26 @@ describe('admin API client', () => {
     expect(mockFetch).toHaveBeenCalledOnce();
   });
 
+  it('marks source channels dead with exact confirmation JSON', async () => {
+    const channelId = '33333333-3333-4333-8333-333333333333';
+    const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const headers = new Headers(init?.headers);
+
+      expect(url.pathname).toBe(`/api/v1/admin/source-channels/${channelId}/mark-dead`);
+      expect(init?.method).toBe('POST');
+      expect(headers.get('content-type')).toBe('application/json');
+      expect(headers.get('x-requested-with')).toBe('XMLHttpRequest');
+      expect(JSON.parse(String(init?.body))).toEqual({ confirmation: channelId });
+
+      return jsonResponse({ id: channelId, is_active: false, is_paused: false });
+    }) satisfies ApiFetch;
+
+    await markSourceChannelDead({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test' }, channelId, channelId);
+
+    expect(mockFetch).toHaveBeenCalledOnce();
+  });
+
   it('uses DB-backed Telegram session and channel admin endpoints', async () => {
     const sessionId = '11111111-1111-4111-8111-111111111111';
     const channelId = '22222222-2222-4222-8222-222222222222';
@@ -1073,12 +1096,16 @@ describe('admin API client', () => {
     expect(calls[10].body).toEqual({ note: 'orphan' });
   });
 
-  it('loads moderation reports and decision history with the admin dashboard', async () => {
+  it('loads moderation reports, SEO reviews, and decision history with the admin dashboard', async () => {
     const calls: string[] = [];
     const mockFetch = vi.fn(async (input: RequestInfo | URL) => {
       const url = new URL(String(input));
       calls.push(`${url.pathname}?${url.searchParams.toString()}`);
 
+      if (url.pathname === '/api/v1/admin/seo-pages') {
+        expect(url.searchParams.get('limit')).toBe('20');
+        return jsonResponse([seoReviewPayload()]);
+      }
       if (url.pathname === '/api/v1/admin/moderation-reports') {
         expect(url.searchParams.get('limit')).toBe('20');
         return jsonResponse([moderationReportPayload()]);
@@ -1092,11 +1119,74 @@ describe('admin API client', () => {
 
     const dashboard = await fetchAdminDashboard({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test' });
 
+    expect(dashboard.seoReviews).toHaveLength(1);
     expect(dashboard.reports).toHaveLength(1);
     expect(dashboard.decisions).toHaveLength(1);
     expect(calls).toContain('/api/v1/admin/blocked-perceptual-hashes?');
+    expect(calls).toContain('/api/v1/admin/seo-pages?limit=20');
     expect(calls).toContain('/api/v1/admin/moderation-reports?limit=20');
     expect(calls).toContain('/api/v1/admin/moderation-decisions?limit=20');
+  });
+
+  it('edits and regenerates meme SEO pages through admin endpoints', async () => {
+    const memeId = '77777777-7777-4777-8777-777777777777';
+    const calls: Array<{ method: string | undefined; path: string; body: unknown }> = [];
+    const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const headers = new Headers(init?.headers);
+      calls.push({
+        method: init?.method,
+        path: url.pathname,
+        body: init?.body ? JSON.parse(String(init.body)) : null
+      });
+
+      expect(headers.get('content-type')).toBe('application/json');
+      expect(headers.get('x-requested-with')).toBe('XMLHttpRequest');
+
+      return jsonResponse(seoPagePayload(memeId));
+    }) satisfies ApiFetch;
+
+    await updateMemeSeoPage(
+      {
+        fetch: mockFetch,
+        baseUrl: 'https://api.memexpert.test',
+        body: {
+          slug: 'launch-reaction',
+          page_title: 'Launch Reaction Meme',
+          meta_description: 'A launch reaction meme for search results.',
+          alt_text: 'A reaction meme about launch day.',
+          caption: 'Launch day mood',
+          body_text: 'Longer SEO body copy.',
+          tags: 'launch, reaction'
+        }
+      },
+      memeId
+    );
+    await regenerateMemeSeoPage(
+      { fetch: mockFetch, baseUrl: 'https://api.memexpert.test', body: { confirmation: memeId } },
+      memeId
+    );
+
+    expect(calls).toEqual([
+      {
+        method: 'PATCH',
+        path: `/api/v1/admin/memes/${memeId}/seo-page`,
+        body: {
+          slug: 'launch-reaction',
+          page_title: 'Launch Reaction Meme',
+          meta_description: 'A launch reaction meme for search results.',
+          alt_text: 'A reaction meme about launch day.',
+          caption: 'Launch day mood',
+          body_text: 'Longer SEO body copy.',
+          tags: 'launch, reaction'
+        }
+      },
+      {
+        method: 'POST',
+        path: `/api/v1/admin/memes/${memeId}/seo-page/regenerate`,
+        body: { confirmation: memeId }
+      }
+    ]);
   });
 
   it('manages blocked perceptual hashes through admin endpoints', async () => {
@@ -1445,6 +1535,31 @@ function moderationDecisionPayload() {
     new_is_public: true,
     new_is_nsfw: true,
     created_at: '2026-01-01T00:00:00Z'
+  };
+}
+
+function seoPagePayload(memeId = '33333333-3333-4333-8333-333333333333') {
+  return {
+    meme_id: memeId,
+    slug: 'launch-reaction',
+    page_title: 'Launch Reaction Meme',
+    meta_description: 'A launch reaction meme for search results.',
+    alt_text: 'A reaction meme about launch day.',
+    caption: 'Launch day mood',
+    body_text: 'Longer SEO body copy.',
+    tags: ['launch', 'reaction'],
+    model_id: 'admin-manual',
+    prompt_version: 'admin-manual',
+    generated_at: '2026-01-01T00:00:00Z',
+    edited_at: '2026-01-02T00:00:00Z'
+  };
+}
+
+function seoReviewPayload() {
+  return {
+    meme: adminMemePayload(),
+    seo_page: seoPagePayload(),
+    status: 'edited'
   };
 }
 

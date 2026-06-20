@@ -3,11 +3,23 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import datetime
 from typing import Literal
+from unicodedata import normalize as normalize_unicode
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, StrictBool, StrictInt, field_validator, model_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    StrictBool,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 
 from memexpert.core.perceptual_hashes import (
     DEFAULT_PERCEPTUAL_HASH_ALGORITHM,
@@ -39,6 +51,9 @@ MAX_TEMPLATE_SLUG_LENGTH = 255
 MAX_TEMPLATE_NAME_LENGTH = 255
 MAX_DESTRUCTIVE_CONFIRMATION_LENGTH = 128
 MAX_HASH_ALGORITHM_LENGTH = 32
+MAX_SEO_SLUG_LENGTH = 255
+MAX_SEO_PAGE_TITLE_LENGTH = 255
+MAX_SEO_TAG_LENGTH = 64
 MAX_TELEGRAM_ACCOUNT_USERNAME_LENGTH = 255
 MAX_TELEGRAM_ACCOUNT_PHONE_HINT_LENGTH = 64
 MAX_ADMIN_TELEGRAM_ERROR_CLASS_LENGTH = 128
@@ -350,6 +365,19 @@ class AdminTelegramChannelGroupRead(BaseModel):
     channels: list[AdminSourceChannelRead]
 
 
+class AdminSourceChannelMarkDeadRequest(BaseModel):
+    """Exact confirmation payload for removing a source channel from crawl."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    confirmation: str = Field(min_length=1, max_length=MAX_DESTRUCTIVE_CONFIRMATION_LENGTH)
+
+    @field_validator("confirmation")
+    @classmethod
+    def _normalize_confirmation(cls, value: str) -> str:
+        return normalize_required_text(value)
+
+
 class AdminMemeTemplateRead(ORMSchema):
     """Admin-editable meme-template taxonomy row."""
 
@@ -618,6 +646,7 @@ class AdminMemeRead(ORMSchema):
     language: ContentLanguage
     is_nsfw: bool
     is_public: bool
+    popularity_score: float
     like_count: int
     tags: list[str]
     template_id: uuid.UUID | None
@@ -647,6 +676,128 @@ class AdminMemeModerationUpdateRequest(BaseModel):
         if self.is_nsfw is None and self.is_public is None and "template_id" not in self.model_fields_set:
             raise ValueError("At least one moderation field must be supplied.")
         return self
+
+
+class AdminMemeSeoPageRead(ORMSchema):
+    """Admin projection for the current durable meme SEO page fields."""
+
+    model_config = ConfigDict(extra="forbid", from_attributes=True)
+
+    meme_id: uuid.UUID
+    slug: str
+    page_title: str
+    meta_description: str
+    alt_text: str
+    caption: str | None
+    body_text: str | None
+    tags: list[str]
+    model_id: str
+    prompt_version: str
+    generated_at: datetime
+    edited_at: datetime | None
+
+
+class AdminMemeSeoReviewRowRead(BaseModel):
+    """Admin SEO review queue row for one public safe meme."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    meme: AdminMemeRead
+    seo_page: AdminMemeSeoPageRead | None
+    status: Literal["missing", "generated", "edited"]
+
+
+class AdminMemeSeoEditRequest(BaseModel):
+    """Manual admin SEO create/update payload."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    slug: str | None = Field(default=None, min_length=1, max_length=MAX_SEO_SLUG_LENGTH)
+    page_title: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=MAX_SEO_PAGE_TITLE_LENGTH,
+        validation_alias=AliasChoices("page_title", "title"),
+    )
+    meta_description: str | None = Field(
+        default=None,
+        min_length=1,
+        validation_alias=AliasChoices("meta_description", "meta"),
+    )
+    alt_text: str | None = Field(
+        default=None,
+        min_length=1,
+        validation_alias=AliasChoices("alt_text", "alt"),
+    )
+    caption: str | None = None
+    body_text: str | None = Field(default=None, validation_alias=AliasChoices("body_text", "body"))
+    tags: list[str] | None = None
+
+    @field_validator("slug")
+    @classmethod
+    def _normalize_slug(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        slug = _normalize_seo_slug(value)
+        if not slug:
+            raise ValueError("slug must contain at least one ASCII letter or number.")
+        return slug
+
+    @field_validator("page_title", "meta_description", "alt_text")
+    @classmethod
+    def _normalize_required_update_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return normalize_required_text(value)
+
+    @field_validator("caption", "body_text")
+    @classmethod
+    def _normalize_optional_text(cls, value: str | None) -> str | None:
+        return normalize_optional_text(value)
+
+    @field_validator("tags", mode="before")
+    @classmethod
+    def _coerce_tags(cls, value: object) -> object:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return value.split(",")
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return list(value)
+        raise ValueError("tags must be provided as a CSV string or list of strings.")
+
+    @field_validator("tags")
+    @classmethod
+    def _normalize_tags(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for tag in value:
+            normalized = re.sub(r"\s+", "-", tag.strip().lower())[:MAX_SEO_TAG_LENGTH]
+            if normalized and normalized not in seen:
+                cleaned.append(normalized)
+                seen.add(normalized)
+        return cleaned
+
+    @model_validator(mode="after")
+    def _require_any_field(self) -> AdminMemeSeoEditRequest:
+        if not self.model_fields_set:
+            raise ValueError("At least one SEO field must be supplied.")
+        return self
+
+
+class AdminMemeSeoRegenerateRequest(BaseModel):
+    """Exact confirmation payload for forced SEO regeneration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    confirmation: str = Field(min_length=1, max_length=MAX_DESTRUCTIVE_CONFIRMATION_LENGTH)
+
+    @field_validator("confirmation")
+    @classmethod
+    def _normalize_confirmation(cls, value: str) -> str:
+        return normalize_required_text(value)
 
 
 class AdminMemeDeleteRequest(BaseModel):
@@ -770,6 +921,10 @@ __all__ = [
     "AdminMemeDeleteRequest",
     "AdminMemeDetailRead",
     "AdminMemeDestructiveActionRead",
+    "AdminMemeSeoEditRequest",
+    "AdminMemeSeoPageRead",
+    "AdminMemeSeoRegenerateRequest",
+    "AdminMemeSeoReviewRowRead",
     "AdminMemeMergeRequest",
     "AdminMemeModerationUpdateRequest",
     "AdminMemeRead",
@@ -781,6 +936,7 @@ __all__ = [
     "AdminSessionRead",
     "AdminSourceChannelAssignRequest",
     "AdminSourceChannelCreateRequest",
+    "AdminSourceChannelMarkDeadRequest",
     "AdminSourceChannelOrphanRequest",
     "AdminSourceChannelRead",
     "AdminSourceChannelUpdateRequest",
@@ -795,3 +951,9 @@ __all__ = [
     "ChannelSuggestionRead",
     "ChannelSuggestionStatus",
 ]
+
+
+def _normalize_seo_slug(value: str) -> str:
+    ascii_value = normalize_unicode("NFKD", normalize_required_text(value)).encode("ascii", "ignore").decode("ascii")
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", ascii_value.lower()).strip("-")
+    return re.sub(r"-{2,}", "-", slug)[:MAX_SEO_SLUG_LENGTH]

@@ -757,6 +757,27 @@ export interface AdminMemeRead {
   updated_at: string;
 }
 
+export interface AdminMemeSeoPageRead {
+  meme_id: string;
+  slug: string;
+  page_title: string;
+  meta_description: string;
+  alt_text: string;
+  caption: string | null;
+  body_text: string | null;
+  tags: string[];
+  model_id: string;
+  prompt_version: string;
+  generated_at: string;
+  edited_at: string | null;
+}
+
+export interface AdminMemeSeoReviewRowRead {
+  meme: AdminMemeRead;
+  seo_page: AdminMemeSeoPageRead | null;
+  status: 'missing' | 'generated' | 'edited';
+}
+
 export interface AdminModerationReportRead {
   id: string;
   meme_id: string;
