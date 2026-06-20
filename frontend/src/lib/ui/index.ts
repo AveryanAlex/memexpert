@@ -13,4 +13,6 @@ export { default as Notice } from './Notice.svelte';
 export { default as PageHeader } from './PageHeader.svelte';
 export { default as PageShell } from './PageShell.svelte';
 export { default as Select } from './Select.svelte';
+export { SortableList } from './dnd';
 export { default as Textarea } from './Textarea.svelte';
+export type { SortableAttach, SortableId, SortableItem, SortableItemControls } from './dnd';

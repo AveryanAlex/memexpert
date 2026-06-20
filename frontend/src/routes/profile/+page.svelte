@@ -9,7 +9,6 @@
     activeCollectionId,
     libraryEmptyText,
     movePinnedMemeId,
-    movePinnedMemeIdToTarget,
     orderPinnedMemesByIds,
     profileCapabilities,
     profileProviderStatuses,
@@ -17,7 +16,7 @@
     profileStats,
     writableCollectionOptions
   } from '$lib/profile/view-model';
-  import { ActionLink, Badge, Button, Card, EmptyState, Notice, Select } from '$lib/ui';
+  import { ActionLink, Badge, Button, Card, EmptyState, Notice, Select, SortableList } from '$lib/ui';
   import type { PageData } from './$types';
 
   let { data }: { data: PageData } = $props();
@@ -33,7 +32,6 @@
   let pinOrderIds = $state<string[]>([]);
   let pinOrderPending = $state(false);
   let pinOrderMessage = $state<string | null>(null);
-  let draggedPinId = $state<string | null>(null);
 
   const LANGUAGE_OPTIONS: Array<{ value: UserLanguage; label: string }> = [
     { value: 'any', label: 'Any language' },
@@ -146,13 +144,6 @@
 
   async function movePin(memeId: string, direction: -1 | 1) {
     await savePinOrder(movePinnedMemeId(pinOrderIds, memeId, direction));
-  }
-
-  async function dropPin(targetMemeId: string) {
-    if (!draggedPinId) return;
-    const sourceId = draggedPinId;
-    draggedPinId = null;
-    await savePinOrder(movePinnedMemeIdToTarget(pinOrderIds, sourceId, targetMemeId));
   }
 
   async function savePinOrder(nextIds: string[]) {
@@ -405,17 +396,18 @@
           <h3 id="pin-order-title" class="m-0 text-xl font-black tracking-[-0.03em]">Pin order</h3>
           <p class="m-0 text-muted">Use Up/Down controls for keyboard-safe ordering, or drag rows onto a new position.</p>
         </div>
-        <div class="grid gap-2" aria-live="polite" aria-busy={pinOrderPending}>
-          {#each orderedPinnedMemes as meme, index (meme.id)}
-            <article
-              class="grid gap-2 rounded-[18px] border border-line bg-paper p-3 sm:grid-cols-[auto_minmax(0,1fr)_auto] sm:items-center"
-              draggable="true"
-              ondragstart={() => (draggedPinId = meme.id)}
-              ondragend={() => (draggedPinId = null)}
-              ondragover={(event) => event.preventDefault()}
-              ondrop={() => dropPin(meme.id)}
-            >
-              <span class="rounded-full border border-line bg-soft px-3 py-1 text-sm font-black text-muted" aria-hidden="true">Drag</span>
+        <SortableList
+          items={orderedPinnedMemes}
+          onReorder={savePinOrder}
+          disabled={pinOrderPending}
+          class="grid gap-2"
+          itemElement="article"
+          itemClass="grid gap-2 rounded-[18px] border border-line bg-paper p-3 sm:grid-cols-[auto_minmax(0,1fr)_auto] sm:items-center"
+          aria-live="polite"
+          aria-busy={pinOrderPending}
+        >
+          {#snippet children(meme, index, controls)}
+              <span {@attach controls.attachHandle} class="cursor-grab rounded-full border border-line bg-soft px-3 py-1 text-sm font-black text-muted active:cursor-grabbing focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ink">Drag</span>
               <div>
                 <p class="m-0 font-black">{meme.caption || meme.tags[0] || `Pinned meme ${index + 1}`}</p>
                 <p class="m-0 text-sm text-muted">Position {index + 1} of {orderedPinnedMemes.length}</p>
@@ -424,9 +416,8 @@
                 <Button size="compact" variant="secondary" type="button" onclick={() => movePin(meme.id, -1)} disabled={pinOrderPending || index === 0}>Up</Button>
                 <Button size="compact" variant="secondary" type="button" onclick={() => movePin(meme.id, 1)} disabled={pinOrderPending || index === orderedPinnedMemes.length - 1}>Down</Button>
               </div>
-            </article>
-          {/each}
-        </div>
+          {/snippet}
+        </SortableList>
         {#if pinOrderMessage}
           <p class="m-0 text-sm text-muted" role="status">{pinOrderMessage}</p>
         {/if}

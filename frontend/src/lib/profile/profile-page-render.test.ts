@@ -104,6 +104,10 @@ describe('/profile page', () => {
     expect(body).toContain('Favorite reaction');
     expect(body).toContain('Pinned reply');
     expect(body).toContain('Pin order');
+    expect(body).toContain('data-dnd-sortable="true"');
+    expect(body).not.toContain('draggable="true"');
+    expect(body).not.toContain('ondragstart');
+    expect(body).not.toContain('ondrop');
     expect(body).toContain('Up');
     expect(body).toContain('Down');
     expect(body).toContain('Bulk actions');
