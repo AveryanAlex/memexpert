@@ -61,6 +61,15 @@ class AuthSession:
         return AuthSessionRead(user=self.user)
 
 
+@dataclass(slots=True)
+class AuthResolution:
+    """Result of resolving an access token into the canonical current account."""
+
+    user: UserRead
+    replacement_session: AuthSession | None = None
+    migrated_from_user_id: uuid.UUID | None = None
+
+
 class AuthService:
     """Issue and verify JWT-backed sessions with nonce-based revocation.
 
@@ -168,34 +177,67 @@ class AuthService:
         *,
         require_full_account: bool = False,
     ) -> UserRead:
-        """Decode an access token, reload the current user row, and enforce auth rules."""
+        """Return the canonical user for a valid access token."""
 
-        payload = self._decode_access_token(access_token)
-        subject = payload.get("sub")
-        if not isinstance(subject, str):
-            raise InvalidTokenError("Access token subject is invalid.")
+        resolution = await self.resolve_access_token(
+            access_token,
+            require_full_account=require_full_account,
+        )
+        return resolution.user
 
-        try:
-            user_id = uuid.UUID(subject)
-        except ValueError as exc:
-            raise InvalidTokenError("Access token subject is invalid.") from exc
+    async def resolve_access_token(
+        self,
+        access_token: str,
+        *,
+        require_full_account: bool = False,
+        ip_address: str | None = None,
+        user_agent: str | None = None,
+    ) -> AuthResolution:
+        """Resolve an access token and repair merged-guest cookies when possible.
 
-        claimed_nonce = payload.get("nonce")
-        if not isinstance(claimed_nonce, int):
-            raise InvalidTokenError("Access token nonce is invalid.")
+        Existing users still require a matching token nonce. If the token
+        subject no longer exists, the only accepted recovery path is an
+        account-merge audit row whose ``guest_account_id`` equals the token
+        subject. The replacement session is returned to the API layer so it
+        can attach a fresh cookie to the same response.
+        """
 
-        current_user = await self._get_user_by_id(user_id)
-        if current_user.token_nonce != claimed_nonce:
-            raise InvalidTokenError(
-                "Session has been revoked; please sign in again.",
+        user_id, claimed_nonce = self._decode_subject_and_nonce(access_token)
+        current_user = await self._get_user_by_id_or_none(user_id)
+        replacement_session: AuthSession | None = None
+        migrated_from_user_id: uuid.UUID | None = None
+
+        if current_user is None:
+            merge_target_user = await self._get_latest_merge_target_for_guest(user_id)
+            if merge_target_user is None:
+                raise AuthenticatedUserNotFoundError(
+                    f"Authenticated user {user_id} no longer exists.",
+                )
+
+            self._ensure_account_is_available(merge_target_user)
+            replacement_session = await self.issue_session_for_user(
+                merge_target_user,
+                ip_address=ip_address,
+                user_agent=user_agent,
+                reload_user=False,
             )
-
-        self._ensure_account_is_available(current_user)
+            current_user = replacement_session.user
+            migrated_from_user_id = user_id
+        else:
+            if current_user.token_nonce != claimed_nonce:
+                raise InvalidTokenError(
+                    "Session has been revoked; please sign in again.",
+                )
+            self._ensure_account_is_available(current_user)
 
         if require_full_account and current_user.account_type is not AccountType.FULL:
             raise UpgradeRequiredError("A full account is required for this operation.")
 
-        return current_user
+        return AuthResolution(
+            user=current_user,
+            replacement_session=replacement_session,
+            migrated_from_user_id=migrated_from_user_id,
+        )
 
     async def refresh_session_from_access_token(
         self,
@@ -357,4 +399,4 @@ def _truncate(value: str | None, limit: int) -> str | None:
     return normalized[:limit]
 
 
-__all__ = ["ACCESS_TOKEN_TYPE", "AuthService", "AuthSession", "HS256_ALGORITHM"]
+__all__ = ["ACCESS_TOKEN_TYPE", "AuthResolution", "AuthService", "AuthSession", "HS256_ALGORITHM"]
