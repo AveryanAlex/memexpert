@@ -458,18 +458,22 @@ async def test_google_link_merges_guest_into_existing_full_and_exposes_linked_pr
     }
     assert linked_providers_payload["email_verified_at"] is not None
 
-    # The guest was merged into the canonical account and deleted, so the
-    # old guest bearer can no longer decode to a user row.
-    assert stale_guest_response.status_code == 401
-    assert stale_guest_response.json()["code"] == "invalid_token"
+    # The guest was merged into the canonical account and deleted; the stale
+    # guest cookie self-heals through the merge log on the next auth-aware read.
+    assert stale_guest_response.status_code == 200
+    assert stale_guest_response.json()["id"] == str(full_user.id)
+    assert stale_guest_response.json()["account_type"] == "full"
+    assert f"{ACCESS_COOKIE_NAME}=" in stale_guest_response.headers["set-cookie"]
 
     async with postgres_session_factory() as session:
         persisted_full_result = await session.execute(select(User).where(User.id == full_user.id))
         deleted_guest_result = await session.execute(select(User).where(User.id == guest_user_id))
         login_event_result = await session.execute(
-            select(LoginEvent).where(LoginEvent.user_id == full_user.id)
+            select(LoginEvent)
+            .where(LoginEvent.user_id == full_user.id)
+            .order_by(LoginEvent.occurred_at.asc())
         )
-        login_event_row = login_event_result.scalar_one()
+        login_event_rows = login_event_result.scalars().all()
         persisted_full = persisted_full_result.scalar_one()
         merge_log_count_result = await session.execute(
             select(func.count()).select_from(AccountMergeLog).where(AccountMergeLog.guest_account_id == guest_user_id)
@@ -478,7 +482,8 @@ async def test_google_link_merges_guest_into_existing_full_and_exposes_linked_pr
         assert persisted_full.google_id == "google-link-subject"
         assert persisted_full.email_verified_at is not None
         assert deleted_guest_result.scalar_one_or_none() is None
-        assert login_event_row.user_agent == "Google Link Browser"
+        assert len(login_event_rows) == 2
+        assert "Google Link Browser" in {row.user_agent for row in login_event_rows}
         assert merge_log_count_result.scalar_one() == 1
 
 
