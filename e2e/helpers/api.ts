@@ -153,12 +153,25 @@ export class E2EApi {
   }
 
   async expectDualIndexProof(memeFileId: string) {
-    const response = await this.request.post(`${this.apiBaseUrl}/api/v1/pipeline/search/smoke`, {
-      headers: { 'X-Memexpert-Operator-Token': this.operatorToken },
-      data: { meme_file_id: memeFileId }
-    });
-    await expect(response).toBeOK();
-    expect(await response.json()).toEqual(expect.objectContaining({ both_targets_searchable: true }));
+    const expectedTargets = [
+      { route: 'qdrant', target: 'qdrant' },
+      { route: 'meili', target: 'meilisearch' }
+    ];
+
+    for (const { route, target } of expectedTargets) {
+      const response = await this.request.get(`${this.apiBaseUrl}/api/v1/pipeline/items/${memeFileId}/sync/${route}`, {
+        headers: { 'X-Memexpert-Operator-Token': this.operatorToken }
+      });
+      await expect(response).toBeOK();
+      expect(await response.json()).toEqual(
+        expect.objectContaining({
+          target,
+          status: 'synced',
+          attempt_count: expect.any(Number),
+          last_preview: expect.any(Object)
+        })
+      );
+    }
   }
 
   private async accessCookie() {
