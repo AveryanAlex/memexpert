@@ -3,18 +3,15 @@
 
 The helper computes a :class:`CrawlerFreshnessSnapshot` from real
 ``meme_sources`` + ``pipeline_stage_journal`` rows. It is kept in its
-own module (instead of adding to
-``memexpert.pipeline.reporting``) because the reporting
-file already carries the S02/S03 inspect-detail + run-summary helpers
-and the freshness math is conceptually separate from the sync-truth
-reporting path.
+own module because freshness math is conceptually separate from the
+pipeline inspect-detail projection code.
 
 The aggregation path prefers ORM readability over SQL cleverness: we
 pull at most ``_HARD_ROW_CAP`` MemeSource rows ordered by
 ``published_at DESC``, then group + trim + percentile-compute in pure
 Python. This keeps the SQL trivially reviewable while still giving
-operators a correct snapshot for the channels T04's freshness harness
-will exercise. If operators later need an order-of-magnitude larger
+operators a correct snapshot for the channels the crawler runtime exercises.
+If operators later need an order-of-magnitude larger
 sample we can promote the grouping into a window-function SQL path
 without changing the caller contract.
 """
@@ -536,11 +533,8 @@ _MIN_DATETIME = datetime.min.replace(tzinfo=UTC)
 def _percentile(sorted_values: Sequence[float], fraction: float) -> float:
     """Linear-interpolation percentile matching numpy's ``linear`` method.
 
-    Duplicated (rather than imported) from
-    :mod:`memexpert.pipeline.reporting` so the crawler
-    freshness surface does not reach into another module's private
-    helper. The math is tiny and intentionally held in sync by the
-    shared doc wording above.
+    Kept local to the crawler freshness surface because the math is tiny and
+    the service should not depend on a reporting-only private helper.
     """
 
     if not sorted_values:

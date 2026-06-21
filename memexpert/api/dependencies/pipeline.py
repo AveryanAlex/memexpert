@@ -13,16 +13,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from memexpert.core.config import get_settings
 from memexpert.core.database import get_async_session_factory, get_db_session
-from memexpert.core.meilisearch import (
-    MeilisearchSyncClientProtocol,
-    PipelineMeilisearchSyncClient,
-)
-from memexpert.core.qdrant import (
-    PipelineQdrantClient,
-    PipelineQdrantSyncClient,
-    QdrantSimilarityClientProtocol,
-    QdrantSyncClientProtocol,
-)
 from memexpert.crawlers.telegram.client import (
     FakeTelegramClient,
     PipelineTelegramClientProtocol,
@@ -40,7 +30,6 @@ from memexpert.ingest.crawler_service import PipelineCrawlerIngestService
 from memexpert.ingest.read_service import PipelineIngestReadService
 from memexpert.pipeline.items import PipelineItemReadService
 from memexpert.pipeline.replay import PipelineReplayService
-from memexpert.pipeline.smoke_proof import PipelineSmokeProofService
 from memexpert.pipeline.sync_status import PipelineSyncStatusService
 from memexpert.schemas.content_pipeline import ContentPipelineErrorCode, ContentPipelineErrorResponse
 from memexpert.services import (
@@ -204,14 +193,6 @@ def get_pipeline_sync_status_service(
     return PipelineSyncStatusService.from_settings(session)
 
 
-def get_pipeline_smoke_proof_service(
-    session: Annotated[AsyncSession, Depends(get_db_session)],
-) -> PipelineSmokeProofService:
-    """Build the search smoke-proof service for one request."""
-
-    return PipelineSmokeProofService.from_settings(session)
-
-
 def get_pipeline_ingest_accept_service(
     session: Annotated[AsyncSession, Depends(get_db_session)],
 ) -> PipelineIngestAcceptService:
@@ -234,29 +215,6 @@ def get_pipeline_crawler_ingest_service(
     """Build the API-safe crawler ingest wrapper for one request."""
 
     return PipelineCrawlerIngestService.from_settings(session)
-
-
-def get_qdrant_sync_client() -> QdrantSyncClientProtocol:
-    """Return the lazy Qdrant sync adapter used by the smoke-proof route.
-
-    The adapter is cached across requests because the underlying
-    ``AsyncQdrantClient`` maintains a pooled HTTP connection; tests override
-    this dependency to inject fakes without importing the real SDK.
-    """
-
-    return PipelineQdrantSyncClient(settings=get_settings())
-
-
-def get_qdrant_similarity_client() -> QdrantSimilarityClientProtocol:
-    """Return the lazy Qdrant similarity adapter used by the smoke-proof route."""
-
-    return PipelineQdrantClient(settings=get_settings())
-
-
-def get_meilisearch_sync_client() -> MeilisearchSyncClientProtocol:
-    """Return the lazy Meilisearch sync adapter used by the smoke-proof route."""
-
-    return PipelineMeilisearchSyncClient(settings=get_settings())
 
 
 def get_pipeline_telegram_client() -> PipelineTelegramClientProtocol:
@@ -325,10 +283,6 @@ PipelineSyncStatusServiceDep = Annotated[
     PipelineSyncStatusService,
     Depends(get_pipeline_sync_status_service),
 ]
-PipelineSmokeProofServiceDep = Annotated[
-    PipelineSmokeProofService,
-    Depends(get_pipeline_smoke_proof_service),
-]
 PipelineIngestAcceptServiceDep = Annotated[
     PipelineIngestAcceptService,
     Depends(get_pipeline_ingest_accept_service),
@@ -342,15 +296,6 @@ PipelineCrawlerIngestServiceDep = Annotated[
     Depends(get_pipeline_crawler_ingest_service),
 ]
 OperatorTokenDep = Annotated[None, Depends(require_pipeline_operator_token)]
-QdrantSyncClientDep = Annotated[QdrantSyncClientProtocol, Depends(get_qdrant_sync_client)]
-QdrantSimilarityClientDep = Annotated[
-    QdrantSimilarityClientProtocol,
-    Depends(get_qdrant_similarity_client),
-]
-MeilisearchSyncClientDep = Annotated[
-    MeilisearchSyncClientProtocol,
-    Depends(get_meilisearch_sync_client),
-]
 PipelineTelegramClientDep = Annotated[
     PipelineTelegramClientProtocol,
     Depends(get_pipeline_telegram_client),
@@ -460,7 +405,6 @@ def _telegram_error_to_http(error: PipelineTelegramError) -> PipelineHTTPError:
 __all__ = [
     "CrawlerOperationsServiceDep",
     "CrawlerRuntimeDep",
-    "MeilisearchSyncClientDep",
     "OperatorTokenDep",
     "PIPELINE_ERROR_RESPONSES",
     "PIPELINE_ERROR_STATUS_CODES",
@@ -471,25 +415,18 @@ __all__ = [
     "PipelineIngestReadServiceDep",
     "PipelineItemReadServiceDep",
     "PipelineReplayServiceDep",
-    "PipelineSmokeProofServiceDep",
     "PipelineSyncStatusServiceDep",
     "PipelineTelegramClientDep",
-    "QdrantSimilarityClientDep",
-    "QdrantSyncClientDep",
     "get_crawler_operations_service",
     "get_crawler_runtime",
     "get_telegram_session_manager",
-    "get_meilisearch_sync_client",
     "get_pipeline_item_read_service",
     "get_pipeline_ingest_accept_service",
     "get_pipeline_crawler_ingest_service",
     "get_pipeline_ingest_read_service",
     "get_pipeline_replay_service",
-    "get_pipeline_smoke_proof_service",
     "get_pipeline_sync_status_service",
     "get_pipeline_telegram_client",
-    "get_qdrant_similarity_client",
-    "get_qdrant_sync_client",
     "pipeline_http_exception_handler",
     "require_pipeline_operator_token",
     "to_pipeline_http_error",

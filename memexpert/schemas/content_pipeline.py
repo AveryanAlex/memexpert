@@ -5,8 +5,8 @@ Historically this module carried every content-pipeline schema in one file.
 The foundational enums/error codes now live in :mod:`pipeline_base` and the
 crawler/upload ingest contract now lives in :mod:`pipeline_ingest`; this
 module keeps the runtime dispatch event, stage-journal read model, item
-read/detail projections, proof-harness summaries, and smoke-proof schemas.
-Every name from the sibling modules is re-exported below so the existing
+read/detail projections, and replay/sync operator contracts. Every name from
+the sibling modules is re-exported below so the existing
 ``memexpert.schemas.content_pipeline`` import surface is byte-for-byte
 preserved for every caller.
 """
@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
@@ -367,228 +366,6 @@ class ContentPipelineReplayAccepted(BaseModel):
     attempt: StrictInt = Field(ge=1)
 
 
-class ContentPipelineRunItemReport(BaseModel):
-    """Compact per-item report row persisted by the S02 runtime proof harness.
-
-    T03 adds the optional per-target sync status fields so the Markdown
-    report can render both sync targets side-by-side in the per-item table
-    without the report builder re-querying durable state. The fields default
-    to ``None`` so pre-S03 fixtures keep deserializing cleanly.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    meme_file_id: uuid.UUID
-    meme_id: uuid.UUID
-    terminal_stage: ContentPipelineStage
-    terminal_status: ContentPipelineStageStatus
-    outcome: str
-    meme_ready_event_id: uuid.UUID | None = None
-    failure_reason: str | None = None
-    failure_text: str | None = None
-    ocr_fallback_used: bool = False
-    ocr_low_confidence: bool = False
-    ocr_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
-    merged_into_meme_id: uuid.UUID | None = None
-    is_nsfw: bool | None = None
-    sync_qdrant_status: SyncTargetStatus | None = None
-    sync_meili_status: SyncTargetStatus | None = None
-    drill_down_url: str
-
-
-class ContentPipelineStageTimings(BaseModel):
-    """Stage-latency percentiles derived from the journal's started_at/finished_at."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    stage: ContentPipelineStage
-    sample_count: StrictInt = Field(ge=0)
-    p50_seconds: float | None = None
-    p95_seconds: float | None = None
-    max_seconds: float | None = None
-
-
-class ContentPipelineRunStageCounts(BaseModel):
-    """Aggregate per-stage counters for a bounded proof-harness run.
-
-    T03 extends the S02 counters with per-target sync pass/fail splits plus
-    the cross-target aggregates (``both_synced_count``,
-    ``partially_searchable_count``) that the operator Markdown report needs.
-    All new fields default to ``0`` so pre-S03 clients that deserialize the
-    model without the new counters still validate.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    transcode_pass: StrictInt = Field(default=0, ge=0)
-    transcode_failed: StrictInt = Field(default=0, ge=0)
-    ocr_pass: StrictInt = Field(default=0, ge=0)
-    ocr_failed: StrictInt = Field(default=0, ge=0)
-    ocr_fallback_used: StrictInt = Field(default=0, ge=0)
-    ocr_low_confidence: StrictInt = Field(default=0, ge=0)
-    embed_pass: StrictInt = Field(default=0, ge=0)
-    embed_blocked: StrictInt = Field(default=0, ge=0)
-    merge_count: StrictInt = Field(default=0, ge=0)
-    classify_pass: StrictInt = Field(default=0, ge=0)
-    classify_blocked: StrictInt = Field(default=0, ge=0)
-    ready_count: StrictInt = Field(default=0, ge=0)
-    blocked_count: StrictInt = Field(default=0, ge=0)
-    sync_qdrant_synced: StrictInt = Field(default=0, ge=0)
-    sync_qdrant_failed: StrictInt = Field(default=0, ge=0)
-    sync_qdrant_pending: StrictInt = Field(default=0, ge=0)
-    sync_qdrant_pass: StrictInt = Field(default=0, ge=0)
-    sync_meili_pass: StrictInt = Field(default=0, ge=0)
-    sync_meili_failed: StrictInt = Field(default=0, ge=0)
-    both_synced_count: StrictInt = Field(default=0, ge=0)
-    partially_searchable_count: StrictInt = Field(default=0, ge=0)
-    blocked_by_qdrant_count: StrictInt = Field(default=0, ge=0)
-    blocked_by_meili_count: StrictInt = Field(default=0, ge=0)
-
-
-class ContentPipelineRunSummary(BaseModel):
-    """Persisted proof-harness summary written to the S02 artifact directory.
-
-    Combines pass-rate, fallback-rate, per-stage timings, merge counts, blocked
-    items, and emitted ``meme_ready`` ids into one machine-readable payload that
-    operators read before deciding whether the heavy chain behaved truthfully
-    for the current corpus run.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    run_id: str
-    started_at: datetime
-    finished_at: datetime
-    dataset_root: str
-    api_base_url: str
-    bounded_item_count: StrictInt = Field(ge=0)
-    stage_counts: ContentPipelineRunStageCounts
-    stage_timings: tuple[ContentPipelineStageTimings, ...]
-    ready_event_ids: tuple[uuid.UUID, ...]
-    blocked_item_ids: tuple[uuid.UUID, ...]
-    flagged_item_ids: tuple[uuid.UUID, ...]
-    item_reports: tuple[ContentPipelineRunItemReport, ...]
-    errors: tuple[str, ...] = ()
-
-
-class SmokeProofTargetResult(BaseModel):
-    """Per-target outcome of one search-sync smoke proof.
-
-    ``searchable`` is ``True`` only when BOTH the id-lookup and the typed
-    query-by-vector (Qdrant) or the text ``search`` call (Meilisearch) surface
-    the target ``meme_file_id`` in their top hits. ``matched_by`` documents
-    which of the two paths fired so operators can distinguish a document that
-    exists in the index but is not retrievable via the text/vector query.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    target: SyncTargetKind
-    searchable: bool
-    reason: str | None = None
-    latency_ms: float | None = None
-    matched_by: Literal["id_lookup", "query_match", "both"] | None = None
-
-
-class SmokeProofResult(BaseModel):
-    """Assembled dual-target smoke proof for one pipeline item.
-
-    The per-target breakdown is authoritative — ``both_targets_searchable`` is
-    derived from ``targets`` and must be ``True`` only when every per-target
-    ``searchable`` flag is also ``True``. The route handler returns this
-    model even on partial / negative proofs so operators see the per-target
-    reason strings in the response body.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    meme_file_id: uuid.UUID
-    query: str | None = None
-    both_targets_searchable: bool
-    targets: tuple[SmokeProofTargetResult, ...]
-    evaluated_at: datetime
-
-
-class ContentPipelineSearchSmokeRequest(BaseModel):
-    """Request body for ``POST /api/v1/pipeline/search/smoke``.
-
-    Exactly one of ``meme_file_id`` and ``query`` must be supplied. When only
-    the ``query`` is supplied the route resolves a ``meme_file_id`` from the
-    top Meilisearch hit before running the per-item proof, so the dual-target
-    truth check always runs against a concrete pipeline item.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    meme_file_id: uuid.UUID | None = None
-    query: str | None = None
-
-    @model_validator(mode="after")
-    def _validate_exactly_one_input(self) -> ContentPipelineSearchSmokeRequest:
-        if self.meme_file_id is None and self.query is None:
-            raise ValueError(
-                "search smoke request must provide exactly one of "
-                "meme_file_id or query.",
-            )
-        if self.meme_file_id is not None and self.query is not None:
-            raise ValueError(
-                "search smoke request must provide exactly one of "
-                "meme_file_id or query — not both.",
-            )
-        if self.query is not None and not self.query.strip():
-            raise ValueError("search smoke request query must not be blank.")
-        return self
-
-
-class ContentPipelineS03RunItemReport(BaseModel):
-    """Compact per-item report row persisted by the S03 search-sync proof harness.
-
-    Each item carries its terminal outcome, per-target sync status, and the
-    per-item :class:`SmokeProofResult` captured after both sync targets reach
-    a terminal state. ``failure_reason`` is the normalized reason the harness
-    saw if either the polling or the smoke proof could not run for this item.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    meme_file_id: uuid.UUID
-    outcome: str
-    qdrant_status: SyncTargetStatus | None = None
-    meili_status: SyncTargetStatus | None = None
-    smoke_result: SmokeProofResult | None = None
-    failure_reason: str | None = None
-
-
-class ContentPipelineS03RunSummary(BaseModel):
-    """Persisted S03 search-sync proof summary written to the artifact directory.
-
-    The counters mirror :class:`ContentPipelineRunStageCounts` fields that
-    matter for the sync chain (``both_synced``, ``partially_searchable``,
-    ``blocked_by_*``) and add the smoke-proof specific ``smoke_pass_count``
-    and ``stale_snapshot_ids`` set. ``stale_snapshot_ids`` lists items whose
-    snapshot claimed both targets were synced but whose smoke proof said
-    otherwise — this is the operator-facing symptom that sync truth and the
-    search engine disagree.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    run_id: str
-    started_at: datetime
-    finished_at: datetime
-    bounded_item_count: StrictInt = Field(ge=0)
-    qdrant_synced_count: StrictInt = Field(default=0, ge=0)
-    meilisearch_synced_count: StrictInt = Field(default=0, ge=0)
-    both_synced_count: StrictInt = Field(default=0, ge=0)
-    partial_count: StrictInt = Field(default=0, ge=0)
-    blocked_by_qdrant_count: StrictInt = Field(default=0, ge=0)
-    blocked_by_meili_count: StrictInt = Field(default=0, ge=0)
-    smoke_pass_count: StrictInt = Field(default=0, ge=0)
-    stale_snapshot_ids: tuple[uuid.UUID, ...] = ()
-    item_reports: tuple[ContentPipelineS03RunItemReport, ...] = ()
-    errors: tuple[str, ...] = ()
-
-
 __all__ = [
     "CRAWLER_MEDIA_TYPE_VALUES",
     "ContentPipelineCanonicalContext",
@@ -606,14 +383,7 @@ __all__ = [
     "ContentPipelineReadyEventSummary",
     "ContentPipelineReplayAccepted",
     "ContentPipelineReplayRequest",
-    "ContentPipelineRunItemReport",
-    "ContentPipelineRunStageCounts",
-    "ContentPipelineRunSummary",
-    "ContentPipelineS03RunItemReport",
-    "ContentPipelineS03RunSummary",
-    "ContentPipelineSearchSmokeRequest",
     "ContentPipelineStageJournalRead",
-    "ContentPipelineStageTimings",
     "ContentPipelineSyncReplayBatchRequest",
     "ContentPipelineSyncReplayTarget",
     "ContentPipelineSyncTargetPreview",
@@ -635,8 +405,6 @@ __all__ = [
     "MAX_TELEGRAM_SESSION_NAME_LENGTH",
     "PerTargetSyncStatus",
     "RawCrawlerPost",
-    "SmokeProofResult",
-    "SmokeProofTargetResult",
     "TelegramSessionRead",
     "_PIPELINE_EVENT_ALLOWED_STAGES",
 ]

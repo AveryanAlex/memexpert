@@ -194,8 +194,7 @@ async def read_crawler_freshness_snapshot(
 
     The SLO p50/p95 pass flags follow the convention "no data means
     pass" — an empty snapshot cannot manufacture a failure on its own.
-    T04's freshness proof harness is the one that actually fails a run
-    when there are not enough samples.
+    Callers decide whether an empty sample is acceptable for their run.
     """
 
     try:

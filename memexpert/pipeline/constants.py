@@ -1,7 +1,7 @@
 """Stage ordering, routing maps, and normalized reason strings for the pipeline.
 
-Focused pipeline services, reporting helpers, smoke proof, and runtime
-callbacks all share the same stage graph and normalized reason strings.
+Focused pipeline services, reporting helpers, and runtime callbacks all share
+the same stage graph and normalized reason strings.
 """
 
 from __future__ import annotations

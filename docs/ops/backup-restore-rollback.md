@@ -151,7 +151,8 @@ Use this decision flow during an incident:
    loss is understood, and object storage from the same backup window is
    available.
 5. After DB restore, run the normal migration service from the chosen image tag
-   and then verify API health, scheduler logs, and search-index smoke checks.
+   and then verify API health, scheduler logs, and search-index replay/status
+   checks.
 
 Do not run ad-hoc downgrade SQL in production unless it is reviewed as part of
 the incident plan. Alembic downgrade support is not a substitute for a tested
@@ -166,7 +167,7 @@ object storage. For launch readiness:
   per-target replay paths in `docs/ops/content-pipeline-search-sync.md`.
 - Use engine-native snapshots or volume backups only as a speed optimization.
 - If a restored database points at older meme/search state, treat both search
-  engines as stale until the S03 smoke proof passes.
+  engines as stale until per-target replay/status checks show they were rebuilt.
 - Do not treat a `synced` snapshot row as sufficient after object or DB restore;
   prove the engine can find the item.
 
@@ -242,7 +243,7 @@ docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" logs --since 10m api wo
 curl -fsS http://127.0.0.1:<api-port>/health
 ```
 
-Then run the relevant pipeline smoke proof from `docs/ops/content-pipeline-smoke.md`
-or `docs/ops/content-pipeline-search-sync.md`. For search recovery, expect
-Qdrant and Meilisearch to be stale until replay/scheduler work finishes and the
-S03 smoke proof passes.
+Then run the relevant API health, pipeline item-detail, and per-target
+search-sync checks from `docs/ops/content-pipeline-search-sync.md`. For search
+recovery, expect Qdrant and Meilisearch to be stale until replay/scheduler work
+finishes and target status rows show fresh `synced` results.

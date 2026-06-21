@@ -115,8 +115,8 @@ class MeilisearchSyncClientProtocol(Protocol):
     The protocol is intentionally narrow: the runtime needs to upsert a
     document, fetch the current state for operator diagnostics, delete a
     document when a canonical file is retired, ensure the index exists
-    before the first write, and — as of T04 — run a bounded text search
-    so the smoke-proof path can prove documents are actually retrievable.
+    before the first write, and run a bounded text search for diagnostics and
+    user-facing candidate collection.
     Anything beyond that belongs on the SDK.
     """
 
@@ -236,11 +236,11 @@ class PipelineMeilisearchSyncClient:
         """Run a bounded text search against the configured Meilisearch index.
 
         Returns the raw ``hits`` list from the Meilisearch response as plain
-        dicts so the smoke-proof path can locate the target ``meme_file_id``
-        via the ``id`` key without the caller having to decode a full SDK
-        response model. Errors are mapped onto the same typed taxonomy as
-        the other adapter methods so the smoke proof sees consistent
-        provider-blocked / timeout / malformed-response reasons.
+        dicts so callers can locate the target ``meme_file_id`` via the ``id``
+        key without having to decode a full SDK response model. Errors are
+        mapped onto the same typed taxonomy as the other adapter methods so
+        search callers see consistent provider-blocked / timeout /
+        malformed-response reasons.
         """
 
         index = await self._ensure_index_client()
@@ -452,9 +452,9 @@ def _coerce_search_hits(raw_response: object) -> list[dict[str, Any]]:
     """Return the ``hits`` list from a Meilisearch search response as plain dicts.
 
     The SDK returns a pydantic ``SearchResults`` model; older versions may
-    return a plain dict. We normalize both shapes here so the smoke-proof
-    caller always sees ``list[dict[str, Any]]`` regardless of which SDK
-    release the environment runs against.
+    return a plain dict. We normalize both shapes here so callers always see
+    ``list[dict[str, Any]]`` regardless of which SDK release the environment
+    runs against.
     """
 
     raw_hits: object = None

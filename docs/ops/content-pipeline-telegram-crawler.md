@@ -1,24 +1,17 @@
-# S04 Telegram Crawler + Freshness SLO Runbook
+# Telegram Crawler + Freshness SLO Runbook
 
-This runbook covers the operator proof loop for milestone **M002 / slice S04**:
-the curated Telegram crawler chain (Telethon catch-up + live listener →
+This runbook covers the Telegram crawler chain (Telethon catch-up + live listener →
 raw ingest accept → media-inspect materialization → transcode → ocr → embed →
-classify → sync_qdrant + sync_meili) plus the freshness SLO proof harness
-that measures end-to-end p50/p95 against the numbers configured in
+classify → sync_qdrant + sync_meili) plus the freshness endpoint that measures
+end-to-end p50/p95 against the numbers configured in
 `memexpert.core.config.Settings`.
 
-S04 is additive to S02 + S03:
-
-- `docs/ops/content-pipeline-smoke.md` — S01 upload/replay/duplicate proof.
-- `docs/ops/content-pipeline-heavy-worker.md` — S02 heavy-worker proof.
-- `docs/ops/content-pipeline-search-sync.md` — S03 per-target sync proof and
-  smoke-proof surface.
-- **this file** — S04 Telegram crawler proof, freshness SLO harness,
-  per-channel replay + repair, flood-wait + ban recovery.
+This file focuses on Telegram crawler runtime operation, freshness inspection,
+per-channel replay/repair, and flood-wait/ban recovery.
 
 ## Overview
 
-S04 ships six operator-facing pieces:
+The crawler ships five operator-facing pieces:
 
 1. **Telethon adapter** (`memexpert/crawlers/telegram/telethon_adapter.py`)
    bound to DB-backed Telethon `StringSession` material. Flood-wait, session
@@ -33,35 +26,25 @@ S04 ships six operator-facing pieces:
    `/api/v1/admin/telegram/*`) for cookie-authenticated session CRUD,
    StringSession import/validation, and channel assignment management.
 4. **Operator crawler API surface** (`memexpert/api/routes/v1/crawler.py`)
-   exposing `/api/v1/crawler/sessions`, `/channels`, `/pause`, `/resume`,
-   `/reassign`, `/replay-post`, and `/freshness` for runtime proof and
-   replay automation.
-5. **Freshness SLO proof harness** (`scripts/verify_s04_runtime.py`) that
-   polls `/freshness` against a curated channel fixture and produces a
-   pass/fail artifact pair under `.artifacts/s04-runtime-smoke/<run-id>/`.
-6. **Curated channel fixture** at
-   `memexpert/crawlers/telegram/channels.example.yaml` — the operator
-   copies or edits this file to reflect the real `source_channels` rows
-   managed through browser admin.
-
-The harness evaluates the freshness SLO numbers configured via
+    exposing `/api/v1/crawler/sessions`, `/channels`, `/pause`, `/resume`,
+    `/reassign`, `/replay-post`, and `/freshness` for runtime inspection and
+    replay automation.
+5. **Freshness SLO snapshot** (`GET /api/v1/crawler/freshness`) that evaluates
+   the freshness SLO numbers configured via
 `Settings.crawler_freshness_slo_p50_seconds` (default **60s**) and
-`Settings.crawler_freshness_slo_p95_seconds` (default **180s**). A run
-passes iff the final snapshot proves `slo_p50_pass=True` AND
-`slo_p95_pass=True` AND the observed item count reached
-`--candidate-limit`.
+`Settings.crawler_freshness_slo_p95_seconds` (default **180s**).
 
 ## Prerequisites
 
 - Docker Compose healthy: `IMGPROXY_PORT=18080 docker compose up -d`.
   Postgres, RabbitMQ, Qdrant, Meilisearch, and MinIO must report healthy
-  before the harness runs.
+  before runtime diagnostics are meaningful.
 - Alembic head applied: `uv run alembic upgrade head`.
 - The native API running on `http://127.0.0.1:8000`: `uv run memexpert-api`.
 - The SvelteKit frontend serving `/admin/telegram`. For local development,
   run the frontend from `frontend/` with `pnpm dev`; set `API_BASE_URL` when
   the API is not reachable at the frontend default.
-- The S02/S03 heavy workers running: `uv run memexpert-workers`. These
+- The heavy workers running: `uv run memexpert-workers`. These
   process both `media_inspect_requested` events from raw crawler accept and
   the later `transcode → ocr → embed → classify → sync_qdrant → sync_meili`
   chain that materialized crawler content feeds.
@@ -69,9 +52,8 @@ passes iff the final snapshot proves `slo_p50_pass=True` AND
   `/api/v1/admin/telegram/*` routes use the normal cookie-authenticated admin
   guard; they do not accept the operator token.
 - Environment variables loaded through the project `.env` / `Settings` surface:
-  - `PIPELINE_OPERATOR_TOKEN` — same token the S02/S03 harnesses use.
-    The S04 harness reads it from `get_settings()` when
-    `--operator-token` is not passed on the CLI.
+  - `PIPELINE_OPERATOR_TOKEN` — required by the operator-token crawler and
+    pipeline routes used in the commands below.
   - `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` — the Telethon app
     credentials used by browser-admin validation and the CLI helper. These are
     per-environment secrets; never commit them.
@@ -103,7 +85,7 @@ admin browser cookie from SvelteKit to the API.
 
 ### Sessions
 
-Before the harness can prove freshness, create or import one DB-backed
+Before the runtime can ingest Telegram content, create or import one DB-backed
 Telegram session for each account the manager should run. In the
 "Import or Create Session" panel:
 
@@ -185,31 +167,13 @@ recorded.
 Use browser admin for CRUD and assignment: create/import/validate/patch/delete
 sessions, add channels, move channels between sessions, orphan channels, and
 edit indexing controls. Use the operator-token `/api/v1/crawler/*` endpoints
-for runtime/proof tasks: list the runtime projection, pause/resume during proof
-automation, replay one Telegram post, and read freshness snapshots. The crawler
-routes still exist for headless scripts and the S04 harness, but browser admin
-is the preferred surface for session and channel management.
-
-## Preparing curated channel fixtures
-
-After adding channels in browser admin, copy the example fixture and point the
-harness at your edited copy:
-
-```bash
-cp memexpert/crawlers/telegram/channels.example.yaml .artifacts/channels.yaml
-# Edit .artifacts/channels.yaml to match the platform_id/title values you
-# manage in /admin/telegram, then pass --channel-fixture-path
-# .artifacts/channels.yaml to the harness.
-```
-
-The live harness refuses to run if any `platform_id` in the fixture does
-not appear in the `GET /api/v1/crawler/channels` response. This is the
-guardrail that turns "fixture/database drift" into a loud setup failure
-instead of a silently-empty freshness snapshot.
+for runtime tasks: list the runtime projection, pause/resume channels, replay
+one Telegram post, and read freshness snapshots. Browser admin is the preferred
+surface for session and channel management.
 
 ## Starting the crawler runtime
 
-Run the dedicated Telegram crawler process before starting the freshness harness:
+Run the dedicated Telegram crawler process before expecting fresh crawler data:
 
 ```bash
 uv run memexpert-telegram-crawler
@@ -266,145 +230,43 @@ Watch for these structured lifecycle events in crawler logs:
   `telegram_crawler_reload_completed` when `SIGHUP` is received.
 - `telegram_crawler_stop_requested` when `SIGINT` or `SIGTERM` is received.
 
-The freshness harness only observes freshness - it does not trigger catch-up or
+The freshness endpoint only observes freshness - it does not trigger catch-up or
 start the crawler runtime.
 
-## Running `scripts/verify_s04_runtime.py`
-
-### Live mode
+## Inspecting freshness snapshots
 
 ```bash
-uv run python scripts/verify_s04_runtime.py \
-  --api-base-url http://127.0.0.1:8000 \
-  --channel-fixture-path .artifacts/channels.yaml \
-  --candidate-limit 8 \
-  --live-duration-seconds 120 \
-  --artifacts-dir .artifacts/s04-runtime-smoke
+curl -s "http://127.0.0.1:8000/api/v1/crawler/freshness?limit_per_channel=100" \
+  -H "X-Memexpert-Operator-Token: $PIPELINE_OPERATOR_TOKEN" | jq
 ```
 
-What the harness does:
-
-1. Health-checks the API.
-2. Loads the curated channel fixture and refuses to run if any listed
-   `platform_id` is missing from `GET /api/v1/crawler/channels`.
-3. Calls `POST /api/v1/crawler/channels/{id}/resume` once per fixture
-   channel so the operator log trail records "I asked for live mode".
-   `resume` is idempotent and uses the operator-token runtime surface that
-   the harness already exercises.
-4. Polls `GET /api/v1/crawler/freshness` on `--poll-interval-seconds`
-   until the combined time budget expires OR a snapshot already proves
-   the SLO (both p50 + p95 pass AND observed item count >= candidate
-   limit).
-5. Aggregates the final snapshot into a
-   `CrawlerS04RunSummary` and writes `report.json` + `report.md` under
-   `<artifacts-dir>/<run-id>/`.
-
-For staging, keep the same command shape but point `--api-base-url` at
-the staging API and pass the staging operator token explicitly when the
-local `.env` does not match that environment:
-
-```bash
-uv run python scripts/verify_s04_runtime.py \
-  --api-base-url https://staging-api.example.invalid \
-  --operator-token "$STAGING_PIPELINE_OPERATOR_TOKEN" \
-  --channel-fixture-path .artifacts/staging-channels.yaml \
-  --candidate-limit 8 \
-  --artifacts-dir .artifacts/s04-runtime-smoke-staging
-```
-
-Do not use `--dry-run` as staging proof. Dry-run only proves the report
-renderer; it does not contact Telegram, Qdrant, Meilisearch, or the API.
-
-### Catch-up-only mode
-
-```bash
-uv run python scripts/verify_s04_runtime.py \
-  --catch-up-only \
-  --channel-fixture-path .artifacts/channels.yaml \
-  --artifacts-dir .artifacts/s04-runtime-smoke
-```
-
-Catch-up-only mode skips the resume + live-duration polling loop. The
-harness only takes one freshness snapshot after healthchecking the API,
-then writes the artifact pair. Use this when `memexpert-telegram-crawler` is
-still running catch-up in another shell and you just want a single observation
-window.
-
-### Dry-run mode
-
-```bash
-uv run python scripts/verify_s04_runtime.py --dry-run \
-  --dry-run-slo-scenario pass \
-  --artifacts-dir .artifacts/s04-runtime-smoke-dry \
-  --run-id operator-dry-run
-```
-
-Dry-run mode never touches the network, the database, or Telethon. It
-runs the aggregation + rendering pipeline against a canned snapshot
-keyed on `--dry-run-slo-scenario`:
-
-| scenario | behavior |
-|----------|----------|
-| `pass` (default) | Three fixture channels each produce a sub-SLO item. Exit 0. |
-| `fail-p50` | Freshness values sit between `slo_p50` and `slo_p95`. Exit 2. |
-| `fail-p95` | Freshness values cross `slo_p95`. Exit 2. |
-| `empty` | No items observed. Exit 2 (observed < bounded). |
-
-Dry-run is what CI uses to confirm the harness, the schemas, and the
-Markdown renderer all agree without standing up the stack.
-
-### Exit codes
-
-- **0** — every condition held: `slo_p50_pass=True` AND `slo_p95_pass=True`
-  AND `observed_item_count >= bounded_item_count`.
-- **1** — setup failure. The fixture was missing or malformed, the API
-  was unreachable, fixture channels were not present in the runtime channel
-  projection, or the operator token was absent. The stderr output carries an
-  actionable hint.
-- **2** — runtime failure. The snapshot was observed successfully but
-  the SLO was breached or the corpus was under-sampled.
-
-## Reading the report
-
-Every run writes two files under `<run-id>/`:
-
-- `report.json` — machine-readable `CrawlerS04RunSummary`.
-- `report.md` — human-readable companion with the same data plus
-  drill-down links into `/api/v1/pipeline/items/<id>/detail`.
-
-Key JSON fields:
+Key fields:
 
 | field | meaning |
 |-------|---------|
-| `mode` | `live`, `catch_up_only`, or `dry_run`. |
-| `run_id` | Operator-visible run identifier. |
-| `bounded_item_count` | The `--candidate-limit` the operator requested. |
 | `observed_item_count` | How many items in the snapshot reached both sync targets. |
 | `p50_seconds` / `p95_seconds` | End-to-end freshness percentiles. |
 | `slo_p50_seconds` / `slo_p95_seconds` | The configured SLO thresholds. |
 | `slo_p50_pass` / `slo_p95_pass` | Whether the observed percentiles are inside the SLO. |
-| `per_channel` | Per-channel roll-up with per-channel SLO pass flags. |
-| `item_reports` | Per-item breakdown with pre-computed `slo_bucket`, `searchability`, current `pipeline_stage` / `pipeline_status`, and Qdrant/Meili status + failure reason fields. |
-| `stalled_channels` | Expected channels that produced **zero** items. |
-| `errors` | Harness-captured error strings (dry-run note, HTTP failures, etc.). |
+| `channels` | Per-channel roll-up with per-channel item counts and SLO pass flags. |
+| `sample_items` | Per-item breakdown with freshness, current pipeline stage/status, and Qdrant/Meili status + failure reason fields. |
 
 ### `slo_bucket` tags
 
-Every item carries one of:
+Classify each sample item while triaging:
 
 - `pass` — freshness inside `slo_p50`.
 - `breached_p50` — between `slo_p50` and `slo_p95`.
 - `breached_p95` — at or above `slo_p95`.
 - `incomplete` — the sync chain never reached both targets (sample has
-  `freshness_seconds=None`). Treat as "no data", not as a breach; read
-  the same row's `searchability`, `pipeline_stage`, `qdrant_status`,
-  `meili_status`, and reason/error fields to see whether the item is
-  blocked, partially searchable, or still in flight.
+  `freshness_seconds=None`). Treat as "no data", not as a breach; read the
+  same row's pipeline and target fields to see whether the item is blocked,
+  partially searchable, or still in flight.
 
 ### Per-item freshness evidence
 
-The freshness endpoint and S04 report now carry enough per-item evidence
-to choose the next diagnostic surface without guessing:
+The freshness endpoint carries enough per-item evidence to choose the next
+diagnostic surface without guessing:
 
 | field | meaning |
 |-------|---------|
@@ -413,16 +275,16 @@ to choose the next diagnostic surface without guessing:
 | `qdrant_status` / `meili_status` | Per-target status, preferring `meme_file_sync_target_snapshots` and falling back to sync stage-journal rows. |
 | `qdrant_reason` / `meili_reason` | Normalized provider or payload failure reason for the target, when known. |
 
-If an item is `partially_searchable`, user search may work through one
-target but the product promise is not fully proven. Use
-`GET /api/v1/pipeline/items/<meme_file_id>/detail` for the full stage
-history and `POST /api/v1/pipeline/search/smoke` to prove the user-facing
-search path for that item.
+If an item is `partially_searchable`, user search may work through one target
+but the product promise is not fully proven. Use
+`GET /api/v1/pipeline/items/<meme_file_id>/detail` and the per-target sync
+routes from `docs/ops/content-pipeline-search-sync.md` for the full stage and
+target history.
 
-### `stalled_channels`
+### Channels with no fresh items
 
-A channel is stalled when it is listed in the fixture but produced zero
-items in the snapshot window. Causes, in priority order:
+When an expected channel produced zero items in the snapshot window, check these
+causes in priority order:
 
 1. **Session flood-wait or ban.** Check
    `GET /api/v1/crawler/sessions` for the owning session's `status` and
@@ -433,17 +295,17 @@ items in the snapshot window. Causes, in priority order:
    runnable session and enable the intended catch-up/live/engagement controls.
 3. **Channel paused.** Check `is_paused` on the channel row via
    `GET /api/v1/crawler/channels`. Resume with `POST /channels/{id}/resume`.
-4. **Crawler manager not started.** The S04 harness only observes; it
-   does not start the runtime. Re-read the "Starting the crawler
-   runtime" section above.
+4. **Crawler manager not started.** The freshness endpoint only observes; it
+   does not start the runtime. Re-read the "Starting the crawler runtime"
+   section above.
 5. **Empty channel.** If the Telegram channel genuinely had no new
    messages in the window, a stalled entry is the honest signal.
 
 ## Per-channel replay + repair
 
 Use `/admin/telegram` for session/channel CRUD, assignment, and indexing-control
-edits. The commands below use `/api/v1/crawler/*` only for runtime proof,
-pause/resume automation, replay, and freshness inspection. Pass the operator
+edits. The commands below use `/api/v1/crawler/*` only for runtime inspection,
+pause/resume automation, replay, and freshness checks. Pass the operator
 token in the `X-Memexpert-Operator-Token` header.
 
 ```bash
@@ -472,7 +334,7 @@ curl -s -X POST "$BASE/api/v1/crawler/channels/<source_channel_id>/replay-post" 
   -H "Content-Type: application/json" \
   -d '{"post_id": "12345"}' | jq
 
-# Read the bounded freshness snapshot the S04 harness consumes.
+# Read the bounded freshness snapshot.
 curl -s "$BASE/api/v1/crawler/freshness?limit_per_channel=100" \
   -H "X-Memexpert-Operator-Token: $TOKEN" | jq
 ```
@@ -541,8 +403,8 @@ Recovery steps:
 4. Once the window expires, patch the session back to `active` and clear errors
    in `/admin/telegram`, or validate access if secret material changed.
 5. Send `SIGHUP` to `memexpert-telegram-crawler` so stale clients/listeners are
-   closed and live listeners are rebuilt. The S04 harness picks up recovery on
-   the next poll.
+   closed and live listeners are rebuilt. Freshness snapshots pick up recovery
+   on the next poll.
 
 If the flood-wait keeps recurring, lower the session row's
 `max_requests_per_second` in `/admin/telegram` (preferred) or the
@@ -570,9 +432,9 @@ row is marked `status=auth_required`, not quarantined. Recovery options are:
    `scripts/auth_telegram_session.py --session-name <name> --string-session-file <path>`;
    the helper validates Telegram authorization, replaces `encrypted_string_session`,
    clears error fields, and sets `status='active'`.
-3. **Validate and prove recovery.** Use `/admin/telegram` "Validate access"
+3. **Validate and check recovery.** Use `/admin/telegram` "Validate access"
    with an optional channel check, send `SIGHUP` to `memexpert-telegram-crawler`,
-   then re-run the harness to confirm freshness recovers.
+   then read `/api/v1/crawler/freshness` to confirm freshness recovers.
 
 ## Common failure modes
 
@@ -584,21 +446,18 @@ row is marked `status=auth_required`, not quarantined. Recovery options are:
 - **`telegram_provider_unavailable`.** Telegram is reachable but refused
   the request. Transient; the runtime reports the stage as retryable and
   the worker will requeue it.
-- **Network/provider blocked proof.** If Telegram, Qdrant, Meilisearch,
+- **Network/provider blocked runtime.** If Telegram, Qdrant, Meilisearch,
   or the embedding/OCR provider is unreachable from local or staging, the
-  correct S04 result is setup/runtime failure with evidence in
-  `errors`, `pipeline_status`, or per-target status fields. Do not mark
-  provider calls as successful in fixtures to force a green run; use
-  `--dry-run` only to validate report plumbing while waiting on network
-  access.
+  correct result is failed or incomplete pipeline evidence in
+  `pipeline_status` or per-target status fields. Do not mark provider calls as
+  successful in fixtures to force a green run.
 - **`telegram_malformed_message`.** Telethon returned a message shape
   the adapter cannot type-check. Non-retryable — the replay route will
   return 422 until Telegram fixes the underlying message. Do not
   replay; escalate if it reproduces across multiple posts.
-- **Fresh session with empty catch-up.** A brand-new session that has
-  not seen any messages yet will produce an empty snapshot. Wait for the
-  live listener to accumulate at least `--candidate-limit` posts, or
-  lower `--candidate-limit` for the first proof run.
+- **Fresh session with empty catch-up.** A brand-new session that has not seen
+  any messages yet will produce an empty snapshot. Wait for the live listener to
+  accumulate posts before judging the SLO.
 - **`crawler_session_not_runnable` for Telegram.** The `telegram_sessions` row
   is missing, disabled, not `active`, auth-required, or lacks encrypted
   StringSession material. Use `/admin/telegram` to validate/import a runnable
@@ -608,54 +467,32 @@ row is marked `status=auth_required`, not quarantined. Recovery options are:
   do not contribute to or block the SLO. This is deliberate; see
   `memexpert/services/crawler_freshness.py`.
 - **Dead-letter inspection.** Crawler ingest failures are classified by
-  the service layer and land in the same stage-journal surface S02/S03
+  the service layer and land in the same stage-journal surface the pipeline
   already expose. Use `GET /api/v1/pipeline/items/{id}/detail` to drill
-  into a stuck item; `POST /api/v1/pipeline/search/smoke` is still valid
-  for items the crawler produced.
-
-## `.artifacts/s04-runtime-smoke/` cleanup
-
-```bash
-rm -rf .artifacts/s04-runtime-smoke/
-```
-
-The harness uses `mkdir(parents=True, exist_ok=True)` so it can safely
-write into a pre-existing tree, and each run lives under its own
-`<run-id>` subdirectory. Delete the whole tree only when you want to
-wipe historical proof runs — individual run directories are the audit
-trail for S04 sign-off.
-
-The directory is already listed in `.gitignore` so artifacts never leak
-into a commit. Verify with `git status .artifacts/` before running the
-harness in a dirty checkout.
+  into a stuck item; use the per-target sync routes for search-index repair.
 
 ## Decision flowchart: "p95 breached the SLO"
 
-When the harness reports `slo_p95_pass=False`, work top-down:
+When the freshness snapshot reports `slo_p95_pass=False`, work top-down:
 
-1. **Check per-channel p95 in the report.** If one channel dominates,
-   focus there first. Stalled channels show up in
-   `stalled_channels` — chase those via the session state surface.
+1. **Check per-channel p95 in the snapshot.** If one channel dominates, focus
+   there first. Channels with zero recent items should be chased via the session
+   state surface.
 2. **Is Telegram fetch the bottleneck?** Look at `memexpert-telegram-crawler`
    logs for flood-wait or provider-unavailable errors. If the listener is
    hitting the token-bucket ceiling, lower
    `CRAWLER_DEFAULT_CATCHUP_MESSAGE_LIMIT` or raise
    `CRAWLER_MAX_REQUESTS_PER_SECOND` (but never both in the same run).
-3. **Is the pipeline heavy chain slow?** Re-run
-   `scripts/verify_s02_runtime.py --dry-run`; if it reports stage
-   timings well below the S02 expectations then the bottleneck is
-   upstream (Telegram) or downstream (sync targets).
-4. **Is a sync target slow?** Re-run
-   `scripts/verify_s03_runtime.py` and inspect `qdrant` vs `meili`
-   stage timing percentiles. If one target is consistently slower
-   than the other, the S03 runbook's replay + repair loop applies
-   verbatim.
+3. **Is the pipeline heavy chain slow?** Inspect item detail stage timestamps
+   for sample items whose freshness is above p95.
+4. **Is a sync target slow?** Compare Qdrant vs Meilisearch target timestamps in
+   item detail and use `docs/ops/content-pipeline-search-sync.md` for replay +
+   repair.
 5. **Is the SLO too tight?** If the stack is healthy at every layer but
    the p95 still sits a few seconds above
    `crawler_freshness_slo_p95_seconds`, evaluate whether the threshold
    reflects the stack's real ceiling. Adjusting the threshold is a
-   product decision, not a harness decision — file a ticket before
-   relaxing it.
+   product decision — file a ticket before relaxing it.
 
 ## Known limitations
 
@@ -664,7 +501,7 @@ When the harness reports `slo_p95_pass=False`, work top-down:
   a live crawler process only observes the new binding after `SIGHUP` or process
   restart.
 - **Catch-up is manager-driven** — neither browser admin nor the operator API can
-  trigger a catch-up sweep on demand. The S04 harness only observes the
+  trigger a catch-up sweep on demand. The freshness endpoint only observes the
   freshness the running manager has already produced.
 - **Freshness is measured on live items** — `MemeSource.published_at`
   must be set for the freshness query to score the item. Catch-up items

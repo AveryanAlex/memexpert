@@ -7,8 +7,8 @@ guards before delegating bytes to raw ingest), a :class:`PipelineTelegramClientP
 (real Telethon client or :class:`FakeTelegramClient`), a SQLAlchemy
 session (used for :class:`TelegramSession` + :class:`SourceChannel`
 mutations that do not belong to the ingest entrypoint), and the
-application settings. T03 will layer a multi-session distributor on top
-of this contract; T04 will add the freshness SLO proof harness.
+application settings. The manager layers multi-session distribution and
+freshness inspection on top of this per-session contract.
 """
 
 from __future__ import annotations
@@ -78,9 +78,9 @@ class CrawlerIngestServiceProtocol(Protocol):
 class CrawlerCatchupReport(BaseModel):
     """Bounded summary of one catch-up sweep on one channel.
 
-    T04's freshness harness consumes this model so the crawler contract
-    does not need a second proof-harness-specific shape. ``errors`` is
-    a bounded tuple of normalized reasons the runtime saw during the
+    The freshness surface consumes this model so the crawler contract does not
+    need a second diagnostics-specific shape. ``errors`` is a bounded tuple of
+    normalized reasons the runtime saw during the
     sweep so operators can see partial-success outcomes without losing
     the sweep's other counters.
     """

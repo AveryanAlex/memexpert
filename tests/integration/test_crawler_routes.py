@@ -1012,8 +1012,7 @@ async def test_freshness_snapshot_with_no_items_reports_null_percentiles_and_slo
     assert body["p50_seconds"] is None
     assert body["p95_seconds"] is None
     # "no data means pass" convention: empty snapshot must not manufacture
-    # an SLO breach. T04's proof harness is responsible for insisting on a
-    # populated sample set before declaring a pass or fail.
+    # an SLO breach. Callers decide whether an empty sample is acceptable.
     assert body["slo_p50_pass"] is True
     assert body["slo_p95_pass"] is True
     assert body["per_channel"] == []

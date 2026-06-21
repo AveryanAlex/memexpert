@@ -204,14 +204,13 @@ class Settings(BaseSettings):
         "memexpert-dev-telegram-session-encryption-secret-change-me",
     )
     # Conservative crawler rate: the Telethon docs and the tech design both
-    # cap user-bot sessions at 30 req/s. T04's SLO proof harness measures
-    # freshness under this limit; T02's real adapter enforces it.
+    # cap user-bot sessions at 30 req/s. The real adapter enforces this limit
+    # and freshness snapshots expose its downstream effect.
     crawler_max_requests_per_second: float = Field(default=15.0, gt=0, le=30)
     crawler_live_mode_enabled: bool = True
     # Freshness SLO budgets (publish → both sync targets synced) in seconds.
-    # T04 asserts the measured p50/p95 against these numbers; T02/T03 do
-    # not depend on them directly but surface them through the operator
-    # inspect surface so drift is visible.
+    # Runtime code surfaces measured p50/p95 against these numbers through the
+    # operator inspect surface so drift is visible.
     crawler_freshness_slo_p50_seconds: float = Field(default=60.0, gt=0)
     crawler_freshness_slo_p95_seconds: float = Field(default=180.0, gt=0)
     crawler_default_catchup_message_limit: int = Field(default=500, gt=0, le=10000)

@@ -12,15 +12,11 @@ from pydantic import ValidationError
 from memexpert.api.dependencies.meme import AnalyticsServiceDep
 from memexpert.api.dependencies.pipeline import (
     PIPELINE_ERROR_RESPONSES,
-    MeilisearchSyncClientDep,
     PipelineIngestAcceptServiceDep,
     PipelineIngestReadServiceDep,
     PipelineItemReadServiceDep,
     PipelineReplayServiceDep,
-    PipelineSmokeProofServiceDep,
     PipelineSyncStatusServiceDep,
-    QdrantSimilarityClientDep,
-    QdrantSyncClientDep,
     require_pipeline_operator_token,
     to_pipeline_http_error,
 )
@@ -33,10 +29,8 @@ from memexpert.schemas.content_pipeline import (
     ContentPipelineItemRead,
     ContentPipelineReplayAccepted,
     ContentPipelineReplayRequest,
-    ContentPipelineSearchSmokeRequest,
     ContentPipelineSyncReplayBatchRequest,
     PerTargetSyncStatus,
-    SmokeProofResult,
 )
 from memexpert.services import PipelinePayloadValidationError, PipelineServiceError
 from memexpert.services.analytics import LaunchKPIRead
@@ -261,8 +255,8 @@ async def _read_sync_target_status(
 ) -> PerTargetSyncStatus:
     """Shared GET helper used by both per-target sync status routes.
 
-    Extracted once three call sites existed (Qdrant + Meilisearch GET +
-    smoke proof in T04) so the typed error translation stays in one place.
+    Extracted once both per-target GET routes existed so the typed error
+    translation stays in one place.
     """
 
     try:
@@ -453,71 +447,5 @@ async def replay_pipeline_items_meili_sync_batch(
         payload=payload,
         target=SyncTargetKind.MEILISEARCH,
     )
-
-
-@router.post(
-    "/search/smoke",
-    response_model=SmokeProofResult,
-    responses=PIPELINE_ERROR_RESPONSES,
-    status_code=status.HTTP_200_OK,
-    summary="Prove one pipeline item is searchable across BOTH sync targets",
-)
-async def run_pipeline_search_smoke(
-    smoke_proof_service: PipelineSmokeProofServiceDep,
-    qdrant_sync_client: QdrantSyncClientDep,
-    qdrant_similarity_client: QdrantSimilarityClientDep,
-    meilisearch_sync_client: MeilisearchSyncClientDep,
-    payload: Annotated[ContentPipelineSearchSmokeRequest, Body()],
-) -> SmokeProofResult:
-    """Run the dual-target search-sync smoke proof for one pipeline item.
-
-    The route returns HTTP 200 even when the proof fails per-target — the
-    per-target breakdown is DATA, not a server error. 422 is reserved for
-    request-validation failures (blank query, both fields set, neither
-    field set) and 404 fires when a query-only lookup resolves no hit.
-    """
-
-    meme_file_id = await _resolve_smoke_proof_target(
-        smoke_proof_service=smoke_proof_service,
-        meilisearch_sync_client=meilisearch_sync_client,
-        payload=payload,
-    )
-    try:
-        return await smoke_proof_service.run_search_smoke_proof(
-            qdrant_sync_client=qdrant_sync_client,
-            qdrant_similarity_client=qdrant_similarity_client,
-            meilisearch_sync_client=meilisearch_sync_client,
-            meme_file_id=meme_file_id,
-            query=payload.query,
-        )
-    except PipelineServiceError as exc:
-        raise to_pipeline_http_error(exc) from exc
-
-
-async def _resolve_smoke_proof_target(
-    *,
-    smoke_proof_service: PipelineSmokeProofServiceDep,
-    meilisearch_sync_client: MeilisearchSyncClientDep,
-    payload: ContentPipelineSearchSmokeRequest,
-) -> uuid.UUID:
-    """Return the ``meme_file_id`` the smoke proof should run against.
-
-    When ``payload.meme_file_id`` is present we use it verbatim. When only
-    ``payload.query`` is present we resolve the top Meilisearch hit once
-    and proof only that item — this keeps the smoke proof per-item across
-    both code paths so operators never need a separate multi-item surface.
-    """
-
-    if payload.meme_file_id is not None:
-        return payload.meme_file_id
-    assert payload.query is not None  # enforced by ContentPipelineSearchSmokeRequest.
-    try:
-        return await smoke_proof_service.resolve_meme_file_id_from_query(
-            meilisearch_sync_client=meilisearch_sync_client,
-            query=payload.query,
-        )
-    except PipelineServiceError as exc:
-        raise to_pipeline_http_error(exc) from exc
-
 
 __all__ = ["router"]

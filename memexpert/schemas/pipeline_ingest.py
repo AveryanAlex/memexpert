@@ -204,7 +204,7 @@ class CrawlerIngestResult(BaseModel):
     matched without a second lookup.
     ``published_at`` mirrors :class:`RawCrawlerPost.published_at` when the
     post was actually consumed, and ``received_at`` is the service-side
-    clock for the ingest attempt (used by T04's freshness SLO harness).
+    clock for the ingest attempt used by freshness snapshots.
     """
 
     model_config = ConfigDict(extra="forbid")

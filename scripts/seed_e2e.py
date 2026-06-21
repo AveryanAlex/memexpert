@@ -78,7 +78,6 @@ from memexpert.models.user import AnalyticsEvent, User
 from memexpert.schemas.content_pipeline import (
     ContentPipelineErrorResponse,
     ContentPipelineItemDetail,
-    SmokeProofResult,
 )
 from memexpert.services.public_trends import refresh_public_trend_materialized_views
 from memexpert.services.search_index_sync import (
@@ -316,13 +315,6 @@ class PipelineApiClient:
         response = self._client.get(f"/api/v1/pipeline/items/{meme_file_id}/detail")
         return _validate_response(response, expected_status=200, model=ContentPipelineItemDetail)
 
-    def run_dual_index_proof(self, meme_file_id: uuid.UUID) -> SmokeProofResult:
-        response = self._client.post(
-            "/api/v1/pipeline/search/smoke",
-            json={"meme_file_id": str(meme_file_id)},
-        )
-        return _validate_response(response, expected_status=200, model=SmokeProofResult)
-
     def public_search(self, query: str, *, include_nsfw: bool = False) -> dict[str, Any]:
         response = self._client.get(
             "/api/v1/memes/search",
@@ -477,11 +469,6 @@ async def _run(args: argparse.Namespace) -> None:
             timeout_seconds=args.timeout_seconds,
         )
         print(f"Uploaded item dual-synced: ingest_request_id={ingest_request.id} meme_file_id={meme_file_id}")
-        dual_index_result = wait_for_dual_index_proof(
-            api_client,
-            meme_file_id=meme_file_id,
-            timeout_seconds=args.timeout_seconds,
-        )
         slug = await publish_created_meme(
             settings=settings,
             meme_id=detail.meme_id,
@@ -560,7 +547,6 @@ async def _run(args: argparse.Namespace) -> None:
             "title": "Created cat pipeline meme",
         },
         "proof": {
-            "dual_index": dual_index_result.model_dump(mode="json"),
             "public_search_total": created_search_payload.get("total"),
             "public_search_hit_ids": [
                 item.get("meme", {}).get("id")
@@ -1789,28 +1775,6 @@ def _outbox_result_snapshot(result: RabbitMQOutboxPublisherBatchResult | None) -
         "failed": result.failed,
         "duration_seconds": result.duration_seconds,
     }
-
-
-def wait_for_dual_index_proof(
-    client: PipelineApiClient,
-    *,
-    meme_file_id: uuid.UUID,
-    timeout_seconds: float,
-) -> SmokeProofResult:
-    deadline = time.monotonic() + timeout_seconds
-    last_result: SmokeProofResult | None = None
-    while time.monotonic() < deadline:
-        result = client.run_dual_index_proof(meme_file_id)
-        last_result = result
-        if result.both_targets_searchable:
-            return result
-        time.sleep(POLL_INTERVAL_SECONDS)
-
-    snapshot = last_result.model_dump(mode="json") if last_result is not None else None
-    raise E2ESeedError(
-        "Created meme failed the internal dual-index proof before timeout: "
-        f"{snapshot}",
-    )
 
 
 def validate_provider_policy(settings: Settings) -> None:
