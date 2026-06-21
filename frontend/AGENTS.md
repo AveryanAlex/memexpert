@@ -1,6 +1,6 @@
 # Frontend Architecture Notes
 
-This SvelteKit app uses Svelte 5, pnpm 10.28.0, Tailwind CSS v4 through `@tailwindcss/vite`, Bits UI 2.18.1 for accessible compound primitives, LayerChart 1.0.13 for charts, and `@lucide/svelte` when an icon clarifies an action.
+This SvelteKit app uses Svelte 5, pnpm, Tailwind CSS v4 through `@tailwindcss/vite`, Bits UI for accessible compound primitives, LayerChart for charts, and `@lucide/svelte` when an icon clarifies an action.
 
 ## Conventions
 
@@ -21,7 +21,7 @@ This SvelteKit app uses Svelte 5, pnpm 10.28.0, Tailwind CSS v4 through `@tailwi
 
 ## Checks
 
-Run from `frontend` with the pinned package manager. If `pnpm` is not on PATH in this container, use `npx pnpm@10.28.0 --config.store-dir=/home/ubuntu/.hermes/profiles/coder/home/.local/share/pnpm/store/v10 run <script>`.
+Run from `frontend`.
 
 - `pnpm check`
 - `pnpm test`
