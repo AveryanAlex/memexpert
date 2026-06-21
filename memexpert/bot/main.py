@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 from aiogram import Bot, Dispatcher
 
+from memexpert.bot.commands import register_bot_commands
 from memexpert.bot.inline import InlineMediaUrlProvider, MemeSearchServiceFactory, build_inline_router
 from memexpert.bot.linking import AccountLinkServiceFactory, build_linking_router
 from memexpert.bot.private_library import (
@@ -109,6 +110,7 @@ async def run_bot(*, settings: Settings | None = None) -> None:
     dispatcher = build_dispatcher(settings=resolved_settings)
 
     try:
+        await register_bot_commands(bot)
         await dispatcher.start_polling(bot)
     finally:
         await bot.session.close()
