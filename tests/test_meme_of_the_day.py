@@ -12,6 +12,7 @@ from fastapi import FastAPI
 from httpx import AsyncClient
 from sqlalchemy import select, text
 
+import memexpert.services.meme_of_the_day as meme_of_the_day_module
 from memexpert.api.dependencies.auth import get_optional_current_user
 from memexpert.api.dependencies.meme import get_meme_of_the_day_service
 from memexpert.core.config import Settings
@@ -24,7 +25,7 @@ from memexpert.services.meme_of_the_day import MemeOfTheDayService
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.transactional_db]
 
 
 async def test_motd_filters_public_safe_recent_quality_candidates(migrated_db_session: AsyncSession) -> None:
@@ -138,7 +139,7 @@ async def test_motd_excludes_future_created_candidate_for_today(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fixed_now = datetime(2026, 6, 20, 12, 0, tzinfo=UTC)
-    monkeypatch.setattr("memexpert.services.meme_of_the_day.utcnow", lambda: fixed_now)
+    monkeypatch.setattr(meme_of_the_day_module, "utcnow", lambda: fixed_now)
     current = await _create_meme(migrated_db_session, created_at=fixed_now - timedelta(hours=1), quality_score=0.6)
     future = await _create_meme(migrated_db_session, created_at=fixed_now + timedelta(hours=1), quality_score=1.0)
 

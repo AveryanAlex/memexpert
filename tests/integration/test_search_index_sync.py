@@ -5,6 +5,7 @@ from __future__ import annotations
 import uuid
 from typing import TYPE_CHECKING
 
+import pytest
 from sqlalchemy import select
 
 from memexpert.models.collection import Collection, CollectionMember, CollectionMeme
@@ -29,6 +30,8 @@ from memexpert.services.search_index_sync import (
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
+
+pytestmark = pytest.mark.transactional_db
 
 
 async def _create_meme_with_primary_file(

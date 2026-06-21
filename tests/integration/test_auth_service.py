@@ -29,6 +29,8 @@ from tests.conftest import create_full_user_via_upgrade
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
+pytestmark = pytest.mark.transactional_db
+
 JWT_SECRET = "test-auth-service-secret-with-32-byte-minimum"
 ACCESS_TOKEN_TTL = timedelta(days=30)
 

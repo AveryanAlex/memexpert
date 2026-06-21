@@ -23,7 +23,7 @@ from memexpert.services.analytics import (
 )
 from tests.factories import build_full_user
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.transactional_db]
 
 
 class FailingAnalyticsSession:

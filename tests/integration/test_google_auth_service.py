@@ -31,6 +31,8 @@ from tests.conftest import create_full_user_via_upgrade
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
+pytestmark = pytest.mark.transactional_db
+
 GOOGLE_CLIENT_ID = "service-test-google-client-id"
 GOOGLE_CLIENT_SECRET = "service-test-google-client-secret"
 GOOGLE_REDIRECT_URI = "https://memexpert.test/auth/google/callback"

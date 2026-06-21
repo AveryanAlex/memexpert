@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, cast
 import pytest
 import pytest_asyncio
 from pydantic import ValidationError
-from sqlalchemy import CheckConstraint, Table, UniqueConstraint, inspect as sa_inspect, select
+from sqlalchemy import CheckConstraint, Table, UniqueConstraint, inspect as sa_inspect, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import configure_mappers, selectinload
 
@@ -184,15 +184,24 @@ async def model_contract_session_factory(
 ) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
     """Create a fresh metadata-managed schema for each model-contract test."""
 
-    async with postgres_async_engine.begin() as connection:
-        await connection.run_sync(metadata.drop_all, checkfirst=True)
-        await connection.run_sync(metadata.create_all)
+    await _create_metadata_schema(postgres_async_engine)
 
     try:
         yield postgres_session_factory
     finally:
-        async with postgres_async_engine.begin() as connection:
-            await connection.run_sync(metadata.drop_all, checkfirst=True)
+        await _reset_public_schema(postgres_async_engine)
+
+
+async def _create_metadata_schema(engine: AsyncEngine) -> None:
+    await _reset_public_schema(engine)
+    async with engine.begin() as connection:
+        await connection.run_sync(metadata.create_all)
+
+
+async def _reset_public_schema(engine: AsyncEngine) -> None:
+    async with engine.begin() as connection:
+        _ = await connection.execute(text("DROP SCHEMA IF EXISTS public CASCADE"))
+        _ = await connection.execute(text("CREATE SCHEMA public"))
 
 
 async def _get_table_names(engine: AsyncEngine) -> set[str]:
@@ -327,14 +336,11 @@ def test_direct_broker_publish_calls_stay_grep_auditable() -> None:
 
 
 async def test_metadata_creates_full_schema_on_postgres(postgres_async_engine: AsyncEngine) -> None:
-    async with postgres_async_engine.begin() as connection:
-        await connection.run_sync(metadata.drop_all, checkfirst=True)
-        await connection.run_sync(metadata.create_all)
+    await _create_metadata_schema(postgres_async_engine)
 
     assert EXPECTED_TABLES.issubset(await _get_table_names(postgres_async_engine))
 
-    async with postgres_async_engine.begin() as connection:
-        await connection.run_sync(metadata.drop_all, checkfirst=True)
+    await _reset_public_schema(postgres_async_engine)
 
 
 async def test_user_admin_flag_defaults_false_in_memory_and_when_persisted(

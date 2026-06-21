@@ -70,5 +70,8 @@ select = ["E", "W", "F", "I", "UP", "B", "SIM", "TCH"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "session"
 asyncio_default_test_loop_scope = "session"
-addopts = ["-n", "4", "--dist", "loadfile"]
+addopts = ["-n", "auto", "--maxprocesses", "8", "--dist", "loadfile"]
 testpaths = ["tests"]
+markers = [
+    "transactional_db: run migrated_db_session inside an outer transaction that rolls back after the test",
+]

@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 
 
 async def test_create_guest_user_writes_only_the_user_row_with_no_favorites_bootstrap(
-    migrated_db_session: AsyncSession,
+    transactional_migrated_db_session: AsyncSession,
 ) -> None:
     """Cold-path guests must not touch collections or memberships.
 
@@ -29,7 +29,7 @@ async def test_create_guest_user_writes_only_the_user_row_with_no_favorites_boot
     rows — crawlers and link-preview fetchers never pay that cost.
     """
 
-    service = UserService(migrated_db_session)
+    service = UserService(transactional_migrated_db_session)
 
     created_user = await service.create_guest_user()
 
@@ -38,20 +38,24 @@ async def test_create_guest_user_writes_only_the_user_row_with_no_favorites_boot
     assert created_user.guest_expires_at is not None
     assert created_user.last_active_at is not None
 
-    result = await migrated_db_session.execute(select(User).where(User.id == created_user.id))
+    result = await transactional_migrated_db_session.execute(select(User).where(User.id == created_user.id))
     persisted_user = result.scalar_one()
     assert persisted_user.active_save_collection_id is None
 
-    collection_count_result = await migrated_db_session.execute(select(func.count()).select_from(Collection))
-    member_count_result = await migrated_db_session.execute(select(func.count()).select_from(CollectionMember))
+    collection_count_result = await transactional_migrated_db_session.execute(
+        select(func.count()).select_from(Collection)
+    )
+    member_count_result = await transactional_migrated_db_session.execute(
+        select(func.count()).select_from(CollectionMember)
+    )
     assert collection_count_result.scalar_one() == 0
     assert member_count_result.scalar_one() == 0
 
 
 async def test_upgrade_guest_normalizes_email_and_supports_provider_lookups(
-    migrated_db_session: AsyncSession,
+    transactional_migrated_db_session: AsyncSession,
 ) -> None:
-    service = UserService(migrated_db_session)
+    service = UserService(transactional_migrated_db_session)
 
     created_user = await create_full_user_via_upgrade(
         service,
@@ -76,9 +80,9 @@ async def test_upgrade_guest_normalizes_email_and_supports_provider_lookups(
 
 
 async def test_upgrade_guest_rejects_duplicate_identities_across_transactions(
-    migrated_db_session: AsyncSession,
+    transactional_migrated_db_session: AsyncSession,
 ) -> None:
-    service = UserService(migrated_db_session)
+    service = UserService(transactional_migrated_db_session)
 
     _ = await create_full_user_via_upgrade(
         service,
@@ -91,40 +95,42 @@ async def test_upgrade_guest_rejects_duplicate_identities_across_transactions(
         _ = await create_full_user_via_upgrade(
             service, google_id="google-dup", email="other@example.com",
         )
-    await migrated_db_session.rollback()
+    await transactional_migrated_db_session.rollback()
 
     with pytest.raises(DuplicateIdentityError, match="owner@example.com"):
         _ = await create_full_user_via_upgrade(service, email="OWNER@EXAMPLE.COM")
-    await migrated_db_session.rollback()
+    await transactional_migrated_db_session.rollback()
 
     with pytest.raises(DuplicateIdentityError, match="Telegram ID 99"):
         _ = await create_full_user_via_upgrade(service, telegram_id=99)
-    await migrated_db_session.rollback()
+    await transactional_migrated_db_session.rollback()
 
 
 async def test_repeated_guest_creation_produces_distinct_accounts_with_no_collections(
-    migrated_db_session: AsyncSession,
+    transactional_migrated_db_session: AsyncSession,
 ) -> None:
-    service = UserService(migrated_db_session)
+    service = UserService(transactional_migrated_db_session)
 
     first_guest = await service.create_guest_user()
     second_guest = await service.create_guest_user()
 
     assert first_guest.id != second_guest.id
 
-    favorites_count_result = await migrated_db_session.execute(
+    favorites_count_result = await transactional_migrated_db_session.execute(
         select(func.count())
         .select_from(Collection)
         .where(Collection.kind == CollectionKind.FAVORITES)
     )
-    membership_count_result = await migrated_db_session.execute(select(func.count()).select_from(CollectionMember))
+    membership_count_result = await transactional_migrated_db_session.execute(
+        select(func.count()).select_from(CollectionMember)
+    )
 
     assert favorites_count_result.scalar_one() == 0
     assert membership_count_result.scalar_one() == 0
 
 
 async def test_create_guest_user_commit_false_rolls_back_on_session_rollback(
-    migrated_db_session: AsyncSession,
+    transactional_migrated_db_session: AsyncSession,
 ) -> None:
     """Bootstrapped guests must disappear when the outer transaction rolls back.
 
@@ -134,22 +140,24 @@ async def test_create_guest_user_commit_false_rolls_back_on_session_rollback(
     an orphan user + favorites + membership tuple.
     """
 
-    service = UserService(migrated_db_session)
+    service = UserService(transactional_migrated_db_session)
 
     created_user = await service.create_guest_user(commit=False)
 
-    in_session_result = await migrated_db_session.execute(select(User).where(User.id == created_user.id))
+    in_session_result = await transactional_migrated_db_session.execute(select(User).where(User.id == created_user.id))
     assert in_session_result.scalar_one_or_none() is not None
 
-    await migrated_db_session.rollback()
+    await transactional_migrated_db_session.rollback()
 
-    user_count_result = await migrated_db_session.execute(select(func.count()).select_from(User))
-    favorites_count_result = await migrated_db_session.execute(
+    user_count_result = await transactional_migrated_db_session.execute(select(func.count()).select_from(User))
+    favorites_count_result = await transactional_migrated_db_session.execute(
         select(func.count())
         .select_from(Collection)
         .where(Collection.kind == CollectionKind.FAVORITES)
     )
-    membership_count_result = await migrated_db_session.execute(select(func.count()).select_from(CollectionMember))
+    membership_count_result = await transactional_migrated_db_session.execute(
+        select(func.count()).select_from(CollectionMember)
+    )
 
     assert user_count_result.scalar_one() == 0
     assert favorites_count_result.scalar_one() == 0
@@ -157,7 +165,7 @@ async def test_create_guest_user_commit_false_rolls_back_on_session_rollback(
 
 
 async def test_upgrade_guest_rejects_malformed_email_and_rolls_back_the_bootstrap(
-    migrated_db_session: AsyncSession,
+    transactional_migrated_db_session: AsyncSession,
 ) -> None:
     """Seeding via the upgrade helper with a malformed email must leave zero rows.
 
@@ -168,24 +176,26 @@ async def test_upgrade_guest_rejects_malformed_email_and_rolls_back_the_bootstra
     seed primitive enforced.
     """
 
-    service = UserService(migrated_db_session)
+    service = UserService(transactional_migrated_db_session)
 
     with pytest.raises(InvalidIdentityError, match="valid address"):
         _ = await create_full_user_via_upgrade(service, email="not-an-email")
 
-    await migrated_db_session.rollback()
+    await transactional_migrated_db_session.rollback()
 
-    user_count_result = await migrated_db_session.execute(select(func.count()).select_from(User))
-    collection_count_result = await migrated_db_session.execute(select(func.count()).select_from(Collection))
+    user_count_result = await transactional_migrated_db_session.execute(select(func.count()).select_from(User))
+    collection_count_result = await transactional_migrated_db_session.execute(
+        select(func.count()).select_from(Collection)
+    )
 
     assert user_count_result.scalar_one() == 0
     assert collection_count_result.scalar_one() == 0
 
 
 async def test_touch_last_active_updates_lifecycle_timestamp(
-    migrated_db_session: AsyncSession,
+    transactional_migrated_db_session: AsyncSession,
 ) -> None:
-    service = UserService(migrated_db_session)
+    service = UserService(transactional_migrated_db_session)
     created_user = await service.create_guest_user()
     updated_at = datetime.now(UTC) + timedelta(minutes=5)
 
@@ -193,15 +203,15 @@ async def test_touch_last_active_updates_lifecycle_timestamp(
 
     assert touched_user.last_active_at == updated_at
 
-    result = await migrated_db_session.execute(select(User).where(User.id == created_user.id))
+    result = await transactional_migrated_db_session.execute(select(User).where(User.id == created_user.id))
     persisted_user = result.scalar_one()
     assert persisted_user.last_active_at == updated_at
 
 
 async def test_update_preferences_persists_user_row_settings(
-    migrated_db_session: AsyncSession,
+    transactional_migrated_db_session: AsyncSession,
 ) -> None:
-    service = UserService(migrated_db_session)
+    service = UserService(transactional_migrated_db_session)
     created_user = await service.create_guest_user()
 
     updated_user = await service.update_preferences(
@@ -213,7 +223,7 @@ async def test_update_preferences_persists_user_row_settings(
     assert updated_user.nsfw_enabled is True
     assert updated_user.language is UserLanguage.RU
 
-    result = await migrated_db_session.execute(select(User).where(User.id == created_user.id))
+    result = await transactional_migrated_db_session.execute(select(User).where(User.id == created_user.id))
     persisted_user = result.scalar_one()
     assert persisted_user.nsfw_enabled is True
     assert persisted_user.language is UserLanguage.RU

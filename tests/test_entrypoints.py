@@ -11,6 +11,7 @@ from unittest.mock import patch
 import pytest
 from aiogram.types import BotCommandScopeAllPrivateChats
 
+import memexpert.bot.commands as bot_commands_module
 from memexpert.api.main import main as api_main
 from memexpert.bot.commands import COMMAND_DEFINITIONS
 from memexpert.bot.main import main as bot_main
@@ -116,13 +117,18 @@ async def test_run_bot_registers_commands_before_polling() -> None:
 
 @pytest.mark.asyncio
 async def test_run_bot_command_registration_failure_logs_raises_and_skips_polling(
-    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     bot = _RuntimeBot(registration_error=RuntimeError("setMyCommands failed"))
     dispatcher = _RuntimeDispatcher(bot)
+    exception_calls: list[dict[str, Any]] = []
+
+    def record_exception(message: str, *args: object, **kwargs: Any) -> None:
+        exception_calls.append({"message": message, "args": args, "kwargs": kwargs})
+
+    monkeypatch.setattr(bot_commands_module.logger, "exception", record_exception)
 
     with (
-        caplog.at_level("ERROR", logger="memexpert.bot.commands"),
         patch("memexpert.bot.main.build_bot", return_value=bot),
         patch("memexpert.bot.main.build_dispatcher", return_value=dispatcher),
         pytest.raises(RuntimeError, match="setMyCommands failed"),
@@ -132,9 +138,9 @@ async def test_run_bot_command_registration_failure_logs_raises_and_skips_pollin
     assert not dispatcher.polling_started
     assert bot.session.closed
     assert bot.events == ["register", "close"]
-    records = [record for record in caplog.records if record.name == "memexpert.bot.commands"]
-    assert len(records) == 1
-    assert records[0].__dict__["event"] == "telegram_bot_command_registration_failed"
+    assert len(exception_calls) == 1
+    extra = exception_calls[0]["kwargs"]["extra"]
+    assert extra["event"] == "telegram_bot_command_registration_failed"
 
 
 def test_workers_main_runs_async_pipeline_runtime() -> None:

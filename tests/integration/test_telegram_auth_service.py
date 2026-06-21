@@ -32,6 +32,8 @@ from tests.conftest import create_full_user_via_upgrade
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
+pytestmark = pytest.mark.transactional_db
+
 TELEGRAM_BOT_TOKEN = "123456:telegram-service-test-bot-token"
 TELEGRAM_LOGIN_MAX_AGE_SECONDS = 300
 TELEGRAM_MINIAPP_MAX_AGE_SECONDS = 300

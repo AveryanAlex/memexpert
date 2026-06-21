@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import select
 
+import memexpert.services.source_engagement_capture as source_engagement_capture_module
 from memexpert.core.config import Settings
 from memexpert.crawlers.telegram.client import (
     FakeTelegramClient,
@@ -601,7 +602,7 @@ async def test_source_engagement_capture_success_appends_scheduled_snapshot_and_
         ),
         media=b"must-not-download",
     )
-    monkeypatch.setattr("memexpert.services.source_engagement_capture.utcnow", lambda: captured_at)
+    monkeypatch.setattr(source_engagement_capture_module, "utcnow", lambda: captured_at)
 
     result = await capture_source_engagement_request(
         postgres_session_factory,
@@ -790,7 +791,7 @@ async def test_source_engagement_capture_missing_message_records_not_found_and_m
     )
     await migrated_db_session.commit()
     fake = FakeTelegramClient()
-    monkeypatch.setattr("memexpert.services.source_engagement_capture.utcnow", lambda: captured_at)
+    monkeypatch.setattr(source_engagement_capture_module, "utcnow", lambda: captured_at)
 
     result = await capture_source_engagement_request(
         postgres_session_factory,
@@ -832,7 +833,7 @@ async def test_source_engagement_capture_transient_failure_records_failed_and_cl
     )
     await migrated_db_session.commit()
     fake = FakeTelegramClient(next_error=PipelineTelegramProviderUnavailableError("telegram down"))
-    monkeypatch.setattr("memexpert.services.source_engagement_capture.utcnow", lambda: captured_at)
+    monkeypatch.setattr(source_engagement_capture_module, "utcnow", lambda: captured_at)
 
     result = await capture_source_engagement_request(
         postgres_session_factory,
@@ -889,7 +890,7 @@ async def test_source_engagement_capture_duplicate_scheduled_message_is_idempote
         ),
     )
     event = _capture_event(fixture)
-    monkeypatch.setattr("memexpert.services.source_engagement_capture.utcnow", lambda: first_captured_at)
+    monkeypatch.setattr(source_engagement_capture_module, "utcnow", lambda: first_captured_at)
     first = await capture_source_engagement_request(
         postgres_session_factory,
         event,

@@ -16,6 +16,8 @@ from tests.conftest import create_full_user_via_upgrade
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
+pytestmark = pytest.mark.transactional_db
+
 
 def test_normalize_channel_suggestion_accepts_supported_platforms() -> None:
     telegram = normalize_channel_suggestion("@memexpert_source")

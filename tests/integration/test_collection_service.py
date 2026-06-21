@@ -42,6 +42,8 @@ from tests.conftest import create_full_user_via_upgrade
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
+pytestmark = pytest.mark.transactional_db
+
 
 class FakeStorageClient:
     def __init__(self) -> None:
@@ -363,9 +365,10 @@ async def test_meme_library_returns_private_authenticated_render_urls_for_owner(
     assert primary_file is not None
     assert primary_file.id == private_meme.primary_file_id
     assert primary_file.render is not None
-    assert primary_file.render.thumbnail_url == f"/api/v1/media/files/{private_meme.primary_file_id}/thumbnail"
-    assert primary_file.render.preview_url == f"/api/v1/media/files/{private_meme.primary_file_id}/preview"
+    assert primary_file.render.thumbnail_url is None
+    assert primary_file.render.preview_url is None
     assert primary_file.render.web_video_url == f"/api/v1/media/files/{private_meme.primary_file_id}/web-video.mp4"
+    assert primary_file.render.download_url == primary_file.render.web_video_url
     serialized = library.model_dump_json()
     assert "pipeline/originals/private/library-upload.gif" not in serialized
     assert "pipeline/derived/private/library-upload.mp4" not in serialized

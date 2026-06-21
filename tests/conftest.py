@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
 import pytest
 import pytest_asyncio
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 from httpx import ASGITransport, AsyncClient
 from redis import Redis
 from redis.exceptions import RedisError
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 from testcontainers.core.container import DockerContainer  # pyright: ignore[reportMissingTypeStubs]
 from testcontainers.core.waiting_utils import (  # pyright: ignore[reportMissingTypeStubs]
     WaitStrategy,
@@ -40,7 +44,7 @@ if TYPE_CHECKING:
     from datetime import datetime
 
     from fastapi import FastAPI
-    from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
+    from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
     from memexpert.schemas.user import UserRead
     from memexpert.services.user_service import UserService
@@ -53,6 +57,13 @@ TEST_REDIS_CONNECT_TIMEOUT_SECONDS: Final = 1.0
 ALEMBIC_COMMAND_TIMEOUT_SECONDS: Final = 60.0
 PROJECT_ROOT: Final = Path(__file__).resolve().parents[1]
 ALEMBIC_INI_PATH: Final = PROJECT_ROOT / "alembic.ini"
+PUBLIC_TREND_MATERIALIZED_VIEW_REFRESH_ORDER: Final = (
+    "public_meme_trends_mv",
+    "public_tag_trends_mv",
+    "public_template_trends_mv",
+    "public_tag_trend_points_mv",
+    "public_template_trend_points_mv",
+)
 TEST_BASE_URL: Final = "https://testserver"
 AUTH_TEST_JWT_SECRET: Final = "route-test-auth-secret-with-32-byte-minimum"
 SECURITY_TEST_UNAVAILABLE_REDIS_URL: Final = "redis://127.0.0.1:1/0"
@@ -118,6 +129,15 @@ class RedisPingWaitStrategy(WaitStrategy):
             )
 
 
+@dataclass
+class MigratedDatabaseSchema:
+    """Mutable schema object cache for the worker-local migrated test database."""
+
+    head_revision: str
+    table_names: tuple[str, ...]
+    materialized_view_names: tuple[str, ...]
+
+
 def _build_alembic_config(database_url: str) -> Config:
     """Construct an Alembic config bound to the ephemeral PostgreSQL URL."""
 
@@ -125,6 +145,16 @@ def _build_alembic_config(database_url: str) -> Config:
     config.set_main_option("script_location", str(PROJECT_ROOT / "alembic"))
     config.attributes["database_url"] = database_url
     return config
+
+
+def _get_alembic_head_revision(database_url: str) -> str:
+    """Return the repository's current Alembic head revision."""
+
+    script_directory = ScriptDirectory.from_config(_build_alembic_config(database_url))
+    head_revision = script_directory.get_current_head()
+    if head_revision is None:  # pragma: no cover - Alembic raises first for multi-head trees.
+        raise AssertionError("Alembic script directory does not define a head revision.")
+    return head_revision
 
 
 async def _run_alembic_upgrade(database_url: str) -> None:
@@ -146,6 +176,134 @@ async def _reset_public_schema(engine: AsyncEngine) -> None:
     async with engine.begin() as connection:
         _ = await connection.execute(text("DROP SCHEMA IF EXISTS public CASCADE"))
         _ = await connection.execute(text("CREATE SCHEMA public"))
+
+
+async def _get_current_alembic_revision(engine: AsyncEngine) -> str | None:
+    """Return the public schema's Alembic revision, or None when no migrated schema exists."""
+
+    async with engine.connect() as connection:
+        version_table = await connection.scalar(text("SELECT to_regclass('public.alembic_version')"))
+        if version_table is None:
+            return None
+        revision = await connection.scalar(text("SELECT version_num FROM public.alembic_version"))
+        return None if revision is None else str(revision)
+
+
+async def _list_truncatable_public_tables(engine: AsyncEngine) -> tuple[str, ...]:
+    """Return quoted regular public tables whose rows should be cleared between tests."""
+
+    async with engine.connect() as connection:
+        result = await connection.execute(
+            text(
+                """
+                SELECT quote_ident(tablename)
+                FROM pg_tables
+                WHERE schemaname = 'public'
+                  AND tablename <> 'alembic_version'
+                ORDER BY tablename
+                """
+            )
+        )
+        return tuple(str(table_name) for table_name in result.scalars())
+
+
+async def _list_public_materialized_views(engine: AsyncEngine) -> tuple[str, ...]:
+    """Return quoted public materialized views in dependency-safe refresh order."""
+
+    ordered_view_cases = "\n".join(
+        f"WHEN {view_name!r} THEN {position}"
+        for position, view_name in enumerate(PUBLIC_TREND_MATERIALIZED_VIEW_REFRESH_ORDER, start=1)
+    )
+    async with engine.connect() as connection:
+        result = await connection.execute(
+            text(
+                f"""
+                SELECT quote_ident(matviewname)
+                FROM pg_matviews
+                WHERE schemaname = 'public'
+                ORDER BY CASE matviewname
+                    {ordered_view_cases}
+                    ELSE 1000
+                END, matviewname
+                """
+            )
+        )
+        return tuple(str(view_name) for view_name in result.scalars())
+
+
+async def _truncate_migrated_database(engine: AsyncEngine, schema: MigratedDatabaseSchema) -> None:
+    """Clear mutable migrated database state without dropping migrated schema objects."""
+
+    async with engine.begin() as connection:
+        if schema.table_names:
+            _ = await connection.execute(
+                text(f"TRUNCATE TABLE {', '.join(schema.table_names)} RESTART IDENTITY CASCADE"),
+            )
+
+        should_refresh_views = False
+        for view_name in schema.materialized_view_names:
+            view_has_rows = await connection.scalar(text(f"SELECT EXISTS (SELECT 1 FROM {view_name} LIMIT 1)"))
+            should_refresh_views = should_refresh_views or bool(view_has_rows)
+
+        if should_refresh_views:
+            for view_name in schema.materialized_view_names:
+                _ = await connection.execute(text(f"REFRESH MATERIALIZED VIEW {view_name}"))
+
+
+async def _reset_and_migrate_public_schema(engine: AsyncEngine, database_url: str) -> MigratedDatabaseSchema:
+    """Reset the public schema, apply Alembic once, and cache mutable object names."""
+
+    head_revision = _get_alembic_head_revision(database_url)
+    await _reset_public_schema(engine)
+    await _run_alembic_upgrade(database_url)
+    return MigratedDatabaseSchema(
+        head_revision=head_revision,
+        table_names=await _list_truncatable_public_tables(engine),
+        materialized_view_names=await _list_public_materialized_views(engine),
+    )
+
+
+async def _ensure_migrated_database_schema(
+    engine: AsyncEngine,
+    database_url: str,
+    schema: MigratedDatabaseSchema,
+) -> None:
+    """Rebuild the worker schema if another isolated migration test reset it."""
+
+    if await _get_current_alembic_revision(engine) == schema.head_revision:
+        return
+
+    rebuilt_schema = await _reset_and_migrate_public_schema(engine, database_url)
+    schema.head_revision = rebuilt_schema.head_revision
+    schema.table_names = rebuilt_schema.table_names
+    schema.materialized_view_names = rebuilt_schema.materialized_view_names
+
+
+@asynccontextmanager
+async def _transactional_migrated_session(
+    engine: AsyncEngine,
+    database_url: str,
+    schema: MigratedDatabaseSchema,
+) -> AsyncIterator[AsyncSession]:
+    """Open a migrated DB session wrapped in an outer rollback-only transaction."""
+
+    await _ensure_migrated_database_schema(engine, database_url, schema)
+
+    async with engine.connect() as connection:
+        transaction = await connection.begin()
+        async with AsyncSession(
+            bind=connection,
+            autoflush=False,
+            expire_on_commit=False,
+            join_transaction_mode="create_savepoint",
+        ) as session:
+            try:
+                yield session
+            finally:
+                await session.close()
+
+        if transaction.is_active:
+            await transaction.rollback()
 
 
 async def reset_test_runtime_state(*, flush_redis: bool = False) -> None:
@@ -293,22 +451,70 @@ async def db_session(
         await session.rollback()
 
 
+@pytest_asyncio.fixture(scope="session", loop_scope="session")
+async def migrated_db_schema(
+    postgres_async_engine: AsyncEngine,
+    postgres_async_url: str,
+) -> AsyncIterator[MigratedDatabaseSchema]:
+    """Apply Alembic once per pytest worker and preserve migrated schema objects."""
+
+    schema = await _reset_and_migrate_public_schema(postgres_async_engine, postgres_async_url)
+    await _truncate_migrated_database(postgres_async_engine, schema)
+
+    try:
+        yield schema
+    finally:
+        await _reset_public_schema(postgres_async_engine)
+
+
 @pytest_asyncio.fixture(loop_scope="session")
 async def migrated_db_session(
+    request: pytest.FixtureRequest,
     postgres_async_engine: AsyncEngine,
     postgres_async_url: str,
     postgres_session_factory: async_sessionmaker[AsyncSession],
+    migrated_db_schema: MigratedDatabaseSchema,
 ) -> AsyncIterator[AsyncSession]:
-    """Yield a session bound to a freshly migrated PostgreSQL schema."""
+    """Yield a session bound to the worker-local migrated PostgreSQL schema."""
 
-    await _reset_public_schema(postgres_async_engine)
-    await _run_alembic_upgrade(postgres_async_url)
+    if request.node.get_closest_marker("transactional_db") is not None:
+        async with _transactional_migrated_session(
+            postgres_async_engine,
+            postgres_async_url,
+            migrated_db_schema,
+        ) as session:
+            yield session
+        return
+
+    await _ensure_migrated_database_schema(
+        postgres_async_engine,
+        postgres_async_url,
+        migrated_db_schema,
+    )
 
     async with postgres_session_factory() as session:
-        yield session
-        await session.rollback()
+        try:
+            yield session
+        finally:
+            await session.rollback()
 
-    await _reset_public_schema(postgres_async_engine)
+    await _truncate_migrated_database(postgres_async_engine, migrated_db_schema)
+
+
+@pytest_asyncio.fixture(loop_scope="session")
+async def transactional_migrated_db_session(
+    postgres_async_engine: AsyncEngine,
+    postgres_async_url: str,
+    migrated_db_schema: MigratedDatabaseSchema,
+) -> AsyncIterator[AsyncSession]:
+    """Yield a migrated DB session whose writes roll back with one outer transaction."""
+
+    async with _transactional_migrated_session(
+        postgres_async_engine,
+        postgres_async_url,
+        migrated_db_schema,
+    ) as session:
+        yield session
 
 
 @pytest.fixture

@@ -38,6 +38,8 @@ if TYPE_CHECKING:
 
     from memexpert.schemas.meme import MemeFileRead
 
+pytestmark = pytest.mark.transactional_db
+
 
 BOT_SCOPE = "telegram-inline-service-test-scope"
 TELEGRAM_ID = 8_102_203

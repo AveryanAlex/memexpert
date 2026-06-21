@@ -17,6 +17,8 @@ from memexpert.services.report import MemeReportService, MemeReportTargetNotVisi
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
+pytestmark = pytest.mark.transactional_db
+
 
 async def _create_meme(session: AsyncSession, *, is_public: bool, is_nsfw: bool) -> Meme:
     meme_id = uuid.uuid7()

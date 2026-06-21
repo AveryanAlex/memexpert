@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats
 
+import memexpert.bot.commands as bot_commands_module
 from memexpert.bot.commands import build_bot_commands, build_private_command_scope, register_bot_commands
 
 if TYPE_CHECKING:
@@ -105,20 +105,28 @@ async def test_register_bot_commands_sends_commands_with_private_scope() -> None
 
 
 @pytest.mark.asyncio
-async def test_register_bot_commands_logs_and_reraises_failure(caplog: pytest.LogCaptureFixture) -> None:
+async def test_register_bot_commands_logs_and_reraises_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     bot = FailingCommandBot(RuntimeError("setMyCommands failed"))
+    exception_calls: list[dict[str, Any]] = []
 
-    with caplog.at_level(logging.ERROR, logger="memexpert.bot.commands"), pytest.raises(
+    def record_exception(message: str, *args: object, **kwargs: Any) -> None:
+        exception_calls.append({"message": message, "args": args, "kwargs": kwargs})
+
+    monkeypatch.setattr(bot_commands_module.logger, "exception", record_exception)
+
+    with pytest.raises(
         RuntimeError,
         match="setMyCommands failed",
     ):
         await register_bot_commands(cast("Bot", bot))
 
-    records = [record for record in caplog.records if record.name == "memexpert.bot.commands"]
-    assert len(records) == 1
-    record = records[0]
-    assert record.exc_info is not None
-    assert record.getMessage() == "Failed to register Telegram bot command menu."
-    assert record.__dict__["event"] == "telegram_bot_command_registration_failed"
-    assert record.__dict__["scope"] == "all_private_chats"
-    assert record.__dict__["command_names"] == EXPECTED_COMMAND_NAMES
+    assert len(exception_calls) == 1
+    call = exception_calls[0]
+    assert call["message"] == "Failed to register Telegram bot command menu."
+    assert call["args"] == ()
+    extra = call["kwargs"]["extra"]
+    assert extra == {
+        "event": "telegram_bot_command_registration_failed",
+        "scope": "all_private_chats",
+        "command_names": EXPECTED_COMMAND_NAMES,
+    }

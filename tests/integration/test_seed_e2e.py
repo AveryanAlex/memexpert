@@ -45,6 +45,9 @@ if TYPE_CHECKING:
     from memexpert.core.meilisearch import PipelineMeilisearchDocument
     from memexpert.core.qdrant import QdrantSyncPayload
 
+pytestmark = pytest.mark.transactional_db
+
+
 class RecordingQdrantSyncClient:
     def __init__(self) -> None:
         self.upsert_calls: list[tuple[QdrantSyncPayload, tuple[float, ...]]] = []

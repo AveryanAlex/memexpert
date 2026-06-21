@@ -47,6 +47,8 @@ if TYPE_CHECKING:
 
     from sqlalchemy.ext.asyncio import AsyncSession
 
+pytestmark = pytest.mark.transactional_db
+
 
 def _now() -> datetime:
     return datetime.now(tz=UTC)
