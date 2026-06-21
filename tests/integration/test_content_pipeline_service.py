@@ -175,18 +175,14 @@ class RecordingBroker:
         return None
 
 
-def build_normalized_media_result(meme_file_id: uuid.UUID) -> NormalizedMediaResult:
-    """Create a stable normalized transcode artifact for service assertions."""
+def build_normalized_media_result(meme_file_id: uuid.UUID, *, web_video: bool = True) -> NormalizedMediaResult:
+    """Create a stable normalized artifact for service assertions."""
 
     return NormalizedMediaResult(
-        mime_type="video/mp4",
-        width=720,
-        height=720,
-        file_size_bytes=4096,
         quality_score=0.82,
         blur_hash="L4AS~q00~q.8%MRjM{Rj00IU%MRj",
-        web_video_object_key=f"pipeline/derived/{meme_file_id}/web.mp4",
-        web_video_bytes=b"normalized-web-video",
+        web_video_object_key=f"pipeline/derived/{meme_file_id}/web.mp4" if web_video else None,
+        web_video_bytes=b"normalized-web-video" if web_video else None,
     )
 
 
@@ -295,11 +291,13 @@ async def _drive_to_embed_pending(
         event_id=uuid.uuid7(),
         result=normalized,
     )
+    web_video_object_key = normalized.web_video_object_key
+    assert web_video_object_key is not None
     await service.complete_ocr_stage(
         meme_file_id=meme_file_id,
         attempt=1,
         event_id=uuid.uuid7(),
-        result=build_ocr_result(source_object_key=normalized.web_video_object_key),
+        result=build_ocr_result(source_object_key=web_video_object_key),
     )
     return meme_file_id, normalized, service
 
@@ -389,8 +387,8 @@ async def test_complete_transcode_stage_persists_derivative_metadata_and_queues_
 
     meme_file_id = await _seed_pending_pipeline_item(
         migrated_db_session,
-        filename="transcode.png",
-        content_type="image/png",
+        filename="transcode.gif",
+        content_type="image/gif",
         media_bytes=b"transcode-bytes",
         source_id="stage-chain",
         post_id="6001",
@@ -418,12 +416,56 @@ async def test_complete_transcode_stage_persists_derivative_metadata_and_queues_
     assert persisted_file is not None
     assert persisted_file.status is ContentProcessingStatus.PROCESSING
     assert persisted_file.s3_web_video_key == normalized.web_video_object_key
-    assert persisted_file.mime_type == "video/mp4"
-    assert persisted_file.width == 720
-    assert persisted_file.height == 720
-    assert persisted_file.file_size_bytes == 4096
+    assert persisted_file.mime_type == "image/gif"
+    assert persisted_file.width == 128
+    assert persisted_file.height == 128
+    assert persisted_file.file_size_bytes == len(b"transcode-bytes")
     assert persisted_file.quality_score == pytest.approx(0.82)
     assert persisted_file.blur_hash == normalized.blur_hash
+
+
+async def test_complete_transcode_stage_preserves_original_metadata_without_static_web_video(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    broker = RecordingBroker()
+    service = PipelineStageCompletionService(migrated_db_session, broker=broker)
+    media_bytes = b"static-image-original-bytes"
+    meme_file_id = await _seed_pending_pipeline_item(
+        migrated_db_session,
+        filename="static.jpg",
+        content_type="image/jpeg",
+        media_bytes=media_bytes,
+        source_id="static-stage-chain",
+        post_id="static-6001",
+        phash_tag="s",
+    )
+
+    await service.complete_transcode_stage(
+        meme_file_id=meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        result=build_normalized_media_result(meme_file_id, web_video=False),
+    )
+
+    after_transcode = await PipelineItemReadService(migrated_db_session).get_item(meme_file_id)
+    assert after_transcode.current_stage is ContentPipelineStage.OCR
+    assert after_transcode.current_status is ContentPipelineStageStatus.PENDING
+    assert after_transcode.web_video_object_key is None
+    assert broker.events[-1].event_type is ContentPipelineEventType.MEME_TRANSCODED
+    assert broker.events[-1].stage is ContentPipelineStage.OCR
+
+    async with postgres_session_factory() as session:
+        persisted_file = await session.scalar(select(MemeFile).where(MemeFile.id == meme_file_id))
+
+    assert persisted_file is not None
+    assert persisted_file.mime_type == "image/jpeg"
+    assert persisted_file.file_size_bytes == len(media_bytes)
+    assert persisted_file.width == 128
+    assert persisted_file.height == 128
+    assert persisted_file.s3_web_video_key is None
+    assert persisted_file.quality_score == pytest.approx(0.82)
+    assert persisted_file.blur_hash == "L4AS~q00~q.8%MRjM{Rj00IU%MRj"
 
 
 async def test_complete_ocr_stage_persists_durable_result_and_keeps_meme_unready(
@@ -452,12 +494,14 @@ async def test_complete_ocr_stage_persists_durable_result_and_keeps_meme_unready
         event_id=uuid.uuid7(),
         result=normalized,
     )
+    web_video_object_key = normalized.web_video_object_key
+    assert web_video_object_key is not None
 
     await service.complete_ocr_stage(
         meme_file_id=meme_file_id,
         attempt=1,
         event_id=uuid.uuid7(),
-        result=build_ocr_result(source_object_key=normalized.web_video_object_key),
+        result=build_ocr_result(source_object_key=web_video_object_key),
     )
     after_ocr = await PipelineItemReadService(migrated_db_session).get_item(meme_file_id)
 

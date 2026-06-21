@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 
     from memexpert.models.content import MemeFile
 
-_IMAGE_MIME_PREFIX = "image/"
+_STATIC_IMAGE_MIME_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
 _SAFE_FILENAME_RE = re.compile(r"[^a-z0-9._-]+")
 _HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
 
@@ -51,7 +51,7 @@ class MediaRenderUrlService:
         """Build render URLs for one already-visible meme file."""
 
         render = PublicMemeFileRenderRead(width=file.width, height=file.height, blur_hash=file.blur_hash)
-        if _is_image_mime(file.mime_type):
+        if _is_static_image_mime(file.mime_type):
             extension = _extension_for_file(file, default="jpg")
             filename = _download_filename(file=file, context=context, extension=extension)
             render.thumbnail_url = self._imgproxy_url(
@@ -86,7 +86,7 @@ class MediaRenderUrlService:
         """Build authenticated API render URLs for one already-authorized private file."""
 
         render = PublicMemeFileRenderRead(width=file.width, height=file.height, blur_hash=file.blur_hash)
-        if _is_image_mime(file.mime_type):
+        if _is_static_image_mime(file.mime_type):
             render.thumbnail_url = self._private_file_url(file.id, variant="thumbnail")
             render.preview_url = self._private_file_url(file.id, variant="preview")
             render.display_url = render.preview_url
@@ -121,8 +121,8 @@ class MediaRenderUrlService:
         return f"/api/v1/media/files/{file_id}/{quote(variant, safe='')}"
 
 
-def _is_image_mime(mime_type: str | None) -> bool:
-    return bool(mime_type and mime_type.lower().startswith(_IMAGE_MIME_PREFIX))
+def _is_static_image_mime(mime_type: str | None) -> bool:
+    return bool(mime_type and mime_type.lower() in _STATIC_IMAGE_MIME_TYPES)
 
 
 def _extension_for_file(file: MemeFile, *, default: str) -> str:

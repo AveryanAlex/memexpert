@@ -33,7 +33,7 @@ The conceptual meme entity. Key fields: `media_type` (image/gif/video), `primary
 
 ### MemeFile
 
-A specific media file belonging to a meme. Key fields: `meme_id` (FK → Meme), `status` (pending/processing/ready/failed), `s3_original_key`, `s3_web_video_key` (nullable — GIF/video only), `perceptual_hash`, `quality_score`, `blur_hash`. The canonical default file is stored on `Meme.primary_file_id`. Image variants (resize, format) served on-the-fly by imgproxy from the original.
+A specific media file belonging to a meme. Key fields: `meme_id` (FK → Meme), `status` (pending/processing/ready/failed), original-upload metadata (`mime_type`, dimensions, byte size), `s3_original_key`, `s3_web_video_key` (nullable — GIF/video playback artifact only), `perceptual_hash`, `quality_score`, `blur_hash`. The canonical default file is stored on `Meme.primary_file_id`. Static image variants (resize, format) are served on-the-fly by imgproxy from the original; derived playback artifacts never overwrite original MIME metadata.
 
 ### MemeSeoPage
 

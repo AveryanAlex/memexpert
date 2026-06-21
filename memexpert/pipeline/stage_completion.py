@@ -114,10 +114,6 @@ class PipelineStageCompletionService(PipelineDispatchingService):
         meme_file, stage_entry = await self._get_meme_file_and_stage_entry(meme_file_id, ContentPipelineStage.TRANSCODE)
         ensure_stage_attempt_is_current(stage_entry, attempt=attempt)
         meme_file.s3_web_video_key = result.web_video_object_key
-        meme_file.mime_type = result.mime_type
-        meme_file.width = result.width
-        meme_file.height = result.height
-        meme_file.file_size_bytes = result.file_size_bytes
         meme_file.quality_score = result.quality_score
         meme_file.blur_hash = result.blur_hash
         await self._finalize_stage_success(

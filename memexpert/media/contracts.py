@@ -25,16 +25,12 @@ class UploadMediaDetails:
 
 @dataclass(frozen=True, slots=True)
 class NormalizedMediaResult:
-    """Normalized derivative output written during the transcode stage."""
+    """Optional playback derivative and display metadata from media preparation."""
 
-    mime_type: str
-    width: int
-    height: int
-    file_size_bytes: int
     quality_score: float
     blur_hash: str | None
-    web_video_object_key: str
-    web_video_bytes: bytes
+    web_video_object_key: str | None = None
+    web_video_bytes: bytes | None = None
 
 
 class MediaProcessingError(RuntimeError):

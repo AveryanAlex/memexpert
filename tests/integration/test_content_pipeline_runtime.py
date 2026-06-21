@@ -341,6 +341,7 @@ class FakeOCRProcessor:
 
     result: OCRExtractionResult | None = None
     error: Exception | None = None
+    calls: list[dict[str, object]] = field(default_factory=list)
 
     async def extract_text(
         self,
@@ -350,7 +351,14 @@ class FakeOCRProcessor:
         media_bytes: bytes,
         source_object_key: str,
     ) -> OCRExtractionResult:
-        _ = (filename, mime_type, media_bytes, source_object_key)
+        self.calls.append(
+            {
+                "filename": filename,
+                "mime_type": mime_type,
+                "media_bytes": media_bytes,
+                "source_object_key": source_object_key,
+            }
+        )
         if self.error is not None:
             raise self.error
         assert self.result is not None
@@ -593,6 +601,15 @@ def build_png_bytes(*, color: tuple[int, int, int]) -> bytes:
     return output.getvalue()
 
 
+def build_jpeg_bytes(*, color: tuple[int, int, int]) -> bytes:
+    """Generate a tiny JPEG image payload entirely in memory for runtime tests."""
+
+    image = Image.new("RGB", (8, 8), color=color)
+    output = BytesIO()
+    image.save(output, format="JPEG")
+    return output.getvalue()
+
+
 def build_seeded_png_bytes(*, seed: str) -> bytes:
     """Generate deterministic but byte-distinct PNG payloads for seeded files."""
 
@@ -651,6 +668,7 @@ async def _seed_transcode_pending_item(
     post_id: str,
     filename: str,
     media_bytes: bytes,
+    content_type: str = "image/png",
     phash_tag: str = "a",
 ) -> tuple[ContentPipelineItemRead, ContentPipelineDispatchEvent]:
     details = _make_distinct_upload_media_details(tag=phash_tag)
@@ -659,7 +677,7 @@ async def _seed_transcode_pending_item(
     event_id = uuid.uuid7()
     now = utcnow()
     original_object_key = f"pipeline/originals/{meme_file_id}/original.{filename.rsplit('.', 1)[-1]}"
-    storage_client.objects[original_object_key] = StoredObject(body=media_bytes, content_type="image/png")
+    storage_client.objects[original_object_key] = StoredObject(body=media_bytes, content_type=content_type)
     dispatch_event = ContentPipelineDispatchEvent(
         event_id=event_id,
         event_type=ContentPipelineEventType.MEME_CREATED,
@@ -690,7 +708,7 @@ async def _seed_transcode_pending_item(
                 width=details.width,
                 height=details.height,
                 file_size_bytes=len(media_bytes),
-                mime_type="image/png",
+                mime_type=content_type,
                 s3_original_key=original_object_key,
                 perceptual_hash=details.perceptual_hash,
                 sha256_hex=hashlib.sha256(media_bytes).hexdigest(),
@@ -729,19 +747,25 @@ async def _seed_transcode_pending_item(
     return await PipelineItemReadService(session).get_item(meme_file_id), dispatch_event
 
 
-def build_normalized_media_result(meme_file_id: uuid.UUID) -> NormalizedMediaResult:
-    """Create a stable normalized transcode artifact for runtime assertions."""
+def build_normalized_media_result(meme_file_id: uuid.UUID, *, web_video: bool = True) -> NormalizedMediaResult:
+    """Create a stable normalized artifact for runtime assertions."""
 
     return NormalizedMediaResult(
-        mime_type="video/mp4",
-        width=720,
-        height=720,
-        file_size_bytes=4096,
         quality_score=0.82,
         blur_hash="L4AS~q00~q.8%MRjM{Rj00IU%MRj",
-        web_video_object_key=f"pipeline/derived/{meme_file_id}/web.mp4",
-        web_video_bytes=b"normalized-web-video",
+        web_video_object_key=f"pipeline/derived/{meme_file_id}/web.mp4" if web_video else None,
+        web_video_bytes=b"normalized-web-video" if web_video else None,
     )
+
+
+def _web_video_key(result: NormalizedMediaResult) -> str:
+    assert result.web_video_object_key is not None
+    return result.web_video_object_key
+
+
+def _web_video_bytes(result: NormalizedMediaResult) -> bytes:
+    assert result.web_video_bytes is not None
+    return result.web_video_bytes
 
 
 def build_ocr_result(*, source_object_key: str) -> OCRExtractionResult:
@@ -789,9 +813,9 @@ async def _seed_ocr_pending_item(
         broker=broker,
     )
     normalized = build_normalized_media_result(item.meme_file_id)
-    storage_client.objects[normalized.web_video_object_key] = StoredObject(
-        body=normalized.web_video_bytes,
-        content_type=normalized.mime_type,
+    storage_client.objects[_web_video_key(normalized)] = StoredObject(
+        body=_web_video_bytes(normalized),
+        content_type="video/mp4",
     )
     await service.complete_transcode_stage(
         meme_file_id=item.meme_file_id,
@@ -1459,7 +1483,7 @@ async def test_pipeline_runtime_forced_transcode_failure_then_replay_then_succes
         session_factory=postgres_session_factory,
         storage_client=storage_client,
         media_processor=FakeMediaProcessor(normalize_result=normalized),
-        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key=normalized.web_video_object_key)),
+        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key=_web_video_key(normalized))),
     )
     success_message = FakeRabbitMessage(message_id=str(replay_event.event_id))
 
@@ -1468,14 +1492,49 @@ async def test_pipeline_runtime_forced_transcode_failure_then_replay_then_succes
     succeeded_item = await _fetch_item(postgres_session_factory, item.meme_file_id, settings=successful_settings)
     assert succeeded_item.current_status is ContentPipelineStageStatus.PENDING
     assert succeeded_item.current_stage is ContentPipelineStage.OCR
-    assert succeeded_item.web_video_object_key == normalized.web_video_object_key
+    assert succeeded_item.web_video_object_key == _web_video_key(normalized)
     assert succeeded_item.normalized_reason is None
     assert len(downstream_broker.publish_calls) == 1
     assert downstream_broker.publish_calls[0]["routing_key"] == successful_runtime.broker_settings.ocr_routing_key
-    assert storage_client.objects[normalized.web_video_object_key].body == normalized.web_video_bytes
+    assert storage_client.objects[_web_video_key(normalized)].body == _web_video_bytes(normalized)
     assert success_message.ack_count == 1
     assert success_message.reject_calls == []
     assert success_message.nack_calls == []
+
+
+async def test_pipeline_runtime_transcode_static_image_skips_web_video_upload(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    storage_client = FakeStorageClient()
+    item, transcode_event = await _seed_transcode_pending_item(
+        migrated_db_session,
+        storage_client,
+        source_id="static-runtime-source",
+        post_id="static-runtime-post",
+        filename="static-runtime.jpg",
+        media_bytes=build_jpeg_bytes(color=(40, 50, 60)),
+        content_type="image/jpeg",
+    )
+    normalized = build_normalized_media_result(item.meme_file_id, web_video=False)
+    downstream_broker = PublishingBroker()
+    runtime = build_pipeline_runtime(
+        settings=Settings(),
+        broker=cast("Any", downstream_broker),
+        session_factory=postgres_session_factory,
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(normalize_result=normalized),
+    )
+    message = FakeRabbitMessage(message_id=str(transcode_event.event_id))
+
+    await runtime.handle_transcode_message(transcode_event.model_dump(mode="json"), message)
+
+    succeeded_item = await _fetch_item(postgres_session_factory, item.meme_file_id)
+    assert succeeded_item.current_stage is ContentPipelineStage.OCR
+    assert succeeded_item.current_status is ContentPipelineStageStatus.PENDING
+    assert succeeded_item.web_video_object_key is None
+    assert storage_client.put_calls == []
+    assert message.ack_count == 1
 
 
 async def test_pipeline_runtime_ocr_success_persists_fallback_result_and_dispatches_embed(
@@ -1498,7 +1557,7 @@ async def test_pipeline_runtime_ocr_success_persists_fallback_result_and_dispatc
         session_factory=postgres_session_factory,
         storage_client=storage_client,
         media_processor=FakeMediaProcessor(normalize_result=normalized),
-        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key=normalized.web_video_object_key)),
+        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key=_web_video_key(normalized))),
     )
     message = FakeRabbitMessage(message_id=str(ocr_event.event_id))
 
@@ -1523,7 +1582,79 @@ async def test_pipeline_runtime_ocr_success_persists_fallback_result_and_dispatc
     assert persisted_ocr.fallback_used is True
     assert persisted_ocr.low_confidence is True
     assert persisted_ocr.confidence == pytest.approx(0.41)
-    assert persisted_ocr.source_object_key == normalized.web_video_object_key
+    assert persisted_ocr.source_object_key == _web_video_key(normalized)
+
+
+async def test_pipeline_runtime_ocr_static_image_uses_original_object_and_original_mime(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    storage_client = FakeStorageClient()
+    broker = RecordingBroker()
+    item, _ = await _seed_transcode_pending_item(
+        migrated_db_session,
+        storage_client,
+        source_id="ocr-static-source",
+        post_id="ocr-static-post",
+        filename="ocr-static.jpg",
+        media_bytes=build_jpeg_bytes(color=(90, 40, 20)),
+        content_type="image/jpeg",
+    )
+    service = PipelineStageCompletionService(migrated_db_session, broker=broker)
+    await service.complete_transcode_stage(
+        meme_file_id=item.meme_file_id,
+        attempt=1,
+        event_id=uuid.uuid7(),
+        result=build_normalized_media_result(item.meme_file_id, web_video=False),
+    )
+    ocr_event = broker.events[-1]
+    ocr_processor = FakeOCRProcessor(result=build_ocr_result(source_object_key=item.original_object_key))
+    runtime = build_pipeline_runtime(
+        settings=Settings(),
+        broker=cast("Any", PublishingBroker()),
+        session_factory=postgres_session_factory,
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(normalize_result=build_normalized_media_result(item.meme_file_id)),
+        ocr_processor=ocr_processor,
+    )
+
+    await runtime.handle_ocr_message(
+        ocr_event.model_dump(mode="json"),
+        FakeRabbitMessage(message_id=str(ocr_event.event_id)),
+    )
+
+    assert ocr_processor.calls[-1]["source_object_key"] == item.original_object_key
+    assert ocr_processor.calls[-1]["mime_type"] == "image/jpeg"
+
+
+async def test_pipeline_runtime_ocr_web_video_uses_derived_object_and_video_mime(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    storage_client = FakeStorageClient()
+    broker = RecordingBroker()
+    _meme_file_id, ocr_event, normalized = await _seed_ocr_pending_item(
+        migrated_db_session,
+        storage_client=storage_client,
+        broker=broker,
+    )
+    ocr_processor = FakeOCRProcessor(result=build_ocr_result(source_object_key=_web_video_key(normalized)))
+    runtime = build_pipeline_runtime(
+        settings=Settings(),
+        broker=cast("Any", PublishingBroker()),
+        session_factory=postgres_session_factory,
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(normalize_result=normalized),
+        ocr_processor=ocr_processor,
+    )
+
+    await runtime.handle_ocr_message(
+        ocr_event.model_dump(mode="json"),
+        FakeRabbitMessage(message_id=str(ocr_event.event_id)),
+    )
+
+    assert ocr_processor.calls[-1]["source_object_key"] == _web_video_key(normalized)
+    assert ocr_processor.calls[-1]["mime_type"] == "video/mp4"
 
 
 async def test_pipeline_runtime_ocr_failure_then_replay_then_success(
@@ -1576,7 +1707,7 @@ async def test_pipeline_runtime_ocr_failure_then_replay_then_success(
         session_factory=postgres_session_factory,
         storage_client=storage_client,
         media_processor=FakeMediaProcessor(normalize_result=normalized),
-        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key=normalized.web_video_object_key)),
+        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key=_web_video_key(normalized))),
     )
     success_message = FakeRabbitMessage(message_id=str(replay_event.event_id))
 
@@ -1734,9 +1865,9 @@ async def _seed_embed_pending_item(
         broker=broker,
     )
     normalized = build_normalized_media_result(item.meme_file_id)
-    storage_client.objects[normalized.web_video_object_key] = StoredObject(
-        body=normalized.web_video_bytes,
-        content_type=normalized.mime_type,
+    storage_client.objects[_web_video_key(normalized)] = StoredObject(
+        body=_web_video_bytes(normalized),
+        content_type="video/mp4",
     )
     await service.complete_transcode_stage(
         meme_file_id=item.meme_file_id,
@@ -1748,7 +1879,7 @@ async def _seed_embed_pending_item(
         meme_file_id=item.meme_file_id,
         attempt=1,
         event_id=uuid.uuid7(),
-        result=build_ocr_result(source_object_key=normalized.web_video_object_key),
+        result=build_ocr_result(source_object_key=_web_video_key(normalized)),
     )
     embed_event = next(
         (
@@ -1937,7 +2068,7 @@ async def test_pipeline_runtime_embed_success_persists_cache_and_dispatches_clas
         session_factory=postgres_session_factory,
         storage_client=storage_client,
         media_processor=FakeMediaProcessor(normalize_result=normalized),
-        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key=normalized.web_video_object_key)),
+        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key=_web_video_key(normalized))),
         voyage_client=voyage_client,
         qdrant_client=qdrant_client,
         classification_client=FakeClassificationClient(result=build_classification_result()),
@@ -1982,7 +2113,7 @@ async def test_pipeline_runtime_embed_provider_unavailable_keeps_stage_replayabl
         session_factory=postgres_session_factory,
         storage_client=storage_client,
         media_processor=FakeMediaProcessor(normalize_result=normalized),
-        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key=normalized.web_video_object_key)),
+        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key=_web_video_key(normalized))),
         voyage_client=FakeVoyageClient(error=VoyageProviderUnavailableError("quota")),
         qdrant_client=FakeQdrantClient(),
         classification_client=FakeClassificationClient(result=build_classification_result()),
@@ -2037,7 +2168,7 @@ async def test_pipeline_runtime_embed_malformed_vector_marks_non_retryable_failu
         session_factory=postgres_session_factory,
         storage_client=storage_client,
         media_processor=FakeMediaProcessor(normalize_result=normalized),
-        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key=normalized.web_video_object_key)),
+        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key=_web_video_key(normalized))),
         voyage_client=FakeVoyageClient(
             error=VoyageMalformedResponseError("wrong dimensions"),
         ),
@@ -2080,7 +2211,7 @@ async def test_pipeline_runtime_classify_success_emits_meme_ready_and_marks_file
         session_factory=postgres_session_factory,
         storage_client=storage_client,
         media_processor=FakeMediaProcessor(normalize_result=normalized),
-        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key=normalized.web_video_object_key)),
+        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key=_web_video_key(normalized))),
         voyage_client=FakeVoyageClient(result=build_voyage_embedding_result()),
         qdrant_client=FakeQdrantClient(),
         classification_client=FakeClassificationClient(
@@ -2127,7 +2258,7 @@ async def test_pipeline_runtime_classify_provider_unavailable_keeps_stage_replay
         session_factory=postgres_session_factory,
         storage_client=storage_client,
         media_processor=FakeMediaProcessor(normalize_result=normalized),
-        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key=normalized.web_video_object_key)),
+        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key=_web_video_key(normalized))),
         voyage_client=FakeVoyageClient(result=build_voyage_embedding_result()),
         qdrant_client=FakeQdrantClient(),
         classification_client=FakeClassificationClient(
@@ -2256,7 +2387,7 @@ async def test_pipeline_runtime_embed_merge_transaction_failure_keeps_stage_repl
         storage_client=storage_client,
         media_processor=FakeMediaProcessor(normalize_result=newer_normalized),
         ocr_processor=FakeOCRProcessor(
-            result=build_ocr_result(source_object_key=newer_normalized.web_video_object_key),
+            result=build_ocr_result(source_object_key=_web_video_key(newer_normalized)),
         ),
         voyage_client=FakeVoyageClient(result=build_voyage_embedding_result(input_hash="3" * 64)),
         qdrant_client=FakeQdrantClient(matches=(similarity_match,)),
@@ -2351,7 +2482,7 @@ async def test_pipeline_runtime_embed_voyage_timeout_keeps_stage_replayable(
         session_factory=postgres_session_factory,
         storage_client=storage_client,
         media_processor=FakeMediaProcessor(normalize_result=normalized),
-        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key=normalized.web_video_object_key)),
+        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key=_web_video_key(normalized))),
         voyage_client=FakeVoyageClient(error=VoyageTimeoutError("took too long")),
         qdrant_client=FakeQdrantClient(),
         classification_client=FakeClassificationClient(result=build_classification_result()),
@@ -2390,7 +2521,7 @@ async def test_pipeline_runtime_embed_qdrant_timeout_keeps_stage_replayable(
         session_factory=postgres_session_factory,
         storage_client=storage_client,
         media_processor=FakeMediaProcessor(normalize_result=normalized),
-        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key=normalized.web_video_object_key)),
+        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key=_web_video_key(normalized))),
         voyage_client=FakeVoyageClient(result=build_voyage_embedding_result()),
         qdrant_client=FakeQdrantClient(error=QdrantTimeoutError("qdrant lookup timed out")),
         classification_client=FakeClassificationClient(result=build_classification_result()),
@@ -2451,7 +2582,7 @@ async def test_pipeline_runtime_embed_qdrant_malformed_response_dead_letters(
         session_factory=postgres_session_factory,
         storage_client=storage_client,
         media_processor=FakeMediaProcessor(normalize_result=normalized),
-        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key=normalized.web_video_object_key)),
+        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key=_web_video_key(normalized))),
         voyage_client=FakeVoyageClient(result=build_voyage_embedding_result()),
         qdrant_client=FakeQdrantClient(
             error=QdrantMalformedResponseError("response is not a sequence"),
@@ -2497,7 +2628,7 @@ async def test_pipeline_runtime_embed_qdrant_provider_unavailable_keeps_stage_re
         session_factory=postgres_session_factory,
         storage_client=storage_client,
         media_processor=FakeMediaProcessor(normalize_result=normalized),
-        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key=normalized.web_video_object_key)),
+        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key=_web_video_key(normalized))),
         voyage_client=FakeVoyageClient(result=build_voyage_embedding_result()),
         qdrant_client=FakeQdrantClient(error=QdrantProviderUnavailableError("qdrant down")),
         classification_client=FakeClassificationClient(result=build_classification_result()),
@@ -2566,7 +2697,7 @@ async def test_pipeline_runtime_embed_contract_violation_dead_letters_non_retrya
         session_factory=postgres_session_factory,
         storage_client=storage_client,
         media_processor=FakeMediaProcessor(normalize_result=normalized),
-        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key=normalized.web_video_object_key)),
+        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key=_web_video_key(normalized))),
         voyage_client=FakeVoyageClient(result=malformed_dimensions_result),
         qdrant_client=FakeQdrantClient(),
         classification_client=FakeClassificationClient(result=build_classification_result()),

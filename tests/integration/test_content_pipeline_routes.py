@@ -391,18 +391,14 @@ async def _seed_pipeline_item(
     return await PipelineItemReadService(session).get_item(meme_file_id)
 
 
-def _normalized_media_result(meme_file_id: uuid.UUID) -> NormalizedMediaResult:
+def _normalized_media_result(meme_file_id: uuid.UUID, *, web_video: bool = True) -> NormalizedMediaResult:
     """Return a deterministic transcode result for the enriched detail route tests."""
 
     return NormalizedMediaResult(
-        mime_type="image/png",
-        width=32,
-        height=32,
-        file_size_bytes=128,
         quality_score=0.77,
         blur_hash="L4AS~q00~q.8%MRjM{Rj00IU%MRj",
-        web_video_object_key=f"pipeline/derived/{meme_file_id}/web.png",
-        web_video_bytes=b"detail-route-transcode-bytes",
+        web_video_object_key=f"pipeline/derived/{meme_file_id}/web.mp4" if web_video else None,
+        web_video_bytes=b"detail-route-transcode-bytes" if web_video else None,
     )
 
 

@@ -93,7 +93,7 @@ def test_web_video_uses_public_media_base_and_never_imgproxy() -> None:
         meme_id=uuid.UUID("22222222-2222-4222-8222-222222222224"),
         s3_original_key="pipeline/originals/video-source.mov",
         s3_web_video_key="pipeline/derived/secret/web.mp4",
-        mime_type="video/mp4",
+        mime_type="video/quicktime",
         quality_score=0.7,
     )
 
@@ -118,7 +118,7 @@ def test_web_video_returns_null_without_public_media_base() -> None:
         meme_id=uuid.UUID("22222222-2222-4222-8222-222222222225"),
         s3_original_key="pipeline/originals/video-source.mov",
         s3_web_video_key="pipeline/derived/secret/web.mp4",
-        mime_type="video/mp4",
+        mime_type="video/quicktime",
         quality_score=0.7,
     )
 
@@ -169,7 +169,7 @@ def test_private_web_video_uses_authenticated_direct_variant_without_imgproxy() 
         meme_id=uuid.UUID("22222222-2222-4222-8222-222222222227"),
         s3_original_key="pipeline/originals/private/source.mov",
         s3_web_video_key="pipeline/derived/private/web.mp4",
-        mime_type="video/mp4",
+        mime_type="video/quicktime",
         quality_score=0.7,
     )
 
@@ -183,3 +183,32 @@ def test_private_web_video_uses_authenticated_direct_variant_without_imgproxy() 
     assert web_video_url is not None
     assert "img.memexpert.test" not in web_video_url
     assert "pipeline/derived/private/web.mp4" not in web_video_url
+
+
+def test_gif_with_web_video_uses_playback_url_not_static_imgproxy_preview() -> None:
+    file_id = uuid.UUID("11111111-1111-4111-8111-111111111117")
+    settings = Settings.model_validate(
+        {
+            "imgproxy_base_url": "https://img.memexpert.test",
+            "media_public_base_url": "https://media.memexpert.test/files/",
+        }
+    )
+    file = MemeFile(
+        id=file_id,
+        meme_id=uuid.UUID("22222222-2222-4222-8222-222222222228"),
+        s3_original_key="pipeline/originals/animated/source.gif",
+        s3_web_video_key="pipeline/derived/animated/web.mp4",
+        mime_type="image/gif",
+        quality_score=0.7,
+    )
+
+    render = MediaRenderUrlService(settings).build_render(
+        file,
+        context=PublicMediaRenderContext(meme_id=uuid.UUID("22222222-2222-4222-8222-222222222228")),
+    )
+
+    assert render.thumbnail_url is None
+    assert render.preview_url is None
+    assert render.original_url is None
+    assert render.web_video_url == f"https://media.memexpert.test/files/{file_id}/web-video.mp4"
+    assert render.download_url == render.web_video_url

@@ -48,7 +48,8 @@ _MIME_TYPE_TO_EXTENSIONS: dict[str, frozenset[str]] = {
     "video/webm": frozenset({"webm"}),
 }
 _VIDEO_MIME_TYPES = frozenset({"video/mp4", "video/quicktime", "video/webm"})
-_DEFAULT_IMAGE_DURATION_SECONDS = 3.0
+_STATIC_IMAGE_MIME_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
+_WEB_VIDEO_MIME_TYPE = "video/mp4"
 
 
 class SubprocessMediaCommandRunner:
@@ -137,16 +138,21 @@ class PipelineMediaProcessor:
         )
         blur_hash = await asyncio.to_thread(encode_blur_hash, preview_image)
 
+        if inspected_media.mime_type in _STATIC_IMAGE_MIME_TYPES:
+            return NormalizedMediaResult(
+                quality_score=quality_score,
+                blur_hash=blur_hash,
+            )
+
         with tempfile.TemporaryDirectory(prefix="memexpert-media-") as temp_dir:
             temp_path = Path(temp_dir)
             input_path = temp_path / f"input{_suffix_for_filename(filename)}"
             output_path = temp_path / "web.mp4"
             input_path.write_bytes(media_bytes)
 
-            ffmpeg_args = self._ffmpeg_command(
+            ffmpeg_args = self._ffmpeg_web_video_command(
                 input_path=input_path,
                 output_path=output_path,
-                content_type=inspected_media.mime_type,
             )
             result = await self._command_runner.run(
                 ffmpeg_args,
@@ -160,17 +166,11 @@ class PipelineMediaProcessor:
             if not web_video_bytes:
                 raise MediaProcessingError("FFmpeg produced an empty normalized web video.")
 
-            probe = await self._probe_video_file(output_path, expected_mime_type="video/mp4")
-            width = probe.width
-            height = probe.height
-            if width <= 0 or height <= 0:
+            probe = await self._probe_video_file(output_path, expected_mime_type=_WEB_VIDEO_MIME_TYPE)
+            if probe.width <= 0 or probe.height <= 0:
                 raise MediaValidationError("Normalized media dimensions are invalid.")
 
         return NormalizedMediaResult(
-            mime_type="video/mp4",
-            width=width,
-            height=height,
-            file_size_bytes=len(web_video_bytes),
             quality_score=quality_score,
             blur_hash=blur_hash,
             web_video_object_key=build_web_video_object_key(meme_file_id, settings=self._settings),
@@ -355,37 +355,15 @@ class PipelineMediaProcessor:
             )
         return _VideoProbeResult(width=width, height=height)
 
-    def _ffmpeg_command(self, *, input_path: Path, output_path: Path, content_type: str) -> tuple[str, ...]:
+    def _ffmpeg_web_video_command(self, *, input_path: Path, output_path: Path) -> tuple[str, ...]:
         scale_filter = "scale=trunc(iw/2)*2:trunc(ih/2)*2:force_original_aspect_ratio=decrease"
-        if content_type in _VIDEO_MIME_TYPES or content_type == "image/gif":
-            return (
-                self._settings.pipeline_ffmpeg_binary,
-                "-y",
-                "-i",
-                str(input_path),
-                "-vf",
-                f"{scale_filter},fps=15,format=yuv420p",
-                "-an",
-                "-movflags",
-                "+faststart",
-                "-pix_fmt",
-                "yuv420p",
-                "-c:v",
-                "libx264",
-                str(output_path),
-            )
-
         return (
             self._settings.pipeline_ffmpeg_binary,
             "-y",
-            "-loop",
-            "1",
             "-i",
             str(input_path),
-            "-t",
-            f"{_DEFAULT_IMAGE_DURATION_SECONDS:.2f}",
             "-vf",
-            f"{scale_filter},format=yuv420p",
+            f"{scale_filter},fps=15,format=yuv420p",
             "-an",
             "-movflags",
             "+faststart",

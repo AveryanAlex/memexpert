@@ -18,6 +18,8 @@ from memexpert.schemas.content_pipeline import ContentPipelineDispatchEvent
 from memexpert.workers.pipeline_runtime.errors import ForcedTranscodeFailure
 from memexpert.workers.pipeline_runtime.stages.context import PipelineStageHandlerContext
 
+_WEB_VIDEO_MIME_TYPE = "video/mp4"
+
 
 async def run_transcode_stage(
     context: PipelineStageHandlerContext,
@@ -44,13 +46,23 @@ async def run_transcode_stage(
         content_type=stage_context.mime_type,
         media_bytes=original_bytes,
     )
-    await upload_object_bytes(
-        context.storage_client,
-        bucket=storage_settings.bucket,
-        key=normalized.web_video_object_key,
-        body=normalized.web_video_bytes,
-        content_type=normalized.mime_type,
-    )
+
+    has_web_video_key = normalized.web_video_object_key is not None
+    has_web_video_bytes = normalized.web_video_bytes is not None
+    if has_web_video_key != has_web_video_bytes:
+        raise MediaValidationError("Normalized media result has an incomplete web-video derivative.")
+
+    uploaded_web_video_key: str | None = None
+    if normalized.web_video_object_key is not None and normalized.web_video_bytes is not None:
+        await upload_object_bytes(
+            context.storage_client,
+            bucket=storage_settings.bucket,
+            key=normalized.web_video_object_key,
+            body=normalized.web_video_bytes,
+            content_type=_WEB_VIDEO_MIME_TYPE,
+        )
+        uploaded_web_video_key = normalized.web_video_object_key
+
     try:
         async with context.session_factory() as session:
             service = PipelineStageCompletionService(session, settings=context.settings, broker=context.broker)
@@ -61,11 +73,12 @@ async def run_transcode_stage(
                 result=normalized,
             )
     except Exception:
-        await delete_object_if_present(
-            context.storage_client,
-            bucket=storage_settings.bucket,
-            key=normalized.web_video_object_key,
-        )
+        if uploaded_web_video_key is not None:
+            await delete_object_if_present(
+                context.storage_client,
+                bucket=storage_settings.bucket,
+                key=uploaded_web_video_key,
+            )
         raise
 
 

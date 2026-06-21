@@ -56,26 +56,43 @@ class PipelineStageHandlerContext:
     broker: RabbitBrokerProtocol | None = None
 
 
+_WEB_VIDEO_MIME_TYPE = "video/mp4"
+
+
+@dataclass(frozen=True, slots=True)
+class StageMediaSource:
+    """Storage object and MIME type a downstream media stage should read."""
+
+    object_key: str
+    mime_type: str
+
+
+def resolve_stage_media_source(stage_context: PipelineStageWorkContext) -> StageMediaSource:
+    """Resolve the storage object and MIME type a downstream stage should read."""
+
+    if stage_context.web_video_object_key is not None:
+        return StageMediaSource(object_key=stage_context.web_video_object_key, mime_type=_WEB_VIDEO_MIME_TYPE)
+    if stage_context.mime_type is None:
+        raise PipelineIngestError("Pipeline item is missing the media type required for media stage work.")
+    return StageMediaSource(object_key=stage_context.original_object_key, mime_type=stage_context.mime_type)
+
+
 async def load_preview_frame(
     context: PipelineStageHandlerContext,
     stage_context: PipelineStageWorkContext,
 ) -> bytes:
     """Load source media and extract the PNG preview used by image-only stages."""
 
-    source_object_key = stage_context.web_video_object_key or stage_context.original_object_key
-    source_mime_type = stage_context.mime_type
-    if source_mime_type is None:
-        raise PipelineIngestError("Pipeline item is missing the media type required for embed/classify work.")
-
+    source = resolve_stage_media_source(stage_context)
     storage_settings = get_pipeline_storage_settings(context.settings)
     source_bytes = await download_object_bytes(
         context.storage_client,
         bucket=storage_settings.bucket,
-        key=source_object_key,
+        key=source.object_key,
     )
     return await context.media_processor.extract_preview_frame(
-        filename=PurePosixPath(source_object_key).name,
-        content_type=source_mime_type,
+        filename=PurePosixPath(source.object_key).name,
+        content_type=source.mime_type,
         media_bytes=source_bytes,
     )
 
@@ -83,5 +100,7 @@ async def load_preview_frame(
 __all__ = [
     "ObjectStorageClientLike",
     "PipelineStageHandlerContext",
+    "StageMediaSource",
     "load_preview_frame",
+    "resolve_stage_media_source",
 ]

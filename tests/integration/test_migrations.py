@@ -950,6 +950,67 @@ async def test_primary_file_invariant_is_enforced_by_database(
             )
 
 
+async def test_restore_static_image_original_metadata_migration_repairs_polluted_rows(
+    migrated_database: tuple[AsyncEngine, str],
+) -> None:
+    engine, database_url = migrated_database
+    config = _build_alembic_config(database_url)
+
+    await _run_alembic_command(command.upgrade, config, "0026")
+
+    meme_id = uuid.uuid7()
+    file_id = uuid.uuid7()
+    async with engine.begin() as connection:
+        _ = await connection.execute(
+            text(
+                """
+                INSERT INTO memes (
+                    id, media_type, primary_file_id, language, is_nsfw,
+                    like_count, tags, is_public
+                ) VALUES (
+                    :meme_id, 'image', :file_id, 'none', false,
+                    0, ARRAY[]::varchar(64)[], true
+                )
+                """
+            ),
+            {"meme_id": meme_id, "file_id": file_id},
+        )
+        _ = await connection.execute(
+            text(
+                """
+                INSERT INTO meme_files (
+                    id, meme_id, status, mime_type, s3_original_key,
+                    s3_web_video_key, quality_score
+                ) VALUES (
+                    :file_id, :meme_id, 'ready', 'video/mp4',
+                    'pipeline/originals/example/original.jpg',
+                    'pipeline/derived/example/web.mp4', 0.5
+                )
+                """
+            ),
+            {"file_id": file_id, "meme_id": meme_id},
+        )
+
+    await _run_alembic_command(command.upgrade, config, "head")
+
+    async with engine.connect() as connection:
+        row = (
+            await connection.execute(
+                text(
+                    """
+                    SELECT mime_type, s3_web_video_key
+                    FROM meme_files
+                    WHERE id = :file_id
+                    """
+                ),
+                {"file_id": file_id},
+            )
+        ).one()
+
+    assert row.mime_type == "image/jpeg"
+    assert row.s3_web_video_key is None
+
+
 async def test_public_trend_points_migration_downgrade_keeps_existing_trend_views(
     migrated_database: tuple[AsyncEngine, str],
 ) -> None:
