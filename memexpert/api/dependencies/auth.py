@@ -164,18 +164,36 @@ OptionalAccessTokenDep = Annotated[str | None, Depends(get_optional_access_token
 
 
 async def get_optional_current_user(
+    request: Request,
+    response: Response,
     auth_service: AuthServiceDep,
     access_token: OptionalAccessTokenDep,
 ) -> UserRead | None:
-    """Return the current authenticated user when a session cookie is provided."""
+    """Return the canonical authenticated user when a session cookie is provided.
+
+    A valid token for a guest account that was merged into another account
+    is repaired here for every auth-aware endpoint. The same response gets
+    a replacement cookie for the canonical target account, so callers do
+    not need a dedicated refresh route.
+    """
 
     if access_token is None:
         return None
 
+    client_ip = request.client.host if request.client is not None else None
     try:
-        return await auth_service.verify_access_token(access_token)
+        resolution = await auth_service.resolve_access_token(
+            access_token,
+            ip_address=client_ip,
+            user_agent=request.headers.get("user-agent"),
+        )
     except AuthServiceError as exc:
         raise to_auth_http_error(exc) from exc
+
+    if resolution.replacement_session is not None:
+        set_access_cookie(response, resolution.replacement_session.access_token)
+
+    return resolution.user
 
 
 OptionalCurrentUserDep = Annotated[UserRead | None, Depends(get_optional_current_user)]
