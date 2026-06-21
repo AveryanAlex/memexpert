@@ -19,7 +19,6 @@ from memexpert.api.dependencies import (
     DbSessionDep,
     ForbidFullAccountCallerDep,
     GuestUserDep,
-    OptionalAccessTokenDep,
     OptionalCurrentUserDep,
     OptionalGuestUserDep,
     ProviderAuthServiceDep,
@@ -147,44 +146,6 @@ async def read_profile_stats(
     """Return profile stats derived from the caller's persisted analytics events."""
 
     return await analytics_service.profile_stats(user_id=current_user.id)
-
-
-@router.post(
-    "/session/refresh",
-    response_model=CurrentSessionRead,
-    responses=AUTH_ERROR_RESPONSES,
-    summary="Refresh the current web session after external account linking",
-)
-async def refresh_current_session(
-    request: Request,
-    response: Response,
-    access_token: OptionalAccessTokenDep,
-    auth_service: AuthServiceDep,
-    account_link_service: AccountLinkServiceDep,
-) -> CurrentSessionRead:
-    """Replace the browser cookie after Telegram links or merges complete outside the browser."""
-
-    if access_token is None:
-        raise to_auth_http_error(AuthenticatedUserNotFoundError("Access session cookie is required."))
-
-    try:
-        auth_session = await auth_service.refresh_session_from_access_token(
-            access_token,
-            ip_address=_extract_client_ip(request),
-            user_agent=request.headers.get("user-agent"),
-        )
-        linked_providers = await account_link_service.get_linked_providers(user_id=auth_session.user.id)
-    except AuthServiceError as exc:
-        raise to_auth_http_error(exc) from exc
-    except UserNotFoundError as exc:
-        raise to_auth_http_error(
-            AuthenticatedUserNotFoundError(
-                f"Authenticated user {auth_session.user.id} no longer exists.",
-            )
-        ) from exc
-
-    set_access_cookie(response, auth_session.access_token)
-    return _build_current_session_read(auth_session.user, linked_providers)
 
 
 @router.post(

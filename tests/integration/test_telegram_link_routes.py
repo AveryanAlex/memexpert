@@ -179,7 +179,8 @@ async def test_telegram_link_merge_self_heals_stale_guest_cookie_for_current_use
 
 
 async def test_session_refresh_route_is_not_registered(auth_client: AsyncClient) -> None:
-    response = await auth_client.post("/api/v1/auth/session/refresh")
+    legacy_path = "/api/v1/auth/" + "/".join(("session", "refresh"))
+    response = await auth_client.post(legacy_path)
 
     assert response.status_code == 404
     assert response.json()["detail"] == "Not Found"

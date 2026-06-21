@@ -239,45 +239,6 @@ class AuthService:
             migrated_from_user_id=migrated_from_user_id,
         )
 
-    async def refresh_session_from_access_token(
-        self,
-        access_token: str,
-        *,
-        ip_address: str | None = None,
-        user_agent: str | None = None,
-    ) -> AuthSession:
-        """Issue a fresh cookie session for a browser returning from an external link flow.
-
-        Normal verification reloads the current user row and derives account type from
-        linked identities instead of trusting a stale token claim. This refresh path is
-        narrower: it still requires a valid, unexpired cookie token and matching nonce
-        for surviving users, while also handling guest rows merged into existing full accounts.
-        When the guest was merged into an existing full account, the merge audit log is
-        used to move the browser session to the canonical target account.
-        """
-
-        user_id, claimed_nonce = self._decode_subject_and_nonce(access_token)
-        current_user = await self._get_user_by_id_or_none(user_id)
-
-        if current_user is None:
-            current_user = await self._get_latest_merge_target_for_guest(user_id)
-            if current_user is None:
-                raise AuthenticatedUserNotFoundError(
-                    f"Authenticated user {user_id} no longer exists.",
-                )
-        elif current_user.token_nonce != claimed_nonce:
-            raise InvalidTokenError(
-                "Session has been revoked; please sign in again.",
-            )
-
-        self._ensure_account_is_available(current_user)
-        return await self.issue_session_for_user(
-            current_user,
-            ip_address=ip_address,
-            user_agent=user_agent,
-            reload_user=False,
-        )
-
     async def _get_user_by_id(self, user_id: uuid.UUID) -> UserRead:
         user = await self._get_user_by_id_or_none(user_id)
         if user is None:
