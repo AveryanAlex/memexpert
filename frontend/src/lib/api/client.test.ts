@@ -47,7 +47,6 @@ import {
   recordMemeImpression,
   recordMemeShare,
   regenerateMemeSeoPage,
-  refreshCurrentSession,
   removeCollectionMember,
   removeMemeFromCollection,
   removeSavedMeme,
@@ -627,36 +626,29 @@ describe('catalog API client', () => {
     expect(responses[0].headers.get('set-cookie')).toContain('memexpert_access_token=new');
   });
 
-  it('starts and refreshes Telegram linking without token payloads', async () => {
+  it('starts Telegram linking without token payloads', async () => {
     const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = new URL(String(input));
       const method = init?.method ?? 'GET';
       const headers = new Headers(init?.headers);
 
-      if (url.pathname === '/api/v1/auth/link/telegram') {
-        expect(method).toBe('POST');
-        expect(headers.get('x-requested-with')).toBe('XMLHttpRequest');
-        return jsonResponse({
-          code: 'abc123',
-          deep_link_url: 'https://t.me/memexpertbot?start=link_abc123',
-          expires_at: '2026-06-12T12:00:00Z',
-          expires_in_seconds: 600,
-          return_url: 'https://memexpert.test/account/telegram'
-        });
-      }
-
-      expect(url.pathname).toBe('/api/v1/auth/session/refresh');
+      expect(url.pathname).toBe('/api/v1/auth/link/telegram');
       expect(method).toBe('POST');
       expect(headers.get('x-requested-with')).toBe('XMLHttpRequest');
-      return jsonResponse(sessionPayload('full'));
+      return jsonResponse({
+        code: 'abc123',
+        deep_link_url: 'https://t.me/memexpertbot?start=link_abc123',
+        expires_at: '2026-06-12T12:00:00Z',
+        expires_in_seconds: 600,
+        return_url: 'https://memexpert.test/account/telegram/complete'
+      });
     }) satisfies ApiFetch;
 
     const link = await startTelegramLink({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test' });
-    const refreshed = await refreshCurrentSession({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test' });
 
     expect(link.deep_link_url).toContain('https://t.me/');
-    expect(refreshed.user.account_type).toBe('full');
-    expect('access_token' in refreshed).toBe(false);
+    expect(link.return_url).toBe('https://memexpert.test/account/telegram/complete');
+    expect(mockFetch).toHaveBeenCalledOnce();
   });
 
   it('saves a favorite through cookie-only transport', async () => {

@@ -251,10 +251,6 @@ export async function fetchProfileStats(request: CatalogRequest): Promise<Profil
   return apiGet<ProfileStatsRead>('/api/v1/auth/profile-stats', new URLSearchParams(), request);
 }
 
-export async function refreshCurrentSession(request: CatalogRequest): Promise<CurrentSessionRead> {
-  return apiJson<CurrentSessionRead>('/api/v1/auth/session/refresh', undefined, request, { method: 'POST' });
-}
-
 export async function startTelegramLink(request: CatalogRequest): Promise<TelegramLinkStartRead> {
   return apiJson<TelegramLinkStartRead>('/api/v1/auth/link/telegram', undefined, request, { method: 'POST' });
 }
