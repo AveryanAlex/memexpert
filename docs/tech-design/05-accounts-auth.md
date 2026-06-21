@@ -26,7 +26,7 @@ Custom JWT auth in FastAPI. No third-party auth service — Telegram Login Widge
 
 Access token payload includes `sub` (user ID), account type/state claims, `exp`, `iat`, and `nonce`. Signed with HS256 or configured algorithm.
 
-`/auth/session/refresh` issues a fresh cookie session from a still-valid access/session cookie. The refresh path also handles the narrow guest→full transition after linking/merge. There is no `RefreshToken` table in the current MVP design.
+Auth-aware FastAPI dependencies resolve access/session cookies through a shared auth resolver. A valid, unexpired cookie whose `sub` points at a guest account retired by an `AccountMergeLog` entry is automatically replaced with a cookie for the canonical merged account on that same response. Invalid, expired, revoked, or unrelated deleted-user tokens remain rejected. There is no manual session-refresh endpoint and no `RefreshToken` table in the current MVP design.
 
 ## Auth Providers
 
@@ -60,7 +60,7 @@ When a guest links to an existing full account (e.g., already used the TG bot), 
 
 Linking flows:
 
-- **Web → Telegram:** "Link Telegram" button → deep link `t.me/memexpertbot?start=link_{code}` → merge
+- **Web → Telegram:** "Link Telegram" button → deep link `t.me/memexpertbot?start=link_{code}` → merge → return to `/account/telegram/complete`, where the normal session load self-heals the cookie and redirects linked sessions onward
 - **Web → Google/Email:** OAuth / email sign-in → upgrade or merge
 - **Mini App:** validate `initData` HMAC → lookup/create by `telegram_id`
 

@@ -222,7 +222,7 @@ async def test_telegram_link_start_route_returns_typed_config_errors_before_pers
         "AUTH_REFRESH_COOKIE_SECURE": "true",
         "SECURITY_RATE_LIMIT_ENABLED": "false",
         "AUTH_TELEGRAM_BOT_USERNAME": "memexpertbot",
-        "AUTH_TELEGRAM_LINK_RETURN_URL": "https://memexpert.test/link/telegram/complete",
+        "AUTH_TELEGRAM_LINK_RETURN_URL": "https://memexpert.test/account/telegram/complete",
     }
 
     for key, value in base_env.items():
@@ -308,7 +308,7 @@ async def test_account_link_service_rejects_invalid_telegram_link_ttl_before_iss
             migrated_db_session,
             telegram_link_bot_username="memexpertbot",
             telegram_link_code_ttl_seconds=0,
-            telegram_link_return_url="https://memexpert.test/link/telegram/complete",
+            telegram_link_return_url="https://memexpert.test/account/telegram/complete",
         )
 
 
@@ -321,7 +321,7 @@ async def test_account_link_service_redeem_rejects_expired_and_replayed_codes_ex
         migrated_db_session,
         telegram_link_bot_username="memexpertbot",
         telegram_link_code_ttl_seconds=600,
-        telegram_link_return_url="https://memexpert.test/link/telegram/complete",
+        telegram_link_return_url="https://memexpert.test/account/telegram/complete",
     )
     identity = TelegramIdentity(telegram_id=987654321, auth_date=utcnow())
 
@@ -359,7 +359,7 @@ async def test_account_link_service_redeem_rejects_unknown_codes_explicitly(
         migrated_db_session,
         telegram_link_bot_username="memexpertbot",
         telegram_link_code_ttl_seconds=600,
-        telegram_link_return_url="https://memexpert.test/link/telegram/complete",
+        telegram_link_return_url="https://memexpert.test/account/telegram/complete",
     )
 
     with pytest.raises(AccountLinkInvariantError, match="invalid"):

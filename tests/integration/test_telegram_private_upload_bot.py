@@ -54,7 +54,7 @@ def _analytics_refs(event: AnalyticsEvent) -> dict[str, object]:
 
 BOT_TOKEN = "123456:telegram-upload-test-bot-token"
 BOT_USERNAME = "memexpertbot"
-RETURN_URL = "https://memexpert.test/link/telegram/complete"
+RETURN_URL = "https://memexpert.test/account/telegram/complete"
 JWT_SECRET = "upload-test-auth-secret-with-32-byte-minimum"
 TELEGRAM_ID = 880_220_330
 

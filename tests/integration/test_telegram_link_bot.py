@@ -47,7 +47,7 @@ def _analytics_properties(event: AnalyticsEvent) -> dict[str, object]:
 
 BOT_TOKEN = "123456:telegram-route-test-bot-token"
 BOT_USERNAME = "memexpertbot"
-RETURN_URL = "https://memexpert.test/link/telegram/complete"
+RETURN_URL = "https://memexpert.test/account/telegram/complete"
 PASSWORD = "correct-horse-battery"
 TELEGRAM_ID = 777_888_999
 JWT_SECRET = "route-test-auth-secret-with-32-byte-minimum"
