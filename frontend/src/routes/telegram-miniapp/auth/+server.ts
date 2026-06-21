@@ -11,7 +11,8 @@ export const POST: RequestHandler = async ({ cookies, fetch, request }) => {
 
   const headers = new Headers({
     accept: 'application/json',
-    'content-type': 'application/json'
+    'content-type': 'application/json',
+    'x-requested-with': 'XMLHttpRequest'
   });
   const cookie = request.headers.get('cookie');
   if (cookie) {

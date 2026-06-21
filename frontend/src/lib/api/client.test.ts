@@ -631,9 +631,11 @@ describe('catalog API client', () => {
     const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = new URL(String(input));
       const method = init?.method ?? 'GET';
+      const headers = new Headers(init?.headers);
 
       if (url.pathname === '/api/v1/auth/link/telegram') {
         expect(method).toBe('POST');
+        expect(headers.get('x-requested-with')).toBe('XMLHttpRequest');
         return jsonResponse({
           code: 'abc123',
           deep_link_url: 'https://t.me/memexpertbot?start=link_abc123',
@@ -645,6 +647,7 @@ describe('catalog API client', () => {
 
       expect(url.pathname).toBe('/api/v1/auth/session/refresh');
       expect(method).toBe('POST');
+      expect(headers.get('x-requested-with')).toBe('XMLHttpRequest');
       return jsonResponse(sessionPayload('full'));
     }) satisfies ApiFetch;
 

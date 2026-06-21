@@ -18,6 +18,7 @@ describe('/telegram-miniapp/auth proxy route', () => {
       expect(init?.method).toBe('POST');
       expect(headers.get('accept')).toBe('application/json');
       expect(headers.get('content-type')).toBe('application/json');
+      expect(headers.get('x-requested-with')).toBe('XMLHttpRequest');
       expect(headers.get('cookie')).toBe('memexpert_access_token=old');
       expect(JSON.parse(String(init?.body))).toEqual({ initData: 'query_id=abc&user=%7B%7D' });
 

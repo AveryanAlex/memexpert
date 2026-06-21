@@ -866,7 +866,11 @@ async function apiJson<T>(
     url.search = params.toString();
   }
 
-  const headers = new Headers({ accept: 'application/json' });
+  const headers = new Headers(init.headers);
+  headers.set('accept', 'application/json');
+  if (isUnsafeMethod(init.method)) {
+    headers.set('x-requested-with', 'XMLHttpRequest');
+  }
   if (request.cookieHeader) {
     headers.set('cookie', request.cookieHeader);
   }
@@ -880,6 +884,11 @@ async function apiJson<T>(
   }
 
   return payload as T;
+}
+
+function isUnsafeMethod(method: string | undefined): boolean {
+  const normalizedMethod = (method ?? 'GET').toUpperCase();
+  return normalizedMethod !== 'GET' && normalizedMethod !== 'HEAD' && normalizedMethod !== 'OPTIONS';
 }
 
 async function apiMutation<T>(path: string, method: 'DELETE' | 'POST', request: MemeActionRequest): Promise<T> {
