@@ -43,7 +43,7 @@
       <ActionLink variant="secondary" href={data.returnTo}>Back to memes</ActionLink>
     {:else}
       <h2 class="m-0 text-2xl font-black tracking-[-0.04em]">Start from this guest session</h2>
-      <p class="m-0 text-muted">Use the Telegram bot link, finish there, then come back and refresh this page.</p>
+      <p class="m-0 text-muted">Use the Telegram bot link, finish there, then return to MemeXpert. Your next page load updates this browser automatically.</p>
 
       <form method="POST" action="?/start" class="my-3 grid gap-2">
         <Button type="submit">Start Telegram link</Button>
@@ -56,10 +56,6 @@
           <p class="m-0 text-muted">This link expires in about {Math.ceil(link.expires_in_seconds / 60)} minutes.</p>
         </div>
       {/if}
-
-      <form method="POST" action="?/refresh" class="my-3 grid gap-2">
-        <Button type="submit" variant="secondary">I finished in Telegram, refresh my session</Button>
-      </form>
 
       {#if message}
         <Notice>{message}</Notice>
