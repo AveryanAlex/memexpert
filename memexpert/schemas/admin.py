@@ -223,11 +223,11 @@ class AdminTelegramSessionRead(ORMSchema):
 
 
 class AdminTelegramSessionCreateRequest(BaseModel):
-    """Create a DB-backed Telegram session row before browser-admin login."""
+    """Create a DB-backed Telegram login shell before account-derived naming."""
 
     model_config = ConfigDict(extra="forbid")
 
-    name: str = Field(min_length=1, max_length=MAX_TELEGRAM_SESSION_NAME_LENGTH)
+    name: str | None = Field(default=None, min_length=1, max_length=MAX_TELEGRAM_SESSION_NAME_LENGTH)
     display_name: str | None = Field(default=None, max_length=MAX_SOURCE_TITLE_LENGTH)
     enabled: StrictBool = True
     live_enabled: StrictBool = True
@@ -238,8 +238,8 @@ class AdminTelegramSessionCreateRequest(BaseModel):
 
     @field_validator("name")
     @classmethod
-    def _normalize_name(cls, value: str) -> str:
-        return normalize_required_text(value)
+    def _normalize_name(cls, value: str | None) -> str | None:
+        return normalize_optional_text(value)
 
     @field_validator("display_name")
     @classmethod

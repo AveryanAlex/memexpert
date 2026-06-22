@@ -20,7 +20,9 @@ describe('/admin/telegram page', () => {
     expect(body).not.toContain('StringSession');
     expect(body).not.toContain('name="string_session"');
     expect(body).not.toContain('name="account_user_id"');
-    expect(body).toContain('action="?/createSession"');
+    expect(body).toContain('Start New Login');
+    expect(body).not.toContain('action="?/createSession"');
+    expect(body).not.toContain('Stable operator-facing key');
     expect(body).toContain('action="?/startQrLogin"');
     expect(body).toContain('action="?/completeQrLogin"');
     expect(body).toContain('action="?/startPhoneLogin"');

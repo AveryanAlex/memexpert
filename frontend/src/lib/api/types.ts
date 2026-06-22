@@ -615,7 +615,7 @@ export interface AdminTelegramChannelGroupRead {
 }
 
 export interface AdminTelegramSessionCreatePayload {
-  name: string;
+  name?: string | null;
   display_name?: string | null;
   enabled: boolean;
   live_enabled: boolean;

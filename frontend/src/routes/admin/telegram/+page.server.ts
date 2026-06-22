@@ -61,18 +61,9 @@ export const actions: Actions = {
     return runAction(async () => {
       await createAdminTelegramSession({
         ...apiRequest(fetch, request),
-        body: {
-          name: readRequired(data, 'name'),
-          display_name: readOptional(data, 'display_name'),
-          enabled: data.get('enabled') === 'on',
-          live_enabled: data.get('live_enabled') === 'on',
-          catchup_enabled: data.get('catchup_enabled') === 'on',
-          engagement_enabled: data.get('engagement_enabled') === 'on',
-          max_requests_per_second: readFloat(data, 'max_requests_per_second', 1),
-          note: readOptional(data, 'note')
-        }
+        body: telegramSessionCreateBody(data)
       });
-      return { message: 'Telegram session created. Start QR or phone login from the session card.' };
+      return { message: 'Telegram login slot created. Start QR or phone login from the session card.' };
     });
   },
   updateSession: async ({ fetch, request }) => {
@@ -104,9 +95,10 @@ export const actions: Actions = {
   },
   startQrLogin: async ({ fetch, request }) => {
     const data = await request.formData();
-    const sessionId = readRequired(data, 'session_id');
     return runAction(async () => {
-      const result = await startAdminTelegramQrLogin(apiRequest(fetch, request), sessionId);
+      const api = apiRequest(fetch, request);
+      const sessionId = await ensureLoginSessionId(api, data);
+      const result = await startAdminTelegramQrLogin(api, sessionId);
       return {
         message: `QR login started. Scan ${result.qr_url}, then complete attempt ${result.attempt_id}. Expires at ${result.expires_at}.`,
         kind: 'qr' as const,
@@ -132,11 +124,12 @@ export const actions: Actions = {
   },
   startPhoneLogin: async ({ fetch, request }) => {
     const data = await request.formData();
-    const sessionId = readRequired(data, 'session_id');
     return runAction(async () => {
+      const api = apiRequest(fetch, request);
+      const sessionId = await ensureLoginSessionId(api, data);
       const result = await startAdminTelegramPhoneLogin(
         {
-          ...apiRequest(fetch, request),
+          ...api,
           body: { phone_number: readRequired(data, 'phone_number'), note: readOptional(data, 'note') }
         },
         sessionId
@@ -323,6 +316,35 @@ export const actions: Actions = {
     });
   }
 };
+
+async function ensureLoginSessionId(api: ReturnType<typeof apiRequest>, data: FormData): Promise<string> {
+  const existingSessionId = readOptional(data, 'session_id');
+  if (existingSessionId) {
+    return existingSessionId;
+  }
+  const created = await createAdminTelegramSession({
+    ...api,
+    body: telegramSessionCreateBody(data)
+  });
+  return created.id;
+}
+
+function telegramSessionCreateBody(data: FormData) {
+  return {
+    name: readOptional(data, 'name'),
+    display_name: readOptional(data, 'display_name'),
+    enabled: readCheckbox(data, 'enabled', true),
+    live_enabled: readCheckbox(data, 'live_enabled', true),
+    catchup_enabled: readCheckbox(data, 'catchup_enabled', true),
+    engagement_enabled: readCheckbox(data, 'engagement_enabled', true),
+    max_requests_per_second: readFloat(data, 'max_requests_per_second', 1),
+    note: readOptional(data, 'note')
+  };
+}
+
+function readCheckbox(data: FormData, name: string, fallback: boolean): boolean {
+  return data.has(name) ? data.get(name) === 'on' : fallback;
+}
 
 async function runAction<T extends { message: string }>(operation: () => Promise<T>) {
   try {

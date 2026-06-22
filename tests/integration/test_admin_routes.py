@@ -110,6 +110,8 @@ class _FakeQrLogin:
 class _FakeTelegramUser:
     id = 777000
     username = "validated_admin_session"
+    first_name = "Validated"
+    last_name = "Admin"
     phone = "+10000007000"
 
 
@@ -1199,14 +1201,12 @@ async def test_admin_telegram_session_lifecycle_validates_without_leaking_string
         create_response = await admin_client.post(
             "/api/v1/admin/telegram/sessions",
             json={
-                "name": "primary-admin-session",
-                "display_name": "Primary Admin Session",
                 "max_requests_per_second": 2.5,
             },
         )
         create_auth_required_response = await admin_client.post(
             "/api/v1/admin/telegram/sessions",
-            json={"name": "auth-required-session", "display_name": "Auth Required Session"},
+            json={},
         )
         session_id = create_response.json()["id"]
         phone_start_response = await admin_client.post(
@@ -1250,6 +1250,8 @@ async def test_admin_telegram_session_lifecycle_validates_without_leaking_string
     assert create_response.status_code == 201
     create_payload = create_response.json()
     assert create_payload["status"] == "auth_required"
+    assert create_payload["name"].startswith("pending_telegram_")
+    assert create_payload["display_name"] == "Pending Telegram login"
     assert create_payload["has_string_session"] is False
     assert create_payload["account_user_id"] is None
     assert create_payload["owned_channel_count"] == 0
@@ -1260,6 +1262,7 @@ async def test_admin_telegram_session_lifecycle_validates_without_leaking_string
     assert create_auth_required_response.status_code == 201
     auth_required_payload = create_auth_required_response.json()
     assert auth_required_payload["status"] == "auth_required"
+    assert auth_required_payload["name"].startswith("pending_telegram_")
     assert auth_required_payload["has_string_session"] is False
 
     assert phone_start_response.status_code == 200
@@ -1272,6 +1275,8 @@ async def test_admin_telegram_session_lifecycle_validates_without_leaking_string
     phone_code_payload = phone_code_response.json()
     assert phone_code_payload["password_required"] is False
     assert phone_code_payload["telegram_session"]["status"] == "active"
+    assert phone_code_payload["telegram_session"]["name"] == "telegram_777000"
+    assert phone_code_payload["telegram_session"]["display_name"] == "Validated Admin"
     assert phone_code_payload["telegram_session"]["has_string_session"] is True
     assert phone_code_payload["telegram_session"]["account_user_id"] == 777000
     assert phone_code_payload["telegram_session"]["account_username"] == "validated_admin_session"
@@ -1307,10 +1312,12 @@ async def test_admin_telegram_session_lifecycle_validates_without_leaking_string
     assert checked_channel_references == ["@validated_channel"]
 
     assert list_response.status_code == 200
-    list_payload = {item["name"]: item for item in list_response.json()}
-    assert list_payload["primary-admin-session"]["owned_channel_count"] == 1
-    assert list_payload["primary-admin-session"]["has_string_session"] is True
-    assert list_payload["auth-required-session"]["has_string_session"] is False
+    list_payload = {item["id"]: item for item in list_response.json()}
+    assert list_payload[session_id]["name"] == "telegram_777000"
+    assert list_payload[session_id]["display_name"] == "Validated Admin"
+    assert list_payload[session_id]["owned_channel_count"] == 1
+    assert list_payload[session_id]["has_string_session"] is True
+    assert list_payload[auth_required_payload["id"]]["has_string_session"] is False
     assert raw_string_session not in list_response.text
     assert full_phone_number not in list_response.text
     assert "encrypted_string_session" not in list_response.text
@@ -1331,6 +1338,8 @@ async def test_admin_telegram_session_lifecycle_validates_without_leaking_string
     assert persisted is not None
     assert persisted.encrypted_string_session is not None
     assert persisted.encrypted_string_session != raw_string_session
+    assert persisted.name == "telegram_777000"
+    assert persisted.display_name == "Validated Admin"
     assert persisted.account_user_id == 777000
     assert persisted.account_username == "validated_admin_session"
     assert login_attempt is not None
@@ -1388,7 +1397,7 @@ async def test_admin_telegram_phone_login_supports_2fa_password_without_leaking_
         admin_client.cookies.set(ACCESS_COOKIE_NAME, admin_token)
         create_response = await admin_client.post(
             "/api/v1/admin/telegram/sessions",
-            json={"name": "two-fa-session", "display_name": "2FA Session"},
+            json={},
         )
         session_id = create_response.json()["id"]
         phone_start_response = await admin_client.post(
@@ -1418,6 +1427,8 @@ async def test_admin_telegram_phone_login_supports_2fa_password_without_leaking_
     password_payload = password_response.json()
     assert password_payload["password_required"] is False
     assert password_payload["telegram_session"]["status"] == "active"
+    assert password_payload["telegram_session"]["name"] == "telegram_777000"
+    assert password_payload["telegram_session"]["display_name"] == "Validated Admin"
     assert password_payload["telegram_session"]["has_string_session"] is True
     assert password_payload["telegram_session"]["account_phone_hint"] == "ending-7000"
     assert password not in password_response.text
@@ -1443,6 +1454,8 @@ async def test_admin_telegram_phone_login_supports_2fa_password_without_leaking_
     assert persisted is not None
     assert persisted.encrypted_string_session is not None
     assert persisted.encrypted_string_session != "authorized-telegram-login-session"
+    assert persisted.name == "telegram_777000"
+    assert persisted.display_name == "Validated Admin"
     assert login_attempt is not None
     assert login_attempt.status == "completed"
     assert login_attempt.encrypted_temp_string_session is None

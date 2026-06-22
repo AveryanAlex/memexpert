@@ -86,23 +86,22 @@ admin browser cookie from SvelteKit to the API.
 
 ### Sessions
 
-Before the runtime can ingest Telegram content, create one DB-backed Telegram
-session shell for each account the manager should run. In the "Create Session"
-panel:
+Before the runtime can ingest Telegram content, start a browser-admin login for
+each account the manager should run. In the "Start New Login" panel:
 
-- Enter the stable session name, display name, crawler policy toggles, and max
-  requests/sec. The new row starts in `auth_required` and is not runnable until
-  browser-admin login stores a valid Telegram session key.
-- In the session card, use **QR login** to start an attempt, scan the returned
+- Use **QR login** to create a temporary session shell, scan the returned
   Telegram URL from a logged-in Telegram app, then complete the attempt id.
-- Or use **Phone + code login** to send a code to the account phone, complete
-  the same attempt id with the Telegram code, and, when Telegram requires it,
-  finish with the **2FA password** form.
+- Or use **Phone login** to create a temporary session shell and send a code to
+  the account phone. Complete the same attempt id with the Telegram code and,
+  when Telegram requires it, finish with the **2FA password** form.
 - Successful login stores the authorized Telethon session encrypted in the DB,
-  updates the account projection from Telegram, clears parked/error state, and
-  marks the session `active`.
-- Keep `enabled`, catch-up, live, engagement, and max requests/sec aligned with
-  the environment. A session can still be visible while disabled or parked.
+  renames the session to `telegram_<telegram_user_id>`, sets `display_name` from
+  the Telegram profile name, updates account projection, clears parked/error
+  state, and marks the session `active`.
+- Login-created sessions start with default crawler controls enabled and
+  `max_requests_per_second=1`. Use "Patch policy/status" after login if an
+  environment needs different catch-up, live, engagement, enabled, or rate-limit
+  settings.
 - Use "Validate access" on an existing session to decrypt the stored secret,
   validate it with Telegram, and optionally check access to a selected source
   channel.
@@ -171,9 +170,9 @@ recorded.
 
 ### Browser admin vs crawler API
 
-Use browser admin for CRUD and assignment: create/import/validate/patch/delete
-sessions, add channels, move channels between sessions, orphan channels, and
-edit indexing controls. Use the operator-token `/api/v1/crawler/*` endpoints
+Use browser admin for login, validation, patch/delete, and assignment: start
+session logins, add channels, move channels between sessions, orphan channels,
+and edit indexing controls. Use the operator-token `/api/v1/crawler/*` endpoints
 for runtime tasks: list the runtime projection, pause/resume channels, replay
 one Telegram post, and read freshness snapshots. Browser admin is the preferred
 surface for session and channel management.

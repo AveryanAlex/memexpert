@@ -1062,7 +1062,7 @@ describe('admin API client', () => {
     await createAdminTelegramSession({
       fetch: mockFetch,
       baseUrl: 'https://api.memexpert.test',
-      body: { name: 'primary', enabled: true, live_enabled: true, catchup_enabled: true, engagement_enabled: true, max_requests_per_second: 1 }
+      body: { enabled: true, live_enabled: true, catchup_enabled: true, engagement_enabled: true, max_requests_per_second: 1 }
     });
     await updateAdminTelegramSession(
       { fetch: mockFetch, baseUrl: 'https://api.memexpert.test', body: { enabled: false, status: 'quarantined', max_requests_per_second: 0.5, clear_error: true, note: 'pause' } },
@@ -1108,7 +1108,8 @@ describe('admin API client', () => {
     expect([1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 14, 15].every((index) => calls[index]?.requestedWith === 'XMLHttpRequest')).toBe(true);
     expect(calls[10].requestedWith).toBe(null);
     expect(calls[11].requestedWith).toBe(null);
-    expect(calls[1].body).toMatchObject({ name: 'primary', enabled: true });
+    expect(calls[1].body).toMatchObject({ enabled: true });
+    expect(calls[1].body).not.toHaveProperty('name');
     expect(calls[1].body).not.toHaveProperty('string_session');
     expect(calls[4].body).toEqual({ attempt_id: 'qr-attempt', note: 'qr done' });
     expect(calls[5].body).toEqual({ phone_number: '+15551234567', note: 'send code' });

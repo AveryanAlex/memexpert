@@ -84,25 +84,21 @@
 {/if}
 
 <div class="my-5 grid gap-4 xl:grid-cols-[minmax(340px,0.75fr)_minmax(0,1.25fr)]">
-  <AdminPanel title="Create Session">
-    <p class="m-0 text-sm text-muted">Create the crawler policy row first, then authenticate it from the session card with Telegram QR or phone-code login.</p>
-    <form method="POST" action="?/createSession" class="grid gap-3">
-      <div class="grid gap-3 md:grid-cols-2">
-        <FormRow label="Name" hint="Stable operator-facing key."><Input name="name" maxlength={64} placeholder="primary_ingest" required /></FormRow>
-        <FormRow label="Display name"><Input name="display_name" placeholder="Primary ingest account" /></FormRow>
-      </div>
-      <div class="grid gap-3 md:grid-cols-2">
-        <FormRow label="Max requests/sec"><Input name="max_requests_per_second" type="number" min="0.1" step="0.1" value="1" required /></FormRow>
-        <FormRow label="Audit note"><Input name="note" placeholder="why this session is being added" /></FormRow>
-      </div>
-      <div class="grid gap-2 rounded-2xl border border-line bg-soft/40 p-3 md:grid-cols-2">
-        <label class="inline-flex items-center gap-2 text-chiptext"><input name="enabled" type="checkbox" checked /> Enabled</label>
-        <label class="inline-flex items-center gap-2 text-chiptext"><input name="catchup_enabled" type="checkbox" checked /> Catch-up enabled</label>
-        <label class="inline-flex items-center gap-2 text-chiptext"><input name="live_enabled" type="checkbox" checked /> Live enabled</label>
-        <label class="inline-flex items-center gap-2 text-chiptext"><input name="engagement_enabled" type="checkbox" checked /> Engagement enabled</label>
-      </div>
-      <Button type="submit">Create session</Button>
-    </form>
+  <AdminPanel title="Start New Login">
+    <p class="m-0 text-sm text-muted">Authenticate with Telegram only. MemeExpert creates the session row automatically, names it from the Telegram user id, and sets the display name from the Telegram profile.</p>
+    <div class="grid gap-3 md:grid-cols-2">
+      <form method="POST" action="?/startQrLogin" class="grid content-start gap-3 rounded-2xl border border-line bg-soft/40 p-3">
+        <strong>QR login</strong>
+        <p class="m-0 text-sm text-muted">Start a new session and scan the Telegram QR URL from the success notice.</p>
+        <Button type="submit" variant="secondary">Start QR login</Button>
+      </form>
+      <form method="POST" action="?/startPhoneLogin" class="grid content-start gap-3 rounded-2xl border border-line bg-soft/40 p-3">
+        <strong>Phone login</strong>
+        <p class="m-0 text-sm text-muted">Start a new session by sending a Telegram login code. The full phone number is never rendered back.</p>
+        <FormRow label="Phone number"><Input name="phone_number" autocomplete="tel" placeholder="+15551234567" required /></FormRow>
+        <Button type="submit" variant="secondary">Send code</Button>
+      </form>
+    </div>
   </AdminPanel>
 
   <AdminPanel title="Add Telegram Channel">
@@ -137,7 +133,7 @@
 
 <AdminPanel title="Sessions">
   {#if data.telegramAdmin.sessions.length === 0}
-    <EmptyState title="No Telegram sessions" message="Create and authenticate a session before assigning indexable Telegram channels." />
+    <EmptyState title="No Telegram sessions" message="Start QR or phone login; the session name is derived automatically after Telegram login succeeds." />
   {:else}
     <div class="grid gap-4">
       {#each data.telegramAdmin.sessions as session (session.id)}

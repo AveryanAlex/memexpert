@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -89,7 +90,6 @@ from memexpert.services.engagement_read_model import load_derived_popularity_sco
 from memexpert.services.meme_seo import MemeSeoGenerationService
 
 if TYPE_CHECKING:
-    import uuid
     from collections.abc import Iterable
     from datetime import datetime
     from typing import Literal
@@ -105,6 +105,14 @@ MAX_AUDIT_SNAPSHOT_IDS = 25
 ADMIN_MANUAL_SEO_PROVENANCE = "admin-manual"
 MAX_SEO_TAG_LENGTH = 64
 MAX_TELEGRAM_ERROR_TEXT_LENGTH = 4000
+PENDING_TELEGRAM_SESSION_NAME_PREFIX = "pending_telegram_"
+PENDING_TELEGRAM_SESSION_DISPLAY_NAME = "Pending Telegram login"
+
+
+def pending_telegram_session_name() -> str:
+    """Return a temporary unique key until login derives the Telegram user id."""
+
+    return f"{PENDING_TELEGRAM_SESSION_NAME_PREFIX}{uuid.uuid7().hex}"
 
 
 class AdminServiceError(Exception):
@@ -277,9 +285,11 @@ class AdminService:
         *,
         admin_user_id: uuid.UUID,
     ) -> AdminTelegramSessionRead:
+        session_name = request.name or pending_telegram_session_name()
+        display_name = request.display_name or request.name or PENDING_TELEGRAM_SESSION_DISPLAY_NAME
         row = TelegramSession(
-            name=request.name,
-            display_name=request.display_name or request.name,
+            name=session_name,
+            display_name=display_name,
             encrypted_string_session=None,
             account_user_id=None,
             account_username=None,
@@ -307,7 +317,7 @@ class AdminService:
             await self.session.commit()
         except IntegrityError as exc:
             await self.session.rollback()
-            raise AdminConflictError(f"Telegram session {request.name!r} already exists.") from exc
+            raise AdminConflictError(f"Telegram session {session_name!r} already exists.") from exc
         await self.session.refresh(row)
         return self._telegram_session_read(row, owned_channel_count=0)
 

@@ -16,6 +16,7 @@ from memexpert.models.base import utcnow
 from memexpert.models.content import TelegramSession, TelegramSessionLoginAttempt
 from memexpert.models.enums import TelegramSessionStatus
 from memexpert.schemas.admin import (
+    MAX_SOURCE_TITLE_LENGTH,
     AdminTelegramLoginCompleteRead,
     AdminTelegramLoginPasswordRequest,
     AdminTelegramLoginPhoneCodeRequest,
@@ -41,6 +42,7 @@ if TYPE_CHECKING:
 
 LOGIN_ATTEMPT_TTL = timedelta(minutes=10)
 _PASSWORD_REQUIRED_ERROR_CLASS = "SessionPasswordNeededError"
+_DERIVED_SESSION_NAME_PREFIX = "telegram_"
 
 
 class TelegramLoginClient(Protocol):
@@ -365,7 +367,11 @@ class AdminTelegramLoginService:
             previous_values = self._admin_service._telegram_session_snapshot(row)
             me = await _maybe_await(client.get_me())
             account = _account_projection_from_me(me)
+            derived_name = _session_name_from_account(account)
+            await self._ensure_session_name_available(row, derived_name)
             row.encrypted_string_session = await self._encrypt_required_client_session(client)
+            row.name = derived_name
+            row.display_name = _display_name_from_me(me, account)
             row.account_user_id = account.user_id
             row.account_username = account.username
             row.account_phone_hint = account.phone_hint
@@ -389,6 +395,11 @@ class AdminTelegramLoginService:
                 note=note,
             )
             await self.session.commit()
+        except AdminConflictError as exc:
+            _LIVE_LOGIN_ATTEMPTS.pop(attempt.id, None)
+            await self._disconnect_client(client)
+            await self._mark_attempt_and_session_failed(row, attempt, exc)
+            raise
         except Exception as exc:
             _LIVE_LOGIN_ATTEMPTS.pop(attempt.id, None)
             await self._disconnect_client(client)
@@ -453,6 +464,18 @@ class AdminTelegramLoginService:
         row.quarantined_at = None
         await self.session.commit()
 
+    async def _ensure_session_name_available(self, row: TelegramSession, derived_name: str) -> None:
+        existing = await self.session.scalar(
+            select(TelegramSession)
+            .where(TelegramSession.name == derived_name, TelegramSession.id != row.id)
+            .with_for_update(),
+        )
+        if existing is not None:
+            raise AdminConflictError(
+                f"Telegram account user id {derived_name.removeprefix(_DERIVED_SESSION_NAME_PREFIX)} "
+                f"is already stored in session {existing.display_name!r}.",
+            )
+
     @staticmethod
     async def _disconnect_client(client: TelegramLoginClient) -> None:
         disconnect = getattr(client, "disconnect", None)
@@ -483,6 +506,32 @@ def _account_projection_from_me(me: object) -> AdminTelegramAccountProjection:
         username=username.strip() if isinstance(username, str) and username.strip() else None,
         phone_hint=_phone_hint(phone if isinstance(phone, str) else None),
     )
+
+
+def _session_name_from_account(account: AdminTelegramAccountProjection) -> str:
+    if account.user_id is None:
+        raise AdminConflictError("Telegram did not return a user id for session naming.")
+    return f"{_DERIVED_SESSION_NAME_PREFIX}{account.user_id}"
+
+
+def _display_name_from_me(me: object, account: AdminTelegramAccountProjection) -> str:
+    first_name = _clean_telegram_profile_text(getattr(me, "first_name", None))
+    last_name = _clean_telegram_profile_text(getattr(me, "last_name", None))
+    full_name = " ".join(part for part in (first_name, last_name) if part)
+    if full_name:
+        return full_name[:MAX_SOURCE_TITLE_LENGTH]
+    if account.username:
+        return f"@{account.username}"[:MAX_SOURCE_TITLE_LENGTH]
+    if account.user_id is not None:
+        return f"Telegram user {account.user_id}"[:MAX_SOURCE_TITLE_LENGTH]
+    return "Telegram account"
+
+
+def _clean_telegram_profile_text(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped or None
 
 
 __all__ = [
