@@ -51,6 +51,39 @@ export function readTelegramWebApp(source: unknown): TelegramWebAppLike | null {
   return normalizeTelegramWebApp(telegram.WebApp);
 }
 
+export function telegramWebAppFromLaunchParams(launchParams: URLSearchParams): TelegramWebAppLike | null {
+  const initData = readString(launchParams.get('tgWebAppData')) ?? '';
+  const startParam = normalizeStartParam(launchParams.get('tgWebAppStartParam'));
+  const themeParams = parseLaunchThemeParams(launchParams.get('tgWebAppThemeParams'));
+  const colorScheme = normalizeColorScheme(launchParams.get('tgWebAppColorScheme'));
+
+  if (!initData && !startParam && Object.keys(themeParams).length === 0) {
+    return null;
+  }
+
+  return {
+    initData,
+    initDataUnsafe: startParam ? { start_param: startParam } : null,
+    themeParams,
+    colorScheme,
+    viewportHeight: null,
+    viewportStableHeight: null,
+    isExpanded: null
+  };
+}
+
+export function hasTelegramMiniAppBootstrapData(webApp: TelegramWebAppLike | null): webApp is TelegramWebAppLike {
+  if (!webApp) {
+    return false;
+  }
+
+  return Boolean(
+    webApp.initData.trim() ||
+      normalizeStartParam(webApp.initDataUnsafe?.start_param) ||
+      Object.keys(webApp.themeParams).length > 0
+  );
+}
+
 export function normalizeTelegramWebApp(value: unknown): TelegramWebAppLike | null {
   if (!isRecord(value)) {
     return null;
@@ -198,6 +231,24 @@ function parseHashParams(hash: string): URLSearchParams {
   }
 
   return new URLSearchParams(normalized.startsWith('?') ? normalized.slice(1) : normalized);
+}
+
+function parseLaunchThemeParams(value: string | null): Record<string, unknown> {
+  const normalized = value?.trim();
+  if (!normalized) {
+    return {};
+  }
+
+  try {
+    const parsed = JSON.parse(normalized) as unknown;
+    return isRecord(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function normalizeColorScheme(value: unknown): 'dark' | 'light' | null {
+  return value === 'dark' || value === 'light' ? value : null;
 }
 
 function readPositiveNumber(value: unknown): number | null {

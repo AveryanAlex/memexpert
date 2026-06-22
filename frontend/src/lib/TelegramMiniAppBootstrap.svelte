@@ -3,7 +3,9 @@
   import { onMount } from 'svelte';
   import {
     extractTelegramMiniAppBootstrapState,
+    hasTelegramMiniAppBootstrapData,
     readTelegramWebApp,
+    telegramWebAppFromLaunchParams,
     telegramLaunchParamsFromUrl,
     type TelegramMiniAppBootstrapState,
     type TelegramWebAppLike
@@ -12,20 +14,25 @@
   const ROUTED_START_PARAM_STORAGE_PREFIX = 'memexpert:telegram-miniapp:routed-start-param:';
 
   onMount(() => {
+    const launchParams = telegramLaunchParamsFromUrl(window.location);
+    const launchWebApp = telegramWebAppFromLaunchParams(launchParams);
     const webApp = readTelegramWebApp(window);
-    if (!webApp) {
+    const bootstrapWebApp = hasTelegramMiniAppBootstrapData(webApp) ? webApp : launchWebApp;
+    if (!bootstrapWebApp) {
       return;
     }
 
-    const state = extractTelegramMiniAppBootstrapState(webApp, telegramLaunchParamsFromUrl(window.location));
+    const state = extractTelegramMiniAppBootstrapState(bootstrapWebApp, launchParams);
     if (!state) {
       return;
     }
 
     applyTelegramShellState(state);
-    callWebAppMethod(webApp.ready);
-    callWebAppMethod(webApp.expand);
-    const expandedState = extractTelegramMiniAppBootstrapState(readTelegramWebApp(window), telegramLaunchParamsFromUrl(window.location));
+    callWebAppMethod(webApp?.ready);
+    callWebAppMethod(webApp?.expand);
+    const expandedWebAppCandidate = readTelegramWebApp(window);
+    const expandedWebApp = hasTelegramMiniAppBootstrapData(expandedWebAppCandidate) ? expandedWebAppCandidate : launchWebApp;
+    const expandedState = extractTelegramMiniAppBootstrapState(expandedWebApp, launchParams);
     const shellState = expandedState ?? state;
     applyTelegramShellState(shellState);
     void authenticateAndRoute(shellState);

@@ -4,9 +4,11 @@ import {
   extractTelegramMiniAppBootstrapState,
   extractTelegramThemeVariables,
   extractTelegramViewportVariables,
+  hasTelegramMiniAppBootstrapData,
   mapTelegramStartParamToRoute,
   normalizeTelegramWebApp,
   readTelegramWebApp,
+  telegramWebAppFromLaunchParams,
   telegramLaunchParamsFromUrl
 } from './telegram-miniapp';
 
@@ -133,6 +135,64 @@ describe('Telegram Mini App helpers', () => {
     expect(initDataState?.startRoute).toBe('/memes/query-slug');
     expect(unknownState?.startParam).toBe('collections');
     expect(unknownState?.startRoute).toBeNull();
+  });
+
+  it('builds a WebApp-like state from Telegram launch params when the host script is unavailable', () => {
+    const initData = 'query_id=abc123&user=%7B%22id%22%3A303030303%7D&auth_date=1770000000&hash=signed';
+    const launchParams = telegramLaunchParamsFromUrl(
+      `https://app.test/#tgWebAppData=${encodeURIComponent(initData)}&tgWebAppStartParam=meme_hash-slug&tgWebAppThemeParams=${encodeURIComponent(
+        JSON.stringify({ bg_color: '#101820', text_color: '#f8fafc' })
+      )}&tgWebAppColorScheme=dark`
+    );
+
+    const webApp = telegramWebAppFromLaunchParams(launchParams);
+    const state = extractTelegramMiniAppBootstrapState(webApp, launchParams);
+
+    expect(webApp?.initData).toBe(initData);
+    expect(webApp?.initDataUnsafe).toEqual({ start_param: 'meme_hash-slug' });
+    expect(state).toMatchObject({
+      initData,
+      startParam: 'meme_hash-slug',
+      startRoute: '/memes/hash-slug',
+      dataAttributes: {
+        'data-telegram-miniapp': 'true',
+        'data-telegram-color-scheme': 'dark'
+      },
+      cssVariables: {
+        '--tg-theme-bg-color': '#101820',
+        '--tg-theme-text-color': '#f8fafc'
+      }
+    });
+  });
+
+  it('returns no launch-param WebApp fallback for non-Telegram URLs', () => {
+    expect(telegramWebAppFromLaunchParams(telegramLaunchParamsFromUrl('https://app.test/?foo=bar'))).toBeNull();
+    expect(telegramWebAppFromLaunchParams(new URLSearchParams({ tgWebAppColorScheme: 'dark' }))).toBeNull();
+  });
+
+  it('distinguishes an empty Telegram SDK object from a real Mini App launch', () => {
+    expect(
+      hasTelegramMiniAppBootstrapData(
+        normalizeTelegramWebApp({
+          initData: '',
+          initDataUnsafe: {},
+          themeParams: {},
+          colorScheme: 'light',
+          isExpanded: true
+        })
+      )
+    ).toBe(false);
+
+    expect(
+      hasTelegramMiniAppBootstrapData(
+        normalizeTelegramWebApp({
+          initData: 'auth_date=1770000000&hash=signed',
+          initDataUnsafe: {},
+          themeParams: {},
+          colorScheme: 'light'
+        })
+      )
+    ).toBe(true);
   });
 
   it('extracts theme and viewport CSS variables from safe primitive values', () => {

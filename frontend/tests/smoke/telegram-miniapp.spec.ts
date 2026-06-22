@@ -1,45 +1,14 @@
-import { expect, test } from '@playwright/test';
+import { expect, test, type Page } from '@playwright/test';
 
 test('Telegram Mini App launch authenticates, applies shell state, and routes meme startapp', async ({ page }) => {
-  await page.addInitScript(() => {
-    const calls = { ready: 0, expand: 0 };
-    Object.defineProperty(window, '__telegramMiniAppCalls', {
-      configurable: true,
-      value: calls
-    });
-    Object.defineProperty(window, 'Telegram', {
-      configurable: true,
-      value: {
-        WebApp: {
-          initData: 'query_id=smoke-miniapp-init-data&user=%7B%22id%22%3A303030303%7D&auth_date=1770000000&hash=mocked',
-          initDataUnsafe: { start_param: 'meme_smoke-test-cat-reaction' },
-          themeParams: {
-            bg_color: '#101820',
-            secondary_bg_color: '#0b1020',
-            text_color: '#f8fafc',
-            button_color: '#f97316'
-          },
-          colorScheme: 'dark',
-          viewportHeight: 720,
-          viewportStableHeight: 700,
-          isExpanded: false,
-          ready() {
-            calls.ready += 1;
-          },
-          expand() {
-            calls.expand += 1;
-            this.isExpanded = true;
-          }
-        }
-      }
-    });
-  });
+  const { telegramSdkRequest } = await installFakeTelegramSdk(page);
 
   const authResponsePromise = page.waitForResponse('**/telegram-miniapp/auth');
-  await page.goto('/');
+  await page.goto(`/#${miniAppLaunchHash()}`);
 
   const authResponse = await authResponsePromise;
   expect(authResponse.status()).toBe(200);
+  await expect(telegramSdkRequest).resolves.toBe(true);
   await expect(authResponse.json()).resolves.not.toHaveProperty('access_token');
   await expect(page).toHaveURL(/\/memes\/smoke-test-cat-reaction$/);
   await expect(page.getByRole('heading', { name: 'Smoke test cat reaction' })).toBeVisible();
@@ -76,3 +45,73 @@ test('Telegram Mini App launch authenticates, applies shell state, and routes me
     expandCalls: 1
   });
 });
+
+test('normal web launch does not load the Telegram Mini App SDK', async ({ page }) => {
+  let requestedTelegramSdk = false;
+  await page.route(/https:\/\/telegram\.org\/js\/telegram-web-app\.js\?62/, async (route) => {
+    requestedTelegramSdk = true;
+    await route.fulfill({ contentType: 'application/javascript', body: '' });
+  });
+
+  await page.goto('/');
+  await expect(page.getByRole('link', { name: 'MemeXpert' })).toBeVisible();
+
+  expect(requestedTelegramSdk).toBe(false);
+});
+
+function miniAppLaunchHash(): string {
+  return new URLSearchParams({
+    tgWebAppData: 'query_id=smoke-miniapp-init-data&user=%7B%22id%22%3A303030303%7D&auth_date=1770000000&hash=mocked',
+    tgWebAppStartParam: 'meme_smoke-test-cat-reaction',
+    tgWebAppThemeParams: JSON.stringify({
+      bg_color: '#101820',
+      secondary_bg_color: '#0b1020',
+      text_color: '#f8fafc',
+      button_color: '#f97316'
+    }),
+    tgWebAppColorScheme: 'dark'
+  }).toString();
+}
+
+async function installFakeTelegramSdk(page: Page): Promise<{ telegramSdkRequest: Promise<boolean> }> {
+  let resolveTelegramSdkRequest: (requested: boolean) => void = () => {};
+  const telegramSdkRequest = new Promise<boolean>((resolve) => {
+    resolveTelegramSdkRequest = resolve;
+  });
+  await page.route(/https:\/\/telegram\.org\/js\/telegram-web-app\.js\?62/, async (route) => {
+    resolveTelegramSdkRequest(true);
+    await route.fulfill({
+      contentType: 'application/javascript',
+      body: `
+        (() => {
+          const launchParams = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+          const calls = { ready: 0, expand: 0 };
+          Object.defineProperty(window, '__telegramMiniAppCalls', {
+            configurable: true,
+            value: calls
+          });
+          window.Telegram = {
+            WebApp: {
+              initData: launchParams.get('tgWebAppData') || '',
+              initDataUnsafe: { start_param: launchParams.get('tgWebAppStartParam') || undefined },
+              themeParams: JSON.parse(launchParams.get('tgWebAppThemeParams') || '{}'),
+              colorScheme: launchParams.get('tgWebAppColorScheme') || null,
+              viewportHeight: 720,
+              viewportStableHeight: 700,
+              isExpanded: false,
+              ready() {
+                calls.ready += 1;
+              },
+              expand() {
+                calls.expand += 1;
+                this.isExpanded = true;
+              }
+            }
+          };
+        })();
+      `
+    });
+  });
+
+  return { telegramSdkRequest };
+}

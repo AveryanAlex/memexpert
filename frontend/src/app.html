@@ -3,6 +3,33 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <script>
+      (() => {
+        // Telegram requires this SDK before app scripts, but ordinary web visits should not load it.
+        const telegramLaunchParamPrefix = 'tgWebApp';
+        const hasTelegramLaunchParam = (params) => Array.from(params.keys()).some((key) => key.startsWith(telegramLaunchParamPrefix));
+        const hashWithoutMarker = window.location.hash.startsWith('#') ? window.location.hash.slice(1) : window.location.hash;
+        const hashQueryStart = hashWithoutMarker.indexOf('?');
+        const hashQuery = hashQueryStart >= 0 ? hashWithoutMarker.slice(hashQueryStart + 1) : hashWithoutMarker;
+        const hasTelegramLaunchParams =
+          hasTelegramLaunchParam(new URLSearchParams(window.location.search)) ||
+          (hashQuery.includes('=') && hasTelegramLaunchParam(new URLSearchParams(hashQuery)));
+        let hasStoredTelegramLaunchParams = false;
+        try {
+          const storedParams = window.sessionStorage.getItem('__telegram__initParams');
+          const parsedStoredParams = storedParams ? JSON.parse(storedParams) : null;
+          hasStoredTelegramLaunchParams = Boolean(
+            parsedStoredParams &&
+              typeof parsedStoredParams === 'object' &&
+              Object.keys(parsedStoredParams).some((key) => key.startsWith(telegramLaunchParamPrefix))
+          );
+        } catch {}
+
+        if ((!window.Telegram || !window.Telegram.WebApp) && (hasTelegramLaunchParams || hasStoredTelegramLaunchParams)) {
+          document.write('<script src="https://telegram.org/js/telegram-web-app.js?62"><\/script>');
+        }
+      })();
+    </script>
     %sveltekit.head%
   </head>
   <body data-sveltekit-preload-data="hover">
