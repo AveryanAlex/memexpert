@@ -5,6 +5,9 @@ import {
   addAdminTelegramChannel,
   ApiError,
   assignAdminTelegramChannel,
+  completeAdminTelegramPhoneCodeLogin,
+  completeAdminTelegramPhonePasswordLogin,
+  completeAdminTelegramQrLogin,
   createAdminTelegramSession,
   deleteAdminTelegramSession,
   fetchAdminTelegramChannelGroups,
@@ -12,6 +15,8 @@ import {
   markSourceChannelDead,
   orphanAdminTelegramChannel,
   setSourceChannelPaused,
+  startAdminTelegramPhoneLogin,
+  startAdminTelegramQrLogin,
   updateAdminTelegramChannel,
   updateAdminTelegramSession,
   validateAdminTelegramSession
@@ -59,20 +64,15 @@ export const actions: Actions = {
         body: {
           name: readRequired(data, 'name'),
           display_name: readOptional(data, 'display_name'),
-          string_session: readOptional(data, 'string_session'),
-          validate: data.get('validate') === 'on',
           enabled: data.get('enabled') === 'on',
           live_enabled: data.get('live_enabled') === 'on',
           catchup_enabled: data.get('catchup_enabled') === 'on',
           engagement_enabled: data.get('engagement_enabled') === 'on',
           max_requests_per_second: readFloat(data, 'max_requests_per_second', 1),
-          account_user_id: readOptionalInt(data, 'account_user_id'),
-          account_username: readOptional(data, 'account_username'),
-          account_phone_hint: readOptional(data, 'account_phone_hint'),
           note: readOptional(data, 'note')
         }
       });
-      return { message: 'Telegram session created. Secret material was not rendered back.' };
+      return { message: 'Telegram session created. Start QR or phone login from the session card.' };
     });
   },
   updateSession: async ({ fetch, request }) => {
@@ -100,6 +100,94 @@ export const actions: Actions = {
         sessionId
       );
       return { message: 'Telegram session policy updated.' };
+    });
+  },
+  startQrLogin: async ({ fetch, request }) => {
+    const data = await request.formData();
+    const sessionId = readRequired(data, 'session_id');
+    return runAction(async () => {
+      const result = await startAdminTelegramQrLogin(apiRequest(fetch, request), sessionId);
+      return {
+        message: `QR login started. Scan ${result.qr_url}, then complete attempt ${result.attempt_id}. Expires at ${result.expires_at}.`,
+        kind: 'qr' as const,
+        sessionId,
+        attemptId: result.attempt_id,
+        qrUrl: result.qr_url
+      };
+    });
+  },
+  completeQrLogin: async ({ fetch, request }) => {
+    const data = await request.formData();
+    const sessionId = readRequired(data, 'session_id');
+    return runAction(async () => {
+      const result = await completeAdminTelegramQrLogin(
+        {
+          ...apiRequest(fetch, request),
+          body: { attempt_id: readRequired(data, 'attempt_id'), note: readOptional(data, 'note') }
+        },
+        sessionId
+      );
+      return { message: result.message };
+    });
+  },
+  startPhoneLogin: async ({ fetch, request }) => {
+    const data = await request.formData();
+    const sessionId = readRequired(data, 'session_id');
+    return runAction(async () => {
+      const result = await startAdminTelegramPhoneLogin(
+        {
+          ...apiRequest(fetch, request),
+          body: { phone_number: readRequired(data, 'phone_number'), note: readOptional(data, 'note') }
+        },
+        sessionId
+      );
+      return {
+        message: `Telegram code sent to phone ${result.phone_number_hint ?? 'account'}. Complete attempt ${result.attempt_id}. Expires at ${result.expires_at}.`,
+        kind: 'phone' as const,
+        sessionId,
+        attemptId: result.attempt_id
+      };
+    });
+  },
+  completePhoneCodeLogin: async ({ fetch, request }) => {
+    const data = await request.formData();
+    const sessionId = readRequired(data, 'session_id');
+    const attemptId = readRequired(data, 'attempt_id');
+    return runAction(async () => {
+      const result = await completeAdminTelegramPhoneCodeLogin(
+        {
+          ...apiRequest(fetch, request),
+          body: { attempt_id: attemptId, code: readRequired(data, 'code'), note: readOptional(data, 'note') }
+        },
+        sessionId
+      );
+      if (result.password_required) {
+        return {
+          message: 'Telegram 2FA password required. Enter it below to finish login.',
+          kind: 'password' as const,
+          sessionId,
+          attemptId
+        };
+      }
+      return { message: result.message };
+    });
+  },
+  completePhonePasswordLogin: async ({ fetch, request }) => {
+    const data = await request.formData();
+    const sessionId = readRequired(data, 'session_id');
+    return runAction(async () => {
+      const result = await completeAdminTelegramPhonePasswordLogin(
+        {
+          ...apiRequest(fetch, request),
+          body: {
+            attempt_id: readRequired(data, 'attempt_id'),
+            password: readRequired(data, 'password'),
+            note: readOptional(data, 'note')
+          }
+        },
+        sessionId
+      );
+      return { message: result.message };
     });
   },
   validateSession: async ({ fetch, request }) => {
@@ -236,7 +324,7 @@ export const actions: Actions = {
   }
 };
 
-async function runAction(operation: () => Promise<{ message: string }>) {
+async function runAction<T extends { message: string }>(operation: () => Promise<T>) {
   try {
     return await operation();
   } catch (caught) {

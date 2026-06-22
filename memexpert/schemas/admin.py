@@ -58,6 +58,9 @@ MAX_TELEGRAM_ACCOUNT_USERNAME_LENGTH = 255
 MAX_TELEGRAM_ACCOUNT_PHONE_HINT_LENGTH = 64
 MAX_ADMIN_TELEGRAM_ERROR_CLASS_LENGTH = 128
 MAX_ADMIN_TELEGRAM_ERROR_TEXT_LENGTH = 4000
+MAX_TELEGRAM_LOGIN_PHONE_LENGTH = 32
+MAX_TELEGRAM_LOGIN_CODE_LENGTH = 64
+MAX_TELEGRAM_LOGIN_PASSWORD_LENGTH = 256
 
 
 class AdminSessionRead(BaseModel):
@@ -220,22 +223,17 @@ class AdminTelegramSessionRead(ORMSchema):
 
 
 class AdminTelegramSessionCreateRequest(BaseModel):
-    """Create/import a DB-backed Telegram session row without returning secret material."""
+    """Create a DB-backed Telegram session row before browser-admin login."""
 
-    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    model_config = ConfigDict(extra="forbid")
 
     name: str = Field(min_length=1, max_length=MAX_TELEGRAM_SESSION_NAME_LENGTH)
     display_name: str | None = Field(default=None, max_length=MAX_SOURCE_TITLE_LENGTH)
-    string_session: SecretStr | None = None
-    validate_session: StrictBool = Field(default=False, alias="validate")
     enabled: StrictBool = True
     live_enabled: StrictBool = True
     catchup_enabled: StrictBool = True
     engagement_enabled: StrictBool = True
     max_requests_per_second: float = Field(default=1.0, gt=0)
-    account_user_id: int | None = Field(default=None, ge=1)
-    account_username: str | None = Field(default=None, max_length=MAX_TELEGRAM_ACCOUNT_USERNAME_LENGTH)
-    account_phone_hint: str | None = Field(default=None, max_length=MAX_TELEGRAM_ACCOUNT_PHONE_HINT_LENGTH)
     note: str | None = Field(default=None, max_length=MAX_ADMIN_NOTE_LENGTH)
 
     @field_validator("name")
@@ -248,20 +246,10 @@ class AdminTelegramSessionCreateRequest(BaseModel):
     def _normalize_display_name(cls, value: str | None) -> str | None:
         return normalize_optional_text(value)
 
-    @field_validator("account_username", "account_phone_hint", "note")
+    @field_validator("note")
     @classmethod
     def _normalize_optional_text(cls, value: str | None) -> str | None:
         return normalize_optional_text(value)
-
-    @field_validator("string_session")
-    @classmethod
-    def _normalize_string_session(cls, value: SecretStr | None) -> SecretStr | None:
-        if value is None:
-            return None
-        raw_value = value.get_secret_value().strip()
-        if not raw_value:
-            raise ValueError("string_session must not be blank when provided.")
-        return SecretStr(raw_value)
 
 
 class AdminTelegramSessionUpdateRequest(BaseModel):
@@ -323,6 +311,117 @@ class AdminTelegramSessionValidateRead(BaseModel):
     telegram_session: AdminTelegramSessionRead
     channel_checked: bool
     channel_reference: str | None = None
+
+
+class AdminTelegramLoginQrStartRead(BaseModel):
+    """Secret-free response for a browser-admin QR login attempt."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    attempt_id: uuid.UUID
+    qr_url: str = Field(min_length=1)
+    expires_at: datetime
+    message: str
+
+
+class AdminTelegramLoginQrCompleteRequest(BaseModel):
+    """Complete a QR login attempt after the QR code has been scanned."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    attempt_id: uuid.UUID
+    note: str | None = Field(default=None, max_length=MAX_ADMIN_NOTE_LENGTH)
+
+    @field_validator("note")
+    @classmethod
+    def _normalize_note(cls, value: str | None) -> str | None:
+        return normalize_optional_text(value)
+
+
+class AdminTelegramLoginPhoneStartRequest(BaseModel):
+    """Send a Telegram login code to one phone number."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    phone_number: str = Field(min_length=5, max_length=MAX_TELEGRAM_LOGIN_PHONE_LENGTH)
+    note: str | None = Field(default=None, max_length=MAX_ADMIN_NOTE_LENGTH)
+
+    @field_validator("phone_number")
+    @classmethod
+    def _normalize_phone_number(cls, value: str) -> str:
+        normalized = re.sub(r"[\s().-]+", "", normalize_required_text(value))
+        if re.fullmatch(r"\+?[0-9]{5,20}", normalized) is None:
+            raise ValueError("phone_number must contain 5-20 digits and may start with '+'.")
+        return normalized
+
+    @field_validator("note")
+    @classmethod
+    def _normalize_note(cls, value: str | None) -> str | None:
+        return normalize_optional_text(value)
+
+
+class AdminTelegramLoginPhoneStartRead(BaseModel):
+    """Secret-free response after Telegram accepts a phone login code request."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    attempt_id: uuid.UUID
+    phone_number_hint: str | None
+    expires_at: datetime
+    message: str
+
+
+class AdminTelegramLoginPhoneCodeRequest(BaseModel):
+    """Complete a phone login attempt with the Telegram code."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    attempt_id: uuid.UUID
+    code: str = Field(min_length=1, max_length=MAX_TELEGRAM_LOGIN_CODE_LENGTH)
+    note: str | None = Field(default=None, max_length=MAX_ADMIN_NOTE_LENGTH)
+
+    @field_validator("code")
+    @classmethod
+    def _normalize_code(cls, value: str) -> str:
+        return normalize_required_text(value).replace(" ", "")
+
+    @field_validator("note")
+    @classmethod
+    def _normalize_note(cls, value: str | None) -> str | None:
+        return normalize_optional_text(value)
+
+
+class AdminTelegramLoginPasswordRequest(BaseModel):
+    """Complete a password-required Telegram login attempt with 2FA password."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    attempt_id: uuid.UUID
+    password: SecretStr = Field(max_length=MAX_TELEGRAM_LOGIN_PASSWORD_LENGTH)
+    note: str | None = Field(default=None, max_length=MAX_ADMIN_NOTE_LENGTH)
+
+    @field_validator("password")
+    @classmethod
+    def _normalize_password(cls, value: SecretStr) -> SecretStr:
+        raw_value = value.get_secret_value().strip()
+        if not raw_value:
+            raise ValueError("password must not be blank.")
+        return SecretStr(raw_value)
+
+    @field_validator("note")
+    @classmethod
+    def _normalize_note(cls, value: str | None) -> str | None:
+        return normalize_optional_text(value)
+
+
+class AdminTelegramLoginCompleteRead(BaseModel):
+    """Secret-free login completion result."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    telegram_session: AdminTelegramSessionRead
+    password_required: bool = False
+    message: str
 
 
 class AdminTelegramSessionDeleteRequest(BaseModel):

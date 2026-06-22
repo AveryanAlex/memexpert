@@ -23,8 +23,9 @@ The crawler ships five operator-facing pieces:
    per session, and delegates each session's catch-up, live listener, and replay
    work to the per-session runtime executor.
 3. **Browser-admin Telegram surface** (`/admin/telegram` plus
-   `/api/v1/admin/telegram/*`) for cookie-authenticated session CRUD,
-   StringSession import/validation, and channel assignment management.
+    `/api/v1/admin/telegram/*`) for cookie-authenticated session CRUD,
+    QR/phone/code/2FA session login, validation, and channel assignment
+    management.
 4. **Operator crawler API surface** (`memexpert/api/routes/v1/crawler.py`)
     exposing `/api/v1/crawler/sessions`, `/channels`, `/pause`, `/resume`,
     `/reassign`, `/replay-post`, and `/freshness` for runtime inspection and
@@ -85,16 +86,21 @@ admin browser cookie from SvelteKit to the API.
 
 ### Sessions
 
-Before the runtime can ingest Telegram content, create or import one DB-backed
-Telegram session for each account the manager should run. In the
-"Import or Create Session" panel:
+Before the runtime can ingest Telegram content, create one DB-backed Telegram
+session shell for each account the manager should run. In the "Create Session"
+panel:
 
-- Create a metadata-only session by leaving `StringSession` blank; the row will
-  exist without secret material and is not runnable until valid secret material
-  is supplied.
-- Import an already-authorized Telethon `StringSession` by pasting it into the
-  form. If `Validate after save` is checked, browser admin validates the
-  pasted session with Telegram before saving account projection fields.
+- Enter the stable session name, display name, crawler policy toggles, and max
+  requests/sec. The new row starts in `auth_required` and is not runnable until
+  browser-admin login stores a valid Telegram session key.
+- In the session card, use **QR login** to start an attempt, scan the returned
+  Telegram URL from a logged-in Telegram app, then complete the attempt id.
+- Or use **Phone + code login** to send a code to the account phone, complete
+  the same attempt id with the Telegram code, and, when Telegram requires it,
+  finish with the **2FA password** form.
+- Successful login stores the authorized Telethon session encrypted in the DB,
+  updates the account projection from Telegram, clears parked/error state, and
+  marks the session `active`.
 - Keep `enabled`, catch-up, live, engagement, and max requests/sec aligned with
   the environment. A session can still be visible while disabled or parked.
 - Use "Validate access" on an existing session to decrypt the stored secret,
@@ -105,12 +111,13 @@ Telegram session for each account the manager should run. In the
   status back to `active` clears parked/quarantine timestamps.
 
 Admin responses and the Svelte page never return or render raw secret material:
-`StringSession` and `encrypted_string_session` are excluded from reads. The
-session projection exposes only `has_string_session` so operators can see
-whether a secret is stored.
+full phone numbers, 2FA passwords, temporary login sessions, final
+`StringSession`, and `encrypted_string_session` values are excluded from reads.
+The session projection exposes only `has_string_session` so operators can see
+whether a final encrypted secret is stored.
 
-The existing headless helper is still useful for ops imports or replacing the
-secret for a known session name without a browser:
+The existing headless helper is now a fallback for exceptional ops imports or
+replacing the secret for a known session name without a browser:
 
 ```bash
 uv run python scripts/auth_telegram_session.py \
@@ -418,7 +425,7 @@ affected session is marked non-runnable while healthy sessions continue. A
 permanent ban surfaces as `PipelineTelegramSessionBannedError` →
 `telegram_session_banned` / HTTP 503. The session row transitions into
 `status=quarantined` and the runtime refuses to use it for any further work.
-An unauthorized imported StringSession surfaces as
+An unauthorized or revoked stored session surfaces as
 `PipelineTelegramSessionAuthRequiredError` / `crawler_session_not_runnable`; the
 row is marked `status=auth_required`, not quarantined. Recovery options are:
 
@@ -426,9 +433,9 @@ row is marked `status=auth_required`, not quarantined. Recovery options are:
    with "Assign or move". The operator-token `POST /channels/{id}/reassign`
    route still exists for headless scripts, but browser admin is preferred for
    human-driven assignment changes.
-2. **Import valid secret material.** For a replacement session, create/import it
-   through `/admin/telegram` and move channels to it. To replace the secret for
-   an existing session name without a browser, use
+2. **Log in with valid Telegram credentials.** For a replacement session, create
+   it through `/admin/telegram`, finish QR or phone-code login, and move channels
+   to it. To replace the secret for an existing session name without a browser, use
    `scripts/auth_telegram_session.py --session-name <name> --string-session-file <path>`;
    the helper validates Telegram authorization, replaces `encrypted_string_session`,
    clears error fields, and sets `status='active'`.
@@ -460,8 +467,8 @@ row is marked `status=auth_required`, not quarantined. Recovery options are:
   accumulate posts before judging the SLO.
 - **`crawler_session_not_runnable` for Telegram.** The `telegram_sessions` row
   is missing, disabled, not `active`, auth-required, or lacks encrypted
-  StringSession material. Use `/admin/telegram` to validate/import a runnable
-  session or move the channel to one.
+  StringSession material. Use `/admin/telegram` to log in and validate a
+  runnable session, or move the channel to one.
 - **Channels without `published_at`.** Legacy `MemeSource` rows without
   `published_at` populated are invisible to the freshness query — they
   do not contribute to or block the SLO. This is deliberate; see

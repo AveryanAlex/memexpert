@@ -277,48 +277,20 @@ class AdminService:
         *,
         admin_user_id: uuid.UUID,
     ) -> AdminTelegramSessionRead:
-        if request.validate_session and request.string_session is None:
-            raise AdminConflictError("A string_session is required when validate=true.")
-
-        encrypted_string_session: str | None = None
-        account_user_id = request.account_user_id
-        account_username = request.account_username
-        account_phone_hint = request.account_phone_hint
-        status = TelegramSessionStatus.AUTH_REQUIRED
-        last_heartbeat_at = None
-
-        if request.string_session is not None:
-            if request.validate_session:
-                try:
-                    validation = await validate_admin_telegram_string_session(
-                        settings=get_settings(),
-                        string_session=request.string_session,
-                    )
-                except AdminTelegramValidationError as exc:
-                    raise AdminConflictError(
-                        f"Telegram session validation failed: {exc.error_class}.",
-                    ) from exc
-                account_user_id = validation.account.user_id
-                account_username = validation.account.username
-                account_phone_hint = validation.account.phone_hint
-                last_heartbeat_at = utcnow()
-            encrypted_string_session = self._encrypt_string_session(request.string_session)
-            status = TelegramSessionStatus.ACTIVE
-
         row = TelegramSession(
             name=request.name,
             display_name=request.display_name or request.name,
-            encrypted_string_session=encrypted_string_session,
-            account_user_id=account_user_id,
-            account_username=account_username,
-            account_phone_hint=account_phone_hint,
-            status=status,
+            encrypted_string_session=None,
+            account_user_id=None,
+            account_username=None,
+            account_phone_hint=None,
+            status=TelegramSessionStatus.AUTH_REQUIRED,
             enabled=request.enabled,
             live_enabled=request.live_enabled,
             catchup_enabled=request.catchup_enabled,
             engagement_enabled=request.engagement_enabled,
             max_requests_per_second=request.max_requests_per_second,
-            last_heartbeat_at=last_heartbeat_at,
+            last_heartbeat_at=None,
         )
         self.session.add(row)
         try:

@@ -617,16 +617,11 @@ export interface AdminTelegramChannelGroupRead {
 export interface AdminTelegramSessionCreatePayload {
   name: string;
   display_name?: string | null;
-  string_session?: string | null;
-  validate?: boolean;
   enabled: boolean;
   live_enabled: boolean;
   catchup_enabled: boolean;
   engagement_enabled: boolean;
   max_requests_per_second: number;
-  account_user_id?: number | null;
-  account_username?: string | null;
-  account_phone_hint?: string | null;
   note?: string | null;
 }
 
@@ -654,6 +649,48 @@ export interface AdminTelegramSessionValidateRead {
   telegram_session: AdminTelegramSessionRead;
   channel_checked: boolean;
   channel_reference: string | null;
+}
+
+export interface AdminTelegramLoginQrStartRead {
+  attempt_id: string;
+  qr_url: string;
+  expires_at: string;
+  message: string;
+}
+
+export interface AdminTelegramLoginQrCompletePayload {
+  attempt_id: string;
+  note?: string | null;
+}
+
+export interface AdminTelegramLoginPhoneStartPayload {
+  phone_number: string;
+  note?: string | null;
+}
+
+export interface AdminTelegramLoginPhoneStartRead {
+  attempt_id: string;
+  phone_number_hint: string | null;
+  expires_at: string;
+  message: string;
+}
+
+export interface AdminTelegramLoginPhoneCodePayload {
+  attempt_id: string;
+  code: string;
+  note?: string | null;
+}
+
+export interface AdminTelegramLoginPasswordPayload {
+  attempt_id: string;
+  password: string;
+  note?: string | null;
+}
+
+export interface AdminTelegramLoginCompleteRead {
+  telegram_session: AdminTelegramSessionRead;
+  password_required: boolean;
+  message: string;
 }
 
 export interface AdminTelegramSessionDeletePayload {

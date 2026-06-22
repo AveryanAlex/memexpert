@@ -15,10 +15,17 @@ describe('/admin/telegram page', () => {
 
     expect(body).toContain('Telegram admin');
     expect(body).toContain('Primary ingest');
-    expect(body).toContain('StringSession stored');
+    expect(body).toContain('session key stored');
     expect(body).not.toContain('secret-session-value');
+    expect(body).not.toContain('StringSession');
+    expect(body).not.toContain('name="string_session"');
+    expect(body).not.toContain('name="account_user_id"');
     expect(body).toContain('action="?/createSession"');
-    expect(body).toContain('name="string_session"');
+    expect(body).toContain('action="?/startQrLogin"');
+    expect(body).toContain('action="?/completeQrLogin"');
+    expect(body).toContain('action="?/startPhoneLogin"');
+    expect(body).toContain('action="?/completePhoneCodeLogin"');
+    expect(body).toContain('action="?/completePhonePasswordLogin"');
     expect(body).toContain('action="?/validateSession"');
     expect(body).toContain('action="?/updateSession"');
     expect(body).toContain('action="?/deleteSession"');
@@ -116,7 +123,7 @@ function telegramSession(): AdminTelegramSessionRead {
     max_requests_per_second: 1,
     account_user_id: 123,
     account_username: 'primary_user',
-    account_phone_hint: '+1***1234',
+    account_phone_hint: 'ending-1234',
     has_string_session: true,
     created_at: '2026-01-01T00:00:00Z',
     updated_at: '2026-01-01T00:00:00Z'

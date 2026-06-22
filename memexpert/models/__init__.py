@@ -26,6 +26,7 @@ from memexpert.models.content import (
     TelegramAdminAuditLog,
     TelegramFileIdCache,
     TelegramSession,
+    TelegramSessionLoginAttempt,
 )
 from memexpert.models.enums import (
     AccountDeletionAction,
@@ -144,6 +145,7 @@ __all__ = [
     "TelegramLinkCode",
     "TelegramMediaFormat",
     "TelegramSession",
+    "TelegramSessionLoginAttempt",
     "TelegramSessionStatus",
     "TimestampMixin",
     "UUIDPrimaryKeyMixin",

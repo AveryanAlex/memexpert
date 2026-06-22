@@ -18,6 +18,7 @@ _EXPORTS: dict[str, str] = {
     "AccountLinkService": "memexpert.services.account_link_service",
     "AccountUnavailableError": "memexpert.services.errors",
     "AdminConflictError": "memexpert.services.admin",
+    "AdminTelegramLoginService": "memexpert.services.admin_telegram_login",
     "AdminNotFoundError": "memexpert.services.admin",
     "AdminService": "memexpert.services.admin",
     "AdminServiceError": "memexpert.services.admin",

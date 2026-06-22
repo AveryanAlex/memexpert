@@ -68,7 +68,7 @@
       <Badge>Signed in as {data.adminUser.email || data.adminUser.id}</Badge>
       <h1 class="my-3 text-[clamp(2.4rem,8vw,5rem)] font-black leading-[0.9] tracking-[-0.075em]">Telegram admin</h1>
       <p class="m-0 max-w-3xl text-muted">
-        Manage DB-backed Telegram sessions and source-channel assignment without exposing StringSession secrets.
+        Manage DB-backed Telegram sessions and source-channel assignment without exposing Telegram login secrets.
       </p>
     </div>
     <ActionLink href="/admin" variant="secondary">Back to admin tools</ActionLink>
@@ -84,30 +84,23 @@
 {/if}
 
 <div class="my-5 grid gap-4 xl:grid-cols-[minmax(340px,0.75fr)_minmax(0,1.25fr)]">
-  <AdminPanel title="Import or Create Session">
-    <p class="m-0 text-sm text-muted">Paste a StringSession only to import it. The admin API returns only a secret-present flag; this page never renders the secret back.</p>
+  <AdminPanel title="Create Session">
+    <p class="m-0 text-sm text-muted">Create the crawler policy row first, then authenticate it from the session card with Telegram QR or phone-code login.</p>
     <form method="POST" action="?/createSession" class="grid gap-3">
       <div class="grid gap-3 md:grid-cols-2">
         <FormRow label="Name" hint="Stable operator-facing key."><Input name="name" maxlength={64} placeholder="primary_ingest" required /></FormRow>
         <FormRow label="Display name"><Input name="display_name" placeholder="Primary ingest account" /></FormRow>
       </div>
-      <FormRow label="StringSession" hint="Optional. Leave blank when creating metadata before importing credentials.">
-        <Textarea name="string_session" rows={3} autocomplete="off" placeholder="optional Telethon StringSession" />
-      </FormRow>
-      <div class="grid gap-3 md:grid-cols-3">
+      <div class="grid gap-3 md:grid-cols-2">
         <FormRow label="Max requests/sec"><Input name="max_requests_per_second" type="number" min="0.1" step="0.1" value="1" required /></FormRow>
-        <FormRow label="Account user id"><Input name="account_user_id" type="number" min="1" /></FormRow>
-        <FormRow label="Account username"><Input name="account_username" placeholder="without @" /></FormRow>
+        <FormRow label="Audit note"><Input name="note" placeholder="why this session is being added" /></FormRow>
       </div>
-      <FormRow label="Phone hint"><Input name="account_phone_hint" placeholder="masked/operator hint" /></FormRow>
       <div class="grid gap-2 rounded-2xl border border-line bg-soft/40 p-3 md:grid-cols-2">
         <label class="inline-flex items-center gap-2 text-chiptext"><input name="enabled" type="checkbox" checked /> Enabled</label>
-        <label class="inline-flex items-center gap-2 text-chiptext"><input name="validate" type="checkbox" /> Validate after save</label>
         <label class="inline-flex items-center gap-2 text-chiptext"><input name="catchup_enabled" type="checkbox" checked /> Catch-up enabled</label>
         <label class="inline-flex items-center gap-2 text-chiptext"><input name="live_enabled" type="checkbox" checked /> Live enabled</label>
         <label class="inline-flex items-center gap-2 text-chiptext"><input name="engagement_enabled" type="checkbox" checked /> Engagement enabled</label>
       </div>
-      <FormRow label="Audit note"><Textarea name="note" rows={2} placeholder="why this session is being added" /></FormRow>
       <Button type="submit">Create session</Button>
     </form>
   </AdminPanel>
@@ -144,7 +137,7 @@
 
 <AdminPanel title="Sessions">
   {#if data.telegramAdmin.sessions.length === 0}
-    <EmptyState title="No Telegram sessions" message="Create or import a session before assigning indexable Telegram channels." />
+    <EmptyState title="No Telegram sessions" message="Create and authenticate a session before assigning indexable Telegram channels." />
   {:else}
     <div class="grid gap-4">
       {#each data.telegramAdmin.sessions as session (session.id)}
@@ -158,7 +151,7 @@
               <Badge tone={session.status === 'active' ? 'success' : 'neutral'}>{session.status}</Badge>
               <Badge class={session.enabled ? '' : 'border-danger-line bg-danger-surface text-danger'}>{session.enabled ? 'enabled' : 'disabled'}</Badge>
               <Badge>{session.owned_channel_count} channels</Badge>
-              <Badge>{session.has_string_session ? 'StringSession stored' : 'no StringSession'}</Badge>
+              <Badge>{session.has_string_session ? 'session key stored' : 'login required'}</Badge>
             </div>
           </div>
 
@@ -175,6 +168,51 @@
               {#if session.last_error_text}<p class="m-0 break-words">{session.last_error_text}</p>{/if}
             </div>
           {/if}
+
+          <div class="grid gap-3 xl:grid-cols-3">
+            <div class="grid content-start gap-3 rounded-2xl border border-line bg-soft/40 p-3">
+              <strong>QR login</strong>
+              <p class="m-0 text-sm text-muted">Start QR login, scan the returned Telegram URL, then complete the attempt id from the success notice.</p>
+              <form method="POST" action="?/startQrLogin" class="grid gap-2">
+                <input type="hidden" name="session_id" value={session.id} />
+                <Button type="submit" variant="secondary">Start QR login</Button>
+              </form>
+              <form method="POST" action="?/completeQrLogin" class="grid gap-2 border-t border-line pt-2">
+                <input type="hidden" name="session_id" value={session.id} />
+                <FormRow label="Attempt id"><Input name="attempt_id" placeholder="paste QR attempt id" required /></FormRow>
+                <Input name="note" placeholder="login note" />
+                <Button type="submit">Complete QR login</Button>
+              </form>
+            </div>
+
+            <div class="grid content-start gap-3 rounded-2xl border border-line bg-soft/40 p-3">
+              <strong>Phone + code login</strong>
+              <p class="m-0 text-sm text-muted">Send a code to the account phone. The full number is submitted once and never rendered back.</p>
+              <form method="POST" action="?/startPhoneLogin" class="grid gap-2">
+                <input type="hidden" name="session_id" value={session.id} />
+                <FormRow label="Phone number"><Input name="phone_number" autocomplete="tel" placeholder="+15551234567" required /></FormRow>
+                <Input name="note" placeholder="login note" />
+                <Button type="submit" variant="secondary">Send code</Button>
+              </form>
+              <form method="POST" action="?/completePhoneCodeLogin" class="grid gap-2 border-t border-line pt-2">
+                <input type="hidden" name="session_id" value={session.id} />
+                <FormRow label="Attempt id"><Input name="attempt_id" placeholder="paste phone attempt id" required /></FormRow>
+                <FormRow label="Telegram code"><Input name="code" autocomplete="one-time-code" required /></FormRow>
+                <Input name="note" placeholder="login note" />
+                <Button type="submit">Complete code login</Button>
+              </form>
+            </div>
+
+            <form method="POST" action="?/completePhonePasswordLogin" class="grid content-start gap-3 rounded-2xl border border-line bg-soft/40 p-3">
+              <input type="hidden" name="session_id" value={session.id} />
+              <strong>2FA password</strong>
+              <p class="m-0 text-sm text-muted">Use this only after code login reports that Telegram requires the account password.</p>
+              <FormRow label="Attempt id"><Input name="attempt_id" placeholder="same phone attempt id" required /></FormRow>
+              <FormRow label="2FA password"><Input name="password" type="password" autocomplete="current-password" required /></FormRow>
+              <Input name="note" placeholder="login note" />
+              <Button type="submit">Finish password login</Button>
+            </form>
+          </div>
 
           <div class="grid gap-3 xl:grid-cols-[minmax(0,1.4fr)_minmax(260px,0.7fr)_minmax(260px,0.7fr)]">
             <form method="POST" action="?/updateSession" class="grid gap-3 rounded-2xl border border-line bg-soft/40 p-3">

@@ -5,6 +5,9 @@ import {
   addAdminTelegramChannel,
   assignAdminTelegramChannel,
   ApiError,
+  completeAdminTelegramPhoneCodeLogin,
+  completeAdminTelegramPhonePasswordLogin,
+  completeAdminTelegramQrLogin,
   createBlockedPerceptualHash,
   createAdminTelegramSession,
   createCollection,
@@ -58,6 +61,8 @@ import {
   reviewChannelSuggestion,
   saveMeme,
   setActiveSaveCollection,
+  startAdminTelegramPhoneLogin,
+  startAdminTelegramQrLogin,
   startTelegramLink,
   unfavoriteMeme,
   unpinMeme,
@@ -1024,6 +1029,15 @@ describe('admin API client', () => {
       if (url.pathname === '/api/v1/admin/telegram/sessions' && init?.method === 'POST') {
         return jsonResponse(telegramSessionPayload(sessionId), 201);
       }
+      if (url.pathname.endsWith('/login/qr/start')) {
+        return jsonResponse({ attempt_id: 'qr-attempt', qr_url: 'tg://login?token=qr', expires_at: '2026-01-01T00:10:00Z', message: 'qr started' });
+      }
+      if (url.pathname.endsWith('/login/phone/start')) {
+        return jsonResponse({ attempt_id: 'phone-attempt', phone_number_hint: 'ending-1234', expires_at: '2026-01-01T00:10:00Z', message: 'code sent' });
+      }
+      if (url.pathname.includes('/login/qr/') || url.pathname.includes('/login/phone/')) {
+        return jsonResponse({ telegram_session: telegramSessionPayload(sessionId), password_required: false, message: 'login complete' });
+      }
       if (url.pathname.endsWith('/validate')) {
         return jsonResponse({ telegram_session: telegramSessionPayload(sessionId), channel_checked: true, channel_reference: '@source' });
       }
@@ -1048,12 +1062,17 @@ describe('admin API client', () => {
     await createAdminTelegramSession({
       fetch: mockFetch,
       baseUrl: 'https://api.memexpert.test',
-      body: { name: 'primary', string_session: 'secret-session', validate: true, enabled: true, live_enabled: true, catchup_enabled: true, engagement_enabled: true, max_requests_per_second: 1 }
+      body: { name: 'primary', enabled: true, live_enabled: true, catchup_enabled: true, engagement_enabled: true, max_requests_per_second: 1 }
     });
     await updateAdminTelegramSession(
       { fetch: mockFetch, baseUrl: 'https://api.memexpert.test', body: { enabled: false, status: 'quarantined', max_requests_per_second: 0.5, clear_error: true, note: 'pause' } },
       sessionId
     );
+    await startAdminTelegramQrLogin({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test' }, sessionId);
+    await completeAdminTelegramQrLogin({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', body: { attempt_id: 'qr-attempt', note: 'qr done' } }, sessionId);
+    await startAdminTelegramPhoneLogin({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', body: { phone_number: '+15551234567', note: 'send code' } }, sessionId);
+    await completeAdminTelegramPhoneCodeLogin({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', body: { attempt_id: 'phone-attempt', code: '12345', note: 'code done' } }, sessionId);
+    await completeAdminTelegramPhonePasswordLogin({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', body: { attempt_id: 'phone-attempt', password: '2fa-password', note: 'password done' } }, sessionId);
     await validateAdminTelegramSession({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', body: { source_channel_id: channelId, note: 'check' } }, sessionId);
     await deleteAdminTelegramSession({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', body: { confirmation: sessionId, note: 'remove' } }, sessionId);
     await fetchAdminTelegramChannels({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', telegramSessionId: sessionId, orphaned: false });
@@ -1071,6 +1090,11 @@ describe('admin API client', () => {
       ['GET', '/api/v1/admin/telegram/sessions', ''],
       ['POST', '/api/v1/admin/telegram/sessions', ''],
       ['PATCH', `/api/v1/admin/telegram/sessions/${sessionId}`, ''],
+      ['POST', `/api/v1/admin/telegram/sessions/${sessionId}/login/qr/start`, ''],
+      ['POST', `/api/v1/admin/telegram/sessions/${sessionId}/login/qr/complete`, ''],
+      ['POST', `/api/v1/admin/telegram/sessions/${sessionId}/login/phone/start`, ''],
+      ['POST', `/api/v1/admin/telegram/sessions/${sessionId}/login/phone/code`, ''],
+      ['POST', `/api/v1/admin/telegram/sessions/${sessionId}/login/phone/password`, ''],
       ['POST', `/api/v1/admin/telegram/sessions/${sessionId}/validate`, ''],
       ['DELETE', `/api/v1/admin/telegram/sessions/${sessionId}`, ''],
       ['GET', '/api/v1/admin/telegram/channels', `telegram_session_id=${sessionId}&orphaned=false`],
@@ -1081,14 +1105,19 @@ describe('admin API client', () => {
       ['POST', `/api/v1/admin/telegram/channels/${channelId}/orphan`, '']
     ]);
     expect(calls[0].requestedWith).toBe(null);
-    expect([1, 2, 3, 4, 7, 8, 9, 10].every((index) => calls[index]?.requestedWith === 'XMLHttpRequest')).toBe(true);
-    expect(calls[5].requestedWith).toBe(null);
-    expect(calls[6].requestedWith).toBe(null);
-    expect(calls[1].body).toMatchObject({ name: 'primary', string_session: 'secret-session', validate: true });
-    expect(calls[4].body).toEqual({ confirmation: sessionId, note: 'remove' });
-    expect(calls[7].body).toMatchObject({ platform: 'telegram', telegram_session_id: sessionId });
-    expect(calls[9].body).toEqual({ telegram_session_id: sessionId, note: 'move' });
-    expect(calls[10].body).toEqual({ note: 'orphan' });
+    expect([1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 14, 15].every((index) => calls[index]?.requestedWith === 'XMLHttpRequest')).toBe(true);
+    expect(calls[10].requestedWith).toBe(null);
+    expect(calls[11].requestedWith).toBe(null);
+    expect(calls[1].body).toMatchObject({ name: 'primary', enabled: true });
+    expect(calls[1].body).not.toHaveProperty('string_session');
+    expect(calls[4].body).toEqual({ attempt_id: 'qr-attempt', note: 'qr done' });
+    expect(calls[5].body).toEqual({ phone_number: '+15551234567', note: 'send code' });
+    expect(calls[6].body).toEqual({ attempt_id: 'phone-attempt', code: '12345', note: 'code done' });
+    expect(calls[7].body).toEqual({ attempt_id: 'phone-attempt', password: '2fa-password', note: 'password done' });
+    expect(calls[9].body).toEqual({ confirmation: sessionId, note: 'remove' });
+    expect(calls[12].body).toMatchObject({ platform: 'telegram', telegram_session_id: sessionId });
+    expect(calls[14].body).toEqual({ telegram_session_id: sessionId, note: 'move' });
+    expect(calls[15].body).toEqual({ note: 'orphan' });
   });
 
   it('loads moderation reports, SEO reviews, and decision history with the admin dashboard', async () => {

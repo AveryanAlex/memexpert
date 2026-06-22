@@ -1053,10 +1053,60 @@ class TelegramSession(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     engagement_enabled: Mapped[bool] = mapped_column(default=True, nullable=False)
     max_requests_per_second: Mapped[float] = mapped_column(Float, default=1.0, nullable=False)
 
+    login_attempts: Mapped[list["TelegramSessionLoginAttempt"]] = relationship(
+        "TelegramSessionLoginAttempt",
+        back_populates="telegram_session",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
     source_channels: Mapped[list["SourceChannel"]] = relationship(
         "SourceChannel",
         back_populates="telegram_session",
         passive_deletes=True,
+    )
+
+
+class TelegramSessionLoginAttempt(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """Short-lived browser-admin Telegram login state without exposing secrets."""
+
+    __tablename__ = "telegram_session_login_attempts"
+    __table_args__ = (
+        CheckConstraint(
+            "method IN ('qr', 'phone')",
+            name="ck_telegram_session_login_attempts_method_known",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'password_required', 'completed', 'failed', 'expired')",
+            name="ck_telegram_session_login_attempts_status_known",
+        ),
+        Index(
+            "ix_telegram_session_login_attempts_session_created_at",
+            "telegram_session_id",
+            "created_at",
+        ),
+        Index("ix_telegram_session_login_attempts_expires_at", "expires_at"),
+    )
+
+    telegram_session_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("telegram_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    method: Mapped[str] = mapped_column(String(16), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
+    # Temporary Telethon StringSession material encrypted with the runtime secret.
+    # API read schemas must never expose this column.
+    encrypted_temp_string_session: Mapped[str | None] = mapped_column(Text, nullable=True)
+    phone_number_hint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    phone_code_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    qr_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_class: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    error_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(nullable=True)
+
+    telegram_session: Mapped["TelegramSession"] = relationship(
+        "TelegramSession",
+        back_populates="login_attempts",
     )
 
 

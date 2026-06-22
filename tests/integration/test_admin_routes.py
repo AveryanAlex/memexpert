@@ -13,6 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import memexpert.services.admin as admin_service_module
+import memexpert.services.admin_telegram_login as admin_telegram_login_module
 from memexpert.models.collection import Collection, CollectionMeme, PinnedMeme
 from memexpert.models.content import (
     AdminMemeDestructiveAuditLog,
@@ -28,6 +29,7 @@ from memexpert.models.content import (
     SourceChannel,
     TelegramAdminAuditLog,
     TelegramSession,
+    TelegramSessionLoginAttempt,
 )
 from memexpert.models.enums import (
     ContentKind,
@@ -91,6 +93,68 @@ async def _persist_canonical_meme(session: AsyncSession, meme: Meme, file: MemeF
     await session.flush()
     session.add(file)
     await session.flush()
+
+
+class _FakeSentCode:
+    phone_code_hash = "fake-phone-code-hash"
+
+
+class _FakeQrLogin:
+    url = "tg://login?token=fake-qr-token"
+
+    async def wait(self, *, timeout: int) -> object:
+        _ = timeout
+        return object()
+
+
+class _FakeTelegramUser:
+    id = 777000
+    username = "validated_admin_session"
+    phone = "+10000007000"
+
+
+class _FakeTelegramSessionStore:
+    def __init__(self, client: _FakeTelegramLoginClient) -> None:
+        self._client = client
+
+    def save(self) -> str:
+        return self._client.string_session
+
+
+class _FakeTelegramLoginClient:
+    def __init__(self, *, require_password: bool = False) -> None:
+        self.require_password = require_password
+        self.string_session = "temporary-telegram-login-session"
+        self.session = _FakeTelegramSessionStore(self)
+        self.sign_in_calls: list[dict[str, object]] = []
+        self.disconnected = False
+
+    async def connect(self) -> None:
+        self.disconnected = False
+
+    async def disconnect(self) -> None:
+        self.disconnected = True
+
+    async def send_code_request(self, phone: str) -> _FakeSentCode:
+        self.string_session = f"temporary-telegram-login-session-{phone[-4:]}"
+        return _FakeSentCode()
+
+    async def sign_in(self, **kwargs: object) -> object:
+        self.sign_in_calls.append(kwargs)
+        if self.require_password and "code" in kwargs:
+            class SessionPasswordNeededError(Exception):
+                pass
+
+            raise SessionPasswordNeededError("password required")
+        self.string_session = "authorized-telegram-login-session"
+        return object()
+
+    async def get_me(self) -> _FakeTelegramUser:
+        return _FakeTelegramUser()
+
+    async def qr_login(self) -> _FakeQrLogin:
+        self.string_session = "temporary-telegram-qr-login-session"
+        return _FakeQrLogin()
 
 
 async def test_admin_routes_require_session_cookie_admin_flag_and_ignore_operator_header(
@@ -1085,8 +1149,19 @@ async def test_admin_telegram_session_lifecycle_validates_without_leaking_string
         email="admin-telegram-session@example.com",
         is_admin=True,
     )
-    raw_string_session = "raw-string-session-secret-for-admin-test"
+    raw_string_session = "authorized-telegram-login-session"
+    full_phone_number = "+10000007000"
     checked_channel_references: list[str | None] = []
+    fake_clients: list[_FakeTelegramLoginClient] = []
+
+    def fake_build_telegram_client(
+        self: admin_telegram_login_module.AdminTelegramLoginService,
+        string_session: SecretStr | None = None,
+    ) -> _FakeTelegramLoginClient:
+        _ = self, string_session
+        client = _FakeTelegramLoginClient()
+        fake_clients.append(client)
+        return client
 
     async def fake_validate_admin_telegram_string_session(
         *,
@@ -1108,6 +1183,11 @@ async def test_admin_telegram_session_lifecycle_validates_without_leaking_string
         )
 
     monkeypatch.setattr(
+        admin_telegram_login_module.AdminTelegramLoginService,
+        "_build_telegram_client",
+        fake_build_telegram_client,
+    )
+    monkeypatch.setattr(
         admin_service_module,
         "validate_admin_telegram_string_session",
         fake_validate_admin_telegram_string_session,
@@ -1121,10 +1201,6 @@ async def test_admin_telegram_session_lifecycle_validates_without_leaking_string
             json={
                 "name": "primary-admin-session",
                 "display_name": "Primary Admin Session",
-                "string_session": raw_string_session,
-                "account_user_id": 12345,
-                "account_username": "seeded_username",
-                "account_phone_hint": "ending-2345",
                 "max_requests_per_second": 2.5,
             },
         )
@@ -1133,6 +1209,14 @@ async def test_admin_telegram_session_lifecycle_validates_without_leaking_string
             json={"name": "auth-required-session", "display_name": "Auth Required Session"},
         )
         session_id = create_response.json()["id"]
+        phone_start_response = await admin_client.post(
+            f"/api/v1/admin/telegram/sessions/{session_id}/login/phone/start",
+            json={"phone_number": full_phone_number},
+        )
+        phone_code_response = await admin_client.post(
+            f"/api/v1/admin/telegram/sessions/{session_id}/login/phone/code",
+            json={"attempt_id": phone_start_response.json()["attempt_id"], "code": "12345", "note": "login by phone"},
+        )
         patch_response = await admin_client.patch(
             f"/api/v1/admin/telegram/sessions/{session_id}",
             json={
@@ -1165,17 +1249,38 @@ async def test_admin_telegram_session_lifecycle_validates_without_leaking_string
 
     assert create_response.status_code == 201
     create_payload = create_response.json()
-    assert create_payload["status"] == "active"
-    assert create_payload["has_string_session"] is True
-    assert create_payload["account_user_id"] == 12345
+    assert create_payload["status"] == "auth_required"
+    assert create_payload["has_string_session"] is False
+    assert create_payload["account_user_id"] is None
     assert create_payload["owned_channel_count"] == 0
     assert raw_string_session not in create_response.text
+    assert full_phone_number not in create_response.text
     assert "encrypted_string_session" not in create_response.text
 
     assert create_auth_required_response.status_code == 201
     auth_required_payload = create_auth_required_response.json()
     assert auth_required_payload["status"] == "auth_required"
     assert auth_required_payload["has_string_session"] is False
+
+    assert phone_start_response.status_code == 200
+    phone_start_payload = phone_start_response.json()
+    assert phone_start_payload["phone_number_hint"] == "ending-7000"
+    assert full_phone_number not in phone_start_response.text
+    assert raw_string_session not in phone_start_response.text
+
+    assert phone_code_response.status_code == 200
+    phone_code_payload = phone_code_response.json()
+    assert phone_code_payload["password_required"] is False
+    assert phone_code_payload["telegram_session"]["status"] == "active"
+    assert phone_code_payload["telegram_session"]["has_string_session"] is True
+    assert phone_code_payload["telegram_session"]["account_user_id"] == 777000
+    assert phone_code_payload["telegram_session"]["account_username"] == "validated_admin_session"
+    assert phone_code_payload["telegram_session"]["account_phone_hint"] == "ending-7000"
+    assert raw_string_session not in phone_code_response.text
+    assert full_phone_number not in phone_code_response.text
+    assert fake_clients[0].sign_in_calls == [
+        {"code": "12345", "phone": full_phone_number, "phone_code_hash": "fake-phone-code-hash"},
+    ]
 
     assert patch_response.status_code == 200
     patch_payload = patch_response.json()
@@ -1207,10 +1312,16 @@ async def test_admin_telegram_session_lifecycle_validates_without_leaking_string
     assert list_payload["primary-admin-session"]["has_string_session"] is True
     assert list_payload["auth-required-session"]["has_string_session"] is False
     assert raw_string_session not in list_response.text
+    assert full_phone_number not in list_response.text
     assert "encrypted_string_session" not in list_response.text
 
     async with postgres_session_factory() as session:
         persisted = await session.get(TelegramSession, UUID(session_id))
+        login_attempt = await session.scalar(
+            select(TelegramSessionLoginAttempt).where(
+                TelegramSessionLoginAttempt.id == UUID(phone_start_payload["attempt_id"]),
+            ),
+        )
         audit_rows = (
             await session.execute(
                 select(TelegramAdminAuditLog).order_by(TelegramAdminAuditLog.created_at.asc()),
@@ -1222,8 +1333,14 @@ async def test_admin_telegram_session_lifecycle_validates_without_leaking_string
     assert persisted.encrypted_string_session != raw_string_session
     assert persisted.account_user_id == 777000
     assert persisted.account_username == "validated_admin_session"
+    assert login_attempt is not None
+    assert login_attempt.status == "completed"
+    assert login_attempt.encrypted_temp_string_session is None
+    assert login_attempt.phone_number_hint == "ending-7000"
+    assert login_attempt.phone_code_hash == "fake-phone-code-hash"
     assert [row.action for row in audit_rows if row.telegram_session_id == persisted.id] == [
         "session_create",
+        "session_login",
         "session_patch",
         "session_patch",
         "channel_create",
@@ -1231,7 +1348,196 @@ async def test_admin_telegram_session_lifecycle_validates_without_leaking_string
     for row in audit_rows:
         audit_text = f"{row.previous_values} {row.new_values}"
         assert raw_string_session not in audit_text
+        assert full_phone_number not in audit_text
         assert "encrypted_string_session" not in audit_text
+
+
+async def test_admin_telegram_phone_login_supports_2fa_password_without_leaking_secret(
+    auth_app: FastAPI,
+    auth_settings_overrides: dict[str, str],
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch,
+) -> None:
+    admin_token = await _issue_user_cookie(
+        postgres_session_factory,
+        auth_settings_overrides,
+        email="admin-telegram-2fa@example.com",
+        is_admin=True,
+    )
+    full_phone_number = "+10000007111"
+    password = "very secret telegram password"
+    fake_clients: list[_FakeTelegramLoginClient] = []
+
+    def fake_build_telegram_client(
+        self: admin_telegram_login_module.AdminTelegramLoginService,
+        string_session: SecretStr | None = None,
+    ) -> _FakeTelegramLoginClient:
+        _ = self, string_session
+        client = _FakeTelegramLoginClient(require_password=True)
+        fake_clients.append(client)
+        return client
+
+    monkeypatch.setattr(
+        admin_telegram_login_module.AdminTelegramLoginService,
+        "_build_telegram_client",
+        fake_build_telegram_client,
+    )
+
+    transport = ASGITransport(app=auth_app)
+    async with AsyncClient(transport=transport, base_url="https://testserver") as admin_client:
+        admin_client.cookies.set(ACCESS_COOKIE_NAME, admin_token)
+        create_response = await admin_client.post(
+            "/api/v1/admin/telegram/sessions",
+            json={"name": "two-fa-session", "display_name": "2FA Session"},
+        )
+        session_id = create_response.json()["id"]
+        phone_start_response = await admin_client.post(
+            f"/api/v1/admin/telegram/sessions/{session_id}/login/phone/start",
+            json={"phone_number": full_phone_number},
+        )
+        phone_code_response = await admin_client.post(
+            f"/api/v1/admin/telegram/sessions/{session_id}/login/phone/code",
+            json={"attempt_id": phone_start_response.json()["attempt_id"], "code": "24680"},
+        )
+        password_response = await admin_client.post(
+            f"/api/v1/admin/telegram/sessions/{session_id}/login/phone/password",
+            json={"attempt_id": phone_start_response.json()["attempt_id"], "password": password},
+        )
+
+    assert create_response.status_code == 201
+    assert phone_start_response.status_code == 200
+    assert phone_code_response.status_code == 200
+    code_payload = phone_code_response.json()
+    assert code_payload["password_required"] is True
+    assert code_payload["telegram_session"]["status"] == "auth_required"
+    assert code_payload["telegram_session"]["has_string_session"] is False
+    assert password not in phone_code_response.text
+    assert full_phone_number not in phone_code_response.text
+
+    assert password_response.status_code == 200
+    password_payload = password_response.json()
+    assert password_payload["password_required"] is False
+    assert password_payload["telegram_session"]["status"] == "active"
+    assert password_payload["telegram_session"]["has_string_session"] is True
+    assert password_payload["telegram_session"]["account_phone_hint"] == "ending-7000"
+    assert password not in password_response.text
+    assert full_phone_number not in password_response.text
+    assert fake_clients[0].sign_in_calls == [
+        {"code": "24680", "phone": full_phone_number, "phone_code_hash": "fake-phone-code-hash"},
+        {"password": password},
+    ]
+
+    async with postgres_session_factory() as session:
+        persisted = await session.get(TelegramSession, UUID(session_id))
+        login_attempt = await session.scalar(
+            select(TelegramSessionLoginAttempt).where(
+                TelegramSessionLoginAttempt.id == UUID(phone_start_response.json()["attempt_id"]),
+            ),
+        )
+        audit_rows = (
+            await session.execute(
+                select(TelegramAdminAuditLog).where(TelegramAdminAuditLog.telegram_session_id == UUID(session_id)),
+            )
+        ).scalars().all()
+
+    assert persisted is not None
+    assert persisted.encrypted_string_session is not None
+    assert persisted.encrypted_string_session != "authorized-telegram-login-session"
+    assert login_attempt is not None
+    assert login_attempt.status == "completed"
+    assert login_attempt.encrypted_temp_string_session is None
+    for row in audit_rows:
+        audit_text = f"{row.previous_values} {row.new_values} {row.note}"
+        assert password not in audit_text
+        assert full_phone_number not in audit_text
+        assert "encrypted_string_session" not in audit_text
+
+
+async def test_admin_telegram_login_rejects_expired_and_wrong_session_attempts(
+    auth_app: FastAPI,
+    auth_settings_overrides: dict[str, str],
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch,
+) -> None:
+    admin_token = await _issue_user_cookie(
+        postgres_session_factory,
+        auth_settings_overrides,
+        email="admin-telegram-expired@example.com",
+        is_admin=True,
+    )
+    full_phone_number = "+10000007222"
+
+    def fake_build_telegram_client(
+        self: admin_telegram_login_module.AdminTelegramLoginService,
+        string_session: SecretStr | None = None,
+    ) -> _FakeTelegramLoginClient:
+        _ = self, string_session
+        return _FakeTelegramLoginClient()
+
+    monkeypatch.setattr(
+        admin_telegram_login_module.AdminTelegramLoginService,
+        "_build_telegram_client",
+        fake_build_telegram_client,
+    )
+
+    transport = ASGITransport(app=auth_app)
+    async with AsyncClient(transport=transport, base_url="https://testserver") as admin_client:
+        admin_client.cookies.set(ACCESS_COOKIE_NAME, admin_token)
+        first_create_response = await admin_client.post(
+            "/api/v1/admin/telegram/sessions",
+            json={"name": "expired-login-session", "display_name": "Expired Login Session"},
+        )
+        second_create_response = await admin_client.post(
+            "/api/v1/admin/telegram/sessions",
+            json={"name": "wrong-login-session", "display_name": "Wrong Login Session"},
+        )
+        first_session_id = first_create_response.json()["id"]
+        second_session_id = second_create_response.json()["id"]
+        expired_start_response = await admin_client.post(
+            f"/api/v1/admin/telegram/sessions/{first_session_id}/login/phone/start",
+            json={"phone_number": full_phone_number},
+        )
+        expired_attempt_id = expired_start_response.json()["attempt_id"]
+
+        async with postgres_session_factory() as session:
+            expired_attempt = await session.get(TelegramSessionLoginAttempt, UUID(expired_attempt_id))
+            assert expired_attempt is not None
+            expired_attempt.expires_at = datetime.now(UTC) - timedelta(minutes=1)
+            await session.commit()
+
+        expired_code_response = await admin_client.post(
+            f"/api/v1/admin/telegram/sessions/{first_session_id}/login/phone/code",
+            json={"attempt_id": expired_attempt_id, "code": "13579"},
+        )
+        wrong_start_response = await admin_client.post(
+            f"/api/v1/admin/telegram/sessions/{first_session_id}/login/phone/start",
+            json={"phone_number": full_phone_number},
+        )
+        wrong_session_response = await admin_client.post(
+            f"/api/v1/admin/telegram/sessions/{second_session_id}/login/phone/code",
+            json={"attempt_id": wrong_start_response.json()["attempt_id"], "code": "13579"},
+        )
+
+    assert first_create_response.status_code == 201
+    assert second_create_response.status_code == 201
+    assert expired_start_response.status_code == 200
+    assert expired_code_response.status_code == 409
+    assert "expired" in expired_code_response.json()["detail"]
+    assert wrong_start_response.status_code == 200
+    assert wrong_session_response.status_code == 409
+    assert "invalid for this Telegram session" in wrong_session_response.json()["detail"]
+    assert full_phone_number not in expired_code_response.text
+    assert full_phone_number not in wrong_session_response.text
+
+    async with postgres_session_factory() as session:
+        expired_attempt = await session.get(TelegramSessionLoginAttempt, UUID(expired_attempt_id))
+        wrong_attempt = await session.get(TelegramSessionLoginAttempt, UUID(wrong_start_response.json()["attempt_id"]))
+
+    assert expired_attempt is not None
+    assert expired_attempt.status == "expired"
+    assert expired_attempt.phone_number_hint == "ending-7222"
+    assert wrong_attempt is not None
+    assert wrong_attempt.status == "pending"
 
 
 async def test_admin_telegram_channel_assignment_orphan_filters_and_audit(

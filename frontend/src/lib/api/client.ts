@@ -17,6 +17,13 @@ import type {
   AdminTelegramChannelGroupRead,
   AdminTelegramChannelOrphanPayload,
   AdminTelegramChannelUpdatePayload,
+  AdminTelegramLoginCompleteRead,
+  AdminTelegramLoginPasswordPayload,
+  AdminTelegramLoginPhoneCodePayload,
+  AdminTelegramLoginPhoneStartPayload,
+  AdminTelegramLoginPhoneStartRead,
+  AdminTelegramLoginQrCompletePayload,
+  AdminTelegramLoginQrStartRead,
   AdminTelegramSessionActionRead,
   AdminTelegramSessionCreatePayload,
   AdminTelegramSessionDeletePayload,
@@ -556,6 +563,58 @@ export async function updateAdminTelegramSession(
   return apiWrite<AdminTelegramSessionRead>(
     `/api/v1/admin/telegram/sessions/${encodeURIComponent(sessionId)}`,
     'PATCH',
+    request
+  );
+}
+
+export async function startAdminTelegramQrLogin(request: CatalogRequest, sessionId: string): Promise<AdminTelegramLoginQrStartRead> {
+  return apiWrite<AdminTelegramLoginQrStartRead>(
+    `/api/v1/admin/telegram/sessions/${encodeURIComponent(sessionId)}/login/qr/start`,
+    'POST',
+    request
+  );
+}
+
+export async function completeAdminTelegramQrLogin(
+  request: CatalogRequest & { body: AdminTelegramLoginQrCompletePayload },
+  sessionId: string
+): Promise<AdminTelegramLoginCompleteRead> {
+  return apiWrite<AdminTelegramLoginCompleteRead>(
+    `/api/v1/admin/telegram/sessions/${encodeURIComponent(sessionId)}/login/qr/complete`,
+    'POST',
+    request
+  );
+}
+
+export async function startAdminTelegramPhoneLogin(
+  request: CatalogRequest & { body: AdminTelegramLoginPhoneStartPayload },
+  sessionId: string
+): Promise<AdminTelegramLoginPhoneStartRead> {
+  return apiWrite<AdminTelegramLoginPhoneStartRead>(
+    `/api/v1/admin/telegram/sessions/${encodeURIComponent(sessionId)}/login/phone/start`,
+    'POST',
+    request
+  );
+}
+
+export async function completeAdminTelegramPhoneCodeLogin(
+  request: CatalogRequest & { body: AdminTelegramLoginPhoneCodePayload },
+  sessionId: string
+): Promise<AdminTelegramLoginCompleteRead> {
+  return apiWrite<AdminTelegramLoginCompleteRead>(
+    `/api/v1/admin/telegram/sessions/${encodeURIComponent(sessionId)}/login/phone/code`,
+    'POST',
+    request
+  );
+}
+
+export async function completeAdminTelegramPhonePasswordLogin(
+  request: CatalogRequest & { body: AdminTelegramLoginPasswordPayload },
+  sessionId: string
+): Promise<AdminTelegramLoginCompleteRead> {
+  return apiWrite<AdminTelegramLoginCompleteRead>(
+    `/api/v1/admin/telegram/sessions/${encodeURIComponent(sessionId)}/login/phone/password`,
+    'POST',
     request
   );
 }

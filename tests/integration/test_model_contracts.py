@@ -42,6 +42,7 @@ from memexpert.models.content import (
     TelegramAdminAuditLog,
     TelegramFileIdCache,
     TelegramSession,
+    TelegramSessionLoginAttempt,
 )
 from memexpert.models.enums import (
     AccountDeletionAction,
@@ -132,6 +133,7 @@ EXPECTED_TABLES = {
     "telegram_admin_audit_logs",
     "telegram_file_id_cache",
     "telegram_link_codes",
+    "telegram_session_login_attempts",
     "telegram_sessions",
     "users",
 }
@@ -316,7 +318,9 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
     assert meme_source_relationships["engagement_snapshots"].mapper.class_ is MemeSourceEngagementSnapshot
     assert source_channel_relationships["telegram_session"].mapper.class_ is TelegramSession
     assert telegram_session_relationships["source_channels"].mapper.class_ is SourceChannel
+    assert telegram_session_relationships["login_attempts"].mapper.class_ is TelegramSessionLoginAttempt
     assert metadata.tables["source_channels"].c["telegram_session_id"].foreign_keys
+    assert metadata.tables["telegram_session_login_attempts"].c["telegram_session_id"].foreign_keys
     assert "session_id" not in metadata.tables["source_channels"].c
     assert "views" not in meme_source_columns
     assert "reactions" not in meme_source_columns
