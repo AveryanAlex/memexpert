@@ -187,12 +187,12 @@
 </script>
 
 <section class="mb-5 grid items-stretch gap-6 md:grid-cols-[minmax(0,1fr)_minmax(280px,0.55fr)]" aria-labelledby="profile-title">
-  <div>
+  <div class="rounded-[36px] border border-white/10 bg-white/90 p-6 shadow-[0_24px_70px_rgb(15_23_42_/_14%)]">
     <Badge>Profile library</Badge>
-    <h1 id="profile-title" class="mb-3 mt-4 text-[clamp(2.4rem,8vw,5.4rem)] font-black leading-[0.9] tracking-[-0.075em]">Your meme shelf.</h1>
-    <p class="m-0 text-muted">Favorites, pins, collections, and save routing from this account session.</p>
+    <h1 id="profile-title" class="mb-3 mt-4 text-[clamp(2.4rem,8vw,5.4rem)] font-black leading-[0.9] tracking-[-0.075em] text-slate-950">Your meme command center.</h1>
+    <p class="m-0 text-slate-600">Favorites, pins, collections, preferences, and account connections from this session.</p>
   </div>
-  <aside class="grid content-start gap-2 rounded-[28px] border border-success-line bg-success-surface p-5" aria-label="Account and provider status">
+  <aside class="grid content-start gap-2 rounded-[28px] border border-white/10 bg-slate-950 p-5 text-white" aria-label="Account and provider status">
     <p class="m-0 font-black">{capabilities.accountLabel}</p>
     <p class="m-0 text-sm text-muted">{capabilities.persistenceText}</p>
     <p class="m-0 text-sm text-muted">{capabilities.pinText}</p>

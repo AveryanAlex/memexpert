@@ -5,7 +5,7 @@
   import type { ContentKind, ContentLanguage, MemeSearchScope } from '$lib/api/types';
   import { bulkGuidanceFromSessionAndCollections, collectionListBulkOptions } from '$lib/features/memes/bulk-view-model';
   import InfiniteMemeFeed from '$lib/features/memes/InfiniteMemeFeed.svelte';
-  import { ActionLink, Badge, Button, Card, FormRow, Input, LoadingState, Notice, PageHeader, Select } from '$lib/ui';
+  import { ActionLink, Badge, Button, Card, FormRow, Input, LoadingState, Notice, Select } from '$lib/ui';
   import * as Dialog from '$lib/ui/dialog';
   import {
     buildSearchHref,
@@ -147,7 +147,11 @@
   {/if}
 </svelte:head>
 
-<PageHeader title="Search MemeXpert." description="Find a meme by phrase, tag, format, language, collection access, and safe-content preferences. Every filter lives in the URL so results are shareable." badge="Catalog search" />
+<section class="mb-6 rounded-[34px] border border-white/10 bg-white/90 p-6 shadow-[0_24px_70px_rgb(15_23_42_/_14%)]">
+  <p class="m-0 text-sm font-black uppercase tracking-[0.18em] text-blue-700">Search workspace</p>
+  <h1 class="mb-2 mt-2 text-[clamp(2rem,5vw,4.2rem)] font-black leading-[0.95] tracking-[-0.07em] text-slate-950">Refine the global search.</h1>
+  <p class="m-0 max-w-3xl text-slate-600">The top bar is for fast search. This page keeps the full URL-backed filter workspace: tags, media, language, NSFW, scopes, and collections.</p>
+</section>
 
 <Card class="mb-6 grid gap-5" aria-labelledby="search-filters-title">
   <div class="flex flex-wrap items-start justify-between gap-3">

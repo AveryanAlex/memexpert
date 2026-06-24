@@ -22,6 +22,7 @@ describe('/search page', () => {
       }
     });
 
+    expect(body).toContain('Refine the global search.');
     expect(body).toContain('Search scope');
     expect(body).toContain('Specific collections');
     expect(body).toContain('My private saves');

@@ -6,9 +6,13 @@ SvelteKit SSR. Responsive. Serves as the Mini App too.
 
 ## Pages
 
+### App Shell Navigation
+
+The website uses a responsive application shell: desktop top navigation with global search, and mobile bottom tabs for For You, Trends, and Profile. The global search is available from primary browsing surfaces and exposes URL-backed filters for tags, NSFW, media type, language, search scope, and collection ids.
+
 ### Home Page
 
-Search bar + "Meme of the Day" featured section + personalized feed for users with history + trending/cold-start memes in a masonry grid. Category/tag chips remain available for quick exploration.
+"Meme of the Day" featured section + personalized For You feed for users with history + trending/cold-start memes in a masonry grid. Category/tag chips remain available for quick exploration through global search and Search workspace filters.
 
 ### Meme Page (`/memes/{slug}` or `/memes/{id}`)
 

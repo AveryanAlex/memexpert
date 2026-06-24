@@ -44,8 +44,9 @@ describe('/ page', () => {
       }
     });
 
-    expect(body).toContain('Find the right meme fast.');
-    expect(body).toContain('action="/search"');
+    expect(body).toContain('Your meme feed, tuned by every save.');
+    expect(body).toContain('For You');
+    expect(body).toContain('Open Trends');
     expect(body).toContain('Your collections');
     expect(body).toContain('Favorites');
     expect(body).toContain('Personalized for you');
@@ -60,6 +61,8 @@ describe('/ page', () => {
     expect(body).toContain('loading="lazy"');
     expect(body).toContain('preload="none"');
     expect(body).toContain('Actions for SSR cat reaction');
+    expect(body).not.toContain('Find the right meme fast.');
+    expect(body).not.toContain('action="/search"');
     expect(body).not.toContain('Previous');
     expect(body).not.toContain('Next page');
   });

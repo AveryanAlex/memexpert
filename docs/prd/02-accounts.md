@@ -25,6 +25,7 @@ When a guest links to an existing full account (e.g., already used the TG bot), 
 **Linking flows:**
 
 - **Web → Telegram:** "Link Telegram" button → deep link to bot → accounts merge
+- **Web login modal → Telegram:** the website opens a Telegram-first login modal. After the user chooses Telegram, the modal shows a bot deep link, a copyable `/start link_<code>` command for manual bot entry, a rotating waiting indicator, and polls the current session about once per second until the backend repairs the browser cookie to the full account.
 - **Web → Google/Email:** OAuth / email sign-in → upgrade or merge
 - **Telegram → Web:** "Log in with Telegram" widget or Mini App `initData` → full account recognized
 

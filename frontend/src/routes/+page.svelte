@@ -4,7 +4,7 @@
   import InfiniteMemeFeed from '$lib/features/memes/InfiniteMemeFeed.svelte';
   import type { MemeFeedSource } from '$lib/features/memes/infinite-feed';
   import MemeOfTheDayPanel from '$lib/features/memes/MemeOfTheDayPanel.svelte';
-  import { ActionLink, Button, Card, Input, Notice, PageHeader, Select } from '$lib/ui';
+  import { ActionLink, Button, Card, Input, Notice, Select } from '$lib/ui';
   import type { ActionData, PageData } from './$types';
 
   let { data, form }: { data: PageData; form: ActionData } = $props();
@@ -58,28 +58,21 @@
   }
 </script>
 
-<PageHeader title="Find the right meme fast." description="Search the public MemeXpert catalog with plain text, or browse a home feed that adapts as you use it." badge="Guest access enabled" />
-
-<form class="mb-6 flex flex-col gap-2 rounded-3xl border border-line bg-paper p-2 shadow-warm-lg md:flex-row" method="GET" action="/search">
-  <Input
-    class="flex-1 border-0 bg-transparent"
-    aria-label="Search memes"
-    name="q"
-    type="search"
-    placeholder="try: cat reaction, distracted boyfriend, friday mood"
-    value={data.query}
-  />
-  <Button type="submit">Search</Button>
-</form>
-
-<div class="mb-6 flex flex-wrap gap-2">
-  <ActionLink variant="secondary" size="compact" href="/search">Advanced search</ActionLink>
-  <ActionLink variant="ghost" size="compact" href="/search?tags=reaction&include_nsfw=false">Browse reactions</ActionLink>
-</div>
+<section class="mb-6 grid gap-4 rounded-[36px] border border-white/10 bg-white/90 p-6 shadow-[0_30px_80px_rgb(15_23_42_/_18%)] md:grid-cols-[minmax(0,1fr)_auto] md:items-end">
+  <div>
+    <p class="m-0 text-sm font-black uppercase tracking-[0.18em] text-blue-700">For You</p>
+    <h1 class="mb-3 mt-2 text-[clamp(2.4rem,7vw,5.8rem)] font-black leading-[0.9] tracking-[-0.08em] text-slate-950">Your meme feed, tuned by every save.</h1>
+    <p class="m-0 max-w-2xl text-lg text-slate-600">Search globally from the top bar, browse recommendations here, or jump into trend analytics when you want the internet’s current pulse.</p>
+  </div>
+  <div class="flex flex-wrap gap-2 md:justify-end">
+    <ActionLink href="/trends">Open Trends</ActionLink>
+    <ActionLink variant="secondary" href="/search">Advanced search</ActionLink>
+  </div>
+</section>
 
 <MemeOfTheDayPanel memeOfTheDay={data.memeOfTheDay} initialError={data.memeOfTheDayErrorMessage} showAccessMarkers={Boolean(data.session)} />
 
-<Card class="my-6 grid gap-4" aria-labelledby="collections-title">
+<Card class="my-6 grid gap-4 border-white/70 bg-white/90 shadow-[0_20px_60px_rgb(15_23_42_/_12%)]" aria-labelledby="collections-title">
   <div>
     <h2 id="collections-title" class="m-0 text-2xl font-black tracking-[-0.04em]">Your collections</h2>
     <p class="m-0 text-muted">Use Favorites for quick saves, or create custom collections from a full account.</p>
