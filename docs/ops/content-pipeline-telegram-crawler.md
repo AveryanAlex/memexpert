@@ -87,13 +87,18 @@ admin browser cookie from SvelteKit to the API.
 ### Sessions
 
 Before the runtime can ingest Telegram content, start a browser-admin login for
-each account the manager should run. In the "Start New Login" panel:
+each account the manager should run. In the "Start New Login" panel, pick the
+same flow an operator would use in the official Telegram client:
 
-- Use **QR login** to create a temporary session shell, scan the returned
-  Telegram URL from a logged-in Telegram app, then complete the attempt id.
-- Or use **Phone login** to create a temporary session shell and send a code to
-  the account phone. Complete the same attempt id with the Telegram code and,
-  when Telegram requires it, finish with the **2FA password** form.
+- **Log in with phone**: enter the phone number once, enter the Telegram code on
+  the next screen, then enter the account password only if Telegram asks for it.
+- **Log in with QR**: show the QR code, scan it from Telegram → Settings →
+  Devices → Link Desktop Device, then enter the account password only if
+  Telegram asks for it.
+
+The browser UI keeps Telegram login attempt ids in hidden form fields; operators
+do not copy/paste attempt ids between steps. The QR screen also includes a text
+link fallback for environments where an admin cannot scan the SVG image.
 - Successful login stores the authorized Telethon session encrypted in the DB,
   renames the session to `telegram_<telegram_user_id>`, sets `display_name` from
   the Telegram profile name, updates account projection, clears parked/error

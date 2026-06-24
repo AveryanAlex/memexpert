@@ -24,10 +24,14 @@ describe('/admin/telegram page', () => {
     expect(body).not.toContain('action="?/createSession"');
     expect(body).not.toContain('Stable operator-facing key');
     expect(body).toContain('action="?/startQrLogin"');
-    expect(body).toContain('action="?/completeQrLogin"');
     expect(body).toContain('action="?/startPhoneLogin"');
-    expect(body).toContain('action="?/completePhoneCodeLogin"');
-    expect(body).toContain('action="?/completePhonePasswordLogin"');
+    expect(body).toContain('Telegram login');
+    expect(body).toContain('phone → code → password');
+    expect(body).toContain('Log in with phone');
+    expect(body).toContain('Log in with QR');
+    expect(body).not.toContain('Attempt id');
+    expect(body).not.toContain('paste QR attempt id');
+    expect(body).not.toContain('paste phone attempt id');
     expect(body).toContain('action="?/validateSession"');
     expect(body).toContain('action="?/updateSession"');
     expect(body).toContain('action="?/deleteSession"');
@@ -66,10 +70,86 @@ describe('/admin/telegram page', () => {
     expect(body).toContain('Paste the Telegram session id to delete it.');
     expect(body).toContain('Could not load Telegram admin tools.');
   });
+
+  it('renders an active QR login step with an SVG QR and hidden attempt id', () => {
+    const session = telegramSession();
+    const attemptId = '44444444-4444-4444-8444-444444444444';
+    const { body } = render(TelegramAdminPage, {
+      props: {
+        data: pageData(session),
+        form: {
+          message: 'Scan the QR code with Telegram, then click Continue.',
+          kind: 'qr',
+          sessionId: session.id,
+          attemptId,
+          qrUrl: 'tg://login?token=fake-qr-token',
+          expiresAt: '2026-01-01T00:10:00Z'
+        }
+      }
+    });
+
+    expect(body).toContain('Step 2 of 2 · Scan QR');
+    expect(body).toContain('data:image/svg+xml;utf8,');
+    expect(body).toContain('alt="Telegram login QR code"');
+    expect(body).toContain('Open Telegram login link');
+    expect(body).toContain('href="tg://login?token=fake-qr-token"');
+    expect(body).toContain('action="?/completeQrLogin"');
+    expect(body).toContain(`type="hidden" name="attempt_id" value="${attemptId}"`);
+    expect(body).toContain('I scanned it — continue');
+    expect(body).not.toContain('Attempt id');
+  });
+
+  it('renders an active phone code step with hidden attempt id', () => {
+    const session = telegramSession();
+    const attemptId = '55555555-5555-4555-8555-555555555555';
+    const { body } = render(TelegramAdminPage, {
+      props: {
+        data: pageData(session),
+        form: {
+          message: 'Code sent to phone ending-1234. Enter the code from Telegram.',
+          kind: 'phone_code',
+          sessionId: session.id,
+          attemptId,
+          phoneHint: 'ending-1234',
+          expiresAt: '2026-01-01T00:10:00Z'
+        }
+      }
+    });
+
+    expect(body).toContain('Step 2 of 3 · Enter code');
+    expect(body).toContain('phone ending-1234');
+    expect(body).toContain('action="?/completePhoneCodeLogin"');
+    expect(body).toContain('name="code"');
+    expect(body).toContain(`type="hidden" name="attempt_id" value="${attemptId}"`);
+    expect(body).not.toContain('Attempt id');
+  });
+
+  it('renders an active QR password step with hidden attempt id', () => {
+    const session = telegramSession();
+    const attemptId = '66666666-6666-4666-8666-666666666666';
+    const { body } = render(TelegramAdminPage, {
+      props: {
+        data: pageData(session),
+        form: {
+          message: 'Telegram requires the account password. Enter it to finish.',
+          kind: 'password',
+          method: 'qr',
+          sessionId: session.id,
+          attemptId
+        }
+      }
+    });
+
+    expect(body).toContain('Step 2 of 2 · Enter password');
+    expect(body).toContain('Telegram password');
+    expect(body).toContain('action="?/completePhonePasswordLogin"');
+    expect(body).toContain('type="hidden" name="method" value="qr"');
+    expect(body).toContain(`type="hidden" name="attempt_id" value="${attemptId}"`);
+    expect(body).not.toContain('Attempt id');
+  });
 });
 
-function pageData() {
-  const session = telegramSession();
+function pageData(session = telegramSession()) {
   return {
     session: null,
     sessionError: null,

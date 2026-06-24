@@ -102,8 +102,16 @@ class _FakeSentCode:
 class _FakeQrLogin:
     url = "tg://login?token=fake-qr-token"
 
+    def __init__(self, *, require_password: bool = False) -> None:
+        self.require_password = require_password
+
     async def wait(self, *, timeout: int) -> object:
         _ = timeout
+        if self.require_password:
+            class SessionPasswordNeededError(Exception):
+                pass
+
+            raise SessionPasswordNeededError("password required")
         return object()
 
 
@@ -156,7 +164,7 @@ class _FakeTelegramLoginClient:
 
     async def qr_login(self) -> _FakeQrLogin:
         self.string_session = "temporary-telegram-qr-login-session"
-        return _FakeQrLogin()
+        return _FakeQrLogin(require_password=self.require_password)
 
 
 async def test_admin_routes_require_session_cookie_admin_flag_and_ignore_operator_header(
@@ -1463,6 +1471,109 @@ async def test_admin_telegram_phone_login_supports_2fa_password_without_leaking_
         audit_text = f"{row.previous_values} {row.new_values} {row.note}"
         assert password not in audit_text
         assert full_phone_number not in audit_text
+        assert "encrypted_string_session" not in audit_text
+
+
+async def test_admin_telegram_qr_login_supports_2fa_password_without_leaking_secret(
+    auth_app: FastAPI,
+    auth_settings_overrides: dict[str, str],
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch,
+) -> None:
+    admin_token = await _issue_user_cookie(
+        postgres_session_factory,
+        auth_settings_overrides,
+        email="admin-telegram-qr-2fa@example.com",
+        is_admin=True,
+    )
+    password = "very secret qr telegram password"
+    fake_clients: list[_FakeTelegramLoginClient] = []
+
+    def fake_build_telegram_client(
+        self: admin_telegram_login_module.AdminTelegramLoginService,
+        string_session: SecretStr | None = None,
+    ) -> _FakeTelegramLoginClient:
+        _ = self, string_session
+        client = _FakeTelegramLoginClient(require_password=True)
+        fake_clients.append(client)
+        return client
+
+    monkeypatch.setattr(
+        admin_telegram_login_module.AdminTelegramLoginService,
+        "_build_telegram_client",
+        fake_build_telegram_client,
+    )
+
+    transport = ASGITransport(app=auth_app)
+    async with AsyncClient(transport=transport, base_url="https://testserver") as admin_client:
+        admin_client.cookies.set(ACCESS_COOKIE_NAME, admin_token)
+        create_response = await admin_client.post(
+            "/api/v1/admin/telegram/sessions",
+            json={},
+        )
+        session_id = create_response.json()["id"]
+        qr_start_response = await admin_client.post(
+            f"/api/v1/admin/telegram/sessions/{session_id}/login/qr/start",
+        )
+        qr_complete_response = await admin_client.post(
+            f"/api/v1/admin/telegram/sessions/{session_id}/login/qr/complete",
+            json={"attempt_id": qr_start_response.json()["attempt_id"]},
+        )
+        password_response = await admin_client.post(
+            f"/api/v1/admin/telegram/sessions/{session_id}/login/phone/password",
+            json={"attempt_id": qr_start_response.json()["attempt_id"], "password": password},
+        )
+
+    assert create_response.status_code == 201
+    assert qr_start_response.status_code == 200
+    assert qr_start_response.json()["qr_url"] == "tg://login?token=fake-qr-token"
+    assert qr_complete_response.status_code == 200
+    qr_complete_payload = qr_complete_response.json()
+    assert qr_complete_payload["password_required"] is True
+    assert qr_complete_payload["telegram_session"]["status"] == "auth_required"
+    assert qr_complete_payload["telegram_session"]["has_string_session"] is False
+    assert password not in qr_complete_response.text
+    assert "temporary-telegram-qr-login-session" not in qr_complete_response.text
+
+    assert password_response.status_code == 200
+    password_payload = password_response.json()
+    assert password_payload["password_required"] is False
+    assert password_payload["telegram_session"]["status"] == "active"
+    assert password_payload["telegram_session"]["name"] == "telegram_777000"
+    assert password_payload["telegram_session"]["display_name"] == "Validated Admin"
+    assert password_payload["telegram_session"]["has_string_session"] is True
+    assert password not in password_response.text
+    assert "authorized-telegram-login-session" not in password_response.text
+    assert fake_clients[0].sign_in_calls == [
+        {"password": password},
+    ]
+
+    async with postgres_session_factory() as session:
+        persisted = await session.get(TelegramSession, UUID(session_id))
+        login_attempt = await session.scalar(
+            select(TelegramSessionLoginAttempt).where(
+                TelegramSessionLoginAttempt.id == UUID(qr_start_response.json()["attempt_id"]),
+            ),
+        )
+        audit_rows = (
+            await session.execute(
+                select(TelegramAdminAuditLog).where(TelegramAdminAuditLog.telegram_session_id == UUID(session_id)),
+            )
+        ).scalars().all()
+
+    assert persisted is not None
+    assert persisted.encrypted_string_session is not None
+    assert persisted.encrypted_string_session != "authorized-telegram-login-session"
+    assert persisted.name == "telegram_777000"
+    assert persisted.display_name == "Validated Admin"
+    assert login_attempt is not None
+    assert login_attempt.method == "qr"
+    assert login_attempt.status == "completed"
+    assert login_attempt.encrypted_temp_string_session is None
+    for row in audit_rows:
+        audit_text = f"{row.previous_values} {row.new_values} {row.note}"
+        assert password not in audit_text
+        assert "temporary-telegram-qr-login-session" not in audit_text
         assert "encrypted_string_session" not in audit_text
 
 

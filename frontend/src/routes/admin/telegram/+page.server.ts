@@ -100,25 +100,36 @@ export const actions: Actions = {
       const sessionId = await ensureLoginSessionId(api, data);
       const result = await startAdminTelegramQrLogin(api, sessionId);
       return {
-        message: `QR login started. Scan ${result.qr_url}, then complete attempt ${result.attempt_id}. Expires at ${result.expires_at}.`,
+        message: 'Scan the QR code with Telegram, then click Continue.',
         kind: 'qr' as const,
         sessionId,
         attemptId: result.attempt_id,
-        qrUrl: result.qr_url
+        qrUrl: result.qr_url,
+        expiresAt: result.expires_at
       };
     });
   },
   completeQrLogin: async ({ fetch, request }) => {
     const data = await request.formData();
     const sessionId = readRequired(data, 'session_id');
+    const attemptId = readRequired(data, 'attempt_id');
     return runAction(async () => {
       const result = await completeAdminTelegramQrLogin(
         {
           ...apiRequest(fetch, request),
-          body: { attempt_id: readRequired(data, 'attempt_id'), note: readOptional(data, 'note') }
+          body: { attempt_id: attemptId, note: readOptional(data, 'note') }
         },
         sessionId
       );
+      if (result.password_required) {
+        return {
+          message: 'Telegram requires the account password. Enter it to finish.',
+          kind: 'password' as const,
+          method: 'qr' as const,
+          sessionId,
+          attemptId
+        };
+      }
       return { message: result.message };
     });
   },
@@ -135,10 +146,12 @@ export const actions: Actions = {
         sessionId
       );
       return {
-        message: `Telegram code sent to phone ${result.phone_number_hint ?? 'account'}. Complete attempt ${result.attempt_id}. Expires at ${result.expires_at}.`,
-        kind: 'phone' as const,
+        message: `Code sent to phone ${result.phone_number_hint ?? 'account'}. Enter the code from Telegram.`,
+        kind: 'phone_code' as const,
         sessionId,
-        attemptId: result.attempt_id
+        attemptId: result.attempt_id,
+        phoneHint: result.phone_number_hint,
+        expiresAt: result.expires_at
       };
     });
   },
@@ -156,8 +169,9 @@ export const actions: Actions = {
       );
       if (result.password_required) {
         return {
-          message: 'Telegram 2FA password required. Enter it below to finish login.',
+          message: 'Telegram requires the account password. Enter it to finish.',
           kind: 'password' as const,
+          method: 'phone' as const,
           sessionId,
           attemptId
         };

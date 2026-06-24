@@ -1,5 +1,6 @@
 <script lang="ts">
   import AdminPanel from '$lib/features/admin/AdminPanel.svelte';
+  import { qrSvgDataUri } from '$lib/qr/svg';
   import { ActionLink, Badge, Button, EmptyState, FormRow, Input, Notice, Select, Textarea } from '$lib/ui';
   import type { AdminSourceChannelRead, AdminTelegramChannelGroupRead, AdminTelegramSessionRead, TelegramSessionStatus } from '$lib/api/types';
   import type { ActionData, PageData } from './$types';
@@ -8,6 +9,11 @@
 
   const sessionStatuses: TelegramSessionStatus[] = ['active', 'auth_required', 'flood_wait', 'quarantined', 'stopped'];
   const channels = $derived(data.telegramAdmin.groups.flatMap((group) => group.channels));
+
+  type LoginStepAction =
+    | { kind: 'qr'; sessionId: string; attemptId: string; qrUrl: string; expiresAt?: string; message: string; error?: boolean }
+    | { kind: 'phone_code'; sessionId: string; attemptId: string; phoneHint?: string | null; expiresAt?: string; message: string; error?: boolean }
+    | { kind: 'password'; method: 'phone' | 'qr'; sessionId: string; attemptId: string; message: string; error?: boolean };
 
   function sessionLabel(session: AdminTelegramSessionRead): string {
     return session.display_name === session.name ? session.name : `${session.display_name} (${session.name})`;
@@ -60,6 +66,26 @@
     ].filter(Boolean);
     return parts.length > 0 ? parts.join(' · ') : 'no account metadata';
   }
+
+  function loginStepFor(session: AdminTelegramSessionRead): LoginStepAction | null {
+    const candidate = form as LoginStepAction | null | undefined;
+    if (!candidate || candidate.sessionId !== session.id) {
+      return null;
+    }
+    return candidate.kind === 'qr' || candidate.kind === 'phone_code' || candidate.kind === 'password' ? candidate : null;
+  }
+
+  function qrImageSrc(qrUrl: string): string | null {
+    try {
+      return qrSvgDataUri(qrUrl);
+    } catch {
+      return null;
+    }
+  }
+
+  function expiresCopy(value: string | undefined): string {
+    return value ? formatTimestamp(value) : 'soon';
+  }
 </script>
 
 <section>
@@ -85,18 +111,18 @@
 
 <div class="my-5 grid gap-4 xl:grid-cols-[minmax(340px,0.75fr)_minmax(0,1.25fr)]">
   <AdminPanel title="Start New Login">
-    <p class="m-0 text-sm text-muted">Authenticate with Telegram only. MemeExpert creates the session row automatically, names it from the Telegram user id, and sets the display name from the Telegram profile.</p>
+    <p class="m-0 text-sm text-muted">Authenticate with Telegram only. Pick one method; MemeExpert creates the session row and continues the next step on that new session card.</p>
     <div class="grid gap-3 md:grid-cols-2">
       <form method="POST" action="?/startQrLogin" class="grid content-start gap-3 rounded-2xl border border-line bg-soft/40 p-3">
-        <strong>QR login</strong>
-        <p class="m-0 text-sm text-muted">Start a new session and scan the Telegram QR URL from the success notice.</p>
-        <Button type="submit" variant="secondary">Start QR login</Button>
+        <strong>Log in with QR</strong>
+        <p class="m-0 text-sm text-muted">Show a QR code you can scan from Telegram → Devices.</p>
+        <Button type="submit" variant="secondary">Show QR code</Button>
       </form>
       <form method="POST" action="?/startPhoneLogin" class="grid content-start gap-3 rounded-2xl border border-line bg-soft/40 p-3">
-        <strong>Phone login</strong>
-        <p class="m-0 text-sm text-muted">Start a new session by sending a Telegram login code. The full phone number is never rendered back.</p>
+        <strong>Log in with phone</strong>
+        <p class="m-0 text-sm text-muted">Enter the phone number once, then continue with the Telegram code.</p>
         <FormRow label="Phone number"><Input name="phone_number" autocomplete="tel" placeholder="+15551234567" required /></FormRow>
-        <Button type="submit" variant="secondary">Send code</Button>
+        <Button type="submit" variant="secondary">Continue</Button>
       </form>
     </div>
   </AdminPanel>
@@ -137,6 +163,7 @@
   {:else}
     <div class="grid gap-4">
       {#each data.telegramAdmin.sessions as session (session.id)}
+        {@const loginStep = loginStepFor(session)}
         <article class="grid gap-4 rounded-3xl border border-line bg-paper p-4">
           <div class="flex flex-wrap items-start justify-between gap-3">
             <div>
@@ -165,49 +192,74 @@
             </div>
           {/if}
 
-          <div class="grid gap-3 xl:grid-cols-3">
-            <div class="grid content-start gap-3 rounded-2xl border border-line bg-soft/40 p-3">
-              <strong>QR login</strong>
-              <p class="m-0 text-sm text-muted">Start QR login, scan the returned Telegram URL, then complete the attempt id from the success notice.</p>
-              <form method="POST" action="?/startQrLogin" class="grid gap-2">
-                <input type="hidden" name="session_id" value={session.id} />
-                <Button type="submit" variant="secondary">Start QR login</Button>
-              </form>
-              <form method="POST" action="?/completeQrLogin" class="grid gap-2 border-t border-line pt-2">
-                <input type="hidden" name="session_id" value={session.id} />
-                <FormRow label="Attempt id"><Input name="attempt_id" placeholder="paste QR attempt id" required /></FormRow>
-                <Input name="note" placeholder="login note" />
-                <Button type="submit">Complete QR login</Button>
-              </form>
+          <div class="grid gap-3 rounded-2xl border border-line bg-soft/40 p-4">
+            <div>
+              <strong>Telegram login</strong>
+              <p class="m-0 text-sm text-muted">Use the same simple flow as Telegram: phone → code → password if needed, or QR → password if needed.</p>
             </div>
 
-            <div class="grid content-start gap-3 rounded-2xl border border-line bg-soft/40 p-3">
-              <strong>Phone + code login</strong>
-              <p class="m-0 text-sm text-muted">Send a code to the account phone. The full number is submitted once and never rendered back.</p>
-              <form method="POST" action="?/startPhoneLogin" class="grid gap-2">
+            {#if loginStep?.kind === 'qr'}
+              {@const qrImage = qrImageSrc(loginStep.qrUrl)}
+              <div class="grid gap-4 lg:grid-cols-[220px_minmax(0,1fr)]">
+                <div class="rounded-2xl border border-line bg-paper p-3">
+                  {#if qrImage}
+                    <img src={qrImage} alt="Telegram login QR code" class="mx-auto aspect-square w-full max-w-[220px]" />
+                  {:else}
+                    <p class="m-0 text-sm text-muted">QR image could not be rendered. Use the fallback link.</p>
+                  {/if}
+                </div>
+                <form method="POST" action="?/completeQrLogin" class="grid content-start gap-3">
+                  <input type="hidden" name="session_id" value={session.id} />
+                  <input type="hidden" name="attempt_id" value={loginStep.attemptId} />
+                  <div>
+                    <strong>Step 2 of 2 · Scan QR</strong>
+                    <p class="m-0 text-sm text-muted">Open Telegram → Settings → Devices → Link Desktop Device, scan this code, then continue here.</p>
+                    <p class="m-0 text-sm text-muted">Expires {expiresCopy(loginStep.expiresAt)}.</p>
+                    <a class="text-sm font-extrabold text-ink underline" href={loginStep.qrUrl}>Open Telegram login link</a>
+                  </div>
+                  <Button type="submit">I scanned it — continue</Button>
+                </form>
+              </div>
+            {:else if loginStep?.kind === 'phone_code'}
+              <form method="POST" action="?/completePhoneCodeLogin" class="grid gap-3 md:max-w-xl">
                 <input type="hidden" name="session_id" value={session.id} />
-                <FormRow label="Phone number"><Input name="phone_number" autocomplete="tel" placeholder="+15551234567" required /></FormRow>
-                <Input name="note" placeholder="login note" />
-                <Button type="submit" variant="secondary">Send code</Button>
+                <input type="hidden" name="attempt_id" value={loginStep.attemptId} />
+                <div>
+                  <strong>Step 2 of 3 · Enter code</strong>
+                  <p class="m-0 text-sm text-muted">Telegram sent a code to {loginStep.phoneHint ? `phone ${loginStep.phoneHint}` : 'the account phone'}. Expires {expiresCopy(loginStep.expiresAt)}.</p>
+                </div>
+                <FormRow label="Telegram code"><Input name="code" autocomplete="one-time-code" inputmode="numeric" required autofocus /></FormRow>
+                <Button type="submit">Continue</Button>
               </form>
-              <form method="POST" action="?/completePhoneCodeLogin" class="grid gap-2 border-t border-line pt-2">
+            {:else if loginStep?.kind === 'password'}
+              <form method="POST" action="?/completePhonePasswordLogin" class="grid gap-3 md:max-w-xl">
                 <input type="hidden" name="session_id" value={session.id} />
-                <FormRow label="Attempt id"><Input name="attempt_id" placeholder="paste phone attempt id" required /></FormRow>
-                <FormRow label="Telegram code"><Input name="code" autocomplete="one-time-code" required /></FormRow>
-                <Input name="note" placeholder="login note" />
-                <Button type="submit">Complete code login</Button>
+                <input type="hidden" name="attempt_id" value={loginStep.attemptId} />
+                <input type="hidden" name="method" value={loginStep.method} />
+                <div>
+                  <strong>{loginStep.method === 'qr' ? 'Step 2 of 2' : 'Step 3 of 3'} · Enter password</strong>
+                  <p class="m-0 text-sm text-muted">Telegram requires the account password to finish this login.</p>
+                </div>
+                <FormRow label="Telegram password"><Input name="password" type="password" autocomplete="current-password" required autofocus /></FormRow>
+                <Button type="submit">Finish login</Button>
               </form>
-            </div>
-
-            <form method="POST" action="?/completePhonePasswordLogin" class="grid content-start gap-3 rounded-2xl border border-line bg-soft/40 p-3">
-              <input type="hidden" name="session_id" value={session.id} />
-              <strong>2FA password</strong>
-              <p class="m-0 text-sm text-muted">Use this only after code login reports that Telegram requires the account password.</p>
-              <FormRow label="Attempt id"><Input name="attempt_id" placeholder="same phone attempt id" required /></FormRow>
-              <FormRow label="2FA password"><Input name="password" type="password" autocomplete="current-password" required /></FormRow>
-              <Input name="note" placeholder="login note" />
-              <Button type="submit">Finish password login</Button>
-            </form>
+            {:else}
+              <div class="grid gap-3 md:grid-cols-2">
+                <form method="POST" action="?/startPhoneLogin" class="grid content-start gap-3 rounded-2xl border border-line bg-paper p-3">
+                  <input type="hidden" name="session_id" value={session.id} />
+                  <strong>Log in with phone</strong>
+                  <p class="m-0 text-sm text-muted">Enter the phone number, then the Telegram code.</p>
+                  <FormRow label="Phone number"><Input name="phone_number" autocomplete="tel" placeholder="+15551234567" required /></FormRow>
+                  <Button type="submit" variant="secondary">Continue</Button>
+                </form>
+                <form method="POST" action="?/startQrLogin" class="grid content-start gap-3 rounded-2xl border border-line bg-paper p-3">
+                  <input type="hidden" name="session_id" value={session.id} />
+                  <strong>Log in with QR</strong>
+                  <p class="m-0 text-sm text-muted">Show a QR code and scan it with Telegram.</p>
+                  <Button type="submit" variant="secondary">Show QR code</Button>
+                </form>
+              </div>
+            {/if}
           </div>
 
           <div class="grid gap-3 xl:grid-cols-[minmax(0,1.4fr)_minmax(260px,0.7fr)_minmax(260px,0.7fr)]">

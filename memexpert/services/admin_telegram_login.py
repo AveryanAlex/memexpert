@@ -192,7 +192,7 @@ class AdminTelegramLoginService:
         row, attempt = await self._get_valid_attempt(
             telegram_session_id,
             request.attempt_id,
-            method="phone",
+            allowed_methods={"phone", "qr"},
             allowed_statuses={"password_required"},
         )
         live_attempt = await self._live_or_restored_attempt(attempt)
@@ -286,6 +286,21 @@ class AdminTelegramLoginService:
         try:
             await _maybe_await(live_attempt.qr_login.wait(timeout=5))
         except Exception as exc:
+            if type(exc).__name__ == _PASSWORD_REQUIRED_ERROR_CLASS:
+                attempt.status = "password_required"
+                attempt.encrypted_temp_string_session = await self._encrypt_required_client_session(live_attempt.client)
+                _LIVE_LOGIN_ATTEMPTS[attempt.id] = live_attempt
+                await self.session.commit()
+                await self.session.refresh(row)
+                counts_by_session = await self._admin_service._count_source_channels_by_session()
+                return AdminTelegramLoginCompleteRead(
+                    telegram_session=self._admin_service._telegram_session_read(
+                        row,
+                        owned_channel_count=counts_by_session.get(row.id, 0),
+                    ),
+                    password_required=True,
+                    message="Telegram requires the account 2FA password to finish login.",
+                )
             _LIVE_LOGIN_ATTEMPTS.pop(attempt.id, None)
             await self._disconnect_client(live_attempt.client)
             await self._mark_attempt_and_session_failed(row, attempt, exc)
@@ -312,7 +327,8 @@ class AdminTelegramLoginService:
         telegram_session_id: uuid.UUID,
         attempt_id: uuid.UUID,
         *,
-        method: str,
+        method: str | None = None,
+        allowed_methods: set[str] | None = None,
         allowed_statuses: set[str],
     ) -> tuple[TelegramSession, TelegramSessionLoginAttempt]:
         row = await self._get_session_for_login(telegram_session_id)
@@ -321,7 +337,11 @@ class AdminTelegramLoginService:
             .where(TelegramSessionLoginAttempt.id == attempt_id)
             .with_for_update(),
         )
-        if attempt is None or attempt.telegram_session_id != row.id or attempt.method != method:
+        if attempt is None or attempt.telegram_session_id != row.id:
+            raise AdminConflictError("Login attempt is invalid for this Telegram session.")
+        if method is not None and attempt.method != method:
+            raise AdminConflictError("Login attempt is invalid for this Telegram session.")
+        if allowed_methods is not None and attempt.method not in allowed_methods:
             raise AdminConflictError("Login attempt is invalid for this Telegram session.")
         if attempt.status not in allowed_statuses:
             raise AdminConflictError(f"Login attempt is already {attempt.status}.")
