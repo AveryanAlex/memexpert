@@ -22,7 +22,7 @@ export class ProfilePage {
   async expectFullAccountProfileState(fixture: SeededCollectionManagementFixture) {
     await this.goto();
 
-    await expect(this.page.getByRole('heading', { name: 'Your meme shelf.', exact: true })).toBeVisible();
+    await expect(this.page.getByRole('heading', { name: 'Your meme command center.', exact: true })).toBeVisible();
     await expect(this.page.getByText('Connected profile', { exact: true })).toBeVisible();
     await expect(
       this.page.getByText('Favorites, saves, pins, and active collection follow this connected account.', { exact: true })
