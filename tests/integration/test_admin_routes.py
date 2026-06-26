@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, cast
 from uuid import UUID, uuid7
@@ -102,11 +104,15 @@ class _FakeSentCode:
 class _FakeQrLogin:
     url = "tg://login?token=fake-qr-token"
 
-    def __init__(self, *, require_password: bool = False) -> None:
+    def __init__(self, *, require_password: bool = False, wait_event: asyncio.Event | None = None) -> None:
         self.require_password = require_password
+        self.wait_event = wait_event
+        self.wait_started = asyncio.Event()
 
-    async def wait(self, *, timeout: int) -> object:
-        _ = timeout
+    async def wait(self, *, timeout: int | float | None = None) -> object:
+        self.wait_started.set()
+        if self.wait_event is not None:
+            await asyncio.wait_for(self.wait_event.wait(), timeout=timeout)
         if self.require_password:
             class SessionPasswordNeededError(Exception):
                 pass
@@ -132,12 +138,14 @@ class _FakeTelegramSessionStore:
 
 
 class _FakeTelegramLoginClient:
-    def __init__(self, *, require_password: bool = False) -> None:
+    def __init__(self, *, require_password: bool = False, qr_wait_event: asyncio.Event | None = None) -> None:
         self.require_password = require_password
+        self.qr_wait_event = qr_wait_event
         self.string_session = "temporary-telegram-login-session"
         self.session = _FakeTelegramSessionStore(self)
         self.sign_in_calls: list[dict[str, object]] = []
         self.disconnected = False
+        self.qr_login_instance: _FakeQrLogin | None = None
 
     async def connect(self) -> None:
         self.disconnected = False
@@ -164,7 +172,8 @@ class _FakeTelegramLoginClient:
 
     async def qr_login(self) -> _FakeQrLogin:
         self.string_session = "temporary-telegram-qr-login-session"
-        return _FakeQrLogin(require_password=self.require_password)
+        self.qr_login_instance = _FakeQrLogin(require_password=self.require_password, wait_event=self.qr_wait_event)
+        return self.qr_login_instance
 
 
 async def test_admin_routes_require_session_cookie_admin_flag_and_ignore_operator_header(
@@ -1474,6 +1483,94 @@ async def test_admin_telegram_phone_login_supports_2fa_password_without_leaking_
         assert "encrypted_string_session" not in audit_text
 
 
+async def test_admin_telegram_qr_login_pending_poll_does_not_fail_attempt(
+    auth_app: FastAPI,
+    auth_settings_overrides: dict[str, str],
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch,
+) -> None:
+    admin_token = await _issue_user_cookie(
+        postgres_session_factory,
+        auth_settings_overrides,
+        email="admin-telegram-qr-pending@example.com",
+        is_admin=True,
+    )
+    qr_wait_event = asyncio.Event()
+    fake_clients: list[_FakeTelegramLoginClient] = []
+
+    def fake_build_telegram_client(
+        self: admin_telegram_login_module.AdminTelegramLoginService,
+        string_session: SecretStr | None = None,
+    ) -> _FakeTelegramLoginClient:
+        _ = self, string_session
+        client = _FakeTelegramLoginClient(qr_wait_event=qr_wait_event)
+        fake_clients.append(client)
+        return client
+
+    monkeypatch.setattr(
+        admin_telegram_login_module.AdminTelegramLoginService,
+        "_build_telegram_client",
+        fake_build_telegram_client,
+    )
+    monkeypatch.setattr(admin_telegram_login_module, "QR_LOGIN_POLL_TIMEOUT_SECONDS", 0.01)
+
+    transport = ASGITransport(app=auth_app)
+    async with AsyncClient(transport=transport, base_url="https://testserver") as admin_client:
+        admin_client.cookies.set(ACCESS_COOKIE_NAME, admin_token)
+        create_response = await admin_client.post(
+            "/api/v1/admin/telegram/sessions",
+            json={},
+        )
+        session_id = create_response.json()["id"]
+        qr_start_response = await admin_client.post(
+            f"/api/v1/admin/telegram/sessions/{session_id}/login/qr/start",
+        )
+        assert fake_clients[0].qr_login_instance is not None
+        await asyncio.wait_for(fake_clients[0].qr_login_instance.wait_started.wait(), timeout=1)
+        qr_complete_response = await admin_client.post(
+            f"/api/v1/admin/telegram/sessions/{session_id}/login/qr/complete",
+            json={"attempt_id": qr_start_response.json()["attempt_id"]},
+        )
+
+    assert create_response.status_code == 201
+    assert qr_start_response.status_code == 200
+    assert qr_complete_response.status_code == 200
+    qr_complete_payload = qr_complete_response.json()
+    assert qr_complete_payload == {
+        "status": "pending",
+        "telegram_session": None,
+        "password_required": False,
+        "message": "Still waiting for Telegram QR scan.",
+    }
+
+    async with postgres_session_factory() as session:
+        persisted = await session.get(TelegramSession, UUID(session_id))
+        login_attempt = await session.scalar(
+            select(TelegramSessionLoginAttempt).where(
+                TelegramSessionLoginAttempt.id == UUID(qr_start_response.json()["attempt_id"]),
+            ),
+        )
+
+    assert persisted is not None
+    assert persisted.last_error_class is None
+    assert persisted.last_error_text is None
+    assert login_attempt is not None
+    assert login_attempt.status == "pending"
+    assert login_attempt.error_class is None
+    assert login_attempt.error_text is None
+
+    live_attempt = admin_telegram_login_module._LIVE_LOGIN_ATTEMPTS.pop(  # noqa: SLF001
+        UUID(qr_start_response.json()["attempt_id"]),
+        None,
+    )
+    if live_attempt is not None:
+        if live_attempt.qr_wait_task is not None:
+            live_attempt.qr_wait_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await live_attempt.qr_wait_task
+        await live_attempt.client.disconnect()
+
+
 async def test_admin_telegram_qr_login_supports_2fa_password_without_leaking_secret(
     auth_app: FastAPI,
     auth_settings_overrides: dict[str, str],
@@ -1529,6 +1626,7 @@ async def test_admin_telegram_qr_login_supports_2fa_password_without_leaking_sec
     assert qr_start_response.json()["qr_url"] == "tg://login?token=fake-qr-token"
     assert qr_complete_response.status_code == 200
     qr_complete_payload = qr_complete_response.json()
+    assert qr_complete_payload["status"] == "password_required"
     assert qr_complete_payload["password_required"] is True
     assert qr_complete_payload["telegram_session"]["status"] == "auth_required"
     assert qr_complete_payload["telegram_session"]["has_string_session"] is False

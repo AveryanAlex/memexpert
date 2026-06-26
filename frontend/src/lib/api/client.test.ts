@@ -1035,7 +1035,10 @@ describe('admin API client', () => {
       if (url.pathname.endsWith('/login/phone/start')) {
         return jsonResponse({ attempt_id: 'phone-attempt', phone_number_hint: 'ending-1234', expires_at: '2026-01-01T00:10:00Z', message: 'code sent' });
       }
-      if (url.pathname.includes('/login/qr/') || url.pathname.includes('/login/phone/')) {
+      if (url.pathname.endsWith('/login/qr/complete')) {
+        return jsonResponse({ status: 'completed', telegram_session: telegramSessionPayload(sessionId), password_required: false, message: 'login complete' });
+      }
+      if (url.pathname.includes('/login/phone/')) {
         return jsonResponse({ telegram_session: telegramSessionPayload(sessionId), password_required: false, message: 'login complete' });
       }
       if (url.pathname.endsWith('/validate')) {

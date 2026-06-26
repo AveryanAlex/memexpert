@@ -100,7 +100,7 @@ export const actions: Actions = {
       const sessionId = await ensureLoginSessionId(api, data);
       const result = await startAdminTelegramQrLogin(api, sessionId);
       return {
-        message: 'Scan the QR code with Telegram, then click Continue.',
+        message: 'Waiting for scan…',
         kind: 'qr' as const,
         sessionId,
         attemptId: result.attempt_id,
@@ -121,7 +121,7 @@ export const actions: Actions = {
         },
         sessionId
       );
-      if (result.password_required) {
+      if (result.status === 'password_required') {
         return {
           message: 'Telegram requires the account password. Enter it to finish.',
           kind: 'password' as const,
@@ -129,6 +129,9 @@ export const actions: Actions = {
           sessionId,
           attemptId
         };
+      }
+      if (result.status === 'pending') {
+        return { message: result.message };
       }
       return { message: result.message };
     });

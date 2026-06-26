@@ -92,13 +92,16 @@ same flow an operator would use in the official Telegram client:
 
 - **Log in with phone**: enter the phone number once, enter the Telegram code on
   the next screen, then enter the account password only if Telegram asks for it.
-- **Log in with QR**: show the QR code, scan it from Telegram → Settings →
-  Devices → Link Desktop Device, then enter the account password only if
-  Telegram asks for it.
+- **Log in with QR**: show the QR code in the modal, scan it from Telegram →
+  Settings → Devices → Link Desktop Device, and wait while MemeExpert polls the
+  login automatically. The modal refreshes QR codes before they expire and shows
+  a loading spinner while a replacement QR code is being generated. Enter the
+  account password only if Telegram asks for it.
 
-The browser UI keeps Telegram login attempt ids in hidden form fields; operators
-do not copy/paste attempt ids between steps. The QR screen also includes a text
-link fallback for environments where an admin cannot scan the SVG image.
+The browser UI keeps Telegram login attempt ids hidden; operators do not
+copy/paste attempt ids between steps, and QR login no longer has an "I scanned
+it" continue button. The QR modal includes a text link fallback for environments
+where an admin cannot scan the SVG image.
 - Successful login stores the authorized Telethon session encrypted in the DB,
   renames the session to `telegram_<telegram_user_id>`, sets `display_name` from
   the Telegram profile name, updates account projection, clears parked/error

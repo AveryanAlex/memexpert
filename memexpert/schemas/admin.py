@@ -325,7 +325,7 @@ class AdminTelegramLoginQrStartRead(BaseModel):
 
 
 class AdminTelegramLoginQrCompleteRequest(BaseModel):
-    """Complete a QR login attempt after the QR code has been scanned."""
+    """Poll a QR login attempt after MemeExpert has started waiting for a scan."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -336,6 +336,17 @@ class AdminTelegramLoginQrCompleteRequest(BaseModel):
     @classmethod
     def _normalize_note(cls, value: str | None) -> str | None:
         return normalize_optional_text(value)
+
+
+class AdminTelegramLoginQrStatusRead(BaseModel):
+    """Status response for a browser-admin QR login long-poll."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["pending", "completed", "password_required"]
+    telegram_session: AdminTelegramSessionRead | None = None
+    password_required: bool = False
+    message: str
 
 
 class AdminTelegramLoginPhoneStartRequest(BaseModel):
