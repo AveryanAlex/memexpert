@@ -71,14 +71,14 @@ describe('/admin/telegram page', () => {
     expect(body).toContain('Could not load Telegram admin tools.');
   });
 
-  it('renders an active QR login step with an SVG QR and hidden attempt id', () => {
+  it('does not render the obsolete inline QR continue form', () => {
     const session = telegramSession();
     const attemptId = '44444444-4444-4444-8444-444444444444';
     const { body } = render(TelegramAdminPage, {
       props: {
         data: pageData(session),
         form: {
-          message: 'Scan the QR code with Telegram, then click Continue.',
+          message: 'Waiting for scan…',
           kind: 'qr',
           sessionId: session.id,
           attemptId,
@@ -88,14 +88,17 @@ describe('/admin/telegram page', () => {
       }
     });
 
-    expect(body).toContain('Step 2 of 2 · Scan QR');
-    expect(body).toContain('data:image/svg+xml;utf8,');
-    expect(body).toContain('alt="Telegram login QR code"');
-    expect(body).toContain('Open Telegram login link');
-    expect(body).toContain('href="tg://login?token=fake-qr-token"');
-    expect(body).toContain('action="?/completeQrLogin"');
-    expect(body).toContain(`type="hidden" name="attempt_id" value="${attemptId}"`);
-    expect(body).toContain('I scanned it — continue');
+    expect(body).toContain('Telegram login');
+    expect(body).toContain('Log in with QR');
+    expect(body).not.toContain('Step 2 of 2 · Scan QR');
+    expect(body).not.toContain('data:image/svg+xml;utf8,');
+    expect(body).not.toContain('alt="Telegram login QR code"');
+    expect(body).not.toContain('Open Telegram login link');
+    expect(body).not.toContain('href="tg://login?token=fake-qr-token"');
+    expect(body).not.toContain('Refresh QR now');
+    expect(body).not.toContain('action="?/completeQrLogin"');
+    expect(body).not.toContain(`type="hidden" name="attempt_id" value="${attemptId}"`);
+    expect(body).not.toContain('I scanned it — continue');
     expect(body).not.toContain('Attempt id');
   });
 

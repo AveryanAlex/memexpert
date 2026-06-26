@@ -52,6 +52,7 @@ from memexpert.schemas.admin import (
     AdminTelegramLoginPhoneStartRequest,
     AdminTelegramLoginQrCompleteRequest,
     AdminTelegramLoginQrStartRead,
+    AdminTelegramLoginQrStatusRead,
     AdminTelegramSessionActionRead,
     AdminTelegramSessionCreateRequest,
     AdminTelegramSessionDeleteRequest,
@@ -209,15 +210,15 @@ async def start_telegram_session_qr_login(
 
 @router.post(
     "/telegram/sessions/{session_id}/login/qr/complete",
-    response_model=AdminTelegramLoginCompleteRead,
-    summary="Complete QR login for a Telegram session",
+    response_model=AdminTelegramLoginQrStatusRead,
+    summary="Poll QR login status for a Telegram session",
 )
 async def complete_telegram_session_qr_login(
     admin_user: AdminUserDep,
     login_service: AdminTelegramLoginServiceDep,
     session_id: Annotated[uuid.UUID, Path()],
     request: Annotated[AdminTelegramLoginQrCompleteRequest, Body()],
-) -> AdminTelegramLoginCompleteRead:
+) -> AdminTelegramLoginQrStatusRead:
     try:
         return await login_service.complete_qr_login(session_id, request, admin_user_id=admin_user.id)
     except (AdminNotFoundError, AdminConflictError) as exc:

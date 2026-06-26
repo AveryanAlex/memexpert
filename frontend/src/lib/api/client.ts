@@ -24,6 +24,7 @@ import type {
   AdminTelegramLoginPhoneStartRead,
   AdminTelegramLoginQrCompletePayload,
   AdminTelegramLoginQrStartRead,
+  AdminTelegramLoginQrStatusRead,
   AdminTelegramSessionActionRead,
   AdminTelegramSessionCreatePayload,
   AdminTelegramSessionDeletePayload,
@@ -578,8 +579,8 @@ export async function startAdminTelegramQrLogin(request: CatalogRequest, session
 export async function completeAdminTelegramQrLogin(
   request: CatalogRequest & { body: AdminTelegramLoginQrCompletePayload },
   sessionId: string
-): Promise<AdminTelegramLoginCompleteRead> {
-  return apiWrite<AdminTelegramLoginCompleteRead>(
+): Promise<AdminTelegramLoginQrStatusRead> {
+  return apiWrite<AdminTelegramLoginQrStatusRead>(
     `/api/v1/admin/telegram/sessions/${encodeURIComponent(sessionId)}/login/qr/complete`,
     'POST',
     request

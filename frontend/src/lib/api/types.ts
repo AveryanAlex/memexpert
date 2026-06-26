@@ -663,6 +663,15 @@ export interface AdminTelegramLoginQrCompletePayload {
   note?: string | null;
 }
 
+export type AdminTelegramQrLoginStatus = 'pending' | 'completed' | 'password_required';
+
+export interface AdminTelegramLoginQrStatusRead {
+  status: AdminTelegramQrLoginStatus;
+  telegram_session: AdminTelegramSessionRead | null;
+  password_required: boolean;
+  message: string;
+}
+
 export interface AdminTelegramLoginPhoneStartPayload {
   phone_number: string;
   note?: string | null;
