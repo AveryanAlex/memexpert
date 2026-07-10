@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   addSourceChannel,
   addAdminTelegramChannel,
+  addAdminTelegramChannelFromReference,
   assignAdminTelegramChannel,
   ApiError,
   completeAdminTelegramPhoneCodeLogin,
@@ -1086,6 +1087,11 @@ describe('admin API client', () => {
       baseUrl: 'https://api.memexpert.test',
       body: { platform: 'telegram', platform_id: '-1001', title: 'Source', telegram_session_id: sessionId, catchup_enabled: true, live_enabled: true, engagement_enabled: true, catchup_message_limit: 500 }
     });
+    await addAdminTelegramChannelFromReference({
+      fetch: mockFetch,
+      baseUrl: 'https://api.memexpert.test',
+      body: { reference: '@source', telegram_session_id: sessionId, suggestion_id: 'suggestion-id', catchup_message_limit: 500 }
+    });
     await updateAdminTelegramChannel({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', body: { catchup_enabled: false, live_enabled: true, engagement_enabled: false, catchup_message_limit: 250 } }, channelId);
     await assignAdminTelegramChannel({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', body: { telegram_session_id: sessionId, note: 'move' } }, channelId);
     await orphanAdminTelegramChannel({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', body: { note: 'orphan' } }, channelId);
@@ -1104,12 +1110,13 @@ describe('admin API client', () => {
       ['GET', '/api/v1/admin/telegram/channels', `telegram_session_id=${sessionId}&orphaned=false`],
       ['GET', '/api/v1/admin/telegram/channels/grouped', ''],
       ['POST', '/api/v1/admin/telegram/channels', ''],
+      ['POST', '/api/v1/admin/telegram/channels/from-reference', ''],
       ['PATCH', `/api/v1/admin/telegram/channels/${channelId}`, ''],
       ['POST', `/api/v1/admin/telegram/channels/${channelId}/assign`, ''],
       ['POST', `/api/v1/admin/telegram/channels/${channelId}/orphan`, '']
     ]);
     expect(calls[0].requestedWith).toBe(null);
-    expect([1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 14, 15].every((index) => calls[index]?.requestedWith === 'XMLHttpRequest')).toBe(true);
+    expect([1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 14, 15, 16].every((index) => calls[index]?.requestedWith === 'XMLHttpRequest')).toBe(true);
     expect(calls[10].requestedWith).toBe(null);
     expect(calls[11].requestedWith).toBe(null);
     expect(calls[1].body).toMatchObject({ enabled: true });
@@ -1121,8 +1128,9 @@ describe('admin API client', () => {
     expect(calls[7].body).toEqual({ attempt_id: 'phone-attempt', password: '2fa-password', note: 'password done' });
     expect(calls[9].body).toEqual({ confirmation: sessionId, note: 'remove' });
     expect(calls[12].body).toMatchObject({ platform: 'telegram', telegram_session_id: sessionId });
-    expect(calls[14].body).toEqual({ telegram_session_id: sessionId, note: 'move' });
-    expect(calls[15].body).toEqual({ note: 'orphan' });
+    expect(calls[13].body).toEqual({ reference: '@source', telegram_session_id: sessionId, suggestion_id: 'suggestion-id', catchup_message_limit: 500 });
+    expect(calls[15].body).toEqual({ telegram_session_id: sessionId, note: 'move' });
+    expect(calls[16].body).toEqual({ note: 'orphan' });
   });
 
   it('loads moderation reports, SEO reviews, and decision history with the admin dashboard', async () => {

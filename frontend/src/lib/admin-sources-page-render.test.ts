@@ -1,6 +1,7 @@
 import { render } from 'svelte/server';
 import { describe, expect, it } from 'vitest';
 import type { AdminSourceChannelRead, AdminTelegramSessionRead, ChannelSuggestionRead } from '$lib/api/types';
+import AddSourceByReference from '$lib/features/admin/sources/AddSourceByReference.svelte';
 import SourcesAdminPage from '../routes/admin/sources/+page.svelte';
 
 describe('/admin/sources page', () => {
@@ -28,6 +29,13 @@ describe('/admin/sources page', () => {
     });
 
     expect(body).toContain('Source management');
+    expect(body).toContain('Add Telegram source');
+    expect(body).toContain('Channel link or @handle');
+    expect(body).toContain('Telegram account');
+    expect(body).toContain('action="?/addSourceByReference"');
+    expect(body).toContain('value="22222222-2222-4222-8222-222222222222" selected');
+    expect(body).toContain('Advanced settings');
+    expect(body).toContain('name="catchup_message_limit"');
     expect(body).toContain('Suggested sources');
     expect(body).toContain('https://t.me/telegram_source');
     expect(body).toContain('Add this source');
@@ -67,7 +75,6 @@ describe('/admin/sources page', () => {
     expect(body).toContain('action="?/markSourceChannelDead"');
     expect(body).toContain('Paste the source ID from Diagnostics to confirm.');
     expect(body).toContain('New sources are added without an account and with ingestion off.');
-    expect(body).not.toContain('Catch up recent posts');
     expect(body).not.toMatch(/<details[^>]*\sopen(?:=|\s|>)/);
     expect(body).not.toContain('placeholder="11111111-1111-4111-8111-111111111111"');
   });
@@ -106,6 +113,69 @@ describe('/admin/sources page', () => {
     expect(body).toMatch(/name="live_enabled" type="checkbox"(?![^>]*disabled)/);
     expect(body).toMatch(/name="engagement_enabled" type="checkbox"(?![^>]*disabled)/);
     expect(body).toMatch(/name="catchup_message_limit" type="number"(?![^>]*\sdisabled(?:=|\s|>))/);
+  });
+
+  it('auto-selects only one ready account and reports when none are ready', () => {
+    const oneReady = render(SourcesAdminPage, {
+      props: {
+        data: {
+          sourceAdmin: {
+            suggestions: [],
+            sourceChannels: [],
+            telegramAccounts: [telegramAccount(), telegramAccount({ id: 'disabled-account', enabled: false })]
+          },
+          loadError: null
+        },
+        form: null
+      } as never
+    }).body;
+    expect(oneReady).toMatch(/<option value="22222222-2222-4222-8222-222222222222" selected="">Primary ingest<\/option>/);
+    expect(oneReady).not.toContain('value="disabled-account"');
+
+    const multipleReady = render(SourcesAdminPage, {
+      props: {
+        data: {
+          sourceAdmin: {
+            suggestions: [],
+            sourceChannels: [],
+            telegramAccounts: [telegramAccount(), telegramAccount({ id: 'ready-backup', display_name: 'Ready backup' })]
+          },
+          loadError: null
+        },
+        form: null
+      } as never
+    }).body;
+    expect(multipleReady).toContain('Choose which ready account should fetch this source.');
+    expect(multipleReady).not.toMatch(/<option value="(?:22222222-2222-4222-8222-222222222222|ready-backup)" selected/);
+
+    const noneReady = render(SourcesAdminPage, {
+      props: {
+        data: {
+          sourceAdmin: { suggestions: [], sourceChannels: [], telegramAccounts: [telegramAccount({ enabled: false })] },
+          loadError: null
+        },
+        form: null
+      } as never
+    }).body;
+    expect(noneReady).toContain('No Telegram account is ready.');
+    expect(noneReady).toContain('href="/admin/telegram"');
+    expect(noneReady).toContain('<button type="submit" disabled=""');
+  });
+
+  it('shows selected suggestion context with a cancel path while retaining the atomic suggestion id', () => {
+    const { body } = render(AddSourceByReference, {
+      props: {
+        telegramAccounts: [telegramAccount()],
+        initialReference: 'https://t.me/telegram_source',
+        initialSuggestionId: 'suggestion-telegram'
+      }
+    });
+
+    expect(body).toContain('<strong>Selected suggestion:</strong> https://t.me/telegram_source');
+    expect(body).toContain('name="suggestion_id" value="suggestion-telegram"');
+    expect(body).toContain('name="reference" placeholder="@public_channel" required="" value="https://t.me/telegram_source"');
+    expect(body).toContain('Cancel suggestion');
+    expect(body).toContain('This source and its matching suggestion will be saved together.');
   });
 });
 

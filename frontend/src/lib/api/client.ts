@@ -15,6 +15,7 @@ import type {
   AdminSourceChannelRead,
   AdminTelegramChannelAssignPayload,
   AdminTelegramChannelCreatePayload,
+  AdminTelegramChannelFromReferencePayload,
   AdminTelegramChannelGroupRead,
   AdminTelegramChannelOrphanPayload,
   AdminTelegramChannelUpdatePayload,
@@ -674,6 +675,12 @@ export async function fetchAdminTelegramChannelGroups(request: CatalogRequest): 
 
 export async function addAdminTelegramChannel(request: CatalogRequest & { body: AdminTelegramChannelCreatePayload }): Promise<AdminSourceChannelRead> {
   return apiWrite<AdminSourceChannelRead>('/api/v1/admin/telegram/channels', 'POST', request);
+}
+
+export async function addAdminTelegramChannelFromReference(
+  request: CatalogRequest & { body: AdminTelegramChannelFromReferencePayload }
+): Promise<AdminSourceChannelRead> {
+  return apiWrite<AdminSourceChannelRead>('/api/v1/admin/telegram/channels/from-reference', 'POST', request);
 }
 
 export async function updateAdminTelegramChannel(

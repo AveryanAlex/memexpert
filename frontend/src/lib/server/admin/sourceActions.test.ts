@@ -6,6 +6,7 @@ describe('source admin actions', () => {
   it('exports the named handlers used by the source workspace', () => {
     expect(Object.keys(sourceActions)).toEqual([
       'reviewSuggestion',
+      'addSourceByReference',
       'addSourceChannel',
       'toggleSourceChannel',
       'markSourceChannelDead',
@@ -34,6 +35,7 @@ describe('source admin actions', () => {
     }) satisfies ApiFetch;
 
     await expect(sourceActions.reviewSuggestion(actionEvent({ suggestion_id: suggestionId, decision: 'reject', admin_note: 'duplicate' }, fetch))).resolves.toEqual({ message: 'Suggestion rejected.' });
+    await expect(sourceActions.addSourceByReference(actionEvent({ reference: 'https://t.me/source', telegram_session_id: sessionId, suggestion_id: suggestionId, catchup_message_limit: '750' }, fetch))).resolves.toEqual({ message: 'Telegram source added and suggestion approved.' });
     await expect(sourceActions.addSourceChannel(actionEvent({ platform: 'telegram', platform_id: '-1001234', username: 'source', title: 'Source' }, fetch))).resolves.toEqual({ message: 'Source added without an account; ingestion is off.' });
     await expect(sourceActions.toggleSourceChannel(actionEvent({ channel_id: channelId, paused: 'true' }, fetch))).resolves.toEqual({ message: 'Source paused.' });
     await expect(sourceActions.markSourceChannelDead(actionEvent({ channel_id: channelId, confirmation: channelId }, fetch))).resolves.toEqual({ message: 'Source removed from crawling; checkpoint history was preserved.' });
@@ -44,6 +46,7 @@ describe('source admin actions', () => {
 
     expect(calls).toEqual([
       { path: `/api/v1/admin/channel-suggestions/${suggestionId}/reject`, method: 'POST', body: { admin_note: 'duplicate' } },
+      { path: '/api/v1/admin/telegram/channels/from-reference', method: 'POST', body: { reference: 'https://t.me/source', telegram_session_id: sessionId, suggestion_id: suggestionId, catchup_message_limit: 750 } },
       { path: '/api/v1/admin/source-channels', method: 'POST', body: { platform: 'telegram', platform_id: '-1001234', username: 'source', title: 'Source', orphaned: true, catchup_message_limit: 500, catchup_enabled: false, live_enabled: false, engagement_enabled: false } },
       { path: `/api/v1/admin/source-channels/${channelId}/pause`, method: 'POST', body: null },
       { path: `/api/v1/admin/source-channels/${channelId}/mark-dead`, method: 'POST', body: { confirmation: channelId } },
@@ -55,9 +58,9 @@ describe('source admin actions', () => {
   });
 
   it('maps API failures to Svelte action failures', async () => {
-    const result = await sourceActions.addSourceChannel(
+    const result = await sourceActions.addSourceByReference(
       actionEvent(
-        { platform: 'telegram', platform_id: '-1001234', title: 'Source' },
+        { reference: '@source', telegram_session_id: '22222222-2222-4222-8222-222222222222' },
         (async () => jsonResponse({ detail: 'Source already exists.' }, 409)) satisfies ApiFetch
       )
     );
@@ -71,6 +74,7 @@ describe('source admin actions', () => {
 
     const malformedActions = [
       { result: sourceActions.reviewSuggestion(actionEvent({ decision: 'reject' }, fetch)), message: 'suggestion_id is required.' },
+      { result: sourceActions.addSourceByReference(actionEvent({ reference: '@source' }, fetch)), message: 'telegram_session_id is required.' },
       { result: sourceActions.addSourceChannel(actionEvent({ platform: 'telegram', platform_id: '-100' }, fetch)), message: 'title is required.' },
       { result: sourceActions.addSourceChannel(actionEvent({ platform: 'reddit', platform_id: 'r/source', title: 'Source' }, fetch)), message: 'Only Telegram sources can be added until crawler support is available.' },
       { result: sourceActions.toggleSourceChannel(actionEvent({ channel_id: channelId, paused: 'yes' }, fetch)), message: 'paused must be true or false.' },

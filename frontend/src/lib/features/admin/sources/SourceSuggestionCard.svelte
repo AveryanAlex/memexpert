@@ -23,7 +23,7 @@
   {/if}
 
   {#if isTelegram}
-    <p class="m-0 text-sm text-muted">Add this source to prefill the advanced manual Telegram entry. Verify the canonical platform ID before saving.</p>
+    <p class="m-0 text-sm text-muted">Add this source to prefill the public channel form. The source and suggestion are saved together.</p>
     <div class="flex flex-wrap gap-2">
       <Button type="button" variant="secondary" onclick={() => onAddTelegram?.(suggestion)}>Add this source</Button>
       <form method="POST" action="?/reviewSuggestion">

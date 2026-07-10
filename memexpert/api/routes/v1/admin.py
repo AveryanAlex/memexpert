@@ -45,6 +45,7 @@ from memexpert.schemas.admin import (
     AdminSourceChannelOrphanRequest,
     AdminSourceChannelRead,
     AdminSourceChannelUpdateRequest,
+    AdminTelegramChannelFromReferenceRequest,
     AdminTelegramChannelGroupRead,
     AdminTelegramLoginCompleteRead,
     AdminTelegramLoginPasswordRequest,
@@ -402,6 +403,26 @@ async def add_telegram_source_channel(
         )
     try:
         return await admin_service.add_source_channel(request, admin_user_id=admin_user.id)
+    except (AdminNotFoundError, AdminConflictError) as exc:
+        raise _map_admin_error(exc) from exc
+
+
+@router.post(
+    "/telegram/channels/from-reference",
+    response_model=AdminSourceChannelRead,
+    status_code=status.HTTP_201_CREATED,
+    summary="Resolve and add a public Telegram channel",
+)
+async def add_telegram_source_channel_from_reference(
+    admin_user: AdminUserDep,
+    admin_service: AdminServiceDep,
+    request: Annotated[AdminTelegramChannelFromReferenceRequest, Body()],
+) -> AdminSourceChannelRead:
+    try:
+        return await admin_service.add_telegram_channel_from_reference(
+            request,
+            admin_user_id=admin_user.id,
+        )
     except (AdminNotFoundError, AdminConflictError) as exc:
         raise _map_admin_error(exc) from exc
 

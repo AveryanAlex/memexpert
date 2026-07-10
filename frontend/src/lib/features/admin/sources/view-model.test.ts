@@ -1,6 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import type { AdminSourceChannelRead, AdminTelegramSessionRead } from '$lib/api/types';
-import { lastFetchLabel, relativeTimestamp, toSourceCardViewModel } from './view-model';
+import {
+  clearSourceSuggestionPrefill,
+  defaultTelegramAccountId,
+  lastFetchLabel,
+  readyTelegramAccounts,
+  relativeTimestamp,
+  sourceSuggestionPrefill,
+  toSourceCardViewModel
+} from './view-model';
 
 describe('source view model', () => {
   it('maps source health into plain-language status and default pause/resume controls', () => {
@@ -65,6 +73,26 @@ describe('source view model', () => {
     expect(lastFetchLabel(sourceChannel({ seconds_since_last_fetch: 65 }))).toBe('Last fetched 1m ago');
     expect(lastFetchLabel(sourceChannel({ seconds_since_last_fetch: null, freshness_status: 'never_fetched' }))).toBe('Not fetched yet');
     expect(relativeTimestamp('2026-01-01T00:00:00Z', new Date('2026-01-02T03:00:00Z'))).toBe('1d ago');
+  });
+
+  it('auto-selects exactly one ready Telegram account and requires a choice otherwise', () => {
+    const now = new Date('2026-01-01T01:00:00Z');
+    const primary = telegramAccount();
+    const backup = telegramAccount({ id: '33333333-3333-4333-8333-333333333333', display_name: 'Backup ingest' });
+    const unavailable = telegramAccount({ id: '44444444-4444-4444-8444-444444444444', enabled: false });
+
+    expect(readyTelegramAccounts([primary, unavailable], now)).toEqual([primary]);
+    expect(defaultTelegramAccountId([primary, unavailable], now)).toBe(primary.id);
+    expect(defaultTelegramAccountId([primary, backup], now)).toBe('');
+    expect(defaultTelegramAccountId([unavailable], now)).toBe('');
+  });
+
+  it('sets and fully clears the suggestion quick-add prefill', () => {
+    expect(sourceSuggestionPrefill('https://t.me/public_channel', 'suggestion-id')).toEqual({
+      reference: 'https://t.me/public_channel',
+      suggestionId: 'suggestion-id'
+    });
+    expect(clearSourceSuggestionPrefill()).toEqual({ reference: '', suggestionId: '' });
   });
 });
 

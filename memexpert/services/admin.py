@@ -83,6 +83,7 @@ from memexpert.schemas.admin import (
     AdminSourceChannelOrphanRequest,
     AdminSourceChannelRead,
     AdminSourceChannelUpdateRequest,
+    AdminTelegramChannelFromReferenceRequest,
     AdminTelegramChannelGroupRead,
     AdminTelegramSessionActionRead,
     AdminTelegramSessionCreateRequest,
@@ -93,6 +94,11 @@ from memexpert.schemas.admin import (
     AdminTelegramSessionValidateRequest,
 )
 from memexpert.schemas.user import ChannelSuggestionRead
+from memexpert.services.admin_telegram_channel_resolver import (
+    AdminTelegramChannelResolverError,
+    normalize_public_telegram_reference,
+    resolve_admin_telegram_channel,
+)
 from memexpert.services.content_merge import ContentMergeService
 from memexpert.services.engagement_read_model import load_derived_popularity_scores
 from memexpert.services.meme_seo import MemeSeoGenerationService
@@ -699,6 +705,7 @@ class AdminService:
         *,
         admin_user_id: uuid.UUID,
     ) -> AdminSourceChannelRead:
+        request, public_username = self._normalize_source_channel_create_request(request)
         telegram_session = await self._resolve_telegram_session_target(
             telegram_session_id=request.telegram_session_id,
             telegram_session_name=request.telegram_session_name,
@@ -714,6 +721,264 @@ class AdminService:
             catchup_enabled = False
             live_enabled = False
             engagement_enabled = False
+        try:
+            if public_username is not None:
+                await self._lock_telegram_public_identity(public_username)
+                semantic_matches = await self._match_existing_telegram_sources(
+                    public_username,
+                    lock_rows=True,
+                )
+                canonical_match = next(
+                    (row for row in semantic_matches if row.platform_id == public_username),
+                    None,
+                )
+                exceptional_matches = [row for row in semantic_matches if row.platform_id != public_username]
+                if exceptional_matches:
+                    raise AdminConflictError(
+                        f"A non-canonical Telegram source already uses @{public_username}. "
+                        "Remove and recreate it before adding this public source.",
+                    )
+                if canonical_match is not None:
+                    raise AdminConflictError(f"A Telegram source for @{public_username} already exists.")
+            channel = await self._add_source_channel_no_commit(
+                request,
+                telegram_session=telegram_session,
+                admin_user_id=admin_user_id,
+                catchup_enabled=catchup_enabled,
+                live_enabled=live_enabled,
+                engagement_enabled=engagement_enabled,
+            )
+            await self.session.commit()
+        except AdminConflictError:
+            await self.session.rollback()
+            raise
+        except IntegrityError as exc:
+            await self.session.rollback()
+            raise AdminConflictError(
+                f"Source channel {request.platform.value}:{request.platform_id} already exists.",
+            ) from exc
+        await self.session.refresh(channel)
+        return self._source_channel_read(await self._get_source_channel_for_read(channel.id))
+
+    async def add_telegram_channel_from_reference(
+        self,
+        request: AdminTelegramChannelFromReferenceRequest,
+        *,
+        admin_user_id: uuid.UUID,
+    ) -> AdminSourceChannelRead:
+        """Resolve Telegram without DB locks, then atomically add/reuse the source."""
+
+        try:
+            normalized_reference = normalize_public_telegram_reference(request.reference)
+        except AdminTelegramChannelResolverError as exc:
+            raise AdminConflictError(str(exc)) from None
+
+        account = await self.session.get(TelegramSession, request.telegram_session_id)
+        if account is None:
+            raise AdminNotFoundError("The selected Telegram account does not exist.")
+        encrypted_string_session = self._require_ready_telegram_account(account)
+
+        if request.suggestion_id is not None:
+            suggestion = await self.session.get(ChannelSuggestion, request.suggestion_id)
+            self._validate_reference_suggestion(
+                suggestion,
+                normalized_reference=normalized_reference.canonical_url,
+                allow_approved_retry=True,
+            )
+
+        try:
+            string_session = self._decrypt_string_session(encrypted_string_session)
+        except TelegramStringSessionDecryptError:
+            raise AdminConflictError("The selected Telegram account could not be opened.") from None
+
+        # End the read-only transaction before making a bounded Telegram call.
+        # No ORM rows or locks are retained across provider I/O.
+        await self.session.rollback()
+        try:
+            resolved = await resolve_admin_telegram_channel(
+                settings=get_settings(),
+                string_session=string_session,
+                reference=normalized_reference.username,
+            )
+        except AdminTelegramChannelResolverError as exc:
+            raise AdminConflictError(str(exc)) from None
+
+        try:
+            await self._lock_telegram_public_identity(resolved.platform_id)
+            locked_account = await self.session.scalar(
+                select(TelegramSession)
+                .where(TelegramSession.id == request.telegram_session_id)
+                .with_for_update(),
+            )
+            if locked_account is None:
+                raise AdminNotFoundError("The selected Telegram account no longer exists.")
+            current_encrypted_string_session = self._require_ready_telegram_account(locked_account)
+            if current_encrypted_string_session != encrypted_string_session:
+                raise AdminConflictError("The selected Telegram account changed during channel lookup. Try again.")
+
+            semantic_matches = await self._match_existing_telegram_sources(
+                resolved.platform_id,
+                lock_rows=True,
+            )
+            exceptional_matches = [row for row in semantic_matches if row.platform_id != resolved.platform_id]
+            if exceptional_matches:
+                raise AdminConflictError(
+                    f"A non-canonical Telegram source already uses @{resolved.platform_id}. "
+                    "Remove and recreate it before adding this public source.",
+                )
+            channel = next(
+                (row for row in semantic_matches if row.platform_id == resolved.platform_id),
+                None,
+            )
+            reused_previous_values = None if channel is None else self._source_channel_snapshot(channel)
+            created = False
+            if channel is None:
+                create_request = AdminSourceChannelCreateRequest(
+                    platform=SourcePlatform.TELEGRAM,
+                    platform_id=resolved.platform_id,
+                    username=resolved.username,
+                    title=resolved.title,
+                    subscriber_count=resolved.subscriber_count,
+                    telegram_session_id=locked_account.id,
+                    catchup_message_limit=request.catchup_message_limit,
+                    catchup_enabled=True,
+                    live_enabled=True,
+                    engagement_enabled=True,
+                )
+                try:
+                    async with self.session.begin_nested():
+                        channel = await self._add_source_channel_no_commit(
+                            create_request,
+                            telegram_session=locked_account,
+                            admin_user_id=admin_user_id,
+                            catchup_enabled=True,
+                            live_enabled=True,
+                            engagement_enabled=True,
+                            audit_action="channel_create_from_reference",
+                            audit_note=(
+                                "Approved matching source suggestion."
+                                if request.suggestion_id is not None
+                                else "Added from a public Telegram reference."
+                            ),
+                            audit_new_values=(
+                                {
+                                    "suggestion_id": str(request.suggestion_id),
+                                    "suggestion_status": ChannelSuggestionStatus.APPROVED.value,
+                                }
+                                if request.suggestion_id is not None
+                                else None
+                            ),
+                        )
+                    created = True
+                except IntegrityError:
+                    semantic_matches = await self._match_existing_telegram_sources(
+                        resolved.platform_id,
+                        lock_rows=True,
+                    )
+                    exceptional_matches = [row for row in semantic_matches if row.platform_id != resolved.platform_id]
+                    if exceptional_matches:
+                        raise AdminConflictError(
+                            f"A non-canonical Telegram source already uses @{resolved.platform_id}. "
+                            "Remove and recreate it before adding this public source.",
+                        ) from None
+                    channel = next(
+                        (row for row in semantic_matches if row.platform_id == resolved.platform_id),
+                        None,
+                    )
+                    if channel is None:
+                        raise AdminConflictError("This Telegram source was changed concurrently. Try again.") from None
+                    reused_previous_values = self._source_channel_snapshot(channel)
+
+            if not created:
+                if not channel.is_active:
+                    raise AdminConflictError(
+                        "This Telegram source was previously removed. Restore it before adding it again.",
+                    )
+                if channel.is_paused:
+                    raise AdminConflictError("This Telegram source is paused. Resume it before adding it again.")
+                channel.telegram_session_id = locked_account.id
+                channel.catchup_enabled = True
+                channel.live_enabled = True
+                channel.engagement_enabled = True
+                channel.catchup_message_limit = request.catchup_message_limit
+                channel.username = resolved.username
+                channel.title = resolved.title
+                channel.subscriber_count = resolved.subscriber_count
+
+            suggestion: ChannelSuggestion | None = None
+            if request.suggestion_id is not None:
+                suggestion = await self.session.scalar(
+                    select(ChannelSuggestion)
+                    .where(ChannelSuggestion.id == request.suggestion_id)
+                    .with_for_update(),
+                )
+                self._validate_reference_suggestion(
+                    suggestion,
+                    normalized_reference=normalized_reference.canonical_url,
+                    allow_approved_retry=True,
+                )
+
+            if suggestion is not None:
+                if suggestion.status is ChannelSuggestionStatus.APPROVED and not created:
+                    pass
+                elif suggestion.status is not ChannelSuggestionStatus.PENDING:
+                    raise AdminConflictError("Only a pending Telegram suggestion can be added.")
+                else:
+                    suggestion.status = ChannelSuggestionStatus.APPROVED
+                    suggestion.reviewed_at = utcnow()
+
+            if not created:
+                self._add_telegram_admin_audit(
+                    admin_user_id=admin_user_id,
+                    action="channel_reuse_from_reference",
+                    telegram_session_id=channel.telegram_session_id,
+                    source_channel_id=channel.id,
+                    previous_values=reused_previous_values or self._source_channel_snapshot(channel),
+                    new_values={
+                        **self._source_channel_snapshot(channel),
+                        **(
+                            {
+                                "suggestion_id": str(suggestion.id),
+                                "suggestion_status": ChannelSuggestionStatus.APPROVED.value,
+                            }
+                            if suggestion is not None
+                            else {}
+                        ),
+                    },
+                    note=(
+                        "Approved matching source suggestion using the existing source."
+                        if suggestion is not None
+                        else "Reused an existing source resolved from a public Telegram reference."
+                    ),
+                )
+            await self.session.commit()
+        except (AdminNotFoundError, AdminConflictError):
+            await self.session.rollback()
+            raise
+        except IntegrityError as exc:
+            await self.session.rollback()
+            raise AdminConflictError("The Telegram source could not be saved because it changed concurrently.") from exc
+        except Exception:
+            await self.session.rollback()
+            raise
+
+        return self._source_channel_read(await self._get_source_channel_for_read(channel.id))
+
+    async def _add_source_channel_no_commit(
+        self,
+        request: AdminSourceChannelCreateRequest,
+        *,
+        telegram_session: TelegramSession | None,
+        admin_user_id: uuid.UUID,
+        catchup_enabled: bool,
+        live_enabled: bool,
+        engagement_enabled: bool,
+        audit_action: str = "channel_create",
+        audit_note: str | None = None,
+        audit_new_values: dict[str, object] | None = None,
+    ) -> SourceChannel:
+        """Insert and audit a source without committing or rolling back."""
+
         channel = SourceChannel(
             platform=request.platform,
             platform_id=request.platform_id,
@@ -727,25 +992,17 @@ class AdminService:
             catchup_message_limit=request.catchup_message_limit,
         )
         self.session.add(channel)
-        try:
-            await self.session.flush()
-            self._add_telegram_admin_audit(
-                admin_user_id=admin_user_id,
-                action="channel_create",
-                telegram_session_id=channel.telegram_session_id,
-                source_channel_id=channel.id,
-                previous_values={},
-                new_values=self._source_channel_snapshot(channel),
-                note=None,
-            )
-            await self.session.commit()
-        except IntegrityError as exc:
-            await self.session.rollback()
-            raise AdminConflictError(
-                f"Source channel {request.platform.value}:{request.platform_id} already exists.",
-            ) from exc
-        await self.session.refresh(channel)
-        return self._source_channel_read(await self._get_source_channel_for_read(channel.id))
+        await self.session.flush()
+        self._add_telegram_admin_audit(
+            admin_user_id=admin_user_id,
+            action=audit_action,
+            telegram_session_id=channel.telegram_session_id,
+            source_channel_id=channel.id,
+            previous_values={},
+            new_values={**self._source_channel_snapshot(channel), **(audit_new_values or {})},
+            note=audit_note,
+        )
+        return channel
 
     async def assign_source_channel(
         self,
@@ -2017,6 +2274,79 @@ class AdminService:
             filters.append(SourceChannel.telegram_session_id.is_not(None))
         return tuple(filters)
 
+    @staticmethod
+    def _normalize_source_channel_create_request(
+        request: AdminSourceChannelCreateRequest,
+    ) -> tuple[AdminSourceChannelCreateRequest, str | None]:
+        """Canonicalize public Telegram references while preserving exceptional ids."""
+
+        if request.platform is not SourcePlatform.TELEGRAM:
+            return request, None
+        try:
+            normalized = normalize_public_telegram_reference(request.platform_id)
+        except AdminTelegramChannelResolverError:
+            normalized = None
+        if normalized is not None:
+            return (
+                request.model_copy(
+                    update={
+                        "platform_id": normalized.username,
+                        "username": normalized.username,
+                    },
+                ),
+                normalized.username,
+            )
+        if request.username is not None:
+            try:
+                normalized_username = normalize_public_telegram_reference(request.username).username
+            except AdminTelegramChannelResolverError:
+                normalized_username = None
+            if normalized_username is not None:
+                return (
+                    request.model_copy(update={"username": normalized_username}),
+                    normalized_username,
+                )
+        return request, None
+
+    async def _lock_telegram_public_identity(self, public_username: str) -> None:
+        """Serialize PostgreSQL mutations for one canonical public username."""
+
+        await self.session.execute(
+            select(
+                func.pg_advisory_xact_lock(
+                    func.hashtextextended(public_username.casefold(), 0),
+                ),
+            ),
+        )
+
+    async def _match_existing_telegram_sources(
+        self,
+        public_username: str,
+        *,
+        lock_rows: bool,
+    ) -> list[SourceChannel]:
+        """Return canonical and exceptional rows claiming one public username."""
+
+        username = public_username.casefold()
+        stmt = (
+            select(SourceChannel)
+            .where(
+                SourceChannel.platform == SourcePlatform.TELEGRAM,
+                or_(
+                    SourceChannel.platform_id == username,
+                    func.lower(SourceChannel.username) == username,
+                ),
+            )
+            .order_by(
+                case((SourceChannel.platform_id == username, 0), else_=1),
+                SourceChannel.created_at.asc(),
+                SourceChannel.id.asc(),
+            )
+        )
+        if lock_rows:
+            stmt = stmt.with_for_update()
+        return list((await self.session.execute(stmt)).scalars().all())
+
     async def _resolve_telegram_session_target(
         self,
         *,
@@ -2041,6 +2371,46 @@ class AdminService:
         if telegram_session is None:
             raise AdminConflictError(f"Telegram session {name!r} does not exist.")
         return telegram_session
+
+    @staticmethod
+    def _require_ready_telegram_account(row: TelegramSession) -> str:
+        """Return encrypted material only when the explicitly selected account is ready."""
+
+        encrypted_string_session = (row.encrypted_string_session or "").strip()
+        flood_wait_is_current = row.flood_wait_until is not None and row.flood_wait_until > utcnow()
+        if (
+            not row.enabled
+            or row.status is not TelegramSessionStatus.ACTIVE
+            or not encrypted_string_session
+            or row.quarantined_at is not None
+            or flood_wait_is_current
+        ):
+            raise AdminConflictError(
+                "The selected Telegram account is not ready. "
+                "Choose an enabled, authorized account without a current rate limit.",
+            )
+        return encrypted_string_session
+
+    @staticmethod
+    def _validate_reference_suggestion(
+        suggestion: ChannelSuggestion | None,
+        *,
+        normalized_reference: str,
+        allow_approved_retry: bool,
+    ) -> None:
+        if suggestion is None:
+            raise AdminNotFoundError("The selected source suggestion does not exist.")
+        allowed_statuses = {ChannelSuggestionStatus.PENDING}
+        if allow_approved_retry:
+            allowed_statuses.add(ChannelSuggestionStatus.APPROVED)
+        if suggestion.status not in allowed_statuses or suggestion.platform is not SourcePlatform.TELEGRAM:
+            raise AdminConflictError("Only a pending Telegram suggestion can be added.")
+        try:
+            normalized_suggestion = normalize_public_telegram_reference(suggestion.channel_url)
+        except AdminTelegramChannelResolverError as exc:
+            raise AdminConflictError("The source suggestion is not a valid public Telegram reference.") from exc
+        if normalized_suggestion.canonical_url.casefold() != normalized_reference.casefold():
+            raise AdminConflictError("The channel reference does not match the selected source suggestion.")
 
     @staticmethod
     def _telegram_session_read(

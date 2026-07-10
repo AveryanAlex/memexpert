@@ -742,6 +742,13 @@ export interface AdminTelegramChannelCreatePayload {
   catchup_message_limit: number;
 }
 
+export interface AdminTelegramChannelFromReferencePayload {
+  reference: string;
+  telegram_session_id: string;
+  suggestion_id?: string | null;
+  catchup_message_limit?: number;
+}
+
 export interface AdminTelegramChannelUpdatePayload {
   catchup_enabled?: boolean;
   live_enabled?: boolean;

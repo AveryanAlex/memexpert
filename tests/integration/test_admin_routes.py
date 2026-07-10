@@ -6,12 +6,13 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 from uuid import UUID, uuid7
 
 from httpx import ASGITransport, AsyncClient
 from pydantic import SecretStr
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import memexpert.services.admin as admin_service_module
@@ -34,6 +35,7 @@ from memexpert.models.content import (
     TelegramSessionLoginAttempt,
 )
 from memexpert.models.enums import (
+    ChannelSuggestionStatus,
     ContentKind,
     ContentProcessingStatus,
     ModerationAction,
@@ -44,6 +46,10 @@ from memexpert.models.enums import (
 )
 from memexpert.models.user import ChannelSuggestion, User
 from memexpert.services import AuthService, UserService
+from memexpert.services.admin_telegram_channel_resolver import (
+    AdminTelegramChannelResolverError,
+    ResolvedAdminTelegramChannel,
+)
 from tests.conftest import create_full_user_via_upgrade
 from tests.integration.test_auth_routes import ACCESS_COOKIE_NAME, build_test_auth_service
 
@@ -187,6 +193,13 @@ async def test_admin_routes_require_session_cookie_admin_flag_and_ignore_operato
     async with AsyncClient(transport=transport, base_url="https://testserver") as anonymous_client:
         anonymous_session_response = await anonymous_client.get("/api/v1/admin/session")
         anonymous_telegram_sessions_response = await anonymous_client.get("/api/v1/admin/telegram/sessions")
+        anonymous_add_reference_response = await anonymous_client.post(
+            "/api/v1/admin/telegram/channels/from-reference",
+            json={
+                "reference": "@public_channel",
+                "telegram_session_id": meme_id,
+            },
+        )
         anonymous_detail_response = await anonymous_client.get(f"/api/v1/admin/memes/{meme_id}")
         anonymous_override_response = await anonymous_client.patch(
             f"/api/v1/admin/memes/{meme_id}/moderation",
@@ -247,6 +260,13 @@ async def test_admin_routes_require_session_cookie_admin_flag_and_ignore_operato
             json={"name": "permission-test", "display_name": "Permission Test"},
         )
         forbidden_telegram_channels_response = await non_admin_client.get("/api/v1/admin/telegram/channels")
+        forbidden_add_reference_response = await non_admin_client.post(
+            "/api/v1/admin/telegram/channels/from-reference",
+            json={
+                "reference": "@public_channel",
+                "telegram_session_id": meme_id,
+            },
+        )
         forbidden_reports_response = await non_admin_client.get("/api/v1/admin/moderation-reports")
         forbidden_blocked_hashes_response = await non_admin_client.get("/api/v1/admin/blocked-perceptual-hashes")
 
@@ -276,6 +296,7 @@ async def test_admin_routes_require_session_cookie_admin_flag_and_ignore_operato
 
     assert anonymous_session_response.status_code == 401
     assert anonymous_telegram_sessions_response.status_code == 401
+    assert anonymous_add_reference_response.status_code == 401
     assert anonymous_detail_response.status_code == 401
     assert anonymous_override_response.status_code == 401
     assert anonymous_seo_pages_response.status_code == 401
@@ -293,6 +314,7 @@ async def test_admin_routes_require_session_cookie_admin_flag_and_ignore_operato
     assert forbidden_seo_regenerate_response.status_code == 403
     assert forbidden_telegram_session_create_response.status_code == 403
     assert forbidden_telegram_channels_response.status_code == 403
+    assert forbidden_add_reference_response.status_code == 403
     assert forbidden_reports_response.status_code == 403
     assert forbidden_blocked_hashes_response.status_code == 403
     assert forbidden_session_response.json()["code"] == "admin_required"
@@ -1370,6 +1392,752 @@ async def test_admin_create_source_channel_uses_telegram_session_id_and_rejects_
         )
         assert persisted is not None
         assert persisted.telegram_session_id == telegram_session_id
+
+
+async def test_admin_manual_source_creation_normalizes_public_references_and_retains_exceptional_ids(
+    auth_app: FastAPI,
+    auth_settings_overrides: dict[str, str],
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    admin_token = await _issue_user_cookie(
+        postgres_session_factory,
+        auth_settings_overrides,
+        email="admin-manual-source-normalization@example.com",
+        is_admin=True,
+    )
+    transport = ASGITransport(app=auth_app)
+    async with AsyncClient(transport=transport, base_url="https://testserver") as admin_client:
+        admin_client.cookies.set(ACCESS_COOKIE_NAME, admin_token)
+        public_response = await admin_client.post(
+            "/api/v1/admin/source-channels",
+            json={
+                "platform": "telegram",
+                "platform_id": "https://telegram.me/Mixed_Public",
+                "username": "ignored_name",
+                "title": "Mixed public",
+                "orphaned": True,
+            },
+        )
+        duplicate_response = await admin_client.post(
+            "/api/v1/admin/source-channels",
+            json={
+                "platform": "telegram",
+                "platform_id": "@mixed_public",
+                "title": "Duplicate mixed public",
+                "orphaned": True,
+            },
+        )
+        public_username_response = await admin_client.post(
+            "/api/v1/admin/source-channels",
+            json={
+                "platform": "telegram",
+                "platform_id": "@Username_Public",
+                "title": "Public username source",
+                "orphaned": True,
+            },
+        )
+        exceptional_username_conflict = await admin_client.post(
+            "/api/v1/admin/source-channels",
+            json={
+                "platform": "telegram",
+                "platform_id": "-100123450001",
+                "username": "@Username_Public",
+                "title": "Conflicting exceptional source",
+                "orphaned": True,
+            },
+        )
+        exceptional_public_username_response = await admin_client.post(
+            "/api/v1/admin/source-channels",
+            json={
+                "platform": "telegram",
+                "platform_id": "-100123450002",
+                "username": "@Exceptional_Public",
+                "title": "Exceptional source with public username",
+                "orphaned": True,
+            },
+        )
+        exceptional_response = await admin_client.post(
+            "/api/v1/admin/source-channels",
+            json={
+                "platform": "telegram",
+                "platform_id": "-100987654321",
+                "username": "private-source-hint",
+                "title": "Exceptional private source",
+                "orphaned": True,
+            },
+        )
+        concurrent_responses = await asyncio.gather(
+            admin_client.post(
+                "/api/v1/admin/source-channels",
+                json={
+                    "platform": "telegram",
+                    "platform_id": "@Concurrent_Public",
+                    "title": "Concurrent public one",
+                    "orphaned": True,
+                },
+            ),
+            admin_client.post(
+                "/api/v1/admin/source-channels",
+                json={
+                    "platform": "telegram",
+                    "platform_id": "https://t.me/concurrent_public",
+                    "title": "Concurrent public two",
+                    "orphaned": True,
+                },
+            ),
+        )
+
+    assert public_response.status_code == 201
+    assert public_response.json()["platform_id"] == "mixed_public"
+    assert public_response.json()["username"] == "mixed_public"
+    assert duplicate_response.status_code == 409
+    assert public_username_response.status_code == 201
+    assert public_username_response.json()["platform_id"] == "username_public"
+    assert public_username_response.json()["username"] == "username_public"
+    assert exceptional_username_conflict.status_code == 409
+    assert "already exists" in exceptional_username_conflict.json()["detail"]
+    assert exceptional_public_username_response.status_code == 201
+    assert exceptional_public_username_response.json()["platform_id"] == "-100123450002"
+    assert exceptional_public_username_response.json()["username"] == "exceptional_public"
+    assert exceptional_response.status_code == 201
+    assert exceptional_response.json()["platform_id"] == "-100987654321"
+    assert exceptional_response.json()["username"] == "private-source-hint"
+    assert sorted(response.status_code for response in concurrent_responses) == [201, 409]
+    async with postgres_session_factory() as session:
+        concurrent_count = await session.scalar(
+            select(func.count()).select_from(SourceChannel).where(
+                SourceChannel.platform_id == "concurrent_public",
+            ),
+        )
+        assert concurrent_count == 1
+
+
+async def test_admin_adds_public_telegram_reference_atomically_and_retry_converges(
+    auth_app: FastAPI,
+    auth_settings_overrides: dict[str, str],
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch,
+) -> None:
+    admin_email = "admin-reference-source@example.com"
+    admin_token = await _issue_user_cookie(
+        postgres_session_factory,
+        auth_settings_overrides,
+        email=admin_email,
+        is_admin=True,
+    )
+    raw_string_sessions = (
+        "reference-source-server-secret-primary",
+        "reference-source-server-secret-secondary",
+    )
+    async with postgres_session_factory() as session:
+        admin_user = (await session.execute(select(User).where(User.email == admin_email))).scalar_one()
+        accounts = [
+            TelegramSession(
+                name=f"reference-source-account-{index}",
+                display_name=f"Reference source account {index}",
+                encrypted_string_session=admin_service_module.AdminService(session)._encrypt_string_session(
+                    SecretStr(raw_string_session),
+                ),
+                status=TelegramSessionStatus.ACTIVE,
+                enabled=True,
+            )
+            for index, raw_string_session in enumerate(raw_string_sessions, start=1)
+        ]
+        suggestion = ChannelSuggestion(
+            user_id=admin_user.id,
+            platform=SourcePlatform.TELEGRAM,
+            channel_url="https://t.me/public_channel",
+        )
+        session.add_all([*accounts, suggestion])
+        await session.commit()
+        account_ids = [account.id for account in accounts]
+        suggestion_id = suggestion.id
+
+    resolver_calls: list[tuple[str, str]] = []
+    resolver_pair_ready = asyncio.Event()
+
+    async def fake_resolve_admin_telegram_channel(
+        *, settings: object, string_session: SecretStr, reference: str
+    ) -> ResolvedAdminTelegramChannel:
+        _ = settings
+        resolver_calls.append((string_session.get_secret_value(), reference))
+        if len(resolver_calls) <= 2:
+            if len(resolver_calls) == 2:
+                resolver_pair_ready.set()
+            await asyncio.wait_for(resolver_pair_ready.wait(), timeout=2)
+        return ResolvedAdminTelegramChannel(
+            platform_id="public_channel",
+            username="public_channel",
+            title="Public channel",
+            subscriber_count=1234,
+        )
+
+    monkeypatch.setattr(
+        admin_service_module,
+        "resolve_admin_telegram_channel",
+        fake_resolve_admin_telegram_channel,
+    )
+    original_source_read = admin_service_module.AdminService._source_channel_read
+
+    def oversized_internal_source_projection(
+        channel: SourceChannel,
+        *,
+        now: datetime | None = None,
+    ) -> object:
+        projection = original_source_read(channel, now=now)
+        return SimpleNamespace(
+            **projection.model_dump(),
+            encrypted_string_session="must-be-filtered-encrypted-material",
+            phone="+15551234567",
+            telegram_password="must-be-filtered-password",
+        )
+
+    monkeypatch.setattr(
+        admin_service_module.AdminService,
+        "_source_channel_read",
+        staticmethod(oversized_internal_source_projection),
+    )
+    request_bodies = [
+        {
+            "reference": "https://telegram.me/Public_Channel",
+            "telegram_session_id": str(account_id),
+            "suggestion_id": str(suggestion_id),
+        }
+        for account_id in account_ids
+    ]
+    transport = ASGITransport(app=auth_app)
+    async with AsyncClient(transport=transport, base_url="https://testserver") as admin_client:
+        admin_client.cookies.set(ACCESS_COOKIE_NAME, admin_token)
+        first_response, duplicate_race_response = await asyncio.gather(
+            admin_client.post(
+                "/api/v1/admin/telegram/channels/from-reference",
+                json=request_bodies[0],
+            ),
+            admin_client.post(
+                "/api/v1/admin/telegram/channels/from-reference",
+                json=request_bodies[1],
+            ),
+        )
+        retry_response = await admin_client.post(
+            "/api/v1/admin/telegram/channels/from-reference",
+            json=request_bodies[0],
+        )
+
+    assert first_response.status_code == 201
+    assert duplicate_race_response.status_code == 201
+    assert retry_response.status_code == 201
+    first_payload = first_response.json()
+    retry_payload = retry_response.json()
+    assert retry_payload["id"] == first_payload["id"]
+    assert duplicate_race_response.json()["id"] == first_payload["id"]
+    assert first_payload == {
+        **first_payload,
+        "platform": "telegram",
+        "platform_id": "public_channel",
+        "username": "public_channel",
+        "title": "Public channel",
+        "subscriber_count": 1234,
+        "catchup_message_limit": 500,
+        "catchup_enabled": True,
+        "live_enabled": True,
+        "engagement_enabled": True,
+    }
+    assert all(raw_string_session not in first_response.text for raw_string_session in raw_string_sessions)
+    assert "encrypted_string_session" not in first_response.text
+    assert "+15551234567" not in first_response.text
+    assert "must-be-filtered-password" not in first_response.text
+    assert len(resolver_calls) == 3
+    assert {call[0] for call in resolver_calls[:2]} == set(raw_string_sessions)
+    assert {call[1] for call in resolver_calls} == {"public_channel"}
+
+    async with postgres_session_factory() as session:
+        source_count = await session.scalar(
+            select(func.count()).select_from(SourceChannel).where(SourceChannel.platform_id == "public_channel"),
+        )
+        persisted_suggestion = await session.get(ChannelSuggestion, suggestion_id)
+        creation_audit = await session.scalar(
+            select(TelegramAdminAuditLog).where(
+                TelegramAdminAuditLog.action == "channel_create_from_reference",
+                TelegramAdminAuditLog.source_channel_id == UUID(first_payload["id"]),
+            ),
+        )
+        assert source_count == 1
+        assert first_payload["telegram_session_id"] in {str(account_id) for account_id in account_ids}
+        assert persisted_suggestion is not None
+        assert persisted_suggestion.status is ChannelSuggestionStatus.APPROVED
+        assert persisted_suggestion.reviewed_at is not None
+        assert creation_audit is not None
+        assert creation_audit.new_values["suggestion_id"] == str(suggestion_id)
+        assert creation_audit.new_values["suggestion_status"] == "approved"
+
+
+async def test_admin_reference_source_reactivates_exact_canonical_source_with_safe_defaults(
+    auth_app: FastAPI,
+    auth_settings_overrides: dict[str, str],
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch,
+) -> None:
+    admin_email = "admin-reference-reactivate@example.com"
+    admin_token = await _issue_user_cookie(
+        postgres_session_factory,
+        auth_settings_overrides,
+        email=admin_email,
+        is_admin=True,
+    )
+    async with postgres_session_factory() as session:
+        admin_user = (await session.execute(select(User).where(User.email == admin_email))).scalar_one()
+        account = TelegramSession(
+            name="reactivate-reference-account",
+            display_name="Reactivate reference account",
+            encrypted_string_session=admin_service_module.AdminService(session)._encrypt_string_session(
+                SecretStr("reactivate-reference-secret"),
+            ),
+            status=TelegramSessionStatus.ACTIVE,
+            enabled=True,
+        )
+        old_account = TelegramSession(
+            name="reactivate-old-account",
+            display_name="Reactivate old account",
+            status=TelegramSessionStatus.STOPPED,
+            enabled=False,
+        )
+        canonical_source = SourceChannel(
+            platform=SourcePlatform.TELEGRAM,
+            platform_id="reactivate_public",
+            username="reactivate_public",
+            title="Old reactivate public",
+            telegram_session=old_account,
+            catchup_enabled=False,
+            live_enabled=False,
+            engagement_enabled=False,
+            catchup_message_limit=12,
+        )
+        suggestion = ChannelSuggestion(
+            user_id=admin_user.id,
+            platform=SourcePlatform.TELEGRAM,
+            channel_url="https://t.me/reactivate_public",
+        )
+        session.add_all([account, old_account, canonical_source, suggestion])
+        await session.commit()
+        account_id = account.id
+        old_account_id = old_account.id
+        canonical_source_id = canonical_source.id
+        suggestion_id = suggestion.id
+
+    async def fake_resolve(*, reference: str, **_kwargs) -> ResolvedAdminTelegramChannel:
+        return ResolvedAdminTelegramChannel(
+            platform_id=reference,
+            username=reference,
+            title=f"Updated {reference.replace('_', ' ')}",
+            subscriber_count=900,
+        )
+
+    monkeypatch.setattr(admin_service_module, "resolve_admin_telegram_channel", fake_resolve)
+    transport = ASGITransport(app=auth_app)
+    async with AsyncClient(transport=transport, base_url="https://testserver") as admin_client:
+        admin_client.cookies.set(ACCESS_COOKIE_NAME, admin_token)
+        response = await admin_client.post(
+            "/api/v1/admin/telegram/channels/from-reference",
+            json={
+                "reference": "@reactivate_public",
+                "telegram_session_id": str(account_id),
+                "suggestion_id": str(suggestion_id),
+                "catchup_message_limit": 321,
+            },
+        )
+
+    assert response.status_code == 201
+    assert response.json()["id"] == str(canonical_source_id)
+    assert response.json()["platform_id"] == "reactivate_public"
+    assert response.json()["username"] == "reactivate_public"
+    assert response.json()["title"] == "Updated reactivate public"
+    assert response.json()["subscriber_count"] == 900
+    assert response.json()["telegram_session_id"] == str(account_id)
+    assert response.json()["catchup_message_limit"] == 321
+    assert response.json()["catchup_enabled"] is True
+    assert response.json()["live_enabled"] is True
+    assert response.json()["engagement_enabled"] is True
+
+    async with postgres_session_factory() as session:
+        persisted_source = await session.get(SourceChannel, canonical_source_id)
+        persisted_suggestion = await session.get(ChannelSuggestion, suggestion_id)
+        reuse_audit = await session.scalar(
+            select(TelegramAdminAuditLog).where(
+                TelegramAdminAuditLog.action == "channel_reuse_from_reference",
+                TelegramAdminAuditLog.source_channel_id == canonical_source_id,
+            ),
+        )
+        assert persisted_source is not None
+        assert persisted_source.platform_id == "reactivate_public"
+        assert persisted_suggestion is not None
+        assert persisted_suggestion.status is ChannelSuggestionStatus.APPROVED
+        assert reuse_audit is not None
+        assert reuse_audit.previous_values["platform_id"] == "reactivate_public"
+        assert reuse_audit.new_values["platform_id"] == "reactivate_public"
+        assert reuse_audit.previous_values["telegram_session_id"] == str(old_account_id)
+        assert reuse_audit.new_values["telegram_session_id"] == str(account_id)
+        assert reuse_audit.previous_values["catchup_enabled"] is False
+        assert reuse_audit.new_values["catchup_enabled"] is True
+        assert reuse_audit.previous_values["live_enabled"] is False
+        assert reuse_audit.new_values["live_enabled"] is True
+        assert reuse_audit.previous_values["engagement_enabled"] is False
+        assert reuse_audit.new_values["engagement_enabled"] is True
+        assert reuse_audit.new_values["catchup_message_limit"] == 321
+        assert reuse_audit.new_values["username"] == "reactivate_public"
+        assert reuse_audit.new_values["title"] == "Updated reactivate public"
+        assert reuse_audit.new_values["subscriber_count"] == 900
+
+
+async def test_admin_reference_source_rejects_paused_dead_and_noncanonical_username_conflicts(
+    auth_app: FastAPI,
+    auth_settings_overrides: dict[str, str],
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch,
+) -> None:
+    admin_email = "admin-reference-existing-conflicts@example.com"
+    admin_token = await _issue_user_cookie(
+        postgres_session_factory,
+        auth_settings_overrides,
+        email=admin_email,
+        is_admin=True,
+    )
+    async with postgres_session_factory() as session:
+        admin_user = (await session.execute(select(User).where(User.email == admin_email))).scalar_one()
+        account = TelegramSession(
+            name="existing-conflict-reference-account",
+            display_name="Existing conflict reference account",
+            encrypted_string_session=admin_service_module.AdminService(session)._encrypt_string_session(
+                SecretStr("existing-conflict-reference-secret"),
+            ),
+            status=TelegramSessionStatus.ACTIVE,
+            enabled=True,
+        )
+        paused_source = SourceChannel(
+            platform=SourcePlatform.TELEGRAM,
+            platform_id="paused_public",
+            username="paused_public",
+            title="Paused public",
+            is_paused=True,
+        )
+        dead_source = SourceChannel(
+            platform=SourcePlatform.TELEGRAM,
+            platform_id="dead_public",
+            username="dead_public",
+            title="Dead public",
+            is_active=False,
+            is_paused=True,
+        )
+        noncanonical_source = SourceChannel(
+            platform=SourcePlatform.TELEGRAM,
+            platform_id="-1007003",
+            username="duplicate_public",
+            title="Non-canonical duplicate public",
+        )
+        suggestions = {
+            username: ChannelSuggestion(
+                user_id=admin_user.id,
+                platform=SourcePlatform.TELEGRAM,
+                channel_url=f"https://t.me/{username}",
+            )
+            for username in ("paused_public", "dead_public", "duplicate_public")
+        }
+        session.add_all([account, paused_source, dead_source, noncanonical_source, *suggestions.values()])
+        await session.commit()
+        account_id = account.id
+        suggestion_ids = {username: suggestion.id for username, suggestion in suggestions.items()}
+
+    async def fake_resolve(*, reference: str, **_kwargs) -> ResolvedAdminTelegramChannel:
+        return ResolvedAdminTelegramChannel(
+            platform_id=reference,
+            username=reference,
+            title=f"Resolved {reference}",
+            subscriber_count=100,
+        )
+
+    monkeypatch.setattr(admin_service_module, "resolve_admin_telegram_channel", fake_resolve)
+    transport = ASGITransport(app=auth_app)
+    async with AsyncClient(transport=transport, base_url="https://testserver") as admin_client:
+        admin_client.cookies.set(ACCESS_COOKIE_NAME, admin_token)
+        responses = {
+            username: await admin_client.post(
+                "/api/v1/admin/telegram/channels/from-reference",
+                json={
+                    "reference": f"@{username}",
+                    "telegram_session_id": str(account_id),
+                    "suggestion_id": str(suggestion_ids[username]),
+                },
+            )
+            for username in suggestion_ids
+        }
+
+    assert responses["paused_public"].status_code == 409
+    assert "paused" in responses["paused_public"].json()["detail"].lower()
+    assert responses["dead_public"].status_code == 409
+    assert "removed" in responses["dead_public"].json()["detail"].lower()
+    assert responses["duplicate_public"].status_code == 409
+    assert "non-canonical" in responses["duplicate_public"].json()["detail"].lower()
+    assert "remove and recreate" in responses["duplicate_public"].json()["detail"].lower()
+
+    async with postgres_session_factory() as session:
+        persisted_suggestions = [
+            await session.get(ChannelSuggestion, suggestion_id)
+            for suggestion_id in suggestion_ids.values()
+        ]
+        persisted_paused = await session.get(SourceChannel, paused_source.id)
+        persisted_dead = await session.get(SourceChannel, dead_source.id)
+        assert all(suggestion is not None for suggestion in persisted_suggestions)
+        assert all(
+            suggestion.status is ChannelSuggestionStatus.PENDING
+            for suggestion in persisted_suggestions
+            if suggestion
+        )
+        assert persisted_paused is not None
+        assert persisted_paused.is_paused is True
+        assert persisted_paused.telegram_session_id is None
+        assert persisted_dead is not None
+        assert persisted_dead.is_active is False
+        assert persisted_dead.telegram_session_id is None
+
+
+async def test_admin_reference_source_rejects_unavailable_account_and_mismatched_suggestion_without_io(
+    auth_app: FastAPI,
+    auth_settings_overrides: dict[str, str],
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch,
+) -> None:
+    admin_email = "admin-reference-validation@example.com"
+    admin_token = await _issue_user_cookie(
+        postgres_session_factory,
+        auth_settings_overrides,
+        email=admin_email,
+        is_admin=True,
+    )
+    async with postgres_session_factory() as session:
+        admin_user = (await session.execute(select(User).where(User.email == admin_email))).scalar_one()
+        encrypted_session = admin_service_module.AdminService(session)._encrypt_string_session(
+            SecretStr("unavailable-account-secret"),
+        )
+        unavailable_accounts = [
+            TelegramSession(
+                name="missing-secret-reference-account",
+                display_name="Missing secret reference account",
+                encrypted_string_session=None,
+                status=TelegramSessionStatus.ACTIVE,
+                enabled=True,
+            ),
+            TelegramSession(
+                name="disabled-reference-account",
+                display_name="Disabled reference account",
+                encrypted_string_session=encrypted_session,
+                status=TelegramSessionStatus.ACTIVE,
+                enabled=False,
+            ),
+            TelegramSession(
+                name="auth-required-reference-account",
+                display_name="Auth required reference account",
+                encrypted_string_session=encrypted_session,
+                status=TelegramSessionStatus.AUTH_REQUIRED,
+                enabled=True,
+            ),
+            TelegramSession(
+                name="quarantined-reference-account",
+                display_name="Quarantined reference account",
+                encrypted_string_session=encrypted_session,
+                status=TelegramSessionStatus.ACTIVE,
+                enabled=True,
+                quarantined_at=datetime.now(UTC),
+            ),
+            TelegramSession(
+                name="flood-wait-reference-account",
+                display_name="Flood wait reference account",
+                encrypted_string_session=encrypted_session,
+                status=TelegramSessionStatus.ACTIVE,
+                enabled=True,
+                flood_wait_until=datetime.now(UTC) + timedelta(minutes=5),
+            ),
+        ]
+        ready_account = TelegramSession(
+            name="mismatch-reference-account",
+            display_name="Mismatch reference account",
+            encrypted_string_session=admin_service_module.AdminService(session)._encrypt_string_session(
+                SecretStr("mismatch-secret"),
+            ),
+            status=TelegramSessionStatus.ACTIVE,
+            enabled=True,
+        )
+        suggestion = ChannelSuggestion(
+            user_id=admin_user.id,
+            platform=SourcePlatform.TELEGRAM,
+            channel_url="https://t.me/different_channel",
+        )
+        session.add_all([*unavailable_accounts, ready_account, suggestion])
+        await session.commit()
+        unavailable_account_ids = [account.id for account in unavailable_accounts]
+        ready_account_id = ready_account.id
+        suggestion_id = suggestion.id
+
+    resolver = monkeypatch.setattr(
+        admin_service_module,
+        "resolve_admin_telegram_channel",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("Telegram I/O must not run")),
+    )
+    _ = resolver
+    transport = ASGITransport(app=auth_app)
+    async with AsyncClient(transport=transport, base_url="https://testserver") as admin_client:
+        admin_client.cookies.set(ACCESS_COOKIE_NAME, admin_token)
+        unavailable_responses = [
+            await admin_client.post(
+                "/api/v1/admin/telegram/channels/from-reference",
+                json={"reference": "@public_channel", "telegram_session_id": str(account_id)},
+            )
+            for account_id in unavailable_account_ids
+        ]
+        invalid_reference_responses = [
+            await admin_client.post(
+                "/api/v1/admin/telegram/channels/from-reference",
+                json={"reference": reference, "telegram_session_id": str(ready_account_id)},
+            )
+            for reference in ("https://t.me/+private-invite", "https://example.com/not-telegram")
+        ]
+        mismatch_response = await admin_client.post(
+            "/api/v1/admin/telegram/channels/from-reference",
+            json={
+                "reference": "@public_channel",
+                "telegram_session_id": str(ready_account_id),
+                "suggestion_id": str(suggestion_id),
+            },
+        )
+
+    assert all(response.status_code == 409 for response in unavailable_responses)
+    assert all(
+        response.json()["detail"].startswith("The selected Telegram account is not ready")
+        for response in unavailable_responses
+    )
+    assert all(response.status_code == 409 for response in invalid_reference_responses)
+    assert all("public" in response.json()["detail"].lower() for response in invalid_reference_responses)
+    assert mismatch_response.status_code == 409
+    assert mismatch_response.json()["detail"] == "The channel reference does not match the selected source suggestion."
+    async with postgres_session_factory() as session:
+        persisted_suggestion = await session.get(ChannelSuggestion, suggestion_id)
+        assert persisted_suggestion is not None
+        assert persisted_suggestion.status is ChannelSuggestionStatus.PENDING
+
+
+async def test_admin_reference_source_rolls_back_suggestion_and_source_on_persistence_failure(
+    auth_app: FastAPI,
+    auth_settings_overrides: dict[str, str],
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch,
+) -> None:
+    admin_email = "admin-reference-rollback@example.com"
+    admin_token = await _issue_user_cookie(
+        postgres_session_factory,
+        auth_settings_overrides,
+        email=admin_email,
+        is_admin=True,
+    )
+    async with postgres_session_factory() as session:
+        admin_user = (await session.execute(select(User).where(User.email == admin_email))).scalar_one()
+        account = TelegramSession(
+            name="rollback-reference-account",
+            display_name="Rollback reference account",
+            encrypted_string_session=admin_service_module.AdminService(session)._encrypt_string_session(
+                SecretStr("rollback-secret"),
+            ),
+            status=TelegramSessionStatus.ACTIVE,
+            enabled=True,
+        )
+        suggestion = ChannelSuggestion(
+            user_id=admin_user.id,
+            platform=SourcePlatform.TELEGRAM,
+            channel_url="https://t.me/rollback_channel",
+        )
+        session.add_all([account, suggestion])
+        await session.commit()
+        account_id = account.id
+        suggestion_id = suggestion.id
+
+    async def fake_resolve(**_kwargs) -> ResolvedAdminTelegramChannel:
+        return ResolvedAdminTelegramChannel(
+            platform_id="rollback_channel",
+            username="rollback_channel",
+            title="Rollback channel",
+            subscriber_count=None,
+        )
+
+    original_insert = admin_service_module.AdminService._add_source_channel_no_commit
+
+    async def fail_after_insert(self, *args, **kwargs):
+        _ = await original_insert(self, *args, **kwargs)
+        raise admin_service_module.AdminConflictError("Simulated persistence failure.")
+
+    monkeypatch.setattr(admin_service_module, "resolve_admin_telegram_channel", fake_resolve)
+    monkeypatch.setattr(admin_service_module.AdminService, "_add_source_channel_no_commit", fail_after_insert)
+    transport = ASGITransport(app=auth_app)
+    async with AsyncClient(transport=transport, base_url="https://testserver") as admin_client:
+        admin_client.cookies.set(ACCESS_COOKIE_NAME, admin_token)
+        response = await admin_client.post(
+            "/api/v1/admin/telegram/channels/from-reference",
+            json={
+                "reference": "@rollback_channel",
+                "telegram_session_id": str(account_id),
+                "suggestion_id": str(suggestion_id),
+            },
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Simulated persistence failure."
+    async with postgres_session_factory() as session:
+        source_count = await session.scalar(
+            select(func.count()).select_from(SourceChannel).where(SourceChannel.platform_id == "rollback_channel"),
+        )
+        persisted_suggestion = await session.get(ChannelSuggestion, suggestion_id)
+        assert source_count == 0
+        assert persisted_suggestion is not None
+        assert persisted_suggestion.status is ChannelSuggestionStatus.PENDING
+
+
+async def test_admin_reference_source_translates_resolver_failure_safely(
+    auth_app: FastAPI,
+    auth_settings_overrides: dict[str, str],
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch,
+) -> None:
+    admin_token = await _issue_user_cookie(
+        postgres_session_factory,
+        auth_settings_overrides,
+        email="admin-reference-provider-error@example.com",
+        is_admin=True,
+    )
+    async with postgres_session_factory() as session:
+        account = TelegramSession(
+            name="provider-error-reference-account",
+            display_name="Provider error reference account",
+            encrypted_string_session=admin_service_module.AdminService(session)._encrypt_string_session(
+                SecretStr("provider-error-secret"),
+            ),
+            status=TelegramSessionStatus.ACTIVE,
+            enabled=True,
+        )
+        session.add(account)
+        await session.commit()
+        account_id = account.id
+
+    async def fail_resolver(**_kwargs):
+        raise AdminTelegramChannelResolverError("Telegram did not respond in time. Try again.")
+
+    monkeypatch.setattr(admin_service_module, "resolve_admin_telegram_channel", fail_resolver)
+    transport = ASGITransport(app=auth_app)
+    async with AsyncClient(transport=transport, base_url="https://testserver") as admin_client:
+        admin_client.cookies.set(ACCESS_COOKIE_NAME, admin_token)
+        response = await admin_client.post(
+            "/api/v1/admin/telegram/channels/from-reference",
+            json={"reference": "@public_channel", "telegram_session_id": str(account_id)},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Telegram did not respond in time. Try again."
+    assert "provider-error-secret" not in response.text
 
 
 async def test_admin_telegram_session_lifecycle_validates_without_leaking_string_session(

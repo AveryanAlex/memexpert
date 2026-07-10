@@ -1,6 +1,7 @@
 import type { RequestEvent } from '@sveltejs/kit';
 import {
   ApiError,
+  addAdminTelegramChannelFromReference,
   addSourceChannel as createSourceChannel,
   assignAdminTelegramChannel,
   markSourceChannelDead as markSourceChannelDeadRequest,
@@ -50,6 +51,27 @@ export async function addSourceChannel({ fetch, request }: RequestEvent) {
       }
     });
     return { message: 'Source added without an account; ingestion is off.' };
+  });
+}
+
+export async function addSourceByReference({ fetch, request }: RequestEvent) {
+  const data = await request.formData();
+  return runAction(async () => {
+    const suggestionId = readOptional(data, 'suggestion_id');
+    await addAdminTelegramChannelFromReference({
+      ...apiRequest(fetch, request),
+      body: {
+        reference: readRequired(data, 'reference'),
+        telegram_session_id: readRequired(data, 'telegram_session_id'),
+        suggestion_id: suggestionId,
+        catchup_message_limit: readInt(data, 'catchup_message_limit', 500)
+      }
+    });
+    return {
+      message: suggestionId
+        ? 'Telegram source added and suggestion approved.'
+        : 'Telegram source added and ready to fetch.'
+    };
   });
 }
 
@@ -153,6 +175,7 @@ export async function validateSourceAccount({ fetch, request }: RequestEvent) {
 
 export const sourceActions = {
   reviewSuggestion,
+  addSourceByReference,
   addSourceChannel,
   toggleSourceChannel,
   markSourceChannelDead,

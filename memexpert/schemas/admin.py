@@ -165,6 +165,17 @@ class AdminSourceChannelCreateRequest(BaseModel):
         return self
 
 
+class AdminTelegramChannelFromReferenceRequest(BaseModel):
+    """Resolve and add one public Telegram channel with safe crawler defaults."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reference: str = Field(min_length=1, max_length=512)
+    telegram_session_id: uuid.UUID
+    suggestion_id: uuid.UUID | None = None
+    catchup_message_limit: StrictInt = Field(default=500, ge=1, le=10000)
+
+
 class AdminSourceChannelUpdateRequest(BaseModel):
     """Patch source-channel crawling/indexing controls."""
 
@@ -1068,6 +1079,7 @@ __all__ = [
     "AdminSourceChannelRead",
     "AdminSourceChannelUpdateRequest",
     "AdminTelegramChannelGroupRead",
+    "AdminTelegramChannelFromReferenceRequest",
     "AdminTelegramSessionActionRead",
     "AdminTelegramSessionCreateRequest",
     "AdminTelegramSessionDeleteRequest",

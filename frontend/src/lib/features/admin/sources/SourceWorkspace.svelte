@@ -1,9 +1,9 @@
 <script lang="ts">
-  import { tick } from 'svelte';
   import AdvancedSection from '$lib/features/admin/AdvancedSection.svelte';
   import AdminPanel from '$lib/features/admin/AdminPanel.svelte';
   import { EmptyState, Notice } from '$lib/ui';
   import type { AdminSourceChannelRead, AdminTelegramSessionRead, ChannelSuggestionRead } from '$lib/api/types';
+  import AddSourceByReference from './AddSourceByReference.svelte';
   import ManualSourceForm from './ManualSourceForm.svelte';
   import SourceCard from './SourceCard.svelte';
   import SourceSuggestionCard from './SourceSuggestionCard.svelte';
@@ -24,14 +24,11 @@
     form?: { message?: string; error?: boolean } | null;
   } = $props();
 
-  let manualOpen = $state(false);
-  let manualSourceForm = $state<{ prefillAndFocus: (reference: string) => void } | null>(null);
+  let referenceSourceForm = $state<{ prefillAndFocus: (reference: string, suggestionId?: string) => void } | null>(null);
   const pendingSuggestions = $derived(sourceAdmin.suggestions.filter((suggestion) => suggestion.status === 'pending'));
 
-  async function addSuggestedTelegramSource(suggestion: ChannelSuggestionRead): Promise<void> {
-    manualOpen = true;
-    await tick();
-    manualSourceForm?.prefillAndFocus(suggestion.channel_url);
+  function addSuggestedTelegramSource(suggestion: ChannelSuggestionRead): void {
+    referenceSourceForm?.prefillAndFocus(suggestion.channel_url, suggestion.id);
   }
 </script>
 
@@ -49,6 +46,8 @@
   <Notice tone="danger" role="alert">{loadError}</Notice>
 {/if}
 
+<AddSourceByReference bind:this={referenceSourceForm} telegramAccounts={sourceAdmin.telegramAccounts} />
+
 <AdminPanel title="Suggested sources">
   {#if pendingSuggestions.length === 0}
     <EmptyState title="No pending suggestions" message="New source suggestions will appear here for review." />
@@ -61,8 +60,8 @@
   {/if}
 </AdminPanel>
 
-<AdvancedSection bind:open={manualOpen} title="Advanced manual source entry" description="Use the canonical Telegram identifier when a suggestion cannot wait for reference-based setup.">
-  <ManualSourceForm bind:this={manualSourceForm} />
+<AdvancedSection title="Advanced manual source entry" description="Use the canonical Telegram identifier when a suggestion cannot wait for reference-based setup.">
+  <ManualSourceForm />
 </AdvancedSection>
 
 <AdminPanel title="All sources">

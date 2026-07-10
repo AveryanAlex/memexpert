@@ -15,6 +15,28 @@ export interface SourceCardViewModel {
   toggleLabel: 'Pause' | 'Resume' | null;
 }
 
+export interface SourceSuggestionPrefill {
+  reference: string;
+  suggestionId: string;
+}
+
+export function sourceSuggestionPrefill(reference: string, suggestionId: string): SourceSuggestionPrefill {
+  return { reference, suggestionId };
+}
+
+export function clearSourceSuggestionPrefill(): SourceSuggestionPrefill {
+  return { reference: '', suggestionId: '' };
+}
+
+export function readyTelegramAccounts(accounts: AdminTelegramSessionRead[], now = new Date()): AdminTelegramSessionRead[] {
+  return accounts.filter((account) => isReadyTelegramAccount(account, now));
+}
+
+export function defaultTelegramAccountId(accounts: AdminTelegramSessionRead[], now = new Date()): string {
+  const readyAccounts = readyTelegramAccounts(accounts, now);
+  return readyAccounts.length === 1 ? readyAccounts[0].id : '';
+}
+
 export function toSourceCardViewModel(source: AdminSourceChannelRead, telegramAccounts: AdminTelegramSessionRead[] = [], now = new Date()): SourceCardViewModel {
   const status = sourcePlainStatus(source, telegramAccounts, now);
   return {
