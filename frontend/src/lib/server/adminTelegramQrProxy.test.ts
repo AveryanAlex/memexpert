@@ -77,6 +77,21 @@ describe('admin Telegram QR proxy routes', () => {
     await expect(response.json()).resolves.toEqual({ detail: 'session_id is required.' });
     expect(fetchMock).not.toHaveBeenCalled();
   });
+
+  it('rejects QR completion without an opaque attempt id before calling the backend', async () => {
+    const fetchMock = vi.fn() satisfies RequestEvent['fetch'];
+
+    const response = await completeQrLogin(
+      minimalCompleteEvent({
+        fetch: fetchMock,
+        request: jsonRequest('/admin/telegram/api/qr/complete', { session_id: 'session-1' })
+      })
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toEqual({ detail: 'attempt_id is required.' });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
 });
 
 function jsonRequest(path: string, body: unknown): Request {

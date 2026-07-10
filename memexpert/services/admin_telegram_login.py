@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Protocol
 
 from pydantic import SecretStr
@@ -45,6 +45,8 @@ if TYPE_CHECKING:
 LOGIN_ATTEMPT_TTL = timedelta(minutes=10)
 QR_LOGIN_POLL_TIMEOUT_SECONDS = 30.0
 _PASSWORD_REQUIRED_ERROR_CLASS = "SessionPasswordNeededError"
+_RETRYABLE_PHONE_CODE_ERROR_CLASSES = frozenset({"PhoneCodeEmptyError", "PhoneCodeInvalidError"})
+_RETRYABLE_PASSWORD_ERROR_CLASS = "PasswordHashInvalidError"
 _DERIVED_SESSION_NAME_PREFIX = "telegram_"
 
 
@@ -77,7 +79,10 @@ class _LiveLoginAttempt:
     client: TelegramLoginClient
     qr_login: Any | None = None
     qr_wait_task: asyncio.Task[Any] | None = None
+    qr_expiry_cleanup_handle: asyncio.TimerHandle | None = None
+    qr_completion_expires_at: datetime | None = None
     phone_number: str | None = None
+    retirement_task: asyncio.Task[None] | None = None
 
 
 _LIVE_LOGIN_ATTEMPTS: dict[uuid.UUID, _LiveLoginAttempt] = {}
@@ -123,7 +128,7 @@ class AdminTelegramLoginService:
             _LIVE_LOGIN_ATTEMPTS[attempt.id] = _LiveLoginAttempt(client=client, phone_number=request.phone_number)
             await self.session.commit()
         except Exception as exc:
-            _LIVE_LOGIN_ATTEMPTS.pop(attempt.id, None)
+            self._take_live_attempt(attempt.id)
             await self._disconnect_client(client)
             await self._mark_attempt_and_session_failed(row, attempt, exc)
             raise AdminConflictError(f"Telegram phone login failed: {type(exc).__name__}.") from exc
@@ -173,7 +178,10 @@ class AdminTelegramLoginService:
                     password_required=True,
                     message="Telegram requires the account 2FA password to finish login.",
                 )
-            _LIVE_LOGIN_ATTEMPTS.pop(attempt.id, None)
+            if type(exc).__name__ in _RETRYABLE_PHONE_CODE_ERROR_CLASSES:
+                _LIVE_LOGIN_ATTEMPTS[attempt.id] = live_attempt
+                raise AdminConflictError("The Telegram code was incorrect. Try again.") from None
+            self._take_live_attempt(attempt.id)
             await self._disconnect_client(live_attempt.client)
             await self._mark_attempt_and_session_failed(row, attempt, exc)
             raise AdminConflictError(f"Telegram code login failed: {type(exc).__name__}.") from exc
@@ -182,6 +190,7 @@ class AdminTelegramLoginService:
             row,
             attempt,
             live_attempt.client,
+            expected_live_attempt=live_attempt,
             admin_user_id=admin_user_id,
             note=request.note,
         )
@@ -203,7 +212,10 @@ class AdminTelegramLoginService:
         try:
             await _maybe_await(live_attempt.client.sign_in(password=request.password.get_secret_value()))
         except Exception as exc:
-            popped_attempt = _LIVE_LOGIN_ATTEMPTS.pop(attempt.id, None)
+            if type(exc).__name__ == _RETRYABLE_PASSWORD_ERROR_CLASS:
+                _LIVE_LOGIN_ATTEMPTS[attempt.id] = live_attempt
+                raise AdminConflictError("The Telegram password was incorrect. Try again.") from None
+            popped_attempt = self._take_live_attempt(attempt.id)
             if popped_attempt is not None:
                 self._cancel_qr_wait_task(popped_attempt)
             await self._disconnect_client(live_attempt.client)
@@ -214,6 +226,7 @@ class AdminTelegramLoginService:
             row,
             attempt,
             live_attempt.client,
+            expected_live_attempt=live_attempt,
             admin_user_id=admin_user_id,
             note=request.note,
         )
@@ -244,24 +257,38 @@ class AdminTelegramLoginService:
                 raise AdminConflictError("Telegram did not return a QR login URL.")
             qr_url = qr_url.strip()
             attempt.qr_url = qr_url
+            attempt.expires_at = _qr_login_expiry(qr_login, now)
             attempt.encrypted_temp_string_session = await self._encrypt_client_session_if_present(client)
-            qr_wait_task = asyncio.create_task(_maybe_await(qr_login.wait(timeout=None)))
-            qr_wait_task.add_done_callback(_consume_background_task_exception)
-            _LIVE_LOGIN_ATTEMPTS[attempt.id] = _LiveLoginAttempt(
+            qr_wait_timeout = max(0.0, (attempt.expires_at - now).total_seconds())
+            qr_wait_task = asyncio.create_task(_maybe_await(qr_login.wait(timeout=qr_wait_timeout)))
+            live_attempt = _LiveLoginAttempt(
                 client=client,
                 qr_login=qr_login,
                 qr_wait_task=qr_wait_task,
             )
+            _LIVE_LOGIN_ATTEMPTS[attempt.id] = live_attempt
+            live_attempt.qr_expiry_cleanup_handle = self._schedule_qr_expiry_cleanup(
+                attempt.id,
+                live_attempt,
+                expires_at=attempt.expires_at,
+            )
+            qr_wait_task.add_done_callback(
+                lambda task, attempt_id=attempt.id, expected_attempt=live_attempt: self._qr_wait_finished(
+                    attempt_id,
+                    expected_attempt,
+                    task,
+                ),
+            )
             await self._expire_other_pending_qr_attempts(row.id, attempt.id, now=now)
             await self.session.commit()
         except AdminConflictError:
-            live_attempt = _LIVE_LOGIN_ATTEMPTS.pop(attempt.id, None)
+            live_attempt = self._take_live_attempt(attempt.id)
             if live_attempt is not None:
                 self._cancel_qr_wait_task(live_attempt)
             await self._disconnect_client(client)
             raise
         except Exception as exc:
-            live_attempt = _LIVE_LOGIN_ATTEMPTS.pop(attempt.id, None)
+            live_attempt = self._take_live_attempt(attempt.id)
             if live_attempt is not None:
                 self._cancel_qr_wait_task(live_attempt)
             await self._disconnect_client(client)
@@ -282,16 +309,13 @@ class AdminTelegramLoginService:
         *,
         admin_user_id: uuid.UUID,
     ) -> AdminTelegramLoginQrStatusRead:
-        row, attempt = await self._get_valid_attempt(
+        _row, attempt, live_attempt = await self._get_qr_attempt_for_poll(
             telegram_session_id,
             request.attempt_id,
-            method="qr",
-            allowed_statuses={"pending"},
         )
-        live_attempt = _LIVE_LOGIN_ATTEMPTS.get(attempt.id)
         if live_attempt is None or live_attempt.qr_login is None or live_attempt.qr_wait_task is None:
             if live_attempt is not None:
-                _LIVE_LOGIN_ATTEMPTS.pop(attempt.id, None)
+                self._take_live_attempt(attempt.id)
                 self._cancel_qr_wait_task(live_attempt)
                 await self._disconnect_client(live_attempt.client)
             attempt.status = "failed"
@@ -300,6 +324,10 @@ class AdminTelegramLoginService:
             attempt.completed_at = utcnow()
             await self.session.commit()
             raise AdminConflictError("QR login state was lost; start a new QR login attempt.")
+
+        # The Telegram wait can last up to the long-poll timeout. Release row locks
+        # before awaiting it so a concurrent QR refresh can supersede this attempt.
+        await self.session.rollback()
 
         try:
             await asyncio.wait_for(
@@ -313,36 +341,69 @@ class AdminTelegramLoginService:
                 password_required=False,
                 message="Still waiting for Telegram QR scan.",
             )
+        except asyncio.CancelledError:
+            if _LIVE_LOGIN_ATTEMPTS.get(request.attempt_id) is not live_attempt:
+                raise AdminConflictError(
+                    "QR login attempt expired or was replaced. Start a new QR login.",
+                ) from None
+            raise
         except Exception as exc:
-            if type(exc).__name__ == _PASSWORD_REQUIRED_ERROR_CLASS:
-                attempt.status = "password_required"
-                attempt.encrypted_temp_string_session = await self._encrypt_required_client_session(live_attempt.client)
-                _LIVE_LOGIN_ATTEMPTS[attempt.id] = live_attempt
-                await self.session.commit()
-                await self.session.refresh(row)
-                counts_by_session = await self._admin_service._count_source_channels_by_session()
-                return AdminTelegramLoginQrStatusRead(
-                    status="password_required",
-                    telegram_session=self._admin_service._telegram_session_read(
-                        row,
-                        owned_channel_count=counts_by_session.get(row.id, 0),
-                    ),
-                    password_required=True,
-                    message="Telegram requires the account 2FA password to finish login.",
+            password_required = type(exc).__name__ == _PASSWORD_REQUIRED_ERROR_CLASS
+            if not password_required:
+                row, locked_attempt = await self._relock_qr_attempt_after_wait(
+                    telegram_session_id,
+                    request.attempt_id,
+                    live_attempt,
                 )
-            _LIVE_LOGIN_ATTEMPTS.pop(attempt.id, None)
-            self._cancel_qr_wait_task(live_attempt)
-            await self._disconnect_client(live_attempt.client)
-            await self._mark_attempt_and_session_failed(row, attempt, exc)
-            raise AdminConflictError(f"Telegram QR login completion failed: {type(exc).__name__}.") from exc
+                self._take_live_attempt(locked_attempt.id, expected=live_attempt)
+                self._cancel_qr_wait_task(live_attempt)
+                await self._disconnect_client(live_attempt.client)
+                await self._mark_attempt_and_session_failed(row, locked_attempt, exc)
+                raise AdminConflictError(f"Telegram QR login completion failed: {type(exc).__name__}.") from exc
+        else:
+            password_required = False
 
-        completed = await self._finalize_authorized_client(
-            row,
-            attempt,
-            live_attempt.client,
-            admin_user_id=admin_user_id,
-            note=request.note,
+        completion_expires_at = self._promote_qr_completion_cleanup(request.attempt_id, live_attempt)
+        if completion_expires_at is None:
+            raise AdminConflictError("QR login attempt expired or was replaced. Start a new QR login.")
+        row, locked_attempt = await self._relock_qr_attempt_after_wait(
+            telegram_session_id,
+            request.attempt_id,
+            live_attempt,
         )
+        locked_attempt.expires_at = completion_expires_at
+
+        if password_required:
+            locked_attempt.status = "password_required"
+            locked_attempt.encrypted_temp_string_session = await self._encrypt_required_client_session(
+                live_attempt.client,
+            )
+            await self.session.commit()
+            await self.session.refresh(row)
+            counts_by_session = await self._admin_service._count_source_channels_by_session()
+            return AdminTelegramLoginQrStatusRead(
+                status="password_required",
+                telegram_session=self._admin_service._telegram_session_read(
+                    row,
+                    owned_channel_count=counts_by_session.get(row.id, 0),
+                ),
+                password_required=True,
+                message="Telegram requires the account 2FA password to finish login.",
+            )
+
+        try:
+            completed = await self._finalize_authorized_client(
+                row,
+                locked_attempt,
+                live_attempt.client,
+                expected_live_attempt=live_attempt,
+                admin_user_id=admin_user_id,
+                note=request.note,
+            )
+        except asyncio.CancelledError:
+            # Keep the fresh completion cleanup active; it will release an
+            # accepted client if request cancellation abandons finalization.
+            raise
         return AdminTelegramLoginQrStatusRead(
             status="completed",
             telegram_session=completed.telegram_session,
@@ -387,12 +448,75 @@ class AdminTelegramLoginService:
             attempt.error_class = "TelegramLoginAttemptExpired"
             attempt.error_text = "Telegram login attempt expired."
             attempt.completed_at = now
-            live_attempt = _LIVE_LOGIN_ATTEMPTS.pop(attempt.id, None)
+            live_attempt = self._take_live_attempt(attempt.id)
             if live_attempt is not None:
                 self._cancel_qr_wait_task(live_attempt)
                 await self._disconnect_client(live_attempt.client)
             await self.session.commit()
             raise AdminConflictError("Telegram login attempt expired; start a new login attempt.")
+        return row, attempt
+
+    async def _get_qr_attempt_for_poll(
+        self,
+        telegram_session_id: uuid.UUID,
+        attempt_id: uuid.UUID,
+    ) -> tuple[TelegramSession, TelegramSessionLoginAttempt, _LiveLoginAttempt | None]:
+        row = await self._get_session_for_login(telegram_session_id)
+        attempt = await self.session.scalar(
+            select(TelegramSessionLoginAttempt)
+            .where(TelegramSessionLoginAttempt.id == attempt_id)
+            .with_for_update(),
+        )
+        if attempt is None or attempt.telegram_session_id != row.id or attempt.method != "qr":
+            raise AdminConflictError("Login attempt is invalid for this Telegram session.")
+        if attempt.status != "pending":
+            raise AdminConflictError(f"Login attempt is already {attempt.status}.")
+
+        live_attempt = _LIVE_LOGIN_ATTEMPTS.get(attempt_id)
+        now = utcnow()
+        if (
+            live_attempt is not None
+            and live_attempt.qr_completion_expires_at is not None
+            and live_attempt.qr_completion_expires_at > now
+        ):
+            attempt.expires_at = live_attempt.qr_completion_expires_at
+        elif attempt.expires_at <= now:
+            attempt.status = "expired"
+            attempt.error_class = "TelegramLoginAttemptExpired"
+            attempt.error_text = "Telegram login attempt expired."
+            attempt.completed_at = now
+            removed_attempt = self._take_live_attempt(attempt.id, expected=live_attempt)
+            if removed_attempt is not None:
+                self._cancel_qr_wait_task(removed_attempt)
+                await self._disconnect_client(removed_attempt.client)
+            await self.session.commit()
+            raise AdminConflictError("Telegram login attempt expired; start a new login attempt.")
+        return row, attempt, live_attempt
+
+    async def _relock_qr_attempt_after_wait(
+        self,
+        telegram_session_id: uuid.UUID,
+        attempt_id: uuid.UUID,
+        expected_live_attempt: _LiveLoginAttempt,
+    ) -> tuple[TelegramSession, TelegramSessionLoginAttempt]:
+        row = await self.session.scalar(
+            select(TelegramSession).where(TelegramSession.id == telegram_session_id).with_for_update(),
+        )
+        attempt = await self.session.scalar(
+            select(TelegramSessionLoginAttempt)
+            .where(TelegramSessionLoginAttempt.id == attempt_id)
+            .with_for_update(),
+        )
+        if (
+            row is None
+            or attempt is None
+            or attempt.telegram_session_id != telegram_session_id
+            or attempt.method != "qr"
+            or attempt.status != "pending"
+            or _LIVE_LOGIN_ATTEMPTS.get(attempt_id) is not expected_live_attempt
+        ):
+            await self.session.rollback()
+            raise AdminConflictError("QR login attempt expired or was replaced. Start a new QR login.")
         return row, attempt
 
     async def _expire_other_pending_qr_attempts(
@@ -419,7 +543,7 @@ class AdminTelegramLoginService:
             stale_attempt.error_class = "TelegramQrLoginSuperseded"
             stale_attempt.error_text = "QR login attempt was replaced by a new QR code."
             stale_attempt.completed_at = now
-            live_attempt = _LIVE_LOGIN_ATTEMPTS.pop(stale_attempt.id, None)
+            live_attempt = self._take_live_attempt(stale_attempt.id)
             if live_attempt is not None:
                 self._cancel_qr_wait_task(live_attempt)
                 await self._disconnect_client(live_attempt.client)
@@ -446,6 +570,7 @@ class AdminTelegramLoginService:
         attempt: TelegramSessionLoginAttempt,
         client: TelegramLoginClient,
         *,
+        expected_live_attempt: _LiveLoginAttempt,
         admin_user_id: uuid.UUID,
         note: str | None,
     ) -> AdminTelegramLoginCompleteRead:
@@ -470,9 +595,6 @@ class AdminTelegramLoginService:
             attempt.status = "completed"
             attempt.encrypted_temp_string_session = None
             attempt.completed_at = utcnow()
-            live_attempt = _LIVE_LOGIN_ATTEMPTS.pop(attempt.id, None)
-            if live_attempt is not None:
-                self._cancel_qr_wait_task(live_attempt)
             self._admin_service._add_telegram_admin_audit(
                 admin_user_id=admin_user_id,
                 action="session_login",
@@ -484,20 +606,14 @@ class AdminTelegramLoginService:
             )
             await self.session.commit()
         except AdminConflictError as exc:
-            live_attempt = _LIVE_LOGIN_ATTEMPTS.pop(attempt.id, None)
-            if live_attempt is not None:
-                self._cancel_qr_wait_task(live_attempt)
-            await self._disconnect_client(client)
             await self._mark_attempt_and_session_failed(row, attempt, exc)
+            await self._retire_live_attempt(attempt.id, expected_live_attempt)
             raise
         except Exception as exc:
-            live_attempt = _LIVE_LOGIN_ATTEMPTS.pop(attempt.id, None)
-            if live_attempt is not None:
-                self._cancel_qr_wait_task(live_attempt)
-            await self._disconnect_client(client)
             await self._mark_attempt_and_session_failed(row, attempt, exc)
+            await self._retire_live_attempt(attempt.id, expected_live_attempt)
             raise AdminConflictError(f"Telegram login finalization failed: {type(exc).__name__}.") from exc
-        await self._disconnect_client(client)
+        await self._retire_live_attempt(attempt.id, expected_live_attempt)
         await self.session.refresh(row)
         counts_by_session = await self._admin_service._count_source_channels_by_session()
         return AdminTelegramLoginCompleteRead(
@@ -580,6 +696,114 @@ class AdminTelegramLoginService:
         task.cancel()
 
     @staticmethod
+    def _cancel_qr_expiry_cleanup(live_attempt: _LiveLoginAttempt) -> None:
+        handle = live_attempt.qr_expiry_cleanup_handle
+        if handle is not None:
+            handle.cancel()
+            live_attempt.qr_expiry_cleanup_handle = None
+
+    def _take_live_attempt(
+        self,
+        attempt_id: uuid.UUID,
+        *,
+        expected: _LiveLoginAttempt | None = None,
+    ) -> _LiveLoginAttempt | None:
+        live_attempt = _LIVE_LOGIN_ATTEMPTS.get(attempt_id)
+        if live_attempt is None or (expected is not None and live_attempt is not expected):
+            return None
+        _LIVE_LOGIN_ATTEMPTS.pop(attempt_id, None)
+        if live_attempt is not None:
+            self._cancel_qr_expiry_cleanup(live_attempt)
+        return live_attempt
+
+    def _launch_live_attempt_retirement(
+        self,
+        attempt_id: uuid.UUID,
+        expected_attempt: _LiveLoginAttempt,
+    ) -> asyncio.Task[None] | None:
+        if expected_attempt.retirement_task is not None:
+            return expected_attempt.retirement_task
+        if _LIVE_LOGIN_ATTEMPTS.get(attempt_id) is not expected_attempt:
+            return None
+        retirement_task = asyncio.create_task(self._retire_exact_live_attempt(attempt_id, expected_attempt))
+        expected_attempt.retirement_task = retirement_task
+        return retirement_task
+
+    async def _retire_live_attempt(
+        self,
+        attempt_id: uuid.UUID,
+        expected_attempt: _LiveLoginAttempt,
+    ) -> None:
+        retirement_task = self._launch_live_attempt_retirement(attempt_id, expected_attempt)
+        if retirement_task is None:
+            return
+        try:
+            await asyncio.shield(retirement_task)
+        except asyncio.CancelledError:
+            retirement_task.add_done_callback(_consume_background_task_exception)
+            raise
+
+    async def _retire_exact_live_attempt(
+        self,
+        attempt_id: uuid.UUID,
+        expected_attempt: _LiveLoginAttempt,
+    ) -> None:
+        self._cancel_qr_wait_task(expected_attempt)
+        try:
+            await self._disconnect_client(expected_attempt.client)
+        finally:
+            self._take_live_attempt(attempt_id, expected=expected_attempt)
+            self._cancel_qr_expiry_cleanup(expected_attempt)
+            expected_attempt.retirement_task = None
+
+    def _qr_wait_finished(
+        self,
+        attempt_id: uuid.UUID,
+        expected_attempt: _LiveLoginAttempt,
+        task: asyncio.Task[Any],
+    ) -> None:
+        if task.cancelled():
+            return
+        exception = task.exception()
+        if exception is None or type(exception).__name__ == _PASSWORD_REQUIRED_ERROR_CLASS:
+            self._promote_qr_completion_cleanup(attempt_id, expected_attempt)
+
+    def _promote_qr_completion_cleanup(
+        self,
+        attempt_id: uuid.UUID,
+        expected_attempt: _LiveLoginAttempt,
+    ) -> datetime | None:
+        if _LIVE_LOGIN_ATTEMPTS.get(attempt_id) is not expected_attempt:
+            return None
+        if expected_attempt.qr_completion_expires_at is not None:
+            return expected_attempt.qr_completion_expires_at
+        self._cancel_qr_expiry_cleanup(expected_attempt)
+        completion_expires_at = utcnow() + LOGIN_ATTEMPT_TTL
+        expected_attempt.qr_completion_expires_at = completion_expires_at
+        expected_attempt.qr_expiry_cleanup_handle = self._schedule_qr_expiry_cleanup(
+            attempt_id,
+            expected_attempt,
+            expires_at=completion_expires_at,
+        )
+        return completion_expires_at
+
+    def _schedule_qr_expiry_cleanup(
+        self,
+        attempt_id: uuid.UUID,
+        live_attempt: _LiveLoginAttempt,
+        *,
+        expires_at: datetime,
+    ) -> asyncio.TimerHandle:
+        delay = max(0.0, (expires_at - utcnow()).total_seconds())
+        return asyncio.get_running_loop().call_later(delay, self._cleanup_expired_qr_attempt, attempt_id, live_attempt)
+
+    def _cleanup_expired_qr_attempt(self, attempt_id: uuid.UUID, expected_attempt: _LiveLoginAttempt) -> None:
+        retirement_task = self._launch_live_attempt_retirement(attempt_id, expected_attempt)
+        if retirement_task is None:
+            return
+        retirement_task.add_done_callback(_consume_background_task_exception)
+
+    @staticmethod
     async def _disconnect_client(client: TelegramLoginClient) -> None:
         disconnect = getattr(client, "disconnect", None)
         if disconnect is not None:
@@ -604,6 +828,16 @@ async def _client_string_session(client: TelegramLoginClient) -> str:
         raise AdminConflictError("Telegram client did not expose StringSession material.")
     raw_string_session = await _maybe_await(save())
     return raw_string_session.strip() if isinstance(raw_string_session, str) else ""
+
+
+def _qr_login_expiry(qr_login: object, now: datetime) -> datetime:
+    """Use Telegram's QR-token deadline when it is sooner than our bounded attempt TTL."""
+    fallback = now + LOGIN_ATTEMPT_TTL
+    expires = getattr(qr_login, "expires", None)
+    if not isinstance(expires, datetime):
+        return fallback
+    normalized = expires.replace(tzinfo=UTC) if expires.tzinfo is None else expires.astimezone(UTC)
+    return min(fallback, normalized)
 
 
 def _account_projection_from_me(me: object) -> AdminTelegramAccountProjection:

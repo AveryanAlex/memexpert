@@ -5,7 +5,7 @@ import type { AdminTelegramSessionRead, UserRead } from '$lib/api/types';
 import TelegramAdminPage from '../routes/admin/telegram/+page.svelte';
 
 describe('/admin/telegram page', () => {
-  it('renders sessions, a source-management link, required session action forms, confirmations, and no secret echo', () => {
+  it('renders task-oriented Telegram accounts with compact health, progressive disclosure, and source management only', () => {
     const { body } = render(TelegramAdminPage, {
       props: {
         data: pageData(),
@@ -13,34 +13,38 @@ describe('/admin/telegram page', () => {
       }
     });
 
-    expect(body).toContain('Telegram admin');
+    expect(body).toContain('Telegram accounts');
+    expect(body).toContain('Connect a Telegram account');
+    expect(body).toContain('Connect with QR');
+    expect(body).toContain('Use phone instead');
     expect(body).toContain('Primary ingest');
-    expect(body).toContain('session key stored');
-    expect(body).not.toContain('secret-session-value');
-    expect(body).not.toContain('StringSession');
-    expect(body).not.toContain('name="string_session"');
-    expect(body).not.toContain('name="account_user_id"');
-    expect(body).toContain('Start New Login');
+    expect(body).toContain('@primary_user');
+    expect(body).toContain('Ready');
+    expect(body).toContain('1 source');
+    expect(body).toContain('Last heartbeat');
+    expect(body).toContain('Diagnostics');
+    expect(body).toContain('Advanced settings');
+    expect(body).toContain('Disconnect account');
+    expect(body).toContain('Permanently deletes this database account record. 1 assigned source becomes unassigned and ingestion is disabled.');
+    expect(body).toContain('Internal status');
+    expect(body).toContain('Technical account name');
+    expect(body).toContain('Account ID');
     expect(body).not.toContain('action="?/createSession"');
-    expect(body).not.toContain('Stable operator-facing key');
     expect(body).toContain('action="?/startQrLogin"');
     expect(body).toContain('action="?/startPhoneLogin"');
-    expect(body).toContain('Telegram login');
-    expect(body).toContain('phone → code → password');
-    expect(body).toContain('Log in with phone');
-    expect(body).toContain('Log in with QR');
+    expect(body).toContain('name="phone_number"');
     expect(body).not.toContain('Attempt id');
     expect(body).not.toContain('paste QR attempt id');
     expect(body).not.toContain('paste phone attempt id');
     expect(body).toContain('action="?/validateSession"');
     expect(body).toContain('action="?/updateSession"');
     expect(body).toContain('action="?/deleteSession"');
-    expect(body).toContain('Assigned channels become orphaned and non-indexable');
-    expect(body).toContain('11111111-1111-4111-8111-111111111111');
+    expect(body).toContain('Type DISCONNECT to permanently delete this account');
+    expect(body).toContain('placeholder="DISCONNECT"');
+    expect(body).not.toContain(`placeholder="${telegramSession().id}"`);
 
-    expect(body).toContain('Manage 2 sources');
+    expect(body).toContain('Manage sources');
     expect(body).toContain('href="/admin/sources"');
-    expect(body).toContain('Manage and validate source assignment from Sources.');
     expect(body).not.toContain('action="?/addChannel"');
     expect(body).not.toContain('Channels by Session');
     expect(body).not.toContain('action="?/updateChannel"');
@@ -48,6 +52,31 @@ describe('/admin/telegram page', () => {
     expect(body).not.toContain('action="?/orphanChannel"');
     expect(body).not.toContain('action="?/toggleChannel"');
     expect(body).not.toContain('action="?/markChannelDead"');
+  });
+
+  it('does not render secret-like account data, full phone numbers, passwords, or visible attempt IDs', () => {
+    const session = telegramSession({
+      name: 'StringSession(secret-session-value)',
+      display_name: 'Encrypted account value',
+      account_username: null,
+      account_phone_hint: '+15551234567',
+      last_error_text: 'x7!'
+    });
+    const { body } = render(TelegramAdminPage, {
+      props: {
+        data: pageData(session),
+        form: { message: 'password=not-for-html StringSession(secret-session-value)', error: true }
+      }
+    });
+
+    expect(body).not.toContain('secret-session-value');
+    expect(body).not.toContain('StringSession');
+    expect(body).not.toContain('Encrypted account value');
+    expect(body).not.toContain('+15551234567');
+    expect(body).not.toContain('not-for-html');
+    expect(body).not.toContain('x7!');
+    expect(body).not.toContain('Attempt ID');
+    expect(body).not.toContain('name="string_session"');
   });
 
   it('renders action errors and load errors as alert states', () => {
@@ -80,9 +109,7 @@ describe('/admin/telegram page', () => {
       }
     });
 
-    expect(body).toContain('Telegram login');
-    expect(body).toContain('Log in with QR');
-    expect(body).not.toContain('Step 2 of 2 · Scan QR');
+    expect(body).toContain('Connect with QR');
     expect(body).not.toContain('data:image/svg+xml;utf8,');
     expect(body).not.toContain('alt="Telegram login QR code"');
     expect(body).not.toContain('Open Telegram login link');
@@ -92,6 +119,26 @@ describe('/admin/telegram page', () => {
     expect(body).not.toContain(`type="hidden" name="attempt_id" value="${attemptId}"`);
     expect(body).not.toContain('I scanned it — continue');
     expect(body).not.toContain('Attempt id');
+  });
+
+  it('keeps login failures attached to the account with a restart action', () => {
+    const session = telegramSession({ status: 'auth_required', has_string_session: false });
+    const { body } = render(TelegramAdminPage, {
+      props: {
+        data: pageData(session),
+        form: {
+          kind: 'login_error',
+          method: 'qr',
+          sessionId: session.id,
+          message: 'QR sign-in could not start.',
+          error: true
+        }
+      }
+    });
+
+    expect(body).toContain('Sign-in did not finish.');
+    expect(body).toContain('Restart with QR');
+    expect(body).toContain('action="?/startQrLogin"');
   });
 
   it('renders an active phone code step with hidden attempt id', () => {
@@ -105,14 +152,16 @@ describe('/admin/telegram page', () => {
           kind: 'phone_code',
           sessionId: session.id,
           attemptId,
+          method: 'phone',
           phoneHint: 'ending-1234',
-          expiresAt: '2026-01-01T00:10:00Z'
+          expiresAt: '2026-01-01T00:10:00Z',
+          error: false
         }
       }
     });
 
-    expect(body).toContain('Step 2 of 3 · Enter code');
-    expect(body).toContain('phone ending-1234');
+    expect(body).toContain('Enter the Telegram code');
+    expect(body).toContain('Phone ending 1234');
     expect(body).toContain('action="?/completePhoneCodeLogin"');
     expect(body).toContain('name="code"');
     expect(body).toContain(`type="hidden" name="attempt_id" value="${attemptId}"`);
@@ -130,17 +179,59 @@ describe('/admin/telegram page', () => {
           kind: 'password',
           method: 'qr',
           sessionId: session.id,
-          attemptId
+          attemptId,
+          error: false
         }
       }
     });
 
-    expect(body).toContain('Step 2 of 2 · Enter password');
+    expect(body).toContain('Enter the Telegram password');
     expect(body).toContain('Telegram password');
     expect(body).toContain('action="?/completePhonePasswordLogin"');
     expect(body).toContain('type="hidden" name="method" value="qr"');
     expect(body).toContain(`type="hidden" name="attempt_id" value="${attemptId}"`);
     expect(body).not.toContain('Attempt id');
+  });
+
+  it('keeps failed code and password continuation forms visible without rendering submitted secrets', () => {
+    const session = telegramSession({ status: 'auth_required', has_string_session: false });
+    const codeAttemptId = '77777777-7777-4777-8777-777777777777';
+    const passwordAttemptId = '88888888-8888-4888-8888-888888888888';
+    const code = render(TelegramAdminPage, {
+      props: {
+        data: pageData(session),
+        form: {
+          kind: 'phone_code',
+          sessionId: session.id,
+          attemptId: codeAttemptId,
+          method: 'phone',
+          phoneHint: 'ending-1234',
+          error: true,
+          message: 'Telegram could not verify that code. Check it and try again.'
+        }
+      }
+    }).body;
+    const password = render(TelegramAdminPage, {
+      props: {
+        data: pageData(session),
+        form: {
+          kind: 'password',
+          method: 'phone',
+          sessionId: session.id,
+          attemptId: passwordAttemptId,
+          phoneHint: 'ending-1234',
+          error: true,
+          message: 'password=not-for-html'
+        }
+      }
+    }).body;
+
+    expect(code).toContain('Telegram could not verify that code. Check it and try again.');
+    expect(code).toContain('action="?/completePhoneCodeLogin"');
+    expect(code).toContain(`type="hidden" name="attempt_id" value="${codeAttemptId}"`);
+    expect(password).toContain('action="?/completePhonePasswordLogin"');
+    expect(password).toContain(`type="hidden" name="attempt_id" value="${passwordAttemptId}"`);
+    expect(password).not.toContain('not-for-html');
   });
 });
 
@@ -150,9 +241,9 @@ function pageData(session = telegramSession()) {
     sessionError: null,
     adminUser: adminUser(),
     telegramAdmin: {
-      sessions: [session],
-      sourceCount: 2
+      sessions: [session]
     },
+    loadedAt: '2026-01-01T00:10:00Z',
     loadError: null
   };
 }
@@ -177,7 +268,7 @@ function adminUser(): UserRead {
   };
 }
 
-function telegramSession(): AdminTelegramSessionRead {
+function telegramSession(overrides: Partial<AdminTelegramSessionRead> = {}): AdminTelegramSessionRead {
   return {
     id: '11111111-1111-4111-8111-111111111111',
     name: 'primary',
@@ -200,6 +291,7 @@ function telegramSession(): AdminTelegramSessionRead {
     account_phone_hint: 'ending-1234',
     has_string_session: true,
     created_at: '2026-01-01T00:00:00Z',
-    updated_at: '2026-01-01T00:00:00Z'
+    updated_at: '2026-01-01T00:00:00Z',
+    ...overrides
   };
 }
