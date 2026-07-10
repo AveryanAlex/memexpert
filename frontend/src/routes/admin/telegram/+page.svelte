@@ -5,13 +5,12 @@
   import { qrSvgDataUri } from '$lib/qr/svg';
   import { ActionLink, Badge, Button, EmptyState, FormRow, Input, LoadingState, Notice, Select, Textarea } from '$lib/ui';
   import * as Dialog from '$lib/ui/dialog';
-  import type { AdminSourceChannelRead, AdminTelegramChannelGroupRead, AdminTelegramLoginQrStatusRead, AdminTelegramSessionRead, TelegramSessionStatus } from '$lib/api/types';
+  import type { AdminTelegramLoginQrStatusRead, AdminTelegramSessionRead, TelegramSessionStatus } from '$lib/api/types';
   import type { ActionData, PageData } from './$types';
 
   let { data, form }: { data: PageData; form: ActionData } = $props();
 
   const sessionStatuses: TelegramSessionStatus[] = ['active', 'auth_required', 'flood_wait', 'quarantined', 'stopped'];
-  const channels = $derived(data.telegramAdmin.groups.flatMap((group) => group.channels));
 
   type LoginStepAction =
     | { kind: 'qr'; sessionId: string; attemptId: string; qrUrl: string; expiresAt?: string; message: string; error?: boolean; refreshing?: boolean }
@@ -50,40 +49,6 @@
 
   function sessionLabel(session: AdminTelegramSessionRead): string {
     return session.display_name === session.name ? session.name : `${session.display_name} (${session.name})`;
-  }
-
-  function groupTitle(group: AdminTelegramChannelGroupRead): string {
-    if (group.is_orphaned) {
-      return `Orphaned Telegram channels (${group.channels.length})`;
-    }
-    if (!group.telegram_session) {
-      return `Unassigned Telegram channels (${group.channels.length})`;
-    }
-    return `${sessionLabel(group.telegram_session)} (${group.channels.length})`;
-  }
-
-  function channelLabel(channel: AdminSourceChannelRead): string {
-    return `${channel.title} · ${channel.platform_id}${channel.username ? ` · @${channel.username}` : ''}`;
-  }
-
-  function freshnessCopy(channel: AdminSourceChannelRead): string {
-    if (channel.freshness_status === 'fresh') {
-      return `fresh${channel.seconds_since_last_fetch === null ? '' : ` · ${formatAge(channel.seconds_since_last_fetch)} ago`}`;
-    }
-    if (channel.freshness_status === 'stale') {
-      return `stale · ${formatAge(channel.seconds_since_last_fetch ?? 0)} ago`;
-    }
-    if (channel.freshness_status === 'checkpoint_only') {
-      return `checkpoint only · last post ${channel.last_read_post_id}`;
-    }
-    return 'never fetched';
-  }
-
-  function formatAge(seconds: number): string {
-    if (seconds >= 86400) return `${Math.floor(seconds / 86400)}d`;
-    if (seconds >= 3600) return `${Math.floor(seconds / 3600)}h`;
-    if (seconds >= 60) return `${Math.floor(seconds / 60)}m`;
-    return `${seconds}s`;
   }
 
   function formatTimestamp(value: string | null): string {
@@ -324,7 +289,10 @@
         Manage DB-backed Telegram sessions and source-channel assignment without exposing Telegram login secrets.
       </p>
     </div>
-    <ActionLink href="/admin" variant="secondary">Back to admin tools</ActionLink>
+    <div class="flex flex-wrap gap-2">
+      <ActionLink href="/admin/sources" variant="secondary">Manage {data.telegramAdmin.sourceCount} {data.telegramAdmin.sourceCount === 1 ? 'source' : 'sources'}</ActionLink>
+      <ActionLink href="/admin" variant="secondary">Back to admin tools</ActionLink>
+    </div>
   </div>
 </section>
 
@@ -381,7 +349,7 @@
   </Dialog.Content>
 </Dialog.Root>
 
-<div class="my-5 grid gap-4 xl:grid-cols-[minmax(340px,0.75fr)_minmax(0,1.25fr)]">
+<div class="my-5">
   <AdminPanel title="Start New Login">
     <p class="m-0 text-sm text-muted">Authenticate with Telegram only. Pick one method; MemeExpert creates the session row and continues the next step on that new session card.</p>
     <div class="grid gap-3 md:grid-cols-2">
@@ -397,35 +365,6 @@
         <Button type="submit" variant="secondary">Continue</Button>
       </form>
     </div>
-  </AdminPanel>
-
-  <AdminPanel title="Add Telegram Channel">
-    <p class="m-0 text-sm text-muted">Assign new Telegram channels to a DB-backed session or intentionally create them orphaned. Orphaned channels are non-indexable and crawler controls are forced off.</p>
-    <form method="POST" action="?/addChannel" class="grid gap-3">
-      <div class="grid gap-3 md:grid-cols-2">
-        <FormRow label="Platform id"><Input name="platform_id" placeholder="-1001234567890 or public handle" required /></FormRow>
-        <FormRow label="Title"><Input name="title" placeholder="Source title" required /></FormRow>
-      </div>
-      <div class="grid gap-3 md:grid-cols-3">
-        <FormRow label="Username"><Input name="username" placeholder="optional" /></FormRow>
-        <FormRow label="Subscribers"><Input name="subscriber_count" type="number" min="0" /></FormRow>
-        <FormRow label="Catch-up limit"><Input name="catchup_message_limit" type="number" min="1" max="10000" value="500" required /></FormRow>
-      </div>
-      <FormRow label="Assignment" hint="Choose Orphaned when no session should index this source yet.">
-        <Select name="assignment" required>
-          <option value="orphaned">Orphaned, non-indexable</option>
-          {#each data.telegramAdmin.sessions as session (session.id)}
-            <option value={session.id}>{sessionLabel(session)}</option>
-          {/each}
-        </Select>
-      </FormRow>
-      <div class="grid gap-2 rounded-2xl border border-line bg-soft/40 p-3 md:grid-cols-3">
-        <label class="inline-flex items-center gap-2 text-chiptext"><input name="catchup_enabled" type="checkbox" checked /> Catch-up enabled when assigned</label>
-        <label class="inline-flex items-center gap-2 text-chiptext"><input name="live_enabled" type="checkbox" checked /> Live enabled when assigned</label>
-        <label class="inline-flex items-center gap-2 text-chiptext"><input name="engagement_enabled" type="checkbox" checked /> Engagement enabled when assigned</label>
-      </div>
-      <Button type="submit">Add Telegram channel</Button>
-    </form>
   </AdminPanel>
 </div>
 
@@ -546,14 +485,7 @@
             <form method="POST" action="?/validateSession" class="grid content-start gap-3 rounded-2xl border border-line bg-soft/40 p-3">
               <input type="hidden" name="session_id" value={session.id} />
               <strong>Validate access</strong>
-              <FormRow label="Optional channel">
-                <Select name="source_channel_id">
-                  <option value="">Session only</option>
-                  {#each channels as channel (channel.id)}
-                    <option value={channel.id}>{channelLabel(channel)}</option>
-                  {/each}
-                </Select>
-              </FormRow>
+              <p class="m-0 text-sm text-muted">Check this Telegram account. Manage and validate source assignment from Sources.</p>
               <Input name="note" placeholder="validation note" />
               <Button type="submit" variant="secondary">Validate</Button>
             </form>
@@ -568,116 +500,6 @@
             </form>
           </div>
         </article>
-      {/each}
-    </div>
-  {/if}
-</AdminPanel>
-
-<AdminPanel title="Channels by Session">
-  {#if data.telegramAdmin.groups.length === 0}
-    <EmptyState title="No channel groups" message="Telegram channel groups could not load." />
-  {:else}
-    <div class="grid gap-4">
-      {#each data.telegramAdmin.groups as group, groupIndex (group.telegram_session?.id ?? `orphaned-${groupIndex}`)}
-        <section class={group.is_orphaned ? 'grid gap-3 rounded-3xl border border-danger-line bg-danger-surface/60 p-4' : 'grid gap-3 rounded-3xl border border-line bg-paper p-4'}>
-          <div class="flex flex-wrap items-start justify-between gap-2">
-            <div>
-              <h3 class="m-0 text-xl font-black tracking-[-0.03em]">{groupTitle(group)}</h3>
-              <p class="m-0 text-sm text-muted">
-                {#if group.is_orphaned}
-                  Orphaned channels have no session, are shown as non-indexable, and cannot enable crawler controls until assigned.
-                {:else if group.telegram_session}
-                  Assigned to {group.telegram_session.name} · session status {group.telegram_session.status}
-                {/if}
-              </p>
-            </div>
-            {#if group.is_orphaned}
-              <Badge class="border-danger-line bg-danger-surface text-danger">non-indexable group</Badge>
-            {:else if group.telegram_session}
-              <Badge tone={group.telegram_session.enabled ? 'success' : 'neutral'}>{group.telegram_session.enabled ? 'session enabled' : 'session disabled'}</Badge>
-            {/if}
-          </div>
-
-          {#if group.channels.length === 0}
-            <p class="m-0 text-sm text-muted">No channels in this group.</p>
-          {:else}
-            <div class="grid gap-3">
-              {#each group.channels as channel (channel.id)}
-                <article class="grid gap-3 rounded-2xl border border-line bg-paper p-3">
-                  <div class="flex flex-wrap items-start justify-between gap-2">
-                    <div>
-                      <strong>{channel.title}</strong>
-                      <p class="m-0 text-sm text-muted">{channel.platform}:{channel.platform_id} · {channel.username ? `@${channel.username}` : 'no username'} · ID {channel.id}</p>
-                      <p class="m-0 text-sm text-muted">{channel.operational_status} · {freshnessCopy(channel)} · last fetched {formatTimestamp(channel.last_fetched_at)}</p>
-                    </div>
-                    <div class="flex flex-wrap gap-2">
-                      <Badge class={channel.is_indexable ? '' : 'border-danger-line bg-danger-surface text-danger'}>{channel.is_indexable ? 'indexable' : 'non-indexable'}</Badge>
-                      <Badge>{channel.is_orphaned ? 'orphaned' : 'assigned'}</Badge>
-                      <Badge>{channel.is_active ? 'active row' : 'dead row'}</Badge>
-                    </div>
-                  </div>
-
-                  <div class="grid gap-3 xl:grid-cols-[minmax(0,1.2fr)_minmax(260px,0.6fr)_minmax(260px,0.6fr)]">
-                    <form method="POST" action="?/updateChannel" class="grid gap-2 rounded-2xl border border-line bg-soft/40 p-3">
-                      <input type="hidden" name="channel_id" value={channel.id} />
-                      <strong>Edit indexing controls</strong>
-                      {#if channel.is_orphaned}
-                        <p class="m-0 text-sm text-danger">Orphaned channels cannot be indexable. Assign this channel before enabling catch-up, live, or engagement.</p>
-                      {/if}
-                      <div class="grid gap-2 md:grid-cols-4">
-                        <label class="inline-flex items-center gap-2 text-chiptext"><input name="catchup_enabled" type="checkbox" checked={channel.is_orphaned ? false : channel.catchup_enabled} disabled={channel.is_orphaned} /> Catch-up</label>
-                        <label class="inline-flex items-center gap-2 text-chiptext"><input name="live_enabled" type="checkbox" checked={channel.is_orphaned ? false : channel.live_enabled} disabled={channel.is_orphaned} /> Live</label>
-                        <label class="inline-flex items-center gap-2 text-chiptext"><input name="engagement_enabled" type="checkbox" checked={channel.is_orphaned ? false : channel.engagement_enabled} disabled={channel.is_orphaned} /> Engagement</label>
-                        <FormRow label="Catch-up limit"><Input name="catchup_message_limit" type="number" min="1" max="10000" value={channel.catchup_message_limit} required /></FormRow>
-                      </div>
-                      <Button type="submit">Save channel controls</Button>
-                    </form>
-
-                    <div class="grid gap-2 rounded-2xl border border-line bg-soft/40 p-3">
-                      <form method="POST" action="?/assignChannel" class="grid gap-2">
-                        <input type="hidden" name="channel_id" value={channel.id} />
-                        <strong>{channel.is_orphaned ? 'Assign channel' : 'Move channel'}</strong>
-                        <Select name="telegram_session_id" required disabled={data.telegramAdmin.sessions.length === 0}>
-                          <option value="">Choose session</option>
-                          {#each data.telegramAdmin.sessions as session (session.id)}
-                            <option value={session.id} selected={session.id === channel.telegram_session_id}>{sessionLabel(session)}</option>
-                          {/each}
-                        </Select>
-                        <Input name="note" placeholder="move/assignment note" />
-                        <Button type="submit" variant="secondary" disabled={data.telegramAdmin.sessions.length === 0}>Assign or move</Button>
-                      </form>
-
-                      <form method="POST" action="?/orphanChannel" class="grid gap-2 border-t border-line pt-2">
-                        <input type="hidden" name="channel_id" value={channel.id} />
-                        <Input name="note" placeholder="orphan note" disabled={channel.is_orphaned} />
-                        <Button type="submit" variant="secondary" disabled={channel.is_orphaned}>Orphan and disable indexing</Button>
-                      </form>
-                    </div>
-
-                    <div class="grid content-start gap-2 rounded-2xl border border-line bg-soft/40 p-3">
-                      {#if channel.is_active}
-                        <form method="POST" action="?/toggleChannel" class="flex flex-wrap gap-2">
-                          <input type="hidden" name="channel_id" value={channel.id} />
-                          <input type="hidden" name="paused" value={channel.is_paused ? 'false' : 'true'} />
-                          <Button type="submit" variant="secondary">{channel.is_paused ? 'Resume' : 'Pause'}</Button>
-                        </form>
-                        <form method="POST" action="?/markChannelDead" class="grid gap-2 border-t border-line pt-2">
-                          <strong>Mark dead</strong>
-                          <p class="m-0 text-sm text-muted">Paste the channel id to confirm. This preserves crawler checkpoint state.</p>
-                          <input type="hidden" name="channel_id" value={channel.id} />
-                          <Input name="confirmation" placeholder={channel.id} autocomplete="off" required />
-                          <Button type="submit" variant="danger">Mark dead</Button>
-                        </form>
-                      {:else}
-                        <Badge>Removed from crawl</Badge>
-                      {/if}
-                    </div>
-                  </div>
-                </article>
-              {/each}
-            </div>
-          {/if}
-        </section>
       {/each}
     </div>
   {/if}

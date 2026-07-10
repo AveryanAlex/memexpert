@@ -2,42 +2,36 @@ import { env } from '$env/dynamic/private';
 import { fail } from '@sveltejs/kit';
 import type { Actions, PageServerLoad } from './$types';
 import {
-  addAdminTelegramChannel,
   ApiError,
-  assignAdminTelegramChannel,
   completeAdminTelegramPhoneCodeLogin,
   completeAdminTelegramPhonePasswordLogin,
   completeAdminTelegramQrLogin,
   createAdminTelegramSession,
   deleteAdminTelegramSession,
-  fetchAdminTelegramChannelGroups,
+  fetchAdminSourceChannels,
   fetchAdminTelegramSessions,
-  markSourceChannelDead,
-  orphanAdminTelegramChannel,
-  setSourceChannelPaused,
   startAdminTelegramPhoneLogin,
   startAdminTelegramQrLogin,
-  updateAdminTelegramChannel,
   updateAdminTelegramSession,
   validateAdminTelegramSession
 } from '$lib/api/client';
 import type { ApiFetch } from '$lib/api/client';
-import type { AdminTelegramChannelGroupRead, AdminTelegramSessionRead, TelegramSessionStatus } from '$lib/api/types';
+import type { AdminTelegramSessionRead, TelegramSessionStatus } from '$lib/api/types';
 
 interface TelegramAdminPagePayload {
   sessions: AdminTelegramSessionRead[];
-  groups: AdminTelegramChannelGroupRead[];
+  sourceCount: number;
 }
 
 export const load: PageServerLoad = async ({ fetch, request }) => {
   const api = apiRequest(fetch, request);
   try {
-    const [sessions, groups] = await Promise.all([
+    const [sessions, sourceChannels] = await Promise.all([
       fetchAdminTelegramSessions(api),
-      fetchAdminTelegramChannelGroups(api)
+      fetchAdminSourceChannels(api)
     ]);
 
-    const telegramAdmin: TelegramAdminPagePayload = { sessions, groups };
+    const telegramAdmin: TelegramAdminPagePayload = { sessions, sourceCount: sourceChannels.length };
 
     return {
       telegramAdmin,
@@ -52,7 +46,7 @@ export const load: PageServerLoad = async ({ fetch, request }) => {
 };
 
 function emptyTelegramAdmin(): TelegramAdminPagePayload {
-  return { sessions: [], groups: [] };
+  return { sessions: [], sourceCount: 0 };
 }
 
 export const actions: Actions = {
@@ -236,101 +230,6 @@ export const actions: Actions = {
       );
       return { message: result.message };
     });
-  },
-  addChannel: async ({ fetch, request }) => {
-    const data = await request.formData();
-    const assignment = readRequired(data, 'assignment');
-    const orphaned = assignment === 'orphaned';
-    return runAction(async () => {
-      await addAdminTelegramChannel({
-        ...apiRequest(fetch, request),
-        body: {
-          platform: 'telegram',
-          platform_id: readRequired(data, 'platform_id'),
-          username: readOptional(data, 'username'),
-          title: readRequired(data, 'title'),
-          subscriber_count: readOptionalInt(data, 'subscriber_count'),
-          telegram_session_id: orphaned ? null : assignment,
-          orphaned,
-          catchup_enabled: orphaned ? false : data.get('catchup_enabled') === 'on',
-          live_enabled: orphaned ? false : data.get('live_enabled') === 'on',
-          engagement_enabled: orphaned ? false : data.get('engagement_enabled') === 'on',
-          catchup_message_limit: readInt(data, 'catchup_message_limit', 500)
-        }
-      });
-      return { message: orphaned ? 'Orphaned Telegram channel added as non-indexable.' : 'Telegram channel added and assigned.' };
-    });
-  },
-  updateChannel: async ({ fetch, request }) => {
-    const data = await request.formData();
-    const channelId = readRequired(data, 'channel_id');
-    return runAction(async () => {
-      await updateAdminTelegramChannel(
-        {
-          ...apiRequest(fetch, request),
-          body: {
-            catchup_enabled: data.get('catchup_enabled') === 'on',
-            live_enabled: data.get('live_enabled') === 'on',
-            engagement_enabled: data.get('engagement_enabled') === 'on',
-            catchup_message_limit: readInt(data, 'catchup_message_limit', 500)
-          }
-        },
-        channelId
-      );
-      return { message: 'Telegram channel indexing controls updated.' };
-    });
-  },
-  assignChannel: async ({ fetch, request }) => {
-    const data = await request.formData();
-    const channelId = readRequired(data, 'channel_id');
-    return runAction(async () => {
-      await assignAdminTelegramChannel(
-        {
-          ...apiRequest(fetch, request),
-          body: {
-            telegram_session_id: readRequired(data, 'telegram_session_id'),
-            note: readOptional(data, 'note')
-          }
-        },
-        channelId
-      );
-      return { message: 'Telegram channel assigned to session.' };
-    });
-  },
-  orphanChannel: async ({ fetch, request }) => {
-    const data = await request.formData();
-    const channelId = readRequired(data, 'channel_id');
-    return runAction(async () => {
-      await orphanAdminTelegramChannel(
-        {
-          ...apiRequest(fetch, request),
-          body: { note: readOptional(data, 'note') }
-        },
-        channelId
-      );
-      return { message: 'Telegram channel orphaned and made non-indexable.' };
-    });
-  },
-  toggleChannel: async ({ fetch, request }) => {
-    const data = await request.formData();
-    return runAction(async () => {
-      await setSourceChannelPaused(
-        apiRequest(fetch, request),
-        readRequired(data, 'channel_id'),
-        readRequired(data, 'paused') === 'true'
-      );
-      return { message: 'Telegram channel pause state updated.' };
-    });
-  },
-  markChannelDead: async ({ fetch, request }) => {
-    const data = await request.formData();
-    const channelId = readRequired(data, 'channel_id');
-    const confirmation = readRequired(data, 'confirmation');
-    return runAction(async () => {
-      requireConfirmation(confirmation, channelId, 'Paste the source channel id to mark it dead.');
-      await markSourceChannelDead(apiRequest(fetch, request), channelId, confirmation);
-      return { message: 'Telegram channel marked dead; crawler checkpoint state was preserved.' };
-    });
   }
 };
 
@@ -396,28 +295,6 @@ function readRequired(data: FormData, name: string): string {
 function readOptional(data: FormData, name: string): string | null {
   const value = String(data.get(name) ?? '').trim();
   return value || null;
-}
-
-function readInt(data: FormData, name: string, fallback: number): number {
-  const raw = String(data.get(name) ?? '').trim();
-  if (!raw) {
-    return fallback;
-  }
-  if (!/^\d+$/.test(raw)) {
-    throw new Error(`${name} must be a whole number.`);
-  }
-  return Number(raw);
-}
-
-function readOptionalInt(data: FormData, name: string): number | null {
-  const raw = String(data.get(name) ?? '').trim();
-  if (!raw) {
-    return null;
-  }
-  if (!/^\d+$/.test(raw)) {
-    throw new Error(`${name} must be a whole number.`);
-  }
-  return Number(raw);
 }
 
 function readFloat(data: FormData, name: string, fallback: number): number {

@@ -522,6 +522,14 @@ export async function fetchAdminOverview(request: CatalogRequest): Promise<Admin
   return apiGet<AdminOverviewRead>('/api/v1/admin/overview', new URLSearchParams(), request);
 }
 
+export async function fetchAdminChannelSuggestions(request: CatalogRequest): Promise<ChannelSuggestionRead[]> {
+  return apiGet<ChannelSuggestionRead[]>('/api/v1/admin/channel-suggestions', new URLSearchParams(), request);
+}
+
+export async function fetchAdminSourceChannels(request: CatalogRequest): Promise<AdminSourceChannelRead[]> {
+  return apiGet<AdminSourceChannelRead[]>('/api/v1/admin/source-channels', new URLSearchParams(), request);
+}
+
 export async function fetchAdminDashboard(request: CatalogRequest): Promise<{
   suggestions: ChannelSuggestionRead[];
   sourceChannels: AdminSourceChannelRead[];
@@ -533,8 +541,8 @@ export async function fetchAdminDashboard(request: CatalogRequest): Promise<{
   decisions: AdminModerationDecisionRead[];
 }> {
   const [suggestions, sourceChannels, templates, blockedPerceptualHashes, memes, seoReviews, reports, decisions] = await Promise.all([
-    apiGet<ChannelSuggestionRead[]>('/api/v1/admin/channel-suggestions', new URLSearchParams(), request),
-    apiGet<AdminSourceChannelRead[]>('/api/v1/admin/source-channels', new URLSearchParams(), request),
+    fetchAdminChannelSuggestions(request),
+    fetchAdminSourceChannels(request),
     apiGet<AdminMemeTemplateRead[]>('/api/v1/admin/meme-templates', new URLSearchParams(), request),
     apiGet<AdminBlockedPerceptualHashRead[]>('/api/v1/admin/blocked-perceptual-hashes', new URLSearchParams(), request),
     apiGet<AdminMemeRead[]>('/api/v1/admin/memes', new URLSearchParams({ limit: '20' }), request),
