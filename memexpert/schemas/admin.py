@@ -69,6 +69,22 @@ class AdminSessionRead(BaseModel):
     user: UserRead
 
 
+class AdminOverviewRead(BaseModel):
+    """Bounded operational counts for the task-oriented admin overview."""
+
+    open_report_count: int
+    pending_suggestion_count: int
+    source_attention_count: int
+    orphaned_source_count: int
+    stale_source_count: int
+    waiting_source_count: int
+    healthy_source_count: int
+    telegram_account_attention_count: int
+    ready_telegram_account_count: int
+    missing_seo_count: int
+    uncurated_template_count: int
+
+
 class AdminChannelSuggestionReviewRequest(BaseModel):
     """Approve/reject note payload for channel suggestions."""
 
@@ -1043,6 +1059,7 @@ __all__ = [
     "AdminModerationDecisionRead",
     "AdminModerationReportRead",
     "AdminModerationReportResolveRequest",
+    "AdminOverviewRead",
     "AdminSessionRead",
     "AdminSourceChannelAssignRequest",
     "AdminSourceChannelCreateRequest",

@@ -545,6 +545,20 @@ export interface AdminSessionRead {
   user: UserRead;
 }
 
+export interface AdminOverviewRead {
+  open_report_count: number;
+  pending_suggestion_count: number;
+  source_attention_count: number;
+  orphaned_source_count: number;
+  stale_source_count: number;
+  waiting_source_count: number;
+  healthy_source_count: number;
+  telegram_account_attention_count: number;
+  ready_telegram_account_count: number;
+  missing_seo_count: number;
+  uncurated_template_count: number;
+}
+
 export interface ChannelSuggestionRead {
   id: string;
   user_id: string;

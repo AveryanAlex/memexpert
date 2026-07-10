@@ -22,6 +22,7 @@ describe('AppShell SSR', () => {
     expect(body).toContain('Sign in');
     expect(body).toContain('Guest');
     expect(body).toContain('aria-label="Mobile navigation"');
+    expect(body).not.toContain('href="/admin"');
   });
 
   it('renders connected profile state for full users', () => {
@@ -36,6 +37,22 @@ describe('AppShell SSR', () => {
     expect(body).toContain('Full profile');
     expect(body).toContain('Connected: Telegram');
     expect(body).toContain('href="/profile"');
+    expect(body.match(/href="\/profile"[^>]*aria-current="page"/g)).toHaveLength(2);
+    expect(body).not.toContain('href="/admin"');
+  });
+
+  it('renders the Admin link only for admins', () => {
+    const { body } = render(AppShell, {
+      props: {
+        session: adminSession(),
+        sessionError: null,
+        currentPath: '/admin'
+      }
+    });
+
+    expect(body).toContain('href="/admin"');
+    expect(body).toContain('>Admin</a>');
+    expect(body.match(/href="\/admin"[^>]*aria-current="page"/g)).toHaveLength(2);
   });
 });
 
@@ -45,4 +62,11 @@ function guestSession(): CurrentSessionRead {
 
 function fullSession(): CurrentSessionRead {
   return { user: { account_type: 'full' }, linked_providers: { telegram_linked: true, google_linked: false, email: null } } as CurrentSessionRead;
+}
+
+function adminSession(): CurrentSessionRead {
+  return {
+    user: { account_type: 'full', is_admin: true },
+    linked_providers: { telegram_linked: true, google_linked: false, email: null }
+  } as CurrentSessionRead;
 }

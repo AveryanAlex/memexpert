@@ -9,7 +9,7 @@ import {
   deactivateBlockedPerceptualHash,
   deleteBlockedPerceptualHash,
   deleteMemeTemplate,
-  fetchAdminDashboard,
+  fetchAdminOverview,
   markSourceChannelDead,
   mergeMemeTemplate,
   regenerateMemeSeoPage,
@@ -27,20 +27,23 @@ export const load: PageServerLoad = async ({ fetch, request }) => {
   const cookieHeader = request.headers.get('cookie') ?? undefined;
   try {
     return {
-      dashboard: await fetchAdminDashboard({ fetch, baseUrl: apiBaseUrl(), cookieHeader }),
+      overview: await fetchAdminOverview({ fetch, baseUrl: apiBaseUrl(), cookieHeader }),
       loadError: null
     };
   } catch (caught) {
     return {
-      dashboard: {
-        suggestions: [],
-        sourceChannels: [],
-        templates: [],
-        blockedPerceptualHashes: [],
-        memes: [],
-        seoReviews: [],
-        reports: [],
-        decisions: []
+      overview: {
+        open_report_count: 0,
+        pending_suggestion_count: 0,
+        source_attention_count: 0,
+        orphaned_source_count: 0,
+        stale_source_count: 0,
+        waiting_source_count: 0,
+        healthy_source_count: 0,
+        telegram_account_attention_count: 0,
+        ready_telegram_account_count: 0,
+        missing_seo_count: 0,
+        uncurated_template_count: 0
       },
       loadError: caught instanceof ApiError ? caught.message : 'Could not load admin tools.'
     };

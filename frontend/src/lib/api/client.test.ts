@@ -18,6 +18,7 @@ import {
   deleteCollection,
   favoriteMeme,
   fetchAdminDashboard,
+  fetchAdminOverview,
   fetchAdminSession,
   fetchAdminTelegramChannelGroups,
   fetchAdminTelegramChannels,
@@ -1154,6 +1155,31 @@ describe('admin API client', () => {
     expect(calls).toContain('/api/v1/admin/seo-pages?limit=20');
     expect(calls).toContain('/api/v1/admin/moderation-reports?limit=20');
     expect(calls).toContain('/api/v1/admin/moderation-decisions?limit=20');
+  });
+
+  it('loads the bounded admin overview from its single endpoint', async () => {
+    const mockFetch = vi.fn(async (input: RequestInfo | URL) => {
+      expect(new URL(String(input)).pathname).toBe('/api/v1/admin/overview');
+      return jsonResponse({
+        open_report_count: 1,
+        pending_suggestion_count: 2,
+        source_attention_count: 3,
+        orphaned_source_count: 4,
+        stale_source_count: 5,
+        waiting_source_count: 6,
+        healthy_source_count: 7,
+        telegram_account_attention_count: 8,
+        ready_telegram_account_count: 9,
+        missing_seo_count: 10,
+        uncurated_template_count: 11
+      });
+    }) satisfies ApiFetch;
+
+    const overview = await fetchAdminOverview({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test' });
+
+    expect(overview.source_attention_count).toBe(3);
+    expect(overview.ready_telegram_account_count).toBe(9);
+    expect(mockFetch).toHaveBeenCalledOnce();
   });
 
   it('edits and regenerates meme SEO pages through admin endpoints', async () => {

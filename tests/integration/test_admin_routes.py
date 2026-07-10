@@ -305,6 +305,222 @@ async def test_admin_routes_require_session_cookie_admin_flag_and_ignore_operato
     assert operator_telegram_sessions_response.status_code == 401
 
 
+async def test_admin_overview_returns_authorized_aggregate_counts_at_source_boundaries(
+    auth_app: FastAPI,
+    auth_settings_overrides: dict[str, str],
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch,
+) -> None:
+    admin_email = "admin-overview@example.com"
+    admin_token = await _issue_user_cookie(
+        postgres_session_factory,
+        auth_settings_overrides,
+        email=admin_email,
+        is_admin=True,
+    )
+    non_admin_token = await _issue_user_cookie(
+        postgres_session_factory,
+        auth_settings_overrides,
+        email="admin-overview-denied@example.com",
+        is_admin=False,
+    )
+    now = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
+
+    async with postgres_session_factory() as session:
+        admin = (await session.execute(select(User).where(User.email == admin_email))).scalar_one()
+        ready_account = TelegramSession(
+            name="overview-ready",
+            display_name="Overview ready",
+            encrypted_string_session="encrypted-ready-session",
+            status=TelegramSessionStatus.ACTIVE,
+            enabled=True,
+        )
+        missing_session_account = TelegramSession(
+            name="overview-missing-session",
+            display_name="Overview missing session",
+            status=TelegramSessionStatus.ACTIVE,
+            enabled=True,
+        )
+        disabled_account = TelegramSession(
+            name="overview-disabled",
+            display_name="Overview disabled",
+            encrypted_string_session="encrypted-disabled-session",
+            status=TelegramSessionStatus.ACTIVE,
+            enabled=False,
+        )
+        stopped_account = TelegramSession(
+            name="overview-stopped",
+            display_name="Overview stopped",
+            encrypted_string_session="encrypted-stopped-session",
+            status=TelegramSessionStatus.STOPPED,
+            enabled=True,
+        )
+        blank_session_account = TelegramSession(
+            name="overview-blank-session",
+            display_name="Overview blank session",
+            encrypted_string_session=" \t\n ",
+            status=TelegramSessionStatus.ACTIVE,
+            enabled=True,
+        )
+        session.add_all(
+            [ready_account, missing_session_account, disabled_account, stopped_account, blank_session_account],
+        )
+        await session.flush()
+
+        session.add_all(
+            [
+                ChannelSuggestion(
+                    user_id=admin.id,
+                    platform=SourcePlatform.TELEGRAM,
+                    channel_url="https://t.me/pending-overview",
+                    status="pending",
+                ),
+                ChannelSuggestion(
+                    user_id=admin.id,
+                    platform=SourcePlatform.TELEGRAM,
+                    channel_url="https://t.me/approved-overview",
+                    status="approved",
+                ),
+                SourceChannel(
+                    platform=SourcePlatform.TELEGRAM,
+                    platform_id="overview-healthy",
+                    title="Overview healthy",
+                    telegram_session_id=ready_account.id,
+                    last_fetched_at=now - timedelta(minutes=30),
+                    created_at=now - timedelta(days=2),
+                ),
+                SourceChannel(
+                    platform=SourcePlatform.TELEGRAM,
+                    platform_id="overview-fresh-boundary",
+                    title="Overview fresh boundary",
+                    telegram_session_id=ready_account.id,
+                    last_fetched_at=now - timedelta(days=1),
+                    created_at=now - timedelta(days=2),
+                ),
+                SourceChannel(
+                    platform=SourcePlatform.TELEGRAM,
+                    platform_id="overview-stale",
+                    title="Overview stale",
+                    telegram_session_id=ready_account.id,
+                    last_fetched_at=now - timedelta(days=1, microseconds=1),
+                    created_at=now - timedelta(days=2),
+                ),
+                SourceChannel(
+                    platform=SourcePlatform.TELEGRAM,
+                    platform_id="overview-waiting",
+                    title="Overview waiting",
+                    telegram_session_id=ready_account.id,
+                    created_at=now - timedelta(minutes=15) + timedelta(microseconds=1),
+                ),
+                SourceChannel(
+                    platform=SourcePlatform.TELEGRAM,
+                    platform_id="overview-grace-expired",
+                    title="Overview grace expired",
+                    telegram_session_id=ready_account.id,
+                    created_at=now - timedelta(minutes=15),
+                ),
+                SourceChannel(
+                    platform=SourcePlatform.TELEGRAM,
+                    platform_id="overview-orphaned",
+                    title="Overview orphaned",
+                    last_fetched_at=now - timedelta(minutes=1),
+                    created_at=now - timedelta(days=2),
+                ),
+                SourceChannel(
+                    platform=SourcePlatform.TELEGRAM,
+                    platform_id="overview-orphaned-waiting",
+                    title="Overview orphaned waiting",
+                    created_at=now - timedelta(minutes=15) + timedelta(microseconds=1),
+                ),
+                SourceChannel(
+                    platform=SourcePlatform.TELEGRAM,
+                    platform_id="overview-orphaned-stale",
+                    title="Overview orphaned stale",
+                    last_fetched_at=now - timedelta(days=2),
+                    created_at=now - timedelta(days=2),
+                ),
+                SourceChannel(
+                    platform=SourcePlatform.TELEGRAM,
+                    platform_id="overview-paused",
+                    title="Overview paused",
+                    telegram_session_id=ready_account.id,
+                    is_paused=True,
+                    last_fetched_at=now - timedelta(days=2),
+                    created_at=now - timedelta(days=2),
+                ),
+                SourceChannel(
+                    platform=SourcePlatform.TELEGRAM,
+                    platform_id="overview-removed",
+                    title="Overview removed",
+                    telegram_session_id=ready_account.id,
+                    is_active=False,
+                    last_fetched_at=now - timedelta(days=2),
+                    created_at=now - timedelta(days=2),
+                ),
+                MemeTemplate(slug="overview-uncurated", name="Overview uncurated", is_curated=False),
+                MemeTemplate(slug="overview-curated", name="Overview curated", is_curated=True),
+            ],
+        )
+        meme, meme_file = _canonical_meme(media_type=ContentKind.IMAGE, is_public=True, is_nsfw=False)
+        private_meme, private_file = _canonical_meme(media_type=ContentKind.IMAGE, is_public=False, is_nsfw=False)
+        nsfw_meme, nsfw_file = _canonical_meme(media_type=ContentKind.IMAGE, is_public=True, is_nsfw=True)
+        covered_meme, covered_file = _canonical_meme(media_type=ContentKind.IMAGE, is_public=True, is_nsfw=False)
+        await _persist_canonical_meme(session, meme, meme_file)
+        await _persist_canonical_meme(session, private_meme, private_file)
+        await _persist_canonical_meme(session, nsfw_meme, nsfw_file)
+        await _persist_canonical_meme(session, covered_meme, covered_file)
+        session.add(
+            MemeSeoPage(
+                meme=covered_meme,
+                slug="overview-covered",
+                page_title="Overview covered",
+                meta_description="Overview covered description",
+                alt_text="Overview covered alt text",
+                model_id="test-model",
+                prompt_version="test-version",
+            ),
+        )
+        session.add_all(
+            [
+                ModerationReport(meme=meme, status=ModerationReportStatus.PENDING),
+                ModerationReport(meme=meme, status=ModerationReportStatus.IN_REVIEW),
+                ModerationReport(meme=meme, status=ModerationReportStatus.RESOLVED),
+            ],
+        )
+        await session.commit()
+
+    monkeypatch.setattr(admin_service_module, "utcnow", lambda: now)
+    transport = ASGITransport(app=auth_app)
+    async with AsyncClient(transport=transport, base_url="https://testserver") as anonymous_client:
+        anonymous_response = await anonymous_client.get("/api/v1/admin/overview")
+    async with AsyncClient(transport=transport, base_url="https://testserver") as non_admin_client:
+        non_admin_client.cookies.set(ACCESS_COOKIE_NAME, non_admin_token)
+        forbidden_response = await non_admin_client.get("/api/v1/admin/overview")
+    async with AsyncClient(transport=transport, base_url="https://testserver") as admin_client:
+        admin_client.cookies.set(ACCESS_COOKIE_NAME, admin_token)
+        response = await admin_client.get("/api/v1/admin/overview")
+
+    assert anonymous_response.status_code == 401
+    assert forbidden_response.status_code == 403
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload == {
+        "open_report_count": 2,
+        "pending_suggestion_count": 1,
+        "source_attention_count": 4,
+        "orphaned_source_count": 2,
+        "stale_source_count": 3,
+        "waiting_source_count": 2,
+        "healthy_source_count": 2,
+        "telegram_account_attention_count": 4,
+        "ready_telegram_account_count": 1,
+        "missing_seo_count": 1,
+        "uncurated_template_count": 1,
+    }
+    assert payload["source_attention_count"] < payload["orphaned_source_count"] + payload["stale_source_count"]
+    assert payload["missing_seo_count"] == 1
+
+
 async def test_admin_can_approve_channel_suggestion_through_cookie_session(
     auth_app: FastAPI,
     auth_settings_overrides: dict[str, str],

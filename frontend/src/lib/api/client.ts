@@ -10,6 +10,7 @@ import type {
   AdminMemeTemplateRead,
   AdminModerationDecisionRead,
   AdminModerationReportRead,
+  AdminOverviewRead,
   AdminSessionRead,
   AdminSourceChannelRead,
   AdminTelegramChannelAssignPayload,
@@ -515,6 +516,10 @@ export async function fetchPinterestFeed(request: SeoCatalogPageRequest): Promis
 
 export async function fetchAdminSession(request: CatalogRequest): Promise<AdminSessionRead> {
   return apiGet<AdminSessionRead>('/api/v1/admin/session', new URLSearchParams(), request);
+}
+
+export async function fetchAdminOverview(request: CatalogRequest): Promise<AdminOverviewRead> {
+  return apiGet<AdminOverviewRead>('/api/v1/admin/overview', new URLSearchParams(), request);
 }
 
 export async function fetchAdminDashboard(request: CatalogRequest): Promise<{

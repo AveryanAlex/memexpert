@@ -37,6 +37,7 @@ from memexpert.schemas.admin import (
     AdminModerationDecisionRead,
     AdminModerationReportRead,
     AdminModerationReportResolveRequest,
+    AdminOverviewRead,
     AdminSessionRead,
     AdminSourceChannelAssignRequest,
     AdminSourceChannelCreateRequest,
@@ -93,6 +94,14 @@ def _map_admin_error(exc: AdminNotFoundError | AdminConflictError) -> HTTPExcept
 @router.get("/session", response_model=AdminSessionRead, summary="Read current admin session")
 async def read_admin_session(admin_user: AdminUserDep) -> AdminSessionRead:
     return AdminSessionRead(user=admin_user)
+
+
+@router.get("/overview", response_model=AdminOverviewRead, summary="Read actionable admin overview counts")
+async def get_admin_overview(
+    _admin: AdminUserDep,
+    admin_service: AdminServiceDep,
+) -> AdminOverviewRead:
+    return await admin_service.get_overview()
 
 
 @router.get(

@@ -12,6 +12,8 @@ export const PRIMARY_NAV_ITEMS: NavItem[] = [
   { label: 'Profile', href: '/profile', match: 'prefix' }
 ];
 
+export const ADMIN_NAV_ITEM: NavItem = { label: 'Admin', href: '/admin', match: 'prefix' };
+
 export function isNavItemActive(item: NavItem, currentPath: string): boolean {
   return item.match === 'exact' ? currentPath === item.href : currentPath === item.href || currentPath.startsWith(`${item.href}/`);
 }

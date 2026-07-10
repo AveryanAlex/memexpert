@@ -5,10 +5,11 @@ from __future__ import annotations
 import inspect
 import uuid
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import TYPE_CHECKING
 
 from pydantic import SecretStr
-from sqlalchemy import case, delete, func, or_, select
+from sqlalchemy import and_, case, delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
@@ -41,7 +42,13 @@ from memexpert.models.content import (
     TelegramFileIdCache,
     TelegramSession,
 )
-from memexpert.models.enums import ModerationAction, ModerationReportStatus, SourcePlatform, TelegramSessionStatus
+from memexpert.models.enums import (
+    ChannelSuggestionStatus,
+    ModerationAction,
+    ModerationReportStatus,
+    SourcePlatform,
+    TelegramSessionStatus,
+)
 from memexpert.models.user import ChannelSuggestion
 from memexpert.schemas.admin import (
     AdminBlockedPerceptualHashActionRead,
@@ -69,6 +76,7 @@ from memexpert.schemas.admin import (
     AdminModerationDecisionRead,
     AdminModerationReportRead,
     AdminModerationReportResolveRequest,
+    AdminOverviewRead,
     AdminSourceChannelAssignRequest,
     AdminSourceChannelCreateRequest,
     AdminSourceChannelMarkDeadRequest,
@@ -98,7 +106,6 @@ if TYPE_CHECKING:
     from sqlalchemy.sql.elements import ColumnElement
 
     from memexpert.core.config import Settings
-    from memexpert.models.enums import ChannelSuggestionStatus
 
 
 MAX_AUDIT_SNAPSHOT_IDS = 25
@@ -107,6 +114,8 @@ MAX_SEO_TAG_LENGTH = 64
 MAX_TELEGRAM_ERROR_TEXT_LENGTH = 4000
 PENDING_TELEGRAM_SESSION_NAME_PREFIX = "pending_telegram_"
 PENDING_TELEGRAM_SESSION_DISPLAY_NAME = "Pending Telegram login"
+SOURCE_STALE_AFTER = timedelta(days=1)
+SOURCE_FIRST_FETCH_GRACE = timedelta(minutes=15)
 
 
 def pending_telegram_session_name() -> str:
@@ -237,6 +246,122 @@ class AdminService:
     """Small admin orchestration service over current durable models."""
 
     session: AsyncSession
+
+    async def get_overview(self) -> AdminOverviewRead:
+        """Return bounded task counts without materializing admin collections.
+
+        A source is waiting only during its first 15 minutes without a successful
+        fetch. After that grace period, active unpaused sources need attention
+        when they are orphaned or stale. Paused and removed sources are omitted
+        from all operational source counts.
+        """
+
+        now = utcnow()
+        stale_before = now - SOURCE_STALE_AFTER
+        first_fetch_grace_ends_at = now - SOURCE_FIRST_FETCH_GRACE
+
+        active_unpaused_source = and_(
+            SourceChannel.is_active.is_(True),
+            SourceChannel.is_paused.is_(False),
+        )
+        waiting_source = and_(
+            active_unpaused_source,
+            SourceChannel.last_fetched_at.is_(None),
+            SourceChannel.created_at > first_fetch_grace_ends_at,
+        )
+        source_past_first_fetch_grace = and_(
+            active_unpaused_source,
+            or_(
+                SourceChannel.last_fetched_at.is_not(None),
+                SourceChannel.created_at <= first_fetch_grace_ends_at,
+            ),
+        )
+        orphaned_source = and_(
+            source_past_first_fetch_grace,
+            SourceChannel.telegram_session_id.is_(None),
+        )
+        stale_source = and_(
+            source_past_first_fetch_grace,
+            or_(
+                SourceChannel.last_fetched_at.is_(None),
+                SourceChannel.last_fetched_at < stale_before,
+            ),
+        )
+        source_needing_attention = and_(
+            source_past_first_fetch_grace,
+            or_(
+                SourceChannel.telegram_session_id.is_(None),
+                SourceChannel.last_fetched_at.is_(None),
+                SourceChannel.last_fetched_at < stale_before,
+            ),
+        )
+        healthy_source = and_(
+            active_unpaused_source,
+            SourceChannel.telegram_session_id.is_not(None),
+            SourceChannel.last_fetched_at.is_not(None),
+            SourceChannel.last_fetched_at >= stale_before,
+        )
+        telegram_session_material_is_missing = or_(
+            TelegramSession.encrypted_string_session.is_(None),
+            func.regexp_replace(
+                TelegramSession.encrypted_string_session,
+                "[[:space:]]",
+                "",
+                "g",
+            )
+            == "",
+        )
+        telegram_account_needing_attention = or_(
+            TelegramSession.enabled.is_(False),
+            telegram_session_material_is_missing,
+            TelegramSession.status != TelegramSessionStatus.ACTIVE,
+        )
+        ready_telegram_account = and_(
+            TelegramSession.enabled.is_(True),
+            ~telegram_session_material_is_missing,
+            TelegramSession.status == TelegramSessionStatus.ACTIVE,
+        )
+
+        def count_rows(model: type[object], *conditions: ColumnElement[bool]):
+            return select(func.count()).select_from(model).where(*conditions).scalar_subquery()
+
+        row = (
+            await self.session.execute(
+                select(
+                    count_rows(
+                        ModerationReport,
+                        ModerationReport.status.in_(
+                            [ModerationReportStatus.PENDING, ModerationReportStatus.IN_REVIEW],
+                        ),
+                    ).label("open_report_count"),
+                    count_rows(
+                        ChannelSuggestion,
+                        ChannelSuggestion.status == ChannelSuggestionStatus.PENDING,
+                    ).label("pending_suggestion_count"),
+                    count_rows(SourceChannel, source_needing_attention).label("source_attention_count"),
+                    count_rows(SourceChannel, orphaned_source).label("orphaned_source_count"),
+                    count_rows(SourceChannel, stale_source).label("stale_source_count"),
+                    count_rows(SourceChannel, waiting_source).label("waiting_source_count"),
+                    count_rows(SourceChannel, healthy_source).label("healthy_source_count"),
+                    count_rows(TelegramSession, telegram_account_needing_attention).label(
+                        "telegram_account_attention_count",
+                    ),
+                    count_rows(TelegramSession, ready_telegram_account).label("ready_telegram_account_count"),
+                    select(func.count())
+                    .select_from(Meme)
+                    .outerjoin(MemeSeoPage, MemeSeoPage.meme_id == Meme.id)
+                    .where(
+                        Meme.is_public.is_(True),
+                        Meme.is_nsfw.is_(False),
+                        MemeSeoPage.meme_id.is_(None),
+                    )
+                    .scalar_subquery()
+                    .label("missing_seo_count"),
+                    count_rows(MemeTemplate, MemeTemplate.is_curated.is_(False)).label("uncurated_template_count"),
+                ),
+            )
+        ).mappings().one()
+        return AdminOverviewRead(**row)
 
     async def list_channel_suggestions(
         self,
