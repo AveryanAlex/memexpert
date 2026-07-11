@@ -22,10 +22,11 @@ The crawler ships five operator-facing pieces:
    The manager discovers runnable DB rows, keeps one cached client/rate limiter
    per session, and delegates each session's catch-up, live listener, and replay
    work to the per-session runtime executor.
-3. **Browser-admin Telegram surface** (`/admin/telegram` plus
-    `/api/v1/admin/telegram/*`) for cookie-authenticated session CRUD,
-    QR/phone/code/2FA session login, validation, and channel assignment
-    management.
+3. **Browser-admin workspaces** for cookie-authenticated durable admins:
+     `/admin/telegram` manages Telegram accounts and login/repair,
+     `/admin/sources` manages source suggestions, public-reference add,
+     assignment, health, and ingestion; the supporting API is under
+     `/api/v1/admin/*`.
 4. **Operator crawler API surface** (`memexpert/api/routes/v1/crawler.py`)
     exposing `/api/v1/crawler/sessions`, `/channels`, `/pause`, `/resume`,
     `/reassign`, `/replay-post`, and `/freshness` for runtime inspection and
@@ -42,7 +43,7 @@ The crawler ships five operator-facing pieces:
   before runtime diagnostics are meaningful.
 - Alembic head applied: `uv run alembic upgrade head`.
 - The native API running on `http://127.0.0.1:8000`: `uv run memexpert-api`.
-- The SvelteKit frontend serving `/admin/telegram`. For local development,
+- The SvelteKit frontend serving the `/admin` workspaces. For local development,
   run the frontend from `frontend/` with `pnpm dev`; set `API_BASE_URL` when
   the API is not reachable at the frontend default.
 - The heavy workers running: `uv run memexpert-workers`. These
@@ -78,53 +79,62 @@ The crawler ships five operator-facing pieces:
     to `false` in environments where catch-up is the only sanctioned
     mode.
 
-## Browser-admin Telegram workflow
+## Browser-admin workspaces
 
-Use `/admin/telegram` for routine Telegram session and source-channel
-management. The page is backed by `/api/v1/admin/telegram/*` and forwards the
-admin browser cookie from SvelteKit to the API.
+The browser UI is a cookie-authenticated control plane that requires both a
+full account and the durable admin flag. It calls `/api/v1/admin/*` through
+SvelteKit and deliberately calls the routine objects **Telegram accounts** and
+**sources**. The runtime/data model still uses
+`telegram_sessions` and `source_channels` internally; use those terms in SQL or
+operator-token API diagnostics, not as the normal browser workflow.
 
-### Sessions
+| Workspace | Routine purpose |
+| --- | --- |
+| `/admin` | Linked attention counts only. |
+| `/admin/sources` | Suggestions, add flow, source health, account assignment, and ingestion controls. |
+| `/admin/telegram` | Account login, validation, policy repair, and disconnect. |
+| `/admin/moderation` and `/admin/moderation/patterns` | Report review and blocked visual-pattern policy. |
+| `/admin/content/seo` and `/admin/content/templates` | SEO queue and template curation. `/admin/content` redirects to SEO. |
 
-Before the runtime can ingest Telegram content, start a browser-admin login for
-each account the manager should run. In the "Start New Login" panel, pick the
-same flow an operator would use in the official Telegram client:
+The overview excludes paused/removed sources from operational counts. A
+never-fetched active source is **waiting** for its first 15 minutes; it becomes
+source attention once it remains orphaned or stale. Orphaned and stale counts
+overlap, so do not add their displayed subcounts: an old never-fetched orphan is
+one source-attention row in both diagnostics. Account attention means the
+account is disabled, inactive, missing authorized stored material, currently
+flood-waited, or quarantined. Counts are triage links, not a real-time crawler
+command.
 
-- **Log in with phone**: enter the phone number once, enter the Telegram code on
-  the next screen, then enter the account password only if Telegram asks for it.
-- **Log in with QR**: show the QR code in the modal, scan it from Telegram →
-  Settings → Devices → Link Desktop Device, and wait while MemeExpert polls the
-  login automatically. The modal refreshes QR codes before they expire and shows
-  a loading spinner while a replacement QR code is being generated. Enter the
-  account password only if Telegram asks for it.
+### Telegram accounts
 
-The browser UI keeps Telegram login attempt ids hidden; operators do not
-copy/paste attempt ids between steps, and QR login no longer has an "I scanned
-it" continue button. The QR modal includes a text link fallback for environments
-where an admin cannot scan the SVG image.
-- Successful login stores the authorized Telethon session encrypted in the DB,
-  renames the session to `telegram_<telegram_user_id>`, sets `display_name` from
-  the Telegram profile name, updates account projection, clears parked/error
-  state, and marks the session `active`.
-- Login-created sessions start with default crawler controls enabled and
-  `max_requests_per_second=1`. Use "Patch policy/status" after login if an
-  environment needs different catch-up, live, engagement, enabled, or rate-limit
-  settings.
-- Use "Validate access" on an existing session to decrypt the stored secret,
-  validate it with Telegram, and optionally check access to a selected source
-  channel.
-- Use "Patch policy/status" to change session status, crawler policy toggles,
-  flood-wait/error fields, or max requests/sec. Clearing errors and setting the
-  status back to `active` clears parked/quarantine timestamps.
+Before the runtime can ingest Telegram content, connect each account the
+manager should run. QR is the primary workflow: scan the QR in Telegram →
+Settings → Devices → Link Desktop Device and wait for automatic polling. The QR
+code refreshes before expiry. Phone sign-in is the disclosed fallback: enter the
+phone number once, then the Telegram code and account password only when
+requested.
 
-Admin responses and the Svelte page never return or render raw secret material:
-full phone numbers, 2FA passwords, temporary login sessions, final
-`StringSession`, and `encrypted_string_session` values are excluded from reads.
-The session projection exposes only `has_string_session` so operators can see
-whether a final encrypted secret is stored.
+The UI never asks an operator to copy/paste a login attempt id and never renders
+raw credentials. Full phone numbers, passwords, temporary login state, final
+StringSession material, and encrypted database values are excluded from API
+reads, rendered HTML, logs, and audit snapshots. Diagnostics may say only that
+an authorized credential is present; account identity, readiness, source count,
+and heartbeat are the routine card contents.
 
-The existing headless helper is now a fallback for exceptional ops imports or
-replacing the secret for a known session name without a browser:
+- Successful login stores the authorized Telethon material encrypted in the DB,
+  updates the account projection, clears parked/error state, and marks the
+  account `active`. Login-created accounts enable catch-up/live/engagement by
+  default with `max_requests_per_second=1`.
+- Use **Validate account** for a routine access check. Diagnostics holds raw
+  timestamps/status/error category; Advanced settings holds policy/rate/repair
+  controls. A separate **Disconnect account** danger disclosure requires
+  `DISCONNECT` and unassigns every source while turning its ingestion off.
+- A ready account is enabled, `active`, authorized, and outside flood-wait or
+  quarantine. Source assignment and public-reference lookup enforce this again
+  on the API even if the browser shows an account as ready.
+
+The headless helper is an exceptional fallback for importing or replacing an
+existing account credential without a browser:
 
 ```bash
 uv run python scripts/auth_telegram_session.py \
@@ -137,36 +147,57 @@ You can also provide the existing StringSession through `--string-session` or
 `TELEGRAM_STRING_SESSION`. The helper never creates `.session` files and never
 prints the StringSession value.
 
-### Channels and assignment
+### Sources and assignment
 
-Use the "Add Telegram Channel" panel instead of SQL data setup:
+Use `/admin/sources` instead of SQL setup or `/admin/telegram` for routine
+source work. The normal **Add Telegram source** form accepts one public
+reference: `@handle`, bare handle, or a one-path `t.me`/`telegram.me` URL. It
+rejects invite links, private links, and other platforms. Choose the exact ready
+account that should fetch it; the form selects automatically only when exactly
+one account is ready.
 
-- Add a Telegram channel with its `platform_id`, title, optional username,
-  optional subscriber count, and `catchup_message_limit`.
-- Assign it directly to a selected DB-backed Telegram session, or choose the
-  `Orphaned, non-indexable` assignment intentionally when no session should
-  index the source yet.
-- For assigned channels, set catch-up, live, and engagement toggles according
-  to the run. The `catchup_message_limit` is the per-channel sweep bound; if it
-  is too high, lower it before raising session or global request rate limits.
-- Orphaned channels are visible in the orphaned group but are non-indexable.
-  Browser admin and the API force catch-up, live, and engagement off while a
-  channel is orphaned, and the manager skips orphaned channels for catch-up,
-  live listening, and replay.
-- Use "Assign or move" to attach a channel to a session. If the channel was
-  orphaned, explicitly save channel controls after assignment when indexing
-  should resume.
-- Use "Orphan and disable indexing" to clear the session assignment and force
-  catch-up, live, and engagement off.
-- Use "Edit indexing controls" for per-channel catch-up/live/engagement
-  toggles and catch-up limit. A channel is indexable only when it is assigned,
-  active, not paused, and at least one crawler/indexing control is enabled.
+The API resolves public metadata with the selected account outside a database
+lock, rechecks readiness, then stores the canonical lowercase Telegram username
+as both public source identity and handle. It assigns that account and enables
+catch-up, live collection, and engagement with a bounded first catch-up of 500
+messages by default. Public Telegram username renames are not followed
+automatically; reconcile a renamed handle as an operator exception before
+expecting continued fetches.
 
-Deleting a Telegram session requires pasting the exact session id into the
-confirmation field. The delete action removes the `telegram_sessions` row and
-its encrypted secret material, then explicitly orphans every assigned channel
-and forces those channels non-indexable by disabling catch-up, live, and
-engagement.
+When the form is started from a Telegram suggestion, source creation/reuse and
+approval of the matching pending suggestion happen atomically. A failed lookup
+leaves the suggestion pending; retrying after a successful create returns the
+same canonical source rather than duplicating it. Reddit and VK suggestions are
+explicitly unsupported while their crawlers do not exist: reject them or leave
+them pending, but do not create inert source rows.
+
+Advanced manual entry is the fallback when the canonical Telegram identifier is
+already known. It deliberately creates an unassigned, non-indexable source with
+catch-up/live/engagement disabled. From the source card, assign a ready account
+and enable the desired ingestion controls. An assigned source is indexable only
+when active, unpaused, and at least one workload control is enabled. Removing
+an account or disconnecting it forces the same safe unassigned/disabled state.
+
+Source cards show health, **last fetched**, and assigned account first.
+Diagnostics contains source/checkpoint identifiers; ingestion settings,
+assignment, source access validation, and remove-source confirmation are
+progressive disclosures. The catch-up limit is a per-source sweep bound: lower
+it before raising an account or global request rate.
+
+The generic browser-admin `POST /api/v1/admin/source-channels` endpoint uses
+the same Telegram-only creation policy as the page. It rejects Reddit/VK rather
+than creating an orphaned row; list/read payloads retain platform data so a
+future crawler can add support without changing operational reads.
+
+### Moderation and content work
+
+`/admin/moderation` is a media-first report queue. Its private/hidden previews
+use the authenticated `/api/v1/media/files/{file_id}/{variant}` proxy, not S3
+keys; full accounts with the durable admin flag can render them while unrelated
+users still receive 404. `/admin/moderation/patterns` lists active/inactive pHash patterns before
+disclosing raw hash/tolerance and danger controls. `/admin/content/seo` is a
+25-row `?page=` review queue; templates are searchable/list-first at
+`/admin/content/templates`, with edit/create/merge/delete controls disclosed.
 
 ### Audit trail
 
@@ -178,12 +209,13 @@ recorded.
 
 ### Browser admin vs crawler API
 
-Use browser admin for login, validation, patch/delete, and assignment: start
-session logins, add channels, move channels between sessions, orphan channels,
-and edit indexing controls. Use the operator-token `/api/v1/crawler/*` endpoints
+Use browser admin for account login/validation/policy and source
+add/assignment/ingestion. Use the operator-token `/api/v1/crawler/*` endpoints
 for runtime tasks: list the runtime projection, pause/resume channels, replay
-one Telegram post, and read freshness snapshots. Browser admin is the preferred
-surface for session and channel management.
+one Telegram post, and read freshness snapshots. Browser admin does not trigger
+a catch-up sweep; after account or source assignment/policy changes, send
+`SIGHUP` to the crawler process so it rebuilds clients/listeners from durable
+state.
 
 ## Starting the crawler runtime
 
@@ -201,7 +233,7 @@ the foreground until stopped.
 Signal behavior:
 
 - `SIGHUP` calls `manager.reload()` and then continues waiting. Send this after
-  browser-admin session/channel assignment or policy changes that should affect
+  browser-admin account/source assignment or policy changes that should affect
   live listeners without a full restart.
 - `SIGINT` / `SIGTERM` request shutdown. The process closes signal handlers,
   calls `manager.shutdown()`, disposes its owned SQLAlchemy engine, and exits.
@@ -224,7 +256,7 @@ Manager discovery rules:
 - Channels are processed only when the `SourceChannel.telegram_session_id`
   assignment points at the runnable session, the channel is active, the channel
   is not paused, and the relevant workload toggle is enabled.
-- Orphaned channels remain visible in `/admin/telegram` and the crawler API, but
+- Orphaned sources remain visible in `/admin/sources` and the crawler API, but
   they are non-indexable and are skipped by catch-up, live listening, and
   replay.
 - The manager keeps one cached Telethon client and one rate limiter per runnable
@@ -304,9 +336,9 @@ causes in priority order:
    `GET /api/v1/crawler/sessions` for the owning session's `status` and
    `flood_wait_until`. If the session is parked, no channel bound to
    it can produce items.
-2. **Channel orphaned or non-indexable.** Check `/admin/telegram` for the
-   assigned/orphaned group and channel controls. Assign the channel to a
-   runnable session and enable the intended catch-up/live/engagement controls.
+2. **Source orphaned or non-indexable.** Check `/admin/sources` for its assigned
+   account and ingestion controls. Assign it to a ready account and enable the
+   intended catch-up/live/engagement controls.
 3. **Channel paused.** Check `is_paused` on the channel row via
    `GET /api/v1/crawler/channels`. Resume with `POST /channels/{id}/resume`.
 4. **Crawler manager not started.** The freshness endpoint only observes; it
@@ -317,8 +349,8 @@ causes in priority order:
 
 ## Per-channel replay + repair
 
-Use `/admin/telegram` for session/channel CRUD, assignment, and indexing-control
-edits. The commands below use `/api/v1/crawler/*` only for runtime inspection,
+Use `/admin/telegram` for account login/policy and `/admin/sources` for source
+assignment and ingestion-control edits. The commands below use `/api/v1/crawler/*` only for runtime inspection,
 pause/resume automation, replay, and freshness checks. Pass the operator
 token in the `X-Memexpert-Operator-Token` header.
 
@@ -410,18 +442,18 @@ clients/listeners should be closed by sending `SIGHUP` to
 Recovery steps:
 
 1. Check `/admin/telegram` or `GET /api/v1/crawler/sessions` and find the
-   parked session.
+   parked account.
 2. Confirm `flood_wait_until` is in the future.
 3. Wait it out. Do not try to bypass — Telegram will escalate the
    cooldown if the client keeps hitting it.
-4. Once the window expires, patch the session back to `active` and clear errors
-   in `/admin/telegram`, or validate access if secret material changed.
+4. Once the window expires, restore the account to `active` and clear errors in
+   `/admin/telegram`, or validate the account if authorized material changed.
 5. Send `SIGHUP` to `memexpert-telegram-crawler` so stale clients/listeners are
    closed and live listeners are rebuilt. Freshness snapshots pick up recovery
    on the next poll.
 
-If the flood-wait keeps recurring, lower the session row's
-`max_requests_per_second` in `/admin/telegram` (preferred) or the
+If the flood-wait keeps recurring, lower the account's
+`max_requests_per_second` in `/admin/telegram` Advanced settings (preferred) or the
 `CRAWLER_MAX_REQUESTS_PER_SECOND` fallback, then send `SIGHUP` to reload the
 crawler process.
 
@@ -436,19 +468,21 @@ An unauthorized or revoked stored session surfaces as
 `PipelineTelegramSessionAuthRequiredError` / `crawler_session_not_runnable`; the
 row is marked `status=auth_required`, not quarantined. Recovery options are:
 
-1. **Move affected channels** to another healthy session in `/admin/telegram`
-   with "Assign or move". The operator-token `POST /channels/{id}/reassign`
+1. **Move affected sources** to another ready account in `/admin/sources`
+   with "Move source". The operator-token `POST /channels/{id}/reassign`
    route still exists for headless scripts, but browser admin is preferred for
    human-driven assignment changes.
-2. **Log in with valid Telegram credentials.** For a replacement session, create
-   it through `/admin/telegram`, finish QR or phone-code login, and move channels
-   to it. To replace the secret for an existing session name without a browser, use
+2. **Log in with valid Telegram credentials.** For a replacement account, create
+   it through `/admin/telegram`, finish QR or phone-code login, then move sources
+   to it from `/admin/sources`. To replace authorized material for an existing
+   technical session name without a browser, use
    `scripts/auth_telegram_session.py --session-name <name> --string-session-file <path>`;
    the helper validates Telegram authorization, replaces `encrypted_string_session`,
    clears error fields, and sets `status='active'`.
-3. **Validate and check recovery.** Use `/admin/telegram` "Validate access"
-   with an optional channel check, send `SIGHUP` to `memexpert-telegram-crawler`,
-   then read `/api/v1/crawler/freshness` to confirm freshness recovers.
+3. **Validate and check recovery.** Use `/admin/telegram` to validate the
+   account or `/admin/sources` to validate source access, send `SIGHUP` to
+   `memexpert-telegram-crawler`, then read `/api/v1/crawler/freshness` to confirm
+   freshness recovers.
 
 ## Common failure modes
 
@@ -472,10 +506,10 @@ row is marked `status=auth_required`, not quarantined. Recovery options are:
 - **Fresh session with empty catch-up.** A brand-new session that has not seen
   any messages yet will produce an empty snapshot. Wait for the live listener to
   accumulate posts before judging the SLO.
-- **`crawler_session_not_runnable` for Telegram.** The `telegram_sessions` row
-  is missing, disabled, not `active`, auth-required, or lacks encrypted
-  StringSession material. Use `/admin/telegram` to log in and validate a
-  runnable session, or move the channel to one.
+- **`crawler_session_not_runnable` for Telegram.** The underlying
+   `telegram_sessions` row is missing, disabled, not `active`, auth-required, or
+   lacks authorized material. Use `/admin/telegram` to log in and validate a
+   ready account, or move the source to one in `/admin/sources`.
 - **Channels without `published_at`.** Legacy `MemeSource` rows without
   `published_at` populated are invisible to the freshness query — they
   do not contribute to or block the SLO. This is deliberate; see
@@ -511,7 +545,7 @@ When the freshness snapshot reports `slo_p95_pass=False`, work top-down:
 ## Known limitations
 
 - **No automatic admin-to-runtime reload hook yet** — assigning or moving a
-  channel in `/admin/telegram` updates `source_channels.telegram_session_id`, but
+  source in `/admin/sources` updates `source_channels.telegram_session_id`, but
   a live crawler process only observes the new binding after `SIGHUP` or process
   restart.
 - **Catch-up is manager-driven** — neither browser admin nor the operator API can

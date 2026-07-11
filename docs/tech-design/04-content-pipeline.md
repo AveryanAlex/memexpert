@@ -4,10 +4,88 @@
 
 Plugin interface per platform. All crawlers normalize output to a common `RawMeme` dataclass (media bytes, media type, source metadata).
 
-- **Telegram (Telethon):** Long-running userbot sessions that listen to channel updates in real-time via Telethon event handlers. Each channel's `last_read_message_id` is persisted in `SourceChannel`. On startup, the crawler catches up on all messages since `last_read_message_id` per channel, then switches to live listening. Multiple sessions (2–3) distribute channels for rate limit safety (≤30 req/s per session).
+- **Telegram (Telethon):** Long-running userbot sessions that listen to channel updates in real-time via Telethon event handlers. Each channel's `last_read_post_id` is persisted in `SourceChannel`. On startup, the crawler catches up on all messages since `last_read_post_id` per channel, then switches to live listening. Multiple sessions (2–3) distribute channels for rate limit safety (≤30 req/s per session).
 - **Reddit (PRAW), VK (VK API):** Planned. Same plugin interface. Platforms without real-time push will poll on intervals, storing `last_read_post_id` in `SourceChannel`.
 
 **Risk:** Telethon userbot accounts are subject to bans. Mitigation: multiple sessions, conservative rates, monitoring. Consider Bot API channel forwarding as a fallback read path.
+
+## Browser Admin Contracts
+
+The browser-admin API is cookie-authenticated and requires both a full account
+and the durable admin flag.
+The SvelteKit routes are a nested shell around task workspaces: `/admin`
+(overview), `/admin/sources`, `/admin/telegram`, `/admin/moderation`,
+`/admin/moderation/patterns`, `/admin/content/seo`,
+`/admin/content/templates`, and `/admin/memes/[id]`. `/admin/content` responds
+with a 303 redirect to `/admin/content/seo`. Desktop uses a sidebar and mobile
+uses the same navigation as a horizontal scrolling strip.
+
+### Overview read
+
+`GET /api/v1/admin/overview` returns only aggregate counts:
+`open_report_count`, `pending_suggestion_count`, `source_attention_count`,
+`orphaned_source_count`, `stale_source_count`, `waiting_source_count`,
+`healthy_source_count`, `telegram_account_attention_count`,
+`ready_telegram_account_count`, `missing_seo_count`, and
+`uncurated_template_count`. It is intentionally a bounded aggregate query, not
+a dashboard payload of every admin collection.
+
+Operational source counts include only active, unpaused rows. A source with no
+successful fetch is waiting during the first 15 minutes after creation; after
+that it needs attention when unassigned or stale. Removed and intentionally
+paused rows do not inflate attention. Orphaned and stale are overlapping
+subcounts: an old never-fetched orphan appears in both but contributes once to
+source attention. An account needs attention when disabled, missing authorized
+stored material, not `active`, currently flood-waited, or quarantined; a ready
+count requires enabled, active, stored material without a current flood-wait or
+quarantine. The frontend calls the human-facing objects **sources** and
+**Telegram accounts** even though the durable crawler model retains
+`SourceChannel` and `TelegramSession` names.
+
+### Public Telegram source add
+
+`POST /api/v1/admin/telegram/channels/from-reference` accepts a public Telegram
+`reference`, a required selected `telegram_session_id`, optional `suggestion_id`,
+and a bounded `catchup_message_limit` (default 500). It accepts only
+`@handle`, bare handle, and one-path `t.me` or `telegram.me` public URLs. Invite
+links, private/non-Telegram references, and paths with query/fragment content
+are rejected. The selected account must be enabled, active, authorized, and
+outside flood-wait/quarantine both before and after the bounded provider call.
+
+The resolver returns secret-free metadata only. A public source's canonical
+`platform_id` and `username` are the lowercase public username, allowing cold
+crawler resolution without persisted access-hash material. This bounded flow
+does not follow Telegram username renames; an operator must reconcile a rename
+before treating the old public identity as current.
+
+The service performs Telegram I/O without retaining a database row lock, then
+locks/rechecks the selected account and canonical source identity before writing.
+It atomically creates or reuses the source, assigns the selected ready account,
+enables catch-up/live/engagement, and approves a matching pending suggestion in
+the same transaction. A duplicate/retry reuses the canonical source and still
+converges on the approved suggestion. The manual source endpoint
+`POST /api/v1/admin/source-channels` remains an exception path for a known
+canonical identifier: it creates an orphan with all ingestion controls disabled
+and explicitly rejects Reddit/VK or any other non-Telegram platform. The list
+projection remains platform-extensible for future crawlers. Reddit and VK are
+not crawler implementations yet; their suggestions may be rejected but must
+not create dormant source rows.
+
+### Admin media and content workspaces
+
+Admin meme projections include a `primary_file` with a private authenticated
+render URL. `GET /api/v1/media/files/{file_id}/{variant}` grants private-file
+access to a full account with the durable admin flag; unrelated non-admin users
+receive 404 unless the normal public/owner/collection access rule applies. The
+DTO and render URL never disclose an S3 object key. This lets moderation and SEO review safely
+render image, video, or audio previews for hidden media.
+
+Moderation reports are list-first at `/admin/moderation`; blocked pHash patterns
+are isolated at `/admin/moderation/patterns` and keep raw hash tuning/lifecycle
+actions disclosed. SEO review is list-first and paginated through `?page=` in
+25-row pages. Templates are list-first and client-searchable; their create,
+edit, merge, and delete controls are disclosed. Technical diagnostics, policy
+repair, and danger actions remain available but are never the routine default.
 
 ## Content Identity And Deduplication
 
@@ -41,7 +119,12 @@ After the embed stage computes a file embedding, semantic merge may query Qdrant
 
 ### Admin Merge
 
-When admins merge memes manually, all files, sources, collection memberships, pins, and like counts are moved to the primary meme. Qdrant payloads are updated for moved files, deleted memes are removed from Meilisearch, and public popularity is recomputed from the moved source rows and analytics events.
+When admins merge memes manually, the request transaction moves database
+relationships (files, sources, collection memberships, pins, and like counts),
+reselects the primary file, deletes the source meme, and records merge/destructive
+audit rows. It does not synchronously write Qdrant or Meilisearch. The normal
+search-sync/reconciliation path later updates external indexes and derived
+popularity from durable PostgreSQL state.
 
 ## Processing
 
@@ -189,12 +272,18 @@ Async, prioritized by popularity/backlog. Each meme receives: URL slug, page tit
 
 ### Admin Editing
 
-Admins can edit SEO pages through:
+The current browser-admin SEO workspace is a paginated, list-first review queue.
+Each row keeps its editor disclosed until needed and supports two exact actions:
 
-- **Manual edit:** direct field editing in admin UI
-- **AI-assisted edit:** "Edit with AI" — admin selects fields, optionally provides instructions, LLM regenerates selected fields. Admin reviews and confirms before saving.
+- **Manual edit:** save the slug, title, description, alt text, caption, body,
+  and tags for one meme.
+- **Regenerate and overwrite:** an explicit `REGENERATE` confirmation lets the
+  provider replace that row's SEO text/catalog tags, reassign its template, and
+  clear manual edits.
 
-Bulk regeneration of pages is out of scope for the first SEO POC. Individual re-generation is a special case of AI-assisted edit (select all fields, no custom instructions).
+Bulk regeneration and field-selective AI editing are not current browser-admin
+features. Individual regeneration is intentionally destructive enough to remain
+inside the row's danger disclosure.
 
 ### URL Strategy
 

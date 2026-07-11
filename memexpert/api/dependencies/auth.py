@@ -234,9 +234,9 @@ async def get_guest_user(current_user: CurrentUserDep) -> UserRead:
 
 
 async def get_admin_user(current_user: CurrentUserDep) -> UserRead:
-    """Require a durable admin flag on the current cookie-authenticated user."""
+    """Require a durable, full account with the admin flag."""
 
-    if not current_user.is_admin:
+    if current_user.account_type is not AccountType.FULL or not current_user.is_admin:
         raise AuthHTTPError(
             status_code=int(HTTPStatus.FORBIDDEN),
             payload=AuthErrorResponse(

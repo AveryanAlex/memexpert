@@ -320,15 +320,23 @@ class AdminService:
             )
             == "",
         )
+        telegram_account_has_current_flood_wait = and_(
+            TelegramSession.flood_wait_until.is_not(None),
+            TelegramSession.flood_wait_until > now,
+        )
         telegram_account_needing_attention = or_(
             TelegramSession.enabled.is_(False),
             telegram_session_material_is_missing,
             TelegramSession.status != TelegramSessionStatus.ACTIVE,
+            telegram_account_has_current_flood_wait,
+            TelegramSession.quarantined_at.is_not(None),
         )
         ready_telegram_account = and_(
             TelegramSession.enabled.is_(True),
             ~telegram_session_material_is_missing,
             TelegramSession.status == TelegramSessionStatus.ACTIVE,
+            ~telegram_account_has_current_flood_wait,
+            TelegramSession.quarantined_at.is_(None),
         )
 
         def count_rows(model: type[object], *conditions: ColumnElement[bool]):
@@ -708,13 +716,15 @@ class AdminService:
         *,
         admin_user_id: uuid.UUID,
     ) -> AdminSourceChannelRead:
+        if request.platform is not SourcePlatform.TELEGRAM:
+            raise AdminConflictError(
+                "Only Telegram sources can be created through browser admin until crawler support is available.",
+            )
         request, public_username = self._normalize_source_channel_create_request(request)
         telegram_session = await self._resolve_telegram_session_target(
             telegram_session_id=request.telegram_session_id,
             telegram_session_name=request.telegram_session_name,
         )
-        if telegram_session is not None and request.platform is not SourcePlatform.TELEGRAM:
-            raise AdminConflictError("Only Telegram source channels can be assigned to Telegram sessions.")
         if telegram_session is None and not request.orphaned:
             raise AdminConflictError("Source channel creation requires telegram_session_id or orphaned=true.")
         catchup_enabled = request.catchup_enabled

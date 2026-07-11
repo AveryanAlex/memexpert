@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 from uuid import UUID, uuid7
 
+import pytest
 from httpx import ASGITransport, AsyncClient
 from pydantic import SecretStr
 from sqlalchemy import func, select
@@ -45,6 +46,7 @@ from memexpert.models.enums import (
     TelegramSessionStatus,
 )
 from memexpert.models.user import ChannelSuggestion, User
+from memexpert.schemas.admin import AdminSourceChannelCreateRequest
 from memexpert.services import AuthService, UserService
 from memexpert.services.admin_telegram_channel_resolver import (
     AdminTelegramChannelResolverError,
@@ -73,6 +75,24 @@ async def _issue_user_cookie(
         persisted_user.is_admin = is_admin
         await session.commit()
         auth_session = await auth_service.issue_session_for_user(user)
+        return auth_session.access_token
+
+
+async def _issue_guest_admin_cookie(
+    session_factory: async_sessionmaker[AsyncSession],
+    auth_settings_overrides: dict[str, str],
+) -> str:
+    """Issue a token for an intentionally misconfigured guest admin fixture."""
+
+    async with session_factory() as session:
+        user_service = UserService(session)
+        auth_service: AuthService = build_test_auth_service(session, auth_settings_overrides)
+        guest = await user_service.create_guest_user()
+        persisted_guest = await session.get(User, guest.id)
+        assert persisted_guest is not None
+        persisted_guest.is_admin = True
+        await session.commit()
+        auth_session = await auth_service.issue_session_for_user(guest)
         return auth_session.access_token
 
 
@@ -288,6 +308,10 @@ async def test_admin_routes_require_session_cookie_admin_flag_and_ignore_operato
         email="admin-denied@example.com",
         is_admin=False,
     )
+    guest_admin_token = await _issue_guest_admin_cookie(
+        postgres_session_factory,
+        auth_settings_overrides,
+    )
     async with AsyncClient(transport=transport, base_url="https://testserver") as non_admin_client:
         non_admin_client.cookies.set(ACCESS_COOKIE_NAME, non_admin_token)
         forbidden_session_response = await non_admin_client.get("/api/v1/admin/session")
@@ -337,6 +361,11 @@ async def test_admin_routes_require_session_cookie_admin_flag_and_ignore_operato
         forbidden_reports_response = await non_admin_client.get("/api/v1/admin/moderation-reports")
         forbidden_blocked_hashes_response = await non_admin_client.get("/api/v1/admin/blocked-perceptual-hashes")
 
+    async with AsyncClient(transport=transport, base_url="https://testserver") as guest_admin_client:
+        guest_admin_client.cookies.set(ACCESS_COOKIE_NAME, guest_admin_token)
+        guest_admin_session_response = await guest_admin_client.get("/api/v1/admin/session")
+        guest_admin_overview_response = await guest_admin_client.get("/api/v1/admin/overview")
+
     async with AsyncClient(transport=transport, base_url="https://testserver") as operator_header_client:
         operator_session_response = await operator_header_client.get(
             "/api/v1/admin/session",
@@ -384,9 +413,13 @@ async def test_admin_routes_require_session_cookie_admin_flag_and_ignore_operato
     assert forbidden_add_reference_response.status_code == 403
     assert forbidden_reports_response.status_code == 403
     assert forbidden_blocked_hashes_response.status_code == 403
+    assert guest_admin_session_response.status_code == 403
+    assert guest_admin_overview_response.status_code == 403
     assert forbidden_session_response.json()["code"] == "admin_required"
     assert forbidden_reports_response.json()["code"] == "admin_required"
     assert forbidden_blocked_hashes_response.json()["code"] == "admin_required"
+    assert guest_admin_session_response.json()["code"] == "admin_required"
+    assert guest_admin_overview_response.json()["code"] == "admin_required"
     assert operator_session_response.status_code == 401
     assert operator_detail_response.status_code == 401
     assert operator_delete_response.status_code == 401
@@ -451,8 +484,41 @@ async def test_admin_overview_returns_authorized_aggregate_counts_at_source_boun
             status=TelegramSessionStatus.ACTIVE,
             enabled=True,
         )
+        future_flood_wait_account = TelegramSession(
+            name="overview-future-flood-wait",
+            display_name="Overview future flood wait",
+            encrypted_string_session="encrypted-future-flood-wait-session",
+            status=TelegramSessionStatus.ACTIVE,
+            enabled=True,
+            flood_wait_until=now + timedelta(minutes=1),
+        )
+        expired_flood_wait_account = TelegramSession(
+            name="overview-expired-flood-wait",
+            display_name="Overview expired flood wait",
+            encrypted_string_session="encrypted-expired-flood-wait-session",
+            status=TelegramSessionStatus.ACTIVE,
+            enabled=True,
+            flood_wait_until=now - timedelta(microseconds=1),
+        )
+        quarantined_account = TelegramSession(
+            name="overview-quarantined",
+            display_name="Overview quarantined",
+            encrypted_string_session="encrypted-quarantined-session",
+            status=TelegramSessionStatus.ACTIVE,
+            enabled=True,
+            quarantined_at=now - timedelta(minutes=1),
+        )
         session.add_all(
-            [ready_account, missing_session_account, disabled_account, stopped_account, blank_session_account],
+            [
+                ready_account,
+                missing_session_account,
+                disabled_account,
+                stopped_account,
+                blank_session_account,
+                future_flood_wait_account,
+                expired_flood_wait_account,
+                quarantined_account,
+            ],
         )
         await session.flush()
 
@@ -601,8 +667,8 @@ async def test_admin_overview_returns_authorized_aggregate_counts_at_source_boun
         "stale_source_count": 3,
         "waiting_source_count": 2,
         "healthy_source_count": 2,
-        "telegram_account_attention_count": 4,
-        "ready_telegram_account_count": 1,
+        "telegram_account_attention_count": 6,
+        "ready_telegram_account_count": 2,
         "missing_seo_count": 1,
         "uncurated_template_count": 1,
     }
@@ -1481,6 +1547,53 @@ async def test_admin_create_source_channel_uses_telegram_session_id_and_rejects_
         )
         assert persisted is not None
         assert persisted.telegram_session_id == telegram_session_id
+
+
+@pytest.mark.parametrize("platform", [SourcePlatform.REDDIT, SourcePlatform.VK])
+async def test_browser_admin_source_creation_rejects_unsupported_platforms_in_route_and_service(
+    auth_app: FastAPI,
+    auth_settings_overrides: dict[str, str],
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    platform: SourcePlatform,
+) -> None:
+    admin_token = await _issue_user_cookie(
+        postgres_session_factory,
+        auth_settings_overrides,
+        email=f"admin-{platform.value}-source-denied@example.com",
+        is_admin=True,
+    )
+    request = AdminSourceChannelCreateRequest(
+        platform=platform,
+        platform_id=f"{platform.value}-source",
+        title=f"{platform.value.title()} source",
+        orphaned=True,
+    )
+
+    async with postgres_session_factory() as session:
+        service = admin_service_module.AdminService(session)
+        with pytest.raises(admin_service_module.AdminConflictError, match="Only Telegram sources"):
+            await service.add_source_channel(request, admin_user_id=uuid7())
+
+    transport = ASGITransport(app=auth_app)
+    async with AsyncClient(transport=transport, base_url="https://testserver") as admin_client:
+        admin_client.cookies.set(ACCESS_COOKIE_NAME, admin_token)
+        response = await admin_client.post(
+            "/api/v1/admin/source-channels",
+            json={
+                "platform": platform.value,
+                "platform_id": request.platform_id,
+                "title": request.title,
+                "orphaned": True,
+            },
+        )
+
+    assert response.status_code == 409
+    assert "Only Telegram sources" in response.json()["detail"]
+    async with postgres_session_factory() as session:
+        count = await session.scalar(
+            select(func.count()).select_from(SourceChannel).where(SourceChannel.platform == platform),
+        )
+        assert count == 0
 
 
 async def test_admin_manual_source_creation_normalizes_public_references_and_retains_exceptional_ids(

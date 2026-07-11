@@ -133,6 +133,302 @@ const motdAlgorithmVersion = 'motd-smoke-v1';
 const motdScoreComponents = { popularity: 0.42, quality: 0.55 };
 const motdScore = 0.97;
 
+const adminIds = {
+  user: '1cb7b083-dc9f-45a6-9e4c-3dc497651a01',
+  suggester: '1cb7b083-dc9f-45a6-9e4c-3dc497651a02',
+  reporter: '1cb7b083-dc9f-45a6-9e4c-3dc497651a03',
+  meme: '1cb7b083-dc9f-45a6-9e4c-3dc497651a04',
+  mediaFile: '1cb7b083-dc9f-45a6-9e4c-3dc497651a05',
+  readyAccount: '1cb7b083-dc9f-45a6-9e4c-3dc497651a06',
+  floodWaitAccount: '1cb7b083-dc9f-45a6-9e4c-3dc497651a07',
+  healthySource: '1cb7b083-dc9f-45a6-9e4c-3dc497651a08',
+  orphanedSource: '1cb7b083-dc9f-45a6-9e4c-3dc497651a09',
+  staleSource: '1cb7b083-dc9f-45a6-9e4c-3dc497651a10',
+  quickAddedSource: '1cb7b083-dc9f-45a6-9e4c-3dc497651a11',
+  telegramSuggestion: '1cb7b083-dc9f-45a6-9e4c-3dc497651a12',
+  redditSuggestion: '1cb7b083-dc9f-45a6-9e4c-3dc497651a13',
+  vkSuggestion: '1cb7b083-dc9f-45a6-9e4c-3dc497651a14',
+  report: '1cb7b083-dc9f-45a6-9e4c-3dc497651a15',
+  decision: '1cb7b083-dc9f-45a6-9e4c-3dc497651a16',
+  blockedPattern: '1cb7b083-dc9f-45a6-9e4c-3dc497651a17',
+  curatedTemplate: '1cb7b083-dc9f-45a6-9e4c-3dc497651a18',
+  uncuratedTemplate: '1cb7b083-dc9f-45a6-9e4c-3dc497651a19'
+};
+
+const adminMediaPreviewUrl = `/api/v1/media/files/${adminIds.mediaFile}/preview`;
+const adminMediaFile = {
+  ...meme.primary_file,
+  id: adminIds.mediaFile,
+  render: {
+    ...meme.primary_file.render,
+    thumbnail_url: adminMediaPreviewUrl,
+    preview_url: adminMediaPreviewUrl,
+    display_url: adminMediaPreviewUrl,
+    original_url: adminMediaPreviewUrl,
+    download_url: adminMediaPreviewUrl
+  },
+  render_url: adminMediaPreviewUrl,
+  download_url: adminMediaPreviewUrl
+};
+
+const adminOverview = {
+  open_report_count: 1,
+  pending_suggestion_count: 3,
+  source_attention_count: 2,
+  orphaned_source_count: 1,
+  stale_source_count: 2,
+  waiting_source_count: 0,
+  healthy_source_count: 1,
+  telegram_account_attention_count: 1,
+  ready_telegram_account_count: 1,
+  missing_seo_count: 1,
+  uncurated_template_count: 1
+};
+
+const adminMeme = {
+  ...meme,
+  id: adminIds.meme,
+  primary_file: adminMediaFile,
+  is_public: false,
+  template_id: adminIds.curatedTemplate,
+  author_user_id: null
+};
+
+const readyAdminTelegramAccount = {
+  id: adminIds.readyAccount,
+  name: 'crawler-alpha',
+  display_name: 'Meme desk account',
+  owned_channel_count: 2,
+  status: 'active',
+  enabled: true,
+  flood_wait_until: null,
+  live_listener_started_at: '2026-01-01T00:00:00Z',
+  last_heartbeat_at: '2026-01-01T00:04:00Z',
+  last_error_class: null,
+  last_error_text: null,
+  quarantined_at: null,
+  live_enabled: true,
+  catchup_enabled: true,
+  engagement_enabled: true,
+  max_requests_per_second: 1,
+  account_user_id: 4242,
+  account_username: 'meme_ops',
+  account_phone_hint: null,
+  has_string_session: true,
+  created_at: '2025-12-01T00:00:00Z',
+  updated_at: '2026-01-01T00:04:00Z'
+};
+
+const floodWaitAdminTelegramAccount = {
+  ...readyAdminTelegramAccount,
+  id: adminIds.floodWaitAccount,
+  name: 'crawler-rate-limited',
+  display_name: 'Rate-limited account',
+  owned_channel_count: 0,
+  account_username: 'meme_backup',
+  flood_wait_until: '2099-01-01T00:00:00Z'
+};
+
+const adminTelegramAccounts = [readyAdminTelegramAccount, floodWaitAdminTelegramAccount];
+const adminSources = [
+  {
+    id: adminIds.healthySource,
+    platform: 'telegram',
+    platform_id: 'daily_cats',
+    username: 'daily_cats',
+    title: 'Daily cats',
+    subscriber_count: 1200,
+    is_active: true,
+    is_paused: false,
+    catchup_enabled: true,
+    live_enabled: true,
+    engagement_enabled: true,
+    catchup_message_limit: 500,
+    telegram_session_id: readyAdminTelegramAccount.id,
+    telegram_session_name: readyAdminTelegramAccount.name,
+    is_orphaned: false,
+    is_indexable: true,
+    last_read_post_id: '184',
+    last_fetched_at: '2026-01-01T00:00:00Z',
+    operational_status: 'active',
+    freshness_status: 'fresh',
+    seconds_since_last_fetch: 240,
+    created_at: '2025-12-20T00:00:00Z',
+    updated_at: '2026-01-01T00:00:00Z'
+  },
+  {
+    id: adminIds.orphanedSource,
+    platform: 'telegram',
+    platform_id: 'small_memes',
+    username: 'small_memes',
+    title: 'Small memes',
+    subscriber_count: null,
+    is_active: true,
+    is_paused: false,
+    catchup_enabled: false,
+    live_enabled: false,
+    engagement_enabled: false,
+    catchup_message_limit: 500,
+    telegram_session_id: null,
+    telegram_session_name: null,
+    is_orphaned: true,
+    is_indexable: false,
+    last_read_post_id: null,
+    last_fetched_at: null,
+    operational_status: 'active',
+    freshness_status: 'never_fetched',
+    seconds_since_last_fetch: null,
+    created_at: '2025-12-20T00:00:00Z',
+    updated_at: '2026-01-01T00:00:00Z'
+  },
+  {
+    id: adminIds.staleSource,
+    platform: 'telegram',
+    platform_id: 'retro_memes',
+    username: 'retro_memes',
+    title: 'Retro memes',
+    subscriber_count: 410,
+    is_active: true,
+    is_paused: false,
+    catchup_enabled: true,
+    live_enabled: true,
+    engagement_enabled: true,
+    catchup_message_limit: 500,
+    telegram_session_id: readyAdminTelegramAccount.id,
+    telegram_session_name: readyAdminTelegramAccount.name,
+    is_orphaned: false,
+    is_indexable: true,
+    last_read_post_id: '18',
+    last_fetched_at: '2025-12-25T00:00:00Z',
+    operational_status: 'active',
+    freshness_status: 'stale',
+    seconds_since_last_fetch: 604800,
+    created_at: '2025-12-10T00:00:00Z',
+    updated_at: '2026-01-01T00:00:00Z'
+  }
+];
+
+const adminSuggestions = [
+  {
+    id: adminIds.telegramSuggestion,
+    user_id: adminIds.suggester,
+    platform: 'telegram',
+    channel_url: 'https://t.me/pizza_memes',
+    status: 'pending',
+    admin_note: 'Popular local suggestion.',
+    reviewed_at: null,
+    created_at: '2026-01-01T00:00:00Z',
+    updated_at: '2026-01-01T00:00:00Z'
+  },
+  {
+    id: adminIds.redditSuggestion,
+    user_id: adminIds.suggester,
+    platform: 'reddit',
+    channel_url: 'https://reddit.com/r/memes',
+    status: 'pending',
+    admin_note: null,
+    reviewed_at: null,
+    created_at: '2025-12-31T00:00:00Z',
+    updated_at: '2025-12-31T00:00:00Z'
+  },
+  {
+    id: adminIds.vkSuggestion,
+    user_id: adminIds.suggester,
+    platform: 'vk',
+    channel_url: 'https://vk.com/memes',
+    status: 'pending',
+    admin_note: null,
+    reviewed_at: null,
+    created_at: '2025-12-30T00:00:00Z',
+    updated_at: '2025-12-30T00:00:00Z'
+  }
+];
+
+const adminReport = {
+  id: adminIds.report,
+  meme_id: adminMeme.id,
+  reporter_user_id: adminIds.reporter,
+  status: 'pending',
+  reason: 'spam',
+  note: 'This looks unrelated to the source channel.',
+  resolved_by_admin_user_id: null,
+  resolved_at: null,
+  created_at: '2026-01-01T00:00:00Z',
+  updated_at: '2026-01-01T00:00:00Z',
+  meme: adminMeme
+};
+
+const adminDecision = {
+  id: adminIds.decision,
+  meme_id: adminMeme.id,
+  report_id: null,
+  admin_user_id: adminIds.user,
+  action: 'mark_sfw',
+  reason: 'other',
+  note: 'Previous review kept this visible.',
+  previous_is_public: true,
+  previous_is_nsfw: true,
+  new_is_public: true,
+  new_is_nsfw: false,
+  previous_template_id: null,
+  new_template_id: adminIds.curatedTemplate,
+  created_at: '2025-12-31T00:00:00Z'
+};
+
+const adminBlockedPattern = {
+  id: adminIds.blockedPattern,
+  perceptual_hash: 'f0e1d2c3b4a59687',
+  hash_algorithm: 'phash',
+  hash_size: 64,
+  max_hamming_distance: 4,
+  reason: 'spam',
+  note: 'Known reposted artwork.',
+  is_active: true,
+  created_by_admin_user_id: adminIds.user,
+  created_at: '2025-12-20T00:00:00Z',
+  updated_at: '2026-01-01T00:00:00Z'
+};
+
+const adminSeoPage = {
+  meme_id: adminMeme.id,
+  slug: 'smoke-admin-meme',
+  page_title: 'Smoke admin meme',
+  meta_description: 'A representative SEO review row for deterministic browser coverage.',
+  alt_text: 'A smoke-test meme graphic.',
+  caption: 'Check the queue item before publishing.',
+  body_text: 'This row is served by the local smoke API.',
+  tags: ['smoke', 'review'],
+  model_id: 'smoke-provider',
+  prompt_version: 'smoke-v1',
+  generated_at: '2026-01-01T00:00:00Z',
+  edited_at: null
+};
+
+const adminTemplates = [
+  {
+    id: adminIds.curatedTemplate,
+    slug: 'ship-it-cat',
+    name: 'Ship it cat',
+    description: 'A cat reaction for a successful launch.',
+    is_curated: true,
+    base_image_url: null,
+    text_regions: [],
+    created_at: '2025-12-20T00:00:00Z',
+    updated_at: '2026-01-01T00:00:00Z'
+  },
+  {
+    id: adminIds.uncuratedTemplate,
+    slug: 'launch-panic',
+    name: 'Launch panic',
+    description: null,
+    is_curated: false,
+    base_image_url: null,
+    text_regions: null,
+    created_at: '2025-12-31T00:00:00Z',
+    updated_at: '2026-01-01T00:00:00Z'
+  }
+];
+
 const server = createServer((request, response) => {
   const url = new URL(request.url ?? '/', `http://${request.headers.host ?? `127.0.0.1:${port}`}`);
 
@@ -150,7 +446,24 @@ const server = createServer((request, response) => {
     return;
   }
 
+  if (url.pathname === adminMediaPreviewUrl) {
+    if (!hasAdminAccess(request)) {
+      sendJson(response, 404, { detail: 'Media file was not found.' });
+      return;
+    }
+    response.writeHead(307, {
+      location: `http://127.0.0.1:${port}/media/smoke-cat.svg`,
+      'cache-control': 'no-store'
+    });
+    response.end();
+    return;
+  }
+
   if (url.pathname === '/api/v1/auth/session') {
+    if (hasAdminAccess(request)) {
+      sendJson(response, 200, sessionPayload('admin'));
+      return;
+    }
     if (hasFullAccess(request)) {
       sendJson(response, 200, sessionPayload('full'));
       return;
@@ -172,6 +485,19 @@ const server = createServer((request, response) => {
       });
     }).catch(() => {
       sendJson(response, 400, { detail: 'Invalid JSON body.' });
+    });
+    return;
+  }
+
+  if (url.pathname.startsWith('/api/v1/admin/')) {
+    if (!hasAdminAccess(request)) {
+      sendJson(response, 403, { detail: 'Admin access is required for smoke admin routes.' });
+      return;
+    }
+    void handleAdminApi(request, response, url).then((handled) => {
+      if (!handled) sendJson(response, 404, { detail: `Unhandled smoke API route: ${url.pathname}` });
+    }).catch(() => {
+      sendJson(response, 500, { detail: 'Smoke admin API could not process the request.' });
     });
     return;
   }
@@ -266,6 +592,191 @@ server.listen(port, '127.0.0.1', () => {
   process.stdout.write(`Smoke API listening on http://127.0.0.1:${port}\n`);
 });
 
+async function handleAdminApi(request, response, url) {
+  const { method } = request;
+  const { pathname } = url;
+
+  if (method === 'GET' && pathname === '/api/v1/admin/session') {
+    sendJson(response, 200, { user: sessionPayload('admin').user });
+    return true;
+  }
+  if (method === 'GET' && pathname === '/api/v1/admin/overview') {
+    sendJson(response, 200, adminOverview);
+    return true;
+  }
+  if (method === 'GET' && pathname === '/api/v1/admin/channel-suggestions') {
+    sendJson(response, 200, adminSuggestions);
+    return true;
+  }
+  if (method === 'GET' && pathname === '/api/v1/admin/source-channels') {
+    sendJson(response, 200, adminSources);
+    return true;
+  }
+  if (method === 'GET' && pathname === '/api/v1/admin/telegram/sessions') {
+    sendJson(response, 200, adminTelegramAccounts);
+    return true;
+  }
+  if (method === 'GET' && pathname === '/api/v1/admin/telegram/channels') {
+    sendJson(response, 200, adminSources);
+    return true;
+  }
+  if (method === 'GET' && pathname === '/api/v1/admin/telegram/channels/grouped') {
+    sendJson(response, 200, [
+      {
+        telegram_session: readyAdminTelegramAccount,
+        is_orphaned: false,
+        channels: adminSources.filter((source) => source.telegram_session_id === readyAdminTelegramAccount.id)
+      },
+      { telegram_session: floodWaitAdminTelegramAccount, is_orphaned: false, channels: [] },
+      {
+        telegram_session: null,
+        is_orphaned: true,
+        channels: adminSources.filter((source) => source.telegram_session_id === null)
+      }
+    ]);
+    return true;
+  }
+  if (method === 'GET' && pathname === '/api/v1/admin/moderation-reports') {
+    sendJson(response, 200, [adminReport]);
+    return true;
+  }
+  if (method === 'GET' && pathname === '/api/v1/admin/moderation-decisions') {
+    sendJson(response, 200, [adminDecision]);
+    return true;
+  }
+  if (method === 'GET' && pathname === '/api/v1/admin/memes') {
+    sendJson(response, 200, [adminMeme]);
+    return true;
+  }
+  if (method === 'GET' && pathname === `/api/v1/admin/memes/${adminMeme.id}`) {
+    sendJson(response, 200, { meme: adminMeme, reports: [adminReport], decisions: [adminDecision] });
+    return true;
+  }
+  if (method === 'GET' && pathname === '/api/v1/admin/blocked-perceptual-hashes') {
+    sendJson(response, 200, [adminBlockedPattern]);
+    return true;
+  }
+  if (method === 'GET' && pathname === '/api/v1/admin/seo-pages') {
+    sendJson(response, 200, [{ meme: adminMeme, seo_page: adminSeoPage, status: 'generated' }]);
+    return true;
+  }
+  if (method === 'GET' && pathname === '/api/v1/admin/meme-templates') {
+    sendJson(response, 200, adminTemplates);
+    return true;
+  }
+
+  if (method === 'POST' && pathname === '/api/v1/admin/telegram/channels/from-reference') {
+    const quickAdd = validateQuickAddRequest(await readRequestJson(request));
+    if ('error' in quickAdd) {
+      sendJson(response, 422, { detail: quickAdd.error });
+      return true;
+    }
+    const source = upsertQuickAddedSource(quickAdd.username);
+    sendJson(response, 201, source);
+    return true;
+  }
+
+  const pauseMatch = method === 'POST'
+    ? pathname.match(/^\/api\/v1\/admin\/source-channels\/([^/]+)\/pause$/)
+    : null;
+  if (pauseMatch) {
+    const source = adminSources.find((candidate) => candidate.id === pauseMatch[1]);
+    if (!source) {
+      sendJson(response, 404, { detail: 'Smoke source was not found.' });
+      return true;
+    }
+    source.is_paused = true;
+    source.is_indexable = false;
+    source.operational_status = 'paused';
+    source.updated_at = new Date().toISOString();
+    sendJson(response, 200, source);
+    return true;
+  }
+
+  return false;
+}
+
+function validateQuickAddRequest(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return { error: 'Quick add requires a JSON object.' };
+  }
+  if (body.telegram_session_id !== readyAdminTelegramAccount.id) {
+    return { error: 'Quick add must select the ready Telegram account.' };
+  }
+  if (body.catchup_message_limit !== 500) {
+    return { error: 'Quick add must use the default catch-up limit.' };
+  }
+  if (body.suggestion_id !== null && body.suggestion_id !== undefined && body.suggestion_id !== adminIds.telegramSuggestion) {
+    return { error: 'Quick add received an unknown source suggestion.' };
+  }
+  const username = canonicalPublicTelegramUsername(body.reference);
+  return username ? { username } : { error: 'Quick add requires one valid public Telegram reference.' };
+}
+
+function canonicalPublicTelegramUsername(reference) {
+  if (typeof reference !== 'string') return null;
+  const value = reference.trim();
+  const handle = value.startsWith('@') ? value.slice(1) : value;
+  if (/^[A-Za-z0-9_]{5,32}$/.test(handle)) return handle.toLowerCase();
+  try {
+    const url = new URL(value.startsWith('http') ? value : `https://${value}`);
+    if (!['t.me', 'telegram.me'].includes(url.hostname.toLowerCase()) || url.search || url.hash) return null;
+    const parts = url.pathname.split('/').filter(Boolean);
+    return parts.length === 1 && /^[A-Za-z0-9_]{5,32}$/.test(parts[0]) ? parts[0].toLowerCase() : null;
+  } catch {
+    return null;
+  }
+}
+
+function upsertQuickAddedSource(username) {
+  const now = new Date().toISOString();
+  const existing = adminSources.find((source) => source.platform === 'telegram' && source.platform_id === username);
+  const source = existing ?? {
+    id: adminIds.quickAddedSource,
+    platform: 'telegram',
+    platform_id: username,
+    username,
+    title: username.split('_').map((part) => `${part[0].toUpperCase()}${part.slice(1)}`).join(' '),
+    subscriber_count: null,
+    is_active: true,
+    is_paused: false,
+    catchup_enabled: true,
+    live_enabled: true,
+    engagement_enabled: true,
+    catchup_message_limit: 500,
+    telegram_session_id: readyAdminTelegramAccount.id,
+    telegram_session_name: readyAdminTelegramAccount.name,
+    is_orphaned: false,
+    is_indexable: true,
+    last_read_post_id: null,
+    last_fetched_at: null,
+    operational_status: 'active',
+    freshness_status: 'never_fetched',
+    seconds_since_last_fetch: null,
+    created_at: now,
+    updated_at: now
+  };
+  if (!existing) adminSources.push(source);
+
+  Object.assign(source, {
+    platform_id: username,
+    username,
+    is_active: true,
+    is_paused: false,
+    catchup_enabled: true,
+    live_enabled: true,
+    engagement_enabled: true,
+    catchup_message_limit: 500,
+    telegram_session_id: readyAdminTelegramAccount.id,
+    telegram_session_name: readyAdminTelegramAccount.name,
+    is_orphaned: false,
+    is_indexable: true,
+    operational_status: 'active',
+    updated_at: now
+  });
+  return source;
+}
+
 function sendJson(response, status, payload, headers = {}) {
   response.writeHead(status, {
     'content-type': 'application/json',
@@ -294,7 +805,12 @@ function readRequestJson(request) {
 }
 
 function hasFullAccess(request) {
-  return (request.headers.cookie ?? '').includes('memexpert_access_token=miniapp-full');
+  const cookie = request.headers.cookie ?? '';
+  return cookie.includes('memexpert_access_token=miniapp-full') || hasAdminAccess(request);
+}
+
+function hasAdminAccess(request) {
+  return (request.headers.cookie ?? '').includes('memexpert_access_token=smoke-admin');
 }
 
 function isSeededCollectionSearch(url) {
@@ -365,21 +881,23 @@ function motdAttribution() {
 }
 
 function sessionPayload(accountType) {
+  const isAdmin = accountType === 'admin';
+  const isFull = accountType === 'full' || isAdmin;
   return {
     user: {
-      id: accountType === 'full' ? 'smoke-full-user' : 'smoke-guest-user',
-      account_type: accountType,
-      telegram_id: accountType === 'full' ? 303030303 : null,
+      id: isAdmin ? adminIds.user : isFull ? 'smoke-full-user' : 'smoke-guest-user',
+      account_type: isFull ? 'full' : 'guest',
+      telegram_id: isFull ? 303030303 : null,
       google_id: null,
-      email: null,
+      email: isAdmin ? 'admin@smoke.test' : null,
       email_verified_at: null,
       language: 'any',
       nsfw_enabled: false,
       token_nonce: 0,
       status: 'active',
-      guest_expires_at: accountType === 'guest' ? '2026-07-12T00:00:00Z' : null,
+      guest_expires_at: isFull ? null : '2026-07-12T00:00:00Z',
       active_save_collection_id: null,
-      is_admin: false,
+      is_admin: isAdmin,
       created_at: '2026-01-01T00:00:00Z',
       updated_at: '2026-01-01T00:00:00Z'
     },
@@ -388,7 +906,7 @@ function sessionPayload(accountType) {
       email_verified_at: null,
       has_password: false,
       google_linked: false,
-      telegram_linked: accountType === 'full'
+      telegram_linked: isFull
     }
   };
 }
