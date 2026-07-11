@@ -2,20 +2,15 @@ import { env } from '$env/dynamic/private';
 import type { Actions, PageServerLoad } from './$types';
 import {
   ApiError,
-  createBlockedPerceptualHash,
   createMemeTemplate,
-  deactivateBlockedPerceptualHash,
-  deleteBlockedPerceptualHash,
   deleteMemeTemplate,
   fetchAdminOverview,
   mergeMemeTemplate,
   regenerateMemeSeoPage,
-  updateBlockedPerceptualHash,
   updateMemeSeoPage,
   updateMemeTemplate
 } from '$lib/api/client';
-import { buildBlockedPhashPayload } from '$lib/admin/blockedPhash';
-import { readInt, readOptional, readRequired, runAction } from '$lib/server/admin/actionUtils';
+import { readOptional, readRequired, runAction } from '$lib/server/admin/actionUtils';
 
 export const load: PageServerLoad = async ({ fetch, request }) => {
   const cookieHeader = request.headers.get('cookie') ?? undefined;
@@ -123,58 +118,6 @@ export const actions: Actions = {
       return { message: 'Unreferenced template deleted.' };
     });
   },
-  createBlockedPerceptualHash: async ({ fetch, request }) => {
-    const data = await request.formData();
-    return runAction(async () => {
-      await createBlockedPerceptualHash({
-        fetch,
-        baseUrl: apiBaseUrl(),
-        cookieHeader: request.headers.get('cookie') ?? undefined,
-        body: blockedPhashPayloadFromForm(data)
-      });
-      return { message: 'Blocked perceptual hash created.' };
-    });
-  },
-  updateBlockedPerceptualHash: async ({ fetch, request }) => {
-    const data = await request.formData();
-    return runAction(async () => {
-      await updateBlockedPerceptualHash(
-        {
-          fetch,
-          baseUrl: apiBaseUrl(),
-          cookieHeader: request.headers.get('cookie') ?? undefined,
-          body: blockedPhashPayloadFromForm(data)
-        },
-        readRequired(data, 'blocked_hash_id')
-      );
-      return { message: 'Blocked perceptual hash updated.' };
-    });
-  },
-  deactivateBlockedPerceptualHash: async ({ fetch, request }) => {
-    const data = await request.formData();
-    return runAction(async () => {
-      await deactivateBlockedPerceptualHash(
-        {
-          fetch,
-          baseUrl: apiBaseUrl(),
-          cookieHeader: request.headers.get('cookie') ?? undefined,
-          body: { note: readOptional(data, 'note') }
-        },
-        readRequired(data, 'blocked_hash_id')
-      );
-      return { message: 'Blocked perceptual hash deactivated.' };
-    });
-  },
-  deleteBlockedPerceptualHash: async ({ fetch, request }) => {
-    const data = await request.formData();
-    return runAction(async () => {
-      const result = await deleteBlockedPerceptualHash(
-        { fetch, baseUrl: apiBaseUrl(), cookieHeader: request.headers.get('cookie') ?? undefined },
-        readRequired(data, 'blocked_hash_id')
-      );
-      return { message: result.message };
-    });
-  },
   updateSeoPage: async ({ fetch, request }) => {
     const data = await request.formData();
     return runAction(async () => {
@@ -207,17 +150,6 @@ export const actions: Actions = {
     });
   }
 };
-
-function blockedPhashPayloadFromForm(data: FormData) {
-  return buildBlockedPhashPayload({
-    perceptualHash: readRequired(data, 'perceptual_hash'),
-    hashAlgorithm: readOptional(data, 'hash_algorithm'),
-    maxHammingDistance: readInt(data, 'max_hamming_distance', 0),
-    reason: readRequired(data, 'reason'),
-    note: readOptional(data, 'note'),
-    isActive: data.get('is_active') === 'on'
-  });
-}
 
 function seoPagePayloadFromForm(data: FormData) {
   return {

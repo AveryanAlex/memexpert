@@ -531,6 +531,12 @@ export async function fetchAdminSourceChannels(request: CatalogRequest): Promise
   return apiGet<AdminSourceChannelRead[]>('/api/v1/admin/source-channels', new URLSearchParams(), request);
 }
 
+export async function fetchAdminBlockedPerceptualHashes(
+  request: CatalogRequest
+): Promise<AdminBlockedPerceptualHashRead[]> {
+  return apiGet<AdminBlockedPerceptualHashRead[]>('/api/v1/admin/blocked-perceptual-hashes', new URLSearchParams(), request);
+}
+
 export async function fetchAdminDashboard(request: CatalogRequest): Promise<{
   suggestions: ChannelSuggestionRead[];
   sourceChannels: AdminSourceChannelRead[];
@@ -545,7 +551,7 @@ export async function fetchAdminDashboard(request: CatalogRequest): Promise<{
     fetchAdminChannelSuggestions(request),
     fetchAdminSourceChannels(request),
     apiGet<AdminMemeTemplateRead[]>('/api/v1/admin/meme-templates', new URLSearchParams(), request),
-    apiGet<AdminBlockedPerceptualHashRead[]>('/api/v1/admin/blocked-perceptual-hashes', new URLSearchParams(), request),
+    fetchAdminBlockedPerceptualHashes(request),
     fetchAdminModerationMemes(request, 20),
     apiGet<AdminMemeSeoReviewRowRead[]>('/api/v1/admin/seo-pages', new URLSearchParams({ limit: '20' }), request),
     fetchAdminModerationReports(request, 20),
