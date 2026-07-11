@@ -537,30 +537,6 @@ export async function fetchAdminBlockedPerceptualHashes(
   return apiGet<AdminBlockedPerceptualHashRead[]>('/api/v1/admin/blocked-perceptual-hashes', new URLSearchParams(), request);
 }
 
-export async function fetchAdminDashboard(request: CatalogRequest): Promise<{
-  suggestions: ChannelSuggestionRead[];
-  sourceChannels: AdminSourceChannelRead[];
-  templates: AdminMemeTemplateRead[];
-  blockedPerceptualHashes: AdminBlockedPerceptualHashRead[];
-  memes: AdminMemeRead[];
-  seoReviews: AdminMemeSeoReviewRowRead[];
-  reports: AdminModerationReportRead[];
-  decisions: AdminModerationDecisionRead[];
-}> {
-  const [suggestions, sourceChannels, templates, blockedPerceptualHashes, memes, seoReviews, reports, decisions] = await Promise.all([
-    fetchAdminChannelSuggestions(request),
-    fetchAdminSourceChannels(request),
-    apiGet<AdminMemeTemplateRead[]>('/api/v1/admin/meme-templates', new URLSearchParams(), request),
-    fetchAdminBlockedPerceptualHashes(request),
-    fetchAdminModerationMemes(request, 20),
-    apiGet<AdminMemeSeoReviewRowRead[]>('/api/v1/admin/seo-pages', new URLSearchParams({ limit: '20' }), request),
-    fetchAdminModerationReports(request, 20),
-    fetchAdminModerationDecisions(request, 20)
-  ]);
-
-  return { suggestions, sourceChannels, templates, blockedPerceptualHashes, memes, seoReviews, reports, decisions };
-}
-
 export async function fetchAdminModerationMemes(request: CatalogRequest, limit = 50): Promise<AdminMemeRead[]> {
   return apiGet<AdminMemeRead[]>('/api/v1/admin/memes', new URLSearchParams({ limit: String(limit) }), request);
 }
@@ -579,6 +555,17 @@ export async function fetchAdminMemeDetail(request: CatalogRequest, memeId: stri
 
 export async function fetchAdminMemeTemplates(request: CatalogRequest): Promise<AdminMemeTemplateRead[]> {
   return apiGet<AdminMemeTemplateRead[]>('/api/v1/admin/meme-templates', new URLSearchParams(), request);
+}
+
+export async function fetchAdminSeoReviewRows(
+  request: CatalogRequest,
+  pagination: { limit: number; offset: number }
+): Promise<AdminMemeSeoReviewRowRead[]> {
+  return apiGet<AdminMemeSeoReviewRowRead[]>(
+    '/api/v1/admin/seo-pages',
+    new URLSearchParams({ limit: String(pagination.limit), offset: String(pagination.offset) }),
+    request
+  );
 }
 
 export async function fetchAdminTelegramSessions(request: CatalogRequest): Promise<AdminTelegramSessionRead[]> {
@@ -1123,12 +1110,50 @@ async function readJson(response: Response): Promise<unknown> {
 }
 
 function readErrorDetail(payload: unknown): string | null {
-  if (payload && typeof payload === 'object' && 'detail' in payload) {
-    const detail = payload.detail;
-    return typeof detail === 'string' ? detail : null;
-  }
+  if (!isRecord(payload)) return null;
+
+  const detail = payload.detail;
+  if (typeof detail === 'string') return detail;
+  if (Array.isArray(detail)) return formatValidationDetails(detail);
 
   return null;
+}
+
+const MAX_VALIDATION_ERRORS = 3;
+const MAX_VALIDATION_FIELD_MESSAGE_LENGTH = 120;
+const MAX_VALIDATION_DETAIL_LENGTH = 360;
+
+function formatValidationDetails(details: unknown[]): string | null {
+  const messages = details
+    .slice(0, MAX_VALIDATION_ERRORS)
+    .map(formatValidationDetail)
+    .filter((message): message is string => message !== null);
+  if (!messages.length) return null;
+
+  const remaining = details.length - MAX_VALIDATION_ERRORS;
+  const suffix = remaining > 0 ? `; +${remaining} more` : '';
+  return truncateValidationMessage(`${messages.join('; ')}${suffix}`, MAX_VALIDATION_DETAIL_LENGTH);
+}
+
+function formatValidationDetail(detail: unknown): string | null {
+  if (!isRecord(detail) || typeof detail.msg !== 'string') return null;
+
+  const location = Array.isArray(detail.loc)
+    ? detail.loc
+        .filter((part): part is string | number => typeof part === 'string' || typeof part === 'number')
+        .filter((part) => part !== 'body' && part !== 'query')
+        .join('.')
+    : '';
+  const message = truncateValidationMessage(detail.msg, MAX_VALIDATION_FIELD_MESSAGE_LENGTH);
+  return location ? `${location}: ${message}` : message;
+}
+
+function truncateValidationMessage(value: string, maxLength: number): string {
+  return value.length > maxLength ? `${value.slice(0, Math.max(0, maxLength - 1))}…` : value;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 export function emptyMemePage(limit: number, offset: number): PublicMemeSearchPageRead {

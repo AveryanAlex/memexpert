@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { ApiFetch } from '$lib/api/client';
-import { actions as rootAdminActions } from '../../../routes/admin/+page.server';
+import * as rootAdminPageServer from '../../../routes/admin/+page.server';
 import { blockedPatternActions } from './blockedPatternActions';
 
 describe('blocked-pattern admin actions', () => {
@@ -12,11 +12,7 @@ describe('blocked-pattern admin actions', () => {
       'reactivateBlockedPerceptualHash',
       'deleteBlockedPerceptualHash'
     ]);
-    expect(rootAdminActions).not.toHaveProperty('createBlockedPerceptualHash');
-    expect(rootAdminActions).not.toHaveProperty('updateBlockedPerceptualHash');
-    expect(rootAdminActions).not.toHaveProperty('deactivateBlockedPerceptualHash');
-    expect(rootAdminActions).not.toHaveProperty('reactivateBlockedPerceptualHash');
-    expect(rootAdminActions).not.toHaveProperty('deleteBlockedPerceptualHash');
+    expect(rootAdminPageServer).not.toHaveProperty('actions');
   });
 
   it('preserves exact create, update, lifecycle, and delete endpoint payloads', async () => {

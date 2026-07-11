@@ -18,8 +18,9 @@ import {
   deleteBlockedPerceptualHash,
   deleteCollection,
   favoriteMeme,
-  fetchAdminDashboard,
+  fetchAdminMemeTemplates,
   fetchAdminOverview,
+  fetchAdminSeoReviewRows,
   fetchAdminSession,
   fetchAdminTelegramChannelGroups,
   fetchAdminTelegramChannels,
@@ -1133,36 +1134,27 @@ describe('admin API client', () => {
     expect(calls[16].body).toEqual({ note: 'orphan' });
   });
 
-  it('loads moderation reports, SEO reviews, and decision history with the admin dashboard', async () => {
+  it('loads focused SEO review and template lists without the legacy dashboard fetch', async () => {
     const calls: string[] = [];
     const mockFetch = vi.fn(async (input: RequestInfo | URL) => {
       const url = new URL(String(input));
       calls.push(`${url.pathname}?${url.searchParams.toString()}`);
 
       if (url.pathname === '/api/v1/admin/seo-pages') {
-        expect(url.searchParams.get('limit')).toBe('20');
+        expect(url.searchParams.get('limit')).toBe('35');
         return jsonResponse([seoReviewPayload()]);
-      }
-      if (url.pathname === '/api/v1/admin/moderation-reports') {
-        expect(url.searchParams.get('limit')).toBe('20');
-        return jsonResponse([moderationReportPayload()]);
-      }
-      if (url.pathname === '/api/v1/admin/moderation-decisions') {
-        expect(url.searchParams.get('limit')).toBe('20');
-        return jsonResponse([moderationDecisionPayload()]);
       }
       return jsonResponse([]);
     }) satisfies ApiFetch;
 
-    const dashboard = await fetchAdminDashboard({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test' });
+    const [reviews, templates] = await Promise.all([
+      fetchAdminSeoReviewRows({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test' }, { limit: 35, offset: 70 }),
+      fetchAdminMemeTemplates({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test' })
+    ]);
 
-    expect(dashboard.seoReviews).toHaveLength(1);
-    expect(dashboard.reports).toHaveLength(1);
-    expect(dashboard.decisions).toHaveLength(1);
-    expect(calls).toContain('/api/v1/admin/blocked-perceptual-hashes?');
-    expect(calls).toContain('/api/v1/admin/seo-pages?limit=20');
-    expect(calls).toContain('/api/v1/admin/moderation-reports?limit=20');
-    expect(calls).toContain('/api/v1/admin/moderation-decisions?limit=20');
+    expect(reviews).toHaveLength(1);
+    expect(templates).toEqual([]);
+    expect(calls).toEqual(['/api/v1/admin/seo-pages?limit=35&offset=70', '/api/v1/admin/meme-templates?']);
   });
 
   it('loads the bounded admin overview from its single endpoint', async () => {
@@ -1249,6 +1241,40 @@ describe('admin API client', () => {
         body: { confirmation: memeId }
       }
     ]);
+  });
+
+  it('turns FastAPI validation details into concise field messages while preserving string details', async () => {
+    const memeId = '77777777-7777-4777-8777-777777777777';
+    const responses = [
+      jsonResponse(
+        {
+          detail: [
+            { loc: ['body', 'slug'], msg: 'Field required' },
+            { loc: ['query', 'limit'], msg: 'Input should be less than or equal to 100' },
+            { loc: ['body', 'meta_description'], msg: 'String should have at least 1 character' },
+            { loc: ['body', 'alt_text'], msg: 'String should have at least 1 character' }
+          ]
+        },
+        422
+      ),
+      jsonResponse({ detail: 'SEO page slug already exists.' }, 409)
+    ];
+    const fetch = vi.fn(async () => responses.shift() ?? jsonResponse({})) satisfies ApiFetch;
+    const request = {
+      fetch,
+      baseUrl: 'https://api.memexpert.test',
+      body: { slug: 'launch-reaction', page_title: 'Launch reaction', meta_description: 'Description', alt_text: 'Alt text' }
+    };
+
+    await expect(updateMemeSeoPage(request, memeId)).rejects.toMatchObject({
+      status: 422,
+      message:
+        'slug: Field required; limit: Input should be less than or equal to 100; meta_description: String should have at least 1 character; +1 more'
+    });
+    await expect(updateMemeSeoPage(request, memeId)).rejects.toMatchObject({
+      status: 409,
+      message: 'SEO page slug already exists.'
+    });
   });
 
   it('manages blocked perceptual hashes through admin endpoints', async () => {

@@ -25,6 +25,7 @@ describe('/admin overview page', () => {
     expect(body).not.toContain('action="?/createTemplate"');
     expect(body).not.toContain('Channel Suggestions');
     expect(body).not.toContain('Moderation Pattern Controls');
+    expect(body).not.toContain('<form');
   });
 
   it('renders overview load failures as an alert', () => {
