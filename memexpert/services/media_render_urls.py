@@ -92,6 +92,10 @@ class MediaRenderUrlService:
             render.display_url = render.preview_url
             render.original_url = self._private_file_url(file.id, variant="original")
             render.download_url = self._private_file_url(file.id, variant="download")
+        else:
+            render.original_url = self._private_file_url(file.id, variant="original")
+            if not file.s3_web_video_key:
+                render.download_url = self._private_file_url(file.id, variant="download")
 
         if file.s3_web_video_key:
             render.web_video_url = self._private_file_url(file.id, variant="web-video.mp4")

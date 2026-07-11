@@ -1560,6 +1560,7 @@ function adminMemePayload() {
     popularity_score: 1,
     like_count: 0,
     tags: [],
+    primary_file: null,
     template_id: null,
     author_user_id: null,
     created_at: '2026-01-01T00:00:00Z',

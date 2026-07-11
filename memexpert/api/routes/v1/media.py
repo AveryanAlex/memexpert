@@ -19,6 +19,7 @@ from memexpert.core.config import get_settings
 from memexpert.core.storage import get_pipeline_storage_settings, get_s3_client
 from memexpert.models.collection import Collection, CollectionMember, CollectionMeme
 from memexpert.models.content import Meme, MemeFile
+from memexpert.models.enums import AccountType
 
 router = APIRouter(prefix="/media", tags=["media"])
 
@@ -44,7 +45,12 @@ async def render_media_file(
 ) -> RedirectResponse:
     """Redirect authenticated callers to a short-lived object URL for an authorized file variant."""
 
-    file = await _load_authorized_file(session, file_id=file_id, user_id=current_user.id)
+    file = await _load_authorized_file(
+        session,
+        file_id=file_id,
+        user_id=current_user.id,
+        allow_admin_access=current_user.is_admin and current_user.account_type is AccountType.FULL,
+    )
     if file is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Media file was not found.")
 
@@ -69,7 +75,13 @@ async def render_media_file(
     return RedirectResponse(url=url, status_code=status.HTTP_307_TEMPORARY_REDIRECT)
 
 
-async def _load_authorized_file(session: AsyncSession, *, file_id: uuid.UUID, user_id: uuid.UUID) -> MemeFile | None:
+async def _load_authorized_file(
+    session: AsyncSession,
+    *,
+    file_id: uuid.UUID,
+    user_id: uuid.UUID,
+    allow_admin_access: bool,
+) -> MemeFile | None:
     authorized_collection = (
         select(CollectionMeme.meme_id)
         .select_from(CollectionMeme)
@@ -81,18 +93,15 @@ async def _load_authorized_file(session: AsyncSession, *, file_id: uuid.UUID, us
         )
         .exists()
     )
-    stmt = (
-        select(MemeFile)
-        .join(Meme, Meme.id == MemeFile.meme_id)
-        .where(
-            MemeFile.id == file_id,
+    stmt = select(MemeFile).join(Meme, Meme.id == MemeFile.meme_id).where(MemeFile.id == file_id)
+    if not allow_admin_access:
+        stmt = stmt.where(
             or_(
                 Meme.is_public.is_(True),
                 Meme.author_user_id == user_id,
                 authorized_collection,
             ),
         )
-    )
     result = await session.execute(stmt)
     return result.scalar_one_or_none()
 

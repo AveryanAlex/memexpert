@@ -15,6 +15,7 @@ from memexpert.core.database import get_db_session
 from memexpert.models.collection import PinnedMeme
 from memexpert.models.content import Meme, MemeFile
 from memexpert.models.enums import ContentKind, ContentLanguage
+from memexpert.models.user import User
 from memexpert.schemas.user import UserRead
 from memexpert.services import CollectionService, MemeSearchService, UserService
 from memexpert.services.analytics import AnalyticsService
@@ -339,6 +340,10 @@ async def test_collection_detail_and_media_route_authorize_private_saved_media(
     owner = await create_full_user_via_upgrade(user_service, telegram_id=2001, email="private-owner@example.com")
     member = await create_full_user_via_upgrade(user_service, telegram_id=2002, email="private-member@example.com")
     outsider = await create_full_user_via_upgrade(user_service, telegram_id=2003, email="private-outsider@example.com")
+    admin = await create_full_user_via_upgrade(user_service, telegram_id=2004, email="private-admin@example.com")
+    persisted_admin = await migrated_db_session.get(User, admin.id)
+    assert persisted_admin is not None
+    persisted_admin.is_admin = True
     private_meme = await _create_meme(
         migrated_db_session,
         author_user_id=owner.id,
@@ -400,6 +405,12 @@ async def test_collection_detail_and_media_route_authorize_private_saved_media(
             follow_redirects=False,
         )
 
+        current_user = UserRead.model_validate(persisted_admin)
+        admin_media_response = await client.get(
+            f"/api/v1/media/files/{private_file_id}/preview",
+            follow_redirects=False,
+        )
+
         current_user = None
         anonymous_media_response = await client.get(
             f"/api/v1/media/files/{private_file_id}/preview",
@@ -429,8 +440,12 @@ async def test_collection_detail_and_media_route_authorize_private_saved_media(
 
     assert outsider_detail_response.status_code == 404
     assert outsider_media_response.status_code == 404
+    assert admin_media_response.status_code == 307
+    assert admin_media_response.headers["location"] == "https://s3.memexpert.test/pipeline/originals/private/owner-upload.png"
     assert anonymous_media_response.status_code == 401
     first_params = cast("dict[str, str]", fake_s3_client.calls[0]["params"])
     second_params = cast("dict[str, str]", fake_s3_client.calls[1]["params"])
+    third_params = cast("dict[str, str]", fake_s3_client.calls[2]["params"])
     assert first_params["Key"] == "pipeline/derived/private/owner-upload.mp4"
     assert second_params["Key"] == "pipeline/originals/private/owner-upload.png"
+    assert third_params["Key"] == "pipeline/originals/private/owner-upload.png"

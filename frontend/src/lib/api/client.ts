@@ -546,13 +546,25 @@ export async function fetchAdminDashboard(request: CatalogRequest): Promise<{
     fetchAdminSourceChannels(request),
     apiGet<AdminMemeTemplateRead[]>('/api/v1/admin/meme-templates', new URLSearchParams(), request),
     apiGet<AdminBlockedPerceptualHashRead[]>('/api/v1/admin/blocked-perceptual-hashes', new URLSearchParams(), request),
-    apiGet<AdminMemeRead[]>('/api/v1/admin/memes', new URLSearchParams({ limit: '20' }), request),
+    fetchAdminModerationMemes(request, 20),
     apiGet<AdminMemeSeoReviewRowRead[]>('/api/v1/admin/seo-pages', new URLSearchParams({ limit: '20' }), request),
-    apiGet<AdminModerationReportRead[]>('/api/v1/admin/moderation-reports', new URLSearchParams({ limit: '20' }), request),
-    apiGet<AdminModerationDecisionRead[]>('/api/v1/admin/moderation-decisions', new URLSearchParams({ limit: '20' }), request)
+    fetchAdminModerationReports(request, 20),
+    fetchAdminModerationDecisions(request, 20)
   ]);
 
   return { suggestions, sourceChannels, templates, blockedPerceptualHashes, memes, seoReviews, reports, decisions };
+}
+
+export async function fetchAdminModerationMemes(request: CatalogRequest, limit = 50): Promise<AdminMemeRead[]> {
+  return apiGet<AdminMemeRead[]>('/api/v1/admin/memes', new URLSearchParams({ limit: String(limit) }), request);
+}
+
+export async function fetchAdminModerationReports(request: CatalogRequest, limit = 50): Promise<AdminModerationReportRead[]> {
+  return apiGet<AdminModerationReportRead[]>('/api/v1/admin/moderation-reports', new URLSearchParams({ limit: String(limit) }), request);
+}
+
+export async function fetchAdminModerationDecisions(request: CatalogRequest, limit = 50): Promise<AdminModerationDecisionRead[]> {
+  return apiGet<AdminModerationDecisionRead[]>('/api/v1/admin/moderation-decisions', new URLSearchParams({ limit: String(limit) }), request);
 }
 
 export async function fetchAdminMemeDetail(request: CatalogRequest, memeId: string): Promise<AdminMemeDetailRead> {

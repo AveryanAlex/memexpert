@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import inspect
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
@@ -93,6 +93,7 @@ from memexpert.schemas.admin import (
     AdminTelegramSessionValidateRead,
     AdminTelegramSessionValidateRequest,
 )
+from memexpert.schemas.meme import PublicMemeFileRead
 from memexpert.schemas.user import ChannelSuggestionRead
 from memexpert.services.admin_telegram_channel_resolver import (
     AdminTelegramChannelResolverError,
@@ -101,6 +102,7 @@ from memexpert.services.admin_telegram_channel_resolver import (
 )
 from memexpert.services.content_merge import ContentMergeService
 from memexpert.services.engagement_read_model import load_derived_popularity_scores
+from memexpert.services.media_render_urls import MediaRenderUrlService
 from memexpert.services.meme_seo import MemeSeoGenerationService
 
 if TYPE_CHECKING:
@@ -252,6 +254,7 @@ class AdminService:
     """Small admin orchestration service over current durable models."""
 
     session: AsyncSession
+    media_render_service: MediaRenderUrlService = field(default_factory=MediaRenderUrlService)
 
     async def get_overview(self) -> AdminOverviewRead:
         """Return bounded task counts without materializing admin collections.
@@ -1361,7 +1364,7 @@ class AdminService:
         stmt = (
             select(Meme)
             .outerjoin(MemeSeoPage, MemeSeoPage.meme_id == Meme.id)
-            .options(selectinload(Meme.seo_page))
+            .options(selectinload(Meme.seo_page), selectinload(Meme.primary_file))
             .where(Meme.is_public.is_(True), Meme.is_nsfw.is_(False))
             .order_by(missing_first.asc(), newest_activity.desc(), Meme.created_at.desc(), Meme.id.desc())
             .limit(limit)
@@ -1627,7 +1630,13 @@ class AdminService:
         limit: int = 50,
         offset: int = 0,
     ) -> list[AdminMemeRead]:
-        stmt = select(Meme).order_by(Meme.created_at.desc()).limit(limit).offset(offset)
+        stmt = (
+            select(Meme)
+            .options(selectinload(Meme.primary_file))
+            .order_by(Meme.created_at.desc())
+            .limit(limit)
+            .offset(offset)
+        )
         if is_nsfw is not None:
             stmt = stmt.where(Meme.is_nsfw.is_(is_nsfw))
         if is_public is not None:
@@ -1637,14 +1646,16 @@ class AdminService:
         return [self._admin_meme_read(row, popularity_score=popularity_scores.get(row.id, 0.0)) for row in rows]
 
     async def get_meme_detail(self, meme_id: uuid.UUID) -> AdminMemeDetailRead:
-        meme = await self.session.get(Meme, meme_id)
+        meme = await self.session.scalar(
+            select(Meme).options(selectinload(Meme.primary_file)).where(Meme.id == meme_id),
+        )
         if meme is None:
             raise AdminNotFoundError(f"Meme {meme_id} does not exist.")
 
         reports = (
             await self.session.execute(
                 select(ModerationReport)
-                .options(selectinload(ModerationReport.meme))
+                .options(selectinload(ModerationReport.meme).selectinload(Meme.primary_file))
                 .where(ModerationReport.meme_id == meme_id)
                 .order_by(ModerationReport.created_at.desc()),
             )
@@ -1763,7 +1774,9 @@ class AdminService:
         admin_user_id: uuid.UUID,
         request: AdminMemeModerationUpdateRequest,
     ) -> AdminMemeRead:
-        meme = await self.session.get(Meme, meme_id)
+        meme = await self.session.scalar(
+            select(Meme).options(selectinload(Meme.primary_file)).where(Meme.id == meme_id),
+        )
         if meme is None:
             raise AdminNotFoundError(f"Meme {meme_id} does not exist.")
 
@@ -1831,7 +1844,7 @@ class AdminService:
     ) -> list[AdminModerationReportRead]:
         stmt = (
             select(ModerationReport)
-            .options(selectinload(ModerationReport.meme))
+            .options(selectinload(ModerationReport.meme).selectinload(Meme.primary_file))
             .order_by(ModerationReport.created_at.asc())
             .limit(limit)
             .offset(offset)
@@ -1866,7 +1879,7 @@ class AdminService:
 
         report = await self.session.scalar(
             select(ModerationReport)
-            .options(selectinload(ModerationReport.meme))
+            .options(selectinload(ModerationReport.meme).selectinload(Meme.primary_file))
             .where(ModerationReport.id == report_id),
         )
         if report is None:
@@ -2007,8 +2020,8 @@ class AdminService:
             tuple(dict.fromkeys(meme.id for meme in memes)),
         )
 
-    @staticmethod
-    def _admin_meme_read(meme: Meme, *, popularity_score: float) -> AdminMemeRead:
+    def _admin_meme_read(self, meme: Meme, *, popularity_score: float) -> AdminMemeRead:
+        primary_file = meme.primary_file
         return AdminMemeRead(
             id=meme.id,
             media_type=meme.media_type,
@@ -2018,6 +2031,20 @@ class AdminService:
             popularity_score=popularity_score,
             like_count=meme.like_count,
             tags=list(meme.tags),
+            primary_file=(
+                None
+                if primary_file is None
+                else PublicMemeFileRead(
+                    id=primary_file.id,
+                    mime_type=primary_file.mime_type,
+                    width=primary_file.width,
+                    height=primary_file.height,
+                    file_size_bytes=primary_file.file_size_bytes,
+                    blur_hash=primary_file.blur_hash,
+                    quality_score=primary_file.quality_score,
+                    render=self.media_render_service.build_private_render(primary_file),
+                )
+            ),
             template_id=meme.template_id,
             author_user_id=meme.author_user_id,
             created_at=meme.created_at,

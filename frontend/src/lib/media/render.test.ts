@@ -7,7 +7,8 @@ import {
   selectImageLoading,
   selectMediaAspectRatio,
   selectMediaPreload,
-  selectMediaRender
+  selectMediaRender,
+  selectVideoSourceType
 } from './render';
 
 describe('selectMediaRender', () => {
@@ -43,6 +44,17 @@ describe('selectMediaRender', () => {
     expect(media.imageUrl).toBe('/api/v1/media/files/file-1/preview');
     expect(media.videoUrl).toBe('/api/v1/media/files/file-1/web-video.mp4');
     expect(media.downloadUrl).toBe('/api/v1/media/files/file-1/download');
+    expect(media.hasMedia).toBe(true);
+  });
+
+  it('selects authenticated audio originals as audio instead of images', () => {
+    const media = selectMediaRender({
+      ...file({ original_url: '/api/v1/media/files/file-1/original' }),
+      mime_type: 'audio/mpeg'
+    });
+
+    expect(media.audioUrl).toBe('/api/v1/media/files/file-1/original');
+    expect(media.imageUrl).toBeNull();
     expect(media.hasMedia).toBe(true);
   });
 
@@ -89,6 +101,13 @@ describe('feed preview media loading', () => {
     expect(selectImageLoading(true)).toBe('eager');
     expect(selectMediaPreload(false)).toBe('none');
     expect(selectMediaPreload(true)).toBe('metadata');
+  });
+});
+
+describe('selectVideoSourceType', () => {
+  it('labels generated web video variants as MP4 instead of the original MIME type', () => {
+    expect(selectVideoSourceType({ ...file({ web_video_url: '/api/v1/media/files/file-1/web-video.mp4' }), mime_type: 'video/quicktime' })).toBe('video/mp4');
+    expect(selectVideoSourceType({ ...file({ original_url: '/api/v1/media/files/file-1/original' }), mime_type: 'video/quicktime' })).toBe('video/quicktime');
   });
 });
 

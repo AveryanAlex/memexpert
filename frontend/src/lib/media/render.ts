@@ -17,9 +17,14 @@ interface MediaDimensions {
 
 export function selectMediaRender(file: PublicMemeFileRead | null | undefined): SelectedMediaRender {
   const render = file?.render;
-  const videoUrl = render?.web_video_url ?? null;
-  const imageUrl = render?.display_url ?? render?.preview_url ?? render?.thumbnail_url ?? render?.original_url ?? file?.render_url ?? null;
-  const audioUrl = file?.mime_type?.startsWith('audio/') ? (file.render_url ?? render?.original_url ?? null) : null;
+  const originalUrl = render?.original_url ?? file?.render_url ?? null;
+  const isAudio = file?.mime_type?.startsWith('audio/') ?? false;
+  const isVideo = file?.mime_type?.startsWith('video/') ?? false;
+  const videoUrl = render?.web_video_url ?? (isVideo ? originalUrl : null);
+  const imageUrl = isAudio
+    ? null
+    : render?.display_url ?? render?.preview_url ?? render?.thumbnail_url ?? (isVideo ? null : originalUrl);
+  const audioUrl = isAudio ? originalUrl : null;
   const downloadUrl = render?.download_url ?? file?.download_url ?? null;
 
   return {
@@ -46,6 +51,10 @@ export function selectImageLoading(detail: boolean): 'eager' | 'lazy' {
 
 export function selectMediaPreload(detail: boolean): 'metadata' | 'none' {
   return detail ? 'metadata' : 'none';
+}
+
+export function selectVideoSourceType(file: PublicMemeFileRead | null | undefined): string {
+  return file?.render?.web_video_url ? 'video/mp4' : file?.mime_type || 'video/mp4';
 }
 
 function selectMediaDimensions(file: PublicMemeFileRead | null | undefined): MediaDimensions | null {

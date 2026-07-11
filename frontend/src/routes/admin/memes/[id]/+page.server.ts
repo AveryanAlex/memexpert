@@ -78,13 +78,14 @@ export const actions: Actions = {
   deleteMeme: async ({ fetch, params, request }) => {
     const data = await request.formData();
     try {
+      requirePhrase(data, 'DELETE');
       await deleteAdminMeme(
         {
           fetch,
           baseUrl: apiBaseUrl(),
           cookieHeader: request.headers.get('cookie') ?? undefined,
           body: {
-            confirmation: readRequired(data, 'confirmation'),
+            confirmation: params.id,
             note: readRequired(data, 'note')
           }
         },
@@ -92,16 +93,18 @@ export const actions: Actions = {
       );
     } catch (caught) {
       if (caught instanceof ApiError) {
-        return fail(caught.status, { message: caught.message });
+        return fail(caught.status, { message: caught.message, error: true });
       }
-      return fail(500, { message: 'Admin meme deletion failed.' });
+      return fail(500, { message: 'Admin meme deletion failed.', error: true });
     }
-    throw redirect(303, '/admin');
+    throw redirect(303, '/admin/moderation');
   },
   mergeMeme: async ({ fetch, params, request }) => {
     const data = await request.formData();
-    const targetMemeId = readRequired(data, 'target_meme_id');
+    let targetMemeId: string;
     try {
+      requirePhrase(data, 'MERGE');
+      targetMemeId = readRequired(data, 'target_meme_id');
       await mergeAdminMeme(
         {
           fetch,
@@ -109,7 +112,7 @@ export const actions: Actions = {
           cookieHeader: request.headers.get('cookie') ?? undefined,
           body: {
             target_meme_id: targetMemeId,
-            confirmation: readRequired(data, 'confirmation'),
+            confirmation: params.id,
             note: readRequired(data, 'note')
           }
         },
@@ -117,9 +120,9 @@ export const actions: Actions = {
       );
     } catch (caught) {
       if (caught instanceof ApiError) {
-        return fail(caught.status, { message: caught.message });
+        return fail(caught.status, { message: caught.message, error: true });
       }
-      return fail(500, { message: 'Admin meme merge failed.' });
+      return fail(500, { message: 'Admin meme merge failed.', error: true });
     }
     throw redirect(303, `/admin/memes/${targetMemeId}`);
   }
@@ -130,9 +133,9 @@ async function runAction(operation: () => Promise<{ message: string }>) {
     return await operation();
   } catch (caught) {
     if (caught instanceof ApiError) {
-      return fail(caught.status, { message: caught.message });
+      return fail(caught.status, { message: caught.message, error: true });
     }
-    return fail(500, { message: 'Admin meme operation failed.' });
+    return fail(500, { message: 'Admin meme operation failed.', error: true });
   }
 }
 
@@ -147,6 +150,13 @@ function readRequired(data: FormData, name: string): string {
 function readOptional(data: FormData, name: string): string | null {
   const value = String(data.get(name) ?? '').trim();
   return value || null;
+}
+
+function requirePhrase(data: FormData, expected: 'DELETE' | 'MERGE'): void {
+  const value = String(data.get('confirmation_phrase') ?? '').trim();
+  if (value !== expected) {
+    throw new ApiError(400, `Type ${expected} to confirm this action.`);
+  }
 }
 
 function apiBaseUrl(): string {

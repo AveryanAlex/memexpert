@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { PublicMemeCardRead, PublicMemeDetailRead } from '$lib/api/types';
-  import { selectFeedPreviewAspectRatio, selectImageLoading, selectMediaPreload, selectMediaRender } from '$lib/media/render';
+  import { selectFeedPreviewAspectRatio, selectImageLoading, selectMediaPreload, selectMediaRender, selectVideoSourceType } from '$lib/media/render';
   import { memeTitle } from '$lib/memeActions';
   import { Download } from '@lucide/svelte';
 
@@ -43,7 +43,7 @@
       poster={media.imageUrl || undefined}
       aria-label={title}
     >
-      <source src={media.videoUrl} type={file?.mime_type || 'video/mp4'} />
+      <source src={media.videoUrl} type={selectVideoSourceType(file)} />
     </video>
   {:else if media.imageUrl}
     <img

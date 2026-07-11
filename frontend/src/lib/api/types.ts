@@ -818,6 +818,7 @@ export interface AdminMemeRead {
   popularity_score: number;
   like_count: number;
   tags: string[];
+  primary_file: PublicMemeFileRead | null;
   template_id: string | null;
   author_user_id: string | null;
   created_at: string;

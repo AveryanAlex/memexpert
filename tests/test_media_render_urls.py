@@ -185,6 +185,23 @@ def test_private_web_video_uses_authenticated_direct_variant_without_imgproxy() 
     assert "pipeline/derived/private/web.mp4" not in web_video_url
 
 
+def test_private_audio_uses_authenticated_original_and_download_variants() -> None:
+    file_id = uuid.UUID("11111111-1111-4111-8111-111111111119")
+    file = MemeFile(
+        id=file_id,
+        meme_id=uuid.UUID("22222222-2222-4222-8222-222222222229"),
+        s3_original_key="pipeline/originals/private/audio.mp3",
+        mime_type="audio/mpeg",
+        quality_score=0.7,
+    )
+
+    render = MediaRenderUrlService(Settings()).build_private_render(file)
+
+    assert render.original_url == f"/api/v1/media/files/{file_id}/original"
+    assert render.download_url == f"/api/v1/media/files/{file_id}/download"
+    assert "pipeline/originals/private/audio.mp3" not in f"{render.original_url} {render.download_url}"
+
+
 def test_gif_with_web_video_uses_playback_url_not_static_imgproxy_preview() -> None:
     file_id = uuid.UUID("11111111-1111-4111-8111-111111111117")
     settings = Settings.model_validate(

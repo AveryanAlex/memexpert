@@ -10,8 +10,6 @@ import {
   fetchAdminOverview,
   mergeMemeTemplate,
   regenerateMemeSeoPage,
-  resolveModerationReport,
-  updateMemeModeration,
   updateBlockedPerceptualHash,
   updateMemeSeoPage,
   updateMemeTemplate
@@ -177,26 +175,6 @@ export const actions: Actions = {
       return { message: result.message };
     });
   },
-  updateMemeModeration: async ({ fetch, request }) => {
-    const data = await request.formData();
-    return runAction(async () => {
-      await updateMemeModeration(
-        {
-          fetch,
-          baseUrl: apiBaseUrl(),
-          cookieHeader: request.headers.get('cookie') ?? undefined,
-          body: {
-            is_nsfw: data.get('is_nsfw') === 'on',
-            is_public: data.get('is_public') === 'on',
-            reason: readOptional(data, 'reason'),
-            note: readOptional(data, 'note')
-          }
-        },
-        readRequired(data, 'meme_id')
-      );
-      return { message: 'Meme moderation flags updated and audited.' };
-    });
-  },
   updateSeoPage: async ({ fetch, request }) => {
     const data = await request.formData();
     return runAction(async () => {
@@ -226,25 +204,6 @@ export const actions: Actions = {
         memeId
       );
       return { message: 'SEO page regenerated and manual edits were overwritten.' };
-    });
-  },
-  resolveModerationReport: async ({ fetch, request }) => {
-    const data = await request.formData();
-    return runAction(async () => {
-      await resolveModerationReport(
-        {
-          fetch,
-          baseUrl: apiBaseUrl(),
-          cookieHeader: request.headers.get('cookie') ?? undefined,
-          body: {
-            action: readRequired(data, 'action'),
-            reason: readOptional(data, 'reason'),
-            note: readOptional(data, 'note')
-          }
-        },
-        readRequired(data, 'report_id')
-      );
-      return { message: 'Moderation report resolved and audited.' };
     });
   }
 };

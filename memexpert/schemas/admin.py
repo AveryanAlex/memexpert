@@ -40,6 +40,7 @@ from memexpert.models.enums import (
 )
 from memexpert.schemas._text import normalize_optional_text, normalize_required_text
 from memexpert.schemas.base import ORMSchema
+from memexpert.schemas.meme import PublicMemeFileRead
 from memexpert.schemas.user import ChannelSuggestionRead, UserRead
 
 MAX_SOURCE_ID_LENGTH = 255
@@ -786,6 +787,7 @@ class AdminMemeRead(ORMSchema):
     popularity_score: float
     like_count: int
     tags: list[str]
+    primary_file: PublicMemeFileRead | None
     template_id: uuid.UUID | None
     author_user_id: uuid.UUID | None
     created_at: datetime

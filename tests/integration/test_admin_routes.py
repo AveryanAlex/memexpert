@@ -672,7 +672,14 @@ async def test_admin_can_list_read_and_resolve_moderation_report_with_audited_de
         admin = (
             await session.execute(select(User).where(User.email == "admin-resolve-report@example.com"))
         ).scalar_one()
-        meme, meme_file = _canonical_meme(media_type=ContentKind.IMAGE, is_public=True, is_nsfw=False)
+        meme, meme_file = _canonical_meme(
+            file_key="admin/private/moderation-primary.jpg",
+            media_type=ContentKind.IMAGE,
+            is_public=False,
+            is_nsfw=False,
+        )
+        meme_file.width = 900
+        meme_file.height = 600
         report = ModerationReport(
             meme=meme,
             reporter_user_id=reporter.id,
@@ -690,6 +697,7 @@ async def test_admin_can_list_read_and_resolve_moderation_report_with_audited_de
     transport = ASGITransport(app=auth_app)
     async with AsyncClient(transport=transport, base_url="https://testserver") as admin_client:
         admin_client.cookies.set(ACCESS_COOKIE_NAME, admin_token)
+        memes_response = await admin_client.get("/api/v1/admin/memes")
         list_response = await admin_client.get("/api/v1/admin/moderation-reports")
         detail_response = await admin_client.get(f"/api/v1/admin/memes/{meme_id}")
         resolve_response = await admin_client.post(
@@ -698,21 +706,35 @@ async def test_admin_can_list_read_and_resolve_moderation_report_with_audited_de
         )
         history_response = await admin_client.get(f"/api/v1/admin/moderation-decisions?meme_id={meme_id}")
 
+    assert memes_response.status_code == 200
+    assert [item["id"] for item in memes_response.json()] == [str(meme_id)]
+    expected_file_id = str(meme_file.id)
+    expected_preview_url = f"/api/v1/media/files/{expected_file_id}/preview"
+    assert memes_response.json()[0]["primary_file"]["render"]["preview_url"] == expected_preview_url
+    assert "admin/private/moderation-primary.jpg" not in memes_response.text
+
     assert list_response.status_code == 200
     assert [item["id"] for item in list_response.json()] == [str(report_id)]
     assert list_response.json()[0]["meme"]["id"] == str(meme_id)
+    assert list_response.json()[0]["meme"]["primary_file"]["render"]["preview_url"] == expected_preview_url
+    assert "admin/private/moderation-primary.jpg" not in list_response.text
 
     assert detail_response.status_code == 200
     detail_payload = detail_response.json()
     assert detail_payload["meme"]["id"] == str(meme_id)
+    assert detail_payload["meme"]["is_public"] is False
+    assert detail_payload["meme"]["primary_file"]["render"]["preview_url"] == expected_preview_url
     assert [item["id"] for item in detail_payload["reports"]] == [str(report_id)]
     assert detail_payload["decisions"] == []
+    assert "admin/private/moderation-primary.jpg" not in detail_response.text
 
     assert resolve_response.status_code == 200
     resolved_payload = resolve_response.json()
     assert resolved_payload["status"] == "resolved"
     assert resolved_payload["resolved_by_admin_user_id"] == str(admin_id)
     assert resolved_payload["meme"]["is_nsfw"] is True
+    assert resolved_payload["meme"]["primary_file"]["render"]["preview_url"] == expected_preview_url
+    assert "admin/private/moderation-primary.jpg" not in resolve_response.text
 
     assert history_response.status_code == 200
     history_payload = history_response.json()
