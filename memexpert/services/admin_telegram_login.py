@@ -38,6 +38,7 @@ from memexpert.services.admin import (
 
 if TYPE_CHECKING:
     import uuid
+    from collections.abc import Callable
 
     from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -80,6 +81,7 @@ class _LiveLoginAttempt:
     qr_login: Any | None = None
     qr_wait_task: asyncio.Task[Any] | None = None
     qr_expiry_cleanup_handle: asyncio.TimerHandle | None = None
+    qr_expiry_cleanup_generation: int = 0
     qr_completion_expires_at: datetime | None = None
     phone_number: str | None = None
     retirement_task: asyncio.Task[None] | None = None
@@ -330,10 +332,7 @@ class AdminTelegramLoginService:
         await self.session.rollback()
 
         try:
-            await asyncio.wait_for(
-                asyncio.shield(live_attempt.qr_wait_task),
-                timeout=QR_LOGIN_POLL_TIMEOUT_SECONDS,
-            )
+            await self._wait_for_qr_completion(live_attempt.qr_wait_task)
         except TimeoutError:
             return AdminTelegramLoginQrStatusRead(
                 status="pending",
@@ -342,10 +341,13 @@ class AdminTelegramLoginService:
                 message="Still waiting for Telegram QR scan.",
             )
         except asyncio.CancelledError:
-            if _LIVE_LOGIN_ATTEMPTS.get(request.attempt_id) is not live_attempt:
+            current_live_attempt = _LIVE_LOGIN_ATTEMPTS.get(request.attempt_id)
+            if current_live_attempt is not live_attempt or live_attempt.retirement_task is not None:
                 raise AdminConflictError(
                     "QR login attempt expired or was replaced. Start a new QR login.",
                 ) from None
+            # The shielded QR task is still owned by this exact live attempt,
+            # so this cancellation belongs to the caller rather than cleanup.
             raise
         except Exception as exc:
             password_required = type(exc).__name__ == _PASSWORD_REQUIRED_ERROR_CLASS
@@ -409,6 +411,12 @@ class AdminTelegramLoginService:
             telegram_session=completed.telegram_session,
             password_required=False,
             message=completed.message,
+        )
+
+    async def _wait_for_qr_completion(self, task: asyncio.Task[Any]) -> None:
+        await asyncio.wait_for(
+            asyncio.shield(task),
+            timeout=QR_LOGIN_POLL_TIMEOUT_SECONDS,
         )
 
     async def _get_session_for_login(self, telegram_session_id: uuid.UUID) -> TelegramSession:
@@ -762,11 +770,15 @@ class AdminTelegramLoginService:
         expected_attempt: _LiveLoginAttempt,
         task: asyncio.Task[Any],
     ) -> None:
-        if task.cancelled():
-            return
-        exception = task.exception()
-        if exception is None or type(exception).__name__ == _PASSWORD_REQUIRED_ERROR_CLASS:
+        if self._qr_wait_was_accepted(task):
             self._promote_qr_completion_cleanup(attempt_id, expected_attempt)
+
+    @staticmethod
+    def _qr_wait_was_accepted(task: asyncio.Task[Any] | None) -> bool:
+        if task is None or not task.done() or task.cancelled():
+            return False
+        exception = task.exception()
+        return exception is None or type(exception).__name__ == _PASSWORD_REQUIRED_ERROR_CLASS
 
     def _promote_qr_completion_cleanup(
         self,
@@ -794,10 +806,36 @@ class AdminTelegramLoginService:
         *,
         expires_at: datetime,
     ) -> asyncio.TimerHandle:
-        delay = max(0.0, (expires_at - utcnow()).total_seconds())
-        return asyncio.get_running_loop().call_later(delay, self._cleanup_expired_qr_attempt, attempt_id, live_attempt)
+        live_attempt.qr_expiry_cleanup_generation += 1
+        cleanup_generation = live_attempt.qr_expiry_cleanup_generation
+        return _schedule_utc_callback(
+            expires_at,
+            self._cleanup_expired_qr_attempt,
+            attempt_id,
+            live_attempt,
+            cleanup_generation,
+        )
 
-    def _cleanup_expired_qr_attempt(self, attempt_id: uuid.UUID, expected_attempt: _LiveLoginAttempt) -> None:
+    def _cleanup_expired_qr_attempt(
+        self,
+        attempt_id: uuid.UUID,
+        expected_attempt: _LiveLoginAttempt,
+        cleanup_generation: int,
+    ) -> None:
+        if (
+            _LIVE_LOGIN_ATTEMPTS.get(attempt_id) is not expected_attempt
+            or expected_attempt.qr_expiry_cleanup_generation != cleanup_generation
+        ):
+            return
+        # A Task becomes done before asyncio runs its done callbacks. If the
+        # token timer wins that scheduling race, preserve an already accepted
+        # result here and replace this generation with the bounded completion
+        # timer. A current completion-timer generation still retires normally.
+        if expected_attempt.qr_completion_expires_at is None and self._qr_wait_was_accepted(
+            expected_attempt.qr_wait_task,
+        ):
+            self._promote_qr_completion_cleanup(attempt_id, expected_attempt)
+            return
         retirement_task = self._launch_live_attempt_retirement(attempt_id, expected_attempt)
         if retirement_task is None:
             return
@@ -814,6 +852,15 @@ async def _maybe_await(value: Any) -> Any:
     if inspect.isawaitable(value):
         return await value
     return value
+
+
+def _schedule_utc_callback(
+    expires_at: datetime,
+    callback: Callable[..., None],
+    *args: Any,
+) -> asyncio.TimerHandle:
+    delay = max(0.0, (expires_at - utcnow()).total_seconds())
+    return asyncio.get_running_loop().call_later(delay, callback, *args)
 
 
 def _consume_background_task_exception(task: asyncio.Task[Any]) -> None:

@@ -7,7 +7,7 @@ import asyncio
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID, uuid7
 
 import pytest
@@ -56,6 +56,8 @@ from tests.conftest import create_full_user_via_upgrade
 from tests.integration.test_auth_routes import ACCESS_COOKIE_NAME, build_test_auth_service
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator, Callable
+
     from fastapi import FastAPI
 
 
@@ -147,7 +149,7 @@ class _FakeQrLogin:
         self.wait_timeout = timeout
         self.wait_started.set()
         if self.wait_event is not None:
-            await asyncio.wait_for(self.wait_event.wait(), timeout=timeout)
+            await self.wait_event.wait()
         if self.require_password:
             class SessionPasswordNeededError(Exception):
                 pass
@@ -181,7 +183,8 @@ class _FakeTelegramLoginClient:
         invalid_password_attempts: int = 0,
         qr_wait_event: asyncio.Event | None = None,
         qr_expires_at: datetime | None = None,
-        get_me_delay: float = 0.0,
+        get_me_started: asyncio.Event | None = None,
+        get_me_release: asyncio.Event | None = None,
         disconnect_started: asyncio.Event | None = None,
         disconnect_release: asyncio.Event | None = None,
     ) -> None:
@@ -190,7 +193,8 @@ class _FakeTelegramLoginClient:
         self.invalid_password_attempts = invalid_password_attempts
         self.qr_wait_event = qr_wait_event
         self.qr_expires_at = qr_expires_at
-        self.get_me_delay = get_me_delay
+        self.get_me_started = get_me_started
+        self.get_me_release = get_me_release
         self.disconnect_started = disconnect_started
         self.disconnect_release = disconnect_release
         self.string_session = "temporary-telegram-login-session"
@@ -242,8 +246,10 @@ class _FakeTelegramLoginClient:
         return object()
 
     async def get_me(self) -> _FakeTelegramUser:
-        if self.get_me_delay:
-            await asyncio.sleep(self.get_me_delay)
+        if self.get_me_started is not None:
+            self.get_me_started.set()
+        if self.get_me_release is not None:
+            await self.get_me_release.wait()
         return _FakeTelegramUser()
 
     async def qr_login(self) -> _FakeQrLogin:
@@ -256,17 +262,288 @@ class _FakeTelegramLoginClient:
         return self.qr_login_instance
 
 
-async def _cleanup_live_qr_test_attempt(attempt_id: UUID) -> None:
-    live_attempt = admin_telegram_login_module._LIVE_LOGIN_ATTEMPTS.pop(attempt_id, None)  # noqa: SLF001
-    if live_attempt is None:
-        return
-    if live_attempt.qr_expiry_cleanup_handle is not None:
-        live_attempt.qr_expiry_cleanup_handle.cancel()
-    if live_attempt.qr_wait_task is not None:
-        live_attempt.qr_wait_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await live_attempt.qr_wait_task
-    await live_attempt.client.disconnect()
+class _MutableUtcClock:
+    def __init__(self, now: datetime) -> None:
+        self.now = now
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def advance(self, delta: timedelta) -> None:
+        self.now += delta
+
+
+class _ManualQrExpiryHandle:
+    def __init__(self, *, expires_at: datetime, callback: Callable[[], None]) -> None:
+        self.expires_at = expires_at
+        self._callback = callback
+        self._cancelled = False
+        self._fired = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def cancelled(self) -> bool:
+        return self._cancelled
+
+    def fire(self, *, even_if_cancelled: bool = False) -> bool:
+        if self._fired or (self._cancelled and not even_if_cancelled):
+            return False
+        self._fired = True
+        self._callback()
+        return True
+
+
+class _ManualQrExpiryScheduler:
+    def __init__(self) -> None:
+        self.handles: list[_ManualQrExpiryHandle] = []
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def schedule(
+            expires_at: datetime,
+            callback: Callable[..., None],
+            *args: object,
+        ) -> asyncio.TimerHandle:
+            handle = _ManualQrExpiryHandle(
+                expires_at=expires_at,
+                callback=lambda: callback(*args),
+            )
+            self.handles.append(handle)
+            return cast("asyncio.TimerHandle", cast("object", handle))
+
+        monkeypatch.setattr(
+            admin_telegram_login_module,
+            "_schedule_utc_callback",
+            schedule,
+        )
+
+    def fire_due(self, now: datetime) -> list[_ManualQrExpiryHandle]:
+        fired: list[_ManualQrExpiryHandle] = []
+        for handle in list(self.handles):
+            if handle.expires_at <= now and handle.fire():
+                fired.append(handle)
+        return fired
+
+
+def _install_manual_qr_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[_MutableUtcClock, _ManualQrExpiryScheduler]:
+    clock = _MutableUtcClock(datetime(2026, 7, 12, 12, 0, tzinfo=UTC))
+    scheduler = _ManualQrExpiryScheduler()
+    monkeypatch.setattr(admin_telegram_login_module, "utcnow", clock)
+    scheduler.install(monkeypatch)
+    return clock, scheduler
+
+
+def _observe_qr_poll_wait(monkeypatch: pytest.MonkeyPatch) -> asyncio.Event:
+    wait_started = asyncio.Event()
+    original_wait = admin_telegram_login_module.AdminTelegramLoginService._wait_for_qr_completion  # noqa: SLF001
+
+    async def observed_wait(
+        service: admin_telegram_login_module.AdminTelegramLoginService,
+        task: asyncio.Task[object],
+    ) -> None:
+        wait_started.set()
+        await original_wait(service, task)
+
+    monkeypatch.setattr(
+        admin_telegram_login_module.AdminTelegramLoginService,
+        "_wait_for_qr_completion",
+        observed_wait,
+    )
+    return wait_started
+
+
+async def _disconnect_live_test_client(client: admin_telegram_login_module.TelegramLoginClient) -> object:
+    return await admin_telegram_login_module._maybe_await(client.disconnect())  # noqa: SLF001
+
+
+def _consume_timed_out_cleanup_task(task: asyncio.Task[Any]) -> None:
+    if not task.cancelled():
+        _ = task.exception()
+
+
+async def _wait_for_live_login_cleanup_tasks(
+    tasks: list[asyncio.Task[Any]],
+    *,
+    deadline: float,
+    operation: str,
+    allow_cancelled: bool,
+) -> tuple[dict[asyncio.Task[Any], object], list[BaseException]]:
+    if not tasks:
+        return {}, []
+
+    timeout = max(0.0, deadline - asyncio.get_running_loop().time())
+    done, pending = await asyncio.wait(tasks, timeout=timeout)
+    completed_results: dict[asyncio.Task[Any], object] = {}
+    completed_errors: list[BaseException] = []
+    for task in done:
+        if task.cancelled():
+            if not allow_cancelled:
+                completed_errors.append(AssertionError(f"{operation} task was cancelled unexpectedly"))
+            continue
+        try:
+            completed_results[task] = task.result()
+        except BaseException as exc:  # noqa: BLE001
+            completed_errors.append(exc)
+
+    if pending:
+        for task in pending:
+            task.add_done_callback(_consume_timed_out_cleanup_task)
+            task.cancel()
+        timeout_error = TimeoutError(f"{operation} did not finish before the live-login cleanup deadline")
+        if completed_errors:
+            raise BaseExceptionGroup(
+                "Live Telegram login cleanup timed out with completed task failures",
+                [timeout_error, *completed_errors],
+            )
+        raise timeout_error
+
+    return completed_results, completed_errors
+
+
+@pytest.fixture(autouse=True)
+async def _retire_live_admin_telegram_login_attempts() -> AsyncIterator[None]:
+    """Keep process-global login clients from leaking across this file's tests."""
+
+    yield
+
+    leftovers = list(admin_telegram_login_module._LIVE_LOGIN_ATTEMPTS.items())  # noqa: SLF001
+    live_attempts: list[admin_telegram_login_module._LiveLoginAttempt] = []  # noqa: SLF001
+    for attempt_id, live_attempt in leftovers:
+        if admin_telegram_login_module._LIVE_LOGIN_ATTEMPTS.get(attempt_id) is live_attempt:  # noqa: SLF001
+            admin_telegram_login_module._LIVE_LOGIN_ATTEMPTS.pop(attempt_id, None)  # noqa: SLF001
+            live_attempts.append(live_attempt)
+
+    unexpected_errors: list[BaseException] = []
+    cancelled_wait_tasks: list[asyncio.Task[object]] = []
+    retirement_tasks: list[asyncio.Task[None]] = []
+    retirement_owner_ids: list[int] = []
+    cleanup_deadline = asyncio.get_running_loop().time() + 10.0
+
+    try:
+        for live_attempt in live_attempts:
+            if live_attempt.qr_expiry_cleanup_handle is not None:
+                live_attempt.qr_expiry_cleanup_handle.cancel()
+                live_attempt.qr_expiry_cleanup_handle = None
+            live_attempt.qr_expiry_cleanup_generation += 1
+            if live_attempt.qr_wait_task is not None:
+                if live_attempt.qr_wait_task.done():
+                    if live_attempt.qr_wait_task.cancelled():
+                        if live_attempt.retirement_task is None:
+                            unexpected_errors.append(
+                                asyncio.CancelledError("QR wait task was cancelled without retirement ownership"),
+                            )
+                    else:
+                        wait_exception = live_attempt.qr_wait_task.exception()
+                        if wait_exception is not None and type(wait_exception).__name__ != "SessionPasswordNeededError":
+                            unexpected_errors.append(wait_exception)
+                else:
+                    live_attempt.qr_wait_task.cancel()
+                    cancelled_wait_tasks.append(live_attempt.qr_wait_task)
+            for release_attribute in ("get_me_release", "disconnect_release"):
+                release_event = getattr(live_attempt.client, release_attribute, None)
+                if isinstance(release_event, asyncio.Event):
+                    release_event.set()
+            if live_attempt.retirement_task is not None:
+                retirement_tasks.append(live_attempt.retirement_task)
+                retirement_owner_ids.append(id(live_attempt))
+
+        wait_results, wait_errors = await _wait_for_live_login_cleanup_tasks(
+            cancelled_wait_tasks,
+            deadline=cleanup_deadline,
+            operation="cancelled QR wait",
+            allow_cancelled=True,
+        )
+        unexpected_errors.extend(wait_errors)
+        for result in wait_results.values():
+            unexpected_errors.append(
+                AssertionError(f"cancelled QR wait task returned unexpectedly: {result!r}"),
+            )
+
+        retirement_results, retirement_errors = await _wait_for_live_login_cleanup_tasks(
+            retirement_tasks,
+            deadline=cleanup_deadline,
+            operation="live-attempt retirement",
+            allow_cancelled=False,
+        )
+        unexpected_errors.extend(retirement_errors)
+        successful_retirement_owner_ids: set[int] = set()
+        for owner_id, retirement_task in zip(retirement_owner_ids, retirement_tasks, strict=True):
+            if retirement_task not in retirement_results:
+                continue
+            result = retirement_results[retirement_task]
+            if result is None:
+                successful_retirement_owner_ids.add(owner_id)
+            else:
+                unexpected_errors.append(
+                    AssertionError(f"live-attempt retirement returned unexpectedly: {result!r}"),
+                )
+
+        clients_to_disconnect = [
+            live_attempt.client
+            for live_attempt in live_attempts
+            if id(live_attempt) not in successful_retirement_owner_ids
+            or getattr(live_attempt.client, "disconnected", True) is False
+        ]
+        disconnect_tasks = [
+            asyncio.create_task(_disconnect_live_test_client(client))
+            for client in clients_to_disconnect
+        ]
+        disconnect_results, disconnect_errors = await _wait_for_live_login_cleanup_tasks(
+            disconnect_tasks,
+            deadline=cleanup_deadline,
+            operation="Telegram client disconnect",
+            allow_cancelled=False,
+        )
+        unexpected_errors.extend(disconnect_errors)
+        for result in disconnect_results.values():
+            if result is not None:
+                unexpected_errors.append(
+                    AssertionError(f"Telegram client disconnect returned unexpectedly: {result!r}"),
+                )
+    finally:
+        assert not admin_telegram_login_module._LIVE_LOGIN_ATTEMPTS  # noqa: SLF001
+
+    if len(unexpected_errors) == 1:
+        raise unexpected_errors[0]
+    if unexpected_errors:
+        raise BaseExceptionGroup("Unexpected live Telegram login cleanup failures", unexpected_errors)
+
+
+async def test_live_login_cleanup_deadline_does_not_await_cancellation_resistant_task() -> None:
+    task_started = asyncio.Event()
+    initial_release = asyncio.Event()
+    cancellation_seen = asyncio.Event()
+    cancellation_release = asyncio.Event()
+
+    async def cancellation_resistant_cleanup() -> None:
+        task_started.set()
+        try:
+            await initial_release.wait()
+        except asyncio.CancelledError:
+            cancellation_seen.set()
+            await cancellation_release.wait()
+
+    cleanup_task = asyncio.create_task(cancellation_resistant_cleanup())
+    await asyncio.wait_for(task_started.wait(), timeout=5)
+    try:
+        with pytest.raises(TimeoutError, match="cleanup deadline"):
+            await _wait_for_live_login_cleanup_tasks(
+                [cleanup_task],
+                deadline=asyncio.get_running_loop().time(),
+                operation="cancellation-resistant test cleanup",
+                allow_cancelled=False,
+            )
+
+        assert cancellation_seen.is_set() is False
+        assert cleanup_task.done() is False
+        await asyncio.wait_for(cancellation_seen.wait(), timeout=5)
+        assert cleanup_task.done() is False
+    finally:
+        initial_release.set()
+        cancellation_release.set()
+        await cleanup_task
 
 
 async def test_admin_routes_require_session_cookie_admin_flag_and_ignore_operator_header(
@@ -2804,6 +3081,7 @@ async def test_admin_telegram_qr_login_pending_poll_does_not_fail_attempt(
     postgres_session_factory: async_sessionmaker[AsyncSession],
     monkeypatch,
 ) -> None:
+    _install_manual_qr_time(monkeypatch)
     admin_token = await _issue_user_cookie(
         postgres_session_factory,
         auth_settings_overrides,
@@ -2827,7 +3105,7 @@ async def test_admin_telegram_qr_login_pending_poll_does_not_fail_attempt(
         "_build_telegram_client",
         fake_build_telegram_client,
     )
-    monkeypatch.setattr(admin_telegram_login_module, "QR_LOGIN_POLL_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(admin_telegram_login_module, "QR_LOGIN_POLL_TIMEOUT_SECONDS", 0.0)
 
     transport = ASGITransport(app=auth_app)
     async with AsyncClient(transport=transport, base_url="https://testserver") as admin_client:
@@ -2841,14 +3119,19 @@ async def test_admin_telegram_qr_login_pending_poll_does_not_fail_attempt(
             f"/api/v1/admin/telegram/sessions/{session_id}/login/qr/start",
         )
         assert fake_clients[0].qr_login_instance is not None
-        await asyncio.wait_for(fake_clients[0].qr_login_instance.wait_started.wait(), timeout=1)
+        await asyncio.wait_for(fake_clients[0].qr_login_instance.wait_started.wait(), timeout=5)
         assert (
             fake_clients[0].qr_login_instance.wait_timeout
             == admin_telegram_login_module.LOGIN_ATTEMPT_TTL.total_seconds()
         )
+        attempt_id = UUID(qr_start_response.json()["attempt_id"])
+        live_attempt = admin_telegram_login_module._LIVE_LOGIN_ATTEMPTS[attempt_id]  # noqa: SLF001
+        qr_wait_task = live_attempt.qr_wait_task
+        assert qr_wait_task is not None
+        assert qr_wait_task.done() is False
         qr_complete_response = await admin_client.post(
             f"/api/v1/admin/telegram/sessions/{session_id}/login/qr/complete",
-            json={"attempt_id": qr_start_response.json()["attempt_id"]},
+            json={"attempt_id": str(attempt_id)},
         )
 
     assert create_response.status_code == 201
@@ -2877,19 +3160,11 @@ async def test_admin_telegram_qr_login_pending_poll_does_not_fail_attempt(
     assert login_attempt.status == "pending"
     assert login_attempt.error_class is None
     assert login_attempt.error_text is None
-
-    live_attempt = admin_telegram_login_module._LIVE_LOGIN_ATTEMPTS.pop(  # noqa: SLF001
-        UUID(qr_start_response.json()["attempt_id"]),
-        None,
-    )
-    if live_attempt is not None:
-        if live_attempt.qr_expiry_cleanup_handle is not None:
-            live_attempt.qr_expiry_cleanup_handle.cancel()
-        if live_attempt.qr_wait_task is not None:
-            live_attempt.qr_wait_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await live_attempt.qr_wait_task
-        await live_attempt.client.disconnect()
+    assert admin_telegram_login_module._LIVE_LOGIN_ATTEMPTS.get(attempt_id) is live_attempt  # noqa: SLF001
+    assert live_attempt.qr_wait_task is qr_wait_task
+    assert qr_wait_task.done() is False
+    assert qr_wait_task.cancelled() is False
+    assert fake_clients[0].disconnected is False
 
 
 async def test_admin_telegram_qr_refresh_supersedes_an_active_long_poll_without_waiting_for_timeout(
@@ -2898,6 +3173,7 @@ async def test_admin_telegram_qr_refresh_supersedes_an_active_long_poll_without_
     postgres_session_factory: async_sessionmaker[AsyncSession],
     monkeypatch,
 ) -> None:
+    _install_manual_qr_time(monkeypatch)
     admin_token = await _issue_user_cookie(
         postgres_session_factory,
         auth_settings_overrides,
@@ -2921,7 +3197,7 @@ async def test_admin_telegram_qr_refresh_supersedes_an_active_long_poll_without_
         "_build_telegram_client",
         fake_build_telegram_client,
     )
-    monkeypatch.setattr(admin_telegram_login_module, "QR_LOGIN_POLL_TIMEOUT_SECONDS", 2.0)
+    poll_wait_started = _observe_qr_poll_wait(monkeypatch)
     transport = ASGITransport(app=auth_app)
     async with AsyncClient(transport=transport, base_url="https://testserver") as admin_client:
         admin_client.cookies.set(ACCESS_COOKIE_NAME, admin_token)
@@ -2930,7 +3206,7 @@ async def test_admin_telegram_qr_refresh_supersedes_an_active_long_poll_without_
         first_start = await admin_client.post(f"/api/v1/admin/telegram/sessions/{session_id}/login/qr/start")
         old_attempt_id = first_start.json()["attempt_id"]
         assert fake_clients[0].qr_login_instance is not None
-        await asyncio.wait_for(fake_clients[0].qr_login_instance.wait_started.wait(), timeout=1)
+        await asyncio.wait_for(fake_clients[0].qr_login_instance.wait_started.wait(), timeout=5)
 
         old_poll_task = asyncio.create_task(
             admin_client.post(
@@ -2938,30 +3214,28 @@ async def test_admin_telegram_qr_refresh_supersedes_an_active_long_poll_without_
                 json={"attempt_id": old_attempt_id},
             ),
         )
-        await asyncio.sleep(0.02)
-        refreshed = await asyncio.wait_for(
-            admin_client.post(f"/api/v1/admin/telegram/sessions/{session_id}/login/qr/start"),
-            timeout=0.5,
-        )
-        old_poll = await asyncio.wait_for(old_poll_task, timeout=0.5)
+        await asyncio.wait_for(poll_wait_started.wait(), timeout=5)
+        refreshed = await admin_client.post(f"/api/v1/admin/telegram/sessions/{session_id}/login/qr/start")
+        old_poll = await old_poll_task
 
     assert refreshed.status_code == 200
     assert refreshed.json()["attempt_id"] != old_attempt_id
     assert old_poll.status_code == 409
     assert old_poll.json()["detail"] == "QR login attempt expired or was replaced. Start a new QR login."
-    await _cleanup_live_qr_test_attempt(UUID(refreshed.json()["attempt_id"]))
+    assert fake_clients[0].disconnected is True
 
 
-async def test_admin_telegram_active_qr_poll_crossing_expiry_returns_controlled_conflict(
+async def test_admin_telegram_qr_poll_caller_cancellation_keeps_live_wait(
     auth_app: FastAPI,
     auth_settings_overrides: dict[str, str],
     postgres_session_factory: async_sessionmaker[AsyncSession],
     monkeypatch,
 ) -> None:
+    _install_manual_qr_time(monkeypatch)
     admin_token = await _issue_user_cookie(
         postgres_session_factory,
         auth_settings_overrides,
-        email="admin-telegram-qr-poll-expiry@example.com",
+        email="admin-telegram-qr-poll-cancel@example.com",
         is_admin=True,
     )
     wait_event = asyncio.Event()
@@ -2972,9 +3246,74 @@ async def test_admin_telegram_active_qr_poll_crossing_expiry_returns_controlled_
         string_session: SecretStr | None = None,
     ) -> _FakeTelegramLoginClient:
         _ = self, string_session
+        client = _FakeTelegramLoginClient(qr_wait_event=wait_event)
+        fake_clients.append(client)
+        return client
+
+    monkeypatch.setattr(
+        admin_telegram_login_module.AdminTelegramLoginService,
+        "_build_telegram_client",
+        fake_build_telegram_client,
+    )
+    poll_wait_started = _observe_qr_poll_wait(monkeypatch)
+    transport = ASGITransport(app=auth_app)
+    async with AsyncClient(transport=transport, base_url="https://testserver") as admin_client:
+        admin_client.cookies.set(ACCESS_COOKIE_NAME, admin_token)
+        create_response = await admin_client.post("/api/v1/admin/telegram/sessions", json={})
+        session_id = create_response.json()["id"]
+        qr_start = await admin_client.post(f"/api/v1/admin/telegram/sessions/{session_id}/login/qr/start")
+        attempt_id = UUID(qr_start.json()["attempt_id"])
+        live_attempt = admin_telegram_login_module._LIVE_LOGIN_ATTEMPTS[attempt_id]  # noqa: SLF001
+        qr_wait_task = live_attempt.qr_wait_task
+        assert qr_wait_task is not None
+
+        poll_task = asyncio.create_task(
+            admin_client.post(
+                f"/api/v1/admin/telegram/sessions/{session_id}/login/qr/complete",
+                json={"attempt_id": str(attempt_id)},
+            ),
+        )
+        await asyncio.wait_for(poll_wait_started.wait(), timeout=5)
+        poll_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await poll_task
+
+    assert admin_telegram_login_module._LIVE_LOGIN_ATTEMPTS.get(attempt_id) is live_attempt  # noqa: SLF001
+    assert live_attempt.retirement_task is None
+    assert live_attempt.qr_wait_task is qr_wait_task
+    assert qr_wait_task.done() is False
+    assert qr_wait_task.cancelled() is False
+    assert fake_clients[0].disconnected is False
+
+
+async def test_admin_telegram_active_qr_poll_crossing_expiry_returns_controlled_conflict(
+    auth_app: FastAPI,
+    auth_settings_overrides: dict[str, str],
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch,
+) -> None:
+    clock, scheduler = _install_manual_qr_time(monkeypatch)
+    admin_token = await _issue_user_cookie(
+        postgres_session_factory,
+        auth_settings_overrides,
+        email="admin-telegram-qr-poll-expiry@example.com",
+        is_admin=True,
+    )
+    wait_event = asyncio.Event()
+    disconnect_started = asyncio.Event()
+    disconnect_release = asyncio.Event()
+    fake_clients: list[_FakeTelegramLoginClient] = []
+
+    def fake_build_telegram_client(
+        self: admin_telegram_login_module.AdminTelegramLoginService,
+        string_session: SecretStr | None = None,
+    ) -> _FakeTelegramLoginClient:
+        _ = self, string_session
         client = _FakeTelegramLoginClient(
             qr_wait_event=wait_event,
-            qr_expires_at=datetime.now(UTC) + timedelta(milliseconds=50),
+            qr_expires_at=clock.now + timedelta(minutes=1),
+            disconnect_started=disconnect_started,
+            disconnect_release=disconnect_release,
         )
         fake_clients.append(client)
         return client
@@ -2984,24 +3323,46 @@ async def test_admin_telegram_active_qr_poll_crossing_expiry_returns_controlled_
         "_build_telegram_client",
         fake_build_telegram_client,
     )
-    monkeypatch.setattr(admin_telegram_login_module, "QR_LOGIN_POLL_TIMEOUT_SECONDS", 2.0)
+    poll_wait_started = _observe_qr_poll_wait(monkeypatch)
     transport = ASGITransport(app=auth_app)
     async with AsyncClient(transport=transport, base_url="https://testserver") as admin_client:
         admin_client.cookies.set(ACCESS_COOKIE_NAME, admin_token)
         create_response = await admin_client.post("/api/v1/admin/telegram/sessions", json={})
         session_id = create_response.json()["id"]
         qr_start = await admin_client.post(f"/api/v1/admin/telegram/sessions/{session_id}/login/qr/start")
-        active_poll = await asyncio.wait_for(
+        attempt_id = UUID(qr_start.json()["attempt_id"])
+        live_attempt = admin_telegram_login_module._LIVE_LOGIN_ATTEMPTS[attempt_id]  # noqa: SLF001
+        poll_finished = asyncio.Event()
+        active_poll_task = asyncio.create_task(
             admin_client.post(
                 f"/api/v1/admin/telegram/sessions/{session_id}/login/qr/complete",
-                json={"attempt_id": qr_start.json()["attempt_id"]},
+                json={"attempt_id": str(attempt_id)},
             ),
-            timeout=0.5,
         )
+        active_poll_task.add_done_callback(lambda _task: poll_finished.set())
+        await asyncio.wait_for(poll_wait_started.wait(), timeout=5)
 
-    assert active_poll.status_code == 409
-    assert active_poll.json()["detail"] == "QR login attempt expired or was replaced. Start a new QR login."
+        clock.advance(timedelta(minutes=2))
+        assert scheduler.fire_due(clock.now) == [scheduler.handles[0]]
+        retirement_task = live_attempt.retirement_task
+        assert retirement_task is not None
+        await asyncio.wait_for(disconnect_started.wait(), timeout=5)
+        await asyncio.wait_for(poll_finished.wait(), timeout=5)
+
+        assert disconnect_release.is_set() is False
+        assert retirement_task.done() is False
+        assert admin_telegram_login_module._LIVE_LOGIN_ATTEMPTS.get(attempt_id) is live_attempt  # noqa: SLF001
+        assert fake_clients[0].disconnected is False
+        active_poll = await active_poll_task
+        assert active_poll.status_code == 409
+        assert active_poll.json()["detail"] == "QR login attempt expired or was replaced. Start a new QR login."
+
+        disconnect_release.set()
+        await retirement_task
+
     assert fake_clients[0].disconnected is True
+    assert fake_clients[0].disconnect_calls == 1
+    assert attempt_id not in admin_telegram_login_module._LIVE_LOGIN_ATTEMPTS  # noqa: SLF001
 
 
 async def test_admin_telegram_qr_login_uses_earlier_token_expiry_for_response_and_wait(
@@ -3010,13 +3371,15 @@ async def test_admin_telegram_qr_login_uses_earlier_token_expiry_for_response_an
     postgres_session_factory: async_sessionmaker[AsyncSession],
     monkeypatch,
 ) -> None:
+    clock, _scheduler = _install_manual_qr_time(monkeypatch)
     admin_token = await _issue_user_cookie(
         postgres_session_factory,
         auth_settings_overrides,
         email="admin-telegram-qr-expiry@example.com",
         is_admin=True,
     )
-    token_expires_at = datetime.now(UTC) + timedelta(seconds=30)
+    token_expires_at = clock.now + timedelta(seconds=30)
+    wait_event = asyncio.Event()
     fake_clients: list[_FakeTelegramLoginClient] = []
 
     def fake_build_telegram_client(
@@ -3024,7 +3387,7 @@ async def test_admin_telegram_qr_login_uses_earlier_token_expiry_for_response_an
         string_session: SecretStr | None = None,
     ) -> _FakeTelegramLoginClient:
         _ = self, string_session
-        client = _FakeTelegramLoginClient(qr_expires_at=token_expires_at)
+        client = _FakeTelegramLoginClient(qr_wait_event=wait_event, qr_expires_at=token_expires_at)
         fake_clients.append(client)
         return client
 
@@ -3041,18 +3404,11 @@ async def test_admin_telegram_qr_login_uses_earlier_token_expiry_for_response_an
         qr_start_response = await admin_client.post(f"/api/v1/admin/telegram/sessions/{session_id}/login/qr/start")
 
     assert qr_start_response.status_code == 200
-    attempt_id = UUID(qr_start_response.json()["attempt_id"])
     returned_expiry = datetime.fromisoformat(qr_start_response.json()["expires_at"])
-    assert abs((returned_expiry - token_expires_at).total_seconds()) < 0.01
+    assert returned_expiry == token_expires_at
     assert fake_clients[0].qr_login_instance is not None
-    await asyncio.wait_for(fake_clients[0].qr_login_instance.wait_started.wait(), timeout=1)
-    assert fake_clients[0].qr_login_instance.wait_timeout is not None
-    assert (
-        0
-        < fake_clients[0].qr_login_instance.wait_timeout
-        < admin_telegram_login_module.LOGIN_ATTEMPT_TTL.total_seconds()
-    )
-    await _cleanup_live_qr_test_attempt(attempt_id)
+    await asyncio.wait_for(fake_clients[0].qr_login_instance.wait_started.wait(), timeout=5)
+    assert fake_clients[0].qr_login_instance.wait_timeout == 30.0
 
 
 async def test_admin_telegram_qr_login_expiry_cleanup_releases_abandoned_client(
@@ -3061,6 +3417,7 @@ async def test_admin_telegram_qr_login_expiry_cleanup_releases_abandoned_client(
     postgres_session_factory: async_sessionmaker[AsyncSession],
     monkeypatch,
 ) -> None:
+    clock, scheduler = _install_manual_qr_time(monkeypatch)
     admin_token = await _issue_user_cookie(
         postgres_session_factory,
         auth_settings_overrides,
@@ -3077,7 +3434,7 @@ async def test_admin_telegram_qr_login_expiry_cleanup_releases_abandoned_client(
         _ = self, string_session
         client = _FakeTelegramLoginClient(
             qr_wait_event=wait_event,
-            qr_expires_at=datetime.now(UTC) + timedelta(milliseconds=50),
+            qr_expires_at=clock.now + timedelta(minutes=1),
         )
         fake_clients.append(client)
         return client
@@ -3096,8 +3453,13 @@ async def test_admin_telegram_qr_login_expiry_cleanup_releases_abandoned_client(
 
     attempt_id = UUID(qr_start_response.json()["attempt_id"])
     assert fake_clients[0].qr_login_instance is not None
-    await asyncio.wait_for(fake_clients[0].qr_login_instance.wait_started.wait(), timeout=1)
-    await asyncio.sleep(0.15)
+    await asyncio.wait_for(fake_clients[0].qr_login_instance.wait_started.wait(), timeout=5)
+    live_attempt = admin_telegram_login_module._LIVE_LOGIN_ATTEMPTS[attempt_id]  # noqa: SLF001
+    clock.advance(timedelta(minutes=2))
+    assert scheduler.fire_due(clock.now) == [scheduler.handles[0]]
+    retirement_task = live_attempt.retirement_task
+    assert retirement_task is not None
+    await retirement_task
     assert attempt_id not in admin_telegram_login_module._LIVE_LOGIN_ATTEMPTS  # noqa: SLF001
     assert fake_clients[0].disconnected is True
 
@@ -3108,6 +3470,7 @@ async def test_admin_telegram_qr_login_completion_cancels_expiry_cleanup(
     postgres_session_factory: async_sessionmaker[AsyncSession],
     monkeypatch,
 ) -> None:
+    clock, scheduler = _install_manual_qr_time(monkeypatch)
     admin_token = await _issue_user_cookie(
         postgres_session_factory,
         auth_settings_overrides,
@@ -3121,7 +3484,7 @@ async def test_admin_telegram_qr_login_completion_cancels_expiry_cleanup(
         string_session: SecretStr | None = None,
     ) -> _FakeTelegramLoginClient:
         _ = self, string_session
-        client = _FakeTelegramLoginClient(qr_expires_at=datetime.now(UTC) + timedelta(milliseconds=100))
+        client = _FakeTelegramLoginClient(qr_expires_at=clock.now + timedelta(minutes=1))
         fake_clients.append(client)
         return client
 
@@ -3145,8 +3508,12 @@ async def test_admin_telegram_qr_login_completion_cancels_expiry_cleanup(
     assert qr_complete_response.status_code == 200
     assert qr_complete_response.json()["status"] == "completed"
     assert attempt_id not in admin_telegram_login_module._LIVE_LOGIN_ATTEMPTS  # noqa: SLF001
-    await asyncio.sleep(0.15)
     assert fake_clients[0].disconnected is True
+    assert fake_clients[0].disconnect_calls == 1
+    assert all(handle.cancelled() for handle in scheduler.handles)
+    clock.advance(admin_telegram_login_module.LOGIN_ATTEMPT_TTL + timedelta(minutes=2))
+    assert scheduler.fire_due(clock.now) == []
+    assert fake_clients[0].disconnect_calls == 1
 
 
 async def test_admin_telegram_qr_finalization_cancellation_retires_client_after_blocked_disconnect(
@@ -3155,6 +3522,7 @@ async def test_admin_telegram_qr_finalization_cancellation_retires_client_after_
     postgres_session_factory: async_sessionmaker[AsyncSession],
     monkeypatch,
 ) -> None:
+    _clock, _scheduler = _install_manual_qr_time(monkeypatch)
     admin_token = await _issue_user_cookie(
         postgres_session_factory,
         auth_settings_overrides,
@@ -3190,8 +3558,6 @@ async def test_admin_telegram_qr_finalization_cancellation_retires_client_after_
         qr_start_response = await admin_client.post(f"/api/v1/admin/telegram/sessions/{session_id}/login/qr/start")
         attempt_id = UUID(qr_start_response.json()["attempt_id"])
         live_attempt = admin_telegram_login_module._LIVE_LOGIN_ATTEMPTS[attempt_id]  # noqa: SLF001
-        cleanup_handle = live_attempt.qr_expiry_cleanup_handle
-        assert cleanup_handle is not None
 
         completion_task = asyncio.create_task(
             admin_client.post(
@@ -3199,7 +3565,11 @@ async def test_admin_telegram_qr_finalization_cancellation_retires_client_after_
                 json={"attempt_id": str(attempt_id)},
             ),
         )
-        await asyncio.wait_for(disconnect_started.wait(), timeout=1)
+        await asyncio.wait_for(disconnect_started.wait(), timeout=5)
+        cleanup_handle = live_attempt.qr_expiry_cleanup_handle
+        retirement_task = live_attempt.retirement_task
+        assert cleanup_handle is not None
+        assert retirement_task is not None
         completion_task.cancel()
         with suppress(asyncio.CancelledError):
             await completion_task
@@ -3209,29 +3579,35 @@ async def test_admin_telegram_qr_finalization_cancellation_retires_client_after_
         assert cleanup_handle.cancelled() is False
 
         disconnect_release.set()
-        await asyncio.wait_for(fake_clients[0].disconnect_finished.wait(), timeout=1)
-        await asyncio.sleep(0)
+        await retirement_task
 
     assert fake_clients[0].disconnected is True
+    assert fake_clients[0].disconnect_finished.is_set()
     assert fake_clients[0].disconnect_calls == 1
     assert attempt_id not in admin_telegram_login_module._LIVE_LOGIN_ATTEMPTS  # noqa: SLF001
     assert live_attempt.qr_expiry_cleanup_handle is None
     assert cleanup_handle.cancelled() is True
 
 
-async def test_admin_telegram_qr_password_can_finish_after_token_expiry_with_fresh_completion_deadline(
+@pytest.mark.parametrize("require_password", [False, True], ids=["success", "password-required"])
+async def test_admin_telegram_qr_accepted_wait_survives_expiry_before_done_callback(
     auth_app: FastAPI,
     auth_settings_overrides: dict[str, str],
     postgres_session_factory: async_sessionmaker[AsyncSession],
     monkeypatch,
+    *,
+    require_password: bool,
 ) -> None:
+    clock, scheduler = _install_manual_qr_time(monkeypatch)
     admin_token = await _issue_user_cookie(
         postgres_session_factory,
         auth_settings_overrides,
-        email="admin-telegram-qr-password-after-token-expiry@example.com",
+        email=f"admin-telegram-qr-expiry-race-{require_password}@example.com",
         is_admin=True,
     )
-    token_expires_at = datetime.now(UTC) + timedelta(milliseconds=50)
+    token_expires_at = clock.now + timedelta(minutes=1)
+    qr_wait_event = asyncio.Event()
+    done_callback_started = asyncio.Event()
     fake_clients: list[_FakeTelegramLoginClient] = []
 
     def fake_build_telegram_client(
@@ -3239,7 +3615,11 @@ async def test_admin_telegram_qr_password_can_finish_after_token_expiry_with_fre
         string_session: SecretStr | None = None,
     ) -> _FakeTelegramLoginClient:
         _ = self, string_session
-        client = _FakeTelegramLoginClient(require_password=True, qr_expires_at=token_expires_at)
+        client = _FakeTelegramLoginClient(
+            require_password=require_password,
+            qr_wait_event=qr_wait_event,
+            qr_expires_at=token_expires_at,
+        )
         fake_clients.append(client)
         return client
 
@@ -3248,44 +3628,104 @@ async def test_admin_telegram_qr_password_can_finish_after_token_expiry_with_fre
         "_build_telegram_client",
         fake_build_telegram_client,
     )
+    poll_wait_started = _observe_qr_poll_wait(monkeypatch)
+    original_wait_finished = admin_telegram_login_module.AdminTelegramLoginService._qr_wait_finished  # noqa: SLF001
+
+    def observed_wait_finished(
+        service: admin_telegram_login_module.AdminTelegramLoginService,
+        attempt_id: UUID,
+        live_attempt: admin_telegram_login_module._LiveLoginAttempt,  # noqa: SLF001
+        task: asyncio.Task[object],
+    ) -> None:
+        done_callback_started.set()
+        original_wait_finished(service, attempt_id, live_attempt, task)
+
+    monkeypatch.setattr(
+        admin_telegram_login_module.AdminTelegramLoginService,
+        "_qr_wait_finished",
+        observed_wait_finished,
+    )
     transport = ASGITransport(app=auth_app)
     async with AsyncClient(transport=transport, base_url="https://testserver") as admin_client:
         admin_client.cookies.set(ACCESS_COOKIE_NAME, admin_token)
         create_response = await admin_client.post("/api/v1/admin/telegram/sessions", json={})
         session_id = create_response.json()["id"]
         qr_start = await admin_client.post(f"/api/v1/admin/telegram/sessions/{session_id}/login/qr/start")
-        attempt_id = qr_start.json()["attempt_id"]
-        await asyncio.sleep(0.1)
-        assert fake_clients[0].disconnected is False
-        password_required = await admin_client.post(
-            f"/api/v1/admin/telegram/sessions/{session_id}/login/qr/complete",
-            json={"attempt_id": attempt_id},
-        )
-        password_complete = await admin_client.post(
-            f"/api/v1/admin/telegram/sessions/{session_id}/login/phone/password",
-            json={"attempt_id": attempt_id, "password": "correct-password"},
-        )
+        attempt_id = UUID(qr_start.json()["attempt_id"])
+        assert fake_clients[0].qr_login_instance is not None
+        await asyncio.wait_for(fake_clients[0].qr_login_instance.wait_started.wait(), timeout=5)
+        live_attempt = admin_telegram_login_module._LIVE_LOGIN_ATTEMPTS[attempt_id]  # noqa: SLF001
+        qr_wait_task = live_attempt.qr_wait_task
+        assert qr_wait_task is not None
+        assert qr_wait_task.done() is False
+        token_cleanup_handle = scheduler.handles[0]
 
-    assert password_required.status_code == 200
-    assert password_required.json()["status"] == "password_required"
-    assert password_complete.status_code == 200
+        qr_complete_task = asyncio.create_task(
+            admin_client.post(
+                f"/api/v1/admin/telegram/sessions/{session_id}/login/qr/complete",
+                json={"attempt_id": str(attempt_id)},
+            ),
+        )
+        await asyncio.wait_for(poll_wait_started.wait(), timeout=5)
+
+        clock.advance(timedelta(minutes=2))
+        expiry_callback_ran = asyncio.Event()
+        race_observations: list[tuple[bool, bool, bool]] = []
+
+        def fire_token_expiry() -> None:
+            race_observations.append(
+                (
+                    qr_wait_task.done(),
+                    done_callback_started.is_set(),
+                    token_cleanup_handle.fire(),
+                ),
+            )
+            expiry_callback_ran.set()
+
+        qr_wait_event.set()
+        asyncio.get_running_loop().call_soon(fire_token_expiry)
+        await asyncio.wait_for(expiry_callback_ran.wait(), timeout=5)
+
+        assert race_observations == [(True, False, True)]
+        assert admin_telegram_login_module._LIVE_LOGIN_ATTEMPTS.get(attempt_id) is live_attempt  # noqa: SLF001
+        assert fake_clients[0].disconnected is False
+        assert token_cleanup_handle.cancelled() is True
+        completion_expires_at = live_attempt.qr_completion_expires_at
+        assert completion_expires_at == clock.now + admin_telegram_login_module.LOGIN_ATTEMPT_TTL
+
+        qr_complete = await qr_complete_task
+        assert qr_complete.status_code == 200
+        if require_password:
+            assert qr_complete.json()["status"] == "password_required"
+            assert fake_clients[0].disconnected is False
+            password_complete = await admin_client.post(
+                f"/api/v1/admin/telegram/sessions/{session_id}/login/phone/password",
+                json={"attempt_id": str(attempt_id), "password": "correct-password"},
+            )
+            assert password_complete.status_code == 200
+        else:
+            assert qr_complete.json()["status"] == "completed"
+
     async with postgres_session_factory() as session:
-        attempt = await session.get(TelegramSessionLoginAttempt, UUID(attempt_id))
+        attempt = await session.get(TelegramSessionLoginAttempt, attempt_id)
     assert attempt is not None
     assert attempt.status == "completed"
+    assert attempt.expires_at == completion_expires_at
     assert attempt.expires_at > token_expires_at
+    assert fake_clients[0].disconnected is True
 
 
-async def test_admin_telegram_qr_success_survives_token_expiry_during_delayed_finalization(
+async def test_admin_telegram_qr_promoted_deadline_retires_abandoned_password_client(
     auth_app: FastAPI,
     auth_settings_overrides: dict[str, str],
     postgres_session_factory: async_sessionmaker[AsyncSession],
     monkeypatch,
 ) -> None:
+    clock, scheduler = _install_manual_qr_time(monkeypatch)
     admin_token = await _issue_user_cookie(
         postgres_session_factory,
         auth_settings_overrides,
-        email="admin-telegram-qr-delayed-finalization@example.com",
+        email="admin-telegram-qr-promoted-expiry@example.com",
         is_admin=True,
     )
     fake_clients: list[_FakeTelegramLoginClient] = []
@@ -3296,8 +3736,8 @@ async def test_admin_telegram_qr_success_survives_token_expiry_during_delayed_fi
     ) -> _FakeTelegramLoginClient:
         _ = self, string_session
         client = _FakeTelegramLoginClient(
-            qr_expires_at=datetime.now(UTC) + timedelta(milliseconds=50),
-            get_me_delay=0.1,
+            require_password=True,
+            qr_expires_at=clock.now + timedelta(minutes=1),
         )
         fake_clients.append(client)
         return client
@@ -3313,10 +3753,94 @@ async def test_admin_telegram_qr_success_survives_token_expiry_during_delayed_fi
         create_response = await admin_client.post("/api/v1/admin/telegram/sessions", json={})
         session_id = create_response.json()["id"]
         qr_start = await admin_client.post(f"/api/v1/admin/telegram/sessions/{session_id}/login/qr/start")
+        attempt_id = UUID(qr_start.json()["attempt_id"])
+        token_cleanup_handle = scheduler.handles[0]
         qr_complete = await admin_client.post(
             f"/api/v1/admin/telegram/sessions/{session_id}/login/qr/complete",
-            json={"attempt_id": qr_start.json()["attempt_id"]},
+            json={"attempt_id": str(attempt_id)},
         )
+
+    assert qr_complete.status_code == 200
+    assert qr_complete.json()["status"] == "password_required"
+    live_attempt = admin_telegram_login_module._LIVE_LOGIN_ATTEMPTS[attempt_id]  # noqa: SLF001
+    completion_cleanup_handle = scheduler.handles[-1]
+    assert completion_cleanup_handle is not token_cleanup_handle
+    assert token_cleanup_handle.cancelled() is True
+    assert completion_cleanup_handle.cancelled() is False
+
+    assert token_cleanup_handle.fire(even_if_cancelled=True) is True
+    assert fake_clients[0].disconnected is False
+    assert admin_telegram_login_module._LIVE_LOGIN_ATTEMPTS.get(attempt_id) is live_attempt  # noqa: SLF001
+
+    clock.advance(admin_telegram_login_module.LOGIN_ATTEMPT_TTL + timedelta(seconds=1))
+    assert scheduler.fire_due(clock.now) == [completion_cleanup_handle]
+    retirement_task = live_attempt.retirement_task
+    assert retirement_task is not None
+    await retirement_task
+
+    assert attempt_id not in admin_telegram_login_module._LIVE_LOGIN_ATTEMPTS  # noqa: SLF001
+    assert fake_clients[0].disconnected is True
+
+
+async def test_admin_telegram_qr_success_survives_token_expiry_during_delayed_finalization(
+    auth_app: FastAPI,
+    auth_settings_overrides: dict[str, str],
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch,
+) -> None:
+    clock, scheduler = _install_manual_qr_time(monkeypatch)
+    admin_token = await _issue_user_cookie(
+        postgres_session_factory,
+        auth_settings_overrides,
+        email="admin-telegram-qr-delayed-finalization@example.com",
+        is_admin=True,
+    )
+    get_me_started = asyncio.Event()
+    get_me_release = asyncio.Event()
+    fake_clients: list[_FakeTelegramLoginClient] = []
+
+    def fake_build_telegram_client(
+        self: admin_telegram_login_module.AdminTelegramLoginService,
+        string_session: SecretStr | None = None,
+    ) -> _FakeTelegramLoginClient:
+        _ = self, string_session
+        client = _FakeTelegramLoginClient(
+            qr_expires_at=clock.now + timedelta(minutes=1),
+            get_me_started=get_me_started,
+            get_me_release=get_me_release,
+        )
+        fake_clients.append(client)
+        return client
+
+    monkeypatch.setattr(
+        admin_telegram_login_module.AdminTelegramLoginService,
+        "_build_telegram_client",
+        fake_build_telegram_client,
+    )
+    transport = ASGITransport(app=auth_app)
+    async with AsyncClient(transport=transport, base_url="https://testserver") as admin_client:
+        admin_client.cookies.set(ACCESS_COOKIE_NAME, admin_token)
+        create_response = await admin_client.post("/api/v1/admin/telegram/sessions", json={})
+        session_id = create_response.json()["id"]
+        qr_start = await admin_client.post(f"/api/v1/admin/telegram/sessions/{session_id}/login/qr/start")
+        attempt_id = UUID(qr_start.json()["attempt_id"])
+        live_attempt = admin_telegram_login_module._LIVE_LOGIN_ATTEMPTS[attempt_id]  # noqa: SLF001
+        qr_complete_task = asyncio.create_task(
+            admin_client.post(
+                f"/api/v1/admin/telegram/sessions/{session_id}/login/qr/complete",
+                json={"attempt_id": str(attempt_id)},
+            ),
+        )
+        await asyncio.wait_for(get_me_started.wait(), timeout=5)
+
+        assert live_attempt.qr_completion_expires_at == clock.now + admin_telegram_login_module.LOGIN_ATTEMPT_TTL
+        clock.advance(timedelta(minutes=2))
+        assert scheduler.fire_due(clock.now) == []
+        assert qr_complete_task.done() is False
+        assert fake_clients[0].disconnected is False
+
+        get_me_release.set()
+        qr_complete = await qr_complete_task
 
     assert qr_complete.status_code == 200
     assert qr_complete.json()["status"] == "completed"
@@ -3330,13 +3854,15 @@ async def test_admin_telegram_qr_expiry_cleanup_cannot_remove_a_replacement_atte
     postgres_session_factory: async_sessionmaker[AsyncSession],
     monkeypatch,
 ) -> None:
+    clock, scheduler = _install_manual_qr_time(monkeypatch)
     admin_token = await _issue_user_cookie(
         postgres_session_factory,
         auth_settings_overrides,
         email="admin-telegram-qr-replacement@example.com",
         is_admin=True,
     )
-    expiries = [datetime.now(UTC) + timedelta(milliseconds=50), datetime.now(UTC) + timedelta(seconds=1)]
+    expiries = [clock.now + timedelta(minutes=1), clock.now + timedelta(minutes=5)]
+    wait_events = [asyncio.Event(), asyncio.Event()]
     fake_clients: list[_FakeTelegramLoginClient] = []
 
     def fake_build_telegram_client(
@@ -3344,7 +3870,10 @@ async def test_admin_telegram_qr_expiry_cleanup_cannot_remove_a_replacement_atte
         string_session: SecretStr | None = None,
     ) -> _FakeTelegramLoginClient:
         _ = self, string_session
-        client = _FakeTelegramLoginClient(qr_expires_at=expiries.pop(0))
+        client = _FakeTelegramLoginClient(
+            qr_wait_event=wait_events[len(fake_clients)],
+            qr_expires_at=expiries[len(fake_clients)],
+        )
         fake_clients.append(client)
         return client
 
@@ -3359,15 +3888,21 @@ async def test_admin_telegram_qr_expiry_cleanup_cannot_remove_a_replacement_atte
         create_response = await admin_client.post("/api/v1/admin/telegram/sessions", json={})
         session_id = create_response.json()["id"]
         first_start_response = await admin_client.post(f"/api/v1/admin/telegram/sessions/{session_id}/login/qr/start")
+        first_attempt_id = UUID(first_start_response.json()["attempt_id"])
+        first_live_attempt = admin_telegram_login_module._LIVE_LOGIN_ATTEMPTS[first_attempt_id]  # noqa: SLF001
+        first_cleanup_handle = scheduler.handles[0]
         second_start_response = await admin_client.post(f"/api/v1/admin/telegram/sessions/{session_id}/login/qr/start")
 
     second_attempt_id = UUID(second_start_response.json()["attempt_id"])
     assert first_start_response.status_code == 200
     assert second_start_response.status_code == 200
-    await asyncio.sleep(0.15)
+    assert first_cleanup_handle.cancelled() is True
+    assert first_live_attempt.retirement_task is None
+    assert first_cleanup_handle.fire(even_if_cancelled=True) is True
+    assert first_attempt_id not in admin_telegram_login_module._LIVE_LOGIN_ATTEMPTS  # noqa: SLF001
+    assert fake_clients[0].disconnected is True
     assert admin_telegram_login_module._LIVE_LOGIN_ATTEMPTS.get(second_attempt_id) is not None  # noqa: SLF001
     assert fake_clients[1].disconnected is False
-    await _cleanup_live_qr_test_attempt(second_attempt_id)
 
 
 async def test_admin_telegram_qr_cleanup_callback_is_exact_object_race_safe(
@@ -3378,17 +3913,16 @@ async def test_admin_telegram_qr_cleanup_callback_is_exact_object_race_safe(
     replacement_client = _FakeTelegramLoginClient()
     old_attempt = admin_telegram_login_module._LiveLoginAttempt(client=old_client)  # noqa: SLF001
     replacement_attempt = admin_telegram_login_module._LiveLoginAttempt(client=replacement_client)  # noqa: SLF001
+    old_attempt.qr_expiry_cleanup_generation = 1
 
     async with postgres_session_factory() as session:
         service = admin_telegram_login_module.AdminTelegramLoginService(session)
         admin_telegram_login_module._LIVE_LOGIN_ATTEMPTS[attempt_id] = replacement_attempt  # noqa: SLF001
-        service._cleanup_expired_qr_attempt(attempt_id, old_attempt)  # noqa: SLF001
-        await asyncio.sleep(0)
+        service._cleanup_expired_qr_attempt(attempt_id, old_attempt, 1)  # noqa: SLF001
 
     assert admin_telegram_login_module._LIVE_LOGIN_ATTEMPTS.get(attempt_id) is replacement_attempt  # noqa: SLF001
     assert old_client.disconnected is False
     assert replacement_client.disconnected is False
-    await _cleanup_live_qr_test_attempt(attempt_id)
 
 
 async def test_admin_telegram_qr_login_supports_2fa_password_without_leaking_secret(
