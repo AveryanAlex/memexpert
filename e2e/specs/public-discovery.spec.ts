@@ -61,7 +61,7 @@ test('guest opens an attributed search result and exercises detail actions', asy
   await app.detail.expectOpen(cat);
   await app.detail.expectAttributionQuery(attribution);
 
-  await app.detail.likeAndExpectAttribution(cat, attribution);
+  await app.detail.favoriteAndExpectAttribution(cat, attribution);
   await app.detail.saveAndExpectAttribution(cat, attribution);
   await app.detail.downloadAndExpectAttribution(cat, attribution);
   await app.detail.shareToTelegramAndExpectAttribution(cat, attribution);
@@ -72,26 +72,28 @@ test('guest explores seeded public trend aggregates, comparison, and timeline', 
   const representative = seededByCategory(seed, trends.representative_meme.category);
 
   await page.goto(trends.trend_path);
-  await expect(page.getByRole('heading', { name: 'Public meme trends.' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Meme trends', exact: true })).toBeVisible();
+  await expect(page.getByText(/Recorded activity adds original-source views/)).toBeVisible();
   await expect(page.getByRole('link', { name: `Open ${representative.title}` }).first()).toBeVisible();
   await expect(page.getByRole('link', { name: new RegExp(escapeRegExp(trends.tag.title)) })).toBeVisible();
   await expect(page.getByRole('link', { name: new RegExp(escapeRegExp(trends.template.title)) })).toBeVisible();
-  await expect(page.getByText(`${trends.tag.history_points.length} history points`).first()).toBeVisible();
 
   await expectAggregateLanding(page, trends.tag, 'Tag');
   await expectAggregateLanding(page, trends.template, 'Template');
 
   await page.goto(trends.compare.path);
-  await expect(page.getByRole('heading', { name: 'Compare public trends.' })).toBeVisible();
-  await expect(page.locator('figcaption').getByText('Trend comparison line chart', { exact: true })).toBeVisible();
-  await expect(page.getByRole('heading', { name: 'Data table' })).toBeVisible();
-  const comparisonTable = page.getByRole('table');
+  await expect(page.getByRole('heading', { name: 'Compare what is catching on.', exact: true })).toBeVisible();
+  await expect(page.locator('figcaption').getByText('Recorded activity comparison', { exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'How they compare', exact: true })).toBeVisible();
+  await expect(
+    page.getByLabel('Selected items').getByText(`Meme · ${representative.title}`, { exact: true })
+  ).toBeVisible();
+  await expect(page.getByText('Some picks will join the chart once they have two recorded activity moments.', { exact: true })).toHaveCount(0);
+  const comparisonTable = page.getByRole('table', { name: 'Recorded activity details for the comparison' });
   await expect(comparisonTable).toBeVisible();
-  await expectComparisonRow(comparisonTable, representative.title, 'meme', 'Per-meme engagement points', 'Real per-meme engagement history.');
-  await expectComparisonRow(comparisonTable, trends.tag.title, 'tag', 'Aggregate history points', 'Real aggregate history points.');
-  await expectComparisonRow(comparisonTable, trends.template.title, 'template', 'Aggregate history points', 'Real aggregate history points.');
-  await expect(page.getByText('Current-window aggregate fallback')).toHaveCount(0);
-  await expect(page.getByText('No comparable history yet')).toHaveCount(0);
+  await expectComparisonSeries(comparisonTable, representative.title, 'Meme');
+  await expectComparisonSeries(comparisonTable, trends.tag.title, 'Tag');
+  await expectComparisonSeries(comparisonTable, trends.template.title, 'Template');
 
   await page.goto(trends.timeline.path);
   await expect(page.getByRole('heading', { name: 'Meme timeline.' })).toBeVisible();
@@ -101,8 +103,8 @@ test('guest explores seeded public trend aggregates, comparison, and timeline', 
     .filter({ has: page.getByRole('heading', { name: trends.timeline.period_label }) });
   await expect(timelinePeriod).toHaveCount(1);
   await expect(timelinePeriod.getByRole('heading', { name: trends.timeline.period_label })).toBeVisible();
-  await expect(timelinePeriod.getByText(new RegExp(`\\b${trends.timeline.snapshot_count} source checks\\b`))).toBeVisible();
-  await expect(timelinePeriod.getByText(trends.timeline.period, { exact: true })).toBeVisible();
+  await expect(timelinePeriod.getByText(/top memes? to revisit/)).toBeVisible();
+  await expect(timelinePeriod.getByText(/Recorded activity · .* signals/).first()).toBeVisible();
   await expect(page.getByRole('link', { name: `Open ${representative.title}` }).first()).toBeVisible();
 });
 
@@ -147,32 +149,50 @@ async function expectAggregateLanding(
 
   await page.goto(landing.path);
   await expect(page.getByRole('heading', { name: landing.title })).toBeVisible();
-  await expect(page.getByLabel(`${label} trend summary`)).toBeVisible();
-  await expect(page.getByText(`${firstHistoryPoint.meme_count} public memes in this aggregate.`)).toBeVisible();
-  await expect(page.getByText('Exact values are listed in the table below.')).toBeVisible();
-  await expect(page.getByText('Aggregate history unavailable')).toHaveCount(0);
-  await expect(page.getByText('Insufficient aggregate history')).toHaveCount(0);
+  await page.getByText(`About this ${label.toLowerCase()}`, { exact: true }).click();
+  await expect(page.getByLabel(`${label} popularity summary`)).toBeVisible();
+  await expect(page.getByText(`${firstHistoryPoint.meme_count} memes help shape this ${label.toLowerCase()}'s recent popularity.`)).toBeVisible();
+  await expect(page.getByRole('region', { name: `${landing.title} recorded activity over time` })).toBeVisible();
 
-  const table = page.getByRole('table', { name: `Exact aggregate history values for ${landing.title}` });
+  const table = page.getByRole('table', { name: `Recorded activity details for ${landing.title}` });
   await expect(table).toBeVisible();
   for (const point of landing.history_points) {
-    await expect(table.getByText(formatObservedAt(point.observed_at))).toBeVisible();
-    await expect(table.getByText(point.value.toFixed(1), { exact: true })).toBeVisible();
-    await expect(table.getByText(String(point.source_views), { exact: true })).toBeVisible();
+    const row = table.getByRole('row').filter({ hasText: formatObservedAt(point.observed_at) });
+    await expect(row).toHaveCount(1);
+    const cells = row.getByRole('cell');
+    await expect(cells.nth(0)).toHaveText(formatCount(recordedActivity(point)));
+    await expect(cells.nth(1)).toHaveText(formatCount(sourceActivity(point)));
+    await expect(cells.nth(2)).toHaveText(formatCount(memeExpertActivity(point)));
+    await expect(cells.nth(3)).toHaveText(formatCount(point.meme_count));
   }
 }
 
-async function expectComparisonRow(table: Locator, title: string, kind: string, basis: string, status: string) {
-  const row = table.getByRole('row').filter({ hasText: title });
-  await expect(row).toHaveCount(1);
-  await expect(row).toBeVisible();
-  await expect(row.getByRole('cell', { name: kind, exact: true })).toBeVisible();
-  await expect(row.getByRole('cell', { name: basis, exact: true })).toBeVisible();
-  await expect(row.getByRole('cell', { name: status, exact: true })).toBeVisible();
+async function expectComparisonSeries(table: Locator, title: string, kind: 'Meme' | 'Tag' | 'Template') {
+  const rows = table.getByRole('row').filter({ hasText: title });
+  await expect.poll(() => rows.count()).toBeGreaterThan(0);
+  const cells = rows.first().getByRole('cell');
+  await expect(cells.nth(0)).toHaveText(kind);
+  await expect(cells.nth(2)).toContainText('signals');
 }
 
 function formatObservedAt(raw: string): string {
-  return new Intl.DateTimeFormat('en', { month: 'short', day: 'numeric', year: 'numeric' }).format(new Date(raw));
+  return new Intl.DateTimeFormat('en', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' }).format(new Date(raw));
+}
+
+function recordedActivity(point: SeededPublicTrendsFixture['tag']['history_points'][number]): number {
+  return sourceActivity(point) + memeExpertActivity(point);
+}
+
+function sourceActivity(point: SeededPublicTrendsFixture['tag']['history_points'][number]): number {
+  return point.source_views + point.source_reactions + point.source_reposts;
+}
+
+function memeExpertActivity(point: SeededPublicTrendsFixture['tag']['history_points'][number]): number {
+  return point.platform_views + point.platform_sends + point.platform_saves + point.platform_likes;
+}
+
+function formatCount(value: number): string {
+  return new Intl.NumberFormat('en').format(value);
 }
 
 function escapeRegExp(value: string): string {

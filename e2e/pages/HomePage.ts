@@ -14,16 +14,10 @@ export class HomePage {
     await searchInput.press('Enter');
   }
 
-  async expectGuestCollectionCreationUnavailable() {
-    await this.page.getByText('Connect Telegram to create custom collections and collaborate.').waitFor();
-    await this.page.getByRole('button', { name: 'Create collection' }).waitFor({ state: 'detached' });
-  }
-
   async expectGuestHomeFeedFallback(seededMemes: SeededMeme[]) {
-    await expect(this.page.getByText('Trending for guests')).toBeVisible();
-    await expect(
-      this.page.getByText('A cold-start feed from public activity while this guest session has little history.')
-    ).toBeVisible();
+    await expect(this.page.getByRole('heading', { name: 'Discover', exact: true })).toBeVisible();
+    await expect(this.page.getByText('Fresh memes, ready to send.', { exact: true })).toBeVisible();
+    await expect(this.page.getByText('Discover more', { exact: true })).toBeVisible();
     await expect(this.page.getByText('No home feed memes yet')).toHaveCount(0);
 
     const publicSeededMemes = seededMemes.filter((meme) => !meme.is_nsfw);

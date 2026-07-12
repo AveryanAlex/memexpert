@@ -1,5 +1,4 @@
 import { expect, type Page } from '@playwright/test';
-import type { SeededCollectionManagementFixture } from '../helpers/seed';
 
 export class ProfilePage {
   constructor(private page: Page) {}
@@ -9,55 +8,29 @@ export class ProfilePage {
   }
 
   async expectNsfwEnabled() {
-    await expect(this.page.getByText('NSFW search is enabled.')).toBeVisible();
-    await expect(this.page.getByText('Search can include NSFW memes')).toBeVisible();
+    await expect(this.page.getByText('Sensitive content is enabled.', { exact: true })).toBeVisible();
+    await expect(this.page.getByText('Turn it off to filter sensitive memes from discovery again.', { exact: true })).toBeVisible();
   }
 
   async disableNsfw() {
-    await this.page.getByRole('button', { name: 'Turn off NSFW' }).click();
-    await expect(this.page.getByText('NSFW stays hidden.')).toBeVisible();
-    await expect(this.page.getByText('NSFW is hidden again.')).toBeVisible();
+    await this.page.getByRole('button', { name: 'Turn off sensitive content', exact: true }).click();
+    await expect(this.page.getByText('Sensitive content stays hidden.', { exact: true })).toBeVisible();
+    await expect(this.page.getByRole('status')).toHaveText('Sensitive content is hidden again.');
   }
 
-  async expectFullAccountProfileState(fixture: SeededCollectionManagementFixture) {
+  async expectFullAccountState() {
     await this.goto();
 
-    await expect(this.page.getByRole('heading', { name: 'Your meme command center.', exact: true })).toBeVisible();
-    await expect(this.page.getByText('Connected profile', { exact: true })).toBeVisible();
-    await expect(
-      this.page.getByText('Favorites, saves, pins, and active collection follow this connected account.', { exact: true })
-    ).toBeVisible();
-
-    await expect(this.page.getByRole('heading', { name: 'Interaction stats', exact: true })).toBeVisible();
-    await expect(this.page.getByText('Counts come from your recorded meme interaction history.', { exact: true })).toBeVisible();
+    await expect(this.page.getByRole('heading', { name: 'Account', exact: true })).toBeVisible();
+    await expect(this.page.getByText('Connected account', { exact: true })).toBeVisible();
+    await expect(this.page.getByRole('heading', { name: 'Telegram', exact: true })).toBeVisible();
+    await expect(this.page.getByRole('heading', { name: 'Preferences', exact: true })).toBeVisible();
+    await expect(this.page.getByRole('combobox', { name: 'Profile language', exact: true })).toBeVisible();
+    await expect(this.page.getByText(/Sensitive content (stays hidden|is enabled)\./)).toBeVisible();
+    await this.page.getByText('Interaction stats', { exact: true }).click();
     for (const label of ['Viewed', 'Sent', 'Saved', 'Downloaded', 'Days active']) {
       await expect(this.page.getByText(label, { exact: true }).first()).toBeVisible();
     }
-
-    await expect(this.page.getByRole('heading', { name: 'Account settings', exact: true })).toBeVisible();
-    await expect(
-      this.page.getByText('Current backend account state. Unsupported web mutations are shown honestly.', { exact: true })
-    ).toBeVisible();
-    await expect(this.page.getByText(fixture.owner.email, { exact: true })).toBeVisible();
-    await expect(this.page.getByText('Verified', { exact: true })).toBeVisible();
-    await expect(this.page.getByText('Password set', { exact: true })).toBeVisible();
-    await expect(this.page.getByRole('combobox', { name: 'Profile language', exact: true })).toBeVisible();
-    await expect(this.page.getByText(/NSFW (stays hidden\.|search is enabled\.)/)).toBeVisible();
-
-    await expect(this.page.getByRole('heading', { name: 'Active save collection', exact: true })).toBeVisible();
-    await expect(this.page.getByRole('combobox', { name: 'Save into', exact: true })).toBeVisible();
-    await expect(this.page.getByRole('heading', { name: 'Collections', exact: true })).toBeVisible();
-    await expect(this.page.getByRole('link', { name: fixture.collection.title, exact: true })).toBeVisible();
-    await expect(this.page.getByRole('heading', { name: 'Favorites', exact: true })).toBeVisible();
-    await expect(this.page.getByRole('heading', { name: 'Pinned memes', exact: true })).toBeVisible();
-    await expect(this.page.getByRole('heading', { name: 'Pin order', exact: true })).toBeVisible();
-    await expect(this.page.getByRole('link', { name: `Open ${fixture.pinned_memes[0].title}`, exact: true }).first()).toBeVisible();
-  }
-
-  async moveFirstPinDownAndExpectSaved() {
-    await this.goto();
-    await expect(this.page.getByRole('heading', { name: 'Pin order' })).toBeVisible();
-    await this.page.getByRole('button', { name: 'Down' }).first().click();
-    await expect(this.page.getByText('Pin order saved.')).toBeVisible();
+    await expect(this.page.getByRole('link', { name: 'Open Saved', exact: true })).toBeVisible();
   }
 }

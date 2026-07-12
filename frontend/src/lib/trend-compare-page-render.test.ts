@@ -1,7 +1,7 @@
 import { render } from 'svelte/server';
 import { describe, expect, it } from 'vitest';
 
-import type { PublicTrendComparisonRead, PublicTrendMetricsRead } from '$lib/api/types';
+import type { PublicMemeCardRead, PublicTrendComparisonRead, PublicTrendMetricsRead } from '$lib/api/types';
 import TrendComparePage from '../routes/trends/compare/+page.svelte';
 
 describe('/trends/compare page', () => {
@@ -42,6 +42,7 @@ describe('/trends/compare page', () => {
     expect(body).toContain('Comparison item');
     expect(body).toMatch(/<noscript>[\s\S]*name="item"/);
     expect(body).toContain('Launch reaction meme');
+    expect(body).toContain('Meme · Launch reaction meme');
     expect(body).toContain('Reaction memes');
     expect(body).toContain('Current Only Template memes');
     expect(body).not.toContain('Use specs like');
@@ -83,8 +84,8 @@ function comparisonPayload(): PublicTrendComparisonRead {
         value: '11111111-1111-4111-8111-111111111111',
         title: 'Launch reaction meme',
         description: 'Popularity score from real captured meme snapshots.',
-        meme: null,
-      trend: trendMetrics(),
+        meme: memeCard(),
+        trend: trendMetrics(),
         insufficient_history: false,
         no_data_reason: null,
         points: [
@@ -198,5 +199,25 @@ function trendMetrics(): PublicTrendMetricsRead {
     engagement_24h: 7,
     trending_score: 22,
     refreshed_at: '2026-01-02T00:00:00Z'
+  };
+}
+
+function memeCard(): PublicMemeCardRead {
+  return {
+    id: '11111111-1111-4111-8111-111111111111',
+    media_type: 'image',
+    language: 'en',
+    is_nsfw: false,
+    popularity_score: 15,
+    like_count: 2,
+    tags: ['reaction'],
+    primary_file: null,
+    caption: 'Launch reaction meme',
+    seo_page_slug: 'launch-reaction',
+    viewer_has_favorited: false,
+    viewer_has_saved: false,
+    viewer_has_pinned: false,
+    created_at: '2026-01-01T00:00:00Z',
+    updated_at: '2026-01-02T00:00:00Z'
   };
 }

@@ -20,7 +20,8 @@ test('full accounts can join, manage roles, search a collection, and reorder pin
     collectionId,
     memberUserId: fixture.member.user_id
   });
-  await app.profile.expectFullAccountProfileState(fixture);
+  await app.profile.expectFullAccountState();
+  await app.library.expectFullAccountLibraryState(fixture);
 
   await app.collection.goto(collectionId);
   await app.collection.expectOwnerControls(fixture);
@@ -58,5 +59,5 @@ test('full accounts can join, manage roles, search a collection, and reorder pin
     await memberContext.close();
   }
 
-  await app.profile.moveFirstPinDownAndExpectSaved();
+  await app.library.moveFirstPinDownAndExpectSaved();
 });

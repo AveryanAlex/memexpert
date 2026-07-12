@@ -604,7 +604,17 @@ class PublicTrendsService:
             _meme_daily_points_text(
                 f"""
                 {_MEME_DAILY_POINT_CTES}
-                SELECT captured_at, popularity_score
+                SELECT
+                    captured_at,
+                    snapshot_count,
+                    source_views,
+                    source_reactions,
+                    source_reposts,
+                    platform_views,
+                    platform_sends,
+                    platform_saves,
+                    platform_likes,
+                    popularity_score
                 FROM scored_meme_daily
                 ORDER BY captured_at DESC
                 LIMIT :limit
@@ -616,7 +626,7 @@ class PublicTrendsService:
         card = _to_public_card_read(meme, media_render_service=self._media_render_service)
         return PublicTrendComparisonSeriesRead(
             kind="meme",
-            value=str(meme.id),
+            value=value,
             title=(
                 meme.seo_page.page_title
                 if meme.seo_page is not None
@@ -631,6 +641,15 @@ class PublicTrendsService:
                     value=_float(row.get("popularity_score")),
                     metric="popularity_score",
                     label="Popularity score",
+                    meme_count=1,
+                    snapshot_count=_int(row.get("snapshot_count")),
+                    source_views=_int(row.get("source_views")),
+                    source_reactions=_int(row.get("source_reactions")),
+                    source_reposts=_int(row.get("source_reposts")),
+                    platform_views=_int(row.get("platform_views")),
+                    platform_sends=_int(row.get("platform_sends")),
+                    platform_saves=_int(row.get("platform_saves")),
+                    platform_likes=_int(row.get("platform_likes")),
                 )
                 for row in snapshot_rows
             ],

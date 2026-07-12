@@ -2294,6 +2294,36 @@ def _assert_public_trend_comparison(
         raise E2ESeedError(
             f"Public trend comparison meme title {meme_series.get('title')!r}, expected {representative.title!r}.",
         )
+    if meme_series.get("value") != representative.slug:
+        raise E2ESeedError(
+            f"Public trend comparison meme value {meme_series.get('value')!r}, expected {representative.slug!r}.",
+        )
+    meme_points = meme_series.get("points")
+    if not isinstance(meme_points, list):
+        raise E2ESeedError(f"Public trend comparison meme series has malformed points: {comparison}")
+    meme_points_by_day = {
+        str(point.get("observed_at", ""))[:10]: point
+        for point in meme_points
+        if isinstance(point, dict)
+    }
+    for observed_at, expected_metrics in _public_trend_daily_metrics(representative.category).items():
+        observed_day = observed_at.date().isoformat()
+        point = meme_points_by_day.get(observed_day)
+        if point is None:
+            raise E2ESeedError(
+                f"Public trend comparison meme series missing expected point day {observed_day}: {comparison}",
+            )
+        if point.get("meme_count") != 1:
+            raise E2ESeedError(
+                f"Public trend comparison meme point {observed_day} returned "
+                f"meme_count={point.get('meme_count')!r}, expected 1.",
+            )
+        for key, expected_value in expected_metrics.items():
+            if point.get(key) != expected_value:
+                raise E2ESeedError(
+                    f"Public trend comparison meme point {observed_day} returned {key}={point.get(key)!r}, "
+                    f"expected {expected_value!r}; point={point}",
+                )
     for kind in ("meme", "tag", "template"):
         points = series_by_kind[kind].get("points")
         if not isinstance(points, list) or len(points) < 2:

@@ -17,6 +17,7 @@ export class CollectionPage {
 
   async expectOwnerControls(fixture: SeededCollectionManagementFixture) {
     await this.expectOpen(fixture);
+    await this.openManagement();
     await expect(this.page.getByRole('heading', { name: 'Invite link' })).toBeVisible();
     await expect(this.page.getByRole('button', { name: 'Create invite' })).toBeVisible();
     await expect(this.page.getByRole('heading', { name: 'Members' })).toBeVisible();
@@ -28,6 +29,7 @@ export class CollectionPage {
 
   async expectViewerGuidance(fixture: SeededCollectionManagementFixture) {
     await this.expectOpen(fixture);
+    await this.openManagement();
     await expect(this.page.getByText('Your access is view-only.')).toBeVisible();
     await expect(
       this.page.getByText('You can view this collection, but member and invite management require editor or owner access.').first()
@@ -37,6 +39,7 @@ export class CollectionPage {
   }
 
   async updateMemberRole(memberUserId: string, role: 'editor' | 'viewer') {
+    await this.openManagement();
     await this.page.getByLabel(`Role for ${shortId(memberUserId)}`).selectOption(role);
     await this.page.getByRole('button', { name: 'Update role' }).click();
     await expect(this.page.getByText('Member role updated.')).toBeVisible();
@@ -45,6 +48,7 @@ export class CollectionPage {
 
   async expectEditorControls(fixture: SeededCollectionManagementFixture) {
     await this.expectOpen(fixture);
+    await this.openManagement();
     await expect(this.page.getByRole('heading', { name: 'Invite link' })).toBeVisible();
     await expect(this.page.getByRole('button', { name: 'Create invite' })).toBeVisible();
     await expect(
@@ -60,6 +64,15 @@ export class CollectionPage {
   private async expectOpen(fixture: SeededCollectionManagementFixture) {
     await expect(this.page).toHaveURL((url) => url.pathname === `/collection/${fixture.collection.id}`);
     await expect(this.page.getByRole('heading', { name: fixture.collection.title })).toBeVisible();
+  }
+
+  private async openManagement() {
+    const management = this.page.getByText('Manage collection', { exact: true });
+    const details = this.page.locator('details').filter({ has: management });
+    const isOpen = await details.evaluate((element) => (element as HTMLDetailsElement).open);
+    if (!isOpen) {
+      await details.locator('summary').click();
+    }
   }
 }
 

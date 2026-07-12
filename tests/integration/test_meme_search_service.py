@@ -3692,11 +3692,26 @@ async def test_public_trend_compare_returns_real_series_and_insufficient_history
 
     meme_series = payload["items"][0]
     assert meme_series["kind"] == "meme"
+    assert meme_series["value"] == "launch-reaction"
     assert meme_series["title"] == "Launch reaction meme"
     assert meme_series["insufficient_history"] is False
     assert len(meme_series["points"]) == 2
     assert meme_series["points"][0]["value"] < meme_series["points"][1]["value"]
     assert {point["metric"] for point in meme_series["points"]} == {"popularity_score"}
+    assert [point["meme_count"] for point in meme_series["points"]] == [1, 1]
+    assert [point["snapshot_count"] for point in meme_series["points"]] == [1, 1]
+    assert [point["source_views"] for point in meme_series["points"]] == [10, 15]
+    assert all(
+        point["source_views"]
+        + point["source_reactions"]
+        + point["source_reposts"]
+        + point["platform_views"]
+        + point["platform_sends"]
+        + point["platform_saves"]
+        + point["platform_likes"]
+        > 0
+        for point in meme_series["points"]
+    )
 
     tag_series = payload["items"][1]
     assert tag_series["kind"] == "tag"

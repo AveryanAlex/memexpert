@@ -33,31 +33,34 @@ export class MemeDetailPage {
     await expect.poll(() => media.evaluate((img) => (img as HTMLImageElement).naturalWidth)).toBeGreaterThan(0);
   }
 
-  async likeAndUnlike() {
-    await this.page.getByRole('button', { name: /^Like \(/ }).click();
-    await expect(this.page.getByRole('button', { name: /^Unlike \(/ })).toBeVisible();
-    await expect(this.page.getByText('Liked.')).toBeVisible();
+  async favoriteAndUnfavorite() {
+    const primaryActions = this.primaryActions();
+    await primaryActions.getByRole('button', { name: /^Favorite \(/ }).click();
+    await expect(primaryActions.getByRole('button', { name: /^Favorited \(/ })).toBeVisible();
+    await expect(this.page.getByRole('status')).toHaveText('Added to favorites.');
 
-    await this.page.getByRole('button', { name: /^Unlike \(/ }).click();
-    await expect(this.page.getByRole('button', { name: /^Like \(/ })).toBeVisible();
-    await expect(this.page.getByText('Unliked.')).toBeVisible();
+    await primaryActions.getByRole('button', { name: /^Favorited \(/ }).click();
+    await expect(primaryActions.getByRole('button', { name: /^Favorite \(/ })).toBeVisible();
+    await expect(this.page.getByRole('status')).toHaveText('Removed from favorites.');
   }
 
-  async likeAndExpectAttribution(meme: SeededMeme, attribution: ExpectedMemeAttribution) {
+  async favoriteAndExpectAttribution(meme: SeededMeme, attribution: ExpectedMemeAttribution) {
     const requestPromise = this.waitForActionPost(meme.meme_id, 'favorite');
-    await this.page.getByRole('button', { name: /^Like \(/ }).click();
+    const primaryActions = this.primaryActions();
+    await primaryActions.getByRole('button', { name: /^Favorite \(/ }).click();
     expectRequestAttribution(await requestPromise, attribution, 'favorite action');
 
-    await expect(this.page.getByRole('button', { name: /^Unlike \(/ })).toBeVisible();
-    await expect(this.page.getByRole('status')).toHaveText('Liked.');
+    await expect(primaryActions.getByRole('button', { name: /^Favorited \(/ })).toBeVisible();
+    await expect(this.page.getByRole('status')).toHaveText('Added to favorites.');
   }
 
   async saveAndExpectAttribution(meme: SeededMeme, attribution: ExpectedMemeAttribution) {
     const requestPromise = this.waitForActionPost(meme.meme_id, 'save');
-    await this.page.getByRole('button', { name: 'Save', exact: true }).click();
+    const primaryActions = this.primaryActions();
+    await primaryActions.getByRole('button', { name: 'Save', exact: true }).click();
     expectRequestAttribution(await requestPromise, attribution, 'save action');
 
-    await expect(this.page.getByRole('button', { name: 'Saved', exact: true })).toBeVisible();
+    await expect(primaryActions.getByRole('button', { name: 'Saved', exact: true })).toBeVisible();
     await expect(this.page.getByRole('status')).toHaveText('Saved to your active collection.');
   }
 
@@ -65,7 +68,8 @@ export class MemeDetailPage {
     await this.stubDownloadAnchors();
 
     const requestPromise = this.waitForActionPost(meme.meme_id, 'download');
-    await this.page.getByRole('button', { name: 'Download', exact: true }).click();
+    await this.openActionsMenu();
+    await this.page.getByRole('menuitem', { name: 'Download', exact: true }).click();
     expectRequestAttribution(await requestPromise, attribution, 'download action');
 
     await expect(this.page.getByRole('status')).toHaveText('Download started.');
@@ -77,7 +81,7 @@ export class MemeDetailPage {
     await this.stubWindowOpen();
 
     const requestPromise = this.waitForActionPost(meme.meme_id, 'share');
-    await this.page.getByRole('button', { name: 'Share to Telegram' }).click();
+    await this.primaryActions().getByRole('button', { name: 'Send', exact: true }).click();
     expectRequestAttribution(await requestPromise, attribution, 'share action');
 
     await expect(this.page.getByRole('status')).toHaveText('Opened Telegram share.');
@@ -86,9 +90,10 @@ export class MemeDetailPage {
     expect(new URL(shareUrl ?? '').searchParams.get('url')).toContain(`/memes/${meme.slug}`);
   }
 
-  async expectPinFullAccountOnly() {
-    await expect(this.page.getByText('Pin requires a full account')).toBeVisible();
-    await expect(this.page.getByRole('button', { name: /^Pin$/ })).toHaveCount(0);
+  async expectPinUnavailableForGuest() {
+    await this.openActionsMenu();
+    await expect(this.page.getByRole('menuitem', { name: 'Pin', exact: true })).toHaveCount(0);
+    await this.page.keyboard.press('Escape');
   }
 
   private waitForActionPost(memeId: string, action: 'download' | 'favorite' | 'save' | 'share') {
@@ -96,6 +101,14 @@ export class MemeDetailPage {
       const url = new URL(request.url());
       return request.method() === 'POST' && url.pathname === `/api/v1/memes/${memeId}/${action}`;
     });
+  }
+
+  private async openActionsMenu() {
+    await this.page.getByRole('button', { name: 'Meme actions', exact: true }).click();
+  }
+
+  private primaryActions() {
+    return this.page.getByLabel('Primary meme actions');
   }
 
   private async stubWindowOpen() {

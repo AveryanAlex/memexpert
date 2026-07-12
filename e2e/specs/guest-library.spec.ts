@@ -6,9 +6,8 @@ test('guest can favorite and unfavorite but cannot use full-account library acti
 
   await app.detail.goto(cat.slug);
   await app.detail.expectOpen(cat);
-  await app.detail.likeAndUnlike();
-  await app.detail.expectPinFullAccountOnly();
+  await app.detail.favoriteAndUnfavorite();
+  await app.detail.expectPinUnavailableForGuest();
 
-  await app.home.goto();
-  await app.home.expectGuestCollectionCreationUnavailable();
+  await app.library.expectGuestFullAccountActionsUnavailable();
 });

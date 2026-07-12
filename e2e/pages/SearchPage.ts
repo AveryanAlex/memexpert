@@ -20,44 +20,48 @@ export class SearchPage {
 
   async searchCollections(input: { query: string; collectionTitles: string[] }) {
     await this.page.goto('/search');
-    const searchForm = this.page.locator('form').filter({ has: this.page.getByLabel('Search text') });
-    await searchForm.getByLabel('Search text').fill(input.query);
-    await searchForm.getByRole('radio', { name: /Specific collections/i }).check();
+    const searchForm = this.searchForm();
+    await searchForm.getByRole('searchbox', { name: 'Search memes', exact: true }).fill(input.query);
+    await searchForm.getByRole('button', { name: /^Filters/ }).click();
+    const filters = this.filtersDialog();
+    await filters.getByRole('radio', { name: /Specific collections/i }).check();
     for (const title of input.collectionTitles) {
-      await searchForm.locator('label').filter({ hasText: title }).getByRole('checkbox').check();
+      await filters.locator('label').filter({ hasText: title }).getByRole('checkbox').check();
     }
-    await searchForm.getByRole('button', { name: 'Search', exact: true }).click();
+    await filters.getByRole('button', { name: 'Show results', exact: true }).click();
   }
 
   async applyFilters(input: { query: string; tag: string; mediaType: string; language: string; includeNsfw: boolean }) {
-    const searchInput = this.page.getByLabel('Search text');
+    const searchForm = this.searchForm();
+    const searchInput = searchForm.getByRole('searchbox', { name: 'Search memes', exact: true });
     await searchInput.fill(input.query);
-    await this.page.getByLabel('Media type').selectOption(input.mediaType);
-    await this.page.getByLabel('Language').selectOption(input.language);
-    await this.page.getByLabel('NSFW').selectOption(String(input.includeNsfw));
-    await this.page.getByLabel('Tags / categories').fill(input.tag);
-    await searchInput.press('Enter');
+    await searchForm.getByRole('button', { name: /^Filters/ }).click();
+    const filters = this.filtersDialog();
+    await filters.getByLabel('Media type').selectOption(input.mediaType);
+    await filters.getByLabel('Language').selectOption(input.language);
+    await filters.getByLabel('Sensitive content').selectOption(String(input.includeNsfw));
+    await filters.getByLabel('Tags or categories').fill(input.tag);
+    await filters.getByRole('button', { name: 'Show results', exact: true }).click();
   }
 
   async cancelNsfwOptIn() {
-    await expect(this.page.getByRole('dialog', { name: 'Include NSFW results?' })).toBeVisible();
+    await expect(this.page.getByRole('dialog', { name: 'Include sensitive results?' })).toBeVisible();
     await this.page.getByRole('button', { name: 'Cancel' }).click();
-    await expect(this.page.getByRole('dialog', { name: 'Include NSFW results?' })).toHaveCount(0);
-    await expect(this.page.getByLabel('NSFW')).toHaveValue('false');
+    await expect(this.page.getByRole('dialog', { name: 'Include sensitive results?' })).toHaveCount(0);
   }
 
   async confirmNsfwOptIn() {
-    await expect(this.page.getByRole('dialog', { name: 'Include NSFW results?' })).toBeVisible();
+    await expect(this.page.getByRole('dialog', { name: 'Include sensitive results?' })).toBeVisible();
     await this.page.getByRole('button', { name: 'Confirm and search' }).click();
-    await expect(this.page.getByRole('dialog', { name: 'Include NSFW results?' })).toHaveCount(0);
+    await expect(this.page.getByRole('dialog', { name: 'Include sensitive results?' })).toHaveCount(0);
   }
 
   async expectNsfwUrlRequestNote() {
-    await expect(this.page.getByText('NSFW was requested in the URL')).toBeVisible();
+    await expect(this.page.getByText(/Sensitive results are requested in this link/)).toBeVisible();
   }
 
   async expectNoNsfwOptInPrompt() {
-    await expect(this.page.getByRole('dialog', { name: 'Include NSFW results?' })).toHaveCount(0);
+    await expect(this.page.getByRole('dialog', { name: 'Include sensitive results?' })).toHaveCount(0);
   }
 
   async expectUrlFilters(input: { query: string; tag: string; mediaType: string; language: string; includeNsfw: boolean }) {
@@ -130,5 +134,13 @@ export class SearchPage {
       const url = new URL(request.url());
       return request.method() === 'POST' && url.pathname === `/api/v1/memes/${meme.meme_id}/${action}`;
     });
+  }
+
+  private searchForm() {
+    return this.page.locator('form#search-results-form');
+  }
+
+  private filtersDialog() {
+    return this.page.getByRole('dialog', { name: 'Filters', exact: true });
   }
 }

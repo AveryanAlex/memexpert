@@ -100,7 +100,15 @@
   }
 
   function matchingTitle(row: ComparisonFormRow): string {
-    return data.comparison.items.find((item) => item.kind === row.kind && item.value === row.identifier)?.title ?? row.identifier;
+    return (
+      data.comparison.items.find(
+        (item) =>
+          item.kind === row.kind &&
+          (item.value === row.identifier ||
+            (item.kind === 'meme' &&
+              (item.meme?.id === row.identifier || item.meme?.seo_page_slug === row.identifier)))
+      )?.title ?? row.identifier
+    );
   }
 
   function itemTypeLabel(kind: string): string {

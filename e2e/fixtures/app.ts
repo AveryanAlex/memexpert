@@ -3,6 +3,7 @@ import { E2EApi } from '../helpers/api';
 import { readSeedArtifact, type SeedArtifact } from '../helpers/seed';
 import { CollectionPage } from '../pages/CollectionPage';
 import { HomePage } from '../pages/HomePage';
+import { LibraryPage } from '../pages/LibraryPage';
 import { MemeDetailPage } from '../pages/MemeDetailPage';
 import { ProfilePage } from '../pages/ProfilePage';
 import { SearchPage } from '../pages/SearchPage';
@@ -14,6 +15,7 @@ type AppFixtures = {
   api: E2EApi;
   app: {
     home: HomePage;
+    library: LibraryPage;
     search: SearchPage;
     detail: MemeDetailPage;
     profile: ProfilePage;
@@ -33,6 +35,7 @@ export const test = base.extend<AppFixtures>({
   app: async ({ page }, use) => {
     await use({
       home: new HomePage(page),
+      library: new LibraryPage(page),
       search: new SearchPage(page),
       detail: new MemeDetailPage(page),
       profile: new ProfilePage(page),
