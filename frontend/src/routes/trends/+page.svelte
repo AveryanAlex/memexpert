@@ -1,7 +1,7 @@
 <script lang="ts">
   import MemeCard from '$lib/features/memes/MemeCard.svelte';
   import TrendSummary from '$lib/features/trends/TrendSummary.svelte';
-  import type { PublicTrendSummaryRead } from '$lib/api/types';
+  import type { PublicTrendMetricsRead, PublicTrendSummaryRead } from '$lib/api/types';
   import { ActionLink, Card, EmptyState, Notice, PageHeader } from '$lib/ui';
   import type { PageData } from './$types';
 
@@ -11,6 +11,10 @@
   const resultEnd = $derived(Math.min(data.offset + data.page.items.length, data.page.total));
   const previousOffset = $derived(Math.max(data.offset - data.page.limit, 0));
   const nextOffset = $derived(data.offset + data.page.limit);
+  const rankingLabel = $derived(rankingName(data.ranking));
+  const numberFormatter = new Intl.NumberFormat('en');
+  const recordedActivityDescription =
+    'Recorded activity adds original-source views, reactions, and reposts to MemeExpert views, sends, saves, and favorites. It counts signals, not unique people.';
 
   function rankingHref(ranking: string, offset = 0): string {
     const params = new URLSearchParams({ ranking });
@@ -20,24 +24,64 @@
     return `/trends?${params.toString()}`;
   }
 
-  function aggregateStatus(summary: PublicTrendSummaryRead): string {
-    const pointCount = summary.points?.length ?? 0;
-    if (pointCount >= 2) return `${pointCount} history points`;
-    if (summary.current_only_reason) return 'current window only';
-    if (summary.insufficient_history) return 'insufficient history';
-    return 'current score';
+  function rankingName(ranking: string): string {
+    if (ranking === 'fastest_rising') return 'Rising';
+    if (ranking === 'most_liked') return 'Most favorited';
+    return 'Trending';
+  }
+
+  function summaryStory(summary: PublicTrendSummaryRead): string {
+    return `Latest recorded activity: ${formatCount(recordedActivity(summary.trend))} signals`;
+  }
+
+  function memeCountLabel(count: number): string {
+    return `${count} ${count === 1 ? 'meme' : 'memes'}`;
+  }
+
+  function recordedActivity(trend: PublicTrendMetricsRead): number {
+    return (
+      count(trend.latest_source_views) +
+      count(trend.latest_source_reactions) +
+      count(trend.latest_source_reposts) +
+      count(trend.latest_platform_views) +
+      count(trend.latest_platform_sends) +
+      count(trend.latest_platform_saves) +
+      count(trend.latest_platform_likes)
+    );
+  }
+
+  function formatCount(value: number): string {
+    return numberFormatter.format(value);
+  }
+
+  function count(value: number | null | undefined): number {
+    return typeof value === 'number' && Number.isFinite(value) ? Math.max(value, 0) : 0;
   }
 </script>
 
-<PageHeader title="Public meme trends." description="Aggregate launch-scope analytics from MemeXpert activity, source engagement deltas, and latest source totals." badge="No per-user data">
-  <ActionLink href="/trends/compare" variant="secondary">Compare trends</ActionLink>
-  <ActionLink href="/trends/timeline" variant="secondary">Timeline</ActionLink>
+<PageHeader title="Meme trends" description="See what people are enjoying this week." badge="This week">
+  <ActionLink href="/trends/compare" variant="secondary">Compare</ActionLink>
+  <ActionLink href="/trends/timeline" variant="secondary">Browse by time</ActionLink>
 </PageHeader>
 
+<p class="mb-6 max-w-3xl text-sm text-muted">{recordedActivityDescription}</p>
+
 <nav class="mb-6 flex flex-wrap gap-2" aria-label="Trend rankings">
-  <a class={data.ranking === 'trending' ? 'rounded-full bg-ink px-4 py-3 font-extrabold text-paper no-underline' : 'rounded-full border border-line bg-paper px-4 py-3 font-extrabold text-ink no-underline'} href={rankingHref('trending')}>Trending</a>
-  <a class={data.ranking === 'fastest_rising' ? 'rounded-full bg-ink px-4 py-3 font-extrabold text-paper no-underline' : 'rounded-full border border-line bg-paper px-4 py-3 font-extrabold text-ink no-underline'} href={rankingHref('fastest_rising')}>Fastest rising</a>
-  <a class={data.ranking === 'most_liked' ? 'rounded-full bg-ink px-4 py-3 font-extrabold text-paper no-underline' : 'rounded-full border border-line bg-paper px-4 py-3 font-extrabold text-ink no-underline'} href={rankingHref('most_liked')}>Most liked</a>
+  <a
+    class={data.ranking === 'trending' ? 'rounded-full bg-ink px-4 py-3 font-extrabold text-paper no-underline' : 'rounded-full border border-line bg-paper px-4 py-3 font-extrabold text-ink no-underline'}
+    href={rankingHref('trending')}
+    aria-current={data.ranking === 'trending' ? 'page' : undefined}
+  >Trending</a>
+  <a
+    class={data.ranking === 'fastest_rising' ? 'rounded-full bg-ink px-4 py-3 font-extrabold text-paper no-underline' : 'rounded-full border border-line bg-paper px-4 py-3 font-extrabold text-ink no-underline'}
+    href={rankingHref('fastest_rising')}
+    aria-current={data.ranking === 'fastest_rising' ? 'page' : undefined}
+  >Rising</a>
+  <a
+    class={data.ranking === 'most_liked' ? 'rounded-full bg-ink px-4 py-3 font-extrabold text-paper no-underline' : 'rounded-full border border-line bg-paper px-4 py-3 font-extrabold text-ink no-underline'}
+    href={rankingHref('most_liked')}
+    aria-current={data.ranking === 'most_liked' ? 'page' : undefined}
+  >Most favorited</a>
 </nav>
 
 {#if data.errorMessage}
@@ -46,20 +90,24 @@
 
 <div class="my-7 flex flex-wrap justify-between gap-3">
   <p class="m-0 text-muted">Showing {resultStart}-{resultEnd} of {data.page.total}</p>
-  <a href="/" class="text-muted">Search all memes</a>
+  <a href="/" class="text-muted">Discover memes</a>
 </div>
 
 {#if data.page.items.length > 0}
   <section class="grid grid-cols-1 gap-4 md:grid-cols-3" aria-label="Trend ranked memes">
-    {#each data.page.items as item (item.meme.id)}
+    {#each data.page.items as item, index (item.meme.id)}
       <Card class="grid gap-3 p-4 shadow-none">
-        <MemeCard meme={item.meme} showAccessMarkers={Boolean(data.session)} />
+        <div class="flex items-center justify-between gap-3">
+          <span class="rounded-full bg-soft px-3 py-1.5 text-sm font-extrabold text-ink">{rankingLabel}</span>
+          <span class="text-sm font-semibold text-muted">#{data.offset + index + 1}</span>
+        </div>
+        <MemeCard meme={item.meme} attribution={item.attribution} showAccessMarkers={Boolean(data.session)} />
         <TrendSummary trend={item.trend} />
       </Card>
     {/each}
   </section>
 {:else if !data.errorMessage}
-  <EmptyState title="No trend data yet" message="Trend materialized views are empty. Refresh analytics after events or snapshots are available." />
+  <EmptyState title="Nothing is trending yet" message="Check back soon for the memes people are starting to enjoy." />
 {/if}
 
 <nav class="mt-6 flex flex-wrap gap-2" aria-label="Pagination">
@@ -71,31 +119,31 @@
   {/if}
 </nav>
 
-<section class="mt-7 grid gap-4 md:grid-cols-2" aria-label="Aggregate trend summaries">
+<section class="mt-7 grid gap-4 md:grid-cols-2" aria-label="Popular tags and templates">
   <Card class="grid gap-3 shadow-none">
-    <h2 class="m-0 text-2xl font-black tracking-[-0.04em]">Tags moving now</h2>
+    <h2 class="m-0 text-2xl font-black tracking-[-0.04em]">Tags people are enjoying</h2>
     {#if data.tagSummaries.length > 0}
       {#each data.tagSummaries as summary}
         <a class="flex items-center justify-between gap-3 rounded-[18px] border border-line bg-paper px-4 py-3 font-extrabold no-underline" href={`/tags/${summary.slug}`}>
           <span>{summary.title}</span>
-          <small class="text-muted">{summary.meme_count} memes · {summary.trend.trending_score.toFixed(1)} score · {aggregateStatus(summary)}</small>
+          <small class="text-right text-muted">{memeCountLabel(summary.meme_count)} · {summaryStory(summary)}</small>
         </a>
       {/each}
     {:else}
-      <p class="m-0 text-muted">No tag aggregates yet.</p>
+      <p class="m-0 text-muted">No tags are standing out just yet.</p>
     {/if}
   </Card>
   <Card class="grid gap-3 shadow-none">
-    <h2 class="m-0 text-2xl font-black tracking-[-0.04em]">Templates moving now</h2>
+    <h2 class="m-0 text-2xl font-black tracking-[-0.04em]">Templates people are enjoying</h2>
     {#if data.templateSummaries.length > 0}
       {#each data.templateSummaries as summary}
         <a class="flex items-center justify-between gap-3 rounded-[18px] border border-line bg-paper px-4 py-3 font-extrabold no-underline" href={`/templates/${summary.slug}`}>
           <span>{summary.title}</span>
-          <small class="text-muted">{summary.meme_count} memes · {summary.trend.trending_score.toFixed(1)} score · {aggregateStatus(summary)}</small>
+          <small class="text-right text-muted">{memeCountLabel(summary.meme_count)} · {summaryStory(summary)}</small>
         </a>
       {/each}
     {:else}
-      <p class="m-0 text-muted">No template aggregates yet.</p>
+      <p class="m-0 text-muted">No templates are standing out just yet.</p>
     {/if}
   </Card>
 </section>

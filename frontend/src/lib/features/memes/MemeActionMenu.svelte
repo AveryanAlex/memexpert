@@ -29,16 +29,32 @@
   import * as Menu from '$lib/ui/dropdown-menu';
   import { Bookmark, Copy, Download, Flag, Heart, MoreHorizontal, Pin, Send } from '@lucide/svelte';
 
+  export type MemeActionSurface = 'card' | 'detail' | 'overflow';
+
   interface Props {
     meme: PublicMemeCardRead | PublicMemeDetailRead;
     href?: string;
     attribution?: MemeActionAttribution | null;
+    surface?: MemeActionSurface;
+    /** @deprecated Use the explicit action surface instead. */
     showPrimary?: boolean;
+    /** @deprecated Use the explicit action surface instead. */
     showSharing?: boolean;
+    /** @deprecated Use the card action surface instead. */
     compact?: boolean;
+    onFavoriteChange?: (favorited: boolean) => void;
   }
 
-  let { meme, href = memeHref(meme), attribution = null, showPrimary = false, showSharing = false, compact = false }: Props = $props();
+  let {
+    meme,
+    href = memeHref(meme),
+    attribution = null,
+    surface = undefined,
+    showPrimary = false,
+    showSharing = false,
+    compact = false,
+    onFavoriteChange
+  }: Props = $props();
 
   const viewerCapabilities = readViewerCapabilities();
 
@@ -51,6 +67,7 @@
   let reportOpen = $state(false);
   let reportReason = $state<ModerationReason>('spam');
   let reportNote = $state('');
+  let hydrated = $state(false);
 
   const reportReasons: Array<{ value: ModerationReason; label: string }> = [
     { value: 'spam', label: 'Spam or scam' },
@@ -68,11 +85,20 @@
   const canPin = $derived(viewerCapabilities().canPinMemes);
   const actionBody = $derived(memeActionAttributionBody(attribution));
   const actionRequest = $derived({ fetch, memeId: meme.id, body: actionBody });
+  const actionSurface = $derived(surface ?? (showPrimary || showSharing ? 'detail' : compact ? 'card' : 'overflow'));
+  const isCardSurface = $derived(actionSurface === 'card');
+  const isDetailSurface = $derived(actionSurface === 'detail');
+  const menuLabel = $derived(isCardSurface ? `Actions for ${title}` : 'Meme actions');
+  const interactionsDisabled = $derived(!hydrated || pending !== null);
 
   syncStateFromMeme();
 
   $effect(() => {
     syncStateFromMeme();
+  });
+
+  $effect(() => {
+    hydrated = true;
   });
 
   function syncStateFromMeme() {
@@ -93,7 +119,8 @@
       } else if (!next && wasFavorited && wasRemoved(response)) {
         likeCount = Math.max(0, likeCount - 1);
       }
-      statusMessage = next ? 'Liked.' : 'Unliked.';
+      statusMessage = next ? 'Added to favorites.' : 'Removed from favorites.';
+      onFavoriteChange?.(next);
     });
   }
 
@@ -218,60 +245,104 @@
   }
 </script>
 
-<div class={compact ? 'flex flex-wrap items-start gap-2' : 'my-3 flex flex-wrap items-start gap-2'}>
-  {#if showPrimary}
-    <div class="flex flex-wrap gap-2" aria-label="Primary meme actions">
-      <Button variant="secondary" type="button" disabled={pending !== null} onclick={toggleFavorite}>
-        <Heart class="size-4" aria-hidden="true" />
-        {favorited ? 'Unlike' : 'Like'} ({likeCount})
+<div class={isCardSurface ? 'border-t border-line px-3 py-2.5' : compact ? 'flex flex-wrap items-start gap-2' : 'my-3 flex flex-wrap items-start gap-2'}>
+  {#if isCardSurface}
+    <div class="grid grid-cols-[repeat(3,minmax(0,1fr))_2.25rem] items-center gap-1" aria-label="Meme actions">
+      <Button
+        class="min-w-0 flex-col"
+        variant="ghost"
+        size="micro"
+        type="button"
+        aria-pressed={favorited}
+        disabled={interactionsDisabled}
+        onclick={toggleFavorite}
+      >
+        <Heart class="size-4 shrink-0" aria-hidden="true" />
+        <span>{favorited ? 'Favorited' : 'Favorite'}</span>
       </Button>
-      <Button variant="secondary" type="button" disabled={pending !== null} onclick={toggleSave}>
-        <Bookmark class="size-4" aria-hidden="true" />
-        {saved ? 'Saved' : 'Save'}
+      <Button
+        class="min-w-0 flex-col"
+        variant="ghost"
+        size="micro"
+        type="button"
+        aria-pressed={saved}
+        disabled={interactionsDisabled}
+        onclick={toggleSave}
+      >
+        <Bookmark class="size-4 shrink-0" aria-hidden="true" />
+        <span>{saved ? 'Saved' : 'Save'}</span>
       </Button>
-      {#if canPin}
-        <Button variant="secondary" type="button" disabled={pending !== null} onclick={togglePin}>
-          <Pin class="size-4" aria-hidden="true" />
-          {pinned ? 'Unpin' : 'Pin'}
+      <Button
+        class="min-w-0 flex-col"
+        variant="ghost"
+        size="micro"
+        type="button"
+        disabled={interactionsDisabled}
+        onclick={shareTelegram}
+      >
+        <Send class="size-4 shrink-0" aria-hidden="true" />
+        <span>Send</span>
+      </Button>
+      <Menu.Root>
+        <Menu.Trigger aria-label={menuLabel} disabled={interactionsDisabled} class="size-9 rounded-[12px] border-line bg-paper text-muted shadow-none hover:bg-soft hover:text-ink">
+          <MoreHorizontal class="size-5" aria-hidden="true" />
+        </Menu.Trigger>
+        <Menu.Content>
+          <Menu.Item onSelect={toggleFavorite} disabled={pending !== null}>
+            <Heart class="size-4" aria-hidden="true" />
+            {favorited ? 'Remove favorite' : 'Favorite'} meme
+          </Menu.Item>
+          <Menu.Item onSelect={toggleSave} disabled={pending !== null}>
+            <Bookmark class="size-4" aria-hidden="true" />
+            {saved ? 'Remove save' : 'Save'}
+          </Menu.Item>
+          {#if canPin}
+            <Menu.Item onSelect={togglePin} disabled={pending !== null}>
+              <Pin class="size-4" aria-hidden="true" />
+              {pinned ? 'Unpin' : 'Pin'}
+            </Menu.Item>
+          {/if}
+          <Menu.Separator />
+          <Menu.Item onSelect={shareTelegram} disabled={pending !== null}><Send class="size-4" aria-hidden="true" />Send to Telegram</Menu.Item>
+          <Menu.Item onSelect={copyLink} disabled={pending !== null}><Copy class="size-4" aria-hidden="true" />Copy link</Menu.Item>
+          <Menu.Item onSelect={downloadMeme} disabled={!canDownload || pending !== null}>
+            <Download class="size-4" aria-hidden="true" />
+            {canDownload ? 'Download' : 'Download unavailable'}
+          </Menu.Item>
+          <Menu.Separator />
+          <Menu.Item tone="danger" onSelect={openReportForm} disabled={pending !== null}>
+            <Flag class="size-4" aria-hidden="true" />
+            Report meme
+          </Menu.Item>
+        </Menu.Content>
+      </Menu.Root>
+    </div>
+  {:else}
+    {#if isDetailSurface}
+      <div class="flex flex-wrap gap-2" aria-label="Primary meme actions">
+        <Button variant="secondary" type="button" aria-pressed={favorited} disabled={interactionsDisabled} onclick={toggleFavorite}>
+          <Heart class="size-4" aria-hidden="true" />
+          {favorited ? 'Favorited' : 'Favorite'} ({likeCount})
         </Button>
-      {:else}
-        <p class="m-0 inline-flex items-center gap-2 rounded-full border border-line bg-soft px-4 py-2 text-sm font-extrabold text-muted">
-          <Pin class="size-4" aria-hidden="true" />
-          Pin requires a full account
-        </p>
-      {/if}
-    </div>
-  {/if}
+        <Button variant="secondary" type="button" aria-pressed={saved} disabled={interactionsDisabled} onclick={toggleSave}>
+          <Bookmark class="size-4" aria-hidden="true" />
+          {saved ? 'Saved' : 'Save'}
+        </Button>
+        <Button variant="secondary" type="button" disabled={interactionsDisabled} onclick={shareTelegram}>
+          <Send class="size-4" aria-hidden="true" />
+          Send
+        </Button>
+      </div>
+    {/if}
 
-  {#if showSharing}
-    <div class="flex flex-wrap gap-2" aria-label="Share and safety actions">
-      <Button variant="secondary" type="button" disabled={pending !== null} onclick={shareTelegram}>
-        <Send class="size-4" aria-hidden="true" />
-        Share to Telegram
-      </Button>
-      <Button variant="secondary" type="button" disabled={pending !== null} onclick={copyLink}>
-        <Copy class="size-4" aria-hidden="true" />
-        Copy link
-      </Button>
-      <Button variant="secondary" type="button" disabled={pending !== null || !canDownload} onclick={downloadMeme}>
-        <Download class="size-4" aria-hidden="true" />
-        {canDownload ? 'Download' : 'Download unavailable'}
-      </Button>
-      <Button variant="ghost" type="button" disabled={pending !== null} onclick={openReportForm}>
-        <Flag class="size-4" aria-hidden="true" />
-        Report
-      </Button>
-    </div>
-  {/if}
-
-  <Menu.Root>
-    <Menu.Trigger aria-label={compact ? `Actions for ${title}` : 'Meme actions'} disabled={pending !== null}>
+    <Menu.Root>
+    <Menu.Trigger aria-label={compact ? `Actions for ${title}` : 'Meme actions'} disabled={interactionsDisabled}>
       <MoreHorizontal class="size-5" aria-hidden="true" />
     </Menu.Trigger>
     <Menu.Content>
       <Menu.Item onSelect={toggleFavorite} disabled={pending !== null}>
         <Heart class="size-4" aria-hidden="true" />
-        {favorited ? 'Unlike' : 'Like'} meme
+        {favorited ? 'Remove favorite' : 'Favorite'} meme
       </Menu.Item>
       <Menu.Item onSelect={toggleSave} disabled={pending !== null}>
         <Bookmark class="size-4" aria-hidden="true" />
@@ -284,9 +355,9 @@
         </Menu.Item>
       {/if}
       <Menu.Separator />
-      <Menu.Item onSelect={shareTelegram}><Send class="size-4" aria-hidden="true" />Share to Telegram</Menu.Item>
-      <Menu.Item onSelect={copyLink}><Copy class="size-4" aria-hidden="true" />Copy link</Menu.Item>
-      <Menu.Item onSelect={downloadMeme} disabled={!canDownload}>
+      <Menu.Item onSelect={shareTelegram} disabled={pending !== null}><Send class="size-4" aria-hidden="true" />Send to Telegram</Menu.Item>
+      <Menu.Item onSelect={copyLink} disabled={pending !== null}><Copy class="size-4" aria-hidden="true" />Copy link</Menu.Item>
+      <Menu.Item onSelect={downloadMeme} disabled={!canDownload || pending !== null}>
         <Download class="size-4" aria-hidden="true" />
         {canDownload ? 'Download' : 'Download unavailable'}
       </Menu.Item>
@@ -296,7 +367,8 @@
         Report meme
       </Menu.Item>
     </Menu.Content>
-  </Menu.Root>
+    </Menu.Root>
+  {/if}
 
   {#if reportOpen}
     <form class="grid w-full max-w-sm gap-2 rounded-2xl border border-line bg-paper p-3 shadow-warm" onsubmit={handleReportSubmit}>

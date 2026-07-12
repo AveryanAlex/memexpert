@@ -5,7 +5,7 @@ import type { PublicTrendAggregatePointRead, PublicTrendMetricsRead, PublicTrend
 import TrendAggregateHistory from './TrendAggregateHistory.svelte';
 
 describe('TrendAggregateHistory', () => {
-  it('renders a real multi-point aggregate chart and exact-value table', () => {
+  it('plots the documented recorded-activity total and provides the same value in its table', () => {
     const { body } = render(TrendAggregateHistory, {
       props: {
         summary: summaryPayload({
@@ -17,18 +17,22 @@ describe('TrendAggregateHistory', () => {
       }
     });
 
-    expect(body).toContain('Aggregate history');
-    expect(body).toContain('Reaction memes aggregate history line chart');
-    expect(body).toContain('Exact aggregate history values for Reaction memes');
-    expect(body).toContain('Aggregate popularity score');
+    expect(body).toContain('Recorded activity over time');
+    expect(body).toContain('Reaction memes recorded activity over time');
+    expect(body).toContain('Recorded activity details for Reaction memes');
+    expect(body).toContain('Recorded activity adds original-source views, reactions, and reposts');
     expect(body).toContain('Jan 1, 2026');
-    expect(body).toContain('150.0');
-    expect(body).toContain('Source views');
-    expect(body).toContain('Platform views');
-    expect(body).not.toContain('Only one real aggregate point is available');
+    expect(body).toContain('Original sources');
+    expect(body).toContain('MemeExpert');
+    expect(body).toContain('26');
+    expect(body).toContain('40');
+    expect(body).not.toContain('Aggregate popularity score');
+    expect(body).not.toContain('150.0');
+    expect(body).not.toContain('Source views');
+    expect(body).not.toContain('history points');
   });
 
-  it('renders a one-point insufficient-history state without a fake line', () => {
+  it('renders a friendly one-point state without a fake line', () => {
     const { body } = render(TrendAggregateHistory, {
       props: {
         summary: summaryPayload({
@@ -38,13 +42,14 @@ describe('TrendAggregateHistory', () => {
       }
     });
 
-    expect(body).toContain('Insufficient aggregate history');
-    expect(body).toContain('Only one real aggregate point is available');
-    expect(body).toContain('Exact aggregate history values for Reaction memes');
-    expect(body).not.toContain('aggregate history line chart');
+    expect(body).toContain('A new trend is taking shape');
+    expect(body).toContain('Come back soon to see how it changes.');
+    expect(body).toContain('Recorded activity details for Reaction memes');
+    expect(body).not.toContain('Insufficient aggregate history');
+    expect(body).not.toContain('recorded activity over time line chart');
   });
 
-  it('renders an honest current-only empty state when aggregate points are missing', () => {
+  it('renders a friendly empty state when activity has not appeared yet', () => {
     const { body } = render(TrendAggregateHistory, {
       props: {
         summary: summaryPayload({
@@ -55,8 +60,10 @@ describe('TrendAggregateHistory', () => {
       }
     });
 
-    expect(body).toContain('Aggregate history unavailable');
-    expect(body).toContain('No historical aggregate snapshot points exist; using the current public trend window only.');
+    expect(body).toContain('Nothing to chart yet');
+    expect(body).toContain('Activity will appear here as this collection of memes catches on.');
+    expect(body).not.toContain('No historical aggregate snapshot points exist; using the current public trend window only.');
+    expect(body).not.toContain('current window only');
     expect(body).not.toContain('<table');
   });
 });

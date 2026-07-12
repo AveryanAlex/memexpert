@@ -10,41 +10,50 @@ describe('MemeActionMenu viewer capabilities', () => {
   it('renders grid cards under full-account context without account props', () => {
     const { body } = render(MemeGrid, {
       props: {
-        memes: [memeCard('11111111-1111-4111-8111-111111111111', 'Context pin meme')]
+        memes: [memeCard('11111111-1111-4111-8111-111111111111', 'Context pin meme')],
+        bulk: { enabled: true }
       },
       context: viewerContext(true)
     });
 
     expect(body).toContain('Actions for Context pin meme');
+    expect(body).toContain('Favorite');
+    expect(body).toContain('Save');
+    expect(body).toContain('Send');
+    expect(body).toContain('Select items');
+    expect(body).not.toContain('Bulk actions');
+    expect(body).not.toContain('type="checkbox"');
     expect(body).not.toContain('Pin requires a full account');
   });
 
-  it('shows the primary Pin action for full accounts', () => {
+  it('renders labeled detail actions and keeps the overflow available for full accounts', () => {
     const { body } = render(MemeActionMenu, {
       props: {
         meme: memeCard('33333333-3333-4333-8333-333333333333', 'Full pin meme'),
-        showPrimary: true
+        surface: 'detail'
       },
       context: viewerContext(true)
     });
 
-    expect(body).toContain('Like (4)');
-    expect(body).toContain('Pin');
+    expect(body).toContain('Favorite (4)');
+    expect(body).toContain('Save');
+    expect(body).toContain('Send');
+    expect(body).toContain('aria-label="Meme actions"');
     expect(body).not.toContain('Pin requires a full account');
   });
 
-  it('shows the primary Pin restriction for guest and non-full accounts', () => {
+  it('does not expose the Pin action to guest and non-full accounts', () => {
     const { body } = render(MemeActionMenu, {
       props: {
         meme: memeCard('22222222-2222-4222-8222-222222222222', 'Guest pin meme'),
-        showPrimary: true
+        surface: 'detail'
       },
       context: viewerContext(false)
     });
 
-    expect(body).toContain('Like (4)');
-    expect(body).toContain('Pin requires a full account');
-    expect(body).not.toContain('>Pin</button>');
+    expect(body).toContain('Favorite (4)');
+    expect(body).not.toContain('Pin requires a full account');
+    expect(body).not.toContain('>Pin</');
   });
 });
 

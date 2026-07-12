@@ -12,8 +12,15 @@ test('Telegram Mini App launch authenticates, applies shell state, and routes me
   await expect(authResponse.json()).resolves.not.toHaveProperty('access_token');
   await expect(page).toHaveURL(/\/memes\/smoke-test-cat-reaction$/);
   await expect(page.getByRole('heading', { name: 'Smoke test cat reaction' })).toBeVisible();
-  await expect(page.getByText('Full profile')).toBeVisible();
-  await expect(page.getByText('Connected: Telegram')).toBeVisible();
+  const brand = page.locator('.app-shell-brand');
+  const accountControl = page.locator('.app-shell-account');
+  const miniAppShell = page.locator('.telegram-miniapp-shell');
+  await expect(brand).toHaveCount(1);
+  await expect(brand).toBeHidden();
+  await expect(accountControl).toHaveCount(1);
+  await expect(accountControl).toBeHidden();
+  await expect(page.getByRole('search')).toBeVisible();
+  await expect(miniAppShell).toHaveCSS('background-color', 'rgb(16, 24, 32)');
 
   const cookie = (await page.context().cookies()).find((item) => item.name === 'memexpert_access_token');
   expect(cookie?.value).toBe('miniapp-full');

@@ -1,13 +1,13 @@
-import { fail, type Cookies } from '@sveltejs/kit';
-import type { Actions, PageServerLoad } from './$types';
-import { DEFAULT_PAGE_SIZE, ApiError, createCollection, emptyMemePage, fetchCollections, fetchHomeFeed, fetchMemeOfTheDay, fetchMemePage, type ApiFetch } from '$lib/api/client';
+import type { Cookies } from '@sveltejs/kit';
+import type { PageServerLoad } from './$types';
+import { DEFAULT_PAGE_SIZE, ApiError, emptyMemePage, fetchHomeFeed, fetchMemeOfTheDay, fetchMemePage, type ApiFetch } from '$lib/api/client';
 import type { PublicMemeOfTheDayRead } from '$lib/api/types';
 import { ACCESS_COOKIE_NAME, apiBaseUrl, cookieHeaderWithAccessToken, forwardBackendAccessCookie } from '$lib/server/backend';
 
 export const load: PageServerLoad = async ({ cookies, fetch, parent, request, url }) => {
   const query = (url.searchParams.get('q') ?? '').trim();
   const offset = readOffset(url.searchParams.get('offset'));
-  const { session } = await parent();
+  await parent();
   const cookieHeader = cookieHeaderWithAccessToken(
     request.headers.get('cookie') ?? undefined,
     cookies.get(ACCESS_COOKIE_NAME) ?? null
@@ -17,7 +17,7 @@ export const load: PageServerLoad = async ({ cookies, fetch, parent, request, ur
   const memeOfTheDayPromise = loadMemeOfTheDay({ fetch, baseUrl: backendBaseUrl, cookieHeader, cookies });
 
   try {
-    const [page, collections, memeOfTheDayResult] = await Promise.all([
+    const [page, memeOfTheDayResult] = await Promise.all([
       feedSource === 'home'
         ? fetchHomeFeed({
             fetch,
@@ -34,22 +34,11 @@ export const load: PageServerLoad = async ({ cookies, fetch, parent, request, ur
             offset,
             cookieHeader
           }),
-      session
-        ? fetchCollections({
-            fetch,
-            baseUrl: backendBaseUrl,
-            cookieHeader,
-            onResponse: (response) => {
-              forwardBackendAccessCookie(response, cookies);
-            }
-          }).catch(() => null)
-        : Promise.resolve(null),
       memeOfTheDayPromise
     ]);
 
     return {
       page,
-      collections,
       query,
       offset,
       feedSource,
@@ -63,7 +52,6 @@ export const load: PageServerLoad = async ({ cookies, fetch, parent, request, ur
     if (error instanceof ApiError) {
       return {
         page: emptyMemePage(DEFAULT_PAGE_SIZE, offset),
-        collections: null,
         query,
         offset,
         feedSource,
@@ -75,7 +63,6 @@ export const load: PageServerLoad = async ({ cookies, fetch, parent, request, ur
 
     return {
       page: emptyMemePage(DEFAULT_PAGE_SIZE, offset),
-      collections: null,
       query,
       offset,
       feedSource,
@@ -83,33 +70,6 @@ export const load: PageServerLoad = async ({ cookies, fetch, parent, request, ur
       memeOfTheDay: memeOfTheDayResult.memeOfTheDay,
       memeOfTheDayErrorMessage: memeOfTheDayResult.errorMessage
     };
-  }
-};
-
-export const actions: Actions = {
-  createCollection: async ({ cookies, fetch, request }) => {
-    const form = await request.formData();
-    try {
-      const created = await createCollection({
-        fetch,
-        baseUrl: apiBaseUrl(),
-        cookieHeader: request.headers.get('cookie') ?? undefined,
-        body: {
-          title: String(form.get('title') ?? ''),
-          description: String(form.get('description') ?? ''),
-          visibility: form.get('visibility') === 'unlisted' ? 'unlisted' : 'private'
-        },
-        onResponse: (response) => {
-          forwardBackendAccessCookie(response, cookies);
-        }
-      });
-
-      return { collectionCreatedId: created.collection.id, successMessage: 'Collection created.' };
-    } catch (error) {
-      return fail(error instanceof ApiError && error.status === 403 ? 403 : 400, {
-        collectionError: error instanceof Error ? error.message : 'Could not create collection.'
-      });
-    }
   }
 };
 

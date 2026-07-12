@@ -585,6 +585,11 @@ const server = createServer((request, response) => {
     return;
   }
 
+  if (/^\/api\/v1\/memes\/[^/]+\/(?:favorite|save|pin)$/.test(url.pathname)) {
+    sendJson(response, 200, request.method === 'DELETE' ? { removed: true } : { ok: true });
+    return;
+  }
+
   sendJson(response, 404, { detail: `Unhandled smoke API route: ${url.pathname}` });
 });
 

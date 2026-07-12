@@ -6,7 +6,7 @@ import { parseSearchParams } from '$lib/searchParams';
 import SearchPage from '../routes/search/+page.svelte';
 
 describe('/search page', () => {
-  it('renders URL-backed scope and collection search controls', () => {
+  it('renders compact consumer controls and native collection values while the filter drawer is closed', () => {
     const { body } = render(SearchPage, {
       props: {
         data: {
@@ -22,55 +22,26 @@ describe('/search page', () => {
       }
     });
 
-    expect(body).toContain('Refine the global search.');
-    expect(body).toContain('Search scope');
-    expect(body).toContain('Specific collections');
-    expect(body).toContain('My private saves');
-    expect(body).toContain('All I can access');
-    expect(body).toContain('Search only memes anyone can open.');
-    expect(body).toContain('Search only memes saved in the readable collections selected below.');
-    expect(body).toContain('collection_ids');
-    expect(body).toContain('Team saves');
-    expect(body).toContain('1 selected from the current URL');
-    expect(body).toContain('Browsing specific collections');
+    const text = visibleText(body);
+
+    expect(text).toContain('Search memes');
+    expect(text).toContain('Filters');
+    expect(text).toContain('Specific collections');
+    expect(text).toContain('Team saves');
+    expect(text).toContain('Browsing selected collections');
+    expect(text).not.toContain('Search workspace');
+    expect(text).not.toContain('URL-backed filter workspace');
+    expect(text).not.toContain('collection_ids');
+    expect(body).toMatch(/<form[^>]+method="GET"[^>]+action="\/search"[^>]*>/);
+    expect(body).toMatch(/<input[^>]+type="hidden"[^>]+name="collection_ids"[^>]+value="team-id"[^>]*>/);
+    expect(body).not.toContain('data-dialog-content');
+    expect(body.match(/<input(?=[^>]*name="q")(?=[^>]*type="search")[^>]*>/g)).toHaveLength(1);
+    const removeCollectionHref = body.match(/href="([^"]+)" aria-label="Remove Team saves filter"/)?.[1]?.replaceAll('&amp;', '&');
+    expect(removeCollectionHref).toContain('scope=public');
+    expect(removeCollectionHref).not.toContain('collection_ids');
   });
 
-  it('renders compact collection filter degraded states', () => {
-    const noSession = render(SearchPage, {
-      props: {
-        data: {
-          session: null,
-          sessionError: null,
-          page: emptyPage(),
-          collections: null,
-          filters: parseSearchParams(new URLSearchParams('scope=collections')),
-          seo: { canonicalUrl: 'https://memexpert.test/search', noindex: false },
-          errorMessage: null,
-          collectionErrorMessage: null
-        }
-      }
-    });
-    const loadError = render(SearchPage, {
-      props: {
-        data: {
-          session: sessionPayload(),
-          sessionError: null,
-          page: emptyPage(),
-          collections: null,
-          filters: parseSearchParams(new URLSearchParams('scope=collections')),
-          seo: { canonicalUrl: 'https://memexpert.test/search', noindex: false },
-          errorMessage: null,
-          collectionErrorMessage: 'Forbidden collection list.'
-        }
-      }
-    });
-
-    expect(noSession.body).toContain('Sign in to load collection choices. Public search remains available.');
-    expect(loadError.body).toContain('Forbidden collection list.');
-    expect(loadError.body).toContain('Collection choices could not load; text, tag, scope, media, language, and NSFW filters still work.');
-  });
-
-  it('renders selected collection labels, URL fallback summaries, and empty actions', () => {
+  it('renders removable named collection chips and consumer-safe fallback labels', () => {
     const { body } = render(SearchPage, {
       props: {
         data: {
@@ -78,7 +49,11 @@ describe('/search page', () => {
           sessionError: null,
           page: emptyPage(),
           collections: collectionList(),
-          filters: parseSearchParams(new URLSearchParams('q=missing&scope=collections&collection_ids=team-id&collection_ids=archived-id')),
+          filters: parseSearchParams(
+            new URLSearchParams(
+              'q=missing&tags=reaction&include_nsfw=true&media_type=gif&language=en&scope=collections&collection_ids=team-id&collection_ids=archived-id'
+            )
+          ),
           seo: { canonicalUrl: 'https://memexpert.test/search', noindex: true },
           errorMessage: null,
           collectionErrorMessage: null
@@ -86,16 +61,27 @@ describe('/search page', () => {
       }
     });
 
-    expect(body).toContain('Results for “missing”');
-    expect(body).toContain('Team saves');
-    expect(body).toContain('2 selected from the current URL');
-    expect(body).toContain('1 selected collection');
-    expect(body).toContain('No memes found');
-    expect(body).toContain('Try a shorter phrase, remove a tag, or broaden media and language filters.');
-    expect(body).toContain('Browse everything');
+    const text = visibleText(body);
+
+    expect(text).toContain('Results for “missing”');
+    expect(text).toContain('#reaction ×');
+    expect(body).toContain('aria-label="Remove reaction filter"');
+    expect(text).toContain('GIFs');
+    expect(text).toContain('English');
+    expect(text).toContain('Sensitive content');
+    expect(text).toContain('Team saves');
+    expect(body).toContain('aria-label="Remove Team saves filter"');
+    expect(text).toContain('Selected collection');
+    expect(text).not.toContain('2 selected from the current URL');
+    expect(text).not.toContain('collection_ids');
+    expect(body).toContain('collection_ids=archived-id');
+    expect(body).not.toContain('collection%5Fids');
+    expect(text).toContain('No memes found');
+    expect(text).toContain('Try a shorter phrase, remove a tag, or broaden media and language filters.');
+    expect(text).toContain('Browse everything');
   });
 
-  it('keeps collection controls enabled in the default public state for native form submission', () => {
+  it('keeps the closed drawer out of SSR output while showing search ideas', () => {
     const { body } = render(SearchPage, {
       props: {
         data: {
@@ -111,17 +97,16 @@ describe('/search page', () => {
       }
     });
 
-    const fieldset = body.match(/<fieldset[^>]+aria-describedby="collection-filter-help collection-filter-state"[^>]*>/)?.[0] ?? '';
-    const collectionInput = body.match(/<input[^>]+name="collection_ids"[^>]+value="team-id"[^>]*>/)?.[0] ?? '';
+    const text = visibleText(body);
 
-    expect(body).toContain('Browsing public catalog');
-    expect(body).toContain('Choose Specific collections above to enable collection filters.');
-    expect(body).toContain('Team saves');
-    expect(fieldset).not.toContain('disabled');
-    expect(collectionInput).toContain('name="collection_ids"');
-    expect(collectionInput).not.toContain('disabled');
-    expect(body).toContain('No memes found');
-    expect(body).not.toContain('Clear all');
+    expect(text).toContain('Browsing public memes');
+    expect(text).toContain('Try a search');
+    expect(text).toContain('Cat reactions');
+    expect(text).toContain('Browse categories');
+    expect(text).not.toContain('Recent searches');
+    expect(text).toContain('No memes found');
+    expect(text).not.toContain('Discovery filters');
+    expect(body).not.toContain('data-dialog-content');
   });
 
   it('renders a compact search error state without empty-state actions', () => {
@@ -140,13 +125,25 @@ describe('/search page', () => {
       }
     });
 
-    expect(body).toContain('Results for “vault”');
-    expect(body).toContain('Specific collections');
-    expect(body).toContain('Sign in with access to this collection to search it.');
-    expect(body).toContain('Retry');
-    expect(body).not.toContain('Browse everything');
+    const text = visibleText(body);
+
+    expect(text).toContain('Results for “vault”');
+    expect(text).toContain('Specific collections');
+    expect(text).toContain('Sign in with access to this collection to search it.');
+    expect(text).toContain('Retry');
+    expect(text).not.toContain('Browse everything');
   });
 });
+
+function visibleText(body: string): string {
+  return body
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, '&')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
 
 function emptyPage(): PublicMemeSearchPageRead {
   return {

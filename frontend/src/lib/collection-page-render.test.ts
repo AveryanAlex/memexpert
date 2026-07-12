@@ -44,6 +44,12 @@ describe('/collection/[id] page', () => {
     });
 
     expect(body).toContain('Launch saves');
+    expect(body).toContain('Save destination');
+    expect(body).toContain('action="?/setActive"');
+    expect(body).toContain('Invite link created.');
+    expect(body).toContain('Manage collection');
+    expect(body).toContain('<details');
+    expect(body).toContain('<summary');
     expect(body).toContain('Collection details');
     expect(body).toContain('Invite link');
     expect(body).toContain('Copy');
@@ -53,6 +59,28 @@ describe('/collection/[id] page', () => {
     expect(body).toContain('Danger zone');
     expect(body).toContain('Launch reaction');
     expect(body).toContain('Remove');
+
+    const saveDestinationIndex = body.indexOf('Save destination');
+    const savedMemeIndex = body.indexOf('Launch reaction');
+    const detailsStart = body.indexOf('<details');
+    const detailsEnd = body.indexOf('</details>', detailsStart);
+    const managementMarkup = body.slice(detailsStart, detailsEnd);
+
+    expect(saveDestinationIndex).toBeLessThan(savedMemeIndex);
+    expect(savedMemeIndex).toBeLessThan(detailsStart);
+    expect(detailsEnd).toBeGreaterThan(detailsStart);
+    expect(managementMarkup).toContain('Collection details');
+    expect(managementMarkup).toContain('Create invite');
+    expect(managementMarkup).toContain('Update role');
+    expect(managementMarkup).toContain('Danger zone');
+    expect(managementMarkup).toContain('action="?/update"');
+    expect(managementMarkup).toContain('action="?/createInvite"');
+    expect(managementMarkup).toContain('action="?/delete"');
+    expect(managementMarkup).toContain('action="?/updateMemberRole"');
+    expect(managementMarkup).toContain('action="?/removeMember"');
+    expect(managementMarkup).toContain('action="?/revokeInvite"');
+    expect(managementMarkup).toContain('name="member_user_id"');
+    expect(managementMarkup).toContain('name="invite_id"');
   });
 
   it('renders view-only empty state without owner controls', () => {

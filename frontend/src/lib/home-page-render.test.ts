@@ -7,7 +7,6 @@ import type {
   PublicMemeCardRead,
   PublicMemeOfTheDayRead,
   PublicMemeSearchPageRead,
-  WebCollectionListRead
 } from '$lib/api/types';
 import HomePage from '../routes/+page.svelte';
 
@@ -32,28 +31,25 @@ describe('/ page', () => {
           session: fullSession(),
           sessionError: null,
           page,
-          collections: collectionList(),
           query: '',
           offset: 0,
           feedSource: 'home',
           errorMessage: null,
           memeOfTheDay: null,
           memeOfTheDayErrorMessage: null
-        },
-        form: null
+        }
       }
     });
 
-    expect(body).toContain('Your meme feed, tuned by every save.');
-    expect(body).toContain('For You');
-    expect(body).toContain('Open Trends');
-    expect(body).toContain('Your collections');
-    expect(body).toContain('Favorites');
-    expect(body).toContain('Personalized for you');
-    expect(body).toContain('Based on your recent MemeXpert likes');
+    expect(body).toContain('Discover');
+    expect(body).toContain('Fresh memes, ready to send.');
+    expect(body).toContain('Discover more');
     expect(body).toContain('SSR cat reaction');
     expect(body).toContain('SSR launch mood');
     expect(body).toContain('SSR video mood');
+    expect(body).toContain('Favorite');
+    expect(body).toContain('Save');
+    expect(body).toContain('Send');
     expect(body).toContain('Showing 3 of 8');
     expect(body).toContain('Load more');
     expect(body).toContain('role="list"');
@@ -61,6 +57,10 @@ describe('/ page', () => {
     expect(body).toContain('loading="lazy"');
     expect(body).toContain('preload="none"');
     expect(body).toContain('Actions for SSR cat reaction');
+    expect(body).not.toContain('Your collections');
+    expect(body).not.toContain('Create collection');
+    expect(body).not.toContain('Bulk actions');
+    expect(body).not.toContain('Algorithm');
     expect(body).not.toContain('Find the right meme fast.');
     expect(body).not.toContain('action="/search"');
     expect(body).not.toContain('Previous');
@@ -74,9 +74,12 @@ describe('/ page', () => {
 
     expect(body).toContain('Meme of the Day');
     expect(body).toContain('Daily pick reaction');
-    expect(body).toContain('Selected 2026-06-20');
-    expect(body).toContain('12 candidates');
-    expect(body).toContain('Algorithm motd-v1');
+    expect(body).toContain('Daily pick');
+    expect(body.indexOf('Meme of the Day')).toBeLessThan(body.indexOf('Daily pick reaction'));
+    expect(body.indexOf('Meme of the Day')).toBeLessThan(body.indexOf('Reactions'));
+    expect(body).not.toContain('Selected 2026-06-20');
+    expect(body).not.toContain('12 candidates');
+    expect(body).not.toContain('Algorithm motd-v1');
   });
 
   it('keeps MOTD attribution in rendered meme links for telemetry handoff', () => {
@@ -97,8 +100,9 @@ describe('/ page', () => {
 
     expect(body).toContain('Meme of the Day');
     expect(body).toContain('No Meme of the Day yet');
-    expect(body).toContain('did not find an eligible public meme for 2026-06-20');
-    expect(body).toContain('0 candidates');
+    expect(body).toContain('Check back soon for a fresh pick.');
+    expect(body).not.toContain('did not find an eligible public meme');
+    expect(body).not.toContain('0 candidates');
   });
 
   it('renders a separate Meme of the Day error state', () => {
@@ -112,23 +116,24 @@ describe('/ page', () => {
     expect(body).toContain('SSR fallback reaction');
   });
 
-  it('renders distinct cold-start trending copy for full and guest sessions', () => {
+  it('keeps fallback attribution out of consumer-facing home copy', () => {
     const page = homePageWithAttribution('fallback_trending', 'cold_start_no_positive_signals');
 
     const full = renderHome(page, fullSession());
     const guest = renderHome(page, guestSession());
 
-    expect(full).toContain('Trending while we learn your taste');
-    expect(full).toContain('turn this cold-start feed into personal recommendations');
-    expect(guest).toContain('Trending for guests');
-    expect(guest).toContain('A cold-start feed from public activity');
+    expect(full).toContain('Discover more');
+    expect(guest).toContain('Discover more');
+    expect(full).not.toContain('Trending while we learn your taste');
+    expect(guest).not.toContain('Trending for guests');
+    expect(full).toContain('data-discovery-source="fallback_trending"');
   });
 
-  it('renders degraded recommendation fallback copy from backend attribution', () => {
+  it('does not show backend degradation details from attribution', () => {
     const body = renderHome(homePageWithAttribution('fallback_trending', 'qdrant_failure'), fullSession());
 
-    expect(body).toContain('Trending fallback');
-    expect(body).toContain('Recommendations are temporarily degraded');
+    expect(body).not.toContain('Trending fallback');
+    expect(body).not.toContain('Recommendations are temporarily degraded');
   });
 
   it('renders the home feed empty state', () => {
@@ -143,10 +148,10 @@ describe('/ page', () => {
 
     const body = renderHome(page, guestSession());
 
-    expect(body).toContain('Guest home feed');
+    expect(body).toContain('Discover more');
     expect(body).toContain('No home feed memes yet');
-    expect(body).toContain('Try Search or check back after the public catalog has more memes.');
-    expect(body).toContain('Open search');
+    expect(body).toContain('Try Search or check back soon.');
+    expect(body).toContain('Search memes');
   });
 });
 
@@ -162,15 +167,13 @@ function renderHome(page: PublicMemeSearchPageRead, session: CurrentSessionRead,
         session,
         sessionError: null,
         page,
-        collections: collectionList(),
         query: '',
         offset: 0,
         feedSource: 'home',
         errorMessage: null,
         memeOfTheDay: options.memeOfTheDay ?? null,
         memeOfTheDayErrorMessage: options.memeOfTheDayErrorMessage ?? null
-      },
-      form: null
+      }
     }
   });
 
@@ -286,43 +289,6 @@ function guestSession(): CurrentSessionRead {
       google_linked: false,
       telegram_linked: false
     }
-  };
-}
-
-function collectionList(): WebCollectionListRead {
-  const collection = {
-    id: '44444444-4444-4444-8444-444444444444',
-    owner_id: '33333333-3333-4333-8333-333333333333',
-    title: 'Favorites',
-    description: null,
-    kind: 'favorites' as const,
-    visibility: 'private' as const,
-    memberships: [],
-    invites: [],
-    created_at: '2026-01-01T00:00:00Z',
-    updated_at: '2026-01-01T00:00:00Z'
-  };
-
-  return {
-    active_save_collection_id: collection.id,
-    collections: [
-      {
-        collection,
-        viewer_role: 'owner',
-        capabilities: {
-          can_view: true,
-          can_add_memes: true,
-          can_remove_memes: false,
-          can_rename: false,
-          can_delete: false,
-          can_create_invites: false,
-          can_revoke_invites: false,
-          can_manage_members: false,
-          can_set_active_save: true
-        },
-        active_save_collection_id: collection.id
-      }
-    ]
   };
 }
 

@@ -16,15 +16,15 @@
   type AggregateDatum = {
     observedAtMs: number;
     observedAt: string | null;
-    value: number;
-    metric: string;
-    label: string;
-    memeCount: number;
-    snapshotCount: number;
+    activity: number;
+    sourceActivity: number;
+    memeExpertActivity: number;
   };
 
   const numberFormatter = new Intl.NumberFormat('en');
   const lineColor = '#b45309';
+  const recordedActivityDescription =
+    'Recorded activity adds original-source views, reactions, and reposts to MemeExpert views, sends, saves, and favorites. It counts signals, not unique people.';
   const visiblePoints = $derived(summary.points ?? []);
   const chartData: AggregateDatum[] = $derived(
     visiblePoints
@@ -32,7 +32,6 @@
       .filter((point): point is AggregateDatum => point !== null)
   );
   const canRenderLine = $derived(visiblePoints.length >= 2 && chartData.length >= 2);
-  const metricLabel = $derived(visiblePoints.at(-1)?.label ?? 'Aggregate popularity score');
   const firstObservedAt = $derived(chartData.at(0)?.observedAt ?? visiblePoints.at(0)?.observed_at ?? null);
   const lastObservedAt = $derived(chartData.at(-1)?.observedAt ?? visiblePoints.at(-1)?.observed_at ?? null);
   const xDomain = $derived.by(() => {
@@ -45,7 +44,7 @@
     return min === max ? [min - 86_400_000, max + 86_400_000] : [min, max];
   });
   const yDomain = $derived.by(() => {
-    const values = chartData.map((point) => point.value);
+    const values = chartData.map((point) => point.activity);
     if (values.length === 0) return undefined;
 
     const min = Math.min(...values);
@@ -53,18 +52,12 @@
 
     return min === max ? [min - 1, max + 1] : undefined;
   });
-  const stateTitle = $derived(visiblePoints.length === 0 ? 'Aggregate history unavailable' : 'Insufficient aggregate history');
-  const stateMessage = $derived.by(() => {
-    if (visiblePoints.length === 0) {
-      return summary.no_data_reason ?? summary.current_only_reason ?? 'No real aggregate history points are available yet.';
-    }
-
-    if (visiblePoints.length >= 2 && chartData.length < 2) {
-      return 'Aggregate points are available, but at least two dated points are required to draw a truthful time line.';
-    }
-
-    return summary.current_only_reason ?? 'Only one real aggregate point is available. A line chart needs at least two real points.';
-  });
+  const stateTitle = $derived(visiblePoints.length === 0 ? 'Nothing to chart yet' : 'A new trend is taking shape');
+  const stateMessage = $derived(
+    visiblePoints.length === 0
+      ? 'Activity will appear here as this collection of memes catches on.'
+      : 'Come back soon to see how it changes.'
+  );
 
   function pointToDatum(point: PublicTrendAggregatePointRead): AggregateDatum | null {
     const observedAtMs = observedAtToTimestamp(point.observed_at);
@@ -73,11 +66,9 @@
     return {
       observedAtMs,
       observedAt: point.observed_at,
-      value: point.value,
-      metric: point.metric,
-      label: point.label,
-      memeCount: point.meme_count ?? 0,
-      snapshotCount: point.snapshot_count ?? 0
+      activity: recordedActivity(point),
+      sourceActivity: sourceActivity(point),
+      memeExpertActivity: memeExpertActivity(point)
     };
   }
 
@@ -89,44 +80,62 @@
   }
 
   function formatObservedAt(raw: string | null): string {
-    if (!raw) return 'current window';
+    if (!raw) return 'This week';
 
     const date = new Date(raw);
-    if (Number.isNaN(date.getTime())) return raw;
+    if (Number.isNaN(date.getTime())) return 'This week';
 
     return new Intl.DateTimeFormat('en', { month: 'short', day: 'numeric', year: 'numeric' }).format(date);
   }
 
-  function formatValue(value: number): string {
-    return value.toFixed(1);
+  function formatCount(value: number | null | undefined): string {
+    return numberFormatter.format(count(value));
   }
 
-  function formatCount(value: number | null | undefined): string {
-    return numberFormatter.format(value ?? 0);
+  /**
+   * Recorded activity is deliberately an unweighted count of all available
+   * source and MemeExpert signals, rather than the API's popularity score.
+   * The sources can overlap, so it is not a unique-person count.
+   */
+  function recordedActivity(point: PublicTrendAggregatePointRead): number {
+    return sourceActivity(point) + memeExpertActivity(point);
+  }
+
+  function sourceActivity(point: PublicTrendAggregatePointRead): number {
+    return count(point.source_views) + count(point.source_reactions) + count(point.source_reposts);
+  }
+
+  function memeExpertActivity(point: PublicTrendAggregatePointRead): number {
+    return count(point.platform_views) + count(point.platform_sends) + count(point.platform_saves) + count(point.platform_likes);
+  }
+
+  function count(value: number | null | undefined): number {
+    return typeof value === 'number' && Number.isFinite(value) ? Math.max(value, 0) : 0;
   }
 </script>
 
 {#snippet footer()}
   <span class="inline-flex items-center gap-2 rounded-full border border-line bg-paper px-3 py-2">
     <span class="h-2.5 w-2.5 rounded-full" style:background={lineColor}></span>
-    {metricLabel}
+    Recorded activity
   </span>
   <span class="rounded-full border border-line bg-paper px-3 py-2">
     {formatObservedAt(firstObservedAt)} to {formatObservedAt(lastObservedAt)}
   </span>
 {/snippet}
 
-<section class="grid gap-4" aria-label={`${summary.title} aggregate history`}>
+<section class="grid gap-4" aria-label={`${summary.title} recorded activity over time`}>
   {#if canRenderLine}
     <ChartFrame
-      label="Aggregate history"
-      description="Real aggregate history points for this public tag or template. Exact values are listed in the table below."
+      label="Recorded activity over time"
+      description={`${recordedActivityDescription} A readable table follows.`}
       footer={footer}
     >
+      <p class="sr-only">The vertical axis shows recorded activity signals. The horizontal direction moves from earlier to later activity.</p>
       <LayerChart
         data={chartData}
         x="observedAtMs"
-        y="value"
+        y="activity"
         {xDomain}
         {yDomain}
         xPadding={[10, 10]}
@@ -135,7 +144,7 @@
         tooltip={{ mode: 'quadtree' }}
         ssr
       >
-        <LayerChartSvg title={`${summary.title} aggregate history line chart`}>
+        <LayerChartSvg title={`${summary.title} recorded activity over time`}>
           <LayerChartGrid y={{ class: 'stroke-ink/10' }} yTicks={4} />
           <LayerChartAxis
             placement="left"
@@ -153,10 +162,9 @@
         >
           {#snippet children({ data }: { data: AggregateDatum })}
             <div class="grid gap-1">
-              <p class="m-0 font-extrabold">{data.label}</p>
-              <p class="m-0 text-muted">{formatObservedAt(data.observedAt)} · {data.metric}</p>
-              <p class="m-0 font-extrabold tabular-nums">{formatValue(data.value)}</p>
-              <p class="m-0 text-muted">{formatCount(data.memeCount)} memes · {formatCount(data.snapshotCount)} snapshots</p>
+              <p class="m-0 font-extrabold">{formatObservedAt(data.observedAt)}</p>
+              <p class="m-0 font-extrabold">Recorded activity: {formatCount(data.activity)} signals</p>
+              <p class="m-0 text-muted">Original sources: {formatCount(data.sourceActivity)} · MemeExpert: {formatCount(data.memeExpertActivity)}</p>
             </div>
           {/snippet}
         </LayerChartTooltip.Root>
@@ -170,43 +178,26 @@
   {/if}
 
   {#if visiblePoints.length > 0}
-    <div class="overflow-x-auto rounded-[24px] border border-line bg-paper">
-      <table class="w-full min-w-[980px] border-collapse text-left text-sm">
-        <caption class="sr-only">Exact aggregate history values for {summary.title}</caption>
+    <div class="overflow-x-auto rounded-xl border border-line bg-paper">
+      <table class="w-full min-w-[680px] border-collapse text-left text-sm">
+        <caption class="sr-only">Recorded activity details for {summary.title}</caption>
         <thead>
           <tr class="border-b border-line text-muted">
-            <th class="py-3 pl-4 pr-3" scope="col">Metric</th>
-            <th class="py-3 pr-3" scope="col">Date/window</th>
-            <th class="py-3 pr-3" scope="col">Value</th>
-            <th class="py-3 pr-3" scope="col">Memes</th>
-            <th class="py-3 pr-3" scope="col">Snapshots</th>
-            <th class="py-3 pr-3" scope="col">Source views</th>
-            <th class="py-3 pr-3" scope="col">Source reactions</th>
-            <th class="py-3 pr-3" scope="col">Source reposts</th>
-            <th class="py-3 pr-3" scope="col">Platform views</th>
-            <th class="py-3 pr-3" scope="col">Sends</th>
-            <th class="py-3 pr-3" scope="col">Saves</th>
-            <th class="py-3 pr-4" scope="col">Likes</th>
+            <th class="py-3 pl-4 pr-3" scope="col">Date</th>
+            <th class="py-3 pr-3" scope="col">Recorded activity</th>
+            <th class="py-3 pr-3" scope="col">Original sources</th>
+            <th class="py-3 pr-3" scope="col">MemeExpert</th>
+            <th class="py-3 pr-4" scope="col">Memes</th>
           </tr>
         </thead>
         <tbody>
-          {#each visiblePoints as point (`${point.observed_at ?? 'current'}:${point.metric}:${point.value}`)}
+          {#each visiblePoints as point, index (`${point.observed_at ?? 'current'}:${recordedActivity(point)}:${index}`)}
             <tr class="border-b border-line/70 align-top last:border-b-0">
-              <th class="py-3 pl-4 pr-3 font-extrabold" scope="row">
-                {point.label}
-                <span class="block text-xs font-bold text-muted">{point.metric}</span>
-              </th>
-              <td class="py-3 pr-3">{formatObservedAt(point.observed_at)}</td>
-              <td class="py-3 pr-3 tabular-nums">{formatValue(point.value)}</td>
-              <td class="py-3 pr-3 tabular-nums">{formatCount(point.meme_count)}</td>
-              <td class="py-3 pr-3 tabular-nums">{formatCount(point.snapshot_count)}</td>
-              <td class="py-3 pr-3 tabular-nums">{formatCount(point.source_views)}</td>
-              <td class="py-3 pr-3 tabular-nums">{formatCount(point.source_reactions)}</td>
-              <td class="py-3 pr-3 tabular-nums">{formatCount(point.source_reposts)}</td>
-              <td class="py-3 pr-3 tabular-nums">{formatCount(point.platform_views)}</td>
-              <td class="py-3 pr-3 tabular-nums">{formatCount(point.platform_sends)}</td>
-              <td class="py-3 pr-3 tabular-nums">{formatCount(point.platform_saves)}</td>
-              <td class="py-3 pr-4 tabular-nums">{formatCount(point.platform_likes)}</td>
+              <th class="py-3 pl-4 pr-3 font-extrabold" scope="row">{formatObservedAt(point.observed_at)}</th>
+              <td class="py-3 pr-3 tabular-nums">{formatCount(recordedActivity(point))}</td>
+              <td class="py-3 pr-3 tabular-nums">{formatCount(sourceActivity(point))}</td>
+              <td class="py-3 pr-3 tabular-nums">{formatCount(memeExpertActivity(point))}</td>
+              <td class="py-3 pr-4 tabular-nums">{formatCount(point.meme_count)}</td>
             </tr>
           {/each}
         </tbody>

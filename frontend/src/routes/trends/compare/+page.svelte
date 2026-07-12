@@ -1,59 +1,151 @@
 <script lang="ts">
   import TrendComparisonChart from '$lib/features/trends/TrendComparisonChart.svelte';
   import type { PublicTrendComparisonSeriesRead } from '$lib/api/types';
-  import { ActionLink, Card, EmptyState, Input, Notice, PageHeader } from '$lib/ui';
+  import { ActionLink, Button, Card, EmptyState, Input, Notice, PageHeader } from '$lib/ui';
   import type { PageData } from './$types';
 
   let { data }: { data: PageData } = $props();
 
-  const formItems = $derived([
-    ...data.items,
-    ...Array(Math.max(data.comparison.max_items - data.items.length, 0)).fill('')
-  ].slice(0, data.comparison.max_items));
+  type ComparisonItemType = 'meme' | 'tag' | 'template';
+  type ComparisonFormRow = {
+    kind: ComparisonItemType;
+    identifier: string;
+    original: string;
+    edited: boolean;
+  };
+
+  let formRows = $state<ComparisonFormRow[]>(initialRows());
+  let formRowsKey = $state(initialRowsKey());
+  let enhanced = $state(false);
   const hasRequestedItems = $derived(data.items.length > 0);
-  const limitedSeries = $derived(
-    data.comparison.items.filter((item) => item.no_data_reason || item.current_only_reason || item.insufficient_history || item.points.length < 2)
+  const numberFormatter = new Intl.NumberFormat('en');
+  const recordedActivityDescription =
+    'Recorded activity adds original-source views, reactions, and reposts to MemeExpert views, sends, saves, and favorites. It counts signals, not unique people.';
+  const selectedRows = $derived(
+    formRows
+      .filter((row) => Boolean(serializedItem(row)))
+      .map((row) => ({
+        ...row,
+        title: matchingTitle(row)
+      }))
   );
+  const activityRows = $derived(
+    data.comparison.items.flatMap((item) =>
+      hasRecordedActivityDetails(item)
+        ? item.points.map((point) => ({ item, point }))
+        : []
+    )
+  );
+  const pendingChartItems = $derived(data.comparison.items.filter((item) => !isPlottableSeries(item)));
+
+  $effect(() => {
+    enhanced = true;
+    const nextKey = rowsKey(data.items, data.comparison.max_items);
+    if (nextKey === formRowsKey) return;
+
+    formRows = createFormRows(data.items, data.comparison.max_items);
+    formRowsKey = nextKey;
+  });
 
   function formatObservedAt(raw: string | null): string {
-    if (!raw) return 'current window';
-    return new Intl.DateTimeFormat('en', { month: 'short', day: 'numeric', year: 'numeric' }).format(new Date(raw));
+    if (!raw) return 'This week';
+
+    const date = new Date(raw);
+    if (Number.isNaN(date.getTime())) return 'This week';
+
+    return new Intl.DateTimeFormat('en', { month: 'short', day: 'numeric', year: 'numeric' }).format(date);
   }
 
-  function isAggregateSeries(item: PublicTrendComparisonSeriesRead): boolean {
-    return item.kind === 'tag' || item.kind === 'template';
+  function createFormRows(items: string[], maxItems: number): ComparisonFormRow[] {
+    return Array.from({ length: maxItems }, (_, index) => parseFormRow(items[index] ?? ''));
   }
 
-  function seriesBasis(item: PublicTrendComparisonSeriesRead): string {
-    if (item.kind === 'meme') return 'Per-meme engagement points';
-    if (isAggregateSeries(item)) {
-      return item.current_only_reason ? 'Current-window aggregate fallback' : 'Aggregate history points';
+  function initialRows(): ComparisonFormRow[] {
+    return createFormRows(data.items, data.comparison.max_items);
+  }
+
+  function initialRowsKey(): string {
+    return rowsKey(data.items, data.comparison.max_items);
+  }
+
+  function parseFormRow(serialized: string): ComparisonFormRow {
+    const separatorIndex = serialized.indexOf(':');
+    const possibleKind = separatorIndex > 0 ? serialized.slice(0, separatorIndex) : null;
+
+    if (possibleKind === 'meme' || possibleKind === 'tag' || possibleKind === 'template') {
+      return {
+        kind: possibleKind,
+        identifier: serialized.slice(separatorIndex + 1),
+        original: serialized,
+        edited: false
+      };
     }
-    return 'Requested trend item';
+
+    return { kind: 'meme', identifier: serialized, original: serialized, edited: false };
   }
 
-  function dataStatus(item: PublicTrendComparisonSeriesRead): string {
-    if (item.no_data_reason) return item.no_data_reason;
-    if (item.current_only_reason) return item.current_only_reason;
-    if (item.insufficient_history) {
-      if (item.kind === 'meme') return 'Insufficient history; at least two per-meme engagement points are needed.';
-      if (isAggregateSeries(item) && item.points.length === 1) return 'Insufficient history; one real aggregate point is available.';
-      if (isAggregateSeries(item)) return 'Insufficient aggregate history; no line is drawn.';
-      return 'Insufficient history; no line is drawn.';
-    }
-    if (item.kind === 'meme') return 'Real per-meme engagement history.';
-    if (isAggregateSeries(item)) return 'Real aggregate history points.';
-    return 'Real trend points.';
+  function rowsKey(items: string[], maxItems: number): string {
+    return JSON.stringify({ items, maxItems });
+  }
+
+  function serializedItem(row: ComparisonFormRow): string {
+    if (!row.edited) return row.original;
+
+    const identifier = row.identifier.trim();
+    return identifier ? `${row.kind}:${identifier}` : '';
+  }
+
+  function markEdited(row: ComparisonFormRow): void {
+    row.edited = true;
+  }
+
+  function matchingTitle(row: ComparisonFormRow): string {
+    return data.comparison.items.find((item) => item.kind === row.kind && item.value === row.identifier)?.title ?? row.identifier;
+  }
+
+  function itemTypeLabel(kind: string): string {
+    if (kind === 'tag') return 'Tag';
+    if (kind === 'template') return 'Template';
+    return 'Meme';
+  }
+
+  /** Uses the same unweighted source-plus-MemeExpert signal count as the charts. */
+  function recordedActivity(point: PublicTrendComparisonSeriesRead['points'][number]): number {
+    return sourceActivity(point) + memeExpertActivity(point);
+  }
+
+  function sourceActivity(point: PublicTrendComparisonSeriesRead['points'][number]): number {
+    return count(point.source_views) + count(point.source_reactions) + count(point.source_reposts);
+  }
+
+  function memeExpertActivity(point: PublicTrendComparisonSeriesRead['points'][number]): number {
+    return count(point.platform_views) + count(point.platform_sends) + count(point.platform_saves) + count(point.platform_likes);
+  }
+
+  function isPlottableSeries(item: PublicTrendComparisonSeriesRead): boolean {
+    return item.points.length >= 2 && hasRecordedActivityDetails(item);
+  }
+
+  function hasRecordedActivityDetails(item: PublicTrendComparisonSeriesRead): boolean {
+    return item.points.some((point) => recordedActivity(point) > 0);
+  }
+
+  function formatCount(value: number): string {
+    return numberFormatter.format(value);
+  }
+
+  function count(value: number | null | undefined): number {
+    return typeof value === 'number' && Number.isFinite(value) ? Math.max(value, 0) : 0;
   }
 </script>
 
 <PageHeader
-  title="Compare public trends."
-  description="Share a URL with meme, tag, and template specs. Meme series use source-delta and platform-event engagement points. Tag and template series use aggregate history points when available, or an explicit current-window fallback when history is missing."
-  badge="Shareable URL"
+  title="Compare what is catching on."
+  description="Pick a few memes, tags, or templates to compare their recorded activity over time."
+  badge="Compare"
 >
   <ActionLink href="/trends" variant="secondary">Back to trends</ActionLink>
-  <ActionLink href="/trends/timeline" variant="secondary">Timeline</ActionLink>
+  <ActionLink href="/trends/timeline" variant="secondary">Browse by time</ActionLink>
 </PageHeader>
 
 {#if data.errorMessage}
@@ -61,73 +153,123 @@
 {/if}
 
 <Card class="mb-6 grid gap-4 shadow-none">
-  <h2 class="m-0 text-2xl font-black tracking-[-0.04em]">Choose items</h2>
-  <p class="m-0 text-muted">Use specs like <code>meme:launch-reaction</code>, <code>tag:reaction</code>, or <code>template:frog-template</code>. Add up to {data.comparison.max_items} items.</p>
+  <h2 class="m-0 text-2xl font-black tracking-[-0.04em]">Choose what to compare</h2>
+  <p class="m-0 text-muted">Pick the item type, then enter its name or identifier. Add up to {data.comparison.max_items} items.</p>
   <form class="grid gap-3" method="GET" action="/trends/compare">
-    {#each formItems as item, index (`compare-input-${index}`)}
-      <label class="grid gap-2 font-extrabold">
-        <span>Item {index + 1}</span>
-        <Input name="item" value={item} placeholder={index === 0 ? 'meme:uuid-or-slug' : index === 1 ? 'tag:reaction' : 'template:frog-template'} />
-      </label>
-    {/each}
+    <noscript>
+      <style>
+        .trend-comparison-enhanced { display: none !important; }
+      </style>
+      <div class="grid gap-3 rounded-xl border border-line bg-soft/50 p-3">
+        <p class="m-0 text-sm text-muted">Without JavaScript, enter comparison items from a shared link.</p>
+        {#each formRows as row, index (`comparison-fallback-${index}`)}
+          <label class="grid gap-2 font-extrabold" for={`comparison-item-${index}`}>
+            <span>Comparison item {index + 1}</span>
+            <input
+              id={`comparison-item-${index}`}
+              name="item"
+              value={serializedItem(row)}
+              placeholder="Comparison item"
+              class="min-w-0 rounded-xl border border-line bg-paper px-3 py-2.5 text-ink placeholder:text-muted/75 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+            />
+          </label>
+        {/each}
+      </div>
+    </noscript>
+    <div class="trend-comparison-enhanced grid gap-3">
+      {#each formRows as row, index (`compare-input-${index}`)}
+        <fieldset class="grid gap-3 rounded-xl border border-line bg-soft/50 p-3">
+          <legend class="px-1 text-sm font-extrabold text-ink">Item {index + 1}</legend>
+          <input type="hidden" name="item" value={serializedItem(row)} disabled={!enhanced} />
+          <div class="grid gap-3 sm:grid-cols-[minmax(10rem,0.7fr)_minmax(0,1fr)]">
+            <label class="grid gap-2 font-extrabold" for={`comparison-kind-${index}`}>
+              <span>Item type</span>
+              <select
+                id={`comparison-kind-${index}`}
+                bind:value={row.kind}
+                onchange={() => markEdited(row)}
+                class="min-w-0 rounded-xl border border-line bg-paper px-3 py-2.5 text-ink focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+              >
+                <option value="meme">Meme</option>
+                <option value="tag">Tag</option>
+                <option value="template">Template</option>
+              </select>
+            </label>
+            <label class="grid gap-2 font-extrabold" for={`comparison-identifier-${index}`}>
+              <span>Name or identifier</span>
+              <Input
+                id={`comparison-identifier-${index}`}
+                bind:value={row.identifier}
+                oninput={() => markEdited(row)}
+                placeholder="Name or identifier"
+              />
+            </label>
+          </div>
+        </fieldset>
+      {/each}
+    </div>
     <div class="flex flex-wrap gap-2">
-      <button class="rounded-[18px] bg-ink px-5 py-4 font-extrabold text-paper" type="submit">Compare</button>
+      <Button type="submit">Compare</Button>
       <ActionLink href="/trends/compare" variant="ghost">Clear</ActionLink>
     </div>
   </form>
+  {#if selectedRows.length > 0}
+    <div class="grid gap-2" aria-label="Selected items">
+      <p class="m-0 text-sm font-extrabold text-ink">Selected items</p>
+      <ul class="m-0 flex list-none flex-wrap gap-2 p-0">
+        {#each selectedRows as row, index (`selected:${index}:${serializedItem(row)}`)}
+          <li class="rounded-full border border-line bg-paper px-3 py-1.5 text-sm font-semibold text-ink">
+            {itemTypeLabel(row.kind)} · {row.title}
+          </li>
+        {/each}
+      </ul>
+    </div>
+  {/if}
 </Card>
 
 {#if !hasRequestedItems}
-  <EmptyState title="Start with URL params" message="Enter items above or share a link like /trends/compare?item=tag:reaction&item=template:frog-template." />
+  <EmptyState title="Pick a few things to compare" message="Start with a meme, tag, or template you want to explore." />
 {:else if data.comparison.items.length === 0 && !data.errorMessage}
-  <EmptyState title="No comparison data" message="The API returned no requested items. Check the item specs and try again." />
+  <EmptyState title="Nothing to compare just yet" message="Try another name or identifier and see what is catching on." />
 {:else}
-  <section class="grid gap-6" aria-label="Trend comparison results">
-    <Card class="grid gap-4 shadow-none">
-      <h2 class="m-0 text-2xl font-black tracking-[-0.04em]">Comparison chart</h2>
+  <section aria-label="Trend comparison results">
+    <Card class="grid gap-6 shadow-none">
+      <h2 class="m-0 text-2xl font-black tracking-[-0.04em]">How they compare</h2>
       <TrendComparisonChart series={data.comparison.items} />
-      {#if limitedSeries.length > 0}
-        <Notice>
-          Some selected items are not drawn as full history lines. {limitedSeries.map((item) => `${item.title}: ${dataStatus(item)}`).join(' ')}
-        </Notice>
+      {#if pendingChartItems.length > 0}
+        <p class="m-0 text-sm text-muted">Some picks will join the chart once they have two recorded activity moments.</p>
       {/if}
-    </Card>
-
-    <Card class="overflow-x-auto shadow-none">
-      <h2 class="m-0 mb-4 text-2xl font-black tracking-[-0.04em]">Data table</h2>
-      <table class="w-full min-w-[720px] border-collapse text-left text-sm">
-        <thead>
-          <tr class="border-b border-line text-muted">
-            <th class="py-3 pr-4">Item</th>
-            <th class="py-3 pr-4">Kind</th>
-            <th class="py-3 pr-4">Series basis</th>
-            <th class="py-3 pr-4">Points</th>
-            <th class="py-3 pr-4">Latest value</th>
-            <th class="py-3 pr-4">Data status</th>
-          </tr>
-        </thead>
-        <tbody>
-          {#each data.comparison.items as item (`row-${item.kind}:${item.value}`)}
-            {@const latestPoint = item.points.at(-1)}
-            <tr class="border-b border-line/70 align-top">
-              <td class="py-3 pr-4 font-extrabold">{item.title}</td>
-              <td class="py-3 pr-4">{item.kind}</td>
-              <td class="py-3 pr-4">{seriesBasis(item)}</td>
-              <td class="py-3 pr-4">{item.points.length}</td>
-              <td class="py-3 pr-4">
-                {#if latestPoint}
-                  {latestPoint.value.toFixed(1)} · {latestPoint.label} · {formatObservedAt(latestPoint.observed_at)}
-                {:else}
-                  No points
-                {/if}
-              </td>
-              <td class="py-3 pr-4 text-muted">
-                {dataStatus(item)}
-              </td>
+      <div class="overflow-x-auto rounded-xl border border-line bg-paper">
+        <table class="w-full min-w-[680px] border-collapse text-left text-sm">
+          <caption class="sr-only">Recorded activity details for the comparison</caption>
+          <thead>
+            <tr class="border-b border-line text-muted">
+              <th class="py-3 pl-4 pr-3" scope="col">Item</th>
+              <th class="py-3 pr-3" scope="col">Type</th>
+              <th class="py-3 pr-3" scope="col">Date</th>
+              <th class="py-3 pr-3" scope="col">Recorded activity</th>
+              <th class="py-3 pr-3" scope="col">Original sources</th>
+              <th class="py-3 pr-4" scope="col">MemeExpert</th>
             </tr>
-          {/each}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {#each activityRows as row (`row-${row.item.kind}:${row.item.value}:${row.point.observed_at ?? 'current'}:${recordedActivity(row.point)}`)}
+              <tr class="border-b border-line/70 align-top last:border-b-0">
+                <th class="py-3 pl-4 pr-3 font-extrabold" scope="row">{row.item.title}</th>
+                <td class="py-3 pr-3">{itemTypeLabel(row.item.kind)}</td>
+                <td class="py-3 pr-3">{formatObservedAt(row.point.observed_at)}</td>
+                <td class="py-3 pr-3 tabular-nums">{formatCount(recordedActivity(row.point))} signals</td>
+                <td class="py-3 pr-3 tabular-nums">{formatCount(sourceActivity(row.point))}</td>
+                <td class="py-3 pr-4 tabular-nums">{formatCount(memeExpertActivity(row.point))}</td>
+              </tr>
+            {:else}
+              <tr>
+                <td class="p-4 text-muted" colspan="6">Recorded activity details will appear as items collect signals.</td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
     </Card>
   </section>
 {/if}
