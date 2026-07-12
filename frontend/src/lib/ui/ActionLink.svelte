@@ -16,14 +16,14 @@
       ? 'border border-line bg-paper text-ink hover:bg-soft'
       : variant === 'ghost'
         ? 'bg-transparent text-muted underline decoration-2 underline-offset-4 hover:text-ink'
-        : 'bg-ink text-paper hover:bg-ink/90'
+        : 'bg-accent text-on-accent hover:bg-accent/90'
   );
-  const sizeClass = $derived(size === 'compact' ? 'rounded-[14px] px-3 py-2 text-sm' : 'rounded-[18px] px-5 py-4');
+  const sizeClass = $derived(size === 'compact' ? 'rounded-[14px] px-3 py-2 text-sm' : 'rounded-[16px] px-4 py-2.5');
 </script>
 
 <a
   {...rest}
-  class={cn('inline-flex items-center justify-center gap-2 font-extrabold no-underline transition', focusRing, variantClass, sizeClass, className)}
+  class={cn('inline-flex items-center justify-center gap-2 font-semibold no-underline transition', focusRing, variantClass, sizeClass, className)}
 >
   {#if children}{@render children()}{/if}
 </a>

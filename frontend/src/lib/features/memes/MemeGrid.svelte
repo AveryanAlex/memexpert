@@ -20,21 +20,25 @@
     label = 'Meme results',
     attributions = {},
     bulk = { enabled: false },
-    showAccessMarkers = false
+    showAccessMarkers = false,
+    layout = 'masonry'
   }: {
     memes: PublicMemeCardRead[];
     label?: string;
     attributions?: Record<string, MemeResultAttributionRead | null | undefined>;
     bulk?: MemeGridBulkOptions;
     showAccessMarkers?: boolean;
+    layout?: 'masonry' | 'ordered';
   } = $props();
 
   let selectedIds = $state<string[]>([]);
+  let selectionMode = $state(false);
   let targetCollectionId = $state('');
   let pendingAction = $state<string | null>(null);
   let statusMessage = $state<string | null>(null);
   let gridElement = $state<HTMLElement>();
   let gridWidth = $state(0);
+  let hydrated = $state(false);
 
   const columnCount = $derived(masonryColumnCount(gridWidth));
   const columnWidth = $derived(masonryColumnWidth(gridWidth, columnCount));
@@ -65,6 +69,17 @@
   });
 
   $effect(() => {
+    if (!bulkEnabled && (selectionMode || selectedIds.length > 0)) {
+      selectionMode = false;
+      selectedIds = [];
+    }
+  });
+
+  $effect(() => {
+    hydrated = true;
+  });
+
+  $effect(() => {
     if (!browser || !gridElement) return;
 
     const updateGridWidth = () => {
@@ -82,6 +97,11 @@
     selectedIds = selectedIds.includes(memeId) ? selectedIds.filter((id) => id !== memeId) : [...selectedIds, memeId];
   }
 
+  function startSelection() {
+    selectionMode = true;
+    statusMessage = null;
+  }
+
   function toggleAll() {
     statusMessage = null;
     selectedIds = allSelected ? [] : memes.map((meme) => meme.id);
@@ -89,6 +109,13 @@
 
   function clearSelection() {
     selectedIds = [];
+    selectionMode = false;
+    statusMessage = null;
+  }
+
+  function finishSelection() {
+    selectedIds = [];
+    selectionMode = false;
     statusMessage = null;
   }
 
@@ -127,6 +154,7 @@
       );
       statusMessage = `${selected.length} selected meme${selected.length === 1 ? '' : 's'} removed from this collection.`;
       selectedIds = [];
+      selectionMode = false;
     });
   }
 
@@ -204,16 +232,21 @@
   }
 </script>
 
-{#if bulkEnabled}
-  <div class="mb-4 grid gap-3 rounded-[28px] border border-line bg-paper p-4 shadow-warm" aria-label={`${label} bulk actions`}>
+{#if bulkEnabled && !selectionMode}
+  <div class="mb-3 flex justify-end">
+    <Button size="compact" variant="ghost" type="button" onclick={startSelection} disabled={!hydrated || memes.length === 0}>Select items</Button>
+  </div>
+{:else if bulkEnabled && selectionMode}
+  <div class="sticky top-16 z-20 mb-4 grid gap-3 rounded-xl border border-line bg-paper/95 p-3 shadow-overlay backdrop-blur" aria-label={`${label} selection actions`}>
     <div class="flex flex-wrap items-center justify-between gap-3">
       <div>
-        <p class="m-0 font-black">Bulk actions</p>
+        <p class="m-0 font-semibold">Select items</p>
         <p class="m-0 text-sm text-muted">{toolbarSummary}</p>
       </div>
       <div class="flex flex-wrap gap-2">
         <Button size="compact" variant="secondary" type="button" onclick={toggleAll} disabled={memes.length === 0 || pendingAction !== null}>{allSelected ? 'Clear all' : 'Select all'}</Button>
-        <Button size="compact" variant="ghost" type="button" onclick={clearSelection} disabled={selected.length === 0 || pendingAction !== null}>Clear</Button>
+        <Button size="compact" variant="ghost" type="button" onclick={clearSelection} disabled={pendingAction !== null}>Clear</Button>
+        <Button size="compact" variant="ghost" type="button" onclick={finishSelection} disabled={pendingAction !== null}>Done</Button>
       </div>
     </div>
 
@@ -244,36 +277,63 @@
     {#if bulk.guidance}
       <p class="m-0 text-sm text-muted">{bulk.guidance}</p>
     {/if}
-    {#if statusMessage}
-      <p class="m-0 text-sm text-muted" role="status">{statusMessage}</p>
-    {/if}
   </div>
 {/if}
 
-<section bind:this={gridElement} class="flex gap-4" aria-label={label} data-column-count={columnCount} role="list" aria-busy={pendingAction !== null}>
-  {#each masonryColumns as column (column.id)}
-    <div class="grid min-w-0 flex-1 content-start gap-4" role="presentation">
-      {#each column.items as meme (meme.id)}
-        {@const attribution = attributions[meme.id]}
-        <div
-          class="relative"
-          role="presentation"
-          data-discovery-source={attribution?.source_algorithm ?? undefined}
-          data-discovery-reason={attribution?.reason ?? undefined}
-          data-discovery-request-id={attribution?.request_id ?? undefined}
-          data-discovery-impression-id={attribution?.impression_id ?? undefined}
-          data-discovery-source-meme-id={attribution?.source_meme_id ?? undefined}
-          data-discovery-score={attribution?.score ?? undefined}
-        >
-          {#if bulkEnabled}
-            <label class="absolute left-3 top-3 z-20 inline-flex items-center gap-2 rounded-full border border-line bg-paper/95 px-3 py-2 text-sm font-extrabold shadow-warm">
-              <input type="checkbox" checked={selectedIds.includes(meme.id)} onchange={() => toggleSelection(meme.id)} aria-label={`Select ${meme.caption || meme.tags[0] || 'meme'}`} />
-              Select
-            </label>
-          {/if}
-          <MemeCard {meme} {attribution} position={memePositions.get(meme.id)} total={memes.length} {showAccessMarkers} />
-        </div>
-      {/each}
-    </div>
-  {/each}
-</section>
+{#if statusMessage}
+  <p class="mb-3 text-sm text-muted" role="status">{statusMessage}</p>
+{/if}
+
+{#if layout === 'ordered'}
+  <section bind:this={gridElement} class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4" aria-label={label} data-layout="ordered" role="list" aria-busy={pendingAction !== null}>
+    {#each memes as meme (meme.id)}
+      {@const attribution = attributions[meme.id]}
+      <div
+        class="relative min-w-0"
+        role="presentation"
+        data-discovery-source={attribution?.source_algorithm ?? undefined}
+        data-discovery-reason={attribution?.reason ?? undefined}
+        data-discovery-request-id={attribution?.request_id ?? undefined}
+        data-discovery-impression-id={attribution?.impression_id ?? undefined}
+        data-discovery-source-meme-id={attribution?.source_meme_id ?? undefined}
+        data-discovery-score={attribution?.score ?? undefined}
+      >
+        {#if selectionMode}
+          <label class="absolute left-3 top-3 z-20 inline-flex items-center gap-2 rounded-full border border-line bg-paper/95 px-3 py-2 text-sm font-extrabold shadow-warm">
+            <input type="checkbox" checked={selectedIds.includes(meme.id)} onchange={() => toggleSelection(meme.id)} aria-label={`Select ${meme.caption || meme.tags[0] || 'meme'}`} />
+            Select
+          </label>
+        {/if}
+        <MemeCard {meme} {attribution} position={memePositions.get(meme.id)} total={memes.length} {showAccessMarkers} />
+      </div>
+    {/each}
+  </section>
+{:else}
+  <section bind:this={gridElement} class="flex gap-4" aria-label={label} data-column-count={columnCount} data-layout="masonry" role="list" aria-busy={pendingAction !== null}>
+    {#each masonryColumns as column (column.id)}
+      <div class="grid min-w-0 flex-1 content-start gap-4" role="presentation">
+        {#each column.items as meme (meme.id)}
+          {@const attribution = attributions[meme.id]}
+          <div
+            class="relative"
+            role="presentation"
+            data-discovery-source={attribution?.source_algorithm ?? undefined}
+            data-discovery-reason={attribution?.reason ?? undefined}
+            data-discovery-request-id={attribution?.request_id ?? undefined}
+            data-discovery-impression-id={attribution?.impression_id ?? undefined}
+            data-discovery-source-meme-id={attribution?.source_meme_id ?? undefined}
+            data-discovery-score={attribution?.score ?? undefined}
+          >
+            {#if selectionMode}
+              <label class="absolute left-3 top-3 z-20 inline-flex items-center gap-2 rounded-full border border-line bg-paper/95 px-3 py-2 text-sm font-extrabold shadow-warm">
+                <input type="checkbox" checked={selectedIds.includes(meme.id)} onchange={() => toggleSelection(meme.id)} aria-label={`Select ${meme.caption || meme.tags[0] || 'meme'}`} />
+                Select
+              </label>
+            {/if}
+            <MemeCard {meme} {attribution} position={memePositions.get(meme.id)} total={memes.length} {showAccessMarkers} />
+          </div>
+        {/each}
+      </div>
+    {/each}
+  </section>
+{/if}

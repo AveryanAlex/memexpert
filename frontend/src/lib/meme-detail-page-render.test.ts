@@ -4,22 +4,26 @@ import { describe, expect, it } from 'vitest';
 import type {
   PublicMemeCardRead,
   PublicMemeDetailRead,
+  PublicMemeLandingRead,
   PublicMemePopularitySummaryRead,
   PublicMemeSearchResultRead,
   PublicTrendMetricsRead
 } from '$lib/api/types';
 import { buildRelatedDiscovery } from '$lib/meme-detail-view';
 import MemeDetailPage from '../routes/memes/[id]/+page.svelte';
+import TagLandingPage from '../routes/tags/[tag]/+page.svelte';
+import TemplateLandingPage from '../routes/templates/[slug]/+page.svelte';
 
 describe('/memes/[id] page', () => {
-  it('renders SEO content, public analytics, actions, media info, and similar discovery', () => {
+  it('renders SEO content, media-first actions, progressive context, and related discovery', () => {
     const meme = memeDetail({
       seo_title: 'Launch day reaction meme',
       seo_description: 'A polished caption for sharing this launch reaction.',
       seo_body_text: 'Use this when the deploy finally goes green.',
       ocr_text: 'ship it',
       tags: ['reaction', 'launch'],
-      download_url: 'https://cdn.example.test/memes/launch.jpg'
+      download_url: 'https://cdn.example.test/memes/launch.jpg',
+      popularity_score: 42.5
     });
     const related = memeCard('22222222-2222-4222-8222-222222222222', 'Another reaction meme');
 
@@ -50,26 +54,24 @@ describe('/memes/[id] page', () => {
 
     expect(head).toContain('Launch day reaction meme | MemeXpert');
     expect(head).toContain('A polished caption for sharing this launch reaction.');
+    expect(body).toContain('https://cdn.example.test/memes/display.jpg');
     expect(body).toContain('Launch day reaction meme');
     expect(body).toContain('Use this when the deploy finally goes green.');
-    expect(body).toContain('Detected text:');
+    expect(body).toContain('About this meme');
+    expect(body).toContain('<details');
+    expect(body).toContain('Text detected in the image');
     expect(body).toContain('ship it');
     expect(body).toContain('#reaction');
-    expect(body).toContain('Media and file info');
-    expect(body).toContain('image/jpeg');
-    expect(body).toContain('Direct media download');
-    expect(body).toContain('href="https://cdn.example.test/memes/launch.jpg"');
-    expect(body).toContain('Public popularity');
-    expect(body).toContain('34 views');
-    expect(body).toContain('Share to Telegram');
-    expect(body).toContain('Copy link');
-    expect(body).toContain('Download');
-    expect(body).toContain('Report');
-    expect(body).toContain('Like (4)');
+    expect(body).toContain('Favorite');
     expect(body).toContain('Save');
-    expect(body).toContain('Pin');
-    expect(body).toContain('Similar memes');
-    expect(body).toContain('source image embedding');
+    expect(body).toContain('Send');
+    expect(body).toContain('34 views');
+    expect(body).toContain('Related memes');
+    expect(body).not.toContain('Media and file info');
+    expect(body).not.toContain('Only fields exposed by the public meme detail API');
+    expect(body).not.toContain('image/jpeg');
+    expect(body).not.toContain('score 42.5');
+    expect(body).not.toContain('source image embedding');
     expect(body).toContain('data-discovery-source="qdrant_similarity"');
     expect(body).toContain('data-discovery-request-id="req_detail"');
     expect(body).toContain('attribution_request_id=req_detail');
@@ -77,7 +79,7 @@ describe('/memes/[id] page', () => {
     expect(body).toContain('Another reaction meme');
   });
 
-  it('renders honest trending fallback and empty analytics states', () => {
+  it('renders a consumer-friendly discovery fallback without technical diagnostics', () => {
     const meme = memeDetail({
       tags: [],
       seo_title: null,
@@ -109,12 +111,34 @@ describe('/memes/[id] page', () => {
     });
 
     expect(body).toContain('When there are no tags');
-    expect(body).toContain('Download unavailable');
-    expect(body).toContain('No public file metadata is available');
-    expect(body).toContain('Popularity analytics are not available for this meme yet.');
-    expect(body).toContain('Trending public memes');
-    expect(body).toContain('similar-memes endpoint and tag fallback were unavailable');
+    expect(body).toContain('Related memes');
+    expect(body).not.toContain('No public file metadata is available');
+    expect(body).not.toContain('Download is unavailable until the catalog exposes a media download URL.');
+    expect(body).not.toContain('Popularity analytics are not available for this meme yet.');
+    expect(body).not.toContain('similar-memes endpoint and tag fallback were unavailable');
     expect(body).toContain('Trending fallback meme');
+  });
+
+  it('keeps the Telegram connection prompt after a guest save', () => {
+    const meme = memeDetail();
+
+    const { body } = render(MemeDetailPage, {
+      props: {
+        data: {
+          session: null,
+          sessionError: null,
+          attribution: null,
+          meme,
+          popularity: null,
+          relatedSource: null,
+          unavailableMessage: null
+        },
+        form: { status: 'saved', message: 'Saved to favorites.', showConnectTelegram: true }
+      }
+    });
+
+    expect(body).toContain('Keep this save beyond this browser.');
+    expect(body).toContain('Connect Telegram to keep saves/favorites');
   });
 
   it('builds related discovery from attributed similar and fallback results', () => {
@@ -137,6 +161,34 @@ describe('/memes/[id] page', () => {
     expect(tagDiscovery.description).toContain('similar-memes endpoint was unavailable');
     expect(trendDiscovery.memes).toEqual([related]);
     expect(trendDiscovery.description).toContain('tag fallback were unavailable');
+  });
+});
+
+describe('tag and template discovery pages', () => {
+  it('puts tag and template galleries ahead of aggregate popularity details', () => {
+    const tagMeme = memeCard('66666666-6666-4666-8666-666666666666', 'Gallery-first tag meme');
+    const templateMeme = memeCard('77777777-7777-4777-8777-777777777777', 'Gallery-first template meme');
+    const tagLanding = landing('tag', 'reaction', 'Reaction memes', tagMeme);
+    const templateLanding = landing('template', 'distracted-boyfriend', 'Distracted boyfriend memes', templateMeme);
+
+    const { body: tagBody } = render(TagLandingPage, {
+      props: { data: { session: null, sessionError: null, landing: tagLanding, offset: 0, errorMessage: null } }
+    });
+    const { body: templateBody } = render(TemplateLandingPage, {
+      props: { data: { session: null, sessionError: null, landing: templateLanding, offset: 0, errorMessage: null } }
+    });
+
+    expect(tagBody).toContain('Gallery-first tag meme');
+    expect(tagBody).toContain('About this tag');
+    expect(tagBody).toContain('34 views');
+    expect(tagBody.indexOf('Gallery-first tag meme')).toBeLessThan(tagBody.indexOf('About this tag'));
+    expect(tagBody).not.toContain('No materialized trend data');
+
+    expect(templateBody).toContain('Gallery-first template meme');
+    expect(templateBody).toContain('About this template');
+    expect(templateBody).toContain('34 views');
+    expect(templateBody.indexOf('Gallery-first template meme')).toBeLessThan(templateBody.indexOf('About this template'));
+    expect(templateBody).not.toContain('No materialized trend data');
   });
 });
 
@@ -287,5 +339,36 @@ function trendMetrics(): PublicTrendMetricsRead {
     engagement_24h: 12,
     trending_score: 8.5,
     refreshed_at: '2026-01-02T00:00:00Z'
+  };
+}
+
+function landing(
+  kind: 'tag' | 'template',
+  slug: string,
+  title: string,
+  meme: PublicMemeCardRead
+): PublicMemeLandingRead {
+  return {
+    kind,
+    slug,
+    title,
+    description: `Browse ${title.toLowerCase()}.`,
+    page: {
+      items: [result(meme)],
+      limit: 20,
+      offset: 0,
+      total: 1,
+      has_more: false,
+      request_id: `req_${kind}`
+    },
+    trend_summary: {
+      kind,
+      slug,
+      title,
+      description: null,
+      meme_count: 1,
+      trend: trendMetrics(),
+      points: []
+    }
   };
 }

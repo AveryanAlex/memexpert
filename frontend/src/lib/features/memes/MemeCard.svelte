@@ -3,7 +3,6 @@
   import { recordMemeDetailClick, recordMemeImpression } from '$lib/api/client';
   import type { MemeResultAttributionRead, PublicMemeCardRead } from '$lib/api/types';
   import { memeActionAttributionBody, memeHref, memeTitle } from '$lib/memeActions';
-  import Badge from '$lib/ui/Badge.svelte';
   import { cn, focusRing } from '$lib/ui/styles';
   import MemeActionMenu from './MemeActionMenu.svelte';
   import MemeMedia from './MemeMedia.svelte';
@@ -59,36 +58,22 @@
 
 <article
   bind:this={cardElement}
-  class="relative grid min-h-[16.25rem] overflow-hidden rounded-[28px] border border-line bg-paper shadow-warm"
+  class="overflow-hidden rounded-xl border border-line bg-paper"
   role={position ? 'listitem' : undefined}
   aria-posinset={position}
   aria-setsize={total}
   aria-labelledby={titleId}
 >
-  <a class={cn('grid rounded-[28px] text-inherit no-underline', focusRing)} {href} aria-label={`Open ${title}`} onclick={handleDetailClick}>
+  <a class={cn('block text-inherit no-underline', focusRing)} {href} aria-label={`Open ${title}`} onclick={handleDetailClick}>
     <MemeMedia {meme} preview />
-    <div class="grid content-between gap-4 p-4">
-      <p id={titleId} class="m-0 text-lg font-extrabold leading-tight">{title}</p>
-      <div class="flex flex-wrap gap-2" aria-label="Meme metadata">
-        <Badge>{meme.language}</Badge>
-        <Badge>{meme.like_count} likes</Badge>
-        {#if showAccessMarkers && accessVisibility !== 'public'}
-          <Badge class="bg-paper/80 text-muted">{accessVisibility === 'shared' ? 'Shared' : 'Private'}</Badge>
-        {/if}
-        {#if meme.primary_file?.width && meme.primary_file.height}
-          <Badge>{meme.primary_file.width}x{meme.primary_file.height}</Badge>
-        {/if}
-      </div>
-      {#if meme.tags.length > 0}
-        <div class="flex flex-wrap gap-2" aria-label="Tags">
-          {#each meme.tags.slice(0, 3) as tag}
-            <Badge>#{tag}</Badge>
-          {/each}
-        </div>
+    <div class="flex items-start justify-between gap-3 px-3 pb-3 pt-2.5">
+      <p id={titleId} class="m-0 line-clamp-2 text-sm font-semibold leading-snug text-ink sm:text-base">{title}</p>
+      {#if showAccessMarkers && accessVisibility !== 'public'}
+        <span class="shrink-0 rounded-full border border-line bg-soft px-2 py-1 text-xs font-semibold text-muted">
+          {accessVisibility === 'shared' ? 'Shared' : 'Private'}
+        </span>
       {/if}
     </div>
   </a>
-  <div class="absolute right-3 top-3 z-10">
-    <MemeActionMenu {meme} {href} {attribution} compact />
-  </div>
+  <MemeActionMenu {meme} {href} {attribution} surface="card" />
 </article>

@@ -1,30 +1,29 @@
 <script lang="ts">
-  import { page } from '$app/state';
-  import { recordMemeDownload } from '$lib/api/client';
   import MemeActionMenu from '$lib/features/memes/MemeActionMenu.svelte';
   import MemeGrid from '$lib/features/memes/MemeGrid.svelte';
   import MemeMedia from '$lib/features/memes/MemeMedia.svelte';
   import TrendSparkline from '$lib/features/trends/TrendSparkline.svelte';
-  import TrendSummary from '$lib/features/trends/TrendSummary.svelte';
-  import { buildMemeDetailView, buildRelatedDiscovery, formatFileSize } from '$lib/meme-detail-view';
-  import { memeActionAttributionBody } from '$lib/memeActions';
+  import { buildMemeDetailView, buildRelatedDiscovery } from '$lib/meme-detail-view';
   import { ActionLink, Badge, Card, EmptyState, Notice } from '$lib/ui';
   import type { ActionData, PageData } from './$types';
 
   let { data, form }: { data: PageData; form: ActionData } = $props();
 
-  const returnTo = $derived(page.url.pathname);
+  const returnTo = $derived(data.meme ? `/memes/${data.meme.seo_page_slug ?? data.meme.id}` : '/');
   const detail = $derived(data.meme ? buildMemeDetailView(data.meme) : null);
   const related = $derived(data.meme ? buildRelatedDiscovery(data.meme, data.relatedSource) : null);
+  const popularityTrend = $derived(data.popularity?.trend ?? null);
+  const popularityPoints = $derived(data.popularity?.sparkline ?? []);
+  let showGuestFavoritePrompt = $state(false);
 
   function tagHref(tag: string): string {
     return `/tags/${encodeURIComponent(tag)}`;
   }
 
-  function recordDirectDownload() {
-    if (!data.meme) return;
-    void recordMemeDownload({ fetch, memeId: data.meme.id, body: memeActionAttributionBody(data.attribution) }).catch(() => undefined);
+  function handleFavoriteChange(favorited: boolean) {
+    showGuestFavoritePrompt = favorited && data.session?.user.account_type !== 'full';
   }
+
 </script>
 
 <svelte:head>
@@ -37,143 +36,96 @@
 </svelte:head>
 
 {#if data.meme && detail && related}
-  <article class="grid gap-6 rounded-[32px] border border-line bg-paper p-4 shadow-warm-lg md:grid-cols-[minmax(280px,0.95fr)_minmax(0,1fr)] md:p-6">
-    <div class="grid content-start gap-4">
+  <article class="grid gap-5 lg:grid-cols-[minmax(0,1.15fr)_minmax(19rem,0.85fr)] lg:items-start lg:gap-8">
+    <div class="min-w-0">
       <MemeMedia meme={data.meme} detail />
-
-      <Card class="grid gap-3 shadow-none" aria-label="Media and file info">
-        <div>
-          <h2 class="m-0 text-2xl font-black tracking-[-0.04em]">Media and file info</h2>
-          <p class="m-0 text-muted">Only fields exposed by the public meme detail API are shown.</p>
-        </div>
-
-        <div class="flex flex-wrap gap-2">
-          {#each detail.mediaFacts as fact}
-            <Badge>{fact}</Badge>
-          {/each}
-          <Badge>score {detail.scoreLabel}</Badge>
-          {#each detail.primaryFileFacts as fact}
-            <Badge>{fact}</Badge>
-          {/each}
-        </div>
-
-        {#if data.meme.files.length > 0}
-          <div class="grid gap-2" aria-label="Files">
-            {#each data.meme.files as file, index (file.id)}
-              <div class="rounded-[18px] border border-line bg-soft p-3 text-sm">
-                <p class="m-0 font-extrabold">File {index + 1}</p>
-                <p class="m-0 text-muted">
-                  {file.mime_type ?? data.meme.media_type}
-                  {#if file.width && file.height}
-                    · {file.width}x{file.height}
-                  {/if}
-                  {#if formatFileSize(file.file_size_bytes)}
-                    · {formatFileSize(file.file_size_bytes)}
-                  {/if}
-                </p>
-              </div>
-            {/each}
-          </div>
-        {:else if data.meme.primary_file}
-          <p class="m-0 text-muted">Primary file metadata is available, but no additional file list was returned.</p>
-        {:else}
-          <p class="m-0 text-muted">No public file metadata is available for this meme yet.</p>
-        {/if}
-
-        {#if detail.downloadUrl}
-          <ActionLink variant="secondary" size="compact" href={detail.downloadUrl} download onclick={recordDirectDownload}>Direct media download</ActionLink>
-        {:else}
-          <p class="m-0 text-muted">Download is unavailable until the catalog exposes a media download URL.</p>
-        {/if}
-      </Card>
     </div>
 
-    <div class="grid content-start gap-5">
-      <div>
-        <div class="flex flex-wrap gap-2">
-          <Badge>{data.meme.language}</Badge>
-          <Badge>{data.meme.media_type}</Badge>
-          <Badge>{data.meme.like_count} likes</Badge>
+    <div class="grid content-start gap-5 lg:sticky lg:top-6">
+      <div class="order-2 grid gap-5 lg:order-1">
+        <header>
           {#if data.meme.is_nsfw}
-            <Badge>NSFW</Badge>
+            <Badge class="mb-3">Sensitive content</Badge>
           {/if}
-        </div>
-        <h1 class="mb-4 mt-3 text-[clamp(2.25rem,7vw,5rem)] font-black leading-[0.9] tracking-[-0.07em]">{detail.title}</h1>
-        {#if detail.description}
-          <p class="max-w-3xl text-lg leading-relaxed">{detail.description}</p>
-        {:else}
-          <p class="max-w-3xl text-lg leading-relaxed text-muted">No public caption or SEO description is available yet.</p>
+          <h1 class="m-0 text-[clamp(2.25rem,7vw,4.5rem)] font-black leading-[0.9] tracking-[-0.07em]">{detail.title}</h1>
+          {#if detail.description}
+            <p class="mb-0 mt-4 max-w-3xl text-lg leading-relaxed text-muted">{detail.description}</p>
+          {/if}
+        </header>
+
+        {#if data.meme.tags.length > 0}
+          <section class="grid gap-3" aria-labelledby="meme-tags-title">
+            <h2 id="meme-tags-title" class="m-0 text-lg font-extrabold">Tags</h2>
+            <div class="flex flex-wrap gap-2">
+              {#each data.meme.tags as tag}
+                <Badge><a class="no-underline" href={tagHref(tag)}>#{tag}</a></Badge>
+              {/each}
+            </div>
+          </section>
         {/if}
       </div>
 
-      <Card class="grid gap-3 shadow-none" aria-label="Meme actions">
-        <div>
-          <h2 class="m-0 text-2xl font-black tracking-[-0.04em]">Share, save, or report</h2>
-          <p class="m-0 text-muted">Use the public action surface for likes, favorites, active saves, pins, sharing, downloads, and moderation reports.</p>
-        </div>
-        <MemeActionMenu meme={data.meme} attribution={data.attribution} showPrimary showSharing />
-      </Card>
+      <div class="order-1 grid gap-3 lg:order-2" aria-label="Meme actions">
+        <MemeActionMenu meme={data.meme} attribution={data.attribution} surface="detail" onFavoriteChange={handleFavoriteChange} />
 
-      {#if detail.bodyText || detail.detectedText}
-        <Card class="grid gap-3 shadow-none" aria-label="Meme text">
-          <h2 class="m-0 text-2xl font-black tracking-[-0.04em]">Text and context</h2>
+        {#if form?.message}
+          <Notice>{form.message}</Notice>
+        {/if}
+        {#if showGuestFavoritePrompt || (form?.status === 'saved' && form.showConnectTelegram)}
+          <Card class="grid gap-2 border-success-line bg-success-surface shadow-none" aria-label="Keep favorites">
+            <p class="m-0 text-lg font-extrabold leading-tight">Keep this save beyond this browser.</p>
+            <ActionLink href={`/account/telegram?returnTo=${encodeURIComponent(returnTo)}`}>
+              Connect Telegram to keep saves/favorites
+            </ActionLink>
+          </Card>
+        {/if}
+      </div>
+
+      <details class="order-3 rounded-xl border border-line bg-paper">
+        <summary class="cursor-pointer px-4 py-3 font-extrabold text-ink focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent">
+          About this meme
+        </summary>
+        <div class="grid gap-5 border-t border-line px-4 py-5">
           {#if detail.bodyText}
-            <p class="m-0 leading-relaxed">{detail.bodyText}</p>
+            <section class="grid gap-2" aria-labelledby="meme-context-title">
+              <h2 id="meme-context-title" class="m-0 text-lg font-extrabold">Context</h2>
+              <p class="m-0 leading-relaxed">{detail.bodyText}</p>
+            </section>
           {/if}
+
           {#if detail.detectedText}
-            <p class="m-0 text-muted"><span class="font-extrabold text-ink">Detected text:</span> {detail.detectedText}</p>
+            <section class="grid gap-2" aria-labelledby="meme-text-title">
+              <h2 id="meme-text-title" class="m-0 text-lg font-extrabold">Text detected in the image</h2>
+              <p class="m-0 leading-relaxed text-muted">{detail.detectedText}</p>
+            </section>
           {/if}
-        </Card>
-      {/if}
 
-      {#if data.meme.tags.length > 0}
-        <Card class="grid gap-3 shadow-none" aria-label="Tags">
-          <h2 class="m-0 text-2xl font-black tracking-[-0.04em]">Tags</h2>
-          <div class="flex flex-wrap gap-2">
-            {#each data.meme.tags as tag}
-              <Badge><a class="no-underline" href={tagHref(tag)}>#{tag}</a></Badge>
-            {/each}
-          </div>
-        </Card>
-      {/if}
-
-      <Card class="grid gap-3 shadow-none" aria-label="Popularity trend">
-        <div>
-          <h2 class="m-0 text-2xl font-black tracking-[-0.04em]">Public popularity</h2>
-          <p class="m-0 text-muted">Aggregate public counts and snapshots only. Empty states mean no public analytics are available yet.</p>
+          {#if popularityTrend || popularityPoints.length >= 2}
+            <section class="grid gap-3" aria-labelledby="meme-popularity-title">
+              <h2 id="meme-popularity-title" class="m-0 text-lg font-extrabold">Popularity</h2>
+              {#if popularityTrend}
+                <div class="flex flex-wrap gap-2" aria-label="Popularity summary">
+                  <Badge>{popularityTrend.recent.views} views</Badge>
+                  <Badge>{popularityTrend.recent.sends} sends</Badge>
+                  <Badge>{popularityTrend.recent.likes} likes</Badge>
+                  <Badge>{popularityTrend.recent.saves} saves</Badge>
+                </div>
+              {/if}
+              {#if popularityPoints.length >= 2}
+                <TrendSparkline points={popularityPoints} />
+              {/if}
+            </section>
+          {/if}
         </div>
-        <TrendSummary trend={data.popularity?.trend ?? null} />
-        {#if data.popularity}
-          <TrendSparkline points={data.popularity.sparkline} />
-        {:else}
-          <p class="m-0 text-muted">Popularity analytics are not available for this meme yet.</p>
-        {/if}
-      </Card>
-
-      <div class="flex flex-wrap gap-2">
-        <ActionLink variant="secondary" href="/">Back to search</ActionLink>
-        <ActionLink variant="ghost" href="/trends">Browse public trends</ActionLink>
-      </div>
-
-      {#if form?.message}
-        <Notice>{form.message}</Notice>
-      {/if}
-      {#if form?.status === 'saved' && form.showConnectTelegram}
-        <Card class="grid gap-2 border-success-line bg-success-surface shadow-none" aria-label="Keep favorites">
-          <p class="m-0 text-lg font-extrabold leading-tight">Keep this save beyond this browser.</p>
-          <ActionLink href={`/account/telegram?returnTo=${encodeURIComponent(returnTo)}`}>
-            Connect Telegram to keep saves/favorites
-          </ActionLink>
-        </Card>
-      {/if}
+      </details>
     </div>
   </article>
 
-  <Card class="mt-7 grid gap-4 shadow-none" aria-label="Related discovery">
+  <section class="mt-8 grid gap-4 border-t border-line pt-6" aria-labelledby="related-memes-title">
     <div class="flex flex-wrap items-start justify-between gap-3">
       <div>
-        <h2 class="m-0 text-3xl font-black tracking-[-0.05em]">{related.heading}</h2>
-        <p class="m-0 max-w-3xl text-muted">{related.description}</p>
+        <h2 id="related-memes-title" class="m-0 text-3xl font-black tracking-[-0.05em]">Related memes</h2>
+        <p class="m-0 max-w-3xl text-muted">Keep exploring with more memes from the catalog.</p>
       </div>
       <ActionLink variant="secondary" size="compact" href={related.href}>{related.linkLabel}</ActionLink>
     </div>
@@ -181,9 +133,9 @@
     {#if related.memes.length > 0}
       <MemeGrid memes={related.memes} attributions={related.attributions} label="Discovery memes" showAccessMarkers={Boolean(data.session)} />
     {:else}
-      <p class="m-0 text-muted">No additional public memes were returned for this discovery fallback.</p>
+      <p class="m-0 text-muted">More memes will appear here soon.</p>
     {/if}
-  </Card>
+  </section>
 {:else}
   <EmptyState title="Meme unavailable" message={data.unavailableMessage}>
     <ActionLink href="/">Search public memes</ActionLink>

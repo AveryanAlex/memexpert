@@ -4,7 +4,7 @@ import type { CurrentSessionRead } from '$lib/api/types';
 import AppShell from '$lib/features/app-shell/AppShell.svelte';
 
 describe('AppShell SSR', () => {
-  it('renders desktop navigation, global search, and mobile tabs for guests', () => {
+  it('renders Discover, Search, Saved, and Account navigation with one guest sign-in action', () => {
     const { body } = render(AppShell, {
       props: {
         session: guestSession(),
@@ -14,18 +14,24 @@ describe('AppShell SSR', () => {
     });
 
     expect(body).toContain('MemeXpert');
-    expect(body).toContain('For You');
-    expect(body).toContain('Trends');
-    expect(body).toContain('Profile');
+    expect(body).toContain('Discover');
+    expect(body).toContain('href="/search"');
+    expect(body).toContain('href="/library"');
+    expect(body).toContain('Account');
     expect(body).toContain('Search memes');
-    expect(body).toContain('More filters');
-    expect(body).toContain('Sign in');
-    expect(body).toContain('Guest');
     expect(body).toContain('aria-label="Mobile navigation"');
+    expect(body).not.toContain('More filters');
+    expect(body.match(/Sign in/g)).toHaveLength(1);
+    expect(body).not.toContain('For You');
+    expect(body).not.toContain('Trends');
+    expect(body).not.toContain('Guest');
     expect(body).not.toContain('href="/admin"');
+
+    const mobileNavigation = body.slice(body.indexOf('aria-label="Mobile navigation"'));
+    expect(mobileNavigation.match(/<svg/g)).toHaveLength(4);
   });
 
-  it('renders connected profile state for full users', () => {
+  it('renders a single Account control for full users', () => {
     const { body } = render(AppShell, {
       props: {
         session: fullSession(),
@@ -34,8 +40,8 @@ describe('AppShell SSR', () => {
       }
     });
 
-    expect(body).toContain('Full profile');
-    expect(body).toContain('Connected: Telegram');
+    expect(body).toContain('Account');
+    expect(body).not.toContain('Sign in');
     expect(body).toContain('href="/profile"');
     expect(body.match(/href="\/profile"[^>]*aria-current="page"/g)).toHaveLength(2);
     expect(body).not.toContain('href="/admin"');
@@ -53,6 +59,18 @@ describe('AppShell SSR', () => {
     expect(body).toContain('href="/admin"');
     expect(body).toContain('>Admin</a>');
     expect(body.match(/href="\/admin"[^>]*aria-current="page"/g)).toHaveLength(2);
+  });
+
+  it('keeps Saved active on collection routes', () => {
+    const { body } = render(AppShell, {
+      props: {
+        session: fullSession(),
+        sessionError: null,
+        currentPath: '/collection/example'
+      }
+    });
+
+    expect(body.match(/href="\/library"[^>]*aria-current="page"/g)).toHaveLength(2);
   });
 });
 

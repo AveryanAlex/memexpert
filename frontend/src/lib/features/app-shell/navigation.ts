@@ -1,32 +1,20 @@
-import type { CurrentSessionRead } from '$lib/api/types';
-
 export interface NavItem {
   label: string;
   href: string;
   match: 'exact' | 'prefix';
+  icon: 'discover' | 'search' | 'saved' | 'account' | 'admin';
 }
 
 export const PRIMARY_NAV_ITEMS: NavItem[] = [
-  { label: 'For You', href: '/', match: 'exact' },
-  { label: 'Trends', href: '/trends', match: 'prefix' },
-  { label: 'Profile', href: '/profile', match: 'prefix' }
+  { label: 'Discover', href: '/', match: 'exact', icon: 'discover' },
+  { label: 'Search', href: '/search', match: 'prefix', icon: 'search' },
+  { label: 'Saved', href: '/library', match: 'prefix', icon: 'saved' },
+  { label: 'Account', href: '/profile', match: 'prefix', icon: 'account' }
 ];
 
-export const ADMIN_NAV_ITEM: NavItem = { label: 'Admin', href: '/admin', match: 'prefix' };
+export const ADMIN_NAV_ITEM: NavItem = { label: 'Admin', href: '/admin', match: 'prefix', icon: 'admin' };
 
 export function isNavItemActive(item: NavItem, currentPath: string): boolean {
+  if (item.href === '/library' && (currentPath === '/collection' || currentPath.startsWith('/collection/'))) return true;
   return item.match === 'exact' ? currentPath === item.href : currentPath === item.href || currentPath.startsWith(`${item.href}/`);
-}
-
-export function profileLabel(session: CurrentSessionRead | null): string {
-  if (!session) return 'Sign in';
-  return session.user.account_type === 'full' ? 'Full profile' : 'Guest';
-}
-
-export function providerSummary(session: CurrentSessionRead | null): string {
-  if (!session) return 'Session unavailable';
-  if (session.linked_providers.telegram_linked) return 'Connected: Telegram';
-  if (session.linked_providers.google_linked) return 'Connected: Google';
-  if (session.linked_providers.email) return 'Connected: Email';
-  return session.user.account_type === 'guest' ? 'Connect to sync' : 'No provider connected';
 }

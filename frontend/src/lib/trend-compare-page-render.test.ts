@@ -5,7 +5,7 @@ import type { PublicTrendComparisonRead, PublicTrendMetricsRead } from '$lib/api
 import TrendComparePage from '../routes/trends/compare/+page.svelte';
 
 describe('/trends/compare page', () => {
-  it('renders shareable item inputs, aggregate history copy, and current-only notice', () => {
+  it('renders labeled comparison rows, selected chips, and an accessible text fallback', () => {
     const { body } = render(TrendComparePage, {
       props: {
         data: {
@@ -18,23 +18,42 @@ describe('/trends/compare page', () => {
       }
     });
 
-    expect(body).toContain('Compare public trends.');
-    expect(body).toContain('Meme series use source-delta and platform-event engagement points');
+    expect(body).toContain('Compare what is catching on.');
+    expect(body).toContain('Choose what to compare');
+    expect(body).toContain('Item type');
+    expect(body).toContain('Name or identifier');
+    expect(body).toContain('Selected items');
     expect(body).toContain('meme:launch-reaction');
     expect(body).toContain('tag:reaction');
     expect(body).toContain('template:current-only-template');
-    expect(body).toContain('Trend comparison line chart');
+    expect(body).toContain('name="item" value="meme:launch-reaction"');
+    expect(body).toContain('name="item" value="tag:reaction"');
+    expect(body).toContain('name="item" value="template:current-only-template"');
+    expect(body).toContain('Recorded activity comparison');
+    expect(body).toContain('Recorded activity adds original-source views, reactions, and reposts');
+    expect(body).toContain('Recorded activity details for the comparison');
+    expect(body).toContain('Recorded activity');
+    expect(body).toContain('Jan 1, 2026');
+    expect(body).toContain('23 signals');
+    expect(body).toContain('22 signals');
+    expect(body).toContain('Some picks will join the chart once they have two recorded activity moments.');
+    expect(body).toContain('<noscript>');
+    expect(body).toContain('Without JavaScript, enter comparison items from a shared link.');
+    expect(body).toContain('Comparison item');
+    expect(body).toMatch(/<noscript>[\s\S]*name="item"/);
     expect(body).toContain('Launch reaction meme');
     expect(body).toContain('Reaction memes');
     expect(body).toContain('Current Only Template memes');
-    expect(body).toContain('15.0');
-    expect(body).toContain('Aggregate history points');
-    expect(body).toContain('Current-window aggregate fallback');
-    expect(body).toContain('No historical aggregate snapshot points exist; using the current public trend window only.');
-    expect(body).not.toContain('Tags and templates do not have historical snapshot series yet');
+    expect(body).not.toContain('Use specs like');
+    expect(body).not.toContain('Meme series use source-delta');
+    expect(body).not.toContain('15.0');
+    expect(body).not.toContain('Aggregate history points');
+    expect(body).not.toContain('Current-window aggregate fallback');
+    expect(body).not.toContain('Insufficient history');
+    expect(body).not.toContain('No historical aggregate snapshot points exist; using the current public trend window only.');
   });
 
-  it('renders the empty starter state without fabricated examples', () => {
+  it('renders a friendly empty starter state without typed URL instructions', () => {
     const { body } = render(TrendComparePage, {
       props: {
         data: {
@@ -47,8 +66,10 @@ describe('/trends/compare page', () => {
       }
     });
 
-    expect(body).toContain('Start with URL params');
-    expect(body).toContain('/trends/compare?item=tag:reaction');
+    expect(body).toContain('Pick a few things to compare');
+    expect(body).toContain('Start with a meme, tag, or template you want to explore.');
+    expect(body).not.toContain('Start with URL params');
+    expect(body).not.toContain('/trends/compare?item=tag:reaction');
   });
 });
 
@@ -63,12 +84,36 @@ function comparisonPayload(): PublicTrendComparisonRead {
         title: 'Launch reaction meme',
         description: 'Popularity score from real captured meme snapshots.',
         meme: null,
-        trend: trendMetrics(),
+      trend: trendMetrics(),
         insufficient_history: false,
         no_data_reason: null,
         points: [
-          { observed_at: '2026-01-01T00:00:00Z', value: 10, metric: 'popularity_score', label: 'Popularity score' },
-          { observed_at: '2026-01-02T00:00:00Z', value: 15, metric: 'popularity_score', label: 'Popularity score' }
+          {
+            observed_at: '2026-01-01T00:00:00Z',
+            value: 10,
+            metric: 'popularity_score',
+            label: 'Popularity score',
+            source_views: 4,
+            source_reactions: 1,
+            source_reposts: 0,
+            platform_views: 3,
+            platform_sends: 1,
+            platform_saves: 0,
+            platform_likes: 1
+          },
+          {
+            observed_at: '2026-01-02T00:00:00Z',
+            value: 15,
+            metric: 'popularity_score',
+            label: 'Popularity score',
+            source_views: 8,
+            source_reactions: 2,
+            source_reposts: 1,
+            platform_views: 6,
+            platform_sends: 2,
+            platform_saves: 1,
+            platform_likes: 3
+          }
         ]
       },
       {

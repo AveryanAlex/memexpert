@@ -27,6 +27,7 @@
     emptyMessage = 'Try a shorter phrase, a different synonym, or clear the filters to browse.',
     bulk = { enabled: false },
     showAccessMarkers = false,
+    layout = 'masonry',
     summary,
     emptyAction
   }: {
@@ -39,6 +40,7 @@
     emptyMessage?: string;
     bulk?: MemeGridBulkOptions;
     showAccessMarkers?: boolean;
+    layout?: 'masonry' | 'ordered';
     summary?: Snippet;
     emptyAction?: Snippet;
   } = $props();
@@ -172,7 +174,7 @@
   }
 </script>
 
-<div class="my-7 flex flex-wrap items-center justify-between gap-3">
+<div class="mb-4 flex flex-wrap items-center justify-between gap-3">
   <div class="flex flex-wrap items-center gap-2">
     {#if summary}{@render summary()}{/if}
   </div>
@@ -189,12 +191,12 @@
     {#if emptyAction}{@render emptyAction()}{/if}
   </EmptyState>
 {:else}
-  <MemeGrid {memes} {label} {attributions} {bulk} {showAccessMarkers} />
+  <MemeGrid {memes} {label} {attributions} {bulk} {showAccessMarkers} {layout} />
 {/if}
 
 <div bind:this={sentinel} aria-hidden="true" class="h-1"></div>
 
-<div class="mt-6 grid justify-items-center gap-3 text-center">
+<div class="mt-5 grid justify-items-center gap-2 text-center">
   {#if nextLoading}
     <LoadingState label="Loading more memes" />
   {/if}
@@ -204,16 +206,14 @@
     <Button type="button" variant="secondary" onclick={retry} disabled={loading}>Retry loading more</Button>
   {:else if showLoadMore}
     <Button type="button" variant="secondary" onclick={loadNext} disabled={loading} aria-describedby="meme-feed-load-more-help">Load more</Button>
-    <p class="m-0 text-sm text-muted">
-      <span id="meme-feed-load-more-help">
-        {#if observerAvailable}
-          More results also load automatically as you scroll.
-        {:else}
-          Automatic loading is unavailable in this browser, so use Load more.
-        {/if}
-      </span>
-    </p>
+    <span id="meme-feed-load-more-help" class="sr-only">
+      {#if observerAvailable}
+        More results also load automatically as you scroll.
+      {:else}
+        Automatic loading is unavailable in this browser, so use Load more.
+      {/if}
+    </span>
   {:else if showEnd}
-    <p class="m-0 rounded-full border border-line bg-paper px-4 py-2 text-sm font-extrabold text-muted">End of results.</p>
+    <p class="m-0 text-sm font-semibold text-muted">You’re all caught up.</p>
   {/if}
 </div>

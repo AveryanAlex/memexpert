@@ -5,7 +5,7 @@ import type { PublicMemeCardRead, PublicTrendTimelinePageRead } from '$lib/api/t
 import TrendTimelinePage from '../routes/trends/timeline/+page.svelte';
 
 describe('/trends/timeline page', () => {
-  it('renders granularity navigation and the honest empty state', () => {
+  it('renders month and year browsing controls with a welcoming empty state', () => {
     const { body } = render(TrendTimelinePage, {
       props: {
         data: {
@@ -22,12 +22,14 @@ describe('/trends/timeline page', () => {
     expect(body).toContain('Meme timeline.');
     expect(body).toContain('href="/trends/timeline?granularity=month"');
     expect(body).toContain('href="/trends/timeline?granularity=year"');
-    expect(body).toContain('No timeline data yet');
-    expect(body).toContain('source deltas or platform events have been captured');
+    expect(body).toContain('No moments to revisit yet');
+    expect(body).toContain('Come back soon to look back at emerging favorites.');
+    expect(body).not.toContain('source deltas or platform events');
+    expect(body).not.toContain('materialized');
     expect(body).not.toContain('Next periods');
   });
 
-  it('renders a real snapshot period and pagination state', () => {
+  it('renders a period as a visual look back with friendly activity and pagination', () => {
     const { body } = render(TrendTimelinePage, {
       props: {
         data: {
@@ -69,10 +71,18 @@ describe('/trends/timeline page', () => {
     });
 
     expect(body).toContain('January 2026');
-    expect(body).toContain('1 memes · 2 source checks');
+    expect(body).toContain('1 top meme to revisit');
     expect(body).toContain('Timeline reaction');
-    expect(body).toContain('Popularity');
-    expect(body).toContain('17.5');
+    expect(body).toContain('Recorded activity adds original-source views, reactions, and reposts');
+    expect(body).toContain('Recorded activity');
+    expect(body).toContain('56 signals');
+    expect(body).toContain('Original sources: 35 · MemeExpert: 21');
+    expect(body).not.toContain('5 favorites');
+    expect(body).not.toContain('3 sends');
+    expect(body).not.toContain('Popularity');
+    expect(body).not.toContain('17.5');
+    expect(body).not.toContain('Source views');
+    expect(body).not.toContain('Snapshots');
     expect(body).toContain('href="/trends/timeline?granularity=month&amp;offset=12"');
     expect(body).toContain('Next periods');
   });

@@ -12,6 +12,13 @@ describe('trend URL params', () => {
     expect(readComparisonItems(params)).toEqual(['meme:first', 'tag:reaction', 'template:frog', 'meme:2', 'meme:3', 'meme:4']);
   });
 
+  it('deduplicates repeated comparison values without changing their order', () => {
+    const params = new URLSearchParams('item=tag%3Ax&item=tag%3Ax&item=meme%3Ay');
+
+    expect(readComparisonItems(params)).toEqual(['tag:x', 'meme:y']);
+    expect(comparisonHref(['tag:x', 'tag:x', 'meme:y'])).toBe('/trends/compare?item=tag%3Ax&item=meme%3Ay');
+  });
+
   it('builds shareable compare and timeline links', () => {
     expect(comparisonHref(['meme:first', ' ', 'tag:reaction'])).toBe('/trends/compare?item=meme%3Afirst&item=tag%3Areaction');
     expect(comparisonHref([])).toBe('/trends/compare');

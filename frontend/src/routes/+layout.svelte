@@ -15,6 +15,11 @@
   provideViewerCapabilities(() => viewerCapabilitiesFromSession(data.session ?? null));
 </script>
 
+<svelte:head>
+  <meta name="theme-color" content="#f7f7f8" media="(prefers-color-scheme: light)" />
+  <meta name="theme-color" content="#16181d" media="(prefers-color-scheme: dark)" />
+</svelte:head>
+
 <TelegramMiniAppBootstrap />
 
 <TooltipProvider delayDuration={500}>

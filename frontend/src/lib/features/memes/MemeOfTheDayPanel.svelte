@@ -2,7 +2,7 @@
   import { browser } from '$app/environment';
   import { fetchMemeOfTheDay } from '$lib/api/client';
   import type { PublicMemeOfTheDayRead } from '$lib/api/types';
-  import { Badge, Button, Card, LoadingState, Notice } from '$lib/ui';
+  import { Button, Card, LoadingState, Notice } from '$lib/ui';
   import MemeCard from './MemeCard.svelte';
 
   interface Props {
@@ -45,55 +45,43 @@
     }
   }
 
-  function candidateLabel(count: number): string {
-    return `${count} candidate${count === 1 ? '' : 's'}`;
-  }
 </script>
 
-<Card class="my-6 overflow-hidden bg-gradient-to-br from-paper via-cream to-soft/60" aria-labelledby={headingId}>
-  <div class="grid gap-5 lg:grid-cols-[minmax(0,0.9fr)_minmax(18rem,1.1fr)] lg:items-start">
-    <div class="grid gap-3">
-      <p class="m-0 text-sm font-extrabold uppercase tracking-[0.18em] text-muted">Daily pick</p>
-      <h2 id={headingId} class="m-0 text-3xl font-black tracking-[-0.05em] text-ink md:text-4xl">Meme of the Day</h2>
-      <p class="m-0 max-w-prose text-muted">A fresh public pick for the homepage, selected from eligible catalog memes.</p>
-
-      {#if current}
-        <div class="flex flex-wrap gap-2" aria-label="Meme of the Day metadata">
-          <Badge>Selected {current.selected_for}</Badge>
-          <Badge>{candidateLabel(current.candidate_count)}</Badge>
-          {#if current.algorithm_version}
-            <Badge>Algorithm {current.algorithm_version}</Badge>
-          {/if}
-        </div>
-      {/if}
+<Card class="mb-5 overflow-hidden p-3 sm:p-4" aria-labelledby={headingId}>
+  <div class="grid gap-4 md:grid-cols-[minmax(12rem,0.7fr)_minmax(20rem,1fr)] md:items-start">
+    <div class="grid content-start gap-2 md:py-2">
+      <div>
+        <p class="m-0 text-xs font-semibold uppercase tracking-[0.16em] text-muted">Daily pick</p>
+        <h2 id={headingId} class="m-0 text-xl font-black tracking-[-0.04em] text-ink sm:text-2xl">Meme of the Day</h2>
+      </div>
+      <p class="m-0 hidden max-w-sm text-sm leading-relaxed text-muted md:block">One standout from today’s catalog, ready to save or send.</p>
     </div>
 
-    <div class="min-w-0">
-      {#if loading}
-        <LoadingState label="Loading Meme of the Day" />
-      {:else if errorMessage}
-        <div class="grid gap-3">
-          <Notice tone="danger" role="alert" class="my-0">{errorMessage}</Notice>
-          <div>
-            <Button type="button" variant="secondary" onclick={retry} disabled={loading}>Retry</Button>
-          </div>
+    {#if loading}
+      <LoadingState label="Loading Meme of the Day" />
+    {:else if errorMessage}
+      <div class="grid gap-3">
+        <Notice tone="danger" role="alert" class="my-0">{errorMessage}</Notice>
+        <div>
+          <Button type="button" variant="secondary" onclick={retry} disabled={loading}>Retry</Button>
         </div>
-      {:else if current?.meme}
-        <div
-          data-discovery-source={current.attribution?.source_algorithm ?? undefined}
-          data-discovery-reason={current.attribution?.reason ?? undefined}
-          data-discovery-request-id={current.attribution?.request_id ?? undefined}
-          data-discovery-impression-id={current.attribution?.impression_id ?? undefined}
-          data-discovery-score={current.attribution?.score ?? undefined}
-        >
-          <MemeCard meme={current.meme} attribution={current.attribution} {showAccessMarkers} />
-        </div>
-      {:else}
-        <div class="grid gap-2 rounded-[28px] border border-line bg-paper/80 p-5" role="status">
-          <p class="m-0 text-xl font-black tracking-[-0.04em] text-ink">No Meme of the Day yet</p>
-          <p class="m-0 text-muted">The selector did not find an eligible public meme{current ? ` for ${current.selected_for}` : ''}. Check back after the next refresh.</p>
-        </div>
-      {/if}
-    </div>
+      </div>
+    {:else if current?.meme}
+      <div
+        class="w-full md:max-w-[34rem] md:justify-self-end"
+        data-discovery-source={current.attribution?.source_algorithm ?? undefined}
+        data-discovery-reason={current.attribution?.reason ?? undefined}
+        data-discovery-request-id={current.attribution?.request_id ?? undefined}
+        data-discovery-impression-id={current.attribution?.impression_id ?? undefined}
+        data-discovery-score={current.attribution?.score ?? undefined}
+      >
+        <MemeCard meme={current.meme} attribution={current.attribution} {showAccessMarkers} />
+      </div>
+    {:else}
+      <div class="grid gap-1 py-3" role="status">
+        <p class="m-0 text-lg font-black tracking-[-0.04em] text-ink">No Meme of the Day yet</p>
+        <p class="m-0 text-muted">Check back soon for a fresh pick.</p>
+      </div>
+    {/if}
   </div>
 </Card>
