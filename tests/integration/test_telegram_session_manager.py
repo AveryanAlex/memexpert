@@ -36,6 +36,73 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 
+_LIVE_LISTENER_TEST_TIMEOUT_SECONDS = 10.0
+
+
+async def _await_live_listener_events_or_completion(
+    *,
+    events: tuple[asyncio.Event, ...],
+    listener_tasks: tuple[asyncio.Task[None], ...],
+) -> None:
+    """Wait for fake lifecycle events while surfacing premature listener failures."""
+
+    async def _wait_for_all_events() -> None:
+        await asyncio.gather(*(event.wait() for event in events))
+
+    event_task = asyncio.create_task(_wait_for_all_events())
+    try:
+        done, _ = await asyncio.wait(
+            (*listener_tasks, event_task),
+            timeout=_LIVE_LISTENER_TEST_TIMEOUT_SECONDS,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        completed_listener_tasks = tuple(task for task in done if task is not event_task)
+        if completed_listener_tasks:
+            results = await asyncio.gather(*completed_listener_tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
+            raise AssertionError("Live listener completed before the fake lifecycle event.")
+        if event_task in done:
+            await event_task
+            return
+        raise AssertionError("Live listener did not reach the fake lifecycle event before the watchdog elapsed.")
+    finally:
+        if not event_task.done():
+            event_task.cancel()
+            await asyncio.gather(event_task, return_exceptions=True)
+
+
+async def test_live_listener_event_wait_surfaces_task_error_before_watchdog() -> None:
+    event = asyncio.Event()
+
+    async def _fails() -> None:
+        raise RuntimeError("listener failed")
+
+    task = asyncio.create_task(_fails())
+
+    with pytest.raises(RuntimeError, match="listener failed"):
+        await _await_live_listener_events_or_completion(
+            events=(event,),
+            listener_tasks=(task,),
+        )
+
+
+async def test_live_listener_event_wait_rejects_early_normal_completion() -> None:
+    event = asyncio.Event()
+
+    async def _completes() -> None:
+        return None
+
+    task = asyncio.create_task(_completes())
+
+    with pytest.raises(AssertionError, match="completed before the fake lifecycle event"):
+        await _await_live_listener_events_or_completion(
+            events=(event,),
+            listener_tasks=(task,),
+        )
+
+
 def _now() -> datetime:
     return datetime.now(tz=UTC)
 
@@ -477,7 +544,7 @@ async def test_manager_live_listeners_scope_channels_and_disable_invalidates_sta
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     alpha_row = await _seed_session(migrated_db_session, session_name="alpha")
-    await _seed_session(migrated_db_session, session_name="beta")
+    beta_row = await _seed_session(migrated_db_session, session_name="beta")
     await _seed_channel(migrated_db_session, platform_id="alpha_live", session_name="alpha")
     await _seed_channel(migrated_db_session, platform_id="alpha_paused_live", session_name="alpha", is_paused=True)
     await _seed_channel(
@@ -491,6 +558,7 @@ async def test_manager_live_listeners_scope_channels_and_disable_invalidates_sta
 
     class _LeakyLiveClient(FakeTelegramClient):
         listened_channel_ids: list[tuple[str, ...]]
+        unbound_message_guard_completed: asyncio.Event
 
         def __init__(
             self,
@@ -500,6 +568,7 @@ async def test_manager_live_listeners_scope_channels_and_disable_invalidates_sta
         ) -> None:
             super().__init__(live_messages=live_messages, media_by_message=media_by_message)
             self.listened_channel_ids = []
+            self.unbound_message_guard_completed = asyncio.Event()
 
         async def listen_live(self, *, channel_ids: Sequence[str]) -> AsyncIterator[RawTelegramMessage]:
             self.listened_channel_ids.append(tuple(channel_ids))
@@ -507,6 +576,9 @@ async def test_manager_live_listeners_scope_channels_and_disable_invalidates_sta
                 for message in self.live_messages.get(channel_id, []):
                     yield message
             yield _build_photo_message(message_id="leak", channel_id="orphan_live")
+            # Resuming after the deliberately unbound yield proves the runtime
+            # ran the channel guard and requested the next stream item.
+            self.unbound_message_guard_completed.set()
             while True:
                 await asyncio.sleep(60)
 
@@ -520,28 +592,33 @@ async def test_manager_live_listeners_scope_channels_and_disable_invalidates_sta
     )
     manager = _build_manager(postgres_session_factory, clients_by_name={"alpha": alpha, "beta": beta})
 
-    await manager.start_live_all()
+    try:
+        await manager.start_live_all()
+        alpha_handle = manager._live_handles[alpha_row.id]  # noqa: SLF001 - test verifies manager lifecycle.
+        beta_handle = manager._live_handles[beta_row.id]  # noqa: SLF001 - test verifies manager lifecycle.
+        alpha_task = alpha_handle.runtime._live_tasks["alpha"]  # noqa: SLF001 - test verifies manager lifecycle.
+        beta_task = beta_handle.runtime._live_tasks["beta"]  # noqa: SLF001 - test verifies manager lifecycle.
+        await _await_live_listener_events_or_completion(
+            events=(alpha.unbound_message_guard_completed, beta.unbound_message_guard_completed),
+            listener_tasks=(alpha_task, beta_task),
+        )
 
-    for _ in range(50):
-        if alpha.downloaded_message_ids == ["101"] and beta.downloaded_message_ids == ["201"]:
-            break
-        await asyncio.sleep(0.02)
-    else:  # pragma: no cover - CI safety net
-        pytest.fail("Live manager did not process expected scoped messages in time.")
+        assert alpha.listened_channel_ids == [("alpha_live",)]
+        assert beta.listened_channel_ids == [("beta_live",)]
+        assert alpha.downloaded_message_ids == ["101"]
+        assert beta.downloaded_message_ids == ["201"]
+        assert "leak" not in alpha.downloaded_message_ids
+        assert "leak" not in beta.downloaded_message_ids
 
-    assert alpha.listened_channel_ids == [("alpha_live",)]
-    assert beta.listened_channel_ids == [("beta_live",)]
-    assert "leak" not in alpha.downloaded_message_ids
-    assert "leak" not in beta.downloaded_message_ids
+        alpha_row.enabled = False
+        await migrated_db_session.commit()
+        await manager.start_live_all()
 
-    alpha_row.enabled = False
-    await migrated_db_session.commit()
-    await manager.start_live_all()
+        assert alpha.closed is True
+        assert beta.closed is False
+    finally:
+        await manager.shutdown()
 
-    assert alpha.closed is True
-    assert beta.closed is False
-
-    await manager.shutdown()
     assert beta.closed is True
 
 
@@ -582,34 +659,35 @@ async def test_manager_restarts_completed_live_handle_and_closes_stale_client(
         ),
     )
 
-    await manager.start_live_session("alpha")
-    for _ in range(50):
-        handle = manager._live_handles.get(session_row.id)  # noqa: SLF001 - test verifies manager lifecycle.
-        task = None if handle is None else handle.runtime._live_tasks.get("alpha")  # noqa: SLF001
-        if task is not None and task.done():
-            break
-        await asyncio.sleep(0.02)
-    else:  # pragma: no cover - CI safety net
-        pytest.fail("Initial live listener did not finish after provider error.")
+    try:
+        await manager.start_live_session("alpha")
+        initial_handle = manager._live_handles[session_row.id]  # noqa: SLF001 - test verifies manager lifecycle.
+        initial_task = initial_handle.runtime._live_tasks["alpha"]  # noqa: SLF001 - test verifies manager lifecycle.
+        await asyncio.wait_for(
+            asyncio.shield(initial_task),
+            timeout=_LIVE_LISTENER_TEST_TIMEOUT_SECONDS,
+        )
 
-    assert len(created) == 1
-    assert created[0].closed is False
+        assert len(created) == 1
+        assert created[0].closed is False
 
-    await manager.start_live_session("alpha")
-    for _ in range(50):
-        if created[1].downloaded_message_ids == ["2"]:
-            break
-        await asyncio.sleep(0.02)
-    else:  # pragma: no cover - CI safety net
-        pytest.fail("Restarted live listener did not process the expected message.")
+        await manager.start_live_session("alpha")
+        restarted_handle = manager._live_handles[session_row.id]  # noqa: SLF001 - test verifies manager lifecycle.
+        restarted_task = restarted_handle.runtime._live_tasks["alpha"]  # noqa: SLF001 - test verifies manager lifecycle.
+        await asyncio.wait_for(
+            asyncio.shield(restarted_task),
+            timeout=_LIVE_LISTENER_TEST_TIMEOUT_SECONDS,
+        )
 
-    assert len(created) == 2
-    assert created[0].closed is True
-    assert created[1].closed is False
-    await migrated_db_session.refresh(session_row)
-    assert session_row.status is TelegramSessionStatus.ACTIVE
+        assert len(created) == 2
+        assert created[0].closed is True
+        assert created[1].closed is False
+        assert created[1].downloaded_message_ids == ["2"]
+        await migrated_db_session.refresh(session_row)
+        assert session_row.status is TelegramSessionStatus.ACTIVE
+    finally:
+        await manager.shutdown()
 
-    await manager.shutdown()
     assert created[1].closed is True
 
 

@@ -556,7 +556,7 @@ class AccountLinkService:
                 AccountMergeLog.guest_account_id == guest_user_id,
                 AccountMergeLog.created_at >= operation_started_at,
             )
-            .order_by(AccountMergeLog.created_at.desc())
+            .order_by(AccountMergeLog.created_at.desc(), AccountMergeLog.id.desc())
         )
         return result.scalars().first()
 

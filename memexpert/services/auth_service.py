@@ -259,7 +259,7 @@ class AuthService:
             select(User)
             .join(AccountMergeLog, AccountMergeLog.target_account_id == User.id)
             .where(AccountMergeLog.guest_account_id == guest_user_id)
-            .order_by(AccountMergeLog.created_at.desc())
+            .order_by(AccountMergeLog.created_at.desc(), AccountMergeLog.id.desc())
             .limit(1)
         )
         user = result.scalar_one_or_none()

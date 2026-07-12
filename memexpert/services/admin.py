@@ -1627,7 +1627,10 @@ class AdminService:
             await self.session.execute(
                 select(BlockedPerceptualHashAuditLog)
                 .where(BlockedPerceptualHashAuditLog.blocked_perceptual_hash_id == blocked_hash_id)
-                .order_by(BlockedPerceptualHashAuditLog.created_at.desc()),
+                .order_by(
+                    BlockedPerceptualHashAuditLog.created_at.desc(),
+                    BlockedPerceptualHashAuditLog.id.desc(),
+                ),
             )
         ).scalars().all()
         return [AdminBlockedPerceptualHashAuditRead.model_validate(row) for row in rows]
@@ -1674,7 +1677,7 @@ class AdminService:
             await self.session.execute(
                 select(ModerationDecision)
                 .where(ModerationDecision.meme_id == meme_id)
-                .order_by(ModerationDecision.created_at.desc())
+                .order_by(ModerationDecision.created_at.desc(), ModerationDecision.id.desc())
                 .limit(100),
             )
         ).scalars().all()
@@ -1950,7 +1953,12 @@ class AdminService:
         limit: int = 50,
         offset: int = 0,
     ) -> list[AdminModerationDecisionRead]:
-        stmt = select(ModerationDecision).order_by(ModerationDecision.created_at.desc()).limit(limit).offset(offset)
+        stmt = (
+            select(ModerationDecision)
+            .order_by(ModerationDecision.created_at.desc(), ModerationDecision.id.desc())
+            .limit(limit)
+            .offset(offset)
+        )
         if meme_id is not None:
             stmt = stmt.where(ModerationDecision.meme_id == meme_id)
         if report_id is not None:

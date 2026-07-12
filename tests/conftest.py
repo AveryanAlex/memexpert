@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import errno
+import socket
+import ssl
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,7 +17,20 @@ from alembic.config import Config
 from alembic.script import ScriptDirectory
 from httpx import ASGITransport, AsyncClient
 from redis import Redis
-from redis.exceptions import RedisError
+from redis.exceptions import (
+    AuthenticationError,
+    AuthenticationWrongNumberOfArgsError,
+    AuthorizationError,
+    BusyLoadingError,
+    ExternalAuthProviderError,
+    NoPermissionError,
+)
+from redis.exceptions import (
+    ConnectionError as RedisConnectionError,
+)
+from redis.exceptions import (
+    TimeoutError as RedisTimeoutError,
+)
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from testcontainers.core.container import DockerContainer  # pyright: ignore[reportMissingTypeStubs]
@@ -51,9 +67,26 @@ if TYPE_CHECKING:
 
 TEST_POSTGRES_IMAGE: Final = "postgres:16"
 TEST_POSTGRES_CONNECT_TIMEOUT_SECONDS: Final = 10.0
+TEST_POSTGRES_STARTUP_TIMEOUT_SECONDS: Final = 60.0
+TEST_POSTGRES_RETRY_INTERVAL_SECONDS: Final = 0.5
+TRANSIENT_POSTGRES_STARTUP_SQLSTATES: Final = frozenset({"53300", "57P03"})
+TRANSIENT_POSTGRES_NETWORK_ERRNOS: Final = frozenset(
+    {
+        errno.ECONNABORTED,
+        errno.ECONNREFUSED,
+        errno.ECONNRESET,
+        errno.EHOSTUNREACH,
+        errno.ENETDOWN,
+        errno.ENETUNREACH,
+        errno.EPIPE,
+        errno.ETIMEDOUT,
+    },
+)
 TEST_REDIS_IMAGE: Final = "redis:7"
 TEST_REDIS_PORT: Final = 6379
 TEST_REDIS_CONNECT_TIMEOUT_SECONDS: Final = 1.0
+TEST_REDIS_STARTUP_TIMEOUT_SECONDS: Final = 60
+TEST_REDIS_POLL_INTERVAL_SECONDS: Final = 0.5
 ALEMBIC_COMMAND_TIMEOUT_SECONDS: Final = 60.0
 PROJECT_ROOT: Final = Path(__file__).resolve().parents[1]
 ALEMBIC_INI_PATH: Final = PROJECT_ROOT / "alembic.ini"
@@ -103,15 +136,26 @@ class RedisPingWaitStrategy(WaitStrategy):
     fixture behavior equivalent without importing the deprecated Redis wrapper.
     """
 
-    def __init__(self, *, port: int = TEST_REDIS_PORT) -> None:
+    def __init__(
+        self,
+        *,
+        port: int = TEST_REDIS_PORT,
+        startup_timeout: int = TEST_REDIS_STARTUP_TIMEOUT_SECONDS,
+        poll_interval: float = TEST_REDIS_POLL_INTERVAL_SECONDS,
+    ) -> None:
         super().__init__()
         self._port = port
-        self.with_transient_exceptions(RedisError, OSError)
+        self.with_startup_timeout(startup_timeout)
+        self.with_poll_interval(poll_interval)
+        self.with_transient_exceptions(OSError)
 
     def wait_until_ready(self, container: WaitStrategyTarget) -> None:
         """Block until the mapped Redis port accepts PING."""
 
+        last_error: Exception | str | None = None
+
         def can_ping() -> bool:
+            nonlocal last_error
             client = Redis(
                 host=container.get_container_host_ip(),
                 port=container.get_exposed_port(self._port),
@@ -119,13 +163,31 @@ class RedisPingWaitStrategy(WaitStrategy):
                 socket_timeout=TEST_REDIS_CONNECT_TIMEOUT_SECONDS,
             )
             try:
-                return bool(client.ping())
+                if client.ping():
+                    return True
+                last_error = "PING returned false."
+                return False
+            except (
+                AuthenticationError,
+                AuthenticationWrongNumberOfArgsError,
+                AuthorizationError,
+                ExternalAuthProviderError,
+                NoPermissionError,
+            ):
+                # Credentials and authorization configuration cannot resolve
+                # through startup retries, so preserve the immediate failure.
+                raise
+            except (BusyLoadingError, RedisConnectionError, RedisTimeoutError, OSError) as exc:
+                last_error = exc
+                return False
             finally:
                 client.close()
 
         if not self._poll(can_ping):
+            diagnostic = "no Redis PING response" if last_error is None else str(last_error)
             raise TimeoutError(
-                "Redis testcontainer did not become ready before the startup timeout elapsed.",
+                "Redis testcontainer did not become ready "
+                f"after {self._startup_timeout:.1f}s. Last error: {diagnostic}",
             )
 
 
@@ -168,6 +230,112 @@ async def _run_alembic_upgrade(database_url: str) -> None:
         raise AssertionError(
             f"Alembic upgrade timed out after {ALEMBIC_COMMAND_TIMEOUT_SECONDS:.1f}s",
         ) from exc
+
+
+async def _wait_for_postgres_ready(
+    engine: AsyncEngine,
+    *,
+    total_timeout: float = TEST_POSTGRES_STARTUP_TIMEOUT_SECONDS,
+    retry_interval: float = TEST_POSTGRES_RETRY_INTERVAL_SECONDS,
+) -> None:
+    """Retry transient PostgreSQL connection failures until a fixed deadline."""
+
+    deadline = asyncio.get_running_loop().time() + total_timeout
+    attempts = 0
+    last_error: DatabaseConnectionError | None = None
+
+    while True:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            break
+
+        attempts += 1
+        try:
+            await verify_async_engine(
+                engine,
+                timeout=min(TEST_POSTGRES_CONNECT_TIMEOUT_SECONDS, remaining),
+            )
+        except DatabaseConnectionError as exc:
+            last_error = exc
+            if not _is_retryable_postgres_startup_error(exc):
+                raise
+        else:
+            return
+
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            break
+        await asyncio.sleep(min(retry_interval, remaining))
+
+    diagnostic = "no connection attempt completed" if last_error is None else str(last_error)
+    raise DatabaseConnectionError(
+        "PostgreSQL testcontainer did not become ready "
+        f"after {total_timeout:.1f}s across {attempts} attempts. Last error: {diagnostic}",
+    ) from last_error
+
+
+def _is_retryable_postgres_startup_error(error: DatabaseConnectionError) -> bool:
+    """Return whether a wrapped PostgreSQL failure can resolve during container startup."""
+
+    nested_errors = tuple(_iter_nested_exceptions(error))
+    sqlstates = tuple(
+        sqlstate
+        for nested_error in nested_errors
+        if (sqlstate := _postgres_sqlstate(nested_error)) is not None
+    )
+
+    if any(sqlstate.startswith(("28", "3D")) for sqlstate in sqlstates):
+        return False
+    if any(
+        isinstance(nested_error, (DatabaseConfigurationError, ValueError, TypeError, ssl.SSLError))
+        for nested_error in nested_errors
+    ):
+        return False
+
+    if any(sqlstate.startswith("08") or sqlstate in TRANSIENT_POSTGRES_STARTUP_SQLSTATES for sqlstate in sqlstates):
+        return True
+    if any(getattr(nested_error, "connection_invalidated", False) for nested_error in nested_errors):
+        return True
+    if any(isinstance(nested_error, TimeoutError) for nested_error in nested_errors):
+        return True
+    return any(_is_transient_postgres_network_error(nested_error) for nested_error in nested_errors)
+
+
+def _is_transient_postgres_network_error(error: BaseException) -> bool:
+    """Return whether a direct OS error is a recognized retryable network failure."""
+
+    if isinstance(error, ConnectionError):
+        return True
+    if isinstance(error, socket.gaierror):
+        return error.errno == socket.EAI_AGAIN
+    return isinstance(error, OSError) and error.errno in TRANSIENT_POSTGRES_NETWORK_ERRNOS
+
+
+def _iter_nested_exceptions(error: BaseException) -> Iterator[BaseException]:
+    """Yield an exception's cause/context chain plus SQLAlchemy DBAPI ``orig`` errors."""
+
+    pending = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        yield current
+        for attribute in ("__cause__", "__context__", "orig"):
+            nested_error = getattr(current, attribute, None)
+            if isinstance(nested_error, BaseException):
+                pending.append(nested_error)
+
+
+def _postgres_sqlstate(error: BaseException) -> str | None:
+    """Extract a PostgreSQL SQLSTATE from asyncpg or DBAPI-compatible exceptions."""
+
+    for attribute in ("sqlstate", "pgcode"):
+        sqlstate = getattr(error, attribute, None)
+        if isinstance(sqlstate, str) and len(sqlstate) == 5:
+            return sqlstate.upper()
+    return None
 
 
 async def _reset_public_schema(engine: AsyncEngine) -> None:
@@ -418,10 +586,7 @@ async def postgres_async_engine(postgres_async_url: str) -> AsyncIterator[AsyncE
         pytest.fail(f"Unable to build the async PostgreSQL test engine: {exc}")
 
     try:
-        await verify_async_engine(
-            engine,
-            timeout=TEST_POSTGRES_CONNECT_TIMEOUT_SECONDS,
-        )
+        await _wait_for_postgres_ready(engine)
     except DatabaseConnectionError as exc:
         await engine.dispose()
         pytest.fail(f"Unable to initialize the async PostgreSQL test engine: {exc}")

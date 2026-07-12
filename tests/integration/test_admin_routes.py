@@ -1165,7 +1165,7 @@ async def test_admin_direct_meme_override_persists_template_and_decision_audit_r
             await session.execute(
                 select(ModerationDecision)
                 .where(ModerationDecision.meme_id == meme_id)
-                .order_by(ModerationDecision.created_at.asc()),
+                .order_by(ModerationDecision.created_at.asc(), ModerationDecision.id.asc()),
             )
         ).scalars().all()
 
@@ -1308,7 +1308,7 @@ async def test_admin_can_manage_blocked_perceptual_hashes_with_audit_and_safe_de
             await session.execute(
                 select(BlockedPerceptualHashAuditLog)
                 .where(BlockedPerceptualHashAuditLog.blocked_perceptual_hash_id == blocked_hash_uuid)
-                .order_by(BlockedPerceptualHashAuditLog.created_at.asc()),
+                .order_by(BlockedPerceptualHashAuditLog.created_at.asc(), BlockedPerceptualHashAuditLog.id.asc()),
             )
         ).scalars().all()
 
@@ -1384,7 +1384,7 @@ async def test_admin_template_merge_reassigns_memes_and_writes_template_override
             await session.execute(
                 select(ModerationDecision)
                 .where(ModerationDecision.meme_id.in_([first_meme_id, second_meme_id]))
-                .order_by(ModerationDecision.created_at.asc()),
+                .order_by(ModerationDecision.created_at.asc(), ModerationDecision.id.asc()),
             )
         ).scalars().all()
 
@@ -2811,7 +2811,10 @@ async def test_admin_telegram_session_lifecycle_validates_without_leaking_string
         )
         audit_rows = (
             await session.execute(
-                select(TelegramAdminAuditLog).order_by(TelegramAdminAuditLog.created_at.asc()),
+                select(TelegramAdminAuditLog).order_by(
+                    TelegramAdminAuditLog.created_at.asc(),
+                    TelegramAdminAuditLog.id.asc(),
+                ),
             )
         ).scalars().all()
 
@@ -4258,7 +4261,7 @@ async def test_admin_telegram_channel_assignment_orphan_filters_and_audit(
             await session.execute(
                 select(TelegramAdminAuditLog.action)
                 .where(TelegramAdminAuditLog.source_channel_id == UUID(channel_id))
-                .order_by(TelegramAdminAuditLog.created_at.asc()),
+                .order_by(TelegramAdminAuditLog.created_at.asc(), TelegramAdminAuditLog.id.asc()),
             )
         ).scalars().all()
 
@@ -4353,7 +4356,7 @@ async def test_admin_delete_telegram_session_orphans_channels_and_audits_delete(
             await session.execute(
                 select(TelegramAdminAuditLog)
                 .where(TelegramAdminAuditLog.telegram_session_id == session_id)
-                .order_by(TelegramAdminAuditLog.created_at.asc()),
+                .order_by(TelegramAdminAuditLog.created_at.asc(), TelegramAdminAuditLog.id.asc()),
             )
         ).scalars().all()
 

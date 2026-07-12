@@ -49,6 +49,8 @@ if TYPE_CHECKING:
 
 pytestmark = pytest.mark.transactional_db
 
+_LIVE_LISTENER_TEST_TIMEOUT_SECONDS = 10.0
+
 
 def _now() -> datetime:
     return datetime.now(tz=UTC)
@@ -601,20 +603,16 @@ async def test_live_listener_round_trips_one_message_and_stops_cleanly(
 
     await runtime.start_live_listener("primary")
 
-    # Wait for the fake's one-shot stream to be fully consumed before asking
-    # the runtime to stop. ``downloaded_message_ids`` is appended before the
-    # ingest/heartbeat commits finish, so stopping immediately after download
-    # can cancel the background task while it is using the transactional test
-    # session and leave SQLAlchemy's savepoint invalidated.
     live_task = runtime._live_tasks["primary"]
-    for _ in range(50):
-        if live_task.done():
-            break
-        await asyncio.sleep(0.02)
-    else:  # pragma: no cover - safety net for flaky CI
-        pytest.fail("Live listener did not finish the fake one-shot stream in time.")
-
-    await runtime.stop_live_listener("primary")
+    try:
+        await asyncio.wait_for(
+            asyncio.shield(live_task),
+            timeout=_LIVE_LISTENER_TEST_TIMEOUT_SECONDS,
+        )
+    finally:
+        # The one-shot fake task finishing proves ingest and heartbeat commits
+        # completed. Always stop it so a watchdog failure cannot leak a task.
+        await runtime.stop_live_listener("primary")
 
     assert fake.downloaded_message_ids == ["100"]
     await migrated_db_session.refresh(session_row)
@@ -654,22 +652,14 @@ async def test_live_listener_skips_duplicate_source_before_download(
 
     await runtime.start_live_listener("primary")
 
-    for _ in range(50):
-        if "101" in fake.downloaded_message_ids:
-            break
-        await asyncio.sleep(0.02)
-    else:  # pragma: no cover - safety net for flaky CI
-        pytest.fail("Live listener did not process the pinned non-duplicate message in time.")
-
     live_task = runtime._live_tasks["primary"]
-    for _ in range(50):
-        if live_task.done():
-            break
-        await asyncio.sleep(0.02)
-    else:  # pragma: no cover - safety net for flaky CI
-        pytest.fail("Live listener did not finish the fake one-shot stream in time.")
-
-    await runtime.stop_live_listener("primary")
+    try:
+        await asyncio.wait_for(
+            asyncio.shield(live_task),
+            timeout=_LIVE_LISTENER_TEST_TIMEOUT_SECONDS,
+        )
+    finally:
+        await runtime.stop_live_listener("primary")
 
     assert fake.downloaded_message_ids == ["101"]
     await migrated_db_session.refresh(channel)

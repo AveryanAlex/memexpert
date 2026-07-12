@@ -211,7 +211,7 @@ async def test_email_signup_link_upgrades_guest_in_place_issues_canonical_sessio
         login_event_rows_result = await session.execute(
             select(LoginEvent)
             .where(LoginEvent.user_id == guest_user_id)
-            .order_by(LoginEvent.created_at.asc())
+            .order_by(LoginEvent.created_at.asc(), LoginEvent.id.asc())
         )
         login_event_rows = login_event_rows_result.scalars().all()
 
@@ -378,7 +378,7 @@ async def test_email_login_link_route_concurrent_loser_gets_already_completed_co
         login_event_rows_result = await session.execute(
             select(LoginEvent)
             .where(LoginEvent.user_id == full_user.id)
-            .order_by(LoginEvent.created_at.asc())
+            .order_by(LoginEvent.created_at.asc(), LoginEvent.id.asc())
         )
 
         merge_logs = merge_logs_result.scalars().all()
