@@ -13,6 +13,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
@@ -87,6 +88,8 @@ from memexpert.services.search_index_sync import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from memexpert.core.database import AsyncSessionFactory
@@ -98,6 +101,11 @@ DEFAULT_ARTIFACTS_DIR: Final = Path("/artifacts")
 DEFAULT_TIMEOUT_SECONDS: Final = 180.0
 DEFAULT_API_TIMEOUT_SECONDS: Final = 20.0
 POLL_INTERVAL_SECONDS: Final = 1.0
+HTTP_RETRY_INITIAL_BACKOFF_SECONDS: Final = 0.25
+HTTP_RETRY_MAX_BACKOFF_SECONDS: Final = 5.0
+HTTP_RETRY_MIN_DELAY_SECONDS: Final = 0.05
+TRANSIENT_HTTP_STATUS_CODES: Final = frozenset({408, 425, 429, *range(500, 600)})
+IDEMPOTENT_HTTP_METHODS: Final = frozenset({"DELETE", "GET", "HEAD", "OPTIONS", "PUT"})
 E2E_SOURCE_ID: Final = "e2e-prd-seed"
 E2E_UPLOAD_SOURCE_ID: Final = "e2e-prd-upload"
 E2E_MODEL_ID: Final = "e2e-prd-seed"
@@ -128,6 +136,69 @@ TERMINAL_INGEST_FAILURE_STATUSES: Final = frozenset(
 
 class E2ESeedError(RuntimeError):
     """Raised when the seed/proof flow cannot complete truthfully."""
+
+
+@dataclass(slots=True)
+class MonotonicDeadline:
+    """One caller-owned retry/poll deadline with an injectable clock and sleeper."""
+
+    expires_at: float
+    _monotonic: Callable[[], float]
+    _sleep: Callable[[float], None]
+
+    @classmethod
+    def after(
+        cls,
+        timeout_seconds: float,
+        *,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> MonotonicDeadline:
+        return cls(
+            expires_at=monotonic() + max(0.0, timeout_seconds),
+            _monotonic=monotonic,
+            _sleep=sleep,
+        )
+
+    def remaining(self) -> float:
+        return max(0.0, self.expires_at - self._monotonic())
+
+    def expired(self) -> bool:
+        return self.remaining() <= 0
+
+    def sleep_for(self, seconds: float) -> None:
+        duration = min(max(0.0, seconds), self.remaining())
+        if duration > 0:
+            self._sleep(duration)
+
+
+def _retry_after_seconds(value: str | None, *, now: datetime | None = None) -> float | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    if not normalized:
+        return None
+    try:
+        seconds = float(normalized)
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(normalized)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=UTC)
+        current = now or datetime.now(tz=UTC)
+        seconds = (retry_at - current).total_seconds()
+    if not math.isfinite(seconds):
+        return None
+    return max(0.0, seconds)
+
+
+def _http_retry_delay(*, attempts: int, retry_after: str | None = None) -> float:
+    requested_delay = _retry_after_seconds(retry_after)
+    exponential_delay = HTTP_RETRY_INITIAL_BACKOFF_SECONDS * (2 ** max(0, attempts - 1))
+    delay = requested_delay if requested_delay is not None else exponential_delay
+    return min(HTTP_RETRY_MAX_BACKOFF_SECONDS, max(HTTP_RETRY_MIN_DELAY_SECONDS, delay))
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,10 +342,17 @@ PUBLIC_TREND_SNAPSHOT_SPECS_BY_CATEGORY: Final[dict[str, tuple[PublicTrendSnapsh
 class PipelineApiClient:
     """Typed HTTP client wrapper for the operator and public proof routes."""
 
-    def __init__(self, *, base_url: str, operator_token: str, timeout_seconds: float) -> None:
-        self._client = httpx.Client(
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        operator_token: str,
+        timeout_seconds: float,
+        client: httpx.Client | None = None,
+    ) -> None:
+        self._request_timeout_seconds = timeout_seconds
+        self._client = client or httpx.Client(
             base_url=base_url.rstrip("/"),
-            timeout=timeout_seconds,
             headers={"X-Memexpert-Operator-Token": operator_token},
         )
 
@@ -287,16 +365,111 @@ class PipelineApiClient:
     def __exit__(self, *_: object) -> None:
         self.close()
 
-    def healthcheck(self) -> None:
-        response = self._client.get("/health")
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        deadline: MonotonicDeadline,
+        retry_safe: bool = False,
+        **kwargs: Any,
+    ) -> httpx.Response:
+        """Issue one request with transient retries bounded by the shared deadline."""
+
+        normalized_method = method.upper()
+        may_retry = normalized_method in IDEMPOTENT_HTTP_METHODS or retry_safe
+        attempts = 0
+        last_failure = "request was not attempted"
+
+        while True:
+            remaining = deadline.remaining()
+            if remaining <= 0:
+                raise E2ESeedError(
+                    f"{normalized_method} {path} exhausted the overall HTTP deadline after {attempts} attempt(s); "
+                    f"last transient failure: {last_failure}",
+                )
+
+            attempts += 1
+            try:
+                response = self._client.request(
+                    normalized_method,
+                    path,
+                    timeout=min(self._request_timeout_seconds, remaining),
+                    **kwargs,
+                )
+            except httpx.TransportError as exc:
+                if not may_retry:
+                    raise E2ESeedError(
+                        f"{normalized_method} {path} failed with ambiguous transport error and is not retry-safe; "
+                        f"the write was not retried: {type(exc).__name__}: {exc}",
+                    ) from exc
+                last_failure = f"{type(exc).__name__}: {exc}"
+                self._sleep_before_http_retry(
+                    method=normalized_method,
+                    path=path,
+                    attempts=attempts,
+                    deadline=deadline,
+                    delay_seconds=_http_retry_delay(attempts=attempts),
+                    failure=last_failure,
+                )
+                continue
+
+            if response.status_code not in TRANSIENT_HTTP_STATUS_CODES or not may_retry:
+                return response
+
+            last_failure = f"HTTP {response.status_code}: {response.text[:500]!r}"
+            self._sleep_before_http_retry(
+                method=normalized_method,
+                path=path,
+                attempts=attempts,
+                deadline=deadline,
+                delay_seconds=_http_retry_delay(
+                    attempts=attempts,
+                    retry_after=response.headers.get("Retry-After"),
+                ),
+                failure=last_failure,
+            )
+
+    def _sleep_before_http_retry(
+        self,
+        *,
+        method: str,
+        path: str,
+        attempts: int,
+        deadline: MonotonicDeadline,
+        delay_seconds: float,
+        failure: str,
+    ) -> None:
+        delay = min(delay_seconds, deadline.remaining())
+        print(
+            f"Transient {method} {path} failure on attempt {attempts}: {failure}; retrying in {delay:.2f}s.",
+            file=sys.stderr,
+            flush=True,
+        )
+        deadline.sleep_for(delay_seconds)
+
+    def healthcheck(self, *, deadline: MonotonicDeadline) -> None:
+        response = self._request("GET", "/health", deadline=deadline)
         if response.status_code != 200:
             raise E2ESeedError(
                 f"GET /health returned unexpected status {response.status_code}: {response.text!r}",
             )
 
-    def upload_cat_png(self, *, image_bytes: bytes, run_id: str) -> IngestRequestRead:
-        response = self._client.post(
+    def upload_cat_png(
+        self,
+        *,
+        image_bytes: bytes,
+        run_id: str,
+        deadline: MonotonicDeadline,
+    ) -> IngestRequestRead:
+        # The API persists and uniquely constrains (source_platform, source_id, post_id),
+        # and returns that existing request on replay. That durable identity makes a
+        # response-lost retry safe; arbitrary POST requests remain non-retryable.
+        response = self._request(
+            "POST",
             "/api/v1/pipeline/uploads",
+            deadline=deadline,
+            retry_safe=True,
             data={
                 "source_platform": SourcePlatform.TELEGRAM.value,
                 "source_id": E2E_UPLOAD_SOURCE_ID,
@@ -307,31 +480,73 @@ class PipelineApiClient:
         )
         return _validate_response(response, expected_status=(200, 202), model=IngestRequestRead)
 
-    def get_ingest_request(self, ingest_request_id: uuid.UUID) -> IngestRequestRead:
-        response = self._client.get(f"/api/v1/pipeline/ingest-requests/{ingest_request_id}")
+    def get_ingest_request(
+        self,
+        ingest_request_id: uuid.UUID,
+        *,
+        deadline: MonotonicDeadline,
+    ) -> IngestRequestRead:
+        response = self._request(
+            "GET",
+            f"/api/v1/pipeline/ingest-requests/{ingest_request_id}",
+            deadline=deadline,
+        )
         return _validate_response(response, expected_status=200, model=IngestRequestRead)
 
-    def get_item_detail(self, meme_file_id: uuid.UUID) -> ContentPipelineItemDetail:
-        response = self._client.get(f"/api/v1/pipeline/items/{meme_file_id}/detail")
+    def get_item_detail(
+        self,
+        meme_file_id: uuid.UUID,
+        *,
+        deadline: MonotonicDeadline,
+    ) -> ContentPipelineItemDetail:
+        response = self._request(
+            "GET",
+            f"/api/v1/pipeline/items/{meme_file_id}/detail",
+            deadline=deadline,
+        )
         return _validate_response(response, expected_status=200, model=ContentPipelineItemDetail)
 
-    def public_search(self, query: str, *, include_nsfw: bool = False) -> dict[str, Any]:
-        response = self._client.get(
+    def public_search(
+        self,
+        query: str,
+        *,
+        deadline: MonotonicDeadline,
+        include_nsfw: bool = False,
+    ) -> dict[str, Any]:
+        response = self._request(
+            "GET",
             "/api/v1/memes/search",
+            deadline=deadline,
             params={"query": query, "include_nsfw": str(include_nsfw).lower(), "limit": "10", "offset": "0"},
         )
         return _validate_json_response(response, expected_status=200)
 
-    def public_detail_by_slug(self, slug: str, *, include_nsfw: bool = False) -> dict[str, Any]:
-        response = self._client.get(
+    def public_detail_by_slug(
+        self,
+        slug: str,
+        *,
+        deadline: MonotonicDeadline,
+        include_nsfw: bool = False,
+    ) -> dict[str, Any]:
+        response = self._request(
+            "GET",
             f"/api/v1/memes/slug/{slug}",
+            deadline=deadline,
             params={"include_nsfw": str(include_nsfw).lower()},
         )
         return _validate_json_response(response, expected_status=200)
 
-    def public_detail_by_slug_status(self, slug: str, *, include_nsfw: bool = False) -> tuple[int, dict[str, Any]]:
-        response = self._client.get(
+    def public_detail_by_slug_status(
+        self,
+        slug: str,
+        *,
+        deadline: MonotonicDeadline,
+        include_nsfw: bool = False,
+    ) -> tuple[int, dict[str, Any]]:
+        response = self._request(
+            "GET",
             f"/api/v1/memes/slug/{slug}",
+            deadline=deadline,
             params={"include_nsfw": str(include_nsfw).lower()},
         )
         try:
@@ -346,36 +561,86 @@ class PipelineApiClient:
             )
         return response.status_code, payload
 
-    def public_trend_page(self, *, limit: int = 20) -> dict[str, Any]:
-        response = self._client.get("/api/v1/memes/trends", params={"limit": str(limit), "offset": "0"})
+    def public_trend_page(self, *, deadline: MonotonicDeadline, limit: int = 20) -> dict[str, Any]:
+        response = self._request(
+            "GET",
+            "/api/v1/memes/trends",
+            deadline=deadline,
+            params={"limit": str(limit), "offset": "0"},
+        )
         return _validate_json_response(response, expected_status=200)
 
-    def public_tag_trend_summaries(self, *, limit: int = 20) -> list[dict[str, Any]]:
-        response = self._client.get("/api/v1/memes/trends/tags", params={"limit": str(limit), "offset": "0"})
+    def public_tag_trend_summaries(
+        self,
+        *,
+        deadline: MonotonicDeadline,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        response = self._request(
+            "GET",
+            "/api/v1/memes/trends/tags",
+            deadline=deadline,
+            params={"limit": str(limit), "offset": "0"},
+        )
         return _validate_json_list_response(response, expected_status=200)
 
-    def public_template_trend_summaries(self, *, limit: int = 20) -> list[dict[str, Any]]:
-        response = self._client.get("/api/v1/memes/trends/templates", params={"limit": str(limit), "offset": "0"})
+    def public_template_trend_summaries(
+        self,
+        *,
+        deadline: MonotonicDeadline,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        response = self._request(
+            "GET",
+            "/api/v1/memes/trends/templates",
+            deadline=deadline,
+            params={"limit": str(limit), "offset": "0"},
+        )
         return _validate_json_list_response(response, expected_status=200)
 
-    def public_trend_comparison(self, items: list[str]) -> dict[str, Any]:
-        response = self._client.get("/api/v1/memes/trends/compare", params=[("item", item) for item in items])
+    def public_trend_comparison(
+        self,
+        items: list[str],
+        *,
+        deadline: MonotonicDeadline,
+    ) -> dict[str, Any]:
+        response = self._request(
+            "GET",
+            "/api/v1/memes/trends/compare",
+            deadline=deadline,
+            params=[("item", item) for item in items],
+        )
         return _validate_json_response(response, expected_status=200)
 
-    def public_trend_timeline(self, *, granularity: str = "month", limit: int = 12) -> dict[str, Any]:
-        response = self._client.get(
+    def public_trend_timeline(
+        self,
+        *,
+        deadline: MonotonicDeadline,
+        granularity: str = "month",
+        limit: int = 12,
+    ) -> dict[str, Any]:
+        response = self._request(
+            "GET",
             "/api/v1/memes/trends/timeline",
+            deadline=deadline,
             params={"granularity": granularity, "limit": str(limit), "offset": "0"},
         )
         return _validate_json_response(response, expected_status=200)
 
-    def public_tag_landing(self, tag_slug: str) -> dict[str, Any]:
-        response = self._client.get(f"/api/v1/memes/tags/{tag_slug}", params={"limit": "20", "offset": "0"})
+    def public_tag_landing(self, tag_slug: str, *, deadline: MonotonicDeadline) -> dict[str, Any]:
+        response = self._request(
+            "GET",
+            f"/api/v1/memes/tags/{tag_slug}",
+            deadline=deadline,
+            params={"limit": "20", "offset": "0"},
+        )
         return _validate_json_response(response, expected_status=200)
 
-    def public_template_landing(self, template_slug: str) -> dict[str, Any]:
-        response = self._client.get(
+    def public_template_landing(self, template_slug: str, *, deadline: MonotonicDeadline) -> dict[str, Any]:
+        response = self._request(
+            "GET",
             f"/api/v1/memes/templates/{template_slug}",
+            deadline=deadline,
             params={"limit": "20", "offset": "0"},
         )
         return _validate_json_response(response, expected_status=200)
@@ -398,7 +663,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--timeout-seconds",
         type=float,
         default=DEFAULT_TIMEOUT_SECONDS,
-        help="Total bounded wait budget for API/worker proof polling (default: %(default)s).",
+        help="Per-phase bounded wait/retry budget for API and eventual-consistency proofs (default: %(default)s).",
     )
     parser.add_argument(
         "--api-timeout-seconds",
@@ -446,27 +711,35 @@ async def _run(args: argparse.Namespace) -> None:
 
     cat_png = build_png_bytes((255, 0, 0))
     operator_token = settings.pipeline_operator_token.get_secret_value()
+
+    def phase_deadline() -> MonotonicDeadline:
+        return MonotonicDeadline.after(args.timeout_seconds)
+
     with PipelineApiClient(
         base_url=args.api_base_url,
         operator_token=operator_token,
         timeout_seconds=args.api_timeout_seconds,
     ) as api_client:
-        api_client.healthcheck()
+        api_client.healthcheck(deadline=phase_deadline())
         print("Uploading generated cat PNG through /api/v1/pipeline/uploads")
-        ingest_request = api_client.upload_cat_png(image_bytes=cat_png, run_id=run_id)
+        ingest_request = api_client.upload_cat_png(
+            image_bytes=cat_png,
+            run_id=run_id,
+            deadline=phase_deadline(),
+        )
         materialized_request, meme_file_id = await wait_for_ingest_materialized_meme_file(
             api_client,
             ingest_request_id=ingest_request.id,
             settings=settings,
             session_factory=session_factory,
-            timeout_seconds=args.timeout_seconds,
+            deadline=phase_deadline(),
         )
         detail = await wait_for_dual_synced(
             api_client,
             meme_file_id=meme_file_id,
             settings=settings,
             session_factory=session_factory,
-            timeout_seconds=args.timeout_seconds,
+            deadline=phase_deadline(),
         )
         print(f"Uploaded item dual-synced: ingest_request_id={ingest_request.id} meme_file_id={meme_file_id}")
         slug = await publish_created_meme(
@@ -484,12 +757,13 @@ async def _run(args: argparse.Namespace) -> None:
             api_client,
             query="cat",
             meme_id=detail.meme_id,
-            timeout_seconds=args.timeout_seconds,
+            deadline=phase_deadline(),
         )
         created_detail_payload = assert_public_detail_resolves(
             api_client,
             slug=slug,
             meme_id=detail.meme_id,
+            deadline=phase_deadline(),
         )
 
         seeded = await seed_direct_corpus(
@@ -499,6 +773,7 @@ async def _run(args: argparse.Namespace) -> None:
             meili_client=meili_client,
             specs=specs,
         )
+        await wait_for_meili_hits(meili_client, specs=specs, deadline=phase_deadline())
         print(f"Seeded deterministic public corpus: {', '.join(item.category for item in seeded)}")
         print("Refreshing public trend materialized views")
         await refresh_public_trend_materialized_views(get_async_engine(), concurrently=True)
@@ -516,12 +791,17 @@ async def _run(args: argparse.Namespace) -> None:
         )
 
         assert_created_is_distinct(created_meme_id=detail.meme_id, seeded=seeded)
-        created_search_payload = api_client.public_search("cat")
+        created_search_payload = api_client.public_search("cat", deadline=phase_deadline())
         assert_public_search_contains(created_search_payload, meme_id=detail.meme_id)
-        seeded_proofs = prove_seeded_public_corpus(api_client, seeded=seeded)
+        seeded_proofs = prove_seeded_public_corpus(
+            api_client,
+            seeded=seeded,
+            deadline=phase_deadline(),
+        )
         public_trends_proof = prove_seeded_public_trends(
             api_client,
             seeded=seeded,
+            deadline=phase_deadline(),
         )
 
     artifact_payload = {
@@ -794,7 +1074,6 @@ async def seed_direct_corpus(
             )
         await session.commit()
 
-    await wait_for_meili_hits(meili_client, specs=specs)
     return seeded
 
 
@@ -1670,17 +1949,16 @@ def wait_for_public_search_contains(
     *,
     query: str,
     meme_id: uuid.UUID,
-    timeout_seconds: float,
+    deadline: MonotonicDeadline,
 ) -> dict[str, Any]:
-    deadline = time.monotonic() + timeout_seconds
     last_payload: dict[str, Any] | None = None
-    while time.monotonic() < deadline:
-        payload = client.public_search(query)
+    while not deadline.expired():
+        payload = client.public_search(query, deadline=deadline)
         last_payload = payload
         hit_ids = _public_search_hit_ids(payload)
         if str(meme_id) in hit_ids:
             return payload
-        time.sleep(POLL_INTERVAL_SECONDS)
+        deadline.sleep_for(POLL_INTERVAL_SECONDS)
 
     hit_ids = _public_search_hit_ids(last_payload) if last_payload is not None else []
     raise E2ESeedError(
@@ -1694,17 +1972,16 @@ async def wait_for_ingest_materialized_meme_file(
     ingest_request_id: uuid.UUID,
     settings: Settings,
     session_factory: AsyncSessionFactory,
-    timeout_seconds: float,
+    deadline: MonotonicDeadline,
 ) -> tuple[IngestRequestRead, uuid.UUID]:
-    deadline = time.monotonic() + timeout_seconds
     last_request: IngestRequestRead | None = None
     last_outbox_result: RabbitMQOutboxPublisherBatchResult | None = None
-    while time.monotonic() < deadline:
+    while not deadline.expired():
         last_outbox_result = await publish_pending_rabbitmq_outbox(
             settings=settings,
             session_factory=session_factory,
         )
-        ingest_request = client.get_ingest_request(ingest_request_id)
+        ingest_request = client.get_ingest_request(ingest_request_id, deadline=deadline)
         last_request = ingest_request
         if ingest_request.status in TERMINAL_INGEST_FAILURE_STATUSES:
             raise E2ESeedError(
@@ -1713,7 +1990,7 @@ async def wait_for_ingest_materialized_meme_file(
             )
         if ingest_request.materialized_meme_file_id is not None:
             return ingest_request, ingest_request.materialized_meme_file_id
-        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+        await _sleep_until_deadline(deadline, POLL_INTERVAL_SECONDS)
 
     snapshot = last_request.model_dump(mode="json") if last_request is not None else None
     raise E2ESeedError(
@@ -1728,17 +2005,16 @@ async def wait_for_dual_synced(
     meme_file_id: uuid.UUID,
     settings: Settings,
     session_factory: AsyncSessionFactory,
-    timeout_seconds: float,
+    deadline: MonotonicDeadline,
 ) -> ContentPipelineItemDetail:
-    deadline = time.monotonic() + timeout_seconds
     last_detail: ContentPipelineItemDetail | None = None
     last_outbox_result: RabbitMQOutboxPublisherBatchResult | None = None
-    while time.monotonic() < deadline:
+    while not deadline.expired():
         last_outbox_result = await publish_pending_rabbitmq_outbox(
             settings=settings,
             session_factory=session_factory,
         )
-        detail = client.get_item_detail(meme_file_id)
+        detail = client.get_item_detail(meme_file_id, deadline=deadline)
         last_detail = detail
         qdrant_status = detail.sync_targets.get(SyncTargetKind.QDRANT)
         meili_status = detail.sync_targets.get(SyncTargetKind.MEILISEARCH)
@@ -1749,7 +2025,7 @@ async def wait_for_dual_synced(
             and meili_status.status is SyncTargetStatus.SYNCED
         ):
             return detail
-        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+        await _sleep_until_deadline(deadline, POLL_INTERVAL_SECONDS)
     snapshot = last_detail.model_dump(mode="json") if last_detail is not None else None
     raise E2ESeedError(
         f"Timed out waiting for {meme_file_id} to dual-sync. Last detail: {snapshot}; "
@@ -1763,6 +2039,12 @@ async def publish_pending_rabbitmq_outbox(
     session_factory: AsyncSessionFactory,
 ) -> RabbitMQOutboxPublisherBatchResult:
     return await run_rabbitmq_outbox_publisher_batch(session_factory, settings=settings)
+
+
+async def _sleep_until_deadline(deadline: MonotonicDeadline, seconds: float) -> None:
+    duration = min(max(0.0, seconds), deadline.remaining())
+    if duration > 0:
+        await asyncio.sleep(duration)
 
 
 def _outbox_result_snapshot(result: RabbitMQOutboxPublisherBatchResult | None) -> dict[str, int | float] | None:
@@ -1793,9 +2075,13 @@ def validate_provider_policy(settings: Settings) -> None:
         )
 
 
-async def wait_for_meili_hits(meili_client: PipelineMeilisearchSyncClient, *, specs: list[SeedSpec]) -> None:
-    deadline = time.monotonic() + 20.0
-    while time.monotonic() < deadline:
+async def wait_for_meili_hits(
+    meili_client: PipelineMeilisearchSyncClient,
+    *,
+    specs: list[SeedSpec],
+    deadline: MonotonicDeadline,
+) -> None:
+    while not deadline.expired():
         missing: list[str] = []
         for spec in specs:
             hits = await meili_client.search(spec.query, limit=10)
@@ -1804,7 +2090,7 @@ async def wait_for_meili_hits(meili_client: PipelineMeilisearchSyncClient, *, sp
                 missing.append(spec.category)
         if not missing:
             return
-        await asyncio.sleep(0.5)
+        await _sleep_until_deadline(deadline, 0.5)
     raise E2ESeedError("Timed out waiting for seeded Meilisearch documents to become searchable.")
 
 
@@ -1818,16 +2104,27 @@ def assert_created_is_distinct(*, created_meme_id: uuid.UUID, seeded: list[Seede
         )
 
 
-def prove_seeded_public_corpus(client: PipelineApiClient, *, seeded: list[SeededMeme]) -> dict[str, dict[str, object]]:
+def prove_seeded_public_corpus(
+    client: PipelineApiClient,
+    *,
+    seeded: list[SeededMeme],
+    deadline: MonotonicDeadline,
+) -> dict[str, dict[str, object]]:
     proof: dict[str, dict[str, object]] = {}
     for item in seeded:
         if item.is_nsfw:
-            default_search = client.public_search(item.query)
-            requested_search = client.public_search(item.query, include_nsfw=True)
+            default_search = client.public_search(item.query, deadline=deadline)
+            requested_search = client.public_search(item.query, deadline=deadline, include_nsfw=True)
             assert_public_search_excludes(default_search, meme_id=item.meme_id, label=f"seeded {item.category}")
             assert_public_search_excludes(requested_search, meme_id=item.meme_id, label=f"seeded {item.category}")
-            assert_public_detail_hidden(client, slug=item.slug, meme_id=item.meme_id)
-            assert_public_detail_hidden(client, slug=item.slug, meme_id=item.meme_id, include_nsfw=True)
+            assert_public_detail_hidden(client, slug=item.slug, meme_id=item.meme_id, deadline=deadline)
+            assert_public_detail_hidden(
+                client,
+                slug=item.slug,
+                meme_id=item.meme_id,
+                deadline=deadline,
+                include_nsfw=True,
+            )
             proof[item.slug] = {
                 "positive_detail_id": None,
                 "anonymous_search_hidden_by_default": True,
@@ -1837,21 +2134,27 @@ def prove_seeded_public_corpus(client: PipelineApiClient, *, seeded: list[Seeded
             }
             continue
 
-        search_payload = client.public_search(item.query)
+        search_payload = client.public_search(item.query, deadline=deadline)
         assert_public_search_contains(search_payload, meme_id=item.meme_id, label=f"seeded {item.category}")
         detail_payload = assert_public_detail_resolves(
             client,
             slug=item.slug,
             meme_id=item.meme_id,
+            deadline=deadline,
         )
         proof[item.slug] = {"positive_detail_id": detail_payload.get("id")}
     return proof
 
 
-def prove_seeded_public_trends(client: PipelineApiClient, *, seeded: list[SeededMeme]) -> dict[str, object]:
+def prove_seeded_public_trends(
+    client: PipelineApiClient,
+    *,
+    seeded: list[SeededMeme],
+    deadline: MonotonicDeadline,
+) -> dict[str, object]:
     representative = _require_seeded_category(seeded, "cat")
 
-    trend_page = client.public_trend_page(limit=20)
+    trend_page = client.public_trend_page(deadline=deadline, limit=20)
     trend_ids = [
         item.get("meme", {}).get("id")
         for item in trend_page.get("items", [])
@@ -1865,7 +2168,7 @@ def prove_seeded_public_trends(client: PipelineApiClient, *, seeded: list[Seeded
 
     tag_summary = _assert_public_trend_summary(
         _find_public_trend_summary(
-            client.public_tag_trend_summaries(limit=20),
+            client.public_tag_trend_summaries(deadline=deadline, limit=20),
             slug=E2E_PUBLIC_TRENDS_TAG_SLUG,
             label="tag summaries",
         ),
@@ -1874,7 +2177,7 @@ def prove_seeded_public_trends(client: PipelineApiClient, *, seeded: list[Seeded
     )
     template_summary = _assert_public_trend_summary(
         _find_public_trend_summary(
-            client.public_template_trend_summaries(limit=20),
+            client.public_template_trend_summaries(deadline=deadline, limit=20),
             slug=E2E_PUBLIC_TRENDS_TEMPLATE_SLUG,
             label="template summaries",
         ),
@@ -1882,9 +2185,9 @@ def prove_seeded_public_trends(client: PipelineApiClient, *, seeded: list[Seeded
         title=f"{E2E_PUBLIC_TRENDS_TEMPLATE_NAME} memes",
     )
 
-    tag_landing = client.public_tag_landing(E2E_PUBLIC_TRENDS_TAG_SLUG)
+    tag_landing = client.public_tag_landing(E2E_PUBLIC_TRENDS_TAG_SLUG, deadline=deadline)
     _assert_landing_trend_summary(tag_landing, slug=E2E_PUBLIC_TRENDS_TAG_SLUG, label="tag landing")
-    template_landing = client.public_template_landing(E2E_PUBLIC_TRENDS_TEMPLATE_SLUG)
+    template_landing = client.public_template_landing(E2E_PUBLIC_TRENDS_TEMPLATE_SLUG, deadline=deadline)
     _assert_landing_trend_summary(
         template_landing,
         slug=E2E_PUBLIC_TRENDS_TEMPLATE_SLUG,
@@ -1896,10 +2199,14 @@ def prove_seeded_public_trends(client: PipelineApiClient, *, seeded: list[Seeded
         f"tag:{E2E_PUBLIC_TRENDS_TAG_SLUG}",
         f"template:{E2E_PUBLIC_TRENDS_TEMPLATE_SLUG}",
     ]
-    comparison = client.public_trend_comparison(comparison_items)
+    comparison = client.public_trend_comparison(comparison_items, deadline=deadline)
     comparison_proof = _assert_public_trend_comparison(comparison, representative=representative)
 
-    timeline = client.public_trend_timeline(granularity=E2E_PUBLIC_TRENDS_TIMELINE_GRANULARITY, limit=12)
+    timeline = client.public_trend_timeline(
+        deadline=deadline,
+        granularity=E2E_PUBLIC_TRENDS_TIMELINE_GRANULARITY,
+        limit=12,
+    )
     timeline_proof = _assert_public_trend_timeline(timeline, representative=representative)
 
     return {
@@ -2039,9 +2346,10 @@ def assert_public_detail_resolves(
     *,
     slug: str,
     meme_id: uuid.UUID,
+    deadline: MonotonicDeadline,
     include_nsfw: bool = False,
 ) -> dict[str, Any]:
-    detail_payload = client.public_detail_by_slug(slug, include_nsfw=include_nsfw)
+    detail_payload = client.public_detail_by_slug(slug, deadline=deadline, include_nsfw=include_nsfw)
     if detail_payload.get("id") != str(meme_id):
         raise E2ESeedError(
             f"Public slug detail {slug!r} resolved {detail_payload.get('id')}, expected {meme_id}.",
@@ -2058,9 +2366,14 @@ def assert_public_detail_hidden(
     *,
     slug: str,
     meme_id: uuid.UUID,
+    deadline: MonotonicDeadline,
     include_nsfw: bool = False,
 ) -> None:
-    status_code, payload = client.public_detail_by_slug_status(slug, include_nsfw=include_nsfw)
+    status_code, payload = client.public_detail_by_slug_status(
+        slug,
+        deadline=deadline,
+        include_nsfw=include_nsfw,
+    )
     if status_code == 404:
         return
     if status_code == 200 and payload.get("id") != str(meme_id):

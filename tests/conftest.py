@@ -65,7 +65,7 @@ if TYPE_CHECKING:
     from memexpert.schemas.user import UserRead
     from memexpert.services.user_service import UserService
 
-TEST_POSTGRES_IMAGE: Final = "postgres:16"
+TEST_POSTGRES_IMAGE: Final = "postgres:16.14"
 TEST_POSTGRES_CONNECT_TIMEOUT_SECONDS: Final = 10.0
 TEST_POSTGRES_STARTUP_TIMEOUT_SECONDS: Final = 60.0
 TEST_POSTGRES_RETRY_INTERVAL_SECONDS: Final = 0.5
@@ -82,7 +82,7 @@ TRANSIENT_POSTGRES_NETWORK_ERRNOS: Final = frozenset(
         errno.ETIMEDOUT,
     },
 )
-TEST_REDIS_IMAGE: Final = "redis:7"
+TEST_REDIS_IMAGE: Final = "redis:7.4.9"
 TEST_REDIS_PORT: Final = 6379
 TEST_REDIS_CONNECT_TIMEOUT_SECONDS: Final = 1.0
 TEST_REDIS_STARTUP_TIMEOUT_SECONDS: Final = 60

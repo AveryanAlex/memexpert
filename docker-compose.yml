@@ -2,7 +2,7 @@
 # in docker-compose.prod.example.yml.
 services:
   postgres:
-    image: postgres:16
+    image: postgres:16.14
     container_name: memexpert-postgres
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-memexpert}
@@ -24,7 +24,7 @@ services:
       start_period: 10s
 
   redis:
-    image: redis:7
+    image: redis:7.4.9
     container_name: memexpert-redis
     command: ["redis-server", "--appendonly", "yes"]
     ports:
@@ -39,7 +39,8 @@ services:
       start_period: 5s
 
   rabbitmq:
-    image: rabbitmq:4-management
+    image: rabbitmq:4.3.1-management
+    user: rabbitmq
     container_name: memexpert-rabbitmq
     environment:
       RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-memexpert}
@@ -57,7 +58,7 @@ services:
       start_period: 20s
 
   qdrant:
-    image: qdrant/qdrant:latest
+    image: qdrant/qdrant:v1.18.2
     container_name: memexpert-qdrant
     ports:
       - "6333:6333"
@@ -75,7 +76,7 @@ services:
       start_period: 10s
 
   meilisearch:
-    image: getmeili/meilisearch:latest
+    image: getmeili/meilisearch:v1.46.1
     container_name: memexpert-meilisearch
     environment:
       MEILI_MASTER_KEY: ${MEILISEARCH_MASTER_KEY:-memexpert-dev-key}
@@ -93,7 +94,7 @@ services:
       start_period: 10s
 
   minio:
-    image: minio/minio:latest
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
     container_name: memexpert-minio
     command: server /data --console-address ":9001"
     environment:
@@ -112,7 +113,7 @@ services:
       start_period: 10s
 
   imgproxy:
-    image: darthsim/imgproxy:latest
+    image: darthsim/imgproxy:v4.0.4
     container_name: memexpert-imgproxy
     environment:
       IMGPROXY_USE_S3: "true"
@@ -136,7 +137,7 @@ services:
       start_period: 10s
 
   pgadmin:
-    image: dpage/pgadmin4:latest
+    image: dpage/pgadmin4:9.16
     container_name: memexpert-pgadmin
     profiles: ["tools"]
     environment:

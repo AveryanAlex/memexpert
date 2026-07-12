@@ -107,6 +107,12 @@ uv run memexpert-bot   # run bot locally
 
 Python app runs natively via `uv` (package manager + virtualenv). All infrastructure services run in Docker containers via `docker-compose.yml`. Code changes don't require container rebuilds — fastest iteration loop.
 
+Infrastructure image tags are explicit and shared across local, container-E2E, production-example, and testcontainer use where applicable: PostgreSQL 16.14, Redis 7.4.9, RabbitMQ 4.3.1-management, Qdrant 1.18.2, Meilisearch 1.46.1, MinIO `RELEASE.2025-09-07T16-13-09Z`, MinIO Client `RELEASE.2025-08-13T08-35-41Z`, and imgproxy 4.0.4. The optional local pgAdmin profile is pinned to 9.16. Updates are deliberate manifest/config changes rather than implicit `latest` or broad-major pulls.
+
+The E2E and production MinIO initializer services clear the pinned `mc` image entrypoint and invoke `/bin/sh -c` explicitly before configuring the alias and idempotently creating the bucket.
+
+Compose runs RabbitMQ as its image-provided `rabbitmq` user so the broker and `rabbitmqctl` share readable Erlang-cookie ownership on rootless as well as rootful Docker daemons.
+
 ## Testing
 
 Run the Python suite through the project `uv` environment:
@@ -116,6 +122,8 @@ uv run pytest -q
 ```
 
 `pyproject.toml` configures pytest to use `pytest-xdist` by default (`-n 4 --dist loadfile`). This keeps file-local test ordering intact while running different test files across four workers, which is the fastest safe default found so far. Use `uv run pytest -q --override-ini 'addopts='` when you need a single-process diagnostic run.
+
+CI overrides that local ceiling explicitly with `-n 2 --dist loadfile` to reduce concurrent RootlessKit/testcontainer pressure. It writes `backend-junit.xml` and uploads it when the backend job fails. Frontend smoke tests keep Playwright retries at zero and write each invocation beneath `frontend/test-results/smoke/<run-id>-<hash>/`; CI uploads `frontend/test-results/**` on frontend failure.
 
 ### Unit Tests (pytest, no I/O)
 
@@ -162,6 +170,8 @@ merge    → build images → deploy staging → Playwright E2E → deploy produ
 ```
 
 Integration tests run in CI with testcontainers — no shared test databases, no flaky state between runs.
+
+CI concurrency is keyed by source repository and branch/PR head so a newer run cancels an obsolete run for that head. Before BuildKit cache options are assembled, CI replaces unsafe branch characters and adds a hash of the source repository and full branch name. The actual default-branch run uses the literal `main` suffix so it keeps the fallback cache populated. Other heads write only their sanitized, hashed scope and read `main` as a fallback, preventing concurrent branches or forks from sharing a writer scope or injecting cache-option delimiters.
 
 ## Risks & Mitigations
 

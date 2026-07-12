@@ -214,7 +214,6 @@ async def test_publish_created_meme_resync_rebuilds_public_indexes_from_canonica
 
 
 def test_wait_for_public_search_contains_polls_public_api_until_created_meme_visible(
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     meme_id = uuid.uuid4()
     payloads: list[dict[str, Any]] = [
@@ -226,18 +225,33 @@ def test_wait_for_public_search_contains_polls_public_api_until_created_meme_vis
         def __init__(self) -> None:
             self.queries: list[str] = []
 
-        def public_search(self, query: str) -> dict[str, Any]:
+        def public_search(
+            self,
+            query: str,
+            *,
+            deadline: seed_e2e.MonotonicDeadline,
+        ) -> dict[str, Any]:
+            _ = deadline
             self.queries.append(query)
             return payloads.pop(0)
 
     client = PublicSearchClient()
-    monkeypatch.setattr(seed_e2e.time, "sleep", lambda _: None)
+    now = 0.0
+
+    def monotonic() -> float:
+        return now
+
+    def sleep(seconds: float) -> None:
+        nonlocal now
+        now += seconds
+
+    deadline = seed_e2e.MonotonicDeadline.after(2.0, monotonic=monotonic, sleep=sleep)
 
     result = seed_e2e.wait_for_public_search_contains(
-        cast("seed_e2e.PipelineApiClient", client),
+        cast("seed_e2e.PipelineApiClient", cast("object", client)),
         query="cat",
         meme_id=meme_id,
-        timeout_seconds=1.0,
+        deadline=deadline,
     )
 
     assert result == {"items": [{"meme": {"id": str(meme_id)}}]}

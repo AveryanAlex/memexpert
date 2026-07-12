@@ -5,6 +5,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+concurrency:
+  group: ci-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name || github.run_id }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -54,7 +58,15 @@ jobs:
         run: uv sync --locked
 
       - name: Run pytest
-        run: uv run pytest -v
+        run: uv run pytest -v -n 2 --dist loadfile --junitxml=backend-junit.xml
+
+      - name: Upload backend JUnit report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-junit
+          path: backend-junit.xml
+          if-no-files-found: ignore
 
   frontend:
     runs-on: ubuntu-24.04
@@ -99,6 +111,14 @@ jobs:
         run: pnpm build
         working-directory: frontend
 
+      - name: Upload frontend Playwright output on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-test-results
+          path: frontend/test-results/**
+          if-no-files-found: ignore
+
   e2e:
     runs-on: ubuntu-latest
     permissions:
@@ -107,6 +127,30 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+
+      - name: Select BuildKit cache scope
+        id: cache-scope
+        shell: bash
+        env:
+          RAW_BRANCH_NAME: ${{ github.head_ref || github.ref_name || 'main' }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$GITHUB_EVENT_NAME" != "pull_request" && "$REF_TYPE" == "branch" && "$RAW_BRANCH_NAME" == "$DEFAULT_BRANCH" ]]; then
+            cache_scope_suffix=main
+          else
+            safe_prefix="${RAW_BRANCH_NAME//[^a-zA-Z0-9_.-]/-}"
+            safe_prefix="${safe_prefix:0:32}"
+            scope_hash="$(printf '%s' "$HEAD_REPOSITORY:$RAW_BRANCH_NAME" | sha256sum)"
+            scope_hash="${scope_hash%% *}"
+            cache_scope_suffix="${safe_prefix:-head}-${scope_hash:0:12}"
+          fi
+
+          printf 'CACHE_SCOPE_SUFFIX=%s\n' "$cache_scope_suffix" >> "$GITHUB_ENV"
+          printf 'suffix=%s\n' "$cache_scope_suffix" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -125,8 +169,10 @@ jobs:
           target: main
           tags: memexpert-main:ci
           load: true
-          cache-from: type=gha,scope=memexpert-main
-          cache-to: type=gha,scope=memexpert-main,mode=max
+          cache-from: |
+            type=gha,scope=memexpert-main-${{ steps.cache-scope.outputs.suffix }}
+            type=gha,scope=memexpert-main-main
+          cache-to: type=gha,scope=memexpert-main-${{ steps.cache-scope.outputs.suffix }},mode=max
 
       - name: Build worker image
         uses: docker/build-push-action@v6
@@ -136,8 +182,10 @@ jobs:
           target: worker
           tags: memexpert-worker:ci
           load: true
-          cache-from: type=gha,scope=memexpert-worker
-          cache-to: type=gha,scope=memexpert-worker,mode=max
+          cache-from: |
+            type=gha,scope=memexpert-worker-${{ steps.cache-scope.outputs.suffix }}
+            type=gha,scope=memexpert-worker-main
+          cache-to: type=gha,scope=memexpert-worker-${{ steps.cache-scope.outputs.suffix }},mode=max
 
       - name: Build frontend image
         uses: docker/build-push-action@v6
@@ -146,8 +194,10 @@ jobs:
           file: frontend/Dockerfile
           tags: memexpert-frontend:ci
           load: true
-          cache-from: type=gha,scope=memexpert-frontend
-          cache-to: type=gha,scope=memexpert-frontend,mode=max
+          cache-from: |
+            type=gha,scope=memexpert-frontend-${{ steps.cache-scope.outputs.suffix }}
+            type=gha,scope=memexpert-frontend-main
+          cache-to: type=gha,scope=memexpert-frontend-${{ steps.cache-scope.outputs.suffix }},mode=max
 
       - name: Build E2E runner image
         uses: docker/build-push-action@v6
@@ -156,15 +206,17 @@ jobs:
           file: e2e/Dockerfile
           tags: memexpert-e2e-runner:ci
           load: true
-          cache-from: type=gha,scope=memexpert-e2e-runner
-          cache-to: type=gha,scope=memexpert-e2e-runner,mode=max
+          cache-from: |
+            type=gha,scope=memexpert-e2e-runner-${{ steps.cache-scope.outputs.suffix }}
+            type=gha,scope=memexpert-e2e-runner-main
+          cache-to: type=gha,scope=memexpert-e2e-runner-${{ steps.cache-scope.outputs.suffix }},mode=max
 
       - name: Smoke test app images
         run: |
           set -euo pipefail
 
           docker network create memexpert-smoke
-          docker run -d --rm \
+          docker run -d \
             --name memexpert-main-smoke \
             --network memexpert-smoke \
             -e APP_HOST=0.0.0.0 \
@@ -185,7 +237,7 @@ jobs:
           docker run --rm memexpert-worker:ci ffmpeg -version
           docker run --rm memexpert-worker:ci ffprobe -version
 
-          docker run -d --rm \
+          docker run -d \
             --name memexpert-frontend-smoke \
             --network memexpert-smoke \
             -e HOST=0.0.0.0 \
@@ -289,8 +341,10 @@ jobs:
           push: true
           tags: ${{ steps.meta-main.outputs.tags }}
           labels: ${{ steps.meta-main.outputs.labels }}
-          cache-from: type=gha,scope=memexpert-main
-          cache-to: type=gha,scope=memexpert-main,mode=max
+          cache-from: |
+            type=gha,scope=memexpert-main-${{ steps.cache-scope.outputs.suffix }}
+            type=gha,scope=memexpert-main-main
+          cache-to: type=gha,scope=memexpert-main-${{ steps.cache-scope.outputs.suffix }},mode=max
 
       - name: Build and push worker image
         if: github.event_name != 'pull_request'
@@ -302,8 +356,10 @@ jobs:
           push: true
           tags: ${{ steps.meta-worker.outputs.tags }}
           labels: ${{ steps.meta-worker.outputs.labels }}
-          cache-from: type=gha,scope=memexpert-worker
-          cache-to: type=gha,scope=memexpert-worker,mode=max
+          cache-from: |
+            type=gha,scope=memexpert-worker-${{ steps.cache-scope.outputs.suffix }}
+            type=gha,scope=memexpert-worker-main
+          cache-to: type=gha,scope=memexpert-worker-${{ steps.cache-scope.outputs.suffix }},mode=max
 
       - name: Build and push frontend image
         if: github.event_name != 'pull_request'
@@ -314,5 +370,7 @@ jobs:
           push: true
           tags: ${{ steps.meta-frontend.outputs.tags }}
           labels: ${{ steps.meta-frontend.outputs.labels }}
-          cache-from: type=gha,scope=memexpert-frontend
-          cache-to: type=gha,scope=memexpert-frontend,mode=max
+          cache-from: |
+            type=gha,scope=memexpert-frontend-${{ steps.cache-scope.outputs.suffix }}
+            type=gha,scope=memexpert-frontend-main
+          cache-to: type=gha,scope=memexpert-frontend-${{ steps.cache-scope.outputs.suffix }},mode=max
