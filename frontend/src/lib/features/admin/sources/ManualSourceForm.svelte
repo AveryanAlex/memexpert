@@ -1,15 +1,28 @@
 <script lang="ts">
+  import { onDestroy, tick } from 'svelte';
   import { Button, FormRow, Input } from '$lib/ui';
 
-  let formElement: HTMLFormElement;
+  let formElement: HTMLFormElement | undefined;
   let platformId = $state('');
   let title = $state('');
   let username = $state('');
+  let focusRequest = 0;
+
+  onDestroy(() => {
+    focusRequest += 1;
+  });
 
   export function prefillAndFocus(reference: string): void {
     platformId = reference;
     if (!title) title = 'Telegram source';
-    requestAnimationFrame(() => formElement?.querySelector<HTMLInputElement>('[name="platform_id"]')?.focus());
+    const request = ++focusRequest;
+    void focusPlatformIdAfterUpdate(request);
+  }
+
+  async function focusPlatformIdAfterUpdate(request: number): Promise<void> {
+    await tick();
+    if (request !== focusRequest) return;
+    formElement?.querySelector<HTMLInputElement>('[name="platform_id"]')?.focus();
   }
 </script>
 

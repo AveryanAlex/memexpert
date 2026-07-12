@@ -94,7 +94,7 @@
     const date = new Date(raw);
     if (Number.isNaN(date.getTime())) return raw;
 
-    return new Intl.DateTimeFormat('en', { month: 'short', day: 'numeric', year: 'numeric' }).format(date);
+    return new Intl.DateTimeFormat('en', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' }).format(date);
   }
 
   function formatValue(value: number): string {

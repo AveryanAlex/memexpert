@@ -19,7 +19,11 @@
   } = $props();
 </script>
 
-<details class={cn('rounded-2xl border p-4', danger ? 'border-danger-line bg-danger-surface' : 'border-line bg-soft/40', className)} bind:open>
+<details
+  class={cn('rounded-2xl border p-4', danger ? 'border-danger-line bg-danger-surface' : 'border-line bg-soft/40', className)}
+  data-advanced-section={title}
+  bind:open
+>
   <summary class="cursor-pointer list-none font-extrabold text-ink marker:content-none">
     <span class="flex items-center justify-between gap-3">
       {title}

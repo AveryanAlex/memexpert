@@ -2,6 +2,7 @@ import { createServer } from 'node:http';
 
 const port = Number(process.env.PORT ?? 8787);
 const seededCollectionId = 'smoke-private-team-saves';
+const adminAccessTokenPrefix = 'smoke-admin-';
 
 const meme = {
   id: 'smoke-meme-1',
@@ -230,7 +231,7 @@ const floodWaitAdminTelegramAccount = {
 };
 
 const adminTelegramAccounts = [readyAdminTelegramAccount, floodWaitAdminTelegramAccount];
-const adminSources = [
+const adminSourceSeed = [
   {
     id: adminIds.healthySource,
     platform: 'telegram',
@@ -307,6 +308,7 @@ const adminSources = [
     updated_at: '2026-01-01T00:00:00Z'
   }
 ];
+const adminSourceStateBySession = new Map();
 
 const adminSuggestions = [
   {
@@ -490,11 +492,12 @@ const server = createServer((request, response) => {
   }
 
   if (url.pathname.startsWith('/api/v1/admin/')) {
-    if (!hasAdminAccess(request)) {
+    const sessionKey = adminSessionKey(request);
+    if (!sessionKey) {
       sendJson(response, 403, { detail: 'Admin access is required for smoke admin routes.' });
       return;
     }
-    void handleAdminApi(request, response, url).then((handled) => {
+    void handleAdminApi(request, response, url, adminSourcesForSession(sessionKey)).then((handled) => {
       if (!handled) sendJson(response, 404, { detail: `Unhandled smoke API route: ${url.pathname}` });
     }).catch(() => {
       sendJson(response, 500, { detail: 'Smoke admin API could not process the request.' });
@@ -592,7 +595,7 @@ server.listen(port, '127.0.0.1', () => {
   process.stdout.write(`Smoke API listening on http://127.0.0.1:${port}\n`);
 });
 
-async function handleAdminApi(request, response, url) {
+async function handleAdminApi(request, response, url, adminSources) {
   const { method } = request;
   const { pathname } = url;
 
@@ -671,7 +674,7 @@ async function handleAdminApi(request, response, url) {
       sendJson(response, 422, { detail: quickAdd.error });
       return true;
     }
-    const source = upsertQuickAddedSource(quickAdd.username);
+    const source = upsertQuickAddedSource(adminSources, quickAdd.username);
     sendJson(response, 201, source);
     return true;
   }
@@ -728,7 +731,7 @@ function canonicalPublicTelegramUsername(reference) {
   }
 }
 
-function upsertQuickAddedSource(username) {
+function upsertQuickAddedSource(adminSources, username) {
   const now = new Date().toISOString();
   const existing = adminSources.find((source) => source.platform === 'telegram' && source.platform_id === username);
   const source = existing ?? {
@@ -805,12 +808,37 @@ function readRequestJson(request) {
 }
 
 function hasFullAccess(request) {
-  const cookie = request.headers.cookie ?? '';
-  return cookie.includes('memexpert_access_token=miniapp-full') || hasAdminAccess(request);
+  return accessToken(request) === 'miniapp-full' || hasAdminAccess(request);
 }
 
 function hasAdminAccess(request) {
-  return (request.headers.cookie ?? '').includes('memexpert_access_token=smoke-admin');
+  return adminSessionKey(request) !== null;
+}
+
+function adminSessionKey(request) {
+  const token = accessToken(request);
+  if (!token?.startsWith(adminAccessTokenPrefix)) return null;
+
+  const key = token.slice(adminAccessTokenPrefix.length);
+  return key && /^[A-Za-z0-9_-]+$/.test(key) ? key : null;
+}
+
+function accessToken(request) {
+  for (const pair of (request.headers.cookie ?? '').split(';')) {
+    const separator = pair.indexOf('=');
+    if (separator < 0 || pair.slice(0, separator).trim() !== 'memexpert_access_token') continue;
+    return pair.slice(separator + 1).trim();
+  }
+  return null;
+}
+
+function adminSourcesForSession(sessionKey) {
+  let sources = adminSourceStateBySession.get(sessionKey);
+  if (!sources) {
+    sources = structuredClone(adminSourceSeed);
+    adminSourceStateBySession.set(sessionKey, sources);
+  }
+  return sources;
 }
 
 function isSeededCollectionSearch(url) {
@@ -895,7 +923,7 @@ function sessionPayload(accountType) {
       nsfw_enabled: false,
       token_nonce: 0,
       status: 'active',
-      guest_expires_at: isFull ? null : '2026-07-12T00:00:00Z',
+      guest_expires_at: isFull ? null : '2099-12-31T23:59:59Z',
       active_save_collection_id: null,
       is_admin: isAdmin,
       created_at: '2026-01-01T00:00:00Z',

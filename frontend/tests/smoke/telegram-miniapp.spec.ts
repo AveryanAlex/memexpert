@@ -1,5 +1,7 @@
 import { expect, test, type Page } from '@playwright/test';
 
+const telegramSdkUrl = '**/telegram-web-app.js*';
+
 test('Telegram Mini App launch authenticates, applies shell state, and routes meme startapp', async ({ page }) => {
   const { telegramSdkRequest } = await installFakeTelegramSdk(page);
 
@@ -48,7 +50,7 @@ test('Telegram Mini App launch authenticates, applies shell state, and routes me
 
 test('normal web launch does not load the Telegram Mini App SDK', async ({ page }) => {
   let requestedTelegramSdk = false;
-  await page.route(/https:\/\/telegram\.org\/js\/telegram-web-app\.js\?62/, async (route) => {
+  await page.route(telegramSdkUrl, async (route) => {
     requestedTelegramSdk = true;
     await route.fulfill({ contentType: 'application/javascript', body: '' });
   });
@@ -78,7 +80,7 @@ async function installFakeTelegramSdk(page: Page): Promise<{ telegramSdkRequest:
   const telegramSdkRequest = new Promise<boolean>((resolve) => {
     resolveTelegramSdkRequest = resolve;
   });
-  await page.route(/https:\/\/telegram\.org\/js\/telegram-web-app\.js\?62/, async (route) => {
+  await page.route(telegramSdkUrl, async (route) => {
     resolveTelegramSdkRequest(true);
     await route.fulfill({
       contentType: 'application/javascript',

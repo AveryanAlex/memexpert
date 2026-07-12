@@ -72,6 +72,12 @@ describe('profile view model', () => {
     ]);
     expect(profilePreferences(session.user).map((preference) => [preference.label, preference.value])).toContainEqual(['NSFW', 'Enabled']);
     expect(profilePreferences(session.user).find((preference) => preference.label === 'NSFW')?.detail).toContain('Search can include');
+    expect(profilePreferences(session.user).find((preference) => preference.label === 'Account status')?.detail).toBe(
+      'Guest session expires Jul 12, 2026 UTC.'
+    );
+
+    const fullAccountStatus = profilePreferences(sessionPayload('full').user).find((preference) => preference.label === 'Account status');
+    expect(fullAccountStatus?.detail).toBe('Created Jan 1, 2026 UTC.');
   });
 
   it('builds zero-count stats from empty interaction history', () => {

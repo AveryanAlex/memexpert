@@ -28,11 +28,12 @@ export const load: PageServerLoad = async ({ cookies, fetch, params, request }) 
       }
     });
 
-    return { detail, errorMessage: null };
+    return { detail, errorMessage: null, loadedAt: new Date().toISOString() };
   } catch (error) {
     return {
       detail: null,
-      errorMessage: error instanceof ApiError ? error.message : 'Could not load this collection.'
+      errorMessage: error instanceof ApiError ? error.message : 'Could not load this collection.',
+      loadedAt: new Date().toISOString()
     };
   }
 };

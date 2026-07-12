@@ -231,5 +231,5 @@ export function languageLabel(language: UserRead['language']): string {
 }
 
 function formatDate(value: string): string {
-  return new Intl.DateTimeFormat('en', { dateStyle: 'medium' }).format(new Date(value));
+  return `${new Intl.DateTimeFormat('en', { dateStyle: 'medium', timeZone: 'UTC' }).format(new Date(value))} UTC`;
 }

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { untrack } from 'svelte';
+  import { onDestroy, tick, untrack } from 'svelte';
   import AdvancedSection from '$lib/features/admin/AdvancedSection.svelte';
   import AdminPanel from '$lib/features/admin/AdminPanel.svelte';
   import type { AdminTelegramSessionRead } from '$lib/api/types';
@@ -20,20 +20,36 @@
   const initialPrefill = untrack(() => sourceSuggestionPrefill(initialReference, initialSuggestionId));
   let reference = $state(initialPrefill.reference);
   let suggestionId = $state(initialPrefill.suggestionId);
-  let formElement: HTMLFormElement;
+  let formElement: HTMLFormElement | undefined;
+  let focusRequest = 0;
+
+  onDestroy(() => {
+    focusRequest += 1;
+  });
 
   export function prefillAndFocus(nextReference: string, nextSuggestionId = ''): void {
     const prefill = sourceSuggestionPrefill(nextReference, nextSuggestionId);
     reference = prefill.reference;
     suggestionId = prefill.suggestionId;
-    requestAnimationFrame(() => formElement?.querySelector<HTMLInputElement>('[name="reference"]')?.focus());
+    requestReferenceFocus();
   }
 
   function clearSuggestion(): void {
     const cleared = clearSourceSuggestionPrefill();
     reference = cleared.reference;
     suggestionId = cleared.suggestionId;
-    requestAnimationFrame(() => formElement?.querySelector<HTMLInputElement>('[name="reference"]')?.focus());
+    requestReferenceFocus();
+  }
+
+  function requestReferenceFocus(): void {
+    const request = ++focusRequest;
+    void focusReferenceAfterUpdate(request);
+  }
+
+  async function focusReferenceAfterUpdate(request: number): Promise<void> {
+    await tick();
+    if (request !== focusRequest) return;
+    formElement?.querySelector<HTMLInputElement>('[name="reference"]')?.focus();
   }
 </script>
 

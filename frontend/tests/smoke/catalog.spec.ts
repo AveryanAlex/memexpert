@@ -22,7 +22,11 @@ test.describe('public masonry feed smoke', () => {
     await expect(firstCardLink).toBeVisible();
     await expect(firstCardMenu).toBeVisible();
 
-    await tabUntilFocused(page, firstCardLink);
+    await expect(firstCardLink).toHaveAccessibleName('Open Smoke test cat reaction');
+    await expect(firstCardLink).toHaveJSProperty('tabIndex', 0);
+    await expect(firstCardLink).not.toHaveAttribute('tabindex', '-1');
+    await firstCardLink.focus();
+    await expect(firstCardLink).toBeFocused();
     await page.keyboard.press('Tab');
     await expect(firstCardMenu).toBeFocused();
     await firstCardMenu.press('Enter');
@@ -114,15 +118,6 @@ function collectionSearchPath() {
     q: seededCollectionQuery
   });
   return `/search?${params.toString()}`;
-}
-
-async function tabUntilFocused(page: import('@playwright/test').Page, locator: import('@playwright/test').Locator) {
-  for (let attempt = 0; attempt < 20; attempt += 1) {
-    await page.keyboard.press('Tab');
-    if (await locator.evaluate((element) => element === document.activeElement)) return;
-  }
-
-  await expect(locator).toBeFocused();
 }
 
 async function disableIntersectionObserver(page: import('@playwright/test').Page) {

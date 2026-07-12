@@ -12,9 +12,9 @@
   function periodLabel(raw: string, granularity: 'month' | 'year' | string): string {
     const date = new Date(raw);
     if (granularity === 'year') {
-      return new Intl.DateTimeFormat('en', { year: 'numeric' }).format(date);
+      return new Intl.DateTimeFormat('en', { year: 'numeric', timeZone: 'UTC' }).format(date);
     }
-    return new Intl.DateTimeFormat('en', { month: 'long', year: 'numeric' }).format(date);
+    return new Intl.DateTimeFormat('en', { month: 'long', year: 'numeric', timeZone: 'UTC' }).format(date);
   }
 </script>
 

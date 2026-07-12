@@ -17,7 +17,7 @@
 
   function formatObservedAt(raw: string | null): string {
     if (!raw) return 'current window';
-    return new Intl.DateTimeFormat('en', { month: 'short', day: 'numeric', year: 'numeric' }).format(new Date(raw));
+    return new Intl.DateTimeFormat('en', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' }).format(new Date(raw));
   }
 
   function isAggregateSeries(item: PublicTrendComparisonSeriesRead): boolean {

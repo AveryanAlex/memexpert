@@ -2,10 +2,19 @@
   import { browser } from '$app/environment';
   import { invalidateAll } from '$app/navigation';
   import { Mail, Send, Sparkles } from '@lucide/svelte';
+  import { onDestroy } from 'svelte';
   import type { CurrentSessionRead, TelegramLinkStartRead } from '$lib/api/types';
   import { Button, LoadingState, Notice } from '$lib/ui';
   import * as Dialog from '$lib/ui/dialog';
-  import { buildTelegramStartCommand, isFullSession, LOGIN_PROVIDER_OPTIONS, TELEGRAM_LOGIN_POLL_INTERVAL_MS, telegramExpiryLabel } from './telegram-login';
+  import {
+    buildTelegramStartCommand,
+    createSingleFlightPollLoop,
+    isFullSession,
+    LOGIN_PROVIDER_OPTIONS,
+    refreshTelegramSession,
+    TELEGRAM_LOGIN_POLL_INTERVAL_MS,
+    telegramExpiryLabel
+  } from './telegram-login';
 
   let { open = $bindable(false), session = null }: { open?: boolean; session: CurrentSessionRead | null } = $props();
 
@@ -15,19 +24,64 @@
   let errorMessage = $state<string | null>(null);
   let copyMessage = $state<string | null>(null);
   let completed = $state(false);
-  let pollTimer: ReturnType<typeof setInterval> | null = null;
+  let linkStartController: AbortController | null = null;
+  let lifecycleGeneration = 0;
 
   const command = $derived(link ? buildTelegramStartCommand(link) : '');
+  const sessionPoller = createSingleFlightPollLoop<CurrentSessionRead | null>({
+    intervalMs: TELEGRAM_LOGIN_POLL_INTERVAL_MS,
+    request: async (signal) => {
+      const response = await fetch('/api/v1/auth/session', {
+        credentials: 'include',
+        headers: { accept: 'application/json' },
+        signal
+      });
+      if (!response.ok) return null;
+      return (await response.json()) as CurrentSessionRead;
+    },
+    onResult: async (nextSession) => {
+      if (!isFullSession(nextSession)) return true;
 
-  $effect(() => {
-    if (!open) {
-      stopPolling();
-      return;
+      const completionGeneration = lifecycleGeneration;
+      const refreshResult = await refreshTelegramSession(invalidateAll);
+      if (completionGeneration !== lifecycleGeneration || !open) return false;
+      if (!refreshResult.completed) {
+        errorMessage = refreshResult.errorMessage;
+        return refreshResult.shouldContinuePolling;
+      }
+
+      errorMessage = null;
+      completed = true;
+      polling = false;
+      open = false;
+      return refreshResult.shouldContinuePolling;
     }
-    if (link && !polling && !completed) startPolling();
   });
 
+  $effect(() => {
+    if (!browser) return;
+    if (!open) {
+      cancelActiveRequests();
+      return;
+    }
+    if (link && !completed) {
+      startPolling();
+      return;
+    }
+    stopPolling();
+  });
+
+  onDestroy(cancelActiveRequests);
+
   async function startTelegram() {
+    if (!browser) return;
+
+    const requestGeneration = ++lifecycleGeneration;
+    linkStartController?.abort();
+    sessionPoller.stop();
+    polling = false;
+    const controller = new AbortController();
+    linkStartController = controller;
     starting = true;
     errorMessage = null;
     copyMessage = null;
@@ -35,16 +89,19 @@
       const response = await fetch('/api/v1/auth/link/telegram', {
         method: 'POST',
         credentials: 'include',
-        headers: { accept: 'application/json', 'x-requested-with': 'XMLHttpRequest' }
+        headers: { accept: 'application/json', 'x-requested-with': 'XMLHttpRequest' },
+        signal: controller.signal
       });
       const payload = await response.json().catch(() => null);
+      if (requestGeneration !== lifecycleGeneration || controller.signal.aborted || !open) return;
       if (!response.ok) throw new Error(typeof payload?.detail === 'string' ? payload.detail : 'Could not start Telegram login.');
       link = payload as TelegramLinkStartRead;
-      startPolling();
     } catch (error) {
+      if (requestGeneration !== lifecycleGeneration || controller.signal.aborted) return;
       errorMessage = error instanceof Error ? error.message : 'Could not start Telegram login.';
     } finally {
-      starting = false;
+      if (linkStartController === controller) linkStartController = null;
+      if (requestGeneration === lifecycleGeneration) starting = false;
     }
   }
 
@@ -59,32 +116,21 @@
   }
 
   function startPolling() {
-    stopPolling();
     polling = true;
-    void pollSession();
-    pollTimer = setInterval(() => void pollSession(), TELEGRAM_LOGIN_POLL_INTERVAL_MS);
+    sessionPoller.start();
   }
 
   function stopPolling() {
-    if (pollTimer) clearInterval(pollTimer);
-    pollTimer = null;
+    sessionPoller.stop();
     polling = false;
   }
 
-  async function pollSession() {
-    try {
-      const response = await fetch('/api/v1/auth/session', { credentials: 'include', headers: { accept: 'application/json' } });
-      if (!response.ok) return;
-      const nextSession = (await response.json()) as CurrentSessionRead;
-      if (isFullSession(nextSession)) {
-        completed = true;
-        stopPolling();
-        await invalidateAll();
-        open = false;
-      }
-    } catch {
-      // Keep polling; transient network failures should not make users restart the login flow.
-    }
+  function cancelActiveRequests() {
+    lifecycleGeneration += 1;
+    linkStartController?.abort();
+    linkStartController = null;
+    starting = false;
+    stopPolling();
   }
 </script>
 

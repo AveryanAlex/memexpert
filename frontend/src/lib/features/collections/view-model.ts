@@ -30,14 +30,14 @@ export function collectionMemberRows(detail: WebCollectionDetailRead): Collectio
   }));
 }
 
-export function collectionInviteRows(invites: CollectionInviteRead[]): CollectionInviteView[] {
+export function collectionInviteRows(invites: CollectionInviteRead[], now = new Date()): CollectionInviteView[] {
   return invites.map((invite) => ({
     id: invite.id,
     label: invite.label?.trim() || 'Direct invite link',
     role: invite.role,
     status: invite.status,
-    statusLabel: inviteStatusLabel(invite),
-    isTerminal: invite.status !== 'pending' || isExpired(invite),
+    statusLabel: inviteStatusLabel(invite, now),
+    isTerminal: invite.status !== 'pending' || isExpired(invite, now),
     usage: invite.max_uses === null ? `${invite.use_count} used` : `${invite.use_count}/${invite.max_uses} used`,
     expires: invite.expires_at ? formatDate(invite.expires_at) : 'No expiry',
     created: formatDate(invite.created_at)
@@ -86,17 +86,17 @@ function shortId(value: string): string {
 }
 
 function formatDate(value: string): string {
-  return new Intl.DateTimeFormat('en', { dateStyle: 'medium' }).format(new Date(value));
+  return `${new Intl.DateTimeFormat('en', { dateStyle: 'medium', timeZone: 'UTC' }).format(new Date(value))} UTC`;
 }
 
-function inviteStatusLabel(invite: CollectionInviteRead): string {
-  if (invite.status === 'pending' && isExpired(invite)) {
+function inviteStatusLabel(invite: CollectionInviteRead, now: Date): string {
+  if (invite.status === 'pending' && isExpired(invite, now)) {
     return 'expired';
   }
 
   return invite.status;
 }
 
-function isExpired(invite: CollectionInviteRead): boolean {
-  return invite.expires_at !== null && new Date(invite.expires_at).getTime() <= Date.now();
+function isExpired(invite: CollectionInviteRead, now: Date): boolean {
+  return invite.expires_at !== null && new Date(invite.expires_at).getTime() <= now.getTime();
 }

@@ -38,7 +38,7 @@ describe('/collection/[id] page', () => {
 
     const { body } = render(CollectionPage, {
       props: {
-        data: { session: null, sessionError: null, detail, errorMessage: null },
+        data: { session: null, sessionError: null, detail, errorMessage: null, loadedAt: '2026-01-03T00:00:00Z' },
         form: { successMessage: 'Invite link created.', inviteUrl: 'https://memexpert.test/collection/invite/token' }
       }
     });
@@ -53,6 +53,9 @@ describe('/collection/[id] page', () => {
     expect(body).toContain('Danger zone');
     expect(body).toContain('Launch reaction');
     expect(body).toContain('Remove');
+    expect(body).toContain('Updated Jan 3, 2026 UTC');
+    expect(body).toContain('Joined Jan 1, 2026 UTC');
+    expect(body).toContain('Expires Jan 8, 2099 UTC · Created Jan 1, 2026 UTC');
   });
 
   it('renders view-only empty state without owner controls', () => {
@@ -73,7 +76,7 @@ describe('/collection/[id] page', () => {
     });
 
     const { body } = render(CollectionPage, {
-      props: { data: { session: null, sessionError: null, detail, errorMessage: null } }
+      props: { data: { session: null, sessionError: null, detail, errorMessage: null, loadedAt: '2026-01-03T00:00:00Z' } }
     });
 
     expect(body).toContain('No saved memes yet');
@@ -106,7 +109,7 @@ describe('/collection/[id] page', () => {
     });
 
     const { body } = render(CollectionPage, {
-      props: { data: { session: null, sessionError: null, detail, errorMessage: null } }
+      props: { data: { session: null, sessionError: null, detail, errorMessage: null, loadedAt: '2026-01-03T00:00:00Z' } }
     });
 
     expect(body).toContain('Create invite');
@@ -119,12 +122,38 @@ describe('/collection/[id] page', () => {
   it('renders unavailable state gracefully', () => {
     const { body } = render(CollectionPage, {
       props: {
-        data: { session: null, sessionError: null, detail: null, errorMessage: 'Collection was not found.' }
+        data: { session: null, sessionError: null, detail: null, errorMessage: 'Collection was not found.', loadedAt: '2026-01-03T00:00:00Z' }
       }
     });
 
     expect(body).toContain('Collection unavailable');
     expect(body).toContain('Collection was not found.');
+  });
+
+  it('uses the server loadedAt boundary for deterministic invite expiry rendering', () => {
+    const detail = collectionDetail({
+      collection: {
+        ...baseCollection(),
+        invites: [pendingInvite({ expires_at: '2026-01-08T00:00:00.000Z' })]
+      }
+    });
+
+    const beforeExpiry = render(CollectionPage, {
+      props: {
+        data: { session: null, sessionError: null, detail, errorMessage: null, loadedAt: '2026-01-07T23:59:59.999Z' }
+      }
+    }).body;
+    const atExpiry = render(CollectionPage, {
+      props: {
+        data: { session: null, sessionError: null, detail, errorMessage: null, loadedAt: '2026-01-08T00:00:00.000Z' }
+      }
+    }).body;
+
+    expect(beforeExpiry).toContain('action="?/revokeInvite"');
+    expect(beforeExpiry).not.toContain('No further action');
+    expect(atExpiry).not.toContain('action="?/revokeInvite"');
+    expect(atExpiry).toContain('No further action');
+    expect(atExpiry).toContain('Expires Jan 8, 2026 UTC');
   });
 });
 
@@ -182,7 +211,9 @@ function editorMember(): WebCollectionDetailRead['collection']['memberships'][nu
   };
 }
 
-function pendingInvite(): WebCollectionDetailRead['collection']['invites'][number] {
+function pendingInvite(
+  overrides: Partial<WebCollectionDetailRead['collection']['invites'][number]> = {}
+): WebCollectionDetailRead['collection']['invites'][number] {
   return {
     id: '55555555-5555-4555-8555-555555555555',
     collection_id: '11111111-1111-4111-8111-111111111111',
@@ -198,7 +229,8 @@ function pendingInvite(): WebCollectionDetailRead['collection']['invites'][numbe
     revoked_at: null,
     recipient_email: null,
     created_at: '2026-01-01T00:00:00Z',
-    updated_at: '2026-01-01T00:00:00Z'
+    updated_at: '2026-01-01T00:00:00Z',
+    ...overrides
   };
 }
 

@@ -20,6 +20,6 @@ async function proxyAuthEndpoint({ fetch, request, apiBaseUrl, path, method }: A
   if (cookie) headers.set('cookie', cookie);
   if (method !== 'GET') headers.set('x-requested-with', 'XMLHttpRequest');
 
-  const upstream = await fetch(new URL(path, apiBaseUrl), { method, headers });
+  const upstream = await fetch(new URL(path, apiBaseUrl), { method, headers, signal: request.signal });
   return passthroughUpstreamResponse(upstream);
 }

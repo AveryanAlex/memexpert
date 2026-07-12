@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount, untrack } from 'svelte';
   import {
     collectionAccessSummary,
     collectionInviteRows,
@@ -12,6 +13,11 @@
   let { data, form }: { data: PageData; form?: ActionData } = $props();
 
   let copyMessage = $state<string | null>(null);
+  const initialLoadedAt = untrack(() => data.loadedAt);
+  let inviteClockSource = initialLoadedAt;
+  let inviteNow = $state(new Date(initialLoadedAt));
+
+  const inviteClockIntervalMs = 30_000;
 
   const detail = $derived(data.detail);
   const collection = $derived(detail?.collection ?? null);
@@ -19,13 +25,27 @@
   const isActive = $derived(Boolean(detail && detail.active_save_collection_id === detail.collection.id));
   const memberCount = $derived(collection?.memberships.length ?? 0);
   const memberRows = $derived(detail ? collectionMemberRows(detail) : []);
-  const inviteRows = $derived(collection ? collectionInviteRows(collection.invites) : []);
+  const inviteRows = $derived(collection ? collectionInviteRows(collection.invites, inviteNow) : []);
   const managementNotice = $derived(detail ? collectionManagementNotice(detail, data.session ?? null) : '');
   const accessSummary = $derived(detail ? collectionAccessSummary(detail) : '');
   const savedMemes = $derived(detail?.saved_memes.map((item) => item.meme) ?? []);
 
+  $effect(() => {
+    if (data.loadedAt === inviteClockSource) return;
+    inviteClockSource = data.loadedAt;
+    inviteNow = new Date(data.loadedAt);
+  });
+
+  onMount(() => {
+    const timer = setInterval(() => {
+      inviteNow = new Date(Math.max(Date.now(), inviteNow.getTime()));
+    }, inviteClockIntervalMs);
+
+    return () => clearInterval(timer);
+  });
+
   function formatDate(value: string): string {
-    return new Intl.DateTimeFormat('en', { dateStyle: 'medium' }).format(new Date(value));
+    return `${new Intl.DateTimeFormat('en', { dateStyle: 'medium', timeZone: 'UTC' }).format(new Date(value))} UTC`;
   }
 
   async function copyInviteUrl(value: string) {
