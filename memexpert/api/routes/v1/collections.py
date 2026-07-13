@@ -10,17 +10,24 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Path, status
+from fastapi import APIRouter, Body, HTTPException, Path, status
 from pydantic import BaseModel, Field
 
 from memexpert.api.dependencies import (
+    AnalyticsServiceDep,
     AutoGuestUserDep,
     CollectionServiceDep,
     FullAccountUserDep,
     MemeSearchServiceDep,
 )
 from memexpert.api.routes._collection_errors import collection_service_http_error
+from memexpert.api.routes._meme_interactions import (
+    MemeActionAttributionRequest,
+    payload_attribution,
+    record_meme_interaction,
+)
 from memexpert.models.enums import (
+    AnalyticsEventType,
     CollectionInviteChannel,
     CollectionKind,
     CollectionMembershipRole,
@@ -253,14 +260,16 @@ async def set_active_save_collection(
 @router.post("/{collection_id}/memes/{meme_id}", response_model=dict[str, bool], summary="Save meme to collection")
 async def save_meme_to_collection(
     collection_service: CollectionServiceDep,
+    analytics_service: AnalyticsServiceDep,
     current_user: AutoGuestUserDep,
     collection_id: Annotated[uuid.UUID, Path()],
     meme_id: Annotated[uuid.UUID, Path()],
+    payload: Annotated[MemeActionAttributionRequest | None, Body()] = None,
 ) -> dict[str, bool]:
     """Save a visible meme into a specific writable collection."""
 
     try:
-        _ = await collection_service.save_meme_to_collection(
+        saved_meme = await collection_service.save_meme_to_collection(
             collection_id=collection_id,
             user_id=current_user.id,
             meme_id=meme_id,
@@ -269,6 +278,16 @@ async def save_meme_to_collection(
         raise _meme_not_found_http_error() from exc
     except CollectionServiceError as exc:
         raise _collection_http_error(exc) from exc
+    await record_meme_interaction(
+        analytics_service,
+        AnalyticsEventType.MEME_SAVE,
+        meme_id=meme_id,
+        current_user=current_user,
+        attribution=payload_attribution(payload),
+        default_surface="public_api_collection_action",
+        collection_id=saved_meme.collection_id,
+        properties={"action": "save"},
+    )
     return {"saved": True}
 
 

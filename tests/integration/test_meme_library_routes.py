@@ -11,7 +11,7 @@ from sqlalchemy import func, select
 from memexpert.api.dependencies.auth import get_optional_current_user
 from memexpert.api.dependencies.collection import get_collection_service
 from memexpert.api.dependencies.meme import get_analytics_service, get_meme_report_service, get_meme_search_service
-from memexpert.api.routes.v1 import memes as meme_routes
+from memexpert.api.routes import _meme_interactions as meme_interaction_routes
 from memexpert.models.collection import CollectionMeme, PinnedMeme
 from memexpert.models.content import Meme, MemeFile
 from memexpert.models.enums import AnalyticsEventType, ContentKind, ContentLanguage, ContentProcessingStatus
@@ -388,7 +388,7 @@ async def test_action_succeeds_when_analytics_writer_fails(
     def capture_exception(_message: str, *, extra: dict[str, object]) -> None:
         log_calls.append(extra)
 
-    monkeypatch.setattr(meme_routes.logger, "exception", capture_exception)
+    monkeypatch.setattr(meme_interaction_routes.logger, "exception", capture_exception)
     app.dependency_overrides[get_collection_service] = override_collection_service
     app.dependency_overrides[get_analytics_service] = override_analytics_service
     app.dependency_overrides[get_optional_current_user] = override_current_user

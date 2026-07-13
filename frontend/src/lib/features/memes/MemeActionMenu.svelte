@@ -180,7 +180,8 @@
         fetch,
         baseUrl: window.location.origin,
         collectionId: collection.collection.id,
-        memeId: meme.id
+        memeId: meme.id,
+        body: actionBody
       });
       saved = true;
       statusMessage = `Saved to ${collection.collection.title}.`;

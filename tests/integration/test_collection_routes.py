@@ -14,8 +14,8 @@ from memexpert.api.routes.v1 import media as media_routes
 from memexpert.core.database import get_db_session
 from memexpert.models.collection import CollectionMeme, PinnedMeme
 from memexpert.models.content import Meme, MemeFile
-from memexpert.models.enums import ContentKind, ContentLanguage
-from memexpert.models.user import User
+from memexpert.models.enums import AnalyticsEventType, ContentKind, ContentLanguage
+from memexpert.models.user import AnalyticsEvent, User
 from memexpert.schemas.user import UserRead
 from memexpert.services import CollectionService, MemeSearchService, UserService
 from memexpert.services.analytics import AnalyticsService
@@ -91,11 +91,15 @@ async def test_collection_routes_crud_detail_remove_active_and_invites(
     def override_meme_search_service() -> MemeSearchService:
         return MemeSearchService(migrated_db_session)
 
+    def override_analytics_service() -> AnalyticsService:
+        return AnalyticsService(migrated_db_session)
+
     async def override_current_user() -> UserRead | None:
         return current_user
 
     app.dependency_overrides[get_collection_service] = override_collection_service
     app.dependency_overrides[get_meme_search_service] = override_meme_search_service
+    app.dependency_overrides[get_analytics_service] = override_analytics_service
     app.dependency_overrides[get_optional_current_user] = override_current_user
     try:
         create_response = await client.post(
@@ -109,7 +113,19 @@ async def test_collection_routes_crud_detail_remove_active_and_invites(
             json={"title": "Launch Saves", "description": "Renamed", "visibility": "unlisted"},
         )
         active_response = await client.put(f"/api/v1/collections/{collection_id}/active-save")
-        save_response = await client.post(f"/api/v1/collections/{collection_id}/memes/{meme.id}")
+        save_response = await client.post(
+            f"/api/v1/collections/{collection_id}/memes/{meme.id}",
+            json={
+                "attribution": {
+                    "request_id": "req_collection_save",
+                    "impression_id": "imp_collection_save",
+                    "surface": "collection_chooser",
+                    "source_algorithm": "hybrid_search",
+                    "rank": 2,
+                    "collection_scope": "public",
+                }
+            },
+        )
         detail_response = await client.get(f"/api/v1/collections/{collection_id}")
         invite_response = await client.post(
             f"/api/v1/collections/{collection_id}/invites",
@@ -131,12 +147,29 @@ async def test_collection_routes_crud_detail_remove_active_and_invites(
     finally:
         app.dependency_overrides.clear()
 
+    save_event = await migrated_db_session.scalar(
+        select(AnalyticsEvent).where(AnalyticsEvent.event_type == AnalyticsEventType.MEME_SAVE)
+    )
+    save_event_refs = cast("dict[str, object]", save_event.payload["refs"]) if save_event else {}
+    save_event_properties = cast("dict[str, object]", save_event.payload["properties"]) if save_event else {}
+
     assert create_response.status_code == 201
     assert update_response.status_code == 200
     assert update_response.json()["collection"]["title"] == "Launch Saves"
     assert active_response.status_code == 200
     assert active_response.json()["active_save_collection_id"] == collection_id
     assert save_response.status_code == 200
+    assert save_event is not None
+    assert save_event.user_id == owner.id
+    assert save_event.payload["surface"] == "collection_chooser"
+    assert save_event.payload["request_id"] == "req_collection_save"
+    assert save_event.payload["impression_id"] == "imp_collection_save"
+    assert save_event.payload["source_algorithm"] == "hybrid_search"
+    assert save_event.payload["rank"] == 2
+    assert save_event_refs["collection_id"] == collection_id
+    assert save_event_refs["meme_id"] == str(meme.id)
+    assert save_event_properties["action"] == "save"
+    assert save_event_properties["collection_scope"] == "public"
     assert detail_response.status_code == 200
     assert [item["meme"]["id"] for item in detail_response.json()["saved_memes"]] == [str(meme.id)]
     assert detail_response.json()["saved_memes"][0]["meme"]["viewer_has_saved"] is True

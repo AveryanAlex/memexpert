@@ -35,12 +35,13 @@ export class MemeDetailPage {
 
   async favoriteAndUnfavorite() {
     const primaryActions = this.primaryActions();
-    await primaryActions.getByRole('button', { name: /^Favorite \(/ }).click();
-    await expect(primaryActions.getByRole('button', { name: /^Favorited \(/ })).toBeVisible();
+    const favoriteButton = primaryActions.getByRole('button', { name: /^Favorite \(/ });
+    await favoriteButton.click();
+    await expect(favoriteButton).toHaveAttribute('aria-pressed', 'true');
     await expect(this.page.getByRole('status')).toHaveText('Added to favorites.');
 
-    await primaryActions.getByRole('button', { name: /^Favorited \(/ }).click();
-    await expect(primaryActions.getByRole('button', { name: /^Favorite \(/ })).toBeVisible();
+    await favoriteButton.click();
+    await expect(favoriteButton).toHaveAttribute('aria-pressed', 'false');
     await expect(this.page.getByRole('status')).toHaveText('Removed from favorites.');
   }
 
@@ -50,18 +51,20 @@ export class MemeDetailPage {
     await primaryActions.getByRole('button', { name: /^Favorite \(/ }).click();
     expectRequestAttribution(await requestPromise, attribution, 'favorite action');
 
-    await expect(primaryActions.getByRole('button', { name: /^Favorited \(/ })).toBeVisible();
+    await expect(primaryActions.getByRole('button', { name: /^Favorite \(/ })).toHaveAttribute('aria-pressed', 'true');
     await expect(this.page.getByRole('status')).toHaveText('Added to favorites.');
   }
 
   async saveAndExpectAttribution(meme: SeededMeme, attribution: ExpectedMemeAttribution) {
-    const requestPromise = this.waitForActionPost(meme.meme_id, 'save');
+    const requestPromise = this.waitForCollectionSavePost(meme.meme_id);
     const primaryActions = this.primaryActions();
-    await primaryActions.getByRole('button', { name: 'Save', exact: true }).click();
+    const saveButton = primaryActions.getByRole('button', { name: 'Save to collection', exact: true });
+    await saveButton.click();
+    await this.page.getByRole('menuitem', { name: 'Favorites', exact: true }).click();
     expectRequestAttribution(await requestPromise, attribution, 'save action');
 
-    await expect(primaryActions.getByRole('button', { name: 'Saved', exact: true })).toBeVisible();
-    await expect(this.page.getByRole('status')).toHaveText('Saved to your active collection.');
+    await expect(saveButton).toHaveAttribute('aria-pressed', 'true');
+    await expect(this.page.getByRole('status')).toHaveText('Saved to Favorites.');
   }
 
   async downloadAndExpectAttribution(meme: SeededMeme, attribution: ExpectedMemeAttribution) {
@@ -96,10 +99,17 @@ export class MemeDetailPage {
     await this.page.keyboard.press('Escape');
   }
 
-  private waitForActionPost(memeId: string, action: 'download' | 'favorite' | 'save' | 'share') {
+  private waitForActionPost(memeId: string, action: 'download' | 'favorite' | 'share') {
     return this.page.waitForRequest((request) => {
       const url = new URL(request.url());
       return request.method() === 'POST' && url.pathname === `/api/v1/memes/${memeId}/${action}`;
+    });
+  }
+
+  private waitForCollectionSavePost(memeId: string) {
+    return this.page.waitForRequest((request) => {
+      const url = new URL(request.url());
+      return request.method() === 'POST' && new RegExp(`^/api/v1/collections/[^/]+/memes/${memeId}$`).test(url.pathname);
     });
   }
 

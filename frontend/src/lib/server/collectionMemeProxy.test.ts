@@ -16,6 +16,8 @@ describe('collection meme proxy', () => {
       expect(headers.get('accept')).toBe('application/json');
       expect(headers.get('cookie')).toBe('memexpert_access_token=old-token; other=1');
       expect(headers.get('x-requested-with')).toBe('XMLHttpRequest');
+      expect(headers.get('content-type')).toBe('application/json');
+      expect(JSON.parse(String(init?.body))).toEqual({ attribution: { request_id: 'req-card' } });
 
       return new Response(JSON.stringify({ saved: true }), { status: 201, headers: upstreamHeaders });
     }) satisfies ProxyFetch;
@@ -26,8 +28,10 @@ describe('collection meme proxy', () => {
         method: 'POST',
         headers: {
           cookie: 'memexpert_access_token=old-token; other=1',
+          'content-type': 'application/json',
           'x-requested-with': 'XMLHttpRequest'
-        }
+        },
+        body: JSON.stringify({ attribution: { request_id: 'req-card' } })
       }),
       apiBaseUrl: 'https://api.memexpert.test',
       collectionId: 'collection/123',

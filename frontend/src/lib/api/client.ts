@@ -387,7 +387,9 @@ export async function setActiveSaveCollection(request: CatalogRequest & { collec
   );
 }
 
-export async function saveMemeToCollection(request: CatalogRequest & { collectionId: string; memeId: string }): Promise<SaveCollectionMemeResponse> {
+export async function saveMemeToCollection(
+  request: CatalogRequest & { collectionId: string; memeId: string; body?: unknown }
+): Promise<SaveCollectionMemeResponse> {
   return apiWrite<SaveCollectionMemeResponse>(
     `/api/v1/collections/${encodeURIComponent(request.collectionId)}/memes/${encodeURIComponent(request.memeId)}`,
     'POST',
