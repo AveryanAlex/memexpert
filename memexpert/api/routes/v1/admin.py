@@ -1,4 +1,4 @@
-# ruff: noqa: TC001,TC003
+# ruff: noqa: TC001,TC002,TC003
 """Cookie-authenticated browser-admin routes."""
 
 from __future__ import annotations
@@ -7,6 +7,7 @@ import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Path, Query, status
+from pydantic import AwareDatetime
 
 from memexpert.api.dependencies import AdminUserDep, DbSessionDep
 from memexpert.models.enums import ChannelSuggestionStatus, ModerationReportStatus, SourcePlatform
@@ -40,9 +41,11 @@ from memexpert.schemas.admin import (
     AdminOverviewRead,
     AdminSessionRead,
     AdminSourceChannelAssignRequest,
+    AdminSourceChannelBackfillRequest,
     AdminSourceChannelCreateRequest,
     AdminSourceChannelMarkDeadRequest,
     AdminSourceChannelOrphanRequest,
+    AdminSourceChannelPostPageRead,
     AdminSourceChannelRead,
     AdminSourceChannelUpdateRequest,
     AdminTelegramChannelFromReferenceRequest,
@@ -334,6 +337,52 @@ async def list_source_channels(
         return await admin_service.list_source_channels(
             telegram_session_id=telegram_session_id,
             orphaned=orphaned,
+        )
+    except (AdminNotFoundError, AdminConflictError) as exc:
+        raise _map_admin_error(exc) from exc
+
+
+@router.get(
+    "/source-channels/{channel_id}/posts",
+    response_model=AdminSourceChannelPostPageRead,
+    summary="List observed source messages with indexing state",
+)
+async def list_source_channel_posts(
+    _admin: AdminUserDep,
+    admin_service: AdminServiceDep,
+    channel_id: Annotated[uuid.UUID, Path()],
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    snapshot_at: Annotated[AwareDatetime | None, Query()] = None,
+) -> AdminSourceChannelPostPageRead:
+    try:
+        return await admin_service.list_source_channel_posts(
+            channel_id,
+            limit=limit,
+            offset=offset,
+            snapshot_at=snapshot_at,
+        )
+    except (AdminNotFoundError, AdminConflictError) as exc:
+        raise _map_admin_error(exc) from exc
+
+
+@router.post(
+    "/source-channels/{channel_id}/backfill",
+    response_model=AdminSourceChannelRead,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Queue older Telegram history for a source",
+)
+async def queue_source_channel_backfill(
+    admin_user: AdminUserDep,
+    admin_service: AdminServiceDep,
+    channel_id: Annotated[uuid.UUID, Path()],
+    request: Annotated[AdminSourceChannelBackfillRequest, Body()],
+) -> AdminSourceChannelRead:
+    try:
+        return await admin_service.queue_source_channel_backfill(
+            channel_id,
+            request,
+            admin_user_id=admin_user.id,
         )
     except (AdminNotFoundError, AdminConflictError) as exc:
         raise _map_admin_error(exc) from exc

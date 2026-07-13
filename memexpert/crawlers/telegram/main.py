@@ -69,6 +69,8 @@ class TelegramCrawlerManagerLike(Protocol):
 
     async def retry_incomplete(self) -> TelegramCrawlerReloadResult: ...
 
+    async def process_backfill_jobs(self) -> int: ...
+
     async def shutdown(self) -> None: ...
 
 
@@ -343,6 +345,27 @@ async def _wait_for_control_signals(
             observed_snapshot = reconcile_outcome.applied_configuration_snapshot
             if reconcile_outcome.full_reload_performed:
                 await control_monitor.discard_pending_reload_requests()
+            try:
+                processed_job_count = cast(
+                    "int",
+                    await _await_operation_or_stop(manager.process_backfill_jobs(), control_monitor),
+                )
+            except _CrawlerStopRequested:
+                return
+            except Exception:  # noqa: BLE001 - durable jobs remain available for a later polling tick.
+                logger.exception(
+                    "telegram_crawler_backfill_poll_failed",
+                    extra={"event": "telegram_crawler_backfill_poll_failed"},
+                )
+            else:
+                if processed_job_count:
+                    logger.info(
+                        "telegram_crawler_backfill_jobs_processed",
+                        extra={
+                            "event": "telegram_crawler_backfill_jobs_processed",
+                            "processed_job_count": processed_job_count,
+                        },
+                    )
             continue
         if control_signal is TelegramCrawlerControlSignal.STOP:
             return

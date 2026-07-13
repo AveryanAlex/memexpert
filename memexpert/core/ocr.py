@@ -17,6 +17,8 @@ from memexpert.models.enums import ContentLanguage
 if TYPE_CHECKING:
     from memexpert.media.contracts import PipelineMediaProcessorProtocol
 
+PADDLE_OCR_CPU_THREADS = 1
+
 
 @dataclass(frozen=True, slots=True)
 class OCRExtractionResult:
@@ -187,6 +189,7 @@ class PipelineOCRProcessor:
                 use_doc_orientation_classify=False,
                 use_doc_unwarping=False,
                 use_textline_orientation=False,
+                cpu_threads=PADDLE_OCR_CPU_THREADS,
             )
             self._paddle_ocr = paddle_ocr
 

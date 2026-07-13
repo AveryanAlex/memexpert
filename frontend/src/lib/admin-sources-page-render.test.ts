@@ -36,6 +36,7 @@ describe('/admin/sources page', () => {
     expect(body).toContain('value="22222222-2222-4222-8222-222222222222" selected');
     expect(body).toContain('Advanced settings');
     expect(body).toContain('name="catchup_message_limit"');
+    expect(body).toContain('value="5000"');
     expect(body).toContain('Suggested sources');
     expect(body).toContain('https://t.me/telegram_source');
     expect(body).toContain('Add this source');
@@ -58,6 +59,8 @@ describe('/admin/sources page', () => {
     expect(body).toContain('Current account:');
     expect(body).toContain('Choose a ready account before saving.');
     expect(body).toContain('action="?/toggleSourceChannel"');
+    expect(body).toContain('View indexed messages');
+    expect(body).toContain('href="/admin/sources/11111111-1111-4111-8111-111111111111"');
 
     expect(body).toContain('Advanced manual source entry');
     expect(body).toContain('Diagnostics');
@@ -211,12 +214,19 @@ function sourceChannel(overrides: Partial<AdminSourceChannelRead> = {}): AdminSo
     catchup_enabled: true,
     live_enabled: true,
     engagement_enabled: true,
-    catchup_message_limit: 500,
+    catchup_message_limit: 5000,
     telegram_session_id: '22222222-2222-4222-8222-222222222222',
     telegram_session_name: 'Primary ingest',
     is_orphaned: false,
     is_indexable: true,
     last_read_post_id: '99',
+    oldest_observed_post_id: '12',
+    initial_catchup_completed: true,
+    history_exhausted: false,
+    backfill_status: 'idle',
+    backfill_requested_count: 0,
+    backfill_scanned_count: 0,
+    backfill_error: null,
     last_fetched_at: '2026-01-01T00:00:00Z',
     operational_status: 'active',
     freshness_status: 'fresh',

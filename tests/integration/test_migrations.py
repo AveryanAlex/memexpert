@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -137,3 +138,133 @@ async def test_alembic_upgrade_downgrade_and_reupgrade_smoke(
 
     assert await _get_current_revision(engine) == head_revision
     assert ({"alembic_version"} | CORE_APP_TABLES).issubset(await _get_table_names(engine))
+
+
+async def test_0029_backfills_existing_telegram_requests_into_source_post_inventory(
+    empty_public_schema: tuple[AsyncEngine, str],
+) -> None:
+    engine, database_url = empty_public_schema
+    config = _build_alembic_config(database_url)
+    channel_id = uuid.uuid7()
+    request_id = uuid.uuid7()
+    fallback_channel_id = uuid.uuid7()
+    fallback_request_id = uuid.uuid7()
+
+    await _run_alembic_command(command.upgrade, config, "0028")
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                """
+                INSERT INTO source_channels (
+                    id, platform, platform_id, title, is_active, last_read_post_id
+                ) VALUES (
+                    :channel_id, 'telegram', 'legacy_channel', 'Legacy channel', true, '511'
+                )
+                """
+            ),
+            {"channel_id": channel_id},
+        )
+        await connection.execute(
+            text(
+                """
+                INSERT INTO pipeline_ingest_requests (
+                    id,
+                    source_platform,
+                    source_id,
+                    post_id,
+                    source_metadata,
+                    status
+                ) VALUES (
+                    :request_id,
+                    'telegram',
+                    'legacy_channel',
+                    '42',
+                    '{"media_type": "photo"}'::jsonb,
+                    'media_inspect_pending'
+                )
+                """
+            ),
+            {"request_id": request_id},
+        )
+        await connection.execute(
+            text(
+                """
+                INSERT INTO source_channels (
+                    id, platform, platform_id, title, is_active, last_read_post_id
+                ) VALUES (
+                    :channel_id, 'telegram', 'fallback_channel', 'Fallback channel', true, 'opaque'
+                )
+                """
+            ),
+            {"channel_id": fallback_channel_id},
+        )
+        await connection.execute(
+            text(
+                """
+                INSERT INTO pipeline_ingest_requests (
+                    id,
+                    source_platform,
+                    source_id,
+                    post_id,
+                    source_metadata,
+                    status
+                ) VALUES (
+                    :request_id,
+                    'telegram',
+                    'fallback_channel',
+                    '84',
+                    '{"media_type": "photo"}'::jsonb,
+                    'media_inspect_pending'
+                )
+                """
+            ),
+            {"request_id": fallback_request_id},
+        )
+
+    await _run_alembic_command(command.upgrade, config, "head")
+
+    async with engine.connect() as connection:
+        inventory_row = (
+            await connection.execute(
+                text(
+                    """
+                    SELECT id, post_id, media_type, status
+                    FROM source_channel_posts
+                    WHERE source_channel_id = :channel_id
+                    """
+                ),
+                {"channel_id": channel_id},
+            )
+        ).one()
+        channel_row = (
+            await connection.execute(
+                text(
+                    """
+                    SELECT oldest_observed_post_id,
+                           history_cursor_post_id,
+                           initial_catchup_completed,
+                           history_exhausted,
+                           catchup_message_limit
+                    FROM source_channels
+                    WHERE id = :channel_id
+                    """
+                ),
+                {"channel_id": channel_id},
+            )
+        ).one()
+        fallback_channel_row = (
+            await connection.execute(
+                text(
+                    """
+                    SELECT oldest_observed_post_id, history_cursor_post_id, initial_catchup_completed
+                    FROM source_channels
+                    WHERE id = :channel_id
+                    """
+                ),
+                {"channel_id": fallback_channel_id},
+            )
+        ).one()
+
+    assert inventory_row == (request_id, "42", "photo", "accepted")
+    assert channel_row == ("42", "512", True, False, 5000)
+    assert fallback_channel_row == ("84", "84", True)

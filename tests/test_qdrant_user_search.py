@@ -14,6 +14,7 @@ from memexpert.api.dependencies.meme import get_meme_search_service
 from memexpert.core.meilisearch import PipelineMeilisearchSyncClient
 from memexpert.core.qdrant import (
     PipelineQdrantClient,
+    PipelineQdrantSyncClient,
     PipelineQdrantUserSearchClient,
     QdrantSimilarityMatch,
     QdrantSyncPayload,
@@ -44,6 +45,28 @@ class FakeQdrantClient:
     async def query_points(self, **kwargs: Any) -> object:
         self.calls.append(kwargs)
         return self.response
+
+
+class FakeQdrantNotFoundError(Exception):
+    status_code = 404
+
+
+class FakeBootstrapQdrantClient:
+    def __init__(self) -> None:
+        self.created = False
+        self.create_calls: list[dict[str, Any]] = []
+        self.upsert_calls: list[dict[str, Any]] = []
+
+    async def upsert(self, **kwargs: Any) -> bool:
+        self.upsert_calls.append(kwargs)
+        if not self.created:
+            raise FakeQdrantNotFoundError("collection missing")
+        return True
+
+    async def create_collection(self, **kwargs: Any) -> bool:
+        self.create_calls.append(kwargs)
+        self.created = True
+        return True
 
 
 @pytest.mark.asyncio
@@ -166,6 +189,63 @@ async def test_similarity_client_uses_query_points_and_filters_self_matches() ->
             "with_vectors": False,
         },
     ]
+
+
+@pytest.mark.asyncio
+async def test_similarity_client_treats_missing_first_collection_as_no_matches() -> None:
+    class MissingCollectionClient:
+        async def query_points(self, **kwargs: Any) -> object:
+            _ = kwargs
+            raise FakeQdrantNotFoundError("collection missing")
+
+    settings = SimpleNamespace(
+        pipeline_qdrant_collection_name="memes-test",
+        pipeline_qdrant_search_top_k=7,
+        pipeline_qdrant_timeout_seconds=1,
+        qdrant_url="http://qdrant.test",
+    )
+    adapter = PipelineQdrantClient(settings=cast("Settings", settings))
+    adapter._client = MissingCollectionClient()
+
+    assert await adapter.find_similar_memes(vector=(0.3, 0.4), current_meme_file_id=uuid.uuid4()) == ()
+
+
+@pytest.mark.asyncio
+async def test_sync_client_creates_missing_collection_then_retries_first_upsert() -> None:
+    now = datetime.now(UTC)
+    settings = SimpleNamespace(
+        pipeline_qdrant_collection_name="memes-test",
+        pipeline_qdrant_timeout_seconds=1,
+        pipeline_voyage_output_dimensions=4,
+        qdrant_url="http://qdrant.test",
+    )
+    raw_client = FakeBootstrapQdrantClient()
+    adapter = PipelineQdrantSyncClient(settings=cast("Settings", settings))
+    adapter._client = raw_client
+    payload = QdrantSyncPayload(
+        meme_id=uuid.uuid4(),
+        meme_file_id=uuid.uuid4(),
+        search_index_algorithm_version="test-v1",
+        is_public=True,
+        author_user_id=None,
+        media_type="image",
+        language="en",
+        is_nsfw=False,
+        seo_page_slug=None,
+        template_id=None,
+        template_slug=None,
+        popularity_score=0.0,
+        like_count=0,
+        created_at=now,
+        updated_at=now,
+    )
+
+    await adapter.upsert_meme_point(payload, (0.1, 0.2, 0.3, 0.4))
+
+    assert len(raw_client.upsert_calls) == 2
+    assert raw_client.create_calls[0]["collection_name"] == "memes-test"
+    vectors_config = raw_client.create_calls[0]["vectors_config"]
+    assert vectors_config.size == 4
 
 
 def test_meme_search_dependency_wires_lazy_text_semantic_and_embedding_clients() -> None:

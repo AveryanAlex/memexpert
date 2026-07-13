@@ -25,12 +25,17 @@ from memexpert.models.content import (
     BlockedPerceptualHashAuditLog,
     Meme,
     MemeFile,
+    MemeFileSyncTargetSnapshot,
     MemeMergeLog,
     MemeSeoPage,
     MemeTemplate,
     ModerationDecision,
     ModerationReport,
+    PipelineIngestRequest,
+    PipelineStageJournal,
     SourceChannel,
+    SourceChannelBackfillJob,
+    SourceChannelPost,
     TelegramAdminAuditLog,
     TelegramSession,
     TelegramSessionLoginAttempt,
@@ -38,11 +43,19 @@ from memexpert.models.content import (
 from memexpert.models.enums import (
     ChannelSuggestionStatus,
     ContentKind,
+    ContentPipelineStage,
+    ContentPipelineStageStatus,
     ContentProcessingStatus,
     ModerationAction,
     ModerationReason,
     ModerationReportStatus,
+    PipelineIngestRequestStatus,
+    SourceAttachReason,
+    SourceChannelBackfillJobStatus,
+    SourceChannelPostStatus,
     SourcePlatform,
+    SyncTargetKind,
+    SyncTargetStatus,
     TelegramSessionStatus,
 )
 from memexpert.models.user import ChannelSuggestion, User
@@ -1826,6 +1839,303 @@ async def test_admin_create_source_channel_uses_telegram_session_id_and_rejects_
         assert persisted.telegram_session_id == telegram_session_id
 
 
+async def test_admin_source_message_inventory_and_manual_backfill(
+    auth_app: FastAPI,
+    auth_settings_overrides: dict[str, str],
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    admin_email = "admin-source-history@example.com"
+    admin_token = await _issue_user_cookie(
+        postgres_session_factory,
+        auth_settings_overrides,
+        email=admin_email,
+        is_admin=True,
+    )
+    now = datetime.now(UTC)
+    async with postgres_session_factory() as session:
+        admin_user = (await session.execute(select(User).where(User.email == admin_email))).scalar_one()
+        telegram_session = TelegramSession(
+            name="source-history-session",
+            display_name="Source history session",
+            encrypted_string_session="encrypted-source-history-session",
+            status=TelegramSessionStatus.ACTIVE,
+            enabled=True,
+            catchup_enabled=False,
+        )
+        session.add(telegram_session)
+        await session.flush()
+        channel = SourceChannel(
+            platform=SourcePlatform.TELEGRAM,
+            platform_id="source_history_channel",
+            username="source_history_channel",
+            title="Source history channel",
+            telegram_session_id=telegram_session.id,
+            oldest_observed_post_id="99",
+            history_cursor_post_id="100",
+            initial_catchup_completed=True,
+            last_read_post_id="103",
+        )
+        session.add(channel)
+        await session.flush()
+
+        meme, meme_file = _canonical_meme(media_type=ContentKind.IMAGE)
+        await _persist_canonical_meme(session, meme, meme_file)
+        stage_meme, stage_meme_file = _canonical_meme(media_type=ContentKind.IMAGE)
+        await _persist_canonical_meme(session, stage_meme, stage_meme_file)
+        session.add_all(
+            [
+                SourceChannelPost(
+                    source_channel_id=channel.id,
+                    post_id="99",
+                    published_at=now - timedelta(minutes=5),
+                    media_type="photo",
+                    status=SourceChannelPostStatus.ACCEPTED,
+                    attempt_count=1,
+                ),
+                SourceChannelPost(
+                    source_channel_id=channel.id,
+                    post_id="100",
+                    published_at=now - timedelta(minutes=4),
+                    media_type="unsupported",
+                    status=SourceChannelPostStatus.UNSUPPORTED,
+                    attempt_count=1,
+                ),
+                SourceChannelPost(
+                    source_channel_id=channel.id,
+                    post_id="101",
+                    published_at=now - timedelta(minutes=3),
+                    media_type="photo",
+                    status=SourceChannelPostStatus.ACCEPTED,
+                    attempt_count=1,
+                ),
+                SourceChannelPost(
+                    source_channel_id=channel.id,
+                    post_id="102",
+                    published_at=now - timedelta(minutes=2),
+                    media_type="photo",
+                    status=SourceChannelPostStatus.ACCEPTED,
+                    attempt_count=1,
+                ),
+                SourceChannelPost(
+                    source_channel_id=channel.id,
+                    post_id="103",
+                    published_at=now - timedelta(minutes=1),
+                    media_type="photo",
+                    status=SourceChannelPostStatus.FAILED,
+                    last_error_code="download_unavailable",
+                    last_error_text="provider disconnected",
+                    attempt_count=1,
+                ),
+                SourceChannelPost(
+                    source_channel_id=channel.id,
+                    post_id="104",
+                    published_at=now,
+                    media_type="photo",
+                    status=SourceChannelPostStatus.ACCEPTED,
+                    attempt_count=1,
+                ),
+                PipelineIngestRequest(
+                    source_platform=SourcePlatform.TELEGRAM,
+                    source_id=channel.platform_id,
+                    post_id="99",
+                    status=PipelineIngestRequestStatus.RESOLVED_SHA_DUPLICATE,
+                    source_attach_reason=SourceAttachReason.BLOCKED_SHA256_EXISTING_FILE,
+                ),
+                PipelineIngestRequest(
+                    source_platform=SourcePlatform.TELEGRAM,
+                    source_id=channel.platform_id,
+                    post_id="101",
+                    status=PipelineIngestRequestStatus.MEDIA_INSPECT_PENDING,
+                ),
+                PipelineIngestRequest(
+                    source_platform=SourcePlatform.TELEGRAM,
+                    source_id=channel.platform_id,
+                    post_id="102",
+                    status=PipelineIngestRequestStatus.MATERIALIZED,
+                    materialized_meme_id=meme.id,
+                    materialized_meme_file_id=meme_file.id,
+                ),
+                PipelineIngestRequest(
+                    source_platform=SourcePlatform.TELEGRAM,
+                    source_id=channel.platform_id,
+                    post_id="104",
+                    status=PipelineIngestRequestStatus.MATERIALIZED,
+                    materialized_meme_id=stage_meme.id,
+                    materialized_meme_file_id=stage_meme_file.id,
+                ),
+                MemeFileSyncTargetSnapshot(
+                    meme_file_id=meme_file.id,
+                    sync_target=SyncTargetKind.QDRANT,
+                    status=SyncTargetStatus.SYNCED,
+                ),
+                MemeFileSyncTargetSnapshot(
+                    meme_file_id=meme_file.id,
+                    sync_target=SyncTargetKind.MEILISEARCH,
+                    status=SyncTargetStatus.SYNCED,
+                ),
+                PipelineStageJournal(
+                    meme_file_id=stage_meme_file.id,
+                    stage=ContentPipelineStage.SYNC_QDRANT,
+                    status=ContentPipelineStageStatus.SUCCEEDED,
+                ),
+                PipelineStageJournal(
+                    meme_file_id=stage_meme_file.id,
+                    stage=ContentPipelineStage.SYNC_MEILI,
+                    status=ContentPipelineStageStatus.SUCCEEDED,
+                ),
+            ],
+        )
+        await session.commit()
+        channel_id = channel.id
+        admin_user_id = admin_user.id
+
+    transport = ASGITransport(app=auth_app)
+    async with AsyncClient(transport=transport, base_url="https://testserver") as admin_client:
+        admin_client.cookies.set(ACCESS_COOKIE_NAME, admin_token)
+        page_response = await admin_client.get(
+            f"/api/v1/admin/source-channels/{channel_id}/posts?limit=2&offset=0",
+        )
+        blocked_page_response = await admin_client.get(
+            f"/api/v1/admin/source-channels/{channel_id}/posts?limit=1&offset=5",
+        )
+        snapshot_at = page_response.json()["snapshot_at"]
+        async with postgres_session_factory() as session:
+            session.add(
+                SourceChannelPost(
+                    source_channel_id=channel_id,
+                    post_id="105",
+                    published_at=datetime.now(UTC),
+                    media_type="photo",
+                    status=SourceChannelPostStatus.OBSERVED,
+                    attempt_count=1,
+                ),
+            )
+            await session.commit()
+        stable_page_response = await admin_client.get(
+            f"/api/v1/admin/source-channels/{channel_id}/posts",
+            params={"limit": 2, "offset": 2, "snapshot_at": snapshot_at},
+        )
+        disabled_account_response = await admin_client.post(
+            f"/api/v1/admin/source-channels/{channel_id}/backfill",
+            json={"message_limit": 16000},
+        )
+        async with postgres_session_factory() as session:
+            assigned_session = await session.get(TelegramSession, telegram_session.id)
+            assert assigned_session is not None
+            assigned_session.catchup_enabled = True
+            await session.commit()
+        backfill_response = await admin_client.post(
+            f"/api/v1/admin/source-channels/{channel_id}/backfill",
+            json={"message_limit": 16000},
+        )
+        duplicate_response = await admin_client.post(
+            f"/api/v1/admin/source-channels/{channel_id}/backfill",
+            json={"message_limit": 5000},
+        )
+
+    assert page_response.status_code == 200
+    page = page_response.json()
+    assert page["total"] == 6
+    assert datetime.fromisoformat(page["snapshot_at"]) <= datetime.now(UTC)
+    assert [item["post_id"] for item in page["items"]] == ["104", "103"]
+    assert page["summary"] == {
+        "observed_count": 6,
+        "indexed_count": 2,
+        "partially_indexed_count": 0,
+        "processing_count": 1,
+        "failed_count": 1,
+        "not_indexable_count": 2,
+    }
+    assert page["items"][0]["index_status"] == "indexed"
+    assert page["items"][0]["qdrant_status"] == "synced"
+    assert page["items"][0]["meilisearch_status"] == "synced"
+    assert page["items"][1]["index_status"] == "failed"
+    assert page["items"][1]["fetch_detail"] == "download_unavailable — provider disconnected"
+    assert stable_page_response.status_code == 200
+    assert [item["post_id"] for item in stable_page_response.json()["items"]] == ["102", "101"]
+    assert stable_page_response.json()["total"] == 6
+    assert disabled_account_response.status_code == 409
+    assert "assigned Telegram account" in disabled_account_response.json()["detail"]
+    assert blocked_page_response.status_code == 200
+    blocked_item = blocked_page_response.json()["items"][0]
+    assert blocked_item["post_id"] == "99"
+    assert blocked_item["ingest_outcome"] == "blocked_sha256_existing_file"
+    assert blocked_item["index_status"] == "not_indexable"
+
+    assert backfill_response.status_code == 202
+    assert backfill_response.json()["backfill_status"] == "queued"
+    assert backfill_response.json()["backfill_requested_count"] == 16000
+    assert backfill_response.json()["backfill_scanned_count"] == 0
+    assert duplicate_response.status_code == 409
+
+    async with postgres_session_factory() as session:
+        job = await session.scalar(
+            select(SourceChannelBackfillJob).where(SourceChannelBackfillJob.source_channel_id == channel_id),
+        )
+        audit = await session.scalar(
+            select(TelegramAdminAuditLog).where(
+                TelegramAdminAuditLog.action == "channel_backfill_requested",
+                TelegramAdminAuditLog.source_channel_id == channel_id,
+            ),
+        )
+        assert job is not None
+        assert job.status is SourceChannelBackfillJobStatus.QUEUED
+        assert job.requested_message_count == 16000
+        assert job.requested_by_admin_user_id == admin_user_id
+        assert audit is not None
+        assert audit.new_values["backfill_message_limit"] == 16000
+
+
+async def test_admin_source_projection_loads_only_latest_backfill_job(
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    now = datetime.now(UTC)
+    async with postgres_session_factory() as session:
+        channel = SourceChannel(
+            platform=SourcePlatform.TELEGRAM,
+            platform_id="latest_backfill_projection",
+            title="Latest backfill projection",
+        )
+        session.add(channel)
+        await session.flush()
+        session.add_all(
+            [
+                SourceChannelBackfillJob(
+                    source_channel_id=channel.id,
+                    status=SourceChannelBackfillJobStatus.COMPLETED,
+                    requested_message_count=1000,
+                    scanned_message_count=1000,
+                    created_at=now - timedelta(minutes=2),
+                    completed_at=now - timedelta(minutes=1),
+                ),
+                SourceChannelBackfillJob(
+                    source_channel_id=channel.id,
+                    status=SourceChannelBackfillJobStatus.FAILED,
+                    requested_message_count=5000,
+                    scanned_message_count=1250,
+                    last_error_text="provider disconnected",
+                    created_at=now - timedelta(minutes=1),
+                    completed_at=now,
+                ),
+            ],
+        )
+        await session.commit()
+        channel_id = channel.id
+
+    async with postgres_session_factory() as session:
+        service = admin_service_module.AdminService(session)
+        rows = await service.list_source_channels(platform=SourcePlatform.TELEGRAM)
+        source = next(row for row in rows if row.id == channel_id)
+        tracked_channel = await session.get(SourceChannel, channel_id)
+
+        assert source.backfill_status == "failed"
+        assert source.backfill_requested_count == 5000
+        assert source.backfill_scanned_count == 1250
+        assert source.backfill_error == "provider disconnected"
+        assert tracked_channel is not None
+        assert "backfill_jobs" not in tracked_channel.__dict__
+
+
 @pytest.mark.parametrize("platform", [SourcePlatform.REDDIT, SourcePlatform.VK])
 async def test_browser_admin_source_creation_rejects_unsupported_platforms_in_route_and_service(
     auth_app: FastAPI,
@@ -2061,9 +2371,14 @@ async def test_admin_adds_public_telegram_reference_atomically_and_retry_converg
     def oversized_internal_source_projection(
         channel: SourceChannel,
         *,
+        latest_backfill_job: SourceChannelBackfillJob | None = None,
         now: datetime | None = None,
     ) -> object:
-        projection = original_source_read(channel, now=now)
+        projection = original_source_read(
+            channel,
+            latest_backfill_job=latest_backfill_job,
+            now=now,
+        )
         return SimpleNamespace(
             **projection.model_dump(),
             encrypted_string_session="must-be-filtered-encrypted-material",
@@ -2116,7 +2431,7 @@ async def test_admin_adds_public_telegram_reference_atomically_and_retry_converg
         "username": "public_channel",
         "title": "Public channel",
         "subscriber_count": 1234,
-        "catchup_message_limit": 500,
+        "catchup_message_limit": 5000,
         "catchup_enabled": True,
         "live_enabled": True,
         "engagement_enabled": True,

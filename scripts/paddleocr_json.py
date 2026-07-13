@@ -17,11 +17,18 @@ from pathlib import Path
 from typing import Any, cast
 
 PaddleOCRFactory = Callable[..., Any]
+DEFAULT_CPU_THREADS = 1
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run PaddleOCR and emit JSON.")
     parser.add_argument("--input", required=True, help="Path to the image to OCR.")
+    parser.add_argument(
+        "--cpu-threads",
+        type=_positive_int,
+        default=DEFAULT_CPU_THREADS,
+        help="Positive Paddle inference CPU thread limit (default: 1).",
+    )
     args = parser.parse_args()
 
     image_path = Path(args.input)
@@ -39,6 +46,7 @@ def main() -> int:
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
             use_textline_orientation=False,
+            cpu_threads=args.cpu_threads,
         )
         result = ocr.predict(input=str(image_path))
     except Exception as exc:
@@ -65,6 +73,16 @@ def _load_paddle_ocr_factory() -> PaddleOCRFactory | None:
         print("PaddleOCR import failed: paddleocr.PaddleOCR is not callable.", file=sys.stderr)
         return None
     return cast("PaddleOCRFactory", paddle_ocr_factory)
+
+
+def _positive_int(value: str) -> int:
+    try:
+        resolved = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if resolved <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return resolved
 
 
 def _to_payload(result: object) -> dict[str, object]:

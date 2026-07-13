@@ -37,11 +37,16 @@
   </div>
 
   {#if model.canToggle && model.toggleLabel}
-    <form method="POST" action="?/toggleSourceChannel" class="flex flex-wrap gap-2">
-      <input type="hidden" name="channel_id" value={source.id} />
-      <input type="hidden" name="paused" value={source.is_paused ? 'false' : 'true'} />
-      <Button type="submit" variant="secondary">{model.toggleLabel}</Button>
-    </form>
+    <div class="flex flex-wrap items-center gap-3">
+      <form method="POST" action="?/toggleSourceChannel" class="flex flex-wrap gap-2">
+        <input type="hidden" name="channel_id" value={source.id} />
+        <input type="hidden" name="paused" value={source.is_paused ? 'false' : 'true'} />
+        <Button type="submit" variant="secondary">{model.toggleLabel}</Button>
+      </form>
+      <a class="text-sm font-black underline decoration-2 underline-offset-4" href={`/admin/sources/${source.id}`}>View indexed messages</a>
+    </div>
+  {:else}
+    <a class="w-fit text-sm font-black underline decoration-2 underline-offset-4" href={`/admin/sources/${source.id}`}>View indexed messages</a>
   {/if}
 
   <div class="grid gap-3">

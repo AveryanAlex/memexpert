@@ -807,7 +807,7 @@ async def _seed_ocr_pending_item(
 
 
 async def test_pipeline_runtime_declares_explicit_retry_and_dlx_topology() -> None:
-    settings = Settings()
+    settings = Settings(pipeline_worker_prefetch_count=3)
     broker = build_pipeline_broker(settings)
     session_a_key = build_source_engagement_session_key(
         uuid.UUID("018f0f4d-37f1-7d32-9a60-7c84ec5f3acb"),
@@ -825,6 +825,12 @@ async def test_pipeline_runtime_declares_explicit_retry_and_dlx_topology() -> No
         ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key="pipeline/derived/example/web.mp4")),
         source_engagement_session_keys=(session_a_key, session_b_key),
     )
+    subscriber_channels = [cast("Any", subscriber).channel for subscriber in broker.subscribers]
+
+    assert len(subscriber_channels) == 9
+    assert all(channel is subscriber_channels[0] for channel in subscriber_channels)
+    assert subscriber_channels[0].prefetch_count == 3
+    assert subscriber_channels[0].global_qos is False
 
     declared_exchanges: list[str] = []
     declared_queue_arguments: dict[str, dict[str, object] | None] = {}

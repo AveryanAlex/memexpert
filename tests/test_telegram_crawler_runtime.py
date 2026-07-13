@@ -100,6 +100,9 @@ class FakeManager:
         self._schedule_signals(self._signals_after_retry)
         return self._retry_results[result_index]
 
+    async def process_backfill_jobs(self) -> int:
+        return 0
+
     def _schedule_signals(self, signals: Sequence[TelegramCrawlerControlSignal]) -> None:
         if self._signal_controller is None or not signals:
             return
@@ -459,6 +462,36 @@ async def test_runtime_reconciles_changed_configuration_without_signal() -> None
         "manager.configuration_snapshot",
         "manager.reload",
         "signal.wait:reload",
+        "signal.wait:stop",
+        "signal.close",
+        "manager.shutdown",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runtime_polls_backfill_jobs_without_configuration_change() -> None:
+    events: list[str] = []
+    signal_controller = FakeSignalController(events)
+
+    class _BackfillPollingManager(FakeManager):
+        async def process_backfill_jobs(self) -> int:
+            self._events.append("manager.process_backfill_jobs")
+            signal_controller.request(TelegramCrawlerControlSignal.STOP)
+            return 1
+
+    await run_telegram_crawler_runtime(
+        settings=Settings(crawler_reconcile_interval_seconds=0.001),
+        engine=FakeEngine(events),
+        manager=_BackfillPollingManager(events),
+        signal_controller=signal_controller,
+    )
+
+    assert events == [
+        "signal.install",
+        "manager.configuration_snapshot",
+        "manager.reload",
+        "manager.configuration_snapshot",
+        "manager.process_backfill_jobs",
         "signal.wait:stop",
         "signal.close",
         "manager.shutdown",

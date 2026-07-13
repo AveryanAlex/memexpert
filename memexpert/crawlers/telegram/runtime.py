@@ -15,12 +15,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import SQLAlchemyError
 
 from memexpert.crawlers.telegram.client import (
@@ -34,8 +37,9 @@ from memexpert.crawlers.telegram.client import (
     RawTelegramMessage,
 )
 from memexpert.models.base import utcnow
-from memexpert.models.content import SourceChannel, TelegramSession
-from memexpert.models.enums import SourcePlatform, TelegramSessionStatus
+from memexpert.models.content import SourceChannel, SourceChannelPost, TelegramSession
+from memexpert.models.enums import SourceChannelPostStatus, SourcePlatform, TelegramSessionStatus
+from memexpert.pipeline.helpers import compare_telegram_post_ids
 from memexpert.schemas.content_pipeline import CrawlerIngestOutcome
 from memexpert.services.errors import CrawlerSessionNotRunnableError
 
@@ -48,6 +52,8 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+_LIVE_LISTENER_START_TIMEOUT_SECONDS = 30.0
 
 # Bounded tuple size for the catch-up report's ``errors`` field. We do not
 # want a pathological channel to produce an unbounded error list that
@@ -189,18 +195,135 @@ class TelegramCrawlerRuntime:
             self.settings.crawler_default_catchup_message_limit,
         )
         min_message_id = self._parse_checkpoint_post_id(channel_row.last_read_post_id)
+        initial_latest_window = not channel_row.initial_catchup_completed
 
         counters = _CatchupCounters()
         try:
             await self._refresh_channel_metadata(channel_row)
-            await self._drive_catchup_loop(
+            if initial_latest_window:
+                initial_stream_completed = await self._drive_catchup_loop(
+                    counters=counters,
+                    channel_row=channel_row,
+                    stream=self.telegram_client.iter_latest_channel_messages(
+                        channel_id=channel_id,
+                        limit=limit,
+                    ),
+                    telegram_session=telegram_session,
+                    advance_checkpoint=True,
+                    advance_history_cursor=True,
+                )
+                initial_messages_scanned = counters.scanned
+                if initial_stream_completed and initial_messages_scanned < limit:
+                    channel_row.history_exhausted = True
+                if initial_stream_completed:
+                    channel_row.initial_catchup_completed = True
+                    await self._drain_forward_pages(
+                        counters=counters,
+                        channel_row=channel_row,
+                        channel_id=channel_id,
+                        limit=limit,
+                        telegram_session=telegram_session,
+                    )
+            else:
+                await self._drain_forward_pages(
+                    counters=counters,
+                    channel_row=channel_row,
+                    channel_id=channel_id,
+                    limit=limit,
+                    telegram_session=telegram_session,
+                    initial_min_message_id=min_message_id,
+                )
+        except PipelineTelegramFloodWaitError as exc:
+            counters.record_error(f"flood_wait:{exc.wait_seconds}s")
+            self._park_session_on_flood_wait(
+                telegram_session,
+                wait_seconds=exc.wait_seconds,
+                error_class=type(exc).__name__,
+                error_text=str(exc),
+            )
+        except PipelineTelegramSessionBannedError as exc:
+            await self._quarantine_session(
+                telegram_session,
+                error_class=type(exc).__name__,
+                error_text=str(exc),
+            )
+            raise
+        except PipelineTelegramSessionAuthRequiredError as exc:
+            await self._mark_session_auth_required(
+                telegram_session,
+                error_class=type(exc).__name__,
+                error_text=str(exc),
+            )
+            raise
+
+        await self._commit_runtime_state()
+        return CrawlerCatchupReport(
+            session_name=session_name,
+            channel_id=channel_id,
+            messages_scanned=counters.scanned,
+            messages_ingested=counters.ingested,
+            messages_skipped_unsupported=counters.skipped_unsupported,
+            messages_skipped_dedup=counters.skipped_dedup,
+            started_at=started_at,
+            finished_at=utcnow(),
+            errors=tuple(counters.errors),
+        )
+
+    async def catch_up_older_channel(
+        self,
+        session_name: str,
+        channel_id: str,
+        *,
+        before_post_id: str | None,
+        limit: int,
+    ) -> CrawlerCatchupReport:
+        """Fetch one older history page without changing the forward checkpoint."""
+
+        started_at = utcnow()
+        telegram_session = await self._require_runnable_session(session_name)
+        channel_row = await self._get_owned_channel_or_raise(channel_id, telegram_session)
+        if (
+            not channel_row.is_active
+            or channel_row.is_paused
+            or not channel_row.catchup_enabled
+            or not telegram_session.catchup_enabled
+        ):
+            raise CrawlerSessionNotRunnableError(
+                f"Cannot backfill Telegram channel {channel_id!r} while its catch-up workload is disabled.",
+            )
+        if not channel_row.initial_catchup_completed:
+            raise CrawlerSessionNotRunnableError(
+                f"Cannot backfill Telegram channel {channel_id!r} before its initial catch-up completes.",
+            )
+
+        boundary = (
+            before_post_id
+            or channel_row.history_cursor_post_id
+            or channel_row.oldest_observed_post_id
+            or channel_row.last_read_post_id
+        )
+        parsed_boundary = self._parse_checkpoint_post_id(boundary)
+        if parsed_boundary is None:
+            raise CrawlerSessionNotRunnableError(
+                f"Cannot backfill Telegram channel {channel_id!r} before its initial catch-up establishes a cursor.",
+            )
+
+        counters = _CatchupCounters()
+        try:
+            stream_completed = await self._drive_catchup_loop(
                 counters=counters,
                 channel_row=channel_row,
-                channel_id=channel_id,
-                min_message_id=min_message_id,
-                limit=limit,
+                stream=self.telegram_client.iter_older_channel_messages(
+                    channel_id=channel_id,
+                    before_message_id=parsed_boundary,
+                    limit=limit,
+                ),
                 telegram_session=telegram_session,
+                advance_checkpoint=False,
+                advance_history_cursor=True,
             )
+            if stream_completed and counters.scanned < limit:
+                channel_row.history_exhausted = True
         except PipelineTelegramFloodWaitError as exc:
             counters.record_error(f"flood_wait:{exc.wait_seconds}s")
             self._park_session_on_flood_wait(
@@ -271,13 +394,44 @@ class TelegramCrawlerRuntime:
         telegram_session.last_heartbeat_at = utcnow()
         await self._commit_runtime_state()
 
-        self._live_tasks[session_name] = asyncio.create_task(
+        ready_event = asyncio.Event()
+        listener_task = asyncio.create_task(
             self._run_live_listener(
                 session_name=session_name,
                 channel_ids=channel_ids,
+                ready_event=ready_event,
             ),
             name=f"crawler-live-{session_name}",
         )
+        self._live_tasks[session_name] = listener_task
+        ready_task = asyncio.create_task(ready_event.wait())
+        try:
+            done, _ = await asyncio.wait(
+                (listener_task, ready_task),
+                timeout=_LIVE_LISTENER_START_TIMEOUT_SECONDS,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if ready_task in done:
+                await ready_task
+                return
+            if listener_task in done:
+                await listener_task
+                raise PipelineTelegramProviderUnavailableError(
+                    f"Live listener for Telegram session {session_name!r} exited before registration completed.",
+                )
+            listener_task.cancel()
+            _ = await asyncio.gather(listener_task, return_exceptions=True)
+            raise PipelineTelegramProviderUnavailableError(
+                f"Live listener for Telegram session {session_name!r} did not register within "
+                f"{_LIVE_LISTENER_START_TIMEOUT_SECONDS:g}s.",
+            )
+        except Exception:
+            self._live_tasks.pop(session_name, None)
+            raise
+        finally:
+            if not ready_task.done():
+                ready_task.cancel()
+            _ = await asyncio.gather(ready_task, return_exceptions=True)
 
     async def stop_live_listener(self, session_name: str, *, mark_stopped: bool = True) -> None:
         """Cancel the background live listener for ``session_name`` if running."""
@@ -367,16 +521,41 @@ class TelegramCrawlerRuntime:
                     "Telegram replay returned message for channel "
                     f"{raw_message.channel_id!r}, expected {channel_id!r}.",
                 )
+            post_row = await self._observe_post(
+                channel,
+                raw_message,
+                advance_history_cursor=False,
+            )
+            if raw_message.media_type == "unsupported":
+                self._mark_post_unsupported(post_row)
+                await self._commit_runtime_state()
+                raise PipelineTelegramMalformedMessageError(
+                    f"Telegram post {channel_id}:{post_id} has no supported media.",
+                )
             predownload_result = await self._try_accept_without_media(raw_message, advance_checkpoint=False)
             if predownload_result is not None:
+                self._mark_post_for_ingest_outcome(post_row, predownload_result)
+                await self._commit_runtime_state()
                 return predownload_result
 
-            media_bytes = await self.telegram_client.download_media(raw_message)
-            raw_post = PipelineTelegramMessageMapper.build_raw_crawler_post(
-                raw_message,
-                media_bytes,
-            )
-            return await self.ingest_service.accept_crawler_post(raw_post, advance_checkpoint=False)
+            try:
+                media_bytes = await self.telegram_client.download_media(raw_message)
+                raw_post = PipelineTelegramMessageMapper.build_raw_crawler_post(
+                    raw_message,
+                    media_bytes,
+                )
+                result = await self.ingest_service.accept_crawler_post(raw_post, advance_checkpoint=False)
+            except PipelineTelegramError as exc:
+                self._mark_post_failed(
+                    post_row,
+                    error_code=type(exc).__name__,
+                    error_text=str(exc),
+                )
+                await self._commit_runtime_state()
+                raise
+            self._mark_post_for_ingest_outcome(post_row, result)
+            await self._commit_runtime_state()
+            return result
         except PipelineTelegramFloodWaitError as exc:
             self._park_session_on_flood_wait(
                 assigned_session,
@@ -405,38 +584,79 @@ class TelegramCrawlerRuntime:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    async def _drive_catchup_loop(
+    async def _drain_forward_pages(
         self,
         *,
         counters: _CatchupCounters,
         channel_row: SourceChannel,
         channel_id: str,
-        min_message_id: int | None,
         limit: int,
         telegram_session: TelegramSession,
+        initial_min_message_id: int | None = None,
     ) -> None:
+        """Drain forward pages until the checkpoint reaches a short final page."""
+
+        min_message_id = (
+            initial_min_message_id
+            if initial_min_message_id is not None
+            else self._parse_checkpoint_post_id(channel_row.last_read_post_id)
+        )
+        while True:
+            checkpoint_before = channel_row.last_read_post_id
+            scanned_before = counters.scanned
+            stream_completed = await self._drive_catchup_loop(
+                counters=counters,
+                channel_row=channel_row,
+                stream=self.telegram_client.iter_channel_messages(
+                    channel_id=channel_id,
+                    min_message_id=min_message_id,
+                    limit=limit,
+                ),
+                telegram_session=telegram_session,
+                advance_checkpoint=True,
+                advance_history_cursor=False,
+            )
+            page_messages_scanned = counters.scanned - scanned_before
+            if (
+                not stream_completed
+                or page_messages_scanned < limit
+                or channel_row.last_read_post_id == checkpoint_before
+            ):
+                return
+            min_message_id = self._parse_checkpoint_post_id(channel_row.last_read_post_id)
+
+    async def _drive_catchup_loop(
+        self,
+        *,
+        counters: _CatchupCounters,
+        channel_row: SourceChannel,
+        stream: AsyncIterator[RawTelegramMessage],
+        telegram_session: TelegramSession,
+        advance_checkpoint: bool,
+        advance_history_cursor: bool,
+    ) -> bool:
         """Iterate the adapter stream and ingest each message through the service."""
 
-        fetched_at_fallback = utcnow()
-        stream = self.telegram_client.iter_channel_messages(
-            channel_id=channel_id,
-            min_message_id=min_message_id,
-            limit=limit,
-        )
         try:
             async for raw_message in stream:
                 counters.scanned += 1
-                # ``last_fetched_at`` must advance on every observation so
-                # operators see that the crawler made progress even when
-                # every message was unsupported or skipped. Updating it
-                # here (not just on the ingest branch) is deliberate.
-                channel_row.last_fetched_at = fetched_at_fallback
+                post_row = await self._observe_post(
+                    channel_row,
+                    raw_message,
+                    advance_history_cursor=advance_history_cursor,
+                )
                 if raw_message.media_type == "unsupported":
                     counters.skipped_unsupported += 1
+                    self._mark_post_unsupported(post_row)
+                    if advance_checkpoint:
+                        self._advance_forward_checkpoint(channel_row, raw_message.message_id)
                     continue
                 await self._ingest_single_message(
                     counters=counters,
+                    channel_row=channel_row,
                     raw_message=raw_message,
+                    post_row=post_row,
+                    advance_checkpoint=advance_checkpoint,
                 )
         except PipelineTelegramFloodWaitError as exc:
             counters.record_error(f"flood_wait:{exc.wait_seconds}s")
@@ -446,25 +666,29 @@ class TelegramCrawlerRuntime:
                 error_class=type(exc).__name__,
                 error_text=str(exc),
             )
-            return
+            return False
         except PipelineTelegramProviderUnavailableError as exc:
             # Provider errors inside the iteration loop (e.g. a mid-stream
             # disconnect) are transient and the session can retry on the
             # next sweep; the session state stays ``active`` so the next
             # operator-triggered catch-up call runs cleanly.
             counters.record_error(f"provider_unavailable:{exc}")
-            return
+            return False
         else:
             # A successful empty poll is still operational progress. Without
             # this assignment newly activated but quiet channels remain
             # indistinguishable from channels the crawler never contacted.
-            channel_row.last_fetched_at = fetched_at_fallback
+            channel_row.last_fetched_at = utcnow()
+            return True
 
     async def _ingest_single_message(
         self,
         *,
         counters: _CatchupCounters,
+        channel_row: SourceChannel,
         raw_message: RawTelegramMessage,
+        post_row: SourceChannelPost,
+        advance_checkpoint: bool,
     ) -> None:
         """Download + ingest one typed message and tally its outcome.
 
@@ -474,23 +698,50 @@ class TelegramCrawlerRuntime:
         re-attempting will keep failing the same way.
         """
 
-        predownload_result = await self._try_accept_without_media(raw_message)
+        predownload_result = await self._try_accept_without_media(
+            raw_message,
+            advance_checkpoint=advance_checkpoint,
+        )
         if predownload_result is not None:
             self._tally_ingest_outcome(counters, predownload_result)
+            self._mark_post_for_ingest_outcome(post_row, predownload_result)
+            if advance_checkpoint:
+                self._advance_forward_checkpoint(channel_row, raw_message.message_id)
             return
 
         try:
             media_bytes = await self.telegram_client.download_media(raw_message)
+        except PipelineTelegramFloodWaitError as exc:
+            self._mark_post_failed(
+                post_row,
+                error_code="flood_wait",
+                error_text=str(exc),
+            )
+            raise
         except PipelineTelegramProviderUnavailableError as exc:
             counters.record_error(
                 f"download_unavailable:{raw_message.message_id}:{exc}",
             )
+            self._mark_post_failed(
+                post_row,
+                error_code="download_unavailable",
+                error_text=str(exc),
+            )
+            if advance_checkpoint:
+                self._advance_forward_checkpoint(channel_row, raw_message.message_id)
             return
         except PipelineTelegramMalformedMessageError as exc:
             counters.record_error(
                 f"download_malformed:{raw_message.message_id}:{exc}",
             )
             counters.skipped_unsupported += 1
+            self._mark_post_failed(
+                post_row,
+                error_code="download_malformed",
+                error_text=str(exc),
+            )
+            if advance_checkpoint:
+                self._advance_forward_checkpoint(channel_row, raw_message.message_id)
             return
 
         try:
@@ -503,10 +754,31 @@ class TelegramCrawlerRuntime:
                 f"mapper_malformed:{raw_message.message_id}:{exc}",
             )
             counters.skipped_unsupported += 1
+            self._mark_post_failed(
+                post_row,
+                error_code="mapper_malformed",
+                error_text=str(exc),
+            )
+            if advance_checkpoint:
+                self._advance_forward_checkpoint(channel_row, raw_message.message_id)
             return
 
-        ingest_result = await self.ingest_service.accept_crawler_post(raw_post)
+        try:
+            ingest_result = await self.ingest_service.accept_crawler_post(
+                raw_post,
+                advance_checkpoint=advance_checkpoint,
+            )
+        except Exception as exc:
+            self._mark_post_failed(
+                post_row,
+                error_code=type(exc).__name__,
+                error_text=str(exc),
+            )
+            raise
         self._tally_ingest_outcome(counters, ingest_result)
+        self._mark_post_for_ingest_outcome(post_row, ingest_result)
+        if advance_checkpoint:
+            self._advance_forward_checkpoint(channel_row, raw_message.message_id)
 
     async def _try_accept_without_media(
         self,
@@ -523,6 +795,123 @@ class TelegramCrawlerRuntime:
             published_at=raw_message.published_at,
             advance_checkpoint=advance_checkpoint,
         )
+
+    async def _observe_post(
+        self,
+        channel_row: SourceChannel,
+        raw_message: RawTelegramMessage,
+        *,
+        advance_history_cursor: bool,
+    ) -> SourceChannelPost:
+        """Upsert one observed post and advance only the appropriate cursors."""
+
+        # Admin inventory pagination uses ``created_at`` as its stable
+        # observation cutoff, so capture this only after the adapter yields
+        # the individual message rather than once for the enclosing page.
+        fetched_at = utcnow()
+        statement = (
+            pg_insert(SourceChannelPost)
+            .values(
+                id=uuid.uuid7(),
+                source_channel_id=channel_row.id,
+                post_id=raw_message.message_id,
+                published_at=raw_message.published_at,
+                media_type=raw_message.media_type,
+                status=SourceChannelPostStatus.OBSERVED,
+                last_error_code=None,
+                last_error_text=None,
+                attempt_count=1,
+                created_at=fetched_at,
+                updated_at=fetched_at,
+            )
+            .on_conflict_do_update(
+                constraint="uq_source_channel_posts_channel_post",
+                set_={
+                    "published_at": raw_message.published_at,
+                    "media_type": raw_message.media_type,
+                    "status": SourceChannelPostStatus.OBSERVED,
+                    "last_error_code": None,
+                    "last_error_text": None,
+                    "attempt_count": SourceChannelPost.attempt_count + 1,
+                    "updated_at": fetched_at,
+                },
+            )
+            .returning(SourceChannelPost)
+        )
+        post_row = (
+            await self.session.scalars(
+                statement.execution_options(populate_existing=True),
+            )
+        ).one()
+        channel_row.last_fetched_at = fetched_at
+        if (
+            channel_row.oldest_observed_post_id is None
+            or compare_telegram_post_ids(
+                raw_message.message_id,
+                channel_row.oldest_observed_post_id,
+            )
+            < 0
+        ):
+            channel_row.oldest_observed_post_id = raw_message.message_id
+        if advance_history_cursor and (
+            channel_row.history_cursor_post_id is None
+            or compare_telegram_post_ids(
+                raw_message.message_id,
+                channel_row.history_cursor_post_id,
+            )
+            < 0
+        ):
+            channel_row.history_cursor_post_id = raw_message.message_id
+        return post_row
+
+    @staticmethod
+    def _advance_forward_checkpoint(channel_row: SourceChannel, post_id: str) -> None:
+        if compare_telegram_post_ids(post_id, channel_row.last_read_post_id) > 0:
+            channel_row.last_read_post_id = post_id
+
+    @staticmethod
+    def _mark_post_accepted(post_row: SourceChannelPost) -> None:
+        post_row.status = SourceChannelPostStatus.ACCEPTED
+        post_row.last_error_code = None
+        post_row.last_error_text = None
+
+    @classmethod
+    def _mark_post_for_ingest_outcome(
+        cls,
+        post_row: SourceChannelPost,
+        ingest_result: CrawlerIngestResult,
+    ) -> None:
+        if ingest_result.outcome in {
+            CrawlerIngestOutcome.SKIPPED_UNSUPPORTED_MEDIA,
+            CrawlerIngestOutcome.REJECTED_MALFORMED,
+        }:
+            cls._mark_post_unsupported(post_row)
+            return
+        if ingest_result.outcome is CrawlerIngestOutcome.SKIPPED_PAUSED_CHANNEL:
+            cls._mark_post_failed(
+                post_row,
+                error_code="channel_paused",
+                error_text="The source channel was paused while this post was being ingested.",
+            )
+            return
+        cls._mark_post_accepted(post_row)
+
+    @staticmethod
+    def _mark_post_unsupported(post_row: SourceChannelPost) -> None:
+        post_row.status = SourceChannelPostStatus.UNSUPPORTED
+        post_row.last_error_code = None
+        post_row.last_error_text = None
+
+    @staticmethod
+    def _mark_post_failed(
+        post_row: SourceChannelPost,
+        *,
+        error_code: str,
+        error_text: str,
+    ) -> None:
+        post_row.status = SourceChannelPostStatus.FAILED
+        post_row.last_error_code = error_code[:128]
+        post_row.last_error_text = error_text[:4000]
 
     @staticmethod
     def _tally_ingest_outcome(
@@ -558,6 +947,7 @@ class TelegramCrawlerRuntime:
         *,
         session_name: str,
         channel_ids: list[str],
+        ready_event: asyncio.Event,
     ) -> None:
         """Drain ``listen_live`` and ingest each message until cancelled."""
 
@@ -565,6 +955,7 @@ class TelegramCrawlerRuntime:
             bound_channel_ids = set(channel_ids)
             async for raw_message in self.telegram_client.listen_live(
                 channel_ids=channel_ids,
+                ready_event=ready_event,
             ):
                 if raw_message.channel_id not in bound_channel_ids:
                     logger.warning(
@@ -574,44 +965,31 @@ class TelegramCrawlerRuntime:
                         raw_message.channel_id,
                     )
                     continue
+                channel_row = await self._get_tracked_channel(raw_message.channel_id)
+                post_row = await self._observe_post(
+                    channel_row,
+                    raw_message,
+                    advance_history_cursor=False,
+                )
                 if raw_message.media_type == "unsupported":
-                    continue
-                predownload_result = await self._try_accept_without_media(raw_message)
-                if predownload_result is not None:
+                    self._mark_post_unsupported(post_row)
+                    self._advance_forward_checkpoint(channel_row, raw_message.message_id)
                     await self._record_live_heartbeat(session_name)
                     continue
-
-                try:
-                    media_bytes = await self.telegram_client.download_media(raw_message)
-                except PipelineTelegramProviderUnavailableError as exc:
+                counters = _CatchupCounters()
+                await self._ingest_single_message(
+                    counters=counters,
+                    channel_row=channel_row,
+                    raw_message=raw_message,
+                    post_row=post_row,
+                    advance_checkpoint=True,
+                )
+                for error in counters.errors:
                     logger.warning(
-                        "Live download failed for message %s: %s",
+                        "Live ingest recorded an error for message %s: %s",
                         raw_message.message_id,
-                        exc,
+                        error,
                     )
-                    continue
-                except PipelineTelegramMalformedMessageError as exc:
-                    logger.warning(
-                        "Live download returned malformed payload for %s: %s",
-                        raw_message.message_id,
-                        exc,
-                    )
-                    continue
-
-                try:
-                    raw_post = PipelineTelegramMessageMapper.build_raw_crawler_post(
-                        raw_message,
-                        media_bytes,
-                    )
-                except PipelineTelegramMalformedMessageError as exc:
-                    logger.warning(
-                        "Live mapper rejected message %s: %s",
-                        raw_message.message_id,
-                        exc,
-                    )
-                    continue
-
-                await self.ingest_service.accept_crawler_post(raw_post)
                 await self._record_live_heartbeat(session_name)
         except asyncio.CancelledError:
             raise

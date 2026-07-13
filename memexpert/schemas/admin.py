@@ -32,10 +32,14 @@ from memexpert.models.enums import (
     ChannelSuggestionStatus,
     ContentKind,
     ContentLanguage,
+    ContentPipelineStage,
+    ContentPipelineStageStatus,
     ModerationAction,
     ModerationReason,
     ModerationReportStatus,
+    PipelineIngestRequestStatus,
     SourcePlatform,
+    SyncTargetStatus,
     TelegramSessionStatus,
 )
 from memexpert.schemas._text import normalize_optional_text, normalize_required_text
@@ -121,6 +125,13 @@ class AdminSourceChannelRead(ORMSchema):
     is_orphaned: bool
     is_indexable: bool
     last_read_post_id: str | None
+    oldest_observed_post_id: str | None
+    initial_catchup_completed: bool
+    history_exhausted: bool
+    backfill_status: Literal["idle", "queued", "running", "failed"]
+    backfill_requested_count: int
+    backfill_scanned_count: int
+    backfill_error: str | None
     last_fetched_at: datetime | None
     operational_status: Literal["active", "inactive", "paused"]
     freshness_status: Literal["checkpoint_only", "fresh", "never_fetched", "stale"]
@@ -145,7 +156,7 @@ class AdminSourceChannelCreateRequest(BaseModel):
     catchup_enabled: StrictBool = True
     live_enabled: StrictBool = True
     engagement_enabled: StrictBool = True
-    catchup_message_limit: StrictInt = Field(default=500, ge=1, le=10000)
+    catchup_message_limit: StrictInt = Field(default=5000, ge=1, le=10000)
 
     @field_validator("platform_id", "title")
     @classmethod
@@ -174,7 +185,7 @@ class AdminTelegramChannelFromReferenceRequest(BaseModel):
     reference: str = Field(min_length=1, max_length=512)
     telegram_session_id: uuid.UUID
     suggestion_id: uuid.UUID | None = None
-    catchup_message_limit: StrictInt = Field(default=500, ge=1, le=10000)
+    catchup_message_limit: StrictInt = Field(default=5000, ge=1, le=10000)
 
 
 class AdminSourceChannelUpdateRequest(BaseModel):
@@ -192,6 +203,66 @@ class AdminSourceChannelUpdateRequest(BaseModel):
         if not self.model_fields_set:
             raise ValueError("At least one source-channel field must be supplied.")
         return self
+
+
+class AdminSourceChannelBackfillRequest(BaseModel):
+    """Queue a durable older-history fetch without changing the live checkpoint."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    message_limit: StrictInt = Field(default=5000, ge=1, le=50000)
+
+
+class AdminSourceChannelPostRead(BaseModel):
+    """One observed source post with its current ingest and search-index truth."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: uuid.UUID
+    post_id: str
+    telegram_url: str | None
+    published_at: datetime | None
+    observed_at: datetime
+    media_type: str | None
+    fetch_status: str
+    fetch_detail: str | None
+    ingest_outcome: str | None
+    ingest_status: PipelineIngestRequestStatus | None
+    meme_id: uuid.UUID | None
+    meme_file_id: uuid.UUID | None
+    pipeline_stage: ContentPipelineStage | None
+    pipeline_status: ContentPipelineStageStatus | None
+    pipeline_error: str | None
+    qdrant_status: SyncTargetStatus | None
+    meilisearch_status: SyncTargetStatus | None
+    index_status: Literal["indexed", "partially_indexed", "processing", "failed", "not_indexable"]
+
+
+class AdminSourceChannelPostSummaryRead(BaseModel):
+    """Aggregate indexing coverage for one curated source channel."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    observed_count: int
+    indexed_count: int
+    partially_indexed_count: int
+    processing_count: int
+    failed_count: int
+    not_indexable_count: int
+
+
+class AdminSourceChannelPostPageRead(BaseModel):
+    """Paginated observed-post inventory used by browser admin."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source_channel_id: uuid.UUID
+    snapshot_at: datetime
+    summary: AdminSourceChannelPostSummaryRead
+    items: list[AdminSourceChannelPostRead]
+    total: int
+    limit: int
+    offset: int
 
 
 class AdminSourceChannelAssignRequest(BaseModel):
@@ -1075,9 +1146,13 @@ __all__ = [
     "AdminOverviewRead",
     "AdminSessionRead",
     "AdminSourceChannelAssignRequest",
+    "AdminSourceChannelBackfillRequest",
     "AdminSourceChannelCreateRequest",
     "AdminSourceChannelMarkDeadRequest",
     "AdminSourceChannelOrphanRequest",
+    "AdminSourceChannelPostPageRead",
+    "AdminSourceChannelPostRead",
+    "AdminSourceChannelPostSummaryRead",
     "AdminSourceChannelRead",
     "AdminSourceChannelUpdateRequest",
     "AdminTelegramChannelGroupRead",

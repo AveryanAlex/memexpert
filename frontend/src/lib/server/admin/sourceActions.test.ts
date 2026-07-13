@@ -13,7 +13,8 @@ describe('source admin actions', () => {
       'updateSourceChannelIngestion',
       'assignSourceChannel',
       'orphanSourceChannel',
-      'validateSourceAccount'
+      'validateSourceAccount',
+      'backfillSourceChannel'
     ]);
   });
 
@@ -43,17 +44,19 @@ describe('source admin actions', () => {
     await expect(sourceActions.assignSourceChannel(actionEvent({ channel_id: channelId, telegram_session_id: sessionId, note: 'move source' }, fetch))).resolves.toEqual({ message: 'Source assigned to a Telegram account.' });
     await expect(sourceActions.orphanSourceChannel(actionEvent({ channel_id: channelId, note: 'pause source' }, fetch))).resolves.toEqual({ message: 'Source is now unassigned and ingestion is off.' });
     await expect(sourceActions.validateSourceAccount(actionEvent({ source_channel_id: channelId, telegram_session_id: sessionId, note: 'check access' }, fetch))).resolves.toEqual({ message: 'Source access validated with @source.' });
+    await expect(sourceActions.backfillSourceChannel(actionEvent({ channel_id: channelId, message_limit: '5000' }, fetch))).resolves.toEqual({ message: 'Older-message backfill queued for 5,000 messages.' });
 
     expect(calls).toEqual([
       { path: `/api/v1/admin/channel-suggestions/${suggestionId}/reject`, method: 'POST', body: { admin_note: 'duplicate' } },
       { path: '/api/v1/admin/telegram/channels/from-reference', method: 'POST', body: { reference: 'https://t.me/source', telegram_session_id: sessionId, suggestion_id: suggestionId, catchup_message_limit: 750 } },
-      { path: '/api/v1/admin/source-channels', method: 'POST', body: { platform: 'telegram', platform_id: '-1001234', username: 'source', title: 'Source', orphaned: true, catchup_message_limit: 500, catchup_enabled: false, live_enabled: false, engagement_enabled: false } },
+      { path: '/api/v1/admin/source-channels', method: 'POST', body: { platform: 'telegram', platform_id: '-1001234', username: 'source', title: 'Source', orphaned: true, catchup_message_limit: 5000, catchup_enabled: false, live_enabled: false, engagement_enabled: false } },
       { path: `/api/v1/admin/source-channels/${channelId}/pause`, method: 'POST', body: null },
       { path: `/api/v1/admin/source-channels/${channelId}/mark-dead`, method: 'POST', body: { confirmation: channelId } },
       { path: `/api/v1/admin/telegram/channels/${channelId}`, method: 'PATCH', body: { catchup_enabled: false, live_enabled: true, engagement_enabled: false, catchup_message_limit: 250 } },
       { path: `/api/v1/admin/telegram/channels/${channelId}/assign`, method: 'POST', body: { telegram_session_id: sessionId, note: 'move source' } },
       { path: `/api/v1/admin/telegram/channels/${channelId}/orphan`, method: 'POST', body: { note: 'pause source' } },
-      { path: `/api/v1/admin/telegram/sessions/${sessionId}/validate`, method: 'POST', body: { source_channel_id: channelId, note: 'check access' } }
+      { path: `/api/v1/admin/telegram/sessions/${sessionId}/validate`, method: 'POST', body: { source_channel_id: channelId, note: 'check access' } },
+      { path: `/api/v1/admin/source-channels/${channelId}/backfill`, method: 'POST', body: { message_limit: 5000 } }
     ]);
   });
 
@@ -82,7 +85,9 @@ describe('source admin actions', () => {
       { result: sourceActions.updateSourceChannelIngestion(actionEvent({}, fetch)), message: 'channel_id is required.' },
       { result: sourceActions.assignSourceChannel(actionEvent({ channel_id: channelId }, fetch)), message: 'telegram_session_id is required.' },
       { result: sourceActions.orphanSourceChannel(actionEvent({}, fetch)), message: 'channel_id is required.' },
-      { result: sourceActions.validateSourceAccount(actionEvent({ source_channel_id: channelId }, fetch)), message: 'telegram_session_id is required.' }
+      { result: sourceActions.validateSourceAccount(actionEvent({ source_channel_id: channelId }, fetch)), message: 'telegram_session_id is required.' },
+      { result: sourceActions.backfillSourceChannel(actionEvent({ message_limit: '5000' }, fetch)), message: 'channel_id is required.' },
+      { result: sourceActions.backfillSourceChannel(actionEvent({ channel_id: channelId, message_limit: '50001' }, fetch)), message: 'message_limit must be between 1 and 50000.' }
     ];
 
     for (const malformed of malformedActions) {

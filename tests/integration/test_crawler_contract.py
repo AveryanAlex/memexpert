@@ -166,6 +166,30 @@ async def test_fake_telegram_client_iter_channel_messages_respects_limit_and_min
     assert [m.message_id for m in bounded] == ["10"]
 
 
+async def test_fake_telegram_client_history_windows_use_safe_processing_order() -> None:
+    messages = [_build_message(message_id=str(message_id)) for message_id in range(1, 11)]
+    client = FakeTelegramClient(canned_messages={"memes_channel": messages})
+
+    latest = [
+        message
+        async for message in client.iter_latest_channel_messages(
+            channel_id="memes_channel",
+            limit=3,
+        )
+    ]
+    older = [
+        message
+        async for message in client.iter_older_channel_messages(
+            channel_id="memes_channel",
+            before_message_id=8,
+            limit=3,
+        )
+    ]
+
+    assert [message.message_id for message in latest] == ["8", "9", "10"]
+    assert [message.message_id for message in older] == ["7", "6", "5"]
+
+
 async def test_fake_telegram_client_download_media_and_close_track_calls() -> None:
     message = _build_message()
     client = FakeTelegramClient(

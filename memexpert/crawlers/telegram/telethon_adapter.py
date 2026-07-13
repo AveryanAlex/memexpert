@@ -457,10 +457,83 @@ class PipelineTelethonClient(PipelineTelegramClientProtocol):
         except Exception as exc:
             raise _translate_telethon_error(exc) from exc
 
+    async def iter_latest_channel_messages(
+        self,
+        *,
+        channel_id: str,
+        limit: int,
+    ) -> AsyncIterator[RawTelegramMessage]:
+        """Yield the latest ``limit`` messages in oldest-to-newest order."""
+
+        messages = await self._load_history_window(
+            channel_id=channel_id,
+            limit=limit,
+            max_message_id=None,
+        )
+        for message in reversed(messages):
+            yield message
+
+    async def iter_older_channel_messages(
+        self,
+        *,
+        channel_id: str,
+        before_message_id: int,
+        limit: int,
+    ) -> AsyncIterator[RawTelegramMessage]:
+        """Yield an older page newest-first below an exclusive message id boundary.
+
+        Advancing the durable history cursor in this order makes page recovery
+        monotonic: if processing stops halfway through, every unprocessed
+        message remains below the last committed boundary and is fetched on
+        the next attempt.
+        """
+
+        messages = await self._load_history_window(
+            channel_id=channel_id,
+            limit=limit,
+            max_message_id=before_message_id,
+        )
+        for message in messages:
+            yield message
+
+    async def _load_history_window(
+        self,
+        *,
+        channel_id: str,
+        limit: int,
+        max_message_id: int | None,
+    ) -> list[RawTelegramMessage]:
+        """Load one newest-first Telethon page for latest/older history scans."""
+
+        client = await self._get_client()
+        entity = await self._resolve_entity(channel_id)
+        channel_title = getattr(entity, "title", None) or channel_id
+        channel_username = getattr(entity, "username", None)
+        messages: list[RawTelegramMessage] = []
+        await self.rate_limiter.acquire()
+        try:
+            async for raw_message in client.iter_messages(
+                entity,
+                limit=limit,
+                max_id=max_message_id or 0,
+            ):
+                messages.append(
+                    TelethonMessageNormalizer.build(
+                        message=raw_message,
+                        channel_id=channel_id,
+                        channel_title=channel_title,
+                        channel_username=channel_username,
+                    )
+                )
+        except Exception as exc:
+            raise _translate_telethon_error(exc) from exc
+        return messages
+
     async def listen_live(
         self,
         *,
         channel_ids: Sequence[str],
+        ready_event: asyncio.Event | None = None,
     ) -> AsyncIterator[RawTelegramMessage]:
         """Stream live messages for the requested channels via a Telethon handler.
 
@@ -513,6 +586,8 @@ class PipelineTelethonClient(PipelineTelegramClientProtocol):
             events.NewMessage(chats=cast("list[object]", entities)),
         )
         self._live_handler = _on_new_message
+        if ready_event is not None:
+            ready_event.set()
 
         try:
             while not self._closed:

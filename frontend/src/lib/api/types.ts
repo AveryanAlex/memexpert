@@ -75,6 +75,9 @@ export interface TelegramLinkStartRead {
   return_url: string;
 }
 export type SourcePlatform = 'reddit' | 'telegram' | 'vk';
+export type AdminSourceBackfillStatus = 'failed' | 'idle' | 'queued' | 'running';
+export type AdminSourcePostIndexStatus = 'failed' | 'indexed' | 'not_indexable' | 'partially_indexed' | 'processing';
+export type AdminSourcePostSyncStatus = 'failed' | 'pending' | 'processing' | 'synced';
 export type ChannelSuggestionStatus = 'approved' | 'pending' | 'rejected';
 export type TelegramSessionStatus = 'active' | 'auth_required' | 'flood_wait' | 'quarantined' | 'stopped';
 export type ModerationReportStatus = 'pending' | 'in_review' | 'resolved' | 'dismissed';
@@ -589,12 +592,63 @@ export interface AdminSourceChannelRead {
   is_orphaned: boolean;
   is_indexable: boolean;
   last_read_post_id: string | null;
+  oldest_observed_post_id: string | null;
+  initial_catchup_completed: boolean;
+  history_exhausted: boolean;
+  backfill_status: AdminSourceBackfillStatus;
+  backfill_requested_count: number;
+  backfill_scanned_count: number;
+  backfill_error: string | null;
   last_fetched_at: string | null;
   operational_status: 'active' | 'inactive' | 'paused';
   freshness_status: 'checkpoint_only' | 'fresh' | 'never_fetched' | 'stale';
   seconds_since_last_fetch: number | null;
   created_at: string;
   updated_at: string;
+}
+
+export interface AdminSourcePostSummaryRead {
+  observed_count: number;
+  indexed_count: number;
+  partially_indexed_count: number;
+  processing_count: number;
+  failed_count: number;
+  not_indexable_count: number;
+}
+
+export interface AdminSourcePostRead {
+  id: string;
+  post_id: string;
+  telegram_url: string | null;
+  published_at: string | null;
+  observed_at: string;
+  media_type: string | null;
+  fetch_status: string;
+  fetch_detail: string | null;
+  ingest_outcome: string | null;
+  ingest_status: string | null;
+  meme_id: string | null;
+  meme_file_id: string | null;
+  pipeline_stage: string | null;
+  pipeline_status: string | null;
+  pipeline_error: string | null;
+  qdrant_status: AdminSourcePostSyncStatus | null;
+  meilisearch_status: AdminSourcePostSyncStatus | null;
+  index_status: AdminSourcePostIndexStatus;
+}
+
+export interface AdminSourcePostPageRead {
+  source_channel_id: string;
+  snapshot_at: string;
+  summary: AdminSourcePostSummaryRead;
+  items: AdminSourcePostRead[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface AdminSourceBackfillPayload {
+  message_limit: number;
 }
 
 export interface AdminTelegramSessionRead {

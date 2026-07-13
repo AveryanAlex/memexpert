@@ -7,7 +7,7 @@ import uuid
 import ast
 from datetime import timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 import pytest_asyncio
@@ -39,6 +39,8 @@ from memexpert.models.content import (
     PipelineStageJournal,
     RabbitMQOutboxMessage,
     SourceChannel,
+    SourceChannelBackfillJob,
+    SourceChannelPost,
     TelegramAdminAuditLog,
     TelegramFileIdCache,
     TelegramSession,
@@ -63,6 +65,8 @@ from memexpert.models.enums import (
     ModerationAction,
     ModerationReason,
     ModerationReportStatus,
+    SourceChannelBackfillJobStatus,
+    SourceChannelPostStatus,
     SourceEngagementCaptureReason,
     SourceEngagementCommentsState,
     SourceEngagementFetchStatus,
@@ -130,6 +134,8 @@ EXPECTED_TABLES = {
     "pipeline_stage_journal",
     "rabbitmq_outbox_messages",
     "source_channels",
+    "source_channel_backfill_jobs",
+    "source_channel_posts",
     "telegram_admin_audit_logs",
     "telegram_file_id_cache",
     "telegram_link_codes",
@@ -1587,19 +1593,93 @@ def test_source_channel_exposes_crawler_checkpoint_columns() -> None:
     assert "engagement_enabled" in columns
     assert "is_paused" in columns
     assert "last_fetched_at" in columns
+    assert "oldest_observed_post_id" in columns
+    assert "history_cursor_post_id" in columns
+    assert "initial_catchup_completed" in columns
+    assert "history_exhausted" in columns
     # Defaults live on the column descriptors because SQLAlchemy resolves
     # them at flush time, not at construction time. Reading them off the
     # column keeps this a pure unit test that does not need a session.
-    assert columns["catchup_message_limit"].default.arg == 500
+    assert columns["catchup_message_limit"].default.arg == 5000
     assert columns["catchup_enabled"].default.arg is True
     assert columns["live_enabled"].default.arg is True
     assert columns["engagement_enabled"].default.arg is True
     assert columns["is_paused"].default.arg is False
+    assert columns["initial_catchup_completed"].default.arg is False
+    assert columns["history_exhausted"].default.arg is False
 
     index_names = {index.name for index in cast("Table", SourceChannel.__table__).indexes}
     assert "ix_source_channels_telegram_session_id" in index_names
     assert "ix_source_channels_session_live" in index_names
     assert "ix_source_channels_session_engagement" in index_names
+
+
+def test_source_channel_post_inventory_model_contract() -> None:
+    table = cast("Table", SourceChannelPost.__table__)
+    assert set(table.c.keys()) == {
+        "attempt_count",
+        "created_at",
+        "id",
+        "last_error_code",
+        "last_error_text",
+        "media_type",
+        "post_id",
+        "published_at",
+        "source_channel_id",
+        "status",
+        "updated_at",
+    }
+    status_default = table.c["status"].default
+    attempt_count_default = table.c["attempt_count"].default
+    assert status_default is not None
+    assert attempt_count_default is not None
+    assert cast("Any", status_default).arg is SourceChannelPostStatus.OBSERVED
+    assert cast("Any", attempt_count_default).arg == 0
+    unique_constraints = {
+        constraint.name: tuple(column.name for column in constraint.columns)
+        for constraint in table.constraints
+        if isinstance(constraint, UniqueConstraint)
+    }
+    assert unique_constraints == {
+        "uq_source_channel_posts_channel_post": ("source_channel_id", "post_id"),
+    }
+    assert {index.name for index in table.indexes} == {
+        "ix_source_channel_posts_channel_published_at",
+        "ix_source_channel_posts_channel_status",
+    }
+
+
+def test_source_channel_backfill_job_model_contract() -> None:
+    table = cast("Table", SourceChannelBackfillJob.__table__)
+    status_default = table.c["status"].default
+    scanned_count_default = table.c["scanned_message_count"].default
+    assert status_default is not None
+    assert scanned_count_default is not None
+    assert cast("Any", status_default).arg is SourceChannelBackfillJobStatus.QUEUED
+    assert cast("Any", scanned_count_default).arg == 0
+    check_constraint_sql = " ".join(
+        str(constraint.sqltext).lower()
+        for constraint in table.constraints
+        if isinstance(constraint, CheckConstraint)
+    )
+    assert "requested_message_count >= 1" in check_constraint_sql
+    assert "requested_message_count <= 50000" in check_constraint_sql
+    assert "scanned_message_count >= 0" in check_constraint_sql
+    assert {index.name for index in table.indexes} == {
+        "ix_source_channel_backfill_jobs_channel_created_id",
+        "ix_source_channel_backfill_jobs_status_locked_created",
+        "uq_source_channel_backfill_jobs_one_active_per_channel",
+    }
+    active_index = next(
+        index
+        for index in table.indexes
+        if index.name == "uq_source_channel_backfill_jobs_one_active_per_channel"
+    )
+    assert active_index.unique is True
+    predicate = active_index.dialect_options["postgresql"]["where"]
+    assert predicate is not None
+    assert "queued" in str(predicate)
+    assert "running" in str(predicate)
 
 
 def test_meme_source_unique_platform_source_post_still_holds() -> None:

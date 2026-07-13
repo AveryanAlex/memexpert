@@ -6,8 +6,10 @@ from io import BytesIO
 from typing import Any, cast
 
 import pytest
+from httpx import Response
 from PIL import Image
 
+import memexpert.core.voyage as voyage_module
 from memexpert.api.dependencies.meme import get_meme_search_service
 from memexpert.core.classification import (
     FakeClassificationClient,
@@ -103,6 +105,18 @@ def test_provider_factories_keep_live_defaults() -> None:
     assert isinstance(voyage_client, PipelineVoyageClient)
     assert isinstance(build_pipeline_classification_client(settings=settings), PipelineClassificationClient)
     assert voyage_client._build_text_request_payload(text="cat query")["input_type"] == "query"
+    assert voyage_client._build_request_payload(image_bytes=b"image", mime_type="image/png")["input_type"] == "document"
+
+
+def test_voyage_provider_error_detail_is_bounded_and_actionable() -> None:
+    response = Response(
+        400,
+        json={"detail": "input_type must be one of query, document, or null"},
+    )
+
+    assert voyage_module._voyage_error_detail(response) == (
+        ": input_type must be one of query, document, or null"
+    )
 
 
 def _png_bytes(color: tuple[int, int, int]) -> bytes:

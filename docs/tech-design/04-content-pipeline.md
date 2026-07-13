@@ -4,7 +4,7 @@
 
 Plugin interface per platform. All crawlers normalize output to a common `RawMeme` dataclass (media bytes, media type, source metadata).
 
-- **Telegram (Telethon):** Long-running userbot sessions that listen to channel updates in real-time via Telethon event handlers. Each channel's `last_read_post_id` is persisted in `SourceChannel`. On startup, the crawler catches up on all messages since `last_read_post_id` per channel, then switches to live listening. While idle, it polls an immutable projection of session/source control fields at the configured cadence; an in-flight reconciliation can delay the next poll. A changed assignment or ingestion policy triggers catch-up before live listeners are rebuilt. Runtime-owned checkpoints, fetch timestamps, heartbeats, and refreshed Telegram metadata are excluded from this projection so normal crawling does not cause reconnect churn. Multiple sessions (2–3) distribute channels for rate limit safety (≤30 req/s per session).
+- **Telegram (Telethon):** Long-running userbot sessions listen to channel updates in real time via Telethon event handlers. Each channel's `last_read_post_id` is persisted in `SourceChannel`. On startup/reconcile, the manager waits until live handlers are registered and then runs bounded catch-up, so posts arriving around the handoff are either queued by the listener or found by the forward sweep. While idle, it polls an immutable projection of session/source control fields at the configured cadence; an in-flight reconciliation can delay the next poll. Runtime-owned checkpoints, fetch timestamps, heartbeats, and refreshed Telegram metadata are excluded from this projection so normal crawling does not cause reconnect churn. Multiple sessions (2–3) distribute channels for rate limit safety (≤30 req/s per session).
 - **Reconciliation completion:** A control snapshot is considered applied only
   after catch-up and listener rebuilding complete without retryable report or
   session failures. Incomplete reconciliation remains pending and is retried on
@@ -54,7 +54,7 @@ quarantine. The frontend calls the human-facing objects **sources** and
 
 `POST /api/v1/admin/telegram/channels/from-reference` accepts a public Telegram
 `reference`, a required selected `telegram_session_id`, optional `suggestion_id`,
-and a bounded `catchup_message_limit` (default 500). It accepts only
+and a bounded `catchup_message_limit` (default 5,000). It accepts only
 `@handle`, bare handle, and one-path `t.me` or `telegram.me` public URLs. Invite
 links, private/non-Telegram references, and paths with query/fragment content
 are rejected. The selected account must be enabled, active, authorized, and
@@ -71,8 +71,8 @@ locks/rechecks the selected account and canonical source identity before writing
 It atomically creates or reuses the source, assigns the selected ready account,
 enables catch-up/live/engagement, and approves a matching pending suggestion in
 the same transaction. The crawler discovers the committed control-state change
-within `CRAWLER_RECONCILE_INTERVAL_SECONDS` (10 seconds by default), runs the
-bounded initial catch-up, and rebuilds its live subscriptions. The HTTP request
+within `CRAWLER_RECONCILE_INTERVAL_SECONDS` (10 seconds by default), rebuilds
+and confirms its live subscriptions, and runs the bounded initial catch-up. The HTTP request
 does not wait for Telegram ingestion. A duplicate/retry reuses the canonical
 source and still converges on the approved suggestion. The manual source endpoint
 `POST /api/v1/admin/source-channels` remains an exception path for a known
@@ -81,6 +81,23 @@ and explicitly rejects Reddit/VK or any other non-Telegram platform. The list
 projection remains platform-extensible for future crawlers. Reddit and VK are
 not crawler implementations yet; their suggestions may be rejected but must
 not create dormant source rows.
+
+Until `initial_catchup_completed` is durable, the adapter repeatedly reads the
+newest bounded window and yields it oldest-to-newest; this prevents a partial
+initial sweep or an early live post from silently switching the source to
+forward-only mode. Later forward catch-up remains contiguous above
+`last_read_post_id`. Older-history pages are processed newest-to-oldest and use a
+separate exclusive cursor, so a mid-page failure resumes without skipping the
+unprocessed suffix and never moves the live high-water mark backward. `source_channel_posts`
+durably inventories every observed message before media handling, including
+unsupported and provider-failed messages. Browser admin joins that ledger to
+`pipeline_ingest_requests`, `pipeline_stage_journal`, and
+`meme_file_sync_target_snapshots`; an item is indexed only when both Qdrant and
+Meilisearch are synced. The Meilisearch adapter waits for asynchronous settings
+and document tasks to finish before recording sync success. Admin message pages
+are filtered by a server-issued observation snapshot to keep offset pagination
+stable while ingestion continues. `source_channel_backfill_jobs` stores bounded
+manual older-history requests and progress so crawler restarts can resume them.
 
 ### Admin media and content workspaces
 
@@ -191,7 +208,12 @@ raw_meme ──→ [API Accept: ingest_request + outbox] ──→ [Outbox Publi
 | `q.sync.meili` | I/O-bound (Meilisearch) | Document sync |
 | `q.seo` | API-bound (PydanticAI provider) | SEO page generation, tag/template assignment (prioritized by popularity) |
 
-Each queue has a configurable prefetch count to control concurrency per worker process.
+Every worker subscriber uses `PIPELINE_WORKER_PREFETCH_COUNT` (default `1`) as
+RabbitMQ consumer QoS. The limit is per queue consumer in each worker process,
+which prevents a backlog from creating unbounded in-flight OCR subprocesses.
+PaddleOCR receives `cpu_threads=1`, and worker images cap OpenMP/OpenBLAS/MKL/
+NumExpr native thread pools at one by default; operators must opt up explicitly
+after sizing the host.
 
 ### Message Schemas
 
@@ -236,11 +258,19 @@ Guest TTL/deletion jobs are intentionally not part of the current product direct
 
 ### OCR Pipeline
 
-PaddleOCR is the live OCR engine for Russian/English meme text. The worker image keeps the main app on Python 3.14, but runs PaddleOCR from a separate Python 3.13 helper venv because PaddlePaddle does not currently publish CPython 3.14 wheels. The helper runs `PaddleOCR(lang="ru", use_doc_orientation_classify=False, use_doc_unwarping=False, use_textline_orientation=False)` and returns JSON across the `PIPELINE_OCR_PADDLE_COMMAND` boundary. `PIPELINE_OCR_PROVIDER_MODE=fake` remains the deterministic CI/E2E path. There is no active Qwen/VLM fallback in this implementation; optional fallback metadata/commands are blank unless a real command is configured.
+PaddleOCR is the live OCR engine for Russian/English meme text. The worker image keeps the main app on Python 3.14, but runs PaddleOCR from a separate Python 3.13 helper venv because PaddlePaddle does not currently publish CPython 3.14 wheels. The helper runs `PaddleOCR(lang="ru", use_doc_orientation_classify=False, use_doc_unwarping=False, use_textline_orientation=False, cpu_threads=1)` and returns JSON across the `PIPELINE_OCR_PADDLE_COMMAND` boundary. `PIPELINE_OCR_PROVIDER_MODE=fake` remains the deterministic CI/E2E path. There is no active Qwen/VLM fallback in this implementation; optional fallback metadata/commands are blank unless a real command is configured.
 
 ### Embedding Pipeline
 
-Voyage AI `voyage-multimodal-3.5` for both image and text embeddings. 1024 dimensions with Matryoshka support (can reduce to 512 later for cost/speed). Embeddings cached in PG — the cache table is the source of truth, Qdrant is a search index.
+Voyage AI `voyage-multimodal-3.5` handles both image and text embeddings. Corpus
+images use the provider retrieval intent `input_type=document`; user search text
+uses `input_type=query` (the field is retrieval intent, not media modality).
+Embeddings are 1024 dimensions with Matryoshka support (can reduce to 512 later
+for cost/speed). Embeddings cached in PG — the cache table is the source of truth,
+Qdrant is a search index. A missing Qdrant collection is treated as an empty
+similarity corpus; the first sync creates a cosine collection with the configured
+embedding dimension and retries its upsert. The first Meilisearch sync likewise
+creates/configures the index before writing the document.
 
 ## Media Storage
 

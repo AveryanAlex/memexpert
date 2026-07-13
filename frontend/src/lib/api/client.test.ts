@@ -6,6 +6,7 @@ import {
   addAdminTelegramChannelFromReference,
   assignAdminTelegramChannel,
   ApiError,
+  backfillAdminSourceChannel,
   completeAdminTelegramPhoneCodeLogin,
   completeAdminTelegramPhonePasswordLogin,
   completeAdminTelegramQrLogin,
@@ -20,6 +21,7 @@ import {
   favoriteMeme,
   fetchAdminMemeTemplates,
   fetchAdminOverview,
+  fetchAdminSourceChannelPosts,
   fetchAdminSeoReviewRows,
   fetchAdminSession,
   fetchAdminTelegramChannelGroups,
@@ -972,7 +974,7 @@ describe('admin API client', () => {
         catchup_enabled: true,
         live_enabled: true,
         engagement_enabled: true,
-        catchup_message_limit: 500,
+        catchup_message_limit: 5000,
         telegram_session_id: null,
         telegram_session_name: null,
         last_read_post_id: null,
@@ -1009,6 +1011,47 @@ describe('admin API client', () => {
     await markSourceChannelDead({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test' }, channelId, channelId);
 
     expect(mockFetch).toHaveBeenCalledOnce();
+  });
+
+  it('loads source post status and queues bounded historical backfill', async () => {
+    const channelId = '33333333-3333-4333-8333-333333333333';
+    const calls: Array<{ method: string; path: string; search: string; body: unknown }> = [];
+    const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      calls.push({
+        method: init?.method ?? 'GET',
+        path: url.pathname,
+        search: url.searchParams.toString(),
+        body: init?.body ? JSON.parse(String(init.body)) : null
+      });
+      if ((init?.method ?? 'GET') === 'GET') {
+        return jsonResponse({
+          source_channel_id: channelId,
+          snapshot_at: '2026-07-13T12:00:00Z',
+          summary: { observed_count: 1, indexed_count: 1, partially_indexed_count: 0, processing_count: 0, failed_count: 0, not_indexable_count: 0 },
+          items: [],
+          total: 1,
+          limit: 50,
+          offset: 100
+        });
+      }
+      return jsonResponse(telegramChannelPayload(channelId, 'session-id'));
+    }) satisfies ApiFetch;
+
+    await fetchAdminSourceChannelPosts(
+      { fetch: mockFetch, baseUrl: 'https://api.memexpert.test' },
+      channelId,
+      { limit: 50, offset: 100, snapshotAt: '2026-07-13T12:00:00Z' }
+    );
+    await backfillAdminSourceChannel(
+      { fetch: mockFetch, baseUrl: 'https://api.memexpert.test', body: { message_limit: 5000 } },
+      channelId
+    );
+
+    expect(calls).toEqual([
+      { method: 'GET', path: `/api/v1/admin/source-channels/${channelId}/posts`, search: 'limit=50&offset=100&snapshot_at=2026-07-13T12%3A00%3A00Z', body: null },
+      { method: 'POST', path: `/api/v1/admin/source-channels/${channelId}/backfill`, search: '', body: { message_limit: 5000 } }
+    ]);
   });
 
   it('uses DB-backed Telegram session and channel admin endpoints', async () => {
@@ -1086,12 +1129,12 @@ describe('admin API client', () => {
     await addAdminTelegramChannel({
       fetch: mockFetch,
       baseUrl: 'https://api.memexpert.test',
-      body: { platform: 'telegram', platform_id: '-1001', title: 'Source', telegram_session_id: sessionId, catchup_enabled: true, live_enabled: true, engagement_enabled: true, catchup_message_limit: 500 }
+      body: { platform: 'telegram', platform_id: '-1001', title: 'Source', telegram_session_id: sessionId, catchup_enabled: true, live_enabled: true, engagement_enabled: true, catchup_message_limit: 5000 }
     });
     await addAdminTelegramChannelFromReference({
       fetch: mockFetch,
       baseUrl: 'https://api.memexpert.test',
-      body: { reference: '@source', telegram_session_id: sessionId, suggestion_id: 'suggestion-id', catchup_message_limit: 500 }
+      body: { reference: '@source', telegram_session_id: sessionId, suggestion_id: 'suggestion-id', catchup_message_limit: 5000 }
     });
     await updateAdminTelegramChannel({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', body: { catchup_enabled: false, live_enabled: true, engagement_enabled: false, catchup_message_limit: 250 } }, channelId);
     await assignAdminTelegramChannel({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', body: { telegram_session_id: sessionId, note: 'move' } }, channelId);
@@ -1129,7 +1172,7 @@ describe('admin API client', () => {
     expect(calls[7].body).toEqual({ attempt_id: 'phone-attempt', password: '2fa-password', note: 'password done' });
     expect(calls[9].body).toEqual({ confirmation: sessionId, note: 'remove' });
     expect(calls[12].body).toMatchObject({ platform: 'telegram', telegram_session_id: sessionId });
-    expect(calls[13].body).toEqual({ reference: '@source', telegram_session_id: sessionId, suggestion_id: 'suggestion-id', catchup_message_limit: 500 });
+    expect(calls[13].body).toEqual({ reference: '@source', telegram_session_id: sessionId, suggestion_id: 'suggestion-id', catchup_message_limit: 5000 });
     expect(calls[15].body).toEqual({ telegram_session_id: sessionId, note: 'move' });
     expect(calls[16].body).toEqual({ note: 'orphan' });
   });
@@ -1708,12 +1751,19 @@ function telegramChannelPayload(id: string, sessionId: string | null) {
     catchup_enabled: sessionId !== null,
     live_enabled: sessionId !== null,
     engagement_enabled: sessionId !== null,
-    catchup_message_limit: 500,
+    catchup_message_limit: 5000,
     telegram_session_id: sessionId,
     telegram_session_name: sessionId === null ? null : 'primary',
     is_orphaned: sessionId === null,
     is_indexable: sessionId !== null,
     last_read_post_id: null,
+    oldest_observed_post_id: null,
+    initial_catchup_completed: false,
+    history_exhausted: false,
+    backfill_status: 'idle',
+    backfill_requested_count: 0,
+    backfill_scanned_count: 0,
+    backfill_error: null,
     last_fetched_at: null,
     operational_status: 'active',
     freshness_status: 'never_fetched',

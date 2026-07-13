@@ -92,7 +92,7 @@
 
     <AdvancedSection title="Advanced settings" description="Change the bounded first catch-up only when this source needs an exception.">
       <FormRow label="Catch-up message limit">
-        <Input name="catchup_message_limit" type="number" min="1" max="10000" value="500" required />
+        <Input name="catchup_message_limit" type="number" min="1" max="10000" value="5000" required />
       </FormRow>
     </AdvancedSection>
 

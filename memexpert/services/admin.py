@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import uuid
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import TYPE_CHECKING
@@ -11,7 +12,7 @@ from typing import TYPE_CHECKING
 from pydantic import SecretStr
 from sqlalchemy import and_, case, delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import aliased, selectinload
 
 from memexpert.core.config import get_settings
 from memexpert.core.perceptual_hashes import perceptual_hash_bit_size
@@ -36,20 +37,32 @@ from memexpert.models.content import (
     MemeTemplate,
     ModerationDecision,
     ModerationReport,
+    PipelineIngestRequest,
     PipelineStageJournal,
     SourceChannel,
+    SourceChannelBackfillJob,
+    SourceChannelPost,
     TelegramAdminAuditLog,
     TelegramFileIdCache,
     TelegramSession,
 )
 from memexpert.models.enums import (
     ChannelSuggestionStatus,
+    ContentPipelineStage,
+    ContentPipelineStageStatus,
     ModerationAction,
     ModerationReportStatus,
+    PipelineIngestRequestStatus,
+    SourceAttachReason,
+    SourceChannelBackfillJobStatus,
+    SourceChannelPostStatus,
     SourcePlatform,
+    SyncTargetKind,
+    SyncTargetStatus,
     TelegramSessionStatus,
 )
 from memexpert.models.user import ChannelSuggestion
+from memexpert.pipeline.constants import ACTIVE_STAGE_STATUSES, STAGE_ORDER
 from memexpert.schemas.admin import (
     AdminBlockedPerceptualHashActionRead,
     AdminBlockedPerceptualHashAuditRead,
@@ -78,9 +91,13 @@ from memexpert.schemas.admin import (
     AdminModerationReportResolveRequest,
     AdminOverviewRead,
     AdminSourceChannelAssignRequest,
+    AdminSourceChannelBackfillRequest,
     AdminSourceChannelCreateRequest,
     AdminSourceChannelMarkDeadRequest,
     AdminSourceChannelOrphanRequest,
+    AdminSourceChannelPostPageRead,
+    AdminSourceChannelPostRead,
+    AdminSourceChannelPostSummaryRead,
     AdminSourceChannelRead,
     AdminSourceChannelUpdateRequest,
     AdminTelegramChannelFromReferenceRequest,
@@ -106,7 +123,7 @@ from memexpert.services.media_render_urls import MediaRenderUrlService
 from memexpert.services.meme_seo import MemeSeoGenerationService
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Sequence
     from datetime import datetime
     from typing import Literal
 
@@ -665,8 +682,16 @@ class AdminService:
                 .order_by(SourceChannel.title.asc())
             )
         ).scalars().all()
+        latest_backfill_jobs = await self._latest_source_channel_backfill_jobs(row.id for row in rows)
         now = utcnow()
-        return [self._source_channel_read(row, now=now) for row in rows]
+        return [
+            self._source_channel_read(
+                row,
+                latest_backfill_job=latest_backfill_jobs.get(row.id),
+                now=now,
+            )
+            for row in rows
+        ]
 
     async def list_telegram_channel_groups(self) -> list[AdminTelegramChannelGroupRead]:
         sessions = (
@@ -680,12 +705,17 @@ class AdminService:
                 .order_by(SourceChannel.title.asc()),
             )
         ).scalars().all()
+        latest_backfill_jobs = await self._latest_source_channel_backfill_jobs(row.id for row in channels)
         counts_by_session = await self._count_source_channels_by_session()
         now = utcnow()
         channels_by_session: dict[uuid.UUID, list[AdminSourceChannelRead]] = {row.id: [] for row in sessions}
         orphaned_channels: list[AdminSourceChannelRead] = []
         for channel in channels:
-            channel_read = self._source_channel_read(channel, now=now)
+            channel_read = self._source_channel_read(
+                channel,
+                latest_backfill_job=latest_backfill_jobs.get(channel.id),
+                now=now,
+            )
             if channel.telegram_session_id is None:
                 orphaned_channels.append(channel_read)
             else:
@@ -771,7 +801,7 @@ class AdminService:
                 f"Source channel {request.platform.value}:{request.platform_id} already exists.",
             ) from exc
         await self.session.refresh(channel)
-        return self._source_channel_read(await self._get_source_channel_for_read(channel.id))
+        return await self._get_source_channel_read(channel.id)
 
     async def add_telegram_channel_from_reference(
         self,
@@ -975,7 +1005,7 @@ class AdminService:
             await self.session.rollback()
             raise
 
-        return self._source_channel_read(await self._get_source_channel_for_read(channel.id))
+        return await self._get_source_channel_read(channel.id)
 
     async def _add_source_channel_no_commit(
         self,
@@ -1046,7 +1076,7 @@ class AdminService:
             note=request.note,
         )
         await self.session.commit()
-        return self._source_channel_read(await self._get_source_channel_for_read(channel.id))
+        return await self._get_source_channel_read(channel.id)
 
     async def orphan_source_channel(
         self,
@@ -1073,7 +1103,7 @@ class AdminService:
             note=request.note,
         )
         await self.session.commit()
-        return self._source_channel_read(await self._get_source_channel_for_read(channel.id))
+        return await self._get_source_channel_read(channel.id)
 
     async def update_source_channel(
         self,
@@ -1106,7 +1136,139 @@ class AdminService:
             note=None,
         )
         await self.session.commit()
-        return self._source_channel_read(await self._get_source_channel_for_read(channel.id))
+        return await self._get_source_channel_read(channel.id)
+
+    async def queue_source_channel_backfill(
+        self,
+        channel_id: uuid.UUID,
+        request: AdminSourceChannelBackfillRequest,
+        *,
+        admin_user_id: uuid.UUID,
+    ) -> AdminSourceChannelRead:
+        """Queue durable older-history work without moving the live checkpoint."""
+
+        channel = await self.session.scalar(
+            select(SourceChannel).where(SourceChannel.id == channel_id).with_for_update(),
+        )
+        if channel is None:
+            raise AdminNotFoundError(f"Source channel {channel_id} does not exist.")
+        if channel.platform is not SourcePlatform.TELEGRAM:
+            raise AdminConflictError("Older-history backfill is currently available only for Telegram sources.")
+        if not channel.is_active or channel.is_paused:
+            state = "removed" if not channel.is_active else "paused"
+            raise AdminConflictError(f"Cannot backfill a {state} source channel.")
+        if channel.telegram_session_id is None:
+            raise AdminConflictError("Assign a ready Telegram account before requesting older history.")
+        telegram_session = await self.session.get(TelegramSession, channel.telegram_session_id)
+        if telegram_session is None:
+            raise AdminConflictError("The assigned Telegram account no longer exists.")
+        _ = self._require_ready_telegram_account(telegram_session)
+        if not telegram_session.catchup_enabled:
+            raise AdminConflictError(
+                "Enable catch-up on the assigned Telegram account before requesting older history.",
+            )
+        if not channel.catchup_enabled:
+            raise AdminConflictError("Enable source catch-up before requesting older history.")
+        if channel.history_exhausted:
+            raise AdminConflictError("Telegram history is already exhausted for this source.")
+        if not channel.initial_catchup_completed or channel.history_cursor_post_id is None:
+            raise AdminConflictError("Wait for the initial latest-message catch-up before requesting older history.")
+
+        active_job = await self.session.scalar(
+            select(SourceChannelBackfillJob)
+            .where(
+                SourceChannelBackfillJob.source_channel_id == channel.id,
+                SourceChannelBackfillJob.status.in_(
+                    (SourceChannelBackfillJobStatus.QUEUED, SourceChannelBackfillJobStatus.RUNNING),
+                ),
+            )
+            .with_for_update()
+            .limit(1),
+        )
+        if active_job is not None:
+            raise AdminConflictError("An older-history backfill is already queued or running for this source.")
+
+        job = SourceChannelBackfillJob(
+            source_channel_id=channel.id,
+            requested_by_admin_user_id=admin_user_id,
+            status=SourceChannelBackfillJobStatus.QUEUED,
+            requested_message_count=request.message_limit,
+            scanned_message_count=0,
+            cursor_post_id=channel.history_cursor_post_id,
+        )
+        self.session.add(job)
+        try:
+            await self.session.flush()
+            self._add_telegram_admin_audit(
+                admin_user_id=admin_user_id,
+                action="channel_backfill_requested",
+                telegram_session_id=channel.telegram_session_id,
+                source_channel_id=channel.id,
+                previous_values=self._source_channel_snapshot(channel),
+                new_values={
+                    **self._source_channel_snapshot(channel),
+                    "backfill_job_id": str(job.id),
+                    "backfill_message_limit": request.message_limit,
+                },
+                note=None,
+            )
+            await self.session.commit()
+        except IntegrityError as exc:
+            await self.session.rollback()
+            raise AdminConflictError("An older-history backfill is already queued or running for this source.") from exc
+        return await self._get_source_channel_read(channel.id)
+
+    async def list_source_channel_posts(
+        self,
+        channel_id: uuid.UUID,
+        *,
+        limit: int,
+        offset: int,
+        snapshot_at: datetime | None = None,
+    ) -> AdminSourceChannelPostPageRead:
+        """Return observed Telegram posts joined to current pipeline and index truth."""
+
+        channel = await self.session.get(SourceChannel, channel_id)
+        if channel is None:
+            raise AdminNotFoundError(f"Source channel {channel_id} does not exist.")
+        current_time = utcnow()
+        observed_through = current_time if snapshot_at is None or snapshot_at > current_time else snapshot_at
+
+        posts = list(
+            (
+                await self.session.execute(
+                    select(SourceChannelPost)
+                    .where(
+                        SourceChannelPost.source_channel_id == channel.id,
+                        SourceChannelPost.created_at <= observed_through,
+                    )
+                    .order_by(
+                        SourceChannelPost.published_at.desc(),
+                        SourceChannelPost.created_at.desc(),
+                        SourceChannelPost.id.desc(),
+                    )
+                    .limit(limit)
+                    .offset(offset),
+                )
+            )
+            .scalars()
+            .all(),
+        )
+        post_reads = await self._source_channel_post_reads(channel, posts)
+        summary = await self._source_channel_post_summary(
+            channel,
+            observed_through=observed_through,
+        )
+
+        return AdminSourceChannelPostPageRead(
+            source_channel_id=channel.id,
+            snapshot_at=observed_through,
+            summary=summary,
+            items=post_reads,
+            total=summary.observed_count,
+            limit=limit,
+            offset=offset,
+        )
 
     async def set_source_channel_paused(
         self,
@@ -1133,7 +1295,7 @@ class AdminService:
                 note=None,
             )
             await self.session.commit()
-        return self._source_channel_read(await self._get_source_channel_for_read(channel.id))
+        return await self._get_source_channel_read(channel.id)
 
     async def mark_source_channel_dead(
         self,
@@ -1163,7 +1325,7 @@ class AdminService:
             note=None,
         )
         await self.session.commit()
-        return self._source_channel_read(await self._get_source_channel_for_read(channel.id))
+        return await self._get_source_channel_read(channel.id)
 
     async def list_meme_templates(self) -> list[AdminMemeTemplateRead]:
         rows = (
@@ -2228,8 +2390,390 @@ class AdminService:
             return
         raise AdminConflictError(f"Unsupported moderation action {action.value}.")
 
+    async def _source_channel_post_summary(
+        self,
+        channel: SourceChannel,
+        *,
+        observed_through: datetime,
+    ) -> AdminSourceChannelPostSummaryRead:
+        """Aggregate index states in SQL so large channels do not load every stage row."""
+
+        qdrant_snapshot = aliased(MemeFileSyncTargetSnapshot)
+        meilisearch_snapshot = aliased(MemeFileSyncTargetSnapshot)
+        qdrant_stage = aliased(PipelineStageJournal)
+        meilisearch_stage = aliased(PipelineStageJournal)
+        file_id = func.coalesce(
+            PipelineIngestRequest.materialized_meme_file_id,
+            PipelineIngestRequest.matched_meme_file_id,
+            MemeSource.file_id,
+        )
+        stage_failed = (
+            select(PipelineStageJournal.id)
+            .where(
+                PipelineStageJournal.meme_file_id == file_id,
+                PipelineStageJournal.status == ContentPipelineStageStatus.FAILED,
+            )
+            .exists()
+        )
+        qdrant_synced = or_(
+            qdrant_snapshot.status == SyncTargetStatus.SYNCED,
+            and_(
+                qdrant_snapshot.id.is_(None),
+                qdrant_stage.status == ContentPipelineStageStatus.SUCCEEDED,
+            ),
+        )
+        meilisearch_synced = or_(
+            meilisearch_snapshot.status == SyncTargetStatus.SYNCED,
+            and_(
+                meilisearch_snapshot.id.is_(None),
+                meilisearch_stage.status == ContentPipelineStageStatus.SUCCEEDED,
+            ),
+        )
+        qdrant_failed = or_(
+            qdrant_snapshot.status == SyncTargetStatus.FAILED,
+            and_(
+                qdrant_snapshot.id.is_(None),
+                qdrant_stage.status == ContentPipelineStageStatus.FAILED,
+            ),
+        )
+        meilisearch_failed = or_(
+            meilisearch_snapshot.status == SyncTargetStatus.FAILED,
+            and_(
+                meilisearch_snapshot.id.is_(None),
+                meilisearch_stage.status == ContentPipelineStageStatus.FAILED,
+            ),
+        )
+        both_synced = and_(qdrant_synced, meilisearch_synced)
+        one_synced = or_(qdrant_synced, meilisearch_synced)
+        not_indexable = or_(
+            SourceChannelPost.status == SourceChannelPostStatus.UNSUPPORTED,
+            PipelineIngestRequest.status == PipelineIngestRequestStatus.FAILED_BLOCKED_PHASH,
+            PipelineIngestRequest.source_attach_reason.in_(
+                (
+                    SourceAttachReason.BLOCKED_SHA256_EXISTING_FILE,
+                    SourceAttachReason.BLOCKED_PERCEPTUAL_HASH_NEW_FILE,
+                ),
+            ),
+        )
+        failed = or_(
+            SourceChannelPost.status == SourceChannelPostStatus.FAILED,
+            PipelineIngestRequest.status.in_(
+                (
+                    PipelineIngestRequestStatus.FAILED_INVALID_MEDIA,
+                    PipelineIngestRequestStatus.PUBLISH_FAILED,
+                ),
+            ),
+            qdrant_failed,
+            meilisearch_failed,
+            stage_failed,
+        )
+        index_status = case(
+            (both_synced, "indexed"),
+            (one_synced, "partially_indexed"),
+            (not_indexable, "not_indexable"),
+            (failed, "failed"),
+            else_="processing",
+        ).label("index_status")
+        classified = (
+            select(index_status)
+            .select_from(SourceChannelPost)
+            .outerjoin(
+                PipelineIngestRequest,
+                and_(
+                    PipelineIngestRequest.source_platform == channel.platform,
+                    PipelineIngestRequest.source_id == channel.platform_id,
+                    PipelineIngestRequest.post_id == SourceChannelPost.post_id,
+                ),
+            )
+            .outerjoin(
+                MemeSource,
+                and_(
+                    MemeSource.platform == channel.platform,
+                    MemeSource.source_id == channel.platform_id,
+                    MemeSource.post_id == SourceChannelPost.post_id,
+                ),
+            )
+            .outerjoin(
+                qdrant_snapshot,
+                and_(
+                    qdrant_snapshot.meme_file_id == file_id,
+                    qdrant_snapshot.sync_target == SyncTargetKind.QDRANT,
+                ),
+            )
+            .outerjoin(
+                meilisearch_snapshot,
+                and_(
+                    meilisearch_snapshot.meme_file_id == file_id,
+                    meilisearch_snapshot.sync_target == SyncTargetKind.MEILISEARCH,
+                ),
+            )
+            .outerjoin(
+                qdrant_stage,
+                and_(
+                    qdrant_stage.meme_file_id == file_id,
+                    qdrant_stage.stage == ContentPipelineStage.SYNC_QDRANT,
+                ),
+            )
+            .outerjoin(
+                meilisearch_stage,
+                and_(
+                    meilisearch_stage.meme_file_id == file_id,
+                    meilisearch_stage.stage == ContentPipelineStage.SYNC_MEILI,
+                ),
+            )
+            .where(
+                SourceChannelPost.source_channel_id == channel.id,
+                SourceChannelPost.created_at <= observed_through,
+            )
+            .subquery()
+        )
+        rows = (
+            await self.session.execute(
+                select(classified.c.index_status, func.count())
+                .group_by(classified.c.index_status),
+            )
+        ).all()
+        counts = {status: count for status, count in rows}
+        return AdminSourceChannelPostSummaryRead(
+            observed_count=sum(counts.values()),
+            indexed_count=counts.get("indexed", 0),
+            partially_indexed_count=counts.get("partially_indexed", 0),
+            processing_count=counts.get("processing", 0),
+            failed_count=counts.get("failed", 0),
+            not_indexable_count=counts.get("not_indexable", 0),
+        )
+
+    async def _source_channel_post_reads(
+        self,
+        channel: SourceChannel,
+        posts: Sequence[SourceChannelPost],
+    ) -> list[AdminSourceChannelPostRead]:
+        if not posts:
+            return []
+
+        post_ids = [post.post_id for post in posts]
+        ingest_requests = list(
+            (
+                await self.session.execute(
+                    select(PipelineIngestRequest).where(
+                        PipelineIngestRequest.source_platform == channel.platform,
+                        PipelineIngestRequest.source_id == channel.platform_id,
+                        PipelineIngestRequest.post_id.in_(post_ids),
+                    ),
+                )
+            )
+            .scalars()
+            .all(),
+        )
+        requests_by_post_id = {request.post_id: request for request in ingest_requests}
+
+        source_rows = list(
+            (
+                await self.session.execute(
+                    select(MemeSource).where(
+                        MemeSource.platform == channel.platform,
+                        MemeSource.source_id == channel.platform_id,
+                        MemeSource.post_id.in_(post_ids),
+                    ),
+                )
+            )
+            .scalars()
+            .all(),
+        )
+        sources_by_post_id = {source.post_id: source for source in source_rows}
+
+        file_id_by_post_id: dict[str, uuid.UUID] = {}
+        for post_id in post_ids:
+            request = requests_by_post_id.get(post_id)
+            source = sources_by_post_id.get(post_id)
+            file_id = None
+            if request is not None:
+                file_id = request.materialized_meme_file_id or request.matched_meme_file_id
+            if file_id is None and source is not None:
+                file_id = source.file_id
+            if file_id is not None:
+                file_id_by_post_id[post_id] = file_id
+
+        file_ids = tuple(dict.fromkeys(file_id_by_post_id.values()))
+        files_by_id = (
+            {
+                row.id: row
+                for row in (
+                    await self.session.execute(select(MemeFile).where(MemeFile.id.in_(file_ids)))
+                )
+                .scalars()
+                .all()
+            }
+            if file_ids
+            else {}
+        )
+        stages_by_file_id: dict[uuid.UUID, list[PipelineStageJournal]] = defaultdict(list)
+        snapshots_by_file_id: dict[uuid.UUID, dict[SyncTargetKind, MemeFileSyncTargetSnapshot]] = defaultdict(dict)
+        if file_ids:
+            for stage in (
+                await self.session.execute(
+                    select(PipelineStageJournal).where(PipelineStageJournal.meme_file_id.in_(file_ids)),
+                )
+            ).scalars():
+                stages_by_file_id[stage.meme_file_id].append(stage)
+            for snapshot in (
+                await self.session.execute(
+                    select(MemeFileSyncTargetSnapshot).where(
+                        MemeFileSyncTargetSnapshot.meme_file_id.in_(file_ids),
+                    ),
+                )
+            ).scalars():
+                snapshots_by_file_id[snapshot.meme_file_id][snapshot.sync_target] = snapshot
+
+        reads: list[AdminSourceChannelPostRead] = []
+        username = (channel.username or "").strip().removeprefix("@")
+        for post in posts:
+            request = requests_by_post_id.get(post.post_id)
+            file_id = file_id_by_post_id.get(post.post_id)
+            entries = sorted(
+                stages_by_file_id.get(file_id, ()),
+                key=lambda entry: STAGE_ORDER.get(entry.stage, 999),
+            )
+            current_stage = self._current_pipeline_stage(entries)
+            target_snapshots = snapshots_by_file_id.get(file_id, {})
+            qdrant_status = self._target_status(
+                target=SyncTargetKind.QDRANT,
+                snapshots=target_snapshots,
+                entries=entries,
+            )
+            meilisearch_status = self._target_status(
+                target=SyncTargetKind.MEILISEARCH,
+                snapshots=target_snapshots,
+                entries=entries,
+            )
+            index_status = self._source_post_index_status(
+                post_status=post.status,
+                ingest_status=None if request is None else request.status,
+                source_attach_reason=None if request is None else request.source_attach_reason,
+                pipeline_status=None if current_stage is None else current_stage.status,
+                qdrant_status=qdrant_status,
+                meilisearch_status=meilisearch_status,
+            )
+            error_parts = [part for part in (post.last_error_code, post.last_error_text) if part]
+            pipeline_error_parts = (
+                []
+                if current_stage is None
+                else [part for part in (current_stage.normalized_reason, current_stage.last_error_text) if part]
+            )
+            meme_file = files_by_id.get(file_id)
+            reads.append(
+                AdminSourceChannelPostRead(
+                    id=post.id,
+                    post_id=post.post_id,
+                    telegram_url=f"https://t.me/{username}/{post.post_id}" if username else None,
+                    published_at=post.published_at,
+                    observed_at=post.created_at,
+                    media_type=post.media_type,
+                    fetch_status=post.status.value,
+                    fetch_detail=" — ".join(error_parts) or None,
+                    ingest_outcome=(
+                        None
+                        if request is None or request.source_attach_reason is None
+                        else request.source_attach_reason.value
+                    ),
+                    ingest_status=None if request is None else request.status,
+                    meme_id=(
+                        request.materialized_meme_id
+                        if request is not None and request.materialized_meme_id is not None
+                        else None if meme_file is None else meme_file.meme_id
+                    ),
+                    meme_file_id=file_id,
+                    pipeline_stage=None if current_stage is None else current_stage.stage,
+                    pipeline_status=None if current_stage is None else current_stage.status,
+                    pipeline_error=" — ".join(pipeline_error_parts) or None,
+                    qdrant_status=qdrant_status,
+                    meilisearch_status=meilisearch_status,
+                    index_status=index_status,
+                ),
+            )
+        return reads
+
     @staticmethod
-    def _source_channel_read(channel: SourceChannel, *, now: datetime | None = None) -> AdminSourceChannelRead:
+    def _current_pipeline_stage(entries: Sequence[PipelineStageJournal]) -> PipelineStageJournal | None:
+        for entry in entries:
+            if entry.status in ACTIVE_STAGE_STATUSES:
+                return entry
+        return entries[-1] if entries else None
+
+    @staticmethod
+    def _target_status(
+        *,
+        target: SyncTargetKind,
+        snapshots: dict[SyncTargetKind, MemeFileSyncTargetSnapshot],
+        entries: Sequence[PipelineStageJournal],
+    ) -> SyncTargetStatus | None:
+        snapshot = snapshots.get(target)
+        if snapshot is not None:
+            return snapshot.status
+        target_stage = (
+            ContentPipelineStage.SYNC_QDRANT
+            if target is SyncTargetKind.QDRANT
+            else ContentPipelineStage.SYNC_MEILI
+        )
+        entry = next((item for item in entries if item.stage is target_stage), None)
+        if entry is None:
+            return None
+        if entry.status is ContentPipelineStageStatus.SUCCEEDED:
+            return SyncTargetStatus.SYNCED
+        if entry.status is ContentPipelineStageStatus.FAILED:
+            return SyncTargetStatus.FAILED
+        if entry.status is ContentPipelineStageStatus.PROCESSING:
+            return SyncTargetStatus.PROCESSING
+        if entry.status is ContentPipelineStageStatus.PENDING:
+            return SyncTargetStatus.PENDING
+        return None
+
+    @staticmethod
+    def _source_post_index_status(
+        *,
+        post_status: SourceChannelPostStatus,
+        ingest_status: PipelineIngestRequestStatus | None,
+        source_attach_reason: SourceAttachReason | None,
+        pipeline_status: ContentPipelineStageStatus | None,
+        qdrant_status: SyncTargetStatus | None,
+        meilisearch_status: SyncTargetStatus | None,
+    ) -> Literal["indexed", "partially_indexed", "processing", "failed", "not_indexable"]:
+        qdrant_synced = qdrant_status is SyncTargetStatus.SYNCED
+        meilisearch_synced = meilisearch_status is SyncTargetStatus.SYNCED
+        if qdrant_synced and meilisearch_synced:
+            return "indexed"
+        if qdrant_synced or meilisearch_synced:
+            return "partially_indexed"
+        if (
+            post_status is SourceChannelPostStatus.UNSUPPORTED
+            or ingest_status is PipelineIngestRequestStatus.FAILED_BLOCKED_PHASH
+            or source_attach_reason
+            in {
+                SourceAttachReason.BLOCKED_SHA256_EXISTING_FILE,
+                SourceAttachReason.BLOCKED_PERCEPTUAL_HASH_NEW_FILE,
+            }
+        ):
+            return "not_indexable"
+        if (
+            post_status is SourceChannelPostStatus.FAILED
+            or ingest_status in {
+                PipelineIngestRequestStatus.FAILED_INVALID_MEDIA,
+                PipelineIngestRequestStatus.PUBLISH_FAILED,
+            }
+            or pipeline_status is ContentPipelineStageStatus.FAILED
+            or qdrant_status is SyncTargetStatus.FAILED
+            or meilisearch_status is SyncTargetStatus.FAILED
+        ):
+            return "failed"
+        return "processing"
+
+    @staticmethod
+    def _source_channel_read(
+        channel: SourceChannel,
+        *,
+        latest_backfill_job: SourceChannelBackfillJob | None = None,
+        now: datetime | None = None,
+    ) -> AdminSourceChannelRead:
         current_time = utcnow() if now is None else now
         operational_status: Literal["active", "inactive", "paused"] = (
             "inactive" if not channel.is_active else "paused" if channel.is_paused else "active"
@@ -2250,6 +2794,17 @@ class AdminService:
             seconds_since_last_fetch = max(0, int((current_time - channel.last_fetched_at).total_seconds()))
             freshness_status = "fresh" if seconds_since_last_fetch <= 24 * 60 * 60 else "stale"
 
+        if latest_backfill_job is None or latest_backfill_job.status is SourceChannelBackfillJobStatus.COMPLETED:
+            backfill_status: Literal["idle", "queued", "running", "failed"] = "idle"
+            backfill_requested_count = 0
+            backfill_scanned_count = 0
+            backfill_error = None
+        else:
+            backfill_status = latest_backfill_job.status.value
+            backfill_requested_count = latest_backfill_job.requested_message_count
+            backfill_scanned_count = latest_backfill_job.scanned_message_count
+            backfill_error = latest_backfill_job.last_error_text
+
         return AdminSourceChannelRead(
             id=channel.id,
             platform=channel.platform,
@@ -2268,12 +2823,27 @@ class AdminService:
             is_orphaned=is_orphaned,
             is_indexable=is_indexable,
             last_read_post_id=channel.last_read_post_id,
+            oldest_observed_post_id=channel.oldest_observed_post_id,
+            initial_catchup_completed=channel.initial_catchup_completed,
+            history_exhausted=channel.history_exhausted,
+            backfill_status=backfill_status,
+            backfill_requested_count=backfill_requested_count,
+            backfill_scanned_count=backfill_scanned_count,
+            backfill_error=backfill_error,
             last_fetched_at=channel.last_fetched_at,
             operational_status=operational_status,
             freshness_status=freshness_status,
             seconds_since_last_fetch=seconds_since_last_fetch,
             created_at=channel.created_at,
             updated_at=channel.updated_at,
+        )
+
+    async def _get_source_channel_read(self, channel_id: uuid.UUID) -> AdminSourceChannelRead:
+        channel = await self._get_source_channel_for_read(channel_id)
+        latest_jobs = await self._latest_source_channel_backfill_jobs((channel.id,))
+        return self._source_channel_read(
+            channel,
+            latest_backfill_job=latest_jobs.get(channel.id),
         )
 
     async def _get_source_channel_for_read(self, channel_id: uuid.UUID) -> SourceChannel:
@@ -2287,6 +2857,39 @@ class AdminService:
         if channel is None:
             raise AdminNotFoundError(f"Source channel {channel_id} does not exist.")
         return channel
+
+    async def _latest_source_channel_backfill_jobs(
+        self,
+        channel_ids: Iterable[uuid.UUID],
+    ) -> dict[uuid.UUID, SourceChannelBackfillJob]:
+        unique_channel_ids = tuple(dict.fromkeys(channel_ids))
+        if not unique_channel_ids:
+            return {}
+
+        ranked_jobs = (
+            select(
+                SourceChannelBackfillJob.id.label("job_id"),
+                func.row_number()
+                .over(
+                    partition_by=SourceChannelBackfillJob.source_channel_id,
+                    order_by=(
+                        SourceChannelBackfillJob.created_at.desc(),
+                        SourceChannelBackfillJob.id.desc(),
+                    ),
+                )
+                .label("job_rank"),
+            )
+            .where(SourceChannelBackfillJob.source_channel_id.in_(unique_channel_ids))
+            .subquery()
+        )
+        jobs = (
+            await self.session.execute(
+                select(SourceChannelBackfillJob)
+                .join(ranked_jobs, ranked_jobs.c.job_id == SourceChannelBackfillJob.id)
+                .where(ranked_jobs.c.job_rank == 1),
+            )
+        ).scalars()
+        return {job.source_channel_id: job for job in jobs}
 
     async def _count_source_channels_by_session(self) -> dict[uuid.UUID, int]:
         rows = (
@@ -2539,6 +3142,9 @@ class AdminService:
             "telegram_session_id": None if channel.telegram_session_id is None else str(channel.telegram_session_id),
             "is_orphaned": channel.telegram_session_id is None,
             "last_read_post_id": channel.last_read_post_id,
+            "oldest_observed_post_id": channel.oldest_observed_post_id,
+            "initial_catchup_completed": channel.initial_catchup_completed,
+            "history_exhausted": channel.history_exhausted,
             "last_fetched_at": None if channel.last_fetched_at is None else channel.last_fetched_at.isoformat(),
         }
 

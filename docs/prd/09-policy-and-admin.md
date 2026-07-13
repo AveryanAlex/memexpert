@@ -74,7 +74,9 @@ attention.
   rechecks this policy; the browser selection is only a convenience.
 - A successful reference add uses safe defaults: source assignment to that
   account plus catch-up, live collection, and engagement enabled; the first
-  catch-up limit defaults to 500 and is bounded in Advanced settings.
+  catch-up takes the latest 5,000 Telegram messages by default and is bounded in
+  Advanced settings. The latest window is processed oldest-to-newest so the live
+  high-water checkpoint remains monotonic.
 - Public Telegram identity is the canonical lowercase username, not an opaque
   Telegram access hash or display title. Telegram handle renames are not tracked
   automatically; reconcile a rename as an operational exception before relying
@@ -91,10 +93,19 @@ attention.
   likewise Telegram-only. The read/list model still carries a platform field so
   future crawler support can be added without a read-contract migration.
 
-Source cards show plain health, last fetched time, and assigned account first.
-Diagnostics exposes technical identifiers/checkpoints; ingestion, assignment,
-and removal remain disclosed. Removing a source stops future crawling while
-preserving checkpoint history.
+Source cards show plain health, last fetched time, assigned account, and a link
+to message indexing. The source detail page lists every observed Telegram
+message, including unsupported and failed fetches, and distinguishes fully
+indexed (Qdrant and Meilisearch), partially indexed, processing, failed, and not
+indexable states. A fixed observation snapshot keeps pagination stable while
+new rows arrive. Operators can queue a bounded older-history catch-up without
+moving the live high-water checkpoint; this supports progressively indexing the
+rest of a large channel after its initial window. Manual history work requires
+the initial window to have completed and catch-up to remain enabled on both the
+source and assigned account. Diagnostics exposes technical
+identifiers/checkpoints; ingestion, assignment, and removal remain disclosed.
+Removing a source stops future crawling while preserving checkpoint and message
+inventory history.
 
 ### Telegram accounts
 
@@ -125,6 +136,6 @@ keys. A full account with the durable admin flag may render a private meme file
 through that proxy; unrelated non-admin users remain unable to discover it. The
 admin request remains a control-plane write and does not synchronously call
 Telegram. An idle crawler polls for committed source/account policy changes at
-the configured reconciliation cadence, performs bounded catch-up for the new
-durable state, and then rebuilds live listeners. An in-flight reconciliation
+the configured reconciliation cadence, rebuilds and confirms live subscriptions,
+then performs bounded catch-up for the new durable state. An in-flight reconciliation
 can delay the next poll.

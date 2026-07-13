@@ -214,7 +214,7 @@ class Settings(BaseSettings):
     # operator inspect surface so drift is visible.
     crawler_freshness_slo_p50_seconds: float = Field(default=60.0, gt=0)
     crawler_freshness_slo_p95_seconds: float = Field(default=180.0, gt=0)
-    crawler_default_catchup_message_limit: int = Field(default=500, gt=0, le=10000)
+    crawler_default_catchup_message_limit: int = Field(default=5000, gt=0, le=10000)
     auth_jwt_secret: SecretStr = SecretStr("memexpert-dev-jwt-secret-with-32-byte-minimum")
     auth_access_token_algorithm: Literal["HS256"] = "HS256"
     # Access tokens are long-lived because revocation is handled by the

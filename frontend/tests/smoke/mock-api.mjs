@@ -244,12 +244,19 @@ const adminSourceSeed = [
     catchup_enabled: true,
     live_enabled: true,
     engagement_enabled: true,
-    catchup_message_limit: 500,
+    catchup_message_limit: 5000,
     telegram_session_id: readyAdminTelegramAccount.id,
     telegram_session_name: readyAdminTelegramAccount.name,
     is_orphaned: false,
     is_indexable: true,
     last_read_post_id: '184',
+    oldest_observed_post_id: '160',
+    initial_catchup_completed: true,
+    history_exhausted: false,
+    backfill_status: 'idle',
+    backfill_requested_count: 0,
+    backfill_scanned_count: 0,
+    backfill_error: null,
     last_fetched_at: '2026-01-01T00:00:00Z',
     operational_status: 'active',
     freshness_status: 'fresh',
@@ -269,12 +276,19 @@ const adminSourceSeed = [
     catchup_enabled: false,
     live_enabled: false,
     engagement_enabled: false,
-    catchup_message_limit: 500,
+    catchup_message_limit: 5000,
     telegram_session_id: null,
     telegram_session_name: null,
     is_orphaned: true,
     is_indexable: false,
     last_read_post_id: null,
+    oldest_observed_post_id: null,
+    initial_catchup_completed: false,
+    history_exhausted: false,
+    backfill_status: 'idle',
+    backfill_requested_count: 0,
+    backfill_scanned_count: 0,
+    backfill_error: null,
     last_fetched_at: null,
     operational_status: 'active',
     freshness_status: 'never_fetched',
@@ -294,12 +308,19 @@ const adminSourceSeed = [
     catchup_enabled: true,
     live_enabled: true,
     engagement_enabled: true,
-    catchup_message_limit: 500,
+    catchup_message_limit: 5000,
     telegram_session_id: readyAdminTelegramAccount.id,
     telegram_session_name: readyAdminTelegramAccount.name,
     is_orphaned: false,
     is_indexable: true,
     last_read_post_id: '18',
+    oldest_observed_post_id: '4',
+    initial_catchup_completed: true,
+    history_exhausted: false,
+    backfill_status: 'failed',
+    backfill_requested_count: 5000,
+    backfill_scanned_count: 121,
+    backfill_error: 'Telegram temporarily refused the history request.',
     last_fetched_at: '2025-12-25T00:00:00Z',
     operational_status: 'active',
     freshness_status: 'stale',
@@ -309,6 +330,109 @@ const adminSourceSeed = [
   }
 ];
 const adminSourceStateBySession = new Map();
+
+const adminSourcePosts = [
+  {
+    id: 'source-post-indexed',
+    post_id: '184',
+    telegram_url: 'https://t.me/daily_cats/184',
+    published_at: '2026-01-01T00:00:00Z',
+    observed_at: '2026-01-01T00:00:10Z',
+    media_type: 'image',
+    fetch_status: 'accepted',
+    fetch_detail: null,
+    ingest_outcome: 'ingested',
+    ingest_status: 'materialized',
+    meme_id: adminIds.meme,
+    meme_file_id: adminIds.mediaFile,
+    pipeline_stage: 'sync_meili',
+    pipeline_status: 'succeeded',
+    pipeline_error: null,
+    qdrant_status: 'synced',
+    meilisearch_status: 'synced',
+    index_status: 'indexed'
+  },
+  {
+    id: 'source-post-partial',
+    post_id: '183',
+    telegram_url: 'https://t.me/daily_cats/183',
+    published_at: '2025-12-31T23:00:00Z',
+    observed_at: '2026-01-01T00:00:11Z',
+    media_type: 'video',
+    fetch_status: 'accepted',
+    fetch_detail: null,
+    ingest_outcome: 'ingested',
+    ingest_status: 'materialized',
+    meme_id: adminIds.meme,
+    meme_file_id: adminIds.mediaFile,
+    pipeline_stage: 'sync_meili',
+    pipeline_status: 'processing',
+    pipeline_error: null,
+    qdrant_status: 'synced',
+    meilisearch_status: 'processing',
+    index_status: 'partially_indexed'
+  },
+  {
+    id: 'source-post-processing',
+    post_id: '182',
+    telegram_url: 'https://t.me/daily_cats/182',
+    published_at: '2025-12-31T22:00:00Z',
+    observed_at: '2026-01-01T00:00:12Z',
+    media_type: 'image',
+    fetch_status: 'accepted',
+    fetch_detail: null,
+    ingest_outcome: 'ingested',
+    ingest_status: 'media_inspecting',
+    meme_id: null,
+    meme_file_id: null,
+    pipeline_stage: null,
+    pipeline_status: null,
+    pipeline_error: null,
+    qdrant_status: null,
+    meilisearch_status: null,
+    index_status: 'processing'
+  },
+  {
+    id: 'source-post-failed',
+    post_id: '181',
+    telegram_url: 'https://t.me/daily_cats/181',
+    published_at: '2025-12-31T21:00:00Z',
+    observed_at: '2026-01-01T00:00:13Z',
+    media_type: 'image',
+    fetch_status: 'accepted',
+    fetch_detail: null,
+    ingest_outcome: 'ingested',
+    ingest_status: 'materialized',
+    meme_id: adminIds.meme,
+    meme_file_id: adminIds.mediaFile,
+    pipeline_stage: 'embed',
+    pipeline_status: 'failed',
+    pipeline_error: 'Embedding provider unavailable.',
+    qdrant_status: 'failed',
+    meilisearch_status: 'pending',
+    index_status: 'failed'
+  },
+  {
+    id: 'source-post-skipped',
+    post_id: '180',
+    telegram_url: 'https://t.me/daily_cats/180',
+    published_at: '2025-12-31T20:00:00Z',
+    observed_at: '2026-01-01T00:00:14Z',
+    media_type: 'text',
+    fetch_status: 'unsupported',
+    fetch_detail: 'The message has no supported meme media.',
+    ingest_outcome: 'skipped_unsupported_media',
+    ingest_status: null,
+    meme_id: null,
+    meme_file_id: null,
+    pipeline_stage: null,
+    pipeline_status: null,
+    pipeline_error: null,
+    qdrant_status: null,
+    meilisearch_status: null,
+    index_status: 'not_indexable'
+  }
+];
 
 const adminSuggestions = [
   {
@@ -620,6 +744,29 @@ async function handleAdminApi(request, response, url, adminSources) {
     sendJson(response, 200, adminSources);
     return true;
   }
+  const sourcePostsMatch = method === 'GET'
+    ? pathname.match(/^\/api\/v1\/admin\/source-channels\/([^/]+)\/posts$/)
+    : null;
+  if (sourcePostsMatch) {
+    const source = adminSources.find((candidate) => candidate.id === sourcePostsMatch[1]);
+    if (!source) {
+      sendJson(response, 404, { detail: 'Smoke source was not found.' });
+      return true;
+    }
+    const allItems = source.id === adminIds.healthySource ? adminSourcePosts : [];
+    const limit = Math.max(1, Math.min(200, Number(url.searchParams.get('limit') ?? 50)));
+    const offset = Math.max(0, Number(url.searchParams.get('offset') ?? 0));
+    sendJson(response, 200, {
+      source_channel_id: source.id,
+      snapshot_at: url.searchParams.get('snapshot_at') ?? new Date().toISOString(),
+      summary: sourcePostSummary(allItems),
+      items: allItems.slice(offset, offset + limit),
+      total: allItems.length,
+      limit,
+      offset
+    });
+    return true;
+  }
   if (method === 'GET' && pathname === '/api/v1/admin/telegram/sessions') {
     sendJson(response, 200, adminTelegramAccounts);
     return true;
@@ -684,6 +831,33 @@ async function handleAdminApi(request, response, url, adminSources) {
     return true;
   }
 
+  const backfillMatch = method === 'POST'
+    ? pathname.match(/^\/api\/v1\/admin\/source-channels\/([^/]+)\/backfill$/)
+    : null;
+  if (backfillMatch) {
+    const source = adminSources.find((candidate) => candidate.id === backfillMatch[1]);
+    if (!source) {
+      sendJson(response, 404, { detail: 'Smoke source was not found.' });
+      return true;
+    }
+    const body = await readRequestJson(request);
+    const messageLimit = body && typeof body === 'object' && !Array.isArray(body) ? body.message_limit : null;
+    if (!Number.isInteger(messageLimit) || messageLimit < 1 || messageLimit > 50_000) {
+      sendJson(response, 422, { detail: 'message_limit must be between 1 and 50000.' });
+      return true;
+    }
+    Object.assign(source, {
+      backfill_status: 'queued',
+      backfill_requested_count: messageLimit,
+      backfill_scanned_count: 0,
+      backfill_error: null,
+      history_exhausted: false,
+      updated_at: new Date().toISOString()
+    });
+    sendJson(response, 202, source);
+    return true;
+  }
+
   const pauseMatch = method === 'POST'
     ? pathname.match(/^\/api\/v1\/admin\/source-channels\/([^/]+)\/pause$/)
     : null;
@@ -711,7 +885,7 @@ function validateQuickAddRequest(body) {
   if (body.telegram_session_id !== readyAdminTelegramAccount.id) {
     return { error: 'Quick add must select the ready Telegram account.' };
   }
-  if (body.catchup_message_limit !== 500) {
+  if (body.catchup_message_limit !== 5000) {
     return { error: 'Quick add must use the default catch-up limit.' };
   }
   if (body.suggestion_id !== null && body.suggestion_id !== undefined && body.suggestion_id !== adminIds.telegramSuggestion) {
@@ -751,12 +925,19 @@ function upsertQuickAddedSource(adminSources, username) {
     catchup_enabled: true,
     live_enabled: true,
     engagement_enabled: true,
-    catchup_message_limit: 500,
+    catchup_message_limit: 5000,
     telegram_session_id: readyAdminTelegramAccount.id,
     telegram_session_name: readyAdminTelegramAccount.name,
     is_orphaned: false,
     is_indexable: true,
     last_read_post_id: null,
+    oldest_observed_post_id: null,
+    initial_catchup_completed: false,
+    history_exhausted: false,
+    backfill_status: 'idle',
+    backfill_requested_count: 0,
+    backfill_scanned_count: 0,
+    backfill_error: null,
     last_fetched_at: null,
     operational_status: 'active',
     freshness_status: 'never_fetched',
@@ -774,7 +955,7 @@ function upsertQuickAddedSource(adminSources, username) {
     catchup_enabled: true,
     live_enabled: true,
     engagement_enabled: true,
-    catchup_message_limit: 500,
+    catchup_message_limit: 5000,
     telegram_session_id: readyAdminTelegramAccount.id,
     telegram_session_name: readyAdminTelegramAccount.name,
     is_orphaned: false,
@@ -783,6 +964,17 @@ function upsertQuickAddedSource(adminSources, username) {
     updated_at: now
   });
   return source;
+}
+
+function sourcePostSummary(items) {
+  return {
+    observed_count: items.length,
+    indexed_count: items.filter((item) => item.index_status === 'indexed').length,
+    partially_indexed_count: items.filter((item) => item.index_status === 'partially_indexed').length,
+    processing_count: items.filter((item) => item.index_status === 'processing').length,
+    failed_count: items.filter((item) => item.index_status === 'failed').length,
+    not_indexable_count: items.filter((item) => item.index_status === 'not_indexable').length
+  };
 }
 
 function sendJson(response, status, payload, headers = {}) {

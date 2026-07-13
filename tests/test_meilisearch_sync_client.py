@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -11,6 +12,8 @@ import pytest
 
 from memexpert.core.meilisearch import (
     MEILISEARCH_FILTERABLE_ATTRIBUTES,
+    MeilisearchSyncMalformedResponseError,
+    MeilisearchSyncTimeoutError,
     PipelineMeilisearchDocument,
     PipelineMeilisearchSyncClient,
     _build_document_payload,
@@ -28,13 +31,15 @@ class FakeMeiliIndex:
         self.delete_document_calls: list[str] = []
         self.search_calls: list[dict[str, object]] = []
         self.filterable_attribute_updates: list[list[str]] = []
+        self.document_updates: list[tuple[list[dict[str, object]], str]] = []
 
     async def get_document(self, document_id: str) -> dict[str, object]:
         self.get_document_calls.append(document_id)
         return {"id": document_id, "meme_id": str(uuid.uuid4()), "tags": ["e2e-prd"]}
 
-    async def delete_document(self, document_id: str) -> None:
+    async def delete_document(self, document_id: str) -> dict[str, object]:
         self.delete_document_calls.append(document_id)
+        return {"taskUid": 3}
 
     async def search(self, query: str, *, limit: int = 20, filter: str | None = None) -> dict[str, object]:
         self.search_calls.append({"query": query, "limit": limit, "filter": filter})
@@ -45,15 +50,45 @@ class FakeMeiliIndex:
         self.filterable_attribute_updates.append(list(body))
         return {"taskUid": 1}
 
+    async def update_documents(
+        self,
+        documents: list[dict[str, object]],
+        *,
+        primary_key: str,
+    ) -> dict[str, object]:
+        self.document_updates.append((documents, primary_key))
+        return {"taskUid": 2}
+
 
 class FakeMeiliClient:
     def __init__(self, index: FakeMeiliIndex) -> None:
         self.index = index
         self.get_or_create_calls: list[dict[str, object]] = []
+        self.wait_for_task_calls: list[dict[str, object]] = []
+        self.wait_results: dict[int, dict[str, object]] = {}
+        self.wait_error: BaseException | None = None
 
     async def get_or_create_index(self, uid: str, *, primary_key: str) -> FakeMeiliIndex:
         self.get_or_create_calls.append({"uid": uid, "primary_key": primary_key})
         return self.index
+
+    async def wait_for_task(
+        self,
+        task_uid: int,
+        *,
+        timeout_in_ms: int,
+        raise_for_status: bool,
+    ) -> dict[str, object]:
+        self.wait_for_task_calls.append(
+            {
+                "task_uid": task_uid,
+                "timeout_in_ms": timeout_in_ms,
+                "raise_for_status": raise_for_status,
+            }
+        )
+        if self.wait_error is not None:
+            raise self.wait_error
+        return self.wait_results.get(task_uid, {"uid": task_uid, "status": "succeeded"})
 
 
 def build_client(index: FakeMeiliIndex) -> PipelineMeilisearchSyncClient:
@@ -64,8 +99,41 @@ def build_client(index: FakeMeiliIndex) -> PipelineMeilisearchSyncClient:
         pipeline_meilisearch_timeout_seconds=1,
     )
     client = PipelineMeilisearchSyncClient(settings=cast("Settings", settings))
+    client._client = FakeMeiliClient(index)
     client._index = index
+    client._index_ready = True
     return client
+
+
+def _build_test_document() -> PipelineMeilisearchDocument:
+    return PipelineMeilisearchDocument(
+        id=uuid.uuid4().hex,
+        meme_id=str(uuid.uuid4()),
+        meme_file_id=str(uuid.uuid4()),
+        search_index_algorithm_version="test-v1",
+        is_public=True,
+        author_user_id=None,
+        media_type="image",
+        language="en",
+        is_nsfw=False,
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+        tags=[],
+        seo_page_slug=None,
+        template_id=None,
+        template_slug=None,
+        popularity_score=0.0,
+        like_count=0,
+        collection_ids=[],
+        public_collection_ids=[],
+        unlisted_collection_ids=[],
+        private_collection_ids=[],
+        shared_collection_ids=[],
+        collection_owner_user_ids=[],
+        collection_member_user_ids=[],
+        ocr_text=None,
+        quality_score=None,
+    )
 
 
 @pytest.mark.asyncio
@@ -86,10 +154,14 @@ async def test_delete_document_uses_meme_file_uuid_hex_document_id() -> None:
     meme_file_id = uuid.uuid4()
     index = FakeMeiliIndex()
     client = build_client(index)
+    fake_client = cast("FakeMeiliClient", client._client)
 
     await client.delete_document(meme_file_id)
 
     assert index.delete_document_calls == [meme_file_id.hex]
+    assert fake_client.wait_for_task_calls == [
+        {"task_uid": 3, "timeout_in_ms": 1000, "raise_for_status": False}
+    ]
 
 
 @pytest.mark.asyncio
@@ -128,11 +200,130 @@ async def test_ensure_index_configures_filterable_attributes() -> None:
     fake_client = FakeMeiliClient(index)
     client._client = fake_client
     client._index = None
+    client._index_ready = False
 
     await client.ensure_index()
 
     assert fake_client.get_or_create_calls == [{"uid": "memes-test", "primary_key": "id"}]
     assert index.filterable_attribute_updates == [list(MEILISEARCH_FILTERABLE_ATTRIBUTES)]
+    assert fake_client.wait_for_task_calls == [
+        {"task_uid": 1, "timeout_in_ms": 1000, "raise_for_status": False}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_first_upsert_creates_and_configures_missing_index() -> None:
+    index = FakeMeiliIndex()
+    client = build_client(index)
+    fake_client = FakeMeiliClient(index)
+    client._client = fake_client
+    client._index = None
+    client._index_ready = False
+    document = PipelineMeilisearchDocument(
+        id=uuid.uuid4().hex,
+        meme_id=str(uuid.uuid4()),
+        meme_file_id=str(uuid.uuid4()),
+        search_index_algorithm_version="test-v1",
+        is_public=True,
+        author_user_id=None,
+        media_type="image",
+        language="en",
+        is_nsfw=False,
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+        tags=[],
+        seo_page_slug=None,
+        template_id=None,
+        template_slug=None,
+        popularity_score=0.0,
+        like_count=0,
+        collection_ids=[],
+        public_collection_ids=[],
+        unlisted_collection_ids=[],
+        private_collection_ids=[],
+        shared_collection_ids=[],
+        collection_owner_user_ids=[],
+        collection_member_user_ids=[],
+        ocr_text=None,
+        quality_score=None,
+    )
+
+    await client.upsert_document(document)
+
+    assert fake_client.get_or_create_calls == [{"uid": "memes-test", "primary_key": "id"}]
+    assert index.filterable_attribute_updates == [list(MEILISEARCH_FILTERABLE_ATTRIBUTES)]
+    assert len(index.document_updates) == 1
+    assert index.document_updates[0][1] == "id"
+    assert fake_client.wait_for_task_calls == [
+        {"task_uid": 1, "timeout_in_ms": 1000, "raise_for_status": False},
+        {"task_uid": 2, "timeout_in_ms": 1000, "raise_for_status": False},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_upsert_waits_for_task_failure_and_preserves_actionable_detail() -> None:
+    index = FakeMeiliIndex()
+    client = build_client(index)
+    fake_client = cast("FakeMeiliClient", client._client)
+    fake_client.wait_results[2] = {
+        "uid": 2,
+        "status": "failed",
+        "error": {"message": "invalid primary key"},
+    }
+
+    with pytest.raises(MeilisearchSyncMalformedResponseError, match="invalid primary key"):
+        await client.upsert_document(_build_test_document())
+
+
+@pytest.mark.asyncio
+async def test_upsert_wait_timeout_maps_to_sync_timeout() -> None:
+    index = FakeMeiliIndex()
+    client = build_client(index)
+    fake_client = cast("FakeMeiliClient", client._client)
+    fake_client.wait_error = TimeoutError("task wait timed out")
+
+    with pytest.raises(MeilisearchSyncTimeoutError, match="task wait timed out"):
+        await client.upsert_document(_build_test_document())
+
+
+@pytest.mark.asyncio
+async def test_upsert_rejects_missing_task_identifier_as_malformed() -> None:
+    class _MissingTaskIndex(FakeMeiliIndex):
+        async def update_documents(
+            self,
+            documents: list[dict[str, object]],
+            *,
+            primary_key: str,
+        ) -> dict[str, object]:
+            self.document_updates.append((documents, primary_key))
+            return {}
+
+    client = build_client(_MissingTaskIndex())
+
+    with pytest.raises(MeilisearchSyncMalformedResponseError, match="valid task identifier"):
+        await client.upsert_document(_build_test_document())
+
+
+@pytest.mark.asyncio
+async def test_ensure_index_creation_is_bounded_by_configured_timeout() -> None:
+    class _HangingMeiliClient(FakeMeiliClient):
+        async def get_or_create_index(self, uid: str, *, primary_key: str) -> FakeMeiliIndex:
+            self.get_or_create_calls.append({"uid": uid, "primary_key": primary_key})
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    index = FakeMeiliIndex()
+    settings = SimpleNamespace(
+        meilisearch_master_key="test-key",
+        meilisearch_url="http://meili.test",
+        pipeline_meilisearch_index_name="memes-test",
+        pipeline_meilisearch_timeout_seconds=0.01,
+    )
+    client = PipelineMeilisearchSyncClient(settings=cast("Settings", settings))
+    client._client = _HangingMeiliClient(index)
+
+    with pytest.raises(MeilisearchSyncTimeoutError):
+        await client.ensure_index()
 
 
 def test_meilisearch_document_serializer_and_preview_include_collection_metadata() -> None:

@@ -11,8 +11,10 @@ import type {
   AdminModerationDecisionRead,
   AdminModerationReportRead,
   AdminOverviewRead,
+  AdminSourceBackfillPayload,
   AdminSessionRead,
   AdminSourceChannelRead,
+  AdminSourcePostPageRead,
   AdminTelegramChannelAssignPayload,
   AdminTelegramChannelCreatePayload,
   AdminTelegramChannelFromReferencePayload,
@@ -529,6 +531,31 @@ export async function fetchAdminChannelSuggestions(request: CatalogRequest): Pro
 
 export async function fetchAdminSourceChannels(request: CatalogRequest): Promise<AdminSourceChannelRead[]> {
   return apiGet<AdminSourceChannelRead[]>('/api/v1/admin/source-channels', new URLSearchParams(), request);
+}
+
+export async function fetchAdminSourceChannelPosts(
+  request: CatalogRequest,
+  channelId: string,
+  pagination: { limit: number; offset: number; snapshotAt?: string | null }
+): Promise<AdminSourcePostPageRead> {
+  const params = new URLSearchParams({ limit: String(pagination.limit), offset: String(pagination.offset) });
+  if (pagination.snapshotAt) params.set('snapshot_at', pagination.snapshotAt);
+  return apiGet<AdminSourcePostPageRead>(
+    `/api/v1/admin/source-channels/${encodeURIComponent(channelId)}/posts`,
+    params,
+    request
+  );
+}
+
+export async function backfillAdminSourceChannel(
+  request: CatalogRequest & { body: AdminSourceBackfillPayload },
+  channelId: string
+): Promise<AdminSourceChannelRead> {
+  return apiWrite<AdminSourceChannelRead>(
+    `/api/v1/admin/source-channels/${encodeURIComponent(channelId)}/backfill`,
+    'POST',
+    request
+  );
 }
 
 export async function fetchAdminBlockedPerceptualHashes(

@@ -18,6 +18,7 @@ from memexpert.core.config import Settings, get_settings
 # lookups can reconstruct the vector without JSON parsing overhead.
 _FLOAT32_ARRAY_TYPE_CODE = "f"
 _FLOAT32_BYTE_WIDTH = 4
+_MAX_PROVIDER_ERROR_DETAIL_LENGTH = 500
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,12 +142,14 @@ class PipelineVoyageClient:
             raise VoyageProviderUnavailableError(f"Voyage provider unavailable: {exc}") from exc
 
         if response.status_code >= 500:
+            detail = _voyage_error_detail(response)
             raise VoyageProviderUnavailableError(
-                f"Voyage provider returned upstream error {response.status_code}.",
+                f"Voyage provider returned upstream error {response.status_code}{detail}.",
             )
         if response.status_code >= 400:
+            detail = _voyage_error_detail(response)
             raise VoyageProviderUnavailableError(
-                f"Voyage provider rejected the embedding request with status {response.status_code}.",
+                f"Voyage provider rejected the embedding request with status {response.status_code}{detail}.",
             )
 
         try:
@@ -172,7 +175,9 @@ class PipelineVoyageClient:
         return {
             "model": self._settings.pipeline_voyage_model,
             "output_dimension": self._settings.pipeline_voyage_output_dimensions,
-            "input_type": "image",
+            # Voyage uses retrieval intent here, not the media modality. Meme
+            # images are corpus documents; text search embeds use ``query``.
+            "input_type": "document",
             "inputs": [
                 {
                     "content": [
@@ -267,6 +272,27 @@ def build_voyage_text_input_hash(text: str) -> str:
     """Return the deterministic SHA-256 key used for cached text query embeddings."""
 
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _voyage_error_detail(response: httpx.Response) -> str:
+    """Return a bounded provider error suffix without exposing request headers."""
+
+    candidate: object
+    try:
+        payload = response.json()
+    except ValueError:
+        candidate = response.text
+    else:
+        candidate = payload
+        if isinstance(payload, dict):
+            candidate = payload.get("detail") or payload.get("message") or payload.get("error") or ""
+            if isinstance(candidate, dict):
+                candidate = candidate.get("message") or candidate.get("detail") or candidate
+    normalized = " ".join(str(candidate).split())
+    if not normalized:
+        return ""
+    bounded = normalized[:_MAX_PROVIDER_ERROR_DETAIL_LENGTH]
+    return f": {bounded}"
 
 
 def _detect_fake_text_marker(text: str) -> _FakeMarker:

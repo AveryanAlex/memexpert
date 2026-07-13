@@ -35,10 +35,16 @@ from memexpert.models.content import (
     PipelineIngestRequest,
     RabbitMQOutboxMessage,
     SourceChannel,
+    SourceChannelPost,
     TelegramSession,
 )
-from memexpert.models.enums import SourcePlatform, TelegramSessionStatus
-from memexpert.schemas.content_pipeline import CrawlerForwardAttribution, CrawlerIngestOutcome
+from memexpert.models.enums import SourceChannelPostStatus, SourcePlatform, TelegramSessionStatus
+from memexpert.schemas.content_pipeline import (
+    CrawlerForwardAttribution,
+    CrawlerIngestOutcome,
+    CrawlerIngestResult,
+    RawCrawlerPost,
+)
 from memexpert.services import CrawlerSessionNotRunnableError
 from tests.integration.test_ingest_accept_service import FakeStorageClient
 
@@ -144,6 +150,7 @@ async def _seed_curated_channel(
         engagement_enabled=engagement_enabled,
         telegram_session_id=telegram_session_id,
         last_read_post_id=last_read_post_id,
+        initial_catchup_completed=last_read_post_id is not None,
     )
     session.add(channel)
     await session.commit()
@@ -242,7 +249,10 @@ async def test_catch_up_channel_ingests_and_counts_mixed_media(
     assert report.channel_id == "curated_channel"
 
     await migrated_db_session.refresh(channel)
-    assert channel.last_read_post_id == "4"
+    assert channel.last_read_post_id == "5"
+    assert channel.oldest_observed_post_id == "1"
+    assert channel.history_cursor_post_id == "1"
+    assert channel.initial_catchup_completed is True
     assert channel.last_fetched_at is not None
     # Channel metadata refresh should have updated subscriber_count from
     # the fake resolve_channel response.
@@ -251,6 +261,21 @@ async def test_catch_up_channel_ingests_and_counts_mixed_media(
     assert await migrated_db_session.scalar(select(func.count()).select_from(PipelineIngestRequest)) == 4
     assert await migrated_db_session.scalar(select(func.count()).select_from(RabbitMQOutboxMessage)) == 4
     assert await migrated_db_session.scalar(select(func.count()).select_from(MemeFile)) == 0
+    post_rows = (
+        await migrated_db_session.execute(
+            select(SourceChannelPost)
+            .where(SourceChannelPost.source_channel_id == channel.id)
+            .order_by(SourceChannelPost.published_at.asc()),
+        )
+    ).scalars().all()
+    assert [row.post_id for row in post_rows] == ["1", "2", "3", "4", "5"]
+    assert [row.status for row in post_rows] == [
+        SourceChannelPostStatus.ACCEPTED,
+        SourceChannelPostStatus.ACCEPTED,
+        SourceChannelPostStatus.ACCEPTED,
+        SourceChannelPostStatus.ACCEPTED,
+        SourceChannelPostStatus.UNSUPPORTED,
+    ]
 
 
 async def test_catch_up_channel_records_successful_empty_poll(
@@ -281,6 +306,74 @@ async def test_catch_up_channel_records_successful_empty_poll(
     await migrated_db_session.refresh(channel)
     assert channel.last_read_post_id is None
     assert channel.last_fetched_at is not None
+    assert channel.initial_catchup_completed is True
+    assert channel.history_exhausted is True
+
+
+async def test_catch_up_channel_inserts_messages_after_an_existing_inventory_snapshot(
+    migrated_db_session: AsyncSession,
+) -> None:
+    await _seed_active_session(migrated_db_session, session_name="primary")
+    channel = await _seed_curated_channel(
+        migrated_db_session,
+        platform_id="snapshot_channel",
+    )
+    stream_started = asyncio.Event()
+    release_message = asyncio.Event()
+    message = _build_unsupported_message(
+        message_id="1",
+        channel_id="snapshot_channel",
+    )
+
+    class _SnapshotPausedClient(FakeTelegramClient):
+        async def iter_latest_channel_messages(
+            self,
+            *,
+            channel_id: str,
+            limit: int,
+        ) -> AsyncIterator[RawTelegramMessage]:
+            stream_started.set()
+            await release_message.wait()
+            async for raw_message in super().iter_latest_channel_messages(
+                channel_id=channel_id,
+                limit=limit,
+            ):
+                yield raw_message
+
+    runtime = _build_runtime(
+        migrated_db_session,
+        telegram_client=_SnapshotPausedClient(
+            canned_messages={"snapshot_channel": [message]},
+        ),
+    )
+    catchup_task = asyncio.create_task(runtime.catch_up_channel("primary", "snapshot_channel"))
+    await asyncio.wait_for(stream_started.wait(), timeout=_LIVE_LISTENER_TEST_TIMEOUT_SECONDS)
+    await asyncio.sleep(0.001)
+    snapshot_at = _now()
+    release_message.set()
+
+    report = await catchup_task
+
+    assert report.messages_scanned == 1
+    post = await migrated_db_session.scalar(
+        select(SourceChannelPost).where(
+            SourceChannelPost.source_channel_id == channel.id,
+            SourceChannelPost.post_id == "1",
+        ),
+    )
+    assert post is not None
+    assert post.created_at > snapshot_at
+    assert (
+        await migrated_db_session.scalar(
+            select(func.count())
+            .select_from(SourceChannelPost)
+            .where(
+                SourceChannelPost.source_channel_id == channel.id,
+                SourceChannelPost.created_at <= snapshot_at,
+            ),
+        )
+        == 0
+    )
 
 
 async def test_catch_up_channel_respects_catchup_message_limit(
@@ -309,7 +402,312 @@ async def test_catch_up_channel_respects_catchup_message_limit(
     assert report.messages_ingested == 3
     assert report.messages_skipped_dedup == 0
     await migrated_db_session.refresh(channel)
-    assert channel.last_read_post_id == "3"
+    assert channel.last_read_post_id == "10"
+    assert channel.oldest_observed_post_id == "8"
+    assert channel.history_cursor_post_id == "8"
+    assert channel.initial_catchup_completed is True
+    request_post_ids = set(
+        (
+            await migrated_db_session.execute(
+                select(PipelineIngestRequest.post_id).where(PipelineIngestRequest.source_id == "limited_channel"),
+            )
+        ).scalars()
+    )
+    assert request_post_ids == {"8", "9", "10"}
+
+
+async def test_initial_latest_window_closes_forward_gap_before_returning(
+    migrated_db_session: AsyncSession,
+) -> None:
+    await _seed_active_session(migrated_db_session, session_name="primary")
+    channel = await _seed_curated_channel(
+        migrated_db_session,
+        platform_id="gap_channel",
+        catchup_message_limit=3,
+    )
+    initial_messages = [_build_photo_message(message_id=str(i), channel_id="gap_channel") for i in range(1, 6)]
+    new_messages = [_build_photo_message(message_id=str(i), channel_id="gap_channel") for i in range(6, 8)]
+
+    class _MessagesArriveDuringInitialWindow(FakeTelegramClient):
+        async def iter_latest_channel_messages(
+            self,
+            *,
+            channel_id: str,
+            limit: int,
+        ) -> AsyncIterator[RawTelegramMessage]:
+            async for message in super().iter_latest_channel_messages(channel_id=channel_id, limit=limit):
+                yield message
+            self.canned_messages[channel_id].extend(new_messages)
+
+    all_messages = [*initial_messages, *new_messages]
+    fake = _MessagesArriveDuringInitialWindow(
+        canned_messages={"gap_channel": initial_messages.copy()},
+        media_by_message={message.message_id: b"img" for message in all_messages},
+    )
+    runtime = _build_runtime(migrated_db_session, telegram_client=fake)
+
+    report = await runtime.catch_up_channel("primary", "gap_channel")
+
+    await migrated_db_session.refresh(channel)
+    assert report.messages_scanned == 5
+    assert channel.last_read_post_id == "7"
+    assert channel.oldest_observed_post_id == "3"
+    assert channel.history_cursor_post_id == "3"
+    assert channel.initial_catchup_completed is True
+    request_post_ids = set(
+        (
+            await migrated_db_session.execute(
+                select(PipelineIngestRequest.post_id).where(PipelineIngestRequest.source_id == "gap_channel"),
+            )
+        ).scalars()
+    )
+    assert request_post_ids == {"3", "4", "5", "6", "7"}
+
+
+async def test_partial_initial_window_retries_latest_messages_before_switching_forward(
+    migrated_db_session: AsyncSession,
+) -> None:
+    await _seed_active_session(migrated_db_session, session_name="primary")
+    channel = await _seed_curated_channel(
+        migrated_db_session,
+        platform_id="retry_initial_channel",
+        catchup_message_limit=3,
+    )
+    messages = [
+        _build_photo_message(message_id=str(i), channel_id="retry_initial_channel")
+        for i in range(1, 11)
+    ]
+
+    class _InitialStreamFailsOnce(FakeTelegramClient):
+        failed = False
+
+        async def iter_latest_channel_messages(
+            self,
+            *,
+            channel_id: str,
+            limit: int,
+        ) -> AsyncIterator[RawTelegramMessage]:
+            async for message in super().iter_latest_channel_messages(channel_id=channel_id, limit=limit):
+                yield message
+                if not self.failed:
+                    self.failed = True
+                    raise PipelineTelegramProviderUnavailableError("forced initial disconnect")
+
+    fake = _InitialStreamFailsOnce(
+        canned_messages={"retry_initial_channel": messages},
+        media_by_message={message.message_id: b"img" for message in messages},
+    )
+    runtime = _build_runtime(migrated_db_session, telegram_client=fake)
+
+    first_report = await runtime.catch_up_channel("primary", "retry_initial_channel")
+    await migrated_db_session.refresh(channel)
+
+    assert first_report.messages_scanned == 1
+    assert first_report.errors == ("provider_unavailable:forced initial disconnect",)
+    assert channel.last_read_post_id == "8"
+    assert channel.history_cursor_post_id == "8"
+    assert channel.initial_catchup_completed is False
+
+    second_report = await runtime.catch_up_channel("primary", "retry_initial_channel")
+    await migrated_db_session.refresh(channel)
+
+    assert second_report.messages_scanned == 3
+    assert channel.last_read_post_id == "10"
+    assert channel.history_cursor_post_id == "8"
+    assert channel.initial_catchup_completed is True
+    request_post_ids = set(
+        (
+            await migrated_db_session.execute(
+                select(PipelineIngestRequest.post_id).where(
+                    PipelineIngestRequest.source_id == "retry_initial_channel",
+                ),
+            )
+        ).scalars()
+    )
+    assert request_post_ids == {"8", "9", "10"}
+
+
+async def test_older_history_backfill_moves_only_the_oldest_cursor(
+    migrated_db_session: AsyncSession,
+) -> None:
+    await _seed_active_session(migrated_db_session, session_name="primary")
+    channel = await _seed_curated_channel(
+        migrated_db_session,
+        platform_id="older_channel",
+        last_read_post_id="10",
+    )
+    channel.oldest_observed_post_id = "8"
+    channel.history_cursor_post_id = "8"
+    channel.initial_catchup_completed = True
+    await migrated_db_session.commit()
+    messages = [_build_photo_message(message_id=str(i), channel_id="older_channel") for i in range(1, 11)]
+    fake = FakeTelegramClient(
+        canned_messages={"older_channel": messages},
+        media_by_message={message.message_id: b"img" for message in messages},
+    )
+    runtime = _build_runtime(migrated_db_session, telegram_client=fake)
+
+    first_report = await runtime.catch_up_older_channel(
+        "primary",
+        "older_channel",
+        before_post_id=None,
+        limit=3,
+    )
+    await migrated_db_session.refresh(channel)
+
+    assert first_report.messages_scanned == 3
+    assert channel.last_read_post_id == "10"
+    assert channel.oldest_observed_post_id == "5"
+    assert channel.history_cursor_post_id == "5"
+    assert channel.history_exhausted is False
+
+    second_report = await runtime.catch_up_older_channel(
+        "primary",
+        "older_channel",
+        before_post_id=channel.history_cursor_post_id,
+        limit=10,
+    )
+    await migrated_db_session.refresh(channel)
+
+    assert second_report.messages_scanned == 4
+    assert channel.last_read_post_id == "10"
+    assert channel.oldest_observed_post_id == "1"
+    assert channel.history_cursor_post_id == "1"
+    assert channel.history_exhausted is True
+
+
+async def test_older_history_uses_legacy_checkpoint_boundary_not_inventory_minimum(
+    migrated_db_session: AsyncSession,
+) -> None:
+    await _seed_active_session(migrated_db_session, session_name="primary")
+    channel = await _seed_curated_channel(
+        migrated_db_session,
+        platform_id="legacy_gap_channel",
+        last_read_post_id="511",
+    )
+    channel.oldest_observed_post_id = "6"
+    channel.history_cursor_post_id = "512"
+    channel.initial_catchup_completed = True
+    await migrated_db_session.commit()
+    messages = [
+        _build_photo_message(message_id=str(i), channel_id="legacy_gap_channel")
+        for i in (510, 511, 512)
+    ]
+    fake = FakeTelegramClient(
+        canned_messages={"legacy_gap_channel": messages},
+        media_by_message={message.message_id: b"img" for message in messages},
+    )
+    runtime = _build_runtime(migrated_db_session, telegram_client=fake)
+
+    report = await runtime.catch_up_older_channel(
+        "primary",
+        "legacy_gap_channel",
+        before_post_id=None,
+        limit=10,
+    )
+    await migrated_db_session.refresh(channel)
+
+    assert report.messages_scanned == 2
+    assert channel.last_read_post_id == "511"
+    assert channel.oldest_observed_post_id == "6"
+    assert channel.history_cursor_post_id == "510"
+    post_ids = set(
+        (
+            await migrated_db_session.execute(
+                select(SourceChannelPost.post_id).where(
+                    SourceChannelPost.source_channel_id == channel.id,
+                ),
+            )
+        ).scalars()
+    )
+    assert post_ids == {"510", "511"}
+
+
+async def test_older_history_failure_keeps_unprocessed_messages_below_committed_cursor(
+    migrated_db_session: AsyncSession,
+) -> None:
+    await _seed_active_session(migrated_db_session, session_name="primary")
+    channel = await _seed_curated_channel(
+        migrated_db_session,
+        platform_id="recoverable_older_channel",
+        last_read_post_id="10",
+    )
+    channel.oldest_observed_post_id = "8"
+    channel.history_cursor_post_id = "8"
+    channel.initial_catchup_completed = True
+    await migrated_db_session.commit()
+    messages = [
+        _build_photo_message(message_id=str(i), channel_id="recoverable_older_channel")
+        for i in range(1, 11)
+    ]
+    fake = FakeTelegramClient(
+        canned_messages={"recoverable_older_channel": messages},
+        media_by_message={message.message_id: b"img" for message in messages},
+    )
+
+    class _CommitThenFailIngestService:
+        def __init__(self) -> None:
+            self.post_ids: list[str] = []
+            self.fail_post_id: str | None = "5"
+
+        async def try_accept_without_media(
+            self,
+            *,
+            platform: SourcePlatform,
+            source_id: str,
+            post_id: str,
+            published_at: datetime | None,
+            advance_checkpoint: bool = True,
+        ) -> CrawlerIngestResult | None:
+            _ = (platform, source_id, post_id, published_at, advance_checkpoint)
+            return None
+
+        async def accept_crawler_post(
+            self,
+            raw_post: RawCrawlerPost,
+            *,
+            advance_checkpoint: bool = True,
+        ) -> CrawlerIngestResult:
+            _ = advance_checkpoint
+            self.post_ids.append(raw_post.post_id)
+            if raw_post.post_id == self.fail_post_id:
+                raise RuntimeError("forced ingest failure")
+            await migrated_db_session.commit()
+            return CrawlerIngestResult(
+                outcome=CrawlerIngestOutcome.INGESTED,
+                received_at=_now(),
+            )
+
+    ingest_service = _CommitThenFailIngestService()
+    runtime = TelegramCrawlerRuntime(
+        ingest_service=ingest_service,
+        telegram_client=fake,
+        session=migrated_db_session,
+        settings=Settings(),
+    )
+
+    with pytest.raises(RuntimeError, match="forced ingest failure"):
+        await runtime.catch_up_older_channel(
+            "primary",
+            "recoverable_older_channel",
+            before_post_id=None,
+            limit=3,
+        )
+    await migrated_db_session.rollback()
+    await migrated_db_session.refresh(channel)
+
+    assert ingest_service.post_ids == ["7", "6", "5"]
+    assert channel.history_cursor_post_id == "6"
+
+    ingest_service.fail_post_id = None
+    await runtime.catch_up_older_channel(
+        "primary",
+        "recoverable_older_channel",
+        before_post_id=channel.history_cursor_post_id,
+        limit=3,
+    )
+
+    assert ingest_service.post_ids[3:] == ["5", "4", "3"]
 
 
 async def test_catch_up_channel_skips_duplicate_source_before_download(
@@ -450,14 +848,13 @@ async def test_catch_up_channel_quarantines_session_on_banned_error(
     )
 
     class _BannedOnIter(FakeTelegramClient):
-        async def iter_channel_messages(
+        async def iter_latest_channel_messages(
             self,
             *,
             channel_id: str,
-            min_message_id: int | None,
             limit: int,
         ) -> AsyncIterator[RawTelegramMessage]:
-            _ = (channel_id, min_message_id, limit)
+            _ = (channel_id, limit)
             raise PipelineTelegramSessionBannedError("session revoked")
             yield  # pragma: no cover - unreachable, kept so the method is an async generator
 
@@ -566,6 +963,19 @@ async def test_catch_up_channel_continues_after_per_message_provider_error(
 
     await migrated_db_session.refresh(session_row)
     assert session_row.status is TelegramSessionStatus.ACTIVE
+    failed_post = await migrated_db_session.scalar(
+        select(SourceChannelPost).where(
+            SourceChannelPost.source_channel_id == (
+                select(SourceChannel.id)
+                .where(SourceChannel.platform_id == "transient_channel")
+                .scalar_subquery()
+            ),
+            SourceChannelPost.post_id == "20",
+        ),
+    )
+    assert failed_post is not None
+    assert failed_post.status is SourceChannelPostStatus.FAILED
+    assert failed_post.last_error_code == "download_unavailable"
 
 
 async def test_catch_up_channel_preserves_forward_attribution_on_raw_request(
@@ -619,15 +1029,19 @@ async def test_live_listener_round_trips_one_message_and_stops_cleanly(
     migrated_db_session: AsyncSession,
 ) -> None:
     session_row = await _seed_active_session(migrated_db_session, session_name="primary")
-    await _seed_curated_channel(
+    channel = await _seed_curated_channel(
         migrated_db_session,
         platform_id="live_channel",
+        last_read_post_id="100",
     )
+    channel.oldest_observed_post_id = "100"
+    channel.history_cursor_post_id = "100"
+    await migrated_db_session.commit()
 
-    live_message = _build_photo_message(message_id="100", channel_id="live_channel")
+    live_message = _build_photo_message(message_id="42", channel_id="live_channel")
     fake = FakeTelegramClient(
         live_messages={"live_channel": [live_message]},
-        media_by_message={"100": b"live-bytes"},
+        media_by_message={"42": b"live-bytes"},
     )
     runtime = _build_runtime(migrated_db_session, telegram_client=fake, phash_tag="V")
 
@@ -644,11 +1058,15 @@ async def test_live_listener_round_trips_one_message_and_stops_cleanly(
         # completed. Always stop it so a watchdog failure cannot leak a task.
         await runtime.stop_live_listener("primary")
 
-    assert fake.downloaded_message_ids == ["100"]
+    assert fake.downloaded_message_ids == ["42"]
     await migrated_db_session.refresh(session_row)
+    await migrated_db_session.refresh(channel)
     assert session_row.status is TelegramSessionStatus.STOPPED
     assert session_row.live_listener_started_at is None
     assert session_row.last_heartbeat_at is not None
+    assert channel.last_read_post_id == "100"
+    assert channel.oldest_observed_post_id == "42"
+    assert channel.history_cursor_post_id == "100"
 
 
 async def test_live_listener_skips_duplicate_source_before_download(
@@ -739,6 +1157,9 @@ async def test_replay_post_does_not_advance_checkpoint(
         platform_id="replay_channel",
         last_read_post_id="500",
     )
+    channel.oldest_observed_post_id = "100"
+    channel.history_cursor_post_id = "100"
+    await migrated_db_session.commit()
 
     message = _build_photo_message(message_id="42", channel_id="replay_channel")
     fake = FakeTelegramClient()
@@ -758,6 +1179,8 @@ async def test_replay_post_does_not_advance_checkpoint(
     await migrated_db_session.refresh(channel)
     # The checkpoint must NOT regress or advance for an idempotent replay.
     assert channel.last_read_post_id == "500"
+    assert channel.oldest_observed_post_id == "42"
+    assert channel.history_cursor_post_id == "100"
 
 
 async def test_replay_post_rejects_orphan_channel(

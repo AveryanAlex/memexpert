@@ -251,6 +251,24 @@ class SourcePlatform(StrEnum):
     VK = "vk"
 
 
+class SourceChannelPostStatus(StrEnum):
+    """Durable crawler outcome for one observed source-channel post."""
+
+    OBSERVED = "observed"
+    ACCEPTED = "accepted"
+    UNSUPPORTED = "unsupported"
+    FAILED = "failed"
+
+
+class SourceChannelBackfillJobStatus(StrEnum):
+    """Lifecycle for crawler-owned older-history backfill work."""
+
+    QUEUED = "queued"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
 class ChannelSuggestionStatus(StrEnum):
     """Moderation lifecycle for user-submitted source-channel suggestions."""
 
@@ -411,6 +429,8 @@ __all__ = [
     "SourceEngagementCommentsState",
     "SourceEngagementFetchStatus",
     "SourceEngagementScheduleLabel",
+    "SourceChannelBackfillJobStatus",
+    "SourceChannelPostStatus",
     "SourcePlatform",
     "SourceAttachReason",
     "SyncTargetKind",

@@ -157,6 +157,8 @@ class PipelineMeilisearchSyncClient:
         self._settings = settings or get_settings()
         self._client: Any | None = None
         self._index: Any | None = None
+        self._index_ready = False
+        self._index_lock = asyncio.Lock()
 
     async def upsert_document(
         self,
@@ -164,10 +166,12 @@ class PipelineMeilisearchSyncClient:
     ) -> None:
         """Advertise one canonical meme to Meilisearch so it becomes text-searchable."""
 
+        await self.ensure_index()
         index = await self._ensure_index_client()
         payload = _build_document_payload(document)
         try:
-            _ = await index.update_documents([payload], primary_key="id")
+            task = await index.update_documents([payload], primary_key="id")
+            await self._wait_for_task(task, operation="upsert_document")
         except Exception as exc:
             _raise_sync_error_from(exc, operation="upsert_document")
 
@@ -202,7 +206,8 @@ class PipelineMeilisearchSyncClient:
 
         index = await self._ensure_index_client()
         try:
-            _ = await index.delete_document(_document_id_for_meme_file(meme_file_id))
+            task = await index.delete_document(_document_id_for_meme_file(meme_file_id))
+            await self._wait_for_task(task, operation="delete_document")
         except Exception as exc:
             _raise_sync_error_from(exc, operation="delete_document")
 
@@ -214,17 +219,25 @@ class PipelineMeilisearchSyncClient:
         ``get_or_create_index`` is a no-op when the index already exists.
         """
 
-        client = await self._ensure_client()
-        try:
-            self._index = await client.get_or_create_index(
-                self._settings.pipeline_meilisearch_index_name,
-                primary_key="id",
-            )
-            index = self._index
-            assert index is not None
-            _ = await index.update_filterable_attributes(list(MEILISEARCH_FILTERABLE_ATTRIBUTES))
-        except Exception as exc:
-            _raise_sync_error_from(exc, operation="ensure_index")
+        if self._index_ready:
+            return
+        async with self._index_lock:
+            if self._index_ready:
+                return
+            client = await self._ensure_client()
+            try:
+                async with asyncio.timeout(self._settings.pipeline_meilisearch_timeout_seconds):
+                    self._index = await client.get_or_create_index(
+                        self._settings.pipeline_meilisearch_index_name,
+                        primary_key="id",
+                    )
+                index = self._index
+                assert index is not None
+                task = await index.update_filterable_attributes(list(MEILISEARCH_FILTERABLE_ATTRIBUTES))
+                await self._wait_for_task(task, operation="ensure_index")
+            except Exception as exc:
+                _raise_sync_error_from(exc, operation="ensure_index")
+            self._index_ready = True
 
     async def search(
         self,
@@ -275,6 +288,37 @@ class PipelineMeilisearchSyncClient:
             )
         return self._client
 
+    async def _wait_for_task(self, task: Any, *, operation: str) -> None:
+        """Wait until an asynchronous Meilisearch write is durably applied."""
+
+        task_uid = getattr(task, "task_uid", None)
+        if task_uid is None and isinstance(task, dict):
+            task_uid = task.get("taskUid", task.get("task_uid"))
+        if type(task_uid) is not int or task_uid < 0:
+            raise MeilisearchSyncMalformedResponseError(
+                f"Meilisearch {operation} did not return a valid task identifier.",
+            )
+        client = await self._ensure_client()
+        result = await client.wait_for_task(
+            task_uid,
+            timeout_in_ms=max(1, round(self._settings.pipeline_meilisearch_timeout_seconds * 1000)),
+            raise_for_status=False,
+        )
+        status = getattr(result, "status", None)
+        error = getattr(result, "error", None)
+        if isinstance(result, dict):
+            status = result.get("status", status)
+            error = result.get("error", error)
+        if status == "failed":
+            detail = "" if error in (None, "") else f": {str(error)[:1000]}"
+            raise MeilisearchSyncMalformedResponseError(
+                f"Meilisearch {operation} task {task_uid} failed{detail}",
+            )
+        if status != "succeeded":
+            raise MeilisearchSyncMalformedResponseError(
+                f"Meilisearch {operation} task {task_uid} returned unexpected status {status!r}.",
+            )
+
 
 def _raise_sync_error_from(exc: BaseException, *, operation: str) -> None:
     """Map an arbitrary SDK/transport exception onto the typed sync-error taxonomy.
@@ -285,6 +329,8 @@ def _raise_sync_error_from(exc: BaseException, *, operation: str) -> None:
     everything else falls through as ``MeilisearchSyncProviderUnavailableError``.
     """
 
+    if isinstance(exc, MeilisearchSyncError):
+        raise exc
     if isinstance(exc, (TimeoutError, asyncio.TimeoutError, httpx.TimeoutException)):
         raise MeilisearchSyncTimeoutError(f"Meilisearch {operation} timed out: {exc}") from exc
     if is_timeout_exception(exc):
@@ -295,6 +341,10 @@ def _raise_sync_error_from(exc: BaseException, *, operation: str) -> None:
     # we don't have to import the SDK at module load time.
     if exc.__class__.__name__ == "MeilisearchTimeoutError":
         raise MeilisearchSyncTimeoutError(f"Meilisearch {operation} timed out: {exc}") from exc
+    if exc.__class__.__name__ == "MeilisearchTaskFailedError":
+        raise MeilisearchSyncMalformedResponseError(
+            f"Meilisearch {operation} task failed: {exc}",
+        ) from exc
 
     status_code = _extract_sdk_status_code(exc)
     if status_code == 409:

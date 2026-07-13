@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import sys
 import unicodedata
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import pytest
@@ -15,6 +17,7 @@ import memexpert.core.ocr as ocr_module
 from memexpert.core.config import Settings
 from memexpert.core.ocr import OCRTimeoutError, PipelineOCRProcessor
 from memexpert.models.enums import ContentLanguage
+from scripts import paddleocr_json
 
 if TYPE_CHECKING:
     import uuid
@@ -53,6 +56,82 @@ class StaticPreviewMediaProcessor:
     async def extract_preview_frame(self, *, filename: str, content_type: str, media_bytes: bytes) -> bytes:
         _ = (filename, content_type, media_bytes)
         return self._preview_frame_bytes
+
+
+@pytest.mark.asyncio
+async def test_in_process_paddleocr_caps_inference_threads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    constructor_kwargs: dict[str, object] = {}
+
+    class FakePaddleOCR:
+        def __init__(self, **kwargs: object) -> None:
+            constructor_kwargs.update(kwargs)
+
+        def predict(self, *, input: str) -> list[dict[str, object]]:
+            _ = input
+            return [{"rec_texts": ["Thread safe"], "rec_scores": [0.95]}]
+
+    monkeypatch.setattr(
+        ocr_module,
+        "import_module",
+        lambda _name: SimpleNamespace(PaddleOCR=FakePaddleOCR),
+    )
+    processor = PipelineOCRProcessor(
+        settings=Settings(),
+        media_processor=StaticPreviewMediaProcessor(b"fake-preview-bytes"),
+    )
+
+    result = await processor.extract_text(
+        filename="meme.png",
+        mime_type="image/png",
+        media_bytes=b"original-bytes",
+        source_object_key="pipeline/originals/meme.png",
+    )
+
+    assert constructor_kwargs["cpu_threads"] == 1
+    assert result.extracted_text == "Thread safe"
+
+
+@pytest.mark.parametrize(
+    ("cpu_thread_args", "expected_cpu_threads"),
+    [
+        ((), 1),
+        (("--cpu-threads", "3"), 3),
+    ],
+)
+def test_paddleocr_helper_caps_and_allows_overriding_inference_threads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    cpu_thread_args: tuple[str, ...],
+    expected_cpu_threads: int,
+) -> None:
+    image_path = tmp_path / "preview.png"
+    image_path.write_bytes(b"fake-preview-bytes")
+    constructor_kwargs: dict[str, object] = {}
+
+    class FakePaddleOCR:
+        def predict(self, *, input: str) -> list[dict[str, object]]:
+            assert input == str(image_path)
+            return [{"rec_texts": ["Helper safe"], "rec_scores": [0.9]}]
+
+    def build_fake_paddleocr(**kwargs: object) -> FakePaddleOCR:
+        constructor_kwargs.update(kwargs)
+        return FakePaddleOCR()
+
+    monkeypatch.setattr(paddleocr_json, "_load_paddle_ocr_factory", lambda: build_fake_paddleocr)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["paddleocr_json.py", "--input", str(image_path), *cpu_thread_args],
+    )
+
+    assert paddleocr_json.main() == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert constructor_kwargs["cpu_threads"] == expected_cpu_threads
+    assert payload["text"] == "Helper safe"
 
 
 @pytest.mark.asyncio

@@ -5,6 +5,7 @@ const adminFixture = {
   memeId: '1cb7b083-dc9f-45a6-9e4c-3dc497651a04',
   mediaFileId: '1cb7b083-dc9f-45a6-9e4c-3dc497651a05',
   readyAccountId: '1cb7b083-dc9f-45a6-9e4c-3dc497651a06',
+  healthySourceId: '1cb7b083-dc9f-45a6-9e4c-3dc497651a08',
   quickAddedSourceId: '1cb7b083-dc9f-45a6-9e4c-3dc497651a11'
 };
 test.beforeEach(async ({ page, baseURL }, testInfo) => {
@@ -102,6 +103,24 @@ test('Telegram accounts use operator terminology while diagnostics and advanced 
   await expect(floodWaitAccount.getByText(/No Telegram action is available while this account is rate-limited/)).toBeVisible();
 
   await expect(page.locator('body')).not.toContainText(/StringSession|encrypted_string_session|attempt[_ ]?id/i);
+});
+
+test('admin inspects source message indexing and queues an older-history pass', async ({ page }) => {
+  await gotoAdmin(page, `/admin/sources/${adminFixture.healthySourceId}`);
+
+  await expect(page.getByRole('heading', { name: 'Daily cats', level: 1 })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Indexing summary' })).toBeVisible();
+  await expect(page.getByRole('columnheader', { name: 'Materialized' })).toBeVisible();
+  await expect(page.getByText('Partially indexed', { exact: true }).first()).toBeVisible();
+  await expect(page.getByText('Embedding provider unavailable.')).toBeVisible();
+
+  const backfillForm = page.locator('form[action="?/backfillSourceChannel"]');
+  const messageLimit = backfillForm.getByLabel('Older messages to fetch');
+  await expect(messageLimit).toHaveValue('5000');
+  await backfillForm.getByRole('button', { name: 'Fetch older messages' }).click();
+  await expect(page.getByRole('status').first()).toContainText('Older-message backfill queued for 5,000 messages.');
+  await expect(page.getByText('Backfill status: Queued')).toBeVisible();
+  await expect(messageLimit).toBeDisabled();
 });
 
 test('moderation renders private admin media through the authenticated proxy and leads to meme review', async ({ page, request, baseURL }) => {

@@ -49,7 +49,10 @@ The crawler ships five operator-facing pieces:
 - The heavy workers running: `uv run memexpert-workers`. These
   process both `media_inspect_requested` events from raw crawler accept and
   the later `transcode → ocr → embed → classify → sync_qdrant → sync_meili`
-  chain that materialized crawler content feeds.
+  chain that materialized crawler content feeds. Keep
+  `PIPELINE_WORKER_PREFETCH_COUNT=1` for the first large channel; each worker
+  queue consumer then has at most one unacknowledged item, and the worker image
+  also caps Paddle/OpenBLAS native threads at one.
 - A browser session cookie for a user with the durable admin flag. The
   `/api/v1/admin/telegram/*` routes use the normal cookie-authenticated admin
   guard; they do not accept the operator token.
@@ -164,8 +167,8 @@ one account is ready.
 The API resolves public metadata with the selected account outside a database
 lock, rechecks readiness, then stores the canonical lowercase Telegram username
 as both public source identity and handle. It assigns that account and enables
-catch-up, live collection, and engagement with a bounded first catch-up of 500
-messages by default. Public Telegram username renames are not followed
+catch-up, live collection, and engagement with the latest 5,000 messages as the
+bounded first catch-up by default. Public Telegram username renames are not followed
 automatically; reconcile a renamed handle as an operator exception before
 expecting continued fetches.
 
@@ -183,11 +186,28 @@ and enable the desired ingestion controls. An assigned source is indexable only
 when active, unpaused, and at least one workload control is enabled. Removing
 an account or disconnecting it forces the same safe unassigned/disabled state.
 
-Source cards show health, **last fetched**, and assigned account first.
+Source cards show health, **last fetched**, assigned account, and a
+message-indexing link first. The source detail page compares every fetched post
+with its pipeline/search state, including unsupported and failed observations.
+"Indexed" means both Qdrant and Meilisearch report `synced`, not merely that an
+ingest request exists. Pagination carries a server-issued observation snapshot,
+so messages arriving while an operator changes pages cannot shift rows between
+offsets; return to the source detail URL without that snapshot to see newer rows.
+
+Use the older-history form on that page to queue a bounded manual backfill (for
+example, 16,000 posts after an initial 1,000-message window). The crawler resumes
+durable queued/running work independently of the live listener. Older history
+is processed newest-to-oldest within each page so a failed page can resume
+without skipping its unprocessed suffix. It advances `oldest_observed_post_id`
+and the private history cursor only, never `last_read_post_id`; an empty older
+page marks Telegram history exhausted. The form stays unavailable until the
+bounded initial window completed and requires catch-up to be enabled on both
+the source and its assigned ready Telegram account.
+
 Diagnostics contains source/checkpoint identifiers; ingestion settings,
 assignment, source access validation, and remove-source confirmation are
-progressive disclosures. The catch-up limit is a per-source sweep bound: lower
-it before raising an account or global request rate.
+progressive disclosures. The catch-up limit is a per-source forward-sweep bound:
+lower it before raising an account or global request rate.
 
 The generic browser-admin `POST /api/v1/admin/source-channels` endpoint uses
 the same Telegram-only creation policy as the page. It rejects Reddit/VK rather
@@ -232,17 +252,19 @@ uv run memexpert-telegram-crawler
 ```
 
 The command resolves normal project settings, builds its own async database
-engine/session factory, constructs `TelegramSessionManager`, and performs the
-initial catch-up-then-live reconciliation. It stays in the foreground until
+engine/session factory, constructs `TelegramSessionManager`, registers live
+subscriptions, and then performs the bounded catch-up reconciliation. Registering
+first closes the gap in which a Telegram post could otherwise arrive between the
+final forward poll and event-handler installation. It stays in the foreground until
 stopped. While waiting, it compares the durable crawler control projection at
 the configured reconciliation interval. A changed projection causes a full
-client/listener rebuild with catch-up before live listening resumes; unchanged
+client/listener rebuild with listener registration before catch-up; unchanged
 polls make no Telegram requests unless the same projection has incomplete
 work. Incomplete work is retried without stopping healthy live listeners.
 
 Signal behavior:
 
-- `SIGHUP` forces the same catch-up-then-live reconciliation immediately and
+- `SIGHUP` forces the same live-registration-then-catch-up reconciliation immediately and
   then continues waiting. Routine browser-admin/operator changes do not require
   the signal.
 - `SIGINT` / `SIGTERM` request shutdown. The process closes signal handlers,
@@ -318,9 +340,12 @@ Verify the durable chain instead:
 3. Confirm `source_channels.last_fetched_at` is non-null. A non-empty channel
    should also advance `last_read_post_id`; an empty successful poll leaves the
    checkpoint empty but still updates `last_fetched_at`.
-4. Confirm `pipeline_ingest_requests` rows appear for the source's
+4. Open the source's admin message-indexing page and confirm
+   `source_channel_posts` rows appear for supported, unsupported, and failed
+   observations.
+5. Confirm `pipeline_ingest_requests` rows appear for supported messages with the source's
    `(source_platform='telegram', source_id=<platform_id>)` identity.
-5. Follow the materialized file through `pipeline_stage_journal` and
+6. Follow the materialized file through `pipeline_stage_journal` and
    `meme_file_sync_target_snapshots`; both Qdrant and Meilisearch must reach a
    synced state before claiming search indexing is complete.
 
@@ -597,11 +622,11 @@ When the freshness snapshot reports `slo_p95_pass=False`, work top-down:
 ## Known limitations
 
 - **Catch-up is asynchronous and manager-driven** — browser admin and operator
-  writes commit durable desired state but do not wait for Telegram. There is no
-  synchronous per-source catch-up endpoint; an idle crawler normally begins
-  convergence on the `CRAWLER_RECONCILE_INTERVAL_SECONDS` cadence, and `SIGHUP`
-  forces an immediate full reconcile. An in-flight pass can delay the next
-  polling tick.
+  writes commit durable desired state but do not wait for Telegram. The manual
+  older-history endpoint queues work and returns `202`; an idle crawler normally
+  claims it within `CRAWLER_RECONCILE_INTERVAL_SECONDS`. Forward-control changes
+  still converge on that cadence, and `SIGHUP` forces an immediate full
+  reconcile. An in-flight pass can delay the next polling tick.
 - **Reconciliation rebuilds all crawler sessions** — configuration changes are
   rare and currently trigger one full catch-up/listener rebuild. A future
   optimization may diff and restart only affected sessions when the channel
@@ -610,6 +635,10 @@ When the freshness snapshot reports `slo_p95_pass=False`, work top-down:
   listener that exits after a fully applied reconcile is restarted by the next
   configuration change, `SIGHUP`, or crawler process restart; unchanged idle
   snapshot polls do not yet supervise completed listener tasks.
+- **Paddle model cache is container-local** — replacing the worker removes
+  `/app/.paddlex`; the first OCR attempt downloads the detector/recognizer models.
+  Keep the crawler stopped during a deployment until an OCR canary repopulates
+  the cache and completes within `PIPELINE_OCR_TIMEOUT_SECONDS`.
 - **Freshness is measured on live items** — `MemeSource.published_at`
   must be set for the freshness query to score the item. Catch-up items
   backfilled from a historical window are NOT scored by the SLO; that

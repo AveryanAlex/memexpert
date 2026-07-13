@@ -4,6 +4,7 @@ import {
   addAdminTelegramChannelFromReference,
   addSourceChannel as createSourceChannel,
   assignAdminTelegramChannel,
+  backfillAdminSourceChannel,
   markSourceChannelDead as markSourceChannelDeadRequest,
   orphanAdminTelegramChannel,
   reviewChannelSuggestion,
@@ -44,7 +45,7 @@ export async function addSourceChannel({ fetch, request }: RequestEvent) {
         username: readOptional(data, 'username'),
         title: readRequired(data, 'title'),
         orphaned: true,
-        catchup_message_limit: 500,
+        catchup_message_limit: 5000,
         catchup_enabled: false,
         live_enabled: false,
         engagement_enabled: false
@@ -64,7 +65,7 @@ export async function addSourceByReference({ fetch, request }: RequestEvent) {
         reference: readRequired(data, 'reference'),
         telegram_session_id: readRequired(data, 'telegram_session_id'),
         suggestion_id: suggestionId,
-        catchup_message_limit: readInt(data, 'catchup_message_limit', 500)
+        catchup_message_limit: readInt(data, 'catchup_message_limit', 5000)
       }
     });
     return {
@@ -111,7 +112,7 @@ export async function updateSourceChannelIngestion({ fetch, request }: RequestEv
           catchup_enabled: data.get('catchup_enabled') === 'on',
           live_enabled: data.get('live_enabled') === 'on',
           engagement_enabled: data.get('engagement_enabled') === 'on',
-          catchup_message_limit: readInt(data, 'catchup_message_limit', 500)
+          catchup_message_limit: readInt(data, 'catchup_message_limit', 5000)
         }
       },
       channelId
@@ -173,6 +174,25 @@ export async function validateSourceAccount({ fetch, request }: RequestEvent) {
   });
 }
 
+export async function backfillSourceChannel({ fetch, request }: RequestEvent) {
+  const data = await request.formData();
+  return runAction(async () => {
+    const channelId = readRequired(data, 'channel_id');
+    const messageLimit = readInt(data, 'message_limit', 5000);
+    if (messageLimit < 1 || messageLimit > 50_000) {
+      throw new ApiError(400, 'message_limit must be between 1 and 50000.');
+    }
+    await backfillAdminSourceChannel(
+      {
+        ...apiRequest(fetch, request),
+        body: { message_limit: messageLimit }
+      },
+      channelId
+    );
+    return { message: `Older-message backfill queued for ${messageLimit.toLocaleString('en-US')} messages.` };
+  });
+}
+
 export const sourceActions = {
   reviewSuggestion,
   addSourceByReference,
@@ -182,5 +202,6 @@ export const sourceActions = {
   updateSourceChannelIngestion,
   assignSourceChannel,
   orphanSourceChannel,
-  validateSourceAccount
+  validateSourceAccount,
+  backfillSourceChannel
 };

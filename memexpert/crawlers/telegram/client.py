@@ -12,6 +12,7 @@ typed raw message + its downloaded bytes into a
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -177,10 +178,28 @@ class PipelineTelegramClientProtocol(Protocol):
     ) -> AsyncIterator[RawTelegramMessage]:
         """Yield messages newer than ``min_message_id`` for catch-up sweeps."""
 
+    def iter_latest_channel_messages(
+        self,
+        *,
+        channel_id: str,
+        limit: int,
+    ) -> AsyncIterator[RawTelegramMessage]:
+        """Yield the latest bounded channel window in oldest-to-newest order."""
+
+    def iter_older_channel_messages(
+        self,
+        *,
+        channel_id: str,
+        before_message_id: int,
+        limit: int,
+    ) -> AsyncIterator[RawTelegramMessage]:
+        """Yield the newest bounded window below ``before_message_id`` newest-first."""
+
     def listen_live(
         self,
         *,
         channel_ids: Sequence[str],
+        ready_event: asyncio.Event | None = None,
     ) -> AsyncIterator[RawTelegramMessage]:
         """Stream live messages for the requested channels after catch-up completes."""
 
@@ -343,12 +362,45 @@ class FakeTelegramClient:
             yielded += 1
             yield message
 
+    async def iter_latest_channel_messages(
+        self,
+        *,
+        channel_id: str,
+        limit: int,
+    ) -> AsyncIterator[RawTelegramMessage]:
+        self._consume_pinned_error()
+        messages = self.canned_messages.get(channel_id, [])
+        for message in messages[-limit:]:
+            yield message
+
+    async def iter_older_channel_messages(
+        self,
+        *,
+        channel_id: str,
+        before_message_id: int,
+        limit: int,
+    ) -> AsyncIterator[RawTelegramMessage]:
+        self._consume_pinned_error()
+        eligible: list[RawTelegramMessage] = []
+        for message in self.canned_messages.get(channel_id, []):
+            try:
+                if int(message.message_id) >= before_message_id:
+                    continue
+            except ValueError:
+                continue
+            eligible.append(message)
+        for message in reversed(eligible[-limit:]):
+            yield message
+
     async def listen_live(
         self,
         *,
         channel_ids: Sequence[str],
+        ready_event: asyncio.Event | None = None,
     ) -> AsyncIterator[RawTelegramMessage]:
         self._consume_pinned_error()
+        if ready_event is not None:
+            ready_event.set()
         for channel_id in channel_ids:
             for message in self.live_messages.get(channel_id, []):
                 yield message

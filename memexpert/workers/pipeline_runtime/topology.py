@@ -13,7 +13,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, cast
 
 from faststream import AckPolicy
-from faststream.rabbit import ExchangeType, RabbitBroker, RabbitExchange, RabbitQueue
+from faststream.rabbit import Channel, ExchangeType, RabbitBroker, RabbitExchange, RabbitQueue
 from faststream.rabbit.annotations import RabbitMessage
 from sqlalchemy import select
 
@@ -360,10 +360,12 @@ def build_pipeline_runtime(
         ),
         source_engagement_telegram_session_manager=resolved_source_engagement_telegram_session_manager,
     )
+    worker_channel = Channel(prefetch_count=resolved_settings.pipeline_worker_prefetch_count)
 
     @resolved_broker.subscriber(
         runtime.media_inspect_queue,
         runtime.pipeline_exchange,
+        channel=worker_channel,
         ack_policy=AckPolicy.MANUAL,
     )
     async def _consume_media_inspect(payload: object, message: RabbitMessage) -> None:
@@ -375,6 +377,7 @@ def build_pipeline_runtime(
         @resolved_broker.subscriber(
             source_engagement_capture_queue,
             runtime.pipeline_exchange,
+            channel=worker_channel,
             ack_policy=AckPolicy.MANUAL,
         )
         async def _consume_source_engagement_capture(payload: object, message: RabbitMessage) -> None:
@@ -384,6 +387,7 @@ def build_pipeline_runtime(
     @resolved_broker.subscriber(
         runtime.transcode_queue,
         runtime.pipeline_exchange,
+        channel=worker_channel,
         ack_policy=AckPolicy.MANUAL,
     )
     async def _consume_transcode(payload: object, message: RabbitMessage) -> None:
@@ -393,6 +397,7 @@ def build_pipeline_runtime(
     @resolved_broker.subscriber(
         runtime.ocr_queue,
         runtime.pipeline_exchange,
+        channel=worker_channel,
         ack_policy=AckPolicy.MANUAL,
     )
     async def _consume_ocr(payload: object, message: RabbitMessage) -> None:
@@ -402,6 +407,7 @@ def build_pipeline_runtime(
     @resolved_broker.subscriber(
         runtime.embed_queue,
         runtime.pipeline_exchange,
+        channel=worker_channel,
         ack_policy=AckPolicy.MANUAL,
     )
     async def _consume_embed(payload: object, message: RabbitMessage) -> None:
@@ -411,6 +417,7 @@ def build_pipeline_runtime(
     @resolved_broker.subscriber(
         runtime.classify_queue,
         runtime.pipeline_exchange,
+        channel=worker_channel,
         ack_policy=AckPolicy.MANUAL,
     )
     async def _consume_classify(payload: object, message: RabbitMessage) -> None:
@@ -420,6 +427,7 @@ def build_pipeline_runtime(
     @resolved_broker.subscriber(
         runtime.sync_qdrant_queue,
         runtime.pipeline_exchange,
+        channel=worker_channel,
         ack_policy=AckPolicy.MANUAL,
     )
     async def _consume_sync_qdrant(payload: object, message: RabbitMessage) -> None:
@@ -429,6 +437,7 @@ def build_pipeline_runtime(
     @resolved_broker.subscriber(
         runtime.sync_meili_queue,
         runtime.pipeline_exchange,
+        channel=worker_channel,
         ack_policy=AckPolicy.MANUAL,
     )
     async def _consume_sync_meili(payload: object, message: RabbitMessage) -> None:

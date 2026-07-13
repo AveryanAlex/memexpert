@@ -20,6 +20,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     and_,
+    text,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, BYTEA, JSONB
 from sqlalchemy.orm import Mapped, foreign, mapped_column, relationship
@@ -39,6 +40,8 @@ from memexpert.models.enums import (
     PipelineIngestRequestStatus,
     RabbitMQOutboxMessageStatus,
     SourceAttachReason,
+    SourceChannelBackfillJobStatus,
+    SourceChannelPostStatus,
     SourceEngagementCaptureReason,
     SourceEngagementCommentsState,
     SourceEngagementFetchStatus,
@@ -983,7 +986,7 @@ class SourceChannel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # Bounded number of messages to consume during initial catch-up. Prevents
     # a brand new curated channel from drowning the crawler by fetching years
     # of history the first time it is added.
-    catchup_message_limit: Mapped[int] = mapped_column(Integer, default=500, nullable=False)
+    catchup_message_limit: Mapped[int] = mapped_column(Integer, default=5000, nullable=False)
     # When ``True`` the crawler runs catch-up sweeps for this channel on
     # startup and after reconnects. Operators can freeze catch-up without
     # disabling the live listener by setting this to ``False``.
@@ -998,10 +1001,35 @@ class SourceChannel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # ``last_read_post_id`` because a poll can return zero new messages;
     # tracking this separately lets operators see staleness.
     last_fetched_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    # Oldest Telegram post represented in the durable per-post inventory.
+    oldest_observed_post_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Exclusive boundary for the next older-history scan. Kept separate from
+    # the inventory minimum so legacy accepted posts cannot make the crawler
+    # skip unsupported or previously unrecorded messages near its checkpoint.
+    history_cursor_post_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Durable marker that the bounded latest-message window completed. A
+    # separate flag is required because live traffic or a partially committed
+    # initial sweep can populate both forward and history cursors without
+    # proving the whole initial window was scanned.
+    initial_catchup_completed: Mapped[bool] = mapped_column(default=False, nullable=False)
+    # Set after an older-history request reaches the beginning of the channel.
+    history_exhausted: Mapped[bool] = mapped_column(default=False, nullable=False)
 
     telegram_session: Mapped["TelegramSession | None"] = relationship(
         "TelegramSession",
         back_populates="source_channels",
+    )
+    posts: Mapped[list["SourceChannelPost"]] = relationship(
+        "SourceChannelPost",
+        back_populates="source_channel",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    backfill_jobs: Mapped[list["SourceChannelBackfillJob"]] = relationship(
+        "SourceChannelBackfillJob",
+        back_populates="source_channel",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
     )
 
     @property
@@ -1012,6 +1040,108 @@ class SourceChannel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         if telegram_session is None:
             return None
         return telegram_session.name
+
+
+class SourceChannelPost(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """Durable inventory row for every Telegram post observed by the crawler."""
+
+    __tablename__ = "source_channel_posts"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_channel_id",
+            "post_id",
+            name="uq_source_channel_posts_channel_post",
+        ),
+        CheckConstraint("attempt_count >= 0", name="source_channel_posts_attempt_count_non_negative"),
+        Index(
+            "ix_source_channel_posts_channel_published_at",
+            "source_channel_id",
+            "published_at",
+        ),
+        Index("ix_source_channel_posts_channel_status", "source_channel_id", "status"),
+    )
+
+    source_channel_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("source_channels.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    post_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    published_at: Mapped[datetime] = mapped_column(nullable=False)
+    media_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    status: Mapped[SourceChannelPostStatus] = mapped_column(
+        string_enum(SourceChannelPostStatus),
+        default=SourceChannelPostStatus.OBSERVED,
+        nullable=False,
+    )
+    last_error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_error_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    source_channel: Mapped["SourceChannel"] = relationship(
+        "SourceChannel",
+        back_populates="posts",
+    )
+
+
+class SourceChannelBackfillJob(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """Durable crawler-owned request to fetch older history for one channel."""
+
+    __tablename__ = "source_channel_backfill_jobs"
+    __table_args__ = (
+        CheckConstraint(
+            "requested_message_count >= 1 AND requested_message_count <= 50000",
+            name="source_channel_backfill_jobs_requested_count_bounded",
+        ),
+        CheckConstraint(
+            "scanned_message_count >= 0 AND scanned_message_count <= requested_message_count",
+            name="source_channel_backfill_jobs_scanned_count_bounded",
+        ),
+        Index(
+            "uq_source_channel_backfill_jobs_one_active_per_channel",
+            "source_channel_id",
+            unique=True,
+            postgresql_where=text("status IN ('queued', 'running')"),
+        ),
+        Index(
+            "ix_source_channel_backfill_jobs_status_locked_created",
+            "status",
+            "locked_at",
+            "created_at",
+        ),
+        Index(
+            "ix_source_channel_backfill_jobs_channel_created_id",
+            "source_channel_id",
+            "created_at",
+            "id",
+        ),
+    )
+
+    source_channel_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("source_channels.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    requested_by_admin_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    status: Mapped[SourceChannelBackfillJobStatus] = mapped_column(
+        string_enum(SourceChannelBackfillJobStatus),
+        default=SourceChannelBackfillJobStatus.QUEUED,
+        nullable=False,
+    )
+    requested_message_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    scanned_message_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    cursor_post_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    last_error_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    locked_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    lock_owner: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(nullable=True)
+
+    source_channel: Mapped["SourceChannel"] = relationship(
+        "SourceChannel",
+        back_populates="backfill_jobs",
+    )
 
 
 class TelegramSession(UUIDPrimaryKeyMixin, TimestampMixin, Base):

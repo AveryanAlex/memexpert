@@ -23,8 +23,13 @@ from memexpert.crawlers.telegram.client import (
 )
 from memexpert.crawlers.telegram.manager import TelegramSessionManager
 from memexpert.ingest.crawler_service import PipelineCrawlerIngestService
-from memexpert.models.content import PipelineIngestRequest, SourceChannel, TelegramSession
-from memexpert.models.enums import SourceEngagementScheduleLabel, SourcePlatform, TelegramSessionStatus
+from memexpert.models.content import PipelineIngestRequest, SourceChannel, SourceChannelBackfillJob, TelegramSession
+from memexpert.models.enums import (
+    SourceChannelBackfillJobStatus,
+    SourceEngagementScheduleLabel,
+    SourcePlatform,
+    TelegramSessionStatus,
+)
 from memexpert.pipeline.events import SourceEngagementCaptureRequestedEvent, build_source_engagement_session_key
 from memexpert.schemas.content_pipeline import CrawlerIngestOutcome
 from memexpert.services import CrawlerSessionNotRunnableError
@@ -178,6 +183,7 @@ async def _seed_channel(
         live_enabled=live_enabled,
         telegram_session_id=telegram_session_id,
         last_read_post_id=last_read_post_id,
+        initial_catchup_completed=last_read_post_id is not None,
     )
     session.add(row)
     await session.commit()
@@ -416,14 +422,13 @@ async def test_manager_auth_required_session_does_not_stop_healthy_catchup(
     await _seed_channel(migrated_db_session, platform_id="healthy_auth_channel", session_name="healthy")
 
     class _AuthOnIter(FakeTelegramClient):
-        async def iter_channel_messages(
+        async def iter_latest_channel_messages(
             self,
             *,
             channel_id: str,
-            min_message_id: int | None,
             limit: int,
         ) -> AsyncIterator[RawTelegramMessage]:
-            _ = (channel_id, min_message_id, limit)
+            _ = (channel_id, limit)
             raise PipelineTelegramSessionAuthRequiredError("auth key revoked")
             yield  # pragma: no cover - keeps this an async generator
 
@@ -459,14 +464,13 @@ async def test_manager_banned_session_quarantines_and_does_not_stop_healthy_catc
     await _seed_channel(migrated_db_session, platform_id="healthy_banned_channel", session_name="healthy")
 
     class _BannedOnIter(FakeTelegramClient):
-        async def iter_channel_messages(
+        async def iter_latest_channel_messages(
             self,
             *,
             channel_id: str,
-            min_message_id: int | None,
             limit: int,
         ) -> AsyncIterator[RawTelegramMessage]:
-            _ = (channel_id, min_message_id, limit)
+            _ = (channel_id, limit)
             raise PipelineTelegramSessionBannedError("session revoked")
             yield  # pragma: no cover - keeps this an async generator
 
@@ -570,8 +574,15 @@ async def test_manager_live_listeners_scope_channels_and_disable_invalidates_sta
             self.listened_channel_ids = []
             self.unbound_message_guard_completed = asyncio.Event()
 
-        async def listen_live(self, *, channel_ids: Sequence[str]) -> AsyncIterator[RawTelegramMessage]:
+        async def listen_live(
+            self,
+            *,
+            channel_ids: Sequence[str],
+            ready_event: asyncio.Event | None = None,
+        ) -> AsyncIterator[RawTelegramMessage]:
             self.listened_channel_ids.append(tuple(channel_ids))
+            if ready_event is not None:
+                ready_event.set()
             for channel_id in channel_ids:
                 for message in self.live_messages.get(channel_id, []):
                     yield message
@@ -636,11 +647,28 @@ async def test_manager_live_start_failure_does_not_prevent_other_sessions_starti
             super().__init__()
             self.listener_started = asyncio.Event()
 
-        async def listen_live(self, *, channel_ids: Sequence[str]) -> AsyncIterator[RawTelegramMessage]:
+        async def listen_live(
+            self,
+            *,
+            channel_ids: Sequence[str],
+            ready_event: asyncio.Event | None = None,
+        ) -> AsyncIterator[RawTelegramMessage]:
             _ = tuple(channel_ids)
+            if ready_event is not None:
+                ready_event.set()
             self.listener_started.set()
             await asyncio.Event().wait()
             yield _build_photo_message(message_id="unreachable", channel_id="unreachable")  # pragma: no cover
+
+        async def iter_latest_channel_messages(
+            self,
+            *,
+            channel_id: str,
+            limit: int,
+        ) -> AsyncIterator[RawTelegramMessage]:
+            assert self.listener_started.is_set()
+            async for message in super().iter_latest_channel_messages(channel_id=channel_id, limit=limit):
+                yield message
 
     beta_client = _BlockingLiveClient()
 
@@ -690,8 +718,15 @@ async def test_manager_restarts_completed_live_handle_and_closes_stale_client(
     created: list[FakeTelegramClient] = []
 
     class _ProviderErrorLiveClient(FakeTelegramClient):
-        async def listen_live(self, *, channel_ids: Sequence[str]) -> AsyncIterator[RawTelegramMessage]:
+        async def listen_live(
+            self,
+            *,
+            channel_ids: Sequence[str],
+            ready_event: asyncio.Event | None = None,
+        ) -> AsyncIterator[RawTelegramMessage]:
             _ = tuple(channel_ids)
+            if ready_event is not None:
+                ready_event.set()
             raise PipelineTelegramProviderUnavailableError("transient live failure")
             yield  # pragma: no cover - keeps this an async generator
 
@@ -800,11 +835,28 @@ async def test_manager_reload_catches_up_source_added_after_live_start_and_rebui
             self.listened_channel_ids = []
             self.listener_started = asyncio.Event()
 
-        async def listen_live(self, *, channel_ids: Sequence[str]) -> AsyncIterator[RawTelegramMessage]:
+        async def listen_live(
+            self,
+            *,
+            channel_ids: Sequence[str],
+            ready_event: asyncio.Event | None = None,
+        ) -> AsyncIterator[RawTelegramMessage]:
             self.listened_channel_ids.append(tuple(channel_ids))
+            if ready_event is not None:
+                ready_event.set()
             self.listener_started.set()
             await asyncio.Event().wait()
             yield _build_photo_message(message_id="unreachable", channel_id="unreachable")  # pragma: no cover
+
+        async def iter_latest_channel_messages(
+            self,
+            *,
+            channel_id: str,
+            limit: int,
+        ) -> AsyncIterator[RawTelegramMessage]:
+            assert self.listener_started.is_set()
+            async for message in super().iter_latest_channel_messages(channel_id=channel_id, limit=limit):
+                yield message
 
     def _client_factory(row: TelegramSession) -> FakeTelegramClient:
         assert row.name == "alpha"
@@ -915,3 +967,116 @@ async def test_manager_reuses_invalidates_reloads_and_shutdowns_cached_clients(
     assert len(created) == 3
     await manager.shutdown()
     assert created[2].closed is True
+
+
+async def test_manager_processes_older_backfill_without_stopping_live_listener(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _seed_session(migrated_db_session, session_name="backfill")
+    channel = await _seed_channel(
+        migrated_db_session,
+        platform_id="backfill_channel",
+        session_name="backfill",
+        last_read_post_id="10",
+    )
+    channel.oldest_observed_post_id = "8"
+    channel.history_cursor_post_id = "8"
+    channel.initial_catchup_completed = True
+    job = SourceChannelBackfillJob(
+        source_channel_id=channel.id,
+        requested_message_count=7,
+    )
+    migrated_db_session.add(job)
+    await migrated_db_session.commit()
+
+    class _ConcurrentBackfillClient(FakeTelegramClient):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.listener_started = asyncio.Event()
+            self.release_listener = asyncio.Event()
+
+        async def listen_live(
+            self,
+            *,
+            channel_ids: Sequence[str],
+            ready_event: asyncio.Event | None = None,
+        ) -> AsyncIterator[RawTelegramMessage]:
+            _ = channel_ids
+            if ready_event is not None:
+                ready_event.set()
+            self.listener_started.set()
+            await self.release_listener.wait()
+            if False:  # pragma: no cover - preserves async-generator shape.
+                yield _build_photo_message(message_id="unused", channel_id="backfill_channel")
+
+    messages = [_build_photo_message(message_id=str(i), channel_id="backfill_channel") for i in range(1, 11)]
+    client = _ConcurrentBackfillClient(
+        canned_messages={"backfill_channel": messages},
+        media_by_message={message.message_id: b"img" for message in messages},
+    )
+    manager = _build_manager(
+        postgres_session_factory,
+        clients_by_name={"backfill": client},
+    )
+
+    try:
+        await manager.start_live_session("backfill")
+        await asyncio.wait_for(client.listener_started.wait(), timeout=_LIVE_LISTENER_TEST_TIMEOUT_SECONDS)
+        live_handle = next(iter(manager._live_handles.values()))  # noqa: SLF001 - lifecycle assertion.
+        live_task = live_handle.runtime._live_tasks["backfill"]  # noqa: SLF001 - lifecycle assertion.
+
+        assert await manager.process_backfill_jobs() == 1
+
+        await migrated_db_session.refresh(job)
+        await migrated_db_session.refresh(channel)
+        assert job.status is SourceChannelBackfillJobStatus.COMPLETED
+        assert job.scanned_message_count == 7
+        assert job.cursor_post_id == "1"
+        assert job.last_error_text is None
+        assert channel.last_read_post_id == "10"
+        assert channel.oldest_observed_post_id == "1"
+        assert channel.history_cursor_post_id == "1"
+        assert live_task.done() is False
+        assert client.closed is False
+    finally:
+        client.release_listener.set()
+        await manager.shutdown()
+
+
+async def test_manager_persists_backfill_failure_after_processing_session_rollback(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _seed_session(
+        migrated_db_session,
+        session_name="disabled-backfill",
+        catchup_enabled=False,
+    )
+    channel = await _seed_channel(
+        migrated_db_session,
+        platform_id="disabled_backfill_channel",
+        session_name="disabled-backfill",
+        last_read_post_id="10",
+    )
+    channel.history_cursor_post_id = "8"
+    job = SourceChannelBackfillJob(
+        source_channel_id=channel.id,
+        requested_message_count=5,
+    )
+    migrated_db_session.add(job)
+    await migrated_db_session.commit()
+
+    manager = _build_manager(
+        postgres_session_factory,
+        clients_by_name={"disabled-backfill": FakeTelegramClient()},
+    )
+
+    assert await manager.process_backfill_jobs() == 1
+
+    await migrated_db_session.refresh(job)
+    assert job.status is SourceChannelBackfillJobStatus.FAILED
+    assert job.last_error_text is not None
+    assert "catch-up disabled" in job.last_error_text
+    assert job.locked_at is None
+    assert job.lock_owner is None

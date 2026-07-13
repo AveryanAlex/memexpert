@@ -78,7 +78,11 @@ CMD ["memexpert-scheduler"]
 
 FROM runtime-base AS worker-system
 
-ENV PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True
+ENV PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True \
+    OMP_NUM_THREADS=1 \
+    OPENBLAS_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    NUMEXPR_NUM_THREADS=1
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \

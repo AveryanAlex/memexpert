@@ -223,6 +223,10 @@ class PipelineQdrantClient(_LazyQdrantClient):
         except (TimeoutError, httpx.TimeoutException) as exc:  # pragma: no cover - exercised via monkeypatch
             raise QdrantTimeoutError(f"Qdrant similarity lookup timed out: {exc}") from exc
         except Exception as exc:  # pragma: no cover - exercised via monkeypatch in tests
+            if _extract_sdk_status_code(exc) == 404:
+                # A brand-new deployment has no collection yet. There cannot
+                # be a duplicate match; the first sync upsert creates it.
+                return ()
             if _is_timeout_exception(exc):
                 raise QdrantTimeoutError(f"Qdrant similarity lookup timed out: {exc}") from exc
             raise QdrantProviderUnavailableError(f"Qdrant similarity lookup failed: {exc}") from exc
@@ -261,6 +265,8 @@ class PipelineQdrantUserSearchClient(_LazyQdrantClient):
         except (TimeoutError, httpx.TimeoutException) as exc:  # pragma: no cover - exercised via monkeypatch
             raise QdrantTimeoutError(f"Qdrant user search timed out: {exc}") from exc
         except Exception as exc:  # pragma: no cover - exercised via monkeypatch in tests
+            if _extract_sdk_status_code(exc) == 404:
+                return ()
             if _is_timeout_exception(exc):
                 raise QdrantTimeoutError(f"Qdrant user search timed out: {exc}") from exc
             raise QdrantProviderUnavailableError(f"Qdrant user search failed: {exc}") from exc
@@ -294,7 +300,37 @@ class PipelineQdrantSyncClient(_LazyQdrantClient):
                 wait=True,
             )
         except Exception as exc:
+            if _extract_sdk_status_code(exc) == 404:
+                await self._create_collection(client)
+                try:
+                    _ = await client.upsert(
+                        collection_name=self._settings.pipeline_qdrant_collection_name,
+                        points=[point],
+                        wait=True,
+                    )
+                except Exception as retry_exc:
+                    _raise_sync_error_from(retry_exc, operation="upsert_meme_point")
+                return
             _raise_sync_error_from(exc, operation="upsert_meme_point")
+
+    async def _create_collection(self, client: Any) -> None:
+        """Create the vector collection lazily for the first indexed meme."""
+
+        from qdrant_client.http.models import Distance, VectorParams
+
+        try:
+            _ = await client.create_collection(
+                collection_name=self._settings.pipeline_qdrant_collection_name,
+                vectors_config=VectorParams(
+                    size=self._settings.pipeline_voyage_output_dimensions,
+                    distance=Distance.COSINE,
+                ),
+            )
+        except Exception as exc:
+            # Another worker may have won the first-upsert race.
+            if _extract_sdk_status_code(exc) == 409:
+                return
+            _raise_sync_error_from(exc, operation="create_collection")
 
     async def fetch_meme_point(
         self,

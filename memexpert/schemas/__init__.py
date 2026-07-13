@@ -4,6 +4,10 @@ from memexpert.schemas.admin import (
     AdminMemeRead,
     AdminMemeTemplateRead,
     AdminSessionRead,
+    AdminSourceChannelBackfillRequest,
+    AdminSourceChannelPostPageRead,
+    AdminSourceChannelPostRead,
+    AdminSourceChannelPostSummaryRead,
     AdminSourceChannelRead,
 )
 from memexpert.schemas.auth import (
@@ -71,6 +75,10 @@ __all__ = [
     "AdminMemeRead",
     "AdminMemeTemplateRead",
     "AdminSessionRead",
+    "AdminSourceChannelBackfillRequest",
+    "AdminSourceChannelPostPageRead",
+    "AdminSourceChannelPostRead",
+    "AdminSourceChannelPostSummaryRead",
     "AdminSourceChannelRead",
     "AnalyticsEventRead",
     "AuthErrorCode",
