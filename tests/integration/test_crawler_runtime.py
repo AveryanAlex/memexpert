@@ -253,6 +253,36 @@ async def test_catch_up_channel_ingests_and_counts_mixed_media(
     assert await migrated_db_session.scalar(select(func.count()).select_from(MemeFile)) == 0
 
 
+async def test_catch_up_channel_records_successful_empty_poll(
+    migrated_db_session: AsyncSession,
+) -> None:
+    await _seed_active_session(migrated_db_session, session_name="primary")
+    channel = await _seed_curated_channel(
+        migrated_db_session,
+        platform_id="quiet_channel",
+    )
+    fake = FakeTelegramClient(
+        canned_messages={"quiet_channel": []},
+        canned_channels={
+            "quiet_channel": RawTelegramChannel(
+                channel_id="quiet_channel",
+                username="quiet_channel",
+                title="Quiet Channel",
+                subscriber_count=12,
+            ),
+        },
+    )
+    runtime = _build_runtime(migrated_db_session, telegram_client=fake)
+
+    report = await runtime.catch_up_channel("primary", "quiet_channel")
+
+    assert report.messages_scanned == 0
+    assert report.errors == ()
+    await migrated_db_session.refresh(channel)
+    assert channel.last_read_post_id is None
+    assert channel.last_fetched_at is not None
+
+
 async def test_catch_up_channel_respects_catchup_message_limit(
     migrated_db_session: AsyncSession,
 ) -> None:

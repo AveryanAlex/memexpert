@@ -6,16 +6,17 @@ import asyncio
 import logging
 import signal
 from contextlib import suppress
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Protocol, cast
 
 from memexpert.core.config import get_settings
 from memexpert.core.database import build_async_engine, build_async_session_factory
 from memexpert.crawlers.telegram.log_config import configure_telegram_crawler_logging
-from memexpert.crawlers.telegram.manager import TelegramSessionManager
+from memexpert.crawlers.telegram.manager import TelegramCrawlerReloadResult, TelegramSessionManager
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Awaitable, Callable
 
     from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -24,6 +25,32 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingConfiguration:
+    """A durable snapshot whose catch-up/listener work needs another attempt."""
+
+    snapshot: object
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingFullReload:
+    """A durable snapshot whose full client/listener rebuild failed."""
+
+    snapshot: object
+
+
+@dataclass(frozen=True, slots=True)
+class _CrawlerReconcileOutcome:
+    """Updated applied state plus whether queued reload signals are redundant."""
+
+    applied_configuration_snapshot: object
+    full_reload_performed: bool
+
+
+class _CrawlerStopRequested(Exception):
+    """Internal control flow used to cancel startup/reconciliation cleanly."""
 
 
 class TelegramCrawlerControlSignal(StrEnum):
@@ -36,11 +63,11 @@ class TelegramCrawlerControlSignal(StrEnum):
 class TelegramCrawlerManagerLike(Protocol):
     """Manager seam used by runtime tests to avoid Telethon/Postgres."""
 
-    async def catch_up_all(self) -> Sequence[object]: ...
+    async def configuration_snapshot(self) -> object: ...
 
-    async def start_live_all(self) -> None: ...
+    async def reload(self) -> TelegramCrawlerReloadResult: ...
 
-    async def reload(self) -> None: ...
+    async def retry_incomplete(self) -> TelegramCrawlerReloadResult: ...
 
     async def shutdown(self) -> None: ...
 
@@ -78,6 +105,25 @@ class _TelegramCrawlerControlMonitor:
             self._task.result()
         return await self._queue.get()
 
+    async def wait_for_stop(self) -> None:
+        await self._stop_requested.wait()
+
+    async def discard_pending_reload_requests(self) -> None:
+        """Coalesce reload signals queued while reconciliation was already running."""
+
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        stop_pending = False
+        while True:
+            try:
+                control_signal = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if control_signal is TelegramCrawlerControlSignal.STOP:
+                stop_pending = True
+        if stop_pending:
+            self._queue.put_nowait(TelegramCrawlerControlSignal.STOP)
+
     async def close(self) -> None:
         if self._task is None:
             return
@@ -88,10 +134,6 @@ class _TelegramCrawlerControlMonitor:
         else:
             with suppress(Exception):
                 self._task.result()
-
-    def raise_if_failed(self) -> None:
-        if self._task is not None and self._task.done():
-            self._task.result()
 
     async def _run(self) -> None:
         while True:
@@ -205,23 +247,38 @@ async def run_telegram_crawler_runtime(
         control_monitor.start()
 
         logger.info("telegram_crawler_runtime_starting", extra={"event": "telegram_crawler_runtime_starting"})
-        await _yield_to_control_monitor(control_monitor)
-        if control_monitor.stop_requested:
+        try:
+            configuration_snapshot = await _await_operation_or_stop(
+                manager_instance.configuration_snapshot(),
+                control_monitor,
+            )
+            reload_result = cast(
+                "TelegramCrawlerReloadResult",
+                await _await_operation_or_stop(manager_instance.reload(), control_monitor),
+            )
+        except _CrawlerStopRequested:
             return
-
-        catchup_reports = await manager_instance.catch_up_all()
         logger.info(
             "telegram_crawler_catchup_completed",
-            extra={"event": "telegram_crawler_catchup_completed", "catchup_reports": len(catchup_reports)},
+            extra={
+                "event": "telegram_crawler_catchup_completed",
+                "catchup_reports": len(reload_result.catchup_reports),
+                "failed_session_names": reload_result.failed_session_names,
+                "retry_required": reload_result.retry_required,
+            },
         )
-        await _yield_to_control_monitor(control_monitor)
-        if control_monitor.stop_requested:
-            return
-
-        await manager_instance.start_live_all()
         logger.info("telegram_crawler_runtime_started", extra={"event": "telegram_crawler_runtime_started"})
 
-        await _wait_for_control_signals(manager_instance, control_monitor)
+        await _wait_for_control_signals(
+            manager_instance,
+            control_monitor,
+            reconcile_interval_seconds=resolved_settings.crawler_reconcile_interval_seconds,
+            applied_configuration_snapshot=(
+                _PendingConfiguration(configuration_snapshot)
+                if reload_result.retry_required
+                else configuration_snapshot
+            ),
+        )
     finally:
         if control_monitor is not None:
             await control_monitor.close()
@@ -236,23 +293,198 @@ async def run_telegram_crawler_runtime(
             logger.info("telegram_crawler_runtime_stopped", extra={"event": "telegram_crawler_runtime_stopped"})
 
 
-async def _yield_to_control_monitor(control_monitor: _TelegramCrawlerControlMonitor) -> None:
-    await asyncio.sleep(0)
-    control_monitor.raise_if_failed()
+async def _await_operation_or_stop(
+    operation: Awaitable[object],
+    control_monitor: _TelegramCrawlerControlMonitor,
+) -> object:
+    """Await one manager operation while allowing SIGINT/SIGTERM cancellation."""
+
+    operation_task = asyncio.ensure_future(operation)
+    stop_task = asyncio.create_task(control_monitor.wait_for_stop())
+    done, _pending = await asyncio.wait(
+        (operation_task, stop_task),
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    if stop_task in done:
+        operation_task.cancel()
+        _ = await asyncio.gather(operation_task, return_exceptions=True)
+        raise _CrawlerStopRequested
+
+    stop_task.cancel()
+    _ = await asyncio.gather(stop_task, return_exceptions=True)
+    return operation_task.result()
 
 
 async def _wait_for_control_signals(
     manager: TelegramCrawlerManagerLike,
     control_monitor: _TelegramCrawlerControlMonitor,
+    *,
+    reconcile_interval_seconds: float,
+    applied_configuration_snapshot: object,
 ) -> None:
+    observed_snapshot = applied_configuration_snapshot
     while True:
-        control_signal = await control_monitor.wait()
+        try:
+            control_signal = await asyncio.wait_for(
+                control_monitor.wait(),
+                timeout=reconcile_interval_seconds,
+            )
+        except TimeoutError:
+            if control_monitor.stop_requested:
+                return
+            try:
+                reconcile_outcome = await _reconcile_if_configuration_changed(
+                    manager,
+                    control_monitor=control_monitor,
+                    applied_configuration_snapshot=observed_snapshot,
+                )
+            except _CrawlerStopRequested:
+                return
+            observed_snapshot = reconcile_outcome.applied_configuration_snapshot
+            if reconcile_outcome.full_reload_performed:
+                await control_monitor.discard_pending_reload_requests()
+            continue
         if control_signal is TelegramCrawlerControlSignal.STOP:
             return
 
         logger.info("telegram_crawler_reload_started", extra={"event": "telegram_crawler_reload_started"})
-        await manager.reload()
-        logger.info("telegram_crawler_reload_completed", extra={"event": "telegram_crawler_reload_completed"})
+        try:
+            snapshot_before_reload = await _await_operation_or_stop(
+                manager.configuration_snapshot(),
+                control_monitor,
+            )
+        except _CrawlerStopRequested:
+            return
+        except Exception:  # noqa: BLE001 - a later poll or signal can retry the snapshot read.
+            logger.exception(
+                "telegram_crawler_reload_failed",
+                extra={"event": "telegram_crawler_reload_failed"},
+            )
+            observed_snapshot = _PendingFullReload(observed_snapshot)
+            continue
+        try:
+            reload_result = cast(
+                "TelegramCrawlerReloadResult",
+                await _await_operation_or_stop(manager.reload(), control_monitor),
+            )
+        except _CrawlerStopRequested:
+            return
+        except Exception:  # noqa: BLE001 - a later poll or signal can retry durable desired state.
+            logger.exception(
+                "telegram_crawler_reload_failed",
+                extra={"event": "telegram_crawler_reload_failed"},
+            )
+            observed_snapshot = _PendingFullReload(snapshot_before_reload)
+            continue
+        observed_snapshot = (
+            _PendingConfiguration(snapshot_before_reload) if reload_result.retry_required else snapshot_before_reload
+        )
+        await control_monitor.discard_pending_reload_requests()
+        logger.info(
+            "telegram_crawler_reload_completed",
+            extra={
+                "event": "telegram_crawler_reload_completed",
+                "catchup_reports": len(reload_result.catchup_reports),
+                "failed_session_names": reload_result.failed_session_names,
+                "retry_required": reload_result.retry_required,
+            },
+        )
+
+
+async def _reconcile_if_configuration_changed(
+    manager: TelegramCrawlerManagerLike,
+    *,
+    control_monitor: _TelegramCrawlerControlMonitor,
+    applied_configuration_snapshot: object,
+) -> _CrawlerReconcileOutcome:
+    try:
+        current_snapshot = await _await_operation_or_stop(
+            manager.configuration_snapshot(),
+            control_monitor,
+        )
+    except _CrawlerStopRequested:
+        raise
+    except Exception:  # noqa: BLE001 - a later poll can retry the durable snapshot read.
+        logger.exception(
+            "telegram_crawler_reconcile_failed",
+            extra={"event": "telegram_crawler_reconcile_failed"},
+        )
+        return _CrawlerReconcileOutcome(
+            applied_configuration_snapshot=applied_configuration_snapshot,
+            full_reload_performed=False,
+        )
+
+    pending_configuration = (
+        applied_configuration_snapshot
+        if isinstance(applied_configuration_snapshot, _PendingConfiguration)
+        else None
+    )
+    pending_full_reload = (
+        applied_configuration_snapshot
+        if isinstance(applied_configuration_snapshot, _PendingFullReload)
+        else None
+    )
+    if (
+        pending_configuration is None
+        and pending_full_reload is None
+        and current_snapshot == applied_configuration_snapshot
+    ):
+        return _CrawlerReconcileOutcome(
+            applied_configuration_snapshot=applied_configuration_snapshot,
+            full_reload_performed=False,
+        )
+
+    retry_incomplete = (
+        pending_configuration is not None
+        and pending_full_reload is None
+        and current_snapshot == pending_configuration.snapshot
+    )
+    logger.info(
+        "telegram_crawler_reconcile_started",
+        extra={
+            "event": "telegram_crawler_reconcile_started",
+            "retry_incomplete": retry_incomplete,
+        },
+    )
+    try:
+        reload_result = cast(
+            "TelegramCrawlerReloadResult",
+            await _await_operation_or_stop(
+                manager.retry_incomplete() if retry_incomplete else manager.reload(),
+                control_monitor,
+            ),
+        )
+    except _CrawlerStopRequested:
+        raise
+    except Exception:  # noqa: BLE001 - durable desired state makes the next poll a safe retry.
+        logger.exception(
+            "telegram_crawler_reconcile_failed",
+            extra={"event": "telegram_crawler_reconcile_failed"},
+        )
+        failed_snapshot = applied_configuration_snapshot if retry_incomplete else _PendingFullReload(current_snapshot)
+        return _CrawlerReconcileOutcome(
+            applied_configuration_snapshot=failed_snapshot,
+            full_reload_performed=False,
+        )
+
+    logger.info(
+        "telegram_crawler_reconcile_completed",
+        extra={
+            "event": "telegram_crawler_reconcile_completed",
+            "catchup_reports": len(reload_result.catchup_reports),
+            "failed_session_names": reload_result.failed_session_names,
+            "retry_required": reload_result.retry_required,
+        },
+    )
+    # Keep the snapshot captured before reconciliation. A concurrent admin
+    # change will differ on the next poll and trigger another pass.
+    applied_snapshot = (
+        _PendingConfiguration(current_snapshot) if reload_result.retry_required else current_snapshot
+    )
+    return _CrawlerReconcileOutcome(
+        applied_configuration_snapshot=applied_snapshot,
+        full_reload_performed=not retry_incomplete,
+    )
 
 
 def main() -> None:

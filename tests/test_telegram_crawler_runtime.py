@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import signal
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -14,6 +15,8 @@ from memexpert.crawlers.telegram.main import (
     TelegramCrawlerSignalController,
     run_telegram_crawler_runtime,
 )
+from memexpert.crawlers.telegram.manager import TelegramCrawlerReloadResult
+from memexpert.crawlers.telegram.runtime import CrawlerCatchupReport
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -55,27 +58,59 @@ class FakeManager:
         signal_controller: FakeSignalController | None = None,
         signals_after_start: Sequence[TelegramCrawlerControlSignal] = (),
         signals_after_reload: Sequence[TelegramCrawlerControlSignal] = (),
+        configuration_snapshots: Sequence[object] = ("configuration",),
+        reload_results: Sequence[TelegramCrawlerReloadResult] = (
+            TelegramCrawlerReloadResult(catchup_reports=(), failed_session_names=()),
+        ),
+        retry_results: Sequence[TelegramCrawlerReloadResult] = (
+            TelegramCrawlerReloadResult(catchup_reports=(), failed_session_names=()),
+        ),
+        signals_after_retry: Sequence[TelegramCrawlerControlSignal] = (),
     ) -> None:
         self._events = events
         self._signal_controller = signal_controller
         self._signals_after_start = signals_after_start
         self._signals_after_reload = signals_after_reload
+        self._configuration_snapshots = tuple(configuration_snapshots)
+        self._configuration_snapshot_index = 0
+        self._reload_results = tuple(reload_results)
+        self._reload_index = 0
+        self._retry_results = tuple(retry_results)
+        self._retry_index = 0
+        self._signals_after_retry = signals_after_retry
 
-    async def catch_up_all(self) -> Sequence[object]:
-        self._events.append("manager.catch_up_all")
-        return [object(), object()]
+    async def configuration_snapshot(self) -> object:
+        self._events.append("manager.configuration_snapshot")
+        index = min(self._configuration_snapshot_index, len(self._configuration_snapshots) - 1)
+        self._configuration_snapshot_index += 1
+        return self._configuration_snapshots[index]
 
-    async def start_live_all(self) -> None:
-        self._events.append("manager.start_live_all")
-        for control_signal in self._signals_after_start:
-            if self._signal_controller is not None:
-                self._signal_controller.request(control_signal)
-
-    async def reload(self) -> None:
+    async def reload(self) -> TelegramCrawlerReloadResult:
         self._events.append("manager.reload")
-        for control_signal in self._signals_after_reload:
-            if self._signal_controller is not None:
-                self._signal_controller.request(control_signal)
+        signals = self._signals_after_start if self._reload_index == 0 else self._signals_after_reload
+        result_index = min(self._reload_index, len(self._reload_results) - 1)
+        self._reload_index += 1
+        self._schedule_signals(signals)
+        return self._reload_results[result_index]
+
+    async def retry_incomplete(self) -> TelegramCrawlerReloadResult:
+        self._events.append("manager.retry_incomplete")
+        result_index = min(self._retry_index, len(self._retry_results) - 1)
+        self._retry_index += 1
+        self._schedule_signals(self._signals_after_retry)
+        return self._retry_results[result_index]
+
+    def _schedule_signals(self, signals: Sequence[TelegramCrawlerControlSignal]) -> None:
+        if self._signal_controller is None or not signals:
+            return
+
+        async def _emit() -> None:
+            await asyncio.sleep(0)
+            for control_signal in signals:
+                if self._signal_controller is not None:
+                    self._signal_controller.request(control_signal)
+
+        _ = asyncio.create_task(_emit())
 
     async def shutdown(self) -> None:
         self._events.append("manager.shutdown")
@@ -88,8 +123,8 @@ class FailingShutdownManager(FakeManager):
 
 
 class FailingCatchupManager(FakeManager):
-    async def catch_up_all(self) -> Sequence[object]:
-        self._events.append("manager.catch_up_all")
+    async def reload(self) -> TelegramCrawlerReloadResult:
+        self._events.append("manager.reload")
         raise RuntimeError("catch-up failed")
 
 
@@ -104,6 +139,38 @@ class FakeLoop:
     def remove_signal_handler(self, sig: signal.Signals) -> bool:
         self.removed.append(sig)
         return True
+
+
+def test_reload_result_retries_transient_errors_but_not_malformed_messages() -> None:
+    now = datetime.now(UTC)
+
+    transient = TelegramCrawlerReloadResult(
+        catchup_reports=(
+            CrawlerCatchupReport(
+                session_name="primary",
+                channel_id="channel",
+                started_at=now,
+                finished_at=now,
+                errors=("provider_unavailable:temporary outage",),
+            ),
+        ),
+        failed_session_names=(),
+    )
+    malformed = TelegramCrawlerReloadResult(
+        catchup_reports=(
+            CrawlerCatchupReport(
+                session_name="primary",
+                channel_id="channel",
+                started_at=now,
+                finished_at=now,
+                errors=("download_malformed:42:bad payload",),
+            ),
+        ),
+        failed_session_names=(),
+    )
+
+    assert transient.retry_required is True
+    assert malformed.retry_required is False
 
 
 @pytest.mark.asyncio
@@ -160,8 +227,8 @@ async def test_runtime_builds_manager_and_disposes_owned_engine(monkeypatch: pyt
         "build_async_session_factory",
         "manager.build",
         "signal.install",
-        "manager.catch_up_all",
-        "manager.start_live_all",
+        "manager.configuration_snapshot",
+        "manager.reload",
         "signal.wait:stop",
         "signal.close",
         "manager.shutdown",
@@ -187,8 +254,8 @@ async def test_telegram_crawler_runtime_uses_injected_fakes_for_startup_and_shut
 
     assert events == [
         "signal.install",
-        "manager.catch_up_all",
-        "manager.start_live_all",
+        "manager.configuration_snapshot",
+        "manager.reload",
         "signal.wait:stop",
         "signal.close",
         "manager.shutdown",
@@ -222,8 +289,8 @@ async def test_runtime_disposes_owned_engine_when_shutdown_fails(monkeypatch: py
     assert events == [
         "build_async_engine",
         "signal.install",
-        "manager.catch_up_all",
-        "manager.start_live_all",
+        "manager.configuration_snapshot",
+        "manager.reload",
         "signal.wait:stop",
         "signal.close",
         "manager.shutdown",
@@ -256,7 +323,8 @@ async def test_runtime_shutdown_and_owned_engine_dispose_run_when_startup_fails(
     assert events == [
         "build_async_engine",
         "signal.install",
-        "manager.catch_up_all",
+        "manager.configuration_snapshot",
+        "manager.reload",
         "signal.close",
         "manager.shutdown",
         "engine.dispose",
@@ -264,16 +332,20 @@ async def test_runtime_shutdown_and_owned_engine_dispose_run_when_startup_fails(
 
 
 @pytest.mark.asyncio
-async def test_runtime_skips_live_start_when_stop_is_requested_during_catchup() -> None:
+async def test_runtime_cancels_startup_reconcile_when_stop_is_requested() -> None:
     events: list[str] = []
     signal_controller = FakeSignalController(events)
 
     class StopDuringCatchupManager(FakeManager):
-        async def catch_up_all(self) -> Sequence[object]:
-            self._events.append("manager.catch_up_all")
+        async def reload(self) -> TelegramCrawlerReloadResult:
+            self._events.append("manager.reload")
             signal_controller.request(TelegramCrawlerControlSignal.STOP)
-            await asyncio.sleep(0)
-            return []
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self._events.append("manager.reload.cancelled")
+                raise
+            raise AssertionError("startup reconcile should be cancelled")
 
     await run_telegram_crawler_runtime(
         settings=Settings(),
@@ -284,8 +356,10 @@ async def test_runtime_skips_live_start_when_stop_is_requested_during_catchup() 
 
     assert events == [
         "signal.install",
-        "manager.catch_up_all",
+        "manager.configuration_snapshot",
+        "manager.reload",
         "signal.wait:stop",
+        "manager.reload.cancelled",
         "signal.close",
         "manager.shutdown",
     ]
@@ -310,9 +384,180 @@ async def test_telegram_crawler_runtime_reloads_on_sighup_event_then_stops() -> 
 
     assert events == [
         "signal.install",
-        "manager.catch_up_all",
-        "manager.start_live_all",
+        "manager.configuration_snapshot",
+        "manager.reload",
         "signal.wait:reload",
+        "manager.configuration_snapshot",
+        "manager.reload",
+        "signal.wait:stop",
+        "signal.close",
+        "manager.shutdown",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runtime_survives_sighup_reload_failure_and_waits_for_stop() -> None:
+    events: list[str] = []
+    signal_controller = FakeSignalController(events)
+
+    class _FailSecondReloadManager(FakeManager):
+        async def reload(self) -> TelegramCrawlerReloadResult:
+            if self._reload_index == 1:
+                self._events.append("manager.reload")
+                self._reload_index += 1
+                raise RuntimeError("reload failed")
+            return await super().reload()
+
+    await run_telegram_crawler_runtime(
+        settings=Settings(crawler_reconcile_interval_seconds=0.001),
+        engine=FakeEngine(events),
+        manager=_FailSecondReloadManager(
+            events,
+            signal_controller=signal_controller,
+            signals_after_start=[TelegramCrawlerControlSignal.RELOAD],
+            signals_after_reload=[TelegramCrawlerControlSignal.STOP],
+        ),
+        signal_controller=signal_controller,
+    )
+
+    assert events == [
+        "signal.install",
+        "manager.configuration_snapshot",
+        "manager.reload",
+        "signal.wait:reload",
+        "manager.configuration_snapshot",
+        "manager.reload",
+        "manager.configuration_snapshot",
+        "manager.reload",
+        "signal.wait:stop",
+        "signal.close",
+        "manager.shutdown",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runtime_reconciles_changed_configuration_without_signal() -> None:
+    events: list[str] = []
+    signal_controller = FakeSignalController(events)
+
+    await run_telegram_crawler_runtime(
+        settings=Settings(crawler_reconcile_interval_seconds=0.001),
+        engine=FakeEngine(events),
+        manager=FakeManager(
+            events,
+            signal_controller=signal_controller,
+            signals_after_reload=[TelegramCrawlerControlSignal.RELOAD, TelegramCrawlerControlSignal.STOP],
+            configuration_snapshots=("before", "after"),
+        ),
+        signal_controller=signal_controller,
+    )
+
+    assert events == [
+        "signal.install",
+        "manager.configuration_snapshot",
+        "manager.reload",
+        "manager.configuration_snapshot",
+        "manager.reload",
+        "signal.wait:reload",
+        "signal.wait:stop",
+        "signal.close",
+        "manager.shutdown",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runtime_retries_incomplete_startup_catchup_without_configuration_change() -> None:
+    events: list[str] = []
+    signal_controller = FakeSignalController(events)
+
+    await run_telegram_crawler_runtime(
+        settings=Settings(crawler_reconcile_interval_seconds=0.001),
+        engine=FakeEngine(events),
+        manager=FakeManager(
+            events,
+            signal_controller=signal_controller,
+            signals_after_retry=[TelegramCrawlerControlSignal.STOP],
+            reload_results=(
+                TelegramCrawlerReloadResult(catchup_reports=(), failed_session_names=("primary",)),
+            ),
+        ),
+        signal_controller=signal_controller,
+    )
+
+    assert events == [
+        "signal.install",
+        "manager.configuration_snapshot",
+        "manager.reload",
+        "manager.configuration_snapshot",
+        "manager.retry_incomplete",
+        "signal.wait:stop",
+        "signal.close",
+        "manager.shutdown",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runtime_uses_full_reload_when_configuration_changes_while_retry_is_pending() -> None:
+    events: list[str] = []
+    signal_controller = FakeSignalController(events)
+
+    await run_telegram_crawler_runtime(
+        settings=Settings(crawler_reconcile_interval_seconds=0.001),
+        engine=FakeEngine(events),
+        manager=FakeManager(
+            events,
+            signal_controller=signal_controller,
+            signals_after_reload=[TelegramCrawlerControlSignal.STOP],
+            configuration_snapshots=("before", "after"),
+            reload_results=(
+                TelegramCrawlerReloadResult(catchup_reports=(), failed_session_names=("primary",)),
+                TelegramCrawlerReloadResult(catchup_reports=(), failed_session_names=()),
+            ),
+        ),
+        signal_controller=signal_controller,
+    )
+
+    assert events == [
+        "signal.install",
+        "manager.configuration_snapshot",
+        "manager.reload",
+        "manager.configuration_snapshot",
+        "manager.reload",
+        "signal.wait:stop",
+        "signal.close",
+        "manager.shutdown",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runtime_preserves_sighup_received_during_incomplete_retry() -> None:
+    events: list[str] = []
+    signal_controller = FakeSignalController(events)
+
+    await run_telegram_crawler_runtime(
+        settings=Settings(crawler_reconcile_interval_seconds=0.001),
+        engine=FakeEngine(events),
+        manager=FakeManager(
+            events,
+            signal_controller=signal_controller,
+            signals_after_reload=[TelegramCrawlerControlSignal.STOP],
+            signals_after_retry=[TelegramCrawlerControlSignal.RELOAD],
+            reload_results=(
+                TelegramCrawlerReloadResult(catchup_reports=(), failed_session_names=("primary",)),
+                TelegramCrawlerReloadResult(catchup_reports=(), failed_session_names=()),
+            ),
+        ),
+        signal_controller=signal_controller,
+    )
+
+    assert events == [
+        "signal.install",
+        "manager.configuration_snapshot",
+        "manager.reload",
+        "manager.configuration_snapshot",
+        "manager.retry_incomplete",
+        "signal.wait:reload",
+        "manager.configuration_snapshot",
         "manager.reload",
         "signal.wait:stop",
         "signal.close",

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import logging
 import uuid
@@ -46,6 +47,39 @@ type TelegramClientFactory = Callable[
     PipelineTelegramClientProtocol | Awaitable[PipelineTelegramClientProtocol],
 ]
 type CrawlerIngestServiceFactory = Callable[["AsyncSession"], PipelineCrawlerIngestService]
+type TelegramSessionConfigurationSignature = tuple[
+    uuid.UUID,
+    str,
+    bool,
+    TelegramSessionStatus,
+    datetime | None,
+    datetime | None,
+    str | None,
+    bool,
+    bool,
+    float,
+]
+type TelegramChannelConfigurationSignature = tuple[
+    uuid.UUID,
+    SourcePlatform,
+    str,
+    uuid.UUID | None,
+    bool,
+    bool,
+    bool,
+    bool,
+    int,
+]
+type TelegramCrawlerConfigurationSnapshot = tuple[
+    tuple[TelegramSessionConfigurationSignature, ...],
+    tuple[TelegramChannelConfigurationSignature, ...],
+]
+
+_NON_RETRYABLE_CATCHUP_ERROR_PREFIXES = (
+    "channel_paused_mid_sweep",
+    "download_malformed:",
+    "mapper_malformed:",
+)
 
 
 @dataclass(slots=True)
@@ -61,6 +95,24 @@ class _LiveRuntimeHandle:
     session_name: str
     db_session: AsyncSession
     runtime: TelegramCrawlerRuntime
+
+
+@dataclass(frozen=True, slots=True)
+class TelegramCrawlerReloadResult:
+    """Outcome of one catch-up-then-live desired-state reconciliation."""
+
+    catchup_reports: tuple[CrawlerCatchupReport, ...]
+    failed_session_names: tuple[str, ...]
+
+    @property
+    def retry_required(self) -> bool:
+        if self.failed_session_names:
+            return True
+        return any(
+            not error.startswith(_NON_RETRYABLE_CATCHUP_ERROR_PREFIXES)
+            for report in self.catchup_reports
+            for error in report.errors
+        )
 
 
 @dataclass(slots=True)
@@ -85,15 +137,23 @@ class TelegramSessionManager:
     async def catch_up_all(self) -> list[CrawlerCatchupReport]:
         """Catch up every runnable catch-up-enabled session without cross-session aborts."""
 
+        reports, _failed_session_names = await self._catch_up_all_with_failures()
+        return reports
+
+    async def _catch_up_all_with_failures(self) -> tuple[list[CrawlerCatchupReport], list[str]]:
+        """Catch up runnable sessions and retain failures for reconciliation retry."""
+
         runnable_sessions = await self._discover_runnable_sessions(workload="catchup")
         reports: list[CrawlerCatchupReport] = []
+        failed_session_names: list[str] = []
         for session_state in runnable_sessions:
             try:
                 reports.extend(await self._catch_up_session(session_state.name, propagate_session_errors=False))
             except Exception:  # noqa: BLE001 - isolate one account from the rest of the sweep.
                 logger.exception("Telegram catch-up failed unexpectedly for session %s.", session_state.name)
+                failed_session_names.append(session_state.name)
                 await self.invalidate_session(session_id=session_state.id)
-        return reports
+        return reports, failed_session_names
 
     async def catch_up_session(self, session_name: str) -> list[CrawlerCatchupReport]:
         """Catch up active channels assigned to one runnable session."""
@@ -161,12 +221,12 @@ class TelegramSessionManager:
                 raise PipelineTelegramSessionNotRunnableError(str(exc)) from exc
             return await self._get_cached_client(session_state)
 
-    async def start_live_all(self) -> None:
-        """Start one listener for each runnable live-enabled session and stop stale ones."""
+    async def start_live_all(self) -> list[str]:
+        """Start runnable listeners and return session names that failed to start."""
 
         if not self.settings.crawler_live_mode_enabled:
             await self.stop_live_all()
-            return
+            return []
         runnable_sessions = await self._discover_runnable_sessions(workload="live")
         runnable_ids = {row.id for row in runnable_sessions}
         for session_id in tuple(self._live_handles):
@@ -174,8 +234,17 @@ class TelegramSessionManager:
                 await self._stop_live_handle(session_id, mark_stopped=False)
                 await self.invalidate_session(session_id=session_id)
         await self._invalidate_cached_clients_not_in(runnable_ids)
+        failed_session_names: list[str] = []
         for session_state in runnable_sessions:
-            await self.start_live_session(session_state.name)
+            try:
+                await self.start_live_session(session_state.name)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - start healthy sessions before reporting the aggregate failure.
+                logger.exception("Telegram live listener failed to start for session %s.", session_state.name)
+                failed_session_names.append(session_state.name)
+                await self.invalidate_session(session_id=session_state.id)
+        return failed_session_names
 
     async def start_live_session(self, session_name: str) -> None:
         """Start the live listener for one runnable live-enabled session."""
@@ -255,13 +324,98 @@ class TelegramSessionManager:
             with suppress(Exception):
                 await cached.client.close()
 
-    async def reload(self) -> None:
-        """Close stale clients/listeners and rebuild live listeners from current DB state."""
+    async def configuration_snapshot(self) -> TelegramCrawlerConfigurationSnapshot:
+        """Return durable crawler-control state for periodic change detection.
+
+        Checkpoints, fetch timestamps, heartbeats, and refreshed Telegram
+        metadata are runtime state and intentionally excluded so their normal
+        writes never cause a client reconnect.
+        """
+
+        async with self.session_factory() as db_session:
+            source_channels = list(
+                (
+                    await db_session.execute(
+                        select(SourceChannel)
+                        .where(SourceChannel.platform == SourcePlatform.TELEGRAM)
+                        .order_by(SourceChannel.id.asc()),
+                    )
+                )
+                .scalars()
+                .all(),
+            )
+            assigned_session_ids = {
+                row.telegram_session_id for row in source_channels if row.telegram_session_id is not None
+            }
+            telegram_sessions = (
+                list(
+                    (
+                        await db_session.execute(
+                            select(TelegramSession)
+                            .where(TelegramSession.id.in_(assigned_session_ids))
+                            .order_by(TelegramSession.id.asc()),
+                        )
+                    )
+                    .scalars()
+                    .all(),
+                )
+                if assigned_session_ids
+                else []
+            )
+
+        session_signatures = tuple(
+            (
+                row.id,
+                row.name,
+                row.enabled,
+                row.status,
+                row.flood_wait_until,
+                row.quarantined_at,
+                self._secret_digest(row.encrypted_string_session),
+                row.catchup_enabled,
+                row.live_enabled,
+                row.max_requests_per_second,
+            )
+            for row in telegram_sessions
+        )
+        channel_signatures = tuple(
+            (
+                row.id,
+                row.platform,
+                row.platform_id,
+                row.telegram_session_id,
+                row.is_active,
+                row.is_paused,
+                row.catchup_enabled,
+                row.live_enabled,
+                row.catchup_message_limit,
+            )
+            for row in source_channels
+        )
+        return session_signatures, channel_signatures
+
+    async def reload(self) -> TelegramCrawlerReloadResult:
+        """Reconcile catch-up and live listeners with current durable state."""
 
         await self.stop_live_all(mark_stopped=False)
         for session_id in tuple(self._client_cache):
             await self.invalidate_session(session_id=session_id)
-        await self.start_live_all()
+        reports, failed_session_names = await self._catch_up_all_with_failures()
+        failed_session_names.extend(await self.start_live_all())
+        return TelegramCrawlerReloadResult(
+            catchup_reports=tuple(reports),
+            failed_session_names=tuple(dict.fromkeys(failed_session_names)),
+        )
+
+    async def retry_incomplete(self) -> TelegramCrawlerReloadResult:
+        """Retry incomplete catch-up/listener work without tearing down healthy listeners."""
+
+        reports, failed_session_names = await self._catch_up_all_with_failures()
+        failed_session_names.extend(await self.start_live_all())
+        return TelegramCrawlerReloadResult(
+            catchup_reports=tuple(reports),
+            failed_session_names=tuple(dict.fromkeys(failed_session_names)),
+        )
 
     async def shutdown(self) -> None:
         """Stop all listeners and close every cached Telegram client."""
@@ -288,7 +442,21 @@ class TelegramSessionManager:
             reports: list[CrawlerCatchupReport] = []
             for channel_id in channel_ids:
                 try:
-                    reports.append(await runtime.catch_up_channel(session_state.name, channel_id))
+                    report = await runtime.catch_up_channel(session_state.name, channel_id)
+                    reports.append(report)
+                    logger.info(
+                        "telegram_crawler_channel_catchup_completed",
+                        extra={
+                            "event": "telegram_crawler_channel_catchup_completed",
+                            "session_name": report.session_name,
+                            "channel_id": report.channel_id,
+                            "messages_scanned": report.messages_scanned,
+                            "messages_ingested": report.messages_ingested,
+                            "messages_skipped_unsupported": report.messages_skipped_unsupported,
+                            "messages_skipped_dedup": report.messages_skipped_dedup,
+                            "errors": report.errors,
+                        },
+                    )
                 except (
                     PipelineTelegramSessionBannedError,
                     PipelineTelegramSessionAuthRequiredError,
@@ -517,6 +685,13 @@ class TelegramSessionManager:
                 await self.invalidate_session(session_id=session_id)
 
     @staticmethod
+    def _secret_digest(encrypted_string_session: str | None) -> str | None:
+        normalized = (encrypted_string_session or "").strip()
+        if not normalized:
+            return None
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+    @staticmethod
     async def _maybe_await(
         value: PipelineTelegramClientProtocol | Awaitable[PipelineTelegramClientProtocol],
     ) -> PipelineTelegramClientProtocol:
@@ -527,6 +702,8 @@ class TelegramSessionManager:
 
 __all__ = [
     "CrawlerIngestServiceFactory",
+    "TelegramCrawlerConfigurationSnapshot",
+    "TelegramCrawlerReloadResult",
     "TelegramClientFactory",
     "TelegramSessionManager",
 ]

@@ -78,6 +78,11 @@ The crawler ships five operator-facing pieces:
   - `CRAWLER_LIVE_MODE_ENABLED` — guards the live listener start-up. Set
     to `false` in environments where catch-up is the only sanctioned
     mode.
+  - `CRAWLER_RECONCILE_INTERVAL_SECONDS` — cadence at which an idle crawler
+    polls for committed session/source control changes. The default is **10s**;
+    an in-flight catch-up/reload can delay the next poll. Polling reads
+    PostgreSQL only; Telegram clients are rebuilt only when the control
+    projection changes.
 
 ## Browser-admin workspaces
 
@@ -212,10 +217,11 @@ recorded.
 Use browser admin for account login/validation/policy and source
 add/assignment/ingestion. Use the operator-token `/api/v1/crawler/*` endpoints
 for runtime tasks: list the runtime projection, pause/resume channels, replay
-one Telegram post, and read freshness snapshots. Browser admin does not trigger
-a catch-up sweep; after account or source assignment/policy changes, send
-`SIGHUP` to the crawler process so it rebuilds clients/listeners from durable
-state.
+one Telegram post, and read freshness snapshots. Admin and operator writes do
+not synchronously call Telegram. An idle crawler polls committed control state
+at `CRAWLER_RECONCILE_INTERVAL_SECONDS`, performs catch-up, and then rebuilds
+live listeners. An in-flight reconcile can delay the next poll. `SIGHUP` remains
+the manual immediate-reconcile override.
 
 ## Starting the crawler runtime
 
@@ -226,15 +232,19 @@ uv run memexpert-telegram-crawler
 ```
 
 The command resolves normal project settings, builds its own async database
-engine/session factory, constructs `TelegramSessionManager`, runs
-`catch_up_all()`, then starts live listeners with `start_live_all()`. It stays in
-the foreground until stopped.
+engine/session factory, constructs `TelegramSessionManager`, and performs the
+initial catch-up-then-live reconciliation. It stays in the foreground until
+stopped. While waiting, it compares the durable crawler control projection at
+the configured reconciliation interval. A changed projection causes a full
+client/listener rebuild with catch-up before live listening resumes; unchanged
+polls make no Telegram requests unless the same projection has incomplete
+work. Incomplete work is retried without stopping healthy live listeners.
 
 Signal behavior:
 
-- `SIGHUP` calls `manager.reload()` and then continues waiting. Send this after
-  browser-admin account/source assignment or policy changes that should affect
-  live listeners without a full restart.
+- `SIGHUP` forces the same catch-up-then-live reconciliation immediately and
+  then continues waiting. Routine browser-admin/operator changes do not require
+  the signal.
 - `SIGINT` / `SIGTERM` request shutdown. The process closes signal handlers,
   calls `manager.shutdown()`, disposes its owned SQLAlchemy engine, and exits.
 
@@ -265,19 +275,54 @@ Manager discovery rules:
 - Flood-wait, auth-required, or quarantine state affects only the failing
   session. Healthy sessions continue catch-up/live work in the same manager
   process.
-- Send `SIGHUP` after admin disable/delete/assignment changes to close stale
-  clients/listeners and rebuild live listeners from current DB state.
+- Configuration reconciliation fingerprints only session/source control fields.
+  Assignment, active/paused state, catch-up/live flags, limits, credential
+  replacement, and account policy changes trigger a reconcile; checkpoints,
+  fetch timestamps, heartbeats, and metadata refreshes do not.
 
 Watch for these structured lifecycle events in crawler logs:
 
 - `telegram_crawler_runtime_starting`, `telegram_crawler_catchup_completed`,
   `telegram_crawler_runtime_started`, and `telegram_crawler_runtime_stopped`.
 - `telegram_crawler_reload_requested`, `telegram_crawler_reload_started`, and
-  `telegram_crawler_reload_completed` when `SIGHUP` is received.
+  `telegram_crawler_reload_completed` when `SIGHUP` is received;
+  `telegram_crawler_reload_failed` leaves the process alive for a later retry.
+- `telegram_crawler_reconcile_started` and
+  `telegram_crawler_reconcile_completed` when polling finds changed durable
+  control state; `telegram_crawler_reconcile_failed` is retried on a later poll.
+  Completion logs include `retry_required` and failed session names. Retryable
+  provider/download failures leave the control snapshot pending, so the next
+  interval retries even if no admin field changed. That retry preserves healthy
+  listeners; a concurrent durable control change still selects the full rebuild
+  path.
+- `telegram_crawler_channel_catchup_completed` for per-channel scanned,
+  ingested, unsupported, deduplicated, and error counts.
 - `telegram_crawler_stop_requested` when `SIGINT` or `SIGTERM` is received.
+  In-flight startup/reconciliation work is cancelled before clients and the DB
+  engine are closed.
 
 The freshness endpoint only observes freshness - it does not trigger catch-up or
 start the crawler runtime.
+
+## Verifying a newly activated source
+
+Initial historical catch-up is intentionally excluded from freshness SLO
+scoring, so `/crawler/freshness` alone cannot prove a new source is indexing.
+Verify the durable chain instead:
+
+1. Confirm the source is active, unpaused, assigned to a ready account, and has
+   catch-up/live enabled.
+2. Wait up to `CRAWLER_RECONCILE_INTERVAL_SECONDS` and find
+   `telegram_crawler_reconcile_completed` plus the source's
+   `telegram_crawler_channel_catchup_completed` log.
+3. Confirm `source_channels.last_fetched_at` is non-null. A non-empty channel
+   should also advance `last_read_post_id`; an empty successful poll leaves the
+   checkpoint empty but still updates `last_fetched_at`.
+4. Confirm `pipeline_ingest_requests` rows appear for the source's
+   `(source_platform='telegram', source_id=<platform_id>)` identity.
+5. Follow the materialized file through `pipeline_stage_journal` and
+   `meme_file_sync_target_snapshots`; both Qdrant and Meilisearch must reach a
+   synced state before claiming search indexing is complete.
 
 ## Inspecting freshness snapshots
 
@@ -332,19 +377,23 @@ target history.
 When an expected channel produced zero items in the snapshot window, check these
 causes in priority order:
 
-1. **Session flood-wait or ban.** Check
+1. **Still inside the reconciliation window.** A just-created or reassigned
+   source may wait up to `CRAWLER_RECONCILE_INTERVAL_SECONDS` before catch-up
+   starts. Historical catch-up items are not scored by the freshness endpoint;
+   use the verification sequence above.
+2. **Session flood-wait or ban.** Check
    `GET /api/v1/crawler/sessions` for the owning session's `status` and
    `flood_wait_until`. If the session is parked, no channel bound to
    it can produce items.
-2. **Source orphaned or non-indexable.** Check `/admin/sources` for its assigned
+3. **Source orphaned or non-indexable.** Check `/admin/sources` for its assigned
    account and ingestion controls. Assign it to a ready account and enable the
    intended catch-up/live/engagement controls.
-3. **Channel paused.** Check `is_paused` on the channel row via
+4. **Channel paused.** Check `is_paused` on the channel row via
    `GET /api/v1/crawler/channels`. Resume with `POST /channels/{id}/resume`.
-4. **Crawler manager not started.** The freshness endpoint only observes; it
+5. **Crawler manager not started.** The freshness endpoint only observes; it
    does not start the runtime. Re-read the "Starting the crawler runtime"
    section above.
-5. **Empty channel.** If the Telegram channel genuinely had no new
+6. **Empty channel.** If the Telegram channel genuinely had no new
    messages in the window, a stalled entry is the honest signal.
 
 ## Per-channel replay + repair
@@ -437,7 +486,8 @@ The affected `telegram_sessions` row transitions into
 continue running. The affected session is not runnable again until it is
 `active` and `flood_wait_until` is no longer in the future, and stale cached
 clients/listeners should be closed by sending `SIGHUP` to
-`memexpert-telegram-crawler`.
+`memexpert-telegram-crawler` or by waiting for configuration reconciliation
+after the account is repaired.
 
 Recovery steps:
 
@@ -448,14 +498,16 @@ Recovery steps:
    cooldown if the client keeps hitting it.
 4. Once the window expires, restore the account to `active` and clear errors in
    `/admin/telegram`, or validate the account if authorized material changed.
-5. Send `SIGHUP` to `memexpert-telegram-crawler` so stale clients/listeners are
-   closed and live listeners are rebuilt. Freshness snapshots pick up recovery
-   on the next poll.
+5. The crawler observes the repaired account on its next configuration poll,
+   closes stale clients/listeners, catches up, and rebuilds live listeners.
+   Send `SIGHUP` only when an immediate reconcile is required.
 
 If the flood-wait keeps recurring, lower the account's
-`max_requests_per_second` in `/admin/telegram` Advanced settings (preferred) or the
-`CRAWLER_MAX_REQUESTS_PER_SECOND` fallback, then send `SIGHUP` to reload the
-crawler process.
+`max_requests_per_second` in `/admin/telegram` Advanced settings (preferred).
+That account policy change triggers reconciliation; use `SIGHUP` only to avoid
+waiting for the interval. Changing the process-wide
+`CRAWLER_MAX_REQUESTS_PER_SECOND` environment fallback requires restarting the
+crawler service because settings are cached at process start.
 
 ## Session auth/ban recovery
 
@@ -480,17 +532,17 @@ row is marked `status=auth_required`, not quarantined. Recovery options are:
    the helper validates Telegram authorization, replaces `encrypted_string_session`,
    clears error fields, and sets `status='active'`.
 3. **Validate and check recovery.** Use `/admin/telegram` to validate the
-   account or `/admin/sources` to validate source access, send `SIGHUP` to
-   `memexpert-telegram-crawler`, then read `/api/v1/crawler/freshness` to confirm
-   freshness recovers.
+   account or `/admin/sources` to validate source access. The crawler reconciles
+   the committed repair automatically; use `SIGHUP` only for an immediate pass,
+   then read `/api/v1/crawler/freshness` to confirm live freshness recovers.
 
 ## Common failure modes
 
 - **`telegram_flood_wait` cascade.** Every catch-up tick hits the same
   cooldown. Root cause is usually an oversized
-  `catchup_message_limit` combined with a too-high
-  `CRAWLER_MAX_REQUESTS_PER_SECOND`. Lower both and reload or invalidate the
-  affected session.
+  `catchup_message_limit` combined with a too-high per-account
+  `max_requests_per_second`. Lower both in browser admin; the crawler
+  automatically reconciles the account policy change.
 - **`telegram_provider_unavailable`.** Telegram is reachable but refused
   the request. Transient; the runtime reports the stage as retryable and
   the worker will requeue it.
@@ -529,8 +581,8 @@ When the freshness snapshot reports `slo_p95_pass=False`, work top-down:
 2. **Is Telegram fetch the bottleneck?** Look at `memexpert-telegram-crawler`
    logs for flood-wait or provider-unavailable errors. If the listener is
    hitting the token-bucket ceiling, lower
-   `CRAWLER_DEFAULT_CATCHUP_MESSAGE_LIMIT` or raise
-   `CRAWLER_MAX_REQUESTS_PER_SECOND` (but never both in the same run).
+   the source's `catchup_message_limit` or raise the assigned account's
+   `max_requests_per_second` (but never both in the same run).
 3. **Is the pipeline heavy chain slow?** Inspect item detail stage timestamps
    for sample items whose freshness is above p95.
 4. **Is a sync target slow?** Compare Qdrant vs Meilisearch target timestamps in
@@ -544,13 +596,20 @@ When the freshness snapshot reports `slo_p95_pass=False`, work top-down:
 
 ## Known limitations
 
-- **No automatic admin-to-runtime reload hook yet** — assigning or moving a
-  source in `/admin/sources` updates `source_channels.telegram_session_id`, but
-  a live crawler process only observes the new binding after `SIGHUP` or process
-  restart.
-- **Catch-up is manager-driven** — neither browser admin nor the operator API can
-  trigger a catch-up sweep on demand. The freshness endpoint only observes the
-  freshness the running manager has already produced.
+- **Catch-up is asynchronous and manager-driven** — browser admin and operator
+  writes commit durable desired state but do not wait for Telegram. There is no
+  synchronous per-source catch-up endpoint; an idle crawler normally begins
+  convergence on the `CRAWLER_RECONCILE_INTERVAL_SECONDS` cadence, and `SIGHUP`
+  forces an immediate full reconcile. An in-flight pass can delay the next
+  polling tick.
+- **Reconciliation rebuilds all crawler sessions** — configuration changes are
+  rare and currently trigger one full catch-up/listener rebuild. A future
+  optimization may diff and restart only affected sessions when the channel
+  fleet is large.
+- **A later live-task failure needs an operator or control-state event** — a
+  listener that exits after a fully applied reconcile is restarted by the next
+  configuration change, `SIGHUP`, or crawler process restart; unchanged idle
+  snapshot polls do not yet supervise completed listener tasks.
 - **Freshness is measured on live items** — `MemeSource.published_at`
   must be set for the freshness query to score the item. Catch-up items
   backfilled from a historical window are NOT scored by the SLO; that

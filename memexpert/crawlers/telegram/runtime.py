@@ -312,9 +312,9 @@ class TelegramCrawlerRuntime:
 
         Validates the target session exists before mutating the channel
         so stray ids surface as a loud error instead of orphaning the
-        channel. The live listener does NOT rebind on the fly — T03 will
-        own that capability; the next live-listener restart picks up
-        the new assignment.
+        channel. The live listener does not rebind on the fly; the manager's
+        next automatic configuration reconciliation or process restart picks
+        up the new assignment.
         """
 
         target_session = await self._load_session(new_session_name)
@@ -454,6 +454,11 @@ class TelegramCrawlerRuntime:
             # operator-triggered catch-up call runs cleanly.
             counters.record_error(f"provider_unavailable:{exc}")
             return
+        else:
+            # A successful empty poll is still operational progress. Without
+            # this assignment newly activated but quiet channels remain
+            # indistinguishable from channels the crawler never contacted.
+            channel_row.last_fetched_at = fetched_at_fallback
 
     async def _ingest_single_message(
         self,

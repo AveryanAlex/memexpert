@@ -123,5 +123,8 @@ sources and disables their ingestion; reconnect or reassign them deliberately.
 Private admin previews use authenticated media render URLs, never storage object
 keys. A full account with the durable admin flag may render a private meme file
 through that proxy; unrelated non-admin users remain unable to discover it. The
-admin surface is a control plane, not a crawler trigger: source/account changes
-can require a crawler reload and do not promise an immediate fetch.
+admin request remains a control-plane write and does not synchronously call
+Telegram. An idle crawler polls for committed source/account policy changes at
+the configured reconciliation cadence, performs bounded catch-up for the new
+durable state, and then rebuilds live listeners. An in-flight reconciliation
+can delay the next poll.

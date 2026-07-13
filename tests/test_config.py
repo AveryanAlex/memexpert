@@ -147,6 +147,16 @@ def test_settings_include_telegram_session_encryption_secret_without_session_dir
         _ = Settings.model_validate({"telegram_session_encryption_secret": "  "})
 
 
+def test_settings_crawler_reconcile_interval_defaults_and_requires_positive_value() -> None:
+    settings = Settings()
+
+    assert settings.crawler_reconcile_interval_seconds == 10.0
+    overridden = Settings.model_validate({"crawler_reconcile_interval_seconds": 2.5})
+    assert overridden.crawler_reconcile_interval_seconds == 2.5
+    with pytest.raises(ValidationError):
+        _ = Settings.model_validate({"crawler_reconcile_interval_seconds": 0})
+
+
 def test_settings_normalize_blank_ocr_command_settings_to_none() -> None:
     settings = Settings.model_validate(
         {

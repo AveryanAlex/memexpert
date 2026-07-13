@@ -208,6 +208,7 @@ class Settings(BaseSettings):
     # and freshness snapshots expose its downstream effect.
     crawler_max_requests_per_second: float = Field(default=15.0, gt=0, le=30)
     crawler_live_mode_enabled: bool = True
+    crawler_reconcile_interval_seconds: float = Field(default=10.0, gt=0.0, le=3600.0)
     # Freshness SLO budgets (publish → both sync targets synced) in seconds.
     # Runtime code surfaces measured p50/p95 against these numbers through the
     # operator inspect surface so drift is visible.

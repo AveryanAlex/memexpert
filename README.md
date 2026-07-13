@@ -6,7 +6,7 @@ MemeExpert is a meme catalog and content-pipeline service. The backend is a Fast
 
 - `memexpert-api`: FastAPI HTTP API. It exposes `/health` on port `8000` and the application routes under `/api/v1`.
 - `memexpert-workers`: RabbitMQ-backed content-pipeline workers for transcode, OCR, embedding, classification, and search-index sync.
-- `memexpert-telegram-crawler`: Dedicated Telegram crawler process. It runs DB-backed multi-session catch-up, starts live listeners, handles `SIGHUP` reload, and exits gracefully on `SIGINT`/`SIGTERM`.
+- `memexpert-telegram-crawler`: Dedicated Telegram crawler process. It runs DB-backed multi-session catch-up, starts live listeners, automatically reconciles committed source/account control changes, handles forced `SIGHUP` reconciliation, and exits gracefully on `SIGINT`/`SIGTERM`.
 - `memexpert-scheduler`: APScheduler runtime for periodic jobs and scheduler-only operational logs.
 - `memexpert-bot`: Optional Telegram bot process using the same backend services and database.
 - `frontend`: SvelteKit Node server. It serves adapter-node output on port `3000` and uses `API_BASE_URL` for private SSR API calls.

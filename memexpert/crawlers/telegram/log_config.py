@@ -12,6 +12,16 @@ class _TelegramCrawlerStructuredFormatter(logging.Formatter):
         "event",
         "signal",
         "catchup_reports",
+        "session_name",
+        "channel_id",
+        "messages_scanned",
+        "messages_ingested",
+        "messages_skipped_unsupported",
+        "messages_skipped_dedup",
+        "errors",
+        "failed_session_names",
+        "retry_required",
+        "retry_incomplete",
     )
 
     def format(self, record: logging.LogRecord) -> str:

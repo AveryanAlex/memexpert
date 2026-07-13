@@ -4,7 +4,15 @@
 
 Plugin interface per platform. All crawlers normalize output to a common `RawMeme` dataclass (media bytes, media type, source metadata).
 
-- **Telegram (Telethon):** Long-running userbot sessions that listen to channel updates in real-time via Telethon event handlers. Each channel's `last_read_post_id` is persisted in `SourceChannel`. On startup, the crawler catches up on all messages since `last_read_post_id` per channel, then switches to live listening. Multiple sessions (2–3) distribute channels for rate limit safety (≤30 req/s per session).
+- **Telegram (Telethon):** Long-running userbot sessions that listen to channel updates in real-time via Telethon event handlers. Each channel's `last_read_post_id` is persisted in `SourceChannel`. On startup, the crawler catches up on all messages since `last_read_post_id` per channel, then switches to live listening. While idle, it polls an immutable projection of session/source control fields at the configured cadence; an in-flight reconciliation can delay the next poll. A changed assignment or ingestion policy triggers catch-up before live listeners are rebuilt. Runtime-owned checkpoints, fetch timestamps, heartbeats, and refreshed Telegram metadata are excluded from this projection so normal crawling does not cause reconnect churn. Multiple sessions (2–3) distribute channels for rate limit safety (≤30 req/s per session).
+- **Reconciliation completion:** A control snapshot is considered applied only
+  after catch-up and listener rebuilding complete without retryable report or
+  session failures. Incomplete reconciliation remains pending and is retried on
+  the normal interval even when the durable configuration itself did not
+  change. Those same-snapshot retries preserve healthy live listeners; a newer
+  control snapshot causes a full catch-up/listener rebuild. `SIGINT`/`SIGTERM`
+  cancels an in-flight sweep before shutdown so deployments do not rely on a
+  forced container kill.
 - **Reddit (PRAW), VK (VK API):** Planned. Same plugin interface. Platforms without real-time push will poll on intervals, storing `last_read_post_id` in `SourceChannel`.
 
 **Risk:** Telethon userbot accounts are subject to bans. Mitigation: multiple sessions, conservative rates, monitoring. Consider Bot API channel forwarding as a fallback read path.
@@ -62,8 +70,11 @@ The service performs Telegram I/O without retaining a database row lock, then
 locks/rechecks the selected account and canonical source identity before writing.
 It atomically creates or reuses the source, assigns the selected ready account,
 enables catch-up/live/engagement, and approves a matching pending suggestion in
-the same transaction. A duplicate/retry reuses the canonical source and still
-converges on the approved suggestion. The manual source endpoint
+the same transaction. The crawler discovers the committed control-state change
+within `CRAWLER_RECONCILE_INTERVAL_SECONDS` (10 seconds by default), runs the
+bounded initial catch-up, and rebuilds its live subscriptions. The HTTP request
+does not wait for Telegram ingestion. A duplicate/retry reuses the canonical
+source and still converges on the approved suggestion. The manual source endpoint
 `POST /api/v1/admin/source-channels` remains an exception path for a known
 canonical identifier: it creates an orphan with all ingestion controls disabled
 and explicitly rejects Reddit/VK or any other non-Telegram platform. The list

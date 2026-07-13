@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from sqlalchemy import func, select
@@ -622,6 +622,65 @@ async def test_manager_live_listeners_scope_channels_and_disable_invalidates_sta
     assert beta.closed is True
 
 
+async def test_manager_live_start_failure_does_not_prevent_other_sessions_starting(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _seed_session(migrated_db_session, session_name="alpha")
+    beta_row = await _seed_session(migrated_db_session, session_name="beta")
+    await _seed_channel(migrated_db_session, platform_id="alpha_live", session_name="alpha")
+    await _seed_channel(migrated_db_session, platform_id="beta_live", session_name="beta")
+
+    class _BlockingLiveClient(FakeTelegramClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.listener_started = asyncio.Event()
+
+        async def listen_live(self, *, channel_ids: Sequence[str]) -> AsyncIterator[RawTelegramMessage]:
+            _ = tuple(channel_ids)
+            self.listener_started.set()
+            await asyncio.Event().wait()
+            yield _build_photo_message(message_id="unreachable", channel_id="unreachable")  # pragma: no cover
+
+    beta_client = _BlockingLiveClient()
+
+    def _client_factory(row: TelegramSession) -> FakeTelegramClient:
+        if row.name == "alpha":
+            raise RuntimeError("alpha connection failed")
+        assert row.name == "beta"
+        return beta_client
+
+    manager = TelegramSessionManager(
+        settings=Settings(),
+        session_factory=postgres_session_factory,
+        telegram_client_factory=_client_factory,
+        ingest_service_factory=lambda db_session: PipelineCrawlerIngestService.from_settings(
+            db_session,
+            settings=Settings(),
+            storage_client=FakeStorageClient(),
+        ),
+    )
+
+    try:
+        failed_session_names = await manager.start_live_all()
+
+        assert failed_session_names == ["alpha"]
+        assert beta_row.id in manager._live_handles  # noqa: SLF001 - verifies failure isolation.
+        assert beta_client.closed is False
+        await asyncio.wait_for(beta_client.listener_started.wait(), timeout=_LIVE_LISTENER_TEST_TIMEOUT_SECONDS)
+
+        beta_handle = manager._live_handles[beta_row.id]  # noqa: SLF001 - verifies non-disruptive retry.
+        retry_result = await manager.retry_incomplete()
+
+        assert retry_result.failed_session_names == ("alpha",)
+        assert manager._live_handles[beta_row.id] is beta_handle  # noqa: SLF001 - verifies non-disruptive retry.
+        assert beta_client.closed is False
+    finally:
+        await manager.shutdown()
+
+    assert beta_client.closed is True
+
+
 async def test_manager_restarts_completed_live_handle_and_closes_stale_client(
     migrated_db_session: AsyncSession,
     postgres_session_factory: async_sessionmaker[AsyncSession],
@@ -685,6 +744,124 @@ async def test_manager_restarts_completed_live_handle_and_closes_stale_client(
         assert created[1].downloaded_message_ids == ["2"]
         await migrated_db_session.refresh(session_row)
         assert session_row.status is TelegramSessionStatus.ACTIVE
+    finally:
+        await manager.shutdown()
+
+    assert created[1].closed is True
+
+
+async def test_manager_configuration_snapshot_ignores_runtime_state_and_detects_control_changes(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    session_row = await _seed_session(migrated_db_session, session_name="alpha")
+    channel = await _seed_channel(migrated_db_session, platform_id="snapshot_channel", session_name="alpha")
+    manager = _build_manager(
+        postgres_session_factory,
+        clients_by_name={"alpha": FakeTelegramClient()},
+    )
+
+    initial_snapshot = await manager.configuration_snapshot()
+
+    session_row.last_heartbeat_at = _now() + timedelta(minutes=1)
+    channel.last_read_post_id = "42"
+    channel.last_fetched_at = _now()
+    channel.title = "Refreshed title"
+    channel.subscriber_count = 500
+    await migrated_db_session.commit()
+
+    assert await manager.configuration_snapshot() == initial_snapshot
+
+    channel.live_enabled = False
+    await migrated_db_session.commit()
+
+    assert await manager.configuration_snapshot() != initial_snapshot
+
+
+async def test_manager_reload_catches_up_source_added_after_live_start_and_rebuilds_listener(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    session_row = await _seed_session(migrated_db_session, session_name="alpha")
+    await _seed_channel(
+        migrated_db_session,
+        platform_id="old_source",
+        session_name="alpha",
+        last_read_post_id="10",
+    )
+    created: list[FakeTelegramClient] = []
+
+    class _RecordingLiveClient(FakeTelegramClient):
+        listened_channel_ids: list[tuple[str, ...]]
+        listener_started: asyncio.Event
+
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.listened_channel_ids = []
+            self.listener_started = asyncio.Event()
+
+        async def listen_live(self, *, channel_ids: Sequence[str]) -> AsyncIterator[RawTelegramMessage]:
+            self.listened_channel_ids.append(tuple(channel_ids))
+            self.listener_started.set()
+            await asyncio.Event().wait()
+            yield _build_photo_message(message_id="unreachable", channel_id="unreachable")  # pragma: no cover
+
+    def _client_factory(row: TelegramSession) -> FakeTelegramClient:
+        assert row.name == "alpha"
+        if not created:
+            client = _RecordingLiveClient()
+        else:
+            client = _RecordingLiveClient(
+                canned_messages={
+                    "old_source": [_build_photo_message(message_id="10", channel_id="old_source")],
+                    "new_source": [_build_photo_message(message_id="20", channel_id="new_source")],
+                },
+                media_by_message={"10": b"old-source", "20": b"new-source"},
+            )
+        created.append(client)
+        return client
+
+    manager = TelegramSessionManager(
+        settings=Settings(),
+        session_factory=postgres_session_factory,
+        telegram_client_factory=_client_factory,
+        ingest_service_factory=lambda db_session: PipelineCrawlerIngestService.from_settings(
+            db_session,
+            settings=Settings(),
+            storage_client=FakeStorageClient(),
+        ),
+    )
+
+    try:
+        await manager.start_live_all()
+        first_client = created[0]
+        assert isinstance(first_client, _RecordingLiveClient)
+        await asyncio.wait_for(first_client.listener_started.wait(), timeout=_LIVE_LISTENER_TEST_TIMEOUT_SECONDS)
+        assert first_client.listened_channel_ids == [("old_source",)]
+
+        new_channel = await _seed_channel(
+            migrated_db_session,
+            platform_id="new_source",
+            session_name="alpha",
+        )
+
+        reload_result = await manager.reload()
+
+        assert created[0].closed is True
+        assert len(created) == 2
+        second_client = created[1]
+        assert isinstance(second_client, _RecordingLiveClient)
+        await asyncio.wait_for(second_client.listener_started.wait(), timeout=_LIVE_LISTENER_TEST_TIMEOUT_SECONDS)
+        assert set(second_client.listened_channel_ids[-1]) == {"old_source", "new_source"}
+        assert second_client.downloaded_message_ids == ["20"]
+        assert {report.channel_id for report in reload_result.catchup_reports} == {"old_source", "new_source"}
+        assert reload_result.retry_required is False
+        await migrated_db_session.refresh(new_channel)
+        assert new_channel.last_read_post_id == "20"
+        assert new_channel.last_fetched_at is not None
+        assert await migrated_db_session.scalar(select(func.count()).select_from(PipelineIngestRequest)) == 1
+        await migrated_db_session.refresh(session_row)
+        assert session_row.live_listener_started_at is not None
     finally:
         await manager.shutdown()
 
