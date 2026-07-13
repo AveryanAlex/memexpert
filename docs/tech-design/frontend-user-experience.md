@@ -43,7 +43,7 @@ Desktop navigation presents the brand, Discover, global query search, Saved, and
 | `InfiniteMemeFeed.svelte` | Owns initial/next page state, deduplicated append behavior, intersection loading, and accessible Load more/retry/end states. It passes the route's layout and bulk policy to `MemeGrid`. |
 | `MemeOfTheDayPanel.svelte` | Presents the daily selection as a compact media-first tile while retaining attribution for telemetry. |
 
-`MemeActionMenu` preserves existing client API calls and status behavior. It receives viewer capability from the root context, so shared cards do not need account-type prop drilling. A Favorite action can trigger the existing guest-to-Telegram connection prompt on detail; it does not change the account model.
+`MemeActionMenu` preserves existing client API calls while keeping routine action success feedback visual: Favorite and Save update their pressed/filled icon states without adding a status row, and action failures still render an error. It receives viewer capability from the root context, so shared cards do not need account-type prop drilling. A Favorite action can trigger the existing guest-to-Telegram connection prompt on detail; it does not change the account model.
 
 Save-to-collection opens a contextual chooser of collections where the viewer can add memes. The API orders those choices by the latest `collection_memes.added_at` value, descending with empty collections last, so the collection used for the most recent addition appears first. The client preserves that order and does not keep cross-user collection state in a module-level cache.
 

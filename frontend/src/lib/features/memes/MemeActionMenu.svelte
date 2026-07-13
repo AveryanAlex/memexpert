@@ -66,7 +66,7 @@
   let pinned = $state(false);
   let likeCount = $state(0);
   let pending = $state<MemeActionKind | null>(null);
-  let statusMessage = $state<string | null>(null);
+  let errorMessage = $state<string | null>(null);
   let reportOpen = $state(false);
   let reportReason = $state<ModerationReason>('spam');
   let reportNote = $state('');
@@ -137,7 +137,6 @@
       } else if (!next && wasFavorited && wasRemoved(response)) {
         likeCount = Math.max(0, likeCount - 1);
       }
-      statusMessage = next ? 'Added to favorites.' : 'Removed from favorites.';
       onFavoriteChange?.(next);
     });
   }
@@ -147,7 +146,6 @@
     await runAction(next ? 'save' : 'unsave', async () => {
       await (next ? saveMeme(actionRequest) : removeSavedMeme(actionRequest));
       saved = next;
-      statusMessage = next ? 'Saved to your active collection.' : 'Removed from your active collection.';
     });
   }
 
@@ -184,7 +182,6 @@
         body: actionBody
       });
       saved = true;
-      statusMessage = `Saved to ${collection.collection.title}.`;
     });
   }
 
@@ -193,7 +190,6 @@
     await runAction(next ? 'pin' : 'unpin', async () => {
       await (next ? pinMeme(actionRequest) : unpinMeme(actionRequest));
       pinned = next;
-      statusMessage = next ? 'Pinned.' : 'Unpinned.';
     });
   }
 
@@ -201,7 +197,6 @@
     await runAction('copy', async () => {
       if (!browser) return;
       await copyText(canonicalUrl);
-      statusMessage = 'Link copied.';
     });
   }
 
@@ -210,13 +205,12 @@
       if (!browser) return;
       void recordMemeShare(actionRequest).catch(() => undefined);
       window.open(telegramShareUrl(canonicalUrl, title), '_blank', 'noopener,noreferrer');
-      statusMessage = 'Opened Telegram share.';
     });
   }
 
   async function downloadMeme() {
     if (!browser || !downloadUrl) {
-      statusMessage = actionFailureMessage('download', null);
+      errorMessage = actionFailureMessage('download', null);
       return;
     }
 
@@ -229,13 +223,12 @@
       document.body.append(link);
       link.click();
       link.remove();
-      statusMessage = 'Download started.';
     });
   }
 
   function openReportForm() {
     reportOpen = true;
-    statusMessage = null;
+    errorMessage = null;
   }
 
   function closeReportForm() {
@@ -253,7 +246,6 @@
       });
       reportOpen = false;
       reportNote = '';
-      statusMessage = 'Report submitted. Thanks for helping keep MemeXpert clean.';
     });
   }
 
@@ -265,11 +257,11 @@
   async function runAction(action: MemeActionKind, callback: () => Promise<void>) {
     if (pending) return;
     pending = action;
-    statusMessage = null;
+    errorMessage = null;
     try {
       await callback();
     } catch (error) {
-      statusMessage = actionFailureMessage(action, error);
+      errorMessage = actionFailureMessage(action, error);
     } finally {
       pending = null;
     }
@@ -488,7 +480,7 @@
     </form>
   {/if}
 
-  {#if statusMessage}
-    <p class="basis-full text-sm text-muted" role="status">{statusMessage}</p>
+  {#if errorMessage}
+    <p class="basis-full text-sm text-danger" role="alert">{errorMessage}</p>
   {/if}
 </div>

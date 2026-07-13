@@ -56,6 +56,7 @@ test.describe('public masonry feed smoke', () => {
     const activeFavorite = firstCard.getByRole('button', { name: 'Remove favorite', exact: true });
     await expect(activeFavorite).toHaveAttribute('aria-pressed', 'true');
     await expect(activeFavorite.locator('svg')).toHaveClass(/text-danger/);
+    await expect(firstCard.getByText('Added to favorites.', { exact: true })).toHaveCount(0);
 
     const loadMore = page.getByRole('button', { name: 'Load more' });
     await expect(loadMore).toBeVisible();
@@ -150,7 +151,8 @@ test.describe('public masonry feed smoke', () => {
     expect((await collectionItems.allTextContents()).map((text) => text.trim())).toEqual(['Recent reactions', 'Favorites']);
 
     await page.getByRole('menuitem', { name: 'Recent reactions', exact: true }).click();
-    await expect(card.getByText('Saved to Recent reactions.')).toBeVisible();
+    await expect(card.getByRole('button', { name: 'Save to collection', exact: true })).toHaveAttribute('aria-pressed', 'true');
+    await expect(card.getByText('Saved to Recent reactions.', { exact: true })).toHaveCount(0);
   });
 
   test('search selection controls stay hidden until Select items is chosen', async ({ page }) => {
