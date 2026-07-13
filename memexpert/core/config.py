@@ -191,6 +191,9 @@ class Settings(BaseSettings):
     scheduler_rabbitmq_outbox_publisher_interval_seconds: float = Field(default=5.0, gt=0.0)
     scheduler_rabbitmq_outbox_publisher_batch_size: int = Field(default=100, ge=1, le=1000)
     scheduler_rabbitmq_outbox_publisher_stale_timeout_seconds: float = Field(default=300.0, gt=0.0)
+    scheduler_telegram_login_cleanup_enabled: bool = True
+    scheduler_telegram_login_cleanup_interval_seconds: float = Field(default=60.0, gt=0.0)
+    scheduler_telegram_login_cleanup_batch_size: int = Field(default=100, ge=1, le=1000)
     scheduler_advisory_lock_enabled: bool = True
     scheduler_advisory_lock_key: Annotated[tuple[int, int], NoDecode] = (0, 0)
     # --- S04: curated Telethon crawler + freshness SLO -----------------

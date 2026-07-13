@@ -163,9 +163,50 @@ describe('/admin/telegram page', () => {
     expect(body).toContain('Enter the Telegram code');
     expect(body).toContain('Phone ending 1234');
     expect(body).toContain('action="?/completePhoneCodeLogin"');
+    expect(body).toContain('formaction="?/cancelLoginAttempt"');
     expect(body).toContain('name="code"');
     expect(body).toContain(`type="hidden" name="attempt_id" value="${attemptId}"`);
     expect(body).not.toContain('Attempt id');
+  });
+
+  it('renders standalone phone and password steps before a new account record exists', () => {
+    const attemptId = '99999999-9999-4999-8999-999999999998';
+    const noAccounts = { ...pageData(), telegramAdmin: { sessions: [] } };
+    const code = render(TelegramAdminPage, {
+      props: {
+        data: noAccounts,
+        form: {
+          message: 'Telegram sent a verification code.',
+          kind: 'phone_code',
+          sessionId: null,
+          attemptId,
+          method: 'phone',
+          phoneHint: 'ending-1234',
+          error: false
+        }
+      }
+    }).body;
+    const password = render(TelegramAdminPage, {
+      props: {
+        data: noAccounts,
+        form: {
+          message: 'Telegram requires the account password.',
+          kind: 'password',
+          method: 'qr',
+          sessionId: null,
+          attemptId,
+          error: false
+        }
+      }
+    }).body;
+
+    expect(code).toContain('Enter the Telegram code');
+    expect(code).toContain('Phone ending 1234');
+    expect(code).toContain(`type="hidden" name="attempt_id" value="${attemptId}"`);
+    expect(code).not.toContain('name="session_id"');
+    expect(password).toContain('Enter the Telegram password');
+    expect(password).toContain('type="hidden" name="method" value="qr"');
+    expect(password).not.toContain('name="session_id"');
   });
 
   it('renders an active QR password step with hidden attempt id', () => {
@@ -188,6 +229,7 @@ describe('/admin/telegram page', () => {
     expect(body).toContain('Enter the Telegram password');
     expect(body).toContain('Telegram password');
     expect(body).toContain('action="?/completePhonePasswordLogin"');
+    expect(body).toContain('Cancel sign-in');
     expect(body).toContain('type="hidden" name="method" value="qr"');
     expect(body).toContain(`type="hidden" name="attempt_id" value="${attemptId}"`);
     expect(body).not.toContain('Attempt id');

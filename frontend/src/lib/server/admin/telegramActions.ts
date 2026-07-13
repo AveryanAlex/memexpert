@@ -2,6 +2,7 @@ import { fail } from '@sveltejs/kit';
 import type { RequestEvent } from '@sveltejs/kit';
 import {
   ApiError,
+  cancelAdminTelegramLoginAttempt,
   completeAdminTelegramPhoneCodeLogin,
   completeAdminTelegramPhonePasswordLogin,
   createAdminTelegramSession,
@@ -12,6 +13,7 @@ import {
   validateAdminTelegramSession
 } from '$lib/api/client';
 import type { TelegramSessionStatus } from '$lib/api/types';
+import { safeOperatorMessage } from '$lib/features/admin/telegram/view-model';
 import { apiRequest, readOptional, readRequired, runAction } from './actionUtils';
 
 type LoginMethod = 'phone' | 'qr';
@@ -20,7 +22,7 @@ const RETRYABLE_PHONE_CODE_MESSAGE = 'The Telegram code was incorrect. Try again
 const RETRYABLE_PASSWORD_MESSAGE = 'The Telegram password was incorrect. Try again.';
 
 interface LoginFailureContext {
-  sessionId?: string;
+  sessionId?: string | null;
   attemptId?: string;
   method: LoginMethod;
   phoneHint?: string | null;
@@ -79,11 +81,13 @@ export async function repairSession({ fetch, request }: RequestEvent) {
 
 export async function startQrLogin({ fetch, request }: RequestEvent) {
   const data = await request.formData();
-  let sessionId = readOptional(data, 'session_id') ?? undefined;
+  const sessionId = readOptional(data, 'session_id');
   try {
     const api = apiRequest(fetch, request);
-    sessionId ??= await ensureLoginSessionId(api, data);
-    const result = await startAdminTelegramQrLogin(api, sessionId);
+    const result = await startAdminTelegramQrLogin({
+      ...api,
+      body: { telegram_session_id: sessionId, note: readOptional(data, 'note') }
+    });
     return {
       message: 'Waiting for scan…',
       kind: 'qr' as const,
@@ -99,14 +103,15 @@ export async function startQrLogin({ fetch, request }: RequestEvent) {
 
 export async function startPhoneLogin({ fetch, request }: RequestEvent) {
   const data = await request.formData();
-  let sessionId = readOptional(data, 'session_id') ?? undefined;
+  const sessionId = readOptional(data, 'session_id');
   try {
     const phoneNumber = readRequired(data, 'phone_number');
     const api = apiRequest(fetch, request);
-    sessionId ??= await ensureLoginSessionId(api, data);
     const result = await startAdminTelegramPhoneLogin(
-      { ...api, body: { phone_number: phoneNumber, note: readOptional(data, 'note') } },
-      sessionId
+      {
+        ...api,
+        body: { telegram_session_id: sessionId, phone_number: phoneNumber, note: readOptional(data, 'note') }
+      }
     );
     return {
       message: 'Telegram sent a verification code. Enter it to continue.',
@@ -127,21 +132,20 @@ export async function completePhoneCodeLogin({ fetch, request }: RequestEvent) {
   const data = await request.formData();
   const context = loginContext(data, 'phone');
   try {
-    const sessionId = readRequired(data, 'session_id');
     const attemptId = readRequired(data, 'attempt_id');
     const result = await completeAdminTelegramPhoneCodeLogin(
       {
         ...apiRequest(fetch, request),
-        body: { attempt_id: attemptId, code: readRequired(data, 'code'), note: readOptional(data, 'note') }
+        body: { code: readRequired(data, 'code'), note: readOptional(data, 'note') }
       },
-      sessionId
+      attemptId
     );
     if (result.password_required) {
       return {
         message: 'Telegram requires the account password. Enter it to finish.',
         kind: 'password' as const,
         method: 'phone' as const,
-        sessionId,
+        sessionId: context.sessionId ?? null,
         attemptId,
         phoneHint: context.phoneHint,
         error: false
@@ -164,14 +168,13 @@ export async function completePhonePasswordLogin({ fetch, request }: RequestEven
     if (requestedMethod !== 'phone' && requestedMethod !== 'qr') {
       throw new ApiError(400, 'method must be phone or qr.');
     }
-    const sessionId = readRequired(data, 'session_id');
     const attemptId = readRequired(data, 'attempt_id');
     const result = await completeAdminTelegramPhonePasswordLogin(
       {
         ...apiRequest(fetch, request),
-        body: { attempt_id: attemptId, password: readRequired(data, 'password'), note: readOptional(data, 'note') }
+        body: { password: readRequired(data, 'password'), note: readOptional(data, 'note') }
       },
-      sessionId
+      attemptId
     );
     return { message: result.message };
   } catch (caught) {
@@ -179,6 +182,17 @@ export async function completePhonePasswordLogin({ fetch, request }: RequestEven
       ? passwordFailure(caught, context)
       : loginFailure(caught, context);
   }
+}
+
+export async function cancelLoginAttempt({ fetch, request }: RequestEvent) {
+  const data = await request.formData();
+  return runAction(async () => {
+    await cancelAdminTelegramLoginAttempt(
+      apiRequest(fetch, request),
+      readRequired(data, 'attempt_id')
+    );
+    return { message: 'Telegram sign-in cancelled.' };
+  });
 }
 
 export async function validateSession({ fetch, request }: RequestEvent) {
@@ -217,11 +231,6 @@ export async function deleteSession({ fetch, request }: RequestEvent) {
   });
 }
 
-async function ensureLoginSessionId(api: ReturnType<typeof apiRequest>, data: FormData): Promise<string> {
-  const created = await createAdminTelegramSession({ ...api, body: telegramSessionCreateBody(data) });
-  return created.id;
-}
-
 function telegramSessionCreateBody(data: FormData) {
   return {
     name: readOptional(data, 'name'),
@@ -237,7 +246,7 @@ function telegramSessionCreateBody(data: FormData) {
 
 function loginContext(data: FormData, method: LoginMethod): LoginFailureContext {
   return {
-    sessionId: readOptional(data, 'session_id') ?? undefined,
+    sessionId: readOptional(data, 'session_id'),
     attemptId: readOptional(data, 'attempt_id') ?? undefined,
     method,
     phoneHint: method === 'phone' ? readOptional(data, 'phone_hint') : undefined
@@ -246,7 +255,10 @@ function loginContext(data: FormData, method: LoginMethod): LoginFailureContext 
 
 function loginFailure(caught: unknown, context: LoginFailureContext) {
   const status = caught instanceof ApiError ? caught.status : 400;
-  const message = caught instanceof Error ? caught.message : 'Telegram sign-in could not continue.';
+  const message = safeOperatorMessage(
+    caught instanceof Error ? caught.message : 'Telegram sign-in could not continue.',
+    'Telegram sign-in could not continue.'
+  );
   return fail(status, {
     message,
     error: true,
@@ -301,6 +313,7 @@ export const telegramAccountActions = {
   startPhoneLogin,
   completePhoneCodeLogin,
   completePhonePasswordLogin,
+  cancelLoginAttempt,
   validateSession,
   deleteSession
 };

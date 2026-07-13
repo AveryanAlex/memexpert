@@ -60,8 +60,8 @@ The crawler ships five operator-facing pieces:
   - `PIPELINE_OPERATOR_TOKEN` — required by the operator-token crawler and
     pipeline routes used in the commands below.
   - `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` — the Telethon app
-    credentials used by browser-admin validation and the CLI helper. These are
-    per-environment secrets; never commit them.
+    credentials used by browser-admin login/validation, scheduler cleanup, and
+    the CLI helper. These are per-environment secrets; never commit them.
   - `TELEGRAM_SESSION_ENCRYPTION_SECRET` — high-entropy secret used to
     encrypt/decrypt DB-backed Telethon `StringSession` values in
     `telegram_sessions.encrypted_string_session` for browser admin, the CLI
@@ -129,10 +129,24 @@ reads, rendered HTML, logs, and audit snapshots. Diagnostics may say only that
 an authorized credential is present; account identity, readiness, source count,
 and heartbeat are the routine card contents.
 
-- Successful login stores the authorized Telethon material encrypted in the DB,
-  updates the account projection, clears parked/error state, and marks the
-  account `active`. Login-created accounts enable catch-up/live/engagement by
-  default with `max_requests_per_second=1`.
+- Starting QR or phone login creates a temporary login attempt only. A new
+  account does not appear in the account list until Telegram authorization and
+  identity lookup both succeed. Closing the dialog sends a best-effort cancel;
+  expiry in the database remains authoritative when the browser or API process
+  disappears.
+- Successful login stores the authorized Telethon material encrypted in the DB
+  and only then creates or updates the account projection. Canonical Telegram
+  account identity is unique: reconnecting an existing identity rotates its
+  credential instead of creating another card. An explicit reconnect target
+  must resolve to the same identity. The account is enabled, returned to
+  `active`, and has stale parked/error state cleared. Newly created accounts
+  enable catch-up/live/engagement by default and use
+  `max_requests_per_second=1`.
+- Temporary credentials are retired differently depending on the outcome. A
+  successfully promoted client is only disconnected. A failed, cancelled, or
+  expired attempt is disconnected when unauthorized, but an authorized
+  abandoned auth key is revoked with Telegram logout before disconnect. This
+  prevents unfinished login flows from accumulating as Telegram devices.
 - Use **Validate account** for a routine access check. Diagnostics holds raw
   timestamps/status/error category; Advanced settings holds policy/rate/repair
   controls. A separate **Disconnect account** danger disclosure requires
@@ -154,6 +168,34 @@ uv run python scripts/auth_telegram_session.py \
 You can also provide the existing StringSession through `--string-session` or
 `TELEGRAM_STRING_SESSION`. The helper never creates `.session` files and never
 prints the StringSession value.
+
+#### Login-attempt cleanup
+
+Normal cleanup is automatic and applies to both QR and phone flows:
+
+1. When the connection dialog closes, the browser sends `DELETE` to
+   `/api/v1/admin/telegram/login-attempts/{attempt_id}`. Treat this as latency
+   optimization, not the only cleanup mechanism.
+2. API-side completion/cancel/expiry cleanup retires the in-memory Telethon
+   client and removes temporary QR, phone continuation, and encrypted session
+   data after retirement succeeds.
+3. The `telegram-login-cleanup` job in `memexpert-scheduler` runs every 60
+   seconds. It claims expired `pending`/`password_required` attempts and
+   terminal attempts whose cleanup is `pending` or `failed`, rebuilds the
+   temporary client from its encrypted credential, revokes an authorized
+   abandoned key, and disconnects it. Cleanup is idempotent and safe to retry
+   after process or provider failures.
+4. A cleanup-failed attempt retains the encrypted temporary credential only so
+   the scheduler can retry revocation. It never becomes a crawler account and
+   is not returned in the routine account list.
+
+If unfinished attempts or Telegram devices appear to accumulate, first verify
+that `memexpert-scheduler` is running and inspect `telegram-login-cleanup` for
+provider/network failures. Do not delete cleanup-failed rows manually: removing
+their encrypted temporary credential makes server-side Telegram logout
+impossible. Once cleanup succeeds, the job sets cleanup to `discarded`, clears
+the credential and provider continuation fields, and preserves only non-secret
+terminal metadata for audit/debugging.
 
 ### Sources and assignment
 

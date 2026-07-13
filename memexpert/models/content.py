@@ -1154,6 +1154,12 @@ class TelegramSession(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             "max_requests_per_second > 0",
             name="ck_telegram_sessions_max_requests_per_second_positive",
         ),
+        Index(
+            "uq_telegram_sessions_account_user_id_not_null",
+            "account_user_id",
+            unique=True,
+            postgresql_where=text("account_user_id IS NOT NULL"),
+        ),
         Index("ix_telegram_sessions_status_updated_at", "status", "updated_at"),
         Index("ix_telegram_sessions_enabled_status", "enabled", "status"),
     )
@@ -1186,7 +1192,6 @@ class TelegramSession(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     login_attempts: Mapped[list["TelegramSessionLoginAttempt"]] = relationship(
         "TelegramSessionLoginAttempt",
         back_populates="telegram_session",
-        cascade="all, delete-orphan",
         passive_deletes=True,
     )
     source_channels: Mapped[list["SourceChannel"]] = relationship(
@@ -1206,23 +1211,50 @@ class TelegramSessionLoginAttempt(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             name="ck_telegram_session_login_attempts_method_known",
         ),
         CheckConstraint(
-            "status IN ('pending', 'password_required', 'completed', 'failed', 'expired')",
+            "status IN ('pending', 'password_required', 'completed', 'failed', 'expired', 'cancelled')",
             name="ck_telegram_session_login_attempts_status_known",
+        ),
+        CheckConstraint(
+            "cleanup_status IN ('pending', 'promoted', 'discarded', 'failed')",
+            name="ck_telegram_session_login_attempts_cleanup_status_known",
+        ),
+        CheckConstraint(
+            "cleanup_attempts >= 0",
+            name="ck_telegram_session_login_attempts_cleanup_attempts_nonnegative",
         ),
         Index(
             "ix_telegram_session_login_attempts_session_created_at",
             "telegram_session_id",
             "created_at",
         ),
+        Index(
+            "ix_telegram_session_login_attempts_cleanup_status_expires_at",
+            "cleanup_status",
+            "expires_at",
+        ),
+        Index(
+            "ix_telegram_session_login_attempts_created_by_created_at",
+            "created_by_admin_user_id",
+            "created_at",
+        ),
         Index("ix_telegram_session_login_attempts_expires_at", "expires_at"),
     )
 
-    telegram_session_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("telegram_sessions.id", ondelete="CASCADE"),
-        nullable=False,
+    telegram_session_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("telegram_sessions.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    created_by_admin_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
     )
     method: Mapped[str] = mapped_column(String(16), nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
+    cleanup_status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
+    cleanup_attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    cleanup_error_class: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    cleanup_error_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    cleanup_completed_at: Mapped[datetime | None] = mapped_column(nullable=True)
     # Temporary Telethon StringSession material encrypted with the runtime secret.
     # API read schemas must never expose this column.
     encrypted_temp_string_session: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -1234,7 +1266,7 @@ class TelegramSessionLoginAttempt(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     expires_at: Mapped[datetime] = mapped_column(nullable=False)
     completed_at: Mapped[datetime | None] = mapped_column(nullable=True)
 
-    telegram_session: Mapped["TelegramSession"] = relationship(
+    telegram_session: Mapped["TelegramSession | None"] = relationship(
         "TelegramSession",
         back_populates="login_attempts",
     )

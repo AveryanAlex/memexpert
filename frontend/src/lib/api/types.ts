@@ -726,8 +726,12 @@ export interface AdminTelegramLoginQrStartRead {
   message: string;
 }
 
+export interface AdminTelegramLoginQrStartPayload {
+  telegram_session_id?: string | null;
+  note?: string | null;
+}
+
 export interface AdminTelegramLoginQrCompletePayload {
-  attempt_id: string;
   note?: string | null;
 }
 
@@ -741,6 +745,7 @@ export interface AdminTelegramLoginQrStatusRead {
 }
 
 export interface AdminTelegramLoginPhoneStartPayload {
+  telegram_session_id?: string | null;
   phone_number: string;
   note?: string | null;
 }
@@ -753,20 +758,24 @@ export interface AdminTelegramLoginPhoneStartRead {
 }
 
 export interface AdminTelegramLoginPhoneCodePayload {
-  attempt_id: string;
   code: string;
   note?: string | null;
 }
 
 export interface AdminTelegramLoginPasswordPayload {
-  attempt_id: string;
   password: string;
   note?: string | null;
 }
 
 export interface AdminTelegramLoginCompleteRead {
-  telegram_session: AdminTelegramSessionRead;
+  telegram_session: AdminTelegramSessionRead | null;
   password_required: boolean;
+  message: string;
+}
+
+export interface AdminTelegramLoginCancelRead {
+  attempt_id: string;
+  status: 'cancelled';
   message: string;
 }
 

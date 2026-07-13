@@ -213,6 +213,9 @@ def test_settings_parse_scheduler_contracts() -> None:
             "scheduler_search_index_sync_processing_timeout_seconds": 45.0,
             "scheduler_seo_backlog_batches_interval_seconds": 240.0,
             "scheduler_seo_backlog_batch_size": 9,
+            "scheduler_telegram_login_cleanup_enabled": False,
+            "scheduler_telegram_login_cleanup_interval_seconds": 30.0,
+            "scheduler_telegram_login_cleanup_batch_size": 17,
             "scheduler_advisory_lock_enabled": False,
             "scheduler_advisory_lock_key": "123, 456",
         }
@@ -238,6 +241,9 @@ def test_settings_parse_scheduler_contracts() -> None:
     assert settings.scheduler_search_index_sync_processing_timeout_seconds == 45.0
     assert settings.scheduler_seo_backlog_batches_interval_seconds == 240.0
     assert settings.scheduler_seo_backlog_batch_size == 9
+    assert settings.scheduler_telegram_login_cleanup_enabled is False
+    assert settings.scheduler_telegram_login_cleanup_interval_seconds == 30.0
+    assert settings.scheduler_telegram_login_cleanup_batch_size == 17
     assert settings.scheduler_advisory_lock_enabled is False
     assert settings.scheduler_advisory_lock_key == (123, 456)
 

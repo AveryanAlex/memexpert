@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { AdminTelegramSessionRead } from '$lib/api/types';
-import { loginStateForAccount, toTelegramAccountViewModel } from './view-model';
+import { loginStateForAccount, loginStateForNewAccount, toTelegramAccountViewModel } from './view-model';
 
 describe('Telegram account view model', () => {
   it('maps every account state to the safe routine repair action', () => {
@@ -130,6 +130,24 @@ describe('Telegram account view model', () => {
     expect(phoneCodeState).toMatchObject({ kind: 'phone_code', error: true, attemptId: 'attempt-1' });
     expect(passwordState).toMatchObject({ kind: 'password', error: true, attemptId: 'attempt-1' });
     expect(JSON.stringify(passwordState)).not.toContain('should-not-render');
+  });
+
+  it('keeps standalone login steps separate from existing account cards', () => {
+    const standalone = { kind: 'phone_code', sessionId: null, attemptId: 'attempt-1', phoneHint: 'ending-1234', message: 'Code sent.' };
+
+    expect(loginStateForNewAccount(standalone, null)).toMatchObject({
+      kind: 'phone_code',
+      sessionId: null,
+      attemptId: 'attempt-1'
+    });
+    expect(loginStateForAccount(standalone, account().id, null)).toBeNull();
+    expect(loginStateForNewAccount(null, {
+      kind: 'password',
+      method: 'qr',
+      sessionId: null,
+      attemptId: 'attempt-2',
+      message: 'Password required.'
+    })).toMatchObject({ kind: 'password', sessionId: null, attemptId: 'attempt-2' });
   });
 });
 
