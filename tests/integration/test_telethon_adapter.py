@@ -77,6 +77,30 @@ class _FakeTelegramClient:
         self.connected = False
 
 
+@dataclass(frozen=True, slots=True)
+class _FakeChannel:
+    title: str = "Channel"
+    username: str | None = None
+
+
+@dataclass(slots=True)
+class _FakeSingleMessageClient:
+    message: object
+
+    async def get_messages(self, _entity: object, *, ids: int) -> object:
+        assert ids == 11
+        return self.message
+
+
+@dataclass(slots=True)
+class _FakeSingleMessageFactory:
+    client: _FakeSingleMessageClient
+    max_requests_per_second: float | None = None
+
+    async def get_client(self) -> _FakeSingleMessageClient:
+        return self.client
+
+
 @pytest.fixture(autouse=True)
 def _reset_fake_telethon_client() -> None:
     _FakeTelegramClient.instances = []
@@ -284,5 +308,44 @@ def test_telethon_channel_photo_service_event_is_not_downloadable_post_media() -
         channel_username=None,
     )
 
+    assert normalized.media_type == "unsupported"
+    assert normalized.raw_payload is service_message
+
+
+async def test_telethon_fetch_single_message_accepts_service_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_at = datetime(2024, 5, 1, 12, 30, tzinfo=UTC)
+    service_message = MessageService(
+        id=11,
+        peer_id=PeerChannel(channel_id=123),
+        date=observed_at,
+        action=MessageActionChatEditPhoto(
+            photo=Photo(
+                id=1,
+                access_hash=2,
+                file_reference=b"",
+                date=observed_at,
+                sizes=[],
+                dc_id=4,
+            ),
+        ),
+    )
+    client = PipelineTelethonClient(
+        factory=cast(
+            "Any",
+            _FakeSingleMessageFactory(client=_FakeSingleMessageClient(message=service_message)),
+        ),
+        rate_limiter=_RateLimiter(max_requests_per_second=10.0),
+    )
+
+    async def _resolve_entity(_self: PipelineTelethonClient, _channel_id: str) -> _FakeChannel:
+        return _FakeChannel()
+
+    monkeypatch.setattr(PipelineTelethonClient, "_resolve_entity", _resolve_entity)
+
+    normalized = await client.fetch_single_message(channel_id="123", post_id="11")
+
+    assert normalized.message_id == "11"
     assert normalized.media_type == "unsupported"
     assert normalized.raw_payload is service_message

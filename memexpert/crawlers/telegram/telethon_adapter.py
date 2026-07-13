@@ -29,6 +29,7 @@ from telethon.errors import (
 from telethon.sessions import StringSession
 from telethon.tl.types import Channel, InputPeerChannel
 from telethon.tl.types import Message as TelethonMessage
+from telethon.tl.types import MessageService as TelethonMessageService
 
 from memexpert.core.database import build_async_engine, build_async_session_factory
 from memexpert.crawlers.telegram.client import (
@@ -661,7 +662,7 @@ class PipelineTelethonClient(PipelineTelegramClientProtocol):
             raise PipelineTelegramMalformedMessageError(
                 f"Telegram returned no message for ({channel_id!r}, {post_id!r}).",
             )
-        if not isinstance(fetched, TelethonMessage):
+        if not isinstance(fetched, (TelethonMessage, TelethonMessageService)):
             raise PipelineTelegramMalformedMessageError(
                 f"Telegram returned a non-message container for ({channel_id!r}, {post_id!r}).",
             )
