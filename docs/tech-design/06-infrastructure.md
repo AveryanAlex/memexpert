@@ -163,13 +163,21 @@ Service layer with real infrastructure — each test run spins up fresh containe
 ## CI/CD
 
 ```
-push/PR → [parallel]
-            ├─ Python: lint (ruff) → type check (ty) → unit tests → integration tests (testcontainers)
-            └─ SvelteKit: pnpm install → svelte-check → Vitest → Playwright smoke → build
-merge    → build images → deploy staging → Playwright E2E → deploy production
+push/PR   → [parallel]
+             ├─ Python lint and type checks
+             ├─ Python unit and integration tests (testcontainers)
+             ├─ SvelteKit checks, Vitest, Playwright smoke, and build
+             └─ container builds, image smoke tests, and real-stack PRD E2E
+main push → publish main/worker/frontend `:main` images → Reploy production
 ```
 
 Integration tests run in CI with testcontainers — no shared test databases, no flaky state between runs.
+
+The production deployment job runs only for a successful push to `main` and
+waits for every CI job. It uses the GitHub Environment `production`; the Reploy
+endpoint is stored in its `REPLOY_URL` environment variable and the bearer token
+in its `REPLOY_TOKEN` environment secret. The deployment requests all three
+published app images so Reploy can pull them and restart the affected units.
 
 CI concurrency is keyed by source repository and branch/PR head so a newer run cancels an obsolete run for that head. Before BuildKit cache options are assembled, CI replaces unsafe branch characters and adds a hash of the source repository and full branch name. The actual default-branch run uses the literal `main` suffix so it keeps the fallback cache populated. Other heads write only their sanitized, hashed scope and read `main` as a fallback, preventing concurrent branches or forks from sharing a writer scope or injecting cache-option delimiters.
 

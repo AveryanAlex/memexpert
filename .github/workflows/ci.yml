@@ -374,3 +374,23 @@ jobs:
             type=gha,scope=memexpert-frontend-${{ steps.cache-scope.outputs.suffix }}
             type=gha,scope=memexpert-frontend-main
           cache-to: type=gha,scope=memexpert-frontend-${{ steps.cache-scope.outputs.suffix }},mode=max
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs:
+      - lint
+      - test
+      - frontend
+      - e2e
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: production
+    steps:
+      - name: Deploy production
+        uses: AveryanAlex/reploy-action@v1
+        with:
+          url: ${{ vars.REPLOY_URL }}
+          token: ${{ secrets.REPLOY_TOKEN }}
+          images: |
+            ghcr.io/averyanalex/memexpert/main:main
+            ghcr.io/averyanalex/memexpert/worker:main
+            ghcr.io/averyanalex/memexpert/frontend:main
