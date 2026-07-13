@@ -213,33 +213,38 @@ class CollectionService:
         return CollectionRead.model_validate(persisted_collection)
 
     async def list_collections_for_user(self, *, user_id: object) -> list[CollectionRead]:
-        """Return collections the user belongs to, newest-updated first, with Favorites ensured."""
+        """Return collections the user belongs to, most recently saved-to first, with Favorites ensured."""
 
         user = await self._get_user_model(user_id)
         if user is None:
             raise UserNotFoundError(f"User {user_id} does not exist.")
 
         _ = await self.ensure_favorites_collection(user.id)
-        result = await self._session.execute(
+        latest_meme_added_at = (
+            select(func.max(CollectionMeme.added_at))
+            .where(CollectionMeme.collection_id == Collection.id)
+            .correlate(Collection)
+            .scalar_subquery()
+        )
+        collection_query = (
             select(Collection)
             .options(selectinload(Collection.memberships), selectinload(Collection.invites))
             .join(CollectionMember, CollectionMember.collection_id == Collection.id)
             .where(CollectionMember.user_id == user.id)
-            .order_by(Collection.kind.asc(), Collection.updated_at.desc(), Collection.title.asc())
+            .order_by(
+                latest_meme_added_at.desc().nulls_last(),
+                Collection.updated_at.desc(),
+                Collection.title.asc(),
+                Collection.id.asc(),
+            )
             .execution_options(populate_existing=True)
         )
+        result = await self._session.execute(collection_query)
         collections = list(result.scalars().unique())
         if await self._persist_terminal_invite_statuses(
             [invite for collection in collections for invite in collection.invites],
         ):
-            result = await self._session.execute(
-                select(Collection)
-                .options(selectinload(Collection.memberships), selectinload(Collection.invites))
-                .join(CollectionMember, CollectionMember.collection_id == Collection.id)
-                .where(CollectionMember.user_id == user.id)
-                .order_by(Collection.kind.asc(), Collection.updated_at.desc(), Collection.title.asc())
-                .execution_options(populate_existing=True)
-            )
+            result = await self._session.execute(collection_query)
             collections = list(result.scalars().unique())
         return [CollectionRead.model_validate(collection) for collection in collections]
 

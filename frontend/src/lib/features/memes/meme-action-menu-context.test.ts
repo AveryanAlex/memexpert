@@ -17,9 +17,10 @@ describe('MemeActionMenu viewer capabilities', () => {
     });
 
     expect(body).toContain('Actions for Context pin meme');
-    expect(body).toContain('Favorite');
-    expect(body).toContain('Save');
-    expect(body).toContain('Send');
+    expect(body).toContain('aria-label="Favorite"');
+    expect(body).toContain('aria-label="Download"');
+    expect(body).toContain('aria-label="Save to collection"');
+    expect(body).toContain('aria-label="Send"');
     expect(body).toContain('Select items');
     expect(body).not.toContain('Bulk actions');
     expect(body).not.toContain('type="checkbox"');
@@ -36,7 +37,7 @@ describe('MemeActionMenu viewer capabilities', () => {
     });
 
     expect(body).toContain('Favorite (4)');
-    expect(body).toContain('Save');
+    expect(body).toContain('aria-label="Save to collection"');
     expect(body).toContain('Send');
     expect(body).toContain('aria-label="Meme actions"');
     expect(body).not.toContain('Pin requires a full account');

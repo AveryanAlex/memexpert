@@ -20,11 +20,13 @@ test.describe('public masonry feed smoke', () => {
     const firstCardLink = feed.getByRole('link', { name: 'Open Smoke test cat reaction' });
     const firstCard = firstCardLink.locator('xpath=ancestor::article');
     const firstCardFavorite = firstCard.getByRole('button', { name: 'Favorite', exact: true });
-    const firstCardSave = firstCard.getByRole('button', { name: 'Save', exact: true });
+    const firstCardDownload = firstCard.getByRole('button', { name: 'Download', exact: true });
+    const firstCardSave = firstCard.getByRole('button', { name: 'Save to collection', exact: true });
     const firstCardSend = firstCard.getByRole('button', { name: 'Send', exact: true });
     const firstCardMenu = feed.getByRole('button', { name: 'Actions for Smoke test cat reaction' });
     await expect(firstCardLink).toBeVisible();
     await expect(firstCardFavorite).toBeVisible();
+    await expect(firstCardDownload).toBeVisible();
     await expect(firstCardSave).toBeVisible();
     await expect(firstCardSend).toBeVisible();
     await expect(firstCardMenu).toBeVisible();
@@ -38,6 +40,8 @@ test.describe('public masonry feed smoke', () => {
     await page.keyboard.press('Tab');
     await expect(firstCardFavorite).toBeFocused();
     await page.keyboard.press('Tab');
+    await expect(firstCardDownload).toBeFocused();
+    await page.keyboard.press('Tab');
     await expect(firstCardSave).toBeFocused();
     await page.keyboard.press('Tab');
     await expect(firstCardSend).toBeFocused();
@@ -47,6 +51,11 @@ test.describe('public masonry feed smoke', () => {
     await expect(firstCardMenu).toHaveAttribute('aria-expanded', 'true');
     await expect(page.getByRole('menuitem', { name: /Favorite meme|Remove favorite/ })).toBeVisible();
     await page.keyboard.press('Escape');
+
+    await firstCardFavorite.click();
+    const activeFavorite = firstCard.getByRole('button', { name: 'Remove favorite', exact: true });
+    await expect(activeFavorite).toHaveAttribute('aria-pressed', 'true');
+    await expect(activeFavorite.locator('svg')).toHaveClass(/text-danger/);
 
     const loadMore = page.getByRole('button', { name: 'Load more' });
     await expect(loadMore).toBeVisible();
@@ -81,7 +90,8 @@ test.describe('public masonry feed smoke', () => {
     const cardLink = feed.getByRole('link', { name: 'Open Smoke test cat reaction' });
     const card = cardLink.locator('xpath=ancestor::article');
     await expect(card.getByRole('button', { name: 'Favorite', exact: true })).toBeVisible();
-    await expect(card.getByRole('button', { name: 'Save', exact: true })).toBeVisible();
+    await expect(card.getByRole('button', { name: 'Download', exact: true })).toBeVisible();
+    await expect(card.getByRole('button', { name: 'Save to collection', exact: true })).toBeVisible();
     await expect(card.getByRole('button', { name: 'Send', exact: true })).toBeVisible();
     await expect(feed.getByRole('button', { name: 'Actions for Smoke test cat reaction' })).toBeVisible();
     const mediaBox = await card.getByRole('img', { name: 'Smoke test cat reaction' }).boundingBox();
@@ -98,7 +108,8 @@ test.describe('public masonry feed smoke', () => {
     const card = feed.getByRole('link', { name: 'Open Smoke test cat reaction' }).locator('xpath=ancestor::article');
     const actions = [
       card.getByRole('button', { name: 'Favorite', exact: true }),
-      card.getByRole('button', { name: 'Save', exact: true }),
+      card.getByRole('button', { name: 'Download', exact: true }),
+      card.getByRole('button', { name: 'Save to collection', exact: true }),
       card.getByRole('button', { name: 'Send', exact: true }),
       card.getByRole('button', { name: 'Actions for Smoke test cat reaction' })
     ];
@@ -112,6 +123,34 @@ test.describe('public masonry feed smoke', () => {
       expect((boxes[index]?.x ?? 0) + (boxes[index]?.width ?? 0)).toBeLessThanOrEqual((boxes[index + 1]?.x ?? 0) + 1);
     }
     await expect(page.locator('html')).toHaveJSProperty('scrollWidth', 320);
+  });
+
+  test('save chooser keeps writable collections in recent-addition order', async ({ baseURL, page }) => {
+    await page.context().addCookies([
+      {
+        name: 'memexpert_access_token',
+        value: 'miniapp-full',
+        url: baseURL ?? 'http://127.0.0.1:4174',
+        httpOnly: true,
+        sameSite: 'Lax'
+      }
+    ]);
+    await disableIntersectionObserver(page);
+    await page.goto('/');
+
+    const feed = page.getByRole('list', { name: 'Meme results' });
+    const card = feed.getByRole('link', { name: 'Open Smoke test cat reaction' }).locator('xpath=ancestor::article');
+    await card.getByRole('button', { name: 'Save to collection', exact: true }).click();
+
+    await expect(page.getByRole('menuitem', { name: 'Recent reactions', exact: true })).toBeVisible();
+    await expect(page.getByRole('menuitem', { name: 'Favorites', exact: true })).toBeVisible();
+    await expect(page.getByRole('menuitem', { name: 'Smoke private team saves', exact: true })).toHaveCount(0);
+    const collectionItems = page.getByRole('menuitem');
+    await expect(collectionItems).toHaveCount(2);
+    expect((await collectionItems.allTextContents()).map((text) => text.trim())).toEqual(['Recent reactions', 'Favorites']);
+
+    await page.getByRole('menuitem', { name: 'Recent reactions', exact: true }).click();
+    await expect(card.getByText('Saved to Recent reactions.')).toBeVisible();
   });
 
   test('search selection controls stay hidden until Select items is chosen', async ({ page }) => {
@@ -173,7 +212,7 @@ test('search result opens detail with media and actions', async ({ page }) => {
   await expect(page.getByRole('img', { name: 'Smoke test cat reaction' })).toBeVisible();
 
   await expect(page.getByRole('button', { name: 'Favorite (7)' })).toBeVisible();
-  await expect(page.getByRole('button', { name: 'Save', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Save to collection', exact: true })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeVisible();
   await expect(page.getByText('Pin requires a full account')).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Pin', exact: true })).toHaveCount(0);

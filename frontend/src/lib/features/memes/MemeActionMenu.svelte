@@ -1,6 +1,7 @@
 <script lang="ts">
   import { browser } from '$app/environment';
   import {
+    fetchCollections,
     favoriteMeme,
     pinMeme,
     recordMemeDownload,
@@ -8,11 +9,12 @@
     reportMeme,
     removeSavedMeme,
     saveMeme,
+    saveMemeToCollection,
     unfavoriteMeme,
     unpinMeme,
     type RemoveActionResponse
   } from '$lib/api/client';
-  import type { ModerationReason, PublicMemeCardRead, PublicMemeDetailRead } from '$lib/api/types';
+  import type { ModerationReason, PublicMemeCardRead, PublicMemeDetailRead, WebCollectionSummaryRead } from '$lib/api/types';
   import {
     actionFailureMessage,
     canonicalMemeUrl,
@@ -25,9 +27,10 @@
     type MemeActionKind
   } from '$lib/memeActions';
   import { Button, Select, Textarea } from '$lib/ui';
+  import { cn } from '$lib/ui/styles';
   import { readViewerCapabilities } from '$lib/viewer-capabilities';
   import * as Menu from '$lib/ui/dropdown-menu';
-  import { Bookmark, Copy, Download, Flag, Heart, MoreHorizontal, Pin, Send } from '@lucide/svelte';
+  import { Bookmark, Copy, Download, Flag, Folder, Heart, MoreHorizontal, Pin, Send } from '@lucide/svelte';
 
   export type MemeActionSurface = 'card' | 'detail' | 'overflow';
 
@@ -68,6 +71,12 @@
   let reportReason = $state<ModerationReason>('spam');
   let reportNote = $state('');
   let hydrated = $state(false);
+  let saveMenuOpen = $state(false);
+  let collectionsRequestForOpen = $state(false);
+  let collectionsLoading = $state(false);
+  let collectionsReady = $state(false);
+  let collectionsError = $state<string | null>(null);
+  let writableCollections = $state<WebCollectionSummaryRead[]>([]);
 
   const reportReasons: Array<{ value: ModerationReason; label: string }> = [
     { value: 'spam', label: 'Spam or scam' },
@@ -101,6 +110,15 @@
     hydrated = true;
   });
 
+  $effect(() => {
+    if (saveMenuOpen && !collectionsRequestForOpen) {
+      collectionsRequestForOpen = true;
+      void loadCollections();
+    } else if (!saveMenuOpen && collectionsRequestForOpen) {
+      collectionsRequestForOpen = false;
+    }
+  });
+
   function syncStateFromMeme() {
     favorited = meme.viewer_has_favorited;
     saved = meme.viewer_has_saved;
@@ -130,6 +148,42 @@
       await (next ? saveMeme(actionRequest) : removeSavedMeme(actionRequest));
       saved = next;
       statusMessage = next ? 'Saved to your active collection.' : 'Removed from your active collection.';
+    });
+  }
+
+  async function loadCollections() {
+    if (!browser || collectionsLoading) return;
+
+    collectionsLoading = true;
+    collectionsReady = false;
+    collectionsError = null;
+    try {
+      const response = await fetchCollections({ fetch, baseUrl: window.location.origin });
+      writableCollections = response.collections.filter((collection) => collection.capabilities.can_add_memes);
+      collectionsReady = true;
+    } catch (error) {
+      collectionsError = error instanceof Error ? error.message : 'Could not load your collections.';
+    } finally {
+      collectionsLoading = false;
+    }
+  }
+
+  function selectCollection(collection: WebCollectionSummaryRead) {
+    void saveToCollection(collection);
+  }
+
+  async function saveToCollection(collection: WebCollectionSummaryRead) {
+    if (!browser) return;
+
+    await runAction('save', async () => {
+      await saveMemeToCollection({
+        fetch,
+        baseUrl: window.location.origin,
+        collectionId: collection.collection.id,
+        memeId: meme.id
+      });
+      saved = true;
+      statusMessage = `Saved to ${collection.collection.title}.`;
     });
   }
 
@@ -245,46 +299,80 @@
   }
 </script>
 
+{#snippet saveCollectionMenu()}
+  <Menu.Content align={isCardSurface ? 'center' : 'start'} class="max-h-80 w-[min(18rem,calc(100vw-2rem))] overflow-y-auto">
+    <p class="m-0 px-3 pb-2 pt-1 text-xs font-extrabold uppercase tracking-wide text-muted">Save to collection</p>
+    {#if collectionsLoading || (!collectionsReady && !collectionsError)}
+      <Menu.Item disabled>Loading collections…</Menu.Item>
+    {:else if collectionsError}
+      <p class="m-0 rounded-xl px-3 py-2.5 text-sm font-semibold text-danger" role="alert">{collectionsError} Close and reopen to retry.</p>
+    {:else if writableCollections.length === 0}
+      <Menu.Item disabled>No writable collections available</Menu.Item>
+    {:else}
+      {#each writableCollections as collection (collection.collection.id)}
+        <Menu.Item onSelect={() => selectCollection(collection)} disabled={pending !== null}>
+          <Folder class="size-4 shrink-0" aria-hidden="true" />
+          <span class="min-w-0 truncate">{collection.collection.title}</span>
+        </Menu.Item>
+      {/each}
+    {/if}
+  </Menu.Content>
+{/snippet}
+
 <div class={isCardSurface ? 'border-t border-line px-3 py-2.5' : compact ? 'flex flex-wrap items-start gap-2' : 'my-3 flex flex-wrap items-start gap-2'}>
   {#if isCardSurface}
-    <div class="grid grid-cols-[repeat(3,minmax(0,1fr))_2.25rem] items-center gap-1" aria-label="Meme actions">
+    <div class="grid grid-cols-5 items-center gap-1" aria-label="Meme actions">
       <Button
-        class="min-w-0 flex-col"
+        class="h-10 w-full min-w-0 px-0 py-0"
         variant="ghost"
         size="micro"
         type="button"
+        aria-label={favorited ? 'Remove favorite' : 'Favorite'}
+        title={favorited ? 'Remove favorite' : 'Favorite'}
         aria-pressed={favorited}
         disabled={interactionsDisabled}
         onclick={toggleFavorite}
       >
-        <Heart class="size-4 shrink-0" aria-hidden="true" />
-        <span>{favorited ? 'Favorited' : 'Favorite'}</span>
+        <Heart class={cn('size-5 shrink-0', favorited && 'fill-current text-danger')} aria-hidden="true" />
       </Button>
       <Button
-        class="min-w-0 flex-col"
+        class="h-10 w-full min-w-0 px-0 py-0"
         variant="ghost"
         size="micro"
         type="button"
-        aria-pressed={saved}
-        disabled={interactionsDisabled}
-        onclick={toggleSave}
+        aria-label={canDownload ? 'Download' : 'Download unavailable'}
+        title={canDownload ? 'Download' : 'Download unavailable'}
+        disabled={!canDownload || interactionsDisabled}
+        onclick={downloadMeme}
       >
-        <Bookmark class="size-4 shrink-0" aria-hidden="true" />
-        <span>{saved ? 'Saved' : 'Save'}</span>
+        <Download class="size-5 shrink-0" aria-hidden="true" />
       </Button>
+      <Menu.Root bind:open={saveMenuOpen}>
+        <Menu.Trigger
+          variant="ghost"
+          aria-label="Save to collection"
+          title="Save to collection"
+          aria-pressed={saved}
+          disabled={interactionsDisabled}
+        >
+          <Bookmark class={cn('size-5 shrink-0', saved && 'fill-current text-accent')} aria-hidden="true" />
+        </Menu.Trigger>
+        {@render saveCollectionMenu()}
+      </Menu.Root>
       <Button
-        class="min-w-0 flex-col"
+        class="h-10 w-full min-w-0 px-0 py-0"
         variant="ghost"
         size="micro"
         type="button"
+        aria-label="Send"
+        title="Send"
         disabled={interactionsDisabled}
         onclick={shareTelegram}
       >
-        <Send class="size-4 shrink-0" aria-hidden="true" />
-        <span>Send</span>
+        <Send class="size-5 shrink-0" aria-hidden="true" />
       </Button>
       <Menu.Root>
-        <Menu.Trigger aria-label={menuLabel} disabled={interactionsDisabled} class="size-9 rounded-[12px] border-line bg-paper text-muted shadow-none hover:bg-soft hover:text-ink">
+        <Menu.Trigger variant="ghost" aria-label={menuLabel} title="More actions" disabled={interactionsDisabled} class="text-muted hover:text-ink">
           <MoreHorizontal class="size-5" aria-hidden="true" />
         </Menu.Trigger>
         <Menu.Content>
@@ -321,13 +409,16 @@
     {#if isDetailSurface}
       <div class="flex flex-wrap gap-2" aria-label="Primary meme actions">
         <Button variant="secondary" type="button" aria-pressed={favorited} disabled={interactionsDisabled} onclick={toggleFavorite}>
-          <Heart class="size-4" aria-hidden="true" />
-          {favorited ? 'Favorited' : 'Favorite'} ({likeCount})
+          <Heart class={cn('size-4', favorited && 'fill-current text-danger')} aria-hidden="true" />
+          Favorite ({likeCount})
         </Button>
-        <Button variant="secondary" type="button" aria-pressed={saved} disabled={interactionsDisabled} onclick={toggleSave}>
-          <Bookmark class="size-4" aria-hidden="true" />
-          {saved ? 'Saved' : 'Save'}
-        </Button>
+        <Menu.Root bind:open={saveMenuOpen}>
+          <Menu.Trigger variant="secondary" aria-label="Save to collection" aria-pressed={saved} disabled={interactionsDisabled}>
+            <Bookmark class={cn('size-4', saved && 'fill-current text-accent')} aria-hidden="true" />
+            {saved ? 'Saved' : 'Save'}
+          </Menu.Trigger>
+          {@render saveCollectionMenu()}
+        </Menu.Root>
         <Button variant="secondary" type="button" disabled={interactionsDisabled} onclick={shareTelegram}>
           <Send class="size-4" aria-hidden="true" />
           Send

@@ -6,15 +6,43 @@ import MemeCard from './MemeCard.svelte';
 import MemeGrid from './MemeGrid.svelte';
 
 describe('MemeCard', () => {
-  it('renders direct Favorite, Save, and Send actions without a dense metadata footer', () => {
+  it('renders five evenly distributed icon actions without visible action labels or a dense metadata footer', () => {
     const { body } = render(MemeCard, { props: { meme: memeCard() } });
 
-    expect(body).toContain('Favorite');
-    expect(body).toContain('Save');
-    expect(body).toContain('Send');
+    expect(body).toContain('grid-cols-5');
+    expect(body).toContain('aria-label="Favorite"');
+    expect(body).toContain('aria-label="Download"');
+    expect(body).toContain('aria-label="Save to collection"');
+    expect(body).toContain('aria-label="Send"');
+    expect(body).not.toContain('<span>Favorite</span>');
+    expect(body).not.toContain('<span>Save</span>');
+    expect(body).not.toContain('<span>Send</span>');
     expect(body).not.toContain('640x360');
     expect(body).not.toContain('>en</');
     expect(body).not.toContain('#reaction');
+  });
+
+  it('hides the fallback title row without leaving a dangling labelled-by reference', () => {
+    const untitled = render(MemeCard, { props: { meme: memeCard({ caption: null, tags: [] }) } });
+    const privateUntitled = render(MemeCard, {
+      props: {
+        meme: memeCard({ caption: null, tags: [], viewer_access: { visibility: 'private' } }),
+        showAccessMarkers: true
+      }
+    });
+
+    expect(untitled.body).not.toContain('aria-labelledby="meme-card-title-');
+    expect(untitled.body).not.toContain('id="meme-card-title-');
+    expect(privateUntitled.body).toContain('Private');
+    expect(privateUntitled.body).not.toContain('id="meme-card-title-');
+  });
+
+  it('renders a filled red heart for an already-favorited meme', () => {
+    const { body } = render(MemeCard, { props: { meme: memeCard({ viewer_has_favorited: true }) } });
+
+    expect(body).toContain('aria-label="Remove favorite"');
+    expect(body).toContain('fill-current text-danger');
+    expect(body).not.toContain('Favorited');
   });
 
   it('only renders shared/private visibility badges when explicitly enabled', () => {

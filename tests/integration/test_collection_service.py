@@ -168,6 +168,62 @@ async def test_full_user_can_create_custom_collection_with_owner_membership(
     assert [membership.role for membership in persisted_collection.memberships] == [CollectionMembershipRole.OWNER]
 
 
+async def test_collection_list_orders_by_most_recent_meme_addition(
+    migrated_db_session: AsyncSession,
+) -> None:
+    user_service = UserService(migrated_db_session)
+    collection_service = CollectionService(migrated_db_session)
+    owner = await create_full_user_via_upgrade(user_service, email="recent-collections@example.com")
+    favorites = await collection_service.ensure_favorites_collection(owner.id)
+    older_collection = await collection_service.create_custom_collection(
+        owner_user_id=owner.id,
+        title="Older saves",
+    )
+    newest_collection = await collection_service.create_custom_collection(
+        owner_user_id=owner.id,
+        title="Newest saves",
+    )
+    empty_collection = await collection_service.create_custom_collection(
+        owner_user_id=owner.id,
+        title="Empty collection",
+    )
+    older_meme = await _create_meme(migrated_db_session)
+    favorite_meme = await _create_meme(migrated_db_session)
+    newest_meme = await _create_meme(migrated_db_session)
+    migrated_db_session.add_all(
+        [
+            CollectionMeme(
+                collection_id=older_collection.id,
+                meme_id=older_meme.id,
+                added_by_user_id=owner.id,
+                added_at=datetime(2026, 1, 1, tzinfo=UTC),
+            ),
+            CollectionMeme(
+                collection_id=favorites.id,
+                meme_id=favorite_meme.id,
+                added_by_user_id=owner.id,
+                added_at=datetime(2026, 1, 2, tzinfo=UTC),
+            ),
+            CollectionMeme(
+                collection_id=newest_collection.id,
+                meme_id=newest_meme.id,
+                added_by_user_id=owner.id,
+                added_at=datetime(2026, 1, 3, tzinfo=UTC),
+            ),
+        ]
+    )
+    await migrated_db_session.commit()
+
+    collections = await collection_service.list_collections_for_user(user_id=owner.id)
+
+    assert [collection.id for collection in collections] == [
+        newest_collection.id,
+        favorites.id,
+        older_collection.id,
+        empty_collection.id,
+    ]
+
+
 async def test_custom_collections_do_not_allow_public_visibility_at_launch(
     migrated_db_session: AsyncSession,
 ) -> None:

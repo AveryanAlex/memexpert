@@ -120,6 +120,45 @@ const seededCollectionSummary = {
   active_save_collection_id: seededCollectionId
 };
 
+const favoritesCollectionId = 'smoke-favorites';
+const recentCollectionId = 'smoke-recent-reactions';
+const writableCollectionCapabilities = {
+  can_view: true,
+  can_add_memes: true,
+  can_remove_memes: true,
+  can_rename: true,
+  can_delete: true,
+  can_create_invites: true,
+  can_revoke_invites: true,
+  can_manage_members: true,
+  can_set_active_save: true
+};
+const favoritesCollectionSummary = {
+  collection: {
+    ...seededCollection,
+    id: favoritesCollectionId,
+    owner_id: 'smoke-full-user',
+    title: 'Favorites',
+    description: null,
+    kind: 'favorites'
+  },
+  viewer_role: 'owner',
+  capabilities: writableCollectionCapabilities,
+  active_save_collection_id: favoritesCollectionId
+};
+const recentCollectionSummary = {
+  collection: {
+    ...seededCollection,
+    id: recentCollectionId,
+    owner_id: 'smoke-full-user',
+    title: 'Recent reactions',
+    description: 'Most recently used writable collection.'
+  },
+  viewer_role: 'owner',
+  capabilities: writableCollectionCapabilities,
+  active_save_collection_id: favoritesCollectionId
+};
+
 const trend = {
   recent: { views: 120, sends: 8, likes: 7, saves: 4, downloads: 3 },
   previous: { views: 90, sends: 5, likes: 4, saves: 2, downloads: 1 },
@@ -612,6 +651,10 @@ const server = createServer((request, response) => {
       sendJson(response, 200, sessionPayload('full'));
       return;
     }
+    if (token === 'guest-auto') {
+      sendJson(response, 200, sessionPayload('guest'));
+      return;
+    }
     const loginAttempt = cookieValue(request, 'smoke_login_attempt');
     if (loginAttempt && loginAttemptPolls.has(loginAttempt)) {
       const pollCount = (loginAttemptPolls.get(loginAttempt) ?? 0) + 1;
@@ -678,14 +721,14 @@ const server = createServer((request, response) => {
   }
 
   if (url.pathname === '/api/v1/collections') {
-    if (!hasFullAccess(request)) {
-      sendJson(response, 401, { detail: 'Sign in to load collection choices.' });
-      return;
-    }
-
+    const fullAccess = hasFullAccess(request);
     sendJson(response, 200, {
-      collections: [seededCollectionSummary],
-      active_save_collection_id: seededCollectionId
+      collections: fullAccess
+        ? [recentCollectionSummary, favoritesCollectionSummary, seededCollectionSummary]
+        : [favoritesCollectionSummary],
+      active_save_collection_id: favoritesCollectionId
+    }, fullAccess || accessToken(request) ? {} : {
+      'set-cookie': 'memexpert_access_token=guest-auto; Path=/; HttpOnly; SameSite=Lax'
     });
     return;
   }
@@ -762,6 +805,11 @@ const server = createServer((request, response) => {
 
   if (/^\/api\/v1\/memes\/[^/]+\/(?:favorite|save|pin)$/.test(url.pathname)) {
     sendJson(response, 200, request.method === 'DELETE' ? { removed: true } : { ok: true });
+    return;
+  }
+
+  if (request.method === 'POST' && /^\/api\/v1\/collections\/[^/]+\/memes\/[^/]+$/.test(url.pathname)) {
+    sendJson(response, 200, { saved: true });
     return;
   }
 

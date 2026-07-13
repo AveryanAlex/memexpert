@@ -21,6 +21,7 @@
 
   const href = $derived(memeHref(meme, attribution));
   const title = $derived(memeTitle(meme));
+  const showTitle = $derived(title !== 'Untitled meme');
   const titleId = $derived(`meme-card-title-${meme.id}`);
   const accessVisibility = $derived(meme.viewer_access?.visibility ?? 'public');
   const actionBody = $derived(memeActionAttributionBody(attribution));
@@ -62,18 +63,22 @@
   role={position ? 'listitem' : undefined}
   aria-posinset={position}
   aria-setsize={total}
-  aria-labelledby={titleId}
+  aria-labelledby={showTitle ? titleId : undefined}
 >
   <a class={cn('block w-full min-w-0 max-w-full text-inherit no-underline', focusRing)} {href} aria-label={`Open ${title}`} onclick={handleDetailClick}>
     <MemeMedia {meme} preview />
-    <div class="flex items-start justify-between gap-3 px-3 pb-3 pt-2.5">
-      <p id={titleId} class="m-0 line-clamp-2 text-sm font-semibold leading-snug text-ink sm:text-base">{title}</p>
-      {#if showAccessMarkers && accessVisibility !== 'public'}
-        <span class="shrink-0 rounded-full border border-line bg-soft px-2 py-1 text-xs font-semibold text-muted">
-          {accessVisibility === 'shared' ? 'Shared' : 'Private'}
-        </span>
-      {/if}
-    </div>
+    {#if showTitle || (showAccessMarkers && accessVisibility !== 'public')}
+      <div class="flex items-start justify-between gap-3 px-3 pb-3 pt-2.5">
+        {#if showTitle}
+          <p id={titleId} class="m-0 line-clamp-2 text-sm font-semibold leading-snug text-ink sm:text-base">{title}</p>
+        {/if}
+        {#if showAccessMarkers && accessVisibility !== 'public'}
+          <span class="ml-auto shrink-0 rounded-full border border-line bg-soft px-2 py-1 text-xs font-semibold text-muted">
+            {accessVisibility === 'shared' ? 'Shared' : 'Private'}
+          </span>
+        {/if}
+      </div>
+    {/if}
   </a>
   <MemeActionMenu {meme} {href} {attribution} surface="card" />
 </article>
