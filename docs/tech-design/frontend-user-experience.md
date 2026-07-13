@@ -27,6 +27,7 @@ The redesign is a presentation and progressive-disclosure change. FastAPI remain
 | `features/app-shell/navigation.ts` | Navigation model | Defines Discover (`/`), Search (`/search`), Saved (`/library`), Account (`/profile`), and conditional Admin items. Collection routes resolve as Saved for active-state purposes. |
 | `features/app-shell/AppShell.svelte` | Shared route shell | Renders the desktop header, mobile bottom navigation, account/sign-in control, page-safe bottom padding, and active navigation state. |
 | `features/app-shell/GlobalSearch.svelte` | Global search entry | Provides a single query-only GET form on desktop and an explicit Search route entry on narrow screens. It does not own filter controls. |
+| `auth-state.ts` | Reactive session projection | Provides the root-layout, context-scoped Svelte store used by the shell, viewer capability context, and account-aware routes. SSR session data seeds an isolated instance; successful browser auth and preference mutations publish to it before route invalidation. It never stores the HttpOnly token. |
 | `TelegramMiniAppBootstrap.svelte` and `telegram-miniapp.ts` | Host adaptation | Detects Telegram data, applies host state, runs readiness/expand hooks, authenticates `initData`, and handles supported start parameters. |
 | `lib/ui/*` | Reusable primitives | Provides token-based controls, focus treatment, dialogs, disclosures, menus, charts, and layout primitives without owning meme- or account-specific behavior. |
 
@@ -100,7 +101,7 @@ When Telegram bootstrap data is available, the application adds `telegram-miniap
 - retains the compact route shell, bottom-navigation safe placement, and direct Send action;
 - calls `ready()` and `expand()` best-effort so host API failures do not block browsing.
 
-Mini App authentication is unchanged: `initData` is POSTed to the existing `/telegram-miniapp/auth` proxy, then route data is invalidated on success. Supported `invite_…` and `meme_…` start parameters route once to their collection-invite or meme destinations. If authentication fails or is unavailable, the current web session remains usable.
+Mini App authentication keeps the existing backend contract: `initData` is POSTed to `/telegram-miniapp/auth`. On success the browser reads the repaired current session into the root auth store before invalidating route data, so shared account UI changes without a document reload. Supported `invite_…` and `meme_…` start parameters route once to their collection-invite or meme destinations. If authentication fails or is unavailable, the current web session remains usable.
 
 ## State and URL Invariants
 

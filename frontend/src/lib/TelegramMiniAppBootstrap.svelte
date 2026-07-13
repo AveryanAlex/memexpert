@@ -1,6 +1,8 @@
 <script lang="ts">
   import { goto, invalidateAll } from '$app/navigation';
   import { onMount } from 'svelte';
+  import { readAuthState } from '$lib/auth-state';
+  import type { CurrentSessionRead } from '$lib/api/types';
   import {
     extractTelegramMiniAppBootstrapState,
     hasTelegramMiniAppBootstrapData,
@@ -12,6 +14,7 @@
   } from '$lib/telegram-miniapp';
 
   const ROUTED_START_PARAM_STORAGE_PREFIX = 'memexpert:telegram-miniapp:routed-start-param:';
+  const authState = readAuthState();
 
   onMount(() => {
     const launchParams = telegramLaunchParamsFromUrl(window.location);
@@ -85,11 +88,22 @@
       });
 
       if (response.ok) {
+        const session = await fetchCurrentBrowserSession();
+        if (session) authState.setSession(session);
         await invalidateAll();
       }
     } catch {
       // Keep browsing with the current web session when Telegram auth is unavailable.
     }
+  }
+
+  async function fetchCurrentBrowserSession(): Promise<CurrentSessionRead | null> {
+    const response = await fetch('/api/v1/auth/session', {
+      credentials: 'include',
+      headers: { accept: 'application/json' }
+    });
+    if (!response.ok) return null;
+    return (await response.json()) as CurrentSessionRead;
   }
 
   async function routeStartParamOnce(state: TelegramMiniAppBootstrapState) {

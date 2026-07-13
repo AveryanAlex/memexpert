@@ -9,7 +9,7 @@ describe('TelegramLoginModal', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     try {
-      const { body } = render(TelegramLoginModal, { props: { open: true, session: null } });
+      const { body } = render(TelegramLoginModal, { props: { open: true } });
 
       expect(body).toEqual(expect.any(String));
       expect(fetchMock).not.toHaveBeenCalled();

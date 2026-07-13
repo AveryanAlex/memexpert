@@ -3,6 +3,7 @@
   import { invalidateAll } from '$app/navigation';
   import { Mail, Send, Sparkles } from '@lucide/svelte';
   import { onDestroy } from 'svelte';
+  import { readAuthState } from '$lib/auth-state';
   import type { CurrentSessionRead, TelegramLinkStartRead } from '$lib/api/types';
   import { Button, LoadingState, Notice } from '$lib/ui';
   import * as Dialog from '$lib/ui/dialog';
@@ -16,8 +17,9 @@
     telegramExpiryLabel
   } from './telegram-login';
 
-  let { open = $bindable(false), session = null }: { open?: boolean; session: CurrentSessionRead | null } = $props();
+  let { open = $bindable(false) }: { open?: boolean } = $props();
 
+  const authState = readAuthState();
   let link = $state<TelegramLinkStartRead | null>(null);
   let starting = $state(false);
   let polling = $state(false);
@@ -43,6 +45,7 @@
       if (!isFullSession(nextSession)) return true;
 
       const completionGeneration = lifecycleGeneration;
+      authState.setSession(nextSession);
       const refreshResult = await refreshTelegramSession(invalidateAll);
       if (completionGeneration !== lifecycleGeneration || !open) return false;
       if (!refreshResult.completed) {

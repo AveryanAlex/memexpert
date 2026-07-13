@@ -4,6 +4,7 @@
   import { untrack } from 'svelte';
   import { ApiError, updateUserPreferences } from '$lib/api/client';
   import type { ContentKind, ContentLanguage, CurrentSessionRead, MemeSearchScope, WebCollectionListRead } from '$lib/api/types';
+  import { readAuthState } from '$lib/auth-state';
   import { ActionLink, Button, FormRow, Input, Notice, Select } from '$lib/ui';
   import * as Dialog from '$lib/ui/dialog';
   import {
@@ -26,6 +27,9 @@
   type ScopeOption = { value: MemeSearchScope; label: string; description: string };
 
   let { filters, session, collections, collectionErrorMessage }: Props = $props();
+
+  const authState = readAuthState(() => ({ session, sessionError: null }));
+  const currentSession = $derived($authState.session);
 
   const formId = 'search-results-form';
   const scopeOptions: ScopeOption[] = [
@@ -66,8 +70,8 @@
       (filters.scope !== 'public' ? 1 : 0) +
       (filters.scope === 'collections' ? filters.collectionIds.length : 0)
   );
-  const shouldConfirmNsfw = $derived(session?.user.nsfw_enabled === false);
-  const nsfwRequestedButDisabled = $derived(filters.includeNsfw && session?.user.nsfw_enabled !== true);
+  const shouldConfirmNsfw = $derived(currentSession?.user.nsfw_enabled === false);
+  const nsfwRequestedButDisabled = $derived(filters.includeNsfw && currentSession?.user.nsfw_enabled !== true);
 
   $effect(() => {
     const nextFilterKey = JSON.stringify(filters);
@@ -149,7 +153,8 @@
     nsfwGatePending = true;
     nsfwGateMessage = null;
     try {
-      await updateUserPreferences({ fetch, body: { nsfw_enabled: true } });
+      const user = await updateUserPreferences({ fetch, body: { nsfw_enabled: true } });
+      authState.updateUser(user);
       const href = pendingSearchHref;
       nsfwGateOpen = false;
       pendingSearchHref = null;

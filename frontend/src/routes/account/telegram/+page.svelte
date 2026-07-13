@@ -1,8 +1,12 @@
 <script lang="ts">
+  import { readAuthState } from '$lib/auth-state';
   import { ActionLink, Badge, Button, Card, Notice } from '$lib/ui';
   import type { ActionData, PageData } from './$types';
 
   let { data, form }: { data: PageData; form: ActionData } = $props();
+
+  const authState = readAuthState(() => ({ session: data.session ?? null, sessionError: data.sessionError }));
+  const session = $derived($authState.session);
 
   const status = $derived(form?.status ?? null);
   const link = $derived.by(() => {
@@ -17,8 +21,8 @@
     }
     return null;
   });
-  const telegramConnected = $derived(data.session?.linked_providers.telegram_linked === true);
-  const isFull = $derived(data.session?.user.account_type === 'full');
+  const telegramConnected = $derived(session?.linked_providers.telegram_linked === true);
+  const isFull = $derived(session?.user.account_type === 'full');
 </script>
 
 <section class="grid items-start gap-6 md:grid-cols-[minmax(0,0.95fr)_minmax(320px,0.7fr)]" aria-labelledby="telegram-title">

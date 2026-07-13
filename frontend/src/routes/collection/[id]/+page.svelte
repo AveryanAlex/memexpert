@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { readAuthState } from '$lib/auth-state';
   import CollectionManagement from '$lib/features/collections/CollectionManagement.svelte';
   import { collectionAccessSummary } from '$lib/features/collections/view-model';
   import MemeGrid from '$lib/features/memes/MemeGrid.svelte';
@@ -6,6 +7,9 @@
   import type { ActionData, PageData } from './$types';
 
   let { data, form }: { data: PageData; form?: ActionData } = $props();
+
+  const authState = readAuthState(() => ({ session: data.session ?? null, sessionError: data.sessionError }));
+  const session = $derived($authState.session);
 
   const detail = $derived(data.detail);
   const collection = $derived(detail?.collection ?? null);
@@ -47,7 +51,7 @@
         <form method="POST" action="?/setActive">
           <Button size="compact" type="submit" disabled={isActive}>{isActive ? 'Active now' : 'Set active'}</Button>
         </form>
-      {:else if data.session?.user.account_type === 'guest'}
+      {:else if session?.user.account_type === 'guest'}
         <ActionLink size="compact" href="/account/telegram?returnTo=/profile">Connect for custom saves</ActionLink>
       {:else}
         <p class="m-0 text-sm text-muted">You need editor or owner access to make this the save destination.</p>
@@ -80,11 +84,11 @@
           removeEnabled: capabilities.can_remove_memes,
           guidance: capabilities.can_remove_memes
             ? 'Editors and owners can remove selected memes from this collection.'
-            : data.session?.user.account_type === 'guest'
+            : session?.user.account_type === 'guest'
               ? 'Guests can browse and favorite. Connect Telegram for collection collaboration actions.'
               : 'Your role can view this collection but cannot remove saved memes.'
         }}
-        showAccessMarkers={Boolean(data.session)}
+        showAccessMarkers={Boolean(session)}
       />
     {:else}
       <EmptyState title="No saved memes yet" message={isActive ? 'Browse the catalog and use Save to add memes here.' : 'Set this collection active, then browse and save memes into it.'}>
@@ -93,7 +97,7 @@
     {/if}
   </section>
 
-  <CollectionManagement {detail} session={data.session ?? null} loadedAt={data.loadedAt} inviteUrl={form?.inviteUrl} />
+  <CollectionManagement {detail} {session} loadedAt={data.loadedAt} inviteUrl={form?.inviteUrl} />
 {:else}
   <EmptyState title="Collection unavailable" message={data.errorMessage ?? 'You may need to join this collection or sign in with an account that has access.'}>
     <ActionLink size="compact" href="/">Back to catalog</ActionLink>

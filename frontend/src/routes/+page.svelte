@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { readAuthState } from '$lib/auth-state';
   import InfiniteMemeFeed from '$lib/features/memes/InfiniteMemeFeed.svelte';
   import type { MemeFeedSource } from '$lib/features/memes/infinite-feed';
   import MemeOfTheDayPanel from '$lib/features/memes/MemeOfTheDayPanel.svelte';
@@ -6,6 +7,9 @@
   import type { PageData } from './$types';
 
   let { data }: { data: PageData } = $props();
+
+  const authState = readAuthState(() => ({ session: data.session ?? null, sessionError: data.sessionError }));
+  const session = $derived($authState.session);
 
   const feedSource = $derived(toMemeFeedSource(data.feedSource));
   const isHomeFeed = $derived(feedSource === 'home' && !data.query.trim());
@@ -26,7 +30,7 @@
   </nav>
 </section>
 
-<MemeOfTheDayPanel memeOfTheDay={data.memeOfTheDay} initialError={data.memeOfTheDayErrorMessage} showAccessMarkers={Boolean(data.session)} />
+<MemeOfTheDayPanel memeOfTheDay={data.memeOfTheDay} initialError={data.memeOfTheDayErrorMessage} showAccessMarkers={Boolean(session)} />
 
 <nav class="mb-5 flex gap-2 overflow-x-auto pb-1" aria-label="Popular topics">
   <a class="shrink-0 rounded-full border border-line bg-paper px-3 py-1.5 text-sm font-semibold text-ink no-underline hover:bg-soft" href="/search?q=reaction">Reactions</a>
@@ -42,7 +46,7 @@
   emptyTitle={isHomeFeed ? 'No home feed memes yet' : 'No memes found'}
   emptyMessage={isHomeFeed ? 'Try Search or check back soon.' : 'Try a shorter phrase, a different synonym, or clear the search box to browse.'}
   bulk={{ enabled: false }}
-  showAccessMarkers={Boolean(data.session)}
+  showAccessMarkers={Boolean(session)}
 >
   {#snippet summary()}
     {#if data.query}
