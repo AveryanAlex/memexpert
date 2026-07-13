@@ -10,6 +10,7 @@ from sqlalchemy import func, select
 
 from memexpert.core.config import Settings
 from memexpert.core.voyage import VoyageEmbeddingResult
+from memexpert.ingest.policy import refresh_effective_visibility
 from memexpert.models.base import utcnow
 from memexpert.models.collection import Collection, CollectionInvite, CollectionMember
 from memexpert.models.content import (
@@ -18,6 +19,7 @@ from memexpert.models.content import (
     MemeFile,
     MemeFileOCRResult,
     MemeFileSyncTargetSnapshot,
+    MemeSource,
     MemeSourceEngagementSnapshot,
     MemeTemplate,
 )
@@ -33,6 +35,10 @@ from memexpert.models.enums import (
     ContentLanguage,
     ContentProcessingStatus,
     EmbeddingInputType,
+    IngestSourceKind,
+    MemeVisibilityMode,
+    SourceAttachReason,
+    SourcePlatform,
     SyncTargetKind,
     SyncTargetStatus,
 )
@@ -88,7 +94,7 @@ class RecordingMeilisearchSyncClient:
 
 
 @pytest.mark.asyncio
-async def test_publish_created_meme_resync_rebuilds_public_indexes_from_canonical_db_state(
+async def test_crawler_promoted_created_meme_resync_rebuilds_public_indexes_from_canonical_db_state(
     migrated_db_session: AsyncSession,
 ) -> None:
     embedding = VoyageEmbeddingResult(
@@ -158,7 +164,31 @@ async def test_publish_created_meme_resync_rebuilds_public_indexes_from_canonica
     )
     await migrated_db_session.commit()
 
-    slug = await seed_e2e.publish_created_meme_in_session(migrated_db_session, meme_id=meme.id, query="cat")
+    slug = await seed_e2e.prepare_created_meme_metadata_in_session(
+        migrated_db_session,
+        meme_id=meme.id,
+        query="cat",
+    )
+    assert meme.is_public is False
+    assert meme.visibility_mode is MemeVisibilityMode.AUTO
+    migrated_db_session.add(
+        MemeSource(
+            file_id=meme_file.id,
+            platform=SourcePlatform.TELEGRAM,
+            source_id=seed_e2e.E2E_PROMOTION_SOURCE_ID,
+            post_id="integration-promotion",
+            source_kind=IngestSourceKind.PUBLIC_CRAWLER,
+            is_first_source=False,
+            source_alive=True,
+            attach_reason=SourceAttachReason.SHA256_EXACT_EXISTING_FILE,
+            matched_meme_file_id=meme_file.id,
+        )
+    )
+    await refresh_effective_visibility(
+        migrated_db_session,
+        meme,
+        incoming_source_kind=IngestSourceKind.PUBLIC_CRAWLER,
+    )
     await migrated_db_session.commit()
 
     qdrant_client = RecordingQdrantSyncClient()

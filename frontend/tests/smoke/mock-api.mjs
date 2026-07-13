@@ -191,8 +191,8 @@ const adminMeme = {
   id: adminIds.meme,
   primary_file: adminMediaFile,
   is_public: false,
+  visibility_mode: 'force_private',
   template_id: adminIds.curatedTemplate,
-  author_user_id: null
 };
 
 const readyAdminTelegramAccount = {
@@ -496,8 +496,10 @@ const adminDecision = {
   reason: 'other',
   note: 'Previous review kept this visible.',
   previous_is_public: true,
+  previous_visibility_mode: 'auto',
   previous_is_nsfw: true,
   new_is_public: true,
+  new_visibility_mode: 'auto',
   new_is_nsfw: false,
   previous_template_id: null,
   new_template_id: adminIds.curatedTemplate,

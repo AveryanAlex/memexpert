@@ -10,13 +10,13 @@ from typing import TYPE_CHECKING
 from sqlalchemy import select
 
 from memexpert.models.content import MemeFile, MemeSource, SourceChannel
+from memexpert.models.enums import IngestSourceKind, SourceAttachReason, SourcePlatform
 from memexpert.pipeline.helpers import compare_telegram_post_ids
 from memexpert.services.errors import CrawlerChannelNotTrackedError
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
-    from memexpert.models.enums import SourceAttachReason, SourcePlatform
     from memexpert.schemas.content_pipeline import RawCrawlerPost
 
 
@@ -133,6 +133,7 @@ def attach_crawler_source_row_to_meme_file(
         platform=raw_post.platform,
         source_id=raw_post.source_id,
         post_id=raw_post.post_id,
+        source_kind=IngestSourceKind.PUBLIC_CRAWLER,
         is_first_source=is_first_source,
         source_alive=True,
         published_at=raw_post.published_at,

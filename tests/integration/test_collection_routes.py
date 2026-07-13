@@ -12,7 +12,7 @@ from memexpert.api.dependencies.collection import get_collection_service
 from memexpert.api.dependencies.meme import get_analytics_service, get_meme_search_service
 from memexpert.api.routes.v1 import media as media_routes
 from memexpert.core.database import get_db_session
-from memexpert.models.collection import PinnedMeme
+from memexpert.models.collection import CollectionMeme, PinnedMeme
 from memexpert.models.content import Meme, MemeFile
 from memexpert.models.enums import ContentKind, ContentLanguage
 from memexpert.models.user import User
@@ -40,7 +40,6 @@ class FakeS3Client:
 async def _create_meme(
     session: AsyncSession,
     *,
-    author_user_id: uuid.UUID | None = None,
     is_public: bool = True,
     mime_type: str = "image/jpeg",
     s3_original_key: str | None = None,
@@ -54,7 +53,6 @@ async def _create_meme(
         primary_file_id=file_id,
         language=ContentLanguage.EN,
         is_public=is_public,
-        author_user_id=author_user_id,
     )
     file = MemeFile(
         id=file_id,
@@ -82,7 +80,7 @@ async def test_collection_routes_crud_detail_remove_active_and_invites(
     owner = await create_full_user_via_upgrade(user_service, telegram_id=1001, email="owner@example.com")
     viewer = await create_full_user_via_upgrade(user_service, telegram_id=1002, email="viewer@example.com")
     guest = await user_service.create_guest_user()
-    meme = await _create_meme(migrated_db_session, author_user_id=owner.id)
+    meme = await _create_meme(migrated_db_session)
     await migrated_db_session.commit()
 
     current_user = UserRead.model_validate(owner)
@@ -344,13 +342,20 @@ async def test_collection_detail_and_media_route_authorize_private_saved_media(
     persisted_admin = await migrated_db_session.get(User, admin.id)
     assert persisted_admin is not None
     persisted_admin.is_admin = True
+    owner_favorites = await CollectionService(migrated_db_session).ensure_favorites_collection(owner.id)
     private_meme = await _create_meme(
         migrated_db_session,
-        author_user_id=owner.id,
         is_public=False,
         s3_original_key="pipeline/originals/private/owner-upload.png",
         s3_web_video_key="pipeline/derived/private/owner-upload.mp4",
         mime_type="image/png",
+    )
+    migrated_db_session.add(
+        CollectionMeme(
+            collection_id=owner_favorites.id,
+            meme_id=private_meme.id,
+            added_by_user_id=owner.id,
+        )
     )
     await migrated_db_session.commit()
     assert private_meme.primary_file_id is not None

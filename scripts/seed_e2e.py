@@ -25,7 +25,7 @@ from PIL import Image, PngImagePlugin
 from pydantic import BaseModel, ValidationError
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.http.models import Distance, VectorParams
-from sqlalchemy import delete, or_, select, update
+from sqlalchemy import delete, func, or_, select, update
 
 from memexpert.core.config import Settings, get_settings
 from memexpert.core.database import get_async_engine, get_async_session_factory
@@ -33,6 +33,7 @@ from memexpert.core.meilisearch import PipelineMeilisearchSyncClient
 from memexpert.core.qdrant import PipelineQdrantSyncClient
 from memexpert.core.storage import get_pipeline_storage_settings, get_s3_client
 from memexpert.core.voyage import build_pipeline_voyage_client
+from memexpert.ingest.crawler_service import PipelineCrawlerIngestService
 from memexpert.ingest.schemas import IngestRequestRead
 from memexpert.messaging.rabbitmq_outbox_runtime import (
     RabbitMQOutboxPublisherBatchResult,
@@ -51,6 +52,7 @@ from memexpert.models.content import (
     MemeSourceEngagementSnapshot,
     MemeTemplate,
     PipelineStageJournal,
+    SourceChannel,
 )
 from memexpert.models.enums import (
     AccountStatus,
@@ -66,6 +68,8 @@ from memexpert.models.enums import (
     ContentPipelineStageStatus,
     ContentProcessingStatus,
     EmbeddingInputType,
+    IngestSourceKind,
+    MemeVisibilityMode,
     PipelineIngestRequestStatus,
     SourceEngagementCaptureReason,
     SourceEngagementCommentsState,
@@ -79,6 +83,9 @@ from memexpert.models.user import AnalyticsEvent, User
 from memexpert.schemas.content_pipeline import (
     ContentPipelineErrorResponse,
     ContentPipelineItemDetail,
+    CrawlerIngestOutcome,
+    CrawlerIngestResult,
+    RawCrawlerPost,
 )
 from memexpert.services.public_trends import refresh_public_trend_materialized_views
 from memexpert.services.search_index_sync import (
@@ -108,6 +115,8 @@ TRANSIENT_HTTP_STATUS_CODES: Final = frozenset({408, 425, 429, *range(500, 600)}
 IDEMPOTENT_HTTP_METHODS: Final = frozenset({"DELETE", "GET", "HEAD", "OPTIONS", "PUT"})
 E2E_SOURCE_ID: Final = "e2e-prd-seed"
 E2E_UPLOAD_SOURCE_ID: Final = "e2e-prd-upload"
+E2E_PROMOTION_SOURCE_ID: Final = "e2e-prd-public-crawler"
+E2E_UPLOAD_USER_EMAIL: Final = "private-upload.e2e@memexpert.test"
 E2E_MODEL_ID: Final = "e2e-prd-seed"
 E2E_PROMPT_VERSION: Final = "e2e-prd-v1"
 E2E_ACCOUNT_PASSWORD: Final = "memexpert-e2e-password"
@@ -249,6 +258,13 @@ class SeededE2EUser:
     user_id: uuid.UUID
     email: str
     password: str
+
+
+@dataclass(frozen=True, slots=True)
+class PrivateUploadFixture:
+    user_id: uuid.UUID
+    collection_id: uuid.UUID
+    crawler_channel_id: uuid.UUID
 
 
 @dataclass(frozen=True, slots=True)
@@ -460,6 +476,8 @@ class PipelineApiClient:
         *,
         image_bytes: bytes,
         run_id: str,
+        uploader_user_id: uuid.UUID,
+        target_collection_id: uuid.UUID,
         deadline: MonotonicDeadline,
     ) -> IngestRequestRead:
         # The API persists and uniquely constrains (source_platform, source_id, post_id),
@@ -474,6 +492,8 @@ class PipelineApiClient:
                 "source_platform": SourcePlatform.TELEGRAM.value,
                 "source_id": E2E_UPLOAD_SOURCE_ID,
                 "post_id": run_id,
+                "uploader_user_id": str(uploader_user_id),
+                "target_collection_id": str(target_collection_id),
                 "view_count": "1",
             },
             files={"file": ("e2e-prd-cat.png", image_bytes, "image/png")},
@@ -708,6 +728,7 @@ async def _run(args: argparse.Namespace) -> None:
     session_factory = get_async_session_factory()
     specs = build_seed_specs()
     await cleanup_e2e_rows(settings=settings, specs=specs)
+    private_upload_fixture = await seed_private_upload_fixture()
 
     cat_png = build_png_bytes((255, 0, 0))
     operator_token = settings.pipeline_operator_token.get_secret_value()
@@ -725,6 +746,8 @@ async def _run(args: argparse.Namespace) -> None:
         ingest_request = api_client.upload_cat_png(
             image_bytes=cat_png,
             run_id=run_id,
+            uploader_user_id=private_upload_fixture.user_id,
+            target_collection_id=private_upload_fixture.collection_id,
             deadline=phase_deadline(),
         )
         materialized_request, meme_file_id = await wait_for_ingest_materialized_meme_file(
@@ -742,10 +765,27 @@ async def _run(args: argparse.Namespace) -> None:
             deadline=phase_deadline(),
         )
         print(f"Uploaded item dual-synced: ingest_request_id={ingest_request.id} meme_file_id={meme_file_id}")
-        slug = await publish_created_meme(
-            settings=settings,
+        await assert_private_upload_state(
+            meme_id=detail.meme_id,
+            meme_file_id=meme_file_id,
+            fixture=private_upload_fixture,
+        )
+        private_search_payload = api_client.public_search("cat", deadline=phase_deadline())
+        assert_public_search_excludes(
+            private_search_payload,
+            meme_id=detail.meme_id,
+            label="private upload before crawler promotion",
+        )
+        slug = await prepare_created_meme_metadata(
             meme_id=detail.meme_id,
             query="cat",
+        )
+        promotion_result = await promote_private_upload_with_crawler(
+            settings=settings,
+            image_bytes=cat_png,
+            run_id=run_id,
+            expected_meme_id=detail.meme_id,
+            expected_meme_file_id=meme_file_id,
         )
         await resync_created_public_meme_indexes(
             settings=settings,
@@ -822,12 +862,21 @@ async def _run(args: argparse.Namespace) -> None:
             "meme_file_id": str(meme_file_id),
             "ingest_request_id": str(materialized_request.id),
             "ingest_request_status": materialized_request.status.value,
+            "initial_visibility": "private",
+            "target_collection_id": str(private_upload_fixture.collection_id),
+            "crawler_promotion_outcome": promotion_result.outcome.value,
+            "crawler_source_id": E2E_PROMOTION_SOURCE_ID,
             "slug": slug,
             "query": "cat",
             "title": "Created cat pipeline meme",
         },
         "proof": {
             "public_search_total": created_search_payload.get("total"),
+            "private_search_hit_ids_before_promotion": [
+                item.get("meme", {}).get("id")
+                for item in private_search_payload.get("items", [])
+                if isinstance(item, dict)
+            ],
             "public_search_hit_ids": [
                 item.get("meme", {}).get("id")
                 for item in created_search_payload.get("items", [])
@@ -1717,6 +1766,7 @@ async def cleanup_e2e_rows(*, settings: Settings, specs: list[SeedSpec]) -> None
 
 
 async def cleanup_seed_rows(session: AsyncSession, *, settings: Settings, specs: list[SeedSpec]) -> None:
+    await cleanup_private_upload_fixture_rows(session)
     await cleanup_collection_management_fixture_rows(session)
 
     analytics_event_ids = [
@@ -1728,7 +1778,9 @@ async def cleanup_seed_rows(session: AsyncSession, *, settings: Settings, specs:
         await session.execute(delete(AnalyticsEvent).where(AnalyticsEvent.id.in_(analytics_event_ids)))
 
     source_result = await session.execute(
-        select(MemeSource).where(MemeSource.source_id.in_([E2E_SOURCE_ID, E2E_UPLOAD_SOURCE_ID])),
+        select(MemeSource).where(
+            MemeSource.source_id.in_([E2E_SOURCE_ID, E2E_UPLOAD_SOURCE_ID, E2E_PROMOTION_SOURCE_ID])
+        ),
     )
     meme_ids: set[uuid.UUID] = set()
     for source in source_result.scalars():
@@ -1764,6 +1816,84 @@ async def cleanup_seed_rows(session: AsyncSession, *, settings: Settings, specs:
         )
         for cache_row in result.scalars():
             await session.delete(cache_row)
+    await session.flush()
+
+
+async def seed_private_upload_fixture() -> PrivateUploadFixture:
+    fixture = PrivateUploadFixture(
+        user_id=_stable_uuid("private-upload:user"),
+        collection_id=_stable_uuid("private-upload:favorites"),
+        crawler_channel_id=_stable_uuid("private-upload:crawler-channel"),
+    )
+    session_factory = get_async_session_factory()
+    async with session_factory() as session:
+        user = User(
+            id=fixture.user_id,
+            status=AccountStatus.ACTIVE,
+            email=E2E_UPLOAD_USER_EMAIL,
+            email_verified_at=utcnow(),
+            password_hash=E2E_ACCOUNT_PASSWORD_HASH,
+            nsfw_enabled=False,
+        )
+        favorites = Collection(
+            id=fixture.collection_id,
+            owner_id=fixture.user_id,
+            title="Favorites",
+            kind=CollectionKind.FAVORITES,
+            visibility=CollectionVisibility.PRIVATE,
+        )
+        crawler_channel = SourceChannel(
+            id=fixture.crawler_channel_id,
+            platform=SourcePlatform.TELEGRAM,
+            platform_id=E2E_PROMOTION_SOURCE_ID,
+            title="E2E public crawler promotion source",
+            is_active=True,
+        )
+        session.add_all([user, crawler_channel])
+        await session.flush()
+        session.add(favorites)
+        await session.flush()
+        user.active_save_collection_id = favorites.id
+        session.add(
+            CollectionMember(
+                collection_id=favorites.id,
+                user_id=user.id,
+                role=CollectionMembershipRole.OWNER,
+            )
+        )
+        await session.commit()
+    return fixture
+
+
+async def cleanup_private_upload_fixture_rows(session: AsyncSession) -> None:
+    user_id = _stable_uuid("private-upload:user")
+    collection_id = _stable_uuid("private-upload:favorites")
+    channel_id = _stable_uuid("private-upload:crawler-channel")
+    await session.execute(
+        update(User)
+        .where(or_(User.id == user_id, User.email == E2E_UPLOAD_USER_EMAIL))
+        .values(active_save_collection_id=None)
+    )
+    collections = await session.scalars(
+        select(Collection).where(or_(Collection.id == collection_id, Collection.owner_id == user_id))
+    )
+    for collection in collections:
+        await session.delete(collection)
+    channels = await session.scalars(
+        select(SourceChannel).where(
+            or_(
+                SourceChannel.id == channel_id,
+                SourceChannel.platform_id == E2E_PROMOTION_SOURCE_ID,
+            )
+        )
+    )
+    for channel in channels:
+        await session.delete(channel)
+    users = await session.scalars(
+        select(User).where(or_(User.id == user_id, User.email == E2E_UPLOAD_USER_EMAIL))
+    )
+    for user in users:
+        await session.delete(user)
     await session.flush()
 
 
@@ -1818,21 +1948,61 @@ async def cleanup_collection_management_fixture_rows(session: AsyncSession) -> N
     await session.flush()
 
 
-async def publish_created_meme(*, settings: Settings, meme_id: uuid.UUID, query: str) -> str:
+async def assert_private_upload_state(
+    *,
+    meme_id: uuid.UUID,
+    meme_file_id: uuid.UUID,
+    fixture: PrivateUploadFixture,
+) -> None:
     session_factory = get_async_session_factory()
     async with session_factory() as session:
-        slug = await publish_created_meme_in_session(session, meme_id=meme_id, query=query)
+        meme = await session.get(Meme, meme_id)
+        if meme is None:
+            raise E2ESeedError(f"Private upload meme {meme_id} is missing from PostgreSQL.")
+        if meme.is_public or meme.visibility_mode is not MemeVisibilityMode.AUTO:
+            raise E2ESeedError(
+                f"Upload {meme_id} did not remain AUTO/private before crawler promotion: "
+                f"mode={meme.visibility_mode.value} is_public={meme.is_public}"
+            )
+        if await session.get(CollectionMeme, (fixture.collection_id, meme_id)) is None:
+            raise E2ESeedError(
+                f"Private upload {meme_id} is missing collection membership {fixture.collection_id}."
+            )
+        source = await session.scalar(
+            select(MemeSource).where(
+                MemeSource.file_id == meme_file_id,
+                MemeSource.source_id == E2E_UPLOAD_SOURCE_ID,
+            )
+        )
+        if source is None:
+            raise E2ESeedError(f"Private upload file {meme_file_id} is missing its upload provenance.")
+        if source.source_kind is not IngestSourceKind.OPERATOR_UPLOAD or source.uploader_user_id != fixture.user_id:
+            raise E2ESeedError(
+                f"Private upload provenance is incorrect: kind={source.source_kind.value} "
+                f"uploader={source.uploader_user_id}."
+            )
+
+
+async def prepare_created_meme_metadata(*, meme_id: uuid.UUID, query: str) -> str:
+    session_factory = get_async_session_factory()
+    async with session_factory() as session:
+        slug = await prepare_created_meme_metadata_in_session(session, meme_id=meme_id, query=query)
         await session.commit()
-    _ = settings
     return slug
 
 
-async def publish_created_meme_in_session(session: AsyncSession, *, meme_id: uuid.UUID, query: str) -> str:
+async def prepare_created_meme_metadata_in_session(
+    session: AsyncSession,
+    *,
+    meme_id: uuid.UUID,
+    query: str,
+) -> str:
     slug = f"e2e-prd-created-{meme_id.hex[:12]}"
     meme = await session.get(Meme, meme_id)
     if meme is None:
         raise E2ESeedError(f"Created meme {meme_id} is missing from the database.")
-    meme.is_public = True
+    if meme.is_public:
+        raise E2ESeedError(f"Created meme {meme_id} became public before crawler promotion.")
     meme.is_nsfw = False
     tags = list(meme.tags)
     for tag in (query, "e2e-prd"):
@@ -1872,6 +2042,68 @@ async def publish_created_meme_in_session(session: AsyncSession, *, meme_id: uui
     return slug
 
 
+async def promote_private_upload_with_crawler(
+    *,
+    settings: Settings,
+    image_bytes: bytes,
+    run_id: str,
+    expected_meme_id: uuid.UUID,
+    expected_meme_file_id: uuid.UUID,
+) -> CrawlerIngestResult:
+    session_factory = get_async_session_factory()
+    crawler_post_id = f"promotion-{run_id}"
+    async with session_factory() as session:
+        service = PipelineCrawlerIngestService.from_settings(
+            session,
+            settings=settings,
+            storage_client=get_s3_client(),
+        )
+        result = await service.accept_crawler_post(
+            RawCrawlerPost(
+                platform=SourcePlatform.TELEGRAM,
+                source_id=E2E_PROMOTION_SOURCE_ID,
+                post_id=crawler_post_id,
+                published_at=utcnow(),
+                media_type="photo",
+                media_bytes=image_bytes,
+                filename="e2e-prd-promoted-cat.png",
+                content_type="image/png",
+                view_count=2,
+            )
+        )
+    if result.outcome is not CrawlerIngestOutcome.SHA256_EXACT_EXISTING_FILE:
+        raise E2ESeedError(f"Crawler promotion returned unexpected outcome {result.outcome.value}.")
+    if result.duplicate_of_meme_id != expected_meme_id or result.meme_file_id != expected_meme_file_id:
+        raise E2ESeedError(
+            "Crawler promotion did not reuse the private canonical meme/file: "
+            f"meme={result.duplicate_of_meme_id} file={result.meme_file_id}."
+        )
+
+    async with session_factory() as session:
+        meme = await session.get(Meme, expected_meme_id)
+        if meme is None or not meme.is_public or meme.visibility_mode is not MemeVisibilityMode.AUTO:
+            raise E2ESeedError(
+                f"Crawler exact-SHA source did not AUTO-promote meme {expected_meme_id}."
+            )
+        file_count = await session.scalar(
+            select(func.count()).select_from(MemeFile).where(MemeFile.meme_id == expected_meme_id)
+        )
+        if file_count != 1:
+            raise E2ESeedError(
+                f"Crawler exact-SHA promotion created an unexpected file; canonical file count={file_count}."
+            )
+        crawler_source = await session.scalar(
+            select(MemeSource).where(
+                MemeSource.file_id == expected_meme_file_id,
+                MemeSource.source_id == E2E_PROMOTION_SOURCE_ID,
+                MemeSource.post_id == crawler_post_id,
+            )
+        )
+        if crawler_source is None or crawler_source.source_kind is not IngestSourceKind.PUBLIC_CRAWLER:
+            raise E2ESeedError("Crawler promotion source provenance was not persisted as public_crawler.")
+    return result
+
+
 async def resync_created_public_meme_indexes(
     *,
     settings: Settings,
@@ -1907,9 +2139,9 @@ async def resync_created_public_meme_indexes_in_session(
     if loaded_index_state.vector is None:
         raise E2ESeedError(f"Created meme file {meme_file_id} has no embedding vector for Qdrant re-sync.")
     if not canonical.is_public:
-        raise E2ESeedError(f"Created meme {canonical.meme_id} is not public after publish mutation.")
+        raise E2ESeedError(f"Created meme {canonical.meme_id} is not public after crawler promotion.")
     if canonical.seo_page_slug is None:
-        raise E2ESeedError(f"Created meme {canonical.meme_id} has no SEO slug after publish mutation.")
+        raise E2ESeedError(f"Created meme {canonical.meme_id} has no SEO slug after crawler promotion.")
 
     qdrant_payload = build_qdrant_sync_payload(canonical)
     meili_document = build_meilisearch_document(canonical)
@@ -1962,7 +2194,7 @@ def wait_for_public_search_contains(
 
     hit_ids = _public_search_hit_ids(last_payload) if last_payload is not None else []
     raise E2ESeedError(
-        f"Public search did not include created meme {meme_id} after post-publish re-sync; hits={hit_ids}",
+        f"Public search did not include created meme {meme_id} after crawler-promotion re-sync; hits={hit_ids}",
     )
 
 

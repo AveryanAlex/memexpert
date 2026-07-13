@@ -25,7 +25,6 @@ if TYPE_CHECKING:
 MEILISEARCH_FILTERABLE_ATTRIBUTES: tuple[str, ...] = (
     "search_index_algorithm_version",
     "is_public",
-    "author_user_id",
     "collection_owner_user_ids",
     "collection_member_user_ids",
     "collection_ids",
@@ -56,7 +55,6 @@ class PipelineMeilisearchDocument:
     meme_file_id: str
     search_index_algorithm_version: str
     is_public: bool
-    author_user_id: str | None
     media_type: str
     language: str
     is_nsfw: bool
@@ -411,7 +409,6 @@ def _build_document_payload(document: PipelineMeilisearchDocument) -> dict[str, 
         "meme_file_id": document.meme_file_id,
         "search_index_algorithm_version": document.search_index_algorithm_version,
         "is_public": document.is_public,
-        "author_user_id": document.author_user_id,
         "media_type": document.media_type,
         "language": document.language,
         "is_nsfw": document.is_nsfw,
@@ -466,7 +463,6 @@ def _build_sync_preview(
         "meme_file_id",
         "search_index_algorithm_version",
         "is_public",
-        "author_user_id",
         "media_type",
         "language",
         "is_nsfw",

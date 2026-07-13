@@ -11,11 +11,12 @@ from sqlalchemy import Enum as SQLEnum
 EnumT = TypeVar("EnumT", bound=StrEnum)
 
 
-def string_enum(enum_cls: type[EnumT]) -> SQLEnum:
+def string_enum(enum_cls: type[EnumT], *, name: str | None = None) -> SQLEnum:
     """Build a SQLAlchemy enum that stores string values and validates inputs."""
 
     return SQLEnum(
         enum_cls,
+        name=name or enum_cls.__name__.lower(),
         native_enum=False,
         create_constraint=True,
         validate_strings=True,
@@ -138,6 +139,22 @@ class IngestFileOrigin(StrEnum):
     NEW_MEME = "new_meme"
     PHASH_EXACT_EXISTING_MEME = "phash_exact_existing_meme"
     BLOCKED_PERCEPTUAL_HASH = "blocked_perceptual_hash"
+
+
+class IngestSourceKind(StrEnum):
+    """Provenance class that determines default ingest visibility policy."""
+
+    USER_UPLOAD = "user_upload"
+    PUBLIC_CRAWLER = "public_crawler"
+    OPERATOR_UPLOAD = "operator_upload"
+
+
+class MemeVisibilityMode(StrEnum):
+    """Administrative visibility policy applied to a canonical meme."""
+
+    AUTO = "auto"
+    FORCE_PUBLIC = "force_public"
+    FORCE_PRIVATE = "force_private"
 
 
 class SourceAttachReason(StrEnum):
@@ -422,6 +439,8 @@ __all__ = [
     "ContentSourceKind",
     "EmbeddingInputType",
     "IngestFileOrigin",
+    "IngestSourceKind",
+    "MemeVisibilityMode",
     "ModerationAction",
     "ModerationReason",
     "ModerationReportStatus",

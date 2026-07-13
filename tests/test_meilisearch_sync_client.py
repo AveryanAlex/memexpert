@@ -112,7 +112,6 @@ def _build_test_document() -> PipelineMeilisearchDocument:
         meme_file_id=str(uuid.uuid4()),
         search_index_algorithm_version="test-v1",
         is_public=True,
-        author_user_id=None,
         media_type="image",
         language="en",
         is_nsfw=False,
@@ -185,8 +184,7 @@ async def test_search_passes_conservative_meilisearch_prefilter_expression() -> 
             "query": "frog",
             "limit": 3,
             "filter": 'search_index_algorithm_version = "collection-aware-v1" '
-            'AND (is_public = true OR (author_user_id = "viewer-1" '
-            'OR collection_owner_user_ids = "viewer-1" '
+            'AND (is_public = true OR (collection_owner_user_ids = "viewer-1" '
             'OR collection_member_user_ids = "viewer-1")) '
             'AND media_type = "image" AND language = "en" AND is_nsfw = false AND tags = "frog"',
         }
@@ -225,7 +223,6 @@ async def test_first_upsert_creates_and_configures_missing_index() -> None:
         meme_file_id=str(uuid.uuid4()),
         search_index_algorithm_version="test-v1",
         is_public=True,
-        author_user_id=None,
         media_type="image",
         language="en",
         is_nsfw=False,
@@ -337,7 +334,6 @@ def test_meilisearch_document_serializer_and_preview_include_collection_metadata
         meme_file_id=str(meme_file_id),
         search_index_algorithm_version="collection-aware-v1",
         is_public=True,
-        author_user_id=str(uuid.uuid4()),
         media_type="image",
         language="en",
         is_nsfw=False,
@@ -397,4 +393,19 @@ def test_meilisearch_prefilter_escapes_quoted_values() -> None:
     assert prefilter.to_meilisearch_filter() == (
         'search_index_algorithm_version = "collection-\\"aware\\"-v1" '
         'AND is_public = true AND is_nsfw = false AND tags = "frog\\\\wizard\\"tag"'
+    )
+
+
+def test_private_meilisearch_prefilter_excludes_public_collection_saves() -> None:
+    prefilter = SearchIndexPrefilter(
+        scope=SearchIndexPrefilterScope.PRIVATE,
+        search_index_algorithm_version="collection-aware-v1",
+        viewer_user_id="viewer-1",
+    )
+
+    assert prefilter.to_meilisearch_filter() == (
+        'search_index_algorithm_version = "collection-aware-v1" '
+        'AND (is_public = false AND '
+        '(collection_owner_user_ids = "viewer-1" OR collection_member_user_ids = "viewer-1")) '
+        'AND is_nsfw = false'
     )

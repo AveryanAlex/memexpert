@@ -23,7 +23,10 @@ describe('moderation admin actions', () => {
     ).resolves.toEqual({ message: 'Report resolved and decision recorded.' });
     await expect(
       moderationActions.updateMemeModeration(
-        actionEvent({ meme_id: memeId, is_public: 'on', reason: 'other', note: 'Manual review' }, fetch)
+        actionEvent(
+          { meme_id: memeId, visibility_mode: 'force_public', reason: 'other', note: 'Manual review' },
+          fetch
+        )
       )
     ).resolves.toEqual({ message: 'Meme visibility and safety settings saved.' });
 
@@ -36,7 +39,7 @@ describe('moderation admin actions', () => {
       {
         path: `/api/v1/admin/memes/${memeId}/moderation`,
         method: 'PATCH',
-        body: { is_nsfw: false, is_public: true, reason: 'other', note: 'Manual review' }
+        body: { is_nsfw: false, visibility_mode: 'force_public', reason: 'other', note: 'Manual review' }
       }
     ]);
   });
@@ -59,8 +62,13 @@ describe('moderation admin actions', () => {
       moderationActions.resolveModerationReport(actionEvent({ action: 'hide' }, fetch))
     ).resolves.toMatchObject({ status: 400, data: { message: 'report_id is required.', error: true } });
     await expect(
-      moderationActions.updateMemeModeration(actionEvent({ is_public: 'on' }, fetch))
+      moderationActions.updateMemeModeration(actionEvent({ visibility_mode: 'auto' }, fetch))
     ).resolves.toMatchObject({ status: 400, data: { message: 'meme_id is required.', error: true } });
+    await expect(
+      moderationActions.updateMemeModeration(
+        actionEvent({ meme_id: '22222222-2222-4222-8222-222222222222' }, fetch)
+      )
+    ).resolves.toMatchObject({ status: 400, data: { message: 'visibility_mode is required.', error: true } });
     expect(fetch).not.toHaveBeenCalled();
   });
 });

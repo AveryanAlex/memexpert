@@ -23,6 +23,7 @@ from memexpert.models.content import Meme, MemeFile, MemeSource
 from memexpert.models.enums import (
     AnalyticsEventType,
     ContentKind,
+    IngestSourceKind,
     SourceAttachReason,
     SourcePlatform,
 )
@@ -229,7 +230,7 @@ async def handle_private_upload_message(
             message=message,
             media=media,
             telegram_user_id=telegram_user_id,
-            owner_user_id=linked_user.id,
+            uploader_user_id=linked_user.id,
             target_collection_id=target_collection.id,
         )
 
@@ -611,7 +612,7 @@ def _build_upload_source(
     message: Message,
     media: TelegramUploadMedia,
     telegram_user_id: int,
-    owner_user_id: uuid.UUID,
+    uploader_user_id: uuid.UUID,
     target_collection_id: uuid.UUID,
 ) -> IngestAcceptSource:
     try:
@@ -619,7 +620,8 @@ def _build_upload_source(
             source_platform=SourcePlatform.TELEGRAM,
             source_id=f"telegram_pm:{telegram_user_id}:{message.chat.id}",
             post_id=f"message:{message.message_id}:file:{media.file_unique_id}",
-            owner_user_id=owner_user_id,
+            source_kind=IngestSourceKind.USER_UPLOAD,
+            uploader_user_id=uploader_user_id,
             user_metadata=user_metadata_with_target_collection(target_collection_id=target_collection_id),
             view_count=0,
         )

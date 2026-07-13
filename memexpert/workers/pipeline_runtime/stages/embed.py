@@ -3,6 +3,10 @@
 
 from __future__ import annotations
 
+from sqlalchemy import select
+
+from memexpert.ingest.policy import load_approximate_merge_scope
+from memexpert.models.content import Meme, MemeFile
 from memexpert.pipeline.dispatch import PipelineStageWorkContext
 from memexpert.pipeline.stage_completion import PipelineStageCompletionService
 from memexpert.schemas.content_pipeline import ContentPipelineDispatchEvent
@@ -25,10 +29,23 @@ async def run_embed_stage(
         image_bytes=preview_frame_bytes,
         mime_type="image/png",
     )
-    similarity_matches = await context.qdrant_client.find_similar_memes(
-        vector=embedding_result.vector,
-        current_meme_file_id=dispatch_event.meme_file_id,
-    )
+    async with context.session_factory() as session:
+        current_meme = await session.scalar(
+            select(Meme).join(MemeFile, MemeFile.meme_id == Meme.id).where(MemeFile.id == dispatch_event.meme_file_id)
+        )
+        if current_meme is None:
+            similarity_matches = ()
+        else:
+            merge_scope = await load_approximate_merge_scope(session, current_meme)
+            similarity_matches = (
+                await context.qdrant_client.find_similar_memes(
+                    vector=embedding_result.vector,
+                    current_meme_file_id=dispatch_event.meme_file_id,
+                    scope=merge_scope,
+                )
+                if merge_scope.can_match
+                else ()
+            )
     async with context.session_factory() as session:
         service = PipelineStageCompletionService(session, settings=context.settings, broker=context.broker)
         _ = await service.complete_embed_stage(

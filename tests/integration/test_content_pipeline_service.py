@@ -39,6 +39,7 @@ from memexpert.models.enums import (
     ContentPipelineStageStatus,
     ContentProcessingStatus,
     IngestFileOrigin,
+    IngestSourceKind,
     RabbitMQOutboxMessageStatus,
     SourceAttachReason,
     SourcePlatform,
@@ -255,6 +256,7 @@ async def _drive_to_embed_pending(
     phash_tag: str,
     broker: RecordingBroker | None = None,
     filename: str = "embed-ready.png",
+    source_kind: IngestSourceKind = IngestSourceKind.OPERATOR_UPLOAD,
 ) -> tuple[uuid.UUID, NormalizedMediaResult, PipelineStageCompletionService]:
     """Create + transcode + OCR a pipeline item up to the embed-pending state."""
 
@@ -266,6 +268,7 @@ async def _drive_to_embed_pending(
         source_id=source_id,
         post_id=post_id,
         phash_tag=phash_tag,
+        source_kind=source_kind,
     )
     service = _build_service_with_distinct_phash(
         session,
@@ -299,6 +302,7 @@ async def _seed_pending_pipeline_item(
     source_id: str,
     post_id: str,
     phash_tag: str = "a",
+    source_kind: IngestSourceKind = IngestSourceKind.OPERATOR_UPLOAD,
 ) -> uuid.UUID:
     details = _make_distinct_upload_media_details(tag=phash_tag)
     meme_id = uuid.uuid7()
@@ -311,7 +315,7 @@ async def _seed_pending_pipeline_item(
             media_type=details.media_type,
             primary_file_id=meme_file_id,
             language=ContentLanguage.NONE,
-            is_public=False,
+            is_public=source_kind is IngestSourceKind.PUBLIC_CRAWLER,
         )
     )
     await session.flush()
@@ -335,6 +339,7 @@ async def _seed_pending_pipeline_item(
                 platform=SourcePlatform.TELEGRAM,
                 source_id=source_id,
                 post_id=post_id,
+                source_kind=source_kind,
                 is_first_source=True,
                 source_alive=True,
                 attach_reason=SourceAttachReason.NEW_FILE,
@@ -752,6 +757,7 @@ async def test_complete_embed_stage_auto_merges_high_similarity_into_older_meme(
         phash_tag="c",
         broker=broker,
         filename="older.png",
+        source_kind=IngestSourceKind.PUBLIC_CRAWLER,
     )
     _ = await older_service.complete_embed_stage(
         meme_file_id=older_meme_file_id,
@@ -777,6 +783,7 @@ async def test_complete_embed_stage_auto_merges_high_similarity_into_older_meme(
         phash_tag="d",
         broker=broker,
         filename="newer.png",
+        source_kind=IngestSourceKind.PUBLIC_CRAWLER,
     )
 
     async with postgres_session_factory() as pre_merge_session:
@@ -1025,6 +1032,7 @@ async def test_complete_classify_stage_follows_primary_file_change_after_merge(
         post_id="9400",
         phash_tag="i",
         filename="primary-older.png",
+        source_kind=IngestSourceKind.PUBLIC_CRAWLER,
     )
     _ = await older_service.complete_embed_stage(
         meme_file_id=older_meme_file_id,
@@ -1056,6 +1064,7 @@ async def test_complete_classify_stage_follows_primary_file_change_after_merge(
         post_id="9401",
         phash_tag="j",
         filename="primary-newer.png",
+        source_kind=IngestSourceKind.PUBLIC_CRAWLER,
     )
 
     newer_file_row = await migrated_db_session.scalar(
@@ -1169,6 +1178,7 @@ async def test_complete_embed_stage_rolls_back_partial_merge_and_keeps_embed_rep
         post_id="9600",
         phash_tag="l",
         filename="rollback-older.png",
+        source_kind=IngestSourceKind.PUBLIC_CRAWLER,
     )
     _ = await older_service.complete_embed_stage(
         meme_file_id=older_meme_file_id,
@@ -1189,6 +1199,7 @@ async def test_complete_embed_stage_rolls_back_partial_merge_and_keeps_embed_rep
         post_id="9601",
         phash_tag="m",
         filename="rollback-newer.png",
+        source_kind=IngestSourceKind.PUBLIC_CRAWLER,
     )
 
     async with postgres_session_factory() as stash_session:

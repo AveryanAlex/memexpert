@@ -11,7 +11,7 @@ from memexpert.ingest.accept_service import PipelineIngestAcceptService
 from memexpert.ingest.schemas import IngestAcceptOutcome, IngestAcceptResult, IngestAcceptSource, IngestRequestRead
 from memexpert.models.base import utcnow
 from memexpert.models.content import MemeSource, PipelineIngestRequest, SourceChannel
-from memexpert.models.enums import SourceAttachReason, SourcePlatform
+from memexpert.models.enums import IngestSourceKind, SourceAttachReason, SourcePlatform
 from memexpert.pipeline.constants import (
     CRAWLER_MEDIA_DEFAULT_CONTENT_TYPES,
     CRAWLER_MEDIA_DEFAULT_FILENAMES,
@@ -278,6 +278,7 @@ class PipelineCrawlerIngestService:
             source_platform=SourcePlatform.TELEGRAM,
             source_id=raw_post.source_id,
             post_id=raw_post.post_id,
+            source_kind=IngestSourceKind.PUBLIC_CRAWLER,
             view_count=raw_post.view_count,
             forward_count=raw_post.forward_count,
             comment_count=raw_post.comment_count,

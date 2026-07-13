@@ -45,7 +45,7 @@ so replay and full rebuild paths always advertise the latest safe state.
 
 Fields intentionally carried into both indexes:
 
-- Access/ranking hints: `is_public`, `author_user_id`, `collection_ids`,
+- Access/ranking hints: `is_public`, `collection_ids`,
   `public_collection_ids`, `unlisted_collection_ids`,
   `private_collection_ids`, `shared_collection_ids`,
   `collection_owner_user_ids`, `collection_member_user_ids`.
@@ -55,6 +55,10 @@ Fields intentionally carried into both indexes:
   `quality_score`.
 - Safe content hints already used by the search sync path: `meme_id`,
   `meme_file_id`/`id`, `seo_page_slug`, and OCR text/snippet.
+
+Qdrant additionally carries internal `uploader_user_ids`. That field exists only
+to constrain private approximate-dedupe candidates to the same sole uploader;
+it is never an access grant. Meilisearch does not carry uploader provenance.
 
 Indexes remain **candidate sources only**. PostgreSQL is still the final access
 authority in `MemeSearchService`; stale Qdrant or Meilisearch payloads must not
@@ -162,6 +166,9 @@ Use per-target replay when canonical PostgreSQL truth changed after the last
 successful sync and the search indexes need to catch up. Typical triggers:
 
 - `is_public` flipped between public/private.
+- `visibility_mode` changed, or crawler provenance promoted an `auto` meme.
+- The private meme's distinct uploader set changed, which makes Qdrant's
+  internal approximate-dedupe payload stale.
 - A meme was added to or removed from a collection.
 - Collection visibility changed between `private`, `unlisted`, and `public`.
 - Tags, template assignment, template slug, or SEO slug changed.
@@ -181,6 +188,34 @@ Operational guidance:
 4. After the replay/rebuild wave, re-read the item detail and per-target status
    routes. A `synced` snapshot is trustworthy only when the target preview and
    timestamps line up with current PostgreSQL truth.
+
+## Staged SHA reconciliation rollout
+
+The provenance migration cannot restore global SHA uniqueness until historical
+duplicates are merged. Use this deployment order:
+
+1. Stop API, crawler, bot-upload, and worker ingestion writers.
+2. Apply the additive revision only: `uv run alembic upgrade 0031`.
+3. Run `uv run memexpert-reconcile-sha-duplicates`. It commits one SHA group per
+   transaction and is safe to restart. Use `--limit <n>` for bounded batches.
+4. Require `uv run memexpert-reconcile-sha-duplicates --verify-only` to print
+   `no duplicate non-null SHA groups remain` and exit zero.
+5. Apply `uv run alembic upgrade 0032`. The migration itself aborts if a
+   duplicate remains; do not bypass that guard.
+6. Read `meme_merge_logs.details` for the obsolete file IDs, S3 keys, Qdrant
+   point IDs, and Meilisearch document IDs. Delete an S3 object only after a
+   PostgreSQL reference check proves no surviving `MemeFile` uses it.
+7. Delete the logged stale Qdrant points/Meilisearch documents, then perform a
+   full rebuild from ready PostgreSQL files. The algorithm version changed to
+   `collection-provenance-v2`, so a partial legacy payload population is not a
+   valid end state.
+8. Verify representative public, private, shared, and crawler-promoted memes
+   through user-facing search/detail/media authorization before resuming
+   ingestion.
+
+The reconciliation merge log is the cleanup ledger. Do not infer obsolete S3
+or index identifiers after deletion from current tables; those rows are already
+gone by design.
 
 ## Common failure modes
 

@@ -26,7 +26,7 @@ By default, the runner also sets `MEMEXPERT_MAIN_IMAGE`, `MEMEXPERT_WORKER_IMAGE
 
 After `workers` starts, the runner polls `rabbitmqctl list_consumers --formatter=json` through the RabbitMQ Compose service under a fixed monotonic deadline. Seed begins only after consumers exist for `pipeline.media_inspect`, `pipeline.transcode`, `pipeline.ocr`, `pipeline.embed`, `pipeline.classify`, `pipeline.sync_qdrant`, and `pipeline.sync_meili`. The Compose `service_started` dependency remains intentionally truthful: it does not claim process readiness, while the orchestrator owns the stronger consumer-registration gate.
 
-Seed HTTP retries and eventual-consistency pollers use caller-owned monotonic deadlines. Each fixed logical phase—health, upload, materialization, dual sync, public visibility, Meilisearch visibility, and final proofs—receives a fresh `--timeout-seconds` budget. A slow phase therefore cannot starve a later independent phase, while every individual request timeout and retry chain remains capped by its current phase deadline. Only transport errors, HTTP 408/425/429, and 5xx responses are retried; non-idempotent writes require a durable replay identity.
+Seed HTTP retries and eventual-consistency pollers use caller-owned monotonic deadlines. Each fixed logical phase—health, private upload, materialization, initial dual sync, crawler promotion, public resync, Meilisearch visibility, and final proofs—receives a fresh `--timeout-seconds` budget. A slow phase therefore cannot starve a later independent phase, while every individual request timeout and retry chain remains capped by its current phase deadline. Only transport errors, HTTP 408/425/429, and 5xx responses are retried; non-idempotent writes require a durable replay identity.
 
 Set `E2E_SKIP_IMAGE_BUILD=1` only when all four configured images already exist in the local Docker daemon. In that mode the runner validates the tags up front, uses `docker compose up --no-build`, and skips the separate E2E runner build. CI uses this mode to reuse the images it just built and loaded:
 
@@ -48,7 +48,7 @@ Default CI and local E2E runs are deterministic and secret-free:
 - `PIPELINE_CLASSIFICATION_PROVIDER_MODE=fake`
 - `PIPELINE_VOYAGE_OUTPUT_DIMENSIONS=4`
 
-The suite does not call live Voyage, Telegram, Google, or other provider APIs. The current default path proves the manual/operator upload pipeline with fake providers. Full fake Telegram ingest is a follow-up.
+The suite does not call live Voyage, Telegram, Google, or other provider APIs. The current default path proves a collection-backed private operator upload, confirms it is absent from public search, then feeds the same bytes through the typed crawler ingest service. The exact-SHA crawler source must reuse the same meme/file, promote AUTO visibility, and become publicly searchable after Qdrant/Meilisearch resync. Full Telethon network emulation remains a follow-up.
 
 Live PaddleOCR is available in the worker image through a Python 3.13 helper venv, but it is deliberately disabled for default E2E. Run the gated smoke explicitly when model downloads/runtime cost are acceptable:
 
@@ -65,7 +65,7 @@ docker run --rm \
 
 - Public discovery through website search, URL-backed filters, detail pages, and imgproxy media rendering.
 - Guest favorite/unfavorite behavior with custom collections and Pin gated to full accounts.
-- Fake-provider content pipeline upload, dual search-index proof, and website discovery of the created meme.
+- Fake-provider private upload, exact-SHA crawler promotion, dual search-index proof, and website discovery of the same canonical meme/file.
 
 ## Artifacts
 

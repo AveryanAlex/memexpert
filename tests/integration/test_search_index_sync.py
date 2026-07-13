@@ -15,6 +15,7 @@ from memexpert.models.enums import (
     CollectionVisibility,
     ContentKind,
     ContentLanguage,
+    IngestSourceKind,
     SourceEngagementCaptureReason,
     SourceEngagementCommentsState,
     SourceEngagementFetchStatus,
@@ -44,7 +45,7 @@ async def _create_meme_with_primary_file(
     is_nsfw: bool = False,
     popularity_score: float = 0.0,
     like_count: int = 0,
-    author_user_id: uuid.UUID | None = None,
+    uploader_user_id: uuid.UUID | None = None,
     ocr_text: str | None = None,
     quality_score: float = 0.8,
 ) -> tuple[Meme, MemeFile]:
@@ -59,7 +60,6 @@ async def _create_meme_with_primary_file(
         is_public=is_public,
         is_nsfw=is_nsfw,
         like_count=like_count,
-        author_user_id=author_user_id,
         ocr_text=ocr_text,
     )
 
@@ -74,6 +74,19 @@ async def _create_meme_with_primary_file(
     await session.flush()
     session.add(meme_file)
     await session.flush()
+    if uploader_user_id is not None:
+        session.add(
+            MemeSource(
+                file_id=meme_file.id,
+                platform=SourcePlatform.TELEGRAM,
+                source_id=f"search-index-uploader-{meme_file.id}",
+                post_id="upload",
+                source_kind=IngestSourceKind.USER_UPLOAD,
+                uploader_user_id=uploader_user_id,
+                source_alive=True,
+            )
+        )
+        await session.flush()
     if popularity_score > 0.0:
         await _set_source_engagement_score(session, meme_file.id, source_views=max(1, int(popularity_score)))
     return meme, meme_file
@@ -87,6 +100,7 @@ async def _set_source_engagement_score(session: AsyncSession, meme_file_id: uuid
             platform=SourcePlatform.TELEGRAM,
             source_id=f"search-index-{meme_file_id.hex}",
             post_id="1",
+            source_kind=IngestSourceKind.PUBLIC_CRAWLER,
             is_first_source=True,
             source_alive=True,
         )
@@ -189,7 +203,7 @@ async def test_search_index_state_builds_collection_aware_public_crawled_payload
     assert meili_document.search_index_algorithm_version == SEARCH_INDEX_ALGORITHM_VERSION
     assert qdrant_payload.is_public is True
     assert meili_document.is_public is True
-    assert qdrant_payload.author_user_id is None
+    assert qdrant_payload.uploader_user_ids == []
     assert qdrant_payload.media_type == ContentKind.IMAGE.value
     assert qdrant_payload.language == ContentLanguage.EN.value
     assert qdrant_payload.tags == ["frog", "wizard"]
@@ -239,7 +253,7 @@ async def test_search_index_state_rebuild_reflects_visibility_collection_tag_and
         is_public=False,
         popularity_score=1.0,
         like_count=1,
-        author_user_id=author.id,
+        uploader_user_id=author.id,
         ocr_text="private upload",
     )
     await migrated_db_session.commit()
@@ -247,7 +261,7 @@ async def test_search_index_state_rebuild_reflects_visibility_collection_tag_and
     initial_state = await load_search_index_state(migrated_db_session, meme_file.id)
     initial_payload = build_qdrant_sync_payload(initial_state.canonical)
     assert initial_payload.is_public is False
-    assert initial_payload.author_user_id == str(author.id)
+    assert initial_payload.uploader_user_ids == [str(author.id)]
     assert initial_payload.collection_ids == []
     assert initial_payload.tags == ["old-tag"]
     assert initial_payload.template_id is None

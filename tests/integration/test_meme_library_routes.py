@@ -34,7 +34,6 @@ async def _create_meme(
     *,
     is_public: bool = True,
     is_nsfw: bool = False,
-    author_user_id: uuid.UUID | None = None,
 ) -> Meme:
     meme_id = uuid.uuid7()
     meme_file_id = uuid.uuid7()
@@ -45,7 +44,6 @@ async def _create_meme(
         language=ContentLanguage.EN,
         is_public=is_public,
         is_nsfw=is_nsfw,
-        author_user_id=author_user_id,
     )
     meme_file = MemeFile(
         id=meme_file_id,
@@ -318,9 +316,9 @@ async def test_share_download_telemetry_respects_private_and_nsfw_visibility(
     migrated_db_session: AsyncSession,
 ) -> None:
     user_service = UserService(migrated_db_session)
-    author = await create_full_user_via_upgrade(user_service, email="telemetry-author@example.com")
+    _ = await create_full_user_via_upgrade(user_service, email="telemetry-author@example.com")
     stranger = await create_full_user_via_upgrade(user_service, email="telemetry-stranger@example.com")
-    private_meme = await _create_meme(migrated_db_session, is_public=False, author_user_id=author.id)
+    private_meme = await _create_meme(migrated_db_session, is_public=False)
     nsfw_meme = await _create_meme(migrated_db_session, is_nsfw=True)
     await migrated_db_session.commit()
 
@@ -463,9 +461,9 @@ async def test_library_routes_reject_private_memes_not_visible_to_user(
     migrated_db_session: AsyncSession,
 ) -> None:
     user_service = UserService(migrated_db_session)
-    author = await create_full_user_via_upgrade(user_service, email="route-private-author@example.com")
+    _ = await create_full_user_via_upgrade(user_service, email="route-private-author@example.com")
     stranger = await create_full_user_via_upgrade(user_service, email="route-private-stranger@example.com")
-    private_meme = await _create_meme(migrated_db_session, is_public=False, author_user_id=author.id)
+    private_meme = await _create_meme(migrated_db_session, is_public=False)
     await migrated_db_session.commit()
 
     def override_collection_service() -> CollectionService:

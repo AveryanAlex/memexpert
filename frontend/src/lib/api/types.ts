@@ -877,13 +877,13 @@ export interface AdminMemeRead {
   media_type: ContentKind;
   language: ContentLanguage;
   is_nsfw: boolean;
+  visibility_mode: 'auto' | 'force_public' | 'force_private';
   is_public: boolean;
   popularity_score: number;
   like_count: number;
   tags: string[];
   primary_file: PublicMemeFileRead | null;
   template_id: string | null;
-  author_user_id: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -942,8 +942,10 @@ export interface AdminModerationDecisionRead {
   reason: ModerationReason | null;
   note: string | null;
   previous_is_public: boolean;
+  previous_visibility_mode: 'auto' | 'force_public' | 'force_private';
   previous_is_nsfw: boolean;
   new_is_public: boolean;
+  new_visibility_mode: 'auto' | 'force_public' | 'force_private';
   new_is_nsfw: boolean;
   previous_template_id: string | null;
   new_template_id: string | null;

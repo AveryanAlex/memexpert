@@ -14,9 +14,9 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
-from memexpert.models.enums import SourceAttachReason, SourceEngagementCommentsState, SourcePlatform
+from memexpert.models.enums import IngestSourceKind, SourceAttachReason, SourceEngagementCommentsState, SourcePlatform
 from memexpert.schemas.pipeline_base import (
     MAX_POST_ID_LENGTH,
     MAX_SOURCE_ID_LENGTH,
@@ -35,7 +35,8 @@ class ContentPipelineUploadMetadata(BaseModel):
     source_platform: SourcePlatform
     source_id: str = Field(min_length=1, max_length=MAX_SOURCE_ID_LENGTH)
     post_id: str = Field(min_length=1, max_length=MAX_POST_ID_LENGTH)
-    owner_user_id: uuid.UUID | None = None
+    source_kind: IngestSourceKind = IngestSourceKind.OPERATOR_UPLOAD
+    uploader_user_id: uuid.UUID | None = None
     view_count: StrictInt | None = Field(default=None, ge=0)
 
     @field_validator("source_id", "post_id")
@@ -45,6 +46,14 @@ class ContentPipelineUploadMetadata(BaseModel):
         if not normalized_value:
             raise ValueError("source provenance fields must not be blank.")
         return normalized_value
+
+    @model_validator(mode="after")
+    def _validate_uploader_contract(self) -> ContentPipelineUploadMetadata:
+        if self.source_kind is IngestSourceKind.USER_UPLOAD and self.uploader_user_id is None:
+            raise ValueError("uploader_user_id is required for user uploads.")
+        if self.source_kind is IngestSourceKind.PUBLIC_CRAWLER and self.uploader_user_id is not None:
+            raise ValueError("Public crawler sources cannot carry uploader_user_id.")
+        return self
 
 
 # ---------------------------------------------------------------------------

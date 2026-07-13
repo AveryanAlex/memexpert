@@ -11,11 +11,13 @@ Ranking weights are **tunable algorithm parameters**, not product requirements. 
 Search must work across both public and user-accessible private content:
 
 - **Public/common catalog** — public memes crawled from source channels.
-- **User private data** — the user's Favorites and private uploads.
+- **User private data** — non-public memes in collections the user can access.
 - **Shared collections** — private collections where the user is owner/editor/viewer.
 - **All accessible memes** — public + every private/shared collection the user can access.
 
 The bot and web share the same service-level search contract. Telegram inline search resolves/creates the full account from `telegram_id` first, then searches the user's accessible scope. The bot does not need to visually distinguish public vs private results; the web should subtly indicate private/shared results.
+
+Private authorization comes only from collection ownership/membership. Upload provenance does not grant a separate author shortcut, and non-admin search/detail/media responses never reveal uploader IDs or private source records. A public meme saved in Favorites remains public and is excluded from the `private` scope, though it remains available in `all` and explicit collection scopes.
 
 Any cached search candidate pool or result key must include normalized query text, content filters, viewer identity, scope, normalized collection ids, NSFW allowance or user preference, and algorithm/version fields. Cached candidates are only an optimization; final PostgreSQL access filtering still decides what can be returned.
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import uuid
 from dataclasses import dataclass, field
@@ -38,6 +39,8 @@ from memexpert.models.enums import (
     ContentPipelineStageStatus,
     ContentProcessingStatus,
     IngestFileOrigin,
+    IngestSourceKind,
+    MemeVisibilityMode,
     ModerationReason,
     PipelineIngestRequestStatus,
     RabbitMQOutboxMessageStatus,
@@ -216,7 +219,8 @@ async def _seed_raw_request(
     source_id: str = "materializer-source",
     post_id: str = "1",
     view_count: int = 12,
-    owner_user_id: uuid.UUID | None = None,
+    source_kind: IngestSourceKind | None = None,
+    uploader_user_id: uuid.UUID | None = None,
     user_metadata: dict[str, object] | None = None,
     source_metadata: dict[str, object] | None = None,
 ) -> PipelineIngestRequest:
@@ -228,7 +232,9 @@ async def _seed_raw_request(
         source_platform=SourcePlatform.TELEGRAM,
         source_id=source_id,
         post_id=post_id,
-        owner_user_id=owner_user_id,
+        source_kind=source_kind
+        or (IngestSourceKind.USER_UPLOAD if uploader_user_id is not None else IngestSourceKind.OPERATOR_UPLOAD),
+        uploader_user_id=uploader_user_id,
         user_metadata=user_metadata or {},
         source_metadata=source_metadata or {"view_count": view_count},
         declared_filename="raw.png",
@@ -250,7 +256,8 @@ async def _seed_existing_meme_file(
     perceptual_hash: str,
     sha256_hex: str = "0" * 64,
     is_public: bool = True,
-    author_user_id: uuid.UUID | None = None,
+    visibility_mode: MemeVisibilityMode | None = None,
+    uploader_user_ids: tuple[uuid.UUID, ...] = (),
 ) -> MemeFile:
     meme_id = uuid.uuid7()
     meme_file_id = uuid.uuid7()
@@ -260,7 +267,8 @@ async def _seed_existing_meme_file(
         primary_file_id=meme_file_id,
         language=ContentLanguage.NONE,
         is_public=is_public,
-        author_user_id=author_user_id,
+        visibility_mode=visibility_mode
+        or (MemeVisibilityMode.FORCE_PUBLIC if is_public else MemeVisibilityMode.AUTO),
     )
     session.add(meme)
     await session.flush()
@@ -278,6 +286,18 @@ async def _seed_existing_meme_file(
         ingest_origin=IngestFileOrigin.NEW_MEME,
     )
     session.add(meme_file)
+    for uploader_user_id in uploader_user_ids:
+        session.add(
+            MemeSource(
+                file_id=meme_file.id,
+                platform=SourcePlatform.TELEGRAM,
+                source_id=f"seed-uploader:{uploader_user_id}:{meme_file.id}",
+                post_id="seed",
+                source_kind=IngestSourceKind.USER_UPLOAD,
+                uploader_user_id=uploader_user_id,
+                source_alive=True,
+            )
+        )
     await session.commit()
     return meme_file
 
@@ -348,6 +368,7 @@ async def test_materializer_new_content_creates_content_rows_outbox_and_cleans_t
     async with postgres_session_factory() as session:
         request = await session.get(PipelineIngestRequest, ingest_request.id)
         meme_file = await session.get(MemeFile, result.materialized_meme_file_id)
+        meme = await session.get(Meme, result.materialized_meme_id)
         sources = (await session.execute(select(MemeSource))).scalars().all()
         stage_rows = (await session.execute(select(PipelineStageJournal))).scalars().all()
         snapshots = (await session.execute(select(MemeSourceEngagementSnapshot))).scalars().all()
@@ -356,9 +377,13 @@ async def test_materializer_new_content_creates_content_rows_outbox_and_cleans_t
     assert request is not None
     assert request.status is PipelineIngestRequestStatus.MATERIALIZED
     assert meme_file is not None
+    assert meme is not None
+    assert meme.visibility_mode is MemeVisibilityMode.AUTO
+    assert meme.is_public is False
     assert meme_file.ingest_origin is IngestFileOrigin.NEW_MEME
     assert meme_file.s3_original_key in storage_client.objects
     assert sources[0].file_id == meme_file.id
+    assert sources[0].source_kind is IngestSourceKind.OPERATOR_UPLOAD
     assert sources[0].attach_reason is SourceAttachReason.NEW_FILE
     assert len(snapshots) == 1
     snapshot = snapshots[0]
@@ -389,6 +414,31 @@ async def test_materializer_new_content_creates_content_rows_outbox_and_cleans_t
     assert outbox_rows[0].payload["meme_file_id"] == str(meme_file.id)
 
 
+async def test_materializer_new_crawler_discovery_is_public_in_auto_mode(
+    migrated_db_session: AsyncSession,
+) -> None:
+    storage_client = FakeStorageClient()
+    request = await _seed_raw_request(
+        migrated_db_session,
+        storage_client,
+        source_id="new-public-crawler",
+        post_id="new-public-crawler-post",
+        source_kind=IngestSourceKind.PUBLIC_CRAWLER,
+    )
+
+    result = await PipelineIngestMaterializer(
+        migrated_db_session,
+        settings=Settings(),
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(inspect_result=_upload_details(perceptual_hash="f" * 16)),
+    ).materialize(request.id)
+
+    meme = await migrated_db_session.get(Meme, result.materialized_meme_id)
+    assert meme is not None
+    assert meme.visibility_mode is MemeVisibilityMode.AUTO
+    assert meme.is_public is True
+
+
 async def test_materializer_new_private_upload_attaches_target_before_index_payload(
     migrated_db_session: AsyncSession,
     postgres_session_factory: async_sessionmaker[AsyncSession],
@@ -404,7 +454,7 @@ async def test_materializer_new_private_upload_attaches_target_before_index_payl
         storage_client,
         source_id="target-materializer-source",
         post_id="target-materializer-post",
-        owner_user_id=owner.id,
+        uploader_user_id=owner.id,
         user_metadata=user_metadata_with_target_collection(target_collection_id=target_collection.id),
     )
     media_processor = FakeMediaProcessor(inspect_result=_upload_details(perceptual_hash="9" * 16))
@@ -430,9 +480,8 @@ async def test_materializer_new_private_upload_attaches_target_before_index_payl
     assert saved.added_by_user_id == owner.id
     assert meme is not None
     assert meme.is_public is False
-    assert meme.author_user_id == owner.id
     assert qdrant_payload.is_public is False
-    assert qdrant_payload.author_user_id == str(owner.id)
+    assert qdrant_payload.uploader_user_ids == [str(owner.id)]
     assert qdrant_payload.collection_ids == [str(target_collection.id)]
     assert qdrant_payload.private_collection_ids == [str(target_collection.id)]
     assert qdrant_payload.collection_owner_user_ids == [str(owner.id)]
@@ -451,6 +500,7 @@ async def test_materializer_phash_duplicate_creates_new_file_under_existing_meme
         storage_client,
         source_id="phash-source",
         post_id="2",
+        source_kind=IngestSourceKind.PUBLIC_CRAWLER,
     )
     media_processor = FakeMediaProcessor(inspect_result=_upload_details(perceptual_hash=perceptual_hash))
 
@@ -491,6 +541,111 @@ async def test_materializer_phash_duplicate_creates_new_file_under_existing_meme
     assert outbox_count == 1
 
 
+async def test_materializer_phash_duplicate_merges_same_single_uploader_private_meme(
+    migrated_db_session: AsyncSession,
+) -> None:
+    uploader = User(email="same-private-phash@example.com")
+    migrated_db_session.add(uploader)
+    await migrated_db_session.flush()
+    target_collection = await _seed_collection(migrated_db_session, owner=uploader)
+    perceptual_hash = "6" * 16
+    existing_file = await _seed_existing_meme_file(
+        migrated_db_session,
+        perceptual_hash=perceptual_hash,
+        is_public=False,
+        uploader_user_ids=(uploader.id,),
+    )
+    storage_client = FakeStorageClient()
+    ingest_request = await _seed_raw_request(
+        migrated_db_session,
+        storage_client,
+        source_id="same-private-phash-source",
+        post_id="same-private-phash-post",
+        uploader_user_id=uploader.id,
+        user_metadata=user_metadata_with_target_collection(target_collection_id=target_collection.id),
+    )
+
+    result = await PipelineIngestMaterializer(
+        migrated_db_session,
+        settings=Settings(),
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(inspect_result=_upload_details(perceptual_hash=perceptual_hash)),
+    ).materialize(ingest_request.id)
+
+    assert result.materialized_meme_id == existing_file.meme_id
+    assert result.matched_meme_file_id == existing_file.id
+    assert await migrated_db_session.get(CollectionMeme, (target_collection.id, existing_file.meme_id)) is not None
+
+
+async def test_user_phash_match_to_public_meme_creates_separate_private_meme(
+    migrated_db_session: AsyncSession,
+) -> None:
+    uploader = User(email="public-near-duplicate-user@example.com")
+    migrated_db_session.add(uploader)
+    await migrated_db_session.flush()
+    target_collection = await _seed_collection(migrated_db_session, owner=uploader)
+    perceptual_hash = "8" * 16
+    public_file = await _seed_existing_meme_file(migrated_db_session, perceptual_hash=perceptual_hash)
+    storage_client = FakeStorageClient()
+    request = await _seed_raw_request(
+        migrated_db_session,
+        storage_client,
+        source_id="public-near-user",
+        post_id="public-near-user-post",
+        uploader_user_id=uploader.id,
+        user_metadata=user_metadata_with_target_collection(target_collection_id=target_collection.id),
+    )
+
+    result = await PipelineIngestMaterializer(
+        migrated_db_session,
+        settings=Settings(),
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(inspect_result=_upload_details(perceptual_hash=perceptual_hash)),
+    ).materialize(request.id)
+
+    assert result.matched_meme_file_id is None
+    assert result.materialized_meme_id != public_file.meme_id
+    private_meme = await migrated_db_session.get(Meme, result.materialized_meme_id)
+    assert private_meme is not None
+    assert private_meme.is_public is False
+
+
+async def test_crawler_phash_match_to_private_meme_creates_separate_public_meme(
+    migrated_db_session: AsyncSession,
+) -> None:
+    uploader = User(email="private-near-crawler-user@example.com")
+    migrated_db_session.add(uploader)
+    await migrated_db_session.flush()
+    perceptual_hash = "c" * 16
+    private_file = await _seed_existing_meme_file(
+        migrated_db_session,
+        perceptual_hash=perceptual_hash,
+        is_public=False,
+        uploader_user_ids=(uploader.id,),
+    )
+    storage_client = FakeStorageClient()
+    request = await _seed_raw_request(
+        migrated_db_session,
+        storage_client,
+        source_id="private-near-crawler",
+        post_id="private-near-crawler-post",
+        source_kind=IngestSourceKind.PUBLIC_CRAWLER,
+    )
+
+    result = await PipelineIngestMaterializer(
+        migrated_db_session,
+        settings=Settings(),
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(inspect_result=_upload_details(perceptual_hash=perceptual_hash)),
+    ).materialize(request.id)
+
+    assert result.matched_meme_file_id is None
+    assert result.materialized_meme_id != private_file.meme_id
+    public_meme = await migrated_db_session.get(Meme, result.materialized_meme_id)
+    assert public_meme is not None
+    assert public_meme.is_public is True
+
+
 async def test_materializer_phash_duplicate_does_not_cross_user_dedupe_private_files(
     migrated_db_session: AsyncSession,
 ) -> None:
@@ -504,7 +659,7 @@ async def test_materializer_phash_duplicate_does_not_cross_user_dedupe_private_f
         migrated_db_session,
         perceptual_hash=perceptual_hash,
         is_public=False,
-        author_user_id=other_owner.id,
+        uploader_user_ids=(other_owner.id,),
     )
     shared_private_collection = await _seed_collection(migrated_db_session, owner=other_owner, member=owner)
     migrated_db_session.add(
@@ -521,7 +676,7 @@ async def test_materializer_phash_duplicate_does_not_cross_user_dedupe_private_f
         storage_client,
         source_id="private-phash-source",
         post_id="private-phash-post",
-        owner_user_id=owner.id,
+        uploader_user_id=owner.id,
         user_metadata=user_metadata_with_target_collection(target_collection_id=target_collection.id),
     )
     media_processor = FakeMediaProcessor(inspect_result=_upload_details(perceptual_hash=perceptual_hash))
@@ -547,6 +702,85 @@ async def test_materializer_phash_duplicate_does_not_cross_user_dedupe_private_f
     )
 
 
+async def test_materializer_rechecks_global_sha_and_collapses_pending_accept_race(
+    migrated_db_session: AsyncSession,
+) -> None:
+    media_bytes = b"pending-accept-sha-race"
+    existing_file = await _seed_existing_meme_file(
+        migrated_db_session,
+        perceptual_hash="d" * 16,
+        sha256_hex=hashlib.sha256(media_bytes).hexdigest(),
+    )
+    storage_client = FakeStorageClient()
+    request = await _seed_raw_request(
+        migrated_db_session,
+        storage_client,
+        media_bytes=media_bytes,
+        source_id="sha-race-source",
+        post_id="sha-race-post",
+    )
+
+    result = await PipelineIngestMaterializer(
+        migrated_db_session,
+        settings=Settings(),
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(inspect_result=_upload_details(perceptual_hash="e" * 16)),
+    ).materialize(request.id)
+
+    assert result.status is PipelineIngestRequestStatus.RESOLVED_SHA_DUPLICATE
+    assert result.materialized_meme_file_id == existing_file.id
+    assert await migrated_db_session.scalar(select(func.count()).select_from(MemeFile)) == 1
+    assert await migrated_db_session.scalar(select(func.count()).select_from(RabbitMQOutboxMessage)) == 0
+
+
+async def test_concurrent_exact_materializations_produce_one_meme_and_one_file(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    _ = migrated_db_session
+    storage_client = FakeStorageClient()
+    media_bytes = b"concurrent-global-sha"
+    async with postgres_session_factory() as first_session:
+        first_request = await _seed_raw_request(
+            first_session,
+            storage_client,
+            media_bytes=media_bytes,
+            source_id="concurrent-source-one",
+            post_id="one",
+        )
+    async with postgres_session_factory() as second_session:
+        second_request = await _seed_raw_request(
+            second_session,
+            storage_client,
+            media_bytes=media_bytes,
+            source_id="concurrent-source-two",
+            post_id="two",
+        )
+
+    async def materialize(request_id: uuid.UUID):
+        async with postgres_session_factory() as session:
+            return await PipelineIngestMaterializer(
+                session,
+                settings=Settings(),
+                storage_client=storage_client,
+                media_processor=FakeMediaProcessor(inspect_result=_upload_details(perceptual_hash="1" * 16)),
+            ).materialize(request_id)
+
+    results = await asyncio.gather(materialize(first_request.id), materialize(second_request.id))
+
+    async with postgres_session_factory() as session:
+        meme_count = await session.scalar(select(func.count()).select_from(Meme))
+        file_count = await session.scalar(select(func.count()).select_from(MemeFile))
+        source_count = await session.scalar(select(func.count()).select_from(MemeSource))
+    assert meme_count == 1
+    assert file_count == 1
+    assert source_count == 2
+    assert {result.status for result in results} == {
+        PipelineIngestRequestStatus.MATERIALIZED,
+        PipelineIngestRequestStatus.RESOLVED_SHA_DUPLICATE,
+    }
+
+
 async def test_materializer_phash_duplicate_does_not_cross_user_dedupe_private_files_for_editor(
     migrated_db_session: AsyncSession,
 ) -> None:
@@ -560,7 +794,7 @@ async def test_materializer_phash_duplicate_does_not_cross_user_dedupe_private_f
         migrated_db_session,
         perceptual_hash=perceptual_hash,
         is_public=False,
-        author_user_id=other_owner.id,
+        uploader_user_ids=(other_owner.id, owner.id),
     )
     shared_private_collection = await _seed_collection(
         migrated_db_session,
@@ -582,7 +816,7 @@ async def test_materializer_phash_duplicate_does_not_cross_user_dedupe_private_f
         storage_client,
         source_id="private-phash-editor-source",
         post_id="private-phash-editor-post",
-        owner_user_id=owner.id,
+        uploader_user_id=owner.id,
         user_metadata=user_metadata_with_target_collection(target_collection_id=target_collection.id),
     )
     media_processor = FakeMediaProcessor(inspect_result=_upload_details(perceptual_hash=perceptual_hash))
@@ -624,7 +858,7 @@ async def test_materializer_persists_source_attribution_from_raw_request_metadat
         storage_client,
         source_id="attribution-source",
         post_id="source-post",
-        owner_user_id=owner_user_id,
+        uploader_user_id=owner_user_id,
         source_metadata={
             "view_count": 41,
             "published_at": published_at.isoformat(),
@@ -657,8 +891,9 @@ async def test_materializer_persists_source_attribution_from_raw_request_metadat
 
     assert result.status is PipelineIngestRequestStatus.MATERIALIZED
     assert meme is not None
-    assert meme.author_user_id == owner_user_id
     assert source is not None
+    assert source.source_kind is IngestSourceKind.USER_UPLOAD
+    assert source.uploader_user_id == owner_user_id
     assert source.file_id == result.materialized_meme_file_id
     assert snapshot is not None
     assert snapshot.view_count == 41
@@ -696,7 +931,7 @@ async def test_materializer_blocked_phash_creates_failed_audit_rows_and_no_trans
         storage_client,
         source_id="blocked-source",
         post_id="3",
-        owner_user_id=owner.id,
+        uploader_user_id=owner.id,
         user_metadata=user_metadata_with_target_collection(target_collection_id=target_collection.id),
     )
     media_processor = FakeMediaProcessor(inspect_result=_upload_details(perceptual_hash=perceptual_hash))

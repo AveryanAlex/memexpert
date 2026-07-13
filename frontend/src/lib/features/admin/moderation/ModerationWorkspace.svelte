@@ -59,7 +59,7 @@
             <div class="flex flex-wrap justify-between gap-2"><strong>{meme.is_public ? 'Visible' : 'Hidden'} · {meme.is_nsfw ? 'Sensitive' : 'Safe'}</strong><a class="text-sm font-black underline" href={`/admin/memes/${meme.id}`}>Open detail</a></div>
             <form method="POST" action="?/updateMemeModeration" class="grid gap-3 sm:grid-cols-2">
               <input type="hidden" name="meme_id" value={meme.id} />
-              <label class="inline-flex items-center gap-2 text-sm font-extrabold"><input name="is_public" type="checkbox" checked={meme.is_public} /> Visible in catalog</label>
+              <label class="grid gap-2 text-sm font-extrabold">Visibility policy<Select name="visibility_mode"><option value="auto" selected={meme.visibility_mode === 'auto'}>Automatic from provenance</option><option value="force_public" selected={meme.visibility_mode === 'force_public'}>Force public</option><option value="force_private" selected={meme.visibility_mode === 'force_private'}>Force private</option></Select><span class="font-normal text-muted">Effective state: {meme.is_public ? 'visible' : 'hidden'}</span></label>
               <label class="inline-flex items-center gap-2 text-sm font-extrabold"><input name="is_nsfw" type="checkbox" checked={meme.is_nsfw} /> Sensitive content</label>
               <label class="grid gap-2 text-sm font-extrabold">Reason<Select name="reason"><option value="">No reason</option>{#each reasons as reason}<option value={reason}>{plain(reason)}</option>{/each}</Select></label>
               <label class="grid gap-2 text-sm font-extrabold">Audit note (optional)<Input name="note" placeholder="Why is this override needed?" /></label>

@@ -28,11 +28,16 @@ from memexpert.core.storage import (
     upload_object_bytes,
 )
 from memexpert.ingest.collection_targets import (
+    resolve_target_collection_id,
     save_meme_to_target_collection,
-    validate_target_collection_write,
-    visible_meme_clause,
 )
+from memexpert.ingest.policy import refresh_effective_visibility
 from memexpert.ingest.schemas import IngestAcceptOutcome, IngestAcceptResult, IngestAcceptSource, IngestRequestRead
+from memexpert.ingest.sha_dedupe import (
+    acquire_sha256_advisory_lock,
+    find_global_sha256_match,
+    sha_match_attach_reason,
+)
 from memexpert.ingest.source_metadata import (
     source_engagement_metrics,
     source_forward_ids,
@@ -41,12 +46,12 @@ from memexpert.ingest.source_metadata import (
 from memexpert.ingest.target_collection_metadata import (
     TargetCollectionMetadataError,
     parse_target_collection_id,
+    user_metadata_with_target_collection,
 )
 from memexpert.messaging.rabbitmq_outbox import RabbitPublisher, relay_rabbitmq_outbox_messages_best_effort
 from memexpert.models.base import utcnow
 from memexpert.models.content import Meme, MemeFile, MemeSource, PipelineIngestRequest
 from memexpert.models.enums import (
-    ContentProcessingStatus,
     PipelineIngestRequestStatus,
     SourceAttachReason,
     SourceEngagementCommentsState,
@@ -149,14 +154,19 @@ class PipelineIngestAcceptService:
             comment_count=source.comment_count,
             comments_state=source.comments_state,
         )
-        target_collection_id = self._parse_target_collection_id(user_metadata)
-        await validate_target_collection_write(
+        target_collection_id = await resolve_target_collection_id(
             self._session,
-            owner_user_id=source.owner_user_id,
+            source_kind=source.source_kind,
+            uploader_user_id=source.uploader_user_id,
+            target_collection_id=self._parse_target_collection_id(user_metadata),
+        )
+        user_metadata = user_metadata_with_target_collection(
+            user_metadata,
             target_collection_id=target_collection_id,
         )
 
-        matched_file = await self._find_sha256_match(sha256_hex, owner_user_id=source.owner_user_id)
+        await acquire_sha256_advisory_lock(self._session, sha256_hex)
+        matched_file = await find_global_sha256_match(self._session, sha256_hex)
         if matched_file is not None:
             return await self._accept_sha_duplicate(
                 source=source,
@@ -196,12 +206,13 @@ class PipelineIngestAcceptService:
         target_collection_id: uuid.UUID | None,
         accepted_at: datetime,
     ) -> IngestAcceptResult:
-        attach_reason = self._sha_match_attach_reason(matched_file)
+        attach_reason = sha_match_attach_reason(matched_file)
         ingest_request = PipelineIngestRequest(
             source_platform=source.source_platform,
             source_id=source.source_id,
             post_id=source.post_id,
-            owner_user_id=source.owner_user_id,
+            source_kind=source.source_kind,
+            uploader_user_id=source.uploader_user_id,
             user_metadata=user_metadata,
             source_metadata=source_metadata,
             declared_filename=filename,
@@ -222,6 +233,8 @@ class PipelineIngestAcceptService:
             platform=source.source_platform,
             source_id=source.source_id,
             post_id=source.post_id,
+            source_kind=source.source_kind,
+            uploader_user_id=source.uploader_user_id,
             is_first_source=False,
             source_alive=True,
             published_at=source_published_at(source_metadata),
@@ -232,6 +245,11 @@ class PipelineIngestAcceptService:
         )
 
         try:
+            meme = await self._session.scalar(
+                select(Meme).where(Meme.id == matched_file.meme_id).with_for_update()
+            )
+            if meme is None:
+                raise PipelineIngestError(f"Matched meme {matched_file.meme_id} does not exist.")
             self._session.add_all([ingest_request, source_row])
             await add_initial_source_engagement_snapshot(
                 self._session,
@@ -242,10 +260,15 @@ class PipelineIngestAcceptService:
             if attach_reason is SourceAttachReason.SHA256_EXACT_EXISTING_FILE:
                 await save_meme_to_target_collection(
                     self._session,
-                    owner_user_id=source.owner_user_id,
+                    uploader_user_id=source.uploader_user_id,
                     target_collection_id=target_collection_id,
                     meme_id=matched_file.meme_id,
                 )
+            await refresh_effective_visibility(
+                self._session,
+                meme,
+                incoming_source_kind=source.source_kind,
+            )
             await self._session.commit()
         except IntegrityError as exc:
             await self._session.rollback()
@@ -292,7 +315,8 @@ class PipelineIngestAcceptService:
             source_platform=source.source_platform,
             source_id=source.source_id,
             post_id=source.post_id,
-            owner_user_id=source.owner_user_id,
+            source_kind=source.source_kind,
+            uploader_user_id=source.uploader_user_id,
             user_metadata=user_metadata,
             source_metadata=source_metadata,
             declared_filename=filename,
@@ -356,17 +380,6 @@ class PipelineIngestAcceptService:
         if existing_request is None:
             return None
         return self._result(existing_request, IngestAcceptOutcome.SOURCE_REPLAY)
-
-    async def _find_sha256_match(self, sha256_hex: str, *, owner_user_id: uuid.UUID | None) -> MemeFile | None:
-        result = await self._session.execute(
-            select(MemeFile)
-            .join(Meme, Meme.id == MemeFile.meme_id)
-            .where(MemeFile.sha256_hex == sha256_hex)
-            .where(visible_meme_clause(owner_user_id))
-            .order_by(Meme.is_public.desc(), MemeFile.created_at.asc(), MemeFile.id.asc())
-            .limit(1)
-        )
-        return result.scalar_one_or_none()
 
     @staticmethod
     def _parse_target_collection_id(user_metadata: dict[str, object]) -> uuid.UUID | None:
@@ -466,15 +479,6 @@ class PipelineIngestAcceptService:
             source_metadata["comment_count"] = comment_count
         if "comments_state" not in source_metadata or comments_state is not SourceEngagementCommentsState.UNKNOWN:
             source_metadata["comments_state"] = comments_state.value
-    @staticmethod
-    def _sha_match_attach_reason(matched_file: MemeFile) -> SourceAttachReason:
-        if (
-            matched_file.status is ContentProcessingStatus.FAILED
-            and matched_file.blocked_perceptual_hash_id is not None
-        ):
-            return SourceAttachReason.BLOCKED_SHA256_EXISTING_FILE
-        return SourceAttachReason.SHA256_EXACT_EXISTING_FILE
-
     @staticmethod
     def _is_source_identity_error(exc: IntegrityError) -> bool:
         constraint_names = {

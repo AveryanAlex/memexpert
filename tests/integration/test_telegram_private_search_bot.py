@@ -172,7 +172,7 @@ async def create_meme_file(
     media_type: ContentKind = ContentKind.IMAGE,
     mime_type: str = "image/jpeg",
     is_public: bool = True,
-    author_user_id: uuid.UUID | None = None,
+    uploader_user_id: uuid.UUID | None = None,
     tags: list[str] | None = None,
     caption: str | None = None,
     popularity_score: float = 0.0,
@@ -187,7 +187,6 @@ async def create_meme_file(
         language=ContentLanguage.EN,
         tags=tags or ["search"],
         is_public=is_public,
-        author_user_id=author_user_id,
     )
     setattr(meme, _DERIVED_POPULARITY_ATTR, popularity_score)
     file = MemeFile(
@@ -217,6 +216,19 @@ async def create_meme_file(
             prompt_version="test-v1",
         )
     await session.flush()
+    if uploader_user_id is not None:
+        collection_id = await session.scalar(
+            select(User.active_save_collection_id).where(User.id == uploader_user_id)
+        )
+        if collection_id is None:
+            collection = Collection(owner_id=uploader_user_id, title=f"Search upload {meme.id}")
+            session.add(collection)
+            await session.flush()
+            collection_id = collection.id
+        session.add(
+            CollectionMeme(collection_id=collection_id, meme_id=meme.id, added_by_user_id=uploader_user_id)
+        )
+        await session.flush()
     return meme, file
 
 
@@ -425,7 +437,7 @@ async def test_private_search_real_service_returns_only_accessible_public_owned_
     authored_private, _authored_file = await create_meme_file(
         migrated_db_session,
         is_public=False,
-        author_user_id=viewer.id,
+        uploader_user_id=viewer.id,
         tags=["owned"],
         caption="Owned private result",
         popularity_score=30.0,
@@ -433,7 +445,7 @@ async def test_private_search_real_service_returns_only_accessible_public_owned_
     shared_private, _shared_file = await create_meme_file(
         migrated_db_session,
         is_public=False,
-        author_user_id=stranger.id,
+        uploader_user_id=stranger.id,
         tags=["shared"],
         caption="Shared private result",
         popularity_score=20.0,
@@ -441,7 +453,7 @@ async def test_private_search_real_service_returns_only_accessible_public_owned_
     unauthorized_private, _unauthorized_file = await create_meme_file(
         migrated_db_session,
         is_public=False,
-        author_user_id=stranger.id,
+        uploader_user_id=stranger.id,
         tags=["hidden"],
         caption="Unauthorized private result",
         popularity_score=100.0,

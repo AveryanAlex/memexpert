@@ -268,3 +268,282 @@ async def test_0029_backfills_existing_telegram_requests_into_source_post_invent
     assert inventory_row == (request_id, "42", "photo", "accepted")
     assert channel_row == ("42", "512", True, False, 5000)
     assert fallback_channel_row == ("84", "84", True)
+
+
+async def test_0031_backfills_provenance_visibility_and_private_collection_access(
+    empty_public_schema: tuple[AsyncEngine, str],
+) -> None:
+    engine, database_url = empty_public_schema
+    config = _build_alembic_config(database_url)
+    user_id = uuid.uuid7()
+    channel_id = uuid.uuid7()
+    private_meme_id, private_file_id = uuid.uuid7(), uuid.uuid7()
+    crawler_meme_id, crawler_file_id = uuid.uuid7(), uuid.uuid7()
+    operator_meme_id, operator_file_id = uuid.uuid7(), uuid.uuid7()
+    hidden_crawler_meme_id, hidden_crawler_file_id = uuid.uuid7(), uuid.uuid7()
+    request_ids = [uuid.uuid7() for _ in range(4)]
+    source_ids = [uuid.uuid7() for _ in range(4)]
+    decision_id = uuid.uuid7()
+    non_visibility_decision_id = uuid.uuid7()
+
+    await _run_alembic_command(command.upgrade, config, "0030")
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                """
+                INSERT INTO users (
+                    id, status, email, nsfw_enabled, language
+                ) VALUES (
+                    :user_id, 'active', 'legacy-private@example.com', false, 'any'
+                )
+                """
+            ),
+            {"user_id": user_id},
+        )
+        await connection.execute(
+            text(
+                """
+                INSERT INTO source_channels (
+                    id, platform, platform_id, title, is_active
+                ) VALUES (
+                    :channel_id, 'telegram', 'public-crawler', 'Public crawler', true
+                )
+                """
+            ),
+            {"channel_id": channel_id},
+        )
+        await connection.execute(
+            text(
+                """
+                INSERT INTO memes (
+                    id, media_type, primary_file_id, language, is_nsfw,
+                    like_count, tags, author_user_id, is_public, created_at, updated_at
+                ) VALUES
+                    (
+                        :private_meme_id, 'image', :private_file_id, 'none', false,
+                        0, '{}', :user_id, false, now() - interval '4 hours', now()
+                    ),
+                    (
+                        :crawler_meme_id, 'image', :crawler_file_id, 'none', false,
+                        0, '{}', NULL, true, now() - interval '3 hours', now()
+                    ),
+                    (
+                        :operator_meme_id, 'image', :operator_file_id, 'none', false,
+                        0, '{}', NULL, true, now() - interval '2 hours', now()
+                    ),
+                    (
+                        :hidden_crawler_meme_id, 'image', :hidden_crawler_file_id, 'none', false,
+                        0, '{}', NULL, false, now() - interval '1 hour', now()
+                    )
+                """
+            ),
+            {
+                "private_meme_id": private_meme_id,
+                "private_file_id": private_file_id,
+                "crawler_meme_id": crawler_meme_id,
+                "crawler_file_id": crawler_file_id,
+                "operator_meme_id": operator_meme_id,
+                "operator_file_id": operator_file_id,
+                "hidden_crawler_meme_id": hidden_crawler_meme_id,
+                "hidden_crawler_file_id": hidden_crawler_file_id,
+                "user_id": user_id,
+            },
+        )
+        await connection.execute(
+            text(
+                """
+                INSERT INTO meme_files (
+                    id, meme_id, status, s3_original_key, sha256_hex, quality_score
+                ) VALUES
+                    (:private_file_id, :private_meme_id, 'ready', 'legacy/private.jpg', :private_sha, 1.0),
+                    (:crawler_file_id, :crawler_meme_id, 'ready', 'legacy/crawler.jpg', :crawler_sha, 1.0),
+                    (:operator_file_id, :operator_meme_id, 'ready', 'legacy/operator.jpg', :operator_sha, 1.0),
+                    (
+                        :hidden_crawler_file_id, :hidden_crawler_meme_id, 'ready',
+                        'legacy/hidden-crawler.jpg', :hidden_sha, 1.0
+                    )
+                """
+            ),
+            {
+                "private_file_id": private_file_id,
+                "private_meme_id": private_meme_id,
+                "private_sha": "1" * 64,
+                "crawler_file_id": crawler_file_id,
+                "crawler_meme_id": crawler_meme_id,
+                "crawler_sha": "2" * 64,
+                "operator_file_id": operator_file_id,
+                "operator_meme_id": operator_meme_id,
+                "operator_sha": "3" * 64,
+                "hidden_crawler_file_id": hidden_crawler_file_id,
+                "hidden_crawler_meme_id": hidden_crawler_meme_id,
+                "hidden_sha": "4" * 64,
+            },
+        )
+        await connection.execute(
+            text(
+                """
+                INSERT INTO pipeline_ingest_requests (
+                    id, source_platform, source_id, post_id, owner_user_id,
+                    status, materialized_meme_id, materialized_meme_file_id
+                ) VALUES
+                    (
+                        :private_request_id, 'telegram', 'private-upload', '1', :user_id,
+                        'materialized', :private_meme_id, :private_file_id
+                    ),
+                    (
+                        :crawler_request_id, 'telegram', 'public-crawler', '2', NULL,
+                        'materialized', :crawler_meme_id, :crawler_file_id
+                    ),
+                    (
+                        :operator_request_id, 'telegram', 'manual-operator', '3', NULL,
+                        'materialized', :operator_meme_id, :operator_file_id
+                    ),
+                    (
+                        :hidden_request_id, 'telegram', 'public-crawler', '4', NULL,
+                        'materialized', :hidden_meme_id, :hidden_file_id
+                    )
+                """
+            ),
+            {
+                "private_request_id": request_ids[0],
+                "crawler_request_id": request_ids[1],
+                "operator_request_id": request_ids[2],
+                "hidden_request_id": request_ids[3],
+                "user_id": user_id,
+                "private_meme_id": private_meme_id,
+                "private_file_id": private_file_id,
+                "crawler_meme_id": crawler_meme_id,
+                "crawler_file_id": crawler_file_id,
+                "operator_meme_id": operator_meme_id,
+                "operator_file_id": operator_file_id,
+                "hidden_meme_id": hidden_crawler_meme_id,
+                "hidden_file_id": hidden_crawler_file_id,
+            },
+        )
+        await connection.execute(
+            text(
+                """
+                INSERT INTO meme_sources (
+                    id, file_id, platform, source_id, post_id, is_first_source, source_alive
+                ) VALUES
+                    (:private_source_id, :private_file_id, 'telegram', 'private-upload', '1', true, true),
+                    (:crawler_source_id, :crawler_file_id, 'telegram', 'public-crawler', '2', true, true),
+                    (:operator_source_id, :operator_file_id, 'telegram', 'manual-operator', '3', true, true),
+                    (:hidden_source_id, :hidden_file_id, 'telegram', 'public-crawler', '4', true, true)
+                """
+            ),
+            {
+                "private_source_id": source_ids[0],
+                "crawler_source_id": source_ids[1],
+                "operator_source_id": source_ids[2],
+                "hidden_source_id": source_ids[3],
+                "private_file_id": private_file_id,
+                "crawler_file_id": crawler_file_id,
+                "operator_file_id": operator_file_id,
+                "hidden_file_id": hidden_crawler_file_id,
+            },
+        )
+        await connection.execute(
+            text(
+                """
+                INSERT INTO moderation_decisions (
+                    id, meme_id, action, reason, previous_is_public, previous_is_nsfw,
+                    new_is_public, new_is_nsfw, created_at
+                ) VALUES
+                    (
+                        :decision_id, :meme_id, 'hide', 'other', true, false,
+                        false, false, now() - interval '1 minute'
+                    ),
+                    (
+                        :non_visibility_decision_id, :meme_id, 'mark_sfw', 'other', false, true,
+                        false, false, now()
+                    )
+                """
+            ),
+            {
+                "decision_id": decision_id,
+                "non_visibility_decision_id": non_visibility_decision_id,
+                "meme_id": hidden_crawler_meme_id,
+            },
+        )
+
+    await _run_alembic_command(command.upgrade, config, "0031")
+
+    async with engine.connect() as connection:
+        request_rows = (
+            await connection.execute(
+                text(
+                    """
+                    SELECT id, source_kind, uploader_user_id
+                    FROM pipeline_ingest_requests
+                    ORDER BY id
+                    """
+                )
+            )
+        ).all()
+        source_rows = (
+            await connection.execute(
+                text("SELECT id, source_kind, uploader_user_id FROM meme_sources ORDER BY id")
+            )
+        ).all()
+        visibility_result = await connection.execute(text("SELECT id, visibility_mode FROM memes"))
+        visibility_rows = dict(visibility_result.tuples().all())
+        favorites_row = (
+            await connection.execute(
+                text(
+                    """
+                    SELECT collection.id, collection.visibility, member.role,
+                           saved.meme_id, uploader.active_save_collection_id
+                    FROM collections AS collection
+                    JOIN collection_members AS member
+                      ON member.collection_id = collection.id
+                     AND member.user_id = :user_id
+                    JOIN collection_memes AS saved
+                      ON saved.collection_id = collection.id
+                     AND saved.meme_id = :meme_id
+                    JOIN users AS uploader ON uploader.id = :user_id
+                    WHERE collection.owner_id = :user_id
+                      AND collection.kind = 'favorites'
+                    """
+                ),
+                {"user_id": user_id, "meme_id": private_meme_id},
+            )
+        ).one()
+        decision_modes = (
+            await connection.execute(
+                text(
+                    """
+                    SELECT previous_visibility_mode, new_visibility_mode
+                    FROM moderation_decisions
+                    WHERE id = :decision_id
+                    """
+                ),
+                {"decision_id": decision_id},
+            )
+        ).one()
+
+    expected_requests = {
+        request_ids[0]: ("user_upload", user_id),
+        request_ids[1]: ("public_crawler", None),
+        request_ids[2]: ("operator_upload", None),
+        request_ids[3]: ("public_crawler", None),
+    }
+    assert {row.id: (row.source_kind, row.uploader_user_id) for row in request_rows} == expected_requests
+    expected_sources = {
+        source_ids[0]: ("user_upload", user_id),
+        source_ids[1]: ("public_crawler", None),
+        source_ids[2]: ("operator_upload", None),
+        source_ids[3]: ("public_crawler", None),
+    }
+    assert {row.id: (row.source_kind, row.uploader_user_id) for row in source_rows} == expected_sources
+    assert visibility_rows == {
+        private_meme_id: "auto",
+        crawler_meme_id: "auto",
+        operator_meme_id: "force_public",
+        hidden_crawler_meme_id: "force_private",
+    }
+    assert favorites_row.visibility == "private"
+    assert favorites_row.role == "owner"
+    assert favorites_row.meme_id == private_meme_id
+    assert favorites_row.active_save_collection_id == favorites_row.id
+    assert decision_modes == ("force_public", "force_private")

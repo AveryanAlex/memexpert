@@ -29,6 +29,7 @@ from memexpert.models.enums import (
     ContentKind,
     ContentLanguage,
     ContentProcessingStatus,
+    IngestSourceKind,
     PipelineIngestRequestStatus,
     SourceAttachReason,
     SourcePlatform,
@@ -166,7 +167,6 @@ async def seed_meme(
     session: AsyncSession,
     *,
     is_public: bool,
-    author_user_id: uuid.UUID | None = None,
 ) -> tuple[Meme, MemeFile]:
     meme_id = uuid.uuid7()
     file_id = uuid.uuid7()
@@ -176,7 +176,6 @@ async def seed_meme(
         primary_file_id=file_id,
         language=ContentLanguage.EN,
         is_public=is_public,
-        author_user_id=author_user_id,
     )
     file = MemeFile(
         id=file_id,
@@ -203,7 +202,7 @@ async def ensure_active_collection(session: AsyncSession, *, user_id: uuid.UUID)
 def ingest_result_for(
     *,
     outcome: IngestAcceptOutcome = IngestAcceptOutcome.ACCEPTED_ASYNC,
-    owner_user_id: uuid.UUID | None = None,
+    uploader_user_id: uuid.UUID | None = None,
     meme_id: uuid.UUID | None = None,
     meme_file_id: uuid.UUID | None = None,
     source_attach_reason: SourceAttachReason | None = None,
@@ -224,7 +223,8 @@ def ingest_result_for(
             source_platform=SourcePlatform.TELEGRAM,
             source_id=source_id,
             post_id=post_id,
-            owner_user_id=owner_user_id,
+            source_kind=IngestSourceKind.USER_UPLOAD,
+            uploader_user_id=uploader_user_id,
             user_metadata={},
             source_metadata={"view_count": 0},
             declared_filename="telegram-photo-701-photo-unique-1.jpg",
@@ -407,7 +407,7 @@ async def test_private_photo_upload_queues_raw_ingest_with_active_collection_met
     await migrated_db_session.commit()
 
     accept_service = FakePrivateUploadAcceptService(
-        accept_result=ingest_result_for(owner_user_id=user.id),
+        accept_result=ingest_result_for(uploader_user_id=user.id),
     )
     upload_bot = _build_upload_bot_context(
         database_url=postgres_async_url,
@@ -422,7 +422,8 @@ async def test_private_photo_upload_queues_raw_ingest_with_active_collection_met
     assert len(accept_service.calls) == 1
     source = accept_service.calls[0]["source"]
     assert isinstance(source, IngestAcceptSource)
-    assert source.owner_user_id == user.id
+    assert source.uploader_user_id == user.id
+    assert source.source_kind is IngestSourceKind.USER_UPLOAD
     active_collection_id = await migrated_db_session.scalar(
         select(User.active_save_collection_id).where(User.id == user.id)
     )
@@ -471,7 +472,7 @@ async def test_private_upload_public_duplicate_saves_existing_public_meme(
     accept_service = FakePrivateUploadAcceptService(
         accept_result=ingest_result_for(
             outcome=IngestAcceptOutcome.RESOLVED_SHA_DUPLICATE,
-            owner_user_id=user.id,
+            uploader_user_id=user.id,
             meme_id=public_meme.id,
             meme_file_id=file.id,
             source_attach_reason=SourceAttachReason.SHA256_EXACT_EXISTING_FILE,
@@ -508,7 +509,7 @@ async def test_private_upload_public_duplicate_saves_existing_public_meme(
 
 
 @pytest.mark.asyncio
-async def test_private_duplicate_not_visible_is_not_reported_as_public_or_saved(
+async def test_private_exact_duplicate_is_saved_after_atomic_membership_attachment(
     migrated_db_session: AsyncSession,
     postgres_session_factory: async_sessionmaker[AsyncSession],
     postgres_async_url: str,
@@ -516,14 +517,24 @@ async def test_private_duplicate_not_visible_is_not_reported_as_public_or_saved(
     user_service = UserService(migrated_db_session)
     user = await create_full_user_via_upgrade(user_service, telegram_id=TELEGRAM_ID)
     await ensure_active_collection(migrated_db_session, user_id=user.id)
-    other_user = await create_full_user_via_upgrade(user_service, email="private-owner@example.com")
-    private_meme, file = await seed_meme(migrated_db_session, is_public=False, author_user_id=other_user.id)
+    private_meme, file = await seed_meme(migrated_db_session, is_public=False)
+    active_collection_id = await migrated_db_session.scalar(
+        select(User.active_save_collection_id).where(User.id == user.id)
+    )
+    assert active_collection_id is not None
+    migrated_db_session.add(
+        CollectionMeme(
+            collection_id=active_collection_id,
+            meme_id=private_meme.id,
+            added_by_user_id=user.id,
+        )
+    )
     await migrated_db_session.commit()
 
     accept_service = FakePrivateUploadAcceptService(
         accept_result=ingest_result_for(
             outcome=IngestAcceptOutcome.RESOLVED_SHA_DUPLICATE,
-            owner_user_id=user.id,
+            uploader_user_id=user.id,
             meme_id=private_meme.id,
             meme_file_id=file.id,
             source_attach_reason=SourceAttachReason.SHA256_EXACT_EXISTING_FILE,
@@ -538,10 +549,9 @@ async def test_private_duplicate_not_visible_is_not_reported_as_public_or_saved(
     await dispatch_photo_upload(dispatcher=upload_bot.dispatcher, bot=upload_bot.bot)
 
     bot_text = last_bot_text(upload_bot.recording_session)
-    assert "доступной версии" in bot_text
-    assert "приват" not in bot_text
+    assert "приват" in bot_text
     assert "публичным" not in bot_text
-    assert await migrated_db_session.scalar(select(CollectionMeme.meme_id)) is None
+    assert await migrated_db_session.get(CollectionMeme, (active_collection_id, private_meme.id)) is not None
 
 
 @pytest.mark.asyncio
@@ -559,7 +569,7 @@ async def test_private_upload_duplicate_source_replay_resolves_existing_source_a
     accept_service = FakePrivateUploadAcceptService(
         accept_result=ingest_result_for(
             outcome=IngestAcceptOutcome.SOURCE_REPLAY,
-            owner_user_id=user.id,
+            uploader_user_id=user.id,
             meme_id=meme.id,
             meme_file_id=file.id,
             source_attach_reason=SourceAttachReason.SHA256_EXACT_EXISTING_FILE,
@@ -594,7 +604,7 @@ async def test_private_upload_source_replay_without_materialized_meme_reports_pr
     accept_service = FakePrivateUploadAcceptService(
         accept_result=ingest_result_for(
             outcome=IngestAcceptOutcome.SOURCE_REPLAY,
-            owner_user_id=user.id,
+            uploader_user_id=user.id,
         )
     )
     upload_bot = _build_upload_bot_context(
@@ -693,7 +703,7 @@ async def test_private_upload_auto_creates_user_and_favorites_before_ingest(
     assert created_user.status is AccountStatus.ACTIVE
     assert favorites is not None
     assert created_user.active_save_collection_id == favorites.id
-    assert source.owner_user_id == created_user.id
+    assert source.uploader_user_id == created_user.id
     assert source.user_metadata[TARGET_COLLECTION_ID_METADATA_KEY] == str(favorites.id)
 
 
@@ -707,7 +717,7 @@ async def test_private_upload_existing_user_without_active_collection_defaults_t
     user = await create_full_user_via_upgrade(user_service, telegram_id=TELEGRAM_ID)
     await migrated_db_session.commit()
 
-    accept_service = FakePrivateUploadAcceptService(accept_result=ingest_result_for(owner_user_id=user.id))
+    accept_service = FakePrivateUploadAcceptService(accept_result=ingest_result_for(uploader_user_id=user.id))
     upload_bot = _build_upload_bot_context(
         database_url=postgres_async_url,
         postgres_session_factory=postgres_session_factory,
@@ -829,7 +839,7 @@ async def test_private_upload_reports_active_collection_save_failure(
     user = await create_full_user_via_upgrade(user_service, telegram_id=TELEGRAM_ID)
     other_user = await create_full_user_via_upgrade(user_service, email="collection-owner@example.com")
     other_collection = await collection_service.create_custom_collection(owner_user_id=other_user.id, title="Other")
-    meme, file = await seed_meme(migrated_db_session, is_public=False, author_user_id=user.id)
+    meme, file = await seed_meme(migrated_db_session, is_public=False)
     persisted_user = await migrated_db_session.scalar(select(User).where(User.id == user.id))
     assert persisted_user is not None
     persisted_user.active_save_collection_id = other_collection.id
@@ -838,7 +848,7 @@ async def test_private_upload_reports_active_collection_save_failure(
     accept_service = FakePrivateUploadAcceptService(
         accept_result=ingest_result_for(
             outcome=IngestAcceptOutcome.RESOLVED_SHA_DUPLICATE,
-            owner_user_id=user.id,
+            uploader_user_id=user.id,
             meme_id=meme.id,
             meme_file_id=file.id,
             source_attach_reason=SourceAttachReason.SHA256_EXACT_EXISTING_FILE,

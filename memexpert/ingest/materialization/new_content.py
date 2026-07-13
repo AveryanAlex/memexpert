@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from memexpert.ingest.policy import initial_visibility_for_source
 from memexpert.ingest.source_metadata import (
     source_engagement_metrics,
     source_forward_ids,
@@ -49,8 +50,7 @@ async def create_new_content_rows(
         media_type=prepared.media_type,
         primary_file_id=meme_file_id,
         language=ContentLanguage.NONE,
-        is_public=False,
-        author_user_id=ingest_request.owner_user_id,
+        is_public=initial_visibility_for_source(ingest_request.source_kind),
     )
     session.add(meme)
     await session.flush()
@@ -60,6 +60,8 @@ async def create_new_content_rows(
         platform=ingest_request.source_platform,
         source_id=ingest_request.source_id,
         post_id=ingest_request.post_id,
+        source_kind=ingest_request.source_kind,
+        uploader_user_id=ingest_request.uploader_user_id,
         is_first_source=not source_is_forwarded(ingest_request.source_metadata),
         source_alive=True,
         published_at=source_published_at(ingest_request.source_metadata),

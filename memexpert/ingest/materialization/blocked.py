@@ -38,6 +38,7 @@ from memexpert.models.enums import (
     ContentPipelineStageStatus,
     ContentProcessingStatus,
     IngestFileOrigin,
+    MemeVisibilityMode,
     ModerationAction,
     PipelineIngestRequestStatus,
     SourceAttachReason,
@@ -138,6 +139,8 @@ async def _create_blocked_rows(
         platform=ingest_request.source_platform,
         source_id=ingest_request.source_id,
         post_id=ingest_request.post_id,
+        source_kind=ingest_request.source_kind,
+        uploader_user_id=ingest_request.uploader_user_id,
         is_first_source=not source_is_forwarded(ingest_request.source_metadata),
         source_alive=True,
         published_at=source_published_at(ingest_request.source_metadata),
@@ -150,8 +153,8 @@ async def _create_blocked_rows(
         media_type=prepared.media_type,
         primary_file_id=meme_file_id,
         language=ContentLanguage.NONE,
+        visibility_mode=MemeVisibilityMode.FORCE_PRIVATE,
         is_public=False,
-        author_user_id=ingest_request.owner_user_id,
     )
     session.add(meme)
     await session.flush()
@@ -194,8 +197,10 @@ async def _create_blocked_rows(
                 reason=blocked_hash.reason,
                 note=error_text,
                 previous_is_public=False,
+                previous_visibility_mode=MemeVisibilityMode.FORCE_PRIVATE,
                 previous_is_nsfw=False,
                 new_is_public=False,
+                new_visibility_mode=MemeVisibilityMode.FORCE_PRIVATE,
                 new_is_nsfw=False,
                 previous_template_id=None,
                 new_template_id=None,

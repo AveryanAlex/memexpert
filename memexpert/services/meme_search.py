@@ -2329,8 +2329,6 @@ class MemeSearchService:
         for meme in memes:
             if meme.is_public:
                 visibility = PublicMemeViewerAccess.PUBLIC
-            elif meme.author_user_id == viewer_user_id:
-                visibility = PublicMemeViewerAccess.PRIVATE
             else:
                 visibility = collection_access.get(meme.id, PublicMemeViewerAccess.PRIVATE)
             markers[meme.id] = PublicMemeViewerAccessRead(visibility=visibility)
@@ -2965,11 +2963,10 @@ def _meme_access_predicate(
     )
 
     if scope is MemeSearchScope.PRIVATE:
-        return or_(Meme.author_user_id == viewer_user_id, authorized_collection)
+        return and_(Meme.is_public.is_(False), authorized_collection)
     if scope is MemeSearchScope.ALL:
         return or_(
             Meme.is_public.is_(True),
-            Meme.author_user_id == viewer_user_id,
             authorized_collection,
         )
     if scope is MemeSearchScope.COLLECTIONS:
@@ -3246,7 +3243,6 @@ def _to_detail_read(meme: Meme) -> MemeDetailRead:
         **card.model_dump(),
         ocr_text=meme.ocr_text,
         is_public=meme.is_public,
-        author_user_id=meme.author_user_id,
         seo_title=meme.seo_page.page_title if meme.seo_page else None,
         seo_description=meme.seo_page.meta_description if meme.seo_page else None,
         seo_alt_text=meme.seo_page.alt_text if meme.seo_page else None,

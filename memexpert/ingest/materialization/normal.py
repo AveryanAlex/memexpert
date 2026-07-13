@@ -13,6 +13,7 @@ from memexpert.ingest.materialization.duplicates import (
 from memexpert.ingest.materialization.new_content import create_new_content_rows
 from memexpert.ingest.materialization.objects import meme_file_id_from_original_key
 from memexpert.ingest.materialization.outbox import create_transcode_outbox_message
+from memexpert.ingest.policy import incoming_approximate_merge_scope
 from memexpert.models.enums import PipelineIngestRequestStatus, SourceAttachReason
 
 if TYPE_CHECKING:
@@ -38,7 +39,10 @@ async def materialize_transcodable_request(
     phash_match = await find_exact_phash_match(
         session,
         prepared.perceptual_hash,
-        owner_user_id=ingest_request.owner_user_id,
+        scope=incoming_approximate_merge_scope(
+            source_kind=ingest_request.source_kind,
+            uploader_user_id=ingest_request.uploader_user_id,
+        ),
     )
     meme_file_id = meme_file_id_from_original_key(prepared.object_key)
     event_id = uuid.uuid7()

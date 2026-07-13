@@ -61,7 +61,6 @@ async def _create_meme(
     session: AsyncSession,
     *,
     is_public: bool = True,
-    author_user_id: uuid.UUID | None = None,
     s3_original_key: str | None = None,
     s3_web_video_key: str | None = None,
     mime_type: str = "image/jpeg",
@@ -74,7 +73,6 @@ async def _create_meme(
         primary_file_id=file_id,
         language=ContentLanguage.EN,
         is_public=is_public,
-        author_user_id=author_user_id,
     )
     file = MemeFile(
         id=file_id,
@@ -349,15 +347,17 @@ async def test_meme_library_returns_private_authenticated_render_urls_for_owner(
     private_meme = await _create_meme(
         migrated_db_session,
         is_public=False,
-        author_user_id=owner.id,
         s3_original_key="pipeline/originals/private/library-upload.gif",
         s3_web_video_key="pipeline/derived/private/library-upload.mp4",
         mime_type="image/gif",
     )
+    favorites = await collection_service.ensure_favorites_collection(owner.id)
+    migrated_db_session.add(
+        CollectionMeme(collection_id=favorites.id, meme_id=private_meme.id, added_by_user_id=owner.id)
+    )
     await migrated_db_session.commit()
     assert private_meme.primary_file_id is not None
 
-    _ = await collection_service.favorite_meme(user_id=owner.id, meme_id=private_meme.id)
     library = await collection_service.get_meme_library(user_id=owner.id)
 
     assert [meme.id for meme in library.favorites] == [private_meme.id]
@@ -412,7 +412,6 @@ async def test_private_cleanup_deletes_only_unreferenced_private_storage_and_row
     private_meme = await _create_meme(
         migrated_db_session,
         is_public=False,
-        author_user_id=owner.id,
         s3_original_key="pipeline/originals/private/cleanup-original.png",
         s3_web_video_key="pipeline/derived/private/cleanup-web.mp4",
         mime_type="image/png",
@@ -423,13 +422,15 @@ async def test_private_cleanup_deletes_only_unreferenced_private_storage_and_row
         s3_original_key="pipeline/originals/public/keep-original.png",
         s3_web_video_key="pipeline/derived/public/keep-web.mp4",
     )
+    migrated_db_session.add(
+        CollectionMeme(
+            collection_id=primary_collection.id,
+            meme_id=private_meme.id,
+            added_by_user_id=owner.id,
+        )
+    )
     await migrated_db_session.commit()
 
-    _ = await collection_service.save_meme_to_collection(
-        collection_id=primary_collection.id,
-        user_id=owner.id,
-        meme_id=private_meme.id,
-    )
     _ = await collection_service.save_meme_to_collection(
         collection_id=shared_collection.id,
         user_id=owner.id,
@@ -494,22 +495,24 @@ async def test_private_cleanup_runs_for_active_collection_and_unfavorite_paths(
     active_meme = await _create_meme(
         migrated_db_session,
         is_public=False,
-        author_user_id=owner.id,
         s3_original_key="pipeline/originals/private/active-cleanup.png",
         s3_web_video_key="pipeline/derived/private/active-cleanup.mp4",
     )
     favorite_meme = await _create_meme(
         migrated_db_session,
         is_public=False,
-        author_user_id=owner.id,
         s3_original_key="pipeline/originals/private/favorite-cleanup.png",
     )
     active_meme_id = active_meme.id
     favorite_meme_id = favorite_meme.id
+    favorites = await collection_service.ensure_favorites_collection(owner.id)
+    migrated_db_session.add_all(
+        [
+            CollectionMeme(collection_id=custom.id, meme_id=active_meme_id, added_by_user_id=owner.id),
+            CollectionMeme(collection_id=favorites.id, meme_id=favorite_meme_id, added_by_user_id=owner.id),
+        ]
+    )
     await migrated_db_session.commit()
-
-    _ = await collection_service.save_meme_to_active_collection(user_id=owner.id, meme_id=active_meme_id)
-    _ = await collection_service.favorite_meme(user_id=owner.id, meme_id=favorite_meme_id)
 
     assert await collection_service.remove_meme_from_active_collection(user_id=owner.id, meme_id=active_meme_id) is True
     assert await collection_service.unfavorite_meme(user_id=owner.id, meme_id=favorite_meme_id) is True
@@ -534,31 +537,24 @@ async def test_custom_collection_delete_cleans_orphans_and_pinned_private_memes(
     orphan_meme = await _create_meme(
         migrated_db_session,
         is_public=False,
-        author_user_id=owner.id,
         s3_original_key="pipeline/originals/private/delete-orphan.png",
         s3_web_video_key="pipeline/derived/private/delete-orphan.mp4",
     )
     pinned_meme = await _create_meme(
         migrated_db_session,
         is_public=False,
-        author_user_id=owner.id,
         s3_original_key="pipeline/originals/private/delete-pinned.png",
         s3_web_video_key="pipeline/derived/private/delete-pinned.mp4",
     )
     orphan_meme_id = orphan_meme.id
     pinned_meme_id = pinned_meme.id
+    migrated_db_session.add_all(
+        [
+            CollectionMeme(collection_id=custom.id, meme_id=orphan_meme_id, added_by_user_id=owner.id),
+            CollectionMeme(collection_id=custom.id, meme_id=pinned_meme_id, added_by_user_id=owner.id),
+        ]
+    )
     await migrated_db_session.commit()
-
-    _ = await collection_service.save_meme_to_collection(
-        collection_id=custom.id,
-        user_id=owner.id,
-        meme_id=orphan_meme_id,
-    )
-    _ = await collection_service.save_meme_to_collection(
-        collection_id=custom.id,
-        user_id=owner.id,
-        meme_id=pinned_meme_id,
-    )
     _ = await collection_service.pin_meme(user_id=owner.id, meme_id=pinned_meme_id)
 
     assert await collection_service.delete_custom_collection(collection_id=custom.id, user_id=owner.id) is True
@@ -619,9 +615,9 @@ async def test_library_writes_reject_private_memes_not_visible_to_user(
 ) -> None:
     user_service = UserService(migrated_db_session)
     collection_service = CollectionService(migrated_db_session)
-    author = await create_full_user_via_upgrade(user_service, email="private-author@example.com")
+    _ = await create_full_user_via_upgrade(user_service, email="private-author@example.com")
     stranger = await create_full_user_via_upgrade(user_service, email="private-stranger@example.com")
-    private_meme = await _create_meme(migrated_db_session, is_public=False, author_user_id=author.id)
+    private_meme = await _create_meme(migrated_db_session, is_public=False)
     await migrated_db_session.commit()
 
     with pytest.raises(MemeNotFoundError):

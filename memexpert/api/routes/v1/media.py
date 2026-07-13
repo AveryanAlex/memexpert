@@ -98,7 +98,6 @@ async def _load_authorized_file(
         stmt = stmt.where(
             or_(
                 Meme.is_public.is_(True),
-                Meme.author_user_id == user_id,
                 authorized_collection,
             ),
         )

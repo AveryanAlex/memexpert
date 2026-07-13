@@ -108,7 +108,7 @@ async def create_meme_file(
     mime_type: str = "image/jpeg",
     is_public: bool = True,
     popularity_score: float = 0.0,
-    author_user_id: uuid.UUID | None = None,
+    uploader_user_id: uuid.UUID | None = None,
     s3_original_key: str | None = None,
 ) -> tuple[Meme, MemeFile]:
     meme_id = uuid.uuid7()
@@ -120,7 +120,6 @@ async def create_meme_file(
         language=ContentLanguage.EN,
         tags=[media_type.value],
         is_public=is_public,
-        author_user_id=author_user_id,
     )
     file = MemeFile(
         id=file_id,
@@ -135,6 +134,19 @@ async def create_meme_file(
     await session.flush()
     session.add(file)
     await session.flush()
+    if uploader_user_id is not None:
+        collection_id = await session.scalar(
+            select(User.active_save_collection_id).where(User.id == uploader_user_id)
+        )
+        if collection_id is None:
+            collection = Collection(owner_id=uploader_user_id, title=f"Inline upload {meme.id}")
+            session.add(collection)
+            await session.flush()
+            collection_id = collection.id
+        session.add(
+            CollectionMeme(collection_id=collection_id, meme_id=meme.id, added_by_user_id=uploader_user_id)
+        )
+        await session.flush()
     if popularity_score > 0.0:
         source = MemeSource(
             file_id=file_id,
@@ -263,19 +275,19 @@ async def test_text_query_searches_private_and_shared_memes_only_for_authorized_
         migrated_db_session,
         is_public=False,
         popularity_score=30.0,
-        author_user_id=viewer.id,
+        uploader_user_id=viewer.id,
     )
     shared_private, shared_file = await create_meme_file(
         migrated_db_session,
         is_public=False,
         popularity_score=20.0,
-        author_user_id=stranger.id,
+        uploader_user_id=stranger.id,
     )
     unauthorized_private, unauthorized_file = await create_meme_file(
         migrated_db_session,
         is_public=False,
         popularity_score=100.0,
-        author_user_id=stranger.id,
+        uploader_user_id=stranger.id,
     )
     shared_collection = Collection(owner_id=stranger.id, title="Inline shared search")
     unauthorized_collection = Collection(owner_id=stranger.id, title="Inline unauthorized search")
@@ -414,7 +426,7 @@ async def test_empty_query_for_new_and_inactive_telegram_user_returns_only_publi
         migrated_db_session,
         is_public=False,
         popularity_score=500.0,
-        author_user_id=inactive_user.id,
+        uploader_user_id=inactive_user.id,
     )
     await add_file_id_cache(migrated_db_session, file=public_file, telegram_file_id="cached-public")
     await add_file_id_cache(migrated_db_session, file=private_file, telegram_file_id="cached-private")
@@ -457,26 +469,26 @@ async def test_empty_query_filters_stale_pins_and_recent_events_by_visibility(
         migrated_db_session,
         is_public=False,
         popularity_score=20.0,
-        author_user_id=viewer.id,
+        uploader_user_id=viewer.id,
     )
     shared_private, shared_file = await create_meme_file(
         migrated_db_session,
         is_public=False,
         popularity_score=30.0,
-        author_user_id=stranger.id,
+        uploader_user_id=stranger.id,
     )
     public_meme, public_file = await create_meme_file(migrated_db_session, is_public=True, popularity_score=40.0)
     stranger_private, stranger_file = await create_meme_file(
         migrated_db_session,
         is_public=False,
         popularity_score=1000.0,
-        author_user_id=stranger.id,
+        uploader_user_id=stranger.id,
     )
     unauthorized_private, unauthorized_file = await create_meme_file(
         migrated_db_session,
         is_public=False,
         popularity_score=900.0,
-        author_user_id=stranger.id,
+        uploader_user_id=stranger.id,
     )
     shared_collection = Collection(owner_id=stranger.id, title="Shared with viewer")
     unauthorized_collection = Collection(owner_id=stranger.id, title="Not shared with viewer")

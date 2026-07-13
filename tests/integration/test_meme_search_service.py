@@ -113,8 +113,10 @@ class FakeSimilarityClient:
         *,
         vector: tuple[float, ...],
         current_meme_file_id: uuid.UUID,
+        scope: object | None = None,
         limit: int | None = None,
     ) -> tuple[QdrantSimilarityMatch, ...]:
+        _ = scope
         self.calls.append({"vector": vector, "current_meme_file_id": current_meme_file_id, "limit": limit})
         if self._failure is not None:
             raise self._failure
@@ -220,7 +222,7 @@ async def _create_meme(
     popularity_score: float = 0.0,
     like_count: int = 0,
     is_public: bool = True,
-    author_user_id: uuid.UUID | None = None,
+    uploader_user_id: uuid.UUID | None = None,
     ocr_text: str | None = None,
     s3_original_key: str | None = None,
     s3_web_video_key: str | None = None,
@@ -240,7 +242,6 @@ async def _create_meme(
         is_nsfw=is_nsfw,
         like_count=like_count,
         is_public=is_public,
-        author_user_id=author_user_id,
         ocr_text=ocr_text,
     )
     file = MemeFile(
@@ -258,6 +259,23 @@ async def _create_meme(
     await session.flush()
     session.add(file)
     await session.flush()
+    if uploader_user_id is not None:
+        collection_id = await session.scalar(
+            select(User.active_save_collection_id).where(User.id == uploader_user_id)
+        )
+        if collection_id is None:
+            upload_collection = Collection(owner_id=uploader_user_id, title=f"Upload {meme.id}")
+            session.add(upload_collection)
+            await session.flush()
+            collection_id = upload_collection.id
+        session.add(
+            CollectionMeme(
+                collection_id=collection_id,
+                meme_id=meme.id,
+                added_by_user_id=uploader_user_id,
+            )
+        )
+        await session.flush()
     if popularity_score > 0.0:
         await _add_source_engagement_snapshots(
             session,
@@ -662,7 +680,7 @@ async def test_home_feed_route_returns_public_personalized_recommendations(
     private_candidate = await _create_meme(
         migrated_db_session,
         is_public=False,
-        author_user_id=viewer.id,
+        uploader_user_id=viewer.id,
         popularity_score=100.0,
         s3_original_key="pipeline/originals/private/home-feed-personalized-hidden.jpg",
     )
@@ -741,7 +759,6 @@ async def test_home_feed_route_cold_start_falls_back_to_public_trending(
     private_meme = await _create_meme(
         migrated_db_session,
         is_public=False,
-        author_user_id=viewer.id,
         popularity_score=100.0,
         s3_original_key="pipeline/originals/private/home-feed-fallback-hidden.jpg",
     )
@@ -1344,7 +1361,7 @@ async def test_recommendation_candidates_postgres_filters_qdrant_private_candida
     hidden_match = await _create_meme(
         migrated_db_session,
         is_public=False,
-        author_user_id=stranger.id,
+        uploader_user_id=stranger.id,
         popularity_score=100.0,
         s3_original_key="pipeline/originals/private/recommendation-hidden.jpg",
     )
@@ -1723,13 +1740,13 @@ async def test_search_and_browse_routes_scope_collections_reject_unauthorized_co
     authorized_private = await _create_meme(
         migrated_db_session,
         is_public=False,
-        author_user_id=viewer.id,
+        uploader_user_id=viewer.id,
         s3_original_key="pipeline/originals/private/authorized-search-route.jpg",
     )
     unauthorized_private = await _create_meme(
         migrated_db_session,
         is_public=False,
-        author_user_id=stranger.id,
+        uploader_user_id=stranger.id,
         s3_original_key="pipeline/originals/private/unauthorized-search-route.jpg",
     )
     authorized_collection = await _create_collection(
@@ -1789,14 +1806,14 @@ async def test_search_route_scope_collections_returns_multiple_authorized_collec
     owned_private = await _create_meme(
         migrated_db_session,
         is_public=False,
-        author_user_id=viewer.id,
+        uploader_user_id=viewer.id,
         popularity_score=30.0,
         s3_original_key="pipeline/originals/private/owned-collection-route.jpg",
     )
     shared_private = await _create_meme(
         migrated_db_session,
         is_public=False,
-        author_user_id=owner.id,
+        uploader_user_id=owner.id,
         popularity_score=20.0,
         s3_original_key="pipeline/originals/private/shared-collection-route.jpg",
     )
@@ -1880,19 +1897,19 @@ async def test_meme_detail_routes_return_authorized_private_and_shared_memes_wit
     owned_private = await _create_meme(
         migrated_db_session,
         is_public=False,
-        author_user_id=viewer.id,
+        uploader_user_id=viewer.id,
         s3_original_key="pipeline/originals/private/detail-owned.jpg",
     )
     shared_private = await _create_meme(
         migrated_db_session,
         is_public=False,
-        author_user_id=owner.id,
+        uploader_user_id=owner.id,
         s3_original_key="pipeline/originals/private/detail-shared.jpg",
     )
     unauthorized_private = await _create_meme(
         migrated_db_session,
         is_public=False,
-        author_user_id=stranger.id,
+        uploader_user_id=stranger.id,
         s3_original_key="pipeline/originals/private/detail-hidden.jpg",
     )
     migrated_db_session.add(
@@ -1972,7 +1989,7 @@ async def test_search_and_browse_routes_validate_scope_auth_and_collection_ids(
     private_meme = await _create_meme(
         migrated_db_session,
         is_public=False,
-        author_user_id=viewer.id,
+        uploader_user_id=viewer.id,
         popularity_score=30.0,
     )
     await migrated_db_session.commit()
@@ -2045,19 +2062,19 @@ async def test_search_route_private_and_all_scopes_mark_access_and_paginate_fall
     owned_private = await _create_meme(
         migrated_db_session,
         is_public=False,
-        author_user_id=viewer.id,
+        uploader_user_id=viewer.id,
         popularity_score=20.0,
     )
     shared_private = await _create_meme(
         migrated_db_session,
         is_public=False,
-        author_user_id=owner.id,
+        uploader_user_id=owner.id,
         popularity_score=10.0,
     )
     unauthorized_private = await _create_meme(
         migrated_db_session,
         is_public=False,
-        author_user_id=stranger.id,
+        uploader_user_id=stranger.id,
         popularity_score=40.0,
     )
     _ = await _create_collection(
@@ -2145,14 +2162,14 @@ async def test_guest_search_route_collections_scope_allows_favorites(
     guest_private_upload = await _create_meme(
         migrated_db_session,
         is_public=False,
-        author_user_id=guest.id,
+        uploader_user_id=guest.id,
         popularity_score=20.0,
     )
     guest_favorite_public = await _create_meme(migrated_db_session, popularity_score=30.0)
     stranger_private = await _create_meme(
         migrated_db_session,
         is_public=False,
-        author_user_id=stranger.id,
+        uploader_user_id=stranger.id,
         popularity_score=40.0,
     )
     favorites = await _create_collection(
@@ -2199,14 +2216,8 @@ async def test_guest_search_route_collections_scope_allows_favorites(
 
     assert private_response.status_code == 200
     private_payload = private_response.json()
-    assert [item["meme"]["id"] for item in private_payload["items"]] == [
-        str(guest_favorite_public.id),
-        str(guest_private_upload.id),
-    ]
-    assert [item["meme"]["viewer_access"]["visibility"] for item in private_payload["items"]] == [
-        "public",
-        "private",
-    ]
+    assert [item["meme"]["id"] for item in private_payload["items"]] == [str(guest_private_upload.id)]
+    assert private_payload["items"][0]["meme"]["viewer_access"]["visibility"] == "private"
     assert str(stranger_private.id) not in private_response.text
 
 
@@ -2220,7 +2231,7 @@ async def test_public_search_defaults_public_but_authenticated_detail_can_return
     private_meme = await _create_meme(
         migrated_db_session,
         is_public=False,
-        author_user_id=owner.id,
+        uploader_user_id=owner.id,
         popularity_score=100.0,
         s3_original_key="pipeline/originals/private/authenticated-owner.jpg",
     )
@@ -2285,45 +2296,45 @@ async def test_search_scopes_filter_db_candidates_memberships_and_nsfw(
     viewer_private_upload = await _create_meme(
         migrated_db_session,
         is_public=False,
-        author_user_id=viewer.id,
+        uploader_user_id=viewer.id,
         popularity_score=1.0,
     )
     public_in_favorites = await _create_meme(migrated_db_session, popularity_score=1.0)
     owned_collection_private = await _create_meme(
         migrated_db_session,
         is_public=False,
-        author_user_id=viewer.id,
+        uploader_user_id=viewer.id,
         popularity_score=1.0,
     )
     editor_collection_private = await _create_meme(
         migrated_db_session,
         is_public=False,
-        author_user_id=editor_owner.id,
+        uploader_user_id=editor_owner.id,
         popularity_score=1.0,
     )
     viewer_collection_private = await _create_meme(
         migrated_db_session,
         is_public=False,
-        author_user_id=viewer_owner.id,
+        uploader_user_id=viewer_owner.id,
         popularity_score=1.0,
     )
     nsfw_editor_collection_private = await _create_meme(
         migrated_db_session,
         is_public=False,
         is_nsfw=True,
-        author_user_id=editor_owner.id,
+        uploader_user_id=editor_owner.id,
         popularity_score=1.0,
     )
     unauthorized_collection_private = await _create_meme(
         migrated_db_session,
         is_public=False,
-        author_user_id=stranger.id,
+        uploader_user_id=stranger.id,
         popularity_score=1.0,
     )
     stale_private_candidate = await _create_meme(
         migrated_db_session,
         is_public=False,
-        author_user_id=stranger.id,
+        uploader_user_id=stranger.id,
         popularity_score=1.0,
     )
 
@@ -2488,7 +2499,6 @@ async def test_search_scopes_filter_db_candidates_memberships_and_nsfw(
     }
     assert {item.meme.id for item in private_page.items} == {
         viewer_private_upload.id,
-        public_in_favorites.id,
         owned_collection_private.id,
         editor_collection_private.id,
         viewer_collection_private.id,
@@ -2518,14 +2528,14 @@ async def test_guest_search_scope_includes_guest_uploads_and_favorites(
     guest_private_upload = await _create_meme(
         migrated_db_session,
         is_public=False,
-        author_user_id=guest.id,
+        uploader_user_id=guest.id,
         popularity_score=1.0,
     )
     guest_favorite_public = await _create_meme(migrated_db_session, popularity_score=1.0)
     stranger_private = await _create_meme(
         migrated_db_session,
         is_public=False,
-        author_user_id=stranger.id,
+        uploader_user_id=stranger.id,
         popularity_score=1.0,
     )
     favorites = await _create_collection(
@@ -2579,7 +2589,7 @@ async def test_guest_search_scope_includes_guest_uploads_and_favorites(
         limit=20,
     )
 
-    assert {item.meme.id for item in private_page.items} == {guest_private_upload.id, guest_favorite_public.id}
+    assert {item.meme.id for item in private_page.items} == {guest_private_upload.id}
     assert {item.meme.id for item in all_page.items} == {
         public_catalog.id,
         guest_private_upload.id,
@@ -2599,7 +2609,7 @@ async def test_public_wrappers_stay_public_by_default_and_allow_authorized_scope
     private_meme = await _create_meme(
         migrated_db_session,
         is_public=False,
-        author_user_id=owner.id,
+        uploader_user_id=owner.id,
         popularity_score=1.0,
         s3_original_key="pipeline/originals/private/scope-owner.jpg",
     )
@@ -3935,7 +3945,7 @@ async def test_detail_route_returns_not_found_for_missing_private_or_nsfw_withou
     private_meme = await _create_meme(
         migrated_db_session,
         is_public=False,
-        author_user_id=author.id,
+        uploader_user_id=author.id,
         s3_original_key="pipeline/originals/private/detail-author-private.jpg",
     )
     nsfw_meme = await _create_meme(migrated_db_session, is_nsfw=True)
@@ -4116,7 +4126,7 @@ async def test_private_memes_are_visible_only_to_author_or_collection_member(
     migrated_db_session.add_all([author, member, stranger])
     await migrated_db_session.flush()
 
-    authored_private = await _create_meme(migrated_db_session, is_public=False, author_user_id=author.id)
+    authored_private = await _create_meme(migrated_db_session, is_public=False, uploader_user_id=author.id)
     shared_private = await _create_meme(migrated_db_session, is_public=False)
     collection = Collection(
         owner_id=author.id,
@@ -4167,7 +4177,7 @@ async def test_detail_read_enforces_visibility_and_nsfw(migrated_db_session: Asy
     viewer = User()
     migrated_db_session.add(viewer)
     await migrated_db_session.flush()
-    private_meme = await _create_meme(migrated_db_session, is_public=False, author_user_id=viewer.id)
+    private_meme = await _create_meme(migrated_db_session, is_public=False, uploader_user_id=viewer.id)
     nsfw_meme = await _create_meme(migrated_db_session, is_nsfw=True)
     service = MemeSearchService(migrated_db_session)
 

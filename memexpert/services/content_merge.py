@@ -5,11 +5,15 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
 from typing import TYPE_CHECKING
 
 from sqlalchemy import select, update
 
+from memexpert.ingest.policy import (
+    load_approximate_merge_scope,
+    refresh_effective_visibility,
+    resolve_visibility_mode,
+)
 from memexpert.models.collection import CollectionMeme, PinnedMeme
 from memexpert.models.content import (
     Meme,
@@ -44,7 +48,7 @@ class ContentMergeService:
     The merge path is deliberately transactional: the stage completion service
     opens one durable commit after stage-row truth changes, and the merge writes
     the entire lineage transfer (files, sources, collection membership, pins,
-    collection membership, pins, merge-audit row) plus the canonical-primary reselection into
+    merge-audit row) plus the canonical-primary reselection into
     that same session. Any failure raises ``PipelineIngestError`` so the
     enclosing commit is rolled back and the ``embed`` stage stays replayable.
     """
@@ -76,7 +80,7 @@ class ContentMergeService:
         merge_target = await self._select_merge_target(
             meme_file=meme_file,
             similarity_matches=similarity_matches,
-            current_meme_created_at=initial_target.created_at,
+            current_meme=initial_target,
         )
 
         if merge_target is None:
@@ -137,7 +141,7 @@ class ContentMergeService:
         *,
         meme_file: MemeFile,
         similarity_matches: tuple[QdrantSimilarityMatch, ...],
-        current_meme_created_at: datetime,
+        current_meme: Meme,
     ) -> tuple[Meme, float] | None:
         sorted_matches = sorted(
             (
@@ -151,15 +155,29 @@ class ContentMergeService:
             reverse=True,
         )
         for match in sorted_matches:
-            result = await self._session.execute(select(Meme).where(Meme.id == match.meme_id))
+            result = await self._session.execute(
+                select(Meme).where(Meme.id == match.meme_id).with_for_update()
+            )
             target_meme = result.scalar_one_or_none()
             if target_meme is None:
                 continue
-            if target_meme.created_at >= current_meme_created_at:
+            if target_meme.created_at >= current_meme.created_at:
                 # Only merge into the *older* canonical meme.
+                continue
+            if not await self._auto_merge_allowed(source_meme=current_meme, target_meme=target_meme):
                 continue
             return target_meme, match.similarity_score
         return None
+
+    async def _auto_merge_allowed(self, *, source_meme: Meme, target_meme: Meme) -> bool:
+        source_scope = await load_approximate_merge_scope(self._session, source_meme)
+        target_scope = await load_approximate_merge_scope(self._session, target_meme)
+        if source_scope.is_public or target_scope.is_public:
+            return source_scope.is_public and target_scope.is_public
+        return (
+            source_scope.uploader_user_id is not None
+            and source_scope.uploader_user_id == target_scope.uploader_user_id
+        )
 
     async def _apply_merge(
         self,
@@ -171,10 +189,14 @@ class ContentMergeService:
         merge_reason: str,
         details: dict[str, object] | None = None,
     ) -> MergeOutcome:
+        target_meme.visibility_mode = resolve_visibility_mode(
+            (target_meme.visibility_mode, source_meme.visibility_mode)
+        )
         moved_file_ids = await self._transfer_meme_files(source_meme_id=source_meme.id, target_meme_id=target_meme.id)
         await self._transfer_collection_memberships(source_meme_id=source_meme.id, target_meme_id=target_meme.id)
         await self._transfer_pins(source_meme_id=source_meme.id, target_meme_id=target_meme.id)
         self._accumulate_like_count(source_meme=source_meme, target_meme=target_meme)
+        await refresh_effective_visibility(self._session, target_meme)
         await self._delete_source_meme(source_meme=source_meme)
 
         primary_file_id = await self._reselect_primary_file(target_meme.id)

@@ -46,6 +46,7 @@ from memexpert.models.enums import (
     ContentPipelineStage,
     ContentPipelineStageStatus,
     ContentProcessingStatus,
+    MemeVisibilityMode,
     ModerationAction,
     ModerationReason,
     ModerationReportStatus,
@@ -1170,7 +1171,7 @@ async def test_admin_direct_meme_override_persists_template_and_decision_audit_r
         override_response = await admin_client.patch(
             f"/api/v1/admin/memes/{meme_id}/moderation",
             json={
-                "is_public": False,
+                "visibility_mode": "force_private",
                 "is_nsfw": True,
                 "template_id": str(template_id),
                 "reason": "spam",
@@ -1182,6 +1183,7 @@ async def test_admin_direct_meme_override_persists_template_and_decision_audit_r
     assert override_response.status_code == 200
     payload = override_response.json()
     assert payload["is_public"] is False
+    assert payload["visibility_mode"] == "force_private"
     assert payload["is_nsfw"] is True
     assert payload["template_id"] == str(template_id)
 
@@ -5247,8 +5249,10 @@ async def test_admin_can_delete_meme_with_durable_destructive_audit(
             reason=ModerationReason.SPAM,
             note="Prior hide",
             previous_is_public=True,
+            previous_visibility_mode=MemeVisibilityMode.AUTO,
             previous_is_nsfw=False,
             new_is_public=False,
+            new_visibility_mode=MemeVisibilityMode.FORCE_PRIVATE,
             new_is_nsfw=False,
         )
         seo_page = MemeSeoPage(

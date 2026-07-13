@@ -58,6 +58,7 @@ from memexpert.models.enums import (
     CollectionVisibility,
     ContentKind,
     ContentLanguage,
+    MemeVisibilityMode,
     ContentPipelineStage,
     ContentPipelineStageStatus,
     ContentProcessingStatus,
@@ -244,7 +245,10 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
     assert not memes_table.c["primary_file_id"].nullable
     assert "popularity_score" not in memes_table.c
     assert meme_files_table.c["meme_id"].foreign_keys
-    assert pipeline_ingest_requests_table.c["owner_user_id"].foreign_keys
+    assert "author_user_id" not in memes_table.c
+    assert memes_table.c["visibility_mode"].nullable is False
+    assert "owner_user_id" not in pipeline_ingest_requests_table.c
+    assert pipeline_ingest_requests_table.c["uploader_user_id"].foreign_keys
     assert pipeline_ingest_requests_table.c["materialized_meme_id"].foreign_keys
     assert pipeline_ingest_requests_table.c["materialized_meme_file_id"].foreign_keys
     assert pipeline_ingest_requests_table.c["matched_meme_file_id"].foreign_keys
@@ -253,6 +257,9 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
         and constraint.name == "uq_meme_files_meme_id_id"
         and [column.name for column in constraint.columns] == ["meme_id", "id"]
         for constraint in meme_files_table.constraints
+    )
+    assert _postgresql_where("uq_meme_files_sha256_hex_not_null", "meme_files") == (
+        "sha256_hex IS NOT NULL"
     )
     assert any(
         isinstance(constraint, UniqueConstraint)
@@ -432,8 +439,10 @@ async def test_moderation_report_and_decision_orm_persist_admin_audit_history(
                 reason=ModerationReason.NSFW,
                 note="Confirmed by admin",
                 previous_is_public=True,
+                previous_visibility_mode=MemeVisibilityMode.AUTO,
                 previous_is_nsfw=False,
                 new_is_public=True,
+                new_visibility_mode=MemeVisibilityMode.AUTO,
                 new_is_nsfw=True,
             ),
         )
@@ -529,7 +538,6 @@ async def test_schema_handles_cycles_multi_invites_and_nullable_content_fields(
             primary_file_id=file_one_id,
             language=ContentLanguage.EN,
             is_public=False,
-            author=owner,
             template=template,
             tags=["reaction", "deadline"],
         )
@@ -711,6 +719,7 @@ async def test_schema_handles_cycles_multi_invites_and_nullable_content_fields(
                     merge_reason="high_similarity_match",
                     details={"moved_file_ids": [str(file_two.id)]},
                 ),
+                CollectionMeme(collection=favorites, meme=meme, added_by_user=owner),
                 CollectionMeme(collection=shared, meme=meme, added_by_user=owner),
                 PinnedMeme(user=owner, meme=meme, position=1),
                 LoginEvent(

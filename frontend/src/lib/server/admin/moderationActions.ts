@@ -23,17 +23,19 @@ export async function resolveModerationReport({ fetch, request }: RequestEvent) 
 export async function updateMemeModeration({ fetch, request }: RequestEvent) {
   const data = await request.formData();
   return runAction(async () => {
+    const memeId = readRequired(data, 'meme_id');
+    const visibilityMode = readRequired(data, 'visibility_mode');
     await updateMemeRequest(
       {
         ...apiRequest(fetch, request),
         body: {
           is_nsfw: data.get('is_nsfw') === 'on',
-          is_public: data.get('is_public') === 'on',
+          visibility_mode: visibilityMode,
           reason: readOptional(data, 'reason'),
           note: readOptional(data, 'note')
         }
       },
-      readRequired(data, 'meme_id')
+      memeId
     );
     return { message: 'Meme visibility and safety settings saved.' };
   });

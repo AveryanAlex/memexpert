@@ -96,7 +96,9 @@ class SearchIndexPrefilter:
             return "is_public = true"
         access_clause = self._meilisearch_viewer_access_clause()
         if self.scope is SearchIndexPrefilterScope.PRIVATE:
-            return access_clause
+            if access_clause is None:
+                return "is_public = false"
+            return f"(is_public = false AND {access_clause})"
         if self.scope is SearchIndexPrefilterScope.ALL:
             if access_clause is None:
                 return "is_public = true"
@@ -108,8 +110,7 @@ class SearchIndexPrefilter:
             return None
         viewer = self._quote(self.viewer_user_id)
         return (
-            f"(author_user_id = {viewer} OR collection_owner_user_ids = {viewer} "
-            f"OR collection_member_user_ids = {viewer})"
+            f"(collection_owner_user_ids = {viewer} OR collection_member_user_ids = {viewer})"
         )
 
     def _qdrant_access_filter(self) -> object | None:
@@ -122,12 +123,22 @@ class SearchIndexPrefilter:
         access_should: list[Any] = []
         if self.viewer_user_id is not None:
             access_should = [
-                FieldCondition(key="author_user_id", match=MatchValue(value=self.viewer_user_id)),
                 FieldCondition(key="collection_owner_user_ids", match=MatchAny(any=[self.viewer_user_id])),
                 FieldCondition(key="collection_member_user_ids", match=MatchAny(any=[self.viewer_user_id])),
             ]
         if self.scope is SearchIndexPrefilterScope.PRIVATE:
-            return cast("object", Filter(should=access_should)) if access_should else None
+            private_condition = FieldCondition(key="is_public", match=MatchValue(value=False))
+            if not access_should:
+                return private_condition
+            return cast(
+                "object",
+                Filter(
+                    must=[
+                        private_condition,
+                        Filter(should=access_should),
+                    ]
+                ),
+            )
         if self.scope is SearchIndexPrefilterScope.ALL:
             if not access_should:
                 return FieldCondition(key="is_public", match=MatchValue(value=True))

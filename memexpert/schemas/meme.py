@@ -95,7 +95,6 @@ class MemeDetailRead(MemeCardRead):
 
     ocr_text: str | None
     is_public: bool
-    author_user_id: uuid.UUID | None
     seo_title: str | None
     seo_description: str | None
     seo_alt_text: str | None = None

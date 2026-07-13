@@ -45,7 +45,7 @@ export const actions: Actions = {
           cookieHeader: request.headers.get('cookie') ?? undefined,
           body: {
             is_nsfw: data.get('is_nsfw') === 'on',
-            is_public: data.get('is_public') === 'on',
+            visibility_mode: readRequired(data, 'visibility_mode'),
             template_id: templateId,
             reason: readOptional(data, 'reason'),
             note: readOptional(data, 'note')

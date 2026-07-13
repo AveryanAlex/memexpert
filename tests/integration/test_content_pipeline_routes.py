@@ -45,6 +45,7 @@ from memexpert.models.enums import (
     ContentPipelineStageStatus,
     ContentProcessingStatus,
     IngestFileOrigin,
+    IngestSourceKind,
     PipelineIngestRequestStatus,
     RabbitMQOutboxMessageStatus,
     SourceAttachReason,
@@ -313,6 +314,7 @@ async def _seed_pipeline_item(
     phash_tag: str,
     filename: str = "seed.png",
     media_bytes: bytes | None = None,
+    source_kind: IngestSourceKind = IngestSourceKind.OPERATOR_UPLOAD,
 ) -> ContentPipelineItemRead:
     details = _distinct_upload_media_details(tag=phash_tag)
     resolved_bytes = media_bytes or f"seed-bytes:{source_id}:{post_id}:{phash_tag}".encode()
@@ -326,7 +328,7 @@ async def _seed_pipeline_item(
             media_type=details.media_type,
             primary_file_id=meme_file_id,
             language=ContentLanguage.NONE,
-            is_public=False,
+            is_public=source_kind is IngestSourceKind.PUBLIC_CRAWLER,
         )
     )
     await session.flush()
@@ -350,6 +352,7 @@ async def _seed_pipeline_item(
                 platform=SourcePlatform.TELEGRAM,
                 source_id=source_id,
                 post_id=post_id,
+                source_kind=source_kind,
                 is_first_source=True,
                 source_alive=True,
                 attach_reason=SourceAttachReason.NEW_FILE,
@@ -483,7 +486,8 @@ def build_ingest_request(
         source_platform=SourcePlatform.TELEGRAM,
         source_id="channel-one",
         post_id="101",
-        owner_user_id=None,
+        source_kind=IngestSourceKind.OPERATOR_UPLOAD,
+        uploader_user_id=None,
         user_metadata={},
         source_metadata={"view_count": 7},
         declared_filename="sample.png",
@@ -510,7 +514,7 @@ async def test_pipeline_routes_require_operator_token_and_accept_real_multipart_
     client: AsyncClient,
 ) -> None:
     ingest_request = build_ingest_request()
-    owner_user_id = uuid.uuid7()
+    uploader_user_id = uuid.uuid7()
     target_collection_id = uuid.uuid7()
     stub_service = StubIngestAcceptService(
         result=IngestAcceptResult(
@@ -528,7 +532,7 @@ async def test_pipeline_routes_require_operator_token_and_accept_real_multipart_
                 "source_platform": "telegram",
                 "source_id": "channel-one",
                 "post_id": "101",
-                "owner_user_id": str(owner_user_id),
+                "uploader_user_id": str(uploader_user_id),
                 "target_collection_id": str(target_collection_id),
                 "view_count": "7",
             },
@@ -552,7 +556,7 @@ async def test_pipeline_routes_require_operator_token_and_accept_real_multipart_
                 "source_platform": "telegram",
                 "source_id": "channel-one",
                 "post_id": "101",
-                "owner_user_id": str(owner_user_id),
+                "uploader_user_id": str(uploader_user_id),
                 "target_collection_id": str(target_collection_id),
                 "view_count": "7",
             },
@@ -578,7 +582,8 @@ async def test_pipeline_routes_require_operator_token_and_accept_real_multipart_
         assert source.source_platform.value == "telegram"
         assert source.source_id == "channel-one"
         assert source.post_id == "101"
-        assert source.owner_user_id == owner_user_id
+        assert source.uploader_user_id == uploader_user_id
+        assert source.source_kind is IngestSourceKind.OPERATOR_UPLOAD
         assert source.user_metadata[TARGET_COLLECTION_ID_METADATA_KEY] == str(target_collection_id)
         assert source.view_count == 7
         assert upload_call["filename"] == "sample.png"
@@ -791,7 +796,7 @@ async def test_pipeline_upload_route_rejects_missing_file_and_blank_provenance_b
         assert missing_owner_response.status_code == 400
         assert missing_owner_response.json() == {
             "code": "pipeline_payload_invalid",
-            "detail": "owner_user_id is required when target_collection_id is provided.",
+            "detail": "uploader_user_id is required when target_collection_id is provided.",
         }
         assert stub_service.calls == []
     finally:
@@ -1024,6 +1029,7 @@ async def _seed_detail_item(
     source_id: str,
     post_id: str,
     phash_tag: str,
+    source_kind: IngestSourceKind = IngestSourceKind.OPERATOR_UPLOAD,
 ) -> uuid.UUID:
     """Create a pipeline item with a unique perceptual hash for detail-route tests."""
 
@@ -1035,6 +1041,7 @@ async def _seed_detail_item(
         phash_tag=phash_tag,
         filename=f"{phash_tag}.png",
         media_bytes=f"detail-route-bytes:{source_id}:{post_id}:{phash_tag}".encode(),
+        source_kind=source_kind,
     )
     return item.meme_file_id
 
@@ -1171,6 +1178,7 @@ async def test_pipeline_detail_route_reports_merge_and_classify_and_ready(
         source_id="detail-merge-older",
         post_id="9200",
         phash_tag="o",
+        source_kind=IngestSourceKind.PUBLIC_CRAWLER,
     )
     older_service = PipelineStageCompletionService(
         migrated_db_session,
@@ -1217,6 +1225,7 @@ async def test_pipeline_detail_route_reports_merge_and_classify_and_ready(
         source_id="detail-merge-newer",
         post_id="9201",
         phash_tag="n",
+        source_kind=IngestSourceKind.PUBLIC_CRAWLER,
     )
     newer_service = PipelineStageCompletionService(
         migrated_db_session,

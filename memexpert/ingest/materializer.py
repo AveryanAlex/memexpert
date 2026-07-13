@@ -18,6 +18,7 @@ from memexpert.ingest.materialization.blocked import (
     find_blocked_perceptual_hash_match,
     materialize_blocked_request,
 )
+from memexpert.ingest.materialization.duplicates import resolve_sha_duplicate_request
 from memexpert.ingest.materialization.invalid import mark_invalid_media
 from memexpert.ingest.materialization.media import MaterializationMediaPreparer
 from memexpert.ingest.materialization.models import (
@@ -35,6 +36,7 @@ from memexpert.ingest.materialization.requests import (
     load_locked_ingest_request,
     mark_materialization_attempt_started,
 )
+from memexpert.ingest.sha_dedupe import acquire_sha256_advisory_lock, find_global_sha256_match
 from memexpert.media.contracts import MediaProcessingError
 from memexpert.messaging.rabbitmq_outbox import relay_rabbitmq_outbox_messages_best_effort
 from memexpert.models.base import utcnow
@@ -134,6 +136,23 @@ class PipelineIngestMaterializer:
                 code=FAILED_MEDIA_TOO_LARGE_CODE,
                 detail=str(exc),
             )
+            return build_materialization_result(ingest_request)
+
+        await acquire_sha256_advisory_lock(self._session, prepared.sha256_hex)
+        sha_match = await find_global_sha256_match(self._session, prepared.sha256_hex)
+        if sha_match is not None:
+            try:
+                await resolve_sha_duplicate_request(
+                    self._session,
+                    matched_file=sha_match,
+                    ingest_request=ingest_request,
+                    resolved_at=now,
+                )
+                await self._session.commit()
+            except SQLAlchemyError as exc:
+                await self._session.rollback()
+                raise PipelineIngestError("Failed to resolve materialization-time SHA duplicate.") from exc
+            await self._objects.cleanup_temp_original(temp_object_key)
             return build_materialization_result(ingest_request)
 
         blocked_match = await find_blocked_perceptual_hash_match(self._session, prepared.perceptual_hash)

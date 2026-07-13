@@ -26,7 +26,7 @@ from memexpert.models.enums import (
 
 if TYPE_CHECKING:
     from memexpert.models.collection import Collection, CollectionInvite, CollectionMember, CollectionMeme, PinnedMeme
-    from memexpert.models.content import Meme, ModerationDecision, ModerationReport
+    from memexpert.models.content import ModerationDecision, ModerationReport
 
 
 class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -187,11 +187,6 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         "ChannelSuggestion",
         back_populates="user",
         cascade="all, delete-orphan",
-    )
-    authored_memes: Mapped[list["Meme"]] = relationship(
-        "Meme",
-        back_populates="author",
-        foreign_keys="Meme.author_user_id",
     )
     moderation_reports_submitted: Mapped[list["ModerationReport"]] = relationship(
         "ModerationReport",

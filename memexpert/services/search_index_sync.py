@@ -12,6 +12,7 @@ from sqlalchemy.orm import joinedload
 
 from memexpert.core.meilisearch import PipelineMeilisearchDocument
 from memexpert.core.qdrant import QdrantSyncPayload
+from memexpert.ingest.policy import load_meme_uploader_user_ids
 from memexpert.models.collection import Collection, CollectionMember, CollectionMeme
 from memexpert.models.content import EmbeddingCache, Meme, MemeFile, MemeSeoPage
 from memexpert.models.enums import CollectionVisibility, EmbeddingInputType
@@ -21,7 +22,7 @@ from memexpert.services.errors import PipelineIngestError
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
-SEARCH_INDEX_ALGORITHM_VERSION = "collection-aware-v1"
+SEARCH_INDEX_ALGORITHM_VERSION = "collection-provenance-v2"
 type CollectionHintRow = tuple[
     uuid.UUID,
     uuid.UUID,
@@ -41,7 +42,7 @@ class CanonicalSearchIndexState:
     meme_file_id: uuid.UUID
     search_index_algorithm_version: str
     is_public: bool
-    author_user_id: str | None
+    uploader_user_ids: tuple[str, ...]
     media_type: str
     language: str
     is_nsfw: bool
@@ -123,12 +124,13 @@ async def load_search_index_state(
 
     seo_page = canonical_meme.seo_page
     popularity_score = await load_derived_popularity_score(session, canonical_meme.id)
+    uploader_user_ids = await load_meme_uploader_user_ids(session, canonical_meme.id)
     canonical = CanonicalSearchIndexState(
         meme_id=canonical_meme.id,
         meme_file_id=meme_file.id,
         search_index_algorithm_version=SEARCH_INDEX_ALGORITHM_VERSION,
         is_public=canonical_meme.is_public,
-        author_user_id=_stringify_uuid(canonical_meme.author_user_id),
+        uploader_user_ids=tuple(str(user_id) for user_id in uploader_user_ids),
         media_type=canonical_meme.media_type.value,
         language=canonical_meme.language.value,
         is_nsfw=canonical_meme.is_nsfw,
@@ -191,7 +193,7 @@ def build_qdrant_sync_payload(canonical: CanonicalSearchIndexState) -> QdrantSyn
         meme_file_id=canonical.meme_file_id,
         search_index_algorithm_version=canonical.search_index_algorithm_version,
         is_public=canonical.is_public,
-        author_user_id=canonical.author_user_id,
+        uploader_user_ids=list(canonical.uploader_user_ids),
         media_type=canonical.media_type,
         language=canonical.language,
         is_nsfw=canonical.is_nsfw,
@@ -225,7 +227,6 @@ def build_meilisearch_document(canonical: CanonicalSearchIndexState) -> Pipeline
         meme_file_id=str(canonical.meme_file_id),
         search_index_algorithm_version=canonical.search_index_algorithm_version,
         is_public=canonical.is_public,
-        author_user_id=canonical.author_user_id,
         media_type=canonical.media_type,
         language=canonical.language,
         is_nsfw=canonical.is_nsfw,

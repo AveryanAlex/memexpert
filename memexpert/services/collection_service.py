@@ -1170,7 +1170,6 @@ class CollectionService:
                 Meme.id == meme_id,
                 or_(
                     Meme.is_public.is_(True),
-                    Meme.author_user_id == viewer_user_id,
                     authorized_collection,
                 ),
             )

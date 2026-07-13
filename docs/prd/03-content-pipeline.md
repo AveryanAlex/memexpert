@@ -62,6 +62,14 @@ Popularity tracking powers:
 - Trending feed
 - Recommendation cold-start fallback
 
+### Visibility and deduplication policy
+
+- User and operator uploads are private by default. Public crawler discoveries are public by default.
+- SHA-256 equality is the only deduplication rule allowed to cross users or the public/private boundary. It reuses the same canonical meme and file, then adds source provenance and the uploader's collection membership.
+- A crawler exact-SHA match promotes an automatic private upload to public. An admin-forced private meme remains private even after crawler provenance is attached.
+- Perceptual-hash and embedding similarity are approximate. They may merge public with public, or private with private only when both memes have the same sole uploader. They never merge public and private content or private content belonging to different/shared uploaders.
+- Exact SHA lookup covers every file variant of a meme and is serialized in PostgreSQL so concurrent uploads converge on one meme/file.
+
 ---
 
 ## Meme Templates (V1)

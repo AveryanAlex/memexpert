@@ -1409,7 +1409,7 @@ describe('admin API client', () => {
     expect(mockFetch).toHaveBeenCalledOnce();
   });
 
-  it('updates direct meme moderation flags with audit reason and note', async () => {
+  it('updates direct meme visibility policy with audit reason and note', async () => {
     const memeId = '55555555-5555-4555-8555-555555555555';
     const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = new URL(String(input));
@@ -1419,20 +1419,26 @@ describe('admin API client', () => {
       expect(init?.method).toBe('PATCH');
       expect(headers.get('x-requested-with')).toBe('XMLHttpRequest');
       expect(JSON.parse(String(init?.body))).toEqual({
-        is_public: false,
+        visibility_mode: 'force_private',
         is_nsfw: true,
         reason: 'spam',
         note: 'manual override'
       });
 
-      return jsonResponse({ ...adminMemePayload(), id: memeId, is_public: false, is_nsfw: true });
+      return jsonResponse({
+        ...adminMemePayload(),
+        id: memeId,
+        visibility_mode: 'force_private',
+        is_public: false,
+        is_nsfw: true
+      });
     }) satisfies ApiFetch;
 
     await updateMemeModeration(
       {
         fetch: mockFetch,
         baseUrl: 'https://api.memexpert.test',
-        body: { is_public: false, is_nsfw: true, reason: 'spam', note: 'manual override' }
+        body: { visibility_mode: 'force_private', is_nsfw: true, reason: 'spam', note: 'manual override' }
       },
       memeId
     );
@@ -1632,13 +1638,13 @@ function adminMemePayload() {
     media_type: 'image',
     language: 'en',
     is_nsfw: false,
+    visibility_mode: 'auto',
     is_public: true,
     popularity_score: 1,
     like_count: 0,
     tags: [],
     primary_file: null,
     template_id: null,
-    author_user_id: null,
     created_at: '2026-01-01T00:00:00Z',
     updated_at: '2026-01-01T00:00:00Z'
   };
@@ -1670,8 +1676,10 @@ function moderationDecisionPayload() {
     reason: 'nsfw',
     note: 'confirmed',
     previous_is_public: true,
+    previous_visibility_mode: 'auto',
     previous_is_nsfw: false,
     new_is_public: true,
+    new_visibility_mode: 'auto',
     new_is_nsfw: true,
     created_at: '2026-01-01T00:00:00Z'
   };

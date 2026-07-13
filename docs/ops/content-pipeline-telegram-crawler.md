@@ -391,6 +391,29 @@ Verify the durable chain instead:
    `meme_file_sync_target_snapshots`; both Qdrant and Meilisearch must reach a
    synced state before claiming search indexing is complete.
 
+### Crawler visibility and exact-SHA promotion
+
+Crawler observations are persisted with `source_kind=public_crawler`. A new
+crawler meme starts public. If the crawler bytes exactly match any existing
+`MemeFile`, the crawler attaches to that canonical file instead of creating a
+new one. For an `auto` private upload this promotes the existing meme to public;
+for `force_private` it attaches provenance but leaves the meme private. A dead
+crawler source never automatically demotes a meme because historical public
+discovery remains true.
+
+Approximate pHash/embedding matches never pull private content into the crawler
+catalog. The crawler creates or merges into a separate public meme unless the
+candidate is already public. When verifying an exact promotion, check all of:
+
+1. The crawler request outcome is `sha256_exact_existing_file`.
+2. `materialized_meme_id` and `materialized_meme_file_id` equal the pre-existing
+   private upload IDs; no second file with the SHA exists.
+3. A `meme_sources` row exists with `source_kind='public_crawler'`.
+4. `memes.visibility_mode='auto'` and effective `is_public=true` (or
+   `force_private` plus `is_public=false` for the suppression case).
+5. Both search targets are replayed/resynced because their previous payload may
+   still advertise the pre-promotion private state.
+
 ## Inspecting freshness snapshots
 
 ```bash

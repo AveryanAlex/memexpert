@@ -173,7 +173,7 @@ manual older-history requests and progress so crawler restarts can resume them.
 Admin meme projections include a `primary_file` with a private authenticated
 render URL. `GET /api/v1/media/files/{file_id}/{variant}` grants private-file
 access to a full account with the durable admin flag; unrelated non-admin users
-receive 404 unless the normal public/owner/collection access rule applies. The
+receive 404 unless the normal public-or-collection access rule applies. The
 DTO and render URL never disclose an S3 object key. This lets moderation and SEO review safely
 render image, video, or audio previews for hidden media.
 
@@ -188,31 +188,37 @@ repair, and danger actions remain available but are never the routine default.
 
 The content model has three separate owners of truth:
 
-- `PipelineIngestRequest` is the pre-content raw-ingest source of truth. API-safe entrypoints create this row after stdlib SHA256/idempotency checks and temporary original-object upload. Heavy workers later inspect media and either materialize `Meme`/`MemeFile` rows or mark a terminal failure.
-- `Meme` is the conceptual meme. It owns public/private moderation state, popularity, collections, SEO page linkage, and the canonical `primary_file_id` pointer.
+- `PipelineIngestRequest` is the pre-content raw-ingest source of truth. It records `source_kind` plus nullable `uploader_user_id`. API-safe entrypoints create this row after stdlib SHA256/idempotency checks and temporary original-object upload. Heavy workers later inspect media and either materialize `Meme`/`MemeFile` rows or mark a terminal failure.
+- `Meme` is the conceptual meme. It owns `visibility_mode`, materialized `is_public`, popularity, collections, SEO page linkage, and the canonical `primary_file_id` pointer. It has no singular owner.
 - `MemeFile` is one physical media file. `sha256_hex` is the only exact same-bytes identity and is unique. File rows own physical metadata, S3 keys, pHash, ingest origin, and optional match lineage.
-- `MemeSource` is one provenance observation. Source rows preserve where a file or duplicate was observed and carry the attach reason plus any matched file id.
+- `MemeSource` is one provenance observation. Source rows preserve where a file or duplicate was observed, `source_kind`, nullable uploader, attach reason, and any matched file id.
 
 ### Ingest-Time Identity
 
-SHA256 is computed immediately after bytes are available, before media inspection, blocked pHash checks, canonical S3 writes, or pHash duplicate lookup.
+SHA256 is computed immediately after bytes are available, before media inspection, blocked pHash checks, canonical S3 writes, or pHash duplicate lookup. Exact decisions take a PostgreSQL transaction advisory lock derived from the SHA, then recheck every `MemeFile` (not only primary files) before writing.
 
 | Condition | Result |
 |-----------|--------|
 | Source identity `(platform, source_id, post_id)` already has a raw ingest request | Return the existing `PipelineIngestRequest`; do not upload or enqueue again. |
-| SHA256 matches an existing non-blocked file | Create/update the ingest request as `resolved_sha_duplicate`, do not inspect media or enqueue media-inspect. Attach a `MemeSource` to the existing file with `attach_reason=sha256_exact_existing_file`. |
+| SHA256 matches an existing non-blocked file | Reuse the canonical meme/file globally, create/update the ingest request as `resolved_sha_duplicate`, do not inspect media or enqueue media-inspect, attach a `MemeSource`, add the uploader's target collection membership when present, and recompute effective visibility atomically. |
 | SHA256 matches an existing blocked/quarantined file | Create/update the ingest request as `resolved_sha_duplicate`, do not inspect media or enqueue media-inspect. Attach a `MemeSource` to the existing blocked file with `attach_reason=blocked_sha256_existing_file`. |
 | SHA miss | Store bytes under the temporary-original prefix, create a `PipelineIngestRequest` with `status=media_inspect_pending`, and write a `rabbitmq_outbox_messages` row in the same DB transaction for a media-inspect worker event carrying `ingest_request_id`. |
 | Worker cannot inspect/read media | Mark the ingest request `failed_invalid_media`, record failure code/detail, create no `Meme`/`MemeFile`, and retain the temporary object for operator retention/debugging. No downstream event is written. |
 | Worker finds active blocked pHash | Promote the original to the canonical key, create hidden failed `Meme`/`MemeFile`/`MemeSource` audit rows, mark the ingest request `failed_blocked_phash`, clean the temporary object, and write no normal transcode event. |
-| Worker finds exact pHash match | Treat this as the same conceptual meme but a new physical file. Promote the original to the canonical key, create a new `MemeFile` under the matched file's `Meme`, set `ingest_origin=phash_exact_existing_meme` and `matched_meme_file_id`, attach source with `attach_reason=phash_exact_new_file`, mark the request `materialized`, and write a downstream transcode outbox event transactionally. |
-| Worker finds no pHash match | Promote the original to the canonical key, create a new `Meme` plus primary `MemeFile` with `ingest_origin=new_meme`, attach source with `attach_reason=new_file`, mark the request `materialized`, and write a downstream transcode outbox event transactionally. |
+| Worker finds eligible exact pHash match | Treat this as the same conceptual meme but a new physical file only when both sides are public or both are private with the same sole uploader. Promote the original to the canonical key, create a new `MemeFile` under the matched `Meme`, attach source and collection membership, and write the downstream event transactionally. |
+| Worker finds no eligible pHash match | Promote the original to the canonical key and create a separate `Meme` plus primary `MemeFile`. User/operator content starts private; crawler content starts public. |
 
 Crawler duplicate-post idempotency is separate from media identity: an already-seen `(platform, source_id, post_id)` returns the existing source row before service-owned media processing. Telegram `file_unique_id` is not a content identity and there is no separate unique media identity table.
 
+An exact crawler source attached to an `auto` private upload promotes the existing meme to public. `force_private` attaches the crawler provenance but suppresses promotion. Approximate crawler matches never consume private content: they create or merge into a separate public meme.
+
 ### Post-Embed Semantic Merge
 
-After the embed stage computes a file embedding, semantic merge may query Qdrant for high cosine similarity and merge two `Meme` concepts. This is not exact-byte identity and not the exact-pHash same-meme ingest path. When semantic merge fires, files, sources, collection memberships, pins, and like counts are consolidated into the target meme and the duplicate meme entity is deleted according to the merge service's invariants. Public popularity is derived later from the moved source rows and analytics events.
+After the embed stage computes a file embedding, semantic merge may query Qdrant for high cosine similarity and merge two `Meme` concepts. This is not exact-byte identity and not the exact-pHash same-meme ingest path. Qdrant filters candidates to public→public or private→private with the same sole uploader; the merge transaction locks both memes and repeats the PostgreSQL provenance check. When semantic merge fires, files, sources, collection memberships, pins, and like counts are consolidated into the target meme and the duplicate meme entity is deleted according to the merge service's invariants. Public popularity is derived later from the moved source rows and analytics events.
+
+### Historical SHA reconciliation
+
+The ownership/provenance migration is deliberately staged. Apply `0031`, keep ingestion paused for the final pass, and run `uv run memexpert-reconcile-sha-duplicates` until `--verify-only` succeeds. Each SHA group commits independently and transfers sources, nonduplicate files, collections, pins, moderation/SEO/pipeline/cache/history rows; visibility conflicts resolve `force_private` over `force_public` over `auto`, and likes are recomputed from distinct Favorites owners. Only then apply `0032`, remove unreferenced obsolete S3 objects from merge-log details, purge stale point/document IDs, and fully rebuild Qdrant and Meilisearch.
 
 ### Admin Merge
 

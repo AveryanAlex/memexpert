@@ -31,6 +31,11 @@ describe('/admin/moderation page', () => {
     expect(body).toContain('Decision note (optional)');
     expect(body).toContain('action="?/resolveModerationReport"');
     expect(body).toContain('action="?/updateMemeModeration"');
+    expect(body).toContain('name="visibility_mode"');
+    expect(body).toContain('value="auto"');
+    expect(body).toContain('value="force_public"');
+    expect(body).toContain('value="force_private"');
+    expect(body).not.toContain('name="is_public"');
     expect(body).toContain('Recent decisions');
     expect(body).toContain('Meme metadata');
     expect(body).toContain('href="/admin/moderation/patterns"');
@@ -107,13 +112,13 @@ function meme(overrides: Partial<AdminMemeRead> = {}): AdminMemeRead {
     media_type: 'image',
     language: 'en',
     is_nsfw: false,
+    visibility_mode: 'auto',
     is_public: true,
     popularity_score: 4.2,
     like_count: 12,
     tags: ['reaction'],
     primary_file: null,
     template_id: null,
-    author_user_id: null,
     created_at: '2026-07-10T10:00:00Z',
     updated_at: '2026-07-10T10:00:00Z',
     ...overrides
@@ -170,8 +175,10 @@ function decision(memeId: string): AdminModerationDecisionRead {
     reason: 'spam',
     note: 'Hidden after review.',
     previous_is_public: true,
+    previous_visibility_mode: 'auto',
     previous_is_nsfw: false,
     new_is_public: false,
+    new_visibility_mode: 'force_private',
     new_is_nsfw: false,
     previous_template_id: null,
     new_template_id: null,

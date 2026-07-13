@@ -35,8 +35,10 @@ Scopes:
 
 Access control rules:
 
-- Qdrant/Meilisearch can prefilter by payloads where possible (`is_public`, `author_user_id`, collection payload hints), but **PostgreSQL is the final authority**.
+- Qdrant/Meilisearch can prefilter by `is_public` and collection payload hints, but **PostgreSQL is the final authority**.
 - Candidate IDs from search indexes must be filtered through collection membership/ownership before DTOs are returned.
+- There is no author/owner authorization shortcut. Public state or collection access is required, including for uploaders.
+- `private` scope contains only accessible non-public memes. A public meme saved in Favorites remains in public/all/collection scopes, not private scope.
 - Collection filters are ignored or rejected for unauthenticated users without a guest/full user row.
 - Cache keys, if used, must include the normalized query, every content filter, viewer/user identity, scope, normalized collection ids, NSFW allowance or user preference, and algorithm/version fields to prevent private result leaks.
 
@@ -89,11 +91,12 @@ classified and synced.
 - **Vector:** Voyage AI `voyage-multimodal-3.5`, 1024 dimensions, cosine distance
 - **Payload:** safe PostgreSQL-derived metadata for candidate prefiltering and
   ranking: `meme_id`, `meme_file_id`, `search_index_algorithm_version`,
-  `is_public`, `author_user_id`, `media_type`, `language`, `is_nsfw`, `tags`,
+  `is_public`, internal `uploader_user_ids`, `media_type`, `language`, `is_nsfw`, `tags`,
   `template_id`, `template_slug`, `seo_page_slug`, derived `popularity_score`,
   `like_count`, `quality_score`, `created_at`, `updated_at`, collection id
   buckets by visibility, shared collection ids, collection owner ids, and
   collection member ids.
+- `uploader_user_ids` exists only to prefilter private approximate-dedupe candidates. It is not used for user-facing access checks and is not returned by public APIs.
 - **Payload indexes:** should be created on fields used by Qdrant-side
   prefilters. These indexes are performance hints only; PostgreSQL filters are
   still the authorization boundary.
@@ -110,7 +113,7 @@ share the same file identity.
   document. SEO prose/modeling fields other than `seo_page_slug`, moderation
   notes, invite data, and raw auth/session data are intentionally not indexed.
 - **Filterable/prefilter hints:** `is_public`, `is_nsfw`, `media_type`,
-  `language`, `tags`, `template_slug`, `author_user_id`, collection id buckets
+  `language`, `tags`, `template_slug`, collection id buckets
   by visibility, shared collection ids, collection owner ids, and collection
   member ids. Collection roles are deliberately not indexed; PostgreSQL applies
   the final permission predicate.
@@ -211,4 +214,4 @@ Behind a feature flag. For Russian queries, optionally translate to English via 
 
 ## Deduplication Search
 
-After the embed stage computes a file's embedding, Qdrant is queried with a high similarity threshold (cosine > 0.92) to find near-duplicate memes that pHash missed (e.g., significant crops, overlays). Matches trigger auto-merge. See [Content Pipeline: Phase 2 Dedup](04-content-pipeline.md#phase-2-embedding-based-merge-post-embed) for the full flow.
+After the embed stage computes a file's embedding, Qdrant is queried with a high similarity threshold (cosine > 0.92) to find near-duplicate memes that pHash missed (e.g., significant crops, overlays). Candidate filtering is strict: public files can match only public memes; a private file can match only private memes whose Qdrant payload has exactly one `uploader_user_ids` value equal to its own sole uploader. PostgreSQL reloads and locks both memes and rechecks the same rule before merging, so a stale index cannot cross visibility or uploader boundaries. See [Content Pipeline](04-content-pipeline.md#post-embed-semantic-merge) for the full flow.

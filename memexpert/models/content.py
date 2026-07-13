@@ -34,6 +34,8 @@ from memexpert.models.enums import (
     ContentProcessingStatus,
     EmbeddingInputType,
     IngestFileOrigin,
+    IngestSourceKind,
+    MemeVisibilityMode,
     ModerationAction,
     ModerationReason,
     ModerationReportStatus,
@@ -74,7 +76,7 @@ class Meme(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         ),
         Index("ix_memes_media_type_language", "media_type", "language"),
         Index("ix_memes_visibility_created_at", "is_public", "created_at"),
-        Index("ix_memes_author_user_id_created_at", "author_user_id", "created_at"),
+        Index("ix_memes_visibility_mode_created_at", "visibility_mode", "created_at"),
     )
 
     media_type: Mapped[ContentKind] = mapped_column(
@@ -95,9 +97,10 @@ class Meme(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         ForeignKey("meme_templates.id", ondelete="SET NULL"),
         nullable=True,
     )
-    author_user_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("users.id", ondelete="SET NULL"),
-        nullable=True,
+    visibility_mode: Mapped[MemeVisibilityMode] = mapped_column(
+        string_enum(MemeVisibilityMode),
+        default=MemeVisibilityMode.AUTO,
+        nullable=False,
     )
     is_public: Mapped[bool] = mapped_column(default=True, nullable=False)
 
@@ -125,11 +128,6 @@ class Meme(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         uselist=False,
     )
     template: Mapped["MemeTemplate | None"] = relationship("MemeTemplate", back_populates="memes")
-    author: Mapped["User | None"] = relationship(
-        "User",
-        back_populates="authored_memes",
-        foreign_keys=[author_user_id],
-    )
     saved_in_collections: Mapped[list["CollectionMeme"]] = relationship(
         "CollectionMeme",
         back_populates="meme",
@@ -269,8 +267,16 @@ class ModerationDecision(UUIDPrimaryKeyMixin, Base):
     )
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
     previous_is_public: Mapped[bool] = mapped_column(nullable=False)
+    previous_visibility_mode: Mapped[MemeVisibilityMode] = mapped_column(
+        string_enum(MemeVisibilityMode, name="previous_meme_visibility_mode"),
+        nullable=False,
+    )
     previous_is_nsfw: Mapped[bool] = mapped_column(nullable=False)
     new_is_public: Mapped[bool] = mapped_column(nullable=False)
+    new_visibility_mode: Mapped[MemeVisibilityMode] = mapped_column(
+        string_enum(MemeVisibilityMode, name="new_meme_visibility_mode"),
+        nullable=False,
+    )
     new_is_nsfw: Mapped[bool] = mapped_column(nullable=False)
     previous_template_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("meme_templates.id", ondelete="SET NULL"),
@@ -309,7 +315,12 @@ class MemeFile(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         Index("ix_meme_files_ingest_origin", "ingest_origin"),
         Index("ix_meme_files_matched_meme_file_id", "matched_meme_file_id"),
         Index("ix_meme_files_perceptual_hash", "perceptual_hash"),
-        Index("ix_meme_files_sha256_hex", "sha256_hex"),
+        Index(
+            "uq_meme_files_sha256_hex_not_null",
+            "sha256_hex",
+            unique=True,
+            postgresql_where=text("sha256_hex IS NOT NULL"),
+        ),
     )
 
     meme_id: Mapped[uuid.UUID] = mapped_column(
@@ -553,7 +564,12 @@ class PipelineIngestRequest(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     source_id: Mapped[str] = mapped_column(String(255), nullable=False)
     post_id: Mapped[str] = mapped_column(String(255), nullable=False)
-    owner_user_id: Mapped[uuid.UUID | None] = mapped_column(
+    source_kind: Mapped[IngestSourceKind] = mapped_column(
+        string_enum(IngestSourceKind),
+        default=IngestSourceKind.OPERATOR_UPLOAD,
+        nullable=False,
+    )
+    uploader_user_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"),
         nullable=True,
     )
@@ -750,6 +766,7 @@ class MemeSource(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         Index("ix_meme_sources_file_id_platform", "file_id", "platform"),
         Index("ix_meme_sources_attach_reason", "attach_reason"),
         Index("ix_meme_sources_matched_meme_file_id", "matched_meme_file_id"),
+        Index("ix_meme_sources_source_kind_uploader", "source_kind", "uploader_user_id"),
         Index("ix_meme_sources_engagement_due_lease", "next_engagement_check_at", "engagement_check_locked_at"),
     )
 
@@ -763,6 +780,15 @@ class MemeSource(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     source_id: Mapped[str] = mapped_column(String(255), nullable=False)
     post_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    source_kind: Mapped[IngestSourceKind] = mapped_column(
+        string_enum(IngestSourceKind),
+        default=IngestSourceKind.OPERATOR_UPLOAD,
+        nullable=False,
+    )
+    uploader_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     is_first_source: Mapped[bool] = mapped_column(default=False, nullable=False)
     source_alive: Mapped[bool] = mapped_column(default=True, nullable=False)
     # The Telegram publish timestamp captured by the crawler; left NULL for

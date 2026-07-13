@@ -415,7 +415,6 @@ def _summary_for(collection: CollectionRead) -> CollectionSummaryRead:
 async def create_meme_file(
     session: AsyncSession,
     *,
-    author_user_id: uuid.UUID | None = None,
     is_public: bool = True,
 ) -> Meme:
     meme_id = uuid.uuid7()
@@ -426,7 +425,6 @@ async def create_meme_file(
         primary_file_id=file_id,
         language=ContentLanguage.EN,
         is_public=is_public,
-        author_user_id=author_user_id,
     )
     file = MemeFile(
         id=file_id,
@@ -551,10 +549,9 @@ async def test_private_library_callback_reports_hidden_meme_without_escaping(
 ) -> None:
     user_service = UserService(migrated_db_session)
     linked_user = await create_full_user_via_upgrade(user_service, telegram_id=TELEGRAM_ID)
-    other_user = await create_full_user_via_upgrade(user_service, email="private-owner@example.com")
+    _ = await create_full_user_via_upgrade(user_service, email="private-owner@example.com")
     hidden_meme = await create_meme_file(
         migrated_db_session,
-        author_user_id=other_user.id,
         is_public=False,
     )
     await migrated_db_session.commit()
@@ -622,7 +619,7 @@ async def test_private_library_callbacks_mutate_real_collection_state(
     user_service = UserService(migrated_db_session)
     collection_service = CollectionService(migrated_db_session)
     linked_user = await create_full_user_via_upgrade(user_service, telegram_id=TELEGRAM_ID)
-    memes = [await create_meme_file(migrated_db_session, author_user_id=linked_user.id) for _ in range(3)]
+    memes = [await create_meme_file(migrated_db_session) for _ in range(3)]
     custom = await collection_service.create_custom_collection(owner_user_id=linked_user.id, title="Active saves")
     _ = await collection_service.favorite_meme(user_id=linked_user.id, meme_id=memes[0].id)
     _ = await collection_service.favorite_meme(user_id=linked_user.id, meme_id=memes[1].id)

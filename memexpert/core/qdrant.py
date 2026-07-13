@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from datetime import datetime
 
     from memexpert.core.search_index_prefilter import SearchIndexPrefilter
+    from memexpert.ingest.policy import ApproximateMergeScope
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,7 +55,6 @@ class QdrantSyncPayload:
     meme_file_id: uuid.UUID
     search_index_algorithm_version: str
     is_public: bool
-    author_user_id: str | None
     media_type: str
     language: str
     is_nsfw: bool
@@ -65,6 +65,7 @@ class QdrantSyncPayload:
     like_count: int
     created_at: datetime
     updated_at: datetime
+    uploader_user_ids: list[str] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
     collection_ids: list[str] = field(default_factory=list)
     public_collection_ids: list[str] = field(default_factory=list)
@@ -133,6 +134,7 @@ class QdrantSimilarityClientProtocol(Protocol):
         *,
         vector: tuple[float, ...],
         current_meme_file_id: uuid.UUID,
+        scope: ApproximateMergeScope | None = None,
         limit: int | None = None,
     ) -> tuple[QdrantSimilarityMatch, ...]: ...
 
@@ -207,6 +209,7 @@ class PipelineQdrantClient(_LazyQdrantClient):
         *,
         vector: tuple[float, ...],
         current_meme_file_id: uuid.UUID,
+        scope: ApproximateMergeScope | None = None,
         limit: int | None = None,
     ) -> tuple[QdrantSimilarityMatch, ...]:
         client = await self._ensure_client()
@@ -216,6 +219,7 @@ class PipelineQdrantClient(_LazyQdrantClient):
             raw_matches = await client.query_points(
                 collection_name=self._settings.pipeline_qdrant_collection_name,
                 query=list(vector),
+                query_filter=_build_approximate_dedupe_filter(scope),
                 limit=resolved_limit,
                 with_payload=True,
                 with_vectors=False,
@@ -232,6 +236,38 @@ class PipelineQdrantClient(_LazyQdrantClient):
             raise QdrantProviderUnavailableError(f"Qdrant similarity lookup failed: {exc}") from exc
 
         return _parse_qdrant_matches(raw_matches, current_meme_file_id=current_meme_file_id)
+
+
+def _build_approximate_dedupe_filter(scope: ApproximateMergeScope | None) -> object | None:
+    """Build the strict public or same-single-uploader Qdrant candidate filter."""
+
+    if scope is None:
+        return None
+
+    from qdrant_client.http.models import FieldCondition, Filter, MatchValue, ValuesCount
+
+    if scope.is_public:
+        return Filter(must=[FieldCondition(key="is_public", match=MatchValue(value=True))])
+    if scope.uploader_user_id is None:
+        return Filter(
+            must=[
+                FieldCondition(key="is_public", match=MatchValue(value=True)),
+                FieldCondition(key="is_public", match=MatchValue(value=False)),
+            ]
+        )
+    return Filter(
+        must=[
+            FieldCondition(key="is_public", match=MatchValue(value=False)),
+            FieldCondition(
+                key="uploader_user_ids",
+                match=MatchValue(value=str(scope.uploader_user_id)),
+            ),
+            FieldCondition(
+                key="uploader_user_ids",
+                values_count=ValuesCount(gte=1, lte=1),
+            ),
+        ]
+    )
 
 class PipelineQdrantUserSearchClient(_LazyQdrantClient):
     """Lazy Qdrant adapter for user-facing semantic meme search.
@@ -453,7 +489,7 @@ def _build_meme_point(
         "meme_file_id": str(payload.meme_file_id),
         "search_index_algorithm_version": payload.search_index_algorithm_version,
         "is_public": payload.is_public,
-        "author_user_id": payload.author_user_id,
+        "uploader_user_ids": list(payload.uploader_user_ids),
         "media_type": payload.media_type,
         "language": payload.language,
         "is_nsfw": payload.is_nsfw,
@@ -511,7 +547,7 @@ def _build_sync_preview(
         "meme_file_id",
         "search_index_algorithm_version",
         "is_public",
-        "author_user_id",
+        "uploader_user_ids",
         "media_type",
         "language",
         "is_nsfw",

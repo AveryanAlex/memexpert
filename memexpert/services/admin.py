@@ -21,6 +21,7 @@ from memexpert.crawlers.telegram.session_crypto import (
     TelegramStringSessionDecryptError,
     TelegramStringSessionSecretError,
 )
+from memexpert.ingest.policy import refresh_effective_visibility
 from memexpert.models.base import utcnow
 from memexpert.models.collection import CollectionMeme, PinnedMeme
 from memexpert.models.content import (
@@ -50,6 +51,7 @@ from memexpert.models.enums import (
     ChannelSuggestionStatus,
     ContentPipelineStage,
     ContentPipelineStageStatus,
+    MemeVisibilityMode,
     ModerationAction,
     ModerationReportStatus,
     PipelineIngestRequestStatus,
@@ -1412,8 +1414,10 @@ class AdminService:
                     reason=None,
                     note=decision_note,
                     previous_is_public=meme.is_public,
+                    previous_visibility_mode=meme.visibility_mode,
                     previous_is_nsfw=meme.is_nsfw,
                     new_is_public=meme.is_public,
+                    new_visibility_mode=meme.visibility_mode,
                     new_is_nsfw=meme.is_nsfw,
                     previous_template_id=previous_template_id,
                     new_template_id=request.target_template_id,
@@ -1950,12 +1954,13 @@ class AdminService:
         request: AdminMemeModerationUpdateRequest,
     ) -> AdminMemeRead:
         meme = await self.session.scalar(
-            select(Meme).options(selectinload(Meme.primary_file)).where(Meme.id == meme_id),
+            select(Meme).options(selectinload(Meme.primary_file)).where(Meme.id == meme_id).with_for_update(),
         )
         if meme is None:
             raise AdminNotFoundError(f"Meme {meme_id} does not exist.")
 
         previous_is_public = meme.is_public
+        previous_visibility_mode = meme.visibility_mode
         previous_is_nsfw = meme.is_nsfw
         previous_template_id = meme.template_id
 
@@ -1966,12 +1971,17 @@ class AdminService:
 
         if request.is_nsfw is not None:
             meme.is_nsfw = request.is_nsfw
-        if request.is_public is not None:
-            meme.is_public = request.is_public
+        if request.visibility_mode is not None:
+            meme.visibility_mode = request.visibility_mode
+            await refresh_effective_visibility(self.session, meme)
         if "template_id" in request.model_fields_set:
             meme.template_id = request.template_id
 
-        flags_changed = previous_is_public != meme.is_public or previous_is_nsfw != meme.is_nsfw
+        flags_changed = (
+            previous_is_public != meme.is_public
+            or previous_visibility_mode is not meme.visibility_mode
+            or previous_is_nsfw != meme.is_nsfw
+        )
         template_changed = previous_template_id != meme.template_id
         if flags_changed:
             self.session.add(
@@ -1982,8 +1992,10 @@ class AdminService:
                     reason=request.reason,
                     note=request.note,
                     previous_is_public=previous_is_public,
+                    previous_visibility_mode=previous_visibility_mode,
                     previous_is_nsfw=previous_is_nsfw,
                     new_is_public=meme.is_public,
+                    new_visibility_mode=meme.visibility_mode,
                     new_is_nsfw=meme.is_nsfw,
                     previous_template_id=previous_template_id,
                     new_template_id=meme.template_id,
@@ -1998,8 +2010,10 @@ class AdminService:
                     reason=request.reason,
                     note=request.note,
                     previous_is_public=meme.is_public,
+                    previous_visibility_mode=meme.visibility_mode,
                     previous_is_nsfw=meme.is_nsfw,
                     new_is_public=meme.is_public,
+                    new_visibility_mode=meme.visibility_mode,
                     new_is_nsfw=meme.is_nsfw,
                     previous_template_id=previous_template_id,
                     new_template_id=meme.template_id,
@@ -2064,6 +2078,7 @@ class AdminService:
 
         meme = report.meme
         previous_is_public = meme.is_public
+        previous_visibility_mode = meme.visibility_mode
         previous_is_nsfw = meme.is_nsfw
         self._apply_moderation_action(meme, request.action)
 
@@ -2082,8 +2097,10 @@ class AdminService:
             reason=request.reason or report.reason,
             note=request.note,
             previous_is_public=previous_is_public,
+            previous_visibility_mode=previous_visibility_mode,
             previous_is_nsfw=previous_is_nsfw,
             new_is_public=meme.is_public,
+            new_visibility_mode=meme.visibility_mode,
             new_is_nsfw=meme.is_nsfw,
             previous_template_id=meme.template_id,
             new_template_id=meme.template_id,
@@ -2163,10 +2180,10 @@ class AdminService:
                 "primary_file_id": str(meme.primary_file_id),
                 "media_type": meme.media_type.value,
                 "language": meme.language.value,
+                "visibility_mode": meme.visibility_mode.value,
                 "is_public": meme.is_public,
                 "is_nsfw": meme.is_nsfw,
                 "template_id": None if meme.template_id is None else str(meme.template_id),
-                "author_user_id": None if meme.author_user_id is None else str(meme.author_user_id),
                 "like_count": meme.like_count,
                 "tags": list(meme.tags[:MAX_AUDIT_SNAPSHOT_IDS]),
             },
@@ -2207,6 +2224,7 @@ class AdminService:
             media_type=meme.media_type,
             language=meme.language,
             is_nsfw=meme.is_nsfw,
+            visibility_mode=meme.visibility_mode,
             is_public=meme.is_public,
             popularity_score=popularity_score,
             like_count=meme.like_count,
@@ -2226,7 +2244,6 @@ class AdminService:
                 )
             ),
             template_id=meme.template_id,
-            author_user_id=meme.author_user_id,
             created_at=meme.created_at,
             updated_at=meme.updated_at,
         )
@@ -2379,12 +2396,15 @@ class AdminService:
             meme.is_nsfw = False
             return
         if action is ModerationAction.HIDE:
+            meme.visibility_mode = MemeVisibilityMode.FORCE_PRIVATE
             meme.is_public = False
             return
         if action is ModerationAction.PUBLISH:
+            meme.visibility_mode = MemeVisibilityMode.FORCE_PUBLIC
             meme.is_public = True
             return
         if action is ModerationAction.HIDE_AND_MARK_NSFW:
+            meme.visibility_mode = MemeVisibilityMode.FORCE_PRIVATE
             meme.is_public = False
             meme.is_nsfw = True
             return

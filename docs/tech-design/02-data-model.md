@@ -12,8 +12,8 @@ MemeFile 2 (1080x810 PNG, from @funny_pics)        ──┼── Meme "Drake -
 MemeFile 3 (900x675 JPEG with border, from Reddit) ──┘     ↑ primary_file = File 1
 ```
 
-**On Meme:** media type, OCR text, language, NSFW flag, like count, template link, public/private flag.
-**On MemeFile:** dimensions, format, file size, S3 URLs for all variants, perceptual hash, quality score, blur hash, processing status.
+**On Meme:** media type, OCR text, language, NSFW flag, like count, template link, visibility policy, and materialized public/private state.
+**On MemeFile:** dimensions, format, file size, S3 URLs for all variants, SHA-256, perceptual hash, quality score, blur hash, processing status.
 
 Embeddings live in a separate cache table, not on MemeFile. This decouples embedding computation from the relational model.
 
@@ -29,11 +29,13 @@ Deletion-related fields may exist as schema placeholders, but user-initiated acc
 
 ### Meme
 
-The conceptual meme entity. Key fields: `media_type` (image/gif/video), `primary_file_id` (FK → MemeFile, best quality), `ocr_text`, `language` (ru/en/mixed/none), `is_nsfw`, `like_count` (denormalized), `tags` (text array — assigned by LLM during SEO generation, used for filtering and tag pages), `template_id`, `author_user_id` (set if user-uploaded), `is_public`.
+The conceptual meme entity. Key fields: `media_type` (image/gif/video), `primary_file_id` (FK → MemeFile, best quality), `ocr_text`, `language` (ru/en/mixed/none), `is_nsfw`, `like_count` (denormalized), `tags` (text array — assigned by LLM during SEO generation, used for filtering and tag pages), `template_id`, `visibility_mode` (`auto`, `force_public`, `force_private`), and materialized effective `is_public`.
+
+There is no singular meme owner or author. Users do not own canonical meme metadata. Upload provenance belongs to `MemeSource`; private read authority comes only from collection access.
 
 ### MemeFile
 
-A specific media file belonging to a meme. Key fields: `meme_id` (FK → Meme), `status` (pending/processing/ready/failed), original-upload metadata (`mime_type`, dimensions, byte size), `s3_original_key`, `s3_web_video_key` (nullable — GIF/video playback artifact only), `perceptual_hash`, `quality_score`, `blur_hash`. The canonical default file is stored on `Meme.primary_file_id`. Static image variants (resize, format) are served on-the-fly by imgproxy from the original; derived playback artifacts never overwrite original MIME metadata.
+A specific media file belonging to a meme. Key fields: `meme_id` (FK → Meme), `status` (pending/processing/ready/failed), original-upload metadata (`mime_type`, dimensions, byte size), `s3_original_key`, `s3_web_video_key` (nullable — GIF/video playback artifact only), globally unique non-null `sha256_hex`, `perceptual_hash`, `quality_score`, `blur_hash`. The canonical default file is stored on `Meme.primary_file_id`. Static image variants (resize, format) are served on-the-fly by imgproxy from the original; derived playback artifacts never overwrite original MIME metadata.
 
 ### MemeSeoPage
 
@@ -45,9 +47,17 @@ Template label (V1 — no editor, but schema is V2-ready). Key fields: `slug` (u
 
 ### MemeSource
 
-Linked to **MemeFile**, not Meme. Tracks where a specific file was found. Key fields: `file_id` (FK → MemeFile), `platform` (telegram/reddit/vk), `source_id`, `post_id`, `published_at`, `is_first_source`, `source_alive`, and source-engagement scheduling state (`last_engagement_check_at`, `next_engagement_check_at`, lease owner/time, attempt count, last error). Stable provenance stays here; volatile Telegram counters do not.
+Linked to **MemeFile**, not Meme. Tracks where a specific file was found. Key fields: `file_id` (FK → MemeFile), `platform` (telegram/reddit/vk), `source_id`, `post_id`, `source_kind` (`user_upload`, `public_crawler`, `operator_upload`), nullable `uploader_user_id`, `published_at`, `is_first_source`, `source_alive`, and source-engagement scheduling state (`last_engagement_check_at`, `next_engagement_check_at`, lease owner/time, attempt count, last error). Stable provenance stays here; volatile Telegram counters do not.
 
 Unique constraint: `(platform, source_id, post_id)`.
+
+### Visibility and provenance invariants
+
+- New user and operator uploads start private; public crawler discoveries start public.
+- In `auto` mode, the existence of any historical `public_crawler` source makes the meme public. Marking that source dead does not demote the meme.
+- `force_private` suppresses crawler promotion; `force_public` stays public regardless of provenance.
+- Exact SHA reuse may attach multiple uploaders to the same canonical meme. Each uploader gets access through their own collection membership; uploader/source metadata is internal and absent from non-admin DTOs.
+- Approximate deduplication may merge public with public, or private with private only when both memes have the same single uploader. It never crosses public/private or uploader boundaries.
 
 ### MemeSourceEngagementSnapshot
 
@@ -85,7 +95,11 @@ User-submitted channel suggestions. Key fields: `user_id`, `platform`, `channel_
 
 ### Collection
 
-Every account has auto-created Favorites (not deletable). Full accounts can create additional private collections. Key fields: `owner_id`, `title`, `is_favorites`, visibility/internal flags.
+Every account gets a Favorites collection lazily on first collection interaction; it is not deletable. Full accounts can create additional collections. Key fields: `owner_id`, `title`, `kind`, and `visibility`. `CollectionMeme` plus collection ownership/membership is the only non-admin authority for private meme access.
+
+### Exact-SHA reconciliation and migration
+
+The provenance rollout is staged. Revision `0031` adds source-kind, uploader, and visibility-mode fields while legacy ownership columns remain and backfills private collection access. Before revision `0032`, `memexpert-reconcile-sha-duplicates` merges one duplicate SHA group per transaction, records obsolete meme/file and S3/Qdrant/Meilisearch identifiers in `MemeMergeLog.details`, transfers dependent rows, and recomputes likes from distinct Favorites owners. Revision `0032` refuses to run while duplicate non-null hashes remain, restores the unique partial SHA index, and removes legacy singular ownership columns.
 
 ### CollectionMember
 

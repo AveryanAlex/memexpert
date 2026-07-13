@@ -78,6 +78,7 @@ from memexpert.models.enums import (
     ContentProcessingStatus,
     ContentSourceKind,
     IngestFileOrigin,
+    IngestSourceKind,
     PipelineIngestRequestStatus,
     RabbitMQOutboxMessageStatus,
     SourceAttachReason,
@@ -381,8 +382,10 @@ class FakeQdrantClient:
         *,
         vector: tuple[float, ...],
         current_meme_file_id: uuid.UUID,
+        scope: object | None = None,
         limit: int | None = None,
     ) -> tuple[QdrantSimilarityMatch, ...]:
+        _ = scope
         self.calls.append({"vector_len": len(vector), "meme_file_id": current_meme_file_id, "limit": limit})
         if self.error is not None:
             raise self.error
@@ -411,7 +414,7 @@ class FakeQdrantSyncClient:
                 "meme_id": payload.meme_id,
                 "search_index_algorithm_version": payload.search_index_algorithm_version,
                 "is_public": payload.is_public,
-                "author_user_id": payload.author_user_id,
+                "uploader_user_ids": list(payload.uploader_user_ids),
                 "media_type": payload.media_type,
                 "language": payload.language,
                 "tags": list(payload.tags),
@@ -467,7 +470,6 @@ class FakeMeilisearchSyncClient:
                 "meme_file_id": document.meme_file_id,
                 "search_index_algorithm_version": document.search_index_algorithm_version,
                 "is_public": document.is_public,
-                "author_user_id": document.author_user_id,
                 "media_type": document.media_type,
                 "tags": list(document.tags),
                 "is_nsfw": document.is_nsfw,
@@ -650,6 +652,7 @@ async def _seed_transcode_pending_item(
     media_bytes: bytes,
     content_type: str = "image/png",
     phash_tag: str = "a",
+    source_kind: IngestSourceKind = IngestSourceKind.OPERATOR_UPLOAD,
 ) -> tuple[ContentPipelineItemRead, ContentPipelineDispatchEvent]:
     details = _make_distinct_upload_media_details(tag=phash_tag)
     meme_id = uuid.uuid7()
@@ -675,7 +678,7 @@ async def _seed_transcode_pending_item(
             media_type=details.media_type,
             primary_file_id=meme_file_id,
             language=ContentLanguage.NONE,
-            is_public=False,
+            is_public=source_kind is IngestSourceKind.PUBLIC_CRAWLER,
         )
     )
     await session.flush()
@@ -699,6 +702,7 @@ async def _seed_transcode_pending_item(
                 platform=SourcePlatform.TELEGRAM,
                 source_id=source_id,
                 post_id=post_id,
+                source_kind=source_kind,
                 is_first_source=True,
                 source_alive=True,
                 attach_reason=SourceAttachReason.NEW_FILE,
@@ -1845,6 +1849,7 @@ async def _seed_embed_pending_item(
             seed=f"embed-runtime:{source_id}:{post_id}:{phash_tag or ''}",
         ),
         phash_tag=phash_tag or "a",
+        source_kind=IngestSourceKind.PUBLIC_CRAWLER,
     )
     service = PipelineStageCompletionService(
         session,
@@ -2825,13 +2830,14 @@ async def test_pipeline_runtime_sync_qdrant_rebuilds_collection_aware_payload_fr
     migrated_db_session.add_all([template, collection])
     await migrated_db_session.flush()
 
-    canonical_meme.author_user_id = author.id
     canonical_meme.is_public = True
     canonical_meme.tags = ["runtime", "fresh"]
     canonical_meme.like_count = 9
     canonical_meme.template_id = template.id
     source = await migrated_db_session.scalar(select(MemeSource).where(MemeSource.file_id == meme_file_id))
     assert source is not None
+    source.source_kind = IngestSourceKind.USER_UPLOAD
+    source.uploader_user_id = author.id
     migrated_db_session.add(
         MemeSourceEngagementSnapshot(
             meme_source_id=source.id,
@@ -2903,7 +2909,7 @@ async def test_pipeline_runtime_sync_qdrant_rebuilds_collection_aware_payload_fr
         "meme_id": canonical_meme.id,
         "search_index_algorithm_version": SEARCH_INDEX_ALGORITHM_VERSION,
         "is_public": True,
-        "author_user_id": str(author.id),
+        "uploader_user_ids": [str(author.id)],
         "media_type": ContentKind.IMAGE.value,
         "language": ContentLanguage.EN.value,
         "tags": ["runtime", "fresh"],
@@ -3301,7 +3307,6 @@ async def test_pipeline_runtime_sync_meili_rebuilds_collection_aware_document_fr
     migrated_db_session.add_all([template, collection])
     await migrated_db_session.flush()
 
-    canonical_meme.author_user_id = author.id
     canonical_meme.is_public = False
     canonical_meme.tags = ["meili", "updated"]
     canonical_meme.like_count = 5
@@ -3381,7 +3386,6 @@ async def test_pipeline_runtime_sync_meili_rebuilds_collection_aware_document_fr
         "meme_file_id": str(meme_file_id),
         "search_index_algorithm_version": SEARCH_INDEX_ALGORITHM_VERSION,
         "is_public": False,
-        "author_user_id": str(author.id),
         "media_type": ContentKind.IMAGE.value,
         "tags": ["meili", "updated"],
         "is_nsfw": False,

@@ -24,6 +24,7 @@ from memexpert.core.qdrant import (
 )
 from memexpert.core.search_index_prefilter import SearchIndexPrefilter, SearchIndexPrefilterScope
 from memexpert.core.voyage import PipelineVoyageClient
+from memexpert.ingest.policy import ApproximateMergeScope
 from memexpert.services.meme_search import MemeSearchService
 from memexpert.services.query_embedding import CachedTextQueryEmbeddingService
 
@@ -145,6 +146,24 @@ async def test_user_search_client_passes_conservative_qdrant_prefilter() -> None
     assert actual_filter_payload == expected_filter_payload
 
 
+def test_private_qdrant_prefilter_excludes_public_collection_saves() -> None:
+    prefilter = SearchIndexPrefilter(
+        scope=SearchIndexPrefilterScope.PRIVATE,
+        search_index_algorithm_version="collection-aware-v1",
+        viewer_user_id="viewer-1",
+    )
+
+    query_filter = prefilter.to_qdrant_filter()
+    assert query_filter is not None
+    payload = cast("Any", query_filter).model_dump(exclude_none=True, mode="json")
+    private_access = payload["must"][1]
+    assert private_access["must"][0] == {"key": "is_public", "match": {"value": False}}
+    assert {condition["key"] for condition in private_access["must"][1]["should"]} == {
+        "collection_owner_user_ids",
+        "collection_member_user_ids",
+    }
+
+
 @pytest.mark.asyncio
 async def test_similarity_client_uses_query_points_and_filters_self_matches() -> None:
     current_meme_file_id = uuid.uuid4()
@@ -184,6 +203,7 @@ async def test_similarity_client_uses_query_points_and_filters_self_matches() ->
         {
             "collection_name": "memes-test",
             "query": [0.3, 0.4],
+            "query_filter": None,
             "limit": 7,
             "with_payload": True,
             "with_vectors": False,
@@ -211,6 +231,36 @@ async def test_similarity_client_treats_missing_first_collection_as_no_matches()
 
 
 @pytest.mark.asyncio
+async def test_similarity_client_filters_private_candidates_to_one_matching_uploader() -> None:
+    fake_client = FakeQdrantClient([])
+    settings = SimpleNamespace(
+        pipeline_qdrant_collection_name="memes-test",
+        pipeline_qdrant_search_top_k=7,
+        pipeline_qdrant_timeout_seconds=1,
+        qdrant_url="http://qdrant.test",
+    )
+    adapter = PipelineQdrantClient(settings=cast("Settings", settings))
+    adapter._client = fake_client
+    uploader_user_id = uuid.uuid4()
+
+    _ = await adapter.find_similar_memes(
+        vector=(0.3, 0.4),
+        current_meme_file_id=uuid.uuid4(),
+        scope=ApproximateMergeScope(is_public=False, uploader_user_id=uploader_user_id),
+    )
+
+    query_filter = fake_client.calls[0]["query_filter"]
+    payload = query_filter.model_dump(exclude_none=True, mode="json")
+    assert payload == {
+        "must": [
+            {"key": "is_public", "match": {"value": False}},
+            {"key": "uploader_user_ids", "match": {"value": str(uploader_user_id)}},
+            {"key": "uploader_user_ids", "values_count": {"gte": 1, "lte": 1}},
+        ]
+    }
+
+
+@pytest.mark.asyncio
 async def test_sync_client_creates_missing_collection_then_retries_first_upsert() -> None:
     now = datetime.now(UTC)
     settings = SimpleNamespace(
@@ -227,7 +277,6 @@ async def test_sync_client_creates_missing_collection_then_retries_first_upsert(
         meme_file_id=uuid.uuid4(),
         search_index_algorithm_version="test-v1",
         is_public=True,
-        author_user_id=None,
         media_type="image",
         language="en",
         is_nsfw=False,
@@ -273,7 +322,7 @@ def test_qdrant_sync_payload_serializer_and_preview_include_collection_metadata(
         meme_file_id=meme_file_id,
         search_index_algorithm_version="collection-aware-v1",
         is_public=False,
-        author_user_id=str(uuid.uuid4()),
+        uploader_user_ids=[str(uuid.uuid4())],
         media_type="image",
         language="en",
         is_nsfw=False,
@@ -302,7 +351,7 @@ def test_qdrant_sync_payload_serializer_and_preview_include_collection_metadata(
     assert point.id == str(meme_file_id)
     assert point.payload["search_index_algorithm_version"] == "collection-aware-v1"
     assert point.payload["is_public"] is False
-    assert point.payload["author_user_id"] == payload.author_user_id
+    assert point.payload["uploader_user_ids"] == payload.uploader_user_ids
     assert point.payload["media_type"] == "image"
     assert point.payload["template_slug"] == "frog-template"
     assert point.payload["popularity_score"] == 42.0

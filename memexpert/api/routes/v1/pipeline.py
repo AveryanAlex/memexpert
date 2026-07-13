@@ -22,7 +22,13 @@ from memexpert.api.dependencies.pipeline import (
 )
 from memexpert.ingest.schemas import IngestAcceptOutcome, IngestAcceptSource, IngestRequestRead
 from memexpert.ingest.target_collection_metadata import user_metadata_with_target_collection
-from memexpert.models.enums import ContentPipelineStage, PipelineIngestRequestStatus, SourcePlatform, SyncTargetKind
+from memexpert.models.enums import (
+    ContentPipelineStage,
+    IngestSourceKind,
+    PipelineIngestRequestStatus,
+    SourcePlatform,
+    SyncTargetKind,
+)
 from memexpert.schemas.content_pipeline import (
     ContentPipelineItemDetail,
     ContentPipelineItemFilter,
@@ -71,20 +77,21 @@ async def create_pipeline_upload(
     source_id: Annotated[str, Form(min_length=1)],
     post_id: Annotated[str, Form(min_length=1)],
     file: Annotated[UploadFile, File()],
-    owner_user_id: Annotated[uuid.UUID | None, Form()] = None,
+    uploader_user_id: Annotated[uuid.UUID | None, Form()] = None,
     target_collection_id: Annotated[uuid.UUID | None, Form()] = None,
     view_count: Annotated[int | None, Form(ge=0)] = None,
 ) -> IngestRequestRead:
     """Accept raw bytes without synchronous media inspection or materialization."""
 
     try:
-        if target_collection_id is not None and owner_user_id is None:
-            raise PipelinePayloadValidationError("owner_user_id is required when target_collection_id is provided.")
+        if target_collection_id is not None and uploader_user_id is None:
+            raise PipelinePayloadValidationError("uploader_user_id is required when target_collection_id is provided.")
         source = IngestAcceptSource(
             source_platform=source_platform,
             source_id=source_id,
             post_id=post_id,
-            owner_user_id=owner_user_id,
+            source_kind=IngestSourceKind.OPERATOR_UPLOAD,
+            uploader_user_id=uploader_user_id,
             user_metadata=user_metadata_with_target_collection(target_collection_id=target_collection_id),
             view_count=view_count,
         )

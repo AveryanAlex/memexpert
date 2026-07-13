@@ -46,6 +46,7 @@
       <h2 class="m-0 text-2xl font-black tracking-[-0.04em]">Current state</h2>
       <div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-1">
         <div class="rounded-2xl border border-line bg-soft/50 p-4"><span class="text-sm font-extrabold text-muted">Catalog visibility</span><p class="mb-0 mt-1 text-2xl font-black">{detail.meme.is_public ? 'Visible' : 'Hidden'}</p></div>
+        <div class="rounded-2xl border border-line bg-soft/50 p-4"><span class="text-sm font-extrabold text-muted">Visibility policy</span><p class="mb-0 mt-1 text-2xl font-black">{plain(detail.meme.visibility_mode)}</p></div>
         <div class="rounded-2xl border border-line bg-soft/50 p-4"><span class="text-sm font-extrabold text-muted">Safety label</span><p class="mb-0 mt-1 text-2xl font-black">{detail.meme.is_nsfw ? 'Sensitive' : 'Safe'}</p></div>
       </div>
       <p class="m-0 text-sm text-muted">{openReports.length} open {openReports.length === 1 ? 'report' : 'reports'} · {detail.decisions.length} recorded {detail.decisions.length === 1 ? 'decision' : 'decisions'}</p>
@@ -83,7 +84,7 @@
   <Card class="my-4 grid gap-4">
     <div><p class="m-0 text-xs font-black uppercase tracking-[0.14em] text-muted">Operator controls</p><h2 class="m-0 text-3xl font-black tracking-[-0.05em]">Overrides</h2><p class="mb-0 mt-1 text-sm text-muted">Changes are recorded in moderation history.</p></div>
     <form method="POST" action="?/updateMeme" class="grid gap-4 md:grid-cols-2">
-      <label class="inline-flex items-center gap-2 font-extrabold"><input name="is_public" type="checkbox" checked={detail.meme.is_public} /> Visible in catalog</label>
+      <label class="grid gap-2 text-sm font-extrabold">Visibility policy<Select name="visibility_mode"><option value="auto" selected={detail.meme.visibility_mode === 'auto'}>Automatic from provenance</option><option value="force_public" selected={detail.meme.visibility_mode === 'force_public'}>Force public</option><option value="force_private" selected={detail.meme.visibility_mode === 'force_private'}>Force private</option></Select><span class="font-normal text-muted">Effective state: {detail.meme.is_public ? 'visible' : 'hidden'}</span></label>
       <label class="inline-flex items-center gap-2 font-extrabold"><input name="is_nsfw" type="checkbox" checked={detail.meme.is_nsfw} /> Sensitive content</label>
       <label class="grid gap-2 text-sm font-extrabold">Template<Select name="template_id"><option value="" selected={detail.meme.template_id === null}>No template</option>{#each data.templates as template (template.id)}<option value={template.id} selected={template.id === detail.meme.template_id}>{template.name}</option>{/each}</Select></label>
       <label class="grid gap-2 text-sm font-extrabold">Reason<Select name="reason"><option value="">No reason</option>{#each moderationReasons as reason}<option value={reason}>{plain(reason)}</option>{/each}</Select></label>
@@ -101,13 +102,13 @@
         <div><dt class="text-xs font-extrabold uppercase text-muted">Likes</dt><dd class="m-0">{detail.meme.like_count}</dd></div>
         <div><dt class="text-xs font-extrabold uppercase text-muted">Tags</dt><dd class="m-0">{detail.meme.tags.join(', ') || 'None'}</dd></div>
         <div><dt class="text-xs font-extrabold uppercase text-muted">Created</dt><dd class="m-0"><time datetime={detail.meme.created_at}>{formatAdminTimestamp(detail.meme.created_at)}</time></dd></div>
-        <div><dt class="text-xs font-extrabold uppercase text-muted">Author ID</dt><dd class="m-0 [overflow-wrap:anywhere]">{detail.meme.author_user_id ?? 'None'}</dd></div>
+        <div><dt class="text-xs font-extrabold uppercase text-muted">Visibility policy</dt><dd class="m-0">{plain(detail.meme.visibility_mode)}</dd></div>
       </dl>
     </AdvancedSection>
 
     <AdvancedSection title="Moderation history" description="Closed reports and immutable admin decisions.">
       <div class="grid gap-5">
-        <section><h3 class="mt-0">Recorded decisions</h3>{#if detail.decisions.length}{#each detail.decisions as decision (decision.id)}<article class="border-t border-line py-3"><strong>{plain(decision.action)}</strong><p class="m-0 text-sm text-muted"><time datetime={decision.created_at}>{formatAdminTimestamp(decision.created_at)}</time> · {decision.new_is_public ? 'Visible' : 'Hidden'} · {decision.new_is_nsfw ? 'Sensitive' : 'Safe'}</p>{#if decision.note}<p class="mb-0">{decision.note}</p>{/if}</article>{/each}{:else}<p class="m-0 text-muted">No admin decisions recorded yet.</p>{/if}</section>
+        <section><h3 class="mt-0">Recorded decisions</h3>{#if detail.decisions.length}{#each detail.decisions as decision (decision.id)}<article class="border-t border-line py-3"><strong>{plain(decision.action)}</strong><p class="m-0 text-sm text-muted"><time datetime={decision.created_at}>{formatAdminTimestamp(decision.created_at)}</time> · {plain(decision.new_visibility_mode)} → {decision.new_is_public ? 'Visible' : 'Hidden'} · {decision.new_is_nsfw ? 'Sensitive' : 'Safe'}</p>{#if decision.note}<p class="mb-0">{decision.note}</p>{/if}</article>{/each}{:else}<p class="m-0 text-muted">No admin decisions recorded yet.</p>{/if}</section>
         <section><h3 class="mt-0">Closed reports</h3>{#if closedReports.length}{#each closedReports as report (report.id)}<p class="border-t border-line py-3"><strong>{plain(report.reason)}</strong> · {plain(report.status)} {report.resolved_at ? `on ${formatAdminTimestamp(report.resolved_at)}` : ''}</p>{/each}{:else}<p class="m-0 text-muted">No closed reports.</p>{/if}</section>
       </div>
     </AdvancedSection>

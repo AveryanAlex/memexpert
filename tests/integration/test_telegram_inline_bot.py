@@ -196,7 +196,7 @@ async def create_meme_file(
     media_type: ContentKind,
     mime_type: str,
     is_public: bool = True,
-    author_user_id: uuid.UUID | None = None,
+    uploader_user_id: uuid.UUID | None = None,
     s3_original_key: str | None = None,
 ) -> tuple[Meme, MemeFile]:
     meme_id = uuid.uuid7()
@@ -208,7 +208,6 @@ async def create_meme_file(
         language=ContentLanguage.EN,
         tags=[media_type.value],
         is_public=is_public,
-        author_user_id=author_user_id,
     )
     setattr(meme, _DERIVED_POPULARITY_ATTR, 42.0)
     file = MemeFile(
@@ -224,6 +223,19 @@ async def create_meme_file(
     await session.flush()
     session.add(file)
     await session.flush()
+    if uploader_user_id is not None:
+        collection_id = await session.scalar(
+            select(User.active_save_collection_id).where(User.id == uploader_user_id)
+        )
+        if collection_id is None:
+            collection = Collection(owner_id=uploader_user_id, title=f"Inline bot upload {meme.id}")
+            session.add(collection)
+            await session.flush()
+            collection_id = collection.id
+        session.add(
+            CollectionMeme(collection_id=collection_id, meme_id=meme.id, added_by_user_id=uploader_user_id)
+        )
+        await session.flush()
     return meme, file
 
 
@@ -591,21 +603,21 @@ async def test_inline_plain_text_query_shows_private_and_shared_memes_only_to_au
         media_type=ContentKind.IMAGE,
         mime_type="image/jpeg",
         is_public=False,
-        author_user_id=viewer.id,
+        uploader_user_id=viewer.id,
     )
     shared_private, shared_file = await create_meme_file(
         migrated_db_session,
         media_type=ContentKind.IMAGE,
         mime_type="image/jpeg",
         is_public=False,
-        author_user_id=stranger.id,
+        uploader_user_id=stranger.id,
     )
     unauthorized_private, unauthorized_file = await create_meme_file(
         migrated_db_session,
         media_type=ContentKind.IMAGE,
         mime_type="image/jpeg",
         is_public=False,
-        author_user_id=stranger.id,
+        uploader_user_id=stranger.id,
     )
     await set_source_popularity_score(migrated_db_session, meme_file=authored_file, score=30.0)
     await set_source_popularity_score(migrated_db_session, meme_file=shared_file, score=20.0)
