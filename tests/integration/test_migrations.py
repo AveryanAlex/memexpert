@@ -547,3 +547,148 @@ async def test_0031_backfills_provenance_visibility_and_private_collection_acces
     assert favorites_row.meme_id == private_meme_id
     assert favorites_row.active_save_collection_id == favorites_row.id
     assert decision_modes == ("force_public", "force_private")
+
+
+async def test_0033_repairs_legacy_crawler_visibility_and_post_classify_readiness(
+    empty_public_schema: tuple[AsyncEngine, str],
+) -> None:
+    engine, database_url = empty_public_schema
+    config = _build_alembic_config(database_url)
+    crawler_meme_id, crawler_file_id = uuid.uuid7(), uuid.uuid7()
+    hidden_meme_id, hidden_file_id = uuid.uuid7(), uuid.uuid7()
+
+    await _run_alembic_command(command.upgrade, config, "0032")
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                """
+                INSERT INTO memes (
+                    id, media_type, primary_file_id, language, is_nsfw,
+                    like_count, tags, visibility_mode, is_public, created_at, updated_at
+                ) VALUES
+                    (
+                        :crawler_meme_id, 'image', :crawler_file_id, 'none', false,
+                        0, '{}', 'force_private', false, now(), now()
+                    ),
+                    (
+                        :hidden_meme_id, 'image', :hidden_file_id, 'none', false,
+                        0, '{}', 'force_private', false, now(), now()
+                    )
+                """
+            ),
+            {
+                "crawler_meme_id": crawler_meme_id,
+                "crawler_file_id": crawler_file_id,
+                "hidden_meme_id": hidden_meme_id,
+                "hidden_file_id": hidden_file_id,
+            },
+        )
+        await connection.execute(
+            text(
+                """
+                INSERT INTO meme_files (
+                    id, meme_id, status, s3_original_key, sha256_hex, quality_score,
+                    created_at, updated_at
+                ) VALUES
+                    (
+                        :crawler_file_id, :crawler_meme_id, 'processing',
+                        'legacy/crawler-ready.jpg', :crawler_sha, 1.0, now(), now()
+                    ),
+                    (
+                        :hidden_file_id, :hidden_meme_id, 'processing',
+                        'legacy/crawler-hidden.jpg', :hidden_sha, 1.0, now(), now()
+                    )
+                """
+            ),
+            {
+                "crawler_file_id": crawler_file_id,
+                "crawler_meme_id": crawler_meme_id,
+                "crawler_sha": "5" * 64,
+                "hidden_file_id": hidden_file_id,
+                "hidden_meme_id": hidden_meme_id,
+                "hidden_sha": "6" * 64,
+            },
+        )
+        await connection.execute(
+            text(
+                """
+                INSERT INTO meme_sources (
+                    id, file_id, platform, source_id, post_id, source_kind,
+                    uploader_user_id, is_first_source, source_alive, created_at, updated_at
+                ) VALUES
+                    (
+                        :crawler_source_id, :crawler_file_id, 'telegram', 'legacy-public', '1',
+                        'public_crawler', NULL, true, true, now(), now()
+                    ),
+                    (
+                        :hidden_source_id, :hidden_file_id, 'telegram', 'legacy-hidden', '2',
+                        'public_crawler', NULL, true, true, now(), now()
+                    )
+                """
+            ),
+            {
+                "crawler_source_id": uuid.uuid7(),
+                "crawler_file_id": crawler_file_id,
+                "hidden_source_id": uuid.uuid7(),
+                "hidden_file_id": hidden_file_id,
+            },
+        )
+        await connection.execute(
+            text(
+                """
+                INSERT INTO pipeline_stage_journal (
+                    id, meme_file_id, stage, status, attempt_count, last_event_id,
+                    is_retryable, started_at, finished_at, created_at, updated_at
+                ) VALUES
+                    (
+                        :crawler_stage_id, :crawler_file_id, 'classify', 'succeeded', 1, NULL,
+                        false, now(), now(), now(), now()
+                    ),
+                    (
+                        :hidden_stage_id, :hidden_file_id, 'classify', 'succeeded', 1, NULL,
+                        false, now(), now(), now(), now()
+                    )
+                """
+            ),
+            {
+                "crawler_stage_id": uuid.uuid7(),
+                "crawler_file_id": crawler_file_id,
+                "hidden_stage_id": uuid.uuid7(),
+                "hidden_file_id": hidden_file_id,
+            },
+        )
+        await connection.execute(
+            text(
+                """
+                INSERT INTO moderation_decisions (
+                    id, meme_id, action, reason,
+                    previous_is_public, previous_visibility_mode, previous_is_nsfw,
+                    new_is_public, new_visibility_mode, new_is_nsfw, created_at
+                ) VALUES (
+                    :decision_id, :hidden_meme_id, 'hide', 'other',
+                    true, 'auto', false, false, 'force_private', false, now()
+                )
+                """
+            ),
+            {"decision_id": uuid.uuid7(), "hidden_meme_id": hidden_meme_id},
+        )
+
+    await _run_alembic_command(command.upgrade, config, "0033")
+
+    async with engine.connect() as connection:
+        rows = (
+            await connection.execute(
+                text(
+                    """
+                    SELECT meme.id, meme.visibility_mode, meme.is_public, file.status
+                    FROM memes AS meme
+                    JOIN meme_files AS file ON file.id = meme.primary_file_id
+                    ORDER BY meme.id
+                    """
+                )
+            )
+        ).all()
+
+    repaired = {row.id: (row.visibility_mode, row.is_public, row.status) for row in rows}
+    assert repaired[crawler_meme_id] == ("auto", True, "ready")
+    assert repaired[hidden_meme_id] == ("force_private", False, "ready")

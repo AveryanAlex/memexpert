@@ -118,6 +118,7 @@ SYNC_STAGE_BY_TARGET: dict[SyncTargetKind, ContentPipelineStage] = {
     SyncTargetKind.QDRANT: ContentPipelineStage.SYNC_QDRANT,
     SyncTargetKind.MEILISEARCH: ContentPipelineStage.SYNC_MEILI,
 }
+SYNC_STAGES: frozenset[ContentPipelineStage] = frozenset(SYNC_STAGE_BY_TARGET.values())
 
 # Dispatch event emitted after a successful per-target sync commit. Keeping
 # the mapping here lets the service express the Qdrant/Meilisearch success
@@ -161,5 +162,6 @@ __all__ = [
     "SYNC_MALFORMED_REASON_BY_TARGET",
     "SYNC_REPLAY_BATCH_MAX",
     "SYNC_STAGE_BY_TARGET",
+    "SYNC_STAGES",
     "SYNC_SUCCESS_EVENT_TYPE_BY_TARGET",
 ]

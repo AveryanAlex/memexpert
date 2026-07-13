@@ -980,6 +980,37 @@ async def test_complete_classify_stage_makes_meme_ready_with_truthful_ocr_and_ns
     assert persisted_meme.language is ContentLanguage.EN
 
 
+@pytest.mark.parametrize(
+    "stage",
+    [ContentPipelineStage.SYNC_QDRANT, ContentPipelineStage.SYNC_MEILI],
+)
+async def test_starting_sync_stage_preserves_classified_file_readiness(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    stage: ContentPipelineStage,
+) -> None:
+    meme_file_id, service = await _drive_to_classify_succeeded(
+        migrated_db_session,
+        source_id=f"{stage.value}-ready",
+        post_id=f"ready-{stage.value}",
+        phash_tag="r",
+        input_hash_seed="r",
+    )
+
+    await service.mark_stage_processing(
+        meme_file_id=meme_file_id,
+        stage=stage,
+        attempt=1,
+        event_id=uuid.uuid7(),
+    )
+
+    async with postgres_session_factory() as session:
+        persisted_file = await session.scalar(select(MemeFile).where(MemeFile.id == meme_file_id))
+
+    assert persisted_file is not None
+    assert persisted_file.status is ContentProcessingStatus.READY
+
+
 async def test_complete_classify_stage_does_not_clear_existing_nsfw_true(
     migrated_db_session: AsyncSession,
     postgres_session_factory: async_sessionmaker[AsyncSession],
@@ -1515,6 +1546,10 @@ async def test_fail_sync_qdrant_stage_preserves_prior_success_timestamps(
     assert failure.last_success_at == first_success_at
     assert failure.last_preview is not None
     assert failure.last_preview.preview_fields["marker"] == "first"
+    async with postgres_session_factory() as session:
+        persisted_file = await session.scalar(select(MemeFile).where(MemeFile.id == meme_file_id))
+    assert persisted_file is not None
+    assert persisted_file.status is ContentProcessingStatus.READY
 
 
 async def test_replay_sync_target_qdrant_leaves_meili_row_untouched(
@@ -1690,6 +1725,10 @@ async def test_fail_sync_meili_stage_preserves_prior_success_timestamps(
     assert failure.last_success_at == first_success_at
     assert failure.last_preview is not None
     assert failure.last_preview.preview_fields["marker"] == "first-meili"
+    async with postgres_session_factory() as session:
+        persisted_file = await session.scalar(select(MemeFile).where(MemeFile.id == meme_file_id))
+    assert persisted_file is not None
+    assert persisted_file.status is ContentProcessingStatus.READY
 
 
 async def test_replay_sync_target_meili_leaves_qdrant_row_byte_identical(

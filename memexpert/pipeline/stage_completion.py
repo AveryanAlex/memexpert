@@ -76,7 +76,8 @@ class PipelineStageCompletionService(PipelineDispatchingService):
         stage_entry.retry_after = None
         stage_entry.started_at = started_at
         stage_entry.finished_at = None
-        meme_file.status = ContentProcessingStatus.PROCESSING
+        if stage not in _consts.SYNC_STAGES:
+            meme_file.status = ContentProcessingStatus.PROCESSING
 
         await self._commit_stage_mutation("Failed to persist running stage state.")
         return PipelineStageWorkContext(
@@ -448,7 +449,8 @@ class PipelineStageCompletionService(PipelineDispatchingService):
         )
         stage_entry.started_at = stage_entry.started_at or failed_at
         stage_entry.finished_at = failed_at
-        meme_file.status = ContentProcessingStatus.FAILED
+        if stage not in _consts.SYNC_STAGES:
+            meme_file.status = ContentProcessingStatus.FAILED
 
         await self._commit_stage_mutation("Failed to persist failed stage state.")
 
@@ -500,7 +502,7 @@ class PipelineStageCompletionService(PipelineDispatchingService):
         )
         if stage is ContentPipelineStage.CLASSIFY:
             meme_file.status = ContentProcessingStatus.READY
-        elif stage not in {ContentPipelineStage.SYNC_QDRANT, ContentPipelineStage.SYNC_MEILI}:
+        elif stage not in _consts.SYNC_STAGES:
             meme_file.status = ContentProcessingStatus.PROCESSING
 
         outbox_message_ids = []

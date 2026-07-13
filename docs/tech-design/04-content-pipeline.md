@@ -220,6 +220,13 @@ After the embed stage computes a file embedding, semantic merge may query Qdrant
 
 The ownership/provenance migration is deliberately staged. Apply `0031`, keep ingestion paused for the final pass, and run `uv run memexpert-reconcile-sha-duplicates` until `--verify-only` succeeds. Each SHA group commits independently and transfers sources, nonduplicate files, collections, pins, moderation/SEO/pipeline/cache/history rows; visibility conflicts resolve `force_private` over `force_public` over `auto`, and likes are recomputed from distinct Favorites owners. Only then apply `0032`, remove unreferenced obsolete S3 objects from merge-log details, purge stale point/document IDs, and fully rebuild Qdrant and Meilisearch.
 
+Classify success is the item-level readiness boundary. Qdrant and Meilisearch
+sync start, success, failure, and replay update their own stage/snapshot truth
+without demoting a ready `MemeFile`; either target may lag while the database
+catalog remains available. Revision `0033` repairs historical post-classify
+files left in `processing`/`failed` by sync work and restores unmoderated legacy
+public-crawler rows to automatic public visibility.
+
 ### Admin Merge
 
 When admins merge memes manually, the request transaction moves database
