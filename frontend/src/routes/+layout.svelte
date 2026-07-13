@@ -1,6 +1,7 @@
 <script lang="ts">
   import '../app.css';
   import { page } from '$app/state';
+  import { provideAuthState } from '$lib/auth-state';
   import AppShell from '$lib/features/app-shell/AppShell.svelte';
   import TelegramLoginModal from '$lib/features/auth/TelegramLoginModal.svelte';
   import TelegramMiniAppBootstrap from '$lib/TelegramMiniAppBootstrap.svelte';
@@ -12,7 +13,15 @@
   let { data, children }: { data: LayoutData; children: Snippet } = $props();
   let loginOpen = $state(false);
 
-  provideViewerCapabilities(() => viewerCapabilitiesFromSession(data.session ?? null));
+  const authState = provideAuthState(() => ({ session: data.session ?? null, sessionError: data.sessionError }));
+  const session = $derived($authState.session);
+  const sessionError = $derived($authState.sessionError);
+
+  $effect(() => {
+    authState.syncFromServer({ session: data.session ?? null, sessionError: data.sessionError });
+  });
+
+  provideViewerCapabilities(() => viewerCapabilitiesFromSession(session));
 </script>
 
 <svelte:head>
@@ -23,8 +32,8 @@
 <TelegramMiniAppBootstrap />
 
 <TooltipProvider delayDuration={500}>
-  <AppShell session={data.session} sessionError={data.sessionError} currentPath={page.url.pathname} onLoginClick={() => (loginOpen = true)}>
+  <AppShell {session} {sessionError} currentPath={page.url.pathname} onLoginClick={() => (loginOpen = true)}>
     {@render children()}
   </AppShell>
-  <TelegramLoginModal bind:open={loginOpen} session={data.session} />
+  <TelegramLoginModal bind:open={loginOpen} />
 </TooltipProvider>

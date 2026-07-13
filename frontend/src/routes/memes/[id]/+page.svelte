@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { readAuthState } from '$lib/auth-state';
   import MemeActionMenu from '$lib/features/memes/MemeActionMenu.svelte';
   import MemeGrid from '$lib/features/memes/MemeGrid.svelte';
   import MemeMedia from '$lib/features/memes/MemeMedia.svelte';
@@ -8,6 +9,9 @@
   import type { ActionData, PageData } from './$types';
 
   let { data, form }: { data: PageData; form: ActionData } = $props();
+
+  const authState = readAuthState(() => ({ session: data.session ?? null, sessionError: data.sessionError }));
+  const session = $derived($authState.session);
 
   const returnTo = $derived(data.meme ? `/memes/${data.meme.seo_page_slug ?? data.meme.id}` : '/');
   const detail = $derived(data.meme ? buildMemeDetailView(data.meme) : null);
@@ -21,7 +25,7 @@
   }
 
   function handleFavoriteChange(favorited: boolean) {
-    showGuestFavoritePrompt = favorited && data.session?.user.account_type !== 'full';
+    showGuestFavoritePrompt = favorited && session?.user.account_type !== 'full';
   }
 
 </script>
@@ -131,7 +135,7 @@
     </div>
 
     {#if related.memes.length > 0}
-      <MemeGrid memes={related.memes} attributions={related.attributions} label="Discovery memes" showAccessMarkers={Boolean(data.session)} />
+      <MemeGrid memes={related.memes} attributions={related.attributions} label="Discovery memes" showAccessMarkers={Boolean(session)} />
     {:else}
       <p class="m-0 text-muted">More memes will appear here soon.</p>
     {/if}

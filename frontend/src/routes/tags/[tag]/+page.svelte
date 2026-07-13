@@ -1,10 +1,14 @@
 <script lang="ts">
+  import { readAuthState } from '$lib/auth-state';
   import MemeGrid from '$lib/features/memes/MemeGrid.svelte';
   import TrendAggregateHistory from '$lib/features/trends/TrendAggregateHistory.svelte';
   import { ActionLink, Badge, EmptyState, PageHeader } from '$lib/ui';
   import type { PageData } from './$types';
 
   let { data }: { data: PageData } = $props();
+
+  const authState = readAuthState(() => ({ session: data.session ?? null, sessionError: data.sessionError }));
+  const session = $derived($authState.session);
 
   const page = $derived(data.landing?.page);
   const resultStart = $derived(page && page.total > 0 ? data.offset + 1 : 0);
@@ -29,7 +33,7 @@
   </div>
 
   {#if page.items.length > 0}
-    <MemeGrid {memes} {attributions} label="Tagged memes" showAccessMarkers={Boolean(data.session)} />
+    <MemeGrid {memes} {attributions} label="Tagged memes" showAccessMarkers={Boolean(session)} />
   {:else}
     <EmptyState title="Nothing here yet" message="Try another tag or discover more memes.">
       <ActionLink href="/">Discover memes</ActionLink>

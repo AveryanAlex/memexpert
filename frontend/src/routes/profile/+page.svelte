@@ -2,11 +2,16 @@
   import { invalidateAll } from '$app/navigation';
   import { ApiError, updateUserPreferences } from '$lib/api/client';
   import type { UserLanguage } from '$lib/api/types';
+  import { readAuthState } from '$lib/auth-state';
   import { profileCapabilities, profileStats } from '$lib/profile/view-model';
   import { ActionLink, Badge, Button, Card, Notice, Select } from '$lib/ui';
   import type { PageData } from './$types';
 
   let { data }: { data: PageData } = $props();
+
+  const authState = readAuthState(() => ({ session: data.session ?? null, sessionError: data.sessionError }));
+  const session = $derived($authState.session);
+  const sessionError = $derived($authState.sessionError);
 
   let nsfwPending = $state(false);
   let nsfwMessage = $state<string | null>(null);
@@ -20,19 +25,19 @@
     { value: 'ru', label: 'Russian' }
   ];
 
-  const capabilities = $derived(profileCapabilities(data.session ?? null));
+  const capabilities = $derived(profileCapabilities(session));
   const stats = $derived(profileStats(data.profileStats));
   const accountLabel = $derived(
-    data.session
-      ? data.session.user.account_type === 'full'
+    session
+      ? session.user.account_type === 'full'
         ? 'Connected account'
         : 'Guest account'
       : 'Account unavailable'
   );
-  const telegramConnected = $derived(Boolean(data.session?.linked_providers.telegram_linked));
+  const telegramConnected = $derived(Boolean(session?.linked_providers.telegram_linked));
 
   $effect(() => {
-    selectedLanguage = data.session?.user.language ?? 'any';
+    selectedLanguage = session?.user.language ?? 'any';
   });
 
   async function disableNsfw() {
@@ -40,7 +45,8 @@
     nsfwMessage = null;
 
     try {
-      await updateUserPreferences({ fetch, body: { nsfw_enabled: false } });
+      const user = await updateUserPreferences({ fetch, body: { nsfw_enabled: false } });
+      authState.updateUser(user);
       nsfwMessage = 'Sensitive content is hidden again.';
       await invalidateAll();
     } catch (error) {
@@ -53,25 +59,27 @@
   async function changeLanguage(event: Event) {
     const nextLanguage = (event.currentTarget as HTMLSelectElement).value;
     if (!isUserLanguage(nextLanguage)) {
-      selectedLanguage = data.session?.user.language ?? 'any';
+      selectedLanguage = session?.user.language ?? 'any';
       return;
     }
 
-    if (!data.session || nextLanguage === data.session.user.language) {
+    if (!session || nextLanguage === session.user.language) {
       selectedLanguage = nextLanguage;
       return;
     }
 
+    const previousLanguage = session.user.language;
     languagePending = true;
     languageMessage = null;
     selectedLanguage = nextLanguage;
 
     try {
-      await updateUserPreferences({ fetch, body: { language: nextLanguage } });
+      const user = await updateUserPreferences({ fetch, body: { language: nextLanguage } });
+      authState.updateUser(user);
       languageMessage = `Language preference updated to ${languageOptionLabel(nextLanguage)}.`;
       await invalidateAll();
     } catch (error) {
-      selectedLanguage = data.session.user.language;
+      selectedLanguage = previousLanguage;
       languageMessage = error instanceof ApiError || error instanceof Error ? error.message : 'Could not update language preference.';
     } finally {
       languagePending = false;
@@ -106,8 +114,8 @@
         <Badge>Not connected</Badge>
       {/if}
     </div>
-    {#if data.sessionError}
-      <p class="m-0 text-sm text-muted" role="status">{data.sessionError}</p>
+    {#if sessionError}
+      <p class="m-0 text-sm text-muted" role="status">{sessionError}</p>
     {:else if telegramConnected}
       <p class="m-0 text-sm text-muted">Telegram is connected for cross-device access.</p>
     {:else if capabilities.showConnectTelegram}
@@ -131,7 +139,7 @@
       <p class="m-0 mb-3 text-sm text-muted">Choose the account language used by account-aware surfaces when supported.</p>
       <label class="grid max-w-[420px] gap-2 font-extrabold text-chiptext">
         <span>Profile language</span>
-        <Select bind:value={selectedLanguage} onchange={changeLanguage} disabled={!data.session || languagePending}>
+        <Select bind:value={selectedLanguage} onchange={changeLanguage} disabled={!session || languagePending}>
           {#each LANGUAGE_OPTIONS as option}
             <option value={option.value}>{option.label}</option>
           {/each}
@@ -144,7 +152,7 @@
 
     <div class="rounded-xl border border-line bg-soft/50 p-4">
       <p class="m-0 font-black">Sensitive content</p>
-      {#if data.session?.user.nsfw_enabled}
+      {#if session?.user.nsfw_enabled}
         <p class="m-0 mt-1 text-sm text-muted">Sensitive content is enabled.</p>
         <p class="m-0 mb-3 text-sm text-muted">Turn it off to filter sensitive memes from discovery again.</p>
         <Button type="button" variant="secondary" size="compact" onclick={disableNsfw} disabled={nsfwPending}>{nsfwPending ? 'Saving...' : 'Turn off sensitive content'}</Button>

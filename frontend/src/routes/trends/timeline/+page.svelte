@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { readAuthState } from '$lib/auth-state';
   import MemeCard from '$lib/features/memes/MemeCard.svelte';
   import type { PublicTrendTimelineMemeRead } from '$lib/api/types';
   import { trendTimelineHref } from '$lib/features/trends/params';
@@ -6,6 +7,9 @@
   import type { PageData } from './$types';
 
   let { data }: { data: PageData } = $props();
+
+  const authState = readAuthState(() => ({ session: data.session ?? null, sessionError: data.sessionError }));
+  const session = $derived($authState.session);
 
   const previousOffset = $derived(Math.max(data.offset - data.timeline.limit, 0));
   const nextOffset = $derived(data.offset + data.timeline.limit);
@@ -90,7 +94,7 @@
           <div class="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
             {#each period.top_memes as item (`${period.period}:${item.meme.id}`)}
               <div class="grid gap-3 rounded-xl border border-line bg-cream/60 p-3">
-                <MemeCard meme={item.meme} showAccessMarkers={Boolean(data.session)} />
+                <MemeCard meme={item.meme} showAccessMarkers={Boolean(session)} />
                 <div class="grid gap-1 text-sm">
                   <p class="m-0 font-semibold text-ink">Recorded activity · {activitySummary(item)}</p>
                   <p class="m-0 text-muted">{activityBreakdown(item)}</p>

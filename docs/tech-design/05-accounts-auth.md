@@ -44,8 +44,8 @@ Auth logic lives in the service layer, used by both FastAPI and the aiogram bot 
 **HTTP clients** (browser, SvelteKit SSR, Mini App, future mobile) — authenticate via FastAPI:
 
 1. **Browser:** HttpOnly access/session cookie. If no valid cookie exists, `/api/v1/auth/session/current` can bootstrap a guest session.
-2. **SvelteKit SSR:** server load/hooks forward the cookie to FastAPI calls. No durable auth state is owned by SvelteKit.
-3. **Mini App:** frontend conditionally loads Telegram's `telegram-web-app.js` only when Telegram launch params are present, reads `window.Telegram.WebApp.initData` (falling back to the signed `tgWebAppData` launch parameter when the host script is unavailable), posts it to `/api/v1/auth/telegram-miniapp`, receives the same cookie-backed session, then uses normal routes.
+2. **SvelteKit SSR:** server load/hooks forward the cookie to FastAPI calls. The root layout seeds a context-scoped Svelte auth store from the current-session load so account-aware UI has one reactive projection; each SSR request/layout instance is isolated, the store contains no token, and it is resynchronized from server load data after navigation or invalidation. No durable auth state is owned by SvelteKit.
+3. **Mini App:** frontend conditionally loads Telegram's `telegram-web-app.js` only when Telegram launch params are present, reads `window.Telegram.WebApp.initData` (falling back to the signed `tgWebAppData` launch parameter when the host script is unavailable), posts it to `/api/v1/auth/telegram-miniapp`, receives the same cookie-backed session, publishes the refreshed current-session projection to the root auth store, then invalidates normal route data.
 4. **Future mobile:** may reuse the same provider exchange endpoints, but token transport can be revisited for non-cookie clients.
 
 **Telegram bot** — authenticates via service layer directly. The bot identifies users by `telegram_id` from the Telegram update object (already verified by Telegram). No JWT needed — the bot process is trusted and calls auth/user services to resolve or create the full account.
@@ -63,6 +63,8 @@ Linking flows:
 - **Web → Telegram:** "Link Telegram" button → deep link `t.me/memexpertbot?start=link_{code}` → merge → return to `/account/telegram/complete`, where the normal session load self-heals the cookie and redirects linked sessions onward
 - **Web → Google/Email:** OAuth / email sign-in → upgrade or merge
 - **Mini App:** validate `initData` HMAC → lookup/create by `telegram_id`
+
+Browser auth and account-preference mutations publish their returned current-session or user projection to the context-scoped auth store before route invalidation. A short reconciliation window prevents an immediately lagging layout response from overwriting that browser-confirmed projection; a matching or newer server snapshot resumes normal server authority. This keeps the application shell, viewer capabilities, and account-aware controls consistent without waiting for a full document reload; FastAPI plus the HttpOnly cookie remain authoritative.
 
 Account splitting is not supported.
 

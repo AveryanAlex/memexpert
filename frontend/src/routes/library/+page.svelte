@@ -1,5 +1,7 @@
 <script lang="ts">
   import { invalidateAll } from '$app/navigation';
+  import { readAuthState } from '$lib/auth-state';
+  import type { UserRead } from '$lib/api/types';
   import { bulkCollectionOptions, bulkGuidanceFromSessionAndCollections } from '$lib/features/memes/bulk-view-model';
   import MemeGrid from '$lib/features/memes/MemeGrid.svelte';
   import LibrarySection from '$lib/features/profile/LibrarySection.svelte';
@@ -16,6 +18,9 @@
 
   let { data, form }: { data: PageData; form?: ActionData } = $props();
 
+  const authState = readAuthState(() => ({ session: data.session ?? null, sessionError: data.sessionError }));
+  const session = $derived($authState.session);
+
   let selectedCollectionId = $state('');
   let selectorPending = $state(false);
   let selectorMessage = $state<string | null>(null);
@@ -23,11 +28,11 @@
   let pinOrderPending = $state(false);
   let pinOrderMessage = $state<string | null>(null);
 
-  const capabilities = $derived(profileCapabilities(data.session ?? null));
+  const capabilities = $derived(profileCapabilities(session));
   const collectionOptions = $derived(writableCollectionOptions(data.library));
   const bulkOptions = $derived(bulkCollectionOptions(data.library?.collections));
   const hasMultipleCollections = $derived(collectionOptions.length > 1);
-  const bulkGuidance = $derived(bulkGuidanceFromSessionAndCollections(data.session ?? null, bulkOptions));
+  const bulkGuidance = $derived(bulkGuidanceFromSessionAndCollections(session, bulkOptions));
   const libraryPinIds = $derived(data.library?.pinned_memes.map((meme) => meme.id) ?? []);
   const orderedPinnedMemes = $derived(orderPinnedMemesByIds(data.library?.pinned_memes ?? [], pinOrderIds));
 
@@ -63,6 +68,7 @@
         throw new Error(typeof payload?.detail === 'string' ? payload.detail : 'Could not update active collection.');
       }
 
+      authState.updateUser((await response.json()) as UserRead);
       selectorMessage = 'Active save collection updated.';
       await invalidateAll();
     } catch (error) {
@@ -122,7 +128,7 @@
   </nav>
 </section>
 
-{#if data.session?.user.account_type === 'full'}
+{#if session?.user.account_type === 'full'}
   <details class="my-4 rounded-xl border border-line bg-paper" open={Boolean(form?.collectionError || form?.collectionCreatedId)}>
     <summary class="cursor-pointer px-5 py-4 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent">
       <span class="font-black">New collection</span>
@@ -179,7 +185,7 @@
       </Select>
     </label>
     {#if !hasMultipleCollections}
-      <p class="m-0 text-sm text-muted">{data.session?.user.account_type === 'full' ? 'Create more collections later to switch destinations.' : 'Guests save into Favorites.'}</p>
+      <p class="m-0 text-sm text-muted">{session?.user.account_type === 'full' ? 'Create more collections later to switch destinations.' : 'Guests save into Favorites.'}</p>
     {/if}
     {#if selectorMessage}
       <p class="m-0 text-sm text-muted" role="status">{selectorMessage}</p>
@@ -221,10 +227,10 @@
           memes={data.library.favorites}
           label="Favorite memes"
           bulk={{ enabled: true, saveEnabled: true, collectionOptions: bulkOptions, guidance: bulkGuidance }}
-          showAccessMarkers={Boolean(data.session)}
+          showAccessMarkers={Boolean(session)}
         />
       {:else}
-        <EmptyState title="No favorites yet" message={libraryEmptyText('favorites', data.session ?? null)}>
+        <EmptyState title="No favorites yet" message={libraryEmptyText('favorites', session)}>
           <ActionLink size="compact" variant="secondary" href="/">Browse memes</ActionLink>
         </EmptyState>
       {/if}
@@ -269,10 +275,10 @@
           memes={orderedPinnedMemes}
           label="Pinned memes"
           bulk={{ enabled: true, saveEnabled: true, collectionOptions: bulkOptions, guidance: bulkGuidance }}
-          showAccessMarkers={Boolean(data.session)}
+          showAccessMarkers={Boolean(session)}
         />
       {:else}
-        <EmptyState title="No pins yet" message={libraryEmptyText('pins', data.session ?? null)}>
+        <EmptyState title="No pins yet" message={libraryEmptyText('pins', session)}>
           {#if capabilities.showConnectTelegram}
             <ActionLink size="compact" href="/account/telegram?returnTo=/library">Connect Telegram</ActionLink>
           {/if}

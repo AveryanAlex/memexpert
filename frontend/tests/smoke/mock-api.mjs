@@ -330,6 +330,9 @@ const adminSourceSeed = [
   }
 ];
 const adminSourceStateBySession = new Map();
+const loginAttemptPolls = new Map();
+const staleFullSessionReads = new Set();
+let loginAttemptSequence = 0;
 
 const adminSourcePosts = [
   {
@@ -590,12 +593,48 @@ const server = createServer((request, response) => {
       sendJson(response, 200, sessionPayload('admin'));
       return;
     }
+    const token = accessToken(request);
+    // Reproduce a lagging layout refresh once; the client store must retain the session already confirmed by polling.
+    if (token?.startsWith('modal-full-') && staleFullSessionReads.delete(token)) {
+      sendJson(response, 200, sessionPayload('guest'));
+      return;
+    }
     if (hasFullAccess(request)) {
       sendJson(response, 200, sessionPayload('full'));
       return;
     }
+    const loginAttempt = cookieValue(request, 'smoke_login_attempt');
+    if (loginAttempt && loginAttemptPolls.has(loginAttempt)) {
+      const pollCount = (loginAttemptPolls.get(loginAttempt) ?? 0) + 1;
+      loginAttemptPolls.set(loginAttempt, pollCount);
+      if (pollCount >= 2) {
+        const accessToken = `modal-full-${loginAttempt}`;
+        staleFullSessionReads.add(accessToken);
+        sendJson(response, 200, sessionPayload('full'), {
+          'set-cookie': `memexpert_access_token=${accessToken}; Path=/; HttpOnly; SameSite=Lax`
+        });
+      } else {
+        sendJson(response, 200, sessionPayload('guest'));
+      }
+      return;
+    }
 
     sendJson(response, 401, { detail: 'Smoke test runs as a guest browser.' });
+    return;
+  }
+
+  if (url.pathname === '/api/v1/auth/link/telegram' && request.method === 'POST') {
+    const attempt = `modal-${++loginAttemptSequence}`;
+    loginAttemptPolls.set(attempt, 0);
+    sendJson(response, 200, {
+      code: attempt,
+      deep_link_url: `https://t.me/memexpertbot?start=link_${attempt}`,
+      expires_at: '2099-12-31T23:59:59Z',
+      expires_in_seconds: 600,
+      return_url: '/account/telegram/complete'
+    }, {
+      'set-cookie': `smoke_login_attempt=${attempt}; Path=/; HttpOnly; SameSite=Lax`
+    });
     return;
   }
 
@@ -1005,7 +1044,8 @@ function readRequestJson(request) {
 }
 
 function hasFullAccess(request) {
-  return accessToken(request) === 'miniapp-full' || hasAdminAccess(request);
+  const token = accessToken(request);
+  return token === 'miniapp-full' || token?.startsWith('modal-full-') || hasAdminAccess(request);
 }
 
 function hasAdminAccess(request) {
@@ -1021,9 +1061,13 @@ function adminSessionKey(request) {
 }
 
 function accessToken(request) {
+  return cookieValue(request, 'memexpert_access_token');
+}
+
+function cookieValue(request, name) {
   for (const pair of (request.headers.cookie ?? '').split(';')) {
     const separator = pair.indexOf('=');
-    if (separator < 0 || pair.slice(0, separator).trim() !== 'memexpert_access_token') continue;
+    if (separator < 0 || pair.slice(0, separator).trim() !== name) continue;
     return pair.slice(separator + 1).trim();
   }
   return null;

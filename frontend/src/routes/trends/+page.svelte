@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { readAuthState } from '$lib/auth-state';
   import MemeCard from '$lib/features/memes/MemeCard.svelte';
   import TrendSummary from '$lib/features/trends/TrendSummary.svelte';
   import type { PublicTrendMetricsRead, PublicTrendSummaryRead } from '$lib/api/types';
@@ -6,6 +7,9 @@
   import type { PageData } from './$types';
 
   let { data }: { data: PageData } = $props();
+
+  const authState = readAuthState(() => ({ session: data.session ?? null, sessionError: data.sessionError }));
+  const session = $derived($authState.session);
 
   const resultStart = $derived(data.page.total === 0 ? 0 : data.offset + 1);
   const resultEnd = $derived(Math.min(data.offset + data.page.items.length, data.page.total));
@@ -101,7 +105,7 @@
           <span class="rounded-full bg-soft px-3 py-1.5 text-sm font-extrabold text-ink">{rankingLabel}</span>
           <span class="text-sm font-semibold text-muted">#{data.offset + index + 1}</span>
         </div>
-        <MemeCard meme={item.meme} attribution={item.attribution} showAccessMarkers={Boolean(data.session)} />
+        <MemeCard meme={item.meme} attribution={item.attribution} showAccessMarkers={Boolean(session)} />
         <TrendSummary trend={item.trend} />
       </Card>
     {/each}

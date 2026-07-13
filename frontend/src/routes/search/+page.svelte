@@ -1,5 +1,6 @@
 <script lang="ts">
   import { navigating } from '$app/state';
+  import { readAuthState } from '$lib/auth-state';
   import type { MemeSearchScope } from '$lib/api/types';
   import { bulkGuidanceFromSessionAndCollections, collectionListBulkOptions } from '$lib/features/memes/bulk-view-model';
   import InfiniteMemeFeed from '$lib/features/memes/InfiniteMemeFeed.svelte';
@@ -10,8 +11,11 @@
 
   let { data }: { data: PageData } = $props();
 
+  const authState = readAuthState(() => ({ session: data.session ?? null, sessionError: data.sessionError }));
+  const session = $derived($authState.session);
+
   const bulkOptions = $derived(collectionListBulkOptions(data.collections));
-  const bulkGuidance = $derived(bulkGuidanceFromSessionAndCollections(data.session ?? null, bulkOptions));
+  const bulkGuidance = $derived(bulkGuidanceFromSessionAndCollections(session, bulkOptions));
   const loadingSearch = $derived(navigating.to?.url.pathname === '/search');
   const hasActiveSearchFilters = $derived(
     data.filters.tags.length > 0 ||
@@ -43,7 +47,7 @@
   </div>
   <SearchFilters
     filters={data.filters}
-    session={data.session ?? null}
+    {session}
     collections={data.collections}
     collectionErrorMessage={data.collectionErrorMessage}
   />
@@ -71,7 +75,7 @@
   layout="ordered"
   emptyMessage="Try a shorter phrase, remove a tag, or broaden media and language filters."
   bulk={{ enabled: true, saveEnabled: true, collectionOptions: bulkOptions, guidance: bulkGuidance }}
-  showAccessMarkers={Boolean(data.session)}
+  showAccessMarkers={Boolean(session)}
 >
   {#snippet summary()}
     {#if data.filters.query}
