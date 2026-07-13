@@ -315,7 +315,7 @@
         {#each column.items as meme (meme.id)}
           {@const attribution = attributions[meme.id]}
           <div
-            class="relative"
+            class="relative min-w-0 max-w-full"
             role="presentation"
             data-discovery-source={attribution?.source_algorithm ?? undefined}
             data-discovery-reason={attribution?.reason ?? undefined}

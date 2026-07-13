@@ -54,6 +54,19 @@ test.describe('public masonry feed smoke', () => {
     await loadMore.click();
     await expect(page.getByRole('link', { name: 'Open Smoke test deploy mood' })).toBeVisible();
     await expect(page.getByText('Showing 2 of 2')).toBeVisible();
+
+    const cardsFitTheirColumns = await feed.evaluate((element) => {
+      const tolerance = 1;
+      return Array.from(element.children).every((column) => {
+        const columnBox = column.getBoundingClientRect();
+        return Array.from(column.querySelectorAll(':scope > div > article')).every((card) => {
+          const cardBox = card.getBoundingClientRect();
+          return cardBox.left >= columnBox.left - tolerance && cardBox.right <= columnBox.right + tolerance;
+        });
+      });
+    });
+    expect(cardsFitTheirColumns).toBe(true);
+    await expect(page.locator('html')).toHaveJSProperty('scrollWidth', 1280);
   });
 
   test('mobile viewport exposes the feed without layout breakage', async ({ page }) => {

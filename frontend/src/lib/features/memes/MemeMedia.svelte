@@ -18,14 +18,18 @@
   const title = $derived(memeTitle(meme));
   const feedPreview = $derived(preview && !detail);
   const previewAspectRatio = $derived(feedPreview && media.hasMedia ? selectFeedPreviewAspectRatio(file) : null);
-  const mediaClass = $derived(detail || feedPreview ? 'block size-full min-h-[inherit] object-contain' : 'block size-full min-h-[inherit] object-cover');
+  const mediaClass = $derived(
+    detail || feedPreview
+      ? 'block size-full min-w-0 max-w-full min-h-[inherit] object-contain'
+      : 'block size-full min-w-0 max-w-full min-h-[inherit] object-cover'
+  );
   const imageLoading = $derived(selectImageLoading(detail));
   const mediaPreload = $derived(selectMediaPreload(detail));
 </script>
 
 <div
   class={[
-    'relative grid place-items-center overflow-hidden bg-[radial-gradient(circle_at_top_left,rgb(255_118_74_/_35%),transparent_35%),linear-gradient(135deg,#252f43,#44516a)] font-black uppercase tracking-[0.16em] text-media-foreground',
+    'relative grid w-full min-w-0 max-w-full place-items-center overflow-hidden bg-[radial-gradient(circle_at_top_left,rgb(255_118_74_/_35%),transparent_35%),linear-gradient(135deg,#252f43,#44516a)] font-black uppercase tracking-[0.16em] text-media-foreground',
     detail ? 'min-h-[22.5rem] rounded-[22px]' : 'min-h-[9.5rem]',
     media.hasMedia ? 'bg-[#101725] p-0' : ''
   ].join(' ')}

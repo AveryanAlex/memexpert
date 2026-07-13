@@ -58,13 +58,13 @@
 
 <article
   bind:this={cardElement}
-  class="overflow-hidden rounded-xl border border-line bg-paper"
+  class="w-full min-w-0 max-w-full overflow-hidden rounded-xl border border-line bg-paper"
   role={position ? 'listitem' : undefined}
   aria-posinset={position}
   aria-setsize={total}
   aria-labelledby={titleId}
 >
-  <a class={cn('block text-inherit no-underline', focusRing)} {href} aria-label={`Open ${title}`} onclick={handleDetailClick}>
+  <a class={cn('block w-full min-w-0 max-w-full text-inherit no-underline', focusRing)} {href} aria-label={`Open ${title}`} onclick={handleDetailClick}>
     <MemeMedia {meme} preview />
     <div class="flex items-start justify-between gap-3 px-3 pb-3 pt-2.5">
       <p id={titleId} class="m-0 line-clamp-2 text-sm font-semibold leading-snug text-ink sm:text-base">{title}</p>

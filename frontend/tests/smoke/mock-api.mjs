@@ -66,7 +66,14 @@ const nextMeme = {
   tags: ['deploy', 'smoke'],
   primary_file: {
     ...meme.primary_file,
-    id: 'smoke-file-2'
+    id: 'smoke-file-2',
+    width: 4096,
+    height: 1024,
+    render: {
+      ...meme.primary_file.render,
+      width: 4096,
+      height: 1024
+    }
   }
 };
 
