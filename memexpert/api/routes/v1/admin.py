@@ -47,6 +47,7 @@ from memexpert.schemas.admin import (
     AdminSourceChannelUpdateRequest,
     AdminTelegramChannelFromReferenceRequest,
     AdminTelegramChannelGroupRead,
+    AdminTelegramLoginCancelRead,
     AdminTelegramLoginCompleteRead,
     AdminTelegramLoginPasswordRequest,
     AdminTelegramLoginPhoneCodeRequest,
@@ -54,6 +55,7 @@ from memexpert.schemas.admin import (
     AdminTelegramLoginPhoneStartRequest,
     AdminTelegramLoginQrCompleteRequest,
     AdminTelegramLoginQrStartRead,
+    AdminTelegramLoginQrStartRequest,
     AdminTelegramLoginQrStatusRead,
     AdminTelegramSessionActionRead,
     AdminTelegramSessionCreateRequest,
@@ -203,85 +205,107 @@ async def update_telegram_session(
 
 
 @router.post(
-    "/telegram/sessions/{session_id}/login/qr/start",
+    "/telegram/login-attempts/qr",
     response_model=AdminTelegramLoginQrStartRead,
-    summary="Start QR login for a Telegram session",
+    summary="Start a standalone Telegram QR login attempt",
 )
-async def start_telegram_session_qr_login(
+async def start_telegram_qr_login_attempt(
     admin_user: AdminUserDep,
     login_service: AdminTelegramLoginServiceDep,
-    session_id: Annotated[uuid.UUID, Path()],
+    request: Annotated[AdminTelegramLoginQrStartRequest | None, Body()] = None,
 ) -> AdminTelegramLoginQrStartRead:
     try:
-        return await login_service.start_qr_login(session_id, admin_user_id=admin_user.id)
+        return await login_service.start_qr_login(
+            request or AdminTelegramLoginQrStartRequest(),
+            admin_user_id=admin_user.id,
+        )
     except (AdminNotFoundError, AdminConflictError) as exc:
         raise _map_admin_error(exc) from exc
 
 
 @router.post(
-    "/telegram/sessions/{session_id}/login/qr/complete",
+    "/telegram/login-attempts/{attempt_id}/qr/complete",
     response_model=AdminTelegramLoginQrStatusRead,
-    summary="Poll QR login status for a Telegram session",
+    summary="Poll a standalone Telegram QR login attempt",
 )
-async def complete_telegram_session_qr_login(
+async def complete_telegram_qr_login_attempt(
     admin_user: AdminUserDep,
     login_service: AdminTelegramLoginServiceDep,
-    session_id: Annotated[uuid.UUID, Path()],
-    request: Annotated[AdminTelegramLoginQrCompleteRequest, Body()],
+    attempt_id: Annotated[uuid.UUID, Path()],
+    request: Annotated[AdminTelegramLoginQrCompleteRequest | None, Body()] = None,
 ) -> AdminTelegramLoginQrStatusRead:
     try:
-        return await login_service.complete_qr_login(session_id, request, admin_user_id=admin_user.id)
+        return await login_service.complete_qr_login(
+            attempt_id,
+            request or AdminTelegramLoginQrCompleteRequest(),
+            admin_user_id=admin_user.id,
+        )
     except (AdminNotFoundError, AdminConflictError) as exc:
         raise _map_admin_error(exc) from exc
 
 
 @router.post(
-    "/telegram/sessions/{session_id}/login/phone/start",
+    "/telegram/login-attempts/phone",
     response_model=AdminTelegramLoginPhoneStartRead,
-    summary="Send a Telegram phone login code for a session",
+    summary="Start a standalone Telegram phone login attempt",
 )
-async def start_telegram_session_phone_login(
+async def start_telegram_phone_login_attempt(
     admin_user: AdminUserDep,
     login_service: AdminTelegramLoginServiceDep,
-    session_id: Annotated[uuid.UUID, Path()],
     request: Annotated[AdminTelegramLoginPhoneStartRequest, Body()],
 ) -> AdminTelegramLoginPhoneStartRead:
     try:
-        return await login_service.start_phone_login(session_id, request, admin_user_id=admin_user.id)
+        return await login_service.start_phone_login(request, admin_user_id=admin_user.id)
     except (AdminNotFoundError, AdminConflictError) as exc:
         raise _map_admin_error(exc) from exc
 
 
 @router.post(
-    "/telegram/sessions/{session_id}/login/phone/code",
+    "/telegram/login-attempts/{attempt_id}/phone/code",
     response_model=AdminTelegramLoginCompleteRead,
-    summary="Complete Telegram phone login with code",
+    summary="Complete a standalone Telegram phone login with a code",
 )
-async def complete_telegram_session_phone_code_login(
+async def complete_telegram_phone_code_login_attempt(
     admin_user: AdminUserDep,
     login_service: AdminTelegramLoginServiceDep,
-    session_id: Annotated[uuid.UUID, Path()],
+    attempt_id: Annotated[uuid.UUID, Path()],
     request: Annotated[AdminTelegramLoginPhoneCodeRequest, Body()],
 ) -> AdminTelegramLoginCompleteRead:
     try:
-        return await login_service.complete_phone_code_login(session_id, request, admin_user_id=admin_user.id)
+        return await login_service.complete_phone_code_login(attempt_id, request, admin_user_id=admin_user.id)
     except (AdminNotFoundError, AdminConflictError) as exc:
         raise _map_admin_error(exc) from exc
 
 
 @router.post(
-    "/telegram/sessions/{session_id}/login/phone/password",
+    "/telegram/login-attempts/{attempt_id}/password",
     response_model=AdminTelegramLoginCompleteRead,
-    summary="Complete Telegram phone login with 2FA password",
+    summary="Complete a standalone Telegram login with a 2FA password",
 )
-async def complete_telegram_session_phone_password_login(
+async def complete_telegram_password_login_attempt(
     admin_user: AdminUserDep,
     login_service: AdminTelegramLoginServiceDep,
-    session_id: Annotated[uuid.UUID, Path()],
+    attempt_id: Annotated[uuid.UUID, Path()],
     request: Annotated[AdminTelegramLoginPasswordRequest, Body()],
 ) -> AdminTelegramLoginCompleteRead:
     try:
-        return await login_service.complete_password_login(session_id, request, admin_user_id=admin_user.id)
+        return await login_service.complete_password_login(attempt_id, request, admin_user_id=admin_user.id)
+    except (AdminNotFoundError, AdminConflictError) as exc:
+        raise _map_admin_error(exc) from exc
+
+
+@router.delete(
+    "/telegram/login-attempts/{attempt_id}",
+    response_model=AdminTelegramLoginCancelRead,
+    summary="Cancel a standalone Telegram login attempt",
+)
+async def cancel_telegram_login_attempt(
+    admin_user: AdminUserDep,
+    login_service: AdminTelegramLoginServiceDep,
+    attempt_id: Annotated[uuid.UUID, Path()],
+) -> AdminTelegramLoginCancelRead:
+    try:
+        return await login_service.cancel_login_attempt(attempt_id, admin_user_id=admin_user.id)
     except (AdminNotFoundError, AdminConflictError) as exc:
         raise _map_admin_error(exc) from exc
 

@@ -42,6 +42,75 @@ quarantine. The frontend calls the human-facing objects **sources** and
 **Telegram accounts** even though the durable crawler model retains
 `SourceChannel` and `TelegramSession` names.
 
+### Telegram account login lifecycle
+
+Browser QR and phone login use a two-phase lifecycle. Starting a new connection
+creates only a provisional `TelegramSessionLoginAttempt`; it does not create a
+`TelegramSession`. The attempt owns its creator, method, expiry, sanitized phone
+hint, provider continuation data, and encrypted temporary Telethon
+`StringSession`. Its nullable `telegram_session_id` is an existing reconnect
+target before authorization and the promoted/reused result afterward. Attempt
+ids are opaque orchestration tokens that the UI does not render; temporary and
+final secret material is never exposed through read models. A reconnect target
+must not let one durable account be silently replaced with a different Telegram
+user.
+
+The browser contract is attempt-oriented:
+
+- `POST /api/v1/admin/telegram/login-attempts/qr` and `/phone` start a
+  provisional attempt;
+- `POST /api/v1/admin/telegram/login-attempts/{attempt_id}/qr/complete`,
+  `/phone/code`, and `/password` advance the matching flow;
+- `DELETE /api/v1/admin/telegram/login-attempts/{attempt_id}` explicitly
+  cancels an unfinished attempt.
+
+After Telethon reports authorization, the service calls `get_me()` and promotes
+the credential in one database transaction. Canonical `account_user_id`
+identity drives an upsert: create a durable session for a new identity, or
+rotate the encrypted credential on the existing session for an already known
+identity. An explicit reconnect target is updated only when that identity
+matches. Promotion restores the durable account to an enabled active state,
+clears stale error/flood-wait/quarantine state as defined by account repair,
+records the audit entry, sets the attempt to `completed` with
+`cleanup_status=promoted`, and removes its QR URL, phone continuation data, and
+encrypted temporary credential. The response contains the promoted/reused
+durable account id; callers must not assume one before successful promotion.
+
+Client retirement depends on ownership of the credential:
+
+- after successful promotion, the temporary client is only `disconnect()`ed;
+  `log_out()` would revoke the credential now owned by the crawler account;
+- a failed, cancelled, or expired attempt is disconnected when it was never
+  authorized;
+- an abandoned attempt whose temporary auth key became authorized is first
+  revoked with Telegram `log_out()`, then disconnected.
+
+The explicit cancel operation makes dialog closure prompt but is best-effort;
+the database TTL is authoritative. Terminal attempt status is one of
+`completed`, `failed`, `expired`, or `cancelled`; nonterminal states are
+`pending` and `password_required`. Cleanup is idempotent and separately tracked
+as `pending`, `promoted`, `discarded`, or `failed`, with bounded attempt/error
+metadata. If provider logout cannot be confirmed, the attempt retains only the
+encrypted credential required to retry. The `telegram-login-cleanup` scheduler
+job runs every 60 seconds, claims expired nonterminal attempts plus terminal
+attempts whose cleanup is pending/failed, reconstructs the temporary client,
+repeats revoke/disconnect safely, and clears temporary secrets after cleanup
+succeeds. Cleanup therefore survives API process restarts and prevents both
+dead database accounts and abandoned authorized devices in Telegram.
+
+The focused lifecycle test matrix is:
+
+| Scenario | Durable/account result | Client and attempt result |
+| --- | --- | --- |
+| Start QR or phone for a new account | No `TelegramSession` is created | Attempt is nonterminal with an encrypted temporary session when available |
+| Complete authorization for a new identity | One active account is created | Credential is promoted; temporary client disconnects without logout |
+| Complete authorization for an existing identity | Existing account credential rotates; no duplicate row | Result points to the existing account and disconnects without logout |
+| Reconnect target authorizes a different identity | Target account is unchanged and completion conflicts | Temporary authorized key remains owned by discard cleanup |
+| Cancel/expire before authorization | No account is created or modified | Attempt becomes terminal and client only disconnects |
+| Cancel/expire after temporary authorization | No account is created or modified | Temporary key is logged out, then disconnected and discarded |
+| Provider logout fails | No account is created or modified | Cleanup becomes `failed`, retains encrypted retry material, and increments attempts |
+| Scheduler retry succeeds after restart | No account is created or modified | Cleanup becomes `discarded` and all temporary secret fields are cleared |
+
 ### Public Telegram source add
 
 `POST /api/v1/admin/telegram/channels/from-reference` accepts a public Telegram

@@ -67,7 +67,13 @@ The public DTO names remain stable (`latest_source_views`, `latest_source_reacti
 
 ### TelegramSession
 
-Canonical registry for Telethon userbot sessions. Key fields: `name`, `display_name`, encrypted `encrypted_string_session`, account projection fields (`account_user_id`, `account_username`, `account_phone_hint`), `status`, `enabled`, per-session feature flags, and `max_requests_per_second`. API read schemas deliberately omit `encrypted_string_session`; runtime code decrypts it only when constructing `TelegramClient(StringSession(...))`.
+Canonical registry for successfully promoted Telethon userbot sessions. Key fields: `name`, `display_name`, encrypted `encrypted_string_session`, account projection fields (`account_user_id`, `account_username`, `account_phone_hint`), `status`, `enabled`, per-session feature flags, and `max_requests_per_second`. Non-null `account_user_id` values are unique, so one Telegram account cannot be registered as multiple crawler sessions. API read schemas deliberately omit `encrypted_string_session`; runtime code decrypts it only when constructing `TelegramClient(StringSession(...))`.
+
+### TelegramSessionLoginAttempt
+
+Short-lived, standalone state for browser-admin QR and phone login. A new-account attempt exists without a `TelegramSession`; nullable `telegram_session_id` either targets an existing session for re-authentication or points to the session assigned after successful promotion. `created_by_admin_user_id` records the initiating operator without preventing user deletion. Temporary encrypted `StringSession`, phone-code, and QR fields are never exposed through API schemas.
+
+Terminal attempt status includes `completed`, `failed`, `expired`, and `cancelled`. Cleanup is tracked independently through `cleanup_status` (`pending`, `promoted`, `discarded`, or `failed`), retry count, error details, and completion timestamp. This permits cancellation and TTL cleanup to revoke abandoned Telegram auth keys while retaining enough encrypted state for retry; successful promotion clears temporary secrets without logging out the canonical crawler credential.
 
 ### SourceChannel
 

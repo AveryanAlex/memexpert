@@ -26,6 +26,7 @@ from memexpert.scheduler.jobs import (
     JOB_ID_SEARCH_INDEX_SYNC,
     JOB_ID_SEO_BACKLOG_BATCHES,
     JOB_ID_SOURCE_ENGAGEMENT_CAPTURE,
+    JOB_ID_TELEGRAM_LOGIN_CLEANUP,
     build_scheduler_job_definitions,
     enabled_scheduler_jobs,
     run_logged_job,
@@ -36,6 +37,7 @@ from memexpert.scheduler.locking import (
 )
 from memexpert.scheduler.runtime import run_scheduler_runtime
 from memexpert.schemas.meme import PublicMemeCardRead, PublicMemeOfTheDayRead
+from memexpert.services.admin_telegram_login import TelegramLoginCleanupBatchResult
 from memexpert.services.scheduler_batch_jobs import SearchIndexBatchJobResult, SeoBacklogBatchJobResult
 from memexpert.services.source_engagement_scheduler import SourceEngagementCaptureSchedulerResult
 
@@ -213,6 +215,7 @@ def test_scheduler_job_definitions_register_expected_ids() -> None:
         JOB_ID_SEARCH_INDEX_SYNC,
         JOB_ID_SEO_BACKLOG_BATCHES,
         JOB_ID_RABBITMQ_OUTBOX_PUBLISHER,
+        JOB_ID_TELEGRAM_LOGIN_CLEANUP,
     ]
 
 
@@ -225,6 +228,7 @@ def test_enabled_scheduler_jobs_filters_disabled_jobs() -> None:
             "scheduler_search_index_sync_enabled": True,
             "scheduler_seo_backlog_batches_enabled": False,
             "scheduler_rabbitmq_outbox_publisher_enabled": False,
+            "scheduler_telegram_login_cleanup_enabled": False,
         }
     )
 
@@ -560,6 +564,60 @@ async def test_rabbitmq_outbox_publisher_job_calls_runtime_and_logs_result(monke
 
 
 @pytest.mark.asyncio
+async def test_telegram_login_cleanup_job_calls_batch_service_and_logs_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings.model_validate(
+        {
+            "scheduler_telegram_login_cleanup_enabled": True,
+            "scheduler_telegram_login_cleanup_batch_size": 17,
+        }
+    )
+    engine = cast("AsyncEngine", object())
+    session_factory = object()
+    called: dict[str, object] = {}
+    info_calls: list[tuple[str, dict[str, object] | None]] = []
+
+    def fake_build_session_factory(bound_engine: object) -> object:
+        called["engine"] = bound_engine
+        return session_factory
+
+    async def fake_cleanup(session_factory_arg: object, *, batch_size: int) -> TelegramLoginCleanupBatchResult:
+        called["session_factory"] = session_factory_arg
+        called["batch_size"] = batch_size
+        return TelegramLoginCleanupBatchResult(scanned=4, expired=2, cleaned=3, failed=1)
+
+    def fake_info(message: str, *args: object, extra: dict[str, object] | None = None, **kwargs: object) -> None:
+        del args, kwargs
+        info_calls.append((message, extra))
+
+    monkeypatch.setattr("memexpert.scheduler.jobs.build_async_session_factory", fake_build_session_factory)
+    monkeypatch.setattr("memexpert.scheduler.jobs.run_telegram_login_cleanup_batch", fake_cleanup)
+    monkeypatch.setattr("memexpert.scheduler.jobs.logger.info", fake_info)
+
+    definition = build_scheduler_job_definitions(settings, engine=engine)[6]
+    await definition.action()
+
+    assert definition.id == JOB_ID_TELEGRAM_LOGIN_CLEANUP
+    assert called == {"engine": engine, "session_factory": session_factory, "batch_size": 17}
+    assert info_calls == [
+        (
+            "scheduler_job_batch_result",
+            {
+                "event": "scheduler_job_batch_result",
+                "job_id": JOB_ID_TELEGRAM_LOGIN_CLEANUP,
+                "status": "completed",
+                "degraded_mode": True,
+                "scanned": 4,
+                "expired": 2,
+                "cleaned": 3,
+                "failed": 1,
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
 async def test_run_logged_job_catches_and_logs_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     exception_calls: list[tuple[str, dict[str, object] | None]] = []
 
@@ -667,6 +725,7 @@ async def test_scheduler_runtime_registers_enabled_jobs_and_shuts_down_gracefull
         JOB_ID_MATERIALIZED_VIEW_REFRESH,
         JOB_ID_MOTD,
         JOB_ID_SEO_BACKLOG_BATCHES,
+        JOB_ID_TELEGRAM_LOGIN_CLEANUP,
     ]
     assert engine.dispose_calls == 0
 
@@ -681,6 +740,7 @@ async def test_scheduler_runtime_skips_disabled_jobs() -> None:
             "scheduler_search_index_sync_enabled": False,
             "scheduler_seo_backlog_batches_enabled": False,
             "scheduler_rabbitmq_outbox_publisher_enabled": False,
+            "scheduler_telegram_login_cleanup_enabled": False,
             "scheduler_advisory_lock_enabled": False,
         }
     )

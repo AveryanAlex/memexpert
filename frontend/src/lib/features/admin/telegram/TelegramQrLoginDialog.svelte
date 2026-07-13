@@ -39,16 +39,22 @@
 
   $effect(() => {
     if (modalOpen) return;
+    const pendingAttemptId = attemptId;
+    attemptId = null;
     stopPolling();
     clearRefreshTimer();
     requestLifecycle.cancel();
+    if (pendingAttemptId) void cancelAttemptBestEffort(pendingAttemptId);
   });
 
   $effect(() => {
     return () => {
+      const pendingAttemptId = attemptId;
+      attemptId = null;
       stopPolling();
       clearRefreshTimer();
       requestLifecycle.cancel();
+      if (pendingAttemptId) void cancelAttemptBestEffort(pendingAttemptId);
     };
   });
 
@@ -57,11 +63,12 @@
     if (!formElement) return;
     const nextSessionId = String(new FormData(formElement).get('session_id') ?? '').trim();
 
-    // A new account has no ID yet. Let its named server action create it, then open
-    // the QR dialog from the returned form data.
+    // A new account has no ID yet. Let its named server action create a standalone
+    // login attempt, then open the QR dialog from the returned form data.
     if (!nextSessionId) return;
 
     event.preventDefault();
+    if (attemptId) void cancelAttemptBestEffort(attemptId);
     stopPolling();
     clearRefreshTimer();
     requestLifecycle.cancel();
@@ -81,7 +88,7 @@
         credentials: 'include',
         signal: requestToken.signal,
         headers: { accept: 'application/json', 'content-type': 'application/json' },
-        body: JSON.stringify({ session_id: nextSessionId })
+        body: JSON.stringify({ telegram_session_id: nextSessionId })
       });
       const payload = await readJson(response);
       if (!response.ok) throw new Error(detailMessage(payload, 'Could not start QR sign-in.'));
@@ -89,7 +96,10 @@
       if (typeof result.attempt_id !== 'string' || typeof result.qr_url !== 'string') {
         throw new Error('Telegram QR sign-in returned an invalid response.');
       }
-      if (!requestLifecycle.isCurrent(requestToken) || !modalOpen) return;
+      if (!requestLifecycle.isCurrent(requestToken) || !modalOpen) {
+        void cancelAttemptBestEffort(result.attempt_id);
+        return;
+      }
       openModal({
         kind: 'qr',
         sessionId: nextSessionId,
@@ -110,6 +120,8 @@
   function openModal(step: TelegramQrLoginStep, requestToken?: QrRequestToken): void {
     if (requestToken && (!requestLifecycle.isCurrent(requestToken) || !modalOpen)) return;
     if (!requestToken) requestLifecycle.cancel();
+    const previousAttemptId = attemptId;
+    if (previousAttemptId && previousAttemptId !== step.attemptId) void cancelAttemptBestEffort(previousAttemptId);
     stopPolling();
     clearRefreshTimer();
     sessionId = step.sessionId;
@@ -138,7 +150,7 @@
   }
 
   function scheduleRefresh(): void {
-    if (!browser || !expiresAt || !sessionId) return;
+    if (!browser || !expiresAt) return;
     clearRefreshTimer();
     const expiry = new Date(expiresAt).getTime();
     if (!Number.isFinite(expiry)) return;
@@ -146,11 +158,18 @@
   }
 
   async function refreshQr(): Promise<void> {
-    if (!sessionId || refreshing) return;
+    if (refreshing) return;
     const currentSessionId = sessionId;
+    const previousAttemptId = attemptId;
     refreshing = true;
     error = null;
     stopPolling();
+    attemptId = null;
+    if (previousAttemptId) await cancelAttemptBestEffort(previousAttemptId);
+    if (!modalOpen || sessionId !== currentSessionId) {
+      refreshing = false;
+      return;
+    }
     const requestToken = requestLifecycle.begin();
     try {
       const response = await fetch('/admin/telegram/api/qr/start', {
@@ -158,7 +177,7 @@
         credentials: 'include',
         signal: requestToken.signal,
         headers: { accept: 'application/json', 'content-type': 'application/json' },
-        body: JSON.stringify({ session_id: currentSessionId })
+        body: JSON.stringify({ telegram_session_id: currentSessionId })
       });
       const payload = await readJson(response);
       if (!response.ok) throw new Error(detailMessage(payload, 'Could not refresh the QR code.'));
@@ -166,7 +185,10 @@
       if (typeof result.attempt_id !== 'string' || typeof result.qr_url !== 'string') {
         throw new Error('Telegram QR refresh returned an invalid response.');
       }
-      if (!requestLifecycle.isCurrent(requestToken) || !modalOpen || sessionId !== currentSessionId) return;
+      if (!requestLifecycle.isCurrent(requestToken) || !modalOpen || sessionId !== currentSessionId) {
+        void cancelAttemptBestEffort(result.attempt_id);
+        return;
+      }
       attemptId = result.attempt_id;
       qrUrl = result.qr_url;
       expiresAt = typeof result.expires_at === 'string' ? result.expires_at : null;
@@ -183,12 +205,12 @@
   }
 
   async function pollStatus(): Promise<void> {
-    if (!browser || !sessionId || !attemptId || polling) return;
+    if (!browser || !attemptId || polling) return;
     const controller = new AbortController();
     pollAbort = controller;
     polling = true;
     try {
-      while (modalOpen && sessionId && attemptId && !controller.signal.aborted) {
+      while (modalOpen && attemptId && !controller.signal.aborted) {
         const currentSessionId = sessionId;
         const currentAttemptId = attemptId;
         const response = await fetch('/admin/telegram/api/qr/complete', {
@@ -196,7 +218,7 @@
           credentials: 'include',
           signal: controller.signal,
           headers: { accept: 'application/json', 'content-type': 'application/json' },
-          body: JSON.stringify({ session_id: currentSessionId, attempt_id: currentAttemptId })
+          body: JSON.stringify({ attempt_id: currentAttemptId })
         });
         const payload = await readJson(response);
         if (!response.ok) throw new Error(detailMessage(payload, 'Could not check QR sign-in status.'));
@@ -207,6 +229,7 @@
         }
         clearRefreshTimer();
         if (result.status === 'password_required') {
+          attemptId = null;
           onPasswordRequired({
             kind: 'password',
             method: 'qr',
@@ -219,6 +242,7 @@
         }
         if (result.status === 'completed') {
           message = safeOperatorMessage(result.message);
+          attemptId = null;
           modalOpen = false;
           await invalidateAll();
           break;
@@ -262,6 +286,20 @@
     stopPolling();
     clearRefreshTimer();
     modalOpen = false;
+  }
+
+  async function cancelAttemptBestEffort(id: string): Promise<void> {
+    if (!browser) return;
+    try {
+      await fetch(`/admin/telegram/api/login-attempts/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+        credentials: 'include',
+        keepalive: true,
+        headers: { accept: 'application/json' }
+      });
+    } catch {
+      // Server-side expiry cleanup remains authoritative when best-effort cancellation fails.
+    }
   }
 </script>
 

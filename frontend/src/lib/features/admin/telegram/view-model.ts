@@ -6,7 +6,7 @@ export type TelegramAccountAction = 'Connect' | 'Enable' | 'Resume' | 'Validate'
 export interface TelegramPasswordLoginStep {
   kind: 'password';
   method: 'phone' | 'qr';
-  sessionId: string;
+  sessionId: string | null;
   attemptId: string;
   phoneHint?: string | null;
   message: string;
@@ -15,7 +15,7 @@ export interface TelegramPasswordLoginStep {
 
 export interface TelegramPhoneCodeLoginStep {
   kind: 'phone_code';
-  sessionId: string;
+  sessionId: string | null;
   attemptId: string;
   phoneHint?: string | null;
   expiresAt?: string;
@@ -25,7 +25,7 @@ export interface TelegramPhoneCodeLoginStep {
 
 export interface TelegramQrLoginStep {
   kind: 'qr';
-  sessionId: string;
+  sessionId: string | null;
   attemptId: string;
   qrUrl: string;
   expiresAt?: string;
@@ -39,7 +39,7 @@ export type TelegramLoginStep = TelegramPhoneCodeLoginStep | TelegramPasswordLog
 export interface TelegramLoginError {
   kind: 'login_error';
   method: 'phone' | 'qr';
-  sessionId: string;
+  sessionId: string | null;
   attemptId?: string;
   phoneHint?: string | null;
   message: string;
@@ -131,7 +131,7 @@ export function qrLoginStep(value: unknown): TelegramQrLoginStep | null {
   const candidate = record(value);
   if (
     candidate?.kind === 'qr' &&
-    typeof candidate.sessionId === 'string' &&
+    (candidate.sessionId === null || typeof candidate.sessionId === 'string') &&
     typeof candidate.attemptId === 'string' &&
     typeof candidate.qrUrl === 'string'
   ) {
@@ -154,7 +154,7 @@ export function passwordLoginStep(value: unknown): TelegramPasswordLoginStep | n
   if (
     candidate?.kind === 'password' &&
     (candidate.method === 'phone' || candidate.method === 'qr') &&
-    typeof candidate.sessionId === 'string' &&
+    (candidate.sessionId === null || typeof candidate.sessionId === 'string') &&
     typeof candidate.attemptId === 'string'
   ) {
     return {
@@ -175,7 +175,7 @@ export function loginError(value: unknown): TelegramLoginError | null {
   if (
     candidate?.kind !== 'login_error' ||
     (candidate.method !== 'phone' && candidate.method !== 'qr') ||
-    typeof candidate.sessionId !== 'string'
+    (candidate.sessionId !== null && typeof candidate.sessionId !== 'string')
   ) {
     return null;
   }
@@ -207,6 +207,33 @@ export function loginStateForAccount(
     return {
       kind: 'phone_code',
       sessionId: accountId,
+      attemptId: candidate.attemptId,
+      phoneHint: typeof candidate.phoneHint === 'string' ? candidate.phoneHint : null,
+      expiresAt: typeof candidate.expiresAt === 'string' ? candidate.expiresAt : undefined,
+      message: safeOperatorMessage(typeof candidate.message === 'string' ? candidate.message : 'Enter the code from Telegram.'),
+      error: candidate.error === true
+    };
+  }
+
+  return passwordLoginStep(candidate);
+}
+
+export function loginStateForNewAccount(
+  form: unknown,
+  qrPasswordStep: TelegramPasswordLoginStep | null
+): TelegramLoginState | null {
+  if (qrPasswordStep?.sessionId === null) return qrPasswordStep;
+
+  const failedLogin = loginError(form);
+  if (failedLogin?.sessionId === null) return failedLogin;
+
+  const candidate = record(form);
+  if (!candidate || candidate.sessionId !== null || typeof candidate.attemptId !== 'string') return null;
+
+  if (candidate.kind === 'phone_code') {
+    return {
+      kind: 'phone_code',
+      sessionId: null,
       attemptId: candidate.attemptId,
       phoneHint: typeof candidate.phoneHint === 'string' ? candidate.phoneHint : null,
       expiresAt: typeof candidate.expiresAt === 'string' ? candidate.expiresAt : undefined,

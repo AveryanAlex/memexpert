@@ -48,27 +48,32 @@ describe('Telegram account actions', () => {
     expect(calls).toEqual([{ path: `/api/v1/admin/telegram/sessions/${sessionId}`, body: { confirmation: sessionId, note: null } }]);
   });
 
-  it('keeps login context when the new QR or phone start fails after creating an account', async () => {
+  it('starts standalone new-account attempts without creating a Telegram session shell', async () => {
+    const calls: Array<{ path: string; body: unknown }> = [];
     const fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const path = new URL(String(input)).pathname;
-      if (path === '/api/v1/admin/telegram/sessions') return jsonResponse({ id: sessionId }, 201);
+      calls.push({ path, body: init?.body ? JSON.parse(String(init.body)) : null });
       return jsonResponse({ detail: 'Provider start failed.' }, 409);
     }) satisfies ApiFetch;
 
     await expect(telegramAccountActions.startQrLogin(actionEvent({}, fetch))).resolves.toMatchObject({
       status: 409,
-      data: { kind: 'login_error', sessionId, method: 'qr', error: true, message: 'Provider start failed.' }
+      data: { kind: 'login_error', sessionId: null, method: 'qr', error: true, message: 'Provider start failed.' }
     });
     await expect(telegramAccountActions.startPhoneLogin(actionEvent({ phone_number: '+15551234567' }, fetch))).resolves.toMatchObject({
       status: 409,
-      data: { kind: 'login_error', sessionId, method: 'phone', error: true, message: 'Provider start failed.' }
+      data: { kind: 'login_error', sessionId: null, method: 'phone', error: true, message: 'Provider start failed.' }
     });
+    expect(calls).toEqual([
+      { path: '/api/v1/admin/telegram/login-attempts/qr', body: { telegram_session_id: null, note: null } },
+      { path: '/api/v1/admin/telegram/login-attempts/phone', body: { telegram_session_id: null, phone_number: '+15551234567', note: null } }
+    ]);
   });
 
   it('returns safe context for successful phone-code and 2FA transitions', async () => {
     const fetch = vi.fn(async (input: RequestInfo | URL) => {
       const path = new URL(String(input)).pathname;
-      if (path.endsWith('/login/phone/start')) {
+      if (path.endsWith('/login-attempts/phone')) {
         return jsonResponse({ attempt_id: attemptId, phone_number_hint: 'ending-1234', expires_at: '2026-01-01T00:10:00Z', message: 'sent' });
       }
       return jsonResponse({ password_required: true, message: '2FA required' });
@@ -170,6 +175,19 @@ describe('Telegram account actions', () => {
       data: { kind: 'login_error', sessionId, attemptId, method: 'phone', error: true, message: 'method must be phone or qr.' }
     });
     expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('cancels a phone or password attempt without requiring an account shell', async () => {
+    const fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      expect(new URL(String(input)).pathname).toBe(`/api/v1/admin/telegram/login-attempts/${attemptId}`);
+      expect(init?.method).toBe('DELETE');
+      return jsonResponse({ attempt_id: attemptId, status: 'cancelled', message: 'cancelled' });
+    }) satisfies ApiFetch;
+
+    await expect(
+      telegramAccountActions.cancelLoginAttempt(actionEvent({ attempt_id: attemptId }, fetch))
+    ).resolves.toEqual({ message: 'Telegram sign-in cancelled.' });
+    expect(fetch).toHaveBeenCalledOnce();
   });
 });
 

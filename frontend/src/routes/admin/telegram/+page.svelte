@@ -3,13 +3,14 @@
   import TelegramAccountList from '$lib/features/admin/telegram/TelegramAccountList.svelte';
   import TelegramLoginPanel from '$lib/features/admin/telegram/TelegramLoginPanel.svelte';
   import TelegramQrLoginDialog from '$lib/features/admin/telegram/TelegramQrLoginDialog.svelte';
-  import { loginError, passwordLoginStep, safeOperatorMessage, type TelegramPasswordLoginStep } from '$lib/features/admin/telegram/view-model';
+  import { loginError, loginStateForNewAccount, passwordLoginStep, safeOperatorMessage, type TelegramPasswordLoginStep } from '$lib/features/admin/telegram/view-model';
   import type { ActionData, PageData } from './$types';
 
   let { data, form }: { data: PageData; form: ActionData } = $props();
 
   let qrDialog = $state<{ startExistingQrLogin: (event: SubmitEvent) => Promise<void> } | null>(null);
   let qrPasswordStep = $state<TelegramPasswordLoginStep | null>(null);
+  const newAccountLoginState = $derived(loginStateForNewAccount(form, qrPasswordStep));
 
   $effect(() => {
     const passwordStep = passwordLoginStep(form);
@@ -57,5 +58,5 @@
 
 <TelegramQrLoginDialog bind:this={qrDialog} {form} onPasswordRequired={setQrPasswordStep} />
 
-<TelegramLoginPanel onStartQrLogin={startExistingQrLogin} />
+<TelegramLoginPanel loginState={newAccountLoginState} onStartQrLogin={startExistingQrLogin} />
 <TelegramAccountList accounts={data.telegramAdmin.sessions} loadedAt={data.loadedAt} {form} {qrPasswordStep} onStartQrLogin={startExistingQrLogin} />

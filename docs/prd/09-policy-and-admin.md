@@ -106,6 +106,23 @@ in UI or API reads. Advanced policy/repair and the destructive disconnect
 control are separate disclosures. Disconnecting an account unassigns its
 sources and disables their ingestion; reconnect or reassign them deliberately.
 
+A connection starts as a provisional login attempt, not as a Telegram account.
+Closing the dialog cancels the attempt best-effort, while server-side expiry is
+authoritative if the browser disappears. Failed, cancelled, and expired
+attempts must not leave an account card or a runnable crawler session. If
+Telegram authorized a temporary credential before the attempt was abandoned,
+the service revokes that credential with Telegram before discarding it; cleanup
+that cannot finish immediately remains retryable by the scheduler.
+
+Only a successful identity check promotes the encrypted credential into a
+durable Telegram account. Promotion upserts by canonical Telegram account
+identity: a first connection creates the account, while login for an identity
+already in the catalog rotates that account's credential instead of creating a
+duplicate. An explicit reconnect target may be updated only when the authorized
+identity matches it. Promotion clears temporary login secrets and disconnects
+the temporary client without logging it out, because logout would revoke the
+credential just stored for the crawler.
+
 ### Moderation and content work
 
 - The moderation queue renders an authorized preview even for hidden/private

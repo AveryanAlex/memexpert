@@ -13,6 +13,7 @@ from memexpert.messaging.rabbitmq_outbox_runtime import (
     rabbitmq_outbox_publisher_result_log_extra,
     run_rabbitmq_outbox_publisher_batch,
 )
+from memexpert.services.admin_telegram_login import run_telegram_login_cleanup_batch
 from memexpert.services.meme_of_the_day import (
     meme_of_the_day_result_log_extra,
     run_scheduler_meme_of_the_day_refresh,
@@ -41,6 +42,7 @@ JOB_ID_MOTD = "motd"
 JOB_ID_SEARCH_INDEX_SYNC = "search-index-sync"
 JOB_ID_SEO_BACKLOG_BATCHES = "seo-backlog-batches"
 JOB_ID_RABBITMQ_OUTBOX_PUBLISHER = "rabbitmq-outbox-publisher"
+JOB_ID_TELEGRAM_LOGIN_CLEANUP = "telegram-login-cleanup"
 
 SchedulerJobAction = Callable[[], Awaitable[None]]
 
@@ -97,6 +99,13 @@ def build_scheduler_job_definitions(settings: Settings, engine: AsyncEngine) -> 
             action=_build_rabbitmq_outbox_publisher_job_action(settings, engine),
             enabled=settings.scheduler_rabbitmq_outbox_publisher_enabled,
             description="Publish durable RabbitMQ outbox messages.",
+        ),
+        SchedulerJobDefinition(
+            id=JOB_ID_TELEGRAM_LOGIN_CLEANUP,
+            trigger_seconds=settings.scheduler_telegram_login_cleanup_interval_seconds,
+            action=_build_telegram_login_cleanup_job_action(settings, engine),
+            enabled=settings.scheduler_telegram_login_cleanup_enabled,
+            description="Expire Telegram login attempts and revoke abandoned temporary credentials.",
         ),
     )
 
@@ -204,6 +213,30 @@ def _build_rabbitmq_outbox_publisher_job_action(settings: Settings, engine: Asyn
     return _action
 
 
+def _build_telegram_login_cleanup_job_action(settings: Settings, engine: AsyncEngine) -> SchedulerJobAction:
+    async def _action() -> None:
+        session_factory = build_async_session_factory(engine)
+        result = await run_telegram_login_cleanup_batch(
+            session_factory,
+            batch_size=settings.scheduler_telegram_login_cleanup_batch_size,
+        )
+        logger.info(
+            "scheduler_job_batch_result",
+            extra={
+                "event": "scheduler_job_batch_result",
+                "job_id": JOB_ID_TELEGRAM_LOGIN_CLEANUP,
+                "status": "completed",
+                "degraded_mode": result.failed > 0,
+                "scanned": result.scanned,
+                "expired": result.expired,
+                "cleaned": result.cleaned,
+                "failed": result.failed,
+            },
+        )
+
+    return _action
+
+
 __all__ = [
     "JOB_ID_MATERIALIZED_VIEW_REFRESH",
     "JOB_ID_MOTD",
@@ -211,6 +244,7 @@ __all__ = [
     "JOB_ID_SEARCH_INDEX_SYNC",
     "JOB_ID_SEO_BACKLOG_BATCHES",
     "JOB_ID_SOURCE_ENGAGEMENT_CAPTURE",
+    "JOB_ID_TELEGRAM_LOGIN_CLEANUP",
     "SchedulerJobDefinition",
     "build_scheduler_job_definitions",
     "enabled_scheduler_jobs",

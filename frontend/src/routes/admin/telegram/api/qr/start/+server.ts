@@ -3,18 +3,22 @@ import type { RequestHandler } from './$types';
 
 export const POST: RequestHandler = async ({ fetch, request }) => {
   const payload = await request.json().catch(() => null);
-  const sessionId = typeof payload?.session_id === 'string' ? payload.session_id.trim() : '';
-  if (!sessionId) {
-    return Response.json({ detail: 'session_id is required.' }, { status: 400 });
+  const sessionId = typeof payload?.telegram_session_id === 'string' ? payload.telegram_session_id.trim() : '';
+  const body: { telegram_session_id?: string; note?: string | null } = {};
+  if (sessionId) body.telegram_session_id = sessionId;
+  if ('note' in (payload ?? {})) {
+    body.note = typeof payload?.note === 'string' && payload.note.trim() ? payload.note.trim() : null;
   }
 
-  return fetch(`${apiBaseUrl()}/api/v1/admin/telegram/sessions/${encodeURIComponent(sessionId)}/login/qr/start`, {
+  return fetch(`${apiBaseUrl()}/api/v1/admin/telegram/login-attempts/qr`, {
     method: 'POST',
     headers: {
       accept: 'application/json',
+      'content-type': 'application/json',
       'x-requested-with': 'XMLHttpRequest',
       cookie: request.headers.get('cookie') ?? ''
-    }
+    },
+    body: JSON.stringify(body)
   });
 };
 

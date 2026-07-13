@@ -20,11 +20,13 @@ import type {
   AdminTelegramChannelOrphanPayload,
   AdminTelegramChannelUpdatePayload,
   AdminTelegramLoginCompleteRead,
+  AdminTelegramLoginCancelRead,
   AdminTelegramLoginPasswordPayload,
   AdminTelegramLoginPhoneCodePayload,
   AdminTelegramLoginPhoneStartPayload,
   AdminTelegramLoginPhoneStartRead,
   AdminTelegramLoginQrCompletePayload,
+  AdminTelegramLoginQrStartPayload,
   AdminTelegramLoginQrStartRead,
   AdminTelegramLoginQrStatusRead,
   AdminTelegramSessionActionRead,
@@ -587,9 +589,11 @@ export async function updateAdminTelegramSession(
   );
 }
 
-export async function startAdminTelegramQrLogin(request: CatalogRequest, sessionId: string): Promise<AdminTelegramLoginQrStartRead> {
+export async function startAdminTelegramQrLogin(
+  request: CatalogRequest & { body?: AdminTelegramLoginQrStartPayload }
+): Promise<AdminTelegramLoginQrStartRead> {
   return apiWrite<AdminTelegramLoginQrStartRead>(
-    `/api/v1/admin/telegram/sessions/${encodeURIComponent(sessionId)}/login/qr/start`,
+    '/api/v1/admin/telegram/login-attempts/qr',
     'POST',
     request
   );
@@ -597,21 +601,20 @@ export async function startAdminTelegramQrLogin(request: CatalogRequest, session
 
 export async function completeAdminTelegramQrLogin(
   request: CatalogRequest & { body: AdminTelegramLoginQrCompletePayload },
-  sessionId: string
+  attemptId: string
 ): Promise<AdminTelegramLoginQrStatusRead> {
   return apiWrite<AdminTelegramLoginQrStatusRead>(
-    `/api/v1/admin/telegram/sessions/${encodeURIComponent(sessionId)}/login/qr/complete`,
+    `/api/v1/admin/telegram/login-attempts/${encodeURIComponent(attemptId)}/qr/complete`,
     'POST',
     request
   );
 }
 
 export async function startAdminTelegramPhoneLogin(
-  request: CatalogRequest & { body: AdminTelegramLoginPhoneStartPayload },
-  sessionId: string
+  request: CatalogRequest & { body: AdminTelegramLoginPhoneStartPayload }
 ): Promise<AdminTelegramLoginPhoneStartRead> {
   return apiWrite<AdminTelegramLoginPhoneStartRead>(
-    `/api/v1/admin/telegram/sessions/${encodeURIComponent(sessionId)}/login/phone/start`,
+    '/api/v1/admin/telegram/login-attempts/phone',
     'POST',
     request
   );
@@ -619,10 +622,10 @@ export async function startAdminTelegramPhoneLogin(
 
 export async function completeAdminTelegramPhoneCodeLogin(
   request: CatalogRequest & { body: AdminTelegramLoginPhoneCodePayload },
-  sessionId: string
+  attemptId: string
 ): Promise<AdminTelegramLoginCompleteRead> {
   return apiWrite<AdminTelegramLoginCompleteRead>(
-    `/api/v1/admin/telegram/sessions/${encodeURIComponent(sessionId)}/login/phone/code`,
+    `/api/v1/admin/telegram/login-attempts/${encodeURIComponent(attemptId)}/phone/code`,
     'POST',
     request
   );
@@ -630,11 +633,22 @@ export async function completeAdminTelegramPhoneCodeLogin(
 
 export async function completeAdminTelegramPhonePasswordLogin(
   request: CatalogRequest & { body: AdminTelegramLoginPasswordPayload },
-  sessionId: string
+  attemptId: string
 ): Promise<AdminTelegramLoginCompleteRead> {
   return apiWrite<AdminTelegramLoginCompleteRead>(
-    `/api/v1/admin/telegram/sessions/${encodeURIComponent(sessionId)}/login/phone/password`,
+    `/api/v1/admin/telegram/login-attempts/${encodeURIComponent(attemptId)}/password`,
     'POST',
+    request
+  );
+}
+
+export async function cancelAdminTelegramLoginAttempt(
+  request: CatalogRequest,
+  attemptId: string
+): Promise<AdminTelegramLoginCancelRead> {
+  return apiWrite<AdminTelegramLoginCancelRead>(
+    `/api/v1/admin/telegram/login-attempts/${encodeURIComponent(attemptId)}`,
+    'DELETE',
     request
   );
 }

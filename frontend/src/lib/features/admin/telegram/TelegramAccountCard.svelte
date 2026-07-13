@@ -63,7 +63,10 @@
       <FormRow label="Telegram code">
         <Input name="code" autocomplete="one-time-code" inputmode="numeric" required autofocus />
       </FormRow>
-      <Button type="submit">Continue</Button>
+      <div class="flex flex-wrap gap-2">
+        <Button type="submit">Continue</Button>
+        <Button type="submit" variant="ghost" formaction="?/cancelLoginAttempt" formnovalidate>Cancel sign-in</Button>
+      </div>
     </form>
   {:else if loginState?.kind === 'password'}
     <form method="POST" action="?/completePhonePasswordLogin" class="grid gap-3 rounded-2xl border border-line bg-soft/40 p-4 md:max-w-xl">
@@ -81,7 +84,10 @@
       <FormRow label="Telegram password">
         <Input name="password" type="password" autocomplete="current-password" required autofocus />
       </FormRow>
-      <Button type="submit">Finish connecting</Button>
+      <div class="flex flex-wrap gap-2">
+        <Button type="submit">Finish connecting</Button>
+        <Button type="submit" variant="ghost" formaction="?/cancelLoginAttempt" formnovalidate>Cancel sign-in</Button>
+      </div>
     </form>
   {:else if loginFailed || model.primaryAction === 'Connect'}
     {#if loginFailed}

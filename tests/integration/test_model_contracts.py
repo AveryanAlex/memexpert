@@ -285,6 +285,7 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
     meme_source_columns = sa_inspect(MemeSource).columns
     source_channel_relationships = sa_inspect(SourceChannel).relationships
     telegram_session_relationships = sa_inspect(TelegramSession).relationships
+    telegram_login_attempt_table = metadata.tables["telegram_session_login_attempts"]
     pipeline_ingest_request_relationships = sa_inspect(PipelineIngestRequest).relationships
 
     assert user_relationships["active_save_collection"].mapper.class_ is Collection
@@ -320,7 +321,24 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
     assert telegram_session_relationships["source_channels"].mapper.class_ is SourceChannel
     assert telegram_session_relationships["login_attempts"].mapper.class_ is TelegramSessionLoginAttempt
     assert metadata.tables["source_channels"].c["telegram_session_id"].foreign_keys
-    assert metadata.tables["telegram_session_login_attempts"].c["telegram_session_id"].foreign_keys
+    assert telegram_login_attempt_table.c["telegram_session_id"].nullable
+    telegram_session_fk = next(iter(telegram_login_attempt_table.c["telegram_session_id"].foreign_keys))
+    assert telegram_session_fk.ondelete == "SET NULL"
+    assert telegram_login_attempt_table.c["created_by_admin_user_id"].nullable
+    created_by_fk = next(iter(telegram_login_attempt_table.c["created_by_admin_user_id"].foreign_keys))
+    assert created_by_fk.column.table.name == "users"
+    assert created_by_fk.ondelete == "SET NULL"
+    assert {
+        "cleanup_status",
+        "cleanup_attempts",
+        "cleanup_error_class",
+        "cleanup_error_text",
+        "cleanup_completed_at",
+    }.issubset(telegram_login_attempt_table.c.keys())
+    assert _postgresql_where(
+        "uq_telegram_sessions_account_user_id_not_null",
+        "telegram_sessions",
+    ) == "account_user_id IS NOT NULL"
     assert "session_id" not in metadata.tables["source_channels"].c
     assert "views" not in meme_source_columns
     assert "reactions" not in meme_source_columns

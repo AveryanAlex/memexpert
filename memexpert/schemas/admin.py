@@ -341,6 +341,20 @@ class AdminTelegramSessionValidateRead(BaseModel):
     channel_reference: str | None = None
 
 
+class AdminTelegramLoginQrStartRequest(BaseModel):
+    """Start a standalone QR login, optionally replacing one stored session."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    telegram_session_id: uuid.UUID | None = None
+    note: str | None = Field(default=None, max_length=MAX_ADMIN_NOTE_LENGTH)
+
+    @field_validator("note")
+    @classmethod
+    def _normalize_note(cls, value: str | None) -> str | None:
+        return normalize_optional_text(value)
+
+
 class AdminTelegramLoginQrStartRead(BaseModel):
     """Secret-free response for a browser-admin QR login attempt."""
 
@@ -357,7 +371,6 @@ class AdminTelegramLoginQrCompleteRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    attempt_id: uuid.UUID
     note: str | None = Field(default=None, max_length=MAX_ADMIN_NOTE_LENGTH)
 
     @field_validator("note")
@@ -383,6 +396,7 @@ class AdminTelegramLoginPhoneStartRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     phone_number: str = Field(min_length=5, max_length=MAX_TELEGRAM_LOGIN_PHONE_LENGTH)
+    telegram_session_id: uuid.UUID | None = None
     note: str | None = Field(default=None, max_length=MAX_ADMIN_NOTE_LENGTH)
 
     @field_validator("phone_number")
@@ -415,7 +429,6 @@ class AdminTelegramLoginPhoneCodeRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    attempt_id: uuid.UUID
     code: str = Field(min_length=1, max_length=MAX_TELEGRAM_LOGIN_CODE_LENGTH)
     note: str | None = Field(default=None, max_length=MAX_ADMIN_NOTE_LENGTH)
 
@@ -435,7 +448,6 @@ class AdminTelegramLoginPasswordRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    attempt_id: uuid.UUID
     password: SecretStr = Field(max_length=MAX_TELEGRAM_LOGIN_PASSWORD_LENGTH)
     note: str | None = Field(default=None, max_length=MAX_ADMIN_NOTE_LENGTH)
 
@@ -458,8 +470,18 @@ class AdminTelegramLoginCompleteRead(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    telegram_session: AdminTelegramSessionRead
+    telegram_session: AdminTelegramSessionRead | None = None
     password_required: bool = False
+    message: str
+
+
+class AdminTelegramLoginCancelRead(BaseModel):
+    """Secret-free result of cancelling a standalone Telegram login attempt."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    attempt_id: uuid.UUID
+    status: Literal["cancelled"]
     message: str
 
 
