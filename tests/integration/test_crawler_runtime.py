@@ -164,18 +164,20 @@ def _build_runtime(
     telegram_client: FakeTelegramClient,
     phash_tag: str = "R",
     storage_client: FakeStorageClient | None = None,
+    settings: Settings | None = None,
 ) -> TelegramCrawlerRuntime:
     _ = phash_tag
+    resolved_settings = settings or Settings()
     service = PipelineCrawlerIngestService.from_settings(
         session,
-        settings=Settings(),
+        settings=resolved_settings,
         storage_client=storage_client or FakeStorageClient(),
     )
     return TelegramCrawlerRuntime(
         ingest_service=service,
         telegram_client=telegram_client,
         session=session,
-        settings=Settings(),
+        settings=resolved_settings,
     )
 
 
@@ -710,6 +712,57 @@ async def test_older_history_failure_keeps_unprocessed_messages_below_committed_
     assert ingest_service.post_ids[3:] == ["5", "4", "3"]
 
 
+async def test_older_history_records_oversized_media_and_advances_history_cursor(
+    migrated_db_session: AsyncSession,
+) -> None:
+    await _seed_active_session(migrated_db_session, session_name="primary")
+    channel = await _seed_curated_channel(
+        migrated_db_session,
+        platform_id="oversized_history_channel",
+        last_read_post_id="10",
+    )
+    channel.oldest_observed_post_id = "10"
+    channel.history_cursor_post_id = "10"
+    await migrated_db_session.commit()
+    messages = [
+        _build_photo_message(message_id=str(i), channel_id="oversized_history_channel")
+        for i in range(1, 11)
+    ]
+    fake = FakeTelegramClient(
+        canned_messages={"oversized_history_channel": messages},
+        media_by_message={"9": b"ok", "8": b"large", "7": b"ok"},
+    )
+    runtime = _build_runtime(
+        migrated_db_session,
+        telegram_client=fake,
+        settings=Settings(pipeline_image_upload_max_bytes=4),
+    )
+
+    report = await runtime.catch_up_older_channel(
+        "primary",
+        "oversized_history_channel",
+        before_post_id=None,
+        limit=3,
+    )
+
+    assert report.messages_scanned == 3
+    assert report.messages_ingested == 2
+    assert report.messages_skipped_unsupported == 1
+    assert report.errors == ()
+    await migrated_db_session.refresh(channel)
+    assert channel.last_read_post_id == "10"
+    assert channel.history_cursor_post_id == "7"
+    oversized_post = await migrated_db_session.scalar(
+        select(SourceChannelPost).where(
+            SourceChannelPost.source_channel_id == channel.id,
+            SourceChannelPost.post_id == "8",
+        ),
+    )
+    assert oversized_post is not None
+    assert oversized_post.status is SourceChannelPostStatus.UNSUPPORTED
+    assert oversized_post.last_error_code == "pipeline_payload_too_large"
+
+
 async def test_catch_up_channel_skips_duplicate_source_before_download(
     migrated_db_session: AsyncSession,
 ) -> None:
@@ -976,6 +1029,58 @@ async def test_catch_up_channel_continues_after_per_message_provider_error(
     assert failed_post is not None
     assert failed_post.status is SourceChannelPostStatus.FAILED
     assert failed_post.last_error_code == "download_unavailable"
+
+
+async def test_catch_up_channel_records_oversized_media_as_unsupported_and_continues(
+    migrated_db_session: AsyncSession,
+) -> None:
+    await _seed_active_session(migrated_db_session, session_name="primary")
+    channel = await _seed_curated_channel(
+        migrated_db_session,
+        platform_id="oversized_channel",
+    )
+    messages = [
+        _build_photo_message(message_id="10", channel_id="oversized_channel"),
+        _build_photo_message(message_id="20", channel_id="oversized_channel"),
+        _build_photo_message(message_id="30", channel_id="oversized_channel"),
+    ]
+    fake = FakeTelegramClient(
+        canned_messages={"oversized_channel": messages},
+        media_by_message={"10": b"ok", "20": b"large", "30": b"ok"},
+    )
+    storage_client = FakeStorageClient()
+    runtime = _build_runtime(
+        migrated_db_session,
+        telegram_client=fake,
+        storage_client=storage_client,
+        settings=Settings(pipeline_image_upload_max_bytes=4),
+    )
+
+    report = await runtime.catch_up_channel("primary", "oversized_channel")
+
+    assert report.messages_scanned == 3
+    assert report.messages_ingested == 2
+    assert report.messages_skipped_unsupported == 1
+    assert report.errors == ()
+    await migrated_db_session.refresh(channel)
+    assert channel.last_read_post_id == "30"
+    assert channel.initial_catchup_completed is True
+    posts = (
+        await migrated_db_session.execute(
+            select(SourceChannelPost)
+            .where(SourceChannelPost.source_channel_id == channel.id)
+            .order_by(SourceChannelPost.post_id.asc()),
+        )
+    ).scalars().all()
+    assert [post.status for post in posts] == [
+        SourceChannelPostStatus.ACCEPTED,
+        SourceChannelPostStatus.UNSUPPORTED,
+        SourceChannelPostStatus.ACCEPTED,
+    ]
+    assert posts[1].last_error_code == "pipeline_payload_too_large"
+    assert posts[1].last_error_text == "Uploaded file exceeds the 4-byte limit."
+    assert len(storage_client.put_calls) == 2
+    assert await migrated_db_session.scalar(select(func.count()).select_from(PipelineIngestRequest)) == 2
 
 
 async def test_catch_up_channel_preserves_forward_attribution_on_raw_request(

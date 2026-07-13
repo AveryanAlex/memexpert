@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import pytest
 from pydantic import SecretStr
 from sqlalchemy import select
+from telethon.tl.types import MessageActionChatEditPhoto, MessageService, PeerChannel, Photo
 
 from memexpert.core.config import Settings
 from memexpert.crawlers.telegram.client import (
@@ -21,6 +23,7 @@ from memexpert.crawlers.telegram.telethon_adapter import (
     TelethonClientFactory,
     _RateLimiter,
 )
+from memexpert.crawlers.telegram.telethon_mapper import TelethonMessageNormalizer
 from memexpert.models.content import TelegramSession
 from memexpert.models.enums import TelegramSessionStatus
 
@@ -254,3 +257,32 @@ def test_telethon_factory_requires_api_credentials() -> None:
         _ = factory._build_client(_TEST_STRING_SESSION)
 
     assert "TELEGRAM_API_ID" in str(exc_info.value)
+
+
+def test_telethon_channel_photo_service_event_is_not_downloadable_post_media() -> None:
+    observed_at = datetime(2024, 5, 1, 12, 30, tzinfo=UTC)
+    service_message = MessageService(
+        id=11,
+        peer_id=PeerChannel(channel_id=123),
+        date=observed_at,
+        action=MessageActionChatEditPhoto(
+            photo=Photo(
+                id=1,
+                access_hash=2,
+                file_reference=b"",
+                date=observed_at,
+                sizes=[],
+                dc_id=4,
+            ),
+        ),
+    )
+
+    normalized = TelethonMessageNormalizer.build(
+        message=cast("Any", service_message),
+        channel_id="123",
+        channel_title="Channel",
+        channel_username=None,
+    )
+
+    assert normalized.media_type == "unsupported"
+    assert normalized.raw_payload is service_message

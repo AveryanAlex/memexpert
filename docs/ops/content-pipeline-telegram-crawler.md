@@ -680,7 +680,14 @@ When the freshness snapshot reports `slo_p95_pass=False`, work top-down:
 - **Paddle model cache is container-local** — replacing the worker removes
   `/app/.paddlex`; the first OCR attempt downloads the detector/recognizer models.
   Keep the crawler stopped during a deployment until an OCR canary repopulates
-  the cache and completes within `PIPELINE_OCR_TIMEOUT_SECONDS`.
+  the cache and completes within `PIPELINE_OCR_TIMEOUT_SECONDS`. The production
+  default is 120 seconds because CPU-only PaddleOCR work on the beta host can
+  legitimately exceed 30 seconds; lower values can turn healthy work into a
+  retry/DLQ storm.
+- **CPU video transcodes need a realistic deadline** — the production default
+  for `PIPELINE_TRANSCODE_TIMEOUT_SECONDS` is 180 seconds. The beta host has
+  valid Telegram videos that exceed the old 45-second deadline; shortening it
+  can strand otherwise supported posts before OCR and indexing.
 - **Freshness is measured on live items** — `MemeSource.published_at`
   must be set for the freshness query to score the item. Catch-up items
   backfilled from a historical window are NOT scored by the SLO; that

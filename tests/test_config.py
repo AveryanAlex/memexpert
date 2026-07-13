@@ -130,10 +130,12 @@ def test_settings_parse_pipeline_contract_and_normalize_object_prefixes() -> Non
 def test_settings_ocr_defaults_are_honest_about_missing_fallback() -> None:
     settings = Settings()
 
+    assert settings.pipeline_transcode_timeout_seconds == 180.0
     assert settings.pipeline_ocr_primary_engine == "paddleocr"
     assert settings.pipeline_ocr_paddle_command is None
     assert settings.pipeline_ocr_fallback_engine is None
     assert settings.pipeline_ocr_fallback_command is None
+    assert settings.pipeline_ocr_timeout_seconds == 120.0
 
 
 def test_settings_pipeline_worker_prefetch_count_defaults_and_bounds() -> None:

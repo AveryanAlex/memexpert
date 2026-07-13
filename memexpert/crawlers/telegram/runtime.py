@@ -41,7 +41,7 @@ from memexpert.models.content import SourceChannel, SourceChannelPost, TelegramS
 from memexpert.models.enums import SourceChannelPostStatus, SourcePlatform, TelegramSessionStatus
 from memexpert.pipeline.helpers import compare_telegram_post_ids
 from memexpert.schemas.content_pipeline import CrawlerIngestOutcome
-from memexpert.services.errors import CrawlerSessionNotRunnableError
+from memexpert.services.errors import CrawlerSessionNotRunnableError, PipelinePayloadTooLargeError
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -768,6 +768,16 @@ class TelegramCrawlerRuntime:
                 raw_post,
                 advance_checkpoint=advance_checkpoint,
             )
+        except PipelinePayloadTooLargeError as exc:
+            counters.skipped_unsupported += 1
+            self._mark_post_unsupported(
+                post_row,
+                error_code=exc.error_code,
+                error_text=str(exc),
+            )
+            if advance_checkpoint:
+                self._advance_forward_checkpoint(channel_row, raw_message.message_id)
+            return
         except Exception as exc:
             self._mark_post_failed(
                 post_row,
@@ -897,10 +907,15 @@ class TelegramCrawlerRuntime:
         cls._mark_post_accepted(post_row)
 
     @staticmethod
-    def _mark_post_unsupported(post_row: SourceChannelPost) -> None:
+    def _mark_post_unsupported(
+        post_row: SourceChannelPost,
+        *,
+        error_code: str | None = None,
+        error_text: str | None = None,
+    ) -> None:
         post_row.status = SourceChannelPostStatus.UNSUPPORTED
-        post_row.last_error_code = None
-        post_row.last_error_text = None
+        post_row.last_error_code = None if error_code is None else error_code[:128]
+        post_row.last_error_text = None if error_text is None else error_text[:4000]
 
     @staticmethod
     def _mark_post_failed(

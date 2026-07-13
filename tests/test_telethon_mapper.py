@@ -88,6 +88,7 @@ class _FakeDocument:
 class _FakeMessage:
     id: int
     date: datetime | None = None
+    action: object | None = None
     photo: object | None = None
     document: _FakeDocument | None = None
     views: int | None = None
@@ -178,6 +179,27 @@ def test_normalizer_classifies_document_media_by_mime_type() -> None:
     ]
 
     assert [p.media_type for p in projections] == ["gif", "video", "video", "unsupported", "unsupported"]
+
+
+def test_normalizer_treats_service_action_photo_as_unsupported() -> None:
+    message = _FakeMessage(
+        id=11,
+        date=_now(),
+        action=object(),
+        # Telethon exposes a channel-photo service action through the same
+        # convenience property used by ordinary photo posts.
+        photo=object(),
+    )
+
+    result = TelethonMessageNormalizer.build(
+        message=_as_message(message),
+        channel_id="c",
+        channel_title="C",
+        channel_username=None,
+    )
+
+    assert result.media_type == "unsupported"
+    assert result.raw_payload is message
 
 
 def test_normalizer_extracts_forward_with_channel_id_and_channel_post() -> None:

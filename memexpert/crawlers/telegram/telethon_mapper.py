@@ -89,6 +89,7 @@ class _TelethonMessageLike(Protocol):
 
     id: int
     date: datetime | None
+    action: object | None
     photo: object | None
     document: object | None
     reactions: _MessageReactionsLike | None
@@ -127,11 +128,17 @@ def _classify_document_mime(mime_type: str | None) -> _MediaType:
 def _classify_media(message: _TelethonMessageLike) -> _MediaType:
     """Return the typed media kind the mapper will advertise to the service.
 
-    Photos always map to ``"photo"``. Documents are classified by their
-    mime type. Messages with neither a photo nor a document return
-    ``"unsupported"`` so the caller can skip them.
+    Telegram service events are always unsupported. In particular, Telethon's
+    ``MessageService`` for a channel-photo change exposes that administrative
+    photo through its convenience ``photo`` property even though it is not a
+    channel post that the crawler should download or index. Ordinary photos
+    map to ``"photo"``. Documents are classified by their mime type. Messages
+    with neither a photo nor a document return ``"unsupported"`` so the caller
+    can skip them.
     """
 
+    if message.action is not None:
+        return "unsupported"
     if message.photo is not None:
         return "photo"
     document = message.document

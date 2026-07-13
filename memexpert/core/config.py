@@ -79,7 +79,7 @@ class Settings(BaseSettings):
     pipeline_allowed_mime_types: Annotated[tuple[str, ...], NoDecode] = PIPELINE_DEFAULT_ALLOWED_MIME_TYPES
     pipeline_phash_size: int = Field(default=16, ge=4, le=64)
     pipeline_image_max_pixels: int = Field(default=45_000_000, gt=0)
-    pipeline_transcode_timeout_seconds: float = Field(default=45.0, gt=0.0, le=900.0)
+    pipeline_transcode_timeout_seconds: float = Field(default=180.0, gt=0.0, le=900.0)
     pipeline_ffmpeg_binary: str = "ffmpeg"
     pipeline_ffprobe_binary: str = "ffprobe"
     pipeline_s3_original_prefix: str = "pipeline/originals"
@@ -110,7 +110,7 @@ class Settings(BaseSettings):
     pipeline_ocr_fallback_command: str | None = None
     pipeline_ocr_provider_mode: Literal["live", "fake"] = "live"
     pipeline_fake_ocr_text: str = "cat e2e smoke fake ocr text"
-    pipeline_ocr_timeout_seconds: float = Field(default=30.0, gt=0.0, le=600.0)
+    pipeline_ocr_timeout_seconds: float = Field(default=120.0, gt=0.0, le=600.0)
     pipeline_ocr_low_confidence_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
     pipeline_voyage_provider_mode: Literal["live", "fake"] = "live"
     pipeline_voyage_model: str = "voyage-multimodal-3.5"
