@@ -19,12 +19,14 @@ test.describe('public masonry feed smoke', () => {
 
     const firstCardLink = feed.getByRole('link', { name: 'Open Smoke test cat reaction' });
     const firstCard = firstCardLink.locator('xpath=ancestor::article');
+    const firstCardZoom = firstCard.getByRole('button', { name: 'Enlarge Smoke test cat reaction', exact: true });
     const firstCardFavorite = firstCard.getByRole('button', { name: 'Favorite', exact: true });
     const firstCardDownload = firstCard.getByRole('button', { name: 'Download', exact: true });
     const firstCardSave = firstCard.getByRole('button', { name: 'Save to collection', exact: true });
     const firstCardSend = firstCard.getByRole('button', { name: 'Send', exact: true });
     const firstCardMenu = feed.getByRole('button', { name: 'Actions for Smoke test cat reaction' });
     await expect(firstCardLink).toBeVisible();
+    await expect(firstCardZoom).toBeVisible();
     await expect(firstCardFavorite).toBeVisible();
     await expect(firstCardDownload).toBeVisible();
     await expect(firstCardSave).toBeVisible();
@@ -37,6 +39,8 @@ test.describe('public masonry feed smoke', () => {
     await expect(firstCardLink).not.toHaveAttribute('tabindex', '-1');
     await firstCardLink.focus();
     await expect(firstCardLink).toBeFocused();
+    await page.keyboard.press('Tab');
+    await expect(firstCardZoom).toBeFocused();
     await page.keyboard.press('Tab');
     await expect(firstCardFavorite).toBeFocused();
     await page.keyboard.press('Tab');
@@ -51,6 +55,14 @@ test.describe('public masonry feed smoke', () => {
     await expect(firstCardMenu).toHaveAttribute('aria-expanded', 'true');
     await expect(page.getByRole('menuitem', { name: /Favorite meme|Remove favorite/ })).toBeVisible();
     await page.keyboard.press('Escape');
+
+    await firstCardZoom.click();
+    const zoomDialog = page.getByRole('dialog', { name: 'Smoke test cat reaction' });
+    await expect(zoomDialog).toBeVisible();
+    await expect(zoomDialog.getByRole('img', { name: 'Enlarged Smoke test cat reaction' })).toBeVisible();
+    await zoomDialog.getByRole('button', { name: 'Close enlarged image' }).click();
+    await expect(zoomDialog).toHaveCount(0);
+    await expect(firstCardZoom).toBeFocused();
 
     await firstCardFavorite.click();
     const activeFavorite = firstCard.getByRole('button', { name: 'Remove favorite', exact: true });
@@ -90,6 +102,7 @@ test.describe('public masonry feed smoke', () => {
     await expect(feed.getByRole('link', { name: 'Open Smoke test cat reaction' })).toBeVisible();
     const cardLink = feed.getByRole('link', { name: 'Open Smoke test cat reaction' });
     const card = cardLink.locator('xpath=ancestor::article');
+    await expect(card.getByRole('button', { name: 'Enlarge Smoke test cat reaction', exact: true })).toBeVisible();
     await expect(card.getByRole('button', { name: 'Favorite', exact: true })).toBeVisible();
     await expect(card.getByRole('button', { name: 'Download', exact: true })).toBeVisible();
     await expect(card.getByRole('button', { name: 'Save to collection', exact: true })).toBeVisible();

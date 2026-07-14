@@ -14,12 +14,38 @@ describe('MemeCard', () => {
     expect(body).toContain('aria-label="Download"');
     expect(body).toContain('aria-label="Save to collection"');
     expect(body).toContain('aria-label="Send"');
+    expect(body).toContain('aria-label="Enlarge Launch reaction"');
     expect(body).not.toContain('<span>Favorite</span>');
     expect(body).not.toContain('<span>Save</span>');
     expect(body).not.toContain('<span>Send</span>');
     expect(body).not.toContain('640x360');
     expect(body).not.toContain('>en</');
     expect(body).not.toContain('#reaction');
+  });
+
+  it('only offers image enlargement for image media with a usable source', () => {
+    const image = render(MemeCard, { props: { meme: memeCard() } });
+    const base = memeCard();
+    const video = render(MemeCard, {
+      props: {
+        meme: memeCard({
+          media_type: 'video',
+          primary_file: {
+            ...base.primary_file!,
+            mime_type: 'video/mp4',
+            render: {
+              ...base.primary_file!.render!,
+              original_url: '/original.mp4',
+              display_url: null,
+              web_video_url: '/video.mp4'
+            }
+          }
+        })
+      }
+    });
+
+    expect(image.body).toContain('aria-label="Enlarge Launch reaction"');
+    expect(video.body).not.toContain('aria-label="Enlarge Launch reaction"');
   });
 
   it('hides the fallback title row without leaving a dangling labelled-by reference', () => {

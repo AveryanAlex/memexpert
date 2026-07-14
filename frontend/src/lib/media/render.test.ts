@@ -8,6 +8,7 @@ import {
   selectMediaAspectRatio,
   selectMediaPreload,
   selectMediaRender,
+  selectMediaZoomImage,
   selectVideoSourceType
 } from './render';
 
@@ -66,6 +67,28 @@ describe('selectMediaRender', () => {
       downloadUrl: null,
       hasMedia: false
     });
+  });
+});
+
+describe('selectMediaZoomImage', () => {
+  it('prefers the original image and falls back through display variants', () => {
+    expect(
+      selectMediaZoomImage(
+        file({
+          original_url: 'https://img.example/original.jpg',
+          display_url: 'https://img.example/display.webp',
+          preview_url: 'https://img.example/preview.webp'
+        })
+      )
+    ).toBe('https://img.example/original.jpg');
+    expect(selectMediaZoomImage(file({ display_url: 'https://img.example/display.webp' }))).toBe('https://img.example/display.webp');
+  });
+
+  it('does not expose audio or video originals as zoomable images', () => {
+    const original = { original_url: '/api/v1/media/files/file-1/original' };
+
+    expect(selectMediaZoomImage({ ...file(original), mime_type: 'audio/mpeg' })).toBeNull();
+    expect(selectMediaZoomImage({ ...file(original), mime_type: 'video/mp4' })).toBeNull();
   });
 });
 

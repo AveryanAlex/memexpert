@@ -11,7 +11,7 @@ The redesign is a presentation and progressive-disclosure change. FastAPI remain
 | Decision | Rationale |
 | --- | --- |
 | Discover, Search, Saved, and Account are the consumer navigation model. | These destinations map directly to browsing, intent-led retrieval, saved work, and personal settings. Trends remains reachable from Discover without taking the place of Search or Saved. |
-| Card media and Favorite/Download/Save/Send actions are always visible. | A meme catalog should make the next meaningful action available where the media is seen, rather than hide primary interaction behind a menu. |
+| Card media, image enlargement, and Favorite/Download/Save/Send actions are always visible. | A meme catalog should make the next meaningful action available where the media is seen, rather than hide primary interaction behind a menu. |
 | Selection is an opt-in, local grid state. | Bulk tools are useful only after an intentional transition into management mode; they must not dominate passive discovery. |
 | Search uses an ordered grid; Discover can use masonry. | Search order is relevance information. Discover optimizes browsing density across varied media dimensions. See [Grid and feed behavior](#grid-and-feed-behavior). |
 | Saved content and account settings have separate routes. | Library operations are content management; connection and preferences are account management. Keeping them separate makes each route smaller and more legible. |
@@ -38,6 +38,7 @@ Desktop navigation presents the brand, Discover, global query search, Saved, and
 | Boundary | Responsibility |
 | --- | --- |
 | `MemeCard.svelte` | Media-first card. Only media/title is a detail link; direct controls remain sibling buttons so interactive elements are not nested. It carries list/rank semantics and optional access markers. |
+| `MemeZoomDialog.svelte` | Top-right image overlay action that opens the highest-resolution available image in a viewport-sized accessible dialog. |
 | `MemeActionMenu.svelte` | One action implementation with `card`, `detail`, and `overflow` surfaces. Cards expose evenly distributed icon-only Favorite, Download, Save-to-collection, and Send controls; detail exposes labeled Favorite, Save-to-collection, and Send controls. Pin, Copy link, and Report remain contextual overflow actions. |
 | `MemeGrid.svelte` | Owns layout choice, result attribution markup, local selection mode, checkboxes, and sticky selection toolbar. It does not decide whether a route enables bulk behavior. |
 | `InfiniteMemeFeed.svelte` | Owns initial/next page state, deduplicated append behavior, intersection loading, and accessible Load more/retry/end states. It passes the route's layout and bulk policy to `MemeGrid`. |
@@ -78,8 +79,8 @@ Save-to-collection opens a contextual chooser of collections where the viewer ca
 ### Discover and cards
 
 - The first 390px-wide Discover viewport must include meme media. Large hero copy, management panels, and permanent bulk controls are excluded from the route.
-- Cards keep aspect-ratio-preserving media, a concise caption when one exists, and visible icon-only Favorite, Download, Save, Send, and overflow controls at touch sizes. The synthetic `Untitled meme` fallback remains available to accessible names and media alt text but does not render as a visible caption row.
-- Media/title remains the card's detail link. Direct action controls come after it in the card's tab order.
+- Cards keep aspect-ratio-preserving media, a concise caption when one exists, a top-right image-enlargement overlay, and visible icon-only Favorite, Download, Save, Send, and overflow controls at touch sizes. The synthetic `Untitled meme` fallback remains available to accessible names and media alt text but does not render as a visible caption row.
+- Media/title remains the card's detail link. Enlarge and direct action controls come after it in the card's tab order.
 - At 320px and above, controls must remain within the viewport without horizontal page overflow.
 
 ### Search filters
@@ -199,7 +200,7 @@ Trend visualizations follow these rules:
 
 - Use named navigation landmarks, active-page `aria-current`, visible mobile labels, and focus-visible rings on all interactive primitives.
 - Preserve semantic card/list structures. Cards expose title-based detail links, `aria-posinset`/`aria-setsize` where a feed provides rank, labeled action groups, and pressed state for Favorite/Save controls.
-- Do not nest action buttons inside the detail link. Keyboard focus reaches media/detail, Favorite, Download, Save, Send, then overflow in a predictable card order. Icon-only card controls retain explicit accessible names and pressed state; a favorited heart is filled and uses the danger/red token instead of changing to a visible “Favorited” label.
+- Do not nest action buttons inside the detail link. Keyboard focus reaches media/detail, Enlarge, Favorite, Download, Save, Send, then overflow in a predictable card order. The enlargement dialog uses the best available image variant, traps focus, closes with Escape, and restores focus to its trigger. Icon-only card controls retain explicit accessible names and pressed state; a favorited heart is filled and uses the danger/red token instead of changing to a visible “Favorited” label.
 - Dialogs have title/description/close controls; filter-sheet content scrolls internally; Reset/Show results are reachable at every viewport size.
 - Selection checkboxes have meme-specific labels, selection feedback uses live status, and pin ordering retains keyboard Up/Down controls in addition to pointer drag support.
 - Native disclosures provide a semantic summary. Status/error messages use appropriate live/alert roles without replacing essential visible text with tooltips.
@@ -209,7 +210,7 @@ Trend visualizations follow these rules:
 ## Regression Checklist for Future UX Changes
 
 1. Preserve Discover/Search/Saved/Account paths, active state, and mobile labels.
-2. Keep media and Favorite/Download/Save/Send visible on cards; keep secondary actions in overflow.
+2. Keep media, image enlargement, and Favorite/Download/Save/Send visible on cards; keep secondary actions in overflow.
 3. Keep Search filters URL-backed, access-aware, consumer-labeled, and responsively disclosed.
 4. Do not move library content back into Account or collection management above saved memes.
 5. Preserve detail/tag/template progressive disclosure and related-result attribution.

@@ -36,6 +36,14 @@ export function selectMediaRender(file: PublicMemeFileRead | null | undefined): 
   };
 }
 
+export function selectMediaZoomImage(file: PublicMemeFileRead | null | undefined): string | null {
+  const mimeType = file?.mime_type?.toLowerCase() ?? '';
+  if (mimeType.startsWith('audio/') || mimeType.startsWith('video/')) return null;
+
+  const render = file?.render;
+  return render?.original_url ?? file?.render_url ?? render?.display_url ?? render?.preview_url ?? render?.thumbnail_url ?? null;
+}
+
 export function selectMediaAspectRatio(file: PublicMemeFileRead | null | undefined): string | null {
   const dimensions = selectMediaDimensions(file);
   return dimensions ? `${dimensions.width} / ${dimensions.height}` : null;

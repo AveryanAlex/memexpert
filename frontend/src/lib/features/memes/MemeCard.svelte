@@ -6,6 +6,7 @@
   import { cn, focusRing } from '$lib/ui/styles';
   import MemeActionMenu from './MemeActionMenu.svelte';
   import MemeMedia from './MemeMedia.svelte';
+  import MemeZoomDialog from './MemeZoomDialog.svelte';
 
   interface Props {
     meme: PublicMemeCardRead;
@@ -59,7 +60,7 @@
 
 <article
   bind:this={cardElement}
-  class="w-full min-w-0 max-w-full overflow-hidden rounded-xl border border-line bg-paper"
+  class="relative w-full min-w-0 max-w-full overflow-hidden rounded-xl border border-line bg-paper"
   role={position ? 'listitem' : undefined}
   aria-posinset={position}
   aria-setsize={total}
@@ -80,5 +81,6 @@
       </div>
     {/if}
   </a>
+  <MemeZoomDialog {meme} />
   <MemeActionMenu {meme} {href} {attribution} surface="card" />
 </article>
