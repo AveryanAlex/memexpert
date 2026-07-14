@@ -38,11 +38,11 @@ export class MemeDetailPage {
     const favoriteButton = primaryActions.getByRole('button', { name: /^Favorite \(/ });
     await favoriteButton.click();
     await expect(favoriteButton).toHaveAttribute('aria-pressed', 'true');
-    await expect(this.page.getByRole('status')).toHaveText('Added to favorites.');
+    await expect(this.page.getByText('Added to favorites.', { exact: true })).toHaveCount(0);
 
     await favoriteButton.click();
     await expect(favoriteButton).toHaveAttribute('aria-pressed', 'false');
-    await expect(this.page.getByRole('status')).toHaveText('Removed from favorites.');
+    await expect(this.page.getByText('Removed from favorites.', { exact: true })).toHaveCount(0);
   }
 
   async favoriteAndExpectAttribution(meme: SeededMeme, attribution: ExpectedMemeAttribution) {
@@ -52,7 +52,7 @@ export class MemeDetailPage {
     expectRequestAttribution(await requestPromise, attribution, 'favorite action');
 
     await expect(primaryActions.getByRole('button', { name: /^Favorite \(/ })).toHaveAttribute('aria-pressed', 'true');
-    await expect(this.page.getByRole('status')).toHaveText('Added to favorites.');
+    await expect(this.page.getByText('Added to favorites.', { exact: true })).toHaveCount(0);
   }
 
   async saveAndExpectAttribution(meme: SeededMeme, attribution: ExpectedMemeAttribution) {
@@ -64,7 +64,7 @@ export class MemeDetailPage {
     expectRequestAttribution(await requestPromise, attribution, 'save action');
 
     await expect(saveButton).toHaveAttribute('aria-pressed', 'true');
-    await expect(this.page.getByRole('status')).toHaveText('Saved to Favorites.');
+    await expect(this.page.getByText('Saved to Favorites.', { exact: true })).toHaveCount(0);
   }
 
   async downloadAndExpectAttribution(meme: SeededMeme, attribution: ExpectedMemeAttribution) {
@@ -75,7 +75,7 @@ export class MemeDetailPage {
     await this.page.getByRole('menuitem', { name: 'Download', exact: true }).click();
     expectRequestAttribution(await requestPromise, attribution, 'download action');
 
-    await expect(this.page.getByRole('status')).toHaveText('Download started.');
+    await expect(this.page.getByText('Download started.', { exact: true })).toHaveCount(0);
     const downloadHref = await this.lastDownloadHref();
     expect(downloadHref).toBeTruthy();
   }
@@ -87,7 +87,7 @@ export class MemeDetailPage {
     await this.primaryActions().getByRole('button', { name: 'Send', exact: true }).click();
     expectRequestAttribution(await requestPromise, attribution, 'share action');
 
-    await expect(this.page.getByRole('status')).toHaveText('Opened Telegram share.');
+    await expect(this.page.getByText('Opened Telegram share.', { exact: true })).toHaveCount(0);
     const shareUrl = await this.lastOpenedUrl();
     expect(shareUrl).toMatch(/^https:\/\/t\.me\/share\/url\?/);
     expect(new URL(shareUrl ?? '').searchParams.get('url')).toContain(`/memes/${meme.slug}`);
