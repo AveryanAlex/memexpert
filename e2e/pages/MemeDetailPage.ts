@@ -55,16 +55,15 @@ export class MemeDetailPage {
     await expect(this.page.getByText('Added to favorites.', { exact: true })).toHaveCount(0);
   }
 
-  async saveAndExpectAttribution(meme: SeededMeme, attribution: ExpectedMemeAttribution) {
-    const requestPromise = this.waitForCollectionSavePost(meme.meme_id);
+  async expectGuestSaveChooserExcludesFavorites() {
     const primaryActions = this.primaryActions();
     const saveButton = primaryActions.getByRole('button', { name: 'Save to collection', exact: true });
+    await expect(saveButton).toHaveAttribute('aria-pressed', 'false');
     await saveButton.click();
-    await this.page.getByRole('menuitem', { name: 'Favorites', exact: true }).click();
-    expectRequestAttribution(await requestPromise, attribution, 'save action');
-
-    await expect(saveButton).toHaveAttribute('aria-pressed', 'true');
-    await expect(this.page.getByText('Saved to Favorites.', { exact: true })).toHaveCount(0);
+    await expect(this.page.getByRole('menuitem', { name: 'Favorites', exact: true })).toHaveCount(0);
+    await expect(this.page.getByRole('menuitem', { name: 'No collections available', exact: true })).toBeVisible();
+    await this.page.keyboard.press('Escape');
+    await expect(saveButton).toHaveAttribute('aria-pressed', 'false');
   }
 
   async downloadAndExpectAttribution(meme: SeededMeme, attribution: ExpectedMemeAttribution) {
@@ -103,13 +102,6 @@ export class MemeDetailPage {
     return this.page.waitForRequest((request) => {
       const url = new URL(request.url());
       return request.method() === 'POST' && url.pathname === `/api/v1/memes/${memeId}/${action}`;
-    });
-  }
-
-  private waitForCollectionSavePost(memeId: string) {
-    return this.page.waitForRequest((request) => {
-      const url = new URL(request.url());
-      return request.method() === 'POST' && new RegExp(`^/api/v1/collections/[^/]+/memes/${memeId}$`).test(url.pathname);
     });
   }
 

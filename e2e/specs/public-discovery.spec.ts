@@ -62,7 +62,7 @@ test('guest opens an attributed search result and exercises detail actions', asy
   await app.detail.expectAttributionQuery(attribution);
 
   await app.detail.favoriteAndExpectAttribution(cat, attribution);
-  await app.detail.saveAndExpectAttribution(cat, attribution);
+  await app.detail.expectGuestSaveChooserExcludesFavorites();
   await app.detail.downloadAndExpectAttribution(cat, attribution);
   await app.detail.shareToTelegramAndExpectAttribution(cat, attribution);
 });

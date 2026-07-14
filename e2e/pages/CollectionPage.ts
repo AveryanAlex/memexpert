@@ -58,7 +58,10 @@ export class CollectionPage {
   }
 
   async expectSavedMemeVisible(meme: SeededMeme) {
-    await expect(this.page.getByRole('link', { name: `Open ${meme.title}` }).first()).toBeVisible();
+    const link = this.page.getByRole('link', { name: `Open ${meme.title}` }).first();
+    await expect(link).toBeVisible();
+    const card = link.locator('xpath=ancestor::article');
+    await expect(card.getByRole('button', { name: 'Save to collection', exact: true })).toHaveAttribute('aria-pressed', 'true');
   }
 
   private async expectOpen(fixture: SeededCollectionManagementFixture) {
