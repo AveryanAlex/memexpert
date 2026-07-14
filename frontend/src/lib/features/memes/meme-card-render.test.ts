@@ -15,6 +15,8 @@ describe('MemeCard', () => {
     expect(body).toContain('aria-label="Save to collection"');
     expect(body).toContain('aria-label="Send"');
     expect(body).toContain('aria-label="Enlarge Launch reaction"');
+    expect(body).toContain('!hidden !size-10');
+    expect(body).toContain('min-[600px]:!grid');
     expect(body).not.toContain('<span>Favorite</span>');
     expect(body).not.toContain('<span>Save</span>');
     expect(body).not.toContain('<span>Send</span>');

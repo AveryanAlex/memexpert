@@ -21,7 +21,7 @@
   <Dialog.Root>
     <Dialog.Trigger
       type="button"
-      class="absolute right-3 top-3 z-10 !grid !size-10 !place-items-center !rounded-full !border !border-white/30 !bg-black/65 !p-0 !text-white shadow-lg backdrop-blur-sm hover:!bg-black/80"
+      class="absolute right-3 top-3 z-10 !hidden !size-10 !place-items-center !rounded-full !border !border-white/30 !bg-black/65 !p-0 !text-white shadow-lg backdrop-blur-sm hover:!bg-black/80 min-[600px]:!grid"
       aria-label={`Enlarge ${title}`}
       title="Enlarge image"
     >

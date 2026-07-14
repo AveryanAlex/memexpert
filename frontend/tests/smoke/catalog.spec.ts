@@ -102,7 +102,7 @@ test.describe('public masonry feed smoke', () => {
     await expect(feed.getByRole('link', { name: 'Open Smoke test cat reaction' })).toBeVisible();
     const cardLink = feed.getByRole('link', { name: 'Open Smoke test cat reaction' });
     const card = cardLink.locator('xpath=ancestor::article');
-    await expect(card.getByRole('button', { name: 'Enlarge Smoke test cat reaction', exact: true })).toBeVisible();
+    await expect(card.locator('button[aria-label="Enlarge Smoke test cat reaction"]')).toBeHidden();
     await expect(card.getByRole('button', { name: 'Favorite', exact: true })).toBeVisible();
     await expect(card.getByRole('button', { name: 'Download', exact: true })).toBeVisible();
     await expect(card.getByRole('button', { name: 'Save to collection', exact: true })).toBeVisible();
@@ -111,6 +111,22 @@ test.describe('public masonry feed smoke', () => {
     const mediaBox = await card.getByRole('img', { name: 'Smoke test cat reaction' }).boundingBox();
     expect(mediaBox?.y).toBeLessThan(844);
     await expect(page.getByRole('button', { name: 'Load more' })).toBeVisible();
+  });
+
+  test('image magnifier follows the masonry one-column threshold', async ({ page }) => {
+    await page.setViewportSize({ width: 590, height: 844 });
+    await disableIntersectionObserver(page);
+    await page.goto('/');
+
+    const feed = page.getByRole('list', { name: 'Meme results' });
+    const firstCard = feed.getByRole('link', { name: 'Open Smoke test cat reaction' }).locator('xpath=ancestor::article');
+    const zoom = firstCard.locator('button[aria-label="Enlarge Smoke test cat reaction"]');
+    await expect(feed).toHaveAttribute('data-column-count', '1');
+    await expect(zoom).toBeHidden();
+
+    await page.setViewportSize({ width: 610, height: 844 });
+    await expect(feed).toHaveAttribute('data-column-count', '2');
+    await expect(zoom).toBeVisible();
   });
 
   test('card actions do not overlap at the supported 320px viewport', async ({ page }) => {
