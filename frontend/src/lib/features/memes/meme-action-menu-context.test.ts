@@ -2,6 +2,7 @@ import { render } from 'svelte/server';
 import { describe, expect, it } from 'vitest';
 
 import type { CurrentSessionRead, PublicMemeCardRead } from '$lib/api/types';
+import { createMemeActionState, memeActionStateContextKey } from '$lib/meme-action-state';
 import { viewerCapabilitiesContextKey, viewerCapabilitiesFromSession } from '$lib/viewer-capabilities';
 import MemeActionMenu from './MemeActionMenu.svelte';
 import MemeGrid from './MemeGrid.svelte';
@@ -55,6 +56,24 @@ describe('MemeActionMenu viewer capabilities', () => {
     expect(body).toContain('Favorite (4)');
     expect(body).not.toContain('Pin requires a full account');
     expect(body).not.toContain('>Pin</');
+  });
+
+  it('renders shared Favorite, Save, and like-count patches', () => {
+    const meme = memeCard('44444444-4444-4444-8444-444444444444', 'Shared action state meme');
+    const actionState = createMemeActionState('full-user-id');
+    actionState.publish(meme.id, { favorited: true, saved: true, likeCount: 5 });
+    const context = viewerContext(true);
+    context.set(memeActionStateContextKey, actionState);
+
+    const { body } = render(MemeActionMenu, {
+      props: { meme, surface: 'detail' },
+      context
+    });
+
+    expect(body).toContain('Favorite (5)');
+    expect(body).toContain('fill-current text-danger');
+    expect(body).toContain('Saved');
+    expect(body).toContain('fill-current text-accent');
   });
 });
 

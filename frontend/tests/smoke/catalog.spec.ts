@@ -66,8 +66,11 @@ test.describe('public masonry feed smoke', () => {
 
     await firstCardFavorite.click();
     const activeFavorite = firstCard.getByRole('button', { name: 'Remove favorite', exact: true });
+    const activeMotdFavorite = motd.getByRole('button', { name: 'Remove favorite', exact: true });
     await expect(activeFavorite).toHaveAttribute('aria-pressed', 'true');
     await expect(activeFavorite.locator('svg')).toHaveClass(/text-danger/);
+    await expect(activeMotdFavorite).toHaveAttribute('aria-pressed', 'true');
+    await expect(activeMotdFavorite.locator('svg')).toHaveClass(/text-danger/);
     await expect(firstCard.getByText('Added to favorites.', { exact: true })).toHaveCount(0);
 
     const loadMore = page.getByRole('button', { name: 'Load more' });
@@ -181,7 +184,16 @@ test.describe('public masonry feed smoke', () => {
 
     await page.getByRole('menuitem', { name: 'Recent reactions', exact: true }).click();
     await expect(card.getByRole('button', { name: 'Save to collection', exact: true })).toHaveAttribute('aria-pressed', 'true');
+    const motdSave = page.getByRole('region', { name: 'Meme of the Day' }).getByRole('button', { name: 'Save to collection', exact: true });
+    await expect(motdSave).toHaveAttribute('aria-pressed', 'true');
     await expect(card.getByText('Saved to Recent reactions.', { exact: true })).toHaveCount(0);
+
+    const motd = page.getByRole('region', { name: 'Meme of the Day' });
+    await motd.getByRole('button', { name: 'Actions for Smoke test cat reaction' }).click();
+    await page.getByRole('menuitem', { name: 'Pin', exact: true }).click();
+
+    await card.getByRole('button', { name: 'Actions for Smoke test cat reaction' }).click();
+    await expect(page.getByRole('menuitem', { name: 'Unpin', exact: true })).toBeVisible();
   });
 
   test('search selection controls stay hidden until Select items is chosen', async ({ page }) => {

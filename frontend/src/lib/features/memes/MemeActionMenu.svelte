@@ -26,6 +26,7 @@
     type MemeActionAttribution,
     type MemeActionKind
   } from '$lib/memeActions';
+  import { readMemeActionState } from '$lib/meme-action-state';
   import { Button, Select, Textarea } from '$lib/ui';
   import { cn } from '$lib/ui/styles';
   import { readViewerCapabilities } from '$lib/viewer-capabilities';
@@ -60,11 +61,8 @@
   }: Props = $props();
 
   const viewerCapabilities = readViewerCapabilities();
+  const memeActionState = readMemeActionState();
 
-  let favorited = $state(false);
-  let saved = $state(false);
-  let pinned = $state(false);
-  let likeCount = $state(0);
   let pending = $state<MemeActionKind | null>(null);
   let errorMessage = $state<string | null>(null);
   let reportOpen = $state(false);
@@ -99,12 +97,11 @@
   const isDetailSurface = $derived(actionSurface === 'detail');
   const menuLabel = $derived(isCardSurface ? `Actions for ${title}` : 'Meme actions');
   const interactionsDisabled = $derived(!hydrated || pending !== null);
-
-  syncStateFromMeme();
-
-  $effect(() => {
-    syncStateFromMeme();
-  });
+  const sharedState = $derived($memeActionState[meme.id]);
+  const favorited = $derived(sharedState?.favorited ?? meme.viewer_has_favorited);
+  const saved = $derived(sharedState?.saved ?? meme.viewer_has_saved);
+  const pinned = $derived(sharedState?.pinned ?? meme.viewer_has_pinned);
+  const likeCount = $derived(sharedState?.likeCount ?? meme.like_count);
 
   $effect(() => {
     hydrated = true;
@@ -119,24 +116,19 @@
     }
   });
 
-  function syncStateFromMeme() {
-    favorited = meme.viewer_has_favorited;
-    saved = meme.viewer_has_saved;
-    pinned = meme.viewer_has_pinned;
-    likeCount = meme.like_count;
-  }
-
   async function toggleFavorite() {
     const next = !favorited;
+    const wasFavorited = favorited;
+    const previousLikeCount = likeCount;
     await runAction(next ? 'favorite' : 'unfavorite', async () => {
-      const wasFavorited = favorited;
       const response = next ? await favoriteMeme(actionRequest) : await unfavoriteMeme(actionRequest);
-      favorited = next;
+      let nextLikeCount = previousLikeCount;
       if (next && !wasFavorited) {
-        likeCount += 1;
+        nextLikeCount += 1;
       } else if (!next && wasFavorited && wasRemoved(response)) {
-        likeCount = Math.max(0, likeCount - 1);
+        nextLikeCount = Math.max(0, nextLikeCount - 1);
       }
+      memeActionState.publish(meme.id, { favorited: next, likeCount: nextLikeCount });
       onFavoriteChange?.(next);
     });
   }
@@ -145,7 +137,7 @@
     const next = !saved;
     await runAction(next ? 'save' : 'unsave', async () => {
       await (next ? saveMeme(actionRequest) : removeSavedMeme(actionRequest));
-      saved = next;
+      memeActionState.publish(meme.id, { saved: next });
     });
   }
 
@@ -181,7 +173,7 @@
         memeId: meme.id,
         body: actionBody
       });
-      saved = true;
+      memeActionState.publish(meme.id, { saved: true });
     });
   }
 
@@ -189,7 +181,7 @@
     const next = !pinned;
     await runAction(next ? 'pin' : 'unpin', async () => {
       await (next ? pinMeme(actionRequest) : unpinMeme(actionRequest));
-      pinned = next;
+      memeActionState.publish(meme.id, { pinned: next });
     });
   }
 
