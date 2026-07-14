@@ -29,7 +29,7 @@ from memexpert.models.base import utcnow
 from memexpert.models.collection import Collection, CollectionMember, CollectionMeme, PinnedMeme
 from memexpert.models.content import EmbeddingCache, Meme, MemeFile, MemeSeoPage, MemeTemplate
 from memexpert.models.enums import AnalyticsEventType, CollectionKind, ContentKind, ContentLanguage, EmbeddingInputType
-from memexpert.models.user import AnalyticsEvent, User
+from memexpert.models.user import AnalyticsEvent
 from memexpert.schemas.meme import (
     MemeCardRead,
     MemeDetailRead,
@@ -2256,9 +2256,6 @@ class MemeSearchService:
             return _ViewerMemeActionState()
 
         unique_meme_ids = tuple(dict.fromkeys(meme_ids))
-        active_save_collection_id = (
-            select(User.active_save_collection_id).where(User.id == viewer_user_id).scalar_subquery()
-        )
         viewer_has_favorited = (
             select(CollectionMeme.meme_id)
             .join(Collection, Collection.id == CollectionMeme.collection_id)
@@ -2271,9 +2268,21 @@ class MemeSearchService:
         )
         viewer_has_saved = (
             select(CollectionMeme.meme_id)
+            .join(Collection, Collection.id == CollectionMeme.collection_id)
+            .outerjoin(
+                CollectionMember,
+                and_(
+                    CollectionMember.collection_id == Collection.id,
+                    CollectionMember.user_id == viewer_user_id,
+                ),
+            )
             .where(
                 CollectionMeme.meme_id == Meme.id,
-                CollectionMeme.collection_id == active_save_collection_id,
+                Collection.kind != CollectionKind.FAVORITES,
+                or_(
+                    Collection.owner_id == viewer_user_id,
+                    CollectionMember.user_id == viewer_user_id,
+                ),
             )
             .exists()
         )

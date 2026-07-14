@@ -197,7 +197,10 @@ class PublicMemeCardRead(BaseModel):
     caption: str | None
     seo_page_slug: str | None = None
     viewer_has_favorited: bool = False
-    viewer_has_saved: bool = False
+    viewer_has_saved: bool = Field(
+        default=False,
+        description="Whether the meme belongs to any non-Favorites collection accessible to the viewer.",
+    )
     viewer_has_pinned: bool = False
     viewer_access: PublicMemeViewerAccessRead | None = None
     created_at: datetime

@@ -179,6 +179,7 @@ async def test_collection_routes_crud_detail_remove_active_and_invites(
     assert join_response.status_code == 200
     assert viewer_detail_response.status_code == 200
     assert viewer_detail_response.json()["viewer_role"] == "viewer"
+    assert viewer_detail_response.json()["saved_memes"][0]["meme"]["viewer_has_saved"] is True
     assert viewer_detail_response.json()["capabilities"]["can_remove_memes"] is False
     assert viewer_remove_response.status_code == 403
     assert guest_create_response.status_code == 403

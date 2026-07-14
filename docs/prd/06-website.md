@@ -9,7 +9,7 @@ SvelteKit SSR application, responsive from a 320px viewport upward. The same pub
 - The primary loop is **discover → search → save or send → continue discovering**.
 - The first mobile Discover viewport prioritizes meme media. Marketing copy, collection administration, and bulk controls must not displace it.
 - Consumer-facing copy is concise and uses familiar terms. Backend fields, ranking diagnostics, raw IDs, scores, fallback algorithms, and candidate counts are not consumer UI.
-- Favorite means adding a meme to Favorites. Save sends a meme to the current active save collection. Send opens Telegram sharing.
+- Favorite means adding a meme to Favorites. The card Save control chooses a writable non-Favorites collection, and its bookmark is active when the meme belongs to any non-Favorites collection the viewer can access. Send opens Telegram sharing.
 
 ## Application Shell
 

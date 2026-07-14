@@ -74,6 +74,13 @@ describe('MemeCard', () => {
     expect(body).not.toContain('Favorited');
   });
 
+  it('renders a filled bookmark only for a meme saved outside Favorites', () => {
+    const { body } = render(MemeCard, { props: { meme: memeCard({ viewer_has_saved: true }) } });
+
+    expect(body).toMatch(/aria-label="Save to collection"[^>]*aria-pressed="true"/);
+    expect(body).toContain('fill-current text-accent');
+  });
+
   it('only renders shared/private visibility badges when explicitly enabled', () => {
     const hiddenShared = render(MemeCard, { props: { meme: memeCard({ viewer_access: { visibility: 'shared' } }) } });
     const shared = render(MemeCard, { props: { meme: memeCard({ viewer_access: { visibility: 'shared' } }), showAccessMarkers: true } });

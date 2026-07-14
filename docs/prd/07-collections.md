@@ -30,6 +30,8 @@ Up to 20. Shown first in inline empty query. Full accounts only. Web profile sup
 
 Liking a meme adds it to the Favorites collection. The total like count (number of unique users who favorited) is displayed publicly on the meme page. This count also feeds into popularity scoring and trending calculations.
 
+Favorites is not offered in the Save-to-collection chooser and does not activate the saved/bookmark state. That state means the meme belongs to at least one accessible non-Favorites collection, regardless of which collection is currently the active save destination.
+
 ## User Uploads
 
 Users upload memes to collections. Uploads are:

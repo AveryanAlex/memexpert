@@ -2698,7 +2698,13 @@ async def test_public_meme_dtos_include_viewer_action_state_for_anonymous_guest_
         kind=CollectionKind.CUSTOM,
         visibility=CollectionVisibility.PRIVATE,
     )
-    migrated_db_session.add_all([guest_favorites, full_favorites, full_active_collection])
+    full_other_collection = Collection(
+        owner_id=full_user.id,
+        title="Other saves",
+        kind=CollectionKind.CUSTOM,
+        visibility=CollectionVisibility.PRIVATE,
+    )
+    migrated_db_session.add_all([guest_favorites, full_favorites, full_active_collection, full_other_collection])
     await migrated_db_session.flush()
     guest_user.active_save_collection_id = guest_favorites.id
     full_user.active_save_collection_id = full_active_collection.id
@@ -2707,7 +2713,7 @@ async def test_public_meme_dtos_include_viewer_action_state_for_anonymous_guest_
             CollectionMeme(collection_id=guest_favorites.id, meme_id=favorite_meme.id, added_by_user_id=guest_user.id),
             CollectionMeme(collection_id=full_favorites.id, meme_id=favorite_meme.id, added_by_user_id=full_user.id),
             CollectionMeme(
-                collection_id=full_active_collection.id,
+                collection_id=full_other_collection.id,
                 meme_id=saved_meme.id,
                 added_by_user_id=full_user.id,
             ),
@@ -2756,7 +2762,7 @@ async def test_public_meme_dtos_include_viewer_action_state_for_anonymous_guest_
 
     assert set(anonymous_states) == {favorite_meme.id, saved_meme.id, pinned_meme.id}
     assert all(state == (False, False, False) for state in anonymous_states.values())
-    assert guest_states[favorite_meme.id] == (True, True, False)
+    assert guest_states[favorite_meme.id] == (True, False, False)
     assert guest_states[saved_meme.id] == (False, False, False)
     assert full_states == expected_full_states
     assert page_states(full_search_page) == expected_full_states

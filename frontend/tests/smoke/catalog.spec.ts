@@ -54,6 +54,7 @@ test.describe('public masonry feed smoke', () => {
     await firstCardMenu.press('Enter');
     await expect(firstCardMenu).toHaveAttribute('aria-expanded', 'true');
     await expect(page.getByRole('menuitem', { name: /Favorite meme|Remove favorite/ })).toBeVisible();
+    await expect(page.getByRole('menuitem', { name: 'Save', exact: true })).toHaveCount(0);
     await page.keyboard.press('Escape');
 
     await firstCardZoom.click();
@@ -71,6 +72,7 @@ test.describe('public masonry feed smoke', () => {
     await expect(activeFavorite.locator('svg')).toHaveClass(/text-danger/);
     await expect(activeMotdFavorite).toHaveAttribute('aria-pressed', 'true');
     await expect(activeMotdFavorite.locator('svg')).toHaveClass(/text-danger/);
+    await expect(firstCardSave).toHaveAttribute('aria-pressed', 'false');
     await expect(firstCard.getByText('Added to favorites.', { exact: true })).toHaveCount(0);
 
     const loadMore = page.getByRole('button', { name: 'Load more' });
@@ -176,11 +178,11 @@ test.describe('public masonry feed smoke', () => {
     await card.getByRole('button', { name: 'Save to collection', exact: true }).click();
 
     await expect(page.getByRole('menuitem', { name: 'Recent reactions', exact: true })).toBeVisible();
-    await expect(page.getByRole('menuitem', { name: 'Favorites', exact: true })).toBeVisible();
+    await expect(page.getByRole('menuitem', { name: 'Favorites', exact: true })).toHaveCount(0);
     await expect(page.getByRole('menuitem', { name: 'Smoke private team saves', exact: true })).toHaveCount(0);
     const collectionItems = page.getByRole('menuitem');
-    await expect(collectionItems).toHaveCount(2);
-    expect((await collectionItems.allTextContents()).map((text) => text.trim())).toEqual(['Recent reactions', 'Favorites']);
+    await expect(collectionItems).toHaveCount(1);
+    expect((await collectionItems.allTextContents()).map((text) => text.trim())).toEqual(['Recent reactions']);
 
     await page.getByRole('menuitem', { name: 'Recent reactions', exact: true }).click();
     await expect(card.getByRole('button', { name: 'Save to collection', exact: true })).toHaveAttribute('aria-pressed', 'true');

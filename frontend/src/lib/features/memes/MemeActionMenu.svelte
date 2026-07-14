@@ -7,8 +7,6 @@
     recordMemeDownload,
     recordMemeShare,
     reportMeme,
-    removeSavedMeme,
-    saveMeme,
     saveMemeToCollection,
     unfavoriteMeme,
     unpinMeme,
@@ -133,14 +131,6 @@
     });
   }
 
-  async function toggleSave() {
-    const next = !saved;
-    await runAction(next ? 'save' : 'unsave', async () => {
-      await (next ? saveMeme(actionRequest) : removeSavedMeme(actionRequest));
-      memeActionState.publish(meme.id, { saved: next });
-    });
-  }
-
   async function loadCollections() {
     if (!browser || collectionsLoading) return;
 
@@ -149,7 +139,9 @@
     collectionsError = null;
     try {
       const response = await fetchCollections({ fetch, baseUrl: window.location.origin });
-      writableCollections = response.collections.filter((collection) => collection.capabilities.can_add_memes);
+      writableCollections = response.collections.filter(
+        (collection) => collection.collection.kind !== 'favorites' && collection.capabilities.can_add_memes
+      );
       collectionsReady = true;
     } catch (error) {
       collectionsError = error instanceof Error ? error.message : 'Could not load your collections.';
@@ -292,7 +284,7 @@
     {:else if collectionsError}
       <p class="m-0 rounded-xl px-3 py-2.5 text-sm font-semibold text-danger" role="alert">{collectionsError} Close and reopen to retry.</p>
     {:else if writableCollections.length === 0}
-      <Menu.Item disabled>No writable collections available</Menu.Item>
+      <Menu.Item disabled>No collections available</Menu.Item>
     {:else}
       {#each writableCollections as collection (collection.collection.id)}
         <Menu.Item onSelect={() => selectCollection(collection)} disabled={pending !== null}>
@@ -365,10 +357,6 @@
             <Heart class="size-4" aria-hidden="true" />
             {favorited ? 'Remove favorite' : 'Favorite'} meme
           </Menu.Item>
-          <Menu.Item onSelect={toggleSave} disabled={pending !== null}>
-            <Bookmark class="size-4" aria-hidden="true" />
-            {saved ? 'Remove save' : 'Save'}
-          </Menu.Item>
           {#if canPin}
             <Menu.Item onSelect={togglePin} disabled={pending !== null}>
               <Pin class="size-4" aria-hidden="true" />
@@ -419,10 +407,6 @@
       <Menu.Item onSelect={toggleFavorite} disabled={pending !== null}>
         <Heart class="size-4" aria-hidden="true" />
         {favorited ? 'Remove favorite' : 'Favorite'} meme
-      </Menu.Item>
-      <Menu.Item onSelect={toggleSave} disabled={pending !== null}>
-        <Bookmark class="size-4" aria-hidden="true" />
-        {saved ? 'Remove save' : 'Save'}
       </Menu.Item>
       {#if canPin}
         <Menu.Item onSelect={togglePin} disabled={pending !== null}>
