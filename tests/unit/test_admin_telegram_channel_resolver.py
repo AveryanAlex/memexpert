@@ -105,6 +105,53 @@ async def test_resolver_stores_lowercase_public_username_that_existing_crawler_c
 
 
 @pytest.mark.asyncio
+async def test_resolver_accepts_requested_handle_from_active_multi_username_list(monkeypatch) -> None:
+    entity = _FakeChannel(
+        id=123456789,
+        username=None,
+        usernames=[
+            SimpleNamespace(username="memach", active=True),
+            SimpleNamespace(username="notmemes", active=True),
+            SimpleNamespace(username="old_memach", active=False),
+        ],
+        title="Not Memes",
+    )
+    client = _FakeClient(entity=entity)
+    monkeypatch.setattr(resolver_module, "_build_telegram_client", lambda **_kwargs: client)
+    monkeypatch.setattr(resolver_module, "_telegram_channel_type", lambda: _FakeChannel)
+
+    resolved = await resolve_admin_telegram_channel(
+        settings=_settings(),
+        string_session=SecretStr("opaque"),
+        reference="@MeMaCh",
+    )
+
+    assert resolved.platform_id == "memach"
+    assert resolved.username == "memach"
+    assert resolved.title == "Not Memes"
+    assert client.references == ["memach"]
+
+
+@pytest.mark.asyncio
+async def test_resolver_rejects_inactive_multi_username_without_legacy_handle(monkeypatch) -> None:
+    client = _FakeClient(
+        entity=_FakeChannel(
+            username=None,
+            usernames=[SimpleNamespace(username="public_channel", active=False)],
+        ),
+    )
+    monkeypatch.setattr(resolver_module, "_build_telegram_client", lambda **_kwargs: client)
+    monkeypatch.setattr(resolver_module, "_telegram_channel_type", lambda: _FakeChannel)
+
+    with pytest.raises(AdminTelegramChannelResolverError, match="with a handle"):
+        await resolve_admin_telegram_channel(
+            settings=_settings(),
+            string_session=SecretStr("opaque"),
+            reference="@public_channel",
+        )
+
+
+@pytest.mark.asyncio
 async def test_resolver_requires_authorization_and_channel_entity(monkeypatch) -> None:
     unauthorized = _FakeClient(entity=_FakeChannel(), authorized=False)
     monkeypatch.setattr(resolver_module, "_build_telegram_client", lambda **_kwargs: unauthorized)
@@ -171,11 +218,13 @@ class _FakeChannel:
         *,
         id: int = 123,
         username: str | None = "public_channel",
+        usernames: list[object] | None = None,
         title: str = "Public channel",
         participants_count: int | None = None,
     ) -> None:
         self.id = id
         self.username = username
+        self.usernames = usernames
         self.title = title
         self.participants_count = participants_count
 

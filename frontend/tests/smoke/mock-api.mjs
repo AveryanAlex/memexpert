@@ -376,6 +376,7 @@ const adminSourceSeed = [
   }
 ];
 const adminSourceStateBySession = new Map();
+const transientQuickAddFailures = new WeakSet();
 const loginAttemptPolls = new Map();
 const staleFullSessionReads = new Set();
 let loginAttemptSequence = 0;
@@ -920,6 +921,11 @@ async function handleAdminApi(request, response, url, adminSources) {
     const quickAdd = validateQuickAddRequest(await readRequestJson(request));
     if ('error' in quickAdd) {
       sendJson(response, 422, { detail: quickAdd.error });
+      return true;
+    }
+    if (quickAdd.username === 'fresh_public_channel' && !transientQuickAddFailures.has(adminSources)) {
+      transientQuickAddFailures.add(adminSources);
+      sendJson(response, 504, { detail: 'Gateway restarted during source creation.' });
       return true;
     }
     const source = upsertQuickAddedSource(adminSources, quickAdd.username);

@@ -117,11 +117,11 @@ async def resolve_admin_telegram_channel(
             if not isinstance(entity, _telegram_channel_type()):
                 raise AdminTelegramChannelResolverError("That public Telegram reference is not a channel.")
             channel_id = getattr(entity, "id", None)
-            username = getattr(entity, "username", None)
+            username = _resolve_public_username(entity, requested_username=normalized.username)
             title = getattr(entity, "title", None)
             if not isinstance(channel_id, int) or channel_id <= 0:
                 raise AdminTelegramChannelResolverError("Telegram returned an invalid channel identity.")
-            if not isinstance(username, str) or _TELEGRAM_USERNAME_RE.fullmatch(username) is None:
+            if username is None:
                 raise AdminTelegramChannelResolverError("Only public Telegram channels with a handle are supported.")
             if not isinstance(title, str) or not title.strip():
                 title = username
@@ -166,6 +166,25 @@ def _normalized_username(username: str) -> NormalizedPublicTelegramReference:
         username=canonical_username,
         canonical_url=f"https://t.me/{canonical_username}",
     )
+
+
+def _resolve_public_username(entity: object, *, requested_username: str) -> str | None:
+    active_usernames = getattr(entity, "usernames", None)
+    if isinstance(active_usernames, (list, tuple)):
+        for candidate in active_usernames:
+            if getattr(candidate, "active", False) is not True:
+                continue
+            username = _valid_public_username(getattr(candidate, "username", None))
+            if username == requested_username:
+                return requested_username
+
+    return _valid_public_username(getattr(entity, "username", None))
+
+
+def _valid_public_username(value: object) -> str | None:
+    if not isinstance(value, str) or _TELEGRAM_USERNAME_RE.fullmatch(value) is None:
+        return None
+    return value.lower()
 
 
 def _build_telegram_client(*, string_session: SecretStr, api_id: int, api_hash: SecretStr):

@@ -135,6 +135,12 @@ crawler resolution without persisted access-hash material. This bounded flow
 does not follow Telegram username renames; an operator must reconcile a rename
 before treating the old public identity as current.
 
+Telegram channels can expose public handles through either the legacy singular
+`username` field or the active entries in the multi-username `usernames` list.
+When the requested handle is active in that list, the resolver accepts and
+stores that requested lowercase handle even if the legacy field is null.
+Inactive aliases do not satisfy the public-handle requirement.
+
 The service performs Telegram I/O without retaining a database row lock, then
 locks/rechecks the selected account and canonical source identity before writing.
 It atomically creates or reuses the source, assigns the selected ready account,
@@ -150,6 +156,13 @@ and explicitly rejects Reddit/VK or any other non-Telegram platform. The list
 projection remains platform-extensible for future crawlers. Reddit and VK are
 not crawler implementations yet; their suggestions may be rejected but must
 not create dormant source rows.
+
+The hydrated browser form submits source creation to the same-origin versioned
+API path instead of routing the write through the frontend server. This keeps an
+already-open admin page usable while the frontend container restarts. Because
+the API operation is idempotent, the client retries only transport failures and
+HTTP 502/503/504 responses; validation, authorization, and conflict responses
+are returned immediately without retry.
 
 Until `initial_catchup_completed` is durable, the adapter repeatedly reads the
 newest bounded window and yields it oldest-to-newest; this prevents a partial

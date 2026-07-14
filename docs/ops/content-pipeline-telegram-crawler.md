@@ -214,12 +214,24 @@ bounded first catch-up by default. Public Telegram username renames are not foll
 automatically; reconcile a renamed handle as an operator exception before
 expecting continued fetches.
 
+Telegram's legacy singular `username` can be null even when the requested
+handle is public. The resolver also checks Telegram's multi-username list and
+accepts the requested handle only when that entry is active. Inactive aliases
+remain unsupported.
+
 When the form is started from a Telegram suggestion, source creation/reuse and
 approval of the matching pending suggestion happen atomically. A failed lookup
 leaves the suggestion pending; retrying after a successful create returns the
 same canonical source rather than duplicating it. Reddit and VK suggestions are
 explicitly unsupported while their crawlers do not exist: reject them or leave
 them pending, but do not create inert source rows.
+
+With JavaScript active, the add form posts directly to the same-origin
+`/api/v1/admin/telegram/channels/from-reference` route. It automatically retries
+network interruptions and 502/503/504 gateway responses, which covers frontend
+or API container restarts during a Reploy deployment. Other API failures are not
+retried. Without JavaScript, the existing SvelteKit server action remains the
+progressive-enhancement fallback.
 
 Advanced manual entry is the fallback when the canonical Telegram identifier is
 already known. It deliberately creates an unassigned, non-indexable source with
