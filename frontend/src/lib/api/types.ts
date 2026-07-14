@@ -200,6 +200,12 @@ export interface PublicMemeOfTheDayRead {
   attribution: MemeResultAttributionRead | null;
 }
 
+export interface MemeFavoriteMutationRead {
+  favorited: boolean;
+  changed: boolean;
+  like_count: number;
+}
+
 export interface PublicMemeSearchPageRead {
   items: PublicMemeSearchResultRead[];
   limit: number;
@@ -453,6 +459,18 @@ export interface WebCollectionDetailRead extends WebCollectionSummaryRead {
 export interface WebCollectionListRead {
   collections: WebCollectionSummaryRead[];
   active_save_collection_id: string | null;
+}
+
+export interface MemeCollectionChoiceRead {
+  collection_id: string;
+  title: string;
+  contains_meme: boolean;
+  can_add_memes: boolean;
+  can_remove_memes: boolean;
+}
+
+export interface MemeCollectionChoicesRead {
+  collections: MemeCollectionChoiceRead[];
 }
 
 export interface CollectionInviteLinkRead {

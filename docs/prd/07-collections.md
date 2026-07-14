@@ -32,6 +32,8 @@ Liking a meme adds it to the Favorites collection. The total like count (number 
 
 Favorites is not offered in the Save-to-collection chooser and does not activate the saved/bookmark state. That state means the meme belongs to at least one accessible non-Favorites collection, regardless of which collection is currently the active save destination.
 
+The chooser lists current non-Favorites memberships before other writable destinations. A saved membership can be removed in place when the viewer has remove capability; read-only shared memberships remain visible and locked. Collection ordering preserves most-recent addition first within the backend-provided order.
+
 ## User Uploads
 
 Users upload memes to collections. Uploads are:

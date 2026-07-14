@@ -149,6 +149,22 @@ class CollectionListRead(ORMSchema):
     active_save_collection_id: uuid.UUID | None
 
 
+class MemeCollectionChoiceRead(ORMSchema):
+    """One accessible non-Favorites destination in a meme save chooser."""
+
+    collection_id: uuid.UUID
+    title: str
+    contains_meme: bool
+    can_add_memes: bool
+    can_remove_memes: bool
+
+
+class MemeCollectionChoicesRead(ORMSchema):
+    """Meme-scoped collection destinations in backend-defined recency order."""
+
+    collections: list[MemeCollectionChoiceRead] = Field(default_factory=list)
+
+
 class CollectionInviteLinkRead(ORMSchema):
     """Direct-link invite response including the one-time plaintext token."""
 
@@ -167,6 +183,8 @@ __all__ = [
     "CollectionMemberRead",
     "CollectionRead",
     "CollectionSummaryRead",
+    "MemeCollectionChoiceRead",
+    "MemeCollectionChoicesRead",
     "MemeLibraryRead",
     "CollectionSavedMemeRead",
     "PinnedMemeRead",

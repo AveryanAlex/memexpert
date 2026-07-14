@@ -33,6 +33,7 @@ import {
   fetchCurrentSession,
   fetchHomeFeed,
   fetchMemeLibrary,
+  fetchMemeCollectionChoices,
   fetchMemeDetail,
   fetchMemePage,
   fetchMemePopularitySummary,
@@ -457,11 +458,23 @@ describe('catalog API client', () => {
         credentials: init?.credentials,
         requestedWith: headers.get('x-requested-with')
       });
-      return jsonResponse(init?.method === 'DELETE' ? { removed: true } : { id: 'collection-meme-1' });
+      return jsonResponse(
+        init?.method === 'DELETE'
+          ? { favorited: false, changed: true, like_count: 7 }
+          : { favorited: true, changed: true, like_count: 8 }
+      );
     }) satisfies ApiFetch;
 
-    await favoriteMeme({ fetch: mockFetch, memeId: 'meme-123' });
-    await unfavoriteMeme({ fetch: mockFetch, memeId: 'meme-123' });
+    await expect(favoriteMeme({ fetch: mockFetch, memeId: 'meme-123' })).resolves.toEqual({
+      favorited: true,
+      changed: true,
+      like_count: 8
+    });
+    await expect(unfavoriteMeme({ fetch: mockFetch, memeId: 'meme-123' })).resolves.toEqual({
+      favorited: false,
+      changed: true,
+      like_count: 7
+    });
 
     expect(calls).toEqual([
       { method: 'POST', path: '/api/v1/memes/meme-123/favorite', credentials: 'include', requestedWith: 'XMLHttpRequest' },
@@ -815,6 +828,9 @@ describe('catalog API client', () => {
       if (url.pathname === '/api/v1/collections' && (init?.method ?? 'GET') === 'GET') {
         return jsonResponse({ collections: [], active_save_collection_id: null });
       }
+      if (url.pathname === `/api/v1/collections/meme-choices/${memeId}`) {
+        return jsonResponse({ collections: [] });
+      }
       if (url.pathname === `/api/v1/collections/${collectionId}` && (init?.method ?? 'GET') === 'GET') {
         return jsonResponse({ ...collectionSummary(collectionId), saved_memes: [] });
       }
@@ -840,6 +856,7 @@ describe('catalog API client', () => {
     }) satisfies ApiFetch;
 
     await fetchCollections({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test' });
+    await fetchMemeCollectionChoices({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', memeId });
     await fetchCollectionDetail({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', collectionId });
     await createCollection({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', body: { title: 'Launch', visibility: 'private' } });
     await setActiveSaveCollection({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', collectionId });
@@ -852,6 +869,7 @@ describe('catalog API client', () => {
 
     expect(calls.map((call) => [call.method, call.path])).toEqual([
       ['GET', '/api/v1/collections'],
+      ['GET', `/api/v1/collections/meme-choices/${memeId}`],
       ['GET', `/api/v1/collections/${collectionId}`],
       ['POST', '/api/v1/collections'],
       ['PUT', `/api/v1/collections/${collectionId}/active-save`],
@@ -862,9 +880,9 @@ describe('catalog API client', () => {
       ['DELETE', `/api/v1/collections/${collectionId}/members/${memberUserId}`],
       ['DELETE', `/api/v1/collections/${collectionId}`]
     ]);
-    expect(calls[2].body).toEqual({ title: 'Launch', visibility: 'private' });
-    expect(calls[5].body).toEqual({ role: 'viewer', max_uses: 1 });
-    expect(calls[7].body).toEqual({ role: 'viewer' });
+    expect(calls[3].body).toEqual({ title: 'Launch', visibility: 'private' });
+    expect(calls[6].body).toEqual({ role: 'viewer', max_uses: 1 });
+    expect(calls[8].body).toEqual({ role: 'viewer' });
   });
 
   it('reorders pins with the full ordered id list', async () => {

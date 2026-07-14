@@ -41,6 +41,8 @@ describe('MemeActionMenu viewer capabilities', () => {
     expect(body).toContain('aria-label="Save to collection"');
     expect(body).toContain('Send');
     expect(body).toContain('aria-label="Meme actions"');
+    expect(body).not.toContain('Favorite meme');
+    expect(body).not.toContain('Send to Telegram');
     expect(body).not.toContain('Pin requires a full account');
   });
 

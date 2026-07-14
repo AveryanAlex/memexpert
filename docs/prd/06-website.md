@@ -40,10 +40,15 @@ Meme cards preserve the media aspect ratio and make the media/title area the det
 Every card exposes these direct, labeled actions without opening a menu:
 
 - **Favorite**
+- **Download**
 - **Save**
 - **Send**
 
-The overflow menu contains secondary or safety actions: pinning when the viewer is eligible, copy link, download when available, and report. Detail pages use the same action behavior with labeled primary controls. Action results and failures are announced without changing the existing action/API semantics.
+The card overflow menu contains only secondary or safety actions that are not already visible below the meme: pinning when the viewer is eligible, copy link, and report. Detail pages use labeled Favorite, Save, and Send controls; Download remains in detail overflow when it is not otherwise visible. Action results and failures are announced without duplicating primary actions.
+
+Save opens a persistent collection chooser. Collections already containing the meme appear first under **Saved in**, with one-step removal when the viewer can edit them; remaining writable collections appear under **Add to**. Favorites is never shown there. The bookmark remains active until the meme is removed from every accessible non-Favorites collection.
+
+Video cards use their generated poster until playback starts. A one-column grid autoplays only the sufficiently visible video, muted and inline; multi-column pointer/hover layouts play on hover. Clicking the video toggles play/pause, leaving the card or viewport pauses and re-mutes it, and an explicit control allows unmuting. Interactive video cards retain a separate visible Open meme link.
 
 ## Search (`/search`)
 

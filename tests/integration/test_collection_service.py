@@ -340,6 +340,24 @@ async def test_favorite_unfavorite_is_idempotent_and_updates_like_count(
     assert await migrated_db_session.scalar(select(Meme.like_count).where(Meme.id == meme.id)) == 0
 
 
+async def test_first_favorite_does_not_replace_an_existing_active_custom_collection(
+    migrated_db_session: AsyncSession,
+) -> None:
+    user_service = UserService(migrated_db_session)
+    collection_service = CollectionService(migrated_db_session)
+    user = await create_full_user_via_upgrade(user_service, email="active-before-favorites@example.com")
+    custom = await collection_service.create_custom_collection(owner_user_id=user.id, title="Keep active")
+    _ = await collection_service.update_active_save_collection(user_id=user.id, collection_id=custom.id)
+    meme = await _create_meme(migrated_db_session)
+    await migrated_db_session.commit()
+
+    _ = await collection_service.favorite_meme(user_id=user.id, meme_id=meme.id)
+    persisted_user = await migrated_db_session.get(User, user.id)
+
+    assert persisted_user is not None
+    assert persisted_user.active_save_collection_id == custom.id
+
+
 async def test_meme_library_bootstraps_guest_active_favorites_without_cards(
     migrated_db_session: AsyncSession,
 ) -> None:

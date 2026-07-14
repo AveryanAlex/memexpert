@@ -112,15 +112,27 @@ async def test_favorite_save_routes_auto_bootstrap_guest_session(
     await migrated_db_session.commit()
 
     favorite_response = await auth_client.post(f"/api/v1/memes/{first_meme.id}/favorite")
+    repeated_favorite_response = await auth_client.post(f"/api/v1/memes/{first_meme.id}/favorite")
     save_response = await auth_client.post(f"/api/v1/memes/{second_meme.id}/save")
     favorites_response = await auth_client.get("/api/v1/memes/favorites")
 
     assert favorite_response.status_code == 200
     assert "memexpert_access_token" in favorite_response.headers["set-cookie"]
+    assert favorite_response.json() == {"favorited": True, "changed": True, "like_count": 1}
+    assert repeated_favorite_response.status_code == 200
+    assert repeated_favorite_response.json() == {"favorited": True, "changed": False, "like_count": 1}
     assert save_response.status_code == 200
     assert favorites_response.status_code == 200
     assert {item["meme_id"] for item in favorites_response.json()} == {str(first_meme.id), str(second_meme.id)}
     assert await migrated_db_session.scalar(select(func.count()).select_from(CollectionMeme)) == 2
+    assert (
+        await migrated_db_session.scalar(
+            select(func.count())
+            .select_from(AnalyticsEvent)
+            .where(AnalyticsEvent.event_type == AnalyticsEventType.MEME_LIKE)
+        )
+        == 1
+    )
 
 
 async def test_library_route_auto_bootstraps_guest_and_returns_empty_profile(
@@ -211,6 +223,15 @@ async def test_detail_and_successful_actions_persist_strict_attribution_events(
 ) -> None:
     user_service = UserService(migrated_db_session)
     full_user = await create_full_user_via_upgrade(user_service, email="attribution-actions@example.com")
+    collection_service = CollectionService(migrated_db_session)
+    active_collection = await collection_service.create_custom_collection(
+        owner_user_id=full_user.id,
+        title="Attribution saves",
+    )
+    _ = await collection_service.update_active_save_collection(
+        user_id=full_user.id,
+        collection_id=active_collection.id,
+    )
     source_meme = await _create_meme(migrated_db_session)
     target_meme = await _create_meme(migrated_db_session)
     await migrated_db_session.commit()
@@ -246,8 +267,11 @@ async def test_detail_and_successful_actions_persist_strict_attribution_events(
         impression_response = await client.post(f"/api/v1/memes/{target_meme.id}/impression", json=action_payload)
         detail_click_response = await client.post(f"/api/v1/memes/{target_meme.id}/detail-click", json=action_payload)
         favorite_response = await client.post(f"/api/v1/memes/{target_meme.id}/favorite", json=action_payload)
+        repeated_favorite_response = await client.post(f"/api/v1/memes/{target_meme.id}/favorite", json=action_payload)
         save_response = await client.post(f"/api/v1/memes/{target_meme.id}/save", json=action_payload)
+        repeated_save_response = await client.post(f"/api/v1/memes/{target_meme.id}/save", json=action_payload)
         pin_response = await client.post(f"/api/v1/memes/{target_meme.id}/pin", json=action_payload)
+        repeated_pin_response = await client.post(f"/api/v1/memes/{target_meme.id}/pin", json=action_payload)
         report_response = await client.post(
             f"/api/v1/memes/{target_meme.id}/report",
             json={"reason": "spam", "attribution": action_payload["attribution"]},
@@ -261,8 +285,12 @@ async def test_detail_and_successful_actions_persist_strict_attribution_events(
     assert impression_response.json() == {"ok": True}
     assert detail_click_response.json() == {"ok": True}
     assert favorite_response.status_code == 200
+    assert repeated_favorite_response.json()["changed"] is False
     assert save_response.status_code == 200
+    assert save_response.json()["collection_id"] == str(active_collection.id)
+    assert repeated_save_response.status_code == 200
     assert pin_response.status_code == 200
+    assert repeated_pin_response.status_code == 200
     assert report_response.status_code == 200
     assert share_response.json() == {"ok": True}
     assert download_response.json() == {"ok": True}

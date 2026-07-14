@@ -13,6 +13,7 @@
     type MemeGridBulkOptions
   } from './bulk-view-model';
   import MemeCard from './MemeCard.svelte';
+  import type { MemeVideoPreviewMode } from './meme-video';
   import { buildMasonryColumns, masonryColumnCount, masonryColumnWidth } from './masonry-layout';
 
   let {
@@ -38,6 +39,7 @@
   let statusMessage = $state<string | null>(null);
   let gridElement = $state<HTMLElement>();
   let gridWidth = $state(0);
+  let renderedColumnCount = $state(0);
   let hydrated = $state(false);
 
   const columnCount = $derived(masonryColumnCount(gridWidth));
@@ -55,6 +57,9 @@
   const canRemoveFromCollection = $derived(Boolean(bulk.removeEnabled && bulk.removeCollectionId));
   const toolbarSummary = $derived(bulkToolbarSummary(memes.length, selected.length, downloadable.length));
   const memePositions = $derived(new Map(memes.map((meme, index) => [meme.id, index + 1])));
+  const videoPreviewMode = $derived<MemeVideoPreviewMode>(
+    !hydrated || renderedColumnCount === 0 ? 'poster' : renderedColumnCount === 1 ? 'viewport' : 'hover'
+  );
 
   $effect(() => {
     const availableIds = new Set(memes.map((meme) => meme.id));
@@ -82,14 +87,29 @@
   $effect(() => {
     if (!browser || !gridElement) return;
 
+    let measurementFrame = 0;
     const updateGridWidth = () => {
-      gridWidth = gridElement?.clientWidth ?? 0;
+      const width = gridElement?.clientWidth ?? 0;
+      gridWidth = width;
+      if (layout === 'masonry') {
+        renderedColumnCount = masonryColumnCount(width);
+        return;
+      }
+      window.cancelAnimationFrame(measurementFrame);
+      measurementFrame = window.requestAnimationFrame(() => {
+        if (!gridElement) return;
+        const tracks = window.getComputedStyle(gridElement).gridTemplateColumns.trim();
+        renderedColumnCount = tracks && tracks !== 'none' ? tracks.split(/\s+/).length : 1;
+      });
     };
     const observer = new ResizeObserver(updateGridWidth);
     updateGridWidth();
     observer.observe(gridElement);
 
-    return () => observer.disconnect();
+    return () => {
+      observer.disconnect();
+      window.cancelAnimationFrame(measurementFrame);
+    };
   });
 
   function toggleSelection(memeId: string) {
@@ -285,7 +305,7 @@
 {/if}
 
 {#if layout === 'ordered'}
-  <section bind:this={gridElement} class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4" aria-label={label} data-layout="ordered" role="list" aria-busy={pendingAction !== null}>
+  <section bind:this={gridElement} class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4" aria-label={label} data-layout="ordered" data-video-preview-mode={videoPreviewMode} role="list" aria-busy={pendingAction !== null}>
     {#each memes as meme (meme.id)}
       {@const attribution = attributions[meme.id]}
       <div
@@ -304,12 +324,12 @@
             Select
           </label>
         {/if}
-        <MemeCard {meme} {attribution} position={memePositions.get(meme.id)} total={memes.length} {showAccessMarkers} />
+        <MemeCard {meme} {attribution} position={memePositions.get(meme.id)} total={memes.length} {showAccessMarkers} {videoPreviewMode} />
       </div>
     {/each}
   </section>
 {:else}
-  <section bind:this={gridElement} class="flex gap-4" aria-label={label} data-column-count={columnCount} data-layout="masonry" role="list" aria-busy={pendingAction !== null}>
+  <section bind:this={gridElement} class="flex gap-4" aria-label={label} data-column-count={columnCount} data-layout="masonry" data-video-preview-mode={videoPreviewMode} role="list" aria-busy={pendingAction !== null}>
     {#each masonryColumns as column (column.id)}
       <div class="grid min-w-0 flex-1 content-start gap-4" role="presentation">
         {#each column.items as meme (meme.id)}
@@ -330,7 +350,7 @@
                 Select
               </label>
             {/if}
-            <MemeCard {meme} {attribution} position={memePositions.get(meme.id)} total={memes.length} {showAccessMarkers} />
+            <MemeCard {meme} {attribution} position={memePositions.get(meme.id)} total={memes.length} {showAccessMarkers} {videoPreviewMode} />
           </div>
         {/each}
       </div>

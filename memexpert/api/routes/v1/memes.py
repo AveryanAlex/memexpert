@@ -35,6 +35,7 @@ from memexpert.api.routes._meme_interactions import (
 from memexpert.models.enums import AnalyticsEventType, ContentKind, ContentLanguage
 from memexpert.schemas.collection import CollectionMemeRead, CollectionRead, MemeLibraryRead, PinnedMemeRead
 from memexpert.schemas.meme import (
+    MemeFavoriteMutationRead,
     MemeSlugRedirectRead,
     PublicMemeDetailRead,
     PublicMemeLandingRead,
@@ -318,10 +319,14 @@ async def home_feed_memes(
 @router.get("/meme-of-the-day", response_model=PublicMemeOfTheDayRead, summary="Read Meme of the Day")
 async def get_meme_of_the_day(
     meme_of_the_day_service: MemeOfTheDayServiceDep,
+    current_user: OptionalCurrentUserDep,
 ) -> PublicMemeOfTheDayRead:
     """Return today's public safe Meme of the Day, refreshing the cache on miss."""
 
-    return await meme_of_the_day_service.get_today(surface="web_home")
+    return await meme_of_the_day_service.get_today(
+        surface="web_home",
+        viewer_user_id=current_user.id if current_user is not None else None,
+    )
 
 
 @router.post(
@@ -488,48 +493,65 @@ async def get_meme_library(
         raise _collection_http_error(exc) from exc
 
 
-@router.post("/{meme_id}/favorite", response_model=CollectionMemeRead, summary="Favorite a meme")
+@router.post("/{meme_id}/favorite", response_model=MemeFavoriteMutationRead, summary="Favorite a meme")
 async def favorite_meme(
     collection_service: CollectionServiceDep,
     analytics_service: AnalyticsServiceDep,
     current_user: AutoGuestUserDep,
     meme_id: Annotated[uuid.UUID, Path()],
     payload: Annotated[MemeActionAttributionRequest | None, Body()] = None,
-) -> CollectionMemeRead:
+) -> MemeFavoriteMutationRead:
     """Save a meme to Favorites; the first save increments the meme like count."""
 
     try:
-        favorite = await collection_service.favorite_meme(user_id=current_user.id, meme_id=meme_id)
+        mutation = await collection_service.favorite_meme_result(user_id=current_user.id, meme_id=meme_id)
     except MemeNotFoundError as exc:
         raise _meme_not_found_http_error() from exc
     except CollectionServiceError as exc:
         raise _collection_http_error(exc) from exc
-    await record_meme_interaction(
-        analytics_service,
-        AnalyticsEventType.MEME_LIKE,
+    if mutation.changed:
+        await record_meme_interaction(
+            analytics_service,
+            AnalyticsEventType.MEME_LIKE,
+            meme_id=meme_id,
+            current_user=current_user,
+            attribution=payload_attribution(payload),
+            default_surface="public_api_meme_action",
+            collection_id=mutation.item.collection_id,
+            properties={"action": "favorite"},
+        )
+    favorite_state = await collection_service.get_meme_favorite_state(
+        user_id=current_user.id,
         meme_id=meme_id,
-        current_user=current_user,
-        attribution=payload_attribution(payload),
-        default_surface="public_api_meme_action",
-        collection_id=favorite.collection_id,
-        properties={"action": "favorite"},
     )
-    return favorite
+    return MemeFavoriteMutationRead(
+        favorited=favorite_state.favorited,
+        changed=mutation.changed,
+        like_count=favorite_state.like_count,
+    )
 
 
-@router.delete("/{meme_id}/favorite", response_model=dict[str, bool], summary="Unfavorite a meme")
+@router.delete("/{meme_id}/favorite", response_model=MemeFavoriteMutationRead, summary="Unfavorite a meme")
 async def unfavorite_meme(
     collection_service: CollectionServiceDep,
     current_user: AutoGuestUserDep,
     meme_id: Annotated[uuid.UUID, Path()],
-) -> dict[str, bool]:
+) -> MemeFavoriteMutationRead:
     """Remove a meme from Favorites when present."""
 
     try:
         removed = await collection_service.unfavorite_meme(user_id=current_user.id, meme_id=meme_id)
     except CollectionServiceError as exc:
         raise _collection_http_error(exc) from exc
-    return {"removed": removed}
+    favorite_state = await collection_service.get_meme_favorite_state(
+        user_id=current_user.id,
+        meme_id=meme_id,
+    )
+    return MemeFavoriteMutationRead(
+        favorited=favorite_state.favorited,
+        changed=removed,
+        like_count=favorite_state.like_count,
+    )
 
 
 @router.post("/{meme_id}/save", response_model=CollectionMemeRead, summary="Save a meme")
@@ -543,22 +565,26 @@ async def save_meme_to_active_collection(
     """Save a meme into the caller's active collection, defaulting guests to Favorites."""
 
     try:
-        saved_meme = await collection_service.save_meme_to_active_collection(user_id=current_user.id, meme_id=meme_id)
+        mutation = await collection_service.save_meme_to_active_collection_result(
+            user_id=current_user.id,
+            meme_id=meme_id,
+        )
     except MemeNotFoundError as exc:
         raise _meme_not_found_http_error() from exc
     except CollectionServiceError as exc:
         raise _collection_http_error(exc) from exc
-    await record_meme_interaction(
-        analytics_service,
-        AnalyticsEventType.MEME_SAVE,
-        meme_id=meme_id,
-        current_user=current_user,
-        attribution=payload_attribution(payload),
-        default_surface="public_api_meme_action",
-        collection_id=saved_meme.collection_id,
-        properties={"action": "save"},
-    )
-    return saved_meme
+    if mutation.changed:
+        await record_meme_interaction(
+            analytics_service,
+            AnalyticsEventType.MEME_SAVE,
+            meme_id=meme_id,
+            current_user=current_user,
+            attribution=payload_attribution(payload),
+            default_surface="public_api_meme_action",
+            collection_id=mutation.item.collection_id,
+            properties={"action": "save"},
+        )
+    return mutation.item
 
 
 @router.delete("/{meme_id}/save", response_model=dict[str, bool], summary="Remove a saved meme")
@@ -627,21 +653,22 @@ async def pin_meme(
     """Append a meme to the caller's full-account pins."""
 
     try:
-        pinned_meme = await collection_service.pin_meme(user_id=current_user.id, meme_id=meme_id)
+        mutation = await collection_service.pin_meme_result(user_id=current_user.id, meme_id=meme_id)
     except MemeNotFoundError as exc:
         raise _meme_not_found_http_error() from exc
     except CollectionServiceError as exc:
         raise _collection_http_error(exc) from exc
-    await record_meme_interaction(
-        analytics_service,
-        AnalyticsEventType.MEME_PIN,
-        meme_id=meme_id,
-        current_user=current_user,
-        attribution=payload_attribution(payload),
-        default_surface="public_api_meme_action",
-        properties={"action": "pin", "position": pinned_meme.position},
-    )
-    return pinned_meme
+    if mutation.changed:
+        await record_meme_interaction(
+            analytics_service,
+            AnalyticsEventType.MEME_PIN,
+            meme_id=meme_id,
+            current_user=current_user,
+            attribution=payload_attribution(payload),
+            default_surface="public_api_meme_action",
+            properties={"action": "pin", "position": mutation.item.position},
+        )
+    return mutation.item
 
 
 @router.delete("/{meme_id}/pin", response_model=dict[str, bool], summary="Unpin a meme")

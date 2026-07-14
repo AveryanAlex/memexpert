@@ -53,7 +53,10 @@ test.describe('public masonry feed smoke', () => {
     await expect(firstCardMenu).toBeFocused();
     await firstCardMenu.press('Enter');
     await expect(firstCardMenu).toHaveAttribute('aria-expanded', 'true');
-    await expect(page.getByRole('menuitem', { name: /Favorite meme|Remove favorite/ })).toBeVisible();
+    await expect(page.getByRole('menuitem', { name: /Favorite meme|Remove favorite/ })).toHaveCount(0);
+    await expect(page.getByRole('menuitem', { name: 'Copy link', exact: true })).toBeVisible();
+    await expect(page.getByRole('menuitem', { name: 'Report meme', exact: true })).toBeVisible();
+    await expect(page.getByRole('menuitem', { name: /Send to Telegram|Download/ })).toHaveCount(0);
     await expect(page.getByRole('menuitem', { name: 'Save', exact: true })).toHaveCount(0);
     await page.keyboard.press('Escape');
 
@@ -160,11 +163,11 @@ test.describe('public masonry feed smoke', () => {
     await expect(page.locator('html')).toHaveJSProperty('scrollWidth', 320);
   });
 
-  test('save chooser keeps writable collections in recent-addition order', async ({ baseURL, page }) => {
+  test('save chooser separates saved and available collections and removes in place', async ({ baseURL, page }) => {
     await page.context().addCookies([
       {
         name: 'memexpert_access_token',
-        value: 'miniapp-full',
+        value: 'smoke-full-save-chooser',
         url: baseURL ?? 'http://127.0.0.1:4174',
         httpOnly: true,
         sameSite: 'Lax'
@@ -177,18 +180,32 @@ test.describe('public masonry feed smoke', () => {
     const card = feed.getByRole('link', { name: 'Open Smoke test cat reaction' }).locator('xpath=ancestor::article');
     await card.getByRole('button', { name: 'Save to collection', exact: true }).click();
 
-    await expect(page.getByRole('menuitem', { name: 'Recent reactions', exact: true })).toBeVisible();
-    await expect(page.getByRole('menuitem', { name: 'Favorites', exact: true })).toHaveCount(0);
-    await expect(page.getByRole('menuitem', { name: 'Smoke private team saves', exact: true })).toHaveCount(0);
-    const collectionItems = page.getByRole('menuitem');
-    await expect(collectionItems).toHaveCount(1);
-    expect((await collectionItems.allTextContents()).map((text) => text.trim())).toEqual(['Recent reactions']);
+    const chooser = page.getByLabel('Collections for Smoke test cat reaction');
+    await expect(chooser).toBeVisible();
+    await expect(chooser.getByText('Add to', { exact: true })).toBeVisible();
+    await expect(chooser.getByRole('button', { name: 'Add to Recent reactions', exact: true })).toBeVisible();
+    await expect(chooser.getByRole('button', { name: 'Add to Later ideas', exact: true })).toBeVisible();
+    await expect(chooser.getByText('Favorites', { exact: true })).toHaveCount(0);
+    await expect(chooser.getByText('Smoke private team saves', { exact: true })).toHaveCount(0);
+    expect(await chooser.evaluate((element) => getComputedStyle(element).borderTopWidth)).toBe('0px');
 
-    await page.getByRole('menuitem', { name: 'Recent reactions', exact: true }).click();
+    await chooser.getByRole('button', { name: 'Add to Recent reactions', exact: true }).click();
     await expect(card.getByRole('button', { name: 'Save to collection', exact: true })).toHaveAttribute('aria-pressed', 'true');
     const motdSave = page.getByRole('region', { name: 'Meme of the Day' }).getByRole('button', { name: 'Save to collection', exact: true });
     await expect(motdSave).toHaveAttribute('aria-pressed', 'true');
+    await expect(chooser.getByText('Saved in', { exact: true })).toBeVisible();
+    await expect(chooser.getByRole('button', { name: 'Remove from Recent reactions', exact: true })).toBeVisible();
+    await expect(chooser.getByRole('button', { name: 'Add to Later ideas', exact: true })).toBeVisible();
     await expect(card.getByText('Saved to Recent reactions.', { exact: true })).toHaveCount(0);
+
+    await chooser.getByRole('button', { name: 'Remove from Recent reactions', exact: true }).click();
+    await expect(card.getByRole('button', { name: 'Save to collection', exact: true })).toHaveAttribute('aria-pressed', 'false');
+    await expect(motdSave).toHaveAttribute('aria-pressed', 'false');
+    await expect(chooser.getByRole('button', { name: 'Add to Recent reactions', exact: true })).toBeVisible();
+
+    await chooser.getByRole('button', { name: 'Add to Later ideas', exact: true }).click();
+    await expect(chooser.getByRole('button', { name: 'Remove from Later ideas', exact: true })).toBeVisible();
+    await page.keyboard.press('Escape');
 
     const motd = page.getByRole('region', { name: 'Meme of the Day' });
     await motd.getByRole('button', { name: 'Actions for Smoke test cat reaction' }).click();
@@ -196,6 +213,119 @@ test.describe('public masonry feed smoke', () => {
 
     await card.getByRole('button', { name: 'Actions for Smoke test cat reaction' }).click();
     await expect(page.getByRole('menuitem', { name: 'Unpin', exact: true })).toBeVisible();
+  });
+
+  test('save chooser ignores an older refresh after another card saves the same meme', async ({ baseURL, page }) => {
+    await page.context().addCookies([
+      {
+        name: 'memexpert_access_token',
+        value: 'smoke-full-save-race',
+        url: baseURL ?? 'http://127.0.0.1:4174',
+        httpOnly: true,
+        sameSite: 'Lax'
+      }
+    ]);
+    await disableIntersectionObserver(page);
+    await page.goto('/');
+
+    const feed = page.getByRole('list', { name: 'Meme results' });
+    const card = feed.getByRole('link', { name: 'Open Smoke test cat reaction' }).locator('xpath=ancestor::article');
+    const feedSave = card.getByRole('button', { name: 'Save to collection', exact: true });
+    const motdSave = page
+      .getByRole('region', { name: 'Meme of the Day' })
+      .getByRole('button', { name: 'Save to collection', exact: true });
+
+    await feedSave.click();
+    let chooser = page.getByLabel('Collections for Smoke test cat reaction');
+    await expect(chooser.getByRole('button', { name: 'Add to Recent reactions', exact: true })).toBeVisible();
+    await page.keyboard.press('Escape');
+
+    const delayedRequestPromise = page.waitForRequest((request) =>
+      new URL(request.url()).pathname.endsWith('/api/v1/collections/meme-choices/smoke-meme-1')
+    );
+    await feedSave.click();
+    const delayedRequest = await delayedRequestPromise;
+    const delayedResponsePromise = delayedRequest.response();
+    chooser = page.getByLabel('Collections for Smoke test cat reaction');
+    await expect(chooser.getByText('Loading collections…', { exact: true })).toBeVisible();
+    await expect(chooser.getByRole('button', { name: 'Add to Recent reactions', exact: true })).toHaveCount(0);
+    await page.keyboard.press('Escape');
+
+    await motdSave.click();
+    chooser = page.getByLabel('Collections for Smoke test cat reaction');
+    await chooser.getByRole('button', { name: 'Add to Recent reactions', exact: true }).click();
+    await expect(motdSave).toHaveAttribute('aria-pressed', 'true');
+    await expect(feedSave).toHaveAttribute('aria-pressed', 'true');
+
+    await delayedResponsePromise;
+    await expect(motdSave).toHaveAttribute('aria-pressed', 'true');
+    await expect(feedSave).toHaveAttribute('aria-pressed', 'true');
+
+    await page.keyboard.press('Escape');
+    await feedSave.click();
+    chooser = page.getByLabel('Collections for Smoke test cat reaction');
+    await expect(chooser.getByRole('button', { name: 'Remove from Recent reactions', exact: true })).toBeVisible();
+  });
+
+  test('Meme of the Day favorite survives reload with one authoritative increment', async ({ baseURL, page }) => {
+    await page.context().addCookies([
+      {
+        name: 'memexpert_access_token',
+        value: 'smoke-full-motd-like-reload',
+        url: baseURL ?? 'http://127.0.0.1:4174',
+        httpOnly: true,
+        sameSite: 'Lax'
+      }
+    ]);
+    await disableIntersectionObserver(page);
+    await page.goto('/');
+
+    const motd = page.getByRole('region', { name: 'Meme of the Day' });
+    const feed = page.getByRole('list', { name: 'Meme results' });
+    const feedCard = feed.getByRole('link', { name: 'Open Smoke test cat reaction' }).locator('xpath=ancestor::article');
+    await motd.getByRole('button', { name: 'Favorite', exact: true }).click();
+    await expect(motd.getByRole('button', { name: 'Remove favorite', exact: true })).toBeVisible();
+    await expect(feedCard.getByRole('button', { name: 'Remove favorite', exact: true })).toBeVisible();
+
+    await page.reload();
+    await expect(motd.getByRole('button', { name: 'Remove favorite', exact: true })).toBeVisible();
+    await expect(feedCard.getByRole('button', { name: 'Remove favorite', exact: true })).toBeVisible();
+
+    await feedCard.getByRole('link', { name: 'Open Smoke test cat reaction' }).click();
+    await expect(page.getByRole('button', { name: 'Favorite (8)', exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Favorite (9)', exact: true })).toHaveCount(0);
+  });
+
+  test('video previews autoplay in one column and play on hover in wider grids', async ({ page }) => {
+    await installMediaSpies(page);
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await page.goto('/search?q=video');
+
+    const grid = page.getByRole('list', { name: 'Search results' });
+    const video = grid.locator('video');
+    await expect(grid).toHaveAttribute('data-video-preview-mode', 'hover');
+    await expect(video).toHaveAttribute('poster', /smoke-cat\.svg/);
+    await expect(video).toHaveJSProperty('muted', true);
+    await expect(video).not.toHaveAttribute('data-play-calls');
+    await video.hover();
+    await expect(video).toHaveAttribute('data-play-calls', '1');
+    await expect(video).toHaveAttribute('aria-label', 'Pause Untitled meme');
+    await video.click();
+    await expect(video).toHaveAttribute('aria-label', 'Play Untitled meme');
+    await expect(page.getByRole('link', { name: 'Open Untitled meme', exact: true })).toBeVisible();
+
+    const unmute = page.getByRole('button', { name: 'Unmute Untitled meme', exact: true });
+    await unmute.click();
+    await expect(page.getByRole('button', { name: 'Mute Untitled meme', exact: true })).toHaveAttribute('aria-pressed', 'true');
+    await expect(video).toHaveJSProperty('muted', false);
+
+    await page.setViewportSize({ width: 390, height: 844 });
+    await video.scrollIntoViewIfNeeded();
+    await expect(grid).toHaveAttribute('data-video-preview-mode', 'viewport');
+    await expect(video).toHaveAttribute('data-play-calls', /^[2-9]\d*$/);
+    await expect(video).toHaveJSProperty('muted', true);
+    await video.click();
+    await expect(video).toHaveAttribute('aria-label', 'Play Untitled meme');
   });
 
   test('search selection controls stay hidden until Select items is chosen', async ({ page }) => {
@@ -262,6 +392,10 @@ test('search result opens detail with media and actions', async ({ page }) => {
   await expect(page.getByText('Pin requires a full account')).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Pin', exact: true })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Meme actions' })).toBeVisible();
+  await page.getByRole('button', { name: 'Meme actions' }).click();
+  await expect(page.getByRole('menuitem', { name: 'Download', exact: true })).toBeVisible();
+  await expect(page.getByRole('menuitem', { name: /Favorite meme|Remove favorite|Send to Telegram/ })).toHaveCount(0);
+  await page.keyboard.press('Escape');
 
   await page.getByRole('button', { name: 'Favorite (7)' }).click();
   await expect(page.getByText('Keep this save beyond this browser.')).toBeVisible();
@@ -312,6 +446,30 @@ async function disableIntersectionObserver(page: import('@playwright/test').Page
       value: class NoopIntersectionObserver {
         observe() {}
         disconnect() {}
+      }
+    });
+  });
+}
+
+async function installMediaSpies(page: import('@playwright/test').Page) {
+  await page.addInitScript(() => {
+    Object.defineProperty(HTMLMediaElement.prototype, 'play', {
+      configurable: true,
+      value() {
+        const element = this as HTMLMediaElement;
+        const calls = Number(element.dataset.playCalls ?? '0') + 1;
+        element.dataset.playCalls = String(calls);
+        element.dispatchEvent(new Event('play'));
+        return Promise.resolve();
+      }
+    });
+    Object.defineProperty(HTMLMediaElement.prototype, 'pause', {
+      configurable: true,
+      value() {
+        const element = this as HTMLMediaElement;
+        const calls = Number(element.dataset.pauseCalls ?? '0') + 1;
+        element.dataset.pauseCalls = String(calls);
+        element.dispatchEvent(new Event('pause'));
       }
     });
   });

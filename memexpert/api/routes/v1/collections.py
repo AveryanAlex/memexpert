@@ -41,6 +41,8 @@ from memexpert.schemas.collection import (
     CollectionMemberRead,
     CollectionRead,
     CollectionSavedMemeRead,
+    MemeCollectionChoiceRead,
+    MemeCollectionChoicesRead,
     WebCollectionSummaryRead,
 )
 from memexpert.schemas.user import UserRead
@@ -111,6 +113,50 @@ async def list_collections(
         collections=[_summary(collection, current_user, active.id) for collection in collections],
         active_save_collection_id=active.id,
     )
+
+
+@router.get(
+    "/meme-choices/{meme_id}",
+    response_model=MemeCollectionChoicesRead,
+    summary="List collection choices for a meme",
+)
+async def list_meme_collection_choices(
+    collection_service: CollectionServiceDep,
+    current_user: AutoGuestUserDep,
+    meme_id: Annotated[uuid.UUID, Path()],
+) -> MemeCollectionChoicesRead:
+    """Return saved and writable non-Favorites destinations in recency order."""
+
+    try:
+        active = await collection_service.get_active_save_collection(user_id=current_user.id)
+        collections = await collection_service.list_collections_for_user(user_id=current_user.id)
+        containing_ids = await collection_service.list_accessible_collection_ids_containing_meme(
+            user_id=current_user.id,
+            meme_id=meme_id,
+        )
+    except MemeNotFoundError as exc:
+        raise _meme_not_found_http_error() from exc
+    except CollectionServiceError as exc:
+        raise _collection_http_error(exc) from exc
+
+    choices: list[MemeCollectionChoiceRead] = []
+    for collection in collections:
+        if collection.kind is CollectionKind.FAVORITES:
+            continue
+        summary = _summary(collection, current_user, active.id)
+        contains_meme = collection.id in containing_ids
+        if not contains_meme and not summary.capabilities.can_add_memes:
+            continue
+        choices.append(
+            MemeCollectionChoiceRead(
+                collection_id=collection.id,
+                title=collection.title,
+                contains_meme=contains_meme,
+                can_add_memes=summary.capabilities.can_add_memes,
+                can_remove_memes=summary.capabilities.can_remove_memes,
+            )
+        )
+    return MemeCollectionChoicesRead(collections=choices)
 
 
 @router.post(
@@ -269,7 +315,7 @@ async def save_meme_to_collection(
     """Save a visible meme into a specific writable collection."""
 
     try:
-        saved_meme = await collection_service.save_meme_to_collection(
+        mutation = await collection_service.save_meme_to_collection_result(
             collection_id=collection_id,
             user_id=current_user.id,
             meme_id=meme_id,
@@ -278,16 +324,17 @@ async def save_meme_to_collection(
         raise _meme_not_found_http_error() from exc
     except CollectionServiceError as exc:
         raise _collection_http_error(exc) from exc
-    await record_meme_interaction(
-        analytics_service,
-        AnalyticsEventType.MEME_SAVE,
-        meme_id=meme_id,
-        current_user=current_user,
-        attribution=payload_attribution(payload),
-        default_surface="public_api_collection_action",
-        collection_id=saved_meme.collection_id,
-        properties={"action": "save"},
-    )
+    if mutation.changed:
+        await record_meme_interaction(
+            analytics_service,
+            AnalyticsEventType.MEME_SAVE,
+            meme_id=meme_id,
+            current_user=current_user,
+            attribution=payload_attribution(payload),
+            default_surface="public_api_collection_action",
+            collection_id=mutation.item.collection_id,
+            properties={"action": "save"},
+        )
     return {"saved": True}
 
 

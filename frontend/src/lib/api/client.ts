@@ -47,6 +47,8 @@ import type {
   ContentKind,
   ContentLanguage,
   CurrentSessionRead,
+  MemeCollectionChoicesRead,
+  MemeFavoriteMutationRead,
   MemeLibraryRead,
   MemeSearchScope,
   PinnedMemeRead,
@@ -363,6 +365,16 @@ export async function fetchCollections(request: CatalogRequest): Promise<WebColl
   return apiGet<WebCollectionListRead>('/api/v1/collections', new URLSearchParams(), request);
 }
 
+export async function fetchMemeCollectionChoices(
+  request: CatalogRequest & { memeId: string }
+): Promise<MemeCollectionChoicesRead> {
+  return apiGet<MemeCollectionChoicesRead>(
+    `/api/v1/collections/meme-choices/${encodeURIComponent(request.memeId)}`,
+    new URLSearchParams(),
+    request
+  );
+}
+
 export async function fetchCollectionDetail(request: CatalogRequest & { collectionId: string }): Promise<WebCollectionDetailRead> {
   return apiGet<WebCollectionDetailRead>(`/api/v1/collections/${encodeURIComponent(request.collectionId)}`, new URLSearchParams(), request);
 }
@@ -440,12 +452,12 @@ export async function removeCollectionMember(request: CatalogRequest & { collect
 export async function joinCollectionInvite(request: CatalogRequest & { token: string }): Promise<WebCollectionSummaryRead> {
   return apiWrite<WebCollectionSummaryRead>(`/api/v1/collections/invites/${encodeURIComponent(request.token)}/join`, 'POST', request);
 }
-export async function favoriteMeme(request: MemeActionRequest): Promise<unknown> {
-  return apiMutation(`/api/v1/memes/${encodeURIComponent(request.memeId)}/favorite`, 'POST', request);
+export async function favoriteMeme(request: MemeActionRequest): Promise<MemeFavoriteMutationRead> {
+  return apiMutation<MemeFavoriteMutationRead>(`/api/v1/memes/${encodeURIComponent(request.memeId)}/favorite`, 'POST', request);
 }
 
-export async function unfavoriteMeme(request: MemeActionRequest): Promise<RemoveActionResponse> {
-  return apiMutation(`/api/v1/memes/${encodeURIComponent(request.memeId)}/favorite`, 'DELETE', request);
+export async function unfavoriteMeme(request: MemeActionRequest): Promise<MemeFavoriteMutationRead> {
+  return apiMutation<MemeFavoriteMutationRead>(`/api/v1/memes/${encodeURIComponent(request.memeId)}/favorite`, 'DELETE', request);
 }
 
 export async function saveMeme(request: MemeActionRequest): Promise<unknown> {

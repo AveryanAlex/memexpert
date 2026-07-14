@@ -126,6 +126,8 @@ async def test_collection_routes_crud_detail_remove_active_and_invites(
                 }
             },
         )
+        repeated_save_response = await client.post(f"/api/v1/collections/{collection_id}/memes/{meme.id}")
+        owner_choices_response = await client.get(f"/api/v1/collections/meme-choices/{meme.id}")
         detail_response = await client.get(f"/api/v1/collections/{collection_id}")
         invite_response = await client.post(
             f"/api/v1/collections/{collection_id}/invites",
@@ -135,6 +137,7 @@ async def test_collection_routes_crud_detail_remove_active_and_invites(
         current_user = UserRead.model_validate(viewer)
         join_response = await client.post(f"/api/v1/collections/invites/{invite_response.json()['token']}/join")
         viewer_detail_response = await client.get(f"/api/v1/collections/{collection_id}")
+        viewer_choices_response = await client.get(f"/api/v1/collections/meme-choices/{meme.id}")
         viewer_remove_response = await client.delete(f"/api/v1/collections/{collection_id}/memes/{meme.id}")
         forbidden_delete_response = await client.delete(f"/api/v1/collections/{collection_id}")
 
@@ -159,6 +162,7 @@ async def test_collection_routes_crud_detail_remove_active_and_invites(
     assert active_response.status_code == 200
     assert active_response.json()["active_save_collection_id"] == collection_id
     assert save_response.status_code == 200
+    assert repeated_save_response.status_code == 200
     assert save_event is not None
     assert save_event.user_id == owner.id
     assert save_event.payload["surface"] == "collection_chooser"
@@ -170,6 +174,25 @@ async def test_collection_routes_crud_detail_remove_active_and_invites(
     assert save_event_refs["meme_id"] == str(meme.id)
     assert save_event_properties["action"] == "save"
     assert save_event_properties["collection_scope"] == "public"
+    assert len(
+        list(
+            (
+                await migrated_db_session.execute(
+                    select(AnalyticsEvent).where(AnalyticsEvent.event_type == AnalyticsEventType.MEME_SAVE)
+                )
+            ).scalars()
+        )
+    ) == 1
+    assert owner_choices_response.status_code == 200
+    assert owner_choices_response.json()["collections"] == [
+        {
+            "collection_id": collection_id,
+            "title": "Launch Saves",
+            "contains_meme": True,
+            "can_add_memes": True,
+            "can_remove_memes": True,
+        }
+    ]
     assert detail_response.status_code == 200
     assert [item["meme"]["id"] for item in detail_response.json()["saved_memes"]] == [str(meme.id)]
     assert detail_response.json()["saved_memes"][0]["meme"]["viewer_has_saved"] is True
@@ -180,6 +203,16 @@ async def test_collection_routes_crud_detail_remove_active_and_invites(
     assert viewer_detail_response.status_code == 200
     assert viewer_detail_response.json()["viewer_role"] == "viewer"
     assert viewer_detail_response.json()["saved_memes"][0]["meme"]["viewer_has_saved"] is True
+    assert viewer_choices_response.status_code == 200
+    assert viewer_choices_response.json()["collections"] == [
+        {
+            "collection_id": collection_id,
+            "title": "Launch Saves",
+            "contains_meme": True,
+            "can_add_memes": False,
+            "can_remove_memes": False,
+        }
+    ]
     assert viewer_detail_response.json()["capabilities"]["can_remove_memes"] is False
     assert viewer_remove_response.status_code == 403
     assert guest_create_response.status_code == 403

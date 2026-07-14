@@ -77,6 +77,35 @@ const nextMeme = {
   }
 };
 
+const videoMeme = {
+  ...meme,
+  id: 'smoke-video-1',
+  media_type: 'video',
+  caption: null,
+  seo_page_slug: null,
+  tags: [],
+  primary_file: {
+    ...meme.primary_file,
+    id: 'smoke-video-file-1',
+    mime_type: 'video/mp4',
+    width: 720,
+    height: 1280,
+    render: {
+      ...meme.primary_file.render,
+      display_url: `http://127.0.0.1:${port}/media/smoke-cat.svg`,
+      original_url: `http://127.0.0.1:${port}/media/smoke-video.mp4`,
+      download_url: `http://127.0.0.1:${port}/media/smoke-video.mp4`,
+      web_video_url: `http://127.0.0.1:${port}/media/smoke-video.mp4`,
+      width: 720,
+      height: 1280
+    },
+    render_url: `http://127.0.0.1:${port}/media/smoke-video.mp4`,
+    download_url: `http://127.0.0.1:${port}/media/smoke-video.mp4`
+  },
+  render_url: `http://127.0.0.1:${port}/media/smoke-video.mp4`,
+  download_url: `http://127.0.0.1:${port}/media/smoke-video.mp4`
+};
+
 const collectionMeme = {
   ...meme,
   id: 'smoke-meme-collection-1',
@@ -122,6 +151,7 @@ const seededCollectionSummary = {
 
 const favoritesCollectionId = 'smoke-favorites';
 const recentCollectionId = 'smoke-recent-reactions';
+const laterCollectionId = 'smoke-later-ideas';
 const writableCollectionCapabilities = {
   can_view: true,
   can_add_memes: true,
@@ -158,6 +188,21 @@ const recentCollectionSummary = {
   capabilities: writableCollectionCapabilities,
   active_save_collection_id: favoritesCollectionId
 };
+const laterCollectionSummary = {
+  collection: {
+    ...seededCollection,
+    id: laterCollectionId,
+    owner_id: 'smoke-full-user',
+    title: 'Later ideas',
+    description: 'Another writable collection.'
+  },
+  viewer_role: 'owner',
+  capabilities: writableCollectionCapabilities,
+  active_save_collection_id: favoritesCollectionId
+};
+
+const viewerMemeStates = new Map();
+let guestStateSequence = 0;
 
 const trend = {
   recent: { views: 120, sends: 8, likes: 7, saves: 4, downloads: 3 },
@@ -652,7 +697,7 @@ const server = createServer((request, response) => {
       sendJson(response, 200, sessionPayload('full'));
       return;
     }
-    if (token === 'guest-auto') {
+    if (token === 'guest-auto' || token?.startsWith('smoke-guest-state-')) {
       sendJson(response, 200, sessionPayload('guest'));
       return;
     }
@@ -725,7 +770,7 @@ const server = createServer((request, response) => {
     const fullAccess = hasFullAccess(request);
     sendJson(response, 200, {
       collections: fullAccess
-        ? [recentCollectionSummary, favoritesCollectionSummary, seededCollectionSummary]
+        ? [recentCollectionSummary, favoritesCollectionSummary, laterCollectionSummary, seededCollectionSummary]
         : [favoritesCollectionSummary],
       active_save_collection_id: favoritesCollectionId
     }, fullAccess || accessToken(request) ? {} : {
@@ -734,9 +779,30 @@ const server = createServer((request, response) => {
     return;
   }
 
+  const memeChoicesMatch = url.pathname.match(/^\/api\/v1\/collections\/meme-choices\/([^/]+)$/);
+  if (memeChoicesMatch) {
+    const state = viewerState(request).state;
+    state.collectionChoiceReadCount += 1;
+    const choices = hasFullAccess(request)
+      ? [
+          collectionChoice(recentCollectionSummary, state.savedCollectionIds.has(recentCollectionId)),
+          collectionChoice(laterCollectionSummary, state.savedCollectionIds.has(laterCollectionId))
+        ]
+      : [];
+    const payload = {
+      collections: choices.sort((left, right) => Number(right.contains_meme) - Number(left.contains_meme))
+    };
+    if (accessToken(request) === 'smoke-full-save-race' && state.collectionChoiceReadCount === 2) {
+      setTimeout(() => sendJson(response, 200, payload), 2_000);
+      return;
+    }
+    sendJson(response, 200, payload);
+    return;
+  }
+
   if (url.pathname === '/api/v1/memes/meme-of-the-day') {
     sendJson(response, 200, {
-      meme,
+      meme: projectViewerMeme(request, meme),
       selected_for: '2026-01-01',
       refreshed_at: '2026-01-01T00:00:00Z',
       algorithm_version: motdAlgorithmVersion,
@@ -760,8 +826,13 @@ const server = createServer((request, response) => {
       return;
     }
 
+    if ((url.searchParams.get('query') ?? '').trim().toLowerCase() === 'video') {
+      sendJson(response, 200, searchPage([{ meme: videoMeme, attribution: attributionFor(url, videoMeme.id) }], url, 'req_smoke_video'));
+      return;
+    }
+
     sendJson(response, 200, {
-      items: [{ meme }],
+      items: [{ meme: projectViewerMeme(request, meme) }],
       limit: Number(url.searchParams.get('limit') ?? 12),
       offset: Number(url.searchParams.get('offset') ?? 0),
       total: 1,
@@ -773,7 +844,7 @@ const server = createServer((request, response) => {
   if (url.pathname === '/api/v1/memes/home-feed' || url.pathname === '/api/v1/memes/browse') {
     const offset = Number(url.searchParams.get('offset') ?? 0);
     sendJson(response, 200, {
-      items: [{ meme: offset > 0 ? nextMeme : meme }],
+      items: [{ meme: projectViewerMeme(request, offset > 0 ? nextMeme : meme) }],
       limit: Number(url.searchParams.get('limit') ?? 12),
       offset,
       total: 2,
@@ -783,7 +854,7 @@ const server = createServer((request, response) => {
   }
 
   if (url.pathname === '/api/v1/memes/slug/smoke-test-cat-reaction') {
-    sendJson(response, 200, detail);
+    sendJson(response, 200, { ...detail, ...projectViewerMeme(request, meme) });
     return;
   }
 
@@ -804,13 +875,41 @@ const server = createServer((request, response) => {
     return;
   }
 
-  if (/^\/api\/v1\/memes\/[^/]+\/(?:favorite|save|pin)$/.test(url.pathname)) {
-    sendJson(response, 200, request.method === 'DELETE' ? { removed: true } : { ok: true });
+  const memeActionMatch = url.pathname.match(/^\/api\/v1\/memes\/([^/]+)\/(favorite|save|pin)$/);
+  if (memeActionMatch) {
+    const stateResult = viewerState(request, { bootstrap: true });
+    const { state } = stateResult;
+    const action = memeActionMatch[2];
+    if (action === 'favorite') {
+      const nextFavorited = request.method !== 'DELETE';
+      const changed = state.favorited !== nextFavorited;
+      state.favorited = nextFavorited;
+      sendJson(response, 200, {
+        favorited: state.favorited,
+        changed,
+        like_count: meme.like_count + (state.favorited ? 1 : 0)
+      }, stateResult.headers);
+      return;
+    }
+    if (action === 'pin') {
+      state.pinned = request.method !== 'DELETE';
+    }
+    sendJson(response, 200, request.method === 'DELETE' ? { removed: true } : { ok: true }, stateResult.headers);
     return;
   }
 
-  if (request.method === 'POST' && /^\/api\/v1\/collections\/[^/]+\/memes\/[^/]+$/.test(url.pathname)) {
-    sendJson(response, 200, { saved: true });
+  const collectionMemeMatch = url.pathname.match(/^\/api\/v1\/collections\/([^/]+)\/memes\/([^/]+)$/);
+  if (collectionMemeMatch && (request.method === 'POST' || request.method === 'DELETE')) {
+    const stateResult = viewerState(request, { bootstrap: true });
+    const collectionId = decodeURIComponent(collectionMemeMatch[1]);
+    if (request.method === 'POST') stateResult.state.savedCollectionIds.add(collectionId);
+    else stateResult.state.savedCollectionIds.delete(collectionId);
+    sendJson(
+      response,
+      200,
+      request.method === 'POST' ? { saved: true } : { removed: true },
+      stateResult.headers
+    );
     return;
   }
 
@@ -1108,7 +1207,7 @@ function readRequestJson(request) {
 
 function hasFullAccess(request) {
   const token = accessToken(request);
-  return token === 'miniapp-full' || token?.startsWith('modal-full-') || hasAdminAccess(request);
+  return token === 'miniapp-full' || token?.startsWith('modal-full-') || token?.startsWith('smoke-full-') || hasAdminAccess(request);
 }
 
 function hasAdminAccess(request) {
@@ -1125,6 +1224,52 @@ function adminSessionKey(request) {
 
 function accessToken(request) {
   return cookieValue(request, 'memexpert_access_token');
+}
+
+function viewerState(request, { bootstrap = false } = {}) {
+  let token = accessToken(request);
+  const headers = {};
+  if (!token && bootstrap) {
+    token = `smoke-guest-state-${++guestStateSequence}`;
+    headers['set-cookie'] = `memexpert_access_token=${token}; Path=/; HttpOnly; SameSite=Lax`;
+  }
+  if (!token) {
+    return {
+      state: { favorited: false, pinned: false, savedCollectionIds: new Set(), collectionChoiceReadCount: 0 },
+      headers
+    };
+  }
+  if (!viewerMemeStates.has(token)) {
+    viewerMemeStates.set(token, {
+      favorited: false,
+      pinned: false,
+      savedCollectionIds: new Set(),
+      collectionChoiceReadCount: 0
+    });
+  }
+  return { state: viewerMemeStates.get(token), headers };
+}
+
+function projectViewerMeme(request, sourceMeme) {
+  if (sourceMeme.id !== meme.id) return sourceMeme;
+  const { state } = viewerState(request);
+  return {
+    ...sourceMeme,
+    like_count: meme.like_count + (state.favorited ? 1 : 0),
+    viewer_has_favorited: state.favorited,
+    viewer_has_saved: state.savedCollectionIds.size > 0,
+    viewer_has_pinned: state.pinned
+  };
+}
+
+function collectionChoice(summary, containsMeme) {
+  return {
+    collection_id: summary.collection.id,
+    title: summary.collection.title,
+    contains_meme: containsMeme,
+    can_add_memes: summary.capabilities.can_add_memes,
+    can_remove_memes: summary.capabilities.can_remove_memes
+  };
 }
 
 function cookieValue(request, name) {

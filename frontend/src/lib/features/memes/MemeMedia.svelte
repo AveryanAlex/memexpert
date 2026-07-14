@@ -3,15 +3,18 @@
   import { selectFeedPreviewAspectRatio, selectImageLoading, selectMediaPreload, selectMediaRender, selectVideoSourceType } from '$lib/media/render';
   import { memeTitle } from '$lib/memeActions';
   import { Download } from '@lucide/svelte';
+  import type { MemeVideoPreviewMode } from './meme-video';
+  import MemeVideoPlayer from './MemeVideoPlayer.svelte';
 
   interface Props {
     meme: PublicMemeCardRead | PublicMemeDetailRead;
     detail?: boolean;
     preview?: boolean;
     showDownload?: boolean;
+    videoPreviewMode?: MemeVideoPreviewMode;
   }
 
-  let { meme, detail = false, preview = false, showDownload = false }: Props = $props();
+  let { meme, detail = false, preview = false, showDownload = false, videoPreviewMode = 'poster' }: Props = $props();
 
   const file = $derived(meme.primary_file);
   const media = $derived(selectMediaRender(file));
@@ -37,18 +40,16 @@
   data-has-media={media.hasMedia}
 >
   {#if media.videoUrl}
-    <video
+    <MemeVideoPlayer
+      src={media.videoUrl}
+      sourceType={selectVideoSourceType(file)}
+      poster={media.imageUrl}
+      {title}
       class={mediaClass}
-      controls={detail}
-      muted={!detail}
-      playsinline
-      loop={!detail}
+      {detail}
+      previewMode={videoPreviewMode}
       preload={mediaPreload}
-      poster={media.imageUrl || undefined}
-      aria-label={title}
-    >
-      <source src={media.videoUrl} type={selectVideoSourceType(file)} />
-    </video>
+    />
   {:else if media.imageUrl}
     <img
       class={mediaClass}

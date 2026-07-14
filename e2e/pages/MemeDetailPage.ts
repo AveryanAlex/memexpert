@@ -60,8 +60,10 @@ export class MemeDetailPage {
     const saveButton = primaryActions.getByRole('button', { name: 'Save to collection', exact: true });
     await expect(saveButton).toHaveAttribute('aria-pressed', 'false');
     await saveButton.click();
-    await expect(this.page.getByRole('menuitem', { name: 'Favorites', exact: true })).toHaveCount(0);
-    await expect(this.page.getByRole('menuitem', { name: 'No collections available', exact: true })).toBeVisible();
+    await expect(
+      this.page.getByRole('button', { name: /^(?:Add to|Remove from|Saved in) Favorites/ })
+    ).toHaveCount(0);
+    await expect(this.page.getByText('No non-Favorites collections are available yet.', { exact: true })).toBeVisible();
     await this.page.keyboard.press('Escape');
     await expect(saveButton).toHaveAttribute('aria-pressed', 'false');
   }

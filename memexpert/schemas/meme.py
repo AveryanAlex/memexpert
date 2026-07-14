@@ -242,6 +242,14 @@ class PublicMemeOfTheDayRead(BaseModel):
     attribution: MemeResultAttributionRead | None = None
 
 
+class MemeFavoriteMutationRead(BaseModel):
+    """Authoritative Favorite state returned after an idempotent mutation."""
+
+    favorited: bool
+    changed: bool
+    like_count: int = Field(ge=0)
+
+
 class PublicMemeSearchPageRead(BaseModel):
     """Offset pagination envelope for public meme catalog responses."""
 

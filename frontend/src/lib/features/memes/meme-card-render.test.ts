@@ -49,6 +49,10 @@ describe('MemeCard', () => {
     expect(image.body).toContain('aria-label="Enlarge Launch reaction"');
     expect(video.body).not.toContain('aria-label="Enlarge Launch reaction"');
     expect(video.body).toContain('poster="/video-preview.webp"');
+    expect(video.body).toContain('data-video-preview-mode="poster"');
+    expect(video.body).toContain('aria-label="Play Launch reaction"');
+    expect(video.body).toContain('aria-label="Unmute Launch reaction"');
+    expect(video.body).toContain('aria-label="Open Launch reaction"');
   });
 
   it('hides the fallback title row without leaving a dangling labelled-by reference', () => {
@@ -79,6 +83,13 @@ describe('MemeCard', () => {
 
     expect(body).toMatch(/aria-label="Save to collection"[^>]*aria-pressed="true"/);
     expect(body).toContain('fill-current text-accent');
+  });
+
+  it('keeps direct card actions out of the overflow menu', () => {
+    const { body } = render(MemeCard, { props: { meme: memeCard() } });
+
+    expect(body).not.toContain('Favorite meme');
+    expect(body).not.toContain('Send to Telegram');
   });
 
   it('only renders shared/private visibility badges when explicitly enabled', () => {

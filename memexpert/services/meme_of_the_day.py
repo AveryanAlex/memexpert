@@ -17,7 +17,7 @@ from memexpert.models.base import utcnow
 from memexpert.models.content import Meme, MemeOfTheDaySelection
 from memexpert.schemas.meme import MemeResultAttributionRead, PublicMemeOfTheDayRead
 from memexpert.services.media_render_urls import MediaRenderUrlService
-from memexpert.services.meme_search import _DERIVED_POPULARITY_ATTR, _to_public_card_read
+from memexpert.services.meme_search import MemeSearchService
 
 if TYPE_CHECKING:
     import uuid
@@ -58,33 +58,44 @@ class MemeOfTheDayService:
         self._settings = settings or get_settings()
         self._media_render_service = media_render_service or MediaRenderUrlService()
 
-    async def get_today(self, *, surface: str = DEFAULT_MOTD_SURFACE) -> PublicMemeOfTheDayRead:
+    async def get_today(
+        self,
+        *,
+        surface: str = DEFAULT_MOTD_SURFACE,
+        viewer_user_id: uuid.UUID | None = None,
+    ) -> PublicMemeOfTheDayRead:
         """Return today's cached MOTD, refreshing if missing or no longer safe."""
 
         selected_for = utcnow().date()
         cached = await self._load_selection(selected_for)
         if cached is not None and self._selection_is_returnable(cached):
-            return self._to_read(cached, surface=surface)
-        return await self.refresh(selected_for=selected_for, surface=surface)
+            return await self._to_read(cached, surface=surface, viewer_user_id=viewer_user_id)
+        return await self.refresh(
+            selected_for=selected_for,
+            surface=surface,
+            viewer_user_id=viewer_user_id,
+        )
 
     async def get_cached(
         self,
         *,
         selected_for: date | None = None,
         surface: str = DEFAULT_MOTD_SURFACE,
+        viewer_user_id: uuid.UUID | None = None,
     ) -> PublicMemeOfTheDayRead | None:
         """Return a cached MOTD row for the UTC date and configured algorithm."""
 
         selection = await self._load_selection(selected_for or utcnow().date())
         if selection is None:
             return None
-        return self._to_read(selection, surface=surface)
+        return await self._to_read(selection, surface=surface, viewer_user_id=viewer_user_id)
 
     async def refresh(
         self,
         *,
         selected_for: date | None = None,
         surface: str = DEFAULT_MOTD_SURFACE,
+        viewer_user_id: uuid.UUID | None = None,
         commit: bool = True,
     ) -> PublicMemeOfTheDayRead:
         """Recompute and upsert the MOTD cache row for the requested UTC date."""
@@ -128,7 +139,7 @@ class MemeOfTheDayService:
         selection = await self._load_selection_by_id(selection_id)
         if commit:
             await self._session.commit()
-        return self._to_read(selection, surface=surface)
+        return await self._to_read(selection, surface=surface, viewer_user_id=viewer_user_id)
 
     async def _load_selection(self, selected_for: date) -> MemeOfTheDaySelection | None:
         stmt = (
@@ -243,12 +254,27 @@ class MemeOfTheDayService:
             return False
         return bool(meme.primary_file and meme.primary_file.quality_score >= self._settings.motd_min_quality_score)
 
-    def _to_read(self, selection: MemeOfTheDaySelection, *, surface: str) -> PublicMemeOfTheDayRead:
+    async def _to_read(
+        self,
+        selection: MemeOfTheDaySelection,
+        *,
+        surface: str,
+        viewer_user_id: uuid.UUID | None,
+    ) -> PublicMemeOfTheDayRead:
         score_components = _score_components(selection.score_components)
         meme = selection.meme if self._selection_is_returnable(selection) and selection.meme is not None else None
-        if meme is not None:
-            setattr(meme, _DERIVED_POPULARITY_ATTR, score_components.get("popularity_raw", 0.0))
-        card = _to_public_card_read(meme, media_render_service=self._media_render_service) if meme is not None else None
+        cards = (
+            await MemeSearchService(
+                self._session,
+                media_render_service=self._media_render_service,
+            ).get_public_meme_cards_by_ids(
+                (meme.id,),
+                viewer_user_id=viewer_user_id,
+            )
+            if meme is not None
+            else []
+        )
+        card = cards[0] if cards else None
         attribution = (
             MemeResultAttributionRead(
                 surface=surface,

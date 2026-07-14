@@ -4,6 +4,7 @@
   import { provideAuthState } from '$lib/auth-state';
   import AppShell from '$lib/features/app-shell/AppShell.svelte';
   import TelegramLoginModal from '$lib/features/auth/TelegramLoginModal.svelte';
+  import { provideMemeVideoCoordinator } from '$lib/features/memes/meme-video-coordinator';
   import { provideMemeActionState } from '$lib/meme-action-state';
   import TelegramMiniAppBootstrap from '$lib/TelegramMiniAppBootstrap.svelte';
   import TooltipProvider from '$lib/ui/tooltip/Provider.svelte';
@@ -18,6 +19,7 @@
   const session = $derived($authState.session);
   const sessionError = $derived($authState.sessionError);
   const memeActionState = provideMemeActionState(() => session?.user.id ?? null);
+  provideMemeVideoCoordinator();
 
   $effect(() => {
     authState.syncFromServer({ session: data.session ?? null, sessionError: data.sessionError });

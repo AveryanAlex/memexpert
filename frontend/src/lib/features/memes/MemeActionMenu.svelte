@@ -1,18 +1,15 @@
 <script lang="ts">
   import { browser } from '$app/environment';
   import {
-    fetchCollections,
     favoriteMeme,
     pinMeme,
     recordMemeDownload,
     recordMemeShare,
     reportMeme,
-    saveMemeToCollection,
     unfavoriteMeme,
-    unpinMeme,
-    type RemoveActionResponse
+    unpinMeme
   } from '$lib/api/client';
-  import type { ModerationReason, PublicMemeCardRead, PublicMemeDetailRead, WebCollectionSummaryRead } from '$lib/api/types';
+  import type { ModerationReason, PublicMemeCardRead, PublicMemeDetailRead } from '$lib/api/types';
   import {
     actionFailureMessage,
     canonicalMemeUrl,
@@ -29,7 +26,8 @@
   import { cn } from '$lib/ui/styles';
   import { readViewerCapabilities } from '$lib/viewer-capabilities';
   import * as Menu from '$lib/ui/dropdown-menu';
-  import { Bookmark, Copy, Download, Flag, Folder, Heart, MoreHorizontal, Pin, Send } from '@lucide/svelte';
+  import { Copy, Download, Flag, Heart, MoreHorizontal, Pin, Send } from '@lucide/svelte';
+  import SaveCollectionChooser from './SaveCollectionChooser.svelte';
 
   export type MemeActionSurface = 'card' | 'detail' | 'overflow';
 
@@ -67,12 +65,6 @@
   let reportReason = $state<ModerationReason>('spam');
   let reportNote = $state('');
   let hydrated = $state(false);
-  let saveMenuOpen = $state(false);
-  let collectionsRequestForOpen = $state(false);
-  let collectionsLoading = $state(false);
-  let collectionsReady = $state(false);
-  let collectionsError = $state<string | null>(null);
-  let writableCollections = $state<WebCollectionSummaryRead[]>([]);
 
   const reportReasons: Array<{ value: ModerationReason; label: string }> = [
     { value: 'spam', label: 'Spam or scam' },
@@ -97,84 +89,54 @@
   const interactionsDisabled = $derived(!hydrated || pending !== null);
   const sharedState = $derived($memeActionState[meme.id]);
   const favorited = $derived(sharedState?.favorited ?? meme.viewer_has_favorited);
+  const favoritePending = $derived(sharedState?.favoritePending ?? false);
   const saved = $derived(sharedState?.saved ?? meme.viewer_has_saved);
+  const savedCollectionIds = $derived(sharedState?.savedCollectionIds);
   const pinned = $derived(sharedState?.pinned ?? meme.viewer_has_pinned);
+  const pinPending = $derived(sharedState?.pinPending ?? false);
   const likeCount = $derived(sharedState?.likeCount ?? meme.like_count);
 
   $effect(() => {
     hydrated = true;
   });
 
-  $effect(() => {
-    if (saveMenuOpen && !collectionsRequestForOpen) {
-      collectionsRequestForOpen = true;
-      void loadCollections();
-    } else if (!saveMenuOpen && collectionsRequestForOpen) {
-      collectionsRequestForOpen = false;
-    }
-  });
-
   async function toggleFavorite() {
+    if (pending) return;
+    const operation = memeActionState.beginOperation(meme.id, 'favorite');
+    if (!operation) return;
+
     const next = !favorited;
-    const wasFavorited = favorited;
-    const previousLikeCount = likeCount;
+    let completed = false;
     await runAction(next ? 'favorite' : 'unfavorite', async () => {
       const response = next ? await favoriteMeme(actionRequest) : await unfavoriteMeme(actionRequest);
-      let nextLikeCount = previousLikeCount;
-      if (next && !wasFavorited) {
-        nextLikeCount += 1;
-      } else if (!next && wasFavorited && wasRemoved(response)) {
-        nextLikeCount = Math.max(0, nextLikeCount - 1);
-      }
-      memeActionState.publish(meme.id, { favorited: next, likeCount: nextLikeCount });
-      onFavoriteChange?.(next);
-    });
-  }
-
-  async function loadCollections() {
-    if (!browser || collectionsLoading) return;
-
-    collectionsLoading = true;
-    collectionsReady = false;
-    collectionsError = null;
-    try {
-      const response = await fetchCollections({ fetch, baseUrl: window.location.origin });
-      writableCollections = response.collections.filter(
-        (collection) => collection.collection.kind !== 'favorites' && collection.capabilities.can_add_memes
-      );
-      collectionsReady = true;
-    } catch (error) {
-      collectionsError = error instanceof Error ? error.message : 'Could not load your collections.';
-    } finally {
-      collectionsLoading = false;
-    }
-  }
-
-  function selectCollection(collection: WebCollectionSummaryRead) {
-    void saveToCollection(collection);
-  }
-
-  async function saveToCollection(collection: WebCollectionSummaryRead) {
-    if (!browser) return;
-
-    await runAction('save', async () => {
-      await saveMemeToCollection({
-        fetch,
-        baseUrl: window.location.origin,
-        collectionId: collection.collection.id,
-        memeId: meme.id,
-        body: actionBody
+      completed = memeActionState.completeOperation(operation, {
+        favorited: response.favorited,
+        likeCount: response.like_count
       });
-      memeActionState.publish(meme.id, { saved: true });
+      if (completed) onFavoriteChange?.(response.favorited);
+    });
+    if (!completed) memeActionState.completeOperation(operation);
+  }
+
+  function updateSavedCollections(collectionIds: readonly string[]) {
+    memeActionState.publish(meme.id, {
+      saved: collectionIds.length > 0,
+      savedCollectionIds: [...collectionIds]
     });
   }
 
   async function togglePin() {
+    if (pending) return;
+    const operation = memeActionState.beginOperation(meme.id, 'pin');
+    if (!operation) return;
+
     const next = !pinned;
+    let completed = false;
     await runAction(next ? 'pin' : 'unpin', async () => {
       await (next ? pinMeme(actionRequest) : unpinMeme(actionRequest));
-      memeActionState.publish(meme.id, { pinned: next });
+      completed = memeActionState.completeOperation(operation, { pinned: next });
     });
+    if (!completed) memeActionState.completeOperation(operation);
   }
 
   async function copyLink() {
@@ -271,30 +233,7 @@
     }
   }
 
-  function wasRemoved(response: unknown): boolean {
-    return Boolean((response as RemoveActionResponse | null)?.removed ?? true);
-  }
 </script>
-
-{#snippet saveCollectionMenu()}
-  <Menu.Content align={isCardSurface ? 'center' : 'start'} class="max-h-80 w-[min(18rem,calc(100vw-2rem))] overflow-y-auto">
-    <p class="m-0 px-3 pb-2 pt-1 text-xs font-extrabold uppercase tracking-wide text-muted">Save to collection</p>
-    {#if collectionsLoading || (!collectionsReady && !collectionsError)}
-      <Menu.Item disabled>Loading collections…</Menu.Item>
-    {:else if collectionsError}
-      <p class="m-0 rounded-xl px-3 py-2.5 text-sm font-semibold text-danger" role="alert">{collectionsError} Close and reopen to retry.</p>
-    {:else if writableCollections.length === 0}
-      <Menu.Item disabled>No collections available</Menu.Item>
-    {:else}
-      {#each writableCollections as collection (collection.collection.id)}
-        <Menu.Item onSelect={() => selectCollection(collection)} disabled={pending !== null}>
-          <Folder class="size-4 shrink-0" aria-hidden="true" />
-          <span class="min-w-0 truncate">{collection.collection.title}</span>
-        </Menu.Item>
-      {/each}
-    {/if}
-  </Menu.Content>
-{/snippet}
 
 <div class={isCardSurface ? 'border-t border-line px-3 py-2.5' : compact ? 'flex flex-wrap items-start gap-2' : 'my-3 flex flex-wrap items-start gap-2'}>
   {#if isCardSurface}
@@ -307,7 +246,7 @@
         aria-label={favorited ? 'Remove favorite' : 'Favorite'}
         title={favorited ? 'Remove favorite' : 'Favorite'}
         aria-pressed={favorited}
-        disabled={interactionsDisabled}
+        disabled={interactionsDisabled || favoritePending}
         onclick={toggleFavorite}
       >
         <Heart class={cn('size-5 shrink-0', favorited && 'fill-current text-danger')} aria-hidden="true" />
@@ -324,18 +263,16 @@
       >
         <Download class="size-5 shrink-0" aria-hidden="true" />
       </Button>
-      <Menu.Root bind:open={saveMenuOpen}>
-        <Menu.Trigger
-          variant="ghost"
-          aria-label="Save to collection"
-          title="Save to collection"
-          aria-pressed={saved}
-          disabled={interactionsDisabled}
-        >
-          <Bookmark class={cn('size-5 shrink-0', saved && 'fill-current text-accent')} aria-hidden="true" />
-        </Menu.Trigger>
-        {@render saveCollectionMenu()}
-      </Menu.Root>
+      <SaveCollectionChooser
+        memeId={meme.id}
+        {title}
+        {attribution}
+        surface="card"
+        {saved}
+        {savedCollectionIds}
+        disabled={interactionsDisabled}
+        onMembershipChange={updateSavedCollections}
+      />
       <Button
         class="h-10 w-full min-w-0 px-0 py-0"
         variant="ghost"
@@ -353,23 +290,13 @@
           <MoreHorizontal class="size-5" aria-hidden="true" />
         </Menu.Trigger>
         <Menu.Content>
-          <Menu.Item onSelect={toggleFavorite} disabled={pending !== null}>
-            <Heart class="size-4" aria-hidden="true" />
-            {favorited ? 'Remove favorite' : 'Favorite'} meme
-          </Menu.Item>
           {#if canPin}
-            <Menu.Item onSelect={togglePin} disabled={pending !== null}>
+            <Menu.Item onSelect={togglePin} disabled={pending !== null || pinPending}>
               <Pin class="size-4" aria-hidden="true" />
               {pinned ? 'Unpin' : 'Pin'}
             </Menu.Item>
           {/if}
-          <Menu.Separator />
-          <Menu.Item onSelect={shareTelegram} disabled={pending !== null}><Send class="size-4" aria-hidden="true" />Send to Telegram</Menu.Item>
           <Menu.Item onSelect={copyLink} disabled={pending !== null}><Copy class="size-4" aria-hidden="true" />Copy link</Menu.Item>
-          <Menu.Item onSelect={downloadMeme} disabled={!canDownload || pending !== null}>
-            <Download class="size-4" aria-hidden="true" />
-            {canDownload ? 'Download' : 'Download unavailable'}
-          </Menu.Item>
           <Menu.Separator />
           <Menu.Item tone="danger" onSelect={openReportForm} disabled={pending !== null}>
             <Flag class="size-4" aria-hidden="true" />
@@ -381,17 +308,20 @@
   {:else}
     {#if isDetailSurface}
       <div class="flex flex-wrap gap-2" aria-label="Primary meme actions">
-        <Button variant="secondary" type="button" aria-pressed={favorited} disabled={interactionsDisabled} onclick={toggleFavorite}>
+        <Button variant="secondary" type="button" aria-pressed={favorited} disabled={interactionsDisabled || favoritePending} onclick={toggleFavorite}>
           <Heart class={cn('size-4', favorited && 'fill-current text-danger')} aria-hidden="true" />
           Favorite ({likeCount})
         </Button>
-        <Menu.Root bind:open={saveMenuOpen}>
-          <Menu.Trigger variant="secondary" aria-label="Save to collection" aria-pressed={saved} disabled={interactionsDisabled}>
-            <Bookmark class={cn('size-4', saved && 'fill-current text-accent')} aria-hidden="true" />
-            {saved ? 'Saved' : 'Save'}
-          </Menu.Trigger>
-          {@render saveCollectionMenu()}
-        </Menu.Root>
+        <SaveCollectionChooser
+          memeId={meme.id}
+          {title}
+          {attribution}
+          surface="detail"
+          {saved}
+          {savedCollectionIds}
+          disabled={interactionsDisabled}
+          onMembershipChange={updateSavedCollections}
+        />
         <Button variant="secondary" type="button" disabled={interactionsDisabled} onclick={shareTelegram}>
           <Send class="size-4" aria-hidden="true" />
           Send
@@ -404,18 +334,12 @@
       <MoreHorizontal class="size-5" aria-hidden="true" />
     </Menu.Trigger>
     <Menu.Content>
-      <Menu.Item onSelect={toggleFavorite} disabled={pending !== null}>
-        <Heart class="size-4" aria-hidden="true" />
-        {favorited ? 'Remove favorite' : 'Favorite'} meme
-      </Menu.Item>
       {#if canPin}
-        <Menu.Item onSelect={togglePin} disabled={pending !== null}>
+        <Menu.Item onSelect={togglePin} disabled={pending !== null || pinPending}>
           <Pin class="size-4" aria-hidden="true" />
           {pinned ? 'Unpin' : 'Pin'}
         </Menu.Item>
       {/if}
-      <Menu.Separator />
-      <Menu.Item onSelect={shareTelegram} disabled={pending !== null}><Send class="size-4" aria-hidden="true" />Send to Telegram</Menu.Item>
       <Menu.Item onSelect={copyLink} disabled={pending !== null}><Copy class="size-4" aria-hidden="true" />Copy link</Menu.Item>
       <Menu.Item onSelect={downloadMeme} disabled={!canDownload || pending !== null}>
         <Download class="size-4" aria-hidden="true" />

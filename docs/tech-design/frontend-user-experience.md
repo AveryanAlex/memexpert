@@ -40,13 +40,15 @@ Desktop navigation presents the brand, Discover, global query search, Saved, and
 | `MemeCard.svelte` | Media-first card. Only media/title is a detail link; direct controls remain sibling buttons so interactive elements are not nested. It carries list/rank semantics and optional access markers. |
 | `MemeZoomDialog.svelte` | Top-right image overlay action that opens the highest-resolution available image in a viewport-sized accessible dialog. |
 | `MemeActionMenu.svelte` | One action implementation with `card`, `detail`, and `overflow` surfaces. Cards expose evenly distributed icon-only Favorite, Download, Save-to-collection, and Send controls; detail exposes labeled Favorite, Save-to-collection, and Send controls. Pin, Copy link, and Report remain contextual overflow actions. |
+| `SaveCollectionChooser.svelte` | Persistent meme-scoped chooser. It groups existing memberships before writable destinations, preserves backend recency order, supports in-place add/remove, and publishes aggregate bookmark state across duplicate cards. |
+| `MemeVideoPlayer.svelte` | Shared grid video preview. It coordinates one active preview/audio source, uses viewport autoplay in one-column grids, hover playback in wider fine-pointer grids, click/keyboard pause, muted defaults, and visibility/reduced-motion safeguards. |
 | `MemeGrid.svelte` | Owns layout choice, result attribution markup, local selection mode, checkboxes, and sticky selection toolbar. It does not decide whether a route enables bulk behavior. |
 | `InfiniteMemeFeed.svelte` | Owns initial/next page state, deduplicated append behavior, intersection loading, and accessible Load more/retry/end states. It passes the route's layout and bulk policy to `MemeGrid`. |
 | `MemeOfTheDayPanel.svelte` | Presents the daily selection as a compact media-first tile while retaining attribution for telemetry. |
 
 `MemeActionMenu` preserves existing client API calls while keeping routine action success feedback visual: Favorite and Save update their pressed/filled icon states without adding a status row, and action failures still render an error. It receives viewer capability from the root context, so shared cards do not need account-type prop drilling. A Favorite action can trigger the existing guest-to-Telegram connection prompt on detail; it does not change the account model.
 
-Save-to-collection opens a contextual chooser of collections where the viewer can add memes. The API orders those choices by the latest `collection_memes.added_at` value, descending with empty collections last, so the collection used for the most recent addition appears first. The client preserves that order and does not keep cross-user collection state in a module-level cache.
+Save-to-collection opens a borderless contextual popover backed by a meme-scoped collection-choice API. The API includes existing accessible non-Favorites memberships, including read-only shared collections, plus unsaved writable collections. Existing memberships render under **Saved in** before **Add to** destinations. The API orders choices by the latest `collection_memes.added_at` value, descending with empty collections last; the client preserves that order and keeps membership patches only in the layout-scoped meme action state.
 
 ### Search, library, collections, detail, and trends
 
@@ -79,8 +81,9 @@ Save-to-collection opens a contextual chooser of collections where the viewer ca
 ### Discover and cards
 
 - The first 390px-wide Discover viewport must include meme media. Large hero copy, management panels, and permanent bulk controls are excluded from the route.
-- Cards keep aspect-ratio-preserving media, a concise caption when one exists, a top-right image-enlargement overlay, and visible icon-only Favorite, Download, Save, Send, and overflow controls at touch sizes. The synthetic `Untitled meme` fallback remains available to accessible names and media alt text but does not render as a visible caption row.
-- Media/title remains the card's detail link. Enlarge and direct action controls come after it in the card's tab order.
+- Cards keep aspect-ratio-preserving media, a concise caption when one exists, a top-right image-enlargement overlay, and visible icon-only Favorite, Download, Save, Send, and overflow controls at touch sizes. The synthetic `Untitled meme` fallback remains available to accessible names and media alt text but does not render as a visible caption row. Interactive videos use a separate Open meme overlay so play/mute controls are never nested inside a link.
+- Video preview policy follows the measured rendered grid: sufficiently visible one-column previews autoplay muted unless reduced motion is requested; multi-column fine-pointer previews play on hover; coarse-pointer multi-column previews remain click-to-play. Leaving hover/viewport, hiding the page, or activating another preview pauses and re-mutes the previous video.
+- Image media/title remains the card's detail link. Interactive videos instead expose a separate Open meme link before Play/Pause and Mute/Unmute controls in tab order.
 - At 320px and above, controls must remain within the viewport without horizontal page overflow.
 
 ### Search filters
@@ -200,7 +203,7 @@ Trend visualizations follow these rules:
 
 - Use named navigation landmarks, active-page `aria-current`, visible mobile labels, and focus-visible rings on all interactive primitives.
 - Preserve semantic card/list structures. Cards expose title-based detail links, `aria-posinset`/`aria-setsize` where a feed provides rank, labeled action groups, and pressed state for Favorite/Save controls.
-- Do not nest action buttons inside the detail link. Keyboard focus reaches media/detail, Enlarge, Favorite, Download, Save, Send, then overflow in a predictable card order. The enlargement dialog uses the best available image variant, traps focus, closes with Escape, and restores focus to its trigger. Icon-only card controls retain explicit accessible names and pressed state; a favorited heart is filled and uses the danger/red token instead of changing to a visible “Favorited” label.
+- Do not nest action buttons inside the detail link. Image-card focus reaches media/detail, Enlarge, Favorite, Download, Save, Send, then overflow. Video-card focus reaches Open meme, Play/Pause, Mute/Unmute, then the same direct actions. The enlargement dialog uses the best available image variant, traps focus, closes with Escape, and restores focus to its trigger. Icon-only card controls retain explicit accessible names and pressed state; a favorited heart is filled and uses the danger/red token instead of changing to a visible “Favorited” label.
 - Viewer action state is layout-scoped and keyed by meme ID, so repeated presentations of the same meme (for example Meme of the Day plus the home feed) update Favorite, Save, Pin, and the visible like count together. Save choosers omit Favorites, and the bookmark is pressed when the meme belongs to any accessible non-Favorites collection. The state is discarded when the active viewer identity changes.
 - Dialogs have title/description/close controls; filter-sheet content scrolls internally; Reset/Show results are reachable at every viewport size.
 - Selection checkboxes have meme-specific labels, selection feedback uses live status, and pin ordering retains keyboard Up/Down controls in addition to pointer drag support.

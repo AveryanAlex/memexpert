@@ -305,18 +305,18 @@ async def handle_inline_library_callback(
         service = CollectionService(session)
         try:
             if action == "fav":
-                favorite = await service.favorite_meme(user_id=user_id, meme_id=meme_id)
-                text = "Added to Favorites."
+                mutation = await service.favorite_meme_result(user_id=user_id, meme_id=meme_id)
+                text = "Added to Favorites." if mutation.changed else "Already in Favorites."
                 event_type = AnalyticsEventType.MEME_LIKE
-                collection_id = favorite.collection_id
+                collection_id = mutation.item.collection_id
             elif action == "save":
-                save = await service.save_meme_to_active_collection(user_id=user_id, meme_id=meme_id)
-                text = "Saved to active collection."
+                mutation = await service.save_meme_to_active_collection_result(user_id=user_id, meme_id=meme_id)
+                text = "Saved to active collection." if mutation.changed else "Already saved there."
                 event_type = AnalyticsEventType.MEME_SAVE
-                collection_id = save.collection_id
+                collection_id = mutation.item.collection_id
             elif action == "pin":
-                _ = await service.pin_meme(user_id=user_id, meme_id=meme_id)
-                text = "Pinned."
+                mutation = await service.pin_meme_result(user_id=user_id, meme_id=meme_id)
+                text = "Pinned." if mutation.changed else "Already pinned."
                 event_type = AnalyticsEventType.MEME_PIN
                 collection_id = None
             else:
@@ -325,6 +325,9 @@ async def handle_inline_library_callback(
         except CollectionServiceError as exc:
             logger.info("Telegram inline library callback rejected: %s", exc)
             await callback_query.answer(str(exc), show_alert=True)
+            return
+        if not mutation.changed:
+            await callback_query.answer(text)
             return
         await record_telegram_interaction_event(
             session,

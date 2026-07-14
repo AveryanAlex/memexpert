@@ -20,6 +20,7 @@ from memexpert.models.content import Meme, MemeFile, MemeOfTheDaySelection
 from memexpert.models.enums import AccountStatus, AnalyticsEventType, ContentKind, ContentLanguage
 from memexpert.models.user import AnalyticsEvent, User
 from memexpert.schemas.user import UserRead
+from memexpert.services.collection_service import CollectionService
 from memexpert.services.meme_of_the_day import MemeOfTheDayService
 
 if TYPE_CHECKING:
@@ -240,6 +241,55 @@ async def test_motd_route_public_read_and_admin_refresh_auth_shape(
     assert unauthorized_refresh.status_code == 401
     assert admin_refresh.status_code == 200
     assert admin_refresh.json()["meme"]["id"] == str(meme.id)
+
+
+async def test_motd_route_overlays_viewer_favorite_state_after_reload(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    meme = await _create_meme(
+        migrated_db_session,
+        created_at=datetime.now(UTC) - timedelta(days=1),
+        quality_score=0.8,
+    )
+    viewer = User(
+        email="motd-viewer@example.com",
+        email_verified_at=datetime.now(UTC),
+        status=AccountStatus.ACTIVE,
+    )
+    other_viewer = User(
+        email="motd-other-viewer@example.com",
+        email_verified_at=datetime.now(UTC),
+        status=AccountStatus.ACTIVE,
+    )
+    migrated_db_session.add_all([viewer, other_viewer])
+    await migrated_db_session.flush()
+    _ = await CollectionService(migrated_db_session).favorite_meme(user_id=viewer.id, meme_id=meme.id)
+
+    current_user = UserRead.model_validate(viewer)
+
+    def override_motd_service() -> MemeOfTheDayService:
+        return MemeOfTheDayService(migrated_db_session)
+
+    async def override_current_user() -> UserRead | None:
+        return current_user
+
+    app.dependency_overrides[get_meme_of_the_day_service] = override_motd_service
+    app.dependency_overrides[get_optional_current_user] = override_current_user
+    try:
+        viewer_response = await client.get("/api/v1/memes/meme-of-the-day")
+        current_user = UserRead.model_validate(other_viewer)
+        other_response = await client.get("/api/v1/memes/meme-of-the-day")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert viewer_response.status_code == 200
+    assert viewer_response.json()["meme"]["viewer_has_favorited"] is True
+    assert viewer_response.json()["meme"]["like_count"] == 1
+    assert other_response.status_code == 200
+    assert other_response.json()["meme"]["viewer_has_favorited"] is False
+    assert other_response.json()["meme"]["like_count"] == 1
 
 
 async def _create_meme(
