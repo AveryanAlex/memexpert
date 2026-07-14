@@ -379,9 +379,9 @@ async def test_collection_detail_and_media_route_authorize_private_saved_media(
     private_meme = await _create_meme(
         migrated_db_session,
         is_public=False,
-        s3_original_key="pipeline/originals/private/owner-upload.png",
+        s3_original_key="pipeline/originals/private/owner-upload.mov",
         s3_web_video_key="pipeline/derived/private/owner-upload.mp4",
-        mime_type="image/png",
+        mime_type="video/quicktime",
     )
     migrated_db_session.add(
         CollectionMeme(
@@ -464,7 +464,7 @@ async def test_collection_detail_and_media_route_authorize_private_saved_media(
     assert owner_render["thumbnail_url"] == f"/api/v1/media/files/{private_file_id}/thumbnail"
     assert owner_render["preview_url"] == f"/api/v1/media/files/{private_file_id}/preview"
     assert owner_render["web_video_url"] == f"/api/v1/media/files/{private_file_id}/web-video.mp4"
-    assert "pipeline/originals/private/owner-upload.png" not in owner_detail_response.text
+    assert "pipeline/originals/private/owner-upload.mov" not in owner_detail_response.text
     assert "pipeline/derived/private/owner-upload.mp4" not in owner_detail_response.text
     assert owner_media_response.status_code == 307
     assert owner_media_response.headers["location"] == "https://s3.memexpert.test/pipeline/derived/private/owner-upload.mp4"
@@ -474,16 +474,18 @@ async def test_collection_detail_and_media_route_authorize_private_saved_media(
     member_render = member_detail_response.json()["saved_memes"][0]["meme"]["primary_file"]["render"]
     assert member_render["preview_url"] == f"/api/v1/media/files/{private_file_id}/preview"
     assert member_media_response.status_code == 307
-    assert member_media_response.headers["location"] == "https://s3.memexpert.test/pipeline/originals/private/owner-upload.png"
+    expected_preview_key = f"pipeline/derived/{private_file_id}/preview.png"
+    assert member_media_response.headers["location"] == f"https://s3.memexpert.test/{expected_preview_key}"
 
     assert outsider_detail_response.status_code == 404
     assert outsider_media_response.status_code == 404
     assert admin_media_response.status_code == 307
-    assert admin_media_response.headers["location"] == "https://s3.memexpert.test/pipeline/originals/private/owner-upload.png"
+    assert admin_media_response.headers["location"] == f"https://s3.memexpert.test/{expected_preview_key}"
     assert anonymous_media_response.status_code == 401
     first_params = cast("dict[str, str]", fake_s3_client.calls[0]["params"])
     second_params = cast("dict[str, str]", fake_s3_client.calls[1]["params"])
     third_params = cast("dict[str, str]", fake_s3_client.calls[2]["params"])
     assert first_params["Key"] == "pipeline/derived/private/owner-upload.mp4"
-    assert second_params["Key"] == "pipeline/originals/private/owner-upload.png"
-    assert third_params["Key"] == "pipeline/originals/private/owner-upload.png"
+    assert second_params["Key"] == expected_preview_key
+    assert second_params["ResponseContentType"] == "image/png"
+    assert third_params["Key"] == expected_preview_key

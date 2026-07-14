@@ -15,8 +15,8 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from memexpert.api.dependencies import CurrentUserDep, DbSessionDep
-from memexpert.core.config import get_settings
-from memexpert.core.storage import get_pipeline_storage_settings, get_s3_client
+from memexpert.core.config import Settings, get_settings
+from memexpert.core.storage import build_preview_image_object_key, get_pipeline_storage_settings, get_s3_client
 from memexpert.models.collection import Collection, CollectionMember, CollectionMeme
 from memexpert.models.content import Meme, MemeFile
 from memexpert.models.enums import AccountType
@@ -54,14 +54,14 @@ async def render_media_file(
     if file is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Media file was not found.")
 
-    object_key = file.s3_web_video_key if variant is MediaFileVariant.WEB_VIDEO else file.s3_original_key
+    settings = get_settings()
+    object_key = _object_key_for_variant(file, variant=variant, settings=settings)
     if object_key is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Media variant was not found.")
 
-    settings = get_settings()
     storage_settings = get_pipeline_storage_settings(settings)
     params: dict[str, str] = {"Bucket": storage_settings.bucket, "Key": object_key}
-    content_type = "video/mp4" if variant is MediaFileVariant.WEB_VIDEO else file.mime_type
+    content_type = _content_type_for_variant(file, variant=variant)
     if content_type:
         params["ResponseContentType"] = content_type
     if variant is MediaFileVariant.DOWNLOAD:
@@ -73,6 +73,22 @@ async def render_media_file(
         ExpiresIn=_PRESIGNED_GET_TTL_SECONDS,
     )
     return RedirectResponse(url=url, status_code=status.HTTP_307_TEMPORARY_REDIRECT)
+
+
+def _object_key_for_variant(file: MemeFile, *, variant: MediaFileVariant, settings: Settings) -> str | None:
+    if variant is MediaFileVariant.WEB_VIDEO:
+        return file.s3_web_video_key
+    if variant in {MediaFileVariant.THUMBNAIL, MediaFileVariant.PREVIEW} and file.s3_web_video_key:
+        return build_preview_image_object_key(file.id, settings=settings)
+    return file.s3_original_key
+
+
+def _content_type_for_variant(file: MemeFile, *, variant: MediaFileVariant) -> str | None:
+    if variant is MediaFileVariant.WEB_VIDEO:
+        return "video/mp4"
+    if variant in {MediaFileVariant.THUMBNAIL, MediaFileVariant.PREVIEW} and file.s3_web_video_key:
+        return "image/png"
+    return file.mime_type
 
 
 async def _load_authorized_file(

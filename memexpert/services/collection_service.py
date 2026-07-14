@@ -11,7 +11,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
 from memexpert.core.config import Settings, get_settings
-from memexpert.core.storage import delete_object_if_present, get_pipeline_storage_settings, get_s3_client
+from memexpert.core.storage import (
+    build_preview_image_object_key,
+    delete_object_if_present,
+    get_pipeline_storage_settings,
+    get_s3_client,
+)
 from memexpert.models.collection import Collection, CollectionInvite, CollectionMember, CollectionMeme, PinnedMeme
 from memexpert.models.content import Meme, MemeFile
 from memexpert.models.enums import (
@@ -1108,7 +1113,7 @@ class CollectionService:
         if await self._meme_has_collection_references(meme.id):
             return ()
 
-        object_keys = _object_keys_for_meme_files(meme.files)
+        object_keys = _object_keys_for_meme_files(meme.files, settings=self._settings)
         await self._session.execute(delete(Meme).where(Meme.id == meme.id))
         return object_keys
 
@@ -1124,7 +1129,7 @@ class CollectionService:
         for meme in memes:
             if await self._meme_has_other_collection_references(meme.id, collection_id=collection_id):
                 continue
-            object_keys.extend(_object_keys_for_meme_files(meme.files))
+            object_keys.extend(_object_keys_for_meme_files(meme.files, settings=self._settings))
             await self._session.execute(delete(Meme).where(Meme.id == meme.id))
         return tuple(dict.fromkeys(object_keys))
 
@@ -1261,11 +1266,12 @@ def _normalize_collection_title(title: str) -> str:
     return normalized_title
 
 
-def _object_keys_for_meme_files(files: list[MemeFile]) -> tuple[str, ...]:
+def _object_keys_for_meme_files(files: list[MemeFile], *, settings: Settings | None) -> tuple[str, ...]:
     object_keys: list[str] = []
     for file in files:
         object_keys.append(file.s3_original_key)
         if file.s3_web_video_key is not None:
+            object_keys.append(build_preview_image_object_key(file.id, settings=settings))
             object_keys.append(file.s3_web_video_key)
     return tuple(dict.fromkeys(object_keys))
 

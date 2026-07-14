@@ -421,8 +421,9 @@ async def test_meme_library_returns_private_authenticated_render_urls_for_owner(
     assert primary_file is not None
     assert primary_file.id == private_meme.primary_file_id
     assert primary_file.render is not None
-    assert primary_file.render.thumbnail_url is None
-    assert primary_file.render.preview_url is None
+    assert primary_file.render.thumbnail_url == f"/api/v1/media/files/{private_meme.primary_file_id}/thumbnail"
+    assert primary_file.render.preview_url == f"/api/v1/media/files/{private_meme.primary_file_id}/preview"
+    assert primary_file.render.display_url == primary_file.render.preview_url
     assert primary_file.render.web_video_url == f"/api/v1/media/files/{private_meme.primary_file_id}/web-video.mp4"
     assert primary_file.render.download_url == primary_file.render.web_video_url
     serialized = library.model_dump_json()
@@ -525,6 +526,7 @@ async def test_private_cleanup_deletes_only_unreferenced_private_storage_and_row
     ) == 0
     assert {call["Key"] for call in storage_client.delete_calls} == {
         "pipeline/originals/private/cleanup-original.png",
+        f"pipeline/derived/{private_meme.primary_file_id}/preview.png",
         "pipeline/derived/private/cleanup-web.mp4",
     }
     delete_call_count = len(storage_client.delete_calls)
@@ -577,6 +579,7 @@ async def test_private_cleanup_runs_for_active_collection_and_unfavorite_paths(
     assert await migrated_db_session.get(Meme, favorite_meme_id) is None
     assert {call["Key"] for call in storage_client.delete_calls} == {
         "pipeline/originals/private/active-cleanup.png",
+        f"pipeline/derived/{active_meme.primary_file_id}/preview.png",
         "pipeline/derived/private/active-cleanup.mp4",
         "pipeline/originals/private/favorite-cleanup.png",
     }
@@ -620,8 +623,10 @@ async def test_custom_collection_delete_cleans_orphans_and_pinned_private_memes(
     assert await migrated_db_session.get(PinnedMeme, (owner.id, pinned_meme_id)) is None
     assert {call["Key"] for call in storage_client.delete_calls} == {
         "pipeline/originals/private/delete-orphan.png",
+        f"pipeline/derived/{orphan_meme.primary_file_id}/preview.png",
         "pipeline/derived/private/delete-orphan.mp4",
         "pipeline/originals/private/delete-pinned.png",
+        f"pipeline/derived/{pinned_meme.primary_file_id}/preview.png",
         "pipeline/derived/private/delete-pinned.mp4",
     }
 

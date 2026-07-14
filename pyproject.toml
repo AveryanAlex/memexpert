@@ -52,6 +52,7 @@ default-groups = ["dev", "worker"]
 memexpert-api = "memexpert.api.main:main"
 memexpert-admin-users = "scripts.admin_users:main"
 memexpert-analytics = "scripts.analytics:main"
+memexpert-backfill-video-posters = "scripts.backfill_video_posters:main"
 memexpert-bot = "memexpert.bot.main:main"
 memexpert-reconcile-sha-duplicates = "scripts.reconcile_sha_duplicates:main"
 memexpert-scheduler = "memexpert.scheduler.main:main"

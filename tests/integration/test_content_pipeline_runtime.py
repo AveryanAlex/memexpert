@@ -737,6 +737,8 @@ def build_normalized_media_result(meme_file_id: uuid.UUID, *, web_video: bool = 
     return NormalizedMediaResult(
         quality_score=0.82,
         blur_hash="L4AS~q00~q.8%MRjM{Rj00IU%MRj",
+        preview_image_object_key=f"pipeline/derived/{meme_file_id}/preview.png" if web_video else None,
+        preview_image_bytes=b"normalized-preview-image" if web_video else None,
         web_video_object_key=f"pipeline/derived/{meme_file_id}/web.mp4" if web_video else None,
         web_video_bytes=b"normalized-web-video" if web_video else None,
     )
@@ -750,6 +752,16 @@ def _web_video_key(result: NormalizedMediaResult) -> str:
 def _web_video_bytes(result: NormalizedMediaResult) -> bytes:
     assert result.web_video_bytes is not None
     return result.web_video_bytes
+
+
+def _preview_image_key(result: NormalizedMediaResult) -> str:
+    assert result.preview_image_object_key is not None
+    return result.preview_image_object_key
+
+
+def _preview_image_bytes(result: NormalizedMediaResult) -> bytes:
+    assert result.preview_image_bytes is not None
+    return result.preview_image_bytes
 
 
 def build_ocr_result(*, source_object_key: str) -> OCRExtractionResult:
@@ -1486,6 +1498,7 @@ async def test_pipeline_runtime_forced_transcode_failure_then_replay_then_succes
     assert succeeded_item.normalized_reason is None
     assert len(downstream_broker.publish_calls) == 1
     assert downstream_broker.publish_calls[0]["routing_key"] == successful_runtime.broker_settings.ocr_routing_key
+    assert storage_client.objects[_preview_image_key(normalized)].body == _preview_image_bytes(normalized)
     assert storage_client.objects[_web_video_key(normalized)].body == _web_video_bytes(normalized)
     assert success_message.ack_count == 1
     assert success_message.reject_calls == []

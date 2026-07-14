@@ -29,6 +29,8 @@ class NormalizedMediaResult:
 
     quality_score: float
     blur_hash: str | None
+    preview_image_object_key: str | None = None
+    preview_image_bytes: bytes | None = None
     web_video_object_key: str | None = None
     web_video_bytes: bytes | None = None
 

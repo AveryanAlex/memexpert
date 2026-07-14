@@ -237,6 +237,19 @@ def build_web_video_object_key(
     return f"{storage_settings.derivative_prefix}/{meme_file_id}/web.{normalized_extension}"
 
 
+def build_preview_image_object_key(
+    meme_file_id: uuid.UUID,
+    *,
+    extension: str = "png",
+    settings: Settings | None = None,
+) -> str:
+    """Build the stable key used to persist a moving-media preview frame."""
+
+    storage_settings = get_pipeline_storage_settings(settings)
+    normalized_extension = _normalize_extension(f"artifact.{extension}")
+    return f"{storage_settings.derivative_prefix}/{meme_file_id}/preview.{normalized_extension}"
+
+
 async def download_object_bytes(
     client: Any,
     *,
@@ -354,6 +367,7 @@ __all__ = [
     "StorageConfigurationError",
     "StorageConnectionError",
     "build_original_object_key",
+    "build_preview_image_object_key",
     "build_s3_client",
     "build_temp_original_object_key",
     "build_web_video_object_key",

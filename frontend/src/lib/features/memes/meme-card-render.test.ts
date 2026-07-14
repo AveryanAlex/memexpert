@@ -36,7 +36,7 @@ describe('MemeCard', () => {
             render: {
               ...base.primary_file!.render!,
               original_url: '/original.mp4',
-              display_url: null,
+              display_url: '/video-preview.webp',
               web_video_url: '/video.mp4'
             }
           }
@@ -46,6 +46,7 @@ describe('MemeCard', () => {
 
     expect(image.body).toContain('aria-label="Enlarge Launch reaction"');
     expect(video.body).not.toContain('aria-label="Enlarge Launch reaction"');
+    expect(video.body).toContain('poster="/video-preview.webp"');
   });
 
   it('hides the fallback title row without leaving a dangling labelled-by reference', () => {

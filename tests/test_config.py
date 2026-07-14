@@ -24,6 +24,7 @@ from memexpert.core.storage import (
     StorageConfigurationError,
     StorageConnectionError,
     build_original_object_key,
+    build_preview_image_object_key,
     build_s3_client,
     build_web_video_object_key,
     normalize_s3_bucket_name,
@@ -578,9 +579,11 @@ def test_pipeline_object_key_builders_follow_a_stable_contract() -> None:
     )
 
     original_key = build_original_object_key(meme_file_id, "../strange name.JPEG", settings=settings)
+    preview_image_key = build_preview_image_object_key(meme_file_id, extension="PNG", settings=settings)
     web_video_key = build_web_video_object_key(meme_file_id, extension="MP4", settings=settings)
 
     assert original_key == f"pipeline/originals/{meme_file_id}/original.jpeg"
+    assert preview_image_key == f"pipeline/derived/{meme_file_id}/preview.png"
     assert web_video_key == f"pipeline/derived/{meme_file_id}/web.mp4"
 
 

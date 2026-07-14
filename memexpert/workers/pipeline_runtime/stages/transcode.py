@@ -19,6 +19,7 @@ from memexpert.workers.pipeline_runtime.errors import ForcedTranscodeFailure
 from memexpert.workers.pipeline_runtime.stages.context import PipelineStageHandlerContext
 
 _WEB_VIDEO_MIME_TYPE = "video/mp4"
+_PREVIEW_IMAGE_MIME_TYPE = "image/png"
 
 
 async def run_transcode_stage(
@@ -52,18 +53,35 @@ async def run_transcode_stage(
     if has_web_video_key != has_web_video_bytes:
         raise MediaValidationError("Normalized media result has an incomplete web-video derivative.")
 
-    uploaded_web_video_key: str | None = None
-    if normalized.web_video_object_key is not None and normalized.web_video_bytes is not None:
-        await upload_object_bytes(
-            context.storage_client,
-            bucket=storage_settings.bucket,
-            key=normalized.web_video_object_key,
-            body=normalized.web_video_bytes,
-            content_type=_WEB_VIDEO_MIME_TYPE,
-        )
-        uploaded_web_video_key = normalized.web_video_object_key
+    has_preview_image_key = normalized.preview_image_object_key is not None
+    has_preview_image_bytes = normalized.preview_image_bytes is not None
+    if has_preview_image_key != has_preview_image_bytes:
+        raise MediaValidationError("Normalized media result has an incomplete preview-image derivative.")
+    if has_web_video_key != has_preview_image_key:
+        raise MediaValidationError("Moving-media normalization must produce both playback and preview derivatives.")
 
+    uploaded_object_keys: list[str] = []
     try:
+        if normalized.preview_image_object_key is not None and normalized.preview_image_bytes is not None:
+            await upload_object_bytes(
+                context.storage_client,
+                bucket=storage_settings.bucket,
+                key=normalized.preview_image_object_key,
+                body=normalized.preview_image_bytes,
+                content_type=_PREVIEW_IMAGE_MIME_TYPE,
+            )
+            uploaded_object_keys.append(normalized.preview_image_object_key)
+
+        if normalized.web_video_object_key is not None and normalized.web_video_bytes is not None:
+            await upload_object_bytes(
+                context.storage_client,
+                bucket=storage_settings.bucket,
+                key=normalized.web_video_object_key,
+                body=normalized.web_video_bytes,
+                content_type=_WEB_VIDEO_MIME_TYPE,
+            )
+            uploaded_object_keys.append(normalized.web_video_object_key)
+
         async with context.session_factory() as session:
             service = PipelineStageCompletionService(session, settings=context.settings, broker=context.broker)
             await service.complete_transcode_stage(
@@ -73,11 +91,11 @@ async def run_transcode_stage(
                 result=normalized,
             )
     except Exception:
-        if uploaded_web_video_key is not None:
+        for object_key in uploaded_object_keys:
             await delete_object_if_present(
                 context.storage_client,
                 bucket=storage_settings.bucket,
-                key=uploaded_web_video_key,
+                key=object_key,
             )
         raise
 

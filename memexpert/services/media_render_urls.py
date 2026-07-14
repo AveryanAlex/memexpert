@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import quote
 
 from memexpert.core.config import Settings, get_settings
+from memexpert.core.storage import build_preview_image_object_key
 from memexpert.schemas.meme import PublicMemeFileRenderRead
 
 if TYPE_CHECKING:
@@ -51,20 +52,23 @@ class MediaRenderUrlService:
         """Build render URLs for one already-visible meme file."""
 
         render = PublicMemeFileRenderRead(width=file.width, height=file.height, blur_hash=file.blur_hash)
-        if _is_static_image_mime(file.mime_type):
-            extension = _extension_for_file(file, default="jpg")
-            filename = _download_filename(file=file, context=context, extension=extension)
+        preview_image_key = _preview_image_key(file, settings=self._settings)
+        if preview_image_key is not None:
             render.thumbnail_url = self._imgproxy_url(
-                file.s3_original_key,
+                preview_image_key,
                 options=("rs:fill:360:360", "g:sm", "f:webp"),
                 extension="webp",
             )
             render.preview_url = self._imgproxy_url(
-                file.s3_original_key,
+                preview_image_key,
                 options=("rs:fit:900:900", "f:webp"),
                 extension="webp",
             )
             render.display_url = render.preview_url
+
+        if _is_static_image_mime(file.mime_type):
+            extension = _extension_for_file(file, default="jpg")
+            filename = _download_filename(file=file, context=context, extension=extension)
             render.original_url = self._imgproxy_url(
                 file.s3_original_key,
                 options=("rs:fit:1600:1600",),
@@ -94,6 +98,10 @@ class MediaRenderUrlService:
             render.download_url = self._private_file_url(file.id, variant="download")
         else:
             render.original_url = self._private_file_url(file.id, variant="original")
+            if file.s3_web_video_key:
+                render.thumbnail_url = self._private_file_url(file.id, variant="thumbnail")
+                render.preview_url = self._private_file_url(file.id, variant="preview")
+                render.display_url = render.preview_url
             if not file.s3_web_video_key:
                 render.download_url = self._private_file_url(file.id, variant="download")
 
@@ -127,6 +135,14 @@ class MediaRenderUrlService:
 
 def _is_static_image_mime(mime_type: str | None) -> bool:
     return bool(mime_type and mime_type.lower() in _STATIC_IMAGE_MIME_TYPES)
+
+
+def _preview_image_key(file: MemeFile, *, settings: Settings) -> str | None:
+    if _is_static_image_mime(file.mime_type):
+        return file.s3_original_key
+    if file.s3_web_video_key:
+        return build_preview_image_object_key(file.id, settings=settings)
+    return None
 
 
 def _extension_for_file(file: MemeFile, *, default: str) -> str:

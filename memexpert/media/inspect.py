@@ -16,7 +16,7 @@ from PIL import Image, ImageFilter, ImageSequence, ImageStat, UnidentifiedImageE
 
 from memexpert.core.config import Settings, get_settings
 from memexpert.core.media_blurhash import encode_blur_hash
-from memexpert.core.storage import build_web_video_object_key
+from memexpert.core.storage import build_preview_image_object_key, build_web_video_object_key
 from memexpert.media.contracts import (
     CommandResult,
     MediaCommandRunner,
@@ -173,6 +173,8 @@ class PipelineMediaProcessor:
         return NormalizedMediaResult(
             quality_score=quality_score,
             blur_hash=blur_hash,
+            preview_image_object_key=build_preview_image_object_key(meme_file_id, settings=self._settings),
+            preview_image_bytes=preview_frame_bytes,
             web_video_object_key=build_web_video_object_key(meme_file_id, settings=self._settings),
             web_video_bytes=web_video_bytes,
         )

@@ -387,6 +387,8 @@ def _normalized_media_result(meme_file_id: uuid.UUID, *, web_video: bool = True)
     return NormalizedMediaResult(
         quality_score=0.77,
         blur_hash="L4AS~q00~q.8%MRjM{Rj00IU%MRj",
+        preview_image_object_key=f"pipeline/derived/{meme_file_id}/preview.png" if web_video else None,
+        preview_image_bytes=b"detail-route-preview-bytes" if web_video else None,
         web_video_object_key=f"pipeline/derived/{meme_file_id}/web.mp4" if web_video else None,
         web_video_bytes=b"detail-route-transcode-bytes" if web_video else None,
     )

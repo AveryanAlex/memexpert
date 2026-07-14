@@ -295,7 +295,7 @@ raw_meme ──→ [API Accept: ingest_request + outbox] ──→ [Outbox Publi
 | Queue | Resource Profile | Consumer |
 |-------|-----------------|----------|
 | `pipeline.media_inspect` | CPU-light to CPU-bound (Pillow/ImageHash/ffprobe) | Raw temp-object inspection, pHash duplicate/blocked checks, content materialization |
-| `q.transcode` | CPU-light to CPU-bound | Media preparation: blur hash/quality for every file; GIF→MP4 and video re-encode only for moving media |
+| `q.transcode` | CPU-light to CPU-bound | Media preparation: blur hash/quality for every file; GIF→MP4/video re-encode plus a PNG preview frame for moving media |
 | `q.ocr` | CPU/GPU-bound (PaddleOCR) | Text extraction, language detection |
 | `q.embed` | API-bound (Voyage AI) | Image embedding computation |
 | `q.classify` | CPU-light | Conservative NSFW detection only |
@@ -375,13 +375,14 @@ S3 (Cloudflare R2 or Backblaze B2). API-safe acceptance first writes raw bytes u
 /temp-originals/{ingest_request_id}/original.{ext}
 /files/{meme_file_id}/original.{ext}
 /files/{meme_file_id}/web_video.mp4   (H.264, GIF/video only)
+/files/{meme_file_id}/preview.png     (first-frame poster, GIF/video only)
 ```
 
 Invalid/unreadable media is the exception: the temporary object is intentionally retained when the request is marked `failed_invalid_media` so operators have a bounded retention/debugging target. Retention/lifecycle policy should expire `pipeline/temp-originals/*` objects after the ops-approved window, not immediately on invalid media.
 
-Only the original and optional `web_video.mp4` playback artifact are stored. Static JPEG/PNG/WebP uploads keep only the original object; they are never looped into synthetic videos. All static image variants (resize, format conversion, thumbnails) are generated on-the-fly by **imgproxy** from the original, CDN-cached by URL with immutable headers. GIF/video playback artifacts are derived at ingest time because GIF→MP4 and video re-encode work is expensive to do on-the-fly.
+Only the original plus optional `web_video.mp4` and `preview.png` moving-media artifacts are stored. Static JPEG/PNG/WebP uploads keep only the original object; they are never looped into synthetic videos. All static image variants (resize, format conversion, thumbnails) are generated on-the-fly by **imgproxy** from the original. GIF/video cards use imgproxy over the stored PNG preview frame, while playback uses the H.264 artifact. Both moving-media derivatives are written before transcode completion is committed, so a visible web video always has a poster. These artifacts are derived at ingest time because GIF→MP4/video re-encode and frame extraction are expensive to do on-the-fly.
 
-~40 GB at 100K memes, ~200 GB at 500K, ~400 GB at 1M (originals + transcoded videos only).
+~40 GB at 100K memes, ~200 GB at 500K, ~400 GB at 1M (originals + transcoded videos + compact PNG preview frames).
 
 ## Primary File Selection
 

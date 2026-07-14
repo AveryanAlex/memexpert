@@ -137,7 +137,7 @@ SvelteKit handles server-side rendering for SEO and fast initial page loads. `+p
 | **PostgreSQL** | Source of truth | All entities, relations, interaction events, embedding cache |
 | **Qdrant** | Vector search + recommendations | MemeFile embeddings with meme-level payload |
 | **Meilisearch** | Text search + facets | Meme documents: OCR text, tags, metadata |
-| **S3** | Media storage | Originals + optional GIF/video playback artifacts; static image variants via imgproxy |
+| **S3** | Media storage | Originals + optional GIF/video playback and preview-frame artifacts; static image variants via imgproxy |
 | **RabbitMQ** | Event streaming | Content pipeline events, fan-out to sync consumers |
 | **Redis** | Cache / rate limiting | Rate limits, hot responses, optional candidate pools |
 
@@ -162,5 +162,5 @@ Backend containers are split by runtime target: API, bot, scheduler, and worker 
 | Qdrant memory | ~2 GB per 1M vectors | 1024-dim float32, HNSW |
 | Meilisearch memory | ~500 MB per 1M docs | Short text fields |
 | Embedding cache (PG) | ~4 KB per entry | 4096 bytes + metadata |
-| S3 storage | ~400 GB at 1M memes | Originals + optional GIF/video playback artifacts only; static image variants via imgproxy |
+| S3 storage | ~400 GB at 1M memes | Originals + optional GIF/video playback and PNG preview-frame artifacts; static image variants via imgproxy |
 | Voyage AI API | ~$100–180/month | At 5–10K new memes/day |

@@ -35,7 +35,7 @@ There is no singular meme owner or author. Users do not own canonical meme metad
 
 ### MemeFile
 
-A specific media file belonging to a meme. Key fields: `meme_id` (FK → Meme), `status` (pending/processing/ready/failed), original-upload metadata (`mime_type`, dimensions, byte size), `s3_original_key`, `s3_web_video_key` (nullable — GIF/video playback artifact only), globally unique non-null `sha256_hex`, `perceptual_hash`, `quality_score`, `blur_hash`. The canonical default file is stored on `Meme.primary_file_id`. Static image variants (resize, format) are served on-the-fly by imgproxy from the original; derived playback artifacts never overwrite original MIME metadata.
+A specific media file belonging to a meme. Key fields: `meme_id` (FK → Meme), `status` (pending/processing/ready/failed), original-upload metadata (`mime_type`, dimensions, byte size), `s3_original_key`, `s3_web_video_key` (nullable — GIF/video playback artifact only), globally unique non-null `sha256_hex`, `perceptual_hash`, `quality_score`, `blur_hash`. The canonical default file is stored on `Meme.primary_file_id`. A non-null `s3_web_video_key` also guarantees a deterministic `preview.png` companion under the file's derivative prefix; its key is derived from `MemeFile.id` rather than duplicated in PostgreSQL. Static image variants (resize, format) are served on-the-fly by imgproxy from the original, while moving-media thumbnail/display variants use that stored preview frame. Derived artifacts never overwrite original MIME metadata.
 
 ### MemeSeoPage
 

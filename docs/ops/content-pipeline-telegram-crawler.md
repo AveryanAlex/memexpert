@@ -638,6 +638,28 @@ row is marked `status=auth_required`, not quarantined. Recovery options are:
    the committed repair automatically; use `SIGHUP` only for an immediate pass,
    then read `/api/v1/crawler/freshness` to confirm live freshness recovers.
 
+## Moving-media preview repair
+
+Successful GIF/video transcodes persist both `web.mp4` playback and a
+deterministic `preview.png` first-frame image. Public card thumbnail/display
+URLs use imgproxy over the PNG; private cards use the authenticated media
+route. Verify the invariant after a storage restore or media-pipeline upgrade:
+
+```bash
+memexpert-backfill-video-posters --verify-only --concurrency 4
+```
+
+Repair missing frames idempotently from the already-normalized web videos:
+
+```bash
+memexpert-backfill-video-posters --concurrency 2
+```
+
+The command skips existing previews, reports every failed file, and exits
+non-zero if any extraction or storage operation fails. `--force` regenerates
+all selected frames; `--limit N` is available for a canary batch. Run it from
+the worker image because preview extraction requires FFmpeg and Pillow.
+
 ## Common failure modes
 
 - **`telegram_flood_wait` cascade.** Every catch-up tick hits the same

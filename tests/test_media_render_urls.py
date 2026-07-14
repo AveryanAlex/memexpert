@@ -80,7 +80,7 @@ def test_imgproxy_unsigned_dev_mode_only_when_key_and_salt_are_absent() -> None:
     assert render.thumbnail_url.startswith("http://localhost:8080/unsafe/")
 
 
-def test_web_video_uses_public_media_base_and_never_imgproxy() -> None:
+def test_web_video_uses_public_media_base_while_preview_uses_imgproxy() -> None:
     file_id = uuid.UUID("11111111-1111-4111-8111-111111111113")
     settings = Settings.model_validate(
         {
@@ -102,8 +102,12 @@ def test_web_video_uses_public_media_base_and_never_imgproxy() -> None:
         context=PublicMediaRenderContext(meme_id=uuid.UUID("22222222-2222-4222-8222-222222222224")),
     )
 
-    assert render.thumbnail_url is None
-    assert render.preview_url is None
+    assert render.thumbnail_url is not None
+    assert render.thumbnail_url.startswith("https://img.memexpert.test/")
+    assert "/rs:fill:360:360/" in render.thumbnail_url
+    assert render.preview_url is not None
+    assert render.preview_url.startswith("https://img.memexpert.test/")
+    assert render.display_url == render.preview_url
     assert render.web_video_url == f"https://media.memexpert.test/files/{file_id}/web-video.mp4"
     assert render.download_url == render.web_video_url
     web_video_url = render.web_video_url
@@ -127,6 +131,8 @@ def test_web_video_returns_null_without_public_media_base() -> None:
         context=PublicMediaRenderContext(meme_id=uuid.UUID("22222222-2222-4222-8222-222222222225")),
     )
 
+    assert render.thumbnail_url is not None
+    assert render.preview_url is not None
     assert render.web_video_url is None
     assert render.download_url is None
 
@@ -175,8 +181,9 @@ def test_private_web_video_uses_authenticated_direct_variant_without_imgproxy() 
 
     render = MediaRenderUrlService(Settings.model_validate({"imgproxy_base_url": "https://img.memexpert.test"})).build_private_render(file)
 
-    assert render.thumbnail_url is None
-    assert render.preview_url is None
+    assert render.thumbnail_url == f"/api/v1/media/files/{file_id}/thumbnail"
+    assert render.preview_url == f"/api/v1/media/files/{file_id}/preview"
+    assert render.display_url == render.preview_url
     assert render.web_video_url == f"/api/v1/media/files/{file_id}/web-video.mp4"
     assert render.download_url == render.web_video_url
     web_video_url = render.web_video_url
@@ -202,7 +209,7 @@ def test_private_audio_uses_authenticated_original_and_download_variants() -> No
     assert "pipeline/originals/private/audio.mp3" not in f"{render.original_url} {render.download_url}"
 
 
-def test_gif_with_web_video_uses_playback_url_not_static_imgproxy_preview() -> None:
+def test_gif_with_web_video_uses_generated_preview_image_and_playback_url() -> None:
     file_id = uuid.UUID("11111111-1111-4111-8111-111111111117")
     settings = Settings.model_validate(
         {
@@ -224,8 +231,11 @@ def test_gif_with_web_video_uses_playback_url_not_static_imgproxy_preview() -> N
         context=PublicMediaRenderContext(meme_id=uuid.UUID("22222222-2222-4222-8222-222222222228")),
     )
 
-    assert render.thumbnail_url is None
-    assert render.preview_url is None
+    assert render.thumbnail_url is not None
+    assert render.thumbnail_url.startswith("https://img.memexpert.test/")
+    assert render.preview_url is not None
+    assert render.preview_url.startswith("https://img.memexpert.test/")
+    assert render.display_url == render.preview_url
     assert render.original_url is None
     assert render.web_video_url == f"https://media.memexpert.test/files/{file_id}/web-video.mp4"
     assert render.download_url == render.web_video_url

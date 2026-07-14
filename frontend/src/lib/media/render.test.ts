@@ -33,6 +33,18 @@ describe('selectMediaRender', () => {
     expect(media.hasMedia).toBe(true);
   });
 
+  it('selects the generated moving-media preview as the video poster', () => {
+    const media = selectMediaRender(
+      file({
+        display_url: 'https://img.example/video-preview.webp',
+        web_video_url: 'https://media.example/file.mp4'
+      })
+    );
+
+    expect(media.imageUrl).toBe('https://img.example/video-preview.webp');
+    expect(media.videoUrl).toBe('https://media.example/file.mp4');
+  });
+
   it('selects authenticated private collection/profile render variants', () => {
     const media = selectMediaRender(
       file({
