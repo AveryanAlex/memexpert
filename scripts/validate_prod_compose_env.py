@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate production Compose app-service environment propagation."""
+"""Validate production Compose app environments and critical resource profiles."""
 
 from __future__ import annotations
 
@@ -84,6 +84,22 @@ SERVICE_SPECIFIC_ENV_KEYS: Final = {
     "telegram-crawler": ("TELEGRAM_API_ID", "TELEGRAM_API_HASH"),
     "scheduler": ("TELEGRAM_API_ID", "TELEGRAM_API_HASH"),
 }
+OCR_ENV_VALUES: Final = {
+    "PIPELINE_WORKER_PREFETCH_COUNT": "2",
+    "PIPELINE_OCR_PADDLE_COMMAND": (
+        "/opt/paddleocr-venv/bin/python /app/scripts/paddleocr_json.py "
+        "--input {input} --cpu-threads 8"
+    ),
+    "OMP_NUM_THREADS": "8",
+    "OPENBLAS_NUM_THREADS": "8",
+    "MKL_NUM_THREADS": "8",
+    "NUMEXPR_NUM_THREADS": "8",
+    "DATABASE_POOL_SIZE": "2",
+    "DATABASE_MAX_OVERFLOW": "1",
+}
+OCR_MEMORY_LIMIT_BYTES: Final = 8 * 1024 * 1024 * 1024
+OCR_CPU_LIMIT: Final = 16.0
+OCR_PIDS_LIMIT: Final = 384
 
 
 class ComposeEnvValidationError(RuntimeError):
@@ -94,6 +110,7 @@ def main() -> int:
     try:
         config = render_compose_config()
         validate_app_environments(config)
+        validate_ocr_resource_profile(config)
     except ComposeEnvValidationError as exc:
         print(exc, file=sys.stderr)
         return 1
@@ -173,6 +190,47 @@ def collect_environment_keys(environment: object) -> set[str]:
                 keys.add(entry.split("=", maxsplit=1)[0])
         return keys
     return set()
+
+
+def validate_ocr_resource_profile(config: dict[str, object]) -> None:
+    services = config.get("services")
+    if not isinstance(services, dict):
+        raise ComposeEnvValidationError("Production Compose config is missing a services object.")
+    service = services.get("worker-ocr")
+    if not isinstance(service, dict):
+        raise ComposeEnvValidationError("Production Compose config is missing worker-ocr.")
+
+    failures: list[str] = []
+    environment = service.get("environment")
+    if not isinstance(environment, dict):
+        failures.append("worker-ocr: environment is not an object")
+    else:
+        for key, expected_value in OCR_ENV_VALUES.items():
+            actual_value = environment.get(key)
+            if actual_value != expected_value:
+                failures.append(f"worker-ocr: {key} is {actual_value!r}, expected {expected_value!r}")
+
+    if service.get("cpus") != OCR_CPU_LIMIT:
+        failures.append(f"worker-ocr: cpus is {service.get('cpus')!r}, expected {OCR_CPU_LIMIT!r}")
+    if service.get("pids_limit") != OCR_PIDS_LIMIT:
+        failures.append(
+            f"worker-ocr: pids_limit is {service.get('pids_limit')!r}, expected {OCR_PIDS_LIMIT!r}",
+        )
+    raw_memory_limit = service.get("mem_limit", 0)
+    try:
+        memory_limit = int(raw_memory_limit) if isinstance(raw_memory_limit, (str, int)) else 0
+    except ValueError:
+        memory_limit = 0
+    if memory_limit != OCR_MEMORY_LIMIT_BYTES:
+        failures.append(
+            f"worker-ocr: mem_limit is {service.get('mem_limit')!r}, "
+            f"expected {OCR_MEMORY_LIMIT_BYTES} bytes",
+        )
+
+    if failures:
+        raise ComposeEnvValidationError(
+            "Production Compose OCR resource profile is incorrect:\n" + "\n".join(failures),
+        )
 
 
 if __name__ == "__main__":

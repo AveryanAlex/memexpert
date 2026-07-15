@@ -350,8 +350,13 @@ services:
     command: ["memexpert-workers", "--role", "ocr"]
     environment:
       <<: *worker-env
-      PIPELINE_WORKER_PREFETCH_COUNT: "1"
-      DATABASE_POOL_SIZE: "1"
+      PIPELINE_WORKER_PREFETCH_COUNT: "2"
+      PIPELINE_OCR_PADDLE_COMMAND: /opt/paddleocr-venv/bin/python /app/scripts/paddleocr_json.py --input {input} --cpu-threads 8
+      OMP_NUM_THREADS: "8"
+      OPENBLAS_NUM_THREADS: "8"
+      MKL_NUM_THREADS: "8"
+      NUMEXPR_NUM_THREADS: "8"
+      DATABASE_POOL_SIZE: "2"
       DATABASE_MAX_OVERFLOW: "1"
       DATABASE_APPLICATION_NAME: memexpert-worker-ocr
     depends_on:
@@ -365,9 +370,9 @@ services:
       timeout: 5s
       retries: 3
       start_period: 300s
-    mem_limit: 6g
-    cpus: 4.0
-    pids_limit: 256
+    mem_limit: 8g
+    cpus: 16.0
+    pids_limit: 384
 
   worker-enrichment:
     <<: *worker-image

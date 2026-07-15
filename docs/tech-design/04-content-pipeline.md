@@ -307,7 +307,12 @@ RabbitMQ consumer QoS. The limit is per queue consumer in each worker process,
 which prevents a backlog from creating unbounded in-flight OCR subprocesses.
 PaddleOCR receives `cpu_threads=1`, and worker images cap OpenMP/OpenBLAS/MKL/
 NumExpr native thread pools at one by default; operators must opt up explicitly
-after sizing the host.
+after sizing the host. The production CPU profile runs two in-flight OCR files,
+configures each isolated helper for eight CPU threads, and gives the OCR service
+an aggregate 16-core quota, 8 GiB memory limit, and 384-PID ceiling. The quota is
+shared rather than hard-partitioned between helpers. The startup OCR canary may
+briefly overlap the two broker deliveries, so the memory and PID limits retain
+headroom for a transient third helper.
 
 ### Operational recovery and overload control
 
@@ -384,7 +389,7 @@ Guest TTL/deletion jobs are intentionally not part of the current product direct
 
 ### OCR Pipeline
 
-PaddleOCR is the live OCR engine for Russian/English meme text. The worker image keeps the main app on Python 3.14, but runs PaddleOCR from a separate Python 3.13 helper venv because PaddlePaddle does not currently publish CPython 3.14 wheels. The helper runs `PaddleOCR(lang="ru", use_doc_orientation_classify=False, use_doc_unwarping=False, use_textline_orientation=False, cpu_threads=1)` and returns JSON across the `PIPELINE_OCR_PADDLE_COMMAND` boundary. `PIPELINE_OCR_PROVIDER_MODE=fake` remains the deterministic CI/E2E path. There is no active Qwen/VLM fallback in this implementation; optional fallback metadata/commands are blank unless a real command is configured.
+PaddleOCR is the live OCR engine for Russian/English meme text. The worker image keeps the main app on Python 3.14, but runs PaddleOCR from a separate Python 3.13 helper venv because PaddlePaddle does not currently publish CPython 3.14 wheels. The helper defaults to `PaddleOCR(lang="ru", use_doc_orientation_classify=False, use_doc_unwarping=False, use_textline_orientation=False, cpu_threads=1)` and returns JSON across the `PIPELINE_OCR_PADDLE_COMMAND` boundary. Production overrides the command with `--cpu-threads 8` and raises the OCR-only OpenMP/OpenBLAS/MKL/NumExpr limits to eight; other worker roles keep the one-thread image defaults. `PIPELINE_OCR_PROVIDER_MODE=fake` remains the deterministic CI/E2E path. There is no active Qwen/VLM fallback in this implementation; optional fallback metadata/commands are blank unless a real command is configured.
 
 ### Embedding Pipeline
 

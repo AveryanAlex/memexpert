@@ -53,6 +53,11 @@ The crawler ships five operator-facing pieces:
   `PIPELINE_WORKER_PREFETCH_COUNT=1` for the first large channel; each worker
   queue consumer then has at most one unacknowledged item, and the worker image
   also caps Paddle/OpenBLAS native threads at one.
+- The sized production OCR role is intentionally different: it uses prefetch
+  `2`, configures each Paddle helper for eight CPU threads, and assigns the
+  service an aggregate 16-core quota, 8 GiB memory limit, 384-PID ceiling, and
+  database pool `2 + 1`. Keep the native-thread overrides scoped to OCR so media
+  and enrichment workers retain the safe one-thread image defaults.
 - A browser session cookie for a user with the durable admin flag. The
   `/api/v1/admin/telegram/*` routes use the normal cookie-authenticated admin
   guard; they do not accept the operator token.
