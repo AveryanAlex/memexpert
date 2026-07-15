@@ -66,7 +66,11 @@ class TelegramCrawlerManagerLike(Protocol):
 
     async def configuration_snapshot(self) -> object: ...
 
-    async def reload(self) -> TelegramCrawlerReloadResult: ...
+    async def reload(
+        self,
+        *,
+        on_listeners_ready: Callable[[], None] | None = None,
+    ) -> TelegramCrawlerReloadResult: ...
 
     async def retry_incomplete(self) -> TelegramCrawlerReloadResult: ...
 
@@ -81,6 +85,16 @@ class TelegramCrawlerSignalControllerLike(Protocol):
     async def wait(self) -> TelegramCrawlerControlSignal: ...
 
     def close(self) -> None: ...
+
+
+class RuntimeHealthReporterLike(Protocol):
+    """Health reporter seam used by the process runtime and focused tests."""
+
+    async def start(self) -> None: ...
+
+    def mark_ready(self) -> None: ...
+
+    async def stop(self) -> None: ...
 
 
 class _TelegramCrawlerControlMonitor:
@@ -218,7 +232,7 @@ async def run_telegram_crawler_runtime(
     session_factory: AsyncSessionFactory | None = None,
     manager: TelegramCrawlerManagerLike | None = None,
     signal_controller: TelegramCrawlerSignalControllerLike | None = None,
-    health_reporter: RuntimeHealthReporter | None = None,
+    health_reporter: RuntimeHealthReporterLike | None = None,
 ) -> None:
     """Run catch-up once, start live listeners, then wait for process signals."""
 
@@ -258,7 +272,12 @@ async def run_telegram_crawler_runtime(
             )
             reload_result = cast(
                 "TelegramCrawlerReloadResult",
-                await _await_operation_or_stop(manager_instance.reload(), control_monitor),
+                await _await_operation_or_stop(
+                    manager_instance.reload(
+                        on_listeners_ready=(health_reporter.mark_ready if health_reporter is not None else None),
+                    ),
+                    control_monitor,
+                ),
             )
         except _CrawlerStopRequested:
             return
@@ -272,8 +291,6 @@ async def run_telegram_crawler_runtime(
             },
         )
         logger.info("telegram_crawler_runtime_started", extra={"event": "telegram_crawler_runtime_started"})
-        if health_reporter is not None:
-            health_reporter.mark_ready()
 
         await _wait_for_control_signals(
             manager_instance,

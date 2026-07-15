@@ -112,7 +112,7 @@ class _LiveRuntimeHandle:
 
 @dataclass(frozen=True, slots=True)
 class TelegramCrawlerReloadResult:
-    """Outcome of one catch-up-then-live desired-state reconciliation."""
+    """Outcome of one live-listener-then-catch-up reconciliation."""
 
     catchup_reports: tuple[CrawlerCatchupReport, ...]
     failed_session_names: tuple[str, ...]
@@ -465,13 +465,19 @@ class TelegramSessionManager:
         )
         return session_signatures, channel_signatures
 
-    async def reload(self) -> TelegramCrawlerReloadResult:
+    async def reload(
+        self,
+        *,
+        on_listeners_ready: Callable[[], None] | None = None,
+    ) -> TelegramCrawlerReloadResult:
         """Register live listeners, then close the forward gap with catch-up."""
 
         await self.stop_live_all(mark_stopped=False)
         for session_id in tuple(self._client_cache):
             await self.invalidate_session(session_id=session_id)
         failed_session_names = await self.start_live_all()
+        if on_listeners_ready is not None:
+            on_listeners_ready()
         reports, catchup_failed_session_names = await self._catch_up_all_with_failures()
         failed_session_names.extend(catchup_failed_session_names)
         return TelegramCrawlerReloadResult(

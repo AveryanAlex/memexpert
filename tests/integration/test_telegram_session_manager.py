@@ -827,6 +827,7 @@ async def test_manager_reload_catches_up_source_added_after_live_start_and_rebui
         last_read_post_id="10",
     )
     created: list[FakeTelegramClient] = []
+    listeners_ready = asyncio.Event()
 
     class _RecordingLiveClient(FakeTelegramClient):
         listened_channel_ids: list[tuple[str, ...]]
@@ -857,6 +858,7 @@ async def test_manager_reload_catches_up_source_added_after_live_start_and_rebui
             limit: int,
         ) -> AsyncIterator[RawTelegramMessage]:
             assert self.listener_started.is_set()
+            assert listeners_ready.is_set()
             async for message in super().iter_latest_channel_messages(channel_id=channel_id, limit=limit):
                 yield message
 
@@ -899,8 +901,9 @@ async def test_manager_reload_catches_up_source_added_after_live_start_and_rebui
             session_name="alpha",
         )
 
-        reload_result = await manager.reload()
+        reload_result = await manager.reload(on_listeners_ready=listeners_ready.set)
 
+        assert listeners_ready.is_set()
         assert created[0].closed is True
         assert len(created) == 2
         second_client = created[1]

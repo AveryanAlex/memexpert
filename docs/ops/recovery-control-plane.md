@@ -115,6 +115,10 @@ freshness, and operation deadlines:
 memexpert-runtime-health
 ```
 
+The crawler becomes ready after its live listeners are established. Initial
+catch-up continues in the running process and does not hold deployment
+activation open while thousands of historical media posts are downloaded.
+
 Useful service checks on Whale:
 
 ```bash

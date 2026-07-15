@@ -30,6 +30,20 @@ class FakeEngine:
         self._events.append("engine.dispose")
 
 
+class FakeHealthReporter:
+    def __init__(self, events: list[str]) -> None:
+        self._events = events
+
+    async def start(self) -> None:
+        self._events.append("health.start")
+
+    def mark_ready(self) -> None:
+        self._events.append("health.ready")
+
+    async def stop(self) -> None:
+        self._events.append("health.stop")
+
+
 class FakeSignalController:
     def __init__(self, events: list[str]) -> None:
         self._events = events
@@ -85,8 +99,14 @@ class FakeManager:
         self._configuration_snapshot_index += 1
         return self._configuration_snapshots[index]
 
-    async def reload(self) -> TelegramCrawlerReloadResult:
+    async def reload(
+        self,
+        *,
+        on_listeners_ready: Callable[[], None] | None = None,
+    ) -> TelegramCrawlerReloadResult:
         self._events.append("manager.reload")
+        if on_listeners_ready is not None:
+            on_listeners_ready()
         signals = self._signals_after_start if self._reload_index == 0 else self._signals_after_reload
         result_index = min(self._reload_index, len(self._reload_results) - 1)
         self._reload_index += 1
@@ -126,8 +146,14 @@ class FailingShutdownManager(FakeManager):
 
 
 class FailingCatchupManager(FakeManager):
-    async def reload(self) -> TelegramCrawlerReloadResult:
+    async def reload(
+        self,
+        *,
+        on_listeners_ready: Callable[[], None] | None = None,
+    ) -> TelegramCrawlerReloadResult:
         self._events.append("manager.reload")
+        if on_listeners_ready is not None:
+            on_listeners_ready()
         raise RuntimeError("catch-up failed")
 
 
@@ -266,6 +292,36 @@ async def test_telegram_crawler_runtime_uses_injected_fakes_for_startup_and_shut
 
 
 @pytest.mark.asyncio
+async def test_runtime_marks_health_ready_when_live_listeners_start() -> None:
+    events: list[str] = []
+    signal_controller = FakeSignalController(events)
+
+    await run_telegram_crawler_runtime(
+        settings=Settings(),
+        engine=FakeEngine(events),
+        manager=FakeManager(
+            events,
+            signal_controller=signal_controller,
+            signals_after_start=[TelegramCrawlerControlSignal.STOP],
+        ),
+        signal_controller=signal_controller,
+        health_reporter=FakeHealthReporter(events),
+    )
+
+    assert events == [
+        "health.start",
+        "signal.install",
+        "manager.configuration_snapshot",
+        "manager.reload",
+        "health.ready",
+        "signal.wait:stop",
+        "signal.close",
+        "manager.shutdown",
+        "health.stop",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_runtime_disposes_owned_engine_when_shutdown_fails(monkeypatch: pytest.MonkeyPatch) -> None:
     events: list[str] = []
     engine = FakeEngine(events)
@@ -340,8 +396,14 @@ async def test_runtime_cancels_startup_reconcile_when_stop_is_requested() -> Non
     signal_controller = FakeSignalController(events)
 
     class StopDuringCatchupManager(FakeManager):
-        async def reload(self) -> TelegramCrawlerReloadResult:
+        async def reload(
+            self,
+            *,
+            on_listeners_ready: Callable[[], None] | None = None,
+        ) -> TelegramCrawlerReloadResult:
             self._events.append("manager.reload")
+            if on_listeners_ready is not None:
+                on_listeners_ready()
             signal_controller.request(TelegramCrawlerControlSignal.STOP)
             try:
                 await asyncio.Event().wait()
@@ -404,12 +466,16 @@ async def test_runtime_survives_sighup_reload_failure_and_waits_for_stop() -> No
     signal_controller = FakeSignalController(events)
 
     class _FailSecondReloadManager(FakeManager):
-        async def reload(self) -> TelegramCrawlerReloadResult:
+        async def reload(
+            self,
+            *,
+            on_listeners_ready: Callable[[], None] | None = None,
+        ) -> TelegramCrawlerReloadResult:
             if self._reload_index == 1:
                 self._events.append("manager.reload")
                 self._reload_index += 1
                 raise RuntimeError("reload failed")
-            return await super().reload()
+            return await super().reload(on_listeners_ready=on_listeners_ready)
 
     await run_telegram_crawler_runtime(
         settings=Settings(crawler_reconcile_interval_seconds=0.001),
