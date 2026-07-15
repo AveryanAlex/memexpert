@@ -509,6 +509,7 @@ class AnalyticsEventType(StrEnum):
     MEME_SHARE = "meme_share"
     MEME_VIEW = "meme_view"
     MINIAPP_OPEN = "miniapp_open"
+    PAGE_VIEW = "page_view"
     SAVE = "save"
     SEARCH_QUERY = "search_query"
     SHARE = "share"

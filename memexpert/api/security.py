@@ -30,9 +30,11 @@ READ_HTTP_METHODS: Final[frozenset[str]] = frozenset({"GET", "HEAD"})
 API_PATH_SEGMENT: Final = "api"
 AUTH_PATH_SEGMENT: Final = "auth"
 ADMIN_PATH_SEGMENT: Final = "admin"
+ANALYTICS_PATH_SEGMENT: Final = "analytics"
 MEMES_PATH_SEGMENT: Final = "memes"
 PIPELINE_PATH_SEGMENT: Final = "pipeline"
 UPLOADS_PATH_SEGMENT: Final = "uploads"
+PAGE_VIEWS_PATH_SEGMENT: Final = "page-views"
 REPORT_PATH_SEGMENT: Final = "report"
 VERSION_PATH_PREFIX: Final = "v"
 V1_AUTH_PATH_PREFIX: Final = "/api/v1/auth"
@@ -74,6 +76,7 @@ class SecurityRouteTier(StrEnum):
     SAFE = "safe"
     AUTH_WRITE = "auth_write"
     SEARCH_FEED = "search_feed"
+    ANALYTICS_WRITE = "analytics_write"
     WRITE = "write"
     UPLOAD = "upload"
     ADMIN = "admin"
@@ -84,6 +87,7 @@ class SecurityRateLimitTier(StrEnum):
 
     AUTH_WRITE = "auth_write"
     SEARCH_FEED = "search_feed"
+    ANALYTICS_WRITE = "analytics_write"
     WRITE = "write"
     UPLOAD = "upload"
     ADMIN = "admin"
@@ -197,6 +201,16 @@ def _is_search_feed_path(segments: tuple[str, ...]) -> bool:
     return first_segment == "trends"
 
 
+def _is_analytics_write_path(segments: tuple[str, ...]) -> bool:
+    """Return whether this is the privacy-bounded page-view ingestion endpoint."""
+
+    return (
+        len(segments) == 4
+        and segments[2] == ANALYTICS_PATH_SEGMENT
+        and segments[3] == PAGE_VIEWS_PATH_SEGMENT
+    )
+
+
 def classify_security_route(request: Request) -> SecurityRouteTier:
     """Classify versioned API requests into the shared CSRF and rate-limit tiers."""
 
@@ -212,6 +226,9 @@ def classify_security_route(request: Request) -> SecurityRouteTier:
         return SecurityRouteTier.AUTH_WRITE if normalized_method not in SAFE_HTTP_METHODS else SecurityRouteTier.SAFE
     if segments[2] == ADMIN_PATH_SEGMENT:
         return SecurityRouteTier.ADMIN
+
+    if normalized_method not in SAFE_HTTP_METHODS and _is_analytics_write_path(segments):
+        return SecurityRouteTier.ANALYTICS_WRITE
 
     if normalized_method in READ_HTTP_METHODS:
         return SecurityRouteTier.SEARCH_FEED if _is_search_feed_path(segments) else SecurityRouteTier.SAFE
@@ -326,6 +343,12 @@ def get_security_rate_limit_policy(
             max_requests=settings.security_rate_limit_search_feed_max_requests,
             window_seconds=settings.security_rate_limit_search_feed_window_seconds,
         )
+    if route_tier is SecurityRouteTier.ANALYTICS_WRITE:
+        return SecurityRateLimitPolicy(
+            tier=SecurityRateLimitTier.ANALYTICS_WRITE,
+            max_requests=settings.security_rate_limit_analytics_write_max_requests,
+            window_seconds=settings.security_rate_limit_analytics_write_window_seconds,
+        )
     if route_tier is SecurityRouteTier.WRITE:
         return SecurityRateLimitPolicy(
             tier=SecurityRateLimitTier.WRITE,
@@ -408,6 +431,7 @@ def resolve_security_rate_limit_subject(
         return _resolve_security_ip_subject(request)
     if policy.tier in {
         SecurityRateLimitTier.SEARCH_FEED,
+        SecurityRateLimitTier.ANALYTICS_WRITE,
         SecurityRateLimitTier.WRITE,
         SecurityRateLimitTier.ADMIN,
     }:
@@ -425,6 +449,8 @@ def _build_rate_limit_exceeded_detail(policy: SecurityRateLimitPolicy, *, retry_
         return f"Too many auth requests from this client IP; retry after {retry_after_seconds} seconds."
     if policy.tier is SecurityRateLimitTier.SEARCH_FEED:
         return f"Too many search feed requests; retry after {retry_after_seconds} seconds."
+    if policy.tier is SecurityRateLimitTier.ANALYTICS_WRITE:
+        return f"Too many analytics requests; retry after {retry_after_seconds} seconds."
     if policy.tier is SecurityRateLimitTier.WRITE:
         return f"Too many write requests; retry after {retry_after_seconds} seconds."
     if policy.tier is SecurityRateLimitTier.UPLOAD:

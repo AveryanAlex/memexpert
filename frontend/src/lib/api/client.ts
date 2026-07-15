@@ -8,6 +8,13 @@ import type {
   AdminMemeSeoReviewRowRead,
   AdminMemeTemplateActionRead,
   AdminMemeTemplateRead,
+  AdminAnalyticsAudienceRead,
+  AdminAnalyticsContentRead,
+  AdminAnalyticsEngagementRead,
+  AdminAnalyticsOverviewRead,
+  AdminAnalyticsSearchQueryDetailRead,
+  AdminAnalyticsSearchQueryPageRead,
+  AdminAnalyticsSearchQuerySort,
   AdminModerationDecisionRead,
   AdminModerationReportRead,
   AdminOverviewRead,
@@ -98,6 +105,11 @@ interface CatalogRequest {
   baseUrl: string;
   cookieHeader?: string;
   onResponse?: (response: Response) => void;
+}
+
+export interface AdminAnalyticsRangeRequest extends CatalogRequest {
+  startDate?: string | null;
+  endDate?: string | null;
 }
 
 interface MemePageFilterParams {
@@ -550,6 +562,68 @@ export async function fetchAdminSession(request: CatalogRequest): Promise<AdminS
 
 export async function fetchAdminOverview(request: CatalogRequest): Promise<AdminOverviewRead> {
   return apiGet<AdminOverviewRead>('/api/v1/admin/overview', new URLSearchParams(), request);
+}
+
+export async function fetchAdminAnalyticsOverview(
+  request: AdminAnalyticsRangeRequest
+): Promise<AdminAnalyticsOverviewRead> {
+  return apiGet<AdminAnalyticsOverviewRead>(
+    '/api/v1/admin/analytics/overview',
+    adminAnalyticsRangeParams(request),
+    request
+  );
+}
+
+export async function fetchAdminAnalyticsEngagement(
+  request: AdminAnalyticsRangeRequest
+): Promise<AdminAnalyticsEngagementRead> {
+  return apiGet<AdminAnalyticsEngagementRead>(
+    '/api/v1/admin/analytics/engagement',
+    adminAnalyticsRangeParams(request),
+    request
+  );
+}
+
+export async function fetchAdminAnalyticsAudience(
+  request: AdminAnalyticsRangeRequest
+): Promise<AdminAnalyticsAudienceRead> {
+  return apiGet<AdminAnalyticsAudienceRead>(
+    '/api/v1/admin/analytics/audience',
+    adminAnalyticsRangeParams(request),
+    request
+  );
+}
+
+export async function fetchAdminAnalyticsContent(
+  request: AdminAnalyticsRangeRequest
+): Promise<AdminAnalyticsContentRead> {
+  return apiGet<AdminAnalyticsContentRead>(
+    '/api/v1/admin/analytics/content',
+    adminAnalyticsRangeParams(request),
+    request
+  );
+}
+
+export async function fetchAdminAnalyticsSearchQueries(
+  request: AdminAnalyticsRangeRequest & { limit: number; offset: number; sort?: AdminAnalyticsSearchQuerySort }
+): Promise<AdminAnalyticsSearchQueryPageRead> {
+  const params = adminAnalyticsRangeParams(request);
+  params.set('limit', String(request.limit));
+  params.set('offset', String(request.offset));
+  if (request.sort) params.set('sort', request.sort);
+  return apiGet<AdminAnalyticsSearchQueryPageRead>('/api/v1/admin/analytics/search-queries', params, request);
+}
+
+export async function fetchAdminAnalyticsSearchQueryDetail(
+  request: AdminAnalyticsRangeRequest & { queryKey: string }
+): Promise<AdminAnalyticsSearchQueryDetailRead> {
+  const params = adminAnalyticsRangeParams(request);
+  params.set('query_key', request.queryKey);
+  return apiGet<AdminAnalyticsSearchQueryDetailRead>(
+    '/api/v1/admin/analytics/search-queries/detail',
+    params,
+    request
+  );
 }
 
 export async function fetchAdminChannelSuggestions(request: CatalogRequest): Promise<ChannelSuggestionRead[]> {
@@ -1097,6 +1171,13 @@ async function fetchLanding(path: string, request: LandingRequest): Promise<Publ
 
 function seoPageParams(request: SeoCatalogPageRequest): URLSearchParams {
   return new URLSearchParams({ limit: String(request.limit), offset: String(request.offset) });
+}
+
+function adminAnalyticsRangeParams(request: Pick<AdminAnalyticsRangeRequest, 'startDate' | 'endDate'>): URLSearchParams {
+  const params = new URLSearchParams();
+  if (request.startDate) params.set('start_date', request.startDate);
+  if (request.endDate) params.set('end_date', request.endDate);
+  return params;
 }
 
 function memePageParams(request: MemePageFilterParams): URLSearchParams {

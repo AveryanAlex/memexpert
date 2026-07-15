@@ -87,7 +87,7 @@ Terminal attempt status includes `completed`, `failed`, `expired`, and `cancelle
 
 ### SourceChannel
 
-Channels being crawled. Key fields: `platform`, `platform_id`, `username`, `title`, `subscriber_count`, `is_active`, `last_read_post_id` (platform-specific, e.g. Telegram message ID — used to resume on restart), `telegram_session_id` (nullable FK to the `telegram_sessions` row that handles this channel), and live/catch-up/engagement flags. If a Telegram session is deleted, `ON DELETE SET NULL` leaves the source channel as an orphan; it remains visible for operator repair but is not runnable until reassigned.
+Channels being crawled. Key fields: `platform`, `platform_id`, `username`, `title`, `subscriber_count`, `is_active`, `last_read_post_id` (platform-specific, e.g. Telegram message ID — used to resume on restart), `telegram_session_id` (nullable FK to the `telegram_sessions` row that handles this channel), and live/catch-up/engagement flags. If a Telegram session is deleted, `ON DELETE SET NULL` leaves that **Telegram** source channel as an orphan; it remains visible for operator repair but is not runnable until reassigned. `orphaned` is deliberately Telegram-only: a non-Telegram source is never made orphaned merely because this nullable Telegram-specific field is empty.
 
 ### ChannelSuggestion
 
@@ -142,7 +142,54 @@ Deferred/reserved. If present, it is a schema placeholder for a future account d
 
 ### AnalyticsEvent
 
-General-purpose product analytics event stream. Key fields: `user_id`, `event_type`, `payload` (JSON — event-specific data), `occurred_at`.
+General-purpose product analytics event stream. Key fields: `user_id`,
+`event_type`, `payload` (JSON — event-specific data), `occurred_at`.
+
+`page_view` stores only one approved coarse consumer surface (for example
+`web_home`, `web_search`, or `web_meme_detail`) and an optional authenticated
+actor. It never accepts or persists a raw URL, pathname, route parameter, query
+string, referrer, IP address, or user-agent. A frontend route tracker emits one
+event for each pathname navigation, excluding admin/API/auth/unknown routes.
+
+Strict first-page `search_query` events store normalized raw query text and
+request ID at the top of the versioned payload; `properties` stores
+`result_total`, `returned_count`, `latency_ms`, `has_more`, and safe filters.
+Raw query text is admin-only operational data, never a public/ordinary-user
+read field. Admin aggregation associates a later detail-click/download event
+with a search only through the shared request ID; it does not infer a
+query-to-meme relationship from user identity, time proximity, or meme ID
+alone.
+
+The strict payload's `actor_account_type` is a guest/full snapshot resolved at
+event write time. Admin active-account mix uses this event-time value so an
+upgrade does not rewrite earlier behavior. For legacy events lacking the
+snapshot, aggregation may look up the current `User.account_type` as a clearly
+weaker compatibility fallback.
+
+Auth lifecycle properties distinguish `full_account_created` from
+`merge_performed`: a merge into an existing canonical account is a conversion
+but never a new full account. `guest_was_persistent` keeps guest-to-full
+conversion metrics from treating a one-request anonymous sign-up as a guest
+conversion. Where historical lifecycle telemetry is absent, account creation
+with the current derived `User.account_type` is a per-day compatibility
+fallback.
+
+Retention cohort membership is merge-stable: `guest_created` events use
+`refs.source_user_id` as the immutable cohort identity and their current
+`user_id` as the activity identity. Account linking may reassign that `user_id`
+to an older canonical account, allowing later activity to count without moving
+or deleting the original guest cohort member. Current `User.created_at` rows
+supplement lifecycle events for legacy and direct-full accounts, but do not
+duplicate a source identity already represented by `guest_created` telemetry.
+
+Admin query reads derive an opaque, domain-separated HMAC `query_key` from the
+normalized query. Lists and top-query aggregates return that key alongside raw
+query text only to authorized admins; drill-down URLs carry the key and date
+controls, never the raw query. The protected detail response resolves the key
+within its reporting range under a bounded raw-event ceiling; ranges above that
+ceiling fail explicitly instead of materializing an unbounded analytics stream
+in the API process. A protected list or detail response, never the route URL,
+delivers raw query text to the browser.
 
 ### MemeInteractionEvent
 
@@ -152,18 +199,23 @@ Key fields:
 
 - `user_id` (nullable only for truly anonymous telemetry; normal web guests have users)
 - `meme_id`
-- `event_type` keeps legacy values (`impression`, `view`, `click`, `favorite`, `save`, `share`, `meme_view`, `meme_send`, `meme_like`, `meme_save`, `search_query`, `inline_query`) and adds canonical meme-scoped/foundation values (`meme_impression`, `meme_detail_click`, `meme_download`, `meme_pin`, `meme_share`, `meme_report`, `inline_served`, `inline_chosen`, `inline_sent`, `collection_action`, `auth_event`, `account_merge`, `miniapp_open`, `channel_suggest`)
+- `event_type` keeps legacy values (`impression`, `view`, `click`, `favorite`, `save`, `share`, `meme_view`, `meme_send`, `meme_like`, `meme_save`, `search_query`, `inline_query`) and adds canonical meme-scoped/foundation values (`meme_impression`, `meme_detail_click`, `meme_download`, `meme_pin`, `meme_share`, `meme_report`, `inline_served`, `inline_chosen`, `inline_sent`, `collection_action`, `auth_event`, `account_merge`, `miniapp_open`, `channel_suggest`, `page_view`)
 - `surface` (`web_home`, `web_search`, `web_related`, `web_collection`, `telegram_inline`, `telegram_pm`, `miniapp`)
 - `source_algorithm` (`search`, `similarity`, `personalized`, `tag_related`, `trending`, `motd`, `collection`, `fallback`)
 - `source_meme_id` for related/similar flows
 - `collection_id`, `query`, `rank`, `score`, `score_components`, `reason`
 - `request_id` / `impression_id`
 - Payload envelope always stores `schema_version`, `actor_type`, `actor_account_type` (when a user exists), typed internal UUID refs under `refs`, and a JSON-safe `properties` bag for extra attribution.
+- `actor_account_type` is an event-time snapshot, not a denormalized current
+  `User.account_type`; this preserves guest/full behavior across an upgrade.
 - Compatibility reads still accept legacy flat `payload.meme_id`, but new strict writes store meme attribution under `payload.refs.meme_id`.
 - Raw `group_id`, `chat_id`, tokens, authorization/cookie headers, IP addresses, user agents, and request headers are forbidden. External/chat identifiers must be hashed before storage.
 - `occurred_at`
 
-Indexes: `(user_id, occurred_at)`, `(meme_id, occurred_at)`, `(event_type, occurred_at)`, and optionally `(request_id)` / `(impression_id)` for attribution joins.
+Indexes: `(occurred_at)`, `(user_id, occurred_at)`, and
+`(event_type, occurred_at)`. The standalone timestamp index bounds range scans;
+payload grouping and query-to-meme attribution remain application-side until a
+dedicated reporting/rollup model replaces raw-event materialization.
 
 ### InlineUsageEvent
 

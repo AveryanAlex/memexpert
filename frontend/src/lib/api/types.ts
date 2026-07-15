@@ -615,6 +615,187 @@ export interface AdminOverviewRead {
   uncurated_template_count: number;
 }
 
+export type AdminAnalyticsBucket = 'day';
+
+/**
+ * A resolved, inclusive UTC reporting window. The backend is authoritative for
+ * the default range and for comparison-period calculation.
+ */
+export interface AdminAnalyticsRangeRead {
+  start_date: string;
+  end_date: string;
+  comparison_start_date: string;
+  comparison_end_date: string;
+  timezone: 'UTC';
+  bucket: AdminAnalyticsBucket;
+}
+
+export interface AdminAnalyticsMetricRead {
+  value: number;
+  previous_value: number;
+  change: number;
+  change_percent: number | null;
+}
+
+/** One named aggregate suitable for a bar chart, donut, or compact table. */
+export interface AdminAnalyticsBreakdownRead {
+  key: string;
+  count: number;
+}
+
+export interface AdminAnalyticsSurfaceRead {
+  surface: string;
+  count: number;
+}
+
+export interface AdminAnalyticsOverviewActivityRead {
+  date: string;
+  page_views: number;
+  active_users: number;
+  interactions: number;
+  searches: number;
+  downloads: number;
+  new_memes: number;
+}
+
+export interface AdminAnalyticsEngagementActivityRead {
+  date: string;
+  interactions: number;
+  searches: number;
+  zero_result_searches: number;
+  detail_clicks: number;
+  downloads: number;
+  sends: number;
+  saves: number;
+  shares: number;
+}
+
+export interface AdminAnalyticsAudienceActivityRead {
+  date: string;
+  new_guests: number;
+  new_full_accounts: number;
+  active_users: number;
+  guest_to_full_conversions: number;
+}
+
+export interface AdminAnalyticsCatalogGrowthRead {
+  date: string;
+  new_memes: number;
+}
+
+export interface AdminAnalyticsSourceEngagementRead {
+  date: string;
+  source_views: number;
+  source_reactions: number;
+  source_reposts: number;
+}
+
+export interface AdminAnalyticsRetentionPeriodRead {
+  eligible_users: number;
+  retained_users: number;
+  rate: number | null;
+}
+
+export interface AdminAnalyticsRetentionCohortRead {
+  cohort_date: string;
+  cohort_size: number;
+  d1: AdminAnalyticsRetentionPeriodRead | null;
+  d7: AdminAnalyticsRetentionPeriodRead | null;
+  d30: AdminAnalyticsRetentionPeriodRead | null;
+}
+
+export interface AdminAnalyticsSearchQueryRead {
+  /** Opaque HMAC-derived identifier used for drill-down URLs; never raw query text. */
+  query_key: string;
+  query: string;
+  searches: number;
+  zero_result_searches: number;
+  zero_result_rate: number | null;
+  average_latency_ms: number | null;
+  detail_clicks: number;
+  downloads: number;
+}
+
+export type AdminAnalyticsSearchQuerySort = 'searches' | 'niche' | 'zero_result_rate' | 'downloads';
+
+export interface AdminAnalyticsMemeOutcomeRead {
+  meme_id: string;
+  interactions: number;
+  detail_clicks: number;
+  downloads: number;
+  saves: number;
+  shares: number;
+}
+
+export interface AdminAnalyticsOverviewRead {
+  range: AdminAnalyticsRangeRead;
+  metrics: Record<string, AdminAnalyticsMetricRead>;
+  activity: AdminAnalyticsOverviewActivityRead[];
+  discovery_funnel: {
+    searches: number;
+    searches_with_results: number;
+    searches_without_results: number;
+    detail_clicks: number;
+    downloads: number;
+  };
+  surface_mix: AdminAnalyticsSurfaceRead[];
+  source_activity: {
+    sources: number;
+    new_sources: number;
+    source_views: number;
+    source_reactions: number;
+    source_reposts: number;
+  };
+}
+
+export interface AdminAnalyticsEngagementRead {
+  range: AdminAnalyticsRangeRead;
+  metrics: Record<string, AdminAnalyticsMetricRead>;
+  activity: AdminAnalyticsEngagementActivityRead[];
+  interactions_by_type: AdminAnalyticsBreakdownRead[];
+  surface_mix: AdminAnalyticsSurfaceRead[];
+  top_search_queries: AdminAnalyticsSearchQueryRead[];
+}
+
+export interface AdminAnalyticsAudienceRead {
+  range: AdminAnalyticsRangeRead;
+  metrics: Record<string, AdminAnalyticsMetricRead>;
+  activity: AdminAnalyticsAudienceActivityRead[];
+  surface_mix: AdminAnalyticsSurfaceRead[];
+  retention_cohorts: AdminAnalyticsRetentionCohortRead[];
+}
+
+export interface AdminAnalyticsContentRead {
+  range: AdminAnalyticsRangeRead;
+  metrics: Record<string, AdminAnalyticsMetricRead>;
+  catalog_growth: AdminAnalyticsCatalogGrowthRead[];
+  media_types: AdminAnalyticsBreakdownRead[];
+  languages: AdminAnalyticsBreakdownRead[];
+  visibility: AdminAnalyticsBreakdownRead[];
+  processing: AdminAnalyticsBreakdownRead[];
+  source_health: AdminAnalyticsBreakdownRead[];
+  source_engagement: AdminAnalyticsSourceEngagementRead[];
+}
+
+export interface AdminAnalyticsSearchQueryPageRead {
+  range: AdminAnalyticsRangeRead;
+  items: AdminAnalyticsSearchQueryRead[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface AdminAnalyticsSearchQueryDetailRead {
+  range: AdminAnalyticsRangeRead;
+  query: string;
+  query_key: string;
+  searches: number;
+  zero_result_searches: number;
+  zero_result_rate: number | null;
+  average_latency_ms: number | null;
+  meme_outcomes: AdminAnalyticsMemeOutcomeRead[];
+}
+
 export interface ChannelSuggestionRead {
   id: string;
   user_id: string;

@@ -105,6 +105,7 @@ Redis sliding-window counters in shared FastAPI middleware. User-scoped tiers de
 | Tier | Endpoints | Limit |
 |------|-----------|-------|
 | `search_feed` | Safe reads on `/api/v1/memes/search`, `/browse`, `/trending`, `/trends`, and `/trends/*` | 30 req/min per signed user, else IP |
+| `analytics_write` | Unsafe `/api/v1/analytics/page-views` telemetry | 6,000 req/min per signed user, else IP; isolated from product writes so a shared frontend/reverse-proxy subject cannot consume their budget |
 | `write` | Remaining unsafe `/api/v1/*` requests | 60 req/min per signed user, else IP |
 | `upload` | Unsafe `/api/v1/pipeline/uploads` | 10 req/min per operator identity when a safe non-secret one exists, else IP |
 | `auth_write` | Unsafe `/api/v1/auth/*` | 10 req/min per IP |

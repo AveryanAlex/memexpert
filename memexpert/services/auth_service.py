@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -16,10 +17,11 @@ from sqlalchemy.exc import IntegrityError
 
 from memexpert.core.config import Settings, get_settings
 from memexpert.models.base import utcnow
-from memexpert.models.enums import AccountStatus, AccountType
+from memexpert.models.enums import AccountStatus, AccountType, AnalyticsEventType
 from memexpert.models.user import AccountMergeLog, LoginEvent, User
 from memexpert.schemas.auth import AuthSessionRead, GuestBootstrapRequest
 from memexpert.schemas.user import UserRead
+from memexpert.services.analytics import AnalyticsService, InteractionEventRefs
 from memexpert.services.errors import (
     AccountUnavailableError,
     AuthConfigurationError,
@@ -38,6 +40,8 @@ if TYPE_CHECKING:
 ACCESS_TOKEN_TYPE: Final = "access"
 HS256_ALGORITHM: Final = "HS256"
 REQUIRED_ACCESS_TOKEN_CLAIMS: Final[tuple[str, ...]] = ("sub", "type", "exp", "iat", "nonce")
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -128,11 +132,41 @@ class AuthService:
             language=resolved_request.language,
             nsfw_enabled=resolved_request.nsfw_enabled,
         )
+        await self._record_guest_created(guest_user)
         return await self.issue_session_for_user(
             guest_user,
             ip_address=ip_address,
             user_agent=user_agent or resolved_request.device_info,
         )
+
+    async def _record_guest_created(self, guest_user: UserRead) -> None:
+        """Best-effort lifecycle telemetry for durable browser guest creation.
+
+        A failed analytics write must never prevent a new visitor from receiving
+        a usable session. The source user ref remains stable if that guest later
+        merges into an existing full account and its event rows are reassigned.
+        """
+
+        try:
+            await AnalyticsService(self._session).record_interaction_event(
+                {
+                    "event_type": AnalyticsEventType.AUTH_EVENT,
+                    "user_id": guest_user.id,
+                    "surface": "web_session",
+                    "refs": InteractionEventRefs(source_user_id=guest_user.id),
+                    "properties": {"action": "guest_created"},
+                }
+            )
+        except Exception:
+            logger.exception(
+                "Guest creation analytics write failed.",
+                extra={
+                    "event": "guest_creation_analytics_write_failed",
+                    "analytics_event_type": AnalyticsEventType.AUTH_EVENT.value,
+                    "surface": "web_session",
+                    "user_id": str(guest_user.id),
+                },
+            )
 
     async def issue_session_for_user(
         self,

@@ -11,8 +11,14 @@ import pytest
 from sqlalchemy import func, select
 
 from memexpert.models.collection import Collection
-from memexpert.models.enums import AccountStatus, AccountType, CollectionKind, UserLanguage
-from memexpert.models.user import LoginEvent, User
+from memexpert.models.enums import (
+    AccountStatus,
+    AccountType,
+    AnalyticsEventType,
+    CollectionKind,
+    UserLanguage,
+)
+from memexpert.models.user import AnalyticsEvent, LoginEvent, User
 from memexpert.schemas import GuestBootstrapRequest, UserRead
 from memexpert.services import (
     AccountUnavailableError,
@@ -141,6 +147,17 @@ async def test_create_guest_session_composes_guest_bootstrap_and_records_login_e
     persisted_login_event = login_event_result.scalar_one()
     assert persisted_login_event.ip_address == "198.51.100.17"
     assert persisted_login_event.user_agent == "Safari on macOS"
+
+    analytics_event = await migrated_db_session.scalar(
+        select(AnalyticsEvent).where(
+            AnalyticsEvent.user_id == session.user.id,
+            AnalyticsEvent.event_type == AnalyticsEventType.AUTH_EVENT,
+        )
+    )
+    assert analytics_event is not None
+    assert analytics_event.payload["surface"] == "web_session"
+    assert analytics_event.payload["properties"] == {"action": "guest_created"}
+    assert analytics_event.payload["refs"] == {"source_user_id": str(session.user.id)}
 
     favorites_count_result = await migrated_db_session.execute(
         select(func.count())

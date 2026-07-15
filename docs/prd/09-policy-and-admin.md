@@ -36,6 +36,7 @@ controls are diagnostic rather than default operator language.
 | Route | Purpose |
 | --- | --- |
 | `/admin` | Actionable overview only; no always-open CRUD forms. |
+| `/admin/analytics` | Read-only analytics workspace: Overview, Engagement, Audience, and Content & Sources. |
 | `/admin/sources` | Suggestions, public Telegram add flow, health, assignment, ingestion settings, pause/resume, and source removal. |
 | `/admin/telegram` | Telegram account connection, validation, account policy, and disconnect. |
 | `/admin/recovery` | Failed/stuck/dead-lettered work, bounded batch preview, audited retry/resume, and job progress. |
@@ -50,18 +51,44 @@ in a horizontally scrollable navigation strip. Every workspace keeps technical
 diagnostics, advanced policy controls, and destructive actions behind native
 disclosures.
 
+### Analytics workspace
+
+Analytics is intentionally separate from the actionable overview: it answers
+“what is changing?” rather than “what needs attention right now?”. Every
+analytics view shares configurable inclusive UTC calendar dates (common ranges
+or a bounded custom range) and a same-length prior-period comparison. Overview
+shows catalog, visits, activity, conversion, source, and discovery-funnel
+trends; Engagement adds interaction/search breakdowns and raw-query drill-down;
+Audience adds account mix and mature retention cohorts; Content & Sources adds
+catalog, processing, source-health, and engagement-delta views.
+
+Charts use adjacent summaries/tables, explicit loading/empty states, and
+readable labels. Access remains restricted to full admin accounts. Query
+exploration exposes raw query text only in protected admin response bodies and
+never exposes a visitor, request identifier, raw URL, IP address, cookie, or
+user-agent in a dashboard response. Its browser links use an opaque
+`query_key`, plus range/sort/pagination controls, rather than raw query text.
+
+The Content & Sources health breakdown reserves **orphaned** for a Telegram
+source whose assigned Telegram account is missing. It is not a generic
+"no-session" state: a future non-Telegram source with no Telegram session is
+classified by its own freshness/health facts instead. The dashboard's
+discovery funnel likewise reports only request-attributed detail clicks and
+downloads, so it does not infer a search conversion when the interaction lacks
+the matching search request ID.
+
 ### Actionable overview
 
 `/admin` answers “What needs attention?” with links to the relevant workspace:
 open moderation reports, sources, Telegram accounts, missing SEO, and uncurated
 templates. Healthy/ready totals are context, not work queues. Source attention
 counts only active, unpaused sources. A source with no successful fetch is
-**waiting** for its first 15 minutes; afterward, orphaned or stale sources need
-attention. Paused and removed sources are intentionally excluded. A Telegram
-account needs attention when it is disabled, lacks stored authorized material,
+**waiting** for its first 15 minutes; afterward, an orphaned Telegram source or
+a stale source needs attention. Paused and removed sources are intentionally
+excluded. A Telegram account needs attention when it is disabled, lacks stored authorized material,
 is not active, has a current flood-wait, or is quarantined. Orphaned and stale
 are overlapping diagnostic subcounts, not buckets to add together: an old
-never-fetched orphan counts in both while it contributes once to source
+never-fetched Telegram orphan counts in both while it contributes once to source
 attention.
 
 ### Source management

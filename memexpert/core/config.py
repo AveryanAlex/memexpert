@@ -294,6 +294,8 @@ class Settings(BaseSettings):
     security_rate_limit_auth_write_window_seconds: int = Field(default=60, gt=0)
     security_rate_limit_search_feed_max_requests: int = Field(default=30, gt=0)
     security_rate_limit_search_feed_window_seconds: int = Field(default=60, gt=0)
+    security_rate_limit_analytics_write_max_requests: int = Field(default=6000, gt=0)
+    security_rate_limit_analytics_write_window_seconds: int = Field(default=60, gt=0)
     security_rate_limit_write_max_requests: int = Field(default=60, gt=0)
     security_rate_limit_write_window_seconds: int = Field(default=60, gt=0)
     security_rate_limit_upload_max_requests: int = Field(default=10, gt=0)

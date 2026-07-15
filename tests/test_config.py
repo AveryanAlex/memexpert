@@ -435,6 +435,14 @@ def test_settings_reject_blank_security_cors_allowed_origins() -> None:
         _ = Settings.model_validate({"security_cors_allowed_origins": "   "})
 
 
+def test_analytics_write_rate_limit_default_tolerates_shared_frontend_proxy_traffic() -> None:
+    settings = Settings()
+
+    assert settings.security_rate_limit_analytics_write_max_requests == 6000
+    assert settings.security_rate_limit_analytics_write_window_seconds == 60
+    assert settings.security_rate_limit_analytics_write_max_requests > settings.security_rate_limit_write_max_requests
+
+
 @pytest.mark.parametrize(
     ("field_name", "value"),
     [
@@ -442,6 +450,8 @@ def test_settings_reject_blank_security_cors_allowed_origins() -> None:
         ("security_rate_limit_auth_write_window_seconds", 0),
         ("security_rate_limit_search_feed_max_requests", 0),
         ("security_rate_limit_search_feed_window_seconds", 0),
+        ("security_rate_limit_analytics_write_max_requests", 0),
+        ("security_rate_limit_analytics_write_window_seconds", 0),
         ("security_rate_limit_write_max_requests", 0),
         ("security_rate_limit_write_window_seconds", 0),
         ("security_rate_limit_upload_max_requests", 0),

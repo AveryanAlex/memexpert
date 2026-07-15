@@ -277,6 +277,91 @@ const adminOverview = {
   uncurated_template_count: 1
 };
 
+const adminAnalyticsRange = {
+  start_date: '2026-06-01',
+  end_date: '2026-06-30',
+  comparison_start_date: '2026-05-02',
+  comparison_end_date: '2026-05-31',
+  timezone: 'UTC',
+  bucket: 'day'
+};
+
+function analyticsMetric(value, previousValue = Math.max(0, value - 2)) {
+  const change = value - previousValue;
+  return {
+    value,
+    previous_value: previousValue,
+    change,
+    change_percent: previousValue ? Number(((change / previousValue) * 100).toFixed(1)) : null
+  };
+}
+
+const adminAnalyticsQuery = {
+  query_key: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+  query: 'frog reaction',
+  searches: 9,
+  zero_result_searches: 1,
+  zero_result_rate: 11.1,
+  average_latency_ms: 44,
+  detail_clicks: 3,
+  downloads: 2
+};
+
+const adminAnalyticsOverview = {
+  range: adminAnalyticsRange,
+  metrics: {
+    catalog_memes: analyticsMetric(512), new_memes: analyticsMetric(24), page_views: analyticsMetric(146), active_users: analyticsMetric(48), interactions: analyticsMetric(109), downloads: analyticsMetric(13), guest_to_full_conversions: analyticsMetric(4)
+  },
+  activity: [
+    { date: '2026-06-01', page_views: 42, active_users: 15, interactions: 31, searches: 18, downloads: 3, new_memes: 8 },
+    { date: '2026-06-02', page_views: 56, active_users: 19, interactions: 43, searches: 24, downloads: 5, new_memes: 10 }
+  ],
+  discovery_funnel: { searches: 42, searches_with_results: 36, searches_without_results: 6, detail_clicks: 18, downloads: 8 },
+  surface_mix: [{ surface: 'web_search', count: 63 }, { surface: 'telegram_inline', count: 31 }],
+  source_activity: { sources: 7, new_sources: 2, source_views: 210, source_reactions: 23, source_reposts: 8 }
+};
+
+const adminAnalyticsEngagement = {
+  range: adminAnalyticsRange,
+  metrics: {
+    interactions: analyticsMetric(109), searches: analyticsMetric(42), zero_result_searches: analyticsMetric(6), zero_result_rate: analyticsMetric(14.3), average_search_latency_ms: analyticsMetric(44), detail_clicks: analyticsMetric(18), downloads: analyticsMetric(8), sends: analyticsMetric(12), saves: analyticsMetric(9), shares: analyticsMetric(4)
+  },
+  activity: [
+    { date: '2026-06-01', interactions: 31, searches: 18, zero_result_searches: 2, detail_clicks: 7, downloads: 3, sends: 4, saves: 3, shares: 1 },
+    { date: '2026-06-02', interactions: 43, searches: 24, zero_result_searches: 4, detail_clicks: 11, downloads: 5, sends: 6, saves: 4, shares: 2 }
+  ],
+  interactions_by_type: [{ key: 'meme_download', count: 8 }, { key: 'meme_save', count: 6 }, { key: 'meme_share', count: 4 }],
+  surface_mix: [{ surface: 'web_search', count: 63 }, { surface: 'telegram_inline', count: 31 }],
+  top_search_queries: [adminAnalyticsQuery]
+};
+
+const adminAnalyticsAudience = {
+  range: adminAnalyticsRange,
+  metrics: {
+    new_guests: analyticsMetric(20), new_full_accounts: analyticsMetric(8), active_users: analyticsMetric(48), active_guests: analyticsMetric(29), active_full_accounts: analyticsMetric(19), guest_to_full_conversions: analyticsMetric(4), guest_to_full_conversion_rate: analyticsMetric(20)
+  },
+  activity: [
+    { date: '2026-06-01', new_guests: 9, new_full_accounts: 3, active_users: 15, guest_to_full_conversions: 2 },
+    { date: '2026-06-02', new_guests: 11, new_full_accounts: 5, active_users: 19, guest_to_full_conversions: 2 }
+  ],
+  surface_mix: [{ surface: 'web_search', count: 35 }, { surface: 'telegram_inline', count: 13 }],
+  retention_cohorts: [{ cohort_date: '2026-05-01', cohort_size: 10, d1: { eligible_users: 10, retained_users: 5, rate: 50 }, d7: { eligible_users: 10, retained_users: 3, rate: 30 }, d30: { eligible_users: 10, retained_users: 2, rate: 20 } }]
+};
+
+const adminAnalyticsContent = {
+  range: adminAnalyticsRange,
+  metrics: {
+    catalog_memes: analyticsMetric(512), new_memes: analyticsMetric(24), public_memes: analyticsMetric(460), private_memes: analyticsMetric(52), nsfw_memes: analyticsMetric(18), seo_pages: analyticsMetric(401), active_sources: analyticsMetric(7), new_sources: analyticsMetric(2), source_views: analyticsMetric(210), source_reactions: analyticsMetric(23), source_reposts: analyticsMetric(8)
+  },
+  catalog_growth: [{ date: '2026-06-01', new_memes: 8 }, { date: '2026-06-02', new_memes: 10 }],
+  media_types: [{ key: 'image', count: 420 }, { key: 'gif', count: 60 }],
+  languages: [{ key: 'en', count: 310 }, { key: 'ru', count: 140 }],
+  visibility: [{ key: 'public', count: 460 }, { key: 'private', count: 52 }],
+  processing: [{ key: 'ready', count: 500 }, { key: 'processing', count: 12 }],
+  source_health: [{ key: 'fresh', count: 5 }, { key: 'stale', count: 2 }],
+  source_engagement: [{ date: '2026-06-01', source_views: 92, source_reactions: 9, source_reposts: 3 }, { date: '2026-06-02', source_views: 118, source_reactions: 14, source_reposts: 5 }]
+};
+
 const adminMeme = {
   ...meme,
   id: adminIds.meme,
@@ -930,6 +1015,44 @@ async function handleAdminApi(request, response, url, adminSources) {
   }
   if (method === 'GET' && pathname === '/api/v1/admin/overview') {
     sendJson(response, 200, adminOverview);
+    return true;
+  }
+  if (method === 'GET' && pathname === '/api/v1/admin/analytics/overview') {
+    sendJson(response, 200, adminAnalyticsOverview);
+    return true;
+  }
+  if (method === 'GET' && pathname === '/api/v1/admin/analytics/engagement') {
+    sendJson(response, 200, adminAnalyticsEngagement);
+    return true;
+  }
+  if (method === 'GET' && pathname === '/api/v1/admin/analytics/audience') {
+    sendJson(response, 200, adminAnalyticsAudience);
+    return true;
+  }
+  if (method === 'GET' && pathname === '/api/v1/admin/analytics/content') {
+    sendJson(response, 200, adminAnalyticsContent);
+    return true;
+  }
+  if (method === 'GET' && pathname === '/api/v1/admin/analytics/search-queries') {
+    sendJson(response, 200, {
+      range: adminAnalyticsRange,
+      items: [adminAnalyticsQuery],
+      total: 1,
+      limit: Number(url.searchParams.get('limit') ?? 50),
+      offset: Number(url.searchParams.get('offset') ?? 0)
+    });
+    return true;
+  }
+  if (method === 'GET' && pathname === '/api/v1/admin/analytics/search-queries/detail') {
+    if (url.searchParams.has('query') || url.searchParams.get('query_key') !== adminAnalyticsQuery.query_key) {
+      sendJson(response, 422, { detail: 'The smoke API requires the opaque query_key parameter.' });
+      return true;
+    }
+    sendJson(response, 200, {
+      range: adminAnalyticsRange,
+      ...adminAnalyticsQuery,
+      meme_outcomes: [{ meme_id: adminIds.meme, interactions: 4, detail_clicks: 2, downloads: 1, saves: 1, shares: 0 }]
+    });
     return true;
   }
   if (method === 'GET' && pathname === '/api/v1/admin/channel-suggestions') {

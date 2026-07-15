@@ -1,6 +1,7 @@
 <script lang="ts">
   import '../app.css';
   import { page } from '$app/state';
+  import PageViewTracker from '$lib/analytics/PageViewTracker.svelte';
   import { provideAuthState } from '$lib/auth-state';
   import AppShell from '$lib/features/app-shell/AppShell.svelte';
   import TelegramLoginModal from '$lib/features/auth/TelegramLoginModal.svelte';
@@ -38,6 +39,7 @@
 </svelte:head>
 
 <TelegramMiniAppBootstrap />
+<PageViewTracker />
 
 <TooltipProvider delayDuration={500}>
   <AppShell {session} {sessionError} currentPath={page.url.pathname} onLoginClick={() => (loginOpen = true)}>

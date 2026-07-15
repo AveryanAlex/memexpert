@@ -91,6 +91,14 @@ _PROFILE_SAVED_EVENT_TYPES = frozenset(
     }
 )
 _PROFILE_DOWNLOADED_EVENT_TYPES = frozenset({AnalyticsEventType.MEME_DOWNLOAD})
+_PROFILE_NON_ACTIVITY_EVENT_TYPES = frozenset(
+    {
+        AnalyticsEventType.ACCOUNT_MERGE,
+        AnalyticsEventType.AUTH_EVENT,
+        AnalyticsEventType.MINIAPP_OPEN,
+        AnalyticsEventType.PAGE_VIEW,
+    }
+)
 _PROFILE_NO_INTERACTIONS_NOTE = "No interactions yet; stats are zero until this user interacts with memes."
 _PROFILE_TAGS_REQUIREMENTS_NOTE = "Top tags require analytics events with payload.refs.meme_id and tagged meme rows."
 _PROFILE_TEMPLATES_REQUIREMENTS_NOTE = (
@@ -345,6 +353,36 @@ class AnalyticsService:
             raise
         return analytics_event
 
+    async def record_interaction_event_best_effort(
+        self,
+        event: InteractionEventWrite | Mapping[str, Any],
+    ) -> bool:
+        """Persist a strict interaction event without affecting the caller's outcome.
+
+        Product telemetry is useful but must not turn a successful page render,
+        search, or interaction into an application error. This wrapper keeps
+        the strict payload validation used by :meth:`record_interaction_event`
+        while swallowing persistence failures after that method rolls back its
+        transaction. Its log metadata intentionally excludes payload values,
+        user identifiers, URLs, and raw queries.
+        """
+
+        event_type = event.event_type.value if isinstance(event, InteractionEventWrite) else "unvalidated"
+        try:
+            await self.record_interaction_event(event)
+        except Exception as exc:
+            logger.exception(
+                "analytics_interaction_event_write_failed",
+                exc_info=False,
+                extra={
+                    "event": "analytics_interaction_event_write_failed",
+                    "event_type": event_type,
+                    "exception_type": type(exc).__name__,
+                },
+            )
+            return False
+        return True
+
     async def record_event(
         self,
         event_type: AnalyticsEventType,
@@ -452,10 +490,15 @@ class AnalyticsService:
                 )
             ).scalars()
         )
-        event_counts = Counter(event.event_type for event in events)
-        active_days = {_normalize_utc(event.occurred_at).date() for event in events}
+        profile_events = [
+            event
+            for event in events
+            if event.event_type not in _PROFILE_NON_ACTIVITY_EVENT_TYPES
+        ]
+        event_counts = Counter(event.event_type for event in profile_events)
+        active_days = {_normalize_utc(event.occurred_at).date() for event in profile_events}
         meme_event_counts: Counter[uuid.UUID] = Counter()
-        for event in events:
+        for event in profile_events:
             meme_id = _strict_payload_meme_ref(event.payload)
             if meme_id is not None:
                 meme_event_counts[meme_id] += 1
@@ -465,7 +508,7 @@ class AnalyticsService:
             limit=top_limit,
         )
         notes: list[str] = []
-        if not events:
+        if not profile_events:
             notes.append(_PROFILE_NO_INTERACTIONS_NOTE)
         notes.extend([_PROFILE_TAGS_REQUIREMENTS_NOTE, _PROFILE_TEMPLATES_REQUIREMENTS_NOTE])
 

@@ -54,6 +54,8 @@ from memexpert.services.analytics import AnalyticsService, hash_external_identif
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
+    from memexpert.services import AccountLinkResult
+
 router = APIRouter(prefix="/auth", tags=["auth"])
 logger = logging.getLogger(__name__)
 
@@ -162,6 +164,7 @@ async def signup_with_email(
     optional_guest: OptionalGuestUserDep,
     account_link_service: AccountLinkServiceDep,
     auth_service: AuthServiceDep,
+    analytics_service: AnalyticsServiceDep,
     credentials: Annotated[EmailSignupRequest, Body()],
 ) -> AuthSessionRead:
     """Create a full account via the unified guest-upgrade writer path."""
@@ -181,6 +184,13 @@ async def signup_with_email(
     except AuthServiceError as exc:
         raise to_auth_http_error(exc) from exc
 
+    await _record_guest_upgrade(
+        analytics_service,
+        link_result=link_result,
+        provider="email",
+        surface="web_auth",
+        guest_was_persistent=optional_guest is not None,
+    )
     return _issue_session_response(response, auth_session)
 
 
@@ -197,6 +207,7 @@ async def login_with_email(
     optional_guest: OptionalGuestUserDep,
     account_link_service: AccountLinkServiceDep,
     auth_service: AuthServiceDep,
+    analytics_service: AnalyticsServiceDep,
     credentials: Annotated[EmailLoginRequest, Body()],
 ) -> AuthSessionRead:
     """Authenticate an existing email/password account via the unified merge path."""
@@ -216,6 +227,13 @@ async def login_with_email(
     except AuthServiceError as exc:
         raise to_auth_http_error(exc) from exc
 
+    await _record_guest_upgrade(
+        analytics_service,
+        link_result=link_result,
+        provider="email",
+        surface="web_auth",
+        guest_was_persistent=optional_guest is not None,
+    )
     return _issue_session_response(response, auth_session)
 
 
@@ -232,6 +250,7 @@ async def login_with_google(
     optional_guest: OptionalGuestUserDep,
     account_link_service: AccountLinkServiceDep,
     auth_service: AuthServiceDep,
+    analytics_service: AnalyticsServiceDep,
     credentials: Annotated[GoogleAuthRequest, Body()],
 ) -> AuthSessionRead:
     """Exchange a Google auth code through the unified guest-upgrade writer path."""
@@ -250,6 +269,13 @@ async def login_with_google(
     except AuthServiceError as exc:
         raise to_auth_http_error(exc) from exc
 
+    await _record_guest_upgrade(
+        analytics_service,
+        link_result=link_result,
+        provider="google",
+        surface="web_auth",
+        guest_was_persistent=optional_guest is not None,
+    )
     return _issue_session_response(response, auth_session)
 
 
@@ -293,6 +319,7 @@ async def login_with_telegram_widget(
     optional_guest: OptionalGuestUserDep,
     account_link_service: AccountLinkServiceDep,
     auth_service: AuthServiceDep,
+    analytics_service: AnalyticsServiceDep,
     credentials: Annotated[TelegramWidgetAuthRequest, Body()],
 ) -> AuthSessionRead:
     """Validate a Telegram Login Widget payload via the unified writer path."""
@@ -311,6 +338,13 @@ async def login_with_telegram_widget(
     except AuthServiceError as exc:
         raise to_auth_http_error(exc) from exc
 
+    await _record_guest_upgrade(
+        analytics_service,
+        link_result=link_result,
+        provider="telegram",
+        surface="web_auth",
+        guest_was_persistent=optional_guest is not None,
+    )
     return _issue_session_response(response, auth_session)
 
 
@@ -334,6 +368,7 @@ async def login_with_telegram_miniapp(
 ) -> AuthSessionRead:
     """Validate Telegram Mini App initData via the unified writer path."""
 
+    link_result: AccountLinkResult | None = None
     try:
         if current_user is not None and current_user.account_type is AccountType.FULL:
             identity = provider_auth_service.resolve_telegram_miniapp_identity(credentials.init_data)
@@ -362,6 +397,14 @@ async def login_with_telegram_miniapp(
     except AuthServiceError as exc:
         raise to_auth_http_error(exc) from exc
 
+    if link_result is not None:
+        await _record_guest_upgrade(
+            analytics_service,
+            link_result=link_result,
+            provider="telegram",
+            surface="telegram_miniapp_auth",
+            guest_was_persistent=optional_guest is not None,
+        )
     await _record_telegram_miniapp_open(analytics_service, session, auth_session)
     return _issue_session_response(response, auth_session)
 
@@ -494,6 +537,67 @@ def _build_linked_providers_read(linked_providers: LinkedProvidersProjection) ->
         google_linked=linked_providers.google_linked,
         telegram_linked=linked_providers.telegram_linked,
     )
+
+
+async def _record_guest_upgrade(
+    analytics_service: AnalyticsService,
+    *,
+    link_result: AccountLinkResult,
+    provider: str,
+    surface: str,
+    guest_was_persistent: bool,
+) -> None:
+    """Persist forward-only conversion facts without making login fail on telemetry."""
+
+    refs = {
+        "account_merge_log_id": link_result.merge_log_id,
+        "source_user_id": link_result.guest_user_id,
+        "target_user_id": link_result.canonical_user_id,
+    }
+    mode = str(link_result.details.get("mode", "unknown"))
+    properties = {
+        "action": "guest_upgraded",
+        "provider": provider,
+        "mode": mode,
+        "merge_performed": link_result.merge_performed,
+        "guest_was_persistent": guest_was_persistent,
+        "full_account_created": not link_result.merge_performed,
+    }
+    try:
+        await analytics_service.record_interaction_event(
+            {
+                "event_type": AnalyticsEventType.AUTH_EVENT,
+                "user_id": link_result.canonical_user_id,
+                "surface": surface,
+                "refs": refs,
+                "properties": properties,
+            }
+        )
+        if link_result.merge_performed:
+            await analytics_service.record_interaction_event(
+                {
+                    "event_type": AnalyticsEventType.ACCOUNT_MERGE,
+                    "user_id": link_result.canonical_user_id,
+                    "surface": surface,
+                    "refs": refs,
+                    "properties": {
+                        "provider": provider,
+                        "mode": mode,
+                        "guest_was_persistent": guest_was_persistent,
+                    },
+                }
+            )
+    except Exception:
+        logger.exception(
+            "Guest conversion analytics write failed.",
+            extra={
+                "event": "guest_conversion_analytics_write_failed",
+                "surface": surface,
+                "provider": provider,
+                "guest_user_id": str(link_result.guest_user_id),
+                "target_user_id": str(link_result.canonical_user_id),
+            },
+        )
 
 
 async def _record_telegram_miniapp_open(

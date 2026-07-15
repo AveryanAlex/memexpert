@@ -21,6 +21,12 @@ import {
   deleteCollection,
   favoriteMeme,
   fetchAdminMemeTemplates,
+  fetchAdminAnalyticsAudience,
+  fetchAdminAnalyticsContent,
+  fetchAdminAnalyticsEngagement,
+  fetchAdminAnalyticsOverview,
+  fetchAdminAnalyticsSearchQueries,
+  fetchAdminAnalyticsSearchQueryDetail,
   fetchAdminOverview,
   fetchAdminSourceChannelPosts,
   fetchAdminSeoReviewRows,
@@ -106,6 +112,38 @@ const trendPage: PublicMemeTrendPageRead = {
 };
 
 describe('catalog API client', () => {
+  it('requests bounded admin analytics dashboards, query sort modes, and query outcomes', async () => {
+    const requests: string[] = [];
+    const mockFetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      requests.push(`${url.pathname}?${url.searchParams.toString()}`);
+      return jsonResponse({});
+    }) satisfies ApiFetch;
+    const baseRequest = {
+      fetch: mockFetch,
+      baseUrl: 'https://api.memexpert.test',
+      startDate: '2026-06-01',
+      endDate: '2026-06-30',
+      cookieHeader: 'sid=admin'
+    };
+
+    await fetchAdminAnalyticsOverview(baseRequest);
+    await fetchAdminAnalyticsEngagement(baseRequest);
+    await fetchAdminAnalyticsAudience(baseRequest);
+    await fetchAdminAnalyticsContent(baseRequest);
+    await fetchAdminAnalyticsSearchQueries({ ...baseRequest, limit: 50, offset: 100, sort: 'niche' });
+    await fetchAdminAnalyticsSearchQueryDetail({ ...baseRequest, queryKey: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' });
+
+    expect(requests).toEqual([
+      '/api/v1/admin/analytics/overview?start_date=2026-06-01&end_date=2026-06-30',
+      '/api/v1/admin/analytics/engagement?start_date=2026-06-01&end_date=2026-06-30',
+      '/api/v1/admin/analytics/audience?start_date=2026-06-01&end_date=2026-06-30',
+      '/api/v1/admin/analytics/content?start_date=2026-06-01&end_date=2026-06-30',
+      '/api/v1/admin/analytics/search-queries?start_date=2026-06-01&end_date=2026-06-30&limit=50&offset=100&sort=niche',
+      '/api/v1/admin/analytics/search-queries/detail?start_date=2026-06-01&end_date=2026-06-30&query_key=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+    ]);
+  });
+
   it('sends plain text search query and forwards SSR cookies', async () => {
     const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = new URL(String(input));

@@ -301,6 +301,48 @@ async def test_record_event_write_failure_logs_safe_payload_summary(
     assert "analytics db unavailable secret" not in repr(exception_calls)
 
 
+async def test_record_interaction_event_best_effort_swallows_persistence_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failing_session = FailingAnalyticsSession()
+    service = AnalyticsService(cast("AsyncSession", failing_session))
+    exception_calls: list[tuple[str, bool | None, dict[str, object] | None]] = []
+
+    def fake_exception(
+        message: str,
+        *args: object,
+        exc_info: bool | None = True,
+        extra: dict[str, object] | None = None,
+        **kwargs: object,
+    ) -> None:
+        del args, kwargs
+        exception_calls.append((message, exc_info, extra))
+
+    monkeypatch.setattr("memexpert.services.analytics.logger.exception", fake_exception)
+
+    recorded = await service.record_interaction_event_best_effort(
+        InteractionEventWrite(
+            event_type=AnalyticsEventType.PAGE_VIEW,
+            surface="web_search",
+        )
+    )
+
+    assert recorded is False
+    assert failing_session.rollback_calls == 1
+    assert exception_calls == [
+        (
+            "analytics_interaction_event_write_failed",
+            False,
+            {
+                "event": "analytics_interaction_event_write_failed",
+                "event_type": "page_view",
+                "exception_type": "RuntimeError",
+            },
+        )
+    ]
+    assert "analytics db unavailable secret" not in repr(exception_calls)
+
+
 async def test_record_interaction_event_requires_meme_ref_for_inline_result_events(
     migrated_db_session: AsyncSession,
 ) -> None:

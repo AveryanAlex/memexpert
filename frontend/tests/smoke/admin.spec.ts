@@ -31,6 +31,29 @@ test('admin shell exposes task navigation and actionable attention cards', async
   await expect(page.getByText('1 ready')).toBeVisible();
 });
 
+test('admin analytics keeps a shared UTC range across dashboards and exposes query drill-down', async ({ page }) => {
+  await gotoAdmin(page, '/admin/analytics?start_date=2026-06-01&end_date=2026-06-30');
+
+  const navigation = page.getByRole('navigation', { name: 'Admin navigation' });
+  await expect(navigation.getByRole('link', { name: 'Analytics' })).toHaveAttribute('aria-current', 'page');
+  await expect(page.getByRole('heading', { name: 'Analytics overview' })).toBeVisible();
+  await expect(page.getByLabel('Start date')).toHaveValue('2026-06-01');
+  await expect(page.getByLabel('End date')).toHaveValue('2026-06-30');
+  await expect(page.getByRole('heading', { name: 'From search to saved media' })).toBeVisible();
+
+  await page.getByRole('navigation', { name: 'Analytics sections' }).getByRole('link', { name: 'Engagement' }).click();
+  await expect(page).toHaveURL(/\/admin\/analytics\/engagement\?start_date=2026-06-01&end_date=2026-06-30$/);
+  await expect(page.getByRole('heading', { name: 'Search query explorer' })).toBeVisible();
+  await page.getByRole('link', { name: 'Niche' }).click();
+  await expect(page).toHaveURL(/sort=niche/);
+  await expect(page.getByText('frog reaction', { exact: true }).first()).toBeVisible();
+  await page.getByRole('link', { name: 'View outcomes' }).first().click();
+  await expect(page).toHaveURL(/query_key=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/);
+  await expect(page).not.toHaveURL(/frog(?:%20|\+| )reaction/);
+  await expect(page.getByRole('heading', { name: 'frog reaction' })).toBeVisible();
+  await expect(page.getByText(adminFixture.memeId, { exact: true })).toBeVisible();
+});
+
 test('admin adds a public Telegram source through the selected ready account and pauses that source', async ({ page }) => {
   await gotoAdmin(page, '/admin/sources');
 

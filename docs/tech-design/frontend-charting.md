@@ -39,6 +39,14 @@ From the PRD and current routes, planned analytics/trends UI needs:
 - accessible fallback text/data tables where visual charts are not enough;
 - reasonable bundle cost for SEO/public pages.
 
+The browser-admin analytics workspace uses the same boundary for its bounded
+UTC series: line/area charts for activity and catalog/source trends,
+stacked/horizontal bars for breakdowns and rankings, a small donut for surface
+mix, and a labelled funnel for discovery. Each visual must retain an adjacent
+summary/table, descriptive caption, responsive loading state, and an explicit
+empty state; charts are never the only place an operator can read an exact
+metric.
+
 ## Library evaluation
 
 | Library | Fit | Strengths | Risks / trade-offs | Verdict |
@@ -85,6 +93,16 @@ LayerChart gives us reusable primitives for the solved parts:
 - visible or screen-reader-only caption text through `label`, `description`, and `showCaption`.
 
 Keep exact values in adjacent tables or summaries when a visual chart is not sufficient for accessibility. Compact sparklines should use the shared wrapper when they render API data, while staying visually minimal unless they need axes, legends, tooltips, or multi-series behavior.
+
+Admin analytics chart inputs are aggregate-only API DTOs. The frontend keeps
+the selected UTC date range in the route URL and passes it unchanged to server
+loads; chart components receive already-bucketed data and must not derive a
+browser-local reporting window. Raw search query drill-down remains a table-led
+admin disclosure, not a chart label that could leak visitor/request metadata.
+Its route may carry only the opaque 64-character hexadecimal `query_key` (with
+date, sort, and pagination controls), never raw query text. The selected raw
+query is rendered only after the server-side admin load receives the protected
+list/detail response; chart props and route URLs must not retain it.
 
 ## Backend/API follow-up scope discovered
 

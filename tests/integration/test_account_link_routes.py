@@ -5,9 +5,10 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import bcrypt
 import httpx
@@ -21,8 +22,8 @@ from memexpert.api.dependencies import (
     get_provider_auth_service,
 )
 from memexpert.core.config import get_settings
-from memexpert.models.enums import AccountType
-from memexpert.models.user import AccountMergeLog, LoginEvent, User
+from memexpert.models.enums import AccountType, AnalyticsEventType
+from memexpert.models.user import AccountMergeLog, AnalyticsEvent, LoginEvent, User
 from memexpert.services import AccountLinkService, AuthService, ProviderAuthService, UserService
 from tests.conftest import create_full_user_via_upgrade
 
@@ -37,6 +38,13 @@ PASSWORD = "correct-horse-battery"
 ACCESS_TOKEN_TTL = timedelta(minutes=15)
 REFRESH_TOKEN_TTL = timedelta(days=30)
 ACCESS_COOKIE_NAME = "memexpert_access_token"
+
+
+def _analytics_payload_mapping(payload: Mapping[str, object], key: str) -> Mapping[str, object]:
+    """Return one safely-narrowed analytics envelope mapping for assertions."""
+
+    value = payload.get(key)
+    return cast("Mapping[str, object]", value) if isinstance(value, Mapping) else {}
 
 
 @dataclass(slots=True)
@@ -220,6 +228,61 @@ async def test_email_signup_link_upgrades_guest_in_place_issues_canonical_sessio
         assert persisted_user.password_hash is not None
         assert len(login_event_rows) == 2
         assert login_event_rows[-1].user_agent == "Link Safari"
+        lifecycle_events = list(
+            (
+                await session.execute(
+                    select(AnalyticsEvent)
+                    .where(
+                        AnalyticsEvent.user_id == guest_user_id,
+                        AnalyticsEvent.event_type == AnalyticsEventType.AUTH_EVENT,
+                    )
+                    .order_by(AnalyticsEvent.occurred_at.asc(), AnalyticsEvent.id.asc())
+                )
+            ).scalars()
+        )
+        assert [_analytics_payload_mapping(event.payload, "properties")["action"] for event in lifecycle_events] == [
+            "guest_created",
+            "guest_upgraded",
+        ]
+        assert lifecycle_events[-1].payload["refs"] == {
+            "source_user_id": str(guest_user_id),
+            "target_user_id": str(guest_user_id),
+        }
+        assert _analytics_payload_mapping(lifecycle_events[-1].payload, "properties")["guest_was_persistent"] is True
+        assert _analytics_payload_mapping(lifecycle_events[-1].payload, "properties")["full_account_created"] is True
+
+
+async def test_direct_email_signup_records_nonpersistent_full_account_creation_lifecycle(
+    auth_client: AsyncClient,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    response = await auth_client.post(
+        "/api/v1/auth/email/signup",
+        json={"email": "direct-lifecycle@example.com", "password": PASSWORD},
+    )
+
+    assert response.status_code == 201
+    user_id = uuid.UUID(response.json()["user"]["id"])
+    async with postgres_session_factory() as session:
+        events = list(
+            (
+                await session.execute(
+                    select(AnalyticsEvent)
+                    .where(
+                        AnalyticsEvent.user_id == user_id,
+                        AnalyticsEvent.event_type == AnalyticsEventType.AUTH_EVENT,
+                    )
+                    .order_by(AnalyticsEvent.occurred_at.asc(), AnalyticsEvent.id.asc()),
+                )
+            ).scalars()
+        )
+
+    assert len(events) == 1
+    properties = _analytics_payload_mapping(events[0].payload, "properties")
+    assert properties["action"] == "guest_upgraded"
+    assert properties["guest_was_persistent"] is False
+    assert properties["full_account_created"] is True
+    assert properties["merge_performed"] is False
 
 
 async def test_email_login_link_wrong_password_leaves_guest_session_intact(
@@ -619,6 +682,26 @@ async def test_email_login_route_merges_guest_when_guest_bearer_is_present(
         assert persisted_guest_result.scalar_one_or_none() is None
         assert persisted_target_result.scalar_one() is not None
         assert merge_log_count_result.scalar_one() == 1
+        lifecycle_events = list(
+            (
+                await session.execute(
+                    select(AnalyticsEvent)
+                    .where(AnalyticsEvent.user_id == full_user.id)
+                    .order_by(AnalyticsEvent.occurred_at.asc(), AnalyticsEvent.id.asc())
+                )
+            ).scalars()
+        )
+        assert any(
+            event.event_type == AnalyticsEventType.AUTH_EVENT
+            and _analytics_payload_mapping(event.payload, "properties").get("action") == "guest_upgraded"
+            and _analytics_payload_mapping(event.payload, "refs").get("source_user_id") == str(guest_user_id)
+            for event in lifecycle_events
+        )
+        assert any(
+            event.event_type == AnalyticsEventType.ACCOUNT_MERGE
+            and _analytics_payload_mapping(event.payload, "refs").get("target_user_id") == str(full_user.id)
+            for event in lifecycle_events
+        )
 
 
 @pytest.mark.parametrize(

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 import uuid
 from typing import Annotated
 
@@ -56,6 +57,7 @@ from memexpert.services import (
     InvalidPinnedMemeOrderError,
     PinLimitExceededError,
 )
+from memexpert.services.analytics import InteractionEventWrite
 from memexpert.services.meme_search import MemeNotFoundError, MemeSearchFilters, MemeSearchScope
 from memexpert.services.public_trends import PublicTrendRanking, PublicTrendTimelineGranularity
 from memexpert.services.report import MemeReportTargetNotVisibleError
@@ -221,6 +223,8 @@ async def search_memes(
         include_nsfw=_nsfw_allowed(current_user, include_nsfw),
         tags=tags,
     )
+    normalized_query = query.strip()
+    search_started = time.perf_counter()
     page = await meme_search_service.search_public_memes(
         query,
         viewer_user_id=current_user.id if current_user else None,
@@ -229,24 +233,30 @@ async def search_memes(
         offset=offset,
         surface="public_api_search",
     )
-    await analytics_service.record_event(
-        AnalyticsEventType.SEARCH_QUERY,
-        user_id=current_user.id if current_user else None,
-        payload={
-            "surface": "public_api",
-            "query": query.strip(),
-            "language": language.value if language is not None else None,
-            "media_type": media_type.value if media_type is not None else None,
-            "scope": filters.scope.value if filters.scope is not None else None,
-            "collection_ids": _collection_id_strings(filters.collection_ids),
-            "include_nsfw": filters.include_nsfw,
-            "tags": list(filters.tags),
-            "limit": limit,
-            "offset": offset,
-            "result_count": len(page.items),
-            "has_more": page.has_more,
-        },
-    )
+    if normalized_query and offset == 0:
+        await analytics_service.record_interaction_event_best_effort(
+            InteractionEventWrite(
+                event_type=AnalyticsEventType.SEARCH_QUERY,
+                user_id=current_user.id if current_user else None,
+                surface="public_api_search",
+                query=normalized_query,
+                request_id=page.request_id,
+                properties={
+                    "filters": {
+                        "language": language.value if language is not None else None,
+                        "media_type": media_type.value if media_type is not None else None,
+                        "scope": filters.scope.value if filters.scope is not None else None,
+                        "collection_ids": _collection_id_strings(filters.collection_ids),
+                        "include_nsfw": filters.include_nsfw,
+                        "tags": list(filters.tags),
+                    },
+                    "result_total": page.total,
+                    "returned_count": len(page.items),
+                    "has_more": page.has_more,
+                    "latency_ms": round((time.perf_counter() - search_started) * 1000),
+                },
+            )
+        )
     return page
 
 

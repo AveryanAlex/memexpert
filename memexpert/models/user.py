@@ -299,6 +299,7 @@ class AnalyticsEvent(UUIDPrimaryKeyMixin, Base):
 
     __tablename__ = "analytics_events"
     __table_args__ = (
+        Index("ix_analytics_events_occurred_at", "occurred_at"),
         Index("ix_analytics_events_user_id_occurred_at", "user_id", "occurred_at"),
         Index("ix_analytics_events_event_type_occurred_at", "event_type", "occurred_at"),
     )

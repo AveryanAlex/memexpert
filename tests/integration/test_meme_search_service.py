@@ -651,20 +651,30 @@ async def test_search_route_uses_plain_text_semantic_path_with_overridden_fakes(
     )
     assert event is not None
     assert event.user_id is None
-    assert event.payload == {
-        "surface": "public_api",
-        "query": "frog wizard",
-        "language": None,
-        "media_type": None,
-        "scope": "public",
-        "collection_ids": [],
-        "include_nsfw": False,
-        "tags": [],
-        "limit": 10,
-        "offset": 0,
-        "result_count": 2,
+    assert event.payload["schema_version"] == 1
+    assert event.payload["actor_type"] == "anonymous"
+    assert event.payload["surface"] == "public_api_search"
+    assert event.payload["query"] == "frog wizard"
+    assert event.payload["request_id"] == payload["request_id"]
+    assert event.payload["refs"] == {}
+    properties = cast("dict[str, object]", event.payload["properties"])
+    latency_ms = properties["latency_ms"]
+    assert properties == {
+        "filters": {
+            "language": None,
+            "media_type": None,
+            "scope": "public",
+            "collection_ids": [],
+            "include_nsfw": False,
+            "tags": [],
+        },
+        "result_total": 2,
+        "returned_count": 2,
         "has_more": False,
+        "latency_ms": latency_ms,
     }
+    assert isinstance(latency_ms, int)
+    assert latency_ms >= 0
 
 
 async def test_home_feed_route_returns_public_personalized_recommendations(
@@ -1876,12 +1886,13 @@ async def test_search_route_scope_collections_returns_multiple_authorized_collec
     assert "owned-collection-route.jpg" not in response.text
     assert "shared-collection-route.jpg" not in response.text
 
+    # An empty /search request is catalog browsing, not a query submission.
+    # It remains visible through impression/page-view analytics without
+    # polluting raw query reporting with a blank term.
     event = await migrated_db_session.scalar(
         select(AnalyticsEvent).where(AnalyticsEvent.event_type == AnalyticsEventType.SEARCH_QUERY)
     )
-    assert event is not None
-    assert event.payload["scope"] == "collections"
-    assert event.payload["collection_ids"] == [str(owned_collection.id), str(shared_collection.id)]
+    assert event is None
 
 
 async def test_meme_detail_routes_return_authorized_private_and_shared_memes_with_markers(

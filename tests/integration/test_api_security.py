@@ -49,6 +49,8 @@ def security_settings_overrides(
         "SECURITY_RATE_LIMIT_AUTH_WRITE_WINDOW_SECONDS": "60",
         "SECURITY_RATE_LIMIT_SEARCH_FEED_MAX_REQUESTS": "2",
         "SECURITY_RATE_LIMIT_SEARCH_FEED_WINDOW_SECONDS": "60",
+        "SECURITY_RATE_LIMIT_ANALYTICS_WRITE_MAX_REQUESTS": "2",
+        "SECURITY_RATE_LIMIT_ANALYTICS_WRITE_WINDOW_SECONDS": "60",
         "SECURITY_RATE_LIMIT_WRITE_MAX_REQUESTS": "2",
         "SECURITY_RATE_LIMIT_WRITE_WINDOW_SECONDS": "60",
         "SECURITY_RATE_LIMIT_UPLOAD_MAX_REQUESTS": "2",
@@ -207,6 +209,8 @@ async def test_safe_read_routes_stay_available_when_redis_unavailable(
         ("GET", "/api/v1/memes/trends", SecurityRouteTier.SEARCH_FEED),
         ("GET", "/api/v1/memes/trends/tags", SecurityRouteTier.SEARCH_FEED),
         ("POST", "/api/v1/collections", SecurityRouteTier.WRITE),
+        ("POST", "/api/v1/analytics/page-views", SecurityRouteTier.ANALYTICS_WRITE),
+        ("POST", "/api/v1/analytics/not-page-views", SecurityRouteTier.WRITE),
         ("POST", "/api/v1/pipeline/uploads", SecurityRouteTier.UPLOAD),
         ("GET", "/api/v1/admin/session", SecurityRouteTier.ADMIN),
         ("POST", "/api/v1/auth/guest", SecurityRouteTier.AUTH_WRITE),
@@ -365,6 +369,37 @@ async def test_write_rate_limit_returns_retry_metadata_for_generic_versioned_wri
     assert limited_response.headers["X-RateLimit-Limit"] == "2"
     assert limited_response.headers["X-RateLimit-Remaining"] == "0"
     assert limited_response.headers["X-RateLimit-Tier"] == "write"
+
+
+async def test_analytics_rate_limit_is_high_volume_and_isolated_from_generic_writes(
+    security_client: AsyncClient,
+) -> None:
+    page_view_payload = {"surface": "web_search"}
+    first_response = await security_client.post("/api/v1/analytics/page-views", json=page_view_payload)
+    second_response = await security_client.post("/api/v1/analytics/page-views", json=page_view_payload)
+    limited_response = await security_client.post("/api/v1/analytics/page-views", json=page_view_payload)
+    write_response = await security_client.post(
+        "/api/v1/collections",
+        json={"title": "Independent write budget", "visibility": "private"},
+    )
+
+    assert first_response.status_code == 202
+    assert first_response.headers["X-RateLimit-Limit"] == "2"
+    assert first_response.headers["X-RateLimit-Remaining"] == "1"
+    assert first_response.headers["X-RateLimit-Tier"] == "analytics_write"
+
+    assert second_response.status_code == 202
+    assert second_response.headers["X-RateLimit-Remaining"] == "0"
+    assert second_response.headers["X-RateLimit-Tier"] == "analytics_write"
+
+    assert limited_response.status_code == 429
+    assert limited_response.json()["code"] == "rate_limit_exceeded"
+    assert limited_response.headers["X-RateLimit-Tier"] == "analytics_write"
+
+    assert write_response.status_code == 401
+    assert write_response.headers["X-RateLimit-Limit"] == "2"
+    assert write_response.headers["X-RateLimit-Remaining"] == "1"
+    assert write_response.headers["X-RateLimit-Tier"] == "write"
 
 
 async def test_upload_rate_limit_returns_retry_metadata_before_operator_auth(
@@ -737,6 +772,37 @@ async def test_csrf_generic_browser_write_proceeds_past_csrf_with_required_heade
     assert response.headers["Access-Control-Allow-Origin"] == "https://app.memexpert.net"
     assert response.headers["Access-Control-Allow-Credentials"] == "true"
     assert response.json()["code"] == "invalid_token"
+
+
+async def test_csrf_rejects_browser_page_view_without_required_header(
+    browser_security_client: AsyncClient,
+) -> None:
+    response = await browser_security_client.post(
+        "/api/v1/analytics/page-views",
+        headers={"Origin": "https://app.memexpert.net"},
+        json={"surface": "web_search"},
+    )
+
+    assert response.status_code == 403
+    assert response.headers["Access-Control-Allow-Origin"] == "https://app.memexpert.net"
+    assert response.json()["code"] == "csrf_failed"
+
+
+async def test_csrf_allows_browser_page_view_with_required_header(
+    browser_security_client: AsyncClient,
+) -> None:
+    response = await browser_security_client.post(
+        "/api/v1/analytics/page-views",
+        headers={
+            "Origin": "https://app.memexpert.net",
+            "X-Requested-With": BROWSER_REQUESTED_WITH_VALUE,
+        },
+        json={"surface": "web_search"},
+    )
+
+    assert response.status_code == 202
+    assert response.headers["Access-Control-Allow-Origin"] == "https://app.memexpert.net"
+    assert response.json() == {"ok": True}
 
 
 async def test_csrf_safe_get_remains_exempt_when_origin_is_present(
