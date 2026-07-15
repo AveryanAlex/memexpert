@@ -9,7 +9,26 @@ MemeExpert is a semantic meme search/catalog and content-pipeline product: it in
 
 ## Deployment status
 
-- The app is not production-deployed yet; only a beta environment is live for internal testing. Do not preserve compatibility for stale/unupdated clients unless explicitly requested; coordinated breaking API changes and destructive database migrations are acceptable in this phase.
+- The public launch is not complete, but a live beta environment runs on `whale` at `https://beta.memexpert.net`. Treat it as production operationally even though coordinated breaking API changes and destructive database migrations are still acceptable during this beta phase.
+
+## Live beta deployment and production access
+
+- The live beta is a NixOS/Podman Quadlet deployment, not the example Docker Compose stack. Its runtime source of truth is the sibling dotfiles repo: `../dotfiles/apps/memexpert/default.nix`, imported by `../dotfiles/machines/whale/default.nix`. Reploy configuration is in `../dotfiles/machines/whale/reploy.nix`.
+- `../dotfiles/profiles/server/memexpert.nix` and the native `memexpert.service` are the separate legacy `memexpert.net` deployment. Do not confuse that service with the beta Quadlet units at `beta.memexpert.net`.
+- Image-only releases normally happen by pushing `main`: CI must pass lint, backend tests, frontend tests/build/smoke, and real-stack E2E; it then publishes the `main`, `worker`, and `frontend` `:main` images to GHCR and invokes Reploy. Follow the GitHub Actions run through the final `deploy` job rather than assuming a successful push is deployed.
+- Nix/runtime changes belong in `../dotfiles`, not generated files on `whale`. From the dotfiles root, validate with `nix run nixpkgs#nixfmt-tree -- --ci` and `nix flake check`, then use `./deploy.sh whale build` and `./deploy.sh whale switch` (or `test`). Never build whale's NixOS configuration locally; `deploy.sh` builds on the target host.
+- Connect with `ssh whale`. Generated Quadlet definitions are visible under `/etc/containers/systemd/memexpert-*.container` and generated services under `/etc/systemd/system/memexpert-*.service`, but never edit them directly. Secrets are Agenix-managed; do not print environment files, full container inspections, tokens, or credentials into logs or chat.
+- High-signal read-only production checks:
+  - Units: `ssh whale "systemctl list-units --all 'memexpert*' --no-pager"`
+  - Containers: `ssh whale "sudo podman ps -a --filter name=memexpert"`
+  - API health: `ssh whale "curl -fsS http://10.90.99.10:8000/health"`
+  - Recent API logs: `ssh whale "journalctl -u memexpert-api.service -n 200 --no-pager -o short-iso"`
+  - Recent worker logs: `ssh whale "journalctl -u 'memexpert-worker-*.service' --since '1 hour ago' --no-pager -o short-iso"`
+  - Follow one worker: `ssh whale "journalctl -fu memexpert-worker-ocr.service -o short-iso"`
+  - Deployment logs: `ssh whale "journalctl -u reploy.service --since '1 hour ago' --no-pager -o short-iso"`
+- App units are `memexpert-api`, `memexpert-frontend`, `memexpert-scheduler`, `memexpert-telegram-crawler`, `memexpert-bot`, and `memexpert-worker-{media,ocr,enrichment,sync,telegram}`. Infrastructure units include `memexpert-{db,redis,rabbitmq,qdrant,meilisearch,minio,imgproxy}`. `memexpert-migrate` being inactive after a successful one-shot migration and `memexpert-minio-init`/`memexpert-network` being `active (exited)` are expected.
+- For an interactive database shell, use `ssh -t whale 'sudo podman exec -it memexpert-db psql -U memexpert -d memexpert'`. Start with read-only queries, avoid broad production dumps, and never mutate production data unless the task explicitly authorizes it.
+- Prefer systemd and Reploy over raw `podman restart`. Manual restarts, image rollouts, migrations, and database writes change production state; perform them only when requested and preserve the migration/dependency ordering declared in Nix. Wait until all three application images exist before a manual Reploy rollout to avoid a mixed release.
 
 ## High-signal structure
 
