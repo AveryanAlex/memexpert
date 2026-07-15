@@ -8,6 +8,7 @@ import uuid
 from datetime import timedelta
 from functools import lru_cache
 from ipaddress import ip_address
+from pathlib import Path
 from typing import Annotated, ClassVar, Literal, cast
 from urllib.parse import urlsplit
 
@@ -57,6 +58,11 @@ class Settings(BaseSettings):
     app_host: str = "0.0.0.0"
     app_port: int = 8000
     database_url: str = "postgresql+asyncpg://memexpert:memexpert@localhost:5432/memexpert"
+    database_connect_timeout_seconds: float = Field(default=5.0, gt=0.0, le=60.0)
+    database_pool_size: int = Field(default=5, ge=1, le=100)
+    database_max_overflow: int = Field(default=10, ge=0, le=100)
+    database_pool_timeout_seconds: float = Field(default=5.0, gt=0.0, le=60.0)
+    database_application_name: str = "memexpert"
     redis_url: str = "redis://localhost:6379/0"
     rabbitmq_url: str = "amqp://memexpert:memexpert@localhost:5672/"
     qdrant_url: str = "http://localhost:6333"
@@ -103,6 +109,19 @@ class Settings(BaseSettings):
     pipeline_broker_retry_backoff_seconds: float = Field(default=5.0, gt=0.0, le=3600.0)
     pipeline_broker_connection_timeout_seconds: float = Field(default=5.0, gt=0.0)
     pipeline_worker_prefetch_count: int = Field(default=1, ge=1, le=512)
+    pipeline_capacity_close_pending_count: int = Field(default=1000, ge=10, le=1_000_000)
+    pipeline_capacity_reopen_pending_count: int = Field(default=500, ge=0, le=999_999)
+    pipeline_capacity_close_oldest_age_seconds: float = Field(default=3600.0, gt=0.0, le=604800.0)
+    pipeline_capacity_reopen_oldest_age_seconds: float = Field(default=900.0, ge=0.0, le=604799.0)
+    pipeline_circuit_failure_threshold: int = Field(default=3, ge=1, le=32)
+    pipeline_circuit_cooldown_seconds: float = Field(default=30.0, gt=0.0, le=3600.0)
+    pipeline_stuck_reclaim_after_seconds: float = Field(default=900.0, gt=60.0, le=86400.0)
+    recovery_telegram_poll_interval_seconds: float = Field(default=5.0, gt=0.0, le=300.0)
+    recovery_telegram_batch_size: int = Field(default=10, ge=1, le=100)
+    runtime_health_file: Path = Path("/tmp/memexpert-runtime-health.json")
+    runtime_health_interval_seconds: float = Field(default=10.0, gt=0.0, le=300.0)
+    runtime_health_stale_after_seconds: float = Field(default=45.0, gt=0.0, le=900.0)
+    runtime_health_operation_timeout_seconds: float = Field(default=900.0, gt=0.0, le=7200.0)
     pipeline_storage_connection_timeout_seconds: float = Field(default=5.0, gt=0.0)
     pipeline_ocr_primary_engine: str = "paddleocr"
     pipeline_ocr_paddle_command: str | None = None
@@ -191,6 +210,11 @@ class Settings(BaseSettings):
     scheduler_rabbitmq_outbox_publisher_interval_seconds: float = Field(default=5.0, gt=0.0)
     scheduler_rabbitmq_outbox_publisher_batch_size: int = Field(default=100, ge=1, le=1000)
     scheduler_rabbitmq_outbox_publisher_stale_timeout_seconds: float = Field(default=300.0, gt=0.0)
+    scheduler_recovery_dispatch_enabled: bool = True
+    scheduler_recovery_dispatch_interval_seconds: float = Field(default=5.0, gt=0.0, le=300.0)
+    scheduler_recovery_dispatch_batch_size: int = Field(default=50, ge=1, le=1000)
+    scheduler_pipeline_capacity_refresh_enabled: bool = True
+    scheduler_pipeline_capacity_refresh_interval_seconds: float = Field(default=15.0, gt=0.0, le=300.0)
     scheduler_telegram_login_cleanup_enabled: bool = True
     scheduler_telegram_login_cleanup_interval_seconds: float = Field(default=60.0, gt=0.0)
     scheduler_telegram_login_cleanup_batch_size: int = Field(default=100, ge=1, le=1000)
@@ -212,6 +236,17 @@ class Settings(BaseSettings):
     crawler_max_requests_per_second: float = Field(default=15.0, gt=0, le=30)
     crawler_live_mode_enabled: bool = True
     crawler_reconcile_interval_seconds: float = Field(default=10.0, gt=0.0, le=3600.0)
+    # Telethon has its own retry loop, but every logical crawler operation
+    # still needs a caller-owned deadline so a bad socket or cross-DC request
+    # cannot pin an account forever.  Keep the retry counts deliberately low:
+    # the durable crawler/backfill layers own retries across logical attempts.
+    crawler_telegram_request_retries: int = Field(default=2, ge=0, le=10)
+    crawler_telegram_connection_retries: int = Field(default=2, ge=0, le=10)
+    crawler_telegram_connect_timeout_seconds: float = Field(default=20.0, gt=0.0, le=300.0)
+    crawler_telegram_resolve_timeout_seconds: float = Field(default=30.0, gt=0.0, le=300.0)
+    crawler_telegram_history_page_timeout_seconds: float = Field(default=60.0, gt=0.0, le=600.0)
+    crawler_telegram_single_message_timeout_seconds: float = Field(default=30.0, gt=0.0, le=300.0)
+    crawler_telegram_media_download_timeout_seconds: float = Field(default=120.0, gt=0.0, le=1800.0)
     # Freshness SLO budgets (publish → both sync targets synced) in seconds.
     # Runtime code surfaces measured p50/p95 against these numbers through the
     # operator inspect surface so drift is visible.
@@ -272,7 +307,15 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    @field_validator("rabbitmq_url", "s3_endpoint", "s3_access_key", "s3_secret_key", "s3_region", mode="before")
+    @field_validator(
+        "database_application_name",
+        "rabbitmq_url",
+        "s3_endpoint",
+        "s3_access_key",
+        "s3_secret_key",
+        "s3_region",
+        mode="before",
+    )
     @classmethod
     def _normalize_required_runtime_text(cls, value: object) -> object:
         if not isinstance(value, str):
@@ -334,6 +377,18 @@ class Settings(BaseSettings):
             raise ValueError("imgproxy_key and imgproxy_salt must be configured together.")
         if self.imgproxy_key is not None and self.imgproxy_salt is not None:
             _validate_browser_reachable_imgproxy_base_url(self.imgproxy_render_base_url)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_pipeline_capacity_hysteresis(self) -> Settings:
+        if self.pipeline_capacity_reopen_pending_count >= self.pipeline_capacity_close_pending_count:
+            raise ValueError(
+                "pipeline_capacity_reopen_pending_count must be below pipeline_capacity_close_pending_count."
+            )
+        if self.pipeline_capacity_reopen_oldest_age_seconds >= self.pipeline_capacity_close_oldest_age_seconds:
+            raise ValueError(
+                "pipeline_capacity_reopen_oldest_age_seconds must be below pipeline_capacity_close_oldest_age_seconds."
+            )
         return self
 
     @field_validator("pipeline_operator_token", mode="before")
@@ -625,9 +680,7 @@ class Settings(BaseSettings):
             return value
 
         raw_methods = cls._coerce_env_sequence(value)
-        normalized_methods = tuple(
-            dict.fromkeys(method.strip().upper() for method in raw_methods if method.strip())
-        )
+        normalized_methods = tuple(dict.fromkeys(method.strip().upper() for method in raw_methods if method.strip()))
         if not normalized_methods:
             raise ValueError("security_cors_allowed_methods must include at least one HTTP method.")
         return normalized_methods

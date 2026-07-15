@@ -1102,6 +1102,14 @@ class SourceChannelPost(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     last_error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
     last_error_text: Mapped[str | None] = mapped_column(Text, nullable=True)
     attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    is_retryable: Mapped[bool] = mapped_column(
+        default=False,
+        server_default=text("false"),
+        nullable=False,
+    )
+    next_attempt_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    quarantined_at: Mapped[datetime | None] = mapped_column(nullable=True)
 
     source_channel: Mapped["SourceChannel"] = relationship(
         "SourceChannel",
@@ -1122,11 +1130,17 @@ class SourceChannelBackfillJob(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             "scanned_message_count >= 0 AND scanned_message_count <= requested_message_count",
             name="source_channel_backfill_jobs_scanned_count_bounded",
         ),
+        CheckConstraint(
+            "quarantined_message_count >= 0 AND quarantined_message_count <= scanned_message_count",
+            name="source_channel_backfill_jobs_quarantined_count_bounded",
+        ),
+        CheckConstraint("attempt_count >= 0", name="source_channel_backfill_jobs_attempt_count_non_negative"),
+        CheckConstraint("lease_generation >= 0", name="source_channel_backfill_jobs_lease_generation_non_negative"),
         Index(
             "uq_source_channel_backfill_jobs_one_active_per_channel",
             "source_channel_id",
             unique=True,
-            postgresql_where=text("status IN ('queued', 'running')"),
+            postgresql_where=text("status IN ('queued', 'running', 'waiting_retry', 'waiting_capacity')"),
         ),
         Index(
             "ix_source_channel_backfill_jobs_status_locked_created",
@@ -1153,14 +1167,43 @@ class SourceChannelBackfillJob(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     status: Mapped[SourceChannelBackfillJobStatus] = mapped_column(
         string_enum(SourceChannelBackfillJobStatus),
         default=SourceChannelBackfillJobStatus.QUEUED,
+        server_default=text("'queued'"),
         nullable=False,
     )
     requested_message_count: Mapped[int] = mapped_column(Integer, nullable=False)
     scanned_message_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    quarantined_message_count: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+        server_default=text("0"),
+        nullable=False,
+    )
     cursor_post_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+        server_default=text("0"),
+        nullable=False,
+    )
+    last_error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_error_class: Mapped[str | None] = mapped_column(String(128), nullable=True)
     last_error_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    failed_post_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    is_retryable: Mapped[bool] = mapped_column(
+        default=False,
+        server_default=text("false"),
+        nullable=False,
+    )
+    next_attempt_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    last_progress_at: Mapped[datetime | None] = mapped_column(nullable=True)
     locked_at: Mapped[datetime | None] = mapped_column(nullable=True)
     lock_owner: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    lease_generation: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+        server_default=text("0"),
+        nullable=False,
+    )
     started_at: Mapped[datetime | None] = mapped_column(nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(nullable=True)
 

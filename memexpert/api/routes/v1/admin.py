@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import uuid
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Path, Query, status
 from pydantic import AwareDatetime
@@ -378,6 +378,7 @@ async def list_source_channel_posts(
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
     offset: Annotated[int, Query(ge=0)] = 0,
     snapshot_at: Annotated[AwareDatetime | None, Query()] = None,
+    post_status: Annotated[Literal["failed", "processing"] | None, Query(alias="status")] = None,
 ) -> AdminSourceChannelPostPageRead:
     try:
         return await admin_service.list_source_channel_posts(
@@ -385,6 +386,7 @@ async def list_source_channel_posts(
             limit=limit,
             offset=offset,
             snapshot_at=snapshot_at,
+            status=post_status,
         )
     except (AdminNotFoundError, AdminConflictError) as exc:
         raise _map_admin_error(exc) from exc

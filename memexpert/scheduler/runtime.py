@@ -23,6 +23,8 @@ if TYPE_CHECKING:
 
     from sqlalchemy.ext.asyncio import AsyncEngine
 
+    from memexpert.runtime_health import RuntimeHealthReporter
+
 logger = logging.getLogger(__name__)
 
 
@@ -43,6 +45,7 @@ async def run_scheduler_runtime(
     scheduler: SchedulerLike | None = None,
     stop_waiter: Callable[[], Awaitable[None] | None] | None = None,
     lock: Any | None = None,
+    health_reporter: RuntimeHealthReporter | None = None,
 ) -> None:
     """Run the scheduler until stopped."""
 
@@ -59,6 +62,8 @@ async def run_scheduler_runtime(
     jobs = enabled_scheduler_jobs(resolved_settings, resolved_engine)
 
     started = False
+    if health_reporter is not None:
+        await health_reporter.start()
     try:
         if resolved_settings.scheduler_advisory_lock_enabled:
             if acquired_lock is None:
@@ -83,8 +88,13 @@ async def run_scheduler_runtime(
             logger.warning("scheduler_advisory_lock_disabled", extra={"event": "scheduler_advisory_lock_disabled"})
 
         for definition in jobs:
+
             async def _job_runner(job_definition: SchedulerJobDefinition = definition) -> None:
-                await run_logged_job(job_definition.id, job_definition.action)
+                if health_reporter is None:
+                    await run_logged_job(job_definition.id, job_definition.action)
+                    return
+                async with health_reporter.operation(f"scheduler_job:{job_definition.id}"):
+                    await run_logged_job(job_definition.id, job_definition.action)
 
             scheduler_instance.add_job(
                 _job_runner,
@@ -106,6 +116,8 @@ async def run_scheduler_runtime(
 
         scheduler_instance.start()
         started = True
+        if health_reporter is not None:
+            health_reporter.mark_ready()
         await _wait_for_stop(stop_waiter)
     finally:
         if started:
@@ -133,6 +145,8 @@ async def run_scheduler_runtime(
                 "advisory_lock_enabled": resolved_settings.scheduler_advisory_lock_enabled,
             },
         )
+        if health_reporter is not None:
+            await health_reporter.stop()
 
 
 async def _wait_for_stop(stop_waiter: Callable[[], Awaitable[None] | None] | None) -> None:

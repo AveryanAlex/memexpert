@@ -8,3 +8,9 @@ export function sourcePostPageFromSearchParam(value: string | null): number {
   if (!Number.isSafeInteger(page) || page < 1) return 1;
   return page;
 }
+
+export type SourcePostStatusFilter = 'failed' | 'processing';
+
+export function sourcePostStatusFromSearchParam(value: string | null): SourcePostStatusFilter | null {
+  return value === 'failed' || value === 'processing' ? value : null;
+}

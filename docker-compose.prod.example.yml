@@ -8,6 +8,11 @@ x-app-env: &app-env
   APP_HOST: 0.0.0.0
   APP_PORT: 8000
   DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:?set POSTGRES_USER}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:?set POSTGRES_DB}
+  DATABASE_CONNECT_TIMEOUT_SECONDS: ${DATABASE_CONNECT_TIMEOUT_SECONDS:-5.0}
+  DATABASE_POOL_SIZE: ${DATABASE_POOL_SIZE:-4}
+  DATABASE_MAX_OVERFLOW: ${DATABASE_MAX_OVERFLOW:-2}
+  DATABASE_POOL_TIMEOUT_SECONDS: ${DATABASE_POOL_TIMEOUT_SECONDS:-5.0}
+  DATABASE_APPLICATION_NAME: ${DATABASE_APPLICATION_NAME:-memexpert}
   REDIS_URL: redis://redis:6379/0
   RABBITMQ_URL: amqp://${RABBITMQ_DEFAULT_USER:?set RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS:?set RABBITMQ_DEFAULT_PASS}@rabbitmq:5672/
   QDRANT_URL: http://qdrant:6333
@@ -27,6 +32,15 @@ x-app-env: &app-env
   PIPELINE_ALLOWED_MIME_TYPES: ${PIPELINE_ALLOWED_MIME_TYPES:-image/jpeg,image/png,image/webp,image/gif,video/mp4,video/quicktime,video/webm}
   PIPELINE_TRANSCODE_TIMEOUT_SECONDS: ${PIPELINE_TRANSCODE_TIMEOUT_SECONDS:-180.0}
   PIPELINE_BROKER_CONNECTION_TIMEOUT_SECONDS: ${PIPELINE_BROKER_CONNECTION_TIMEOUT_SECONDS:-10.0}
+  PIPELINE_CAPACITY_CLOSE_PENDING_COUNT: ${PIPELINE_CAPACITY_CLOSE_PENDING_COUNT:-1000}
+  PIPELINE_CAPACITY_REOPEN_PENDING_COUNT: ${PIPELINE_CAPACITY_REOPEN_PENDING_COUNT:-500}
+  PIPELINE_CAPACITY_CLOSE_OLDEST_AGE_SECONDS: ${PIPELINE_CAPACITY_CLOSE_OLDEST_AGE_SECONDS:-3600}
+  PIPELINE_CAPACITY_REOPEN_OLDEST_AGE_SECONDS: ${PIPELINE_CAPACITY_REOPEN_OLDEST_AGE_SECONDS:-900}
+  PIPELINE_CIRCUIT_FAILURE_THRESHOLD: ${PIPELINE_CIRCUIT_FAILURE_THRESHOLD:-3}
+  PIPELINE_CIRCUIT_COOLDOWN_SECONDS: ${PIPELINE_CIRCUIT_COOLDOWN_SECONDS:-30}
+  PIPELINE_STUCK_RECLAIM_AFTER_SECONDS: ${PIPELINE_STUCK_RECLAIM_AFTER_SECONDS:-900}
+  RECOVERY_TELEGRAM_POLL_INTERVAL_SECONDS: ${RECOVERY_TELEGRAM_POLL_INTERVAL_SECONDS:-5}
+  RECOVERY_TELEGRAM_BATCH_SIZE: ${RECOVERY_TELEGRAM_BATCH_SIZE:-10}
   PIPELINE_BROKER_SOURCE_ENGAGEMENT_CAPTURE_QUEUE: ${PIPELINE_BROKER_SOURCE_ENGAGEMENT_CAPTURE_QUEUE:-pipeline.source_engagement_capture}
   PIPELINE_STORAGE_CONNECTION_TIMEOUT_SECONDS: ${PIPELINE_STORAGE_CONNECTION_TIMEOUT_SECONDS:-10.0}
   PIPELINE_VOYAGE_PROVIDER_MODE: ${PIPELINE_VOYAGE_PROVIDER_MODE:-live}
@@ -78,6 +92,10 @@ x-app-env: &app-env
   CRAWLER_FRESHNESS_SLO_P50_SECONDS: ${CRAWLER_FRESHNESS_SLO_P50_SECONDS:-60.0}
   CRAWLER_FRESHNESS_SLO_P95_SECONDS: ${CRAWLER_FRESHNESS_SLO_P95_SECONDS:-180.0}
   CRAWLER_DEFAULT_CATCHUP_MESSAGE_LIMIT: ${CRAWLER_DEFAULT_CATCHUP_MESSAGE_LIMIT:-5000}
+  RUNTIME_HEALTH_FILE: /tmp/memexpert-runtime-health.json
+  RUNTIME_HEALTH_INTERVAL_SECONDS: ${RUNTIME_HEALTH_INTERVAL_SECONDS:-10.0}
+  RUNTIME_HEALTH_STALE_AFTER_SECONDS: ${RUNTIME_HEALTH_STALE_AFTER_SECONDS:-45.0}
+  RUNTIME_HEALTH_OPERATION_TIMEOUT_SECONDS: ${RUNTIME_HEALTH_OPERATION_TIMEOUT_SECONDS:-900.0}
   SCHEDULER_MATERIALIZED_VIEW_REFRESH_ENABLED: ${SCHEDULER_MATERIALIZED_VIEW_REFRESH_ENABLED:-true}
   SCHEDULER_MATERIALIZED_VIEW_REFRESH_INTERVAL_SECONDS: ${SCHEDULER_MATERIALIZED_VIEW_REFRESH_INTERVAL_SECONDS:-300}
   SCHEDULER_SOURCE_ENGAGEMENT_CAPTURE_ENABLED: ${SCHEDULER_SOURCE_ENGAGEMENT_CAPTURE_ENABLED:-true}
@@ -98,11 +116,35 @@ x-app-env: &app-env
   SCHEDULER_SEARCH_INDEX_SYNC_INTERVAL_SECONDS: ${SCHEDULER_SEARCH_INDEX_SYNC_INTERVAL_SECONDS:-600}
   SCHEDULER_SEO_BACKLOG_BATCHES_ENABLED: ${SCHEDULER_SEO_BACKLOG_BATCHES_ENABLED:-true}
   SCHEDULER_SEO_BACKLOG_BATCHES_INTERVAL_SECONDS: ${SCHEDULER_SEO_BACKLOG_BATCHES_INTERVAL_SECONDS:-900}
+  SCHEDULER_RABBITMQ_OUTBOX_PUBLISHER_ENABLED: ${SCHEDULER_RABBITMQ_OUTBOX_PUBLISHER_ENABLED:-true}
+  SCHEDULER_RABBITMQ_OUTBOX_PUBLISHER_INTERVAL_SECONDS: ${SCHEDULER_RABBITMQ_OUTBOX_PUBLISHER_INTERVAL_SECONDS:-5}
+  SCHEDULER_RABBITMQ_OUTBOX_PUBLISHER_BATCH_SIZE: ${SCHEDULER_RABBITMQ_OUTBOX_PUBLISHER_BATCH_SIZE:-100}
+  SCHEDULER_RABBITMQ_OUTBOX_PUBLISHER_STALE_TIMEOUT_SECONDS: ${SCHEDULER_RABBITMQ_OUTBOX_PUBLISHER_STALE_TIMEOUT_SECONDS:-300}
+  SCHEDULER_RECOVERY_DISPATCH_ENABLED: ${SCHEDULER_RECOVERY_DISPATCH_ENABLED:-true}
+  SCHEDULER_RECOVERY_DISPATCH_INTERVAL_SECONDS: ${SCHEDULER_RECOVERY_DISPATCH_INTERVAL_SECONDS:-5}
+  SCHEDULER_RECOVERY_DISPATCH_BATCH_SIZE: ${SCHEDULER_RECOVERY_DISPATCH_BATCH_SIZE:-50}
+  SCHEDULER_PIPELINE_CAPACITY_REFRESH_ENABLED: ${SCHEDULER_PIPELINE_CAPACITY_REFRESH_ENABLED:-true}
+  SCHEDULER_PIPELINE_CAPACITY_REFRESH_INTERVAL_SECONDS: ${SCHEDULER_PIPELINE_CAPACITY_REFRESH_INTERVAL_SECONDS:-15}
   SCHEDULER_TELEGRAM_LOGIN_CLEANUP_ENABLED: ${SCHEDULER_TELEGRAM_LOGIN_CLEANUP_ENABLED:-true}
   SCHEDULER_TELEGRAM_LOGIN_CLEANUP_INTERVAL_SECONDS: ${SCHEDULER_TELEGRAM_LOGIN_CLEANUP_INTERVAL_SECONDS:-60}
   SCHEDULER_TELEGRAM_LOGIN_CLEANUP_BATCH_SIZE: ${SCHEDULER_TELEGRAM_LOGIN_CLEANUP_BATCH_SIZE:-100}
   SCHEDULER_ADVISORY_LOCK_ENABLED: ${SCHEDULER_ADVISORY_LOCK_ENABLED:-true}
   SCHEDULER_ADVISORY_LOCK_KEY: ${SCHEDULER_ADVISORY_LOCK_KEY:-0,0}
+
+x-worker-env: &worker-env
+  <<: *app-env
+  RUNTIME_HEALTH_FILE: /tmp/memexpert-runtime-health.json
+  RUNTIME_HEALTH_INTERVAL_SECONDS: "10.0"
+  RUNTIME_HEALTH_STALE_AFTER_SECONDS: "45.0"
+  RUNTIME_HEALTH_OPERATION_TIMEOUT_SECONDS: "900.0"
+  DATABASE_POOL_TIMEOUT_SECONDS: "5.0"
+  PIPELINE_OCR_PROVIDER_MODE: ${PIPELINE_OCR_PROVIDER_MODE:-live}
+  PIPELINE_OCR_PRIMARY_ENGINE: ${PIPELINE_OCR_PRIMARY_ENGINE:-paddleocr}
+  PIPELINE_OCR_PADDLE_COMMAND: ${PIPELINE_OCR_PADDLE_COMMAND:?set PIPELINE_OCR_PADDLE_COMMAND}
+  PIPELINE_OCR_FALLBACK_ENGINE: ${PIPELINE_OCR_FALLBACK_ENGINE:-}
+  PIPELINE_OCR_FALLBACK_COMMAND: ${PIPELINE_OCR_FALLBACK_COMMAND:-}
+  PIPELINE_OCR_TIMEOUT_SECONDS: ${PIPELINE_OCR_TIMEOUT_SECONDS:-120.0}
+  PIPELINE_OCR_LOW_CONFIDENCE_THRESHOLD: ${PIPELINE_OCR_LOW_CONFIDENCE_THRESHOLD:-0.6}
 
 services:
   postgres:
@@ -277,26 +319,132 @@ services:
       migrate:
         condition: service_completed_successfully
 
-  workers:
+  worker-media:
     <<: *worker-image
     restart: unless-stopped
+    command: ["memexpert-workers", "--role", "media"]
     environment:
-      <<: *app-env
-      PIPELINE_WORKER_PREFETCH_COUNT: ${PIPELINE_WORKER_PREFETCH_COUNT:-1}
-      PIPELINE_OCR_PROVIDER_MODE: ${PIPELINE_OCR_PROVIDER_MODE:-live}
-      PIPELINE_OCR_PRIMARY_ENGINE: ${PIPELINE_OCR_PRIMARY_ENGINE:-paddleocr}
-      PIPELINE_OCR_PADDLE_COMMAND: ${PIPELINE_OCR_PADDLE_COMMAND:?set PIPELINE_OCR_PADDLE_COMMAND}
-      PIPELINE_OCR_FALLBACK_ENGINE: ${PIPELINE_OCR_FALLBACK_ENGINE:-}
-      PIPELINE_OCR_FALLBACK_COMMAND: ${PIPELINE_OCR_FALLBACK_COMMAND:-}
-      PIPELINE_OCR_TIMEOUT_SECONDS: ${PIPELINE_OCR_TIMEOUT_SECONDS:-120.0}
-      PIPELINE_OCR_LOW_CONFIDENCE_THRESHOLD: ${PIPELINE_OCR_LOW_CONFIDENCE_THRESHOLD:-0.6}
+      <<: *worker-env
+      PIPELINE_WORKER_PREFETCH_COUNT: "1"
+      DATABASE_POOL_SIZE: "2"
+      DATABASE_MAX_OVERFLOW: "1"
+      DATABASE_APPLICATION_NAME: memexpert-worker-media
     depends_on:
       migrate:
         condition: service_completed_successfully
       rabbitmq:
         condition: service_healthy
     healthcheck:
-      disable: true
+      test: ["CMD", "memexpert-runtime-health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    mem_limit: 4g
+    cpus: 4.0
+    pids_limit: 256
+
+  worker-ocr:
+    <<: *worker-image
+    restart: unless-stopped
+    command: ["memexpert-workers", "--role", "ocr"]
+    environment:
+      <<: *worker-env
+      PIPELINE_WORKER_PREFETCH_COUNT: "1"
+      DATABASE_POOL_SIZE: "1"
+      DATABASE_MAX_OVERFLOW: "1"
+      DATABASE_APPLICATION_NAME: memexpert-worker-ocr
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "memexpert-runtime-health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 300s
+    mem_limit: 6g
+    cpus: 4.0
+    pids_limit: 256
+
+  worker-enrichment:
+    <<: *worker-image
+    restart: unless-stopped
+    command: ["memexpert-workers", "--role", "enrichment"]
+    environment:
+      <<: *worker-env
+      PIPELINE_WORKER_PREFETCH_COUNT: "2"
+      DATABASE_POOL_SIZE: "3"
+      DATABASE_MAX_OVERFLOW: "1"
+      DATABASE_APPLICATION_NAME: memexpert-worker-enrichment
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "memexpert-runtime-health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    mem_limit: 4g
+    cpus: 4.0
+    pids_limit: 192
+
+  worker-sync:
+    <<: *worker-image
+    restart: unless-stopped
+    command: ["memexpert-workers", "--role", "sync"]
+    environment:
+      <<: *worker-env
+      PIPELINE_WORKER_PREFETCH_COUNT: "4"
+      DATABASE_POOL_SIZE: "3"
+      DATABASE_MAX_OVERFLOW: "1"
+      DATABASE_APPLICATION_NAME: memexpert-worker-sync
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "memexpert-runtime-health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    mem_limit: 2g
+    cpus: 2.0
+    pids_limit: 128
+
+  worker-telegram:
+    <<: *worker-image
+    restart: unless-stopped
+    command: ["memexpert-workers", "--role", "telegram"]
+    environment:
+      <<: *worker-env
+      PIPELINE_WORKER_PREFETCH_COUNT: "1"
+      DATABASE_POOL_SIZE: "2"
+      DATABASE_MAX_OVERFLOW: "1"
+      DATABASE_APPLICATION_NAME: memexpert-worker-telegram
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID:?set TELEGRAM_API_ID}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:?set TELEGRAM_API_HASH}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "memexpert-runtime-health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    mem_limit: 2g
+    cpus: 2.0
+    pids_limit: 128
 
   telegram-crawler:
     <<: *worker-image
@@ -304,13 +452,18 @@ services:
     command: ["memexpert-telegram-crawler"]
     environment:
       <<: *app-env
+      DATABASE_APPLICATION_NAME: memexpert-telegram-crawler
       TELEGRAM_API_ID: ${TELEGRAM_API_ID:?set TELEGRAM_API_ID}
       TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:?set TELEGRAM_API_HASH}
     depends_on:
       migrate:
         condition: service_completed_successfully
     healthcheck:
-      disable: true
+      test: ["CMD", "memexpert-runtime-health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 300s
 
   scheduler:
     <<: *main-image
@@ -318,13 +471,18 @@ services:
     command: ["memexpert-scheduler"]
     environment:
       <<: *app-env
+      DATABASE_APPLICATION_NAME: memexpert-scheduler
       TELEGRAM_API_ID: ${TELEGRAM_API_ID:?set TELEGRAM_API_ID}
       TELEGRAM_API_HASH: ${TELEGRAM_API_HASH:?set TELEGRAM_API_HASH}
     depends_on:
       migrate:
         condition: service_completed_successfully
     healthcheck:
-      disable: true
+      test: ["CMD", "memexpert-runtime-health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
 
   bot:
     <<: *main-image

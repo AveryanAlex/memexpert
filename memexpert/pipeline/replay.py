@@ -14,9 +14,11 @@ from memexpert.models.enums import (
     ContentPipelineStage,
     ContentPipelineStageStatus,
     ContentSourceKind,
+    RecoveryJobItemStatus,
     SyncTargetKind,
     SyncTargetStatus,
 )
+from memexpert.models.operations import RecoveryJobItem
 from memexpert.pipeline import constants as _consts
 from memexpert.pipeline.dispatch import PipelineDispatchingService
 from memexpert.pipeline.helpers import is_replay_reserved, reserve_replay, sorted_stage_entries
@@ -37,6 +39,7 @@ class PipelineReplayService(PipelineDispatchingService):
         meme_file_id: uuid.UUID,
         *,
         stage: ContentPipelineStage | None = None,
+        recovery_item: RecoveryJobItem | None = None,
     ) -> ContentPipelineReplayAccepted:
         meme_file = await self._get_meme_file(meme_file_id)
         if not meme_file.s3_original_key:
@@ -52,6 +55,9 @@ class PipelineReplayService(PipelineDispatchingService):
                 raise PipelineReplayNotAllowedError(
                     f"Pipeline item {meme_file_id} is already reserved for replay, but its event id is missing.",
                 )
+            self._attach_recovery_item(recovery_item, target_entry.last_event_id)
+            if recovery_item is not None:
+                await self._commit_recovery_attachment()
             return ContentPipelineReplayAccepted(
                 meme_file_id=meme_file.id,
                 replay_event_id=target_entry.last_event_id,
@@ -72,6 +78,7 @@ class PipelineReplayService(PipelineDispatchingService):
             created_at=utcnow(),
         )
         reserve_replay(target_entry, replay_event)
+        self._attach_recovery_item(recovery_item, replay_event.event_id)
         outbox_message_id = await self._enqueue_dispatch_event(replay_event)
         try:
             await self._session.commit()
@@ -92,10 +99,16 @@ class PipelineReplayService(PipelineDispatchingService):
         self,
         meme_file_id: uuid.UUID,
         target: SyncTargetKind,
+        *,
+        recovery_item: RecoveryJobItem | None = None,
     ) -> ContentPipelineReplayAccepted:
         meme_file = await self._get_meme_file(meme_file_id)
         ensure_sync_replay_allowed(meme_file)
-        return await self._replay_single_sync_target(meme_file_id, target)
+        return await self._replay_single_sync_target(
+            meme_file_id,
+            target,
+            recovery_item=recovery_item,
+        )
 
     async def replay_sync_target_batch(
         self,
@@ -121,6 +134,8 @@ class PipelineReplayService(PipelineDispatchingService):
         self,
         meme_file_id: uuid.UUID,
         target: SyncTargetKind,
+        *,
+        recovery_item: RecoveryJobItem | None = None,
     ) -> ContentPipelineReplayAccepted:
         stage = _consts.SYNC_STAGE_BY_TARGET[target]
         meme_file = await self._get_meme_file(meme_file_id)
@@ -143,6 +158,9 @@ class PipelineReplayService(PipelineDispatchingService):
                 raise PipelineReplayNotAllowedError(
                     f"Pipeline item {meme_file_id} is already reserved for replay, but its event id is missing.",
                 )
+            self._attach_recovery_item(recovery_item, stage_entry.last_event_id)
+            if recovery_item is not None:
+                await self._commit_recovery_attachment()
             return ContentPipelineReplayAccepted(
                 meme_file_id=meme_file.id,
                 replay_event_id=stage_entry.last_event_id,
@@ -163,6 +181,7 @@ class PipelineReplayService(PipelineDispatchingService):
             created_at=utcnow(),
         )
         reserve_replay(stage_entry, replay_event)
+        self._attach_recovery_item(recovery_item, replay_event.event_id)
 
         await upsert_sync_target_snapshot(
             self._session,
@@ -193,6 +212,23 @@ class PipelineReplayService(PipelineDispatchingService):
             stage=replay_event.stage,
             attempt=replay_event.attempt,
         )
+
+    @staticmethod
+    def _attach_recovery_item(recovery_item: RecoveryJobItem | None, event_id: uuid.UUID) -> None:
+        if recovery_item is None:
+            return
+        recovery_item.status = RecoveryJobItemStatus.DISPATCHED
+        recovery_item.dispatch_event_id = event_id
+        recovery_item.dispatched_at = utcnow()
+        recovery_item.normalized_reason = None
+        recovery_item.safe_error_text = None
+
+    async def _commit_recovery_attachment(self) -> None:
+        try:
+            await self._session.commit()
+        except SQLAlchemyError as exc:
+            await self._session.rollback()
+            raise PipelineIngestError("Failed to attach an existing replay to recovery work.") from exc
 
     def _select_replay_entry(
         self,

@@ -1,6 +1,6 @@
 import { render } from 'svelte/server';
 import { describe, expect, it } from 'vitest';
-import type { AdminSourceChannelRead, AdminSourcePostPageRead, AdminSourcePostRead, AdminTelegramSessionRead } from '$lib/api/types';
+import type { AdminSourceBackfillRead, AdminSourceChannelRead, AdminSourcePostPageRead, AdminSourcePostRead, AdminTelegramSessionRead } from '$lib/api/types';
 import SourceDetailWorkspace from '$lib/features/admin/sources/SourceDetailWorkspace.svelte';
 
 describe('/admin/sources/[channelId] detail', () => {
@@ -9,6 +9,7 @@ describe('/admin/sources/[channelId] detail', () => {
       props: {
         source: sourceChannel(),
         postPage: sourcePostPage(),
+        recoveryRequestIds: sourceRecoveryRequestIds(),
         telegramAccounts: [telegramAccount()],
         paging: { page: 1, snapshotAt: '2026-07-13T12:00:00Z', hasPrevious: false, hasNext: true },
         loadError: null,
@@ -32,6 +33,8 @@ describe('/admin/sources/[channelId] detail', () => {
     expect(body).toContain('action="?/backfillSourceChannel"');
     expect(body).toMatch(/name="message_limit"[^>]*min="1"[^>]*max="50000"[^>]*value="5000"/);
     expect(body).toContain('Fetch older messages');
+    expect(body).toContain('action="?/replaySourcePost"');
+    expect(body).toContain('name="request_id" value="11111111-1111-4111-8111-111111111111"');
     expect(body).toContain('aria-label="Source message pagination"');
     expect(body).toContain('Page 1');
     expect(body).toContain('Show latest messages');
@@ -46,6 +49,7 @@ describe('/admin/sources/[channelId] detail', () => {
       props: {
         source: sourceChannel({ backfill_status: 'running', backfill_requested_count: 5000, backfill_scanned_count: 1250 }),
         postPage: sourcePostPage(),
+        recoveryRequestIds: sourceRecoveryRequestIds(),
         telegramAccounts: [telegramAccount()],
         paging: { page: 1, snapshotAt: '2026-07-13T12:00:00Z', hasPrevious: false, hasNext: false },
         loadError: null,
@@ -62,19 +66,31 @@ describe('/admin/sources/[channelId] detail', () => {
       props: {
         source: sourceChannel({ backfill_status: 'failed', backfill_error: 'Flood wait until tomorrow.' }),
         postPage: sourcePostPage(),
+        backfills: { items: [sourceBackfill()] },
+        recoveryRequestIds: sourceRecoveryRequestIds({
+          'backfill-id': '22222222-2222-4222-8222-222222222222'
+        }),
         telegramAccounts: [telegramAccount()],
         paging: { page: 1, snapshotAt: '2026-07-13T12:00:00Z', hasPrevious: false, hasNext: false },
         loadError: null,
-        form: null
+        form: {
+          message: 'Failed backfill queued to resume from its durable cursor.',
+          recoveryJobId: '33333333-3333-4333-8333-333333333333'
+        }
       }
     }).body;
     expect(failed).toContain('Backfill failed: Flood wait until tomorrow.');
-    expect(failed).not.toMatch(/name="message_limit"[^>]*disabled=""/);
+    expect(failed).toMatch(/name="message_limit"[^>]*disabled=""/);
+    expect(failed).toContain('Resume backfill');
+    expect(failed).toContain('action="?/resumeSourceBackfill"');
+    expect(failed).toContain('name="request_id" value="22222222-2222-4222-8222-222222222222"');
+    expect(failed).toContain('href="/admin/recovery/batches/33333333-3333-4333-8333-333333333333"');
 
     const catchupDisabled = render(SourceDetailWorkspace, {
       props: {
         source: sourceChannel({ catchup_enabled: false }),
         postPage: sourcePostPage(),
+        recoveryRequestIds: sourceRecoveryRequestIds(),
         telegramAccounts: [telegramAccount()],
         paging: { page: 1, snapshotAt: '2026-07-13T12:00:00Z', hasPrevious: false, hasNext: false },
         loadError: null,
@@ -88,6 +104,7 @@ describe('/admin/sources/[channelId] detail', () => {
       props: {
         source: sourceChannel(),
         postPage: sourcePostPage(),
+        recoveryRequestIds: sourceRecoveryRequestIds(),
         telegramAccounts: [telegramAccount({ flood_wait_until: '2099-01-01T00:00:00Z' })],
         paging: { page: 1, snapshotAt: '2026-07-13T12:00:00Z', hasPrevious: false, hasNext: false },
         loadError: null,
@@ -101,6 +118,7 @@ describe('/admin/sources/[channelId] detail', () => {
       props: {
         source: sourceChannel({ oldest_observed_post_id: null, initial_catchup_completed: false }),
         postPage: sourcePostPage(),
+        recoveryRequestIds: sourceRecoveryRequestIds(),
         telegramAccounts: [telegramAccount()],
         paging: { page: 1, snapshotAt: '2026-07-13T12:00:00Z', hasPrevious: false, hasNext: false },
         loadError: null,
@@ -112,6 +130,13 @@ describe('/admin/sources/[channelId] detail', () => {
     expect(initialFetchPending).toContain('Wait for the initial latest-message catch-up');
   });
 });
+
+function sourceRecoveryRequestIds(backfills: Record<string, string> = {}) {
+  return {
+    backfills,
+    posts: { failed: '11111111-1111-4111-8111-111111111111' }
+  };
+}
 
 function sourceChannel(overrides: Partial<AdminSourceChannelRead> = {}): AdminSourceChannelRead {
   return {
@@ -182,7 +207,7 @@ function sourcePostPage(): AdminSourcePostPageRead {
     sourcePost({ id: 'indexed', post_id: '10000', index_status: 'indexed', qdrant_status: 'synced', meilisearch_status: 'synced' }),
     sourcePost({ id: 'partial', post_id: '9999', index_status: 'partially_indexed', qdrant_status: 'synced', meilisearch_status: 'processing' }),
     sourcePost({ id: 'processing', post_id: '9998', index_status: 'processing', ingest_status: 'media_inspecting', meme_id: null, meme_file_id: null, pipeline_stage: null, pipeline_status: null, qdrant_status: null, meilisearch_status: null }),
-    sourcePost({ id: 'failed', post_id: '9997', index_status: 'failed', pipeline_stage: 'embed', pipeline_status: 'failed', pipeline_error: 'Embedding provider unavailable.', qdrant_status: 'failed', meilisearch_status: 'pending' }),
+    sourcePost({ id: 'failed', post_id: '9997', index_status: 'failed', pipeline_stage: 'embed', pipeline_status: 'failed', pipeline_error: 'Embedding provider unavailable.', qdrant_status: 'failed', meilisearch_status: 'pending', is_retryable: true, capabilities: ['replay_source_post'] }),
     sourcePost({ id: 'skipped', post_id: '9996', index_status: 'not_indexable', media_type: 'text', fetch_status: 'unsupported', ingest_outcome: 'skipped_unsupported_media', ingest_status: null, meme_id: null, meme_file_id: null, pipeline_stage: null, pipeline_status: null, qdrant_status: null, meilisearch_status: null })
   ];
   return {
@@ -216,6 +241,39 @@ function sourcePost(overrides: Partial<AdminSourcePostRead> = {}): AdminSourcePo
     qdrant_status: 'synced',
     meilisearch_status: 'synced',
     index_status: 'indexed',
+    is_retryable: false,
+    version: 'post-version',
+    capabilities: [],
+    blocked_reason: null,
+    ...overrides
+  };
+}
+
+function sourceBackfill(overrides: Partial<AdminSourceBackfillRead> = {}): AdminSourceBackfillRead {
+  return {
+    id: 'backfill-id',
+    source_channel_id: 'source-id',
+    status: 'failed',
+    requested_count: 5000,
+    scanned_count: 1250,
+    remaining_count: 3750,
+    cursor_post_id: '8750',
+    attempt_count: 2,
+    quarantined_count: 0,
+    last_error_code: 'telegram_provider_unavailable',
+    last_error_class: 'TimeoutError',
+    safe_error: 'Telegram did not respond before the deadline.',
+    is_retryable: true,
+    next_attempt_at: null,
+    last_progress_at: '2026-07-13T11:00:00Z',
+    telegram_session_id: 'account-id',
+    telegram_session_name: 'primary',
+    created_at: '2026-07-13T10:00:00Z',
+    started_at: '2026-07-13T10:01:00Z',
+    finished_at: '2026-07-13T11:01:00Z',
+    updated_at: '2026-07-13T11:01:00Z',
+    version: 'backfill-version',
+    capabilities: ['resume_backfill'],
     ...overrides
   };
 }

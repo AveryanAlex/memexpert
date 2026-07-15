@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Final
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Mapping
+    from collections.abc import AsyncIterator
 
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
@@ -78,34 +79,81 @@ def _build_connect_args(
     database_url: str,
     *,
     connect_timeout: float,
+    application_name: str | None = None,
     connect_args: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     resolved_connect_args = dict(connect_args or {})
     if database_url.startswith(f"{POSTGRES_ASYNC_DRIVERNAME}://"):
         _ = resolved_connect_args.setdefault("timeout", connect_timeout)
+        if application_name is not None:
+            configured_server_settings = resolved_connect_args.get("server_settings")
+            server_settings = (
+                dict(configured_server_settings) if isinstance(configured_server_settings, Mapping) else {}
+            )
+            _ = server_settings.setdefault("application_name", application_name)
+            resolved_connect_args["server_settings"] = server_settings
     return resolved_connect_args
 
 
 def build_async_engine(
     database_url: str | None = None,
     *,
-    connect_timeout: float = DEFAULT_CONNECT_TIMEOUT_SECONDS,
+    settings: Settings | None = None,
+    connect_timeout: float | None = None,
+    pool_size: int | None = None,
+    max_overflow: int | None = None,
+    pool_timeout: float | None = None,
+    application_name: str | None = None,
     pool_pre_ping: bool = True,
     connect_args: Mapping[str, object] | None = None,
     **engine_options: object,
 ) -> AsyncEngine:
     """Build a lazy async SQLAlchemy engine from the configured database URL."""
 
+    resolved_settings = settings or (get_settings() if database_url is None else None)
     resolved_database_url = (
-        normalize_async_database_url(database_url)
-        if database_url is not None
-        else get_database_url()
+        normalize_async_database_url(database_url) if database_url is not None else get_database_url(resolved_settings)
+    )
+    resolved_connect_timeout = (
+        connect_timeout
+        if connect_timeout is not None
+        else (
+            resolved_settings.database_connect_timeout_seconds
+            if resolved_settings is not None
+            else DEFAULT_CONNECT_TIMEOUT_SECONDS
+        )
     )
     resolved_connect_args = _build_connect_args(
         resolved_database_url,
-        connect_timeout=connect_timeout,
+        connect_timeout=resolved_connect_timeout,
+        application_name=(
+            application_name
+            if application_name is not None
+            else (resolved_settings.database_application_name if resolved_settings is not None else None)
+        ),
         connect_args=connect_args,
     )
+    resolved_pool_size = (
+        pool_size
+        if pool_size is not None
+        else (resolved_settings.database_pool_size if resolved_settings is not None else None)
+    )
+    resolved_max_overflow = (
+        max_overflow
+        if max_overflow is not None
+        else (resolved_settings.database_max_overflow if resolved_settings is not None else None)
+    )
+    resolved_pool_timeout = (
+        pool_timeout
+        if pool_timeout is not None
+        else (resolved_settings.database_pool_timeout_seconds if resolved_settings is not None else None)
+    )
+    if resolved_pool_size is not None:
+        engine_options.setdefault("pool_size", resolved_pool_size)
+    if resolved_max_overflow is not None:
+        engine_options.setdefault("max_overflow", resolved_max_overflow)
+    if resolved_pool_timeout is not None:
+        engine_options.setdefault("pool_timeout", resolved_pool_timeout)
 
     try:
         return create_async_engine(
@@ -135,7 +183,7 @@ def get_async_engine() -> AsyncEngine:
 
     global _engine
     if _engine is None:
-        _engine = build_async_engine()
+        _engine = build_async_engine(settings=get_settings())
     return _engine
 
 

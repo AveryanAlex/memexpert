@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import asyncio
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
@@ -51,16 +52,33 @@ class _FakeTelegramClient:
     instances: ClassVar[list[_FakeTelegramClient]] = []
     authorized: ClassVar[bool] = True
     account: ClassVar[_FakeAccount | None] = _FakeAccount()
+    connect_delay_seconds: ClassVar[float] = 0.0
 
-    def __init__(self, *, session: object, api_id: int, api_hash: str) -> None:
+    def __init__(
+        self,
+        *,
+        session: object,
+        api_id: int,
+        api_hash: str,
+        request_retries: int,
+        connection_retries: int,
+        raise_last_call_error: bool,
+        auto_reconnect: bool,
+    ) -> None:
         self.session = session
         self.api_id = api_id
         self.api_hash = api_hash
+        self.request_retries = request_retries
+        self.connection_retries = connection_retries
+        self.raise_last_call_error = raise_last_call_error
+        self.auto_reconnect = auto_reconnect
         self.connected = False
         self.disconnected = False
         self.instances.append(self)
 
     async def connect(self) -> None:
+        if self.connect_delay_seconds:
+            await asyncio.sleep(self.connect_delay_seconds)
         self.connected = True
 
     def is_connected(self) -> bool:
@@ -95,10 +113,35 @@ class _FakeSingleMessageClient:
 @dataclass(slots=True)
 class _FakeSingleMessageFactory:
     client: _FakeSingleMessageClient
+    settings: Settings
     max_requests_per_second: float | None = None
 
     async def get_client(self) -> _FakeSingleMessageClient:
         return self.client
+
+
+@dataclass(slots=True)
+class _FailingSingleMessageClient:
+    error: Exception
+
+    async def get_messages(self, _entity: object, *, ids: int) -> object:
+        _ = ids
+        raise self.error
+
+
+@dataclass(slots=True)
+class _EvictingSingleMessageFactory:
+    client: _FailingSingleMessageClient
+    settings: Settings
+    session_name: str = "test-session"
+    max_requests_per_second: float | None = None
+    invalidated_clients: list[object] = field(default_factory=list)
+
+    async def get_client(self) -> _FailingSingleMessageClient:
+        return self.client
+
+    async def invalidate_client(self, *, client: object | None = None) -> None:
+        self.invalidated_clients.append(client)
 
 
 @pytest.fixture(autouse=True)
@@ -106,6 +149,7 @@ def _reset_fake_telethon_client() -> None:
     _FakeTelegramClient.instances = []
     _FakeTelegramClient.authorized = True
     _FakeTelegramClient.account = _FakeAccount()
+    _FakeTelegramClient.connect_delay_seconds = 0.0
 
 
 def _settings() -> Settings:
@@ -131,9 +175,13 @@ async def _insert_telegram_session(
 ) -> None:
     encrypted_string_session = None
     if string_session is not None:
-        encrypted_string_session = TelegramStringSessionCipher(settings.telegram_session_encryption_secret).encrypt(
-            string_session,
-        ).get_secret_value()
+        encrypted_string_session = (
+            TelegramStringSessionCipher(settings.telegram_session_encryption_secret)
+            .encrypt(
+                string_session,
+            )
+            .get_secret_value()
+        )
     session.add(
         TelegramSession(
             name=name,
@@ -173,6 +221,10 @@ async def test_telethon_factory_passes_db_string_session_to_telegram_client(
     assert client.api_id == settings.telegram_api_id
     assert settings.telegram_api_hash is not None
     assert client.api_hash == settings.telegram_api_hash.get_secret_value()
+    assert client.request_retries == 2
+    assert client.connection_retries == 2
+    assert client.raise_last_call_error is True
+    assert client.auto_reconnect is False
     assert factory.max_requests_per_second == 2.5
 
     async with postgres_session_factory() as verify_session:
@@ -207,6 +259,38 @@ async def test_telethon_client_updates_limiter_from_loaded_db_session(
     _ = await client._get_client()
 
     assert client.rate_limiter._min_interval_seconds == 0.25
+
+
+async def test_telethon_factory_times_out_evicts_and_reconnects_with_fresh_client(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings().model_copy(update={"crawler_telegram_connect_timeout_seconds": 0.01})
+    await _insert_telegram_session(migrated_db_session, settings=settings)
+    import memexpert.crawlers.telegram.telethon_adapter as adapter_module
+
+    monkeypatch.setattr(adapter_module, "StringSession", _FakeStringSession)
+    monkeypatch.setattr(adapter_module, "TelegramClient", _FakeTelegramClient)
+    _FakeTelegramClient.connect_delay_seconds = 1.0
+    factory = TelethonClientFactory(
+        settings=settings,
+        session_name="primary",
+        session_factory=postgres_session_factory,
+    )
+
+    with pytest.raises(PipelineTelegramProviderUnavailableError, match="TimeoutError"):
+        _ = await factory.get_client()
+
+    first_client = _FakeTelegramClient.instances[0]
+    assert first_client.disconnected is True
+    assert factory._client is None  # noqa: SLF001 - verifies poisoned client eviction.
+
+    _FakeTelegramClient.connect_delay_seconds = 0.0
+    reconnected = await factory.get_client()
+
+    assert reconnected is _FakeTelegramClient.instances[1]
+    assert reconnected is not first_client
 
 
 async def test_telethon_factory_rejects_missing_or_unusable_db_session(
@@ -334,7 +418,10 @@ async def test_telethon_fetch_single_message_accepts_service_event(
     client = PipelineTelethonClient(
         factory=cast(
             "Any",
-            _FakeSingleMessageFactory(client=_FakeSingleMessageClient(message=service_message)),
+            _FakeSingleMessageFactory(
+                client=_FakeSingleMessageClient(message=service_message),
+                settings=_settings(),
+            ),
         ),
         rate_limiter=_RateLimiter(max_requests_per_second=10.0),
     )
@@ -349,3 +436,29 @@ async def test_telethon_fetch_single_message_accepts_service_event(
     assert normalized.message_id == "11"
     assert normalized.media_type == "unsupported"
     assert normalized.raw_payload is service_message
+
+
+async def test_telethon_exhausted_request_error_is_retryable_and_evicts_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    underlying_client = _FailingSingleMessageClient(
+        error=RuntimeError("Request was unsuccessful 6 time(s)"),
+    )
+    factory = _EvictingSingleMessageFactory(
+        client=underlying_client,
+        settings=_settings(),
+    )
+    client = PipelineTelethonClient(
+        factory=cast("Any", factory),
+        rate_limiter=_RateLimiter(max_requests_per_second=10.0),
+    )
+
+    async def _resolve_entity(_self: PipelineTelethonClient, _channel_id: str) -> _FakeChannel:
+        return _FakeChannel()
+
+    monkeypatch.setattr(PipelineTelethonClient, "_resolve_entity", _resolve_entity)
+
+    with pytest.raises(PipelineTelegramProviderUnavailableError, match="exhausted"):
+        _ = await client.fetch_single_message(channel_id="123", post_id="11")
+
+    assert factory.invalidated_clients == [underlying_client]

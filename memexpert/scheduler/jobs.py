@@ -18,7 +18,9 @@ from memexpert.services.meme_of_the_day import (
     meme_of_the_day_result_log_extra,
     run_scheduler_meme_of_the_day_refresh,
 )
+from memexpert.services.pipeline_reliability import PipelineCapacityPolicy, refresh_pipeline_capacity_states
 from memexpert.services.public_trends import refresh_public_trend_materialized_views
+from memexpert.services.recovery_runtime import run_recovery_dispatch_batch
 from memexpert.services.scheduler_batch_jobs import (
     run_scheduler_search_index_sync_batch,
     run_scheduler_seo_backlog_batch,
@@ -42,6 +44,8 @@ JOB_ID_MOTD = "motd"
 JOB_ID_SEARCH_INDEX_SYNC = "search-index-sync"
 JOB_ID_SEO_BACKLOG_BATCHES = "seo-backlog-batches"
 JOB_ID_RABBITMQ_OUTBOX_PUBLISHER = "rabbitmq-outbox-publisher"
+JOB_ID_RECOVERY_DISPATCH = "recovery-dispatch"
+JOB_ID_PIPELINE_CAPACITY_REFRESH = "pipeline-capacity-refresh"
 JOB_ID_TELEGRAM_LOGIN_CLEANUP = "telegram-login-cleanup"
 
 SchedulerJobAction = Callable[[], Awaitable[None]]
@@ -99,6 +103,20 @@ def build_scheduler_job_definitions(settings: Settings, engine: AsyncEngine) -> 
             action=_build_rabbitmq_outbox_publisher_job_action(settings, engine),
             enabled=settings.scheduler_rabbitmq_outbox_publisher_enabled,
             description="Publish durable RabbitMQ outbox messages.",
+        ),
+        SchedulerJobDefinition(
+            id=JOB_ID_RECOVERY_DISPATCH,
+            trigger_seconds=settings.scheduler_recovery_dispatch_interval_seconds,
+            action=_build_recovery_dispatch_job_action(settings, engine),
+            enabled=settings.scheduler_recovery_dispatch_enabled,
+            description="Dispatch and reconcile audited admin recovery work.",
+        ),
+        SchedulerJobDefinition(
+            id=JOB_ID_PIPELINE_CAPACITY_REFRESH,
+            trigger_seconds=settings.scheduler_pipeline_capacity_refresh_interval_seconds,
+            action=_build_pipeline_capacity_refresh_job_action(settings, engine),
+            enabled=settings.scheduler_pipeline_capacity_refresh_enabled,
+            description="Refresh hysteretic pipeline admission gates.",
         ),
         SchedulerJobDefinition(
             id=JOB_ID_TELEGRAM_LOGIN_CLEANUP,
@@ -213,6 +231,60 @@ def _build_rabbitmq_outbox_publisher_job_action(settings: Settings, engine: Asyn
     return _action
 
 
+def _build_recovery_dispatch_job_action(settings: Settings, engine: AsyncEngine) -> SchedulerJobAction:
+    async def _action() -> None:
+        session_factory = build_async_session_factory(engine)
+        result = await run_recovery_dispatch_batch(
+            session_factory,
+            settings=settings,
+            batch_size=settings.scheduler_recovery_dispatch_batch_size,
+        )
+        logger.info(
+            "scheduler_job_batch_result",
+            extra={
+                "event": "scheduler_job_batch_result",
+                "job_id": JOB_ID_RECOVERY_DISPATCH,
+                "status": "completed",
+                "degraded_mode": result.failed > 0,
+                "claimed": result.claimed,
+                "dispatched": result.dispatched,
+                "waiting_capacity": result.waiting_capacity,
+                "failed": result.failed,
+                "skipped_stale": result.skipped_stale,
+                "reclaimed": result.reclaimed,
+            },
+        )
+
+    return _action
+
+
+def _build_pipeline_capacity_refresh_job_action(settings: Settings, engine: AsyncEngine) -> SchedulerJobAction:
+    async def _action() -> None:
+        session_factory = build_async_session_factory(engine)
+        result = await refresh_pipeline_capacity_states(
+            session_factory,
+            policy=PipelineCapacityPolicy(
+                close_pending_count=settings.pipeline_capacity_close_pending_count,
+                reopen_pending_count=settings.pipeline_capacity_reopen_pending_count,
+                close_oldest_age_seconds=settings.pipeline_capacity_close_oldest_age_seconds,
+                reopen_oldest_age_seconds=settings.pipeline_capacity_reopen_oldest_age_seconds,
+            ),
+        )
+        logger.info(
+            "scheduler_job_batch_result",
+            extra={
+                "event": "scheduler_job_batch_result",
+                "job_id": JOB_ID_PIPELINE_CAPACITY_REFRESH,
+                "status": "completed",
+                "degraded_mode": bool(result.closed_stages),
+                "observed_stages": result.observed_stages,
+                "closed_stages": [stage.value for stage in result.closed_stages],
+            },
+        )
+
+    return _action
+
+
 def _build_telegram_login_cleanup_job_action(settings: Settings, engine: AsyncEngine) -> SchedulerJobAction:
     async def _action() -> None:
         session_factory = build_async_session_factory(engine)
@@ -240,7 +312,9 @@ def _build_telegram_login_cleanup_job_action(settings: Settings, engine: AsyncEn
 __all__ = [
     "JOB_ID_MATERIALIZED_VIEW_REFRESH",
     "JOB_ID_MOTD",
+    "JOB_ID_PIPELINE_CAPACITY_REFRESH",
     "JOB_ID_RABBITMQ_OUTBOX_PUBLISHER",
+    "JOB_ID_RECOVERY_DISPATCH",
     "JOB_ID_SEARCH_INDEX_SYNC",
     "JOB_ID_SEO_BACKLOG_BATCHES",
     "JOB_ID_SOURCE_ENGAGEMENT_CAPTURE",

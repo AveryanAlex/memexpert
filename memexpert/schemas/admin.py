@@ -39,6 +39,7 @@ from memexpert.models.enums import (
     ModerationReason,
     ModerationReportStatus,
     PipelineIngestRequestStatus,
+    RecoveryCapability,
     SourcePlatform,
     SyncTargetStatus,
     TelegramSessionStatus,
@@ -129,7 +130,17 @@ class AdminSourceChannelRead(ORMSchema):
     oldest_observed_post_id: str | None
     initial_catchup_completed: bool
     history_exhausted: bool
-    backfill_status: Literal["idle", "queued", "running", "failed"]
+    backfill_status: Literal[
+        "cancelled",
+        "completed",
+        "completed_with_failures",
+        "failed",
+        "idle",
+        "queued",
+        "running",
+        "waiting_capacity",
+        "waiting_retry",
+    ]
     backfill_requested_count: int
     backfill_scanned_count: int
     backfill_error: str | None
@@ -237,6 +248,10 @@ class AdminSourceChannelPostRead(BaseModel):
     qdrant_status: SyncTargetStatus | None
     meilisearch_status: SyncTargetStatus | None
     index_status: Literal["indexed", "partially_indexed", "processing", "failed", "not_indexable"]
+    is_retryable: bool = False
+    version: str
+    capabilities: list[RecoveryCapability] = Field(default_factory=list)
+    blocked_reason: str | None = None
 
 
 class AdminSourceChannelPostSummaryRead(BaseModel):

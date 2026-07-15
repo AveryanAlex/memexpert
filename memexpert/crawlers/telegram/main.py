@@ -14,6 +14,7 @@ from memexpert.core.config import get_settings
 from memexpert.core.database import build_async_engine, build_async_session_factory
 from memexpert.crawlers.telegram.log_config import configure_telegram_crawler_logging
 from memexpert.crawlers.telegram.manager import TelegramCrawlerReloadResult, TelegramSessionManager
+from memexpert.runtime_health import RuntimeHealthReporter
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -68,8 +69,6 @@ class TelegramCrawlerManagerLike(Protocol):
     async def reload(self) -> TelegramCrawlerReloadResult: ...
 
     async def retry_incomplete(self) -> TelegramCrawlerReloadResult: ...
-
-    async def process_backfill_jobs(self) -> int: ...
 
     async def shutdown(self) -> None: ...
 
@@ -219,6 +218,7 @@ async def run_telegram_crawler_runtime(
     session_factory: AsyncSessionFactory | None = None,
     manager: TelegramCrawlerManagerLike | None = None,
     signal_controller: TelegramCrawlerSignalControllerLike | None = None,
+    health_reporter: RuntimeHealthReporter | None = None,
 ) -> None:
     """Run catch-up once, start live listeners, then wait for process signals."""
 
@@ -230,6 +230,8 @@ async def run_telegram_crawler_runtime(
     controller: TelegramCrawlerSignalControllerLike | None = None
     control_monitor: _TelegramCrawlerControlMonitor | None = None
 
+    if health_reporter is not None:
+        await health_reporter.start()
     try:
         resolved_engine = engine or build_async_engine(resolved_settings.database_url)
         if manager is None:
@@ -270,6 +272,8 @@ async def run_telegram_crawler_runtime(
             },
         )
         logger.info("telegram_crawler_runtime_started", extra={"event": "telegram_crawler_runtime_started"})
+        if health_reporter is not None:
+            health_reporter.mark_ready()
 
         await _wait_for_control_signals(
             manager_instance,
@@ -293,6 +297,8 @@ async def run_telegram_crawler_runtime(
             if owns_engine and resolved_engine is not None:
                 await resolved_engine.dispose()
             logger.info("telegram_crawler_runtime_stopped", extra={"event": "telegram_crawler_runtime_stopped"})
+            if health_reporter is not None:
+                await health_reporter.stop()
 
 
 async def _await_operation_or_stop(
@@ -345,27 +351,30 @@ async def _wait_for_control_signals(
             observed_snapshot = reconcile_outcome.applied_configuration_snapshot
             if reconcile_outcome.full_reload_performed:
                 await control_monitor.discard_pending_reload_requests()
-            try:
-                processed_job_count = cast(
-                    "int",
-                    await _await_operation_or_stop(manager.process_backfill_jobs(), control_monitor),
-                )
-            except _CrawlerStopRequested:
-                return
-            except Exception:  # noqa: BLE001 - durable jobs remain available for a later polling tick.
-                logger.exception(
-                    "telegram_crawler_backfill_poll_failed",
-                    extra={"event": "telegram_crawler_backfill_poll_failed"},
-                )
-            else:
-                if processed_job_count:
-                    logger.info(
-                        "telegram_crawler_backfill_jobs_processed",
-                        extra={
-                            "event": "telegram_crawler_backfill_jobs_processed",
-                            "processed_job_count": processed_job_count,
-                        },
+            supervise_live_listeners = getattr(manager, "supervise_live_listeners", None)
+            if supervise_live_listeners is not None:
+                try:
+                    failed_listener_names = await _await_operation_or_stop(
+                        supervise_live_listeners(),
+                        control_monitor,
                     )
+                except _CrawlerStopRequested:
+                    return
+                except Exception:  # noqa: BLE001 - the next reconcile tick retries supervision.
+                    logger.exception(
+                        "telegram_live_listener_supervision_failed",
+                        extra={"event": "telegram_live_listener_supervision_failed"},
+                    )
+                else:
+                    if failed_listener_names:
+                        logger.warning(
+                            "telegram_live_listener_restart_failed",
+                            extra={
+                                "event": "telegram_live_listener_restart_failed",
+                                "failed_session_names": failed_listener_names,
+                                "retryable": True,
+                            },
+                        )
             continue
         if control_signal is TelegramCrawlerControlSignal.STOP:
             return
@@ -438,14 +447,10 @@ async def _reconcile_if_configuration_changed(
         )
 
     pending_configuration = (
-        applied_configuration_snapshot
-        if isinstance(applied_configuration_snapshot, _PendingConfiguration)
-        else None
+        applied_configuration_snapshot if isinstance(applied_configuration_snapshot, _PendingConfiguration) else None
     )
     pending_full_reload = (
-        applied_configuration_snapshot
-        if isinstance(applied_configuration_snapshot, _PendingFullReload)
-        else None
+        applied_configuration_snapshot if isinstance(applied_configuration_snapshot, _PendingFullReload) else None
     )
     if (
         pending_configuration is None
@@ -501,9 +506,7 @@ async def _reconcile_if_configuration_changed(
     )
     # Keep the snapshot captured before reconciliation. A concurrent admin
     # change will differ on the next poll and trigger another pass.
-    applied_snapshot = (
-        _PendingConfiguration(current_snapshot) if reload_result.retry_required else current_snapshot
-    )
+    applied_snapshot = _PendingConfiguration(current_snapshot) if reload_result.retry_required else current_snapshot
     return _CrawlerReconcileOutcome(
         applied_configuration_snapshot=applied_snapshot,
         full_reload_performed=not retry_incomplete,
@@ -513,7 +516,12 @@ async def _reconcile_if_configuration_changed(
 def main() -> None:
     """Run the Telegram crawler process."""
 
-    asyncio.run(run_telegram_crawler_runtime())
+    settings = get_settings()
+    health_reporter = RuntimeHealthReporter.from_settings(
+        settings,
+        service="memexpert-telegram-crawler",
+    )
+    asyncio.run(run_telegram_crawler_runtime(settings=settings, health_reporter=health_reporter))
 
 
 __all__ = [

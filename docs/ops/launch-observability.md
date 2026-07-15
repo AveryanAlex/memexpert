@@ -28,7 +28,7 @@ For Docker Compose-style staging stacks, follow the app container logs for each 
 ```sh
 docker compose logs -f api
 docker compose logs -f scheduler
-docker compose logs -f workers
+docker compose logs -f worker-media worker-ocr worker-enrichment worker-sync worker-telegram
 ```
 
 Useful safe search terms for plain-text log tools or hosted log search are:

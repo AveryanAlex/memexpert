@@ -22,7 +22,9 @@ from memexpert.models.enums import ContentKind, ContentLanguage
 from memexpert.scheduler.jobs import (
     JOB_ID_MATERIALIZED_VIEW_REFRESH,
     JOB_ID_MOTD,
+    JOB_ID_PIPELINE_CAPACITY_REFRESH,
     JOB_ID_RABBITMQ_OUTBOX_PUBLISHER,
+    JOB_ID_RECOVERY_DISPATCH,
     JOB_ID_SEARCH_INDEX_SYNC,
     JOB_ID_SEO_BACKLOG_BATCHES,
     JOB_ID_SOURCE_ENGAGEMENT_CAPTURE,
@@ -221,6 +223,8 @@ def test_scheduler_job_definitions_register_expected_ids() -> None:
         JOB_ID_SEARCH_INDEX_SYNC,
         JOB_ID_SEO_BACKLOG_BATCHES,
         JOB_ID_RABBITMQ_OUTBOX_PUBLISHER,
+        JOB_ID_RECOVERY_DISPATCH,
+        JOB_ID_PIPELINE_CAPACITY_REFRESH,
         JOB_ID_TELEGRAM_LOGIN_CLEANUP,
     ]
 
@@ -234,13 +238,14 @@ def test_enabled_scheduler_jobs_filters_disabled_jobs() -> None:
             "scheduler_search_index_sync_enabled": True,
             "scheduler_seo_backlog_batches_enabled": False,
             "scheduler_rabbitmq_outbox_publisher_enabled": False,
+            "scheduler_recovery_dispatch_enabled": False,
+            "scheduler_pipeline_capacity_refresh_enabled": False,
             "scheduler_telegram_login_cleanup_enabled": False,
         }
     )
 
     enabled_job_ids = [
-        definition.id
-        for definition in enabled_scheduler_jobs(settings, engine=cast("AsyncEngine", object()))
+        definition.id for definition in enabled_scheduler_jobs(settings, engine=cast("AsyncEngine", object()))
     ]
 
     assert enabled_job_ids == [JOB_ID_SOURCE_ENGAGEMENT_CAPTURE, JOB_ID_SEARCH_INDEX_SYNC]
@@ -601,7 +606,11 @@ async def test_telegram_login_cleanup_job_calls_batch_service_and_logs_result(
     monkeypatch.setattr("memexpert.scheduler.jobs.run_telegram_login_cleanup_batch", fake_cleanup)
     monkeypatch.setattr("memexpert.scheduler.jobs.logger.info", fake_info)
 
-    definition = build_scheduler_job_definitions(settings, engine=engine)[6]
+    definition = next(
+        definition
+        for definition in build_scheduler_job_definitions(settings, engine=engine)
+        if definition.id == JOB_ID_TELEGRAM_LOGIN_CLEANUP
+    )
     await definition.action()
 
     assert definition.id == JOB_ID_TELEGRAM_LOGIN_CLEANUP
@@ -706,6 +715,8 @@ async def test_scheduler_runtime_registers_enabled_jobs_and_shuts_down_gracefull
             "scheduler_search_index_sync_enabled": False,
             "scheduler_seo_backlog_batches_enabled": True,
             "scheduler_rabbitmq_outbox_publisher_enabled": False,
+            "scheduler_recovery_dispatch_enabled": False,
+            "scheduler_pipeline_capacity_refresh_enabled": False,
             "scheduler_advisory_lock_enabled": False,
         }
     )
@@ -746,6 +757,8 @@ async def test_scheduler_runtime_skips_disabled_jobs() -> None:
             "scheduler_search_index_sync_enabled": False,
             "scheduler_seo_backlog_batches_enabled": False,
             "scheduler_rabbitmq_outbox_publisher_enabled": False,
+            "scheduler_recovery_dispatch_enabled": False,
+            "scheduler_pipeline_capacity_refresh_enabled": False,
             "scheduler_telegram_login_cleanup_enabled": False,
             "scheduler_advisory_lock_enabled": False,
         }

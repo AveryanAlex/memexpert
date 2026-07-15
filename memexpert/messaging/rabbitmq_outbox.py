@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Protocol, cast
 
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 
 from memexpert.core.broker import ensure_pipeline_broker_started
@@ -157,8 +157,12 @@ class RabbitOutboxRelay:
         return await self._claim_query(
             select(RabbitMQOutboxMessage)
             .where(
-                RabbitMQOutboxMessage.status.in_(
-                    (RabbitMQOutboxMessageStatus.PENDING, RabbitMQOutboxMessageStatus.FAILED)
+                or_(
+                    RabbitMQOutboxMessage.status == RabbitMQOutboxMessageStatus.PENDING,
+                    and_(
+                        RabbitMQOutboxMessage.status == RabbitMQOutboxMessageStatus.FAILED,
+                        RabbitMQOutboxMessage.attempt_count < self._settings.pipeline_broker_retry_max_attempts,
+                    ),
                 ),
                 or_(
                     RabbitMQOutboxMessage.next_retry_at.is_(None),
@@ -205,8 +209,12 @@ class RabbitOutboxRelay:
             select(RabbitMQOutboxMessage)
             .where(
                 RabbitMQOutboxMessage.id.in_(message_ids),
-                RabbitMQOutboxMessage.status.in_(
-                    (RabbitMQOutboxMessageStatus.PENDING, RabbitMQOutboxMessageStatus.FAILED)
+                or_(
+                    RabbitMQOutboxMessage.status == RabbitMQOutboxMessageStatus.PENDING,
+                    and_(
+                        RabbitMQOutboxMessage.status == RabbitMQOutboxMessageStatus.FAILED,
+                        RabbitMQOutboxMessage.attempt_count < self._settings.pipeline_broker_retry_max_attempts,
+                    ),
                 ),
             )
             .order_by(RabbitMQOutboxMessage.created_at.asc(), RabbitMQOutboxMessage.id.asc())

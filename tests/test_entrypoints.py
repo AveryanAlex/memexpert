@@ -6,7 +6,7 @@ import inspect
 import tomllib
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from aiogram.types import BotCommandScopeAllPrivateChats
@@ -20,6 +20,7 @@ from memexpert.core.config import Settings
 from memexpert.crawlers.telegram.main import main as telegram_crawler_main
 from memexpert.scheduler.main import main as scheduler_main
 from memexpert.workers.main import main as workers_main
+from memexpert.workers.roles import WorkerRole
 from scripts.analytics import main as analytics_main
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -144,13 +145,17 @@ async def test_run_bot_command_registration_failure_logs_raises_and_skips_pollin
 
 
 def test_workers_main_runs_async_pipeline_runtime() -> None:
-    with patch("memexpert.workers.main.asyncio.run") as asyncio_run:
-        workers_main()
+    with (
+        patch("memexpert.workers.main.asyncio.run") as asyncio_run,
+        patch("memexpert.workers.main.run_pipeline_runtime", new_callable=AsyncMock) as run_pipeline_runtime,
+    ):
+        workers_main(["--role", "ocr"])
 
     asyncio_run.assert_called_once()
     coroutine = asyncio_run.call_args.args[0]
     assert inspect.iscoroutine(coroutine)
     coroutine.close()
+    run_pipeline_runtime.assert_called_once_with(role=WorkerRole.OCR)
 
 
 def test_scheduler_main_runs_async_scheduler_runtime() -> None:

@@ -7,12 +7,14 @@ import {
   backfillAdminSourceChannel,
   markSourceChannelDead as markSourceChannelDeadRequest,
   orphanAdminTelegramChannel,
+  replayAdminSourcePost,
+  resumeAdminSourceBackfill,
   reviewChannelSuggestion,
   setSourceChannelPaused,
   updateAdminTelegramChannel,
   validateAdminTelegramSession
 } from '$lib/api/client';
-import { apiRequest, readBoolean, readInt, readOptional, readRequired, requireConfirmation, runAction } from './actionUtils';
+import { apiRequest, readAuditReason, readBoolean, readInt, readOptional, readRequestId, readRequired, requireConfirmation, runAction } from './actionUtils';
 
 export async function reviewSuggestion({ fetch, request }: RequestEvent) {
   const data = await request.formData();
@@ -193,6 +195,47 @@ export async function backfillSourceChannel({ fetch, request }: RequestEvent) {
   });
 }
 
+export async function resumeSourceBackfill({ fetch, request }: RequestEvent) {
+  const data = await request.formData();
+  return runAction(async () => {
+    const result = await resumeAdminSourceBackfill(
+      {
+        ...apiRequest(fetch, request),
+        body: {
+          request_id: readRequestId(data),
+          version: readRequired(data, 'version'),
+          reason: readAuditReason(data)
+        }
+      },
+      readRequired(data, 'channel_id'),
+      readRequired(data, 'job_id')
+    );
+    return {
+      message: 'Failed backfill queued to resume from its durable cursor.',
+      recoveryJobId: result.id
+    };
+  });
+}
+
+export async function replaySourcePost({ fetch, request }: RequestEvent) {
+  const data = await request.formData();
+  return runAction(async () => {
+    const result = await replayAdminSourcePost(
+      {
+        ...apiRequest(fetch, request),
+        body: {
+          request_id: readRequestId(data),
+          version: readRequired(data, 'version'),
+          reason: readAuditReason(data)
+        }
+      },
+      readRequired(data, 'channel_id'),
+      readRequired(data, 'post_id')
+    );
+    return { message: 'Telegram post replay queued.', recoveryJobId: result.id };
+  });
+}
+
 export const sourceActions = {
   reviewSuggestion,
   addSourceByReference,
@@ -203,5 +246,7 @@ export const sourceActions = {
   assignSourceChannel,
   orphanSourceChannel,
   validateSourceAccount,
-  backfillSourceChannel
+  backfillSourceChannel,
+  resumeSourceBackfill,
+  replaySourcePost
 };

@@ -9,6 +9,7 @@ describe('/admin overview page', () => {
 
     expect(body).toContain('What needs attention?');
     expect(body).toContain('Open reports');
+    expect(body).toContain('Recovery work');
     expect(body).toContain('Sources need attention');
     expect(body).toContain('Telegram accounts need attention');
     expect(body).toContain('Missing SEO');
@@ -17,6 +18,7 @@ describe('/admin overview page', () => {
     expect(body).toContain('1 waiting · 5 healthy');
     expect(body).toContain('6 ready');
     expect(body).toContain('href="/admin/moderation"');
+    expect(body).toContain('href="/admin/recovery"');
     expect(body).toContain('href="/admin/sources"');
     expect(body).toContain('href="/admin/telegram"');
     expect(body).toContain('href="/admin/content/seo"');
@@ -56,6 +58,12 @@ function pageData(): PageData {
       missing_seo_count: 9,
       uncurated_template_count: 10
     },
+    recovery: {
+      retryable_count: 11,
+      blocked_count: 2,
+      stuck_count: 3,
+      dead_lettered_count: 4
+    },
     loadError: null
-  } as PageData;
+  } as unknown as PageData;
 }

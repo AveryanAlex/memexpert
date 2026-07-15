@@ -91,6 +91,7 @@ from memexpert.models.enums import (
     SyncTargetStatus,
     TelegramSessionStatus,
 )
+from memexpert.models.operations import PipelineStageAttempt
 from memexpert.models.user import User
 from memexpert.pipeline.events import (
     SourceEngagementCaptureRequestedEvent,
@@ -141,6 +142,7 @@ from memexpert.workers.pipeline_runtime.stages.ocr import run_ocr_stage
 from memexpert.workers.pipeline_runtime.stages.sync_meili import run_sync_meili_stage
 from memexpert.workers.pipeline_runtime.stages.sync_qdrant import run_sync_qdrant_stage
 from memexpert.workers.pipeline_runtime.stages.transcode import run_transcode_stage
+from memexpert.workers.roles import WorkerRole
 
 if TYPE_CHECKING:
     from aio_pika.abc import HeadersType
@@ -148,6 +150,8 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
     from memexpert.core.search_index_prefilter import SearchIndexPrefilter
+
+
 @dataclass(slots=True)
 class StoredObject:
     body: bytes
@@ -844,9 +848,13 @@ async def test_pipeline_runtime_declares_explicit_retry_and_dlx_topology() -> No
     subscriber_channels = [cast("Any", subscriber).channel for subscriber in broker.subscribers]
 
     assert len(subscriber_channels) == 9
-    assert all(channel is subscriber_channels[0] for channel in subscriber_channels)
-    assert subscriber_channels[0].prefetch_count == 3
-    assert subscriber_channels[0].global_qos is False
+    assert len({id(channel) for channel in subscriber_channels}) == 9
+    assert all(channel.prefetch_count == 3 for channel in subscriber_channels)
+    assert all(channel.global_qos is False for channel in subscriber_channels)
+    assert all(
+        cast("Any", subscriber).consume_args == WorkerRole.ALL.consumer_arguments()
+        for subscriber in broker.subscribers
+    )
 
     declared_exchanges: list[str] = []
     declared_queue_arguments: dict[str, dict[str, object] | None] = {}
@@ -901,10 +909,9 @@ async def test_pipeline_runtime_declares_explicit_retry_and_dlx_topology() -> No
     for session_key in (session_a_key, session_b_key):
         queue_name = runtime.broker_settings.source_engagement_capture_queue_for_session(session_key)
         assert source_engagement_queue_arguments[queue_name]["x-single-active-consumer"] is True
-        assert (
-            source_engagement_queue_arguments[queue_name]["x-dead-letter-routing-key"]
-            == runtime.broker_settings.source_engagement_capture_retry_request_routing_key_for_session(session_key)
-        )
+        assert source_engagement_queue_arguments[queue_name][
+            "x-dead-letter-routing-key"
+        ] == runtime.broker_settings.source_engagement_capture_retry_request_routing_key_for_session(session_key)
     assert transcode_queue_arguments["x-dead-letter-routing-key"] == runtime.broker_settings.retry_routing_key
     assert ocr_queue_arguments["x-dead-letter-routing-key"] == runtime.broker_settings.ocr_retry_request_routing_key
     assert media_inspect_retry_queue_arguments["x-message-ttl"] == runtime.broker_settings.retry_backoff_milliseconds
@@ -1280,12 +1287,19 @@ async def test_pipeline_runtime_source_engagement_flood_wait_parks_session_and_a
 async def test_pipeline_runtime_media_inspect_handler_dead_letters_malformed_payload() -> None:
     settings = Settings()
     broker = build_pipeline_broker(settings)
+    durable_dead_letters: list[dict[str, object]] = []
+
+    async def record_dead_letter(**kwargs: object) -> uuid.UUID:
+        durable_dead_letters.append(dict(kwargs))
+        return uuid.uuid7()
+
     runtime = build_pipeline_runtime(
         settings=settings,
         broker=broker,
         storage_client=FakeStorageClient(),
         media_processor=FakeMediaProcessor(inspect_result=None),
         ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key="unused")),
+        dead_letter_recorder=record_dead_letter,
     )
     dead_letters: list[Any] = []
 
@@ -1315,6 +1329,15 @@ async def test_pipeline_runtime_media_inspect_handler_dead_letters_malformed_pay
     assert message.ack_count == 1
     assert message.reject_calls == []
     assert message.nack_calls == []
+    assert durable_dead_letters == [
+        {
+            "session_factory": runtime.session_factory,
+            "payload": json.dumps({"bad": "payload"}, sort_keys=True),
+            "headers": {},
+            "broker_message_id": "bad-media-inspect",
+            "normalized_reason": PIPELINE_REASON_MALFORMED_EVENT,
+        }
+    ]
     assert dead_letters == [
         {
             "payload": json.dumps({"bad": "payload"}, sort_keys=True),
@@ -1586,6 +1609,56 @@ async def test_pipeline_runtime_ocr_success_persists_fallback_result_and_dispatc
     assert persisted_ocr.low_confidence is True
     assert persisted_ocr.confidence == pytest.approx(0.41)
     assert persisted_ocr.source_object_key == _web_video_key(normalized)
+
+
+async def test_pipeline_runtime_duplicate_successful_event_acks_without_reexecuting_provider(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    storage_client = FakeStorageClient()
+    broker = RecordingBroker()
+    meme_file_id, ocr_event, normalized = await _seed_ocr_pending_item(
+        migrated_db_session,
+        storage_client=storage_client,
+        broker=broker,
+    )
+    downstream_broker = PublishingBroker()
+    ocr_processor = FakeOCRProcessor(result=build_ocr_result(source_object_key=_web_video_key(normalized)))
+    runtime = build_pipeline_runtime(
+        settings=Settings(),
+        broker=cast("Any", downstream_broker),
+        session_factory=postgres_session_factory,
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(normalize_result=normalized),
+        ocr_processor=ocr_processor,
+    )
+    payload = ocr_event.model_dump(mode="json")
+    first_message = FakeRabbitMessage(message_id=str(ocr_event.event_id))
+    duplicate_message = FakeRabbitMessage(message_id=str(ocr_event.event_id))
+
+    await runtime.handle_ocr_message(payload, first_message)
+    await runtime.handle_ocr_message(payload, duplicate_message)
+
+    assert first_message.ack_count == 1
+    assert duplicate_message.ack_count == 1
+    assert len(ocr_processor.calls) == 1
+    assert len(downstream_broker.publish_calls) == 1
+    async with postgres_session_factory() as session:
+        attempts = (
+            (
+                await session.execute(
+                    select(PipelineStageAttempt).where(
+                        PipelineStageAttempt.meme_file_id == meme_file_id,
+                        PipelineStageAttempt.stage == ContentPipelineStage.OCR,
+                        PipelineStageAttempt.event_id == ocr_event.event_id,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert len(attempts) == 1
+    assert attempts[0].outcome.value == "succeeded"
 
 
 async def test_pipeline_runtime_ocr_static_image_uses_original_object_and_original_mime(
@@ -1889,8 +1962,7 @@ async def _seed_embed_pending_item(
         (
             event
             for event in reversed(broker.events[initial_event_count:])
-            if event.meme_file_id == item.meme_file_id
-            and event.stage is ContentPipelineStage.EMBED
+            if event.meme_file_id == item.meme_file_id and event.stage is ContentPipelineStage.EMBED
         ),
         None,
     )
@@ -1956,11 +2028,7 @@ async def _seed_sync_qdrant_pending_item(
         event_id=uuid.uuid7(),
         classification_result=build_classification_result(),
     )
-    sync_qdrant_event = next(
-        event
-        for event in broker.events
-        if event.stage is ContentPipelineStage.SYNC_QDRANT
-    )
+    sync_qdrant_event = next(event for event in broker.events if event.stage is ContentPipelineStage.SYNC_QDRANT)
     return meme_file_id, sync_qdrant_event, normalized
 
 
@@ -1995,11 +2063,7 @@ async def _seed_sync_meili_pending_item(
         event_id=uuid.uuid7(),
         classification_result=build_classification_result(),
     )
-    sync_meili_event = next(
-        event
-        for event in broker.events
-        if event.stage is ContentPipelineStage.SYNC_MEILI
-    )
+    sync_meili_event = next(event for event in broker.events if event.stage is ContentPipelineStage.SYNC_MEILI)
     return meme_file_id, sync_meili_event, normalized
 
 
@@ -2326,9 +2390,7 @@ async def test_pipeline_runtime_embed_merge_transaction_failure_keeps_stage_repl
             embedding_result=build_voyage_embedding_result(input_hash="2" * 64),
             similarity_matches=(),
         )
-        older_file_row = await stash_session.scalar(
-            select(MemeFile).where(MemeFile.id == older_meme_file_id)
-        )
+        older_file_row = await stash_session.scalar(select(MemeFile).where(MemeFile.id == older_meme_file_id))
         assert older_file_row is not None
         older_meme_id = older_file_row.meme_id
 
@@ -2336,24 +2398,26 @@ async def test_pipeline_runtime_embed_merge_transaction_failure_keeps_stage_repl
     # should remain unchanged after the merge rollback on the newer file.
     async with postgres_session_factory() as baseline_session:
         baseline_files = (
-            await baseline_session.execute(select(MemeFile).where(MemeFile.meme_id == older_meme_id))
-        ).scalars().all()
+            (await baseline_session.execute(select(MemeFile).where(MemeFile.meme_id == older_meme_id))).scalars().all()
+        )
         baseline_file_ids = {row.id for row in baseline_files}
         baseline_sources = (
-            await baseline_session.execute(
-                select(MemeSource).where(MemeSource.file_id.in_(baseline_file_ids))
-            )
-        ).scalars().all()
-        baseline_merge_logs = (
-            await baseline_session.execute(select(MemeMergeLog))
-        ).scalars().all()
+            (await baseline_session.execute(select(MemeSource).where(MemeSource.file_id.in_(baseline_file_ids))))
+            .scalars()
+            .all()
+        )
+        baseline_merge_logs = (await baseline_session.execute(select(MemeMergeLog))).scalars().all()
         baseline_source_snapshot_ids = (
-            await baseline_session.execute(
-                select(MemeSourceEngagementSnapshot.id).where(
-                    MemeSourceEngagementSnapshot.meme_source_id.in_([source.id for source in baseline_sources])
+            (
+                await baseline_session.execute(
+                    select(MemeSourceEngagementSnapshot.id).where(
+                        MemeSourceEngagementSnapshot.meme_source_id.in_([source.id for source in baseline_sources])
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
 
     newer_broker = RecordingBroker()
     newer_meme_file_id, embed_event, newer_normalized = await _seed_embed_pending_item(
@@ -2416,31 +2480,37 @@ async def test_pipeline_runtime_embed_merge_transaction_failure_keeps_stage_repl
     # sources, no merge-log emitted, source engagement rows untouched.
     async with postgres_session_factory() as verify_session:
         post_files = (
-            await verify_session.execute(select(MemeFile).where(MemeFile.meme_id == older_meme_id))
-        ).scalars().all()
+            (await verify_session.execute(select(MemeFile).where(MemeFile.meme_id == older_meme_id))).scalars().all()
+        )
         post_file_ids = {row.id for row in post_files}
         post_sources = (
-            await verify_session.execute(
-                select(MemeSource).where(MemeSource.file_id.in_(post_file_ids))
-            )
-        ).scalars().all()
-        post_merge_logs = (
-            await verify_session.execute(select(MemeMergeLog))
-        ).scalars().all()
+            (await verify_session.execute(select(MemeSource).where(MemeSource.file_id.in_(post_file_ids))))
+            .scalars()
+            .all()
+        )
+        post_merge_logs = (await verify_session.execute(select(MemeMergeLog))).scalars().all()
         post_source_snapshot_ids = (
-            await verify_session.execute(
-                select(MemeSourceEngagementSnapshot.id).where(
-                    MemeSourceEngagementSnapshot.meme_source_id.in_([source.id for source in post_sources])
+            (
+                await verify_session.execute(
+                    select(MemeSourceEngagementSnapshot.id).where(
+                        MemeSourceEngagementSnapshot.meme_source_id.in_([source.id for source in post_sources])
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         # The embed cache row for the newer file must have been rolled back so
         # a replay starts from a clean durable state.
         post_cache_rows = (
-            await verify_session.execute(
-                select(EmbeddingCache).where(EmbeddingCache.source_file_id == newer_meme_file_id)
+            (
+                await verify_session.execute(
+                    select(EmbeddingCache).where(EmbeddingCache.source_file_id == newer_meme_file_id)
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
 
     assert post_file_ids == baseline_file_ids
     assert {row.id for row in post_sources} == {row.id for row in baseline_sources}
@@ -3146,9 +3216,7 @@ async def test_pipeline_runtime_sync_qdrant_forced_failure_knob_marks_stage_repl
         source_id="sync-qdrant-forced",
         post_id="8714",
     )
-    failing_settings = Settings.model_validate(
-        {"pipeline_worker_fail_sync_qdrant_for_meme_file_id": str(meme_file_id)}
-    )
+    failing_settings = Settings.model_validate({"pipeline_worker_fail_sync_qdrant_for_meme_file_id": str(meme_file_id)})
     runtime = build_pipeline_runtime(
         settings=failing_settings,
         broker=build_pipeline_broker(failing_settings),
@@ -3643,9 +3711,7 @@ async def test_pipeline_runtime_sync_meili_forced_failure_knob_marks_stage_repla
         source_id="sync-meili-forced",
         post_id="8814",
     )
-    failing_settings = Settings.model_validate(
-        {"pipeline_worker_fail_sync_meili_for_meme_file_id": str(meme_file_id)}
-    )
+    failing_settings = Settings.model_validate({"pipeline_worker_fail_sync_meili_for_meme_file_id": str(meme_file_id)})
     runtime = build_pipeline_runtime(
         settings=failing_settings,
         broker=build_pipeline_broker(failing_settings),
@@ -3708,16 +3774,16 @@ async def test_classify_completion_fans_out_both_sync_stages_and_publishes_both_
                         PipelineStageJournal.meme_file_id == meme_file_id,
                     )
                 )
-            ).scalars().all()
+            )
+            .scalars()
+            .all()
         }
     assert ContentPipelineStage.SYNC_QDRANT in stage_values
     assert ContentPipelineStage.SYNC_MEILI in stage_values
 
     # Both MEME_READY dispatches were published exactly once.
     meme_ready_stages = {
-        event.stage
-        for event in broker.events
-        if event.event_type is ContentPipelineEventType.MEME_READY
+        event.stage for event in broker.events if event.event_type is ContentPipelineEventType.MEME_READY
     }
     assert meme_ready_stages == {
         ContentPipelineStage.SYNC_QDRANT,
@@ -3774,16 +3840,22 @@ async def test_classify_completion_fan_out_publish_failure_commits_stage_rows_an
                         ),
                     )
                 )
-            ).scalars().all()
+            )
+            .scalars()
+            .all()
         }
         outbox_rows = (
-            await session.execute(
-                select(RabbitMQOutboxMessage).where(
-                    RabbitMQOutboxMessage.aggregate_id == str(meme_file_id),
-                    RabbitMQOutboxMessage.event_type == ContentPipelineEventType.MEME_READY.value,
+            (
+                await session.execute(
+                    select(RabbitMQOutboxMessage).where(
+                        RabbitMQOutboxMessage.aggregate_id == str(meme_file_id),
+                        RabbitMQOutboxMessage.event_type == ContentPipelineEventType.MEME_READY.value,
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
 
     assert stage_rows[ContentPipelineStage.CLASSIFY].status is ContentPipelineStageStatus.SUCCEEDED
     assert stage_rows[ContentPipelineStage.SYNC_QDRANT].status is ContentPipelineStageStatus.PENDING

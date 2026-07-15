@@ -99,6 +99,8 @@ class CrawlerCatchupReport(BaseModel):
     messages_ingested: StrictInt = Field(default=0, ge=0)
     messages_skipped_unsupported: StrictInt = Field(default=0, ge=0)
     messages_skipped_dedup: StrictInt = Field(default=0, ge=0)
+    messages_quarantined: StrictInt = Field(default=0, ge=0)
+    retryable_failure_post_id: str | None = None
     started_at: datetime
     finished_at: datetime
     errors: tuple[str, ...] = ()
@@ -112,6 +114,8 @@ class _CatchupCounters:
     ingested: int = 0
     skipped_unsupported: int = 0
     skipped_dedup: int = 0
+    quarantined: int = 0
+    retryable_failure_post_id: str | None = None
     errors: list[str] = field(default_factory=list)
 
     def record_error(self, message: str) -> None:
@@ -264,6 +268,8 @@ class TelegramCrawlerRuntime:
             messages_ingested=counters.ingested,
             messages_skipped_unsupported=counters.skipped_unsupported,
             messages_skipped_dedup=counters.skipped_dedup,
+            messages_quarantined=counters.quarantined,
+            retryable_failure_post_id=counters.retryable_failure_post_id,
             started_at=started_at,
             finished_at=utcnow(),
             errors=tuple(counters.errors),
@@ -355,6 +361,8 @@ class TelegramCrawlerRuntime:
             messages_ingested=counters.ingested,
             messages_skipped_unsupported=counters.skipped_unsupported,
             messages_skipped_dedup=counters.skipped_dedup,
+            messages_quarantined=counters.quarantined,
+            retryable_failure_post_id=counters.retryable_failure_post_id,
             started_at=started_at,
             finished_at=utcnow(),
             errors=tuple(counters.errors),
@@ -441,7 +449,7 @@ class TelegramCrawlerRuntime:
             task.cancel()
             try:
                 await asyncio.shield(asyncio.wait_for(task, timeout=5.0))
-            except (TimeoutError, asyncio.CancelledError):
+            except TimeoutError, asyncio.CancelledError:
                 # Cancellation is expected; the task finishing late is
                 # not an error the caller needs to see. Log at debug
                 # level so operators can still find it in the worker logs.
@@ -550,6 +558,7 @@ class TelegramCrawlerRuntime:
                     post_row,
                     error_code=type(exc).__name__,
                     error_text=str(exc),
+                    retryable=True,
                 )
                 await self._commit_runtime_state()
                 raise
@@ -643,13 +652,16 @@ class TelegramCrawlerRuntime:
                 post_row = await self._observe_post(
                     channel_row,
                     raw_message,
-                    advance_history_cursor=advance_history_cursor,
+                    advance_history_cursor=False,
                 )
                 if raw_message.media_type == "unsupported":
                     counters.skipped_unsupported += 1
                     self._mark_post_unsupported(post_row)
                     if advance_checkpoint:
                         self._advance_forward_checkpoint(channel_row, raw_message.message_id)
+                    if advance_history_cursor:
+                        self._advance_history_cursor(channel_row, raw_message.message_id)
+                    await self._commit_runtime_state()
                     continue
                 await self._ingest_single_message(
                     counters=counters,
@@ -658,6 +670,18 @@ class TelegramCrawlerRuntime:
                     post_row=post_row,
                     advance_checkpoint=advance_checkpoint,
                 )
+                if advance_history_cursor:
+                    if post_row.status is SourceChannelPostStatus.FAILED:
+                        if post_row.is_retryable and post_row.attempt_count < 3:
+                            counters.retryable_failure_post_id = raw_message.message_id
+                            await self._commit_runtime_state()
+                            return False
+                        post_row.quarantined_at = utcnow()
+                        counters.quarantined += 1
+                        if advance_checkpoint:
+                            self._advance_forward_checkpoint(channel_row, raw_message.message_id)
+                    self._advance_history_cursor(channel_row, raw_message.message_id)
+                await self._commit_runtime_state()
         except PipelineTelegramFloodWaitError as exc:
             counters.record_error(f"flood_wait:{exc.wait_seconds}s")
             self._park_session_on_flood_wait(
@@ -716,6 +740,7 @@ class TelegramCrawlerRuntime:
                 post_row,
                 error_code="flood_wait",
                 error_text=str(exc),
+                retryable=True,
             )
             raise
         except PipelineTelegramProviderUnavailableError as exc:
@@ -726,9 +751,8 @@ class TelegramCrawlerRuntime:
                 post_row,
                 error_code="download_unavailable",
                 error_text=str(exc),
+                retryable=True,
             )
-            if advance_checkpoint:
-                self._advance_forward_checkpoint(channel_row, raw_message.message_id)
             return
         except PipelineTelegramMalformedMessageError as exc:
             counters.record_error(
@@ -739,6 +763,7 @@ class TelegramCrawlerRuntime:
                 post_row,
                 error_code="download_malformed",
                 error_text=str(exc),
+                retryable=False,
             )
             if advance_checkpoint:
                 self._advance_forward_checkpoint(channel_row, raw_message.message_id)
@@ -758,6 +783,7 @@ class TelegramCrawlerRuntime:
                 post_row,
                 error_code="mapper_malformed",
                 error_text=str(exc),
+                retryable=False,
             )
             if advance_checkpoint:
                 self._advance_forward_checkpoint(channel_row, raw_message.message_id)
@@ -783,6 +809,7 @@ class TelegramCrawlerRuntime:
                 post_row,
                 error_code=type(exc).__name__,
                 error_text=str(exc),
+                retryable=True,
             )
             raise
         self._tally_ingest_outcome(counters, ingest_result)
@@ -831,6 +858,8 @@ class TelegramCrawlerRuntime:
                 last_error_code=None,
                 last_error_text=None,
                 attempt_count=1,
+                is_retryable=False,
+                last_attempt_at=fetched_at,
                 created_at=fetched_at,
                 updated_at=fetched_at,
             )
@@ -843,6 +872,10 @@ class TelegramCrawlerRuntime:
                     "last_error_code": None,
                     "last_error_text": None,
                     "attempt_count": SourceChannelPost.attempt_count + 1,
+                    "is_retryable": False,
+                    "next_attempt_at": None,
+                    "last_attempt_at": fetched_at,
+                    "quarantined_at": None,
                     "updated_at": fetched_at,
                 },
             )
@@ -880,10 +913,21 @@ class TelegramCrawlerRuntime:
             channel_row.last_read_post_id = post_id
 
     @staticmethod
+    def _advance_history_cursor(channel_row: SourceChannel, post_id: str) -> None:
+        if (
+            channel_row.history_cursor_post_id is None
+            or compare_telegram_post_ids(post_id, channel_row.history_cursor_post_id) < 0
+        ):
+            channel_row.history_cursor_post_id = post_id
+
+    @staticmethod
     def _mark_post_accepted(post_row: SourceChannelPost) -> None:
         post_row.status = SourceChannelPostStatus.ACCEPTED
         post_row.last_error_code = None
         post_row.last_error_text = None
+        post_row.is_retryable = False
+        post_row.next_attempt_at = None
+        post_row.quarantined_at = None
 
     @classmethod
     def _mark_post_for_ingest_outcome(
@@ -902,6 +946,7 @@ class TelegramCrawlerRuntime:
                 post_row,
                 error_code="channel_paused",
                 error_text="The source channel was paused while this post was being ingested.",
+                retryable=True,
             )
             return
         cls._mark_post_accepted(post_row)
@@ -916,6 +961,9 @@ class TelegramCrawlerRuntime:
         post_row.status = SourceChannelPostStatus.UNSUPPORTED
         post_row.last_error_code = None if error_code is None else error_code[:128]
         post_row.last_error_text = None if error_text is None else error_text[:4000]
+        post_row.is_retryable = False
+        post_row.next_attempt_at = None
+        post_row.quarantined_at = None
 
     @staticmethod
     def _mark_post_failed(
@@ -923,10 +971,19 @@ class TelegramCrawlerRuntime:
         *,
         error_code: str,
         error_text: str,
+        retryable: bool,
     ) -> None:
         post_row.status = SourceChannelPostStatus.FAILED
         post_row.last_error_code = error_code[:128]
         post_row.last_error_text = error_text[:4000]
+        post_row.is_retryable = retryable
+        attempted_at = utcnow()
+        post_row.last_attempt_at = attempted_at
+        post_row.next_attempt_at = (
+            attempted_at + timedelta(seconds=min(300.0, 5.0 * 2 ** max(post_row.attempt_count - 1, 0)))
+            if retryable
+            else None
+        )
 
     @staticmethod
     def _tally_ingest_outcome(
@@ -1119,8 +1176,7 @@ class TelegramCrawlerRuntime:
         """Return the active channel ids owned by this session."""
 
         result = await self.session.execute(
-            select(SourceChannel)
-            .where(
+            select(SourceChannel).where(
                 SourceChannel.platform == SourcePlatform.TELEGRAM,
                 SourceChannel.is_active.is_(True),
                 SourceChannel.is_paused.is_(False),
@@ -1143,7 +1199,7 @@ class TelegramCrawlerRuntime:
         telegram_session.status = TelegramSessionStatus.FLOOD_WAIT
         telegram_session.flood_wait_until = utcnow() + timedelta(seconds=wait_seconds)
         telegram_session.last_error_class = error_class
-        telegram_session.last_error_text = error_text[: 4000]
+        telegram_session.last_error_text = error_text[:4000]
 
     async def _quarantine_session(
         self,
@@ -1158,7 +1214,7 @@ class TelegramCrawlerRuntime:
         telegram_session.status = TelegramSessionStatus.QUARANTINED
         telegram_session.quarantined_at = now
         telegram_session.last_error_class = error_class
-        telegram_session.last_error_text = error_text[: 4000]
+        telegram_session.last_error_text = error_text[:4000]
         await self._commit_runtime_state()
 
     async def _mark_session_auth_required(
@@ -1202,9 +1258,7 @@ class TelegramCrawlerRuntime:
         """Return the durable session row for ``session_name`` or raise."""
 
         result = await self.session.execute(
-            select(TelegramSession)
-            .where(TelegramSession.name == session_name)
-            .limit(1)
+            select(TelegramSession).where(TelegramSession.name == session_name).limit(1)
         )
         existing = result.scalar_one_or_none()
         if existing is not None:

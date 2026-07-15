@@ -19,6 +19,7 @@ from sqlalchemy import and_, func, or_, select
 from memexpert.crawlers.telegram.client import (
     PipelineTelegramClientProtocol,
     PipelineTelegramFloodWaitError,
+    PipelineTelegramProviderUnavailableError,
     PipelineTelegramSessionAuthRequiredError,
     PipelineTelegramSessionBannedError,
     PipelineTelegramSessionNotRunnableError,
@@ -27,8 +28,16 @@ from memexpert.crawlers.telegram.runtime import CrawlerCatchupReport, TelegramCr
 from memexpert.ingest.crawler_service import PipelineCrawlerIngestService
 from memexpert.models.base import utcnow
 from memexpert.models.content import SourceChannel, SourceChannelBackfillJob, TelegramSession
-from memexpert.models.enums import SourceChannelBackfillJobStatus, SourcePlatform, TelegramSessionStatus
+from memexpert.models.enums import (
+    RecoveryJobItemStatus,
+    RecoveryWorkKind,
+    SourceChannelBackfillJobStatus,
+    SourcePlatform,
+    TelegramSessionStatus,
+)
+from memexpert.models.operations import RecoveryJobItem, SourceChannelBackfillAttempt
 from memexpert.services.errors import CrawlerSessionNotRunnableError
+from memexpert.services.pipeline_reliability import is_historical_admission_open
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -82,6 +91,8 @@ _NON_RETRYABLE_CATCHUP_ERROR_PREFIXES = (
 )
 _BACKFILL_LOCK_TIMEOUT = timedelta(minutes=5)
 _BACKFILL_PAGE_SIZE = 100
+_BACKFILL_MAX_AUTOMATIC_ATTEMPTS = 5
+_BACKFILL_RETRY_BASE_SECONDS = 30.0
 
 
 @dataclass(slots=True)
@@ -183,7 +194,7 @@ class TelegramSessionManager:
                 raise
             except Exception as exc:  # noqa: BLE001 - persist terminal operator-visible job failure.
                 await db_session.rollback()
-                await self._fail_backfill_job(job_id, str(exc))
+                await self._handle_backfill_exception(job_id, exc)
                 logger.exception("Telegram older-history backfill job %s failed.", job_id)
             return 1
 
@@ -272,6 +283,39 @@ class TelegramSessionManager:
                 failed_session_names.append(session_state.name)
                 await self.invalidate_session(session_id=session_state.id)
         return failed_session_names
+
+    async def supervise_live_listeners(self) -> tuple[str, ...]:
+        """Observe terminated listener tasks and restart only their accounts.
+
+        Listener tasks are intentionally account-scoped.  A provider failure
+        therefore invalidates and reconnects that session without disturbing
+        healthy listeners, and the process control loop can call this method
+        on every reconciliation tick even when DB configuration is unchanged.
+        """
+
+        for session_id, handle in tuple(self._live_handles.items()):
+            task = handle.runtime._live_tasks.get(  # noqa: SLF001 - manager owns runtime lifecycle.
+                handle.session_name,
+            )
+            if task is None or not task.done():
+                continue
+            task_error: BaseException | None = None
+            if not task.cancelled():
+                task_error = task.exception()
+            log = logger.error if task_error is not None else logger.warning
+            log(
+                "telegram_live_listener_terminated",
+                extra={
+                    "event": "telegram_live_listener_terminated",
+                    "session_name": handle.session_name,
+                    "error_class": type(task_error).__name__ if task_error is not None else None,
+                    "retryable": True,
+                },
+                exc_info=(type(task_error), task_error, task_error.__traceback__) if task_error is not None else None,
+            )
+            await self.invalidate_session(session_id=session_id)
+
+        return tuple(await self.start_live_all())
 
     async def start_live_session(self, session_name: str) -> None:
         """Start the live listener for one runnable live-enabled session."""
@@ -457,7 +501,7 @@ class TelegramSessionManager:
         self,
         db_session: AsyncSession,
     ) -> SourceChannelBackfillJob | None:
-        """Lease one queued job or one running job whose previous lease expired."""
+        """Lease one due time slice, fencing stale owners and capacity-paused work."""
 
         now = utcnow()
         stale_before = now - _BACKFILL_LOCK_TIMEOUT
@@ -466,6 +510,14 @@ class TelegramSessionManager:
             .where(
                 or_(
                     SourceChannelBackfillJob.status == SourceChannelBackfillJobStatus.QUEUED,
+                    and_(
+                        SourceChannelBackfillJob.status == SourceChannelBackfillJobStatus.WAITING_RETRY,
+                        or_(
+                            SourceChannelBackfillJob.next_attempt_at.is_(None),
+                            SourceChannelBackfillJob.next_attempt_at <= now,
+                        ),
+                    ),
+                    SourceChannelBackfillJob.status == SourceChannelBackfillJobStatus.WAITING_CAPACITY,
                     and_(
                         SourceChannelBackfillJob.status == SourceChannelBackfillJobStatus.RUNNING,
                         or_(
@@ -481,10 +533,54 @@ class TelegramSessionManager:
         )
         if job is None:
             return None
+        if not await is_historical_admission_open(db_session):
+            job.status = SourceChannelBackfillJobStatus.WAITING_CAPACITY
+            job.is_retryable = True
+            job.next_attempt_at = now + timedelta(seconds=15)
+            job.locked_at = None
+            job.lock_owner = None
+            await db_session.commit()
+            return None
+
+        open_attempt = await db_session.scalar(
+            select(SourceChannelBackfillAttempt).where(
+                SourceChannelBackfillAttempt.backfill_job_id == job.id,
+                SourceChannelBackfillAttempt.finished_at.is_(None),
+            )
+        )
+        job.lease_generation += 1
+        if open_attempt is None:
+            job.attempt_count += 1
+            recovery_item_id = await db_session.scalar(
+                select(RecoveryJobItem.id)
+                .where(
+                    RecoveryJobItem.work_kind == RecoveryWorkKind.BACKFILL,
+                    RecoveryJobItem.work_id == str(job.id),
+                    RecoveryJobItem.status == RecoveryJobItemStatus.DISPATCHED,
+                )
+                .order_by(RecoveryJobItem.dispatched_at.desc())
+                .limit(1)
+            )
+            source_channel = await db_session.get(SourceChannel, job.source_channel_id)
+            db_session.add(
+                SourceChannelBackfillAttempt(
+                    backfill_job_id=job.id,
+                    attempt_number=job.attempt_count,
+                    lease_generation=job.lease_generation,
+                    telegram_session_id=(source_channel.telegram_session_id if source_channel is not None else None),
+                    recovery_item_id=recovery_item_id,
+                    worker_instance_id=self._backfill_worker_id,
+                    started_at=now,
+                )
+            )
         job.status = SourceChannelBackfillJobStatus.RUNNING
         job.started_at = job.started_at or now
         job.locked_at = now
         job.lock_owner = self._backfill_worker_id
+        job.is_retryable = False
+        job.next_attempt_at = None
+        job.last_error_code = None
+        job.last_error_class = None
         job.last_error_text = None
         await db_session.commit()
         return job
@@ -494,7 +590,7 @@ class TelegramSessionManager:
         db_session: AsyncSession,
         job: SourceChannelBackfillJob,
     ) -> None:
-        """Process a leased job in bounded durable pages without touching listeners."""
+        """Process exactly one bounded page and release the lease for fair scheduling."""
 
         channel = await db_session.get(SourceChannel, job.source_channel_id)
         if channel is None:
@@ -518,62 +614,208 @@ class TelegramSessionManager:
 
         client = await self._get_cached_client(session_state)
         runtime = self._build_runtime(db_session=db_session, telegram_client=client)
-        while job.scanned_message_count < job.requested_message_count:
-            remaining = job.requested_message_count - job.scanned_message_count
-            page_limit = min(
-                remaining,
-                channel.catchup_message_limit,
-                self.settings.crawler_default_catchup_message_limit,
-                _BACKFILL_PAGE_SIZE,
-            )
-            report = await runtime.catch_up_older_channel(
-                session_state.name,
-                channel.platform_id,
-                # The channel cursor is updated by the runtime's per-message
-                # commits. Prefer it over a possibly stale job cursor after a
-                # process crash; at worst the job over-fetches one 100-message
-                # page instead of silently skipping that page.
-                before_post_id=channel.history_cursor_post_id or job.cursor_post_id,
-                limit=page_limit,
-            )
-            await db_session.refresh(channel)
-            await db_session.refresh(job)
-            job.scanned_message_count += report.messages_scanned
-            job.cursor_post_id = channel.history_cursor_post_id
-            job.locked_at = utcnow()
-            job.lock_owner = self._backfill_worker_id
-            if report.errors:
-                job.status = SourceChannelBackfillJobStatus.FAILED
-                job.last_error_text = "; ".join(report.errors)[:4000]
-                job.completed_at = utcnow()
-                job.locked_at = None
-                job.lock_owner = None
-                await db_session.commit()
-                return
-            if report.messages_scanned < page_limit or channel.history_exhausted:
-                break
-            await db_session.commit()
+        remaining = job.requested_message_count - job.scanned_message_count
+        if remaining <= 0:
+            await self._complete_backfill_job(db_session, job)
+            return
+        page_limit = min(
+            remaining,
+            channel.catchup_message_limit,
+            self.settings.crawler_default_catchup_message_limit,
+            _BACKFILL_PAGE_SIZE,
+        )
+        claimed_generation = job.lease_generation
+        report = await runtime.catch_up_older_channel(
+            session_state.name,
+            channel.platform_id,
+            before_post_id=channel.history_cursor_post_id or job.cursor_post_id,
+            limit=page_limit,
+        )
+        await db_session.refresh(channel)
+        await db_session.refresh(job)
+        if job.lease_generation != claimed_generation or job.lock_owner != self._backfill_worker_id:
+            raise RuntimeError(f"Backfill job {job.id} lease changed while its page was running.")
 
-        job.status = SourceChannelBackfillJobStatus.COMPLETED
-        job.completed_at = utcnow()
+        retrying_post = report.retryable_failure_post_id is not None
+        durable_scanned = max(report.messages_scanned - int(retrying_post), 0)
+        job.scanned_message_count = min(
+            job.requested_message_count,
+            job.scanned_message_count + durable_scanned,
+        )
+        job.quarantined_message_count = min(
+            job.scanned_message_count,
+            job.quarantined_message_count + report.messages_quarantined,
+        )
+        job.cursor_post_id = channel.history_cursor_post_id
+        if durable_scanned:
+            job.last_progress_at = utcnow()
+
+        if retrying_post:
+            await self._schedule_backfill_retry(
+                db_session,
+                job,
+                error_code="source_post_retry_pending",
+                error_class="PipelineTelegramProviderUnavailableError",
+                error_text="; ".join(report.errors) or "Telegram source post needs another attempt.",
+                failed_post_id=report.retryable_failure_post_id,
+            )
+            return
+
+        fatal_errors = tuple(error for error in report.errors if not _is_quarantined_post_error(error))
+        if fatal_errors:
+            await self._schedule_backfill_retry(
+                db_session,
+                job,
+                error_code=_backfill_error_code(fatal_errors[0]),
+                error_class="TelegramBackfillPageError",
+                error_text="; ".join(fatal_errors),
+            )
+            return
+
+        page_exhausted = report.messages_scanned < page_limit or channel.history_exhausted
+        requested_complete = job.scanned_message_count >= job.requested_message_count
+        if page_exhausted or requested_complete:
+            await self._complete_backfill_job(db_session, job)
+            return
+
+        job.status = SourceChannelBackfillJobStatus.QUEUED
         job.locked_at = None
         job.lock_owner = None
-        job.last_error_text = None
+        job.next_attempt_at = None
         await db_session.commit()
 
-    async def _fail_backfill_job(self, job_id: uuid.UUID, error_text: str) -> None:
-        """Persist a terminal failure after the processing session rolled back."""
+    async def _handle_backfill_exception(self, job_id: uuid.UUID, exc: Exception) -> None:
+        """Classify one failed time slice into bounded automatic or operator recovery."""
 
+        manual_only = isinstance(
+            exc,
+            (
+                PipelineTelegramSessionAuthRequiredError,
+                PipelineTelegramSessionBannedError,
+                CrawlerSessionNotRunnableError,
+            ),
+        )
         async with self.session_factory() as db_session:
-            job = await db_session.get(SourceChannelBackfillJob, job_id)
+            job = await db_session.get(SourceChannelBackfillJob, job_id, with_for_update=True)
             if job is None:
                 return
-            job.status = SourceChannelBackfillJobStatus.FAILED
-            job.last_error_text = error_text[:4000]
-            job.completed_at = utcnow()
-            job.locked_at = None
-            job.lock_owner = None
-            await db_session.commit()
+            await self._schedule_backfill_retry(
+                db_session,
+                job,
+                error_code=_backfill_exception_code(exc),
+                error_class=type(exc).__name__,
+                error_text=str(exc) or type(exc).__name__,
+                manual_only=manual_only,
+            )
+
+    async def _schedule_backfill_retry(
+        self,
+        db_session: AsyncSession,
+        job: SourceChannelBackfillJob,
+        *,
+        error_code: str,
+        error_class: str,
+        error_text: str,
+        failed_post_id: str | None = None,
+        manual_only: bool = False,
+    ) -> None:
+        now = utcnow()
+        exhausted = job.attempt_count >= _BACKFILL_MAX_AUTOMATIC_ATTEMPTS
+        job.status = (
+            SourceChannelBackfillJobStatus.FAILED
+            if manual_only or exhausted
+            else SourceChannelBackfillJobStatus.WAITING_RETRY
+        )
+        job.last_error_code = error_code[:128]
+        job.last_error_class = error_class[:128]
+        job.last_error_text = error_text[:4000]
+        job.failed_post_id = failed_post_id
+        job.is_retryable = True
+        job.next_attempt_at = (
+            None
+            if manual_only or exhausted
+            else now
+            + timedelta(
+                seconds=min(
+                    300.0,
+                    _BACKFILL_RETRY_BASE_SECONDS * 2 ** max(job.attempt_count - 1, 0),
+                )
+            )
+        )
+        job.completed_at = now if job.status is SourceChannelBackfillJobStatus.FAILED else None
+        job.locked_at = None
+        job.lock_owner = None
+        await self._finish_open_backfill_attempt(
+            db_session,
+            job,
+            normalized_reason=job.last_error_code,
+            error_class=job.last_error_class,
+            error_text=job.last_error_text,
+            failed_post_id=failed_post_id,
+            is_retryable=True,
+        )
+        await db_session.commit()
+
+    async def _complete_backfill_job(
+        self,
+        db_session: AsyncSession,
+        job: SourceChannelBackfillJob,
+    ) -> None:
+        job.status = (
+            SourceChannelBackfillJobStatus.COMPLETED_WITH_FAILURES
+            if job.quarantined_message_count
+            else SourceChannelBackfillJobStatus.COMPLETED
+        )
+        job.completed_at = utcnow()
+        job.last_progress_at = job.completed_at
+        job.locked_at = None
+        job.lock_owner = None
+        job.last_error_code = None
+        job.last_error_class = None
+        job.last_error_text = None
+        job.failed_post_id = None
+        job.is_retryable = False
+        job.next_attempt_at = None
+        await self._finish_open_backfill_attempt(
+            db_session,
+            job,
+            normalized_reason=None,
+            error_class=None,
+            error_text=None,
+            failed_post_id=None,
+            is_retryable=False,
+        )
+        await db_session.commit()
+
+    @staticmethod
+    async def _finish_open_backfill_attempt(
+        db_session: AsyncSession,
+        job: SourceChannelBackfillJob,
+        *,
+        normalized_reason: str | None,
+        error_class: str | None,
+        error_text: str | None,
+        failed_post_id: str | None,
+        is_retryable: bool,
+    ) -> None:
+        attempt = await db_session.scalar(
+            select(SourceChannelBackfillAttempt)
+            .where(
+                SourceChannelBackfillAttempt.backfill_job_id == job.id,
+                SourceChannelBackfillAttempt.finished_at.is_(None),
+            )
+            .order_by(SourceChannelBackfillAttempt.attempt_number.desc())
+            .with_for_update()
+            .limit(1)
+        )
+        if attempt is None:
+            return
+        attempt.normalized_reason = normalized_reason
+        attempt.error_class = error_class
+        attempt.safe_error_text = error_text
+        attempt.failed_post_id = failed_post_id
+        attempt.is_retryable = is_retryable
+        attempt.finished_at = utcnow()
 
     async def _requeue_backfill_job(self, job_id: uuid.UUID) -> None:
         """Release an in-flight lease during graceful crawler shutdown."""
@@ -655,9 +897,7 @@ class TelegramSessionManager:
         workload: str,
     ) -> TelegramSession:
         session_state = await db_session.scalar(
-            select(TelegramSession)
-            .where(TelegramSession.name == session_name)
-            .limit(1),
+            select(TelegramSession).where(TelegramSession.name == session_name).limit(1),
         )
         if session_state is None:
             raise CrawlerSessionNotRunnableError(f"Telegram session {session_name!r} does not exist.")
@@ -727,8 +967,7 @@ class TelegramSessionManager:
         if session_state.status is TelegramSessionStatus.FLOOD_WAIT:
             return True
         return bool(
-            session_state.flood_wait_until is not None
-            and self._as_utc(session_state.flood_wait_until) > utcnow()
+            session_state.flood_wait_until is not None and self._as_utc(session_state.flood_wait_until) > utcnow()
         )
 
     def _remaining_flood_wait_seconds(self, session_state: TelegramSession) -> int:
@@ -861,6 +1100,29 @@ class TelegramSessionManager:
         if inspect.isawaitable(value):
             return cast("PipelineTelegramClientProtocol", await value)
         return value
+
+
+def _is_quarantined_post_error(error: str) -> bool:
+    return error.startswith(("download_unavailable:", "download_malformed:", "mapper_malformed:"))
+
+
+def _backfill_error_code(error: str) -> str:
+    prefix = error.partition(":")[0].strip().lower().replace(" ", "_")
+    return (prefix or "telegram_backfill_page_failed")[:128]
+
+
+def _backfill_exception_code(exc: Exception) -> str:
+    if isinstance(exc, PipelineTelegramFloodWaitError):
+        return "telegram_flood_wait"
+    if isinstance(exc, PipelineTelegramProviderUnavailableError):
+        return "telegram_provider_unavailable"
+    if isinstance(exc, PipelineTelegramSessionAuthRequiredError):
+        return "telegram_session_auth_required"
+    if isinstance(exc, PipelineTelegramSessionBannedError):
+        return "telegram_session_banned"
+    if isinstance(exc, CrawlerSessionNotRunnableError):
+        return "telegram_source_or_session_not_runnable"
+    return type(exc).__name__[:128]
 
 
 __all__ = [

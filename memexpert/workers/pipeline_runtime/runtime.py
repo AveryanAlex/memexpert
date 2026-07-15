@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import logging
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -28,6 +31,13 @@ from memexpert.pipeline.events import MediaInspectRequestedEvent, SourceEngageme
 from memexpert.pipeline.stage_completion import PipelineStageCompletionService
 from memexpert.schemas.content_pipeline import ContentPipelineDispatchEvent
 from memexpert.services import PipelineIngestError
+from memexpert.services.pipeline_reliability import (
+    DEPENDENCY_BY_STAGE,
+    DependencyCircuitOpenError,
+    acquire_dependency_circuit,
+    record_dependency_failure,
+    record_dependency_success,
+)
 from memexpert.services.source_engagement_capture import (
     SourceEngagementTelegramClientFactory,
     capture_source_engagement_request,
@@ -49,13 +59,28 @@ from memexpert.workers.pipeline_runtime.errors import (
 from memexpert.workers.pipeline_runtime.stage_registry import get_stage_handler
 from memexpert.workers.pipeline_runtime.stages.context import PipelineStageHandlerContext
 from memexpert.workers.pipeline_runtime.stages.media_inspect import run_media_inspect_stage
+from memexpert.workers.roles import WorkerRole
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from memexpert.crawlers.telegram.manager import TelegramSessionManager
     from memexpert.media.contracts import PipelineMediaProcessorProtocol
+    from memexpert.runtime_health import RuntimeHealthReporter
     from memexpert.workers.pipeline_runtime.stages.context import ObjectStorageClientLike
+
+type WorkerBackgroundRunner = Callable[[Settings, asyncio.Event], Awaitable[None]]
+type DeadLetterRecorder = Callable[..., Awaitable[uuid.UUID]]
+
+logger = logging.getLogger(__name__)
+
+_OCR_CANARY_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAIAAAAAwCAIAAABWluXpAAAAeElEQVR42u3bMQrAIBBFwfyQ+195PYFCLFaQea2g4KBgY"
+    "arq0bleWwAAgAAAEAAAAgBAvX2zgSR/51o8qi+bbXstJ8AVJAAABACAAAAQAAAABACAAAAQAAACAEAAAAgAAAEAIAAABODm4puqE"
+    "wBAAAAIAAABAKDeBuQAElucUbrxAAAAAElFTkSuQmCC"
+)
 
 
 class RabbitMessageLike(Protocol):
@@ -76,6 +101,7 @@ class RabbitMessageLike(Protocol):
 class PipelineRuntime:
     """RabbitMQ-backed runtime that consumes the real heavy-worker pipeline stages."""
 
+    role: WorkerRole
     settings: Settings
     broker: RabbitBroker
     session_factory: AsyncSessionFactory
@@ -110,7 +136,9 @@ class PipelineRuntime:
     classification_client: ClassificationClientProtocol
     source_engagement_telegram_client_factory: SourceEngagementTelegramClientFactory
     source_engagement_close_telegram_client_after_capture: bool
+    dead_letter_recorder: DeadLetterRecorder
     source_engagement_telegram_session_manager: TelegramSessionManager | None = None
+    health_reporter: RuntimeHealthReporter | None = None
 
     async def declare_topology(self) -> None:
         """Declare the heavy-worker queues, retry queues, and DLQ topology explicitly."""
@@ -118,26 +146,84 @@ class PipelineRuntime:
         exchange = await self.broker.declare_exchange(self.pipeline_exchange)
         retry_exchange = await self.broker.declare_exchange(self.retry_exchange)
         dead_letter_exchange = await self.broker.declare_exchange(self.dead_letter_exchange)
-        media_inspect_queue = await self.broker.declare_queue(self.media_inspect_queue)
-        source_engagement_capture_queues = [
-            await self.broker.declare_queue(queue) for queue in self.source_engagement_capture_queues
-        ]
-        transcode_queue = await self.broker.declare_queue(self.transcode_queue)
-        ocr_queue = await self.broker.declare_queue(self.ocr_queue)
-        embed_queue = await self.broker.declare_queue(self.embed_queue)
-        classify_queue = await self.broker.declare_queue(self.classify_queue)
-        sync_qdrant_queue = await self.broker.declare_queue(self.sync_qdrant_queue)
-        sync_meili_queue = await self.broker.declare_queue(self.sync_meili_queue)
-        media_inspect_retry_queue = await self.broker.declare_queue(self.media_inspect_retry_queue)
-        source_engagement_capture_retry_queues = [
-            await self.broker.declare_queue(queue) for queue in self.source_engagement_capture_retry_queues
-        ]
-        transcode_retry_queue = await self.broker.declare_queue(self.transcode_retry_queue)
-        ocr_retry_queue = await self.broker.declare_queue(self.ocr_retry_queue)
-        embed_retry_queue = await self.broker.declare_queue(self.embed_retry_queue)
-        classify_retry_queue = await self.broker.declare_queue(self.classify_retry_queue)
-        sync_qdrant_retry_queue = await self.broker.declare_queue(self.sync_qdrant_retry_queue)
-        sync_meili_retry_queue = await self.broker.declare_queue(self.sync_meili_retry_queue)
+        media_inspect_queue = (
+            await self.broker.declare_queue(self.media_inspect_queue) if self.role.consumes_media_inspect else None
+        )
+        source_engagement_capture_queues = (
+            [await self.broker.declare_queue(queue) for queue in self.source_engagement_capture_queues]
+            if self.role.consumes_source_engagement
+            else []
+        )
+        transcode_queue = (
+            await self.broker.declare_queue(self.transcode_queue)
+            if self.role.consumes_stage(ContentPipelineStage.TRANSCODE)
+            else None
+        )
+        ocr_queue = (
+            await self.broker.declare_queue(self.ocr_queue)
+            if self.role.consumes_stage(ContentPipelineStage.OCR)
+            else None
+        )
+        embed_queue = (
+            await self.broker.declare_queue(self.embed_queue)
+            if self.role.consumes_stage(ContentPipelineStage.EMBED)
+            else None
+        )
+        classify_queue = (
+            await self.broker.declare_queue(self.classify_queue)
+            if self.role.consumes_stage(ContentPipelineStage.CLASSIFY)
+            else None
+        )
+        sync_qdrant_queue = (
+            await self.broker.declare_queue(self.sync_qdrant_queue)
+            if self.role.consumes_stage(ContentPipelineStage.SYNC_QDRANT)
+            else None
+        )
+        sync_meili_queue = (
+            await self.broker.declare_queue(self.sync_meili_queue)
+            if self.role.consumes_stage(ContentPipelineStage.SYNC_MEILI)
+            else None
+        )
+        media_inspect_retry_queue = (
+            await self.broker.declare_queue(self.media_inspect_retry_queue)
+            if self.role.consumes_media_inspect
+            else None
+        )
+        source_engagement_capture_retry_queues = (
+            [await self.broker.declare_queue(queue) for queue in self.source_engagement_capture_retry_queues]
+            if self.role.consumes_source_engagement
+            else []
+        )
+        transcode_retry_queue = (
+            await self.broker.declare_queue(self.transcode_retry_queue)
+            if self.role.consumes_stage(ContentPipelineStage.TRANSCODE)
+            else None
+        )
+        ocr_retry_queue = (
+            await self.broker.declare_queue(self.ocr_retry_queue)
+            if self.role.consumes_stage(ContentPipelineStage.OCR)
+            else None
+        )
+        embed_retry_queue = (
+            await self.broker.declare_queue(self.embed_retry_queue)
+            if self.role.consumes_stage(ContentPipelineStage.EMBED)
+            else None
+        )
+        classify_retry_queue = (
+            await self.broker.declare_queue(self.classify_retry_queue)
+            if self.role.consumes_stage(ContentPipelineStage.CLASSIFY)
+            else None
+        )
+        sync_qdrant_retry_queue = (
+            await self.broker.declare_queue(self.sync_qdrant_retry_queue)
+            if self.role.consumes_stage(ContentPipelineStage.SYNC_QDRANT)
+            else None
+        )
+        sync_meili_retry_queue = (
+            await self.broker.declare_queue(self.sync_meili_retry_queue)
+            if self.role.consumes_stage(ContentPipelineStage.SYNC_MEILI)
+            else None
+        )
         dead_letter_queue = await self.broker.declare_queue(self.dead_letter_queue)
 
         embed_retry_return_routing_key = self.broker_settings.retry_return_routing_key_for_stage(
@@ -165,8 +251,12 @@ class PipelineRuntime:
             ContentPipelineStage.SYNC_MEILI,
         )
 
-        _ = await media_inspect_queue.bind(exchange, routing_key=self.broker_settings.media_inspect_routing_key)
-        _ = await media_inspect_queue.bind(exchange, routing_key=self.broker_settings.media_inspect_retry_routing_key)
+        if media_inspect_queue is not None:
+            _ = await media_inspect_queue.bind(exchange, routing_key=self.broker_settings.media_inspect_routing_key)
+            _ = await media_inspect_queue.bind(
+                exchange,
+                routing_key=self.broker_settings.media_inspect_retry_routing_key,
+            )
         for source_engagement_capture_queue in source_engagement_capture_queues:
             session_key = self._source_engagement_session_key_for_queue(source_engagement_capture_queue.name)
             _ = await source_engagement_capture_queue.bind(
@@ -177,23 +267,30 @@ class PipelineRuntime:
                 exchange,
                 routing_key=self.broker_settings.source_engagement_capture_retry_routing_key_for_session(session_key),
             )
-        _ = await transcode_queue.bind(exchange, routing_key=self.broker_settings.meme_created_routing_key)
-        _ = await transcode_queue.bind(exchange, routing_key=self.broker_settings.stage_replay_routing_key)
-        _ = await transcode_queue.bind(exchange, routing_key=self.broker_settings.transcode_retry_routing_key)
-        _ = await ocr_queue.bind(exchange, routing_key=self.broker_settings.ocr_routing_key)
-        _ = await ocr_queue.bind(exchange, routing_key=self.broker_settings.ocr_retry_routing_key)
-        _ = await embed_queue.bind(exchange, routing_key=self.broker_settings.embed_routing_key)
-        _ = await embed_queue.bind(exchange, routing_key=embed_retry_return_routing_key)
-        _ = await classify_queue.bind(exchange, routing_key=self.broker_settings.classify_routing_key)
-        _ = await classify_queue.bind(exchange, routing_key=classify_retry_return_routing_key)
-        _ = await sync_qdrant_queue.bind(exchange, routing_key=self.broker_settings.sync_qdrant_routing_key)
-        _ = await sync_qdrant_queue.bind(exchange, routing_key=sync_qdrant_retry_return_routing_key)
-        _ = await sync_meili_queue.bind(exchange, routing_key=self.broker_settings.sync_meili_routing_key)
-        _ = await sync_meili_queue.bind(exchange, routing_key=sync_meili_retry_return_routing_key)
-        _ = await media_inspect_retry_queue.bind(
-            retry_exchange,
-            routing_key=self.broker_settings.media_inspect_retry_request_routing_key,
-        )
+        if transcode_queue is not None:
+            _ = await transcode_queue.bind(exchange, routing_key=self.broker_settings.meme_created_routing_key)
+            _ = await transcode_queue.bind(exchange, routing_key=self.broker_settings.stage_replay_routing_key)
+            _ = await transcode_queue.bind(exchange, routing_key=self.broker_settings.transcode_retry_routing_key)
+        if ocr_queue is not None:
+            _ = await ocr_queue.bind(exchange, routing_key=self.broker_settings.ocr_routing_key)
+            _ = await ocr_queue.bind(exchange, routing_key=self.broker_settings.ocr_retry_routing_key)
+        if embed_queue is not None:
+            _ = await embed_queue.bind(exchange, routing_key=self.broker_settings.embed_routing_key)
+            _ = await embed_queue.bind(exchange, routing_key=embed_retry_return_routing_key)
+        if classify_queue is not None:
+            _ = await classify_queue.bind(exchange, routing_key=self.broker_settings.classify_routing_key)
+            _ = await classify_queue.bind(exchange, routing_key=classify_retry_return_routing_key)
+        if sync_qdrant_queue is not None:
+            _ = await sync_qdrant_queue.bind(exchange, routing_key=self.broker_settings.sync_qdrant_routing_key)
+            _ = await sync_qdrant_queue.bind(exchange, routing_key=sync_qdrant_retry_return_routing_key)
+        if sync_meili_queue is not None:
+            _ = await sync_meili_queue.bind(exchange, routing_key=self.broker_settings.sync_meili_routing_key)
+            _ = await sync_meili_queue.bind(exchange, routing_key=sync_meili_retry_return_routing_key)
+        if media_inspect_retry_queue is not None:
+            _ = await media_inspect_retry_queue.bind(
+                retry_exchange,
+                routing_key=self.broker_settings.media_inspect_retry_request_routing_key,
+            )
         for source_engagement_capture_retry_queue in source_engagement_capture_retry_queues:
             session_key = self._source_engagement_session_key_for_retry_queue(
                 source_engagement_capture_retry_queue.name,
@@ -204,12 +301,21 @@ class PipelineRuntime:
                     session_key,
                 ),
             )
-        _ = await transcode_retry_queue.bind(retry_exchange, routing_key=self.broker_settings.retry_routing_key)
-        _ = await ocr_retry_queue.bind(retry_exchange, routing_key=self.broker_settings.ocr_retry_request_routing_key)
-        _ = await embed_retry_queue.bind(retry_exchange, routing_key=embed_retry_request_routing_key)
-        _ = await classify_retry_queue.bind(retry_exchange, routing_key=classify_retry_request_routing_key)
-        _ = await sync_qdrant_retry_queue.bind(retry_exchange, routing_key=sync_qdrant_retry_request_routing_key)
-        _ = await sync_meili_retry_queue.bind(retry_exchange, routing_key=sync_meili_retry_request_routing_key)
+        if transcode_retry_queue is not None:
+            _ = await transcode_retry_queue.bind(retry_exchange, routing_key=self.broker_settings.retry_routing_key)
+        if ocr_retry_queue is not None:
+            _ = await ocr_retry_queue.bind(
+                retry_exchange,
+                routing_key=self.broker_settings.ocr_retry_request_routing_key,
+            )
+        if embed_retry_queue is not None:
+            _ = await embed_retry_queue.bind(retry_exchange, routing_key=embed_retry_request_routing_key)
+        if classify_retry_queue is not None:
+            _ = await classify_retry_queue.bind(retry_exchange, routing_key=classify_retry_request_routing_key)
+        if sync_qdrant_retry_queue is not None:
+            _ = await sync_qdrant_retry_queue.bind(retry_exchange, routing_key=sync_qdrant_retry_request_routing_key)
+        if sync_meili_retry_queue is not None:
+            _ = await sync_meili_retry_queue.bind(retry_exchange, routing_key=sync_meili_retry_request_routing_key)
         _ = await dead_letter_queue.bind(
             dead_letter_exchange,
             routing_key=self.broker_settings.dead_letter_routing_key,
@@ -361,8 +467,7 @@ class PipelineRuntime:
                 attempt=effective_attempt,
                 normalized_reason=PIPELINE_REASON_UNSUPPORTED_STAGE,
                 last_error_text=(
-                    f"The runtime handler for {expected_stage.value!r} received "
-                    f"{dispatch_event.stage.value!r}."
+                    f"The runtime handler for {expected_stage.value!r} received {dispatch_event.stage.value!r}."
                 ),
                 retryable=False,
             )
@@ -373,6 +478,7 @@ class PipelineRuntime:
             )
             return
 
+        dependency = DEPENDENCY_BY_STAGE.get(dispatch_event.stage)
         try:
             stage_context = await self._start_stage_processing(
                 meme_file_id=dispatch_event.meme_file_id,
@@ -380,14 +486,51 @@ class PipelineRuntime:
                 attempt=effective_attempt,
                 event_id=dispatch_event.event_id,
             )
+            if stage_context is None:
+                await message.ack()
+                return
+            if dependency is not None:
+                await acquire_dependency_circuit(
+                    self.session_factory,
+                    dependency=dependency,
+                    owner=self._circuit_owner(),
+                )
             await self._run_stage_for(
                 dispatch_event=dispatch_event,
                 stage_context=stage_context,
                 attempt=effective_attempt,
             )
+            if dependency is not None:
+                try:
+                    await record_dependency_success(self.session_factory, dependency=dependency)
+                except Exception:
+                    logger.exception(
+                        "pipeline_dependency_circuit_success_record_failed",
+                        extra={
+                            "event": "pipeline_dependency_circuit_success_record_failed",
+                            "dependency": dependency,
+                        },
+                    )
         except Exception as exc:
             normalized_reason = normalize_failure_reason(expected_stage, exc)
             retryable = is_replayable_failure(expected_stage, exc)
+            if dependency is not None and retryable and not isinstance(exc, DependencyCircuitOpenError):
+                try:
+                    await record_dependency_failure(
+                        self.session_factory,
+                        dependency=dependency,
+                        error=exc,
+                        failure_threshold=self.settings.pipeline_circuit_failure_threshold,
+                        cooldown_seconds=self.settings.pipeline_circuit_cooldown_seconds,
+                    )
+                except Exception:
+                    logger.exception(
+                        "pipeline_dependency_circuit_failure_record_failed",
+                        extra={
+                            "event": "pipeline_dependency_circuit_failure_record_failed",
+                            "dependency": dependency,
+                        },
+                    )
             await self._mark_stage_failed(
                 meme_file_id=dispatch_event.meme_file_id,
                 stage=dispatch_event.stage,
@@ -455,7 +598,7 @@ class PipelineRuntime:
         stage: ContentPipelineStage,
         attempt: int,
         event_id: uuid.UUID,
-    ) -> PipelineStageWorkContext:
+    ) -> PipelineStageWorkContext | None:
         async with self.session_factory() as session:
             service = self._build_stage_completion_service(session)
             return await service.start_stage_processing(
@@ -476,42 +619,105 @@ class PipelineRuntime:
         last_error_text: str,
         retryable: bool,
     ) -> None:
-        try:
-            async with self.session_factory() as session:
-                service = self._build_stage_completion_service(session)
-                await service.mark_stage_failed(
-                    meme_file_id=meme_file_id,
-                    stage=stage,
-                    attempt=attempt,
-                    event_id=event_id,
-                    normalized_reason=normalized_reason,
-                    last_error_text=last_error_text,
-                    retryable=retryable,
-                )
-        except Exception:
-            return
+        async with self.session_factory() as session:
+            service = self._build_stage_completion_service(session)
+            await service.mark_stage_failed(
+                meme_file_id=meme_file_id,
+                stage=stage,
+                attempt=attempt,
+                event_id=event_id,
+                normalized_reason=normalized_reason,
+                last_error_text=last_error_text,
+                retryable=retryable,
+            )
 
     def _build_stage_completion_service(self, session: AsyncSession) -> PipelineStageCompletionService:
         return PipelineStageCompletionService(
             session,
             settings=self.settings,
             broker=self.broker,
+            worker_role=self.role.value,
+            worker_instance_id=(self.health_reporter.boot_id if self.health_reporter is not None else None),
         )
 
-    async def run(self, *, stop_event: asyncio.Event | None = None) -> None:
+    def _circuit_owner(self) -> str:
+        instance_id = self.health_reporter.boot_id if self.health_reporter is not None else str(id(self))
+        return f"{self.role.value}:{instance_id}"
+
+    @asynccontextmanager
+    async def operation(
+        self,
+        name: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> AsyncIterator[None]:
+        """Track one bounded subscriber operation when health reporting is enabled."""
+
+        if self.health_reporter is None:
+            yield
+            return
+        async with self.health_reporter.operation(name, timeout_seconds=timeout_seconds):
+            yield
+
+    async def verify_readiness(self) -> None:
+        """Run role-specific startup canaries before the process reports ready."""
+
+        if not self.role.needs_ocr:
+            return
+        async with self.operation(
+            "ocr_startup_canary",
+            timeout_seconds=self.settings.pipeline_ocr_timeout_seconds,
+        ):
+            _ = await self.ocr_processor.extract_text(
+                filename="runtime-health-canary.png",
+                mime_type="image/png",
+                media_bytes=_OCR_CANARY_PNG,
+                source_object_key="runtime-health/canary.png",
+            )
+
+    async def run(
+        self,
+        *,
+        stop_event: asyncio.Event | None = None,
+        background_runners: Sequence[WorkerBackgroundRunner] = (),
+    ) -> None:
         """Start the FastStream broker, declare topology, and block until shutdown."""
 
         resolved_stop_event = stop_event or asyncio.Event()
-        await self.broker.start()
+        if self.health_reporter is not None:
+            await self.health_reporter.start()
         try:
-            await self.declare_topology()
-            await resolved_stop_event.wait()
-        finally:
+            await self.broker.start()
             try:
-                if self.source_engagement_telegram_session_manager is not None:
-                    await self.source_engagement_telegram_session_manager.shutdown()
+                await self.declare_topology()
+                await self.verify_readiness()
+                if self.health_reporter is not None:
+                    self.health_reporter.mark_ready()
+                async with asyncio.TaskGroup() as task_group:
+                    for runner in background_runners:
+                        _ = task_group.create_task(
+                            self._run_background_runner(runner, resolved_stop_event),
+                            name=f"worker-{self.role.value}-background",
+                        )
+                    await resolved_stop_event.wait()
             finally:
-                await self.broker.stop()
+                try:
+                    if self.source_engagement_telegram_session_manager is not None:
+                        await self.source_engagement_telegram_session_manager.shutdown()
+                finally:
+                    await self.broker.stop()
+        finally:
+            if self.health_reporter is not None:
+                await self.health_reporter.stop()
+
+    async def _run_background_runner(
+        self,
+        runner: WorkerBackgroundRunner,
+        stop_event: asyncio.Event,
+    ) -> None:
+        await runner(self.settings, stop_event)
+        if not stop_event.is_set():
+            raise RuntimeError(f"Worker role {self.role.value!r} background runner exited before shutdown.")
 
     def _effective_attempt(
         self,
@@ -646,7 +852,27 @@ class PipelineRuntime:
         normalized_reason: str,
     ) -> None:
         try:
-            # Direct publish exception: keep the original delivery unacked until DLX transfer succeeds.
+            _ = await self.dead_letter_recorder(
+                session_factory=self.session_factory,
+                payload=payload,
+                headers=message.headers,
+                broker_message_id=message.message_id,
+                normalized_reason=normalized_reason,
+            )
+        except Exception:
+            logger.exception(
+                "pipeline_dead_letter_persistence_failed",
+                extra={
+                    "event": "pipeline_dead_letter_persistence_failed",
+                    "message_id": message.message_id,
+                    "normalized_reason": normalized_reason,
+                },
+            )
+            await message.nack(requeue=True)
+            return
+
+        try:
+            # Keep publishing to the legacy RabbitMQ DLQ during the PostgreSQL-ledger transition.
             _ = await self.broker.publish(
                 payload,
                 exchange=self.dead_letter_exchange,
@@ -661,13 +887,20 @@ class PipelineRuntime:
                 mandatory=True,
             )
         except Exception:
-            await message.nack(requeue=True)
-            return
+            logger.exception(
+                "pipeline_legacy_dead_letter_publish_failed",
+                extra={
+                    "event": "pipeline_legacy_dead_letter_publish_failed",
+                    "message_id": message.message_id,
+                    "normalized_reason": normalized_reason,
+                },
+            )
 
         await message.ack()
 
 
 __all__ = [
+    "DeadLetterRecorder",
     "PipelineRuntime",
     "RabbitMessageLike",
 ]

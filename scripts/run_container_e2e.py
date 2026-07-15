@@ -35,7 +35,13 @@ IMAGE_ENV_DEFAULTS: Final = {
 }
 TRUTHY_VALUES: Final = {"1", "true", "yes", "on"}
 WAITED_LONG_LIVED_SERVICES: Final = ("api", "frontend")
-EXPLICITLY_GATED_LONG_LIVED_SERVICES: Final = ("workers",)
+EXPLICITLY_GATED_LONG_LIVED_SERVICES: Final = (
+    "worker-media",
+    "worker-ocr",
+    "worker-enrichment",
+    "worker-sync",
+    "worker-telegram",
+)
 LOG_SERVICES: Final = (
     "postgres",
     "redis",
@@ -47,7 +53,11 @@ LOG_SERVICES: Final = (
     "imgproxy",
     "migrate",
     "api",
-    "workers",
+    "worker-media",
+    "worker-ocr",
+    "worker-enrichment",
+    "worker-sync",
+    "worker-telegram",
     "frontend",
     "seed",
     "e2e-runner",
@@ -58,6 +68,7 @@ RUN_ID_HASH_LENGTH: Final = 12
 PIPELINE_CONSUMER_WAIT_TIMEOUT_SECONDS: Final = 90.0
 PIPELINE_CONSUMER_POLL_INTERVAL_SECONDS: Final = 1.0
 RABBITMQCTL_TIMEOUT_SECONDS: Final = 10.0
+PIPELINE_CONSUMER_ROLE_ARGUMENT: Final = "x-memexpert-worker-role"
 REQUIRED_PIPELINE_CONSUMER_QUEUES: Final = frozenset(
     {
         "pipeline.media_inspect",
@@ -69,6 +80,15 @@ REQUIRED_PIPELINE_CONSUMER_QUEUES: Final = frozenset(
         "pipeline.sync_meili",
     },
 )
+EXPECTED_PIPELINE_CONSUMER_ROLES: Final = {
+    "pipeline.media_inspect": "media",
+    "pipeline.transcode": "media",
+    "pipeline.ocr": "ocr",
+    "pipeline.embed": "enrichment",
+    "pipeline.classify": "enrichment",
+    "pipeline.sync_qdrant": "sync",
+    "pipeline.sync_meili": "sync",
+}
 
 
 class E2ERunCollisionError(RuntimeError):
@@ -81,6 +101,10 @@ class RabbitMQConsumerInspectionError(RuntimeError):
 
 class PipelineConsumerReadinessError(RuntimeError):
     """Raised when required pipeline consumers do not register before the deadline."""
+
+
+class PipelineConsumerOwnershipError(RuntimeError):
+    """Raised when a pipeline queue is consumed by the wrong worker role."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,6 +200,7 @@ def main() -> int:
             env=env,
         )
         wait_for_pipeline_consumers(compose, env=env)
+        wait_for_pipeline_consumer_ownership(compose, env=env)
         if not skip_image_build:
             run_checked([*compose, "build", "e2e-runner"], env=env)
         run_checked([*compose, "run", "--rm", "--no-deps", "seed"], env=env)
@@ -511,6 +536,84 @@ def parse_consumer_queues(output: str) -> set[str]:
     return queues
 
 
+def parse_consumer_arguments(value: object, *, row_index: int) -> dict[str, object]:
+    """Normalize RabbitMQ JSON consumer arguments into a string-keyed mapping."""
+
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        arguments: dict[str, object] = {}
+        for key, argument_value in value.items():
+            if not isinstance(key, str):
+                raise RabbitMQConsumerInspectionError(
+                    f"rabbitmqctl consumer row {row_index} has non-string argument keys",
+                )
+            arguments[key] = argument_value
+        return arguments
+    if not isinstance(value, list):
+        raise RabbitMQConsumerInspectionError(
+            f"rabbitmqctl consumer row {row_index} has invalid arguments={value!r}",
+        )
+
+    arguments = {}
+    for argument_index, entry in enumerate(value):
+        if not isinstance(entry, list) or len(entry) != 3:
+            raise RabbitMQConsumerInspectionError(
+                f"rabbitmqctl consumer row {row_index} argument {argument_index} "
+                f"must be a [name, type, value] triplet, got {entry!r}",
+            )
+        name, value_type, argument_value = entry
+        if not isinstance(name, str) or not isinstance(value_type, str):
+            raise RabbitMQConsumerInspectionError(
+                f"rabbitmqctl consumer row {row_index} argument {argument_index} "
+                f"has invalid name/type metadata: {entry!r}",
+            )
+        if name in arguments:
+            raise RabbitMQConsumerInspectionError(
+                f"rabbitmqctl consumer row {row_index} repeats argument {name!r}",
+            )
+        arguments[name] = argument_value
+    return arguments
+
+
+def parse_pipeline_consumer_ownership(output: str) -> dict[str, list[str]]:
+    """Parse worker ownership from inspectable RabbitMQ consumer metadata."""
+
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise RabbitMQConsumerInspectionError(
+            f"rabbitmqctl list_consumers did not return valid JSON: {exc}; output={output[:500]!r}",
+        ) from exc
+    if not isinstance(payload, list):
+        raise RabbitMQConsumerInspectionError(
+            f"rabbitmqctl list_consumers must return a JSON array, got {type(payload).__name__}",
+        )
+
+    ownership: dict[str, list[str]] = {}
+    for index, row in enumerate(payload):
+        if not isinstance(row, dict):
+            raise RabbitMQConsumerInspectionError(
+                f"rabbitmqctl consumer row {index} must be an object, got {type(row).__name__}",
+            )
+        queue_name = row.get("queue_name")
+        if not isinstance(queue_name, str) or not queue_name.strip():
+            raise RabbitMQConsumerInspectionError(
+                f"rabbitmqctl consumer row {index} has invalid queue_name={queue_name!r}",
+            )
+        consumer_arguments = parse_consumer_arguments(row.get("arguments"), row_index=index)
+        role = consumer_arguments.get(PIPELINE_CONSUMER_ROLE_ARGUMENT)
+        if role is None:
+            continue
+        if not isinstance(role, str) or not role.strip():
+            raise RabbitMQConsumerInspectionError(
+                f"rabbitmqctl consumer row {index} has invalid "
+                f"{PIPELINE_CONSUMER_ROLE_ARGUMENT}={role!r}",
+            )
+        ownership.setdefault(queue_name, []).append(role)
+    return ownership
+
+
 def inspect_pipeline_consumers(
     compose: list[str],
     *,
@@ -550,6 +653,47 @@ def inspect_pipeline_consumers(
             f"stdout={stdout!r}; stderr={stderr!r}",
         )
     return parse_consumer_queues(completed.stdout)
+
+
+def inspect_pipeline_consumer_ownership(
+    compose: list[str],
+    *,
+    env: dict[str, str],
+    timeout_seconds: float,
+) -> dict[str, list[str]]:
+    """Fetch queue-to-worker-role ownership through RabbitMQ consumer metadata."""
+
+    command = [
+        *compose,
+        "exec",
+        "-T",
+        "rabbitmq",
+        "rabbitmqctl",
+        "list_consumers",
+        "--formatter=json",
+        "--silent",
+    ]
+    print(f"$ {' '.join(command)}", flush=True)
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=ROOT,
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=max(0.1, timeout_seconds),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RabbitMQConsumerInspectionError(f"rabbitmqctl consumer inspection failed: {exc}") from exc
+    if completed.returncode != 0:
+        stdout = completed.stdout.strip()[:1000]
+        stderr = completed.stderr.strip()[:1000]
+        raise RabbitMQConsumerInspectionError(
+            f"rabbitmqctl list_consumers exited with status {completed.returncode}; "
+            f"stdout={stdout!r}; stderr={stderr!r}",
+        )
+    return parse_pipeline_consumer_ownership(completed.stdout)
 
 
 def wait_for_pipeline_consumers(
@@ -616,6 +760,67 @@ def wait_for_pipeline_consumers(
         f"Timed out after {timeout_seconds:.1f}s waiting for RabbitMQ pipeline consumers; attempts={attempts}; "
         f"missing={','.join(sorted(missing)) or '(none)'}; "
         f"observed={','.join(sorted(last_observed)) or '(none)'}; last_error={last_error or '(none)'}",
+    )
+
+
+def wait_for_pipeline_consumer_ownership(
+    compose: list[str],
+    *,
+    env: dict[str, str],
+    expected_roles: dict[str, str] = EXPECTED_PIPELINE_CONSUMER_ROLES,
+    timeout_seconds: float = PIPELINE_CONSUMER_WAIT_TIMEOUT_SECONDS,
+    poll_interval_seconds: float = PIPELINE_CONSUMER_POLL_INTERVAL_SECONDS,
+    inspect_consumers: Callable[[float], dict[str, list[str]]] | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    """Wait until every required queue has exactly one consumer from its intended role."""
+
+    deadline = monotonic() + timeout_seconds
+    attempts = 0
+    last_observed: dict[str, list[str]] = {}
+    last_error: str | None = None
+    while True:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            break
+        attempts += 1
+        try:
+            last_observed = (
+                inspect_consumers(remaining)
+                if inspect_consumers is not None
+                else inspect_pipeline_consumer_ownership(
+                    compose,
+                    env=env,
+                    timeout_seconds=min(RABBITMQCTL_TIMEOUT_SECONDS, remaining),
+                )
+            )
+            last_error = None
+        except (RabbitMQConsumerInspectionError, OSError, subprocess.TimeoutExpired) as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+        else:
+            mismatches = {
+                queue_name: roles
+                for queue_name, expected_role in expected_roles.items()
+                if (roles := last_observed.get(queue_name, [])) != [expected_role]
+            }
+            print(
+                f"RabbitMQ consumer ownership attempt {attempts}: mismatches={json.dumps(mismatches, sort_keys=True)}.",
+                flush=True,
+            )
+            if not mismatches:
+                print(f"All pipeline consumers have the intended role after {attempts} attempt(s).", flush=True)
+                return
+
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            break
+        sleep(min(poll_interval_seconds, remaining))
+
+    raise PipelineConsumerOwnershipError(
+        f"Timed out after {timeout_seconds:.1f}s waiting for RabbitMQ consumer role ownership; "
+        f"attempts={attempts}; expected={json.dumps(expected_roles, sort_keys=True)}; "
+        f"observed={json.dumps(last_observed, sort_keys=True)}; last_error={last_error or '(none)'}",
     )
 
 

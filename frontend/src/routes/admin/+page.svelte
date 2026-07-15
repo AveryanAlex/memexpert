@@ -6,6 +6,17 @@
 
   const cards = $derived([
     {
+      href: '/admin/recovery',
+      label: 'Recovery work',
+      count:
+        data.recovery.retryable_count +
+        data.recovery.blocked_count +
+        data.recovery.stuck_count +
+        data.recovery.dead_lettered_count,
+      detail: `${data.recovery.retryable_count} retryable · ${data.recovery.blocked_count} blocked`,
+      secondary: `${data.recovery.stuck_count} stuck · ${data.recovery.dead_lettered_count} dead-lettered`
+    },
+    {
       href: '/admin/moderation',
       label: 'Open reports',
       count: data.overview.open_report_count,

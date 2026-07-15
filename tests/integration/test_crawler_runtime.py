@@ -264,12 +264,16 @@ async def test_catch_up_channel_ingests_and_counts_mixed_media(
     assert await migrated_db_session.scalar(select(func.count()).select_from(RabbitMQOutboxMessage)) == 4
     assert await migrated_db_session.scalar(select(func.count()).select_from(MemeFile)) == 0
     post_rows = (
-        await migrated_db_session.execute(
-            select(SourceChannelPost)
-            .where(SourceChannelPost.source_channel_id == channel.id)
-            .order_by(SourceChannelPost.published_at.asc()),
+        (
+            await migrated_db_session.execute(
+                select(SourceChannelPost)
+                .where(SourceChannelPost.source_channel_id == channel.id)
+                .order_by(SourceChannelPost.published_at.asc()),
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     assert [row.post_id for row in post_rows] == ["1", "2", "3", "4", "5"]
     assert [row.status for row in post_rows] == [
         SourceChannelPostStatus.ACCEPTED,
@@ -475,10 +479,7 @@ async def test_partial_initial_window_retries_latest_messages_before_switching_f
         platform_id="retry_initial_channel",
         catchup_message_limit=3,
     )
-    messages = [
-        _build_photo_message(message_id=str(i), channel_id="retry_initial_channel")
-        for i in range(1, 11)
-    ]
+    messages = [_build_photo_message(message_id=str(i), channel_id="retry_initial_channel") for i in range(1, 11)]
 
     class _InitialStreamFailsOnce(FakeTelegramClient):
         failed = False
@@ -591,10 +592,7 @@ async def test_older_history_uses_legacy_checkpoint_boundary_not_inventory_minim
     channel.history_cursor_post_id = "512"
     channel.initial_catchup_completed = True
     await migrated_db_session.commit()
-    messages = [
-        _build_photo_message(message_id=str(i), channel_id="legacy_gap_channel")
-        for i in (510, 511, 512)
-    ]
+    messages = [_build_photo_message(message_id=str(i), channel_id="legacy_gap_channel") for i in (510, 511, 512)]
     fake = FakeTelegramClient(
         canned_messages={"legacy_gap_channel": messages},
         media_by_message={message.message_id: b"img" for message in messages},
@@ -638,10 +636,7 @@ async def test_older_history_failure_keeps_unprocessed_messages_below_committed_
     channel.history_cursor_post_id = "8"
     channel.initial_catchup_completed = True
     await migrated_db_session.commit()
-    messages = [
-        _build_photo_message(message_id=str(i), channel_id="recoverable_older_channel")
-        for i in range(1, 11)
-    ]
+    messages = [_build_photo_message(message_id=str(i), channel_id="recoverable_older_channel") for i in range(1, 11)]
     fake = FakeTelegramClient(
         canned_messages={"recoverable_older_channel": messages},
         media_by_message={message.message_id: b"img" for message in messages},
@@ -712,6 +707,79 @@ async def test_older_history_failure_keeps_unprocessed_messages_below_committed_
     assert ingest_service.post_ids[3:] == ["5", "4", "3"]
 
 
+async def test_older_history_quarantines_one_poison_post_after_three_attempts_and_continues(
+    migrated_db_session: AsyncSession,
+) -> None:
+    await _seed_active_session(migrated_db_session, session_name="primary")
+    channel = await _seed_curated_channel(
+        migrated_db_session,
+        platform_id="poison_older_channel",
+        last_read_post_id="10",
+    )
+    channel.oldest_observed_post_id = "8"
+    channel.history_cursor_post_id = "8"
+    channel.initial_catchup_completed = True
+    await migrated_db_session.commit()
+    messages = [_build_photo_message(message_id=str(i), channel_id="poison_older_channel") for i in range(1, 11)]
+
+    class _PoisonPostClient(FakeTelegramClient):
+        async def download_media(self, message: RawTelegramMessage) -> bytes:
+            if message.message_id == "5":
+                raise PipelineTelegramProviderUnavailableError("poison post download")
+            return await super().download_media(message)
+
+    fake = _PoisonPostClient(
+        canned_messages={"poison_older_channel": messages},
+        media_by_message={message.message_id: b"img" for message in messages},
+    )
+    runtime = _build_runtime(migrated_db_session, telegram_client=fake)
+
+    first = await runtime.catch_up_older_channel(
+        "primary",
+        "poison_older_channel",
+        before_post_id=None,
+        limit=3,
+    )
+    await migrated_db_session.refresh(channel)
+    assert first.retryable_failure_post_id == "5"
+    assert channel.history_cursor_post_id == "6"
+
+    second = await runtime.catch_up_older_channel(
+        "primary",
+        "poison_older_channel",
+        before_post_id=channel.history_cursor_post_id,
+        limit=3,
+    )
+    await migrated_db_session.refresh(channel)
+    assert second.messages_scanned == 1
+    assert second.retryable_failure_post_id == "5"
+    assert channel.history_cursor_post_id == "6"
+
+    third = await runtime.catch_up_older_channel(
+        "primary",
+        "poison_older_channel",
+        before_post_id=channel.history_cursor_post_id,
+        limit=3,
+    )
+    await migrated_db_session.refresh(channel)
+    assert third.messages_scanned == 3
+    assert third.messages_quarantined == 1
+    assert third.retryable_failure_post_id is None
+    assert channel.history_cursor_post_id == "3"
+
+    poison_post = await migrated_db_session.scalar(
+        select(SourceChannelPost).where(
+            SourceChannelPost.source_channel_id == channel.id,
+            SourceChannelPost.post_id == "5",
+        )
+    )
+    assert poison_post is not None
+    assert poison_post.status is SourceChannelPostStatus.FAILED
+    assert poison_post.attempt_count == 3
+    assert poison_post.is_retryable is True
+    assert poison_post.quarantined_at is not None
+
+
 async def test_older_history_records_oversized_media_and_advances_history_cursor(
     migrated_db_session: AsyncSession,
 ) -> None:
@@ -724,10 +792,7 @@ async def test_older_history_records_oversized_media_and_advances_history_cursor
     channel.oldest_observed_post_id = "10"
     channel.history_cursor_post_id = "10"
     await migrated_db_session.commit()
-    messages = [
-        _build_photo_message(message_id=str(i), channel_id="oversized_history_channel")
-        for i in range(1, 11)
-    ]
+    messages = [_build_photo_message(message_id=str(i), channel_id="oversized_history_channel") for i in range(1, 11)]
     fake = FakeTelegramClient(
         canned_messages={"oversized_history_channel": messages},
         media_by_message={"9": b"ok", "8": b"large", "7": b"ok"},
@@ -981,7 +1046,7 @@ async def test_catch_up_channel_flood_wait_parks_session_with_partial_report(
     assert channel.last_read_post_id == "10"
 
 
-async def test_catch_up_channel_continues_after_per_message_provider_error(
+async def test_catch_up_channel_retries_per_message_provider_error_without_skipping_forward(
     migrated_db_session: AsyncSession,
 ) -> None:
     session_row = await _seed_active_session(migrated_db_session, session_name="primary")
@@ -1005,30 +1070,32 @@ async def test_catch_up_channel_continues_after_per_message_provider_error(
 
     report = await runtime.catch_up_channel("primary", "transient_channel")
 
-    # 3 scanned. Message 10 ingests successfully. Message 20's download
-    # pin raises PipelineTelegramProviderUnavailableError so the loop
-    # records an error and continues. Message 30 downloads cleanly and is
-    # accepted as a second raw ingest request.
-    assert report.messages_scanned == 3
-    assert report.messages_ingested == 2
+    # The first sweep stops on message 20 so checkpoint 30 cannot skip it.
+    assert report.messages_scanned == 2
+    assert report.messages_ingested == 1
     assert report.messages_skipped_dedup == 0
+    assert report.retryable_failure_post_id == "20"
     assert any("download_unavailable:20" in e for e in report.errors)
+
+    fake.media_by_message["20"] = b"img-20"
+    retry_report = await runtime.catch_up_channel("primary", "transient_channel")
+    assert retry_report.messages_scanned == 3
+    assert retry_report.messages_ingested == 2
+    assert retry_report.messages_skipped_dedup == 1
+    assert retry_report.retryable_failure_post_id is None
 
     await migrated_db_session.refresh(session_row)
     assert session_row.status is TelegramSessionStatus.ACTIVE
     failed_post = await migrated_db_session.scalar(
         select(SourceChannelPost).where(
-            SourceChannelPost.source_channel_id == (
-                select(SourceChannel.id)
-                .where(SourceChannel.platform_id == "transient_channel")
-                .scalar_subquery()
-            ),
+            SourceChannelPost.source_channel_id
+            == (select(SourceChannel.id).where(SourceChannel.platform_id == "transient_channel").scalar_subquery()),
             SourceChannelPost.post_id == "20",
         ),
     )
     assert failed_post is not None
-    assert failed_post.status is SourceChannelPostStatus.FAILED
-    assert failed_post.last_error_code == "download_unavailable"
+    assert failed_post.status is SourceChannelPostStatus.ACCEPTED
+    assert failed_post.last_error_code is None
 
 
 async def test_catch_up_channel_records_oversized_media_as_unsupported_and_continues(
@@ -1066,12 +1133,16 @@ async def test_catch_up_channel_records_oversized_media_as_unsupported_and_conti
     assert channel.last_read_post_id == "30"
     assert channel.initial_catchup_completed is True
     posts = (
-        await migrated_db_session.execute(
-            select(SourceChannelPost)
-            .where(SourceChannelPost.source_channel_id == channel.id)
-            .order_by(SourceChannelPost.post_id.asc()),
+        (
+            await migrated_db_session.execute(
+                select(SourceChannelPost)
+                .where(SourceChannelPost.source_channel_id == channel.id)
+                .order_by(SourceChannelPost.post_id.asc()),
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     assert [post.status for post in posts] == [
         SourceChannelPostStatus.ACCEPTED,
         SourceChannelPostStatus.UNSUPPORTED,

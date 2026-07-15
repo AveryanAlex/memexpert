@@ -8,6 +8,8 @@ from collections.abc import Mapping
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
+from sqlalchemy import select
+
 from memexpert.models.base import utcnow
 from memexpert.models.content import MemeFile, MemeFileOCRResult, PipelineStageJournal
 from memexpert.models.enums import (
@@ -15,9 +17,11 @@ from memexpert.models.enums import (
     ContentPipelineStageStatus,
     ContentProcessingStatus,
     ContentSourceKind,
+    PipelineAttemptOutcome,
     SyncTargetKind,
     SyncTargetStatus,
 )
+from memexpert.models.operations import PipelineStageAttempt, RecoveryJobItem
 from memexpert.pipeline import constants as _consts
 from memexpert.pipeline.dispatch import (
     PipelineDispatchingService,
@@ -44,16 +48,35 @@ from memexpert.services.errors import (
 )
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
+    from sqlalchemy.ext.asyncio import AsyncSession
+
     from memexpert.core.classification import ClassificationResult
+    from memexpert.core.config import Settings
     from memexpert.core.ocr import OCRExtractionResult
     from memexpert.core.qdrant import QdrantSimilarityMatch
     from memexpert.core.voyage import VoyageEmbeddingResult
     from memexpert.media.contracts import NormalizedMediaResult
+    from memexpert.messaging.rabbitmq_outbox import RabbitBrokerProtocol
     from memexpert.services.content_merge import MergeOutcome
 
 
 class PipelineStageCompletionService(PipelineDispatchingService):
     """Persist stage transitions, stage outputs, fan-out, and sync snapshots."""
+
+    def __init__(
+        self,
+        session: AsyncSession,
+        *,
+        settings: Settings | None = None,
+        broker: RabbitBrokerProtocol | None = None,
+        worker_role: str | None = None,
+        worker_instance_id: str | None = None,
+    ) -> None:
+        super().__init__(session, settings=settings, broker=broker)
+        self._worker_role = worker_role
+        self._worker_instance_id = worker_instance_id
 
     async def start_stage_processing(
         self,
@@ -62,8 +85,27 @@ class PipelineStageCompletionService(PipelineDispatchingService):
         stage: ContentPipelineStage,
         attempt: int,
         event_id: uuid.UUID,
-    ) -> PipelineStageWorkContext:
-        meme_file, stage_entry = await self._get_meme_file_and_stage_entry(meme_file_id, stage)
+    ) -> PipelineStageWorkContext | None:
+        stage_entry = await self._session.scalar(
+            select(PipelineStageJournal)
+            .where(
+                PipelineStageJournal.meme_file_id == meme_file_id,
+                PipelineStageJournal.stage == stage,
+            )
+            .with_for_update()
+        )
+        if stage_entry is None:
+            raise PipelineIngestError(
+                f"Pipeline item {meme_file_id} does not have durable journal state for stage {stage.value}."
+            )
+        if stage_entry.last_event_id == event_id and stage_entry.status in {
+            ContentPipelineStageStatus.PROCESSING,
+            ContentPipelineStageStatus.SUCCEEDED,
+        }:
+            await self._session.commit()
+            return None
+
+        meme_file = await self._get_meme_file(meme_file_id)
         ensure_stage_attempt_is_current(stage_entry, attempt=attempt)
         started_at = utcnow()
 
@@ -76,6 +118,13 @@ class PipelineStageCompletionService(PipelineDispatchingService):
         stage_entry.retry_after = None
         stage_entry.started_at = started_at
         stage_entry.finished_at = None
+        await self._record_attempt_started(
+            meme_file_id=meme_file_id,
+            stage=stage,
+            attempt=attempt,
+            event_id=event_id,
+            started_at=started_at,
+        )
         if stage not in _consts.SYNC_STAGES:
             meme_file.status = ContentProcessingStatus.PROCESSING
 
@@ -289,8 +338,7 @@ class PipelineStageCompletionService(PipelineDispatchingService):
         ensure_stage_attempt_is_current(stage_entry, attempt=attempt)
 
         already_succeeded = (
-            stage_entry.status is ContentPipelineStageStatus.SUCCEEDED
-            and stage_entry.last_event_id == event_id
+            stage_entry.status is ContentPipelineStageStatus.SUCCEEDED and stage_entry.last_event_id == event_id
         )
 
         preview_model = build_sync_preview_model(payload_preview, target=target) if payload_preview else None
@@ -443,14 +491,23 @@ class PipelineStageCompletionService(PipelineDispatchingService):
         stage_entry.last_error_text = trim_error_text(last_error_text)
         stage_entry.is_retryable = retryable
         stage_entry.retry_after = (
-            failed_at + timedelta(seconds=self._broker_settings.retry_backoff_seconds)
-            if retryable
-            else None
+            failed_at + timedelta(seconds=self._broker_settings.retry_backoff_seconds) if retryable else None
         )
         stage_entry.started_at = stage_entry.started_at or failed_at
         stage_entry.finished_at = failed_at
         if stage not in _consts.SYNC_STAGES:
             meme_file.status = ContentProcessingStatus.FAILED
+
+        await self._record_attempt_finished(
+            meme_file_id=meme_file_id,
+            stage=stage,
+            attempt=attempt,
+            event_id=event_id,
+            outcome=(PipelineAttemptOutcome.FAILED_RETRYABLE if retryable else PipelineAttemptOutcome.FAILED_TERMINAL),
+            normalized_reason=normalized_reason,
+            safe_error_text=last_error_text,
+            finished_at=failed_at,
+        )
 
         await self._commit_stage_mutation("Failed to persist failed stage state.")
 
@@ -494,6 +551,17 @@ class PipelineStageCompletionService(PipelineDispatchingService):
         stage_entry.started_at = stage_entry.started_at or finished_at
         stage_entry.finished_at = finished_at
 
+        await self._record_attempt_finished(
+            meme_file_id=meme_file.id,
+            stage=stage,
+            attempt=attempt,
+            event_id=event_id,
+            outcome=PipelineAttemptOutcome.SUCCEEDED,
+            normalized_reason=None,
+            safe_error_text=None,
+            finished_at=finished_at,
+        )
+
         downstream_dispatches = prepare_downstream_dispatches(
             self._session,
             meme_file=meme_file,
@@ -512,6 +580,99 @@ class PipelineStageCompletionService(PipelineDispatchingService):
 
         await self._commit_stage_mutation("Failed to persist successful stage state.")
         await self._relay_outbox_messages_after_commit(tuple(outbox_message_ids))
+
+    async def _record_attempt_started(
+        self,
+        *,
+        meme_file_id: uuid.UUID,
+        stage: ContentPipelineStage,
+        attempt: int,
+        event_id: uuid.UUID,
+        started_at: datetime,
+    ) -> None:
+        attempt_row = await self._load_attempt(
+            meme_file_id=meme_file_id,
+            stage=stage,
+            attempt=attempt,
+            event_id=event_id,
+        )
+        if attempt_row is None:
+            recovery_item_id = await self._session.scalar(
+                select(RecoveryJobItem.id).where(RecoveryJobItem.dispatch_event_id == event_id)
+            )
+            attempt_row = PipelineStageAttempt(
+                meme_file_id=meme_file_id,
+                stage=stage,
+                event_id=event_id,
+                attempt_number=attempt,
+                recovery_item_id=recovery_item_id,
+                worker_role=self._worker_role,
+                worker_instance_id=self._worker_instance_id,
+                started_at=started_at,
+            )
+            self._session.add(attempt_row)
+            return
+        attempt_row.outcome = PipelineAttemptOutcome.PROCESSING
+        attempt_row.normalized_reason = None
+        attempt_row.safe_error_text = None
+        attempt_row.finished_at = None
+        attempt_row.worker_role = self._worker_role or attempt_row.worker_role
+        attempt_row.worker_instance_id = self._worker_instance_id or attempt_row.worker_instance_id
+
+    async def _record_attempt_finished(
+        self,
+        *,
+        meme_file_id: uuid.UUID,
+        stage: ContentPipelineStage,
+        attempt: int,
+        event_id: uuid.UUID,
+        outcome: PipelineAttemptOutcome,
+        normalized_reason: str | None,
+        safe_error_text: str | None,
+        finished_at: datetime,
+    ) -> None:
+        attempt_row = await self._load_attempt(
+            meme_file_id=meme_file_id,
+            stage=stage,
+            attempt=attempt,
+            event_id=event_id,
+        )
+        if attempt_row is None:
+            recovery_item_id = await self._session.scalar(
+                select(RecoveryJobItem.id).where(RecoveryJobItem.dispatch_event_id == event_id)
+            )
+            attempt_row = PipelineStageAttempt(
+                meme_file_id=meme_file_id,
+                stage=stage,
+                event_id=event_id,
+                attempt_number=attempt,
+                recovery_item_id=recovery_item_id,
+                worker_role=self._worker_role,
+                worker_instance_id=self._worker_instance_id,
+                started_at=finished_at,
+            )
+            self._session.add(attempt_row)
+        attempt_row.outcome = outcome
+        attempt_row.normalized_reason = trim_reason(normalized_reason) if normalized_reason else None
+        attempt_row.safe_error_text = trim_error_text(safe_error_text) if safe_error_text else None
+        attempt_row.finished_at = finished_at
+
+    async def _load_attempt(
+        self,
+        *,
+        meme_file_id: uuid.UUID,
+        stage: ContentPipelineStage,
+        attempt: int,
+        event_id: uuid.UUID,
+    ) -> PipelineStageAttempt | None:
+        return await self._session.scalar(
+            select(PipelineStageAttempt).where(
+                PipelineStageAttempt.meme_file_id == meme_file_id,
+                PipelineStageAttempt.stage == stage,
+                PipelineStageAttempt.event_id == event_id,
+                PipelineStageAttempt.attempt_number == attempt,
+            )
+        )
 
 
 __all__ = ["PipelineStageCompletionService"]

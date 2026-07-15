@@ -128,6 +128,9 @@ ENV MEMEXPERT_WORKER_IMAGE=1 \
 
 USER app
 
+HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=3 \
+    CMD memexpert-runtime-health
+
 CMD ["memexpert-workers"]
 
 

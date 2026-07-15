@@ -149,6 +149,26 @@ def test_settings_pipeline_worker_prefetch_count_defaults_and_bounds() -> None:
         _ = Settings(pipeline_worker_prefetch_count=513)
 
 
+def test_settings_database_pool_and_runtime_health_defaults_and_bounds() -> None:
+    settings = Settings()
+
+    assert settings.database_connect_timeout_seconds == 5.0
+    assert settings.database_pool_size == 5
+    assert settings.database_max_overflow == 10
+    assert settings.database_pool_timeout_seconds == 5.0
+    assert settings.database_application_name == "memexpert"
+    assert settings.runtime_health_interval_seconds == 10.0
+    assert settings.runtime_health_stale_after_seconds == 45.0
+    assert settings.runtime_health_operation_timeout_seconds == 900.0
+
+    with pytest.raises(ValidationError):
+        _ = Settings(database_pool_size=0)
+    with pytest.raises(ValidationError):
+        _ = Settings(database_max_overflow=-1)
+    with pytest.raises(ValidationError):
+        _ = Settings(runtime_health_interval_seconds=0)
+
+
 def test_settings_include_telegram_session_encryption_secret_without_session_dir() -> None:
     settings = Settings.model_validate(
         {"telegram_session_encryption_secret": "  test-telegram-session-encryption-secret  "},
@@ -165,10 +185,21 @@ def test_settings_crawler_reconcile_interval_defaults_and_requires_positive_valu
 
     assert settings.crawler_reconcile_interval_seconds == 10.0
     assert settings.crawler_default_catchup_message_limit == 5000
+    assert settings.crawler_telegram_request_retries == 2
+    assert settings.crawler_telegram_connection_retries == 2
+    assert settings.crawler_telegram_connect_timeout_seconds == 20.0
+    assert settings.crawler_telegram_resolve_timeout_seconds == 30.0
+    assert settings.crawler_telegram_history_page_timeout_seconds == 60.0
+    assert settings.crawler_telegram_single_message_timeout_seconds == 30.0
+    assert settings.crawler_telegram_media_download_timeout_seconds == 120.0
     overridden = Settings.model_validate({"crawler_reconcile_interval_seconds": 2.5})
     assert overridden.crawler_reconcile_interval_seconds == 2.5
     with pytest.raises(ValidationError):
         _ = Settings.model_validate({"crawler_reconcile_interval_seconds": 0})
+    with pytest.raises(ValidationError):
+        _ = Settings.model_validate({"crawler_telegram_request_retries": -1})
+    with pytest.raises(ValidationError):
+        _ = Settings.model_validate({"crawler_telegram_connect_timeout_seconds": 0})
 
 
 def test_settings_normalize_blank_ocr_command_settings_to_none() -> None:
@@ -593,3 +624,23 @@ def test_get_settings_returns_cached_instance() -> None:
     second = get_settings()
 
     assert first is second
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {
+            "pipeline_capacity_close_pending_count": 100,
+            "pipeline_capacity_reopen_pending_count": 100,
+        },
+        {
+            "pipeline_capacity_close_oldest_age_seconds": 300,
+            "pipeline_capacity_reopen_oldest_age_seconds": 300,
+        },
+    ],
+)
+def test_pipeline_capacity_hysteresis_requires_lower_reopen_thresholds(
+    overrides: dict[str, int],
+) -> None:
+    with pytest.raises(ValueError, match="must be below"):
+        Settings.model_validate(overrides)

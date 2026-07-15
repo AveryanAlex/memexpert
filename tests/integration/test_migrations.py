@@ -10,10 +10,12 @@ from typing import TYPE_CHECKING, cast
 import pytest_asyncio
 from alembic.config import Config
 from alembic.script import ScriptDirectory
+from sqlalchemy import CheckConstraint, text
 from sqlalchemy import inspect as sa_inspect
-from sqlalchemy import text
+from sqlalchemy.dialects import postgresql
 
 from alembic import command
+from memexpert.models import metadata
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable
@@ -138,6 +140,230 @@ async def test_alembic_upgrade_downgrade_and_reupgrade_smoke(
 
     assert await _get_current_revision(engine) == head_revision
     assert ({"alembic_version"} | CORE_APP_TABLES).issubset(await _get_table_names(engine))
+
+
+async def test_0034_adds_operator_recovery_state_and_downgrades_new_backfill_statuses(
+    empty_public_schema: tuple[AsyncEngine, str],
+) -> None:
+    engine, database_url = empty_public_schema
+    config = _build_alembic_config(database_url)
+    admin_user_id = uuid.uuid7()
+    channel_ids = [uuid.uuid7() for _ in range(4)]
+    post_id = uuid.uuid7()
+    backfill_ids = [uuid.uuid7() for _ in range(4)]
+
+    await _run_alembic_command(command.upgrade, config, "0033")
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                """
+                INSERT INTO users (id, status, email, nsfw_enabled, language)
+                VALUES (:user_id, 'active', 'recovery-admin@example.com', false, 'any')
+                """
+            ),
+            {"user_id": admin_user_id},
+        )
+        await connection.execute(
+            text(
+                """
+                INSERT INTO source_channels (id, platform, platform_id, title, is_active)
+                VALUES
+                    (:channel_0, 'telegram', 'legacy-failed', 'Legacy failed', true),
+                    (:channel_1, 'telegram', 'waiting-capacity', 'Waiting capacity', true),
+                    (:channel_2, 'telegram', 'partial-complete', 'Partial complete', true),
+                    (:channel_3, 'telegram', 'cancelled', 'Cancelled', true)
+                """
+            ),
+            {f"channel_{index}": channel_id for index, channel_id in enumerate(channel_ids)},
+        )
+        await connection.execute(
+            text(
+                """
+                INSERT INTO source_channel_posts (
+                    id, source_channel_id, post_id, published_at, status,
+                    last_error_code, last_error_text, attempt_count
+                ) VALUES (
+                    :post_row_id, :channel_id, '42', now(), 'failed',
+                    'telegram_request_failed', 'legacy provider failure', 6
+                )
+                """
+            ),
+            {"post_row_id": post_id, "channel_id": channel_ids[0]},
+        )
+        await connection.execute(
+            text(
+                """
+                INSERT INTO source_channel_backfill_jobs (
+                    id, source_channel_id, requested_by_admin_user_id, status,
+                    requested_message_count, scanned_message_count, last_error_text,
+                    locked_at, started_at
+                ) VALUES (
+                    :job_id, :channel_id, :admin_user_id, 'failed',
+                    100, 12, 'legacy provider failure', now(), now()
+                )
+                """
+            ),
+            {
+                "job_id": backfill_ids[0],
+                "channel_id": channel_ids[0],
+                "admin_user_id": admin_user_id,
+            },
+        )
+
+    await _run_alembic_command(command.upgrade, config, "0034")
+
+    async with engine.begin() as connection:
+        historical_post = (
+            await connection.execute(
+                text(
+                    """
+                    SELECT is_retryable, last_attempt_at IS NOT NULL AS has_last_attempt
+                    FROM source_channel_posts
+                    WHERE id = :post_id
+                    """
+                ),
+                {"post_id": post_id},
+            )
+        ).one()
+        historical_backfill = (
+            await connection.execute(
+                text(
+                    """
+                    SELECT is_retryable, attempt_count,
+                           last_progress_at IS NOT NULL AS has_last_progress
+                    FROM source_channel_backfill_jobs
+                    WHERE id = :job_id
+                    """
+                ),
+                {"job_id": backfill_ids[0]},
+            )
+        ).one()
+
+        assert historical_post == (True, True)
+        assert historical_backfill == (True, 1, True)
+
+        await connection.execute(
+            text(
+                """
+                UPDATE source_channel_backfill_jobs
+                SET status = 'waiting_retry'
+                WHERE id = :job_id
+                """
+            ),
+            {"job_id": backfill_ids[0]},
+        )
+        await connection.execute(
+            text(
+                """
+                INSERT INTO source_channel_backfill_jobs (
+                    id, source_channel_id, status,
+                    requested_message_count, scanned_message_count
+                ) VALUES
+                    (:job_1, :channel_1, 'waiting_capacity', 100, 0),
+                    (:job_2, :channel_2, 'completed_with_failures', 100, 100),
+                    (:job_3, :channel_3, 'cancelled', 100, 0)
+                """
+            ),
+            {
+                "job_1": backfill_ids[1],
+                "channel_1": channel_ids[1],
+                "job_2": backfill_ids[2],
+                "channel_2": channel_ids[2],
+                "job_3": backfill_ids[3],
+                "channel_3": channel_ids[3],
+            },
+        )
+
+        for table_name in ("recovery_jobs", "pipeline_stage_attempts"):
+            actual_check_names = set(
+                (
+                    await connection.execute(
+                        text(
+                            """
+                            SELECT conname
+                            FROM pg_constraint
+                            WHERE conrelid = CAST(:table_name AS regclass)
+                              AND contype = 'c'
+                            """
+                        ),
+                        {"table_name": table_name},
+                    )
+                ).scalars()
+            )
+            preparer = postgresql.dialect().identifier_preparer
+            expected_check_names = {
+                preparer.format_constraint(constraint)
+                for constraint in metadata.tables[table_name].constraints
+                if isinstance(constraint, CheckConstraint)
+            }
+            assert actual_check_names == expected_check_names
+
+        attempt_unique_definition = (
+            await connection.execute(
+                text(
+                    """
+                    SELECT pg_get_constraintdef(oid)
+                    FROM pg_constraint
+                    WHERE conrelid = 'pipeline_stage_attempts'::regclass
+                      AND conname = 'uq_pipeline_stage_attempts_file_stage_event_attempt'
+                    """
+                )
+            )
+        ).scalar_one()
+        assert attempt_unique_definition == ("UNIQUE (meme_file_id, stage, event_id, attempt_number)")
+
+    operational_tables = {
+        "dependency_circuit_states",
+        "operational_audit_logs",
+        "pipeline_capacity_states",
+        "pipeline_dead_letters",
+        "pipeline_stage_attempts",
+        "recovery_job_items",
+        "recovery_jobs",
+        "runtime_heartbeats",
+        "source_channel_backfill_attempts",
+    }
+    assert operational_tables.issubset(await _get_table_names(engine))
+
+    await _run_alembic_command(command.downgrade, config, "0033")
+
+    async with engine.connect() as connection:
+        status_rows = (
+            await connection.execute(
+                text(
+                    """
+                    SELECT id, status
+                    FROM source_channel_backfill_jobs
+                    WHERE id = ANY(:job_ids)
+                    """
+                ),
+                {"job_ids": backfill_ids},
+            )
+        ).all()
+        post_columns = {
+            row.column_name
+            for row in (
+                await connection.execute(
+                    text(
+                        """
+                        SELECT column_name
+                        FROM information_schema.columns
+                        WHERE table_schema = current_schema()
+                          AND table_name = 'source_channel_posts'
+                        """
+                    )
+                )
+            )
+        }
+
+    assert {row.id: row.status for row in status_rows} == {
+        backfill_ids[0]: "queued",
+        backfill_ids[1]: "queued",
+        backfill_ids[2]: "completed",
+        backfill_ids[3]: "failed",
+    }
+    assert operational_tables.isdisjoint(await _get_table_names(engine))
+    assert {"is_retryable", "next_attempt_at", "last_attempt_at", "quarantined_at"}.isdisjoint(post_columns)
 
 
 async def test_0029_backfills_existing_telegram_requests_into_source_post_inventory(
@@ -482,9 +708,7 @@ async def test_0031_backfills_provenance_visibility_and_private_collection_acces
             )
         ).all()
         source_rows = (
-            await connection.execute(
-                text("SELECT id, source_kind, uploader_user_id FROM meme_sources ORDER BY id")
-            )
+            await connection.execute(text("SELECT id, source_kind, uploader_user_id FROM meme_sources ORDER BY id"))
         ).all()
         visibility_result = await connection.execute(text("SELECT id, visibility_mode FROM memes"))
         visibility_rows = dict(visibility_result.tuples().all())

@@ -22,6 +22,7 @@ export const ADMIN_NAVIGATION_GROUPS: AdminNavigationGroup[] = [
     label: 'Workspaces',
     items: [
       { label: 'Overview', href: '/admin', match: 'exact' },
+      { label: 'Recovery', href: '/admin/recovery', match: 'prefix' },
       { label: 'Sources', href: '/admin/sources', match: 'prefix' },
       {
         label: 'Moderation',

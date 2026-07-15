@@ -30,6 +30,7 @@ from memexpert.models.enums import (
     SourcePlatform,
     TelegramSessionStatus,
 )
+from memexpert.models.operations import SourceChannelBackfillAttempt
 from memexpert.pipeline.events import SourceEngagementCaptureRequestedEvent, build_source_engagement_session_key
 from memexpert.schemas.content_pipeline import CrawlerIngestOutcome
 from memexpert.services import CrawlerSessionNotRunnableError
@@ -709,7 +710,7 @@ async def test_manager_live_start_failure_does_not_prevent_other_sessions_starti
     assert beta_client.closed is True
 
 
-async def test_manager_restarts_completed_live_handle_and_closes_stale_client(
+async def test_manager_supervisor_restarts_completed_live_handle_and_closes_stale_client(
     migrated_db_session: AsyncSession,
     postgres_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -765,7 +766,7 @@ async def test_manager_restarts_completed_live_handle_and_closes_stale_client(
         assert len(created) == 1
         assert created[0].closed is False
 
-        await manager.start_live_session("alpha")
+        failed_session_names = await manager.supervise_live_listeners()
         restarted_handle = manager._live_handles[session_row.id]  # noqa: SLF001 - test verifies manager lifecycle.
         restarted_task = restarted_handle.runtime._live_tasks["alpha"]  # noqa: SLF001 - test verifies manager lifecycle.
         await asyncio.wait_for(
@@ -774,6 +775,7 @@ async def test_manager_restarts_completed_live_handle_and_closes_stale_client(
         )
 
         assert len(created) == 2
+        assert failed_session_names == ()
         assert created[0].closed is True
         assert created[1].closed is False
         assert created[1].downloaded_message_ids == ["2"]
@@ -1042,6 +1044,116 @@ async def test_manager_processes_older_backfill_without_stopping_live_listener(
     finally:
         client.release_listener.set()
         await manager.shutdown()
+
+    assert client.closed is True
+
+
+async def test_manager_processes_only_one_backfill_page_per_lease(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _seed_session(migrated_db_session, session_name="sliced-backfill")
+    channel = await _seed_channel(
+        migrated_db_session,
+        platform_id="sliced_backfill_channel",
+        session_name="sliced-backfill",
+        last_read_post_id="102",
+    )
+    channel.oldest_observed_post_id = "102"
+    channel.history_cursor_post_id = "102"
+    channel.initial_catchup_completed = True
+    job = SourceChannelBackfillJob(source_channel_id=channel.id, requested_message_count=101)
+    migrated_db_session.add(job)
+    await migrated_db_session.commit()
+    messages = [
+        _build_photo_message(message_id=str(index), channel_id="sliced_backfill_channel") for index in range(1, 103)
+    ]
+    manager = _build_manager(
+        postgres_session_factory,
+        clients_by_name={
+            "sliced-backfill": FakeTelegramClient(
+                canned_messages={"sliced_backfill_channel": messages},
+                media_by_message={message.message_id: b"img" for message in messages},
+            )
+        },
+    )
+
+    assert await manager.process_backfill_jobs() == 1
+    await migrated_db_session.refresh(job)
+    assert job.status is SourceChannelBackfillJobStatus.QUEUED
+    assert job.scanned_message_count == 100
+    assert job.attempt_count == 1
+    assert job.lease_generation == 1
+
+    assert await manager.process_backfill_jobs() == 1
+    await migrated_db_session.refresh(job)
+    assert job.status is SourceChannelBackfillJobStatus.COMPLETED
+    assert job.scanned_message_count == 101
+    assert job.attempt_count == 1
+    assert job.lease_generation == 2
+
+
+async def test_manager_stops_automatic_backfill_retries_after_five_attempts(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _seed_session(migrated_db_session, session_name="bounded-backfill")
+    channel = await _seed_channel(
+        migrated_db_session,
+        platform_id="bounded_backfill_channel",
+        session_name="bounded-backfill",
+        last_read_post_id="10",
+    )
+    channel.oldest_observed_post_id = "8"
+    channel.history_cursor_post_id = "8"
+    channel.initial_catchup_completed = True
+    job = SourceChannelBackfillJob(source_channel_id=channel.id, requested_message_count=5)
+    migrated_db_session.add(job)
+    await migrated_db_session.commit()
+
+    class _UnavailableHistoryClient(FakeTelegramClient):
+        async def iter_older_channel_messages(
+            self,
+            *,
+            channel_id: str,
+            before_message_id: int,
+            limit: int,
+        ) -> AsyncIterator[RawTelegramMessage]:
+            _ = (channel_id, before_message_id, limit)
+            raise PipelineTelegramProviderUnavailableError("history provider unavailable")
+            yield  # pragma: no cover - preserves async-generator shape.
+
+    manager = _build_manager(
+        postgres_session_factory,
+        clients_by_name={"bounded-backfill": _UnavailableHistoryClient()},
+    )
+
+    for attempt_number in range(1, 6):
+        assert await manager.process_backfill_jobs() == 1
+        await migrated_db_session.refresh(job)
+        assert job.attempt_count == attempt_number
+        if attempt_number < 5:
+            assert job.status is SourceChannelBackfillJobStatus.WAITING_RETRY
+            job.next_attempt_at = _now() - timedelta(seconds=1)
+            await migrated_db_session.commit()
+
+    assert job.status is SourceChannelBackfillJobStatus.FAILED
+    assert job.is_retryable is True
+    assert job.next_attempt_at is None
+    assert job.last_error_code == "provider_unavailable"
+    attempts = (
+        (
+            await migrated_db_session.execute(
+                select(SourceChannelBackfillAttempt)
+                .where(SourceChannelBackfillAttempt.backfill_job_id == job.id)
+                .order_by(SourceChannelBackfillAttempt.attempt_number)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [attempt.attempt_number for attempt in attempts] == [1, 2, 3, 4, 5]
+    assert all(attempt.finished_at is not None for attempt in attempts)
 
 
 async def test_manager_persists_backfill_failure_after_processing_session_rollback(

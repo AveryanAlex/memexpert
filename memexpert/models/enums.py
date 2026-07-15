@@ -282,8 +282,104 @@ class SourceChannelBackfillJobStatus(StrEnum):
 
     QUEUED = "queued"
     RUNNING = "running"
+    WAITING_RETRY = "waiting_retry"
+    WAITING_CAPACITY = "waiting_capacity"
     COMPLETED = "completed"
+    COMPLETED_WITH_FAILURES = "completed_with_failures"
     FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class RecoveryWorkKind(StrEnum):
+    """Canonical operational work types exposed by the recovery control plane."""
+
+    BACKFILL = "backfill"
+    SOURCE_POST = "source_post"
+    INGEST_REQUEST = "ingest_request"
+    PIPELINE_STAGE = "pipeline_stage"
+    SYNC_TARGET = "sync_target"
+    OUTBOX = "outbox"
+    DEAD_LETTER = "dead_letter"
+
+
+class RecoveryBucket(StrEnum):
+    """Mutually exclusive admin recovery buckets."""
+
+    DEAD_LETTERED = "dead_lettered"
+    STUCK = "stuck"
+    RETRYABLE = "retryable"
+    BLOCKED = "blocked"
+
+
+class RecoveryCapability(StrEnum):
+    """Backend-declared recovery operations available for one work item."""
+
+    RESUME_BACKFILL = "resume_backfill"
+    REPLAY_SOURCE_POST = "replay_source_post"
+    REINSPECT_INGEST = "reinspect_ingest"
+    RETRY_STAGE = "retry_stage"
+    RESYNC_TARGET = "resync_target"
+    REBUILD_OUTBOX = "rebuild_outbox"
+    RECOVER_DEAD_LETTER = "recover_dead_letter"
+    ARCHIVE_DEAD_LETTER = "archive_dead_letter"
+
+
+class RecoveryJobStatus(StrEnum):
+    """Lifecycle for durable recovery batches."""
+
+    PREVIEW = "preview"
+    QUEUED = "queued"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    COMPLETED_WITH_FAILURES = "completed_with_failures"
+    CANCELLED = "cancelled"
+    EXPIRED = "expired"
+
+
+class RecoveryJobItemStatus(StrEnum):
+    """Lifecycle for one item inside a recovery batch."""
+
+    QUEUED = "queued"
+    WAITING_CAPACITY = "waiting_capacity"
+    DISPATCHED = "dispatched"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    SKIPPED_STALE = "skipped_stale"
+    CANCELLED = "cancelled"
+
+
+class RecoveryDeadLetterStatus(StrEnum):
+    """Resolution state for the durable dead-letter ledger."""
+
+    UNRESOLVED = "unresolved"
+    RECOVERY_QUEUED = "recovery_queued"
+    RESOLVED = "resolved"
+    ARCHIVED = "archived"
+
+
+class PipelineAttemptOutcome(StrEnum):
+    """Immutable outcome recorded for one pipeline-stage attempt."""
+
+    PROCESSING = "processing"
+    SUCCEEDED = "succeeded"
+    FAILED_RETRYABLE = "failed_retryable"
+    FAILED_TERMINAL = "failed_terminal"
+    SKIPPED = "skipped"
+
+
+class PipelineCapacityStatus(StrEnum):
+    """Admission state for one pipeline stage."""
+
+    OPEN = "open"
+    CLOSED = "closed"
+
+
+class DependencyCircuitStatus(StrEnum):
+    """Durable dependency circuit-breaker state."""
+
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
 
 
 class ChannelSuggestionStatus(StrEnum):

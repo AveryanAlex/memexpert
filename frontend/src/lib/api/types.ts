@@ -75,9 +75,44 @@ export interface TelegramLinkStartRead {
   return_url: string;
 }
 export type SourcePlatform = 'reddit' | 'telegram' | 'vk';
-export type AdminSourceBackfillStatus = 'failed' | 'idle' | 'queued' | 'running';
+export type AdminSourceBackfillStatus =
+  | 'cancelled'
+  | 'completed'
+  | 'completed_with_failures'
+  | 'failed'
+  | 'idle'
+  | 'queued'
+  | 'running'
+  | 'waiting_capacity'
+  | 'waiting_retry';
 export type AdminSourcePostIndexStatus = 'failed' | 'indexed' | 'not_indexable' | 'partially_indexed' | 'processing';
 export type AdminSourcePostSyncStatus = 'failed' | 'pending' | 'processing' | 'synced';
+export type AdminRecoveryBucket = 'blocked' | 'dead_lettered' | 'retryable' | 'stuck';
+export type AdminRecoveryWorkKind =
+  | 'backfill'
+  | 'dead_letter'
+  | 'ingest_request'
+  | 'outbox'
+  | 'pipeline_stage'
+  | 'source_post'
+  | 'sync_target';
+export type AdminRecoveryCapability =
+  | 'archive_dead_letter'
+  | 'rebuild_outbox'
+  | 'recover_dead_letter'
+  | 'reinspect_ingest'
+  | 'replay_source_post'
+  | 'resync_target'
+  | 'resume_backfill'
+  | 'retry_stage';
+export type AdminRecoveryBatchStatus =
+  | 'cancelled'
+  | 'completed'
+  | 'completed_with_failures'
+  | 'expired'
+  | 'preview'
+  | 'queued'
+  | 'running';
 export type ChannelSuggestionStatus = 'approved' | 'pending' | 'rejected';
 export type TelegramSessionStatus = 'active' | 'auth_required' | 'flood_wait' | 'quarantined' | 'stopped';
 export type ModerationReportStatus = 'pending' | 'in_review' | 'resolved' | 'dismissed';
@@ -653,6 +688,10 @@ export interface AdminSourcePostRead {
   qdrant_status: AdminSourcePostSyncStatus | null;
   meilisearch_status: AdminSourcePostSyncStatus | null;
   index_status: AdminSourcePostIndexStatus;
+  is_retryable: boolean;
+  version: string;
+  capabilities: AdminRecoveryCapability[];
+  blocked_reason: string | null;
 }
 
 export interface AdminSourcePostPageRead {
@@ -667,6 +706,136 @@ export interface AdminSourcePostPageRead {
 
 export interface AdminSourceBackfillPayload {
   message_limit: number;
+}
+
+export interface AdminSourceBackfillRead {
+  id: string;
+  source_channel_id: string;
+  status: AdminSourceBackfillStatus;
+  requested_count: number;
+  scanned_count: number;
+  remaining_count: number;
+  cursor_post_id: string | null;
+  attempt_count: number;
+  quarantined_count: number;
+  last_error_code: string | null;
+  last_error_class: string | null;
+  safe_error: string | null;
+  is_retryable: boolean;
+  next_attempt_at: string | null;
+  last_progress_at: string | null;
+  telegram_session_id: string | null;
+  telegram_session_name: string | null;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  updated_at: string;
+  version: string;
+  capabilities: AdminRecoveryCapability[];
+}
+
+export interface AdminSourceBackfillListRead {
+  items: AdminSourceBackfillRead[];
+}
+
+export interface AdminRecoverySummaryRead {
+  retryable_count: number;
+  blocked_count: number;
+  stuck_count: number;
+  dead_lettered_count: number;
+}
+
+export interface AdminRecoveryWorkRead {
+  kind: AdminRecoveryWorkKind;
+  id: string;
+  bucket: AdminRecoveryBucket;
+  title: string;
+  source_label: string | null;
+  source_channel_id: string | null;
+  post_id: string | null;
+  meme_file_id: string | null;
+  stage: string | null;
+  target: string | null;
+  status: string;
+  reason: string | null;
+  safe_error: string | null;
+  error_code: string | null;
+  is_retryable: boolean;
+  attempt_count: number;
+  occurred_at: string;
+  next_attempt_at: string | null;
+  version: string;
+  capabilities: AdminRecoveryCapability[];
+  blocked_reason: string | null;
+  details: Record<string, string | number | boolean | null>;
+}
+
+export interface AdminRecoveryWorkPageRead {
+  items: AdminRecoveryWorkRead[];
+  next_cursor: string | null;
+  snapshot_at: string;
+}
+
+export interface AdminRecoveryMutationPayload {
+  request_id: string;
+  version: string;
+  reason: string;
+  capability: AdminRecoveryCapability;
+}
+
+export interface AdminRecoveryWorkReference {
+  kind: AdminRecoveryWorkKind;
+  id: string;
+  version: string;
+}
+
+export interface AdminRecoveryBatchPreviewPayload {
+  request_id: string;
+  reason: string;
+  capability: AdminRecoveryCapability;
+  items: AdminRecoveryWorkReference[];
+}
+
+export interface AdminRecoveryBatchMutationPayload {
+  version: string;
+  reason: string;
+}
+
+export interface AdminRecoveryJobItemRead {
+  id: string;
+  work_kind: AdminRecoveryWorkKind;
+  work_id: string;
+  action: AdminRecoveryCapability;
+  status: 'cancelled' | 'dispatched' | 'failed' | 'queued' | 'skipped_stale' | 'succeeded' | 'waiting_capacity';
+  normalized_reason: string | null;
+  safe_error: string | null;
+  dispatched_at: string | null;
+  finished_at: string | null;
+}
+
+export interface AdminRecoveryBatchRead {
+  id: string;
+  request_id: string;
+  status: AdminRecoveryBatchStatus;
+  action: AdminRecoveryCapability;
+  reason: string;
+  total_count: number;
+  completed_count: number;
+  failed_count: number;
+  expires_at: string | null;
+  scheduled_at: string | null;
+  completed_at: string | null;
+  cancelled_at: string | null;
+  created_at: string;
+  updated_at: string;
+  version: string;
+  items: AdminRecoveryJobItemRead[];
+}
+
+export interface AdminSourceRecoveryMutationPayload {
+  request_id: string;
+  version: string;
+  reason: string;
 }
 
 export interface AdminTelegramSessionRead {

@@ -52,6 +52,69 @@ def test_parse_consumer_queues_returns_registered_queue_names() -> None:
     }
 
 
+def test_parse_pipeline_consumer_ownership_maps_inspectable_role_arguments() -> None:
+    payload = json.dumps(
+        [
+            {
+                "queue_name": "pipeline.media_inspect",
+                "consumer_tag": "ctag3.a67ebace3517446c82bcad1c2334f75d",
+                "arguments": [["x-memexpert-worker-role", "longstr", "media"]],
+            },
+            {
+                "queue_name": "pipeline.ocr",
+                "consumer_tag": "ctag2.c718a740c9804c87b7d564d35ec0c54d",
+                "arguments": [["x-memexpert-worker-role", "longstr", "ocr"]],
+            },
+            {"queue_name": "unrelated", "consumer_tag": "amq.ctag-generated", "arguments": []},
+        ]
+    )
+
+    assert run_container_e2e.parse_pipeline_consumer_ownership(payload) == {
+        "pipeline.media_inspect": ["media"],
+        "pipeline.ocr": ["ocr"],
+    }
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ("not-a-table", "invalid arguments"),
+        ([["x-memexpert-worker-role", "longstr"]], "triplet"),
+        ([["x-memexpert-worker-role", "longstr", 7]], "invalid x-memexpert-worker-role"),
+    ],
+)
+def test_parse_pipeline_consumer_ownership_rejects_malformed_arguments(
+    arguments: object,
+    message: str,
+) -> None:
+    payload = json.dumps([{"queue_name": "pipeline.ocr", "arguments": arguments}])
+
+    with pytest.raises(run_container_e2e.RabbitMQConsumerInspectionError, match=message):
+        run_container_e2e.parse_pipeline_consumer_ownership(payload)
+
+
+def test_wait_for_pipeline_consumer_ownership_retries_wrong_role_then_succeeds() -> None:
+    observations = [
+        {"pipeline.ocr": ["media"]},
+        {"pipeline.ocr": ["ocr"]},
+    ]
+    clock = FakeClock()
+
+    run_container_e2e.wait_for_pipeline_consumer_ownership(
+        ["docker", "compose"],
+        env={},
+        expected_roles={"pipeline.ocr": "ocr"},
+        timeout_seconds=2.0,
+        poll_interval_seconds=1.0,
+        inspect_consumers=lambda _remaining: observations.pop(0),
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    assert observations == []
+    assert clock.sleeps == [1.0]
+
+
 @pytest.mark.parametrize(
     ("payload", "message"),
     [
@@ -307,6 +370,7 @@ def test_main_records_capture_failure_without_failing_successful_assertions(
     monkeypatch.setattr(run_container_e2e, "assert_project_available", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(run_container_e2e, "run_checked", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(run_container_e2e, "wait_for_pipeline_consumers", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(run_container_e2e, "wait_for_pipeline_consumer_ownership", lambda *_args, **_kwargs: None)
     capture_failure = run_container_e2e.CommandFailure(
         command=("docker", "compose", "logs"),
         message="command exited with status 7",
@@ -341,6 +405,7 @@ def test_main_retains_claim_and_records_failed_teardown_without_failing_assertio
     monkeypatch.setattr(run_container_e2e, "assert_project_available", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(run_container_e2e, "run_checked", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(run_container_e2e, "wait_for_pipeline_consumers", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(run_container_e2e, "wait_for_pipeline_consumer_ownership", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(run_container_e2e, "collect_artifacts", lambda *_args, **_kwargs: [])
     teardown_failure = run_container_e2e.CommandFailure(
         command=("docker", "compose", "down"),
@@ -419,6 +484,7 @@ def test_main_keep_stack_retains_claim_without_attempting_cleanup(
     monkeypatch.setattr(run_container_e2e, "assert_project_available", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(run_container_e2e, "run_checked", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(run_container_e2e, "wait_for_pipeline_consumers", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(run_container_e2e, "wait_for_pipeline_consumer_ownership", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(run_container_e2e, "collect_artifacts", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(
         run_container_e2e,

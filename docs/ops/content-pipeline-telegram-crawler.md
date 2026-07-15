@@ -86,6 +86,18 @@ The crawler ships five operator-facing pieces:
     an in-flight catch-up/reload can delay the next poll. Polling reads
     PostgreSQL only; Telegram clients are rebuilt only when the control
     projection changes.
+  - `CRAWLER_TELEGRAM_REQUEST_RETRIES` / `CRAWLER_TELEGRAM_CONNECTION_RETRIES`
+    — Telethon's internal retry budgets, both defaulting to **2**. Durable
+    crawler/backfill retries own subsequent logical attempts.
+  - `CRAWLER_TELEGRAM_CONNECT_TIMEOUT_SECONDS` (**20s**),
+    `CRAWLER_TELEGRAM_RESOLVE_TIMEOUT_SECONDS` (**30s**),
+    `CRAWLER_TELEGRAM_HISTORY_PAGE_TIMEOUT_SECONDS` (**60s**),
+    `CRAWLER_TELEGRAM_SINGLE_MESSAGE_TIMEOUT_SECONDS` (**30s**), and
+    `CRAWLER_TELEGRAM_MEDIA_DOWNLOAD_TIMEOUT_SECONDS` (**120s**) are hard
+    caller-owned deadlines. A transport timeout discards the whole Telethon
+    client; the next account operation builds a fresh connection. Telethon's
+    background `auto_reconnect` loop is deliberately disabled so a dead socket
+    terminates the account listener and enters this supervised rebuild path.
 
 ## Browser-admin workspaces
 
@@ -249,12 +261,23 @@ so messages arriving while an operator changes pages cannot shift rows between
 offsets; return to the source detail URL without that snapshot to see newer rows.
 
 Use the older-history form on that page to queue a bounded manual backfill (for
-example, 16,000 posts after an initial 1,000-message window). The crawler resumes
-durable queued/running work independently of the live listener. Older history
+example, 16,000 posts after an initial 1,000-message window). The isolated
+`telegram` worker role resumes durable queued/running work independently of the
+crawler's live listener. Older history
 is processed newest-to-oldest within each page so a failed page can resume
 without skipping its unprocessed suffix. It advances `oldest_observed_post_id`
 and the private history cursor only, never `last_read_post_id`; an empty older
-page marks Telegram history exhausted. The form stays unavailable until the
+page marks Telegram history exhausted. Each lease executes at most one
+100-message page, then releases the job so live/account work and other sources
+remain schedulable. Transient page failures use at most five automatic logical
+attempts; the resulting retryable failure is resumed explicitly from the
+backfill history in `/admin/recovery` after the account/source issue is fixed.
+
+A retryable individual post holds the older-history cursor for two retries. On
+the third failure that post alone is quarantined, the cursor advances, and the
+remaining page continues. Its failed inventory row stays available for an
+audited manual replay. Historical failures present before migration `0034` are
+never replayed automatically. The form stays unavailable until the
 bounded initial window completed and requires catch-up to be enabled on both
 the source and its assigned ready Telegram account.
 
@@ -668,8 +691,18 @@ the worker image because preview extraction requires FFmpeg and Pillow.
   `max_requests_per_second`. Lower both in browser admin; the crawler
   automatically reconciles the account policy change.
 - **`telegram_provider_unavailable`.** Telegram is reachable but refused
-  the request. Transient; the runtime reports the stage as retryable and
-  the worker will requeue it.
+  the request, a transport deadline expired, or Telethon exhausted its own
+  retry loop (including `Request was unsuccessful N time(s)`). Transient; the
+  runtime reports the work as retryable. Search journald for
+  `event=telegram_operation_failed`; the structured record includes account,
+  operation, channel/post context, deadline, source error class, and whether
+  the cached client was reset.
+- **Live listener terminated after startup.** The steady-state reconciliation
+  tick observes completed account-scoped listener tasks, invalidates only that
+  account's cached client, and starts a fresh listener. Healthy account handles
+  stay running. Repeated `telegram_live_listener_terminated` followed by
+  `telegram_live_listener_restart_failed` indicates an account/provider issue,
+  not a reason to restart unrelated accounts manually.
 - **Network/provider blocked runtime.** If Telegram, Qdrant, Meilisearch,
   or the embedding/OCR provider is unreachable from local or staging, the
   correct result is failed or incomplete pipeline evidence in

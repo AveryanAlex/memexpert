@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
+import re
 from contextlib import suppress
 from dataclasses import dataclass, field
 from io import BytesIO
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, NoReturn, TypeVar, cast
 
 from pydantic import SecretStr
 from sqlalchemy import select
@@ -23,7 +25,9 @@ from telethon.errors import (
     AuthKeyUnregisteredError,
     FloodWaitError,
     RPCError,
+    ServerError,
     SessionRevokedError,
+    TimedOutError,
     UserDeactivatedError,
 )
 from telethon.sessions import StringSession
@@ -54,7 +58,7 @@ from memexpert.models.content import TelegramSession
 from memexpert.models.enums import TelegramSessionStatus
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Sequence
+    from collections.abc import AsyncIterator, Awaitable, Sequence
 
     from sqlalchemy.ext.asyncio import AsyncEngine
     from telethon.events import NewMessage
@@ -63,12 +67,17 @@ if TYPE_CHECKING:
     from memexpert.core.database import AsyncSessionFactory
 
 
+logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
+
 # Telethon's AUTH-level failures that indicate actual account/session
 # revocation are permanent until an operator rotates the registry row.
 _SESSION_BANNED_EXCEPTIONS: tuple[type[BaseException], ...] = (
     UserDeactivatedError,
     SessionRevokedError,
 )
+_EXHAUSTED_REQUEST_PATTERN = re.compile(r"\bRequest was unsuccessful \d+ time\(s\)", re.IGNORECASE)
 
 
 def _translate_telethon_error(exc: BaseException) -> PipelineTelegramError:
@@ -88,6 +97,10 @@ def _translate_telethon_error(exc: BaseException) -> PipelineTelegramError:
     * Anything else escapes unchanged so real bugs stay loud.
     """
 
+    if _EXHAUSTED_REQUEST_PATTERN.search(str(exc)):
+        return PipelineTelegramProviderUnavailableError(
+            "Telegram exhausted its internal request retries before receiving a response.",
+        )
     if isinstance(exc, FloodWaitError):
         wait_seconds = int(getattr(exc, "seconds", 0) or 0)
         return PipelineTelegramFloodWaitError(
@@ -107,6 +120,44 @@ def _translate_telethon_error(exc: BaseException) -> PipelineTelegramError:
             f"Telegram RPC or transport failure: {exc.__class__.__name__}: {exc}.",
         )
     raise exc  # pragma: no cover - propagate unknown types for visibility
+
+
+def _requires_client_reset(exc: BaseException) -> bool:
+    """Return whether a failed operation may have poisoned Telethon transport state."""
+
+    return isinstance(exc, (ConnectionError, TimeoutError, OSError, ServerError, TimedOutError)) or bool(
+        _EXHAUSTED_REQUEST_PATTERN.search(str(exc)),
+    )
+
+
+def _log_operation_failure(
+    *,
+    operation: str,
+    session_name: str,
+    exc: BaseException,
+    translated_error: PipelineTelegramError,
+    timeout_seconds: float,
+    client_reset: bool,
+    channel_id: str | None = None,
+    post_id: str | None = None,
+) -> None:
+    """Emit a stable, queryable operation failure without leaking credentials."""
+
+    logger.warning(
+        "telegram_operation_failed",
+        extra={
+            "event": "telegram_operation_failed",
+            "operation": operation,
+            "session_name": session_name,
+            "channel_id": channel_id,
+            "post_id": post_id,
+            "timeout_seconds": timeout_seconds,
+            "error_class": type(exc).__name__,
+            "translated_error_class": type(translated_error).__name__,
+            "retryable": isinstance(translated_error, PipelineTelegramProviderUnavailableError),
+            "client_reset": client_reset,
+        },
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,19 +208,39 @@ class TelethonClientFactory:
                 return self._client
             session_config = await self._load_session_config()
             self._max_requests_per_second = session_config.max_requests_per_second
-            self._client = self._build_client(session_config.string_session)
+            client = self._build_client(session_config.string_session)
+            self._client = client
+            timeout_seconds = self.settings.crawler_telegram_connect_timeout_seconds
             try:
-                await self._client.connect()
+                async with asyncio.timeout(timeout_seconds):
+                    await client.connect()
+                    is_authorized = await client.is_user_authorized()
+                    account = await client.get_me() if is_authorized else None
             except Exception as exc:  # narrow: rewrap and re-raise as typed error
-                translated_error = _translate_telethon_error(exc)
+                try:
+                    translated_error = _translate_telethon_error(exc)
+                except BaseException:
+                    self._client = None
+                    await self._disconnect_client(client)
+                    raise
                 if isinstance(translated_error, PipelineTelegramSessionAuthRequiredError):
                     with suppress(Exception):
                         await self._mark_auth_required(
                             error_class=type(translated_error).__name__,
                             error_text=str(translated_error),
                         )
+                _log_operation_failure(
+                    operation="connect_auth",
+                    session_name=self.session_name,
+                    exc=exc,
+                    translated_error=translated_error,
+                    timeout_seconds=timeout_seconds,
+                    client_reset=True,
+                )
+                self._client = None
+                await self._disconnect_client(client)
                 raise translated_error from exc
-            if not await self._client.is_user_authorized():
+            if not is_authorized:
                 message = (
                     f"Telegram session {self.session_name!r} is not authorized; "
                     "import a valid Telethon StringSession with scripts/auth_telegram_session.py."
@@ -179,13 +250,11 @@ class TelethonClientFactory:
                         error_class=PipelineTelegramSessionAuthRequiredError.__name__,
                         error_text=message,
                     )
-                with suppress(Exception):
-                    disconnect_result: object = self._client.disconnect()
-                    if inspect.isawaitable(disconnect_result):
-                        await disconnect_result
+                self._client = None
+                await self._disconnect_client(client)
                 raise PipelineTelegramSessionAuthRequiredError(message)
-            await self._mark_authorized(client=self._client)
-            return self._client
+            await self._mark_authorized(account=account)
+            return client
 
     def _build_client(self, string_session: SecretStr) -> TelegramClient:
         """Construct the ``TelegramClient`` bound to this DB-backed StringSession."""
@@ -194,13 +263,19 @@ class TelethonClientFactory:
         api_hash_secret = self.settings.telegram_api_hash
         if api_id is None or api_hash_secret is None:
             raise PipelineTelegramProviderUnavailableError(
-                "Telegram API credentials are not configured; "
-                "set TELEGRAM_API_ID and TELEGRAM_API_HASH.",
+                "Telegram API credentials are not configured; set TELEGRAM_API_ID and TELEGRAM_API_HASH.",
             )
         return TelegramClient(
             session=StringSession(string_session.get_secret_value()),
             api_id=api_id,
             api_hash=api_hash_secret.get_secret_value(),
+            request_retries=self.settings.crawler_telegram_request_retries,
+            connection_retries=self.settings.crawler_telegram_connection_retries,
+            raise_last_call_error=True,
+            # Process-level account supervision owns reconnects.  Disabling
+            # Telethon's indefinite background reconnect loop ensures a dead
+            # socket completes ``client.disconnected`` and gets fully rebuilt.
+            auto_reconnect=False,
         )
 
     async def _load_session_config(self) -> _LoadedTelegramSessionConfig:
@@ -209,9 +284,7 @@ class TelethonClientFactory:
         session_factory = self._get_session_factory()
         async with session_factory() as db_session:
             row = await db_session.scalar(
-                select(TelegramSession)
-                .where(TelegramSession.name == self.session_name)
-                .limit(1),
+                select(TelegramSession).where(TelegramSession.name == self.session_name).limit(1),
             )
             if row is None:
                 raise PipelineTelegramSessionNotRunnableError(
@@ -253,9 +326,7 @@ class TelethonClientFactory:
         session_factory = self._get_session_factory()
         async with session_factory() as db_session:
             row = await db_session.scalar(
-                select(TelegramSession)
-                .where(TelegramSession.name == self.session_name)
-                .limit(1),
+                select(TelegramSession).where(TelegramSession.name == self.session_name).limit(1),
             )
             if row is None:
                 return
@@ -264,22 +335,13 @@ class TelethonClientFactory:
             row.last_error_text = error_text[:4000]
             await db_session.commit()
 
-    async def _mark_authorized(self, *, client: TelegramClient) -> None:
+    async def _mark_authorized(self, *, account: object | None) -> None:
         """Persist heartbeat and safe account projection fields after authorization."""
 
-        account = None
-        get_me = getattr(client, "get_me", None)
-        if get_me is not None:
-            try:
-                account = await get_me()
-            except Exception:
-                account = None
         session_factory = self._get_session_factory()
         async with session_factory() as db_session:
             row = await db_session.scalar(
-                select(TelegramSession)
-                .where(TelegramSession.name == self.session_name)
-                .limit(1),
+                select(TelegramSession).where(TelegramSession.name == self.session_name).limit(1),
             )
             if row is None:
                 return
@@ -305,13 +367,34 @@ class TelethonClientFactory:
             self._session_factory = build_async_session_factory(self._engine)
         return self._session_factory
 
+    async def invalidate_client(self, *, client: TelegramClient | None = None) -> None:
+        """Disconnect and evict the cached client after a poisoned transport failure."""
+
+        async with self._lock:
+            current_client = self._client
+            if current_client is None or (client is not None and current_client is not client):
+                return
+            self._client = None
+        await self._disconnect_client(current_client)
+
     async def close(self) -> None:
-        """Dispose any engine this factory created for DB-backed session loading."""
+        """Disconnect the client and dispose any engine created by this factory."""
+
+        await self.invalidate_client()
 
         if self._engine is not None:
             await self._engine.dispose()
             self._engine = None
             self._session_factory = None
+
+    async def _disconnect_client(self, client: TelegramClient) -> None:
+        """Best-effort bounded disconnect used by failure and shutdown paths."""
+
+        with suppress(Exception):
+            disconnect_result: object = client.disconnect()
+            if inspect.isawaitable(disconnect_result):
+                async with asyncio.timeout(min(self.settings.crawler_telegram_connect_timeout_seconds, 5.0)):
+                    await disconnect_result
 
 
 class _RateLimiter:
@@ -402,6 +485,84 @@ class PipelineTelethonClient(PipelineTelegramClientProtocol):
             )
         return client
 
+    async def _await_operation(
+        self,
+        awaitable: Awaitable[_T],
+        *,
+        operation: str,
+        timeout_seconds: float,
+        client: TelegramClient,
+        channel_id: str | None = None,
+        post_id: str | None = None,
+    ) -> _T:
+        """Await one Telethon RPC under a named deadline and normalize failures."""
+
+        try:
+            async with asyncio.timeout(timeout_seconds):
+                return await awaitable
+        except Exception as exc:
+            await self._raise_operation_error(
+                operation=operation,
+                timeout_seconds=timeout_seconds,
+                client=client,
+                exc=exc,
+                channel_id=channel_id,
+                post_id=post_id,
+            )
+
+    async def _next_history_message(
+        self,
+        iterator: AsyncIterator[Any],
+        *,
+        client: TelegramClient,
+        channel_id: str,
+    ) -> Any:
+        """Bound the wait for each Telethon history page fetched by an iterator."""
+
+        timeout_seconds = self.factory.settings.crawler_telegram_history_page_timeout_seconds
+        try:
+            async with asyncio.timeout(timeout_seconds):
+                return await anext(iterator)
+        except StopAsyncIteration:
+            raise
+        except Exception as exc:
+            await self._raise_operation_error(
+                operation="history_page",
+                timeout_seconds=timeout_seconds,
+                client=client,
+                exc=exc,
+                channel_id=channel_id,
+            )
+
+    async def _raise_operation_error(
+        self,
+        *,
+        operation: str,
+        timeout_seconds: float,
+        client: TelegramClient,
+        exc: BaseException,
+        channel_id: str | None = None,
+        post_id: str | None = None,
+    ) -> NoReturn:
+        """Translate, log, and evict a client whose transport may be unhealthy."""
+
+        translated_error = _translate_telethon_error(exc)
+        client_reset = _requires_client_reset(exc)
+        _log_operation_failure(
+            operation=operation,
+            session_name=self.factory.session_name,
+            exc=exc,
+            translated_error=translated_error,
+            timeout_seconds=timeout_seconds,
+            client_reset=client_reset,
+            channel_id=channel_id,
+            post_id=post_id,
+        )
+        if client_reset:
+            self._entity_cache.clear()
+            await self.factory.invalidate_client(client=client)
+        raise translated_error from exc
+
     async def _resolve_entity(self, channel_id_or_username: str) -> Channel:
         """Return the cached :class:`Channel` entity for a channel identifier.
 
@@ -416,10 +577,13 @@ class PipelineTelethonClient(PipelineTelegramClientProtocol):
             return cached
         client = await self._get_client()
         await self.rate_limiter.acquire()
-        try:
-            entity = await client.get_entity(channel_id_or_username)
-        except Exception as exc:
-            raise _translate_telethon_error(exc) from exc
+        entity = await self._await_operation(
+            client.get_entity(channel_id_or_username),
+            operation="resolve_channel",
+            timeout_seconds=self.factory.settings.crawler_telegram_resolve_timeout_seconds,
+            client=client,
+            channel_id=channel_id_or_username,
+        )
         if not isinstance(entity, Channel):
             raise PipelineTelegramMalformedMessageError(
                 f"Telegram entity {channel_id_or_username!r} is not a channel.",
@@ -442,21 +606,28 @@ class PipelineTelethonClient(PipelineTelegramClientProtocol):
         channel_username = getattr(entity, "username", None)
         min_id = int(min_message_id) if min_message_id is not None else 0
         await self.rate_limiter.acquire()
-        try:
-            async for raw_message in client.iter_messages(
-                entity,
-                limit=limit,
-                min_id=min_id,
-                reverse=True,
-            ):
+        iterator = client.iter_messages(
+            entity,
+            limit=limit,
+            min_id=min_id,
+            reverse=True,
+        ).__aiter__()
+        while True:
+            try:
+                raw_message = await self._next_history_message(
+                    cast("AsyncIterator[Any]", iterator),
+                    client=client,
+                    channel_id=channel_id,
+                )
+            except StopAsyncIteration:
+                break
+            else:
                 yield TelethonMessageNormalizer.build(
                     message=raw_message,
                     channel_id=channel_id,
                     channel_title=channel_title,
                     channel_username=channel_username,
                 )
-        except Exception as exc:
-            raise _translate_telethon_error(exc) from exc
 
     async def iter_latest_channel_messages(
         self,
@@ -512,12 +683,21 @@ class PipelineTelethonClient(PipelineTelegramClientProtocol):
         channel_username = getattr(entity, "username", None)
         messages: list[RawTelegramMessage] = []
         await self.rate_limiter.acquire()
-        try:
-            async for raw_message in client.iter_messages(
-                entity,
-                limit=limit,
-                max_id=max_message_id or 0,
-            ):
+        iterator = client.iter_messages(
+            entity,
+            limit=limit,
+            max_id=max_message_id or 0,
+        ).__aiter__()
+        while True:
+            try:
+                raw_message = await self._next_history_message(
+                    cast("AsyncIterator[Any]", iterator),
+                    client=client,
+                    channel_id=channel_id,
+                )
+            except StopAsyncIteration:
+                break
+            else:
                 messages.append(
                     TelethonMessageNormalizer.build(
                         message=raw_message,
@@ -526,8 +706,6 @@ class PipelineTelethonClient(PipelineTelegramClientProtocol):
                         channel_username=channel_username,
                     )
                 )
-        except Exception as exc:
-            raise _translate_telethon_error(exc) from exc
         return messages
 
     async def listen_live(
@@ -590,11 +768,45 @@ class PipelineTelethonClient(PipelineTelegramClientProtocol):
         if ready_event is not None:
             ready_event.set()
 
+        disconnected_awaitable = getattr(client, "disconnected", None)
+        disconnected_guard = (
+            asyncio.ensure_future(asyncio.shield(disconnected_awaitable))
+            if inspect.isawaitable(disconnected_awaitable)
+            else None
+        )
         try:
             while not self._closed:
-                next_message = await queue.get()
+                next_message_task = asyncio.create_task(queue.get())
+                try:
+                    if disconnected_guard is None:
+                        next_message = await next_message_task
+                    else:
+                        done, _ = await asyncio.wait(
+                            (next_message_task, disconnected_guard),
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if disconnected_guard in done:
+                            if self._closed:
+                                return
+                            disconnect_error: BaseException | None = None
+                            if not disconnected_guard.cancelled():
+                                disconnect_error = disconnected_guard.exception()
+                            await self._raise_operation_error(
+                                operation="listen_live",
+                                timeout_seconds=self.factory.settings.crawler_telegram_connect_timeout_seconds,
+                                client=client,
+                                exc=disconnect_error
+                                or ConnectionError("Telethon disconnected while the live listener was active."),
+                            )
+                        next_message = next_message_task.result()
+                finally:
+                    if not next_message_task.done():
+                        next_message_task.cancel()
+                        _ = await asyncio.gather(next_message_task, return_exceptions=True)
                 yield next_message
         finally:
+            if disconnected_guard is not None and not disconnected_guard.done():
+                disconnected_guard.cancel()
             if self._live_handler is not None:
                 with suppress(Exception):
                     client.remove_event_handler(self._live_handler)
@@ -612,10 +824,14 @@ class PipelineTelethonClient(PipelineTelegramClientProtocol):
             )
         media_buffer = BytesIO()
         await self.rate_limiter.acquire()
-        try:
-            _ = await client.download_media(raw_payload, file=media_buffer)
-        except Exception as exc:
-            raise _translate_telethon_error(exc) from exc
+        _ = await self._await_operation(
+            client.download_media(raw_payload, file=media_buffer),
+            operation="download_media",
+            timeout_seconds=self.factory.settings.crawler_telegram_media_download_timeout_seconds,
+            client=client,
+            channel_id=message.channel_id,
+            post_id=message.message_id,
+        )
         result = media_buffer.getvalue()
         if not result:
             raise PipelineTelegramMalformedMessageError(
@@ -654,10 +870,14 @@ class PipelineTelethonClient(PipelineTelegramClientProtocol):
                 f"Telegram post ids must be numeric; got {post_id!r}.",
             ) from exc
         await self.rate_limiter.acquire()
-        try:
-            fetched = await client.get_messages(entity, ids=numeric_post_id)
-        except Exception as exc:
-            raise _translate_telethon_error(exc) from exc
+        fetched = await self._await_operation(
+            client.get_messages(entity, ids=numeric_post_id),
+            operation="fetch_single_message",
+            timeout_seconds=self.factory.settings.crawler_telegram_single_message_timeout_seconds,
+            client=client,
+            channel_id=channel_id,
+            post_id=post_id,
+        )
         if fetched is None:
             raise PipelineTelegramMalformedMessageError(
                 f"Telegram returned no message for ({channel_id!r}, {post_id!r}).",
@@ -686,12 +906,6 @@ class PipelineTelethonClient(PipelineTelegramClientProtocol):
                     live_queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
-        client = self.factory._client  # noqa: SLF001 - intentional peek: close-only path
-        if client is not None and client.is_connected():
-            with suppress(Exception):
-                disconnect_result: object = client.disconnect()
-                if inspect.isawaitable(disconnect_result):
-                    await disconnect_result
         await self.factory.close()
 
 

@@ -23,9 +23,9 @@ only; do not paste real secret values into tickets, logs, or committed files.
 
 ## Safety Rules
 
-- Freeze app writes before a destructive restore: stop `frontend`, `api`,
-  `workers`, `scheduler`, and `telegram-crawler` first. Stop the optional `bot`
-  too if that profile is enabled.
+- Freeze app writes before a destructive restore: stop `frontend`, `api`, all
+  five `worker-*` roles, `scheduler`, and `telegram-crawler` first. Stop the
+  optional `bot` too if that profile is enabled.
 - Take a fresh PostgreSQL and object-storage backup before any production
   rollback or restore, even if the incident is urgent.
 - Do not roll back the database just because service images are rolling back.
@@ -94,7 +94,8 @@ export ENV_FILE=.env.prod
 export COMPOSE_FILE=docker-compose.prod.example.yml
 export BACKUP_TS=<timestamp>
 
-docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" stop frontend api workers scheduler telegram-crawler
+docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" stop \
+  frontend api worker-media worker-ocr worker-enrichment worker-sync worker-telegram scheduler telegram-crawler
 
 docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" exec -T postgres sh -lc \
   'dropdb --if-exists -U "$POSTGRES_USER" "$POSTGRES_DB" && createdb -U "$POSTGRES_USER" "$POSTGRES_DB"'
@@ -108,7 +109,8 @@ docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" run --rm \
   --entrypoint /bin/sh minio-init -lc \
   'mc alias set prod http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" && mc mirror --overwrite "/backup/s3/$S3_BUCKET" "prod/$S3_BUCKET"'
 
-docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d migrate api workers scheduler telegram-crawler frontend
+docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d \
+  migrate api worker-media worker-ocr worker-enrichment worker-sync worker-telegram scheduler telegram-crawler frontend
 ```
 
 Add the optional `bot` service to the stop/up commands only when the bot profile
@@ -128,8 +130,10 @@ export MEMEXPERT_WORKER_IMAGE="ghcr.io/averyanalex/memexpert/worker:$PREVIOUS_SH
 export MEMEXPERT_FRONTEND_IMAGE="ghcr.io/averyanalex/memexpert/frontend:$PREVIOUS_SHA_TAG"
 
 docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" config --images
-docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" pull migrate api workers scheduler telegram-crawler frontend
-docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d --no-build migrate api workers scheduler telegram-crawler frontend
+docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" pull \
+  migrate api worker-media worker-ocr worker-enrichment worker-sync worker-telegram scheduler telegram-crawler frontend
+docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d --no-build \
+  migrate api worker-media worker-ocr worker-enrichment worker-sync worker-telegram scheduler telegram-crawler frontend
 docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" ps
 ```
 
@@ -239,7 +243,8 @@ After any real restore or rollback:
 
 ```bash
 docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" ps
-docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" logs --since 10m api workers scheduler telegram-crawler
+docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" logs --since 10m \
+  api worker-media worker-ocr worker-enrichment worker-sync worker-telegram scheduler telegram-crawler
 curl -fsS http://127.0.0.1:<api-port>/health
 ```
 

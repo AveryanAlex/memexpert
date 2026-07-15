@@ -39,6 +39,11 @@ x-app-env: &app-env
   PIPELINE_QDRANT_COLLECTION_NAME: memexpert-memes-e2e
   PIPELINE_MEILISEARCH_INDEX_NAME: memexpert-memes-e2e
   PIPELINE_WORKER_PREFETCH_COUNT: "1"
+  RUNTIME_HEALTH_FILE: /tmp/memexpert-runtime-health.json
+  RUNTIME_HEALTH_INTERVAL_SECONDS: "1.0"
+  RUNTIME_HEALTH_STALE_AFTER_SECONDS: "10.0"
+  RUNTIME_HEALTH_OPERATION_TIMEOUT_SECONDS: "120.0"
+  DATABASE_POOL_TIMEOUT_SECONDS: "5.0"
   AUTH_JWT_SECRET: ${AUTH_JWT_SECRET:-memexpert-e2e-jwt-secret-with-32-byte-minimum}
   AUTH_ACCESS_COOKIE_SECURE: "false"
   SECURITY_CORS_ALLOWED_ORIGINS: http://frontend:3000,http://localhost:3000,http://127.0.0.1:3000
@@ -201,16 +206,110 @@ services:
       migrate:
         condition: service_completed_successfully
 
-  workers:
+  worker-media:
     <<: *worker-image
-    environment: *app-env
+    command: ["memexpert-workers", "--role", "media"]
+    environment:
+      <<: *app-env
+      PIPELINE_WORKER_PREFETCH_COUNT: "1"
+      DATABASE_POOL_SIZE: "2"
+      DATABASE_MAX_OVERFLOW: "1"
+      DATABASE_APPLICATION_NAME: memexpert-e2e-worker-media
     depends_on:
       migrate:
         condition: service_completed_successfully
       rabbitmq:
         condition: service_healthy
     healthcheck:
-      disable: true
+      test: ["CMD", "memexpert-runtime-health"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 20s
+
+  worker-ocr:
+    <<: *worker-image
+    command: ["memexpert-workers", "--role", "ocr"]
+    environment:
+      <<: *app-env
+      PIPELINE_WORKER_PREFETCH_COUNT: "1"
+      DATABASE_POOL_SIZE: "1"
+      DATABASE_MAX_OVERFLOW: "1"
+      DATABASE_APPLICATION_NAME: memexpert-e2e-worker-ocr
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "memexpert-runtime-health"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 30s
+
+  worker-enrichment:
+    <<: *worker-image
+    command: ["memexpert-workers", "--role", "enrichment"]
+    environment:
+      <<: *app-env
+      PIPELINE_WORKER_PREFETCH_COUNT: "2"
+      DATABASE_POOL_SIZE: "3"
+      DATABASE_MAX_OVERFLOW: "1"
+      DATABASE_APPLICATION_NAME: memexpert-e2e-worker-enrichment
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "memexpert-runtime-health"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 20s
+
+  worker-sync:
+    <<: *worker-image
+    command: ["memexpert-workers", "--role", "sync"]
+    environment:
+      <<: *app-env
+      PIPELINE_WORKER_PREFETCH_COUNT: "4"
+      DATABASE_POOL_SIZE: "3"
+      DATABASE_MAX_OVERFLOW: "1"
+      DATABASE_APPLICATION_NAME: memexpert-e2e-worker-sync
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "memexpert-runtime-health"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 20s
+
+  worker-telegram:
+    <<: *worker-image
+    command: ["memexpert-workers", "--role", "telegram"]
+    environment:
+      <<: *app-env
+      PIPELINE_WORKER_PREFETCH_COUNT: "1"
+      DATABASE_POOL_SIZE: "2"
+      DATABASE_MAX_OVERFLOW: "1"
+      DATABASE_APPLICATION_NAME: memexpert-e2e-worker-telegram
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "memexpert-runtime-health"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 20s
 
   frontend:
     image: ${MEMEXPERT_FRONTEND_IMAGE:-memexpert-frontend:e2e}
@@ -245,8 +344,16 @@ services:
     depends_on:
       api:
         condition: service_healthy
-      workers:
-        # The orchestrator separately gates seed on all seven RabbitMQ consumers.
+      worker-media:
+        # The orchestrator separately gates seed on role ownership for all seven RabbitMQ consumers.
+        condition: service_started
+      worker-ocr:
+        condition: service_started
+      worker-enrichment:
+        condition: service_started
+      worker-sync:
+        condition: service_started
+      worker-telegram:
         condition: service_started
     volumes:
       - type: bind

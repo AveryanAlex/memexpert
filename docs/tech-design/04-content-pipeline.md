@@ -251,7 +251,7 @@ popularity from durable PostgreSQL state.
 
 ## Processing
 
-Event-driven pipeline using **FastStream + RabbitMQ**. Each processing stage is a FastStream subscriber that consumes from one exchange/queue and publishes to the next. Stages are independent processes — they can be scaled, deployed, and restarted separately.
+Event-driven pipeline using **FastStream + RabbitMQ**. Each processing stage is a FastStream subscriber that consumes from one exchange/queue and publishes to the next. Production groups subscribers into five isolated roles backed by one worker image: `media`, `ocr`, `enrichment`, `sync`, and `telegram`; local development and rollback retain `--role all`.
 
 ### Event Topology
 
@@ -292,16 +292,15 @@ raw_meme ──→ [API Accept: ingest_request + outbox] ──→ [Outbox Publi
 
 ### Queues by Resource Profile
 
-| Queue | Resource Profile | Consumer |
-|-------|-----------------|----------|
-| `pipeline.media_inspect` | CPU-light to CPU-bound (Pillow/ImageHash/ffprobe) | Raw temp-object inspection, pHash duplicate/blocked checks, content materialization |
-| `q.transcode` | CPU-light to CPU-bound | Media preparation: blur hash/quality for every file; GIF→MP4/video re-encode plus a PNG preview frame for moving media |
-| `q.ocr` | CPU/GPU-bound (PaddleOCR) | Text extraction, language detection |
-| `q.embed` | API-bound (Voyage AI) | Image embedding computation |
-| `q.classify` | CPU-light | Conservative NSFW detection only |
-| `q.sync.qdrant` | I/O-bound (Qdrant) | Vector + payload sync |
-| `q.sync.meili` | I/O-bound (Meilisearch) | Document sync |
-| `q.seo` | API-bound (PydanticAI provider) | SEO page generation, tag/template assignment (prioritized by popularity) |
+| Queue | Role | Resource Profile | Consumer |
+|-------|------|-----------------|----------|
+| `pipeline.media_inspect` | `media` | CPU-light to CPU-bound (Pillow/ImageHash/ffprobe) | Raw temp-object inspection, pHash duplicate/blocked checks, content materialization |
+| `pipeline.transcode` | `media` | CPU-light to CPU-bound | Media preparation: blur hash/quality for every file; GIF→MP4/video re-encode plus a PNG preview frame for moving media |
+| `pipeline.ocr` | `ocr` | CPU/GPU-bound (PaddleOCR) | Text extraction, language detection |
+| `pipeline.embed` | `enrichment` | API-bound (Voyage AI) | Image embedding computation |
+| `pipeline.classify` | `enrichment` | CPU-light | Conservative NSFW detection only |
+| `pipeline.sync_qdrant` | `sync` | I/O-bound (Qdrant) | Vector + payload sync |
+| `pipeline.sync_meili` | `sync` | I/O-bound (Meilisearch) | Document sync |
 
 Every worker subscriber uses `PIPELINE_WORKER_PREFETCH_COUNT` (default `1`) as
 RabbitMQ consumer QoS. The limit is per queue consumer in each worker process,
@@ -309,6 +308,28 @@ which prevents a backlog from creating unbounded in-flight OCR subprocesses.
 PaddleOCR receives `cpu_threads=1`, and worker images cap OpenMP/OpenBLAS/MKL/
 NumExpr native thread pools at one by default; operators must opt up explicitly
 after sizing the host.
+
+### Operational recovery and overload control
+
+The latest canonical state remains in the ingest request, stage journal, sync
+snapshot, source-post/backfill, and outbox tables. Migration `0034` adds
+append-preserving `pipeline_stage_attempts` and
+`source_channel_backfill_attempts`, audited `recovery_jobs` /
+`recovery_job_items`, a sanitized `pipeline_dead_letters` ledger, hysteretic
+`pipeline_capacity_states`, and shared `dependency_circuit_states`.
+
+Admin recovery never republishes arbitrary payload bytes. A scheduled item is
+version-checked against canonical state and translated into the normal replay,
+media-inspect outbox, sync replay, source-post replay, backfill resume, or
+outbox-rebuild path. Dispatch event IDs tie attempts and eventual completion
+back to the recovery item. Dead letters are written to PostgreSQL before the
+original broker delivery is acknowledged.
+
+Capacity state gates historical and recovery admission before it can increase
+the live-stage backlog. Close/reopen thresholds use hysteresis. Provider
+circuits are durable across worker restarts and permit one fenced half-open
+probe after cooldown; the broker's five-attempt limit is still the final
+automatic retry bound.
 
 ### Message Schemas
 
@@ -334,6 +355,15 @@ RabbitMQ dead letter exchanges (DLX) handle worker-consume failures. Messages ex
 
 Pipeline entrypoints, the media materializer, and stage transition services use a generic RabbitMQ transactional outbox instead of commit-then-publish. `rabbitmq_outbox_messages` rows are written in the same DB transaction as ingest/materialization/stage state, then the `rabbitmq-outbox-publisher` job in `memexpert-scheduler` starts or reuses the RabbitMQ pipeline broker, recovers stale `publishing` leases, claims due `pending`/`failed` rows with row locks, publishes by stored `exchange`, `routing_key`, JSON payload, headers, and stable `message_id`, and marks rows `published` or `failed` with retry metadata. This path handles raw-upload `media_inspect_requested` events, post-materialization transcode dispatches, stage fan-out, replay, and sync-success notifications.
 
+Queue age alone never reconstructs a `pending` stage or media-inspection
+request. Pending work remains owned by its existing outbox/published broker
+message; only stale `processing`/`media_inspecting` leases are fenced and
+replayed. Consumers lock the stage journal before starting and acknowledge an
+identical event that is already processing or succeeded, so publisher
+ambiguity or RabbitMQ redelivery cannot execute the provider twice. Recovery
+dispatch likewise locks and revalidates canonical state, and outbox recovery
+does not complete until the publisher records the message as `published`.
+
 ### Periodic Tasks
 
 Tasks that run on a schedule (not event-driven) are managed by APScheduler in a dedicated process:
@@ -342,10 +372,11 @@ Tasks that run on a schedule (not event-driven) are managed by APScheduler in a 
 - Source engagement capture enqueueing for due Telegram source posts
 - Search-index sync (batched, not per-like)
 - Generic RabbitMQ transactional outbox publishing for ingest/materialization/stage events
+- Audited recovery dispatch/reconciliation and pipeline-capacity refresh
 - Meme of the Day selection/cache refresh
 - Scheduled SEO generation batches prioritized by backlog class and stable tie-breakers
 
-The current implementation registers these scheduler jobs with independent enable and interval settings. Source engagement capture, public trend materialized-view refresh, Meme of the Day cache refresh, search-index sync, SEO backlog batches, and RabbitMQ outbox publishing contain production behavior.
+The current implementation registers these scheduler jobs with independent enable and interval settings. Source engagement capture, public trend materialized-view refresh, Meme of the Day cache refresh, search-index sync, SEO backlog batches, RabbitMQ outbox publishing, recovery dispatch, and capacity refresh contain production behavior.
 
 Source engagement scheduling is stored in PostgreSQL on `meme_sources` and anchored to the Telegram post date. The scheduler only claims due rows and writes `source_engagement_capture_requested` messages through the transactional outbox; worker-side RabbitMQ consumers perform the Telegram fetch and append `meme_source_engagement_snapshots`. Public trends/search popularity are derived from those snapshots plus `analytics_events`, so no pipeline stage writes canonical popularity counters back to `memes` or `meme_sources`.
 

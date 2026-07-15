@@ -12,7 +12,14 @@ from typing import Final
 ROOT: Final = Path(__file__).resolve().parents[1]
 COMPOSE_FILE: Final = ROOT / "docker-compose.prod.example.yml"
 ENV_FILE: Final = ROOT / ".env.prod.example"
-APP_SERVICES: Final = ("migrate", "api", "workers", "telegram-crawler", "scheduler")
+WORKER_SERVICES: Final = (
+    "worker-media",
+    "worker-ocr",
+    "worker-enrichment",
+    "worker-sync",
+    "worker-telegram",
+)
+APP_SERVICES: Final = ("migrate", "api", *WORKER_SERVICES, "telegram-crawler", "scheduler")
 
 COMMON_PROVIDER_AUTH_ENV_KEYS: Final = (
     "PIPELINE_VOYAGE_PROVIDER_MODE",
@@ -55,18 +62,25 @@ COMMON_PROVIDER_AUTH_ENV_KEYS: Final = (
     "AUTH_GOOGLE_USERINFO_URL",
     "AUTH_GOOGLE_TIMEOUT_SECONDS",
 )
+WORKER_ENV_KEYS: Final = (
+    "PIPELINE_WORKER_PREFETCH_COUNT",
+    "PIPELINE_OCR_PROVIDER_MODE",
+    "PIPELINE_OCR_PRIMARY_ENGINE",
+    "PIPELINE_OCR_PADDLE_COMMAND",
+    "PIPELINE_OCR_FALLBACK_ENGINE",
+    "PIPELINE_OCR_FALLBACK_COMMAND",
+    "PIPELINE_OCR_TIMEOUT_SECONDS",
+    "PIPELINE_OCR_LOW_CONFIDENCE_THRESHOLD",
+    "DATABASE_POOL_SIZE",
+    "DATABASE_MAX_OVERFLOW",
+    "DATABASE_POOL_TIMEOUT_SECONDS",
+    "DATABASE_APPLICATION_NAME",
+    "RUNTIME_HEALTH_FILE",
+)
 SERVICE_SPECIFIC_ENV_KEYS: Final = {
     "api": ("TELEGRAM_API_ID", "TELEGRAM_API_HASH"),
-    "workers": (
-        "PIPELINE_WORKER_PREFETCH_COUNT",
-        "PIPELINE_OCR_PROVIDER_MODE",
-        "PIPELINE_OCR_PRIMARY_ENGINE",
-        "PIPELINE_OCR_PADDLE_COMMAND",
-        "PIPELINE_OCR_FALLBACK_ENGINE",
-        "PIPELINE_OCR_FALLBACK_COMMAND",
-        "PIPELINE_OCR_TIMEOUT_SECONDS",
-        "PIPELINE_OCR_LOW_CONFIDENCE_THRESHOLD",
-    ),
+    **{service_name: WORKER_ENV_KEYS for service_name in WORKER_SERVICES},
+    "worker-telegram": (*WORKER_ENV_KEYS, "TELEGRAM_API_ID", "TELEGRAM_API_HASH"),
     "telegram-crawler": ("TELEGRAM_API_ID", "TELEGRAM_API_HASH"),
     "scheduler": ("TELEGRAM_API_ID", "TELEGRAM_API_HASH"),
 }

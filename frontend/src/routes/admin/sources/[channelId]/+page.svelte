@@ -8,6 +8,9 @@
 <SourceDetailWorkspace
   source={data.source}
   postPage={data.postPage}
+  backfills={data.backfills}
+  backfillLoadError={data.backfillLoadError}
+  recoveryRequestIds={data.recoveryRequestIds}
   telegramAccounts={data.telegramAccounts}
   paging={data.paging}
   loadError={data.loadError}

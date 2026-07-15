@@ -38,6 +38,7 @@ controls are diagnostic rather than default operator language.
 | `/admin` | Actionable overview only; no always-open CRUD forms. |
 | `/admin/sources` | Suggestions, public Telegram add flow, health, assignment, ingestion settings, pause/resume, and source removal. |
 | `/admin/telegram` | Telegram account connection, validation, account policy, and disconnect. |
+| `/admin/recovery` | Failed/stuck/dead-lettered work, bounded batch preview, audited retry/resume, and job progress. |
 | `/admin/moderation` | Report queue, safe preview, direct review, and recent decisions. |
 | `/admin/moderation/patterns` | Specialist blocked perceptual-hash workspace. |
 | `/admin/content/seo` | Paginated SEO review queue. `/admin/content` redirects here. |
@@ -106,6 +107,23 @@ source and assigned account. Diagnostics exposes technical
 identifiers/checkpoints; ingestion, assignment, and removal remain disclosed.
 Removing a source stops future crawling while preserving checkpoint and message
 inventory history.
+
+### Failed-work recovery
+
+The Recovery workspace is the application-work control plane. It shows
+canonical failures from source posts and backfills through ingest, processing,
+search sync, outbox publishing, and dead letters. The backend declares the
+actions available for each row; the browser never invents retryability from an
+error string. Every retry or resume requires an operator reason, an idempotency
+request ID, and the version displayed during review. Large selections require a
+short-lived preview and explicit scheduling.
+
+Recovery is asynchronous and capacity-aware. Operators can inspect progress or
+cancel undispatched batch items, but cannot restart containers or systemd
+services from the product. Historical failures become visible after upgrades
+without being replayed automatically. Telegram poison posts are isolated after
+three attempts so one message cannot permanently block the rest of a channel's
+history.
 
 ### Telegram accounts
 

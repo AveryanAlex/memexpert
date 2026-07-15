@@ -115,6 +115,7 @@ EXPECTED_TABLES = {
     "collection_members",
     "collection_memes",
     "collections",
+    "dependency_circuit_states",
     "embedding_cache",
     "inline_usage_events",
     "meme_file_ocr_results",
@@ -130,11 +131,19 @@ EXPECTED_TABLES = {
     "memes",
     "moderation_decisions",
     "moderation_reports",
+    "operational_audit_logs",
     "pinned_memes",
+    "pipeline_capacity_states",
+    "pipeline_dead_letters",
     "pipeline_ingest_requests",
+    "pipeline_stage_attempts",
     "pipeline_stage_journal",
     "rabbitmq_outbox_messages",
+    "recovery_job_items",
+    "recovery_jobs",
+    "runtime_heartbeats",
     "source_channels",
+    "source_channel_backfill_attempts",
     "source_channel_backfill_jobs",
     "source_channel_posts",
     "telegram_admin_audit_logs",
@@ -239,6 +248,7 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
     meme_files_table = metadata.tables["meme_files"]
     motd_table = metadata.tables["meme_of_the_day_selections"]
     pipeline_ingest_requests_table = metadata.tables["pipeline_ingest_requests"]
+    pipeline_stage_attempts_table = metadata.tables["pipeline_stage_attempts"]
     assert "invite_link" not in metadata.tables["collections"].c
     assert metadata.tables["users"].c["active_save_collection_id"].foreign_keys
     assert metadata.tables["collections"].c["owner_id"].foreign_keys
@@ -258,9 +268,7 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
         and [column.name for column in constraint.columns] == ["meme_id", "id"]
         for constraint in meme_files_table.constraints
     )
-    assert _postgresql_where("uq_meme_files_sha256_hex_not_null", "meme_files") == (
-        "sha256_hex IS NOT NULL"
-    )
+    assert _postgresql_where("uq_meme_files_sha256_hex_not_null", "meme_files") == ("sha256_hex IS NOT NULL")
     assert any(
         isinstance(constraint, UniqueConstraint)
         and constraint.name == "uq_motd_selected_for_algorithm_version"
@@ -270,6 +278,12 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
     assert any(
         isinstance(constraint, CheckConstraint) and "candidate_count >= 0" in str(constraint.sqltext)
         for constraint in motd_table.constraints
+    )
+    assert any(
+        isinstance(constraint, UniqueConstraint)
+        and constraint.name == "uq_pipeline_stage_attempts_file_stage_event_attempt"
+        and [column.name for column in constraint.columns] == ["meme_file_id", "stage", "event_id", "attempt_number"]
+        for constraint in pipeline_stage_attempts_table.constraints
     )
     assert motd_table.c["meme_id"].nullable
     motd_meme_fk = next(iter(motd_table.c["meme_id"].foreign_keys))
@@ -348,10 +362,13 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
         "cleanup_error_text",
         "cleanup_completed_at",
     }.issubset(telegram_login_attempt_table.c.keys())
-    assert _postgresql_where(
-        "uq_telegram_sessions_account_user_id_not_null",
-        "telegram_sessions",
-    ) == "account_user_id IS NOT NULL"
+    assert (
+        _postgresql_where(
+            "uq_telegram_sessions_account_user_id_not_null",
+            "telegram_sessions",
+        )
+        == "account_user_id IS NOT NULL"
+    )
     assert "session_id" not in metadata.tables["source_channels"].c
     assert "views" not in meme_source_columns
     assert "reactions" not in meme_source_columns
@@ -804,13 +821,13 @@ async def test_schema_handles_cycles_multi_invites_and_nullable_content_fields(
         persisted_meme = meme_result.scalar_one()
         assert persisted_meme.primary_file_id == file_one.id
         assert len(persisted_meme.files) == 2
-        assert len(persisted_meme.files[0].pipeline_stage_journal_entries) + len(
-            persisted_meme.files[1].pipeline_stage_journal_entries
-        ) == 8
+        assert (
+            len(persisted_meme.files[0].pipeline_stage_journal_entries)
+            + len(persisted_meme.files[1].pipeline_stage_journal_entries)
+            == 8
+        )
         assert {
-            entry.stage
-            for meme_file in persisted_meme.files
-            for entry in meme_file.pipeline_stage_journal_entries
+            entry.stage for meme_file in persisted_meme.files for entry in meme_file.pipeline_stage_journal_entries
         } >= {
             ContentPipelineStage.INGEST,
             ContentPipelineStage.TRANSCODE,
@@ -829,9 +846,7 @@ async def test_schema_handles_cycles_multi_invites_and_nullable_content_fields(
         ocr_result = await session.scalar(
             select(MemeFileOCRResult).where(MemeFileOCRResult.meme_file_id == file_one.id)
         )
-        merge_log = await session.scalar(
-            select(MemeMergeLog).where(MemeMergeLog.source_meme_file_id == file_two.id)
-        )
+        merge_log = await session.scalar(select(MemeMergeLog).where(MemeMergeLog.source_meme_file_id == file_two.id))
 
         assert ocr_result is not None
         assert ocr_result.engine == "paddleocr"
@@ -1413,9 +1428,7 @@ async def test_sync_target_snapshot_orm_persists_and_enforces_uniqueness(
         await session.commit()
 
         persisted_meme_file = await session.scalar(
-            select(MemeFile)
-            .options(selectinload(MemeFile.sync_target_snapshots))
-            .where(MemeFile.id == meme_file.id)
+            select(MemeFile).options(selectinload(MemeFile.sync_target_snapshots)).where(MemeFile.id == meme_file.id)
         )
         assert persisted_meme_file is not None
         assert len(persisted_meme_file.sync_target_snapshots) == 1
@@ -1595,9 +1608,7 @@ def test_source_engagement_snapshot_model_contract() -> None:
     }
 
     check_constraint_sql = " ".join(
-        str(constraint.sqltext).lower()
-        for constraint in table.constraints
-        if isinstance(constraint, CheckConstraint)
+        str(constraint.sqltext).lower() for constraint in table.constraints if isinstance(constraint, CheckConstraint)
     )
     assert "view_count" in check_constraint_sql
     assert "reaction_count" in check_constraint_sql
@@ -1647,21 +1658,28 @@ def test_source_channel_post_inventory_model_contract() -> None:
         "attempt_count",
         "created_at",
         "id",
+        "is_retryable",
+        "last_attempt_at",
         "last_error_code",
         "last_error_text",
         "media_type",
+        "next_attempt_at",
         "post_id",
         "published_at",
+        "quarantined_at",
         "source_channel_id",
         "status",
         "updated_at",
     }
     status_default = table.c["status"].default
     attempt_count_default = table.c["attempt_count"].default
+    is_retryable_default = table.c["is_retryable"].default
     assert status_default is not None
     assert attempt_count_default is not None
+    assert is_retryable_default is not None
     assert cast("Any", status_default).arg is SourceChannelPostStatus.OBSERVED
     assert cast("Any", attempt_count_default).arg == 0
+    assert cast("Any", is_retryable_default).arg is False
     unique_constraints = {
         constraint.name: tuple(column.name for column in constraint.columns)
         for constraint in table.constraints
@@ -1685,9 +1703,7 @@ def test_source_channel_backfill_job_model_contract() -> None:
     assert cast("Any", status_default).arg is SourceChannelBackfillJobStatus.QUEUED
     assert cast("Any", scanned_count_default).arg == 0
     check_constraint_sql = " ".join(
-        str(constraint.sqltext).lower()
-        for constraint in table.constraints
-        if isinstance(constraint, CheckConstraint)
+        str(constraint.sqltext).lower() for constraint in table.constraints if isinstance(constraint, CheckConstraint)
     )
     assert "requested_message_count >= 1" in check_constraint_sql
     assert "requested_message_count <= 50000" in check_constraint_sql
@@ -1698,9 +1714,7 @@ def test_source_channel_backfill_job_model_contract() -> None:
         "uq_source_channel_backfill_jobs_one_active_per_channel",
     }
     active_index = next(
-        index
-        for index in table.indexes
-        if index.name == "uq_source_channel_backfill_jobs_one_active_per_channel"
+        index for index in table.indexes if index.name == "uq_source_channel_backfill_jobs_one_active_per_channel"
     )
     assert active_index.unique is True
     predicate = active_index.dialect_options["postgresql"]["where"]

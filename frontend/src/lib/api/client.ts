@@ -11,7 +11,18 @@ import type {
   AdminModerationDecisionRead,
   AdminModerationReportRead,
   AdminOverviewRead,
+  AdminRecoveryBatchMutationPayload,
+  AdminRecoveryBatchPreviewPayload,
+  AdminRecoveryBatchRead,
+  AdminRecoveryMutationPayload,
+  AdminRecoverySummaryRead,
+  AdminRecoveryWorkRead,
+  AdminRecoveryWorkPageRead,
+  AdminRecoveryBucket,
+  AdminRecoveryWorkKind,
   AdminSourceBackfillPayload,
+  AdminSourceBackfillListRead,
+  AdminSourceRecoveryMutationPayload,
   AdminSessionRead,
   AdminSourceChannelRead,
   AdminSourcePostPageRead,
@@ -552,13 +563,142 @@ export async function fetchAdminSourceChannels(request: CatalogRequest): Promise
 export async function fetchAdminSourceChannelPosts(
   request: CatalogRequest,
   channelId: string,
-  pagination: { limit: number; offset: number; snapshotAt?: string | null }
+  pagination: { limit: number; offset: number; snapshotAt?: string | null; status?: string | null }
 ): Promise<AdminSourcePostPageRead> {
   const params = new URLSearchParams({ limit: String(pagination.limit), offset: String(pagination.offset) });
   if (pagination.snapshotAt) params.set('snapshot_at', pagination.snapshotAt);
+  if (pagination.status) params.set('status', pagination.status);
   return apiGet<AdminSourcePostPageRead>(
     `/api/v1/admin/source-channels/${encodeURIComponent(channelId)}/posts`,
     params,
+    request
+  );
+}
+
+export async function fetchAdminSourceBackfills(
+  request: CatalogRequest,
+  channelId: string
+): Promise<AdminSourceBackfillListRead> {
+  return apiGet<AdminSourceBackfillListRead>(
+    `/api/v1/admin/source-channels/${encodeURIComponent(channelId)}/backfills`,
+    new URLSearchParams(),
+    request
+  );
+}
+
+export async function resumeAdminSourceBackfill(
+  request: CatalogRequest & { body: AdminSourceRecoveryMutationPayload },
+  channelId: string,
+  jobId: string
+): Promise<AdminRecoveryBatchRead> {
+  return apiWrite<AdminRecoveryBatchRead>(
+    `/api/v1/admin/source-channels/${encodeURIComponent(channelId)}/backfills/${encodeURIComponent(jobId)}/resume`,
+    'POST',
+    request
+  );
+}
+
+export async function replayAdminSourcePost(
+  request: CatalogRequest & { body: AdminSourceRecoveryMutationPayload },
+  channelId: string,
+  postId: string
+): Promise<AdminRecoveryBatchRead> {
+  return apiWrite<AdminRecoveryBatchRead>(
+    `/api/v1/admin/source-channels/${encodeURIComponent(channelId)}/posts/${encodeURIComponent(postId)}/replay`,
+    'POST',
+    request
+  );
+}
+
+export async function fetchAdminRecoverySummary(request: CatalogRequest): Promise<AdminRecoverySummaryRead> {
+  return apiGet<AdminRecoverySummaryRead>('/api/v1/admin/recovery/summary', new URLSearchParams(), request);
+}
+
+export async function fetchAdminRecoveryWork(
+  request: CatalogRequest,
+  filters: {
+    bucket?: AdminRecoveryBucket | null;
+    kind?: AdminRecoveryWorkKind | null;
+    source?: string | null;
+    stage?: string | null;
+    reason?: string | null;
+    query?: string | null;
+    cursor?: string | null;
+    limit: number;
+  }
+): Promise<AdminRecoveryWorkPageRead> {
+  const params = new URLSearchParams({ limit: String(filters.limit) });
+  if (filters.bucket) params.set('bucket', filters.bucket);
+  if (filters.kind) params.set('kind', filters.kind);
+  const sourceIsUuid = filters.source && isUuid(filters.source);
+  if (sourceIsUuid) params.set('source_channel_id', filters.source as string);
+  if (filters.stage) params.set('stage', filters.stage);
+  if (filters.reason) params.set('reason', filters.reason);
+  if (filters.query) params.set('q', filters.query);
+  else if (filters.source && !sourceIsUuid) params.set('q', filters.source);
+  if (filters.cursor) params.set('cursor', filters.cursor);
+  return apiGet<AdminRecoveryWorkPageRead>('/api/v1/admin/recovery/work', params, request);
+}
+
+export async function fetchAdminRecoveryWorkDetail(
+  request: CatalogRequest,
+  kind: AdminRecoveryWorkKind,
+  workId: string
+): Promise<AdminRecoveryWorkRead> {
+  return apiGet<AdminRecoveryWorkRead>(
+    `/api/v1/admin/recovery/work/${encodeURIComponent(kind)}/${encodeURIComponent(workId)}`,
+    new URLSearchParams(),
+    request
+  );
+}
+
+export async function retryAdminRecoveryWork(
+  request: CatalogRequest & { body: AdminRecoveryMutationPayload },
+  kind: AdminRecoveryWorkKind,
+  workId: string
+): Promise<AdminRecoveryBatchRead> {
+  return apiWrite<AdminRecoveryBatchRead>(
+    `/api/v1/admin/recovery/work/${encodeURIComponent(kind)}/${encodeURIComponent(workId)}/retry`,
+    'POST',
+    request
+  );
+}
+
+export async function previewAdminRecoveryBatch(
+  request: CatalogRequest & { body: AdminRecoveryBatchPreviewPayload }
+): Promise<AdminRecoveryBatchRead> {
+  return apiWrite<AdminRecoveryBatchRead>('/api/v1/admin/recovery/batches/preview', 'POST', request);
+}
+
+export async function fetchAdminRecoveryBatch(
+  request: CatalogRequest,
+  jobId: string
+): Promise<AdminRecoveryBatchRead> {
+  return apiGet<AdminRecoveryBatchRead>(
+    `/api/v1/admin/recovery/batches/${encodeURIComponent(jobId)}`,
+    new URLSearchParams(),
+    request
+  );
+}
+
+export async function scheduleAdminRecoveryBatch(
+  request: CatalogRequest & { body: AdminRecoveryBatchMutationPayload },
+  jobId: string
+): Promise<AdminRecoveryBatchRead> {
+  return apiWrite<AdminRecoveryBatchRead>(
+    `/api/v1/admin/recovery/batches/${encodeURIComponent(jobId)}/schedule`,
+    'POST',
+    request
+  );
+}
+
+export async function cancelAdminRecoveryBatch(
+  request: CatalogRequest & { body: AdminRecoveryBatchMutationPayload },
+  jobId: string
+): Promise<AdminRecoveryBatchRead> {
+  return apiWrite<AdminRecoveryBatchRead>(
+    `/api/v1/admin/recovery/batches/${encodeURIComponent(jobId)}/cancel`,
+    'POST',
     request
   );
 }

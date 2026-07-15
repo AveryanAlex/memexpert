@@ -38,6 +38,22 @@ export function readOptional(data: FormData, name: string): string | null {
   return value || null;
 }
 
+export function readRequestId(data: FormData): string {
+  const value = readRequired(data, 'request_id');
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)) {
+    throw new ApiError(400, 'request_id must be a UUID.');
+  }
+  return value;
+}
+
+export function readAuditReason(data: FormData): string {
+  const reason = readRequired(data, 'reason');
+  if (reason.length < 3 || reason.length > 500) {
+    throw new ApiError(400, 'reason must be between 3 and 500 characters.');
+  }
+  return reason;
+}
+
 export function readBoolean(data: FormData, name: string): boolean {
   const value = readRequired(data, name);
   if (value === 'true') return true;

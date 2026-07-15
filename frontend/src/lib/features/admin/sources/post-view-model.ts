@@ -37,6 +37,11 @@ export function syncStatusLabel(status: AdminSourcePostSyncStatus | null): strin
 export function backfillStatusLabel(status: AdminSourceBackfillStatus): string {
   if (status === 'queued') return 'Queued';
   if (status === 'running') return 'Running';
+  if (status === 'waiting_retry') return 'Waiting to retry';
+  if (status === 'waiting_capacity') return 'Waiting for capacity';
+  if (status === 'completed') return 'Completed';
+  if (status === 'completed_with_failures') return 'Completed with failures';
+  if (status === 'cancelled') return 'Cancelled';
   if (status === 'failed') return 'Failed';
   return 'Idle';
 }
@@ -78,19 +83,30 @@ export function sourceBackfillAvailability(
   if (!source.initial_catchup_completed) {
     return blocked('Wait for the initial latest-message catch-up before fetching older messages.');
   }
-  if (source.backfill_status === 'queued' || source.backfill_status === 'running') {
+  if (
+    source.backfill_status === 'queued' ||
+    source.backfill_status === 'running' ||
+    source.backfill_status === 'waiting_capacity' ||
+    source.backfill_status === 'waiting_retry'
+  ) {
     return blocked('An older-message backfill is already queued or running for this source.');
   }
   return { canQueue: true, reason: null };
 }
 
-export function sourcePostPageHref(channelId: string, page: number, snapshotAt: string): string {
+export function sourcePostPageHref(channelId: string, page: number, snapshotAt: string, status?: string | null): string {
   const params = new URLSearchParams({ page: String(page), snapshot_at: snapshotAt });
+  if (status) params.set('status', status);
   return `/admin/sources/${encodeURIComponent(channelId)}?${params.toString()}`;
 }
 
-export function sourcePostLatestHref(channelId: string): string {
-  return `/admin/sources/${encodeURIComponent(channelId)}`;
+export function sourcePostLatestHref(channelId: string, status?: string | null): string {
+  const path = `/admin/sources/${encodeURIComponent(channelId)}`;
+  return status ? `${path}?status=${encodeURIComponent(status)}` : path;
+}
+
+export function sourcePostFilterHref(channelId: string, status: 'failed' | 'processing'): string {
+  return `/admin/sources/${encodeURIComponent(channelId)}?status=${status}`;
 }
 
 export function humanizePipelineValue(value: string | null): string {

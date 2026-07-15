@@ -10,6 +10,8 @@ queue, and every routing-key binding used by the heavy-worker stages.
 
 from __future__ import annotations
 
+import asyncio
+import importlib
 from typing import TYPE_CHECKING, cast
 
 from faststream import AckPolicy
@@ -17,7 +19,7 @@ from faststream.rabbit import Channel, ExchangeType, RabbitBroker, RabbitExchang
 from faststream.rabbit.annotations import RabbitMessage
 from sqlalchemy import select
 
-from memexpert.core.broker import PipelineBrokerSettings, get_pipeline_broker, get_pipeline_broker_settings
+from memexpert.core.broker import PipelineBrokerSettings, build_pipeline_broker, get_pipeline_broker_settings
 from memexpert.core.classification import (
     ClassificationClientProtocol,
     build_pipeline_classification_client,
@@ -42,17 +44,54 @@ from memexpert.media.inspect import PipelineMediaProcessor
 from memexpert.models.content import TelegramSession
 from memexpert.models.enums import ContentPipelineStage
 from memexpert.pipeline.events import build_source_engagement_session_key
+from memexpert.runtime_health import RuntimeHealthReporter
+from memexpert.services.pipeline_reliability import record_pipeline_dead_letter
 from memexpert.services.source_engagement_capture import (
     build_pipeline_source_engagement_telegram_client_factory,
 )
-from memexpert.workers.pipeline_runtime.runtime import PipelineRuntime, RabbitMessageLike
+from memexpert.workers.pipeline_runtime.runtime import DeadLetterRecorder, PipelineRuntime, RabbitMessageLike
+from memexpert.workers.roles import WorkerRole
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Awaitable, Callable, Sequence
 
     from memexpert.media.contracts import PipelineMediaProcessorProtocol
     from memexpert.services.source_engagement_capture import SourceEngagementTelegramClientFactory
     from memexpert.workers.pipeline_runtime.stages.context import ObjectStorageClientLike
+
+type WorkerBackgroundRunner = Callable[[Settings, asyncio.Event], Awaitable[None]]
+
+
+class _UnavailableDependency:
+    """Fail loudly if role isolation ever routes work to an uninitialized provider."""
+
+    def __init__(self, *, role: WorkerRole, name: str) -> None:
+        self._role = role
+        self._name = name
+
+    def __getattr__(self, attribute: str) -> object:
+        raise RuntimeError(
+            f"Worker role {self._role.value!r} does not initialize dependency {self._name!r} "
+            f"(attempted attribute {attribute!r})."
+        )
+
+    def __call__(self, *_args: object, **_kwargs: object) -> object:
+        raise RuntimeError(f"Worker role {self._role.value!r} does not initialize dependency {self._name!r}.")
+
+
+def _resolve_dependency[DependencyT](
+    explicit: DependencyT | None,
+    *,
+    enabled: bool,
+    factory: Callable[[], DependencyT],
+    role: WorkerRole,
+    name: str,
+) -> DependencyT:
+    if explicit is not None:
+        return explicit
+    if enabled:
+        return factory()
+    return cast("DependencyT", _UnavailableDependency(role=role, name=name))
 
 
 def _build_pipeline_exchange(broker_settings: PipelineBrokerSettings) -> RabbitExchange:
@@ -144,6 +183,7 @@ def _build_dead_letter_queue(broker_settings: PipelineBrokerSettings) -> RabbitQ
 def build_pipeline_runtime(
     *,
     settings: Settings | None = None,
+    role: WorkerRole = WorkerRole.ALL,
     broker: RabbitBroker | None = None,
     session_factory: AsyncSessionFactory | None = None,
     storage_client: ObjectStorageClientLike | None = None,
@@ -158,29 +198,76 @@ def build_pipeline_runtime(
     source_engagement_close_telegram_client_after_capture: bool | None = None,
     source_engagement_telegram_session_manager: TelegramSessionManager | None = None,
     source_engagement_session_keys: Sequence[str] = (),
+    health_reporter: RuntimeHealthReporter | None = None,
+    dead_letter_recorder: DeadLetterRecorder | None = None,
 ) -> PipelineRuntime:
     """Build the RabbitMQ heavy-worker runtime and register its FastStream subscribers."""
 
     resolved_settings = settings or get_settings()
+    resolved_role = WorkerRole(role)
     resolved_broker_settings = get_pipeline_broker_settings(resolved_settings)
-    resolved_broker = broker or get_pipeline_broker()
+    resolved_broker = broker or build_pipeline_broker(resolved_settings)
     resolved_session_factory = session_factory or get_async_session_factory()
-    resolved_storage_client = storage_client or cast("ObjectStorageClientLike", get_s3_client())
-    resolved_media_processor = media_processor or PipelineMediaProcessor(settings=resolved_settings)
-    resolved_ocr_processor = ocr_processor or build_pipeline_ocr_processor(
-        settings=resolved_settings,
-        media_processor=resolved_media_processor,
+    resolved_storage_client = _resolve_dependency(
+        storage_client,
+        enabled=resolved_role.needs_storage,
+        factory=lambda: cast("ObjectStorageClientLike", get_s3_client()),
+        role=resolved_role,
+        name="storage_client",
     )
-    resolved_voyage_client = voyage_client or build_pipeline_voyage_client(settings=resolved_settings)
-    resolved_qdrant_client = qdrant_client or PipelineQdrantClient(settings=resolved_settings)
-    resolved_qdrant_sync_client = qdrant_sync_client or PipelineQdrantSyncClient(settings=resolved_settings)
-    resolved_meilisearch_sync_client = meilisearch_sync_client or PipelineMeilisearchSyncClient(
-        settings=resolved_settings,
+    resolved_media_processor = _resolve_dependency(
+        media_processor,
+        enabled=resolved_role.needs_media_processor,
+        factory=lambda: PipelineMediaProcessor(settings=resolved_settings),
+        role=resolved_role,
+        name="media_processor",
     )
-    resolved_classification_client = classification_client or build_pipeline_classification_client(
-        settings=resolved_settings,
+    resolved_ocr_processor = _resolve_dependency(
+        ocr_processor,
+        enabled=resolved_role.needs_ocr,
+        factory=lambda: build_pipeline_ocr_processor(
+            settings=resolved_settings,
+            media_processor=resolved_media_processor,
+        ),
+        role=resolved_role,
+        name="ocr_processor",
     )
-    if source_engagement_telegram_client_factory is None:
+    resolved_voyage_client = _resolve_dependency(
+        voyage_client,
+        enabled=resolved_role.needs_enrichment,
+        factory=lambda: build_pipeline_voyage_client(settings=resolved_settings),
+        role=resolved_role,
+        name="voyage_client",
+    )
+    resolved_qdrant_client = _resolve_dependency(
+        qdrant_client,
+        enabled=resolved_role.needs_enrichment,
+        factory=lambda: PipelineQdrantClient(settings=resolved_settings),
+        role=resolved_role,
+        name="qdrant_client",
+    )
+    resolved_qdrant_sync_client = _resolve_dependency(
+        qdrant_sync_client,
+        enabled=resolved_role.needs_sync,
+        factory=lambda: PipelineQdrantSyncClient(settings=resolved_settings),
+        role=resolved_role,
+        name="qdrant_sync_client",
+    )
+    resolved_meilisearch_sync_client = _resolve_dependency(
+        meilisearch_sync_client,
+        enabled=resolved_role.needs_sync,
+        factory=lambda: PipelineMeilisearchSyncClient(settings=resolved_settings),
+        role=resolved_role,
+        name="meilisearch_sync_client",
+    )
+    resolved_classification_client = _resolve_dependency(
+        classification_client,
+        enabled=resolved_role.needs_enrichment,
+        factory=lambda: build_pipeline_classification_client(settings=resolved_settings),
+        role=resolved_role,
+        name="classification_client",
+    )
+    if source_engagement_telegram_client_factory is None and resolved_role.consumes_source_engagement:
         resolved_source_engagement_telegram_session_manager = (
             source_engagement_telegram_session_manager
             or TelegramSessionManager(settings=resolved_settings, session_factory=resolved_session_factory)
@@ -190,15 +277,24 @@ def build_pipeline_runtime(
             session_manager=resolved_source_engagement_telegram_session_manager,
         )
         resolved_source_engagement_close_telegram_client_after_capture = False
-    else:
+    elif source_engagement_telegram_client_factory is not None:
         resolved_source_engagement_telegram_session_manager = source_engagement_telegram_session_manager
         resolved_source_engagement_telegram_client_factory = source_engagement_telegram_client_factory
         resolved_source_engagement_close_telegram_client_after_capture = True
+    else:
+        resolved_source_engagement_telegram_session_manager = None
+        resolved_source_engagement_telegram_client_factory = cast(
+            "SourceEngagementTelegramClientFactory",
+            _UnavailableDependency(role=resolved_role, name="source_engagement_telegram_client_factory"),
+        )
+        resolved_source_engagement_close_telegram_client_after_capture = False
     if source_engagement_close_telegram_client_after_capture is not None:
         resolved_source_engagement_close_telegram_client_after_capture = (
             source_engagement_close_telegram_client_after_capture
         )
-    resolved_source_engagement_session_keys = tuple(dict.fromkeys(source_engagement_session_keys))
+    resolved_source_engagement_session_keys = (
+        tuple(dict.fromkeys(source_engagement_session_keys)) if resolved_role.consumes_source_engagement else ()
+    )
     transcode_retry_queue_name = f"{resolved_broker_settings.transcode_queue}.retry"
     ocr_retry_queue_name = f"{resolved_broker_settings.ocr_queue}.retry"
     embed_retry_queue_name = f"{resolved_broker_settings.embed_queue}.retry"
@@ -232,6 +328,7 @@ def build_pipeline_runtime(
     )
 
     runtime = PipelineRuntime(
+        role=resolved_role,
         settings=resolved_settings,
         broker=resolved_broker,
         session_factory=resolved_session_factory,
@@ -250,7 +347,9 @@ def build_pipeline_runtime(
                 queue_name=resolved_broker_settings.source_engagement_capture_queue_for_session(session_key),
                 routing_key=resolved_broker_settings.source_engagement_capture_binding_key_for_session(session_key),
                 retry_request_routing_key=(
-                    resolved_broker_settings.source_engagement_capture_retry_request_routing_key_for_session(session_key)
+                    resolved_broker_settings.source_engagement_capture_retry_request_routing_key_for_session(
+                        session_key
+                    )
                 ),
                 retry_exchange=resolved_broker_settings.retry_exchange,
             )
@@ -358,91 +457,129 @@ def build_pipeline_runtime(
         source_engagement_close_telegram_client_after_capture=(
             resolved_source_engagement_close_telegram_client_after_capture
         ),
+        dead_letter_recorder=dead_letter_recorder or record_pipeline_dead_letter,
         source_engagement_telegram_session_manager=resolved_source_engagement_telegram_session_manager,
+        health_reporter=health_reporter,
     )
-    worker_channel = Channel(prefetch_count=resolved_settings.pipeline_worker_prefetch_count)
 
-    @resolved_broker.subscriber(
-        runtime.media_inspect_queue,
-        runtime.pipeline_exchange,
-        channel=worker_channel,
-        ack_policy=AckPolicy.MANUAL,
-    )
-    async def _consume_media_inspect(payload: object, message: RabbitMessage) -> None:
-        rabbit_message = cast("RabbitMessageLike", cast("object", message))
-        await runtime.handle_media_inspect_message(payload, rabbit_message)
+    def worker_channel() -> Channel:
+        return Channel(prefetch_count=resolved_settings.pipeline_worker_prefetch_count)
 
-    for source_engagement_capture_queue in runtime.source_engagement_capture_queues:
+    def consume_args() -> dict[str, str]:
+        return resolved_role.consumer_arguments()
+
+    if resolved_role.consumes_media_inspect:
 
         @resolved_broker.subscriber(
-            source_engagement_capture_queue,
+            runtime.media_inspect_queue,
             runtime.pipeline_exchange,
-            channel=worker_channel,
+            channel=worker_channel(),
+            consume_args=consume_args(),
             ack_policy=AckPolicy.MANUAL,
         )
-        async def _consume_source_engagement_capture(payload: object, message: RabbitMessage) -> None:
+        async def _consume_media_inspect(payload: object, message: RabbitMessage) -> None:
             rabbit_message = cast("RabbitMessageLike", cast("object", message))
-            await runtime.handle_source_engagement_capture_message(payload, rabbit_message)
+            async with runtime.operation("media_inspect"):
+                await runtime.handle_media_inspect_message(payload, rabbit_message)
 
-    @resolved_broker.subscriber(
-        runtime.transcode_queue,
-        runtime.pipeline_exchange,
-        channel=worker_channel,
-        ack_policy=AckPolicy.MANUAL,
-    )
-    async def _consume_transcode(payload: object, message: RabbitMessage) -> None:
-        rabbit_message = cast("RabbitMessageLike", cast("object", message))
-        await runtime.handle_transcode_message(payload, rabbit_message)
+    if resolved_role.consumes_source_engagement:
+        for source_engagement_capture_queue in runtime.source_engagement_capture_queues:
 
-    @resolved_broker.subscriber(
-        runtime.ocr_queue,
-        runtime.pipeline_exchange,
-        channel=worker_channel,
-        ack_policy=AckPolicy.MANUAL,
-    )
-    async def _consume_ocr(payload: object, message: RabbitMessage) -> None:
-        rabbit_message = cast("RabbitMessageLike", cast("object", message))
-        await runtime.handle_ocr_message(payload, rabbit_message)
+            @resolved_broker.subscriber(
+                source_engagement_capture_queue,
+                runtime.pipeline_exchange,
+                channel=worker_channel(),
+                consume_args=consume_args(),
+                ack_policy=AckPolicy.MANUAL,
+            )
+            async def _consume_source_engagement_capture(payload: object, message: RabbitMessage) -> None:
+                rabbit_message = cast("RabbitMessageLike", cast("object", message))
+                async with runtime.operation("source_engagement_capture"):
+                    await runtime.handle_source_engagement_capture_message(payload, rabbit_message)
 
-    @resolved_broker.subscriber(
-        runtime.embed_queue,
-        runtime.pipeline_exchange,
-        channel=worker_channel,
-        ack_policy=AckPolicy.MANUAL,
-    )
-    async def _consume_embed(payload: object, message: RabbitMessage) -> None:
-        rabbit_message = cast("RabbitMessageLike", cast("object", message))
-        await runtime.handle_embed_message(payload, rabbit_message)
+    if resolved_role.consumes_stage(ContentPipelineStage.TRANSCODE):
 
-    @resolved_broker.subscriber(
-        runtime.classify_queue,
-        runtime.pipeline_exchange,
-        channel=worker_channel,
-        ack_policy=AckPolicy.MANUAL,
-    )
-    async def _consume_classify(payload: object, message: RabbitMessage) -> None:
-        rabbit_message = cast("RabbitMessageLike", cast("object", message))
-        await runtime.handle_classify_message(payload, rabbit_message)
+        @resolved_broker.subscriber(
+            runtime.transcode_queue,
+            runtime.pipeline_exchange,
+            channel=worker_channel(),
+            consume_args=consume_args(),
+            ack_policy=AckPolicy.MANUAL,
+        )
+        async def _consume_transcode(payload: object, message: RabbitMessage) -> None:
+            rabbit_message = cast("RabbitMessageLike", cast("object", message))
+            async with runtime.operation("transcode"):
+                await runtime.handle_transcode_message(payload, rabbit_message)
 
-    @resolved_broker.subscriber(
-        runtime.sync_qdrant_queue,
-        runtime.pipeline_exchange,
-        channel=worker_channel,
-        ack_policy=AckPolicy.MANUAL,
-    )
-    async def _consume_sync_qdrant(payload: object, message: RabbitMessage) -> None:
-        rabbit_message = cast("RabbitMessageLike", cast("object", message))
-        await runtime.handle_sync_qdrant_message(payload, rabbit_message)
+    if resolved_role.consumes_stage(ContentPipelineStage.OCR):
 
-    @resolved_broker.subscriber(
-        runtime.sync_meili_queue,
-        runtime.pipeline_exchange,
-        channel=worker_channel,
-        ack_policy=AckPolicy.MANUAL,
-    )
-    async def _consume_sync_meili(payload: object, message: RabbitMessage) -> None:
-        rabbit_message = cast("RabbitMessageLike", cast("object", message))
-        await runtime.handle_sync_meili_message(payload, rabbit_message)
+        @resolved_broker.subscriber(
+            runtime.ocr_queue,
+            runtime.pipeline_exchange,
+            channel=worker_channel(),
+            consume_args=consume_args(),
+            ack_policy=AckPolicy.MANUAL,
+        )
+        async def _consume_ocr(payload: object, message: RabbitMessage) -> None:
+            rabbit_message = cast("RabbitMessageLike", cast("object", message))
+            async with runtime.operation("ocr"):
+                await runtime.handle_ocr_message(payload, rabbit_message)
+
+    if resolved_role.consumes_stage(ContentPipelineStage.EMBED):
+
+        @resolved_broker.subscriber(
+            runtime.embed_queue,
+            runtime.pipeline_exchange,
+            channel=worker_channel(),
+            consume_args=consume_args(),
+            ack_policy=AckPolicy.MANUAL,
+        )
+        async def _consume_embed(payload: object, message: RabbitMessage) -> None:
+            rabbit_message = cast("RabbitMessageLike", cast("object", message))
+            async with runtime.operation("embed"):
+                await runtime.handle_embed_message(payload, rabbit_message)
+
+    if resolved_role.consumes_stage(ContentPipelineStage.CLASSIFY):
+
+        @resolved_broker.subscriber(
+            runtime.classify_queue,
+            runtime.pipeline_exchange,
+            channel=worker_channel(),
+            consume_args=consume_args(),
+            ack_policy=AckPolicy.MANUAL,
+        )
+        async def _consume_classify(payload: object, message: RabbitMessage) -> None:
+            rabbit_message = cast("RabbitMessageLike", cast("object", message))
+            async with runtime.operation("classify"):
+                await runtime.handle_classify_message(payload, rabbit_message)
+
+    if resolved_role.consumes_stage(ContentPipelineStage.SYNC_QDRANT):
+
+        @resolved_broker.subscriber(
+            runtime.sync_qdrant_queue,
+            runtime.pipeline_exchange,
+            channel=worker_channel(),
+            consume_args=consume_args(),
+            ack_policy=AckPolicy.MANUAL,
+        )
+        async def _consume_sync_qdrant(payload: object, message: RabbitMessage) -> None:
+            rabbit_message = cast("RabbitMessageLike", cast("object", message))
+            async with runtime.operation("sync_qdrant"):
+                await runtime.handle_sync_qdrant_message(payload, rabbit_message)
+
+    if resolved_role.consumes_stage(ContentPipelineStage.SYNC_MEILI):
+
+        @resolved_broker.subscriber(
+            runtime.sync_meili_queue,
+            runtime.pipeline_exchange,
+            channel=worker_channel(),
+            consume_args=consume_args(),
+            ack_policy=AckPolicy.MANUAL,
+        )
+        async def _consume_sync_meili(payload: object, message: RabbitMessage) -> None:
+            rabbit_message = cast("RabbitMessageLike", cast("object", message))
+            async with runtime.operation("sync_meili"):
+                await runtime.handle_sync_meili_message(payload, rabbit_message)
 
     return runtime
 
@@ -458,22 +595,57 @@ async def _load_source_engagement_session_keys(session_factory: AsyncSessionFact
             .order_by(TelegramSession.name.asc(), TelegramSession.id.asc())
         )
         return tuple(
-            build_source_engagement_session_key(session_id, session_name)
-            for session_id, session_name in result.all()
+            build_source_engagement_session_key(session_id, session_name) for session_id, session_name in result.all()
         )
 
 
-async def run_pipeline_runtime(*, settings: Settings | None = None) -> None:
+def _load_role_background_runners(role: WorkerRole) -> tuple[WorkerBackgroundRunner, ...]:
+    if role not in {WorkerRole.TELEGRAM, WorkerRole.ALL}:
+        return ()
+    try:
+        recovery_runtime = importlib.import_module("memexpert.services.recovery_runtime")
+    except ModuleNotFoundError as exc:
+        if exc.name == "memexpert.services.recovery_runtime":
+            return ()
+        raise
+    run_telegram_recovery_loop = cast(
+        "WorkerBackgroundRunner",
+        recovery_runtime.run_telegram_recovery_loop,
+    )
+    return (run_telegram_recovery_loop,)
+
+
+async def run_pipeline_runtime(
+    *,
+    settings: Settings | None = None,
+    role: WorkerRole = WorkerRole.ALL,
+    stop_event: asyncio.Event | None = None,
+    background_runners: Sequence[WorkerBackgroundRunner] = (),
+) -> None:
     """Start the real RabbitMQ-backed content-pipeline worker runtime."""
 
+    resolved_settings = settings or get_settings()
+    resolved_role = WorkerRole(role)
     session_factory = get_async_session_factory()
-    source_engagement_session_keys = await _load_source_engagement_session_keys(session_factory)
+    source_engagement_session_keys = (
+        await _load_source_engagement_session_keys(session_factory) if resolved_role.consumes_source_engagement else ()
+    )
+    health_reporter = RuntimeHealthReporter.from_settings(
+        resolved_settings,
+        service="memexpert-workers",
+        role=resolved_role.value,
+    )
     runtime = build_pipeline_runtime(
-        settings=settings,
+        settings=resolved_settings,
+        role=resolved_role,
         session_factory=session_factory,
         source_engagement_session_keys=source_engagement_session_keys,
+        health_reporter=health_reporter,
     )
-    await runtime.run()
+    await runtime.run(
+        stop_event=stop_event,
+        background_runners=(*_load_role_background_runners(resolved_role), *background_runners),
+    )
 
 
-__all__ = ["build_pipeline_runtime", "run_pipeline_runtime"]
+__all__ = ["WorkerBackgroundRunner", "build_pipeline_runtime", "run_pipeline_runtime"]

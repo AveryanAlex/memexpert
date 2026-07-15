@@ -6,13 +6,13 @@ Run the real-stack PRD E2E suite from the repository root:
 python scripts/run_container_e2e.py
 ```
 
-The orchestrator exclusively creates `.artifacts/e2e/<run-id>/`, exports `E2E_RUN_ID` and `E2E_ARTIFACT_DIR`, sets per-run default main/worker/frontend/e2e-runner image tags, starts `docker-compose.e2e.yml` with `docker compose -p memexpert-e2e-<run-id>`, waits for service health, and then verifies that RabbitMQ has consumers on all seven pipeline queues before seeding. It runs the seed proof and Playwright inside the Compose network, captures status/logs/metadata, and removes the stack with volumes unless `E2E_KEEP_STACK=1` is set.
+The orchestrator exclusively creates `.artifacts/e2e/<run-id>/`, exports `E2E_RUN_ID` and `E2E_ARTIFACT_DIR`, sets per-run default main/worker/frontend/e2e-runner image tags, starts `docker-compose.e2e.yml` with `docker compose -p memexpert-e2e-<run-id>`, waits for service health, and then verifies that RabbitMQ has exactly one correctly-owned consumer on each of the seven pipeline queues before seeding. It runs the seed proof and Playwright inside the Compose network, captures status/logs/metadata, and removes the stack with volumes unless `E2E_KEEP_STACK=1` is set.
 
 Before starting Compose, the runner rejects an existing artifact directory and atomically claims the Compose project name with a dedicated labeled Docker network. A second worktree using the same sanitized run ID fails at network creation even when its artifact root differs. The claim remains while `E2E_KEEP_STACK=1` is active or any normal cleanup step fails, and is removed only after the stack, volumes, and per-run images clean up successfully. The runner also rejects pre-existing Compose-labeled containers, volumes, or networks and never joins or tears down a stack it did not establish as available. Explicit run IDs are normalized to Docker-safe values; normalized IDs longer than 48 characters retain a hash suffix so different long IDs cannot collide merely because of truncation.
 
 ## Stack
 
-The E2E Compose file mirrors the production process split: `postgres`, `redis`, `rabbitmq`, `qdrant`, `meilisearch`, `minio`, `minio-init`, `imgproxy`, `migrate`, `api`, `workers`, `frontend`, `seed`, and `e2e-runner`. `api`/`migrate`/`seed` use the unified `main` image target; `workers` uses the worker image target with extra dependencies and media/OCR tooling.
+The E2E Compose file mirrors the production process split: `postgres`, `redis`, `rabbitmq`, `qdrant`, `meilisearch`, `minio`, `minio-init`, `imgproxy`, `migrate`, `api`, the five `worker-*` roles, `frontend`, `seed`, and `e2e-runner`. All roles use the same worker image, but `media`, `ocr`, `enrichment`, `sync`, and `telegram` initialize and consume only their owned dependencies and queues.
 
 It deliberately has no fixed host ports, no `container_name`, and no fixed Compose project name. Named volumes are project-scoped by Compose, so concurrent runs are isolated by the `memexpert-e2e-<run-id>` project name.
 
@@ -24,7 +24,7 @@ RabbitMQ runs as the image's `rabbitmq` user in every Compose variant. This keep
 
 By default, the runner also sets `MEMEXPERT_MAIN_IMAGE`, `MEMEXPERT_WORKER_IMAGE`, `MEMEXPERT_FRONTEND_IMAGE`, and `MEMEXPERT_E2E_RUNNER_IMAGE` to tags derived from the sanitized run id. This avoids concurrent runs racing on mutable global image tags. If you explicitly provide any of those variables, the runner honors your value and does not remove that image tag during cleanup.
 
-After `workers` starts, the runner polls `rabbitmqctl list_consumers --formatter=json` through the RabbitMQ Compose service under a fixed monotonic deadline. Seed begins only after consumers exist for `pipeline.media_inspect`, `pipeline.transcode`, `pipeline.ocr`, `pipeline.embed`, `pipeline.classify`, `pipeline.sync_qdrant`, and `pipeline.sync_meili`. The Compose `service_started` dependency remains intentionally truthful: it does not claim process readiness, while the orchestrator owns the stronger consumer-registration gate.
+After the five worker roles start, the runner polls `rabbitmqctl list_consumers --formatter=json` through the RabbitMQ Compose service under a fixed monotonic deadline. Seed begins only after each required queue has one consumer whose `x-memexpert-worker-role` argument identifies its intended role: media inspect/transcode → `media`, OCR → `ocr`, embed/classify → `enrichment`, and Qdrant/Meilisearch → `sync`. The Compose `service_started` dependency remains intentionally truthful: it does not claim process readiness, while the orchestrator owns the stronger role-ownership gate.
 
 Seed HTTP retries and eventual-consistency pollers use caller-owned monotonic deadlines. Each fixed logical phase—health, private upload, materialization, initial dual sync, crawler promotion, public resync, Meilisearch visibility, and final proofs—receives a fresh `--timeout-seconds` budget. A slow phase therefore cannot starve a later independent phase, while every individual request timeout and retry chain remains capped by its current phase deadline. Only transport errors, HTTP 408/425/429, and 5xx responses are retried; non-idempotent writes require a durable replay identity.
 
@@ -92,7 +92,8 @@ Then inspect it with the project name from `run-metadata.json`, for example:
 
 ```sh
 docker compose -p memexpert-e2e-<run-id> -f docker-compose.e2e.yml ps
-docker compose -p memexpert-e2e-<run-id> -f docker-compose.e2e.yml logs -f api workers frontend
+docker compose -p memexpert-e2e-<run-id> -f docker-compose.e2e.yml logs -f \
+  api worker-media worker-ocr worker-enrichment worker-sync worker-telegram frontend
 ```
 
 Clean up manually when finished:

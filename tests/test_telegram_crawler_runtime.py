@@ -469,20 +469,20 @@ async def test_runtime_reconciles_changed_configuration_without_signal() -> None
 
 
 @pytest.mark.asyncio
-async def test_runtime_polls_backfill_jobs_without_configuration_change() -> None:
+async def test_runtime_leaves_backfill_jobs_to_the_telegram_worker_role() -> None:
     events: list[str] = []
     signal_controller = FakeSignalController(events)
 
-    class _BackfillPollingManager(FakeManager):
-        async def process_backfill_jobs(self) -> int:
-            self._events.append("manager.process_backfill_jobs")
+    class _BackfillOwnershipManager(FakeManager):
+        async def supervise_live_listeners(self) -> tuple[str, ...]:
+            self._events.append("manager.supervise_live_listeners")
             signal_controller.request(TelegramCrawlerControlSignal.STOP)
-            return 1
+            return ()
 
     await run_telegram_crawler_runtime(
         settings=Settings(crawler_reconcile_interval_seconds=0.001),
         engine=FakeEngine(events),
-        manager=_BackfillPollingManager(events),
+        manager=_BackfillOwnershipManager(events),
         signal_controller=signal_controller,
     )
 
@@ -491,7 +491,37 @@ async def test_runtime_polls_backfill_jobs_without_configuration_change() -> Non
         "manager.configuration_snapshot",
         "manager.reload",
         "manager.configuration_snapshot",
-        "manager.process_backfill_jobs",
+        "manager.supervise_live_listeners",
+        "signal.wait:stop",
+        "signal.close",
+        "manager.shutdown",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runtime_supervises_live_listeners_without_configuration_change() -> None:
+    events: list[str] = []
+    signal_controller = FakeSignalController(events)
+
+    class _ListenerSupervisingManager(FakeManager):
+        async def supervise_live_listeners(self) -> tuple[str, ...]:
+            self._events.append("manager.supervise_live_listeners")
+            signal_controller.request(TelegramCrawlerControlSignal.STOP)
+            return ()
+
+    await run_telegram_crawler_runtime(
+        settings=Settings(crawler_reconcile_interval_seconds=0.001),
+        engine=FakeEngine(events),
+        manager=_ListenerSupervisingManager(events),
+        signal_controller=signal_controller,
+    )
+
+    assert events == [
+        "signal.install",
+        "manager.configuration_snapshot",
+        "manager.reload",
+        "manager.configuration_snapshot",
+        "manager.supervise_live_listeners",
         "signal.wait:stop",
         "signal.close",
         "manager.shutdown",
@@ -510,9 +540,7 @@ async def test_runtime_retries_incomplete_startup_catchup_without_configuration_
             events,
             signal_controller=signal_controller,
             signals_after_retry=[TelegramCrawlerControlSignal.STOP],
-            reload_results=(
-                TelegramCrawlerReloadResult(catchup_reports=(), failed_session_names=("primary",)),
-            ),
+            reload_results=(TelegramCrawlerReloadResult(catchup_reports=(), failed_session_names=("primary",)),),
         ),
         signal_controller=signal_controller,
     )

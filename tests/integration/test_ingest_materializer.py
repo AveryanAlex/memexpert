@@ -1127,3 +1127,66 @@ async def test_outbox_batch_runner_publishes_generically_and_recovers_stale_clai
     assert recovered_row.status is RabbitMQOutboxMessageStatus.FAILED
     assert recovered_row.next_retry_at is not None
     assert recovered_row.last_error_text == "RabbitMQ outbox message was recovered from a stale publishing lease."
+
+
+async def test_outbox_automatic_attempts_stop_at_budget_but_admin_pending_reset_gets_one_attempt(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    settings = Settings(
+        pipeline_broker_retry_max_attempts=2,
+        scheduler_rabbitmq_outbox_publisher_batch_size=10,
+    )
+    exhausted = RabbitMQOutboxMessage(
+        exchange="memexpert.pipeline",
+        aggregate_type="test",
+        aggregate_id=str(uuid.uuid7()),
+        event_type="exhausted_event",
+        routing_key="pipeline.exhausted",
+        payload={},
+        headers={},
+        message_id=str(uuid.uuid7()),
+        status=RabbitMQOutboxMessageStatus.FAILED,
+        attempt_count=2,
+        next_retry_at=utcnow() - timedelta(seconds=1),
+    )
+    admin_reset = RabbitMQOutboxMessage(
+        exchange="memexpert.pipeline",
+        aggregate_type="test",
+        aggregate_id=str(uuid.uuid7()),
+        event_type="admin_reset_event",
+        routing_key="pipeline.admin-reset",
+        payload={},
+        headers={},
+        message_id=str(uuid.uuid7()),
+        status=RabbitMQOutboxMessageStatus.PENDING,
+        attempt_count=2,
+        next_retry_at=utcnow(),
+    )
+    migrated_db_session.add_all((exhausted, admin_reset))
+    await migrated_db_session.commit()
+    broker = FakeBroker(fail_routing_keys={"pipeline.exhausted", "pipeline.admin-reset"})
+
+    first = await run_rabbitmq_outbox_publisher_batch(
+        postgres_session_factory,
+        settings=settings,
+        broker=broker,
+    )
+    second = await run_rabbitmq_outbox_publisher_batch(
+        postgres_session_factory,
+        settings=settings,
+        broker=broker,
+    )
+
+    assert first.claimed == first.failed == 1
+    assert second.claimed == second.failed == 0
+    assert [call["routing_key"] for call in broker.publish_calls] == ["pipeline.admin-reset"]
+    async with postgres_session_factory() as session:
+        persisted_exhausted = await session.get(RabbitMQOutboxMessage, exhausted.id)
+        persisted_admin_reset = await session.get(RabbitMQOutboxMessage, admin_reset.id)
+        assert persisted_exhausted is not None
+        assert persisted_exhausted.attempt_count == 2
+        assert persisted_exhausted.status is RabbitMQOutboxMessageStatus.FAILED
+        assert persisted_admin_reset is not None
+        assert persisted_admin_reset.attempt_count == 3
+        assert persisted_admin_reset.status is RabbitMQOutboxMessageStatus.FAILED

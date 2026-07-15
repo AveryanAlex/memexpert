@@ -22,6 +22,14 @@ class _TelegramCrawlerStructuredFormatter(logging.Formatter):
         "failed_session_names",
         "retry_required",
         "retry_incomplete",
+        "operation",
+        "post_id",
+        "timeout_seconds",
+        "error_class",
+        "translated_error_class",
+        "retryable",
+        "client_reset",
+        "restart_attempt",
     )
 
     def format(self, record: logging.LogRecord) -> str:

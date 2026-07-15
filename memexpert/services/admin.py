@@ -7,7 +7,7 @@ import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import SecretStr
 from sqlalchemy import and_, case, delete, func, or_, select
@@ -55,6 +55,7 @@ from memexpert.models.enums import (
     ModerationAction,
     ModerationReportStatus,
     PipelineIngestRequestStatus,
+    RecoveryCapability,
     SourceAttachReason,
     SourceChannelBackfillJobStatus,
     SourceChannelPostStatus,
@@ -362,41 +363,45 @@ class AdminService:
             return select(func.count()).select_from(model).where(*conditions).scalar_subquery()
 
         row = (
-            await self.session.execute(
-                select(
-                    count_rows(
-                        ModerationReport,
-                        ModerationReport.status.in_(
-                            [ModerationReportStatus.PENDING, ModerationReportStatus.IN_REVIEW],
+            (
+                await self.session.execute(
+                    select(
+                        count_rows(
+                            ModerationReport,
+                            ModerationReport.status.in_(
+                                [ModerationReportStatus.PENDING, ModerationReportStatus.IN_REVIEW],
+                            ),
+                        ).label("open_report_count"),
+                        count_rows(
+                            ChannelSuggestion,
+                            ChannelSuggestion.status == ChannelSuggestionStatus.PENDING,
+                        ).label("pending_suggestion_count"),
+                        count_rows(SourceChannel, source_needing_attention).label("source_attention_count"),
+                        count_rows(SourceChannel, orphaned_source).label("orphaned_source_count"),
+                        count_rows(SourceChannel, stale_source).label("stale_source_count"),
+                        count_rows(SourceChannel, waiting_source).label("waiting_source_count"),
+                        count_rows(SourceChannel, healthy_source).label("healthy_source_count"),
+                        count_rows(TelegramSession, telegram_account_needing_attention).label(
+                            "telegram_account_attention_count",
                         ),
-                    ).label("open_report_count"),
-                    count_rows(
-                        ChannelSuggestion,
-                        ChannelSuggestion.status == ChannelSuggestionStatus.PENDING,
-                    ).label("pending_suggestion_count"),
-                    count_rows(SourceChannel, source_needing_attention).label("source_attention_count"),
-                    count_rows(SourceChannel, orphaned_source).label("orphaned_source_count"),
-                    count_rows(SourceChannel, stale_source).label("stale_source_count"),
-                    count_rows(SourceChannel, waiting_source).label("waiting_source_count"),
-                    count_rows(SourceChannel, healthy_source).label("healthy_source_count"),
-                    count_rows(TelegramSession, telegram_account_needing_attention).label(
-                        "telegram_account_attention_count",
+                        count_rows(TelegramSession, ready_telegram_account).label("ready_telegram_account_count"),
+                        select(func.count())
+                        .select_from(Meme)
+                        .outerjoin(MemeSeoPage, MemeSeoPage.meme_id == Meme.id)
+                        .where(
+                            Meme.is_public.is_(True),
+                            Meme.is_nsfw.is_(False),
+                            MemeSeoPage.meme_id.is_(None),
+                        )
+                        .scalar_subquery()
+                        .label("missing_seo_count"),
+                        count_rows(MemeTemplate, MemeTemplate.is_curated.is_(False)).label("uncurated_template_count"),
                     ),
-                    count_rows(TelegramSession, ready_telegram_account).label("ready_telegram_account_count"),
-                    select(func.count())
-                    .select_from(Meme)
-                    .outerjoin(MemeSeoPage, MemeSeoPage.meme_id == Meme.id)
-                    .where(
-                        Meme.is_public.is_(True),
-                        Meme.is_nsfw.is_(False),
-                        MemeSeoPage.meme_id.is_(None),
-                    )
-                    .scalar_subquery()
-                    .label("missing_seo_count"),
-                    count_rows(MemeTemplate, MemeTemplate.is_curated.is_(False)).label("uncurated_template_count"),
-                ),
+                )
             )
-        ).mappings().one()
+            .mappings()
+            .one()
+        )
         return AdminOverviewRead(**row)
 
     async def list_channel_suggestions(
@@ -430,15 +435,16 @@ class AdminService:
 
     async def list_telegram_sessions(self) -> list[AdminTelegramSessionRead]:
         rows = (
-            await self.session.execute(
-                select(TelegramSession).order_by(TelegramSession.name.asc()),
+            (
+                await self.session.execute(
+                    select(TelegramSession).order_by(TelegramSession.name.asc()),
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         counts_by_session = await self._count_source_channels_by_session()
-        return [
-            self._telegram_session_read(row, owned_channel_count=counts_by_session.get(row.id, 0))
-            for row in rows
-        ]
+        return [self._telegram_session_read(row, owned_channel_count=counts_by_session.get(row.id, 0)) for row in rows]
 
     async def create_telegram_session(
         self,
@@ -621,13 +627,17 @@ class AdminService:
 
         previous_session_values = self._telegram_session_snapshot(row)
         channels = (
-            await self.session.execute(
-                select(SourceChannel)
-                .where(SourceChannel.telegram_session_id == session_id)
-                .order_by(SourceChannel.title.asc())
-                .with_for_update(),
+            (
+                await self.session.execute(
+                    select(SourceChannel)
+                    .where(SourceChannel.telegram_session_id == session_id)
+                    .order_by(SourceChannel.title.asc())
+                    .with_for_update(),
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         for channel in channels:
             previous_channel_values = self._source_channel_snapshot(channel)
             self._force_orphaned_channel_disabled(channel)
@@ -671,19 +681,23 @@ class AdminService:
         if telegram_session_id is not None and await self.session.get(TelegramSession, telegram_session_id) is None:
             raise AdminNotFoundError(f"Telegram session {telegram_session_id} does not exist.")
         rows = (
-            await self.session.execute(
-                select(SourceChannel)
-                .options(selectinload(SourceChannel.telegram_session))
-                .where(
-                    *self._source_channel_filters(
-                        platform=platform,
-                        telegram_session_id=telegram_session_id,
-                        orphaned=orphaned,
-                    ),
+            (
+                await self.session.execute(
+                    select(SourceChannel)
+                    .options(selectinload(SourceChannel.telegram_session))
+                    .where(
+                        *self._source_channel_filters(
+                            platform=platform,
+                            telegram_session_id=telegram_session_id,
+                            orphaned=orphaned,
+                        ),
+                    )
+                    .order_by(SourceChannel.title.asc())
                 )
-                .order_by(SourceChannel.title.asc())
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         latest_backfill_jobs = await self._latest_source_channel_backfill_jobs(row.id for row in rows)
         now = utcnow()
         return [
@@ -697,16 +711,20 @@ class AdminService:
 
     async def list_telegram_channel_groups(self) -> list[AdminTelegramChannelGroupRead]:
         sessions = (
-            await self.session.execute(select(TelegramSession).order_by(TelegramSession.name.asc()))
-        ).scalars().all()
+            (await self.session.execute(select(TelegramSession).order_by(TelegramSession.name.asc()))).scalars().all()
+        )
         channels = (
-            await self.session.execute(
-                select(SourceChannel)
-                .options(selectinload(SourceChannel.telegram_session))
-                .where(SourceChannel.platform == SourcePlatform.TELEGRAM)
-                .order_by(SourceChannel.title.asc()),
+            (
+                await self.session.execute(
+                    select(SourceChannel)
+                    .options(selectinload(SourceChannel.telegram_session))
+                    .where(SourceChannel.platform == SourcePlatform.TELEGRAM)
+                    .order_by(SourceChannel.title.asc()),
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         latest_backfill_jobs = await self._latest_source_channel_backfill_jobs(row.id for row in channels)
         counts_by_session = await self._count_source_channels_by_session()
         now = utcnow()
@@ -851,9 +869,7 @@ class AdminService:
         try:
             await self._lock_telegram_public_identity(resolved.platform_id)
             locked_account = await self.session.scalar(
-                select(TelegramSession)
-                .where(TelegramSession.id == request.telegram_session_id)
-                .with_for_update(),
+                select(TelegramSession).where(TelegramSession.id == request.telegram_session_id).with_for_update(),
             )
             if locked_account is None:
                 raise AdminNotFoundError("The selected Telegram account no longer exists.")
@@ -953,9 +969,7 @@ class AdminService:
             suggestion: ChannelSuggestion | None = None
             if request.suggestion_id is not None:
                 suggestion = await self.session.scalar(
-                    select(ChannelSuggestion)
-                    .where(ChannelSuggestion.id == request.suggestion_id)
-                    .with_for_update(),
+                    select(ChannelSuggestion).where(ChannelSuggestion.id == request.suggestion_id).with_for_update(),
                 )
                 self._validate_reference_suggestion(
                     suggestion,
@@ -997,7 +1011,7 @@ class AdminService:
                     ),
                 )
             await self.session.commit()
-        except (AdminNotFoundError, AdminConflictError):
+        except AdminNotFoundError, AdminConflictError:
             await self.session.rollback()
             raise
         except IntegrityError as exc:
@@ -1227,6 +1241,7 @@ class AdminService:
         limit: int,
         offset: int,
         snapshot_at: datetime | None = None,
+        status: Literal["failed", "processing"] | None = None,
     ) -> AdminSourceChannelPostPageRead:
         """Return observed Telegram posts joined to current pipeline and index truth."""
 
@@ -1236,27 +1251,28 @@ class AdminService:
         current_time = utcnow()
         observed_through = current_time if snapshot_at is None or snapshot_at > current_time else snapshot_at
 
-        posts = list(
-            (
-                await self.session.execute(
-                    select(SourceChannelPost)
-                    .where(
-                        SourceChannelPost.source_channel_id == channel.id,
-                        SourceChannelPost.created_at <= observed_through,
-                    )
-                    .order_by(
-                        SourceChannelPost.published_at.desc(),
-                        SourceChannelPost.created_at.desc(),
-                        SourceChannelPost.id.desc(),
-                    )
-                    .limit(limit)
-                    .offset(offset),
-                )
+        post_stmt = (
+            select(SourceChannelPost)
+            .where(
+                SourceChannelPost.source_channel_id == channel.id,
+                SourceChannelPost.created_at <= observed_through,
             )
-            .scalars()
-            .all(),
+            .order_by(
+                SourceChannelPost.published_at.desc(),
+                SourceChannelPost.created_at.desc(),
+                SourceChannelPost.id.desc(),
+            )
         )
-        post_reads = await self._source_channel_post_reads(channel, posts)
+        if status is None:
+            posts = list((await self.session.execute(post_stmt.limit(limit).offset(offset))).scalars().all())
+            post_reads = await self._source_channel_post_reads(channel, posts)
+            filtered_total: int | None = None
+        else:
+            candidate_posts = list((await self.session.execute(post_stmt.limit(10_000))).scalars().all())
+            candidate_reads = await self._source_channel_post_reads(channel, candidate_posts)
+            matching_reads = [item for item in candidate_reads if item.index_status == status]
+            filtered_total = len(matching_reads)
+            post_reads = matching_reads[offset : offset + limit]
         summary = await self._source_channel_post_summary(
             channel,
             observed_through=observed_through,
@@ -1267,7 +1283,7 @@ class AdminService:
             snapshot_at=observed_through,
             summary=summary,
             items=post_reads,
-            total=summary.observed_count,
+            total=summary.observed_count if filtered_total is None else filtered_total,
             limit=limit,
             offset=offset,
         )
@@ -1330,9 +1346,7 @@ class AdminService:
         return await self._get_source_channel_read(channel.id)
 
     async def list_meme_templates(self) -> list[AdminMemeTemplateRead]:
-        rows = (
-            await self.session.execute(select(MemeTemplate).order_by(MemeTemplate.name.asc()))
-        ).scalars().all()
+        rows = (await self.session.execute(select(MemeTemplate).order_by(MemeTemplate.name.asc()))).scalars().all()
         return [AdminMemeTemplateRead.model_validate(row) for row in rows]
 
     async def create_meme_template(self, request: AdminMemeTemplateCreateRequest) -> AdminMemeTemplateRead:
@@ -1397,8 +1411,10 @@ class AdminService:
             raise AdminNotFoundError(f"Target meme template {request.target_template_id} does not exist.")
 
         affected_memes = (
-            await self.session.execute(select(Meme).where(Meme.template_id == template_id).with_for_update())
-        ).scalars().all()
+            (await self.session.execute(select(Meme).where(Meme.template_id == template_id).with_for_update()))
+            .scalars()
+            .all()
+        )
         source_label = f"{source_template.name} ({source_template.id})"
         target_label = f"{target_template.name} ({target_template.id})"
         decision_note = f"Template merge {source_label} -> {target_label}. {request.note}"
@@ -1563,10 +1579,7 @@ class AdminService:
         request: AdminMemeSeoEditRequest,
     ) -> AdminMemeSeoPageRead:
         meme = await self.session.scalar(
-            select(Meme)
-            .where(Meme.id == meme_id)
-            .options(selectinload(Meme.seo_page))
-            .with_for_update(),
+            select(Meme).where(Meme.id == meme_id).options(selectinload(Meme.seo_page)).with_for_update(),
         )
         if meme is None:
             raise AdminNotFoundError(f"Meme {meme_id} does not exist.")
@@ -1790,15 +1803,19 @@ class AdminService:
         blocked_hash_id: uuid.UUID,
     ) -> list[AdminBlockedPerceptualHashAuditRead]:
         rows = (
-            await self.session.execute(
-                select(BlockedPerceptualHashAuditLog)
-                .where(BlockedPerceptualHashAuditLog.blocked_perceptual_hash_id == blocked_hash_id)
-                .order_by(
-                    BlockedPerceptualHashAuditLog.created_at.desc(),
-                    BlockedPerceptualHashAuditLog.id.desc(),
-                ),
+            (
+                await self.session.execute(
+                    select(BlockedPerceptualHashAuditLog)
+                    .where(BlockedPerceptualHashAuditLog.blocked_perceptual_hash_id == blocked_hash_id)
+                    .order_by(
+                        BlockedPerceptualHashAuditLog.created_at.desc(),
+                        BlockedPerceptualHashAuditLog.id.desc(),
+                    ),
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         return [AdminBlockedPerceptualHashAuditRead.model_validate(row) for row in rows]
 
     async def list_moderation_memes(
@@ -1832,21 +1849,29 @@ class AdminService:
             raise AdminNotFoundError(f"Meme {meme_id} does not exist.")
 
         reports = (
-            await self.session.execute(
-                select(ModerationReport)
-                .options(selectinload(ModerationReport.meme).selectinload(Meme.primary_file))
-                .where(ModerationReport.meme_id == meme_id)
-                .order_by(ModerationReport.created_at.desc()),
+            (
+                await self.session.execute(
+                    select(ModerationReport)
+                    .options(selectinload(ModerationReport.meme).selectinload(Meme.primary_file))
+                    .where(ModerationReport.meme_id == meme_id)
+                    .order_by(ModerationReport.created_at.desc()),
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         decisions = (
-            await self.session.execute(
-                select(ModerationDecision)
-                .where(ModerationDecision.meme_id == meme_id)
-                .order_by(ModerationDecision.created_at.desc(), ModerationDecision.id.desc())
-                .limit(100),
+            (
+                await self.session.execute(
+                    select(ModerationDecision)
+                    .where(ModerationDecision.meme_id == meme_id)
+                    .order_by(ModerationDecision.created_at.desc(), ModerationDecision.id.desc())
+                    .limit(100),
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         popularity_scores = await self._load_admin_popularity_scores([meme])
         meme_read = self._admin_meme_read(meme, popularity_score=popularity_scores.get(meme.id, 0.0))
 
@@ -2154,12 +2179,14 @@ class AdminService:
                 await self.session.execute(
                     select(CollectionMeme.collection_id).where(CollectionMeme.meme_id == meme.id),
                 )
-            ).scalars().all()
+            )
+            .scalars()
+            .all()
         )
         pinned_user_ids = tuple(
-            (
-                await self.session.execute(select(PinnedMeme.user_id).where(PinnedMeme.meme_id == meme.id))
-            ).scalars().all()
+            (await self.session.execute(select(PinnedMeme.user_id).where(PinnedMeme.meme_id == meme.id)))
+            .scalars()
+            .all()
         )
         report_rows = (
             await self.session.execute(
@@ -2269,9 +2296,14 @@ class AdminService:
         )
 
     async def _count_blocked_hash_matches(self, blocked_hash_id: uuid.UUID) -> int:
-        return await self.session.scalar(
-            select(func.count()).select_from(MemeFile).where(MemeFile.blocked_perceptual_hash_id == blocked_hash_id),
-        ) or 0
+        return (
+            await self.session.scalar(
+                select(func.count())
+                .select_from(MemeFile)
+                .where(MemeFile.blocked_perceptual_hash_id == blocked_hash_id),
+            )
+            or 0
+        )
 
     def _add_blocked_hash_audit(
         self,
@@ -2361,7 +2393,9 @@ class AdminService:
             select(func.count()).select_from(MemeFileOCRResult).where(MemeFileOCRResult.meme_file_id.in_(file_ids)),
         )
         stage_count = await self.session.scalar(
-            select(func.count()).select_from(PipelineStageJournal).where(PipelineStageJournal.meme_file_id.in_(file_ids)),
+            select(func.count())
+            .select_from(PipelineStageJournal)
+            .where(PipelineStageJournal.meme_file_id.in_(file_ids)),
         )
         telegram_count = await self.session.scalar(
             select(func.count()).select_from(TelegramFileIdCache).where(TelegramFileIdCache.meme_file_id.in_(file_ids)),
@@ -2549,8 +2583,7 @@ class AdminService:
         )
         rows = (
             await self.session.execute(
-                select(classified.c.index_status, func.count())
-                .group_by(classified.c.index_status),
+                select(classified.c.index_status, func.count()).group_by(classified.c.index_status),
             )
         ).all()
         counts = {status: count for status, count in rows}
@@ -2618,9 +2651,7 @@ class AdminService:
         files_by_id = (
             {
                 row.id: row
-                for row in (
-                    await self.session.execute(select(MemeFile).where(MemeFile.id.in_(file_ids)))
-                )
+                for row in (await self.session.execute(select(MemeFile).where(MemeFile.id.in_(file_ids))))
                 .scalars()
                 .all()
             }
@@ -2700,7 +2731,9 @@ class AdminService:
                     meme_id=(
                         request.materialized_meme_id
                         if request is not None and request.materialized_meme_id is not None
-                        else None if meme_file is None else meme_file.meme_id
+                        else None
+                        if meme_file is None
+                        else meme_file.meme_id
                     ),
                     meme_file_id=file_id,
                     pipeline_stage=None if current_stage is None else current_stage.stage,
@@ -2709,6 +2742,20 @@ class AdminService:
                     qdrant_status=qdrant_status,
                     meilisearch_status=meilisearch_status,
                     index_status=index_status,
+                    is_retryable=post.is_retryable,
+                    version=f"{post.updated_at.isoformat()}:",
+                    capabilities=(
+                        [RecoveryCapability.REPLAY_SOURCE_POST]
+                        if post.status is SourceChannelPostStatus.FAILED and post.is_retryable
+                        else []
+                    ),
+                    blocked_reason=(
+                        None
+                        if post.status is SourceChannelPostStatus.FAILED and post.is_retryable
+                        else "Open the pipeline recovery detail for downstream failures."
+                        if index_status == "failed" and file_id is not None
+                        else "This source post is not in a retryable failed state."
+                    ),
                 ),
             )
         return reads
@@ -2731,9 +2778,7 @@ class AdminService:
         if snapshot is not None:
             return snapshot.status
         target_stage = (
-            ContentPipelineStage.SYNC_QDRANT
-            if target is SyncTargetKind.QDRANT
-            else ContentPipelineStage.SYNC_MEILI
+            ContentPipelineStage.SYNC_QDRANT if target is SyncTargetKind.QDRANT else ContentPipelineStage.SYNC_MEILI
         )
         entry = next((item for item in entries if item.stage is target_stage), None)
         if entry is None:
@@ -2776,7 +2821,8 @@ class AdminService:
             return "not_indexable"
         if (
             post_status is SourceChannelPostStatus.FAILED
-            or ingest_status in {
+            or ingest_status
+            in {
                 PipelineIngestRequestStatus.FAILED_INVALID_MEDIA,
                 PipelineIngestRequestStatus.PUBLISH_FAILED,
             }
@@ -2815,7 +2861,17 @@ class AdminService:
             freshness_status = "fresh" if seconds_since_last_fetch <= 24 * 60 * 60 else "stale"
 
         if latest_backfill_job is None or latest_backfill_job.status is SourceChannelBackfillJobStatus.COMPLETED:
-            backfill_status: Literal["idle", "queued", "running", "failed"] = "idle"
+            backfill_status: Literal[
+                "cancelled",
+                "completed",
+                "completed_with_failures",
+                "failed",
+                "idle",
+                "queued",
+                "running",
+                "waiting_capacity",
+                "waiting_retry",
+            ] = "idle"
             backfill_requested_count = 0
             backfill_scanned_count = 0
             backfill_error = None
@@ -3032,9 +3088,7 @@ class AdminService:
         if name is None:
             return None
         telegram_session = await self.session.scalar(
-            select(TelegramSession)
-            .where(TelegramSession.name == name)
-            .limit(1),
+            select(TelegramSession).where(TelegramSession.name == name).limit(1),
         )
         if telegram_session is None:
             raise AdminConflictError(f"Telegram session {name!r} does not exist.")
@@ -3184,9 +3238,13 @@ class AdminService:
 
     def _encrypt_string_session(self, string_session: SecretStr) -> str:
         try:
-            return TelegramStringSessionCipher(get_settings().telegram_session_encryption_secret).encrypt(
-                string_session,
-            ).get_secret_value()
+            return (
+                TelegramStringSessionCipher(get_settings().telegram_session_encryption_secret)
+                .encrypt(
+                    string_session,
+                )
+                .get_secret_value()
+            )
         except TelegramStringSessionSecretError as exc:
             raise AdminConflictError("Telegram StringSession material could not be encrypted.") from exc
 

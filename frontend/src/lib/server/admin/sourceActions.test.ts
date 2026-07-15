@@ -14,7 +14,9 @@ describe('source admin actions', () => {
       'assignSourceChannel',
       'orphanSourceChannel',
       'validateSourceAccount',
-      'backfillSourceChannel'
+      'backfillSourceChannel',
+      'resumeSourceBackfill',
+      'replaySourcePost'
     ]);
   });
 
@@ -32,6 +34,12 @@ describe('source admin actions', () => {
       if (new URL(String(input)).pathname.endsWith('/validate')) {
         return jsonResponse({ channel_checked: true, channel_reference: '@source' });
       }
+      if (new URL(String(input)).pathname.includes('/backfills/')) {
+        return jsonResponse({ id: 'resume-recovery-job' });
+      }
+      if (new URL(String(input)).pathname.endsWith('/replay')) {
+        return jsonResponse({ id: 'replay-recovery-job' });
+      }
       return jsonResponse({});
     }) satisfies ApiFetch;
 
@@ -45,6 +53,8 @@ describe('source admin actions', () => {
     await expect(sourceActions.orphanSourceChannel(actionEvent({ channel_id: channelId, note: 'pause source' }, fetch))).resolves.toEqual({ message: 'Source is now unassigned and ingestion is off.' });
     await expect(sourceActions.validateSourceAccount(actionEvent({ source_channel_id: channelId, telegram_session_id: sessionId, note: 'check access' }, fetch))).resolves.toEqual({ message: 'Source access validated with @source.' });
     await expect(sourceActions.backfillSourceChannel(actionEvent({ channel_id: channelId, message_limit: '5000' }, fetch))).resolves.toEqual({ message: 'Older-message backfill queued for 5,000 messages.' });
+    await expect(sourceActions.resumeSourceBackfill(actionEvent({ channel_id: channelId, job_id: 'backfill-id', version: 'version-1', request_id: '44444444-4444-4444-8444-444444444444', reason: 'Telegram account was reconnected.' }, fetch))).resolves.toEqual({ message: 'Failed backfill queued to resume from its durable cursor.', recoveryJobId: 'resume-recovery-job' });
+    await expect(sourceActions.replaySourcePost(actionEvent({ channel_id: channelId, post_id: '1234', version: 'version-2', request_id: '55555555-5555-4555-8555-555555555555', reason: 'The provider is healthy again.' }, fetch))).resolves.toEqual({ message: 'Telegram post replay queued.', recoveryJobId: 'replay-recovery-job' });
 
     expect(calls).toEqual([
       { path: `/api/v1/admin/channel-suggestions/${suggestionId}/reject`, method: 'POST', body: { admin_note: 'duplicate' } },
@@ -56,7 +66,9 @@ describe('source admin actions', () => {
       { path: `/api/v1/admin/telegram/channels/${channelId}/assign`, method: 'POST', body: { telegram_session_id: sessionId, note: 'move source' } },
       { path: `/api/v1/admin/telegram/channels/${channelId}/orphan`, method: 'POST', body: { note: 'pause source' } },
       { path: `/api/v1/admin/telegram/sessions/${sessionId}/validate`, method: 'POST', body: { source_channel_id: channelId, note: 'check access' } },
-      { path: `/api/v1/admin/source-channels/${channelId}/backfill`, method: 'POST', body: { message_limit: 5000 } }
+      { path: `/api/v1/admin/source-channels/${channelId}/backfill`, method: 'POST', body: { message_limit: 5000 } },
+      { path: `/api/v1/admin/source-channels/${channelId}/backfills/backfill-id/resume`, method: 'POST', body: { request_id: '44444444-4444-4444-8444-444444444444', version: 'version-1', reason: 'Telegram account was reconnected.' } },
+      { path: `/api/v1/admin/source-channels/${channelId}/posts/1234/replay`, method: 'POST', body: { request_id: '55555555-5555-4555-8555-555555555555', version: 'version-2', reason: 'The provider is healthy again.' } }
     ]);
   });
 
@@ -87,13 +99,51 @@ describe('source admin actions', () => {
       { result: sourceActions.orphanSourceChannel(actionEvent({}, fetch)), message: 'channel_id is required.' },
       { result: sourceActions.validateSourceAccount(actionEvent({ source_channel_id: channelId }, fetch)), message: 'telegram_session_id is required.' },
       { result: sourceActions.backfillSourceChannel(actionEvent({ message_limit: '5000' }, fetch)), message: 'channel_id is required.' },
-      { result: sourceActions.backfillSourceChannel(actionEvent({ channel_id: channelId, message_limit: '50001' }, fetch)), message: 'message_limit must be between 1 and 50000.' }
+      { result: sourceActions.backfillSourceChannel(actionEvent({ channel_id: channelId, message_limit: '50001' }, fetch)), message: 'message_limit must be between 1 and 50000.' },
+      { result: sourceActions.resumeSourceBackfill(actionEvent({ channel_id: channelId, job_id: 'backfill-id', version: 'v', reason: 'fixed' }, fetch)), message: 'request_id is required.' },
+      { result: sourceActions.resumeSourceBackfill(actionEvent({ channel_id: channelId, version: 'v', request_id: '66666666-6666-4666-8666-666666666666', reason: 'fixed' }, fetch)), message: 'job_id is required.' },
+      { result: sourceActions.replaySourcePost(actionEvent({ channel_id: channelId, post_id: '1', version: 'v', reason: 'fixed' }, fetch)), message: 'request_id is required.' },
+      { result: sourceActions.replaySourcePost(actionEvent({ channel_id: channelId, post_id: '1', version: 'v', request_id: '77777777-7777-4777-8777-777777777777', reason: 'x' }, fetch)), message: 'reason must be between 3 and 500 characters.' }
     ];
 
     for (const malformed of malformedActions) {
       await expect(malformed.result).resolves.toMatchObject({ status: 400, data: { message: malformed.message, error: true } });
     }
     expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('forwards submitted request ids unchanged across repeated resume and replay submissions', async () => {
+    const requestBodies: unknown[] = [];
+    const fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      requestBodies.push(init?.body ? JSON.parse(String(init.body)) : null);
+      return jsonResponse({ id: 'recovery-job' });
+    }) satisfies ApiFetch;
+    const resumeValues = {
+      channel_id: '11111111-1111-4111-8111-111111111111',
+      job_id: 'backfill-id',
+      version: 'backfill-version',
+      request_id: '88888888-8888-4888-8888-888888888888',
+      reason: 'Telegram account was reconnected.'
+    };
+    const replayValues = {
+      channel_id: '11111111-1111-4111-8111-111111111111',
+      post_id: '1234',
+      version: 'post-version',
+      request_id: '99999999-9999-4999-8999-999999999999',
+      reason: 'The provider is healthy again.'
+    };
+
+    await sourceActions.resumeSourceBackfill(actionEvent(resumeValues, fetch));
+    await sourceActions.resumeSourceBackfill(actionEvent(resumeValues, fetch));
+    await sourceActions.replaySourcePost(actionEvent(replayValues, fetch));
+    await sourceActions.replaySourcePost(actionEvent(replayValues, fetch));
+
+    expect(requestBodies).toEqual([
+      { request_id: resumeValues.request_id, version: resumeValues.version, reason: resumeValues.reason },
+      { request_id: resumeValues.request_id, version: resumeValues.version, reason: resumeValues.reason },
+      { request_id: replayValues.request_id, version: replayValues.version, reason: replayValues.reason },
+      { request_id: replayValues.request_id, version: replayValues.version, reason: replayValues.reason }
+    ]);
   });
 });
 
