@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   recoveryCapabilityLabel,
+  recoveryDefaultBatchCapability,
   recoveryFiltersFromUrl,
   recoveryHref,
   recoveryPrimaryCapability,
@@ -49,5 +50,11 @@ describe('admin recovery view model', () => {
     expect(recoveryPrimaryCapability([])).toBeNull();
     expect(recoveryCapabilityLabel('resume_backfill')).toBe('Resume backfill');
     expect(recoveryCapabilityLabel('retry_stage')).toBe('Retry stage');
+    expect(recoveryDefaultBatchCapability([
+      { capabilities: [] },
+      { capabilities: ['resume_backfill'] },
+      { capabilities: ['retry_stage'] }
+    ])).toBe('resume_backfill');
+    expect(recoveryDefaultBatchCapability([])).toBe('retry_stage');
   });
 });

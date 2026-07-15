@@ -54,6 +54,66 @@ test('admin analytics keeps a shared UTC range across dashboards and exposes que
   await expect(page.getByText(adminFixture.memeId, { exact: true })).toBeVisible();
 });
 
+test('recovery selection follows the batch action and can select all compatible rows on the page', async ({ page }) => {
+  await gotoAdmin(page, '/admin/recovery');
+
+  await expect(page.getByRole('heading', { name: 'Failed and stuck work' })).toBeVisible();
+  const action = page.getByRole('combobox', { name: 'Batch action' });
+  await expect(action).toHaveValue('resume_backfill');
+
+  const selectAll = page.getByLabel('Select all compatible recovery work on this page');
+  const memach = page.getByLabel('Select @memach backfill for Resume backfill');
+  const log4inpowerken = page.getByLabel('Select @log4inpowerken backfill for Resume backfill');
+  const ocrOneForResume = page.getByLabel('Select OCR file one for Resume backfill');
+  const blockedForResume = page.getByLabel('Select Blocked Telegram post for Resume backfill');
+
+  await expect(memach).toBeEnabled();
+  await expect(log4inpowerken).toBeEnabled();
+  await expect(ocrOneForResume).toBeDisabled();
+  await expect(blockedForResume).toBeDisabled();
+
+  await memach.check();
+  await expect(memach).toBeChecked();
+  await expect(selectAll).not.toBeChecked();
+  await expect(selectAll).toHaveJSProperty('indeterminate', true);
+  await expect(page.getByText('1 of 2 compatible rows selected for Resume backfill.')).toBeVisible();
+
+  let formPayload = await recoveryFormPayload(page);
+  expect(formPayload.capability).toBe('resume_backfill');
+  expect(formPayload.items.map((item) => JSON.parse(item))).toEqual([
+    { kind: 'backfill', id: 'smoke-backfill-memach', version: 'backfill-version-1' }
+  ]);
+
+  await selectAll.click();
+  await expect(selectAll).toBeChecked();
+  await expect(memach).toBeChecked();
+  await expect(log4inpowerken).toBeChecked();
+  await expect(ocrOneForResume).not.toBeChecked();
+  await expect(page.getByText('2 of 2 compatible rows selected for Resume backfill.')).toBeVisible();
+
+  await action.selectOption('retry_stage');
+  await expect(page.getByText('0 of 2 compatible rows selected for Retry stage.')).toBeVisible();
+  await expect(selectAll).not.toBeChecked();
+  await expect(selectAll).toHaveJSProperty('indeterminate', false);
+  await expect(page.getByLabel('Select @memach backfill for Retry stage')).toBeDisabled();
+  const ocrOne = page.getByLabel('Select OCR file one for Retry stage');
+  const ocrTwo = page.getByLabel('Select OCR file two for Retry stage');
+  await expect(ocrOne).toBeEnabled();
+  await expect(ocrTwo).toBeEnabled();
+
+  await selectAll.click();
+  await expect(ocrOne).toBeChecked();
+  await expect(ocrTwo).toBeChecked();
+  await expect(page.getByLabel('Select Blocked Telegram post for Retry stage')).toBeDisabled();
+
+  formPayload = await recoveryFormPayload(page);
+  expect(formPayload.capability).toBe('retry_stage');
+  expect(formPayload.items.map((item) => JSON.parse(item))).toEqual([
+    { kind: 'pipeline_stage', id: 'smoke-file-ocr-1:ocr', version: 'ocr-version-1' },
+    { kind: 'pipeline_stage', id: 'smoke-file-ocr-2:ocr', version: 'ocr-version-2' }
+  ]);
+});
+
 test('admin adds a public Telegram source through the selected ready account and pauses that source', async ({ page }) => {
   await gotoAdmin(page, '/admin/sources');
 
@@ -255,4 +315,14 @@ async function openDisclosure(scope: Locator, title: string): Promise<Locator> {
   await details.locator(':scope > summary').click();
   await expect(details).toHaveJSProperty('open', true);
   return details;
+}
+
+async function recoveryFormPayload(page: Page): Promise<{ capability: string; items: string[] }> {
+  return page.locator('#batch-preview-form').evaluate((form) => {
+    const data = new FormData(form as HTMLFormElement);
+    return {
+      capability: String(data.get('capability')),
+      items: data.getAll('item').map((item) => String(item))
+    };
+  });
 }

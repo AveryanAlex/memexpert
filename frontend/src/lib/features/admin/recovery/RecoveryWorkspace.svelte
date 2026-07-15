@@ -3,6 +3,7 @@
     AdminRecoveryBatchRead,
     AdminRecoveryCapability,
     AdminRecoverySummaryRead,
+    AdminRecoveryWorkRead,
     AdminRecoveryWorkPageRead
   } from '$lib/api/types';
   import AdminPanel from '$lib/features/admin/AdminPanel.svelte';
@@ -17,6 +18,7 @@
     humanizeRecoveryValue,
     recoveryBucketLabel,
     recoveryCapabilityLabel,
+    recoveryDefaultBatchCapability,
     recoveryHref,
     recoveryPrimaryCapability,
     recoveryWorkRequestKey,
@@ -42,7 +44,9 @@
     form?: { message?: string; error?: boolean; batch?: AdminRecoveryBatchRead; recoveryJobId?: string | null } | null;
   } = $props();
 
-  let batchCapability = $state<AdminRecoveryCapability>('retry_stage');
+  let selectedBatchCapability = $state<AdminRecoveryCapability | null>(null);
+  let selectedItemValues = $state<string[]>([]);
+  let selectionPageKey = $state<string | null>(null);
 
   const summaryCards = $derived([
     { bucket: 'retryable' as const, label: 'Retryable', count: summary.retryable_count, detail: 'Safe recovery is available.' },
@@ -50,6 +54,65 @@
     { bucket: 'stuck' as const, label: 'Stuck', count: summary.stuck_count, detail: 'No useful progress within its deadline.' },
     { bucket: 'dead_lettered' as const, label: 'Dead-lettered', count: summary.dead_lettered_count, detail: 'Broker delivery ended and needs review.' }
   ]);
+  const batchCapability = $derived(
+    selectedBatchCapability ?? recoveryDefaultBatchCapability(workPage.items)
+  );
+  const currentPageKey = $derived(currentSelectionPageKey());
+  const compatibleItemValues = $derived(
+    workPage.items
+      .filter((work) => work.capabilities.includes(batchCapability))
+      .map(recoveryWorkSelectionValue)
+  );
+  const selectedItemValueSet = $derived(new Set(selectedItemValues));
+  const selectedCompatibleCount = $derived(
+    compatibleItemValues.filter((value) => selectedItemValueSet.has(value)).length
+  );
+  const allCompatibleSelected = $derived(
+    compatibleItemValues.length > 0 && selectedCompatibleCount === compatibleItemValues.length
+  );
+  const someCompatibleSelected = $derived(
+    selectedCompatibleCount > 0 && !allCompatibleSelected
+  );
+
+  $effect(() => {
+    if (selectionPageKey === null) {
+      selectionPageKey = currentPageKey;
+      return;
+    }
+    if (currentPageKey === selectionPageKey) return;
+    selectionPageKey = currentPageKey;
+    selectedBatchCapability = null;
+    selectedItemValues = [];
+  });
+
+  function changeBatchCapability(event: Event): void {
+    const nextCapability = (event.currentTarget as HTMLSelectElement).value as AdminRecoveryCapability;
+    if (nextCapability === batchCapability) return;
+    selectedBatchCapability = nextCapability;
+    selectedItemValues = [];
+  }
+
+  function toggleAllCompatible(): void {
+    selectedItemValues = allCompatibleSelected ? [] : [...compatibleItemValues];
+  }
+
+  function recoveryWorkSelectionValue(work: Pick<AdminRecoveryWorkRead, 'kind' | 'id' | 'version'>): string {
+    return JSON.stringify({ kind: work.kind, id: work.id, version: work.version });
+  }
+
+  function currentSelectionPageKey(): string {
+    return JSON.stringify([
+      filters.bucket,
+      filters.kind,
+      filters.source,
+      filters.stage,
+      filters.reason,
+      filters.query,
+      filters.cursor,
+      workPage.snapshot_at,
+      workPage.items.map((work) => [work.kind, work.id, work.version])
+    ]);
+  }
 </script>
 
 <section class="grid gap-3">
@@ -124,12 +187,32 @@
 </AdminPanel>
 
 <section class="mt-6 grid gap-4" aria-labelledby="recovery-queue-heading">
-  <div class="flex flex-wrap items-end justify-between gap-3">
+  <div class="flex flex-wrap items-end justify-between gap-4">
     <div>
       <p class="m-0 text-xs font-black uppercase tracking-[0.14em] text-muted">Canonical queue</p>
       <h2 id="recovery-queue-heading" class="m-0 text-3xl font-black tracking-[-0.05em]">Recovery work</h2>
+      <p class="mb-0 mt-1 text-sm text-muted">Snapshot {formatAdminTimestamp(workPage.snapshot_at)}</p>
     </div>
-    <p class="m-0 text-sm text-muted">Snapshot {formatAdminTimestamp(workPage.snapshot_at)}</p>
+    <div class="grid min-w-[18rem] gap-1">
+      <label for="recovery-batch-capability" class="text-sm font-extrabold">Batch action</label>
+      <Select
+        id="recovery-batch-capability"
+        name="capability"
+        form="batch-preview-form"
+        value={batchCapability}
+        onchange={changeBatchCapability}
+      >
+        <option value="resume_backfill">Resume backfills</option>
+        <option value="replay_source_post">Replay Telegram posts</option>
+        <option value="reinspect_ingest">Re-inspect media</option>
+        <option value="retry_stage">Retry pipeline stage</option>
+        <option value="resync_target">Resync search target</option>
+        <option value="rebuild_outbox">Rebuild outbox event</option>
+        <option value="recover_dead_letter">Recover dead letter</option>
+        <option value="archive_dead_letter">Archive dead letter</option>
+      </Select>
+      <p class="m-0 text-xs text-muted">{compatibleItemValues.length.toLocaleString('en-US')} compatible on this page · {selectedCompatibleCount.toLocaleString('en-US')} selected</p>
+    </div>
   </div>
 
   {#if workPage.items.length}
@@ -138,7 +221,22 @@
         <caption class="sr-only">Failed, stuck, and dead-lettered work with declared recovery actions.</caption>
         <thead class="bg-soft text-chiptext">
           <tr>
-            <th class="px-4 py-3 font-black">Select</th>
+            <th class="px-4 py-3 font-black">
+              <label class="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  checked={allCompatibleSelected}
+                  indeterminate={someCompatibleSelected}
+                  disabled={compatibleItemValues.length === 0}
+                  onchange={toggleAllCompatible}
+                  aria-label="Select all compatible recovery work on this page"
+                  class="size-4 accent-accent"
+                  data-recovery-select-all
+                />
+                <span>Select all</span>
+              </label>
+              <span class="mt-1 block text-xs font-normal text-muted">Current page</span>
+            </th>
             <th class="px-4 py-3 font-black">Work</th>
             <th class="px-4 py-3 font-black">Source</th>
             <th class="px-4 py-3 font-black">Stage</th>
@@ -152,13 +250,15 @@
           {#each workPage.items as work (`${work.kind}:${work.id}`)}
             {@const capability = recoveryPrimaryCapability(work.capabilities)}
             {@const canBatch = work.capabilities.includes(batchCapability)}
-            <tr class="border-t border-line align-top">
+            {@const selectionValue = recoveryWorkSelectionValue(work)}
+            <tr class="border-t border-line align-top" class:bg-soft={selectedItemValueSet.has(selectionValue)}>
               <td class="px-4 py-4">
                 <input
                   type="checkbox"
                   name="item"
                   form="batch-preview-form"
-                  value={JSON.stringify({ kind: work.kind, id: work.id, version: work.version })}
+                  value={selectionValue}
+                  bind:group={selectedItemValues}
                   disabled={!canBatch}
                   aria-label={`Select ${work.title} for ${recoveryCapabilityLabel(batchCapability)}`}
                   class="size-4 accent-accent"
@@ -220,21 +320,10 @@
 </section>
 
 <AdminPanel title="Bounded batch recovery" class="mt-6">
-  <p class="mt-0 text-sm text-muted">Choose one action, select up to 1,000 compatible rows in the table, and preview them. Nothing is dispatched until the preview is explicitly scheduled.</p>
+  <p class="mt-0 text-sm text-muted">Choose the batch action above the table, select compatible rows on the current page, and preview them. Nothing is dispatched until the preview is explicitly scheduled.</p>
+  <p class="text-sm font-extrabold" aria-live="polite">{selectedCompatibleCount.toLocaleString('en-US')} of {compatibleItemValues.length.toLocaleString('en-US')} compatible rows selected for {recoveryCapabilityLabel(batchCapability)}.</p>
   <form id="batch-preview-form" method="POST" action="?/previewRecoveryBatch" class="grid gap-3 lg:grid-cols-2">
     <input type="hidden" name="request_id" value={requestIds.batchPreview} />
-    <FormRow label="One recovery action">
-      <Select name="capability" bind:value={batchCapability}>
-        <option value="resume_backfill">Resume backfills</option>
-        <option value="replay_source_post">Replay Telegram posts</option>
-        <option value="reinspect_ingest">Re-inspect media</option>
-        <option value="retry_stage">Retry pipeline stage</option>
-        <option value="resync_target">Resync search target</option>
-        <option value="rebuild_outbox">Rebuild outbox event</option>
-        <option value="recover_dead_letter">Recover dead letter</option>
-        <option value="archive_dead_letter">Archive dead letter</option>
-      </Select>
-    </FormRow>
     <FormRow label="Audit reason" hint="Applied to every item admitted to this batch.">
       <Textarea name="reason" rows={3} minlength={3} maxlength={500} required placeholder="Why is this bounded recovery safe now?" />
     </FormRow>

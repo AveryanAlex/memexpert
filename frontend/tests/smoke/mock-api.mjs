@@ -362,6 +362,74 @@ const adminAnalyticsContent = {
   source_engagement: [{ date: '2026-06-01', source_views: 92, source_reactions: 9, source_reposts: 3 }, { date: '2026-06-02', source_views: 118, source_reactions: 14, source_reposts: 5 }]
 };
 
+const adminRecoveryWork = [
+  recoveryWork({
+    kind: 'backfill',
+    id: 'smoke-backfill-memach',
+    title: '@memach backfill',
+    source_label: '@memach',
+    source_channel_id: adminIds.staleSource,
+    version: 'backfill-version-1',
+    capabilities: ['resume_backfill']
+  }),
+  recoveryWork({
+    kind: 'backfill',
+    id: 'smoke-backfill-log4inpowerken',
+    title: '@log4inpowerken backfill',
+    source_label: '@log4inpowerken',
+    source_channel_id: adminIds.healthySource,
+    version: 'backfill-version-2',
+    capabilities: ['resume_backfill']
+  }),
+  recoveryWork({
+    kind: 'pipeline_stage',
+    id: 'smoke-file-ocr-1:ocr',
+    title: 'OCR file one',
+    meme_file_id: 'smoke-file-ocr-1',
+    stage: 'ocr',
+    error_code: 'ocr_timeout',
+    reason: 'ocr_timeout',
+    safe_error: 'OCR exceeded its processing deadline.',
+    version: 'ocr-version-1',
+    capabilities: ['retry_stage']
+  }),
+  recoveryWork({
+    kind: 'pipeline_stage',
+    id: 'smoke-file-ocr-2:ocr',
+    title: 'OCR file two',
+    meme_file_id: 'smoke-file-ocr-2',
+    stage: 'ocr',
+    error_code: 'ocr_timeout',
+    reason: 'ocr_timeout',
+    safe_error: 'OCR exceeded its processing deadline.',
+    version: 'ocr-version-2',
+    capabilities: ['retry_stage']
+  }),
+  recoveryWork({
+    kind: 'source_post',
+    id: 'smoke-blocked-post',
+    bucket: 'blocked',
+    title: 'Blocked Telegram post',
+    source_label: '@offline_source',
+    post_id: '404',
+    status: 'failed',
+    error_code: 'source_account_unavailable',
+    reason: 'source_account_unavailable',
+    safe_error: null,
+    is_retryable: false,
+    version: 'blocked-version-1',
+    capabilities: [],
+    blocked_reason: 'Reconnect the source account before retrying.'
+  })
+];
+
+const adminRecoverySummary = {
+  retryable_count: 4,
+  blocked_count: 1,
+  stuck_count: 0,
+  dead_lettered_count: 0
+};
+
 const adminMeme = {
   ...meme,
   id: adminIds.meme,
@@ -1017,6 +1085,18 @@ async function handleAdminApi(request, response, url, adminSources) {
     sendJson(response, 200, adminOverview);
     return true;
   }
+  if (method === 'GET' && pathname === '/api/v1/admin/recovery/summary') {
+    sendJson(response, 200, adminRecoverySummary);
+    return true;
+  }
+  if (method === 'GET' && pathname === '/api/v1/admin/recovery/work') {
+    sendJson(response, 200, {
+      items: adminRecoveryWork,
+      next_cursor: null,
+      snapshot_at: '2026-07-15T12:00:00Z'
+    });
+    return true;
+  }
   if (method === 'GET' && pathname === '/api/v1/admin/analytics/overview') {
     sendJson(response, 200, adminAnalyticsOverview);
     return true;
@@ -1200,6 +1280,34 @@ async function handleAdminApi(request, response, url, adminSources) {
   }
 
   return false;
+}
+
+function recoveryWork(overrides = {}) {
+  return {
+    kind: 'pipeline_stage',
+    id: 'smoke-recovery-work',
+    bucket: 'retryable',
+    title: 'Recovery work',
+    source_label: null,
+    source_channel_id: null,
+    post_id: null,
+    meme_file_id: null,
+    stage: null,
+    target: null,
+    status: 'failed',
+    reason: 'provider_unavailable',
+    safe_error: 'The provider was temporarily unavailable.',
+    error_code: 'provider_unavailable',
+    is_retryable: true,
+    attempt_count: 2,
+    occurred_at: '2026-07-15T11:00:00Z',
+    next_attempt_at: null,
+    version: 'recovery-version',
+    capabilities: ['retry_stage'],
+    blocked_reason: null,
+    details: {},
+    ...overrides
+  };
 }
 
 function validateQuickAddRequest(body) {

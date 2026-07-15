@@ -47,6 +47,13 @@ describe('/admin/recovery workspace', () => {
     expect(body).toContain('Reconnect the source account before retrying.');
     expect(body).toContain('Bounded batch recovery');
     expect(body).toContain('action="?/previewRecoveryBatch"');
+    expect(body).toContain('data-recovery-select-all');
+    expect(body).toContain('Select all compatible recovery work on this page');
+    expect(body).toContain('1 compatible on this page · 0 selected');
+    expect(body).toContain('0 of 1 compatible rows selected for Resume backfill.');
+    expect(body.indexOf('Batch action')).toBeLessThan(body.indexOf('<table'));
+    expect(body.match(/<input[^>]+aria-label="Select @memach backfill for Resume backfill"[^>]*>/)?.[0]).not.toContain('disabled');
+    expect(body.match(/<input[^>]+aria-label="Select Telegram post #99 for Resume backfill"[^>]*>/)?.[0]).toContain('disabled');
     expect(body).toContain('href="/admin/recovery?bucket=retryable&amp;source=%40memach&amp;cursor=next-cursor"');
   });
 

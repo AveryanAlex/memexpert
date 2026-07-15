@@ -124,6 +124,16 @@ export function recoveryPrimaryCapability(
   return priority.find((capability) => capabilities.includes(capability)) ?? null;
 }
 
+export function recoveryDefaultBatchCapability(
+  work: Pick<AdminRecoveryWorkRead, 'capabilities'>[]
+): AdminRecoveryCapability {
+  for (const item of work) {
+    const capability = recoveryPrimaryCapability(item.capabilities);
+    if (capability) return capability;
+  }
+  return 'retry_stage';
+}
+
 export function humanizeRecoveryValue(value: string | null): string {
   if (!value) return 'Not available';
   return value
