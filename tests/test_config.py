@@ -149,6 +149,16 @@ def test_settings_pipeline_worker_prefetch_count_defaults_and_bounds() -> None:
         _ = Settings(pipeline_worker_prefetch_count=513)
 
 
+def test_settings_search_candidate_pool_limit_defaults_and_bounds() -> None:
+    assert Settings().search_candidate_pool_limit_per_source == 200
+    assert Settings(search_candidate_pool_limit_per_source=500).search_candidate_pool_limit_per_source == 500
+
+    with pytest.raises(ValidationError):
+        _ = Settings(search_candidate_pool_limit_per_source=99)
+    with pytest.raises(ValidationError):
+        _ = Settings(search_candidate_pool_limit_per_source=501)
+
+
 def test_settings_database_pool_and_runtime_health_defaults_and_bounds() -> None:
     settings = Settings()
 

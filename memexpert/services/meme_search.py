@@ -235,7 +235,7 @@ class MemeSearchService:
         resolved_limit = _clamp_limit(limit)
         resolved_offset = max(0, offset)
         request_id = new_discovery_request_id()
-        candidate_limit = max(resolved_limit + resolved_offset, resolved_limit) * 4
+        candidate_limit = self._settings.search_candidate_pool_limit_per_source
 
         normalized_query = query.strip()
         embedding_started_seconds = time.perf_counter()
@@ -359,7 +359,12 @@ class MemeSearchService:
 
         ranked_memes = sorted(
             memes,
-            key=lambda meme: (visible_scores[meme.id].total, popularity_by_meme_id.get(meme.id, 0.0), meme.created_at),
+            key=lambda meme: (
+                visible_scores[meme.id].total,
+                popularity_by_meme_id.get(meme.id, 0.0),
+                meme.created_at,
+                str(meme.id),
+            ),
             reverse=True,
         )
         total = len(ranked_memes)
