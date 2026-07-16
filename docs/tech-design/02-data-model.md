@@ -89,6 +89,16 @@ Terminal attempt status includes `completed`, `failed`, `expired`, and `cancelle
 
 Channels being crawled. Key fields: `platform`, `platform_id`, `username`, `title`, `subscriber_count`, `is_active`, `last_read_post_id` (platform-specific, e.g. Telegram message ID — used to resume on restart), `telegram_session_id` (nullable FK to the `telegram_sessions` row that handles this channel), and live/catch-up/engagement flags. If a Telegram session is deleted, `ON DELETE SET NULL` leaves that **Telegram** source channel as an orphan; it remains visible for operator repair but is not runnable until reassigned. `orphaned` is deliberately Telegram-only: a non-Telegram source is never made orphaned merely because this nullable Telegram-specific field is empty.
 
+The browser-admin list adds rebuildable aggregate fields rather than denormalized
+columns: `latest_post_at = max(source_channel_posts.published_at)`,
+`observed_post_count = count(source_channel_posts)`, and `meme_count = count`
+of distinct canonical `meme_files.meme_id` values reached through matching
+`meme_sources(platform, source_id)`. The service computes these for the bounded
+source inventory in one aggregate read and combines them with the separately
+bounded latest-backfill projection. The source-post channel/time index and the
+`meme_sources(platform, source_id, post_id)` unique index support these reads;
+there is no per-source query loop and no migration-owned counter that can drift.
+
 ### ChannelSuggestion
 
 User-submitted channel suggestions. Key fields: `user_id`, `platform`, `channel_url`, `status` (pending/approved/rejected), `admin_note`.

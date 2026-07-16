@@ -5,4 +5,4 @@
   let { data, form }: { data: PageData; form: ActionData } = $props();
 </script>
 
-<SourceWorkspace sourceAdmin={data.sourceAdmin} loadError={data.loadError} {form} />
+<SourceWorkspace sourceAdmin={data.sourceAdmin} sourceAdminErrors={data.sourceAdminErrors} loadError={data.loadError} {form} />

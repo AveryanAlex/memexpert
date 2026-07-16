@@ -1,11 +1,16 @@
 import { describe, expect, it } from 'vitest';
 import type { AdminSourceChannelRead, AdminTelegramSessionRead } from '$lib/api/types';
 import {
+  DEFAULT_SOURCE_INVENTORY_SORT,
   clearSourceSuggestionPrefill,
   defaultTelegramAccountId,
+  isSourceAtLeastExpected,
   lastFetchLabel,
+  mergeSourceProjections,
+  nextSourceInventorySort,
   readyTelegramAccounts,
   relativeTimestamp,
+  sortSourceInventory,
   sourceSuggestionPrefill,
   toSourceCardViewModel
 } from './view-model';
@@ -94,6 +99,89 @@ describe('source view model', () => {
     });
     expect(clearSourceSuggestionPrefill()).toEqual({ reference: '', suggestionId: '' });
   });
+
+  it('overlays a reused source until the loaded projection reaches the committed response', () => {
+    const stale = sourceChannel({
+      telegram_session_id: null,
+      telegram_session_name: null,
+      is_orphaned: true,
+      is_indexable: false,
+      updated_at: '2026-01-01T00:00:00Z'
+    });
+    const committed = sourceChannel({ updated_at: '2026-01-01T00:01:00Z' });
+    const newer = sourceChannel({
+      last_fetched_at: '2026-01-01T00:02:00Z',
+      updated_at: '2026-01-01T00:02:00Z'
+    });
+
+    expect(mergeSourceProjections([stale], [committed])).toEqual([committed]);
+    expect(isSourceAtLeastExpected(stale, committed)).toBe(false);
+    expect(isSourceAtLeastExpected(committed, committed)).toBe(true);
+    expect(isSourceAtLeastExpected(newer, committed)).toBe(true);
+  });
+
+  it('sorts attention-first by default without mutating the loaded source projection', () => {
+    const now = new Date('2026-01-01T01:00:00Z');
+    const sources = [
+      sourceChannel({ id: 'healthy', title: 'Healthy source' }),
+      sourceChannel({ id: 'orphaned', title: 'Orphaned source', telegram_session_id: null, telegram_session_name: null, is_orphaned: true, is_indexable: false }),
+      sourceChannel({ id: 'failed', title: 'Failed backfill', backfill_status: 'failed', backfill_error: 'History request failed.' }),
+      sourceChannel({ id: 'stale', title: 'Stale source', freshness_status: 'stale', seconds_since_last_fetch: 7_200 })
+    ];
+    const originalOrder = [...sources];
+
+    expect(sortSourceInventory(sources, [telegramAccount()], DEFAULT_SOURCE_INVENTORY_SORT, now).map((source) => source.id)).toEqual([
+      'failed',
+      'stale',
+      'orphaned',
+      'healthy'
+    ]);
+    expect(sortSourceInventory(sources, [telegramAccount()], { key: 'health', direction: 'descending' }, now)[0]?.id).toBe('healthy');
+    expect(sources).toEqual(originalOrder);
+  });
+
+  it('toggles the active direction and uses the new column default when switching columns', () => {
+    expect(nextSourceInventorySort(DEFAULT_SOURCE_INVENTORY_SORT, 'health')).toEqual({
+      key: 'health',
+      direction: 'descending'
+    });
+    expect(nextSourceInventorySort(DEFAULT_SOURCE_INVENTORY_SORT, 'source')).toEqual({
+      key: 'source',
+      direction: 'ascending'
+    });
+    expect(nextSourceInventorySort(DEFAULT_SOURCE_INVENTORY_SORT, 'latest_post')).toEqual({
+      key: 'latest_post',
+      direction: 'descending'
+    });
+  });
+
+  it('keeps unknown timestamps and subscriber counts last in both directions with deterministic ties', () => {
+    const sources = [
+      sourceChannel({ id: 'missing', title: 'Same title', latest_post_at: null, subscriber_count: null }),
+      sourceChannel({ id: 'newer', title: 'Same title', latest_post_at: '2026-01-02T00:00:00Z', subscriber_count: 200 }),
+      sourceChannel({ id: 'older', title: 'Same title', latest_post_at: '2026-01-01T00:00:00Z', subscriber_count: 100 })
+    ];
+
+    expect(sortSourceInventory(sources, [], { key: 'latest_post', direction: 'ascending' }).map((source) => source.id)).toEqual([
+      'older',
+      'newer',
+      'missing'
+    ]);
+    expect(sortSourceInventory(sources, [], { key: 'latest_post', direction: 'descending' }).map((source) => source.id)).toEqual([
+      'newer',
+      'older',
+      'missing'
+    ]);
+    expect(sortSourceInventory(sources, [], { key: 'subscribers', direction: 'ascending' }).map((source) => source.id)).toEqual([
+      'older',
+      'newer',
+      'missing'
+    ]);
+    expect(sortSourceInventory([sources[1], sources[2]], [], { key: 'source', direction: 'ascending' }).map((source) => source.id)).toEqual([
+      'newer',
+      'older'
+    ]);
+  });
 });
 
 function sourceChannel(overrides: Partial<AdminSourceChannelRead> = {}): AdminSourceChannelRead {
@@ -104,6 +192,9 @@ function sourceChannel(overrides: Partial<AdminSourceChannelRead> = {}): AdminSo
     username: 'source_handle',
     title: 'Source title',
     subscriber_count: 100,
+    latest_post_at: '2026-01-01T00:00:00Z',
+    observed_post_count: 250,
+    meme_count: 125,
     is_active: true,
     is_paused: false,
     catchup_enabled: true,

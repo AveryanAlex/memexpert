@@ -30,6 +30,24 @@ describe('/admin/sources/[channelId] detail', () => {
     expect(body).toContain('Qdrant');
     expect(body).toContain('Meilisearch');
     expect(body).toContain('Embedding provider unavailable.');
+    expect(body).toContain('Source management');
+    expect(body).toContain('Diagnostics');
+    expect(body).toContain('Ingestion settings');
+    expect(body).toContain('Assignment');
+    expect(body).toContain('Validate source access');
+    expect(body).toContain('Remove source');
+    expect(body).toContain('action="?/toggleSourceChannel"');
+    expect(body).toContain('action="?/updateSourceChannelIngestion"');
+    expect(body).toContain('action="?/assignSourceChannel"');
+    expect(body).toContain('action="?/orphanSourceChannel"');
+    expect(body).toContain('action="?/validateSourceAccount"');
+    expect(body).toContain('action="?/markSourceChannelDead"');
+    expect(body).toContain('Assignment note (optional)');
+    expect(body).toContain('Validation note (optional)');
+    expect(body).toContain('Paste the source ID from Diagnostics to confirm.');
+    expect(body).toMatch(/name="catchup_enabled" type="checkbox" checked=""(?![^>]*disabled)/);
+    expect(body).toMatch(/name="catchup_message_limit" type="number"[^>]*value="5000"/);
+    expect(body).not.toMatch(/name="catchup_message_limit" type="number"[^>]*\sdisabled(?:=|\s|>)/);
     expect(body).toContain('action="?/backfillSourceChannel"');
     expect(body).toMatch(/name="message_limit"[^>]*min="1"[^>]*max="50000"[^>]*value="5000"/);
     expect(body).toContain('Fetch older messages');
@@ -129,6 +147,30 @@ describe('/admin/sources/[channelId] detail', () => {
     expect(initialFetchPending).toContain('Initial fetch pending');
     expect(initialFetchPending).toContain('Wait for the initial latest-message catch-up');
   });
+
+  it('keeps source management available when the fetched-message ledger is temporarily unavailable', () => {
+    const body = render(SourceDetailWorkspace, {
+      props: {
+        source: sourceChannel(),
+        postPage: null,
+        postLoadError: 'Fetched-message ledger is restarting.',
+        telegramAccountsLoadError: 'Telegram accounts are restarting.',
+        recoveryRequestIds: { backfills: {}, posts: {} },
+        telegramAccounts: [],
+        paging: { page: 1, snapshotAt: '2026-07-13T12:00:00Z', hasPrevious: false, hasNext: false },
+        loadError: null,
+        form: null
+      }
+    }).body;
+
+    expect(body).toContain('Source management');
+    expect(body).toContain('action="?/toggleSourceChannel"');
+    expect(body).toContain('Diagnostics');
+    expect(body).toContain('action="?/markSourceChannelDead"');
+    expect(body).toContain('Telegram accounts are restarting. Account-dependent controls are temporarily disabled.');
+    expect(body).toContain('Fetched-message ledger is restarting. Source management remains available above.');
+    expect(body).not.toContain('Indexing summary');
+  });
 });
 
 function sourceRecoveryRequestIds(backfills: Record<string, string> = {}) {
@@ -146,6 +188,9 @@ function sourceChannel(overrides: Partial<AdminSourceChannelRead> = {}): AdminSo
     username: 'daily_memes',
     title: 'Daily memes',
     subscriber_count: 1200,
+    latest_post_at: '2026-07-13T09:30:00Z',
+    observed_post_count: 5000,
+    meme_count: 2400,
     is_active: true,
     is_paused: false,
     catchup_enabled: true,

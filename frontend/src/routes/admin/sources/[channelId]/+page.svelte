@@ -10,6 +10,8 @@
   postPage={data.postPage}
   backfills={data.backfills}
   backfillLoadError={data.backfillLoadError}
+  postLoadError={data.postLoadError}
+  telegramAccountsLoadError={data.telegramAccountsLoadError}
   recoveryRequestIds={data.recoveryRequestIds}
   telegramAccounts={data.telegramAccounts}
   paging={data.paging}

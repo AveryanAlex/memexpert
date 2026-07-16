@@ -1,10 +1,9 @@
 <script lang="ts">
-  import { invalidateAll } from '$app/navigation';
   import { onDestroy, tick, untrack } from 'svelte';
   import AdvancedSection from '$lib/features/admin/AdvancedSection.svelte';
   import AdminPanel from '$lib/features/admin/AdminPanel.svelte';
   import { ApiError } from '$lib/api/client';
-  import type { AdminTelegramChannelFromReferencePayload, AdminTelegramSessionRead } from '$lib/api/types';
+  import type { AdminSourceChannelRead, AdminTelegramChannelFromReferencePayload, AdminTelegramSessionRead } from '$lib/api/types';
   import { Button, FormRow, Input, Notice } from '$lib/ui';
   import { addTelegramSourceWithRetry } from './add-source-client';
   import { clearSourceSuggestionPrefill, readyTelegramAccounts, sourceSuggestionPrefill } from './view-model';
@@ -12,11 +11,13 @@
   let {
     telegramAccounts,
     initialReference = '',
-    initialSuggestionId = ''
+    initialSuggestionId = '',
+    onSourceAdded
   }: {
     telegramAccounts: AdminTelegramSessionRead[];
     initialReference?: string;
     initialSuggestionId?: string;
+    onSourceAdded?: (source: AdminSourceChannelRead, suggestionId: string | null) => void;
   } = $props();
 
   const readyAccounts = $derived(readyTelegramAccounts(telegramAccounts));
@@ -28,8 +29,10 @@
   let submitting = $state(false);
   let retrying = $state(false);
   let feedback = $state<{ message: string; tone: 'neutral' | 'danger' | 'success' } | null>(null);
+  let destroyed = false;
 
   onDestroy(() => {
+    destroyed = true;
     focusRequest += 1;
   });
 
@@ -72,7 +75,7 @@
     feedback = null;
 
     try {
-      await addTelegramSourceWithRetry({
+      const source = await addTelegramSourceWithRetry({
         fetch,
         baseUrl: window.location.origin,
         body: payload,
@@ -84,16 +87,17 @@
           };
         }
       });
+      if (destroyed) return;
       formElement.reset();
       reference = '';
       suggestionId = '';
+      onSourceAdded?.(source, payload.suggestion_id ?? null);
       feedback = {
         message: approvesSuggestion
           ? 'Telegram source added and suggestion approved.'
           : 'Telegram source added and ready to fetch.',
         tone: 'success'
       };
-      void refreshSourceData();
     } catch (error) {
       feedback = {
         message: error instanceof ApiError ? error.message : 'Could not add the Telegram source. Check the connection and try again.',
@@ -115,17 +119,6 @@
     };
   }
 
-  async function refreshSourceData(): Promise<void> {
-    for (const delayMs of [0, 1_000, 2_000, 4_000]) {
-      if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
-      try {
-        await invalidateAll();
-        return;
-      } catch {
-        // The frontend may still be restarting after the API accepted the source.
-      }
-    }
-  }
 </script>
 
 <AdminPanel title="Add Telegram source">

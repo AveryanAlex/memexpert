@@ -190,6 +190,15 @@ class AdminTelegramValidationResult:
     channel_reference: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _SourceChannelAggregate:
+    """Rebuildable inventory metrics for one admin source projection."""
+
+    latest_post_at: datetime | None
+    observed_post_count: int
+    meme_count: int
+
+
 async def validate_admin_telegram_string_session(
     *,
     settings: Settings,
@@ -699,10 +708,12 @@ class AdminService:
             .all()
         )
         latest_backfill_jobs = await self._latest_source_channel_backfill_jobs(row.id for row in rows)
+        aggregates = await self._source_channel_aggregates(row.id for row in rows)
         now = utcnow()
         return [
             self._source_channel_read(
                 row,
+                aggregate=aggregates[row.id],
                 latest_backfill_job=latest_backfill_jobs.get(row.id),
                 now=now,
             )
@@ -726,6 +737,7 @@ class AdminService:
             .all()
         )
         latest_backfill_jobs = await self._latest_source_channel_backfill_jobs(row.id for row in channels)
+        aggregates = await self._source_channel_aggregates(row.id for row in channels)
         counts_by_session = await self._count_source_channels_by_session()
         now = utcnow()
         channels_by_session: dict[uuid.UUID, list[AdminSourceChannelRead]] = {row.id: [] for row in sessions}
@@ -733,6 +745,7 @@ class AdminService:
         for channel in channels:
             channel_read = self._source_channel_read(
                 channel,
+                aggregate=aggregates[channel.id],
                 latest_backfill_job=latest_backfill_jobs.get(channel.id),
                 now=now,
             )
@@ -2837,6 +2850,7 @@ class AdminService:
     def _source_channel_read(
         channel: SourceChannel,
         *,
+        aggregate: _SourceChannelAggregate,
         latest_backfill_job: SourceChannelBackfillJob | None = None,
         now: datetime | None = None,
     ) -> AdminSourceChannelRead:
@@ -2888,6 +2902,9 @@ class AdminService:
             username=channel.username,
             title=channel.title,
             subscriber_count=channel.subscriber_count,
+            latest_post_at=aggregate.latest_post_at,
+            observed_post_count=aggregate.observed_post_count,
+            meme_count=aggregate.meme_count,
             is_active=channel.is_active,
             is_paused=channel.is_paused,
             catchup_enabled=channel.catchup_enabled,
@@ -2917,8 +2934,10 @@ class AdminService:
     async def _get_source_channel_read(self, channel_id: uuid.UUID) -> AdminSourceChannelRead:
         channel = await self._get_source_channel_for_read(channel_id)
         latest_jobs = await self._latest_source_channel_backfill_jobs((channel.id,))
+        aggregates = await self._source_channel_aggregates((channel.id,))
         return self._source_channel_read(
             channel,
+            aggregate=aggregates[channel.id],
             latest_backfill_job=latest_jobs.get(channel.id),
         )
 
@@ -2933,6 +2952,72 @@ class AdminService:
         if channel is None:
             raise AdminNotFoundError(f"Source channel {channel_id} does not exist.")
         return channel
+
+    async def _source_channel_aggregates(
+        self,
+        channel_ids: Iterable[uuid.UUID],
+    ) -> dict[uuid.UUID, _SourceChannelAggregate]:
+        """Load post and canonical-meme inventory for a bounded channel set."""
+
+        unique_channel_ids = tuple(dict.fromkeys(channel_ids))
+        if not unique_channel_ids:
+            return {}
+
+        post_aggregates = (
+            select(
+                SourceChannelPost.source_channel_id.label("source_channel_id"),
+                func.max(SourceChannelPost.published_at).label("latest_post_at"),
+                func.count(SourceChannelPost.id).label("observed_post_count"),
+            )
+            .where(SourceChannelPost.source_channel_id.in_(unique_channel_ids))
+            .group_by(SourceChannelPost.source_channel_id)
+            .subquery()
+        )
+        meme_aggregates = (
+            select(
+                SourceChannel.id.label("source_channel_id"),
+                func.count(func.distinct(MemeFile.meme_id)).label("meme_count"),
+            )
+            .select_from(SourceChannel)
+            .join(
+                MemeSource,
+                and_(
+                    MemeSource.platform == SourceChannel.platform,
+                    MemeSource.source_id == SourceChannel.platform_id,
+                ),
+            )
+            .join(MemeFile, MemeFile.id == MemeSource.file_id)
+            .where(SourceChannel.id.in_(unique_channel_ids))
+            .group_by(SourceChannel.id)
+            .subquery()
+        )
+        rows = (
+            await self.session.execute(
+                select(
+                    SourceChannel.id.label("source_channel_id"),
+                    post_aggregates.c.latest_post_at,
+                    func.coalesce(post_aggregates.c.observed_post_count, 0).label("observed_post_count"),
+                    func.coalesce(meme_aggregates.c.meme_count, 0).label("meme_count"),
+                )
+                .outerjoin(
+                    post_aggregates,
+                    post_aggregates.c.source_channel_id == SourceChannel.id,
+                )
+                .outerjoin(
+                    meme_aggregates,
+                    meme_aggregates.c.source_channel_id == SourceChannel.id,
+                )
+                .where(SourceChannel.id.in_(unique_channel_ids)),
+            )
+        ).mappings()
+        return {
+            row["source_channel_id"]: _SourceChannelAggregate(
+                latest_post_at=row["latest_post_at"],
+                observed_post_count=int(row["observed_post_count"]),
+                meme_count=int(row["meme_count"]),
+            )
+            for row in rows
+        }
 
     async def _latest_source_channel_backfill_jobs(
         self,

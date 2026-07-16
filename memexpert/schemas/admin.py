@@ -116,6 +116,9 @@ class AdminSourceChannelRead(ORMSchema):
     username: str | None
     title: str
     subscriber_count: int | None
+    latest_post_at: datetime | None
+    observed_post_count: int = Field(ge=0)
+    meme_count: int = Field(ge=0)
     is_active: bool
     is_paused: bool
     catchup_enabled: bool

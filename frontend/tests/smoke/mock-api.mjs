@@ -483,6 +483,9 @@ const adminSourceSeed = [
     username: 'daily_cats',
     title: 'Daily cats',
     subscriber_count: 1200,
+    latest_post_at: '2026-01-01T00:00:00Z',
+    observed_post_count: 25,
+    meme_count: 18,
     is_active: true,
     is_paused: false,
     catchup_enabled: true,
@@ -515,6 +518,9 @@ const adminSourceSeed = [
     username: 'small_memes',
     title: 'Small memes',
     subscriber_count: null,
+    latest_post_at: null,
+    observed_post_count: 0,
+    meme_count: 0,
     is_active: true,
     is_paused: false,
     catchup_enabled: false,
@@ -547,6 +553,9 @@ const adminSourceSeed = [
     username: 'retro_memes',
     title: 'Retro memes',
     subscriber_count: 410,
+    latest_post_at: '2025-12-25T00:00:00Z',
+    observed_post_count: 18,
+    meme_count: 11,
     is_active: true,
     is_paused: false,
     catchup_enabled: true,
@@ -575,6 +584,7 @@ const adminSourceSeed = [
 ];
 const adminSourceStateBySession = new Map();
 const transientQuickAddFailures = new WeakSet();
+const transientSourceRefreshFailures = new WeakSet();
 const loginAttemptPolls = new Map();
 const staleFullSessionReads = new Set();
 let loginAttemptSequence = 0;
@@ -1140,6 +1150,10 @@ async function handleAdminApi(request, response, url, adminSources) {
     return true;
   }
   if (method === 'GET' && pathname === '/api/v1/admin/source-channels') {
+    if (transientSourceRefreshFailures.delete(adminSources)) {
+      sendJson(response, 503, { detail: 'Source catalog is restarting after creation.' });
+      return true;
+    }
     sendJson(response, 200, adminSources);
     return true;
   }
@@ -1164,6 +1178,18 @@ async function handleAdminApi(request, response, url, adminSources) {
       limit,
       offset
     });
+    return true;
+  }
+  const sourceBackfillsMatch = method === 'GET'
+    ? pathname.match(/^\/api\/v1\/admin\/source-channels\/([^/]+)\/backfills$/)
+    : null;
+  if (sourceBackfillsMatch) {
+    const source = adminSources.find((candidate) => candidate.id === sourceBackfillsMatch[1]);
+    if (!source) {
+      sendJson(response, 404, { detail: 'Smoke source was not found.' });
+      return true;
+    }
+    sendJson(response, 200, { items: [] });
     return true;
   }
   if (method === 'GET' && pathname === '/api/v1/admin/telegram/sessions') {
@@ -1231,6 +1257,7 @@ async function handleAdminApi(request, response, url, adminSources) {
       return true;
     }
     const source = upsertQuickAddedSource(adminSources, quickAdd.username);
+    transientSourceRefreshFailures.add(adminSources);
     sendJson(response, 201, source);
     return true;
   }
@@ -1352,6 +1379,9 @@ function upsertQuickAddedSource(adminSources, username) {
     username,
     title: username.split('_').map((part) => `${part[0].toUpperCase()}${part.slice(1)}`).join(' '),
     subscriber_count: null,
+    latest_post_at: null,
+    observed_post_count: 0,
+    meme_count: 0,
     is_active: true,
     is_paused: false,
     catchup_enabled: true,

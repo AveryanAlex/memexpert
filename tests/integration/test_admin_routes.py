@@ -28,6 +28,7 @@ from memexpert.models.content import (
     MemeFileSyncTargetSnapshot,
     MemeMergeLog,
     MemeSeoPage,
+    MemeSource,
     MemeTemplate,
     ModerationDecision,
     ModerationReport,
@@ -1795,6 +1796,141 @@ async def test_admin_source_channel_health_and_mark_dead_conflicts(
         assert audit_row.new_values["is_active"] is False
 
 
+async def test_admin_source_channel_projects_populated_and_empty_inventory_metrics(
+    auth_app: FastAPI,
+    auth_settings_overrides: dict[str, str],
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    admin_token = await _issue_user_cookie(
+        postgres_session_factory,
+        auth_settings_overrides,
+        email="admin-source-metrics@example.com",
+        is_admin=True,
+    )
+    latest_post_at = datetime.now(UTC).replace(microsecond=0)
+
+    async with postgres_session_factory() as session:
+        populated_channel = SourceChannel(
+            platform=SourcePlatform.TELEGRAM,
+            platform_id="source-metrics-populated",
+            title="Source Metrics Populated",
+        )
+        empty_channel = SourceChannel(
+            platform=SourcePlatform.TELEGRAM,
+            platform_id="source-metrics-empty",
+            title="Source Metrics Empty",
+        )
+        unrelated_channel = SourceChannel(
+            platform=SourcePlatform.TELEGRAM,
+            platform_id="source-metrics-unrelated",
+            title="Source Metrics Unrelated",
+        )
+        session.add_all([populated_channel, empty_channel, unrelated_channel])
+        await session.flush()
+
+        first_meme, first_file = _canonical_meme(media_type=ContentKind.IMAGE)
+        second_meme, second_file = _canonical_meme(media_type=ContentKind.IMAGE)
+        await _persist_canonical_meme(session, first_meme, first_file)
+        await _persist_canonical_meme(session, second_meme, second_file)
+        alternate_first_file = MemeFile(
+            id=uuid7(),
+            meme_id=first_meme.id,
+            status=ContentProcessingStatus.READY,
+            s3_original_key=f"admin/{first_meme.id}/alternate.jpg",
+            mime_type="image/jpeg",
+            quality_score=0.8,
+        )
+        session.add(alternate_first_file)
+        await session.flush()
+        session.add_all(
+            [
+                SourceChannelPost(
+                    source_channel_id=populated_channel.id,
+                    post_id="1",
+                    published_at=latest_post_at - timedelta(minutes=2),
+                ),
+                SourceChannelPost(
+                    source_channel_id=populated_channel.id,
+                    post_id="2",
+                    published_at=latest_post_at,
+                ),
+                SourceChannelPost(
+                    source_channel_id=populated_channel.id,
+                    post_id="3",
+                    published_at=latest_post_at - timedelta(minutes=1),
+                ),
+                SourceChannelPost(
+                    source_channel_id=populated_channel.id,
+                    post_id="4",
+                    published_at=latest_post_at - timedelta(minutes=3),
+                ),
+                SourceChannelPost(
+                    source_channel_id=unrelated_channel.id,
+                    post_id="9",
+                    published_at=latest_post_at + timedelta(minutes=1),
+                ),
+                MemeSource(
+                    file_id=first_file.id,
+                    platform=populated_channel.platform,
+                    source_id=populated_channel.platform_id,
+                    post_id="1",
+                ),
+                MemeSource(
+                    file_id=first_file.id,
+                    platform=populated_channel.platform,
+                    source_id=populated_channel.platform_id,
+                    post_id="2",
+                ),
+                MemeSource(
+                    file_id=second_file.id,
+                    platform=populated_channel.platform,
+                    source_id=populated_channel.platform_id,
+                    post_id="3",
+                ),
+                MemeSource(
+                    file_id=alternate_first_file.id,
+                    platform=populated_channel.platform,
+                    source_id=populated_channel.platform_id,
+                    post_id="4",
+                ),
+                MemeSource(
+                    file_id=second_file.id,
+                    platform=unrelated_channel.platform,
+                    source_id=unrelated_channel.platform_id,
+                    post_id="9",
+                ),
+            ],
+        )
+        await session.commit()
+        populated_channel_id = populated_channel.id
+        empty_channel_id = empty_channel.id
+
+    transport = ASGITransport(app=auth_app)
+    async with AsyncClient(transport=transport, base_url="https://testserver") as admin_client:
+        admin_client.cookies.set(ACCESS_COOKIE_NAME, admin_token)
+        list_response = await admin_client.get("/api/v1/admin/source-channels")
+        pause_response = await admin_client.post(
+            f"/api/v1/admin/source-channels/{populated_channel_id}/pause",
+        )
+
+    assert list_response.status_code == 200
+    channels = {item["id"]: item for item in list_response.json()}
+    populated_payload = channels[str(populated_channel_id)]
+    empty_payload = channels[str(empty_channel_id)]
+    assert datetime.fromisoformat(populated_payload["latest_post_at"]) == latest_post_at
+    assert populated_payload["observed_post_count"] == 4
+    assert populated_payload["meme_count"] == 2
+    assert empty_payload["latest_post_at"] is None
+    assert empty_payload["observed_post_count"] == 0
+    assert empty_payload["meme_count"] == 0
+
+    assert pause_response.status_code == 200
+    paused_payload = pause_response.json()
+    assert datetime.fromisoformat(paused_payload["latest_post_at"]) == latest_post_at
+    assert paused_payload["observed_post_count"] == 4
+    assert paused_payload["meme_count"] == 2
+
+
 async def test_admin_create_source_channel_uses_telegram_session_id_and_rejects_unknown_target(
     auth_app: FastAPI,
     auth_settings_overrides: dict[str, str],
@@ -2391,11 +2527,13 @@ async def test_admin_adds_public_telegram_reference_atomically_and_retry_converg
     def oversized_internal_source_projection(
         channel: SourceChannel,
         *,
+        aggregate: admin_service_module._SourceChannelAggregate,
         latest_backfill_job: SourceChannelBackfillJob | None = None,
         now: datetime | None = None,
     ) -> object:
         projection = original_source_read(
             channel,
+            aggregate=aggregate,
             latest_backfill_job=latest_backfill_job,
             now=now,
         )

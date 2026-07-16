@@ -5,7 +5,7 @@ import AddSourceByReference from '$lib/features/admin/sources/AddSourceByReferen
 import SourcesAdminPage from '../routes/admin/sources/+page.svelte';
 
 describe('/admin/sources page', () => {
-  it('renders supported suggestions, source health, and progressive source controls', () => {
+  it('renders supported suggestions and a sortable source inventory table', () => {
     const { body } = render(SourcesAdminPage, {
       props: {
         data: {
@@ -52,32 +52,34 @@ describe('/admin/sources page', () => {
     expect(body).toContain('Needs attention');
     expect(body).toContain('Crawler unavailable');
     expect(body).toContain('Removed');
-    expect(body).toContain('Last fetched:</strong> 5m ago');
+    expect(body).toContain('<td class="px-3 py-4">5m ago</td>');
     expect(body).toContain('Account:</strong> Primary ingest');
     expect(body).toContain('Account:</strong> Backup ingest (unavailable)');
     expect(body).toContain('Account:</strong> Not applicable');
-    expect(body).toContain('Current account:');
-    expect(body).toContain('Choose a ready account before saving.');
+    expect(body).toContain('<table');
+    expect(body).toContain('Configured sources with health, activity, catalog counts, and operator actions.');
+    expect(body).toContain('<th scope="row"');
+    expect(body).toContain('aria-sort="ascending"');
+    expect(body).toContain('aria-label="Sort by Health / account, descending"');
+    expect(body).toContain('Latest post');
+    expect(body).toContain('Last fetched');
+    expect(body).toContain('Memes');
+    expect(body).toContain('Posts');
+    expect(body).toContain('Subscribers');
+    expect(body).toContain('125');
+    expect(body).toContain('250');
     expect(body).toContain('action="?/toggleSourceChannel"');
-    expect(body).toContain('View indexed messages');
+    expect(body).toContain('aria-label="Manage Source title"');
+    expect(body).toContain('aria-label="Pause Source title"');
     expect(body).toContain('href="/admin/sources/11111111-1111-4111-8111-111111111111"');
 
     expect(body).toContain('Advanced manual source entry');
-    expect(body).toContain('Diagnostics');
-    expect(body).toContain('Ingestion settings');
-    expect(body).toContain('Assignment');
-    expect(body).toContain('Remove source');
-    expect(body).toContain('action="?/updateSourceChannelIngestion"');
-    expect(body).toContain('action="?/assignSourceChannel"');
-    expect(body).toContain('action="?/orphanSourceChannel"');
-    expect(body).toContain('action="?/validateSourceAccount"');
-    expect(body).toContain('Validate source access');
-    expect(body).toContain('Assignment note (optional)');
-    expect(body).toContain('Reason (optional)');
-    expect(body).toContain('Validation note (optional)');
-    expect(body).toContain('action="?/markSourceChannelDead"');
-    expect(body).toContain('Paste the source ID from Diagnostics to confirm.');
     expect(body).toContain('New sources are added without an account and with ingestion off.');
+    expect(body).not.toContain('action="?/updateSourceChannelIngestion"');
+    expect(body).not.toContain('action="?/assignSourceChannel"');
+    expect(body).not.toContain('action="?/orphanSourceChannel"');
+    expect(body).not.toContain('action="?/validateSourceAccount"');
+    expect(body).not.toContain('action="?/markSourceChannelDead"');
     expect(body).not.toMatch(/<details[^>]*\sopen(?:=|\s|>)/);
     expect(body).not.toContain('placeholder="11111111-1111-4111-8111-111111111111"');
   });
@@ -95,7 +97,7 @@ describe('/admin/sources page', () => {
     expect(body).toContain('Could not load source management.');
   });
 
-  it('enables ingestion controls after a ready account is assigned to a manual source with ingestion off', () => {
+  it('keeps source health visible when ingestion is off and leaves advanced management to detail', () => {
     const { body } = render(SourcesAdminPage, {
       props: {
         data: {
@@ -112,10 +114,9 @@ describe('/admin/sources page', () => {
 
     expect(body).toContain('Needs attention');
     expect(body).toContain('Ingestion is off.');
-    expect(body).toMatch(/name="catchup_enabled" type="checkbox"(?![^>]*disabled)/);
-    expect(body).toMatch(/name="live_enabled" type="checkbox"(?![^>]*disabled)/);
-    expect(body).toMatch(/name="engagement_enabled" type="checkbox"(?![^>]*disabled)/);
-    expect(body).toMatch(/name="catchup_message_limit" type="number"(?![^>]*\sdisabled(?:=|\s|>))/);
+    expect(body).toContain('aria-label="Manage Source title"');
+    expect(body).not.toContain('name="catchup_enabled" type="checkbox"');
+    expect(body).not.toContain('action="?/updateSourceChannelIngestion"');
   });
 
   it('auto-selects only one ready account and reports when none are ready', () => {
@@ -209,6 +210,9 @@ function sourceChannel(overrides: Partial<AdminSourceChannelRead> = {}): AdminSo
     username: 'source_handle',
     title: 'Source title',
     subscriber_count: 100,
+    latest_post_at: '2026-01-01T00:00:00Z',
+    observed_post_count: 250,
+    meme_count: 125,
     is_active: true,
     is_paused: false,
     catchup_enabled: true,

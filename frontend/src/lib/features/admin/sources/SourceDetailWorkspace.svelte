@@ -14,12 +14,16 @@
     sourceBackfillAvailability,
     syncStatusLabel
   } from './post-view-model';
+  import SourceManagementPanel from './SourceManagementPanel.svelte';
+  import { toSourceCardViewModel } from './view-model';
 
   let {
     source,
     postPage,
     backfills = { items: [] },
     backfillLoadError = null,
+    postLoadError = null,
+    telegramAccountsLoadError = null,
     recoveryRequestIds,
     telegramAccounts,
     paging,
@@ -30,6 +34,8 @@
     postPage: AdminSourcePostPageRead | null;
     backfills?: AdminSourceBackfillListRead;
     backfillLoadError?: string | null;
+    postLoadError?: string | null;
+    telegramAccountsLoadError?: string | null;
     recoveryRequestIds: { backfills: Record<string, string>; posts: Record<string, string> };
     telegramAccounts: AdminTelegramSessionRead[];
     paging: { page: number; snapshotAt: string; status?: 'failed' | 'processing' | null; hasPrevious: boolean; hasNext: boolean };
@@ -46,6 +52,7 @@
   );
   const backfillAvailability = $derived(source ? sourceBackfillAvailability(source, telegramAccounts) : null);
   const canBackfill = $derived((backfillAvailability?.canQueue ?? false) && source?.backfill_status !== 'failed');
+  const sourceModel = $derived(source ? toSourceCardViewModel(source, telegramAccounts) : null);
 </script>
 
 <p class="m-0"><a class="text-sm font-black underline decoration-2 underline-offset-4" href="/admin/sources">Back to sources</a></p>
@@ -59,7 +66,7 @@
   </Notice>
 {/if}
 
-{#if loadError || !source || !postPage}
+{#if loadError || !source}
   <Notice tone="danger" role="alert">{loadError ?? 'Source indexing details are unavailable.'}</Notice>
 {:else}
   <section class="mt-4 grid gap-3">
@@ -69,21 +76,38 @@
         <h1 class="m-0 text-[clamp(2.2rem,7vw,4.5rem)] font-black leading-[0.9] tracking-[-0.07em]">{source.title}</h1>
         <p class="mt-2 text-muted">{handleLabel} · message-level fetch, pipeline, and search-index status</p>
       </div>
-      <div class="flex flex-wrap gap-2">
-        <Badge>{source.platform === 'telegram' ? 'Telegram' : source.platform.toUpperCase()}</Badge>
-        <Badge tone={source.history_exhausted ? 'success' : 'neutral'}>
-          {source.platform !== 'telegram'
-            ? 'History backfill unavailable'
-            : source.history_exhausted
-              ? 'Full history scanned'
-              : !source.initial_catchup_completed
-                ? 'Initial fetch pending'
-                : 'Older history available'}
-        </Badge>
+      <div class="grid justify-items-end gap-2">
+        <div class="flex flex-wrap justify-end gap-2">
+          <Badge>{source.platform === 'telegram' ? 'Telegram' : source.platform.toUpperCase()}</Badge>
+          <Badge tone={source.history_exhausted ? 'success' : 'neutral'}>
+            {source.platform !== 'telegram'
+              ? 'History backfill unavailable'
+              : source.history_exhausted
+                ? 'Full history scanned'
+                : !source.initial_catchup_completed
+                  ? 'Initial fetch pending'
+                  : 'Older history available'}
+          </Badge>
+        </div>
+        {#if sourceModel?.canToggle && sourceModel.toggleLabel}
+          <form method="POST" action="?/toggleSourceChannel">
+            <input type="hidden" name="channel_id" value={source.id} />
+            <input type="hidden" name="paused" value={source.is_paused ? 'false' : 'true'} />
+            <Button type="submit" variant="secondary" size="compact">{sourceModel.toggleLabel}</Button>
+          </form>
+        {/if}
       </div>
     </div>
   </section>
 
+  <AdminPanel title="Source management" class="mt-6">
+    {#if telegramAccountsLoadError}
+      <Notice tone="danger" role="alert">{telegramAccountsLoadError} Account-dependent controls are temporarily disabled.</Notice>
+    {/if}
+    <SourceManagementPanel {source} {telegramAccounts} />
+  </AdminPanel>
+
+  {#if postPage}
   <section class="mt-6 grid gap-3" aria-labelledby="source-index-summary-heading">
     <h2 id="source-index-summary-heading" class="m-0 text-2xl font-black tracking-[-0.04em]">Indexing summary</h2>
     <div class="grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
@@ -302,6 +326,9 @@
       {/if}
     </nav>
   </section>
+  {:else}
+    <Notice class="mt-6" tone="danger" role="alert">{postLoadError ?? 'Fetched-message history is temporarily unavailable.'} Source management remains available above.</Notice>
+  {/if}
 {/if}
 
 {#snippet SummaryStat(label: string, value: number, tone: 'neutral' | 'success' | 'trend' = 'neutral')}

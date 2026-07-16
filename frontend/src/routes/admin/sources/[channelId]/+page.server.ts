@@ -1,7 +1,17 @@
 import { env } from '$env/dynamic/private';
 import type { Actions, PageServerLoad } from './$types';
 import { ApiError, fetchAdminSourceBackfills, fetchAdminSourceChannelPosts, fetchAdminSourceChannels, fetchAdminTelegramSessions } from '$lib/api/client';
-import { backfillSourceChannel, replaySourcePost, resumeSourceBackfill } from '$lib/server/admin/sourceActions';
+import {
+  assignSourceChannel,
+  backfillSourceChannel,
+  markSourceChannelDead,
+  orphanSourceChannel,
+  replaySourcePost,
+  resumeSourceBackfill,
+  toggleSourceChannel,
+  updateSourceChannelIngestion,
+  validateSourceAccount
+} from '$lib/server/admin/sourceActions';
 import { SOURCE_POST_PAGE_SIZE, sourcePostPageFromSearchParam, sourcePostStatusFromSearchParam } from '$lib/server/admin/sourcePostPagination';
 
 export const load: PageServerLoad = async ({ fetch, params, request, url }) => {
@@ -15,69 +25,66 @@ export const load: PageServerLoad = async ({ fetch, params, request, url }) => {
     cookieHeader: request.headers.get('cookie') ?? undefined
   };
 
-  try {
-    const backfillsPromise = fetchAdminSourceBackfills(api, params.channelId)
-      .then((backfills) => ({ backfills, backfillLoadError: null as string | null }))
-      .catch((caught) => ({
-        backfills: { items: [] },
-        backfillLoadError: caught instanceof ApiError ? caught.message : 'Could not load backfill history.'
-      }));
-    const [sourceChannels, postPage, telegramAccounts] = await Promise.all([
-      fetchAdminSourceChannels(api),
-      fetchAdminSourceChannelPosts(api, params.channelId, {
-        limit: SOURCE_POST_PAGE_SIZE,
-        offset,
-        snapshotAt,
-        status
-      }),
-      fetchAdminTelegramSessions(api)
-    ]);
-    const { backfills, backfillLoadError } = await backfillsPromise;
-    const recoveryRequestIds = {
-      backfills: Object.fromEntries(backfills.items.map((job) => [job.id, crypto.randomUUID()])),
-      posts: Object.fromEntries(postPage.items.map((post) => [post.id, crypto.randomUUID()]))
-    };
-    const source = sourceChannels.find((candidate) => candidate.id === params.channelId) ?? null;
-    if (!source) {
-      return {
-        source: null,
-        postPage: null,
-        backfills,
-        backfillLoadError,
-        recoveryRequestIds,
-        telegramAccounts,
-        paging: { page, snapshotAt: snapshotAt ?? new Date().toISOString(), status, hasPrevious: page > 1, hasNext: false },
-        loadError: 'Source was not found.'
-      };
-    }
-    return {
-      source,
-      postPage,
-      backfills,
-      backfillLoadError,
-      recoveryRequestIds,
-      telegramAccounts,
-      paging: {
-        page,
-        snapshotAt: postPage.snapshot_at,
-        status,
-        hasPrevious: page > 1,
-        hasNext: postPage.offset + postPage.items.length < postPage.total
-      },
-      loadError: null
-    };
-  } catch (caught) {
-    return {
-      source: null,
-      postPage: null,
-      backfills: { items: [] },
-      backfillLoadError: null,
-      recoveryRequestIds: { backfills: {}, posts: {} },
-      telegramAccounts: [],
-      paging: { page, snapshotAt: snapshotAt ?? new Date().toISOString(), status, hasPrevious: page > 1, hasNext: false },
-      loadError: caught instanceof ApiError ? caught.message : 'Could not load source indexing details.'
-    };
-  }
+  const [sourceChannelsResult, postPageResult, telegramAccountsResult, backfillsResult] = await Promise.allSettled([
+    fetchAdminSourceChannels(api),
+    fetchAdminSourceChannelPosts(api, params.channelId, {
+      limit: SOURCE_POST_PAGE_SIZE,
+      offset,
+      snapshotAt,
+      status
+    }),
+    fetchAdminTelegramSessions(api),
+    fetchAdminSourceBackfills(api, params.channelId)
+  ]);
+
+  const sourceChannels = settledValue(sourceChannelsResult, []);
+  const postPage = settledValue(postPageResult, null);
+  const telegramAccounts = settledValue(telegramAccountsResult, []);
+  const backfills = settledValue(backfillsResult, { items: [] });
+  const source = sourceChannels.find((candidate) => candidate.id === params.channelId) ?? null;
+  const recoveryRequestIds = {
+    backfills: Object.fromEntries(backfills.items.map((job) => [job.id, crypto.randomUUID()])),
+    posts: Object.fromEntries((postPage?.items ?? []).map((post) => [post.id, crypto.randomUUID()]))
+  };
+
+  return {
+    source,
+    postPage,
+    backfills,
+    backfillLoadError: loadErrorMessage(backfillsResult, 'Could not load backfill history.'),
+    postLoadError: loadErrorMessage(postPageResult, 'Could not load fetched-message history.'),
+    telegramAccountsLoadError: loadErrorMessage(telegramAccountsResult, 'Could not load Telegram accounts.'),
+    recoveryRequestIds,
+    telegramAccounts,
+    paging: {
+      page,
+      snapshotAt: postPage?.snapshot_at ?? snapshotAt ?? new Date().toISOString(),
+      status,
+      hasPrevious: page > 1,
+      hasNext: postPage ? postPage.offset + postPage.items.length < postPage.total : false
+    },
+    loadError: loadErrorMessage(sourceChannelsResult, 'Could not load source details.')
+      ?? (source ? null : 'Source was not found.')
+  };
 };
 
-export const actions: Actions = { backfillSourceChannel, resumeSourceBackfill, replaySourcePost };
+export const actions: Actions = {
+  toggleSourceChannel,
+  updateSourceChannelIngestion,
+  assignSourceChannel,
+  orphanSourceChannel,
+  validateSourceAccount,
+  markSourceChannelDead,
+  backfillSourceChannel,
+  resumeSourceBackfill,
+  replaySourcePost
+};
+
+function settledValue<T>(result: PromiseSettledResult<T>, fallback: T): T {
+  return result.status === 'fulfilled' ? result.value : fallback;
+}
+
+function loadErrorMessage(result: PromiseSettledResult<unknown>, fallback: string): string | null {
+  if (result.status === 'fulfilled') return null;
+  return result.reason instanceof ApiError ? result.reason.message : fallback;
+}

@@ -836,6 +836,9 @@ export interface AdminSourceChannelRead {
   backfill_requested_count: number;
   backfill_scanned_count: number;
   backfill_error: string | null;
+  latest_post_at: string | null;
+  observed_post_count: number;
+  meme_count: number;
   last_fetched_at: string | null;
   operational_status: 'active' | 'inactive' | 'paused';
   freshness_status: 'checkpoint_only' | 'fresh' | 'never_fetched' | 'stale';

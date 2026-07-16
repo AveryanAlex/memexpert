@@ -2,6 +2,23 @@ import type { AdminSourceChannelRead, AdminTelegramSessionRead } from '$lib/api/
 import { isReadyTelegramAccount } from '$lib/features/admin/telegram/readiness';
 
 export type SourcePlainStatus = 'Healthy' | 'Paused' | 'Waiting to fetch' | 'Needs account' | 'Needs attention' | 'Crawler unavailable' | 'Removed';
+export type SourceInventorySortKey = 'source' | 'health' | 'latest_post' | 'last_fetched' | 'memes' | 'posts' | 'subscribers';
+export type SourceInventorySortDirection = 'ascending' | 'descending';
+
+export interface SourceInventorySort {
+  key: SourceInventorySortKey;
+  direction: SourceInventorySortDirection;
+}
+
+export const DEFAULT_SOURCE_INVENTORY_SORT: SourceInventorySort = {
+  key: 'health',
+  direction: 'ascending'
+};
+
+const SOURCE_TITLE_COLLATOR = new Intl.Collator('en', {
+  numeric: true,
+  sensitivity: 'base'
+});
 
 export interface SourceCardViewModel {
   source: AdminSourceChannelRead;
@@ -35,6 +52,97 @@ export function readyTelegramAccounts(accounts: AdminTelegramSessionRead[], now 
 export function defaultTelegramAccountId(accounts: AdminTelegramSessionRead[], now = new Date()): string {
   const readyAccounts = readyTelegramAccounts(accounts, now);
   return readyAccounts.length === 1 ? readyAccounts[0].id : '';
+}
+
+export function nextSourceInventorySort(
+  current: SourceInventorySort,
+  key: SourceInventorySortKey
+): SourceInventorySort {
+  if (current.key === key) {
+    return {
+      key,
+      direction: current.direction === 'ascending' ? 'descending' : 'ascending'
+    };
+  }
+  return { key, direction: sourceInventoryDefaultDirection(key) };
+}
+
+export function sortSourceInventory(
+  sources: readonly AdminSourceChannelRead[],
+  telegramAccounts: readonly AdminTelegramSessionRead[],
+  sort: SourceInventorySort,
+  now = new Date()
+): AdminSourceChannelRead[] {
+  const accountList = [...telegramAccounts];
+  const direction = sort.direction === 'ascending' ? 1 : -1;
+  return [...sources].sort((left, right) => {
+    const leftModel = toSourceCardViewModel(left, accountList, now);
+    const rightModel = toSourceCardViewModel(right, accountList, now);
+    let comparison = 0;
+
+    switch (sort.key) {
+      case 'source':
+        comparison = compareText(left.title, right.title);
+        break;
+      case 'health':
+        comparison = sourceAttentionRank(left, leftModel.status) - sourceAttentionRank(right, rightModel.status);
+        if (comparison === 0) comparison = compareText(leftModel.assignedAccountLabel, rightModel.assignedAccountLabel);
+        break;
+      case 'latest_post':
+        comparison = compareNullableTimestamp(left.latest_post_at, right.latest_post_at, sort.direction);
+        break;
+      case 'last_fetched':
+        comparison = compareNullableTimestamp(left.last_fetched_at, right.last_fetched_at, sort.direction);
+        break;
+      case 'memes':
+        comparison = left.meme_count - right.meme_count;
+        break;
+      case 'posts':
+        comparison = left.observed_post_count - right.observed_post_count;
+        break;
+      case 'subscribers':
+        comparison = compareNullableNumber(left.subscriber_count, right.subscriber_count, sort.direction);
+        break;
+    }
+
+    if (sort.key !== 'latest_post' && sort.key !== 'last_fetched' && sort.key !== 'subscribers') {
+      comparison *= direction;
+    }
+    if (comparison !== 0) return comparison;
+
+    const titleComparison = compareText(left.title, right.title);
+    return titleComparison !== 0 ? titleComparison : compareText(left.id, right.id);
+  });
+}
+
+export function sourceInventoryDefaultDirection(key: SourceInventorySortKey): SourceInventorySortDirection {
+  return key === 'source' || key === 'health' || key === 'last_fetched' ? 'ascending' : 'descending';
+}
+
+export function mergeSourceProjections(
+  loaded: AdminSourceChannelRead[],
+  optimistic: AdminSourceChannelRead[]
+): AdminSourceChannelRead[] {
+  const optimisticById = new Map(optimistic.map((source) => [source.id, source]));
+  const loadedIds = new Set(loaded.map((source) => source.id));
+  return [
+    ...loaded.map((source) => optimisticById.get(source.id) ?? source),
+    ...optimistic.filter((source) => !loadedIds.has(source.id))
+  ];
+}
+
+export function isSourceAtLeastExpected(
+  actual: AdminSourceChannelRead | undefined,
+  expected: AdminSourceChannelRead
+): boolean {
+  if (!actual || actual.id !== expected.id) return false;
+  const actualUpdatedAt = Date.parse(actual.updated_at);
+  const expectedUpdatedAt = Date.parse(expected.updated_at);
+  if (Number.isFinite(actualUpdatedAt) && Number.isFinite(expectedUpdatedAt)) {
+    if (actualUpdatedAt > expectedUpdatedAt) return true;
+    if (actualUpdatedAt < expectedUpdatedAt) return false;
+  }
+  return sourceMutationProjectionMatches(actual, expected);
 }
 
 export function toSourceCardViewModel(source: AdminSourceChannelRead, telegramAccounts: AdminTelegramSessionRead[] = [], now = new Date()): SourceCardViewModel {
@@ -107,6 +215,67 @@ function sourceStatusDetail(source: AdminSourceChannelRead, status: SourcePlainS
 
 function hasEnabledIngestion(source: Pick<AdminSourceChannelRead, 'catchup_enabled' | 'live_enabled' | 'engagement_enabled'>): boolean {
   return source.catchup_enabled || source.live_enabled || source.engagement_enabled;
+}
+
+function sourceAttentionRank(source: AdminSourceChannelRead, status: SourcePlainStatus): number {
+  if (source.backfill_status === 'failed') return 0;
+  switch (status) {
+    case 'Needs attention': return 1;
+    case 'Needs account': return 2;
+    case 'Waiting to fetch': return 3;
+    case 'Crawler unavailable': return 4;
+    case 'Removed': return 5;
+    case 'Paused': return 6;
+    case 'Healthy': return 7;
+  }
+}
+
+function compareText(left: string, right: string): number {
+  return SOURCE_TITLE_COLLATOR.compare(left, right);
+}
+
+function compareNullableTimestamp(
+  left: string | null,
+  right: string | null,
+  direction: SourceInventorySortDirection
+): number {
+  const leftTimestamp = left === null ? null : Date.parse(left);
+  const rightTimestamp = right === null ? null : Date.parse(right);
+  return compareNullableNumber(
+    Number.isFinite(leftTimestamp) ? leftTimestamp : null,
+    Number.isFinite(rightTimestamp) ? rightTimestamp : null,
+    direction
+  );
+}
+
+function compareNullableNumber(
+  left: number | null,
+  right: number | null,
+  direction: SourceInventorySortDirection
+): number {
+  if (left === null && right === null) return 0;
+  if (left === null) return 1;
+  if (right === null) return -1;
+  return (left - right) * (direction === 'ascending' ? 1 : -1);
+}
+
+function sourceMutationProjectionMatches(actual: AdminSourceChannelRead, expected: AdminSourceChannelRead): boolean {
+  return actual.platform === expected.platform
+    && actual.platform_id === expected.platform_id
+    && actual.username === expected.username
+    && actual.title === expected.title
+    && actual.subscriber_count === expected.subscriber_count
+    && actual.is_active === expected.is_active
+    && actual.is_paused === expected.is_paused
+    && actual.catchup_enabled === expected.catchup_enabled
+    && actual.live_enabled === expected.live_enabled
+    && actual.engagement_enabled === expected.engagement_enabled
+    && actual.catchup_message_limit === expected.catchup_message_limit
+    && actual.telegram_session_id === expected.telegram_session_id
+    && actual.telegram_session_name === expected.telegram_session_name
+    && actual.is_orphaned === expected.is_orphaned
+    && actual.is_indexable === expected.is_indexable
+    && actual.operational_status === expected.operational_status;
 }
 
 function assignedAccountLabel(source: AdminSourceChannelRead, telegramAccounts: AdminTelegramSessionRead[]): string {

@@ -122,17 +122,30 @@ attention.
   likewise Telegram-only. The read/list model still carries a platform field so
   future crawler support can be added without a read-contract migration.
 
-Source cards show plain health, last fetched time, assigned account, and a link
-to message indexing. The source detail page lists every observed Telegram
-message, including unsupported and failed fetches, and distinguishes fully
-indexed (Qdrant and Meilisearch), partially indexed, processing, failed, and not
-indexable states. A fixed observation snapshot keeps pagination stable while
-new rows arrive. Operators can queue a bounded older-history catch-up without
-moving the live high-water checkpoint; this supports progressively indexing the
-rest of a large channel after its initial window. Manual history work requires
-the initial window to have completed and catch-up to remain enabled on both the
-source and assigned account. Diagnostics exposes technical
-identifiers/checkpoints; ingestion, assignment, and removal remain disclosed.
+The source workspace uses one sortable operator table rather than a wall of
+cards. It keeps every active, paused, orphaned, stale, unsupported, and removed
+source visible, with columns for name/handle, plain health and assigned account,
+latest upstream post time, last successful fetch, distinct catalog memes,
+observed posts, subscribers, and routine actions. Latest post time is the newest
+durable source-post publication timestamp; observed posts count the durable
+message inventory; catalog memes count distinct canonical memes attached through
+source provenance, so deduplicated reposts do not inflate the total. Missing
+timestamps and subscriber counts sort last.
+
+Pause/resume and the source-detail link remain inline. Diagnostics, ingestion,
+assignment, validation, and removal live on the source detail page so the table
+stays scannable while all operator controls remain available. Source identity
+and management load independently from the fetched-message ledger, so a
+temporary ledger failure does not hide pause, diagnostics, assignment, or
+removal controls. The detail page lists every observed Telegram message,
+including unsupported and failed fetches, and distinguishes fully indexed
+(Qdrant and Meilisearch), partially indexed,
+processing, failed, and not indexable states. A fixed observation snapshot keeps
+pagination stable while new rows arrive. Operators can queue a bounded
+older-history catch-up without moving the live high-water checkpoint; this
+supports progressively indexing the rest of a large channel after its initial
+window. Manual history work requires the initial window to have completed and
+catch-up to remain enabled on both the source and assigned account.
 Removing a source stops future crawling while preserving checkpoint and message
 inventory history.
 

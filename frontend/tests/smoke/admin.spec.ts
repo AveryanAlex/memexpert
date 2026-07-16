@@ -118,6 +118,18 @@ test('admin adds a public Telegram source through the selected ready account and
   await gotoAdmin(page, '/admin/sources');
 
   await expect(page.getByRole('heading', { name: 'Sources', level: 1 })).toBeVisible();
+  const sourceTable = page.getByRole('table', {
+    name: 'Configured sources with health, activity, catalog counts, and operator actions.'
+  });
+  const healthHeader = sourceTable.getByRole('columnheader', { name: /Health \/ account/ });
+  await expect(healthHeader).toHaveAttribute('aria-sort', 'ascending');
+  const sourceHeader = sourceTable.getByRole('columnheader', { name: /Source/ });
+  await sourceHeader.getByRole('button').click();
+  await expect(sourceHeader).toHaveAttribute('aria-sort', 'ascending');
+  const rowHeaders = sourceTable.getByRole('rowheader');
+  await expect(rowHeaders.nth(0)).toContainText('Daily cats');
+  await expect(rowHeaders.nth(1)).toContainText('Retro memes');
+  await expect(rowHeaders.nth(2)).toContainText('Small memes');
   await expect(page.getByText(/Reddit crawler support is unavailable/)).toBeVisible();
   await expect(page.getByText(/VK crawler support is unavailable/)).toBeVisible();
   const quickAddForm = page.locator('form[action="?/addSourceByReference"]');
@@ -138,26 +150,31 @@ test('admin adds a public Telegram source through the selected ready account and
   await expect(referenceInput).toBeFocused();
 
   await referenceInput.fill('@fresh_public_channel');
-  await quickAddForm.getByRole('button', { name: 'Add source', exact: true }).click();
-  await expect(page.getByRole('status')).toContainText('Telegram source added and ready to fetch.');
-  await page.reload();
-  await waitForAdminHydration(page);
+  const addSourceButton = quickAddForm.getByRole('button', { name: 'Add source', exact: true });
+  await addSourceButton.click();
+  await expect(quickAddForm.getByText('Telegram source added and ready to fetch.', { exact: true })).toBeVisible();
+  const transientRefreshError = page.getByText('Source catalog is restarting after creation.', { exact: true });
+  await expect(transientRefreshError).toBeVisible();
+  await expect(addSourceButton).toBeEnabled();
+  await expect(accountSelect).toHaveValue(adminFixture.readyAccountId);
+  await expect(telegramSuggestion).toBeVisible();
+  await expect(transientRefreshError).not.toBeVisible();
 
-  const addedSource = page.locator('article').filter({ has: page.getByRole('heading', { name: 'Fresh Public Channel' }) });
-  await expect(addedSource.getByText('@fresh_public_channel', { exact: true })).toBeVisible();
+  const addedSource = sourceTable.getByRole('row').filter({ hasText: 'Fresh Public Channel' });
+  await expect(addedSource.getByText('@fresh_public_channel · Telegram', { exact: true })).toBeVisible();
   await expect(addedSource.getByText(/Account: Meme desk account/)).toBeVisible();
 
-  const diagnostics = await openDisclosure(addedSource, 'Diagnostics');
-  await expect(diagnostics.getByText('Source ID', { exact: true })).toBeVisible();
-  await expect(diagnostics.getByText(adminFixture.quickAddedSourceId, { exact: true })).toBeVisible();
-  await expect(diagnostics.getByText('Platform ID', { exact: true })).toBeVisible();
-
-  await addedSource.getByRole('button', { name: 'Pause' }).click();
+  await addedSource.getByRole('button', { name: 'Pause Fresh Public Channel' }).click();
   await expect(page.getByRole('status')).toContainText('Source paused.');
-  await page.reload();
-  await waitForAdminHydration(page);
-  const pausedSource = page.locator('article').filter({ has: page.getByRole('heading', { name: 'Fresh Public Channel' }) });
+  const pausedSource = sourceTable.getByRole('row').filter({ hasText: 'Fresh Public Channel' });
   await expect(pausedSource.getByText('Paused', { exact: true })).toBeVisible();
+
+  await pausedSource.getByRole('link', { name: 'Manage Fresh Public Channel' }).click();
+  await expect(page).toHaveURL(new RegExp(`/admin/sources/${adminFixture.quickAddedSourceId}$`));
+  await expect(page.getByRole('heading', { name: 'Fresh Public Channel', level: 1 })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Source management', level: 2 })).toBeVisible();
+  await expect(page.locator('details[data-advanced-section="Diagnostics"]')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Resume', exact: true })).toBeVisible();
 });
 
 test('Telegram accounts use operator terminology while diagnostics and advanced controls stay disclosed', async ({ page }) => {
@@ -270,6 +287,22 @@ test('mobile admin navigation remains usable', async ({ page }) => {
   await expect(page).toHaveURL(/\/admin\/sources$/);
   await waitForAdminHydration(page);
   await expect(page.getByRole('heading', { name: 'Sources', level: 1 })).toBeVisible();
+
+  const sourceTable = page.getByRole('table', {
+    name: 'Configured sources with health, activity, catalog counts, and operator actions.'
+  });
+  const firstSourceRow = sourceTable.getByRole('row').nth(1);
+  const edgeCellPositions = await firstSourceRow.locator('th, td').evaluateAll((cells) => [
+    getComputedStyle(cells[0]).position,
+    getComputedStyle(cells[cells.length - 1]).position
+  ]);
+  expect(edgeCellPositions).toEqual(['static', 'static']);
+
+  const postsHeader = sourceTable.getByRole('columnheader', { name: /Posts/ });
+  await postsHeader.scrollIntoViewIfNeeded();
+  await expect(postsHeader).toBeVisible();
+  await postsHeader.getByRole('button').click();
+  await expect(postsHeader).toHaveAttribute('aria-sort', 'descending');
 });
 
 async function signInAsAdmin(page: Page, baseURL: string | undefined, testInfo: TestInfo): Promise<void> {
