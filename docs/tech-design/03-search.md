@@ -11,7 +11,11 @@ Every search query may use several retrieval paths in parallel:
 3. **Popularity/trending:** PostgreSQL/materialized views provide fallback and boosting signals.
 4. **Personal recommendations:** Qdrant recommend/search APIs provide user-history candidates for feed surfaces and optional query-independent blending.
 
-Both engines return a fixed-size candidate pool (configurable, default: 200 candidates each). Results are merged by `meme_id` and scored with configurable weights. Example shape:
+Both engines return the same fixed-size candidate pool, controlled by
+`SEARCH_CANDIDATE_POOL_LIMIT_PER_SOURCE` (default: 200 candidates from each
+engine, bounded to 100–500). The pool size is independent of the requested page
+`limit` and `offset`. Results are merged by `meme_id` and scored with
+configurable weights. Example shape:
 
 ```text
 combined_score = w_semantic × semantic_score
@@ -57,7 +61,18 @@ Bot inline search normally uses `all` after resolving/creating the Telegram full
 
 True cursor-based pagination is hard on a score computed from independent engines because neither engine knows the other's scores.
 
-Baseline MVP may use bounded offset pagination with over-fetch + deterministic merge/rerank. This is acceptable while candidate pools are small and traffic is low.
+Baseline MVP uses bounded offset pagination over a fixed candidate pool with a
+deterministic merge/rerank. The response `total` is the number of unique
+candidates in that bounded union that pass final PostgreSQL access and content
+filters; it is not an exact corpus-wide match count. With the default, at most
+400 provider hits are merged, and cross-engine duplicates reduce the candidates
+that enter PostgreSQL filtering.
+Because retrieval depth and score normalization do not depend on the requested
+page size, `total`, scores, and ordering remain stable across `limit` and
+`offset` while the provider indexes and PostgreSQL ranking inputs are unchanged.
+The final sort uses `meme_id` as a tie-breaker after score, popularity, and
+creation time. Requests beyond the bounded total return an empty page rather
+than increasing provider retrieval depth.
 
 Optional stabilization when ranking becomes more expensive or pagination instability becomes visible: **cached candidate pool**.
 

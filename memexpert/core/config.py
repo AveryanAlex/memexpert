@@ -143,6 +143,7 @@ class Settings(BaseSettings):
     pipeline_meilisearch_index_name: str = "memexpert-memes"
     pipeline_meilisearch_timeout_seconds: float = Field(default=10.0, gt=0.0, le=600.0)
     meilisearch_settings_task_timeout_seconds: float = Field(default=600.0, gt=0.0, le=3600.0)
+    search_candidate_pool_limit_per_source: int = Field(default=200, ge=100, le=500)
     recommendation_positive_lookback_hours: int = Field(default=168, ge=1, le=2160)
     recommendation_impression_lookback_hours: int = Field(default=72, ge=1, le=720)
     recommendation_positive_signal_limit: int = Field(default=50, ge=1, le=500)

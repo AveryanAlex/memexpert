@@ -530,6 +530,64 @@ async def test_hybrid_search_ranks_by_weighted_semantic_text_and_popularity(
     assert page.items[0].score.total > page.items[1].score.total
 
 
+async def test_hybrid_search_total_and_order_are_stable_across_page_sizes(
+    migrated_db_session: AsyncSession,
+) -> None:
+    tied_created_at = datetime(2026, 1, 1, tzinfo=UTC)
+    memes: list[Meme] = []
+    for _ in range(201):
+        meme = await _create_meme(migrated_db_session)
+        meme.created_at = tied_created_at
+        memes.append(meme)
+    await migrated_db_session.commit()
+
+    text_client = FakeTextSearchClient(
+        [
+            {
+                "id": str(meme.primary_file_id),
+                "meme_id": str(meme.id),
+                "_rankingScore": 1.0,
+            }
+            for meme in memes
+        ]
+    )
+    service = MemeSearchService(migrated_db_session, text_client=text_client)
+
+    limit_12_page = await service.search_memes("frog", limit=12)
+    limit_20_page = await service.search_memes("frog", limit=20)
+    limit_100_page = await service.search_memes("frog", limit=100)
+    second_page = await service.search_memes("frog", limit=12, offset=12)
+    second_100_page = await service.search_memes("frog", limit=100, offset=100)
+    beyond_pool_page = await service.search_memes("frog", limit=12, offset=200)
+
+    expected_order = sorted((meme.id for meme in memes[:200]), key=str, reverse=True)
+    assert {
+        limit_12_page.total,
+        limit_20_page.total,
+        limit_100_page.total,
+        second_page.total,
+        second_100_page.total,
+        beyond_pool_page.total,
+    } == {200}
+    assert [item.meme.id for item in limit_12_page.items] == expected_order[:12]
+    assert [item.meme.id for item in limit_20_page.items] == expected_order[:20]
+    assert [item.meme.id for item in limit_100_page.items] == expected_order[:100]
+    assert [item.meme.id for item in second_page.items] == expected_order[12:24]
+    assert [item.attribution.rank for item in second_page.items] == list(range(13, 25))
+    assert [item.meme.id for item in second_100_page.items] == expected_order[100:]
+    assert [item.attribution.rank for item in second_100_page.items] == list(range(101, 201))
+    assert [item.meme.id for item in limit_100_page.items + second_100_page.items] == expected_order
+    assert memes[200].id not in {item.meme.id for item in limit_100_page.items + second_100_page.items}
+    assert beyond_pool_page.items == []
+    assert limit_12_page.has_more is True
+    assert limit_20_page.has_more is True
+    assert limit_100_page.has_more is True
+    assert second_page.has_more is True
+    assert second_100_page.has_more is False
+    assert beyond_pool_page.has_more is False
+    assert {call["limit"] for call in text_client.calls} == {200}
+
+
 async def test_plain_text_query_embedding_feeds_qdrant_and_hybrid_merge(
     migrated_db_session: AsyncSession,
 ) -> None:
@@ -563,14 +621,14 @@ async def test_plain_text_query_embedding_feeds_qdrant_and_hybrid_merge(
     assert semantic_client.calls == [
         {
             "query_vector": (0.3, 0.4),
-            "limit": 40,
+            "limit": 200,
             "prefilter": _expected_prefilter(scope=SearchIndexPrefilterScope.PUBLIC),
         }
     ]
     assert text_client.calls == [
         {
             "query": "frog wizard",
-            "limit": 40,
+            "limit": 200,
             "prefilter": _expected_prefilter(scope=SearchIndexPrefilterScope.PUBLIC),
         }
     ]
@@ -641,7 +699,7 @@ async def test_search_route_uses_plain_text_semantic_path_with_overridden_fakes(
     assert semantic_client.calls == [
         {
             "query_vector": (0.7, 0.8),
-            "limit": 40,
+            "limit": 200,
             "prefilter": _expected_prefilter(scope=SearchIndexPrefilterScope.PUBLIC),
         }
     ]
@@ -1552,7 +1610,7 @@ async def test_search_service_passes_conservative_prefilters_to_text_and_semanti
     assert public_text_client.calls == [
         {
             "query": "frog",
-            "limit": 40,
+            "limit": 200,
             "prefilter": _expected_prefilter(
                 scope=SearchIndexPrefilterScope.PUBLIC,
                 media_type=ContentKind.IMAGE,
@@ -1564,7 +1622,7 @@ async def test_search_service_passes_conservative_prefilters_to_text_and_semanti
     assert public_semantic_client.calls == [
         {
             "query_vector": (0.1, 0.2),
-            "limit": 40,
+            "limit": 200,
             "prefilter": _expected_prefilter(
                 scope=SearchIndexPrefilterScope.PUBLIC,
                 media_type=ContentKind.IMAGE,
@@ -4127,7 +4185,7 @@ async def test_provider_failures_fall_back_to_popular_without_raw_error_payload(
     assert text_client.calls == [
         {
             "query": "frog",
-            "limit": 80,
+            "limit": 200,
             "prefilter": _expected_prefilter(scope=SearchIndexPrefilterScope.PUBLIC),
         }
     ]
