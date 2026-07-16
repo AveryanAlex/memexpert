@@ -36,6 +36,13 @@ async def _seed_synonym_control_plane(
 ) -> None:
     async with session_factory() as session:
         for locale in SearchSynonymLocale:
+            catalog = (
+                await session.execute(
+                    select(SearchSynonymCatalog).where(SearchSynonymCatalog.locale == locale)
+                )
+            ).scalar_one_or_none()
+            if catalog is not None:
+                continue
             result = compile_search_synonyms("", locale=locale)
             catalog = SearchSynonymCatalog(locale=locale)
             session.add(catalog)
@@ -55,7 +62,8 @@ async def _seed_synonym_control_plane(
                     version=1,
                 )
             )
-        session.add(SearchSynonymSyncState(id=SEARCH_SYNONYM_SYNC_STATE_ID))
+        if await session.get(SearchSynonymSyncState, SEARCH_SYNONYM_SYNC_STATE_ID) is None:
+            session.add(SearchSynonymSyncState(id=SEARCH_SYNONYM_SYNC_STATE_ID))
         await session.commit()
 
 
