@@ -18,9 +18,10 @@ if TYPE_CHECKING:
 
 from memexpert.core.config import Settings
 from memexpert.messaging.rabbitmq_outbox_runtime import RabbitMQOutboxPublisherBatchResult
-from memexpert.models.enums import ContentKind, ContentLanguage
+from memexpert.models.enums import ContentKind, ContentLanguage, SearchSynonymSyncStatus
 from memexpert.scheduler.jobs import (
     JOB_ID_MATERIALIZED_VIEW_REFRESH,
+    JOB_ID_MEILISEARCH_SETTINGS_RECONCILE,
     JOB_ID_MOTD,
     JOB_ID_PIPELINE_CAPACITY_REFRESH,
     JOB_ID_RABBITMQ_OUTBOX_PUBLISHER,
@@ -40,6 +41,7 @@ from memexpert.scheduler.locking import (
 from memexpert.scheduler.runtime import run_scheduler_runtime
 from memexpert.schemas.meme import PublicMemeCardRead, PublicMemeOfTheDayRead
 from memexpert.services.admin_telegram_login import TelegramLoginCleanupBatchResult
+from memexpert.services.meilisearch_settings_reconcile import MeilisearchSettingsReconcileResult
 from memexpert.services.scheduler_batch_jobs import SearchIndexBatchJobResult, SeoBacklogBatchJobResult
 from memexpert.services.source_engagement_scheduler import SourceEngagementCaptureSchedulerResult
 
@@ -191,6 +193,11 @@ def test_configure_scheduler_logging_uses_stdout_when_bootstrapping(monkeypatch:
         record.expired = 2
         record.cleaned = 3
         record.attempt_id = "019f5c1a-5fd6-7000-8000-000000000001"
+        record.changed = True
+        record.desired_hash = "a" * 64
+        record.actual_hash = "b" * 64
+        record.provider_task_uid = 42
+        record.revision_count = 2
 
         payload = json.loads(handler.format(record))
         assert payload["event"] == "popularity_snapshot_capture_succeeded"
@@ -207,6 +214,11 @@ def test_configure_scheduler_logging_uses_stdout_when_bootstrapping(monkeypatch:
         assert payload["expired"] == 2
         assert payload["cleaned"] == 3
         assert payload["attempt_id"] == "019f5c1a-5fd6-7000-8000-000000000001"
+        assert payload["changed"] is True
+        assert payload["desired_hash"] == "a" * 64
+        assert payload["actual_hash"] == "b" * 64
+        assert payload["provider_task_uid"] == 42
+        assert payload["revision_count"] == 2
     finally:
         root_logger.handlers.clear()
         root_logger.setLevel(logging.NOTSET)
@@ -221,12 +233,19 @@ def test_scheduler_job_definitions_register_expected_ids() -> None:
         JOB_ID_SOURCE_ENGAGEMENT_CAPTURE,
         JOB_ID_MOTD,
         JOB_ID_SEARCH_INDEX_SYNC,
+        JOB_ID_MEILISEARCH_SETTINGS_RECONCILE,
         JOB_ID_SEO_BACKLOG_BATCHES,
         JOB_ID_RABBITMQ_OUTBOX_PUBLISHER,
         JOB_ID_RECOVERY_DISPATCH,
         JOB_ID_PIPELINE_CAPACITY_REFRESH,
         JOB_ID_TELEGRAM_LOGIN_CLEANUP,
     ]
+    reconcile_definition = next(
+        definition for definition in definitions if definition.id == JOB_ID_MEILISEARCH_SETTINGS_RECONCILE
+    )
+    assert reconcile_definition.enabled is True
+    assert reconcile_definition.trigger_seconds == 60.0
+    assert reconcile_definition.run_on_startup is True
 
 
 def test_enabled_scheduler_jobs_filters_disabled_jobs() -> None:
@@ -236,6 +255,7 @@ def test_enabled_scheduler_jobs_filters_disabled_jobs() -> None:
             "scheduler_source_engagement_capture_enabled": True,
             "scheduler_motd_enabled": False,
             "scheduler_search_index_sync_enabled": True,
+            "scheduler_meilisearch_settings_reconcile_enabled": False,
             "scheduler_seo_backlog_batches_enabled": False,
             "scheduler_rabbitmq_outbox_publisher_enabled": False,
             "scheduler_recovery_dispatch_enabled": False,
@@ -459,6 +479,72 @@ async def test_search_index_sync_job_calls_batch_service_and_logs_result(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_meilisearch_settings_reconcile_job_calls_service_and_logs_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings.model_validate({"scheduler_meilisearch_settings_reconcile_enabled": True})
+    engine = cast("AsyncEngine", object())
+    session_factory = object()
+    called: dict[str, object] = {}
+    info_calls: list[tuple[str, dict[str, object] | None]] = []
+
+    def fake_build_session_factory(bound_engine: object) -> object:
+        called["engine"] = bound_engine
+        return session_factory
+
+    async def fake_reconcile(
+        session_factory_arg: object,
+        *,
+        settings: Settings,
+    ) -> MeilisearchSettingsReconcileResult:
+        called["session_factory"] = session_factory_arg
+        called["settings"] = settings
+        return MeilisearchSettingsReconcileResult(
+            status=SearchSynonymSyncStatus.SYNCED,
+            reason="applied",
+            changed=True,
+            desired_hash="a" * 64,
+            actual_hash="a" * 64,
+            provider_task_uid=42,
+            revision_count=2,
+            duration_seconds=0.5,
+        )
+
+    def fake_info(message: str, *args: object, extra: dict[str, object] | None = None, **kwargs: object) -> None:
+        del args, kwargs
+        info_calls.append((message, extra))
+
+    monkeypatch.setattr("memexpert.scheduler.jobs.build_async_session_factory", fake_build_session_factory)
+    monkeypatch.setattr("memexpert.scheduler.jobs.run_meilisearch_settings_reconcile", fake_reconcile)
+    monkeypatch.setattr("memexpert.scheduler.jobs.logger.info", fake_info)
+
+    definition = build_scheduler_job_definitions(settings, engine=engine)[4]
+    await definition.action()
+
+    assert definition.id == JOB_ID_MEILISEARCH_SETTINGS_RECONCILE
+    assert definition.run_on_startup is True
+    assert called == {"engine": engine, "session_factory": session_factory, "settings": settings}
+    assert info_calls == [
+        (
+            "scheduler_job_batch_result",
+            {
+                "event": "scheduler_job_batch_result",
+                "job_id": JOB_ID_MEILISEARCH_SETTINGS_RECONCILE,
+                "status": "synced",
+                "degraded_mode": False,
+                "reason": "applied",
+                "changed": True,
+                "desired_hash": "a" * 64,
+                "actual_hash": "a" * 64,
+                "provider_task_uid": 42,
+                "revision_count": 2,
+                "duration_seconds": 0.5,
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
 async def test_seo_backlog_job_calls_batch_service_and_logs_result(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = Settings.model_validate({"scheduler_seo_backlog_batches_enabled": True})
     engine = cast("AsyncEngine", object())
@@ -483,7 +569,7 @@ async def test_seo_backlog_job_calls_batch_service_and_logs_result(monkeypatch: 
     monkeypatch.setattr("memexpert.scheduler.jobs.run_scheduler_seo_backlog_batch", fake_run_batch)
     monkeypatch.setattr("memexpert.scheduler.jobs.logger.info", fake_info)
 
-    definition = build_scheduler_job_definitions(settings, engine=engine)[4]
+    definition = build_scheduler_job_definitions(settings, engine=engine)[5]
     await definition.action()
 
     assert definition.id == JOB_ID_SEO_BACKLOG_BATCHES
@@ -546,7 +632,7 @@ async def test_rabbitmq_outbox_publisher_job_calls_runtime_and_logs_result(monke
     monkeypatch.setattr("memexpert.scheduler.jobs.run_rabbitmq_outbox_publisher_batch", fake_run_batch)
     monkeypatch.setattr("memexpert.scheduler.jobs.logger.info", fake_info)
 
-    definition = build_scheduler_job_definitions(settings, engine=engine)[5]
+    definition = build_scheduler_job_definitions(settings, engine=engine)[6]
     await definition.action()
 
     assert definition.id == JOB_ID_RABBITMQ_OUTBOX_PUBLISHER
@@ -713,6 +799,7 @@ async def test_scheduler_runtime_registers_enabled_jobs_and_shuts_down_gracefull
             "scheduler_source_engagement_capture_enabled": False,
             "scheduler_motd_enabled": True,
             "scheduler_search_index_sync_enabled": False,
+            "scheduler_meilisearch_settings_reconcile_enabled": True,
             "scheduler_seo_backlog_batches_enabled": True,
             "scheduler_rabbitmq_outbox_publisher_enabled": False,
             "scheduler_recovery_dispatch_enabled": False,
@@ -741,9 +828,21 @@ async def test_scheduler_runtime_registers_enabled_jobs_and_shuts_down_gracefull
     assert [job["id"] for job in scheduler.jobs] == [
         JOB_ID_MATERIALIZED_VIEW_REFRESH,
         JOB_ID_MOTD,
+        JOB_ID_MEILISEARCH_SETTINGS_RECONCILE,
         JOB_ID_SEO_BACKLOG_BATCHES,
         JOB_ID_TELEGRAM_LOGIN_CLEANUP,
     ]
+    reconcile_job = next(
+        job for job in scheduler.jobs if job["id"] == JOB_ID_MEILISEARCH_SETTINGS_RECONCILE
+    )
+    assert reconcile_job["max_instances"] == 1
+    assert isinstance(reconcile_job["next_run_time"], datetime)
+    assert reconcile_job["next_run_time"].tzinfo is not None
+    assert all(
+        "next_run_time" not in job
+        for job in scheduler.jobs
+        if job["id"] != JOB_ID_MEILISEARCH_SETTINGS_RECONCILE
+    )
     assert engine.dispose_calls == 0
 
 
@@ -755,6 +854,7 @@ async def test_scheduler_runtime_skips_disabled_jobs() -> None:
             "scheduler_source_engagement_capture_enabled": False,
             "scheduler_motd_enabled": False,
             "scheduler_search_index_sync_enabled": False,
+            "scheduler_meilisearch_settings_reconcile_enabled": False,
             "scheduler_seo_backlog_batches_enabled": False,
             "scheduler_rabbitmq_outbox_publisher_enabled": False,
             "scheduler_recovery_dispatch_enabled": False,

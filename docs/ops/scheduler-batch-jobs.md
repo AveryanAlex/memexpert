@@ -6,6 +6,7 @@ This runbook covers the backend scheduler jobs that perform deferred, bounded wo
 - `materialized-view-refresh` refreshes public trend materialized views derived from source engagement snapshots and analytics events.
 - `motd` refreshes the deterministic Meme of the Day cache row for the current UTC date.
 - `search-index-sync` updates Qdrant and Meilisearch from canonical PostgreSQL state.
+- `meilisearch-settings-reconcile` applies the combined published synonym map from PostgreSQL.
 - `seo-backlog-batches` generates or refreshes public-safe meme SEO pages.
 - `rabbitmq-outbox-publisher` publishes durable RabbitMQ outbox messages.
 
@@ -32,6 +33,15 @@ Search-index job:
 | `PIPELINE_VOYAGE_OUTPUT_DIMENSIONS` | `1024` | Vector dimensions used when loading cached embeddings for Qdrant. |
 | `QDRANT_URL`, `PIPELINE_QDRANT_COLLECTION_NAME`, `PIPELINE_QDRANT_TIMEOUT_SECONDS` | see config | Qdrant write target. |
 | `MEILISEARCH_URL`, `MEILISEARCH_MASTER_KEY`, `PIPELINE_MEILISEARCH_INDEX_NAME`, `PIPELINE_MEILISEARCH_TIMEOUT_SECONDS` | see config | Meilisearch write target. |
+
+Meilisearch synonym settings job:
+
+| variable | default | meaning |
+|---|---:|---|
+| `SCHEDULER_MEILISEARCH_SETTINGS_RECONCILE_ENABLED` | `true` | Enables durable synonym reconciliation. The job also runs once immediately after the singleton scheduler acquires its advisory lock. |
+| `SCHEDULER_MEILISEARCH_SETTINGS_RECONCILE_INTERVAL_SECONDS` | `60` | Periodic desired/observed-state check cadence. |
+| `MEILISEARCH_SETTINGS_TASK_TIMEOUT_SECONDS` | `600` | Maximum wait for an asynchronous full settings-replacement task. |
+| `MEILISEARCH_URL`, `MEILISEARCH_MASTER_KEY`, `PIPELINE_MEILISEARCH_INDEX_NAME` | see config | Meilisearch target shared with document sync. |
 
 Source engagement and public trend jobs:
 
@@ -90,7 +100,7 @@ Search-index, source-engagement, and SEO jobs emit:
 | field | meaning |
 |---|---|
 | `event` | Always `scheduler_job_batch_result`. |
-| `job_id` | `search-index-sync`, `source-engagement-capture`, or `seo-backlog-batches`. |
+| `job_id` | `search-index-sync`, `meilisearch-settings-reconcile`, `source-engagement-capture`, or `seo-backlog-batches`. |
 | `scanned` | Work rows or memes claimed by this run. |
 | `updated` | External index updates or SEO page writes that succeeded. |
 | `failed` | Claimed items that ended in a recorded failure. |
@@ -98,6 +108,11 @@ Search-index, source-engagement, and SEO jobs emit:
 | `duration_seconds` | Wall-clock seconds spent inside the job action. |
 
 The source-engagement job uses `claimed` for due source rows and `enqueued` for RabbitMQ outbox messages written. The MOTD job emits the same `event=scheduler_job_batch_result` with `job_id=motd`, `candidate_count`, `selected_meme_id`, `reason`, `algorithm_version`, and `refreshed_at`. The outbox publisher emits the same event with `job_id=rabbitmq-outbox-publisher`, `recovered`, `claimed`, `published`, `failed`, and `duration_seconds` fields.
+
+The Meilisearch settings job emits `status`, `changed`, `desired_hash`,
+`actual_hash`, `provider_task_uid`, and `revision_count`. Hashes are safe
+content fingerprints; logs and admin reads never contain the synonym map or
+Meilisearch credentials.
 
 The generic wrapper still emits `scheduler_job_started`, `scheduler_job_succeeded`, and `scheduler_job_failed`. A non-zero `failed` count inside `scheduler_job_batch_result` does not make the scheduler action fail; failures are durable backlog state and are retried by later runs where appropriate.
 
@@ -128,6 +143,36 @@ Initial ingest writes an `ingest_initial` snapshot as the baseline. Later captur
 Each scheduler run finds due work through the `MemeSource -> SourceChannel -> TelegramSession` FK assignment, skips orphaned or disabled channels and non-runnable Telegram sessions, claims due alive Telegram `meme_sources` rows with `FOR UPDATE SKIP LOCKED`, sets the source engagement lease fields, and writes a `source_engagement_capture_requested` message through the generic RabbitMQ outbox in the same DB transaction. Claiming is capped by both `SCHEDULER_SOURCE_ENGAGEMENT_CAPTURE_BATCH_SIZE` globally and `SCHEDULER_SOURCE_ENGAGEMENT_CAPTURE_PER_SESSION_BATCH_SIZE` per Telegram session so one session cannot consume the full default run while other sessions have due work. Scheduler-published messages include `telegram_session_id`, `session_name`, and `session_key`, and route as `pipeline.source_engagement_capture.<session_key>`. A session in `flood_wait` is skipped while `flood_wait_until` is in the future; once the cooldown expires, the scheduler clears the session flood-wait state as it claims work so the later runtime can load an active session. Worker startup discovers engagement-enabled Telegram sessions and declares a single-active RabbitMQ main queue plus retry queue for each session key; this isolates in-flight captures per session while allowing different sessions to run independently. Runtime source-engagement captures reuse the `TelegramSessionManager` cached client for the event session. If Telegram returns FloodWait, the worker parks only that `telegram_sessions` row, clears the source lease, ACKs the message, and does not write a failed source snapshot. Source-level failures such as missing or inaccessible posts still write scheduled snapshots.
 
 Snapshot NULLs mean "Telegram did not expose this counter" and are preserved in canonical storage. Public trend/read-model queries may coalesce unknown to 0 for ranking and summaries only. `forward_count` is Telegram's public forward/repost count and maps to public `latest_source_reposts`; it is unrelated to `forwarded_from_*` attribution on forwarded messages.
+
+## Meilisearch Synonym Settings Reconciliation
+
+PostgreSQL is authoritative. An admin publish archives the locale's previous
+publication, creates a new immutable published revision and fresh draft, then
+marks the singleton `search_synonym_sync_states` row pending with the complete
+desired locale revision set. It does not call Meilisearch in the request path.
+
+The scheduler loads every published locale snapshot and fails safely if locale
+maps contain the same source key with different targets. It recompiles each
+authored source and verifies the stored compiler version, compiled map, and
+revision hash before trusting it. With no publications it remains idle only if
+nothing was previously applied; disappearance after an application is a
+failure requiring operator review. It refuses every empty locale snapshot and
+an empty combined map, so it can never clear live synonyms because of missing
+or invalid database state. For a non-empty map, it reads the current provider
+settings and compares canonical hashes. An
+equal hash is recorded as synchronized without a write. A mismatch submits one
+full asynchronous synonym replacement, stores the provider task UID, waits for
+completion, re-reads the settings, and only records success if the observed hash
+matches the desired hash.
+
+Failures preserve the last applied hash/revision set and store only bounded,
+credential-free diagnostics. A later periodic run retries automatically;
+operators can also request an audited, idempotent retry from
+`/admin/search/synonyms`. Scheduler state writes compare the exact published
+revision generation before changing desired state. If an admin publishes while
+a provider task is in flight, the stale completion cannot overwrite the newer
+pending generation and the same job immediately runs another convergence pass.
+Each job run closes its Meilisearch SDK client and HTTP connection pool.
 
 ## Search-Index Work Selection
 
@@ -194,6 +239,32 @@ ORDER BY last_attempt_at NULLS FIRST
 LIMIT 100;
 ```
 
+Inspect synonym publications and their durable sync state:
+
+```sql
+SELECT
+  id,
+  status,
+  desired_hash,
+  applied_hash,
+  actual_hash,
+  desired_revision_ids,
+  applied_revision_ids,
+  provider_task_uid,
+  left(last_error, 500) AS last_error_sample,
+  requested_at,
+  last_attempt_at,
+  last_success_at,
+  last_failure_at
+FROM search_synonym_sync_states;
+
+SELECT c.locale, r.revision_number, r.status, r.compiler_version,
+       r.compiled_hash, r.published_at, r.archived_at
+FROM search_synonym_revisions r
+JOIN search_synonym_catalogs c ON c.id = r.catalog_id
+ORDER BY c.locale, r.revision_number DESC;
+```
+
 Outbox backlog and failures:
 
 ```sql
@@ -242,6 +313,7 @@ Automatic replay:
 - Leave failed search-index snapshots in `failed`; the scheduler will retry them in later bounded runs.
 - Leave stale `synced` snapshots alone; the scheduler detects canonical drift and reprocesses them.
 - Leave crashed `processing` rows alone unless an operator has confirmed the lease timeout is too high; the scheduler reclaims them after `SCHEDULER_SEARCH_INDEX_SYNC_PROCESSING_TIMEOUT_SECONDS`.
+- Leave failed or pending synonym settings state durable; the next settings run retries it. After correcting a catalog or provider issue, an admin may use the audited Retry sync action without republishing.
 - Leave failed outbox rows in `failed`; the `rabbitmq-outbox-publisher` job retries them when `next_retry_at` is due.
 - Leave stale outbox `publishing` rows alone unless an operator has confirmed the lease timeout is too high; the scheduler recovers them after `SCHEDULER_RABBITMQ_OUTBOX_PUBLISHER_STALE_TIMEOUT_SECONDS`.
 
@@ -267,4 +339,5 @@ Full/manual resync:
 - `sync_qdrant_timeout` / `sync_meili_timeout`: provider timeout. Check engine health and timeout settings; leave failed rows for retry after the provider recovers.
 - `sync_qdrant_provider_blocked` / `sync_meili_provider_blocked`: provider unavailable or rejected the write. Check URLs, credentials, and index/collection existence.
 - `sync_qdrant_malformed_payload` / `sync_meili_malformed_payload`: payload or provider response shape is invalid. Inspect `last_error_text`; this usually needs a code/config fix rather than repeated replay.
+- `meilisearch-settings-reconcile` with `status='failed'`: inspect the bounded `last_error` and scheduler log. Fix cross-locale key conflicts in the draft and republish, or restore provider health and use Retry sync. Never clear provider synonyms manually as a recovery shortcut.
 - SEO `failed` result counts with no page written: inspect scheduler logs around the provider warning. In live mode, confirm `PIPELINE_SEO_API_KEY`, model, base URL, and object-storage access for image inputs.

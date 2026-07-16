@@ -113,6 +113,9 @@ export type AdminRecoveryBatchStatus =
   | 'preview'
   | 'queued'
   | 'running';
+export type AdminSearchSynonymLocale = 'en' | 'ru';
+export type AdminSearchSynonymRevisionStatus = 'archived' | 'draft' | 'published';
+export type AdminSearchSynonymSyncStatus = 'failed' | 'idle' | 'pending' | 'synced' | 'syncing';
 export type ChannelSuggestionStatus = 'approved' | 'pending' | 'rejected';
 export type TelegramSessionStatus = 'active' | 'auth_required' | 'flood_wait' | 'quarantined' | 'stopped';
 export type ModerationReportStatus = 'pending' | 'in_review' | 'resolved' | 'dismissed';
@@ -1011,6 +1014,88 @@ export interface AdminRecoveryBatchRead {
   updated_at: string;
   version: string;
   items: AdminRecoveryJobItemRead[];
+}
+
+export interface AdminSearchSynonymValidationIssue {
+  level: 'error' | 'warning';
+  code: string;
+  message: string;
+  line_number: number | null;
+  term: string | null;
+}
+
+export interface AdminSearchSynonymValidationRead {
+  valid: boolean;
+  group_count: number;
+  compiled_key_count: number;
+  edge_count: number;
+  payload_bytes: number;
+  issues: AdminSearchSynonymValidationIssue[];
+}
+
+export interface AdminSearchSynonymRevisionRead {
+  id: string;
+  revision_number: number;
+  status: AdminSearchSynonymRevisionStatus;
+  source_text: string;
+  compiler_version: string;
+  compiled_hash: string | null;
+  validation: AdminSearchSynonymValidationRead;
+  change_note: string | null;
+  published_at: string | null;
+  created_at: string;
+  updated_at: string;
+  version: string;
+}
+
+export interface AdminSearchSynonymCatalogRead {
+  locale: AdminSearchSynonymLocale;
+  draft: AdminSearchSynonymRevisionRead;
+  published: AdminSearchSynonymRevisionRead | null;
+  history: AdminSearchSynonymRevisionRead[];
+}
+
+export interface AdminSearchSynonymSyncStateRead {
+  index_name: string;
+  status: AdminSearchSynonymSyncStatus;
+  desired_hash: string | null;
+  applied_hash: string | null;
+  actual_hash: string | null;
+  desired_revisions: Partial<Record<AdminSearchSynonymLocale, number>>;
+  last_task_uid: number | null;
+  requested_at: string | null;
+  last_checked_at: string | null;
+  last_applied_at: string | null;
+  safe_error: string | null;
+  updated_at: string | null;
+  version: string;
+}
+
+export interface AdminSearchSynonymDraftUpdatePayload {
+  request_id: string;
+  version: string;
+  source_text: string;
+  reason: string;
+}
+
+export interface AdminSearchSynonymMutationPayload {
+  request_id: string;
+  version: string;
+  reason: string;
+}
+
+export interface AdminSearchSynonymPublishPayload extends AdminSearchSynonymMutationPayload {
+  confirm_destructive: boolean;
+}
+
+export interface AdminSearchSynonymResetPayload extends AdminSearchSynonymMutationPayload {
+  revision_id?: string | null;
+}
+
+export interface AdminSearchSynonymSyncRetryPayload {
+  request_id: string;
+  version: string;
+  reason: string;
 }
 
 export interface AdminSourceRecoveryMutationPayload {

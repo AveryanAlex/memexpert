@@ -66,6 +66,9 @@ from memexpert.models.enums import (
     ModerationAction,
     ModerationReason,
     ModerationReportStatus,
+    SearchSynonymLocale,
+    SearchSynonymRevisionStatus,
+    SearchSynonymSyncStatus,
     SourceChannelBackfillJobStatus,
     SourceChannelPostStatus,
     SourceEngagementCaptureReason,
@@ -78,6 +81,11 @@ from memexpert.models.enums import (
     TelegramMediaFormat,
     TelegramSessionStatus,
     UserLanguage,
+)
+from memexpert.models.search_synonyms import (
+    SearchSynonymCatalog,
+    SearchSynonymRevision,
+    SearchSynonymSyncState,
 )
 from memexpert.models.user import (
     AccountDeletionLog,
@@ -142,6 +150,9 @@ EXPECTED_TABLES = {
     "recovery_job_items",
     "recovery_jobs",
     "runtime_heartbeats",
+    "search_synonym_catalogs",
+    "search_synonym_revisions",
+    "search_synonym_sync_states",
     "source_channels",
     "source_channel_backfill_attempts",
     "source_channel_backfill_jobs",
@@ -249,6 +260,9 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
     motd_table = metadata.tables["meme_of_the_day_selections"]
     pipeline_ingest_requests_table = metadata.tables["pipeline_ingest_requests"]
     pipeline_stage_attempts_table = metadata.tables["pipeline_stage_attempts"]
+    synonym_catalogs_table = metadata.tables["search_synonym_catalogs"]
+    synonym_revisions_table = metadata.tables["search_synonym_revisions"]
+    synonym_sync_states_table = metadata.tables["search_synonym_sync_states"]
     assert "invite_link" not in metadata.tables["collections"].c
     assert metadata.tables["users"].c["active_save_collection_id"].foreign_keys
     assert metadata.tables["collections"].c["owner_id"].foreign_keys
@@ -303,6 +317,23 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
     assert primary_file_fk.deferrable is True
     assert primary_file_fk.initially == "DEFERRED"
     assert _postgresql_where("uq_collections_one_favorites_per_owner", "collections") == "kind = 'favorites'"
+    assert any(
+        isinstance(constraint, UniqueConstraint)
+        and constraint.name == "uq_search_synonym_catalogs_locale"
+        for constraint in synonym_catalogs_table.constraints
+    )
+    assert _postgresql_where(
+        "uq_search_synonym_revisions_one_draft",
+        "search_synonym_revisions",
+    ) == "status = 'draft'"
+    assert _postgresql_where(
+        "uq_search_synonym_revisions_one_published",
+        "search_synonym_revisions",
+    ) == "status = 'published'"
+    assert synonym_revisions_table.c["catalog_id"].foreign_keys
+    assert synonym_revisions_table.c["created_by_admin_user_id"].foreign_keys
+    assert synonym_revisions_table.c["published_by_admin_user_id"].foreign_keys
+    assert synonym_sync_states_table.c["id"].primary_key
 
     user_relationships = sa_inspect(User).relationships
     meme_relationships = sa_inspect(Meme).relationships
@@ -314,6 +345,8 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
     telegram_session_relationships = sa_inspect(TelegramSession).relationships
     telegram_login_attempt_table = metadata.tables["telegram_session_login_attempts"]
     pipeline_ingest_request_relationships = sa_inspect(PipelineIngestRequest).relationships
+    synonym_catalog_relationships = sa_inspect(SearchSynonymCatalog).relationships
+    synonym_revision_relationships = sa_inspect(SearchSynonymRevision).relationships
 
     assert user_relationships["active_save_collection"].mapper.class_ is Collection
     assert user_relationships["owned_collections"].mapper.class_ is Collection
@@ -328,6 +361,9 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
     assert pipeline_ingest_request_relationships["materialized_meme"].mapper.class_ is Meme
     assert pipeline_ingest_request_relationships["materialized_meme_file"].mapper.class_ is MemeFile
     assert pipeline_ingest_request_relationships["matched_meme_file"].mapper.class_ is MemeFile
+    assert synonym_catalog_relationships["revisions"].mapper.class_ is SearchSynonymRevision
+    assert synonym_revision_relationships["catalog"].mapper.class_ is SearchSynonymCatalog
+    assert sa_inspect(SearchSynonymSyncState).primary_key[0].name == "id"
     rabbitmq_outbox_columns = sa_inspect(RabbitMQOutboxMessage).columns
     assert rabbitmq_outbox_columns["aggregate_id"] is not None
     assert rabbitmq_outbox_columns["message_id"] is not None
@@ -1197,6 +1233,22 @@ def test_sync_target_enum_values_are_locked_and_stable() -> None:
     # protects T02/T03/T04 against accidental reordering or renames.
     assert tuple(SyncTargetKind) == (SyncTargetKind.QDRANT, SyncTargetKind.MEILISEARCH)
     assert [member.value for member in SyncTargetKind] == ["qdrant", "meilisearch"]
+
+
+def test_search_synonym_enum_values_are_locked_and_stable() -> None:
+    assert [member.value for member in SearchSynonymLocale] == ["en", "ru"]
+    assert [member.value for member in SearchSynonymRevisionStatus] == [
+        "draft",
+        "published",
+        "archived",
+    ]
+    assert [member.value for member in SearchSynonymSyncStatus] == [
+        "idle",
+        "pending",
+        "syncing",
+        "synced",
+        "failed",
+    ]
     assert tuple(SyncTargetStatus) == (
         SyncTargetStatus.PENDING,
         SyncTargetStatus.PROCESSING,

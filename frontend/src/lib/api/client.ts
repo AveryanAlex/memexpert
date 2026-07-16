@@ -27,6 +27,14 @@ import type {
   AdminRecoveryWorkPageRead,
   AdminRecoveryBucket,
   AdminRecoveryWorkKind,
+  AdminSearchSynonymCatalogRead,
+  AdminSearchSynonymDraftUpdatePayload,
+  AdminSearchSynonymLocale,
+  AdminSearchSynonymMutationPayload,
+  AdminSearchSynonymPublishPayload,
+  AdminSearchSynonymResetPayload,
+  AdminSearchSynonymSyncRetryPayload,
+  AdminSearchSynonymSyncStateRead,
   AdminSourceBackfillPayload,
   AdminSourceBackfillListRead,
   AdminSourceRecoveryMutationPayload,
@@ -242,7 +250,8 @@ interface SeoCatalogPageRequest extends CatalogRequest {
 export class ApiError extends Error {
   constructor(
     readonly status: number,
-    message: string
+    message: string,
+    readonly detail?: unknown
   ) {
     super(message);
     this.name = 'ApiError';
@@ -686,6 +695,81 @@ export async function replayAdminSourcePost(
 
 export async function fetchAdminRecoverySummary(request: CatalogRequest): Promise<AdminRecoverySummaryRead> {
   return apiGet<AdminRecoverySummaryRead>('/api/v1/admin/recovery/summary', new URLSearchParams(), request);
+}
+
+export async function fetchAdminSearchSynonymCatalog(
+  request: CatalogRequest,
+  locale: AdminSearchSynonymLocale
+): Promise<AdminSearchSynonymCatalogRead> {
+  return apiGet<AdminSearchSynonymCatalogRead>(
+    `/api/v1/admin/search-synonyms/${encodeURIComponent(locale)}`,
+    new URLSearchParams(),
+    request
+  );
+}
+
+export async function updateAdminSearchSynonymDraft(
+  request: CatalogRequest & { body: AdminSearchSynonymDraftUpdatePayload },
+  locale: AdminSearchSynonymLocale
+): Promise<AdminSearchSynonymCatalogRead> {
+  return apiWrite<AdminSearchSynonymCatalogRead>(
+    `/api/v1/admin/search-synonyms/${encodeURIComponent(locale)}/draft`,
+    'PUT',
+    request
+  );
+}
+
+export async function importAdminSearchSynonymSeed(
+  request: CatalogRequest & { body: AdminSearchSynonymMutationPayload },
+  locale: AdminSearchSynonymLocale
+): Promise<AdminSearchSynonymCatalogRead> {
+  return apiWrite<AdminSearchSynonymCatalogRead>(
+    `/api/v1/admin/search-synonyms/${encodeURIComponent(locale)}/draft/import-seed`,
+    'POST',
+    request
+  );
+}
+
+export async function publishAdminSearchSynonymDraft(
+  request: CatalogRequest & { body: AdminSearchSynonymPublishPayload },
+  locale: AdminSearchSynonymLocale
+): Promise<AdminSearchSynonymCatalogRead> {
+  return apiWrite<AdminSearchSynonymCatalogRead>(
+    `/api/v1/admin/search-synonyms/${encodeURIComponent(locale)}/draft/publish`,
+    'POST',
+    request
+  );
+}
+
+export async function resetAdminSearchSynonymDraft(
+  request: CatalogRequest & { body: AdminSearchSynonymResetPayload },
+  locale: AdminSearchSynonymLocale
+): Promise<AdminSearchSynonymCatalogRead> {
+  return apiWrite<AdminSearchSynonymCatalogRead>(
+    `/api/v1/admin/search-synonyms/${encodeURIComponent(locale)}/draft/reset`,
+    'POST',
+    request
+  );
+}
+
+export async function fetchAdminSearchSynonymSyncState(
+  request: CatalogRequest
+): Promise<AdminSearchSynonymSyncStateRead> {
+  return apiGet<AdminSearchSynonymSyncStateRead>(
+    '/api/v1/admin/search-synonyms/sync',
+    new URLSearchParams(),
+    request
+  );
+}
+
+export async function retryAdminSearchSynonymSync(
+  request: CatalogRequest & { body: AdminSearchSynonymSyncRetryPayload }
+): Promise<AdminSearchSynonymSyncStateRead> {
+  return apiWrite<AdminSearchSynonymSyncStateRead>(
+    '/api/v1/admin/search-synonyms/sync/retry',
+    'POST',
+    request
+  );
 }
 
 export async function fetchAdminRecoveryWork(
@@ -1294,7 +1378,11 @@ async function apiWrite<T>(path: string, method: 'DELETE' | 'PATCH' | 'POST' | '
   const payload = await readJson(response);
 
   if (!response.ok) {
-    throw new ApiError(response.status, readErrorDetail(payload) ?? `API returned ${response.status}`);
+    throw new ApiError(
+      response.status,
+      readErrorDetail(payload) ?? `API returned ${response.status}`,
+      isRecord(payload) && isRecord(payload.detail) ? payload.detail : undefined
+    );
   }
 
   return payload as T;
@@ -1391,6 +1479,7 @@ function readErrorDetail(payload: unknown): string | null {
   const detail = payload.detail;
   if (typeof detail === 'string') return detail;
   if (Array.isArray(detail)) return formatValidationDetails(detail);
+  if (isRecord(detail) && typeof detail.message === 'string') return detail.message;
 
   return null;
 }

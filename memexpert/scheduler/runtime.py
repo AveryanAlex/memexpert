@@ -7,6 +7,7 @@ import inspect
 import logging
 import signal
 from contextlib import suppress
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -96,14 +97,16 @@ async def run_scheduler_runtime(
                 async with health_reporter.operation(f"scheduler_job:{job_definition.id}"):
                     await run_logged_job(job_definition.id, job_definition.action)
 
-            scheduler_instance.add_job(
-                _job_runner,
-                trigger=IntervalTrigger(seconds=cast("Any", definition.trigger_seconds)),
-                id=definition.id,
-                replace_existing=True,
-                coalesce=True,
-                max_instances=1,
-            )
+            job_options: dict[str, object] = {
+                "trigger": IntervalTrigger(seconds=cast("Any", definition.trigger_seconds)),
+                "id": definition.id,
+                "replace_existing": True,
+                "coalesce": True,
+                "max_instances": 1,
+            }
+            if definition.run_on_startup:
+                job_options["next_run_time"] = datetime.now(UTC)
+            scheduler_instance.add_job(_job_runner, **job_options)
 
         logger.info(
             "scheduler_runtime_started",

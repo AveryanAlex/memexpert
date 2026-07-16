@@ -465,6 +465,31 @@ class SyncTargetStatus(StrEnum):
     FAILED = "failed"
 
 
+class SearchSynonymLocale(StrEnum):
+    """Separately curated synonym catalogs supported by the search index."""
+
+    EN = "en"
+    RU = "ru"
+
+
+class SearchSynonymRevisionStatus(StrEnum):
+    """Lifecycle states for versioned synonym catalog revisions."""
+
+    DRAFT = "draft"
+    PUBLISHED = "published"
+    ARCHIVED = "archived"
+
+
+class SearchSynonymSyncStatus(StrEnum):
+    """Durable lifecycle for the combined Meilisearch synonym settings map."""
+
+    IDLE = "idle"
+    PENDING = "pending"
+    SYNCING = "syncing"
+    SYNCED = "synced"
+    FAILED = "failed"
+
+
 class TelegramSessionStatus(StrEnum):
     """Operational lifecycle for a Telethon userbot session.
 
@@ -541,6 +566,9 @@ __all__ = [
     "ModerationAction",
     "ModerationReason",
     "ModerationReportStatus",
+    "SearchSynonymLocale",
+    "SearchSynonymRevisionStatus",
+    "SearchSynonymSyncStatus",
     "SourceEngagementCaptureReason",
     "SourceEngagementCommentsState",
     "SourceEngagementFetchStatus",

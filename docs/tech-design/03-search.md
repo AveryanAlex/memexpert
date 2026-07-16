@@ -119,8 +119,33 @@ share the same file identity.
   the final permission predicate.
 - **Sortable/ranking hints:** derived `popularity_score`, `like_count`, `quality_score`,
   `created_at`, `updated_at`, and `search_index_algorithm_version`.
-- **Russian stop words** configured
-- **Typo tolerance** enabled (min 4 chars for 1 typo, 8 for 2)
+
+The document-sync client explicitly reconciles filterable attributes when it
+first ensures the index. Stop words, custom typo-tolerance thresholds, and
+searchable attributes otherwise use Meilisearch defaults.
+
+Curated synonyms have a separate control plane. PostgreSQL stores independent
+English and Russian catalogs with one mutable draft and immutable published
+history. The compiler normalizes newline/comma mutual groups into deterministic
+directional maps, records its compiler version and validation snapshot, and
+warns when a phrase exceeds Meilisearch's three-token source-key limit. Long
+phrases may still be targets. Publishing rejects an empty effective catalog,
+cross-locale key conflicts, and unconfirmed large key reductions.
+
+Publishing changes only durable desired state. The singleton scheduler is the
+sole settings writer: on startup and periodically it combines all published
+locale snapshots, recompiles their source to verify compiler version, snapshot,
+and hash integrity, compares desired and observed provider hashes, submits one
+full asynchronous replacement, waits for the Meilisearch task, and records the
+applied revision set or a safe retryable failure. Every state write verifies
+that the publication generation is still current; a superseded in-flight task
+cannot overwrite a newer publish and is followed by an immediate convergence
+pass. Every locale and the combined map must be non-empty. The per-run HTTP
+client is closed after reconciliation. Operators manage drafts, history,
+publication, and retry state at
+`/admin/search/synonyms`. Exact query-side expansion behavior and limitations
+are documented in
+[Meilisearch Synonym Behavior](../research/meilisearch-synonym-behavior.md).
 
 Search results return `meme_id` lists from Meilisearch/Qdrant, then fetch full display data from PostgreSQL.
 

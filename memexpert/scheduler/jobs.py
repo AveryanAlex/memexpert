@@ -14,6 +14,10 @@ from memexpert.messaging.rabbitmq_outbox_runtime import (
     run_rabbitmq_outbox_publisher_batch,
 )
 from memexpert.services.admin_telegram_login import run_telegram_login_cleanup_batch
+from memexpert.services.meilisearch_settings_reconcile import (
+    meilisearch_settings_reconcile_result_log_extra,
+    run_meilisearch_settings_reconcile,
+)
 from memexpert.services.meme_of_the_day import (
     meme_of_the_day_result_log_extra,
     run_scheduler_meme_of_the_day_refresh,
@@ -42,6 +46,7 @@ JOB_ID_MATERIALIZED_VIEW_REFRESH = "materialized-view-refresh"
 JOB_ID_SOURCE_ENGAGEMENT_CAPTURE = "source-engagement-capture"
 JOB_ID_MOTD = "motd"
 JOB_ID_SEARCH_INDEX_SYNC = "search-index-sync"
+JOB_ID_MEILISEARCH_SETTINGS_RECONCILE = "meilisearch-settings-reconcile"
 JOB_ID_SEO_BACKLOG_BATCHES = "seo-backlog-batches"
 JOB_ID_RABBITMQ_OUTBOX_PUBLISHER = "rabbitmq-outbox-publisher"
 JOB_ID_RECOVERY_DISPATCH = "recovery-dispatch"
@@ -58,6 +63,7 @@ class SchedulerJobDefinition:
     action: SchedulerJobAction
     enabled: bool
     description: str
+    run_on_startup: bool = False
 
 
 def build_scheduler_job_definitions(settings: Settings, engine: AsyncEngine) -> tuple[SchedulerJobDefinition, ...]:
@@ -89,6 +95,14 @@ def build_scheduler_job_definitions(settings: Settings, engine: AsyncEngine) -> 
             action=_build_search_index_sync_job_action(settings, engine),
             enabled=settings.scheduler_search_index_sync_enabled,
             description="Sync the search index.",
+        ),
+        SchedulerJobDefinition(
+            id=JOB_ID_MEILISEARCH_SETTINGS_RECONCILE,
+            trigger_seconds=settings.scheduler_meilisearch_settings_reconcile_interval_seconds,
+            action=_build_meilisearch_settings_reconcile_job_action(settings, engine),
+            enabled=settings.scheduler_meilisearch_settings_reconcile_enabled,
+            description="Reconcile published synonym settings into Meilisearch.",
+            run_on_startup=True,
         ),
         SchedulerJobDefinition(
             id=JOB_ID_SEO_BACKLOG_BATCHES,
@@ -207,6 +221,24 @@ def _build_search_index_sync_job_action(settings: Settings, engine: AsyncEngine)
     return _action
 
 
+def _build_meilisearch_settings_reconcile_job_action(
+    settings: Settings,
+    engine: AsyncEngine,
+) -> SchedulerJobAction:
+    async def _action() -> None:
+        session_factory = build_async_session_factory(engine)
+        result = await run_meilisearch_settings_reconcile(session_factory, settings=settings)
+        logger.info(
+            "scheduler_job_batch_result",
+            extra=meilisearch_settings_reconcile_result_log_extra(
+                JOB_ID_MEILISEARCH_SETTINGS_RECONCILE,
+                result,
+            ),
+        )
+
+    return _action
+
+
 def _build_seo_backlog_batches_job_action(settings: Settings, engine: AsyncEngine) -> SchedulerJobAction:
     async def _action() -> None:
         session_factory = build_async_session_factory(engine)
@@ -311,6 +343,7 @@ def _build_telegram_login_cleanup_job_action(settings: Settings, engine: AsyncEn
 
 __all__ = [
     "JOB_ID_MATERIALIZED_VIEW_REFRESH",
+    "JOB_ID_MEILISEARCH_SETTINGS_RECONCILE",
     "JOB_ID_MOTD",
     "JOB_ID_PIPELINE_CAPACITY_REFRESH",
     "JOB_ID_RABBITMQ_OUTBOX_PUBLISHER",

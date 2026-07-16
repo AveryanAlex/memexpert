@@ -17,6 +17,7 @@ describe('admin navigation', () => {
       'Sources',
       'Moderation',
       'Blocked patterns',
+      'Synonyms',
       'SEO',
       'Templates',
       'Telegram accounts'
@@ -31,6 +32,7 @@ describe('admin navigation', () => {
     expect(body).toContain('Sources');
     expect(body).toContain('Moderation');
     expect(body).toContain('Blocked patterns');
+    expect(body).toContain('Synonyms');
     expect(body).toContain('SEO');
     expect(body).toContain('Templates');
     expect(body).toContain('Telegram accounts');
@@ -44,6 +46,7 @@ describe('admin navigation', () => {
     const sources = ADMIN_NAVIGATION_ITEMS[3];
     const moderation = ADMIN_NAVIGATION_ITEMS[4];
     const patterns = ADMIN_NAVIGATION_ITEMS[5];
+    const synonyms = ADMIN_NAVIGATION_ITEMS[6];
 
     expect(isAdminNavigationItemActive(overview, '/admin')).toBe(true);
     expect(isAdminNavigationItemActive(overview, '/admin/sources')).toBe(false);
@@ -52,6 +55,7 @@ describe('admin navigation', () => {
     expect(isAdminNavigationItemActive(sources, '/admin/sources/new')).toBe(true);
     expect(isAdminNavigationItemActive(moderation, '/admin/moderation/patterns')).toBe(false);
     expect(isAdminNavigationItemActive(patterns, '/admin/moderation/patterns/edit')).toBe(true);
+    expect(isAdminNavigationItemActive(synonyms, '/admin/search/synonyms')).toBe(true);
     expect(getActiveAdminNavigationItem('/admin/moderation/patterns')).toBe(patterns);
     expect(getActiveAdminNavigationItem('/admin/memes/123')).toBe(moderation);
     expect(isAdminNavigationItemActive(ADMIN_CATALOG_LINK, '/')).toBe(false);

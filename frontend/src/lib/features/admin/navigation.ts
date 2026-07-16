@@ -37,6 +37,7 @@ export const ADMIN_NAVIGATION_GROUPS: AdminNavigationGroup[] = [
   {
     label: 'Content',
     items: [
+      { label: 'Synonyms', href: '/admin/search/synonyms', match: 'prefix' },
       { label: 'SEO', href: '/admin/content/seo', match: 'prefix' },
       { label: 'Templates', href: '/admin/content/templates', match: 'prefix' }
     ]

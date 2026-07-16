@@ -2,7 +2,12 @@
 
 ## How Search Works
 
-Search combines full-text search (OCR text, tags, captions, Russian morphology via Meilisearch), semantic search (Voyage AI multimodal embeddings via Qdrant), popularity/trending signals, and user-specific recommendation signals.
+Search combines full-text search (OCR text, tags, captions, and curated
+same-language aliases in Meilisearch), semantic search (Voyage AI multimodal
+embeddings via Qdrant), popularity/trending signals, and user-specific
+recommendation signals. Meilisearch synonym expansion is not stemming or a
+general morphology engine: operators must curate useful lexical and meme-culture
+variants explicitly, such as Russian inflections or `жаба,лягушка`.
 
 Ranking weights are **tunable algorithm parameters**, not product requirements. The initial implementation should expose/configure weights, record `algorithm_version`, and log per-result score components so they can be tuned after real traffic and analytics exist.
 

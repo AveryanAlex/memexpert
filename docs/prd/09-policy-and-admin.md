@@ -40,6 +40,7 @@ controls are diagnostic rather than default operator language.
 | `/admin/sources` | Suggestions, public Telegram add flow, health, assignment, ingestion settings, pause/resume, and source removal. |
 | `/admin/telegram` | Telegram account connection, validation, account policy, and disconnect. |
 | `/admin/recovery` | Failed/stuck/dead-lettered work, bounded batch preview, audited retry/resume, and job progress. |
+| `/admin/search/synonyms` | English and Russian synonym drafts, validation, publishing, revision restore, and Meilisearch sync status. |
 | `/admin/moderation` | Report queue, safe preview, direct review, and recent decisions. |
 | `/admin/moderation/patterns` | Specialist blocked perceptual-hash workspace. |
 | `/admin/content/seo` | Paginated SEO review queue. `/admin/content` redirects here. |
@@ -151,6 +152,33 @@ services from the product. Historical failures become visible after upgrades
 without being replayed automatically. Telegram poison posts are isolated after
 three attempts so one message cannot permanently block the rest of a channel's
 history.
+
+### Search synonym management
+
+`/admin/search/synonyms` manages separate English and Russian same-language
+catalogs in a bulk newline/comma format. PostgreSQL is the source of truth.
+Every locale has one mutable draft plus immutable published and archived
+revisions; restoring history copies an old revision into the draft rather than
+mutating history. Translation aliases remain a separate future catalog and are
+not mixed into either locale.
+
+Saving a draft normalizes and validates it without changing live search.
+Publishing requires an effective Meilisearch map, rejects conflicting keys
+across the two locale snapshots, and requires explicit confirmation when it
+would remove a large share of active keys. Meilisearch's source-key token limit
+is surfaced in validation: long phrases may remain useful targets, while a
+group with no eligible key is inactive. All mutations require an operator
+reason and idempotency request ID. Draft, publish, and restore mutations also
+require the version displayed during review. Sync retry is intentionally
+idempotent and accepts a stale monitoring-row version because scheduler health
+checks advance that row independently of desired state.
+
+Publishing only records durable desired state. The scheduler is the sole
+Meilisearch settings writer and asynchronously replaces the complete combined
+published map. The page exposes desired, applied, and observed hashes, the
+provider task, a safe error, and an audited retry action. An empty effective map
+is never submitted, so a missing or invalid publication cannot accidentally
+clear live synonyms.
 
 ### Telegram accounts
 

@@ -65,6 +65,9 @@ from memexpert.models.enums import (
     RecoveryJobItemStatus,
     RecoveryJobStatus,
     RecoveryWorkKind,
+    SearchSynonymLocale,
+    SearchSynonymRevisionStatus,
+    SearchSynonymSyncStatus,
     SourceChannelBackfillJobStatus,
     SourceChannelPostStatus,
     SourceEngagementCaptureReason,
@@ -89,6 +92,11 @@ from memexpert.models.operations import (
     RecoveryJobItem,
     RuntimeHeartbeat,
     SourceChannelBackfillAttempt,
+)
+from memexpert.models.search_synonyms import (
+    SearchSynonymCatalog,
+    SearchSynonymRevision,
+    SearchSynonymSyncState,
 )
 from memexpert.models.user import (
     AccountDeletionLog,
@@ -176,6 +184,12 @@ __all__ = [
     "RecoveryJobStatus",
     "RecoveryWorkKind",
     "RuntimeHeartbeat",
+    "SearchSynonymCatalog",
+    "SearchSynonymLocale",
+    "SearchSynonymRevision",
+    "SearchSynonymRevisionStatus",
+    "SearchSynonymSyncState",
+    "SearchSynonymSyncStatus",
     "SourceChannel",
     "SourceChannelBackfillJob",
     "SourceChannelBackfillAttempt",

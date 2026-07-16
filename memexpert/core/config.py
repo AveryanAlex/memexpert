@@ -142,6 +142,7 @@ class Settings(BaseSettings):
     pipeline_qdrant_timeout_seconds: float = Field(default=10.0, gt=0.0, le=600.0)
     pipeline_meilisearch_index_name: str = "memexpert-memes"
     pipeline_meilisearch_timeout_seconds: float = Field(default=10.0, gt=0.0, le=600.0)
+    meilisearch_settings_task_timeout_seconds: float = Field(default=600.0, gt=0.0, le=3600.0)
     recommendation_positive_lookback_hours: int = Field(default=168, ge=1, le=2160)
     recommendation_impression_lookback_hours: int = Field(default=72, ge=1, le=720)
     recommendation_positive_signal_limit: int = Field(default=50, ge=1, le=500)
@@ -203,6 +204,8 @@ class Settings(BaseSettings):
     scheduler_search_index_sync_interval_seconds: float = Field(default=600.0, gt=0.0)
     scheduler_search_index_sync_batch_size: int = Field(default=50, ge=1, le=1000)
     scheduler_search_index_sync_processing_timeout_seconds: float = Field(default=900.0, gt=0.0)
+    scheduler_meilisearch_settings_reconcile_enabled: bool = True
+    scheduler_meilisearch_settings_reconcile_interval_seconds: float = Field(default=60.0, gt=0.0)
     scheduler_seo_backlog_batches_enabled: bool = True
     scheduler_seo_backlog_batches_interval_seconds: float = Field(default=900.0, gt=0.0)
     scheduler_seo_backlog_batch_size: int = Field(default=25, ge=1, le=500)

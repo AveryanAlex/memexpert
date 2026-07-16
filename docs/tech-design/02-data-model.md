@@ -132,6 +132,30 @@ Design notes:
 - `model_version` enables future model upgrades: recompute with new model, keep both, switch Qdrant atomically.
 - Text query embeddings act as a query cache — intentionally no eviction, as the table size is bounded by unique query volume.
 
+### SearchSynonymCatalog and SearchSynonymRevision
+
+`search_synonym_catalogs` has one row per supported locale (`en`, `ru`). A
+catalog owns exactly one mutable draft revision and at most one published
+revision; older publications are archived rather than overwritten.
+
+`search_synonym_revisions` stores the authored newline/comma source, lifecycle
+status and revision number, deterministic compiled map, compiler version and
+hash, validation/stats snapshots, optimistic-lock version, change note, admin
+attribution, and publication/archive timestamps. Partial unique indexes enforce
+one draft and one published revision per catalog. Published and archived rows
+are immutable application history; rollback copies a selected snapshot into the
+draft and requires a later publish.
+
+### SearchSynonymSyncState
+
+`search_synonym_sync_states` is a singleton durable reconciliation record for
+the combined Meilisearch synonym map. It stores desired, applied, and last
+observed hashes; desired/applied locale revision IDs; sync status; provider task
+UID; bounded error text; attempt/success/failure timestamps; and an
+monotonic row version. Publication updates desired state transactionally.
+Only the scheduler performs the external settings replacement and advances
+applied state.
+
 ### AccountMergeLog
 
 Audit trail for guest → full account merges. Key fields: `guest_account_id`, `target_account_id`, `favorites_transferred`, `views_transferred`, `interaction_events_transferred`, `inline_usage_events_transferred`.

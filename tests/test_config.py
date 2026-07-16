@@ -245,6 +245,9 @@ def test_settings_parse_scheduler_contracts() -> None:
             "scheduler_search_index_sync_interval_seconds": 180.0,
             "scheduler_search_index_sync_batch_size": 7,
             "scheduler_search_index_sync_processing_timeout_seconds": 45.0,
+            "scheduler_meilisearch_settings_reconcile_enabled": False,
+            "scheduler_meilisearch_settings_reconcile_interval_seconds": 75.0,
+            "meilisearch_settings_task_timeout_seconds": 240.0,
             "scheduler_seo_backlog_batches_interval_seconds": 240.0,
             "scheduler_seo_backlog_batch_size": 9,
             "scheduler_telegram_login_cleanup_enabled": False,
@@ -273,6 +276,9 @@ def test_settings_parse_scheduler_contracts() -> None:
     assert settings.scheduler_search_index_sync_interval_seconds == 180.0
     assert settings.scheduler_search_index_sync_batch_size == 7
     assert settings.scheduler_search_index_sync_processing_timeout_seconds == 45.0
+    assert settings.scheduler_meilisearch_settings_reconcile_enabled is False
+    assert settings.scheduler_meilisearch_settings_reconcile_interval_seconds == 75.0
+    assert settings.meilisearch_settings_task_timeout_seconds == 240.0
     assert settings.scheduler_seo_backlog_batches_interval_seconds == 240.0
     assert settings.scheduler_seo_backlog_batch_size == 9
     assert settings.scheduler_telegram_login_cleanup_enabled is False
@@ -305,6 +311,9 @@ def test_settings_scheduler_batch_job_defaults_match_design() -> None:
     assert settings.motd_quality_weight == 0.15
     assert settings.scheduler_search_index_sync_batch_size == 50
     assert settings.scheduler_search_index_sync_processing_timeout_seconds == 900.0
+    assert settings.scheduler_meilisearch_settings_reconcile_enabled is True
+    assert settings.scheduler_meilisearch_settings_reconcile_interval_seconds == 60.0
+    assert settings.meilisearch_settings_task_timeout_seconds == 600.0
     assert settings.scheduler_seo_backlog_batch_size == 25
 
 
@@ -314,6 +323,8 @@ def test_settings_scheduler_batch_job_defaults_match_design() -> None:
         ("scheduler_search_index_sync_batch_size", 0),
         ("scheduler_source_engagement_capture_per_session_batch_size", 0),
         ("scheduler_search_index_sync_processing_timeout_seconds", 0.0),
+        ("scheduler_meilisearch_settings_reconcile_interval_seconds", 0.0),
+        ("meilisearch_settings_task_timeout_seconds", 0.0),
         ("scheduler_seo_backlog_batch_size", 0),
         ("motd_candidate_lookback_days", 0),
         ("motd_candidate_limit", 0),

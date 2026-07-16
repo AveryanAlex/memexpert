@@ -42,6 +42,7 @@ FROM runtime-base AS main-app
 
 COPY memexpert/ ./memexpert/
 COPY scripts/ ./scripts/
+COPY docs/research/ ./docs/research/
 COPY alembic.ini ./
 COPY alembic/ ./alembic/
 RUN --mount=from=uv,source=/uv,target=/usr/local/bin/uv \

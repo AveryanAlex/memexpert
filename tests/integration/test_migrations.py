@@ -916,3 +916,73 @@ async def test_0033_repairs_legacy_crawler_visibility_and_post_classify_readines
     repaired = {row.id: (row.visibility_mode, row.is_public, row.status) for row in rows}
     assert repaired[crawler_meme_id] == ("auto", True, "ready")
     assert repaired[hidden_meme_id] == ("force_private", False, "ready")
+
+
+async def test_0036_seeds_locale_synonym_drafts_and_idle_sync_state(
+    empty_public_schema: tuple[AsyncEngine, str],
+) -> None:
+    engine, database_url = empty_public_schema
+    config = _build_alembic_config(database_url)
+
+    await _run_alembic_command(command.upgrade, config, "0035")
+    await _run_alembic_command(command.upgrade, config, "0036")
+
+    async with engine.connect() as connection:
+        catalogs = (
+            await connection.execute(
+                text(
+                    """
+                    SELECT catalog.locale, revision.revision_number, revision.status,
+                           revision.source_text, revision.compiler_version,
+                           revision.validation ->> 'valid' AS valid,
+                           revision.version
+                    FROM search_synonym_catalogs AS catalog
+                    JOIN search_synonym_revisions AS revision
+                      ON revision.catalog_id = catalog.id
+                    ORDER BY catalog.locale
+                    """
+                )
+            )
+        ).all()
+        sync_state = (
+            await connection.execute(
+                text(
+                    """
+                    SELECT id, status, desired_hash, desired_revision_ids,
+                           applied_revision_ids, version
+                    FROM search_synonym_sync_states
+                    """
+                )
+            )
+        ).one()
+        index_names = set(
+            (
+                await connection.execute(
+                    text(
+                        """
+                        SELECT indexname
+                        FROM pg_indexes
+                        WHERE schemaname = current_schema()
+                          AND tablename = 'search_synonym_revisions'
+                        """
+                    )
+                )
+            ).scalars()
+        )
+
+    assert [tuple(row) for row in catalogs] == [
+        ("en", 1, "draft", "", "meili_synonyms_v1", "false", 1),
+        ("ru", 1, "draft", "", "meili_synonyms_v1", "false", 1),
+    ]
+    assert tuple(sync_state) == ("meilisearch", "idle", None, {}, {}, 1)
+    assert {
+        "uq_search_synonym_revisions_one_draft",
+        "uq_search_synonym_revisions_one_published",
+    }.issubset(index_names)
+
+    await _run_alembic_command(command.downgrade, config, "0035")
+    assert {
+        "search_synonym_catalogs",
+        "search_synonym_revisions",
+        "search_synonym_sync_states",
+    }.isdisjoint(await _get_table_names(engine))
