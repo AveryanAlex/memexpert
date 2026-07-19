@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import io
 import json
+import logging
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -31,6 +32,10 @@ from memexpert.models.enums import ContentKind
 
 if TYPE_CHECKING:
     import uuid
+
+logger = logging.getLogger(__name__)
+
+_SUBPROCESS_REAP_TIMEOUT_SECONDS = 5.0
 
 _IMAGE_FORMAT_TO_MIME_TYPE: dict[str, str] = {
     "GIF": "image/gif",
@@ -65,13 +70,41 @@ class SubprocessMediaCommandRunner:
             async with asyncio.timeout(timeout_seconds):
                 stdout, stderr = await process.communicate()
         except TimeoutError as exc:
-            process.kill()
-            with contextlib.suppress(ProcessLookupError):
-                await process.wait()
+            await _kill_and_reap_process(process)
             raise MediaTimeoutError(f"Timed out after {timeout_seconds:.2f}s while running {' '.join(args)}.") from exc
+        except BaseException:
+            await _kill_and_reap_process(process)
+            raise
 
         returncode = process.returncode if process.returncode is not None else -1
         return CommandResult(args=args, returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+async def _kill_and_reap_process(process: asyncio.subprocess.Process) -> None:
+    """Kill a command child and bound reaping so shutdown cannot hang forever."""
+
+    if process.returncode is None:
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
+
+    try:
+        async with asyncio.timeout(_SUBPROCESS_REAP_TIMEOUT_SECONDS):
+            await process.wait()
+    except TimeoutError:
+        logger.error(
+            "media_subprocess_reap_timed_out",
+            extra={"event": "media_subprocess_reap_timed_out"},
+        )
+    except asyncio.CancelledError:
+        logger.warning(
+            "media_subprocess_reap_cancelled",
+            extra={"event": "media_subprocess_reap_cancelled"},
+        )
+    except Exception:
+        logger.exception(
+            "media_subprocess_reap_failed",
+            extra={"event": "media_subprocess_reap_failed"},
+        )
 
 
 class PipelineMediaProcessor:

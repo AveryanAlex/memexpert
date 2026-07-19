@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import logging
 import shlex
 import tempfile
 from dataclasses import dataclass
@@ -18,6 +20,9 @@ if TYPE_CHECKING:
     from memexpert.media.contracts import PipelineMediaProcessorProtocol
 
 PADDLE_OCR_CPU_THREADS = 1
+_SUBPROCESS_REAP_TIMEOUT_SECONDS = 5.0
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,11 +243,13 @@ class PipelineOCRProcessor:
             async with asyncio.timeout(self._settings.pipeline_ocr_timeout_seconds):
                 stdout, stderr = await process.communicate()
         except TimeoutError as exc:
-            process.kill()
-            await process.wait()
+            await _kill_and_reap_process(process)
             raise OCRTimeoutError(
                 f"Timed out after {self._settings.pipeline_ocr_timeout_seconds:.2f}s while running {purpose}."
             ) from exc
+        except BaseException:
+            await _kill_and_reap_process(process)
+            raise
 
         if process.returncode != 0:
             rendered_stderr = stderr.decode("utf-8", errors="replace").strip()
@@ -256,6 +263,33 @@ class PipelineOCRProcessor:
             raise OCRMalformedOutputError(f"{purpose} returned malformed JSON.") from exc
 
         return _parse_command_payload(payload, purpose=purpose)
+
+
+async def _kill_and_reap_process(process: asyncio.subprocess.Process) -> None:
+    """Kill a command child and bound reaping so shutdown cannot hang forever."""
+
+    if process.returncode is None:
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
+
+    try:
+        async with asyncio.timeout(_SUBPROCESS_REAP_TIMEOUT_SECONDS):
+            await process.wait()
+    except TimeoutError:
+        logger.error(
+            "ocr_subprocess_reap_timed_out",
+            extra={"event": "ocr_subprocess_reap_timed_out"},
+        )
+    except asyncio.CancelledError:
+        logger.warning(
+            "ocr_subprocess_reap_cancelled",
+            extra={"event": "ocr_subprocess_reap_cancelled"},
+        )
+    except Exception:
+        logger.exception(
+            "ocr_subprocess_reap_failed",
+            extra={"event": "ocr_subprocess_reap_failed"},
+        )
 
 
 class FakeOCRProcessor:

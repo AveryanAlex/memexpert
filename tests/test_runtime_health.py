@@ -30,6 +30,13 @@ async def test_runtime_health_reporter_becomes_ready_and_keeps_heartbeating(tmp_
 
         reporter.mark_ready()
         first = check_runtime_health(health_file, pid_is_alive=lambda _pid: True)
+        assert first["lifecycle_state"] == "running"
+
+        reporter.mark_draining()
+        draining = check_runtime_health(health_file, pid_is_alive=lambda _pid: True)
+        assert draining["ready"] is True
+        assert draining["lifecycle_state"] == "draining"
+
         await asyncio.sleep(0.03)
         second = check_runtime_health(health_file, pid_is_alive=lambda _pid: True)
 
@@ -55,6 +62,29 @@ async def test_runtime_health_fails_an_overdue_tracked_operation(tmp_path: Path)
                     stale_after_seconds=10.0,
                     pid_is_alive=lambda _pid: True,
                 )
+    finally:
+        await reporter.stop()
+
+
+async def test_runtime_health_keeps_starting_overdue_operation_live_while_draining(tmp_path: Path) -> None:
+    health_file = tmp_path / "runtime-health.json"
+    reporter = RuntimeHealthReporter(path=health_file, service="worker", operation_timeout_seconds=10.0)
+    await reporter.start()
+    try:
+        async with reporter.operation("ocr", timeout_seconds=2.0):
+            reporter.mark_draining()
+            payload = json.loads(health_file.read_text(encoding="utf-8"))
+            deadline_at = payload["operations"][0]["deadline_at"]
+
+            checked = check_runtime_health(
+                health_file,
+                now=deadline_at + 0.1,
+                stale_after_seconds=10.0,
+                pid_is_alive=lambda _pid: True,
+            )
+
+            assert checked["lifecycle_state"] == "draining"
+            assert checked["ready"] is False
     finally:
         await reporter.stop()
 

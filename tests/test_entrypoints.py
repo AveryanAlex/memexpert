@@ -147,7 +147,7 @@ async def test_run_bot_command_registration_failure_logs_raises_and_skips_pollin
 def test_workers_main_runs_async_pipeline_runtime() -> None:
     with (
         patch("memexpert.workers.main.asyncio.run") as asyncio_run,
-        patch("memexpert.workers.main.run_pipeline_runtime", new_callable=AsyncMock) as run_pipeline_runtime,
+        patch("memexpert.workers.main.run_worker_runtime", new_callable=AsyncMock) as run_worker_runtime,
     ):
         workers_main(["--role", "ocr"])
 
@@ -155,7 +155,7 @@ def test_workers_main_runs_async_pipeline_runtime() -> None:
     coroutine = asyncio_run.call_args.args[0]
     assert inspect.iscoroutine(coroutine)
     coroutine.close()
-    run_pipeline_runtime.assert_called_once_with(role=WorkerRole.OCR)
+    run_worker_runtime.assert_called_once_with(role=WorkerRole.OCR)
 
 
 def test_scheduler_main_runs_async_scheduler_runtime() -> None:

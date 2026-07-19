@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shlex
@@ -56,6 +57,35 @@ class StaticPreviewMediaProcessor:
     async def extract_preview_frame(self, *, filename: str, content_type: str, media_bytes: bytes) -> bytes:
         _ = (filename, content_type, media_bytes)
         return self._preview_frame_bytes
+
+
+class PendingSubprocess:
+    def __init__(self) -> None:
+        self.returncode: int | None = None
+        self.communicate_started = asyncio.Event()
+        self._communicate_release = asyncio.Event()
+        self.kill_calls = 0
+        self.wait_calls = 0
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        self.communicate_started.set()
+        await self._communicate_release.wait()
+        return b"", b""
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+
+    async def wait(self) -> int:
+        self.wait_calls += 1
+        self.returncode = -9
+        return self.returncode
+
+
+class UnreapableSubprocess(PendingSubprocess):
+    async def wait(self) -> int:
+        self.wait_calls += 1
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
 
 
 @pytest.mark.asyncio
@@ -214,6 +244,100 @@ async def test_paddle_command_timeout_is_reported_as_ocr_timeout(
             media_bytes=b"original-bytes",
             source_object_key="pipeline/originals/meme.png",
         )
+
+
+@pytest.mark.asyncio
+async def test_ocr_command_timeout_kills_and_reaps_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = PendingSubprocess()
+
+    async def create_subprocess(*_args: object, **_kwargs: object) -> PendingSubprocess:
+        return process
+
+    monkeypatch.setattr(ocr_module.asyncio, "create_subprocess_exec", create_subprocess)
+    processor = PipelineOCRProcessor(
+        settings=Settings(pipeline_ocr_timeout_seconds=0.01),
+        media_processor=StaticPreviewMediaProcessor(b"fake-preview-bytes"),
+    )
+
+    with pytest.raises(OCRTimeoutError):
+        await processor._run_ocr_command(
+            command="fake-ocr {input}",
+            image_path=tmp_path / "preview.png",
+            purpose="test OCR command",
+        )
+
+    assert process.kill_calls == 1
+    assert process.wait_calls == 1
+    assert process.returncode == -9
+
+
+@pytest.mark.asyncio
+async def test_ocr_command_cancellation_kills_and_reaps_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = PendingSubprocess()
+
+    async def create_subprocess(*_args: object, **_kwargs: object) -> PendingSubprocess:
+        return process
+
+    monkeypatch.setattr(ocr_module.asyncio, "create_subprocess_exec", create_subprocess)
+    processor = PipelineOCRProcessor(
+        settings=Settings(pipeline_ocr_timeout_seconds=5.0),
+        media_processor=StaticPreviewMediaProcessor(b"fake-preview-bytes"),
+    )
+    command_task = asyncio.create_task(
+        processor._run_ocr_command(
+            command="fake-ocr {input}",
+            image_path=tmp_path / "preview.png",
+            purpose="test OCR command",
+        )
+    )
+    await asyncio.wait_for(process.communicate_started.wait(), timeout=1.0)
+
+    command_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await command_task
+
+    assert process.kill_calls == 1
+    assert process.wait_calls == 1
+    assert process.returncode == -9
+
+
+@pytest.mark.asyncio
+async def test_ocr_command_cancellation_bounds_reaping_an_unresponsive_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = UnreapableSubprocess()
+
+    async def create_subprocess(*_args: object, **_kwargs: object) -> UnreapableSubprocess:
+        return process
+
+    monkeypatch.setattr(ocr_module.asyncio, "create_subprocess_exec", create_subprocess)
+    monkeypatch.setattr(ocr_module, "_SUBPROCESS_REAP_TIMEOUT_SECONDS", 0.01)
+    processor = PipelineOCRProcessor(
+        settings=Settings(pipeline_ocr_timeout_seconds=5.0),
+        media_processor=StaticPreviewMediaProcessor(b"fake-preview-bytes"),
+    )
+    command_task = asyncio.create_task(
+        processor._run_ocr_command(
+            command="fake-ocr {input}",
+            image_path=tmp_path / "preview.png",
+            purpose="test OCR command",
+        )
+    )
+    await asyncio.wait_for(process.communicate_started.wait(), timeout=1.0)
+
+    command_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(command_task, timeout=0.2)
+
+    assert process.kill_calls == 1
+    assert process.wait_calls == 1
 
 
 @pytest.mark.asyncio

@@ -43,5 +43,6 @@ PIPELINE_REASON_TRANSCODE_FAILED = "transcode_stage_failed"
 PIPELINE_REASON_TRANSCODE_INVALID_MEDIA = "transcode_invalid_media"
 PIPELINE_REASON_TRANSCODE_TIMEOUT = "transcode_timeout"
 PIPELINE_REASON_UNSUPPORTED_STAGE = "unsupported_stage"
+PIPELINE_REASON_WORKER_SHUTDOWN = "worker_shutdown"
 
 type DeadLetterPayload = str | bytes | bytearray | int | float | bool | None

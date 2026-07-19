@@ -53,6 +53,7 @@ class RuntimeHealthReporter:
     boot_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     pid: int = field(default_factory=os.getpid)
     _ready: bool = field(default=False, init=False)
+    _lifecycle_state: str = field(default="starting", init=False)
     _last_progress_at: float = field(default_factory=time.time, init=False)
     _operations: dict[str, RuntimeOperation] = field(default_factory=dict, init=False)
     _heartbeat_task: asyncio.Task[None] | None = field(default=None, init=False)
@@ -90,6 +91,7 @@ class RuntimeHealthReporter:
         """Publish a terminal not-ready state and stop the heartbeat task."""
 
         self._ready = False
+        self._lifecycle_state = "stopped"
         self._operations.clear()
         self._write()
         heartbeat_task = self._heartbeat_task
@@ -103,6 +105,14 @@ class RuntimeHealthReporter:
         """Mark startup complete and make the process eligible to become healthy."""
 
         self._ready = True
+        self._lifecycle_state = "running"
+        self._last_progress_at = time.time()
+        self._write()
+
+    def mark_draining(self) -> None:
+        """Expose intentional shutdown without failing the liveness health check."""
+
+        self._lifecycle_state = "draining"
         self._last_progress_at = time.time()
         self._write()
 
@@ -152,6 +162,7 @@ class RuntimeHealthReporter:
             "boot_id": self.boot_id,
             "pid": self.pid,
             "ready": self._ready,
+            "lifecycle_state": self._lifecycle_state,
             "heartbeat_at": now,
             "last_progress_at": self._last_progress_at,
             "operations": [
@@ -208,7 +219,8 @@ def check_runtime_health(
         raise RuntimeHealthError("runtime health payload must be a JSON object")
     if payload.get("schema_version") != HEALTH_SCHEMA_VERSION:
         raise RuntimeHealthError("runtime health payload has an unsupported schema version")
-    if payload.get("ready") is not True:
+    draining = payload.get("lifecycle_state") == "draining"
+    if payload.get("ready") is not True and not draining:
         raise RuntimeHealthError("runtime has not completed startup readiness")
 
     checked_at = time.time() if now is None else now
@@ -239,7 +251,10 @@ def check_runtime_health(
         if not isinstance(name, str) or not name.strip():
             raise RuntimeHealthError(f"runtime operation {index} has an invalid name")
         deadline_at = _require_number(operation_payload, "deadline_at", prefix=f"runtime operation {index}")
-        if checked_at > deadline_at:
+        # The worker owns a stricter process-wide shutdown deadline while it is
+        # draining. Keep the container live until that deadline can cancel and
+        # requeue work instead of letting HealthOnFailure send an early kill.
+        if not draining and checked_at > deadline_at:
             raise RuntimeHealthError(f"runtime operation {name!r} exceeded its deadline")
     return payload
 

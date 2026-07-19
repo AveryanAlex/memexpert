@@ -413,7 +413,10 @@ def build_pipeline_broker(settings: Settings | None = None) -> RabbitBroker:
     """Build a lazy FastStream Rabbit broker without performing network I/O."""
 
     broker_settings = get_pipeline_broker_settings(settings)
-    return RabbitBroker(broker_settings.url)
+    return RabbitBroker(
+        broker_settings.url,
+        timeout=broker_settings.connection_timeout,
+    )
 
 
 def get_pipeline_broker() -> RabbitBroker:

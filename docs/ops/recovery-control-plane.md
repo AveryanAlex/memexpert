@@ -133,7 +133,106 @@ The role-specific PostgreSQL `application_name` and RabbitMQ
 `x-memexpert-worker-role` consumer argument make ownership visible without
 inspecting process internals.
 
+## Graceful worker shutdown
+
+Workers treat the first `SIGTERM` or `SIGINT` as a drain request. They set the
+runtime health `lifecycle_state` to `draining`, stop RabbitMQ consumer intake,
+wait for in-flight handlers under one application-wide deadline, and then close
+the broker and shared dependencies. A second termination signal or the
+application deadline cancels remaining handlers. Because consumers acknowledge
+manually, a cancelled delivery still owned by its journal generation is
+negatively acknowledged for immediate requeue. A delivery whose generation is
+already complete or superseded is acknowledged instead, and closing the broker
+channel is the fallback if the database-backed disposition fails.
+Terminal and retry-exhausted failures still obey the record-before-ack rule:
+cancellation cleanup persists/reconciles their PostgreSQL dead-letter row before
+acknowledging the source delivery.
+
+Whale deliberately nests the shutdown budgets:
+
+| Layer | Timeout | Purpose |
+| --- | ---: | --- |
+| Worker application | 210 seconds | Stop intake and drain or cancel in-flight handlers |
+| Quadlet/Podman `StopTimeout` | 240 seconds | Allow application cleanup before the container is killed |
+| systemd `TimeoutStopSec` | 270 seconds | Allow Podman to finish container teardown |
+
+Keep the invariant `210 < 240 < 270` when changing any of these values. Do not
+raise only the application timeout past an outer supervisor deadline. The
+application value is configured with
+`PIPELINE_WORKER_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS` in Whale's Nix deployment.
+Keep the RabbitMQ connection timeout below the application deadline as well.
+Whale uses 10 seconds; an initial robust-connect attempt is allowed to settle
+within that finite timeout rather than being cancelled before FastStream owns
+the connection.
+
+The runtime health file progresses through `lifecycle_state` values `starting`,
+`running`, `draining`, and terminal `stopped`. `memexpert-runtime-health` must
+remain successful while the process is alive and within its `draining`
+deadline. Production configures `HealthOnFailure=kill`, so turning an
+intentional drain into an unhealthy result would cause premature termination
+and defeat manual-ack requeue guarantees.
+
+During a deploy or manual `systemctl stop`, follow all worker roles and verify
+that intake stops before the drain wait, the process exits before Podman's
+240-second boundary, and no unit records exit status 137:
+
+```bash
+journalctl -fu 'memexpert-worker-*.service' -o short-iso
+
+systemctl list-units --all 'memexpert-worker-*' --no-pager
+journalctl -u 'memexpert-worker-*.service' --since '-15 minutes' \
+  --no-pager -o short-iso
+```
+
+A clean stop logs this structured event sequence:
+
+1. `worker_shutdown_requested`
+2. `worker_shutdown_started`
+3. `worker_consumers_quiesced`
+4. `worker_shutdown_drain_completed`
+5. `worker_shutdown_completed`
+
+Workers configure INFO-level JSON logging to stdout, so these event names and
+fields are directly searchable in journald.
+
+`worker_shutdown_force_requested` means a second signal requested immediate
+cancellation. `worker_shutdown_drain_timed_out` means the 210-second application
+deadline cancelled remaining handlers. Either event requires checking that the
+cancelled delivery was redelivered; its matching stage journal should briefly
+show retryable reason `worker_shutdown` rather than remain stuck in
+`processing`. The event should still be followed by
+`worker_shutdown_completed` before the outer timeout. Filter a rollout directly
+with:
+
+```bash
+journalctl -u 'memexpert-worker-*.service' --since '-15 minutes' \
+  --no-pager -o cat | grep -E \
+  'worker_shutdown_|worker_consumers_quiesced'
+```
+
+After the replacement workers become healthy, confirm RabbitMQ consumers are
+owned by the expected roles and watch recovery/admin state for redelivered
+work. A redelivery after a forced drain is expected; a delivery accepted after
+the worker logged that intake stopped, a 137 exit, or a worker still stopping
+after 240 seconds indicates a shutdown regression. Do not acknowledge or purge
+the affected queue manually: allow the idempotent consumer and recovery
+control plane to reconcile it.
+
 ## Deployment order
+
+Reploy still submits one combined systemd restart transaction, but explicit
+unit ordering keeps the old web tier available while workers drain. For a full
+image rollout, systemd applies the dependency chain in these directions:
+
+```text
+stop:  workers -> frontend -> API -> migration
+start: migration -> API -> frontend -> workers
+```
+
+Worker units have ordering-only `After=memexpert-frontend.service`; they do not
+require the frontend to remain healthy. Do not replace the combined release
+with separate worker and web Reploy calls: a new worker generation or migration
+must not run against an arbitrarily old API/schema contract.
 
 1. Deploy migration `0034`.
 2. Start the API and scheduler.

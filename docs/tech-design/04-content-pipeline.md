@@ -329,6 +329,60 @@ shared rather than hard-partitioned between helpers. The startup OCR canary may
 briefly overlap the two broker deliveries, so the memory and PID limits retain
 headroom for a transient third helper.
 
+### Graceful worker shutdown
+
+`SIGTERM` and `SIGINT` start a bounded two-phase shutdown. First, the runtime
+sets health `lifecycle_state` to `draining` and stops RabbitMQ consumer intake
+concurrently across all subscribers so no new delivery starts after the drain
+boundary. Second, it waits for already-running handlers up to one process-wide
+deadline, then closes the broker and shared dependencies. A second termination
+signal or expiry of the deadline cancels remaining handlers before dependencies
+are closed.
+
+Pipeline deliveries use manual acknowledgement. A handler that finishes during
+the drain acknowledges normally; a cancelled stage handler conditionally marks
+the matching `processing` journal generation retryable with reason
+`worker_shutdown`, then negatively acknowledges the delivery for immediate
+requeue. It cannot overwrite an already-succeeded or newer event generation,
+and it acknowledges such completed or superseded deliveries instead of
+requeueing stale work. Broker/channel close remains the fallback when the
+database-backed disposition cannot be completed. Any provider subprocess owned
+by a cancelled handler must be terminated and reaped before the worker exits.
+This lets the same delivery resume immediately instead of waiting for stale-work
+reclaim. Stage idempotency and lease fencing remain necessary because a delivery
+can be retried after interruption at any point before its acknowledgement.
+If cancellation lands after a terminal or retry-exhausted failure commits but
+before dead-letter finalization, cleanup re-enters the idempotent PostgreSQL
+dead-letter recorder and acknowledges only after that canonical ledger exists.
+
+Production nests three shutdown deadlines: the application drain is 210
+seconds (`PIPELINE_WORKER_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS`), the Quadlet/
+Podman stop timeout is 240 seconds, and systemd `TimeoutStopSec` is 270 seconds.
+The strict `210 < 240 < 270` ordering reserves time for broker/dependency close
+and container teardown before either supervisor sends `SIGKILL`. These are
+process-wide budgets, not per-subscriber budgets.
+
+The initial aio-pika robust-connect handshake is deliberately not cancelled:
+until FastStream owns the resulting connection, cancellation can orphan its
+internal reconnect task. FastStream receives the configured finite RabbitMQ
+connection timeout (10 seconds in production), which remains inside the
+application deadline. Once the connection is owned, broker startup, topology
+declaration, and readiness can be cancelled normally.
+
+Telegram workers discover enabled source-engagement sessions before registering
+their per-session queues. That database discovery is connection-timeout-bounded,
+publishes the startup health heartbeat first, and races both shutdown events so
+a signal cannot strand the process before `PipelineRuntime.run()` begins.
+
+Draining is a live lifecycle state, not a failed health state. Runtime health
+progresses through `starting`, `running`, `draining`, and terminal `stopped`;
+`memexpert-runtime-health` continues to succeed during the bounded `draining`
+state. This is required because the production Quadlet uses
+`HealthOnFailure=kill`; reporting the intentional drain as unhealthy would
+bypass the application deadline and risk killing in-flight manual-ack work.
+Worker lifecycle events are emitted as structured JSON on stdout at INFO level
+so journald retains their event names and shutdown context.
+
 ### Operational recovery and overload control
 
 The latest canonical state remains in the ingest request, stage journal, sync

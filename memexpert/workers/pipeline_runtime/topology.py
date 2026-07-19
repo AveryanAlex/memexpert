@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import logging
 from typing import TYPE_CHECKING, cast
 
 from faststream import AckPolicy
@@ -60,6 +61,10 @@ if TYPE_CHECKING:
     from memexpert.workers.pipeline_runtime.stages.context import ObjectStorageClientLike
 
 type WorkerBackgroundRunner = Callable[[Settings, asyncio.Event], Awaitable[None]]
+
+logger = logging.getLogger(__name__)
+
+_PRE_RUNTIME_CLEANUP_TIMEOUT_SECONDS = 5.0
 
 
 class _UnavailableDependency:
@@ -479,7 +484,10 @@ def build_pipeline_runtime(
         )
         async def _consume_media_inspect(payload: object, message: RabbitMessage) -> None:
             rabbit_message = cast("RabbitMessageLike", cast("object", message))
-            async with runtime.operation("media_inspect"):
+            async with runtime.consumer_operation("media_inspect") as admitted:
+                if not admitted:
+                    await rabbit_message.nack(requeue=True)
+                    return
                 await runtime.handle_media_inspect_message(payload, rabbit_message)
 
     if resolved_role.consumes_source_engagement:
@@ -494,7 +502,10 @@ def build_pipeline_runtime(
             )
             async def _consume_source_engagement_capture(payload: object, message: RabbitMessage) -> None:
                 rabbit_message = cast("RabbitMessageLike", cast("object", message))
-                async with runtime.operation("source_engagement_capture"):
+                async with runtime.consumer_operation("source_engagement_capture") as admitted:
+                    if not admitted:
+                        await rabbit_message.nack(requeue=True)
+                        return
                     await runtime.handle_source_engagement_capture_message(payload, rabbit_message)
 
     if resolved_role.consumes_stage(ContentPipelineStage.TRANSCODE):
@@ -508,7 +519,10 @@ def build_pipeline_runtime(
         )
         async def _consume_transcode(payload: object, message: RabbitMessage) -> None:
             rabbit_message = cast("RabbitMessageLike", cast("object", message))
-            async with runtime.operation("transcode"):
+            async with runtime.consumer_operation("transcode") as admitted:
+                if not admitted:
+                    await rabbit_message.nack(requeue=True)
+                    return
                 await runtime.handle_transcode_message(payload, rabbit_message)
 
     if resolved_role.consumes_stage(ContentPipelineStage.OCR):
@@ -522,7 +536,10 @@ def build_pipeline_runtime(
         )
         async def _consume_ocr(payload: object, message: RabbitMessage) -> None:
             rabbit_message = cast("RabbitMessageLike", cast("object", message))
-            async with runtime.operation("ocr"):
+            async with runtime.consumer_operation("ocr") as admitted:
+                if not admitted:
+                    await rabbit_message.nack(requeue=True)
+                    return
                 await runtime.handle_ocr_message(payload, rabbit_message)
 
     if resolved_role.consumes_stage(ContentPipelineStage.EMBED):
@@ -536,7 +553,10 @@ def build_pipeline_runtime(
         )
         async def _consume_embed(payload: object, message: RabbitMessage) -> None:
             rabbit_message = cast("RabbitMessageLike", cast("object", message))
-            async with runtime.operation("embed"):
+            async with runtime.consumer_operation("embed") as admitted:
+                if not admitted:
+                    await rabbit_message.nack(requeue=True)
+                    return
                 await runtime.handle_embed_message(payload, rabbit_message)
 
     if resolved_role.consumes_stage(ContentPipelineStage.CLASSIFY):
@@ -550,7 +570,10 @@ def build_pipeline_runtime(
         )
         async def _consume_classify(payload: object, message: RabbitMessage) -> None:
             rabbit_message = cast("RabbitMessageLike", cast("object", message))
-            async with runtime.operation("classify"):
+            async with runtime.consumer_operation("classify") as admitted:
+                if not admitted:
+                    await rabbit_message.nack(requeue=True)
+                    return
                 await runtime.handle_classify_message(payload, rabbit_message)
 
     if resolved_role.consumes_stage(ContentPipelineStage.SYNC_QDRANT):
@@ -564,7 +587,10 @@ def build_pipeline_runtime(
         )
         async def _consume_sync_qdrant(payload: object, message: RabbitMessage) -> None:
             rabbit_message = cast("RabbitMessageLike", cast("object", message))
-            async with runtime.operation("sync_qdrant"):
+            async with runtime.consumer_operation("sync_qdrant") as admitted:
+                if not admitted:
+                    await rabbit_message.nack(requeue=True)
+                    return
                 await runtime.handle_sync_qdrant_message(payload, rabbit_message)
 
     if resolved_role.consumes_stage(ContentPipelineStage.SYNC_MEILI):
@@ -578,7 +604,10 @@ def build_pipeline_runtime(
         )
         async def _consume_sync_meili(payload: object, message: RabbitMessage) -> None:
             rabbit_message = cast("RabbitMessageLike", cast("object", message))
-            async with runtime.operation("sync_meili"):
+            async with runtime.consumer_operation("sync_meili") as admitted:
+                if not admitted:
+                    await rabbit_message.nack(requeue=True)
+                    return
                 await runtime.handle_sync_meili_message(payload, rabbit_message)
 
     return runtime
@@ -597,6 +626,73 @@ async def _load_source_engagement_session_keys(session_factory: AsyncSessionFact
         return tuple(
             build_source_engagement_session_key(session_id, session_name) for session_id, session_name in result.all()
         )
+
+
+async def _load_source_engagement_session_keys_until_stopped(
+    session_factory: AsyncSessionFactory,
+    *,
+    settings: Settings,
+    role: WorkerRole,
+    stop_event: asyncio.Event,
+    force_stop_event: asyncio.Event,
+) -> tuple[str, ...] | None:
+    """Bound pre-runtime DB discovery and let process signals cancel it."""
+
+    if stop_event.is_set() or force_stop_event.is_set():
+        return None
+
+    load_task = asyncio.create_task(
+        _load_source_engagement_session_keys(session_factory),
+        name=f"worker-{role.value}-source-session-discovery",
+    )
+    stop_waiter = asyncio.create_task(
+        stop_event.wait(),
+        name=f"worker-{role.value}-source-session-stop-waiter",
+    )
+    force_waiter = asyncio.create_task(
+        force_stop_event.wait(),
+        name=f"worker-{role.value}-source-session-force-stop-waiter",
+    )
+    try:
+        done, _ = await asyncio.wait(
+            (load_task, stop_waiter, force_waiter),
+            timeout=settings.database_connect_timeout_seconds,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        shutdown_requested = stop_event.is_set() or force_stop_event.is_set()
+        if load_task in done:
+            if shutdown_requested:
+                _ = await asyncio.gather(load_task, return_exceptions=True)
+                return None
+            return await load_task
+
+        load_task.cancel()
+        completed, _ = await asyncio.wait(
+            (load_task,),
+            timeout=_PRE_RUNTIME_CLEANUP_TIMEOUT_SECONDS,
+        )
+        if completed:
+            _ = await asyncio.gather(load_task, return_exceptions=True)
+        else:
+            logger.error(
+                "worker_source_session_discovery_cleanup_timed_out",
+                extra={
+                    "event": "worker_source_session_discovery_cleanup_timed_out",
+                    "role": role.value,
+                },
+            )
+
+        if stop_event.is_set() or force_stop_event.is_set():
+            return None
+        raise TimeoutError(
+            "Timed out while discovering Telegram source-engagement sessions "
+            f"after {settings.database_connect_timeout_seconds:.2f}s."
+        )
+    finally:
+        for waiter in (stop_waiter, force_waiter):
+            if not waiter.done():
+                waiter.cancel()
+        _ = await asyncio.gather(stop_waiter, force_waiter, return_exceptions=True)
 
 
 def _load_role_background_runners(role: WorkerRole) -> tuple[WorkerBackgroundRunner, ...]:
@@ -620,32 +716,58 @@ async def run_pipeline_runtime(
     settings: Settings | None = None,
     role: WorkerRole = WorkerRole.ALL,
     stop_event: asyncio.Event | None = None,
+    force_stop_event: asyncio.Event | None = None,
     background_runners: Sequence[WorkerBackgroundRunner] = (),
 ) -> None:
     """Start the real RabbitMQ-backed content-pipeline worker runtime."""
 
     resolved_settings = settings or get_settings()
     resolved_role = WorkerRole(role)
+    resolved_stop_event = stop_event or asyncio.Event()
+    resolved_force_stop_event = force_stop_event or asyncio.Event()
     session_factory = get_async_session_factory()
-    source_engagement_session_keys = (
-        await _load_source_engagement_session_keys(session_factory) if resolved_role.consumes_source_engagement else ()
-    )
     health_reporter = RuntimeHealthReporter.from_settings(
         resolved_settings,
         service="memexpert-workers",
         role=resolved_role.value,
     )
-    runtime = build_pipeline_runtime(
-        settings=resolved_settings,
-        role=resolved_role,
-        session_factory=session_factory,
-        source_engagement_session_keys=source_engagement_session_keys,
-        health_reporter=health_reporter,
-    )
-    await runtime.run(
-        stop_event=stop_event,
-        background_runners=(*_load_role_background_runners(resolved_role), *background_runners),
-    )
+    runtime: PipelineRuntime | None = None
+    health_prestarted = False
+    runtime_manages_health = False
+    try:
+        if resolved_role.consumes_source_engagement:
+            await health_reporter.start()
+            health_prestarted = True
+            source_engagement_session_keys = await _load_source_engagement_session_keys_until_stopped(
+                session_factory,
+                settings=resolved_settings,
+                role=resolved_role,
+                stop_event=resolved_stop_event,
+                force_stop_event=resolved_force_stop_event,
+            )
+            if source_engagement_session_keys is None:
+                health_reporter.mark_draining()
+                return
+        else:
+            source_engagement_session_keys = ()
+
+        runtime = build_pipeline_runtime(
+            settings=resolved_settings,
+            role=resolved_role,
+            session_factory=session_factory,
+            source_engagement_session_keys=source_engagement_session_keys,
+            health_reporter=health_reporter,
+        )
+        resolved_background_runners = (*_load_role_background_runners(resolved_role), *background_runners)
+        runtime_manages_health = True
+        await runtime.run(
+            stop_event=resolved_stop_event,
+            force_stop_event=resolved_force_stop_event,
+            background_runners=resolved_background_runners,
+        )
+    finally:
+        if health_prestarted and not runtime_manages_health:
+            await health_reporter.stop()
 
 
 __all__ = ["WorkerBackgroundRunner", "build_pipeline_runtime", "run_pipeline_runtime"]

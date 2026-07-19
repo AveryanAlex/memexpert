@@ -49,7 +49,7 @@ from memexpert.models.enums import (
 from memexpert.pipeline.constants import SYNC_REPLAY_BATCH_MAX
 from memexpert.pipeline.items import PipelineItemReadService
 from memexpert.pipeline.replay import PipelineReplayService
-from memexpert.pipeline.stage_completion import PipelineStageCompletionService
+from memexpert.pipeline.stage_completion import CancelledStageDisposition, PipelineStageCompletionService
 from memexpert.schemas.content_pipeline import (
     ContentPipelineDispatchEvent,
     ContentPipelineEventType,
@@ -608,6 +608,136 @@ async def test_replay_item_rejects_stage_that_has_not_been_dispatched_yet(
 
     with pytest.raises(PipelineReplayNotAllowedError, match="has no durable journal row"):
         _ = await service.replay_item(meme_file_id, stage=ContentPipelineStage.EMBED)
+
+
+async def test_abandon_stage_processing_makes_interrupted_delivery_immediately_retryable(
+    migrated_db_session: AsyncSession,
+) -> None:
+    service = PipelineStageCompletionService(migrated_db_session, broker=RecordingBroker())
+    meme_file_id = await _seed_pending_pipeline_item(
+        migrated_db_session,
+        filename="shutdown-interrupted.png",
+        content_type="image/png",
+        media_bytes=b"shutdown-interrupted-bytes",
+        source_id="shutdown-interrupted",
+        post_id="6005",
+        phash_tag="t",
+    )
+    event_id = uuid.uuid7()
+    context = await service.start_stage_processing(
+        meme_file_id=meme_file_id,
+        stage=ContentPipelineStage.TRANSCODE,
+        attempt=1,
+        event_id=event_id,
+    )
+    assert context is not None
+
+    abandoned = await service.abandon_stage_processing(
+        meme_file_id=meme_file_id,
+        stage=ContentPipelineStage.TRANSCODE,
+        attempt=1,
+        event_id=event_id,
+        normalized_reason="worker_shutdown",
+        last_error_text="worker stopped during processing",
+    )
+
+    item = await PipelineItemReadService(migrated_db_session).get_item(meme_file_id)
+    transcode = next(stage for stage in item.stages if stage.stage is ContentPipelineStage.TRANSCODE)
+    assert abandoned.disposition is CancelledStageDisposition.REQUEUE
+    assert transcode.status is ContentPipelineStageStatus.FAILED
+    assert transcode.is_retryable
+    assert transcode.normalized_reason == "worker_shutdown"
+
+
+async def test_abandon_stage_processing_does_not_overwrite_completed_truth(
+    migrated_db_session: AsyncSession,
+) -> None:
+    service = PipelineStageCompletionService(migrated_db_session, broker=RecordingBroker())
+    meme_file_id = await _seed_pending_pipeline_item(
+        migrated_db_session,
+        filename="shutdown-after-success.png",
+        content_type="image/png",
+        media_bytes=b"shutdown-after-success-bytes",
+        source_id="shutdown-after-success",
+        post_id="6006",
+        phash_tag="u",
+    )
+    event_id = uuid.uuid7()
+    context = await service.start_stage_processing(
+        meme_file_id=meme_file_id,
+        stage=ContentPipelineStage.TRANSCODE,
+        attempt=1,
+        event_id=event_id,
+    )
+    assert context is not None
+    await service.mark_stage_succeeded(
+        meme_file_id=meme_file_id,
+        stage=ContentPipelineStage.TRANSCODE,
+        attempt=1,
+        event_id=event_id,
+    )
+
+    abandoned = await service.abandon_stage_processing(
+        meme_file_id=meme_file_id,
+        stage=ContentPipelineStage.TRANSCODE,
+        attempt=1,
+        event_id=event_id,
+        normalized_reason="worker_shutdown",
+        last_error_text="late cancellation",
+    )
+
+    item = await PipelineItemReadService(migrated_db_session).get_item(meme_file_id)
+    transcode = next(stage for stage in item.stages if stage.stage is ContentPipelineStage.TRANSCODE)
+    assert abandoned.disposition is CancelledStageDisposition.ACKNOWLEDGE
+    assert transcode.status is ContentPipelineStageStatus.SUCCEEDED
+    assert transcode.normalized_reason is None
+
+
+async def test_abandon_stage_processing_does_not_overwrite_newer_event_generation(
+    migrated_db_session: AsyncSession,
+) -> None:
+    service = PipelineStageCompletionService(migrated_db_session, broker=RecordingBroker())
+    meme_file_id = await _seed_pending_pipeline_item(
+        migrated_db_session,
+        filename="shutdown-newer-generation.png",
+        content_type="image/png",
+        media_bytes=b"shutdown-newer-generation-bytes",
+        source_id="shutdown-newer-generation",
+        post_id="6007",
+        phash_tag="v",
+    )
+    interrupted_event_id = uuid.uuid7()
+    newer_event_id = uuid.uuid7()
+    first_context = await service.start_stage_processing(
+        meme_file_id=meme_file_id,
+        stage=ContentPipelineStage.TRANSCODE,
+        attempt=1,
+        event_id=interrupted_event_id,
+    )
+    assert first_context is not None
+    newer_context = await service.start_stage_processing(
+        meme_file_id=meme_file_id,
+        stage=ContentPipelineStage.TRANSCODE,
+        attempt=1,
+        event_id=newer_event_id,
+    )
+    assert newer_context is not None
+
+    abandoned = await service.abandon_stage_processing(
+        meme_file_id=meme_file_id,
+        stage=ContentPipelineStage.TRANSCODE,
+        attempt=1,
+        event_id=interrupted_event_id,
+        normalized_reason="worker_shutdown",
+        last_error_text="late cancellation from older delivery",
+    )
+
+    item = await PipelineItemReadService(migrated_db_session).get_item(meme_file_id)
+    transcode = next(stage for stage in item.stages if stage.stage is ContentPipelineStage.TRANSCODE)
+    assert abandoned.disposition is CancelledStageDisposition.ACKNOWLEDGE
+    assert transcode.status is ContentPipelineStageStatus.PROCESSING
+    assert transcode.last_event_id == newer_event_id
+    assert transcode.normalized_reason is None
 
 
 async def test_replay_publish_failure_keeps_reservation_and_retryable_outbox(

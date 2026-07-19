@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
@@ -180,6 +181,66 @@ async def test_ocr_role_runs_bundled_startup_canary_before_readiness() -> None:
     assert ocr_processor.calls[0]["filename"] == "runtime-health-canary.png"
     assert ocr_processor.calls[0]["mime_type"] == "image/png"
     assert len(cast("bytes", ocr_processor.calls[0]["media_bytes"])) > 100
+
+
+async def test_telegram_role_observes_stop_during_pre_runtime_session_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    discovery_started = asyncio.Event()
+
+    class FakeHealthReporter:
+        async def start(self) -> None:
+            events.append("health.start")
+
+        async def stop(self) -> None:
+            events.append("health.stop")
+
+        def mark_draining(self) -> None:
+            events.append("health.draining")
+
+    async def load_session_keys(_session_factory: object) -> tuple[str, ...]:
+        events.append("discovery.started")
+        discovery_started.set()
+        try:
+            await asyncio.Future()
+            raise AssertionError("blocked session discovery unexpectedly resumed")
+        except asyncio.CancelledError:
+            events.append("discovery.cancelled")
+            raise
+
+    monkeypatch.setattr(topology_module, "get_async_session_factory", object)
+    monkeypatch.setattr(topology_module, "_load_source_engagement_session_keys", load_session_keys)
+    monkeypatch.setattr(
+        topology_module.RuntimeHealthReporter,
+        "from_settings",
+        lambda *_args, **_kwargs: FakeHealthReporter(),
+    )
+    monkeypatch.setattr(
+        topology_module,
+        "build_pipeline_runtime",
+        lambda **_kwargs: pytest.fail("runtime must not be built after pre-start shutdown"),
+    )
+    stop_event = asyncio.Event()
+
+    run_task = asyncio.create_task(
+        topology_module.run_pipeline_runtime(
+            settings=Settings(),
+            role=WorkerRole.TELEGRAM,
+            stop_event=stop_event,
+        )
+    )
+    await asyncio.wait_for(discovery_started.wait(), timeout=1.0)
+    stop_event.set()
+    await asyncio.wait_for(run_task, timeout=1.0)
+
+    assert events == [
+        "health.start",
+        "discovery.started",
+        "discovery.cancelled",
+        "health.draining",
+        "health.stop",
+    ]
 
 
 def test_worker_role_stage_ownership_is_non_overlapping_outside_all() -> None:

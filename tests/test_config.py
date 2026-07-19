@@ -149,6 +149,20 @@ def test_settings_pipeline_worker_prefetch_count_defaults_and_bounds() -> None:
         _ = Settings(pipeline_worker_prefetch_count=513)
 
 
+def test_settings_pipeline_worker_graceful_shutdown_timeout_defaults_and_bounds() -> None:
+    assert Settings().pipeline_worker_graceful_shutdown_timeout_seconds == 210.0
+    assert (
+        Settings(pipeline_worker_graceful_shutdown_timeout_seconds=42.5)
+        .pipeline_worker_graceful_shutdown_timeout_seconds
+        == 42.5
+    )
+
+    with pytest.raises(ValidationError):
+        _ = Settings(pipeline_worker_graceful_shutdown_timeout_seconds=0.0)
+    with pytest.raises(ValidationError):
+        _ = Settings(pipeline_worker_graceful_shutdown_timeout_seconds=900.1)
+
+
 def test_settings_search_candidate_pool_limit_defaults_and_bounds() -> None:
     assert Settings().search_candidate_pool_limit_per_source == 200
     assert Settings(search_candidate_pool_limit_per_source=500).search_candidate_pool_limit_per_source == 500
@@ -570,6 +584,7 @@ def test_pipeline_runtime_helpers_are_lazy_until_verified() -> None:
     settings = Settings.model_validate(
         {
             "rabbitmq_url": "amqp://guest:guest@127.0.0.1:9/",
+            "pipeline_broker_connection_timeout_seconds": 0.37,
             "s3_endpoint": "http://127.0.0.1:9",
             "s3_access_key": "test-access",
             "s3_secret_key": "test-secret",
@@ -581,6 +596,7 @@ def test_pipeline_runtime_helpers_are_lazy_until_verified() -> None:
     storage_client = cast("object", build_s3_client(settings))
 
     assert broker is not None
+    assert cast("Any", broker)._connection_kwargs["timeout"] == 0.37
     assert storage_client is not None
 
 

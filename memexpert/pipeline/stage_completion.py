@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import timedelta
+from enum import StrEnum
 from typing import TYPE_CHECKING
 
 from sqlalchemy import select
@@ -60,6 +62,22 @@ if TYPE_CHECKING:
     from memexpert.media.contracts import NormalizedMediaResult
     from memexpert.messaging.rabbitmq_outbox import RabbitBrokerProtocol
     from memexpert.services.content_merge import MergeOutcome
+
+
+class CancelledStageDisposition(StrEnum):
+    """Broker action that preserves canonical truth after delivery cancellation."""
+
+    ACKNOWLEDGE = "acknowledge"
+    DEAD_LETTER = "dead_letter"
+    REQUEUE = "requeue"
+
+
+@dataclass(frozen=True, slots=True)
+class CancelledStageResolution:
+    """Canonical disposition and failure reason for one cancelled delivery."""
+
+    disposition: CancelledStageDisposition
+    normalized_reason: str | None = None
 
 
 class PipelineStageCompletionService(PipelineDispatchingService):
@@ -482,6 +500,92 @@ class PipelineStageCompletionService(PipelineDispatchingService):
     ) -> None:
         meme_file, stage_entry = await self._get_meme_file_and_stage_entry(meme_file_id, stage)
         ensure_stage_attempt_is_current(stage_entry, attempt=attempt)
+        await self._apply_stage_failure(
+            meme_file=meme_file,
+            stage_entry=stage_entry,
+            stage=stage,
+            attempt=attempt,
+            event_id=event_id,
+            normalized_reason=normalized_reason,
+            last_error_text=last_error_text,
+            retryable=retryable,
+        )
+
+    async def abandon_stage_processing(
+        self,
+        *,
+        meme_file_id: uuid.UUID,
+        stage: ContentPipelineStage,
+        attempt: int,
+        event_id: uuid.UUID,
+        normalized_reason: str,
+        last_error_text: str,
+    ) -> CancelledStageResolution:
+        """Choose the safe broker disposition without overwriting later truth."""
+
+        stage_entry = await self._session.scalar(
+            select(PipelineStageJournal)
+            .where(
+                PipelineStageJournal.meme_file_id == meme_file_id,
+                PipelineStageJournal.stage == stage,
+            )
+            .with_for_update()
+        )
+        if stage_entry is None:
+            raise PipelineIngestError(
+                f"Pipeline item {meme_file_id} does not have durable journal state for stage {stage.value}."
+            )
+        if stage_entry.last_event_id != event_id or attempt < stage_entry.attempt_count:
+            await self._session.commit()
+            return CancelledStageResolution(CancelledStageDisposition.ACKNOWLEDGE)
+
+        if stage_entry.status is not ContentPipelineStageStatus.PROCESSING:
+            if stage_entry.status is ContentPipelineStageStatus.FAILED and (
+                not stage_entry.is_retryable or attempt >= self._broker_settings.retry_max_attempts
+            ):
+                disposition = CancelledStageDisposition.DEAD_LETTER
+            elif stage_entry.status is ContentPipelineStageStatus.PENDING or (
+                stage_entry.status is ContentPipelineStageStatus.FAILED and stage_entry.is_retryable
+            ):
+                disposition = CancelledStageDisposition.REQUEUE
+            else:
+                disposition = CancelledStageDisposition.ACKNOWLEDGE
+            await self._session.commit()
+            return CancelledStageResolution(
+                disposition,
+                normalized_reason=(
+                    stage_entry.normalized_reason
+                    if disposition is CancelledStageDisposition.DEAD_LETTER
+                    else None
+                ),
+            )
+
+        meme_file = await self._get_meme_file(meme_file_id)
+        ensure_stage_attempt_is_current(stage_entry, attempt=attempt)
+        await self._apply_stage_failure(
+            meme_file=meme_file,
+            stage_entry=stage_entry,
+            stage=stage,
+            attempt=attempt,
+            event_id=event_id,
+            normalized_reason=normalized_reason,
+            last_error_text=last_error_text,
+            retryable=True,
+        )
+        return CancelledStageResolution(CancelledStageDisposition.REQUEUE)
+
+    async def _apply_stage_failure(
+        self,
+        *,
+        meme_file: MemeFile,
+        stage_entry: PipelineStageJournal,
+        stage: ContentPipelineStage,
+        attempt: int,
+        event_id: uuid.UUID,
+        normalized_reason: str,
+        last_error_text: str,
+        retryable: bool,
+    ) -> None:
         failed_at = utcnow()
 
         stage_entry.status = ContentPipelineStageStatus.FAILED
@@ -499,7 +603,7 @@ class PipelineStageCompletionService(PipelineDispatchingService):
             meme_file.status = ContentProcessingStatus.FAILED
 
         await self._record_attempt_finished(
-            meme_file_id=meme_file_id,
+            meme_file_id=meme_file.id,
             stage=stage,
             attempt=attempt,
             event_id=event_id,
@@ -675,4 +779,8 @@ class PipelineStageCompletionService(PipelineDispatchingService):
         )
 
 
-__all__ = ["PipelineStageCompletionService"]
+__all__ = [
+    "CancelledStageDisposition",
+    "CancelledStageResolution",
+    "PipelineStageCompletionService",
+]

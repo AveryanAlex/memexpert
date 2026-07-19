@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import uuid
@@ -47,6 +48,7 @@ from memexpert.core.voyage import (
 )
 from memexpert.crawlers.telegram.client import FakeTelegramClient, PipelineTelegramFloodWaitError, RawTelegramMessage
 from memexpert.media.contracts import (
+    MediaValidationError,
     NormalizedMediaResult,
     UploadMediaDetails,
 )
@@ -133,6 +135,9 @@ from memexpert.workers.pipeline_runtime import (
     PIPELINE_REASON_SYNC_QDRANT_MALFORMED_PAYLOAD,
     PIPELINE_REASON_SYNC_QDRANT_PROVIDER_BLOCKED,
     PIPELINE_REASON_SYNC_QDRANT_TIMEOUT,
+    PIPELINE_REASON_TRANSCODE_FAILED,
+    PIPELINE_REASON_TRANSCODE_INVALID_MEDIA,
+    PIPELINE_REASON_WORKER_SHUTDOWN,
     build_pipeline_runtime,
 )
 from memexpert.workers.pipeline_runtime.stage_registry import PIPELINE_STAGE_HANDLERS, RUNNABLE_DOWNSTREAM_STAGES
@@ -1526,6 +1531,242 @@ async def test_pipeline_runtime_forced_transcode_failure_then_replay_then_succes
     assert success_message.ack_count == 1
     assert success_message.reject_calls == []
     assert success_message.nack_calls == []
+
+
+async def test_pipeline_runtime_cancelled_stage_is_failed_requeued_and_immediately_replayable(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    storage_client = FakeStorageClient()
+    item, transcode_event = await _seed_transcode_pending_item(
+        migrated_db_session,
+        storage_client,
+        source_id="runtime-shutdown",
+        post_id="7002",
+        filename="runtime-shutdown.png",
+        media_bytes=build_png_bytes(color=(120, 30, 90)),
+    )
+    normalize_started = asyncio.Event()
+
+    class BlockingMediaProcessor(FakeMediaProcessor):
+        async def normalize_for_web(
+            self,
+            *,
+            meme_file_id: uuid.UUID,
+            filename: str,
+            content_type: str,
+            media_bytes: bytes,
+        ) -> NormalizedMediaResult:
+            _ = (meme_file_id, filename, content_type, media_bytes)
+            normalize_started.set()
+            await asyncio.Future()
+            raise AssertionError("blocked media processor unexpectedly resumed")
+
+    settings = Settings()
+    interrupted_runtime = build_pipeline_runtime(
+        settings=settings,
+        broker=build_pipeline_broker(settings),
+        session_factory=postgres_session_factory,
+        storage_client=storage_client,
+        media_processor=BlockingMediaProcessor(),
+        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key="unused")),
+    )
+    interrupted_message = FakeRabbitMessage(message_id=str(transcode_event.event_id))
+    delivery_task = asyncio.create_task(
+        interrupted_runtime.handle_transcode_message(
+            transcode_event.model_dump(mode="json"),
+            interrupted_message,
+        )
+    )
+    await asyncio.wait_for(normalize_started.wait(), timeout=1.0)
+
+    delivery_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await delivery_task
+
+    interrupted_item = await _fetch_item(postgres_session_factory, item.meme_file_id)
+    assert interrupted_item.current_status is ContentPipelineStageStatus.FAILED
+    assert interrupted_item.normalized_reason == PIPELINE_REASON_WORKER_SHUTDOWN
+    assert interrupted_message.nack_calls == [True]
+    assert interrupted_message.ack_count == 0
+
+    normalized = build_normalized_media_result(item.meme_file_id)
+    resumed_runtime = build_pipeline_runtime(
+        settings=settings,
+        broker=cast("Any", PublishingBroker()),
+        session_factory=postgres_session_factory,
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(normalize_result=normalized),
+        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key=_web_video_key(normalized))),
+    )
+    resumed_message = FakeRabbitMessage(message_id=str(transcode_event.event_id))
+    await resumed_runtime.handle_transcode_message(transcode_event.model_dump(mode="json"), resumed_message)
+
+    resumed_item = await _fetch_item(postgres_session_factory, item.meme_file_id)
+    assert resumed_item.current_stage is ContentPipelineStage.OCR
+    assert resumed_item.current_status is ContentPipelineStageStatus.PENDING
+    assert resumed_message.ack_count == 1
+    assert resumed_message.nack_calls == []
+
+
+async def test_pipeline_runtime_cancelled_superseded_stage_acks_without_overwriting_newer_generation(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    storage_client = FakeStorageClient()
+    item, interrupted_event = await _seed_transcode_pending_item(
+        migrated_db_session,
+        storage_client,
+        source_id="runtime-shutdown-superseded",
+        post_id="7003",
+        filename="runtime-shutdown-superseded.png",
+        media_bytes=build_png_bytes(color=(40, 90, 140)),
+    )
+    normalize_started = asyncio.Event()
+
+    class BlockingMediaProcessor(FakeMediaProcessor):
+        async def normalize_for_web(
+            self,
+            *,
+            meme_file_id: uuid.UUID,
+            filename: str,
+            content_type: str,
+            media_bytes: bytes,
+        ) -> NormalizedMediaResult:
+            _ = (meme_file_id, filename, content_type, media_bytes)
+            normalize_started.set()
+            await asyncio.Future()
+            raise AssertionError("blocked media processor unexpectedly resumed")
+
+    settings = Settings()
+    runtime = build_pipeline_runtime(
+        settings=settings,
+        broker=build_pipeline_broker(settings),
+        session_factory=postgres_session_factory,
+        storage_client=storage_client,
+        media_processor=BlockingMediaProcessor(),
+        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key="unused")),
+    )
+    interrupted_message = FakeRabbitMessage(message_id=str(interrupted_event.event_id))
+    delivery_task = asyncio.create_task(
+        runtime.handle_transcode_message(
+            interrupted_event.model_dump(mode="json"),
+            interrupted_message,
+        )
+    )
+    await asyncio.wait_for(normalize_started.wait(), timeout=1.0)
+
+    newer_event_id = uuid.uuid7()
+    async with postgres_session_factory() as newer_session:
+        newer_service = PipelineStageCompletionService(newer_session, broker=RecordingBroker())
+        newer_context = await newer_service.start_stage_processing(
+            meme_file_id=item.meme_file_id,
+            stage=ContentPipelineStage.TRANSCODE,
+            attempt=1,
+            event_id=newer_event_id,
+        )
+    assert newer_context is not None
+
+    delivery_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await delivery_task
+
+    current = await _fetch_item(postgres_session_factory, item.meme_file_id)
+    assert current.current_status is ContentPipelineStageStatus.PROCESSING
+    assert current.last_event_id == newer_event_id
+    assert current.normalized_reason is None
+    assert interrupted_message.ack_count == 1
+    assert interrupted_message.nack_calls == []
+
+
+@pytest.mark.parametrize(
+    ("normalize_error", "retry_max_attempts", "expected_reason", "expected_retryable"),
+    [
+        (
+            MediaValidationError("invalid media"),
+            5,
+            PIPELINE_REASON_TRANSCODE_INVALID_MEDIA,
+            False,
+        ),
+        (
+            RuntimeError("transient failure at final attempt"),
+            1,
+            PIPELINE_REASON_TRANSCODE_FAILED,
+            True,
+        ),
+    ],
+    ids=["terminal", "retry-exhausted"],
+)
+async def test_pipeline_runtime_cancellation_after_final_failure_persists_dead_letter_before_ack(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+    normalize_error: Exception,
+    retry_max_attempts: int,
+    expected_reason: str,
+    expected_retryable: bool,
+) -> None:
+    storage_client = FakeStorageClient()
+    item, transcode_event = await _seed_transcode_pending_item(
+        migrated_db_session,
+        storage_client,
+        source_id="runtime-shutdown-terminal",
+        post_id="7004",
+        filename="runtime-shutdown-terminal.png",
+        media_bytes=build_png_bytes(color=(180, 60, 20)),
+    )
+    terminal_failure_committed = asyncio.Event()
+    durable_dead_letters: list[dict[str, object]] = []
+
+    async def record_dead_letter(**kwargs: object) -> uuid.UUID:
+        durable_dead_letters.append(dict(kwargs))
+        return uuid.uuid7()
+
+    settings = Settings(pipeline_broker_retry_max_attempts=retry_max_attempts)
+    broker = build_pipeline_broker(settings)
+    runtime = build_pipeline_runtime(
+        settings=settings,
+        broker=broker,
+        session_factory=postgres_session_factory,
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(normalize_error=normalize_error),
+        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key="unused")),
+        dead_letter_recorder=record_dead_letter,
+    )
+
+    async def publish_dead_letter(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(broker, "publish", publish_dead_letter)
+    runtime_type = type(runtime)
+    original_mark_stage_failed = runtime_type._mark_stage_failed
+
+    async def mark_stage_failed_then_block(runtime_instance: Any, **kwargs: Any) -> None:
+        await original_mark_stage_failed(runtime_instance, **kwargs)
+        terminal_failure_committed.set()
+        await asyncio.Future()
+        raise AssertionError("terminal failure boundary unexpectedly resumed")
+
+    monkeypatch.setattr(runtime_type, "_mark_stage_failed", mark_stage_failed_then_block)
+    message = FakeRabbitMessage(message_id=str(transcode_event.event_id))
+    delivery_task = asyncio.create_task(
+        runtime.handle_transcode_message(transcode_event.model_dump(mode="json"), message)
+    )
+    await asyncio.wait_for(terminal_failure_committed.wait(), timeout=1.0)
+
+    delivery_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await delivery_task
+
+    current = await _fetch_item(postgres_session_factory, item.meme_file_id)
+    transcode = next(stage for stage in current.stages if stage.stage is ContentPipelineStage.TRANSCODE)
+    assert transcode.status is ContentPipelineStageStatus.FAILED
+    assert transcode.is_retryable is expected_retryable
+    assert transcode.normalized_reason == expected_reason
+    assert len(durable_dead_letters) == 1
+    assert durable_dead_letters[0]["normalized_reason"] == expected_reason
+    assert message.ack_count == 1
+    assert message.nack_calls == []
 
 
 async def test_pipeline_runtime_transcode_static_image_skips_web_video_upload(

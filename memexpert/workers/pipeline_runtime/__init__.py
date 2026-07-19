@@ -43,6 +43,7 @@ from memexpert.workers.pipeline_runtime.constants import (
     PIPELINE_REASON_TRANSCODE_INVALID_MEDIA,
     PIPELINE_REASON_TRANSCODE_TIMEOUT,
     PIPELINE_REASON_UNSUPPORTED_STAGE,
+    PIPELINE_REASON_WORKER_SHUTDOWN,
 )
 from memexpert.workers.pipeline_runtime.errors import (
     ForcedClassifyFailure,
@@ -96,6 +97,7 @@ __all__ = [
     "PIPELINE_REASON_TRANSCODE_INVALID_MEDIA",
     "PIPELINE_REASON_TRANSCODE_TIMEOUT",
     "PIPELINE_REASON_UNSUPPORTED_STAGE",
+    "PIPELINE_REASON_WORKER_SHUTDOWN",
     "ForcedClassifyFailure",
     "ForcedEmbedFailure",
     "ForcedSyncMeiliFailure",

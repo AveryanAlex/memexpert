@@ -109,6 +109,7 @@ class Settings(BaseSettings):
     pipeline_broker_retry_backoff_seconds: float = Field(default=5.0, gt=0.0, le=3600.0)
     pipeline_broker_connection_timeout_seconds: float = Field(default=5.0, gt=0.0)
     pipeline_worker_prefetch_count: int = Field(default=1, ge=1, le=512)
+    pipeline_worker_graceful_shutdown_timeout_seconds: float = Field(default=210.0, gt=0.0, le=900.0)
     pipeline_capacity_close_pending_count: int = Field(default=1000, ge=10, le=1_000_000)
     pipeline_capacity_reopen_pending_count: int = Field(default=500, ge=0, le=999_999)
     pipeline_capacity_close_oldest_age_seconds: float = Field(default=3600.0, gt=0.0, le=604800.0)
