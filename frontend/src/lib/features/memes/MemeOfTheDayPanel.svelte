@@ -3,6 +3,7 @@
   import { fetchMemeOfTheDay } from '$lib/api/client';
   import type { PublicMemeOfTheDayRead } from '$lib/api/types';
   import { Button, Card, LoadingState, Notice } from '$lib/ui';
+  import { memeDiscoveryDataAttributes } from './discovery-attribution';
   import MemeCard from './MemeCard.svelte';
 
   interface Props {
@@ -69,11 +70,7 @@
     {:else if current?.meme}
       <div
         class="w-full md:max-w-[34rem] md:justify-self-end"
-        data-discovery-source={current.attribution?.source_algorithm ?? undefined}
-        data-discovery-reason={current.attribution?.reason ?? undefined}
-        data-discovery-request-id={current.attribution?.request_id ?? undefined}
-        data-discovery-impression-id={current.attribution?.impression_id ?? undefined}
-        data-discovery-score={current.attribution?.score ?? undefined}
+        {...memeDiscoveryDataAttributes(current.attribution)}
       >
         <MemeCard meme={current.meme} attribution={current.attribution} {showAccessMarkers} />
       </div>

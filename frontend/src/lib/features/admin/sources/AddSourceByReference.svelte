@@ -4,7 +4,7 @@
   import AdminPanel from '$lib/features/admin/AdminPanel.svelte';
   import { ApiError } from '$lib/api/client';
   import type { AdminSourceChannelRead, AdminTelegramChannelFromReferencePayload, AdminTelegramSessionRead } from '$lib/api/types';
-  import { Button, FormRow, Input, Notice } from '$lib/ui';
+  import { Button, FormRow, Input, Notice, Select } from '$lib/ui';
   import { addTelegramSourceWithRetry } from './add-source-client';
   import { clearSourceSuggestionPrefill, readyTelegramAccounts, sourceSuggestionPrefill } from './view-model';
 
@@ -130,16 +130,16 @@
         <Input name="reference" bind:value={reference} placeholder="@public_channel" required />
       </FormRow>
       <FormRow label="Telegram account">
-        <select
+        <Select
           name="telegram_session_id"
           required
-          class="min-h-11 w-full rounded-2xl border border-line bg-paper px-3 py-2 text-sm text-ink"
+          class="min-h-11 w-full rounded-2xl text-sm"
         >
           <option value="" disabled>Choose a ready account</option>
           {#each readyAccounts as account (account.id)}
             <option value={account.id} selected={readyAccounts.length === 1}>{account.display_name}</option>
           {/each}
-        </select>
+        </Select>
       </FormRow>
     </div>
 

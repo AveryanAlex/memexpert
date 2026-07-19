@@ -1,7 +1,7 @@
 <script lang="ts">
   import TrendComparisonChart from '$lib/features/trends/TrendComparisonChart.svelte';
   import type { PublicTrendComparisonSeriesRead } from '$lib/api/types';
-  import { ActionLink, Button, Card, EmptyState, Input, Notice, PageHeader } from '$lib/ui';
+  import { ActionLink, Button, Card, EmptyState, FormRow, Input, Notice, PageHeader, Select } from '$lib/ui';
   import type { PageData } from './$types';
 
   let { data }: { data: PageData } = $props();
@@ -171,16 +171,14 @@
       <div class="grid gap-3 rounded-xl border border-line bg-soft/50 p-3">
         <p class="m-0 text-sm text-muted">Without JavaScript, enter comparison items from a shared link.</p>
         {#each formRows as row, index (`comparison-fallback-${index}`)}
-          <label class="grid gap-2 font-extrabold" for={`comparison-item-${index}`}>
-            <span>Comparison item {index + 1}</span>
-            <input
+          <FormRow label={`Comparison item ${index + 1}`}>
+            <Input
               id={`comparison-item-${index}`}
               name="item"
               value={serializedItem(row)}
               placeholder="Comparison item"
-              class="min-w-0 rounded-xl border border-line bg-paper px-3 py-2.5 text-ink placeholder:text-muted/75 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
             />
-          </label>
+          </FormRow>
         {/each}
       </div>
     </noscript>
@@ -190,28 +188,25 @@
           <legend class="px-1 text-sm font-extrabold text-ink">Item {index + 1}</legend>
           <input type="hidden" name="item" value={serializedItem(row)} disabled={!enhanced} />
           <div class="grid gap-3 sm:grid-cols-[minmax(10rem,0.7fr)_minmax(0,1fr)]">
-            <label class="grid gap-2 font-extrabold" for={`comparison-kind-${index}`}>
-              <span>Item type</span>
-              <select
+            <FormRow label="Item type">
+              <Select
                 id={`comparison-kind-${index}`}
                 bind:value={row.kind}
                 onchange={() => markEdited(row)}
-                class="min-w-0 rounded-xl border border-line bg-paper px-3 py-2.5 text-ink focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
               >
                 <option value="meme">Meme</option>
                 <option value="tag">Tag</option>
                 <option value="template">Template</option>
-              </select>
-            </label>
-            <label class="grid gap-2 font-extrabold" for={`comparison-identifier-${index}`}>
-              <span>Name or identifier</span>
+              </Select>
+            </FormRow>
+            <FormRow label="Name or identifier">
               <Input
                 id={`comparison-identifier-${index}`}
                 bind:value={row.identifier}
                 oninput={() => markEdited(row)}
                 placeholder="Name or identifier"
               />
-            </label>
+            </FormRow>
           </div>
         </fieldset>
       {/each}

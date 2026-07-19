@@ -27,6 +27,7 @@ describe('MemeCard', () => {
 
   it('only offers image enlargement for image media with a usable source', () => {
     const image = render(MemeCard, { props: { meme: memeCard() } });
+    const suppressedImage = render(MemeCard, { props: { meme: memeCard(), showZoom: false } });
     const base = memeCard();
     const video = render(MemeCard, {
       props: {
@@ -47,6 +48,7 @@ describe('MemeCard', () => {
     });
 
     expect(image.body).toContain('aria-label="Enlarge Launch reaction"');
+    expect(suppressedImage.body).not.toContain('aria-label="Enlarge Launch reaction"');
     expect(video.body).not.toContain('aria-label="Enlarge Launch reaction"');
     expect(video.body).toContain('poster="/video-preview.webp"');
     expect(video.body).toContain('data-video-preview-mode="poster"');

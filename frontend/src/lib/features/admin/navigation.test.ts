@@ -68,4 +68,14 @@ describe('admin navigation', () => {
     expect(body).toMatch(/href="\/admin\/moderation\/patterns"[^>]*aria-current="page"/);
     expect(body).not.toMatch(/href="\/admin\/moderation"[^>]*aria-current="page"/);
   });
+
+  it('uses the shared pill treatment for mobile admin navigation', () => {
+    const { body } = render(AdminNavigation, {
+      props: { currentPath: '/admin/sources', variant: 'mobile' }
+    });
+
+    expect(body).toMatch(/href="\/admin\/sources"[^>]*aria-current="page"/);
+    expect(body).toContain('rounded-full');
+    expect(body).toContain('focus-visible:outline-accent');
+  });
 });

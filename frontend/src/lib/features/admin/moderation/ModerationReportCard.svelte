@@ -2,7 +2,7 @@
   import type { AdminModerationReportRead } from '$lib/api/types';
   import AdvancedSection from '$lib/features/admin/AdvancedSection.svelte';
   import { formatAdminTimestamp } from '$lib/features/admin/formatTimestamp';
-  import { Badge, Button, Card, Input, Select } from '$lib/ui';
+  import { Badge, Button, Card, FormRow, Input, Select } from '$lib/ui';
   import AdminMediaPreview from './AdminMediaPreview.svelte';
 
   let { report }: { report: AdminModerationReportRead } = $props();
@@ -50,18 +50,16 @@
       <form method="POST" action="?/resolveModerationReport" class="grid gap-3 rounded-2xl border border-line bg-cream/50 p-4">
         <input type="hidden" name="report_id" value={report.id} />
         <input type="hidden" name="reason" value={report.reason} />
-        <label class="grid gap-2 text-sm font-extrabold">
-          Resolution
+        <FormRow label="Resolution">
           <Select name="action">
             {#each actions as [value, label]}
               <option value={value}>{label}</option>
             {/each}
           </Select>
-        </label>
-        <label class="grid gap-2 text-sm font-extrabold">
-          Decision note (optional)
+        </FormRow>
+        <FormRow label="Decision note (optional)">
           <Input name="note" placeholder="Add context for the audit history" />
-        </label>
+        </FormRow>
         <Button type="submit">Record decision</Button>
       </form>
     {:else}

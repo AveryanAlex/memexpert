@@ -2,7 +2,7 @@
   import type { AdminBlockedPerceptualHashRead, ModerationReason } from '$lib/api/types';
   import AdvancedSection from '$lib/features/admin/AdvancedSection.svelte';
   import { formatAdminTimestamp } from '$lib/features/admin/formatTimestamp';
-  import { Badge, Button, Input, Select, Textarea } from '$lib/ui';
+  import { Badge, Button, FormRow, Input, Select, Textarea } from '$lib/ui';
 
   let { pattern }: { pattern: AdminBlockedPerceptualHashRead } = $props();
 
@@ -51,31 +51,26 @@
       <form method="POST" action="?/updateBlockedPerceptualHash" class="grid gap-4 rounded-2xl border border-line bg-cream/50 p-4">
         <input type="hidden" name="blocked_hash_id" value={pattern.id} />
         {#if pattern.is_active}<input type="hidden" name="is_active" value="on" />{/if}
-        <label class="grid gap-2 text-sm font-extrabold">
-          Raw perceptual hash
+        <FormRow label="Raw perceptual hash">
           <Input name="perceptual_hash" autocomplete="off" spellcheck={false} value={pattern.perceptual_hash} />
-        </label>
+        </FormRow>
         <div class="grid gap-4 sm:grid-cols-2">
-          <label class="grid gap-2 text-sm font-extrabold">
-            Reason
+          <FormRow label="Reason">
             <Select name="reason" value={pattern.reason}>
               {#each reasons as [value, label]}<option {value}>{label}</option>{/each}
             </Select>
-          </label>
-          <label class="grid gap-2 text-sm font-extrabold">
-            Hash algorithm
+          </FormRow>
+          <FormRow label="Hash algorithm">
             <Select name="hash_algorithm" value={pattern.hash_algorithm}><option value="phash">pHash</option></Select>
-          </label>
-          <label class="grid gap-2 text-sm font-extrabold">
-            Allowed differing pHash bits
+          </FormRow>
+          <FormRow label="Allowed differing pHash bits">
             <Input name="max_hamming_distance" type="number" min="0" step="1" value={String(pattern.max_hamming_distance)} />
-          </label>
+          </FormRow>
           <div class="grid content-end gap-1 text-sm"><strong>Bit size</strong><span class="text-muted">{pattern.hash_size} bits, derived from the raw hash</span></div>
         </div>
-        <label class="grid gap-2 text-sm font-extrabold">
-          Audit note (optional)
+        <FormRow label="Audit note (optional)">
           <Textarea name="note" value={pattern.note ?? ''} placeholder="Why is this pattern changing?" />
-        </label>
+        </FormRow>
         <div><Button type="submit" variant="secondary">Save pattern details</Button></div>
       </form>
     </div>
@@ -86,34 +81,30 @@
       {#if pattern.is_active}
         <form method="POST" action="?/deactivateBlockedPerceptualHash" class="grid gap-3">
           <input type="hidden" name="blocked_hash_id" value={pattern.id} />
-          <label class="grid gap-2 text-sm font-extrabold">
-            Type DEACTIVATE to confirm
+          <FormRow label="Type DEACTIVATE to confirm">
             <Input name="confirmation_phrase" autocomplete="off" required />
-          </label>
-          <label class="grid gap-2 text-sm font-extrabold">
-            Audit note (optional)
+          </FormRow>
+          <FormRow label="Audit note (optional)">
             <Textarea name="note" placeholder="Why should this stop matching?" />
-          </label>
+          </FormRow>
           <div><Button type="submit" variant="danger">Deactivate pattern</Button></div>
         </form>
       {:else}
         <p class="m-0 text-sm text-muted">This pattern is inactive and does not block new uploads.</p>
         <form method="POST" action="?/reactivateBlockedPerceptualHash" class="grid gap-3">
           <input type="hidden" name="blocked_hash_id" value={pattern.id} />
-          <label class="grid gap-2 text-sm font-extrabold">
-            Type REACTIVATE to confirm
+          <FormRow label="Type REACTIVATE to confirm">
             <Input name="confirmation_phrase" autocomplete="off" required />
-          </label>
+          </FormRow>
           <div><Button type="submit" variant="danger">Reactivate pattern</Button></div>
         </form>
       {/if}
 
       <form method="POST" action="?/deleteBlockedPerceptualHash" class="grid gap-3 border-t border-danger-line pt-5">
         <input type="hidden" name="blocked_hash_id" value={pattern.id} />
-        <label class="grid gap-2 text-sm font-extrabold">
-          Type DELETE to confirm
+        <FormRow label="Type DELETE to confirm">
           <Input name="confirmation_phrase" autocomplete="off" required />
-        </label>
+        </FormRow>
         <div><Button type="submit" variant="danger">Delete pattern</Button></div>
       </form>
     </div>

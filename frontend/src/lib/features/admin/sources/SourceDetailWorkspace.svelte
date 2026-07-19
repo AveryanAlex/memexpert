@@ -2,7 +2,7 @@
   import type { AdminSourceBackfillListRead, AdminSourceChannelRead, AdminSourcePostPageRead, AdminTelegramSessionRead } from '$lib/api/types';
   import AdminPanel from '$lib/features/admin/AdminPanel.svelte';
   import { formatAdminTimestamp } from '$lib/features/admin/formatTimestamp';
-  import { Badge, Button, EmptyState, FormRow, Input, Notice, Textarea } from '$lib/ui';
+  import { ActionLink, Badge, Button, EmptyState, FormRow, Input, Notice, Textarea } from '$lib/ui';
   import {
     backfillStatusLabel,
     humanizePipelineValue,
@@ -216,11 +216,11 @@
         <h2 id="source-post-list-heading" class="m-0 text-3xl font-black tracking-[-0.05em]">Fetched messages</h2>
       </div>
       <div class="flex flex-wrap items-center gap-2">
-        <a
-          class="rounded-[14px] border border-ink bg-ink px-3 py-2 text-sm font-extrabold text-paper no-underline hover:opacity-85"
+        <ActionLink
+          size="compact"
           href={sourcePostLatestHref(source.id, paging.status)}
-          data-sveltekit-reload
-        >Show latest messages</a>
+          data-sveltekit-reload=""
+        >Show latest messages</ActionLink>
         <Badge>{postPage.total.toLocaleString('en-US')} observed</Badge>
       </div>
     </div>
@@ -364,13 +364,13 @@
 
     <nav class="flex flex-wrap items-center justify-between gap-3 border-t border-line pt-4" aria-label="Source message pagination">
       {#if paging.hasPrevious}
-        <a class="rounded-[14px] border border-line bg-paper px-3 py-2 text-sm font-extrabold text-ink no-underline hover:bg-soft" href={sourcePostPageHref(source.id, paging.page - 1, paging.snapshotAt, paging.status)}>Previous</a>
+        <ActionLink variant="secondary" size="compact" href={sourcePostPageHref(source.id, paging.page - 1, paging.snapshotAt, paging.status)}>Previous</ActionLink>
       {:else}
         <span class="rounded-[14px] border border-line bg-soft px-3 py-2 text-sm font-extrabold text-muted" aria-disabled="true">Previous</span>
       {/if}
       <span class="text-sm font-extrabold text-muted">Page {paging.page}</span>
       {#if paging.hasNext}
-        <a class="rounded-[14px] border border-line bg-paper px-3 py-2 text-sm font-extrabold text-ink no-underline hover:bg-soft" href={sourcePostPageHref(source.id, paging.page + 1, paging.snapshotAt, paging.status)}>Next</a>
+        <ActionLink variant="secondary" size="compact" href={sourcePostPageHref(source.id, paging.page + 1, paging.snapshotAt, paging.status)}>Next</ActionLink>
       {:else}
         <span class="rounded-[14px] border border-line bg-soft px-3 py-2 text-sm font-extrabold text-muted" aria-disabled="true">Next</span>
       {/if}

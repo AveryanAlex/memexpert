@@ -137,6 +137,76 @@ test.describe('public masonry feed smoke', () => {
     await expect(zoom).toBeVisible();
   });
 
+  test('image magnifier stays intrinsic-sized and fully visible in a short viewport', async ({ page }) => {
+    await page.setViewportSize({ width: 1000, height: 400 });
+    await disableIntersectionObserver(page);
+    await page.goto('/');
+
+    const feed = page.getByRole('list', { name: 'Meme results' });
+    const zoom = feed.getByRole('button', { name: 'Enlarge Smoke test cat reaction', exact: true });
+    await zoom.click();
+
+    const dialog = page.getByRole('dialog', { name: 'Smoke test cat reaction' });
+    const image = dialog.getByRole('img', { name: 'Enlarged Smoke test cat reaction' });
+    await expect(image).toBeVisible();
+
+    const geometry = await dialog.evaluate((element) => {
+      const imageElement = element.querySelector('img');
+      const closeElement = element.querySelector('button[aria-label="Close enlarged image"]');
+      if (!(imageElement instanceof HTMLImageElement) || !(closeElement instanceof HTMLButtonElement)) {
+        throw new Error('Zoom dialog media controls are missing.');
+      }
+
+      const rect = (node: Element) => {
+        const box = node.getBoundingClientRect();
+        return { top: box.top, right: box.right, bottom: box.bottom, left: box.left, width: box.width, height: box.height };
+      };
+
+      return {
+        viewport: { width: window.innerWidth, height: window.innerHeight },
+        dialog: rect(element),
+        image: rect(imageElement),
+        close: rect(closeElement),
+        natural: { width: imageElement.naturalWidth, height: imageElement.naturalHeight }
+      };
+    });
+    const tolerance = 2;
+
+    expect(geometry.dialog.left).toBeGreaterThanOrEqual(-tolerance);
+    expect(geometry.dialog.top).toBeGreaterThanOrEqual(-tolerance);
+    expect(geometry.dialog.right).toBeLessThanOrEqual(geometry.viewport.width + tolerance);
+    expect(geometry.dialog.bottom).toBeLessThanOrEqual(geometry.viewport.height + tolerance);
+    expect(geometry.image.left).toBeGreaterThanOrEqual(geometry.dialog.left - tolerance);
+    expect(geometry.image.top).toBeGreaterThanOrEqual(geometry.dialog.top - tolerance);
+    expect(geometry.image.right).toBeLessThanOrEqual(geometry.dialog.right + tolerance);
+    expect(geometry.image.bottom).toBeLessThanOrEqual(geometry.dialog.bottom + tolerance);
+    expect(geometry.image.width).toBeLessThanOrEqual(geometry.natural.width + tolerance);
+    expect(geometry.image.height).toBeLessThanOrEqual(geometry.natural.height + tolerance);
+    expect(geometry.image.width / geometry.image.height).toBeCloseTo(geometry.natural.width / geometry.natural.height, 2);
+    expect(geometry.close.bottom).toBeLessThanOrEqual(geometry.image.top + tolerance);
+
+    await page.keyboard.press('Escape');
+    await expect(dialog).toHaveCount(0);
+    await expect(zoom).toBeFocused();
+  });
+
+  test('ordered search uses shared grid column state for its magnifier', async ({ page }) => {
+    await page.setViewportSize({ width: 620, height: 844 });
+    await disableIntersectionObserver(page);
+    await page.goto('/search?q=cat%20reaction');
+
+    const grid = page.getByRole('list', { name: 'Search results' });
+    const card = grid.getByRole('link', { name: 'Open Smoke test cat reaction' }).locator('xpath=ancestor::article');
+    const zoom = card.locator('button[aria-label="Enlarge Smoke test cat reaction"]');
+    await expect(grid).toHaveAttribute('data-layout', 'ordered');
+    await expect(grid).toHaveAttribute('data-column-count', '1');
+    await expect(zoom).toBeHidden();
+
+    await page.setViewportSize({ width: 660, height: 844 });
+    await expect(grid).toHaveAttribute('data-column-count', '2');
+    await expect(zoom).toBeVisible();
+  });
+
   test('card actions do not overlap at the supported 320px viewport', async ({ page }) => {
     await page.setViewportSize({ width: 320, height: 700 });
     await disableIntersectionObserver(page);
@@ -303,6 +373,7 @@ test.describe('public masonry feed smoke', () => {
 
     const grid = page.getByRole('list', { name: 'Search results' });
     const video = grid.locator('video');
+    await expect(grid).toHaveAttribute('data-layout', 'ordered');
     await expect(grid).toHaveAttribute('data-video-preview-mode', 'hover');
     await expect(video).toHaveAttribute('poster', /smoke-cat\.svg/);
     await expect(video).toHaveJSProperty('muted', true);

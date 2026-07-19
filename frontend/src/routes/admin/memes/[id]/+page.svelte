@@ -2,7 +2,7 @@
   import AdvancedSection from '$lib/features/admin/AdvancedSection.svelte';
   import { formatAdminTimestamp } from '$lib/features/admin/formatTimestamp';
   import AdminMediaPreview from '$lib/features/admin/moderation/AdminMediaPreview.svelte';
-  import { Badge, Button, Card, Input, Notice, Select } from '$lib/ui';
+  import { Badge, Button, Card, FormRow, Input, Label, Notice, Select } from '$lib/ui';
   import type { ActionData, PageData } from './$types';
 
   let { data, form }: { data: PageData; form: ActionData } = $props();
@@ -84,11 +84,11 @@
   <Card class="my-4 grid gap-4">
     <div><p class="m-0 text-xs font-black uppercase tracking-[0.14em] text-muted">Operator controls</p><h2 class="m-0 text-3xl font-black tracking-[-0.05em]">Overrides</h2><p class="mb-0 mt-1 text-sm text-muted">Changes are recorded in moderation history.</p></div>
     <form method="POST" action="?/updateMeme" class="grid gap-4 md:grid-cols-2">
-      <label class="grid gap-2 text-sm font-extrabold">Visibility policy<Select name="visibility_mode"><option value="auto" selected={detail.meme.visibility_mode === 'auto'}>Automatic from provenance</option><option value="force_public" selected={detail.meme.visibility_mode === 'force_public'}>Force public</option><option value="force_private" selected={detail.meme.visibility_mode === 'force_private'}>Force private</option></Select><span class="font-normal text-muted">Effective state: {detail.meme.is_public ? 'visible' : 'hidden'}</span></label>
-      <label class="inline-flex items-center gap-2 font-extrabold"><input name="is_nsfw" type="checkbox" checked={detail.meme.is_nsfw} /> Sensitive content</label>
-      <label class="grid gap-2 text-sm font-extrabold">Template<Select name="template_id"><option value="" selected={detail.meme.template_id === null}>No template</option>{#each data.templates as template (template.id)}<option value={template.id} selected={template.id === detail.meme.template_id}>{template.name}</option>{/each}</Select></label>
-      <label class="grid gap-2 text-sm font-extrabold">Reason<Select name="reason"><option value="">No reason</option>{#each moderationReasons as reason}<option value={reason}>{plain(reason)}</option>{/each}</Select></label>
-      <label class="grid gap-2 text-sm font-extrabold md:col-span-2">Audit note (optional)<Input name="note" placeholder="Why is this override needed?" /></label>
+      <FormRow label="Visibility policy" hint={`Effective state: ${detail.meme.is_public ? 'visible' : 'hidden'}`}><Select name="visibility_mode"><option value="auto" selected={detail.meme.visibility_mode === 'auto'}>Automatic from provenance</option><option value="force_public" selected={detail.meme.visibility_mode === 'force_public'}>Force public</option><option value="force_private" selected={detail.meme.visibility_mode === 'force_private'}>Force private</option></Select></FormRow>
+      <Label class="!inline-flex items-center gap-2"><input name="is_nsfw" type="checkbox" checked={detail.meme.is_nsfw} /> Sensitive content</Label>
+      <FormRow label="Template"><Select name="template_id"><option value="" selected={detail.meme.template_id === null}>No template</option>{#each data.templates as template (template.id)}<option value={template.id} selected={template.id === detail.meme.template_id}>{template.name}</option>{/each}</Select></FormRow>
+      <FormRow label="Reason"><Select name="reason"><option value="">No reason</option>{#each moderationReasons as reason}<option value={reason}>{plain(reason)}</option>{/each}</Select></FormRow>
+      <FormRow label="Audit note (optional)" class="md:col-span-2"><Input name="note" placeholder="Why is this override needed?" /></FormRow>
       <Button type="submit" class="md:col-span-2">Save overrides</Button>
     </form>
   </Card>
@@ -118,17 +118,17 @@
         <form method="POST" action="?/mergeMeme" class="grid gap-3 rounded-2xl border border-danger-line bg-paper/70 p-4">
           <h3 class="m-0 text-xl font-black">Merge into another meme</h3>
           <p class="m-0 text-sm text-muted">Transfers files, saves, pins, and popularity lineage into the target, then permanently removes this source meme. This cannot be undone.</p>
-          <label class="grid gap-2 text-sm font-extrabold">Target meme ID<Input name="target_meme_id" placeholder="Target UUID" required /></label>
-          <label class="grid gap-2 text-sm font-extrabold">Required audit note<Input name="note" placeholder="Why should these memes be merged?" required /></label>
-          <label class="grid gap-2 text-sm font-extrabold">Type MERGE to confirm<Input name="confirmation_phrase" autocomplete="off" spellcheck="false" required /></label>
+          <FormRow label="Target meme ID"><Input name="target_meme_id" placeholder="Target UUID" required /></FormRow>
+          <FormRow label="Required audit note"><Input name="note" placeholder="Why should these memes be merged?" required /></FormRow>
+          <FormRow label="Type MERGE to confirm"><Input name="confirmation_phrase" autocomplete="off" spellcheck="false" required /></FormRow>
           <Button type="submit" variant="danger">Merge meme</Button>
         </form>
 
         <form method="POST" action="?/deleteMeme" class="grid gap-3 rounded-2xl border border-danger-line bg-paper/70 p-4">
           <h3 class="m-0 text-xl font-black">Delete permanently</h3>
           <p class="m-0 text-sm text-muted">Permanently removes the meme, media references, reports, saves, and other dependent records after an audit snapshot. This cannot be undone.</p>
-          <label class="grid gap-2 text-sm font-extrabold">Required audit note<Input name="note" placeholder="Why is deletion necessary?" required /></label>
-          <label class="grid gap-2 text-sm font-extrabold">Type DELETE to confirm<Input name="confirmation_phrase" autocomplete="off" spellcheck="false" required /></label>
+          <FormRow label="Required audit note"><Input name="note" placeholder="Why is deletion necessary?" required /></FormRow>
+          <FormRow label="Type DELETE to confirm"><Input name="confirmation_phrase" autocomplete="off" spellcheck="false" required /></FormRow>
           <Button type="submit" variant="danger">Delete permanently</Button>
         </form>
       </div>

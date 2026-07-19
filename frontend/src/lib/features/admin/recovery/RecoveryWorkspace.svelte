@@ -8,7 +8,7 @@
   } from '$lib/api/types';
   import AdminPanel from '$lib/features/admin/AdminPanel.svelte';
   import { formatAdminTimestamp } from '$lib/features/admin/formatTimestamp';
-  import { Badge, Button, Card, EmptyState, FormRow, Input, Notice, Select, Textarea } from '$lib/ui';
+  import { ActionLink, Badge, Button, Card, EmptyState, FormRow, Input, Notice, Select, Textarea } from '$lib/ui';
   import RecoveryActionForm from './RecoveryActionForm.svelte';
   import {
     RECOVERY_BUCKETS,
@@ -181,7 +181,7 @@
     </FormRow>
     <div class="flex items-end gap-2">
       <Button type="submit">Apply filters</Button>
-      <a class="rounded-[14px] border border-line bg-paper px-3 py-2 text-sm font-extrabold text-ink no-underline hover:bg-soft" href="/admin/recovery">Clear</a>
+      <ActionLink variant="secondary" size="compact" href="/admin/recovery">Clear</ActionLink>
     </div>
   </form>
 </AdminPanel>
@@ -306,13 +306,13 @@
 
   <nav class="flex flex-wrap items-center justify-between gap-3 border-t border-line pt-4" aria-label="Recovery work pagination">
     {#if filters.cursor}
-      <a class="rounded-[14px] border border-line bg-paper px-3 py-2 text-sm font-extrabold text-ink no-underline hover:bg-soft" href={recoveryHref(filters, { cursor: null })}>First page</a>
+      <ActionLink variant="secondary" size="compact" href={recoveryHref(filters, { cursor: null })}>First page</ActionLink>
     {:else}
       <span class="rounded-[14px] border border-line bg-soft px-3 py-2 text-sm font-extrabold text-muted" aria-disabled="true">First page</span>
     {/if}
     <span class="text-sm font-extrabold text-muted">Up to {RECOVERY_PAGE_SIZE} items per page</span>
     {#if workPage.next_cursor}
-      <a class="rounded-[14px] border border-ink bg-ink px-3 py-2 text-sm font-extrabold text-paper no-underline hover:opacity-85" href={recoveryHref(filters, { cursor: workPage.next_cursor })}>Next page</a>
+      <ActionLink size="compact" href={recoveryHref(filters, { cursor: workPage.next_cursor })}>Next page</ActionLink>
     {:else}
       <span class="rounded-[14px] border border-line bg-soft px-3 py-2 text-sm font-extrabold text-muted" aria-disabled="true">Next page</span>
     {/if}

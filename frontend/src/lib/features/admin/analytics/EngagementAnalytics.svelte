@@ -5,7 +5,7 @@
     AdminAnalyticsSearchQueryDetailRead,
     AdminAnalyticsSearchQueryPageRead
   } from '$lib/api/types';
-  import { Card, EmptyState, Notice } from '$lib/ui';
+  import { ActionLink, Card, EmptyState, Notice, PillLink } from '$lib/ui';
   import AnalyticsBreakdownChart from './AnalyticsBreakdownChart.svelte';
   import AnalyticsDonut from './AnalyticsDonut.svelte';
   import AnalyticsHeader from './AnalyticsHeader.svelte';
@@ -151,14 +151,13 @@
   <nav class="flex flex-wrap gap-2" aria-label="Search query sort mode">
     {#each querySorts as option (option.value)}
       {@const active = option.value === sort}
-      <a
+      <PillLink
+        size="compact"
+        class="!py-2 !font-extrabold"
+        {active}
         href={adminAnalyticsHref('/admin/analytics/engagement', range ?? requestedRange, { sort: option.value, offset, query_key: selectedQueryKey })}
-        aria-current={active ? 'true' : undefined}
         title={option.detail}
-        class={active
-          ? 'rounded-full bg-ink px-3 py-2 text-sm font-extrabold text-paper no-underline'
-          : 'rounded-full border border-line bg-paper px-3 py-2 text-sm font-extrabold text-ink no-underline hover:bg-soft'}
-      >{option.label}</a>
+      >{option.label}</PillLink>
     {/each}
   </nav>
 
@@ -176,7 +175,7 @@
               <td class="px-4 py-3 tabular-nums">{formatAnalyticsNumber(item.average_latency_ms, 'milliseconds')}</td>
               <td class="px-4 py-3 tabular-nums">{formatAnalyticsNumber(item.detail_clicks)}</td>
               <td class="px-4 py-3 tabular-nums">{formatAnalyticsNumber(item.downloads)}</td>
-              <td class="px-4 py-3"><a class="whitespace-nowrap rounded-xl border border-line bg-paper px-3 py-2 text-sm font-extrabold text-ink no-underline hover:bg-soft" href={adminAnalyticsHref('/admin/analytics/engagement', range ?? requestedRange, { query_key: item.query_key, offset, sort })}>View outcomes</a></td>
+              <td class="px-4 py-3"><ActionLink class="whitespace-nowrap" variant="secondary" size="compact" href={adminAnalyticsHref('/admin/analytics/engagement', range ?? requestedRange, { query_key: item.query_key, offset, sort })}>View outcomes</ActionLink></td>
             </tr>
           {/each}
         </tbody>
@@ -185,11 +184,11 @@
     {#if searchQueries}
       <nav class="flex flex-wrap items-center justify-between gap-3" aria-label="Search query pagination">
         {#if previousOffset !== null}
-          <a class="rounded-xl border border-line bg-paper px-3 py-2 text-sm font-extrabold text-ink no-underline hover:bg-soft" href={adminAnalyticsHref('/admin/analytics/engagement', range ?? requestedRange, { offset: previousOffset, sort })}>Previous queries</a>
+          <ActionLink variant="secondary" size="compact" href={adminAnalyticsHref('/admin/analytics/engagement', range ?? requestedRange, { offset: previousOffset, sort })}>Previous queries</ActionLink>
         {:else}<span class="rounded-xl border border-line bg-soft px-3 py-2 text-sm font-extrabold text-muted" aria-disabled="true">Previous queries</span>{/if}
         <span class="text-sm text-muted">{formatAnalyticsNumber(offset + 1)}–{formatAnalyticsNumber(Math.min(offset + searchQueries.limit, searchQueries.total))}</span>
         {#if nextOffset !== null}
-          <a class="rounded-xl border border-ink bg-ink px-3 py-2 text-sm font-extrabold text-paper no-underline hover:opacity-85" href={adminAnalyticsHref('/admin/analytics/engagement', range ?? requestedRange, { offset: nextOffset, sort })}>Next queries</a>
+          <ActionLink size="compact" href={adminAnalyticsHref('/admin/analytics/engagement', range ?? requestedRange, { offset: nextOffset, sort })}>Next queries</ActionLink>
         {:else}<span class="rounded-xl border border-line bg-soft px-3 py-2 text-sm font-extrabold text-muted" aria-disabled="true">Next queries</span>{/if}
       </nav>
     {/if}
@@ -201,7 +200,7 @@
     <Card class="grid gap-4" aria-labelledby="query-outcomes-heading">
       <div class="flex flex-wrap items-start justify-between gap-4">
         <div class="grid gap-1"><p class="m-0 text-xs font-black uppercase tracking-[0.16em] text-muted">Selected query</p><h3 id="query-outcomes-heading" class="m-0 break-words text-2xl font-black tracking-[-0.04em]">{queryDetail.query}</h3><p class="m-0 text-sm text-muted">{formatAnalyticsNumber(queryDetail.searches)} searches · {formatAnalyticsNumber(queryDetail.zero_result_rate, 'percent')} zero-result rate · {formatAnalyticsNumber(queryDetail.average_latency_ms, 'milliseconds')} average latency</p></div>
-        <a class="rounded-xl border border-line bg-paper px-3 py-2 text-sm font-extrabold text-ink no-underline hover:bg-soft" href={adminAnalyticsHref('/admin/analytics/engagement', range ?? requestedRange, { offset, sort })}>Close outcomes</a>
+        <ActionLink variant="secondary" size="compact" href={adminAnalyticsHref('/admin/analytics/engagement', range ?? requestedRange, { offset, sort })}>Close outcomes</ActionLink>
       </div>
       {#if queryDetail.meme_outcomes.length > 0}
         <div class="overflow-x-auto rounded-2xl border border-line"><table class="w-full min-w-[52rem] border-collapse text-left text-sm"><caption class="sr-only">Anonymous outcomes for the selected search query.</caption><thead class="bg-soft text-muted"><tr><th class="px-4 py-3 font-black">Meme ID</th><th class="px-4 py-3 font-black">Interactions</th><th class="px-4 py-3 font-black">Detail clicks</th><th class="px-4 py-3 font-black">Downloads</th><th class="px-4 py-3 font-black">Saves</th><th class="px-4 py-3 font-black">Shares</th></tr></thead><tbody>{#each queryDetail.meme_outcomes as outcome (outcome.meme_id)}<tr class="border-t border-line"><th class="px-4 py-3 font-mono text-xs font-bold" scope="row">{outcome.meme_id}</th><td class="px-4 py-3 tabular-nums">{formatAnalyticsNumber(outcome.interactions)}</td><td class="px-4 py-3 tabular-nums">{formatAnalyticsNumber(outcome.detail_clicks)}</td><td class="px-4 py-3 tabular-nums">{formatAnalyticsNumber(outcome.downloads)}</td><td class="px-4 py-3 tabular-nums">{formatAnalyticsNumber(outcome.saves)}</td><td class="px-4 py-3 tabular-nums">{formatAnalyticsNumber(outcome.shares)}</td></tr>{/each}</tbody></table></div>

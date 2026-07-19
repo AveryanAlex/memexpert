@@ -4,7 +4,7 @@
   import type { UserLanguage } from '$lib/api/types';
   import { readAuthState } from '$lib/auth-state';
   import { profileCapabilities, profileStats } from '$lib/profile/view-model';
-  import { ActionLink, Badge, Button, Card, Notice, Select } from '$lib/ui';
+  import { ActionLink, Badge, Button, Card, FormRow, Notice, Select } from '$lib/ui';
   import type { PageData } from './$types';
 
   let { data }: { data: PageData } = $props();
@@ -137,14 +137,13 @@
     <div class="rounded-xl border border-line bg-soft/50 p-4">
       <p class="m-0 font-black">Language preference</p>
       <p class="m-0 mb-3 text-sm text-muted">Choose the account language used by account-aware surfaces when supported.</p>
-      <label class="grid max-w-[420px] gap-2 font-extrabold text-chiptext">
-        <span>Profile language</span>
+      <FormRow label="Profile language" class="max-w-[420px]">
         <Select bind:value={selectedLanguage} onchange={changeLanguage} disabled={!session || languagePending}>
           {#each LANGUAGE_OPTIONS as option}
             <option value={option.value}>{option.label}</option>
           {/each}
         </Select>
-      </label>
+      </FormRow>
       {#if languageMessage}
         <p class="m-0 mt-3 text-sm text-muted" role="status">{languageMessage}</p>
       {/if}

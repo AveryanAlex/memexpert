@@ -17,6 +17,7 @@
     position?: number;
     total?: number;
     showAccessMarkers?: boolean;
+    showZoom?: boolean;
     videoPreviewMode?: MemeVideoPreviewMode;
   }
 
@@ -26,6 +27,7 @@
     position,
     total,
     showAccessMarkers = false,
+    showZoom = true,
     videoPreviewMode = 'poster'
   }: Props = $props();
   let cardElement = $state<HTMLElement>();
@@ -128,6 +130,6 @@
       {/if}
     </a>
   {/if}
-  <MemeZoomDialog {meme} />
+  <MemeZoomDialog {meme} showTrigger={showZoom} />
   <MemeActionMenu {meme} {href} {attribution} surface="card" />
 </article>

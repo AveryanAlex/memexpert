@@ -91,6 +91,11 @@ describe('/ page', () => {
     expect(body).toContain('attribution_surface=web_home');
     expect(body).toContain('attribution_rank=1');
     expect(body).toContain('data-discovery-source="motd"');
+    expect(body).toContain('data-discovery-reason="daily_selection"');
+    expect(body).toContain('data-discovery-request-id="req_motd"');
+    expect(body).toContain('data-discovery-impression-id="imp_motd"');
+    expect(body).toContain('data-discovery-source-meme-id="motd-source-meme"');
+    expect(body).toContain('data-discovery-score="0.91"');
   });
 
   it('renders an empty Meme of the Day state when no candidate is selected', () => {
@@ -217,6 +222,7 @@ function motdAttribution(): MemeResultAttributionRead {
     request_id: 'req_motd',
     impression_id: 'imp_motd',
     surface: 'web_home',
+    source_meme_id: 'motd-source-meme',
     algorithm_version: 'motd-v1',
     score: 0.91,
     score_components: { freshness: 0.3, quality: 0.61 }

@@ -3,7 +3,7 @@
   import MemeCard from '$lib/features/memes/MemeCard.svelte';
   import type { PublicTrendTimelineMemeRead } from '$lib/api/types';
   import { trendTimelineHref } from '$lib/features/trends/params';
-  import { ActionLink, Card, EmptyState, Notice, PageHeader } from '$lib/ui';
+  import { ActionLink, Card, EmptyState, Notice, PageHeader, PillLink } from '$lib/ui';
   import type { PageData } from './$types';
 
   let { data }: { data: PageData } = $props();
@@ -16,6 +16,10 @@
   const numberFormatter = new Intl.NumberFormat('en');
   const recordedActivityDescription =
     'Recorded activity adds original-source views, reactions, and reposts to MemeExpert views, sends, saves, and favorites. It counts signals, not unique people.';
+  const granularities = [
+    { value: 'month', label: 'By month' },
+    { value: 'year', label: 'By year' }
+  ] as const;
 
   function periodLabel(raw: string, granularity: 'month' | 'year' | string): string {
     const date = new Date(raw);
@@ -71,8 +75,12 @@
 <p class="mb-6 max-w-3xl text-sm text-muted">{recordedActivityDescription}</p>
 
 <nav class="mb-6 flex flex-wrap gap-2" aria-label="Timeline granularity">
-  <a class={data.granularity === 'month' ? 'rounded-full bg-ink px-4 py-3 font-extrabold text-paper no-underline' : 'rounded-full border border-line bg-paper px-4 py-3 font-extrabold text-ink no-underline'} href={trendTimelineHref('month')}>By month</a>
-  <a class={data.granularity === 'year' ? 'rounded-full bg-ink px-4 py-3 font-extrabold text-paper no-underline' : 'rounded-full border border-line bg-paper px-4 py-3 font-extrabold text-ink no-underline'} href={trendTimelineHref('year')}>By year</a>
+  {#each granularities as granularity}
+    <PillLink
+      active={data.granularity === granularity.value}
+      href={trendTimelineHref(granularity.value)}
+    >{granularity.label}</PillLink>
+  {/each}
 </nav>
 
 {#if data.errorMessage}

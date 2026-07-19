@@ -3,7 +3,7 @@
   import InfiniteMemeFeed from '$lib/features/memes/InfiniteMemeFeed.svelte';
   import type { MemeFeedSource } from '$lib/features/memes/infinite-feed';
   import MemeOfTheDayPanel from '$lib/features/memes/MemeOfTheDayPanel.svelte';
-  import { ActionLink } from '$lib/ui';
+  import { ActionLink, PillLink } from '$lib/ui';
   import type { PageData } from './$types';
 
   let { data }: { data: PageData } = $props();
@@ -13,6 +13,11 @@
 
   const feedSource = $derived(toMemeFeedSource(data.feedSource));
   const isHomeFeed = $derived(feedSource === 'home' && !data.query.trim());
+  const popularTopics = [
+    { label: 'Reactions', query: 'reaction' },
+    { label: 'Work', query: 'work' },
+    { label: 'Animals', query: 'animals' }
+  ];
 
   function toMemeFeedSource(value: PageData['feedSource']): MemeFeedSource {
     return value === 'home' ? 'home' : 'catalog';
@@ -33,9 +38,9 @@
 <MemeOfTheDayPanel memeOfTheDay={data.memeOfTheDay} initialError={data.memeOfTheDayErrorMessage} showAccessMarkers={Boolean(session)} />
 
 <nav class="mb-5 flex gap-2 overflow-x-auto pb-1" aria-label="Popular topics">
-  <a class="shrink-0 rounded-full border border-line bg-paper px-3 py-1.5 text-sm font-semibold text-ink no-underline hover:bg-soft" href="/search?q=reaction">Reactions</a>
-  <a class="shrink-0 rounded-full border border-line bg-paper px-3 py-1.5 text-sm font-semibold text-ink no-underline hover:bg-soft" href="/search?q=work">Work</a>
-  <a class="shrink-0 rounded-full border border-line bg-paper px-3 py-1.5 text-sm font-semibold text-ink no-underline hover:bg-soft" href="/search?q=animals">Animals</a>
+  {#each popularTopics as topic}
+    <PillLink size="compact" href={`/search?q=${topic.query}`}>{topic.label}</PillLink>
+  {/each}
 </nav>
 
 <InfiniteMemeFeed

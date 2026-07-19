@@ -3,7 +3,7 @@
   import MemeCard from '$lib/features/memes/MemeCard.svelte';
   import TrendSummary from '$lib/features/trends/TrendSummary.svelte';
   import type { PublicTrendMetricsRead, PublicTrendSummaryRead } from '$lib/api/types';
-  import { ActionLink, Card, EmptyState, Notice, PageHeader } from '$lib/ui';
+  import { ActionLink, Card, EmptyState, Notice, PageHeader, PillLink } from '$lib/ui';
   import type { PageData } from './$types';
 
   let { data }: { data: PageData } = $props();
@@ -19,6 +19,11 @@
   const numberFormatter = new Intl.NumberFormat('en');
   const recordedActivityDescription =
     'Recorded activity adds original-source views, reactions, and reposts to MemeExpert views, sends, saves, and favorites. It counts signals, not unique people.';
+  const rankings = [
+    { value: 'trending', label: 'Trending' },
+    { value: 'fastest_rising', label: 'Rising' },
+    { value: 'most_liked', label: 'Most favorited' }
+  ] as const;
 
   function rankingHref(ranking: string, offset = 0): string {
     const params = new URLSearchParams({ ranking });
@@ -71,21 +76,9 @@
 <p class="mb-6 max-w-3xl text-sm text-muted">{recordedActivityDescription}</p>
 
 <nav class="mb-6 flex flex-wrap gap-2" aria-label="Trend rankings">
-  <a
-    class={data.ranking === 'trending' ? 'rounded-full bg-ink px-4 py-3 font-extrabold text-paper no-underline' : 'rounded-full border border-line bg-paper px-4 py-3 font-extrabold text-ink no-underline'}
-    href={rankingHref('trending')}
-    aria-current={data.ranking === 'trending' ? 'page' : undefined}
-  >Trending</a>
-  <a
-    class={data.ranking === 'fastest_rising' ? 'rounded-full bg-ink px-4 py-3 font-extrabold text-paper no-underline' : 'rounded-full border border-line bg-paper px-4 py-3 font-extrabold text-ink no-underline'}
-    href={rankingHref('fastest_rising')}
-    aria-current={data.ranking === 'fastest_rising' ? 'page' : undefined}
-  >Rising</a>
-  <a
-    class={data.ranking === 'most_liked' ? 'rounded-full bg-ink px-4 py-3 font-extrabold text-paper no-underline' : 'rounded-full border border-line bg-paper px-4 py-3 font-extrabold text-ink no-underline'}
-    href={rankingHref('most_liked')}
-    aria-current={data.ranking === 'most_liked' ? 'page' : undefined}
-  >Most favorited</a>
+  {#each rankings as ranking}
+    <PillLink active={data.ranking === ranking.value} href={rankingHref(ranking.value)}>{ranking.label}</PillLink>
+  {/each}
 </nav>
 
 {#if data.errorMessage}

@@ -103,6 +103,9 @@ describe('/search page', () => {
     expect(text).toContain('Try a search');
     expect(text).toContain('Cat reactions');
     expect(text).toContain('Browse categories');
+    expect(body).toContain('href="/search?q=cat+reaction&amp;');
+    expect(body).toContain('href="/search?tags=reaction&amp;');
+    expect(body).toContain('focus-visible:outline-accent');
     expect(text).not.toContain('Recent searches');
     expect(text).toContain('No memes found');
     expect(text).not.toContain('Discovery filters');

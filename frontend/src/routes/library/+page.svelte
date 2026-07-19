@@ -13,7 +13,7 @@
     profileCapabilities,
     writableCollectionOptions
   } from '$lib/profile/view-model';
-  import { ActionLink, Badge, Button, Card, EmptyState, Input, Notice, Select, SortableList } from '$lib/ui';
+  import { ActionLink, Badge, Button, Card, EmptyState, FormRow, Input, Notice, PillLink, Select, SortableList } from '$lib/ui';
   import type { ActionData, PageData } from './$types';
 
   let { data, form }: { data: PageData; form?: ActionData } = $props();
@@ -35,6 +35,11 @@
   const bulkGuidance = $derived(bulkGuidanceFromSessionAndCollections(session, bulkOptions));
   const libraryPinIds = $derived(data.library?.pinned_memes.map((meme) => meme.id) ?? []);
   const orderedPinnedMemes = $derived(orderPinnedMemesByIds(data.library?.pinned_memes ?? [], pinOrderIds));
+  const librarySections = [
+    { href: '#favorites', label: 'Favorites' },
+    { href: '#collections', label: 'Collections' },
+    { href: '#pins', label: 'Pins' }
+  ];
 
   $effect(() => {
     selectedCollectionId = activeCollectionId(data.library);
@@ -122,9 +127,9 @@
     <p class="m-0 mt-2 max-w-2xl text-muted">Favorites, collections, and pins in one place.</p>
   </div>
   <nav class="flex flex-wrap gap-2" aria-label="Saved library sections">
-    <a class="rounded-full border border-line bg-paper px-3 py-2 text-sm font-extrabold no-underline hover:bg-soft" href="#favorites">Favorites</a>
-    <a class="rounded-full border border-line bg-paper px-3 py-2 text-sm font-extrabold no-underline hover:bg-soft" href="#collections">Collections</a>
-    <a class="rounded-full border border-line bg-paper px-3 py-2 text-sm font-extrabold no-underline hover:bg-soft" href="#pins">Pins</a>
+    {#each librarySections as section}
+      <PillLink size="compact" class="!py-2 !font-extrabold" href={section.href}>{section.label}</PillLink>
+    {/each}
   </nav>
 </section>
 
@@ -145,21 +150,18 @@
       {/if}
 
       <form class="grid gap-3 sm:grid-cols-2" method="POST" action="?/createCollection">
-        <label class="grid gap-2 font-extrabold text-chiptext">
-          <span>Title</span>
+        <FormRow label="Title">
           <Input name="title" placeholder="New collection title" maxlength={120} required aria-label="New collection title" />
-        </label>
-        <label class="grid gap-2 font-extrabold text-chiptext">
-          <span>Visibility</span>
+        </FormRow>
+        <FormRow label="Visibility">
           <Select name="visibility" aria-label="Collection visibility">
             <option value="private">Private</option>
             <option value="unlisted">Unlisted</option>
           </Select>
-        </label>
-        <label class="grid gap-2 font-extrabold text-chiptext sm:col-span-2">
-          <span>Description</span>
+        </FormRow>
+        <FormRow label="Description" class="sm:col-span-2">
           <Input name="description" placeholder="Description" aria-label="Collection description" />
-        </label>
+        </FormRow>
         <div class="sm:col-span-2">
           <Button type="submit">Create collection</Button>
         </div>
@@ -176,14 +178,13 @@
       <h2 id="active-save-title" class="m-0 text-xl font-black tracking-[-0.03em]">Active save destination</h2>
       <p class="m-0 text-muted">New Save actions go to this collection.</p>
     </div>
-    <label class="grid gap-2 font-extrabold text-chiptext">
-      <span>Save into</span>
+    <FormRow label="Save into">
       <Select class="w-full max-w-[420px]" bind:value={selectedCollectionId} onchange={changeActiveCollection} disabled={selectorPending || !hasMultipleCollections}>
         {#each collectionOptions as collection (collection.id)}
           <option value={collection.id}>{collection.title} ({collection.saved_meme_count})</option>
         {/each}
       </Select>
-    </label>
+    </FormRow>
     {#if !hasMultipleCollections}
       <p class="m-0 text-sm text-muted">{session?.user.account_type === 'full' ? 'Create more collections later to switch destinations.' : 'Guests save into Favorites.'}</p>
     {/if}
@@ -192,11 +193,7 @@
     {/if}
   </Card>
 
-  <section id="collections" class="my-7" aria-labelledby="collections-title">
-    <div class="mb-4 flex flex-wrap items-center justify-between gap-3">
-      <h2 id="collections-title" class="m-0 text-2xl font-black tracking-[-0.04em]">Collections</h2>
-      <Badge>{data.library.collections.length} total</Badge>
-    </div>
+  <LibrarySection id="collections" title="Collections" count={`${data.library.collections.length} total`}>
     {#if data.library.collections.length > 0}
       <div class="grid gap-2">
         {#each data.library.collections as collection (collection.id)}
@@ -218,72 +215,68 @@
     {:else}
       <p class="m-0 text-muted">Collections will appear after your account session is ready.</p>
     {/if}
-  </section>
+  </LibrarySection>
 
-  <div id="favorites">
-    <LibrarySection title="Favorites" count={`${data.library.favorites.length} memes`}>
-      {#if data.library.favorites.length > 0}
-        <MemeGrid
-          memes={data.library.favorites}
-          label="Favorite memes"
-          bulk={{ enabled: true, saveEnabled: true, collectionOptions: bulkOptions, guidance: bulkGuidance }}
-          showAccessMarkers={Boolean(session)}
-        />
-      {:else}
-        <EmptyState title="No favorites yet" message={libraryEmptyText('favorites', session)}>
-          <ActionLink size="compact" variant="secondary" href="/">Browse memes</ActionLink>
-        </EmptyState>
-      {/if}
-    </LibrarySection>
-  </div>
+  <LibrarySection id="favorites" title="Favorites" count={`${data.library.favorites.length} memes`}>
+    {#if data.library.favorites.length > 0}
+      <MemeGrid
+        memes={data.library.favorites}
+        label="Favorite memes"
+        bulk={{ enabled: true, saveEnabled: true, collectionOptions: bulkOptions, guidance: bulkGuidance }}
+        showAccessMarkers={Boolean(session)}
+      />
+    {:else}
+      <EmptyState title="No favorites yet" message={libraryEmptyText('favorites', session)}>
+        <ActionLink size="compact" variant="secondary" href="/">Browse memes</ActionLink>
+      </EmptyState>
+    {/if}
+  </LibrarySection>
 
-  <div id="pins">
-    <LibrarySection title="Pins" count={`${data.library.pinned_memes.length} pinned`}>
-      {#if data.library.pinned_memes.length > 0}
-        <Card class="mb-4 grid gap-3 shadow-none" aria-labelledby="pin-order-title">
-          <div>
-            <h3 id="pin-order-title" class="m-0 text-xl font-black tracking-[-0.03em]">Pin order</h3>
-            <p class="m-0 text-muted">Use Up and Down controls for keyboard-safe ordering, or drag rows to a new position.</p>
-          </div>
-          <SortableList
-            items={orderedPinnedMemes}
-            onReorder={savePinOrder}
-            disabled={pinOrderPending}
-            class="grid gap-2"
-            itemElement="article"
-            itemClass="grid gap-2 rounded-xl border border-line bg-paper p-3 sm:grid-cols-[auto_minmax(0,1fr)_auto] sm:items-center"
-            aria-live="polite"
-            aria-busy={pinOrderPending}
-          >
-            {#snippet children(meme, index, controls)}
-              <span {@attach controls.attachHandle} class="cursor-grab rounded-full border border-line bg-soft px-3 py-1 text-sm font-black text-muted active:cursor-grabbing focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ink">Drag</span>
-              <div>
-                <p class="m-0 font-black">{meme.caption || meme.tags[0] || `Pinned meme ${index + 1}`}</p>
-                <p class="m-0 text-sm text-muted">Position {index + 1} of {orderedPinnedMemes.length}</p>
-              </div>
-              <div class="flex flex-wrap gap-2 sm:justify-end">
-                <Button size="compact" variant="secondary" type="button" onclick={() => movePin(meme.id, -1)} disabled={pinOrderPending || index === 0}>Up</Button>
-                <Button size="compact" variant="secondary" type="button" onclick={() => movePin(meme.id, 1)} disabled={pinOrderPending || index === orderedPinnedMemes.length - 1}>Down</Button>
-              </div>
-            {/snippet}
-          </SortableList>
-          {#if pinOrderMessage}
-            <p class="m-0 text-sm text-muted" role="status">{pinOrderMessage}</p>
-          {/if}
-        </Card>
-        <MemeGrid
-          memes={orderedPinnedMemes}
-          label="Pinned memes"
-          bulk={{ enabled: true, saveEnabled: true, collectionOptions: bulkOptions, guidance: bulkGuidance }}
-          showAccessMarkers={Boolean(session)}
-        />
-      {:else}
-        <EmptyState title="No pins yet" message={libraryEmptyText('pins', session)}>
-          {#if capabilities.showConnectTelegram}
-            <ActionLink size="compact" href="/account/telegram?returnTo=/library">Connect Telegram</ActionLink>
-          {/if}
-        </EmptyState>
-      {/if}
-    </LibrarySection>
-  </div>
+  <LibrarySection id="pins" title="Pins" count={`${data.library.pinned_memes.length} pinned`}>
+    {#if data.library.pinned_memes.length > 0}
+      <Card class="mb-4 grid gap-3 shadow-none" aria-labelledby="pin-order-title">
+        <div>
+          <h3 id="pin-order-title" class="m-0 text-xl font-black tracking-[-0.03em]">Pin order</h3>
+          <p class="m-0 text-muted">Use Up and Down controls for keyboard-safe ordering, or drag rows to a new position.</p>
+        </div>
+        <SortableList
+          items={orderedPinnedMemes}
+          onReorder={savePinOrder}
+          disabled={pinOrderPending}
+          class="grid gap-2"
+          itemElement="article"
+          itemClass="grid gap-2 rounded-xl border border-line bg-paper p-3 sm:grid-cols-[auto_minmax(0,1fr)_auto] sm:items-center"
+          aria-live="polite"
+          aria-busy={pinOrderPending}
+        >
+          {#snippet children(meme, index, controls)}
+            <span {@attach controls.attachHandle} class="cursor-grab rounded-full border border-line bg-soft px-3 py-1 text-sm font-black text-muted active:cursor-grabbing focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ink">Drag</span>
+            <div>
+              <p class="m-0 font-black">{meme.caption || meme.tags[0] || `Pinned meme ${index + 1}`}</p>
+              <p class="m-0 text-sm text-muted">Position {index + 1} of {orderedPinnedMemes.length}</p>
+            </div>
+            <div class="flex flex-wrap gap-2 sm:justify-end">
+              <Button size="compact" variant="secondary" type="button" onclick={() => movePin(meme.id, -1)} disabled={pinOrderPending || index === 0}>Up</Button>
+              <Button size="compact" variant="secondary" type="button" onclick={() => movePin(meme.id, 1)} disabled={pinOrderPending || index === orderedPinnedMemes.length - 1}>Down</Button>
+            </div>
+          {/snippet}
+        </SortableList>
+        {#if pinOrderMessage}
+          <p class="m-0 text-sm text-muted" role="status">{pinOrderMessage}</p>
+        {/if}
+      </Card>
+      <MemeGrid
+        memes={orderedPinnedMemes}
+        label="Pinned memes"
+        bulk={{ enabled: true, saveEnabled: true, collectionOptions: bulkOptions, guidance: bulkGuidance }}
+        showAccessMarkers={Boolean(session)}
+      />
+    {:else}
+      <EmptyState title="No pins yet" message={libraryEmptyText('pins', session)}>
+        {#if capabilities.showConnectTelegram}
+          <ActionLink size="compact" href="/account/telegram?returnTo=/library">Connect Telegram</ActionLink>
+        {/if}
+      </EmptyState>
+    {/if}
+  </LibrarySection>
 {/if}

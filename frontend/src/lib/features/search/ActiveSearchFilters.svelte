@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { MemeSearchScope, WebCollectionListRead } from '$lib/api/types';
-  import { Badge } from '$lib/ui';
+  import { Badge, PillLink } from '$lib/ui';
   import {
     buildSearchHref,
     LANGUAGE_OPTIONS,
@@ -115,9 +115,9 @@
       <h2 id="search-ideas-title" class="m-0 text-sm font-semibold text-muted">Try a search</h2>
       <div class="mt-2 flex flex-wrap gap-2">
         {#each SUGGESTED_INTENTS as intent}
-          <a class="rounded-full border border-line bg-paper px-3 py-1.5 text-sm font-semibold text-ink no-underline hover:bg-soft" href={filterHref({ query: intent.query })}>
+          <PillLink size="compact" href={filterHref({ query: intent.query })}>
             {intent.label}
-          </a>
+          </PillLink>
         {/each}
       </div>
     </div>
@@ -125,9 +125,9 @@
       <h2 class="m-0 text-sm font-semibold text-muted">Browse categories</h2>
       <div class="mt-2 flex flex-wrap gap-2" aria-label="Quick categories">
         {#each QUICK_SEARCH_TAGS as tag}
-          <a class="rounded-full border border-line bg-paper px-3 py-1.5 text-sm font-semibold text-ink no-underline hover:bg-soft" href={filterHref({ tags: [tag] })}>
+          <PillLink size="compact" href={filterHref({ tags: [tag] })}>
             #{categoryLabel(tag)}
-          </a>
+          </PillLink>
         {/each}
       </div>
     </div>

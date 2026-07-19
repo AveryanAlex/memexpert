@@ -22,6 +22,8 @@ describe('/trends/timeline page', () => {
     expect(body).toContain('Meme timeline.');
     expect(body).toContain('href="/trends/timeline?granularity=month"');
     expect(body).toContain('href="/trends/timeline?granularity=year"');
+    expect(body).toMatch(/href="\/trends\/timeline\?granularity=month"[^>]*aria-current="page"/);
+    expect(body).not.toMatch(/href="\/trends\/timeline\?granularity=year"[^>]*aria-current="page"/);
     expect(body).toContain('No moments to revisit yet');
     expect(body).toContain('Come back soon to look back at emerging favorites.');
     expect(body).not.toContain('source deltas or platform events');

@@ -3,7 +3,7 @@
   import { invalidateAll } from '$app/navigation';
   import { recordMemeDownload } from '$lib/api/client';
   import type { MemeResultAttributionRead, PublicMemeCardRead } from '$lib/api/types';
-  import { memeActionAttributionBody } from '$lib/memeActions';
+  import { memeActionAttributionBody, memeTitle } from '$lib/memeActions';
   import { Button, Select } from '$lib/ui';
   import { Download } from '@lucide/svelte';
   import {
@@ -12,6 +12,7 @@
     selectedMemes,
     type MemeGridBulkOptions
   } from './bulk-view-model';
+  import { memeDiscoveryDataAttributes } from './discovery-attribution';
   import MemeCard from './MemeCard.svelte';
   import type { MemeVideoPreviewMode } from './meme-video';
   import { buildMasonryColumns, masonryColumnCount, masonryColumnWidth } from './masonry-layout';
@@ -233,7 +234,7 @@
       if (!response.ok) {
         const payload = await response.json().catch(() => null);
         const detail = typeof payload?.detail === 'string' ? payload.detail : `HTTP ${response.status}`;
-        throw new Error(`Could not update ${meme.caption || meme.tags[0] || 'selected meme'}: ${detail}`);
+        throw new Error(`Could not update ${memeTitle(meme)}: ${detail}`);
       }
     }
   }
@@ -304,28 +305,36 @@
   <p class="mb-3 text-sm text-muted" role="status">{statusMessage}</p>
 {/if}
 
+{#snippet gridItem(meme: PublicMemeCardRead)}
+  {@const attribution = attributions[meme.id]}
+  {@const discoveryAttributes = memeDiscoveryDataAttributes(attribution)}
+  <div
+    class="relative min-w-0 max-w-full"
+    role="presentation"
+    {...discoveryAttributes}
+  >
+    {#if selectionMode}
+      <label class="absolute left-3 top-3 z-20 inline-flex items-center gap-2 rounded-full border border-line bg-paper/95 px-3 py-2 text-sm font-extrabold shadow-warm">
+        <input type="checkbox" checked={selectedIds.includes(meme.id)} onchange={() => toggleSelection(meme.id)} aria-label={`Select ${memeTitle(meme)}`} />
+        Select
+      </label>
+    {/if}
+    <MemeCard
+      {meme}
+      {attribution}
+      position={memePositions.get(meme.id)}
+      total={memes.length}
+      {showAccessMarkers}
+      showZoom={renderedColumnCount > 1}
+      {videoPreviewMode}
+    />
+  </div>
+{/snippet}
+
 {#if layout === 'ordered'}
-  <section bind:this={gridElement} class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4" aria-label={label} data-layout="ordered" data-video-preview-mode={videoPreviewMode} role="list" aria-busy={pendingAction !== null}>
+  <section bind:this={gridElement} class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4" aria-label={label} data-column-count={renderedColumnCount} data-layout="ordered" data-video-preview-mode={videoPreviewMode} role="list" aria-busy={pendingAction !== null}>
     {#each memes as meme (meme.id)}
-      {@const attribution = attributions[meme.id]}
-      <div
-        class="relative min-w-0"
-        role="presentation"
-        data-discovery-source={attribution?.source_algorithm ?? undefined}
-        data-discovery-reason={attribution?.reason ?? undefined}
-        data-discovery-request-id={attribution?.request_id ?? undefined}
-        data-discovery-impression-id={attribution?.impression_id ?? undefined}
-        data-discovery-source-meme-id={attribution?.source_meme_id ?? undefined}
-        data-discovery-score={attribution?.score ?? undefined}
-      >
-        {#if selectionMode}
-          <label class="absolute left-3 top-3 z-20 inline-flex items-center gap-2 rounded-full border border-line bg-paper/95 px-3 py-2 text-sm font-extrabold shadow-warm">
-            <input type="checkbox" checked={selectedIds.includes(meme.id)} onchange={() => toggleSelection(meme.id)} aria-label={`Select ${meme.caption || meme.tags[0] || 'meme'}`} />
-            Select
-          </label>
-        {/if}
-        <MemeCard {meme} {attribution} position={memePositions.get(meme.id)} total={memes.length} {showAccessMarkers} {videoPreviewMode} />
-      </div>
+      {@render gridItem(meme)}
     {/each}
   </section>
 {:else}
@@ -333,25 +342,7 @@
     {#each masonryColumns as column (column.id)}
       <div class="grid min-w-0 flex-1 content-start gap-4" role="presentation">
         {#each column.items as meme (meme.id)}
-          {@const attribution = attributions[meme.id]}
-          <div
-            class="relative min-w-0 max-w-full"
-            role="presentation"
-            data-discovery-source={attribution?.source_algorithm ?? undefined}
-            data-discovery-reason={attribution?.reason ?? undefined}
-            data-discovery-request-id={attribution?.request_id ?? undefined}
-            data-discovery-impression-id={attribution?.impression_id ?? undefined}
-            data-discovery-source-meme-id={attribution?.source_meme_id ?? undefined}
-            data-discovery-score={attribution?.score ?? undefined}
-          >
-            {#if selectionMode}
-              <label class="absolute left-3 top-3 z-20 inline-flex items-center gap-2 rounded-full border border-line bg-paper/95 px-3 py-2 text-sm font-extrabold shadow-warm">
-                <input type="checkbox" checked={selectedIds.includes(meme.id)} onchange={() => toggleSelection(meme.id)} aria-label={`Select ${meme.caption || meme.tags[0] || 'meme'}`} />
-                Select
-              </label>
-            {/if}
-            <MemeCard {meme} {attribution} position={memePositions.get(meme.id)} total={memes.length} {showAccessMarkers} {videoPreviewMode} />
-          </div>
+          {@render gridItem(meme)}
         {/each}
       </div>
     {/each}

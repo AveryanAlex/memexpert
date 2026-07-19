@@ -31,6 +31,10 @@ describe('/library page', () => {
     expect(body).toContain('href="#favorites"');
     expect(body).toContain('href="#collections"');
     expect(body).toContain('href="#pins"');
+    expect(body).toMatch(/href="#favorites"[^>]*focus-visible:outline-accent/);
+    expect(body).toContain('<section id="favorites"');
+    expect(body).toContain('<section id="collections"');
+    expect(body).toContain('<section id="pins"');
     expect(body).toContain('Save into');
     expect(body).toContain('Team saves');
     expect(body).toContain('Active save');

@@ -2,7 +2,7 @@
   import type { AdminMemeTemplateRead } from '$lib/api/types';
   import AdvancedSection from '$lib/features/admin/AdvancedSection.svelte';
   import { formatAdminTimestamp } from '$lib/features/admin/formatTimestamp';
-  import { Badge, Button, Card, Input, Select, Textarea } from '$lib/ui';
+  import { Badge, Button, Card, FormRow, Input, Label, Select, Textarea } from '$lib/ui';
 
   let { template, mergeTargets }: { template: AdminMemeTemplateRead; mergeTargets: AdminMemeTemplateRead[] } = $props();
 
@@ -31,27 +31,23 @@
     <form method="POST" action="?/updateTemplate" class="grid gap-4">
       <input type="hidden" name="template_id" value={template.id} />
       <div class="grid gap-4 lg:grid-cols-2">
-        <label class="grid gap-2 text-sm font-extrabold">
-          Slug
+        <FormRow label="Slug">
           <Input name="slug" value={template.slug} required />
-        </label>
-        <label class="grid gap-2 text-sm font-extrabold">
-          Name
+        </FormRow>
+        <FormRow label="Name">
           <Input name="name" value={template.name} required />
-        </label>
+        </FormRow>
       </div>
-      <label class="grid gap-2 text-sm font-extrabold">
-        Description (optional)
+      <FormRow label="Description (optional)">
         <Textarea name="description" value={template.description ?? ''} rows={3} />
-      </label>
-      <label class="grid gap-2 text-sm font-extrabold">
-        Base image URL (optional)
+      </FormRow>
+      <FormRow label="Base image URL (optional)">
         <Input name="base_image_url" type="url" value={template.base_image_url ?? ''} />
-      </label>
-      <label class="inline-flex items-center gap-2 text-sm font-extrabold">
+      </FormRow>
+      <Label class="!inline-flex items-center gap-2">
         <input name="is_curated" type="checkbox" checked={template.is_curated} />
         Curator has reviewed this template
-      </label>
+      </Label>
       <div><Button type="submit" variant="secondary">Save template</Button></div>
     </form>
   </AdvancedSection>
@@ -60,31 +56,26 @@
     <div class="grid gap-6">
       <form method="POST" action="?/mergeTemplate" class="grid gap-3 border-b border-danger-line pb-6">
         <input type="hidden" name="template_id" value={template.id} />
-        <label class="grid gap-2 text-sm font-extrabold">
-          Merge into
+        <FormRow label="Merge into">
           <Select name="target_template_id" required disabled={!targetTemplates.length}>
             <option value="">Choose a target template</option>
             {#each targetTemplates as target (target.id)}<option value={target.id}>{target.name} · {target.slug}</option>{/each}
           </Select>
-        </label>
-        <label class="grid gap-2 text-sm font-extrabold">
-          Reason for merge
-          <span class="text-xs font-medium text-muted">This reason accompanies the affected meme decisions created by the merge.</span>
+        </FormRow>
+        <FormRow label="Reason for merge" hint="This reason accompanies the affected meme decisions created by the merge.">
           <Textarea name="note" required placeholder="Why are these templates being combined?" rows={2} />
-        </label>
-        <label class="grid gap-2 text-sm font-extrabold">
-          Type MERGE to confirm
+        </FormRow>
+        <FormRow label="Type MERGE to confirm">
           <Input name="confirmation_phrase" autocomplete="off" required />
-        </label>
+        </FormRow>
         <div><Button type="submit" variant="danger" disabled={!targetTemplates.length}>Merge template</Button></div>
       </form>
 
       <form method="POST" action="?/deleteTemplate" class="grid gap-3">
         <input type="hidden" name="template_id" value={template.id} />
-        <label class="grid gap-2 text-sm font-extrabold">
-          Type DELETE to confirm
+        <FormRow label="Type DELETE to confirm">
           <Input name="confirmation_phrase" autocomplete="off" required />
-        </label>
+        </FormRow>
         <div><Button type="submit" variant="danger">Delete template</Button></div>
       </form>
     </div>

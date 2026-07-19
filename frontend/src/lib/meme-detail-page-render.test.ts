@@ -74,6 +74,7 @@ describe('/memes/[id] page', () => {
     expect(body).not.toContain('source image embedding');
     expect(body).toContain('data-discovery-source="qdrant_similarity"');
     expect(body).toContain('data-discovery-request-id="req_detail"');
+    expect(body).toContain('data-discovery-source-meme-id="11111111-1111-4111-8111-111111111111"');
     expect(body).toContain('attribution_request_id=req_detail');
     expect(body).toContain('attribution_source_algorithm=qdrant_similarity');
     expect(body).toContain('Another reaction meme');
@@ -179,16 +180,55 @@ describe('tag and template discovery pages', () => {
     });
 
     expect(tagBody).toContain('Gallery-first tag meme');
+    expect(tagBody).toContain('aria-label="Tagged memes"');
     expect(tagBody).toContain('About this tag');
+    expect(tagBody).toContain("1 memes help shape this tag's recent popularity.");
     expect(tagBody).toContain('34 views');
+    expect(tagBody).toContain('href="/search"');
     expect(tagBody.indexOf('Gallery-first tag meme')).toBeLessThan(tagBody.indexOf('About this tag'));
     expect(tagBody).not.toContain('No materialized trend data');
 
     expect(templateBody).toContain('Gallery-first template meme');
+    expect(templateBody).toContain('aria-label="Template memes"');
     expect(templateBody).toContain('About this template');
+    expect(templateBody).toContain("1 memes help shape this template's recent popularity.");
     expect(templateBody).toContain('34 views');
+    expect(templateBody).toContain('href="/search"');
     expect(templateBody.indexOf('Gallery-first template meme')).toBeLessThan(templateBody.indexOf('About this template'));
     expect(templateBody).not.toContain('No materialized trend data');
+  });
+
+  it('preserves offset pagination links for both taxonomy routes', () => {
+    const tagLanding = landing(
+      'tag',
+      'reaction',
+      'Reaction memes',
+      memeCard('88888888-8888-4888-8888-888888888888', 'Paginated tag meme')
+    );
+    const templateLanding = landing(
+      'template',
+      'distracted-boyfriend',
+      'Distracted boyfriend memes',
+      memeCard('99999999-9999-4999-8999-999999999999', 'Paginated template meme')
+    );
+
+    for (const landingPage of [tagLanding, templateLanding]) {
+      landingPage.page = { ...landingPage.page, limit: 20, offset: 40, total: 61, has_more: true };
+    }
+
+    const { body: tagBody } = render(TagLandingPage, {
+      props: { data: { session: null, sessionError: null, landing: tagLanding, offset: 40, errorMessage: null } }
+    });
+    const { body: templateBody } = render(TemplateLandingPage, {
+      props: { data: { session: null, sessionError: null, landing: templateLanding, offset: 40, errorMessage: null } }
+    });
+
+    for (const body of [tagBody, templateBody]) {
+      expect(body).toContain('Showing 41-41 of 61');
+      expect(body).toContain('href="?offset=20"');
+      expect(body).toContain('href="?offset=60"');
+      expect(body.indexOf('Previous')).toBeLessThan(body.indexOf('Next page'));
+    }
   });
 });
 

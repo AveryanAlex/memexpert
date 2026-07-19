@@ -1,7 +1,7 @@
 <script lang="ts">
   import BlockedPatternCard from '$lib/features/admin/moderation/BlockedPatternCard.svelte';
   import AdvancedSection from '$lib/features/admin/AdvancedSection.svelte';
-  import { Badge, Button, EmptyState, Input, Notice, Select, Textarea } from '$lib/ui';
+  import { Badge, Button, EmptyState, FormRow, Input, Label, Notice, Select, Textarea } from '$lib/ui';
   import type { ActionData, PageData } from './$types';
 
   let { data, form }: { data: PageData; form: ActionData } = $props();
@@ -68,38 +68,33 @@
 <div class="mt-6">
   <AdvancedSection title="Add a blocked pattern" description="Use this only when a known visual fingerprint should be held out of future uploads.">
     <form method="POST" action="?/createBlockedPerceptualHash" class="grid gap-4">
-      <label class="grid gap-2 text-sm font-extrabold">
-        Reason
+      <FormRow label="Reason">
         <Select name="reason">
           {#each reasons as [value, label]}<option {value}>{label}</option>{/each}
         </Select>
-      </label>
+      </FormRow>
 
       <AdvancedSection title="Pattern fingerprint and match settings" description="Technical values are for exceptional policy work. Bit size is calculated from the hash when you save.">
         <div class="grid gap-4">
-          <label class="grid gap-2 text-sm font-extrabold">
-            Raw perceptual hash
+          <FormRow label="Raw perceptual hash">
             <Input name="perceptual_hash" autocomplete="off" spellcheck={false} placeholder="Hexadecimal visual fingerprint" />
-          </label>
-          <label class="grid gap-2 text-sm font-extrabold">
-            Hash algorithm
+          </FormRow>
+          <FormRow label="Hash algorithm">
             <Select name="hash_algorithm"><option value="phash">pHash</option></Select>
-          </label>
-          <label class="grid gap-2 text-sm font-extrabold">
-            Allowed differing pHash bits
+          </FormRow>
+          <FormRow label="Allowed differing pHash bits">
             <Input name="max_hamming_distance" type="number" min="0" step="1" value="0" />
-          </label>
+          </FormRow>
         </div>
       </AdvancedSection>
 
-      <label class="inline-flex items-center gap-2 text-sm font-extrabold">
+      <Label class="!inline-flex items-center gap-2">
         <input name="is_active" type="checkbox" checked />
         Start blocking new uploads immediately
-      </label>
-      <label class="grid gap-2 text-sm font-extrabold">
-        Audit note (optional)
+      </Label>
+      <FormRow label="Audit note (optional)">
         <Textarea name="note" placeholder="Why should this pattern be blocked?" />
-      </label>
+      </FormRow>
       <div><Button type="submit">Add blocked pattern</Button></div>
     </form>
   </AdvancedSection>

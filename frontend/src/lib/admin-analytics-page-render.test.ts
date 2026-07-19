@@ -53,6 +53,8 @@ describe('admin analytics workspaces', () => {
     expect(body).toContain('sort=niche');
     expect(body).toContain('start_date=2026-06-01');
     expect(body).toContain('query_key=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef');
+    expect(body).toMatch(/href="[^\"]*sort=niche[^\"]*"[^>]*aria-current="page"/);
+    expect(body).toContain('focus-visible:outline-accent');
     expect(body).not.toContain('query=frog+reaction');
   });
 

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Button, FormRow, Input, PageHeader } from '$lib/ui';
+  import { Button, FormRow, Input, PageHeader, PillLink } from '$lib/ui';
   import {
     ADMIN_ANALYTICS_PRESETS,
     adminAnalyticsHref,
@@ -66,13 +66,12 @@
     <div class="flex flex-wrap gap-2" aria-label="Quick date ranges">
       {#each ADMIN_ANALYTICS_PRESETS as preset (preset.days)}
         {@const selected = selectedDays === preset.days}
-        <a
+        <PillLink
+          size="compact"
+          class="!py-2 !font-extrabold"
+          active={selected}
           href={adminAnalyticsPresetHref(currentPath, preset.days)}
-          aria-current={selected ? 'true' : undefined}
-          class={selected
-            ? 'rounded-full bg-ink px-3 py-2 text-sm font-extrabold text-paper no-underline'
-            : 'rounded-full border border-line bg-paper px-3 py-2 text-sm font-extrabold text-ink no-underline hover:bg-cream'}
-        >{preset.label}</a>
+        >{preset.label}</PillLink>
       {/each}
     </div>
   </div>

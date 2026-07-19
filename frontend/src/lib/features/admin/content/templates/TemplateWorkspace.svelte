@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { AdminMemeTemplateRead } from '$lib/api/types';
   import AdvancedSection from '$lib/features/admin/AdvancedSection.svelte';
-  import { Badge, Button, EmptyState, Input, Notice, Textarea } from '$lib/ui';
+  import { Badge, Button, EmptyState, FormRow, Input, Label, Notice, Textarea } from '$lib/ui';
   import TemplateCard from './TemplateCard.svelte';
 
   let {
@@ -48,10 +48,9 @@
         <p class="m-0 text-xs font-black uppercase tracking-[0.14em] text-muted">Primary list</p>
         <h2 id="template-list-heading" class="m-0 text-3xl font-black tracking-[-0.05em]">Template catalog</h2>
       </div>
-      <label class="grid gap-2 text-sm font-extrabold">
-        Search templates
+      <FormRow label="Search templates">
         <Input bind:value={query} type="search" placeholder="Search templates by name or slug" aria-label="Search templates by name or slug" />
-      </label>
+      </FormRow>
     </div>
     {#if filteredTemplates.length}
       <p class="m-0 text-sm text-muted">{filteredTemplates.length} {filteredTemplates.length === 1 ? 'template' : 'templates'} shown</p>
@@ -68,27 +67,23 @@
   <AdvancedSection title="Create a template" description="Create a new catalog entry only when an existing template does not match the meme family.">
     <form method="POST" action="?/createTemplate" class="grid gap-4">
       <div class="grid gap-4 lg:grid-cols-2">
-        <label class="grid gap-2 text-sm font-extrabold">
-          Slug
+        <FormRow label="Slug">
           <Input name="slug" required placeholder="distracted-boyfriend" />
-        </label>
-        <label class="grid gap-2 text-sm font-extrabold">
-          Name
+        </FormRow>
+        <FormRow label="Name">
           <Input name="name" required placeholder="Distracted Boyfriend" />
-        </label>
+        </FormRow>
       </div>
-      <label class="grid gap-2 text-sm font-extrabold">
-        Description (optional)
+      <FormRow label="Description (optional)">
         <Textarea name="description" rows={3} placeholder="How this template is typically used" />
-      </label>
-      <label class="grid gap-2 text-sm font-extrabold">
-        Base image URL (optional)
+      </FormRow>
+      <FormRow label="Base image URL (optional)">
         <Input name="base_image_url" type="url" placeholder="https://…" />
-      </label>
-      <label class="inline-flex items-center gap-2 text-sm font-extrabold">
+      </FormRow>
+      <Label class="!inline-flex items-center gap-2">
         <input name="is_curated" type="checkbox" />
         Curator has reviewed this template
-      </label>
+      </Label>
       <div><Button type="submit">Create template</Button></div>
     </form>
   </AdvancedSection>

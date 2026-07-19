@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { AdminMemeSeoReviewRowRead } from '$lib/api/types';
-  import { Badge, EmptyState, Notice } from '$lib/ui';
+  import { ActionLink, Badge, EmptyState, Notice } from '$lib/ui';
   import SeoReviewCard from './SeoReviewCard.svelte';
 
   let {
@@ -54,13 +54,13 @@
 
     <nav class="flex flex-wrap items-center justify-between gap-3 border-t border-line pt-4" aria-label="SEO review pagination">
       {#if paging.hasPrevious}
-        <a class="rounded-[14px] border border-line bg-paper px-3 py-2 text-sm font-extrabold text-ink no-underline hover:bg-soft" href={`/admin/content/seo?page=${paging.page - 1}`}>Previous</a>
+        <ActionLink variant="secondary" size="compact" href={`/admin/content/seo?page=${paging.page - 1}`}>Previous</ActionLink>
       {:else}
         <span class="rounded-[14px] border border-line bg-soft px-3 py-2 text-sm font-extrabold text-muted" aria-disabled="true">Previous</span>
       {/if}
       <span class="text-sm font-extrabold text-muted">Page {paging.page}</span>
       {#if paging.hasNext}
-        <a class="rounded-[14px] border border-line bg-paper px-3 py-2 text-sm font-extrabold text-ink no-underline hover:bg-soft" href={`/admin/content/seo?page=${paging.page + 1}`}>Next</a>
+        <ActionLink variant="secondary" size="compact" href={`/admin/content/seo?page=${paging.page + 1}`}>Next</ActionLink>
       {:else}
         <span class="rounded-[14px] border border-line bg-soft px-3 py-2 text-sm font-extrabold text-muted" aria-disabled="true">Next</span>
       {/if}
