@@ -986,3 +986,136 @@ async def test_0036_seeds_locale_synonym_drafts_and_idle_sync_state(
         "search_synonym_revisions",
         "search_synonym_sync_states",
     }.isdisjoint(await _get_table_names(engine))
+
+
+async def test_0037_adds_versioned_telegram_post_metadata(
+    empty_public_schema: tuple[AsyncEngine, str],
+) -> None:
+    engine, database_url = empty_public_schema
+    config = _build_alembic_config(database_url)
+    channel_id = uuid.uuid7()
+    post_row_id = uuid.uuid7()
+
+    await _run_alembic_command(command.upgrade, config, "0036")
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                """
+                INSERT INTO source_channels (id, platform, platform_id, title, is_active)
+                VALUES (:channel_id, 'telegram', 'metadata-legacy', 'Metadata legacy', true)
+                """
+            ),
+            {"channel_id": channel_id},
+        )
+        await connection.execute(
+            text(
+                """
+                INSERT INTO source_channel_posts (
+                    id, source_channel_id, post_id, published_at, status, attempt_count
+                ) VALUES (
+                    :post_row_id, :channel_id, '42', now(), 'accepted', 1
+                )
+                """
+            ),
+            {"post_row_id": post_row_id, "channel_id": channel_id},
+        )
+
+    await _run_alembic_command(command.upgrade, config, "0037")
+
+    async with engine.connect() as connection:
+        legacy_metadata = (
+            await connection.execute(
+                text(
+                    """
+                    SELECT first_observed_text,
+                           latest_text,
+                           first_observed_text_entities,
+                           latest_text_entities,
+                           media_group_id,
+                           reply_to_post_id,
+                           telegram_edited_at,
+                           metadata_first_observed_at,
+                           metadata_last_observed_at,
+                           metadata_version,
+                           is_deleted,
+                           deletion_observed_at
+                    FROM source_channel_posts
+                    WHERE id = :post_row_id
+                    """
+                ),
+                {"post_row_id": post_row_id},
+            )
+        ).one()
+        index_definition = (
+            await connection.execute(
+                text(
+                    """
+                    SELECT indexdef
+                    FROM pg_indexes
+                    WHERE schemaname = current_schema()
+                      AND tablename = 'source_channel_posts'
+                      AND indexname = 'ix_source_channel_posts_channel_media_group_post'
+                    """
+                )
+            )
+        ).scalar_one()
+        metadata_constraint = (
+            await connection.execute(
+                text(
+                    """
+                    SELECT pg_get_constraintdef(oid)
+                    FROM pg_constraint
+                    WHERE conname = 'ck_source_channel_posts_metadata_version_non_negative'
+                    """
+                )
+            )
+        ).scalar_one()
+
+    assert tuple(legacy_metadata) == (
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        0,
+        False,
+        None,
+    )
+    assert "WHERE (media_group_id IS NOT NULL)" in index_definition
+    assert "metadata_version >= 0" in metadata_constraint
+
+    await _run_alembic_command(command.downgrade, config, "0036")
+    async with engine.connect() as connection:
+        remaining_metadata_columns = set(
+            (
+                await connection.execute(
+                    text(
+                        """
+                        SELECT column_name
+                        FROM information_schema.columns
+                        WHERE table_schema = current_schema()
+                          AND table_name = 'source_channel_posts'
+                          AND column_name IN (
+                              'first_observed_text',
+                              'latest_text',
+                              'first_observed_text_entities',
+                              'latest_text_entities',
+                              'media_group_id',
+                              'reply_to_post_id',
+                              'telegram_edited_at',
+                              'metadata_first_observed_at',
+                              'metadata_last_observed_at',
+                              'metadata_version',
+                              'is_deleted',
+                              'deletion_observed_at'
+                          )
+                        """
+                    )
+                )
+            ).scalars()
+        )
+    assert remaining_metadata_columns == set()

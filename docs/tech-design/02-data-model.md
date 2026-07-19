@@ -99,6 +99,29 @@ bounded latest-backfill projection. The source-post channel/time index and the
 `meme_sources(platform, source_id, post_id)` unique index support these reads;
 there is no per-source query loop and no migration-owned counter that can drift.
 
+### SourceChannelPost
+
+The durable per-message Telegram inventory is the source of truth for post
+context before deduplication. In addition to fetch/attempt state, it stores
+`first_observed_text` and `latest_text`, their normalized allowlisted JSONB text
+entities, `media_group_id`, `reply_to_post_id`, `telegram_edited_at`, metadata
+first/last observation timestamps, `metadata_version`, and deletion state. No
+raw Telethon object crosses this boundary. Existing rows begin at metadata
+version `0`; successful captures use version `1`, where null text explicitly
+means Telegram exposed no text. First-observed fields are populated only while
+the prior version is below `1`; every successful observation updates latest
+fields and clears a stale deletion marker.
+
+`(source_channel_id, post_id)` remains the message identity. A partial
+`(source_channel_id, media_group_id, post_id)` index supports album-membership
+lookups only when `media_group_id` is present. Because `post_id` is stored as
+text for platform compatibility, callers order Telegram album members by its
+numeric value rather than lexical order. Albums do not introduce another model:
+each member remains an independent source post/meme, and `Meme.files` continues
+to mean alternative physical versions of one meme. `reply_to_post_id` is
+populated only from Telegram's explicit reply header; chronology alone creates
+no relationship.
+
 ### ChannelSuggestion
 
 User-submitted channel suggestions. Key fields: `user_id`, `platform`, `channel_url`, `status` (pending/approved/rejected), `admin_note`.

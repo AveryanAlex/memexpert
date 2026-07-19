@@ -24,6 +24,9 @@ from memexpert.crawlers.telegram.client import (
     PipelineTelegramSessionBannedError,
     RawTelegramChannel,
     RawTelegramMessage,
+    TelegramMessageEditedEvent,
+    TelegramMessagesDeletedEvent,
+    TelegramNewMessageEvent,
 )
 from memexpert.crawlers.telegram.runtime import (
     CrawlerCatchupReport,
@@ -44,6 +47,8 @@ from memexpert.schemas.content_pipeline import (
     CrawlerIngestOutcome,
     CrawlerIngestResult,
     RawCrawlerPost,
+    TelegramPostMetadata,
+    TelegramTextEntity,
 )
 from memexpert.services import CrawlerSessionNotRunnableError
 from tests.integration.test_ingest_accept_service import FakeStorageClient
@@ -68,6 +73,7 @@ def _build_photo_message(
     channel_id: str = "curated_channel",
     forward: CrawlerForwardAttribution | None = None,
     views: int = 11,
+    telegram_post: TelegramPostMetadata | None = None,
 ) -> RawTelegramMessage:
     return RawTelegramMessage(
         message_id=message_id,
@@ -79,6 +85,7 @@ def _build_photo_message(
         views=views,
         reactions={"heart": 3},
         forward=forward,
+        telegram_post=telegram_post,
     )
 
 
@@ -86,6 +93,7 @@ def _build_unsupported_message(
     *,
     message_id: str,
     channel_id: str = "curated_channel",
+    telegram_post: TelegramPostMetadata | None = None,
 ) -> RawTelegramMessage:
     return RawTelegramMessage(
         message_id=message_id,
@@ -97,6 +105,7 @@ def _build_unsupported_message(
         views=0,
         reactions={},
         forward=None,
+        telegram_post=telegram_post,
     )
 
 
@@ -282,6 +291,213 @@ async def test_catch_up_channel_ingests_and_counts_mixed_media(
         SourceChannelPostStatus.ACCEPTED,
         SourceChannelPostStatus.UNSUPPORTED,
     ]
+
+
+async def test_catch_up_captures_supported_and_text_only_metadata_before_short_circuits(
+    migrated_db_session: AsyncSession,
+) -> None:
+    await _seed_active_session(migrated_db_session, session_name="primary")
+    channel = await _seed_curated_channel(
+        migrated_db_session,
+        platform_id="metadata_channel",
+    )
+    edited_at = datetime(2024, 5, 1, 12, 30, tzinfo=UTC)
+    supported_metadata = TelegramPostMetadata(
+        text="  Exact caption 🧠\n",
+        text_entities=(TelegramTextEntity(type="bold", offset=2, length=5),),
+        media_group_id="9007199254740993",
+        reply_to_post_id="99",
+        edited_at=edited_at,
+    )
+    text_only_metadata = TelegramPostMetadata(text="Standalone text-only post")
+    supported = _build_photo_message(
+        message_id="100",
+        channel_id="metadata_channel",
+        telegram_post=supported_metadata,
+    )
+    text_only = _build_unsupported_message(
+        message_id="101",
+        channel_id="metadata_channel",
+        telegram_post=text_only_metadata,
+    )
+    fake = FakeTelegramClient(
+        canned_messages={"metadata_channel": [supported, text_only]},
+        media_by_message={"100": b"supported-media"},
+    )
+
+    report = await _build_runtime(
+        migrated_db_session,
+        telegram_client=fake,
+    ).catch_up_channel("primary", "metadata_channel")
+
+    assert report.messages_ingested == 1
+    assert report.messages_skipped_unsupported == 1
+    assert fake.downloaded_message_ids == ["100"]
+    rows = (
+        (
+            await migrated_db_session.execute(
+                select(SourceChannelPost)
+                .where(SourceChannelPost.source_channel_id == channel.id)
+                .order_by(SourceChannelPost.post_id.asc()),
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [row.post_id for row in rows] == ["100", "101"]
+    supported_row, text_only_row = rows
+    assert supported_row.first_observed_text == supported_metadata.text
+    assert supported_row.latest_text == supported_metadata.text
+    assert supported_row.first_observed_text_entities == supported_metadata.entity_json()
+    assert supported_row.latest_text_entities == supported_metadata.entity_json()
+    assert supported_row.media_group_id == supported_metadata.media_group_id
+    assert supported_row.reply_to_post_id == supported_metadata.reply_to_post_id
+    assert supported_row.telegram_edited_at == edited_at
+    assert supported_row.metadata_version == 1
+    assert supported_row.metadata_first_observed_at is not None
+    assert supported_row.metadata_last_observed_at == supported_row.metadata_first_observed_at
+    assert supported_row.is_deleted is False
+    assert supported_row.deletion_observed_at is None
+
+    assert text_only_row.status is SourceChannelPostStatus.UNSUPPORTED
+    assert text_only_row.first_observed_text == text_only_metadata.text
+    assert text_only_row.latest_text == text_only_metadata.text
+    assert text_only_row.first_observed_text_entities == []
+    assert text_only_row.latest_text_entities == []
+    assert text_only_row.metadata_version == 1
+
+    ingest_request = (
+        await migrated_db_session.execute(
+            select(PipelineIngestRequest).where(
+                PipelineIngestRequest.source_id == "metadata_channel",
+                PipelineIngestRequest.post_id == "100",
+            )
+        )
+    ).scalar_one()
+    assert ingest_request.source_metadata["telegram_post"] == supported_metadata.json_snapshot()
+
+
+async def test_reobservation_and_replay_preserve_first_metadata_and_refresh_latest(
+    migrated_db_session: AsyncSession,
+) -> None:
+    await _seed_active_session(migrated_db_session, session_name="primary")
+    channel = await _seed_curated_channel(
+        migrated_db_session,
+        platform_id="metadata_reobserve_channel",
+    )
+    original_metadata = TelegramPostMetadata(
+        text="first observed caption",
+        text_entities=(TelegramTextEntity(type="italic", offset=0, length=5),),
+        media_group_id="700",
+    )
+    original_message = _build_photo_message(
+        message_id="10",
+        channel_id="metadata_reobserve_channel",
+        telegram_post=original_metadata,
+    )
+    first_runtime = _build_runtime(
+        migrated_db_session,
+        telegram_client=FakeTelegramClient(
+            canned_messages={"metadata_reobserve_channel": [original_message]},
+            media_by_message={"10": b"original"},
+        ),
+    )
+    first_report = await first_runtime.catch_up_channel("primary", "metadata_reobserve_channel")
+    assert first_report.messages_ingested == 1
+
+    post_row = await migrated_db_session.scalar(
+        select(SourceChannelPost).where(
+            SourceChannelPost.source_channel_id == channel.id,
+            SourceChannelPost.post_id == "10",
+        )
+    )
+    assert post_row is not None
+    first_observed_at = post_row.metadata_first_observed_at
+    first_attempt_count = post_row.attempt_count
+    assert first_observed_at is not None
+
+    # Rewind only the test checkpoint so the same history item is observed
+    # again. The source-id duplicate path must run without downloading media,
+    # but its newer Telegram context must still be authoritative on the row.
+    channel.last_read_post_id = None
+    await migrated_db_session.commit()
+    reobserved_metadata = TelegramPostMetadata(
+        text="caption seen during a later history scan",
+        text_entities=(TelegramTextEntity(type="bold", offset=0, length=7),),
+        media_group_id="701",
+        reply_to_post_id="9",
+        edited_at=datetime(2024, 5, 2, 12, 30, tzinfo=UTC),
+    )
+    reobserved_message = _build_photo_message(
+        message_id="10",
+        channel_id="metadata_reobserve_channel",
+        telegram_post=reobserved_metadata,
+    )
+    duplicate_fake = FakeTelegramClient(
+        canned_messages={"metadata_reobserve_channel": [reobserved_message]},
+    )
+    duplicate_report = await _build_runtime(
+        migrated_db_session,
+        telegram_client=duplicate_fake,
+    ).catch_up_channel("primary", "metadata_reobserve_channel")
+
+    assert duplicate_report.messages_skipped_dedup == 1
+    assert duplicate_fake.downloaded_message_ids == []
+    await migrated_db_session.refresh(post_row)
+    assert post_row.first_observed_text == original_metadata.text
+    assert post_row.first_observed_text_entities == original_metadata.entity_json()
+    assert post_row.latest_text == reobserved_metadata.text
+    assert post_row.latest_text_entities == reobserved_metadata.entity_json()
+    assert post_row.media_group_id == "701"
+    assert post_row.reply_to_post_id == "9"
+    assert post_row.metadata_first_observed_at == first_observed_at
+    assert post_row.metadata_last_observed_at is not None
+    assert post_row.metadata_last_observed_at >= first_observed_at
+    assert post_row.attempt_count == first_attempt_count + 1
+
+    # Replay is another observation but remains checkpoint-neutral and also
+    # stops at the existing source before attempting a media download.
+    channel.last_read_post_id = "500"
+    await migrated_db_session.commit()
+    replay_metadata = TelegramPostMetadata(
+        text="caption seen during replay",
+        reply_to_post_id="8",
+        edited_at=datetime(2024, 5, 3, 12, 30, tzinfo=UTC),
+    )
+    replay_message = _build_photo_message(
+        message_id="10",
+        channel_id="metadata_reobserve_channel",
+        telegram_post=replay_metadata,
+    )
+    replay_fake = FakeTelegramClient()
+    replay_fake.pin_single_message(
+        channel_id="metadata_reobserve_channel",
+        post_id="10",
+        message=replay_message,
+    )
+    replay_result = await _build_runtime(
+        migrated_db_session,
+        telegram_client=replay_fake,
+    ).replay_post("metadata_reobserve_channel", "10")
+
+    assert replay_result.outcome is CrawlerIngestOutcome.SKIPPED_DUPLICATE_POST_ID
+    assert replay_fake.downloaded_message_ids == []
+    await migrated_db_session.refresh(channel)
+    await migrated_db_session.refresh(post_row)
+    assert channel.last_read_post_id == "500"
+    assert post_row.first_observed_text == original_metadata.text
+    assert post_row.latest_text == replay_metadata.text
+    assert post_row.reply_to_post_id == "8"
+    assert post_row.metadata_first_observed_at == first_observed_at
+    request = (
+        await migrated_db_session.execute(
+            select(PipelineIngestRequest).where(
+                PipelineIngestRequest.source_id == "metadata_reobserve_channel",
+                PipelineIngestRequest.post_id == "10",
+            )
+        )
+    ).scalar_one()
+    assert request.source_metadata["telegram_post"] == original_metadata.json_snapshot()
 
 
 async def test_catch_up_channel_records_successful_empty_poll(
@@ -577,6 +793,155 @@ async def test_older_history_backfill_moves_only_the_oldest_cursor(
     assert channel.oldest_observed_post_id == "1"
     assert channel.history_cursor_post_id == "1"
     assert channel.history_exhausted is True
+
+
+async def test_album_members_survive_history_pages_and_runtime_restarts_as_separate_posts(
+    migrated_db_session: AsyncSession,
+) -> None:
+    await _seed_active_session(migrated_db_session, session_name="primary")
+    channel = await _seed_curated_channel(
+        migrated_db_session,
+        platform_id="album_history_channel",
+        catchup_message_limit=2,
+    )
+    group_id = "9223372036854775000"
+    messages = [
+        _build_photo_message(
+            message_id=str(message_id),
+            channel_id="album_history_channel",
+            telegram_post=TelegramPostMetadata(
+                text=f"album member {message_id}",
+                media_group_id=group_id,
+            ),
+        )
+        for message_id in (9, 10, 11, 12)
+    ]
+    fake = FakeTelegramClient(
+        canned_messages={"album_history_channel": messages},
+        media_by_message={message.message_id: f"media-{message.message_id}".encode() for message in messages},
+    )
+
+    latest_report = await _build_runtime(
+        migrated_db_session,
+        telegram_client=fake,
+    ).catch_up_channel("primary", "album_history_channel")
+    assert latest_report.messages_ingested == 2
+    await migrated_db_session.refresh(channel)
+    assert channel.history_cursor_post_id == "11"
+
+    # Construct fresh runtimes for each older page to exercise durable album
+    # membership across the same restart boundaries used operationally.
+    first_older_report = await _build_runtime(
+        migrated_db_session,
+        telegram_client=fake,
+    ).catch_up_older_channel(
+        "primary",
+        "album_history_channel",
+        before_post_id=None,
+        limit=1,
+    )
+    assert first_older_report.messages_ingested == 1
+    await migrated_db_session.refresh(channel)
+    assert channel.history_cursor_post_id == "10"
+
+    second_older_report = await _build_runtime(
+        migrated_db_session,
+        telegram_client=fake,
+    ).catch_up_older_channel(
+        "primary",
+        "album_history_channel",
+        before_post_id=None,
+        limit=1,
+    )
+    assert second_older_report.messages_ingested == 1
+
+    group_rows = (
+        (
+            await migrated_db_session.execute(
+                select(SourceChannelPost).where(
+                    SourceChannelPost.source_channel_id == channel.id,
+                    SourceChannelPost.media_group_id == group_id,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    # Telegram message ids define album order numerically; every member keeps
+    # its own durable source row and ingest request.
+    numeric_order = sorted(group_rows, key=lambda row: int(row.post_id))
+    assert [row.post_id for row in numeric_order] == ["9", "10", "11", "12"]
+    assert [row.latest_text for row in numeric_order] == [
+        "album member 9",
+        "album member 10",
+        "album member 11",
+        "album member 12",
+    ]
+    assert len({row.id for row in group_rows}) == 4
+    assert (
+        await migrated_db_session.scalar(
+            select(func.count())
+            .select_from(PipelineIngestRequest)
+            .where(PipelineIngestRequest.source_id == "album_history_channel")
+        )
+        == 4
+    )
+
+
+async def test_adjacent_posts_are_unlinked_without_explicit_telegram_relationships(
+    migrated_db_session: AsyncSession,
+) -> None:
+    await _seed_active_session(migrated_db_session, session_name="primary")
+    channel = await _seed_curated_channel(
+        migrated_db_session,
+        platform_id="relationship_channel",
+    )
+    messages = [
+        _build_unsupported_message(
+            message_id="20",
+            channel_id="relationship_channel",
+            telegram_post=TelegramPostMetadata(text="context immediately before media"),
+        ),
+        _build_photo_message(
+            message_id="21",
+            channel_id="relationship_channel",
+            telegram_post=TelegramPostMetadata(text="standalone media"),
+        ),
+        _build_photo_message(
+            message_id="22",
+            channel_id="relationship_channel",
+            telegram_post=TelegramPostMetadata(
+                text="explicit reply",
+                reply_to_post_id="20",
+            ),
+        ),
+    ]
+    await _build_runtime(
+        migrated_db_session,
+        telegram_client=FakeTelegramClient(
+            canned_messages={"relationship_channel": messages},
+            media_by_message={"21": b"standalone", "22": b"reply"},
+        ),
+    ).catch_up_channel("primary", "relationship_channel")
+
+    posts = {
+        post.post_id: post
+        for post in (
+            (
+                await migrated_db_session.execute(
+                    select(SourceChannelPost).where(SourceChannelPost.source_channel_id == channel.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    }
+    assert posts["20"].media_group_id is None
+    assert posts["20"].reply_to_post_id is None
+    assert posts["21"].media_group_id is None
+    assert posts["21"].reply_to_post_id is None
+    assert posts["22"].media_group_id is None
+    assert posts["22"].reply_to_post_id == "20"
 
 
 async def test_older_history_uses_legacy_checkpoint_boundary_not_inventory_minimum(
@@ -1199,6 +1564,153 @@ async def test_catch_up_channel_preserves_forward_attribution_on_raw_request(
 # ---------------------------------------------------------------------------
 # Live listener lifecycle
 # ---------------------------------------------------------------------------
+
+
+async def test_live_edit_delete_and_reappearance_refresh_only_authoritative_metadata(
+    migrated_db_session: AsyncSession,
+) -> None:
+    await _seed_active_session(migrated_db_session, session_name="primary")
+    channel = await _seed_curated_channel(
+        migrated_db_session,
+        platform_id="live_metadata_channel",
+    )
+    original_metadata = TelegramPostMetadata(
+        text="original live caption",
+        media_group_id="5000",
+    )
+    original_message = _build_photo_message(
+        message_id="42",
+        channel_id="live_metadata_channel",
+        telegram_post=original_metadata,
+    )
+    await _build_runtime(
+        migrated_db_session,
+        telegram_client=FakeTelegramClient(
+            canned_messages={"live_metadata_channel": [original_message]},
+            media_by_message={"42": b"original-live-media"},
+        ),
+    ).catch_up_channel("primary", "live_metadata_channel")
+
+    post = await migrated_db_session.scalar(
+        select(SourceChannelPost).where(
+            SourceChannelPost.source_channel_id == channel.id,
+            SourceChannelPost.post_id == "42",
+        )
+    )
+    assert post is not None
+    original_status = post.status
+    original_attempt_count = post.attempt_count
+    original_first_observed_at = post.metadata_first_observed_at
+    channel.last_read_post_id = "500"
+    await migrated_db_session.commit()
+
+    edited_at = datetime(2024, 6, 1, 10, 0, tzinfo=UTC)
+    edited_metadata = TelegramPostMetadata(
+        text="edited live caption",
+        text_entities=(TelegramTextEntity(type="underline", offset=0, length=6),),
+        media_group_id="5000",
+        reply_to_post_id="41",
+        edited_at=edited_at,
+    )
+    edited_message = _build_photo_message(
+        message_id="42",
+        channel_id="live_metadata_channel",
+        telegram_post=edited_metadata,
+    )
+    edit_runtime = _build_runtime(
+        migrated_db_session,
+        telegram_client=FakeTelegramClient(
+            live_events=[TelegramMessageEditedEvent(message=edited_message)],
+        ),
+    )
+    await edit_runtime._run_live_listener(
+        session_name="primary",
+        channel_ids=["live_metadata_channel"],
+        ready_event=asyncio.Event(),
+    )
+
+    await migrated_db_session.refresh(channel)
+    await migrated_db_session.refresh(post)
+    assert channel.last_read_post_id == "500"
+    assert post.status is original_status
+    assert post.attempt_count == original_attempt_count
+    assert post.first_observed_text == original_metadata.text
+    assert post.latest_text == edited_metadata.text
+    assert post.latest_text_entities == edited_metadata.entity_json()
+    assert post.reply_to_post_id == "41"
+    assert post.telegram_edited_at == edited_at
+    assert post.metadata_first_observed_at == original_first_observed_at
+    assert post.is_deleted is False
+
+    delete_runtime = _build_runtime(
+        migrated_db_session,
+        telegram_client=FakeTelegramClient(
+            live_events=[
+                TelegramMessagesDeletedEvent(
+                    channel_id="live_metadata_channel",
+                    post_ids=("42",),
+                )
+            ],
+        ),
+    )
+    await delete_runtime._run_live_listener(
+        session_name="primary",
+        channel_ids=["live_metadata_channel"],
+        ready_event=asyncio.Event(),
+    )
+
+    await migrated_db_session.refresh(channel)
+    await migrated_db_session.refresh(post)
+    assert channel.last_read_post_id == "500"
+    assert post.status is original_status
+    assert post.attempt_count == original_attempt_count
+    assert post.first_observed_text == original_metadata.text
+    assert post.latest_text == edited_metadata.text
+    assert post.is_deleted is True
+    assert post.deletion_observed_at is not None
+
+    reappeared_metadata = TelegramPostMetadata(
+        text="reappeared live caption",
+        media_group_id="5000",
+        reply_to_post_id="40",
+        edited_at=datetime(2024, 6, 2, 10, 0, tzinfo=UTC),
+    )
+    reappeared_message = _build_photo_message(
+        message_id="42",
+        channel_id="live_metadata_channel",
+        telegram_post=reappeared_metadata,
+    )
+    reappearance_fake = FakeTelegramClient(
+        live_events=[TelegramNewMessageEvent(message=reappeared_message)],
+    )
+    await _build_runtime(
+        migrated_db_session,
+        telegram_client=reappearance_fake,
+    )._run_live_listener(
+        session_name="primary",
+        channel_ids=["live_metadata_channel"],
+        ready_event=asyncio.Event(),
+    )
+
+    await migrated_db_session.refresh(channel)
+    await migrated_db_session.refresh(post)
+    assert channel.last_read_post_id == "500"
+    assert post.status is original_status
+    assert post.attempt_count == original_attempt_count + 1
+    assert post.first_observed_text == original_metadata.text
+    assert post.latest_text == reappeared_metadata.text
+    assert post.reply_to_post_id == "40"
+    assert post.is_deleted is False
+    assert post.deletion_observed_at is None
+    assert reappearance_fake.downloaded_message_ids == []
+    assert (
+        await migrated_db_session.scalar(
+            select(func.count())
+            .select_from(PipelineIngestRequest)
+            .where(PipelineIngestRequest.source_id == "live_metadata_channel")
+        )
+        == 1
+    )
 
 
 async def test_live_listener_round_trips_one_message_and_stops_cleanly(

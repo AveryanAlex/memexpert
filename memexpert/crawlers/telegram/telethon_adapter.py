@@ -34,6 +34,7 @@ from telethon.sessions import StringSession
 from telethon.tl.types import Channel, InputPeerChannel
 from telethon.tl.types import Message as TelethonMessage
 from telethon.tl.types import MessageService as TelethonMessageService
+from telethon.utils import get_peer_id
 
 from memexpert.core.database import build_async_engine, build_async_session_factory
 from memexpert.crawlers.telegram.client import (
@@ -47,6 +48,10 @@ from memexpert.crawlers.telegram.client import (
     PipelineTelegramSessionNotRunnableError,
     RawTelegramChannel,
     RawTelegramMessage,
+    TelegramLiveEvent,
+    TelegramMessageEditedEvent,
+    TelegramMessagesDeletedEvent,
+    TelegramNewMessageEvent,
 )
 from memexpert.crawlers.telegram.session_crypto import (
     TelegramStringSessionCipher,
@@ -61,7 +66,6 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Sequence
 
     from sqlalchemy.ext.asyncio import AsyncEngine
-    from telethon.events import NewMessage
 
     from memexpert.core.config import Settings
     from memexpert.core.database import AsyncSessionFactory
@@ -174,12 +178,15 @@ class TelethonClientFactory:
     Reads ``telegram_api_id`` / ``telegram_api_hash`` from settings and the
     encrypted Telethon ``StringSession`` from ``telegram_sessions`` only on the
     first :meth:`get_client` call. Subsequent calls return the cached client so
-    the runtime does not reconnect on every catch-up sweep.
+    the runtime does not reconnect on every catch-up sweep. Operators can set
+    ``persist_session_state=False`` for read-only previews that must not update
+    session heartbeat, account, or authentication diagnostics.
     """
 
     settings: Settings
     session_name: str
     session_factory: AsyncSessionFactory | None = None
+    persist_session_state: bool = True
     _client: TelegramClient | None = field(default=None, init=False, repr=False)
     _engine: AsyncEngine | None = field(default=None, init=False, repr=False)
     _session_factory: AsyncSessionFactory | None = field(default=None, init=False, repr=False)
@@ -223,7 +230,10 @@ class TelethonClientFactory:
                     self._client = None
                     await self._disconnect_client(client)
                     raise
-                if isinstance(translated_error, PipelineTelegramSessionAuthRequiredError):
+                if self.persist_session_state and isinstance(
+                    translated_error,
+                    PipelineTelegramSessionAuthRequiredError,
+                ):
                     with suppress(Exception):
                         await self._mark_auth_required(
                             error_class=type(translated_error).__name__,
@@ -245,15 +255,17 @@ class TelethonClientFactory:
                     f"Telegram session {self.session_name!r} is not authorized; "
                     "import a valid Telethon StringSession with scripts/auth_telegram_session.py."
                 )
-                with suppress(Exception):
-                    await self._mark_auth_required(
-                        error_class=PipelineTelegramSessionAuthRequiredError.__name__,
-                        error_text=message,
-                    )
+                if self.persist_session_state:
+                    with suppress(Exception):
+                        await self._mark_auth_required(
+                            error_class=PipelineTelegramSessionAuthRequiredError.__name__,
+                            error_text=message,
+                        )
                 self._client = None
                 await self._disconnect_client(client)
                 raise PipelineTelegramSessionAuthRequiredError(message)
-            await self._mark_authorized(account=account)
+            if self.persist_session_state:
+                await self._mark_authorized(account=account)
             return client
 
     def _build_client(self, string_session: SecretStr) -> TelegramClient:
@@ -450,12 +462,12 @@ class PipelineTelethonClient(PipelineTelegramClientProtocol):
     factory: TelethonClientFactory
     rate_limiter: _RateLimiter
     _entity_cache: dict[str, Channel] = field(default_factory=dict, init=False, repr=False)
-    _live_queue: asyncio.Queue[RawTelegramMessage] | None = field(
+    _live_queue: asyncio.Queue[TelegramLiveEvent] | None = field(
         default=None,
         init=False,
         repr=False,
     )
-    _live_handler: object | None = field(default=None, init=False, repr=False)
+    _live_handlers: list[object] = field(default_factory=list, init=False, repr=False)
     _closed: bool = field(default=False, init=False, repr=False)
 
     @classmethod
@@ -464,11 +476,20 @@ class PipelineTelethonClient(PipelineTelegramClientProtocol):
         *,
         settings: Settings,
         session_name: str,
+        persist_session_state: bool = True,
     ) -> PipelineTelethonClient:
-        """Return a new adapter bound to ``session_name`` without connecting yet."""
+        """Return an adapter bound to ``session_name`` without connecting yet.
+
+        ``persist_session_state=False`` keeps connection/auth observations out
+        of the database for read-only operator previews.
+        """
 
         return cls(
-            factory=TelethonClientFactory(settings=settings, session_name=session_name),
+            factory=TelethonClientFactory(
+                settings=settings,
+                session_name=session_name,
+                persist_session_state=persist_session_state,
+            ),
             rate_limiter=_RateLimiter(
                 max_requests_per_second=settings.crawler_max_requests_per_second,
             ),
@@ -713,15 +734,14 @@ class PipelineTelethonClient(PipelineTelegramClientProtocol):
         *,
         channel_ids: Sequence[str],
         ready_event: asyncio.Event | None = None,
-    ) -> AsyncIterator[RawTelegramMessage]:
-        """Stream live messages for the requested channels via a Telethon handler.
+    ) -> AsyncIterator[TelegramLiveEvent]:
+        """Stream new, edited, and deleted messages via Telethon handlers.
 
-        Registers one ``events.NewMessage`` handler covering every
-        resolved channel and bridges events into an ``asyncio.Queue``
-        so the runtime's async for loop never blocks the Telethon
-        dispatcher. The handler normalizes the message into a
-        :class:`RawTelegramMessage` inside the handler and puts the
-        projection on the queue; the async iterator just drains it.
+        Registers new-message, edit, and deletion handlers covering every
+        resolved channel and bridges events into an ``asyncio.Queue`` so the
+        runtime's async for loop never blocks the Telethon dispatcher. Message
+        handlers normalize into :class:`RawTelegramMessage` before queuing;
+        deletion handlers queue the affected channel and post IDs.
         """
 
         client = await self._get_client()
@@ -730,41 +750,66 @@ class PipelineTelethonClient(PipelineTelegramClientProtocol):
         for channel_id in channel_ids:
             entity = await self._resolve_entity(channel_id)
             entities.append(entity)
-            channel_lookup[int(entity.id)] = (
+            lookup = (
                 channel_id,
                 getattr(entity, "title", None) or channel_id,
                 getattr(entity, "username", None),
             )
+            channel_lookup[int(entity.id)] = lookup
+            channel_lookup[int(get_peer_id(entity))] = lookup
 
-        queue: asyncio.Queue[RawTelegramMessage] = asyncio.Queue()
+        queue: asyncio.Queue[TelegramLiveEvent] = asyncio.Queue()
         self._live_queue = queue
 
-        async def _on_new_message(event: NewMessage.Event) -> None:
+        def _normalize_event_message(raw_message: object) -> RawTelegramMessage | None:
             try:
-                raw_message = event.message
-                resolved_channel_id = int(getattr(raw_message.peer_id, "channel_id", 0))
+                peer_id = getattr(raw_message, "peer_id", None)
+                resolved_channel_id = int(getattr(peer_id, "channel_id", 0))
                 lookup = channel_lookup.get(resolved_channel_id)
                 if lookup is None:
-                    return
+                    return None
                 channel_id_str, channel_title, channel_username = lookup
-                normalized = TelethonMessageNormalizer.build(
-                    message=raw_message,
+                return TelethonMessageNormalizer.build(
+                    message=cast("Any", raw_message),
                     channel_id=channel_id_str,
                     channel_title=channel_title,
                     channel_username=channel_username,
                 )
             except PipelineTelegramMalformedMessageError:
-                # Never propagate into Telethon's dispatcher — malformed
-                # live messages are logged by the caller via the queue
-                # drain path; the handler just drops them.
-                return
-            await queue.put(normalized)
+                return None
 
-        client.add_event_handler(
-            _on_new_message,
-            events.NewMessage(chats=cast("list[object]", entities)),
+        async def _on_new_message(event: Any) -> None:
+            normalized = _normalize_event_message(event.message)
+            if normalized is not None:
+                await queue.put(TelegramNewMessageEvent(message=normalized))
+
+        async def _on_message_edited(event: Any) -> None:
+            normalized = _normalize_event_message(event.message)
+            if normalized is not None:
+                await queue.put(TelegramMessageEditedEvent(message=normalized))
+
+        async def _on_messages_deleted(event: Any) -> None:
+            raw_chat_id = getattr(event, "chat_id", None)
+            if not isinstance(raw_chat_id, int):
+                return
+            lookup = channel_lookup.get(raw_chat_id)
+            if lookup is None:
+                return
+            deleted_ids = getattr(event, "deleted_ids", None)
+            if not isinstance(deleted_ids, (list, tuple)):
+                return
+            post_ids = tuple(str(post_id) for post_id in deleted_ids if isinstance(post_id, int))
+            if post_ids:
+                await queue.put(TelegramMessagesDeletedEvent(channel_id=lookup[0], post_ids=post_ids))
+
+        live_handlers = (
+            (_on_new_message, events.NewMessage(chats=cast("list[object]", entities))),
+            (_on_message_edited, events.MessageEdited(chats=cast("list[object]", entities))),
+            (_on_messages_deleted, events.MessageDeleted(chats=cast("list[object]", entities))),
         )
-        self._live_handler = _on_new_message
+        for handler, event_builder in live_handlers:
+            client.add_event_handler(handler, event_builder)
+            self._live_handlers.append(handler)
         if ready_event is not None:
             ready_event.set()
 
@@ -807,11 +852,78 @@ class PipelineTelethonClient(PipelineTelegramClientProtocol):
         finally:
             if disconnected_guard is not None and not disconnected_guard.done():
                 disconnected_guard.cancel()
-            if self._live_handler is not None:
+            for handler in self._live_handlers:
                 with suppress(Exception):
-                    client.remove_event_handler(self._live_handler)
-                self._live_handler = None
+                    client.remove_event_handler(cast("Any", handler))
+            self._live_handlers.clear()
             self._live_queue = None
+
+    async def fetch_messages(
+        self,
+        *,
+        channel_id: str,
+        post_ids: Sequence[str],
+    ) -> dict[str, RawTelegramMessage | None]:
+        """Fetch one RPC chunk, preserving only explicit missing results."""
+
+        if len(post_ids) > 100:
+            raise ValueError("Telegram metadata batches must contain at most 100 post ids.")
+        if not post_ids:
+            return {}
+        numeric_post_ids: list[int] = []
+        for post_id in post_ids:
+            try:
+                numeric_post_ids.append(int(post_id))
+            except ValueError as exc:
+                raise PipelineTelegramMalformedMessageError(
+                    f"Telegram post ids must be numeric; got {post_id!r}.",
+                ) from exc
+
+        client = await self._get_client()
+        entity = await self._resolve_entity(channel_id)
+        channel_title = getattr(entity, "title", None) or channel_id
+        channel_username = getattr(entity, "username", None)
+        await self.rate_limiter.acquire()
+        fetched = await self._await_operation(
+            client.get_messages(entity, ids=numeric_post_ids),
+            operation="fetch_messages",
+            timeout_seconds=self.factory.settings.crawler_telegram_single_message_timeout_seconds,
+            client=client,
+            channel_id=channel_id,
+        )
+        fetched_messages = tuple(fetched) if isinstance(fetched, (list, tuple)) else (fetched,)
+        for raw_message in fetched_messages:
+            if raw_message is None:
+                continue
+            if not isinstance(raw_message, (TelethonMessage, TelethonMessageService)):
+                raise PipelineTelegramMalformedMessageError(
+                    "Telegram returned an unexpected item in a metadata batch: "
+                    f"{type(raw_message).__name__}.",
+                )
+        if len(fetched_messages) != len(post_ids):
+            # Telethon documents positional results for integer message IDs.
+            # If Telegram omits an entry entirely, its position is ambiguous;
+            # omit every key so the backfill treats the batch as transient
+            # instead of guessing that any post was deleted.
+            return {}
+
+        results: dict[str, RawTelegramMessage | None] = {}
+        for post_id, raw_message in zip(post_ids, fetched_messages, strict=True):
+            if raw_message is None:
+                results[post_id] = None
+                continue
+            normalized = TelethonMessageNormalizer.build(
+                message=cast("Any", raw_message),
+                channel_id=channel_id,
+                channel_title=channel_title,
+                channel_username=channel_username,
+            )
+            if normalized.message_id != post_id:
+                raise PipelineTelegramMalformedMessageError(
+                    "Telegram returned an unrequested message id in a metadata batch.",
+                )
+            results[post_id] = normalized
+        return results
 
     async def download_media(self, message: RawTelegramMessage) -> bytes:
         """Download the media bytes for one normalized message via Telethon."""

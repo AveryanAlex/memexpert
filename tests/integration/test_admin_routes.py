@@ -2081,6 +2081,11 @@ async def test_admin_source_message_inventory_and_manual_backfill(
                     last_error_code="download_unavailable",
                     last_error_text="provider disconnected",
                     attempt_count=1,
+                    metadata_version=1,
+                    metadata_first_observed_at=now - timedelta(minutes=1),
+                    metadata_last_observed_at=now,
+                    is_deleted=True,
+                    deletion_observed_at=now,
                 ),
                 SourceChannelPost(
                     source_channel_id=channel.id,
@@ -2089,6 +2094,16 @@ async def test_admin_source_message_inventory_and_manual_backfill(
                     media_type="photo",
                     status=SourceChannelPostStatus.ACCEPTED,
                     attempt_count=1,
+                    first_observed_text="Original caption",
+                    latest_text="x" * 600,
+                    first_observed_text_entities=[],
+                    latest_text_entities=[],
+                    media_group_id="9007199254740993",
+                    reply_to_post_id="103",
+                    telegram_edited_at=now - timedelta(seconds=30),
+                    metadata_first_observed_at=now - timedelta(minutes=1),
+                    metadata_last_observed_at=now,
+                    metadata_version=1,
                 ),
                 PipelineIngestRequest(
                     source_platform=SourcePlatform.TELEGRAM,
@@ -2201,14 +2216,26 @@ async def test_admin_source_message_inventory_and_manual_backfill(
         "processing_count": 1,
         "failed_count": 1,
         "not_indexable_count": 2,
+        "metadata_captured_count": 2,
+        "metadata_missing_count": 4,
     }
     assert page["items"][0]["index_status"] == "indexed"
     assert page["items"][0]["qdrant_status"] == "synced"
     assert page["items"][0]["meilisearch_status"] == "synced"
+    assert page["items"][0]["metadata_state"] == "captured"
+    assert page["items"][0]["text_excerpt"] == f"{'x' * 497}..."
+    assert page["items"][0]["media_group_id"] == "9007199254740993"
+    assert page["items"][0]["reply_to_post_id"] == "103"
+    assert datetime.fromisoformat(page["items"][0]["telegram_edited_at"]) == now - timedelta(seconds=30)
     assert page["items"][1]["index_status"] == "failed"
     assert page["items"][1]["fetch_detail"] == "download_unavailable — provider disconnected"
+    assert page["items"][1]["metadata_state"] == "captured"
+    assert page["items"][1]["text_excerpt"] is None
+    assert page["items"][1]["is_deleted"] is True
+    assert datetime.fromisoformat(page["items"][1]["deletion_observed_at"]) == now
     assert stable_page_response.status_code == 200
     assert [item["post_id"] for item in stable_page_response.json()["items"]] == ["102", "101"]
+    assert all(item["metadata_state"] == "missing" for item in stable_page_response.json()["items"])
     assert stable_page_response.json()["total"] == 6
     assert disabled_account_response.status_code == 409
     assert "assigned Telegram account" in disabled_account_response.json()["detail"]

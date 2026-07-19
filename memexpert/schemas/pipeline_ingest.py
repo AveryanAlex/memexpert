@@ -25,6 +25,7 @@ from memexpert.schemas.pipeline_base import (
     MAX_TELEGRAM_CONTENT_TYPE_LENGTH,
     MAX_TELEGRAM_FILENAME_LENGTH,
 )
+from memexpert.schemas.telegram_post import TelegramPostMetadata
 
 
 class ContentPipelineUploadMetadata(BaseModel):
@@ -150,6 +151,7 @@ class RawCrawlerPost(BaseModel):
     forward_count: StrictInt | None = Field(default=None, ge=0)
     comment_count: StrictInt | None = Field(default=None, ge=0)
     comments_state: SourceEngagementCommentsState = SourceEngagementCommentsState.UNKNOWN
+    telegram_post: TelegramPostMetadata = Field(default_factory=TelegramPostMetadata)
 
     @field_validator("platform")
     @classmethod

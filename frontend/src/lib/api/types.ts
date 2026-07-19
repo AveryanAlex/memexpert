@@ -854,6 +854,8 @@ export interface AdminSourcePostSummaryRead {
   processing_count: number;
   failed_count: number;
   not_indexable_count: number;
+  metadata_captured_count: number;
+  metadata_missing_count: number;
 }
 
 export interface AdminSourcePostRead {
@@ -863,6 +865,15 @@ export interface AdminSourcePostRead {
   published_at: string | null;
   observed_at: string;
   media_type: string | null;
+  metadata_state: 'captured' | 'missing';
+  text_excerpt: string | null;
+  media_group_id: string | null;
+  reply_to_post_id: string | null;
+  telegram_edited_at: string | null;
+  metadata_first_observed_at: string | null;
+  metadata_last_observed_at: string | null;
+  is_deleted: boolean;
+  deletion_observed_at: string | null;
   fetch_status: string;
   fetch_detail: string | null;
   ingest_outcome: string | null;

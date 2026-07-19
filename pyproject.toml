@@ -52,6 +52,7 @@ default-groups = ["dev", "worker"]
 memexpert-api = "memexpert.api.main:main"
 memexpert-admin-users = "scripts.admin_users:main"
 memexpert-analytics = "scripts.analytics:main"
+memexpert-backfill-telegram-post-metadata = "scripts.backfill_telegram_post_metadata:main"
 memexpert-backfill-video-posters = "scripts.backfill_video_posters:main"
 memexpert-bot = "memexpert.bot.main:main"
 memexpert-import-pipeline-dlq = "scripts.import_pipeline_dlq:main"

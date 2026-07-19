@@ -65,6 +65,7 @@ MAX_TELEGRAM_ACCOUNT_USERNAME_LENGTH = 255
 MAX_TELEGRAM_ACCOUNT_PHONE_HINT_LENGTH = 64
 MAX_ADMIN_TELEGRAM_ERROR_CLASS_LENGTH = 128
 MAX_ADMIN_TELEGRAM_ERROR_TEXT_LENGTH = 4000
+MAX_SOURCE_POST_TEXT_EXCERPT_LENGTH = 500
 MAX_TELEGRAM_LOGIN_PHONE_LENGTH = 32
 MAX_TELEGRAM_LOGIN_CODE_LENGTH = 64
 MAX_TELEGRAM_LOGIN_PASSWORD_LENGTH = 256
@@ -239,6 +240,15 @@ class AdminSourceChannelPostRead(BaseModel):
     published_at: datetime | None
     observed_at: datetime
     media_type: str | None
+    metadata_state: Literal["captured", "missing"]
+    text_excerpt: str | None = Field(max_length=MAX_SOURCE_POST_TEXT_EXCERPT_LENGTH)
+    media_group_id: str | None
+    reply_to_post_id: str | None
+    telegram_edited_at: datetime | None
+    metadata_first_observed_at: datetime | None
+    metadata_last_observed_at: datetime | None
+    is_deleted: bool
+    deletion_observed_at: datetime | None
     fetch_status: str
     fetch_detail: str | None
     ingest_outcome: str | None
@@ -268,6 +278,8 @@ class AdminSourceChannelPostSummaryRead(BaseModel):
     processing_count: int
     failed_count: int
     not_indexable_count: int
+    metadata_captured_count: int
+    metadata_missing_count: int
 
 
 class AdminSourceChannelPostPageRead(BaseModel):

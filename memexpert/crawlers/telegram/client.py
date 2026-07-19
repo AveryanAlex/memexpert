@@ -22,6 +22,7 @@ from memexpert.models.enums import SourceEngagementCommentsState, SourcePlatform
 from memexpert.schemas.content_pipeline import (
     CrawlerForwardAttribution,
     RawCrawlerPost,
+    TelegramPostMetadata,
 )
 
 
@@ -118,6 +119,7 @@ class RawTelegramMessage:
     forward_count: int | None
     comment_count: int | None
     comments_state: SourceEngagementCommentsState
+    telegram_post: TelegramPostMetadata
     raw_payload: object
 
     def __init__(
@@ -136,6 +138,7 @@ class RawTelegramMessage:
         forward_count: int | None = None,
         comment_count: int | None = None,
         comments_state: SourceEngagementCommentsState = SourceEngagementCommentsState.UNKNOWN,
+        telegram_post: TelegramPostMetadata | None = None,
         raw_payload: object = None,
     ) -> None:
         object.__setattr__(self, "message_id", message_id)
@@ -150,6 +153,7 @@ class RawTelegramMessage:
         object.__setattr__(self, "forward_count", forward_count)
         object.__setattr__(self, "comment_count", comment_count)
         object.__setattr__(self, "comments_state", comments_state)
+        object.__setattr__(self, "telegram_post", telegram_post or TelegramPostMetadata())
         object.__setattr__(self, "raw_payload", raw_payload)
 
     @property
@@ -157,6 +161,31 @@ class RawTelegramMessage:
         """Legacy metric accessor; new code should use ``view_count``."""
 
         return self.view_count
+
+
+@dataclass(frozen=True, slots=True)
+class TelegramNewMessageEvent:
+    """Live Telegram event that should run the normal ingest path."""
+
+    message: RawTelegramMessage
+
+
+@dataclass(frozen=True, slots=True)
+class TelegramMessageEditedEvent:
+    """Live Telegram edit that refreshes post context without re-ingest."""
+
+    message: RawTelegramMessage
+
+
+@dataclass(frozen=True, slots=True)
+class TelegramMessagesDeletedEvent:
+    """Live deletion notice for existing posts in one tracked channel."""
+
+    channel_id: str
+    post_ids: tuple[str, ...]
+
+
+type TelegramLiveEvent = TelegramNewMessageEvent | TelegramMessageEditedEvent | TelegramMessagesDeletedEvent
 
 
 @runtime_checkable
@@ -200,8 +229,21 @@ class PipelineTelegramClientProtocol(Protocol):
         *,
         channel_ids: Sequence[str],
         ready_event: asyncio.Event | None = None,
-    ) -> AsyncIterator[RawTelegramMessage]:
+    ) -> AsyncIterator[TelegramLiveEvent]:
         """Stream live messages for the requested channels after catch-up completes."""
+
+    async def fetch_messages(
+        self,
+        *,
+        channel_id: str,
+        post_ids: Sequence[str],
+    ) -> dict[str, RawTelegramMessage | None]:
+        """Fetch a bounded set of messages with explicit missing semantics.
+
+        A requested key mapped to ``None`` means Telegram explicitly reported
+        the post missing. An omitted key means the adapter could not determine
+        that post's state and callers must treat it as transient.
+        """
 
     async def download_media(self, message: RawTelegramMessage) -> bytes:
         """Materialize the media bytes attached to one raw Telegram message."""
@@ -285,6 +327,7 @@ class PipelineTelegramMessageMapper:
             forward_count=message.forward_count,
             comment_count=message.comment_count,
             comments_state=message.comments_state,
+            telegram_post=message.telegram_post,
         )
 
 
@@ -304,6 +347,7 @@ class FakeTelegramClient:
     canned_channels: dict[str, RawTelegramChannel] = field(default_factory=dict)
     media_by_message: dict[str, bytes] = field(default_factory=dict)
     live_messages: dict[str, list[RawTelegramMessage]] = field(default_factory=dict)
+    live_events: list[TelegramLiveEvent] = field(default_factory=list)
     single_messages: dict[tuple[str, str], RawTelegramMessage] = field(default_factory=dict)
     next_error: PipelineTelegramError | None = None
     # Typed errors injected on download_media calls, keyed by message id.
@@ -397,13 +441,29 @@ class FakeTelegramClient:
         *,
         channel_ids: Sequence[str],
         ready_event: asyncio.Event | None = None,
-    ) -> AsyncIterator[RawTelegramMessage]:
+    ) -> AsyncIterator[TelegramLiveEvent]:
         self._consume_pinned_error()
         if ready_event is not None:
             ready_event.set()
+        if self.live_events:
+            for event in self.live_events:
+                yield event
+            return
         for channel_id in channel_ids:
             for message in self.live_messages.get(channel_id, []):
-                yield message
+                yield TelegramNewMessageEvent(message=message)
+
+    async def fetch_messages(
+        self,
+        *,
+        channel_id: str,
+        post_ids: Sequence[str],
+    ) -> dict[str, RawTelegramMessage | None]:
+        self._consume_pinned_error()
+        return {
+            post_id: self.single_messages.get((channel_id, post_id))
+            for post_id in post_ids
+        }
 
     async def download_media(self, message: RawTelegramMessage) -> bytes:
         pinned_download_error = self.download_errors.pop(message.message_id, None)
@@ -460,4 +520,8 @@ __all__ = [
     "PipelineTelegramSessionNotRunnableError",
     "RawTelegramChannel",
     "RawTelegramMessage",
+    "TelegramLiveEvent",
+    "TelegramMessageEditedEvent",
+    "TelegramMessagesDeletedEvent",
+    "TelegramNewMessageEvent",
 ]

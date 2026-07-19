@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Literal, cast
@@ -22,6 +23,9 @@ from memexpert.crawlers.telegram.client import (
     PipelineTelegramSessionBannedError,
     RawTelegramChannel,
     RawTelegramMessage,
+    TelegramMessageEditedEvent,
+    TelegramMessagesDeletedEvent,
+    TelegramNewMessageEvent,
 )
 from memexpert.crawlers.telegram.runtime import (
     CrawlerCatchupReport,
@@ -34,7 +38,9 @@ from memexpert.schemas.content_pipeline import (
     CrawlerIngestOutcome,
     CrawlerIngestResult,
     RawCrawlerPost,
+    TelegramPostMetadata,
     TelegramSessionRead,
+    TelegramTextEntity,
 )
 
 if TYPE_CHECKING:
@@ -56,6 +62,7 @@ def _build_message(
     channel_id: str = "memes_channel",
     media_type: str = "photo",
     forward: CrawlerForwardAttribution | None = None,
+    telegram_post: TelegramPostMetadata | None = None,
 ) -> RawTelegramMessage:
     return RawTelegramMessage(
         message_id=message_id,
@@ -70,6 +77,7 @@ def _build_message(
         forward_count=4,
         comment_count=2,
         comments_state=SourceEngagementCommentsState.ENABLED,
+        telegram_post=telegram_post,
     )
 
 
@@ -80,7 +88,14 @@ def test_pipeline_telegram_message_mapper_builds_raw_crawler_post_with_forward()
         channel_username=None,
         channel_title="Original",
     )
-    message = _build_message(forward=forward)
+    telegram_post = TelegramPostMetadata(
+        text="Exact caption 👋",
+        text_entities=(TelegramTextEntity(type="bold", offset=0, length=5),),
+        media_group_id="9001",
+        reply_to_post_id="41",
+        edited_at=_now(),
+    )
+    message = _build_message(forward=forward, telegram_post=telegram_post)
     raw_post = PipelineTelegramMessageMapper.build_raw_crawler_post(message, b"image-bytes")
 
     assert isinstance(raw_post, RawCrawlerPost)
@@ -94,6 +109,7 @@ def test_pipeline_telegram_message_mapper_builds_raw_crawler_post_with_forward()
     assert raw_post.comment_count == 2
     assert raw_post.comments_state is SourceEngagementCommentsState.ENABLED
     assert raw_post.forward == forward
+    assert raw_post.telegram_post == telegram_post
     assert raw_post.published_at == message.published_at
     # Filename + content_type are intentionally None — the service fills in
     # crawler-friendly defaults when reaching the media processor.
@@ -129,6 +145,7 @@ def test_raw_crawler_post_rejects_non_telegram_platforms() -> None:
             view_count=None,
             reactions={},
             forward=None,
+            telegram_post=TelegramPostMetadata(),
         )
 
 
@@ -276,6 +293,64 @@ async def test_fake_telegram_client_fetch_single_message_returns_pinned_entry() 
             channel_id="memes_channel",
             post_id="999",
         )
+
+
+async def test_fake_telegram_client_fetch_messages_preserves_requested_missing_entries() -> None:
+    first = _build_message(message_id="100")
+    third = _build_message(message_id="102")
+    client = FakeTelegramClient(
+        single_messages={
+            ("memes_channel", "100"): first,
+            ("memes_channel", "102"): third,
+        },
+    )
+
+    fetched = await client.fetch_messages(
+        channel_id="memes_channel",
+        post_ids=("100", "101", "102"),
+    )
+
+    assert fetched == {"100": first, "101": None, "102": third}
+
+
+async def test_fake_telegram_client_emits_typed_live_events_in_order() -> None:
+    new_message = _build_message(message_id="200")
+    edited_message = _build_message(
+        message_id="200",
+        telegram_post=TelegramPostMetadata(text="edited"),
+    )
+    expected = [
+        TelegramNewMessageEvent(message=new_message),
+        TelegramMessageEditedEvent(message=edited_message),
+        TelegramMessagesDeletedEvent(channel_id="memes_channel", post_ids=("200", "201")),
+    ]
+    ready_event = asyncio.Event()
+    client = FakeTelegramClient(live_events=expected)
+
+    actual = [
+        event
+        async for event in client.listen_live(
+            channel_ids=("memes_channel",),
+            ready_event=ready_event,
+        )
+    ]
+
+    assert ready_event.is_set()
+    assert actual == expected
+
+
+async def test_fake_telegram_client_wraps_legacy_live_messages_as_new_events() -> None:
+    message = _build_message(message_id="300")
+    client = FakeTelegramClient(live_messages={"memes_channel": [message]})
+
+    actual = [
+        event
+        async for event in client.listen_live(
+            channel_ids=("memes_channel",),
+        )
+    ]
+
+    assert actual == [TelegramNewMessageEvent(message=message)]
 
 
 def test_pipeline_telegram_errors_form_a_taxonomy() -> None:

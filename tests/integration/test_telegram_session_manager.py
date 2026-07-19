@@ -20,6 +20,8 @@ from memexpert.crawlers.telegram.client import (
     PipelineTelegramSessionBannedError,
     PipelineTelegramSessionNotRunnableError,
     RawTelegramMessage,
+    TelegramLiveEvent,
+    TelegramNewMessageEvent,
 )
 from memexpert.crawlers.telegram.manager import TelegramSessionManager
 from memexpert.ingest.crawler_service import PipelineCrawlerIngestService
@@ -580,14 +582,16 @@ async def test_manager_live_listeners_scope_channels_and_disable_invalidates_sta
             *,
             channel_ids: Sequence[str],
             ready_event: asyncio.Event | None = None,
-        ) -> AsyncIterator[RawTelegramMessage]:
+        ) -> AsyncIterator[TelegramLiveEvent]:
             self.listened_channel_ids.append(tuple(channel_ids))
             if ready_event is not None:
                 ready_event.set()
             for channel_id in channel_ids:
                 for message in self.live_messages.get(channel_id, []):
-                    yield message
-            yield _build_photo_message(message_id="leak", channel_id="orphan_live")
+                    yield TelegramNewMessageEvent(message=message)
+            yield TelegramNewMessageEvent(
+                message=_build_photo_message(message_id="leak", channel_id="orphan_live"),
+            )
             # Resuming after the deliberately unbound yield proves the runtime
             # ran the channel guard and requested the next stream item.
             self.unbound_message_guard_completed.set()
@@ -653,13 +657,15 @@ async def test_manager_live_start_failure_does_not_prevent_other_sessions_starti
             *,
             channel_ids: Sequence[str],
             ready_event: asyncio.Event | None = None,
-        ) -> AsyncIterator[RawTelegramMessage]:
+        ) -> AsyncIterator[TelegramLiveEvent]:
             _ = tuple(channel_ids)
             if ready_event is not None:
                 ready_event.set()
             self.listener_started.set()
             await asyncio.Event().wait()
-            yield _build_photo_message(message_id="unreachable", channel_id="unreachable")  # pragma: no cover
+            yield TelegramNewMessageEvent(  # pragma: no cover
+                message=_build_photo_message(message_id="unreachable", channel_id="unreachable"),
+            )
 
         async def iter_latest_channel_messages(
             self,
@@ -724,12 +730,14 @@ async def test_manager_supervisor_restarts_completed_live_handle_and_closes_stal
             *,
             channel_ids: Sequence[str],
             ready_event: asyncio.Event | None = None,
-        ) -> AsyncIterator[RawTelegramMessage]:
+        ) -> AsyncIterator[TelegramLiveEvent]:
             _ = tuple(channel_ids)
             if ready_event is not None:
                 ready_event.set()
             raise PipelineTelegramProviderUnavailableError("transient live failure")
-            yield  # pragma: no cover - keeps this an async generator
+            yield TelegramNewMessageEvent(  # pragma: no cover - keeps this an async generator
+                message=_build_photo_message(message_id="unreachable", channel_id="unreachable"),
+            )
 
     def _client_factory(row: TelegramSession) -> FakeTelegramClient:
         assert row.name == "alpha"
@@ -843,13 +851,15 @@ async def test_manager_reload_catches_up_source_added_after_live_start_and_rebui
             *,
             channel_ids: Sequence[str],
             ready_event: asyncio.Event | None = None,
-        ) -> AsyncIterator[RawTelegramMessage]:
+        ) -> AsyncIterator[TelegramLiveEvent]:
             self.listened_channel_ids.append(tuple(channel_ids))
             if ready_event is not None:
                 ready_event.set()
             self.listener_started.set()
             await asyncio.Event().wait()
-            yield _build_photo_message(message_id="unreachable", channel_id="unreachable")  # pragma: no cover
+            yield TelegramNewMessageEvent(  # pragma: no cover
+                message=_build_photo_message(message_id="unreachable", channel_id="unreachable"),
+            )
 
         async def iter_latest_channel_messages(
             self,
@@ -1006,14 +1016,16 @@ async def test_manager_processes_older_backfill_without_stopping_live_listener(
             *,
             channel_ids: Sequence[str],
             ready_event: asyncio.Event | None = None,
-        ) -> AsyncIterator[RawTelegramMessage]:
+        ) -> AsyncIterator[TelegramLiveEvent]:
             _ = channel_ids
             if ready_event is not None:
                 ready_event.set()
             self.listener_started.set()
             await self.release_listener.wait()
             if False:  # pragma: no cover - preserves async-generator shape.
-                yield _build_photo_message(message_id="unused", channel_id="backfill_channel")
+                yield TelegramNewMessageEvent(
+                    message=_build_photo_message(message_id="unused", channel_id="backfill_channel"),
+                )
 
     messages = [_build_photo_message(message_id=str(i), channel_id="backfill_channel") for i in range(1, 11)]
     client = _ConcurrentBackfillClient(

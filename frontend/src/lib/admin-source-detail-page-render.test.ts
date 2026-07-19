@@ -21,12 +21,29 @@ describe('/admin/sources/[channelId] detail', () => {
     expect(body).toContain('Indexing summary');
     expect(body).toContain('Fetched messages');
     expect(body).toContain('Fetched</span>');
+    expect(body).toContain('Metadata captured');
+    expect(body).toContain('Metadata missing');
     expect(body).toContain('Indexed</span>');
     expect(body).toContain('Partially indexed');
     expect(body).toContain('Processing');
     expect(body).toContain('Failed');
     expect(body).toContain('Not indexable');
     expect(body).toContain('Materialized');
+    expect(body).toContain('Telegram context');
+    expect(body).toContain('Cats &amp; coffee');
+    expect(body).toContain('Привет 👋');
+    expect(body).toContain('Telegram exposed no text or caption.');
+    expect(body).toContain('Telegram post metadata has not been captured.');
+    expect(body).toContain('Media group:');
+    expect(body).toContain('9007199254740993');
+    expect(body).toContain('Reply to:');
+    expect(body).toContain('#9995');
+    expect(body).toContain('Edited 2026-07-13 09:30 UTC');
+    expect(body).toContain('Metadata first observed 2026-07-13 09:31 UTC');
+    expect(body).toContain('Metadata last observed 2026-07-13 09:35 UTC');
+    expect(body).toContain('Deleted from Telegram');
+    expect(body).toContain('Deletion observed 2026-07-13 10:00 UTC');
+    expect(body).toContain('Standalone text-only post');
     expect(body).toContain('Qdrant');
     expect(body).toContain('Meilisearch');
     expect(body).toContain('Embedding provider unavailable.');
@@ -250,15 +267,15 @@ function telegramAccount(overrides: Partial<AdminTelegramSessionRead> = {}): Adm
 function sourcePostPage(): AdminSourcePostPageRead {
   const items = [
     sourcePost({ id: 'indexed', post_id: '10000', index_status: 'indexed', qdrant_status: 'synced', meilisearch_status: 'synced' }),
-    sourcePost({ id: 'partial', post_id: '9999', index_status: 'partially_indexed', qdrant_status: 'synced', meilisearch_status: 'processing' }),
-    sourcePost({ id: 'processing', post_id: '9998', index_status: 'processing', ingest_status: 'media_inspecting', meme_id: null, meme_file_id: null, pipeline_stage: null, pipeline_status: null, qdrant_status: null, meilisearch_status: null }),
-    sourcePost({ id: 'failed', post_id: '9997', index_status: 'failed', pipeline_stage: 'embed', pipeline_status: 'failed', pipeline_error: 'Embedding provider unavailable.', qdrant_status: 'failed', meilisearch_status: 'pending', is_retryable: true, capabilities: ['replay_source_post'] }),
-    sourcePost({ id: 'skipped', post_id: '9996', index_status: 'not_indexable', media_type: 'text', fetch_status: 'unsupported', ingest_outcome: 'skipped_unsupported_media', ingest_status: null, meme_id: null, meme_file_id: null, pipeline_stage: null, pipeline_status: null, qdrant_status: null, meilisearch_status: null })
+    sourcePost({ id: 'partial', post_id: '9999', index_status: 'partially_indexed', qdrant_status: 'synced', meilisearch_status: 'processing', text_excerpt: null, reply_to_post_id: null, telegram_edited_at: null }),
+    sourcePost({ id: 'processing', post_id: '9998', index_status: 'processing', ingest_status: 'media_inspecting', meme_id: null, meme_file_id: null, pipeline_stage: null, pipeline_status: null, qdrant_status: null, meilisearch_status: null, metadata_state: 'missing', text_excerpt: null, media_group_id: null, reply_to_post_id: null, telegram_edited_at: null, metadata_first_observed_at: null, metadata_last_observed_at: null }),
+    sourcePost({ id: 'failed', post_id: '9997', index_status: 'failed', pipeline_stage: 'embed', pipeline_status: 'failed', pipeline_error: 'Embedding provider unavailable.', qdrant_status: 'failed', meilisearch_status: 'pending', is_retryable: true, capabilities: ['replay_source_post'], media_group_id: null, reply_to_post_id: null, is_deleted: true, deletion_observed_at: '2026-07-13T10:00:00Z' }),
+    sourcePost({ id: 'skipped', post_id: '9996', index_status: 'not_indexable', media_type: 'text', fetch_status: 'unsupported', ingest_outcome: 'skipped_unsupported_media', ingest_status: null, meme_id: null, meme_file_id: null, pipeline_stage: null, pipeline_status: null, qdrant_status: null, meilisearch_status: null, text_excerpt: 'Standalone text-only post', media_group_id: null, reply_to_post_id: null, telegram_edited_at: null })
   ];
   return {
     source_channel_id: 'source-id',
     snapshot_at: '2026-07-13T12:00:00Z',
-    summary: { observed_count: 5, indexed_count: 1, partially_indexed_count: 1, processing_count: 1, failed_count: 1, not_indexable_count: 1 },
+    summary: { observed_count: 5, indexed_count: 1, partially_indexed_count: 1, processing_count: 1, failed_count: 1, not_indexable_count: 1, metadata_captured_count: 4, metadata_missing_count: 1 },
     items,
     total: 55,
     limit: 50,
@@ -274,6 +291,15 @@ function sourcePost(overrides: Partial<AdminSourcePostRead> = {}): AdminSourcePo
     published_at: '2026-07-13T09:30:00Z',
     observed_at: '2026-07-13T09:31:00Z',
     media_type: 'image',
+    metadata_state: 'captured',
+    text_excerpt: 'Cats & coffee\nПривет 👋',
+    media_group_id: '9007199254740993',
+    reply_to_post_id: '9995',
+    telegram_edited_at: '2026-07-13T09:30:30Z',
+    metadata_first_observed_at: '2026-07-13T09:31:00Z',
+    metadata_last_observed_at: '2026-07-13T09:35:00Z',
+    is_deleted: false,
+    deletion_observed_at: null,
     fetch_status: 'accepted',
     fetch_detail: null,
     ingest_outcome: 'ingested',

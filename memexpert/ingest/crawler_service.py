@@ -370,6 +370,7 @@ def _crawler_source_metadata(raw_post: RawCrawlerPost) -> dict[str, object]:
         "forward_count": raw_post.forward_count,
         "comment_count": raw_post.comment_count,
         "comments_state": raw_post.comments_state.value,
+        "telegram_post": raw_post.telegram_post.json_snapshot(),
     }
     if raw_post.forward is not None:
         metadata["forward"] = raw_post.forward.model_dump(mode="json")

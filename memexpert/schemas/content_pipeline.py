@@ -56,6 +56,7 @@ from memexpert.schemas.pipeline_ingest import (
     CrawlerSourcePlatform,
     RawCrawlerPost,
 )
+from memexpert.schemas.telegram_post import TelegramPostMetadata, TelegramTextEntity
 
 
 class TelegramSessionRead(ORMSchema):
@@ -406,5 +407,7 @@ __all__ = [
     "PerTargetSyncStatus",
     "RawCrawlerPost",
     "TelegramSessionRead",
+    "TelegramPostMetadata",
+    "TelegramTextEntity",
     "_PIPELINE_EVENT_ALLOWED_STAGES",
 ]

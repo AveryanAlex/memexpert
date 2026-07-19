@@ -25,6 +25,7 @@ from memexpert.crawlers.telegram.client import (
 )
 from memexpert.models.enums import SourceEngagementCommentsState
 from memexpert.schemas.content_pipeline import CrawlerForwardAttribution
+from memexpert.schemas.telegram_post import TelegramPostMetadata, TelegramTextEntity
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -78,6 +79,13 @@ class _MessageRepliesLike(Protocol):
 
 
 @runtime_checkable
+class _MessageReplyHeaderLike(Protocol):
+    """Minimal reply header shape used for explicit post relationships."""
+
+    reply_to_msg_id: int | None
+
+
+@runtime_checkable
 class _TelethonMessageLike(Protocol):
     """Minimal duck-typing shape for a Telethon ``Message`` object.
 
@@ -94,6 +102,11 @@ class _TelethonMessageLike(Protocol):
     document: object | None
     reactions: _MessageReactionsLike | None
     fwd_from: _MessageFwdHeaderLike | None
+    message: str | None
+    entities: list[object] | None
+    grouped_id: int | None
+    reply_to: _MessageReplyHeaderLike | None
+    edit_date: datetime | None
 
 
 # Telethon exposes photo + document on the message. Photos are always
@@ -104,6 +117,28 @@ class _TelethonMessageLike(Protocol):
 # and decides whether to count it as a skip.
 _GIF_MIME_TYPE = "image/gif"
 _MediaType = Literal["photo", "gif", "video", "unsupported"]
+
+_TEXT_ENTITY_TYPES = {
+    "MessageEntityBankCard": "bank_card",
+    "MessageEntityBlockquote": "blockquote",
+    "MessageEntityBold": "bold",
+    "MessageEntityBotCommand": "bot_command",
+    "MessageEntityCashtag": "cashtag",
+    "MessageEntityCode": "code",
+    "MessageEntityCustomEmoji": "custom_emoji",
+    "MessageEntityEmail": "email",
+    "MessageEntityHashtag": "hashtag",
+    "MessageEntityItalic": "italic",
+    "MessageEntityMention": "mention",
+    "MessageEntityMentionName": "mention_name",
+    "MessageEntityPhone": "phone",
+    "MessageEntityPre": "pre",
+    "MessageEntitySpoiler": "spoiler",
+    "MessageEntityStrike": "strikethrough",
+    "MessageEntityTextUrl": "text_url",
+    "MessageEntityUnderline": "underline",
+    "MessageEntityUrl": "url",
+}
 
 
 def _classify_document_mime(mime_type: str | None) -> _MediaType:
@@ -170,6 +205,75 @@ def _coerce_aware_datetime(value: datetime | None, *, field_name: str) -> dateti
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value
+
+
+def _coerce_optional_aware_datetime(value: object) -> datetime | None:
+    """Return an optional Telegram timestamp normalized to an aware value."""
+
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value
+
+
+def _extract_text_entities(raw_entities: object) -> tuple[TelegramTextEntity, ...]:
+    """Serialize known Telegram entity variants into an allowlisted shape."""
+
+    if not isinstance(raw_entities, (list, tuple)):
+        return ()
+    entities: list[TelegramTextEntity] = []
+    for raw_entity in raw_entities:
+        entity_type = _TEXT_ENTITY_TYPES.get(type(raw_entity).__name__)
+        offset = getattr(raw_entity, "offset", None)
+        length = getattr(raw_entity, "length", None)
+        if entity_type is None or isinstance(offset, bool) or not isinstance(offset, int):
+            continue
+        if isinstance(length, bool) or not isinstance(length, int):
+            continue
+        if offset < 0 or length < 0:
+            continue
+        values: dict[str, object] = {
+            "type": entity_type,
+            "offset": offset,
+            "length": length,
+        }
+        for field_name in ("url", "language"):
+            value = getattr(raw_entity, field_name, None)
+            if isinstance(value, str):
+                values[field_name] = value
+        for field_name in ("user_id", "document_id"):
+            value = getattr(raw_entity, field_name, None)
+            if isinstance(value, int) and not isinstance(value, bool):
+                values[field_name] = value
+        collapsed = getattr(raw_entity, "collapsed", None)
+        if isinstance(collapsed, bool):
+            values["collapsed"] = collapsed
+        entities.append(TelegramTextEntity.model_validate(values))
+    return tuple(entities)
+
+
+def _extract_post_metadata(message: _TelethonMessageLike) -> TelegramPostMetadata:
+    """Return exact text and normalized Telegram post relationships."""
+
+    raw_text = getattr(message, "message", None)
+    text = raw_text if isinstance(raw_text, str) and raw_text != "" else None
+    grouped_id = getattr(message, "grouped_id", None)
+    media_group_id = str(grouped_id) if isinstance(grouped_id, int) and not isinstance(grouped_id, bool) else None
+    reply_header = getattr(message, "reply_to", None)
+    reply_to_msg_id = getattr(reply_header, "reply_to_msg_id", None)
+    reply_to_post_id = (
+        str(reply_to_msg_id)
+        if isinstance(reply_to_msg_id, int) and not isinstance(reply_to_msg_id, bool)
+        else None
+    )
+    return TelegramPostMetadata(
+        text=text,
+        text_entities=_extract_text_entities(getattr(message, "entities", None)),
+        media_group_id=media_group_id,
+        reply_to_post_id=reply_to_post_id,
+        edited_at=_coerce_optional_aware_datetime(getattr(message, "edit_date", None)),
+    )
 
 
 def _extract_reactions(
@@ -359,6 +463,7 @@ class TelethonMessageNormalizer:
         comment_count, comments_state = _extract_comment_metrics(getattr(message, "replies", None))
         reactions = _extract_reactions(getattr(message, "reactions", None))
         forward = _extract_forward_attribution(getattr(message, "fwd_from", None))
+        telegram_post = _extract_post_metadata(message)
 
         return RawTelegramMessage(
             message_id=str(message.id),
@@ -373,6 +478,7 @@ class TelethonMessageNormalizer:
             forward_count=forward_count,
             comment_count=comment_count,
             comments_state=comments_state,
+            telegram_post=telegram_post,
             raw_payload=message,
         )
 

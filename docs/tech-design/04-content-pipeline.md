@@ -172,7 +172,22 @@ forward-only mode. Later forward catch-up remains contiguous above
 separate exclusive cursor, so a mid-page failure resumes without skipping the
 unprocessed suffix and never moves the live high-water mark backward. `source_channel_posts`
 durably inventories every observed message before media handling, including
-unsupported and provider-failed messages. Browser admin joins that ledger to
+unsupported, text-only, duplicate, and provider-failed messages. The same
+pre-media upsert version-gates immutable first-observed text/entities, refreshes
+latest text/entities plus Telegram group/reply/edit context, records metadata
+observation times, and clears a stale deletion marker. New-message events then
+follow normal ingest; edit events update only this metadata; deletion events
+mark existing rows deleted while retaining text and never move a checkpoint.
+The normalized ingest-time version is copied to
+`pipeline_ingest_requests.source_metadata.telegram_post` for supported media,
+while `source_channel_posts` remains authoritative.
+
+Albums are not aggregate pipeline objects. Equal Telegram `grouped_id` values
+record membership across page boundaries and restarts, members stay independent
+messages/memes ordered by numeric Telegram message ID, and `Meme.files` retains
+its alternative-version meaning. Only Telegram's explicit reply header creates
+a reply relationship; neighboring messages are not inferred to belong
+together. Browser admin joins the source-post ledger to
 `pipeline_ingest_requests`, `pipeline_stage_journal`, and
 `meme_file_sync_target_snapshots`; an item is indexed only when both Qdrant and
 Meilisearch are synced. The Meilisearch adapter waits for asynchronous settings

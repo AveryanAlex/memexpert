@@ -22,7 +22,7 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
-from sqlalchemy import select
+from sqlalchemy import case, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -35,6 +35,9 @@ from memexpert.crawlers.telegram.client import (
     PipelineTelegramSessionAuthRequiredError,
     PipelineTelegramSessionBannedError,
     RawTelegramMessage,
+    TelegramMessageEditedEvent,
+    TelegramMessagesDeletedEvent,
+    TelegramNewMessageEvent,
 )
 from memexpert.models.base import utcnow
 from memexpert.models.content import SourceChannel, SourceChannelPost, TelegramSession
@@ -534,6 +537,7 @@ class TelegramCrawlerRuntime:
                 raw_message,
                 advance_history_cursor=False,
             )
+            await self._commit_runtime_state()
             if raw_message.media_type == "unsupported":
                 self._mark_post_unsupported(post_row)
                 await self._commit_runtime_state()
@@ -654,6 +658,10 @@ class TelegramCrawlerRuntime:
                     raw_message,
                     advance_history_cursor=False,
                 )
+                # SourceChannelPost is authoritative for message context, so
+                # commit it before deduplication, download, or ingest work can
+                # fail or roll the shared session back.
+                await self._commit_runtime_state()
                 if raw_message.media_type == "unsupported":
                     counters.skipped_unsupported += 1
                     self._mark_post_unsupported(post_row)
@@ -846,23 +854,38 @@ class TelegramCrawlerRuntime:
         # observation cutoff, so capture this only after the adapter yields
         # the individual message rather than once for the enclosing page.
         fetched_at = utcnow()
+        metadata = raw_message.telegram_post
+        text_entities = metadata.entity_json()
+        insert_statement = pg_insert(SourceChannelPost).values(
+            id=uuid.uuid7(),
+            source_channel_id=channel_row.id,
+            post_id=raw_message.message_id,
+            published_at=raw_message.published_at,
+            media_type=raw_message.media_type,
+            status=SourceChannelPostStatus.OBSERVED,
+            last_error_code=None,
+            last_error_text=None,
+            attempt_count=1,
+            is_retryable=False,
+            last_attempt_at=fetched_at,
+            first_observed_text=metadata.text,
+            latest_text=metadata.text,
+            first_observed_text_entities=text_entities,
+            latest_text_entities=text_entities,
+            media_group_id=metadata.media_group_id,
+            reply_to_post_id=metadata.reply_to_post_id,
+            telegram_edited_at=metadata.edited_at,
+            metadata_first_observed_at=fetched_at,
+            metadata_last_observed_at=fetched_at,
+            metadata_version=metadata.schema_version,
+            is_deleted=False,
+            deletion_observed_at=None,
+            created_at=fetched_at,
+            updated_at=fetched_at,
+        )
+        excluded = insert_statement.excluded
         statement = (
-            pg_insert(SourceChannelPost)
-            .values(
-                id=uuid.uuid7(),
-                source_channel_id=channel_row.id,
-                post_id=raw_message.message_id,
-                published_at=raw_message.published_at,
-                media_type=raw_message.media_type,
-                status=SourceChannelPostStatus.OBSERVED,
-                last_error_code=None,
-                last_error_text=None,
-                attempt_count=1,
-                is_retryable=False,
-                last_attempt_at=fetched_at,
-                created_at=fetched_at,
-                updated_at=fetched_at,
-            )
+            insert_statement
             .on_conflict_do_update(
                 constraint="uq_source_channel_posts_channel_post",
                 set_={
@@ -876,6 +899,33 @@ class TelegramCrawlerRuntime:
                     "next_attempt_at": None,
                     "last_attempt_at": fetched_at,
                     "quarantined_at": None,
+                    "first_observed_text": case(
+                        (SourceChannelPost.metadata_version < metadata.schema_version, excluded.first_observed_text),
+                        else_=SourceChannelPost.first_observed_text,
+                    ),
+                    "latest_text": excluded.latest_text,
+                    "first_observed_text_entities": case(
+                        (
+                            SourceChannelPost.metadata_version < metadata.schema_version,
+                            excluded.first_observed_text_entities,
+                        ),
+                        else_=SourceChannelPost.first_observed_text_entities,
+                    ),
+                    "latest_text_entities": excluded.latest_text_entities,
+                    "media_group_id": excluded.media_group_id,
+                    "reply_to_post_id": excluded.reply_to_post_id,
+                    "telegram_edited_at": excluded.telegram_edited_at,
+                    "metadata_first_observed_at": case(
+                        (
+                            SourceChannelPost.metadata_version < metadata.schema_version,
+                            excluded.metadata_first_observed_at,
+                        ),
+                        else_=SourceChannelPost.metadata_first_observed_at,
+                    ),
+                    "metadata_last_observed_at": fetched_at,
+                    "metadata_version": metadata.schema_version,
+                    "is_deleted": False,
+                    "deletion_observed_at": None,
                     "updated_at": fetched_at,
                 },
             )
@@ -906,6 +956,106 @@ class TelegramCrawlerRuntime:
         ):
             channel_row.history_cursor_post_id = raw_message.message_id
         return post_row
+
+    async def _refresh_post_metadata_only(
+        self,
+        channel_row: SourceChannel,
+        raw_message: RawTelegramMessage,
+    ) -> SourceChannelPost:
+        """Refresh an edited message without changing ingest/checkpoint state."""
+
+        observed_at = utcnow()
+        metadata = raw_message.telegram_post
+        text_entities = metadata.entity_json()
+        insert_statement = pg_insert(SourceChannelPost).values(
+            id=uuid.uuid7(),
+            source_channel_id=channel_row.id,
+            post_id=raw_message.message_id,
+            published_at=raw_message.published_at,
+            media_type=raw_message.media_type,
+            status=SourceChannelPostStatus.OBSERVED,
+            attempt_count=0,
+            is_retryable=False,
+            first_observed_text=metadata.text,
+            latest_text=metadata.text,
+            first_observed_text_entities=text_entities,
+            latest_text_entities=text_entities,
+            media_group_id=metadata.media_group_id,
+            reply_to_post_id=metadata.reply_to_post_id,
+            telegram_edited_at=metadata.edited_at,
+            metadata_first_observed_at=observed_at,
+            metadata_last_observed_at=observed_at,
+            metadata_version=metadata.schema_version,
+            is_deleted=False,
+            deletion_observed_at=None,
+            created_at=observed_at,
+            updated_at=observed_at,
+        )
+        excluded = insert_statement.excluded
+        statement = (
+            insert_statement.on_conflict_do_update(
+                constraint="uq_source_channel_posts_channel_post",
+                set_={
+                    "first_observed_text": case(
+                        (SourceChannelPost.metadata_version < metadata.schema_version, excluded.first_observed_text),
+                        else_=SourceChannelPost.first_observed_text,
+                    ),
+                    "latest_text": excluded.latest_text,
+                    "first_observed_text_entities": case(
+                        (
+                            SourceChannelPost.metadata_version < metadata.schema_version,
+                            excluded.first_observed_text_entities,
+                        ),
+                        else_=SourceChannelPost.first_observed_text_entities,
+                    ),
+                    "latest_text_entities": excluded.latest_text_entities,
+                    "media_group_id": excluded.media_group_id,
+                    "reply_to_post_id": excluded.reply_to_post_id,
+                    "telegram_edited_at": excluded.telegram_edited_at,
+                    "metadata_first_observed_at": case(
+                        (
+                            SourceChannelPost.metadata_version < metadata.schema_version,
+                            excluded.metadata_first_observed_at,
+                        ),
+                        else_=SourceChannelPost.metadata_first_observed_at,
+                    ),
+                    "metadata_last_observed_at": observed_at,
+                    "metadata_version": metadata.schema_version,
+                    "is_deleted": False,
+                    "deletion_observed_at": None,
+                    "updated_at": observed_at,
+                },
+            )
+            .returning(SourceChannelPost)
+        )
+        return (
+            await self.session.scalars(
+                statement.execution_options(populate_existing=True),
+            )
+        ).one()
+
+    async def _mark_posts_deleted(
+        self,
+        channel_row: SourceChannel,
+        post_ids: tuple[str, ...],
+    ) -> None:
+        """Mark known posts deleted without erasing text or moving checkpoints."""
+
+        if not post_ids:
+            return
+        observed_at = utcnow()
+        await self.session.execute(
+            update(SourceChannelPost)
+            .where(
+                SourceChannelPost.source_channel_id == channel_row.id,
+                SourceChannelPost.post_id.in_(post_ids),
+            )
+            .values(
+                is_deleted=True,
+                deletion_observed_at=observed_at,
+                updated_at=observed_at,
+            )
+        )
 
     @staticmethod
     def _advance_forward_checkpoint(channel_row: SourceChannel, post_id: str) -> None:
@@ -1021,14 +1171,25 @@ class TelegramCrawlerRuntime:
         channel_ids: list[str],
         ready_event: asyncio.Event,
     ) -> None:
-        """Drain ``listen_live`` and ingest each message until cancelled."""
+        """Handle new, edited, and deleted live Telegram events."""
 
         try:
             bound_channel_ids = set(channel_ids)
-            async for raw_message in self.telegram_client.listen_live(
+            async for live_event in self.telegram_client.listen_live(
                 channel_ids=channel_ids,
                 ready_event=ready_event,
             ):
+                if isinstance(live_event, TelegramMessagesDeletedEvent):
+                    if live_event.channel_id not in bound_channel_ids:
+                        continue
+                    channel_row = await self._get_tracked_channel(live_event.channel_id)
+                    await self._mark_posts_deleted(channel_row, live_event.post_ids)
+                    await self._record_live_heartbeat(session_name)
+                    continue
+
+                if not isinstance(live_event, (TelegramNewMessageEvent, TelegramMessageEditedEvent)):
+                    continue
+                raw_message = live_event.message
                 if raw_message.channel_id not in bound_channel_ids:
                     logger.warning(
                         "Live listener for %s ignored message %s from unbound channel %s.",
@@ -1038,11 +1199,17 @@ class TelegramCrawlerRuntime:
                     )
                     continue
                 channel_row = await self._get_tracked_channel(raw_message.channel_id)
+                if isinstance(live_event, TelegramMessageEditedEvent):
+                    await self._refresh_post_metadata_only(channel_row, raw_message)
+                    await self._record_live_heartbeat(session_name)
+                    continue
+
                 post_row = await self._observe_post(
                     channel_row,
                     raw_message,
                     advance_history_cursor=False,
                 )
+                await self._commit_runtime_state()
                 if raw_message.media_type == "unsupported":
                     self._mark_post_unsupported(post_row)
                     self._advance_forward_checkpoint(channel_row, raw_message.message_id)

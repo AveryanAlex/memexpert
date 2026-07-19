@@ -1079,12 +1079,23 @@ class SourceChannelPost(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             name="uq_source_channel_posts_channel_post",
         ),
         CheckConstraint("attempt_count >= 0", name="source_channel_posts_attempt_count_non_negative"),
+        CheckConstraint(
+            "metadata_version >= 0",
+            name="metadata_version_non_negative",
+        ),
         Index(
             "ix_source_channel_posts_channel_published_at",
             "source_channel_id",
             "published_at",
         ),
         Index("ix_source_channel_posts_channel_status", "source_channel_id", "status"),
+        Index(
+            "ix_source_channel_posts_channel_media_group_post",
+            "source_channel_id",
+            "media_group_id",
+            "post_id",
+            postgresql_where=text("media_group_id IS NOT NULL"),
+        ),
     )
 
     source_channel_id: Mapped[uuid.UUID] = mapped_column(
@@ -1110,6 +1121,33 @@ class SourceChannelPost(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     next_attempt_at: Mapped[datetime | None] = mapped_column(nullable=True)
     last_attempt_at: Mapped[datetime | None] = mapped_column(nullable=True)
     quarantined_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    first_observed_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    latest_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    first_observed_text_entities: Mapped[list[dict[str, object]] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+    )
+    latest_text_entities: Mapped[list[dict[str, object]] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+    )
+    media_group_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    reply_to_post_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    telegram_edited_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    metadata_first_observed_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    metadata_last_observed_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    metadata_version: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+        server_default=text("0"),
+        nullable=False,
+    )
+    is_deleted: Mapped[bool] = mapped_column(
+        default=False,
+        server_default=text("false"),
+        nullable=False,
+    )
+    deletion_observed_at: Mapped[datetime | None] = mapped_column(nullable=True)
 
     source_channel: Mapped["SourceChannel"] = relationship(
         "SourceChannel",

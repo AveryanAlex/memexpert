@@ -138,6 +138,7 @@ if TYPE_CHECKING:
 
 MAX_AUDIT_SNAPSHOT_IDS = 25
 ADMIN_MANUAL_SEO_PROVENANCE = "admin-manual"
+MAX_SOURCE_POST_TEXT_EXCERPT_LENGTH = 500
 MAX_SEO_TAG_LENGTH = 64
 MAX_TELEGRAM_ERROR_TEXT_LENGTH = 4000
 PENDING_TELEGRAM_SESSION_NAME_PREFIX = "pending_telegram_"
@@ -2541,8 +2542,12 @@ class AdminService:
             (failed, "failed"),
             else_="processing",
         ).label("index_status")
+        metadata_state = case(
+            (SourceChannelPost.metadata_version >= 1, "captured"),
+            else_="missing",
+        ).label("metadata_state")
         classified = (
-            select(index_status)
+            select(index_status, metadata_state)
             .select_from(SourceChannelPost)
             .outerjoin(
                 PipelineIngestRequest,
@@ -2596,17 +2601,30 @@ class AdminService:
         )
         rows = (
             await self.session.execute(
-                select(classified.c.index_status, func.count()).group_by(classified.c.index_status),
+                select(
+                    classified.c.index_status,
+                    classified.c.metadata_state,
+                    func.count(),
+                ).group_by(
+                    classified.c.index_status,
+                    classified.c.metadata_state,
+                ),
             )
         ).all()
-        counts = {status: count for status, count in rows}
+        index_counts: defaultdict[str, int] = defaultdict(int)
+        metadata_counts: defaultdict[str, int] = defaultdict(int)
+        for index_state, metadata_state_value, count in rows:
+            index_counts[index_state] += count
+            metadata_counts[metadata_state_value] += count
         return AdminSourceChannelPostSummaryRead(
-            observed_count=sum(counts.values()),
-            indexed_count=counts.get("indexed", 0),
-            partially_indexed_count=counts.get("partially_indexed", 0),
-            processing_count=counts.get("processing", 0),
-            failed_count=counts.get("failed", 0),
-            not_indexable_count=counts.get("not_indexable", 0),
+            observed_count=sum(index_counts.values()),
+            indexed_count=index_counts["indexed"],
+            partially_indexed_count=index_counts["partially_indexed"],
+            processing_count=index_counts["processing"],
+            failed_count=index_counts["failed"],
+            not_indexable_count=index_counts["not_indexable"],
+            metadata_captured_count=metadata_counts["captured"],
+            metadata_missing_count=metadata_counts["missing"],
         )
 
     async def _source_channel_post_reads(
@@ -2733,6 +2751,15 @@ class AdminService:
                     published_at=post.published_at,
                     observed_at=post.created_at,
                     media_type=post.media_type,
+                    metadata_state="captured" if post.metadata_version >= 1 else "missing",
+                    text_excerpt=self._source_post_text_excerpt(post.latest_text),
+                    media_group_id=post.media_group_id,
+                    reply_to_post_id=post.reply_to_post_id,
+                    telegram_edited_at=post.telegram_edited_at,
+                    metadata_first_observed_at=post.metadata_first_observed_at,
+                    metadata_last_observed_at=post.metadata_last_observed_at,
+                    is_deleted=post.is_deleted,
+                    deletion_observed_at=post.deletion_observed_at,
                     fetch_status=post.status.value,
                     fetch_detail=" — ".join(error_parts) or None,
                     ingest_outcome=(
@@ -2772,6 +2799,12 @@ class AdminService:
                 ),
             )
         return reads
+
+    @staticmethod
+    def _source_post_text_excerpt(value: str | None) -> str | None:
+        if value is None or len(value) <= MAX_SOURCE_POST_TEXT_EXCERPT_LENGTH:
+            return value
+        return f"{value[: MAX_SOURCE_POST_TEXT_EXCERPT_LENGTH - 3]}..."
 
     @staticmethod
     def _current_pipeline_stage(entries: Sequence[PipelineStageJournal]) -> PipelineStageJournal | None:

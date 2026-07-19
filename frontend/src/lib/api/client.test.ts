@@ -1088,8 +1088,40 @@ describe('admin API client', () => {
         return jsonResponse({
           source_channel_id: channelId,
           snapshot_at: '2026-07-13T12:00:00Z',
-          summary: { observed_count: 1, indexed_count: 1, partially_indexed_count: 0, processing_count: 0, failed_count: 0, not_indexable_count: 0 },
-          items: [],
+          summary: { observed_count: 1, indexed_count: 1, partially_indexed_count: 0, processing_count: 0, failed_count: 0, not_indexable_count: 0, metadata_captured_count: 1, metadata_missing_count: 0 },
+          items: [{
+            id: 'source-post-id',
+            post_id: '184',
+            telegram_url: 'https://t.me/daily_memes/184',
+            published_at: '2026-07-13T09:30:00Z',
+            observed_at: '2026-07-13T09:31:00Z',
+            media_type: 'image',
+            metadata_state: 'captured',
+            text_excerpt: 'Unicode caption: Привет 👋',
+            media_group_id: '9007199254740993',
+            reply_to_post_id: '183',
+            telegram_edited_at: '2026-07-13T09:32:00Z',
+            metadata_first_observed_at: '2026-07-13T09:31:00Z',
+            metadata_last_observed_at: '2026-07-13T09:33:00Z',
+            is_deleted: false,
+            deletion_observed_at: null,
+            fetch_status: 'accepted',
+            fetch_detail: null,
+            ingest_outcome: 'ingested',
+            ingest_status: 'materialized',
+            meme_id: null,
+            meme_file_id: null,
+            pipeline_stage: null,
+            pipeline_status: null,
+            pipeline_error: null,
+            qdrant_status: 'synced',
+            meilisearch_status: 'synced',
+            index_status: 'indexed',
+            is_retryable: false,
+            version: 'source-post-version',
+            capabilities: [],
+            blocked_reason: null
+          }],
           total: 1,
           limit: 50,
           offset: 100
@@ -1098,11 +1130,20 @@ describe('admin API client', () => {
       return jsonResponse(telegramChannelPayload(channelId, 'session-id'));
     }) satisfies ApiFetch;
 
-    await fetchAdminSourceChannelPosts(
+    const postPage = await fetchAdminSourceChannelPosts(
       { fetch: mockFetch, baseUrl: 'https://api.memexpert.test' },
       channelId,
       { limit: 50, offset: 100, snapshotAt: '2026-07-13T12:00:00Z' }
     );
+    expect(postPage.summary.metadata_captured_count).toBe(1);
+    expect(postPage.summary.metadata_missing_count).toBe(0);
+    expect(postPage.items[0]).toMatchObject({
+      metadata_state: 'captured',
+      text_excerpt: 'Unicode caption: Привет 👋',
+      media_group_id: '9007199254740993',
+      reply_to_post_id: '183',
+      is_deleted: false
+    });
     await backfillAdminSourceChannel(
       { fetch: mockFetch, baseUrl: 'https://api.memexpert.test', body: { message_limit: 5000 } },
       channelId

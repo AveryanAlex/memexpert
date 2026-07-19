@@ -286,6 +286,79 @@ never replayed automatically. The form stays unavailable until the
 bounded initial window completed and requires catch-up to be enabled on both
 the source and its assigned ready Telegram account.
 
+#### Backfilling Telegram post metadata
+
+Migration `0037` leaves legacy source-message rows at metadata version `0`.
+Use the dedicated metadata backfill to fetch only Telegram message context. It
+does not download media, enqueue pipeline work, change ingest/fetch attempt
+status, or advance `last_read_post_id`, the history cursor, or oldest-observed
+state.
+
+The limiter is process-local to each Telethon client. Do not run `--apply`
+concurrently with the crawler process using the same accounts, because the two
+processes would each enforce their own limit and could double the effective
+request rate. Stop or otherwise quiesce the crawler first, then preview the
+bounded work. Dry-run performs Telegram reads but does not update source posts
+or Telegram session heartbeat, account, authentication, cooldown, or
+quarantine state:
+
+```bash
+uv run memexpert-backfill-telegram-post-metadata --dry-run
+
+# Optional repeatable filters accept a tracked channel platform id or username.
+uv run memexpert-backfill-telegram-post-metadata \
+  --dry-run \
+  --channel daily_cats \
+  --channel another_channel \
+  --batch-size 100
+```
+
+Apply is deliberately explicit:
+
+```bash
+uv run memexpert-backfill-telegram-post-metadata --apply --batch-size 100
+```
+
+Each batch is fetched through its channel's assigned crawler account and that
+account's existing rate limiter, then committed independently. A successful
+fetch records version `1`, including a legitimate null text for no-text posts.
+A message Telegram reports missing is marked locally deleted and is not fetched
+again by later backfill runs; it remains eligible for a future live/history
+observation, which repopulates first/latest context and clears deletion. A
+transient provider failure leaves the row uncaptured for a later run. A flood
+wait parks only the affected account with Telegram's cooldown and skips its
+remaining work; wait for the cooldown and restore the account to `active`
+before rerunning. A newly detected ban or non-runnable client failure
+quarantines the account in apply mode, an authorization failure changes it to
+`auth_required`, and a deterministically malformed response is reported as a
+permanent failure without being mislabeled as retryable. Pre-existing
+non-runnable account states are skipped once per account and reported when
+operator attention is needed. Dry-run reports those projected outcomes without
+applying session-state changes. Channels with uncaptured rows but no assigned
+Telegram session are reported as unassigned instead of being silently omitted.
+Exit status `1` means retryable work remains; status `2` means operator
+attention is required. Restart the crawler only after the command has closed
+its clients.
+
+Verify counts without selecting stored text or credentials:
+
+```sql
+SELECT
+    source_channel_id,
+    count(*) FILTER (WHERE metadata_version >= 1) AS captured,
+    count(*) FILTER (WHERE metadata_version < 1 AND NOT is_deleted) AS remaining,
+    count(*) FILTER (WHERE is_deleted) AS deleted
+FROM source_channel_posts
+GROUP BY source_channel_id
+ORDER BY source_channel_id;
+```
+
+The source-detail message ledger reports the same captured/missing state, a
+bounded latest-text excerpt, group/reply IDs, edit time, and deletion state.
+Album members remain separate messages/memes; membership is exactly Telegram's
+`grouped_id`, ordering is numeric message-ID order, and adjacent standalone
+posts are never linked.
+
 Diagnostics contains source/checkpoint identifiers; ingestion settings,
 assignment, source access validation, and remove-source confirmation are
 progressive disclosures. The catch-up limit is a per-source forward-sweep bound:
@@ -424,9 +497,12 @@ Verify the durable chain instead:
    checkpoint empty but still updates `last_fetched_at`.
 4. Open the source's admin message-indexing page and confirm
    `source_channel_posts` rows appear for supported, unsupported, and failed
-   observations.
+   observations. Newly observed rows should report metadata captured even when
+   the message is text-only or has no text; group/reply/edit/deletion details
+   appear only when Telegram supplied them.
 5. Confirm `pipeline_ingest_requests` rows appear for supported messages with the source's
-   `(source_platform='telegram', source_id=<platform_id>)` identity.
+   `(source_platform='telegram', source_id=<platform_id>)` identity and a
+   normalized `source_metadata.telegram_post` snapshot.
 6. Follow the materialized file through `pipeline_stage_journal` and
    `meme_file_sync_target_snapshots`; both Qdrant and Meilisearch must reach a
    synced state before claiming search indexing is complete.

@@ -211,8 +211,27 @@ test('admin inspects source message indexing and queues an older-history pass', 
   await expect(page.getByRole('heading', { name: 'Daily cats', level: 1 })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Indexing summary' })).toBeVisible();
   await expect(page.getByRole('columnheader', { name: 'Materialized' })).toBeVisible();
+  await expect(page.getByRole('columnheader', { name: 'Telegram context' })).toBeVisible();
+  await expect(page.getByText('Metadata captured', { exact: true }).first()).toBeVisible();
+  await expect(page.getByText('Metadata missing', { exact: true }).first()).toBeVisible();
   await expect(page.getByText('Partially indexed', { exact: true }).first()).toBeVisible();
   await expect(page.getByText('Embedding provider unavailable.')).toBeVisible();
+
+  const capturedPost = page.getByRole('row').filter({ has: page.getByRole('link', { name: '#184', exact: true }) });
+  await expect(capturedPost.getByText('Cats & coffee')).toBeVisible();
+  await expect(capturedPost.getByText('9007199254740993', { exact: true })).toBeVisible();
+  await expect(capturedPost.getByText('Reply to:', { exact: true })).toBeVisible();
+  await expect(capturedPost.getByText('#179', { exact: true })).toBeVisible();
+  await expect(capturedPost.getByText('Edited 2026-01-01 00:05 UTC', { exact: true })).toBeVisible();
+  await expect(capturedPost.getByText('Not marked deleted', { exact: true })).toBeVisible();
+
+  const deletedPost = page.getByRole('row').filter({ has: page.getByRole('link', { name: '#181', exact: true }) });
+  await expect(deletedPost.getByText('Deleted from Telegram', { exact: true })).toBeVisible();
+  await expect(deletedPost.getByText('This retained caption remains available after deletion.', { exact: true })).toBeVisible();
+  await expect(deletedPost.getByText('Deletion observed 2026-01-01 00:15 UTC', { exact: true })).toBeVisible();
+
+  const textOnlyPost = page.getByRole('row').filter({ has: page.getByRole('link', { name: '#180', exact: true }) });
+  await expect(textOnlyPost.getByText('Standalone text-only Telegram post.', { exact: true })).toBeVisible();
 
   const backfillForm = page.locator('form[action="?/backfillSourceChannel"]');
   const messageLimit = backfillForm.getByLabel('Older messages to fetch');

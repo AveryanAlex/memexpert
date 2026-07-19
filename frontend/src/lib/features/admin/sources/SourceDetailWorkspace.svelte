@@ -110,8 +110,10 @@
   {#if postPage}
   <section class="mt-6 grid gap-3" aria-labelledby="source-index-summary-heading">
     <h2 id="source-index-summary-heading" class="m-0 text-2xl font-black tracking-[-0.04em]">Indexing summary</h2>
-    <div class="grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
+    <div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-8">
       {@render SummaryStat('Fetched', postPage.summary.observed_count)}
+      {@render SummaryStat('Metadata captured', postPage.summary.metadata_captured_count, 'success')}
+      {@render SummaryStat('Metadata missing', postPage.summary.metadata_missing_count, 'trend')}
       {@render SummaryStat('Indexed', postPage.summary.indexed_count, 'success')}
       {@render SummaryStat('Partially indexed', postPage.summary.partially_indexed_count, 'trend')}
       {@render SummaryLinkStat('Processing', postPage.summary.processing_count, sourcePostFilterHref(source.id, 'processing'), 'trend')}
@@ -232,11 +234,12 @@
 
     {#if postPage.items.length}
       <div class="overflow-x-auto rounded-3xl border border-line bg-paper">
-        <table class="min-w-[88rem] w-full border-collapse text-left text-sm">
-          <caption class="sr-only">Fetch, materialization, pipeline, and search-index state for Telegram messages.</caption>
+        <table class="min-w-[112rem] w-full border-collapse text-left text-sm">
+          <caption class="sr-only">Telegram metadata, fetch, materialization, pipeline, and search-index state for source messages.</caption>
           <thead class="bg-soft text-chiptext">
             <tr>
               <th class="px-4 py-3 font-black">Message</th>
+              <th class="px-4 py-3 font-black">Telegram context</th>
               <th class="px-4 py-3 font-black">Fetched</th>
               <th class="px-4 py-3 font-black">Materialized</th>
               <th class="px-4 py-3 font-black">Pipeline</th>
@@ -257,6 +260,53 @@
                     <strong>#{post.post_id}</strong>
                   {/if}
                   <p class="mb-0 mt-1 text-xs text-muted">{post.published_at ? formatAdminTimestamp(post.published_at) : 'Publish time unavailable'}</p>
+                </td>
+                <td class="max-w-md px-4 py-4">
+                  <div class="flex flex-wrap gap-2">
+                    <Badge tone={post.metadata_state === 'captured' ? 'success' : 'neutral'}>
+                      Metadata {post.metadata_state}
+                    </Badge>
+                    {#if post.is_deleted}
+                      <Badge class="border-danger-line bg-danger-surface text-danger">Deleted from Telegram</Badge>
+                    {/if}
+                  </div>
+
+                  {#if post.metadata_state === 'captured'}
+                    {#if post.text_excerpt !== null}
+                      <p class="mb-0 mt-2 whitespace-pre-wrap break-words text-sm">{post.text_excerpt}</p>
+                    {:else}
+                      <p class="mb-0 mt-2 text-xs text-muted">Telegram exposed no text or caption.</p>
+                    {/if}
+
+                    {#if post.media_group_id || post.reply_to_post_id}
+                      <dl class="mb-0 mt-2 grid gap-1 text-xs">
+                        {#if post.media_group_id}
+                          <div class="flex flex-wrap gap-1"><dt class="font-black">Media group:</dt><dd class="m-0 break-all">{post.media_group_id}</dd></div>
+                        {/if}
+                        {#if post.reply_to_post_id}
+                          <div class="flex flex-wrap gap-1"><dt class="font-black">Reply to:</dt><dd class="m-0 break-all">#{post.reply_to_post_id}</dd></div>
+                        {/if}
+                      </dl>
+                    {/if}
+
+                    <div class="mt-2 grid gap-1 text-xs text-muted">
+                      <p class="m-0">{post.telegram_edited_at ? `Edited ${formatAdminTimestamp(post.telegram_edited_at)}` : 'No Telegram edit observed'}</p>
+                      {#if post.metadata_first_observed_at}
+                        <p class="m-0">Metadata first observed {formatAdminTimestamp(post.metadata_first_observed_at)}</p>
+                      {/if}
+                      {#if post.metadata_last_observed_at}
+                        <p class="m-0">Metadata last observed {formatAdminTimestamp(post.metadata_last_observed_at)}</p>
+                      {/if}
+                    </div>
+                  {:else}
+                    <p class="mb-0 mt-2 max-w-sm text-xs text-muted">Telegram post metadata has not been captured.</p>
+                  {/if}
+
+                  {#if post.is_deleted}
+                    <p class="mb-0 mt-2 text-xs text-danger">{post.deletion_observed_at ? `Deletion observed ${formatAdminTimestamp(post.deletion_observed_at)}` : 'Deletion observation time unavailable'}</p>
+                  {:else}
+                    <p class="mb-0 mt-2 text-xs text-muted">Not marked deleted</p>
+                  {/if}
                 </td>
                 <td class="px-4 py-4">
                   <strong>{humanizePipelineValue(post.fetch_status)}</strong>

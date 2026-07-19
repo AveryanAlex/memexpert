@@ -19,6 +19,39 @@ Users can suggest new channels for crawling via a form in the bot PM and on the 
 - **GIFs** — converted to MP4 for delivery
 - **Videos** (MP4, WEBM) — website and Mini App only, excluded from TG inline
 
+### Telegram post context retention
+
+The crawler retains Telegram post context independently of whether a message
+contains supported media. `SourceChannelPost` is written before media
+classification, download, or duplicate short-circuiting, so captions,
+unsupported attachments, and text-only posts all remain in the source ledger.
+It stores the exact first text MemeExpert observes and the latest observed text,
+plus an allowlisted JSON projection of Telegram text entities. The crawler also
+records Telegram's explicit `grouped_id`, reply target, edit time, metadata
+observation times, and locally observed deletion state without persisting raw
+Telethon objects.
+
+Metadata version `0` means a legacy or otherwise uncaptured row. Version `1`
+means Telegram context was successfully captured; a null text at version `1`
+means Telegram exposed no text. The first value is the first version MemeExpert
+saw, not necessarily the version Telegram originally published, and only the
+first/latest pair is retained rather than a full edit history. A later
+successful observation refreshes only the latest value and clears a stale
+deletion marker.
+
+Telegram albums remain separate messages and separate memes. Membership comes
+only from an identical Telegram `grouped_id`, and members are ordered by
+numeric Telegram message ID. `Meme.files` continues to represent alternative
+physical versions of one meme and is never used as an album container. Replies
+are linked only when Telegram supplies an explicit reply target; adjacent posts
+are never associated heuristically.
+
+Supported-media ingest requests receive the normalized observation snapshot in
+`source_metadata.telegram_post`, but `SourceChannelPost` remains authoritative.
+Public search, embeddings, consumer source-text display, album carousels, and
+album-level saving/sharing are deferred; this capture does not change consumer
+API or UI behavior.
+
 ### Content Processing
 
 Every meme goes through:

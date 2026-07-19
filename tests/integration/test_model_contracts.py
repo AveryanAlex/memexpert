@@ -13,6 +13,7 @@ import pytest
 import pytest_asyncio
 from pydantic import ValidationError
 from sqlalchemy import CheckConstraint, Table, UniqueConstraint, inspect as sa_inspect, select, text
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import configure_mappers, selectinload
 
@@ -1709,29 +1710,55 @@ def test_source_channel_post_inventory_model_contract() -> None:
     assert set(table.c.keys()) == {
         "attempt_count",
         "created_at",
+        "deletion_observed_at",
+        "first_observed_text",
+        "first_observed_text_entities",
         "id",
+        "is_deleted",
         "is_retryable",
         "last_attempt_at",
         "last_error_code",
         "last_error_text",
+        "latest_text",
+        "latest_text_entities",
+        "media_group_id",
+        "metadata_first_observed_at",
+        "metadata_last_observed_at",
+        "metadata_version",
         "media_type",
         "next_attempt_at",
         "post_id",
         "published_at",
         "quarantined_at",
+        "reply_to_post_id",
         "source_channel_id",
         "status",
+        "telegram_edited_at",
         "updated_at",
     }
     status_default = table.c["status"].default
     attempt_count_default = table.c["attempt_count"].default
     is_retryable_default = table.c["is_retryable"].default
+    metadata_version_default = table.c["metadata_version"].default
+    is_deleted_default = table.c["is_deleted"].default
     assert status_default is not None
     assert attempt_count_default is not None
     assert is_retryable_default is not None
+    assert metadata_version_default is not None
+    assert is_deleted_default is not None
     assert cast("Any", status_default).arg is SourceChannelPostStatus.OBSERVED
     assert cast("Any", attempt_count_default).arg == 0
     assert cast("Any", is_retryable_default).arg is False
+    assert cast("Any", metadata_version_default).arg == 0
+    assert cast("Any", is_deleted_default).arg is False
+    assert isinstance(table.c["first_observed_text_entities"].type, postgresql.JSONB)
+    assert isinstance(table.c["latest_text_entities"].type, postgresql.JSONB)
+    check_constraint_sql = " ".join(
+        str(constraint.sqltext).lower()
+        for constraint in table.constraints
+        if isinstance(constraint, CheckConstraint)
+    )
+    assert "metadata_version >= 0" in check_constraint_sql
     unique_constraints = {
         constraint.name: tuple(column.name for column in constraint.columns)
         for constraint in table.constraints
@@ -1741,9 +1768,17 @@ def test_source_channel_post_inventory_model_contract() -> None:
         "uq_source_channel_posts_channel_post": ("source_channel_id", "post_id"),
     }
     assert {index.name for index in table.indexes} == {
+        "ix_source_channel_posts_channel_media_group_post",
         "ix_source_channel_posts_channel_published_at",
         "ix_source_channel_posts_channel_status",
     }
+    assert (
+        _postgresql_where(
+            "ix_source_channel_posts_channel_media_group_post",
+            "source_channel_posts",
+        )
+        == "media_group_id IS NOT NULL"
+    )
 
 
 def test_source_channel_backfill_job_model_contract() -> None:

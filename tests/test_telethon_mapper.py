@@ -80,6 +80,58 @@ class _FakeMessageReplies:
 
 
 @dataclass
+class _FakeMessageReplyHeader:
+    reply_to_msg_id: int | None = None
+
+
+@dataclass
+class MessageEntityBold:
+    offset: int
+    length: int
+
+
+@dataclass
+class MessageEntityTextUrl:
+    offset: int
+    length: int
+    url: str
+
+
+@dataclass
+class MessageEntityPre:
+    offset: int
+    length: int
+    language: str
+
+
+@dataclass
+class MessageEntityMentionName:
+    offset: int
+    length: int
+    user_id: int
+
+
+@dataclass
+class MessageEntityCustomEmoji:
+    offset: int
+    length: int
+    document_id: int
+
+
+@dataclass
+class MessageEntityBlockquote:
+    offset: int
+    length: int
+    collapsed: bool | None = None
+
+
+@dataclass
+class MessageEntityUnknown:
+    offset: int
+    length: int
+
+
+@dataclass
 class _FakeDocument:
     mime_type: str | None
 
@@ -96,6 +148,11 @@ class _FakeMessage:
     replies: _FakeMessageReplies | None = None
     reactions: _FakeMessageReactions | None = None
     fwd_from: _FakeMessageFwdHeader | None = None
+    message: str | None = None
+    entities: list[object] | None = None
+    grouped_id: int | None = None
+    reply_to: _FakeMessageReplyHeader | None = None
+    edit_date: datetime | None = None
 
 
 def _now() -> datetime:
@@ -179,6 +236,98 @@ def test_normalizer_classifies_document_media_by_mime_type() -> None:
     ]
 
     assert [p.media_type for p in projections] == ["gif", "video", "video", "unsupported", "unsupported"]
+
+
+def test_normalizer_preserves_exact_unicode_caption_and_normalizes_post_context() -> None:
+    caption = "  Привет, мир 👋\nhttps://example.test/мем  "
+    naive_edit_date = datetime(2024, 5, 1, 13, 45, 0)
+    message = _FakeMessage(
+        id=23,
+        date=_now(),
+        photo=object(),
+        message=caption,
+        entities=[
+            MessageEntityBold(offset=2, length=11),
+            MessageEntityTextUrl(
+                offset=17,
+                length=26,
+                url="https://example.test/мем",
+            ),
+            MessageEntityPre(offset=2, length=6, language="ru"),
+            MessageEntityMentionName(offset=2, length=6, user_id=987_654_321),
+            MessageEntityCustomEmoji(offset=13, length=2, document_id=123_456_789),
+            MessageEntityBlockquote(offset=0, length=43, collapsed=True),
+            MessageEntityUnknown(offset=0, length=1),
+        ],
+        grouped_id=9_223_372_036_854_000_001,
+        reply_to=_FakeMessageReplyHeader(reply_to_msg_id=19),
+        edit_date=naive_edit_date,
+    )
+
+    result = TelethonMessageNormalizer.build(
+        message=_as_message(message),
+        channel_id="c",
+        channel_title="C",
+        channel_username=None,
+    )
+
+    metadata = result.telegram_post
+    assert metadata.text == caption
+    assert metadata.media_group_id == "9223372036854000001"
+    assert metadata.reply_to_post_id == "19"
+    assert metadata.edited_at == naive_edit_date.replace(tzinfo=UTC)
+    assert metadata.entity_json() == [
+        {"type": "bold", "offset": 2, "length": 11},
+        {
+            "type": "text_url",
+            "offset": 17,
+            "length": 26,
+            "url": "https://example.test/мем",
+        },
+        {"type": "pre", "offset": 2, "length": 6, "language": "ru"},
+        {
+            "type": "mention_name",
+            "offset": 2,
+            "length": 6,
+            "user_id": 987_654_321,
+        },
+        {
+            "type": "custom_emoji",
+            "offset": 13,
+            "length": 2,
+            "document_id": 123_456_789,
+        },
+        {
+            "type": "blockquote",
+            "offset": 0,
+            "length": 43,
+            "collapsed": True,
+        },
+    ]
+
+
+def test_normalizer_captures_text_only_message_without_inventing_relationships() -> None:
+    text = "Standalone text only 🧠"
+    message = _FakeMessage(
+        id=24,
+        date=_now(),
+        message=text,
+        entities=[],
+    )
+
+    result = TelethonMessageNormalizer.build(
+        message=_as_message(message),
+        channel_id="c",
+        channel_title="C",
+        channel_username=None,
+    )
+
+    assert result.media_type == "unsupported"
+    assert result.telegram_post.text == text
+    assert result.telegram_post.text_entities == ()
+    assert result.telegram_post.media_group_id is None
+    assert result.telegram_post.reply_to_post_id is None
+    assert result.telegram_post.edited_at is None
 
 
 def test_normalizer_treats_service_action_photo_as_unsupported() -> None:
