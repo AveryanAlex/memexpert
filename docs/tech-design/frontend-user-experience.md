@@ -14,6 +14,7 @@ The redesign is a presentation and progressive-disclosure change. FastAPI remain
 | Card media, image enlargement, and Favorite/Download/Save/Send actions are always visible. | A meme catalog should make the next meaningful action available where the media is seen, rather than hide primary interaction behind a menu. |
 | Selection is an opt-in, local grid state. | Bulk tools are useful only after an intentional transition into management mode; they must not dominate passive discovery. |
 | Multi-card surfaces use rank-aware measured masonry. | One placement contract preserves backend relevance in DOM and visual order while packing varied media dimensions densely. See [Grid and feed behavior](#grid-and-feed-behavior). |
+| Similar memes use an SSR-first infinite feed. | The detail route renders 12 results immediately and appends bounded pages through the shared rank-aware masonry without exposing bulk tools; backend similarity/fallback order and attribution remain intact. |
 | Saved content and account settings have separate routes. | Library operations are content management; connection and preferences are account management. Keeping them separate makes each route smaller and more legible. |
 | Advanced or technical information lives behind explicit disclosure. | Collections, meme details, tag/template analytics, and trends should lead with media and understandable context, not control panels or diagnostics. |
 | Telegram adapts the host shell instead of forking routes. | Website and Mini App retain one route and action contract while adopting Telegram viewport, theme, safe-area, and authentication behavior. |
@@ -46,7 +47,7 @@ Desktop navigation presents the brand, Discover, global query search, Saved, and
 | `lib/ui/Masonry.svelte` | Generic measured layout primitive. It retains one keyed flat DOM list, calculates rank-aware coordinates from rendered item heights, and owns hydration/no-JavaScript fallback behavior without meme-domain policy. |
 | `MemeGrid.svelte` | Composes the shared masonry primitive with result attribution markup, local selection mode, checkboxes, and the sticky selection toolbar. It does not decide whether a route enables bulk behavior. |
 | `discovery-attribution.ts` | Maps the shared discovery-attribution fields to DOM data attributes for grids and Meme of the Day without diverging field sets. |
-| `InfiniteMemeFeed.svelte` | Owns initial/next page state, deduplicated append behavior, intersection loading, and accessible Load more/retry/end states. It passes route bulk policy to `MemeGrid`; layout is shared across surfaces. |
+| `InfiniteMemeFeed.svelte` | Owns initial/next page state, deduplicated append behavior, intersection loading, and accessible Load more/retry/end states for Search and Similar sources. It resets and aborts stale pagination when its source key changes, passes route bulk policy to `MemeGrid`, and shares its layout across surfaces. |
 | `MemeOfTheDayPanel.svelte` | Presents the daily selection as a compact media-first tile while retaining attribution for telemetry. |
 | `features/taxonomy/TaxonomyLandingPage.svelte` and `server/taxonomyLanding.ts` | Share gallery-first tag/template presentation and loading while route files remain thin kind/slug adapters. |
 
@@ -62,7 +63,7 @@ Save-to-collection opens a borderless contextual popover backed by a meme-scoped
 | Saved | `server/libraryPage.ts` centralizes the cookie-forwarded library request. `/library` owns collection creation, active save destination, collection list, Favorites, Pins, pin reorder, and saved-content grids. |
 | Account | `/profile` owns Telegram connection, language, sensitive-content preference, and compact statistics only. Its server load fetches stats independently of the library. |
 | Collection | The route presents metadata, active-save control, notices, and saved memes first. `CollectionManagement.svelte` contains the disclosure for rename/visibility, invitations, members, revocation, and deletion. |
-| Meme/detail landing | `/memes/[id]` composes media, `MemeActionMenu`, de-duplicated concise context, **About this meme**, full-width **Sources & activity**, nested **Professional analytics**, and related discovery. Detail, sources, analytics, and related loads fail independently. Tag/template routes place galleries before their collapsed aggregate activity information. |
+| Meme/detail landing | `/memes/[id]` composes media, `MemeActionMenu`, de-duplicated concise context, **About this meme**, full-width **Sources & activity**, nested **Professional analytics**, and an SSR-first Similar feed. Detail, sources, analytics, and Similar loads fail independently. Tag/template routes place galleries before their collapsed aggregate activity information. |
 | Trends | Trend route components translate server-provided rankings and activity data into consumer labels, accessible charts, and tables. They do not redefine ranking on the client. |
 
 ## Route Ownership and Progressive Disclosure
@@ -178,12 +179,18 @@ Container resizing and post-reveal media-height changes may trigger a measured r
 
 `InfiniteMemeFeed` deduplicates initial results and appends only unseen IDs in later page order. Loading state, retry, result count, explicit Load more fallback, and end state remain available regardless of `IntersectionObserver` support.
 
+For `similar`, the meme-scoped SSR load requests the canonical first 12 results. Browser pagination uses the same-origin SvelteKit proxy with `limit=12` and offsets `12`, `24`, and so on; the proxy validates pagination, forwards cookies, propagates upstream error status and cancellation, and marks every response `private, no-store`. Same-detail source/analytics query navigation retains that SSR result instead of repeating Similar retrieval. The feed appends in API order until `has_more` is false or its stable bounded `total` (at most 200) is reached. Navigation, component teardown, or a changed source meme ID aborts in-flight work; a source change also clears the prior source's results, error, count, and pagination state.
+
+The Similar feed is always rank-preserving and bulk-disabled. It relies on the API to exclude the source and own Qdrant/tag/template/popular degradation, while the client only deduplicates repeated IDs caused by an eventually consistent page boundary. The public popularity materialized view refreshes on a five-minute cadence, so pages are best-effort across refreshes and do not claim snapshot isolation. A page failure leaves the meme detail usable and exposes an inline retry; an empty first page and a completed feed have distinct accessible states.
+
+All initial and appended Similar cards retain API-provided attribution, including global rank and related-source identity. Their detail links override the application's hover preload policy with `data-sveltekit-preload-data="tap"`; taps, clicks, and keyboard activation retain normal navigation without hover-triggered detail-data waterfalls.
+
 Bulk capability is passed per route. `MemeGrid` then owns a local `selectionMode`:
 
 - no checkboxes or sticky toolbar before **Select items** is chosen;
 - Select all, Clear, Done, and actionable save/add/remove/download controls appear only in that mode;
 - Clear, Done, disabling bulk capability, and successful collection removal leave the mode cleanly;
-- Discover explicitly passes bulk disabled.
+- Discover and Similar explicitly pass bulk disabled.
 
 ## Detail, Collection, and Trend Semantics
 
@@ -219,6 +226,11 @@ decreases. Missing/one-point history uses an honest insufficient-history state
 instead of a fabricated line. Each projection has its own loading/error state,
 so an analytics or related-content failure does not remove source attribution
 or the meme itself.
+
+The SSR-first Similar feed follows those independent projections. It keeps the
+source detail, action forms, Telegram connection prompt, tags, and telemetry
+intact while omitting file-level diagnostics, raw ranking scores, and fallback
+implementation details from consumer UI.
 
 Collection management uses native `<details>/<summary>` after the content grid. Its forms retain existing hidden inputs, action names, capability checks, clipboard fallback, notices, invitation lifecycle, member-role constraints, and destructive-operation semantics. It is not a reduced permission model; it is a delayed presentation of the same permitted operations.
 

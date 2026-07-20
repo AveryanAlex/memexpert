@@ -10,7 +10,7 @@ export interface MemeFeedFilters {
   collectionIds?: string[];
 }
 
-export type MemeFeedSource = 'catalog' | 'home';
+export type MemeFeedSource = 'catalog' | 'home' | 'similar';
 
 export const INFINITE_FEED_OBSERVER_ROOT_MARGIN = '420px 0px';
 
@@ -51,8 +51,14 @@ export function nextMemePageOffset(page: PublicMemeSearchPageRead): number {
   return page.offset + step;
 }
 
-export function memeFeedKey(filters: MemeFeedFilters): string {
+export function memeFeedKey(
+  filters: MemeFeedFilters,
+  source: MemeFeedSource = 'catalog',
+  sourceMemeId: string | null = null
+): string {
   return JSON.stringify({
+    source,
+    sourceMemeId: source === 'similar' ? sourceMemeId : null,
     query: filters.query.trim(),
     tags: filters.tags ?? [],
     includeNsfw: filters.includeNsfw,

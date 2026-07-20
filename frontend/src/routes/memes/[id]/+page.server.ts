@@ -2,18 +2,17 @@ import { fail } from '@sveltejs/kit';
 import type { Actions, PageServerLoad } from './$types';
 import {
   ApiError,
+  DEFAULT_PAGE_SIZE,
+  emptyMemePage,
   favoriteMeme,
   fetchCurrentSession,
   fetchMemeAnalytics,
   fetchMemePopularitySummary,
   fetchMemeSources,
-  fetchSimilarMemes,
-  fetchTagLanding,
-  fetchTrendPage
+  fetchSimilarMemes
 } from '$lib/api/client';
 import type { ApiFetch } from '$lib/api/client';
-import type { PublicMemeDetailRead } from '$lib/api/types';
-import type { MemeDetailRelatedSource } from '$lib/meme-detail-view';
+import type { PublicMemeSearchPageRead } from '$lib/api/types';
 import {
   MEME_SOURCE_PAGE_SIZE,
   parseMemeInsightsParams
@@ -21,9 +20,9 @@ import {
 import { parseMemeAttributionSearchParams } from '$lib/memeActions';
 import { apiBaseUrl, cookieHeaderWithAccessToken, forwardBackendAccessCookie } from '$lib/server/backend';
 
-const RELATED_LIMIT = 7;
+const SIMILAR_LIMIT = DEFAULT_PAGE_SIZE;
 
-export const load: PageServerLoad = async ({ fetch, parent, request, url }) => {
+export const load: PageServerLoad = async ({ fetch, isDataRequest, parent, request, url }) => {
   const cookieHeader = request.headers.get('cookie') ?? undefined;
   const attribution = parseMemeAttributionSearchParams(url.searchParams);
   const insightsParams = parseMemeInsightsParams(url.searchParams);
@@ -37,20 +36,26 @@ export const load: PageServerLoad = async ({ fetch, parent, request, url }) => {
       insightsParams,
       insightsUrl: { pathname: url.pathname, search: url.search },
       popularity: null,
-      relatedSource: null,
+      retainSimilarPage: false,
+      similarPage: emptyMemePage(SIMILAR_LIMIT, 0),
+      similarErrorMessage: null,
       sourceError: null,
       sourcePage: null
     };
   }
 
-  const [popularity, relatedSource, sourceResult, analyticsResult] = await Promise.all([
+  const retainSimilarPage = canRetainSimilarPage({ isDataRequest, request, url });
+  const similarRequest = retainSimilarPage
+    ? Promise.resolve({ page: emptyMemePage(SIMILAR_LIMIT, 0), errorMessage: null })
+    : fetchInitialSimilarPage(fetch, cookieHeader, meme.id);
+  const [popularity, similar, sourceResult, analyticsResult] = await Promise.all([
     fetchMemePopularitySummary({
       fetch,
       baseUrl: apiBaseUrl(),
       memeId: meme.id,
       cookieHeader
     }).catch(() => null),
-    fetchRelatedDiscoverySource(fetch, cookieHeader, meme),
+    similarRequest,
     settleInsight(
       fetchMemeSources({
         fetch,
@@ -83,7 +88,9 @@ export const load: PageServerLoad = async ({ fetch, parent, request, url }) => {
     insightsParams,
     insightsUrl: { pathname: url.pathname, search: url.search },
     popularity,
-    relatedSource,
+    retainSimilarPage,
+    similarPage: similar.page,
+    similarErrorMessage: similar.errorMessage,
     sourceError: sourceResult.error,
     sourcePage: sourceResult.data
   };
@@ -97,55 +104,51 @@ async function settleInsight<T>(promise: Promise<T>, message: string): Promise<{
   }
 }
 
-async function fetchRelatedDiscoverySource(
+function canRetainSimilarPage({
+  isDataRequest,
+  request,
+  url
+}: {
+  isDataRequest: boolean;
+  request: Request;
+  url: URL;
+}): boolean {
+  if (!isDataRequest) return false;
+  const referer = request.headers.get('referer');
+  if (!referer) return false;
+
+  try {
+    const previousUrl = new URL(referer);
+    return (
+      previousUrl.origin === url.origin &&
+      previousUrl.pathname === url.pathname &&
+      previousUrl.search !== url.search
+    );
+  } catch {
+    return false;
+  }
+}
+
+async function fetchInitialSimilarPage(
   fetch: ApiFetch,
   cookieHeader: string | undefined,
-  meme: PublicMemeDetailRead
-): Promise<MemeDetailRelatedSource> {
+  memeId: string
+): Promise<{ page: PublicMemeSearchPageRead; errorMessage: string | null }> {
   try {
     const page = await fetchSimilarMemes({
       fetch,
       baseUrl: apiBaseUrl(),
-      memeId: meme.id,
-      limit: RELATED_LIMIT,
+      memeId,
+      limit: SIMILAR_LIMIT,
       offset: 0,
       cookieHeader
     });
-    return { kind: 'similar', page };
+    return { page, errorMessage: null };
   } catch {
-    // Fall back only when the canonical similar endpoint is unavailable.
-  }
-
-  const firstTag = meme.tags[0]?.trim();
-
-  if (firstTag) {
-    try {
-      const landing = await fetchTagLanding({
-        fetch,
-        baseUrl: apiBaseUrl(),
-        slug: firstTag,
-        limit: RELATED_LIMIT,
-        offset: 0,
-        cookieHeader
-      });
-      return { kind: 'tag', tag: firstTag, items: landing.page.items };
-    } catch {
-      // Fall through to public trends so tag API issues do not break detail pages.
-    }
-  }
-
-  try {
-    const trends = await fetchTrendPage({
-      fetch,
-      baseUrl: apiBaseUrl(),
-      ranking: 'trending',
-      limit: RELATED_LIMIT,
-      offset: 0,
-      cookieHeader
-    });
-    return { kind: 'trending', items: trends.items.map((item) => ({ meme: item.meme, attribution: item.attribution })) };
-  } catch {
-    return null;
+    return {
+      page: emptyMemePage(SIMILAR_LIMIT, 0),
+      errorMessage: 'Could not load similar memes. Try again.'
+    };
   }
 }
 

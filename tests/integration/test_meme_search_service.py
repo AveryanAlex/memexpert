@@ -52,7 +52,14 @@ from memexpert.services.analytics import AnalyticsService, InteractionEventRefs,
 from memexpert.services.collection_service import CollectionService
 from memexpert.services.engagement_read_model import load_derived_popularity_scores
 from memexpert.services.media_render_urls import MediaRenderUrlService
-from memexpert.services.meme_search import MemeNotFoundError, MemeSearchFilters, MemeSearchScope, MemeSearchService
+from memexpert.services.meme_search import (
+    PUBLIC_POPULAR_ALGORITHM_VERSION,
+    SIMILAR_ALGORITHM_VERSION,
+    MemeNotFoundError,
+    MemeSearchFilters,
+    MemeSearchScope,
+    MemeSearchService,
+)
 from memexpert.services.meme_seo import MemeSeoGenerationService, MemeSeoProviderResult
 from memexpert.services.public_trends import (
     TREND_MATERIALIZED_VIEWS,
@@ -1079,6 +1086,7 @@ async def test_similar_route_uses_qdrant_embedding_and_filters_private_and_self_
     second_match = await _create_meme(migrated_db_session, tags=["frog"], popularity_score=10.0)
     await _add_image_embedding(migrated_db_session, source, (0.25, 0.75))
     await migrated_db_session.commit()
+    await _refresh_trend_views(migrated_db_session)
     similarity_client = FakeSimilarityClient(
         (
             QdrantSimilarityMatch(
@@ -1114,6 +1122,7 @@ async def test_similar_route_uses_qdrant_embedding_and_filters_private_and_self_
         response = await client.get(f"/api/v1/memes/{source.id}/similar", params={"limit": 2})
     finally:
         app.dependency_overrides.clear()
+    second_page = await service.get_public_similar_memes(source.id, limit=1, offset=1)
 
     assert response.status_code == 200
     payload = response.json()
@@ -1124,12 +1133,106 @@ async def test_similar_route_uses_qdrant_embedding_and_filters_private_and_self_
     assert first_attribution["source_meme_id"] == str(source.id)
     assert first_attribution["score"] == pytest.approx(0.91)
     assert first_attribution["score_components"] == {"similarity": 0.91, "total": 0.91}
-    assert len(similarity_client.calls) == 1
+    assert payload["total"] == second_page.total == 2
+    assert [item.meme.id for item in second_page.items] == [second_match.id]
+    assert second_page.items[0].attribution.rank == 2
+    assert len(similarity_client.calls) == 2
     assert similarity_client.calls[0]["vector"] == pytest.approx((0.25, 0.75))
     assert similarity_client.calls[0]["current_meme_file_id"] == _primary_file_id(source)
-    assert similarity_client.calls[0]["limit"] == 20
+    assert {call["limit"] for call in similarity_client.calls} == {800}
     assert str(private_match.id) not in response.text
     assert "similar-hidden.jpg" not in response.text
+
+
+async def test_public_similar_memes_pages_across_partial_qdrant_and_all_fallback_tiers(
+    migrated_db_session: AsyncSession,
+) -> None:
+    template = MemeTemplate(slug="mixed-similar", name="Mixed Similar")
+    migrated_db_session.add(template)
+    await migrated_db_session.flush()
+    source = await _create_meme(migrated_db_session, tags=["frog"])
+    source.template_id = template.id
+    qdrant_tag = await _create_meme(migrated_db_session, tags=["frog"], popularity_score=1.0)
+    qdrant_template = await _create_meme(migrated_db_session, tags=["reaction"], popularity_score=1.0)
+    qdrant_template.template_id = template.id
+    fallback_tags = [
+        await _create_meme(migrated_db_session, tags=["frog"], popularity_score=score)
+        for score in (20.0, 10.0)
+    ]
+    fallback_template = await _create_meme(
+        migrated_db_session,
+        tags=["reaction"],
+        popularity_score=50.0,
+    )
+    fallback_template.template_id = template.id
+    fallback_popular = [
+        await _create_meme(migrated_db_session, tags=["other"], popularity_score=score)
+        for score in (70.0, 60.0)
+    ]
+    await _add_image_embedding(migrated_db_session, source, (0.3, 0.7))
+    await _refresh_trend_views(migrated_db_session)
+    similarity_client = FakeSimilarityClient(
+        (
+            QdrantSimilarityMatch(
+                meme_file_id=uuid.uuid4(),
+                meme_id=source.id,
+                similarity_score=0.99,
+            ),
+            QdrantSimilarityMatch(
+                meme_file_id=_primary_file_id(qdrant_tag),
+                meme_id=qdrant_tag.id,
+                similarity_score=0.95,
+            ),
+            QdrantSimilarityMatch(
+                meme_file_id=_primary_file_id(qdrant_template),
+                meme_id=qdrant_template.id,
+                similarity_score=0.9,
+            ),
+            QdrantSimilarityMatch(
+                meme_file_id=_primary_file_id(qdrant_tag),
+                meme_id=qdrant_tag.id,
+                similarity_score=0.85,
+            ),
+        )
+    )
+    service = MemeSearchService(
+        migrated_db_session,
+        similarity_client=similarity_client,
+        settings=Settings.model_validate({"pipeline_voyage_output_dimensions": 2}),
+    )
+
+    first_page = await service.get_public_similar_memes(source.id, limit=3)
+    second_page = await service.get_public_similar_memes(source.id, limit=3, offset=3)
+    third_page = await service.get_public_similar_memes(source.id, limit=3, offset=6)
+    items = [*first_page.items, *second_page.items, *third_page.items]
+
+    assert [item.meme.id for item in items] == [
+        qdrant_tag.id,
+        qdrant_template.id,
+        *(meme.id for meme in fallback_tags),
+        fallback_template.id,
+        *(meme.id for meme in fallback_popular),
+    ]
+    assert [item.attribution.source_algorithm for item in items] == [
+        "qdrant_similarity",
+        "qdrant_similarity",
+        "fallback_tag",
+        "fallback_tag",
+        "fallback_template",
+        "fallback_popular",
+        "fallback_popular",
+    ]
+    assert [item.attribution.rank for item in items] == list(range(1, 8))
+    assert len({item.meme.id for item in items}) == 7
+    assert {first_page.total, second_page.total, third_page.total} == {7}
+    assert first_page.has_more is True
+    assert second_page.has_more is True
+    assert third_page.has_more is False
+    assert [item.attribution.reason for item in items[:2]] == ["qdrant_similarity", "qdrant_similarity"]
+    assert {item.attribution.reason for item in items[2:]} == {"similarity_backfill"}
+    assert {item.attribution.algorithm_version for item in items} == {SIMILAR_ALGORITHM_VERSION}
+    assert len(similarity_client.calls) == 3
+    assert {call["limit"] for call in similarity_client.calls} == {800}
 
 
 async def test_public_similar_memes_missing_embedding_falls_back_tag_template_then_popular(
@@ -1145,6 +1248,7 @@ async def test_public_similar_memes_missing_embedding_falls_back_tag_template_th
     source.template_id = template.id
     template_match.template_id = template.id
     await migrated_db_session.commit()
+    await _refresh_trend_views(migrated_db_session)
     similarity_client = FakeSimilarityClient()
     service = MemeSearchService(
         migrated_db_session,
@@ -1181,6 +1285,7 @@ async def test_public_similar_memes_qdrant_failure_falls_back_without_private_le
     )
     await _add_image_embedding(migrated_db_session, source, (0.4, 0.6))
     await migrated_db_session.commit()
+    await _refresh_trend_views(migrated_db_session)
     similarity_client = FakeSimilarityClient(failure=RuntimeError("qdrant unavailable secret"))
     service = MemeSearchService(
         migrated_db_session,
@@ -1199,7 +1304,7 @@ async def test_public_similar_memes_qdrant_failure_falls_back_without_private_le
     assert len(similarity_client.calls) == 1
     assert similarity_client.calls[0]["vector"] == pytest.approx((0.4, 0.6))
     assert similarity_client.calls[0]["current_meme_file_id"] == _primary_file_id(source)
-    assert similarity_client.calls[0]["limit"] == 20
+    assert similarity_client.calls[0]["limit"] == 800
 
 
 async def test_public_similar_memes_filters_nsfw_unless_allowed(
@@ -1210,6 +1315,7 @@ async def test_public_similar_memes_filters_nsfw_unless_allowed(
     nsfw_match = await _create_meme(migrated_db_session, is_nsfw=True, popularity_score=30.0)
     await _add_image_embedding(migrated_db_session, source, (0.1, 0.9))
     await migrated_db_session.commit()
+    await _refresh_trend_views(migrated_db_session)
     similarity_client = FakeSimilarityClient(
         (
             QdrantSimilarityMatch(
@@ -1237,6 +1343,119 @@ async def test_public_similar_memes_filters_nsfw_unless_allowed(
     assert [item.meme.id for item in nsfw_page.items] == [nsfw_match.id, safe_match.id]
     assert safe_page.items[0].attribution.source_algorithm == "qdrant_similarity"
     assert nsfw_page.items[0].meme.is_nsfw is True
+
+
+async def test_public_similar_memes_fixed_pool_is_stable_and_hydrates_only_requested_page(
+    migrated_db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = await _create_meme(migrated_db_session)
+    for _ in range(205):
+        await _create_meme(migrated_db_session)
+    await _refresh_trend_views(migrated_db_session)
+    service = MemeSearchService(migrated_db_session)
+    original_load_visible_memes = service._load_visible_memes
+    hydrated_candidate_counts: list[int] = []
+
+    async def capture_load_visible_memes(
+        meme_ids: tuple[uuid.UUID, ...],
+        *,
+        viewer_user_id: uuid.UUID | None,
+        filters: MemeSearchFilters,
+    ) -> list[Meme]:
+        hydrated_candidate_counts.append(len(meme_ids))
+        return await original_load_visible_memes(
+            meme_ids,
+            viewer_user_id=viewer_user_id,
+            filters=filters,
+        )
+
+    monkeypatch.setattr(service, "_load_visible_memes", capture_load_visible_memes)
+
+    first_page = await service.get_public_similar_memes(source.id, limit=12)
+    first_part = await service.get_public_similar_memes(source.id, limit=5)
+    second_part = await service.get_public_similar_memes(source.id, limit=7, offset=5)
+    beyond_pool = await service.get_public_similar_memes(source.id, limit=12, offset=200)
+
+    first_page_ids = [item.meme.id for item in first_page.items]
+    split_page_ids = [item.meme.id for item in (*first_part.items, *second_part.items)]
+    assert first_page_ids == split_page_ids
+    assert len(first_page_ids) == 12
+    assert {first_page.total, first_part.total, second_part.total, beyond_pool.total} == {200}
+    assert first_page.has_more is True
+    assert beyond_pool.items == []
+    assert beyond_pool.has_more is False
+    assert hydrated_candidate_counts == [12, 5, 7]
+    assert source.id not in first_page_ids
+    assert [item.attribution.rank for item in second_part.items] == list(range(6, 13))
+    assert {item.attribution.algorithm_version for item in first_page.items} == {SIMILAR_ALGORITHM_VERSION}
+
+
+async def test_public_popular_and_similar_include_memes_created_after_trends_refresh(
+    migrated_db_session: AsyncSession,
+) -> None:
+    source = await _create_meme(migrated_db_session, tags=["fresh"])
+    await _refresh_trend_views(migrated_db_session)
+    fresh_meme = await _create_meme(migrated_db_session, tags=["fresh"])
+    service = MemeSearchService(migrated_db_session)
+
+    browse_page = await service.browse_memes(limit=10)
+    similar_page = await service.get_public_similar_memes(source.id, limit=10)
+
+    assert browse_page.total == 2
+    assert fresh_meme.id in {item.meme.id for item in browse_page.items}
+    fresh_browse_item = next(item for item in browse_page.items if item.meme.id == fresh_meme.id)
+    assert fresh_browse_item.meme.popularity_score == 0.0
+    assert [item.meme.id for item in similar_page.items] == [fresh_meme.id]
+    assert similar_page.total == 1
+    assert similar_page.items[0].attribution.source_algorithm == "fallback_tag"
+
+
+async def test_public_similar_memes_paginates_across_tag_template_and_popular_tiers(
+    migrated_db_session: AsyncSession,
+) -> None:
+    template = MemeTemplate(slug="tiered-similar", name="Tiered Similar")
+    migrated_db_session.add(template)
+    await migrated_db_session.flush()
+    source = await _create_meme(migrated_db_session, tags=["frog", "wizard"])
+    source.template_id = template.id
+    tag_matches = [
+        await _create_meme(migrated_db_session, tags=["frog"], popularity_score=score)
+        for score in (30.0, 20.0, 10.0)
+    ]
+    template_matches = [
+        await _create_meme(migrated_db_session, tags=["reaction"], popularity_score=score)
+        for score in (50.0, 40.0)
+    ]
+    for meme in template_matches:
+        meme.template_id = template.id
+    popular_matches = [
+        await _create_meme(migrated_db_session, tags=["other"], popularity_score=score)
+        for score in (70.0, 60.0, 50.0, 40.0, 30.0)
+    ]
+    await _refresh_trend_views(migrated_db_session)
+    service = MemeSearchService(migrated_db_session)
+
+    first_page = await service.get_public_similar_memes(source.id, limit=4)
+    second_page = await service.get_public_similar_memes(source.id, limit=4, offset=4)
+    third_page = await service.get_public_similar_memes(source.id, limit=4, offset=8)
+    items = [*first_page.items, *second_page.items, *third_page.items]
+
+    assert [item.meme.id for item in items] == [
+        *(meme.id for meme in tag_matches),
+        *(meme.id for meme in template_matches),
+        *(meme.id for meme in popular_matches),
+    ]
+    assert [item.attribution.source_algorithm for item in items] == [
+        *(["fallback_tag"] * 3),
+        *(["fallback_template"] * 2),
+        *(["fallback_popular"] * 5),
+    ]
+    assert [item.attribution.rank for item in items] == list(range(1, 11))
+    assert {first_page.total, second_page.total, third_page.total} == {10}
+    assert first_page.has_more is True
+    assert second_page.has_more is True
+    assert third_page.has_more is False
 
 
 async def test_recommendation_candidates_build_weighted_centroid_from_positive_signals(
@@ -1748,6 +1967,7 @@ async def test_public_route_json_includes_render_contract_without_storage_leakag
         s3_original_key="pipeline/originals/private/hidden.jpg",
     )
     await migrated_db_session.commit()
+    await _refresh_trend_views(migrated_db_session)
 
     settings = Settings.model_validate(
         {
@@ -2065,6 +2285,7 @@ async def test_search_and_browse_routes_validate_scope_auth_and_collection_ids(
         popularity_score=30.0,
     )
     await migrated_db_session.commit()
+    await _refresh_trend_views(migrated_db_session)
     collection_id = uuid.uuid4()
 
     _install_meme_route_overrides(app, migrated_db_session)
@@ -2157,6 +2378,7 @@ async def test_search_route_private_and_all_scopes_mark_access_and_paginate_fall
         memes=[shared_private],
     )
     await migrated_db_session.commit()
+    await _refresh_trend_views(migrated_db_session)
 
     service = MemeSearchService(migrated_db_session)
     _install_meme_route_overrides(app, migrated_db_session, current_user=_user_read(viewer), service=service)
@@ -2252,6 +2474,7 @@ async def test_guest_search_route_collections_scope_allows_favorites(
         memes=[guest_favorite_public],
     )
     await migrated_db_session.commit()
+    await _refresh_trend_views(migrated_db_session)
 
     service = MemeSearchService(migrated_db_session)
     _install_meme_route_overrides(app, migrated_db_session, current_user=_user_read(guest), service=service)
@@ -2793,6 +3016,7 @@ async def test_public_meme_dtos_include_viewer_action_state_for_anonymous_guest_
         ]
     )
     await migrated_db_session.flush()
+    await _refresh_trend_views(migrated_db_session)
     service = MemeSearchService(migrated_db_session)
     search_service = MemeSearchService(
         migrated_db_session,
@@ -2878,6 +3102,7 @@ async def test_public_page_viewer_action_state_uses_fixed_query_count(
         ]
     )
     await migrated_db_session.flush()
+    await _refresh_trend_views(migrated_db_session)
     service = MemeSearchService(migrated_db_session)
 
     async def count_selects(limit: int) -> int:
@@ -3254,6 +3479,7 @@ async def test_tag_and_template_landing_routes_return_public_pages(
     first.template_id = template.id
     second.template_id = template.id
     await migrated_db_session.flush()
+    await _refresh_trend_views(migrated_db_session)
     _install_meme_route_overrides(app, migrated_db_session)
 
     try:
@@ -3303,6 +3529,7 @@ async def test_search_filters_and_paginates_after_visibility(migrated_db_session
         is_nsfw=True,
         popularity_score=200.0,
     )
+    await _refresh_trend_views(migrated_db_session)
     service = MemeSearchService(migrated_db_session)
 
     page = await service.search_memes(
@@ -3327,6 +3554,7 @@ async def test_browse_route_filters_and_paginates_popular_catalog(
     second = await _create_meme(migrated_db_session, tags=["cat"], popularity_score=2.0)
     await _create_meme(migrated_db_session, tags=["dog"], popularity_score=100.0)
     await _create_meme(migrated_db_session, tags=["cat"], is_nsfw=True, popularity_score=200.0)
+    await _refresh_trend_views(migrated_db_session)
     _install_meme_route_overrides(app, migrated_db_session)
 
     try:
@@ -3343,7 +3571,46 @@ async def test_browse_route_filters_and_paginates_popular_catalog(
     assert payload["has_more"] is False
     assert [item["meme"]["id"] for item in payload["items"]] == [str(second.id)]
     _assert_public_page_attribution(payload, source_algorithm="popular", surface="public_api_browse", ranks=[2])
+    assert payload["items"][0]["attribution"]["algorithm_version"] == PUBLIC_POPULAR_ALGORITHM_VERSION
     assert str(first.id) != str(second.id)
+
+
+async def test_public_popular_pager_hydrates_only_the_requested_slice(
+    migrated_db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for _ in range(40):
+        await _create_meme(migrated_db_session)
+    await _create_meme(migrated_db_session, is_public=False)
+    await _create_meme(migrated_db_session, is_nsfw=True)
+    await _refresh_trend_views(migrated_db_session)
+    service = MemeSearchService(migrated_db_session)
+    original_load_visible_memes = service._load_visible_memes
+    hydrated_candidate_counts: list[int] = []
+
+    async def capture_load_visible_memes(
+        meme_ids: tuple[uuid.UUID, ...],
+        *,
+        viewer_user_id: uuid.UUID | None,
+        filters: MemeSearchFilters,
+    ) -> list[Meme]:
+        hydrated_candidate_counts.append(len(meme_ids))
+        return await original_load_visible_memes(
+            meme_ids,
+            viewer_user_id=viewer_user_id,
+            filters=filters,
+        )
+
+    monkeypatch.setattr(service, "_load_visible_memes", capture_load_visible_memes)
+
+    page = await service.browse_memes(limit=7, offset=13)
+
+    assert page.total == 40
+    assert page.has_more is True
+    assert len(page.items) == 7
+    assert [item.attribution.rank for item in page.items] == list(range(14, 21))
+    assert {item.attribution.algorithm_version for item in page.items} == {PUBLIC_POPULAR_ALGORITHM_VERSION}
+    assert hydrated_candidate_counts == [7]
 
 
 async def test_trending_route_ranks_recent_events_snapshots_and_popularity_without_private_ids(
@@ -4045,6 +4312,7 @@ async def test_public_routes_apply_nsfw_defaults_and_authenticated_opt_in(
     full_user_without_nsfw = build_full_user(nsfw_enabled=False)
     migrated_db_session.add_all([guest_user, full_user, full_user_without_nsfw])
     await migrated_db_session.flush()
+    await _refresh_trend_views(migrated_db_session)
 
     async def browse_ids(current_user: UserRead | None, include_nsfw: bool) -> list[str]:
         _install_meme_route_overrides(app, migrated_db_session, current_user=current_user)
@@ -4262,6 +4530,7 @@ async def test_provider_failures_fall_back_to_popular_without_raw_error_payload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     popular_meme = await _create_meme(migrated_db_session, popularity_score=100.0)
+    await _refresh_trend_views(migrated_db_session)
     text_client = FailingTextSearchClient()
     embedding_client = FailingQueryEmbeddingClient()
     info_calls: list[tuple[str, dict[str, object] | None]] = []

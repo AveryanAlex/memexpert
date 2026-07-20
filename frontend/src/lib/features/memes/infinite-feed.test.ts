@@ -65,6 +65,13 @@ describe('infinite meme feed helpers', () => {
     );
   });
 
+  it('keys similar feeds by their source meme without changing other feed identities', () => {
+    const filters = { query: '' };
+
+    expect(memeFeedKey(filters, 'similar', 'source-a')).not.toBe(memeFeedKey(filters, 'similar', 'source-b'));
+    expect(memeFeedKey(filters, 'catalog', 'source-a')).toBe(memeFeedKey(filters, 'catalog', 'source-b'));
+  });
+
   it('only allows observer or Load more fetching in a stable ready state', () => {
     expect(canLoadNextMemePage({ hasMore: true, loading: false, errorMessage: null, itemCount: 3 })).toBe(true);
     expect(canLoadNextMemePage({ hasMore: false, loading: false, errorMessage: null, itemCount: 3 })).toBe(false);

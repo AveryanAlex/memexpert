@@ -126,6 +126,7 @@
         {href}
         aria-label={`Open ${title}`}
         title="Open meme"
+        data-sveltekit-preload-data="tap"
         onclick={handleDetailClick}
       >
         <ExternalLink class="size-5" aria-hidden="true" />
@@ -139,6 +140,7 @@
             id={titleId}
             class={cn('m-0 line-clamp-2 text-sm font-semibold leading-snug text-ink no-underline sm:text-base', focusRing)}
             {href}
+            data-sveltekit-preload-data="tap"
             onclick={handleDetailClick}
           >{title}</a>
         {/if}
@@ -150,7 +152,13 @@
       </div>
     {/if}
   {:else}
-    <a class={cn('block w-full min-w-0 max-w-full text-inherit no-underline', focusRing)} {href} aria-label={`Open ${title}`} onclick={handleDetailClick}>
+    <a
+      class={cn('block w-full min-w-0 max-w-full text-inherit no-underline', focusRing)}
+      {href}
+      aria-label={`Open ${title}`}
+      data-sveltekit-preload-data="tap"
+      onclick={handleDetailClick}
+    >
       <MemeMedia {meme} preview />
       {#if showTitle || (showAccessMarkers && accessVisibility !== 'public')}
         <div class="flex items-start justify-between gap-3 px-3 pb-3 pt-2.5">

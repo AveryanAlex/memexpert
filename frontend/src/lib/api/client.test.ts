@@ -349,8 +349,8 @@ describe('catalog API client', () => {
 
       expect(url.pathname).toBe(`/api/v1/memes/${memeId}/similar`);
       expect(url.searchParams.get('include_nsfw')).toBe('false');
-      expect(url.searchParams.get('limit')).toBe('7');
-      expect(url.searchParams.get('offset')).toBe('0');
+      expect(url.searchParams.get('limit')).toBe('12');
+      expect(url.searchParams.get('offset')).toBe('24');
 
       return jsonResponse(page);
     }) satisfies ApiFetch;
@@ -359,8 +359,8 @@ describe('catalog API client', () => {
       fetch: mockFetch,
       baseUrl: 'https://api.memexpert.test',
       memeId,
-      limit: 7,
-      offset: 0
+      limit: 12,
+      offset: 24
     });
 
     expect(mockFetch).toHaveBeenCalledOnce();

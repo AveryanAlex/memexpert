@@ -2,12 +2,12 @@
   import { browser } from '$app/environment';
   import { recordMemeView } from '$lib/api/client';
   import { readAuthState } from '$lib/auth-state';
+  import InfiniteMemeFeed from '$lib/features/memes/InfiniteMemeFeed.svelte';
   import MemeActionMenu from '$lib/features/memes/MemeActionMenu.svelte';
   import MemeSourcesAndActivity from '$lib/features/memes/MemeSourcesAndActivity.svelte';
-  import MemeGrid from '$lib/features/memes/MemeGrid.svelte';
   import MemeMedia from '$lib/features/memes/MemeMedia.svelte';
   import TrendSparkline from '$lib/features/trends/TrendSparkline.svelte';
-  import { buildMemeDetailView, buildRelatedDiscovery } from '$lib/meme-detail-view';
+  import { buildMemeDetailView } from '$lib/meme-detail-view';
   import { memeActionAttributionBody } from '$lib/memeActions';
   import { ActionLink, Badge, Card, EmptyState, Notice } from '$lib/ui';
   import type { ActionData, PageData } from './$types';
@@ -19,7 +19,6 @@
 
   const returnTo = $derived(data.meme ? `/memes/${data.meme.seo_page_slug ?? data.meme.id}` : '/');
   const detail = $derived(data.meme ? buildMemeDetailView(data.meme) : null);
-  const related = $derived(data.meme ? buildRelatedDiscovery(data.meme, data.relatedSource) : null);
   const popularityTrend = $derived(data.popularity?.trend ?? null);
   const popularityPoints = $derived(data.popularity?.sparkline ?? []);
   let showGuestFavoritePrompt = $state(false);
@@ -45,7 +44,6 @@
   function handleFavoriteChange(favorited: boolean) {
     showGuestFavoritePrompt = favorited && session?.user.account_type !== 'full';
   }
-
 </script>
 
 <svelte:head>
@@ -57,7 +55,7 @@
   {/if}
 </svelte:head>
 
-{#if data.meme && detail && related}
+{#if data.meme && detail}
   <article class="grid gap-5 lg:grid-cols-[minmax(0,1.15fr)_minmax(19rem,0.85fr)] lg:items-start lg:gap-8">
     <div class="min-w-0">
       <MemeMedia meme={data.meme} detail />
@@ -153,20 +151,25 @@
     search={data.insightsUrl.search}
   />
 
-  <section class="mt-8 grid gap-4 border-t border-line pt-6" aria-labelledby="related-memes-title">
-    <div class="flex flex-wrap items-start justify-between gap-3">
-      <div>
-        <h2 id="related-memes-title" class="m-0 text-3xl font-black tracking-[-0.05em]">Related memes</h2>
-        <p class="m-0 max-w-3xl text-muted">Keep exploring with more memes from the catalog.</p>
-      </div>
-      <ActionLink variant="secondary" size="compact" href={related.href}>{related.linkLabel}</ActionLink>
+  <section class="mt-8 grid gap-4 border-t border-line pt-6" aria-labelledby="similar-memes-title">
+    <div>
+      <h2 id="similar-memes-title" class="m-0 text-3xl font-black tracking-[-0.05em]">Similar memes</h2>
+      <p class="m-0 max-w-3xl text-muted">Keep exploring with more memes from the catalog.</p>
     </div>
 
-    {#if related.memes.length > 0}
-      <MemeGrid memes={related.memes} attributions={related.attributions} label="Discovery memes" showAccessMarkers={Boolean(session)} />
-    {:else}
-      <p class="m-0 text-muted">More memes will appear here soon.</p>
-    {/if}
+    <InfiniteMemeFeed
+      initialPage={data.similarPage}
+      filters={{ query: '' }}
+      initialError={data.similarErrorMessage}
+      retainInitialState={data.retainSimilarPage}
+      source="similar"
+      sourceMemeId={data.meme.id}
+      label="Similar memes"
+      emptyTitle="No similar memes yet"
+      emptyMessage="More memes will appear here as the catalog grows."
+      bulk={{ enabled: false }}
+      showAccessMarkers={Boolean(session)}
+    />
   </section>
 {:else}
   <EmptyState title="Meme unavailable" message={data.unavailableMessage}>

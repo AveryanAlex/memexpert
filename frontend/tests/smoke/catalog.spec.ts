@@ -22,6 +22,7 @@ interface MasonryHydrationFrame {
   visible: number[];
   positions: Array<{ index: number; left: number; top: number }>;
 }
+const infiniteFeedSentinel = '[data-infinite-feed-sentinel]';
 
 test.describe('public masonry feed smoke', () => {
   test('desktop feed keeps keyboard order and accessible Load more', async ({ page }) => {
@@ -331,6 +332,138 @@ test.describe('public masonry feed smoke', () => {
     }
   });
 
+  test('detail automatically extends one ranked Similar masonry page per sentinel crossing', async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await installControlledIntersectionObserver(page);
+    const pagingRequests: URL[] = [];
+    const detailDataRequests: URL[] = [];
+    page.on('request', (request) => {
+      const url = new URL(request.url());
+      if (url.pathname === '/api/v1/memes/smoke-meme-1/similar') pagingRequests.push(url);
+      if (url.pathname.endsWith('/__data.json')) detailDataRequests.push(url);
+    });
+
+    await page.goto('/');
+    await page.getByRole('list', { name: 'Meme results' }).getByRole('link', { name: 'Open Smoke test cat reaction' }).click();
+    await expect(page).toHaveURL(/\/memes\/smoke-test-cat-reaction/);
+
+    const grid = page.getByRole('list', { name: 'Similar memes' });
+    await expect(grid).toHaveAttribute('data-layout', 'masonry');
+    await expect(grid).toHaveAttribute('data-masonry-state', 'ready');
+    await expect(grid.getByRole('link', { name: 'Open Smoke similar meme 1', exact: true })).toBeVisible();
+    await expect(grid.getByRole('link', { name: 'Open Smoke similar meme 12', exact: true })).toBeVisible();
+    await expect(grid.getByRole('link', { name: 'Open Smoke similar meme 13', exact: true })).toHaveCount(0);
+    await expect(page.getByText('Showing 12 of 25')).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Select items' })).toHaveCount(0);
+    await expect.poll(() => controlledObserverCount(page, infiniteFeedSentinel)).toBe(1);
+
+    const offset12Response = page.waitForResponse((response) => isSimilarPageResponse(response, 'smoke-meme-1', 12));
+    expect(await triggerControlledIntersection(page, infiniteFeedSentinel, 2)).toEqual([1, 1]);
+    await offset12Response;
+
+    await expect(grid.getByRole('link', { name: 'Open Smoke similar meme 24', exact: true })).toBeVisible();
+    await expect(page.getByText('Showing 24 of 25')).toBeVisible();
+    expect(pagingRequests.map((url) => url.searchParams.get('offset'))).toEqual(['12']);
+
+    const offset24Response = page.waitForResponse((response) => isSimilarPageResponse(response, 'smoke-meme-1', 24));
+    expect(await triggerControlledIntersection(page, infiniteFeedSentinel, 2)).toEqual([1, 1]);
+    await offset24Response;
+
+    await expect(grid.getByRole('link', { name: 'Open Smoke similar meme 25', exact: true })).toBeVisible();
+    await expect(page.getByText('Showing 25 of 25')).toBeVisible();
+    await expect(page.getByText('You’re all caught up.')).toBeVisible();
+    expect(pagingRequests.map((url) => url.searchParams.get('offset'))).toEqual(['12', '24']);
+    expect(pagingRequests.every((url) => url.searchParams.get('limit') === '12')).toBe(true);
+
+    expect(await triggerControlledIntersection(page, infiniteFeedSentinel, 2)).toEqual([1, 1]);
+    await page.waitForTimeout(100);
+    expect(pagingRequests.map((url) => url.searchParams.get('offset'))).toEqual(['12', '24']);
+    await expect(grid.locator('[data-discovery-source="qdrant_similarity"]')).toHaveCount(25);
+    await expect(grid.locator('[data-discovery-source-meme-id="smoke-meme-1"]')).toHaveCount(25);
+    const orderedLabels = await grid.locator('a[aria-label^="Open Smoke similar meme "]').evaluateAll((links) =>
+      links.map((link) => link.getAttribute('aria-label'))
+    );
+    expect(orderedLabels).toEqual(Array.from({ length: 25 }, (_, index) => `Open Smoke similar meme ${index + 1}`));
+
+    const appendedLink = grid.getByRole('link', { name: 'Open Smoke similar meme 25', exact: true });
+    await expect(appendedLink).toHaveAttribute('data-sveltekit-preload-data', 'tap');
+    await expect(appendedLink).toHaveAttribute('href', /attribution_rank=25/);
+    await expect(appendedLink).toHaveAttribute('href', /attribution_source_meme_id=smoke-meme-1/);
+    const initialDetailDataRequestCount = detailDataRequests.length;
+    await appendedLink.hover();
+    await page.waitForTimeout(300);
+    expect(detailDataRequests).toHaveLength(initialDetailDataRequestCount);
+  });
+
+  test('changing the Similar source resets and isolates an in-flight page', async ({ page }) => {
+    await installControlledIntersectionObserver(page);
+    await page.goto('/');
+    await page.getByRole('list', { name: 'Meme results' }).getByRole('link', { name: 'Open Smoke test cat reaction' }).click();
+    await expect(page).toHaveURL(/\/memes\/smoke-test-cat-reaction/);
+
+    const sourceAGrid = page.getByRole('list', { name: 'Similar memes' });
+    await expect(sourceAGrid.getByRole('link', { name: 'Open Smoke similar meme 1', exact: true })).toBeVisible();
+    await expect.poll(() => controlledObserverCount(page, infiniteFeedSentinel)).toBe(1);
+    const stalePageRequest = page.waitForRequest((request) => {
+      const url = new URL(request.url());
+      return url.pathname === '/api/v1/memes/smoke-meme-1/similar' && url.searchParams.get('offset') === '12';
+    });
+    expect(await triggerControlledIntersection(page, infiniteFeedSentinel)).toEqual([1]);
+    const staleRequest = await stalePageRequest;
+
+    await sourceAGrid.getByRole('link', { name: 'Open Smoke similar meme 1', exact: true }).click();
+    await expect(page).toHaveURL(/\/memes\/smoke-similar-meme-1/);
+    await expect(page.getByRole('heading', { name: 'Smoke similar meme 1', level: 1 })).toBeVisible();
+    expect(await staleRequest.response()).toBeNull();
+
+    const sourceBGrid = page.getByRole('list', { name: 'Similar memes' });
+    await expect(sourceBGrid.getByRole('link', { name: 'Open Smoke test cat reaction', exact: true })).toBeVisible();
+    await expect(sourceBGrid.getByRole('link', { name: 'Open Smoke test deploy mood', exact: true })).toBeVisible();
+    await expect(page.getByText('Showing 2 of 2')).toBeVisible();
+    await expect(sourceBGrid.locator('[data-discovery-source-meme-id="smoke-similar-1"]')).toHaveCount(2);
+    await page.waitForTimeout(650);
+    await expect(sourceBGrid.locator('a[aria-label^="Open Smoke similar meme "]')).toHaveCount(0);
+    await expect(sourceBGrid.getByRole('listitem')).toHaveCount(2);
+  });
+
+  test('a failed session revalidation preserves the loaded Similar grid until refresh retry succeeds', async ({ baseURL, page }) => {
+    await installControlledIntersectionObserver(page);
+    await page.goto('/memes/smoke-test-cat-reaction');
+
+    const grid = page.getByRole('list', { name: 'Similar memes' });
+    await expect(grid.getByRole('link', { name: 'Open Smoke similar meme 12', exact: true })).toBeVisible();
+    await expect.poll(() => controlledObserverCount(page, infiniteFeedSentinel)).toBe(1);
+    const offset12Response = page.waitForResponse((response) => isSimilarPageResponse(response, 'smoke-meme-1', 12));
+    expect(await triggerControlledIntersection(page, infiniteFeedSentinel)).toEqual([1]);
+    await offset12Response;
+    await expect(grid.getByRole('link', { name: 'Open Smoke similar meme 24', exact: true })).toBeVisible();
+    await expect(page.getByText('Showing 24 of 25')).toBeVisible();
+
+    await page.context().addCookies([
+      {
+        name: 'smoke_similar_revalidation_failure',
+        value: '1',
+        url: baseURL ?? 'http://127.0.0.1:4174'
+      }
+    ]);
+    await page.locator('.app-shell-sign-in').click();
+    await expect(page.getByRole('heading', { name: 'Sign in to MemeXpert' })).toBeVisible();
+    await page.getByRole('button', { name: /Continue with Telegram/ }).click();
+
+    await expect(page.getByRole('heading', { name: 'Sign in to MemeXpert' })).toBeHidden();
+    await expect(page.getByText('Could not load similar memes. Try again.')).toBeVisible();
+    await expect(grid.getByRole('link', { name: 'Open Smoke similar meme 24', exact: true })).toBeVisible();
+    await expect(page.getByText('Showing 24 of 25')).toBeVisible();
+
+    const refreshRetryRequest = page.waitForRequest((request) => isSimilarPageRequest(request, 'smoke-meme-1', 0));
+    await page.getByRole('button', { name: 'Retry refreshing results' }).click();
+    await refreshRetryRequest;
+    await expect(page.getByText('Could not load similar memes. Try again.')).toHaveCount(0);
+    await expect(grid.getByRole('link', { name: 'Open Smoke similar meme 12', exact: true })).toBeVisible();
+    await expect(grid.getByRole('link', { name: 'Open Smoke similar meme 13', exact: true })).toHaveCount(0);
+    await expect(page.getByText('Showing 12 of 25')).toBeVisible();
+  });
+
   test('card actions do not overlap at the supported 320px viewport', async ({ page }) => {
     await page.setViewportSize({ width: 320, height: 700 });
     await disableIntersectionObserver(page);
@@ -589,9 +722,10 @@ test('search result opens detail with media and actions', async ({ page, request
   );
   await expect(page.getByRole('img', { name: 'Smoke test cat reaction' })).toBeVisible();
 
-  await expect(page.getByRole('button', { name: 'Favorite (7)' })).toBeVisible();
-  await expect(page.getByRole('button', { name: 'Save to collection', exact: true })).toBeVisible();
-  await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeVisible();
+  const detailActions = page.locator('article').first().locator('[aria-label="Meme actions"]');
+  await expect(detailActions.getByRole('button', { name: 'Favorite (7)' })).toBeVisible();
+  await expect(detailActions.getByRole('button', { name: 'Save to collection', exact: true })).toBeVisible();
+  await expect(detailActions.getByRole('button', { name: 'Send', exact: true })).toBeVisible();
   await expect(page.getByText('Pin requires a full account')).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Pin', exact: true })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Meme actions' })).toBeVisible();
@@ -622,8 +756,12 @@ test('search result opens detail with media and actions', async ({ page, request
   await expect(professional.getByText('Recorded activity · signals per day')).toBeVisible();
   const statsAfterRangeChange = await readSmokeStats(request, statsUrl);
   expect(statsAfterRangeChange.detailViewCount).toBe(statsBeforeRangeChange.detailViewCount);
+  expect(statsAfterRangeChange.similarInitialReadCount).toBe(statsBeforeRangeChange.similarInitialReadCount);
+  await expect(
+    page.getByRole('list', { name: 'Similar memes' }).getByRole('link', { name: 'Open Smoke similar meme 1', exact: true })
+  ).toHaveCount(1);
 
-  await page.getByRole('button', { name: 'Favorite (7)' }).click();
+  await detailActions.getByRole('button', { name: 'Favorite (7)' }).click();
   await expect(page.getByText('Keep this save beyond this browser.')).toBeVisible();
   await expect(page.getByRole('link', { name: 'Connect Telegram to keep saves/favorites' })).toBeVisible();
 });
@@ -834,10 +972,125 @@ async function disableIntersectionObserver(page: import('@playwright/test').Page
 async function readSmokeStats(
   request: import('@playwright/test').APIRequestContext,
   url: string
-): Promise<{ detailReadCount: number; detailViewCount: number }> {
+): Promise<{ detailReadCount: number; detailViewCount: number; similarInitialReadCount: number }> {
   const response = await request.get(url);
   expect(response.ok()).toBe(true);
   return response.json();
+}
+
+async function installControlledIntersectionObserver(page: import('@playwright/test').Page) {
+  await page.addInitScript(() => {
+    class ControlledIntersectionObserver {
+      readonly elements = new Set<Element>();
+      readonly root: Element | Document | null;
+      readonly rootMargin: string;
+      readonly thresholds: number[];
+
+      constructor(
+        readonly callback: IntersectionObserverCallback,
+        options: IntersectionObserverInit = {}
+      ) {
+        this.root = options.root ?? null;
+        this.rootMargin = options.rootMargin ?? '0px';
+        this.thresholds = Array.isArray(options.threshold) ? [...options.threshold] : [options.threshold ?? 0];
+        observers.add(this);
+      }
+
+      observe(element: Element) {
+        this.elements.add(element);
+      }
+
+      unobserve(element: Element) {
+        this.elements.delete(element);
+      }
+
+      disconnect() {
+        this.elements.clear();
+        observers.delete(this);
+      }
+
+      takeRecords(): IntersectionObserverEntry[] {
+        return [];
+      }
+    }
+
+    const observers = new Set<ControlledIntersectionObserver>();
+    type ControlledWindow = Window & {
+      countSmokeIntersectionObservers?: (selector: string) => number;
+      triggerSmokeIntersection?: (selector: string) => number;
+    };
+    const controlledWindow = window as ControlledWindow;
+
+    Object.defineProperty(window, 'IntersectionObserver', {
+      configurable: true,
+      value: ControlledIntersectionObserver
+    });
+    controlledWindow.countSmokeIntersectionObservers = (selector) => {
+      const target = document.querySelector(selector);
+      return target ? [...observers].filter((observer) => observer.elements.has(target)).length : 0;
+    };
+    controlledWindow.triggerSmokeIntersection = (selector) => {
+      const target = document.querySelector(selector);
+      if (!target) return 0;
+
+      const matching = [...observers].filter((observer) => observer.elements.has(target));
+      const bounds = target.getBoundingClientRect();
+      const entry = {
+        boundingClientRect: bounds,
+        intersectionRatio: 1,
+        intersectionRect: bounds,
+        isIntersecting: true,
+        rootBounds: null,
+        target,
+        time: performance.now()
+      } as IntersectionObserverEntry;
+      for (const observer of matching) {
+        observer.callback([entry], observer as unknown as IntersectionObserver);
+      }
+      return matching.length;
+    };
+  });
+}
+
+async function controlledObserverCount(page: import('@playwright/test').Page, selector: string): Promise<number> {
+  return page.evaluate((targetSelector) => {
+    const count = (window as Window & { countSmokeIntersectionObservers?: (selector: string) => number })
+      .countSmokeIntersectionObservers;
+    return count?.(targetSelector) ?? 0;
+  }, selector);
+}
+
+async function triggerControlledIntersection(
+  page: import('@playwright/test').Page,
+  selector: string,
+  count = 1
+): Promise<number[]> {
+  return page.evaluate(
+    ({ targetSelector, triggerCount }) => {
+      const trigger = (window as Window & { triggerSmokeIntersection?: (selector: string) => number })
+        .triggerSmokeIntersection;
+      return Array.from({ length: triggerCount }, () => trigger?.(targetSelector) ?? 0);
+    },
+    { targetSelector: selector, triggerCount: count }
+  );
+}
+
+function isSimilarPageResponse(
+  response: import('@playwright/test').Response,
+  sourceMemeId: string,
+  offset: number
+): boolean {
+  const url = new URL(response.url());
+  return url.pathname === `/api/v1/memes/${sourceMemeId}/similar` && url.searchParams.get('offset') === String(offset);
+}
+
+function isSimilarPageRequest(
+  request: import('@playwright/test').Request,
+  sourceMemeId: string,
+  offset: number
+): boolean {
+  const url = new URL(request.url());
+  return url.pathname === `/api/v1/memes/${sourceMemeId}/similar` && url.searchParams.get('offset') === String(offset);
 }
 
 async function installMediaSpies(page: import('@playwright/test').Page) {

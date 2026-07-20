@@ -91,7 +91,7 @@ Fallbacks should be explicit and observable, not silent behavior changes. Search
 | Failure | Behavior |
 |---------|----------|
 | Query embedding provider fails | Skip semantic query path; use text + popularity/trending. |
-| Qdrant down | Text + popularity/trending. Similar/recommendation endpoints fall back to tag-related/trending with attribution. |
+| Qdrant down | Text + popularity/trending. Similar falls back through tag, template, and public-popular tiers; personalized recommendations fall back to trending, with attribution. |
 | Meilisearch down | Semantic + popularity/trending. Text-specific ranking unavailable. |
 | Both search engines down | Trending/popular materialized view fallback. |
 | Redis down | Recompute; no candidate-pool cache/rate-limit cache. Search correctness should remain intact. |
@@ -195,6 +195,7 @@ pipeline service.
 | Context | Strategy | Details |
 |---------|----------|---------|
 | Search results | Offset or optional cached candidate pool | Deterministic merge/rerank; Redis pool added when needed for stable deep pagination |
+| Similar memes | Bounded offset pages | Stable ordered pool of at most 200 candidates; 12-result UI pages and empty responses beyond `total` |
 | Collection browsing | Cursor-based | `(added_at, meme_id)` |
 | Trending / feeds | Cursor-based | `(score, meme_id)` or materialized-view rank |
 | Recommendations | Cursor-based/bounded pages | Qdrant recommend/search result pages plus DB access filtering |
@@ -203,13 +204,24 @@ pipeline service.
 
 ### Similar Memes
 
-Service endpoint/function accepts a source `meme_id`, loads the primary file embedding, queries Qdrant for nearest neighbors, filters by access/NSFW, excludes the source meme, and returns result DTOs with similarity scores and attribution.
+`GET /api/v1/memes/{meme_id}/similar` accepts `limit` and `offset` and returns the existing discovery-page DTO. Candidate retrieval is independent of those page parameters: the service builds one deterministic ordered pool capped at 200 candidates, slices it by `offset`/`limit`, and hydrates only the returned page. `total` is the bounded pool size, not a corpus-wide count; offsets at or beyond `total` return an empty page. Ordering, `total`, scores, and global ranks remain stable across page sizes while Qdrant, PostgreSQL rows, and the public trend materialized view are unchanged.
 
-Fallback order:
+The API, rather than the frontend, fills the pool in this order:
 
-1. Similarity results from Qdrant.
-2. Tag/template-related accessible memes when no embedding/Qdrant is available.
-3. Trending/popular fallback.
+1. A fixed Qdrant prefix for the source file embedding, bounded to four times the 200-result pool size.
+2. Public memes with overlapping tags.
+3. Public memes using the same template.
+4. Public-popular memes from `public_meme_trends_mv`.
+
+Each tier excludes the source and IDs already selected by an earlier tier. PostgreSQL applies the final public, NSFW, and content filters even to Qdrant candidates. Fallback tiers order IDs deterministically by their tier signal, popularity, creation time, and meme ID; they query counts plus only the row-ID ranges needed to determine the requested slice, rather than loading the catalog into ORM objects and sorting it in Python. The service then hydrates at most the requested result page.
+
+Every page carries the source meme ID, source algorithm and reason, algorithm version, score components, request/impression IDs, and global rank so appended cards remain attributable. Missing embeddings, unavailable or failed Qdrant, filtered-out semantic candidates, and partially filled semantic pools all degrade through the same API-owned tiers.
+
+### MV-Backed Public Popular Paging
+
+Public-popular fallback paths for Search, Browse, tag pages, and template pages use the same `public_meme_trends_mv` row-ID pager: PostgreSQL orders and slices IDs first, and the service hydrates only the requested page. These surfaces retain their existing pagination totals and visibility semantics; private and mixed-access ranking paths are unchanged.
+
+The materialized view is refreshed on the scheduler's default five-minute cadence, so offset pages are eventually consistent rather than snapshot-isolated. A refresh can move candidates between requests; deterministic ties and client-side ID deduplication make this best effort, and no snapshot token or Redis dependency is introduced. This is a read-path optimization only: it does not add embedding backfills, ingestion or admin recovery behavior, or new operational logging.
 
 ### Personalized Feed
 
@@ -225,11 +237,9 @@ Positive signal weights, positive-signal lookback, recent-impression lookback, p
 
 Data-volume and performance assumptions for this stage are intentionally bounded: load only recent/capped positive analytics and durable rows, load only primary image embeddings for those source memes, request only a capped Qdrant candidate pool, then perform final DB filtering/deduplication in PostgreSQL. Source positive memes and recent impression memes are excluded where practical. Cold start, missing embeddings, missing Qdrant client, Qdrant failure, or an empty DB-filtered candidate set falls back to trending/popular candidates with attribution reason metadata.
 
-Personalized recommendations are used:
-
-- on the home page feed;
-- as a small blend in the meme detail related/similar section;
-- as an optional boost in empty-query bot/Mini App discovery.
+Personalized recommendations are currently used on the home page feed. Optional
+query-independent blends for bot or Mini App discovery remain future work; the
+public Similar endpoint does not add a personalized tier.
 
 ### Trending
 

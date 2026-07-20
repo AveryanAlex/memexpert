@@ -12,7 +12,22 @@ from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Protocol
 
-from sqlalchemy import Select, and_, any_, bindparam, false, func, literal, or_, select, text
+from sqlalchemy import (
+    Float,
+    Select,
+    Uuid,
+    and_,
+    any_,
+    bindparam,
+    column,
+    false,
+    func,
+    literal,
+    or_,
+    select,
+    table,
+    text,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -63,8 +78,11 @@ TRENDING_SNAPSHOT_WEIGHT = 0.25
 TRENDING_POPULARITY_WEIGHT = 0.15
 TRENDING_LIKE_WEIGHT = 0.05
 POPULAR_ALGORITHM_VERSION = "popular_v1"
+PUBLIC_POPULAR_ALGORITHM_VERSION = "public_popular_mv_v2"
 LEGACY_TRENDING_ALGORITHM_VERSION = "source_engagement_trending_v1"
-QDRANT_SIMILARITY_ALGORITHM_VERSION = SEARCH_INDEX_ALGORITHM_VERSION
+SIMILAR_ALGORITHM_VERSION = f"{SEARCH_INDEX_ALGORITHM_VERSION}_similar_pool_v2"
+SIMILAR_CANDIDATE_POOL_LIMIT = 200
+SIMILAR_QDRANT_PREFIX_LIMIT = SIMILAR_CANDIDATE_POOL_LIMIT * 4
 PERSONALIZED_RECOMMENDATION_ALGORITHM_VERSION = f"{SEARCH_INDEX_ALGORITHM_VERSION}_personalized_v1"
 TRENDING_EVENT_WEIGHTS = {
     AnalyticsEventType.MEME_DOWNLOAD: 2.0,
@@ -78,6 +96,11 @@ TRENDING_EVENT_WEIGHTS = {
 
 logger = logging.getLogger(__name__)
 _DERIVED_POPULARITY_ATTR = "_derived_popularity_score"
+_PUBLIC_MEME_TRENDS_MV = table(
+    "public_meme_trends_mv",
+    column("meme_id", Uuid(as_uuid=True)),
+    column("latest_popularity_score", Float()),
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -164,6 +187,30 @@ class _SimilarCandidate:
     score: float | None = None
     score_components: dict[str, float] | None = None
     algorithm_version: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _SimilarCandidateRef:
+    meme_id: uuid.UUID
+    source_algorithm: str
+    reason: str
+    score: float | None = None
+    score_components: dict[str, float] | None = None
+    algorithm_version: str | None = None
+    popularity_score: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _PublicPopularityRow:
+    meme_id: uuid.UUID
+    popularity_score: float
+    tags: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _PublicPopularitySummary:
+    total: int
+    max_popularity_score: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -287,7 +334,11 @@ class MemeSearchService:
                 filters=resolved_filters,
                 query=normalized_query,
                 source_algorithm="fallback_popular",
-                algorithm_version=POPULAR_ALGORITHM_VERSION,
+                algorithm_version=(
+                    PUBLIC_POPULAR_ALGORITHM_VERSION
+                    if resolved_filters.scope is MemeSearchScope.PUBLIC
+                    else POPULAR_ALGORITHM_VERSION
+                ),
                 degraded_mode=True,
                 reason=fallback_reason,
                 fallback_reason=fallback_reason,
@@ -868,31 +919,66 @@ class MemeSearchService:
         resolved_limit = _clamp_limit(limit)
         resolved_offset = max(0, offset)
         request_id = new_discovery_request_id()
-        target_count = resolved_offset + resolved_limit + 1
 
-        candidates, fallback_reason = await self._qdrant_similar_candidates(
+        qdrant_candidates, fallback_reason = await self._qdrant_similar_candidate_refs(
             source_meme,
             filters=resolved_filters,
-            target_count=target_count,
             request_id=request_id,
             surface=surface,
             viewer_user_id=viewer_user_id,
         )
-        seen_meme_ids = {source_meme.id, *(candidate.meme.id for candidate in candidates)}
-        if len(candidates) < target_count:
-            candidates.extend(
-                await self._similar_fallback_candidates(
-                    source_meme,
-                    filters=resolved_filters,
-                    seen_meme_ids=seen_meme_ids,
-                    target_count=target_count,
-                    reason=fallback_reason or "similarity_backfill",
-                )
-            )
+        qdrant_count = len(qdrant_candidates)
+        qdrant_page_end = min(qdrant_count, resolved_offset + resolved_limit)
+        page_candidate_refs = (
+            qdrant_candidates[resolved_offset:qdrant_page_end] if resolved_offset < qdrant_count else []
+        )
+        fallback_page_offset = max(0, resolved_offset - qdrant_count)
+        fallback_page_limit = max(0, resolved_limit - len(page_candidate_refs))
+        fallback_candidates, fallback_total = await self._similar_fallback_candidate_page(
+            source_meme,
+            filters=resolved_filters,
+            excluded_meme_ids={source_meme.id, *(candidate.meme_id for candidate in qdrant_candidates)},
+            pool_limit=SIMILAR_CANDIDATE_POOL_LIMIT - qdrant_count,
+            offset=fallback_page_offset,
+            limit=fallback_page_limit,
+            reason=fallback_reason or "similarity_backfill",
+        )
+        page_candidate_refs.extend(fallback_candidates)
+        total = min(SIMILAR_CANDIDATE_POOL_LIMIT, qdrant_count + fallback_total)
 
-        page_candidates = candidates[resolved_offset : resolved_offset + resolved_limit]
+        page_memes = (
+            await self._load_visible_memes(
+                tuple(candidate.meme_id for candidate in page_candidate_refs),
+                viewer_user_id=None,
+                filters=resolved_filters,
+            )
+            if page_candidate_refs
+            else []
+        )
+        page_memes_by_id = {meme.id: meme for meme in page_memes}
+        qdrant_page_memes = [
+            meme
+            for candidate in page_candidate_refs
+            if candidate.popularity_score is None and (meme := page_memes_by_id.get(candidate.meme_id)) is not None
+        ]
+        await self._attach_derived_popularity_scores(qdrant_page_memes)
+        for candidate in page_candidate_refs:
+            if candidate.popularity_score is not None and (meme := page_memes_by_id.get(candidate.meme_id)) is not None:
+                setattr(meme, _DERIVED_POPULARITY_ATTR, candidate.popularity_score)
+
         items: list[MemeSearchResultRead] = []
-        for rank, candidate in enumerate(page_candidates, start=resolved_offset + 1):
+        for rank, candidate_ref in enumerate(page_candidate_refs, start=resolved_offset + 1):
+            meme = page_memes_by_id.get(candidate_ref.meme_id)
+            if meme is None:
+                continue
+            candidate = _SimilarCandidate(
+                meme=meme,
+                source_algorithm=candidate_ref.source_algorithm,
+                reason=candidate_ref.reason,
+                score=candidate_ref.score,
+                score_components=candidate_ref.score_components,
+                algorithm_version=candidate_ref.algorithm_version,
+            )
             score_read = _similar_candidate_score_read(candidate)
             items.append(
                 MemeSearchResultRead(
@@ -918,8 +1004,8 @@ class MemeSearchService:
             items=items,
             limit=resolved_limit,
             offset=resolved_offset,
-            total=len(candidates),
-            has_more=len(candidates) > resolved_offset + resolved_limit,
+            total=total,
+            has_more=resolved_offset + resolved_limit < total,
             request_id=request_id,
         )
         _log_discovery_completed(
@@ -930,17 +1016,15 @@ class MemeSearchService:
             filters=resolved_filters,
             query=None,
             source_algorithm="qdrant_similarity" if fallback_reason is None else "fallback_public_recommendations",
-            algorithm_version=(
-                QDRANT_SIMILARITY_ALGORITHM_VERSION if fallback_reason is None else POPULAR_ALGORITHM_VERSION
-            ),
+            algorithm_version=SIMILAR_ALGORITHM_VERSION,
             degraded_mode=fallback_reason is not None,
             reason=fallback_reason,
             fallback_reason=fallback_reason,
             limit=resolved_limit,
             offset=resolved_offset,
-            candidate_count=len(candidates),
+            candidate_count=total,
             result_count=len(items),
-            total=len(candidates),
+            total=total,
             total_latency_seconds=time.perf_counter() - started_seconds,
         )
         return await self._to_public_search_page(
@@ -1610,6 +1694,23 @@ class MemeSearchService:
         if template is None:
             return None, empty_page
 
+        filters = _resolve_search_filters(
+            MemeSearchFilters(include_nsfw=include_nsfw),
+            viewer_user_id=viewer_user_id,
+        )
+        if filters.scope is MemeSearchScope.PUBLIC:
+            return template, await self._public_popular_page(
+                filters=filters,
+                limit=resolved_limit,
+                offset=resolved_offset,
+                request_id=request_id,
+                surface=surface,
+                source_algorithm="popular",
+                query=None,
+                reason="template_popular",
+                template_id=template.id,
+            )
+
         base_stmt = _visible_meme_stmt(viewer_user_id).where(Meme.template_id == template.id)
         base_stmt = _apply_filters(base_stmt, MemeSearchFilters(include_nsfw=include_nsfw))
         total = await self._session.scalar(select(func.count()).select_from(base_stmt.order_by(None).subquery())) or 0
@@ -1624,10 +1725,6 @@ class MemeSearchService:
         memes = sorted_memes[resolved_offset : resolved_offset + resolved_limit]
         max_popularity = max((popularity_by_meme_id.get(meme.id, 0.0) for meme in memes), default=0.0)
         items = []
-        filters = _resolve_search_filters(
-            MemeSearchFilters(include_nsfw=include_nsfw),
-            viewer_user_id=viewer_user_id,
-        )
         for rank, meme in enumerate(memes, start=resolved_offset + 1):
             popularity = _normalize_value(popularity_by_meme_id.get(meme.id, 0.0), max_popularity)
             score = _CandidateScore(popularity=popularity, total=POPULARITY_WEIGHT * popularity)
@@ -1946,16 +2043,15 @@ class MemeSearchService:
             include_nsfw=include_nsfw,
         )
 
-    async def _qdrant_similar_candidates(
+    async def _qdrant_similar_candidate_refs(
         self,
         source_meme: Meme,
         *,
         filters: MemeSearchFilters,
-        target_count: int,
         request_id: str,
         surface: str,
         viewer_user_id: uuid.UUID | None,
-    ) -> tuple[list[_SimilarCandidate], str | None]:
+    ) -> tuple[list[_SimilarCandidateRef], str | None]:
         if source_meme.primary_file_id is None:
             return [], "missing_embedding"
 
@@ -1977,7 +2073,7 @@ class MemeSearchService:
                 viewer_user_id=viewer_user_id,
                 filters=filters,
                 source_algorithm="qdrant_similarity",
-                algorithm_version=QDRANT_SIMILARITY_ALGORITHM_VERSION,
+                algorithm_version=SIMILAR_ALGORITHM_VERSION,
                 reason="qdrant_client_not_configured",
                 fallback_reason="qdrant_failure",
             )
@@ -1988,7 +2084,7 @@ class MemeSearchService:
             matches = await self._similarity_client.find_similar_memes(
                 vector=vector,
                 current_meme_file_id=source_meme.primary_file_id,
-                limit=max(20, target_count * 4),
+                limit=SIMILAR_QDRANT_PREFIX_LIMIT,
             )
         except Exception as exc:
             semantic_latency_seconds = time.perf_counter() - semantic_started_seconds
@@ -1999,7 +2095,7 @@ class MemeSearchService:
                 viewer_user_id=viewer_user_id,
                 filters=filters,
                 source_algorithm="qdrant_similarity",
-                algorithm_version=QDRANT_SIMILARITY_ALGORITHM_VERSION,
+                algorithm_version=SIMILAR_ALGORITHM_VERSION,
                 reason="qdrant_lookup_failed",
                 fallback_reason="qdrant_failure",
                 exception_type=type(exc).__name__,
@@ -2007,33 +2103,36 @@ class MemeSearchService:
             )
             return [], "qdrant_failure"
 
-        ordered_matches = _dedupe_similarity_matches(matches, source_meme_id=source_meme.id)
+        ordered_matches = _dedupe_similarity_matches(matches, source_meme_id=source_meme.id)[
+            :SIMILAR_QDRANT_PREFIX_LIMIT
+        ]
         if not ordered_matches:
             return [], "similarity_empty"
 
-        memes = await self._load_visible_memes(
-            tuple(match.meme_id for match in ordered_matches),
-            viewer_user_id=None,
-            filters=filters,
+        visible_stmt = _apply_filters(
+            select(Meme.id).where(
+                Meme.id.in_(tuple(match.meme_id for match in ordered_matches)),
+                Meme.is_public.is_(True),
+            ),
+            filters,
         )
-        await self._attach_derived_popularity_scores(memes)
-        memes_by_id = {meme.id: meme for meme in memes}
-        candidates: list[_SimilarCandidate] = []
+        visible_result = await self._session.execute(visible_stmt)
+        visible_meme_ids = set(visible_result.scalars())
+        candidates: list[_SimilarCandidateRef] = []
         for match in ordered_matches:
-            meme = memes_by_id.get(match.meme_id)
-            if meme is None:
+            if match.meme_id not in visible_meme_ids:
                 continue
             candidates.append(
-                _SimilarCandidate(
-                    meme=meme,
+                _SimilarCandidateRef(
+                    meme_id=match.meme_id,
                     source_algorithm="qdrant_similarity",
                     reason="qdrant_similarity",
                     score=match.similarity_score,
                     score_components={"similarity": match.similarity_score, "total": match.similarity_score},
-                    algorithm_version=QDRANT_SIMILARITY_ALGORITHM_VERSION,
+                    algorithm_version=SIMILAR_ALGORITHM_VERSION,
                 )
             )
-            if len(candidates) >= target_count:
+            if len(candidates) >= SIMILAR_CANDIDATE_POOL_LIMIT:
                 break
 
         return (candidates, None) if candidates else ([], "similarity_empty")
@@ -2072,7 +2171,7 @@ class MemeSearchService:
                 viewer_user_id=viewer_user_id,
                 filters=filters,
                 source_algorithm="qdrant_similarity",
-                algorithm_version=QDRANT_SIMILARITY_ALGORITHM_VERSION,
+                algorithm_version=SIMILAR_ALGORITHM_VERSION,
                 degraded_component="embedding",
                 reason="stored_image_embedding_decode_failed",
                 fallback_reason="missing_embedding",
@@ -2080,105 +2179,103 @@ class MemeSearchService:
             )
             return None
 
-    async def _similar_fallback_candidates(
+    async def _similar_fallback_candidate_page(
         self,
         source_meme: Meme,
         *,
         filters: MemeSearchFilters,
-        seen_meme_ids: set[uuid.UUID],
-        target_count: int,
+        excluded_meme_ids: set[uuid.UUID],
+        pool_limit: int,
+        offset: int,
+        limit: int,
         reason: str,
-    ) -> list[_SimilarCandidate]:
-        candidates: list[_SimilarCandidate] = []
+    ) -> tuple[list[_SimilarCandidateRef], int]:
+        if pool_limit <= 0:
+            return [], 0
+
+        candidates: list[_SimilarCandidateRef] = []
         source_tags = frozenset(tag.strip().lower() for tag in source_meme.tags if tag.strip())
-
+        tier_specs: list[tuple[str, Select[Any], bool, frozenset[str] | None]] = []
         if source_tags:
-            tag_predicate = or_(*(literal(tag) == any_(Meme.tags) for tag in source_tags))
-            candidates.extend(
-                await self._fallback_candidate_rows(
-                    _apply_filters(_public_meme_stmt(), filters).where(tag_predicate),
-                    seen_meme_ids=seen_meme_ids,
-                    target_count=target_count,
-                    source_algorithm="fallback_tag",
-                    reason=reason,
-                    source_tags=source_tags,
+            tier_specs.append(
+                (
+                    "fallback_tag",
+                    self._public_popularity_stmt(
+                        filters=filters,
+                        excluded_meme_ids=excluded_meme_ids,
+                        any_tags=source_tags,
+                    ),
+                    False,
+                    source_tags,
                 )
             )
-
-        if source_meme.template_id is not None and len(seen_meme_ids) - 1 < target_count:
-            candidates.extend(
-                await self._fallback_candidate_rows(
-                    _apply_filters(_public_meme_stmt(), filters).where(Meme.template_id == source_meme.template_id),
-                    seen_meme_ids=seen_meme_ids,
-                    target_count=target_count,
-                    source_algorithm="fallback_template",
-                    reason=reason,
-                    template_match=True,
+        if source_meme.template_id is not None:
+            tier_specs.append(
+                (
+                    "fallback_template",
+                    self._public_popularity_stmt(
+                        filters=filters,
+                        excluded_meme_ids=excluded_meme_ids,
+                        exclude_any_tags=source_tags,
+                        template_id=source_meme.template_id,
+                    ),
+                    True,
+                    None,
                 )
             )
-
-        if len(seen_meme_ids) - 1 < target_count:
-            candidates.extend(
-                await self._fallback_candidate_rows(
-                    _apply_filters(_public_meme_stmt(), filters),
-                    seen_meme_ids=seen_meme_ids,
-                    target_count=target_count,
-                    source_algorithm="fallback_popular",
-                    reason=reason,
-                )
+        tier_specs.append(
+            (
+                "fallback_popular",
+                self._public_popularity_stmt(
+                    filters=filters,
+                    excluded_meme_ids=excluded_meme_ids,
+                    exclude_any_tags=source_tags,
+                    exclude_template_id=source_meme.template_id,
+                ),
+                False,
+                None,
             )
+        )
 
-        return candidates
-
-    async def _fallback_candidate_rows(
-        self,
-        stmt: Select[tuple[Meme]],
-        *,
-        seen_meme_ids: set[uuid.UUID],
-        target_count: int,
-        source_algorithm: str,
-        reason: str,
-        source_tags: frozenset[str] | None = None,
-        template_match: bool = False,
-    ) -> list[_SimilarCandidate]:
-        remaining = target_count - (len(seen_meme_ids) - 1)
-        if remaining <= 0:
-            return []
-
-        if seen_meme_ids:
-            stmt = stmt.where(~Meme.id.in_(tuple(seen_meme_ids)))
-        result = await self._session.execute(stmt)
-        all_memes = list(result.scalars().all())
-        popularity_by_meme_id = await self._attach_derived_popularity_scores(all_memes)
-        memes = sorted(
-            all_memes,
-            key=lambda meme: (popularity_by_meme_id.get(meme.id, 0.0), meme.created_at, str(meme.id)),
-            reverse=True,
-        )[:remaining]
-        max_popularity = max((popularity_by_meme_id.get(meme.id, 0.0) for meme in memes), default=0.0)
-        candidates: list[_SimilarCandidate] = []
-        for meme in memes:
-            if meme.id in seen_meme_ids:
-                continue
-            seen_meme_ids.add(meme.id)
-            popularity = _normalize_value(popularity_by_meme_id.get(meme.id, 0.0), max_popularity)
-            score = POPULARITY_WEIGHT * popularity
-            score_components = {"popularity": popularity, "total": score}
-            if source_tags is not None:
-                score_components["tag_overlap"] = _tag_overlap_score(source_tags, meme.tags)
-            if template_match:
-                score_components["template_match"] = 1.0
-            candidates.append(
-                _SimilarCandidate(
-                    meme=meme,
-                    source_algorithm=source_algorithm,
-                    reason=reason,
-                    score=score,
-                    score_components=score_components,
-                    algorithm_version=POPULAR_ALGORITHM_VERSION,
+        fallback_total = 0
+        requested_end = offset + limit
+        for source_algorithm, stmt, template_match, tag_source in tier_specs:
+            if fallback_total >= pool_limit:
+                break
+            summary = await self._public_popularity_summary(stmt)
+            tier_total = min(summary.total, pool_limit - fallback_total)
+            tier_start = fallback_total
+            tier_end = tier_start + tier_total
+            intersection_start = max(offset, tier_start)
+            intersection_end = min(requested_end, tier_end)
+            if intersection_start < intersection_end:
+                rows = await self._public_popularity_rows(
+                    stmt,
+                    offset=intersection_start - tier_start,
+                    limit=intersection_end - intersection_start,
                 )
-            )
-        return candidates
+                for row in rows:
+                    popularity = _normalize_value(row.popularity_score, summary.max_popularity_score)
+                    score = POPULARITY_WEIGHT * popularity
+                    score_components = {"popularity": popularity, "total": score}
+                    if tag_source is not None:
+                        score_components["tag_overlap"] = _tag_overlap_score(tag_source, row.tags)
+                    if template_match:
+                        score_components["template_match"] = 1.0
+                    candidates.append(
+                        _SimilarCandidateRef(
+                            meme_id=row.meme_id,
+                            source_algorithm=source_algorithm,
+                            reason=reason,
+                            score=score,
+                            score_components=score_components,
+                            algorithm_version=SIMILAR_ALGORITHM_VERSION,
+                            popularity_score=row.popularity_score,
+                        )
+                    )
+            fallback_total = tier_end
+
+        return candidates, fallback_total
 
     async def _to_public_search_page(
         self,
@@ -2426,6 +2523,137 @@ class MemeSearchService:
             if (meme := memes_by_id.get(meme_id)) is not None
         ]
 
+    def _public_popularity_stmt(
+        self,
+        *,
+        filters: MemeSearchFilters,
+        excluded_meme_ids: set[uuid.UUID] | None = None,
+        any_tags: frozenset[str] = frozenset(),
+        exclude_any_tags: frozenset[str] = frozenset(),
+        template_id: uuid.UUID | None = None,
+        exclude_template_id: uuid.UUID | None = None,
+    ) -> Select[Any]:
+        popularity_score = func.coalesce(_PUBLIC_MEME_TRENDS_MV.c.latest_popularity_score, 0.0).label(
+            "popularity_score"
+        )
+        stmt = (
+            select(
+                Meme.id.label("meme_id"),
+                popularity_score,
+                Meme.tags.label("tags"),
+            )
+            .select_from(Meme)
+            .outerjoin(_PUBLIC_MEME_TRENDS_MV, _PUBLIC_MEME_TRENDS_MV.c.meme_id == Meme.id)
+            .where(Meme.is_public.is_(True))
+        )
+        stmt = _apply_filters(stmt, filters)
+        if excluded_meme_ids:
+            stmt = stmt.where(~Meme.id.in_(tuple(excluded_meme_ids)))
+        if any_tags:
+            stmt = stmt.where(or_(*(literal(tag) == any_(Meme.tags) for tag in any_tags)))
+        if exclude_any_tags:
+            stmt = stmt.where(~or_(*(literal(tag) == any_(Meme.tags) for tag in exclude_any_tags)))
+        if template_id is not None:
+            stmt = stmt.where(Meme.template_id == template_id)
+        if exclude_template_id is not None:
+            stmt = stmt.where(or_(Meme.template_id.is_(None), Meme.template_id != exclude_template_id))
+        return stmt.order_by(popularity_score.desc(), Meme.created_at.desc(), Meme.id.desc())
+
+    async def _public_popularity_summary(self, stmt: Select[Any]) -> _PublicPopularitySummary:
+        candidates = stmt.order_by(None).subquery()
+        result = await self._session.execute(
+            select(
+                func.count().label("total"),
+                func.coalesce(func.max(candidates.c.popularity_score), 0.0).label("max_popularity_score"),
+            ).select_from(candidates)
+        )
+        row = result.one()
+        return _PublicPopularitySummary(
+            total=int(row.total or 0),
+            max_popularity_score=float(row.max_popularity_score or 0.0),
+        )
+
+    async def _public_popularity_rows(
+        self,
+        stmt: Select[Any],
+        *,
+        offset: int,
+        limit: int,
+    ) -> list[_PublicPopularityRow]:
+        if limit <= 0:
+            return []
+        result = await self._session.execute(stmt.offset(max(0, offset)).limit(limit))
+        return [
+            _PublicPopularityRow(
+                meme_id=row.meme_id,
+                popularity_score=float(row.popularity_score or 0.0),
+                tags=tuple(row.tags or ()),
+            )
+            for row in result
+        ]
+
+    async def _public_popular_page(
+        self,
+        *,
+        filters: MemeSearchFilters,
+        limit: int,
+        offset: int,
+        request_id: str,
+        surface: str,
+        source_algorithm: str,
+        query: str | None,
+        reason: str | None,
+        template_id: uuid.UUID | None = None,
+    ) -> MemeSearchPageRead:
+        stmt = self._public_popularity_stmt(filters=filters, template_id=template_id)
+        summary = await self._public_popularity_summary(stmt)
+        rows = await self._public_popularity_rows(stmt, offset=offset, limit=limit)
+        memes = (
+            await self._load_visible_memes(
+                tuple(row.meme_id for row in rows),
+                viewer_user_id=None,
+                filters=filters,
+            )
+            if rows
+            else []
+        )
+        memes_by_id = {meme.id: meme for meme in memes}
+        items: list[MemeSearchResultRead] = []
+        for rank, row in enumerate(rows, start=offset + 1):
+            meme = memes_by_id.get(row.meme_id)
+            if meme is None:
+                continue
+            setattr(meme, _DERIVED_POPULARITY_ATTR, row.popularity_score)
+            popularity = _normalize_value(row.popularity_score, summary.max_popularity_score)
+            score = _CandidateScore(popularity=popularity, total=POPULARITY_WEIGHT * popularity)
+            score_read = _to_score_read(score)
+            items.append(
+                MemeSearchResultRead(
+                    meme=_to_card_read(meme),
+                    score=score_read,
+                    attribution=_build_result_attribution(
+                        request_id=request_id,
+                        surface=surface,
+                        source_algorithm=source_algorithm,
+                        rank=rank,
+                        query=query,
+                        filters=filters,
+                        score=score_read.total,
+                        score_components=_score_components(score_read),
+                        algorithm_version=PUBLIC_POPULAR_ALGORITHM_VERSION,
+                        reason=reason,
+                    ),
+                )
+            )
+        return MemeSearchPageRead(
+            items=items,
+            limit=limit,
+            offset=offset,
+            total=summary.total,
+            has_more=offset + limit < summary.total,
+            request_id=request_id,
+        )
+
     async def _popular_page(
         self,
         *,
@@ -2440,6 +2668,17 @@ class MemeSearchService:
         reason: str | None = None,
     ) -> MemeSearchPageRead:
         resolved_filters = _resolve_search_filters(filters, viewer_user_id=viewer_user_id)
+        if resolved_filters.scope is MemeSearchScope.PUBLIC:
+            return await self._public_popular_page(
+                filters=resolved_filters,
+                limit=limit,
+                offset=offset,
+                request_id=request_id,
+                surface=surface,
+                source_algorithm=source_algorithm,
+                query=query,
+                reason=reason,
+            )
         base_stmt = _apply_filters(
             _search_scope_meme_stmt(
                 viewer_user_id,
@@ -2542,7 +2781,7 @@ def _meme_stmt_with_files() -> Select[tuple[Meme]]:
     )
 
 
-def _apply_filters(stmt: Select[tuple[Meme]], filters: MemeSearchFilters) -> Select[tuple[Meme]]:
+def _apply_filters(stmt: Select[Any], filters: MemeSearchFilters) -> Select[Any]:
     if filters.language is not None:
         stmt = stmt.where(Meme.language == filters.language)
     if filters.media_type is not None:

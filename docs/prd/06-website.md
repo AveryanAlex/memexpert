@@ -130,6 +130,20 @@ Detail, sources, analytics, and related memes load independently; one
 unavailable projection must not erase the others. Clean share/canonical meme
 URLs omit disclosure, sorting, pagination, snapshot, and analytics-range state.
 
+Related memes use the same rank-aware masonry presentation as Search in an
+SSR-first infinite feed. The server renders the first 12 results and the
+browser appends 12-result pages without reordering cards already shown, up to
+the API's stable bounded pool of 200 candidates. Automatic intersection
+loading retains an accessible **Load more** control plus loading, retry, empty,
+and end states. The feed does not expose bulk selection, and moving to another
+meme resets it to that source.
+
+The API owns semantic, tag-related, same-template, and public-popular
+degradation; the frontend never invents or re-ranks fallback results. Every
+appended card preserves the attribution and global rank returned by the API.
+Detail links in this grid use tap-only data preloading so pointer hover cannot
+launch several expensive detail-page loads before the user chooses a meme.
+
 Tag and template pages likewise put the gallery before aggregate popularity information. Any available recent activity and history appear in an **About this tag** or **About this template** disclosure after the gallery.
 
 ## Trends (`/trends`)

@@ -18,6 +18,7 @@
 
   let {
     memes,
+    total,
     label = 'Meme results',
     attributions = {},
     bulk = { enabled: false },
@@ -25,6 +26,7 @@
     exposureScope
   }: {
     memes: PublicMemeCardRead[];
+    total?: number;
     label?: string;
     attributions?: Record<string, MemeResultAttributionRead | null | undefined>;
     bulk?: MemeGridBulkOptions;
@@ -309,7 +311,7 @@
         exposureId={exposureIdFor(attribution)}
         exposurePlacement={`${exposureScopeKey}:${memePositions.get(meme.id) ?? 0}:${meme.id}`}
         position={memePositions.get(meme.id)}
-        total={memes.length}
+        total={total ?? memes.length}
         {showAccessMarkers}
         showZoom={masonryReady && renderedColumnCount > 1}
         {videoPreviewMode}

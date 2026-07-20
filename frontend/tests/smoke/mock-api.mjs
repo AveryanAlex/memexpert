@@ -77,6 +77,20 @@ const nextMeme = {
   }
 };
 
+const similarMemes = Array.from({ length: 25 }, (_, index) => {
+  const rank = index + 1;
+  return {
+    ...nextMeme,
+    id: `smoke-similar-${rank}`,
+    caption: `Smoke similar meme ${rank}`,
+    seo_page_slug: `smoke-similar-meme-${rank}`,
+    primary_file: {
+      ...nextMeme.primary_file,
+      id: `smoke-similar-file-${rank}`
+    }
+  };
+});
+
 const videoMeme = {
   ...meme,
   id: 'smoke-video-1',
@@ -633,9 +647,11 @@ const transientQuickAddFailures = new WeakSet();
 const transientSourceRefreshFailures = new WeakSet();
 const loginAttemptPolls = new Map();
 const staleFullSessionReads = new Set();
+const failedSimilarRefreshTokens = new Set();
 let loginAttemptSequence = 0;
 let detailReadCount = 0;
 let detailViewCount = 0;
+let similarInitialReadCount = 0;
 
 const adminSourcePosts = [
   {
@@ -912,7 +928,7 @@ const server = createServer((request, response) => {
   const url = new URL(request.url ?? '/', `http://${request.headers.host ?? `127.0.0.1:${port}`}`);
 
   if (url.pathname === '/__smoke/stats') {
-    sendJson(response, 200, { detailReadCount, detailViewCount });
+    sendJson(response, 200, { detailReadCount, detailViewCount, similarInitialReadCount });
     return;
   }
 
@@ -1138,6 +1154,20 @@ const server = createServer((request, response) => {
     return;
   }
 
+  if (url.pathname === '/api/v1/memes/slug/smoke-similar-meme-1') {
+    const candidate = similarMemes[0];
+    sendJson(response, 200, {
+      ...detail,
+      ...projectViewerMeme(request, candidate),
+      ocr_text: 'similar source one',
+      seo_title: candidate.caption,
+      seo_description: 'A second deterministic source used to verify Similar feed resets.',
+      seo_body_text: 'Navigating here must discard pending pages from the previous source meme.',
+      files: [candidate.primary_file]
+    });
+    return;
+  }
+
   if (url.pathname === '/api/v1/memes/smoke-meme-1/popularity') {
     sendJson(response, 200, {
       meme_id: 'smoke-meme-1',
@@ -1223,6 +1253,45 @@ const server = createServer((request, response) => {
   if (/^\/api\/v1\/memes\/[^/]+\/(?:detail-click|download|impression|share|view)$/.test(url.pathname)) {
     if (url.pathname.endsWith('/view')) detailViewCount += 1;
     sendJson(response, 200, { ok: true });
+    return;
+  }
+
+  const similarMatch = url.pathname.match(/^\/api\/v1\/memes\/(smoke-meme-1|smoke-similar-1)\/similar$/);
+  if (similarMatch) {
+    const sourceMemeId = similarMatch[1];
+    const limit = Number(url.searchParams.get('limit') ?? 12);
+    const offset = Number(url.searchParams.get('offset') ?? 0);
+    if (offset === 0) similarInitialReadCount += 1;
+    const token = accessToken(request);
+    if (
+      sourceMemeId === 'smoke-meme-1' &&
+      offset === 0 &&
+      token?.startsWith('modal-full-') &&
+      cookieValue(request, 'smoke_similar_revalidation_failure') === '1' &&
+      !failedSimilarRefreshTokens.has(token)
+    ) {
+      failedSimilarRefreshTokens.add(token);
+      sendJson(response, 503, { detail: 'Temporary Similar refresh failure.' });
+      return;
+    }
+    const candidates = sourceMemeId === 'smoke-meme-1' ? similarMemes : [meme, nextMeme];
+    const items = candidates.slice(offset, offset + limit).map((candidate, index) => ({
+      meme: projectViewerMeme(request, candidate),
+      attribution: similarAttribution(candidate.id, offset + index + 1, sourceMemeId)
+    }));
+    const payload = {
+      items,
+      limit,
+      offset,
+      total: candidates.length,
+      has_more: offset + limit < candidates.length,
+      request_id: `req_smoke_similar_${sourceMemeId}_${offset}`
+    };
+    if (sourceMemeId === 'smoke-meme-1' && offset > 0) {
+      setTimeout(() => sendJson(response, 200, payload), 500);
+    } else {
+      sendJson(response, 200, payload);
+    }
     return;
   }
 
@@ -1845,6 +1914,32 @@ function attributionFor(url, memeId) {
     score: 1,
     score_components: { collection_match: 1 },
     reason: 'Seeded readable collection result'
+  };
+}
+
+function similarAttribution(memeId, rank, sourceMemeId) {
+  return {
+    request_id: `req_smoke_similar_${sourceMemeId}_${Math.floor((rank - 1) / 12) * 12}`,
+    impression_id: `imp_similar_${memeId}`,
+    surface: 'public_api_meme_similar',
+    source_algorithm: 'qdrant_similarity',
+    rank,
+    query: null,
+    filters: {
+      language: null,
+      media_type: null,
+      include_nsfw: false,
+      tags: [],
+      scope: 'public',
+      collection_ids: []
+    },
+    collection_scope: 'public',
+    collection_ids: [],
+    source_meme_id: sourceMemeId,
+    algorithm_version: 'similar-smoke-v1',
+    score: 1 - rank / 100,
+    score_components: { similarity: 1 - rank / 100 },
+    reason: 'similarity_match'
   };
 }
 
