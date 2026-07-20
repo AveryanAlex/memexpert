@@ -74,6 +74,12 @@ describe('/trends/timeline page', () => {
 
     expect(body).toContain('January 2026');
     expect(body).toContain('1 top meme to revisit');
+    expect(body).toContain('aria-label="Top memes from January 2026"');
+    expect(body).toContain('data-layout="masonry"');
+    expect(body).toContain('data-masonry-state="pending"');
+    expect(body).toContain('role="listitem"');
+    expect(body).toContain('aria-posinset="1"');
+    expect(body).toContain('aria-setsize="1"');
     expect(body).toContain('Timeline reaction');
     expect(body).toContain('Recorded activity adds original-source views, reactions, and reposts');
     expect(body).toContain('Recorded activity');

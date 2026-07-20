@@ -2,6 +2,26 @@ import { expect, test } from '@playwright/test';
 
 const seededCollectionId = 'smoke-private-team-saves';
 const seededCollectionQuery = 'vault reaction';
+const rankedMasonryQuery = 'ranked masonry smoke';
+const rankedMasonryTitles = [
+  'Ranked portrait one',
+  'Ranked ultra wide two',
+  'Ranked square three',
+  'Ranked landscape four',
+  'Ranked captionless five',
+  'Ranked missing media six',
+  'Ranked video seven',
+  'Ranked tall eight with enough caption copy to make its card height distinct',
+  'Ranked appended portrait nine',
+  'Ranked appended wide ten'
+] as const;
+
+interface MasonryHydrationFrame {
+  state: string | null;
+  order: number[];
+  visible: number[];
+  positions: Array<{ index: number; left: number; top: number }>;
+}
 
 test.describe('public masonry feed smoke', () => {
   test('desktop feed keeps keyboard order and accessible Load more', async ({ page }) => {
@@ -87,11 +107,11 @@ test.describe('public masonry feed smoke', () => {
 
     const cardsFitTheirColumns = await feed.evaluate((element) => {
       const tolerance = 1;
-      return Array.from(element.children).every((column) => {
-        const columnBox = column.getBoundingClientRect();
-        return Array.from(column.querySelectorAll(':scope > div > article')).every((card) => {
+      return Array.from(element.querySelectorAll(':scope > [data-masonry-index]')).every((item) => {
+        const itemBox = item.getBoundingClientRect();
+        return Array.from(item.querySelectorAll(':scope > div > article, :scope > article')).every((card) => {
           const cardBox = card.getBoundingClientRect();
-          return cardBox.left >= columnBox.left - tolerance && cardBox.right <= columnBox.right + tolerance;
+          return cardBox.left >= itemBox.left - tolerance && cardBox.right <= itemBox.right + tolerance;
         });
       });
     });
@@ -190,21 +210,125 @@ test.describe('public masonry feed smoke', () => {
     await expect(zoom).toBeFocused();
   });
 
-  test('ordered search uses shared grid column state for its magnifier', async ({ page }) => {
-    await page.setViewportSize({ width: 620, height: 844 });
+  test('search masonry uses shared column state for its magnifier', async ({ page }) => {
+    await page.setViewportSize({ width: 590, height: 844 });
     await disableIntersectionObserver(page);
     await page.goto('/search?q=cat%20reaction');
 
     const grid = page.getByRole('list', { name: 'Search results' });
     const card = grid.getByRole('link', { name: 'Open Smoke test cat reaction' }).locator('xpath=ancestor::article');
     const zoom = card.locator('button[aria-label="Enlarge Smoke test cat reaction"]');
-    await expect(grid).toHaveAttribute('data-layout', 'ordered');
+    await expect(grid).toHaveAttribute('data-layout', 'masonry');
+    await expect(grid).toHaveAttribute('data-masonry-state', 'ready');
     await expect(grid).toHaveAttribute('data-column-count', '1');
     await expect(zoom).toBeHidden();
 
-    await page.setViewportSize({ width: 660, height: 844 });
+    await page.setViewportSize({ width: 610, height: 844 });
     await expect(grid).toHaveAttribute('data-column-count', '2');
     await expect(zoom).toBeVisible();
+  });
+
+  test('ranked search is hydration-stable, densely packed, and stable after append', async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await installMasonryHydrationRecorder(page);
+    await disableIntersectionObserver(page);
+    await page.goto(rankedMasonrySearchPath());
+
+    const grid = page.getByRole('list', { name: 'Search results' });
+    const items = grid.locator(':scope > [data-masonry-index]');
+    await expect(grid).toHaveAttribute('data-layout', 'masonry');
+    await expect(grid).toHaveAttribute('data-column-count', '4');
+    await expect(grid).toHaveAttribute('data-masonry-state', 'ready');
+    await expect(items).toHaveCount(8);
+    await expect(page.getByRole('link', { name: `Open ${rankedMasonryTitles[7]}`, exact: true })).toBeVisible();
+    await nextBrowserFrames(page, 2);
+
+    const initialGeometry = await readMasonryGeometry(grid);
+    expect(initialGeometry.items.map((item) => item.index)).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
+    expect(initialGeometry.items.map((item) => item.position)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(initialGeometry.items.map((item) => item.title)).toEqual(rankedMasonryTitles.slice(0, 8));
+    expectRankAwareMasonryGeometry(initialGeometry);
+
+    const hydrationFrames = await page.evaluate(() => {
+      return (window as typeof window & { __masonryHydrationFrames?: MasonryHydrationFrame[] }).__masonryHydrationFrames ?? [];
+    });
+    expect(hydrationFrames.length).toBeGreaterThan(0);
+    expect(hydrationFrames.filter((frame) => frame.order.length > 0).every((frame) => frame.order.join(',') === '0,1,2,3,4,5,6,7')).toBe(true);
+
+    const firstVisibleIndex = hydrationFrames.findIndex((frame) => frame.visible.length > 0);
+    expect(firstVisibleIndex).toBeGreaterThanOrEqual(0);
+    expect(hydrationFrames.slice(0, firstVisibleIndex).every((frame) => frame.visible.length === 0)).toBe(true);
+    const firstVisibleFrame = hydrationFrames[firstVisibleIndex];
+    expect(firstVisibleFrame?.state).toBe('ready');
+    expect(firstVisibleFrame?.visible).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
+    for (const item of initialGeometry.items) {
+      const firstPosition = firstVisibleFrame?.positions.find((position) => position.index === item.index);
+      expect(firstPosition, `initial visible position for ranked item ${item.index}`).toBeDefined();
+      expect(Math.abs((firstPosition?.left ?? Number.NaN) - (item.left - initialGeometry.container.left))).toBeLessThanOrEqual(1);
+      expect(Math.abs((firstPosition?.top ?? Number.NaN) - (item.top - initialGeometry.container.top))).toBeLessThanOrEqual(1);
+    }
+
+    await page.getByRole('button', { name: 'Load more' }).click();
+    await expect(items).toHaveCount(10);
+    await expect(page.getByRole('link', { name: `Open ${rankedMasonryTitles[9]}`, exact: true })).toBeVisible();
+    await expect(grid).toHaveAttribute('data-masonry-state', 'ready');
+    await nextBrowserFrames(page, 2);
+
+    const appendedGeometry = await readMasonryGeometry(grid);
+    expect(appendedGeometry.items.map((item) => item.index)).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    expect(appendedGeometry.items.map((item) => item.title)).toEqual([...rankedMasonryTitles]);
+    expectRankAwareMasonryGeometry(appendedGeometry);
+    for (const item of initialGeometry.items) {
+      const afterAppend = appendedGeometry.items.find((candidate) => candidate.index === item.index);
+      expect(afterAppend, `appended position for ranked item ${item.index}`).toBeDefined();
+      const initialLeft = item.left - initialGeometry.container.left;
+      const initialTop = item.top - initialGeometry.container.top;
+      const appendedLeft = (afterAppend?.left ?? Number.NaN) - appendedGeometry.container.left;
+      const appendedTop = (afterAppend?.top ?? Number.NaN) - appendedGeometry.container.top;
+      expect(Math.abs(appendedLeft - initialLeft)).toBeLessThanOrEqual(1);
+      expect(Math.abs(appendedTop - initialTop)).toBeLessThanOrEqual(1);
+    }
+  });
+
+  test('ranked search masonry responds with one through four columns', async ({ page }) => {
+    await disableIntersectionObserver(page);
+    await page.setViewportSize({ width: 390, height: 900 });
+    await page.goto(rankedMasonrySearchPath());
+
+    const grid = page.getByRole('list', { name: 'Search results' });
+    for (const [width, columns] of [[390, '1'], [660, '2'], [960, '3'], [1280, '4']] as const) {
+      await page.setViewportSize({ width, height: 900 });
+      await expect(grid).toHaveAttribute('data-column-count', columns);
+      await expect(grid).toHaveAttribute('data-masonry-state', 'ready');
+      await nextBrowserFrames(page, 2);
+      await expect(grid).toHaveAttribute('data-masonry-state', 'ready');
+      const geometry = await readMasonryGeometry(grid);
+      expect(new Set(geometry.items.map((item) => item.column)).size).toBe(Number(columns));
+      expectRankAwareMasonryGeometry(geometry);
+    }
+  });
+
+  test('ranked search has a visible ordered fallback without JavaScript', async ({ browser, baseURL }) => {
+    const context = await browser.newContext({
+      baseURL,
+      javaScriptEnabled: false,
+      viewport: { width: 960, height: 900 }
+    });
+    const page = await context.newPage();
+
+    try {
+      await page.goto(rankedMasonrySearchPath());
+      const grid = page.getByRole('list', { name: 'Search results' });
+      const items = grid.locator(':scope > [data-masonry-index]');
+      await expect(grid).toHaveAttribute('data-layout', 'masonry');
+      await expect(grid).toHaveAttribute('data-masonry-state', 'pending');
+      await expect(items).toHaveCount(8);
+      await expect(page.getByRole('link', { name: `Open ${rankedMasonryTitles[0]}`, exact: true })).toBeVisible();
+      await expect(page.getByRole('link', { name: `Open ${rankedMasonryTitles[7]}`, exact: true })).toBeVisible();
+      await expect.poll(async () => items.evaluateAll((nodes) => nodes.map((node) => Number(node.getAttribute('data-masonry-index'))))).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
+    } finally {
+      await context.close();
+    }
   });
 
   test('card actions do not overlap at the supported 320px viewport', async ({ page }) => {
@@ -373,7 +497,8 @@ test.describe('public masonry feed smoke', () => {
 
     const grid = page.getByRole('list', { name: 'Search results' });
     const video = grid.locator('video');
-    await expect(grid).toHaveAttribute('data-layout', 'ordered');
+    await expect(grid).toHaveAttribute('data-layout', 'masonry');
+    await expect(grid).toHaveAttribute('data-masonry-state', 'ready');
     await expect(grid).toHaveAttribute('data-video-preview-mode', 'hover');
     await expect(video).toHaveAttribute('poster', /smoke-cat\.svg/);
     await expect(video).toHaveJSProperty('muted', true);
@@ -538,6 +663,160 @@ function collectionSearchPath() {
     q: seededCollectionQuery
   });
   return `/search?${params.toString()}`;
+}
+
+function rankedMasonrySearchPath() {
+  return `/search?q=${encodeURIComponent(rankedMasonryQuery)}`;
+}
+
+interface MasonryGeometry {
+  state: string | null;
+  columnCount: number;
+  container: MasonryBox;
+  items: Array<MasonryBox & { index: number; column: number; position: number; title: string | null }>;
+}
+
+interface MasonryBox {
+  top: number;
+  right: number;
+  bottom: number;
+  left: number;
+  width: number;
+  height: number;
+}
+
+async function readMasonryGeometry(grid: import('@playwright/test').Locator): Promise<MasonryGeometry> {
+  return grid.evaluate((element) => {
+    const rect = (node: Element) => {
+      const box = node.getBoundingClientRect();
+      return {
+        top: box.top,
+        right: box.right,
+        bottom: box.bottom,
+        left: box.left,
+        width: box.width,
+        height: box.height
+      };
+    };
+    const items = Array.from(element.querySelectorAll<HTMLElement>(':scope > [data-masonry-index]'));
+
+    return {
+      state: element.getAttribute('data-masonry-state'),
+      columnCount: Number(element.getAttribute('data-column-count')),
+      container: rect(element),
+      items: items.map((item) => {
+        const article = item.querySelector('article');
+        const openLink = item.querySelector<HTMLElement>('[aria-label^="Open "]');
+        return {
+          ...rect(item),
+          index: Number(item.dataset.masonryIndex),
+          column: Number(item.dataset.masonryColumn),
+          position: Number(article?.getAttribute('aria-posinset')),
+          title: openLink?.getAttribute('aria-label')?.replace(/^Open /, '') ?? null
+        };
+      })
+    };
+  });
+}
+
+function expectRankAwareMasonryGeometry(geometry: MasonryGeometry) {
+  const tolerance = 1.5;
+  expect(geometry.state).toBe('ready');
+  expect(geometry.items.length).toBeGreaterThan(0);
+  expect(new Set(geometry.items.map((item) => item.column)).size).toBe(geometry.columnCount);
+
+  const first = geometry.items[0];
+  expect(Math.abs(first.left - geometry.container.left)).toBeLessThanOrEqual(tolerance);
+  expect(Math.abs(first.top - geometry.container.top)).toBeLessThanOrEqual(tolerance);
+
+  for (let index = 0; index < geometry.items.length; index += 1) {
+    const item = geometry.items[index];
+    expect(item.left).toBeGreaterThanOrEqual(geometry.container.left - tolerance);
+    expect(item.top).toBeGreaterThanOrEqual(geometry.container.top - tolerance);
+    expect(item.right).toBeLessThanOrEqual(geometry.container.right + tolerance);
+    expect(item.bottom).toBeLessThanOrEqual(geometry.container.bottom + tolerance);
+    if (index > 0) {
+      expect(item.top).toBeGreaterThanOrEqual(geometry.items[index - 1].top - tolerance);
+    }
+  }
+
+  for (let leftIndex = 0; leftIndex < geometry.items.length; leftIndex += 1) {
+    for (let rightIndex = leftIndex + 1; rightIndex < geometry.items.length; rightIndex += 1) {
+      const left = geometry.items[leftIndex];
+      const right = geometry.items[rightIndex];
+      const horizontalOverlap = Math.min(left.right, right.right) - Math.max(left.left, right.left);
+      const verticalOverlap = Math.min(left.bottom, right.bottom) - Math.max(left.top, right.top);
+      expect(horizontalOverlap > tolerance && verticalOverlap > tolerance, `ranked items ${left.index} and ${right.index} overlap`).toBe(false);
+    }
+  }
+
+  if (geometry.columnCount > 1 && geometry.items.length > geometry.columnCount) {
+    const firstRowBottom = Math.max(...geometry.items.slice(0, geometry.columnCount).map((item) => item.bottom));
+    expect(geometry.items[geometry.columnCount].top).toBeLessThan(firstRowBottom - 8);
+  }
+}
+
+async function installMasonryHydrationRecorder(page: import('@playwright/test').Page) {
+  await page.addInitScript(() => {
+    const recordedWindow = window as typeof window & { __masonryHydrationFrames?: MasonryHydrationFrame[] };
+    const frames: MasonryHydrationFrame[] = [];
+    recordedWindow.__masonryHydrationFrames = frames;
+    let previous = '';
+    let remainingFrames = 300;
+
+    const round = (value: number) => Math.round(value * 100) / 100;
+    const isVisible = (item: HTMLElement, grid: HTMLElement) => {
+      let current: HTMLElement | null = item;
+      while (current) {
+        const style = getComputedStyle(current);
+        if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0 || current.hidden) return false;
+        if (current === grid) break;
+        current = current.parentElement;
+      }
+      const box = item.getBoundingClientRect();
+      return box.width > 0 && box.height > 0;
+    };
+    const sample = () => {
+      const grid = document.querySelector<HTMLElement>('[aria-label="Search results"][data-layout="masonry"]');
+      if (grid) {
+        const gridBox = grid.getBoundingClientRect();
+        const items = Array.from(grid.querySelectorAll<HTMLElement>(':scope > [data-masonry-index]'));
+        if (items.length > 0) {
+          const frame: MasonryHydrationFrame = {
+            state: grid.getAttribute('data-masonry-state'),
+            order: items.map((item) => Number(item.dataset.masonryIndex)),
+            visible: items.filter((item) => isVisible(item, grid)).map((item) => Number(item.dataset.masonryIndex)),
+            positions: items.map((item) => {
+              const box = item.getBoundingClientRect();
+              return {
+                index: Number(item.dataset.masonryIndex),
+                left: round(box.left - gridBox.left),
+                top: round(box.top - gridBox.top)
+              };
+            })
+          };
+          const serialized = JSON.stringify(frame);
+          if (serialized !== previous) {
+            frames.push(frame);
+            previous = serialized;
+          }
+        }
+      }
+
+      remainingFrames -= 1;
+      if (remainingFrames > 0) requestAnimationFrame(sample);
+    };
+
+    requestAnimationFrame(sample);
+  });
+}
+
+async function nextBrowserFrames(page: import('@playwright/test').Page, count: number) {
+  await page.evaluate(async (frameCount) => {
+    for (let frame = 0; frame < frameCount; frame += 1) {
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    }
+  }, count);
 }
 
 async function disableIntersectionObserver(page: import('@playwright/test').Page) {

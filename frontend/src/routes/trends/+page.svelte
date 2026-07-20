@@ -1,9 +1,10 @@
 <script lang="ts">
   import { readAuthState } from '$lib/auth-state';
   import MemeCard from '$lib/features/memes/MemeCard.svelte';
+  import type { MemeVideoPreviewMode } from '$lib/features/memes/meme-video';
   import TrendSummary from '$lib/features/trends/TrendSummary.svelte';
-  import type { PublicTrendMetricsRead, PublicTrendSummaryRead } from '$lib/api/types';
-  import { ActionLink, Card, EmptyState, Notice, PageHeader, PillLink } from '$lib/ui';
+  import type { PublicMemeTrendRead, PublicTrendMetricsRead, PublicTrendSummaryRead } from '$lib/api/types';
+  import { ActionLink, Card, EmptyState, Masonry, Notice, PageHeader, PillLink } from '$lib/ui';
   import type { PageData } from './$types';
 
   let { data }: { data: PageData } = $props();
@@ -66,6 +67,15 @@
   function count(value: number | null | undefined): number {
     return typeof value === 'number' && Number.isFinite(value) ? Math.max(value, 0) : 0;
   }
+
+  function trendKey(item: PublicMemeTrendRead): string {
+    return item.meme.id;
+  }
+
+  function cardVideoPreviewMode(columnCount: number, ready: boolean): MemeVideoPreviewMode {
+    if (!ready || columnCount === 0) return 'poster';
+    return columnCount === 1 ? 'viewport' : 'hover';
+  }
 </script>
 
 <PageHeader title="Meme trends" description="See what people are enjoying this week." badge="This week">
@@ -91,9 +101,21 @@
 </div>
 
 {#if data.page.items.length > 0}
-  <section class="grid grid-cols-1 gap-4 md:grid-cols-3" aria-label="Trend ranked memes">
-    {#each data.page.items as item, index (item.meme.id)}
-      <Card class="grid gap-3 p-4 shadow-none">
+  <Masonry
+    items={data.page.items}
+    getKey={trendKey}
+    maxColumns={3}
+    element="section"
+    aria-label="Trend ranked memes"
+    role="list"
+  >
+    {#snippet children(item, index, layout)}
+      <Card
+        class="grid gap-3 p-4 shadow-none"
+        role="listitem"
+        aria-posinset={data.offset + index + 1}
+        aria-setsize={data.page.total}
+      >
         <div class="flex items-center justify-between gap-3">
           <span class="rounded-full bg-soft px-3 py-1.5 text-sm font-extrabold text-ink">{rankingLabel}</span>
           <span class="text-sm font-semibold text-muted">#{data.offset + index + 1}</span>
@@ -104,11 +126,13 @@
           exposureId={item.attribution.impression_id}
           exposurePlacement={`trends:${data.ranking}:${data.offset + index}:${item.meme.id}`}
           showAccessMarkers={Boolean(session)}
+          showZoom={layout.ready && layout.columnCount > 1}
+          videoPreviewMode={cardVideoPreviewMode(layout.columnCount, layout.ready)}
         />
         <TrendSummary trend={item.trend} />
       </Card>
-    {/each}
-  </section>
+    {/snippet}
+  </Masonry>
 {:else if !data.errorMessage}
   <EmptyState title="Nothing is trending yet" message="Check back soon for the memes people are starting to enjoy." />
 {/if}

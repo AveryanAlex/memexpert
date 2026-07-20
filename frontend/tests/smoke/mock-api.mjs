@@ -106,6 +106,20 @@ const videoMeme = {
   download_url: `http://127.0.0.1:${port}/media/smoke-video.mp4`
 };
 
+const rankedMasonryQuery = 'ranked masonry smoke';
+const rankedMasonryMemes = [
+  rankedMasonryMeme(1, 'Ranked portrait one', 480, 960),
+  rankedMasonryMeme(2, 'Ranked ultra wide two', 1600, 400),
+  rankedMasonryMeme(3, 'Ranked square three', 800, 800),
+  rankedMasonryMeme(4, 'Ranked landscape four', 1200, 675),
+  rankedMasonryMeme(5, null, 900, 600, { tags: ['Ranked captionless five'] }),
+  rankedMasonryMeme(6, 'Ranked missing media six', 640, 360, { missingMedia: true }),
+  rankedMasonryMeme(7, 'Ranked video seven', 720, 1280, { mediaType: 'video' }),
+  rankedMasonryMeme(8, 'Ranked tall eight with enough caption copy to make its card height distinct', 600, 1200),
+  rankedMasonryMeme(9, 'Ranked appended portrait nine', 500, 1000),
+  rankedMasonryMeme(10, 'Ranked appended wide ten', 1800, 450)
+];
+
 const collectionMeme = {
   ...meme,
   id: 'smoke-meme-collection-1',
@@ -1078,6 +1092,24 @@ const server = createServer((request, response) => {
       return;
     }
 
+    if ((url.searchParams.get('query') ?? '').trim().toLowerCase() === rankedMasonryQuery) {
+      const offset = Math.max(0, Number(url.searchParams.get('offset') ?? 0));
+      const limit = 8;
+      const pageMemes = rankedMasonryMemes.slice(offset, offset + limit);
+      sendJson(response, 200, {
+        items: pageMemes.map((item, index) => ({
+          meme: projectViewerMeme(request, item),
+          attribution: rankedMasonryAttributionFor(url, item.id, offset + index + 1)
+        })),
+        limit,
+        offset,
+        total: rankedMasonryMemes.length,
+        has_more: offset + pageMemes.length < rankedMasonryMemes.length,
+        request_id: 'req_smoke_ranked_masonry'
+      });
+      return;
+    }
+
     sendJson(response, 200, {
       items: [{ meme: projectViewerMeme(request, meme) }],
       limit: Number(url.searchParams.get('limit') ?? 12),
@@ -1721,6 +1753,72 @@ function searchPage(items, url, requestId) {
     total: items.length,
     has_more: false,
     request_id: requestId
+  };
+}
+
+function rankedMasonryMeme(index, caption, width, height, { tags = [`ranked-${index}`], mediaType = 'image', missingMedia = false } = {}) {
+  const id = `smoke-ranked-masonry-${index}`;
+  const isVideo = mediaType === 'video';
+  const mediaUrl = isVideo
+    ? `http://127.0.0.1:${port}/media/smoke-video.mp4`
+    : `http://127.0.0.1:${port}/media/smoke-cat.svg`;
+  const primaryFile = missingMedia
+    ? null
+    : {
+        ...meme.primary_file,
+        id: `${id}-file`,
+        mime_type: isVideo ? 'video/mp4' : 'image/svg+xml',
+        width,
+        height,
+        render: {
+          ...meme.primary_file.render,
+          display_url: `http://127.0.0.1:${port}/media/smoke-cat.svg`,
+          original_url: mediaUrl,
+          download_url: mediaUrl,
+          web_video_url: isVideo ? mediaUrl : null,
+          width,
+          height
+        },
+        render_url: mediaUrl,
+        download_url: mediaUrl
+      };
+
+  return {
+    ...meme,
+    id,
+    media_type: mediaType,
+    caption,
+    seo_page_slug: `ranked-masonry-${index}`,
+    tags,
+    primary_file: primaryFile,
+    render_url: missingMedia ? null : mediaUrl,
+    download_url: missingMedia ? null : mediaUrl
+  };
+}
+
+function rankedMasonryAttributionFor(url, memeId, rank) {
+  return {
+    request_id: 'req_smoke_ranked_masonry',
+    impression_id: `imp_ranked_masonry_${rank}`,
+    surface: 'search',
+    source_algorithm: 'smoke-ranked-masonry',
+    rank,
+    query: url.searchParams.get('query') ?? null,
+    filters: {
+      language: url.searchParams.get('language'),
+      media_type: url.searchParams.get('media_type'),
+      include_nsfw: url.searchParams.get('include_nsfw') === 'true',
+      tags: url.searchParams.getAll('tags'),
+      scope: url.searchParams.get('scope'),
+      collection_ids: url.searchParams.getAll('collection_ids')
+    },
+    collection_scope: url.searchParams.get('scope'),
+    collection_ids: url.searchParams.getAll('collection_ids'),
+    source_meme_id: null,
+    algorithm_version: 'smoke-v1',
+    score: rankedMasonryMemes.length - rank + 1,
+    score_components: { backend_rank: rank },
+    reason: 'Deterministic ranked masonry fixture'
   };
 }
 

@@ -13,7 +13,7 @@ The redesign is a presentation and progressive-disclosure change. FastAPI remain
 | Discover, Search, Saved, and Account are the consumer navigation model. | These destinations map directly to browsing, intent-led retrieval, saved work, and personal settings. Trends remains reachable from Discover without taking the place of Search or Saved. |
 | Card media, image enlargement, and Favorite/Download/Save/Send actions are always visible. | A meme catalog should make the next meaningful action available where the media is seen, rather than hide primary interaction behind a menu. |
 | Selection is an opt-in, local grid state. | Bulk tools are useful only after an intentional transition into management mode; they must not dominate passive discovery. |
-| Search uses an ordered grid; Discover can use masonry. | Search order is relevance information. Discover optimizes browsing density across varied media dimensions. See [Grid and feed behavior](#grid-and-feed-behavior). |
+| Multi-card surfaces use rank-aware measured masonry. | One placement contract preserves backend relevance in DOM and visual order while packing varied media dimensions densely. See [Grid and feed behavior](#grid-and-feed-behavior). |
 | Saved content and account settings have separate routes. | Library operations are content management; connection and preferences are account management. Keeping them separate makes each route smaller and more legible. |
 | Advanced or technical information lives behind explicit disclosure. | Collections, meme details, tag/template analytics, and trends should lead with media and understandable context, not control panels or diagnostics. |
 | Telegram adapts the host shell instead of forking routes. | Website and Mini App retain one route and action contract while adopting Telegram viewport, theme, safe-area, and authentication behavior. |
@@ -43,9 +43,10 @@ Desktop navigation presents the brand, Discover, global query search, Saved, and
 | `MemeActionMenu.svelte` | One action implementation with `card`, `detail`, and `overflow` surfaces. Cards expose evenly distributed icon-only Favorite, Download, Save-to-collection, and Send controls; detail exposes labeled Favorite, Save-to-collection, and Send controls. Pin, Copy link, and Report remain contextual overflow actions. |
 | `SaveCollectionChooser.svelte` | Persistent meme-scoped chooser. It groups existing memberships before writable destinations, preserves backend recency order, supports in-place add/remove, and publishes aggregate bookmark state across duplicate cards. |
 | `MemeVideoPlayer.svelte` | Shared grid video preview. It coordinates one active preview/audio source, uses viewport autoplay in one-column grids, hover playback in wider fine-pointer grids, click/keyboard pause, muted defaults, and visibility/reduced-motion safeguards. |
-| `MemeGrid.svelte` | Owns layout choice, result attribution markup, local selection mode, checkboxes, and sticky selection toolbar. It does not decide whether a route enables bulk behavior. |
+| `lib/ui/Masonry.svelte` | Generic measured layout primitive. It retains one keyed flat DOM list, calculates rank-aware coordinates from rendered item heights, and owns hydration/no-JavaScript fallback behavior without meme-domain policy. |
+| `MemeGrid.svelte` | Composes the shared masonry primitive with result attribution markup, local selection mode, checkboxes, and the sticky selection toolbar. It does not decide whether a route enables bulk behavior. |
 | `discovery-attribution.ts` | Maps the shared discovery-attribution fields to DOM data attributes for grids and Meme of the Day without diverging field sets. |
-| `InfiniteMemeFeed.svelte` | Owns initial/next page state, deduplicated append behavior, intersection loading, and accessible Load more/retry/end states. It passes the route's layout and bulk policy to `MemeGrid`. |
+| `InfiniteMemeFeed.svelte` | Owns initial/next page state, deduplicated append behavior, intersection loading, and accessible Load more/retry/end states. It passes route bulk policy to `MemeGrid`; layout is shared across surfaces. |
 | `MemeOfTheDayPanel.svelte` | Presents the daily selection as a compact media-first tile while retaining attribution for telemetry. |
 | `features/taxonomy/TaxonomyLandingPage.svelte` and `server/taxonomyLanding.ts` | Share gallery-first tag/template presentation and loading while route files remain thin kind/slug adapters. |
 
@@ -57,7 +58,7 @@ Save-to-collection opens a borderless contextual popover backed by a meme-scoped
 
 | Area | Boundaries and ownership |
 | --- | --- |
-| Search | `SearchFilters.svelte` owns the editable URL-backed query/filter draft, responsive dialog, and sensitive-content confirmation. `ActiveSearchFilters.svelte` renders consumer-language removable chips and empty-search suggestions. The route composes these with the ordered result feed. |
+| Search | `SearchFilters.svelte` owns the editable URL-backed query/filter draft, responsive dialog, and sensitive-content confirmation. `ActiveSearchFilters.svelte` renders consumer-language removable chips and empty-search suggestions. The route composes these with the shared rank-aware result feed. |
 | Saved | `server/libraryPage.ts` centralizes the cookie-forwarded library request. `/library` owns collection creation, active save destination, collection list, Favorites, Pins, pin reorder, and saved-content grids. |
 | Account | `/profile` owns Telegram connection, language, sensitive-content preference, and compact statistics only. Its server load fetches stats independently of the library. |
 | Collection | The route presents metadata, active-save control, notices, and saved memes first. `CollectionManagement.svelte` contains the disclosure for rename/visibility, invitations, members, revocation, and deletion. |
@@ -69,7 +70,7 @@ Save-to-collection opens a borderless contextual popover backed by a meme-scoped
 | Route | Primary content | Deferred/disclosed content | Must not reappear here |
 | --- | --- | --- | --- |
 | `/` | Discover header, Meme of the Day, topics, feed | None required for normal browsing | Collection creation/list, bulk toolbar, recommendation/fallback diagnostics |
-| `/search` | Query, Filters trigger, active chips, result count, ordered results | Filter form in a dialog/sheet | A permanently expanded advanced workspace or raw implementation terms |
+| `/search` | Query, Filters trigger, active chips, result count, rank-aware results | Filter form in a dialog/sheet | A permanently expanded advanced workspace or raw implementation terms |
 | `/library` | Favorites, Collections, Pins, active save destination | New collection form | Provider/account diagnostics |
 | `/profile` | Telegram connection, language, sensitive-content preference, compact stats | Interaction stats | Saved grids, pin ordering, collection list, active save selector |
 | `/collection/{id}` | Collection summary, save destination, saved memes | **Manage collection** native disclosure | Management controls above the meme grid |
@@ -163,17 +164,15 @@ The redesign therefore keeps the analytics contract described in [Analytics](../
 
 ## Grid and Feed Behavior
 
-### Ordered Search
+### Rank-aware measured masonry
 
-`MemeGrid` receives `layout="ordered"` from `/search`. It renders one responsive CSS grid in the exact backend array order: one column on narrow screens, then two, three, and four columns as space permits. DOM order, visual sequence, keyboard traversal, `aria-posinset`, and result rank remain aligned with backend relevance order.
+All multi-card meme surfaces share one measured masonry primitive. `MemeGrid` uses it for Search, Discover, Saved, collections, related memes, and taxonomy galleries; Trends and each Timeline period use the same primitive with a three-column maximum. The primitive renders items once as a keyed flat DOM list in backend order and never regroups or moves DOM nodes into visual column containers.
 
-This is intentionally different from an image-gallery algorithm. A person evaluating a search result needs predictable order, readable meme text, stable pagination, and a clear relationship between the result count/rank and the card they encounter.
+After measuring the container and naturally rendered items at their final column width, placement processes items strictly in array order. Rank 1 is top-left; for any ranks `i < j`, `top(i) <= top(j)`; items with the same top coordinate appear left-to-right in rank order. Selection of the shortest eligible column and left-biased tie-breaking makes placement deterministic. Coordinates use actual rendered heights rather than media or caption estimates, reducing unused space without weakening search relevance, keyboard traversal, `aria-posinset`, or `aria-setsize` semantics.
 
-### Masonry Discover
+SSR emits a complete responsive grid in semantic order. On a scripting-capable client, the initial cards remain measurable but hidden while the first coordinates and container height are calculated; those styles are committed atomically before all cards are revealed, with no transition. A user therefore never sees the fallback grid reorder during hydration. `@media (scripting: none)` exposes the fallback immediately when JavaScript is disabled, and missing measurement support also reveals the ordered fallback. One-column layouts remain ordinary flow.
 
-Discover and gallery-oriented surfaces use the masonry mode when density is more valuable than strict visual relevance ordering. The layout processes backend items sequentially and appends each item to the currently shortest estimated column, breaking ties by earlier column. It is deterministic and does not randomly shuffle input, but multi-column visual scanning is not the ordered-search relevance contract.
-
-Masonry reduces unused space when images, GIFs, videos, and placeholders have different heights. On a one-column mobile layout it naturally preserves array order.
+Container resizing and post-reveal media-height changes may trigger a measured relayout without changing DOM order. Infinite append preserves every existing coordinate and withholds only the new batch until it is measured, so loading more results cannot visibly reorder cards already shown.
 
 ### Infinite pagination and selection
 
@@ -253,7 +252,7 @@ Trend visualizations follow these rules:
 ## Accessibility Requirements
 
 - Use named navigation landmarks, active-page `aria-current`, visible mobile labels, and focus-visible rings on all interactive primitives.
-- Preserve semantic card/list structures. Cards expose title-based detail links, `aria-posinset`/`aria-setsize` where a feed provides rank, labeled action groups, and pressed state for Favorite/Save controls.
+- Preserve semantic card/list structures. The masonry root and its cards remain a flat DOM list in backend rank order. Cards expose title-based detail links, `aria-posinset`/`aria-setsize` where a feed provides rank, labeled action groups, and pressed state for Favorite/Save controls.
 - Do not nest action buttons inside the detail link. Image-card focus reaches media/detail, then Enlarge when the grid offers it, Favorite, Download, Save, Send, and overflow. Video-card focus reaches Open meme, Play/Pause, Mute/Unmute, then the same direct actions. The enlargement dialog uses the best available image variant, preserves its full aspect ratio within the viewport, traps focus, closes with Escape, and restores focus to its trigger. Icon-only card controls retain explicit accessible names and pressed state; a favorited heart is filled and uses the danger/red token instead of changing to a visible “Favorited” label.
 - Viewer action state is layout-scoped and keyed by meme ID, so repeated presentations of the same meme (for example Meme of the Day plus the home feed) update Favorite, Save, Pin, and the visible like count together. Save choosers omit Favorites, and the bookmark is pressed when the meme belongs to any accessible non-Favorites collection. The state is discarded when the active viewer identity changes.
 - Dialogs have title/description/close controls; filter-sheet content scrolls internally; Reset/Show results are reachable at every viewport size.

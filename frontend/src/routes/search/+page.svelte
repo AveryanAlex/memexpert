@@ -72,7 +72,6 @@
   }}
   initialError={data.errorMessage}
   label="Search results"
-  layout="ordered"
   emptyMessage="Try a shorter phrase, remove a tag, or broaden media and language filters."
   bulk={{ enabled: true, saveEnabled: true, collectionOptions: bulkOptions, guidance: bulkGuidance }}
   showAccessMarkers={Boolean(session)}

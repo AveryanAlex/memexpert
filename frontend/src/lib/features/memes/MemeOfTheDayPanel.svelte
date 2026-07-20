@@ -78,6 +78,8 @@
           exposureId={current.attribution?.impression_id}
           exposurePlacement={`meme-of-the-day:${current.meme.id}`}
           {showAccessMarkers}
+          showZoom={true}
+          videoPreviewMode="poster"
         />
       </div>
     {:else}

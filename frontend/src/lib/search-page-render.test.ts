@@ -1,7 +1,7 @@
 import { render } from 'svelte/server';
 import { describe, expect, it } from 'vitest';
 
-import type { CurrentSessionRead, PublicMemeSearchPageRead, WebCollectionListRead } from '$lib/api/types';
+import type { CurrentSessionRead, MemeResultAttributionRead, PublicMemeCardRead, PublicMemeSearchPageRead, WebCollectionListRead } from '$lib/api/types';
 import { parseSearchParams } from '$lib/searchParams';
 import SearchPage from '../routes/search/+page.svelte';
 
@@ -136,6 +136,30 @@ describe('/search page', () => {
     expect(text).toContain('Retry');
     expect(text).not.toContain('Browse everything');
   });
+
+  it('renders populated results in backend order through the hydration-stable masonry fallback', () => {
+    const { body } = render(SearchPage, {
+      props: {
+        data: {
+          session: null,
+          sessionError: null,
+          page: populatedPage(),
+          collections: null,
+          filters: parseSearchParams(new URLSearchParams('q=ranked')),
+          seo: { canonicalUrl: 'https://memexpert.test/search?q=ranked', noindex: true },
+          errorMessage: null,
+          collectionErrorMessage: null
+        }
+      }
+    });
+
+    expect(body).toContain('data-layout="masonry"');
+    expect(body).toContain('data-masonry-state="pending"');
+    expect(body.indexOf('First ranked result')).toBeLessThan(body.indexOf('Second ranked result'));
+    expect(body.indexOf('Second ranked result')).toBeLessThan(body.indexOf('Third ranked result'));
+    expect(body).toContain('aria-posinset="1"');
+    expect(body).toContain('aria-setsize="3"');
+  });
 });
 
 function visibleText(body: string): string {
@@ -156,6 +180,67 @@ function emptyPage(): PublicMemeSearchPageRead {
     total: 0,
     has_more: false,
     request_id: 'req_empty'
+  };
+}
+
+function populatedPage(): PublicMemeSearchPageRead {
+  const captions = ['First ranked result', 'Second ranked result', 'Third ranked result'];
+  return {
+    items: captions.map((caption, index) => ({
+      meme: searchMeme(`rank-${index + 1}`, caption),
+      attribution: searchAttribution(index + 1)
+    })),
+    limit: 12,
+    offset: 0,
+    total: captions.length,
+    has_more: false,
+    request_id: 'req_ranked'
+  };
+}
+
+function searchMeme(id: string, caption: string): PublicMemeCardRead {
+  return {
+    id,
+    media_type: 'image',
+    language: 'en',
+    is_nsfw: false,
+    popularity_score: 1,
+    like_count: 0,
+    tags: ['ranked'],
+    primary_file: null,
+    caption,
+    seo_page_slug: null,
+    viewer_has_favorited: false,
+    viewer_has_saved: false,
+    viewer_has_pinned: false,
+    created_at: '2026-01-01T00:00:00Z',
+    updated_at: '2026-01-01T00:00:00Z'
+  };
+}
+
+function searchAttribution(rank: number): MemeResultAttributionRead {
+  return {
+    request_id: 'req_ranked',
+    impression_id: `imp_rank_${rank}`,
+    surface: 'web_search',
+    source_algorithm: 'search',
+    rank,
+    query: 'ranked',
+    filters: {
+      language: null,
+      media_type: null,
+      include_nsfw: false,
+      tags: [],
+      scope: 'public',
+      collection_ids: []
+    },
+    collection_scope: null,
+    collection_ids: [],
+    source_meme_id: null,
+    algorithm_version: 'test-v1',
+    score: null,
+    score_components: {},
+    reason: null
   };
 }
 

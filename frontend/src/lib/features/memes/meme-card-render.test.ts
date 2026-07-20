@@ -124,15 +124,16 @@ describe('MemeCard', () => {
     expect(publicCard.body).not.toContain('Private');
   });
 
-  it('keeps backend result order in the ordered search layout', () => {
+  it('keeps backend result order in the shared masonry DOM', () => {
     const memes = [
       memeCard({ id: 'first', caption: 'First result' }),
       memeCard({ id: 'second', caption: 'Second result' }),
       memeCard({ id: 'third', caption: 'Third result' })
     ];
-    const { body } = render(MemeGrid, { props: { memes, layout: 'ordered' } });
+    const { body } = render(MemeGrid, { props: { memes } });
 
-    expect(body).toContain('data-layout="ordered"');
+    expect(body).toContain('data-layout="masonry"');
+    expect(body).toContain('data-masonry-state="pending"');
     expect(body.indexOf('First result')).toBeLessThan(body.indexOf('Second result'));
     expect(body.indexOf('Second result')).toBeLessThan(body.indexOf('Third result'));
   });

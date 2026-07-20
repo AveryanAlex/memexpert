@@ -1,9 +1,10 @@
 <script lang="ts">
   import { readAuthState } from '$lib/auth-state';
   import MemeCard from '$lib/features/memes/MemeCard.svelte';
+  import type { MemeVideoPreviewMode } from '$lib/features/memes/meme-video';
   import type { PublicTrendTimelineMemeRead } from '$lib/api/types';
   import { trendTimelineHref } from '$lib/features/trends/params';
-  import { ActionLink, Card, EmptyState, Notice, PageHeader, PillLink } from '$lib/ui';
+  import { ActionLink, Card, EmptyState, Masonry, Notice, PageHeader, PillLink } from '$lib/ui';
   import type { PageData } from './$types';
 
   let { data }: { data: PageData } = $props();
@@ -61,6 +62,15 @@
   function count(value: number | null | undefined): number {
     return typeof value === 'number' && Number.isFinite(value) ? Math.max(value, 0) : 0;
   }
+
+  function timelineMemeKey(item: PublicTrendTimelineMemeRead): string {
+    return item.meme.id;
+  }
+
+  function cardVideoPreviewMode(columnCount: number, ready: boolean): MemeVideoPreviewMode {
+    if (!ready || columnCount === 0) return 'poster';
+    return columnCount === 1 ? 'viewport' : 'hover';
+  }
 </script>
 
 <PageHeader
@@ -99,21 +109,35 @@
         </div>
 
         {#if period.top_memes.length > 0}
-          <div class="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-            {#each period.top_memes as item (`${period.period}:${item.meme.id}`)}
-              <div class="grid gap-3 rounded-xl border border-line bg-cream/60 p-3">
+          <Masonry
+            items={period.top_memes}
+            getKey={timelineMemeKey}
+            maxColumns={3}
+            element="section"
+            aria-label={`Top memes from ${periodLabel(period.period_start, data.granularity)}`}
+            role="list"
+          >
+            {#snippet children(item, index, layout)}
+              <div
+                class="grid gap-3 rounded-xl border border-line bg-cream/60 p-3"
+                role="listitem"
+                aria-posinset={index + 1}
+                aria-setsize={period.top_memes.length}
+              >
                 <MemeCard
                   meme={item.meme}
                   exposurePlacement={`timeline:${period.period}:${item.meme.id}`}
                   showAccessMarkers={Boolean(session)}
+                  showZoom={layout.ready && layout.columnCount > 1}
+                  videoPreviewMode={cardVideoPreviewMode(layout.columnCount, layout.ready)}
                 />
                 <div class="grid gap-1 text-sm">
                   <p class="m-0 font-semibold text-ink">Recorded activity · {activitySummary(item)}</p>
                   <p class="m-0 text-muted">{activityBreakdown(item)}</p>
                 </div>
               </div>
-            {/each}
-          </div>
+            {/snippet}
+          </Masonry>
         {:else}
           <p class="m-0 text-muted">No public memes from this time are ready to revisit yet.</p>
         {/if}

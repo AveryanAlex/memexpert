@@ -4,7 +4,7 @@
   import { recordMemeDownload } from '$lib/api/client';
   import type { MemeResultAttributionRead, PublicMemeCardRead } from '$lib/api/types';
   import { memeActionAttributionBody, memeTitle } from '$lib/memeActions';
-  import { Button, Select } from '$lib/ui';
+  import { Button, Masonry, Select } from '$lib/ui';
   import { Download } from '@lucide/svelte';
   import {
     bulkDownloadItems,
@@ -15,7 +15,6 @@
   import { memeDiscoveryDataAttributes } from './discovery-attribution';
   import MemeCard from './MemeCard.svelte';
   import type { MemeVideoPreviewMode } from './meme-video';
-  import { buildMasonryColumns, masonryColumnCount, masonryColumnWidth } from './masonry-layout';
 
   let {
     memes,
@@ -23,7 +22,6 @@
     attributions = {},
     bulk = { enabled: false },
     showAccessMarkers = false,
-    layout = 'masonry',
     exposureScope
   }: {
     memes: PublicMemeCardRead[];
@@ -31,7 +29,6 @@
     attributions?: Record<string, MemeResultAttributionRead | null | undefined>;
     bulk?: MemeGridBulkOptions;
     showAccessMarkers?: boolean;
-    layout?: 'masonry' | 'ordered';
     exposureScope?: string;
   } = $props();
 
@@ -40,16 +37,9 @@
   let targetCollectionId = $state('');
   let pendingAction = $state<string | null>(null);
   let statusMessage = $state<string | null>(null);
-  let gridElement = $state<HTMLElement>();
-  let gridWidth = $state(0);
-  let renderedColumnCount = $state(0);
+  let renderedColumnCount = $state(1);
+  let masonryReady = $state(false);
   let hydrated = $state(false);
-
-  const columnCount = $derived(masonryColumnCount(gridWidth));
-  const columnWidth = $derived(masonryColumnWidth(gridWidth, columnCount));
-  // Preserve backend ranking by processing memes strictly in array order. Each meme is appended to
-  // the current shortest estimated column, so the layout is deterministic without random shuffling.
-  const masonryColumns = $derived(buildMasonryColumns(memes, columnCount, columnWidth));
 
   const bulkEnabled = $derived(Boolean(bulk.enabled));
   const selected = $derived(selectedMemes(memes, selectedIds));
@@ -60,9 +50,9 @@
   const canRemoveFromCollection = $derived(Boolean(bulk.removeEnabled && bulk.removeCollectionId));
   const toolbarSummary = $derived(bulkToolbarSummary(memes.length, selected.length, downloadable.length));
   const memePositions = $derived(new Map(memes.map((meme, index) => [meme.id, index + 1])));
-  const exposureScopeKey = $derived(exposureScope?.trim() || `grid:${label}:${layout}`);
+  const exposureScopeKey = $derived(exposureScope?.trim() || `grid:${label}:masonry`);
   const videoPreviewMode = $derived<MemeVideoPreviewMode>(
-    !hydrated || renderedColumnCount === 0 ? 'poster' : renderedColumnCount === 1 ? 'viewport' : 'hover'
+    !hydrated || !masonryReady ? 'poster' : renderedColumnCount === 1 ? 'viewport' : 'hover'
   );
 
   $effect(() => {
@@ -88,34 +78,6 @@
     hydrated = true;
   });
 
-  $effect(() => {
-    if (!browser || !gridElement) return;
-
-    let measurementFrame = 0;
-    const updateGridWidth = () => {
-      const width = gridElement?.clientWidth ?? 0;
-      gridWidth = width;
-      if (layout === 'masonry') {
-        renderedColumnCount = masonryColumnCount(width);
-        return;
-      }
-      window.cancelAnimationFrame(measurementFrame);
-      measurementFrame = window.requestAnimationFrame(() => {
-        if (!gridElement) return;
-        const tracks = window.getComputedStyle(gridElement).gridTemplateColumns.trim();
-        renderedColumnCount = tracks && tracks !== 'none' ? tracks.split(/\s+/).length : 1;
-      });
-    };
-    const observer = new ResizeObserver(updateGridWidth);
-    updateGridWidth();
-    observer.observe(gridElement);
-
-    return () => {
-      observer.disconnect();
-      window.cancelAnimationFrame(measurementFrame);
-    };
-  });
-
   function toggleSelection(memeId: string) {
     statusMessage = null;
     selectedIds = selectedIds.includes(memeId) ? selectedIds.filter((id) => id !== memeId) : [...selectedIds, memeId];
@@ -123,6 +85,10 @@
 
   function exposureIdFor(attribution: MemeResultAttributionRead | null | undefined): string | undefined {
     return attribution?.impression_id;
+  }
+
+  function memeKey(meme: PublicMemeCardRead): string {
+    return meme.id;
   }
 
   function startSelection() {
@@ -312,48 +278,42 @@
   <p class="mb-3 text-sm text-muted" role="status">{statusMessage}</p>
 {/if}
 
-{#snippet gridItem(meme: PublicMemeCardRead)}
-  {@const attribution = attributions[meme.id]}
-  {@const discoveryAttributes = memeDiscoveryDataAttributes(attribution)}
-  <div
-    class="relative min-w-0 max-w-full"
-    role="presentation"
-    {...discoveryAttributes}
-  >
-    {#if selectionMode}
-      <label class="absolute left-3 top-3 z-20 inline-flex items-center gap-2 rounded-full border border-line bg-paper/95 px-3 py-2 text-sm font-extrabold shadow-warm">
-        <input type="checkbox" checked={selectedIds.includes(meme.id)} onchange={() => toggleSelection(meme.id)} aria-label={`Select ${memeTitle(meme)}`} />
-        Select
-      </label>
-    {/if}
-    <MemeCard
-      {meme}
-      {attribution}
-      exposureId={exposureIdFor(attribution)}
-      exposurePlacement={`${exposureScopeKey}:${memePositions.get(meme.id) ?? 0}:${meme.id}`}
-      position={memePositions.get(meme.id)}
-      total={memes.length}
-      {showAccessMarkers}
-      showZoom={renderedColumnCount > 1}
-      {videoPreviewMode}
-    />
-  </div>
-{/snippet}
-
-{#if layout === 'ordered'}
-  <section bind:this={gridElement} class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4" aria-label={label} data-column-count={renderedColumnCount} data-layout="ordered" data-video-preview-mode={videoPreviewMode} role="list" aria-busy={pendingAction !== null}>
-    {#each memes as meme (meme.id)}
-      {@render gridItem(meme)}
-    {/each}
-  </section>
-{:else}
-  <section bind:this={gridElement} class="flex gap-4" aria-label={label} data-column-count={columnCount} data-layout="masonry" data-video-preview-mode={videoPreviewMode} role="list" aria-busy={pendingAction !== null}>
-    {#each masonryColumns as column (column.id)}
-      <div class="grid min-w-0 flex-1 content-start gap-4" role="presentation">
-        {#each column.items as meme (meme.id)}
-          {@render gridItem(meme)}
-        {/each}
-      </div>
-    {/each}
-  </section>
-{/if}
+<Masonry
+  bind:columnCount={renderedColumnCount}
+  bind:ready={masonryReady}
+  items={memes}
+  getKey={memeKey}
+  element="section"
+  aria-label={label}
+  data-video-preview-mode={videoPreviewMode}
+  role="list"
+  busy={pendingAction !== null}
+>
+  {#snippet children(meme)}
+    {@const attribution = attributions[meme.id]}
+    {@const discoveryAttributes = memeDiscoveryDataAttributes(attribution)}
+    <div
+      class="relative min-w-0 max-w-full"
+      role="presentation"
+      {...discoveryAttributes}
+    >
+      {#if selectionMode}
+        <label class="absolute left-3 top-3 z-20 inline-flex items-center gap-2 rounded-full border border-line bg-paper/95 px-3 py-2 text-sm font-extrabold shadow-warm">
+          <input type="checkbox" checked={selectedIds.includes(meme.id)} onchange={() => toggleSelection(meme.id)} aria-label={`Select ${memeTitle(meme)}`} />
+          Select
+        </label>
+      {/if}
+      <MemeCard
+        {meme}
+        {attribution}
+        exposureId={exposureIdFor(attribution)}
+        exposurePlacement={`${exposureScopeKey}:${memePositions.get(meme.id) ?? 0}:${meme.id}`}
+        position={memePositions.get(meme.id)}
+        total={memes.length}
+        {showAccessMarkers}
+        showZoom={masonryReady && renderedColumnCount > 1}
+        {videoPreviewMode}
+      />
+    </div>
+  {/snippet}
+</Masonry>

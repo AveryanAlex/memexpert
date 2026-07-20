@@ -65,11 +65,11 @@ The filter disclosure contains tags/categories, media type, language, sensitive-
 
 Search state remains URL-backed and shareable. Query, tags, sensitive-content choice, media type, language, scope, selected collections, and offset retain their established URL semantics; an incoming collection-scoped link is still subject to the recipient's access permissions.
 
-### Search Ordering and Discover Masonry
+### Rank-aware Masonry
 
-Discover may use a dense, aspect-ratio-preserving masonry layout because browsing benefits from reduced gaps across mixed image, GIF, video, and text sizes. The masonry assignment is deterministic and consumes the backend array in order, but it optimizes visual density rather than promising a strict visual relevance sequence.
+Search, Discover, Saved, taxonomy galleries, related memes, Trends, and Timeline use the same aspect-ratio-preserving measured masonry behavior. Cards stay in one flat DOM list in backend order. Their visual placement is also rank-aware: rank 1 is top-left, a later card's top edge never appears above an earlier card's top edge, and cards sharing a top edge follow rank from left to right. This retains relevance and keyboard order while avoiding the large row gaps produced by mixed image, GIF, video, and text heights.
 
-Search uses an ordered responsive grid instead of masonry. Cards are rendered in the backend-ranked order so users can read relevance-ranked results, compare meme text, and continue through paginated results without a masonry layout obscuring the order. On mobile, both layouts reduce to one column. Infinite loading appends only unseen meme IDs and does not reorder cards already shown.
+Server rendering emits the complete semantic list in backend order. With JavaScript enabled, cards are not shown first in a fallback grid and then visibly rearranged during hydration; initial measurement and coordinates are applied before the cards are revealed together. Without JavaScript or measurement support, the ordered responsive grid remains usable. Infinite loading appends only unseen meme IDs, keeps existing cards in place, and reveals each appended batch only after it has been measured.
 
 ## Saved Library and Account
 
@@ -164,7 +164,7 @@ The Mini App keeps the same routes and consumer actions while adapting the shell
 
 - Navigation has named landmarks, visible mobile labels, active-page state, and keyboard-visible focus treatment.
 - Card media/detail links, direct actions, overflow menus, selection controls, dialogs, disclosures, and live action status are keyboard reachable and labeled.
-- Grids retain list semantics and rank/position metadata where available. Search's ordered layout keeps keyboard and DOM traversal aligned with backend ranking.
+- Grids retain list semantics and rank/position metadata where available. Flat DOM order keeps keyboard and assistive-technology traversal aligned with backend ranking on every masonry surface.
 - Infinite feeds retain loading, retry, count, end-state, and accessible **Load more** behavior even when automatic intersection loading is available.
 - Charts provide titles/descriptions and adjacent tables or summaries for exact values. Dialogs and mobile filter sheets must remain operable with keyboard and assistive technology.
 

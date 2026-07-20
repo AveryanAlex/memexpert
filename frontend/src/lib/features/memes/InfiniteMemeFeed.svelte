@@ -27,7 +27,6 @@
     emptyMessage = 'Try a shorter phrase, a different synonym, or clear the filters to browse.',
     bulk = { enabled: false },
     showAccessMarkers = false,
-    layout = 'masonry',
     summary,
     emptyAction
   }: {
@@ -40,7 +39,6 @@
     emptyMessage?: string;
     bulk?: MemeGridBulkOptions;
     showAccessMarkers?: boolean;
-    layout?: 'masonry' | 'ordered';
     summary?: Snippet;
     emptyAction?: Snippet;
   } = $props();
@@ -191,7 +189,7 @@
     {#if emptyAction}{@render emptyAction()}{/if}
   </EmptyState>
 {:else}
-  <MemeGrid {memes} {label} {attributions} {bulk} {showAccessMarkers} {layout} />
+  <MemeGrid {memes} {label} {attributions} {bulk} {showAccessMarkers} />
 {/if}
 
 <div bind:this={sentinel} aria-hidden="true" class="h-1"></div>
