@@ -13,8 +13,8 @@ from sqlalchemy.orm import selectinload
 
 from memexpert.core.config import Settings, get_settings
 from memexpert.core.storage import (
-    build_preview_image_object_key,
     delete_object_if_present,
+    derive_preview_image_object_key,
     get_pipeline_storage_settings,
     get_s3_client,
 )
@@ -27,7 +27,10 @@ from memexpert.models.enums import (
     CollectionKind,
     CollectionMembershipRole,
     CollectionVisibility,
+    MediaGenerationCleanupStatus,
+    MediaGenerationStatus,
 )
+from memexpert.models.operations import MediaGeneration
 from memexpert.models.user import User
 from memexpert.schemas import (
     CollectionInviteRead,
@@ -1236,7 +1239,12 @@ class CollectionService:
         if await self._meme_has_collection_references(meme.id):
             return ()
 
-        object_keys = _object_keys_for_meme_files(meme.files, settings=self._settings)
+        generations = await self._prepare_media_generation_cleanup(meme.files)
+        object_keys = _object_keys_for_meme_files(
+            meme.files,
+            generations=generations,
+            settings=self._settings,
+        )
         await self._session.execute(delete(Meme).where(Meme.id == meme.id))
         return object_keys
 
@@ -1252,9 +1260,47 @@ class CollectionService:
         for meme in memes:
             if await self._meme_has_other_collection_references(meme.id, collection_id=collection_id):
                 continue
-            object_keys.extend(_object_keys_for_meme_files(meme.files, settings=self._settings))
+            generations = await self._prepare_media_generation_cleanup(meme.files)
+            object_keys.extend(
+                _object_keys_for_meme_files(
+                    meme.files,
+                    generations=generations,
+                    settings=self._settings,
+                )
+            )
             await self._session.execute(delete(Meme).where(Meme.id == meme.id))
         return tuple(dict.fromkeys(object_keys))
+
+    async def _prepare_media_generation_cleanup(self, files: list[MemeFile]) -> list[MediaGeneration]:
+        file_ids = [file.id for file in files]
+        if not file_ids:
+            return []
+        generations = (
+            (
+                await self._session.execute(
+                    select(MediaGeneration)
+                    .where(MediaGeneration.meme_file_id.in_(file_ids))
+                    .with_for_update()
+                )
+            )
+            .scalars()
+            .all()
+        )
+        now = datetime.now(UTC)
+        active_ids = {
+            file.active_media_generation_id
+            for file in files
+            if file.active_media_generation_id is not None
+        }
+        for generation in generations:
+            generation.status = (
+                MediaGenerationStatus.SUPERSEDED
+                if generation.id in active_ids
+                else MediaGenerationStatus.STALE
+            )
+            generation.superseded_at = generation.superseded_at or now
+            generation.cleanup_status = MediaGenerationCleanupStatus.PENDING
+        return list(generations)
 
     async def _meme_has_collection_references(self, meme_id: object) -> bool:
         count = await self._session.scalar(
@@ -1399,13 +1445,27 @@ def _normalize_collection_title(title: str) -> str:
     return normalized_title
 
 
-def _object_keys_for_meme_files(files: list[MemeFile], *, settings: Settings | None) -> tuple[str, ...]:
+def _object_keys_for_meme_files(
+    files: list[MemeFile],
+    *,
+    generations: list[MediaGeneration] | None = None,
+    settings: Settings | None,
+) -> tuple[str, ...]:
     object_keys: list[str] = []
     for file in files:
         object_keys.append(file.s3_original_key)
         if file.s3_web_video_key is not None:
-            object_keys.append(build_preview_image_object_key(file.id, settings=settings))
+            object_keys.append(
+                derive_preview_image_object_key(
+                    file.s3_web_video_key,
+                    meme_file_id=file.id,
+                    settings=settings,
+                )
+            )
             object_keys.append(file.s3_web_video_key)
+    for generation in generations or []:
+        object_keys.append(generation.preview_image_object_key)
+        object_keys.append(generation.web_video_object_key)
     return tuple(dict.fromkeys(object_keys))
 
 

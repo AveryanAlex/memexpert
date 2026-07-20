@@ -44,8 +44,13 @@ class PipelineDatabaseService:
 
         return cls(session, settings=settings)
 
-    async def _get_meme_file(self, meme_file_id: uuid.UUID) -> MemeFile:
-        result = await self._session.execute(
+    async def _get_meme_file(
+        self,
+        meme_file_id: uuid.UUID,
+        *,
+        for_update: bool = False,
+    ) -> MemeFile:
+        statement = (
             select(MemeFile)
             .options(
                 selectinload(MemeFile.meme),
@@ -55,6 +60,13 @@ class PipelineDatabaseService:
             )
             .where(MemeFile.id == meme_file_id)
         )
+        if for_update:
+            # ``populate_existing`` is required here: a long-lived worker session
+            # may already have loaded the file before another delivery activated a
+            # generation.  The row lock alone must not leave that stale pointer in
+            # the identity map.
+            statement = statement.with_for_update(of=MemeFile).execution_options(populate_existing=True)
+        result = await self._session.execute(statement)
         meme_file = result.scalar_one_or_none()
         if meme_file is None:
             raise PipelineItemNotFoundError(f"Pipeline item {meme_file_id} does not exist.")
@@ -87,12 +99,28 @@ class PipelineDatabaseService:
         self,
         meme_file_id: uuid.UUID,
         stage: ContentPipelineStage,
+        *,
+        for_update: bool = False,
     ) -> tuple[MemeFile, PipelineStageJournal]:
-        meme_file = await self._get_meme_file(meme_file_id)
-        stage_entry = next(
-            (entry for entry in meme_file.pipeline_stage_journal_entries if entry.stage is stage),
-            None,
-        )
+        meme_file = await self._get_meme_file(meme_file_id, for_update=for_update)
+        if for_update:
+            # Lock aggregate rows in the same file -> stage order used by media
+            # generation reservation.  The separate select also refreshes a
+            # journal row that may already be present in this session.
+            stage_entry = await self._session.scalar(
+                select(PipelineStageJournal)
+                .where(
+                    PipelineStageJournal.meme_file_id == meme_file_id,
+                    PipelineStageJournal.stage == stage,
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        else:
+            stage_entry = next(
+                (entry for entry in meme_file.pipeline_stage_journal_entries if entry.stage is stage),
+                None,
+            )
         if stage_entry is None:
             raise PipelineIngestError(
                 f"Pipeline item {meme_file_id} does not have durable journal state for stage {stage.value}."

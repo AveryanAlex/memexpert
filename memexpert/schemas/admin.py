@@ -40,6 +40,8 @@ from memexpert.models.enums import (
     ModerationReportStatus,
     PipelineIngestRequestStatus,
     RecoveryCapability,
+    RecoveryReplayScope,
+    RecoveryWorkKind,
     SourcePlatform,
     SyncTargetStatus,
     TelegramSessionStatus,
@@ -1161,6 +1163,109 @@ class AdminModerationReportResolveRequest(BaseModel):
         return normalize_optional_text(value)
 
 
+class AdminMemeMediaObservationRead(BaseModel):
+    """Safe source/output media facts shown to an admin without object identifiers."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    width: int | None = None
+    height: int | None = None
+    frame_rate: float | str | None = None
+    duration_seconds: float | None = None
+    bitrate_bps: int | None = None
+    file_size_bytes: int | None = None
+    video_codec: str | None = None
+    audio_codec: str | None = None
+    pixel_format: str | None = None
+    video_profile: str | None = None
+    video_level: str | int | None = None
+
+
+class AdminMemeProcessingActionScopeRequirementsRead(BaseModel):
+    """Effective warnings, risks, and acknowledgements for one replay scope."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    warnings: list[str] = Field(default_factory=list)
+    risks: list[str] = Field(default_factory=list)
+    required_acknowledgements: list[str] = Field(default_factory=list)
+
+
+class AdminMemeProcessingActionRead(BaseModel):
+    """One backend-owned replay option, including blockers and acknowledgements."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    capability: RecoveryCapability
+    available: bool
+    scopes: list[RecoveryReplayScope] = Field(default_factory=list)
+    default_scope: RecoveryReplayScope | None = None
+    retry_limits: list[int] = Field(default_factory=lambda: [1, 3, 5])
+    default_retry_limit: int = 3
+    downstream_stages: list[ContentPipelineStage] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    risks: list[str] = Field(default_factory=list)
+    required_acknowledgements: list[str] = Field(default_factory=list)
+    scope_requirements: dict[
+        RecoveryReplayScope,
+        AdminMemeProcessingActionScopeRequirementsRead,
+    ] = Field(default_factory=dict)
+    blocked_prerequisites: list[str] = Field(default_factory=list)
+
+
+class AdminMemeProcessingJobRead(BaseModel):
+    """Compact active replay-job reference embedded in processing detail."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: uuid.UUID
+    status: str
+    action: RecoveryCapability
+
+
+class AdminMemeProcessingStageRead(BaseModel):
+    """Current durable state and controls for one attached file stage."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    stage: ContentPipelineStage
+    status: ContentPipelineStageStatus
+    attempt_count: int = Field(ge=0)
+    version: str
+    work_kind: RecoveryWorkKind = RecoveryWorkKind.PIPELINE_STAGE
+    work_id: str
+    safe_error: str | None = None
+    normalized_reason: str | None = None
+    actions: list[AdminMemeProcessingActionRead] = Field(default_factory=list)
+    active_job: AdminMemeProcessingJobRead | None = None
+
+
+class AdminMemeProcessingFileRead(BaseModel):
+    """All safe processing and active-derivative facts for one attached file."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: uuid.UUID
+    is_primary: bool
+    status: str
+    mime_type: str | None = None
+    width: int | None = None
+    height: int | None = None
+    file_size_bytes: int | None = None
+    source_has_audio: bool | None = None
+    web_video_has_audio: bool | None = None
+    web_video_profile: str | None = None
+    web_video_verified_at: datetime | None = None
+    original: AdminMemeMediaObservationRead | None = None
+    output: AdminMemeMediaObservationRead | None = None
+    stages: list[AdminMemeProcessingStageRead] = Field(default_factory=list)
+    actions: list[AdminMemeProcessingActionRead] = Field(default_factory=list)
+    version: str | None = None
+    work_kind: RecoveryWorkKind | None = None
+    work_id: str | None = None
+    active_job: AdminMemeProcessingJobRead | None = None
+
+
 class AdminMemeDetailRead(BaseModel):
     """Admin meme detail bundle for the browser management page."""
 
@@ -1169,6 +1274,7 @@ class AdminMemeDetailRead(BaseModel):
     meme: AdminMemeRead
     reports: list[AdminModerationReportRead]
     decisions: list[AdminModerationDecisionRead]
+    processing_files: list[AdminMemeProcessingFileRead] = Field(default_factory=list)
 
 
 __all__ = [
@@ -1186,6 +1292,11 @@ __all__ = [
     "AdminMemeDeleteRequest",
     "AdminMemeDetailRead",
     "AdminMemeDestructiveActionRead",
+    "AdminMemeMediaObservationRead",
+    "AdminMemeProcessingActionRead",
+    "AdminMemeProcessingFileRead",
+    "AdminMemeProcessingJobRead",
+    "AdminMemeProcessingStageRead",
     "AdminMemeSeoEditRequest",
     "AdminMemeSeoPageRead",
     "AdminMemeSeoRegenerateRequest",

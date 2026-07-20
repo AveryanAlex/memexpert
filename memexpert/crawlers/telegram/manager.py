@@ -96,6 +96,7 @@ _BACKFILL_LOCK_TIMEOUT = timedelta(minutes=5)
 _BACKFILL_PAGE_SIZE = 100
 _BACKFILL_MAX_AUTOMATIC_ATTEMPTS = 5
 _BACKFILL_RETRY_BASE_SECONDS = 30.0
+_NON_STAGE_BUDGET_BASE_KEY = "non_stage_budget_consumed_at_dispatch"
 
 
 @dataclass(slots=True)
@@ -580,6 +581,28 @@ class TelegramSessionManager:
             await db_session.commit()
             return None
 
+        recovery_item = await db_session.scalar(
+            select(RecoveryJobItem)
+            .where(
+                RecoveryJobItem.work_kind == RecoveryWorkKind.BACKFILL,
+                RecoveryJobItem.work_id == str(job.id),
+                RecoveryJobItem.status == RecoveryJobItemStatus.DISPATCHED,
+            )
+            .order_by(RecoveryJobItem.dispatched_at.desc(), RecoveryJobItem.id.desc())
+            .limit(1)
+        )
+        if recovery_item is not None:
+            consumed = await self._backfill_recovery_failures_consumed(db_session, recovery_item)
+            if consumed >= recovery_item.retry_limit:
+                job.status = SourceChannelBackfillJobStatus.FAILED
+                job.is_retryable = True
+                job.next_attempt_at = None
+                job.completed_at = now
+                job.locked_at = None
+                job.lock_owner = None
+                await db_session.commit()
+                return None
+
         open_attempt = await db_session.scalar(
             select(SourceChannelBackfillAttempt).where(
                 SourceChannelBackfillAttempt.backfill_job_id == job.id,
@@ -589,16 +612,6 @@ class TelegramSessionManager:
         job.lease_generation += 1
         if open_attempt is None:
             job.attempt_count += 1
-            recovery_item_id = await db_session.scalar(
-                select(RecoveryJobItem.id)
-                .where(
-                    RecoveryJobItem.work_kind == RecoveryWorkKind.BACKFILL,
-                    RecoveryJobItem.work_id == str(job.id),
-                    RecoveryJobItem.status == RecoveryJobItemStatus.DISPATCHED,
-                )
-                .order_by(RecoveryJobItem.dispatched_at.desc())
-                .limit(1)
-            )
             source_channel = await db_session.get(SourceChannel, job.source_channel_id)
             db_session.add(
                 SourceChannelBackfillAttempt(
@@ -606,7 +619,7 @@ class TelegramSessionManager:
                     attempt_number=job.attempt_count,
                     lease_generation=job.lease_generation,
                     telegram_session_id=(source_channel.telegram_session_id if source_channel is not None else None),
-                    recovery_item_id=recovery_item_id,
+                    recovery_item_id=recovery_item.id if recovery_item is not None else None,
                     worker_instance_id=self._backfill_worker_id,
                     started_at=now,
                 )
@@ -758,7 +771,25 @@ class TelegramSessionManager:
         manual_only: bool = False,
     ) -> None:
         now = utcnow()
-        exhausted = job.attempt_count >= _BACKFILL_MAX_AUTOMATIC_ATTEMPTS
+        open_attempt = await db_session.scalar(
+            select(SourceChannelBackfillAttempt)
+            .where(
+                SourceChannelBackfillAttempt.backfill_job_id == job.id,
+                SourceChannelBackfillAttempt.finished_at.is_(None),
+            )
+            .order_by(SourceChannelBackfillAttempt.attempt_number.desc())
+            .limit(1)
+        )
+        recovery_item = (
+            await db_session.get(RecoveryJobItem, open_attempt.recovery_item_id)
+            if open_attempt is not None and open_attempt.recovery_item_id is not None
+            else None
+        )
+        if recovery_item is None:
+            exhausted = job.attempt_count >= _BACKFILL_MAX_AUTOMATIC_ATTEMPTS
+        else:
+            consumed_before = await self._backfill_recovery_failures_consumed(db_session, recovery_item)
+            exhausted = consumed_before + int(not manual_only) >= recovery_item.retry_limit
         job.status = (
             SourceChannelBackfillJobStatus.FAILED
             if manual_only or exhausted
@@ -790,9 +821,27 @@ class TelegramSessionManager:
             error_class=job.last_error_class,
             error_text=job.last_error_text,
             failed_post_id=failed_post_id,
-            is_retryable=True,
+            is_retryable=not manual_only,
         )
         await db_session.commit()
+
+    @staticmethod
+    async def _backfill_recovery_failures_consumed(
+        db_session: AsyncSession,
+        recovery_item: RecoveryJobItem,
+    ) -> int:
+        retryable_failures = int(
+            await db_session.scalar(
+                select(func.count(SourceChannelBackfillAttempt.id)).where(
+                    SourceChannelBackfillAttempt.recovery_item_id == recovery_item.id,
+                    SourceChannelBackfillAttempt.finished_at.is_not(None),
+                    SourceChannelBackfillAttempt.is_retryable.is_(True),
+                )
+            )
+            or 0
+        )
+        base = recovery_item.previous_stage_state.get(_NON_STAGE_BUDGET_BASE_KEY)
+        return (base if isinstance(base, int) and base >= 0 else 0) + retryable_failures
 
     async def _complete_backfill_job(
         self,

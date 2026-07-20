@@ -21,6 +21,7 @@ from memexpert.api.dependencies.meme import get_analytics_service, get_meme_sear
 from memexpert.core.config import Settings, get_settings
 from memexpert.core.qdrant import QdrantSimilarityMatch, QdrantUserSearchMatch
 from memexpert.core.search_index_prefilter import SearchIndexPrefilter, SearchIndexPrefilterScope
+from memexpert.core.storage import media_object_version_token
 from memexpert.core.voyage import VoyageEmbeddingResult
 from memexpert.models.collection import Collection, CollectionMember, CollectionMeme, PinnedMeme
 from memexpert.models.content import (
@@ -3139,6 +3140,12 @@ async def test_public_video_detail_uses_direct_media_base_without_imgproxy(
         s3_web_video_key="pipeline/derived/private/web.mp4",
         mime_type="video/mp4",
     )
+    assert meme.primary_file_id is not None
+    generation_id = uuid.UUID("22222222-2222-7222-8222-222222222223")
+    active_video_key = f"pipeline/derived/{meme.primary_file_id}/generations/{generation_id}/web.mp4"
+    primary_file = await migrated_db_session.get(MemeFile, meme.primary_file_id)
+    assert primary_file is not None
+    primary_file.s3_web_video_key = active_video_key
     await migrated_db_session.commit()
     settings = Settings.model_validate(
         {
@@ -3156,7 +3163,10 @@ async def test_public_video_detail_uses_direct_media_base_without_imgproxy(
     assert detail.primary_file is not None
     assert detail.primary_file.render is not None
     assert detail.primary_file.render.web_video_url is not None
-    assert detail.primary_file.render.web_video_url.startswith("https://media.memexpert.test/files/")
+    version = media_object_version_token(active_video_key)
+    assert detail.primary_file.render.web_video_url == (
+        f"https://media.memexpert.test/files/{meme.primary_file_id}/web-video.mp4?v={version}"
+    )
     assert "img.memexpert.test" not in detail.primary_file.render.web_video_url
 
 

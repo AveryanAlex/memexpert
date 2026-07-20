@@ -27,15 +27,21 @@ from memexpert.crawlers.telegram.manager import TelegramSessionManager
 from memexpert.ingest.crawler_service import PipelineCrawlerIngestService
 from memexpert.models.content import PipelineIngestRequest, SourceChannel, SourceChannelBackfillJob, TelegramSession
 from memexpert.models.enums import (
+    RecoveryCapability,
+    RecoveryJobItemStatus,
+    RecoveryJobStatus,
+    RecoveryWorkKind,
     SourceChannelBackfillJobStatus,
     SourceEngagementScheduleLabel,
     SourcePlatform,
     TelegramSessionStatus,
 )
-from memexpert.models.operations import SourceChannelBackfillAttempt
+from memexpert.models.operations import RecoveryJob, RecoveryJobItem, SourceChannelBackfillAttempt
+from memexpert.models.user import User
 from memexpert.pipeline.events import SourceEngagementCaptureRequestedEvent, build_source_engagement_session_key
 from memexpert.schemas.content_pipeline import CrawlerIngestOutcome
 from memexpert.services import CrawlerSessionNotRunnableError
+from memexpert.services.recovery_runtime import RecoveryRuntime
 from tests.integration.test_ingest_accept_service import FakeStorageClient
 
 if TYPE_CHECKING:
@@ -1169,6 +1175,102 @@ async def test_manager_stops_automatic_backfill_retries_after_five_attempts(
     )
     assert [attempt.attempt_number for attempt in attempts] == [1, 2, 3, 4, 5]
     assert all(attempt.finished_at is not None for attempt in attempts)
+
+
+async def test_manager_enforces_recovery_item_backfill_budget(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    admin = User(email="backfill-recovery-budget@example.com", is_admin=True)
+    await _seed_session(migrated_db_session, session_name="recovery-bounded-backfill")
+    channel = await _seed_channel(
+        migrated_db_session,
+        platform_id="recovery_bounded_backfill_channel",
+        session_name="recovery-bounded-backfill",
+        last_read_post_id="10",
+    )
+    channel.oldest_observed_post_id = "8"
+    channel.history_cursor_post_id = "8"
+    channel.initial_catchup_completed = True
+    backfill = SourceChannelBackfillJob(source_channel_id=channel.id, requested_message_count=5)
+    migrated_db_session.add_all((admin, backfill))
+    await migrated_db_session.flush()
+    recovery_job = RecoveryJob(
+        requested_by_admin_user_id=admin.id,
+        request_id=uuid.uuid7(),
+        status=RecoveryJobStatus.RUNNING,
+        action=RecoveryCapability.RESUME_BACKFILL,
+        retry_limit=3,
+        reason="Bound this backfill recovery to three retryable failures.",
+        total_count=1,
+        scheduled_at=_now(),
+    )
+    migrated_db_session.add(recovery_job)
+    await migrated_db_session.flush()
+    recovery_item = RecoveryJobItem(
+        recovery_job_id=recovery_job.id,
+        work_kind=RecoveryWorkKind.BACKFILL,
+        work_id=str(backfill.id),
+        action=RecoveryCapability.RESUME_BACKFILL,
+        expected_version="dispatched",
+        retry_limit=3,
+        attempt_budget_start=1,
+        previous_stage_state={"non_stage_budget_consumed_at_dispatch": 0},
+        status=RecoveryJobItemStatus.DISPATCHED,
+        dispatched_at=_now(),
+    )
+    migrated_db_session.add(recovery_item)
+    await migrated_db_session.commit()
+
+    class _UnavailableHistoryClient(FakeTelegramClient):
+        async def iter_older_channel_messages(
+            self,
+            *,
+            channel_id: str,
+            before_message_id: int,
+            limit: int,
+        ) -> AsyncIterator[RawTelegramMessage]:
+            _ = (channel_id, before_message_id, limit)
+            raise PipelineTelegramProviderUnavailableError("history provider unavailable")
+            yield  # pragma: no cover - preserves async-generator shape.
+
+    manager = _build_manager(
+        postgres_session_factory,
+        clients_by_name={"recovery-bounded-backfill": _UnavailableHistoryClient()},
+    )
+    for attempt_number in range(1, 4):
+        assert await manager.process_backfill_jobs() == 1
+        await migrated_db_session.refresh(backfill)
+        assert backfill.attempt_count == attempt_number
+        if attempt_number < 3:
+            assert backfill.status is SourceChannelBackfillJobStatus.WAITING_RETRY
+            backfill.next_attempt_at = _now() - timedelta(seconds=1)
+            await migrated_db_session.commit()
+
+    assert backfill.status is SourceChannelBackfillJobStatus.FAILED
+    attempts = (
+        (
+            await migrated_db_session.execute(
+                select(SourceChannelBackfillAttempt)
+                .where(SourceChannelBackfillAttempt.backfill_job_id == backfill.id)
+                .order_by(SourceChannelBackfillAttempt.attempt_number)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [attempt.recovery_item_id for attempt in attempts] == [recovery_item.id] * 3
+
+    runtime = RecoveryRuntime(session_factory=postgres_session_factory, settings=Settings())
+    assert await runtime.reconcile(batch_size=10) == 1
+    async with postgres_session_factory() as session:
+        persisted_item = await session.get(RecoveryJobItem, recovery_item.id)
+        persisted_job = await session.get(RecoveryJob, recovery_job.id)
+        assert persisted_item is not None
+        assert persisted_item.status is RecoveryJobItemStatus.FAILED
+        assert persisted_item.retryable_failures_consumed == 3
+        assert persisted_job is not None
+        assert persisted_job.status is RecoveryJobStatus.COMPLETED_WITH_FAILURES
 
 
 async def test_manager_persists_backfill_failure_after_processing_session_rollback(

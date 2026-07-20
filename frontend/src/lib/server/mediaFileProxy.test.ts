@@ -5,7 +5,9 @@ import type { ProxyFetch } from './proxyResponse';
 describe('media file proxy', () => {
   it('forwards cookies, encoded params, and manual redirect handling', async () => {
     const fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      expect(String(input)).toBe('https://api.memexpert.test/api/v1/media/files/file%2Fwith%20space/web-video.mp4');
+      expect(String(input)).toBe(
+        'https://api.memexpert.test/api/v1/media/files/file%2Fwith%20space/web-video.mp4?v=generation-token'
+      );
       expect(init?.method).toBe('GET');
       expect(init?.redirect).toBe('manual');
       expect(new Headers(init?.headers).get('cookie')).toBe('memexpert_access_token=admin-token');
@@ -21,9 +23,12 @@ describe('media file proxy', () => {
 
     const response = await proxyMediaFile({
       fetch,
-      request: new Request('https://web.memexpert.test/api/v1/media/files/file%2Fwith%20space/web-video.mp4', {
-        headers: { cookie: 'memexpert_access_token=admin-token' }
-      }),
+      request: new Request(
+        'https://web.memexpert.test/api/v1/media/files/file%2Fwith%20space/web-video.mp4?v=generation-token',
+        {
+          headers: { cookie: 'memexpert_access_token=admin-token' }
+        }
+      ),
       apiBaseUrl: 'https://api.memexpert.test',
       fileId: 'file/with space',
       variant: 'web-video.mp4'
@@ -33,6 +38,8 @@ describe('media file proxy', () => {
     expect(response.headers.get('location')).toBe('https://storage.example.test/signed-object');
     expect(response.headers.get('x-internal-storage-key')).toBeNull();
     expect(response.headers.get('set-cookie')).toBeNull();
+    expect(response.headers.get('cache-control')).toBe('private, no-store');
+    expect(response.headers.get('pragma')).toBe('no-cache');
     expect(fetch).toHaveBeenCalledOnce();
   });
 

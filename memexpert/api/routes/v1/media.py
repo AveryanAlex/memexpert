@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from memexpert.api.dependencies import CurrentUserDep, DbSessionDep
 from memexpert.core.config import Settings, get_settings
-from memexpert.core.storage import build_preview_image_object_key, get_pipeline_storage_settings, get_s3_client
+from memexpert.core.storage import derive_preview_image_object_key, get_pipeline_storage_settings, get_s3_client
 from memexpert.models.collection import Collection, CollectionMember, CollectionMeme
 from memexpert.models.content import Meme, MemeFile
 from memexpert.models.enums import AccountType
@@ -72,14 +72,25 @@ async def render_media_file(
         Params=params,
         ExpiresIn=_PRESIGNED_GET_TTL_SECONDS,
     )
-    return RedirectResponse(url=url, status_code=status.HTTP_307_TEMPORARY_REDIRECT)
+    return RedirectResponse(
+        url=url,
+        status_code=status.HTTP_307_TEMPORARY_REDIRECT,
+        headers={
+            "Cache-Control": "private, no-store",
+            "Pragma": "no-cache",
+        },
+    )
 
 
 def _object_key_for_variant(file: MemeFile, *, variant: MediaFileVariant, settings: Settings) -> str | None:
     if variant is MediaFileVariant.WEB_VIDEO:
         return file.s3_web_video_key
     if variant in {MediaFileVariant.THUMBNAIL, MediaFileVariant.PREVIEW} and file.s3_web_video_key:
-        return build_preview_image_object_key(file.id, settings=settings)
+        return derive_preview_image_object_key(
+            file.s3_web_video_key,
+            meme_file_id=file.id,
+            settings=settings,
+        )
     return file.s3_original_key
 
 

@@ -12,7 +12,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Protocol, cast
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import String, and_, case, func, or_, select
+from sqlalchemy import cast as sql_cast
 from sqlalchemy.exc import SQLAlchemyError
 
 from memexpert.core.broker import ensure_pipeline_broker_started
@@ -20,6 +21,7 @@ from memexpert.core.config import Settings, get_settings
 from memexpert.models.base import utcnow
 from memexpert.models.content import RabbitMQOutboxMessage
 from memexpert.models.enums import RabbitMQOutboxMessageStatus
+from memexpert.models.operations import RecoveryJobItem
 
 if TYPE_CHECKING:
     import logging
@@ -31,6 +33,8 @@ if TYPE_CHECKING:
 
 DEFAULT_RABBITMQ_CONTENT_TYPE = "application/json"
 _MAX_OUTBOX_ERROR_TEXT_LENGTH = 2000
+_NON_STAGE_BUDGET_BASE_KEY = "non_stage_budget_consumed_at_dispatch"
+_STAGE_DISPATCH_PUBLICATION_FAILURES_KEY = "stage_dispatch_publication_failures"
 
 
 class RabbitBrokerProtocol(Protocol):
@@ -154,14 +158,31 @@ class RabbitOutboxRelay:
 
         now = utcnow()
         safe_limit = max(1, limit)
+        recovery_attempt_ceiling = _recovery_attempt_ceiling()
         return await self._claim_query(
             select(RabbitMQOutboxMessage)
             .where(
                 or_(
-                    RabbitMQOutboxMessage.status == RabbitMQOutboxMessageStatus.PENDING,
+                    and_(
+                        RabbitMQOutboxMessage.status == RabbitMQOutboxMessageStatus.PENDING,
+                        or_(
+                            recovery_attempt_ceiling.is_(None),
+                            RabbitMQOutboxMessage.attempt_count < recovery_attempt_ceiling,
+                        ),
+                    ),
                     and_(
                         RabbitMQOutboxMessage.status == RabbitMQOutboxMessageStatus.FAILED,
-                        RabbitMQOutboxMessage.attempt_count < self._settings.pipeline_broker_retry_max_attempts,
+                        or_(
+                            and_(
+                                recovery_attempt_ceiling.is_(None),
+                                RabbitMQOutboxMessage.attempt_count
+                                < self._settings.pipeline_broker_retry_max_attempts,
+                            ),
+                            and_(
+                                recovery_attempt_ceiling.is_not(None),
+                                RabbitMQOutboxMessage.attempt_count < recovery_attempt_ceiling,
+                            ),
+                        ),
                     ),
                 ),
                 or_(
@@ -205,15 +226,32 @@ class RabbitOutboxRelay:
         return len(messages)
 
     async def _claim_specific(self, message_ids: tuple[uuid.UUID, ...]) -> tuple[RabbitMQOutboxMessage, ...]:
+        recovery_attempt_ceiling = _recovery_attempt_ceiling()
         return await self._claim_query(
             select(RabbitMQOutboxMessage)
             .where(
                 RabbitMQOutboxMessage.id.in_(message_ids),
                 or_(
-                    RabbitMQOutboxMessage.status == RabbitMQOutboxMessageStatus.PENDING,
+                    and_(
+                        RabbitMQOutboxMessage.status == RabbitMQOutboxMessageStatus.PENDING,
+                        or_(
+                            recovery_attempt_ceiling.is_(None),
+                            RabbitMQOutboxMessage.attempt_count < recovery_attempt_ceiling,
+                        ),
+                    ),
                     and_(
                         RabbitMQOutboxMessage.status == RabbitMQOutboxMessageStatus.FAILED,
-                        RabbitMQOutboxMessage.attempt_count < self._settings.pipeline_broker_retry_max_attempts,
+                        or_(
+                            and_(
+                                recovery_attempt_ceiling.is_(None),
+                                RabbitMQOutboxMessage.attempt_count
+                                < self._settings.pipeline_broker_retry_max_attempts,
+                            ),
+                            and_(
+                                recovery_attempt_ceiling.is_not(None),
+                                RabbitMQOutboxMessage.attempt_count < recovery_attempt_ceiling,
+                            ),
+                        ),
                     ),
                 ),
             )
@@ -273,6 +311,8 @@ class RabbitOutboxRelay:
         message.locked_at = None
         message.lock_owner = None
         message.last_error_text = None
+        if message.attempt_count > 1:
+            await self._observe_recovery_stage_publication(message)
         await self._commit_message_update("Failed to mark RabbitMQ outbox message as published.")
 
     async def _mark_failed(self, message: RabbitMQOutboxMessage, *, error: Exception) -> None:
@@ -282,7 +322,23 @@ class RabbitOutboxRelay:
         message.locked_at = None
         message.lock_owner = None
         message.last_error_text = _trim_error_text(str(error) or error.__class__.__name__)
+        await self._observe_recovery_stage_publication(message)
         await self._commit_message_update("Failed to mark RabbitMQ outbox message publish failure.")
+
+    async def _observe_recovery_stage_publication(self, message: RabbitMQOutboxMessage) -> None:
+        item = await self._session.scalar(
+            select(RecoveryJobItem)
+            .where(sql_cast(RecoveryJobItem.dispatch_event_id, String) == message.message_id)
+            .order_by(
+                RecoveryJobItem.dispatched_at.desc().nulls_last(),
+                RecoveryJobItem.created_at.desc(),
+                RecoveryJobItem.id.desc(),
+            )
+            .with_for_update()
+            .limit(1)
+        )
+        if item is not None:
+            observe_recovery_stage_publication_outcome(item, message)
 
     async def _commit_message_update(self, failure_message: str) -> None:
         try:
@@ -290,6 +346,59 @@ class RabbitOutboxRelay:
         except SQLAlchemyError as exc:
             await self._session.rollback()
             raise RabbitOutboxError(failure_message) from exc
+
+
+def _recovery_attempt_ceiling():
+    """Return the newest recovery owner's absolute outbox-attempt ceiling.
+
+    Non-stage recovery actions persist their outbox-counter baseline in
+    ``previous_stage_state``.  Stage replay items instead use
+    ``attempt_budget_start`` for the pipeline journal's absolute attempt
+    number while their newly-created outbox row starts at zero.  Keep those
+    counter domains separate so a stage with historical attempts does not
+    receive extra broker publication attempts.
+    """
+
+    non_stage_budget_base = RecoveryJobItem.previous_stage_state[_NON_STAGE_BUDGET_BASE_KEY].as_integer()
+    stage_publication_failures = func.coalesce(
+        RecoveryJobItem.previous_stage_state[_STAGE_DISPATCH_PUBLICATION_FAILURES_KEY].as_integer(),
+        0,
+    )
+    stage_worker_failures = func.greatest(
+        RecoveryJobItem.retryable_failures_consumed - stage_publication_failures,
+        0,
+    )
+
+    return (
+        select(
+            case(
+                (
+                    non_stage_budget_base.is_not(None),
+                    RecoveryJobItem.attempt_budget_start
+                    + RecoveryJobItem.retry_limit
+                    - func.coalesce(non_stage_budget_base, 0)
+                    - 1,
+                ),
+                # A stage-dispatch outbox row is immutable and newly created,
+                # so attempt_count=0 before its first publication attempt. Any
+                # worker failures already consumed reduce the remaining broker
+                # ceiling without subtracting publication failures twice.
+                else_=func.greatest(RecoveryJobItem.retry_limit - stage_worker_failures, 0),
+            )
+        )
+        .where(
+            sql_cast(RecoveryJobItem.dispatch_event_id, String) == RabbitMQOutboxMessage.message_id,
+            RecoveryJobItem.attempt_budget_start.is_not(None),
+        )
+        .order_by(
+            RecoveryJobItem.dispatched_at.desc().nulls_last(),
+            RecoveryJobItem.created_at.desc(),
+            RecoveryJobItem.id.desc(),
+        )
+        .limit(1)
+        .correlate(RabbitMQOutboxMessage)
+        .scalar_subquery()
+    )
 
 
 async def publish_rabbit_message_direct(
@@ -411,6 +520,52 @@ def _trim_error_text(value: str) -> str:
     return value.strip()[:_MAX_OUTBOX_ERROR_TEXT_LENGTH]
 
 
+def recovery_stage_publication_failures(item: RecoveryJobItem) -> int:
+    """Return the monotonic broker-failure component of a stage recovery budget."""
+
+    value = item.previous_stage_state.get(_STAGE_DISPATCH_PUBLICATION_FAILURES_KEY)
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+
+def recovery_stage_worker_attempt_ceiling(item: RecoveryJobItem) -> int:
+    """Return a stage's absolute worker-attempt ceiling after broker failures."""
+
+    if item.attempt_budget_start is None:
+        raise ValueError("Stage recovery worker ceiling requires an attempt budget start.")
+    remaining_worker_failures = max(
+        item.retry_limit - recovery_stage_publication_failures(item),
+        1,
+    )
+    return item.attempt_budget_start + remaining_worker_failures - 1
+
+
+def observe_recovery_stage_publication_outcome(
+    item: RecoveryJobItem,
+    outbox: RabbitMQOutboxMessage,
+) -> None:
+    """Merge one stage outbox outcome into the shared retryable-failure budget."""
+
+    if item.stage is None:
+        return
+    if outbox.status is RabbitMQOutboxMessageStatus.FAILED:
+        observed_failures = outbox.attempt_count
+    elif outbox.status is RabbitMQOutboxMessageStatus.PUBLISHED:
+        observed_failures = max(outbox.attempt_count - 1, 0)
+    else:
+        return
+
+    previous_publication_failures = recovery_stage_publication_failures(item)
+    publication_failures = max(previous_publication_failures, observed_failures)
+    worker_failures = max(item.retryable_failures_consumed - previous_publication_failures, 0)
+    state = dict(item.previous_stage_state)
+    state[_STAGE_DISPATCH_PUBLICATION_FAILURES_KEY] = publication_failures
+    item.previous_stage_state = state
+    item.retryable_failures_consumed = max(
+        item.retryable_failures_consumed,
+        publication_failures + worker_failures,
+    )
+
+
 __all__ = [
     "RabbitBrokerProtocol",
     "RabbitMessageSpec",
@@ -419,8 +574,11 @@ __all__ = [
     "RabbitOutboxRelay",
     "RabbitPublisher",
     "message_spec_from_outbox_message",
+    "observe_recovery_stage_publication_outcome",
     "outbox_message_from_spec",
     "outbox_message_id_from_message_id",
     "publish_rabbit_message_direct",
+    "recovery_stage_publication_failures",
+    "recovery_stage_worker_attempt_ceiling",
     "relay_rabbitmq_outbox_messages_best_effort",
 ]

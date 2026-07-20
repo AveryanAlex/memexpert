@@ -10,6 +10,7 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 
+from memexpert.core.storage import media_object_version_token
 from memexpert.models.collection import Collection, CollectionInvite, CollectionMeme, PinnedMeme
 from memexpert.models.content import Meme, MemeFile
 from memexpert.models.enums import (
@@ -429,8 +430,13 @@ async def test_meme_library_returns_private_authenticated_render_urls_for_owner(
     migrated_db_session.add(
         CollectionMeme(collection_id=favorites.id, meme_id=private_meme.id, added_by_user_id=owner.id)
     )
-    await migrated_db_session.commit()
     assert private_meme.primary_file_id is not None
+    generation_id = uuid.UUID("22222222-2222-7222-8222-222222222224")
+    active_video_key = f"pipeline/derived/{private_meme.primary_file_id}/generations/{generation_id}/web.mp4"
+    private_file = await migrated_db_session.get(MemeFile, private_meme.primary_file_id)
+    assert private_file is not None
+    private_file.s3_web_video_key = active_video_key
+    await migrated_db_session.commit()
 
     library = await collection_service.get_meme_library(user_id=owner.id)
 
@@ -439,10 +445,17 @@ async def test_meme_library_returns_private_authenticated_render_urls_for_owner(
     assert primary_file is not None
     assert primary_file.id == private_meme.primary_file_id
     assert primary_file.render is not None
-    assert primary_file.render.thumbnail_url == f"/api/v1/media/files/{private_meme.primary_file_id}/thumbnail"
-    assert primary_file.render.preview_url == f"/api/v1/media/files/{private_meme.primary_file_id}/preview"
+    version = media_object_version_token(active_video_key)
+    assert primary_file.render.thumbnail_url == (
+        f"/api/v1/media/files/{private_meme.primary_file_id}/thumbnail?v={version}"
+    )
+    assert primary_file.render.preview_url == (
+        f"/api/v1/media/files/{private_meme.primary_file_id}/preview?v={version}"
+    )
     assert primary_file.render.display_url == primary_file.render.preview_url
-    assert primary_file.render.web_video_url == f"/api/v1/media/files/{private_meme.primary_file_id}/web-video.mp4"
+    assert primary_file.render.web_video_url == (
+        f"/api/v1/media/files/{private_meme.primary_file_id}/web-video.mp4?v={version}"
+    )
     assert primary_file.render.download_url == primary_file.render.web_video_url
     serialized = library.model_dump_json()
     assert "pipeline/originals/private/library-upload.gif" not in serialized

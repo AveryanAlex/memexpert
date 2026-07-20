@@ -6,12 +6,14 @@ from __future__ import annotations
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
 from sqlalchemy import select
 
+from memexpert.media.contracts import SUPPORTED_MOVING_MEDIA_MIME_TYPES
+from memexpert.messaging.rabbitmq_outbox import recovery_stage_publication_failures
 from memexpert.models.base import utcnow
 from memexpert.models.content import MemeFile, MemeFileOCRResult, PipelineStageJournal
 from memexpert.models.enums import (
@@ -19,11 +21,15 @@ from memexpert.models.enums import (
     ContentPipelineStageStatus,
     ContentProcessingStatus,
     ContentSourceKind,
+    MediaGenerationCleanupStatus,
+    MediaGenerationStatus,
     PipelineAttemptOutcome,
+    RecoveryCapability,
+    RecoveryJobItemStatus,
     SyncTargetKind,
     SyncTargetStatus,
 )
-from memexpert.models.operations import PipelineStageAttempt, RecoveryJobItem
+from memexpert.models.operations import MediaGeneration, PipelineStageAttempt, RecoveryJobItem
 from memexpert.pipeline import constants as _consts
 from memexpert.pipeline.dispatch import (
     PipelineDispatchingService,
@@ -48,10 +54,9 @@ from memexpert.services.errors import (
     PipelineIngestError,
     PipelineMergeTransactionError,
 )
+from memexpert.services.media_generation import MediaGenerationConflictError
 
 if TYPE_CHECKING:
-    from datetime import datetime
-
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from memexpert.core.classification import ClassificationResult
@@ -124,6 +129,7 @@ class PipelineStageCompletionService(PipelineDispatchingService):
             return None
 
         meme_file = await self._get_meme_file(meme_file_id)
+        recovery_item = await self._load_recovery_item(event_id)
         ensure_stage_attempt_is_current(stage_entry, attempt=attempt)
         started_at = utcnow()
 
@@ -143,7 +149,8 @@ class PipelineStageCompletionService(PipelineDispatchingService):
             event_id=event_id,
             started_at=started_at,
         )
-        if stage not in _consts.SYNC_STAGES:
+        preserve_file_status = _should_preserve_file_status(recovery_item, meme_file)
+        if stage not in _consts.SYNC_STAGES and not preserve_file_status:
             meme_file.status = ContentProcessingStatus.PROCESSING
 
         await self._commit_stage_mutation("Failed to persist running stage state.")
@@ -154,6 +161,9 @@ class PipelineStageCompletionService(PipelineDispatchingService):
             mime_type=meme_file.mime_type,
             original_object_key=meme_file.s3_original_key,
             web_video_object_key=meme_file.s3_web_video_key,
+            recovery_item_id=recovery_item.id if recovery_item is not None else None,
+            preserve_ready=preserve_file_status,
+            retry_limit=recovery_item.retry_limit if recovery_item is not None else 3,
         )
 
     async def mark_stage_processing(
@@ -179,9 +189,90 @@ class PipelineStageCompletionService(PipelineDispatchingService):
         event_id: uuid.UUID,
         result: NormalizedMediaResult,
     ) -> None:
-        meme_file, stage_entry = await self._get_meme_file_and_stage_entry(meme_file_id, ContentPipelineStage.TRANSCODE)
+        # Atomic activation serializes on the file aggregate before locking the
+        # transcode journal and generation rows.  Besides preventing concurrent
+        # pointer swaps, the locked load refreshes any stale identity-map state.
+        meme_file, stage_entry = await self._get_meme_file_and_stage_entry(
+            meme_file_id,
+            ContentPipelineStage.TRANSCODE,
+            for_update=True,
+        )
         ensure_stage_attempt_is_current(stage_entry, attempt=attempt)
-        meme_file.s3_web_video_key = result.web_video_object_key
+        moving_media = (meme_file.mime_type or "").lower() in SUPPORTED_MOVING_MEDIA_MIME_TYPES
+        if moving_media and (
+            result.generation_id is None
+            or result.web_video_object_key is None
+            or result.preview_image_object_key is None
+        ):
+            raise MediaGenerationConflictError(
+                "Moving-media completion requires a reserved immutable generation and both artifacts."
+            )
+        if result.web_video_object_key is not None:
+            if result.generation_id is None:
+                # Static-image processors do not reserve moving-media generations.
+                meme_file.s3_web_video_key = result.web_video_object_key
+                meme_file.active_media_generation_id = None
+                meme_file.source_has_audio = result.source_has_audio
+                meme_file.web_video_has_audio = result.web_video_has_audio
+                meme_file.web_video_profile = result.web_video_profile
+                meme_file.web_video_verified_at = result.web_video_verified_at
+            else:
+                generation = await self._session.get(
+                    MediaGeneration,
+                    result.generation_id,
+                    with_for_update=True,
+                    populate_existing=True,
+                )
+                if generation is None or generation.meme_file_id != meme_file.id:
+                    raise MediaGenerationConflictError("Moving-media generation no longer belongs to this file.")
+                if generation.status is not MediaGenerationStatus.UPLOADED:
+                    raise MediaGenerationConflictError(
+                        "Moving-media generation was not upload-verified before activation."
+                    )
+                if meme_file.s3_web_video_key != generation.expected_web_video_object_key:
+                    generation.status = MediaGenerationStatus.STALE
+                    generation.cleanup_status = MediaGenerationCleanupStatus.PENDING
+                    generation.safe_failure_reason = "active_pointer_changed"
+                    generation.safe_failure_text = "The active web-video pointer changed before activation."
+                    await self._session.commit()
+                    raise MediaGenerationConflictError("The active web-video pointer changed before activation.")
+                if (
+                    generation.web_video_object_key != result.web_video_object_key
+                    or generation.preview_image_object_key != result.preview_image_object_key
+                ):
+                    raise MediaGenerationConflictError("Completion output does not match the reserved generation keys.")
+                previous_generation = (
+                    await self._session.get(
+                        MediaGeneration,
+                        meme_file.active_media_generation_id,
+                        with_for_update=True,
+                        populate_existing=True,
+                    )
+                    if meme_file.active_media_generation_id is not None
+                    else None
+                )
+                activated_at = utcnow()
+                if previous_generation is not None and previous_generation.id != generation.id:
+                    previous_generation.status = MediaGenerationStatus.SUPERSEDED
+                    previous_generation.superseded_at = activated_at
+                    previous_generation.cleanup_status = MediaGenerationCleanupStatus.PENDING
+                meme_file.s3_web_video_key = generation.web_video_object_key
+                meme_file.active_media_generation_id = generation.id
+                meme_file.source_has_audio = result.source_has_audio
+                meme_file.web_video_has_audio = result.web_video_has_audio
+                meme_file.web_video_profile = result.web_video_profile
+                meme_file.web_video_verified_at = result.web_video_verified_at or generation.verified_at or activated_at
+                generation.status = MediaGenerationStatus.ACTIVE
+                generation.activated_at = activated_at
+                generation.cleanup_status = MediaGenerationCleanupStatus.NOT_ELIGIBLE
+                generation.cleanup_error_text = None
+        else:
+            meme_file.s3_web_video_key = None
+            meme_file.active_media_generation_id = None
+            meme_file.source_has_audio = result.source_has_audio
+            meme_file.web_video_has_audio = None
+            meme_file.web_video_profile = None
+            meme_file.web_video_verified_at = None
         meme_file.quality_score = result.quality_score
         meme_file.blur_hash = result.blur_hash
         await self._finalize_stage_success(
@@ -509,6 +600,7 @@ class PipelineStageCompletionService(PipelineDispatchingService):
             normalized_reason=normalized_reason,
             last_error_text=last_error_text,
             retryable=retryable,
+            consume_retry_budget=True,
         )
 
     async def abandon_stage_processing(
@@ -554,9 +646,7 @@ class PipelineStageCompletionService(PipelineDispatchingService):
             return CancelledStageResolution(
                 disposition,
                 normalized_reason=(
-                    stage_entry.normalized_reason
-                    if disposition is CancelledStageDisposition.DEAD_LETTER
-                    else None
+                    stage_entry.normalized_reason if disposition is CancelledStageDisposition.DEAD_LETTER else None
                 ),
             )
 
@@ -571,6 +661,7 @@ class PipelineStageCompletionService(PipelineDispatchingService):
             normalized_reason=normalized_reason,
             last_error_text=last_error_text,
             retryable=True,
+            consume_retry_budget=False,
         )
         return CancelledStageResolution(CancelledStageDisposition.REQUEUE)
 
@@ -585,6 +676,7 @@ class PipelineStageCompletionService(PipelineDispatchingService):
         normalized_reason: str,
         last_error_text: str,
         retryable: bool,
+        consume_retry_budget: bool,
     ) -> None:
         failed_at = utcnow()
 
@@ -599,19 +691,52 @@ class PipelineStageCompletionService(PipelineDispatchingService):
         )
         stage_entry.started_at = stage_entry.started_at or failed_at
         stage_entry.finished_at = failed_at
-        if stage not in _consts.SYNC_STAGES:
+        recovery_item = await self._load_recovery_item(event_id, lock=True)
+        derivative_maintenance = bool(
+            recovery_item is not None and recovery_item.action is RecoveryCapability.REGENERATE_DERIVATIVES
+        )
+        preserve_file_status = _should_preserve_file_status(recovery_item, meme_file)
+        if stage not in _consts.SYNC_STAGES and not preserve_file_status and not derivative_maintenance:
             meme_file.status = ContentProcessingStatus.FAILED
 
+        if recovery_item is not None and retryable and consume_retry_budget:
+            budget_start = recovery_item.attempt_budget_start or attempt
+            recovery_item.attempt_budget_start = budget_start
+            publication_failures = recovery_stage_publication_failures(recovery_item)
+            recovery_item.retryable_failures_consumed = max(
+                recovery_item.retryable_failures_consumed,
+                publication_failures + attempt - budget_start + 1,
+            )
         await self._record_attempt_finished(
             meme_file_id=meme_file.id,
             stage=stage,
             attempt=attempt,
             event_id=event_id,
-            outcome=(PipelineAttemptOutcome.FAILED_RETRYABLE if retryable else PipelineAttemptOutcome.FAILED_TERMINAL),
+            outcome=(
+                PipelineAttemptOutcome.SKIPPED
+                if not consume_retry_budget
+                else PipelineAttemptOutcome.FAILED_RETRYABLE
+                if retryable
+                else PipelineAttemptOutcome.FAILED_TERMINAL
+            ),
             normalized_reason=normalized_reason,
             safe_error_text=last_error_text,
             finished_at=failed_at,
         )
+
+        if derivative_maintenance and recovery_item is not None:
+            _restore_stage_state_after_derivative_failure(
+                stage_entry,
+                recovery_item.previous_stage_state,
+                fallback_attempt=max(attempt - 1, 0),
+            )
+            budget_exhausted = recovery_item.retryable_failures_consumed >= recovery_item.retry_limit
+            if not retryable or budget_exhausted:
+                recovery_item.status = RecoveryJobItemStatus.FAILED
+                recovery_item.normalized_reason = trim_reason(normalized_reason)
+                recovery_item.safe_error_text = trim_error_text(last_error_text)
+                recovery_item.finished_at = failed_at
+                recovery_item.reservation_active = False
 
         await self._commit_stage_mutation("Failed to persist failed stage state.")
 
@@ -666,17 +791,22 @@ class PipelineStageCompletionService(PipelineDispatchingService):
             finished_at=finished_at,
         )
 
-        downstream_dispatches = prepare_downstream_dispatches(
-            self._session,
-            meme_file=meme_file,
-            stage=stage,
-            created_at=finished_at,
+        recovery_item = await self._load_recovery_item(event_id, lock=True)
+        downstream_dispatches = (
+            ()
+            if recovery_item is not None and recovery_item.suppress_fanout
+            else prepare_downstream_dispatches(
+                self._session,
+                meme_file=meme_file,
+                stage=stage,
+                created_at=finished_at,
+            )
         )
-        if stage is ContentPipelineStage.CLASSIFY:
+        preserve_file_status = _should_preserve_file_status(recovery_item, meme_file)
+        if stage is ContentPipelineStage.CLASSIFY and not preserve_file_status:
             meme_file.status = ContentProcessingStatus.READY
-        elif stage not in _consts.SYNC_STAGES:
+        elif stage not in _consts.SYNC_STAGES and not preserve_file_status:
             meme_file.status = ContentProcessingStatus.PROCESSING
-
         outbox_message_ids = []
         dispatch_events = tuple(dispatch.event for dispatch in downstream_dispatches) + extra_dispatch_events
         for dispatch_event in dispatch_events:
@@ -777,6 +907,85 @@ class PipelineStageCompletionService(PipelineDispatchingService):
                 PipelineStageAttempt.attempt_number == attempt,
             )
         )
+
+    async def _load_recovery_item(
+        self,
+        event_id: uuid.UUID,
+        *,
+        lock: bool = False,
+    ) -> RecoveryJobItem | None:
+        statement = select(RecoveryJobItem).where(RecoveryJobItem.dispatch_event_id == event_id)
+        if lock:
+            statement = statement.with_for_update()
+        return await self._session.scalar(statement)
+
+
+def _restore_stage_state_after_derivative_failure(
+    stage_entry: PipelineStageJournal,
+    snapshot: dict[str, object],
+    *,
+    fallback_attempt: int,
+) -> None:
+    """Restore catalog pipeline truth while the generation ledger records maintenance failure."""
+
+    raw_status = snapshot.get("status")
+    try:
+        status = ContentPipelineStageStatus(str(raw_status))
+    except ValueError:
+        status = ContentPipelineStageStatus.SUCCEEDED
+    stage_entry.status = status
+    stage_entry.attempt_count = _snapshot_int(snapshot.get("attempt_count"), fallback=fallback_attempt)
+    stage_entry.last_event_id = _snapshot_uuid(snapshot.get("last_event_id"))
+    stage_entry.normalized_reason = _snapshot_optional_text(snapshot.get("normalized_reason"))
+    stage_entry.last_error_text = _snapshot_optional_text(snapshot.get("last_error_text"))
+    raw_retryable = snapshot.get("is_retryable")
+    stage_entry.is_retryable = raw_retryable if isinstance(raw_retryable, bool) else False
+    stage_entry.retry_after = _snapshot_datetime(snapshot.get("retry_after"))
+    stage_entry.started_at = _snapshot_datetime(snapshot.get("started_at"))
+    stage_entry.finished_at = _snapshot_datetime(snapshot.get("finished_at"))
+
+
+def _should_preserve_file_status(
+    recovery_item: RecoveryJobItem | None,
+    meme_file: MemeFile,
+) -> bool:
+    if recovery_item is None:
+        return False
+    if recovery_item.action is RecoveryCapability.REGENERATE_DERIVATIVES:
+        return True
+    return recovery_item.preserve_ready and meme_file.status is ContentProcessingStatus.READY
+
+
+def _snapshot_int(value: object, *, fallback: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int | str):
+        return fallback
+    try:
+        return max(int(value), 0)
+    except ValueError:
+        return fallback
+
+
+def _snapshot_uuid(value: object) -> uuid.UUID | None:
+    if value is None or value == "":
+        return None
+    try:
+        return uuid.UUID(str(value))
+    except ValueError:
+        return None
+
+
+def _snapshot_datetime(value: object) -> datetime | None:
+    if value is None or value == "":
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None and parsed.utcoffset() is not None else None
+
+
+def _snapshot_optional_text(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
 
 
 __all__ = [

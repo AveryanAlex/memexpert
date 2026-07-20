@@ -318,6 +318,12 @@ class MemeFile(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         Index("ix_meme_files_matched_meme_file_id", "matched_meme_file_id"),
         Index("ix_meme_files_perceptual_hash", "perceptual_hash"),
         Index(
+            "ix_meme_files_web_video_profile_verified",
+            "web_video_profile",
+            "web_video_verified_at",
+            postgresql_where=text("s3_web_video_key IS NOT NULL"),
+        ),
+        Index(
             "uq_meme_files_sha256_hex_not_null",
             "sha256_hex",
             unique=True,
@@ -340,6 +346,19 @@ class MemeFile(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     mime_type: Mapped[str | None] = mapped_column(String(255), nullable=True)
     s3_original_key: Mapped[str] = mapped_column(Text, nullable=False)
     s3_web_video_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    active_media_generation_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(
+            "media_generations.id",
+            ondelete="SET NULL",
+            use_alter=True,
+            name="fk_meme_files_active_media_generation_id",
+        ),
+        nullable=True,
+    )
+    source_has_audio: Mapped[bool | None] = mapped_column(nullable=True)
+    web_video_has_audio: Mapped[bool | None] = mapped_column(nullable=True)
+    web_video_profile: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    web_video_verified_at: Mapped[datetime | None] = mapped_column(nullable=True)
     perceptual_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     sha256_hex: Mapped[str | None] = mapped_column(String(64), nullable=True)
     ingest_origin: Mapped[IngestFileOrigin | None] = mapped_column(

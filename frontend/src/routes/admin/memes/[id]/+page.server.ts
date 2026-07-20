@@ -1,6 +1,7 @@
 import { env } from '$env/dynamic/private';
 import { error, fail, redirect } from '@sveltejs/kit';
 import type { Actions, PageServerLoad } from './$types';
+import type { AdminMemeDetailRead, AdminRecoveryWorkKind } from '$lib/api/types';
 import {
   ApiError,
   deleteAdminMeme,
@@ -10,6 +11,7 @@ import {
   resolveModerationReport,
   updateMemeModeration
 } from '$lib/api/client';
+import { actRecoveryWork } from '$lib/server/admin/recoveryActions';
 
 export const load: PageServerLoad = async ({ fetch, params, request }) => {
   const requestConfig = {
@@ -18,22 +20,29 @@ export const load: PageServerLoad = async ({ fetch, params, request }) => {
     cookieHeader: request.headers.get('cookie') ?? undefined
   };
 
-  try {
-    const [detail, templates] = await Promise.all([
-      fetchAdminMemeDetail(requestConfig, params.id),
-      fetchAdminMemeTemplates(requestConfig)
-    ]);
-
-    return { detail, templates, loadError: null };
-  } catch (caught) {
-    if (caught instanceof ApiError && caught.status === 404) {
-      throw error(404, caught.message);
-    }
-    return { detail: null, templates: [], loadError: caught instanceof ApiError ? caught.message : 'Could not load meme.' };
+  const [detailResult, templatesResult] = await Promise.allSettled([
+    fetchAdminMemeDetail(requestConfig, params.id),
+    fetchAdminMemeTemplates(requestConfig)
+  ]);
+  if (detailResult.status === 'rejected' && detailResult.reason instanceof ApiError && detailResult.reason.status === 404) {
+    throw error(404, detailResult.reason.message);
   }
+  const detail = detailResult.status === 'fulfilled' ? detailResult.value : null;
+  return {
+    detail,
+    templates: templatesResult.status === 'fulfilled' ? templatesResult.value : [],
+    processingRequestIds: detail ? processingActionRequestIds(detail) : {},
+    loadError: detailResult.status === 'rejected'
+      ? detailResult.reason instanceof ApiError ? detailResult.reason.message : 'Could not load meme.'
+      : null,
+    templatesLoadError: templatesResult.status === 'rejected'
+      ? templatesResult.reason instanceof ApiError ? templatesResult.reason.message : 'Could not load meme templates.'
+      : null
+  };
 };
 
 export const actions: Actions = {
+  actRecoveryWork,
   updateMeme: async ({ fetch, params, request }) => {
     const data = await request.formData();
     return runAction(async () => {
@@ -127,6 +136,28 @@ export const actions: Actions = {
     throw redirect(303, `/admin/memes/${targetMemeId}`);
   }
 };
+
+function processingActionRequestIds(detail: AdminMemeDetailRead): Record<string, string> {
+  const requestIds: Record<string, string> = {};
+  for (const file of detail.processing_files ?? []) {
+    if (file.actions?.length) {
+      const kind = file.work_kind ?? 'pipeline_stage';
+      const workId = file.work_id ?? `${file.id}:transcode`;
+      requestIds[processingRequestKey(kind, workId)] = crypto.randomUUID();
+    }
+    for (const stage of file.stages) {
+      if (!stage.actions?.length) continue;
+      const kind = stage.work_kind ?? 'pipeline_stage';
+      const workId = stage.work_id ?? `${file.id}:${stage.stage}`;
+      requestIds[processingRequestKey(kind, workId)] = crypto.randomUUID();
+    }
+  }
+  return requestIds;
+}
+
+function processingRequestKey(kind: AdminRecoveryWorkKind, workId: string): string {
+  return `${kind}:${workId}`;
+}
 
 async function runAction(operation: () => Promise<{ message: string }>) {
   try {

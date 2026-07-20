@@ -20,6 +20,7 @@ export async function proxyMediaFile({ fetch, request, apiBaseUrl, fileId, varia
     `/api/v1/media/files/${encodeURIComponent(fileId)}/${encodeURIComponent(variant)}`,
     apiBaseUrl
   );
+  upstreamUrl.search = new URL(request.url).search;
   const headers = new Headers({ accept: 'application/json' });
   const cookie = request.headers.get('cookie');
   if (cookie) headers.set('cookie', cookie);
@@ -33,7 +34,14 @@ export async function proxyMediaFile({ fetch, request, apiBaseUrl, fileId, varia
   if (upstream.status === 307) {
     const location = upstream.headers.get('location');
     if (!location) return jsonError(502, 'Media redirect was unavailable.');
-    return new Response(null, { status: 307, headers: { location } });
+    return new Response(null, {
+      status: 307,
+      headers: {
+        location,
+        'cache-control': 'private, no-store',
+        pragma: 'no-cache'
+      }
+    });
   }
 
   const responseHeaders = new Headers();

@@ -5,6 +5,13 @@ from __future__ import annotations
 import uuid
 
 from memexpert.core.config import Settings
+from memexpert.core.storage import (
+    build_preview_image_generation_object_key,
+    build_web_video_generation_object_key,
+    derive_preview_image_object_key,
+    media_object_version_token,
+    parse_media_generation_object_key,
+)
 from memexpert.models.content import MemeFile
 from memexpert.services.media_render_urls import MediaRenderUrlService, PublicMediaRenderContext
 
@@ -108,7 +115,8 @@ def test_web_video_uses_public_media_base_while_preview_uses_imgproxy() -> None:
     assert render.preview_url is not None
     assert render.preview_url.startswith("https://img.memexpert.test/")
     assert render.display_url == render.preview_url
-    assert render.web_video_url == f"https://media.memexpert.test/files/{file_id}/web-video.mp4"
+    version = media_object_version_token(file.s3_web_video_key or "")
+    assert render.web_video_url == f"https://media.memexpert.test/files/{file_id}/web-video.mp4?v={version}"
     assert render.download_url == render.web_video_url
     web_video_url = render.web_video_url
     assert web_video_url is not None
@@ -179,12 +187,16 @@ def test_private_web_video_uses_authenticated_direct_variant_without_imgproxy() 
         quality_score=0.7,
     )
 
-    render = MediaRenderUrlService(Settings.model_validate({"imgproxy_base_url": "https://img.memexpert.test"})).build_private_render(file)
+    render = MediaRenderUrlService(
+        Settings.model_validate({"imgproxy_base_url": "https://img.memexpert.test"})
+    ).build_private_render(file)
 
-    assert render.thumbnail_url == f"/api/v1/media/files/{file_id}/thumbnail"
-    assert render.preview_url == f"/api/v1/media/files/{file_id}/preview"
+    assert file.s3_web_video_key is not None
+    version = media_object_version_token(file.s3_web_video_key)
+    assert render.thumbnail_url == f"/api/v1/media/files/{file_id}/thumbnail?v={version}"
+    assert render.preview_url == f"/api/v1/media/files/{file_id}/preview?v={version}"
     assert render.display_url == render.preview_url
-    assert render.web_video_url == f"/api/v1/media/files/{file_id}/web-video.mp4"
+    assert render.web_video_url == f"/api/v1/media/files/{file_id}/web-video.mp4?v={version}"
     assert render.download_url == render.web_video_url
     web_video_url = render.web_video_url
     assert web_video_url is not None
@@ -237,5 +249,62 @@ def test_gif_with_web_video_uses_generated_preview_image_and_playback_url() -> N
     assert render.preview_url.startswith("https://img.memexpert.test/")
     assert render.display_url == render.preview_url
     assert render.original_url is None
-    assert render.web_video_url == f"https://media.memexpert.test/files/{file_id}/web-video.mp4"
+    version = media_object_version_token(file.s3_web_video_key or "")
+    assert render.web_video_url == f"https://media.memexpert.test/files/{file_id}/web-video.mp4?v={version}"
     assert render.download_url == render.web_video_url
+
+
+def test_generation_key_changes_playback_token_and_preview_source() -> None:
+    file_id = uuid.UUID("11111111-1111-4111-8111-111111111120")
+    settings = Settings.model_validate(
+        {
+            "imgproxy_base_url": "https://img.memexpert.test",
+            "media_public_base_url": "https://media.memexpert.test/files",
+        }
+    )
+    first = MemeFile(
+        id=file_id,
+        meme_id=uuid.UUID("22222222-2222-4222-8222-222222222230"),
+        s3_original_key="pipeline/originals/video-source.webm",
+        s3_web_video_key=f"pipeline/derived/{file_id}/generations/11111111-1111-7111-8111-111111111111/web.mp4",
+        mime_type="video/webm",
+        quality_score=0.7,
+    )
+    second = MemeFile(
+        id=file_id,
+        meme_id=first.meme_id,
+        s3_original_key=first.s3_original_key,
+        s3_web_video_key=f"pipeline/derived/{file_id}/generations/22222222-2222-7222-8222-222222222222/web.mp4",
+        mime_type=first.mime_type,
+        quality_score=0.7,
+    )
+
+    first_render = MediaRenderUrlService(settings).build_render(
+        first,
+        context=PublicMediaRenderContext(meme_id=first.meme_id),
+    )
+    second_render = MediaRenderUrlService(settings).build_render(
+        second,
+        context=PublicMediaRenderContext(meme_id=second.meme_id),
+    )
+
+    assert first_render.web_video_url != second_render.web_video_url
+    assert first_render.preview_url != second_render.preview_url
+    assert first_render.thumbnail_url != second_render.thumbnail_url
+
+
+def test_generation_key_helpers_pair_and_parse_only_recognized_artifacts() -> None:
+    file_id = uuid.UUID("11111111-1111-7111-8111-111111111121")
+    generation_id = uuid.UUID("22222222-2222-7222-8222-222222222221")
+    video_key = build_web_video_generation_object_key(file_id, generation_id)
+    preview_key = build_preview_image_generation_object_key(file_id, generation_id)
+
+    assert derive_preview_image_object_key(video_key, meme_file_id=file_id) == preview_key
+    parsed = parse_media_generation_object_key(video_key)
+    assert parsed is not None
+    assert parsed.meme_file_id == file_id
+    assert parsed.generation_id == generation_id
+    assert parsed.artifact_name == "web.mp4"
+    assert parse_media_generation_object_key(f"pipeline/derived/{file_id}/web.mp4") is None
+    unknown_key = f"pipeline/derived/{file_id}/generations/{generation_id}/unknown.bin"
+    assert parse_media_generation_object_key(unknown_key) is None

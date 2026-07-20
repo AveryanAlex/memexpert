@@ -13,7 +13,9 @@ MemeFile 3 (900x675 JPEG with border, from Reddit) ──┘     ↑ primary_fil
 ```
 
 **On Meme:** media type, OCR text, language, NSFW flag, like count, template link, visibility policy, and materialized public/private state.
-**On MemeFile:** dimensions, format, file size, S3 URLs for all variants, SHA-256, perceptual hash, quality score, blur hash, processing status.
+**On MemeFile:** original dimensions/format/size, active derivative pointer,
+source/output audio state, derivative profile/verification time, SHA-256,
+perceptual hash, quality score, blur hash, and processing status.
 
 Embeddings live in a separate cache table, not on MemeFile. This decouples embedding computation from the relational model.
 
@@ -35,7 +37,70 @@ There is no singular meme owner or author. Users do not own canonical meme metad
 
 ### MemeFile
 
-A specific media file belonging to a meme. Key fields: `meme_id` (FK → Meme), `status` (pending/processing/ready/failed), original-upload metadata (`mime_type`, dimensions, byte size), `s3_original_key`, `s3_web_video_key` (nullable — GIF/video playback artifact only), globally unique non-null `sha256_hex`, `perceptual_hash`, `quality_score`, `blur_hash`. The canonical default file is stored on `Meme.primary_file_id`. A non-null `s3_web_video_key` also guarantees a deterministic `preview.png` companion under the file's derivative prefix; its key is derived from `MemeFile.id` rather than duplicated in PostgreSQL. Static image variants (resize, format) are served on-the-fly by imgproxy from the original, while moving-media thumbnail/display variants use that stored preview frame. Derived artifacts never overwrite original MIME metadata.
+A specific media file belonging to a meme. Key fields: `meme_id` (FK →
+Meme), `status` (pending/processing/ready/failed), original-upload metadata
+(`mime_type`, dimensions, byte size), `s3_original_key`, active nullable
+`s3_web_video_key`, `source_has_audio`, `web_video_has_audio`,
+`web_video_profile`, `web_video_verified_at`, globally unique non-null
+`sha256_hex`, `perceptual_hash`, `quality_score`, and `blur_hash`. The canonical
+default file is stored on `Meme.primary_file_id`.
+
+An active generation key has a sibling poster derived from the key itself:
+`.../generations/{generation_id}/web.mp4` maps to sibling `preview.png`.
+Legacy `{file_id}/web.mp4`, `{file_id}/web_video.mp4`, and
+`{file_id}/preview.png` remain readable during migration. Static image variants
+are served on-the-fly by imgproxy; moving-media thumbnails use the active stored
+poster. Derived artifacts never overwrite original MIME metadata or dimensions.
+
+### MediaGeneration
+
+A durable immutable attempt to produce one moving-media web generation. It
+links the file and optional recovery item and stores expected/replacement video
+and poster keys, selected profile, retry limit, source/output media observations
+(dimensions, frame rate, duration, bitrate, size, video/audio codecs and audio
+presence), status, attempts, safe failure, activation/supersession timestamps,
+and cleanup state. Generation object keys are unique. Indexes cover file/status,
+recovery linkage, cleanup eligibility, and old superseded generations.
+
+Both artifacts are generated and verified locally, uploaded to immutable keys,
+and only then activated by one fenced database update. A failed/stale generation
+cannot change `MemeFile.status` or the active pointer. Cleanup may delete only a
+recognized, old, unreferenced generation and never an active, young, unknown, or
+otherwise referenced object.
+
+### RecoveryJob and RecoveryJobItem
+
+`RecoveryJob` stores immutable requester and idempotency request ID, optional
+current assignee, action, replay scope, retry limit, explicit/query selector and
+selection snapshot, `preparing` materialization cursor/lease/generation,
+selected-root and expanded-step counts, grouped exclusions, detailed status
+counts, source job for failed-item retry, preview/schedule/cancellation times,
+and version. Job history is indexed by status/creation and requester/creation;
+materialization leases are independently reclaimable.
+
+`RecoveryQuerySnapshotMember` is the immutable root-membership ledger for one
+uncapped query preview. Each row stores the job/root key, canonical work
+identity, captured version, optional file/stage identity, and whether the root
+came from the outdated-video selector. Its bounded context fingerprint covers
+selected-action eligibility, prerequisite state, active reservations, and exact
+downstream row/missing-marker topology and versions. A unique job/root key
+prevents duplicate capture, while the job/UUIDv7 index is the restart-safe
+expansion cursor. The rows cascade only with their recovery job; canonical IDs
+intentionally are not foreign keys so deleting or transitioning live work
+cannot erase reviewed snapshot membership.
+
+`RecoveryJobItem` stores one planned stage step, its root/parent/source item,
+file/stage identity, expected and canonical versions, reservation state,
+preserve-READY fence, terminal acknowledgement, dispatch event, starting
+attempt baseline, retryable failures consumed, retry limit, sanitized result,
+and timestamps. Unique job/work and job/file/stage constraints make resumed
+materialization idempotent. Parent/status and failed-first indexes support
+dependency dispatch and paginated operator reads. A partial unique active-
+stage-reservation index prevents concurrent replay jobs from owning the same
+canonical file/stage. A sibling partial unique work-reservation index fences
+active non-stage targets by canonical work kind and ID, so concurrent admins
+cannot queue duplicate ingest, outbox, backfill, source-post, or dead-letter
+work.
 
 ### MemeSeoPage
 

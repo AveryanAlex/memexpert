@@ -8,12 +8,15 @@ import asyncio
 import hashlib
 import json
 import math
+import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
+from fractions import Fraction
 from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
@@ -31,10 +34,11 @@ from memexpert.core.config import Settings, get_settings
 from memexpert.core.database import get_async_engine, get_async_session_factory
 from memexpert.core.meilisearch import PipelineMeilisearchSyncClient
 from memexpert.core.qdrant import PipelineQdrantSyncClient
-from memexpert.core.storage import get_pipeline_storage_settings, get_s3_client
+from memexpert.core.storage import derive_preview_image_object_key, get_pipeline_storage_settings, get_s3_client
 from memexpert.core.voyage import build_pipeline_voyage_client
 from memexpert.ingest.crawler_service import PipelineCrawlerIngestService
 from memexpert.ingest.schemas import IngestRequestRead
+from memexpert.media.contracts import WEB_VIDEO_PROFILE_ID
 from memexpert.messaging.rabbitmq_outbox_runtime import (
     RabbitMQOutboxPublisherBatchResult,
     run_rabbitmq_outbox_publisher_batch,
@@ -69,6 +73,7 @@ from memexpert.models.enums import (
     ContentProcessingStatus,
     EmbeddingInputType,
     IngestSourceKind,
+    MediaGenerationStatus,
     MemeVisibilityMode,
     PipelineIngestRequestStatus,
     SourceEngagementCaptureReason,
@@ -79,6 +84,7 @@ from memexpert.models.enums import (
     SyncTargetKind,
     SyncTargetStatus,
 )
+from memexpert.models.operations import MediaGeneration
 from memexpert.models.user import AnalyticsEvent, User
 from memexpert.schemas.content_pipeline import (
     ContentPipelineErrorResponse,
@@ -192,7 +198,7 @@ def _retry_after_seconds(value: str | None, *, now: datetime | None = None) -> f
     except ValueError:
         try:
             retry_at = parsedate_to_datetime(normalized)
-        except (TypeError, ValueError, OverflowError):
+        except TypeError, ValueError, OverflowError:
             return None
         if retry_at.tzinfo is None:
             retry_at = retry_at.replace(tzinfo=UTC)
@@ -480,6 +486,27 @@ class PipelineApiClient:
         target_collection_id: uuid.UUID,
         deadline: MonotonicDeadline,
     ) -> IngestRequestRead:
+        return self.upload_media(
+            media_bytes=image_bytes,
+            filename="e2e-prd-cat.png",
+            content_type="image/png",
+            post_id=run_id,
+            uploader_user_id=uploader_user_id,
+            target_collection_id=target_collection_id,
+            deadline=deadline,
+        )
+
+    def upload_media(
+        self,
+        *,
+        media_bytes: bytes,
+        filename: str,
+        content_type: str,
+        post_id: str,
+        uploader_user_id: uuid.UUID,
+        target_collection_id: uuid.UUID,
+        deadline: MonotonicDeadline,
+    ) -> IngestRequestRead:
         # The API persists and uniquely constrains (source_platform, source_id, post_id),
         # and returns that existing request on replay. That durable identity makes a
         # response-lost retry safe; arbitrary POST requests remain non-retryable.
@@ -491,12 +518,12 @@ class PipelineApiClient:
             data={
                 "source_platform": SourcePlatform.TELEGRAM.value,
                 "source_id": E2E_UPLOAD_SOURCE_ID,
-                "post_id": run_id,
+                "post_id": post_id,
                 "uploader_user_id": str(uploader_user_id),
                 "target_collection_id": str(target_collection_id),
                 "view_count": "1",
             },
-            files={"file": ("e2e-prd-cat.png", image_bytes, "image/png")},
+            files={"file": (filename, media_bytes, content_type)},
         )
         return _validate_response(response, expected_status=(200, 202), model=IngestRequestRead)
 
@@ -765,6 +792,45 @@ async def _run(args: argparse.Namespace) -> None:
             deadline=phase_deadline(),
         )
         print(f"Uploaded item dual-synced: ingest_request_id={ingest_request.id} meme_file_id={meme_file_id}")
+        print("Generating audible and silent moving-media fixtures with FFmpeg")
+        moving_media_fixtures = await asyncio.to_thread(_build_audio_profile_media_fixtures, settings)
+        audio_profile_proofs: list[dict[str, object]] = []
+        for fixture_name, fixture_bytes, expected_audio, expected_frame_rate in moving_media_fixtures:
+            print(f"Uploading {fixture_name} through /api/v1/pipeline/uploads")
+            media_ingest = api_client.upload_media(
+                media_bytes=fixture_bytes,
+                filename=f"e2e-prd-{fixture_name}.webm",
+                content_type="video/webm",
+                post_id=f"{run_id}-{fixture_name}",
+                uploader_user_id=private_upload_fixture.user_id,
+                target_collection_id=private_upload_fixture.collection_id,
+                deadline=phase_deadline(),
+            )
+            _materialized_media, moving_media_file_id = await wait_for_ingest_materialized_meme_file(
+                api_client,
+                ingest_request_id=media_ingest.id,
+                settings=settings,
+                session_factory=session_factory,
+                deadline=phase_deadline(),
+            )
+            await wait_for_dual_synced(
+                api_client,
+                meme_file_id=moving_media_file_id,
+                settings=settings,
+                session_factory=session_factory,
+                deadline=phase_deadline(),
+            )
+            audio_profile_proofs.append(
+                await _prove_audio_safe_derivative(
+                    settings=settings,
+                    session_factory=session_factory,
+                    s3_client=s3_client,
+                    meme_file_id=moving_media_file_id,
+                    fixture_name=fixture_name,
+                    expected_audio=expected_audio,
+                    expected_frame_rate=expected_frame_rate,
+                )
+            )
         await assert_private_upload_state(
             meme_id=detail.meme_id,
             meme_file_id=meme_file_id,
@@ -870,6 +936,7 @@ async def _run(args: argparse.Namespace) -> None:
             "query": "cat",
             "title": "Created cat pipeline meme",
         },
+        "audio_safe_media": audio_profile_proofs,
         "proof": {
             "public_search_total": created_search_payload.get("total"),
             "private_search_hit_ids_before_promotion": [
@@ -932,8 +999,7 @@ async def ensure_qdrant_collection(*, settings: Settings) -> None:
         size = _extract_qdrant_vector_size(info)
         if size is not None and size != settings.pipeline_voyage_output_dimensions:
             raise E2ESeedError(
-                "Qdrant collection dimension mismatch: "
-                f"{size} != {settings.pipeline_voyage_output_dimensions}",
+                f"Qdrant collection dimension mismatch: {size} != {settings.pipeline_voyage_output_dimensions}",
             )
     except E2ESeedError:
         raise
@@ -1769,11 +1835,7 @@ async def cleanup_seed_rows(session: AsyncSession, *, settings: Settings, specs:
     await cleanup_private_upload_fixture_rows(session)
     await cleanup_collection_management_fixture_rows(session)
 
-    analytics_event_ids = [
-        event_id
-        for spec in specs
-        for event_id in _public_trend_analytics_event_ids(spec.category)
-    ]
+    analytics_event_ids = [event_id for spec in specs for event_id in _public_trend_analytics_event_ids(spec.category)]
     if analytics_event_ids:
         await session.execute(delete(AnalyticsEvent).where(AnalyticsEvent.id.in_(analytics_event_ids)))
 
@@ -1790,8 +1852,7 @@ async def cleanup_seed_rows(session: AsyncSession, *, settings: Settings, specs:
 
     slug_result = await session.execute(
         select(MemeSeoPage).where(
-            MemeSeoPage.slug.in_([spec.slug for spec in specs])
-            | MemeSeoPage.slug.like("e2e-prd-created-%"),
+            MemeSeoPage.slug.in_([spec.slug for spec in specs]) | MemeSeoPage.slug.like("e2e-prd-created-%"),
         ),
     )
     for seo_page in slug_result.scalars():
@@ -1889,9 +1950,7 @@ async def cleanup_private_upload_fixture_rows(session: AsyncSession) -> None:
     )
     for channel in channels:
         await session.delete(channel)
-    users = await session.scalars(
-        select(User).where(or_(User.id == user_id, User.email == E2E_UPLOAD_USER_EMAIL))
-    )
+    users = await session.scalars(select(User).where(or_(User.id == user_id, User.email == E2E_UPLOAD_USER_EMAIL)))
     for user in users:
         await session.delete(user)
     await session.flush()
@@ -1965,9 +2024,7 @@ async def assert_private_upload_state(
                 f"mode={meme.visibility_mode.value} is_public={meme.is_public}"
             )
         if await session.get(CollectionMeme, (fixture.collection_id, meme_id)) is None:
-            raise E2ESeedError(
-                f"Private upload {meme_id} is missing collection membership {fixture.collection_id}."
-            )
+            raise E2ESeedError(f"Private upload {meme_id} is missing collection membership {fixture.collection_id}.")
         source = await session.scalar(
             select(MemeSource).where(
                 MemeSource.file_id == meme_file_id,
@@ -2082,9 +2139,7 @@ async def promote_private_upload_with_crawler(
     async with session_factory() as session:
         meme = await session.get(Meme, expected_meme_id)
         if meme is None or not meme.is_public or meme.visibility_mode is not MemeVisibilityMode.AUTO:
-            raise E2ESeedError(
-                f"Crawler exact-SHA source did not AUTO-promote meme {expected_meme_id}."
-            )
+            raise E2ESeedError(f"Crawler exact-SHA source did not AUTO-promote meme {expected_meme_id}.")
         file_count = await session.scalar(
             select(func.count()).select_from(MemeFile).where(MemeFile.meme_id == expected_meme_id)
         )
@@ -2196,6 +2251,283 @@ def wait_for_public_search_contains(
     raise E2ESeedError(
         f"Public search did not include created meme {meme_id} after crawler-promotion re-sync; hits={hit_ids}",
     )
+
+
+def _build_audio_profile_media_fixtures(
+    settings: Settings,
+) -> tuple[tuple[str, bytes, bool, float], ...]:
+    """Generate tiny real WebM inputs that exercise Opus audio and silent FPS capping."""
+
+    with tempfile.TemporaryDirectory(prefix="memexpert-e2e-media-") as temp_dir:
+        temp_path = Path(temp_dir)
+        audible_path = temp_path / "audible-webm-opus.webm"
+        silent_path = temp_path / "silent-webm-60fps.webm"
+        common = (
+            settings.pipeline_ffmpeg_binary,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+        )
+        _run_e2e_media_command(
+            (
+                *common,
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=640x360:rate=24:duration=2",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=880:sample_rate=48000:duration=2",
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-c:v",
+                "libvpx-vp9",
+                "-deadline",
+                "realtime",
+                "-cpu-used",
+                "8",
+                "-b:v",
+                "500k",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "libopus",
+                "-b:a",
+                "96k",
+                "-shortest",
+                str(audible_path),
+            )
+        )
+        _run_e2e_media_command(
+            (
+                *common,
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=360x640:rate=60:duration=2",
+                "-map",
+                "0:v:0",
+                "-an",
+                "-c:v",
+                "libvpx-vp9",
+                "-deadline",
+                "realtime",
+                "-cpu-used",
+                "8",
+                "-b:v",
+                "500k",
+                "-pix_fmt",
+                "yuv420p",
+                str(silent_path),
+            )
+        )
+        return (
+            ("audible-webm-opus", audible_path.read_bytes(), True, 24.0),
+            ("silent-webm-60fps", silent_path.read_bytes(), False, 30.0),
+        )
+
+
+def _run_e2e_media_command(args: tuple[str, ...]) -> None:
+    try:
+        result = subprocess.run(args, capture_output=True, check=False, timeout=90)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise E2ESeedError(f"Could not generate the real moving-media E2E fixture: {type(exc).__name__}.") from exc
+    if result.returncode != 0:
+        error = " ".join(result.stderr.decode("utf-8", errors="replace").split())[:1000]
+        raise E2ESeedError(f"FFmpeg could not generate a moving-media E2E fixture: {error}")
+
+
+async def _prove_audio_safe_derivative(
+    *,
+    settings: Settings,
+    session_factory: AsyncSessionFactory,
+    s3_client: Any,
+    meme_file_id: uuid.UUID,
+    fixture_name: str,
+    expected_audio: bool,
+    expected_frame_rate: float,
+) -> dict[str, object]:
+    """Download and independently probe an activated derivative from the real stack."""
+
+    async with session_factory() as session:
+        meme_file = await session.get(MemeFile, meme_file_id)
+        if meme_file is None:
+            raise E2ESeedError(f"Moving-media fixture {fixture_name} lost its canonical file row.")
+        if meme_file.s3_web_video_key is None or meme_file.active_media_generation_id is None:
+            raise E2ESeedError(f"Moving-media fixture {fixture_name} did not activate an immutable derivative.")
+        generation = await session.get(MediaGeneration, meme_file.active_media_generation_id)
+        if generation is None or generation.status is not MediaGenerationStatus.ACTIVE:
+            raise E2ESeedError(f"Moving-media fixture {fixture_name} has no active generation ledger row.")
+        if generation.web_video_object_key != meme_file.s3_web_video_key:
+            raise E2ESeedError(f"Moving-media fixture {fixture_name} has a mismatched active object pointer.")
+        if (
+            generation.profile != WEB_VIDEO_PROFILE_ID
+            or generation.verified_at is None
+            or meme_file.web_video_profile != WEB_VIDEO_PROFILE_ID
+            or meme_file.web_video_verified_at is None
+        ):
+            raise E2ESeedError(f"Moving-media fixture {fixture_name} does not use the verified v2 profile.")
+        if (
+            generation.source_has_audio is not expected_audio
+            or generation.output_has_audio is not expected_audio
+            or meme_file.source_has_audio is not expected_audio
+            or meme_file.web_video_has_audio is not expected_audio
+        ):
+            raise E2ESeedError(f"Moving-media fixture {fixture_name} has inconsistent persisted audio state.")
+        web_video_key = meme_file.s3_web_video_key
+        preview_key = derive_preview_image_object_key(
+            web_video_key,
+            meme_file_id=meme_file.id,
+            settings=settings,
+        )
+        if preview_key != generation.preview_image_object_key:
+            raise E2ESeedError(f"Moving-media fixture {fixture_name} points at a mismatched poster generation.")
+
+    storage = get_pipeline_storage_settings(settings)
+    web_video_bytes, preview_bytes = await asyncio.gather(
+        asyncio.to_thread(_download_e2e_object, s3_client, storage.bucket, web_video_key),
+        asyncio.to_thread(_download_e2e_object, s3_client, storage.bucket, preview_key),
+    )
+    if not preview_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise E2ESeedError(f"Moving-media fixture {fixture_name} did not download a valid PNG poster.")
+    observations = await asyncio.to_thread(_probe_downloaded_e2e_video, settings, web_video_bytes)
+    streams = observations.get("streams")
+    media_format = observations.get("format")
+    if not isinstance(streams, list) or not isinstance(media_format, dict):
+        raise E2ESeedError(f"FFprobe returned malformed output for moving-media fixture {fixture_name}.")
+    videos = [stream for stream in streams if isinstance(stream, dict) and stream.get("codec_type") == "video"]
+    audios = [stream for stream in streams if isinstance(stream, dict) and stream.get("codec_type") == "audio"]
+    if len(videos) != 1 or len(audios) != int(expected_audio):
+        raise E2ESeedError(f"Moving-media fixture {fixture_name} has the wrong output stream counts.")
+    if len(streams) != len(videos) + len(audios):
+        raise E2ESeedError(f"Moving-media fixture {fixture_name} contains an unexpected stream type.")
+    video = videos[0]
+    format_names = {value.strip() for value in str(media_format.get("format_name", "")).split(",")}
+    if "mp4" not in format_names and "mov" not in format_names:
+        raise E2ESeedError(f"Moving-media fixture {fixture_name} did not download an MP4 container.")
+    if (
+        video.get("codec_name") != "h264"
+        or str(video.get("profile", "")).casefold() != "high"
+        or video.get("pix_fmt") != "yuv420p"
+        or _probe_non_negative_int(video.get("level")) != 41
+    ):
+        raise E2ESeedError(f"Moving-media fixture {fixture_name} violates the H.264 playback profile.")
+    width = _probe_non_negative_int(video.get("width"))
+    height = _probe_non_negative_int(video.get("height"))
+    if (
+        width is None
+        or height is None
+        or width < 2
+        or height < 2
+        or width % 2
+        or height % 2
+        or not _within_mobile_video_envelope(width, height)
+    ):
+        raise E2ESeedError(f"Moving-media fixture {fixture_name} violates the even 1080p envelope.")
+    frame_rate = _positive_probe_rate(video.get("avg_frame_rate") or video.get("r_frame_rate"))
+    if frame_rate is None or frame_rate > 30.01 or abs(frame_rate - expected_frame_rate) > 0.05:
+        raise E2ESeedError(f"Moving-media fixture {fixture_name} produced unexpected frame rate {frame_rate!r}.")
+    bit_rate = _probe_non_negative_int(video.get("bit_rate"))
+    if bit_rate is None or bit_rate <= 0 or bit_rate > 6_300_000:
+        raise E2ESeedError(f"Moving-media fixture {fixture_name} violates the 6 Mbps video-rate profile.")
+    if audios:
+        audio = audios[0]
+        normalized_audio_profile = str(audio.get("profile", "")).replace("AAC", "").strip().casefold()
+        if (
+            audio.get("codec_name") != "aac"
+            or normalized_audio_profile not in {"lc", "low complexity"}
+            or _probe_non_negative_int(audio.get("sample_rate")) != 48_000
+            or _probe_non_negative_int(audio.get("channels")) != 2
+        ):
+            raise E2ESeedError(f"Moving-media fixture {fixture_name} violates the AAC-LC audio profile.")
+    return {
+        "fixture": fixture_name,
+        "meme_file_id": str(meme_file_id),
+        "profile": WEB_VIDEO_PROFILE_ID,
+        "downloaded_byte_size": len(web_video_bytes),
+        "poster_byte_size": len(preview_bytes),
+        "width": width,
+        "height": height,
+        "frame_rate": frame_rate,
+        "video_bit_rate": bit_rate,
+        "video_codec": "h264",
+        "audio_codec": "aac" if expected_audio else None,
+        "source_has_audio": expected_audio,
+        "web_video_has_audio": expected_audio,
+    }
+
+
+def _download_e2e_object(client: Any, bucket: str, key: str) -> bytes:
+    try:
+        response = client.get_object(Bucket=bucket, Key=key)
+        body = response["Body"]
+        try:
+            payload = body.read()
+        finally:
+            body.close()
+    except Exception as exc:  # noqa: BLE001 - render one safe fixture-level failure.
+        raise E2ESeedError(f"Could not download an activated E2E media artifact: {type(exc).__name__}.") from exc
+    if not isinstance(payload, bytes) or not payload:
+        raise E2ESeedError("An activated E2E media artifact was empty.")
+    return payload
+
+
+def _probe_downloaded_e2e_video(settings: Settings, payload: bytes) -> dict[str, object]:
+    with tempfile.TemporaryDirectory(prefix="memexpert-e2e-probe-") as temp_dir:
+        path = Path(temp_dir) / "downloaded.mp4"
+        path.write_bytes(payload)
+        args = (
+            settings.pipeline_ffprobe_binary,
+            "-v",
+            "error",
+            "-show_streams",
+            "-show_format",
+            "-of",
+            "json",
+            str(path),
+        )
+        try:
+            result = subprocess.run(args, capture_output=True, check=False, timeout=30)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise E2ESeedError(f"Could not probe the downloaded E2E derivative: {type(exc).__name__}.") from exc
+    if result.returncode != 0:
+        error = " ".join(result.stderr.decode("utf-8", errors="replace").split())[:1000]
+        raise E2ESeedError(f"FFprobe rejected the downloaded E2E derivative: {error}")
+    try:
+        decoded = json.loads(result.stdout)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise E2ESeedError("FFprobe returned malformed JSON for the downloaded E2E derivative.") from exc
+    if not isinstance(decoded, dict):
+        raise E2ESeedError("FFprobe returned malformed metadata for the downloaded E2E derivative.")
+    return decoded
+
+
+def _positive_probe_rate(value: object) -> float | None:
+    try:
+        rate = Fraction(str(value))
+    except ValueError, ZeroDivisionError:
+        return None
+    return float(rate) if rate > 0 else None
+
+
+def _probe_non_negative_int(value: object) -> int | None:
+    try:
+        parsed = int(str(value))
+    except ValueError:
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _within_mobile_video_envelope(width: int, height: int) -> bool:
+    if width > height:
+        return width <= 1920 and height <= 1080
+    if height > width:
+        return width <= 1080 and height <= 1920
+    return width <= 1080 and height <= 1080
 
 
 async def wait_for_ingest_materialized_meme_file(
@@ -2387,11 +2719,7 @@ def prove_seeded_public_trends(
     representative = _require_seeded_category(seeded, "cat")
 
     trend_page = client.public_trend_page(deadline=deadline, limit=20)
-    trend_ids = [
-        item.get("meme", {}).get("id")
-        for item in trend_page.get("items", [])
-        if isinstance(item, dict)
-    ]
+    trend_ids = [item.get("meme", {}).get("id") for item in trend_page.get("items", []) if isinstance(item, dict)]
     if str(representative.meme_id) not in trend_ids:
         raise E2ESeedError(
             f"Public trends page did not include seeded representative meme {representative.meme_id}; "
@@ -2485,11 +2813,7 @@ def _assert_landing_trend_summary(landing: dict[str, Any], *, slug: str, label: 
 
 def _assert_expected_public_trend_points(points: list[Any], *, label: str) -> None:
     expected_points = build_public_trend_aggregate_history_points_payload()
-    points_by_day = {
-        str(point.get("observed_at", ""))[:10]: point
-        for point in points
-        if isinstance(point, dict)
-    }
+    points_by_day = {str(point.get("observed_at", ""))[:10]: point for point in points if isinstance(point, dict)}
     for expected in expected_points:
         observed_day = str(expected["observed_at"])[:10]
         point = points_by_day.get(observed_day)
@@ -2534,9 +2858,7 @@ def _assert_public_trend_comparison(
     if not isinstance(meme_points, list):
         raise E2ESeedError(f"Public trend comparison meme series has malformed points: {comparison}")
     meme_points_by_day = {
-        str(point.get("observed_at", ""))[:10]: point
-        for point in meme_points
-        if isinstance(point, dict)
+        str(point.get("observed_at", ""))[:10]: point for point in meme_points if isinstance(point, dict)
     }
     for observed_at, expected_metrics in _public_trend_daily_metrics(representative.category).items():
         observed_day = observed_at.date().isoformat()
@@ -2584,8 +2906,7 @@ def _assert_public_trend_timeline(
     if period is None:
         raise E2ESeedError(f"Public trend timeline missing period {E2E_PUBLIC_TRENDS_TIMELINE_PERIOD}: {timeline}")
     expected_snapshot_count = sum(
-        int(point["snapshot_count"])
-        for point in build_public_trend_aggregate_history_points_payload()
+        int(point["snapshot_count"]) for point in build_public_trend_aggregate_history_points_payload()
     )
     if period.get("snapshot_count") != expected_snapshot_count:
         raise E2ESeedError(
@@ -2641,8 +2962,7 @@ def assert_public_detail_hidden(
     if status_code == 200 and payload.get("id") != str(meme_id):
         return
     raise E2ESeedError(
-        f"Anonymous public detail for NSFW slug {slug!r} should be hidden; "
-        f"status={status_code}, payload={payload}",
+        f"Anonymous public detail for NSFW slug {slug!r} should be hidden; status={status_code}, payload={payload}",
     )
 
 
@@ -2659,11 +2979,7 @@ def assert_public_search_excludes(payload: dict[str, Any], *, meme_id: uuid.UUID
 
 
 def _public_search_hit_ids(payload: dict[str, Any]) -> list[object]:
-    return [
-        item.get("meme", {}).get("id")
-        for item in payload.get("items", [])
-        if isinstance(item, dict)
-    ]
+    return [item.get("meme", {}).get("id") for item in payload.get("items", []) if isinstance(item, dict)]
 
 
 def build_seed_png_bytes(spec: SeedSpec) -> bytes:

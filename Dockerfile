@@ -3,8 +3,11 @@
 ARG PYTHON_VERSION=3.14
 ARG DEBIAN_VERSION=bookworm
 ARG UV_VERSION=0.11.19
+ARG FFMPEG_VERSION=8.1.2
+ARG FFMPEG_IMAGE=mwader/static-ffmpeg:8.1.2@sha256:33f770f812cbfc3de96c547157fc9faf8bd95a36481753439ffa761045167585
 
 FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
+FROM ${FFMPEG_IMAGE} AS ffmpeg-bin
 
 
 FROM python:${PYTHON_VERSION}-slim-${DEBIAN_VERSION} AS runtime-base
@@ -79,19 +82,24 @@ CMD ["memexpert-scheduler"]
 
 FROM runtime-base AS worker-system
 
+ARG FFMPEG_VERSION
+
 ENV PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True \
     OMP_NUM_THREADS=1 \
     OPENBLAS_NUM_THREADS=1 \
     MKL_NUM_THREADS=1 \
     NUMEXPR_NUM_THREADS=1
 
+COPY --from=ffmpeg-bin --chmod=0755 /ffmpeg /ffprobe /usr/local/bin/
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ffmpeg \
         libgl1 \
         libglib2.0-0 \
         libgomp1 \
     && rm -rf /var/lib/apt/lists/* \
+    && ffmpeg -version 2>&1 | grep -F "ffmpeg version ${FFMPEG_VERSION} " \
+    && ffprobe -version 2>&1 | grep -F "ffprobe version ${FFMPEG_VERSION} " \
     && mkdir -p /app/.paddleocr /app/.paddlex \
     && chown app:app /app/.paddleocr /app/.paddlex
 

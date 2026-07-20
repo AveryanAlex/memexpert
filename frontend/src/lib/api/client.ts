@@ -19,9 +19,15 @@ import type {
   AdminModerationReportRead,
   AdminOverviewRead,
   AdminRecoveryBatchMutationPayload,
+  AdminRecoveryBatchHandoffPayload,
   AdminRecoveryBatchPreviewPayload,
   AdminRecoveryBatchRead,
+  AdminRecoveryActionPayload,
+  AdminRecoveryCandidateRead,
+  AdminRecoveryJobItemPageRead,
+  AdminRecoveryJobPageRead,
   AdminRecoveryMutationPayload,
+  AdminRecoveryRetryFailedPreviewPayload,
   AdminRecoverySummaryRead,
   AdminRecoveryWorkRead,
   AdminRecoveryWorkPageRead,
@@ -847,6 +853,30 @@ export async function fetchAdminRecoveryWorkDetail(
   );
 }
 
+export async function fetchAdminRecoveryCandidate(
+  request: CatalogRequest,
+  kind: AdminRecoveryWorkKind,
+  workId: string
+): Promise<AdminRecoveryCandidateRead> {
+  return apiGet<AdminRecoveryCandidateRead>(
+    `/api/v1/admin/recovery/work/${encodeURIComponent(kind)}/${encodeURIComponent(workId)}/candidate`,
+    new URLSearchParams(),
+    request
+  );
+}
+
+export async function actOnAdminRecoveryWork(
+  request: CatalogRequest & { body: AdminRecoveryActionPayload },
+  kind: AdminRecoveryWorkKind,
+  workId: string
+): Promise<AdminRecoveryBatchRead> {
+  return apiWrite<AdminRecoveryBatchRead>(
+    `/api/v1/admin/recovery/work/${encodeURIComponent(kind)}/${encodeURIComponent(workId)}/actions`,
+    'POST',
+    request
+  );
+}
+
 export async function retryAdminRecoveryWork(
   request: CatalogRequest & { body: AdminRecoveryMutationPayload },
   kind: AdminRecoveryWorkKind,
@@ -876,6 +906,50 @@ export async function fetchAdminRecoveryBatch(
   );
 }
 
+export async function fetchAdminRecoveryJobs(
+  request: CatalogRequest,
+  pagination: { cursor?: string | null; limit?: number; status?: string | null } = {}
+): Promise<AdminRecoveryJobPageRead> {
+  const params = new URLSearchParams({ limit: String(pagination.limit ?? 25) });
+  if (pagination.cursor) params.set('cursor', pagination.cursor);
+  if (pagination.status) params.set('status', pagination.status);
+  return apiGet<AdminRecoveryJobPageRead>('/api/v1/admin/recovery/batches', params, request);
+}
+
+export async function fetchAdminRecoveryJobItems(
+  request: CatalogRequest,
+  jobId: string,
+  pagination: {
+    cursor?: string | null;
+    limit?: number;
+    status?: string | null;
+    order?: 'created' | 'failed_first';
+  } = {}
+): Promise<AdminRecoveryJobItemPageRead> {
+  const params = new URLSearchParams({
+    limit: String(pagination.limit ?? 50),
+    failed_first: String((pagination.order ?? 'failed_first') === 'failed_first')
+  });
+  if (pagination.cursor) params.set('cursor', pagination.cursor);
+  if (pagination.status) params.set('status', pagination.status);
+  return apiGet<AdminRecoveryJobItemPageRead>(
+    `/api/v1/admin/recovery/batches/${encodeURIComponent(jobId)}/items`,
+    params,
+    request
+  );
+}
+
+export async function previewFailedAdminRecoveryBatch(
+  request: CatalogRequest & { body: AdminRecoveryRetryFailedPreviewPayload },
+  jobId: string
+): Promise<AdminRecoveryBatchRead> {
+  return apiWrite<AdminRecoveryBatchRead>(
+    `/api/v1/admin/recovery/batches/${encodeURIComponent(jobId)}/retry-failed-preview`,
+    'POST',
+    request
+  );
+}
+
 export async function scheduleAdminRecoveryBatch(
   request: CatalogRequest & { body: AdminRecoveryBatchMutationPayload },
   jobId: string
@@ -893,6 +967,17 @@ export async function cancelAdminRecoveryBatch(
 ): Promise<AdminRecoveryBatchRead> {
   return apiWrite<AdminRecoveryBatchRead>(
     `/api/v1/admin/recovery/batches/${encodeURIComponent(jobId)}/cancel`,
+    'POST',
+    request
+  );
+}
+
+export async function handoffAdminRecoveryBatch(
+  request: CatalogRequest & { body: AdminRecoveryBatchHandoffPayload },
+  jobId: string
+): Promise<AdminRecoveryBatchRead> {
+  return apiWrite<AdminRecoveryBatchRead>(
+    `/api/v1/admin/recovery/batches/${encodeURIComponent(jobId)}/handoff`,
     'POST',
     request
   );

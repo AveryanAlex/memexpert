@@ -118,6 +118,11 @@ class Settings(BaseSettings):
     pipeline_circuit_failure_threshold: int = Field(default=3, ge=1, le=32)
     pipeline_circuit_cooldown_seconds: float = Field(default=30.0, gt=0.0, le=3600.0)
     pipeline_stuck_reclaim_after_seconds: float = Field(default=900.0, gt=60.0, le=86400.0)
+    media_generation_retention_seconds: float = Field(
+        default=7 * 86400.0,
+        ge=7 * 86400.0,
+        le=90 * 86400.0,
+    )
     recovery_telegram_poll_interval_seconds: float = Field(default=5.0, gt=0.0, le=300.0)
     recovery_telegram_batch_size: int = Field(default=10, ge=1, le=100)
     runtime_health_file: Path = Path("/tmp/memexpert-runtime-health.json")
@@ -224,6 +229,9 @@ class Settings(BaseSettings):
     scheduler_recovery_dispatch_enabled: bool = True
     scheduler_recovery_dispatch_interval_seconds: float = Field(default=5.0, gt=0.0, le=300.0)
     scheduler_recovery_dispatch_batch_size: int = Field(default=50, ge=1, le=1000)
+    scheduler_media_generation_gc_enabled: bool = True
+    scheduler_media_generation_gc_interval_seconds: float = Field(default=3600.0, gt=0.0, le=86400.0)
+    scheduler_media_generation_gc_batch_size: int = Field(default=100, ge=1, le=1000)
     scheduler_pipeline_capacity_refresh_enabled: bool = True
     scheduler_pipeline_capacity_refresh_interval_seconds: float = Field(default=15.0, gt=0.0, le=300.0)
     scheduler_telegram_login_cleanup_enabled: bool = True

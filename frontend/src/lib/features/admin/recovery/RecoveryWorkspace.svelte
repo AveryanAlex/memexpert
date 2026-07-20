@@ -2,25 +2,33 @@
   import type {
     AdminRecoveryBatchRead,
     AdminRecoveryCapability,
+    AdminRecoveryJobPageRead,
+    AdminRecoveryReplayScope,
+    AdminRecoveryRetryLimit,
     AdminRecoverySummaryRead,
     AdminRecoveryWorkRead,
     AdminRecoveryWorkPageRead
   } from '$lib/api/types';
   import AdminPanel from '$lib/features/admin/AdminPanel.svelte';
   import { formatAdminTimestamp } from '$lib/features/admin/formatTimestamp';
-  import { ActionLink, Badge, Button, Card, EmptyState, FormRow, Input, Notice, Select, Textarea } from '$lib/ui';
-  import RecoveryActionForm from './RecoveryActionForm.svelte';
+  import { ActionLink, Badge, Button, Card, EmptyState, FormRow, Input, Label, Notice, Select, Textarea } from '$lib/ui';
+  import RecoveryActionMenu from './RecoveryActionMenu.svelte';
+  import RecoveryJobs from './RecoveryJobs.svelte';
+  import RecoveryRegenerate from './RecoveryRegenerate.svelte';
   import {
     RECOVERY_BUCKETS,
+    RECOVERY_RETRY_LIMITS,
+    RECOVERY_SECTIONS,
     RECOVERY_PAGE_SIZE,
     RECOVERY_STAGES,
     RECOVERY_WORK_KINDS,
     humanizeRecoveryValue,
+    recoveryActionsForWork,
+    recoveryBatchAcknowledgements,
     recoveryBucketLabel,
     recoveryCapabilityLabel,
     recoveryDefaultBatchCapability,
     recoveryHref,
-    recoveryPrimaryCapability,
     recoveryWorkRequestKey,
     recoveryWorkHref,
     recoveryWorkKindLabel,
@@ -31,20 +39,26 @@
   let {
     summary,
     workPage,
+    jobsPage,
     filters,
     requestIds,
     loadError,
+    jobsLoadError,
     form
   }: {
     summary: AdminRecoverySummaryRead;
     workPage: AdminRecoveryWorkPageRead;
+    jobsPage: AdminRecoveryJobPageRead;
     filters: RecoveryFilters;
     requestIds: RecoveryWorkspaceRequestIds;
     loadError: string | null;
+    jobsLoadError: string | null;
     form?: { message?: string; error?: boolean; batch?: AdminRecoveryBatchRead; recoveryJobId?: string | null } | null;
   } = $props();
 
   let selectedBatchCapability = $state<AdminRecoveryCapability | null>(null);
+  let selectedBatchScope = $state<AdminRecoveryReplayScope>('stage_only');
+  let selectedBatchRetryLimit = $state<AdminRecoveryRetryLimit>(3);
   let selectedItemValues = $state<string[]>([]);
   let selectionPageKey = $state<string | null>(null);
 
@@ -55,17 +69,26 @@
     { bucket: 'dead_lettered' as const, label: 'Dead-lettered', count: summary.dead_lettered_count, detail: 'Broker delivery ended and needs review.' }
   ]);
   const batchCapability = $derived(
-    selectedBatchCapability ?? recoveryDefaultBatchCapability(workPage.items)
+    selectedBatchCapability
+      ?? workPage.items.flatMap(recoveryActionsForWork).find((action) => action.available)?.capability
+      ?? recoveryDefaultBatchCapability(workPage.items)
   );
   const currentPageKey = $derived(currentSelectionPageKey());
   const compatibleItemValues = $derived(
     workPage.items
-      .filter((work) => work.capabilities.includes(batchCapability))
+      .filter((work) => recoveryActionsForWork(work).some((action) => action.available && action.capability === batchCapability))
       .map(recoveryWorkSelectionValue)
   );
   const selectedItemValueSet = $derived(new Set(selectedItemValues));
   const selectedCompatibleCount = $derived(
     compatibleItemValues.filter((value) => selectedItemValueSet.has(value)).length
+  );
+  const selectedBatchAcknowledgements = $derived(
+    recoveryBatchAcknowledgements(
+      workPage.items.filter((work) => selectedItemValueSet.has(recoveryWorkSelectionValue(work))),
+      batchCapability,
+      selectedBatchScope
+    )
   );
   const allCompatibleSelected = $derived(
     compatibleItemValues.length > 0 && selectedCompatibleCount === compatibleItemValues.length
@@ -73,6 +96,7 @@
   const someCompatibleSelected = $derived(
     selectedCompatibleCount > 0 && !allCompatibleSelected
   );
+  const allMatchingQueryFilters = $derived(JSON.stringify(recoveryQueryFilters()));
 
   $effect(() => {
     if (selectionPageKey === null) {
@@ -82,6 +106,8 @@
     if (currentPageKey === selectionPageKey) return;
     selectionPageKey = currentPageKey;
     selectedBatchCapability = null;
+    selectedBatchScope = 'stage_only';
+    selectedBatchRetryLimit = 3;
     selectedItemValues = [];
   });
 
@@ -89,6 +115,7 @@
     const nextCapability = (event.currentTarget as HTMLSelectElement).value as AdminRecoveryCapability;
     if (nextCapability === batchCapability) return;
     selectedBatchCapability = nextCapability;
+    selectedBatchScope = 'stage_only';
     selectedItemValues = [];
   }
 
@@ -113,13 +140,43 @@
       workPage.items.map((work) => [work.kind, work.id, work.version])
     ]);
   }
+
+  function recoveryQueryFilters(): Record<string, string> {
+    const queryFilters: Record<string, string> = {};
+    if (filters.bucket) queryFilters.bucket = filters.bucket;
+    if (filters.kind) queryFilters.kind = filters.kind;
+    if (filters.stage) queryFilters.stage = filters.stage;
+    if (filters.reason) queryFilters.reason = filters.reason;
+    if (filters.query) queryFilters.query = filters.query;
+    else if (filters.source) {
+      if (/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(filters.source)) {
+        queryFilters.source_channel_id = filters.source;
+      } else queryFilters.query = filters.source;
+    }
+    return queryFilters;
+  }
 </script>
 
 <section class="grid gap-3">
-  <p class="m-0 text-sm font-black uppercase tracking-[0.16em] text-muted">Recovery control plane</p>
-  <h1 class="m-0 text-[clamp(2.4rem,8vw,5rem)] font-black leading-[0.9] tracking-[-0.075em]">Failed and stuck work</h1>
-  <p class="m-0 max-w-3xl text-muted">Inspect canonical failure state, then queue one bounded and audited recovery action. Historical failures never replay automatically.</p>
+  <p class="m-0 text-sm font-black uppercase tracking-[0.16em] text-muted">Operational control plane</p>
+  <h1 class="m-0 text-[clamp(2.4rem,8vw,5rem)] font-black leading-[0.9] tracking-[-0.075em]">Replay &amp; Repair</h1>
+  <p class="m-0 max-w-3xl text-muted">Inspect failures, deliberately regenerate derived media, and follow every audited replay job without taking healthy catalog media offline.</p>
 </section>
+
+<nav class="mt-6 grid gap-2 sm:grid-cols-3" aria-label="Replay and Repair sections">
+  {#each RECOVERY_SECTIONS as section (section.value)}
+    <a
+      href={recoveryHref(filters, { section: section.value, cursor: null, jobCursor: null })}
+      aria-current={filters.section === section.value ? 'page' : undefined}
+      class={filters.section === section.value
+        ? 'rounded-2xl border border-ink bg-ink p-4 text-paper no-underline'
+        : 'rounded-2xl border border-line bg-paper p-4 text-ink no-underline hover:bg-soft'}
+    >
+      <strong>{section.label}</strong>
+      <span class="mt-1 block text-xs opacity-80">{section.description}</span>
+    </a>
+  {/each}
+</nav>
 
 {#if form?.message}
   <Notice tone={form.error ? 'danger' : 'success'} role={form.error ? 'alert' : 'status'}>
@@ -129,9 +186,10 @@
     {/if}
   </Notice>
 {/if}
-{#if loadError}
-  <Notice tone="danger" role="alert">{loadError}</Notice>
-{/if}
+{#if filters.section === 'needs_attention'}
+  {#if loadError}
+    <Notice tone="danger" role="alert">{loadError}</Notice>
+  {/if}
 
 <section class="mt-6 grid gap-3 sm:grid-cols-2 xl:grid-cols-4" aria-label="Recovery summary">
   {#each summaryCards as card (card.bucket)}
@@ -205,6 +263,8 @@
         <option value="resume_backfill">Resume backfills</option>
         <option value="replay_source_post">Replay Telegram posts</option>
         <option value="reinspect_ingest">Re-inspect media</option>
+        <option value="regenerate_derivatives">Regenerate derivatives</option>
+        <option value="replay_stage">Replay pipeline stage</option>
         <option value="retry_stage">Retry pipeline stage</option>
         <option value="resync_target">Resync search target</option>
         <option value="rebuild_outbox">Rebuild outbox event</option>
@@ -248,8 +308,8 @@
         </thead>
         <tbody>
           {#each workPage.items as work (`${work.kind}:${work.id}`)}
-            {@const capability = recoveryPrimaryCapability(work.capabilities)}
-            {@const canBatch = work.capabilities.includes(batchCapability)}
+            {@const actions = recoveryActionsForWork(work)}
+            {@const canBatch = actions.some((action) => action.available && action.capability === batchCapability)}
             {@const selectionValue = recoveryWorkSelectionValue(work)}
             <tr class="border-t border-line align-top" class:bg-soft={selectedItemValueSet.has(selectionValue)}>
               <td class="px-4 py-4">
@@ -282,13 +342,14 @@
               <td class="px-4 py-4">{work.attempt_count.toLocaleString('en-US')}</td>
               <td class="px-4 py-4">{formatAdminTimestamp(work.occurred_at)}</td>
               <td class="px-4 py-4">
-                {#if capability}
-                  <RecoveryActionForm
+                {#if actions.length}
+                  <RecoveryActionMenu
                     kind={work.kind}
                     workId={work.id}
                     version={work.version}
                     requestId={requestIds.work[recoveryWorkRequestKey(work)]}
-                    {capability}
+                    {actions}
+                    stage={work.stage}
                     compact
                   />
                 {:else}
@@ -319,11 +380,23 @@
   </nav>
 </section>
 
-<AdminPanel title="Bounded batch recovery" class="mt-6">
+<AdminPanel title="Preview selected recovery work" class="mt-6">
   <p class="mt-0 text-sm text-muted">Choose the batch action above the table, select compatible rows on the current page, and preview them. Nothing is dispatched until the preview is explicitly scheduled.</p>
   <p class="text-sm font-extrabold" aria-live="polite">{selectedCompatibleCount.toLocaleString('en-US')} of {compatibleItemValues.length.toLocaleString('en-US')} compatible rows selected for {recoveryCapabilityLabel(batchCapability)}.</p>
   <form id="batch-preview-form" method="POST" action="?/previewRecoveryBatch" class="grid gap-3 lg:grid-cols-2">
     <input type="hidden" name="request_id" value={requestIds.batchPreview} />
+    <input type="hidden" name="selector_type" value="explicit" />
+    <FormRow label="Replay scope">
+      <Select name="scope" bind:value={selectedBatchScope}>
+        <option value="stage_only">Selected stage only</option>
+        {#if batchCapability === 'replay_stage'}<option value="stage_and_dependents">Stage and dependents</option>{/if}
+      </Select>
+    </FormRow>
+    <FormRow label="Retry limit" hint="Only retryable failures consume this budget.">
+      <Select name="retry_limit" bind:value={selectedBatchRetryLimit}>
+        {#each RECOVERY_RETRY_LIMITS as limit}<option value={limit}>{limit} attempt{limit === 1 ? '' : 's'}</option>{/each}
+      </Select>
+    </FormRow>
     <FormRow label="Audit reason" hint="Applied to every item admitted to this batch.">
       <Textarea name="reason" rows={3} minlength={3} maxlength={500} required placeholder="Why is this bounded recovery safe now?" />
     </FormRow>
@@ -332,8 +405,45 @@
         <Input name="confirmation_phrase" autocomplete="off" required />
       </FormRow>
     {/if}
+    {#each selectedBatchAcknowledgements as acknowledgement (acknowledgement.key)}
+      <Label class="!flex items-start gap-2 rounded-2xl border border-line bg-soft p-3">
+        <input type="checkbox" name="acknowledgement" value={acknowledgement.key} required class="mt-1 size-4 accent-accent" />
+        <span class="text-sm">{acknowledgement.label}</span>
+      </Label>
+    {/each}
     <div class="flex items-end"><Button type="submit">Preview batch</Button></div>
   </form>
+
+  <div class="mt-5 grid gap-3 rounded-2xl border border-line bg-soft p-4">
+    <div>
+      <strong>Select all matching</strong>
+      <p class="mb-0 mt-1 text-sm text-muted">Create one uncapped query preview from the current action and filters. Preparing returns immediately; the scheduler freezes a server-owned membership snapshot, then resumably expands and revalidates it. The page timestamp is context, not historical reconstruction.</p>
+    </div>
+    <form method="POST" action="?/previewRecoveryBatch" class="grid gap-3 lg:grid-cols-2" data-all-matching-preview>
+      <input type="hidden" name="request_id" value={requestIds.allMatchingPreview} />
+      <input type="hidden" name="action" value={batchCapability} />
+      <input type="hidden" name="scope" value={selectedBatchScope} />
+      <input type="hidden" name="retry_limit" value={selectedBatchRetryLimit} />
+      <input type="hidden" name="selector_type" value="query" />
+      <input type="hidden" name="query_filters" value={allMatchingQueryFilters} />
+      <input type="hidden" name="snapshot_at" value={workPage.snapshot_at} />
+      <FormRow label="Audit reason" hint="Applies to every exact match admitted after version and prerequisite checks.">
+        <Textarea name="reason" rows={3} minlength={3} maxlength={500} required />
+      </FormRow>
+      {#if batchCapability === 'archive_dead_letter'}
+        <FormRow label="Type ARCHIVE" hint="Archiving resolves every exact dead-letter match without replaying it.">
+          <Input name="confirmation_phrase" autocomplete="off" required />
+        </FormRow>
+      {/if}
+      {#if batchCapability === 'replay_stage' || batchCapability === 'regenerate_derivatives'}
+        <Label class="!flex items-start gap-2 rounded-2xl border border-line bg-paper p-3">
+          <input type="checkbox" name="acknowledgement" value="terminal_override" required class="mt-1 size-4 accent-accent" />
+          <span class="text-sm">I acknowledge that exact materialization may include eligible terminal-failed roots and authorizes their audited override.</span>
+        </Label>
+      {/if}
+      <div class="flex items-end"><Button type="submit">Prepare all matching</Button></div>
+    </form>
+  </div>
 
   {#if form?.batch}
     <div class="mt-4 grid gap-3 rounded-2xl border border-line bg-soft p-4">
@@ -345,16 +455,25 @@
         <a class="text-sm font-black underline decoration-2 underline-offset-4" href={`/admin/recovery/batches/${encodeURIComponent(form.batch.id)}`}>Open batch</a>
       </div>
       {#if form.batch.status === 'preview'}
-        <form method="POST" action="?/scheduleRecoveryBatch" class="grid gap-3 sm:grid-cols-[1fr_auto] sm:items-end">
+        <form method="POST" action="?/scheduleRecoveryBatch" class="flex flex-wrap items-center justify-between gap-3">
           <input type="hidden" name="job_id" value={form.batch.id} />
           <input type="hidden" name="version" value={form.batch.version} />
           <input type="hidden" name="reason" value={form.batch.reason} />
-          <FormRow label="Type SCHEDULE" hint="Dispatch remains capacity-aware after scheduling.">
-            <Input name="confirmation_phrase" autocomplete="off" required />
-          </FormRow>
+          <p class="m-0 text-sm text-muted">Reviewed previews dispatch gradually under the capacity budget.</p>
           <Button type="submit">Schedule batch</Button>
         </form>
       {/if}
     </div>
   {/if}
 </AdminPanel>
+{:else if filters.section === 'regenerate'}
+  <RecoveryRegenerate
+    {summary}
+    snapshotAt={summary.snapshot_at ?? workPage.snapshot_at}
+    outdatedRequestId={requestIds.outdatedVideoPreview}
+    successfulStageRequestId={requestIds.successfulStagePreview}
+    batch={form?.batch ?? null}
+  />
+{:else}
+  <RecoveryJobs page={jobsPage} filters={filters} loadError={jobsLoadError} />
+{/if}

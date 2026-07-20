@@ -167,6 +167,16 @@ def test_settings_pipeline_worker_graceful_shutdown_timeout_defaults_and_bounds(
         _ = Settings(pipeline_worker_graceful_shutdown_timeout_seconds=900.1)
 
 
+def test_settings_media_generation_retention_never_drops_below_seven_days() -> None:
+    seven_days = 7 * 86400.0
+
+    assert Settings().media_generation_retention_seconds == seven_days
+    assert Settings(media_generation_retention_seconds=seven_days).media_generation_retention_seconds == seven_days
+
+    with pytest.raises(ValidationError):
+        _ = Settings(media_generation_retention_seconds=seven_days - 1)
+
+
 def test_settings_search_candidate_pool_limit_defaults_and_bounds() -> None:
     assert Settings().search_candidate_pool_limit_per_source == 200
     assert Settings(search_candidate_pool_limit_per_source=500).search_candidate_pool_limit_per_source == 500

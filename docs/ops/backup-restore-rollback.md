@@ -1,15 +1,18 @@
 # Backup, Restore, And Rollback Runbook
 
-This MVP launch runbook covers manual backups, restore drills, and service/image
-rollback for the production-style Docker Compose stack. It uses placeholders
-only; do not paste real secret values into tickets, logs, or committed files.
+This runbook covers manual backups, restore drills, and service/image rollback.
+The commands below remain the local/production-example Docker Compose form. The
+live beta at `beta.memexpert.net` is the NixOS/Podman Quadlet deployment on
+`whale`; its source of truth is the sibling dotfiles repo, not generated unit
+files on the host. It uses placeholders only; never paste secrets into tickets,
+logs, or committed files.
 
 ## Scope And Source Of Truth
 
 - PostgreSQL is the authoritative store for users, memes, pipeline state,
   crawler state, scheduler state, and search-sync snapshots.
 - S3/MinIO-compatible object storage holds originals, temp originals, and
-  derivatives under the configured `S3_BUCKET`.
+  immutable derivative generations under the configured `S3_BUCKET`.
 - Qdrant and Meilisearch are rebuildable indexes. For launch, treat their
   backups as optional convenience; PostgreSQL plus object storage are the
   required recovery sources.
@@ -20,6 +23,13 @@ only; do not paste real secret values into tickets, logs, or committed files.
   `MEILISEARCH_URL`, and `MEILISEARCH_MASTER_KEY`. The compose image-selection
   variables remain `MEMEXPERT_MAIN_IMAGE`, `MEMEXPERT_WORKER_IMAGE`, and
   `MEMEXPERT_FRONTEND_IMAGE`.
+
+For live beta runtime changes, edit `../dotfiles/apps/memexpert/default.nix`,
+validate the dotfiles flake, and use `./deploy.sh whale build` then `switch` (or
+`test`) from that repo. `deploy.sh` builds on the target. Never edit generated
+Quadlet/systemd files directly. Image-only rollback/redeploy still follows the
+normal CI/Reploy dependency ordering and all three application images must exist
+before rollout.
 
 ## Safety Rules
 
@@ -36,6 +46,10 @@ only; do not paste real secret values into tickets, logs, or committed files.
   and must be coordinated with object storage from the same window.
 - Never delete canonical object keys manually during rollback. Extra objects are
   usually harmless; missing objects break restored database rows.
+- PostgreSQL active media pointers and immutable generation objects must come
+  from the same backup window. Pause generation GC during restore/reconciliation;
+  never delete current, young, unknown, or referenced objects to make a restore
+  look tidy.
 
 ## PostgreSQL Backup
 
@@ -80,6 +94,10 @@ Object-storage retention guidance:
 - Keep canonical originals and derivatives recoverable for at least as long as
   the PostgreSQL backup window. A restored database can reference older object
   keys.
+- Live storage retains superseded recognized generations for seven days, but a
+  point-in-time object backup must retain the generation set paired with each
+  PostgreSQL backup for the full database restore window. The live GC window is
+  not permission to prune historical backup media.
 - If your deployment uses managed S3 instead of the bundled MinIO service,
   adapt only the `mc alias set` endpoint/credentials source; keep bucket names
   and prefixes from `S3_BUCKET` and the pipeline `Settings` values.
@@ -113,6 +131,12 @@ docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" up -d \
   migrate api worker-media worker-ocr worker-enrichment worker-sync worker-telegram scheduler telegram-crawler frontend
 ```
 
+Keep media-generation GC disabled until the restored database has been checked
+against restored objects. For every non-null active web-video pointer, derive
+and verify its sibling `preview.png`; verify its durable generation record and
+profile/audio observations where applicable. Extra superseded/unknown objects
+are safer than missing active objects and must not be removed manually.
+
 Add the optional `bot` service to the stop/up commands only when the bot profile
 is enabled in that environment.
 
@@ -120,6 +144,25 @@ is enabled in that environment.
 
 Use this when the database does not need to move backward. The rollback target
 must be a previously published immutable tag for all three app images.
+
+### Immutable-media compatibility boundary
+
+Migration `0042` and the first activation of an immutable media generation form
+a one-way runtime compatibility boundary. Once any active web-video pointer uses
+`pipeline/derived/{file_id}/generations/{generation_id}/web.mp4`, do **not** roll
+the API, workers, or frontend back to an image from before `0042`. The old
+rendering code derives the flat legacy poster path
+`pipeline/derived/{file_id}/preview.png`; it cannot pair that poster with the
+active generation video and can therefore break playback even if the forward
+database schema still accepts the old image.
+
+Treat all three application images as one release unit across this boundary. In
+an incident, deploy a forward hotfix that understands both legacy and generation
+layouts. The only safe way to run a pre-`0042` image again is a coordinated
+PostgreSQL **and** object-storage restore from a window before immutable
+generation activation, with the accepted loss of later writes explicitly
+approved. An Alembic downgrade or image-only rollback does not rewrite active
+object pointers and is not sufficient.
 
 ```bash
 export ENV_FILE=.env.prod
@@ -151,6 +194,9 @@ Use this decision flow during an incident:
    image, roll back service images only and keep the DB forward.
 3. If migrations are not backward-compatible, prefer a forward hotfix or a new
    image that can read the current schema.
+   `0042` becomes runtime-incompatible with older images as soon as an immutable
+   generation is activated; follow the compatibility boundary above even when
+   the database columns themselves are additive.
 4. Restore PostgreSQL only when the release corrupted data, the accepted write
    loss is understood, and object storage from the same backup window is
    available.
@@ -233,6 +279,8 @@ Pass criteria:
 
 - `postgres.dump` and `postgres.dump.list` exist under the backup timestamp.
 - Scratch restore prints one Alembic version row and a `meme_files` count.
+- Scratch restore can read `media_generations` and every active derivative key
+  belongs either to a durable generation or a recognized legacy layout.
 - Scratch bucket mirror completes and `mc ls --summarize` reports objects or an
   intentional empty bucket.
 - Cleanup removes the scratch database and scratch bucket.
@@ -252,3 +300,15 @@ Then run the relevant API health, pipeline item-detail, and per-target
 search-sync checks from `docs/ops/content-pipeline-search-sync.md`. For search
 recovery, expect Qdrant and Meilisearch to be stale until replay/scheduler work
 finishes and target status rows show fresh `synced` results.
+
+On Whale, use the production-safe checks from the repository notes (`ssh whale`
+plus systemd/Podman/API health/journald), not the Compose commands above. Open
+Replay & Repair and verify:
+
+- every active web video resolves and has its derived sibling poster;
+- active `web-h264-aac-1080p30-v2` generations retain verified dimensions, FPS,
+  bitrate, codecs, and source/output audio state;
+- no generation referenced by PostgreSQL is missing from restored storage;
+- generation GC remains stopped until these checks pass; and
+- any search/index drift is repaired through versioned stage-only or cascading
+  jobs rather than by editing snapshot rows.

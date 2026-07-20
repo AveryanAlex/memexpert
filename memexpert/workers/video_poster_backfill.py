@@ -13,9 +13,10 @@ from botocore.exceptions import ClientError
 from memexpert.core.config import Settings, get_settings
 from memexpert.core.storage import (
     StorageConnectionError,
-    build_preview_image_object_key,
+    derive_preview_image_object_key,
     download_object_bytes,
     get_pipeline_storage_settings,
+    parse_media_generation_object_key,
     upload_object_bytes,
 )
 from memexpert.media.contracts import MediaValidationError, PipelineMediaProcessorProtocol
@@ -77,9 +78,15 @@ class VideoPosterBackfiller:
         self._storage_settings = get_pipeline_storage_settings(self._settings)
 
     def preview_image_object_key(self, candidate: VideoPosterCandidate) -> str:
-        """Return the deterministic companion key for one web video."""
+        """Return the deterministic companion key for one legacy web video."""
 
-        return build_preview_image_object_key(candidate.meme_file_id, settings=self._settings)
+        self._reject_immutable_generation(candidate)
+
+        return derive_preview_image_object_key(
+            candidate.web_video_object_key,
+            meme_file_id=candidate.meme_file_id,
+            settings=self._settings,
+        )
 
     async def preview_image_exists(self, candidate: VideoPosterCandidate) -> bool:
         """Check whether one candidate already has its durable preview frame."""
@@ -111,6 +118,7 @@ class VideoPosterBackfiller:
     ) -> VideoPosterBackfillStatus:
         """Create a missing preview image, or report that the artifact exists."""
 
+        self._reject_immutable_generation(candidate)
         if not overwrite and await self.preview_image_exists(candidate):
             return VideoPosterBackfillStatus.PRESENT
 
@@ -137,6 +145,17 @@ class VideoPosterBackfiller:
             content_type=_PREVIEW_IMAGE_MIME_TYPE,
         )
         return VideoPosterBackfillStatus.CREATED
+
+    def _reject_immutable_generation(self, candidate: VideoPosterCandidate) -> None:
+        generation_key = parse_media_generation_object_key(
+            candidate.web_video_object_key,
+            settings=self._settings,
+        )
+        if generation_key is not None:
+            raise MediaValidationError(
+                "Immutable generation posters cannot be repaired in place; "
+                "use Replay & Repair derivative regeneration to activate a fresh pair."
+            )
 
 
 __all__ = [

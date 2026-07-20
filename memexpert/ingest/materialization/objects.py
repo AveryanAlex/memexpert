@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, cast
 
 from memexpert.core.config import get_settings
 from memexpert.core.storage import (
+    StorageObjectMissingError,
     delete_object_if_present,
     download_object_bytes,
     get_pipeline_storage_settings,
@@ -42,6 +43,8 @@ class MaterializationObjectStore:
                 bucket=self._storage_settings.bucket,
                 key=key,
             )
+        except StorageObjectMissingError:
+            raise
         except Exception as exc:
             raise PipelineStorageError("Failed to download the raw original from temporary storage.") from exc
 

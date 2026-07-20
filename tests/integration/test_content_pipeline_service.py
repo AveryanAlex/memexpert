@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -19,7 +19,15 @@ from memexpert.core.qdrant import (
 )
 from memexpert.core.voyage import VoyageEmbeddingResult
 from memexpert.ingest.crawler_service import PipelineCrawlerIngestService
-from memexpert.media.contracts import NormalizedMediaResult, UploadMediaDetails
+from memexpert.media.contracts import (
+    WEB_VIDEO_PROFILE_ID,
+    MediaFrameRate,
+    MediaProbeObservations,
+    NormalizedMediaResult,
+    UploadMediaDetails,
+    VideoStreamObservation,
+    WebVideoFrameRateMode,
+)
 from memexpert.models.content import (
     EmbeddingCache,
     Meme,
@@ -60,6 +68,7 @@ from memexpert.services import (
     PipelineReplayNotAllowedError,
 )
 from memexpert.services.content_merge import MERGE_REASON_HIGH_SIMILARITY
+from memexpert.services.media_generation import MediaGenerationService
 
 if TYPE_CHECKING:
     from datetime import datetime
@@ -174,6 +183,43 @@ def build_normalized_media_result(meme_file_id: uuid.UUID, *, web_video: bool = 
         preview_image_bytes=b"normalized-preview-image" if web_video else None,
         web_video_object_key=f"pipeline/derived/{meme_file_id}/web.mp4" if web_video else None,
         web_video_bytes=b"normalized-web-video" if web_video else None,
+    )
+
+
+def build_silent_media_observations(*, output: bool) -> MediaProbeObservations:
+    """Create durable source/output observations for generation lifecycle tests."""
+
+    frame_rate = MediaFrameRate(15, 1)
+    return MediaProbeObservations(
+        format_names=("mov", "mp4", "m4a", "3gp", "3g2", "mj2") if output else ("gif",),
+        format_long_name="QuickTime / MOV" if output else "CompuServe Graphics Interchange Format (GIF)",
+        start_time_seconds=0.0,
+        duration_seconds=2.0,
+        bit_rate=1_000_000 if output else 500_000,
+        byte_size=250_000 if output else 125_000,
+        video_streams=(
+            VideoStreamObservation(
+                index=0,
+                codec_name="h264" if output else "gif",
+                profile="High" if output else None,
+                level=41 if output else None,
+                pixel_format="yuv420p" if output else "bgra",
+                width=128,
+                height=128,
+                average_frame_rate=frame_rate,
+                real_frame_rate=frame_rate,
+                start_time_seconds=0.0,
+                duration_seconds=2.0,
+                bit_rate=900_000 if output else 500_000,
+                frame_count=30,
+            ),
+        ),
+        audio_streams=(),
+        subtitle_stream_count=0,
+        data_stream_count=0,
+        attachment_stream_count=0,
+        unknown_stream_types=(),
+        chapter_count=0,
     )
 
 
@@ -389,7 +435,28 @@ async def test_complete_transcode_stage_persists_derivative_metadata_and_queues_
         post_id="6001",
         phash_tag="t",
     )
-    normalized = build_normalized_media_result(meme_file_id)
+    generation_service = MediaGenerationService(migrated_db_session, settings=Settings())
+    generation = await generation_service.reserve(
+        meme_file_id=meme_file_id,
+        expected_web_video_object_key=None,
+        recovery_item_id=None,
+        retry_limit=3,
+    )
+    normalized = replace(
+        build_normalized_media_result(meme_file_id),
+        preview_image_object_key=generation.preview_image_object_key,
+        web_video_object_key=generation.web_video_object_key,
+        generation_id=generation.id,
+        web_video_profile=WEB_VIDEO_PROFILE_ID,
+        frame_rate_mode=WebVideoFrameRateMode.PRESERVE,
+        source_has_audio=False,
+        web_video_has_audio=False,
+        source_observations=build_silent_media_observations(output=False),
+        output_observations=build_silent_media_observations(output=True),
+        web_video_verified_at=utcnow_for_tests(),
+    )
+    await generation_service.record_verified(generation.id, normalized)
+    await generation_service.record_uploaded(generation.id)
 
     await service.complete_transcode_stage(
         meme_file_id=meme_file_id,
@@ -411,6 +478,10 @@ async def test_complete_transcode_stage_persists_derivative_metadata_and_queues_
     assert persisted_file is not None
     assert persisted_file.status is ContentProcessingStatus.PROCESSING
     assert persisted_file.s3_web_video_key == normalized.web_video_object_key
+    assert persisted_file.active_media_generation_id == generation.id
+    assert persisted_file.web_video_profile == WEB_VIDEO_PROFILE_ID
+    assert persisted_file.source_has_audio is False
+    assert persisted_file.web_video_has_audio is False
     assert persisted_file.mime_type == "image/gif"
     assert persisted_file.width == 128
     assert persisted_file.height == 128

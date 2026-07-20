@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Sequence
+from typing import Any, cast
 
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -56,6 +57,8 @@ class PipelineReplayService(PipelineDispatchingService):
                     f"Pipeline item {meme_file_id} is already reserved for replay, but its event id is missing.",
                 )
             self._attach_recovery_item(recovery_item, target_entry.last_event_id)
+            if recovery_item is not None and recovery_item.attempt_budget_start is None:
+                recovery_item.attempt_budget_start = max(target_entry.attempt_count, 1)
             if recovery_item is not None:
                 await self._commit_recovery_attachment()
             return ContentPipelineReplayAccepted(
@@ -78,7 +81,7 @@ class PipelineReplayService(PipelineDispatchingService):
             created_at=utcnow(),
         )
         reserve_replay(target_entry, replay_event)
-        self._attach_recovery_item(recovery_item, replay_event.event_id)
+        self._attach_recovery_item(recovery_item, replay_event.event_id, attempt=replay_attempt)
         outbox_message_id = await self._enqueue_dispatch_event(replay_event)
         try:
             await self._session.commit()
@@ -88,6 +91,137 @@ class PipelineReplayService(PipelineDispatchingService):
 
         await self._relay_outbox_messages_after_commit((outbox_message_id,))
 
+        return ContentPipelineReplayAccepted(
+            meme_file_id=meme_file.id,
+            replay_event_id=replay_event.event_id,
+            stage=replay_event.stage,
+            attempt=replay_event.attempt,
+        )
+
+    async def replay_admin_stage(
+        self,
+        meme_file_id: uuid.UUID,
+        *,
+        stage: ContentPipelineStage,
+        recovery_item: RecoveryJobItem,
+    ) -> ContentPipelineReplayAccepted:
+        """Reserve a successful or failed stage for cookie-admin orchestration.
+
+        The operator-token methods intentionally retain their failure-only
+        policy. Eligibility and terminal acknowledgement are checked again
+        here so this broader path cannot be called safely without a durable
+        recovery item.
+        """
+
+        if stage is ContentPipelineStage.INGEST:
+            raise PipelineReplayNotAllowedError("The ingest stage cannot be replayed.")
+        meme_file = await self._get_meme_file(meme_file_id)
+        if not meme_file.s3_original_key:
+            raise PipelineReplayNotAllowedError(
+                f"Pipeline item {meme_file_id} is missing durable original storage identifiers.",
+            )
+        stage_entry = next(
+            (entry for entry in meme_file.pipeline_stage_journal_entries if entry.stage is stage),
+            None,
+        )
+        if stage_entry is None:
+            stage_entry = PipelineStageJournal(
+                id=uuid.uuid7(),
+                meme_file_id=meme_file.id,
+                stage=stage,
+                status=ContentPipelineStageStatus.FAILED,
+                attempt_count=0,
+                normalized_reason="orchestrated_stage_not_materialized",
+                is_retryable=True,
+            )
+            self._session.add(stage_entry)
+            meme_file.pipeline_stage_journal_entries.append(stage_entry)
+            if recovery_item.work_id.startswith(f"{meme_file.id}:"):
+                recovery_item.work_id = str(stage_entry.id)
+
+        if is_replay_reserved(stage_entry):
+            if stage_entry.last_event_id is None:
+                raise PipelineReplayNotAllowedError(
+                    f"Pipeline item {meme_file_id} has an incomplete replay reservation.",
+                )
+            self._attach_recovery_item(
+                recovery_item,
+                stage_entry.last_event_id,
+                attempt=max(stage_entry.attempt_count, 1),
+            )
+            await self._commit_recovery_attachment()
+            return ContentPipelineReplayAccepted(
+                meme_file_id=meme_file.id,
+                replay_event_id=stage_entry.last_event_id,
+                stage=stage,
+                attempt=max(stage_entry.attempt_count, 1),
+            )
+
+        if stage_entry.status in {
+            ContentPipelineStageStatus.PENDING,
+            ContentPipelineStageStatus.PROCESSING,
+            ContentPipelineStageStatus.DUPLICATE,
+        }:
+            raise PipelineReplayNotAllowedError(
+                f"Stage {stage.value} is {stage_entry.status.value} and cannot be replayed yet.",
+            )
+        if (
+            stage_entry.status is ContentPipelineStageStatus.FAILED
+            and not stage_entry.is_retryable
+            and not recovery_item.terminal_override_acknowledged
+        ):
+            raise PipelineReplayNotAllowedError(
+                f"Terminal {stage.value} replay requires an audited acknowledgement.",
+            )
+
+        replay_attempt = max(stage_entry.attempt_count + 1, 1)
+        replay_event = ContentPipelineDispatchEvent(
+            event_id=uuid.uuid7(),
+            event_type=ContentPipelineEventType.STAGE_REPLAY_REQUESTED,
+            meme_id=meme_file.meme_id,
+            meme_file_id=meme_file.id,
+            stage=stage,
+            source_kind=ContentSourceKind.MANUAL_UPLOAD,
+            original_object_key=meme_file.s3_original_key,
+            attempt=replay_attempt,
+            created_at=utcnow(),
+        )
+        cast("Any", recovery_item).previous_stage_state = {
+            "status": stage_entry.status.value,
+            "attempt_count": stage_entry.attempt_count,
+            "last_event_id": str(stage_entry.last_event_id) if stage_entry.last_event_id else None,
+            "normalized_reason": stage_entry.normalized_reason,
+            "last_error_text": stage_entry.last_error_text,
+            "is_retryable": stage_entry.is_retryable,
+            "retry_after": stage_entry.retry_after.isoformat() if stage_entry.retry_after else None,
+            "started_at": stage_entry.started_at.isoformat() if stage_entry.started_at else None,
+            "finished_at": stage_entry.finished_at.isoformat() if stage_entry.finished_at else None,
+        }
+        reserve_replay(stage_entry, replay_event)
+        self._attach_recovery_item(recovery_item, replay_event.event_id, attempt=replay_attempt)
+        recovery_item.canonical_version = f"{utcnow().isoformat()}:{replay_event.event_id}"
+
+        if stage in {ContentPipelineStage.SYNC_QDRANT, ContentPipelineStage.SYNC_MEILI}:
+            target = SyncTargetKind.QDRANT if stage is ContentPipelineStage.SYNC_QDRANT else SyncTargetKind.MEILISEARCH
+            await upsert_sync_target_snapshot(
+                self._session,
+                meme_file_id=meme_file_id,
+                target=target,
+                status=SyncTargetStatus.PENDING,
+                last_event_id=replay_event.event_id,
+                preview=None,
+                normalized_reason=_consts.PIPELINE_REASON_SYNC_REPLAY_REQUESTED,
+                last_error_text=None,
+                bump_attempt=False,
+                record_success=False,
+            )
+        outbox_message_id = await self._enqueue_dispatch_event(replay_event)
+        try:
+            await self._session.commit()
+        except SQLAlchemyError as exc:
+            await self._session.rollback()
+            raise PipelineIngestError("Failed to persist admin replay reservation state.") from exc
+        await self._relay_outbox_messages_after_commit((outbox_message_id,))
         return ContentPipelineReplayAccepted(
             meme_file_id=meme_file.id,
             replay_event_id=replay_event.event_id,
@@ -159,6 +293,8 @@ class PipelineReplayService(PipelineDispatchingService):
                     f"Pipeline item {meme_file_id} is already reserved for replay, but its event id is missing.",
                 )
             self._attach_recovery_item(recovery_item, stage_entry.last_event_id)
+            if recovery_item is not None and recovery_item.attempt_budget_start is None:
+                recovery_item.attempt_budget_start = max(stage_entry.attempt_count, 1)
             if recovery_item is not None:
                 await self._commit_recovery_attachment()
             return ContentPipelineReplayAccepted(
@@ -181,7 +317,7 @@ class PipelineReplayService(PipelineDispatchingService):
             created_at=utcnow(),
         )
         reserve_replay(stage_entry, replay_event)
-        self._attach_recovery_item(recovery_item, replay_event.event_id)
+        self._attach_recovery_item(recovery_item, replay_event.event_id, attempt=replay_attempt)
 
         await upsert_sync_target_snapshot(
             self._session,
@@ -214,7 +350,12 @@ class PipelineReplayService(PipelineDispatchingService):
         )
 
     @staticmethod
-    def _attach_recovery_item(recovery_item: RecoveryJobItem | None, event_id: uuid.UUID) -> None:
+    def _attach_recovery_item(
+        recovery_item: RecoveryJobItem | None,
+        event_id: uuid.UUID,
+        *,
+        attempt: int | None = None,
+    ) -> None:
         if recovery_item is None:
             return
         recovery_item.status = RecoveryJobItemStatus.DISPATCHED
@@ -222,6 +363,9 @@ class PipelineReplayService(PipelineDispatchingService):
         recovery_item.dispatched_at = utcnow()
         recovery_item.normalized_reason = None
         recovery_item.safe_error_text = None
+        recovery_item.reservation_active = True
+        if recovery_item.attempt_budget_start is None and attempt is not None:
+            recovery_item.attempt_budget_start = attempt
 
     async def _commit_recovery_attachment(self) -> None:
         try:

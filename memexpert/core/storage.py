@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import re
 import uuid
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import PurePosixPath
 from typing import Any, Final
 from urllib.parse import urlparse
@@ -28,6 +30,7 @@ DEFAULT_STORAGE_CONNECTION_TIMEOUT_SECONDS: Final = 5.0
 SUPPORTED_S3_ENDPOINT_SCHEMES: Final[frozenset[str]] = frozenset({"http", "https"})
 _VALID_BUCKET_CHARS_RE: Final = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
 _VALID_EXTENSION_RE: Final = re.compile(r"^[a-z0-9]{1,10}$")
+_MISSING_OBJECT_ERROR_CODES: Final = frozenset({"404", "nosuchkey", "notfound"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,12 +48,33 @@ class PipelineStorageSettings:
     connection_timeout: float
 
 
+@dataclass(frozen=True, slots=True)
+class MediaGenerationObjectKey:
+    """Recognized immutable derivative object-key components."""
+
+    meme_file_id: uuid.UUID
+    generation_id: uuid.UUID
+    artifact_name: str
+
+
 class StorageConfigurationError(ValueError):
     """Raised when S3-compatible settings cannot produce a storage client contract."""
 
 
 class StorageConnectionError(RuntimeError):
     """Raised when the S3-compatible runtime cannot establish a real connection."""
+
+
+class StorageObjectMissingError(RuntimeError):
+    """Raised when S3 definitively reports that a requested object does not exist."""
+
+
+class StorageObjectPresence(StrEnum):
+    """Tri-state result for a non-mutating object-presence probe."""
+
+    PRESENT = "present"
+    MISSING = "missing"
+    UNAVAILABLE = "unavailable"
 
 
 _s3_client: Any | None = None
@@ -250,6 +274,95 @@ def build_preview_image_object_key(
     return f"{storage_settings.derivative_prefix}/{meme_file_id}/preview.{normalized_extension}"
 
 
+def build_web_video_generation_object_key(
+    meme_file_id: uuid.UUID,
+    generation_id: uuid.UUID,
+    *,
+    settings: Settings | None = None,
+) -> str:
+    """Build one immutable web-video generation key."""
+
+    storage_settings = get_pipeline_storage_settings(settings)
+    return (
+        f"{storage_settings.derivative_prefix}/{meme_file_id}/generations/"
+        f"{generation_id}/web.mp4"
+    )
+
+
+def build_preview_image_generation_object_key(
+    meme_file_id: uuid.UUID,
+    generation_id: uuid.UUID,
+    *,
+    settings: Settings | None = None,
+) -> str:
+    """Build the immutable poster key paired with one web-video generation."""
+
+    storage_settings = get_pipeline_storage_settings(settings)
+    return (
+        f"{storage_settings.derivative_prefix}/{meme_file_id}/generations/"
+        f"{generation_id}/preview.png"
+    )
+
+
+def derive_preview_image_object_key(
+    web_video_object_key: str,
+    *,
+    meme_file_id: uuid.UUID | None = None,
+    settings: Settings | None = None,
+) -> str:
+    """Derive a video's sibling poster, retaining legacy file-id compatibility."""
+
+    normalized_key = web_video_object_key.strip().strip("/")
+    if not normalized_key:
+        raise StorageConfigurationError("web_video_object_key must not be blank.")
+    video_path = PurePosixPath(normalized_key)
+    if video_path.name == "web.mp4":
+        return str(video_path.with_name("preview.png"))
+    if meme_file_id is None:
+        raise StorageConfigurationError(
+            "A non-canonical web-video key requires meme_file_id for legacy poster fallback."
+        )
+    return build_preview_image_object_key(meme_file_id, settings=settings)
+
+
+def parse_media_generation_object_key(
+    object_key: str,
+    *,
+    settings: Settings | None = None,
+) -> MediaGenerationObjectKey | None:
+    """Parse only recognized immutable generation keys; unknown objects stay opaque."""
+
+    storage_settings = get_pipeline_storage_settings(settings)
+    pattern = re.compile(
+        rf"^{re.escape(storage_settings.derivative_prefix)}/"
+        r"(?P<file_id>[0-9a-fA-F-]{36})/generations/"
+        r"(?P<generation_id>[0-9a-fA-F-]{36})/"
+        r"(?P<artifact_name>web\.mp4|preview\.png)$"
+    )
+    match = pattern.fullmatch(object_key.strip().strip("/"))
+    if match is None:
+        return None
+    try:
+        meme_file_id = uuid.UUID(match.group("file_id"))
+        generation_id = uuid.UUID(match.group("generation_id"))
+    except ValueError:
+        return None
+    return MediaGenerationObjectKey(
+        meme_file_id=meme_file_id,
+        generation_id=generation_id,
+        artifact_name=match.group("artifact_name"),
+    )
+
+
+def media_object_version_token(object_key: str) -> str:
+    """Return a non-reversible cache version derived from an active object key."""
+
+    normalized_key = object_key.strip()
+    if not normalized_key:
+        raise StorageConfigurationError("object_key must not be blank.")
+    return hashlib.sha256(normalized_key.encode()).hexdigest()[:16]
+
+
 async def download_object_bytes(
     client: Any,
     *,
@@ -258,7 +371,14 @@ async def download_object_bytes(
 ) -> bytes:
     """Read one object from S3-compatible storage into memory."""
 
-    response = await asyncio.to_thread(client.get_object, Bucket=bucket, Key=key)
+    try:
+        response = await asyncio.to_thread(client.get_object, Bucket=bucket, Key=key)
+    except Exception as exc:
+        if is_missing_storage_object_error(exc):
+            raise StorageObjectMissingError(
+                "The requested storage object no longer exists."
+            ) from exc
+        raise
     body = response.get("Body")
     if body is None or not hasattr(body, "read"):
         raise StorageConnectionError(f"S3 object {key} did not return a readable body.")
@@ -275,6 +395,66 @@ async def download_object_bytes(
     if not isinstance(object_bytes, bytes):
         raise StorageConnectionError(f"S3 object {key} returned a non-bytes payload.")
     return object_bytes
+
+
+def is_missing_storage_object_error(exc: BaseException) -> bool:
+    """Return whether an S3-compatible error definitively means object absence.
+
+    Access failures, timeouts, endpoint failures, and unknown provider errors
+    deliberately return ``False`` so callers never convert an outage into a
+    destructive "missing object" decision.
+    """
+
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return False
+    error = response.get("Error")
+    raw_code = error.get("Code") if isinstance(error, dict) else None
+    if isinstance(raw_code, (str, int)) and str(raw_code).strip().lower() in _MISSING_OBJECT_ERROR_CODES:
+        return True
+    metadata = response.get("ResponseMetadata")
+    raw_status = metadata.get("HTTPStatusCode") if isinstance(metadata, dict) else None
+    return raw_status == 404 or raw_status == "404"
+
+
+async def check_object_presence(
+    client: Any,
+    *,
+    bucket: str,
+    key: str,
+    timeout: float | None = None,
+) -> StorageObjectPresence:
+    """HEAD one object without conflating absence with storage unavailability."""
+
+    try:
+        if timeout is None:
+            await asyncio.to_thread(client.head_object, Bucket=bucket, Key=key)
+        else:
+            async with asyncio.timeout(timeout):
+                await asyncio.to_thread(client.head_object, Bucket=bucket, Key=key)
+    except Exception as exc:
+        if is_missing_storage_object_error(exc):
+            return StorageObjectPresence.MISSING
+        return StorageObjectPresence.UNAVAILABLE
+    return StorageObjectPresence.PRESENT
+
+
+async def check_pipeline_object_presence(
+    object_key: str,
+    *,
+    client: Any | None = None,
+    settings: Settings | None = None,
+) -> StorageObjectPresence:
+    """Lazily HEAD one object using the configured pipeline storage boundary."""
+
+    storage_settings = get_pipeline_storage_settings(settings)
+    resolved_client = client or get_s3_client()
+    return await check_object_presence(
+        resolved_client,
+        bucket=storage_settings.bucket,
+        key=object_key,
+        timeout=storage_settings.connection_timeout,
+    )
 
 
 async def upload_object_bytes(
@@ -364,21 +544,32 @@ def reset_s3_client_state() -> None:
 __all__ = [
     "DEFAULT_STORAGE_CONNECTION_TIMEOUT_SECONDS",
     "PipelineStorageSettings",
+    "MediaGenerationObjectKey",
     "StorageConfigurationError",
     "StorageConnectionError",
+    "StorageObjectMissingError",
+    "StorageObjectPresence",
     "build_original_object_key",
+    "build_preview_image_generation_object_key",
     "build_preview_image_object_key",
     "build_s3_client",
     "build_temp_original_object_key",
+    "build_web_video_generation_object_key",
     "build_web_video_object_key",
+    "check_object_presence",
+    "check_pipeline_object_presence",
     "delete_object_if_present",
     "download_object_bytes",
+    "derive_preview_image_object_key",
     "get_pipeline_storage_settings",
     "get_s3_client",
     "is_s3_client_initialized",
+    "is_missing_storage_object_error",
+    "media_object_version_token",
     "normalize_object_key_prefix",
     "normalize_s3_bucket_name",
     "normalize_s3_endpoint",
+    "parse_media_generation_object_key",
     "reset_s3_client_state",
     "upload_object_bytes",
     "verify_s3_storage",

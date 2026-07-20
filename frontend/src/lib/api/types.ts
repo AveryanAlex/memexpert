@@ -98,21 +98,37 @@ export type AdminRecoveryWorkKind =
   | 'sync_target';
 export type AdminRecoveryCapability =
   | 'archive_dead_letter'
+  | 'regenerate_derivatives'
   | 'rebuild_outbox'
   | 'recover_dead_letter'
   | 'reinspect_ingest'
+  | 'replay_stage'
   | 'replay_source_post'
   | 'resync_target'
   | 'resume_backfill'
   | 'retry_stage';
+export type AdminRecoveryReplayScope = 'stage_and_dependents' | 'stage_only';
+export type AdminRecoveryRetryLimit = 1 | 3 | 5;
 export type AdminRecoveryBatchStatus =
   | 'cancelled'
+  | 'cancelling'
   | 'completed'
   | 'completed_with_failures'
   | 'expired'
+  | 'preparing'
   | 'preview'
   | 'queued'
   | 'running';
+export type AdminRecoveryJobItemStatus =
+  | 'cancelled'
+  | 'dispatched'
+  | 'failed'
+  | 'queued'
+  | 'skipped_dependency'
+  | 'skipped_stale'
+  | 'succeeded'
+  | 'waiting_capacity'
+  | 'waiting_dependency';
 export type AdminSearchSynonymLocale = 'en' | 'ru';
 export type AdminSearchSynonymRevisionStatus = 'archived' | 'draft' | 'published';
 export type AdminSearchSynonymSyncStatus = 'failed' | 'idle' | 'pending' | 'synced' | 'syncing';
@@ -1142,6 +1158,51 @@ export interface AdminRecoverySummaryRead {
   blocked_count: number;
   stuck_count: number;
   dead_lettered_count: number;
+  outdated_web_video_count?: number;
+  active_job_count?: number;
+  preparing_job_count?: number;
+  snapshot_at?: string;
+}
+
+export interface AdminRecoveryBlockedPrerequisiteRead {
+  code?: string;
+  message: string;
+}
+
+export interface AdminRecoveryRiskRead {
+  code?: string;
+  message: string;
+  severity?: 'danger' | 'info' | 'warning';
+}
+
+export interface AdminRecoveryAcknowledgementRead {
+  key: string;
+  label: string;
+}
+
+export interface AdminRecoveryActionScopeRequirementsRead {
+  warnings?: string[];
+  risks?: Array<AdminRecoveryRiskRead | string>;
+  required_acknowledgements?: Array<AdminRecoveryAcknowledgementRead | string>;
+}
+
+export interface AdminRecoveryActionCandidateRead {
+  capability: AdminRecoveryCapability;
+  /** Compatibility alias accepted while coordinated backend changes roll out. */
+  action?: AdminRecoveryCapability;
+  available: boolean;
+  scopes?: AdminRecoveryReplayScope[];
+  default_scope?: AdminRecoveryReplayScope | null;
+  retry_limits?: AdminRecoveryRetryLimit[];
+  default_retry_limit?: AdminRecoveryRetryLimit;
+  downstream_stages?: string[];
+  warnings?: string[];
+  risks?: Array<AdminRecoveryRiskRead | string>;
+  required_acknowledgements?: Array<AdminRecoveryAcknowledgementRead | string>;
+  scope_requirements?: Partial<
+    Record<AdminRecoveryReplayScope, AdminRecoveryActionScopeRequirementsRead>
+  >;
+  blocked_prerequisites?: Array<AdminRecoveryBlockedPrerequisiteRead | string>;
 }
 
 export interface AdminRecoveryWorkRead {
@@ -1165,8 +1226,14 @@ export interface AdminRecoveryWorkRead {
   next_attempt_at: string | null;
   version: string;
   capabilities: AdminRecoveryCapability[];
+  actions: AdminRecoveryActionCandidateRead[];
   blocked_reason: string | null;
   details: Record<string, string | number | boolean | null>;
+  available_actions?: AdminRecoveryActionCandidateRead[];
+  warnings?: string[];
+  risks?: Array<AdminRecoveryRiskRead | string>;
+  web_video_profile?: string | null;
+  active_job?: AdminRecoveryActiveJobRead | AdminRecoveryJobSummaryRead | null;
 }
 
 export interface AdminRecoveryWorkPageRead {
@@ -1182,17 +1249,75 @@ export interface AdminRecoveryMutationPayload {
   capability: AdminRecoveryCapability;
 }
 
+export interface AdminRecoveryActionPayload {
+  request_id: string;
+  version: string;
+  reason: string;
+  action: AdminRecoveryCapability;
+  scope: AdminRecoveryReplayScope;
+  retry_limit: AdminRecoveryRetryLimit;
+  acknowledgements: string[];
+}
+
+export interface AdminRecoveryMediaProfileRead {
+  active_object_key?: string | null;
+  profile: string | null;
+  verified_at?: string | null;
+  source_has_audio?: boolean | null;
+  web_video_has_audio?: boolean | null;
+  outdated?: boolean;
+}
+
+export interface AdminRecoveryActiveJobRead {
+  id: string;
+  status: AdminRecoveryBatchStatus | string;
+  action: AdminRecoveryCapability;
+  scope?: AdminRecoveryReplayScope;
+  requested_by_admin_user_id?: string;
+  assigned_admin_user_id?: string | null;
+  created_at?: string;
+}
+
+export interface AdminRecoveryCandidateRead {
+  work: AdminRecoveryWorkRead;
+  version?: string;
+  actions: AdminRecoveryActionCandidateRead[];
+  warnings?: string[];
+  risks?: Array<AdminRecoveryRiskRead | string>;
+  media_profile?: AdminRecoveryMediaProfileRead | string | null;
+  active_job?: AdminRecoveryActiveJobRead | null;
+}
+
 export interface AdminRecoveryWorkReference {
   kind: AdminRecoveryWorkKind;
   id: string;
   version: string;
 }
 
+export interface AdminRecoveryExplicitSelector {
+  type: 'explicit';
+  items: AdminRecoveryWorkReference[];
+}
+
+export interface AdminRecoveryQuerySelector {
+  type: 'query';
+  filters: Record<string, string | number | boolean | string[] | null>;
+  snapshot_at: string;
+}
+
+export type AdminRecoveryBatchSelector = AdminRecoveryExplicitSelector | AdminRecoveryQuerySelector;
+
 export interface AdminRecoveryBatchPreviewPayload {
   request_id: string;
   reason: string;
-  capability: AdminRecoveryCapability;
-  items: AdminRecoveryWorkReference[];
+  action: AdminRecoveryCapability;
+  scope: AdminRecoveryReplayScope;
+  retry_limit: AdminRecoveryRetryLimit;
+  selector: AdminRecoveryBatchSelector;
+  acknowledgements?: string[];
+  /** Legacy fields remain readable during the coordinated rollout. */
+  capability?: AdminRecoveryCapability;
+  items?: AdminRecoveryWorkReference[];
 }
 
 export interface AdminRecoveryBatchMutationPayload {
@@ -1200,27 +1325,91 @@ export interface AdminRecoveryBatchMutationPayload {
   reason: string;
 }
 
+export interface AdminRecoveryRetryFailedPreviewPayload {
+  request_id: string;
+  version: string;
+  reason: string;
+  retry_limit: AdminRecoveryRetryLimit;
+}
+
+export interface AdminRecoveryBatchHandoffPayload {
+  version: string;
+  reason: string;
+  assigned_admin_user_id: string;
+}
+
 export interface AdminRecoveryJobItemRead {
   id: string;
+  source_item_id?: string | null;
   work_kind: AdminRecoveryWorkKind;
   work_id: string;
+  meme_file_id?: string | null;
   action: AdminRecoveryCapability;
-  status: 'cancelled' | 'dispatched' | 'failed' | 'queued' | 'skipped_stale' | 'succeeded' | 'waiting_capacity';
+  status: AdminRecoveryJobItemStatus;
+  stage?: string | null;
+  parent_item_id?: string | null;
+  root_item_id?: string | null;
+  is_root?: boolean;
+  attempt_count?: number;
+  retry_limit?: AdminRecoveryRetryLimit;
+  attempt_budget_start?: number;
+  retryable_failures_consumed?: number;
+  expected_version?: string | null;
+  canonical_version?: string | null;
   normalized_reason: string | null;
   safe_error: string | null;
   dispatched_at: string | null;
   finished_at: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
 }
 
-export interface AdminRecoveryBatchRead {
+export interface AdminRecoveryExclusionGroupRead {
+  reason: string;
+  count: number;
+  message?: string;
+}
+
+export interface AdminRecoveryJobSummaryRead {
   id: string;
   request_id: string;
   status: AdminRecoveryBatchStatus;
   action: AdminRecoveryCapability;
+  scope?: AdminRecoveryReplayScope;
+  retry_limit?: AdminRecoveryRetryLimit;
   reason: string;
   total_count: number;
   completed_count: number;
   failed_count: number;
+  selected_root_count?: number;
+  expanded_execution_count?: number;
+  preparation_scanned_count?: number;
+  preparation_matched_count?: number;
+  preparation_excluded_count?: number;
+  excluded_count?: number;
+  queued_count?: number;
+  waiting_count?: number;
+  waiting_capacity_count?: number;
+  waiting_dependency_count?: number;
+  dispatched_count?: number;
+  succeeded_count?: number;
+  stale_count?: number;
+  skipped_count?: number;
+  skipped_dependency_count?: number;
+  cancelled_count?: number;
+  exclusion_groups?: AdminRecoveryExclusionGroupRead[];
+  exclusions?: Record<string, number>;
+  exclusions_by_reason?: Record<string, number>;
+  requested_by_admin_user_id?: string;
+  requested_by_display_name?: string | null;
+  assigned_to_admin_user_id?: string | null;
+  assigned_admin_user_id?: string | null;
+  assigned_to_display_name?: string | null;
+  can_handoff?: boolean;
+  source_job_id?: string | null;
+  source_recovery_job_id?: string | null;
+  selection_snapshot_at?: string | null;
+  materialization_completed_at?: string | null;
   expires_at: string | null;
   scheduled_at: string | null;
   completed_at: string | null;
@@ -1228,7 +1417,22 @@ export interface AdminRecoveryBatchRead {
   created_at: string;
   updated_at: string;
   version: string;
+}
+
+export interface AdminRecoveryBatchRead extends AdminRecoveryJobSummaryRead {
+  items?: AdminRecoveryJobItemRead[];
+}
+
+export interface AdminRecoveryJobPageRead {
+  items: AdminRecoveryJobSummaryRead[];
+  next_cursor: string | null;
+  total?: number;
+}
+
+export interface AdminRecoveryJobItemPageRead {
   items: AdminRecoveryJobItemRead[];
+  next_cursor: string | null;
+  total?: number;
 }
 
 export interface AdminSearchSynonymValidationIssue {
@@ -1620,10 +1824,62 @@ export interface AdminModerationDecisionRead {
   created_at: string;
 }
 
+export interface AdminMediaObservationRead {
+  width?: number | null;
+  height?: number | null;
+  frame_rate?: number | string | null;
+  duration_seconds?: number | null;
+  bitrate_bps?: number | null;
+  file_size_bytes?: number | null;
+  video_codec?: string | null;
+  audio_codec?: string | null;
+  pixel_format?: string | null;
+  video_profile?: string | null;
+  video_level?: string | number | null;
+}
+
+export interface AdminMemeProcessingStageRead {
+  stage: string;
+  status: string;
+  attempt_count: number;
+  version: string;
+  work_kind?: AdminRecoveryWorkKind;
+  work_id?: string;
+  safe_error?: string | null;
+  normalized_reason?: string | null;
+  actions?: AdminRecoveryActionCandidateRead[];
+  active_job?: AdminRecoveryActiveJobRead | AdminRecoveryJobSummaryRead | null;
+}
+
+export interface AdminMemeProcessingFileRead {
+  id: string;
+  is_primary: boolean;
+  status: string;
+  mime_type?: string | null;
+  width?: number | null;
+  height?: number | null;
+  file_size_bytes?: number | null;
+  source_has_audio?: boolean | null;
+  web_video_has_audio?: boolean | null;
+  web_video_profile?: string | null;
+  web_video_verified_at?: string | null;
+  original?: AdminMediaObservationRead | null;
+  output?: AdminMediaObservationRead | null;
+  source_observation?: AdminMediaObservationRead | null;
+  output_observation?: AdminMediaObservationRead | null;
+  stages: AdminMemeProcessingStageRead[];
+  actions?: AdminRecoveryActionCandidateRead[];
+  version?: string;
+  work_kind?: AdminRecoveryWorkKind;
+  work_id?: string;
+  active_job?: AdminRecoveryActiveJobRead | AdminRecoveryJobSummaryRead | null;
+}
+
 export interface AdminMemeDetailRead {
   meme: AdminMemeRead;
   reports: AdminModerationReportRead[];
   decisions: AdminModerationDecisionRead[];
+  processing_files?: AdminMemeProcessingFileRead[];
 }
 
 export interface AdminMemeDestructiveActionRead {

@@ -39,7 +39,7 @@ controls are diagnostic rather than default operator language.
 | `/admin/analytics` | Read-only analytics workspace: Overview, Engagement, Audience, and Content & Sources. |
 | `/admin/sources` | Suggestions, public Telegram add flow, health, assignment, ingestion settings, pause/resume, and source removal. |
 | `/admin/telegram` | Telegram account connection, validation, account policy, and disconnect. |
-| `/admin/recovery` | Failed/stuck/dead-lettered work, bounded batch preview, audited retry/resume, and job progress. |
+| `/admin/recovery` | **Replay & Repair**: attention queues, deliberate regeneration/replay, exact batch previews, active jobs, history, and failures. |
 | `/admin/search/synonyms` | English and Russian synonym drafts, validation, publishing, revision restore, and Meilisearch sync status. |
 | `/admin/moderation` | Report queue, safe preview, direct review, and recent decisions. |
 | `/admin/moderation/patterns` | Specialist blocked perceptual-hash workspace. |
@@ -149,22 +149,66 @@ catch-up to remain enabled on both the source and assigned account.
 Removing a source stops future crawling while preserving checkpoint and message
 inventory history.
 
-### Failed-work recovery
+### Replay & Repair
 
-The Recovery workspace is the application-work control plane. It shows
-canonical failures from source posts and backfills through ingest, processing,
-search sync, outbox publishing, and dead letters. The backend declares the
-actions available for each row; the browser never invents retryability from an
-error string. Every retry or resume requires an operator reason, an idempotency
-request ID, and the version displayed during review. Large selections require a
-short-lived preview and explicit scheduling.
+Replay & Repair is the application-work control plane with three sections:
 
-Recovery is asynchronous and capacity-aware. Operators can inspect progress or
-cancel undispatched batch items, but cannot restart containers or systemd
-services from the product. Historical failures become visible after upgrades
-without being replayed automatically. Telegram poison posts are isolated after
-three attempts so one message cannot permanently block the rest of a channel's
-history.
+- **Needs attention** shows retryable, stuck, blocked, and dead-lettered work
+  from source posts/backfills through ingest, processing, search sync, outbox,
+  and dead letters.
+- **Regenerate** handles deliberate stage replay and derivative maintenance.
+  Its first cohort is every web video not on `web-h264-aac-1080p30-v2`, every
+  unverified derivative, and every inconsistent source/output audio state. A
+  separate **Successful stage replay** cohort selects exactly one non-Ingest
+  stage and can preview every matching successful root: `succeeded` journal
+  rows for Transcode/OCR/Embed/Classify and `synced` target rows for Qdrant or
+  Meilisearch.
+- **Jobs** shows exact preview preparation, active work, history, exclusions,
+  and failures. All admins may inspect jobs and perform an audited handoff while
+  the immutable original requester remains visible.
+
+The backend declares every available action and every blocked prerequisite; the
+browser never infers eligibility from an error string. Succeeded, retryable-
+failed, and terminal-failed stages may be replayed. A terminal override requires
+an audit reason and acknowledgement checkbox, not typed confirmation. Pending
+or processing rows, missing originals/prerequisites, duplicate rows, unsupported
+Ingest replay, and an active reservation remain blocked.
+
+Pipeline-stage actions choose **Selected stage only** or **Stage and
+dependents**. Stage-only intentionally leaves existing descendants untouched
+and displays a stale-data warning; stage-only Transcode means atomic derivative
+regeneration. A cascade follows Transcode → OCR → Embed → Classify, then lets
+Qdrant and Meilisearch run concurrently. Provider-backed and semantic-merge
+risks are shown before scheduling. Every job chooses 1, 3, or 5 retryable
+failures, default 3; terminal failures stop immediately and worker-shutdown
+redelivery does not spend that budget.
+
+Explicit versioned references remain supported. **Select all matching** instead
+stores the current action, filters, and snapshot as an uncapped server query.
+One click immediately commits a `preparing` job. The first leased scheduler
+turn freezes exact root membership under a server-owned MVCC snapshot; the
+client observation timestamp remains context and is not treated as historical
+row reconstruction. Later restart-safe keyset turns expand dependency steps,
+revalidate captured versions, and record sanitized exclusions. Preview expiry
+starts only after expansion finishes. Reviewed outdated-video previews schedule
+with one click and no typed phrase. Successful-stage queries also freeze the
+chosen stage and stage-only/cascade scope for the whole job; replaying another
+stage requires a separate preview. Their review retains the selected 1/3/5
+retry limit, audit reason, backend-declared provider/semantic risks, stale-data
+or terminal acknowledgements, and exact selected-root versus expanded-step
+counts. Roots that changed, lost eligibility/prerequisites, or acquired an
+active reservation after capture appear only as grouped sanitized exclusions;
+newly successful live rows never enter the reviewed snapshot.
+
+Jobs expose selected roots, expanded execution steps, preparation progress,
+grouped exclusions, and queued/waiting/dispatched/succeeded/failed/stale/
+skipped/cancelled totals. Cancellation first enters `cancelling`, stops new
+admission, cancels queued descendants, lets dispatched work reconcile, and only
+then finalizes accurate totals. Failed items sort first and can seed a new
+**Preview retry of failed items**. Recovery remains asynchronous and capacity-
+aware and never restarts containers or systemd services from the product.
+Historical failures remain visible without automatic replay; Telegram poison
+posts remain isolated so one message cannot block later history.
 
 ### Search synonym management
 
@@ -224,8 +268,11 @@ credential just stored for the crawler.
 
 - The moderation queue renders an authorized preview even for hidden/private
   memes, links directly to the meme review route, and records decisions. The
-  meme route puts preview, current state, and open reports before metadata and
-  merge/delete controls.
+  meme route puts preview and current state first, then a **Processing** panel
+  for every attached file before reports and controls. The panel identifies the
+  primary file and shows file/stage state, active profile, original/output
+  dimensions and FPS, audio state, attempts, active job, and every backend-
+  declared action without exposing storage object keys.
 - Blocked patterns are pHash policy fingerprints. The specialist page lists
   active and inactive patterns first; raw hash/algorithm/tolerance editing and
   lifecycle/deletion controls are disclosed.

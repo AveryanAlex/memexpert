@@ -127,6 +127,19 @@ AUTH_TEST_GOOGLE_USERINFO_URL: Final = "https://google.test/userinfo"
 AUTH_TEST_GOOGLE_TIMEOUT_SECONDS: Final = 5.0
 
 
+@pytest.fixture(autouse=True)
+def _stub_recovery_original_presence(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep recovery tests hermetic unless they inject an explicit presence checker."""
+
+    from memexpert.core.storage import StorageObjectPresence
+    from memexpert.services import admin_recovery
+
+    async def present(_object_key: str) -> StorageObjectPresence:
+        return StorageObjectPresence.PRESENT
+
+    monkeypatch.setattr(admin_recovery, "check_pipeline_object_presence", present)
+
+
 class RedisPingWaitStrategy(WaitStrategy):
     """Wait for Redis with the structured testcontainers wait-strategy API.
 

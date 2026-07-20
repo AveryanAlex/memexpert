@@ -22,6 +22,22 @@ export interface SeededE2EUser {
   password: string;
 }
 
+export interface AudioSafeMediaProof {
+  fixture: string;
+  meme_file_id: string;
+  profile: string;
+  downloaded_byte_size: number;
+  poster_byte_size: number;
+  width: number;
+  height: number;
+  frame_rate: number;
+  video_bit_rate: number;
+  video_codec: 'h264';
+  audio_codec: 'aac' | null;
+  source_has_audio: boolean;
+  web_video_has_audio: boolean;
+}
+
 export interface SeededCollectionManagementFixture {
   owner: SeededE2EUser;
   member: SeededE2EUser;
@@ -93,6 +109,7 @@ export interface SeedArtifact {
   seeded_memes: SeededMeme[];
   collection_management: SeededCollectionManagementFixture;
   public_trends: SeededPublicTrendsFixture;
+  audio_safe_media: AudioSafeMediaProof[];
   created_meme: {
     meme_id: string;
     meme_file_id: string;

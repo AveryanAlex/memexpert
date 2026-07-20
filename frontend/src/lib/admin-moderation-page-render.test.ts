@@ -62,9 +62,51 @@ describe('/admin/memes/[id] page', () => {
     const { body } = render(MemeDetailPage, {
       props: {
         data: {
-          detail: { meme: reviewedMeme, reports: [report(reviewedMeme, 'nsfw')], decisions: [decision(reviewedMeme.id)] },
+          detail: {
+            meme: reviewedMeme,
+            reports: [report(reviewedMeme, 'nsfw')],
+            decisions: [decision(reviewedMeme.id)],
+            processing_files: [
+              {
+                id: 'processing-file-primary',
+                is_primary: true,
+                status: 'ready',
+                mime_type: 'video/webm',
+                source_has_audio: true,
+                web_video_has_audio: true,
+                web_video_profile: 'web-h264-aac-1080p30-v2',
+                web_video_verified_at: '2026-07-10T12:30:00Z',
+                original: { width: 1280, height: 720, frame_rate: 24, duration_seconds: 3, file_size_bytes: 2048, video_codec: 'vp9', audio_codec: 'opus' },
+                output: { width: 1280, height: 720, frame_rate: 24, duration_seconds: 3, file_size_bytes: 1024, bitrate_bps: 2_000_000, video_codec: 'h264', audio_codec: 'aac', pixel_format: 'yuv420p', video_profile: 'High' },
+                version: 'file-version',
+                actions: [{ capability: 'regenerate_derivatives', available: true, scopes: ['stage_only'] }],
+                stages: [
+                  { stage: 'transcode', status: 'succeeded', attempt_count: 1, version: 'transcode-version', actions: [{ capability: 'replay_stage', available: true, scopes: ['stage_only', 'stage_and_dependents'] }] },
+                  { stage: 'ocr', status: 'succeeded', attempt_count: 2, version: 'ocr-version', actions: [] }
+                ],
+                active_job: null
+              },
+              {
+                id: 'processing-file-alternate',
+                is_primary: false,
+                status: 'failed',
+                mime_type: 'image/jpeg',
+                source_has_audio: false,
+                web_video_has_audio: false,
+                web_video_profile: null,
+                web_video_verified_at: null,
+                original: { width: 640, height: 480, file_size_bytes: 512 },
+                output: null,
+                stages: [{ stage: 'ocr', status: 'failed', attempt_count: 3, version: 'alt-ocr', safe_error: 'OCR failed safely.', actions: [] }]
+              }
+            ]
+          },
           templates: [],
-          loadError: null
+          processingRequestIds: {
+            'pipeline_stage:processing-file-primary:transcode': '11111111-1111-4111-8111-111111111111'
+          },
+          loadError: null,
+          templatesLoadError: null
         },
         form: null
       } as never
@@ -75,6 +117,16 @@ describe('/admin/memes/[id] page', () => {
     expect(body).toContain('Hidden');
     expect(body).toContain('Safety label');
     expect(body).toContain('Sensitive');
+    expect(body).toContain('Processing');
+    expect(body).toContain('processing-file-primary');
+    expect(body).toContain('processing-file-alternate');
+    expect(body).toContain('Primary');
+    expect(body).toContain('web-h264-aac-1080p30-v2');
+    expect(body).toContain('1280×720');
+    expect(body).toContain('24 FPS');
+    expect(body).toContain('Audio present');
+    expect(body).toContain('Regenerate derivatives');
+    expect(body).toContain('Replay stage');
     expect(body.indexOf('Preview')).toBeLessThan(body.indexOf('Open reports'));
     expect(body.indexOf('Open reports')).toBeLessThan(body.indexOf('Overrides'));
     expect(body).toContain('Metadata');

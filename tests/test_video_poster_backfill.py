@@ -11,6 +11,7 @@ import pytest
 from botocore.exceptions import ClientError
 
 from memexpert.core.config import Settings
+from memexpert.media.contracts import MediaValidationError
 from memexpert.workers.video_poster_backfill import (
     VideoPosterBackfiller,
     VideoPosterBackfillStatus,
@@ -88,8 +89,9 @@ class FakeMediaProcessor:
         filename: str,
         content_type: str,
         media_bytes: bytes,
+        generation_id: uuid.UUID | None = None,
     ) -> NormalizedMediaResult:
-        _ = (meme_file_id, filename, content_type, media_bytes)
+        _ = (meme_file_id, filename, content_type, media_bytes, generation_id)
         raise AssertionError("poster backfill must not re-transcode videos")
 
     async def extract_preview_frame(
@@ -159,3 +161,31 @@ async def test_backfiller_force_regenerates_existing_preview() -> None:
 
     assert result is VideoPosterBackfillStatus.CREATED
     assert storage_client.objects[preview_image_key] == (b"fresh-preview", "image/png")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("overwrite", [False, True])
+async def test_backfiller_refuses_to_mutate_immutable_generation_poster(overwrite: bool) -> None:
+    meme_file_id = uuid.UUID("11111111-1111-7111-8111-111111111115")
+    generation_id = uuid.UUID("22222222-2222-7222-8222-222222222225")
+    generation_prefix = f"pipeline/derived/{meme_file_id}/generations/{generation_id}"
+    web_video_key = f"{generation_prefix}/web.mp4"
+    preview_image_key = f"{generation_prefix}/preview.png"
+    storage_client = FakeStorageClient()
+    storage_client.objects[web_video_key] = (b"normalized-web-video", "video/mp4")
+    if overwrite:
+        storage_client.objects[preview_image_key] = (b"immutable-preview", "image/png")
+    media_processor = FakeMediaProcessor(preview_bytes=b"mutated-preview")
+    backfiller = VideoPosterBackfiller(
+        storage_client=storage_client,
+        media_processor=media_processor,
+        settings=Settings(),
+    )
+    candidate = VideoPosterCandidate(meme_file_id=meme_file_id, web_video_object_key=web_video_key)
+
+    with pytest.raises(MediaValidationError, match="cannot be repaired in place"):
+        await backfiller.ensure_preview_image(candidate, overwrite=overwrite)
+
+    assert not storage_client.put_calls
+    assert not media_processor.extract_calls
+    assert storage_client.objects.get(preview_image_key) != (b"mutated-preview", "image/png")

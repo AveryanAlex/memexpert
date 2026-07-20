@@ -21,6 +21,7 @@ from memexpert.messaging.rabbitmq_outbox_runtime import RabbitMQOutboxPublisherB
 from memexpert.models.enums import ContentKind, ContentLanguage, SearchSynonymSyncStatus
 from memexpert.scheduler.jobs import (
     JOB_ID_MATERIALIZED_VIEW_REFRESH,
+    JOB_ID_MEDIA_GENERATION_GC,
     JOB_ID_MEILISEARCH_SETTINGS_RECONCILE,
     JOB_ID_MOTD,
     JOB_ID_PIPELINE_CAPACITY_REFRESH,
@@ -239,6 +240,7 @@ def test_scheduler_job_definitions_register_expected_ids() -> None:
         JOB_ID_SEO_BACKLOG_BATCHES,
         JOB_ID_RABBITMQ_OUTBOX_PUBLISHER,
         JOB_ID_RECOVERY_DISPATCH,
+        JOB_ID_MEDIA_GENERATION_GC,
         JOB_ID_PIPELINE_CAPACITY_REFRESH,
         JOB_ID_TELEGRAM_LOGIN_CLEANUP,
         JOB_ID_SOURCE_CHANNEL_AUDIENCE_CAPTURE,
@@ -263,6 +265,7 @@ def test_enabled_scheduler_jobs_filters_disabled_jobs() -> None:
             "scheduler_seo_backlog_batches_enabled": False,
             "scheduler_rabbitmq_outbox_publisher_enabled": False,
             "scheduler_recovery_dispatch_enabled": False,
+            "scheduler_media_generation_gc_enabled": False,
             "scheduler_pipeline_capacity_refresh_enabled": False,
             "scheduler_telegram_login_cleanup_enabled": False,
         }
@@ -853,6 +856,7 @@ async def test_scheduler_runtime_registers_enabled_jobs_and_shuts_down_gracefull
             "scheduler_seo_backlog_batches_enabled": True,
             "scheduler_rabbitmq_outbox_publisher_enabled": False,
             "scheduler_recovery_dispatch_enabled": False,
+            "scheduler_media_generation_gc_enabled": False,
             "scheduler_pipeline_capacity_refresh_enabled": False,
             "scheduler_advisory_lock_enabled": False,
         }
@@ -909,6 +913,7 @@ async def test_scheduler_runtime_skips_disabled_jobs() -> None:
             "scheduler_seo_backlog_batches_enabled": False,
             "scheduler_rabbitmq_outbox_publisher_enabled": False,
             "scheduler_recovery_dispatch_enabled": False,
+            "scheduler_media_generation_gc_enabled": False,
             "scheduler_pipeline_capacity_refresh_enabled": False,
             "scheduler_telegram_login_cleanup_enabled": False,
             "scheduler_advisory_lock_enabled": False,

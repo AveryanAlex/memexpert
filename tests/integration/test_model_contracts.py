@@ -89,6 +89,7 @@ from memexpert.models.search_synonyms import (
     SearchSynonymRevision,
     SearchSynonymSyncState,
 )
+from memexpert.models.operations import RecoveryJobItem
 from memexpert.models.user import (
     AccountDeletionLog,
     AccountMergeLog,
@@ -132,6 +133,7 @@ EXPECTED_TABLES = {
     "meme_file_ocr_results",
     "meme_file_sync_target_snapshots",
     "login_events",
+    "media_generations",
     "meme_files",
     "meme_exposures",
     "meme_merge_logs",
@@ -153,6 +155,7 @@ EXPECTED_TABLES = {
     "rabbitmq_outbox_messages",
     "recovery_job_items",
     "recovery_jobs",
+    "recovery_query_snapshot_members",
     "runtime_heartbeats",
     "search_synonym_catalogs",
     "search_synonym_revisions",
@@ -1830,6 +1833,31 @@ def test_meme_source_unique_platform_source_post_still_holds() -> None:
     assert unique_constraints == {
         "uq_meme_sources_platform_source_post": ("platform", "source_id", "post_id"),
     }
+
+
+def test_recovery_item_active_reservation_indexes_cover_stage_and_non_stage_work() -> None:
+    table = cast("Table", RecoveryJobItem.__table__)
+    stage_index = next(
+        index
+        for index in table.indexes
+        if index.name == "uq_recovery_job_items_active_stage_reservation"
+    )
+    work_index = next(
+        index
+        for index in table.indexes
+        if index.name == "uq_recovery_job_items_active_work_reservation"
+    )
+
+    assert stage_index.unique is True
+    assert tuple(column.name for column in stage_index.columns) == ("meme_file_id", "stage")
+    stage_predicate = str(stage_index.dialect_options["postgresql"]["where"]).lower()
+    assert "reservation_active" in stage_predicate
+    assert "stage is not null" in stage_predicate
+    assert work_index.unique is True
+    assert tuple(column.name for column in work_index.columns) == ("work_kind", "work_id")
+    work_predicate = str(work_index.dialect_options["postgresql"]["where"]).lower()
+    assert "reservation_active" in work_predicate
+    assert "stage is null" in work_predicate
 
 
 async def test_telegram_session_orm_persists_projects_safely_and_enforces_uniqueness(

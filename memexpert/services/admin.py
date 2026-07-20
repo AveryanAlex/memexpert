@@ -22,6 +22,7 @@ from memexpert.crawlers.telegram.session_crypto import (
     TelegramStringSessionSecretError,
 )
 from memexpert.ingest.policy import refresh_effective_visibility
+from memexpert.media.contracts import SUPPORTED_MOVING_MEDIA_MIME_TYPES
 from memexpert.models.base import utcnow
 from memexpert.models.collection import CollectionMeme, PinnedMeme
 from memexpert.models.content import (
@@ -56,6 +57,9 @@ from memexpert.models.enums import (
     ModerationReportStatus,
     PipelineIngestRequestStatus,
     RecoveryCapability,
+    RecoveryJobItemStatus,
+    RecoveryJobStatus,
+    RecoveryWorkKind,
     SourceAttachReason,
     SourceChannelAudienceCaptureReason,
     SourceChannelBackfillJobStatus,
@@ -65,6 +69,7 @@ from memexpert.models.enums import (
     SyncTargetStatus,
     TelegramSessionStatus,
 )
+from memexpert.models.operations import MediaGeneration, RecoveryJob, RecoveryJobItem
 from memexpert.models.user import ChannelSuggestion
 from memexpert.pipeline.constants import ACTIVE_STAGE_STATUSES, STAGE_ORDER
 from memexpert.schemas.admin import (
@@ -77,8 +82,13 @@ from memexpert.schemas.admin import (
     AdminMemeDeleteRequest,
     AdminMemeDestructiveActionRead,
     AdminMemeDetailRead,
+    AdminMemeMediaObservationRead,
     AdminMemeMergeRequest,
     AdminMemeModerationUpdateRequest,
+    AdminMemeProcessingActionRead,
+    AdminMemeProcessingFileRead,
+    AdminMemeProcessingJobRead,
+    AdminMemeProcessingStageRead,
     AdminMemeRead,
     AdminMemeSeoEditRequest,
     AdminMemeSeoPageRead,
@@ -116,6 +126,7 @@ from memexpert.schemas.admin import (
 )
 from memexpert.schemas.meme import PublicMemeFileRead
 from memexpert.schemas.user import ChannelSuggestionRead
+from memexpert.services.admin_recovery import AdminRecoveryService
 from memexpert.services.admin_telegram_channel_resolver import (
     AdminTelegramChannelResolverError,
     normalize_public_telegram_reference,
@@ -125,6 +136,8 @@ from memexpert.services.content_merge import ContentMergeService
 from memexpert.services.engagement_read_model import load_derived_popularity_scores
 from memexpert.services.media_render_urls import MediaRenderUrlService
 from memexpert.services.meme_seo import MemeSeoGenerationService
+from memexpert.services.recovery_versions import media_recovery_version, recovery_row_version
+from memexpert.services.safe_errors import sanitize_operational_error
 from memexpert.services.source_channel_audience import (
     record_source_channel_audience_observation,
     source_channel_audience_observation_from_count,
@@ -1870,7 +1883,12 @@ class AdminService:
 
     async def get_meme_detail(self, meme_id: uuid.UUID) -> AdminMemeDetailRead:
         meme = await self.session.scalar(
-            select(Meme).options(selectinload(Meme.primary_file)).where(Meme.id == meme_id),
+            select(Meme)
+            .options(
+                selectinload(Meme.primary_file),
+                selectinload(Meme.files).selectinload(MemeFile.pipeline_stage_journal_entries),
+            )
+            .where(Meme.id == meme_id),
         )
         if meme is None:
             raise AdminNotFoundError(f"Meme {meme_id} does not exist.")
@@ -1901,12 +1919,153 @@ class AdminService:
         )
         popularity_scores = await self._load_admin_popularity_scores([meme])
         meme_read = self._admin_meme_read(meme, popularity_score=popularity_scores.get(meme.id, 0.0))
+        processing_files = await self._admin_meme_processing_files(meme)
 
         return AdminMemeDetailRead(
             meme=meme_read,
             reports=[self._admin_moderation_report_read(report, meme_read=meme_read) for report in reports],
             decisions=[AdminModerationDecisionRead.model_validate(decision) for decision in decisions],
+            processing_files=processing_files,
         )
+
+    async def _admin_meme_processing_files(self, meme: Meme) -> list[AdminMemeProcessingFileRead]:
+        file_ids = [file.id for file in meme.files]
+        if not file_ids:
+            return []
+
+        generations = (
+            (
+                await self.session.execute(
+                    select(MediaGeneration).where(
+                        MediaGeneration.id.in_(
+                            [
+                                file.active_media_generation_id
+                                for file in meme.files
+                                if file.active_media_generation_id is not None
+                            ]
+                        )
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        generations_by_id = {generation.id: generation for generation in generations}
+        active_rows = (
+            await self.session.execute(
+                select(RecoveryJobItem, RecoveryJob)
+                .join(RecoveryJob, RecoveryJob.id == RecoveryJobItem.recovery_job_id)
+                .where(
+                    RecoveryJobItem.meme_file_id.in_(file_ids),
+                    RecoveryJob.status.in_(
+                        (
+                            RecoveryJobStatus.QUEUED,
+                            RecoveryJobStatus.RUNNING,
+                            RecoveryJobStatus.CANCELLING,
+                        )
+                    ),
+                    RecoveryJobItem.status.in_(
+                        (
+                            RecoveryJobItemStatus.QUEUED,
+                            RecoveryJobItemStatus.WAITING_DEPENDENCY,
+                            RecoveryJobItemStatus.WAITING_CAPACITY,
+                            RecoveryJobItemStatus.DISPATCHED,
+                        )
+                    ),
+                )
+                .order_by(RecoveryJobItem.created_at.desc(), RecoveryJobItem.id.desc())
+            )
+        ).all()
+        active_by_stage: dict[tuple[uuid.UUID, ContentPipelineStage], tuple[RecoveryJobItem, RecoveryJob]] = {}
+        active_by_file: dict[uuid.UUID, tuple[RecoveryJobItem, RecoveryJob]] = {}
+        for item, job in active_rows:
+            if item.meme_file_id is None:
+                continue
+            active_by_file.setdefault(item.meme_file_id, (item, job))
+            if item.stage is not None:
+                active_by_stage.setdefault((item.meme_file_id, item.stage), (item, job))
+
+        result: list[AdminMemeProcessingFileRead] = []
+        recovery_service = AdminRecoveryService(self.session)
+        for file in sorted(meme.files, key=lambda row: (row.id != meme.primary_file_id, row.created_at, row.id)):
+            generation = (
+                generations_by_id.get(file.active_media_generation_id)
+                if file.active_media_generation_id is not None
+                else None
+            )
+            entries = sorted(
+                file.pipeline_stage_journal_entries,
+                key=lambda row: (STAGE_ORDER[row.stage], row.created_at, row.id),
+            )
+            status_by_stage = {entry.stage: entry for entry in entries}
+            action_contract_by_stage: dict[
+                ContentPipelineStage,
+                list[AdminMemeProcessingActionRead],
+            ] = {}
+            stages: list[AdminMemeProcessingStageRead] = []
+            for entry in entries:
+                active_pair = active_by_stage.get((file.id, entry.stage))
+                candidate = await recovery_service.get_candidate(
+                    RecoveryWorkKind.PIPELINE_STAGE,
+                    str(entry.id),
+                )
+                actions = [
+                    AdminMemeProcessingActionRead.model_validate(action.model_dump())
+                    for action in candidate.actions
+                ]
+                action_contract_by_stage[entry.stage] = actions
+                stages.append(
+                    AdminMemeProcessingStageRead(
+                        stage=entry.stage,
+                        status=entry.status,
+                        attempt_count=entry.attempt_count,
+                        version=(
+                            media_recovery_version(entry, file)
+                            if entry.stage is ContentPipelineStage.TRANSCODE
+                            and _processing_is_moving_media(file)
+                            else recovery_row_version(entry, entry.last_event_id)
+                        ),
+                        work_id=str(entry.id),
+                        safe_error=_safe_processing_error(entry.last_error_text),
+                        normalized_reason=entry.normalized_reason,
+                        actions=actions,
+                        active_job=_processing_job_read(active_pair[1]) if active_pair is not None else None,
+                    )
+                )
+
+            transcode = status_by_stage.get(ContentPipelineStage.TRANSCODE)
+            file_actions = action_contract_by_stage.get(ContentPipelineStage.TRANSCODE, [])
+            active_file_pair = active_by_file.get(file.id)
+            result.append(
+                AdminMemeProcessingFileRead(
+                    id=file.id,
+                    is_primary=file.id == meme.primary_file_id,
+                    status=file.status.value,
+                    mime_type=file.mime_type,
+                    width=file.width,
+                    height=file.height,
+                    file_size_bytes=file.file_size_bytes,
+                    source_has_audio=file.source_has_audio,
+                    web_video_has_audio=file.web_video_has_audio,
+                    web_video_profile=file.web_video_profile,
+                    web_video_verified_at=file.web_video_verified_at,
+                    original=_source_media_observation(file, generation),
+                    output=_output_media_observation(generation),
+                    stages=stages,
+                    actions=file_actions,
+                    version=(
+                        media_recovery_version(transcode, file)
+                        if transcode is not None and _processing_is_moving_media(file)
+                        else recovery_row_version(transcode, transcode.last_event_id)
+                        if transcode is not None
+                        else recovery_row_version(file)
+                    ),
+                    work_kind=RecoveryWorkKind.PIPELINE_STAGE if transcode is not None else None,
+                    work_id=str(transcode.id) if transcode is not None else None,
+                    active_job=(_processing_job_read(active_file_pair[1]) if active_file_pair is not None else None),
+                )
+            )
+        return result
 
     async def delete_meme(
         self,
@@ -3406,6 +3565,104 @@ class AdminService:
                 note=note,
             ),
         )
+
+
+def _processing_is_moving_media(meme_file: MemeFile) -> bool:
+    mime_type = (meme_file.mime_type or "").casefold()
+    return mime_type in SUPPORTED_MOVING_MEDIA_MIME_TYPES
+
+
+def _processing_job_read(job: RecoveryJob) -> AdminMemeProcessingJobRead:
+    return AdminMemeProcessingJobRead(id=job.id, status=job.status.value, action=job.action)
+
+
+
+
+def _safe_processing_error(value: str | None) -> str | None:
+    return sanitize_operational_error(value, max_length=1000)
+
+
+def _source_media_observation(
+    file: MemeFile,
+    generation: MediaGeneration | None,
+) -> AdminMemeMediaObservationRead:
+    payload = generation.source_observations if generation is not None else {}
+    video = _first_observation(payload, "video_streams")
+    audio = _first_observation(payload, "audio_streams")
+    return AdminMemeMediaObservationRead(
+        width=generation.source_width if generation is not None else file.width,
+        height=generation.source_height if generation is not None else file.height,
+        frame_rate=(
+            _frame_rate(
+                generation.source_frame_rate_numerator,
+                generation.source_frame_rate_denominator,
+            )
+            if generation is not None
+            else None
+        ),
+        duration_seconds=generation.source_duration_seconds if generation is not None else None,
+        bitrate_bps=_safe_int(video.get("bit_rate")),
+        file_size_bytes=file.file_size_bytes,
+        video_codec=_safe_str(video.get("codec_name")),
+        audio_codec=_safe_str(audio.get("codec_name")),
+        pixel_format=_safe_str(video.get("pixel_format")),
+        video_profile=_safe_str(video.get("profile")),
+        video_level=_safe_level(video.get("level")),
+    )
+
+
+def _output_media_observation(
+    generation: MediaGeneration | None,
+) -> AdminMemeMediaObservationRead | None:
+    if generation is None:
+        return None
+    video = _first_observation(generation.output_observations, "video_streams")
+    return AdminMemeMediaObservationRead(
+        width=generation.output_width,
+        height=generation.output_height,
+        frame_rate=_frame_rate(
+            generation.output_frame_rate_numerator,
+            generation.output_frame_rate_denominator,
+        ),
+        duration_seconds=generation.output_duration_seconds,
+        bitrate_bps=generation.output_video_bitrate,
+        file_size_bytes=generation.output_byte_size,
+        video_codec=generation.output_video_codec,
+        audio_codec=generation.output_audio_codec,
+        pixel_format=_safe_str(video.get("pixel_format")),
+        video_profile=_safe_str(video.get("profile")),
+        video_level=_safe_level(video.get("level")),
+    )
+
+
+def _first_observation(payload: dict[str, object], key: str) -> dict[str, object]:
+    values = payload.get(key)
+    if not isinstance(values, list | tuple) or not values or not isinstance(values[0], dict):
+        return {}
+    return {str(name): value for name, value in values[0].items()}
+
+
+def _frame_rate(numerator: int | None, denominator: int | None) -> float | None:
+    if numerator is None or denominator is None or numerator <= 0 or denominator <= 0:
+        return None
+    return round(numerator / denominator, 4)
+
+
+def _safe_int(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int | float | str):
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _safe_str(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _safe_level(value: object) -> str | int | None:
+    return value if isinstance(value, str | int) and not isinstance(value, bool) else None
 
 
 __all__ = [

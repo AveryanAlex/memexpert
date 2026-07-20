@@ -8,8 +8,10 @@
 <RecoveryWorkspace
   summary={data.summary}
   workPage={data.workPage}
+  jobsPage={data.jobsPage}
   filters={data.filters}
   requestIds={data.requestIds}
   loadError={data.loadError}
+  jobsLoadError={data.jobsLoadError}
   {form}
 />

@@ -48,7 +48,16 @@ The card overflow menu contains only secondary or safety actions that are not al
 
 Save opens a persistent collection chooser. Collections already containing the meme appear first under **Saved in**, with one-step removal when the viewer can edit them; remaining writable collections appear under **Add to**. Favorites is never shown there. The bookmark remains active until the meme is removed from every accessible non-Favorites collection.
 
-Video cards use their generated poster until playback starts. A one-column grid autoplays only the sufficiently visible video, muted and inline; multi-column pointer/hover layouts play on hover. Clicking the video toggles play/pause, leaving the card or viewport pauses and re-mutes it, and an explicit control allows unmuting. Interactive video cards retain a separate visible Open meme link.
+Video cards use the poster belonging to their active immutable web-video
+generation until playback starts. Playback URLs carry a version token derived
+from that active object, so an atomic derivative repair cannot leave a browser
+on a stale video/poster pair. A one-column grid autoplays only the sufficiently
+visible video, muted and inline; multi-column pointer/hover layouts play on
+hover. Clicking the video toggles play/pause, leaving the card or viewport
+pauses and re-mutes it, and an explicit control allows unmuting. When the source
+was audible, the verified AAC-LC track becomes audible after **Unmute**; silent
+sources remain silent. Interactive video cards retain a separate visible Open
+meme link. Authenticated media redirects are private and non-cacheable.
 
 ## Search (`/search`)
 

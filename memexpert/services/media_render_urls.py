@@ -9,10 +9,10 @@ import re
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 from memexpert.core.config import Settings, get_settings
-from memexpert.core.storage import build_preview_image_object_key
+from memexpert.core.storage import derive_preview_image_object_key, media_object_version_token
 from memexpert.schemas.meme import PublicMemeFileRenderRead
 
 if TYPE_CHECKING:
@@ -81,7 +81,12 @@ class MediaRenderUrlService:
             )
 
         if file.s3_web_video_key:
-            render.web_video_url = self._public_file_url(file.id, variant="web-video.mp4")
+            version_token = media_object_version_token(file.s3_web_video_key)
+            render.web_video_url = self._public_file_url(
+                file.id,
+                variant="web-video.mp4",
+                version_token=version_token,
+            )
             if render.download_url is None:
                 render.download_url = render.web_video_url
         return render
@@ -99,14 +104,28 @@ class MediaRenderUrlService:
         else:
             render.original_url = self._private_file_url(file.id, variant="original")
             if file.s3_web_video_key:
-                render.thumbnail_url = self._private_file_url(file.id, variant="thumbnail")
-                render.preview_url = self._private_file_url(file.id, variant="preview")
+                version_token = media_object_version_token(file.s3_web_video_key)
+                render.thumbnail_url = self._private_file_url(
+                    file.id,
+                    variant="thumbnail",
+                    version_token=version_token,
+                )
+                render.preview_url = self._private_file_url(
+                    file.id,
+                    variant="preview",
+                    version_token=version_token,
+                )
                 render.display_url = render.preview_url
             if not file.s3_web_video_key:
                 render.download_url = self._private_file_url(file.id, variant="download")
 
         if file.s3_web_video_key:
-            render.web_video_url = self._private_file_url(file.id, variant="web-video.mp4")
+            version_token = media_object_version_token(file.s3_web_video_key)
+            render.web_video_url = self._private_file_url(
+                file.id,
+                variant="web-video.mp4",
+                version_token=version_token,
+            )
             if render.download_url is None:
                 render.download_url = render.web_video_url
         return render
@@ -124,13 +143,27 @@ class MediaRenderUrlService:
         digest = hmac.new(self._imgproxy_key, self._imgproxy_salt + path.encode(), hashlib.sha256).digest()
         return _base64url_bytes(digest)
 
-    def _public_file_url(self, file_id: uuid.UUID, *, variant: str) -> str | None:
+    def _public_file_url(
+        self,
+        file_id: uuid.UUID,
+        *,
+        variant: str,
+        version_token: str | None = None,
+    ) -> str | None:
         if self._public_media_base_url is None:
             return None
-        return f"{self._public_media_base_url}/{file_id}/{quote(variant, safe='')}"
+        path = f"{self._public_media_base_url}/{file_id}/{quote(variant, safe='')}"
+        return _append_version_token(path, version_token)
 
-    def _private_file_url(self, file_id: uuid.UUID, *, variant: str) -> str:
-        return f"/api/v1/media/files/{file_id}/{quote(variant, safe='')}"
+    def _private_file_url(
+        self,
+        file_id: uuid.UUID,
+        *,
+        variant: str,
+        version_token: str | None = None,
+    ) -> str:
+        path = f"/api/v1/media/files/{file_id}/{quote(variant, safe='')}"
+        return _append_version_token(path, version_token)
 
 
 def _is_static_image_mime(mime_type: str | None) -> bool:
@@ -141,8 +174,18 @@ def _preview_image_key(file: MemeFile, *, settings: Settings) -> str | None:
     if _is_static_image_mime(file.mime_type):
         return file.s3_original_key
     if file.s3_web_video_key:
-        return build_preview_image_object_key(file.id, settings=settings)
+        return derive_preview_image_object_key(
+            file.s3_web_video_key,
+            meme_file_id=file.id,
+            settings=settings,
+        )
     return None
+
+
+def _append_version_token(url: str, version_token: str | None) -> str:
+    if version_token is None:
+        return url
+    return f"{url}?{urlencode({'v': version_token})}"
 
 
 def _extension_for_file(file: MemeFile, *, default: str) -> str:

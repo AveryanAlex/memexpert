@@ -193,8 +193,9 @@ class _BlockingMediaProcessor:
         filename: str,
         content_type: str,
         media_bytes: bytes,
+        generation_id: uuid.UUID | None = None,
     ) -> NormalizedMediaResult:
-        _ = (filename, content_type)
+        _ = (filename, content_type, generation_id)
         if media_bytes != self.expected_bytes:
             raise AssertionError("Worker downloaded unexpected test media bytes.")
         self.control.send(("delivery_started", str(meme_file_id)))

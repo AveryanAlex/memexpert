@@ -146,8 +146,9 @@ class FakeMediaProcessor:
         filename: str,
         content_type: str,
         media_bytes: bytes,
+        generation_id: uuid.UUID | None = None,
     ) -> NormalizedMediaResult:
-        _ = (meme_file_id, filename, content_type, media_bytes)
+        _ = (meme_file_id, filename, content_type, media_bytes, generation_id)
         raise AssertionError("normalize_for_web should not be called by materializer tests")
 
     async def extract_preview_frame(

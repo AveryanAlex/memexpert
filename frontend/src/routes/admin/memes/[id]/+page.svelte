@@ -2,6 +2,7 @@
   import AdvancedSection from '$lib/features/admin/AdvancedSection.svelte';
   import { formatAdminTimestamp } from '$lib/features/admin/formatTimestamp';
   import AdminMediaPreview from '$lib/features/admin/moderation/AdminMediaPreview.svelte';
+  import MemeProcessingPanel from '$lib/features/admin/recovery/MemeProcessingPanel.svelte';
   import { Badge, Button, Card, FormRow, Input, Label, Notice, Select } from '$lib/ui';
   import type { ActionData, PageData } from './$types';
 
@@ -19,6 +20,7 @@
   const openReports = $derived(data.detail?.reports.filter((report) => report.status === 'pending' || report.status === 'in_review') ?? []);
   const closedReports = $derived(data.detail?.reports.filter((report) => report.status !== 'pending' && report.status !== 'in_review') ?? []);
   const formError = $derived(Boolean(form && 'error' in form && form.error));
+  const recoveryJobId = $derived(form && 'recoveryJobId' in form ? form.recoveryJobId : null);
 
   function plain(value: string): string {
     return value.replaceAll('_', ' ').replace(/^./, (letter) => letter.toUpperCase());
@@ -31,7 +33,7 @@
   <p class="m-0 text-muted">Start with the media, current state, and open reports. Use overrides only when a change is needed.</p>
 </section>
 
-{#if form?.message}<Notice role={formError ? 'alert' : 'status'} tone={formError ? 'danger' : 'success'}>{form.message}</Notice>{/if}
+{#if form?.message}<Notice role={formError ? 'alert' : 'status'} tone={formError ? 'danger' : 'success'}>{form.message}{#if recoveryJobId}<a class="ml-2 font-black underline" href={`/admin/recovery/batches/${encodeURIComponent(recoveryJobId)}`}>Open replay job</a>{/if}</Notice>{/if}
 {#if data.loadError}<Notice role="alert" tone="danger">{data.loadError}</Notice>{/if}
 
 {#if data.detail}
@@ -52,6 +54,8 @@
       <p class="m-0 text-sm text-muted">{openReports.length} open {openReports.length === 1 ? 'report' : 'reports'} · {detail.decisions.length} recorded {detail.decisions.length === 1 ? 'decision' : 'decisions'}</p>
     </Card>
   </div>
+
+  <MemeProcessingPanel processingFiles={detail.processing_files} requestIds={data.processingRequestIds} />
 
   <Card class="my-4 grid gap-4">
     <div><p class="m-0 text-xs font-black uppercase tracking-[0.14em] text-muted">Needs attention</p><h2 class="m-0 text-3xl font-black tracking-[-0.05em]">Open reports</h2></div>
@@ -83,6 +87,7 @@
 
   <Card class="my-4 grid gap-4">
     <div><p class="m-0 text-xs font-black uppercase tracking-[0.14em] text-muted">Operator controls</p><h2 class="m-0 text-3xl font-black tracking-[-0.05em]">Overrides</h2><p class="mb-0 mt-1 text-sm text-muted">Changes are recorded in moderation history.</p></div>
+    {#if data.templatesLoadError}<Notice tone="danger" role="alert">{data.templatesLoadError} Existing meme detail remains available.</Notice>{/if}
     <form method="POST" action="?/updateMeme" class="grid gap-4 md:grid-cols-2">
       <FormRow label="Visibility policy" hint={`Effective state: ${detail.meme.is_public ? 'visible' : 'hidden'}`}><Select name="visibility_mode"><option value="auto" selected={detail.meme.visibility_mode === 'auto'}>Automatic from provenance</option><option value="force_public" selected={detail.meme.visibility_mode === 'force_public'}>Force public</option><option value="force_private" selected={detail.meme.visibility_mode === 'force_private'}>Force private</option></Select></FormRow>
       <Label class="!inline-flex items-center gap-2"><input name="is_nsfw" type="checkbox" checked={detail.meme.is_nsfw} /> Sensitive content</Label>

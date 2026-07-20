@@ -12,11 +12,17 @@ from memexpert.api.dependencies import AdminUserDep, DbSessionDep
 from memexpert.models.enums import ContentPipelineStage, RecoveryBucket, RecoveryWorkKind
 from memexpert.schemas.admin_recovery import (
     AdminSourceBackfillPageRead,
+    RecoveryActionRequest,
     RecoveryBatchCancelRequest,
+    RecoveryBatchHandoffRequest,
     RecoveryBatchPreviewRequest,
     RecoveryBatchScheduleRequest,
+    RecoveryCandidateRead,
+    RecoveryJobItemPageRead,
+    RecoveryJobPageRead,
     RecoveryJobRead,
     RecoveryMutationRequest,
+    RecoveryRetryFailedPreviewRequest,
     RecoverySummaryRead,
     RecoveryTargetMutationRequest,
     RecoveryWorkPageRead,
@@ -97,6 +103,47 @@ async def read_recovery_work(
         raise _map_recovery_error(exc) from exc
 
 
+@router.get(
+    "/recovery/work/{kind}/{work_id}/candidate",
+    response_model=RecoveryCandidateRead,
+    summary="Read replay and repair actions for canonical work",
+)
+async def read_recovery_candidate(
+    _admin: AdminUserDep,
+    recovery_service: AdminRecoveryServiceDep,
+    kind: Annotated[RecoveryWorkKind, Path()],
+    work_id: Annotated[str, Path(min_length=1, max_length=255)],
+) -> RecoveryCandidateRead:
+    try:
+        return await recovery_service.get_candidate(kind, work_id)
+    except (AdminRecoveryNotFoundError, AdminRecoveryConflictError) as exc:
+        raise _map_recovery_error(exc) from exc
+
+
+@router.post(
+    "/recovery/work/{kind}/{work_id}/actions",
+    response_model=RecoveryJobRead,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Schedule one audited Replay & Repair action",
+)
+async def act_on_recovery_work(
+    admin_user: AdminUserDep,
+    recovery_service: AdminRecoveryServiceDep,
+    kind: Annotated[RecoveryWorkKind, Path()],
+    work_id: Annotated[str, Path(min_length=1, max_length=255)],
+    payload: Annotated[RecoveryActionRequest, Body()],
+) -> RecoveryJobRead:
+    try:
+        return await recovery_service.perform_action(
+            admin_user_id=admin_user.id,
+            kind=kind,
+            work_id=work_id,
+            payload=payload,
+        )
+    except (AdminRecoveryNotFoundError, AdminRecoveryConflictError) as exc:
+        raise _map_recovery_error(exc) from exc
+
+
 @router.post(
     "/recovery/work/{kind}/{work_id}/retry",
     response_model=RecoveryJobRead,
@@ -121,11 +168,29 @@ async def retry_recovery_work(
         raise _map_recovery_error(exc) from exc
 
 
+@router.get(
+    "/recovery/batches",
+    response_model=RecoveryJobPageRead,
+    summary="List Replay & Repair job history",
+)
+async def list_recovery_batches(
+    _admin: AdminUserDep,
+    recovery_service: AdminRecoveryServiceDep,
+    job_status: Annotated[str | None, Query(alias="status", max_length=64)] = None,
+    cursor: Annotated[str | None, Query(max_length=2048)] = None,
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+) -> RecoveryJobPageRead:
+    try:
+        return await recovery_service.list_jobs(status=job_status, cursor=cursor, limit=limit)
+    except AdminRecoveryConflictError as exc:
+        raise _map_recovery_error(exc) from exc
+
+
 @router.post(
     "/recovery/batches/preview",
     response_model=RecoveryJobRead,
     status_code=status.HTTP_201_CREATED,
-    summary="Preview a bounded recovery batch",
+    summary="Preview explicit or uncapped query-selected recovery work",
 )
 async def preview_recovery_batch(
     admin_user: AdminUserDep,
@@ -177,6 +242,32 @@ async def read_recovery_batch(
         raise _map_recovery_error(exc) from exc
 
 
+@router.get(
+    "/recovery/batches/{job_id}/items",
+    response_model=RecoveryJobItemPageRead,
+    summary="List paginated Replay & Repair job items",
+)
+async def list_recovery_batch_items(
+    _admin: AdminUserDep,
+    recovery_service: AdminRecoveryServiceDep,
+    job_id: Annotated[uuid.UUID, Path()],
+    item_status: Annotated[str | None, Query(alias="status", max_length=64)] = None,
+    cursor: Annotated[str | None, Query(max_length=2048)] = None,
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    failed_first: Annotated[bool, Query()] = True,
+) -> RecoveryJobItemPageRead:
+    try:
+        return await recovery_service.list_job_items(
+            job_id=job_id,
+            status=item_status,
+            cursor=cursor,
+            limit=limit,
+            failed_first=failed_first,
+        )
+    except (AdminRecoveryNotFoundError, AdminRecoveryConflictError) as exc:
+        raise _map_recovery_error(exc) from exc
+
+
 @router.post(
     "/recovery/batches/{job_id}/cancel",
     response_model=RecoveryJobRead,
@@ -194,6 +285,51 @@ async def cancel_recovery_batch(
             job_id=job_id,
             version=payload.version,
             reason=payload.reason,
+        )
+    except (AdminRecoveryNotFoundError, AdminRecoveryConflictError) as exc:
+        raise _map_recovery_error(exc) from exc
+
+
+@router.post(
+    "/recovery/batches/{job_id}/handoff",
+    response_model=RecoveryJobRead,
+    summary="Assign an operational job while retaining its requester",
+)
+async def handoff_recovery_batch(
+    admin_user: AdminUserDep,
+    recovery_service: AdminRecoveryServiceDep,
+    job_id: Annotated[uuid.UUID, Path()],
+    payload: Annotated[RecoveryBatchHandoffRequest, Body()],
+) -> RecoveryJobRead:
+    try:
+        return await recovery_service.handoff_job(
+            admin_user_id=admin_user.id,
+            job_id=job_id,
+            assigned_admin_user_id=payload.assigned_admin_user_id,
+            version=payload.version,
+            reason=payload.reason,
+        )
+    except (AdminRecoveryNotFoundError, AdminRecoveryConflictError) as exc:
+        raise _map_recovery_error(exc) from exc
+
+
+@router.post(
+    "/recovery/batches/{job_id}/retry-failed-preview",
+    response_model=RecoveryJobRead,
+    status_code=status.HTTP_201_CREATED,
+    summary="Preview a retry of failed Replay & Repair steps",
+)
+async def preview_failed_recovery_items(
+    admin_user: AdminUserDep,
+    recovery_service: AdminRecoveryServiceDep,
+    job_id: Annotated[uuid.UUID, Path()],
+    payload: Annotated[RecoveryRetryFailedPreviewRequest, Body()],
+) -> RecoveryJobRead:
+    try:
+        return await recovery_service.preview_failed_items(
+            admin_user_id=admin_user.id,
+            job_id=job_id,
+            payload=payload,
         )
     except (AdminRecoveryNotFoundError, AdminRecoveryConflictError) as exc:
         raise _map_recovery_error(exc) from exc

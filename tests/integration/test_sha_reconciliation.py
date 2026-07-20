@@ -96,6 +96,24 @@ async def _reset_public_schema(engine: AsyncEngine) -> None:
         await connection.execute(text("CREATE SCHEMA public"))
 
 
+async def _add_current_meme_file_orm_compatibility_columns(engine: AsyncEngine) -> None:
+    """Keep the current ORM usable while exercising the physical 0031 schema."""
+
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                """
+                ALTER TABLE meme_files
+                    ADD COLUMN active_media_generation_id uuid,
+                    ADD COLUMN source_has_audio boolean,
+                    ADD COLUMN web_video_has_audio boolean,
+                    ADD COLUMN web_video_profile varchar(128),
+                    ADD COLUMN web_video_verified_at timestamptz
+                """
+            )
+        )
+
+
 @pytest_asyncio.fixture(loop_scope="session")
 async def reconciliation_database(
     postgres_async_engine: AsyncEngine,
@@ -104,6 +122,7 @@ async def reconciliation_database(
     await _reset_public_schema(postgres_async_engine)
     config = _build_alembic_config(postgres_async_url)
     await _run_upgrade(config, "0031")
+    await _add_current_meme_file_orm_compatibility_columns(postgres_async_engine)
     session_factory = async_sessionmaker(postgres_async_engine, expire_on_commit=False)
     try:
         yield session_factory, config, postgres_async_engine

@@ -451,7 +451,23 @@ const adminRecoveryWork = [
     reason: 'ocr_timeout',
     safe_error: 'OCR exceeded its processing deadline.',
     version: 'ocr-version-1',
-    capabilities: ['retry_stage']
+    capabilities: ['retry_stage'],
+    actions: [
+      { capability: 'retry_stage', available: true, scopes: ['stage_only'] },
+      {
+        capability: 'replay_stage',
+        available: true,
+        scopes: ['stage_only', 'stage_and_dependents'],
+        scope_requirements: {
+          stage_only: { warnings: [], risks: [], required_acknowledgements: [] },
+          stage_and_dependents: {
+            warnings: [],
+            risks: ['External provider output may differ from the previous run.'],
+            required_acknowledgements: ['terminal_override']
+          }
+        }
+      }
+    ]
   }),
   recoveryWork({
     kind: 'pipeline_stage',
@@ -479,6 +495,13 @@ const adminRecoveryWork = [
     is_retryable: false,
     version: 'blocked-version-1',
     capabilities: [],
+    actions: [
+      {
+        capability: 'replay_source_post',
+        available: false,
+        blocked_prerequisites: ['Reconnect the source account before retrying.']
+      }
+    ],
     blocked_reason: 'Reconnect the source account before retrying.'
   })
 ];
@@ -487,8 +510,78 @@ const adminRecoverySummary = {
   retryable_count: 4,
   blocked_count: 1,
   stuck_count: 0,
-  dead_lettered_count: 0
+  dead_lettered_count: 0,
+  outdated_web_video_count: 7400,
+  active_job_count: 1,
+  preparing_job_count: 0,
+  snapshot_at: '2026-07-15T12:00:00Z'
 };
+
+const adminRecoveryJob = {
+  id: '77777777-7777-4777-8777-777777777777',
+  request_id: '66666666-6666-4666-8666-666666666666',
+  status: 'completed_with_failures',
+  action: 'replay_stage',
+  scope: 'stage_and_dependents',
+  retry_limit: 3,
+  reason: 'Smoke replay and repair job.',
+  total_count: 6,
+  selected_root_count: 2,
+  expanded_execution_count: 6,
+  completed_count: 6,
+  failed_count: 1,
+  queued_count: 0,
+  waiting_count: 0,
+  dispatched_count: 0,
+  succeeded_count: 4,
+  stale_count: 0,
+  skipped_count: 1,
+  cancelled_count: 0,
+  exclusion_groups: [{ reason: 'changed_since_snapshot', count: 1, message: 'Canonical state changed.' }],
+  requested_by_display_name: 'Smoke requester',
+  assigned_to_display_name: 'Smoke operator',
+  expires_at: null,
+  scheduled_at: '2026-07-15T12:01:00Z',
+  completed_at: '2026-07-15T12:03:00Z',
+  cancelled_at: null,
+  created_at: '2026-07-15T12:00:00Z',
+  updated_at: '2026-07-15T12:03:00Z',
+  version: 'job-version-1',
+  items: []
+};
+
+const adminRecoveryJobItems = [
+  {
+    id: '88888888-8888-4888-8888-888888888888',
+    work_kind: 'pipeline_stage',
+    work_id: 'smoke-video-file-1:ocr',
+    action: 'replay_stage',
+    stage: 'ocr',
+    status: 'failed',
+    attempt_count: 3,
+    retry_limit: 3,
+    retryable_failures_consumed: 3,
+    normalized_reason: 'ocr_timeout',
+    safe_error: 'OCR exceeded its safe processing deadline.',
+    dispatched_at: '2026-07-15T12:01:00Z',
+    finished_at: '2026-07-15T12:03:00Z'
+  },
+  {
+    id: '99999999-9999-4999-8999-999999999999',
+    work_kind: 'pipeline_stage',
+    work_id: 'smoke-video-file-1:transcode',
+    action: 'replay_stage',
+    stage: 'transcode',
+    status: 'succeeded',
+    attempt_count: 1,
+    retry_limit: 3,
+    retryable_failures_consumed: 0,
+    normalized_reason: null,
+    safe_error: null,
+    dispatched_at: '2026-07-15T12:01:00Z',
+    finished_at: '2026-07-15T12:02:00Z'
+  }
+];
 
 const adminMeme = {
   ...meme,
@@ -498,6 +591,81 @@ const adminMeme = {
   visibility_mode: 'force_private',
   template_id: adminIds.curatedTemplate,
 };
+
+const adminMemeProcessingFiles = [
+  {
+    id: adminIds.mediaFile,
+    is_primary: true,
+    status: 'ready',
+    mime_type: 'video/webm',
+    width: 1280,
+    height: 720,
+    file_size_bytes: 4096,
+    source_has_audio: true,
+    web_video_has_audio: true,
+    web_video_profile: 'web-h264-aac-1080p30-v2',
+    web_video_verified_at: '2026-07-15T11:30:00Z',
+    original: { width: 1280, height: 720, frame_rate: 24, duration_seconds: 4, file_size_bytes: 4096, video_codec: 'vp9', audio_codec: 'opus' },
+    output: { width: 1280, height: 720, frame_rate: 24, duration_seconds: 4, bitrate_bps: 2_000_000, file_size_bytes: 2048, video_codec: 'h264', audio_codec: 'aac', pixel_format: 'yuv420p', video_profile: 'High' },
+    version: 'smoke-processing-file-version',
+    actions: [
+      {
+        capability: 'regenerate_derivatives',
+        available: true,
+        scopes: ['stage_only'],
+        default_scope: 'stage_only',
+        retry_limits: [1, 3, 5],
+        default_retry_limit: 3,
+        downstream_stages: [],
+        warnings: [],
+        risks: [],
+        required_acknowledgements: [],
+        blocked_prerequisites: []
+      }
+    ],
+    stages: [
+      {
+        stage: 'transcode',
+        status: 'succeeded',
+        attempt_count: 1,
+        version: 'smoke-transcode-version',
+        work_kind: 'pipeline_stage',
+        work_id: `${adminIds.mediaFile}:transcode`,
+        safe_error: null,
+        normalized_reason: null,
+        actions: [
+          {
+            capability: 'replay_stage',
+            available: true,
+            scopes: ['stage_only', 'stage_and_dependents'],
+            default_scope: 'stage_only',
+            retry_limits: [1, 3, 5],
+            default_retry_limit: 3,
+            downstream_stages: ['ocr', 'embed', 'classify', 'sync_qdrant', 'sync_meili'],
+            warnings: ['Stage-only replay leaves existing downstream data stale.'],
+            risks: [],
+            required_acknowledgements: [],
+            scope_requirements: {
+              stage_only: {
+                warnings: ['Stage-only replay leaves existing downstream data stale.'],
+                risks: [],
+                required_acknowledgements: []
+              },
+              stage_and_dependents: {
+                warnings: [],
+                risks: ['External provider output or semantic merge results may differ from the previous successful run.'],
+                required_acknowledgements: [{ key: 'terminal_override', label: 'I acknowledge the terminal override.' }]
+              }
+            },
+            blocked_prerequisites: []
+          }
+        ],
+        active_job: null
+      }
+    ],
+    active_job: null
+  }
+];
 
 const readyAdminTelegramAccount = {
   id: adminIds.readyAccount,
@@ -1364,6 +1532,49 @@ async function handleAdminApi(request, response, url, adminSources) {
     });
     return true;
   }
+  if (method === 'GET' && pathname === '/api/v1/admin/recovery/batches') {
+    sendJson(response, 200, { items: [adminRecoveryJob], next_cursor: null, total: 1 });
+    return true;
+  }
+  if (method === 'GET' && pathname === `/api/v1/admin/recovery/batches/${adminRecoveryJob.id}`) {
+    sendJson(response, 200, adminRecoveryJob);
+    return true;
+  }
+  if (method === 'GET' && pathname === `/api/v1/admin/recovery/batches/${adminRecoveryJob.id}/items`) {
+    sendJson(response, 200, { items: adminRecoveryJobItems, next_cursor: null, total: adminRecoveryJobItems.length });
+    return true;
+  }
+  if (method === 'POST' && pathname === '/api/v1/admin/recovery/batches/preview') {
+    const body = await readRequestJson(request);
+    if (!body || body.selector?.type !== 'query' || body.selector?.filters?.outdated_web_video !== true) {
+      sendJson(response, 400, { detail: 'Smoke recovery preview requires the outdated-video query selector.' });
+      return true;
+    }
+    sendJson(response, 201, {
+      ...adminRecoveryJob,
+      id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      request_id: body.request_id,
+      status: 'preparing',
+      action: body.action,
+      scope: body.scope,
+      retry_limit: body.retry_limit,
+      reason: body.reason,
+      total_count: 0,
+      selected_root_count: 0,
+      expanded_execution_count: 0,
+      completed_count: 0,
+      failed_count: 0,
+      preparation_scanned_count: 1200,
+      preparation_matched_count: 1000,
+      preparation_excluded_count: 2,
+      exclusion_groups: [{ reason: 'changed_since_snapshot', count: 2 }],
+      scheduled_at: null,
+      completed_at: null,
+      version: 'preparing-version',
+      items: []
+    });
+    return true;
+  }
   if (method === 'GET' && pathname === '/api/v1/admin/analytics/overview') {
     sendJson(response, 200, adminAnalyticsOverview);
     return true;
@@ -1486,7 +1697,7 @@ async function handleAdminApi(request, response, url, adminSources) {
     return true;
   }
   if (method === 'GET' && pathname === `/api/v1/admin/memes/${adminMeme.id}`) {
-    sendJson(response, 200, { meme: adminMeme, reports: [adminReport], decisions: [adminDecision] });
+    sendJson(response, 200, { meme: adminMeme, reports: [adminReport], decisions: [adminDecision], processing_files: adminMemeProcessingFiles });
     return true;
   }
   if (method === 'GET' && pathname === '/api/v1/admin/blocked-perceptual-hashes') {
@@ -1567,7 +1778,7 @@ async function handleAdminApi(request, response, url, adminSources) {
 }
 
 function recoveryWork(overrides = {}) {
-  return {
+  const work = {
     kind: 'pipeline_stage',
     id: 'smoke-recovery-work',
     bucket: 'retryable',
@@ -1592,6 +1803,8 @@ function recoveryWork(overrides = {}) {
     details: {},
     ...overrides
   };
+  work.actions ??= work.capabilities.map((capability) => ({ capability, available: true }));
+  return work;
 }
 
 function validateQuickAddRequest(body) {

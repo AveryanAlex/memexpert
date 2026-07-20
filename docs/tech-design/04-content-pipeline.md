@@ -305,12 +305,21 @@ raw_meme ──→ [API Accept: ingest_request + outbox] ──→ [Outbox Publi
 
 `meme_embedded` fans out to two consumers: Embedding Dedup (checks Qdrant for cosine > 0.92, auto-merges if match found) and Classify. Both bind their own queue via a fanout exchange. Fan-out from `meme_ready` works the same way — each sync consumer binds its own queue, so adding a new consumer requires no changes to the producing stage.
 
+That is the ordinary live-ingest topology. An orchestrated Replay & Repair job
+owns a materialized dependency graph instead: Transcode → OCR → Embed →
+Classify, then Qdrant and Meilisearch as concurrent children. A recovery-owned
+event carries its job/item identity; stage completion suppresses ordinary
+fan-out and releases only the job's planned children. Stage-only replay has no
+children and intentionally leaves current descendants untouched. Parent
+failure, stale version, or cancellation marks undispatched descendants
+`skipped_dependency`.
+
 ### Queues by Resource Profile
 
 | Queue | Role | Resource Profile | Consumer |
 |-------|------|-----------------|----------|
 | `pipeline.media_inspect` | `media` | CPU-light to CPU-bound (Pillow/ImageHash/ffprobe) | Raw temp-object inspection, pHash duplicate/blocked checks, content materialization |
-| `pipeline.transcode` | `media` | CPU-light to CPU-bound | Media preparation: blur hash/quality for every file; GIF→MP4/video re-encode plus a PNG preview frame for moving media |
+| `pipeline.transcode` | `media` | CPU-light to CPU-bound | Media preparation: blur hash/quality for every file; verified `web-h264-aac-1080p30-v2` H.264/AAC generation plus sibling PNG poster for moving media |
 | `pipeline.ocr` | `ocr` | CPU/GPU-bound (PaddleOCR) | Text extraction, language detection |
 | `pipeline.embed` | `enrichment` | API-bound (Voyage AI) | Image embedding computation |
 | `pipeline.classify` | `enrichment` | CPU-light | Conservative NSFW detection only |
@@ -354,6 +363,8 @@ can be retried after interruption at any point before its acknowledgement.
 If cancellation lands after a terminal or retry-exhausted failure commits but
 before dead-letter finalization, cleanup re-enters the idempotent PostgreSQL
 dead-letter recorder and acknowledges only after that canonical ledger exists.
+Worker-shutdown cancellation/redelivery resumes the same logical recovery
+attempt and never increments that job's retryable-failure budget.
 
 Production nests three shutdown deadlines: the application drain is 210
 seconds (`PIPELINE_WORKER_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS`), the Quadlet/
@@ -386,24 +397,75 @@ so journald retains their event names and shutdown context.
 ### Operational recovery and overload control
 
 The latest canonical state remains in the ingest request, stage journal, sync
-snapshot, source-post/backfill, and outbox tables. Migration `0034` adds
-append-preserving `pipeline_stage_attempts` and
-`source_channel_backfill_attempts`, audited `recovery_jobs` /
-`recovery_job_items`, a sanitized `pipeline_dead_letters` ledger, hysteretic
-`pipeline_capacity_states`, and shared `dependency_circuit_states`.
+snapshot, source-post/backfill, outbox, and active media pointer. Migration
+`0034` introduced append-preserving attempt history, audited recovery jobs/items,
+the sanitized dead-letter ledger, capacity state, and dependency circuits. The
+Replay & Repair migration extends CHECK-backed enums and adds replay scope,
+dependency/reservation fields, per-job attempt budgets, `preparing` materializer
+cursor/lease/counts, `cancelling`, assignee/handoff, failed-item lineage, indexes,
+and durable media generations.
 
-Admin recovery never republishes arbitrary payload bytes. A scheduled item is
-version-checked against canonical state and translated into the normal replay,
-media-inspect outbox, sync replay, source-post replay, backfill resume, or
-outbox-rebuild path. Dispatch event IDs tie attempts and eventual completion
-back to the recovery item. Dead letters are written to PostgreSQL before the
-original broker delivery is acknowledged.
+The candidate/planner service owns eligibility. Succeeded, retryable-failed,
+and terminal-failed stages can be proposed; terminal replay requires a reason
+and acknowledgement. Pending/processing work, unsupported Ingest replay,
+missing original/prerequisite, duplicate canonical state, and an active replay
+reservation remain blocked. The API returns all actions, scopes, downstream
+stages, warnings, provider/semantic risks, media profile, version, and active
+job. The operator-token replay service stays failure-only; successful and forced
+replay exists only behind cookie-admin auth, CSRF, idempotency, version fences,
+and audit.
 
-Capacity state gates historical and recovery admission before it can increase
-the live-stage backlog. Close/reopen thresholds use hysteresis. Provider
-circuits are durable across worker restarts and permit one fenced half-open
-probe after cooldown; the broker's five-attempt limit is still the final
-automatic retry bound.
+Original-object eligibility is a lazy tri-state `HEAD` check: `present`,
+definitively `missing` (only HTTP 404/`NoSuchKey`/`NotFound`), or `unavailable`.
+Storage permissions, timeouts, endpoint failures, and unknown provider errors
+are never converted to absence. Batch scheduling probes before taking item
+locks and key-fences again under the scheduling lock. Query-page probes run
+under the durable materialization lease but outside the job-row lock; an
+unavailable result releases the lease without advancing the cursor or counts.
+Final worker `GET` absence is terminal and does not consume an admin retry
+budget, including temporary ingest originals and canonical media originals.
+
+An explicit preview carries versioned references. An uncapped query preview
+stores action/scope/filter and immediately starts in `preparing` with a null
+selection snapshot. Query selectors discriminate outdated derivative repair
+from successful-stage replay. A successful-stage selector names exactly one
+stage other than Ingest; Transcode/OCR/Embed/Classify roots come from
+`PipelineStageJournal.status = succeeded`, while Qdrant/Meilisearch roots come
+from the corresponding canonical target snapshot in `synced`. Its selected
+stage and stage-only/cascade scope are immutable job inputs, so one materialized
+graph never mixes root stages or replay scopes.
+
+The scheduler's first leased phase captures every matching root without a cap
+under one server-owned PostgreSQL repeatable-read snapshot, then atomically
+persists that captured time and the immutable membership ledger.
+A crash before this commit leaves the snapshot null and retries capture without
+duplicates. Later leased phases expand only those captured member UUIDs,
+advancing the cursor transactionally with idempotent step insertion. A member
+whose canonical version, prerequisite eligibility, active reservation, or
+captured descendant topology/version transitioned is a sanitized exclusion;
+for successful-stage selection this includes a root that is no longer
+`succeeded`/`synced`. Live rows that became eligible after capture cannot enter.
+Only exact completion sets `expires_at`. Counts distinguish selected roots from
+expanded execution steps, retain preparation progress and grouped exclusions,
+and persist every status total. Scheduling still requires the audited reason,
+1/3/5 retry budget, and every backend-declared stale-descendant, terminal-
+override, provider, or semantic-merge risk acknowledgement for the selected
+scope.
+
+Admin recovery never republishes arbitrary payload bytes. Dispatch locks the
+journal/snapshot and recovery rows and transactionally persists reservation,
+next canonical version, recovery linkage, and outbox publication. Dispatch event
+IDs tie attempts and completion back to the item. A child's parent must succeed;
+Qdrant and Meilisearch can claim concurrently after Classify. Capacity state
+gates historical/recovery admission with hysteresis, and durable provider
+circuits allow one fenced half-open probe after cooldown.
+
+Jobs select 1, 3, or 5 retryable failures (default 3). Terminal failures stop
+immediately. Worker-shutdown redelivery does not consume the budget. Recovery-
+owned maintenance stores a preserve-READY fence: stage start/failure must not
+demote an already READY file or remove it from the catalog. Cancellation enters
+`cancelling`, stops admission, cancels queued/waiting descendants, continues
+reconciling dispatched items, and finalizes only when totals are accurate.
 
 ### Message Schemas
 
@@ -420,12 +482,19 @@ class MemeCreated(BaseModel):
 class MemeTranscoded(BaseModel):
     meme_id: int
     meme_file_id: int
-    variants: dict[str, str]  # variant name → S3 key
+    generation_id: UUID
+    web_video_profile: Literal["web-h264-aac-1080p30-v2"]
+    source_has_audio: bool
+    web_video_has_audio: bool
 ```
 
 ### Retry & Dead Letter
 
-RabbitMQ dead letter exchanges (DLX) handle worker-consume failures. Messages exceeding max retries (5, with exponential backoff) are routed to a dead letter queue (`dlq.*`) for inspection and manual replay. No message is silently lost.
+RabbitMQ dead letter exchanges (DLX) handle ordinary worker-consume failures.
+Messages exceeding the normal maximum (5, with exponential backoff) are routed
+to `dlq.*` for inspection and manual replay. A Replay & Repair delivery also
+obeys its item's independent 1/3/5 retryable-failure budget; a terminal result
+stops before either remaining allowance is spent. No message is silently lost.
 
 Pipeline entrypoints, the media materializer, and stage transition services use a generic RabbitMQ transactional outbox instead of commit-then-publish. `rabbitmq_outbox_messages` rows are written in the same DB transaction as ingest/materialization/stage state, then the `rabbitmq-outbox-publisher` job in `memexpert-scheduler` starts or reuses the RabbitMQ pipeline broker, recovers stale `publishing` leases, claims due `pending`/`failed` rows with row locks, publishes by stored `exchange`, `routing_key`, JSON payload, headers, and stable `message_id`, and marks rows `published` or `failed` with retry metadata. This path handles raw-upload `media_inspect_requested` events, post-materialization transcode dispatches, stage fan-out, replay, and sync-success notifications.
 
@@ -479,13 +548,56 @@ S3 (Cloudflare R2 or Backblaze B2). API-safe acceptance first writes raw bytes u
 ```
 /temp-originals/{ingest_request_id}/original.{ext}
 /files/{meme_file_id}/original.{ext}
-/files/{meme_file_id}/web_video.mp4   (H.264, GIF/video only)
-/files/{meme_file_id}/preview.png     (first-frame poster, GIF/video only)
+/pipeline/derived/{meme_file_id}/generations/{generation_id}/web.mp4
+/pipeline/derived/{meme_file_id}/generations/{generation_id}/preview.png
 ```
 
 Invalid/unreadable media is the exception: the temporary object is intentionally retained when the request is marked `failed_invalid_media` so operators have a bounded retention/debugging target. Retention/lifecycle policy should expire `pipeline/temp-originals/*` objects after the ops-approved window, not immediately on invalid media.
 
-Only the original plus optional `web_video.mp4` and `preview.png` moving-media artifacts are stored. Static JPEG/PNG/WebP uploads keep only the original object; they are never looped into synthetic videos. All static image variants (resize, format conversion, thumbnails) are generated on-the-fly by **imgproxy** from the original. GIF/video cards use imgproxy over the stored PNG preview frame, while playback uses the H.264 artifact. Both moving-media derivatives are written before transcode completion is committed, so a visible web video always has a poster. These artifacts are derived at ingest time because GIF→MP4/video re-encode and frame extraction are expensive to do on-the-fly.
+Static JPEG/PNG/WebP uploads keep only the original and are never looped into
+synthetic videos; imgproxy creates their display variants. Moving media keeps
+immutable generation pairs. The poster key is derived by replacing the active
+video filename with sibling `preview.png`; legacy flat file prefixes remain
+readable.
+
+The worker probes `avg_frame_rate` and `r_frame_rate`. Valid sources at or below
+30 FPS keep timestamps without an FPS filter; faster sources use `fps=30`, and
+invalid metadata normalizes conservatively to 30. Orientation-aware scaling
+never upscales and produces even dimensions inside 1920×1080 landscape,
+1080×1920 portrait, or 1080×1080 square. The worker image pins FFmpeg/FFprobe
+8.1.2 from a digest-addressed multi-architecture static build. FFmpeg maps
+`0:v:0` and optional `0:a:0?`, encodes H.264 High Level
+4.1/yuv420p/medium/CRF 21 with 6M maxrate, 12M bufsize, ~2-second GOP and
+FastStart, and encodes the first audio stream as AAC-LC 128 kbps/48 kHz/stereo.
+Metadata, chapters, subtitles, and data streams are stripped.
+
+Post-encode FFprobe verifies MP4, exactly one H.264/yuv420p video, the mobile
+envelope, no >30 FPS or artificial upsampling, duration and A/V sync within one
+output frame, exactly one AAC-LC stream iff the source had audio, and the VBV
+rate using video-packet timestamps and sizes against the 6M/12M token bucket,
+not only the stream's average bitrate. Both local artifacts must verify before
+either upload. Both immutable
+uploads must succeed before a fenced transaction switches the active pointer,
+profile/audio metadata, verification time, and generation status. Any failure
+preserves the previous pointer and file/pipeline state. Cleanup removes only a
+confirmed-unreferenced new generation; ambiguity is left for garbage collection.
+
+Playback URLs include a non-secret token derived from the active object key;
+authenticated redirects are `private, no-store`. Superseded generations remain
+for seven days. GC recognizes only generation-layout objects and deletes only
+old, unreferenced generations—never current, young, unknown, or referenced
+objects.
+
+The containerized real-stack E2E seed generates two WebM/VP9 inputs through
+FFmpeg: an audible 24 FPS landscape source with Opus and a silent 60 FPS
+portrait source. Both travel through the upload API and real media worker. The
+proof downloads the activated MP4 and sibling PNG from object storage, checks
+the active generation ledger and pointer, and independently runs FFprobe. It
+requires H.264 High/Level 4.1 and `yuv420p`, an even mobile-envelope size,
+positive video rate below the profile ceiling, 24 FPS plus one AAC-LC 48 kHz
+stereo stream for the audible input, and 30 FPS with no audio stream for the
+silent input. The typed proof is retained in `seed.json` and asserted again by
+Playwright.
 
 ~40 GB at 100K memes, ~200 GB at 500K, ~400 GB at 1M (originals + transcoded videos + compact PNG preview frames).
 

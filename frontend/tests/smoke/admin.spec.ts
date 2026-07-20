@@ -57,7 +57,7 @@ test('admin analytics keeps a shared UTC range across dashboards and exposes que
 test('recovery selection follows the batch action and can select all compatible rows on the page', async ({ page }) => {
   await gotoAdmin(page, '/admin/recovery');
 
-  await expect(page.getByRole('heading', { name: 'Failed and stuck work' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Replay & Repair' })).toBeVisible();
   const action = page.getByRole('combobox', { name: 'Batch action' });
   await expect(action).toHaveValue('resume_backfill');
 
@@ -112,6 +112,51 @@ test('recovery selection follows the batch action and can select all compatible 
     { kind: 'pipeline_stage', id: 'smoke-file-ocr-1:ocr', version: 'ocr-version-1' },
     { kind: 'pipeline_stage', id: 'smoke-file-ocr-2:ocr', version: 'ocr-version-2' }
   ]);
+
+  await action.selectOption('replay_stage');
+  const ocrCascade = page.getByLabel('Select OCR file one for Replay stage');
+  await expect(ocrCascade).toBeEnabled();
+  await ocrCascade.check();
+  const previewForm = page.locator('#batch-preview-form');
+  const terminalOverride = previewForm.getByLabel(
+    'I acknowledge that this terminal failure is being overridden for an audited replay.'
+  );
+  await expect(terminalOverride).not.toBeVisible();
+  await previewForm.getByLabel('Replay scope').selectOption('stage_and_dependents');
+  await expect(terminalOverride).toBeVisible();
+  await expect(terminalOverride).toHaveAttribute('required', '');
+});
+
+test('Replay & Repair materializes the uncapped outdated-video query and exposes job failures first', async ({ page }) => {
+  await gotoAdmin(page, '/admin/recovery?view=regenerate');
+
+  await expect(page.getByRole('heading', { name: 'Replay & Repair' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Outdated web videos' })).toBeVisible();
+  await expect(page.getByText('7,400', { exact: true })).toBeVisible();
+  await expect(page.getByText('web-h264-aac-1080p30-v2', { exact: false })).toBeVisible();
+  const regenerate = page.locator('form[action^="?/previewRecoveryBatch"]').filter({
+    has: page.getByRole('button', { name: 'Select all matching', exact: true })
+  });
+  await expect(regenerate.locator('input[name="selector_type"]')).toHaveValue('query');
+  await expect(regenerate.locator('input[name="query_filters"]')).toHaveValue('{"outdated_web_video":true}');
+  await expect(regenerate.getByLabel('Retry limit')).toHaveValue('3');
+  await regenerate.getByLabel('Audit reason').fill('Regenerate every outdated smoke derivative.');
+  await regenerate.getByLabel(/terminal-failed Transcode roots/).check();
+  await regenerate.getByRole('button', { name: 'Select all matching', exact: true }).click();
+  await expect(page.getByRole('status').first()).toContainText('Exact preview preparation started');
+  await expect(page.getByText('1,200 scanned · 1,000 matched · 2 excluded')).toBeVisible();
+
+  await page.getByRole('navigation', { name: 'Replay and Repair sections' }).getByRole('link', { name: /Jobs/ }).click();
+  await expect(page.getByRole('heading', { name: 'Jobs', exact: true })).toBeVisible();
+  await page.getByRole('link', { name: 'Replay stage' }).click();
+  await expect(page).toHaveURL(new RegExp(`/admin/recovery/batches/77777777-7777-4777-8777-777777777777$`));
+  await expect(page.getByRole('heading', { name: 'Replay stage' })).toBeVisible();
+  await expect(page.getByText('Smoke requester')).toBeVisible();
+  await expect(page.getByText('Changed Since Snapshot')).toBeVisible();
+  const items = page.getByRole('table');
+  await expect(items.getByRole('row').nth(1)).toContainText('Failed');
+  await expect(items.getByText('OCR exceeded its safe processing deadline.')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Preview retry of failed items' })).toBeVisible();
 });
 
 test('admin adds a public Telegram source through the selected ready account and pauses that source', async ({ page }) => {
@@ -262,6 +307,25 @@ test('moderation renders private admin media through the authenticated proxy and
   await expect(page).toHaveURL(new RegExp(`/admin/memes/${adminFixture.memeId}$`));
   await expect(page.getByRole('heading', { name: 'Review meme' })).toBeVisible();
   await expect(page.getByRole('img', { name: 'Admin meme preview' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Processing' })).toBeVisible();
+  await expect(page.getByText('web-h264-aac-1080p30-v2')).toBeVisible();
+  await expect(page.getByText('Audio present').first()).toBeVisible();
+  const processingFile = page.locator(`[data-processing-file="${adminFixture.mediaFileId}"]`);
+  const stageActions = processingFile.locator('details[data-recovery-action-menu]').nth(1);
+  await stageActions.locator(':scope > summary').click();
+  await stageActions.getByRole('button', { name: 'Replay stage' }).click();
+  const replayDialog = page.getByRole('dialog');
+  await expect(replayDialog.getByText('ocr → embed → classify → sync_qdrant → sync_meili')).toBeVisible();
+  await expect(replayDialog.getByLabel('Replay scope')).toHaveValue('stage_only');
+  await expect(replayDialog.getByLabel('Retry limit')).toHaveValue('3');
+  await expect(replayDialog.getByText('Stage-only replay leaves existing dependents untouched.')).toBeVisible();
+  await expect(replayDialog.getByLabel('I acknowledge the terminal override.')).not.toBeVisible();
+  await expect(replayDialog.getByText(/External provider output or semantic merge results/)).not.toBeVisible();
+  await replayDialog.getByLabel('Replay scope').selectOption('stage_and_dependents');
+  await expect(replayDialog.getByText('Search targets may run concurrently after classification.')).toBeVisible();
+  await expect(replayDialog.getByLabel('I acknowledge the terminal override.')).toBeVisible();
+  await expect(replayDialog.getByText(/External provider output or semantic merge results/)).toBeVisible();
+  await replayDialog.getByRole('button', { name: 'Cancel' }).click();
   await expect(page.getByRole('link', { name: 'Back to moderation' })).toBeVisible();
 });
 

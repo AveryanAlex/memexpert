@@ -448,9 +448,17 @@ curl -X POST "http://127.0.0.1:8000/api/v1/pipeline/items/<meme_file_id>/sync/me
 
 Those endpoints still queue the pipeline worker per-target replay path; the scheduler job does not remove or replace them.
 
+They also remain operator-token, failure-only, and bounded. Cookie-admin Replay
+& Repair is separate: successful or forced stage replay is CSRF-protected and
+audited, and broad all-matching work first becomes a resumable `preparing` job.
+Its materializer scans in keyset pages, records exact roots/steps/exclusions,
+and releases the reviewed result under the same capacity gates.
+
 Full/manual resync:
 
-- For a broad Meilisearch catch-up, let the scheduler advance in bounded chunks or use the existing per-target batch replay endpoint in operator-sized chunks.
+- For routine drift, let the scheduler advance in bounded chunks. Use the
+  operator batch route only for a bounded failure cohort; use cookie-admin
+  Replay & Repair for an audited, exact all-matching maintenance job.
 - For a full Qdrant alias rebuild, keep using the existing manual/full-resync procedure for rebuilding the Qdrant collection/alias. The scheduler job is an incremental catch-up mechanism; it does not perform alias swaps or whole-index rebuild orchestration.
 
 ## Common Failure Modes

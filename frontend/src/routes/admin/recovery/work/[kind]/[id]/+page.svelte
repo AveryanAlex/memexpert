@@ -5,4 +5,4 @@
   let { data, form }: { data: PageData; form: ActionData } = $props();
 </script>
 
-<RecoveryWorkDetail work={data.work} requestId={data.requestId} loadError={data.loadError} {form} />
+<RecoveryWorkDetail work={data.work} candidate={data.candidate} requestId={data.requestId} loadError={data.loadError} {form} />

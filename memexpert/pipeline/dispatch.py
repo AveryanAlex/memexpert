@@ -47,6 +47,9 @@ class PipelineStageWorkContext:
     mime_type: str | None
     original_object_key: str
     web_video_object_key: str | None
+    recovery_item_id: uuid.UUID | None = None
+    preserve_ready: bool = False
+    retry_limit: int = 3
 
 
 @dataclass(frozen=True, slots=True)

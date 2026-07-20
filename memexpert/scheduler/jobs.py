@@ -14,6 +14,7 @@ from memexpert.messaging.rabbitmq_outbox_runtime import (
     run_rabbitmq_outbox_publisher_batch,
 )
 from memexpert.services.admin_telegram_login import run_telegram_login_cleanup_batch
+from memexpert.services.media_generation import run_media_generation_gc_batch
 from memexpert.services.meilisearch_settings_reconcile import (
     meilisearch_settings_reconcile_result_log_extra,
     run_meilisearch_settings_reconcile,
@@ -55,6 +56,7 @@ JOB_ID_MEILISEARCH_SETTINGS_RECONCILE = "meilisearch-settings-reconcile"
 JOB_ID_SEO_BACKLOG_BATCHES = "seo-backlog-batches"
 JOB_ID_RABBITMQ_OUTBOX_PUBLISHER = "rabbitmq-outbox-publisher"
 JOB_ID_RECOVERY_DISPATCH = "recovery-dispatch"
+JOB_ID_MEDIA_GENERATION_GC = "media-generation-gc"
 JOB_ID_PIPELINE_CAPACITY_REFRESH = "pipeline-capacity-refresh"
 JOB_ID_TELEGRAM_LOGIN_CLEANUP = "telegram-login-cleanup"
 
@@ -129,6 +131,13 @@ def build_scheduler_job_definitions(settings: Settings, engine: AsyncEngine) -> 
             action=_build_recovery_dispatch_job_action(settings, engine),
             enabled=settings.scheduler_recovery_dispatch_enabled,
             description="Dispatch and reconcile audited admin recovery work.",
+        ),
+        SchedulerJobDefinition(
+            id=JOB_ID_MEDIA_GENERATION_GC,
+            trigger_seconds=settings.scheduler_media_generation_gc_interval_seconds,
+            action=_build_media_generation_gc_job_action(settings, engine),
+            enabled=settings.scheduler_media_generation_gc_enabled,
+            description="Delete old unreferenced immutable media generations.",
         ),
         SchedulerJobDefinition(
             id=JOB_ID_PIPELINE_CAPACITY_REFRESH,
@@ -320,6 +329,29 @@ def _build_recovery_dispatch_job_action(settings: Settings, engine: AsyncEngine)
     return _action
 
 
+def _build_media_generation_gc_job_action(settings: Settings, engine: AsyncEngine) -> SchedulerJobAction:
+    async def _action() -> None:
+        result = await run_media_generation_gc_batch(
+            build_async_session_factory(engine),
+            settings=settings,
+            batch_size=settings.scheduler_media_generation_gc_batch_size,
+        )
+        logger.info(
+            "scheduler_job_batch_result",
+            extra={
+                "event": "scheduler_job_batch_result",
+                "job_id": JOB_ID_MEDIA_GENERATION_GC,
+                "examined": result.examined,
+                "deleted": result.deleted,
+                "retained_referenced": result.retained_referenced,
+                "unrecognized": result.unrecognized,
+                "failed": result.failed,
+            },
+        )
+
+    return _action
+
+
 def _build_pipeline_capacity_refresh_job_action(settings: Settings, engine: AsyncEngine) -> SchedulerJobAction:
     async def _action() -> None:
         session_factory = build_async_session_factory(engine)
@@ -372,6 +404,7 @@ def _build_telegram_login_cleanup_job_action(settings: Settings, engine: AsyncEn
 
 
 __all__ = [
+    "JOB_ID_MEDIA_GENERATION_GC",
     "JOB_ID_MATERIALIZED_VIEW_REFRESH",
     "JOB_ID_MEILISEARCH_SETTINGS_RECONCILE",
     "JOB_ID_MOTD",

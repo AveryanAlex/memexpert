@@ -234,8 +234,8 @@ jobs:
 
           docker run --rm memexpert-main:ci sh -c 'command -v memexpert-api && command -v memexpert-bot && command -v memexpert-scheduler && python -c "import importlib.util, sys; absent=(\"paddleocr\", \"paddle\", \"PIL\", \"imagehash\"); sys.exit(0 if all(importlib.util.find_spec(name) is None for name in absent) else 1)"'
           docker run --rm memexpert-worker:ci sh -c 'command -v memexpert-workers && command -v ffmpeg && command -v ffprobe && python -c "import importlib.util, sys; absent=(\"paddleocr\", \"paddle\"); present=(\"PIL\", \"imagehash\"); sys.exit(0 if all(importlib.util.find_spec(name) is None for name in absent) and all(importlib.util.find_spec(name) is not None for name in present) else 1)" && /opt/paddleocr-venv/bin/python -c "import paddle, paddleocr; print(\"paddleocr-helper-ok\")" && /opt/paddleocr-venv/bin/python /app/scripts/paddleocr_json.py --help >/dev/null'
-          docker run --rm memexpert-worker:ci ffmpeg -version
-          docker run --rm memexpert-worker:ci ffprobe -version
+          docker run --rm memexpert-worker:ci sh -c 'ffmpeg -version 2>&1 | grep -F "ffmpeg version 8.1.2 "'
+          docker run --rm memexpert-worker:ci sh -c 'ffprobe -version 2>&1 | grep -F "ffprobe version 8.1.2 "'
 
           docker run -d \
             --name memexpert-frontend-smoke \

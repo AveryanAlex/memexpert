@@ -13,7 +13,7 @@ describe('admin navigation', () => {
     expect(ADMIN_NAVIGATION_ITEMS.map((item) => item.label)).toEqual([
       'Overview',
       'Analytics',
-      'Recovery',
+      'Replay & Repair',
       'Sources',
       'Moderation',
       'Blocked patterns',
@@ -28,7 +28,7 @@ describe('admin navigation', () => {
     expect(body).toContain('aria-label="Admin navigation"');
     expect(body).toContain('Overview');
     expect(body).toContain('Analytics');
-    expect(body).toContain('Recovery');
+    expect(body).toContain('Replay &amp; Repair');
     expect(body).toContain('Sources');
     expect(body).toContain('Moderation');
     expect(body).toContain('Blocked patterns');

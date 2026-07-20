@@ -1,29 +1,38 @@
 <script lang="ts">
-  import type { AdminRecoveryWorkRead } from '$lib/api/types';
+  import type { AdminRecoveryCandidateRead, AdminRecoveryWorkRead } from '$lib/api/types';
   import AdminPanel from '$lib/features/admin/AdminPanel.svelte';
   import { formatAdminTimestamp } from '$lib/features/admin/formatTimestamp';
   import { Badge, EmptyState, Notice } from '$lib/ui';
-  import RecoveryActionForm from './RecoveryActionForm.svelte';
+  import RecoveryActionMenu from './RecoveryActionMenu.svelte';
   import {
     humanizeRecoveryValue,
+    recoveryActionsForWork,
     recoveryBucketLabel,
-    recoveryPrimaryCapability,
+    recoverySafeMessage,
     recoveryWorkKindLabel
   } from './view-model';
 
   let {
     work,
+    candidate = null,
     requestId,
     loadError,
     form
   }: {
     work: AdminRecoveryWorkRead | null;
+    candidate?: AdminRecoveryCandidateRead | null;
     requestId: string;
     loadError: string | null;
     form?: { message?: string; error?: boolean; recoveryJobId?: string | null } | null;
   } = $props();
 
-  const capability = $derived(work ? recoveryPrimaryCapability(work.capabilities) : null);
+  const actions = $derived(candidate?.actions?.length ? candidate.actions : work ? recoveryActionsForWork(work) : []);
+  const activeJob = $derived(candidate?.active_job ?? work?.active_job ?? null);
+  const mediaProfile = $derived(
+    typeof candidate?.media_profile === 'string'
+      ? candidate.media_profile
+      : candidate?.media_profile?.profile ?? work?.web_video_profile ?? null
+  );
   const detailEntries = $derived(work ? Object.entries(work.details) : []);
 </script>
 
@@ -54,6 +63,11 @@
 
   {#if work.safe_error}<Notice tone="danger" role="alert">{work.safe_error}</Notice>{/if}
   {#if work.blocked_reason}<Notice>{work.blocked_reason}</Notice>{/if}
+  {#if candidate?.warnings?.length || candidate?.risks?.length}
+    <Notice>
+      {[...(candidate.warnings ?? []), ...(candidate.risks ?? []).map(recoverySafeMessage)].join(' ')}
+    </Notice>
+  {/if}
 
   <div class="mt-6 grid gap-4 xl:grid-cols-[minmax(0,1fr)_22rem]">
     <div class="grid gap-4">
@@ -65,6 +79,7 @@
           <div class="rounded-2xl border border-line bg-soft p-4"><strong>Normalized reason</strong><p class="mb-0 mt-1 text-sm text-muted">{humanizeRecoveryValue(work.reason ?? work.error_code)}</p></div>
           <div class="rounded-2xl border border-line bg-soft p-4"><strong>Automatic retry</strong><p class="mb-0 mt-1 text-sm text-muted">{work.next_attempt_at ? formatAdminTimestamp(work.next_attempt_at) : 'Not scheduled'}</p></div>
           <div class="rounded-2xl border border-line bg-soft p-4"><strong>Retryability</strong><p class="mb-0 mt-1 text-sm text-muted">{work.is_retryable ? 'Retryable' : 'Not retryable'}</p></div>
+          <div class="rounded-2xl border border-line bg-soft p-4"><strong>Media profile</strong><p class="mb-0 mt-1 text-sm text-muted">{mediaProfile ?? 'Not applicable'}</p></div>
         </div>
       </AdminPanel>
 
@@ -89,10 +104,11 @@
           {#if work.post_id}<div><dt class="font-extrabold text-muted">Post</dt><dd class="m-0">{work.post_id}</dd></div>{/if}
           {#if work.source_channel_id}<div><dt class="font-extrabold text-muted">Source channel ID</dt><dd class="m-0 break-all">{work.source_channel_id}</dd></div>{/if}
           {#if work.meme_file_id}<div><dt class="font-extrabold text-muted">File</dt><dd class="m-0 break-all">{work.meme_file_id}</dd></div>{/if}
+          {#if activeJob}<div><dt class="font-extrabold text-muted">Active job</dt><dd class="m-0"><a class="font-black underline" href={`/admin/recovery/batches/${encodeURIComponent(activeJob.id)}`}>{activeJob.id}</a></dd></div>{/if}
         </dl>
       </AdminPanel>
-      {#if capability}
-        <RecoveryActionForm kind={work.kind} workId={work.id} version={work.version} {requestId} {capability} />
+      {#if actions.length}
+        <RecoveryActionMenu kind={work.kind} workId={work.id} version={candidate?.version ?? work.version} {requestId} {actions} stage={work.stage} />
       {:else}
         <Notice>{work.blocked_reason ?? 'No safe recovery action is currently available.'}</Notice>
       {/if}

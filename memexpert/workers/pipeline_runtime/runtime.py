@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from faststream.rabbit import RabbitBroker, RabbitExchange, RabbitQueue
 from pydantic import ValidationError
+from sqlalchemy import select
 
 from memexpert.core.broker import PipelineBrokerSettings
 from memexpert.core.classification import ClassificationClientProtocol
@@ -24,8 +25,19 @@ from memexpert.core.qdrant import (
     QdrantSimilarityClientProtocol,
     QdrantSyncClientProtocol,
 )
+from memexpert.core.storage import StorageObjectMissingError
 from memexpert.core.voyage import VoyageClientProtocol
-from memexpert.models.enums import ContentPipelineStage
+from memexpert.messaging.rabbitmq_outbox import recovery_stage_worker_attempt_ceiling
+from memexpert.models.base import utcnow
+from memexpert.models.content import RabbitMQOutboxMessage
+from memexpert.models.enums import (
+    ContentPipelineStage,
+    RabbitMQOutboxMessageStatus,
+    RecoveryJobItemStatus,
+    RecoveryJobStatus,
+    RecoveryWorkKind,
+)
+from memexpert.models.operations import RecoveryJob, RecoveryJobItem
 from memexpert.pipeline.dispatch import PipelineStageWorkContext
 from memexpert.pipeline.events import (
     MediaInspectRequestedEvent,
@@ -46,6 +58,7 @@ from memexpert.services.pipeline_reliability import (
     record_dependency_failure,
     record_dependency_success,
 )
+from memexpert.services.safe_errors import sanitize_operational_error
 from memexpert.services.source_channel_audience_capture import (
     SourceChannelAudienceTelegramClientFactory,
     capture_source_channel_audience_request,
@@ -59,6 +72,7 @@ from memexpert.workers.pipeline_runtime.constants import (
     PIPELINE_REASON_MEDIA_INSPECT_FAILED,
     PIPELINE_REASON_SOURCE_CHANNEL_AUDIENCE_CAPTURE_FAILED,
     PIPELINE_REASON_SOURCE_ENGAGEMENT_CAPTURE_FAILED,
+    PIPELINE_REASON_SOURCE_OBJECT_MISSING,
     PIPELINE_REASON_UNSUPPORTED_STAGE,
     PIPELINE_REASON_WORKER_SHUTDOWN,
 )
@@ -93,6 +107,7 @@ logger = logging.getLogger(__name__)
 _FORCED_TASK_CLEANUP_TIMEOUT_SECONDS = 10.0
 _CANCELLED_DELIVERY_CLEANUP_TIMEOUT_SECONDS = 10.0
 _DEPENDENCY_CLEANUP_TIMEOUT_SECONDS = 5.0
+_NON_STAGE_BUDGET_BASE_KEY = "non_stage_budget_consumed_at_dispatch"
 
 _OCR_CANARY_PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAIAAAAAwCAIAAABWluXpAAAAeElEQVR42u3bMQrAIBBFwfyQ+195PYFCLFaQea2g4KBgY"
@@ -406,8 +421,32 @@ class PipelineRuntime:
                 self._stage_handler_context(),
                 inspect_event=inspect_event,
             )
-        except Exception:
-            if effective_attempt < self.broker_settings.retry_max_attempts:
+        except Exception as exc:
+            source_missing = isinstance(exc, StorageObjectMissingError)
+            normalized_reason = (
+                PIPELINE_REASON_SOURCE_OBJECT_MISSING
+                if source_missing
+                else PIPELINE_REASON_MEDIA_INSPECT_FAILED
+            )
+            retry_attempt_ceiling = await self._recovery_retry_attempt_ceiling(
+                event_id=inspect_event.event_id,
+                default=self.broker_settings.retry_max_attempts,
+            )
+            await self._record_ingest_recovery_failure(
+                event_id=inspect_event.event_id,
+                effective_attempt=effective_attempt,
+                error=exc,
+                normalized_reason=normalized_reason,
+                retryable=not source_missing,
+            )
+            if source_missing:
+                await self._dead_letter_or_requeue(
+                    coerce_dead_letter_payload(inspect_event.model_dump(mode="json")),
+                    message=message,
+                    normalized_reason=normalized_reason,
+                )
+                return
+            if effective_attempt < retry_attempt_ceiling:
                 await message.reject(requeue=False)
                 return
 
@@ -675,7 +714,19 @@ class PipelineRuntime:
                 retryable=retryable,
             )
 
-            should_queue_retry = retryable and attempt < self.broker_settings.retry_max_attempts
+            if await self._finalize_failure_for_cancelling_recovery(
+                event_id=dispatch_event.event_id,
+                normalized_reason=normalized_reason,
+                error=exc,
+            ):
+                await message.ack()
+                return
+
+            retry_attempt_ceiling = await self._recovery_retry_attempt_ceiling(
+                event_id=dispatch_event.event_id,
+                default=self.broker_settings.retry_max_attempts,
+            )
+            should_queue_retry = retryable and attempt < retry_attempt_ceiling
             if should_queue_retry:
                 await message.reject(requeue=False)
                 return
@@ -834,6 +885,139 @@ class PipelineRuntime:
                 last_error_text=last_error_text,
                 retryable=retryable,
             )
+
+    async def _recovery_retry_attempt_ceiling(
+        self,
+        *,
+        event_id: uuid.UUID,
+        default: int,
+    ) -> int:
+        """Resolve an admin replay's absolute attempt ceiling without affecting ordinary work."""
+
+        async with self.session_factory() as session:
+            item = await session.scalar(
+                select(RecoveryJobItem).where(RecoveryJobItem.dispatch_event_id == event_id)
+            )
+        if item is None or item.attempt_budget_start is None:
+            return default
+        if item.work_kind is RecoveryWorkKind.INGEST_REQUEST:
+            async with self.session_factory() as session:
+                publication_failures = await self._ingest_publication_failures(session, item)
+            base = item.previous_stage_state.get(_NON_STAGE_BUDGET_BASE_KEY)
+            consumed_before_worker = (base if isinstance(base, int) and base >= 0 else 0) + publication_failures
+            return max(item.retry_limit - consumed_before_worker, 1)
+        return recovery_stage_worker_attempt_ceiling(item)
+
+    async def _finalize_failure_for_cancelling_recovery(
+        self,
+        *,
+        event_id: uuid.UUID,
+        normalized_reason: str,
+        error: Exception,
+    ) -> bool:
+        """Stop retry admission once the owning admin job is cancelling."""
+
+        async with self.session_factory() as session:
+            job_id = await session.scalar(
+                select(RecoveryJobItem.recovery_job_id).where(
+                    RecoveryJobItem.dispatch_event_id == event_id,
+                )
+            )
+            if job_id is None:
+                return False
+            job = await session.get(RecoveryJob, job_id, with_for_update=True)
+            if job is None or job.status is not RecoveryJobStatus.CANCELLING:
+                return False
+            item = await session.scalar(
+                select(RecoveryJobItem)
+                .where(
+                    RecoveryJobItem.recovery_job_id == job.id,
+                    RecoveryJobItem.dispatch_event_id == event_id,
+                )
+                .with_for_update()
+            )
+            if item is None:
+                return False
+            if item.status is RecoveryJobItemStatus.DISPATCHED:
+                item.status = RecoveryJobItemStatus.FAILED
+                item.normalized_reason = normalized_reason[:128]
+                item.safe_error_text = sanitize_operational_error(error)
+                item.finished_at = utcnow()
+                item.reservation_active = False
+            await session.commit()
+            return item.status in {
+                RecoveryJobItemStatus.FAILED,
+                RecoveryJobItemStatus.SKIPPED_STALE,
+                RecoveryJobItemStatus.SKIPPED_DEPENDENCY,
+                RecoveryJobItemStatus.CANCELLED,
+            }
+
+    async def _record_ingest_recovery_failure(
+        self,
+        *,
+        event_id: uuid.UUID,
+        effective_attempt: int,
+        error: Exception,
+        normalized_reason: str = PIPELINE_REASON_MEDIA_INSPECT_FAILED,
+        retryable: bool = True,
+    ) -> None:
+        async with self.session_factory() as session:
+            job_id = await session.scalar(
+                select(RecoveryJobItem.recovery_job_id).where(
+                    RecoveryJobItem.dispatch_event_id == event_id,
+                    RecoveryJobItem.work_kind == RecoveryWorkKind.INGEST_REQUEST,
+                )
+            )
+            if job_id is None:
+                return
+            job = await session.get(RecoveryJob, job_id, with_for_update=True)
+            if job is None:
+                return
+            item = await session.scalar(
+                select(RecoveryJobItem)
+                .where(
+                    RecoveryJobItem.dispatch_event_id == event_id,
+                    RecoveryJobItem.work_kind == RecoveryWorkKind.INGEST_REQUEST,
+                )
+                .with_for_update()
+            )
+            if item is None or item.status is not RecoveryJobItemStatus.DISPATCHED:
+                return
+            publication_failures = await self._ingest_publication_failures(session, item)
+            base = item.previous_stage_state.get(_NON_STAGE_BUDGET_BASE_KEY)
+            consumed_before_worker = (base if isinstance(base, int) and base >= 0 else 0) + publication_failures
+            if retryable:
+                item.retryable_failures_consumed = max(
+                    item.retryable_failures_consumed,
+                    consumed_before_worker + effective_attempt,
+                )
+            item.normalized_reason = normalized_reason
+            item.safe_error_text = sanitize_operational_error(error)
+            if not retryable:
+                item.status = RecoveryJobItemStatus.FAILED
+                item.finished_at = utcnow()
+                item.reservation_active = False
+            await session.commit()
+
+    @staticmethod
+    async def _ingest_publication_failures(
+        session: AsyncSession,
+        item: RecoveryJobItem,
+    ) -> int:
+        if item.dispatch_event_id is None or item.attempt_budget_start is None:
+            return 0
+        outbox = await session.scalar(
+            select(RabbitMQOutboxMessage).where(
+                RabbitMQOutboxMessage.message_id == str(item.dispatch_event_id)
+            )
+        )
+        if outbox is None:
+            return 0
+        if outbox.status is RabbitMQOutboxMessageStatus.FAILED:
+            return max(outbox.attempt_count - item.attempt_budget_start + 1, 0)
+        if outbox.status is RabbitMQOutboxMessageStatus.PUBLISHED:
+            return max(outbox.attempt_count - item.attempt_budget_start, 0)
+        return 0
 
     def _build_stage_completion_service(self, session: AsyncSession) -> PipelineStageCompletionService:
         return PipelineStageCompletionService(

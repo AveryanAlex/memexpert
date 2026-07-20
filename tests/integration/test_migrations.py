@@ -10,12 +10,10 @@ from typing import TYPE_CHECKING, cast
 import pytest_asyncio
 from alembic.config import Config
 from alembic.script import ScriptDirectory
-from sqlalchemy import CheckConstraint, text
 from sqlalchemy import inspect as sa_inspect
-from sqlalchemy.dialects import postgresql
+from sqlalchemy import text
 
 from alembic import command
-from memexpert.models import metadata
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable
@@ -30,6 +28,7 @@ CORE_APP_TABLES = {
     "users",
     "memes",
     "meme_files",
+    "media_generations",
     "collections",
     "pipeline_stage_journal",
 }
@@ -274,7 +273,24 @@ async def test_0034_adds_operator_recovery_state_and_downgrades_new_backfill_sta
             },
         )
 
-        for table_name in ("recovery_jobs", "pipeline_stage_attempts"):
+        # Freeze the physical 0034 contract instead of comparing a historical
+        # revision with head metadata. PostgreSQL's 63-byte identifier limit
+        # gives the long attempt constraint its deterministic Alembic suffix.
+        expected_check_names_by_table = {
+            "recovery_jobs": {
+                "ck_recovery_jobs_recovery_jobs_total_count_non_negative",
+                "ck_recovery_jobs_recovery_jobs_completed_count_non_negative",
+                "ck_recovery_jobs_recovery_jobs_failed_count_non_negative",
+                "ck_recovery_jobs_recoveryjobstatus",
+                "ck_recovery_jobs_recoverycapability",
+            },
+            "pipeline_stage_attempts": {
+                "ck_pipeline_stage_attempts_pipeline_stage_attempts_atte_9d56",
+                "ck_pipeline_stage_attempts_contentpipelinestage",
+                "ck_pipeline_stage_attempts_pipelineattemptoutcome",
+            },
+        }
+        for table_name, expected_check_names in expected_check_names_by_table.items():
             actual_check_names = set(
                 (
                     await connection.execute(
@@ -290,12 +306,6 @@ async def test_0034_adds_operator_recovery_state_and_downgrades_new_backfill_sta
                     )
                 ).scalars()
             )
-            preparer = postgresql.dialect().identifier_preparer
-            expected_check_names = {
-                preparer.format_constraint(constraint)
-                for constraint in metadata.tables[table_name].constraints
-                if isinstance(constraint, CheckConstraint)
-            }
             assert actual_check_names == expected_check_names
 
         attempt_unique_definition = (
@@ -1333,3 +1343,565 @@ async def test_0041_indexes_both_public_meme_analytics_reference_shapes(
             {"index_names": sorted(expected_indexes)},
         )
     assert remaining == 0
+
+
+async def test_0042_adds_and_removes_immutable_media_generation_contract(
+    empty_public_schema: tuple[AsyncEngine, str],
+) -> None:
+    engine, database_url = empty_public_schema
+    config = _build_alembic_config(database_url)
+
+    await _run_alembic_command(command.upgrade, config, "0042")
+    assert "media_generations" in await _get_table_names(engine)
+    assert "recovery_query_snapshot_members" in await _get_table_names(engine)
+
+    async with engine.connect() as connection:
+        generation_columns = await connection.run_sync(
+            lambda sync_connection: {
+                column["name"] for column in sa_inspect(sync_connection).get_columns("media_generations")
+            }
+        )
+        meme_file_columns = await connection.run_sync(
+            lambda sync_connection: {column["name"] for column in sa_inspect(sync_connection).get_columns("meme_files")}
+        )
+        generation_indexes = await connection.run_sync(
+            lambda sync_connection: {
+                index["name"] for index in sa_inspect(sync_connection).get_indexes("media_generations")
+            }
+        )
+        recovery_item_indexes = await connection.run_sync(
+            lambda sync_connection: {
+                index["name"] for index in sa_inspect(sync_connection).get_indexes("recovery_job_items")
+            }
+        )
+        snapshot_member_columns = await connection.run_sync(
+            lambda sync_connection: {
+                column["name"]
+                for column in sa_inspect(sync_connection).get_columns("recovery_query_snapshot_members")
+            }
+        )
+        snapshot_member_indexes = await connection.run_sync(
+            lambda sync_connection: {
+                index["name"]
+                for index in sa_inspect(sync_connection).get_indexes("recovery_query_snapshot_members")
+            }
+        )
+        snapshot_member_foreign_keys = await connection.run_sync(
+            lambda sync_connection: sa_inspect(sync_connection).get_foreign_keys(
+                "recovery_query_snapshot_members"
+            )
+        )
+        generation_checks = await connection.run_sync(
+            lambda sync_connection: {
+                constraint["name"]: constraint["sqltext"]
+                for constraint in sa_inspect(sync_connection).get_check_constraints("media_generations")
+            }
+        )
+        generation_foreign_keys = await connection.run_sync(
+            lambda sync_connection: sa_inspect(sync_connection).get_foreign_keys("media_generations")
+        )
+        meme_file_foreign_keys = await connection.run_sync(
+            lambda sync_connection: sa_inspect(sync_connection).get_foreign_keys("meme_files")
+        )
+
+    assert {
+        "meme_file_id",
+        "recovery_item_id",
+        "expected_web_video_object_key",
+        "web_video_object_key",
+        "preview_image_object_key",
+        "profile",
+        "retry_limit",
+        "attempt_count",
+        "status",
+        "source_observations",
+        "output_observations",
+        "source_width",
+        "source_height",
+        "source_frame_rate_numerator",
+        "source_frame_rate_denominator",
+        "source_duration_seconds",
+        "source_has_audio",
+        "output_width",
+        "output_height",
+        "output_frame_rate_numerator",
+        "output_frame_rate_denominator",
+        "output_duration_seconds",
+        "output_video_bitrate",
+        "output_byte_size",
+        "output_video_codec",
+        "output_audio_codec",
+        "output_has_audio",
+        "safe_failure_reason",
+        "safe_failure_text",
+        "verified_at",
+        "uploaded_at",
+        "activated_at",
+        "superseded_at",
+        "cleanup_status",
+        "cleanup_attempt_count",
+        "cleanup_error_text",
+        "cleanup_at",
+    }.issubset(generation_columns)
+    assert {
+        "active_media_generation_id",
+        "source_has_audio",
+        "web_video_has_audio",
+        "web_video_profile",
+        "web_video_verified_at",
+    }.issubset(meme_file_columns)
+    assert {
+        "ix_media_generations_cleanup_status_created",
+        "ix_media_generations_file_created",
+        "ix_media_generations_recovery_item",
+        "ix_media_generations_status_superseded",
+    }.issubset(generation_indexes)
+    assert {
+        "uq_recovery_job_items_active_stage_reservation",
+        "uq_recovery_job_items_active_work_reservation",
+    }.issubset(recovery_item_indexes)
+    assert {
+        "recovery_job_id",
+        "root_key",
+        "work_kind",
+        "work_id",
+        "meme_file_id",
+        "stage",
+        "captured_version",
+        "captured_context_fingerprint",
+        "is_outdated_video",
+    }.issubset(snapshot_member_columns)
+    assert "ix_recovery_query_snapshot_members_job_id" in snapshot_member_indexes
+    assert len(snapshot_member_foreign_keys) == 1
+    assert snapshot_member_foreign_keys[0]["referred_table"] == "recovery_jobs"
+    assert snapshot_member_foreign_keys[0]["options"]["ondelete"] == "CASCADE"
+    assert any("retry_limit" in sqltext and "1" in sqltext and "5" in sqltext for sqltext in generation_checks.values())
+    assert any("attempt_count >= 0" in sqltext for sqltext in generation_checks.values())
+    assert {foreign_key["referred_table"] for foreign_key in generation_foreign_keys} == {
+        "meme_files",
+        "recovery_job_items",
+    }
+    active_generation_fk = next(
+        foreign_key
+        for foreign_key in meme_file_foreign_keys
+        if foreign_key["constrained_columns"] == ["active_media_generation_id"]
+    )
+    assert active_generation_fk["referred_table"] == "media_generations"
+    assert active_generation_fk["options"]["ondelete"] == "SET NULL"
+
+    await _run_alembic_command(command.downgrade, config, "0041")
+    assert "media_generations" not in await _get_table_names(engine)
+    assert "recovery_query_snapshot_members" not in await _get_table_names(engine)
+    async with engine.connect() as connection:
+        downgraded_meme_file_columns = await connection.run_sync(
+            lambda sync_connection: {column["name"] for column in sa_inspect(sync_connection).get_columns("meme_files")}
+        )
+        downgraded_recovery_item_indexes = await connection.run_sync(
+            lambda sync_connection: {
+                index["name"] for index in sa_inspect(sync_connection).get_indexes("recovery_job_items")
+            }
+        )
+    assert {
+        "active_media_generation_id",
+        "source_has_audio",
+        "web_video_has_audio",
+        "web_video_profile",
+        "web_video_verified_at",
+    }.isdisjoint(downgraded_meme_file_columns)
+    assert "uq_recovery_job_items_active_work_reservation" not in downgraded_recovery_item_indexes
+
+
+async def test_0042_backfills_and_safely_terminalizes_legacy_recovery_jobs(
+    empty_public_schema: tuple[AsyncEngine, str],
+) -> None:
+    engine, database_url = empty_public_schema
+    config = _build_alembic_config(database_url)
+    admin_user_id = uuid.uuid7()
+    meme_id = uuid.uuid7()
+    meme_file_id = uuid.uuid7()
+    stage_id = uuid.uuid7()
+    sync_target_id = uuid.uuid7()
+    preview_stage_job_id = uuid.uuid7()
+    queued_stage_job_id = uuid.uuid7()
+    running_sync_job_id = uuid.uuid7()
+    preview_non_stage_job_id = uuid.uuid7()
+    preview_stage_item_id = uuid.uuid7()
+    queued_stage_item_id = uuid.uuid7()
+    running_sync_item_id = uuid.uuid7()
+    preview_non_stage_item_id = uuid.uuid7()
+    dispatch_event_id = uuid.uuid7()
+    outbox_id = uuid.uuid7()
+
+    await _run_alembic_command(command.upgrade, config, "0041")
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                """
+                INSERT INTO users (id, status, email, nsfw_enabled, language)
+                VALUES (:user_id, 'active', 'legacy-recovery@example.com', false, 'any')
+                """
+            ),
+            {"user_id": admin_user_id},
+        )
+        await connection.execute(
+            text(
+                """
+                INSERT INTO memes (
+                    id, media_type, primary_file_id, language, is_nsfw,
+                    like_count, tags, visibility_mode, is_public
+                ) VALUES (
+                    :meme_id, 'video', :meme_file_id, 'none', false,
+                    0, '{}', 'auto', true
+                )
+                """
+            ),
+            {"meme_id": meme_id, "meme_file_id": meme_file_id},
+        )
+        await connection.execute(
+            text(
+                """
+                INSERT INTO meme_files (
+                    id, meme_id, status, mime_type, s3_original_key,
+                    s3_web_video_key, sha256_hex, quality_score
+                ) VALUES (
+                    :meme_file_id, :meme_id, 'ready', 'video/webm',
+                    'legacy/original.webm', 'legacy/web.mp4', :sha256_hex, 1.0
+                )
+                """
+            ),
+            {
+                "meme_file_id": meme_file_id,
+                "meme_id": meme_id,
+                "sha256_hex": "7" * 64,
+            },
+        )
+        await connection.execute(
+            text(
+                """
+                INSERT INTO pipeline_stage_journal (
+                    id, meme_file_id, stage, status, attempt_count,
+                    normalized_reason, is_retryable, finished_at
+                ) VALUES (
+                    :stage_id, :meme_file_id, 'transcode', 'failed', 2,
+                    'legacy_transcode_failure', true, now()
+                )
+                """
+            ),
+            {"stage_id": stage_id, "meme_file_id": meme_file_id},
+        )
+        await connection.execute(
+            text(
+                """
+                INSERT INTO meme_file_sync_target_snapshots (
+                    id, meme_file_id, sync_target, status, normalized_reason,
+                    last_payload_preview, attempt_count, last_attempt_at
+                ) VALUES (
+                    :sync_target_id, :meme_file_id, 'qdrant', 'failed',
+                    'legacy_sync_failure', '{}', 1, now()
+                )
+                """
+            ),
+            {"sync_target_id": sync_target_id, "meme_file_id": meme_file_id},
+        )
+        await connection.execute(
+            text(
+                """
+                INSERT INTO recovery_jobs (
+                    id, requested_by_admin_user_id, request_id, status, action,
+                    reason, selection, total_count, completed_count, failed_count,
+                    scheduled_at
+                ) VALUES
+                    (
+                        :preview_stage_job_id, :admin_user_id, :preview_stage_request_id,
+                        'preview', 'retry_stage', 'Review legacy stage',
+                        '{"items": [{"kind": "pipeline_stage", "id": "stale", "version": "stale"}]}',
+                        99, 7, 4, NULL
+                    ),
+                    (
+                        :queued_stage_job_id, :admin_user_id, :queued_stage_request_id,
+                        'queued', 'retry_stage', 'Run legacy stage',
+                        '{"kind": "pipeline_stage", "id": "legacy"}',
+                        99, 7, 4, now()
+                    ),
+                    (
+                        :running_sync_job_id, :admin_user_id, :running_sync_request_id,
+                        'running', 'resync_target', 'Run legacy sync',
+                        '{"kind": "sync_target", "id": "legacy"}',
+                        99, 7, 4, now()
+                    ),
+                    (
+                        :preview_non_stage_job_id, :admin_user_id, :preview_non_stage_request_id,
+                        'preview', 'rebuild_outbox', 'Review legacy outbox',
+                        '{"items": []}', 99, 7, 4, NULL
+                    )
+                """
+            ),
+            {
+                "admin_user_id": admin_user_id,
+                "preview_stage_job_id": preview_stage_job_id,
+                "preview_stage_request_id": uuid.uuid7(),
+                "queued_stage_job_id": queued_stage_job_id,
+                "queued_stage_request_id": uuid.uuid7(),
+                "running_sync_job_id": running_sync_job_id,
+                "running_sync_request_id": uuid.uuid7(),
+                "preview_non_stage_job_id": preview_non_stage_job_id,
+                "preview_non_stage_request_id": uuid.uuid7(),
+            },
+        )
+        await connection.execute(
+            text(
+                """
+                INSERT INTO recovery_job_items (
+                    id, recovery_job_id, work_kind, work_id, action,
+                    expected_version, status, dispatch_event_id, canonical_version,
+                    dispatched_at
+                ) VALUES
+                    (
+                        :preview_stage_item_id, :preview_stage_job_id, 'pipeline_stage',
+                        :stage_id, 'retry_stage', 'stage-version-reviewed', 'queued',
+                        NULL, 'legacy-preview-canonical', NULL
+                    ),
+                    (
+                        :queued_stage_item_id, :queued_stage_job_id, 'pipeline_stage',
+                        :stage_id, 'retry_stage', 'stage-version-active', 'waiting_capacity',
+                        NULL, NULL, NULL
+                    ),
+                    (
+                        :running_sync_item_id, :running_sync_job_id, 'sync_target',
+                        :sync_target_id, 'resync_target', 'sync-version-active', 'dispatched',
+                        :dispatch_event_id, 'sync-canonical', now()
+                    ),
+                    (
+                        :preview_non_stage_item_id, :preview_non_stage_job_id, 'outbox',
+                        :outbox_id, 'rebuild_outbox', 'outbox-version-reviewed', 'queued',
+                        NULL, NULL, NULL
+                    )
+                """
+            ),
+            {
+                "preview_stage_item_id": preview_stage_item_id,
+                "preview_stage_job_id": preview_stage_job_id,
+                "queued_stage_item_id": queued_stage_item_id,
+                "queued_stage_job_id": queued_stage_job_id,
+                "running_sync_item_id": running_sync_item_id,
+                "running_sync_job_id": running_sync_job_id,
+                "preview_non_stage_item_id": preview_non_stage_item_id,
+                "preview_non_stage_job_id": preview_non_stage_job_id,
+                "stage_id": str(stage_id),
+                "sync_target_id": str(sync_target_id),
+                "dispatch_event_id": dispatch_event_id,
+                "outbox_id": str(outbox_id),
+            },
+        )
+
+    await _run_alembic_command(command.upgrade, config, "0042")
+
+    async with engine.connect() as connection:
+        job_rows = (
+            await connection.execute(
+                text(
+                    """
+                    SELECT id, requested_by_admin_user_id, assigned_admin_user_id,
+                           status, scope, retry_limit, selection,
+                           selected_root_count, expanded_execution_count,
+                           total_count, completed_count, failed_count,
+                           queued_count, waiting_count, dispatched_count,
+                           succeeded_count, stale_count, skipped_count, cancelled_count,
+                           selection_snapshot_at, materialization_completed_at,
+                           cancelled_at, completed_at
+                    FROM recovery_jobs
+                    WHERE id = ANY(:job_ids)
+                    """
+                ),
+                {
+                    "job_ids": [
+                        preview_stage_job_id,
+                        queued_stage_job_id,
+                        running_sync_job_id,
+                        preview_non_stage_job_id,
+                    ]
+                },
+            )
+        ).all()
+        item_rows = (
+            await connection.execute(
+                text(
+                    """
+                    SELECT id, status, action, meme_file_id, stage, is_root,
+                           retry_limit, attempt_budget_start, retryable_failures_consumed,
+                           preserve_ready, suppress_fanout, reservation_active,
+                           dispatch_event_id, canonical_version, normalized_reason,
+                           safe_error_text, dispatched_at, finished_at
+                    FROM recovery_job_items
+                    WHERE id = ANY(:item_ids)
+                    """
+                ),
+                {
+                    "item_ids": [
+                        preview_stage_item_id,
+                        queued_stage_item_id,
+                        running_sync_item_id,
+                        preview_non_stage_item_id,
+                    ]
+                },
+            )
+        ).all()
+        reservation_index_definitions = dict(
+            (
+                await connection.execute(
+                    text(
+                        """
+                        SELECT indexname, indexdef
+                        FROM pg_indexes
+                        WHERE schemaname = current_schema()
+                          AND indexname IN (
+                              'uq_recovery_job_items_active_stage_reservation',
+                              'uq_recovery_job_items_active_work_reservation'
+                          )
+                        """
+                    )
+                )
+            ).tuples().all()
+        )
+
+    jobs = {row.id: row for row in job_rows}
+    items = {row.id: row for row in item_rows}
+
+    stage_preview = jobs[preview_stage_job_id]
+    assert stage_preview.requested_by_admin_user_id == admin_user_id
+    assert stage_preview.assigned_admin_user_id == admin_user_id
+    assert (stage_preview.status, stage_preview.scope, stage_preview.retry_limit) == (
+        "preview",
+        "stage_only",
+        3,
+    )
+    assert (
+        stage_preview.selected_root_count,
+        stage_preview.expanded_execution_count,
+        stage_preview.total_count,
+        stage_preview.completed_count,
+        stage_preview.failed_count,
+        stage_preview.queued_count,
+    ) == (1, 1, 1, 0, 0, 1)
+    assert stage_preview.selection_snapshot_at is not None
+    assert stage_preview.materialization_completed_at is not None
+    assert stage_preview.selection == {
+        "selector": {
+            "type": "explicit",
+            "items": [
+                {
+                    "kind": "pipeline_stage",
+                    "id": str(stage_id),
+                    "version": "stage-version-reviewed",
+                }
+            ],
+        },
+        "scope": "stage_only",
+        "retry_limit": 3,
+        "acknowledgements": [],
+    }
+
+    stage_preview_item = items[preview_stage_item_id]
+    assert (stage_preview_item.status, stage_preview_item.action) == (
+        "queued",
+        "regenerate_derivatives",
+    )
+    assert (stage_preview_item.meme_file_id, stage_preview_item.stage) == (
+        meme_file_id,
+        "transcode",
+    )
+    assert stage_preview_item.is_root is True
+    assert stage_preview_item.retry_limit == 3
+    assert stage_preview_item.attempt_budget_start is None
+    assert stage_preview_item.retryable_failures_consumed == 0
+    assert stage_preview_item.preserve_ready is True
+    assert stage_preview_item.suppress_fanout is True
+    assert stage_preview_item.reservation_active is False
+    assert stage_preview_item.canonical_version is None
+
+    for terminalized_job_id in (queued_stage_job_id, running_sync_job_id):
+        terminalized = jobs[terminalized_job_id]
+        assert terminalized.status == "cancelled"
+        assert terminalized.selection["migration_terminalized"] is True
+        assert terminalized.completed_count == 1
+        assert terminalized.cancelled_count == 1
+        assert terminalized.queued_count == 0
+        assert terminalized.waiting_count == 0
+        assert terminalized.dispatched_count == 0
+        assert terminalized.cancelled_at is not None
+        assert terminalized.completed_at is not None
+
+    queued_stage_item = items[queued_stage_item_id]
+    assert queued_stage_item.status == "cancelled"
+    assert queued_stage_item.normalized_reason == "legacy_recovery_terminalized"
+    assert queued_stage_item.safe_error_text
+    assert queued_stage_item.finished_at is not None
+    assert queued_stage_item.reservation_active is False
+    assert (queued_stage_item.meme_file_id, queued_stage_item.stage) == (
+        meme_file_id,
+        "transcode",
+    )
+
+    running_sync_item = items[running_sync_item_id]
+    assert running_sync_item.status == "cancelled"
+    assert (running_sync_item.meme_file_id, running_sync_item.stage) == (
+        meme_file_id,
+        "sync_qdrant",
+    )
+    assert running_sync_item.preserve_ready is True
+    assert running_sync_item.suppress_fanout is True
+    assert running_sync_item.reservation_active is False
+    # A pre-upgrade broker delivery may still arrive after this job is
+    # terminalized. It must no longer resolve as recovery-owned work.
+    assert running_sync_item.dispatch_event_id is None
+    assert running_sync_item.canonical_version is None
+    assert running_sync_item.dispatched_at is None
+
+    non_stage_preview = jobs[preview_non_stage_job_id]
+    non_stage_item = items[preview_non_stage_item_id]
+    assert non_stage_preview.status == "preview"
+    assert non_stage_preview.selection["selector"]["items"] == [
+        {
+            "kind": "outbox",
+            "id": str(outbox_id),
+            "version": "outbox-version-reviewed",
+        }
+    ]
+    assert non_stage_item.meme_file_id is None
+    assert non_stage_item.stage is None
+    assert non_stage_item.preserve_ready is False
+    assert non_stage_item.suppress_fanout is False
+    assert non_stage_item.reservation_active is False
+
+    stage_index = reservation_index_definitions["uq_recovery_job_items_active_stage_reservation"].lower()
+    work_index = reservation_index_definitions["uq_recovery_job_items_active_work_reservation"].lower()
+    assert "reservation_active" in stage_index and "stage is not null" in stage_index
+    assert "reservation_active" in work_index and "stage is null" in work_index
+
+    await _run_alembic_command(command.downgrade, config, "0041")
+    async with engine.connect() as connection:
+        downgraded_rows = (
+            await connection.execute(
+                text(
+                    """
+                        SELECT job.id,
+                               job.status AS job_status,
+                               item.action AS item_action,
+                               item.status AS item_status
+                    FROM recovery_jobs AS job
+                    JOIN recovery_job_items AS item ON item.recovery_job_id = job.id
+                    WHERE item.id IN (:preview_item_id, :queued_item_id, :running_item_id)
+                    """
+                ),
+                {
+                    "preview_item_id": preview_stage_item_id,
+                    "queued_item_id": queued_stage_item_id,
+                    "running_item_id": running_sync_item_id,
+                },
+            )
+        ).all()
+    downgraded = {row.id: row for row in downgraded_rows}
+    assert downgraded[preview_stage_job_id].job_status == "preview"
+    assert downgraded[preview_stage_job_id].item_action == "retry_stage"
+    assert downgraded[queued_stage_job_id].job_status == "cancelled"
+    assert downgraded[running_sync_job_id].job_status == "cancelled"

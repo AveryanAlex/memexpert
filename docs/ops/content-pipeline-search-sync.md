@@ -160,6 +160,14 @@ Operators who need to replay more than that must split the work into
 successive calls. The cap is deliberate — it prevents accidental
 "requeue the entire corpus" operator errors.
 
+These operator-token routes remain deliberately **failure-only** and bounded;
+they are not the universal admin control plane. Cookie-authenticated admins use
+`/admin/recovery` (**Replay & Repair**) for successful/forced replay,
+stage-only versus cascading scope, version/audit/CSRF fencing, and an uncapped
+all-matching selector. “Uncapped” there means one durable query job whose
+scheduler materializes exact versioned rows in keyset pages under capacity
+control—not one unbounded API request or broker publish burst.
+
 ## When to replay or rebuild
 
 Use per-target replay when canonical PostgreSQL truth changed after the last

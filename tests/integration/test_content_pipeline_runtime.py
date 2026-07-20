@@ -12,6 +12,7 @@ from io import BytesIO
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
+from botocore.exceptions import ClientError
 from PIL import Image
 from sqlalchemy import select
 
@@ -83,6 +84,10 @@ from memexpert.models.enums import (
     IngestSourceKind,
     PipelineIngestRequestStatus,
     RabbitMQOutboxMessageStatus,
+    RecoveryCapability,
+    RecoveryJobItemStatus,
+    RecoveryJobStatus,
+    RecoveryWorkKind,
     SourceAttachReason,
     SourceChannelAudienceCaptureReason,
     SourceEngagementCaptureReason,
@@ -94,7 +99,7 @@ from memexpert.models.enums import (
     SyncTargetStatus,
     TelegramSessionStatus,
 )
-from memexpert.models.operations import PipelineStageAttempt
+from memexpert.models.operations import PipelineStageAttempt, RecoveryJob, RecoveryJobItem
 from memexpert.models.user import User
 from memexpert.pipeline.events import (
     SourceChannelAudienceCaptureRequestedEvent,
@@ -114,6 +119,7 @@ from memexpert.schemas.content_pipeline import (
     ContentPipelineSyncTargetPreview,
 )
 from memexpert.services import PipelineIngestError
+from memexpert.services.recovery_runtime import RecoveryRuntime
 from memexpert.services.search_index_sync import SEARCH_INDEX_ALGORITHM_VERSION
 from memexpert.workers.pipeline_runtime import (
     PIPELINE_REASON_CLASSIFY_PROVIDER_BLOCKED,
@@ -130,6 +136,7 @@ from memexpert.workers.pipeline_runtime import (
     PIPELINE_REASON_MALFORMED_EVENT,
     PIPELINE_REASON_MEDIA_INSPECT_FAILED,
     PIPELINE_REASON_OCR_TIMEOUT,
+    PIPELINE_REASON_SOURCE_OBJECT_MISSING,
     PIPELINE_REASON_SYNC_MEILI_CONFLICT,
     PIPELINE_REASON_SYNC_MEILI_MALFORMED_PAYLOAD,
     PIPELINE_REASON_SYNC_MEILI_PROVIDER_BLOCKED,
@@ -310,8 +317,9 @@ class FakeMediaProcessor:
         filename: str,
         content_type: str,
         media_bytes: bytes,
+        generation_id: uuid.UUID | None = None,
     ) -> NormalizedMediaResult:
-        _ = (meme_file_id, filename, content_type, media_bytes)
+        _ = (meme_file_id, filename, content_type, media_bytes, generation_id)
         if self.normalize_error is not None:
             raise self.normalize_error
         assert self.normalize_result is not None
@@ -1570,6 +1578,279 @@ async def test_pipeline_runtime_media_inspect_retries_and_dead_letters_transient
     assert decoded_payload["event_type"] == "media_inspect_requested"
 
 
+async def test_media_inspect_recovery_budget_ignores_shutdown_and_stops_after_one_retryable_failure(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings.model_validate({"pipeline_broker_retry_max_attempts": 5})
+    storage_client = FakeStorageClient()
+    ingest_request = await seed_raw_ingest_request_for_runtime(
+        migrated_db_session,
+        storage_client,
+        media_bytes=b"runtime-recovery-budget",
+        source_id="runtime-recovery-budget-source",
+        post_id="9003",
+    )
+    admin = User(email="runtime-recovery-budget@example.com", is_admin=True)
+    migrated_db_session.add(admin)
+    await migrated_db_session.flush()
+    event_id = uuid.uuid7()
+    recovery_job = RecoveryJob(
+        requested_by_admin_user_id=admin.id,
+        request_id=uuid.uuid7(),
+        status=RecoveryJobStatus.RUNNING,
+        action=RecoveryCapability.REINSPECT_INGEST,
+        retry_limit=1,
+        reason="Limit media inspection recovery to one retryable failure.",
+        total_count=1,
+        scheduled_at=utcnow(),
+    )
+    migrated_db_session.add(recovery_job)
+    await migrated_db_session.flush()
+    recovery_item = RecoveryJobItem(
+        recovery_job_id=recovery_job.id,
+        work_kind=RecoveryWorkKind.INGEST_REQUEST,
+        work_id=str(ingest_request.id),
+        action=RecoveryCapability.REINSPECT_INGEST,
+        expected_version="dispatched",
+        retry_limit=1,
+        attempt_budget_start=1,
+        previous_stage_state={"non_stage_budget_consumed_at_dispatch": 0},
+        status=RecoveryJobItemStatus.DISPATCHED,
+        dispatch_event_id=event_id,
+        dispatched_at=utcnow(),
+    )
+    matching_outbox = RabbitMQOutboxMessage(
+        exchange="memexpert.pipeline",
+        routing_key="pipeline.media_inspect",
+        payload={"event_id": str(event_id), "ingest_request_id": str(ingest_request.id)},
+        headers={},
+        message_id=str(event_id),
+        event_type="media_inspect_requested",
+        aggregate_type="pipeline_ingest_request",
+        aggregate_id=str(ingest_request.id),
+        status=RabbitMQOutboxMessageStatus.PUBLISHED,
+        attempt_count=1,
+        published_at=utcnow(),
+    )
+    migrated_db_session.add_all((recovery_item, matching_outbox))
+    await migrated_db_session.commit()
+
+    broker = build_pipeline_broker(settings)
+
+    async def record_dead_letter(**_kwargs: object) -> uuid.UUID:
+        return uuid.uuid7()
+
+    runtime = build_pipeline_runtime(
+        settings=settings,
+        broker=broker,
+        session_factory=postgres_session_factory,
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(inspect_result=None),
+        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key="unused")),
+        dead_letter_recorder=record_dead_letter,
+    )
+    payload = build_media_inspect_requested_payload(
+        event_id=event_id,
+        ingest_request_id=ingest_request.id,
+        source_platform=ingest_request.source_platform,
+        sha256_hex=ingest_request.sha256_hex or "0" * 64,
+        created_at=utcnow(),
+    )
+
+    async def cancelled_stage(*_args: object, **_kwargs: object) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr("memexpert.workers.pipeline_runtime.runtime.run_media_inspect_stage", cancelled_stage)
+    shutdown_message = FakeRabbitMessage(message_id=str(event_id))
+    with pytest.raises(asyncio.CancelledError):
+        await runtime.handle_media_inspect_message(payload, shutdown_message)
+    async with postgres_session_factory() as session:
+        after_shutdown = await session.get(RecoveryJobItem, recovery_item.id)
+        assert after_shutdown is not None
+        assert after_shutdown.retryable_failures_consumed == 0
+
+    async def transient_failure(*_args: object, **_kwargs: object) -> None:
+        raise OSError("temporary object-store failure")
+
+    async def publish_dead_letter(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    cast("Any", broker).publish = publish_dead_letter
+    monkeypatch.setattr("memexpert.workers.pipeline_runtime.runtime.run_media_inspect_stage", transient_failure)
+    failed_message = FakeRabbitMessage(message_id=str(event_id))
+    await runtime.handle_media_inspect_message(payload, failed_message)
+    assert failed_message.reject_calls == []
+    assert failed_message.ack_count == 1
+
+    recovery_runtime = RecoveryRuntime(session_factory=postgres_session_factory, settings=settings)
+    assert await recovery_runtime.reconcile(batch_size=10) == 1
+    async with postgres_session_factory() as session:
+        persisted_item = await session.get(RecoveryJobItem, recovery_item.id)
+        persisted_job = await session.get(RecoveryJob, recovery_job.id)
+        assert persisted_item is not None
+        assert persisted_item.status is RecoveryJobItemStatus.FAILED
+        assert persisted_item.retryable_failures_consumed == 1
+        assert persisted_item.normalized_reason == PIPELINE_REASON_MEDIA_INSPECT_FAILED
+        assert persisted_job is not None
+        assert persisted_job.status is RecoveryJobStatus.COMPLETED_WITH_FAILURES
+
+
+async def test_cancelling_recovery_finalizes_dispatched_stage_failure_without_retry(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    admin = User(email="runtime-cancelling-stage@example.com", is_admin=True)
+    migrated_db_session.add(admin)
+    await migrated_db_session.flush()
+    event_id = uuid.uuid7()
+    job = RecoveryJob(
+        requested_by_admin_user_id=admin.id,
+        request_id=uuid.uuid7(),
+        status=RecoveryJobStatus.CANCELLING,
+        action=RecoveryCapability.REPLAY_STAGE,
+        retry_limit=3,
+        reason="Stop retry admission after cancellation begins.",
+        total_count=1,
+        scheduled_at=utcnow(),
+        cancelled_at=utcnow(),
+    )
+    migrated_db_session.add(job)
+    await migrated_db_session.flush()
+    item = RecoveryJobItem(
+        recovery_job_id=job.id,
+        work_kind=RecoveryWorkKind.PIPELINE_STAGE,
+        work_id=str(uuid.uuid7()),
+        action=RecoveryCapability.REPLAY_STAGE,
+        expected_version="dispatched",
+        retry_limit=3,
+        status=RecoveryJobItemStatus.DISPATCHED,
+        dispatch_event_id=event_id,
+        dispatched_at=utcnow(),
+        reservation_active=True,
+    )
+    migrated_db_session.add(item)
+    await migrated_db_session.commit()
+
+    settings = Settings()
+    runtime = build_pipeline_runtime(
+        settings=settings,
+        broker=build_pipeline_broker(settings),
+        session_factory=postgres_session_factory,
+        storage_client=FakeStorageClient(),
+        media_processor=FakeMediaProcessor(inspect_result=None),
+        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key="unused")),
+    )
+
+    stopped = await runtime._finalize_failure_for_cancelling_recovery(  # noqa: SLF001
+        event_id=event_id,
+        normalized_reason="transcode_stage_failed",
+        error=OSError("temporary object-store failure token=private-value"),
+    )
+
+    assert stopped is True
+    async with postgres_session_factory() as session:
+        persisted = await session.get(RecoveryJobItem, item.id)
+        assert persisted is not None
+        assert persisted.status is RecoveryJobItemStatus.FAILED
+        assert persisted.reservation_active is False
+        assert persisted.finished_at is not None
+        assert persisted.normalized_reason == "transcode_stage_failed"
+        assert persisted.safe_error_text is not None
+        assert "private-value" not in persisted.safe_error_text
+
+
+async def test_cancelling_recovery_worker_failure_acks_without_retry_and_reconciles(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    storage_client = FakeStorageClient()
+    seed_broker = RecordingBroker()
+    meme_file_id, ocr_event, normalized = await _seed_ocr_pending_item(
+        migrated_db_session,
+        storage_client=storage_client,
+        broker=seed_broker,
+    )
+    stage_row = await migrated_db_session.scalar(
+        select(PipelineStageJournal).where(
+            PipelineStageJournal.meme_file_id == meme_file_id,
+            PipelineStageJournal.stage == ContentPipelineStage.OCR,
+        )
+    )
+    assert stage_row is not None
+    assert stage_row.last_event_id == ocr_event.event_id
+
+    admin = User(email="runtime-cancelling-worker@example.com", is_admin=True)
+    migrated_db_session.add(admin)
+    await migrated_db_session.flush()
+    job = RecoveryJob(
+        requested_by_admin_user_id=admin.id,
+        request_id=uuid.uuid7(),
+        status=RecoveryJobStatus.CANCELLING,
+        action=RecoveryCapability.REPLAY_STAGE,
+        retry_limit=3,
+        reason="Stop retry admission after this dispatched OCR failure.",
+        total_count=1,
+        expanded_execution_count=1,
+        scheduled_at=utcnow(),
+        cancelled_at=utcnow(),
+    )
+    migrated_db_session.add(job)
+    await migrated_db_session.flush()
+    recovery_item = RecoveryJobItem(
+        recovery_job_id=job.id,
+        work_kind=RecoveryWorkKind.PIPELINE_STAGE,
+        work_id=str(stage_row.id),
+        meme_file_id=meme_file_id,
+        stage=ContentPipelineStage.OCR,
+        action=RecoveryCapability.REPLAY_STAGE,
+        expected_version="dispatched",
+        retry_limit=3,
+        attempt_budget_start=stage_row.attempt_count + 1,
+        status=RecoveryJobItemStatus.DISPATCHED,
+        dispatch_event_id=ocr_event.event_id,
+        dispatched_at=utcnow(),
+        reservation_active=True,
+    )
+    migrated_db_session.add(recovery_item)
+    await migrated_db_session.commit()
+
+    runtime = build_pipeline_runtime(
+        settings=Settings.model_validate({"pipeline_broker_retry_max_attempts": 5}),
+        broker=cast("Any", PublishingBroker()),
+        session_factory=postgres_session_factory,
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(normalize_result=normalized),
+        ocr_processor=FakeOCRProcessor(error=OCRTimeoutError("temporary OCR timeout")),
+    )
+    message = FakeRabbitMessage(message_id=str(ocr_event.event_id))
+
+    await runtime.handle_ocr_message(ocr_event.model_dump(mode="json"), message)
+
+    assert message.ack_count == 1
+    assert message.reject_calls == []
+    assert message.nack_calls == []
+    async with postgres_session_factory() as session:
+        persisted_item = await session.get(RecoveryJobItem, recovery_item.id)
+        assert persisted_item is not None
+        assert persisted_item.status is RecoveryJobItemStatus.FAILED
+        assert persisted_item.reservation_active is False
+        assert persisted_item.normalized_reason == PIPELINE_REASON_OCR_TIMEOUT
+
+    recovery_runtime = RecoveryRuntime(session_factory=postgres_session_factory, settings=Settings())
+    # The worker already terminalized the item; the reconciler only has to
+    # aggregate the now-terminal cancelling job, so no dispatched-item count is
+    # added here.
+    assert await recovery_runtime.reconcile(batch_size=10) == 0
+    async with postgres_session_factory() as session:
+        persisted_job = await session.get(RecoveryJob, job.id)
+        assert persisted_job is not None
+        assert persisted_job.status is RecoveryJobStatus.CANCELLED
+        assert persisted_job.failed_count == 1
+        assert persisted_job.cancelled_count == 0
+
+
 async def test_pipeline_runtime_forced_transcode_failure_then_replay_then_success(
     migrated_db_session: AsyncSession,
     postgres_session_factory: async_sessionmaker[AsyncSession],
@@ -1677,8 +1958,9 @@ async def test_pipeline_runtime_cancelled_stage_is_failed_requeued_and_immediate
             filename: str,
             content_type: str,
             media_bytes: bytes,
+            generation_id: uuid.UUID | None = None,
         ) -> NormalizedMediaResult:
-            _ = (meme_file_id, filename, content_type, media_bytes)
+            _ = (meme_file_id, filename, content_type, media_bytes, generation_id)
             normalize_started.set()
             await asyncio.Future()
             raise AssertionError("blocked media processor unexpectedly resumed")
@@ -1753,8 +2035,9 @@ async def test_pipeline_runtime_cancelled_superseded_stage_acks_without_overwrit
             filename: str,
             content_type: str,
             media_bytes: bytes,
+            generation_id: uuid.UUID | None = None,
         ) -> NormalizedMediaResult:
-            _ = (meme_file_id, filename, content_type, media_bytes)
+            _ = (meme_file_id, filename, content_type, media_bytes, generation_id)
             normalize_started.set()
             await asyncio.Future()
             raise AssertionError("blocked media processor unexpectedly resumed")
@@ -4238,3 +4521,225 @@ async def test_classify_completion_fan_out_publish_failure_commits_stage_rows_an
         broker_settings.sync_qdrant_routing_key,
         broker_settings.sync_meili_routing_key,
     ]
+
+
+async def test_missing_original_get_is_terminal_and_does_not_consume_recovery_budget(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    get_calls: list[tuple[str, str]] = []
+
+    class MissingOriginalStorageClient(FakeStorageClient):
+        def get_object(self, *, Bucket: str, Key: str) -> object:
+            get_calls.append((Bucket, Key))
+            raise ClientError(
+                {
+                    "Error": {"Code": "NoSuchKey", "Message": "missing"},
+                    "ResponseMetadata": {"HTTPStatusCode": 404},
+                },
+                "GetObject",
+            )
+
+    storage_client = MissingOriginalStorageClient()
+    pipeline_item, transcode_event = await _seed_transcode_pending_item(
+        migrated_db_session,
+        storage_client,
+        source_id="missing-original-runtime",
+        post_id="missing-original-runtime",
+        filename="missing-original.webm",
+        media_bytes=b"source disappeared before worker GET",
+        content_type="video/webm",
+    )
+    transcode = await migrated_db_session.scalar(
+        select(PipelineStageJournal).where(
+            PipelineStageJournal.meme_file_id == pipeline_item.meme_file_id,
+            PipelineStageJournal.stage == ContentPipelineStage.TRANSCODE,
+        )
+    )
+    assert transcode is not None
+    recovery_event_id = uuid.uuid7()
+    transcode.last_event_id = recovery_event_id
+    transcode_event = transcode_event.model_copy(update={"event_id": recovery_event_id})
+    admin = User(email="runtime-missing-original@example.com", is_admin=True)
+    migrated_db_session.add(admin)
+    await migrated_db_session.flush()
+    job = RecoveryJob(
+        requested_by_admin_user_id=admin.id,
+        assigned_admin_user_id=admin.id,
+        request_id=uuid.uuid7(),
+        status=RecoveryJobStatus.RUNNING,
+        action=RecoveryCapability.REGENERATE_DERIVATIVES,
+        retry_limit=3,
+        reason="Classify a final missing-original GET as terminal.",
+        total_count=1,
+        selected_root_count=1,
+        expanded_execution_count=1,
+        dispatched_count=1,
+        scheduled_at=utcnow(),
+    )
+    migrated_db_session.add(job)
+    await migrated_db_session.flush()
+    recovery_item = RecoveryJobItem(
+        recovery_job_id=job.id,
+        meme_file_id=pipeline_item.meme_file_id,
+        stage=ContentPipelineStage.TRANSCODE,
+        work_kind=RecoveryWorkKind.PIPELINE_STAGE,
+        work_id=str(transcode.id),
+        action=RecoveryCapability.REGENERATE_DERIVATIVES,
+        expected_version="dispatched",
+        retry_limit=3,
+        attempt_budget_start=1,
+        status=RecoveryJobItemStatus.DISPATCHED,
+        dispatch_event_id=transcode_event.event_id,
+        dispatched_at=utcnow(),
+        reservation_active=True,
+    )
+    migrated_db_session.add(recovery_item)
+    await migrated_db_session.commit()
+    async with postgres_session_factory() as session:
+        pending_stage = await session.get(PipelineStageJournal, transcode.id)
+        assert pending_stage is not None
+        assert pending_stage.status is ContentPipelineStageStatus.PENDING
+        assert pending_stage.last_event_id == transcode_event.event_id
+    broker = PublishingBroker()
+    runtime = build_pipeline_runtime(
+        settings=Settings.model_validate({"pipeline_broker_retry_max_attempts": 5}),
+        broker=cast("Any", broker),
+        session_factory=postgres_session_factory,
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(
+            normalize_result=build_normalized_media_result(pipeline_item.meme_file_id),
+        ),
+        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key="unused")),
+    )
+    message = FakeRabbitMessage(message_id=str(transcode_event.event_id))
+
+    await runtime.handle_transcode_message(transcode_event.model_dump(mode="json"), message)
+
+    assert message.ack_count == 1
+    assert message.reject_calls == []
+    assert message.nack_calls == []
+    assert get_calls
+    async with postgres_session_factory() as session:
+        failed_stage = await session.get(PipelineStageJournal, transcode.id)
+        dispatched_item = await session.get(RecoveryJobItem, recovery_item.id)
+        assert failed_stage is not None
+        # Derivative-only maintenance restores the pre-existing catalog stage
+        # truth even though the attempt itself is terminal.
+        assert failed_stage.status is ContentPipelineStageStatus.SUCCEEDED
+        assert failed_stage.is_retryable is False
+        assert dispatched_item is not None
+        assert dispatched_item.status is RecoveryJobItemStatus.FAILED
+        assert dispatched_item.normalized_reason == PIPELINE_REASON_SOURCE_OBJECT_MISSING
+        assert dispatched_item.retryable_failures_consumed == 0
+        assert dispatched_item.reservation_active is False
+
+    recovery_runtime = RecoveryRuntime(session_factory=postgres_session_factory, settings=Settings())
+    assert await recovery_runtime.reconcile(batch_size=10) == 0
+    async with postgres_session_factory() as session:
+        persisted_item = await session.get(RecoveryJobItem, recovery_item.id)
+        persisted_job = await session.get(RecoveryJob, job.id)
+        assert persisted_item is not None
+        assert persisted_item.status is RecoveryJobItemStatus.FAILED
+        assert persisted_item.normalized_reason == PIPELINE_REASON_SOURCE_OBJECT_MISSING
+        assert persisted_item.retryable_failures_consumed == 0
+        assert persisted_item.reservation_active is False
+        assert persisted_job is not None
+        assert persisted_job.status is RecoveryJobStatus.COMPLETED_WITH_FAILURES
+
+
+async def test_missing_temp_original_get_terminalizes_ingest_recovery_without_budget(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    class MissingTempStorageClient(FakeStorageClient):
+        def get_object(self, *, Bucket: str, Key: str) -> object:
+            _ = (Bucket, Key)
+            raise ClientError(
+                {
+                    "Error": {"Code": "404", "Message": "missing"},
+                    "ResponseMetadata": {"HTTPStatusCode": 404},
+                },
+                "GetObject",
+            )
+
+    storage_client = MissingTempStorageClient()
+    ingest_request = await seed_raw_ingest_request_for_runtime(
+        migrated_db_session,
+        storage_client,
+        media_bytes=b"temporary source disappeared before worker GET",
+        source_id="missing-temp-runtime",
+        post_id="missing-temp-runtime",
+    )
+    admin = User(email="runtime-missing-temp@example.com", is_admin=True)
+    migrated_db_session.add(admin)
+    await migrated_db_session.flush()
+    event_id = uuid.uuid7()
+    job = RecoveryJob(
+        requested_by_admin_user_id=admin.id,
+        assigned_admin_user_id=admin.id,
+        request_id=uuid.uuid7(),
+        status=RecoveryJobStatus.RUNNING,
+        action=RecoveryCapability.REINSPECT_INGEST,
+        retry_limit=3,
+        reason="Classify a missing temporary original as terminal.",
+        total_count=1,
+        selected_root_count=1,
+        expanded_execution_count=1,
+        dispatched_count=1,
+        scheduled_at=utcnow(),
+    )
+    migrated_db_session.add(job)
+    await migrated_db_session.flush()
+    recovery_item = RecoveryJobItem(
+        recovery_job_id=job.id,
+        work_kind=RecoveryWorkKind.INGEST_REQUEST,
+        work_id=str(ingest_request.id),
+        action=RecoveryCapability.REINSPECT_INGEST,
+        expected_version="dispatched",
+        retry_limit=3,
+        attempt_budget_start=1,
+        previous_stage_state={"non_stage_budget_consumed_at_dispatch": 0},
+        status=RecoveryJobItemStatus.DISPATCHED,
+        dispatch_event_id=event_id,
+        dispatched_at=utcnow(),
+        reservation_active=True,
+    )
+    migrated_db_session.add(recovery_item)
+    await migrated_db_session.commit()
+    runtime = build_pipeline_runtime(
+        settings=Settings.model_validate({"pipeline_broker_retry_max_attempts": 5}),
+        broker=cast("Any", PublishingBroker()),
+        session_factory=postgres_session_factory,
+        storage_client=storage_client,
+        media_processor=FakeMediaProcessor(inspect_result=None),
+        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key="unused")),
+    )
+    payload = build_media_inspect_requested_payload(
+        event_id=event_id,
+        ingest_request_id=ingest_request.id,
+        source_platform=ingest_request.source_platform,
+        sha256_hex=ingest_request.sha256_hex or "0" * 64,
+        created_at=utcnow(),
+    )
+    message = FakeRabbitMessage(message_id=str(event_id))
+
+    await runtime.handle_media_inspect_message(payload, message)
+
+    assert message.ack_count == 1
+    assert message.reject_calls == []
+    assert message.nack_calls == []
+    async with postgres_session_factory() as session:
+        persisted_item = await session.get(RecoveryJobItem, recovery_item.id)
+        assert persisted_item is not None
+        assert persisted_item.status is RecoveryJobItemStatus.FAILED
+        assert persisted_item.normalized_reason == PIPELINE_REASON_SOURCE_OBJECT_MISSING
+        assert persisted_item.retryable_failures_consumed == 0
+        assert persisted_item.reservation_active is False
+
+    recovery_runtime = RecoveryRuntime(session_factory=postgres_session_factory, settings=Settings())
+    assert await recovery_runtime.reconcile(batch_size=10) == 0
+    async with postgres_session_factory() as session:
+        persisted_job = await session.get(RecoveryJob, job.id)
+        assert persisted_job is not None
+        assert persisted_job.status is RecoveryJobStatus.COMPLETED_WITH_FAILURES

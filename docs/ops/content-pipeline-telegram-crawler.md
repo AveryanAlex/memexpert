@@ -817,27 +817,38 @@ row is marked `status=auth_required`, not quarantined. Recovery options are:
    the committed repair automatically; use `SIGHUP` only for an immediate pass,
    then read `/api/v1/crawler/freshness` to confirm live freshness recovers.
 
-## Moving-media preview repair
+## Moving-media Replay & Repair
 
-Successful GIF/video transcodes persist both `web.mp4` playback and a
-deterministic `preview.png` first-frame image. Public card thumbnail/display
-URLs use imgproxy over the PNG; private cards use the authenticated media
-route. Verify the invariant after a storage restore or media-pipeline upgrade:
+New GIF/video transcodes use immutable profile `web-h264-aac-1080p30-v2` and
+persist a generation pair:
 
-```bash
-memexpert-backfill-video-posters --verify-only --concurrency 4
+```text
+pipeline/derived/{file_id}/generations/{generation_id}/web.mp4
+pipeline/derived/{file_id}/generations/{generation_id}/preview.png
 ```
 
-Repair missing frames idempotently from the already-normalized web videos:
+The file's active video key selects the generation and derives its sibling
+poster; legacy flat `web.mp4`/`web_video.mp4` plus `preview.png` remain readable.
+Public cards use imgproxy over the active PNG and playback uses the active H.264
+MP4. Private cards use authenticated, non-cacheable redirects. A version token
+changes when activation changes.
 
-```bash
-memexpert-backfill-video-posters --concurrency 2
-```
+Use `/admin/recovery` → **Regenerate** → **Outdated web videos** for normal
+repair. **Select all matching** creates one uncapped, resumable exact preview;
+it does not rerun OCR, embeddings, classification, or search sync. Review and
+schedule 10 then 100 roots before the full cohort. A generation must pass local
+video/audio/sync/rate validation and upload both artifacts before the active
+pointer switches. Any FFmpeg, probe, upload, database, or stale-version failure
+keeps the previous active media and READY state.
 
-The command skips existing previews, reports every failed file, and exits
-non-zero if any extraction or storage operation fails. `--force` regenerates
-all selected frames; `--limit N` is available for a canary batch. Run it from
-the worker image because preview extraction requires FFmpeg and Pillow.
+`memexpert-backfill-video-posters --verify-only` remains a legacy diagnostic
+for flat generations after a restore. Its mutation mode is an emergency legacy
+fallback, not the way to regenerate the new profile. The helper refuses
+immutable `/generations/{generation_id}/` keys, including forced repair; use
+atomic derivative regeneration so a fresh pair and URL version activate
+together. After a repair, verify every active video has its derived sibling
+poster and let the seven-day generation GC remove only recognized, old,
+unreferenced objects.
 
 ## Common failure modes
 
@@ -942,7 +953,10 @@ When the freshness snapshot reports `slo_p95_pass=False`, work top-down:
 - **CPU video transcodes need a realistic deadline** — the production default
   for `PIPELINE_TRANSCODE_TIMEOUT_SECONDS` is 180 seconds. The beta host has
   valid Telegram videos that exceed the old 45-second deadline; shortening it
-  can strand otherwise supported posts before OCR and indexing.
+  can strand otherwise supported posts before OCR and indexing. The 1080p30
+  profile can process roughly twice the frames of the legacy 15 FPS output;
+  size concurrency and deadlines from the 100-root canary rather than raising
+  parallelism speculatively.
 - **Freshness is measured on live items** — `MemeSource.published_at`
   must be set for the freshness query to score the item. Catch-up items
   backfilled from a historical window are NOT scored by the SLO; that

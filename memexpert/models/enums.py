@@ -334,6 +334,8 @@ class RecoveryCapability(StrEnum):
     REPLAY_SOURCE_POST = "replay_source_post"
     REINSPECT_INGEST = "reinspect_ingest"
     RETRY_STAGE = "retry_stage"
+    REPLAY_STAGE = "replay_stage"
+    REGENERATE_DERIVATIVES = "regenerate_derivatives"
     RESYNC_TARGET = "resync_target"
     REBUILD_OUTBOX = "rebuild_outbox"
     RECOVER_DEAD_LETTER = "recover_dead_letter"
@@ -343,9 +345,11 @@ class RecoveryCapability(StrEnum):
 class RecoveryJobStatus(StrEnum):
     """Lifecycle for durable recovery batches."""
 
+    PREPARING = "preparing"
     PREVIEW = "preview"
     QUEUED = "queued"
     RUNNING = "running"
+    CANCELLING = "cancelling"
     COMPLETED = "completed"
     COMPLETED_WITH_FAILURES = "completed_with_failures"
     CANCELLED = "cancelled"
@@ -356,12 +360,43 @@ class RecoveryJobItemStatus(StrEnum):
     """Lifecycle for one item inside a recovery batch."""
 
     QUEUED = "queued"
+    WAITING_DEPENDENCY = "waiting_dependency"
     WAITING_CAPACITY = "waiting_capacity"
     DISPATCHED = "dispatched"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     SKIPPED_STALE = "skipped_stale"
+    SKIPPED_DEPENDENCY = "skipped_dependency"
     CANCELLED = "cancelled"
+
+
+class RecoveryReplayScope(StrEnum):
+    """How far an admin-owned stage replay is allowed to propagate."""
+
+    STAGE_ONLY = "stage_only"
+    STAGE_AND_DEPENDENTS = "stage_and_dependents"
+
+
+class MediaGenerationStatus(StrEnum):
+    """Lifecycle of one immutable moving-media derivative generation."""
+
+    GENERATING = "generating"
+    VERIFIED = "verified"
+    UPLOADED = "uploaded"
+    ACTIVE = "active"
+    SUPERSEDED = "superseded"
+    FAILED = "failed"
+    STALE = "stale"
+
+
+class MediaGenerationCleanupStatus(StrEnum):
+    """Durable cleanup state for immutable derivative objects."""
+
+    NOT_ELIGIBLE = "not_eligible"
+    PENDING = "pending"
+    DELETED = "deleted"
+    RETAINED_REFERENCED = "retained_referenced"
+    FAILED = "failed"
 
 
 class RecoveryDeadLetterStatus(StrEnum):

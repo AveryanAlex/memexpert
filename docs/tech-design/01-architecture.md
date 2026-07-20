@@ -171,7 +171,7 @@ Managed: PostgreSQL, S3 (R2/B2), Cloudflare CDN
 
 Qdrant, Meilisearch, and RabbitMQ are lightweight enough to share a server with the API at initial scale. Split to dedicated nodes if latency becomes an issue.
 
-Backend containers are split by runtime target: API, bot, scheduler, and worker images install only their service dependency group plus common Python runtime dependencies. The worker image is intentionally heavier: it is the only Python app image with FFmpeg/FFprobe, Paddle/OpenCV system libraries, and the Python 3.13 PaddleOCR helper venv. PaddleOCR/PaddlePaddle are not installed into the main Python 3.14 app environment.
+Backend containers are split by runtime target: API, bot, scheduler, and worker images install only their service dependency group plus common Python runtime dependencies. The worker image is intentionally heavier: it is the only Python app image with FFmpeg/FFprobe, Paddle/OpenCV system libraries, and the Python 3.13 PaddleOCR helper venv. FFmpeg and FFprobe are multi-architecture static 8.1.2 binaries copied from a digest-pinned build image instead of the older Debian package; CI verifies the exact runtime version. PaddleOCR/PaddlePaddle are not installed into the main Python 3.14 app environment.
 
 ### Resource Estimates
 

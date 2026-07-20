@@ -19,6 +19,36 @@ Users can suggest new channels for crawling via a form in the bot PM and on the 
 - **GIFs** — converted to MP4 for delivery
 - **Videos** (MP4, WEBM) — website and Mini App only, excluded from TG inline
 
+#### Browser moving-media profile
+
+Every GIF/video receives an immutable browser derivative using profile
+`web-h264-aac-1080p30-v2`. Sources at or below 30 FPS retain their timing and
+frame rate; faster or invalid-rate sources normalize to at most 30 FPS. The
+pipeline never upscales and fits even dimensions inside 1920×1080 landscape,
+1080×1920 portrait, or 1080×1080 square. Video is H.264 High Level 4.1,
+`yuv420p`, medium preset, CRF 21, 6 Mbps maximum rate with a 12 Mbps buffer and
+an approximately two-second maximum GOP. MP4 output is FastStart-ready.
+
+The first source audio stream, when present, becomes AAC-LC 128 kbps, 48 kHz
+stereo. Silent videos and GIF-like inputs remain silent. Metadata, chapters,
+subtitles, and data streams are excluded. Post-encode probing must verify the
+container, codecs, dimensions, source-safe frame rate, duration/A/V sync,
+audio invariant, and packet-window conformance to the VBV token bucket before
+the derivative can become active.
+
+The file records whether the source and active output contain audio, the active
+profile, and verification time. A durable immutable generation also records
+source/output width, height, frame rate, duration, bitrate, byte size, codecs,
+attempts, failure state, activation, and cleanup. A failed regeneration leaves
+the previous active media and READY catalog state untouched.
+
+The real-stack release proof generates and ingests an audible 24 FPS WebM/Opus
+source and a silent portrait 60 FPS WebM source. It downloads each activated
+MP4 and sibling poster, independently probes the outputs, and requires the
+audible source to retain one AAC-LC stream at 24 FPS while the silent source
+remains audio-free and is capped at 30 FPS. Both outputs must satisfy the H.264
+High/Level 4.1, even-dimension mobile envelope, and 6 Mbps rate constraints.
+
 ### Telegram post context retention
 
 The crawler retains Telegram post context independently of whether a message
@@ -63,6 +93,13 @@ Every meme goes through:
 - **Language detection** (ru / en / mixed / none)
 - **Popularity scoring** (views, impressions, downloads, reactions, reposts, platform engagement)
 - **Template identification** (AI-assigned during SEO generation)
+
+Admins may deliberately replay an individual stage, replay it with its exact
+dependents, or regenerate moving-media derivatives without rerunning OCR,
+embeddings, classification, or search synchronization. Eligibility and
+prerequisites are always computed from canonical backend state. Ordinary
+pipeline fan-out is suppressed while a replay job owns the dependency graph,
+and an already-READY meme remains available throughout maintenance.
 
 ### SEO Page Content Generation
 

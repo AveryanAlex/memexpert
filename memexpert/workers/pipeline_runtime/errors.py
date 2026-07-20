@@ -37,6 +37,7 @@ from memexpert.core.qdrant import (
     QdrantSyncTimeoutError,
     QdrantTimeoutError,
 )
+from memexpert.core.storage import StorageObjectMissingError
 from memexpert.core.voyage import (
     VoyageMalformedResponseError,
     VoyageProviderUnavailableError,
@@ -67,6 +68,7 @@ from memexpert.workers.pipeline_runtime.constants import (
     PIPELINE_REASON_OCR_FAILED,
     PIPELINE_REASON_OCR_PROVIDER_BLOCKED,
     PIPELINE_REASON_OCR_TIMEOUT,
+    PIPELINE_REASON_SOURCE_OBJECT_MISSING,
     PIPELINE_REASON_SYNC_MEILI_CONFLICT,
     PIPELINE_REASON_SYNC_MEILI_MALFORMED_PAYLOAD,
     PIPELINE_REASON_SYNC_MEILI_PROVIDER_BLOCKED,
@@ -125,6 +127,9 @@ def coerce_dead_letter_payload(payload: object) -> DeadLetterPayload:
 
 def normalize_failure_reason(stage: ContentPipelineStage, exc: Exception) -> str:
     """Map an exception raised inside a stage runner to a normalized reason string."""
+
+    if isinstance(exc, StorageObjectMissingError):
+        return PIPELINE_REASON_SOURCE_OBJECT_MISSING
 
     if stage is ContentPipelineStage.TRANSCODE:
         if isinstance(exc, ForcedTranscodeFailure):
@@ -205,6 +210,9 @@ def normalize_failure_reason(stage: ContentPipelineStage, exc: Exception) -> str
 
 def is_replayable_failure(stage: ContentPipelineStage, exc: Exception) -> bool:
     """Return ``True`` iff the exception should be requeued for another attempt."""
+
+    if isinstance(exc, StorageObjectMissingError):
+        return False
 
     if stage is ContentPipelineStage.TRANSCODE:
         return not isinstance(exc, MediaValidationError)

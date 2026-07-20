@@ -1066,6 +1066,17 @@ async def test_admin_can_list_read_and_resolve_moderation_report_with_audited_de
             note="This should be marked nsfw",
         )
         await _persist_canonical_meme(session, meme, meme_file)
+        session.add(
+            PipelineStageJournal(
+                meme_file_id=meme_file.id,
+                stage=ContentPipelineStage.TRANSCODE,
+                status=ContentPipelineStageStatus.SUCCEEDED,
+                attempt_count=2,
+                last_event_id=uuid7(),
+                is_retryable=False,
+                finished_at=datetime.now(UTC),
+            )
+        )
         session.add(report)
         await session.commit()
         await session.refresh(report)
@@ -1105,6 +1116,28 @@ async def test_admin_can_list_read_and_resolve_moderation_report_with_audited_de
     assert detail_payload["meme"]["primary_file"]["render"]["preview_url"] == expected_preview_url
     assert [item["id"] for item in detail_payload["reports"]] == [str(report_id)]
     assert detail_payload["decisions"] == []
+    assert len(detail_payload["processing_files"]) == 1
+    processing_file = detail_payload["processing_files"][0]
+    assert processing_file["id"] == expected_file_id
+    assert processing_file["is_primary"] is True
+    assert processing_file["status"] == "ready"
+    assert processing_file["width"] == 900
+    assert processing_file["height"] == 600
+    assert len(processing_file["stages"]) == 1
+    processing_stage = processing_file["stages"][0]
+    assert processing_stage["stage"] == "transcode"
+    assert processing_stage["status"] == "succeeded"
+    assert processing_stage["attempt_count"] == 2
+    actions = {item["capability"]: item for item in processing_stage["actions"]}
+    assert set(actions) == {"retry_stage", "replay_stage", "regenerate_derivatives"}
+    assert actions["retry_stage"]["available"] is False
+    assert actions["replay_stage"]["available"] is True
+    assert actions["replay_stage"]["scopes"] == ["stage_only", "stage_and_dependents"]
+    assert actions["regenerate_derivatives"]["available"] is False
+    assert actions["regenerate_derivatives"]["scopes"] == ["stage_only"]
+    assert actions["regenerate_derivatives"]["blocked_prerequisites"] == [
+        "Derivative regeneration applies only to moving media."
+    ]
     assert "admin/private/moderation-primary.jpg" not in detail_response.text
 
     assert resolve_response.status_code == 200

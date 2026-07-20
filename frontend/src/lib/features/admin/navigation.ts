@@ -23,7 +23,7 @@ export const ADMIN_NAVIGATION_GROUPS: AdminNavigationGroup[] = [
     items: [
       { label: 'Overview', href: '/admin', match: 'exact' },
       { label: 'Analytics', href: '/admin/analytics', match: 'prefix' },
-      { label: 'Recovery', href: '/admin/recovery', match: 'prefix' },
+      { label: 'Replay & Repair', href: '/admin/recovery', match: 'prefix' },
       { label: 'Sources', href: '/admin/sources', match: 'prefix' },
       {
         label: 'Moderation',

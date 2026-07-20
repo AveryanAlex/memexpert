@@ -48,7 +48,7 @@ Default CI and local E2E runs are deterministic and secret-free:
 - `PIPELINE_CLASSIFICATION_PROVIDER_MODE=fake`
 - `PIPELINE_VOYAGE_OUTPUT_DIMENSIONS=4`
 
-The suite does not call live Voyage, Telegram, Google, or other provider APIs. The current default path proves a collection-backed private operator upload, confirms it is absent from public search, then feeds the same bytes through the typed crawler ingest service. The exact-SHA crawler source must reuse the same meme/file, promote AUTO visibility, and become publicly searchable after Qdrant/Meilisearch resync. Full Telethon network emulation remains a follow-up.
+The suite does not call live Voyage, Telegram, Google, or other provider APIs. The current default path proves a collection-backed private operator upload, confirms it is absent from public search, then feeds the same bytes through the typed crawler ingest service. The exact-SHA crawler source must reuse the same meme/file, promote AUTO visibility, and become publicly searchable after Qdrant/Meilisearch resync. It also uses local FFmpeg sources to exercise the real media worker: an audible 24 FPS WebM/Opus input and a silent portrait 60 FPS WebM input. Full Telethon network emulation remains a follow-up.
 
 Live PaddleOCR is available in the worker image through a Python 3.13 helper venv, but it is deliberately disabled for default E2E. Run the gated smoke explicitly when model downloads/runtime cost are acceptable:
 
@@ -66,12 +66,13 @@ docker run --rm \
 - Public discovery through website search, URL-backed filters, detail pages, and imgproxy media rendering.
 - Guest favorite/unfavorite behavior with custom collections and Pin gated to full accounts.
 - Fake-provider private upload, exact-SHA crawler promotion, dual search-index proof, and website discovery of the same canonical meme/file.
+- Audio-safe moving media through the upload API and real worker: the seed downloads each activated MP4 and sibling PNG, independently FFprobes H.264 profile/level, pixel format, dimensions, FPS, bitrate, and AAC-LC presence or absence, and verifies persisted generation/pointer/audio state. Playwright then asserts the typed 24 FPS audible and 30 FPS silent proofs from `seed.json`.
 
 ## Artifacts
 
 Artifacts are written under `.artifacts/e2e/<run-id>/`:
 
-- `seed.json`: seeded public meme ids/slugs/queries and created upload proof data.
+- `seed.json`: seeded public meme ids/slugs/queries, created upload proof data, and the downloaded/probed audible and silent derivative observations under `audio_safe_media`.
 - `compose-ps.txt`: final Compose service status.
 - `compose-logs.txt`: timestamped logs for app, infra, seed, and runner services.
 - `compose-config.yml`: rendered E2E Compose config.
