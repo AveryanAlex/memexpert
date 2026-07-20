@@ -101,6 +101,13 @@ from memexpert.models.operations import (
     RuntimeHeartbeat,
     SourceChannelBackfillAttempt,
 )
+from memexpert.models.recommendation import (
+    RecommendationDailyAggregate,
+    UserMemeRecommendationState,
+    UserRecommendationProfile,
+    UserRecommendationProfileSignal,
+    UserRecommendationProfileStatus,
+)
 from memexpert.models.search_synonyms import (
     SearchSynonymCatalog,
     SearchSynonymRevision,
@@ -198,6 +205,7 @@ __all__ = [
     "RecoveryQuerySnapshotMember",
     "RecoveryReplayScope",
     "RecoveryWorkKind",
+    "RecommendationDailyAggregate",
     "RuntimeHeartbeat",
     "SearchSynonymCatalog",
     "SearchSynonymLocale",
@@ -231,7 +239,11 @@ __all__ = [
     "TimestampMixin",
     "UUIDPrimaryKeyMixin",
     "User",
+    "UserMemeRecommendationState",
     "UserLanguage",
+    "UserRecommendationProfile",
+    "UserRecommendationProfileSignal",
+    "UserRecommendationProfileStatus",
     "metadata",
     "OperationalAuditLog",
     "string_enum",

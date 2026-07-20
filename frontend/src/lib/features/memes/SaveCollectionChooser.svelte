@@ -1,5 +1,6 @@
 <script lang="ts">
   import { browser } from '$app/environment';
+  import { uuidV7 } from '$lib/analytics/uuid-v7';
   import { fetchMemeCollectionChoices, removeMemeFromCollection, saveMemeToCollection } from '$lib/api/client';
   import type { MemeCollectionChoiceRead } from '$lib/api/types';
   import { actionFailureMessage, memeActionAttributionBody, type MemeActionAttribution } from '$lib/memeActions';
@@ -41,7 +42,6 @@
   let choices = $state<MemeCollectionChoiceRead[]>([]);
 
   const isCardSurface = $derived(surface === 'card');
-  const actionBody = $derived(memeActionAttributionBody(attribution));
   const savedIds = $derived(
     new Set(savedCollectionIds ?? choices.filter((choice) => choice.contains_meme).map((choice) => choice.collection_id))
   );
@@ -118,12 +118,14 @@
     loading = false;
     errorMessage = null;
     try {
+      const actionBody = memeActionAttributionBody(attribution, uuidV7());
       if (containsMeme) {
         await removeMemeFromCollection({
           fetch,
           baseUrl: window.location.origin,
           collectionId: choice.collection_id,
-          memeId: targetMemeId
+          memeId: targetMemeId,
+          body: actionBody
         });
       } else {
         await saveMemeToCollection({

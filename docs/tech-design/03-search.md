@@ -9,20 +9,23 @@ Every search query may use several retrieval paths in parallel:
 1. **Semantic:** Qdrant returns top candidates ranked by embedding cosine similarity.
 2. **Text:** Meilisearch returns top candidates ranked by text relevance (`_rankingScore`, 0–1).
 3. **Popularity/trending:** PostgreSQL/materialized views provide fallback and boosting signals.
-4. **Personal recommendations:** Qdrant recommend/search APIs provide user-history candidates for feed surfaces and optional query-independent blending.
+4. **Taste rerank:** an available persisted profile contributes a small score
+   only after query-led candidates are collected; it never injects unrelated
+   candidates into an explicit text search.
 
 Both engines return the same fixed-size candidate pool, controlled by
 `SEARCH_CANDIDATE_POOL_LIMIT_PER_SOURCE` (default: 200 candidates from each
 engine, bounded to 100–500). The pool size is independent of the requested page
 `limit` and `offset`. Results are merged by `meme_id` and scored with
-configurable weights. Example shape:
+configurable weights.
 
-```text
-combined_score = w_semantic × semantic_score
-               + w_text × text_score
-               + w_popularity × normalized_popularity
-               + w_personal × personal_score
-```
+The `personalized_v2` starting contract for Text Search is `0.45 semantic +
+0.35 text + 0.10 taste + 0.05 popularity + 0.05 quality`. Public Trends,
+taxonomy, and SEO surfaces remain global and deterministic. Search keeps its
+bounded offset URLs for shareability. Search attribution uses the dedicated
+`*_hybrid_taste_v2` ranking version rather than the underlying index schema
+version; Similar uses `*_similar_taste_v4`, so either formula can evolve
+without being mistaken for an index-only change.
 
 Weights are **configuration and experiment inputs**, not fixed truth. Every response/log entry that feeds analytics should include `algorithm_version`, active weights, score components, and result attribution.
 
@@ -91,32 +94,62 @@ Fallbacks should be explicit and observable, not silent behavior changes. Search
 | Failure | Behavior |
 |---------|----------|
 | Query embedding provider fails | Skip semantic query path; use text + popularity/trending. |
-| Qdrant down | Text + popularity/trending. Similar falls back through tag, template, and public-popular tiers; personalized recommendations fall back to trending, with attribution. |
+| Qdrant down | Search uses text + popularity/trending, and Similar falls back through tag, template, and public-popular tiers. With Redis healthy, Home omits vector sources but still fuses, ranks, and freezes a bounded pool of PostgreSQL trend/exploration candidates; Redis-unavailable Home uses its signed PostgreSQL keyset fallback. All degraded paths retain attribution. |
 | Meilisearch down | Semantic + popularity/trending. Text-specific ranking unavailable. |
 | Both search engines down | Trending/popular materialized view fallback. |
-| Redis down | Recompute; no candidate-pool cache/rate-limit cache. Search correctness should remain intact. |
+| Redis down | Search recomputes without its optional cache. Home serves `public_meme_trends_mv` through a PostgreSQL keyset cursor and hydrates only the requested page. |
 
 Circuit breakers can protect Qdrant/Meilisearch/Voyage from repeated failing calls. Exact thresholds are operational config. Reweighting uses the same configurable weight model with missing components zeroed or renormalized.
 
 ## Qdrant
 
-Single collection `meme_files`. One point per `MemeFile` that the pipeline has
-classified and synced.
+The current implementation uses one configured collection (default
+`memexpert-memes`) with one point per classified and synced `MemeFile`.
 
 - **Vector:** Voyage AI `voyage-multimodal-3.5`, 1024 dimensions, cosine distance
 - **Payload:** safe PostgreSQL-derived metadata for candidate prefiltering and
   ranking: `meme_id`, `meme_file_id`, `search_index_algorithm_version`,
-  `is_public`, internal `uploader_user_ids`, `media_type`, `language`, `is_nsfw`, `tags`,
+  `is_public`, `is_primary_file`, internal `uploader_user_ids`, `media_type`,
+  `language`, `is_nsfw`, `tags`,
   `template_id`, `template_slug`, `seo_page_slug`, derived `popularity_score`,
   `like_count`, `quality_score`, `created_at`, `updated_at`, collection id
   buckets by visibility, shared collection ids, collection owner ids, and
   collection member ids.
 - `uploader_user_ids` exists only to prefilter private approximate-dedupe candidates. It is not used for user-facing access checks and is not returned by public APIs.
-- **Payload indexes:** should be created on fields used by Qdrant-side
-  prefilters. These indexes are performance hints only; PostgreSQL filters are
-  still the authorization boundary.
+- `is_primary_file` is true only for `Meme.primary_file_id`. Recommendation
+  retrieval requires it so alternative crops cannot occupy multiple candidate
+  slots; semantic deduplication and general file-level search may still inspect
+  every file.
+- **Payload indexes:** collection ensure idempotently provisions keyword indexes
+  on `search_index_algorithm_version`, `uploader_user_ids`, `media_type`,
+  `language`, `tags`, `collection_ids`, `collection_owner_user_ids`, and
+  `collection_member_user_ids`, plus boolean indexes on `is_public`,
+  `is_primary_file`, and `is_nsfw`. These are performance hints only;
+  PostgreSQL remains the authorization and final filter boundary.
 
-Used for: semantic search, similar memes, personalized feed (recommend API / vector search from positives), and deduplication during ingestion (high-threshold similarity search).
+The long-lived sync adapter caches successful collection provisioning. If an
+upsert receives `404` after the collection was replaced out of band, it clears
+that readiness flag, reruns collection ensure for all eleven payload indexes,
+and retries the upsert once; persistent provider failures remain durable sync
+failures rather than an unbounded retry loop.
+
+The recommendation adapter accepts a batch of named nearest-neighbor requests
+for short-term intent and long-term profile centroids plus a Qdrant
+`RecommendQuery(strategy=best_score)` over recent positive primary-file IDs.
+One shared filter enforces public/content preconditions, primary-file-only
+candidates, and source-point exclusions. It returns per-source candidate ranks
+and scores; Qdrant does not apply dynamic authorization, reciprocal-rank fusion,
+item features, or the final formula.
+
+Nearest-vector and `best_score` requests run as separate batches. A missing or
+stale positive seed can therefore degrade the multi-positive source to an empty
+result without discarding already successful short-/long-term nearest results.
+The lightweight API and Telegram adapters share one process-wide lazy Qdrant SDK
+client instead of opening a transport pool per request/update; FastAPI lifespan
+and bot shutdown close and clear that shared client.
+
+Used for: semantic search, similar memes, personalized retrieval, and
+deduplication during ingestion (high-threshold similarity search).
 
 ## Meilisearch
 
@@ -197,8 +230,8 @@ pipeline service.
 | Search results | Offset or optional cached candidate pool | Deterministic merge/rerank; Redis pool added when needed for stable deep pagination |
 | Similar memes | Bounded offset pages | Stable ordered pool of at most 200 candidates; 12-result UI pages and empty responses beyond `total` |
 | Collection browsing | Cursor-based | `(added_at, meme_id)` |
-| Trending / feeds | Cursor-based | `(score, meme_id)` or materialized-view rank |
-| Recommendations | Cursor-based/bounded pages | Qdrant recommend/search result pages plus DB access filtering |
+| Trending / public fallback | Cursor-based | PostgreSQL `(score, meme_id)` keyset or materialized-view rank |
+| Home recommendations | Signed pool cursor | Frozen Redis pool identity/index; PostgreSQL MV keyset cursor when Redis is unavailable |
 
 ## Recommendations
 
@@ -213,9 +246,34 @@ The API, rather than the frontend, fills the pool in this order:
 3. Public memes using the same template.
 4. Public-popular memes from `public_meme_trends_mv`.
 
-Each tier excludes the source and IDs already selected by an earlier tier. PostgreSQL applies the final public, NSFW, and content filters even to Qdrant candidates. Fallback tiers order IDs deterministically by their tier signal, popularity, creation time, and meme ID; they query counts plus only the row-ID ranges needed to determine the requested slice, rather than loading the catalog into ORM objects and sorting it in Python. The service then hydrates at most the requested result page.
+Each tier excludes the source and IDs already selected by an earlier tier. PostgreSQL applies the final public, NSFW, and content filters even to Qdrant candidates. Fallback tiers order IDs deterministically by their tier signal, popularity, creation time, and meme ID. PostgreSQL returns no more than the remaining slots in the 200-item lightweight reference pool; the service scores that full bounded pool, slices it, and hydrates at most the requested result page.
 
-Every page carries the source meme ID, source algorithm and reason, algorithm version, score components, request/impression IDs, and global rank so appended cards remain attributable. Missing embeddings, unavailable or failed Qdrant, filtered-out semantic candidates, and partially filled semantic pools all degrade through the same API-owned tiers.
+Candidate generation remains source-meme-led. `personalized_v2` applies this
+light rerank to the complete bounded pool, including fallback tiers:
+
+```text
+0.75 similarity + 0.10 taste + 0.05 quality + 0.05 popularity + 0.05 freshness
+```
+
+Similarity remains the dominant contract. Only Qdrant candidates receive a
+non-zero calibrated `similarity` component. Tag-overlap, same-template, and
+public-popular candidates use zero for that component rather than presenting a
+tier signal as vector similarity; their deterministic source scores govern
+admission, while taste, quality, popularity, and freshness rerank the complete
+pool. Stable pre-rerank pool position breaks equal-score ties. The endpoint
+keeps its bounded offset URLs, and a profile/index refresh may still move the
+best-effort pool between requests.
+
+Every page carries a server-issued attribution token binding source meme,
+algorithm/profile versions, request/impression identity, score components,
+server-authored source algorithm, and global rank so appended cards remain
+attributable. Its typed candidate-source contribution distinguishes
+`visual_similarity`, `tag_overlap`, `same_template`, and `public_popular` and
+preserves the source-native rank and score.
+Expanded fields remain compatibility-only and untrusted when sent back by a
+client. Missing embeddings, unavailable or failed Qdrant, filtered-out semantic
+candidates, and partially filled semantic pools all degrade through the same
+API-owned tiers.
 
 ### MV-Backed Public Popular Paging
 
@@ -225,21 +283,164 @@ The materialized view is refreshed on the scheduler's default five-minute cadenc
 
 ### Personalized Feed
 
-Recommendation service builds a short-term user preference vector/candidate request from recent positive events:
+`services/recommendations/` owns `personalized_v2` signals, exact state,
+profiles, candidate fusion, item features, ranking, diversity, attribution, and
+feed sessions. `MemeSearchService` remains responsible for index search and
+bounded PostgreSQL hydration. PostgreSQL is authoritative for users,
+interactions, access, cooldowns, features, and profile vectors; Qdrant remains a
+candidate index and Redis a disposable presentation cache.
 
-- strong positives: favorite/like, save, pin, download, Telegram send/chosen inline result
-- medium positives: detail view, repeated view, collection add
-- weak/neutral signals: impression without click, later used for evaluation/reranking
+The shared signal policy is current Favorite/Save/Pin `5`,
+download/Send/Share/inline chosen or sent `4`, engaged view `2`, detail
+view/click `1`, and impression `0`.
+Removal cancels durable preference state and never becomes a negative. The
+online representations are:
 
-The service calls the shared `MemeSearchService.recommendation_candidates(...)` path, which returns the generic `MemeSearchPageRead` discovery DTO rather than a home-feed-specific shape. It loads recent positive meme embeddings from PostgreSQL `EmbeddingCache`, computes a weighted centroid/preference vector, and asks the existing Qdrant user-search adapter for a bounded candidate pool. Qdrant/index payload filters are a conservative prefilter only; PostgreSQL access, collection scope, and NSFW filters remain the final authority before returning candidates.
+- short-term: 24-hour half-life over at most seven days of item signals,
+  including current Favorite/Save/Pin rows added inside that window;
+- current intent: successful search vectors at weight `3`, combined in Redis
+  with a 30-minute half-life and two-hour TTL, without raw query text;
+- long-term: durable preferences plus high-intent history at a 90-day half-life
+  and no history cutoff, materializing the top 500 meme signals and vectors in
+  PostgreSQL.
 
-Positive signal weights, positive-signal lookback, recent-impression lookback, positive row cap, and Qdrant candidate cap are `Settings` fields. They are tunable algorithm inputs for iteration, not final product truth. Current conservative defaults treat likes/pins as strongest, saves/favorites as strong, Telegram sends/inline selections as medium-strong, collection adds/downloads as medium, and views/detail clicks as weaker positives.
+At 20 distinct strong positives, deterministic cosine farthest-first
+initialization and up to five spherical-centroid iterations produce two to four
+clusters. Clusters under three items are discarded and a global centroid is
+always retained. Users below the threshold use recent direct positives plus one
+global long-term centroid.
 
-Data-volume and performance assumptions for this stage are intentionally bounded: load only recent/capped positive analytics and durable rows, load only primary image embeddings for those source memes, request only a capped Qdrant candidate pool, then perform final DB filtering/deduplication in PostgreSQL. Source positive memes and recent impression memes are excluded where practical. Cold start, missing embeddings, missing Qdrant client, Qdrant failure, or an empty DB-filtered candidate set falls back to trending/popular candidates with attribution reason metadata.
+Candidate source budgets are 120 short-term, 120 current-intent, up to 240
+across long-term global/cluster queries, 120 recent multi-positive
+`best_score`, 80 MV-trending, and 40 exploration. The deduplicated union is
+capped at 600. Weighted reciprocal-rank fusion uses constant `60`; all cluster
+rankings share one normalization group so users with more clusters do not
+receive more total long-term influence. At most 200 candidates continue to
+diversity reranking and the frozen pool; PostgreSQL feature/embedding loading
+and formula scoring remain bounded by the preceding union of at most 600.
 
-Personalized recommendations are currently used on the home page feed. Optional
-query-independent blends for bot or Mini App discovery remain future work; the
-public Similar endpoint does not add a personalized tier.
+Persisted taste vectors are eligible only when both their embedding model and
+profile base version match current configuration. Home, Search, and Similar
+ignore stale rows; the bounded profile scheduler discovers and replaces them.
+
+The configurable starting score is:
+
+```text
+0.40 personal_fit
++ 0.15 current_intent
++ 0.10 fused_candidate_score
++ 0.15 quality_prior
++ 0.10 freshness
++ 0.05 popularity_alignment
++ 0.05 exploration_bonus
+```
+
+`quality_prior = 0.40 source_quality + 0.30 technical_quality + 0.30
+platform_response`. Item features come from
+`public_meme_recommendation_features_mv`; missing values are neutral `0.5` with
+coverage flags. Source metric coverage requires a successful engagement
+snapshot with a measured view count, and technical-quality coverage requires a
+successful primary-file transcode journal or attempt; non-null storage defaults
+do not count as measurements. Percentile ties retain equal quantiles. Freshness
+uses latest live-source publication with a 45-day half-life and falls back to
+meme creation. Popularity alignment compares the item quantile with the
+viewer's median strong-positive quantile and remains neutral until five
+qualifying positives exist.
+
+Greedy diversity reranks the top 100. It penalizes similarity to the last ten
+selected items, repeated source within five, and repeated template within
+three. Source and template are each capped at two per 20 results, with
+deterministic relaxation only to fill the page. This is presentation diversity,
+not a substitute for exact/near-duplicate merging. One eligible exploration
+position is reserved per 20 results: it must be recent public content, have
+source quality at least `0.55`, technical quality at least `0.50`, popularity
+below quantile `0.80`, and pass every normal authorization, NSFW, moderation,
+cooldown, and diversity check.
+
+`user_meme_recommendation_state` enforces exact cooldowns independently of
+bounded event reads: 72 hours after the latest impression and seven days after
+the latest strong positive. The service does not infer dislike from an ignored
+impression. Home output is public-only, although any accessible private/shared
+or NSFW interaction may shape taste; current output NSFW and moderation policy
+is rechecked in PostgreSQL.
+
+The first Home request creates no more than a 200-item ordered Redis pool with a
+two-hour TTL. Before a cursorless serving-eligible request spends profile or
+Qdrant work, a Redis read preflight runs under
+`RECOMMENDATION_REDIS_TIMEOUT_SECONDS` (default `0.5`).
+`RecommendationFeedPageRead` returns `items`, request/feed-session identity,
+`next_cursor`, `expires_at`, and `has_more`. The signed opaque cursor contains
+`kind`, `version`, `mode`, keyed `viewer_key` and `filter_key` bindings,
+`algorithm_version`, `next_index`, a compact exact set of already-returned pool
+meme IDs, and `iat`/`exp`. Pool mode additionally carries `pool_id`;
+PostgreSQL-trending mode instead carries `last_score` and `last_meme_id` for its
+keyset. The returned-ID set is bounded by the 200-item pool and the complete
+cursor by 8 KiB. The filter binding covers the active content filters,
+language, and NSFW policy. Every page rechecks public status,
+moderation, NSFW, and exact cooldown state, so an action after page one cannot
+leak or skip arbitrary uncached items. Freeze retains at most
+`RECOMMENDATION_FEED_POOL_MAX_PER_VIEWER` pools per viewer (default `4`) in a
+creation-time sorted index and atomically deletes the oldest pool bodies beyond
+that cap. An expired, missing, or retention-evicted pool returns `410
+feed_cursor_expired`. Legacy `offset` is accepted for one compatibility release
+and is mutually exclusive with `cursor`.
+
+Session-storage Home restoration is not trusted hydration.
+`POST /api/v1/memes/home-feed/reauthorize` accepts at most 200 saved meme/token
+pairs, verifies each token's expiry, viewer, meme, and `web_home` surface, then
+rehydrates only the subset that still passes current PostgreSQL public,
+moderation, NSFW, and filter checks. The browser waits for that result before
+installing restored cards; invalid/expired state is discarded.
+
+If the Redis preflight, pool freeze, or continuation read is unavailable, Home
+reads `public_meme_trends_mv` through a signed
+PostgreSQL `(trending_score, meme_id)` keyset cursor and hydrates only the
+requested page with algorithm version `public_trending_keyset_v1` and a typed
+`trending` candidate-source contribution. A failed pool continuation transfers
+its signed exact returned-ID set and next rank into the keyset cursor, avoiding
+replays even before client impression delivery completes. With Redis available, Qdrant failure
+or a cold-start profile instead omits unavailable vector sources and continues
+through the normal bounded fusion/ranking/pool path using PostgreSQL trending
+and exploration candidates; it does not discard those candidates or force a
+keyset session. Neither path loads the catalog into Python. Guest-to-full merge
+takes minimum first-seen, maximum event timestamps, and summed impression
+count, then invalidates the target profile and both viewer feed-pool namespaces.
+
+Empty Telegram inline queries put currently accessible explicit pins first,
+including private/shared pins, then consume public Home ranking. Both tiers
+apply the linked viewer's NSFW policy and Telegram sendability filtering. The
+initial request starts the Home continuation session even when pins fill the
+page, and a compact Redis-backed next-offset cursor resumes the same pin/Home
+session. Served rows carry trusted algorithm/profile/candidate-source
+dimensions; a compact
+impression identity in Telegram result/callback IDs joins chosen/sent/send and
+library-add events back to the matching served row. Non-empty inline requests
+remain text-query-led.
+
+Rollout is a three-part serving gate. Defaults are
+`RECOMMENDATION_ENABLED=false`, `RECOMMENDATION_SHADOW_MODE=true`, and
+`RECOMMENDATION_CANARY_PERCENT=0`; serving requires enabled, non-shadow, and a
+stable-viewer bucket inside a nonzero canary. Enabled shadow work is cancelled
+after `RECOMMENDATION_SHADOW_TIMEOUT_SECONDS` (default `0.25`) and returns the
+global MV-backed page regardless of shadow success. Search and Similar retain
+their global quality/popularity terms but zero profile taste outside the same
+serving gate.
+
+Cursor verification/continuation precedes that gate. A valid frozen pool (or
+PostgreSQL trending cursor) whose algorithm binding still matches can continue
+until expiry even after enabled/shadow/canary settings change. This preserves
+session ordering; a gate reduction prevents new personalized pools but does not
+revoke existing ones. Immediate revocation requires a separate, explicitly
+authorized pool invalidation or versioned rollout.
+
+This phase retains raw interaction history indefinitely and adds no inferred
+negative, “Not interested,” personalization reset/opt-out, partition/archive or
+deletion policy, collaborative filtering, matrix factorization, BPR/LightFM, or
+learned ranker.
+
+The repository contains this target contract, but schema/code presence is not
+evidence that the live-beta migration, Qdrant payload backfill, index
+provisioning, shadow run, canary, or feature activation has occurred.
 
 ### Trending
 
@@ -247,16 +448,47 @@ Uses materialized-view backed public trend rankings derived from source engageme
 
 ## Interaction Attribution
 
-Search/recommendation service should return enough metadata for event tracking:
+Search and recommendation results include a signed server-issued
+`attribution_token`, not trusted client-authored ranking facts. Claims bind the
+viewer, meme, request/impression identity, surface, global rank, typed candidate
+source contributions, algorithm/profile versions, score, related-source
+identity, and expiry. They omit raw query text and collection identifiers. The
+backend verifies signature, expiry, viewer, meme, and current access before an
+event or mutation can use the attribution. A token issued to an anonymous public
+reader may be accepted only by a guest-attributed event or write path to bridge
+automatic guest bootstrap; tokens bound to any concrete viewer remain
+non-transferable.
 
-- request id
-- rank
-- source algorithm/reason
-- source meme id for related sections
-- score and score components
-- query/filter/scope/collection context
+Frontend and bot clients treat the token as opaque and forward it with
+impressions, engaged views, detail clicks, sends, downloads, saves, pins, and
+related mutations. Legacy nested attribution is accepted only during the
+backend-first compatibility window, marked untrusted, and must not override a
+valid token.
 
-Frontend and bot presentation layers must pass this metadata back when recording impressions, views, detail clicks, sends, downloads, saves, and shares.
+## Evidence-Gated Vector Evolution
+
+The active representation remains the existing 1024-dimensional Voyage
+`voyage-multimodal-3.5` image-document vector, and Meilisearch remains the OCR
+lexical engine. There is no deployed named-vector collection, Qdrant sparse OCR
+index, or meme-level recommendation collection in this phase.
+
+A chronological offline evaluator compares the current centroid, two-profile,
+clustered, and multi-positive variants using Recall@K, NDCG@K, catalog coverage,
+source/template concentration, and intra-list diversity. Add `ocr_dense` only
+if it improves Recall@50 by at least 5% overall or 10% for text-heavy memes,
+adds no more than 50 ms to p95 retrieval, and leaves projected Qdrant peak memory
+below 70% of the 4 GB limit. If memory fails that gate, evaluate
+512-dimensional Matryoshka vectors or scalar quantization first.
+
+Before another item embedding is introduced, normalize storage into immutable
+embedding artifacts plus file-to-artifact associations so identical OCR text is
+reusable. A future migration then introduces a stable read alias, creates a
+versioned named-vector collection and payload indexes, dual-writes new sync
+events, backfills from PostgreSQL in bounded batches, verifies READY-primary
+coverage/counts/dimensions/filters and sampled ranking parity, atomically
+switches the alias, and retains the old collection for rollback. These are
+Phase-3 steps, not a description of the repository's current collection or a
+claim that any production alias/backfill has run.
 
 ## Russian Query Translation
 

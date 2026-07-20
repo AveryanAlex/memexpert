@@ -64,6 +64,10 @@ from memexpert.api.dependencies.pipeline import (
     require_pipeline_operator_token,
     to_pipeline_http_error,
 )
+from memexpert.api.dependencies.recommendation import (
+    RecommendationServiceDep,
+    get_recommendation_service,
+)
 
 __all__ = [
     "AUTH_ERROR_RESPONSES",
@@ -97,6 +101,7 @@ __all__ = [
     "PipelineSyncStatusServiceDep",
     "ProviderAuthServiceDep",
     "PublicTrendsServiceDep",
+    "RecommendationServiceDep",
     "SeoCatalogServiceDep",
     "auth_http_exception_handler",
     "forbid_full_account_caller",
@@ -120,6 +125,7 @@ __all__ = [
     "get_or_bootstrap_guest_user",
     "get_provider_auth_service",
     "get_public_trends_service",
+    "get_recommendation_service",
     "get_seo_catalog_service",
     "pipeline_http_exception_handler",
     "require_pipeline_operator_token",

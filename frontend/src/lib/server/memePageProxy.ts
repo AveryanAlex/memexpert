@@ -4,6 +4,8 @@ import { DEFAULT_PAGE_SIZE, ApiError, fetchHomeFeed, fetchMemePage, type ApiFetc
 import { parseSearchParams } from '$lib/searchParams';
 import { forwardBackendAccessCookie } from './backend';
 
+const PRIVATE_JSON_HEADERS = { 'cache-control': 'private, no-store' } as const;
+
 interface MemePageProxyRequest {
   fetch: ApiFetch;
   request: Request;
@@ -21,36 +23,45 @@ export async function proxyMemePage({ fetch, request, cookies, apiBaseUrl, mode 
   }
 
   const filters = parseSearchParams(params);
+  const cursor = mode === 'home-feed' ? params.get('cursor')?.trim() || null : null;
+
+  if (cursor && params.has('offset')) {
+    return json(
+      { detail: 'cursor and offset are mutually exclusive.' },
+      { status: 400, headers: PRIVATE_JSON_HEADERS }
+    );
+  }
 
   try {
     const commonRequest = {
-      fetch,
+      fetch: (input: RequestInfo | URL, init?: RequestInit) => fetch(input, { ...init, signal: request.signal }),
       baseUrl: apiBaseUrl,
       tags: filters.tags,
       includeNsfw: params.has('include_nsfw') ? filters.includeNsfw : undefined,
       mediaType: filters.mediaType,
       language: filters.language,
       limit: readPositiveInt(params.get('limit'), DEFAULT_PAGE_SIZE),
-      offset: filters.offset,
       cookieHeader: request.headers.get('cookie') ?? undefined,
       onResponse: (response: Response) => {
         forwardBackendAccessCookie(response, cookies);
       }
     };
     const page = mode === 'home-feed'
-      ? await fetchHomeFeed(commonRequest)
+      ? await fetchHomeFeed({ ...commonRequest, offset: cursor ? undefined : filters.offset, cursor })
       : await fetchMemePage({
           ...commonRequest,
+          offset: filters.offset,
           query,
           scope: filters.scope,
           collectionIds: filters.collectionIds
         });
 
-    return json(page);
+    return json(page, { headers: PRIVATE_JSON_HEADERS });
   } catch (error) {
     const status = error instanceof ApiError ? error.status : 502;
     const detail = error instanceof Error ? error.message : 'Could not reach the meme catalog API.';
-    return json({ detail }, { status });
+    const code = error instanceof ApiError ? error.code : undefined;
+    return json({ ...(code ? { code } : {}), detail }, { status, headers: PRIVATE_JSON_HEADERS });
   }
 }
 

@@ -151,8 +151,9 @@ anchored to the Telegram post date (`+1h`, `+3h`, `+12h`, `+1d`, `+3d`, `+7d`,
 ### Public Trend Read Models
 
 `public_meme_trends_mv`, `public_tag_trends_mv`, `public_template_trends_mv`,
-`public_tag_trend_points_mv`, and `public_template_trend_points_mv` are
-derived-cached read models. They are rebuildable from
+`public_tag_trend_points_mv`, `public_template_trend_points_mv`, and
+`public_meme_recommendation_features_mv` are derived-cached read models. They
+are rebuildable from
 `meme_source_engagement_snapshots`, `analytics_events`, and current
 meme/template metadata. Current source totals use the latest successful
 snapshot per source post; historical/window source metrics use positive
@@ -162,6 +163,29 @@ the inline `meme_send` compatibility event is counted once rather than again as
 `inline_sent`.
 
 The public DTO names remain stable (`latest_source_views`, `latest_source_reactions`, `latest_source_reposts`, `latest_popularity_score`), but these values are derived read-model metrics. There is no canonical `memes.popularity_score` column and no `meme_popularity_snapshots` table.
+
+`public_meme_recommendation_features_mv` contains one row per currently public
+meme with a primary file. It records the latest live-source publication
+time; all live source-channel IDs; a deterministic representative channel;
+75th-percentile source popularity and quality quantiles; primary-file technical
+quality; Bayesian-smoothed matched high-intent response; trend and popularity
+quantiles; template ID; exposure/live-source counts; and per-feature coverage
+flags. Source percentiles are computed within channel and publication-age
+cohorts (`0–1d`, `2–7d`, `8–30d`, `31–180d`, and older). Source quality uses a
+100-view cohort prior over `(reactions + 3 × forwards + 0.5 × comments) /
+views`; platform response uses the global keyed-exposure mean across web-card
+and Telegram-inline exposure kinds as a 20-impression prior.
+Latest source publication falls back to meme creation only when provenance is
+absent. A missing derived quantile or quality input is represented as neutral
+`0.5` plus a false coverage flag, never as zero quality. A live source lacking
+a successful engagement snapshot with a measured view count still contributes
+its source metadata and any publication time, but not source-popularity or
+source-quality coverage. Equal source or trend metrics share the same
+percentile. Technical quality is covered only when a
+successful transcode journal or attempt proves the primary file's score was
+derived; the non-null `quality_score` storage default is not coverage. The view
+is a ranking projection, not an authorization source; response hydration still
+rechecks the canonical meme and primary file.
 
 ### Public Meme Insights Read Model
 
@@ -300,6 +324,72 @@ References **Meme**, not MemeFile. Composite PK: `(collection_id, meme_id)`. Als
 
 Up to 20 per user. Composite PK: `(user_id, meme_id)`. `position` (1–20).
 
+### Recommendation Serving State and Profiles
+
+`UserMemeRecommendationState` is the exact per-viewer, per-meme projection used
+for cooldown correctness. Its composite key is `(user_id, meme_id)` and its
+fields are `first_seen_at`, `latest_impression_at`,
+`latest_engaged_view_at`, `latest_strong_action_at`, and nonnegative
+`impression_count`. It is updated from idempotent events and current durable
+collection/pin state. Serving hard-excludes the latest impression for 72 hours
+and the latest strong action for seven days; this lookup is not bounded to the
+most recent N event rows, so an older item cannot escape because a user has more
+than 80 impressions. Ignored impressions are not negative preferences.
+
+During guest-to-full merge, colliding state rows take the minimum
+`first_seen_at`, maximum of each latest-event timestamp, and the sum of
+`impression_count`. The source row is removed only as part of the account merge
+transaction. Both viewer feed-pool namespaces are invalidated, and the target
+`UserRecommendationProfileStatus` is marked dirty.
+
+`UserRecommendationProfileStatus` has one row per user with recommendation
+history. `dirty_since` makes rebuild work claimable; `last_rebuilt_at` and
+`event_watermark` make lag and successful convergence observable. A persisted
+profile whose embedding model or profile base version differs from current
+configuration is also bounded rebuild work even when this ledger is clean;
+serving ignores that stale vector until the rebuild converges.
+
+`UserRecommendationProfile` stores PostgreSQL-authoritative long-term vectors,
+never Qdrant user vectors. Slot `0` is the global centroid and slots `1–4` are
+deterministic taste clusters. Each row records the embedding model and profile
+versions, signal count, total weight, event watermark, encoded vector bytes,
+and generation time. Clusters are materialized only from at least 20 distinct
+strong-positive memes; deterministic cosine farthest-first initialization and
+up to five spherical-centroid iterations produce two to four clusters, dropping
+clusters below three items while retaining the global centroid.
+
+`UserRecommendationProfileSignal` stores at most the top 500 decayed long-term
+signals for one user, keyed by `(user_id, meme_id)`, with weight,
+`last_signal_at`, and strong-positive status. Current Favorite, Save, or Pin
+state contributes weight `5` only while it exists. Download, Send/Share, or
+inline chosen/sent contributes `4` to both serving horizons. Send-family rows
+with the same meme/impression identity collapse to one logical signal before
+decay. Engaged view `2` and detail
+view/click `1` contribute only to the seven-day short-term read; impression is
+`0`. A current durable preference also enters the short-term read when its
+add/pin timestamp is inside that seven-day window. Removal cancels a durable
+contribution and is not a negative. Long-term
+high-intent events have a 90-day half-life without a retention cutoff; the
+online short-term read has a 24-hour half-life. The separate current-intent
+vector lives only in Redis, has a 30-minute half-life and two-hour TTL, and never
+stores raw query text.
+
+`RecommendationDailyAggregate` is a bounded dashboard rollup uniquely keyed by
+date, surface, algorithm version, profile version, and candidate source. It
+stores impression, strong-action, attributed-send, result, exploration, and
+impression-level fallback counts plus a bounded JSON metrics bag. The bag holds
+strong/send rates, cooldown-repeat count/rate, fallback rate, catalog/long-tail
+coverage, source/template concentration, exploration share/conversion, and
+unique-meme count. Repeated contributions with the same typed source on one
+keyed impression are deduplicated. `cache_expiry_count` is a reserved column
+written as zero because cursor expiry exists only in request-path structured
+logs; no synthetic analytics event is created. These rows do not replace raw
+events as the audit or offline-evaluation source.
+
+These tables and the migration that defines them are a repository contract,
+not proof that revision `0043` has run or that profiles/features have been
+backfilled on the live beta.
+
 ### TelegramFileIdCache
 
 References **MemeFile**. Key fields: `file_id_tg` (PK), `meme_file_id`, `media_format` (photo/animation), `file_unique_id`.
@@ -312,7 +402,9 @@ Key fields: `input_hash` (SHA256 of input, unique), `input_type` (image/text), `
 
 Design notes:
 - Stored as BYTEA, not a vector type — PG is not used for vector search.
-- `model_version` enables future model upgrades: recompute with new model, keep both, switch Qdrant atomically.
+- `model_version` enables future versioned recomputation. An atomic Qdrant alias
+  switch requires the evidence-gated Phase-3 collection/dual-write migration;
+  it is not part of the current single-collection architecture.
 - Text query embeddings act as a query cache — intentionally no eviction, as the table size is bounded by unique query volume.
 
 ### SearchSynonymCatalog and SearchSynonymRevision
@@ -351,6 +443,25 @@ Deferred/reserved. If present, it is a schema placeholder for a future account d
 
 General-purpose product analytics event stream. Key fields: `user_id`,
 `event_type`, `payload` (JSON — event-specific data), `occurred_at`.
+
+For `meme_impression`, `meme_engaged_view`, and `meme_detail_click`, the client
+generates a UUIDv7 that is used directly as `analytics_events.id`. A repeated
+write with the same ID and same canonical content succeeds as an idempotent
+no-op; reuse for different content is a conflict. The interaction batch API
+accepts at most 50 events. The browser further caps serialized batches at 48
+KiB, starts bounded page-hide keepalive work even when a normal request is in
+flight, isolates permanent 4xx poison events during ordinary delivery, and
+drops pending viewer-bound tokens when authentication changes. It strips
+optional properties from a single oversized event before discarding it only if
+the required identity/token fields still exceed the byte limit.
+The writer also collapses `meme_impression` and `meme_engaged_view` to one row
+per viewer/meme/impression/stage even if a client mistakenly regenerates the
+UUID. Client timestamps more than five minutes ahead of server time are
+rejected so cooldown and profile watermarks cannot be pushed arbitrarily into
+the future.
+`meme_engaged_view` is emitted once per placement only after at least 50%
+visibility for three accumulated foreground seconds; autoplay by itself does
+not qualify.
 
 Public per-meme analytics accepts both strict `payload.refs.meme_id` and legacy
 root `payload.meme_id` references. PostgreSQL expression indexes on each shape,
@@ -429,9 +540,12 @@ Key fields:
 
 - `user_id` (nullable only for truly anonymous telemetry; normal web guests have users)
 - `meme_id`
-- `event_type` keeps legacy values (`impression`, `view`, `click`, `favorite`, `save`, `share`, `meme_view`, `meme_send`, `meme_like`, `meme_save`, `search_query`, `inline_query`) and adds canonical meme-scoped/foundation values (`meme_impression`, `meme_detail_click`, `meme_download`, `meme_pin`, `meme_share`, `meme_report`, `inline_served`, `inline_chosen`, `inline_sent`, `collection_action`, `auth_event`, `account_merge`, `miniapp_open`, `channel_suggest`, `page_view`)
+- `event_type` keeps legacy values (`impression`, `view`, `click`, `favorite`, `save`, `share`, `meme_view`, `meme_send`, `meme_like`, `meme_save`, `search_query`, `inline_query`) and adds canonical meme-scoped/foundation values (`meme_impression`, `meme_engaged_view`, `meme_detail_click`, `meme_download`, `meme_pin`, `meme_share`, `meme_report`, `inline_served`, `inline_chosen`, `inline_sent`, `collection_action`, `auth_event`, `account_merge`, `miniapp_open`, `channel_suggest`, `page_view`)
 - `surface` (`web_home`, `web_search`, `web_related`, `web_collection`, `telegram_inline`, `telegram_pm`, `miniapp`)
-- `source_algorithm` (`search`, `similarity`, `personalized`, `tag_related`, `trending`, `motd`, `collection`, `fallback`)
+- `source_algorithm` is a bounded server-authored string family rather than a
+  database enum; current values include `hybrid_search`, `qdrant_similarity`,
+  `personalized_recommendations`, `explicit_pins`, `public_trends_mv_*`, `motd`,
+  and `fallback_*`
 - `source_meme_id` for related/similar flows
 - `collection_id`, `query`, `rank`, `score`, `score_components`, `reason`
 - `request_id` / `impression_id`
@@ -446,6 +560,12 @@ Indexes: `(occurred_at)`, `(user_id, occurred_at)`, and
 `(event_type, occurred_at)`. The standalone timestamp index bounds range scans;
 payload grouping and query-to-meme attribution remain application-side until a
 dedicated reporting/rollup model replaces raw-event materialization.
+
+Raw interaction events are retained indefinitely in PostgreSQL. This design
+does not add partitioning, archival, deletion, personalization reset, opt-out,
+inferred dislikes, or a “Not interested” state. Current durable preference rows,
+not historical add events, determine whether Favorite/Save/Pin contributions
+remain active.
 
 ### InlineUsageEvent
 

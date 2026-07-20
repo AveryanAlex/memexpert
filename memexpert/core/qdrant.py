@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import math
 import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, cast
@@ -19,8 +21,28 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
     from datetime import datetime
 
+    from qdrant_client.http.models import Filter as QdrantFilter
+
     from memexpert.core.search_index_prefilter import SearchIndexPrefilter
     from memexpert.ingest.policy import ApproximateMergeScope
+
+
+_QDRANT_PAYLOAD_INDEX_SPECS: tuple[tuple[str, str], ...] = (
+    ("search_index_algorithm_version", "keyword"),
+    ("is_public", "bool"),
+    ("is_primary_file", "bool"),
+    ("uploader_user_ids", "keyword"),
+    ("media_type", "keyword"),
+    ("language", "keyword"),
+    ("is_nsfw", "bool"),
+    ("tags", "keyword"),
+    ("collection_ids", "keyword"),
+    ("collection_owner_user_ids", "keyword"),
+    ("collection_member_user_ids", "keyword"),
+)
+
+logger = logging.getLogger(__name__)
+_async_qdrant_client: Any | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +64,55 @@ class QdrantUserSearchMatch:
 
 
 @dataclass(frozen=True, slots=True)
+class QdrantNearestSourceQuery:
+    """One named nearest-neighbor source in a batched recommendation lookup."""
+
+    source: str
+    vector: tuple[float, ...]
+    limit: int
+
+    def __post_init__(self) -> None:
+        _validate_recommendation_source(self.source)
+        if not self.vector:
+            raise ValueError("Qdrant nearest-source vectors must not be empty.")
+        if self.limit < 1:
+            raise ValueError("Qdrant nearest-source limits must be positive.")
+
+
+@dataclass(frozen=True, slots=True)
+class QdrantRecommendSourceQuery:
+    """One named best-score multi-positive source in a recommendation batch."""
+
+    source: str
+    positive_meme_file_ids: tuple[uuid.UUID, ...]
+    limit: int
+
+    def __post_init__(self) -> None:
+        _validate_recommendation_source(self.source)
+        if not self.positive_meme_file_ids:
+            raise ValueError("Qdrant best-score recommendation sources require positive point IDs.")
+        if self.limit < 1:
+            raise ValueError("Qdrant best-score recommendation limits must be positive.")
+
+
+@dataclass(frozen=True, slots=True)
+class QdrantRecommendationMatch:
+    """One candidate returned for a named recommendation source."""
+
+    meme_file_id: uuid.UUID
+    meme_id: uuid.UUID
+    candidate_score: float
+
+
+@dataclass(frozen=True, slots=True)
+class QdrantRecommendationSourceResult:
+    """Candidates for one input source, preserving batch request order."""
+
+    source: str
+    matches: tuple[QdrantRecommendationMatch, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class QdrantSyncPayload:
     """Durable payload advertised to Qdrant as part of the per-file sync upsert.
 
@@ -55,6 +126,7 @@ class QdrantSyncPayload:
     meme_file_id: uuid.UUID
     search_index_algorithm_version: str
     is_public: bool
+    is_primary_file: bool
     media_type: str
     language: str
     is_nsfw: bool
@@ -157,6 +229,19 @@ class QdrantUserSearchClientProtocol(Protocol):
     ) -> tuple[QdrantUserSearchMatch, ...]: ...
 
 
+class QdrantRecommendationClientProtocol(Protocol):
+    """Batched multi-source recommendation retrieval boundary."""
+
+    async def query_recommendation_sources(
+        self,
+        *,
+        nearest_queries: Sequence[QdrantNearestSourceQuery] = (),
+        recommend_queries: Sequence[QdrantRecommendSourceQuery] = (),
+        prefilter: SearchIndexPrefilter | None = None,
+        excluded_meme_file_ids: Sequence[uuid.UUID] = (),
+    ) -> tuple[QdrantRecommendationSourceResult, ...]: ...
+
+
 class QdrantSyncClientProtocol(Protocol):
     """Typed Qdrant sync adapter surface used by the runtime and tests.
 
@@ -187,13 +272,44 @@ class _LazyQdrantClient:
 
     async def _ensure_client(self) -> Any:
         if self._client is None:
-            from qdrant_client import AsyncQdrantClient
-
-            self._client = AsyncQdrantClient(
-                url=self._settings.qdrant_url,
-                timeout=max(1, int(self._settings.pipeline_qdrant_timeout_seconds)),
-            )
+            self._client = get_async_qdrant_client(self._settings)
         return self._client
+
+
+def get_async_qdrant_client(settings: Settings | None = None) -> Any:
+    """Return the process-wide lazy Qdrant SDK client.
+
+    API and Telegram service factories build lightweight adapters per request
+    or update. Sharing the underlying SDK client keeps those wrappers from
+    creating an unbounded number of HTTP transport pools.
+    """
+
+    global _async_qdrant_client
+    if _async_qdrant_client is None:
+        from qdrant_client import AsyncQdrantClient
+
+        resolved_settings = settings or get_settings()
+        _async_qdrant_client = AsyncQdrantClient(
+            url=resolved_settings.qdrant_url,
+            timeout=max(1, int(resolved_settings.pipeline_qdrant_timeout_seconds)),
+        )
+    return _async_qdrant_client
+
+
+def is_async_qdrant_initialized() -> bool:
+    """Expose whether the shared SDK client has opened a transport pool."""
+
+    return _async_qdrant_client is not None
+
+
+async def reset_async_qdrant_state() -> None:
+    """Close and clear the shared Qdrant SDK client."""
+
+    global _async_qdrant_client
+    cached_client = _async_qdrant_client
+    _async_qdrant_client = None
+    if cached_client is not None:
+        await cached_client.close()
 
 
 class PipelineQdrantClient(_LazyQdrantClient):
@@ -269,6 +385,43 @@ def _build_approximate_dedupe_filter(scope: ApproximateMergeScope | None) -> obj
         ]
     )
 
+
+def _build_recommendation_filter(
+    *,
+    prefilter: SearchIndexPrefilter | None,
+    excluded_meme_file_ids: Sequence[uuid.UUID],
+) -> QdrantFilter:
+    """Build the recommendation-only primary-file and source-exclusion filter."""
+
+    from qdrant_client.http.models import FieldCondition, Filter, HasIdCondition, MatchValue
+
+    must_conditions: list[Any] = []
+    if prefilter is not None:
+        base_filter = prefilter.to_qdrant_filter()
+        if base_filter is not None:
+            must_conditions.append(base_filter)
+    must_conditions.append(
+        FieldCondition(
+            key="is_primary_file",
+            match=MatchValue(value=True),
+        )
+    )
+    must_not_conditions: list[Any] = []
+    if excluded_meme_file_ids:
+        must_not_conditions.append(
+            HasIdCondition(has_id=[str(meme_file_id) for meme_file_id in excluded_meme_file_ids])
+        )
+    return Filter(
+        must=must_conditions,
+        must_not=must_not_conditions or None,
+    )
+
+
+def _validate_recommendation_source(source: str) -> None:
+    if not source.strip():
+        raise ValueError("Qdrant recommendation source names must not be blank.")
+
+
 class PipelineQdrantUserSearchClient(_LazyQdrantClient):
     """Lazy Qdrant adapter for user-facing semantic meme search.
 
@@ -309,16 +462,165 @@ class PipelineQdrantUserSearchClient(_LazyQdrantClient):
 
         return _parse_qdrant_user_search_matches(raw_matches)
 
+
+class PipelineQdrantRecommendationClient(_LazyQdrantClient):
+    """Batched nearest-neighbor and best-score recommendation adapter.
+
+    This boundary is intentionally separate from general semantic search:
+    recommendation retrieval always restricts candidates to canonical primary
+    files, while search and ingestion deduplication may still inspect every
+    indexed file. PostgreSQL remains the final visibility and safety authority.
+    """
+
+    async def query_recommendation_sources(
+        self,
+        *,
+        nearest_queries: Sequence[QdrantNearestSourceQuery] = (),
+        recommend_queries: Sequence[QdrantRecommendSourceQuery] = (),
+        prefilter: SearchIndexPrefilter | None = None,
+        excluded_meme_file_ids: Sequence[uuid.UUID] = (),
+    ) -> tuple[QdrantRecommendationSourceResult, ...]:
+        source_names = tuple(query.source for query in (*nearest_queries, *recommend_queries))
+        if not source_names:
+            return ()
+        if len(source_names) != len(set(source_names)):
+            raise ValueError("Qdrant recommendation source names must be unique within a batch.")
+
+        from qdrant_client.http.models import (
+            QueryRequest,
+            RecommendInput,
+            RecommendQuery,
+            RecommendStrategy,
+        )
+
+        query_filter = _build_recommendation_filter(
+            prefilter=prefilter,
+            excluded_meme_file_ids=tuple(
+                dict.fromkeys(
+                    (
+                        *excluded_meme_file_ids,
+                        *(meme_file_id for query in recommend_queries for meme_file_id in query.positive_meme_file_ids),
+                    )
+                )
+            ),
+        )
+        nearest_requests = [
+            QueryRequest(
+                query=list(query.vector),
+                filter=query_filter,
+                limit=query.limit,
+                with_payload=True,
+                with_vector=False,
+            )
+            for query in nearest_queries
+        ]
+        recommend_requests = [
+            QueryRequest(
+                query=RecommendQuery(
+                    recommend=RecommendInput(
+                        positive=[str(meme_file_id) for meme_file_id in query.positive_meme_file_ids],
+                        strategy=RecommendStrategy.BEST_SCORE,
+                    )
+                ),
+                filter=query_filter,
+                limit=query.limit,
+                with_payload=True,
+                with_vector=False,
+            )
+            for query in recommend_queries
+        ]
+
+        client = await self._ensure_client()
+        results = await _query_recommendation_batch(
+            client,
+            collection_name=self._settings.pipeline_qdrant_collection_name,
+            requests=nearest_requests,
+            source_names=tuple(query.source for query in nearest_queries),
+            operation="nearest-neighbor",
+        )
+        try:
+            results += await _query_recommendation_batch(
+                client,
+                collection_name=self._settings.pipeline_qdrant_collection_name,
+                requests=recommend_requests,
+                source_names=tuple(query.source for query in recommend_queries),
+                operation="best-score",
+            )
+        except QdrantSimilarityError as exc:
+            # RecommendQuery rejects a request when any positive point is no
+            # longer present in Qdrant. That source is best-effort and must not
+            # erase already-successful independent nearest-vector sources.
+            logger.warning(
+                "qdrant_best_score_recommendation_degraded",
+                extra={
+                    "event": "qdrant_best_score_recommendation_degraded",
+                    "exception_type": type(exc).__name__,
+                    "source_count": len(recommend_queries),
+                },
+            )
+            results += tuple(
+                QdrantRecommendationSourceResult(source=query.source, matches=())
+                for query in recommend_queries
+            )
+        return results
+
+
+async def _query_recommendation_batch(
+    client: Any,
+    *,
+    collection_name: str,
+    requests: Sequence[object],
+    source_names: Sequence[str],
+    operation: str,
+) -> tuple[QdrantRecommendationSourceResult, ...]:
+    """Run and decode one independently-failing recommendation source group."""
+
+    if not requests:
+        return ()
+    try:
+        raw_responses = await client.query_batch_points(
+            collection_name=collection_name,
+            requests=requests,
+        )
+    except (TimeoutError, httpx.TimeoutException) as exc:  # pragma: no cover - exercised via monkeypatch
+        raise QdrantTimeoutError(f"Qdrant recommendation {operation} batch timed out: {exc}") from exc
+    except Exception as exc:  # pragma: no cover - exercised via monkeypatch in tests
+        if _extract_sdk_status_code(exc) == 404:
+            return tuple(QdrantRecommendationSourceResult(source=source, matches=()) for source in source_names)
+        if _is_timeout_exception(exc):
+            raise QdrantTimeoutError(f"Qdrant recommendation {operation} batch timed out: {exc}") from exc
+        raise QdrantProviderUnavailableError(
+            f"Qdrant recommendation {operation} batch failed: {exc}",
+        ) from exc
+
+    if not isinstance(raw_responses, (list, tuple)) or len(raw_responses) != len(source_names):
+        raise QdrantMalformedResponseError(
+            f"Qdrant recommendation {operation} batch response count does not match its request count.",
+        )
+    return tuple(
+        QdrantRecommendationSourceResult(
+            source=source,
+            matches=_parse_qdrant_recommendation_matches(raw_response),
+        )
+        for source, raw_response in zip(source_names, raw_responses, strict=True)
+    )
+
+
 class PipelineQdrantSyncClient(_LazyQdrantClient):
     """Lazy Qdrant sync adapter for per-file upsert/fetch/delete operations.
 
-    Shares the same ``AsyncQdrantClient`` construction pattern as
-    :class:`PipelineQdrantClient` but keeps its own instance so the similarity
-    read path and the sync write path can be instrumented or mocked independently.
+    Shares the same process-wide ``AsyncQdrantClient`` transport as the read
+    adapters while keeping an independent adapter boundary so the similarity
+    and sync paths can be instrumented or mocked independently.
     Every SDK exception is mapped onto exactly one of the four typed
     ``QdrantSync*`` errors — callers never see raw SDK exceptions or reach past
     the adapter to httpx/transport errors.
     """
+
+    def __init__(self, *, settings: Settings | None = None) -> None:
+        super().__init__(settings=settings)
+        self._collection_ready = False
+        self._collection_ready_lock = asyncio.Lock()
 
     async def upsert_meme_point(
         self,
@@ -328,26 +630,45 @@ class PipelineQdrantSyncClient(_LazyQdrantClient):
         """Advertise one canonical meme to Qdrant so it becomes searchable."""
 
         client = await self._ensure_client()
+        await self._ensure_collection(client)
         point = _build_meme_point(payload=payload, vector=vector)
-        try:
-            _ = await client.upsert(
-                collection_name=self._settings.pipeline_qdrant_collection_name,
-                points=[point],
-                wait=True,
-            )
-        except Exception as exc:
-            if _extract_sdk_status_code(exc) == 404:
-                await self._create_collection(client)
-                try:
-                    _ = await client.upsert(
-                        collection_name=self._settings.pipeline_qdrant_collection_name,
-                        points=[point],
-                        wait=True,
-                    )
-                except Exception as retry_exc:
-                    _raise_sync_error_from(retry_exc, operation="upsert_meme_point")
+        for attempt in range(2):
+            try:
+                _ = await client.upsert(
+                    collection_name=self._settings.pipeline_qdrant_collection_name,
+                    points=[point],
+                    wait=True,
+                )
                 return
-            _raise_sync_error_from(exc, operation="upsert_meme_point")
+            except Exception as exc:
+                if attempt == 0 and _extract_sdk_status_code(exc) == 404:
+                    # A collection can be replaced operationally after this
+                    # long-lived adapter cached readiness. Re-run the complete
+                    # collection/index contract once before surfacing failure.
+                    self._collection_ready = False
+                    await self._ensure_collection(client)
+                    continue
+                _raise_sync_error_from(exc, operation="upsert_meme_point")
+
+    async def _ensure_collection(self, client: Any) -> None:
+        """Create the collection if needed and provision its payload indexes once."""
+
+        if self._collection_ready:
+            return
+        async with self._collection_ready_lock:
+            if self._collection_ready:
+                return
+            try:
+                collection_exists = await client.collection_exists(
+                    self._settings.pipeline_qdrant_collection_name,
+                )
+            except Exception as exc:
+                _raise_sync_error_from(exc, operation="collection_exists")
+                return  # pragma: no cover - _raise_sync_error_from never returns
+            if not collection_exists:
+                await self._create_collection(client)
+            await self._ensure_payload_indexes(client)
+            self._collection_ready = True
 
     async def _create_collection(self, client: Any) -> None:
         """Create the vector collection lazily for the first indexed meme."""
@@ -367,6 +688,27 @@ class PipelineQdrantSyncClient(_LazyQdrantClient):
             if _extract_sdk_status_code(exc) == 409:
                 return
             _raise_sync_error_from(exc, operation="create_collection")
+
+    async def _ensure_payload_indexes(self, client: Any) -> None:
+        """Idempotently create indexes for every Qdrant-side filter field."""
+
+        from qdrant_client.http.models import PayloadSchemaType
+
+        for field_name, schema_name in _QDRANT_PAYLOAD_INDEX_SPECS:
+            try:
+                _ = await client.create_payload_index(
+                    collection_name=self._settings.pipeline_qdrant_collection_name,
+                    field_name=field_name,
+                    field_schema=PayloadSchemaType(schema_name),
+                    wait=True,
+                )
+            except Exception as exc:
+                # Concurrent workers may both observe the collection before
+                # either finishes provisioning a field. An existing index is
+                # the desired state, so that race is safe to accept.
+                if _extract_sdk_status_code(exc) == 409:
+                    continue
+                _raise_sync_error_from(exc, operation=f"create_payload_index:{field_name}")
 
     async def fetch_meme_point(
         self,
@@ -404,6 +746,7 @@ class PipelineQdrantSyncClient(_LazyQdrantClient):
             )
         except Exception as exc:
             _raise_sync_error_from(exc, operation="delete_meme_point")
+
 
 def _raise_sync_error_from(exc: BaseException, *, operation: str) -> None:
     """Map an arbitrary SDK/transport exception onto the typed sync-error taxonomy.
@@ -489,6 +832,7 @@ def _build_meme_point(
         "meme_file_id": str(payload.meme_file_id),
         "search_index_algorithm_version": payload.search_index_algorithm_version,
         "is_public": payload.is_public,
+        "is_primary_file": payload.is_primary_file,
         "uploader_user_ids": list(payload.uploader_user_ids),
         "media_type": payload.media_type,
         "language": payload.language,
@@ -547,6 +891,7 @@ def _build_sync_preview(
         "meme_file_id",
         "search_index_algorithm_version",
         "is_public",
+        "is_primary_file",
         "uploader_user_ids",
         "media_type",
         "language",
@@ -681,6 +1026,46 @@ def _parse_qdrant_user_search_matches(raw_matches: object) -> tuple[QdrantUserSe
     return tuple(resolved_matches)
 
 
+def _parse_qdrant_recommendation_matches(raw_matches: object) -> tuple[QdrantRecommendationMatch, ...]:
+    """Decode one response inside a batched recommendation lookup."""
+
+    points = _extract_qdrant_points(raw_matches)
+    if points is None:
+        raise QdrantMalformedResponseError(
+            "Qdrant recommendation response is not an iterable sequence of matches.",
+        )
+
+    resolved_matches: list[QdrantRecommendationMatch] = []
+    for raw_entry in points:
+        payload = _extract_payload(raw_entry)
+        if payload is None:
+            continue
+        raw_meme_file_id = payload.get("meme_file_id")
+        raw_meme_id = payload.get("meme_id")
+        if not isinstance(raw_meme_file_id, str) or not isinstance(raw_meme_id, str):
+            continue
+        try:
+            meme_file_id = uuid.UUID(raw_meme_file_id)
+            meme_id = uuid.UUID(raw_meme_id)
+        except ValueError:
+            continue
+
+        raw_score = getattr(raw_entry, "score", None)
+        if isinstance(raw_score, bool) or not isinstance(raw_score, (int, float)):
+            continue
+        candidate_score = float(raw_score)
+        if not math.isfinite(candidate_score):
+            continue
+        resolved_matches.append(
+            QdrantRecommendationMatch(
+                meme_file_id=meme_file_id,
+                meme_id=meme_id,
+                candidate_score=candidate_score,
+            )
+        )
+    return tuple(resolved_matches)
+
+
 def _extract_payload(raw_entry: object) -> dict[str, object] | None:
     payload = getattr(raw_entry, "payload", None)
     if not isinstance(payload, dict):
@@ -699,10 +1084,16 @@ def _extract_qdrant_points(raw_matches: object) -> Sequence[object] | None:
 
 __all__ = [
     "PipelineQdrantClient",
+    "PipelineQdrantRecommendationClient",
     "PipelineQdrantSyncClient",
     "PipelineQdrantUserSearchClient",
     "QdrantMalformedResponseError",
     "QdrantProviderUnavailableError",
+    "QdrantNearestSourceQuery",
+    "QdrantRecommendationClientProtocol",
+    "QdrantRecommendationMatch",
+    "QdrantRecommendationSourceResult",
+    "QdrantRecommendSourceQuery",
     "QdrantSimilarityClientProtocol",
     "QdrantSimilarityError",
     "QdrantSimilarityMatch",
@@ -716,4 +1107,7 @@ __all__ = [
     "QdrantTimeoutError",
     "QdrantUserSearchClientProtocol",
     "QdrantUserSearchMatch",
+    "get_async_qdrant_client",
+    "is_async_qdrant_initialized",
+    "reset_async_qdrant_state",
 ]

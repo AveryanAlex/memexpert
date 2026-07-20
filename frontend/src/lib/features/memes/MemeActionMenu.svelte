@@ -1,5 +1,6 @@
 <script lang="ts">
   import { browser } from '$app/environment';
+  import { uuidV7 } from '$lib/analytics/uuid-v7';
   import {
     favoriteMeme,
     pinMeme,
@@ -80,8 +81,6 @@
   const downloadUrl = $derived(memeDownloadUrl(meme));
   const canDownload = $derived(Boolean(downloadUrl));
   const canPin = $derived(viewerCapabilities().canPinMemes);
-  const actionBody = $derived(memeActionAttributionBody(attribution));
-  const actionRequest = $derived({ fetch, memeId: meme.id, body: actionBody });
   const actionSurface = $derived(surface ?? (showPrimary || showSharing ? 'detail' : compact ? 'card' : 'overflow'));
   const isCardSurface = $derived(actionSurface === 'card');
   const isDetailSurface = $derived(actionSurface === 'detail');
@@ -100,6 +99,10 @@
     hydrated = true;
   });
 
+  function actionRequest() {
+    return { fetch, memeId: meme.id, body: memeActionAttributionBody(attribution, uuidV7()) };
+  }
+
   async function toggleFavorite() {
     if (pending) return;
     const operation = memeActionState.beginOperation(meme.id, 'favorite');
@@ -108,7 +111,7 @@
     const next = !favorited;
     let completed = false;
     await runAction(next ? 'favorite' : 'unfavorite', async () => {
-      const response = next ? await favoriteMeme(actionRequest) : await unfavoriteMeme(actionRequest);
+      const response = next ? await favoriteMeme(actionRequest()) : await unfavoriteMeme(actionRequest());
       completed = memeActionState.completeOperation(operation, {
         favorited: response.favorited,
         likeCount: response.like_count
@@ -133,7 +136,7 @@
     const next = !pinned;
     let completed = false;
     await runAction(next ? 'pin' : 'unpin', async () => {
-      await (next ? pinMeme(actionRequest) : unpinMeme(actionRequest));
+      await (next ? pinMeme(actionRequest()) : unpinMeme(actionRequest()));
       completed = memeActionState.completeOperation(operation, { pinned: next });
     });
     if (!completed) memeActionState.completeOperation(operation);
@@ -149,7 +152,7 @@
   async function shareTelegram() {
     await runAction('telegram', async () => {
       if (!browser) return;
-      void recordMemeShare(actionRequest).catch(() => undefined);
+      void recordMemeShare(actionRequest()).catch(() => undefined);
       window.open(telegramShareUrl(canonicalUrl, title), '_blank', 'noopener,noreferrer');
     });
   }
@@ -161,7 +164,7 @@
     }
 
     await runAction('download', async () => {
-      void recordMemeDownload(actionRequest).catch(() => undefined);
+      void recordMemeDownload(actionRequest()).catch(() => undefined);
       const link = document.createElement('a');
       link.href = downloadUrl;
       link.download = `${title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'meme'}`;
@@ -186,7 +189,7 @@
   async function submitReport() {
     await runAction('report', async () => {
       await reportMeme({
-        ...actionRequest,
+        ...actionRequest(),
         reason: reportReason,
         note: reportNote
       });

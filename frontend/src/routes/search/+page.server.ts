@@ -1,11 +1,13 @@
 import type { PageServerLoad } from './$types';
-import { DEFAULT_PAGE_SIZE, ApiError, emptyMemePage, fetchCollections, fetchMemePage } from '$lib/api/client';
+import { DEFAULT_PAGE_SIZE, ApiError, emptyMemePage, fetchCollections, fetchMemePage, type ApiFetch } from '$lib/api/client';
 import { ACCESS_COOKIE_NAME, apiBaseUrl, cookieHeaderWithAccessToken, forwardBackendAccessCookie } from '$lib/server/backend';
 import { canonicalPublicOrigin } from '$lib/server/canonicalOrigin';
 import { parseSearchParams } from '$lib/searchParams';
 
-export const load: PageServerLoad = async ({ cookies, fetch, parent, request, url }) => {
+export const load: PageServerLoad = async ({ cookies, fetch, parent, request, setHeaders, url }) => {
+  setHeaders({ 'cache-control': 'private, no-store' });
   const filters = parseSearchParams(url.searchParams);
+  const upstreamFetch: ApiFetch = (input, init) => fetch(input, { ...init, signal: request.signal });
   const { session } = await parent();
   const cookieHeader = cookieHeaderWithAccessToken(
     request.headers.get('cookie') ?? undefined,
@@ -19,7 +21,7 @@ export const load: PageServerLoad = async ({ cookies, fetch, parent, request, ur
   try {
     const [page, collectionState] = await Promise.all([
       fetchMemePage({
-        fetch,
+        fetch: upstreamFetch,
         baseUrl: apiBaseUrl(),
         query: filters.query,
         tags: filters.tags,
@@ -34,7 +36,7 @@ export const load: PageServerLoad = async ({ cookies, fetch, parent, request, ur
       }),
       session
         ? fetchCollections({
-            fetch,
+            fetch: upstreamFetch,
             baseUrl: apiBaseUrl(),
             cookieHeader,
             onResponse: (response) => {

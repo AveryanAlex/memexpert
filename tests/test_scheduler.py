@@ -26,6 +26,8 @@ from memexpert.scheduler.jobs import (
     JOB_ID_MOTD,
     JOB_ID_PIPELINE_CAPACITY_REFRESH,
     JOB_ID_RABBITMQ_OUTBOX_PUBLISHER,
+    JOB_ID_RECOMMENDATION_ANALYTICS_ROLLUP,
+    JOB_ID_RECOMMENDATION_PROFILE_REBUILD,
     JOB_ID_RECOVERY_DISPATCH,
     JOB_ID_SEARCH_INDEX_SYNC,
     JOB_ID_SEO_BACKLOG_BATCHES,
@@ -44,6 +46,8 @@ from memexpert.scheduler.runtime import run_scheduler_runtime
 from memexpert.schemas.meme import PublicMemeCardRead, PublicMemeOfTheDayRead
 from memexpert.services.admin_telegram_login import TelegramLoginCleanupBatchResult
 from memexpert.services.meilisearch_settings_reconcile import MeilisearchSettingsReconcileResult
+from memexpert.services.recommendations.analytics import RecommendationAnalyticsRollupResult
+from memexpert.services.recommendations.profile_store import ProfileRebuildResult
 from memexpert.services.scheduler_batch_jobs import SearchIndexBatchJobResult, SeoBacklogBatchJobResult
 from memexpert.services.source_channel_audience_scheduler import SourceChannelAudienceCaptureSchedulerResult
 from memexpert.services.source_engagement_scheduler import SourceEngagementCaptureSchedulerResult
@@ -243,6 +247,8 @@ def test_scheduler_job_definitions_register_expected_ids() -> None:
         JOB_ID_MEDIA_GENERATION_GC,
         JOB_ID_PIPELINE_CAPACITY_REFRESH,
         JOB_ID_TELEGRAM_LOGIN_CLEANUP,
+        JOB_ID_RECOMMENDATION_PROFILE_REBUILD,
+        JOB_ID_RECOMMENDATION_ANALYTICS_ROLLUP,
         JOB_ID_SOURCE_CHANNEL_AUDIENCE_CAPTURE,
     ]
     reconcile_definition = next(
@@ -268,6 +274,8 @@ def test_enabled_scheduler_jobs_filters_disabled_jobs() -> None:
             "scheduler_media_generation_gc_enabled": False,
             "scheduler_pipeline_capacity_refresh_enabled": False,
             "scheduler_telegram_login_cleanup_enabled": False,
+            "scheduler_recommendation_profile_rebuild_enabled": False,
+            "scheduler_recommendation_analytics_rollup_enabled": False,
         }
     )
 
@@ -276,6 +284,131 @@ def test_enabled_scheduler_jobs_filters_disabled_jobs() -> None:
     ]
 
     assert enabled_job_ids == [JOB_ID_SOURCE_ENGAGEMENT_CAPTURE, JOB_ID_SEARCH_INDEX_SYNC]
+
+
+@pytest.mark.asyncio
+async def test_recommendation_profile_rebuild_job_calls_bounded_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings.model_validate({"scheduler_recommendation_profile_rebuild_enabled": True})
+    engine = cast("AsyncEngine", object())
+    session_factory = object()
+    called: dict[str, object] = {}
+    info_calls: list[tuple[str, dict[str, object] | None]] = []
+
+    def fake_build_session_factory(bound_engine: object) -> object:
+        called["engine"] = bound_engine
+        return session_factory
+
+    async def fake_rebuild(session_factory_arg: object, *, settings: Settings) -> ProfileRebuildResult:
+        called["session_factory"] = session_factory_arg
+        called["settings"] = settings
+        return ProfileRebuildResult(claimed_users=3, rebuilt_users=2, failed_users=1)
+
+    def fake_info(message: str, *args: object, extra: dict[str, object] | None = None, **kwargs: object) -> None:
+        del args, kwargs
+        info_calls.append((message, extra))
+
+    monkeypatch.setattr("memexpert.scheduler.jobs.build_async_session_factory", fake_build_session_factory)
+    monkeypatch.setattr("memexpert.scheduler.jobs.rebuild_dirty_recommendation_profiles", fake_rebuild)
+    monkeypatch.setattr("memexpert.scheduler.jobs.logger.info", fake_info)
+
+    definition = next(
+        item
+        for item in build_scheduler_job_definitions(settings, engine=engine)
+        if item.id == JOB_ID_RECOMMENDATION_PROFILE_REBUILD
+    )
+    await definition.action()
+
+    assert called == {"engine": engine, "session_factory": session_factory, "settings": settings}
+    assert info_calls == [
+        (
+            "scheduler_job_batch_result",
+            {
+                "event": "scheduler_job_batch_result",
+                "job_id": JOB_ID_RECOMMENDATION_PROFILE_REBUILD,
+                "status": "completed",
+                "degraded_mode": True,
+                "claimed_users": 3,
+                "rebuilt_users": 2,
+                "failed_users": 1,
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_recommendation_analytics_rollup_job_recomputes_bounded_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings.model_validate(
+        {
+            "scheduler_recommendation_analytics_rollup_enabled": True,
+            "scheduler_recommendation_analytics_rollup_lookback_days": 3,
+        }
+    )
+    engine = cast("AsyncEngine", object())
+    session_factory = object()
+    called: dict[str, object] = {}
+    info_calls: list[tuple[str, dict[str, object] | None]] = []
+
+    def fake_build_session_factory(bound_engine: object) -> object:
+        called["engine"] = bound_engine
+        return session_factory
+
+    async def fake_rollup(
+        session_factory_arg: object,
+        *,
+        lookback_days: int,
+        impression_cooldown_hours: int,
+        strong_positive_cooldown_hours: int,
+    ) -> RecommendationAnalyticsRollupResult:
+        called["session_factory"] = session_factory_arg
+        called["lookback_days"] = lookback_days
+        called["impression_cooldown_hours"] = impression_cooldown_hours
+        called["strong_positive_cooldown_hours"] = strong_positive_cooldown_hours
+        return RecommendationAnalyticsRollupResult(
+            start_date=date(2026, 7, 18),
+            end_date=date(2026, 7, 20),
+            aggregate_rows=7,
+        )
+
+    def fake_info(message: str, *args: object, extra: dict[str, object] | None = None, **kwargs: object) -> None:
+        del args, kwargs
+        info_calls.append((message, extra))
+
+    monkeypatch.setattr("memexpert.scheduler.jobs.build_async_session_factory", fake_build_session_factory)
+    monkeypatch.setattr("memexpert.scheduler.jobs.rollup_recommendation_daily_analytics", fake_rollup)
+    monkeypatch.setattr("memexpert.scheduler.jobs.logger.info", fake_info)
+
+    definition = next(
+        item
+        for item in build_scheduler_job_definitions(settings, engine=engine)
+        if item.id == JOB_ID_RECOMMENDATION_ANALYTICS_ROLLUP
+    )
+    await definition.action()
+
+    assert called == {
+        "engine": engine,
+        "session_factory": session_factory,
+        "lookback_days": 3,
+        "impression_cooldown_hours": 72,
+        "strong_positive_cooldown_hours": 168,
+    }
+    assert info_calls == [
+        (
+            "scheduler_job_batch_result",
+            {
+                "event": "scheduler_job_batch_result",
+                "job_id": JOB_ID_RECOMMENDATION_ANALYTICS_ROLLUP,
+                "status": "completed",
+                "degraded_mode": False,
+                "start_date": "2026-07-18",
+                "end_date": "2026-07-20",
+                "aggregate_rows": 7,
+            },
+        )
+    ]
 
 
 @pytest.mark.asyncio
@@ -858,6 +991,8 @@ async def test_scheduler_runtime_registers_enabled_jobs_and_shuts_down_gracefull
             "scheduler_recovery_dispatch_enabled": False,
             "scheduler_media_generation_gc_enabled": False,
             "scheduler_pipeline_capacity_refresh_enabled": False,
+            "scheduler_recommendation_profile_rebuild_enabled": False,
+            "scheduler_recommendation_analytics_rollup_enabled": False,
             "scheduler_advisory_lock_enabled": False,
         }
     )
@@ -916,6 +1051,8 @@ async def test_scheduler_runtime_skips_disabled_jobs() -> None:
             "scheduler_media_generation_gc_enabled": False,
             "scheduler_pipeline_capacity_refresh_enabled": False,
             "scheduler_telegram_login_cleanup_enabled": False,
+            "scheduler_recommendation_profile_rebuild_enabled": False,
+            "scheduler_recommendation_analytics_rollup_enabled": False,
             "scheduler_advisory_lock_enabled": False,
         }
     )

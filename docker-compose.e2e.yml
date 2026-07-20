@@ -38,6 +38,9 @@ x-app-env: &app-env
   PIPELINE_VOYAGE_OUTPUT_DIMENSIONS: "4"
   PIPELINE_QDRANT_COLLECTION_NAME: memexpert-memes-e2e
   PIPELINE_MEILISEARCH_INDEX_NAME: memexpert-memes-e2e
+  RECOMMENDATION_ENABLED: "true"
+  RECOMMENDATION_SHADOW_MODE: "false"
+  RECOMMENDATION_CANARY_PERCENT: "100"
   PIPELINE_WORKER_PREFETCH_COUNT: "1"
   RUNTIME_HEALTH_FILE: /tmp/memexpert-runtime-health.json
   RUNTIME_HEALTH_INTERVAL_SECONDS: "1.0"
@@ -94,7 +97,7 @@ services:
       start_period: 20s
 
   qdrant:
-    image: qdrant/qdrant:v1.18.2
+    image: qdrant/qdrant:v1.18.3
     volumes:
       - qdrant_data:/qdrant/storage
     healthcheck:

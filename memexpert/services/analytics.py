@@ -9,12 +9,14 @@ import math
 import uuid
 from collections import Counter
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import func, select, text
+from sqlalchemy.dialects.postgresql import insert
 
 from memexpert.models.base import utcnow
 from memexpert.models.content import Meme, MemeTemplate
@@ -27,6 +29,7 @@ from memexpert.schemas.auth import (
     ProfileStatsTemplateRead,
 )
 from memexpert.services.meme_exposure import MemeExposureService
+from memexpert.services.recommendations.interaction_state import project_recommendation_interaction
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -34,6 +37,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 INTERACTION_EVENT_SCHEMA_VERSION = 1
+INTERACTION_EVENT_MAX_FUTURE_SKEW = timedelta(minutes=5)
 
 
 class InteractionActorType(StrEnum):
@@ -65,6 +69,7 @@ _MEME_REF_EVENT_TYPES = frozenset(
         AnalyticsEventType.INLINE_SERVED,
         AnalyticsEventType.MEME_DETAIL_CLICK,
         AnalyticsEventType.MEME_DOWNLOAD,
+        AnalyticsEventType.MEME_ENGAGED_VIEW,
         AnalyticsEventType.MEME_IMPRESSION,
         AnalyticsEventType.MEME_LIKE,
         AnalyticsEventType.MEME_PIN,
@@ -88,7 +93,19 @@ _HIGH_INTENT_EXPOSURE_EVENT_TYPES = frozenset(
         AnalyticsEventType.SHARE,
     }
 )
-_PROFILE_VIEW_EVENT_TYPES = frozenset({AnalyticsEventType.MEME_VIEW, AnalyticsEventType.VIEW})
+_ONCE_PER_IMPRESSION_EVENT_TYPES = frozenset(
+    {
+        AnalyticsEventType.MEME_ENGAGED_VIEW,
+        AnalyticsEventType.MEME_IMPRESSION,
+    }
+)
+_PROFILE_VIEW_EVENT_TYPES = frozenset(
+    {
+        AnalyticsEventType.MEME_ENGAGED_VIEW,
+        AnalyticsEventType.MEME_VIEW,
+        AnalyticsEventType.VIEW,
+    }
+)
 _PROFILE_SENT_EVENT_TYPES = frozenset(
     {
         AnalyticsEventType.MEME_SEND,
@@ -124,26 +141,33 @@ def _normalize_payload_key(key: str) -> str:
 
 
 def _validate_safe_json_value(value: object, *, path: tuple[str, ...]) -> None:
-    if value is None or isinstance(value, (bool, int, str)):
-        return
-    if isinstance(value, float):
-        if not math.isfinite(value):
-            raise ValueError(f"{'.'.join(path) or 'payload'} must not contain non-finite floats")
-        return
-    if isinstance(value, list):
-        for index, item in enumerate(value):
-            _validate_safe_json_value(item, path=(*path, str(index)))
-        return
-    if isinstance(value, dict):
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise ValueError(f"{'.'.join(path) or 'payload'} contains a non-string JSON key")
-            normalized_key = _normalize_payload_key(key)
-            if normalized_key in _UNSAFE_PAYLOAD_KEYS:
-                raise ValueError(f"Unsafe analytics payload key '{key}' is not allowed")
-            _validate_safe_json_value(item, path=(*path, key))
-        return
-    raise ValueError(f"{'.'.join(path) or 'payload'} contains a non-JSON-safe value of type {type(value).__name__}")
+    pending = [(value, path)]
+    while pending:
+        item, item_path = pending.pop()
+        if item is None or isinstance(item, (bool, int, str)):
+            continue
+        if isinstance(item, float):
+            if not math.isfinite(item):
+                raise ValueError(f"{'.'.join(item_path) or 'payload'} must not contain non-finite floats")
+            continue
+        if isinstance(item, list):
+            pending.extend(
+                (child, (*item_path, str(index)))
+                for index, child in enumerate(item)
+            )
+            continue
+        if isinstance(item, dict):
+            for key, child in item.items():
+                if not isinstance(key, str):
+                    raise ValueError(f"{'.'.join(item_path) or 'payload'} contains a non-string JSON key")
+                normalized_key = _normalize_payload_key(key)
+                if normalized_key in _UNSAFE_PAYLOAD_KEYS:
+                    raise ValueError(f"Unsafe analytics payload key '{key}' is not allowed")
+                pending.append((child, (*item_path, key)))
+            continue
+        raise ValueError(
+            f"{'.'.join(item_path) or 'payload'} contains a non-JSON-safe value of type {type(item).__name__}"
+        )
 
 
 def _normalize_utc(value: datetime | None) -> datetime:
@@ -151,6 +175,14 @@ def _normalize_utc(value: datetime | None) -> datetime:
     if resolved.tzinfo is None:
         return resolved.replace(tzinfo=UTC)
     return resolved.astimezone(UTC)
+
+
+def _validate_interaction_occurred_at(value: datetime | None) -> datetime | None:
+    """Reject client clocks far enough ahead to poison serving watermarks."""
+
+    if value is not None and _normalize_utc(value) > utcnow() + INTERACTION_EVENT_MAX_FUTURE_SKEW:
+        raise ValueError("occurred_at must not be more than five minutes in the future")
+    return value
 
 
 def _strict_payload_meme_ref(payload: Mapping[str, object]) -> uuid.UUID | None:
@@ -166,6 +198,17 @@ def _strict_payload_meme_ref(payload: Mapping[str, object]) -> uuid.UUID | None:
         return uuid.UUID(meme_id)
     except ValueError:
         return None
+
+
+def _same_interaction_identity(existing: AnalyticsEvent, write: InteractionEventWrite) -> bool:
+    """Distinguish a safe retry from reuse of a UUID for another interaction."""
+
+    return (
+        existing.user_id == write.user_id
+        and existing.event_type is write.event_type
+        and _strict_payload_meme_ref(existing.payload) == write.refs.meme_id
+        and existing.payload.get("impression_id") == write.impression_id
+    )
 
 
 class InteractionEventRefs(BaseModel):
@@ -261,13 +304,21 @@ class InteractionEventWrite(_InteractionEventPayloadFields):
     """
 
     event_type: AnalyticsEventType
+    event_id: uuid.UUID | None = None
     user_id: uuid.UUID | None = None
     actor_type: InteractionActorType | None = None
     actor_account_type: AccountType | None = None
     occurred_at: datetime | None = None
 
+    @field_validator("occurred_at")
+    @classmethod
+    def _validate_occurred_at(cls, value: datetime | None) -> datetime | None:
+        return _validate_interaction_occurred_at(value)
+
     @model_validator(mode="after")
     def _validate_contract(self) -> InteractionEventWrite:
+        if self.event_id is not None and self.event_id.version != 7:
+            raise ValueError("event_id must be a UUIDv7")
         if self.user_id is None and self.actor_account_type is not None:
             raise ValueError("actor_account_type requires a non-null user_id")
         if self.user_id is None and self.actor_type == InteractionActorType.USER:
@@ -317,6 +368,19 @@ class LaunchKPIRead(BaseModel):
     source_reposts: int
 
 
+class InteractionEventIdConflictError(ValueError):
+    """Raised when a client reuses an event UUID for a different interaction."""
+
+
+@dataclass(frozen=True, slots=True)
+class InteractionBatchWriteResult:
+    """Outcome of one atomic idempotent analytics batch."""
+
+    events: tuple[AnalyticsEvent, ...]
+    recorded: int
+    duplicates: int
+
+
 class AnalyticsService:
     """Read and write product analytics without inventing user-facing metrics."""
 
@@ -335,7 +399,48 @@ class AnalyticsService:
         Invalid payloads raise before the DB write.
         """
 
-        write = event if isinstance(event, InteractionEventWrite) else InteractionEventWrite.model_validate(event)
+        result = await self.record_interaction_events((event,))
+        return result.events[0]
+
+    async def record_interaction_events(
+        self,
+        events: tuple[InteractionEventWrite | Mapping[str, Any], ...],
+    ) -> InteractionBatchWriteResult:
+        """Persist at most 50 interactions atomically, ignoring exact UUIDv7 retries."""
+
+        if not events:
+            raise ValueError("At least one interaction event is required.")
+        if len(events) > 50:
+            raise ValueError("Interaction batches may contain at most 50 events.")
+        writes = tuple(
+            event if isinstance(event, InteractionEventWrite) else InteractionEventWrite.model_validate(event)
+            for event in events
+        )
+        recorded_events: list[AnalyticsEvent] = []
+        recorded = 0
+        duplicates = 0
+        try:
+            for write in writes:
+                analytics_event, inserted = await self._record_interaction_event_no_commit(write)
+                recorded_events.append(analytics_event)
+                if inserted:
+                    recorded += 1
+                else:
+                    duplicates += 1
+            await self._session.commit()
+        except Exception:
+            await self._session.rollback()
+            raise
+        return InteractionBatchWriteResult(
+            events=tuple(recorded_events),
+            recorded=recorded,
+            duplicates=duplicates,
+        )
+
+    async def _record_interaction_event_no_commit(
+        self,
+        write: InteractionEventWrite,
+    ) -> tuple[AnalyticsEvent, bool]:
         actor_type, actor_account_type = await self._resolve_actor_context(write)
         payload = InteractionEventPayload(
             actor_account_type=actor_account_type,
@@ -352,21 +457,129 @@ class AnalyticsService:
             source_algorithm=write.source_algorithm,
             surface=write.surface,
         )
-        occurred_at = _normalize_utc(write.occurred_at)
-        analytics_event = AnalyticsEvent(
+        occurred_at = _normalize_utc(_validate_interaction_occurred_at(write.occurred_at))
+        payload_json = payload.model_dump(mode="json", exclude_none=True)
+        if write.event_id is not None:
+            existing_event = await self._session.get(AnalyticsEvent, write.event_id)
+            if existing_event is not None:
+                if not _same_interaction_identity(existing_event, write):
+                    raise InteractionEventIdConflictError(
+                        "event_id is already assigned to a different interaction event"
+                    )
+                return existing_event, False
+
+        logical_duplicate = await self._find_once_per_impression_duplicate(write)
+        if logical_duplicate is not None:
+            # The logical-key lock may have waited behind another transaction.
+            # Recheck the client UUID so a concurrent unrelated insert still
+            # receives the normal idempotency conflict response.
+            if write.event_id is not None:
+                existing_event = await self._session.get(AnalyticsEvent, write.event_id)
+                if existing_event is not None and not _same_interaction_identity(existing_event, write):
+                    raise InteractionEventIdConflictError(
+                        "event_id is already assigned to a different interaction event"
+                    )
+            return logical_duplicate, False
+
+        if write.event_id is None:
+            analytics_event = AnalyticsEvent(
+                user_id=write.user_id,
+                event_type=write.event_type,
+                payload=payload_json,
+                occurred_at=occurred_at,
+            )
+            self._session.add(analytics_event)
+            # Make a canonical no-ID write visible to another logical stage
+            # check in the same batch before projecting its serving state.
+            if (
+                write.event_type in _ONCE_PER_IMPRESSION_EVENT_TYPES
+                and write.impression_id is not None
+                and write.refs.meme_id is not None
+            ):
+                await self._session.flush()
+            await self._project_inserted_interaction(write, occurred_at=occurred_at)
+            return analytics_event, True
+
+        event_id = write.event_id
+        statement = (
+            insert(AnalyticsEvent)
+            .values(
+                id=event_id,
+                user_id=write.user_id,
+                event_type=write.event_type,
+                payload=payload_json,
+                occurred_at=occurred_at,
+            )
+            .on_conflict_do_nothing(index_elements=[AnalyticsEvent.id])
+            .returning(AnalyticsEvent)
+        )
+        inserted_event = (await self._session.execute(statement)).scalar_one_or_none()
+        if inserted_event is None:
+            existing_event = await self._session.get(AnalyticsEvent, event_id)
+            if existing_event is None:
+                raise RuntimeError("Idempotent interaction insert did not return or resolve its event row.")
+            if not _same_interaction_identity(existing_event, write):
+                raise InteractionEventIdConflictError(
+                    "event_id is already assigned to a different interaction event"
+                )
+            return existing_event, False
+
+        await self._project_inserted_interaction(write, occurred_at=occurred_at)
+        return inserted_event, True
+
+    async def _find_once_per_impression_duplicate(
+        self,
+        write: InteractionEventWrite,
+    ) -> AnalyticsEvent | None:
+        """Serialize and collapse repeated impression stages across UUID retries."""
+
+        impression_id = write.impression_id
+        meme_id = write.refs.meme_id
+        if (
+            write.event_type not in _ONCE_PER_IMPRESSION_EVENT_TYPES
+            or impression_id is None
+            or meme_id is None
+        ):
+            return None
+
+        viewer_key = str(write.user_id) if write.user_id is not None else "anonymous"
+        dedupe_key = f"{viewer_key}:{meme_id}:{impression_id}:{write.event_type.value}"
+        await self._session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:dedupe_key, 0))"),
+            {"dedupe_key": dedupe_key},
+        )
+        user_predicate = (
+            AnalyticsEvent.user_id == write.user_id
+            if write.user_id is not None
+            else AnalyticsEvent.user_id.is_(None)
+        )
+        return await self._session.scalar(
+            select(AnalyticsEvent)
+            .where(
+                user_predicate,
+                AnalyticsEvent.event_type == write.event_type,
+                AnalyticsEvent.payload["impression_id"].astext == impression_id,
+                AnalyticsEvent.payload["refs"]["meme_id"].astext == str(meme_id),
+            )
+            .order_by(AnalyticsEvent.occurred_at, AnalyticsEvent.id)
+            .limit(1)
+        )
+
+    async def _project_inserted_interaction(
+        self,
+        write: InteractionEventWrite,
+        *,
+        occurred_at: datetime,
+    ) -> None:
+        await self._record_exposure_fact(write, occurred_at=occurred_at)
+        await project_recommendation_interaction(
+            self._session,
             user_id=write.user_id,
             event_type=write.event_type,
-            payload=payload.model_dump(mode="json", exclude_none=True),
+            meme_id=write.refs.meme_id,
+            properties=write.properties,
             occurred_at=occurred_at,
         )
-        try:
-            self._session.add(analytics_event)
-            await self._record_exposure_fact(write, occurred_at=occurred_at)
-            await self._session.commit()
-        except Exception:
-            await self._session.rollback()
-            raise
-        return analytics_event
 
     async def _record_exposure_fact(self, write: InteractionEventWrite, *, occurred_at: datetime) -> None:
         """Project attributed exposure stages into an idempotent public-safe fact."""
@@ -681,7 +894,9 @@ def hash_external_identifier(namespace: str, value: object) -> str:
 
 __all__ = [
     "AnalyticsService",
+    "InteractionBatchWriteResult",
     "InteractionActorType",
+    "InteractionEventIdConflictError",
     "InteractionEventPayload",
     "InteractionEventRefs",
     "InteractionEventWrite",

@@ -220,6 +220,9 @@ function searchMeme(id: string, caption: string): PublicMemeCardRead {
 
 function searchAttribution(rank: number): MemeResultAttributionRead {
   return {
+    attribution_token: null,
+    candidate_sources: [],
+    profile_version: null,
     request_id: 'req_ranked',
     impression_id: `imp_rank_${rank}`,
     surface: 'web_search',

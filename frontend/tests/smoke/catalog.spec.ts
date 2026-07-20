@@ -120,6 +120,63 @@ test.describe('public masonry feed smoke', () => {
     await expect(page.locator('html')).toHaveJSProperty('scrollWidth', 1280);
   });
 
+  test('Back restores the frozen Home cursor only after server reauthorization', async ({ page }) => {
+    await page.setViewportSize({ width: 900, height: 520 });
+    await disableIntersectionObserver(page);
+    let reauthorizationRequests = 0;
+    page.on('request', (request) => {
+      if (new URL(request.url()).pathname === '/api/v1/memes/home-feed/reauthorize') {
+        reauthorizationRequests += 1;
+      }
+    });
+    await page.goto('/');
+    const feed = page.getByRole('list', { name: 'Meme results' });
+    await page.getByRole('button', { name: 'Load more' }).click();
+    await expect(feed.getByRole('link', { name: 'Open Smoke test deploy mood' })).toBeVisible();
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    const previousScroll = await page.evaluate(() => window.scrollY);
+
+    // Dispatch without Playwright's actionability scroll so this navigation starts at the position being tested.
+    await page.getByRole('link', { name: 'Search', exact: true }).first().dispatchEvent('click');
+    await expect(page).toHaveURL(/\/search$/);
+    const savedScroll = await page.evaluate(() => {
+      const key = Object.keys(sessionStorage).find((candidate) => candidate.startsWith('memexpert:home-feed:v2:'));
+      return key ? JSON.parse(sessionStorage.getItem(key) ?? '{}').scrollY : null;
+    });
+    expect(savedScroll).toBeGreaterThanOrEqual(previousScroll - 2);
+    await page.goBack();
+    await expect(page).toHaveURL(/\/$/);
+
+    await expect.poll(() => reauthorizationRequests).toBeGreaterThan(0);
+    await expect(feed.getByRole('link', { name: 'Open Smoke test cat reaction' })).toBeVisible();
+    await expect(feed.getByRole('link', { name: 'Open Smoke test deploy mood' })).toBeVisible();
+    await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThanOrEqual(previousScroll - 2);
+  });
+
+  test('Back never renders a saved Home item omitted by fresh authorization', async ({ page }) => {
+    await disableIntersectionObserver(page);
+    await page.goto('/');
+    const feed = page.getByRole('list', { name: 'Meme results' });
+    await page.getByRole('button', { name: 'Load more' }).click();
+    await expect(feed.getByRole('link', { name: 'Open Smoke test deploy mood' })).toBeVisible();
+    await page.route('**/api/v1/memes/home-feed/reauthorize**', async (route) => {
+      const upstream = await route.fetch();
+      const payload = await upstream.json();
+      await route.fulfill({
+        response: upstream,
+        json: { ...payload, items: payload.items.slice(0, 1) }
+      });
+    });
+
+    await page.getByRole('link', { name: 'Search', exact: true }).first().click();
+    await expect(page).toHaveURL(/\/search$/);
+    await page.goBack();
+    await expect(page).toHaveURL(/\/$/);
+
+    await expect(feed.getByRole('link', { name: 'Open Smoke test cat reaction' })).toBeVisible();
+    await expect(feed.getByRole('link', { name: 'Open Smoke test deploy mood' })).toHaveCount(0);
+  });
+
   test('mobile viewport exposes the feed without layout breakage', async ({ page }) => {
     await page.setViewportSize({ width: 390, height: 844 });
     await disableIntersectionObserver(page);
@@ -711,11 +768,16 @@ test('search result opens detail with media and actions', async ({ page, request
 
   const result = page.getByRole('link', { name: 'Open Smoke test cat reaction' });
   await expect(result).toBeVisible();
-  await expect(result).toHaveAttribute('href', /attribution_impression_id=web_/);
+  await expect(result).toHaveAttribute(
+    'href',
+    /attribution_impression_id=[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/
+  );
   await result.click();
 
   await expect(page).toHaveURL(/\/memes\/smoke-test-cat-reaction(?:\?.*)?$/);
-  expect(new URL(page.url()).searchParams.get('attribution_impression_id')).toMatch(/^web_/);
+  expect(new URL(page.url()).searchParams.get('attribution_impression_id')).toMatch(
+    /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+  );
   await expect(page.getByRole('heading', { name: 'Smoke test cat reaction' })).toBeVisible();
   await expect.poll(async () => (await readSmokeStats(request, statsUrl)).detailViewCount).toBe(
     statsBeforeVisit.detailViewCount + 1

@@ -7,12 +7,13 @@ import type {
   PublicMemeCardRead,
   PublicMemeOfTheDayRead,
   PublicMemeSearchPageRead,
+  RecommendationFeedPageRead,
 } from '$lib/api/types';
 import HomePage from '../routes/+page.svelte';
 
 describe('/ page', () => {
   it('renders personalized SSR home feed results through the infinite feed without page links', () => {
-    const page: PublicMemeSearchPageRead = {
+    const page: RecommendationFeedPageRead = {
       items: [
         { meme: memeCard('11111111-1111-4111-8111-111111111111', 'SSR cat reaction'), attribution: attribution(1, 'personalized_recommendations', 'qdrant_preference_vector') },
         { meme: memeCard('22222222-2222-4222-8222-222222222222', 'SSR launch mood'), attribution: attribution(2, 'personalized_recommendations', 'qdrant_preference_vector') },
@@ -22,7 +23,10 @@ describe('/ page', () => {
       offset: 0,
       total: 8,
       has_more: true,
-      request_id: 'req_home'
+      request_id: 'req_home',
+      feed_session_id: 'feed_home',
+      next_cursor: 'signed-next-cursor',
+      expires_at: '2026-07-20T12:00:00Z'
     };
 
     const { body } = render(HomePage, {
@@ -30,6 +34,7 @@ describe('/ page', () => {
         data: {
           session: fullSession(),
           sessionError: null,
+          pageViewerId: fullSession().user.id,
           page,
           query: '',
           offset: 0,
@@ -171,6 +176,7 @@ function renderHome(page: PublicMemeSearchPageRead, session: CurrentSessionRead,
       data: {
         session,
         sessionError: null,
+        pageViewerId: session.user.id,
         page,
         query: '',
         offset: 0,
@@ -231,6 +237,9 @@ function motdAttribution(): MemeResultAttributionRead {
 
 function attribution(rank: number, sourceAlgorithm: string, reason: string): MemeResultAttributionRead {
   return {
+    attribution_token: null,
+    candidate_sources: [],
+    profile_version: null,
     request_id: 'req_home',
     impression_id: `imp_${rank}`,
     surface: 'test',

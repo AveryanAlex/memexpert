@@ -2,6 +2,7 @@
   import '../app.css';
   import { page } from '$app/state';
   import PageViewTracker from '$lib/analytics/PageViewTracker.svelte';
+  import { provideMemeInteractionQueue } from '$lib/analytics/interaction-queue';
   import { provideAuthState } from '$lib/auth-state';
   import AppShell from '$lib/features/app-shell/AppShell.svelte';
   import TelegramLoginModal from '$lib/features/auth/TelegramLoginModal.svelte';
@@ -22,6 +23,7 @@
   const sessionError = $derived($authState.sessionError);
   const memeActionState = provideMemeActionState(() => session?.user.id ?? null);
   const memeExposureScope = provideMemeExposureScope(page.url.pathname);
+  const memeInteractionQueue = provideMemeInteractionQueue();
   provideMemeVideoCoordinator();
 
   $effect(() => {
@@ -29,7 +31,9 @@
   });
 
   $effect(() => {
-    memeActionState.syncViewer(session?.user.id ?? null);
+    const viewerId = session?.user.id ?? null;
+    memeActionState.syncViewer(viewerId);
+    memeInteractionQueue.syncViewer(viewerId);
   });
 
   $effect(() => {
@@ -41,6 +45,7 @@
   onMount(() => {
     const nonce = globalThis.crypto?.randomUUID?.() ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
     memeExposureScope.beginClientVisit(nonce);
+    return memeInteractionQueue.startBrowserLifecycle();
   });
 </script>
 

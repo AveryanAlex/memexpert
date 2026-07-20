@@ -71,6 +71,28 @@ describe('meme action helpers', () => {
     expect(canonicalMemeUrl(meme, 'https://memexpert.test')).toBe('https://memexpert.test/memes/frog-wizard');
   });
 
+  it('prefers one opaque signed token over legacy ranking fields in URLs and action bodies', () => {
+    const meme = detail({ id: 'meme-123', seo_page_slug: 'frog-wizard' });
+    const attribution = {
+      attribution_token: 'signed.opaque.value',
+      request_id: 'must-not-leak',
+      query: 'private search phrase',
+      collection_ids: ['private-collection'],
+      score_components: { semantic: 0.9 }
+    };
+
+    const href = memeHref(meme, attribution);
+    const params = new URL(href, 'https://memexpert.test').searchParams;
+
+    expect(params.get('attribution_token')).toBe('signed.opaque.value');
+    expect([...params.keys()]).toEqual(['attribution_token']);
+    expect(parseMemeAttributionSearchParams(params)).toEqual({ attribution_token: 'signed.opaque.value' });
+    expect(memeActionAttributionBody(attribution, '018f22ec-9c00-7000-8000-000000000001')).toEqual({
+      event_id: '018f22ec-9c00-7000-8000-000000000001',
+      attribution_token: 'signed.opaque.value'
+    });
+  });
+
   it('falls back through meme and file media URLs', () => {
     const meme = detail({
       id: 'meme-123',

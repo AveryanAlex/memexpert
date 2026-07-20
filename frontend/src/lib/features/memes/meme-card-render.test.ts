@@ -181,6 +181,9 @@ function memeCard(overrides: Partial<PublicMemeCardRead> = {}): PublicMemeCardRe
 
 function resultAttribution(impressionId: string): MemeResultAttributionRead {
   return {
+    attribution_token: null,
+    candidate_sources: [],
+    profile_version: null,
     request_id: 'req-card',
     impression_id: impressionId,
     surface: 'web_search',

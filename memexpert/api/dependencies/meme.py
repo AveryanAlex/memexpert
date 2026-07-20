@@ -18,6 +18,7 @@ from memexpert.services.meme_search import MemeSearchService
 from memexpert.services.public_meme_insights import PublicMemeInsightsService
 from memexpert.services.public_trends import PublicTrendsService
 from memexpert.services.query_embedding import CachedTextQueryEmbeddingService
+from memexpert.services.recommendations.taste import TastePersonalizationService
 from memexpert.services.report import MemeReportService
 from memexpert.services.seo_catalog import SeoCatalogService
 
@@ -40,6 +41,7 @@ def get_meme_search_service(session: Annotated[AsyncSession, Depends(get_db_sess
             provider=build_pipeline_voyage_client(),
             cache_session_factory=get_async_session_factory(),
         ),
+        taste_personalization=TastePersonalizationService(session),
     )
 
 

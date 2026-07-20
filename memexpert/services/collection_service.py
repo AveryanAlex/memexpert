@@ -60,6 +60,10 @@ from memexpert.services.errors import (
 )
 from memexpert.services.media_render_urls import MediaRenderUrlService
 from memexpert.services.meme_search import MemeNotFoundError, MemeSearchService
+from memexpert.services.recommendations.interaction_state import (
+    invalidate_recommendation_profile,
+    project_durable_preference_change,
+)
 from memexpert.services.user_service import UserService
 
 if TYPE_CHECKING:
@@ -367,11 +371,20 @@ class CollectionService:
 
         user, collection = await self._get_collection_for_read(collection_id=collection_id, user_id=user_id)
         self._ensure_owner_can_manage_custom_collection(user, collection)
+        affected_user_ids = set(
+            await self._session.scalars(
+                select(func.coalesce(CollectionMeme.added_by_user_id, collection.owner_id))
+                .where(CollectionMeme.collection_id == collection.id)
+                .distinct()
+            )
+        )
         object_keys_to_delete = await self._delete_private_memes_orphaned_by_collection_delete(collection.id)
         await self._session.execute(
             update(User).where(User.active_save_collection_id == collection.id).values(active_save_collection_id=None)
         )
         await self._session.delete(collection)
+        for affected_user_id in affected_user_ids:
+            await invalidate_recommendation_profile(self._session, user_id=affected_user_id)
 
         try:
             await self._session.commit()
@@ -420,6 +433,13 @@ class CollectionService:
         )
         if inserted and collection.kind is CollectionKind.FAVORITES:
             await self._increment_like_count(meme.id)
+        if inserted:
+            await project_durable_preference_change(
+                self._session,
+                user_id=user.id,
+                meme_id=meme.id,
+                is_add=True,
+            )
 
         try:
             await self._session.commit()
@@ -437,10 +457,16 @@ class CollectionService:
         user, collection = await self._get_collection_for_read(collection_id=collection_id, user_id=user_id)
         self._ensure_can_write_collection(user, collection)
         removed = await self._delete_collection_meme(collection_id=collection.id, meme_id=meme_id)
-        if not removed:
+        if removed is None:
             return False
+        removed_meme_id, added_by_user_id = removed
         if collection.kind is CollectionKind.FAVORITES:
             await self._decrement_like_count(meme_id)
+        await self._project_collection_meme_removal(
+            actor_user_id=user.id,
+            preference_user_id=added_by_user_id or collection.owner_id,
+            meme_id=removed_meme_id,
+        )
         object_keys_to_delete = await self._delete_orphan_private_meme_if_unreferenced(meme_id)
 
         try:
@@ -471,6 +497,12 @@ class CollectionService:
         )
         if inserted:
             await self._increment_like_count(meme.id)
+            await project_durable_preference_change(
+                self._session,
+                user_id=favorites.owner_id,
+                meme_id=meme.id,
+                is_add=True,
+            )
 
         try:
             await self._session.commit()
@@ -491,10 +523,16 @@ class CollectionService:
             return False
 
         removed = await self._delete_collection_meme(collection_id=favorites.id, meme_id=meme_id)
-        if not removed:
+        if removed is None:
             return False
+        removed_meme_id, added_by_user_id = removed
 
         await self._decrement_like_count(meme_id)
+        await self._project_collection_meme_removal(
+            actor_user_id=favorites.owner_id,
+            preference_user_id=added_by_user_id or favorites.owner_id,
+            meme_id=removed_meme_id,
+        )
         object_keys_to_delete = await self._delete_orphan_private_meme_if_unreferenced(meme_id)
 
         try:
@@ -601,6 +639,13 @@ class CollectionService:
         )
         if inserted and collection.kind is CollectionKind.FAVORITES:
             await self._increment_like_count(meme.id)
+        if inserted:
+            await project_durable_preference_change(
+                self._session,
+                user_id=user.id,
+                meme_id=meme.id,
+                is_add=True,
+            )
 
         try:
             await self._session.commit()
@@ -628,11 +673,17 @@ class CollectionService:
         self._ensure_can_write_collection(user, collection)
 
         removed = await self._delete_collection_meme(collection_id=collection.id, meme_id=meme_id)
-        if not removed:
+        if removed is None:
             return False
+        removed_meme_id, added_by_user_id = removed
 
         if collection.kind is CollectionKind.FAVORITES:
             await self._decrement_like_count(meme_id)
+        await self._project_collection_meme_removal(
+            actor_user_id=user.id,
+            preference_user_id=added_by_user_id or collection.owner_id,
+            meme_id=removed_meme_id,
+        )
         object_keys_to_delete = await self._delete_orphan_private_meme_if_unreferenced(meme_id)
         try:
             await self._session.commit()
@@ -679,6 +730,12 @@ class CollectionService:
         position = int(pin_count or 0) + 1
         pinned_meme = PinnedMeme(user_id=user.id, meme_id=meme.id, position=position)
         self._session.add(pinned_meme)
+        await project_durable_preference_change(
+            self._session,
+            user_id=user.id,
+            meme_id=meme.id,
+            is_add=True,
+        )
 
         try:
             await self._session.commit()
@@ -704,6 +761,12 @@ class CollectionService:
         self._session.add_all(
             PinnedMeme(user_id=user.id, meme_id=pin.meme_id, position=index, pinned_at=pin.pinned_at)
             for index, pin in enumerate(remaining_pins, start=1)
+        )
+        await project_durable_preference_change(
+            self._session,
+            user_id=user.id,
+            meme_id=cast("uuid.UUID", meme_id),
+            is_add=False,
         )
 
         try:
@@ -1222,13 +1285,42 @@ class CollectionService:
             raise CollectionServiceError("Saved meme association could not be loaded.")
         return saved_meme, inserted
 
-    async def _delete_collection_meme(self, *, collection_id: object, meme_id: object) -> bool:
+    async def _delete_collection_meme(
+        self,
+        *,
+        collection_id: object,
+        meme_id: object,
+    ) -> tuple[uuid.UUID, uuid.UUID | None] | None:
         result = await self._session.execute(
             delete(CollectionMeme)
             .where(CollectionMeme.collection_id == collection_id, CollectionMeme.meme_id == meme_id)
-            .returning(CollectionMeme.meme_id)
+            .returning(CollectionMeme.meme_id, CollectionMeme.added_by_user_id)
         )
-        return result.scalar_one_or_none() is not None
+        row = result.one_or_none()
+        if row is None:
+            return None
+        return cast("uuid.UUID", row.meme_id), cast("uuid.UUID | None", row.added_by_user_id)
+
+    async def _project_collection_meme_removal(
+        self,
+        *,
+        actor_user_id: uuid.UUID,
+        preference_user_id: uuid.UUID,
+        meme_id: uuid.UUID,
+    ) -> None:
+        await project_durable_preference_change(
+            self._session,
+            user_id=actor_user_id,
+            meme_id=meme_id,
+            is_add=False,
+        )
+        if preference_user_id != actor_user_id:
+            await project_durable_preference_change(
+                self._session,
+                user_id=preference_user_id,
+                meme_id=meme_id,
+                is_add=False,
+            )
 
     async def _delete_orphan_private_meme_if_unreferenced(self, meme_id: object) -> tuple[str, ...]:
         meme = await self._session.scalar(

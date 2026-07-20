@@ -1,33 +1,49 @@
 import type { Cookies } from '@sveltejs/kit';
 import type { PageServerLoad } from './$types';
-import { DEFAULT_PAGE_SIZE, ApiError, emptyMemePage, fetchHomeFeed, fetchMemeOfTheDay, fetchMemePage, type ApiFetch } from '$lib/api/client';
+import {
+  DEFAULT_PAGE_SIZE,
+  ApiError,
+  emptyMemePage,
+  fetchCurrentSession,
+  fetchHomeFeed,
+  fetchMemeOfTheDay,
+  fetchMemePage,
+  type ApiFetch
+} from '$lib/api/client';
 import type { PublicMemeOfTheDayRead } from '$lib/api/types';
 import { ACCESS_COOKIE_NAME, apiBaseUrl, cookieHeaderWithAccessToken, forwardBackendAccessCookie } from '$lib/server/backend';
 
-export const load: PageServerLoad = async ({ cookies, fetch, parent, request, url }) => {
+export const load: PageServerLoad = async ({ cookies, fetch, parent, request, setHeaders, url }) => {
+  setHeaders({ 'cache-control': 'private, no-store' });
   const query = (url.searchParams.get('q') ?? '').trim();
   const offset = readOffset(url.searchParams.get('offset'));
-  await parent();
+  const upstreamFetch: ApiFetch = (input, init) => fetch(input, { ...init, signal: request.signal });
+  const parentData = await parent();
   const cookieHeader = cookieHeaderWithAccessToken(
     request.headers.get('cookie') ?? undefined,
     cookies.get(ACCESS_COOKIE_NAME) ?? null
   );
   const backendBaseUrl = apiBaseUrl();
   const feedSource = query ? 'catalog' : 'home';
-  const memeOfTheDayPromise = loadMemeOfTheDay({ fetch, baseUrl: backendBaseUrl, cookieHeader, cookies });
+  const parentViewerId = parentData.session?.user.id ?? null;
+  let issuedHomeAccessToken: string | null = null;
+  const memeOfTheDayPromise = loadMemeOfTheDay({ fetch: upstreamFetch, baseUrl: backendBaseUrl, cookieHeader, cookies });
 
   try {
     const [page, memeOfTheDayResult] = await Promise.all([
       feedSource === 'home'
         ? fetchHomeFeed({
-            fetch,
+            fetch: upstreamFetch,
             baseUrl: backendBaseUrl,
             limit: DEFAULT_PAGE_SIZE,
             offset,
-            cookieHeader
+            cookieHeader,
+            onResponse: (response) => {
+              issuedHomeAccessToken = forwardBackendAccessCookie(response, cookies) ?? issuedHomeAccessToken;
+            }
           })
         : fetchMemePage({
-            fetch,
+            fetch: upstreamFetch,
             baseUrl: backendBaseUrl,
             query,
             limit: DEFAULT_PAGE_SIZE,
@@ -36,9 +52,20 @@ export const load: PageServerLoad = async ({ cookies, fetch, parent, request, ur
           }),
       memeOfTheDayPromise
     ]);
+    const pageViewerId = feedSource === 'home'
+      ? await resolveHomePageViewerId({
+          fetch: upstreamFetch,
+          baseUrl: backendBaseUrl,
+          cookieHeader,
+          cookies,
+          parentViewerId,
+          issuedAccessToken: issuedHomeAccessToken
+        })
+      : parentViewerId;
 
     return {
       page,
+      pageViewerId,
       query,
       offset,
       feedSource,
@@ -48,10 +75,21 @@ export const load: PageServerLoad = async ({ cookies, fetch, parent, request, ur
     };
   } catch (error) {
     const memeOfTheDayResult = await memeOfTheDayPromise;
+    const pageViewerId = feedSource === 'home'
+      ? await resolveHomePageViewerId({
+          fetch: upstreamFetch,
+          baseUrl: backendBaseUrl,
+          cookieHeader,
+          cookies,
+          parentViewerId,
+          issuedAccessToken: issuedHomeAccessToken
+        })
+      : parentViewerId;
 
     if (error instanceof ApiError) {
       return {
         page: emptyMemePage(DEFAULT_PAGE_SIZE, offset),
+        pageViewerId,
         query,
         offset,
         feedSource,
@@ -63,6 +101,7 @@ export const load: PageServerLoad = async ({ cookies, fetch, parent, request, ur
 
     return {
       page: emptyMemePage(DEFAULT_PAGE_SIZE, offset),
+      pageViewerId,
       query,
       offset,
       feedSource,
@@ -72,6 +111,42 @@ export const load: PageServerLoad = async ({ cookies, fetch, parent, request, ur
     };
   }
 };
+
+interface HomePageViewerRequest {
+  fetch: ApiFetch;
+  baseUrl: string;
+  cookieHeader?: string;
+  cookies: Cookies;
+  parentViewerId: string | null;
+  issuedAccessToken: string | null;
+}
+
+async function resolveHomePageViewerId({
+  fetch,
+  baseUrl,
+  cookieHeader,
+  cookies,
+  parentViewerId,
+  issuedAccessToken
+}: HomePageViewerRequest): Promise<string | null> {
+  if (parentViewerId || !issuedAccessToken) {
+    return parentViewerId;
+  }
+
+  try {
+    const session = await fetchCurrentSession({
+      fetch,
+      baseUrl,
+      cookieHeader: cookieHeaderWithAccessToken(cookieHeader, issuedAccessToken),
+      onResponse: (response) => {
+        forwardBackendAccessCookie(response, cookies);
+      }
+    });
+    return session.user.id;
+  } catch {
+    return null;
+  }
+}
 
 function readOffset(raw: string | null): number {
   const offset = Number.parseInt(raw ?? '', 10);

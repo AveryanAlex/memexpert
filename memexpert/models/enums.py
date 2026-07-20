@@ -576,6 +576,7 @@ class AnalyticsEventType(StrEnum):
     INLINE_SERVED = "inline_served"
     MEME_DETAIL_CLICK = "meme_detail_click"
     MEME_DOWNLOAD = "meme_download"
+    MEME_ENGAGED_VIEW = "meme_engaged_view"
     MEME_IMPRESSION = "meme_impression"
     MEME_LIKE = "meme_like"
     MEME_PIN = "meme_pin"

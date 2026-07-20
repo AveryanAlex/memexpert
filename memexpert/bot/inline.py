@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import uuid
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from aiogram import Router
 from aiogram.types import (
@@ -25,17 +25,22 @@ from aiogram.types import (
 from sqlalchemy import select
 
 from memexpert.bot.analytics import record_telegram_interaction_event, telegram_user_hash
-from memexpert.bot.meme_search_factory import build_default_meme_search_service_factory
+from memexpert.bot.meme_search_factory import (
+    build_default_meme_search_service_factory,
+    build_default_recommendation_service_factory,
+)
 from memexpert.core.config import Settings, get_settings
 from memexpert.core.database import get_async_session_factory
 from memexpert.core.storage import StorageConfigurationError, build_s3_client, get_pipeline_storage_settings
 from memexpert.models.content import MemeFile
 from memexpert.models.enums import AccountStatus, AccountType, AnalyticsEventType, TelegramMediaFormat
-from memexpert.models.user import User
+from memexpert.models.user import AnalyticsEvent, User
 from memexpert.services import CollectionService, CollectionServiceError, ProviderNotConfiguredError
+from memexpert.services.recommendations.telegram_sessions import TelegramInlineSessionStore
 from memexpert.services.telegram_inline import (
     MPEG4_GIF_MIME_TYPE,
     MemeSearchServiceFactory,
+    RecommendationServiceFactory,
     TelegramInlineMediaResult,
     TelegramInlineMediaUrlProvider,
     TelegramInlineSearchPage,
@@ -106,7 +111,9 @@ def build_inline_router(
     settings: Settings | None = None,
     session_factory: AsyncSessionFactory | None = None,
     meme_search_service_factory: MemeSearchServiceFactory | None = None,
+    recommendation_service_factory: RecommendationServiceFactory | None = None,
     inline_media_url_provider: InlineMediaUrlProvider | None = None,
+    inline_sessions: TelegramInlineSessionStore | None = None,
 ) -> Router:
     """Build the inline-mode router backed by the shared meme search service."""
 
@@ -115,12 +122,23 @@ def build_inline_router(
     resolved_service_factory = meme_search_service_factory or build_default_meme_search_service_factory(
         resolved_settings,
     )
+    resolved_recommendation_factory = (
+        recommendation_service_factory
+        or build_default_recommendation_service_factory(
+            resolved_settings,
+            meme_search_service_factory=resolved_service_factory,
+        )
+    )
     resolved_media_url_provider = inline_media_url_provider or S3PresignedInlineMediaUrlProvider(resolved_settings)
+    resolved_inline_sessions = inline_sessions or TelegramInlineSessionStore(settings=resolved_settings)
     bot_scope = _build_bot_scope(resolved_settings)
     resolved_inline_service_factory = _build_default_inline_service_factory(
         meme_search_service_factory=resolved_service_factory,
+        recommendation_service_factory=resolved_recommendation_factory,
         inline_media_url_provider=resolved_media_url_provider,
         bot_scope=bot_scope,
+        inline_sessions=resolved_inline_sessions,
+        settings=resolved_settings,
     )
 
     router = Router(name="inline-search")
@@ -160,24 +178,41 @@ async def answer_inline_query(
     session_factory: AsyncSessionFactory,
     inline_service_factory: TelegramInlineServiceFactory | None = None,
     meme_search_service_factory: MemeSearchServiceFactory | None = None,
+    recommendation_service_factory: RecommendationServiceFactory | None = None,
     inline_media_url_provider: InlineMediaUrlProvider | None = None,
     bot_scope: str | None = None,
+    inline_sessions: TelegramInlineSessionStore | None = None,
+    settings: Settings | None = None,
 ) -> None:
     """Search memes for a Telegram inline query and answer with sendable media results."""
 
-    offset = _parse_offset(inline_query.offset)
     query = inline_query.query.strip()
+    raw_offset = inline_query.offset.strip()
+    if query or raw_offset.isdecimal():
+        offset = _parse_offset(raw_offset)
+        cursor = None
+    else:
+        offset = 0
+        cursor = raw_offset or None
 
     async with session_factory() as session:
         try:
             resolved_inline_service_factory = inline_service_factory
             if resolved_inline_service_factory is None:
-                if meme_search_service_factory is None or inline_media_url_provider is None or bot_scope is None:
+                if (
+                    meme_search_service_factory is None
+                    or recommendation_service_factory is None
+                    or inline_media_url_provider is None
+                    or bot_scope is None
+                ):
                     raise ProviderNotConfiguredError("Telegram inline service factory is not configured.")
                 resolved_inline_service_factory = _build_default_inline_service_factory(
                     meme_search_service_factory=meme_search_service_factory,
+                    recommendation_service_factory=recommendation_service_factory,
                     inline_media_url_provider=inline_media_url_provider,
                     bot_scope=bot_scope,
+                    inline_sessions=inline_sessions or TelegramInlineSessionStore(settings=settings),
+                    settings=settings or get_settings(),
                 )
             inline_service = resolved_inline_service_factory(session)
             page = await inline_service.search_inline_memes(
@@ -185,6 +220,7 @@ async def answer_inline_query(
                 query=query,
                 limit=INLINE_SEARCH_LIMIT,
                 offset=offset,
+                cursor=cursor,
             )
             served_items: list[TelegramInlineMediaResult] = []
             results: list[InlineResult] = []
@@ -206,11 +242,13 @@ async def answer_inline_query(
             )
             served_items = []
             results = []
-        # Search pagination is offset-based, but inline conversion may filter out
-        # unsupported/private-storage items. Do not ask Telegram for another page
-        # after returning zero sendable results; that can otherwise produce empty
-        # scroll pages or skip supported media that the user never saw.
-        next_offset = str(offset + page.limit) if page.has_more and results else ""
+        # Text search keeps shareable numeric offsets. Empty discovery exposes a
+        # compact Redis-backed handle because the frozen recommendation cursor is
+        # larger than Telegram's 64-byte next_offset limit.
+        if query:
+            next_offset = str(offset + page.limit) if page.has_more and results else ""
+        else:
+            next_offset = (page.next_cursor or "") if page.has_more and results else ""
         await inline_query.answer(
             results,
             cache_time=INLINE_CACHE_TIME_SECONDS,
@@ -220,7 +258,7 @@ async def answer_inline_query(
         await _record_inline_query_event(
             session,
             inline_query=inline_query,
-            offset=offset,
+            offset=page.offset,
             result_count=len(results),
             has_more=page.has_more,
         )
@@ -228,7 +266,7 @@ async def answer_inline_query(
             session,
             inline_query=inline_query,
             items=served_items,
-            offset=offset,
+            offset=page.offset,
             result_count=len(results),
             is_personal=page.is_personal,
         )
@@ -256,6 +294,12 @@ async def record_chosen_inline_result(
         user_id = await _resolve_linked_user_id(session, telegram_user_id=chosen_result.from_user.id)
         if file_id is None or meme_id is None:
             return
+        served_attribution = await _load_served_inline_attribution(
+            session,
+            user_id=user_id,
+            meme_id=meme_id,
+            impression_id=impression_id,
+        )
 
         for event_type in (
             AnalyticsEventType.INLINE_CHOSEN,
@@ -270,6 +314,7 @@ async def record_chosen_inline_result(
                 file_id=file_id,
                 chosen_result=chosen_result,
                 impression_id=impression_id,
+                served_attribution=served_attribution,
             )
 
 
@@ -280,7 +325,7 @@ async def handle_inline_library_callback(
 ) -> None:
     """Handle the simple Favorite/Save/Pin buttons attached to inline meme results."""
 
-    action, file_id = _parse_library_callback_data(callback_query.data)
+    action, file_id, impression_id = _parse_library_callback_data(callback_query.data)
     if action is None or file_id is None:
         await callback_query.answer("This meme action is no longer supported.", show_alert=True)
         return
@@ -329,16 +374,27 @@ async def handle_inline_library_callback(
         if not mutation.changed:
             await callback_query.answer(text)
             return
+        served_attribution = await _load_served_inline_attribution(
+            session,
+            user_id=user_id,
+            meme_id=meme_id,
+            impression_id=impression_id,
+        )
+        event_fields, trusted_properties = _trusted_inline_attribution_fields(served_attribution)
         await record_telegram_interaction_event(
             session,
             {
                 "event_type": event_type,
                 "user_id": user_id,
-                "surface": "telegram_inline_library",
+                "surface": event_fields.pop("surface", "telegram_inline_library"),
                 "refs": {"collection_id": collection_id, "meme_id": meme_id},
+                "impression_id": impression_id,
+                **event_fields,
                 "properties": {
-                    "action": action,
+                    "action": "add",
+                    "preference_kind": {"fav": "favorite", "save": "save", "pin": "pin"}[action],
                     "telegram_user_hash": telegram_user_hash(callback_query.from_user.id),
+                    **trusted_properties,
                 },
             },
             log_context={
@@ -355,15 +411,21 @@ async def handle_inline_library_callback(
 def _build_default_inline_service_factory(
     *,
     meme_search_service_factory: MemeSearchServiceFactory,
+    recommendation_service_factory: RecommendationServiceFactory,
     inline_media_url_provider: InlineMediaUrlProvider,
     bot_scope: str,
+    inline_sessions: TelegramInlineSessionStore,
+    settings: Settings,
 ) -> TelegramInlineServiceFactory:
     def factory(session: AsyncSession) -> TelegramInlineService:
         return TelegramInlineService(
             session,
             meme_search_service=meme_search_service_factory(session),
+            recommendation_service=recommendation_service_factory(session),
             media_url_provider=inline_media_url_provider,
             bot_scope=bot_scope,
+            inline_sessions=inline_sessions,
+            settings=settings,
         )
 
     return factory
@@ -418,6 +480,10 @@ async def _record_inline_served_events(
     for item in items:
         attribution = item.attribution
         surface = attribution.surface or "telegram_inline"
+        impression_id = _result_impression_id(
+            file_id=item.file.id,
+            impression_id=attribution.impression_id,
+        )
         await record_telegram_interaction_event(
             session,
             {
@@ -426,7 +492,7 @@ async def _record_inline_served_events(
                 "surface": surface,
                 "refs": {"meme_id": item.meme.id, "meme_file_id": item.file.id},
                 "request_id": attribution.request_id,
-                "impression_id": attribution.impression_id,
+                "impression_id": impression_id,
                 "source_algorithm": attribution.source_algorithm,
                 "query": attribution.query,
                 "rank": attribution.rank,
@@ -440,6 +506,12 @@ async def _record_inline_served_events(
                     "result_count": result_count,
                     "media_format": item.media_format.value,
                     "is_personal": is_personal,
+                    "attribution_trusted": True,
+                    "algorithm_version": attribution.algorithm_version,
+                    "profile_version": attribution.profile_version,
+                    "candidate_sources": [
+                        source.model_dump(mode="json") for source in attribution.candidate_sources
+                    ],
                 },
             },
             log_context={
@@ -448,7 +520,7 @@ async def _record_inline_served_events(
                 "meme_id": str(item.meme.id),
                 "meme_file_id": str(item.file.id),
                 "request_id": attribution.request_id,
-                "impression_id": attribution.impression_id,
+                "impression_id": impression_id,
                 "user_id": str(user_id) if user_id else None,
             },
         )
@@ -463,19 +535,23 @@ async def _record_chosen_inline_event(
     file_id: uuid.UUID,
     chosen_result: ChosenInlineResult,
     impression_id: str | None,
+    served_attribution: dict[str, object] | None,
 ) -> None:
+    event_fields, trusted_properties = _trusted_inline_attribution_fields(served_attribution)
     await record_telegram_interaction_event(
         session,
         {
             "event_type": event_type,
             "user_id": user_id,
-            "surface": "telegram_inline",
+            "surface": event_fields.pop("surface", "telegram_inline"),
             "refs": {"meme_id": meme_id, "meme_file_id": file_id},
             "impression_id": impression_id,
             "query": chosen_result.query,
+            **event_fields,
             "properties": {
                 "telegram_user_hash": telegram_user_hash(chosen_result.from_user.id),
                 "result_id": chosen_result.result_id,
+                **trusted_properties,
             },
         },
         log_context={
@@ -487,6 +563,55 @@ async def _record_chosen_inline_event(
             "user_id": str(user_id) if user_id else None,
         },
     )
+
+
+async def _load_served_inline_attribution(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID | None,
+    meme_id: uuid.UUID,
+    impression_id: str | None,
+) -> dict[str, object] | None:
+    if not impression_id:
+        return None
+    payload = await session.scalar(
+        select(AnalyticsEvent.payload)
+        .where(
+            AnalyticsEvent.event_type == AnalyticsEventType.INLINE_SERVED,
+            AnalyticsEvent.user_id == user_id,
+            AnalyticsEvent.payload["impression_id"].astext == impression_id,
+            AnalyticsEvent.payload["refs"]["meme_id"].astext == str(meme_id),
+        )
+        .order_by(AnalyticsEvent.occurred_at.desc(), AnalyticsEvent.id.desc())
+        .limit(1)
+    )
+    return dict(payload) if isinstance(payload, dict) else None
+
+
+def _trusted_inline_attribution_fields(
+    payload: dict[str, object] | None,
+) -> tuple[dict[str, object], dict[str, object]]:
+    if payload is None:
+        return {}, {}
+    properties = payload.get("properties")
+    if not isinstance(properties, dict) or properties.get("attribution_trusted") is not True:
+        return {}, {}
+    typed_properties = cast("dict[str, object]", properties)
+
+    event_fields = {
+        key: payload[key]
+        for key in ("surface", "request_id", "source_algorithm", "rank", "score", "score_components", "reason")
+        if payload.get(key) is not None
+    }
+    trusted_properties = {
+        "attribution_trusted": True,
+        **{
+            key: typed_properties[key]
+            for key in ("algorithm_version", "profile_version", "candidate_sources")
+            if typed_properties.get(key) is not None
+        },
+    }
+    return event_fields, trusted_properties
 
 
 async def _resolve_linked_user_id(session: AsyncSession, *, telegram_user_id: int) -> uuid.UUID | None:
@@ -617,11 +742,13 @@ def _build_result_id(*, media_format: TelegramMediaFormat, file_id: uuid.UUID, i
     prefix = "p" if media_format is TelegramMediaFormat.PHOTO else "a"
     if not impression_id:
         return f"{prefix}:{file_id.hex}"
-    result_id = f"{prefix}:{file_id.hex}:{impression_id}"
-    if len(result_id) <= 64:
-        return result_id
-    compact_impression_id = "imp_" + hashlib.sha256(impression_id.encode("utf-8")).hexdigest()[:12]
-    return f"{prefix}:{file_id.hex}:{compact_impression_id}"
+    return f"{prefix}:{file_id.hex}:{_result_impression_id(file_id=file_id, impression_id=impression_id)}"
+
+
+def _result_impression_id(*, file_id: uuid.UUID, impression_id: str) -> str:
+    if len(f"p:{file_id.hex}:{impression_id}") <= 64:
+        return impression_id
+    return "imp_" + hashlib.sha256(impression_id.encode("utf-8")).hexdigest()[:24]
 
 
 def _parse_result_file_id(result_id: str) -> uuid.UUID | None:
@@ -644,16 +771,18 @@ def _build_library_callback_data(action: str, result_id: str) -> str:
     return f"{LIBRARY_CALLBACK_PREFIX}:{action}:{result_id}"
 
 
-def _parse_library_callback_data(value: str | None) -> tuple[str | None, uuid.UUID | None]:
+def _parse_library_callback_data(
+    value: str | None,
+) -> tuple[str | None, uuid.UUID | None, str | None]:
     if value is None:
-        return None, None
+        return None, None, None
     try:
         prefix, action, result_id = value.split(":", maxsplit=2)
     except ValueError:
-        return None, None
+        return None, None, None
     if prefix != LIBRARY_CALLBACK_PREFIX:
-        return None, None
-    return action, _parse_result_file_id(result_id)
+        return None, None, None
+    return action, _parse_result_file_id(result_id), _parse_result_impression_id(result_id)
 
 
 def _build_bot_scope(settings: Settings) -> str:
@@ -672,6 +801,7 @@ __all__ = [
     "InlineMediaUrlProvider",
     "LIBRARY_CALLBACK_PREFIX",
     "MemeSearchServiceFactory",
+    "RecommendationServiceFactory",
     "S3PresignedInlineMediaUrlProvider",
     "answer_inline_query",
     "build_inline_router",

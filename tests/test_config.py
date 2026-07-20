@@ -187,6 +187,41 @@ def test_settings_search_candidate_pool_limit_defaults_and_bounds() -> None:
         _ = Settings(search_candidate_pool_limit_per_source=501)
 
 
+def test_settings_recommendation_rollout_defaults_cannot_serve_personalized_v2() -> None:
+    settings = Settings()
+
+    assert settings.recommendation_enabled is False
+    assert settings.recommendation_shadow_mode is True
+    assert settings.recommendation_canary_percent == 0
+    assert settings.recommendation_shadow_timeout_seconds == pytest.approx(0.25)
+
+    explicitly_enabled = Settings.model_validate(
+        {
+            "recommendation_enabled": True,
+            "recommendation_shadow_mode": False,
+            "recommendation_canary_percent": 1,
+        }
+    )
+    assert explicitly_enabled.recommendation_enabled is True
+    assert explicitly_enabled.recommendation_shadow_mode is False
+    assert explicitly_enabled.recommendation_canary_percent == 1
+
+    with pytest.raises(ValidationError):
+        _ = Settings(recommendation_shadow_timeout_seconds=0.0)
+    with pytest.raises(ValidationError):
+        _ = Settings(recommendation_shadow_timeout_seconds=5.1)
+
+
+def test_settings_recommendation_feed_pool_per_viewer_cap_is_small_and_bounded() -> None:
+    assert Settings().recommendation_feed_pool_max_per_viewer == 4
+    assert Settings(recommendation_feed_pool_max_per_viewer=32).recommendation_feed_pool_max_per_viewer == 32
+
+    with pytest.raises(ValidationError):
+        _ = Settings(recommendation_feed_pool_max_per_viewer=0)
+    with pytest.raises(ValidationError):
+        _ = Settings(recommendation_feed_pool_max_per_viewer=33)
+
+
 def test_settings_database_pool_and_runtime_health_defaults_and_bounds() -> None:
     settings = Settings()
 
@@ -368,6 +403,20 @@ def test_settings_scheduler_batch_job_defaults_match_design() -> None:
     assert settings.scheduler_meilisearch_settings_reconcile_interval_seconds == 60.0
     assert settings.meilisearch_settings_task_timeout_seconds == 600.0
     assert settings.scheduler_seo_backlog_batch_size == 25
+
+
+def test_settings_require_home_ranking_weights_to_sum_to_one() -> None:
+    with pytest.raises(ValidationError, match="home ranking weights must sum to 1.0"):
+        _ = Settings.model_validate({"recommendation_personal_fit_weight": 0.39})
+
+    settings = Settings.model_validate(
+        {
+            "recommendation_personal_fit_weight": 0.39,
+            "recommendation_exploration_weight": 0.06,
+        }
+    )
+    assert settings.recommendation_personal_fit_weight == 0.39
+    assert settings.recommendation_exploration_weight == 0.06
 
 
 @pytest.mark.parametrize(

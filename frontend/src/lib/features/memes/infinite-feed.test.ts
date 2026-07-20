@@ -89,6 +89,9 @@ function result(id: string): PublicMemeSearchResultRead {
   return {
     meme: meme(id),
     attribution: {
+      attribution_token: null,
+      candidate_sources: [],
+      profile_version: null,
       request_id: 'req_test',
       impression_id: `imp_${id}`,
       surface: 'test',

@@ -1,9 +1,10 @@
 <script lang="ts">
   import { browser } from '$app/environment';
-  import { recordMemeDetailClick, recordMemeImpression } from '$lib/api/client';
+  import { createAccumulatedForegroundTimer, hasEngagedViewVisibility } from '$lib/analytics/engaged-view';
+  import { readMemeInteractionQueue } from '$lib/analytics/interaction-queue';
   import type { MemeResultAttributionRead, PublicMemeCardRead } from '$lib/api/types';
   import { selectMediaRender } from '$lib/media/render';
-  import { memeActionAttributionBody, memeHref, memeTitle } from '$lib/memeActions';
+  import { memeHref, memeTitle } from '$lib/memeActions';
   import { cn, focusRing } from '$lib/ui/styles';
   import { ExternalLink } from '@lucide/svelte';
   import MemeActionMenu from './MemeActionMenu.svelte';
@@ -38,6 +39,7 @@
   let cardElement = $state<HTMLElement>();
   const componentId = $props.id();
   const exposureScope = readMemeExposureScope();
+  const interactionQueue = readMemeInteractionQueue();
 
   const providedExposureId = $derived(firstNonBlankExposureId(exposureId, attribution?.impression_id));
   const resolvedExposureId = $derived.by(() => {
@@ -59,8 +61,7 @@
   const showTitle = $derived(title !== 'Untitled meme');
   const titleId = $derived(`meme-card-title-${meme.id}`);
   const accessVisibility = $derived(meme.viewer_access?.visibility ?? 'public');
-  const actionBody = $derived(memeActionAttributionBody(exposureAttribution));
-  const telemetryRequest = $derived({ fetch, memeId: meme.id, body: actionBody, keepalive: true });
+  const attributionToken = $derived(attribution?.attribution_token ?? null);
   const isVideo = $derived(Boolean(selectMediaRender(meme.primary_file).videoUrl));
 
   $effect(() => {
@@ -69,42 +70,72 @@
       !$exposureScope.clientReady ||
       !resolvedExposureId ||
       !cardElement ||
-      exposureScope.hasRecorded(resolvedExposureId) ||
+      (exposureScope.hasRecorded(resolvedExposureId) && exposureScope.hasRecorded(`${resolvedExposureId}:engaged`)) ||
       typeof IntersectionObserver === 'undefined'
     ) return;
 
     const observedExposureId = resolvedExposureId;
+    const engagedExposureId = `${observedExposureId}:engaged`;
+    const engagementTimer = createAccumulatedForegroundTimer({
+      onComplete: () => {
+        if (!exposureScope.claim(engagedExposureId)) return;
+        interactionQueue.enqueue({
+          eventType: 'meme_engaged_view',
+          memeId: meme.id,
+          attributionToken,
+          properties: { impression_id: observedExposureId }
+        });
+      }
+    });
+    const syncDocumentVisibility = () => {
+      engagementTimer.setForeground(document.visibilityState !== 'hidden');
+    };
+    syncDocumentVisibility();
+    document.addEventListener('visibilitychange', syncDocumentVisibility);
+
     const observer = new IntersectionObserver(
       (entries) => {
-        if (
-          exposureScope.hasRecorded(observedExposureId) ||
-          !hasQualifyingMemeExposure(entries)
-        ) return;
+        const entry = [...entries].reverse().find((candidate) => candidate.target === cardElement);
+        if (!entry) return;
 
-        if (!exposureScope.claim(observedExposureId)) return;
-        observer.disconnect();
-        void recordMemeImpression(telemetryRequest).catch((error) => logTelemetryFailure('impression', error));
+        if (!exposureScope.hasRecorded(observedExposureId) && hasQualifyingMemeExposure([entry])) {
+          if (exposureScope.claim(observedExposureId)) {
+            interactionQueue.enqueue({
+              eventType: 'meme_impression',
+              memeId: meme.id,
+              attributionToken,
+              properties: { impression_id: observedExposureId }
+            });
+          }
+        }
+        engagementTimer.setVisible(hasEngagedViewVisibility(entry));
       },
-      { threshold: 0.25 }
+      { threshold: [0.25, 0.5] }
     );
     observer.observe(cardElement);
 
-    return () => observer.disconnect();
+    return () => {
+      observer.disconnect();
+      engagementTimer.dispose();
+      document.removeEventListener('visibilitychange', syncDocumentVisibility);
+    };
   });
 
   function handleDetailClick() {
     if (!browser) return;
 
-    void recordMemeDetailClick(telemetryRequest).catch((error) => logTelemetryFailure('detail-click', error));
+    interactionQueue.enqueue({
+      eventType: 'meme_detail_click',
+      memeId: meme.id,
+      attributionToken,
+      properties: resolvedExposureId ? { impression_id: resolvedExposureId } : undefined
+    });
   }
 
   function firstNonBlankExposureId(...values: Array<string | null | undefined>): string | null {
     return values.find((value): value is string => Boolean(value?.trim())) ?? null;
   }
 
-  function logTelemetryFailure(action: 'detail-click' | 'impression', error: unknown) {
-    console.warn('Meme card telemetry failed.', { action, memeId: meme.id, error });
-  }
 </script>
 
 <article

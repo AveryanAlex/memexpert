@@ -14,10 +14,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from memexpert.models.content import Meme, MemeFile, MemeTemplate
 from memexpert.models.enums import AnalyticsEventType, ContentKind, ContentLanguage, ContentProcessingStatus
+from memexpert.models.recommendation import UserMemeRecommendationState, UserRecommendationProfileStatus
 from memexpert.models.user import AccountMergeLog, AnalyticsEvent, User
 from memexpert.services.analytics import (
     AnalyticsService,
     InteractionActorType,
+    InteractionEventIdConflictError,
     InteractionEventRefs,
     InteractionEventWrite,
 )
@@ -38,6 +40,137 @@ class FailingAnalyticsSession:
 
     async def rollback(self) -> None:
         self.rollback_calls += 1
+
+
+async def test_uuidv7_events_are_idempotent_and_project_exact_recommendation_state(
+    migrated_db_session: AsyncSession,
+) -> None:
+    user = build_full_user()
+    migrated_db_session.add(user)
+    await migrated_db_session.flush()
+    meme = await _create_profile_stats_meme(migrated_db_session)
+    await migrated_db_session.commit()
+    service = AnalyticsService(migrated_db_session)
+    observed_at = datetime.now(UTC)
+    impression_id = uuid.uuid7()
+    engaged_id = uuid.uuid7()
+    writes = (
+        InteractionEventWrite(
+            event_id=impression_id,
+            event_type=AnalyticsEventType.MEME_IMPRESSION,
+            user_id=user.id,
+            surface="web_home",
+            refs=InteractionEventRefs(meme_id=meme.id),
+            impression_id="imp-state-1",
+            occurred_at=observed_at,
+        ),
+        InteractionEventWrite(
+            event_id=engaged_id,
+            event_type=AnalyticsEventType.MEME_ENGAGED_VIEW,
+            user_id=user.id,
+            surface="web_home",
+            refs=InteractionEventRefs(meme_id=meme.id),
+            impression_id="imp-state-1",
+            occurred_at=observed_at + timedelta(seconds=3),
+        ),
+    )
+
+    first = await service.record_interaction_events(writes)
+    retried = await service.record_interaction_events(writes)
+    logical_retries = await service.record_interaction_events(
+        (
+            writes[0].model_copy(
+                update={
+                    "event_id": uuid.uuid7(),
+                    "occurred_at": observed_at + timedelta(seconds=10),
+                }
+            ),
+            writes[1].model_copy(
+                update={
+                    "event_id": uuid.uuid7(),
+                    "occurred_at": observed_at + timedelta(seconds=11),
+                }
+            ),
+        )
+    )
+    strong_at = observed_at + timedelta(seconds=4)
+    await service.record_interaction_event(
+        InteractionEventWrite(
+            event_id=uuid.uuid7(),
+            event_type=AnalyticsEventType.MEME_PIN,
+            user_id=user.id,
+            surface="web_home",
+            refs=InteractionEventRefs(meme_id=meme.id),
+            properties={"action": "add", "preference_kind": "pin"},
+            occurred_at=strong_at,
+        )
+    )
+    await service.record_interaction_event(
+        InteractionEventWrite(
+            event_id=uuid.uuid7(),
+            event_type=AnalyticsEventType.MEME_PIN,
+            user_id=user.id,
+            surface="web_home",
+            refs=InteractionEventRefs(meme_id=meme.id),
+            properties={"action": "remove", "preference_kind": "pin"},
+            occurred_at=observed_at + timedelta(seconds=5),
+        )
+    )
+
+    state = await migrated_db_session.get(UserMemeRecommendationState, (user.id, meme.id))
+    profile_status = await migrated_db_session.get(UserRecommendationProfileStatus, user.id)
+    events = (
+        await migrated_db_session.scalars(
+            select(AnalyticsEvent).where(AnalyticsEvent.id.in_((impression_id, engaged_id)))
+        )
+    ).all()
+    assert (first.recorded, first.duplicates) == (2, 0)
+    assert (retried.recorded, retried.duplicates) == (0, 2)
+    assert (logical_retries.recorded, logical_retries.duplicates) == (0, 2)
+    assert len(events) == 2
+    assert state is not None
+    assert state.first_seen_at == observed_at
+    assert state.latest_impression_at == observed_at
+    assert state.latest_engaged_view_at == observed_at + timedelta(seconds=3)
+    assert state.latest_strong_action_at == strong_at
+    assert state.impression_count == 1
+    assert profile_status is not None
+    assert profile_status.dirty_since == observed_at + timedelta(seconds=3)
+
+    with pytest.raises(InteractionEventIdConflictError):
+        await service.record_interaction_event(
+            InteractionEventWrite(
+                event_id=impression_id,
+                event_type=AnalyticsEventType.MEME_DETAIL_CLICK,
+                user_id=user.id,
+                surface="web_home",
+                refs=InteractionEventRefs(meme_id=meme.id),
+            )
+        )
+
+    with pytest.raises(InteractionEventIdConflictError):
+        await service.record_interaction_event(
+            writes[0].model_copy(update={"impression_id": "imp-state-other"})
+        )
+
+
+async def test_interaction_event_rejects_non_uuidv7_client_id() -> None:
+    with pytest.raises(ValidationError, match="UUIDv7"):
+        _ = InteractionEventWrite(
+            event_id=uuid.uuid4(),
+            event_type=AnalyticsEventType.PAGE_VIEW,
+            surface="web_home",
+        )
+
+
+async def test_interaction_event_rejects_unreasonable_future_timestamp() -> None:
+    with pytest.raises(ValidationError, match="five minutes in the future"):
+        _ = InteractionEventWrite(
+            event_type=AnalyticsEventType.MEME_IMPRESSION,
+            surface="web_home",
+            refs=InteractionEventRefs(meme_id=uuid.uuid7()),
+            occurred_at=datetime.now(UTC) + timedelta(minutes=6),
+        )
 
 
 async def _create_profile_stats_meme(

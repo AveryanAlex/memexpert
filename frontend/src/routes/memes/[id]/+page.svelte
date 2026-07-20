@@ -1,5 +1,6 @@
 <script lang="ts">
   import { browser } from '$app/environment';
+  import { uuidV7 } from '$lib/analytics/uuid-v7';
   import { recordMemeView } from '$lib/api/client';
   import { readAuthState } from '$lib/auth-state';
   import InfiniteMemeFeed from '$lib/features/memes/InfiniteMemeFeed.svelte';
@@ -32,7 +33,7 @@
     void recordMemeView({
       fetch,
       memeId,
-      body: memeActionAttributionBody(data.attribution),
+      body: memeActionAttributionBody(data.attribution, uuidV7()),
       keepalive: true
     }).catch((error) => console.warn('Meme detail telemetry failed.', { action: 'view', memeId, error }));
   });

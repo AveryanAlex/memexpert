@@ -202,6 +202,7 @@ async def test_search_index_state_builds_collection_aware_public_crawled_payload
     assert qdrant_payload.search_index_algorithm_version == SEARCH_INDEX_ALGORITHM_VERSION
     assert meili_document.search_index_algorithm_version == SEARCH_INDEX_ALGORITHM_VERSION
     assert qdrant_payload.is_public is True
+    assert qdrant_payload.is_primary_file is True
     assert meili_document.is_public is True
     assert qdrant_payload.uploader_user_ids == []
     assert qdrant_payload.media_type == ContentKind.IMAGE.value
@@ -236,6 +237,27 @@ async def test_search_index_state_builds_collection_aware_public_crawled_payload
     assert meili_document.collection_ids == qdrant_payload.collection_ids
     assert meili_document.collection_owner_user_ids == qdrant_payload.collection_owner_user_ids
     assert meili_document.collection_member_user_ids == qdrant_payload.collection_member_user_ids
+
+
+async def test_search_index_state_marks_only_the_canonical_primary_file(
+    migrated_db_session: AsyncSession,
+) -> None:
+    meme, primary_file = await _create_meme_with_primary_file(migrated_db_session)
+    secondary_file = MemeFile(
+        id=uuid.uuid7(),
+        meme_id=meme.id,
+        s3_original_key=f"pipeline/originals/{meme.id}-secondary.jpg",
+        mime_type="image/jpeg",
+        quality_score=0.7,
+    )
+    migrated_db_session.add(secondary_file)
+    await migrated_db_session.commit()
+
+    primary_state = await load_search_index_state(migrated_db_session, primary_file.id)
+    secondary_state = await load_search_index_state(migrated_db_session, secondary_file.id)
+
+    assert build_qdrant_sync_payload(primary_state.canonical).is_primary_file is True
+    assert build_qdrant_sync_payload(secondary_state.canonical).is_primary_file is False
 
 
 async def test_search_index_state_rebuild_reflects_visibility_collection_tag_and_popularity_changes(

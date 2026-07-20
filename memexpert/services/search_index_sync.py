@@ -42,6 +42,7 @@ class CanonicalSearchIndexState:
     meme_file_id: uuid.UUID
     search_index_algorithm_version: str
     is_public: bool
+    is_primary_file: bool
     uploader_user_ids: tuple[str, ...]
     media_type: str
     language: str
@@ -130,6 +131,7 @@ async def load_search_index_state(
         meme_file_id=meme_file.id,
         search_index_algorithm_version=SEARCH_INDEX_ALGORITHM_VERSION,
         is_public=canonical_meme.is_public,
+        is_primary_file=canonical_meme.primary_file_id == meme_file.id,
         uploader_user_ids=tuple(str(user_id) for user_id in uploader_user_ids),
         media_type=canonical_meme.media_type.value,
         language=canonical_meme.language.value,
@@ -193,6 +195,7 @@ def build_qdrant_sync_payload(canonical: CanonicalSearchIndexState) -> QdrantSyn
         meme_file_id=canonical.meme_file_id,
         search_index_algorithm_version=canonical.search_index_algorithm_version,
         is_public=canonical.is_public,
+        is_primary_file=canonical.is_primary_file,
         uploader_user_ids=list(canonical.uploader_user_ids),
         media_type=canonical.media_type,
         language=canonical.language,

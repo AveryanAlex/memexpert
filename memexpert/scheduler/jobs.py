@@ -25,6 +25,8 @@ from memexpert.services.meme_of_the_day import (
 )
 from memexpert.services.pipeline_reliability import PipelineCapacityPolicy, refresh_pipeline_capacity_states
 from memexpert.services.public_trends import refresh_public_trend_materialized_views
+from memexpert.services.recommendations.analytics import rollup_recommendation_daily_analytics
+from memexpert.services.recommendations.profile_store import rebuild_dirty_recommendation_profiles
 from memexpert.services.recovery_runtime import run_recovery_dispatch_batch
 from memexpert.services.scheduler_batch_jobs import (
     run_scheduler_search_index_sync_batch,
@@ -48,6 +50,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 JOB_ID_MATERIALIZED_VIEW_REFRESH = "materialized-view-refresh"
+JOB_ID_RECOMMENDATION_ANALYTICS_ROLLUP = "recommendation-analytics-rollup"
+JOB_ID_RECOMMENDATION_PROFILE_REBUILD = "recommendation-profile-rebuild"
 JOB_ID_SOURCE_ENGAGEMENT_CAPTURE = "source-engagement-capture"
 JOB_ID_SOURCE_CHANNEL_AUDIENCE_CAPTURE = "source-channel-audience-capture"
 JOB_ID_MOTD = "motd"
@@ -154,6 +158,20 @@ def build_scheduler_job_definitions(settings: Settings, engine: AsyncEngine) -> 
             description="Expire Telegram login attempts and revoke abandoned temporary credentials.",
         ),
         SchedulerJobDefinition(
+            id=JOB_ID_RECOMMENDATION_PROFILE_REBUILD,
+            trigger_seconds=settings.scheduler_recommendation_profile_rebuild_interval_seconds,
+            action=_build_recommendation_profile_rebuild_job_action(settings, engine),
+            enabled=settings.scheduler_recommendation_profile_rebuild_enabled,
+            description="Rebuild bounded dirty recommendation profiles.",
+        ),
+        SchedulerJobDefinition(
+            id=JOB_ID_RECOMMENDATION_ANALYTICS_ROLLUP,
+            trigger_seconds=settings.scheduler_recommendation_analytics_rollup_interval_seconds,
+            action=_build_recommendation_analytics_rollup_job_action(settings, engine),
+            enabled=settings.scheduler_recommendation_analytics_rollup_enabled,
+            description="Roll up bounded daily recommendation analytics.",
+        ),
+        SchedulerJobDefinition(
             id=JOB_ID_SOURCE_CHANNEL_AUDIENCE_CAPTURE,
             trigger_seconds=settings.scheduler_source_channel_audience_capture_interval_seconds,
             action=_build_source_channel_audience_capture_job_action(settings, engine),
@@ -213,6 +231,58 @@ def _build_source_engagement_capture_job_action(settings: Settings, engine: Asyn
                 JOB_ID_SOURCE_ENGAGEMENT_CAPTURE,
                 result,
             ),
+        )
+
+    return _action
+
+
+def _build_recommendation_profile_rebuild_job_action(
+    settings: Settings,
+    engine: AsyncEngine,
+) -> SchedulerJobAction:
+    async def _action() -> None:
+        result = await rebuild_dirty_recommendation_profiles(
+            build_async_session_factory(engine),
+            settings=settings,
+        )
+        logger.info(
+            "scheduler_job_batch_result",
+            extra={
+                "event": "scheduler_job_batch_result",
+                "job_id": JOB_ID_RECOMMENDATION_PROFILE_REBUILD,
+                "status": "completed",
+                "degraded_mode": result.failed_users > 0,
+                "claimed_users": result.claimed_users,
+                "rebuilt_users": result.rebuilt_users,
+                "failed_users": result.failed_users,
+            },
+        )
+
+    return _action
+
+
+def _build_recommendation_analytics_rollup_job_action(
+    settings: Settings,
+    engine: AsyncEngine,
+) -> SchedulerJobAction:
+    async def _action() -> None:
+        result = await rollup_recommendation_daily_analytics(
+            build_async_session_factory(engine),
+            lookback_days=settings.scheduler_recommendation_analytics_rollup_lookback_days,
+            impression_cooldown_hours=settings.recommendation_impression_cooldown_hours,
+            strong_positive_cooldown_hours=settings.recommendation_strong_positive_cooldown_hours,
+        )
+        logger.info(
+            "scheduler_job_batch_result",
+            extra={
+                "event": "scheduler_job_batch_result",
+                "job_id": JOB_ID_RECOMMENDATION_ANALYTICS_ROLLUP,
+                "status": "completed",
+                "degraded_mode": False,
+                "start_date": result.start_date.isoformat(),
+                "end_date": result.end_date.isoformat(),
+                "aggregate_rows": result.aggregate_rows,
+            },
         )
 
     return _action
@@ -410,6 +480,8 @@ __all__ = [
     "JOB_ID_MOTD",
     "JOB_ID_PIPELINE_CAPACITY_REFRESH",
     "JOB_ID_RABBITMQ_OUTBOX_PUBLISHER",
+    "JOB_ID_RECOMMENDATION_ANALYTICS_ROLLUP",
+    "JOB_ID_RECOMMENDATION_PROFILE_REBUILD",
     "JOB_ID_RECOVERY_DISPATCH",
     "JOB_ID_SEARCH_INDEX_SYNC",
     "JOB_ID_SEO_BACKLOG_BATCHES",

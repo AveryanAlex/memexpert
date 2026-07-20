@@ -1,6 +1,7 @@
 <script lang="ts">
   import { browser } from '$app/environment';
   import { invalidateAll } from '$app/navigation';
+  import { uuidV7 } from '$lib/analytics/uuid-v7';
   import { recordMemeDownload } from '$lib/api/client';
   import type { MemeResultAttributionRead, PublicMemeCardRead } from '$lib/api/types';
   import { memeActionAttributionBody, memeTitle } from '$lib/memeActions';
@@ -120,7 +121,7 @@
       await mutateSelected(
         (meme) => `/api/v1/memes/${encodeURIComponent(meme.id)}/save`,
         'POST',
-        (meme) => memeActionAttributionBody(attributions[meme.id])
+        (meme) => memeActionAttributionBody(attributions[meme.id], uuidV7())
       );
       statusMessage = `${selected.length} selected meme${selected.length === 1 ? '' : 's'} saved to the active collection.`;
     });
@@ -133,7 +134,8 @@
     await runBulkAction('add', `Adding selected memes to ${targetTitle}...`, async () => {
       await mutateSelected(
         (meme) => `/api/v1/collections/${encodeURIComponent(targetCollectionId)}/memes/${encodeURIComponent(meme.id)}`,
-        'POST'
+        'POST',
+        (meme) => memeActionAttributionBody(attributions[meme.id], uuidV7())
       );
       statusMessage = `${selected.length} selected meme${selected.length === 1 ? '' : 's'} added to ${targetTitle}.`;
     });
@@ -146,7 +148,8 @@
     await runBulkAction('remove', 'Removing selected memes...', async () => {
       await mutateSelected(
         (meme) => `/api/v1/collections/${encodeURIComponent(collectionId)}/memes/${encodeURIComponent(meme.id)}`,
-        'DELETE'
+        'DELETE',
+        (meme) => memeActionAttributionBody(attributions[meme.id], uuidV7())
       );
       statusMessage = `${selected.length} selected meme${selected.length === 1 ? '' : 's'} removed from this collection.`;
       selectedIds = [];
@@ -218,7 +221,7 @@
     void recordMemeDownload({
       fetch,
       memeId,
-      body: memeActionAttributionBody(attributions[memeId]),
+      body: memeActionAttributionBody(attributions[memeId], uuidV7()),
       keepalive: true
     }).catch((error: unknown) => console.warn('Bulk meme download telemetry failed.', { memeId, error }));
   }

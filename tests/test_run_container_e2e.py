@@ -194,6 +194,66 @@ def test_long_sanitized_run_ids_keep_hash_suffixes_unique() -> None:
     assert second.startswith("feature-")
 
 
+def test_degraded_recommendation_command_is_phase_scoped_and_keeps_reports_separate() -> None:
+    compose = ["docker", "compose", "-p", "memexpert-e2e-test"]
+
+    command = run_container_e2e.degraded_recommendation_command(
+        compose,
+        phase="qdrant-unavailable",
+    )
+
+    assert command[: len(compose)] == compose
+    assert "E2E_RECOMMENDATION_DEGRADED_PHASE=qdrant-unavailable" in command
+    assert "E2E_ARTIFACTS_DIR=/artifacts/degraded/qdrant-unavailable" in command
+    assert command[-1] == "specs/recommendation-degraded.spec.ts"
+
+
+def test_degraded_dependency_check_restores_health_after_failed_assertion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    compose = ["docker", "compose", "-p", "memexpert-e2e-test"]
+    commands: list[list[str]] = []
+    assertion_failure = subprocess.CalledProcessError(17, ["playwright"])
+
+    def fake_run_checked(command: list[str], **_: object) -> None:
+        commands.append(command)
+        if "E2E_RECOMMENDATION_DEGRADED_PHASE=qdrant-unavailable" in command:
+            raise assertion_failure
+
+    monkeypatch.setattr(run_container_e2e, "run_checked", fake_run_checked)
+
+    with pytest.raises(subprocess.CalledProcessError) as exc_info:
+        run_container_e2e.run_degraded_dependency_check(
+            compose,
+            env={},
+            dependency="qdrant",
+            phase="qdrant-unavailable",
+        )
+
+    assert exc_info.value is assertion_failure
+    assert commands[0] == [*compose, "stop", "--timeout", "30", "qdrant"]
+    assert commands[-1] == [
+        *compose,
+        "up",
+        "--detach",
+        "--no-deps",
+        "--wait",
+        "--wait-timeout",
+        "120",
+        "qdrant",
+    ]
+
+
+def test_degraded_dependency_check_rejects_phase_dependency_mismatch() -> None:
+    with pytest.raises(ValueError, match="expects dependency 'qdrant', not 'redis'"):
+        run_container_e2e.run_degraded_dependency_check(
+            ["docker", "compose"],
+            env={},
+            dependency="redis",
+            phase="qdrant-unavailable",
+        )
+
+
 def test_create_artifact_dir_rejects_existing_run_directory(tmp_path: Path) -> None:
     existing = tmp_path / "same-run"
     existing.mkdir()

@@ -23,8 +23,8 @@ from memexpert.api.dependencies import (
 from memexpert.api.routes._collection_errors import collection_service_http_error
 from memexpert.api.routes._meme_interactions import (
     MemeActionAttributionRequest,
-    payload_attribution,
     record_meme_interaction,
+    resolve_meme_interaction_request,
 )
 from memexpert.models.enums import (
     AnalyticsEventType,
@@ -314,6 +314,7 @@ async def save_meme_to_collection(
 ) -> dict[str, bool]:
     """Save a visible meme into a specific writable collection."""
 
+    interaction = resolve_meme_interaction_request(payload, meme_id=meme_id, current_user=current_user)
     try:
         mutation = await collection_service.save_meme_to_collection_result(
             collection_id=collection_id,
@@ -330,10 +331,10 @@ async def save_meme_to_collection(
             AnalyticsEventType.MEME_SAVE,
             meme_id=meme_id,
             current_user=current_user,
-            attribution=payload_attribution(payload),
+            interaction=interaction,
             default_surface="public_api_collection_action",
             collection_id=mutation.item.collection_id,
-            properties={"action": "save"},
+            properties={"action": "add", "preference_kind": "save"},
         )
     return {"saved": True}
 
@@ -345,12 +346,15 @@ async def save_meme_to_collection(
 )
 async def remove_meme_from_collection(
     collection_service: CollectionServiceDep,
+    analytics_service: AnalyticsServiceDep,
     current_user: AutoGuestUserDep,
     collection_id: Annotated[uuid.UUID, Path()],
     meme_id: Annotated[uuid.UUID, Path()],
+    payload: Annotated[MemeActionAttributionRequest | None, Body()] = None,
 ) -> dict[str, bool]:
     """Remove a meme from a specific writable collection."""
 
+    interaction = resolve_meme_interaction_request(payload, meme_id=meme_id, current_user=current_user)
     try:
         removed = await collection_service.remove_meme_from_collection(
             collection_id=collection_id,
@@ -359,6 +363,17 @@ async def remove_meme_from_collection(
         )
     except CollectionServiceError as exc:
         raise _collection_http_error(exc) from exc
+    if removed:
+        await record_meme_interaction(
+            analytics_service,
+            AnalyticsEventType.MEME_SAVE,
+            meme_id=meme_id,
+            current_user=current_user,
+            interaction=interaction,
+            default_surface="public_api_collection_action",
+            collection_id=collection_id,
+            properties={"action": "remove", "preference_kind": "save"},
+        )
     return {"removed": removed}
 
 

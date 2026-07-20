@@ -52,6 +52,7 @@ from memexpert.core.database import (
     reset_async_database_state,
     verify_async_engine,
 )
+from memexpert.core.qdrant import reset_async_qdrant_state
 from memexpert.core.redis import reset_async_redis_state
 from memexpert.models.enums import UserLanguage
 
@@ -96,6 +97,7 @@ PUBLIC_TREND_MATERIALIZED_VIEW_REFRESH_ORDER: Final = (
     "public_template_trends_mv",
     "public_tag_trend_points_mv",
     "public_template_trend_points_mv",
+    "public_meme_recommendation_features_mv",
 )
 TEST_BASE_URL: Final = "https://testserver"
 AUTH_TEST_JWT_SECRET: Final = "route-test-auth-secret-with-32-byte-minimum"
@@ -488,11 +490,12 @@ async def _transactional_migrated_session(
 
 
 async def reset_test_runtime_state(*, flush_redis: bool = False) -> None:
-    """Clear cached settings plus global DB/Redis runtime state before env-driven app tests."""
+    """Clear cached settings plus global provider runtime state between tests."""
 
     get_settings.cache_clear()
     await reset_async_database_state()
     await reset_async_redis_state(flushdb=flush_redis)
+    await reset_async_qdrant_state()
 
 
 async def create_full_user_via_upgrade(

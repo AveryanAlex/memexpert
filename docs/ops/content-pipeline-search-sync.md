@@ -7,6 +7,12 @@ for keeping Qdrant and Meilisearch aligned with PostgreSQL truth.
 Use the item detail, per-target status, and replay routes below for production
 diagnostics.
 
+The repository now defines the `is_primary_file` payload and idempotent Qdrant
+payload-index provisioning needed by `personalized_v2`. This runbook does not
+assert that the live-beta payload has been backfilled, that its indexes have
+been created, or that recommendation traffic has been activated. Treat those as
+separate verified rollout steps.
+
 ## Prerequisites
 
 - Docker Compose healthy: `IMGPROXY_PORT=18080 docker compose up -d`.
@@ -56,9 +62,35 @@ Fields intentionally carried into both indexes:
 - Safe content hints already used by the search sync path: `meme_id`,
   `meme_file_id`/`id`, `seo_page_slug`, and OCR text/snippet.
 
-Qdrant additionally carries internal `uploader_user_ids`. That field exists only
-to constrain private approximate-dedupe candidates to the same sole uploader;
-it is never an access grant. Meilisearch does not carry uploader provenance.
+Qdrant additionally carries `is_primary_file` and internal
+`uploader_user_ids`. `is_primary_file` is recomputed as
+`Meme.primary_file_id == MemeFile.id` on every sync. Recommendation queries
+require it to be true; ingestion deduplication and file-level search may still
+inspect every file. `uploader_user_ids` exists only to constrain private
+approximate-dedupe candidates to the same sole uploader; it is never an access
+grant. Meilisearch carries neither field.
+
+The normal Qdrant collection-ensure path idempotently requests these payload
+indexes:
+
+| type | fields |
+|---|---|
+| keyword | `search_index_algorithm_version`, `uploader_user_ids`, `media_type`, `language`, `tags`, `collection_ids`, `collection_owner_user_ids`, `collection_member_user_ids` |
+| boolean | `is_public`, `is_primary_file`, `is_nsfw` |
+
+Provisioning is safe to retry and accepts an already-existing index as the
+desired state. It does not populate `is_primary_file` on old points; only a
+normal resync/replay rebuilds that payload from PostgreSQL. The bounded
+`search-index-sync` scheduler treats a synced Qdrant preview whose
+`is_primary_file` value is missing or differs from the current primary file as
+stale work, so it can drain this payload-contract backfill without an unrelated
+meme update.
+
+A long-lived sync process caches successful collection readiness. If an upsert
+later receives `404` because the collection disappeared or was replaced, it
+clears that cache, reruns collection and all payload-index provisioning, and
+retries the upsert once. A second failure follows the normal durable sync-failure
+path; it does not loop indefinitely.
 
 Indexes remain **candidate sources only**. PostgreSQL is still the final access
 authority in `MemeSearchService`; stale Qdrant or Meilisearch payloads must not
@@ -92,6 +124,50 @@ Fields intentionally omitted from indexes:
   `meta_description`, `alt_text`, `caption`, `body_text`, SEO tag copies,
   `model_id`, `prompt_version`), moderation notes, and other
   operator/internal audit fields.
+
+## Qdrant recommendation rollout and verification
+
+The live beta's Nix/Quadlet source of truth pins validated Qdrant 1.18.3 by
+immutable digest, never `latest`:
+
+```text
+docker.io/qdrant/qdrant@sha256:0bd98fa7977f1e75694779359ca4e212822e5a71334e28421182f72f209d5286
+```
+
+Local and E2E Compose use the explicit `v1.18.3` tag. The production example and
+beta Nix/Quadlet source use the immutable 1.18.3 digest above; beta omits
+automatic image updates so upgrades require a deliberate deployment-source
+change. The digest pin is present in source, but this document does not claim a
+Reploy run or any application/index rollout has completed.
+
+Before enabling `personalized_v2`, an authorized rollout must:
+
+1. Confirm the running Qdrant reports 1.18.3 and the immutable digest expected
+   by Nix.
+2. Let the application collection-ensure path create the eleven payload indexes
+   and verify their field names/types from Qdrant collection metadata.
+3. Let the bounded `search-index-sync` scheduler drain stale/missing
+   `is_primary_file` previews. Enumerate READY files from PostgreSQL and use
+   authorized bounded Qdrant replay only for a verified residual/failure cohort.
+4. Compare READY-primary PostgreSQL count with points matching
+   `is_primary_file=true`, verify there is exactly one primary point per
+   eligible meme, and sample public/NSFW/language/source-exclusion filters.
+5. Verify recommendation reads return primary files while approximate dedupe can
+   still find alternate files, then record counts and sampled parity without
+   dumping vectors or sensitive payloads.
+
+Steps 2–4 mutate live state. Do not run them, replay beta sync, or manually
+create indexes without explicit authorization and normal deployment/migration
+ordering. Read-only inspection comes first, and logs/chat must never contain
+environment files, credentials, full container inspections, vectors, or tokens.
+
+The Phase-3 stable-alias/named-vector migration is future-only. If offline and
+memory gates justify it, the sequence is create a versioned collection and
+indexes, dual-write, bounded PostgreSQL backfill, verify READY-primary coverage,
+counts/dimensions/filters/ranking parity, atomically switch the alias, and retain
+the old collection for rollback. Today's metadata repair remains bounded replay
+into the configured single collection; do not infer an existing alias from
+future design notes.
 
 ## Inspecting one item
 
@@ -182,6 +258,8 @@ successful sync and the search indexes need to catch up. Typical triggers:
 - Tags, template assignment, template slug, or SEO slug changed.
 - `like_count`, derived source-engagement popularity, or `quality_score` changed
   enough to matter for ranking.
+- `Meme.primary_file_id` changed, so both the new and former primary Qdrant
+  points need rebuilt `is_primary_file` values.
 
 Operational guidance:
 

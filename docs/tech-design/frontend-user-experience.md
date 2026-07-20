@@ -4,6 +4,10 @@
 
 This document defines the consumer-facing SvelteKit experience for the public website and Telegram Mini App. It implements the product contract in [Website](../prd/06-website.md) while preserving SSR, backend/API contracts, access control, telemetry, SEO, and existing deep links.
 
+The `personalized_v2` portions describe the repository compatibility target.
+Their presence here is not evidence that the backend migration, index backfill,
+shadow evaluation, canary, or live-beta activation has occurred.
+
 The redesign is a presentation and progressive-disclosure change. FastAPI remains the authority for search, recommendations, collections, permissions, actions, analytics, and Mini App authentication. `/admin/*` routes and admin feature components are outside this document's scope.
 
 ## UX Architecture Decisions
@@ -47,7 +51,9 @@ Desktop navigation presents the brand, Discover, global query search, Saved, and
 | `lib/ui/Masonry.svelte` | Generic measured layout primitive. It retains one keyed flat DOM list, calculates rank-aware coordinates from rendered item heights, and owns hydration/no-JavaScript fallback behavior without meme-domain policy. |
 | `MemeGrid.svelte` | Composes the shared masonry primitive with result attribution markup, local selection mode, checkboxes, and the sticky selection toolbar. It does not decide whether a route enables bulk behavior. |
 | `discovery-attribution.ts` | Maps the shared discovery-attribution fields to DOM data attributes for grids and Meme of the Day without diverging field sets. |
-| `InfiniteMemeFeed.svelte` | Owns initial/next page state, deduplicated append behavior, intersection loading, and accessible Load more/retry/end states for Search and Similar sources. It resets and aborts stale pagination when its source key changes, passes route bulk policy to `MemeGrid`, and shares its layout across surfaces. |
+| `InfiniteMemeFeed.svelte` | Owns initial/next page state, deduplicated append behavior, intersection loading, and accessible Load more/retry/end states. Home uses opaque cursor/feed-session state; Search and Similar retain offsets. It resets and aborts stale pagination when its source/viewer key changes, passes route bulk policy to `MemeGrid`, and shares its layout across surfaces. |
+| `home-feed-session.ts` | Persists the unexpired Home item list, feed-session ID, next cursor, and viewer/filter binding in session storage. Back navigation submits stored IDs/tokens for server reauthorization before installing any restored cards; mismatched/expired state is cleared, and `410 feed_cursor_expired` restarts once. |
+| `analytics/interaction-queue.ts` and `engaged-view.ts` | Create UUIDv7 interaction IDs, cap requests at 50 events and 48 KiB, retry safely, rotate pending state on viewer changes, isolate permanent poison events, start keepalive work on page hide, and accumulate engaged-view time only while a card is at least 50% visible and the document is foregrounded. |
 | `MemeOfTheDayPanel.svelte` | Presents the daily selection as a compact media-first tile while retaining attribution for telemetry. |
 | `features/taxonomy/TaxonomyLandingPage.svelte` and `server/taxonomyLanding.ts` | Share gallery-first tag/template presentation and loading while route files remain thin kind/slug adapters. |
 
@@ -116,6 +122,33 @@ Mini App authentication keeps the existing backend contract: `initData` is POSTe
 
 ## State and URL Invariants
 
+### Home feed sessions
+
+Home continuation is opaque and cursor-led. The browser never decodes or
+constructs a feed cursor; it forwards `next_cursor` and keeps
+`feed_session_id`, `expires_at`, accumulated items, and `has_more` together as
+one restorable unit. Session-storage keys include the normalized feed/filter key
+and viewer identity. A viewer change, filter change, expired timestamp, malformed
+state, or mismatched binding discards the stored feed before rendering.
+
+The Home SSR loader captures any access cookie issued while fetching the first
+page, resolves the session represented by that exact cookie, and supplies its
+`pageViewerId` as the payload binding. The reactive browser viewer must match
+that binding before initial or restored Home cards can render; a stale parent
+session cannot relabel a newly issued guest page as anonymous.
+
+On detail navigation and browser Back, the client reads the unexpired item list
+and continuation cursor but does not install stored cards directly. It sends at
+most 200 stored meme IDs and opaque attribution tokens to the same-origin Home
+reauthorization proxy, which propagates cancellation and returns only cards that
+still pass token viewer/meme/surface checks plus current PostgreSQL public,
+moderation, NSFW, and filter policy. Only that response may reconstruct the
+ranked layout for native history scroll restoration; an omitted card never
+briefly renders. A failed/invalid reauthorization discards storage and leaves
+the fresh SSR page. A `410 feed_cursor_expired` during continuation clears the
+saved state and restarts from a fresh first page once, replacing rather than
+appending so stale and new pools cannot mix.
+
 ### Search
 
 `SearchRouteState` is the single route-state model for Search. It normalizes and serializes these existing parameters:
@@ -135,7 +168,15 @@ The SSR load parses this state, forwards it unchanged to the existing meme page 
 ### Route, form, and deep-link contracts
 
 - Keep existing public paths, server action names, form fields, query parameters, cookie forwarding, and API payloads. A visual refactor must not change the backend contract.
-- `memeHref` continues to generate `/memes/{seo_page_slug|id}` and preserves available attribution query parameters on detail links.
+- Home, Search, detail/initial Similar SSR responses, and same-origin discovery
+  proxies set
+  `Cache-Control: private, no-store`. SvelteKit request cancellation and browser
+  feed `AbortController` signals propagate to upstream FastAPI fetches; route,
+  source-meme, filter, or viewer changes abort stale work before it can update
+  the active feed.
+- `memeHref` continues to generate `/memes/{seo_page_slug|id}` and preserves the
+  opaque `attribution_token` on detail links. Legacy expanded attribution query
+  fields are compatibility-only and must not be preferred when a token exists.
 - Collection pages, library creation, active-save selection, invite/member forms, pin reorder, comparison serialization, trend ranking/timeline controls, and Mini App start-parameter routes retain their established URL/action behavior.
 - The search filter drawer is a presentation wrapper around a real GET form. Native form submission remains meaningful without JavaScript; the trends comparison route retains its noscript serialized-item inputs.
 - Meme source/analytics controls preserve discovery-attribution parameters and
@@ -153,13 +194,38 @@ The SSR load parses this state, forwards it unchanged to the existing meme page 
 
 ## Telemetry and Attribution Invariants
 
-Presentation must not discard a result's `MemeResultAttributionRead` data just because it is not rendered as consumer copy.
+Presentation must retain a result's opaque server-issued attribution token even
+though no algorithm details are rendered as consumer copy.
 
-1. `MemeGrid` and Meme of the Day retain discovery data attributes for source algorithm, reason, request ID, impression ID, source meme ID, and score context.
-2. `MemeCard` records one impression after at least 25% intersection and records a detail click before navigation. Exposure IDs are stable for one layout placement/page, survive component remounts, and remain distinct for genuinely different placements. Both sends use keepalive support; the idempotent backend exposure fact prevents a repeated token from increasing the keyed denominator.
-3. Favorite, Save, Pin, Send/share, Download, Report, and bulk-download paths forward the same attribution through `memeActionAttributionBody` where the existing action supports it.
-4. Detail links serialize attribution (`request_id`, `impression_id`, surface, source algorithm, query/filter/scope/collection context, rank, score components, and related-source identity) so the detail action chain remains attributable.
-5. Consumer surfaces may say only what helps a user decide. Algorithm names, fallback reasons, request IDs, score components, and candidate diagnostics remain telemetry/data attributes rather than visible copy.
+1. Discovery placements use the canonical surfaces `web_home`, `web_search`,
+   and `web_related`. A token travels unchanged from result to card, detail link,
+   interaction event, and supported mutation; the browser never parses,
+   modifies, or synthesizes its claims.
+2. `MemeCard` records one `meme_impression` after at least 25% intersection. It
+   records `meme_engaged_view` once only after at least 50% visibility for three
+   accumulated foreground seconds. Hidden-document time, offscreen intervals,
+   and autoplay alone do not count.
+3. Impressions, engaged views, and detail clicks receive a client-generated
+   UUIDv7. The layout-scoped queue sends at most 50 events and 48 KiB per
+   request. It retries transport/408/425/429/5xx failures, recursively isolates
+   permanent 4xx poison events during ordinary delivery, and starts independent
+   bounded keepalive work on `visibilitychange`/`pagehide` even if another
+   request is in flight. A viewer change clears pending viewer-bound tokens so
+   they cannot be submitted with a different authentication cookie. A
+   single-event byte overflow first drops optional properties; if required
+   fields alone still exceed 48 KiB, that malformed event is not queued. Cards
+   without server-issued result attribution cache a UUIDv7 placement ID for the
+   current page visit and reuse it across impression, engaged-view, and
+   detail-click events so the backend can project one keyed exposure.
+4. Favorite, Save, Pin, Send/share, Download, Report, and bulk-download paths
+   forward `attribution_token` and, where supported, `event_id`. Durable
+   preference mutations identify `properties.action=add|remove`; removal does
+   not become a dislike.
+5. Legacy expanded discovery data attributes may remain during compatibility,
+   but are untrusted. A present token is authoritative and detail links prefer
+   only that opaque value. Algorithm names, fallback reasons, request IDs,
+   score components, candidate diagnostics, and token claims are never visible
+   consumer copy.
 
 The redesign therefore keeps the analytics contract described in [Analytics](../prd/08-analytics.md) while removing debug-heavy presentation.
 
@@ -178,6 +244,16 @@ Container resizing and post-reveal media-height changes may trigger a measured r
 ### Infinite pagination and selection
 
 `InfiniteMemeFeed` deduplicates initial results and appends only unseen IDs in later page order. Loading state, retry, result count, explicit Load more fallback, and end state remain available regardless of `IntersectionObserver` support.
+
+For `home`, the first SSR page supplies `feed_session_id`, `next_cursor`,
+`expires_at`, and `has_more`. Browser continuation sends the cursor rather than
+an offset, appends in the frozen order, persists the resulting feed session for
+back navigation, and aborts on navigation or source/viewer changes. Restored
+items wait for the server reauthorization described above. A cursor expiry
+restarts once from page one and replaces the old list. Viewer identity is part
+of the SSR page binding, reactive feed key, and session-storage key, preventing
+a guest/full switch or sign-in from rendering or restoring another viewer's
+pool. Search keeps URL offsets and does not reuse this private Home state.
 
 For `similar`, the meme-scoped SSR load requests the canonical first 12 results. Browser pagination uses the same-origin SvelteKit proxy with `limit=12` and offsets `12`, `24`, and so on; the proxy validates pagination, forwards cookies, propagates upstream error status and cancellation, and marks every response `private, no-store`. Same-detail source/analytics query navigation retains that SSR result instead of repeating Similar retrieval. The feed appends in API order until `has_more` is false or its stable bounded `total` (at most 200) is reached. Navigation, component teardown, or a changed source meme ID aborts in-flight work; a source change also clears the prior source's results, error, count, and pagination state.
 

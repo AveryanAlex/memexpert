@@ -6,6 +6,9 @@ import { memeDiscoveryDataAttributes } from './discovery-attribution';
 describe('memeDiscoveryDataAttributes', () => {
   it('maps every shared discovery field without dropping a zero score', () => {
     const attribution: MemeResultAttributionRead = {
+      attribution_token: null,
+      candidate_sources: [],
+      profile_version: null,
       request_id: 'request-1',
       impression_id: 'impression-1',
       surface: 'web_home',

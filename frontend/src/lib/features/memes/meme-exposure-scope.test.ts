@@ -7,6 +7,7 @@ describe('page-scoped meme exposures', () => {
     const scope = createMemeExposureScope('/search');
 
     const first = scope.resolveExposureId(null, 'results:1:meme-a');
+    expect(first).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
     expect(scope.resolveExposureId(null, 'results:1:meme-a')).toBe(first);
     expect(scope.resolveExposureId(null, 'results:2:meme-a')).not.toBe(first);
     expect(scope.resolveExposureId(' backend-token ', 'results:3:meme-a')).toBe(' backend-token ');

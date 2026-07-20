@@ -214,7 +214,29 @@ export interface MemeResultAttributionFiltersRead {
   collection_ids: string[];
 }
 
+export type MemeCandidateSource =
+  | 'short_term'
+  | 'current_intent'
+  | 'long_term_global'
+  | 'long_term_cluster'
+  | 'multi_positive'
+  | 'trending'
+  | 'exploration'
+  | 'visual_similarity'
+  | 'tag_overlap'
+  | 'same_template'
+  | 'public_popular';
+
+export interface MemeCandidateSourceContributionRead {
+  source: MemeCandidateSource;
+  rank: number;
+  score: number | null;
+  contribution: number;
+}
+
 export interface MemeResultAttributionRead {
+  attribution_token: string | null;
+  candidate_sources: MemeCandidateSourceContributionRead[];
   request_id: string | null;
   impression_id: string;
   surface: string | null;
@@ -226,6 +248,7 @@ export interface MemeResultAttributionRead {
   collection_ids: string[];
   source_meme_id: string | null;
   algorithm_version: string | null;
+  profile_version: string | null;
   score: number | null;
   score_components: Record<string, number>;
   reason: string | null;
@@ -267,6 +290,41 @@ export interface PublicMemeSearchPageRead {
   total: number;
   has_more: boolean;
   request_id: string;
+}
+
+export interface RecommendationFeedPageRead extends PublicMemeSearchPageRead {
+  feed_session_id: string;
+  next_cursor: string | null;
+  expires_at: string;
+}
+
+export interface RecommendationFeedReauthorizationItemWrite {
+  meme_id: string;
+  attribution_token: string;
+}
+
+export interface RecommendationFeedReauthorizationRead {
+  items: PublicMemeSearchResultRead[];
+}
+
+export type MemeInteractionBatchEventType = 'meme_impression' | 'meme_engaged_view' | 'meme_detail_click';
+
+export interface MemeInteractionBatchEventWrite {
+  event_id: string;
+  event_type: MemeInteractionBatchEventType;
+  meme_id: string;
+  occurred_at: string;
+  attribution_token: string | null;
+  properties?: Record<string, unknown>;
+}
+
+export interface MemeInteractionBatchWrite {
+  events: MemeInteractionBatchEventWrite[];
+}
+
+export interface MemeInteractionBatchRecordedRead {
+  recorded: number;
+  duplicates: number;
 }
 
 export interface CollectionSummaryRead {

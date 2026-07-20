@@ -6,7 +6,7 @@ Run the real-stack PRD E2E suite from the repository root:
 python scripts/run_container_e2e.py
 ```
 
-The orchestrator exclusively creates `.artifacts/e2e/<run-id>/`, exports `E2E_RUN_ID` and `E2E_ARTIFACT_DIR`, sets per-run default main/worker/frontend/e2e-runner image tags, starts `docker-compose.e2e.yml` with `docker compose -p memexpert-e2e-<run-id>`, waits for service health, and then verifies that RabbitMQ has exactly one correctly-owned consumer on each of the seven pipeline queues before seeding. It runs the seed proof and Playwright inside the Compose network, captures status/logs/metadata, and removes the stack with volumes unless `E2E_KEEP_STACK=1` is set.
+The orchestrator exclusively creates `.artifacts/e2e/<run-id>/`, exports `E2E_RUN_ID` and `E2E_ARTIFACT_DIR`, sets per-run default main/worker/frontend/e2e-runner image tags, starts `docker-compose.e2e.yml` with `docker compose -p memexpert-e2e-<run-id>`, waits for service health, and then verifies that RabbitMQ has exactly one correctly-owned consumer on each of the seven pipeline queues before seeding. It runs the seed proof and normal Playwright suite inside the Compose network, then runs the degraded recommendation proofs described below. Finally it captures status/logs/metadata and removes the stack with volumes unless `E2E_KEEP_STACK=1` is set.
 
 Before starting Compose, the runner rejects an existing artifact directory and atomically claims the Compose project name with a dedicated labeled Docker network. A second worktree using the same sanitized run ID fails at network creation even when its artifact root differs. The claim remains while `E2E_KEEP_STACK=1` is active or any normal cleanup step fails, and is removed only after the stack, volumes, and per-run images clean up successfully. The runner also rejects pre-existing Compose-labeled containers, volumes, or networks and never joins or tears down a stack it did not establish as available. Explicit run IDs are normalized to Docker-safe values; normalized IDs longer than 48 characters retain a hash suffix so different long IDs cannot collide merely because of truncation.
 
@@ -16,7 +16,7 @@ The E2E Compose file mirrors the production process split: `postgres`, `redis`, 
 
 It deliberately has no fixed host ports, no `container_name`, and no fixed Compose project name. Named volumes are project-scoped by Compose, so concurrent runs are isolated by the `memexpert-e2e-<run-id>` project name.
 
-The checked-in local, E2E, and production examples use verified explicit infrastructure releases rather than mutable broad tags: PostgreSQL 16.14, Redis 7.4.9, RabbitMQ 4.3.1-management, Qdrant 1.18.2, Meilisearch 1.46.1, MinIO `RELEASE.2025-09-07T16-13-09Z`, MinIO Client `RELEASE.2025-08-13T08-35-41Z`, and imgproxy 4.0.4. The optional local pgAdmin profile uses pgAdmin 9.16.
+The checked-in local, E2E, and production examples use verified explicit infrastructure releases rather than mutable broad tags: PostgreSQL 16.14, Redis 7.4.9, RabbitMQ 4.3.1-management, Qdrant 1.18.3 (an explicit tag locally/E2E and immutable digest in the production example), Meilisearch 1.46.1, MinIO `RELEASE.2025-09-07T16-13-09Z`, MinIO Client `RELEASE.2025-08-13T08-35-41Z`, and imgproxy 4.0.4. The optional local pgAdmin profile uses pgAdmin 9.16.
 
 Both E2E and production `minio-init` clear the `mc` image entrypoint and execute an explicit `/bin/sh -c` command, so bucket initialization cannot be reinterpreted as arguments to the `mc` entrypoint.
 
@@ -27,6 +27,8 @@ By default, the runner also sets `MEMEXPERT_MAIN_IMAGE`, `MEMEXPERT_WORKER_IMAGE
 After the five worker roles start, the runner polls `rabbitmqctl list_consumers --formatter=json` through the RabbitMQ Compose service under a fixed monotonic deadline. Seed begins only after each required queue has one consumer whose `x-memexpert-worker-role` argument identifies its intended role: media inspect/transcode → `media`, OCR → `ocr`, embed/classify → `enrichment`, and Qdrant/Meilisearch → `sync`. The Compose `service_started` dependency remains intentionally truthful: it does not claim process readiness, while the orchestrator owns the stronger role-ownership gate.
 
 Seed HTTP retries and eventual-consistency pollers use caller-owned monotonic deadlines. Each fixed logical phase—health, private upload, materialization, initial dual sync, crawler promotion, public resync, Meilisearch visibility, and final proofs—receives a fresh `--timeout-seconds` budget. A slow phase therefore cannot starve a later independent phase, while every individual request timeout and retry chain remains capped by its current phase deadline. Only transport errors, HTTP 408/425/429, and 5xx responses are retried; non-idempotent writes require a durable replay identity.
+
+After the normal seeded suite passes, the orchestrator runs a narrowly scoped recommendation API spec in two outage phases. With Qdrant stopped, a fresh guest first proves the cold PostgreSQL pool has reserve candidates, Favorites one indexed result, and then proves that the resulting non-cold profile still receives a public, non-NSFW Home pool from PostgreSQL trend/exploration candidates. This keeps the outage proof isolated from interactions created by the normal suite while ensuring the second request actually attempts a Qdrant read. Qdrant is restarted with `docker compose up --wait` before the next phase. The runner then stops Redis and proves that another fresh guest receives two non-repeating pages through the signed PostgreSQL trend keyset cursor, with no private or NSFW fixture exposed. Redis is likewise restarted and health-gated before artifact capture or cleanup. Each dependency restart runs in a `finally` path, including when its Playwright assertion fails.
 
 Set `E2E_SKIP_IMAGE_BUILD=1` only when all four configured images already exist in the local Docker daemon. In that mode the runner validates the tags up front, uses `docker compose up --no-build`, and skips the separate E2E runner build. CI uses this mode to reuse the images it just built and loaded:
 
@@ -48,6 +50,13 @@ Default CI and local E2E runs are deterministic and secret-free:
 - `PIPELINE_CLASSIFICATION_PROVIDER_MODE=fake`
 - `PIPELINE_VOYAGE_OUTPUT_DIMENSIONS=4`
 
+The isolated E2E Compose stack deliberately overrides the fail-safe
+recommendation rollout defaults with `RECOMMENDATION_ENABLED=true`,
+`RECOMMENDATION_SHADOW_MODE=false`, and `RECOMMENDATION_CANARY_PERCENT=100`.
+This lets normal and outage phases exercise `personalized_v2` deterministically;
+it is test-only configuration and must not be copied as a production rollout
+decision.
+
 The suite does not call live Voyage, Telegram, Google, or other provider APIs. The current default path proves a collection-backed private operator upload, confirms it is absent from public search, then feeds the same bytes through the typed crawler ingest service. The exact-SHA crawler source must reuse the same meme/file, promote AUTO visibility, and become publicly searchable after Qdrant/Meilisearch resync. It also uses local FFmpeg sources to exercise the real media worker: an audible 24 FPS WebM/Opus input and a silent portrait 60 FPS WebM input. Full Telethon network emulation remains a follow-up.
 
 Live PaddleOCR is available in the worker image through a Python 3.13 helper venv, but it is deliberately disabled for default E2E. Run the gated smoke explicitly when model downloads/runtime cost are acceptable:
@@ -67,6 +76,7 @@ docker run --rm \
 - Guest favorite/unfavorite behavior with custom collections and Pin gated to full accounts.
 - Fake-provider private upload, exact-SHA crawler promotion, dual search-index proof, and website discovery of the same canonical meme/file.
 - Audio-safe moving media through the upload API and real worker: the seed downloads each activated MP4 and sibling PNG, independently FFprobes H.264 profile/level, pixel format, dimensions, FPS, bitrate, and AAC-LC presence or absence, and verifies persisted generation/pointer/audio state. Playwright then asserts the typed 24 FPS audible and 30 FPS silent proofs from `seed.json`.
+- Personalized Home degradation with real positive context while Qdrant is stopped, plus public/NSFW-safe PostgreSQL keyset pagination while Redis is stopped.
 
 ## Artifacts
 
@@ -78,6 +88,7 @@ Artifacts are written under `.artifacts/e2e/<run-id>/`:
 - `compose-config.yml`: rendered E2E Compose config.
 - `run-metadata.json`: run id, project name, artifact path, timestamps, process exit code, keep-stack flag, project-claim release/retention state, primary failure, and structured artifact-capture/cleanup failures.
 - `playwright-report/` and `playwright-test-results/`: Playwright reports, traces, screenshots, and videos.
+- `degraded/<phase>/playwright-report/` and `degraded/<phase>/playwright-test-results/`: isolated reports and diagnostics for the Qdrant and Redis outage phases.
 
 Every capture file starts with the command that produced it, flushed before child output. A nonzero or unlaunchable capture command leaves a visible `ARTIFACT CAPTURE FAILED` marker when the file is writable and is also recorded in `run-metadata.json`. Artifact-capture and cleanup failures are best-effort diagnostics: they are visible but do not change a successful core E2E result or replace an existing core failure code. Metadata finalization failure remains nonzero because the run result cannot be recorded truthfully.
 

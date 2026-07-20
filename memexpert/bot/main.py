@@ -8,7 +8,12 @@ from typing import TYPE_CHECKING
 from aiogram import Bot, Dispatcher
 
 from memexpert.bot.commands import register_bot_commands
-from memexpert.bot.inline import InlineMediaUrlProvider, MemeSearchServiceFactory, build_inline_router
+from memexpert.bot.inline import (
+    InlineMediaUrlProvider,
+    MemeSearchServiceFactory,
+    RecommendationServiceFactory,
+    build_inline_router,
+)
 from memexpert.bot.linking import AccountLinkServiceFactory, build_linking_router
 from memexpert.bot.private_library import (
     PrivateLibraryCollectionServiceFactory,
@@ -23,12 +28,14 @@ from memexpert.bot.private_upload import (
     build_private_upload_router,
 )
 from memexpert.core.config import Settings, get_settings
+from memexpert.core.qdrant import reset_async_qdrant_state
 from memexpert.services import ProviderNotConfiguredError
 
 if TYPE_CHECKING:
     from aiogram.client.session.base import BaseSession
 
     from memexpert.core.database import AsyncSessionFactory
+    from memexpert.services.recommendations.telegram_sessions import TelegramInlineSessionStore
 
 
 def build_bot(settings: Settings | None = None, *, session: BaseSession | None = None) -> Bot:
@@ -45,7 +52,9 @@ def build_dispatcher(
     session_factory: AsyncSessionFactory | None = None,
     account_link_service_factory: AccountLinkServiceFactory | None = None,
     meme_search_service_factory: MemeSearchServiceFactory | None = None,
+    recommendation_service_factory: RecommendationServiceFactory | None = None,
     inline_media_url_provider: InlineMediaUrlProvider | None = None,
+    inline_sessions: TelegramInlineSessionStore | None = None,
     private_upload_accept_service_factory: PrivateUploadAcceptServiceFactory | None = None,
     private_upload_collection_service_factory: CollectionServiceFactory | None = None,
     private_library_collection_service_factory: PrivateLibraryCollectionServiceFactory | None = None,
@@ -67,7 +76,9 @@ def build_dispatcher(
             settings=resolved_settings,
             session_factory=session_factory,
             meme_search_service_factory=meme_search_service_factory,
+            recommendation_service_factory=recommendation_service_factory,
             inline_media_url_provider=inline_media_url_provider,
+            inline_sessions=inline_sessions,
         )
     )
     _ = dispatcher.include_router(
@@ -113,7 +124,10 @@ async def run_bot(*, settings: Settings | None = None) -> None:
         await register_bot_commands(bot)
         await dispatcher.start_polling(bot)
     finally:
-        await bot.session.close()
+        try:
+            await bot.session.close()
+        finally:
+            await reset_async_qdrant_state()
 
 
 def main() -> None:

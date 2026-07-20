@@ -16,13 +16,7 @@ export class MemeDetailPage {
 
   async expectAttributionQuery(attribution: ExpectedMemeAttribution) {
     await expect(this.page).toHaveURL((url) => {
-      return (
-        url.searchParams.get('attribution_request_id') === attribution.requestId &&
-        url.searchParams.get('attribution_impression_id') === attribution.impressionId &&
-        url.searchParams.get('attribution_source_algorithm') === attribution.sourceAlgorithm &&
-        url.searchParams.get('attribution_surface') === attribution.surface &&
-        url.searchParams.get('attribution_rank') === String(attribution.rank)
-      );
+      return url.searchParams.get('attribution_token') === attribution.token;
     });
   }
 

@@ -151,8 +151,28 @@ async def test_collection_routes_crud_detail_remove_active_and_invites(
     finally:
         app.dependency_overrides.clear()
 
-    save_event = await migrated_db_session.scalar(
-        select(AnalyticsEvent).where(AnalyticsEvent.event_type == AnalyticsEventType.MEME_SAVE)
+    save_events = list(
+        await migrated_db_session.scalars(
+            select(AnalyticsEvent)
+            .where(AnalyticsEvent.event_type == AnalyticsEventType.MEME_SAVE)
+            .order_by(AnalyticsEvent.occurred_at, AnalyticsEvent.id)
+        )
+    )
+    save_event = next(
+        (
+            event
+            for event in save_events
+            if cast("dict[str, object]", event.payload["properties"])["action"] == "add"
+        ),
+        None,
+    )
+    remove_event = next(
+        (
+            event
+            for event in save_events
+            if cast("dict[str, object]", event.payload["properties"])["action"] == "remove"
+        ),
+        None,
     )
     save_event_refs = cast("dict[str, object]", save_event.payload["refs"]) if save_event else {}
     save_event_properties = cast("dict[str, object]", save_event.payload["properties"]) if save_event else {}
@@ -173,17 +193,16 @@ async def test_collection_routes_crud_detail_remove_active_and_invites(
     assert save_event.payload["rank"] == 2
     assert save_event_refs["collection_id"] == collection_id
     assert save_event_refs["meme_id"] == str(meme.id)
-    assert save_event_properties["action"] == "save"
+    assert save_event_properties["action"] == "add"
+    assert save_event_properties["preference_kind"] == "save"
+    assert save_event_properties["attribution_trusted"] is False
     assert save_event_properties["collection_scope"] == "public"
-    assert len(
-        list(
-            (
-                await migrated_db_session.execute(
-                    select(AnalyticsEvent).where(AnalyticsEvent.event_type == AnalyticsEventType.MEME_SAVE)
-                )
-            ).scalars()
-        )
-    ) == 1
+    assert remove_event is not None
+    remove_event_properties = cast("dict[str, object]", remove_event.payload["properties"])
+    assert remove_event.user_id == owner.id
+    assert remove_event_properties["preference_kind"] == "save"
+    assert remove_event_properties["attribution_trusted"] is False
+    assert len(save_events) == 2
     assert owner_choices_response.status_code == 200
     assert owner_choices_response.json()["collections"] == [
         {

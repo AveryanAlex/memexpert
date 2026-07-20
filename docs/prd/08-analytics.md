@@ -187,8 +187,11 @@ Core events:
   (inline/web/miniapp), request ID, result total, returned count, latency_ms,
   filters, and collection scope
 - **meme_impression:** a web meme card reached at least 25% visibility; includes
-  stable placement-scoped impression ID plus rank, surface, request, and
-  algorithm/source attribution
+  a client-generated UUIDv7 event ID, stable placement-scoped impression ID,
+  and trusted server-issued attribution
+- **meme_engaged_view:** fires at most once per placement after the card has at
+  least 50% visibility for three accumulated foreground seconds; background
+  time and autoplay alone do not count as positive engagement
 - **inline_served:** one meme returned in a Telegram inline result page with
   its own stable exposure key; it is separate from web impressions
 - **meme_view:** detail page opened or PM/detail view shown; web detail reads
@@ -197,7 +200,8 @@ Core events:
 - **meme_detail_click:** user clicked from a feed/search/related block to a meme detail page
 - **meme_send / inline_chosen / inline_sent**
 - **meme_like / meme_save / meme_pin / meme_upload / meme_download / meme_share**
-- **collection_action** with `action` in payload for create/invite/join/add/remove/bulk flows
+- **collection_action** with `action` in payload for create/invite/join/add/remove/bulk flows;
+  Favorite, Save, and Pin mutations use `properties.action=add|remove`
 - **meme_report**
 - **auth_event / account_merge:** guest-created and guest-upgraded lifecycle
   milestones, plus durable guest-to-full merge attribution
@@ -206,6 +210,37 @@ Core events:
 - **inline_viral_tracking:** group_id (hashed), unique users from same group over time
 
 Current backend foundation decision: all strict interaction writes stay in the existing `analytics_events` table with a versioned payload envelope (`schema_version`, `actor_type`, `actor_account_type`, `surface`, `refs`, `properties`). Legacy names remain valid for compatibility, and recommendation/trend readers must accept both legacy flat `payload.meme_id` and strict `payload.refs.meme_id` during the transition, but new reusable writes should prefer the canonical event names above and must never store raw `group_id`, `chat_id`, tokens, authorization/cookie headers, request headers, IP addresses, or user agents.
+
+Browser interaction telemetry uses
+`POST /api/v1/analytics/interactions/batch`. A batch contains at most 50 events.
+Impressions, engaged views, and detail clicks carry a client-generated UUIDv7
+that becomes the `analytics_events.id`; retrying the same event is a successful
+no-op, while reusing an ID for different content is rejected. The browser also
+caps each serialized request at 48 KiB, queues and retries events, and starts a
+separate bounded keepalive delivery on page hide even when an ordinary request
+is in flight. Normal delivery retries transport failures, 408/425/429, and 5xx;
+a permanent 4xx batch failure is split until the bad event can be discarded
+without poisoning valid siblings. When authentication changes, queued
+viewer-bound events are discarded rather than replayed with the new viewer's
+cookie. If one event exceeds the byte ceiling, optional client properties are
+removed first; an event whose required identity/token fields still exceed the
+ceiling is not queued. Product mutations also accept `event_id` so their
+telemetry is safely retryable.
+
+The backend enforces the same 48 KiB request ceiling before JSON decoding for
+both declared and streamed bodies, then rechecks canonical serialized size and
+the 50-event limit. Event properties are JSON-only and have bounded nesting,
+container/member counts, key length, and string length, preventing an arbitrary
+client from turning the public endpoint into unbounded parsing or JSONB work.
+Cards without server result attribution generate one stable UUIDv7 placement ID
+per page placement; the backend promotes that bounded client ID to the canonical
+`impression_id` while keeping its ranking attribution untrusted.
+
+For durable preferences, current collection/pin state is authoritative. A
+historical add event does not keep contributing after removal, and a removal is
+not a negative signal. Raw events remain retained indefinitely in PostgreSQL;
+this roadmap adds no partitioning, deletion, archive, personalization reset, or
+opt-out behavior.
 
 Web search writes only after a non-empty first page succeeds. Its raw query and
 request ID remain inside the durable event stream for admin aggregation and
@@ -218,17 +253,84 @@ must never appear there. The detail endpoint resolves the key under the same
 admin authorization and returns raw query text only in its protected response
 body.
 
-Required attribution fields where applicable:
+Trusted discovery attribution is server-authored. Each result includes an
+opaque signed `attribution_token` bound to the viewer and meme. The token claims
+request/impression identity, surface, global rank, candidate-source
+contributions, algorithm/profile versions, score, related-source identity, and
+expiry. It deliberately omits raw query text and collection identifiers. The
+backend verifies the token and current meme access before accepting an event or
+mutation.
+
+During the backend-first compatibility window, legacy nested attribution may be
+accepted, but it is marked `attribution_trusted=false` and never overrides a
+valid token. It is removed after compatible web/bot clients deploy. Consumers
+must not render algorithm internals.
+
+Telegram empty-query results preserve the same trust boundary. Each
+`inline_served` row stores server-authored algorithm/profile versions and typed
+candidate-source contributions, including `explicit_pins` where applicable,
+with `attribution_trusted=true`. A compact impression identity is embedded in
+the Telegram result/callback ID and joins later `inline_chosen`, `inline_sent`,
+`meme_send`, Favorite, Save, and Pin-add rows to that exact served exposure.
+Those later events inherit ranking fields only from the matching trusted served
+row for the recorded user, meme, and impression identity; Telegram client fields
+do not author them.
+
+Canonical server-side attribution fields where applicable:
 
 - `surface`: `web_home`, `web_search`, `web_related`, `web_collection`, `web_profile`, `telegram_inline`, `telegram_pm`, `miniapp`
-- `source_algorithm`: `search`, `similarity`, `tag_related`, `personalized`, `trending`, `motd`, `collection`, `fallback`
+- `source_algorithm`: a server-controlled retrieval family, not a closed client
+  enum; current values include `hybrid_search`, `qdrant_similarity`,
+  `personalized_recommendations`, `explicit_pins`, `public_trends_mv_*`, `motd`,
+  and `fallback_*`
 - `source_meme_id`: source meme when a result appears under related/similar memes
-- `query`, `filters`, `collection_id`, `rank`, `score`, `score_components`, `reason`
+- `rank`, `score`, candidate-source contributions, algorithm/profile versions,
+  and `reason`
 - `request_id` and/or `impression_id` so later clicks/downloads can be tied back to the result that exposed the meme
 
 ### Recommendation Signals
 
-Recommendation service consumes positive interaction history. Download, save/favorite, pin, send/chosen-inline are strong positives; detail view is medium; impression without click is stored for future ranking/evaluation but should be weak or neutral initially.
+Recommendation service consumes positive interaction history with the shared
+policy: current Favorite/Save/Pin `5`; Download, Send/Share, or inline
+chosen/sent `4`; engaged view `2`; detail click/view `1`; and impression `0`.
+Send-family rows sharing one meme/impression identity collapse to one logical
+signal before decay, so Telegram's chosen/sent/send compatibility rows do not
+triple-count preference. Recent successful
+search vectors have short-lived current-intent weight `3` without putting raw
+queries in Redis. Impressions drive cooldown and evaluation only; ignored
+impressions are never inferred dislikes.
+
+### Recommendation Reporting
+
+Recommendation analytics are grouped by surface, algorithm version, profile
+version, and typed candidate source. Required measures are:
+
+- strong-action and attributed-send rate per keyed impression;
+- repeat-within-cooldown rate;
+- source and template concentration;
+- catalog, long-tail, and exploration coverage;
+- exploration share and conversion;
+- cold-start, provider fallback, Redis fallback, and cursor-expiry rates;
+- candidate counts, filtered ratio, and p50/p95 latency for retrieval, fusion,
+  PostgreSQL filtering/features, reranking, and page hydration.
+
+Daily conversion numerators join back to a canonical impression by viewer,
+meme, and opaque impression key. Multiple qualifying actions reduce to one
+converted exposure, and unmatched actions never enter the numerator, keeping
+keyed rates bounded by `1.0`. Repeated retrieval contributions with the same
+typed candidate source also reduce to one source/impression fact.
+
+Bounded daily aggregate rows support dashboards while raw events remain the
+audit/evaluation source. They currently materialize keyed strong/send,
+cooldown-repeat, concentration, catalog/long-tail, exploration, and
+impression-level fallback metrics. Cold-start/provider/Redis breakdowns, cursor
+expiry, candidate/filter counts, and latency samples remain structured-log
+metrics; p50/p95 are computed by the log backend. The aggregate schema's
+`cache_expiry_count` is reserved at zero rather than populated from synthetic
+events. Current beta volume is too small for statistical A/B claims: use
+chronological offline replay for algorithm choice and stable-hash canaries for
+rollout safety. Shadow traffic records candidate/ranking metrics without
+changing the rendered feed.
 
 Admin dashboard interaction totals likewise exclude page views, searches,
 impressions, inline-query/served exposure, and account lifecycle events; those

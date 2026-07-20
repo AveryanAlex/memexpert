@@ -40,6 +40,31 @@ class MemeResultAttributionFiltersRead(BaseModel):
     collection_ids: list[str] = Field(default_factory=list)
 
 
+class RecommendationCandidateSource(StrEnum):
+    """Typed candidate origins used by versioned recommendation attribution."""
+
+    SHORT_TERM = "short_term"
+    CURRENT_INTENT = "current_intent"
+    LONG_TERM_GLOBAL = "long_term_global"
+    LONG_TERM_CLUSTER = "long_term_cluster"
+    MULTI_POSITIVE = "multi_positive"
+    TRENDING = "trending"
+    EXPLORATION = "exploration"
+    VISUAL_SIMILARITY = "visual_similarity"
+    TAG_OVERLAP = "tag_overlap"
+    SAME_TEMPLATE = "same_template"
+    PUBLIC_POPULAR = "public_popular"
+
+
+class RecommendationCandidateSourceContributionRead(BaseModel):
+    """One bounded source contribution for a ranked recommendation candidate."""
+
+    source: RecommendationCandidateSource
+    rank: int = Field(ge=1)
+    score: float | None = None
+    contribution: float
+
+
 class MemeResultAttributionRead(BaseModel):
     """Public-safe source metadata for one discoverable meme impression."""
 
@@ -54,9 +79,12 @@ class MemeResultAttributionRead(BaseModel):
     collection_ids: list[str] = Field(default_factory=list)
     source_meme_id: uuid.UUID | None = None
     algorithm_version: str | None = None
+    profile_version: str | None = None
     score: float | None = None
     score_components: dict[str, float] = Field(default_factory=dict)
+    candidate_sources: list[RecommendationCandidateSourceContributionRead] = Field(default_factory=list)
     reason: str | None = None
+    attribution_token: str | None = None
 
 
 class MemeFileRead(BaseModel):
@@ -120,6 +148,8 @@ class MemeSearchScoreRead(BaseModel):
     semantic: float
     text: float
     popularity: float
+    taste: float = 0.0
+    quality: float = 0.5
     total: float
 
 
@@ -259,6 +289,43 @@ class PublicMemeSearchPageRead(BaseModel):
     total: int
     has_more: bool
     request_id: str = Field(default_factory=new_discovery_request_id)
+
+
+class RecommendationFeedPageRead(BaseModel):
+    """Frozen personalized feed page with opaque cursor continuation.
+
+    ``limit``, ``offset``, and ``total`` remain for one compatibility release;
+    cursor-aware consumers must use ``next_cursor`` and ``has_more``.
+    """
+
+    items: list[PublicMemeSearchResultRead]
+    request_id: str = Field(default_factory=new_discovery_request_id)
+    feed_session_id: str
+    next_cursor: str | None = None
+    expires_at: datetime
+    has_more: bool
+    limit: int
+    offset: int = 0
+    total: int
+
+
+class RecommendationFeedReauthorizationItemWrite(BaseModel):
+    """One previously issued Home result presented for fresh authorization."""
+
+    meme_id: uuid.UUID
+    attribution_token: str = Field(min_length=1, max_length=8192)
+
+
+class RecommendationFeedReauthorizationRequest(BaseModel):
+    """Bounded back-navigation state that must be rechecked before rendering."""
+
+    items: list[RecommendationFeedReauthorizationItemWrite] = Field(max_length=200)
+
+
+class RecommendationFeedReauthorizationRead(BaseModel):
+    """Currently visible subset of a previously rendered Home feed."""
+
+    items: list[PublicMemeSearchResultRead]
 
 
 class PublicTrendCountsRead(BaseModel):
@@ -717,6 +784,12 @@ __all__ = [
     "MemeFileRead",
     "MemeResultAttributionFiltersRead",
     "MemeResultAttributionRead",
+    "RecommendationCandidateSource",
+    "RecommendationCandidateSourceContributionRead",
+    "RecommendationFeedPageRead",
+    "RecommendationFeedReauthorizationItemWrite",
+    "RecommendationFeedReauthorizationRead",
+    "RecommendationFeedReauthorizationRequest",
     "MemeSlugRedirectRead",
     "MemeSearchPageRead",
     "MemeSearchResultRead",

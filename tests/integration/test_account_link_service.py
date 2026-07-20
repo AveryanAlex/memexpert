@@ -5,8 +5,9 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, override
+from unittest.mock import AsyncMock, call
 
 import pytest
 from sqlalchemy import func, select
@@ -21,6 +22,11 @@ from memexpert.models.enums import (
     ContentKind,
     ContentProcessingStatus,
     UserLanguage,
+)
+from memexpert.models.recommendation import (
+    UserMemeRecommendationState,
+    UserRecommendationProfile,
+    UserRecommendationProfileStatus,
 )
 from memexpert.models.user import AccountMergeLog, AnalyticsEvent, InlineUsageEvent, User
 from memexpert.services import (
@@ -39,6 +45,8 @@ from memexpert.services import (
     UserService,
 )
 from memexpert.services.provider_auth_service import GoogleIdentity, TelegramIdentity
+from memexpert.services.recommendations.feed_sessions import FeedSessionStore
+from memexpert.services.recommendations.intent import RecommendationIntentStore
 from tests.conftest import create_full_user_via_upgrade
 
 if TYPE_CHECKING:
@@ -348,7 +356,16 @@ async def test_email_login_merges_guest_into_existing_full_with_deduped_favorite
     migrated_db_session: AsyncSession,
 ) -> None:
     user_service = UserService(migrated_db_session)
-    link_service = build_account_link_service(migrated_db_session)
+    feed_sessions = AsyncMock(spec=FeedSessionStore)
+    intent_store = AsyncMock(spec=RecommendationIntentStore)
+    feed_sessions.invalidate_viewer.side_effect = RuntimeError("redis feed cache unavailable")
+    intent_store.invalidate.side_effect = RuntimeError("redis intent cache unavailable")
+    link_service = AccountLinkService(
+        migrated_db_session,
+        provider_auth_service=build_provider_auth_service(migrated_db_session),
+        recommendation_feed_sessions=feed_sessions,
+        recommendation_intent_store=intent_store,
+    )
 
     guest = await user_service.create_guest_user(language=UserLanguage.EN, nsfw_enabled=True)
     full_user = await create_password_user(
@@ -389,6 +406,47 @@ async def test_email_login_merges_guest_into_existing_full_with_deduped_favorite
         guest_user_id=guest.id,
         meme_id=str(transferred_meme.id),
     )
+    first_seen = datetime(2026, 1, 1, tzinfo=UTC)
+    migrated_db_session.add_all(
+        [
+            UserMemeRecommendationState(
+                user_id=guest.id,
+                meme_id=duplicate_meme.id,
+                first_seen_at=first_seen,
+                latest_impression_at=first_seen,
+                latest_engaged_view_at=first_seen,
+                latest_strong_action_at=first_seen,
+                impression_count=2,
+            ),
+            UserMemeRecommendationState(
+                user_id=full_user.id,
+                meme_id=duplicate_meme.id,
+                first_seen_at=first_seen + timedelta(days=1),
+                latest_impression_at=first_seen + timedelta(days=2),
+                latest_engaged_view_at=first_seen + timedelta(days=2),
+                latest_strong_action_at=first_seen + timedelta(days=2),
+                impression_count=3,
+            ),
+            UserMemeRecommendationState(
+                user_id=guest.id,
+                meme_id=transferred_meme.id,
+                first_seen_at=first_seen + timedelta(hours=1),
+                latest_impression_at=first_seen + timedelta(hours=1),
+                impression_count=1,
+            ),
+            UserRecommendationProfileStatus(user_id=full_user.id, dirty_since=None),
+            UserRecommendationProfile(
+                user_id=full_user.id,
+                profile_slot=0,
+                model_version="test-model",
+                profile_version="test-profile",
+                signal_count=1,
+                total_weight=1.0,
+                vector=b"stale",
+                generated_at=first_seen,
+            ),
+        ]
+    )
     await migrated_db_session.commit()
 
     result = await link_service.link_guest_with_email_login(
@@ -427,6 +485,19 @@ async def test_email_login_merges_guest_into_existing_full_with_deduped_favorite
     guest_favorites_result = await migrated_db_session.execute(
         select(Collection).where(Collection.id == guest_favorites_id)
     )
+    recommendation_states = (
+        await migrated_db_session.scalars(
+            select(UserMemeRecommendationState)
+            .where(UserMemeRecommendationState.user_id == full_user.id)
+            .order_by(UserMemeRecommendationState.meme_id)
+        )
+    ).all()
+    recommendation_profile_count = await migrated_db_session.scalar(
+        select(func.count())
+        .select_from(UserRecommendationProfile)
+        .where(UserRecommendationProfile.user_id == full_user.id)
+    )
+    recommendation_profile_status = await migrated_db_session.get(UserRecommendationProfileStatus, full_user.id)
 
     assert deleted_guest_result.scalar_one_or_none() is None
     persisted_full = persisted_full_result.scalar_one()
@@ -437,6 +508,21 @@ async def test_email_login_merges_guest_into_existing_full_with_deduped_favorite
     assert set(favorites_meme_ids_result.scalars().all()) == {duplicate_meme.id, transferred_meme.id}
     assert analytics_user_ids_result.scalars().all() == [full_user.id, full_user.id]
     assert inline_user_ids_result.scalars().all() == [full_user.id]
+    states_by_meme_id = {state.meme_id: state for state in recommendation_states}
+    assert states_by_meme_id[duplicate_meme.id].first_seen_at == first_seen
+    assert states_by_meme_id[duplicate_meme.id].latest_impression_at == first_seen + timedelta(days=2)
+    assert states_by_meme_id[duplicate_meme.id].latest_engaged_view_at == first_seen + timedelta(days=2)
+    assert states_by_meme_id[duplicate_meme.id].latest_strong_action_at == first_seen + timedelta(days=2)
+    assert states_by_meme_id[duplicate_meme.id].impression_count == 5
+    assert states_by_meme_id[transferred_meme.id].impression_count == 1
+    assert recommendation_profile_count == 0
+    assert recommendation_profile_status is not None
+    assert recommendation_profile_status.dirty_since is not None
+    assert feed_sessions.invalidate_viewer.await_args_list == [call(guest.id), call(full_user.id)]
+    assert intent_store.invalidate.await_args_list == [
+        call(user_id=guest.id),
+        call(user_id=full_user.id),
+    ]
 
     merge_log = merge_log_result.scalar_one()
     assert merge_log.favorites_transferred == 1

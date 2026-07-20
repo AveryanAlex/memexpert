@@ -132,7 +132,14 @@ export class SearchPage {
   private waitForResultTelemetryPost(meme: SeededMeme, action: SearchResultTelemetryAction): Promise<Request> {
     return this.page.waitForRequest((request) => {
       const url = new URL(request.url());
-      return request.method() === 'POST' && url.pathname === `/api/v1/memes/${meme.meme_id}/${action}`;
+      if (request.method() !== 'POST' || url.pathname !== '/api/v1/analytics/interactions/batch') return false;
+      const payload = request.postDataJSON() as {
+        events?: Array<{ event_type?: string; meme_id?: string }>;
+      };
+      const eventType = action === 'impression' ? 'meme_impression' : 'meme_detail_click';
+      return Boolean(
+        payload.events?.some((event) => event.event_type === eventType && event.meme_id === meme.meme_id)
+      );
     });
   }
 

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 import uuid
 from datetime import datetime
@@ -24,13 +25,14 @@ from memexpert.api.dependencies import (
     OptionalCurrentUserDep,
     PublicMemeInsightsServiceDep,
     PublicTrendsServiceDep,
+    RecommendationServiceDep,
 )
 from memexpert.api.routes._collection_errors import collection_service_http_error
 from memexpert.api.routes._meme_interactions import (
     MemeActionAttributionRequest,
     MemeInteractionAttributionRequest,
-    payload_attribution,
     record_meme_interaction,
+    resolve_meme_interaction_request,
 )
 from memexpert.models.enums import AnalyticsEventType, ContentKind, ContentLanguage
 from memexpert.schemas.collection import CollectionMemeRead, CollectionRead, MemeLibraryRead, PinnedMemeRead
@@ -51,6 +53,9 @@ from memexpert.schemas.meme import (
     PublicTrendComparisonRead,
     PublicTrendSummaryRead,
     PublicTrendTimelinePageRead,
+    RecommendationFeedPageRead,
+    RecommendationFeedReauthorizationRead,
+    RecommendationFeedReauthorizationRequest,
 )
 from memexpert.schemas.report import MemeReportCreateRequest, MemeReportRead
 from memexpert.schemas.user import UserRead
@@ -63,9 +68,19 @@ from memexpert.services import (
 from memexpert.services.analytics import InteractionEventWrite
 from memexpert.services.meme_search import MemeNotFoundError, MemeSearchFilters, MemeSearchScope
 from memexpert.services.public_trends import PublicTrendRanking, PublicTrendTimelineGranularity
+from memexpert.services.recommendations.attribution import (
+    AttributionTokenError,
+    AttributionTokenExpiredError,
+)
+from memexpert.services.recommendations.feed_sessions import (
+    MAX_FEED_CURSOR_LENGTH,
+    FeedCursorError,
+    FeedCursorExpiredError,
+)
 from memexpert.services.report import MemeReportTargetNotVisibleError
 
 router = APIRouter(prefix="/memes", tags=["memes"])
+logger = logging.getLogger(__name__)
 
 SEARCH_SCOPE_DESCRIPTION = (
     "Optional search visibility scope. If omitted, requests use public results for HTTP public API "
@@ -90,7 +105,7 @@ class PinReorderRequest(BaseModel):
     meme_ids: list[uuid.UUID] = Field(max_length=20)
 
 
-class MemeReportCreateWithAttributionRequest(MemeReportCreateRequest):
+class MemeReportCreateWithAttributionRequest(MemeReportCreateRequest, MemeActionAttributionRequest):
     """Report payload plus optional discovery attribution for telemetry."""
 
     attribution: MemeInteractionAttributionRequest | None = None
@@ -141,14 +156,14 @@ async def search_memes(
         filters=filters,
         limit=limit,
         offset=offset,
-        surface="public_api_search",
+        surface="web_search",
     )
     if normalized_query and offset == 0:
         await analytics_service.record_interaction_event_best_effort(
             InteractionEventWrite(
                 event_type=AnalyticsEventType.SEARCH_QUERY,
                 user_id=current_user.id if current_user else None,
-                surface="public_api_search",
+                surface="web_search",
                 query=normalized_query,
                 request_id=page.request_id,
                 properties={
@@ -206,17 +221,18 @@ async def browse_memes(
     return page
 
 
-@router.get("/home-feed", response_model=PublicMemeSearchPageRead, summary="Read personalized home feed")
+@router.get("/home-feed", response_model=RecommendationFeedPageRead, summary="Read personalized home feed")
 async def home_feed_memes(
-    meme_search_service: MemeSearchServiceDep,
+    recommendation_service: RecommendationServiceDep,
     current_user: AutoGuestUserDep,
     language: Annotated[ContentLanguage | None, Query()] = None,
     media_type: Annotated[ContentKind | None, Query()] = None,
     include_nsfw: Annotated[bool, Query()] = False,
     tags: Annotated[list[str] | None, Query()] = None,
     limit: Annotated[int, Query(ge=1, le=100)] = 20,
-    offset: Annotated[int, Query(ge=0)] = 0,
-) -> PublicMemeSearchPageRead:
+    cursor: Annotated[str | None, Query(min_length=1, max_length=MAX_FEED_CURSOR_LENGTH)] = None,
+    offset: Annotated[int | None, Query(ge=0, description="Deprecated offset compatibility.")] = None,
+) -> RecommendationFeedPageRead:
     """Return a public-catalog home feed personalized to the current cookie user."""
 
     filters = _build_filters(
@@ -227,13 +243,97 @@ async def home_feed_memes(
         include_nsfw=_nsfw_allowed(current_user, include_nsfw),
         tags=tags,
     )
-    return await meme_search_service.home_feed_public_memes(
-        viewer_user_id=current_user.id,
-        filters=filters,
-        limit=limit,
-        offset=offset,
-        surface="public_api_home_feed",
+    if cursor is not None and offset is not None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="feed_cursor_and_offset_mutually_exclusive",
+        )
+    try:
+        return await recommendation_service.home_feed(
+            viewer_user_id=current_user.id,
+            filters=filters,
+            limit=limit,
+            cursor=cursor,
+            offset=offset or 0,
+        )
+    except FeedCursorExpiredError as exc:
+        logger.info(
+            "recommendation_feed_cursor_expired",
+            extra={
+                "event": "recommendation_feed_cursor_expired",
+                "surface": "web_home",
+                "algorithm_version": recommendation_service.configured_algorithm_version,
+                "configured_algorithm_version": recommendation_service.configured_algorithm_version,
+                "profile_version": "none",
+                "cache_status": "expired",
+                "reason": "feed_cursor_expired",
+                "fallback_category": "cache_expiry",
+                "error_code": "feed_cursor_expired",
+            },
+        )
+        raise HTTPException(status_code=status.HTTP_410_GONE, detail="feed_cursor_expired") from exc
+    except FeedCursorError as exc:
+        logger.info(
+            "recommendation_feed_cursor_invalid",
+            extra={
+                "event": "recommendation_feed_cursor_invalid",
+                "surface": "web_home",
+                "algorithm_version": recommendation_service.configured_algorithm_version,
+                "configured_algorithm_version": recommendation_service.configured_algorithm_version,
+                "profile_version": "none",
+                "cache_status": "invalid",
+                "reason": "feed_cursor_invalid",
+                "fallback_category": "invalid_cursor",
+                "error_code": "feed_cursor_invalid",
+            },
+        )
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="feed_cursor_invalid",
+        ) from exc
+
+
+@router.post(
+    "/home-feed/reauthorize",
+    response_model=RecommendationFeedReauthorizationRead,
+    summary="Reauthorize saved Home feed items",
+)
+async def reauthorize_home_feed_memes(
+    payload: RecommendationFeedReauthorizationRequest,
+    recommendation_service: RecommendationServiceDep,
+    current_user: AutoGuestUserDep,
+    language: Annotated[ContentLanguage | None, Query()] = None,
+    media_type: Annotated[ContentKind | None, Query()] = None,
+    include_nsfw: Annotated[bool, Query()] = False,
+    tags: Annotated[list[str] | None, Query()] = None,
+) -> RecommendationFeedReauthorizationRead:
+    """Refresh browser-restored cards through current PostgreSQL authority."""
+
+    filters = _build_filters(
+        language=language,
+        media_type=media_type,
+        scope=MemeSearchScope.PUBLIC,
+        collection_ids=(),
+        include_nsfw=_nsfw_allowed(current_user, include_nsfw),
+        tags=tags,
     )
+    try:
+        items = await recommendation_service.reauthorize_feed_items(
+            viewer_user_id=current_user.id,
+            filters=filters,
+            items=tuple((item.meme_id, item.attribution_token) for item in payload.items),
+        )
+    except AttributionTokenExpiredError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="feed_attribution_expired",
+        ) from exc
+    except AttributionTokenError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="feed_attribution_invalid",
+        ) from exc
+    return RecommendationFeedReauthorizationRead(items=items)
 
 
 @router.get("/meme-of-the-day", response_model=PublicMemeOfTheDayRead, summary="Read Meme of the Day")
@@ -301,6 +401,7 @@ async def trending_memes(
         limit=limit,
         offset=offset,
         surface="public_api_trending",
+        viewer_user_id=current_user.id if current_user else None,
     )
     return _trend_page_to_search_page(page)
 
@@ -328,6 +429,7 @@ async def trend_rankings(
         limit=limit,
         offset=offset,
         surface="public_api_trends",
+        viewer_user_id=current_user.id if current_user else None,
     )
 
 
@@ -423,6 +525,7 @@ async def favorite_meme(
 ) -> MemeFavoriteMutationRead:
     """Save a meme to Favorites; the first save increments the meme like count."""
 
+    interaction = resolve_meme_interaction_request(payload, meme_id=meme_id, current_user=current_user)
     try:
         mutation = await collection_service.favorite_meme_result(user_id=current_user.id, meme_id=meme_id)
     except MemeNotFoundError as exc:
@@ -435,10 +538,10 @@ async def favorite_meme(
             AnalyticsEventType.MEME_LIKE,
             meme_id=meme_id,
             current_user=current_user,
-            attribution=payload_attribution(payload),
+            interaction=interaction,
             default_surface="public_api_meme_action",
             collection_id=mutation.item.collection_id,
-            properties={"action": "favorite"},
+            properties={"action": "add", "preference_kind": "favorite"},
         )
     favorite_state = await collection_service.get_meme_favorite_state(
         user_id=current_user.id,
@@ -454,11 +557,14 @@ async def favorite_meme(
 @router.delete("/{meme_id}/favorite", response_model=MemeFavoriteMutationRead, summary="Unfavorite a meme")
 async def unfavorite_meme(
     collection_service: CollectionServiceDep,
+    analytics_service: AnalyticsServiceDep,
     current_user: AutoGuestUserDep,
     meme_id: Annotated[uuid.UUID, Path()],
+    payload: Annotated[MemeActionAttributionRequest | None, Body()] = None,
 ) -> MemeFavoriteMutationRead:
     """Remove a meme from Favorites when present."""
 
+    interaction = resolve_meme_interaction_request(payload, meme_id=meme_id, current_user=current_user)
     try:
         removed = await collection_service.unfavorite_meme(user_id=current_user.id, meme_id=meme_id)
     except CollectionServiceError as exc:
@@ -467,6 +573,16 @@ async def unfavorite_meme(
         user_id=current_user.id,
         meme_id=meme_id,
     )
+    if removed:
+        await record_meme_interaction(
+            analytics_service,
+            AnalyticsEventType.MEME_LIKE,
+            meme_id=meme_id,
+            current_user=current_user,
+            interaction=interaction,
+            default_surface="public_api_meme_action",
+            properties={"action": "remove", "preference_kind": "favorite"},
+        )
     return MemeFavoriteMutationRead(
         favorited=favorite_state.favorited,
         changed=removed,
@@ -484,6 +600,7 @@ async def save_meme_to_active_collection(
 ) -> CollectionMemeRead:
     """Save a meme into the caller's active collection, defaulting guests to Favorites."""
 
+    interaction = resolve_meme_interaction_request(payload, meme_id=meme_id, current_user=current_user)
     try:
         mutation = await collection_service.save_meme_to_active_collection_result(
             user_id=current_user.id,
@@ -499,10 +616,10 @@ async def save_meme_to_active_collection(
             AnalyticsEventType.MEME_SAVE,
             meme_id=meme_id,
             current_user=current_user,
-            attribution=payload_attribution(payload),
+            interaction=interaction,
             default_surface="public_api_meme_action",
             collection_id=mutation.item.collection_id,
-            properties={"action": "save"},
+            properties={"action": "add", "preference_kind": "save"},
         )
     return mutation.item
 
@@ -510,15 +627,28 @@ async def save_meme_to_active_collection(
 @router.delete("/{meme_id}/save", response_model=dict[str, bool], summary="Remove a saved meme")
 async def remove_meme_from_active_collection(
     collection_service: CollectionServiceDep,
+    analytics_service: AnalyticsServiceDep,
     current_user: AutoGuestUserDep,
     meme_id: Annotated[uuid.UUID, Path()],
+    payload: Annotated[MemeActionAttributionRequest | None, Body()] = None,
 ) -> dict[str, bool]:
     """Remove a meme from the active save collection when present."""
 
+    interaction = resolve_meme_interaction_request(payload, meme_id=meme_id, current_user=current_user)
     try:
         removed = await collection_service.remove_meme_from_active_collection(user_id=current_user.id, meme_id=meme_id)
     except CollectionServiceError as exc:
         raise _collection_http_error(exc) from exc
+    if removed:
+        await record_meme_interaction(
+            analytics_service,
+            AnalyticsEventType.MEME_SAVE,
+            meme_id=meme_id,
+            current_user=current_user,
+            interaction=interaction,
+            default_surface="public_api_meme_action",
+            properties={"action": "remove", "preference_kind": "save"},
+        )
     return {"removed": removed}
 
 
@@ -572,6 +702,7 @@ async def pin_meme(
 ) -> PinnedMemeRead:
     """Append a meme to the caller's full-account pins."""
 
+    interaction = resolve_meme_interaction_request(payload, meme_id=meme_id, current_user=current_user)
     try:
         mutation = await collection_service.pin_meme_result(user_id=current_user.id, meme_id=meme_id)
     except MemeNotFoundError as exc:
@@ -584,9 +715,9 @@ async def pin_meme(
             AnalyticsEventType.MEME_PIN,
             meme_id=meme_id,
             current_user=current_user,
-            attribution=payload_attribution(payload),
+            interaction=interaction,
             default_surface="public_api_meme_action",
-            properties={"action": "pin", "position": mutation.item.position},
+            properties={"action": "add", "preference_kind": "pin", "position": mutation.item.position},
         )
     return mutation.item
 
@@ -594,15 +725,28 @@ async def pin_meme(
 @router.delete("/{meme_id}/pin", response_model=dict[str, bool], summary="Unpin a meme")
 async def unpin_meme(
     collection_service: CollectionServiceDep,
+    analytics_service: AnalyticsServiceDep,
     current_user: FullAccountUserDep,
     meme_id: Annotated[uuid.UUID, Path()],
+    payload: Annotated[MemeActionAttributionRequest | None, Body()] = None,
 ) -> dict[str, bool]:
     """Remove a pin and compact the remaining order."""
 
+    interaction = resolve_meme_interaction_request(payload, meme_id=meme_id, current_user=current_user)
     try:
         removed = await collection_service.unpin_meme(user_id=current_user.id, meme_id=meme_id)
     except CollectionServiceError as exc:
         raise _collection_http_error(exc) from exc
+    if removed:
+        await record_meme_interaction(
+            analytics_service,
+            AnalyticsEventType.MEME_PIN,
+            meme_id=meme_id,
+            current_user=current_user,
+            interaction=interaction,
+            default_surface="public_api_meme_action",
+            properties={"action": "remove", "preference_kind": "pin"},
+        )
     return {"removed": removed}
 
 
@@ -630,6 +774,7 @@ async def report_meme(
 ) -> MemeReportRead:
     """Create or reuse the caller's open moderation report for a visible meme."""
 
+    interaction = resolve_meme_interaction_request(payload, meme_id=meme_id, current_user=current_user)
     try:
         report = await report_service.report_meme(
             meme_id,
@@ -644,7 +789,7 @@ async def report_meme(
         AnalyticsEventType.MEME_REPORT,
         meme_id=meme_id,
         current_user=current_user,
-        attribution=payload.attribution,
+        interaction=interaction,
         default_surface="public_api_meme_action",
         report_id=report.id,
         properties={"action": "report", "reason": report.reason.value, "status": report.status.value},
@@ -663,6 +808,7 @@ async def share_meme(
 ) -> MemeInteractionRecordedRead:
     """Record a visible meme share action without serving media or redirecting."""
 
+    interaction = resolve_meme_interaction_request(payload, meme_id=meme_id, current_user=current_user)
     await _ensure_visible_meme_for_interaction(
         meme_search_service,
         meme_id=meme_id,
@@ -674,7 +820,7 @@ async def share_meme(
         AnalyticsEventType.MEME_SHARE,
         meme_id=meme_id,
         current_user=current_user,
-        attribution=payload_attribution(payload),
+        interaction=interaction,
         default_surface="public_api_meme_action",
         properties={
             "action": "share",
@@ -696,6 +842,7 @@ async def record_meme_impression(
 ) -> MemeInteractionRecordedRead:
     """Record a visible list-card impression without changing meme state."""
 
+    interaction = resolve_meme_interaction_request(payload, meme_id=meme_id, current_user=current_user)
     await _ensure_visible_meme_for_interaction(
         meme_search_service,
         meme_id=meme_id,
@@ -707,7 +854,7 @@ async def record_meme_impression(
         AnalyticsEventType.MEME_IMPRESSION,
         meme_id=meme_id,
         current_user=current_user,
-        attribution=payload_attribution(payload),
+        interaction=interaction,
         default_surface="public_api_meme_card",
         properties={"action": "impression", "include_nsfw": _nsfw_allowed(current_user, include_nsfw)},
     )
@@ -725,6 +872,7 @@ async def record_meme_view(
 ) -> MemeInteractionRecordedRead:
     """Record one visible detail-page visit independently of detail reads."""
 
+    interaction = resolve_meme_interaction_request(payload, meme_id=meme_id, current_user=current_user)
     await _ensure_visible_meme_for_interaction(
         meme_search_service,
         meme_id=meme_id,
@@ -736,7 +884,7 @@ async def record_meme_view(
         AnalyticsEventType.MEME_VIEW,
         meme_id=meme_id,
         current_user=current_user,
-        attribution=payload_attribution(payload),
+        interaction=interaction,
         default_surface="public_api_meme_detail",
         properties={"include_nsfw": _nsfw_allowed(current_user, include_nsfw)},
     )
@@ -758,6 +906,7 @@ async def record_meme_detail_click(
 ) -> MemeInteractionRecordedRead:
     """Record a visible list-card click before the caller navigates to detail."""
 
+    interaction = resolve_meme_interaction_request(payload, meme_id=meme_id, current_user=current_user)
     await _ensure_visible_meme_for_interaction(
         meme_search_service,
         meme_id=meme_id,
@@ -769,7 +918,7 @@ async def record_meme_detail_click(
         AnalyticsEventType.MEME_DETAIL_CLICK,
         meme_id=meme_id,
         current_user=current_user,
-        attribution=payload_attribution(payload),
+        interaction=interaction,
         default_surface="public_api_meme_card",
         properties={"action": "detail_click", "include_nsfw": _nsfw_allowed(current_user, include_nsfw)},
     )
@@ -787,6 +936,7 @@ async def download_meme(
 ) -> MemeInteractionRecordedRead:
     """Record a visible meme download action without serving or signing media."""
 
+    interaction = resolve_meme_interaction_request(payload, meme_id=meme_id, current_user=current_user)
     await _ensure_visible_meme_for_interaction(
         meme_search_service,
         meme_id=meme_id,
@@ -798,7 +948,7 @@ async def download_meme(
         AnalyticsEventType.MEME_DOWNLOAD,
         meme_id=meme_id,
         current_user=current_user,
-        attribution=payload_attribution(payload),
+        interaction=interaction,
         default_surface="public_api_meme_action",
         properties={"action": "download", "include_nsfw": _nsfw_allowed(current_user, include_nsfw)},
     )
@@ -1013,7 +1163,7 @@ async def get_similar_memes(
             include_nsfw=_nsfw_allowed(current_user, include_nsfw),
             limit=limit,
             offset=offset,
-            surface="public_api_meme_similar",
+            surface="web_related",
         )
     except MemeNotFoundError as exc:
         raise _meme_not_found_http_error() from exc

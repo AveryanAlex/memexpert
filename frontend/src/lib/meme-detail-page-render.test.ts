@@ -292,6 +292,9 @@ function result(
   return {
     meme,
     attribution: {
+      attribution_token: null,
+      candidate_sources: [],
+      profile_version: null,
       request_id: 'req_detail',
       impression_id: `imp_${rank}`,
       surface: 'public_api_meme_similar',

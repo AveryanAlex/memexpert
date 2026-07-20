@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import builtins
 import math
 import uuid
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, cast
 
@@ -18,8 +20,16 @@ from memexpert.api.dependencies import PIPELINE_OPERATOR_TOKEN_HEADER_NAME
 from memexpert.api.dependencies.auth import get_optional_current_user
 from memexpert.api.dependencies.collection import get_collection_service
 from memexpert.api.dependencies.meme import get_analytics_service, get_meme_search_service, get_public_trends_service
+from memexpert.api.dependencies.recommendation import get_recommendation_service
 from memexpert.core.config import Settings, get_settings
-from memexpert.core.qdrant import QdrantSimilarityMatch, QdrantUserSearchMatch
+from memexpert.core.qdrant import (
+    QdrantNearestSourceQuery,
+    QdrantRecommendationMatch,
+    QdrantRecommendationSourceResult,
+    QdrantRecommendSourceQuery,
+    QdrantSimilarityMatch,
+    QdrantUserSearchMatch,
+)
 from memexpert.core.search_index_prefilter import SearchIndexPrefilter, SearchIndexPrefilterScope
 from memexpert.core.storage import media_object_version_token
 from memexpert.core.voyage import VoyageEmbeddingResult
@@ -48,6 +58,7 @@ from memexpert.models.enums import (
     SourcePlatform,
 )
 from memexpert.models.user import AccountMergeLog, AnalyticsEvent, User
+from memexpert.schemas.meme import RecommendationCandidateSource
 from memexpert.schemas.user import UserRead
 from memexpert.services.analytics import AnalyticsService, InteractionEventRefs, InteractionEventWrite
 from memexpert.services.collection_service import CollectionService
@@ -55,6 +66,7 @@ from memexpert.services.engagement_read_model import load_derived_popularity_sco
 from memexpert.services.media_render_urls import MediaRenderUrlService
 from memexpert.services.meme_search import (
     PUBLIC_POPULAR_ALGORITHM_VERSION,
+    SEARCH_ALGORITHM_VERSION,
     SIMILAR_ALGORITHM_VERSION,
     MemeNotFoundError,
     MemeSearchFilters,
@@ -67,6 +79,11 @@ from memexpert.services.public_trends import (
     PublicTrendsService,
     refresh_public_trend_materialized_views,
 )
+from memexpert.services.recommendations.attribution import AttributionTokenService
+from memexpert.services.recommendations.feed_sessions import FeedSessionStore
+from memexpert.services.recommendations.intent import RecommendationIntentStore
+from memexpert.services.recommendations.service import RecommendationService
+from memexpert.services.recommendations.taste import ItemTasteScore
 from memexpert.services.search_index_sync import SEARCH_INDEX_ALGORITHM_VERSION
 from tests.factories import build_full_user
 from tests.integration.test_auth_routes import ACCESS_COOKIE_NAME
@@ -133,6 +150,100 @@ class FakeSimilarityClient:
         return self._hits[:limit]
 
 
+class FakeRecommendationQdrantClient:
+    def __init__(self, hits: tuple[QdrantRecommendationMatch, ...] = ()) -> None:
+        self._hits = hits
+        self.calls: list[dict[str, object]] = []
+
+    async def query_recommendation_sources(
+        self,
+        *,
+        nearest_queries: Sequence[QdrantNearestSourceQuery] = (),
+        recommend_queries: Sequence[QdrantRecommendSourceQuery] = (),
+        prefilter: SearchIndexPrefilter | None = None,
+        excluded_meme_file_ids: Sequence[uuid.UUID] = (),
+    ) -> tuple[QdrantRecommendationSourceResult, ...]:
+        self.calls.append(
+            {
+                "nearest_queries": tuple(nearest_queries),
+                "recommend_queries": tuple(recommend_queries),
+                "prefilter": prefilter,
+                "excluded_meme_file_ids": tuple(excluded_meme_file_ids),
+            }
+        )
+        return tuple(
+            QdrantRecommendationSourceResult(source=query.source, matches=self._hits[: query.limit])
+            for query in (*nearest_queries, *recommend_queries)
+        )
+
+
+class MemoryRecommendationRedis:
+    """Small Redis contract fake for deterministic feed and intent tests."""
+
+    def __init__(self) -> None:
+        self.values: dict[str, str] = {}
+        self.sets: dict[str, set[str]] = {}
+        self.sorted_sets: dict[str, dict[str, float]] = {}
+
+    async def get(self, key: str) -> str | None:
+        return self.values.get(key)
+
+    async def set(self, key: str, value: str, *, ex: int) -> bool:
+        assert ex > 0
+        self.values[key] = value
+        return True
+
+    async def sadd(self, key: str, *values: str) -> int:
+        bucket = self.sets.setdefault(key, set())
+        previous_count = len(bucket)
+        bucket.update(values)
+        return len(bucket) - previous_count
+
+    async def smembers(self, key: str) -> builtins.set[str]:
+        return set(self.sets.get(key, set()))
+
+    async def expire(self, key: str, seconds: int) -> bool:
+        assert key in self.sets or key in self.values
+        return seconds > 0
+
+    async def delete(self, *keys: str) -> int:
+        deleted = 0
+        for key in keys:
+            deleted += int(self.values.pop(key, None) is not None)
+            deleted += int(self.sets.pop(key, None) is not None)
+            deleted += int(self.sorted_sets.pop(key, None) is not None)
+        return deleted
+
+    async def eval(
+        self,
+        script: str,
+        numkeys: int,
+        *keys_and_args: object,
+    ) -> object:
+        assert "ZCARD" in script
+        assert numkeys == 2
+        pool_key, index_key, payload, ttl, score, pool_id, max_pools, pool_prefix = keys_and_args
+        assert int(str(ttl)) > 0
+        pool_key = str(pool_key)
+        index_key = str(index_key)
+        pool_id = str(pool_id)
+        pool_prefix = str(pool_prefix)
+        self.values[pool_key] = str(payload)
+        index = self.sorted_sets.setdefault(index_key, {})
+        index[pool_id] = float(str(score))
+        ordered = sorted(index, key=lambda value: (index[value], value))
+        evicted = ordered[: max(0, len(ordered) - int(str(max_pools)))]
+        for evicted_id in evicted:
+            index.pop(evicted_id, None)
+            self.values.pop(f"{pool_prefix}{evicted_id}", None)
+        return evicted
+
+    async def zrange(self, key: str, start: int, end: int) -> object:
+        index = self.sorted_sets.get(key, {})
+        ordered = sorted(index, key=lambda value: (index[value], value))
+        return ordered[start:] if end == -1 else ordered[start : end + 1]
+
+
 class FakeQueryEmbeddingClient:
     def __init__(self, vector: tuple[float, ...]) -> None:
         self._vector = vector
@@ -141,6 +252,30 @@ class FakeQueryEmbeddingClient:
     async def embed_query(self, query: str) -> tuple[float, ...]:
         self.calls.append(query)
         return self._vector
+
+
+class FakeTastePersonalization:
+    def __init__(self, scores: dict[uuid.UUID, ItemTasteScore]) -> None:
+        self._scores = scores
+        self.score_calls: list[tuple[uuid.UUID | None, tuple[uuid.UUID, ...]]] = []
+        self.intent_calls: list[tuple[uuid.UUID | None, tuple[float, ...] | None]] = []
+
+    async def score_items(
+        self,
+        *,
+        viewer_user_id: uuid.UUID | None,
+        meme_ids: tuple[uuid.UUID, ...],
+    ) -> dict[uuid.UUID, ItemTasteScore]:
+        self.score_calls.append((viewer_user_id, meme_ids))
+        return {meme_id: self._scores[meme_id] for meme_id in meme_ids}
+
+    async def record_successful_search(
+        self,
+        *,
+        viewer_user_id: uuid.UUID | None,
+        query_vector: tuple[float, ...] | None,
+    ) -> None:
+        self.intent_calls.append((viewer_user_id, query_vector))
 
 
 class FailingTextSearchClient:
@@ -467,6 +602,7 @@ def _install_meme_route_overrides(
     *,
     current_user: UserRead | None = None,
     service: MemeSearchService | None = None,
+    recommendation_service: RecommendationService | None = None,
 ) -> None:
     def override_meme_search_service() -> MemeSearchService:
         return service or MemeSearchService(session)
@@ -488,6 +624,43 @@ def _install_meme_route_overrides(
     app.dependency_overrides[get_collection_service] = override_collection_service
     app.dependency_overrides[get_public_trends_service] = override_public_trends_service
     app.dependency_overrides[get_optional_current_user] = override_current_user
+    if recommendation_service is not None:
+        app.dependency_overrides[get_recommendation_service] = lambda: recommendation_service
+
+
+def _build_recommendation_service(
+    session: AsyncSession,
+    *,
+    settings: Settings | None = None,
+    hits: tuple[QdrantRecommendationMatch, ...] = (),
+    redis: MemoryRecommendationRedis | None = None,
+) -> tuple[
+    RecommendationService,
+    MemeSearchService,
+    FakeRecommendationQdrantClient,
+    MemoryRecommendationRedis,
+]:
+    resolved_settings = settings or Settings(
+        recommendation_enabled=True,
+        recommendation_shadow_mode=False,
+        recommendation_canary_percent=100,
+    )
+    resolved_redis = redis or MemoryRecommendationRedis()
+    meme_search_service = MemeSearchService(session, settings=resolved_settings)
+    qdrant_client = FakeRecommendationQdrantClient(hits)
+    return (
+        RecommendationService(
+            session,
+            meme_search_service=meme_search_service,
+            qdrant_client=qdrant_client,
+            feed_sessions=FeedSessionStore(redis=resolved_redis, settings=resolved_settings),
+            intent_store=RecommendationIntentStore(redis=resolved_redis, settings=resolved_settings),
+            settings=resolved_settings,
+        ),
+        meme_search_service,
+        qdrant_client,
+        resolved_redis,
+    )
 
 
 async def _refresh_trend_views(session: AsyncSession) -> None:
@@ -534,7 +707,7 @@ async def test_hybrid_search_ranks_by_weighted_semantic_text_and_popularity(
     assert len({item.attribution.impression_id for item in page.items}) == 3
     assert [item.attribution.rank for item in page.items] == [1, 2, 3]
     assert page.items[0].attribution.source_algorithm == "hybrid_search"
-    assert page.items[0].attribution.algorithm_version == SEARCH_INDEX_ALGORITHM_VERSION
+    assert page.items[0].attribution.algorithm_version == SEARCH_ALGORITHM_VERSION
     assert page.items[0].score.semantic == 1.0
     assert page.items[1].score.text == 1.0
     assert page.items[0].score.total > page.items[1].score.total
@@ -647,6 +820,68 @@ async def test_plain_text_query_embedding_feeds_qdrant_and_hybrid_merge(
     assert page.items[1].score.text == 1.0
 
 
+async def test_search_taste_term_requires_explicit_personalized_v2_rollout(
+    migrated_db_session: AsyncSession,
+) -> None:
+    stronger_query_match = await _create_meme(migrated_db_session)
+    taste_preferred = await _create_meme(migrated_db_session)
+    viewer_id = uuid.uuid7()
+    text_hits = [
+        {
+            "id": str(stronger_query_match.primary_file_id),
+            "meme_id": str(stronger_query_match.id),
+            "_rankingScore": 1.0,
+        },
+        {
+            "id": str(taste_preferred.primary_file_id),
+            "meme_id": str(taste_preferred.id),
+            "_rankingScore": 0.9,
+        },
+    ]
+    taste = FakeTastePersonalization(
+        {
+            stronger_query_match.id: ItemTasteScore(taste=0.0, quality=0.5, profile_version="taste-v2"),
+            taste_preferred.id: ItemTasteScore(taste=1.0, quality=0.5, profile_version="taste-v2"),
+        }
+    )
+    zero_canary_service = MemeSearchService(
+        migrated_db_session,
+        text_client=FakeTextSearchClient(text_hits),
+        taste_personalization=taste,
+        settings=Settings(
+            recommendation_enabled=True,
+            recommendation_shadow_mode=False,
+            recommendation_canary_percent=0,
+        ),
+    )
+    enabled_service = MemeSearchService(
+        migrated_db_session,
+        text_client=FakeTextSearchClient(text_hits),
+        taste_personalization=taste,
+        settings=Settings(
+            recommendation_enabled=True,
+            recommendation_shadow_mode=False,
+            recommendation_canary_percent=100,
+        ),
+    )
+
+    disabled_page = await zero_canary_service.search_memes("rollout", viewer_user_id=viewer_id)
+    enabled_page = await enabled_service.search_memes("rollout", viewer_user_id=viewer_id)
+
+    assert [item.meme.id for item in disabled_page.items] == [
+        stronger_query_match.id,
+        taste_preferred.id,
+    ]
+    assert all(item.score.taste == 0.0 for item in disabled_page.items)
+    assert all(item.attribution.profile_version is None for item in disabled_page.items)
+    assert [item.meme.id for item in enabled_page.items] == [
+        taste_preferred.id,
+        stronger_query_match.id,
+    ]
+    assert enabled_page.items[0].score.taste == pytest.approx(1.0)
+    assert enabled_page.items[0].attribution.profile_version == "taste-v2"
+
+
 async def test_search_route_uses_plain_text_semantic_path_with_overridden_fakes(
     app: FastAPI,
     client: AsyncClient,
@@ -689,11 +924,18 @@ async def test_search_route_uses_plain_text_semantic_path_with_overridden_fakes(
     assert response.status_code == 200
     payload = response.json()
     assert [item["meme"]["id"] for item in payload["items"]] == [str(semantic_meme.id), str(text_meme.id)]
-    _assert_public_page_attribution(payload, source_algorithm="hybrid_search", surface="public_api_search")
+    _assert_public_page_attribution(payload, source_algorithm="hybrid_search", surface="web_search")
     first_attribution = payload["items"][0]["attribution"]
     assert first_attribution["query"] == "frog wizard"
-    assert first_attribution["algorithm_version"] == SEARCH_INDEX_ALGORITHM_VERSION
-    assert set(first_attribution["score_components"]) == {"semantic", "text", "popularity", "total"}
+    assert first_attribution["algorithm_version"] == SEARCH_ALGORITHM_VERSION
+    assert set(first_attribution["score_components"]) == {
+        "semantic",
+        "text",
+        "taste",
+        "popularity",
+        "quality",
+        "total",
+    }
     assert first_attribution["score"] == first_attribution["score_components"]["total"]
     assert first_attribution["filters"] == {
         "language": None,
@@ -721,7 +963,7 @@ async def test_search_route_uses_plain_text_semantic_path_with_overridden_fakes(
     assert event.user_id is None
     assert event.payload["schema_version"] == 1
     assert event.payload["actor_type"] == "anonymous"
-    assert event.payload["surface"] == "public_api_search"
+    assert event.payload["surface"] == "web_search"
     assert event.payload["query"] == "frog wizard"
     assert event.payload["request_id"] == payload["request_id"]
     assert event.payload["refs"] == {}
@@ -762,37 +1004,48 @@ async def test_home_feed_route_returns_public_personalized_recommendations(
         popularity_score=100.0,
         s3_original_key="pipeline/originals/private/home-feed-personalized-hidden.jpg",
     )
-    migrated_db_session.add(
-        AnalyticsEvent(
-            user_id=viewer.id,
-            event_type=AnalyticsEventType.MEME_LIKE,
-            payload={"refs": {"meme_id": str(source.id)}},
-        )
-    )
     await _add_image_embedding(migrated_db_session, source, (1.0, 0.0))
     await migrated_db_session.commit()
-    semantic_client = FakeSemanticSearchClient(
-        (
-            QdrantUserSearchMatch(
-                meme_file_id=_primary_file_id(private_candidate),
-                meme_id=private_candidate.id,
-                semantic_score=0.99,
-            ),
-            QdrantUserSearchMatch(
-                meme_file_id=_primary_file_id(public_candidate),
-                meme_id=public_candidate.id,
-                semantic_score=0.9,
-            ),
+    await AnalyticsService(migrated_db_session).record_interaction_event(
+        InteractionEventWrite(
+            event_type=AnalyticsEventType.MEME_DOWNLOAD,
+            user_id=viewer.id,
+            surface="web_home",
+            refs=InteractionEventRefs(meme_id=source.id),
         )
     )
-    service = MemeSearchService(
+    await _refresh_trend_views(migrated_db_session)
+    settings = Settings.model_validate(
+        {
+            "pipeline_voyage_output_dimensions": 2,
+            "recommendation_enabled": True,
+            "recommendation_shadow_mode": False,
+            "recommendation_canary_percent": 100,
+        }
+    )
+    recommendation_service, service, qdrant_client, _redis = _build_recommendation_service(
         migrated_db_session,
-        semantic_client=semantic_client,
-        settings=Settings.model_validate(
-            {"pipeline_voyage_output_dimensions": 2, "recommendation_qdrant_candidate_limit": 5}
+        settings=settings,
+        hits=(
+            QdrantRecommendationMatch(
+                meme_file_id=_primary_file_id(private_candidate),
+                meme_id=private_candidate.id,
+                candidate_score=0.99,
+            ),
+            QdrantRecommendationMatch(
+                meme_file_id=_primary_file_id(public_candidate),
+                meme_id=public_candidate.id,
+                candidate_score=0.9,
+            ),
         ),
     )
-    _install_meme_route_overrides(app, migrated_db_session, current_user=_user_read(viewer), service=service)
+    _install_meme_route_overrides(
+        app,
+        migrated_db_session,
+        current_user=_user_read(viewer),
+        service=service,
+        recommendation_service=recommendation_service,
+    )
 
     try:
         response = await client.get("/api/v1/memes/home-feed", params={"limit": 10})
@@ -807,22 +1060,31 @@ async def test_home_feed_route_returns_public_personalized_recommendations(
     _assert_public_page_attribution(
         payload,
         source_algorithm="personalized_recommendations",
-        surface="public_api_home_feed",
+        surface="web_home",
     )
     attribution = payload["items"][0]["attribution"]
-    assert attribution["reason"] == "qdrant_preference_vector"
-    assert attribution["filters"]["scope"] == "public"
-    assert attribution["collection_scope"] == "public"
+    assert attribution["reason"] == "multi_source_personalized"
+    assert attribution["algorithm_version"] == "personalized_v2"
+    assert attribution["attribution_token"]
+    assert {source["source"] for source in attribution["candidate_sources"]} >= {
+        "short_term",
+        "long_term_global",
+    }
     assert attribution["query"] is None
+    assert payload["feed_session_id"]
+    assert payload["expires_at"]
     assert "score" not in payload["items"][0]
     assert "s3_original_key" not in payload["items"][0]["meme"]["primary_file"]
-    assert semantic_client.calls == [
-        {
-            "query_vector": (1.0, 0.0),
-            "limit": 5,
-            "prefilter": _expected_prefilter(scope=SearchIndexPrefilterScope.PUBLIC, viewer_user_id=viewer.id),
-        }
-    ]
+    assert len(qdrant_client.calls) == 1
+    qdrant_call = qdrant_client.calls[0]
+    assert qdrant_call["prefilter"] == _expected_prefilter(
+        scope=SearchIndexPrefilterScope.PUBLIC,
+        viewer_user_id=viewer.id,
+    )
+    assert _primary_file_id(source) in cast(
+        "tuple[uuid.UUID, ...]",
+        qdrant_call["excluded_meme_file_ids"],
+    )
 
 
 async def test_home_feed_route_cold_start_falls_back_to_public_trending(
@@ -841,8 +1103,17 @@ async def test_home_feed_route_cold_start_falls_back_to_public_trending(
         s3_original_key="pipeline/originals/private/home-feed-fallback-hidden.jpg",
     )
     await migrated_db_session.commit()
-    service = MemeSearchService(migrated_db_session)
-    _install_meme_route_overrides(app, migrated_db_session, current_user=_user_read(viewer), service=service)
+    await _refresh_trend_views(migrated_db_session)
+    recommendation_service, service, qdrant_client, _redis = _build_recommendation_service(
+        migrated_db_session
+    )
+    _install_meme_route_overrides(
+        app,
+        migrated_db_session,
+        current_user=_user_read(viewer),
+        service=service,
+        recommendation_service=recommendation_service,
+    )
 
     try:
         response = await client.get("/api/v1/memes/home-feed", params={"limit": 10})
@@ -854,13 +1125,75 @@ async def test_home_feed_route_cold_start_falls_back_to_public_trending(
     assert "home-feed-fallback-hidden.jpg" not in response.text
     payload = response.json()
     assert [item["meme"]["id"] for item in payload["items"]] == [str(public_meme.id)]
-    _assert_public_page_attribution(payload, source_algorithm="fallback_trending", surface="public_api_home_feed")
+    _assert_public_page_attribution(
+        payload,
+        source_algorithm="personalized_recommendations",
+        surface="web_home",
+    )
     attribution = payload["items"][0]["attribution"]
-    assert attribution["reason"] == "cold_start_no_positive_signals"
-    assert attribution["filters"]["scope"] == "public"
-    assert attribution["collection_scope"] == "public"
+    assert attribution["reason"] == "multi_source_personalized"
+    assert attribution["candidate_sources"][0]["source"] == "trending"
+    assert attribution["attribution_token"]
+    assert qdrant_client.calls == []
     assert "score" not in payload["items"][0]
     assert "s3_original_key" not in payload["items"][0]["meme"]["primary_file"]
+
+
+async def test_home_feed_cursor_continues_frozen_pool_and_missing_pool_returns_410(
+    app: FastAPI,
+    client: AsyncClient,
+    migrated_db_session: AsyncSession,
+) -> None:
+    viewer = build_full_user()
+    migrated_db_session.add(viewer)
+    await migrated_db_session.flush()
+    memes = [
+        await _create_meme(migrated_db_session, popularity_score=score)
+        for score in (30.0, 20.0, 10.0)
+    ]
+    await migrated_db_session.commit()
+    await _refresh_trend_views(migrated_db_session)
+    recommendation_service, service, _qdrant_client, redis = _build_recommendation_service(
+        migrated_db_session
+    )
+    _install_meme_route_overrides(
+        app,
+        migrated_db_session,
+        current_user=_user_read(viewer),
+        service=service,
+        recommendation_service=recommendation_service,
+    )
+
+    try:
+        first_response = await client.get("/api/v1/memes/home-feed", params={"limit": 1})
+        first_payload = first_response.json()
+        second_response = await client.get(
+            "/api/v1/memes/home-feed",
+            params={"limit": 1, "cursor": first_payload["next_cursor"]},
+        )
+        redis.values.clear()
+        expired_response = await client.get(
+            "/api/v1/memes/home-feed",
+            params={"limit": 1, "cursor": first_payload["next_cursor"]},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    second_payload = second_response.json()
+    assert first_payload["has_more"] is True
+    assert first_payload["next_cursor"]
+    assert first_payload["offset"] == 0
+    assert second_payload["offset"] == 1
+    assert second_payload["request_id"] == first_payload["request_id"]
+    assert second_payload["feed_session_id"] == first_payload["feed_session_id"]
+    assert second_payload["items"][0]["meme"]["id"] != first_payload["items"][0]["meme"]["id"]
+    assert {item["meme"]["id"] for item in (*first_payload["items"], *second_payload["items"])} <= {
+        str(meme.id) for meme in memes
+    }
+    assert expired_response.status_code == 410
+    assert expired_response.json() == {"detail": "feed_cursor_expired"}
 
 
 async def test_home_feed_route_gates_include_nsfw_by_user_preference(
@@ -875,13 +1208,17 @@ async def test_home_feed_route_gates_include_nsfw_by_user_preference(
     safe_meme = await _create_meme(migrated_db_session, popularity_score=10.0)
     nsfw_meme = await _create_meme(migrated_db_session, is_nsfw=True, popularity_score=100.0)
     await migrated_db_session.commit()
-    service = MemeSearchService(migrated_db_session)
+    await _refresh_trend_views(migrated_db_session)
+    recommendation_service, service, _qdrant_client, _redis = _build_recommendation_service(
+        migrated_db_session
+    )
 
     _install_meme_route_overrides(
         app,
         migrated_db_session,
         current_user=_user_read(nsfw_disabled_viewer),
         service=service,
+        recommendation_service=recommendation_service,
     )
     try:
         disabled_response = await client.get(
@@ -896,6 +1233,7 @@ async def test_home_feed_route_gates_include_nsfw_by_user_preference(
         migrated_db_session,
         current_user=_user_read(nsfw_enabled_viewer),
         service=service,
+        recommendation_service=recommendation_service,
     )
     try:
         enabled_response = await client.get(
@@ -908,13 +1246,14 @@ async def test_home_feed_route_gates_include_nsfw_by_user_preference(
     assert disabled_response.status_code == 200
     disabled_payload = disabled_response.json()
     assert [item["meme"]["id"] for item in disabled_payload["items"]] == [str(safe_meme.id)]
-    assert disabled_payload["items"][0]["attribution"]["filters"]["include_nsfw"] is False
+    assert disabled_payload["items"][0]["attribution"]["surface"] == "web_home"
+    assert disabled_payload["items"][0]["attribution"]["attribution_token"]
     assert str(nsfw_meme.id) not in disabled_response.text
 
     assert enabled_response.status_code == 200
     enabled_payload = enabled_response.json()
     assert [item["meme"]["id"] for item in enabled_payload["items"]] == [str(nsfw_meme.id), str(safe_meme.id)]
-    assert enabled_payload["items"][0]["attribution"]["filters"]["include_nsfw"] is True
+    assert all(item["attribution"]["surface"] == "web_home" for item in enabled_payload["items"])
 
 
 async def test_home_feed_no_cookie_bootstraps_and_reuses_guest_session(
@@ -924,12 +1263,19 @@ async def test_home_feed_no_cookie_bootstraps_and_reuses_guest_session(
 ) -> None:
     public_meme = await _create_meme(migrated_db_session, popularity_score=10.0)
     await migrated_db_session.commit()
-    service = MemeSearchService(migrated_db_session)
+    await _refresh_trend_views(migrated_db_session)
+    recommendation_service, service, _qdrant_client, _redis = _build_recommendation_service(
+        migrated_db_session
+    )
 
     def override_meme_search_service() -> MemeSearchService:
         return service
 
+    def override_recommendation_service() -> RecommendationService:
+        return recommendation_service
+
     auth_app.dependency_overrides[get_meme_search_service] = override_meme_search_service
+    auth_app.dependency_overrides[get_recommendation_service] = override_recommendation_service
     try:
         first_response = await auth_client.get("/api/v1/memes/home-feed", params={"limit": 1})
         second_response = await auth_client.get("/api/v1/memes/home-feed", params={"limit": 1})
@@ -946,10 +1292,11 @@ async def test_home_feed_no_cookie_bootstraps_and_reuses_guest_session(
     assert [item["meme"]["id"] for item in first_payload["items"]] == [str(public_meme.id)]
     _assert_public_page_attribution(
         first_payload,
-        source_algorithm="fallback_trending",
-        surface="public_api_home_feed",
+        source_algorithm="personalized_recommendations",
+        surface="web_home",
     )
-    assert first_payload["items"][0]["attribution"]["reason"] == "cold_start_no_positive_signals"
+    assert first_payload["items"][0]["attribution"]["reason"] == "multi_source_personalized"
+    assert first_payload["items"][0]["attribution"]["attribution_token"]
 
     users = (await migrated_db_session.execute(select(User))).scalars().all()
     assert len(users) == 1
@@ -996,7 +1343,15 @@ async def test_public_openapi_registers_catalog_routes_without_internal_surface(
     assert "collection_ids" in search_parameters
     assert "scope" in browse_parameters
     assert "collection_ids" in browse_parameters
-    assert set(home_feed_parameters) >= {"language", "media_type", "include_nsfw", "tags", "limit", "offset"}
+    assert set(home_feed_parameters) >= {
+        "language",
+        "media_type",
+        "include_nsfw",
+        "tags",
+        "limit",
+        "cursor",
+        "offset",
+    }
     assert "scope" not in home_feed_parameters
     assert "collection_ids" not in home_feed_parameters
     assert "query_vector" not in search_parameters
@@ -1032,6 +1387,14 @@ async def test_public_openapi_registers_catalog_routes_without_internal_surface(
     assert set(similar_parameters) >= {"meme_id", "include_nsfw", "limit", "offset"}
     assert set(components["PublicMemeSearchResultRead"]["properties"]) == {"meme", "attribution"}
     assert "request_id" in components["PublicMemeSearchPageRead"]["properties"]
+    assert set(components["RecommendationFeedPageRead"]["properties"]) >= {
+        "items",
+        "request_id",
+        "feed_session_id",
+        "next_cursor",
+        "expires_at",
+        "has_more",
+    }
     assert "MemeResultAttributionRead" in components
     assert set(components["MemeResultAttributionRead"]["properties"]) >= {
         "request_id",
@@ -1068,6 +1431,183 @@ async def test_public_openapi_registers_catalog_routes_without_internal_surface(
     assert "s3_web_video_key" not in components["PublicMemeFileRead"]["properties"]
     assert "author_user_id" not in components["PublicMemeDetailRead"]["properties"]
     assert "is_public" not in components["PublicMemeDetailRead"]["properties"]
+
+
+async def test_similar_taste_term_requires_explicit_personalized_v2_rollout(
+    migrated_db_session: AsyncSession,
+) -> None:
+    source = await _create_meme(migrated_db_session)
+    stronger_similarity = await _create_meme(migrated_db_session)
+    taste_preferred = await _create_meme(migrated_db_session)
+    await _add_image_embedding(migrated_db_session, source, (1.0, 0.0))
+    viewer_id = uuid.uuid7()
+    similarity_hits = (
+        QdrantSimilarityMatch(
+            meme_file_id=_primary_file_id(stronger_similarity),
+            meme_id=stronger_similarity.id,
+            similarity_score=0.9,
+        ),
+        QdrantSimilarityMatch(
+            meme_file_id=_primary_file_id(taste_preferred),
+            meme_id=taste_preferred.id,
+            similarity_score=0.85,
+        ),
+    )
+    taste = FakeTastePersonalization(
+        {
+            stronger_similarity.id: ItemTasteScore(
+                taste=0.0,
+                quality=0.5,
+                popularity=0.5,
+                freshness=0.5,
+                profile_version="taste-v2",
+            ),
+            taste_preferred.id: ItemTasteScore(
+                taste=1.0,
+                quality=0.5,
+                popularity=0.5,
+                freshness=0.5,
+                profile_version="taste-v2",
+            ),
+        }
+    )
+    shadow_service = MemeSearchService(
+        migrated_db_session,
+        similarity_client=FakeSimilarityClient(similarity_hits),
+        taste_personalization=taste,
+        settings=Settings(
+            pipeline_voyage_output_dimensions=2,
+            recommendation_enabled=True,
+            recommendation_shadow_mode=True,
+            recommendation_canary_percent=100,
+        ),
+    )
+    enabled_service = MemeSearchService(
+        migrated_db_session,
+        similarity_client=FakeSimilarityClient(similarity_hits),
+        taste_personalization=taste,
+        settings=Settings(
+            pipeline_voyage_output_dimensions=2,
+            recommendation_enabled=True,
+            recommendation_shadow_mode=False,
+            recommendation_canary_percent=100,
+        ),
+    )
+
+    disabled_page = await shadow_service.get_public_similar_memes(
+        source.id,
+        viewer_user_id=viewer_id,
+        limit=2,
+    )
+    enabled_page = await enabled_service.get_public_similar_memes(
+        source.id,
+        viewer_user_id=viewer_id,
+        limit=2,
+    )
+
+    assert [item.meme.id for item in disabled_page.items] == [
+        stronger_similarity.id,
+        taste_preferred.id,
+    ]
+    assert all(item.attribution.score_components["taste"] == 0.0 for item in disabled_page.items)
+    assert all(item.attribution.profile_version is None for item in disabled_page.items)
+    assert [item.meme.id for item in enabled_page.items] == [
+        taste_preferred.id,
+        stronger_similarity.id,
+    ]
+    assert enabled_page.items[0].attribution.score_components["taste"] == pytest.approx(1.0)
+    assert enabled_page.items[0].attribution.profile_version == "taste-v2"
+
+
+async def test_similar_reranks_complete_pool_and_signs_typed_candidate_sources(
+    migrated_db_session: AsyncSession,
+) -> None:
+    template = MemeTemplate(slug="full-pool-similar", name="Full Pool Similar")
+    migrated_db_session.add(template)
+    await migrated_db_session.flush()
+    source = await _create_meme(migrated_db_session, tags=["frog"])
+    source.template_id = template.id
+    visual_match = await _create_meme(migrated_db_session, tags=["visual"])
+    tag_match = await _create_meme(migrated_db_session, tags=["frog"])
+    template_match = await _create_meme(migrated_db_session, tags=["reaction"])
+    template_match.template_id = template.id
+    popular_match = await _create_meme(migrated_db_session, tags=["other"])
+    await _add_image_embedding(migrated_db_session, source, (1.0, 0.0))
+    await _refresh_trend_views(migrated_db_session)
+    viewer_id = uuid.uuid7()
+    taste = FakeTastePersonalization(
+        {
+            visual_match.id: ItemTasteScore(),
+            tag_match.id: ItemTasteScore(taste=1.0, profile_version="taste-v2"),
+            template_match.id: ItemTasteScore(),
+            popular_match.id: ItemTasteScore(),
+        }
+    )
+    settings = Settings(
+        pipeline_voyage_output_dimensions=2,
+        recommendation_enabled=True,
+        recommendation_shadow_mode=False,
+        recommendation_canary_percent=100,
+    )
+    service = MemeSearchService(
+        migrated_db_session,
+        similarity_client=FakeSimilarityClient(
+            (
+                QdrantSimilarityMatch(
+                    meme_file_id=_primary_file_id(visual_match),
+                    meme_id=visual_match.id,
+                    similarity_score=0.05,
+                ),
+            )
+        ),
+        taste_personalization=taste,
+        settings=settings,
+    )
+
+    page = await service.get_public_similar_memes(
+        source.id,
+        viewer_user_id=viewer_id,
+        limit=4,
+    )
+
+    assert [item.meme.id for item in page.items] == [
+        tag_match.id,
+        visual_match.id,
+        template_match.id,
+        popular_match.id,
+    ]
+    assert len(taste.score_calls) == 1
+    assert taste.score_calls[0] == (
+        viewer_id,
+        (visual_match.id, tag_match.id, template_match.id, popular_match.id),
+    )
+    assert [item.attribution.candidate_sources[0].source for item in page.items] == [
+        RecommendationCandidateSource.TAG_OVERLAP,
+        RecommendationCandidateSource.VISUAL_SIMILARITY,
+        RecommendationCandidateSource.SAME_TEMPLATE,
+        RecommendationCandidateSource.PUBLIC_POPULAR,
+    ]
+    assert page.items[0].attribution.score_components == {
+        "tag_overlap": 1.0,
+        "similarity": 0.0,
+        "taste": 1.0,
+        "quality": 0.5,
+        "popularity": 0.5,
+        "freshness": 0.5,
+        "total": pytest.approx(0.175),
+    }
+    tag_source = page.items[0].attribution.candidate_sources[0]
+    assert tag_source.rank == 1
+    assert tag_source.score == 1.0
+    assert tag_source.contribution == pytest.approx(0.175)
+    token = page.items[0].attribution.attribution_token
+    assert token is not None
+    claims = AttributionTokenService.from_settings(settings).verify(
+        token,
+        expected_meme_id=tag_match.id,
+        viewer_user_id=viewer_id,
+    )
+    assert claims.candidate_sources == page.items[0].attribution.candidate_sources
 
 
 async def test_similar_route_uses_qdrant_embedding_and_filters_private_and_self_matches(
@@ -1128,12 +1668,19 @@ async def test_similar_route_uses_qdrant_embedding_and_filters_private_and_self_
     assert response.status_code == 200
     payload = response.json()
     assert [item["meme"]["id"] for item in payload["items"]] == [str(first_match.id), str(second_match.id)]
-    _assert_public_page_attribution(payload, source_algorithm="qdrant_similarity", surface="public_api_meme_similar")
+    _assert_public_page_attribution(payload, source_algorithm="qdrant_similarity", surface="web_related")
     first_attribution = payload["items"][0]["attribution"]
     assert first_attribution["reason"] == "qdrant_similarity"
     assert first_attribution["source_meme_id"] == str(source.id)
-    assert first_attribution["score"] == pytest.approx(0.91)
-    assert first_attribution["score_components"] == {"similarity": 0.91, "total": 0.91}
+    assert first_attribution["score"] == pytest.approx(0.7575)
+    assert first_attribution["score_components"] == {
+        "similarity": 0.91,
+        "taste": 0.0,
+        "quality": 0.5,
+        "popularity": 0.5,
+        "freshness": 0.5,
+        "total": pytest.approx(0.7575),
+    }
     assert payload["total"] == second_page.total == 2
     assert [item.meme.id for item in second_page.items] == [second_match.id]
     assert second_page.items[0].attribution.rank == 2
@@ -2150,7 +2697,7 @@ async def test_search_route_scope_collections_returns_multiple_authorized_collec
     assert response.status_code == 200
     payload = response.json()
     assert [item["meme"]["id"] for item in payload["items"]] == [str(owned_private.id), str(shared_private.id)]
-    _assert_public_page_attribution(payload, source_algorithm="fallback_popular", surface="public_api_search")
+    _assert_public_page_attribution(payload, source_algorithm="fallback_popular", surface="web_search")
     assert payload["items"][0]["attribution"]["collection_scope"] == "collections"
     assert payload["items"][0]["attribution"]["collection_ids"] == [
         str(owned_collection.id),
@@ -2407,7 +2954,7 @@ async def test_search_route_private_and_all_scopes_mark_access_and_paginate_fall
         str(owned_private.id),
         str(shared_private.id),
     ]
-    _assert_public_page_attribution(private_payload, source_algorithm="fallback_popular", surface="public_api_search")
+    _assert_public_page_attribution(private_payload, source_algorithm="fallback_popular", surface="web_search")
     assert private_payload["items"][0]["attribution"]["filters"]["scope"] == "private"
     assert {item["meme"]["viewer_access"]["visibility"] for item in private_payload["items"]} == {
         "private",
@@ -4572,7 +5119,7 @@ async def test_provider_failures_fall_back_to_popular_without_raw_error_payload(
     assert "provider-secret" not in response.text
     payload = response.json()
     assert [item["meme"]["id"] for item in payload["items"]] == [str(popular_meme.id)]
-    _assert_public_page_attribution(payload, source_algorithm="fallback_popular", surface="public_api_search")
+    _assert_public_page_attribution(payload, source_algorithm="fallback_popular", surface="web_search")
     assert payload["items"][0]["attribution"]["reason"] == "provider_failure"
     assert payload["items"][0]["attribution"]["query"] == "frog"
     completion_extra = next(extra for message, extra in info_calls if message == "meme_search_completed")

@@ -16,10 +16,12 @@ from memexpert.models.collection import CollectionMeme, PinnedMeme
 from memexpert.models.content import Meme, MemeFile
 from memexpert.models.enums import AnalyticsEventType, ContentKind, ContentLanguage, ContentProcessingStatus
 from memexpert.models.user import AnalyticsEvent
+from memexpert.schemas.meme import MemeResultAttributionRead
 from memexpert.schemas.user import UserRead
 from memexpert.services import CollectionService, UserService
 from memexpert.services.analytics import AnalyticsService
 from memexpert.services.meme_search import MemeSearchService
+from memexpert.services.recommendations.attribution import AttributionTokenService
 from memexpert.services.report import MemeReportService
 from tests.conftest import create_full_user_via_upgrade
 
@@ -111,7 +113,22 @@ async def test_favorite_save_routes_auto_bootstrap_guest_session(
     second_meme = await _create_meme(migrated_db_session)
     await migrated_db_session.commit()
 
-    favorite_response = await auth_client.post(f"/api/v1/memes/{first_meme.id}/favorite")
+    anonymous_token = AttributionTokenService.from_settings().issue_for_result(
+        meme_id=first_meme.id,
+        viewer_user_id=None,
+        attribution=MemeResultAttributionRead(
+            request_id="req-anonymous-search",
+            impression_id="imp-anonymous-search",
+            surface="web_search",
+            source_algorithm="hybrid_search",
+            rank=1,
+            algorithm_version="hybrid_v1",
+        ),
+    )
+    favorite_response = await auth_client.post(
+        f"/api/v1/memes/{first_meme.id}/favorite",
+        json={"attribution_token": anonymous_token},
+    )
     repeated_favorite_response = await auth_client.post(f"/api/v1/memes/{first_meme.id}/favorite")
     save_response = await auth_client.post(f"/api/v1/memes/{second_meme.id}/save")
     favorites_response = await auth_client.get("/api/v1/memes/favorites")
@@ -125,14 +142,14 @@ async def test_favorite_save_routes_auto_bootstrap_guest_session(
     assert favorites_response.status_code == 200
     assert {item["meme_id"] for item in favorites_response.json()} == {str(first_meme.id), str(second_meme.id)}
     assert await migrated_db_session.scalar(select(func.count()).select_from(CollectionMeme)) == 2
-    assert (
-        await migrated_db_session.scalar(
-            select(func.count())
-            .select_from(AnalyticsEvent)
-            .where(AnalyticsEvent.event_type == AnalyticsEventType.MEME_LIKE)
-        )
-        == 1
+    favorite_event = await migrated_db_session.scalar(
+        select(AnalyticsEvent).where(AnalyticsEvent.event_type == AnalyticsEventType.MEME_LIKE)
     )
+    assert favorite_event is not None
+    assert favorite_event.payload["request_id"] == "req-anonymous-search"
+    assert favorite_event.payload["impression_id"] == "imp-anonymous-search"
+    assert favorite_event.payload["surface"] == "web_search"
+    assert cast("dict[str, object]", favorite_event.payload["properties"])["attribution_trusted"] is True
 
 
 async def test_library_route_auto_bootstraps_guest_and_returns_empty_profile(

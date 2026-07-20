@@ -5,7 +5,12 @@ This runbook covers the backend scheduler jobs that perform deferred, bounded wo
 - `source-engagement-capture` claims due Telegram source posts and enqueues metric refresh work.
 - `source-channel-audience-capture` claims due Telegram channels and enqueues
   forward-only subscriber-count observations.
-- `materialized-view-refresh` refreshes public trend materialized views derived from source engagement snapshots and analytics events.
+- `materialized-view-refresh` refreshes public trend materialized views and the
+  dependent public recommendation-feature view.
+- `recommendation-profile-rebuild` rebuilds a bounded batch of dirty long-term
+  user taste profiles in PostgreSQL.
+- `recommendation-analytics-rollup` idempotently recomputes a bounded UTC-day
+  window of dashboard aggregates from authoritative raw interactions.
 - `motd` refreshes the deterministic Meme of the Day cache row for the current UTC date.
 - `search-index-sync` updates Qdrant and Meilisearch from canonical PostgreSQL state.
 - `meilisearch-settings-reconcile` applies the combined published synonym map from PostgreSQL.
@@ -64,6 +69,26 @@ Source engagement and public trend jobs:
 | `SCHEDULER_MATERIALIZED_VIEW_REFRESH_ENABLED` | `true` | Enables the public trend MV refresh job. |
 | `SCHEDULER_MATERIALIZED_VIEW_REFRESH_INTERVAL_SECONDS` | `300` | Refresh cadence for the derived public trend read models. |
 
+Recommendation profile job:
+
+| variable | default | meaning |
+|---|---:|---|
+| `SCHEDULER_RECOMMENDATION_PROFILE_REBUILD_ENABLED` | `true` | Enables bounded rebuilds of dirty PostgreSQL recommendation profiles. |
+| `SCHEDULER_RECOMMENDATION_PROFILE_REBUILD_INTERVAL_SECONDS` | `300` | APScheduler interval. |
+| `SCHEDULER_RECOMMENDATION_PROFILE_REBUILD_BATCH_SIZE` | `50` | Maximum dirty users locked with `SKIP LOCKED` and attempted per run. |
+| `RECOMMENDATION_LONG_TERM_HALF_LIFE_DAYS` | `90` | Exponential half-life applied to historical high-intent signals; raw history has no cutoff. |
+| `RECOMMENDATION_LONG_TERM_SIGNAL_LIMIT` | `500` | Maximum weighted meme signals materialized for one user. |
+| `RECOMMENDATION_CLUSTER_ACTIVATION_SIGNALS` | `20` | Distinct strong-positive threshold for deterministic profile clustering. |
+| `RECOMMENDATION_CLUSTER_ITERATIONS` / `RECOMMENDATION_CLUSTER_MIN_ITEMS` | `5` / `3` | Spherical clustering iteration bound and minimum retained cluster size. |
+
+Recommendation analytics job:
+
+| variable | default | meaning |
+|---|---:|---|
+| `SCHEDULER_RECOMMENDATION_ANALYTICS_ROLLUP_ENABLED` | `true` | Enables the bounded, idempotent daily dashboard rollup. |
+| `SCHEDULER_RECOMMENDATION_ANALYTICS_ROLLUP_INTERVAL_SECONDS` | `3600` | Recompute cadence. |
+| `SCHEDULER_RECOMMENDATION_ANALYTICS_ROLLUP_LOOKBACK_DAYS` | `2` | UTC dates replaced atomically per run so late browser retries update today and yesterday. |
+
 Meme of the Day job and API refresh:
 
 | variable | default | meaning |
@@ -103,7 +128,8 @@ RabbitMQ outbox publisher job:
 
 ## Result Logs
 
-Search-index, source-engagement, source-channel-audience, and SEO jobs all emit
+Search-index, source-engagement, source-channel-audience, recommendation-profile,
+and SEO jobs all emit
 `event=scheduler_job_batch_result`, their `job_id`, and `duration_seconds`.
 Their work-count fields are job-specific rather than one shared schema.
 
@@ -128,12 +154,98 @@ payloads stay out of the scheduler result. The MOTD job emits the same
 outbox publisher emits the same event with `job_id=rabbitmq-outbox-publisher`,
 `recovered`, `claimed`, `published`, `failed`, and `duration_seconds` fields.
 
+The recommendation profile job emits
+`job_id=recommendation-profile-rebuild`, `claimed_users`, `rebuilt_users`, and
+`failed_users`. It sets `degraded_mode=true` when any user fails. A failed user
+remains dirty for a later bounded retry; one failure rolls back only that user's
+nested rebuild and does not discard successful users from the same batch.
+
+The recommendation analytics job emits
+`job_id=recommendation-analytics-rollup`, the inclusive `start_date` and
+`end_date`, and `aggregate_rows`. It never logs raw events, viewer IDs, queries,
+tokens, or vectors.
+
 The Meilisearch settings job emits `status`, `changed`, `desired_hash`,
 `actual_hash`, `provider_task_uid`, and `revision_count`. Hashes are safe
 content fingerprints; logs and admin reads never contain the synonym map or
 Meilisearch credentials.
 
 The generic wrapper still emits `scheduler_job_started`, `scheduler_job_succeeded`, and `scheduler_job_failed`. A non-zero `failed` count inside `scheduler_job_batch_result` does not make the scheduler action fail; failures are durable backlog state and are retried by later runs where appropriate.
+
+## Recommendation Profile Work Selection
+
+`user_recommendation_profile_status` is the durable work ledger. Interaction
+and durable-preference changes set `dirty_since`; account merge also dirties the
+target profile after transferring signals and invalidating both viewers' feed
+caches. Persisted profile rows whose embedding model or profile base version no
+longer matches current configuration are eligible even when `dirty_since` is
+clean; a bounded reconciliation also creates a missing ledger row if needed.
+Each scheduler run orders eligible users by `dirty_since`, locks at most
+`SCHEDULER_RECOMMENDATION_PROFILE_REBUILD_BATCH_SIZE` ledger rows with `FOR
+UPDATE SKIP LOCKED`, and rebuilds each user independently. Serving ignores a
+stale vector while this backlog drains.
+
+The rebuild reads current Favorite/Save/Pin state plus indefinitely retained
+high-intent events, applies the 90-day half-life, and stores at most 500 weighted
+meme signals. Slot zero is the global centroid. With at least 20 distinct strong
+positives, deterministic cosine farthest-first initialization and at most five
+spherical iterations may also store up to four clusters, dropping clusters
+under three items. Profile rows record model/profile versions, counts, weight,
+event watermark, vector bytes, and generated time in PostgreSQL; user vectors
+are never written to Qdrant.
+
+On success the user's prior signals/profile slots are replaced atomically,
+`dirty_since` is cleared, and `last_rebuilt_at`/`event_watermark` advance. On
+failure the nested transaction rolls back and `dirty_since` remains set. Watch
+the oldest dirty timestamp and repeated `failed_users`, not just whether the
+generic scheduler wrapper returned. Missing or invalid item embeddings may
+reduce a user's profile slots without deleting their raw events.
+
+Revision `0043` creates dirty status rows for recommendation state available at
+migration time after projecting existing events and current collection/pin
+rows. Assess that migration separately for the live event volume and normal
+deployment ordering; the subsequent scheduler profile rebuild is the bounded
+part and drains only 50 users at a time by default. Do not claim the backfill
+complete from schema/code presence, and do not run an unbounded live rebuild
+without explicit authorization.
+
+## Materialized View Refresh Order
+
+`materialized-view-refresh` runs on the existing five-minute cadence. It
+refreshes `public_meme_trends_mv`, tag/template summaries, tag/template point
+views, and finally `public_meme_recommendation_features_mv`, because the item
+feature view consumes trend ranks. Each view prefers `CONCURRENTLY`; when
+PostgreSQL rejects that mode the job logs
+`public_trend_mv_concurrent_refresh_fallback` with the view name and retries
+that view non-concurrently. A later dependency failure fails the job and leaves
+the last successfully materialized state in place for serving.
+
+Monitor feature-view row count against currently public memes with ready primary
+files, `refreshed_at` age, provenance/source-quality/technical/platform-response
+coverage flags, and exploration-index availability. Missing derived values are
+expected to be neutral `0.5` with false coverage, not zero. Home can continue
+through the older view during a failed refresh, but rising feature age and broad
+coverage loss should block a `personalized_v2` canary expansion.
+
+`recommendation-analytics-rollup` deletes and replaces only its configured
+inclusive UTC-date window in one transaction. Rows are grouped by surface,
+algorithm/profile version, and candidate source, with impression, strong-action,
+attributed-send, exploration, and impression-level fallback counts. Repeated
+contributions for the same typed candidate source on one keyed impression count
+once. The JSON metrics include strong/send rates,
+`repeat_within_cooldown_count` and rate using the active configured cooldowns,
+fallback rate, catalog/long-tail coverage, source/template concentration,
+exploration share/conversion, and unique-meme count. Long-tail coverage counts
+distinct exposed memes with feature-row popularity below `0.8` against the full
+feature-view catalog; monitor feature coverage alongside it.
+
+The schema's `cache_expiry_count` is reserved and this rollup writes it as zero:
+cursor expiry is request-path structured telemetry, not an `analytics_events`
+fact. Cold-start/provider/Redis breakdowns, candidate counts, filtered ratio,
+and latency samples likewise remain structured-log concerns. An empty table can
+still mean no eligible attributed events or a disabled/failing job, so
+dashboards must also monitor the job timestamp. Raw events remain the audit and
+offline-evaluation source; aggregates never replace them.
 
 ## Meme Of The Day Work Selection
 
@@ -303,8 +415,10 @@ Claimable work includes:
 - Snapshot rows with `status in ('pending', 'failed')`.
 - `processing` rows whose `last_attempt_at` is older than `SCHEDULER_SEARCH_INDEX_SYNC_PROCESSING_TIMEOUT_SECONDS`.
 - `synced` rows whose canonical search-index clock is newer than `last_success_at`.
+- Qdrant `synced` rows whose typed payload preview has a missing or stale
+  `is_primary_file` value relative to the current `Meme.primary_file_id`.
 
-The canonical clock includes `memes.updated_at`, `meme_files.updated_at`, SEO generated/edited timestamps, template updates, collection updates, collection membership rows, and collection-meme membership timestamps. Search payload `popularity_score` is derived at rebuild time from source engagement snapshots plus `analytics_events`; it is not a stored canonical meme column.
+The canonical clock includes `memes.updated_at`, `meme_files.updated_at`, SEO generated/edited timestamps, template updates, collection updates, collection membership rows, and collection-meme membership timestamps. Search payload `popularity_score` is derived at rebuild time from source engagement snapshots plus `analytics_events`; it is not a stored canonical meme column. Backlog counts and oldest-lag age also include the stale Qdrant primary-file payload contract above, even if its last successful sync is newer than the canonical clock, so the bounded scheduler can backfill old points without an unrelated row update.
 
 Each claimed row is set to `processing`, `last_attempt_at` is refreshed, and `attempt_count` is incremented before the scheduler calls Qdrant or Meilisearch. The claim transaction commits before the external write so overlapping scheduler runs skip the same target row. Successful writes set `status='synced'`, clear error fields, refresh `last_success_at`, and store a bounded typed preview compatible with the pipeline inspect decoder. Failed writes set `status='failed'`, `normalized_reason`, `last_error_text`, and `last_attempt_at` while preserving the last known good `last_success_at` and preview.
 
@@ -357,6 +471,42 @@ WHERE status = 'processing'
 ORDER BY last_attempt_at NULLS FIRST
 LIMIT 100;
 ```
+
+Inspect bounded recommendation-profile backlog and feature freshness:
+
+```sql
+SELECT
+  count(*) AS dirty_users,
+  min(dirty_since) AS oldest_dirty_since,
+  max(last_rebuilt_at) AS latest_rebuild
+FROM user_recommendation_profile_status
+WHERE dirty_since IS NOT NULL;
+
+SELECT
+  status.user_id,
+  status.dirty_since,
+  status.last_rebuilt_at,
+  status.event_watermark,
+  count(profile.id) AS profile_slots
+FROM user_recommendation_profile_status status
+LEFT JOIN user_recommendation_profiles profile ON profile.user_id = status.user_id
+WHERE status.dirty_since IS NOT NULL
+GROUP BY status.user_id, status.dirty_since, status.last_rebuilt_at, status.event_watermark
+ORDER BY status.dirty_since
+LIMIT 100;
+
+SELECT
+  count(*) AS feature_rows,
+  min(refreshed_at) AS oldest_refresh,
+  max(refreshed_at) AS newest_refresh,
+  count(*) FILTER (WHERE (coverage_flags ->> 'source_quality')::boolean) AS source_quality_covered,
+  count(*) FILTER (WHERE (coverage_flags ->> 'platform_response')::boolean) AS response_covered
+FROM public_meme_recommendation_features_mv;
+```
+
+These reads expose UUIDs and aggregate coverage only. Do not select vectors,
+raw analytics payloads, queries, attribution tokens, or credentials into
+operator logs/chat.
 
 Inspect synonym publications and their durable sync state:
 
@@ -435,6 +585,12 @@ Automatic replay:
 - Leave failed or pending synonym settings state durable; the next settings run retries it. After correcting a catalog or provider issue, an admin may use the audited Retry sync action without republishing.
 - Leave failed outbox rows in `failed`; the `rabbitmq-outbox-publisher` job retries them when `next_retry_at` is due.
 - Leave stale outbox `publishing` rows alone unless an operator has confirmed the lease timeout is too high; the scheduler recovers them after `SCHEDULER_RABBITMQ_OUTBOX_PUBLISHER_STALE_TIMEOUT_SECONDS`.
+- Leave failed recommendation users dirty; the next five-minute bounded run
+  retries them. Investigate repeated failures before manually changing status
+  or profile rows.
+- Leave a failed recommendation-feature MV refresh to the next scheduled run
+  after correcting the PostgreSQL/lock issue. Do not substitute direct writes
+  into a materialized view.
 
 Manual per-file/per-target replay remains the existing operator API path documented in `docs/ops/content-pipeline-search-sync.md`:
 
@@ -459,7 +615,11 @@ Full/manual resync:
 - For routine drift, let the scheduler advance in bounded chunks. Use the
   operator batch route only for a bounded failure cohort; use cookie-admin
   Replay & Repair for an audited, exact all-matching maintenance job.
-- For a full Qdrant alias rebuild, keep using the existing manual/full-resync procedure for rebuilding the Qdrant collection/alias. The scheduler job is an incremental catch-up mechanism; it does not perform alias swaps or whole-index rebuild orchestration.
+- The current scheduler is an incremental catch-up mechanism for the configured
+  Qdrant collection. It does not perform alias swaps or whole-index rebuild
+  orchestration. A stable read alias, named-vector collection, dual-write,
+  bounded backfill, verified atomic switch, and rollback retention are
+  evidence-gated Phase-3 work, not an existing routine full-resync path.
 
 ## Common Failure Modes
 
@@ -467,4 +627,12 @@ Full/manual resync:
 - `sync_qdrant_provider_blocked` / `sync_meili_provider_blocked`: provider unavailable or rejected the write. Check URLs, credentials, and index/collection existence.
 - `sync_qdrant_malformed_payload` / `sync_meili_malformed_payload`: payload or provider response shape is invalid. Inspect `last_error_text`; this usually needs a code/config fix rather than repeated replay.
 - `meilisearch-settings-reconcile` with `status='failed'`: inspect the bounded `last_error` and scheduler log. Fix cross-locale key conflicts in the draft and republish, or restore provider health and use Retry sync. Never clear provider synonyms manually as a recovery shortcut.
+- `recommendation-profile-rebuild` with repeated `failed_users`: inspect safe
+  exception context and affected dirty/status timestamps; verify migration head
+  and primary image embedding shape. Do not log profile vectors or clear dirty
+  flags merely to reduce backlog.
+- `materialized-view-refresh` failing at
+  `public_meme_recommendation_features_mv`: verify the trend view dependency,
+  unique indexes, database capacity/locks, and migration head. Keep serving the
+  prior materialization and retry in normal dependency order.
 - SEO `failed` result counts with no page written: inspect scheduler logs around the provider warning. In live mode, confirm `PIPELINE_SEO_API_KEY`, model, base URL, and object-storage access for image inputs.

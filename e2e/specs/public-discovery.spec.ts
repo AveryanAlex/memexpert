@@ -2,19 +2,33 @@ import type { Locator, Page } from '@playwright/test';
 import { expect, test } from '../fixtures/app';
 import { publicTrendsFixture, seededByCategory, type SeededPublicTrendsFixture } from '../helpers/seed';
 
-test('guest home feed API bootstraps cold-start fallback from seeded public memes', async ({ api, seed }) => {
+test('guest home feed freezes cursor pages and excludes a newly favored impression', async ({ api, seed }) => {
   await api.expectNoAccessCookieStored();
-  const seededHomeFeedParams = { limit: '10', tags: 'e2e-prd' };
+  const seededHomeFeedParams = { limit: '2', tags: 'e2e-prd' };
 
   const first = await api.homeFeed(seededHomeFeedParams);
   const accessToken = api.expectAccessCookieSet(first.response);
   await api.expectAccessCookieStored(accessToken);
-  api.expectHomeFeedFallback(first.payload, seed.seeded_memes);
+  api.expectPersonalizedHomeFeed(first.payload, seed.seeded_memes);
+  expect(first.payload.has_more).toBe(true);
+  expect(first.payload.next_cursor).toEqual(expect.any(String));
+  const firstItem = first.payload.items[0];
+  if (!firstItem || !first.payload.next_cursor) throw new Error('Expected a first item and continuation cursor.');
 
-  const second = await api.homeFeed(seededHomeFeedParams);
+  await api.recordHomeImpression(firstItem);
+  await api.favoriteHomeItem(firstItem);
+
+  const second = await api.homeFeed({ ...seededHomeFeedParams, cursor: first.payload.next_cursor });
   api.expectAccessCookieNotSet(second.response);
   await api.expectAccessCookieStored(accessToken);
-  api.expectHomeFeedFallback(second.payload, seed.seeded_memes);
+  api.expectPersonalizedHomeFeed(second.payload, seed.seeded_memes);
+  expect(second.payload.feed_session_id).toBe(first.payload.feed_session_id);
+  expect(second.payload.request_id).toBe(first.payload.request_id);
+  expect(second.payload.items.map((item) => item.meme.id)).not.toContain(firstItem.meme.id);
+
+  const refreshed = await api.homeFeed(seededHomeFeedParams);
+  api.expectPersonalizedHomeFeed(refreshed.payload, seed.seeded_memes);
+  expect(refreshed.payload.items.map((item) => item.meme.id)).not.toContain(firstItem.meme.id);
 });
 
 test('guest discovers a public meme with URL-backed filters and imgproxy media', async ({ app, seed }) => {

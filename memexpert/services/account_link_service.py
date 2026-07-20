@@ -8,6 +8,7 @@ import re
 import secrets
 import uuid
 from collections.abc import Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Self
@@ -49,6 +50,9 @@ from memexpert.services.provider_auth_service import (
     ProviderAuthService,
     TelegramIdentity,
 )
+from memexpert.services.recommendations.feed_sessions import FeedSessionStore
+from memexpert.services.recommendations.intent import RecommendationIntentStore
+from memexpert.services.recommendations.interaction_state import merge_user_recommendation_state
 from memexpert.services.user_service import UserService
 
 if TYPE_CHECKING:
@@ -132,6 +136,8 @@ class AccountLinkService:
         telegram_link_bot_username: str | None = None,
         telegram_link_code_ttl_seconds: int = 600,
         telegram_link_return_url: str | None = None,
+        recommendation_feed_sessions: FeedSessionStore | None = None,
+        recommendation_intent_store: RecommendationIntentStore | None = None,
     ) -> None:
         self._session: AsyncSession = session
         self._user_service: UserService = user_service or UserService(session)
@@ -145,6 +151,8 @@ class AccountLinkService:
             telegram_link_code_ttl_seconds,
         )
         self._telegram_link_return_url: str | None = normalize_optional_text(telegram_link_return_url)
+        self._recommendation_feed_sessions = recommendation_feed_sessions or FeedSessionStore()
+        self._recommendation_intent_store = recommendation_intent_store or RecommendationIntentStore()
 
     @classmethod
     def from_settings(
@@ -175,6 +183,8 @@ class AccountLinkService:
                 if resolved_settings.auth_telegram_link_return_url is not None
                 else None
             ),
+            recommendation_feed_sessions=FeedSessionStore(settings=resolved_settings),
+            recommendation_intent_store=RecommendationIntentStore(settings=resolved_settings),
         )
 
     async def get_linked_providers(self, *, user_id: object) -> LinkedProvidersProjection:
@@ -727,6 +737,11 @@ class AccountLinkService:
             source_user_id=guest_user.id,
             target_user_id=target_user.id,
         )
+        await merge_user_recommendation_state(
+            self._session,
+            source_user_id=guest_user.id,
+            target_user_id=target_user.id,
+        )
 
         details = {
             "mode": "merge_into_existing_full",
@@ -757,6 +772,10 @@ class AccountLinkService:
             await self._session.flush()
         await self._session.delete(guest_user)
         await self._session.commit()
+        await self._invalidate_merged_recommendation_runtime(
+            source_user_id=guest_user_id,
+            target_user_id=target_user_id,
+        )
 
         return self._build_result(
             canonical_user=target_user,
@@ -771,6 +790,24 @@ class AccountLinkService:
             views_transferred=views_transferred,
             details=details,
         )
+
+    async def _invalidate_merged_recommendation_runtime(
+        self,
+        *,
+        source_user_id: uuid.UUID,
+        target_user_id: uuid.UUID,
+    ) -> None:
+        """Drop stale source/target Redis state without weakening a committed merge."""
+
+        for user_id in (source_user_id, target_user_id):
+            # Redis is an optimization boundary. Both concrete stores are
+            # already best-effort, and these guards also protect injected
+            # adapters so a committed account merge is never reported as
+            # failed because cache invalidation degraded.
+            with suppress(Exception):
+                await self._recommendation_feed_sessions.invalidate_viewer(user_id)
+            with suppress(Exception):
+                await self._recommendation_intent_store.invalidate(user_id=user_id)
 
     async def _lock_telegram_link_code(self, code: str) -> TelegramLinkCode:
         code_hash = self._hash_telegram_link_code(code)

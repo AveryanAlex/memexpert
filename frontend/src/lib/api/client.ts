@@ -81,6 +81,8 @@ import type {
   CurrentSessionRead,
   MemeCollectionChoicesRead,
   MemeFavoriteMutationRead,
+  MemeInteractionBatchRecordedRead,
+  MemeInteractionBatchWrite,
   MemeLibraryRead,
   MemeSearchScope,
   PinnedMemeRead,
@@ -91,6 +93,9 @@ import type {
   PublicMemeOfTheDayRead,
   PublicMemeLandingRead,
   PublicMemePopularitySummaryRead,
+  RecommendationFeedPageRead,
+  RecommendationFeedReauthorizationItemWrite,
+  RecommendationFeedReauthorizationRead,
   PublicMemeSearchPageRead,
   PublicMemeSourcePageRead,
   PublicMemeSourceSort,
@@ -128,16 +133,26 @@ export interface AdminAnalyticsRangeRequest extends CatalogRequest {
   endDate?: string | null;
 }
 
-interface MemePageFilterParams {
+interface MemePageFilterBase {
   tags?: string[];
   includeNsfw?: boolean;
   mediaType?: ContentKind | null;
   language?: ContentLanguage | null;
   limit: number;
+}
+
+interface MemePageFilterParams extends MemePageFilterBase {
   offset: number;
 }
 
-interface HomeFeedRequest extends CatalogRequest, MemePageFilterParams {}
+interface HomeFeedRequest extends CatalogRequest, MemePageFilterBase {
+  offset?: number;
+  cursor?: string | null;
+}
+
+interface HomeFeedReauthorizationRequest extends CatalogRequest, Omit<MemePageFilterBase, 'limit'> {
+  items: RecommendationFeedReauthorizationItemWrite[];
+}
 
 interface PageRequest extends CatalogRequest, MemePageFilterParams {
   query: string;
@@ -188,6 +203,13 @@ interface MemeActionRequest {
   onResponse?: (response: Response) => void;
   memeId: string;
   body?: unknown;
+  keepalive?: boolean;
+}
+
+export interface MemeInteractionBatchRequest {
+  fetch: ApiFetch;
+  baseUrl?: string;
+  body: MemeInteractionBatchWrite;
   keepalive?: boolean;
 }
 
@@ -269,7 +291,8 @@ export class ApiError extends Error {
   constructor(
     readonly status: number,
     message: string,
-    readonly detail?: unknown
+    readonly detail?: unknown,
+    readonly code?: string
   ) {
     super(message);
     this.name = 'ApiError';
@@ -301,8 +324,33 @@ export async function fetchMemePage(request: PageRequest): Promise<PublicMemeSea
   return apiGet<PublicMemeSearchPageRead>('/api/v1/memes/browse', params, request);
 }
 
-export async function fetchHomeFeed(request: HomeFeedRequest): Promise<PublicMemeSearchPageRead> {
-  return apiGet<PublicMemeSearchPageRead>('/api/v1/memes/home-feed', memePageParams(request), request);
+export async function fetchHomeFeed(request: HomeFeedRequest): Promise<RecommendationFeedPageRead> {
+  const params = memePageParams(request);
+  const cursor = request.cursor?.trim();
+  if (cursor) {
+    params.delete('offset');
+    params.set('cursor', cursor);
+  }
+  return apiGet<RecommendationFeedPageRead>('/api/v1/memes/home-feed', params, request);
+}
+
+export async function reauthorizeHomeFeedItems(
+  request: HomeFeedReauthorizationRequest
+): Promise<RecommendationFeedReauthorizationRead> {
+  const params = memePageParams({ ...request, limit: 1 });
+  params.delete('limit');
+  params.delete('offset');
+  return apiJson<RecommendationFeedReauthorizationRead>(
+    '/api/v1/memes/home-feed/reauthorize',
+    params,
+    request,
+    {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ items: request.items })
+    }
+  );
 }
 
 export async function fetchMemeOfTheDay(request: CatalogRequest): Promise<PublicMemeOfTheDayRead> {
@@ -480,7 +528,9 @@ export async function saveMemeToCollection(
   );
 }
 
-export async function removeMemeFromCollection(request: CatalogRequest & { collectionId: string; memeId: string }): Promise<RemoveActionResponse> {
+export async function removeMemeFromCollection(
+  request: CatalogRequest & { collectionId: string; memeId: string; body?: unknown }
+): Promise<RemoveActionResponse> {
   return apiWrite<RemoveActionResponse>(
     `/api/v1/collections/${encodeURIComponent(request.collectionId)}/memes/${encodeURIComponent(request.memeId)}`,
     'DELETE',
@@ -552,11 +602,11 @@ export async function reorderPins(request: CatalogRequest & { body: PinReorderPa
 }
 
 export async function reportMeme(request: MemeReportRequest): Promise<MemeReportRead> {
-  const attribution = readActionAttribution(request.body);
+  const actionMetadata = readActionMetadata(request.body);
   return apiJsonWrite<MemeReportRead>(`/api/v1/memes/${encodeURIComponent(request.memeId)}/report`, 'POST', request, {
     reason: request.reason,
     note: request.note ?? null,
-    ...(attribution === undefined ? {} : { attribution })
+    ...actionMetadata
   });
 }
 
@@ -578,6 +628,27 @@ export async function recordMemeDetailClick(request: MemeActionRequest): Promise
 
 export async function recordMemeDownload(request: MemeActionRequest): Promise<MemeInteractionRecordedResponse> {
   return apiMutation<MemeInteractionRecordedResponse>(`/api/v1/memes/${encodeURIComponent(request.memeId)}/download`, 'POST', request);
+}
+
+export async function recordMemeInteractionBatch(
+  request: MemeInteractionBatchRequest
+): Promise<MemeInteractionBatchRecordedRead> {
+  const response = await request.fetch(buildApiInput('/api/v1/analytics/interactions/batch', request.baseUrl), {
+    method: 'POST',
+    credentials: 'include',
+    keepalive: request.keepalive,
+    headers: {
+      accept: 'application/json',
+      'content-type': 'application/json',
+      'x-requested-with': 'XMLHttpRequest'
+    },
+    body: JSON.stringify(request.body)
+  });
+  const payload = await readJson(response);
+  if (!response.ok) {
+    throw apiErrorFromResponse(response, payload, `Interaction batch returned ${response.status}`);
+  }
+  return payload as MemeInteractionBatchRecordedRead;
 }
 
 export async function fetchTagLanding(request: LandingRequest): Promise<PublicMemeLandingRead> {
@@ -1386,10 +1457,10 @@ function adminAnalyticsRangeParams(request: Pick<AdminAnalyticsRangeRequest, 'st
   return params;
 }
 
-function memePageParams(request: MemePageFilterParams): URLSearchParams {
+function memePageParams(request: MemePageFilterBase & { offset?: number }): URLSearchParams {
   const params = new URLSearchParams({
     limit: String(request.limit),
-    offset: String(request.offset)
+    offset: String(request.offset ?? 0)
   });
 
   for (const tag of request.tags ?? []) {
@@ -1443,7 +1514,7 @@ async function apiJson<T>(
   const payload = await readJson(response);
 
   if (!response.ok) {
-    throw new ApiError(response.status, readErrorDetail(payload) ?? `Catalog API returned ${response.status}`);
+    throw apiErrorFromResponse(response, payload, `Catalog API returned ${response.status}`);
   }
 
   return payload as T;
@@ -1456,7 +1527,7 @@ function isUnsafeMethod(method: string | undefined): boolean {
 
 async function apiMutation<T>(path: string, method: 'DELETE' | 'POST', request: MemeActionRequest): Promise<T> {
   const headers = new Headers({ accept: 'application/json', 'x-requested-with': 'XMLHttpRequest' });
-  const body = method === 'POST' ? request.body : undefined;
+  const body = request.body;
   if (body !== undefined) {
     headers.set('content-type', 'application/json');
   }
@@ -1475,7 +1546,7 @@ async function apiMutation<T>(path: string, method: 'DELETE' | 'POST', request: 
   const payload = await readJson(response);
 
   if (!response.ok) {
-    throw new ApiError(response.status, readErrorDetail(payload) ?? `Meme action returned ${response.status}`);
+    throw apiErrorFromResponse(response, payload, `Meme action returned ${response.status}`);
   }
 
   return payload as T;
@@ -1500,11 +1571,7 @@ async function apiWrite<T>(path: string, method: 'DELETE' | 'PATCH' | 'POST' | '
   const payload = await readJson(response);
 
   if (!response.ok) {
-    throw new ApiError(
-      response.status,
-      readErrorDetail(payload) ?? `API returned ${response.status}`,
-      isRecord(payload) && isRecord(payload.detail) ? payload.detail : undefined
-    );
+    throw apiErrorFromResponse(response, payload, `API returned ${response.status}`);
   }
 
   return payload as T;
@@ -1534,7 +1601,7 @@ async function apiBrowserWrite<T>(
   const payload = await readJson(response);
 
   if (!response.ok) {
-    throw new ApiError(response.status, readErrorDetail(payload) ?? `API write returned ${response.status}`);
+    throw apiErrorFromResponse(response, payload, `API write returned ${response.status}`);
   }
 
   return payload as T;
@@ -1565,7 +1632,7 @@ async function apiJsonWrite<T>(
   const payload = await readJson(response);
 
   if (!response.ok) {
-    throw new ApiError(response.status, readErrorDetail(payload) ?? `API write returned ${response.status}`);
+    throw apiErrorFromResponse(response, payload, `API write returned ${response.status}`);
   }
 
   return payload as T;
@@ -1575,11 +1642,27 @@ function buildApiInput(path: string, baseUrl: string | undefined): RequestInfo |
   return baseUrl ? new URL(path, baseUrl) : path;
 }
 
-function readActionAttribution(body: unknown): unknown | undefined {
-  if (!body || typeof body !== 'object' || !('attribution' in body)) {
-    return undefined;
-  }
-  return body.attribution;
+function readActionMetadata(body: unknown): Record<string, unknown> {
+  if (!isRecord(body)) return {};
+  const metadata: Record<string, unknown> = {};
+  if (typeof body.event_id === 'string') metadata.event_id = body.event_id;
+  if (typeof body.attribution_token === 'string') metadata.attribution_token = body.attribution_token;
+  if ('attribution' in body) metadata.attribution = body.attribution;
+  return metadata;
+}
+
+function apiErrorFromResponse(response: Response, payload: unknown, fallback: string): ApiError {
+  const detail = isRecord(payload) && isRecord(payload.detail) ? payload.detail : undefined;
+  const code = readErrorCode(payload);
+  return new ApiError(response.status, readErrorDetail(payload) ?? fallback, detail, code);
+}
+
+function readErrorCode(payload: unknown): string | undefined {
+  if (!isRecord(payload)) return undefined;
+  if (typeof payload.code === 'string') return payload.code;
+  return typeof payload.detail === 'string' && /^[a-z][a-z0-9_]{1,119}$/.test(payload.detail)
+    ? payload.detail
+    : undefined;
 }
 
 async function readJson(response: Response): Promise<unknown> {

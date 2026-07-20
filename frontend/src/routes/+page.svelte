@@ -10,6 +10,7 @@
 
   const authState = readAuthState(() => ({ session: data.session ?? null, sessionError: data.sessionError }));
   const session = $derived($authState.session);
+  const feedViewerId = $derived(session?.user.id ?? data.pageViewerId);
 
   const feedSource = $derived(toMemeFeedSource(data.feedSource));
   const isHomeFeed = $derived(feedSource === 'home' && !data.query.trim());
@@ -52,6 +53,8 @@
   emptyMessage={isHomeFeed ? 'Try Search or check back soon.' : 'Try a shorter phrase, a different synonym, or clear the search box to browse.'}
   bulk={{ enabled: false }}
   showAccessMarkers={Boolean(session)}
+  viewerId={feedViewerId}
+  initialPageViewerId={data.pageViewerId}
 >
   {#snippet summary()}
     {#if data.query}

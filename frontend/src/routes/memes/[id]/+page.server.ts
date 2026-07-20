@@ -24,6 +24,7 @@ const SIMILAR_LIMIT = DEFAULT_PAGE_SIZE;
 
 export const load: PageServerLoad = async ({ fetch, isDataRequest, parent, request, url }) => {
   const cookieHeader = request.headers.get('cookie') ?? undefined;
+  const upstreamFetch: ApiFetch = (input, init) => fetch(input, { ...init, signal: request.signal });
   const attribution = parseMemeAttributionSearchParams(url.searchParams);
   const insightsParams = parseMemeInsightsParams(url.searchParams);
   const { meme } = await parent();
@@ -47,10 +48,10 @@ export const load: PageServerLoad = async ({ fetch, isDataRequest, parent, reque
   const retainSimilarPage = canRetainSimilarPage({ isDataRequest, request, url });
   const similarRequest = retainSimilarPage
     ? Promise.resolve({ page: emptyMemePage(SIMILAR_LIMIT, 0), errorMessage: null })
-    : fetchInitialSimilarPage(fetch, cookieHeader, meme.id);
+    : fetchInitialSimilarPage(upstreamFetch, cookieHeader, meme.id);
   const [popularity, similar, sourceResult, analyticsResult] = await Promise.all([
     fetchMemePopularitySummary({
-      fetch,
+      fetch: upstreamFetch,
       baseUrl: apiBaseUrl(),
       memeId: meme.id,
       cookieHeader
@@ -58,7 +59,7 @@ export const load: PageServerLoad = async ({ fetch, isDataRequest, parent, reque
     similarRequest,
     settleInsight(
       fetchMemeSources({
-        fetch,
+        fetch: upstreamFetch,
         baseUrl: apiBaseUrl(),
         memeId: meme.id,
         cookieHeader,
@@ -71,7 +72,7 @@ export const load: PageServerLoad = async ({ fetch, isDataRequest, parent, reque
     ),
     settleInsight(
       fetchMemeAnalytics({
-        fetch,
+        fetch: upstreamFetch,
         baseUrl: apiBaseUrl(),
         memeId: meme.id,
         cookieHeader,

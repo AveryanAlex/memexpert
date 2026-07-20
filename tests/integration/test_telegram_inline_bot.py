@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
@@ -48,9 +48,14 @@ from memexpert.schemas.meme import (
     MemeSearchPageRead,
     MemeSearchResultRead,
     MemeSearchScoreRead,
+    PublicMemeCardRead,
+    PublicMemeFileRead,
+    PublicMemeSearchResultRead,
+    RecommendationFeedPageRead,
 )
 from memexpert.services import UserService
 from memexpert.services.meme_search import MemeSearchFilters, MemeSearchScope, MemeSearchService
+from memexpert.services.recommendations.telegram_sessions import TelegramInlineSessionStore
 from tests.conftest import create_full_user_via_upgrade
 
 if TYPE_CHECKING:
@@ -146,6 +151,61 @@ class FakeMemeSearchService:
             }
         )
         return self.page
+
+
+class FakeRecommendationService:
+    def __init__(self, pages: dict[str | None, RecommendationFeedPageRead]) -> None:
+        self.pages = pages
+        self.calls: list[dict[str, object]] = []
+
+    async def home_feed(
+        self,
+        *,
+        viewer_user_id: uuid.UUID,
+        filters: MemeSearchFilters,
+        limit: int,
+        cursor: str | None = None,
+        offset: int = 0,
+    ) -> RecommendationFeedPageRead:
+        self.calls.append(
+            {
+                "viewer_user_id": viewer_user_id,
+                "scope": filters.scope,
+                "include_nsfw": filters.include_nsfw,
+                "limit": limit,
+                "cursor": cursor,
+                "offset": offset,
+            }
+        )
+        return self.pages[cursor]
+
+
+class MemoryRedis:
+    def __init__(self) -> None:
+        self.values: dict[str, str] = {}
+
+    async def get(self, key: str) -> str | None:
+        return self.values.get(key)
+
+    async def set(self, key: str, value: str, *, ex: int) -> bool:
+        _ = ex
+        self.values[key] = value
+        return True
+
+    async def sadd(self, key: str, *values: str) -> int:
+        _ = (key, values)
+        return 0
+
+    async def smembers(self, key: str) -> object:
+        _ = key
+        return set()
+
+    async def expire(self, key: str, seconds: int) -> bool:
+        _ = (key, seconds)
+        return True
+
+    async def delete(self, *keys: str) -> int:
+        return sum(int(self.values.pop(key, None) is not None) for key in keys)
 
 
 class FakeInlineMediaUrlProvider:
@@ -330,6 +390,64 @@ def search_page_for(
         total=len(items) if total is None else total,
         has_more=has_more,
         request_id=request_id,
+    )
+
+
+def recommendation_page_for(
+    entries: list[tuple[Meme, MemeFile]],
+    *,
+    next_cursor: str | None = None,
+    has_more: bool = False,
+    total: int | None = None,
+) -> RecommendationFeedPageRead:
+    now = datetime.now(UTC)
+    request_id = "req_inline_home_test"
+    items = [
+        PublicMemeSearchResultRead(
+            meme=PublicMemeCardRead(
+                id=meme.id,
+                media_type=meme.media_type,
+                language=meme.language,
+                is_nsfw=meme.is_nsfw,
+                popularity_score=float(getattr(meme, _DERIVED_POPULARITY_ATTR, 0.0)),
+                like_count=meme.like_count,
+                tags=list(meme.tags),
+                primary_file=PublicMemeFileRead(
+                    id=file.id,
+                    mime_type=file.mime_type,
+                    width=file.width,
+                    height=file.height,
+                    file_size_bytes=file.file_size_bytes,
+                    blur_hash=file.blur_hash,
+                    quality_score=file.quality_score,
+                ),
+                caption=None,
+                created_at=meme.created_at or now,
+                updated_at=meme.updated_at or now,
+            ),
+            attribution=MemeResultAttributionRead(
+                request_id=request_id,
+                impression_id=f"imp_inline_home_{rank}",
+                surface="web_home",
+                source_algorithm="personalized_recommendations",
+                rank=rank,
+                algorithm_version="personalized_v2",
+                score=1.0,
+                reason="multi_source_personalized",
+            ),
+        )
+        for rank, (meme, file) in enumerate(entries, start=1)
+    ]
+    return RecommendationFeedPageRead(
+        items=items,
+        request_id=request_id,
+        feed_session_id="inline-home-feed-test",
+        next_cursor=next_cursor,
+        expires_at=now + timedelta(hours=2),
+        has_more=has_more,
+        limit=20,
+        offset=0,
+        total=len(items) if total is None else total,
     )
 
 
@@ -531,6 +649,8 @@ async def test_inline_plain_text_query_calls_shared_search_service_and_records_q
     assert served_event.payload["rank"] == 1
     assert served_properties["media_format"] == "photo"
     assert served_properties["is_personal"] is True
+    assert served_properties["attribution_trusted"] is True
+    assert served_properties["candidate_sources"] == []
     assert inline_usage_events == 0
 
 
@@ -1126,12 +1246,16 @@ async def test_inline_empty_query_for_linked_user_returns_pins_then_popular_and_
     await migrated_db_session.commit()
 
     fake_service = FakeMemeSearchService(MemeSearchPageRead(items=[], limit=20, offset=0, total=0, has_more=False))
+    fake_recommendation = FakeRecommendationService(
+        {None: recommendation_page_for([(popular_meme, popular_file)])}
+    )
     telegram_session = RecordingTelegramSession()
     bot = build_bot(build_bot_settings(postgres_async_url), session=telegram_session)
     dispatcher = build_dispatcher(
         settings=build_bot_settings(postgres_async_url),
         session_factory=postgres_session_factory,
         meme_search_service_factory=lambda session: fake_service,
+        recommendation_service_factory=lambda session: fake_recommendation,
     )
 
     try:
@@ -1149,10 +1273,90 @@ async def test_inline_empty_query_for_linked_user_returns_pins_then_popular_and_
     assert isinstance(second_result, InlineQueryResultCachedPhoto)
     assert first_result.photo_file_id == "cached-pinned-photo-id"
     assert second_result.photo_file_id == "cached-popular-photo-id"
+    assert fake_recommendation.calls[0]["scope"] is MemeSearchScope.PUBLIC
 
 
 @pytest.mark.asyncio
-async def test_inline_empty_query_for_linked_user_returns_recent_then_popular_when_no_pins(
+async def test_inline_empty_query_uses_compact_redis_cursor_after_full_pin_page(
+    migrated_db_session: AsyncSession,
+    postgres_async_url: str,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    user = User(telegram_id=TELEGRAM_ID)
+    migrated_db_session.add(user)
+    for position in range(1, 21):
+        meme, file = await create_meme_file(
+            migrated_db_session,
+            media_type=ContentKind.IMAGE,
+            mime_type="image/jpeg",
+        )
+        migrated_db_session.add(PinnedMeme(user=user, meme=meme, position=position))
+        await add_file_id_cache(
+            migrated_db_session,
+            file=file,
+            media_format=TelegramMediaFormat.PHOTO,
+            telegram_file_id=f"cached-pin-{position}",
+        )
+    home_meme, home_file = await create_meme_file(
+        migrated_db_session,
+        media_type=ContentKind.IMAGE,
+        mime_type="image/jpeg",
+    )
+    await add_file_id_cache(
+        migrated_db_session,
+        file=home_file,
+        media_format=TelegramMediaFormat.PHOTO,
+        telegram_file_id="cached-home-after-pins",
+    )
+    await migrated_db_session.commit()
+
+    fake_search = FakeMemeSearchService(
+        MemeSearchPageRead(items=[], limit=20, offset=0, total=0, has_more=False)
+    )
+    fake_recommendation = FakeRecommendationService(
+        {None: recommendation_page_for([(home_meme, home_file)])}
+    )
+    settings = build_bot_settings(postgres_async_url)
+    inline_sessions = TelegramInlineSessionStore(redis=MemoryRedis(), settings=settings)
+    telegram_session = RecordingTelegramSession()
+    bot = build_bot(settings, session=telegram_session)
+    dispatcher = build_dispatcher(
+        settings=settings,
+        session_factory=postgres_session_factory,
+        meme_search_service_factory=lambda session: fake_search,
+        recommendation_service_factory=lambda session: fake_recommendation,
+        inline_sessions=inline_sessions,
+    )
+
+    try:
+        await dispatch_inline_query(dispatcher=dispatcher, bot=bot, query="", update_id=110)
+        first_answer = last_inline_answer(telegram_session)
+        next_offset = first_answer.next_offset
+        assert next_offset is not None
+        await dispatch_inline_query(
+            dispatcher=dispatcher,
+            bot=bot,
+            query="",
+            offset=next_offset,
+            update_id=111,
+        )
+    finally:
+        await bot.session.close()
+
+    assert len(first_answer.results) == 20
+    assert 1 <= len(next_offset) <= 64
+    assert not next_offset.isdecimal()
+    second_answer = last_inline_answer(telegram_session)
+    assert len(second_answer.results) == 1
+    second_result = second_answer.results[0]
+    assert isinstance(second_result, InlineQueryResultCachedPhoto)
+    assert second_result.photo_file_id == "cached-home-after-pins"
+    assert second_answer.next_offset == ""
+    assert len(fake_recommendation.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_inline_empty_query_for_linked_user_uses_home_recommendation_order(
     migrated_db_session: AsyncSession,
     postgres_async_url: str,
     postgres_session_factory: async_sessionmaker[AsyncSession],
@@ -1192,12 +1396,16 @@ async def test_inline_empty_query_for_linked_user_returns_recent_then_popular_wh
     await migrated_db_session.commit()
 
     fake_service = FakeMemeSearchService(MemeSearchPageRead(items=[], limit=20, offset=0, total=0, has_more=False))
+    fake_recommendation = FakeRecommendationService(
+        {None: recommendation_page_for([(recent_meme, recent_file), (popular_meme, popular_file)])}
+    )
     telegram_session = RecordingTelegramSession()
     bot = build_bot(build_bot_settings(postgres_async_url), session=telegram_session)
     dispatcher = build_dispatcher(
         settings=build_bot_settings(postgres_async_url),
         session_factory=postgres_session_factory,
         meme_search_service_factory=lambda session: fake_service,
+        recommendation_service_factory=lambda session: fake_recommendation,
     )
 
     try:
@@ -1218,7 +1426,7 @@ async def test_inline_empty_query_for_linked_user_returns_recent_then_popular_wh
 
 
 @pytest.mark.asyncio
-async def test_inline_empty_query_recent_send_personalization_reads_strict_refs(
+async def test_inline_empty_query_uses_home_results_with_strict_attribution(
     migrated_db_session: AsyncSession,
     postgres_async_url: str,
     postgres_session_factory: async_sessionmaker[AsyncSession],
@@ -1261,28 +1469,64 @@ async def test_inline_empty_query_recent_send_personalization_reads_strict_refs(
     await migrated_db_session.commit()
 
     fake_service = FakeMemeSearchService(MemeSearchPageRead(items=[], limit=20, offset=0, total=0, has_more=False))
+    fake_recommendation = FakeRecommendationService(
+        {None: recommendation_page_for([(recent_meme, recent_file), (popular_meme, popular_file)])}
+    )
     telegram_session = RecordingTelegramSession()
     bot = build_bot(build_bot_settings(postgres_async_url), session=telegram_session)
     dispatcher = build_dispatcher(
         settings=build_bot_settings(postgres_async_url),
         session_factory=postgres_session_factory,
         meme_search_service_factory=lambda session: fake_service,
+        recommendation_service_factory=lambda session: fake_recommendation,
     )
 
     try:
         await dispatch_inline_query(dispatcher=dispatcher, bot=bot, query="")
+        answer = last_inline_answer(telegram_session)
+        first_result = answer.results[0]
+        await dispatch_chosen_inline_result(
+            dispatcher=dispatcher,
+            bot=bot,
+            result_id=first_result.id,
+        )
     finally:
         await bot.session.close()
 
-    answer = last_inline_answer(telegram_session)
     assert len(answer.results) == 2
-    first_result = answer.results[0]
     assert isinstance(first_result, InlineQueryResultCachedPhoto)
     assert first_result.photo_file_id == "cached-strict-recent-photo-id"
+    assert first_result.id.startswith(f"p:{recent_file.id.hex}:imp_")
+    async with postgres_session_factory() as session:
+        served_event = await session.scalar(
+            select(AnalyticsEvent).where(
+                AnalyticsEvent.event_type == AnalyticsEventType.INLINE_SERVED,
+                AnalyticsEvent.payload["refs"]["meme_id"].astext == str(recent_meme.id),
+            )
+        )
+        assert served_event is not None
+        send_event = await session.scalar(
+            select(AnalyticsEvent).where(
+                AnalyticsEvent.event_type == AnalyticsEventType.MEME_SEND,
+                AnalyticsEvent.payload["refs"]["meme_id"].astext == str(recent_meme.id),
+                AnalyticsEvent.payload["impression_id"].astext
+                == str(served_event.payload["impression_id"]),
+            )
+        )
+    assert send_event is not None
+    served_properties = _analytics_properties(served_event)
+    send_properties = _analytics_properties(send_event)
+    assert served_event.payload["surface"] == "telegram_inline_empty_query"
+    assert send_event.payload["surface"] == "telegram_inline_empty_query"
+    assert send_event.payload["impression_id"] == served_event.payload["impression_id"]
+    assert served_properties["attribution_trusted"] is True
+    assert served_properties["algorithm_version"] == "personalized_v2"
+    assert send_properties["attribution_trusted"] is True
+    assert send_properties["algorithm_version"] == "personalized_v2"
 
 
 @pytest.mark.asyncio
-async def test_inline_empty_query_for_linked_user_falls_back_to_popular_when_no_pins_or_recents(
+async def test_inline_empty_query_for_linked_user_uses_home_when_no_pins(
     migrated_db_session: AsyncSession,
     postgres_async_url: str,
     postgres_session_factory: async_sessionmaker[AsyncSession],
@@ -1304,12 +1548,16 @@ async def test_inline_empty_query_for_linked_user_falls_back_to_popular_when_no_
     await migrated_db_session.commit()
 
     fake_service = FakeMemeSearchService(MemeSearchPageRead(items=[], limit=20, offset=0, total=0, has_more=False))
+    fake_recommendation = FakeRecommendationService(
+        {None: recommendation_page_for([(popular_meme, popular_file)])}
+    )
     telegram_session = RecordingTelegramSession()
     bot = build_bot(build_bot_settings(postgres_async_url), session=telegram_session)
     dispatcher = build_dispatcher(
         settings=build_bot_settings(postgres_async_url),
         session_factory=postgres_session_factory,
         meme_search_service_factory=lambda session: fake_service,
+        recommendation_service_factory=lambda session: fake_recommendation,
     )
 
     try:
@@ -1329,7 +1577,7 @@ async def test_inline_empty_query_for_linked_user_falls_back_to_popular_when_no_
 
 
 @pytest.mark.asyncio
-async def test_inline_empty_query_skips_unsendable_pin_and_uses_later_popular_fallback(
+async def test_inline_empty_query_skips_unsendable_pin_and_fills_from_home(
     migrated_db_session: AsyncSession,
     postgres_async_url: str,
     postgres_session_factory: async_sessionmaker[AsyncSession],
@@ -1339,7 +1587,7 @@ async def test_inline_empty_query_skips_unsendable_pin_and_uses_later_popular_fa
     video_meme, _ = await create_meme_file(
         migrated_db_session,
         media_type=ContentKind.VIDEO,
-        mime_type="video/mp4",
+        mime_type="video/webm",
     )
     popular_meme, popular_file = await create_meme_file(
         migrated_db_session,
@@ -1357,12 +1605,16 @@ async def test_inline_empty_query_skips_unsendable_pin_and_uses_later_popular_fa
     await migrated_db_session.commit()
 
     fake_service = FakeMemeSearchService(MemeSearchPageRead(items=[], limit=20, offset=0, total=0, has_more=False))
+    fake_recommendation = FakeRecommendationService(
+        {None: recommendation_page_for([(popular_meme, popular_file)])}
+    )
     telegram_session = RecordingTelegramSession()
     bot = build_bot(build_bot_settings(postgres_async_url), session=telegram_session)
     dispatcher = build_dispatcher(
         settings=build_bot_settings(postgres_async_url),
         session_factory=postgres_session_factory,
         meme_search_service_factory=lambda session: fake_service,
+        recommendation_service_factory=lambda session: fake_recommendation,
     )
 
     try:
@@ -1410,12 +1662,16 @@ async def test_inline_empty_query_treats_ineligible_linked_users_as_guests(
     await migrated_db_session.commit()
 
     fake_service = FakeMemeSearchService(MemeSearchPageRead(items=[], limit=20, offset=0, total=0, has_more=False))
+    fake_recommendation = FakeRecommendationService(
+        {None: recommendation_page_for([(popular_meme, popular_file)])}
+    )
     telegram_session = RecordingTelegramSession()
     bot = build_bot(build_bot_settings(postgres_async_url), session=telegram_session)
     dispatcher = build_dispatcher(
         settings=build_bot_settings(postgres_async_url),
         session_factory=postgres_session_factory,
         meme_search_service_factory=lambda session: fake_service,
+        recommendation_service_factory=lambda session: fake_recommendation,
     )
 
     try:
@@ -1465,12 +1721,20 @@ async def test_inline_empty_query_for_new_user_returns_popular_public_memes_pers
     await migrated_db_session.commit()
 
     fake_service = FakeMemeSearchService(MemeSearchPageRead(items=[], limit=20, offset=0, total=0, has_more=False))
+    fake_recommendation = FakeRecommendationService(
+        {
+            None: recommendation_page_for(
+                [(more_popular_meme, more_popular_file), (less_popular_meme, less_popular_file)]
+            )
+        }
+    )
     telegram_session = RecordingTelegramSession()
     bot = build_bot(build_bot_settings(postgres_async_url), session=telegram_session)
     dispatcher = build_dispatcher(
         settings=build_bot_settings(postgres_async_url),
         session_factory=postgres_session_factory,
         meme_search_service_factory=lambda session: fake_service,
+        recommendation_service_factory=lambda session: fake_recommendation,
     )
 
     try:
@@ -1628,6 +1892,11 @@ async def test_chosen_inline_result_after_inline_auto_create_records_created_use
     assert created_user is not None
     assert event is not None
     assert event.user_id == created_user.id
+    assert event.payload["surface"] == "telegram_inline_search"
+    assert event.payload["request_id"] == "req_inline_test"
+    assert event.payload["impression_id"] == "imp_inline_1"
+    assert event.payload["source_algorithm"] == "hybrid_search"
+    assert _analytics_properties(event)["attribution_trusted"] is True
 
 
 @pytest.mark.asyncio
@@ -1648,6 +1917,28 @@ async def test_inline_library_callbacks_call_collection_service_paths(
         media_type=ContentKind.IMAGE,
         mime_type="image/jpeg",
     )
+    migrated_db_session.add(
+        AnalyticsEvent(
+            user_id=linked_user.id,
+            event_type=AnalyticsEventType.INLINE_SERVED,
+            payload={
+                "surface": "telegram_inline_empty_query",
+                "request_id": "req_callback_attribution",
+                "impression_id": "imp_callback_attribution",
+                "source_algorithm": "personalized_recommendations",
+                "refs": {
+                    "meme_id": str(favorite_meme.id),
+                    "meme_file_id": str(favorite_file.id),
+                },
+                "properties": {
+                    "attribution_trusted": True,
+                    "algorithm_version": "personalized_v2",
+                    "profile_version": "taste_v2:callback",
+                    "candidate_sources": [],
+                },
+            },
+        )
+    )
     await migrated_db_session.commit()
 
     telegram_session = RecordingTelegramSession()
@@ -1664,7 +1955,7 @@ async def test_inline_library_callbacks_call_collection_service_paths(
         await dispatch_library_callback(
             dispatcher=dispatcher,
             bot=bot,
-            data=f"lib:fav:p:{favorite_file.id.hex}",
+            data=f"lib:fav:p:{favorite_file.id.hex}:imp_callback_attribution",
         )
         await dispatch_library_callback(
             dispatcher=dispatcher,
@@ -1702,9 +1993,13 @@ async def test_inline_library_callbacks_call_collection_service_paths(
     like_event = events_by_type[AnalyticsEventType.MEME_LIKE]
     save_event = events_by_type[AnalyticsEventType.MEME_SAVE]
     pin_event = events_by_type[AnalyticsEventType.MEME_PIN]
-    assert events_by_type[AnalyticsEventType.MEME_LIKE].payload["surface"] == "telegram_inline_library"
+    assert events_by_type[AnalyticsEventType.MEME_LIKE].payload["surface"] == "telegram_inline_empty_query"
+    assert like_event.payload["impression_id"] == "imp_callback_attribution"
     assert _analytics_refs(like_event)["meme_id"] == str(favorite_meme.id)
-    assert _analytics_properties(like_event)["action"] == "fav"
+    assert _analytics_properties(like_event)["action"] == "add"
+    assert _analytics_properties(like_event)["preference_kind"] == "favorite"
+    assert _analytics_properties(like_event)["attribution_trusted"] is True
+    assert _analytics_properties(like_event)["algorithm_version"] == "personalized_v2"
     assert _analytics_refs(save_event)["meme_id"] == str(save_meme.id)
     assert _analytics_refs(pin_event)["meme_id"] == str(favorite_meme.id)
 

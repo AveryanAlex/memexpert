@@ -8,6 +8,7 @@ type MemeLike = PublicMemeCardRead | PublicMemeDetailRead;
 export type MemeActionAttribution = Partial<
   Pick<
     MemeResultAttributionRead,
+    | 'attribution_token'
     | 'algorithm_version'
     | 'collection_ids'
     | 'collection_scope'
@@ -26,10 +27,13 @@ export type MemeActionAttribution = Partial<
 >;
 
 export interface MemeActionAttributionBody {
-  attribution: MemeActionAttribution;
+  event_id?: string;
+  attribution_token?: string;
+  attribution?: MemeActionAttribution;
 }
 
 const ATTRIBUTION_QUERY_KEYS = {
+  attribution_token: 'attribution_token',
   algorithm_version: 'attribution_algorithm_version',
   collection_id: 'attribution_collection_id',
   collection_scope: 'attribution_collection_scope',
@@ -61,6 +65,12 @@ export function memeAttributionSearchParams(attribution?: MemeActionAttribution 
   const params = new URLSearchParams();
   if (!attribution) return params;
 
+  const attributionToken = attribution.attribution_token?.trim();
+  if (attributionToken) {
+    params.set(ATTRIBUTION_QUERY_KEYS.attribution_token, attributionToken);
+    return params;
+  }
+
   setParam(params, ATTRIBUTION_QUERY_KEYS.request_id, attribution.request_id);
   setParam(params, ATTRIBUTION_QUERY_KEYS.impression_id, attribution.impression_id);
   setParam(params, ATTRIBUTION_QUERY_KEYS.surface, attribution.surface);
@@ -83,6 +93,9 @@ export function memeAttributionSearchParams(attribution?: MemeActionAttribution 
 export function parseMemeAttributionSearchParams(params: URLSearchParams): MemeActionAttribution | null {
   if (!Object.values(ATTRIBUTION_QUERY_KEYS).some((key) => params.has(key))) return null;
 
+  const attributionToken = readParam(params, ATTRIBUTION_QUERY_KEYS.attribution_token);
+  if (attributionToken) return { attribution_token: attributionToken };
+
   return {
     request_id: readParam(params, ATTRIBUTION_QUERY_KEYS.request_id),
     impression_id: readParam(params, ATTRIBUTION_QUERY_KEYS.impression_id),
@@ -101,8 +114,44 @@ export function parseMemeAttributionSearchParams(params: URLSearchParams): MemeA
   };
 }
 
-export function memeActionAttributionBody(attribution?: MemeActionAttribution | null): MemeActionAttributionBody | undefined {
-  return attribution ? { attribution } : undefined;
+export function memeActionAttributionBody(
+  attribution?: MemeActionAttribution | null,
+  eventId?: string | null
+): MemeActionAttributionBody | undefined {
+  const normalizedEventId = eventId?.trim();
+  const attributionToken = attribution?.attribution_token?.trim();
+  if (attributionToken) {
+    return {
+      ...(normalizedEventId ? { event_id: normalizedEventId } : {}),
+      attribution_token: attributionToken
+    };
+  }
+  if (attribution) {
+    return {
+      ...(normalizedEventId ? { event_id: normalizedEventId } : {}),
+      attribution: legacyActionAttribution(attribution)
+    };
+  }
+  return normalizedEventId ? { event_id: normalizedEventId } : undefined;
+}
+
+function legacyActionAttribution(attribution: MemeActionAttribution): MemeActionAttribution {
+  return {
+    algorithm_version: attribution.algorithm_version,
+    collection_ids: attribution.collection_ids,
+    collection_scope: attribution.collection_scope,
+    filters: attribution.filters,
+    impression_id: attribution.impression_id,
+    query: attribution.query,
+    rank: attribution.rank,
+    reason: attribution.reason,
+    request_id: attribution.request_id,
+    score: attribution.score,
+    score_components: attribution.score_components,
+    source_algorithm: attribution.source_algorithm,
+    source_meme_id: attribution.source_meme_id,
+    surface: attribution.surface
+  };
 }
 
 export function telegramShareUrl(url: string, text?: string | null): string {

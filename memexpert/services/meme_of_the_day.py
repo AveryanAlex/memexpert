@@ -18,6 +18,7 @@ from memexpert.models.content import Meme, MemeOfTheDaySelection
 from memexpert.schemas.meme import MemeResultAttributionRead, PublicMemeOfTheDayRead
 from memexpert.services.media_render_urls import MediaRenderUrlService
 from memexpert.services.meme_search import MemeSearchService
+from memexpert.services.recommendations.attribution import sign_result_attribution
 
 if TYPE_CHECKING:
     import uuid
@@ -274,15 +275,20 @@ class MemeOfTheDayService:
         )
         card = cards[0] if cards else None
         attribution = (
-            MemeResultAttributionRead(
-                surface=surface,
-                source_algorithm=MOTD_SOURCE_ALGORITHM,
-                rank=1,
-                collection_scope="public",
-                algorithm_version=selection.algorithm_version,
-                score=selection.score,
-                score_components=score_components,
-                reason=selection.reason,
+            sign_result_attribution(
+                MemeResultAttributionRead(
+                    surface=surface,
+                    source_algorithm=MOTD_SOURCE_ALGORITHM,
+                    rank=1,
+                    collection_scope="public",
+                    algorithm_version=selection.algorithm_version,
+                    score=selection.score,
+                    score_components=score_components,
+                    reason=selection.reason,
+                ),
+                meme_id=card.id,
+                viewer_user_id=viewer_user_id,
+                settings=self._settings,
             )
             if card is not None
             else None

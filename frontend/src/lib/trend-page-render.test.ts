@@ -53,6 +53,9 @@ describe('/trends page', () => {
 
 function attribution(): MemeResultAttributionRead {
   return {
+    attribution_token: null,
+    candidate_sources: [],
+    profile_version: null,
     request_id: 'trend-request',
     impression_id: 'trend-impression',
     surface: 'web_trends',

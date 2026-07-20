@@ -89,6 +89,13 @@ EXPECTED_PIPELINE_CONSUMER_ROLES: Final = {
     "pipeline.sync_qdrant": "sync",
     "pipeline.sync_meili": "sync",
 }
+DEGRADED_RECOMMENDATION_SPEC: Final = "specs/recommendation-degraded.spec.ts"
+DEGRADED_RECOMMENDATION_PHASE_ENV: Final = "E2E_RECOMMENDATION_DEGRADED_PHASE"
+DEGRADED_RECOMMENDATION_PHASES: Final = {
+    "qdrant-unavailable": "qdrant",
+    "redis-unavailable": "redis",
+}
+DEGRADED_DEPENDENCY_RESTORE_TIMEOUT_SECONDS: Final = 120
 
 
 class E2ERunCollisionError(RuntimeError):
@@ -205,6 +212,18 @@ def main() -> int:
             run_checked([*compose, "build", "e2e-runner"], env=env)
         run_checked([*compose, "run", "--rm", "--no-deps", "seed"], env=env)
         run_checked([*compose, "run", "--rm", "--no-deps", "e2e-runner"], env=env)
+        run_degraded_dependency_check(
+            compose,
+            env=env,
+            dependency="qdrant",
+            phase="qdrant-unavailable",
+        )
+        run_degraded_dependency_check(
+            compose,
+            env=env,
+            dependency="redis",
+            phase="redis-unavailable",
+        )
     except E2ERunCollisionError as exc:
         exit_code = 2
         failure = {"kind": "collision", "message": str(exc)}
@@ -367,6 +386,65 @@ def compose_up_command(
         command.extend(["--wait", "--wait-timeout", "420"])
     command.extend(services)
     return command
+
+
+def degraded_recommendation_command(compose: list[str], *, phase: str) -> list[str]:
+    """Build one isolated Playwright invocation for a degraded recommendation phase."""
+
+    if phase not in DEGRADED_RECOMMENDATION_PHASES:
+        raise ValueError(f"Unsupported degraded recommendation phase: {phase}")
+    return [
+        *compose,
+        "run",
+        "--rm",
+        "--no-deps",
+        "-e",
+        f"{DEGRADED_RECOMMENDATION_PHASE_ENV}={phase}",
+        "-e",
+        f"E2E_ARTIFACTS_DIR=/artifacts/degraded/{phase}",
+        "e2e-runner",
+        "pnpm",
+        "exec",
+        "playwright",
+        "test",
+        DEGRADED_RECOMMENDATION_SPEC,
+    ]
+
+
+def run_degraded_dependency_check(
+    compose: list[str],
+    *,
+    env: dict[str, str],
+    dependency: str,
+    phase: str,
+) -> None:
+    """Stop one dependency, run its proof, and restore it even when the proof fails."""
+
+    expected_dependency = DEGRADED_RECOMMENDATION_PHASES.get(phase)
+    if expected_dependency != dependency:
+        raise ValueError(
+            f"Degraded recommendation phase {phase!r} expects dependency "
+            f"{expected_dependency!r}, not {dependency!r}",
+        )
+    run_checked([*compose, "stop", "--timeout", "30", dependency], env=env)
+    try:
+        run_checked(degraded_recommendation_command(compose, phase=phase), env=env)
+    finally:
+        # `up --wait` both restarts the existing container and proves its health
+        # before another degraded phase or final artifact capture can proceed.
+        run_checked(
+            [
+                *compose,
+                "up",
+                "--detach",
+                "--no-deps",
+                "--wait",
+                "--wait-timeout",
+                str(DEGRADED_DEPENDENCY_RESTORE_TIMEOUT_SECONDS),
+                dependency,
+            ],
+            env=env,
+        )
 
 
 def assert_images_exist(images: list[str], *, env: dict[str, str]) -> None:

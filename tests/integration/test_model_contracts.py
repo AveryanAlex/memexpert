@@ -153,6 +153,7 @@ EXPECTED_TABLES = {
     "pipeline_stage_attempts",
     "pipeline_stage_journal",
     "rabbitmq_outbox_messages",
+    "recommendation_daily_aggregates",
     "recovery_job_items",
     "recovery_jobs",
     "recovery_query_snapshot_members",
@@ -170,6 +171,10 @@ EXPECTED_TABLES = {
     "telegram_link_codes",
     "telegram_session_login_attempts",
     "telegram_sessions",
+    "user_meme_recommendation_state",
+    "user_recommendation_profiles",
+    "user_recommendation_profile_signals",
+    "user_recommendation_profile_status",
     "users",
 }
 REPO_ROOT = Path(__file__).resolve().parents[2]

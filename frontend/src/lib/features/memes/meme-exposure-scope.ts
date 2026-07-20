@@ -1,3 +1,4 @@
+import { uuidV7 } from '$lib/analytics/uuid-v7';
 import { getContext, setContext } from 'svelte';
 import { writable, type Readable } from 'svelte/store';
 
@@ -34,6 +35,7 @@ export function createMemeExposureScope(initialPageKey = ''): MemeExposureScope 
   let clientVisitNonce = 'ssr';
   let pageSequence = 0;
   let recorded = new Set<string>();
+  let generatedExposureIds = new Map<string, string>();
   let visitEpoch = `${clientVisitNonce}:${pageSequence}`;
   let clientReady = false;
   const state = writable<MemeExposureScopeState>({ clientReady, pageKey, visitEpoch });
@@ -46,6 +48,7 @@ export function createMemeExposureScope(initialPageKey = ''): MemeExposureScope 
       pageSequence += 1;
       visitEpoch = `${clientVisitNonce}:${pageSequence}`;
       recorded = new Set<string>();
+      generatedExposureIds = new Map<string, string>();
       state.set({ clientReady, pageKey, visitEpoch });
     },
     beginClientVisit: (nonce) => {
@@ -54,11 +57,17 @@ export function createMemeExposureScope(initialPageKey = ''): MemeExposureScope 
       visitEpoch = `${clientVisitNonce}:${pageSequence}`;
       clientReady = true;
       recorded = new Set<string>();
+      generatedExposureIds = new Map<string, string>();
       state.set({ clientReady, pageKey, visitEpoch });
     },
     resolveExposureId: (providedId, placementKey) => {
       if (providedId?.trim()) return providedId;
-      return `web_${stableToken(`${pageKey}:${visitEpoch}`)}_${stableToken(placementKey)}`;
+      const placementScope = `${pageKey}:${visitEpoch}:${placementKey}`;
+      const existingExposureId = generatedExposureIds.get(placementScope);
+      if (existingExposureId) return existingExposureId;
+      const exposureId = uuidV7();
+      generatedExposureIds.set(placementScope, exposureId);
+      return exposureId;
     },
     hasRecorded: (exposureId) => recorded.has(exposureId),
     claim: (exposureId) => {
@@ -77,15 +86,4 @@ export function provideMemeExposureScope(initialPageKey: string): MemeExposureSc
 
 export function readMemeExposureScope(): MemeExposureScope {
   return getContext<MemeExposureScope | undefined>(memeExposureScopeContextKey) ?? createMemeExposureScope();
-}
-
-function stableToken(value: string): string {
-  let first = 0x811c9dc5;
-  let second = 0x9e3779b9;
-  for (let index = 0; index < value.length; index += 1) {
-    const code = value.charCodeAt(index);
-    first = Math.imul(first ^ code, 0x01000193);
-    second = Math.imul(second ^ code, 0x85ebca6b);
-  }
-  return `${(first >>> 0).toString(36)}${(second >>> 0).toString(36)}`;
 }

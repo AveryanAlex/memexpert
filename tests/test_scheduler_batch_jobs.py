@@ -133,6 +133,7 @@ async def test_search_index_batch_processes_both_targets_with_per_target_limit(
     assert len(meili_client.upserts) == 1
     qdrant_payload, vector = qdrant_client.upserts[0]
     assert qdrant_payload.meme_file_id == first.meme_file.id
+    assert qdrant_payload.is_primary_file is True
     assert vector == pytest.approx((0.25, 0.75))
 
     snapshots = await _load_snapshots(migrated_db_session, first.meme_file.id)
@@ -143,6 +144,8 @@ async def test_search_index_batch_processes_both_targets_with_per_target_limit(
         decoded_preview = decode_sync_preview(snapshot.last_payload_preview, target=snapshot.sync_target)
         assert decoded_preview is not None
         assert decoded_preview.target is snapshot.sync_target
+        if snapshot.sync_target is SyncTargetKind.QDRANT:
+            assert decoded_preview.preview_fields["is_primary_file"] is True
 
 
 async def test_search_index_batch_reprocesses_stale_synced_snapshot(
@@ -173,9 +176,10 @@ async def test_search_index_batch_reprocesses_stale_synced_snapshot(
         ]
     )
     await migrated_db_session.commit()
+    qdrant_client = FakeQdrantSyncClient()
     meili_client = FakeMeilisearchSyncClient()
 
-    result = await run_scheduler_search_index_sync_batch(
+    job = SearchIndexBatchJobService(
         postgres_session_factory,
         settings=Settings.model_validate(
             {
@@ -183,15 +187,27 @@ async def test_search_index_batch_reprocesses_stale_synced_snapshot(
                 "scheduler_search_index_sync_batch_size": 10,
             }
         ),
-        qdrant_client=FakeQdrantSyncClient(),
+        qdrant_client=qdrant_client,
         meilisearch_client=meili_client,
     )
+    backlog_before = await job._load_backlog_snapshot()
+    result = await job.run()
 
-    assert result.scanned == 1
-    assert result.updated == 1
+    # The missing is_primary_file preview is a stale Qdrant payload contract,
+    # even though its success timestamp is newer than canonical PostgreSQL.
+    assert backlog_before.index_sync_unsynced_count == 1
+    assert result.scanned == 2
+    assert result.updated == 2
+    assert [payload.meme_file_id for payload, _vector in qdrant_client.upserts] == [fixture.meme_file.id]
     assert meili_client.upserts == [str(fixture.meme_file.id)]
     snapshots = await _load_snapshots(migrated_db_session, fixture.meme_file.id)
+    qdrant_snapshot = next(snapshot for snapshot in snapshots if snapshot.sync_target is SyncTargetKind.QDRANT)
     meili_snapshot = next(snapshot for snapshot in snapshots if snapshot.sync_target is SyncTargetKind.MEILISEARCH)
+    assert qdrant_snapshot.status is SyncTargetStatus.SYNCED
+    assert qdrant_snapshot.attempt_count == 2
+    qdrant_preview = decode_sync_preview(qdrant_snapshot.last_payload_preview, target=SyncTargetKind.QDRANT)
+    assert qdrant_preview is not None
+    assert qdrant_preview.preview_fields["is_primary_file"] is True
     assert meili_snapshot.status is SyncTargetStatus.SYNCED
     assert meili_snapshot.attempt_count == 3
     assert meili_snapshot.last_success_at is not None

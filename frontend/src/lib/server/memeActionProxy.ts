@@ -31,7 +31,7 @@ export async function proxyMemeAction({
     headers.set('x-requested-with', requestedWith);
   }
 
-  const bodyText = method === 'POST' ? await request.text() : '';
+  const bodyText = await request.text();
   if (bodyText) {
     headers.set('content-type', request.headers.get('content-type') ?? 'application/json');
   }
@@ -39,7 +39,8 @@ export async function proxyMemeAction({
   const upstream = await fetch(new URL(`/api/v1/memes/${encodeURIComponent(memeId)}/${action}`, apiBaseUrl), {
     method,
     headers,
-    body: bodyText || undefined
+    body: bodyText || undefined,
+    signal: request.signal
   });
 
   return passthroughUpstreamResponse(upstream);

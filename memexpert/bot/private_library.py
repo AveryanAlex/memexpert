@@ -500,8 +500,9 @@ async def _handle_callback_action(
                 event_type=AnalyticsEventType.MEME_LIKE,
                 user_id=user.id,
                 telegram_user_hash_value=telegram_user_hash_value,
-                action="unfavorite",
+                action="remove",
                 meme_id=meme_id,
+                extra_properties={"preference_kind": "favorite"},
             ),
         )
     if action == "rs":
@@ -518,9 +519,10 @@ async def _handle_callback_action(
                 event_type=AnalyticsEventType.MEME_SAVE,
                 user_id=user.id,
                 telegram_user_hash_value=telegram_user_hash_value,
-                action="remove_save",
+                action="remove",
                 meme_id=meme_id,
                 collection_id=user.active_save_collection_id,
+                extra_properties={"preference_kind": "save"},
             ),
         )
     if action == "pn":
@@ -537,8 +539,9 @@ async def _handle_callback_action(
                 event_type=AnalyticsEventType.MEME_PIN,
                 user_id=user.id,
                 telegram_user_hash_value=telegram_user_hash_value,
-                action="pin",
+                action="add",
                 meme_id=meme_id,
+                extra_properties={"preference_kind": "pin"},
             ),
         )
     if action == "up":
@@ -555,8 +558,9 @@ async def _handle_callback_action(
                 event_type=AnalyticsEventType.MEME_PIN,
                 user_id=user.id,
                 telegram_user_hash_value=telegram_user_hash_value,
-                action="unpin",
+                action="remove",
                 meme_id=meme_id,
+                extra_properties={"preference_kind": "pin"},
             ),
         )
     if action in {"pu", "pd"}:
@@ -578,9 +582,12 @@ async def _handle_callback_action(
                 event_type=AnalyticsEventType.MEME_PIN,
                 user_id=user.id,
                 telegram_user_hash_value=telegram_user_hash_value,
-                action="reorder_pin",
+                action="reorder",
                 meme_id=meme_id,
-                extra_properties={"direction": "up" if action == "pu" else "down"},
+                extra_properties={
+                    "direction": "up" if action == "pu" else "down",
+                    "preference_kind": "pin",
+                },
             )
             if moved
             else None,

@@ -37,6 +37,7 @@ from memexpert.schemas.meme import (
 )
 from memexpert.services.media_render_urls import MediaRenderUrlService
 from memexpert.services.meme_search import _DERIVED_POPULARITY_ATTR, _to_public_card_read
+from memexpert.services.recommendations.attribution import sign_result_attribution
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,7 @@ TREND_MATERIALIZED_VIEWS = (
     "public_template_trends_mv",
     "public_tag_trend_points_mv",
     "public_template_trend_points_mv",
+    "public_meme_recommendation_features_mv",
 )
 
 type PublicTrendRanking = Literal["trending", "fastest_rising", "most_liked"]
@@ -84,6 +86,7 @@ class PublicTrendsService:
         limit: int = 20,
         offset: int = 0,
         surface: str = "public_api_trends",
+        viewer_user_id: uuid.UUID | None = None,
     ) -> PublicMemeTrendPageRead:
         """Return MV-ranked public memes for the requested ranking mode."""
 
@@ -145,19 +148,23 @@ class PublicTrendsService:
                 PublicMemeTrendRead(
                     meme=_to_public_card_read(meme, media_render_service=self._media_render_service),
                     trend=_trend_metrics_from_row(row),
-                    attribution=MemeResultAttributionRead(
-                        request_id=request_id,
-                        impression_id=new_discovery_impression_id(),
-                        surface=surface,
-                        source_algorithm=f"public_trends_mv_{ranking}",
-                        rank=rank,
-                        query=None,
-                        filters=filters,
-                        collection_scope="public",
-                        algorithm_version=PUBLIC_TRENDS_ALGORITHM_VERSION,
-                        score=_trend_score_from_row(row, ranking=ranking),
-                        score_components=_trend_score_components_from_row(row, ranking=ranking),
-                        reason=ranking,
+                    attribution=sign_result_attribution(
+                        MemeResultAttributionRead(
+                            request_id=request_id,
+                            impression_id=new_discovery_impression_id(),
+                            surface=surface,
+                            source_algorithm=f"public_trends_mv_{ranking}",
+                            rank=rank,
+                            query=None,
+                            filters=filters,
+                            collection_scope="public",
+                            algorithm_version=PUBLIC_TRENDS_ALGORITHM_VERSION,
+                            score=_trend_score_from_row(row, ranking=ranking),
+                            score_components=_trend_score_components_from_row(row, ranking=ranking),
+                            reason=ranking,
+                        ),
+                        meme_id=meme.id,
+                        viewer_user_id=viewer_user_id,
                     ),
                 )
             )

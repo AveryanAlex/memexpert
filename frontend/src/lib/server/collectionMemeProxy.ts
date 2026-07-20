@@ -26,7 +26,7 @@ export async function proxyCollectionMemeAction({
   if (requestedWith) {
     headers.set('x-requested-with', requestedWith);
   }
-  const body = method === 'POST' ? await request.text() : '';
+  const body = await request.text();
   const contentType = request.headers.get('content-type');
   if (body && contentType) {
     headers.set('content-type', contentType);

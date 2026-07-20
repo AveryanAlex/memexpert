@@ -1105,6 +1105,14 @@ const server = createServer((request, response) => {
     return;
   }
 
+  if (url.pathname === '/api/v1/analytics/interactions/batch' && request.method === 'POST') {
+    readRequestJson(request).then((body) => {
+      const count = Array.isArray(body?.events) ? body.events.length : 0;
+      sendJson(response, 202, { recorded: count, duplicates: 0 });
+    }).catch(() => sendJson(response, 400, { detail: 'Invalid interaction batch.' }));
+    return;
+  }
+
   if (url.pathname === '/media/smoke-cat.svg') {
     response.writeHead(200, {
       'content-type': 'image/svg+xml',
@@ -1142,10 +1150,6 @@ const server = createServer((request, response) => {
       sendJson(response, 200, sessionPayload('full'));
       return;
     }
-    if (token === 'guest-auto' || token?.startsWith('smoke-guest-state-')) {
-      sendJson(response, 200, sessionPayload('guest'));
-      return;
-    }
     const loginAttempt = cookieValue(request, 'smoke_login_attempt');
     if (loginAttempt && loginAttemptPolls.has(loginAttempt)) {
       const pollCount = (loginAttemptPolls.get(loginAttempt) ?? 0) + 1;
@@ -1159,6 +1163,10 @@ const server = createServer((request, response) => {
       } else {
         sendJson(response, 200, sessionPayload('guest'));
       }
+      return;
+    }
+    if (token === 'guest-auto' || token?.startsWith('smoke-guest-state-')) {
+      sendJson(response, 200, sessionPayload('guest'));
       return;
     }
 
@@ -1213,14 +1221,15 @@ const server = createServer((request, response) => {
 
   if (url.pathname === '/api/v1/collections') {
     const fullAccess = hasFullAccess(request);
+    const bootstrapHeaders = fullAccess || accessToken(request)
+      ? {}
+      : viewerState(request, { bootstrap: true }).headers;
     sendJson(response, 200, {
       collections: fullAccess
         ? [recentCollectionSummary, favoritesCollectionSummary, laterCollectionSummary, seededCollectionSummary]
         : [favoritesCollectionSummary],
       active_save_collection_id: favoritesCollectionId
-    }, fullAccess || accessToken(request) ? {} : {
-      'set-cookie': 'memexpert_access_token=guest-auto; Path=/; HttpOnly; SameSite=Lax'
-    });
+    }, bootstrapHeaders);
     return;
   }
 
@@ -1304,14 +1313,57 @@ const server = createServer((request, response) => {
     return;
   }
 
-  if (url.pathname === '/api/v1/memes/home-feed' || url.pathname === '/api/v1/memes/browse') {
+  if (url.pathname === '/api/v1/memes/home-feed/reauthorize' && request.method === 'POST') {
+    readRequestJson(request).then((body) => {
+      const knownMemes = new Map([meme, nextMeme].map((item) => [item.id, item]));
+      const items = Array.isArray(body?.items)
+        ? body.items.flatMap((item, index) => {
+            const restoredMeme = knownMemes.get(item?.meme_id);
+            return restoredMeme
+              ? [{
+                  meme: projectViewerMeme(request, restoredMeme),
+                  attribution: homeAttribution(restoredMeme.id, index + 1, item.attribution_token)
+                }]
+              : [];
+          })
+        : [];
+      sendJson(response, 200, { items });
+    }).catch(() => sendJson(response, 400, { detail: 'Invalid saved Home feed.' }));
+    return;
+  }
+
+  if (url.pathname === '/api/v1/memes/home-feed') {
+    const offset = url.searchParams.has('cursor') ? 12 : Number(url.searchParams.get('offset') ?? 0);
+    const homeMeme = offset > 0 ? nextMeme : meme;
+    const bootstrapHeaders = accessToken(request)
+      ? {}
+      : viewerState(request, { bootstrap: true }).headers;
+    sendJson(response, 200, {
+      items: [{
+        meme: projectViewerMeme(request, homeMeme),
+        attribution: homeAttribution(homeMeme.id, offset + 1)
+      }],
+      limit: Number(url.searchParams.get('limit') ?? 12),
+      offset,
+      total: 2,
+      has_more: offset <= 0,
+      request_id: `req_smoke_home_${offset}`,
+      feed_session_id: 'feed_smoke_home',
+      next_cursor: offset <= 0 ? 'smoke-signed-home-cursor' : null,
+      expires_at: '2099-01-01T00:00:00Z'
+    }, bootstrapHeaders);
+    return;
+  }
+
+  if (url.pathname === '/api/v1/memes/browse') {
     const offset = Number(url.searchParams.get('offset') ?? 0);
     sendJson(response, 200, {
       items: [{ meme: projectViewerMeme(request, offset > 0 ? nextMeme : meme) }],
       limit: Number(url.searchParams.get('limit') ?? 12),
       offset,
       total: 2,
-      has_more: offset <= 0
+      has_more: offset <= 0,
+      request_id: `req_smoke_browse_${offset}`
     });
     return;
   }
@@ -2101,6 +2153,23 @@ function rankedMasonryAttributionFor(url, memeId, rank) {
     score: rankedMasonryMemes.length - rank + 1,
     score_components: { backend_rank: rank },
     reason: 'Deterministic ranked masonry fixture'
+  };
+}
+
+function homeAttribution(memeId, rank, attributionToken = `smoke-signed-home-${memeId}`) {
+  return {
+    request_id: 'req_smoke_home',
+    impression_id: `imp_smoke_home_${memeId}`,
+    surface: 'web_home',
+    source_algorithm: 'personalized_recommendations',
+    rank,
+    algorithm_version: 'personalized_v2',
+    profile_version: 'taste_v2:smoke',
+    score: 1 - rank / 100,
+    score_components: { total: 1 - rank / 100 },
+    candidate_sources: [],
+    reason: 'multi_source_personalized',
+    attribution_token: attributionToken
   };
 }
 

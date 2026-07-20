@@ -63,6 +63,8 @@ import {
   recordMemeDetailClick,
   recordMemeDownload,
   recordMemeImpression,
+  reauthorizeHomeFeedItems,
+  recordMemeInteractionBatch,
   recordMemeShare,
   recordMemeView,
   regenerateMemeSeoPage,
@@ -219,6 +221,60 @@ describe('catalog API client', () => {
       limit: 12,
       offset: 24,
       cookieHeader: 'memexpert_access_token=guest'
+    });
+
+    expect(mockFetch).toHaveBeenCalledOnce();
+  });
+
+  it('uses an opaque home cursor without also sending a compatibility offset', async () => {
+    const mockFetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      expect(url.pathname).toBe('/api/v1/memes/home-feed');
+      expect(url.searchParams.get('cursor')).toBe('signed pool cursor');
+      expect(url.searchParams.has('offset')).toBe(false);
+      return jsonResponse({
+        ...page,
+        feed_session_id: 'feed-session-1',
+        next_cursor: null,
+        expires_at: '2026-07-20T12:00:00Z'
+      });
+    }) satisfies ApiFetch;
+
+    await fetchHomeFeed({
+      fetch: mockFetch,
+      baseUrl: 'https://api.memexpert.test',
+      limit: 12,
+      offset: 900,
+      cursor: ' signed pool cursor '
+    });
+
+    expect(mockFetch).toHaveBeenCalledOnce();
+  });
+
+  it('posts saved home items for fresh filtered authorization', async () => {
+    const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const headers = new Headers(init?.headers);
+      expect(url.pathname).toBe('/api/v1/memes/home-feed/reauthorize');
+      expect(url.searchParams.getAll('tags')).toEqual(['cat']);
+      expect(url.searchParams.get('include_nsfw')).toBe('false');
+      expect(url.searchParams.has('limit')).toBe(false);
+      expect(init?.method).toBe('POST');
+      expect(init?.credentials).toBe('include');
+      expect(headers.get('content-type')).toBe('application/json');
+      expect(headers.get('x-requested-with')).toBe('XMLHttpRequest');
+      expect(JSON.parse(String(init?.body))).toEqual({
+        items: [{ meme_id: 'meme-1', attribution_token: 'signed-token' }]
+      });
+      return jsonResponse({ items: [] });
+    }) satisfies ApiFetch;
+
+    await reauthorizeHomeFeedItems({
+      fetch: mockFetch,
+      baseUrl: 'https://app.memexpert.test',
+      tags: ['cat'],
+      includeNsfw: false,
+      items: [{ meme_id: 'meme-1', attribution_token: 'signed-token' }]
     });
 
     expect(mockFetch).toHaveBeenCalledOnce();
@@ -549,6 +605,23 @@ describe('catalog API client', () => {
     ]);
   });
 
+  it('keeps idempotency and signed attribution bodies on DELETE mutations', async () => {
+    const body = {
+      event_id: '018f22ec-9c00-7000-8000-000000000001',
+      attribution_token: 'signed-attribution'
+    };
+    const mockFetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      expect(init?.method).toBe('DELETE');
+      expect(new Headers(init?.headers).get('content-type')).toBe('application/json');
+      expect(JSON.parse(String(init?.body))).toEqual(body);
+      return jsonResponse({ favorited: false, changed: true, like_count: 7 });
+    }) satisfies ApiFetch;
+
+    await unfavoriteMeme({ fetch: mockFetch, memeId: 'meme-123', body });
+
+    expect(mockFetch).toHaveBeenCalledOnce();
+  });
+
   it('uses existing save and pin action endpoints with CSRF-compatible request header', async () => {
     const calls: Array<{ method: string | undefined; path: string; requestedWith: string | null }> = [];
     const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -622,6 +695,31 @@ describe('catalog API client', () => {
     expect(mockFetch).toHaveBeenCalledOnce();
   });
 
+  it('posts a bounded interaction batch with idempotency IDs and keepalive', async () => {
+    const events = [{
+      event_id: '018f22ec-9c00-7000-8000-000000000001',
+      event_type: 'meme_impression' as const,
+      meme_id: '11111111-1111-4111-8111-111111111111',
+      occurred_at: '2026-07-20T10:00:00.000Z',
+      attribution_token: 'signed-attribution'
+    }];
+    const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input), 'https://web.memexpert.test');
+      expect(url.pathname).toBe('/api/v1/analytics/interactions/batch');
+      expect(init?.method).toBe('POST');
+      expect(init?.credentials).toBe('include');
+      expect(init?.keepalive).toBe(true);
+      expect(new Headers(init?.headers).get('x-requested-with')).toBe('XMLHttpRequest');
+      expect(JSON.parse(String(init?.body))).toEqual({ events });
+      return jsonResponse({ recorded: 1, duplicates: 0 }, 202);
+    }) satisfies ApiFetch;
+
+    await expect(recordMemeInteractionBatch({ fetch: mockFetch, body: { events }, keepalive: true })).resolves.toEqual({
+      recorded: 1,
+      duplicates: 0
+    });
+  });
+
   it('submits meme reports with JSON body and CSRF-compatible request header', async () => {
     const memeId = '11111111-1111-4111-8111-111111111111';
     const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -692,6 +790,28 @@ describe('catalog API client', () => {
     });
 
     expect(mockFetch).toHaveBeenCalledOnce();
+  });
+
+  it('forwards signed report attribution and its idempotency event without legacy fields', async () => {
+    const memeId = '11111111-1111-4111-8111-111111111111';
+    const body = {
+      event_id: '018f22ec-9c00-7000-8000-000000000001',
+      attribution_token: 'signed-attribution'
+    };
+    const mockFetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      expect(JSON.parse(String(init?.body))).toEqual({ reason: 'spam', note: null, ...body });
+      return jsonResponse({
+        id: '22222222-2222-4222-8222-222222222222',
+        meme_id: memeId,
+        status: 'pending',
+        reason: 'spam',
+        note: null,
+        created_at: '2026-01-01T00:00:00Z',
+        updated_at: '2026-01-01T00:00:00Z'
+      });
+    }) satisfies ApiFetch;
+
+    await reportMeme({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', memeId, reason: 'spam', body });
   });
 
   it('loads current session through the web bootstrap endpoint and forwards Set-Cookie hooks', async () => {

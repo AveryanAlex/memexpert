@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import uuid
 from datetime import timedelta
@@ -151,6 +152,57 @@ class Settings(BaseSettings):
     pipeline_meilisearch_timeout_seconds: float = Field(default=10.0, gt=0.0, le=600.0)
     meilisearch_settings_task_timeout_seconds: float = Field(default=600.0, gt=0.0, le=3600.0)
     search_candidate_pool_limit_per_source: int = Field(default=200, ge=100, le=500)
+    recommendation_algorithm_version: str = Field(default="personalized_v2", min_length=1, max_length=64)
+    recommendation_profile_version: str = Field(default="taste_v2", min_length=1, max_length=64)
+    # Rollout gates are deliberately fail-safe. Enabling serving requires an
+    # operator to opt in to the subsystem, leave shadow mode, and raise the
+    # stable-viewer canary above zero as three separate changes.
+    recommendation_enabled: bool = False
+    recommendation_shadow_mode: bool = True
+    recommendation_canary_percent: int = Field(default=0, ge=0, le=100)
+    recommendation_shadow_timeout_seconds: float = Field(default=0.25, gt=0.0, le=5.0)
+    recommendation_feed_pool_ttl_seconds: int = Field(default=7200, ge=60, le=86400)
+    recommendation_feed_candidate_limit: int = Field(default=600, ge=20, le=600)
+    recommendation_feed_rerank_limit: int = Field(default=200, ge=20, le=200)
+    recommendation_feed_pool_limit: int = Field(default=200, ge=20, le=200)
+    recommendation_feed_pool_max_per_viewer: int = Field(default=4, ge=1, le=32)
+    recommendation_redis_timeout_seconds: float = Field(default=0.5, gt=0.0, le=10.0)
+    recommendation_attribution_token_ttl_seconds: int = Field(default=86400, ge=60, le=604800)
+    recommendation_impression_cooldown_hours: int = Field(default=72, ge=1, le=720)
+    recommendation_strong_positive_cooldown_hours: int = Field(default=168, ge=1, le=2160)
+    recommendation_short_term_half_life_hours: float = Field(default=24.0, gt=0.0, le=168.0)
+    recommendation_short_term_window_hours: int = Field(default=168, ge=1, le=720)
+    recommendation_search_intent_half_life_minutes: float = Field(default=30.0, gt=0.0, le=240.0)
+    recommendation_search_intent_ttl_seconds: int = Field(default=7200, ge=60, le=86400)
+    recommendation_long_term_half_life_days: float = Field(default=90.0, gt=0.0, le=730.0)
+    recommendation_long_term_signal_limit: int = Field(default=500, ge=20, le=500)
+    recommendation_cluster_activation_signals: int = Field(default=20, ge=3, le=500)
+    recommendation_cluster_iterations: int = Field(default=5, ge=1, le=20)
+    recommendation_cluster_min_items: int = Field(default=3, ge=2, le=20)
+    recommendation_short_term_candidate_limit: int = Field(default=120, ge=1, le=600)
+    recommendation_intent_candidate_limit: int = Field(default=120, ge=1, le=600)
+    recommendation_long_term_candidate_limit: int = Field(default=240, ge=1, le=600)
+    recommendation_multi_positive_candidate_limit: int = Field(default=120, ge=1, le=600)
+    recommendation_trending_candidate_limit: int = Field(default=80, ge=1, le=600)
+    recommendation_exploration_candidate_limit: int = Field(default=40, ge=1, le=600)
+    recommendation_rrf_constant: float = Field(default=60.0, gt=0.0, le=1000.0)
+    recommendation_personal_fit_weight: float = Field(default=0.40, ge=0.0, le=1.0)
+    recommendation_current_intent_weight: float = Field(default=0.15, ge=0.0, le=1.0)
+    recommendation_fused_candidate_weight: float = Field(default=0.10, ge=0.0, le=1.0)
+    recommendation_quality_weight: float = Field(default=0.15, ge=0.0, le=1.0)
+    recommendation_freshness_weight: float = Field(default=0.10, ge=0.0, le=1.0)
+    recommendation_popularity_alignment_weight: float = Field(default=0.05, ge=0.0, le=1.0)
+    recommendation_exploration_weight: float = Field(default=0.05, ge=0.0, le=1.0)
+    recommendation_freshness_half_life_days: float = Field(default=45.0, gt=0.0, le=730.0)
+    recommendation_exploration_min_source_quality: float = Field(default=0.55, ge=0.0, le=1.0)
+    recommendation_exploration_min_technical_quality: float = Field(default=0.50, ge=0.0, le=1.0)
+    recommendation_exploration_max_popularity_quantile: float = Field(default=0.80, ge=0.0, le=1.0)
+    recommendation_exploration_slot_interval: int = Field(default=20, ge=2, le=100)
+    recommendation_diversity_semantic_penalty: float = Field(default=0.15, ge=0.0, le=1.0)
+    recommendation_diversity_source_penalty: float = Field(default=0.08, ge=0.0, le=1.0)
+    recommendation_diversity_template_penalty: float = Field(default=0.08, ge=0.0, le=1.0)
+    recommendation_diversity_source_cap_per_20: int = Field(default=2, ge=1, le=20)
+    recommendation_diversity_template_cap_per_20: int = Field(default=2, ge=1, le=20)
     recommendation_positive_lookback_hours: int = Field(default=168, ge=1, le=2160)
     recommendation_impression_lookback_hours: int = Field(default=72, ge=1, le=720)
     recommendation_positive_signal_limit: int = Field(default=50, ge=1, le=500)
@@ -193,6 +245,12 @@ class Settings(BaseSettings):
     pipeline_worker_fail_sync_meili_for_meme_file_id: str | None = None
     scheduler_materialized_view_refresh_enabled: bool = True
     scheduler_materialized_view_refresh_interval_seconds: float = Field(default=300.0, gt=0.0)
+    scheduler_recommendation_profile_rebuild_enabled: bool = True
+    scheduler_recommendation_profile_rebuild_interval_seconds: float = Field(default=300.0, gt=0.0)
+    scheduler_recommendation_profile_rebuild_batch_size: int = Field(default=50, ge=1, le=500)
+    scheduler_recommendation_analytics_rollup_enabled: bool = True
+    scheduler_recommendation_analytics_rollup_interval_seconds: float = Field(default=3600.0, gt=0.0)
+    scheduler_recommendation_analytics_rollup_lookback_days: int = Field(default=2, ge=1, le=31)
     scheduler_source_engagement_capture_enabled: bool = True
     scheduler_source_engagement_capture_interval_seconds: float = Field(default=21600.0, gt=0.0)
     scheduler_source_engagement_capture_batch_size: int = Field(default=100, ge=1, le=1000)
@@ -410,6 +468,23 @@ class Settings(BaseSettings):
             raise ValueError(
                 "pipeline_capacity_reopen_oldest_age_seconds must be below pipeline_capacity_close_oldest_age_seconds."
             )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_recommendation_ranking_weights(self) -> Settings:
+        ranking_weight_sum = sum(
+            (
+                self.recommendation_personal_fit_weight,
+                self.recommendation_current_intent_weight,
+                self.recommendation_fused_candidate_weight,
+                self.recommendation_quality_weight,
+                self.recommendation_freshness_weight,
+                self.recommendation_popularity_alignment_weight,
+                self.recommendation_exploration_weight,
+            )
+        )
+        if not math.isclose(ranking_weight_sum, 1.0, rel_tol=0.0, abs_tol=1e-9):
+            raise ValueError("recommendation home ranking weights must sum to 1.0")
         return self
 
     @field_validator("pipeline_operator_token", mode="before")

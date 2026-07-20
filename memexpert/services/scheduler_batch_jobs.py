@@ -202,12 +202,38 @@ class SearchIndexBatchJobService:
         )
         async with self._session_factory() as session:
             unsynced_count, failed_count, processing_count, oldest_updated_at = (await session.execute(stmt)).one()
+            stale_primary_payload_count, stale_primary_payload_oldest = (
+                await session.execute(
+                    select(
+                        func.count(),
+                        func.min(MemeFileSyncTargetSnapshot.updated_at),
+                    )
+                    .select_from(MemeFileSyncTargetSnapshot)
+                    .join(MemeFile, MemeFile.id == MemeFileSyncTargetSnapshot.meme_file_id)
+                    .join(Meme, Meme.id == MemeFile.meme_id)
+                    .where(
+                        MemeFileSyncTargetSnapshot.sync_target == SyncTargetKind.QDRANT,
+                        MemeFileSyncTargetSnapshot.status == SyncTargetStatus.SYNCED,
+                        MemeFile.status == ContentProcessingStatus.READY,
+                        MemeFileSyncTargetSnapshot.last_payload_preview["is_primary_file"]
+                        .as_boolean()
+                        .is_distinct_from(Meme.primary_file_id == MemeFile.id),
+                    )
+                )
+            ).one()
+
+        unsynced_count = int(unsynced_count or 0) + int(stale_primary_payload_count or 0)
+        if isinstance(stale_primary_payload_oldest, datetime) and (
+            not isinstance(oldest_updated_at, datetime)
+            or stale_primary_payload_oldest < oldest_updated_at
+        ):
+            oldest_updated_at = stale_primary_payload_oldest
 
         oldest_lag_seconds = None
         if isinstance(oldest_updated_at, datetime):
             oldest_lag_seconds = max((utcnow() - oldest_updated_at).total_seconds(), 0.0)
         return _SearchIndexBacklogSnapshot(
-            index_sync_unsynced_count=int(unsynced_count or 0),
+            index_sync_unsynced_count=unsynced_count,
             index_sync_failed_count=int(failed_count or 0),
             index_sync_processing_count=int(processing_count or 0),
             index_sync_oldest_lag_seconds=oldest_lag_seconds,
@@ -235,6 +261,13 @@ class SearchIndexBatchJobService:
             seconds=self._settings.scheduler_search_index_sync_processing_timeout_seconds,
         )
         canonical_clock = _canonical_search_index_clock_expr()
+        qdrant_payload_contract_stale = (
+            MemeFileSyncTargetSnapshot.last_payload_preview["is_primary_file"]
+            .as_boolean()
+            .is_distinct_from(Meme.primary_file_id == MemeFile.id)
+            if target is SyncTargetKind.QDRANT
+            else literal(False)
+        )
         status_priority = case(
             (MemeFileSyncTargetSnapshot.status == SyncTargetStatus.FAILED, 0),
             (MemeFileSyncTargetSnapshot.status == SyncTargetStatus.PENDING, 1),
@@ -264,6 +297,7 @@ class SearchIndexBatchJobService:
                         or_(
                             MemeFileSyncTargetSnapshot.last_success_at.is_(None),
                             canonical_clock > MemeFileSyncTargetSnapshot.last_success_at,
+                            qdrant_payload_contract_stale,
                         ),
                     ),
                 ),
@@ -645,6 +679,7 @@ def _qdrant_preview_fields(payload: QdrantSyncPayload) -> dict[str, object]:
             "meme_file_id": payload.meme_file_id,
             "search_index_algorithm_version": payload.search_index_algorithm_version,
             "is_public": payload.is_public,
+            "is_primary_file": payload.is_primary_file,
             "uploader_user_ids": payload.uploader_user_ids,
             "media_type": payload.media_type,
             "language": payload.language,

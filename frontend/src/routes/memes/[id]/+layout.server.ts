@@ -2,17 +2,20 @@ import { redirect } from '@sveltejs/kit';
 import type { LayoutServerLoad } from './$types';
 import {
   ApiError,
-  fetchMemeDetail
+  fetchMemeDetail,
+  type ApiFetch
 } from '$lib/api/client';
 import { apiBaseUrl } from '$lib/server/backend';
 
-export const load: LayoutServerLoad = async ({ fetch, params, request }) => {
+export const load: LayoutServerLoad = async ({ fetch, params, request, setHeaders }) => {
+  setHeaders({ 'cache-control': 'private, no-store' });
   const cookieHeader = request.headers.get('cookie') ?? undefined;
+  const upstreamFetch: ApiFetch = (input, init) => fetch(input, { ...init, signal: request.signal });
   let meme: Awaited<ReturnType<typeof fetchMemeDetail>>;
 
   try {
     meme = await fetchMemeDetail({
-      fetch,
+      fetch: upstreamFetch,
       baseUrl: apiBaseUrl(),
       memeId: params.id,
       cookieHeader

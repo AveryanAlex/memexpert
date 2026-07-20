@@ -20,10 +20,14 @@ export interface HomeFeedItem {
     primary_file: Record<string, unknown> | null;
   };
   attribution: {
+    attribution_token: string | null;
     surface: string | null;
     source_algorithm: string | null;
+    algorithm_version: string | null;
+    profile_version: string | null;
     reason: string | null;
     query: string | null;
+    candidate_sources: Array<{ source: string; rank: number; score: number | null; contribution: number }>;
     filters: {
       include_nsfw: boolean;
       scope: string | null;
@@ -39,6 +43,9 @@ export interface HomeFeedPayload {
   offset: number;
   has_more: boolean;
   request_id: string;
+  feed_session_id: string;
+  next_cursor: string | null;
+  expires_at: string;
 }
 
 export interface HomeFeedResult {
@@ -71,7 +78,7 @@ export class E2EApi {
     return { response, payload: (await response.json()) as HomeFeedPayload };
   }
 
-  expectHomeFeedFallback(payload: HomeFeedPayload, seededMemes: SeededMeme[]) {
+  expectPersonalizedHomeFeed(payload: HomeFeedPayload, seededMemes: SeededMeme[]) {
     const publicSeededById = new Map(
       seededMemes.filter((meme) => !meme.is_nsfw).map((meme) => [meme.meme_id, meme])
     );
@@ -92,21 +99,52 @@ export class E2EApi {
     }
 
     for (const item of payload.items) {
+      expect(item.meme.is_nsfw).toBe(false);
       expect(item.attribution).toEqual(
         expect.objectContaining({
-          surface: 'public_api_home_feed',
-          source_algorithm: 'fallback_trending',
-          reason: 'cold_start_no_positive_signals',
-          query: null,
-          collection_scope: 'public'
+          surface: 'web_home',
+          source_algorithm: 'personalized_recommendations',
+          algorithm_version: 'personalized_v2',
+          query: null
         })
       );
-      expect(item.attribution.filters).toEqual(expect.objectContaining({ include_nsfw: false, scope: 'public' }));
+      expect(item.attribution.attribution_token).toEqual(expect.any(String));
+      expect(['multi_source_personalized', 'quality_exploration']).toContain(item.attribution.reason);
       expect(item).not.toHaveProperty('score');
       expect(item.meme.primary_file ?? {}).not.toHaveProperty('s3_original_key');
       expect(item.meme.primary_file ?? {}).not.toHaveProperty('s3_web_video_key');
       expect(item.meme.primary_file ?? {}).not.toHaveProperty('source_object_key');
     }
+    expect(payload.feed_session_id).toEqual(expect.any(String));
+    expect(Number.isNaN(Date.parse(payload.expires_at))).toBe(false);
+    expect(payload.has_more).toBe(Boolean(payload.next_cursor));
+  }
+
+  async recordHomeImpression(item: HomeFeedItem) {
+    const response = await this.request.post(`${this.apiBaseUrl}/api/v1/analytics/interactions/batch`, {
+      data: {
+        events: [
+          {
+            event_id: uuidV7(),
+            event_type: 'meme_impression',
+            meme_id: item.meme.id,
+            occurred_at: new Date().toISOString(),
+            attribution_token: item.attribution.attribution_token
+          }
+        ]
+      }
+    });
+    await expect(response).toBeOK();
+  }
+
+  async favoriteHomeItem(item: HomeFeedItem) {
+    const response = await this.request.post(`${this.apiBaseUrl}/api/v1/memes/${item.meme.id}/favorite`, {
+      data: {
+        event_id: uuidV7(),
+        attribution_token: item.attribution.attribution_token
+      }
+    });
+    await expect(response).toBeOK();
   }
 
   expectAccessCookieSet(response: APIResponse): string {
@@ -178,6 +216,20 @@ export class E2EApi {
     const state = await this.request.storageState();
     return state.cookies.find((cookie) => cookie.name === ACCESS_COOKIE_NAME);
   }
+}
+
+function uuidV7(timestamp = Date.now()): string {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  let milliseconds = BigInt(timestamp);
+  for (let index = 5; index >= 0; index -= 1) {
+    bytes[index] = Number(milliseconds & 0xffn);
+    milliseconds >>= 8n;
+  }
+  bytes[6] = (bytes[6] & 0x0f) | 0x70;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
 export async function loginViaEmail(page: Page, apiBaseUrl: string, user: SeededE2EUser) {
