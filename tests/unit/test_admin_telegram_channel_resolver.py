@@ -22,6 +22,11 @@ if TYPE_CHECKING:
     from memexpert.core.config import Settings
 
 
+@pytest.fixture(autouse=True)
+def _fake_full_channel_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(resolver_module, "_telegram_full_channel_request", lambda entity: entity)
+
+
 @pytest.mark.parametrize(
     ("reference", "username"),
     [
@@ -90,6 +95,7 @@ async def test_resolver_stores_lowercase_public_username_that_existing_crawler_c
     assert resolved.title == "Canonical channel"
     assert resolved.subscriber_count == 456
     assert client.references == ["canonical_channel"]
+    assert client.full_channel_requests == [entity]
     assert client.disconnected is True
     assert captured["string_session"] is secret
     assert "server-only-string-session" not in repr(resolved)
@@ -243,6 +249,7 @@ class _FakeClient:
         self.delay_seconds = delay_seconds
         self.error = error
         self.references: list[str] = []
+        self.full_channel_requests: list[object] = []
         self.disconnected = False
 
     async def connect(self) -> None:
@@ -258,6 +265,12 @@ class _FakeClient:
         if self.error is not None:
             raise self.error
         return self.entity
+
+    async def __call__(self, request: object) -> object:
+        self.full_channel_requests.append(request)
+        return SimpleNamespace(
+            full_chat=SimpleNamespace(participants_count=getattr(self.entity, "participants_count", None)),
+        )
 
     async def disconnect(self) -> None:
         self.disconnected = True

@@ -3,6 +3,8 @@
 This runbook covers the backend scheduler jobs that perform deferred, bounded work outside user request paths:
 
 - `source-engagement-capture` claims due Telegram source posts and enqueues metric refresh work.
+- `source-channel-audience-capture` claims due Telegram channels and enqueues
+  forward-only subscriber-count observations.
 - `materialized-view-refresh` refreshes public trend materialized views derived from source engagement snapshots and analytics events.
 - `motd` refreshes the deterministic Meme of the Day cache row for the current UTC date.
 - `search-index-sync` updates Qdrant and Meilisearch from canonical PostgreSQL state.
@@ -53,6 +55,12 @@ Source engagement and public trend jobs:
 | `SCHEDULER_SOURCE_ENGAGEMENT_CAPTURE_PER_SESSION_BATCH_SIZE` | `20` | Maximum due `meme_sources` rows claimed for one Telegram session in a run, capped by the global batch size. |
 | `SCHEDULER_SOURCE_ENGAGEMENT_CAPTURE_LEASE_TIMEOUT_SECONDS` | `1800` | Lease timeout before an old source-engagement claim can be reclaimed. |
 | `PIPELINE_BROKER_SOURCE_ENGAGEMENT_CAPTURE_QUEUE` | `pipeline.source_engagement_capture` | RabbitMQ queue-name prefix used by worker-side metric fetchers. The worker declares per-session queues such as `pipeline.source_engagement_capture.<session_key>` with `x-single-active-consumer=true` and exact session routing keys. |
+| `SCHEDULER_SOURCE_CHANNEL_AUDIENCE_CAPTURE_ENABLED` | `true` | Enables the due-channel audience enqueue job. |
+| `SCHEDULER_SOURCE_CHANNEL_AUDIENCE_CAPTURE_INTERVAL_SECONDS` | `3600` | APScheduler polling interval. A terminal `success` or `not_exposed` outcome advances the channel to a daily UTC slot with deterministic per-channel jitter; a `failed` outcome remains due for a later poll. |
+| `SCHEDULER_SOURCE_CHANNEL_AUDIENCE_CAPTURE_BATCH_SIZE` | `100` | Maximum due `source_channels` rows claimed per run. |
+| `SCHEDULER_SOURCE_CHANNEL_AUDIENCE_CAPTURE_PER_SESSION_BATCH_SIZE` | `20` | Per-Telegram-session claim cap within the global batch. |
+| `SCHEDULER_SOURCE_CHANNEL_AUDIENCE_CAPTURE_LEASE_TIMEOUT_SECONDS` | `1800` | Lease timeout before an abandoned audience claim can be reclaimed. |
+| `PIPELINE_BROKER_SOURCE_CHANNEL_AUDIENCE_CAPTURE_QUEUE` | `pipeline.source_channel_audience_capture` | Per-session main/retry queue prefix for the existing Telegram worker role. |
 | `SCHEDULER_MATERIALIZED_VIEW_REFRESH_ENABLED` | `true` | Enables the public trend MV refresh job. |
 | `SCHEDULER_MATERIALIZED_VIEW_REFRESH_INTERVAL_SECONDS` | `300` | Refresh cadence for the derived public trend read models. |
 
@@ -62,7 +70,7 @@ Meme of the Day job and API refresh:
 |---|---:|---|
 | `SCHEDULER_MOTD_ENABLED` | `true` | Enables the scheduled MOTD cache refresh job. |
 | `SCHEDULER_MOTD_INTERVAL_SECONDS` | `86400` | APScheduler interval. The selection key is still the UTC date plus `MOTD_ALGORITHM_VERSION`. |
-| `MOTD_ALGORITHM_VERSION` | `motd_v1` | Cache key and attribution algorithm version for the deterministic selector. |
+| `MOTD_ALGORITHM_VERSION` | `motd_v2` | Cache key and attribution algorithm version for the deterministic selector. |
 | `MOTD_CANDIDATE_LOOKBACK_DAYS` | `30` | Recent-candidate window. Today's UTC selection ends at current UTC time; past/future requested dates end at the requested UTC date's next midnight. |
 | `MOTD_CANDIDATE_LIMIT` | `50` | Maximum candidate rows scored per refresh. |
 | `MOTD_MIN_QUALITY_SCORE` | `0.5` | Minimum `meme_files.quality_score` on the meme's primary file. |
@@ -95,19 +103,30 @@ RabbitMQ outbox publisher job:
 
 ## Result Logs
 
-Search-index, source-engagement, and SEO jobs emit:
+Search-index, source-engagement, source-channel-audience, and SEO jobs all emit
+`event=scheduler_job_batch_result`, their `job_id`, and `duration_seconds`.
+Their work-count fields are job-specific rather than one shared schema.
+
+Search-index and SEO batch jobs use:
 
 | field | meaning |
 |---|---|
-| `event` | Always `scheduler_job_batch_result`. |
-| `job_id` | `search-index-sync`, `meilisearch-settings-reconcile`, `source-engagement-capture`, or `seo-backlog-batches`. |
 | `scanned` | Work rows or memes claimed by this run. |
 | `updated` | External index updates or SEO page writes that succeeded. |
 | `failed` | Claimed items that ended in a recorded failure. |
 | `skipped` | Claimed items that could not be finalized because another run changed the row, or SEO generation returned a non-write skip result. |
-| `duration_seconds` | Wall-clock seconds spent inside the job action. |
 
-The source-engagement job uses `claimed` for due source rows and `enqueued` for RabbitMQ outbox messages written. The MOTD job emits the same `event=scheduler_job_batch_result` with `job_id=motd`, `candidate_count`, `selected_meme_id`, `reason`, `algorithm_version`, and `refreshed_at`. The outbox publisher emits the same event with `job_id=rabbitmq-outbox-publisher`, `recovered`, `claimed`, `published`, `failed`, and `duration_seconds` fields.
+The source-engagement and source-channel-audience enqueue jobs instead use
+`claimed` for due rows and `enqueued` for RabbitMQ outbox messages written. The
+audience event also carries `status=completed`, `degraded_mode=false`,
+`source_channel_ids`, and `outbox_message_ids`; it does not emit `scanned`,
+`updated`, `failed`, or `skipped`. Those internal UUIDs support operator
+correlation, while subscriber counts, session credentials, usernames, and error
+payloads stay out of the scheduler result. The MOTD job emits the same
+`event=scheduler_job_batch_result` with `job_id=motd`, `candidate_count`,
+`selected_meme_id`, `reason`, `algorithm_version`, and `refreshed_at`. The
+outbox publisher emits the same event with `job_id=rabbitmq-outbox-publisher`,
+`recovered`, `claimed`, `published`, `failed`, and `duration_seconds` fields.
 
 The Meilisearch settings job emits `status`, `changed`, `desired_hash`,
 `actual_hash`, `provider_task_uid`, and `revision_count`. Hashes are safe
@@ -138,11 +157,111 @@ The publisher sends the stored JSON payload to the row's stored `exchange` and `
 
 The canonical volatile source counters live in append-only `meme_source_engagement_snapshots`. `meme_sources` stores provenance and scheduling state only: platform identity, `published_at`, `next_engagement_check_at`, lease fields, and source liveness. It does not store Telegram view/reaction/forward totals.
 
-Initial ingest writes an `ingest_initial` snapshot as the baseline. Later captures are scheduled from the Telegram post date, not ingest time: `+1h`, `+3h`, `+12h`, `+1d`, `+3d`, `+7d`, `+1month`, then monthly. A missed old interval is not backfilled with invented deltas; the first observed snapshot for a source contributes zero historical delta because there is no previous snapshot to compare.
+Initial ingest writes an `ingest_initial` snapshot as the baseline. Later
+captures are scheduled from the Telegram post date, not ingest time: `+1h`,
+`+3h`, `+12h`, `+1d`, `+3d`, `+7d`, `+1month`, then monthly. A missed old
+interval is not backfilled with invented deltas; the first observed snapshot
+for a source contributes zero historical delta because there is no previous
+snapshot to compare. Public activity reads count only increases above each
+counter's prior running high, so a decrease and recovery cannot be counted
+twice.
 
 Each scheduler run finds due work through the `MemeSource -> SourceChannel -> TelegramSession` FK assignment, skips orphaned or disabled channels and non-runnable Telegram sessions, claims due alive Telegram `meme_sources` rows with `FOR UPDATE SKIP LOCKED`, sets the source engagement lease fields, and writes a `source_engagement_capture_requested` message through the generic RabbitMQ outbox in the same DB transaction. Claiming is capped by both `SCHEDULER_SOURCE_ENGAGEMENT_CAPTURE_BATCH_SIZE` globally and `SCHEDULER_SOURCE_ENGAGEMENT_CAPTURE_PER_SESSION_BATCH_SIZE` per Telegram session so one session cannot consume the full default run while other sessions have due work. Scheduler-published messages include `telegram_session_id`, `session_name`, and `session_key`, and route as `pipeline.source_engagement_capture.<session_key>`. A session in `flood_wait` is skipped while `flood_wait_until` is in the future; once the cooldown expires, the scheduler clears the session flood-wait state as it claims work so the later runtime can load an active session. Worker startup discovers engagement-enabled Telegram sessions and declares a single-active RabbitMQ main queue plus retry queue for each session key; this isolates in-flight captures per session while allowing different sessions to run independently. Runtime source-engagement captures reuse the `TelegramSessionManager` cached client for the event session. If Telegram returns FloodWait, the worker parks only that `telegram_sessions` row, clears the source lease, ACKs the message, and does not write a failed source snapshot. Source-level failures such as missing or inaccessible posts still write scheduled snapshots.
 
-Snapshot NULLs mean "Telegram did not expose this counter" and are preserved in canonical storage. Public trend/read-model queries may coalesce unknown to 0 for ranking and summaries only. `forward_count` is Telegram's public forward/repost count and maps to public `latest_source_reposts`; it is unrelated to `forwarded_from_*` attribution on forwarded messages.
+Snapshot NULLs mean "Telegram did not expose this counter" and are preserved
+in canonical storage. Public trend ranking may coalesce unknown to `0`; the
+public meme source/analytics DTOs preserve null plus coverage. `forward_count`
+is Telegram's public forward/repost count and maps to public
+`latest_source_reposts`; it is unrelated to `forwarded_from_*` attribution on
+forwarded messages.
+
+## Source Channel Audience Work Selection
+
+`source_channel_audience_snapshots` is durable forward-only observation history
+keyed by channel/slot/reason; the system never reconstructs subscriber counts
+before collection began. A failed slot remains retryable, but the first
+terminal `success` or `not_exposed` observation for a slot is immutable.
+Public-source resolution records `initial_resolution`, the crawler's metadata
+refresh records `crawler_refresh`, and this scheduler dispatches `scheduled`
+daily slots. All three paths call Telegram `channels.getFullChannel`; a missing
+participant count is stored as `not_exposed`, while known zero is a successful
+`0` observation.
+
+The scheduler polls hourly by default. It claims active, unpaused Telegram
+channels with engagement enabled, an assigned enabled/engagement-enabled
+runnable session, a due `next_audience_capture_at` (or no schedule yet), and no
+live lease newer than the timeout. Claims use `FOR UPDATE SKIP LOCKED`, global
+and per-session caps, and the transactional RabbitMQ outbox. Each message is
+routed to `pipeline.source_channel_audience_capture.<session_key>`; the existing
+Telegram worker role declares single-active main and retry queues per session
+and reuses its session manager/rate limiter. No separate container is required.
+Before calling Telegram, the worker locks and revalidates that the queued event
+still owns the channel's current session and due time and that the channel is
+still active, unpaused, and engagement-enabled. It repeats the same fence after
+the RPC, so a concurrent pause, reassignment, disable, or reschedule discards
+the result without clearing or overwriting the newer lease/schedule.
+
+Session-affined queue keys are discovered only when the Telegram worker starts.
+After adding or enabling a Telegram session, or changing its name, restart the
+`memexpert-worker-telegram.service` worker through the normal systemd/Reploy
+workflow before allowing scheduled dispatch. Until the new binding exists,
+mandatory RabbitMQ publication is unroutable and the durable outbox keeps
+retrying it. Adding or reassigning a channel to a session whose queue was
+already discovered does not require this restart.
+
+Both `success` and `not_exposed` are terminal for a scheduled slot. The first
+terminal row persisted for
+`(source_channel_id, capture_slot, capture_reason)` is immutable, and a later
+same-slot attempt returns that row unchanged. A terminal result clears the
+matching lease and advances to the next daily UTC time with stable
+channel-specific jitter. A success also refreshes the
+`SourceChannel.subscriber_count` latest-success cache; `not_exposed` preserves
+that cache. Only a `failed` row remains retryable: a later same-slot attempt may
+replace it with another `failed`, `success`, or `not_exposed` result. Failure
+clears the lease but leaves the original due time in place, so a later hourly
+scheduler poll retries that slot rather than fabricating another sample. Flood
+wait is different again: it parks only the affected Telegram session, clears
+the channel lease, and writes no failed audience snapshot; healthy sessions
+continue. Revoked authorization and permanent bans likewise write no retryable
+audience snapshot: they mark the session `auth_required` or `quarantined`,
+invalidate its cached worker client, and leave the due slot dormant until an
+operator repairs or replaces the non-runnable session. None of these
+non-success paths clears a previously valid subscriber cache.
+
+Inspect stale/missing audience state without printing credentials or raw
+container environment:
+
+```sql
+SELECT
+  id,
+  title,
+  subscriber_count,
+  subscriber_count_updated_at,
+  last_audience_capture_at,
+  next_audience_capture_at,
+  audience_capture_attempt_count,
+  last_audience_error_code
+FROM source_channels
+WHERE platform = 'telegram'
+ORDER BY next_audience_capture_at NULLS FIRST
+LIMIT 100;
+
+SELECT
+  source_channel_id,
+  captured_at,
+  capture_reason,
+  fetch_status,
+  subscriber_count,
+  error_code
+FROM source_channel_audience_snapshots
+ORDER BY captured_at DESC
+LIMIT 100;
+```
+
+The public meme API uses only successful observations. It assigns
+`audience_at_publish` from the latest success at or before publication when no
+more than 48 hours old, exposes current/latest counts with coverage, and never
+calls a sum of channel subscribers reach or unique audience.
 
 ## Meilisearch Synonym Settings Reconciliation
 

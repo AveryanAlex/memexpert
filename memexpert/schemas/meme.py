@@ -331,6 +331,277 @@ class PublicMemePopularitySummaryRead(BaseModel):
     sparkline: list[PublicMemePopularityPointRead] = Field(default_factory=list)
 
 
+class PublicMemeSourceSort(StrEnum):
+    """Stable public source-post orderings supported by the detail page."""
+
+    VIEWS_DESC = "views_desc"
+    REACTIONS_DESC = "reactions_desc"
+    REPOSTS_DESC = "reposts_desc"
+    INTERACTION_RATE_DESC = "interaction_rate_desc"
+    NEWEST = "newest"
+    OLDEST = "oldest"
+
+
+class PublicMemeAnalyticsWindow(StrEnum):
+    """Selectable public analytics history windows."""
+
+    SEVEN_DAYS = "7d"
+    THIRTY_DAYS = "30d"
+    NINETY_DAYS = "90d"
+    ALL = "all"
+
+
+class PublicMemeAnalyticsGranularity(StrEnum):
+    """Time bucket used by one public analytics point."""
+
+    DAY = "day"
+    WEEK = "week"
+    MONTH = "month"
+    ADAPTIVE = "adaptive"
+
+
+class PublicMemeMetricCoverageRead(BaseModel):
+    """How many source posts exposed one nullable Telegram counter."""
+
+    measured_posts: int = Field(default=0, ge=0)
+    total_posts: int = Field(default=0, ge=0)
+    ratio: float = Field(default=0.0, ge=0.0, le=1.0)
+
+
+class PublicMemeSourceCoverageRead(BaseModel):
+    """Per-counter measurement coverage for public source posts."""
+
+    views: PublicMemeMetricCoverageRead = Field(default_factory=PublicMemeMetricCoverageRead)
+    reactions: PublicMemeMetricCoverageRead = Field(default_factory=PublicMemeMetricCoverageRead)
+    comments: PublicMemeMetricCoverageRead = Field(default_factory=PublicMemeMetricCoverageRead)
+    reposts: PublicMemeMetricCoverageRead = Field(default_factory=PublicMemeMetricCoverageRead)
+
+
+class PublicMemeSourceTotalsRead(BaseModel):
+    """Known absolute Telegram counters; ``None`` means no post exposed the metric."""
+
+    views: int | None = Field(default=None, ge=0)
+    reactions: int | None = Field(default=None, ge=0)
+    comments: int | None = Field(default=None, ge=0)
+    reposts: int | None = Field(default=None, ge=0)
+
+
+class PublicMemeSourceRateRead(BaseModel):
+    """A transparent ratio-of-sums with its eligible-post coverage."""
+
+    value: float | None = Field(default=None, ge=0.0)
+    numerator: int | None = Field(default=None, ge=0)
+    denominator: int | None = Field(default=None, ge=0)
+    eligible_posts: int = Field(default=0, ge=0)
+    total_posts: int = Field(default=0, ge=0)
+
+
+class PublicMemeSourceRatesRead(BaseModel):
+    """Views-based Telegram engagement rates over fully measurable post subsets."""
+
+    reactions: PublicMemeSourceRateRead = Field(default_factory=PublicMemeSourceRateRead)
+    comments: PublicMemeSourceRateRead = Field(default_factory=PublicMemeSourceRateRead)
+    reposts: PublicMemeSourceRateRead = Field(default_factory=PublicMemeSourceRateRead)
+    interactions: PublicMemeSourceRateRead = Field(default_factory=PublicMemeSourceRateRead)
+
+
+class PublicMemeSourceAudienceRead(BaseModel):
+    """Subscriber observations usable for one source post without claiming reach."""
+
+    audience_at_publish: int | None = Field(default=None, ge=0)
+    current_audience: int | None = Field(default=None, ge=0)
+    views_per_1000_subscribers: float | None = Field(default=None, ge=0.0)
+    interactions_per_1000_subscribers: float | None = Field(default=None, ge=0.0)
+
+
+class PublicMemeSourceAudienceSummaryRead(BaseModel):
+    """Coverage and normalized source performance over known audience snapshots."""
+
+    current_known_channels: int = Field(default=0, ge=0)
+    total_channels: int = Field(default=0, ge=0)
+    publish_time_eligible_posts: int = Field(default=0, ge=0)
+    total_posts: int = Field(default=0, ge=0)
+    views_per_1000_subscribers: PublicMemeSourceRateRead = Field(
+        default_factory=PublicMemeSourceRateRead,
+    )
+    interactions_per_1000_subscribers: PublicMemeSourceRateRead = Field(
+        default_factory=PublicMemeSourceRateRead,
+    )
+
+
+class PublicMemeSourcePostRead(BaseModel):
+    """One public Telegram post without crawler/session or raw-source internals."""
+
+    channel_title: str
+    channel_username: str | None = None
+    channel_url: str | None = None
+    post_url: str | None = None
+    published_at: datetime | None = None
+    available: bool
+    captured_at: datetime | None = None
+    views: int | None = Field(default=None, ge=0)
+    reactions: int | None = Field(default=None, ge=0)
+    comments: int | None = Field(default=None, ge=0)
+    reposts: int | None = Field(default=None, ge=0)
+    rates: PublicMemeSourceRatesRead = Field(default_factory=PublicMemeSourceRatesRead)
+    audience: PublicMemeSourceAudienceRead = Field(default_factory=PublicMemeSourceAudienceRead)
+
+
+class PublicMemeSourceSummaryRead(BaseModel):
+    """Aggregate public Telegram provenance and measurement coverage."""
+
+    total_posts: int = Field(default=0, ge=0)
+    available_posts: int = Field(default=0, ge=0)
+    distinct_channels: int = Field(default=0, ge=0)
+    earliest_published_at: datetime | None = None
+    latest_published_at: datetime | None = None
+    latest_captured_at: datetime | None = None
+    totals: PublicMemeSourceTotalsRead = Field(default_factory=PublicMemeSourceTotalsRead)
+    coverage: PublicMemeSourceCoverageRead = Field(default_factory=PublicMemeSourceCoverageRead)
+    rates: PublicMemeSourceRatesRead = Field(default_factory=PublicMemeSourceRatesRead)
+    audience: PublicMemeSourceAudienceSummaryRead = Field(default_factory=PublicMemeSourceAudienceSummaryRead)
+
+
+class PublicMemeSourcePageRead(BaseModel):
+    """Stable offset page of public Telegram source posts."""
+
+    meme_id: uuid.UUID
+    snapshot_at: datetime
+    sort: PublicMemeSourceSort
+    items: list[PublicMemeSourcePostRead] = Field(default_factory=list)
+    summary: PublicMemeSourceSummaryRead = Field(default_factory=PublicMemeSourceSummaryRead)
+    limit: int = Field(ge=1, le=100)
+    offset: int = Field(ge=0)
+    total: int = Field(ge=0)
+    has_more: bool
+
+
+class PublicMemeActivityCountsRead(BaseModel):
+    """Exact activity counts; downloads are reported but excluded from Recorded activity."""
+
+    source_views: int = Field(default=0, ge=0)
+    source_reactions: int = Field(default=0, ge=0)
+    source_reposts: int = Field(default=0, ge=0)
+    memeexpert_views: int = Field(default=0, ge=0)
+    memeexpert_sends: int = Field(default=0, ge=0)
+    memeexpert_saves: int = Field(default=0, ge=0)
+    memeexpert_favorites: int = Field(default=0, ge=0)
+    downloads: int = Field(default=0, ge=0)
+    recorded_activity: int = Field(default=0, ge=0)
+
+
+class PublicMemeActivityPointRead(PublicMemeActivityCountsRead):
+    """One exact public activity bucket."""
+
+    bucket_start: datetime
+    bucket_end: datetime
+    granularity: PublicMemeAnalyticsGranularity
+
+
+class PublicMemeAnalyticsMomentumRead(BaseModel):
+    """Latest seven complete/partial UTC days compared with the preceding seven."""
+
+    recent_recorded_activity: int = Field(default=0, ge=0)
+    previous_recorded_activity: int = Field(default=0, ge=0)
+    change: int = 0
+    change_rate: float | None = None
+
+
+class PublicMemeAnalyticsPeakRead(BaseModel):
+    """Highest Recorded activity bucket in the selected period."""
+
+    bucket_start: datetime
+    bucket_end: datetime
+    granularity: PublicMemeAnalyticsGranularity
+    recorded_activity: int = Field(ge=0)
+
+
+class PublicMemeAnalyticsSummaryRead(BaseModel):
+    """Selected-period totals and compact headline metrics."""
+
+    totals: PublicMemeActivityCountsRead = Field(default_factory=PublicMemeActivityCountsRead)
+    average_recorded_activity_per_day: float = Field(default=0.0, ge=0.0)
+    current_favorites: int = Field(default=0, ge=0)
+    momentum: PublicMemeAnalyticsMomentumRead = Field(default_factory=PublicMemeAnalyticsMomentumRead)
+    peak: PublicMemeAnalyticsPeakRead | None = None
+
+
+class PublicMemeObservedSourcePointRead(PublicMemeSourceTotalsRead):
+    """Absolute known Telegram counters at an observation boundary."""
+
+    observed_at: datetime
+    coverage: PublicMemeSourceCoverageRead = Field(default_factory=PublicMemeSourceCoverageRead)
+
+
+class PublicMemeObservedSourceSeriesRead(BaseModel):
+    """Opening baseline plus real absolute Telegram observations."""
+
+    opening_baseline: PublicMemeObservedSourcePointRead
+    points: list[PublicMemeObservedSourcePointRead] = Field(default_factory=list)
+
+
+class PublicMemeWebExposureFunnelRead(BaseModel):
+    """Web exposure funnel using only distinct matched impression tokens."""
+
+    recorded_card_impressions: int = Field(default=0, ge=0)
+    attributed_impressions: int = Field(default=0, ge=0)
+    matched_detail_clicks: int = Field(default=0, ge=0)
+    matched_high_intent_actions: int = Field(default=0, ge=0)
+    detail_click_rate: float | None = Field(default=None, ge=0.0)
+    high_intent_rate: float | None = Field(default=None, ge=0.0)
+
+
+class PublicMemeInlineExposureFunnelRead(BaseModel):
+    """Telegram inline funnel using only distinct matched impression tokens."""
+
+    inline_results_served: int = Field(default=0, ge=0)
+    attributed_results_served: int = Field(default=0, ge=0)
+    matched_chosen: int = Field(default=0, ge=0)
+    matched_sent: int = Field(default=0, ge=0)
+    chosen_rate: float | None = Field(default=None, ge=0.0)
+    sent_rate: float | None = Field(default=None, ge=0.0)
+
+
+class PublicMemeExposureFunnelsRead(BaseModel):
+    """Separate web and Telegram-inline exposure funnels."""
+
+    web: PublicMemeWebExposureFunnelRead = Field(default_factory=PublicMemeWebExposureFunnelRead)
+    telegram_inline: PublicMemeInlineExposureFunnelRead = Field(
+        default_factory=PublicMemeInlineExposureFunnelRead,
+    )
+
+
+class PublicMemeChannelAudienceChangeRead(BaseModel):
+    """Known subscriber-count change without presenting summed subscribers as reach."""
+
+    total_channels: int = Field(default=0, ge=0)
+    current_known_channels: int = Field(default=0, ge=0)
+    comparable_channels: int = Field(default=0, ge=0)
+    net_known_subscriber_change: int | None = None
+
+
+class PublicMemeAnalyticsRead(BaseModel):
+    """Privacy-safe professional analytics for one visible public meme."""
+
+    meme_id: uuid.UUID
+    window: PublicMemeAnalyticsWindow
+    start_at: datetime
+    end_at: datetime
+    granularity: PublicMemeAnalyticsGranularity
+    history_start_at: datetime | None = None
+    history_end_at: datetime | None = None
+    refreshed_at: datetime
+    insufficient_history: bool = False
+    summary: PublicMemeAnalyticsSummaryRead = Field(default_factory=PublicMemeAnalyticsSummaryRead)
+    activity_points: list[PublicMemeActivityPointRead] = Field(default_factory=list)
+    observed_source: PublicMemeObservedSourceSeriesRead
+    source_performance: PublicMemeSourceSummaryRead = Field(default_factory=PublicMemeSourceSummaryRead)
+    audience_change: PublicMemeChannelAudienceChangeRead = Field(
+        default_factory=PublicMemeChannelAudienceChangeRead,
+    )
+    exposure_funnels: PublicMemeExposureFunnelsRead = Field(default_factory=PublicMemeExposureFunnelsRead)
+
+
 class PublicTrendAggregatePointRead(BaseModel):
     """One real aggregate trend point for public tag/template history."""
 
@@ -451,13 +722,38 @@ __all__ = [
     "MemeSearchResultRead",
     "MemeSearchScoreRead",
     "PublicMemeCardRead",
+    "PublicMemeActivityCountsRead",
+    "PublicMemeActivityPointRead",
+    "PublicMemeAnalyticsGranularity",
+    "PublicMemeAnalyticsMomentumRead",
+    "PublicMemeAnalyticsPeakRead",
+    "PublicMemeAnalyticsRead",
+    "PublicMemeAnalyticsSummaryRead",
+    "PublicMemeAnalyticsWindow",
+    "PublicMemeChannelAudienceChangeRead",
     "PublicMemeDetailRead",
+    "PublicMemeExposureFunnelsRead",
     "PublicMemeFileRead",
     "PublicMemeFileRenderRead",
+    "PublicMemeInlineExposureFunnelRead",
     "PublicMemeLandingRead",
+    "PublicMemeMetricCoverageRead",
     "PublicMemeOfTheDayRead",
+    "PublicMemeObservedSourcePointRead",
+    "PublicMemeObservedSourceSeriesRead",
     "PublicMemePopularityPointRead",
     "PublicMemePopularitySummaryRead",
+    "PublicMemeSourceAudienceRead",
+    "PublicMemeSourceAudienceSummaryRead",
+    "PublicMemeSourceCoverageRead",
+    "PublicMemeSourcePageRead",
+    "PublicMemeSourcePostRead",
+    "PublicMemeSourceRateRead",
+    "PublicMemeSourceRatesRead",
+    "PublicMemeSourceSort",
+    "PublicMemeSourceSummaryRead",
+    "PublicMemeSourceTotalsRead",
+    "PublicMemeWebExposureFunnelRead",
     "PublicTrendAggregatePointRead",
     "PublicTrendComparisonPointRead",
     "PublicTrendComparisonRead",

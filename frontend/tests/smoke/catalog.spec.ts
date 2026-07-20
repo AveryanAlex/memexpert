@@ -436,11 +436,13 @@ test.describe('public masonry feed smoke', () => {
     await expect(dialogContent).toHaveCount(0);
 
     await result.click();
-    await expect(page).toHaveURL(/\/memes\/smoke-test-cat-reaction$/);
+    await expect(page).toHaveURL(/\/memes\/smoke-test-cat-reaction(?:\?.*)?$/);
   });
 });
 
-test('search result opens detail with media and actions', async ({ page }) => {
+test('search result opens detail with media and actions', async ({ page, request }, testInfo) => {
+  const statsUrl = `http://127.0.0.1:${Number(testInfo.config.metadata.mockApiPort)}/__smoke/stats`;
+  const statsBeforeVisit = await readSmokeStats(request, statsUrl);
   await page.goto('/');
 
   const searchInput = page.getByLabel('Search memes');
@@ -451,10 +453,15 @@ test('search result opens detail with media and actions', async ({ page }) => {
 
   const result = page.getByRole('link', { name: 'Open Smoke test cat reaction' });
   await expect(result).toBeVisible();
+  await expect(result).toHaveAttribute('href', /attribution_impression_id=web_/);
   await result.click();
 
-  await expect(page).toHaveURL(/\/memes\/smoke-test-cat-reaction$/);
+  await expect(page).toHaveURL(/\/memes\/smoke-test-cat-reaction(?:\?.*)?$/);
+  expect(new URL(page.url()).searchParams.get('attribution_impression_id')).toMatch(/^web_/);
   await expect(page.getByRole('heading', { name: 'Smoke test cat reaction' })).toBeVisible();
+  await expect.poll(async () => (await readSmokeStats(request, statsUrl)).detailViewCount).toBe(
+    statsBeforeVisit.detailViewCount + 1
+  );
   await expect(page.getByRole('img', { name: 'Smoke test cat reaction' })).toBeVisible();
 
   await expect(page.getByRole('button', { name: 'Favorite (7)' })).toBeVisible();
@@ -467,6 +474,29 @@ test('search result opens detail with media and actions', async ({ page }) => {
   await expect(page.getByRole('menuitem', { name: 'Download', exact: true })).toBeVisible();
   await expect(page.getByRole('menuitem', { name: /Favorite meme|Remove favorite|Send to Telegram/ })).toHaveCount(0);
   await page.keyboard.press('Escape');
+
+  const insights = page.locator('details[data-meme-insights]');
+  await expect(insights).toBeVisible();
+  await insights.locator(':scope > summary').click();
+  await expect(insights.getByRole('link', { name: 'Smoke Memes Lab' })).toBeVisible();
+  await expect(insights.getByRole('link', { name: 'Open Telegram post' })).toHaveAttribute('href', 'https://t.me/smoke_memes_lab/42');
+  await expect(insights.getByText('Unknown', { exact: true }).first()).toBeVisible();
+
+  const professional = insights.locator('details').filter({ hasText: 'Professional analytics' });
+  await expect(professional).toBeVisible();
+  await professional.locator(':scope > summary').click();
+  await expect(professional.getByText('Recorded activity · signals per day')).toBeVisible();
+  await expect(professional.getByText('Exposure funnels')).toBeVisible();
+  await expect(professional.getByText('Telegram inline')).toBeVisible();
+
+  const statsBeforeRangeChange = await readSmokeStats(request, statsUrl);
+  await professional.getByRole('link', { name: '7 days' }).click();
+  await expect(page).toHaveURL(/activity_window=7d.*#meme-professional-analytics$/);
+  await expect(insights).toHaveAttribute('open', '');
+  await expect(professional).toHaveAttribute('open', '');
+  await expect(professional.getByText('Recorded activity · signals per day')).toBeVisible();
+  const statsAfterRangeChange = await readSmokeStats(request, statsUrl);
+  expect(statsAfterRangeChange.detailViewCount).toBe(statsBeforeRangeChange.detailViewCount);
 
   await page.getByRole('button', { name: 'Favorite (7)' }).click();
   await expect(page.getByText('Keep this save beyond this browser.')).toBeVisible();
@@ -520,6 +550,15 @@ async function disableIntersectionObserver(page: import('@playwright/test').Page
       }
     });
   });
+}
+
+async function readSmokeStats(
+  request: import('@playwright/test').APIRequestContext,
+  url: string
+): Promise<{ detailReadCount: number; detailViewCount: number }> {
+  const response = await request.get(url);
+  expect(response.ok()).toBe(true);
+  return response.json();
 }
 
 async function installMediaSpies(page: import('@playwright/test').Page) {

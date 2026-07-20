@@ -57,6 +57,7 @@ from memexpert.models.enums import (
     PipelineIngestRequestStatus,
     RecoveryCapability,
     SourceAttachReason,
+    SourceChannelAudienceCaptureReason,
     SourceChannelBackfillJobStatus,
     SourceChannelPostStatus,
     SourcePlatform,
@@ -124,6 +125,10 @@ from memexpert.services.content_merge import ContentMergeService
 from memexpert.services.engagement_read_model import load_derived_popularity_scores
 from memexpert.services.media_render_urls import MediaRenderUrlService
 from memexpert.services.meme_seo import MemeSeoGenerationService
+from memexpert.services.source_channel_audience import (
+    record_source_channel_audience_observation,
+    source_channel_audience_observation_from_count,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
@@ -978,7 +983,15 @@ class AdminService:
                 channel.catchup_message_limit = request.catchup_message_limit
                 channel.username = resolved.username
                 channel.title = resolved.title
-                channel.subscriber_count = resolved.subscriber_count
+
+            await record_source_channel_audience_observation(
+                self.session,
+                channel,
+                source_channel_audience_observation_from_count(resolved.subscriber_count),
+                capture_reason=SourceChannelAudienceCaptureReason.INITIAL_RESOLUTION,
+                telegram_session_id=locked_account.id,
+                advance_daily_schedule=True,
+            )
 
             suggestion: ChannelSuggestion | None = None
             if request.suggestion_id is not None:

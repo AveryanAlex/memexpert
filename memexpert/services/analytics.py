@@ -26,6 +26,7 @@ from memexpert.schemas.auth import (
     ProfileStatsTagRead,
     ProfileStatsTemplateRead,
 )
+from memexpert.services.meme_exposure import MemeExposureService
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -73,6 +74,18 @@ _MEME_REF_EVENT_TYPES = frozenset(
         AnalyticsEventType.MEME_SHARE,
         AnalyticsEventType.MEME_VIEW,
         AnalyticsEventType.SAVE,
+    }
+)
+_HIGH_INTENT_EXPOSURE_EVENT_TYPES = frozenset(
+    {
+        AnalyticsEventType.FAVORITE,
+        AnalyticsEventType.MEME_DOWNLOAD,
+        AnalyticsEventType.MEME_LIKE,
+        AnalyticsEventType.MEME_SAVE,
+        AnalyticsEventType.MEME_SEND,
+        AnalyticsEventType.MEME_SHARE,
+        AnalyticsEventType.SAVE,
+        AnalyticsEventType.SHARE,
     }
 )
 _PROFILE_VIEW_EVENT_TYPES = frozenset({AnalyticsEventType.MEME_VIEW, AnalyticsEventType.VIEW})
@@ -339,19 +352,77 @@ class AnalyticsService:
             source_algorithm=write.source_algorithm,
             surface=write.surface,
         )
+        occurred_at = _normalize_utc(write.occurred_at)
         analytics_event = AnalyticsEvent(
             user_id=write.user_id,
             event_type=write.event_type,
             payload=payload.model_dump(mode="json", exclude_none=True),
-            occurred_at=_normalize_utc(write.occurred_at),
+            occurred_at=occurred_at,
         )
         try:
             self._session.add(analytics_event)
+            await self._record_exposure_fact(write, occurred_at=occurred_at)
             await self._session.commit()
         except Exception:
             await self._session.rollback()
             raise
         return analytics_event
+
+    async def _record_exposure_fact(self, write: InteractionEventWrite, *, occurred_at: datetime) -> None:
+        """Project attributed exposure stages into an idempotent public-safe fact."""
+
+        meme_id = write.refs.meme_id
+        exposure_key = write.impression_id
+        if meme_id is None or exposure_key is None:
+            return
+        if await self._session.scalar(select(Meme.id).where(Meme.id == meme_id).limit(1)) is None:
+            # Strict analytics refs intentionally support events whose target
+            # has already been removed; the public exposure projection is
+            # narrower and only retains currently catalogued memes.
+            return
+
+        service = MemeExposureService(self._session, autocommit=False)
+        if write.event_type in (AnalyticsEventType.IMPRESSION, AnalyticsEventType.MEME_IMPRESSION):
+            await service.record_web_exposure(
+                meme_id=meme_id,
+                exposure_key=exposure_key,
+                occurred_at=occurred_at,
+            )
+            return
+        if write.event_type in (AnalyticsEventType.CLICK, AnalyticsEventType.MEME_DETAIL_CLICK):
+            await service.record_web_detail_click(
+                meme_id=meme_id,
+                exposure_key=exposure_key,
+                occurred_at=occurred_at,
+            )
+            return
+        if write.event_type is AnalyticsEventType.INLINE_SERVED:
+            await service.record_inline_exposure(
+                meme_id=meme_id,
+                exposure_key=exposure_key,
+                occurred_at=occurred_at,
+            )
+            return
+        if write.event_type is AnalyticsEventType.INLINE_CHOSEN:
+            await service.record_inline_chosen(
+                meme_id=meme_id,
+                exposure_key=exposure_key,
+                occurred_at=occurred_at,
+            )
+            return
+        if write.event_type is AnalyticsEventType.INLINE_SENT:
+            await service.record_inline_sent(
+                meme_id=meme_id,
+                exposure_key=exposure_key,
+                occurred_at=occurred_at,
+            )
+            return
+        if write.event_type in _HIGH_INTENT_EXPOSURE_EVENT_TYPES and not write.surface.startswith("telegram_inline"):
+            await service.record_web_high_intent_action(
+                meme_id=meme_id,
+                exposure_key=exposure_key,
+                occurred_at=occurred_at,
+            )
 
     async def record_interaction_event_best_effort(
         self,

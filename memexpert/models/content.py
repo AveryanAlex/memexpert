@@ -42,6 +42,8 @@ from memexpert.models.enums import (
     PipelineIngestRequestStatus,
     RabbitMQOutboxMessageStatus,
     SourceAttachReason,
+    SourceChannelAudienceCaptureReason,
+    SourceChannelAudienceFetchStatus,
     SourceChannelBackfillJobStatus,
     SourceChannelPostStatus,
     SourceEngagementCaptureReason,
@@ -979,6 +981,10 @@ class SourceChannel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "source_channels"
     __table_args__ = (
         UniqueConstraint("platform", "platform_id", name="uq_source_channels_platform_platform_id"),
+        CheckConstraint(
+            "audience_capture_attempt_count >= 0",
+            name="source_channels_audience_capture_attempt_count_non_negative",
+        ),
         Index("ix_source_channels_is_active_platform", "is_active", "platform"),
         Index("ix_source_channels_telegram_session_id", "telegram_session_id"),
         Index(
@@ -993,6 +999,12 @@ class SourceChannel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             "telegram_session_id",
             "engagement_enabled",
         ),
+        Index(
+            "ix_source_channels_session_audience_due",
+            "telegram_session_id",
+            "next_audience_capture_at",
+            "audience_capture_locked_at",
+        ),
     )
 
     platform: Mapped[SourcePlatform] = mapped_column(
@@ -1003,6 +1015,17 @@ class SourceChannel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     username: Mapped[str | None] = mapped_column(String(255), nullable=True)
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     subscriber_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # ``subscriber_count`` is a latest-success cache only. These timestamps
+    # keep scheduling/observability state separate from the immutable audience
+    # observation rows below; failed or not-exposed captures never clear the
+    # last known cache.
+    subscriber_count_updated_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    last_audience_capture_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    next_audience_capture_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    audience_capture_locked_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    audience_capture_lock_owner: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    audience_capture_attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_audience_error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
     is_active: Mapped[bool] = mapped_column(default=True, nullable=False)
     last_read_post_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     telegram_session_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -1051,6 +1074,12 @@ class SourceChannel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         cascade="all, delete-orphan",
         passive_deletes=True,
     )
+    audience_snapshots: Mapped[list["SourceChannelAudienceSnapshot"]] = relationship(
+        "SourceChannelAudienceSnapshot",
+        back_populates="source_channel",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
     backfill_jobs: Mapped[list["SourceChannelBackfillJob"]] = relationship(
         "SourceChannelBackfillJob",
         back_populates="source_channel",
@@ -1066,6 +1095,72 @@ class SourceChannel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         if telegram_session is None:
             return None
         return telegram_session.name
+
+
+class SourceChannelAudienceSnapshot(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """Daily or opportunistic Telegram channel audience observation."""
+
+    __tablename__ = "source_channel_audience_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_channel_id",
+            "capture_slot",
+            "capture_reason",
+            name="uq_source_channel_audience_snapshots_channel_slot_reason",
+        ),
+        CheckConstraint(
+            "subscriber_count IS NULL OR subscriber_count >= 0",
+            name="source_channel_audience_snapshots_subscriber_count_non_negative",
+        ),
+        CheckConstraint(
+            "(fetch_status = 'success') = (subscriber_count IS NOT NULL)",
+            name="status_count",
+        ),
+        Index(
+            "ix_source_channel_audience_snapshots_slot_status",
+            "capture_slot",
+            "fetch_status",
+        ),
+        Index(
+            "ix_source_channel_audience_snapshots_session_captured",
+            "telegram_session_id",
+            "captured_at",
+        ),
+    )
+
+    source_channel_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("source_channels.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    telegram_session_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("telegram_sessions.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    captured_at: Mapped[datetime] = mapped_column(default=utcnow, nullable=False)
+    capture_slot: Mapped[date] = mapped_column(Date, nullable=False)
+    capture_reason: Mapped[SourceChannelAudienceCaptureReason] = mapped_column(
+        string_enum(SourceChannelAudienceCaptureReason),
+        nullable=False,
+    )
+    fetch_status: Mapped[SourceChannelAudienceFetchStatus] = mapped_column(
+        string_enum(SourceChannelAudienceFetchStatus),
+        nullable=False,
+    )
+    subscriber_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    source_channel: Mapped["SourceChannel"] = relationship(
+        "SourceChannel",
+        back_populates="audience_snapshots",
+    )
+    telegram_session: Mapped["TelegramSession | None"] = relationship("TelegramSession")
+
+
+Index(
+    "ix_source_channel_audience_snapshots_channel_captured_desc",
+    SourceChannelAudienceSnapshot.__table__.c.source_channel_id,
+    SourceChannelAudienceSnapshot.__table__.c.captured_at.desc(),
+)
 
 
 class SourceChannelPost(UUIDPrimaryKeyMixin, TimestampMixin, Base):

@@ -5,7 +5,7 @@ import type {
   PublicMemeSearchPageRead,
   PublicMemeSearchResultRead
 } from '$lib/api/types';
-import { memeDownloadUrl, memeTitle } from '$lib/memeActions';
+import { memeDownloadUrl } from '$lib/memeActions';
 
 export type MemeDetailRelatedSource =
   | { kind: 'similar'; page: PublicMemeSearchPageRead }
@@ -20,7 +20,8 @@ export interface MemeDetailRelatedItem {
 
 export interface MemeDetailViewModel {
   title: string;
-  description: string | null;
+  metaDescription: string | null;
+  leadDescription: string | null;
   bodyText: string | null;
   detectedText: string | null;
   fileCount: number;
@@ -43,12 +44,20 @@ export interface MemeDetailRelatedDiscovery {
 export function buildMemeDetailView(meme: PublicMemeDetailRead): MemeDetailViewModel {
   const fileCount = meme.files.length || (meme.primary_file ? 1 : 0);
   const primaryFileFacts = fileFacts(meme.primary_file);
+  const title = firstText(meme.seo_title, meme.caption, meme.tags[0]) ?? 'Meme detail';
+  const displayed = new Set<string>();
+  rememberText(displayed, title);
+  const metaDescription = firstText(meme.seo_description, meme.caption, meme.ocr_text);
+  const leadDescription = firstDistinctText(displayed, meme.seo_description, meme.caption);
+  const bodyText = firstDistinctText(displayed, meme.seo_body_text);
+  const detectedText = firstDistinctText(displayed, meme.ocr_text);
 
   return {
-    title: memeTitle(meme) === 'Untitled meme' ? 'Meme detail' : memeTitle(meme),
-    description: firstText(meme.seo_description, meme.caption, meme.ocr_text),
-    bodyText: firstText(meme.seo_body_text),
-    detectedText: firstText(meme.ocr_text),
+    title,
+    metaDescription,
+    leadDescription,
+    bodyText,
+    detectedText,
     fileCount,
     scoreLabel: meme.popularity_score.toFixed(1),
     mediaFacts: [meme.media_type, meme.language, `${meme.like_count} likes`, `${fileCount} ${fileCount === 1 ? 'file' : 'files'}`],
@@ -176,4 +185,33 @@ function firstText(...values: Array<string | null | undefined>): string | null {
     if (trimmed) return trimmed;
   }
   return null;
+}
+
+function firstDistinctText(
+  displayed: Set<string>,
+  ...values: Array<string | null | undefined>
+): string | null {
+  for (const value of values) {
+    const trimmed = value?.trim();
+    if (!trimmed) continue;
+    const normalized = normalizeMemeDisplayText(trimmed);
+    if (!normalized || displayed.has(normalized)) continue;
+    displayed.add(normalized);
+    return trimmed;
+  }
+  return null;
+}
+
+function rememberText(displayed: Set<string>, value: string | null | undefined): void {
+  const normalized = normalizeMemeDisplayText(value);
+  if (normalized) displayed.add(normalized);
+}
+
+/**
+ * Best-effort deterministic fold for visible-text deduplication. ECMAScript's
+ * `toLowerCase()` uses Unicode default casing and does not depend on the host
+ * locale; it is intentionally not presented as full Unicode case folding.
+ */
+export function normalizeMemeDisplayText(value: string | null | undefined): string {
+  return value?.normalize('NFKC').trim().replace(/\s+/gu, ' ').toLowerCase() ?? '';
 }

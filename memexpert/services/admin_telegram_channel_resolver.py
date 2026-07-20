@@ -125,7 +125,8 @@ async def resolve_admin_telegram_channel(
                 raise AdminTelegramChannelResolverError("Only public Telegram channels with a handle are supported.")
             if not isinstance(title, str) or not title.strip():
                 title = username
-            subscriber_count = getattr(entity, "participants_count", None)
+            full_channel = await client(_telegram_full_channel_request(entity))
+            subscriber_count = getattr(getattr(full_channel, "full_chat", None), "participants_count", None)
             normalized_subscriber_count = (
                 subscriber_count if isinstance(subscriber_count, int) and subscriber_count >= 0 else None
             )
@@ -202,6 +203,13 @@ def _telegram_channel_type() -> type[object]:
     from telethon.tl.types import Channel  # noqa: PLC0415
 
     return Channel
+
+
+def _telegram_full_channel_request(entity: object) -> object:
+    from telethon.tl.functions.channels import GetFullChannelRequest  # noqa: PLC0415
+    from telethon.utils import get_input_channel  # noqa: PLC0415
+
+    return GetFullChannelRequest(channel=get_input_channel(entity))
 
 
 __all__ = [

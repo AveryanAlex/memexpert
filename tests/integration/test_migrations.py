@@ -1119,3 +1119,217 @@ async def test_0037_adds_versioned_telegram_post_metadata(
             ).scalars()
         )
     assert remaining_metadata_columns == set()
+
+
+async def test_0038_adds_audience_schedule_without_synthetic_history(
+    empty_public_schema: tuple[AsyncEngine, str],
+) -> None:
+    engine, database_url = empty_public_schema
+    config = _build_alembic_config(database_url)
+    telegram_session_id = uuid.uuid7()
+    source_channel_id = uuid.uuid7()
+
+    await _run_alembic_command(command.upgrade, config, "0037")
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                """
+                INSERT INTO telegram_sessions (id, name, display_name, status, enabled)
+                VALUES (:session_id, 'audience-session', 'Audience session', 'active', true)
+                """
+            ),
+            {"session_id": telegram_session_id},
+        )
+        await connection.execute(
+            text(
+                """
+                INSERT INTO source_channels (
+                    id, platform, platform_id, title, subscriber_count,
+                    is_active, telegram_session_id
+                ) VALUES (
+                    :channel_id, 'telegram', 'audience_channel', 'Audience channel',
+                    1234, true, :session_id
+                )
+                """
+            ),
+            {"channel_id": source_channel_id, "session_id": telegram_session_id},
+        )
+
+    await _run_alembic_command(command.upgrade, config, "0038")
+
+    async with engine.connect() as connection:
+        channel_state = (
+            await connection.execute(
+                text(
+                    """
+                    SELECT subscriber_count,
+                           subscriber_count_updated_at,
+                           next_audience_capture_at,
+                           audience_capture_attempt_count
+                    FROM source_channels
+                    WHERE id = :channel_id
+                    """
+                ),
+                {"channel_id": source_channel_id},
+            )
+        ).one()
+        snapshot_count = await connection.scalar(
+            text("SELECT count(*) FROM source_channel_audience_snapshots")
+        )
+        status_count_constraint = await connection.scalar(
+            text(
+                """
+                SELECT pg_get_constraintdef(oid)
+                FROM pg_constraint
+                WHERE conname = 'ck_source_channel_audience_snapshots_status_count'
+                """
+            )
+        )
+
+    assert channel_state.subscriber_count == 1234
+    assert channel_state.subscriber_count_updated_at is None
+    assert channel_state.next_audience_capture_at is not None
+    assert channel_state.audience_capture_attempt_count == 0
+    assert snapshot_count == 0
+    assert status_count_constraint is not None
+    assert "fetch_status" in status_count_constraint
+    assert "subscriber_count IS NOT NULL" in status_count_constraint
+
+    await _run_alembic_command(command.downgrade, config, "0037")
+    assert "source_channel_audience_snapshots" not in await _get_table_names(engine)
+
+
+async def test_0040_rebuilds_all_public_trend_views_with_high_water_send_semantics(
+    empty_public_schema: tuple[AsyncEngine, str],
+) -> None:
+    engine, database_url = empty_public_schema
+    config = _build_alembic_config(database_url)
+    expected_views = {
+        "public_meme_trends_mv",
+        "public_tag_trends_mv",
+        "public_template_trends_mv",
+        "public_tag_trend_points_mv",
+        "public_template_trend_points_mv",
+    }
+    directly_aggregated_views = {
+        "public_meme_trends_mv",
+        "public_tag_trend_points_mv",
+        "public_template_trend_points_mv",
+    }
+
+    await _run_alembic_command(command.upgrade, config, "0039")
+    await _run_alembic_command(command.upgrade, config, "0040")
+
+
+    assert expected_views <= await _get_materialized_view_names(engine)
+    async with engine.connect() as connection:
+        corrected_definitions = {
+            view_name: cast(
+                "str",
+                await connection.scalar(
+                    text("SELECT pg_get_viewdef(CAST(:view_name AS regclass), true)"),
+                    {"view_name": view_name},
+                ),
+            )
+            for view_name in directly_aggregated_views
+        }
+        corrected_fastest_rising_index = cast(
+            "str",
+            await connection.scalar(
+                text(
+                    """
+                    SELECT indexdef
+                    FROM pg_indexes
+                    WHERE schemaname = current_schema()
+                      AND indexname = 'ix_public_meme_trends_mv_fastest_rising'
+                    """
+                )
+            ),
+        )
+    for definition in corrected_definitions.values():
+        assert "ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING" in definition
+        assert "inline_sent" not in definition
+    assert "download" not in corrected_fastest_rising_index
+    corrected_meme_definition = corrected_definitions["public_meme_trends_mv"]
+    assert "COALESCE(ec.download_count_24h, 0) * 2" not in corrected_meme_definition
+    assert "COALESCE(ec.recent_download_count, 0) * 2" not in corrected_meme_definition
+    assert "COALESCE(ec.previous_download_count, 0) * 2" not in corrected_meme_definition
+
+    await _run_alembic_command(command.downgrade, config, "0039")
+    assert expected_views <= await _get_materialized_view_names(engine)
+    async with engine.connect() as connection:
+        legacy_definition = cast(
+            "str",
+            await connection.scalar(
+                text("SELECT pg_get_viewdef('public_meme_trends_mv'::regclass, true)")
+            ),
+        )
+        legacy_fastest_rising_index = cast(
+            "str",
+            await connection.scalar(
+                text(
+                    """
+                    SELECT indexdef
+                    FROM pg_indexes
+                    WHERE schemaname = current_schema()
+                      AND indexname = 'ix_public_meme_trends_mv_fastest_rising'
+                    """
+                )
+            ),
+        )
+    assert "lag(" in legacy_definition
+    assert "inline_sent" in legacy_definition
+    assert "COALESCE(ec.download_count_24h, 0) * 2" in legacy_definition
+    assert "download" in legacy_fastest_rising_index
+
+    await _run_alembic_command(command.upgrade, config, "0040")
+
+
+async def test_0041_indexes_both_public_meme_analytics_reference_shapes(
+    empty_public_schema: tuple[AsyncEngine, str],
+) -> None:
+    engine, database_url = empty_public_schema
+    config = _build_alembic_config(database_url)
+    expected_indexes = {
+        "ix_analytics_events_refs_meme_event_occurred",
+        "ix_analytics_events_legacy_meme_event_occurred",
+    }
+
+    await _run_alembic_command(command.upgrade, config, "0041")
+    async with engine.connect() as connection:
+        rows = (
+            await connection.execute(
+                text(
+                    """
+                    SELECT indexname, indexdef
+                    FROM pg_indexes
+                    WHERE schemaname = current_schema()
+                      AND indexname = ANY(:index_names)
+                    """
+                ),
+                {"index_names": sorted(expected_indexes)},
+            )
+        ).all()
+
+    definitions = {row.indexname: row.indexdef for row in rows}
+    assert definitions.keys() == expected_indexes
+    for definition in definitions.values():
+        assert "payload" in definition
+        assert "meme_id" in definition
+        assert "event_type" in definition
+        assert "occurred_at" in definition
+
+    await _run_alembic_command(command.downgrade, config, "0040")
+    async with engine.connect() as connection:
+        remaining = await connection.scalar(
+            text(
+                """
+                SELECT count(*)
+                FROM pg_indexes
+                WHERE schemaname = current_schema()
+                  AND indexname = ANY(:index_names)
+                """
+            ),
+            {"index_names": sorted(expected_indexes)},
+        )
+    assert remaining == 0

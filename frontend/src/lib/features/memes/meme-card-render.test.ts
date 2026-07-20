@@ -1,7 +1,7 @@
 import { render } from 'svelte/server';
 import { describe, expect, it } from 'vitest';
 
-import type { PublicMemeCardRead } from '$lib/api/types';
+import type { MemeResultAttributionRead, PublicMemeCardRead } from '$lib/api/types';
 import MemeCard from './MemeCard.svelte';
 import MemeGrid from './MemeGrid.svelte';
 
@@ -94,6 +94,23 @@ describe('MemeCard', () => {
     expect(body).not.toContain('Send to Telegram');
   });
 
+  it('does not emit generated fallback exposure IDs before client hydration', () => {
+    const { body } = render(MemeCard, { props: { meme: memeCard() } });
+
+    expect(body).not.toContain('data-exposure-id');
+    expect(body).not.toContain('attribution_impression_id');
+    expect(body).not.toMatch(/web_[a-z0-9_]+/);
+  });
+
+  it('preserves backend exposure IDs in SSR links and card data', () => {
+    const { body } = render(MemeCard, {
+      props: { meme: memeCard(), attribution: resultAttribution('imp_API_Exact-1') }
+    });
+
+    expect(body).toContain('data-exposure-id="imp_API_Exact-1"');
+    expect(body).toContain('attribution_impression_id=imp_API_Exact-1');
+  });
+
   it('only renders shared/private visibility badges when explicitly enabled', () => {
     const hiddenShared = render(MemeCard, { props: { meme: memeCard({ viewer_access: { visibility: 'shared' } }) } });
     const shared = render(MemeCard, { props: { meme: memeCard({ viewer_access: { visibility: 'shared' } }), showAccessMarkers: true } });
@@ -158,5 +175,31 @@ function memeCard(overrides: Partial<PublicMemeCardRead> = {}): PublicMemeCardRe
     created_at: '2026-01-01T00:00:00Z',
     updated_at: '2026-01-01T00:00:00Z',
     ...overrides
+  };
+}
+
+function resultAttribution(impressionId: string): MemeResultAttributionRead {
+  return {
+    request_id: 'req-card',
+    impression_id: impressionId,
+    surface: 'web_search',
+    source_algorithm: 'search',
+    rank: 1,
+    query: null,
+    filters: {
+      language: null,
+      media_type: null,
+      include_nsfw: false,
+      tags: [],
+      scope: null,
+      collection_ids: []
+    },
+    collection_scope: null,
+    collection_ids: [],
+    source_meme_id: null,
+    algorithm_version: 'test-v1',
+    score: null,
+    score_components: {},
+    reason: null
   };
 }

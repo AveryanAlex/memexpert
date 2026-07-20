@@ -96,6 +96,18 @@ class RawTelegramChannel:
     subscriber_count: int | None
 
 
+@dataclass(frozen=True, slots=True)
+class RawTelegramChannelAudience:
+    """Typed projection returned by Telegram ``channels.getFullChannel``.
+
+    ``subscriber_count=None`` means Telegram did not expose the participant
+    count. A known zero is preserved as a valid successful observation.
+    """
+
+    channel_id: str
+    subscriber_count: int | None
+
+
 @dataclass(frozen=True, slots=True, init=False)
 class RawTelegramMessage:
     """Typed adapter-level projection of one Telegram channel message.
@@ -251,6 +263,9 @@ class PipelineTelegramClientProtocol(Protocol):
     async def resolve_channel(self, username_or_id: str) -> RawTelegramChannel:
         """Resolve a human-friendly channel identifier into its typed projection."""
 
+    async def fetch_channel_audience(self, channel_id: str) -> RawTelegramChannelAudience:
+        """Fetch the channel's current audience through ``channels.getFullChannel``."""
+
     async def fetch_single_message(
         self,
         *,
@@ -345,6 +360,7 @@ class FakeTelegramClient:
 
     canned_messages: dict[str, list[RawTelegramMessage]] = field(default_factory=dict)
     canned_channels: dict[str, RawTelegramChannel] = field(default_factory=dict)
+    canned_channel_audiences: dict[str, RawTelegramChannelAudience] = field(default_factory=dict)
     media_by_message: dict[str, bytes] = field(default_factory=dict)
     live_messages: dict[str, list[RawTelegramMessage]] = field(default_factory=dict)
     live_events: list[TelegramLiveEvent] = field(default_factory=list)
@@ -355,6 +371,7 @@ class FakeTelegramClient:
     # tripping ``next_error`` pinning on other methods.
     download_errors: dict[str, PipelineTelegramError] = field(default_factory=dict)
     downloaded_message_ids: list[str] = field(default_factory=list)
+    audience_fetch_channel_ids: list[str] = field(default_factory=list)
     closed: bool = False
 
     def pin_single_message(
@@ -488,6 +505,22 @@ class FakeTelegramClient:
                 f"FakeTelegramClient has no canned channel for {username_or_id!r}.",
             ) from exc
 
+    async def fetch_channel_audience(self, channel_id: str) -> RawTelegramChannelAudience:
+        self._consume_pinned_error()
+        self.audience_fetch_channel_ids.append(channel_id)
+        audience = self.canned_channel_audiences.get(channel_id)
+        if audience is not None:
+            return audience
+        channel = self.canned_channels.get(channel_id)
+        if channel is not None:
+            return RawTelegramChannelAudience(
+                channel_id=channel.channel_id,
+                subscriber_count=channel.subscriber_count,
+            )
+        raise PipelineTelegramMalformedMessageError(
+            f"FakeTelegramClient has no canned channel audience for {channel_id!r}.",
+        )
+
     async def fetch_single_message(
         self,
         *,
@@ -519,6 +552,7 @@ __all__ = [
     "PipelineTelegramSessionBannedError",
     "PipelineTelegramSessionNotRunnableError",
     "RawTelegramChannel",
+    "RawTelegramChannelAudience",
     "RawTelegramMessage",
     "TelegramLiveEvent",
     "TelegramMessageEditedEvent",

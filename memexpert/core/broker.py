@@ -34,6 +34,7 @@ class PipelineBrokerSettings:
     routing_key_prefix: str
     media_inspect_queue: str
     source_engagement_capture_queue: str
+    source_channel_audience_capture_queue: str
     transcode_queue: str
     ocr_queue: str
     embed_queue: str
@@ -126,6 +127,41 @@ class PipelineBrokerSettings:
             f"{self.source_engagement_capture_retry_routing_key}."
             f"{self._normalize_source_engagement_session_key(session_key)}"
         )
+
+    @property
+    def source_channel_audience_capture_routing_key(self) -> str:
+        """Return the channel-audience routing-key prefix before the session suffix."""
+
+        return f"{self.routing_key_prefix}.source_channel_audience_capture"
+
+    def source_channel_audience_capture_queue_for_session(self, session_key: str) -> str:
+        """Return the stable audience main queue name for one Telegram session."""
+
+        normalized = self._normalize_source_engagement_session_key(session_key)
+        return f"{self.source_channel_audience_capture_queue}.{normalized}"
+
+    def source_channel_audience_capture_retry_queue_for_session(self, session_key: str) -> str:
+        """Return the stable audience retry queue name for one Telegram session."""
+
+        return f"{self.source_channel_audience_capture_queue_for_session(session_key)}.retry"
+
+    def source_channel_audience_capture_binding_key_for_session(self, session_key: str) -> str:
+        """Return the audience main queue binding key for one Telegram session."""
+
+        normalized = self._normalize_source_engagement_session_key(session_key)
+        return f"{self.source_channel_audience_capture_routing_key}.{normalized}"
+
+    def source_channel_audience_capture_retry_request_routing_key_for_session(self, session_key: str) -> str:
+        """Return the retry-exchange audience key for one Telegram session."""
+
+        normalized = self._normalize_source_engagement_session_key(session_key)
+        return f"{self.routing_key_prefix}.retry.source_channel_audience_capture.{normalized}"
+
+    def source_channel_audience_capture_retry_routing_key_for_session(self, session_key: str) -> str:
+        """Return the main-exchange audience retry return key for one session."""
+
+        normalized = self._normalize_source_engagement_session_key(session_key)
+        return f"{self.routing_key_prefix}.source_channel_audience_capture_retry.{normalized}"
 
     @property
     def transcode_routing_key(self) -> str:
@@ -363,6 +399,10 @@ def get_pipeline_broker_settings(settings: Settings | None = None) -> PipelineBr
             resolved_settings.pipeline_broker_source_engagement_capture_queue,
             field_name="pipeline_broker_source_engagement_capture_queue",
         ),
+        source_channel_audience_capture_queue=_normalize_topology_name(
+            resolved_settings.pipeline_broker_source_channel_audience_capture_queue,
+            field_name="pipeline_broker_source_channel_audience_capture_queue",
+        ),
         transcode_queue=_normalize_topology_name(
             resolved_settings.pipeline_broker_transcode_queue,
             field_name="pipeline_broker_transcode_queue",
@@ -515,6 +555,7 @@ async def verify_pipeline_broker(
                     },
                 )
                 source_engagement_capture_queues = []
+                source_channel_audience_capture_queues = []
                 for session_key in source_engagement_session_keys:
                     source_engagement_capture_queues.append(
                         await channel.declare_queue(
@@ -525,6 +566,21 @@ async def verify_pipeline_broker(
                                 "x-dead-letter-exchange": broker_settings.retry_exchange,
                                 "x-dead-letter-routing-key": (
                                     broker_settings.source_engagement_capture_retry_request_routing_key_for_session(
+                                        session_key,
+                                    )
+                                ),
+                            },
+                        )
+                    )
+                    source_channel_audience_capture_queues.append(
+                        await channel.declare_queue(
+                            broker_settings.source_channel_audience_capture_queue_for_session(session_key),
+                            durable=True,
+                            arguments={
+                                "x-single-active-consumer": True,
+                                "x-dead-letter-exchange": broker_settings.retry_exchange,
+                                "x-dead-letter-routing-key": (
+                                    broker_settings.source_channel_audience_capture_retry_request_routing_key_for_session(
                                         session_key,
                                     )
                                 ),
@@ -558,6 +614,7 @@ async def verify_pipeline_broker(
                     },
                 )
                 source_engagement_capture_retry_queues = []
+                source_channel_audience_capture_retry_queues = []
                 for session_key in source_engagement_session_keys:
                     source_engagement_capture_retry_queues.append(
                         await channel.declare_queue(
@@ -568,6 +625,21 @@ async def verify_pipeline_broker(
                                 "x-dead-letter-exchange": broker_settings.exchange,
                                 "x-dead-letter-routing-key": (
                                     broker_settings.source_engagement_capture_retry_routing_key_for_session(session_key)
+                                ),
+                            },
+                        )
+                    )
+                    source_channel_audience_capture_retry_queues.append(
+                        await channel.declare_queue(
+                            broker_settings.source_channel_audience_capture_retry_queue_for_session(session_key),
+                            durable=True,
+                            arguments={
+                                "x-message-ttl": broker_settings.retry_backoff_milliseconds,
+                                "x-dead-letter-exchange": broker_settings.exchange,
+                                "x-dead-letter-routing-key": (
+                                    broker_settings.source_channel_audience_capture_retry_routing_key_for_session(
+                                        session_key,
+                                    )
                                 ),
                             },
                         )
@@ -594,6 +666,23 @@ async def verify_pipeline_broker(
                         exchange,
                         routing_key=broker_settings.source_engagement_capture_retry_routing_key_for_session(session_key),
                     )
+                for audience_capture_queue, session_key in zip(
+                    source_channel_audience_capture_queues,
+                    source_engagement_session_keys,
+                    strict=True,
+                ):
+                    _ = await audience_capture_queue.bind(
+                        exchange,
+                        routing_key=broker_settings.source_channel_audience_capture_binding_key_for_session(
+                            session_key,
+                        ),
+                    )
+                    _ = await audience_capture_queue.bind(
+                        exchange,
+                        routing_key=broker_settings.source_channel_audience_capture_retry_routing_key_for_session(
+                            session_key,
+                        ),
+                    )
                 _ = await transcode_queue.bind(exchange, routing_key=broker_settings.meme_created_routing_key)
                 _ = await transcode_queue.bind(exchange, routing_key=broker_settings.stage_replay_routing_key)
                 _ = await transcode_queue.bind(exchange, routing_key=broker_settings.transcode_retry_routing_key)
@@ -610,6 +699,19 @@ async def verify_pipeline_broker(
                         retry_exchange,
                         routing_key=broker_settings.source_engagement_capture_retry_request_routing_key_for_session(
                             session_key,
+                        ),
+                    )
+                for audience_retry_queue, session_key in zip(
+                    source_channel_audience_capture_retry_queues,
+                    source_engagement_session_keys,
+                    strict=True,
+                ):
+                    _ = await audience_retry_queue.bind(
+                        retry_exchange,
+                        routing_key=(
+                            broker_settings.source_channel_audience_capture_retry_request_routing_key_for_session(
+                                session_key,
+                            )
                         ),
                     )
                 _ = await retry_queue.bind(retry_exchange, routing_key=broker_settings.retry_routing_key)

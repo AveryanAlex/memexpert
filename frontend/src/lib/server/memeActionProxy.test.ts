@@ -113,7 +113,7 @@ describe('meme action proxy', () => {
     }) satisfies ProxyFetch;
     const body = { attribution: { request_id: 'req-list', impression_id: 'imp-list', rank: 3 } };
 
-    for (const action of ['impression', 'detail-click'] as const) {
+    for (const action of ['impression', 'detail-click', 'view'] as const) {
       const response = await proxyMemeAction({
         fetch: mockFetch,
         request: new Request(`https://web.memexpert.test/api/v1/memes/meme-123/${action}`, {
@@ -131,7 +131,8 @@ describe('meme action proxy', () => {
 
     expect(calls).toEqual([
       { path: '/api/v1/memes/meme-123/impression', body, contentType: 'application/json' },
-      { path: '/api/v1/memes/meme-123/detail-click', body, contentType: 'application/json' }
+      { path: '/api/v1/memes/meme-123/detail-click', body, contentType: 'application/json' },
+      { path: '/api/v1/memes/meme-123/view', body, contentType: 'application/json' }
     ]);
   });
 });

@@ -58,7 +58,7 @@ type PublicTrendTimelineGranularity = Literal["month", "year"]
 
 MAX_COMPARE_ITEMS = 6
 TIMELINE_TOP_MEMES_PER_PERIOD = 5
-PUBLIC_TRENDS_ALGORITHM_VERSION = "public_trends_mv_v1"
+PUBLIC_TRENDS_ALGORITHM_VERSION = "public_trends_mv_v2"
 
 
 class PublicTrendsService:
@@ -350,7 +350,7 @@ class PublicTrendsService:
         resolved_granularity = granularity if granularity in ("month", "year") else "month"
         resolved_limit = _clamp_limit(limit)
         resolved_offset = max(0, offset)
-        period_expr = f"date_trunc('{resolved_granularity}', d.captured_at)"
+        period_expr = f"date_trunc('{resolved_granularity}', d.captured_at, 'UTC')"
         total = await self._session.scalar(
             _meme_daily_points_text(
                 f"""
@@ -741,14 +741,12 @@ def _ranking_order_sql(ranking: PublicTrendRanking) -> str:
                     + mt.recent_send_count * 3
                     + mt.recent_like_count * 5
                     + mt.recent_save_count * 4
-                    + mt.recent_download_count * 2
                 )
                 - (
                     mt.previous_view_count
                     + mt.previous_send_count * 3
                     + mt.previous_like_count * 5
                     + mt.previous_save_count * 4
-                    + mt.previous_download_count * 2
                 )
             ) DESC,
             mt.trending_score DESC,
@@ -833,7 +831,6 @@ safe_events AS (
         'meme_send',
         'share',
         'meme_share',
-        'inline_sent',
         'meme_like',
         'favorite',
         'meme_save',
@@ -843,10 +840,10 @@ safe_events AS (
 event_daily AS (
     SELECT
         se.meme_id,
-        date_trunc('day', se.occurred_at) AS captured_at,
+        date_trunc('day', se.occurred_at, 'UTC') AS captured_at,
         count(*) FILTER (WHERE se.event_type IN ('meme_view', 'view'))::integer AS platform_views,
         count(*) FILTER (
-            WHERE se.event_type IN ('meme_send', 'share', 'meme_share', 'inline_sent')
+            WHERE se.event_type IN ('meme_send', 'share', 'meme_share')
         )::integer AS platform_sends,
         count(*) FILTER (WHERE se.event_type IN ('meme_save', 'save'))::integer AS platform_saves,
         count(*) FILTER (WHERE se.event_type IN ('meme_like', 'favorite'))::integer AS platform_likes
@@ -854,7 +851,7 @@ event_daily AS (
     LEFT JOIN requested r ON r.meme_id = se.meme_id
     WHERE se.meme_id IS NOT NULL
       AND (:meme_id_count = 0 OR r.meme_id IS NOT NULL)
-    GROUP BY se.meme_id, date_trunc('day', se.occurred_at)
+    GROUP BY se.meme_id, date_trunc('day', se.occurred_at, 'UTC')
 ),
 successful_source_snapshots AS (
     SELECT
@@ -865,18 +862,21 @@ successful_source_snapshots AS (
         ses.view_count,
         ses.reaction_count,
         ses.forward_count,
-        lag(ses.view_count) OVER (
+        max(ses.view_count) OVER (
             PARTITION BY ses.meme_source_id
             ORDER BY ses.captured_at, ses.id
-        ) AS previous_view_count,
-        lag(ses.reaction_count) OVER (
+            ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+        ) AS previous_view_high,
+        max(ses.reaction_count) OVER (
             PARTITION BY ses.meme_source_id
             ORDER BY ses.captured_at, ses.id
-        ) AS previous_reaction_count,
-        lag(ses.forward_count) OVER (
+            ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+        ) AS previous_reaction_high,
+        max(ses.forward_count) OVER (
             PARTITION BY ses.meme_source_id
             ORDER BY ses.captured_at, ses.id
-        ) AS previous_forward_count
+            ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+        ) AS previous_forward_high
     FROM meme_source_engagement_snapshots ses
     JOIN meme_sources ms ON ms.id = ses.meme_source_id
     JOIN meme_files mf ON mf.id = ms.file_id
@@ -887,28 +887,28 @@ successful_source_snapshots AS (
 source_daily AS (
     SELECT
         meme_id,
-        date_trunc('day', captured_at) AS captured_at,
+        date_trunc('day', captured_at, 'UTC') AS captured_at,
         count(*)::integer AS snapshot_count,
         sum(
             CASE
-                WHEN previous_view_count IS NULL OR view_count IS NULL THEN 0
-                ELSE GREATEST(view_count - previous_view_count, 0)
+                WHEN previous_view_high IS NULL OR view_count IS NULL THEN 0
+                ELSE GREATEST(view_count - previous_view_high, 0)
             END
         )::integer AS source_views,
         sum(
             CASE
-                WHEN previous_reaction_count IS NULL OR reaction_count IS NULL THEN 0
-                ELSE GREATEST(reaction_count - previous_reaction_count, 0)
+                WHEN previous_reaction_high IS NULL OR reaction_count IS NULL THEN 0
+                ELSE GREATEST(reaction_count - previous_reaction_high, 0)
             END
         )::integer AS source_reactions,
         sum(
             CASE
-                WHEN previous_forward_count IS NULL OR forward_count IS NULL THEN 0
-                ELSE GREATEST(forward_count - previous_forward_count, 0)
+                WHEN previous_forward_high IS NULL OR forward_count IS NULL THEN 0
+                ELSE GREATEST(forward_count - previous_forward_high, 0)
             END
         )::integer AS source_reposts
     FROM successful_source_snapshots
-    GROUP BY meme_id, date_trunc('day', captured_at)
+    GROUP BY meme_id, date_trunc('day', captured_at, 'UTC')
 ),
 meme_daily AS (
     SELECT
@@ -1014,7 +1014,6 @@ def _weighted_trend_event_count(row: dict[str, object], *, prefix: Literal["rece
         + _float(row.get(f"{prefix}_send_count")) * 3.0
         + _float(row.get(f"{prefix}_like_count")) * 5.0
         + _float(row.get(f"{prefix}_save_count")) * 4.0
-        + _float(row.get(f"{prefix}_download_count")) * 2.0
     )
 
 

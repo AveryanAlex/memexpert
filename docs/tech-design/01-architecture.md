@@ -29,7 +29,7 @@
 │          (shared Python package — business logic)            │
 │                                                             │
 │ Search · Recommendations · Collections · Memes · Auth       │
-│ Analytics/Interactions · Trends/MOTD                        │
+│ Analytics/Interactions · Public Meme Insights · Trends/MOTD │
 │         │            │            │                         │
 │         ▼            ▼            ▼                         │
 │   PostgreSQL    Qdrant/Meili    Redis                        │
@@ -78,13 +78,31 @@ Every process is a thin entry point over `services/`. The service layer owns DB 
 | **SvelteKit** | SSR, public website, admin UI, and Mini App frontend shell. Server-side rendering for SEO and initial page loads. | HTTP → FastAPI |
 | **FastStream Workers** | Event-driven processing. Separate consumer groups by resource profile (see Content Pipeline). | RabbitMQ → Services → PG, S3, external APIs |
 | **Crawlers** | Long-running listeners per platform (Telethon for Telegram). Listen to channel updates in real-time, catch up from `last_read_post_id` on startup. Publish `raw_meme` events to RabbitMQ. | RabbitMQ, PG, S3 |
-| **Scheduler** | APScheduler process for periodic tasks: source-engagement capture enqueueing, materialized-view refresh, search-index sync, Meme of the Day, and scheduled SEO batches. | Services → PG, Redis, RabbitMQ |
+| **Scheduler** | APScheduler process for periodic tasks: source-engagement and channel-audience capture enqueueing, materialized-view refresh, search-index sync, Meme of the Day, and scheduled SEO batches. | Services → PG, Redis, RabbitMQ |
 | **Channel Bot** | Separate aiogram bot for themed MemeXpert-owned channels. Acts as a virtual user — has its own recommendation profile per channel, selects memes by tag + popularity + novelty, posts 2–4×/day. Monitors subscriber feedback (reactions, views, forwards) to refine per-channel selection. | Services → PG, Telegram Bot API |
 | **imgproxy** | On-the-fly image transforms (resize, WebP/AVIF). CDN-cached. | S3 (source), CDN (delivery) |
 
 ### FastAPI as Public API
 
 FastAPI is the public HTTP API — versioned (`/api/v1/`), documented with OpenAPI. Routes are thin: parse request, call service, format response. Auth is implemented in the service layer and transported to browser clients through HttpOnly cookie-backed access/session JWTs with nonce-based revocation. The OpenAPI spec enables client codegen for any platform.
+
+Meme detail GETs are read-only and safe to repeat for SSR, canonical redirects,
+prefetch, and query-backed UI refreshes. A visible page visit is an explicit
+`POST /api/v1/memes/{meme_id}/view`; the browser sends it once per hydrated
+detail component and displayed meme ID with the preserved discovery
+attribution.
+
+Public meme detail has two independent read projections owned by
+`PublicMemeInsightsService`: `GET /api/v1/memes/{meme_id}/sources` returns a
+stable page of safe Telegram source DTOs, while
+`GET /api/v1/memes/{meme_id}/analytics` returns privacy-bounded activity, an
+opening absolute source baseline representing the latest known aggregate state
+as of the selected range's `start_at`, server-bucketed end states, audience
+coverage, and keyed funnels. Both first prove the meme is
+public/safety-visible and then restrict provenance to Telegram `public_crawler`
+rows reached through every `MemeFile`. They never serialize raw source IDs,
+uploader/operator provenance, Telegram sessions, crawler errors/raw metrics,
+source text, forwarded-original identity, event actors, or queries.
 
 ### aiogram Bot as Telegram API
 
@@ -134,7 +152,7 @@ SvelteKit handles server-side rendering for SEO and fast initial page loads. `+p
 
 | Store | Role | Data |
 |-------|------|------|
-| **PostgreSQL** | Source of truth | All entities, relations, interaction events, embedding cache |
+| **PostgreSQL** | Source of truth | All entities, relations, interaction events, idempotent exposure facts, source/audience observations, embedding cache |
 | **Qdrant** | Vector search + recommendations | MemeFile embeddings with meme-level payload |
 | **Meilisearch** | Text search + facets | Meme documents: OCR text, tags, metadata |
 | **S3** | Media storage | Originals + optional GIF/video playback and preview-frame artifacts; static image variants via imgproxy |

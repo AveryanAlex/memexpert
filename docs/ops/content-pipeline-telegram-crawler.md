@@ -49,7 +49,8 @@ The crawler ships five operator-facing pieces:
 - The heavy workers running: `uv run memexpert-workers`. These
   process both `media_inspect_requested` events from raw crawler accept and
   the later `transcode → ocr → embed → classify → sync_qdrant → sync_meili`
-  chain that materialized crawler content feeds. Keep
+  chain that materialized crawler content feeds. The Telegram worker role also
+  consumes the per-session source-engagement and channel-audience queues. Keep
   `PIPELINE_WORKER_PREFETCH_COUNT=1` for the first large channel; each worker
   queue consumer then has at most one unacknowledged item, and the worker image
   also caps Paddle/OpenBLAS native threads at one.
@@ -230,6 +231,11 @@ catch-up, live collection, and engagement with the latest 5,000 messages as the
 bounded first catch-up by default. Public Telegram username renames are not followed
 automatically; reconcile a renamed handle as an operator exception before
 expecting continued fetches.
+
+The same resolution calls `channels.getFullChannel` and, once public metadata
+resolves, records a forward-only `initial_resolution` audience observation: a
+participant count is `success`, while a missing count is `not_exposed`, not zero
+and not a reason to reject an otherwise public source.
 
 Telegram's legacy singular `username` can be null even when the requested
 handle is public. The resolver also checks Telegram's multi-username list and
@@ -530,6 +536,22 @@ candidate is already public. When verifying an exact promotion, check all of:
 5. Both search targets are replayed/resynced because their previous payload may
    still advertise the pre-promotion private state.
 
+### Public meme source attribution verification
+
+`GET /api/v1/memes/<meme_id>/sources` is deliberately narrower than admin
+source history. It traverses every file of a public/safety-visible meme but
+returns only `platform=telegram AND source_kind=public_crawler`. It retains dead
+posts as unavailable history and supplies public channel/post links only for a
+validated Telegram username and numeric post ID. Stable sorting/pagination uses
+the response `snapshot_at` on later pages.
+
+`GET /api/v1/memes/<meme_id>/analytics?window=30d` uses the same source filter.
+Neither response may reveal raw source/platform IDs, uploader/operator sources,
+Telegram account/session assignment, leases/errors/raw metrics, message text,
+forwarded-original identity, analytics users, requests, or queries. If any of
+those appears, treat it as a privacy regression rather than an operator
+convenience.
+
 ## Inspecting freshness snapshots
 
 ```bash
@@ -666,15 +688,68 @@ update the scheduled snapshot.
 
 The cadence is anchored to the Telegram post date (`published_at`), not to the
 time MemeXpert first ingested the post: `+1h`, `+3h`, `+12h`, `+1d`, `+3d`,
-`+7d`, `+1month`, then monthly. Historical public trends use `lag()` between
-successful snapshots for the same `meme_source_id`, so a baseline or old post
-with missed intervals contributes no invented delta.
+`+7d`, `+1month`, then monthly. A baseline or old post with missed intervals
+contributes no invented delta. Public activity read models advance each
+view/reaction/repost counter only above its running observed high, so a temporary
+decrease and recovery cannot double-count activity; the separate per-meme
+server-bucketed absolute end-state series still preserves decreases between
+returned points.
 
 Snapshot `NULL` values mean Telegram did not expose that counter; known zero is
 stored as `0`. Public trend/search read models may coalesce unknown to zero for
-ranking. Telegram `forward_count` is the public forward/repost counter and maps
-to `latest_source_reposts`; it is separate from `forwarded_from_*` provenance on
+ranking, but the public source page preserves null plus measured-post coverage.
+Telegram `forward_count` is the public forward/repost counter and maps to
+`latest_source_reposts`; it is separate from `forwarded_from_*` provenance on
 forwarded messages.
+
+### Source channel audience snapshots
+
+Subscriber counts are channel-level observations, not post counters or unique
+reach. Public-source resolution, opportunistic crawler metadata refresh, and
+scheduled capture fetch
+`channels.getFullChannel.full_chat.participants_count`. When a capture reaches
+persistence, it targets a `source_channel_audience_snapshots` row keyed by
+channel, slot, and reason, with a `success`/`not_exposed`/`failed` status and
+nullable nonnegative count. The first terminal `success` or `not_exposed` row
+for that key is immutable, and later same-slot attempts return it unchanged.
+Only a `failed` row remains retryable and may be replaced by a later `failed`,
+`success`, or `not_exposed` result. Known zero is preserved, and there is
+deliberately no backfill for time before capture began.
+
+Not every attempted path produces a row. Initial resolution can fail before a
+source channel exists, crawler metadata resolution can fail before the audience
+call, and a scheduled flood wait deliberately clears the lease and parks the
+session without writing a failed snapshot. These are no-observation outcomes,
+not zero-subscriber samples. A crawler refresh that reaches the audience call
+does persist its normalized provider failure before applying its normal
+session/error handling.
+
+The scheduled path is session-affined in exactly the same way as source
+engagement. `memexpert-scheduler` polls due channels, leases them through
+`source_channels.next_audience_capture_at` and audience lock fields, writes a
+transactional `source_channel_audience_capture_requested` outbox message, and
+the existing Telegram worker consumes
+`pipeline.source_channel_audience_capture.<session_key>`. A success refreshes
+the channel's latest-success `subscriber_count` cache. Both success and
+`not_exposed` clear the lease and advance to a daily UTC slot with deterministic
+jitter. A persisted `failed` result clears the lease but keeps the original due
+time for the next hourly scheduler poll; a scheduled flood wait writes no
+snapshot and waits for the session cooldown. Authorization revocation and a
+permanent ban also write no retryable audience snapshot: they transition the
+session to `auth_required` or `quarantined` and evict its cached worker client,
+so the unchanged due slot remains dormant until operator repair. The worker
+checks channel activity, pause/engagement flags, session ownership, and the
+exact due time under a row lock both before and after Telegram I/O; stale work
+does not call Telegram at preflight and cannot persist over a concurrent
+reassignment or reschedule at the final fence. None clears a previously valid
+cache. See
+[Scheduler batch jobs](scheduler-batch-jobs.md#source-channel-audience-work-selection)
+for settings, queues, SQL checks, and lease recovery.
+
+The public meme source service may normalize a post only when a successful
+snapshot exists at or before `published_at` and is no older than 48 hours. It
+reports eligible/total coverage for per-1,000-subscriber views/interactions;
+subscriber sums are never labeled reach or unique audience.
 
 ## Flood-wait recovery
 
@@ -804,6 +879,15 @@ the worker image because preview extraction requires FFmpeg and Pillow.
   `published_at` populated are invisible to the freshness query — they
   do not contribute to or block the SLO. This is deliberate; see
   `memexpert/services/crawler_freshness.py`.
+- **Audience capture stays stale.** Check that the channel remains active,
+  unpaused, engagement-enabled, assigned to a runnable account, and has no live
+  audience lease. Inspect `source-channel-audience-capture` scheduler logs and
+  its session-affined RabbitMQ queue. `not_exposed` is a legitimate Telegram
+  result and advances to the next daily slot; a failed observation remains due
+  for hourly retry and should retain the last successful cache. If the assigned
+  session was newly added/enabled or renamed, restart
+  `memexpert-worker-telegram.service` so its per-session queue is declared. Do
+  not invent or manually backfill subscriber history.
 - **Dead-letter inspection.** Crawler ingest failures are classified by
   the service layer and land in the same stage-journal surface the pipeline
   already expose. Use `GET /api/v1/pipeline/items/{id}/detail` to drill

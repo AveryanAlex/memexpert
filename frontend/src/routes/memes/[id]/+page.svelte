@@ -1,10 +1,14 @@
 <script lang="ts">
+  import { browser } from '$app/environment';
+  import { recordMemeView } from '$lib/api/client';
   import { readAuthState } from '$lib/auth-state';
   import MemeActionMenu from '$lib/features/memes/MemeActionMenu.svelte';
+  import MemeSourcesAndActivity from '$lib/features/memes/MemeSourcesAndActivity.svelte';
   import MemeGrid from '$lib/features/memes/MemeGrid.svelte';
   import MemeMedia from '$lib/features/memes/MemeMedia.svelte';
   import TrendSparkline from '$lib/features/trends/TrendSparkline.svelte';
   import { buildMemeDetailView, buildRelatedDiscovery } from '$lib/meme-detail-view';
+  import { memeActionAttributionBody } from '$lib/memeActions';
   import { ActionLink, Badge, Card, EmptyState, Notice } from '$lib/ui';
   import type { ActionData, PageData } from './$types';
 
@@ -19,6 +23,20 @@
   const popularityTrend = $derived(data.popularity?.trend ?? null);
   const popularityPoints = $derived(data.popularity?.sparkline ?? []);
   let showGuestFavoritePrompt = $state(false);
+  let recordedViewMemeId = $state<string | null>(null);
+
+  $effect(() => {
+    const memeId = data.meme?.id;
+    if (!browser || !memeId || recordedViewMemeId === memeId) return;
+
+    recordedViewMemeId = memeId;
+    void recordMemeView({
+      fetch,
+      memeId,
+      body: memeActionAttributionBody(data.attribution),
+      keepalive: true
+    }).catch((error) => console.warn('Meme detail telemetry failed.', { action: 'view', memeId, error }));
+  });
 
   function tagHref(tag: string): string {
     return `/tags/${encodeURIComponent(tag)}`;
@@ -33,9 +51,9 @@
 <svelte:head>
   {#if detail}
     <title>{detail.title} | MemeXpert</title>
-    <meta name="description" content={detail.description ?? 'Public MemeXpert meme detail page for sharing, saving, and discovery.'} />
+    <meta name="description" content={detail.metaDescription ?? 'Public MemeXpert meme detail page for sharing, saving, and discovery.'} />
     <meta property="og:title" content={detail.title} />
-    <meta property="og:description" content={detail.description ?? 'Public MemeXpert meme detail page.'} />
+    <meta property="og:description" content={detail.metaDescription ?? 'Public MemeXpert meme detail page.'} />
   {/if}
 </svelte:head>
 
@@ -52,8 +70,8 @@
             <Badge class="mb-3">Sensitive content</Badge>
           {/if}
           <h1 class="m-0 text-[clamp(2.25rem,7vw,4.5rem)] font-black leading-[0.9] tracking-[-0.07em]">{detail.title}</h1>
-          {#if detail.description}
-            <p class="mb-0 mt-4 max-w-3xl text-lg leading-relaxed text-muted">{detail.description}</p>
+          {#if detail.leadDescription}
+            <p class="mb-0 mt-4 max-w-3xl text-lg leading-relaxed text-muted">{detail.leadDescription}</p>
           {/if}
         </header>
 
@@ -124,6 +142,16 @@
       </details>
     </div>
   </article>
+
+  <MemeSourcesAndActivity
+    sourcePage={data.sourcePage}
+    sourceError={data.sourceError}
+    analytics={data.analytics}
+    analyticsError={data.analyticsError}
+    insightsParams={data.insightsParams}
+    pathname={data.insightsUrl.pathname}
+    search={data.insightsUrl.search}
+  />
 
   <section class="mt-8 grid gap-4 border-t border-line pt-6" aria-labelledby="related-memes-title">
     <div class="flex flex-wrap items-start justify-between gap-3">

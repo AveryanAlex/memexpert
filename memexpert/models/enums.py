@@ -207,6 +207,22 @@ class SourceEngagementCommentsState(StrEnum):
     NOT_EXPOSED = "not_exposed"
 
 
+class SourceChannelAudienceCaptureReason(StrEnum):
+    """Why a Telegram channel audience observation was captured."""
+
+    INITIAL_RESOLUTION = "initial_resolution"
+    CRAWLER_REFRESH = "crawler_refresh"
+    SCHEDULED = "scheduled"
+
+
+class SourceChannelAudienceFetchStatus(StrEnum):
+    """Normalized outcomes from Telegram channel audience fetches."""
+
+    SUCCESS = "success"
+    NOT_EXPOSED = "not_exposed"
+    FAILED = "failed"
+
+
 class ContentPipelineStage(StrEnum):
     """Pipeline stages recorded in the DB-backed journal."""
 
@@ -569,6 +585,8 @@ __all__ = [
     "SearchSynonymLocale",
     "SearchSynonymRevisionStatus",
     "SearchSynonymSyncStatus",
+    "SourceChannelAudienceCaptureReason",
+    "SourceChannelAudienceFetchStatus",
     "SourceEngagementCaptureReason",
     "SourceEngagementCommentsState",
     "SourceEngagementFetchStatus",

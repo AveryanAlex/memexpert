@@ -81,7 +81,7 @@ export function memeAttributionSearchParams(attribution?: MemeActionAttribution 
 }
 
 export function parseMemeAttributionSearchParams(params: URLSearchParams): MemeActionAttribution | null {
-  if (![...params.keys()].some((key) => key.startsWith('attribution_'))) return null;
+  if (!Object.values(ATTRIBUTION_QUERY_KEYS).some((key) => params.has(key))) return null;
 
   return {
     request_id: readParam(params, ATTRIBUTION_QUERY_KEYS.request_id),

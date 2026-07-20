@@ -38,10 +38,17 @@ from memexpert.models.content import (
     PipelineIngestRequest,
     RabbitMQOutboxMessage,
     SourceChannel,
+    SourceChannelAudienceSnapshot,
     SourceChannelPost,
     TelegramSession,
 )
-from memexpert.models.enums import SourceChannelPostStatus, SourcePlatform, TelegramSessionStatus
+from memexpert.models.enums import (
+    SourceChannelAudienceCaptureReason,
+    SourceChannelAudienceFetchStatus,
+    SourceChannelPostStatus,
+    SourcePlatform,
+    TelegramSessionStatus,
+)
 from memexpert.schemas.content_pipeline import (
     CrawlerForwardAttribution,
     CrawlerIngestOutcome,
@@ -51,6 +58,10 @@ from memexpert.schemas.content_pipeline import (
     TelegramTextEntity,
 )
 from memexpert.services import CrawlerSessionNotRunnableError
+from memexpert.services.source_channel_audience import (
+    SourceChannelAudienceObservation,
+    record_source_channel_audience_observation,
+)
 from tests.integration.test_ingest_accept_service import FakeStorageClient
 
 if TYPE_CHECKING:
@@ -193,6 +204,125 @@ def _build_runtime(
 # ---------------------------------------------------------------------------
 # catch_up_channel happy path + counters
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("fetch_status", "subscriber_count", "expected_cached_count"),
+    [
+        (SourceChannelAudienceFetchStatus.SUCCESS, 300, 300),
+        (SourceChannelAudienceFetchStatus.NOT_EXPOSED, None, 200),
+    ],
+    ids=["success", "not-exposed"],
+)
+async def test_channel_metadata_refresh_skips_terminal_audience_slot_before_rpc(
+    migrated_db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    fetch_status: SourceChannelAudienceFetchStatus,
+    subscriber_count: int | None,
+    expected_cached_count: int,
+) -> None:
+    captured_at = datetime(2026, 7, 20, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr("memexpert.crawlers.telegram.runtime.utcnow", lambda: captured_at)
+    await _seed_active_session(migrated_db_session, session_name="primary")
+    channel = await _seed_curated_channel(
+        migrated_db_session,
+        platform_id="terminal_audience_channel",
+        title="Stale title",
+    )
+    channel.username = "stale_username"
+    channel.subscriber_count = 200
+    await record_source_channel_audience_observation(
+        migrated_db_session,
+        channel,
+        SourceChannelAudienceObservation(
+            fetch_status=fetch_status,
+            subscriber_count=subscriber_count,
+        ),
+        capture_reason=SourceChannelAudienceCaptureReason.CRAWLER_REFRESH,
+        captured_at=captured_at,
+    )
+    fake = FakeTelegramClient(
+        canned_channels={
+            channel.platform_id: RawTelegramChannel(
+                channel_id=channel.platform_id,
+                username="fresh_username",
+                title="Fresh title",
+                subscriber_count=999,
+            )
+        }
+    )
+
+    await _build_runtime(
+        migrated_db_session,
+        telegram_client=fake,
+    )._refresh_channel_metadata(channel)
+
+    assert fake.audience_fetch_channel_ids == []
+    assert channel.title == "Fresh title"
+    assert channel.username == "fresh_username"
+    assert channel.subscriber_count == expected_cached_count
+
+
+@pytest.mark.parametrize("existing_failed_slot", [False, True], ids=["missing", "failed"])
+async def test_channel_metadata_refresh_retries_retryable_audience_slot_and_updates_cache(
+    migrated_db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    existing_failed_slot: bool,
+) -> None:
+    captured_at = datetime(2026, 7, 20, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr("memexpert.crawlers.telegram.runtime.utcnow", lambda: captured_at)
+    await _seed_active_session(migrated_db_session, session_name="primary")
+    channel = await _seed_curated_channel(
+        migrated_db_session,
+        platform_id=f"retryable_audience_channel_{existing_failed_slot}",
+        title="Stale title",
+    )
+    channel.username = "stale_username"
+    channel.subscriber_count = 200
+    if existing_failed_slot:
+        await record_source_channel_audience_observation(
+            migrated_db_session,
+            channel,
+            SourceChannelAudienceObservation(
+                fetch_status=SourceChannelAudienceFetchStatus.FAILED,
+                error_code="temporary_failure",
+            ),
+            capture_reason=SourceChannelAudienceCaptureReason.CRAWLER_REFRESH,
+            captured_at=captured_at,
+        )
+    fake = FakeTelegramClient(
+        canned_channels={
+            channel.platform_id: RawTelegramChannel(
+                channel_id=channel.platform_id,
+                username="fresh_username",
+                title="Fresh title",
+                subscriber_count=999,
+            )
+        }
+    )
+
+    await _build_runtime(
+        migrated_db_session,
+        telegram_client=fake,
+    )._refresh_channel_metadata(channel)
+
+    snapshot = await migrated_db_session.scalar(
+        select(SourceChannelAudienceSnapshot).where(
+            SourceChannelAudienceSnapshot.source_channel_id == channel.id,
+            SourceChannelAudienceSnapshot.capture_slot == captured_at.date(),
+            SourceChannelAudienceSnapshot.capture_reason == SourceChannelAudienceCaptureReason.CRAWLER_REFRESH,
+        )
+    )
+    assert fake.audience_fetch_channel_ids == [channel.platform_id]
+    assert channel.title == "Fresh title"
+    assert channel.username == "fresh_username"
+    assert channel.subscriber_count == 999
+    assert channel.subscriber_count_updated_at is not None
+    assert snapshot is not None
+    assert snapshot.fetch_status is SourceChannelAudienceFetchStatus.SUCCESS
+    assert snapshot.subscriber_count == 999
+    assert channel.subscriber_count_updated_at == snapshot.captured_at
 
 
 async def test_catch_up_channel_ingests_and_counts_mixed_media(

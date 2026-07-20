@@ -23,7 +23,8 @@
     attributions = {},
     bulk = { enabled: false },
     showAccessMarkers = false,
-    layout = 'masonry'
+    layout = 'masonry',
+    exposureScope
   }: {
     memes: PublicMemeCardRead[];
     label?: string;
@@ -31,6 +32,7 @@
     bulk?: MemeGridBulkOptions;
     showAccessMarkers?: boolean;
     layout?: 'masonry' | 'ordered';
+    exposureScope?: string;
   } = $props();
 
   let selectedIds = $state<string[]>([]);
@@ -58,6 +60,7 @@
   const canRemoveFromCollection = $derived(Boolean(bulk.removeEnabled && bulk.removeCollectionId));
   const toolbarSummary = $derived(bulkToolbarSummary(memes.length, selected.length, downloadable.length));
   const memePositions = $derived(new Map(memes.map((meme, index) => [meme.id, index + 1])));
+  const exposureScopeKey = $derived(exposureScope?.trim() || `grid:${label}:${layout}`);
   const videoPreviewMode = $derived<MemeVideoPreviewMode>(
     !hydrated || renderedColumnCount === 0 ? 'poster' : renderedColumnCount === 1 ? 'viewport' : 'hover'
   );
@@ -116,6 +119,10 @@
   function toggleSelection(memeId: string) {
     statusMessage = null;
     selectedIds = selectedIds.includes(memeId) ? selectedIds.filter((id) => id !== memeId) : [...selectedIds, memeId];
+  }
+
+  function exposureIdFor(attribution: MemeResultAttributionRead | null | undefined): string | undefined {
+    return attribution?.impression_id;
   }
 
   function startSelection() {
@@ -322,6 +329,8 @@
     <MemeCard
       {meme}
       {attribution}
+      exposureId={exposureIdFor(attribution)}
+      exposurePlacement={`${exposureScopeKey}:${memePositions.get(meme.id) ?? 0}:${meme.id}`}
       position={memePositions.get(meme.id)}
       total={memes.length}
       {showAccessMarkers}

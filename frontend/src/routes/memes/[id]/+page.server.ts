@@ -1,11 +1,12 @@
-import { fail, redirect } from '@sveltejs/kit';
+import { fail } from '@sveltejs/kit';
 import type { Actions, PageServerLoad } from './$types';
 import {
   ApiError,
   favoriteMeme,
   fetchCurrentSession,
-  fetchMemeDetail,
+  fetchMemeAnalytics,
   fetchMemePopularitySummary,
+  fetchMemeSources,
   fetchSimilarMemes,
   fetchTagLanding,
   fetchTrendPage
@@ -13,69 +14,88 @@ import {
 import type { ApiFetch } from '$lib/api/client';
 import type { PublicMemeDetailRead } from '$lib/api/types';
 import type { MemeDetailRelatedSource } from '$lib/meme-detail-view';
+import {
+  MEME_SOURCE_PAGE_SIZE,
+  parseMemeInsightsParams
+} from '$lib/features/memes/meme-insights-params';
 import { parseMemeAttributionSearchParams } from '$lib/memeActions';
 import { apiBaseUrl, cookieHeaderWithAccessToken, forwardBackendAccessCookie } from '$lib/server/backend';
 
 const RELATED_LIMIT = 7;
 
-export const load: PageServerLoad = async ({ fetch, params, request, url }) => {
+export const load: PageServerLoad = async ({ fetch, parent, request, url }) => {
   const cookieHeader = request.headers.get('cookie') ?? undefined;
   const attribution = parseMemeAttributionSearchParams(url.searchParams);
-  let meme: Awaited<ReturnType<typeof fetchMemeDetail>>;
-  try {
-    meme = await fetchMemeDetail({
-      fetch,
-      baseUrl: apiBaseUrl(),
-      memeId: params.id,
-      attribution,
-      cookieHeader
-    });
-  } catch (error) {
-    if (error instanceof ApiError && error.status === 404) {
-      return {
-        attribution,
-        meme: null,
-        popularity: null,
-        relatedSource: null,
-        unavailableMessage: 'This meme is not available. It may be private, removed, or filtered by safety settings.'
-      };
-    }
+  const insightsParams = parseMemeInsightsParams(url.searchParams);
+  const { meme } = await parent();
 
-    if (error instanceof ApiError && error.status === 422) {
-      return {
-        attribution,
-        meme: null,
-        popularity: null,
-        relatedSource: null,
-        unavailableMessage: 'This meme link is invalid.'
-      };
-    }
-
+  if (!meme) {
     return {
       attribution,
-      meme: null,
+      analytics: null,
+      analyticsError: null,
+      insightsParams,
+      insightsUrl: { pathname: url.pathname, search: url.search },
       popularity: null,
       relatedSource: null,
-      unavailableMessage: 'Could not reach the meme catalog API.'
+      sourceError: null,
+      sourcePage: null
     };
   }
 
-  if (meme.seo_page_slug && params.id !== meme.seo_page_slug) {
-    throw redirect(308, `/memes/${meme.seo_page_slug}${url.search}`);
-  }
-
-  const [popularity, relatedSource] = await Promise.all([
+  const [popularity, relatedSource, sourceResult, analyticsResult] = await Promise.all([
     fetchMemePopularitySummary({
       fetch,
       baseUrl: apiBaseUrl(),
       memeId: meme.id,
       cookieHeader
     }).catch(() => null),
-    fetchRelatedDiscoverySource(fetch, cookieHeader, meme)
+    fetchRelatedDiscoverySource(fetch, cookieHeader, meme),
+    settleInsight(
+      fetchMemeSources({
+        fetch,
+        baseUrl: apiBaseUrl(),
+        memeId: meme.id,
+        cookieHeader,
+        sort: insightsParams.sourceSort,
+        limit: MEME_SOURCE_PAGE_SIZE,
+        offset: insightsParams.sourceOffset,
+        snapshotAt: insightsParams.sourceSnapshot
+      }),
+      'Telegram source posts could not be loaded right now.'
+    ),
+    settleInsight(
+      fetchMemeAnalytics({
+        fetch,
+        baseUrl: apiBaseUrl(),
+        memeId: meme.id,
+        cookieHeader,
+        window: insightsParams.analyticsWindow
+      }),
+      'Professional activity analytics could not be loaded right now.'
+    )
   ]);
 
-  return { attribution, meme, popularity, relatedSource, unavailableMessage: null };
+  return {
+    attribution,
+    analytics: analyticsResult.data,
+    analyticsError: analyticsResult.error,
+    insightsParams,
+    insightsUrl: { pathname: url.pathname, search: url.search },
+    popularity,
+    relatedSource,
+    sourceError: sourceResult.error,
+    sourcePage: sourceResult.data
+  };
 };
+
+async function settleInsight<T>(promise: Promise<T>, message: string): Promise<{ data: T | null; error: string | null }> {
+  try {
+    return { data: await promise, error: null };
+  } catch {
+    return { data: null, error: message };
+  }
+}
 
 async function fetchRelatedDiscoverySource(
   fetch: ApiFetch,

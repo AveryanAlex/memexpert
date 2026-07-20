@@ -105,9 +105,30 @@ Selection mode is never shown by default on Discover. Clear, Done, and successfu
 
 ### Meme Detail (`/memes/{slug}` or `/memes/{id}`)
 
-Meme detail is media first. Desktop uses a media area with a compact sticky context/action area; mobile places Favorite, Save, and Send immediately below the media. The visible context is limited to title, concise description, tags, and related memes.
+Meme detail is media first. Desktop uses a media area with a compact sticky context/action area; mobile places Favorite, Save, and Send immediately below the media. The visible context is limited to title, concise description, tags, and related memes. Title, lead description, long-form body, and OCR text are compared after Unicode compatibility normalization, trimming, whitespace collapse, and locale-independent lowercasing; an exact normalized lower-priority duplicate is suppressed. SEO description and media alt text remain independent metadata.
 
 OCR text, long-form context, and popularity information are progressively disclosed in **About this meme**. MIME types, byte sizes, file rows, public API explanations, raw popularity scores, and internal similarity/fallback diagnostics are not consumer-facing. Related memes preserve their actual discovery attribution while presenting a simple continuation path.
+
+A separate full-width **Sources & activity** disclosure follows the meme
+article and precedes Related memes. Its summary reports the number of observed
+Telegram posts and channels plus known views. Inside, every public-crawler post
+is available through stable pagination and can be sorted by views, reactions,
+reposts, interaction rate, newest, or oldest. Missing counters render as not
+captured, unavailable posts remain labeled historical rows, and only validated
+public `t.me` channel/post links are clickable.
+
+**Professional analytics** is nested within that disclosure. It provides
+URL-backed 7/30/90-day and All controls, an original-source versus MemeExpert
+activity chart, a selectable server-bucketed absolute Telegram counter chart,
+exact-value tables, source rates with eligibility coverage, separate web and
+Telegram inline funnels, and forward-only channel-audience comparisons. The
+activity chart compares adaptive buckets as signals per day while its table
+retains exact bucket totals. Both charts use UTC time axes; each absolute-source
+point uses the last real capture time represented by its server bucket. A
+missing selected Telegram counter breaks the line instead of becoming zero.
+Detail, sources, analytics, and related memes load independently; one
+unavailable projection must not erase the others. Clean share/canonical meme
+URLs omit disclosure, sorting, pagination, snapshot, and analytics-range state.
 
 Tag and template pages likewise put the gallery before aggregate popularity information. Any available recent activity and history appear in an **About this tag** or **About this template** disclosure after the gallery.
 
@@ -115,7 +136,17 @@ Tag and template pages likewise put the gallery before aggregate popularity info
 
 Trends are public, story-led discovery surfaces with **Trending**, **Rising**, and **Most favorited** rankings. Each ranked meme shows media, rank, direction, understandable recent activity, and a recent change rather than raw ranking scores or history-sufficiency diagnostics. Comparison and timeline are secondary actions.
 
-**Recorded activity** is the public activity label used in trend summaries, tag/template history, comparisons, and timeline cards. It is an unweighted sum of available original-source views, reactions, and reposts plus MemeExpert views, sends, saves, and favorites. It counts signals, not unique people, and is not the backend ranking/popularity score.
+**Recorded activity** is the public activity label used in meme analytics,
+trend summaries, tag/template history, comparisons, and timeline cards. It is
+an unweighted sum of available original-source view, reaction, and repost
+increases plus MemeExpert views, sends, saves, and favorite actions. It counts
+signals, not unique people, and is not the backend ranking/popularity score.
+Comments, impressions/results served, downloads, and subscriber counts are
+reported separately and never enter Recorded activity. A counter correction
+does not create negative activity, and recovery to a previously observed high
+does not count the same activity twice. Downloads remain visible as adjacent
+metrics but contribute no weight to public trend rankings or Meme of the Day
+scoring.
 
 - Timeline supports month/year nostalgia browsing while retaining URL controls and pagination.
 - Comparison accepts labeled meme, tag, and template rows and remains shareable through its existing URL serialization. Charts include an adjacent readable table of the same values.

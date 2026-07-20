@@ -9,12 +9,60 @@ import type {
   PublicMemeSearchResultRead,
   PublicTrendMetricsRead
 } from '$lib/api/types';
-import { buildRelatedDiscovery } from '$lib/meme-detail-view';
+import { buildMemeDetailView, buildRelatedDiscovery, normalizeMemeDisplayText } from '$lib/meme-detail-view';
 import MemeDetailPage from '../routes/memes/[id]/+page.svelte';
 import TagLandingPage from '../routes/tags/[tag]/+page.svelte';
 import TemplateLandingPage from '../routes/templates/[slug]/+page.svelte';
 
 describe('/memes/[id] page', () => {
+  it('keeps SEO metadata while suppressing normalized duplicate visible text', () => {
+    const captionFallback = buildMemeDetailView(
+      memeDetail({
+        tags: [],
+        seo_title: null,
+        seo_description: null,
+        caption: '  SAME   Caption  ',
+        seo_body_text: 'same caption',
+        ocr_text: 'ＳＡＭＥ Caption'
+      })
+    );
+
+    expect(captionFallback.title).toBe('SAME   Caption');
+    expect(captionFallback.metaDescription).toBe('SAME   Caption');
+    expect(captionFallback.leadDescription).toBeNull();
+    expect(captionFallback.bodyText).toBeNull();
+    expect(captionFallback.detectedText).toBeNull();
+
+    const ocrFallback = buildMemeDetailView(
+      memeDetail({ tags: [], seo_title: null, seo_description: null, caption: null, seo_body_text: null, ocr_text: 'ship it' })
+    );
+    expect(ocrFallback.title).toBe('Meme detail');
+    expect(ocrFallback.metaDescription).toBe('ship it');
+    expect(ocrFallback.leadDescription).toBeNull();
+    expect(ocrFallback.detectedText).toBe('ship it');
+  });
+
+  it('skips blank titles and uses deterministic locale-independent Unicode normalization', () => {
+    const captionTitle = buildMemeDetailView(
+      memeDetail({ seo_title: '   ', caption: 'Caption fallback', ocr_text: 'OCR should stay behind About' })
+    );
+    const noVisibleTitle = buildMemeDetailView(
+      memeDetail({ tags: [], seo_title: '\t', caption: '  ', seo_description: null, ocr_text: 'OCR metadata fallback' })
+    );
+    const tagTitle = buildMemeDetailView(
+      memeDetail({ tags: ['classic reaction'], seo_title: '\t', caption: '  ', seo_description: null })
+    );
+
+    expect(captionTitle.title).toBe('Caption fallback');
+    expect(captionTitle.detectedText).toBe('OCR should stay behind About');
+    expect(noVisibleTitle.title).toBe('Meme detail');
+    expect(noVisibleTitle.metaDescription).toBe('OCR metadata fallback');
+    expect(noVisibleTitle.leadDescription).toBeNull();
+    expect(noVisibleTitle.detectedText).toBe('OCR metadata fallback');
+    expect(tagTitle.title).toBe('classic reaction');
+    expect(normalizeMemeDisplayText('  I  İ  ı  i  ')).toBe('i i̇ ı i');
+  });
+
   it('renders SEO content, media-first actions, progressive context, and related discovery', () => {
     const meme = memeDetail({
       seo_title: 'Launch day reaction meme',
@@ -30,6 +78,7 @@ describe('/memes/[id] page', () => {
     const { body, head } = render(MemeDetailPage, {
       props: {
         data: {
+          ...emptyInsightsData(),
           session: null,
           sessionError: null,
           attribution: null,
@@ -96,6 +145,7 @@ describe('/memes/[id] page', () => {
     const { body } = render(MemeDetailPage, {
       props: {
         data: {
+          ...emptyInsightsData(),
           session: null,
           sessionError: null,
           attribution: null,
@@ -126,6 +176,7 @@ describe('/memes/[id] page', () => {
     const { body } = render(MemeDetailPage, {
       props: {
         data: {
+          ...emptyInsightsData(),
           session: null,
           sessionError: null,
           attribution: null,
@@ -164,6 +215,22 @@ describe('/memes/[id] page', () => {
     expect(trendDiscovery.description).toContain('tag fallback were unavailable');
   });
 });
+
+function emptyInsightsData() {
+  return {
+    analytics: null,
+    analyticsError: null,
+    insightsParams: {
+      sourceSort: 'views_desc' as const,
+      sourceOffset: 0,
+      sourceSnapshot: null,
+      analyticsWindow: '30d' as const
+    },
+    insightsUrl: { pathname: '/memes/launch-reaction', search: '' },
+    sourceError: null,
+    sourcePage: null
+  };
+}
 
 describe('tag and template discovery pages', () => {
   it('puts tag and template galleries ahead of aggregate popularity details', () => {

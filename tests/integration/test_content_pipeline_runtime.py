@@ -84,6 +84,7 @@ from memexpert.models.enums import (
     PipelineIngestRequestStatus,
     RabbitMQOutboxMessageStatus,
     SourceAttachReason,
+    SourceChannelAudienceCaptureReason,
     SourceEngagementCaptureReason,
     SourceEngagementCommentsState,
     SourceEngagementFetchStatus,
@@ -96,8 +97,10 @@ from memexpert.models.enums import (
 from memexpert.models.operations import PipelineStageAttempt
 from memexpert.models.user import User
 from memexpert.pipeline.events import (
+    SourceChannelAudienceCaptureRequestedEvent,
     SourceEngagementCaptureRequestedEvent,
     build_media_inspect_requested_payload,
+    build_source_channel_audience_session_key,
     build_source_engagement_session_key,
 )
 from memexpert.pipeline.items import PipelineItemReadService
@@ -852,8 +855,8 @@ async def test_pipeline_runtime_declares_explicit_retry_and_dlx_topology() -> No
     )
     subscriber_channels = [cast("Any", subscriber).channel for subscriber in broker.subscribers]
 
-    assert len(subscriber_channels) == 9
-    assert len({id(channel) for channel in subscriber_channels}) == 9
+    assert len(subscriber_channels) == 11
+    assert len({id(channel) for channel in subscriber_channels}) == 11
     assert all(channel.prefetch_count == 3 for channel in subscriber_channels)
     assert all(channel.global_qos is False for channel in subscriber_channels)
     assert all(
@@ -891,12 +894,20 @@ async def test_pipeline_runtime_declares_explicit_retry_and_dlx_topology() -> No
     source_engagement_queue_arguments = {
         queue.name: declared_queue_arguments[queue.name] or {} for queue in runtime.source_engagement_capture_queues
     }
+    audience_queue_arguments = {
+        queue.name: declared_queue_arguments[queue.name] or {}
+        for queue in runtime.source_channel_audience_capture_queues
+    }
     transcode_queue_arguments = declared_queue_arguments[runtime.transcode_queue.name] or {}
     ocr_queue_arguments = declared_queue_arguments[runtime.ocr_queue.name] or {}
     media_inspect_retry_queue_arguments = declared_queue_arguments[runtime.media_inspect_retry_queue.name] or {}
     source_engagement_retry_queue_arguments = {
         queue.name: declared_queue_arguments[queue.name] or {}
         for queue in runtime.source_engagement_capture_retry_queues
+    }
+    audience_retry_queue_arguments = {
+        queue.name: declared_queue_arguments[queue.name] or {}
+        for queue in runtime.source_channel_audience_capture_retry_queues
     }
     transcode_retry_queue_arguments = declared_queue_arguments[runtime.transcode_retry_queue.name] or {}
     ocr_retry_queue_arguments = declared_queue_arguments[runtime.ocr_retry_queue.name] or {}
@@ -907,6 +918,8 @@ async def test_pipeline_runtime_declares_explicit_retry_and_dlx_topology() -> No
     )
     assert len(runtime.source_engagement_capture_queues) == 2
     assert len(runtime.source_engagement_capture_retry_queues) == 2
+    assert len(runtime.source_channel_audience_capture_queues) == 2
+    assert len(runtime.source_channel_audience_capture_retry_queues) == 2
     assert {queue.name for queue in runtime.source_engagement_capture_queues} == {
         runtime.broker_settings.source_engagement_capture_queue_for_session(session_a_key),
         runtime.broker_settings.source_engagement_capture_queue_for_session(session_b_key),
@@ -917,6 +930,13 @@ async def test_pipeline_runtime_declares_explicit_retry_and_dlx_topology() -> No
         assert source_engagement_queue_arguments[queue_name][
             "x-dead-letter-routing-key"
         ] == runtime.broker_settings.source_engagement_capture_retry_request_routing_key_for_session(session_key)
+        audience_queue_name = runtime.broker_settings.source_channel_audience_capture_queue_for_session(session_key)
+        assert audience_queue_arguments[audience_queue_name]["x-single-active-consumer"] is True
+        assert audience_queue_arguments[audience_queue_name]["x-dead-letter-routing-key"] == (
+            runtime.broker_settings.source_channel_audience_capture_retry_request_routing_key_for_session(
+                session_key,
+            )
+        )
     assert transcode_queue_arguments["x-dead-letter-routing-key"] == runtime.broker_settings.retry_routing_key
     assert ocr_queue_arguments["x-dead-letter-routing-key"] == runtime.broker_settings.ocr_retry_request_routing_key
     assert media_inspect_retry_queue_arguments["x-message-ttl"] == runtime.broker_settings.retry_backoff_milliseconds
@@ -931,6 +951,15 @@ async def test_pipeline_runtime_declares_explicit_retry_and_dlx_topology() -> No
         )
         assert source_engagement_retry_queue_arguments[retry_queue_name]["x-dead-letter-routing-key"] == (
             runtime.broker_settings.source_engagement_capture_retry_routing_key_for_session(session_key)
+        )
+        audience_retry_queue_name = (
+            runtime.broker_settings.source_channel_audience_capture_retry_queue_for_session(session_key)
+        )
+        assert audience_retry_queue_arguments[audience_retry_queue_name]["x-message-ttl"] == (
+            runtime.broker_settings.retry_backoff_milliseconds
+        )
+        assert audience_retry_queue_arguments[audience_retry_queue_name]["x-dead-letter-routing-key"] == (
+            runtime.broker_settings.source_channel_audience_capture_retry_routing_key_for_session(session_key)
         )
     assert transcode_retry_queue_arguments["x-message-ttl"] == runtime.broker_settings.retry_backoff_milliseconds
     assert (
@@ -954,6 +983,17 @@ async def test_pipeline_runtime_declares_explicit_retry_and_dlx_topology() -> No
                 runtime.broker_settings.source_engagement_capture_retry_routing_key_for_session(session_key),
             ),
         ]
+        audience_queue_name = runtime.broker_settings.source_channel_audience_capture_queue_for_session(session_key)
+        assert recorded_queues[audience_queue_name].bindings == [
+            (
+                runtime.pipeline_exchange.name,
+                runtime.broker_settings.source_channel_audience_capture_binding_key_for_session(session_key),
+            ),
+            (
+                runtime.pipeline_exchange.name,
+                runtime.broker_settings.source_channel_audience_capture_retry_routing_key_for_session(session_key),
+            ),
+        ]
     assert recorded_queues[runtime.transcode_queue.name].bindings == [
         (runtime.pipeline_exchange.name, runtime.broker_settings.meme_created_routing_key),
         (runtime.pipeline_exchange.name, runtime.broker_settings.stage_replay_routing_key),
@@ -972,6 +1012,17 @@ async def test_pipeline_runtime_declares_explicit_retry_and_dlx_topology() -> No
             (
                 runtime.retry_exchange.name,
                 runtime.broker_settings.source_engagement_capture_retry_request_routing_key_for_session(session_key),
+            ),
+        ]
+        audience_retry_queue_name = (
+            runtime.broker_settings.source_channel_audience_capture_retry_queue_for_session(session_key)
+        )
+        assert recorded_queues[audience_retry_queue_name].bindings == [
+            (
+                runtime.retry_exchange.name,
+                runtime.broker_settings.source_channel_audience_capture_retry_request_routing_key_for_session(
+                    session_key,
+                ),
             ),
         ]
     assert recorded_queues[runtime.transcode_retry_queue.name].bindings == [
@@ -1186,6 +1237,76 @@ async def test_pipeline_runtime_source_engagement_capture_handler_fetches_stats_
     assert snapshot.fetch_status is SourceEngagementFetchStatus.SUCCESS
     assert snapshot.view_count == 77
     assert snapshot.reaction_count == 0
+
+
+async def test_pipeline_runtime_source_channel_audience_handler_acks_valid_request(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    settings = Settings()
+    fake = FakeTelegramClient()
+    runtime = build_pipeline_runtime(
+        settings=settings,
+        broker=build_pipeline_broker(settings),
+        storage_client=FakeStorageClient(),
+        media_processor=FakeMediaProcessor(),
+        ocr_processor=FakeOCRProcessor(result=build_ocr_result(source_object_key="unused")),
+        source_channel_audience_telegram_client_factory=lambda _event: fake,
+    )
+    calls: list[tuple[object, object, object, object, bool]] = []
+
+    async def fake_capture(
+        session_factory: object,
+        capture_event: object,
+        *,
+        telegram_client_factory: object,
+        telegram_session_invalidator: object,
+        close_telegram_client_after_capture: bool,
+    ) -> object:
+        calls.append(
+            (
+                session_factory,
+                capture_event,
+                telegram_client_factory,
+                telegram_session_invalidator,
+                close_telegram_client_after_capture,
+            )
+        )
+        return object()
+
+    monkeypatch.setattr(
+        "memexpert.workers.pipeline_runtime.runtime.capture_source_channel_audience_request",
+        fake_capture,
+    )
+    telegram_session_id = uuid.UUID("018f0f4d-37f1-7d32-9a60-7c84ec5f3acb")
+    session_name = "audience-session"
+    scheduled_for = datetime(2026, 1, 1, 13, 0, tzinfo=UTC)
+    event = SourceChannelAudienceCaptureRequestedEvent(
+        event_id=uuid.uuid7(),
+        event_type="source_channel_audience_capture_requested",
+        source_channel_id=uuid.uuid7(),
+        source_platform=SourcePlatform.TELEGRAM,
+        platform_id="audience_channel",
+        scheduled_for=scheduled_for,
+        capture_slot=scheduled_for.date(),
+        capture_reason=SourceChannelAudienceCaptureReason.SCHEDULED,
+        telegram_session_id=telegram_session_id,
+        session_name=session_name,
+        session_key=build_source_channel_audience_session_key(telegram_session_id, session_name),
+        created_at=scheduled_for,
+    )
+    message = FakeRabbitMessage(message_id=str(event.event_id))
+
+    await runtime.handle_source_channel_audience_capture_message(event.model_dump(mode="json"), message)
+
+    assert message.ack_count == 1
+    assert message.reject_calls == []
+    assert len(calls) == 1
+    assert calls[0][0] is runtime.session_factory
+    assert calls[0][1] == event
+    assert calls[0][2] is runtime.source_channel_audience_telegram_client_factory
+    assert runtime.source_engagement_telegram_session_manager is not None
+    assert calls[0][3] == runtime.source_engagement_telegram_session_manager.invalidate_session
+    assert calls[0][4] is True
 
 
 async def test_pipeline_runtime_source_engagement_flood_wait_parks_session_and_acks(

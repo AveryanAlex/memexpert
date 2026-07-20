@@ -95,6 +95,7 @@ class Settings(BaseSettings):
     pipeline_broker_routing_key_prefix: str = "pipeline"
     pipeline_broker_media_inspect_queue: str = "pipeline.media_inspect"
     pipeline_broker_source_engagement_capture_queue: str = "pipeline.source_engagement_capture"
+    pipeline_broker_source_channel_audience_capture_queue: str = "pipeline.source_channel_audience_capture"
     pipeline_broker_transcode_queue: str = "pipeline.transcode"
     pipeline_broker_ocr_queue: str = "pipeline.ocr"
     pipeline_broker_embed_queue: str = "pipeline.embed"
@@ -192,9 +193,14 @@ class Settings(BaseSettings):
     scheduler_source_engagement_capture_batch_size: int = Field(default=100, ge=1, le=1000)
     scheduler_source_engagement_capture_per_session_batch_size: int = Field(default=20, ge=1, le=1000)
     scheduler_source_engagement_capture_lease_timeout_seconds: float = Field(default=1800.0, gt=0.0)
+    scheduler_source_channel_audience_capture_enabled: bool = True
+    scheduler_source_channel_audience_capture_interval_seconds: float = Field(default=3600.0, gt=0.0)
+    scheduler_source_channel_audience_capture_batch_size: int = Field(default=100, ge=1, le=1000)
+    scheduler_source_channel_audience_capture_per_session_batch_size: int = Field(default=20, ge=1, le=1000)
+    scheduler_source_channel_audience_capture_lease_timeout_seconds: float = Field(default=1800.0, gt=0.0)
     scheduler_motd_enabled: bool = True
     scheduler_motd_interval_seconds: float = Field(default=86400.0, gt=0.0)
-    motd_algorithm_version: str = Field(default="motd_v1", min_length=1, max_length=64)
+    motd_algorithm_version: str = Field(default="motd_v2", min_length=1, max_length=64)
     motd_candidate_lookback_days: int = Field(default=30, ge=1, le=365)
     motd_candidate_limit: int = Field(default=50, ge=1, le=500)
     motd_min_quality_score: float = Field(default=0.5, ge=0.0, le=1.0)
@@ -419,6 +425,7 @@ class Settings(BaseSettings):
         "pipeline_broker_routing_key_prefix",
         "pipeline_broker_media_inspect_queue",
         "pipeline_broker_source_engagement_capture_queue",
+        "pipeline_broker_source_channel_audience_capture_queue",
         "pipeline_broker_transcode_queue",
         "pipeline_broker_ocr_queue",
         "pipeline_broker_embed_queue",

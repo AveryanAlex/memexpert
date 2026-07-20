@@ -6,11 +6,12 @@
   import AppShell from '$lib/features/app-shell/AppShell.svelte';
   import TelegramLoginModal from '$lib/features/auth/TelegramLoginModal.svelte';
   import { provideMemeVideoCoordinator } from '$lib/features/memes/meme-video-coordinator';
+  import { provideMemeExposureScope } from '$lib/features/memes/meme-exposure-scope';
   import { provideMemeActionState } from '$lib/meme-action-state';
   import TelegramMiniAppBootstrap from '$lib/TelegramMiniAppBootstrap.svelte';
   import TooltipProvider from '$lib/ui/tooltip/Provider.svelte';
   import { provideViewerCapabilities, viewerCapabilitiesFromSession } from '$lib/viewer-capabilities';
-  import type { Snippet } from 'svelte';
+  import { onMount, type Snippet } from 'svelte';
   import type { LayoutData } from './$types';
 
   let { data, children }: { data: LayoutData; children: Snippet } = $props();
@@ -20,6 +21,7 @@
   const session = $derived($authState.session);
   const sessionError = $derived($authState.sessionError);
   const memeActionState = provideMemeActionState(() => session?.user.id ?? null);
+  const memeExposureScope = provideMemeExposureScope(page.url.pathname);
   provideMemeVideoCoordinator();
 
   $effect(() => {
@@ -30,7 +32,16 @@
     memeActionState.syncViewer(session?.user.id ?? null);
   });
 
+  $effect(() => {
+    memeExposureScope.syncPage(page.url.pathname);
+  });
+
   provideViewerCapabilities(() => viewerCapabilitiesFromSession(session));
+
+  onMount(() => {
+    const nonce = globalThis.crypto?.randomUUID?.() ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+    memeExposureScope.beginClientVisit(nonce);
+  });
 </script>
 
 <svelte:head>

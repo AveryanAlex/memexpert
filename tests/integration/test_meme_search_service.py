@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, cast
@@ -49,6 +50,7 @@ from memexpert.models.user import AccountMergeLog, AnalyticsEvent, User
 from memexpert.schemas.user import UserRead
 from memexpert.services.analytics import AnalyticsService, InteractionEventRefs, InteractionEventWrite
 from memexpert.services.collection_service import CollectionService
+from memexpert.services.engagement_read_model import load_derived_popularity_scores
 from memexpert.services.media_render_urls import MediaRenderUrlService
 from memexpert.services.meme_search import MemeNotFoundError, MemeSearchFilters, MemeSearchScope, MemeSearchService
 from memexpert.services.meme_seo import MemeSeoGenerationService, MemeSeoProviderResult
@@ -966,6 +968,7 @@ async def test_public_openapi_registers_catalog_routes_without_internal_surface(
     assert "/api/v1/memes/{meme_id}/popularity" in paths
     assert "/api/v1/memes/{meme_id}/similar" in paths
     assert "/api/v1/memes/{meme_id}/impression" in paths
+    assert "/api/v1/memes/{meme_id}/view" in paths
     assert "/api/v1/memes/{meme_id}/detail-click" in paths
     assert "/api/v1/memes/{meme_id}" in paths
     search_parameter_list = paths["/api/v1/memes/search"]["get"]["parameters"]
@@ -3598,7 +3601,7 @@ async def test_public_trend_endpoints_rank_from_materialized_views_and_return_ag
     assert popularity_payload["trend"]["latest_source_views"] == 30
 
 
-async def test_public_trend_views_count_strict_writer_nested_meme_refs(
+async def test_public_trend_views_count_strict_refs_without_double_counting_inline_send_mirrors(
     app: FastAPI,
     client: AsyncClient,
     migrated_db_session: AsyncSession,
@@ -3623,6 +3626,14 @@ async def test_public_trend_views_count_strict_writer_nested_meme_refs(
     )
     await analytics_service.record_interaction_event(
         InteractionEventWrite(
+            event_type=AnalyticsEventType.MEME_SEND,
+            surface="telegram_inline",
+            refs=InteractionEventRefs(meme_id=meme.id),
+            properties={"chat_hash": "hashed-chat-inline"},
+        )
+    )
+    await analytics_service.record_interaction_event(
+        InteractionEventWrite(
             event_type=AnalyticsEventType.MEME_DOWNLOAD,
             surface="public_api",
             refs=InteractionEventRefs(meme_id=meme.id),
@@ -3637,6 +3648,8 @@ async def test_public_trend_views_count_strict_writer_nested_meme_refs(
         ]
     )
     await migrated_db_session.flush()
+    derived_scores = await load_derived_popularity_scores(migrated_db_session, (meme.id,))
+    assert derived_scores[meme.id] == pytest.approx(math.log(3) + math.log(4) * 3)
     await _refresh_trend_views(migrated_db_session)
     _install_meme_route_overrides(app, migrated_db_session)
 
@@ -3650,7 +3663,51 @@ async def test_public_trend_views_count_strict_writer_nested_meme_refs(
     assert trend["recent"]["views"] == 2
     assert trend["recent"]["sends"] == 3
     assert trend["recent"]["downloads"] == 1
-    assert trend["engagement_24h"] == 13.0
+    assert trend["engagement_24h"] == 11.0
+
+
+async def test_public_trend_downloads_are_adjacent_metrics_not_ranking_signals(
+    migrated_db_session: AsyncSession,
+) -> None:
+    download_meme = await _create_meme(migrated_db_session, tags=["download-ranking"])
+    viewed_meme = await _create_meme(migrated_db_session, tags=["download-ranking"])
+    analytics_service = AnalyticsService(migrated_db_session)
+    for _ in range(3):
+        await analytics_service.record_interaction_event(
+            InteractionEventWrite(
+                event_type=AnalyticsEventType.MEME_DOWNLOAD,
+                surface="public_api",
+                refs=InteractionEventRefs(meme_id=download_meme.id),
+            )
+        )
+    await analytics_service.record_interaction_event(
+        InteractionEventWrite(
+            event_type=AnalyticsEventType.MEME_VIEW,
+            surface="public_api",
+            refs=InteractionEventRefs(meme_id=viewed_meme.id),
+        )
+    )
+    await _refresh_trend_views(migrated_db_session)
+
+    page = await PublicTrendsService(migrated_db_session).rank_memes(
+        ranking="fastest_rising",
+        tags=("download-ranking",),
+        limit=10,
+    )
+
+    assert [item.meme.id for item in page.items] == [viewed_meme.id, download_meme.id]
+    download_item = page.items[1]
+    assert download_item.trend.recent.downloads == 3
+    assert download_item.trend.engagement_24h == 0.0
+    assert download_item.trend.trending_score == 0.0
+    assert download_item.attribution.algorithm_version == "public_trends_mv_v2"
+    assert download_item.attribution.score_components == {
+        "recent_weighted": 0.0,
+        "previous_weighted": 0.0,
+        "delta": 0.0,
+        "trending": 0.0,
+        "engagement_24h": 0.0,
+    }
 
 
 async def test_public_trend_empty_states_are_honest(
@@ -3730,10 +3787,12 @@ async def test_public_trend_compare_returns_real_series_and_insufficient_history
         migrated_db_session,
         meme=meme,
         file_id=meme.primary_file_id,
-        captured_counts=(0, 10, 25),
+        captured_counts=(0, 10, 5, 10, 25),
         captured_ats=(
             datetime(2026, 1, 1, tzinfo=UTC) - timedelta(seconds=1),
             datetime(2026, 1, 1, tzinfo=UTC),
+            datetime(2026, 1, 1, 1, tzinfo=UTC),
+            datetime(2026, 1, 1, 2, tzinfo=UTC),
             datetime(2026, 1, 2, tzinfo=UTC),
         ),
     )
@@ -3784,7 +3843,7 @@ async def test_public_trend_compare_returns_real_series_and_insufficient_history
     assert meme_series["points"][0]["value"] < meme_series["points"][1]["value"]
     assert {point["metric"] for point in meme_series["points"]} == {"popularity_score"}
     assert [point["meme_count"] for point in meme_series["points"]] == [1, 1]
-    assert [point["snapshot_count"] for point in meme_series["points"]] == [1, 1]
+    assert [point["snapshot_count"] for point in meme_series["points"]] == [3, 1]
     assert [point["source_views"] for point in meme_series["points"]] == [10, 15]
     assert all(
         point["source_views"]
@@ -3915,6 +3974,57 @@ async def test_public_trend_timeline_groups_real_snapshot_periods_without_privat
     ]
 
 
+async def test_public_trend_points_and_periods_stay_utc_in_a_non_utc_database_session(
+    migrated_db_session: AsyncSession,
+) -> None:
+    utc_day = (datetime.now(UTC) - timedelta(days=1)).replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    event_at = utc_day + timedelta(minutes=30)
+    source_at = utc_day + timedelta(hours=16, minutes=30)
+    meme = await _create_meme(migrated_db_session, tags=["utc-bucket"])
+    await _add_source_engagement_snapshots(
+        migrated_db_session,
+        meme=meme,
+        file_id=meme.primary_file_id,
+        captured_counts=(10, 25),
+        captured_ats=(source_at - timedelta(minutes=1), source_at),
+    )
+    migrated_db_session.add(
+        AnalyticsEvent(
+            event_type=AnalyticsEventType.MEME_VIEW,
+            payload={"refs": {"meme_id": str(meme.id)}},
+            occurred_at=event_at,
+        )
+    )
+    await migrated_db_session.flush()
+    await migrated_db_session.execute(text("SET LOCAL TIME ZONE 'Asia/Tokyo'"))
+
+    service = PublicTrendsService(migrated_db_session)
+    popularity = await service.meme_popularity_summary(meme.id)
+    assert popularity is not None
+    assert len(popularity.sparkline) == 1
+    assert popularity.sparkline[0].captured_at == utc_day
+    assert popularity.sparkline[0].source_views == 15
+    assert popularity.sparkline[0].platform_views == 1
+
+    timeline = await service.timeline_periods(granularity="month")
+    assert len(timeline.periods) == 1
+    assert timeline.periods[0].period_start == utc_day.replace(day=1)
+    assert timeline.periods[0].top_memes[0].first_captured_at == utc_day
+
+    await _refresh_trend_views(migrated_db_session)
+    tag_summary = await service.tag_summary("utc-bucket")
+    assert tag_summary is not None
+    assert len(tag_summary.points) == 1
+    assert tag_summary.points[0].observed_at == utc_day
+    assert tag_summary.points[0].source_views == 15
+    assert tag_summary.points[0].platform_views == 1
+
+
 async def test_public_trend_refresh_command_path_uses_concurrent_refresh_with_fallback(
     postgres_async_engine: AsyncEngine,
     migrated_db_session: AsyncSession,
@@ -4026,10 +4136,17 @@ async def test_detail_route_returns_not_found_for_missing_private_or_nsfw_withou
     nsfw_meme = await _create_meme(migrated_db_session, is_nsfw=True)
     missing_id = uuid.uuid4()
 
-    async def detail_response(meme_id: uuid.UUID, current_user: UserRead | None, include_nsfw: bool = False):
+    async def detail_response(
+        meme_id: uuid.UUID,
+        current_user: UserRead | None,
+        include_nsfw: bool = False,
+    ):
         _install_meme_route_overrides(app, migrated_db_session, current_user=current_user)
         try:
-            response = await client.get(f"/api/v1/memes/{meme_id}", params={"include_nsfw": include_nsfw})
+            response = await client.get(
+                f"/api/v1/memes/{meme_id}",
+                params={"include_nsfw": include_nsfw},
+            )
         finally:
             app.dependency_overrides.clear()
         return response
@@ -4051,6 +4168,16 @@ async def test_detail_route_returns_not_found_for_missing_private_or_nsfw_withou
 
     assert (await detail_response(nsfw_meme.id, _user_read(author))).status_code == 404
     assert (await detail_response(nsfw_meme.id, _user_read(author), include_nsfw=True)).status_code == 200
+
+    _install_meme_route_overrides(app, migrated_db_session, current_user=_user_read(author))
+    try:
+        view_response = await client.post(
+            f"/api/v1/memes/{nsfw_meme.id}/view",
+            params={"include_nsfw": True},
+        )
+    finally:
+        app.dependency_overrides.clear()
+    assert view_response.status_code == 200
 
     event = await migrated_db_session.scalar(
         select(AnalyticsEvent)

@@ -27,7 +27,11 @@ from memexpert.core.qdrant import (
 from memexpert.core.voyage import VoyageClientProtocol
 from memexpert.models.enums import ContentPipelineStage
 from memexpert.pipeline.dispatch import PipelineStageWorkContext
-from memexpert.pipeline.events import MediaInspectRequestedEvent, SourceEngagementCaptureRequestedEvent
+from memexpert.pipeline.events import (
+    MediaInspectRequestedEvent,
+    SourceChannelAudienceCaptureRequestedEvent,
+    SourceEngagementCaptureRequestedEvent,
+)
 from memexpert.pipeline.stage_completion import (
     CancelledStageDisposition,
     CancelledStageResolution,
@@ -42,6 +46,10 @@ from memexpert.services.pipeline_reliability import (
     record_dependency_failure,
     record_dependency_success,
 )
+from memexpert.services.source_channel_audience_capture import (
+    SourceChannelAudienceTelegramClientFactory,
+    capture_source_channel_audience_request,
+)
 from memexpert.services.source_engagement_capture import (
     SourceEngagementTelegramClientFactory,
     capture_source_engagement_request,
@@ -49,6 +57,7 @@ from memexpert.services.source_engagement_capture import (
 from memexpert.workers.pipeline_runtime.constants import (
     PIPELINE_REASON_MALFORMED_EVENT,
     PIPELINE_REASON_MEDIA_INSPECT_FAILED,
+    PIPELINE_REASON_SOURCE_CHANNEL_AUDIENCE_CAPTURE_FAILED,
     PIPELINE_REASON_SOURCE_ENGAGEMENT_CAPTURE_FAILED,
     PIPELINE_REASON_UNSUPPORTED_STAGE,
     PIPELINE_REASON_WORKER_SHUTDOWN,
@@ -120,6 +129,7 @@ class PipelineRuntime:
     dead_letter_exchange: RabbitExchange
     media_inspect_queue: RabbitQueue
     source_engagement_capture_queues: tuple[RabbitQueue, ...]
+    source_channel_audience_capture_queues: tuple[RabbitQueue, ...]
     transcode_queue: RabbitQueue
     ocr_queue: RabbitQueue
     embed_queue: RabbitQueue
@@ -128,6 +138,7 @@ class PipelineRuntime:
     sync_meili_queue: RabbitQueue
     media_inspect_retry_queue: RabbitQueue
     source_engagement_capture_retry_queues: tuple[RabbitQueue, ...]
+    source_channel_audience_capture_retry_queues: tuple[RabbitQueue, ...]
     transcode_retry_queue: RabbitQueue
     ocr_retry_queue: RabbitQueue
     embed_retry_queue: RabbitQueue
@@ -145,6 +156,8 @@ class PipelineRuntime:
     classification_client: ClassificationClientProtocol
     source_engagement_telegram_client_factory: SourceEngagementTelegramClientFactory
     source_engagement_close_telegram_client_after_capture: bool
+    source_channel_audience_telegram_client_factory: SourceChannelAudienceTelegramClientFactory
+    source_channel_audience_close_telegram_client_after_capture: bool
     dead_letter_recorder: DeadLetterRecorder
     source_engagement_telegram_session_manager: TelegramSessionManager | None = None
     health_reporter: RuntimeHealthReporter | None = None
@@ -170,6 +183,11 @@ class PipelineRuntime:
         )
         source_engagement_capture_queues = (
             [await self.broker.declare_queue(queue) for queue in self.source_engagement_capture_queues]
+            if self.role.consumes_source_engagement
+            else []
+        )
+        source_channel_audience_capture_queues = (
+            [await self.broker.declare_queue(queue) for queue in self.source_channel_audience_capture_queues]
             if self.role.consumes_source_engagement
             else []
         )
@@ -210,6 +228,11 @@ class PipelineRuntime:
         )
         source_engagement_capture_retry_queues = (
             [await self.broker.declare_queue(queue) for queue in self.source_engagement_capture_retry_queues]
+            if self.role.consumes_source_engagement
+            else []
+        )
+        source_channel_audience_capture_retry_queues = (
+            [await self.broker.declare_queue(queue) for queue in self.source_channel_audience_capture_retry_queues]
             if self.role.consumes_source_engagement
             else []
         )
@@ -286,6 +309,20 @@ class PipelineRuntime:
                 exchange,
                 routing_key=self.broker_settings.source_engagement_capture_retry_routing_key_for_session(session_key),
             )
+        for audience_capture_queue in source_channel_audience_capture_queues:
+            session_key = self._source_channel_audience_session_key_for_queue(audience_capture_queue.name)
+            _ = await audience_capture_queue.bind(
+                exchange,
+                routing_key=self.broker_settings.source_channel_audience_capture_binding_key_for_session(
+                    session_key,
+                ),
+            )
+            _ = await audience_capture_queue.bind(
+                exchange,
+                routing_key=self.broker_settings.source_channel_audience_capture_retry_routing_key_for_session(
+                    session_key,
+                ),
+            )
         if transcode_queue is not None:
             _ = await transcode_queue.bind(exchange, routing_key=self.broker_settings.meme_created_routing_key)
             _ = await transcode_queue.bind(exchange, routing_key=self.broker_settings.stage_replay_routing_key)
@@ -318,6 +355,16 @@ class PipelineRuntime:
                 retry_exchange,
                 routing_key=self.broker_settings.source_engagement_capture_retry_request_routing_key_for_session(
                     session_key,
+                ),
+            )
+        for audience_retry_queue in source_channel_audience_capture_retry_queues:
+            session_key = self._source_channel_audience_session_key_for_retry_queue(audience_retry_queue.name)
+            _ = await audience_retry_queue.bind(
+                retry_exchange,
+                routing_key=(
+                    self.broker_settings.source_channel_audience_capture_retry_request_routing_key_for_session(
+                        session_key,
+                    )
                 ),
             )
         if transcode_retry_queue is not None:
@@ -403,6 +450,51 @@ class PipelineRuntime:
                 coerce_dead_letter_payload(capture_event.model_dump(mode="json")),
                 message=message,
                 normalized_reason=PIPELINE_REASON_SOURCE_ENGAGEMENT_CAPTURE_FAILED,
+            )
+            return
+
+        await message.ack()
+
+    async def handle_source_channel_audience_capture_message(
+        self,
+        payload: object,
+        message: RabbitMessageLike,
+    ) -> None:
+        """Consume one scheduled Telegram channel-audience capture request."""
+
+        try:
+            capture_event = SourceChannelAudienceCaptureRequestedEvent.model_validate(payload)
+        except ValidationError:
+            await self._dead_letter_or_requeue(
+                coerce_dead_letter_payload(payload),
+                message=message,
+                normalized_reason=PIPELINE_REASON_MALFORMED_EVENT,
+            )
+            return
+
+        try:
+            _ = await capture_source_channel_audience_request(
+                self.session_factory,
+                capture_event,
+                telegram_client_factory=self.source_channel_audience_telegram_client_factory,
+                telegram_session_invalidator=(
+                    self.source_engagement_telegram_session_manager.invalidate_session
+                    if self.source_engagement_telegram_session_manager is not None
+                    else None
+                ),
+                close_telegram_client_after_capture=(
+                    self.source_channel_audience_close_telegram_client_after_capture
+                ),
+            )
+        except Exception:
+            effective_attempt = self._source_channel_audience_capture_effective_attempt(capture_event, message)
+            if effective_attempt < self.broker_settings.retry_max_attempts:
+                await message.reject(requeue=False)
+                return
+            await self._dead_letter_or_requeue(
+                coerce_dead_letter_payload(capture_event.model_dump(mode="json")),
+                message=message,
+                normalized_reason=PIPELINE_REASON_SOURCE_CHANNEL_AUDIENCE_CAPTURE_FAILED,
             )
             return
 
@@ -1351,6 +1443,16 @@ class PipelineRuntime:
             1,
         )
 
+    def _source_channel_audience_capture_effective_attempt(
+        self,
+        capture_event: SourceChannelAudienceCaptureRequestedEvent,
+        message: RabbitMessageLike,
+    ) -> int:
+        retry_queue_name = self.broker_settings.source_channel_audience_capture_retry_queue_for_session(
+            capture_event.session_key,
+        )
+        return max(1 + self._retry_cycle_count_for_queue(retry_queue_name, message.headers), 1)
+
     def _source_engagement_session_key_for_queue(self, queue_name: str) -> str:
         prefix = f"{self.broker_settings.source_engagement_capture_queue}."
         if not queue_name.startswith(prefix):
@@ -1362,6 +1464,19 @@ class PipelineRuntime:
         suffix = ".retry"
         if not queue_name.startswith(prefix) or not queue_name.endswith(suffix):
             raise ValueError(f"Unexpected source engagement retry queue name {queue_name!r}.")
+        return queue_name.removeprefix(prefix).removesuffix(suffix)
+
+    def _source_channel_audience_session_key_for_queue(self, queue_name: str) -> str:
+        prefix = f"{self.broker_settings.source_channel_audience_capture_queue}."
+        if not queue_name.startswith(prefix):
+            raise ValueError(f"Unexpected source channel audience queue name {queue_name!r}.")
+        return queue_name.removeprefix(prefix)
+
+    def _source_channel_audience_session_key_for_retry_queue(self, queue_name: str) -> str:
+        prefix = f"{self.broker_settings.source_channel_audience_capture_queue}."
+        suffix = ".retry"
+        if not queue_name.startswith(prefix) or not queue_name.endswith(suffix):
+            raise ValueError(f"Unexpected source channel audience retry queue name {queue_name!r}.")
         return queue_name.removeprefix(prefix).removesuffix(suffix)
 
     def _retry_cycle_count(self, stage: ContentPipelineStage, headers: dict[str, Any]) -> int:

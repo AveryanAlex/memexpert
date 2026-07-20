@@ -40,6 +40,7 @@ from memexpert.models.content import (
     PipelineStageJournal,
     RabbitMQOutboxMessage,
     SourceChannel,
+    SourceChannelAudienceSnapshot,
     SourceChannelBackfillJob,
     SourceChannelPost,
     TelegramAdminAuditLog,
@@ -95,6 +96,7 @@ from memexpert.models.user import (
     ChannelSuggestion,
     InlineUsageEvent,
     LoginEvent,
+    MemeExposure,
     TelegramLinkCode,
     User,
 )
@@ -131,6 +133,7 @@ EXPECTED_TABLES = {
     "meme_file_sync_target_snapshots",
     "login_events",
     "meme_files",
+    "meme_exposures",
     "meme_merge_logs",
     "meme_of_the_day_selections",
     "meme_seo_pages",
@@ -155,6 +158,7 @@ EXPECTED_TABLES = {
     "search_synonym_revisions",
     "search_synonym_sync_states",
     "source_channels",
+    "source_channel_audience_snapshots",
     "source_channel_backfill_attempts",
     "source_channel_backfill_jobs",
     "source_channel_posts",
@@ -382,6 +386,7 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
     assert meme_file_relationships["blocked_perceptual_hash"].mapper.class_ is BlockedPerceptualHash
     assert meme_source_relationships["engagement_snapshots"].mapper.class_ is MemeSourceEngagementSnapshot
     assert source_channel_relationships["telegram_session"].mapper.class_ is TelegramSession
+    assert source_channel_relationships["audience_snapshots"].mapper.class_ is SourceChannelAudienceSnapshot
     assert telegram_session_relationships["source_channels"].mapper.class_ is SourceChannel
     assert telegram_session_relationships["login_attempts"].mapper.class_ is TelegramSessionLoginAttempt
     assert metadata.tables["source_channels"].c["telegram_session_id"].foreign_keys
@@ -409,6 +414,7 @@ def test_metadata_registers_all_expected_tables_and_relationships() -> None:
     assert "session_id" not in metadata.tables["source_channels"].c
     assert "views" not in meme_source_columns
     assert "reactions" not in meme_source_columns
+    assert sa_inspect(MemeExposure).columns["exposure_key"] is not None
     assert sa_inspect(BlockedPerceptualHashAuditLog).columns["blocked_perceptual_hash_id"] is not None
     assert sa_inspect(TelegramAdminAuditLog).columns["telegram_session_id"] is not None
 

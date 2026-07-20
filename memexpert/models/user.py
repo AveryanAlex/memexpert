@@ -7,7 +7,19 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import BigInteger, CheckConstraint, ForeignKey, Index, String, Text, case, func, or_, text
+from sqlalchemy import (
+    BigInteger,
+    CheckConstraint,
+    ForeignKey,
+    Index,
+    String,
+    Text,
+    UniqueConstraint,
+    case,
+    func,
+    or_,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.orm import Mapped, foreign, mapped_column, relationship
@@ -302,6 +314,18 @@ class AnalyticsEvent(UUIDPrimaryKeyMixin, Base):
         Index("ix_analytics_events_occurred_at", "occurred_at"),
         Index("ix_analytics_events_user_id_occurred_at", "user_id", "occurred_at"),
         Index("ix_analytics_events_event_type_occurred_at", "event_type", "occurred_at"),
+        Index(
+            "ix_analytics_events_refs_meme_event_occurred",
+            text("((payload['refs']) ->> 'meme_id')"),
+            "event_type",
+            "occurred_at",
+        ),
+        Index(
+            "ix_analytics_events_legacy_meme_event_occurred",
+            text("(payload ->> 'meme_id')"),
+            "event_type",
+            "occurred_at",
+        ),
     )
 
     user_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -316,6 +340,67 @@ class AnalyticsEvent(UUIDPrimaryKeyMixin, Base):
     occurred_at: Mapped[datetime] = mapped_column(default=utcnow, nullable=False)
 
     user: Mapped["User | None"] = relationship("User", back_populates="analytics_events")
+
+
+class MemeExposure(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """Idempotent public exposure/funnel state without actor or query data."""
+
+    __tablename__ = "meme_exposures"
+    __table_args__ = (
+        UniqueConstraint(
+            "meme_id",
+            "kind",
+            "exposure_key",
+            name="uq_meme_exposures_meme_kind_key",
+        ),
+        CheckConstraint(
+            "kind IN ('web_card', 'telegram_inline')",
+            name="kind_supported",
+        ),
+        CheckConstraint(
+            "exposure_key <> ''",
+            name="key_not_blank",
+        ),
+        CheckConstraint(
+            "kind = 'web_card' OR detail_clicked_at IS NULL",
+            name="detail_click_web_only",
+        ),
+        CheckConstraint(
+            "kind = 'web_card' OR high_intent_action_at IS NULL",
+            name="high_intent_web_only",
+        ),
+        CheckConstraint(
+            "kind = 'telegram_inline' OR inline_chosen_at IS NULL",
+            name="inline_chosen_inline_only",
+        ),
+        CheckConstraint(
+            "kind = 'telegram_inline' OR inline_sent_at IS NULL",
+            name="inline_sent_inline_only",
+        ),
+        Index("ix_meme_exposures_meme_kind_exposed", "meme_id", "kind", "exposed_at"),
+        Index(
+            "ix_meme_exposures_meme_kind_converted",
+            "meme_id",
+            "kind",
+            "detail_clicked_at",
+            "inline_chosen_at",
+            "inline_sent_at",
+        ),
+    )
+
+    meme_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("memes.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    exposure_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    # Stage timestamps are nullable so a click/action arriving before the
+    # best-effort impression write can be reconciled when the exposure lands.
+    exposed_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    detail_clicked_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    high_intent_action_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    inline_chosen_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    inline_sent_at: Mapped[datetime | None] = mapped_column(nullable=True)
 
 
 class InlineUsageEvent(UUIDPrimaryKeyMixin, Base):
@@ -372,6 +457,7 @@ __all__ = [
     "ChannelSuggestion",
     "InlineUsageEvent",
     "LoginEvent",
+    "MemeExposure",
     "TelegramLinkCode",
     "User",
 ]

@@ -4,7 +4,70 @@
 
 ### Per-Meme Analytics
 
-Every meme page shows a public popularity chart (sparkline or expandable). Data: popularity score over time, view count, impression count, download count, like count, source count.
+Every public meme page has a source/activity summary plus an expandable
+professional view. The public read surface is:
+
+- `GET /api/v1/memes/{meme_id}/sources` — all Telegram
+  `public_crawler` posts across every file, stable `snapshot_at` pagination,
+  six supported sorts, safe channel/post links, availability, nullable latest
+  counters, coverage, views-based rates, and audience-normalized metrics.
+- `GET /api/v1/memes/{meme_id}/analytics?window=7d|30d|90d|all` — selected
+  UTC-period totals, activity points, seven-day momentum, peak bucket, current
+  favorites, an opening absolute source baseline as of the selected range start
+  plus server-bucketed absolute source end states, source
+  performance/coverage, known audience change, and separate exposure funnels.
+- `GET /api/v1/memes/{meme_id}/popularity` remains compatible for the compact
+  legacy popularity summary; professional UI must not present its opaque score
+  as Recorded activity.
+- Meme detail GETs are read-only. `POST /api/v1/memes/{meme_id}/view` records a
+  visible detail visit with optional discovery attribution. The web page emits
+  it once after hydration for each displayed meme ID, so source sort/page and
+  analytics-range navigation cannot manufacture additional MemeExpert views.
+
+Seven-, 30-, and 90-day activity points are explicit UTC days, independent of
+the PostgreSQL session timezone. `all` uses adaptive
+day/week/month buckets so recent history stays precise without making long
+histories unbounded. Absolute source points use the same server-selected bucket
+boundaries but emit only for buckets containing a real Telegram observation.
+The API returns explicit `history_start_at`, `history_end_at`, `refreshed_at`,
+granularity, and `insufficient_history`; the frontend does not re-bucket in
+browser-local time or fabricate a line from fewer than two usable points.
+
+**Recorded activity** is the unweighted sum of positive original-source view,
+reaction, and repost increases plus MemeExpert views, sends, saves, and favorite
+actions. It excludes comments, card impressions, inline results served,
+downloads, and subscribers. For each source counter, activity advances only
+above that counter's running observed high watermark: `100 → 90 → 100`
+contributes zero. The separate observed Telegram series starts with
+`opening_baseline`, the latest known absolute aggregate state as of the selected
+range's `start_at`, then reports the aggregate end state of each server bucket
+that contains one or more real captures. Multiple captures in a bucket collapse
+to their final state, and the returned point is stamped at the latest real
+`captured_at` represented in that bucket—not at an artificial bucket boundary
+or at every raw capture time. Corrections can therefore decrease between
+returned points, and a newly discovered post can introduce a baseline jump,
+without inventing intermediate samples.
+
+Download counts remain reportable as adjacent metrics, but contribute no
+weight to public trend rankings or Meme of the Day scoring.
+
+Telegram counters and subscriber counts are nullable, and all totals/rates
+carry measured/eligible post coverage. Views-based reaction/comment/repost
+rates use a ratio of sums over posts with that counter and positive views;
+combined interaction rate requires all three interaction counters. Per-1,000-
+subscriber views/interactions require a successful audience observation no
+more than 48 hours before publication. Subscriber snapshots are not
+backfilled, summed subscribers are not labeled reach, and no metric claims
+unique viewers.
+
+Web and Telegram-inline funnels are separate. `meme_exposures` stores one
+privacy-bounded fact per `(meme_id, kind, exposure_key)` and first-observed stage
+timestamps, including distinct inline-chosen and inline-sent stages. Web rates
+match detail clicks/high-intent actions only to keyed web card exposures; inline
+rates match chosen and sent outcomes only to keyed inline results. Unkeyed
+legacy events may increase lower-confidence exposure totals but never a funnel
+denominator or conversion. No public funnel groups by user, query, request,
+chat, or time proximity.
 
 ### Template Analytics
 
@@ -123,8 +186,14 @@ Core events:
 - **search_query:** normalized non-empty initial query, source
   (inline/web/miniapp), request ID, result total, returned count, latency_ms,
   filters, and collection scope
-- **meme_impression:** meme shown on screen/web feed or returned in a Telegram inline result; includes rank, surface, request/impression id, algorithm/source, score components
-- **meme_view:** detail page opened or PM/detail view shown
+- **meme_impression:** a web meme card reached at least 25% visibility; includes
+  stable placement-scoped impression ID plus rank, surface, request, and
+  algorithm/source attribution
+- **inline_served:** one meme returned in a Telegram inline result page with
+  its own stable exposure key; it is separate from web impressions
+- **meme_view:** detail page opened or PM/detail view shown; web detail reads
+  stay side-effect free and record this through the dedicated view action once
+  per displayed meme visit
 - **meme_detail_click:** user clicked from a feed/search/related block to a meme detail page
 - **meme_send / inline_chosen / inline_sent**
 - **meme_like / meme_save / meme_pin / meme_upload / meme_download / meme_share**

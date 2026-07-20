@@ -9,11 +9,14 @@
   import MemeActionMenu from './MemeActionMenu.svelte';
   import MemeMedia from './MemeMedia.svelte';
   import MemeZoomDialog from './MemeZoomDialog.svelte';
+  import { hasQualifyingMemeExposure, readMemeExposureScope } from './meme-exposure-scope';
   import type { MemeVideoPreviewMode } from './meme-video';
 
   interface Props {
     meme: PublicMemeCardRead;
     attribution?: MemeResultAttributionRead | null;
+    exposureId?: string;
+    exposurePlacement?: string;
     position?: number;
     total?: number;
     showAccessMarkers?: boolean;
@@ -24,6 +27,8 @@
   let {
     meme,
     attribution = null,
+    exposureId,
+    exposurePlacement,
     position,
     total,
     showAccessMarkers = false,
@@ -31,26 +36,52 @@
     videoPreviewMode = 'poster'
   }: Props = $props();
   let cardElement = $state<HTMLElement>();
-  let recordedImpressionFor = $state<string | null>(null);
+  const componentId = $props.id();
+  const exposureScope = readMemeExposureScope();
 
-  const href = $derived(memeHref(meme, attribution));
+  const providedExposureId = $derived(firstNonBlankExposureId(exposureId, attribution?.impression_id));
+  const resolvedExposureId = $derived.by(() => {
+    const scopeState = $exposureScope;
+    if (providedExposureId) {
+      return exposureScope.resolveExposureId(providedExposureId, exposurePlacement ?? `card:${componentId}:${meme.id}`);
+    }
+    if (!scopeState.clientReady) return null;
+    return exposureScope.resolveExposureId(
+      null,
+      exposurePlacement ?? `card:${componentId}:${meme.id}`
+    );
+  });
+  const exposureAttribution = $derived(
+    resolvedExposureId ? { ...(attribution ?? {}), impression_id: resolvedExposureId } : attribution
+  );
+  const href = $derived(memeHref(meme, exposureAttribution));
   const title = $derived(memeTitle(meme));
   const showTitle = $derived(title !== 'Untitled meme');
   const titleId = $derived(`meme-card-title-${meme.id}`);
   const accessVisibility = $derived(meme.viewer_access?.visibility ?? 'public');
-  const actionBody = $derived(memeActionAttributionBody(attribution));
+  const actionBody = $derived(memeActionAttributionBody(exposureAttribution));
   const telemetryRequest = $derived({ fetch, memeId: meme.id, body: actionBody, keepalive: true });
   const isVideo = $derived(Boolean(selectMediaRender(meme.primary_file).videoUrl));
 
   $effect(() => {
-    if (!browser || !cardElement || recordedImpressionFor === meme.id || typeof IntersectionObserver === 'undefined') return;
+    if (
+      !browser ||
+      !$exposureScope.clientReady ||
+      !resolvedExposureId ||
+      !cardElement ||
+      exposureScope.hasRecorded(resolvedExposureId) ||
+      typeof IntersectionObserver === 'undefined'
+    ) return;
 
-    const observedMemeId = meme.id;
+    const observedExposureId = resolvedExposureId;
     const observer = new IntersectionObserver(
       (entries) => {
-        if (recordedImpressionFor === observedMemeId || !entries.some((entry) => entry.isIntersecting)) return;
+        if (
+          exposureScope.hasRecorded(observedExposureId) ||
+          !hasQualifyingMemeExposure(entries)
+        ) return;
 
-        recordedImpressionFor = observedMemeId;
+        if (!exposureScope.claim(observedExposureId)) return;
         observer.disconnect();
         void recordMemeImpression(telemetryRequest).catch((error) => logTelemetryFailure('impression', error));
       },
@@ -67,6 +98,10 @@
     void recordMemeDetailClick(telemetryRequest).catch((error) => logTelemetryFailure('detail-click', error));
   }
 
+  function firstNonBlankExposureId(...values: Array<string | null | undefined>): string | null {
+    return values.find((value): value is string => Boolean(value?.trim())) ?? null;
+  }
+
   function logTelemetryFailure(action: 'detail-click' | 'impression', error: unknown) {
     console.warn('Meme card telemetry failed.', { action, memeId: meme.id, error });
   }
@@ -79,6 +114,7 @@
   aria-posinset={position}
   aria-setsize={total}
   aria-labelledby={showTitle ? titleId : undefined}
+  data-exposure-id={resolvedExposureId ?? undefined}
 >
   {#if isVideo}
     <div class="relative">
@@ -131,5 +167,5 @@
     </a>
   {/if}
   <MemeZoomDialog {meme} showTrigger={showZoom} />
-  <MemeActionMenu {meme} {href} {attribution} surface="card" />
+  <MemeActionMenu {meme} {href} attribution={exposureAttribution} surface="card" />
 </article>

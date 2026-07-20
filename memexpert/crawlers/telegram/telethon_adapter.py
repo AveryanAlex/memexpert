@@ -31,10 +31,11 @@ from telethon.errors import (
     UserDeactivatedError,
 )
 from telethon.sessions import StringSession
+from telethon.tl.functions.channels import GetFullChannelRequest
 from telethon.tl.types import Channel, InputPeerChannel
 from telethon.tl.types import Message as TelethonMessage
 from telethon.tl.types import MessageService as TelethonMessageService
-from telethon.utils import get_peer_id
+from telethon.utils import get_input_channel, get_peer_id
 
 from memexpert.core.database import build_async_engine, build_async_session_factory
 from memexpert.crawlers.telegram.client import (
@@ -47,6 +48,7 @@ from memexpert.crawlers.telegram.client import (
     PipelineTelegramSessionBannedError,
     PipelineTelegramSessionNotRunnableError,
     RawTelegramChannel,
+    RawTelegramChannelAudience,
     RawTelegramMessage,
     TelegramLiveEvent,
     TelegramMessageEditedEvent,
@@ -961,6 +963,26 @@ class PipelineTelethonClient(PipelineTelegramClientProtocol):
             username=getattr(entity, "username", None),
             title=getattr(entity, "title", None) or username_or_id,
             subscriber_count=subscriber_count if isinstance(subscriber_count, int) else None,
+        )
+
+    async def fetch_channel_audience(self, channel_id: str) -> RawTelegramChannelAudience:
+        """Fetch the current participant count through ``channels.getFullChannel``."""
+
+        client = await self._get_client()
+        entity = await self._resolve_entity(channel_id)
+        await self.rate_limiter.acquire()
+        full_channel = await self._await_operation(
+            client(GetFullChannelRequest(channel=get_input_channel(entity))),
+            operation="fetch_channel_audience",
+            timeout_seconds=self.factory.settings.crawler_telegram_resolve_timeout_seconds,
+            client=client,
+            channel_id=channel_id,
+        )
+        raw_count = getattr(getattr(full_channel, "full_chat", None), "participants_count", None)
+        subscriber_count = raw_count if isinstance(raw_count, int) and raw_count >= 0 else None
+        return RawTelegramChannelAudience(
+            channel_id=str(entity.id),
+            subscriber_count=subscriber_count,
         )
 
     async def fetch_single_message(

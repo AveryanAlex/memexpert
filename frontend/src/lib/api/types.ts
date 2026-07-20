@@ -370,6 +370,207 @@ export interface PublicMemePopularitySummaryRead {
   sparkline: PublicMemePopularityPointRead[];
 }
 
+export type PublicMemeSourceSort =
+  | 'views_desc'
+  | 'reactions_desc'
+  | 'reposts_desc'
+  | 'interaction_rate_desc'
+  | 'newest'
+  | 'oldest';
+
+export type PublicMemeAnalyticsWindow = '7d' | '30d' | '90d' | 'all';
+export type PublicMemeAnalyticsGranularity = 'day' | 'week' | 'month' | 'adaptive';
+
+export interface PublicMemeMetricCoverageRead {
+  measured_posts: number;
+  total_posts: number;
+  ratio: number;
+}
+
+export interface PublicMemeSourceCoverageRead {
+  views: PublicMemeMetricCoverageRead;
+  reactions: PublicMemeMetricCoverageRead;
+  comments: PublicMemeMetricCoverageRead;
+  reposts: PublicMemeMetricCoverageRead;
+}
+
+export interface PublicMemeSourceTotalsRead {
+  views: number | null;
+  reactions: number | null;
+  comments: number | null;
+  reposts: number | null;
+}
+
+export interface PublicMemeSourceRateRead {
+  value: number | null;
+  numerator: number | null;
+  denominator: number | null;
+  eligible_posts: number;
+  total_posts: number;
+}
+
+export interface PublicMemeSourceRatesRead {
+  reactions: PublicMemeSourceRateRead;
+  comments: PublicMemeSourceRateRead;
+  reposts: PublicMemeSourceRateRead;
+  interactions: PublicMemeSourceRateRead;
+}
+
+export interface PublicMemeSourceAudienceRead {
+  audience_at_publish: number | null;
+  current_audience: number | null;
+  views_per_1000_subscribers: number | null;
+  interactions_per_1000_subscribers: number | null;
+}
+
+export interface PublicMemeSourceAudienceSummaryRead {
+  current_known_channels: number;
+  total_channels: number;
+  publish_time_eligible_posts: number;
+  total_posts: number;
+  views_per_1000_subscribers: PublicMemeSourceRateRead;
+  interactions_per_1000_subscribers: PublicMemeSourceRateRead;
+}
+
+export interface PublicMemeSourcePostRead {
+  channel_title: string;
+  channel_username: string | null;
+  channel_url: string | null;
+  post_url: string | null;
+  published_at: string | null;
+  available: boolean;
+  captured_at: string | null;
+  views: number | null;
+  reactions: number | null;
+  comments: number | null;
+  reposts: number | null;
+  rates: PublicMemeSourceRatesRead;
+  audience: PublicMemeSourceAudienceRead;
+}
+
+export interface PublicMemeSourceSummaryRead {
+  total_posts: number;
+  available_posts: number;
+  distinct_channels: number;
+  earliest_published_at: string | null;
+  latest_published_at: string | null;
+  latest_captured_at: string | null;
+  totals: PublicMemeSourceTotalsRead;
+  coverage: PublicMemeSourceCoverageRead;
+  rates: PublicMemeSourceRatesRead;
+  audience: PublicMemeSourceAudienceSummaryRead;
+}
+
+export interface PublicMemeSourcePageRead {
+  meme_id: string;
+  snapshot_at: string;
+  sort: PublicMemeSourceSort;
+  items: PublicMemeSourcePostRead[];
+  summary: PublicMemeSourceSummaryRead;
+  limit: number;
+  offset: number;
+  total: number;
+  has_more: boolean;
+}
+
+export interface PublicMemeActivityCountsRead {
+  source_views: number;
+  source_reactions: number;
+  source_reposts: number;
+  memeexpert_views: number;
+  memeexpert_sends: number;
+  memeexpert_saves: number;
+  memeexpert_favorites: number;
+  downloads: number;
+  recorded_activity: number;
+}
+
+export interface PublicMemeActivityPointRead extends PublicMemeActivityCountsRead {
+  bucket_start: string;
+  bucket_end: string;
+  granularity: PublicMemeAnalyticsGranularity;
+}
+
+export interface PublicMemeAnalyticsMomentumRead {
+  recent_recorded_activity: number;
+  previous_recorded_activity: number;
+  change: number;
+  change_rate: number | null;
+}
+
+export interface PublicMemeAnalyticsPeakRead {
+  bucket_start: string;
+  bucket_end: string;
+  granularity: PublicMemeAnalyticsGranularity;
+  recorded_activity: number;
+}
+
+export interface PublicMemeAnalyticsSummaryRead {
+  totals: PublicMemeActivityCountsRead;
+  average_recorded_activity_per_day: number;
+  current_favorites: number;
+  momentum: PublicMemeAnalyticsMomentumRead;
+  peak: PublicMemeAnalyticsPeakRead | null;
+}
+
+export interface PublicMemeObservedSourcePointRead extends PublicMemeSourceTotalsRead {
+  observed_at: string;
+  coverage: PublicMemeSourceCoverageRead;
+}
+
+export interface PublicMemeObservedSourceSeriesRead {
+  opening_baseline: PublicMemeObservedSourcePointRead;
+  points: PublicMemeObservedSourcePointRead[];
+}
+
+export interface PublicMemeWebExposureFunnelRead {
+  recorded_card_impressions: number;
+  attributed_impressions: number;
+  matched_detail_clicks: number;
+  matched_high_intent_actions: number;
+  detail_click_rate: number | null;
+  high_intent_rate: number | null;
+}
+
+export interface PublicMemeInlineExposureFunnelRead {
+  inline_results_served: number;
+  attributed_results_served: number;
+  matched_chosen: number;
+  matched_sent: number;
+  chosen_rate: number | null;
+  sent_rate: number | null;
+}
+
+export interface PublicMemeExposureFunnelsRead {
+  web: PublicMemeWebExposureFunnelRead;
+  telegram_inline: PublicMemeInlineExposureFunnelRead;
+}
+
+export interface PublicMemeChannelAudienceChangeRead {
+  total_channels: number;
+  current_known_channels: number;
+  comparable_channels: number;
+  net_known_subscriber_change: number | null;
+}
+
+export interface PublicMemeAnalyticsRead {
+  meme_id: string;
+  window: PublicMemeAnalyticsWindow;
+  start_at: string;
+  end_at: string;
+  granularity: PublicMemeAnalyticsGranularity;
+  history_start_at: string | null;
+  history_end_at: string | null;
+  refreshed_at: string;
+  insufficient_history: boolean;
+  summary: PublicMemeAnalyticsSummaryRead;
+  activity_points: PublicMemeActivityPointRead[];
+  observed_source: PublicMemeObservedSourceSeriesRead;
+  source_performance: PublicMemeSourceSummaryRead;
+  audience_change: PublicMemeChannelAudienceChangeRead;
+  exposure_funnels: PublicMemeExposureFunnelsRead;
+}
+
 export interface PublicTrendAggregatePointRead {
   observed_at: string | null;
   value: number;

@@ -71,7 +71,6 @@ _DERIVED_POPULARITY_SCORE_SQL = text(
             'meme_send',
             'share',
             'meme_share',
-            'inline_sent',
             'meme_save',
             'save',
             'meme_like',
@@ -83,7 +82,7 @@ _DERIVED_POPULARITY_SCORE_SQL = text(
             se.meme_id,
             count(*) FILTER (WHERE se.event_type IN ('meme_view', 'view'))::integer AS platform_views,
             count(*) FILTER (
-                WHERE se.event_type IN ('meme_send', 'share', 'meme_share', 'inline_sent')
+                WHERE se.event_type IN ('meme_send', 'share', 'meme_share')
             )::integer AS platform_sends,
             count(*) FILTER (WHERE se.event_type IN ('meme_save', 'save'))::integer AS platform_saves,
             count(*) FILTER (WHERE se.event_type IN ('meme_like', 'favorite'))::integer AS platform_likes

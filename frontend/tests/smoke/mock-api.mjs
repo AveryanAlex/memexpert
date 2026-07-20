@@ -221,6 +221,38 @@ const trend = {
   refreshed_at: '2026-01-01T00:00:00Z'
 };
 
+const smokeSourceCoverage = {
+  views: { measured_posts: 1, total_posts: 1, ratio: 1 },
+  reactions: { measured_posts: 1, total_posts: 1, ratio: 1 },
+  comments: { measured_posts: 0, total_posts: 1, ratio: 0 },
+  reposts: { measured_posts: 1, total_posts: 1, ratio: 1 }
+};
+const smokeSourceRates = {
+  reactions: { value: 0.05, numerator: 6, denominator: 120, eligible_posts: 1, total_posts: 1 },
+  comments: { value: null, numerator: null, denominator: null, eligible_posts: 0, total_posts: 1 },
+  reposts: { value: 0.025, numerator: 3, denominator: 120, eligible_posts: 1, total_posts: 1 },
+  interactions: { value: null, numerator: null, denominator: null, eligible_posts: 0, total_posts: 1 }
+};
+const smokeSourceSummary = {
+  total_posts: 1,
+  available_posts: 1,
+  distinct_channels: 1,
+  earliest_published_at: '2025-12-31T18:00:00Z',
+  latest_published_at: '2025-12-31T18:00:00Z',
+  latest_captured_at: '2026-01-02T00:00:00Z',
+  totals: { views: 120, reactions: 6, comments: null, reposts: 3 },
+  coverage: smokeSourceCoverage,
+  rates: smokeSourceRates,
+  audience: {
+    current_known_channels: 1,
+    total_channels: 1,
+    publish_time_eligible_posts: 1,
+    total_posts: 1,
+    views_per_1000_subscribers: { value: 240, numerator: 120, denominator: 500, eligible_posts: 1, total_posts: 1 },
+    interactions_per_1000_subscribers: { value: null, numerator: null, denominator: null, eligible_posts: 0, total_posts: 1 }
+  }
+};
+
 const motdAlgorithmVersion = 'motd-smoke-v1';
 const motdScoreComponents = { popularity: 0.42, quality: 0.55 };
 const motdScore = 0.97;
@@ -588,6 +620,8 @@ const transientSourceRefreshFailures = new WeakSet();
 const loginAttemptPolls = new Map();
 const staleFullSessionReads = new Set();
 let loginAttemptSequence = 0;
+let detailReadCount = 0;
+let detailViewCount = 0;
 
 const adminSourcePosts = [
   {
@@ -863,6 +897,11 @@ const adminTemplates = [
 const server = createServer((request, response) => {
   const url = new URL(request.url ?? '/', `http://${request.headers.host ?? `127.0.0.1:${port}`}`);
 
+  if (url.pathname === '/__smoke/stats') {
+    sendJson(response, 200, { detailReadCount, detailViewCount });
+    return;
+  }
+
   if (url.pathname === '/health') {
     sendJson(response, 200, { ok: true });
     return;
@@ -1062,6 +1101,7 @@ const server = createServer((request, response) => {
   }
 
   if (url.pathname === '/api/v1/memes/slug/smoke-test-cat-reaction') {
+    detailReadCount += 1;
     sendJson(response, 200, { ...detail, ...projectViewerMeme(request, meme) });
     return;
   }
@@ -1078,7 +1118,78 @@ const server = createServer((request, response) => {
     return;
   }
 
-  if (/^\/api\/v1\/memes\/[^/]+\/(?:detail-click|download|impression|share)$/.test(url.pathname)) {
+  if (url.pathname === '/api/v1/memes/smoke-meme-1/sources') {
+    sendJson(response, 200, {
+      meme_id: 'smoke-meme-1',
+      snapshot_at: url.searchParams.get('snapshot_at') ?? '2026-01-02T00:00:00Z',
+      sort: url.searchParams.get('sort') ?? 'views_desc',
+      items: [{
+        channel_title: 'Smoke Memes Lab',
+        channel_username: 'smoke_memes_lab',
+        channel_url: 'https://t.me/smoke_memes_lab',
+        post_url: 'https://t.me/smoke_memes_lab/42',
+        published_at: '2025-12-31T18:00:00Z',
+        available: true,
+        captured_at: '2026-01-02T00:00:00Z',
+        views: 120,
+        reactions: 6,
+        comments: null,
+        reposts: 3,
+        rates: smokeSourceRates,
+        audience: {
+          audience_at_publish: 500,
+          current_audience: 540,
+          views_per_1000_subscribers: 240,
+          interactions_per_1000_subscribers: null
+        }
+      }],
+      summary: smokeSourceSummary,
+      limit: Number(url.searchParams.get('limit') ?? 10),
+      offset: Number(url.searchParams.get('offset') ?? 0),
+      total: 1,
+      has_more: false
+    });
+    return;
+  }
+
+  if (url.pathname === '/api/v1/memes/smoke-meme-1/analytics') {
+    sendJson(response, 200, {
+      meme_id: 'smoke-meme-1',
+      window: url.searchParams.get('window') ?? '30d',
+      start_at: '2025-12-03T00:00:00Z',
+      end_at: '2026-01-02T00:00:00Z',
+      granularity: 'day',
+      history_start_at: '2025-12-31T18:00:00Z',
+      history_end_at: '2026-01-02T00:00:00Z',
+      refreshed_at: '2026-01-02T00:00:00Z',
+      insufficient_history: false,
+      summary: {
+        totals: { source_views: 30, source_reactions: 2, source_reposts: 1, memeexpert_views: 12, memeexpert_sends: 3, memeexpert_saves: 2, memeexpert_favorites: 1, downloads: 4, recorded_activity: 51 },
+        average_recorded_activity_per_day: 1.7,
+        current_favorites: 7,
+        momentum: { recent_recorded_activity: 40, previous_recorded_activity: 11, change: 29, change_rate: 2.636 },
+        peak: { bucket_start: '2026-01-01T00:00:00Z', bucket_end: '2026-01-02T00:00:00Z', granularity: 'day', recorded_activity: 35 }
+      },
+      activity_points: [
+        { bucket_start: '2025-12-31T00:00:00Z', bucket_end: '2026-01-01T00:00:00Z', granularity: 'day', source_views: 10, source_reactions: 1, source_reposts: 0, memeexpert_views: 2, memeexpert_sends: 1, memeexpert_saves: 1, memeexpert_favorites: 0, downloads: 1, recorded_activity: 15 },
+        { bucket_start: '2026-01-01T00:00:00Z', bucket_end: '2026-01-02T00:00:00Z', granularity: 'day', source_views: 20, source_reactions: 1, source_reposts: 1, memeexpert_views: 10, memeexpert_sends: 2, memeexpert_saves: 1, memeexpert_favorites: 1, downloads: 3, recorded_activity: 36 }
+      ],
+      observed_source: {
+        opening_baseline: { observed_at: '2025-12-31T18:00:00Z', views: 90, reactions: 4, comments: null, reposts: 2, coverage: smokeSourceCoverage },
+        points: [{ observed_at: '2026-01-02T00:00:00Z', views: 120, reactions: 6, comments: null, reposts: 3, coverage: smokeSourceCoverage }]
+      },
+      source_performance: smokeSourceSummary,
+      audience_change: { total_channels: 1, current_known_channels: 1, comparable_channels: 1, net_known_subscriber_change: 40 },
+      exposure_funnels: {
+        web: { recorded_card_impressions: 20, attributed_impressions: 18, matched_detail_clicks: 8, matched_high_intent_actions: 3, detail_click_rate: 0.4444, high_intent_rate: 0.1667 },
+        telegram_inline: { inline_results_served: 10, attributed_results_served: 9, matched_chosen: 4, matched_sent: 3, chosen_rate: 0.4444, sent_rate: 0.3333 }
+      }
+    });
+    return;
+  }
+
+  if (/^\/api\/v1\/memes\/[^/]+\/(?:detail-click|download|impression|share|view)$/.test(url.pathname)) {
+    if (url.pathname.endsWith('/view')) detailViewCount += 1;
     sendJson(response, 200, { ok: true });
     return;
   }

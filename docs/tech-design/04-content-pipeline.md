@@ -539,32 +539,53 @@ LLM identifies known templates from image during SEO generation. Fuzzy-matched a
 
 ### Derived Popularity
 
-Public `popularity_score` fields are derived read-model/index payload values, not canonical meme columns. They are recomputed from the latest successful source engagement snapshots plus platform interaction events and synced to Qdrant/Meilisearch in batch.
+Public `popularity_score` fields are derived read-model/index payload values,
+not canonical meme columns. They are recomputed from the latest successful
+source-engagement snapshots plus canonical platform-interaction events and
+synced to Qdrant/Meilisearch in batch.
 
 ```text
-popularity = log(1 + source_views) × source_view_weight
-           + log(1 + source_reactions) × source_reaction_weight
-           + log(1 + source_reposts) × source_repost_weight
-           + log(1 + platform_sends) × send_weight
-           + log(1 + platform_likes) × like_weight
-           + log(1 + platform_saves) × save_weight
-           + log(1 + platform_downloads) × download_weight
-           + log(1 + platform_views) × view_weight
+popularity = ln(1 + source_views) × 1
+           + ln(1 + source_reactions) × 2
+           + ln(1 + source_reposts) × 3
+           + ln(1 + platform_views) × 1
+           + ln(1 + platform_sends) × 3
+           + ln(1 + platform_saves) × 4
+           + ln(1 + platform_likes) × 5
 ```
 
-Logarithmic scaling prevents viral outliers from dominating. Source totals come from the latest successful `meme_source_engagement_snapshots` row per source post. Historical charts and velocity windows use snapshot-to-snapshot deltas; the first source snapshot is only a baseline and contributes no invented delta. Platform metrics come from `analytics_events`.
+Logarithmic scaling prevents viral outliers from dominating. Source totals come
+from the latest successful `meme_source_engagement_snapshots` row per source
+post. Windowed source activity advances only above each counter's prior running
+high watermark; the first source snapshot is a baseline, corrections contribute
+no negative activity, and recovery to an already observed high does not count
+twice. Platform metrics come from canonical aliases in `analytics_events`.
+Downloads remain reportable beside the score but have zero ranking weight;
+impressions/results served are exposure denominators and never popularity
+inputs.
 
 Snapshot `NULL` means Telegram did not expose a counter and is preserved in canonical storage. Public read models may coalesce unknown to `0` for ranking/output. Telegram `forward_count` is the public forward/repost counter that feeds derived source repost metrics; forwarded-message provenance (`forwarded_from_*`) is attribution, not engagement.
 
 ### Trending Score
 
-Measures recent growth velocity. Prefer materialized views for rankings and aggregate trend surfaces when they simplify reads.
+The public trend materialized views combine weighted recent activity, positive
+week-over-week growth, and a small lifetime-popularity prior:
 
 ```text
-trending = (engagement_last_24h - engagement_prev_24h) / (engagement_prev_24h + k)
+weighted(window) = views/source-views × 1
+                 + sends/source-reposts × 3
+                 + likes/source-reactions × 5
+                 + saves × 4
+
+trending = weighted(7d)
+         + weighted(24h) × 0.5
+         + max(weighted(7d) - weighted(previous 7d), 0) × 0.75
+         + popularity × 0.25
 ```
 
-Where `engagement` = weighted sum of sends, saves, downloads, likes, views, impressions, and new source appearances over the window. `k` dampens noise from low-volume memes.
+Source-window inputs use the running-high-watermark increases described above.
+Canonical MemeExpert sends are counted once even when an inline-delivery mirror
+event exists. Downloads and impressions remain outside the ranking score.
 
 ### Meme of the Day
 

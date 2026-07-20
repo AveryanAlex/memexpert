@@ -10,7 +10,10 @@
 - Tap → sends as photo (images) or animation (GIFs). Sent as a plain image, no buttons, no branding.
 - Videos excluded from inline.
 - Empty query: pins → personalized/recent sends → trending (full accounts); trending only until enough personal history exists.
-- Inline impressions and chosen/sent results are tracked for analytics and recommendations.
+- Inline results served and chosen/sent outcomes carry stable exposure keys for
+  analytics and recommendations. Public funnel rates use only keyed results;
+  unkeyed legacy events remain lower-confidence totals and are never matched by
+  user identity or time proximity.
 
 MVP implementation note: inline answers can reuse cached Telegram Bot API `file_id`s and public HTTPS media URLs. First-send upload from private object storage is deferred until the bot has a presigned/public media URL or a proactive upload/cache warmup path.
 
@@ -59,3 +62,21 @@ Provides:
 ## Share from Website
 
 Meme pages include a "Share to Telegram" button. Opens a Telegram share dialog — user picks a chat, the meme is shared. Implementation: standard `https://t.me/share/url?url=...` with meme page link, or a deep link to the Mini App for richer experience.
+
+## Public Telegram Attribution
+
+Public meme pages attribute every observed Telegram post attached to any file
+of the meme, but only when its provenance is `source_kind=public_crawler`.
+Uploader/operator sources, crawler account/session identity, source text, raw
+platform IDs, and forwarded-original identity never enter the public response.
+When a tracked channel still has a valid public username, the page links to the
+channel and exact post. A deleted or inaccessible post remains in historical
+attribution and is marked unavailable rather than silently disappearing.
+
+Telegram views, reactions, comments, and reposts are independently nullable.
+Missing means Telegram did not expose the counter; it is not rendered or
+aggregated as a known zero. Subscriber counts are forward-only observations
+from `channels.getFullChannel` during source creation, crawler refresh, and
+daily capture. They support coverage-qualified per-post and
+per-1,000-subscriber comparisons, not claims of unique reach or reconstructed
+historical audience.

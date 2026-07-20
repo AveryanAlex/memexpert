@@ -174,7 +174,6 @@ class MemeOfTheDayService:
                             + COALESCE(mt.recent_send_count, 0) * 3
                             + COALESCE(mt.recent_like_count, 0) * 5
                             + COALESCE(mt.recent_save_count, 0) * 4
-                            + COALESCE(mt.recent_download_count, 0) * 2
                         )
                         -
                         (
@@ -182,7 +181,6 @@ class MemeOfTheDayService:
                             + COALESCE(mt.previous_send_count, 0) * 3
                             + COALESCE(mt.previous_like_count, 0) * 5
                             + COALESCE(mt.previous_save_count, 0) * 4
-                            + COALESCE(mt.previous_download_count, 0) * 2
                         ),
                         0
                     )::double precision AS trending_growth_raw

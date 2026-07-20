@@ -52,7 +52,7 @@ class WorkerRole(StrEnum):
 
     @property
     def consumes_source_engagement(self) -> bool:
-        """Whether the role consumes per-account Telegram engagement work."""
+        """Whether the role consumes session-affined Telegram metrics work."""
 
         return self in {WorkerRole.ALL, WorkerRole.TELEGRAM}
 

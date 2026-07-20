@@ -264,6 +264,7 @@ async def test_detail_and_successful_actions_persist_strict_attribution_events(
             f"/api/v1/memes/{target_meme.id}",
             params=_attribution_query_params(source_meme.id),
         )
+        view_response = await client.post(f"/api/v1/memes/{target_meme.id}/view", json=action_payload)
         impression_response = await client.post(f"/api/v1/memes/{target_meme.id}/impression", json=action_payload)
         detail_click_response = await client.post(f"/api/v1/memes/{target_meme.id}/detail-click", json=action_payload)
         favorite_response = await client.post(f"/api/v1/memes/{target_meme.id}/favorite", json=action_payload)
@@ -282,6 +283,7 @@ async def test_detail_and_successful_actions_persist_strict_attribution_events(
         app.dependency_overrides.clear()
 
     assert detail_response.status_code == 200
+    assert view_response.json() == {"ok": True}
     assert impression_response.json() == {"ok": True}
     assert detail_click_response.json() == {"ok": True}
     assert favorite_response.status_code == 200
@@ -366,10 +368,12 @@ async def test_share_download_telemetry_respects_private_and_nsfw_visibility(
     app.dependency_overrides[get_optional_current_user] = override_current_user
     try:
         private_share_response = await client.post(f"/api/v1/memes/{private_meme.id}/share", json={})
+        private_view_response = await client.post(f"/api/v1/memes/{private_meme.id}/view", json={})
         private_impression_response = await client.post(f"/api/v1/memes/{private_meme.id}/impression", json={})
         private_detail_click_response = await client.post(f"/api/v1/memes/{private_meme.id}/detail-click", json={})
         private_download_response = await client.post(f"/api/v1/memes/{private_meme.id}/download", json={})
         nsfw_share_response = await client.post(f"/api/v1/memes/{nsfw_meme.id}/share", json={})
+        nsfw_view_response = await client.post(f"/api/v1/memes/{nsfw_meme.id}/view", json={})
         nsfw_impression_response = await client.post(f"/api/v1/memes/{nsfw_meme.id}/impression", json={})
         nsfw_detail_click_response = await client.post(f"/api/v1/memes/{nsfw_meme.id}/detail-click", json={})
         nsfw_download_response = await client.post(f"/api/v1/memes/{nsfw_meme.id}/download", json={})
@@ -377,10 +381,12 @@ async def test_share_download_telemetry_respects_private_and_nsfw_visibility(
         app.dependency_overrides.clear()
 
     assert private_share_response.status_code == 404
+    assert private_view_response.status_code == 404
     assert private_impression_response.status_code == 404
     assert private_detail_click_response.status_code == 404
     assert private_download_response.status_code == 404
     assert nsfw_share_response.status_code == 404
+    assert nsfw_view_response.status_code == 404
     assert nsfw_impression_response.status_code == 404
     assert nsfw_detail_click_response.status_code == 404
     assert nsfw_download_response.status_code == 404

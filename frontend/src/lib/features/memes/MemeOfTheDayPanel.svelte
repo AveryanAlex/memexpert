@@ -72,7 +72,13 @@
         class="w-full md:max-w-[34rem] md:justify-self-end"
         {...memeDiscoveryDataAttributes(current.attribution)}
       >
-        <MemeCard meme={current.meme} attribution={current.attribution} {showAccessMarkers} />
+        <MemeCard
+          meme={current.meme}
+          attribution={current.attribution}
+          exposureId={current.attribution?.impression_id}
+          exposurePlacement={`meme-of-the-day:${current.meme.id}`}
+          {showAccessMarkers}
+        />
       </div>
     {:else}
       <div class="grid gap-1 py-3" role="status">

@@ -28,6 +28,7 @@ from memexpert.scheduler.jobs import (
     JOB_ID_RECOVERY_DISPATCH,
     JOB_ID_SEARCH_INDEX_SYNC,
     JOB_ID_SEO_BACKLOG_BATCHES,
+    JOB_ID_SOURCE_CHANNEL_AUDIENCE_CAPTURE,
     JOB_ID_SOURCE_ENGAGEMENT_CAPTURE,
     JOB_ID_TELEGRAM_LOGIN_CLEANUP,
     build_scheduler_job_definitions,
@@ -43,6 +44,7 @@ from memexpert.schemas.meme import PublicMemeCardRead, PublicMemeOfTheDayRead
 from memexpert.services.admin_telegram_login import TelegramLoginCleanupBatchResult
 from memexpert.services.meilisearch_settings_reconcile import MeilisearchSettingsReconcileResult
 from memexpert.services.scheduler_batch_jobs import SearchIndexBatchJobResult, SeoBacklogBatchJobResult
+from memexpert.services.source_channel_audience_scheduler import SourceChannelAudienceCaptureSchedulerResult
 from memexpert.services.source_engagement_scheduler import SourceEngagementCaptureSchedulerResult
 
 
@@ -239,6 +241,7 @@ def test_scheduler_job_definitions_register_expected_ids() -> None:
         JOB_ID_RECOVERY_DISPATCH,
         JOB_ID_PIPELINE_CAPACITY_REFRESH,
         JOB_ID_TELEGRAM_LOGIN_CLEANUP,
+        JOB_ID_SOURCE_CHANNEL_AUDIENCE_CAPTURE,
     ]
     reconcile_definition = next(
         definition for definition in definitions if definition.id == JOB_ID_MEILISEARCH_SETTINGS_RECONCILE
@@ -253,6 +256,7 @@ def test_enabled_scheduler_jobs_filters_disabled_jobs() -> None:
         {
             "scheduler_materialized_view_refresh_enabled": False,
             "scheduler_source_engagement_capture_enabled": True,
+            "scheduler_source_channel_audience_capture_enabled": False,
             "scheduler_motd_enabled": False,
             "scheduler_search_index_sync_enabled": True,
             "scheduler_meilisearch_settings_reconcile_enabled": False,
@@ -347,6 +351,51 @@ async def test_source_engagement_capture_job_calls_batch_service_and_logs_result
             },
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_source_channel_audience_capture_job_calls_batch_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings.model_validate({"scheduler_source_channel_audience_capture_enabled": True})
+    engine = cast("AsyncEngine", object())
+    session_factory = object()
+    called: dict[str, object] = {}
+
+    def fake_build_session_factory(bound_engine: object) -> object:
+        called["engine"] = bound_engine
+        return session_factory
+
+    monkeypatch.setattr(
+        "memexpert.scheduler.jobs.build_async_session_factory",
+        fake_build_session_factory,
+    )
+
+    async def fake_run_batch(
+        session_factory_arg: object,
+        *,
+        settings: Settings,
+    ) -> SourceChannelAudienceCaptureSchedulerResult:
+        called["session_factory"] = session_factory_arg
+        called["settings"] = settings
+        return SourceChannelAudienceCaptureSchedulerResult(
+            claimed=1,
+            enqueued=1,
+            source_channel_ids=(uuid.UUID("00000000-0000-0000-0000-000000000001"),),
+            outbox_message_ids=(uuid.UUID("00000000-0000-0000-0000-000000000002"),),
+            duration_seconds=0.1,
+        )
+
+    monkeypatch.setattr(
+        "memexpert.scheduler.jobs.run_scheduler_source_channel_audience_capture_batch",
+        fake_run_batch,
+    )
+    definition = build_scheduler_job_definitions(settings, engine=engine)[-1]
+
+    await definition.action()
+
+    assert definition.id == JOB_ID_SOURCE_CHANNEL_AUDIENCE_CAPTURE
+    assert called == {"engine": engine, "session_factory": session_factory, "settings": settings}
 
 
 @pytest.mark.asyncio
@@ -797,6 +846,7 @@ async def test_scheduler_runtime_registers_enabled_jobs_and_shuts_down_gracefull
         {
             "scheduler_materialized_view_refresh_enabled": True,
             "scheduler_source_engagement_capture_enabled": False,
+            "scheduler_source_channel_audience_capture_enabled": False,
             "scheduler_motd_enabled": True,
             "scheduler_search_index_sync_enabled": False,
             "scheduler_meilisearch_settings_reconcile_enabled": True,
@@ -852,6 +902,7 @@ async def test_scheduler_runtime_skips_disabled_jobs() -> None:
         {
             "scheduler_materialized_view_refresh_enabled": False,
             "scheduler_source_engagement_capture_enabled": False,
+            "scheduler_source_channel_audience_capture_enabled": False,
             "scheduler_motd_enabled": False,
             "scheduler_search_index_sync_enabled": False,
             "scheduler_meilisearch_settings_reconcile_enabled": False,

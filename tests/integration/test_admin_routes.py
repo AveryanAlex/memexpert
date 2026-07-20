@@ -35,6 +35,7 @@ from memexpert.models.content import (
     PipelineIngestRequest,
     PipelineStageJournal,
     SourceChannel,
+    SourceChannelAudienceSnapshot,
     SourceChannelBackfillJob,
     SourceChannelPost,
     TelegramAdminAuditLog,
@@ -53,6 +54,8 @@ from memexpert.models.enums import (
     ModerationReportStatus,
     PipelineIngestRequestStatus,
     SourceAttachReason,
+    SourceChannelAudienceCaptureReason,
+    SourceChannelAudienceFetchStatus,
     SourceChannelBackfillJobStatus,
     SourceChannelPostStatus,
     SourcePlatform,
@@ -2634,6 +2637,14 @@ async def test_admin_adds_public_telegram_reference_atomically_and_retry_converg
             select(func.count()).select_from(SourceChannel).where(SourceChannel.platform_id == "public_channel"),
         )
         persisted_suggestion = await session.get(ChannelSuggestion, suggestion_id)
+        audience_snapshot = await session.scalar(
+            select(SourceChannelAudienceSnapshot).where(
+                SourceChannelAudienceSnapshot.source_channel_id == UUID(first_payload["id"]),
+                SourceChannelAudienceSnapshot.capture_reason
+                == SourceChannelAudienceCaptureReason.INITIAL_RESOLUTION,
+            )
+        )
+        persisted_source = await session.get(SourceChannel, UUID(first_payload["id"]))
         creation_audit = await session.scalar(
             select(TelegramAdminAuditLog).where(
                 TelegramAdminAuditLog.action == "channel_create_from_reference",
@@ -2648,6 +2659,12 @@ async def test_admin_adds_public_telegram_reference_atomically_and_retry_converg
         assert creation_audit is not None
         assert creation_audit.new_values["suggestion_id"] == str(suggestion_id)
         assert creation_audit.new_values["suggestion_status"] == "approved"
+        assert audience_snapshot is not None
+        assert audience_snapshot.fetch_status is SourceChannelAudienceFetchStatus.SUCCESS
+        assert audience_snapshot.subscriber_count == 1234
+        assert persisted_source is not None
+        assert persisted_source.subscriber_count_updated_at is not None
+        assert persisted_source.next_audience_capture_at is not None
 
 
 async def test_admin_reference_source_reactivates_exact_canonical_source_with_safe_defaults(

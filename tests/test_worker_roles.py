@@ -28,12 +28,16 @@ if TYPE_CHECKING:
         (WorkerRole.OCR, {"ocr_queue"}),
         (WorkerRole.ENRICHMENT, {"embed_queue", "classify_queue"}),
         (WorkerRole.SYNC, {"sync_qdrant_queue", "sync_meili_queue"}),
-        (WorkerRole.TELEGRAM, {"source_engagement_capture_queues"}),
+        (
+            WorkerRole.TELEGRAM,
+            {"source_engagement_capture_queues", "source_channel_audience_capture_queues"},
+        ),
         (
             WorkerRole.ALL,
             {
                 "media_inspect_queue",
                 "source_engagement_capture_queues",
+                "source_channel_audience_capture_queues",
                 "transcode_queue",
                 "ocr_queue",
                 "embed_queue",

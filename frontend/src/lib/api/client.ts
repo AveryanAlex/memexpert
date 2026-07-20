@@ -79,11 +79,15 @@ import type {
   MemeSearchScope,
   PinnedMemeRead,
   ProfileStatsRead,
+  PublicMemeAnalyticsRead,
+  PublicMemeAnalyticsWindow,
   PublicMemeDetailRead,
   PublicMemeOfTheDayRead,
   PublicMemeLandingRead,
   PublicMemePopularitySummaryRead,
   PublicMemeSearchPageRead,
+  PublicMemeSourcePageRead,
+  PublicMemeSourceSort,
   PublicMemeTrendPageRead,
   PublicTrendComparisonRead,
   PublicTrendSummaryRead,
@@ -101,8 +105,6 @@ import type {
   WebCollectionListRead,
   WebCollectionSummaryRead
 } from './types';
-import { memeAttributionSearchParams } from '$lib/memeActions';
-import type { MemeActionAttribution } from '$lib/memeActions';
 
 export const DEFAULT_PAGE_SIZE = 12;
 
@@ -139,12 +141,22 @@ interface PageRequest extends CatalogRequest, MemePageFilterParams {
 
 interface DetailRequest extends CatalogRequest {
   memeId: string;
-  attribution?: MemeActionAttribution | null;
 }
 
 interface SimilarMemeRequest extends DetailRequest {
   limit: number;
   offset: number;
+}
+
+export interface MemeSourcePageRequest extends DetailRequest {
+  sort: PublicMemeSourceSort;
+  limit: number;
+  offset: number;
+  snapshotAt?: string | null;
+}
+
+export interface MemeAnalyticsRequest extends DetailRequest {
+  window: PublicMemeAnalyticsWindow;
 }
 
 interface TrendRequest extends CatalogRequest {
@@ -307,10 +319,6 @@ export async function fetchMemeDetail(request: DetailRequest): Promise<PublicMem
   const encoded = encodeURIComponent(request.memeId);
   const path = isUuid(request.memeId) ? `/api/v1/memes/${encoded}` : `/api/v1/memes/slug/${encoded}`;
   const params = new URLSearchParams({ include_nsfw: 'false' });
-  const attributionParams = memeAttributionSearchParams(request.attribution);
-  for (const [key, value] of attributionParams) {
-    params.append(key, value);
-  }
   return apiGet<PublicMemeDetailRead>(
     path,
     params,
@@ -389,6 +397,31 @@ export async function fetchMemePopularitySummary(request: DetailRequest): Promis
   return apiGet<PublicMemePopularitySummaryRead>(
     `/api/v1/memes/${encodeURIComponent(request.memeId)}/popularity`,
     new URLSearchParams({ include_nsfw: 'false' }),
+    request
+  );
+}
+
+export async function fetchMemeSources(request: MemeSourcePageRequest): Promise<PublicMemeSourcePageRead> {
+  const params = new URLSearchParams({
+    include_nsfw: 'false',
+    sort: request.sort,
+    limit: String(request.limit),
+    offset: String(request.offset)
+  });
+  if (request.snapshotAt) {
+    params.set('snapshot_at', request.snapshotAt);
+  }
+  return apiGet<PublicMemeSourcePageRead>(
+    `/api/v1/memes/${encodeURIComponent(request.memeId)}/sources`,
+    params,
+    request
+  );
+}
+
+export async function fetchMemeAnalytics(request: MemeAnalyticsRequest): Promise<PublicMemeAnalyticsRead> {
+  return apiGet<PublicMemeAnalyticsRead>(
+    `/api/v1/memes/${encodeURIComponent(request.memeId)}/analytics`,
+    new URLSearchParams({ include_nsfw: 'false', window: request.window }),
     request
   );
 }
@@ -527,6 +560,10 @@ export async function recordMemeShare(request: MemeActionRequest): Promise<MemeI
 
 export async function recordMemeImpression(request: MemeActionRequest): Promise<MemeInteractionRecordedResponse> {
   return apiMutation<MemeInteractionRecordedResponse>(`/api/v1/memes/${encodeURIComponent(request.memeId)}/impression`, 'POST', request);
+}
+
+export async function recordMemeView(request: MemeActionRequest): Promise<MemeInteractionRecordedResponse> {
+  return apiMutation<MemeInteractionRecordedResponse>(`/api/v1/memes/${encodeURIComponent(request.memeId)}/view`, 'POST', request);
 }
 
 export async function recordMemeDetailClick(request: MemeActionRequest): Promise<MemeInteractionRecordedResponse> {

@@ -3,13 +3,12 @@
 
 from __future__ import annotations
 
-import json
-import math
 import time
 import uuid
+from datetime import datetime
 from typing import Annotated
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Path, Query, status
+from fastapi import APIRouter, Body, HTTPException, Path, Query, status
 from pydantic import BaseModel, Field
 
 from memexpert.api.dependencies import (
@@ -23,12 +22,12 @@ from memexpert.api.dependencies import (
     MemeReportServiceDep,
     MemeSearchServiceDep,
     OptionalCurrentUserDep,
+    PublicMemeInsightsServiceDep,
     PublicTrendsServiceDep,
 )
 from memexpert.api.routes._collection_errors import collection_service_http_error
 from memexpert.api.routes._meme_interactions import (
     MemeActionAttributionRequest,
-    MemeInteractionAttributionFiltersRequest,
     MemeInteractionAttributionRequest,
     payload_attribution,
     record_meme_interaction,
@@ -38,12 +37,16 @@ from memexpert.schemas.collection import CollectionMemeRead, CollectionRead, Mem
 from memexpert.schemas.meme import (
     MemeFavoriteMutationRead,
     MemeSlugRedirectRead,
+    PublicMemeAnalyticsRead,
+    PublicMemeAnalyticsWindow,
     PublicMemeDetailRead,
     PublicMemeLandingRead,
     PublicMemeOfTheDayRead,
     PublicMemePopularitySummaryRead,
     PublicMemeSearchPageRead,
     PublicMemeSearchResultRead,
+    PublicMemeSourcePageRead,
+    PublicMemeSourceSort,
     PublicMemeTrendPageRead,
     PublicTrendComparisonRead,
     PublicTrendSummaryRead,
@@ -97,99 +100,6 @@ class MemeInteractionRecordedRead(BaseModel):
     """Small acknowledgement for action-only telemetry endpoints."""
 
     ok: bool = True
-
-
-def _query_attribution(
-    request_id: Annotated[str | None, Query(alias="attribution_request_id", max_length=255)] = None,
-    impression_id: Annotated[str | None, Query(alias="attribution_impression_id", max_length=255)] = None,
-    surface: Annotated[str | None, Query(alias="attribution_surface", max_length=120)] = None,
-    source_algorithm: Annotated[str | None, Query(alias="attribution_source_algorithm", max_length=120)] = None,
-    rank: Annotated[int | None, Query(alias="attribution_rank", ge=0)] = None,
-    query: Annotated[str | None, Query(alias="attribution_query", max_length=500)] = None,
-    filters: Annotated[str | None, Query(alias="attribution_filters", max_length=4096)] = None,
-    collection_scope: Annotated[str | None, Query(alias="attribution_collection_scope", max_length=120)] = None,
-    collection_ids: Annotated[list[str] | None, Query(alias="attribution_collection_id")] = None,
-    score: Annotated[float | None, Query(alias="attribution_score")] = None,
-    score_components: Annotated[str | None, Query(alias="attribution_score_components", max_length=4096)] = None,
-    source_meme_id: Annotated[uuid.UUID | None, Query(alias="attribution_source_meme_id")] = None,
-    algorithm_version: Annotated[str | None, Query(alias="attribution_algorithm_version", max_length=120)] = None,
-    reason: Annotated[str | None, Query(alias="attribution_reason", max_length=255)] = None,
-) -> MemeInteractionAttributionRequest | None:
-    """Parse public-safe detail-link attribution query params."""
-
-    if not any(
-        value is not None
-        for value in (
-            request_id,
-            impression_id,
-            surface,
-            source_algorithm,
-            rank,
-            query,
-            filters,
-            collection_scope,
-            *(collection_ids or ()),
-            score,
-            score_components,
-            source_meme_id,
-            algorithm_version,
-            reason,
-        )
-    ):
-        return None
-    return MemeInteractionAttributionRequest(
-        request_id=request_id,
-        impression_id=impression_id,
-        surface=surface,
-        source_algorithm=source_algorithm,
-        rank=rank,
-        query=query,
-        filters=_parse_query_attribution_filters(filters),
-        collection_scope=collection_scope,
-        collection_ids=collection_ids or [],
-        score=score,
-        score_components=_parse_query_score_components(score_components),
-        source_meme_id=source_meme_id,
-        algorithm_version=algorithm_version,
-        reason=reason,
-    )
-
-
-MemeAttributionQueryDep = Annotated[MemeInteractionAttributionRequest | None, Depends(_query_attribution)]
-
-
-def _parse_query_attribution_filters(value: str | None) -> MemeInteractionAttributionFiltersRequest | None:
-    if not value:
-        return None
-    try:
-        decoded = json.loads(value)
-        return MemeInteractionAttributionFiltersRequest.model_validate(decoded)
-    except ValueError as exc:
-        raise _invalid_attribution_http_error("attribution_filters must be a valid attribution filter object.") from exc
-
-
-def _parse_query_score_components(value: str | None) -> dict[str, float]:
-    if not value:
-        return {}
-    try:
-        decoded = json.loads(value)
-    except ValueError as exc:
-        raise _invalid_attribution_http_error("attribution_score_components must be a valid JSON object.") from exc
-    if not isinstance(decoded, dict):
-        raise _invalid_attribution_http_error("attribution_score_components must be a valid JSON object.")
-    components: dict[str, float] = {}
-    for key, component_value in decoded.items():
-        if not isinstance(key, str) or not isinstance(component_value, int | float):
-            raise _invalid_attribution_http_error("attribution_score_components values must be numeric.")
-        converted = float(component_value)
-        if not math.isfinite(converted):
-            raise _invalid_attribution_http_error("attribution_score_components values must be finite.")
-        components[key] = converted
-    return components
-
-
-def _invalid_attribution_http_error(detail: str) -> HTTPException:
-    return HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=detail)
 
 
 @router.get("/search", response_model=PublicMemeSearchPageRead, summary="Search memes")
@@ -804,6 +714,35 @@ async def record_meme_impression(
     return MemeInteractionRecordedRead()
 
 
+@router.post("/{meme_id}/view", response_model=MemeInteractionRecordedRead, summary="Record meme detail view")
+async def record_meme_view(
+    meme_search_service: MemeSearchServiceDep,
+    analytics_service: AnalyticsServiceDep,
+    current_user: OptionalCurrentUserDep,
+    meme_id: Annotated[uuid.UUID, Path()],
+    payload: Annotated[MemeActionAttributionRequest | None, Body()] = None,
+    include_nsfw: Annotated[bool, Query()] = False,
+) -> MemeInteractionRecordedRead:
+    """Record one visible detail-page visit independently of detail reads."""
+
+    await _ensure_visible_meme_for_interaction(
+        meme_search_service,
+        meme_id=meme_id,
+        current_user=current_user,
+        include_nsfw=include_nsfw,
+    )
+    await record_meme_interaction(
+        analytics_service,
+        AnalyticsEventType.MEME_VIEW,
+        meme_id=meme_id,
+        current_user=current_user,
+        attribution=payload_attribution(payload),
+        default_surface="public_api_meme_detail",
+        properties={"include_nsfw": _nsfw_allowed(current_user, include_nsfw)},
+    )
+    return MemeInteractionRecordedRead()
+
+
 @router.post(
     "/{meme_id}/detail-click",
     response_model=MemeInteractionRecordedRead,
@@ -869,10 +808,8 @@ async def download_meme(
 @router.get("/slug/{slug}", response_model=PublicMemeDetailRead, summary="Read meme details by SEO slug")
 async def get_meme_detail_by_slug(
     meme_search_service: MemeSearchServiceDep,
-    analytics_service: AnalyticsServiceDep,
     current_user: OptionalCurrentUserDep,
     slug: Annotated[str, Path(min_length=1, max_length=255)],
-    attribution: MemeAttributionQueryDep,
     include_nsfw: Annotated[bool, Query()] = False,
 ) -> PublicMemeDetailRead:
     """Resolve a visible meme detail DTO from its canonical SEO slug."""
@@ -888,15 +825,6 @@ async def get_meme_detail_by_slug(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Meme was not found.",
         ) from exc
-    await record_meme_interaction(
-        analytics_service,
-        AnalyticsEventType.MEME_VIEW,
-        meme_id=detail.id,
-        current_user=current_user,
-        attribution=attribution,
-        default_surface="public_api_meme_detail",
-        properties={"include_nsfw": _nsfw_allowed(current_user, include_nsfw)},
-    )
     return detail
 
 
@@ -989,6 +917,63 @@ async def get_meme_canonical_slug(
 
 
 @router.get(
+    "/{meme_id}/sources",
+    response_model=PublicMemeSourcePageRead,
+    summary="Read public meme source posts",
+)
+async def get_meme_sources(
+    public_meme_insights_service: PublicMemeInsightsServiceDep,
+    current_user: OptionalCurrentUserDep,
+    meme_id: Annotated[uuid.UUID, Path()],
+    sort: Annotated[PublicMemeSourceSort, Query()] = PublicMemeSourceSort.VIEWS_DESC,
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    snapshot_at: Annotated[
+        datetime | None,
+        Query(description="API-issued RFC3339 cutoff to keep metric sorting and pagination stable."),
+    ] = None,
+    include_nsfw: Annotated[bool, Query()] = False,
+) -> PublicMemeSourcePageRead:
+    """Return public-crawler Telegram attribution across every file of a public meme."""
+
+    page = await public_meme_insights_service.source_page(
+        meme_id,
+        sort=sort,
+        limit=limit,
+        offset=offset,
+        snapshot_at=snapshot_at,
+        include_nsfw=_nsfw_allowed(current_user, include_nsfw),
+    )
+    if page is None:
+        raise _meme_not_found_http_error()
+    return page
+
+
+@router.get(
+    "/{meme_id}/analytics",
+    response_model=PublicMemeAnalyticsRead,
+    summary="Read public meme professional analytics",
+)
+async def get_meme_analytics(
+    public_meme_insights_service: PublicMemeInsightsServiceDep,
+    current_user: OptionalCurrentUserDep,
+    meme_id: Annotated[uuid.UUID, Path()],
+    window: Annotated[PublicMemeAnalyticsWindow, Query()] = PublicMemeAnalyticsWindow.THIRTY_DAYS,
+    include_nsfw: Annotated[bool, Query()] = False,
+) -> PublicMemeAnalyticsRead:
+    """Return source activity, observed counters, audience coverage, and separate exposure funnels."""
+
+    analytics = await public_meme_insights_service.analytics(
+        meme_id,
+        window=window,
+        include_nsfw=_nsfw_allowed(current_user, include_nsfw),
+    )
+    if analytics is None:
+        raise _meme_not_found_http_error()
+    return analytics
+
+
+@router.get(
     "/{meme_id}/popularity",
     response_model=PublicMemePopularitySummaryRead,
     summary="Read public meme popularity summary",
@@ -1037,10 +1022,8 @@ async def get_similar_memes(
 @router.get("/{meme_id}", response_model=PublicMemeDetailRead, summary="Read meme details")
 async def get_meme_detail(
     meme_search_service: MemeSearchServiceDep,
-    analytics_service: AnalyticsServiceDep,
     current_user: OptionalCurrentUserDep,
     meme_id: Annotated[uuid.UUID, Path()],
-    attribution: MemeAttributionQueryDep,
     include_nsfw: Annotated[bool, Query()] = False,
 ) -> PublicMemeDetailRead:
     """Return a detail DTO for a visible meme."""
@@ -1056,15 +1039,6 @@ async def get_meme_detail(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Meme was not found.",
         ) from exc
-    await record_meme_interaction(
-        analytics_service,
-        AnalyticsEventType.MEME_VIEW,
-        meme_id=detail.id,
-        current_user=current_user,
-        attribution=attribution,
-        default_surface="public_api_meme_detail",
-        properties={"include_nsfw": _nsfw_allowed(current_user, include_nsfw)},
-    )
     return detail
 
 

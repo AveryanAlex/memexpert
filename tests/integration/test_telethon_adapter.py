@@ -149,6 +149,18 @@ class _FakeLiveClient:
 
 
 @dataclass(slots=True)
+class _FakeFullChannelClient:
+    subscriber_count: int | None
+    requests: list[object] = field(default_factory=list)
+
+    async def __call__(self, request: object) -> object:
+        self.requests.append(request)
+        return SimpleNamespace(
+            full_chat=SimpleNamespace(participants_count=self.subscriber_count),
+        )
+
+
+@dataclass(slots=True)
 class _FakeSingleMessageFactory:
     client: _FakeSingleMessageClient
     settings: Settings
@@ -210,6 +222,30 @@ def _settings() -> Settings:
             "crawler_max_requests_per_second": 10.0,
         }
     )
+
+
+async def test_telethon_fetch_channel_audience_uses_full_channel_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import memexpert.crawlers.telegram.telethon_adapter as adapter_module
+
+    telegram_client = _FakeFullChannelClient(subscriber_count=0)
+    adapter = PipelineTelethonClient(
+        factory=cast("Any", _FakeAdapterFactory(client=telegram_client, settings=_settings())),
+        rate_limiter=_RateLimiter(max_requests_per_second=1000),
+    )
+    adapter._entity_cache["public_channel"] = cast(  # noqa: SLF001 - exercise cached entity request path.
+        "Any",
+        SimpleNamespace(id=123456),
+    )
+    monkeypatch.setattr(adapter_module, "get_input_channel", lambda _entity: cast("Any", object()))
+
+    audience = await adapter.fetch_channel_audience("public_channel")
+
+    assert audience.channel_id == "123456"
+    assert audience.subscriber_count == 0
+    assert len(telegram_client.requests) == 1
+    assert type(telegram_client.requests[0]).__name__ == "GetFullChannelRequest"
 
 
 async def _insert_telegram_session(

@@ -98,6 +98,71 @@ async def test_motd_uses_trend_mv_metrics_when_present_and_allows_missing_mv_row
     assert missing_mv.id != trended.id
 
 
+async def test_motd_keeps_download_metrics_but_excludes_them_from_trending_growth(
+    migrated_db_session: AsyncSession,
+) -> None:
+    now = datetime.now(UTC)
+    download_heavy = await _create_meme(
+        migrated_db_session,
+        created_at=now - timedelta(days=1),
+        quality_score=0.8,
+    )
+    viewed = await _create_meme(
+        migrated_db_session,
+        created_at=now - timedelta(days=2),
+        quality_score=0.8,
+    )
+    migrated_db_session.add_all(
+        [
+            AnalyticsEvent(
+                event_type=AnalyticsEventType.MEME_DOWNLOAD,
+                payload={"meme_id": str(download_heavy.id)},
+                occurred_at=now - timedelta(hours=1),
+            )
+            for _ in range(8)
+        ]
+        + [
+            AnalyticsEvent(
+                event_type=AnalyticsEventType.MEME_VIEW,
+                payload={"meme_id": str(viewed.id)},
+                occurred_at=now - timedelta(hours=1),
+            )
+        ]
+    )
+    await migrated_db_session.flush()
+    await migrated_db_session.execute(text("REFRESH MATERIALIZED VIEW public_meme_trends_mv"))
+
+    trend_result = await migrated_db_session.execute(
+        text(
+            """
+            SELECT meme_id, recent_view_count, recent_download_count
+            FROM public_meme_trends_mv
+            WHERE meme_id IN (:download_meme_id, :viewed_meme_id)
+            """
+        ),
+        {"download_meme_id": download_heavy.id, "viewed_meme_id": viewed.id},
+    )
+    trend_rows = {row["meme_id"]: row for row in trend_result.mappings()}
+
+    result = await MemeOfTheDayService(
+        migrated_db_session,
+        settings=Settings.model_validate(
+            {
+                "motd_popularity_weight": 0.0,
+                "motd_trending_growth_weight": 1.0,
+                "motd_novelty_weight": 0.0,
+                "motd_quality_weight": 0.0,
+            }
+        ),
+    ).refresh()
+
+    assert trend_rows[download_heavy.id]["recent_download_count"] == 8
+    assert trend_rows[download_heavy.id]["recent_view_count"] == 0
+    assert result.meme is not None
+    assert result.meme.id == viewed.id
+    assert result.score_components["trending_growth_raw"] == pytest.approx(1.0)
+
+
 async def test_motd_deterministic_tiebreakers_use_newest_then_meme_id(migrated_db_session: AsyncSession) -> None:
     older = await _create_meme(
         migrated_db_session,

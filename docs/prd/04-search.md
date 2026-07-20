@@ -41,7 +41,7 @@ Collection filters are URL-backed like the other filters so search result links 
 
 ## Trending
 
-Computed from: growth rate of reposts across channels (new source appearances in 24–48h) + growth in platform engagement (sends, saves, downloads, views, impressions, likes on MemeXpert). Both signals combined.
+Computed from positive source view/reaction/repost increases above each counter's running high watermark plus MemeExpert views, sends, saves, and likes. Downloads and impressions remain reportable but have zero public-ranking weight.
 
 Trending can be materialized/precomputed and used as the cold-start fallback for users without enough interaction history.
 

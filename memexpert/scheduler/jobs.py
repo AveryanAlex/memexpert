@@ -30,6 +30,10 @@ from memexpert.services.scheduler_batch_jobs import (
     run_scheduler_seo_backlog_batch,
     scheduler_batch_result_log_extra,
 )
+from memexpert.services.source_channel_audience_scheduler import (
+    run_scheduler_source_channel_audience_capture_batch,
+    source_channel_audience_capture_scheduler_result_log_extra,
+)
 from memexpert.services.source_engagement_scheduler import (
     run_scheduler_source_engagement_capture_batch,
     source_engagement_capture_scheduler_result_log_extra,
@@ -44,6 +48,7 @@ logger = logging.getLogger(__name__)
 
 JOB_ID_MATERIALIZED_VIEW_REFRESH = "materialized-view-refresh"
 JOB_ID_SOURCE_ENGAGEMENT_CAPTURE = "source-engagement-capture"
+JOB_ID_SOURCE_CHANNEL_AUDIENCE_CAPTURE = "source-channel-audience-capture"
 JOB_ID_MOTD = "motd"
 JOB_ID_SEARCH_INDEX_SYNC = "search-index-sync"
 JOB_ID_MEILISEARCH_SETTINGS_RECONCILE = "meilisearch-settings-reconcile"
@@ -139,6 +144,13 @@ def build_scheduler_job_definitions(settings: Settings, engine: AsyncEngine) -> 
             enabled=settings.scheduler_telegram_login_cleanup_enabled,
             description="Expire Telegram login attempts and revoke abandoned temporary credentials.",
         ),
+        SchedulerJobDefinition(
+            id=JOB_ID_SOURCE_CHANNEL_AUDIENCE_CAPTURE,
+            trigger_seconds=settings.scheduler_source_channel_audience_capture_interval_seconds,
+            action=_build_source_channel_audience_capture_job_action(settings, engine),
+            enabled=settings.scheduler_source_channel_audience_capture_enabled,
+            description="Enqueue due Telegram channel audience capture work.",
+        ),
     )
 
 
@@ -190,6 +202,24 @@ def _build_source_engagement_capture_job_action(settings: Settings, engine: Asyn
             "scheduler_job_batch_result",
             extra=source_engagement_capture_scheduler_result_log_extra(
                 JOB_ID_SOURCE_ENGAGEMENT_CAPTURE,
+                result,
+            ),
+        )
+
+    return _action
+
+
+def _build_source_channel_audience_capture_job_action(
+    settings: Settings,
+    engine: AsyncEngine,
+) -> SchedulerJobAction:
+    async def _action() -> None:
+        session_factory = build_async_session_factory(engine)
+        result = await run_scheduler_source_channel_audience_capture_batch(session_factory, settings=settings)
+        logger.info(
+            "scheduler_job_batch_result",
+            extra=source_channel_audience_capture_scheduler_result_log_extra(
+                JOB_ID_SOURCE_CHANNEL_AUDIENCE_CAPTURE,
                 result,
             ),
         )
@@ -351,6 +381,7 @@ __all__ = [
     "JOB_ID_SEARCH_INDEX_SYNC",
     "JOB_ID_SEO_BACKLOG_BATCHES",
     "JOB_ID_SOURCE_ENGAGEMENT_CAPTURE",
+    "JOB_ID_SOURCE_CHANNEL_AUDIENCE_CAPTURE",
     "JOB_ID_TELEGRAM_LOGIN_CLEANUP",
     "SchedulerJobDefinition",
     "build_scheduler_job_definitions",

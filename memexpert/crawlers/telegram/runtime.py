@@ -41,10 +41,22 @@ from memexpert.crawlers.telegram.client import (
 )
 from memexpert.models.base import utcnow
 from memexpert.models.content import SourceChannel, SourceChannelPost, TelegramSession
-from memexpert.models.enums import SourceChannelPostStatus, SourcePlatform, TelegramSessionStatus
+from memexpert.models.enums import (
+    SourceChannelAudienceCaptureReason,
+    SourceChannelAudienceFetchStatus,
+    SourceChannelPostStatus,
+    SourcePlatform,
+    TelegramSessionStatus,
+)
 from memexpert.pipeline.helpers import compare_telegram_post_ids
 from memexpert.schemas.content_pipeline import CrawlerIngestOutcome
 from memexpert.services.errors import CrawlerSessionNotRunnableError, PipelinePayloadTooLargeError
+from memexpert.services.source_channel_audience import (
+    SourceChannelAudienceObservation,
+    record_source_channel_audience_observation,
+    source_channel_audience_observation_from_count,
+    terminal_source_channel_audience_snapshot_for_slot,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -1310,11 +1322,11 @@ class TelegramCrawlerRuntime:
     async def _refresh_channel_metadata(self, channel_row: SourceChannel) -> None:
         """Refresh drifted channel title + username from the live adapter.
 
-        Kept deliberately small: the runtime only updates the two fields
-        that can change on the Telegram side. ``subscriber_count`` is
-        refreshed only if the adapter returned one (fakes often omit it).
-        Operator-curated columns (``is_paused``, ``catchup_enabled``) are
-        intentionally untouched.
+        The lightweight entity projection updates title/username, then a
+        dedicated ``channels.getFullChannel`` call records an audience
+        observation. Missing counts become ``not_exposed`` and failures never
+        clear the latest successful subscriber cache. Operator-curated columns
+        (``is_paused``, ``catchup_enabled``) are intentionally untouched.
         """
 
         try:
@@ -1336,8 +1348,57 @@ class TelegramCrawlerRuntime:
             channel_row.title = resolved.title
         if resolved.username is not None and resolved.username != channel_row.username:
             channel_row.username = resolved.username
-        if resolved.subscriber_count is not None:
-            channel_row.subscriber_count = resolved.subscriber_count
+        capture_slot = utcnow().date()
+        terminal_snapshot = await terminal_source_channel_audience_snapshot_for_slot(
+            self.session,
+            channel_row.id,
+            capture_slot=capture_slot,
+            capture_reason=SourceChannelAudienceCaptureReason.CRAWLER_REFRESH,
+        )
+        if terminal_snapshot is not None:
+            return
+        try:
+            audience = await self.telegram_client.fetch_channel_audience(channel_row.platform_id)
+        except (
+            PipelineTelegramFloodWaitError,
+            PipelineTelegramSessionBannedError,
+            PipelineTelegramSessionAuthRequiredError,
+        ) as exc:
+            await record_source_channel_audience_observation(
+                self.session,
+                channel_row,
+                SourceChannelAudienceObservation(
+                    fetch_status=SourceChannelAudienceFetchStatus.FAILED,
+                    error_code=type(exc).__name__[:128],
+                ),
+                capture_reason=SourceChannelAudienceCaptureReason.CRAWLER_REFRESH,
+                capture_slot=capture_slot,
+            )
+            raise
+        except PipelineTelegramError as exc:
+            await record_source_channel_audience_observation(
+                self.session,
+                channel_row,
+                SourceChannelAudienceObservation(
+                    fetch_status=SourceChannelAudienceFetchStatus.FAILED,
+                    error_code=type(exc).__name__[:128],
+                ),
+                capture_reason=SourceChannelAudienceCaptureReason.CRAWLER_REFRESH,
+                capture_slot=capture_slot,
+            )
+            logger.warning(
+                "Failed to refresh channel audience for %s: %s",
+                channel_row.platform_id,
+                exc,
+            )
+            return
+        await record_source_channel_audience_observation(
+            self.session,
+            channel_row,
+            source_channel_audience_observation_from_count(audience.subscriber_count),
+            capture_reason=SourceChannelAudienceCaptureReason.CRAWLER_REFRESH,
+            capture_slot=capture_slot,
+        )
 
     async def _channel_ids_for_session(self, telegram_session: TelegramSession) -> list[str]:
         """Return the active channel ids owned by this session."""

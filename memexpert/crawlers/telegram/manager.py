@@ -45,7 +45,10 @@ if TYPE_CHECKING:
 
     from memexpert.core.config import Settings
     from memexpert.core.database import AsyncSessionFactory
-    from memexpert.pipeline.events import SourceEngagementCaptureRequestedEvent
+    from memexpert.pipeline.events import (
+        SourceChannelAudienceCaptureRequestedEvent,
+        SourceEngagementCaptureRequestedEvent,
+    )
     from memexpert.schemas.content_pipeline import CrawlerIngestResult
 
 
@@ -235,6 +238,35 @@ class TelegramSessionManager:
         event: SourceEngagementCaptureRequestedEvent,
     ) -> PipelineTelegramClientProtocol:
         """Return the cached runnable client for a source-engagement stats fetch event."""
+
+        async with self.session_factory() as db_session:
+            session_state = await db_session.get(TelegramSession, event.telegram_session_id)
+            if session_state is None:
+                raise PipelineTelegramSessionNotRunnableError(
+                    f"Telegram session {event.telegram_session_id} does not exist.",
+                )
+            if session_state.name != event.session_name:
+                raise PipelineTelegramSessionNotRunnableError(
+                    f"Telegram session {event.telegram_session_id} is named {session_state.name!r}, "
+                    f"not {event.session_name!r}.",
+                )
+            if self._is_session_flood_waited(session_state):
+                wait_seconds = self._remaining_flood_wait_seconds(session_state)
+                raise PipelineTelegramFloodWaitError(
+                    f"Telegram session {session_state.name!r} is flood-waited for {wait_seconds}s.",
+                    wait_seconds=wait_seconds,
+                )
+            try:
+                self._assert_runnable_session(session_state, workload="engagement")
+            except CrawlerSessionNotRunnableError as exc:
+                raise PipelineTelegramSessionNotRunnableError(str(exc)) from exc
+            return await self._get_cached_client(session_state)
+
+    async def source_channel_audience_client_for_event(
+        self,
+        event: SourceChannelAudienceCaptureRequestedEvent,
+    ) -> PipelineTelegramClientProtocol:
+        """Return the cached runnable client for a channel-audience fetch event."""
 
         async with self.session_factory() as db_session:
             session_state = await db_session.get(TelegramSession, event.telegram_session_id)

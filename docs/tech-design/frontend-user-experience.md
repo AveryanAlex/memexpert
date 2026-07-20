@@ -61,7 +61,7 @@ Save-to-collection opens a borderless contextual popover backed by a meme-scoped
 | Saved | `server/libraryPage.ts` centralizes the cookie-forwarded library request. `/library` owns collection creation, active save destination, collection list, Favorites, Pins, pin reorder, and saved-content grids. |
 | Account | `/profile` owns Telegram connection, language, sensitive-content preference, and compact statistics only. Its server load fetches stats independently of the library. |
 | Collection | The route presents metadata, active-save control, notices, and saved memes first. `CollectionManagement.svelte` contains the disclosure for rename/visibility, invitations, members, revocation, and deletion. |
-| Meme/detail landing | `/memes/[id]` composes media, `MemeActionMenu`, concise context, a collapsed About section, and related discovery. Tag/template routes place galleries before their collapsed aggregate activity information. |
+| Meme/detail landing | `/memes/[id]` composes media, `MemeActionMenu`, de-duplicated concise context, **About this meme**, full-width **Sources & activity**, nested **Professional analytics**, and related discovery. Detail, sources, analytics, and related loads fail independently. Tag/template routes place galleries before their collapsed aggregate activity information. |
 | Trends | Trend route components translate server-provided rankings and activity data into consumer labels, accessible charts, and tables. They do not redefine ranking on the client. |
 
 ## Route Ownership and Progressive Disclosure
@@ -73,7 +73,7 @@ Save-to-collection opens a borderless contextual popover backed by a meme-scoped
 | `/library` | Favorites, Collections, Pins, active save destination | New collection form | Provider/account diagnostics |
 | `/profile` | Telegram connection, language, sensitive-content preference, compact stats | Interaction stats | Saved grids, pin ordering, collection list, active save selector |
 | `/collection/{id}` | Collection summary, save destination, saved memes | **Manage collection** native disclosure | Management controls above the meme grid |
-| `/memes/{id}` | Media, Favorite/Save/Send, title/description, tags, related memes | **About this meme** | MIME/file/byte rows, raw score, API/fallback diagnostics |
+| `/memes/{id}` | Media, Favorite/Save/Send, one non-duplicated title/description sequence, tags, related memes | **About this meme**, then **Sources & activity** with nested **Professional analytics** | MIME/file/byte rows, raw score, API/fallback diagnostics, crawler/session/source identities |
 | `/tags/{tag}`, `/templates/{slug}` | Page context and gallery | **About this tag/template** activity disclosure | Aggregate diagnostic panels before media |
 | `/trends` | Ranked media and readable weekly story | Compare and timeline links | Raw trend score and materialization/history jargon |
 
@@ -136,13 +136,25 @@ The SSR load parses this state, forwards it unchanged to the existing meme page 
 - `memeHref` continues to generate `/memes/{seo_page_slug|id}` and preserves available attribution query parameters on detail links.
 - Collection pages, library creation, active-save selection, invite/member forms, pin reorder, comparison serialization, trend ranking/timeline controls, and Mini App start-parameter routes retain their established URL/action behavior.
 - The search filter drawer is a presentation wrapper around a real GET form. Native form submission remains meaningful without JavaScript; the trends comparison route retains its noscript serialized-item inputs.
+- Meme source/analytics controls preserve discovery-attribution parameters and
+  stable source/professional disclosure anchors. Their local open state survives
+  same-route navigation. `source_sort`, `source_offset`, and the API-issued
+  `source_snapshot` keep source pages stable; `activity_window` selects
+  `7d`, `30d`, `90d`, or `all`. Changing source sort clears offset/snapshot;
+  paging reuses the response snapshot. Clean share/canonical meme URL builders
+  omit these presentation parameters; this does not require the page to emit a
+  dedicated `rel=canonical` element.
+- Detail GETs are read-only. After hydration the route posts one `meme_view`
+  for the displayed meme ID and keeps that client guard across insight query
+  navigation, so pagination, sorting, and range selection do not inflate the
+  page's own activity chart.
 
 ## Telemetry and Attribution Invariants
 
 Presentation must not discard a result's `MemeResultAttributionRead` data just because it is not rendered as consumer copy.
 
 1. `MemeGrid` and Meme of the Day retain discovery data attributes for source algorithm, reason, request ID, impression ID, source meme ID, and score context.
-2. `MemeCard` records one impression after at least 25% intersection and records a detail click before navigation. Both send the attribution body with keepalive support.
+2. `MemeCard` records one impression after at least 25% intersection and records a detail click before navigation. Exposure IDs are stable for one layout placement/page, survive component remounts, and remain distinct for genuinely different placements. Both sends use keepalive support; the idempotent backend exposure fact prevents a repeated token from increasing the keyed denominator.
 3. Favorite, Save, Pin, Send/share, Download, Report, and bulk-download paths forward the same attribution through `memeActionAttributionBody` where the existing action supports it.
 4. Detail links serialize attribution (`request_id`, `impression_id`, surface, source algorithm, query/filter/scope/collection context, rank, score components, and related-source identity) so the detail action chain remains attributable.
 5. Consumer surfaces may say only what helps a user decide. Algorithm names, fallback reasons, request IDs, score components, and candidate diagnostics remain telemetry/data attributes rather than visible copy.
@@ -178,7 +190,36 @@ Bulk capability is passed per route. `MemeGrid` then owns a local `selectionMode
 
 ### Detail and collection disclosures
 
-Meme detail starts with media, then concise context and direct actions. Context text, OCR text, and popularity summary/sparkline are behind **About this meme**. This keeps the source detail, action forms, Telegram connection prompt, tags, related results, and telemetry intact while omitting file-level diagnostics and raw ranking scores from consumer UI.
+Meme detail starts with media, then concise context and direct actions. Visible
+title, lead description, body/context, and OCR candidates are considered in
+that priority order. Before rendering each lower-priority candidate, normalize
+with Unicode NFKC, trim, collapse whitespace, and lowercase without locale
+dependence; suppress only an
+exact normalized duplicate already displayed. SEO meta description and image
+alt text stay independent. Long context, OCR, and the compact legacy popularity
+summary remain behind **About this meme**.
+
+After the article, **Sources & activity** summarizes posts, channels, and known
+views and lists all eligible Telegram source posts. It defaults to most viewed,
+puts unknown metrics last, marks missing values as not captured, retains
+unavailable historical posts, uses only API-provided safe links, and supports
+stable paginated sorting. The disclosure is full-width at 320px and desktop.
+
+Nested **Professional analytics** owns 7/30/90/All controls, headline Recorded
+activity/average/momentum/peak/favorites, a source-versus-MemeExpert activity
+chart, an absolute Telegram end-state chart with a selector for views,
+reactions, comments, or reposts, source performance/audience coverage, separate
+web/inline funnels, and exact-value tables for both chart inputs. The activity
+chart uses signals per day so daily, weekly, and monthly adaptive buckets remain
+visually comparable; exact bucket totals and granularity remain in the table.
+Both charts use UTC time axes; an absolute point is positioned at the last real
+capture time represented by its server bucket. Absolute source lines may
+decrease after Telegram corrections, and a nullable selected counter creates a
+visible gap rather than a zero or a line across unknown data; activity never
+decreases. Missing/one-point history uses an honest insufficient-history state
+instead of a fabricated line. Each projection has its own loading/error state,
+so an analytics or related-content failure does not remove source attribution
+or the meme itself.
 
 Collection management uses native `<details>/<summary>` after the content grid. Its forms retain existing hidden inputs, action names, capability checks, clipboard fallback, notices, invitation lifecycle, member-role constraints, and destructive-operation semantics. It is not a reduced permission model; it is a delayed presentation of the same permitted operations.
 
@@ -194,6 +235,13 @@ recorded activity = original-source views + reactions + reposts
 ```
 
 It is an unweighted signal count, not a unique-person count and not the ranking/popularity score. Source signals can overlap with platform signals. Trend cards use understandable direction and recent-change language; charts, aggregate histories, comparisons, and timeline cards label the measure consistently and show source versus MemeExpert breakdowns.
+
+Comments, impressions/results served, downloads, and subscriber counts are
+adjacent metrics, not Recorded activity. Source activity uses per-counter
+running high-watermark increases; the server-bucketed absolute end-state chart
+preserves corrections between returned points. Subscriber-normalized rates
+always show eligible/total coverage and never call summed channel subscribers
+reach or unique audience.
 
 Trend visualizations follow these rules:
 
@@ -220,7 +268,7 @@ Trend visualizations follow these rules:
 2. Keep media, image enlargement, and Favorite/Download/Save/Send visible on cards; keep secondary actions in overflow.
 3. Keep Search filters URL-backed, access-aware, consumer-labeled, and responsively disclosed.
 4. Do not move library content back into Account or collection management above saved memes.
-5. Preserve detail/tag/template progressive disclosure and related-result attribution.
+5. Preserve detail/tag/template progressive disclosure, visible-text deduplication, source/analytics partial states, and related-result attribution.
 6. Preserve recorded-activity semantics and accessible trend tables; do not surface raw score/diagnostic copy.
 7. Preserve Mini App theme, safe-area, `initData`, and start-parameter behavior.
 8. Run focused SSR tests, frontend checks/build, and browser smoke/visual acceptance when modifying these contracts.

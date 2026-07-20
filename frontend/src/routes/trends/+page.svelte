@@ -98,7 +98,13 @@
           <span class="rounded-full bg-soft px-3 py-1.5 text-sm font-extrabold text-ink">{rankingLabel}</span>
           <span class="text-sm font-semibold text-muted">#{data.offset + index + 1}</span>
         </div>
-        <MemeCard meme={item.meme} attribution={item.attribution} showAccessMarkers={Boolean(session)} />
+        <MemeCard
+          meme={item.meme}
+          attribution={item.attribution}
+          exposureId={item.attribution.impression_id}
+          exposurePlacement={`trends:${data.ranking}:${data.offset + index}:${item.meme.id}`}
+          showAccessMarkers={Boolean(session)}
+        />
         <TrendSummary trend={item.trend} />
       </Card>
     {/each}

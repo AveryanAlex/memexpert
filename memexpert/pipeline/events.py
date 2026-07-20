@@ -6,7 +6,7 @@ from __future__ import annotations
 import hashlib
 import re
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from typing import TYPE_CHECKING, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -17,19 +17,22 @@ from memexpert.models.base import utcnow
 from memexpert.models.enums import (
     ContentPipelineStage,
     ContentSourceKind,
+    SourceChannelAudienceCaptureReason,
     SourceEngagementScheduleLabel,
     SourcePlatform,
 )
 from memexpert.schemas.content_pipeline import ContentPipelineDispatchEvent, ContentPipelineEventType
 
 if TYPE_CHECKING:
-    from memexpert.models.content import MemeFile, MemeSource, PipelineIngestRequest
+    from memexpert.models.content import MemeFile, MemeSource, PipelineIngestRequest, SourceChannel
 
 PIPELINE_INGEST_REQUEST_AGGREGATE_TYPE: Final = "pipeline_ingest_request"
 PIPELINE_MEME_FILE_AGGREGATE_TYPE: Final = "meme_file"
 PIPELINE_MEME_SOURCE_AGGREGATE_TYPE: Final = "meme_source"
+PIPELINE_SOURCE_CHANNEL_AGGREGATE_TYPE: Final = "source_channel"
 MEDIA_INSPECT_REQUESTED_EVENT_TYPE: Final = "media_inspect_requested"
 SOURCE_ENGAGEMENT_CAPTURE_REQUESTED_EVENT_TYPE: Final = "source_engagement_capture_requested"
+SOURCE_CHANNEL_AUDIENCE_CAPTURE_REQUESTED_EVENT_TYPE: Final = "source_channel_audience_capture_requested"
 _SOURCE_ENGAGEMENT_SESSION_KEY_RE: Final = re.compile(r"^[A-Za-z0-9._-]+$")
 _SOURCE_ENGAGEMENT_SESSION_KEY_PREFIX_MAX_LENGTH: Final = 48
 _SOURCE_ENGAGEMENT_SESSION_KEY_HASH_LENGTH: Final = 12
@@ -61,6 +64,25 @@ class SourceEngagementCaptureRequestedEvent(BaseModel):
     post_id: str = Field(min_length=1, max_length=255)
     scheduled_for: datetime
     schedule_label: SourceEngagementScheduleLabel
+    telegram_session_id: uuid.UUID
+    session_name: str = Field(min_length=1, max_length=64)
+    session_key: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._-]+$")
+    created_at: datetime
+
+
+class SourceChannelAudienceCaptureRequestedEvent(BaseModel):
+    """Validated payload consumed by the Telegram channel-audience worker."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    event_id: uuid.UUID
+    event_type: Literal["source_channel_audience_capture_requested"]
+    source_channel_id: uuid.UUID
+    source_platform: SourcePlatform
+    platform_id: str = Field(min_length=1, max_length=255)
+    scheduled_for: datetime
+    capture_slot: date
+    capture_reason: SourceChannelAudienceCaptureReason
     telegram_session_id: uuid.UUID
     session_name: str = Field(min_length=1, max_length=64)
     session_key: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._-]+$")
@@ -99,6 +121,23 @@ def build_source_engagement_capture_routing_key(settings: Settings, *, session_k
             "source engagement session_key may contain only letters, numbers, dots, underscores, and hyphens.",
         )
     return f"{settings.pipeline_broker_routing_key_prefix}.source_engagement_capture.{normalized_session_key}"
+
+
+def build_source_channel_audience_session_key(telegram_session_id: uuid.UUID, session_name: str) -> str:
+    """Return the stable RabbitMQ-safe audience queue suffix for one Telegram session."""
+
+    return build_source_engagement_session_key(telegram_session_id, session_name)
+
+
+def build_source_channel_audience_capture_routing_key(settings: Settings, *, session_key: str) -> str:
+    """Return the worker routing key for channel audience capture work."""
+
+    normalized_session_key = session_key.strip()
+    if _SOURCE_ENGAGEMENT_SESSION_KEY_RE.fullmatch(normalized_session_key) is None:
+        raise ValueError(
+            "source channel audience session_key may contain only letters, numbers, dots, underscores, and hyphens.",
+        )
+    return f"{settings.pipeline_broker_routing_key_prefix}.source_channel_audience_capture.{normalized_session_key}"
 
 
 def build_stage_routing_key(settings: Settings, stage: ContentPipelineStage) -> str:
@@ -229,6 +268,79 @@ def build_source_engagement_capture_message_spec(
     )
 
 
+def build_source_channel_audience_capture_requested_payload(
+    *,
+    event_id: uuid.UUID,
+    source_channel_id: uuid.UUID,
+    source_platform: SourcePlatform,
+    platform_id: str,
+    scheduled_for: datetime,
+    capture_slot: date,
+    capture_reason: SourceChannelAudienceCaptureReason,
+    telegram_session_id: uuid.UUID,
+    session_name: str,
+    created_at: datetime,
+) -> dict[str, object]:
+    """Build the JSONB payload for a channel audience capture request."""
+
+    session_key = build_source_channel_audience_session_key(telegram_session_id, session_name)
+    return SourceChannelAudienceCaptureRequestedEvent(
+        event_id=event_id,
+        event_type=SOURCE_CHANNEL_AUDIENCE_CAPTURE_REQUESTED_EVENT_TYPE,
+        source_channel_id=source_channel_id,
+        source_platform=source_platform,
+        platform_id=platform_id,
+        scheduled_for=scheduled_for,
+        capture_slot=capture_slot,
+        capture_reason=capture_reason,
+        telegram_session_id=telegram_session_id,
+        session_name=session_name,
+        session_key=session_key,
+        created_at=created_at,
+    ).model_dump(mode="json")
+
+
+def build_source_channel_audience_capture_message_spec(
+    source_channel: SourceChannel,
+    *,
+    scheduled_for: datetime,
+    capture_slot: date,
+    settings: Settings,
+    telegram_session_id: uuid.UUID,
+    session_name: str,
+) -> RabbitMessageSpec:
+    """Return a durable RabbitMQ message spec for scheduled channel audience capture."""
+
+    event_id = uuid.uuid7()
+    created_at = utcnow()
+    payload = build_source_channel_audience_capture_requested_payload(
+        event_id=event_id,
+        source_channel_id=source_channel.id,
+        source_platform=source_channel.platform,
+        platform_id=source_channel.platform_id,
+        scheduled_for=scheduled_for,
+        capture_slot=capture_slot,
+        capture_reason=SourceChannelAudienceCaptureReason.SCHEDULED,
+        telegram_session_id=telegram_session_id,
+        session_name=session_name,
+        created_at=created_at,
+    )
+    return RabbitMessageSpec(
+        exchange=settings.pipeline_broker_exchange,
+        routing_key=build_source_channel_audience_capture_routing_key(
+            settings,
+            session_key=str(payload["session_key"]),
+        ),
+        payload=payload,
+        message_id=str(event_id),
+        event_type=SOURCE_CHANNEL_AUDIENCE_CAPTURE_REQUESTED_EVENT_TYPE,
+        aggregate_type=PIPELINE_SOURCE_CHANNEL_AGGREGATE_TYPE,
+        aggregate_id=source_channel.id,
+        ordering_key=str(source_channel.id),
+        created_at=created_at,
+    )
+
+
 def build_meme_created_transcode_dispatch_event(
     *,
     event_id: uuid.UUID,
@@ -286,14 +398,21 @@ __all__ = [
     "PIPELINE_INGEST_REQUEST_AGGREGATE_TYPE",
     "PIPELINE_MEME_FILE_AGGREGATE_TYPE",
     "PIPELINE_MEME_SOURCE_AGGREGATE_TYPE",
+    "PIPELINE_SOURCE_CHANNEL_AGGREGATE_TYPE",
+    "SOURCE_CHANNEL_AUDIENCE_CAPTURE_REQUESTED_EVENT_TYPE",
     "SOURCE_ENGAGEMENT_CAPTURE_REQUESTED_EVENT_TYPE",
     "MediaInspectRequestedEvent",
+    "SourceChannelAudienceCaptureRequestedEvent",
     "SourceEngagementCaptureRequestedEvent",
     "build_media_inspect_message_spec",
     "build_meme_created_transcode_dispatch_event",
     "build_meme_created_transcode_message_spec",
     "build_media_inspect_requested_payload",
     "build_media_inspect_routing_key",
+    "build_source_channel_audience_capture_message_spec",
+    "build_source_channel_audience_capture_requested_payload",
+    "build_source_channel_audience_capture_routing_key",
+    "build_source_channel_audience_session_key",
     "build_source_engagement_capture_message_spec",
     "build_source_engagement_capture_requested_payload",
     "build_source_engagement_capture_routing_key",

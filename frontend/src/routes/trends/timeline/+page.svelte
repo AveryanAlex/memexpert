@@ -102,7 +102,11 @@
           <div class="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
             {#each period.top_memes as item (`${period.period}:${item.meme.id}`)}
               <div class="grid gap-3 rounded-xl border border-line bg-cream/60 p-3">
-                <MemeCard meme={item.meme} showAccessMarkers={Boolean(session)} />
+                <MemeCard
+                  meme={item.meme}
+                  exposurePlacement={`timeline:${period.period}:${item.meme.id}`}
+                  showAccessMarkers={Boolean(session)}
+                />
                 <div class="grid gap-1 text-sm">
                   <p class="m-0 font-semibold text-ink">Recorded activity · {activitySummary(item)}</p>
                   <p class="m-0 text-muted">{activityBreakdown(item)}</p>

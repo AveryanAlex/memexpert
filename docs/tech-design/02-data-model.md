@@ -63,17 +63,68 @@ Unique constraint: `(platform, source_id, post_id)`.
 
 Append-only source metric observations for a `MemeSource`. Key fields: `meme_source_id`, `captured_at`, `scheduled_for`, `capture_reason`, `schedule_label`, `view_count`, `reactions`, `reaction_count`, `comment_count`, `forward_count`, `comments_state`, `fetch_status`, `source_alive`, `error_code`, and `raw_metrics`.
 
-`NULL` counters are meaningful: they mean the source did not expose the counter. A known zero remains `0`. Public ranking/read models may coalesce unknown to zero for presentation, but canonical snapshots preserve the distinction.
+`NULL` counters are meaningful: they mean the source did not expose the
+counter. A known zero remains `0`. Ranking models may coalesce unknown to zero
+for scoring, but canonical snapshots and public source/insight DTOs preserve
+the distinction and publish coverage.
 
-Initial ingestion writes an `ingest_initial` baseline snapshot. Historical source deltas are computed with `lag()` per `meme_source_id`; the first snapshot contributes no invented delta. Follow-up schedule slots are anchored to the Telegram post date (`+1h`, `+3h`, `+12h`, `+1d`, `+3d`, `+7d`, `+1month`, then monthly), not to ingest time.
+Initial ingestion writes an `ingest_initial` baseline snapshot. The first known
+value contributes no invented activity. Public activity read models advance
+each counter only above its running high watermark, so decreases contribute
+zero and `100 → 90 → 100` is not double-counted. The separate per-meme
+observed-counter series starts from an opening absolute baseline containing the
+latest known aggregate state as of the selected range's `start_at`, then uses
+the final absolute aggregate state in each server-selected bucket containing a
+real observation. Its point time is the latest real `captured_at` represented
+in the bucket, never an artificial bucket end or every raw capture timestamp,
+and it may decrease after an upstream correction. Follow-up schedule slots are
+anchored to the Telegram post date (`+1h`, `+3h`, `+12h`, `+1d`, `+3d`, `+7d`,
+`+1month`, then monthly), not to ingest time.
 
 `forward_count` is Telegram's public forward/repost count and feeds derived public `latest_source_reposts`. It is unrelated to forwarded-message provenance such as `forwarded_from_*`.
 
 ### Public Trend Read Models
 
-`public_meme_trends_mv`, `public_tag_trends_mv`, `public_template_trends_mv`, `public_tag_trend_points_mv`, and `public_template_trend_points_mv` are derived-cached read models. They are rebuildable from `meme_source_engagement_snapshots`, `analytics_events`, and current meme/template metadata. Current source totals use the latest successful snapshot per source post; historical/window metrics use snapshot-to-snapshot deltas; internal platform metrics come from `analytics_events`.
+`public_meme_trends_mv`, `public_tag_trends_mv`, `public_template_trends_mv`,
+`public_tag_trend_points_mv`, and `public_template_trend_points_mv` are
+derived-cached read models. They are rebuildable from
+`meme_source_engagement_snapshots`, `analytics_events`, and current
+meme/template metadata. Current source totals use the latest successful
+snapshot per source post; historical/window source metrics use positive
+increases above each counter's prior running high, matching per-meme Recorded
+activity semantics. Internal platform metrics come from canonical event aliases;
+the inline `meme_send` compatibility event is counted once rather than again as
+`inline_sent`.
 
 The public DTO names remain stable (`latest_source_views`, `latest_source_reactions`, `latest_source_reposts`, `latest_popularity_score`), but these values are derived read-model metrics. There is no canonical `memes.popularity_score` column and no `meme_popularity_snapshots` table.
+
+### Public Meme Insights Read Model
+
+`PublicMemeInsightsService` derives one meme's public source and analytics DTOs
+from canonical tables without creating another mutable truth store. Source
+eligibility is strict: join `MemeSource -> MemeFile -> Meme`, require a visible
+public meme, `platform=telegram`, and `source_kind=public_crawler`, and include
+all matching files. A source page uses the latest successful engagement and
+audience observations at or before its server-issued `snapshot_at`; the same
+cutoff also excludes later source rows, keeping metric sorting and offset
+pagination stable. Its query reads only one latest engagement row per post, one
+latest audience row per channel, and the nearest eligible audience observation
+within 48 hours before each post publication; it does not load indefinitely
+growing history merely to render current source rows. The analytics projection
+loads the history its selected range/baseline requires. Platform days and trend
+periods are truncated explicitly in UTC rather than inheriting the database
+session timezone.
+
+`PublicMemeSourcePageRead` contains safe channel/post URLs, post availability,
+nullable counters, measured-post coverage, ratio-of-sums rates, audience fields,
+summary totals, and pagination only. `PublicMemeAnalyticsRead` contains UTC
+window metadata, exact activity buckets, an opening absolute baseline with the
+latest known aggregate state as of `start_at`, server-bucketed absolute end
+states grounded in real observations, source performance, forward-only audience
+change, and separate web/inline funnels.
+Neither DTO contains raw platform/source IDs, uploader or operator provenance,
+Telegram session/lease/error data, `raw_metrics`, source text,
+forwarded-original fields, user/request/query data, or raw ranking scores.
 
 ### TelegramSession
 
@@ -87,7 +138,21 @@ Terminal attempt status includes `completed`, `failed`, `expired`, and `cancelle
 
 ### SourceChannel
 
-Channels being crawled. Key fields: `platform`, `platform_id`, `username`, `title`, `subscriber_count`, `is_active`, `last_read_post_id` (platform-specific, e.g. Telegram message ID — used to resume on restart), `telegram_session_id` (nullable FK to the `telegram_sessions` row that handles this channel), and live/catch-up/engagement flags. If a Telegram session is deleted, `ON DELETE SET NULL` leaves that **Telegram** source channel as an orphan; it remains visible for operator repair but is not runnable until reassigned. `orphaned` is deliberately Telegram-only: a non-Telegram source is never made orphaned merely because this nullable Telegram-specific field is empty.
+Channels being crawled. Key fields: `platform`, `platform_id`, `username`,
+`title`, latest-success `subscriber_count` cache and
+`subscriber_count_updated_at`,
+audience-capture state (`last_audience_capture_at`,
+`next_audience_capture_at`, lock owner/time, attempt count, and last error),
+`is_active`,
+`last_read_post_id` (platform-specific, e.g. Telegram message ID — used to
+resume on restart), `telegram_session_id` (nullable FK to the
+`telegram_sessions` row that handles this channel), and live/catch-up/engagement
+flags. Failed or not-exposed audience captures never clear a valid subscriber
+cache. If a Telegram session is deleted, `ON DELETE SET NULL` leaves that
+**Telegram** source channel as an orphan; it remains visible for operator repair
+but is not runnable until reassigned. `orphaned` is deliberately Telegram-only:
+a non-Telegram source is never made orphaned merely because this nullable
+Telegram-specific field is empty.
 
 The browser-admin list adds rebuildable aggregate fields rather than denormalized
 columns: `latest_post_at = max(source_channel_posts.published_at)`,
@@ -98,6 +163,26 @@ source inventory in one aggregate read and combines them with the separately
 bounded latest-backfill projection. The source-post channel/time index and the
 `meme_sources(platform, source_id, post_id)` unique index support these reads;
 there is no per-source query loop and no migration-owned counter that can drift.
+
+### SourceChannelAudienceSnapshot
+
+Forward-only Telegram channel-audience observation. Key fields:
+`source_channel_id`, nullable `telegram_session_id`, `captured_at`, UTC
+`capture_slot`, `capture_reason` (`initial_resolution`, `crawler_refresh`, or
+`scheduled`), `fetch_status` (`success`, `not_exposed`, or `failed`), nullable
+nonnegative `subscriber_count`, and safe `error_code`. For each unique
+`(source_channel_id, capture_slot, capture_reason)` key, the first `success` or
+`not_exposed` row is terminal and immutable; later same-slot attempts return it
+unchanged. Only a `failed` row remains retryable and may be replaced by a later
+`failed`, `success`, or `not_exposed` result. Known zero is preserved;
+non-success rows cannot carry a count.
+
+There is no historical reconstruction. A post's `audience_at_publish` is the
+latest successful snapshot at or before publication only when it is at most 48
+hours old. `current_audience` is the latest successful snapshot at the public
+read cutoff. Per-1,000-subscriber ratios require a positive eligible audience
+denominator and publish eligible/total coverage; summed subscriber counts are
+never presented as unique reach.
 
 ### SourceChannelPost
 
@@ -202,6 +287,12 @@ Deferred/reserved. If present, it is a schema placeholder for a future account d
 General-purpose product analytics event stream. Key fields: `user_id`,
 `event_type`, `payload` (JSON — event-specific data), `occurred_at`.
 
+Public per-meme analytics accepts both strict `payload.refs.meme_id` and legacy
+root `payload.meme_id` references. PostgreSQL expression indexes on each shape,
+followed by `event_type` and `occurred_at`, keep bounded public history queries
+from scanning the full event stream; the response boundary still exposes only
+aggregate counts, never raw payloads or actor data.
+
 `page_view` stores only one approved coarse consumer surface (for example
 `web_home`, `web_search`, or `web_meme_detail`) and an optional authenticated
 actor. It never accepts or persists a raw URL, pathname, route parameter, query
@@ -247,6 +338,23 @@ within its reporting range under a bounded raw-event ceiling; ranges above that
 ceiling fail explicitly instead of materializing an unbounded analytics stream
 in the API process. A protected list or detail response, never the route URL,
 delivers raw query text to the browser.
+
+### MemeExposure
+
+Privacy-bounded, idempotent public funnel fact keyed by
+`(meme_id, kind, exposure_key)`, where `kind` is `web_card` or
+`telegram_inline`. Nullable first-observed stage timestamps are `exposed_at`,
+web-only `detail_clicked_at` and `high_intent_action_at`, and inline-only
+`inline_chosen_at` and `inline_sent_at`. Chosen and sent remain distinct stages
+even when Telegram reports both for one result. Upserts preserve the earliest
+timestamp and allow an out-of-order conversion to arrive before the exposure
+fact.
+
+The table intentionally stores no user, query, request, rank, collection,
+surface payload, or external/chat identifier. Public funnel denominators and
+conversions come only from matched keys in this table. Analytics events without
+an exposure key may contribute to a lower-confidence raw exposure total but
+cannot be inferred into a funnel.
 
 ### MemeInteractionEvent
 

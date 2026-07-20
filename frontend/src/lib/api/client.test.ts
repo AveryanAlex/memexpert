@@ -39,10 +39,12 @@ import {
   fetchCurrentSession,
   fetchHomeFeed,
   fetchMemeLibrary,
+  fetchMemeAnalytics,
   fetchMemeCollectionChoices,
   fetchMemeDetail,
   fetchMemePage,
   fetchMemePopularitySummary,
+  fetchMemeSources,
   fetchProfileStats,
   fetchPinterestFeed,
   fetchSeoMemes,
@@ -62,6 +64,7 @@ import {
   recordMemeDownload,
   recordMemeImpression,
   recordMemeShare,
+  recordMemeView,
   regenerateMemeSeoPage,
   removeCollectionMember,
   removeMemeFromCollection,
@@ -276,10 +279,6 @@ describe('catalog API client', () => {
 
       expect(url.pathname).toBe('/api/v1/memes/slug/frog-wizard');
       expect(url.searchParams.get('include_nsfw')).toBe('false');
-      expect(url.searchParams.get('attribution_request_id')).toBe('req-action-1');
-      expect(url.searchParams.get('attribution_impression_id')).toBe('imp-action-1');
-      expect(url.searchParams.get('attribution_source_algorithm')).toBe('qdrant_similarity');
-      expect(JSON.parse(url.searchParams.get('attribution_score_components') ?? '{}')).toEqual({ total: 0.92 });
 
       return jsonResponse(memeDetail({ id: 'meme-123', seo_page_slug: 'frog-wizard' }));
     }) satisfies ApiFetch;
@@ -287,8 +286,7 @@ describe('catalog API client', () => {
     await fetchMemeDetail({
       fetch: mockFetch,
       baseUrl: 'https://api.memexpert.test',
-      memeId: 'frog-wizard',
-      attribution: actionAttribution()
+      memeId: 'frog-wizard'
     });
 
     expect(mockFetch).toHaveBeenCalledOnce();
@@ -311,6 +309,37 @@ describe('catalog API client', () => {
     });
 
     expect(mockFetch).toHaveBeenCalledOnce();
+  });
+
+  it('requests stable source pages and selectable professional analytics', async () => {
+    const calls: string[] = [];
+    const mockFetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      calls.push(`${url.pathname}?${url.searchParams.toString()}`);
+      return jsonResponse({});
+    }) satisfies ApiFetch;
+
+    await fetchMemeSources({
+      fetch: mockFetch,
+      baseUrl: 'https://api.memexpert.test',
+      memeId: 'meme-123',
+      sort: 'interaction_rate_desc',
+      limit: 10,
+      offset: 20,
+      snapshotAt: '2026-07-20T10:00:00.000Z',
+      cookieHeader: 'sid=viewer'
+    });
+    await fetchMemeAnalytics({
+      fetch: mockFetch,
+      baseUrl: 'https://api.memexpert.test',
+      memeId: 'meme-123',
+      window: '90d'
+    });
+
+    expect(calls).toEqual([
+      '/api/v1/memes/meme-123/sources?include_nsfw=false&sort=interaction_rate_desc&limit=10&offset=20&snapshot_at=2026-07-20T10%3A00%3A00.000Z',
+      '/api/v1/memes/meme-123/analytics?include_nsfw=false&window=90d'
+    ]);
   });
 
   it('requests similar memes through the canonical id endpoint', async () => {
@@ -560,6 +589,7 @@ describe('catalog API client', () => {
     await saveMeme({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', memeId: 'meme-123', body: { attribution: actionAttribution() } });
     await pinMeme({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', memeId: 'meme-123', body: { attribution: actionAttribution() } });
     await recordMemeImpression({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', memeId: 'meme-123', body: { attribution: actionAttribution() } });
+    await recordMemeView({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', memeId: 'meme-123', body: { attribution: actionAttribution() } });
     await recordMemeDetailClick({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', memeId: 'meme-123', body: { attribution: actionAttribution() } });
     await recordMemeShare({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', memeId: 'meme-123', body: { attribution: actionAttribution() } });
     await recordMemeDownload({ fetch: mockFetch, baseUrl: 'https://api.memexpert.test', memeId: 'meme-123', body: { attribution: actionAttribution() } });
@@ -569,6 +599,7 @@ describe('catalog API client', () => {
       '/api/v1/memes/meme-123/save',
       '/api/v1/memes/meme-123/pin',
       '/api/v1/memes/meme-123/impression',
+      '/api/v1/memes/meme-123/view',
       '/api/v1/memes/meme-123/detail-click',
       '/api/v1/memes/meme-123/share',
       '/api/v1/memes/meme-123/download'
@@ -1708,7 +1739,7 @@ function actionAttribution(): MemeActionAttribution {
 }
 
 function isTelemetryActionPath(pathname: string): boolean {
-  return ['/detail-click', '/download', '/impression', '/share'].some((suffix) => pathname.endsWith(suffix));
+  return ['/detail-click', '/download', '/impression', '/share', '/view'].some((suffix) => pathname.endsWith(suffix));
 }
 
 function memeCard(id: string, flags: Partial<MemeLibraryRead['favorites'][number]>): MemeLibraryRead['favorites'][number] {

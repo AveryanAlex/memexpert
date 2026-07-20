@@ -47,6 +47,9 @@ from memexpert.models.enums import ContentPipelineStage
 from memexpert.pipeline.events import build_source_engagement_session_key
 from memexpert.runtime_health import RuntimeHealthReporter
 from memexpert.services.pipeline_reliability import record_pipeline_dead_letter
+from memexpert.services.source_channel_audience_capture import (
+    build_pipeline_source_channel_audience_telegram_client_factory,
+)
 from memexpert.services.source_engagement_capture import (
     build_pipeline_source_engagement_telegram_client_factory,
 )
@@ -57,6 +60,7 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Sequence
 
     from memexpert.media.contracts import PipelineMediaProcessorProtocol
+    from memexpert.services.source_channel_audience_capture import SourceChannelAudienceTelegramClientFactory
     from memexpert.services.source_engagement_capture import SourceEngagementTelegramClientFactory
     from memexpert.workers.pipeline_runtime.stages.context import ObjectStorageClientLike
 
@@ -201,6 +205,8 @@ def build_pipeline_runtime(
     classification_client: ClassificationClientProtocol | None = None,
     source_engagement_telegram_client_factory: SourceEngagementTelegramClientFactory | None = None,
     source_engagement_close_telegram_client_after_capture: bool | None = None,
+    source_channel_audience_telegram_client_factory: SourceChannelAudienceTelegramClientFactory | None = None,
+    source_channel_audience_close_telegram_client_after_capture: bool | None = None,
     source_engagement_telegram_session_manager: TelegramSessionManager | None = None,
     source_engagement_session_keys: Sequence[str] = (),
     health_reporter: RuntimeHealthReporter | None = None,
@@ -272,22 +278,29 @@ def build_pipeline_runtime(
         role=resolved_role,
         name="classification_client",
     )
-    if source_engagement_telegram_client_factory is None and resolved_role.consumes_source_engagement:
-        resolved_source_engagement_telegram_session_manager = (
-            source_engagement_telegram_session_manager
-            or TelegramSessionManager(settings=resolved_settings, session_factory=resolved_session_factory)
+    needs_shared_telegram_manager = resolved_role.consumes_source_engagement and (
+        source_engagement_telegram_client_factory is None
+        or source_channel_audience_telegram_client_factory is None
+    )
+    resolved_source_engagement_telegram_session_manager = source_engagement_telegram_session_manager
+    if resolved_source_engagement_telegram_session_manager is None and needs_shared_telegram_manager:
+        resolved_source_engagement_telegram_session_manager = TelegramSessionManager(
+            settings=resolved_settings,
+            session_factory=resolved_session_factory,
         )
+
+    if source_engagement_telegram_client_factory is None and resolved_role.consumes_source_engagement:
+        if resolved_source_engagement_telegram_session_manager is None:  # pragma: no cover - guarded above.
+            raise RuntimeError("source engagement capture requires a Telegram session manager.")
         resolved_source_engagement_telegram_client_factory = build_pipeline_source_engagement_telegram_client_factory(
             resolved_settings,
             session_manager=resolved_source_engagement_telegram_session_manager,
         )
         resolved_source_engagement_close_telegram_client_after_capture = False
     elif source_engagement_telegram_client_factory is not None:
-        resolved_source_engagement_telegram_session_manager = source_engagement_telegram_session_manager
         resolved_source_engagement_telegram_client_factory = source_engagement_telegram_client_factory
         resolved_source_engagement_close_telegram_client_after_capture = True
     else:
-        resolved_source_engagement_telegram_session_manager = None
         resolved_source_engagement_telegram_client_factory = cast(
             "SourceEngagementTelegramClientFactory",
             _UnavailableDependency(role=resolved_role, name="source_engagement_telegram_client_factory"),
@@ -296,6 +309,34 @@ def build_pipeline_runtime(
     if source_engagement_close_telegram_client_after_capture is not None:
         resolved_source_engagement_close_telegram_client_after_capture = (
             source_engagement_close_telegram_client_after_capture
+        )
+    if source_channel_audience_telegram_client_factory is None and resolved_role.consumes_source_engagement:
+        if resolved_source_engagement_telegram_session_manager is None:  # pragma: no cover - guarded above.
+            raise RuntimeError("source channel audience capture requires a Telegram session manager.")
+        resolved_source_channel_audience_telegram_client_factory = (
+            build_pipeline_source_channel_audience_telegram_client_factory(
+                resolved_settings,
+                session_manager=resolved_source_engagement_telegram_session_manager,
+            )
+        )
+        resolved_source_channel_audience_close_telegram_client_after_capture = False
+    elif source_channel_audience_telegram_client_factory is not None:
+        resolved_source_channel_audience_telegram_client_factory = (
+            source_channel_audience_telegram_client_factory
+        )
+        resolved_source_channel_audience_close_telegram_client_after_capture = True
+    else:
+        resolved_source_channel_audience_telegram_client_factory = cast(
+            "SourceChannelAudienceTelegramClientFactory",
+            _UnavailableDependency(
+                role=resolved_role,
+                name="source_channel_audience_telegram_client_factory",
+            ),
+        )
+        resolved_source_channel_audience_close_telegram_client_after_capture = False
+    if source_channel_audience_close_telegram_client_after_capture is not None:
+        resolved_source_channel_audience_close_telegram_client_after_capture = (
+            source_channel_audience_close_telegram_client_after_capture
         )
     resolved_source_engagement_session_keys = (
         tuple(dict.fromkeys(source_engagement_session_keys)) if resolved_role.consumes_source_engagement else ()
@@ -360,6 +401,23 @@ def build_pipeline_runtime(
             )
             for session_key in resolved_source_engagement_session_keys
         ),
+        source_channel_audience_capture_queues=tuple(
+            _build_source_engagement_capture_queue(
+                queue_name=(
+                    resolved_broker_settings.source_channel_audience_capture_queue_for_session(session_key)
+                ),
+                routing_key=(
+                    resolved_broker_settings.source_channel_audience_capture_binding_key_for_session(session_key)
+                ),
+                retry_request_routing_key=(
+                    resolved_broker_settings.source_channel_audience_capture_retry_request_routing_key_for_session(
+                        session_key,
+                    )
+                ),
+                retry_exchange=resolved_broker_settings.retry_exchange,
+            )
+            for session_key in resolved_source_engagement_session_keys
+        ),
         transcode_queue=_build_stage_queue(
             queue_name=resolved_broker_settings.transcode_queue,
             routing_key=resolved_broker_settings.meme_created_routing_key,
@@ -413,6 +471,21 @@ def build_pipeline_runtime(
             )
             for session_key in resolved_source_engagement_session_keys
         ),
+        source_channel_audience_capture_retry_queues=tuple(
+            _build_retry_queue(
+                queue_name=(
+                    resolved_broker_settings.source_channel_audience_capture_retry_queue_for_session(session_key)
+                ),
+                retry_backoff_milliseconds=resolved_broker_settings.retry_backoff_milliseconds,
+                exchange=resolved_broker_settings.exchange,
+                retry_return_routing_key=(
+                    resolved_broker_settings.source_channel_audience_capture_retry_routing_key_for_session(
+                        session_key,
+                    )
+                ),
+            )
+            for session_key in resolved_source_engagement_session_keys
+        ),
         transcode_retry_queue=_build_retry_queue(
             queue_name=transcode_retry_queue_name,
             retry_backoff_milliseconds=resolved_broker_settings.retry_backoff_milliseconds,
@@ -462,6 +535,12 @@ def build_pipeline_runtime(
         source_engagement_close_telegram_client_after_capture=(
             resolved_source_engagement_close_telegram_client_after_capture
         ),
+        source_channel_audience_telegram_client_factory=(
+            resolved_source_channel_audience_telegram_client_factory
+        ),
+        source_channel_audience_close_telegram_client_after_capture=(
+            resolved_source_channel_audience_close_telegram_client_after_capture
+        ),
         dead_letter_recorder=dead_letter_recorder or record_pipeline_dead_letter,
         source_engagement_telegram_session_manager=resolved_source_engagement_telegram_session_manager,
         health_reporter=health_reporter,
@@ -507,6 +586,23 @@ def build_pipeline_runtime(
                         await rabbit_message.nack(requeue=True)
                         return
                     await runtime.handle_source_engagement_capture_message(payload, rabbit_message)
+
+        for audience_capture_queue in runtime.source_channel_audience_capture_queues:
+
+            @resolved_broker.subscriber(
+                audience_capture_queue,
+                runtime.pipeline_exchange,
+                channel=worker_channel(),
+                consume_args=consume_args(),
+                ack_policy=AckPolicy.MANUAL,
+            )
+            async def _consume_source_channel_audience_capture(payload: object, message: RabbitMessage) -> None:
+                rabbit_message = cast("RabbitMessageLike", cast("object", message))
+                async with runtime.consumer_operation("source_channel_audience_capture") as admitted:
+                    if not admitted:
+                        await rabbit_message.nack(requeue=True)
+                        return
+                    await runtime.handle_source_channel_audience_capture_message(payload, rabbit_message)
 
     if resolved_role.consumes_stage(ContentPipelineStage.TRANSCODE):
 
