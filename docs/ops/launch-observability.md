@@ -45,6 +45,12 @@ Useful safe search terms for plain-text log tools or hosted log search are:
 
 When correlating a user-visible degraded response, search by the response `request_id` instead of query text. If logs are JSON-formatted, filter on fields like `event`, `request_id`, `job_id`, and `degraded_mode`; if logs are plain text, search for the event names above and then inspect the structured fields printed with the record.
 
+The API configures a privacy-bounded JSON handler for the `memexpert` logger
+namespace while leaving Uvicorn access/error logging intact. Structured INFO
+events and all warnings/errors reach stdout; only explicitly allowlisted
+dimensions are serialized. Raw logging arguments, query text, collection IDs,
+tokens, cursors, vectors, and exception messages are not emitted.
+
 ## Scheduler Job Health
 
 Inspect `memexpert-scheduler` logs for:
@@ -63,6 +69,80 @@ rows or a growing oldest `dirty_since` indicate rebuild lag even when one batch
 finishes normally.
 The analytics rollup reports its UTC date window and row count; alert on missed
 hourly runs before interpreting an empty daily aggregate as zero traffic.
+
+## PostgreSQL Statement And Materialized-View Health
+
+PostgreSQL is started with `pg_stat_statements` preloaded, planning and I/O
+timing enabled, and revision `0044` installs the extension. A database-container
+restart is required when first introducing the preload setting; creating the
+extension alone does not activate collection in an already-running server.
+
+Inspect expensive statements without exporting SQL text or bound values:
+
+```sql
+SELECT
+  queryid,
+  calls,
+  round(total_exec_time::numeric, 1) AS total_exec_ms,
+  round(mean_exec_time::numeric, 1) AS mean_exec_ms,
+  rows,
+  shared_blks_read,
+  shared_blks_hit,
+  temp_blks_read,
+  temp_blks_written
+FROM pg_stat_statements
+WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+ORDER BY total_exec_time DESC
+LIMIT 25;
+```
+
+Do not select or paste the `query` column into logs/chat. Resolve a query ID
+inside the protected database session, then correlate its aggregate timings
+with privacy-bounded API events.
+
+Inspect refresh age, relation growth, and vacuum eligibility:
+
+```sql
+SELECT
+  view_name,
+  refreshed_at,
+  now() - refreshed_at AS refresh_age
+FROM materialized_view_refresh_state
+ORDER BY view_name;
+
+SELECT
+  relname,
+  n_live_tup,
+  n_dead_tup,
+  round(n_dead_tup::numeric / GREATEST(n_live_tup, 1), 2) AS dead_live_ratio,
+  pg_size_pretty(pg_total_relation_size(relid)) AS total_size,
+  last_autovacuum,
+  last_autoanalyze
+FROM pg_stat_user_tables
+WHERE relname IN (
+  'public_meme_trends_mv',
+  'public_meme_recommendation_features_mv'
+)
+ORDER BY relname;
+
+SELECT
+  application_name,
+  state,
+  now() - xact_start AS transaction_age,
+  wait_event_type,
+  wait_event,
+  backend_xmin IS NOT NULL AS holds_snapshot
+FROM pg_stat_activity
+WHERE datname = current_database()
+  AND (state = 'idle in transaction' OR backend_xmin IS NOT NULL)
+ORDER BY xact_start NULLS LAST;
+```
+
+Alert when a refresh approaches its configured 900-second cadence, a
+materialized view's dead/live ratio grows persistently, or a long-lived idle
+transaction holds `backend_xmin`. Resetting statement statistics, terminating a
+backend, or rebuilding a view changes production state and requires explicit
+maintenance authorization.
 
 ## Search And Recommendations
 

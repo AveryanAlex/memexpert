@@ -54,6 +54,13 @@ TREND_MATERIALIZED_VIEWS = (
     "public_template_trend_points_mv",
     "public_meme_recommendation_features_mv",
 )
+_REFRESH_STATE_TABLE = "materialized_view_refresh_state"
+_RECORD_REFRESH_SQL = f"""
+INSERT INTO {_REFRESH_STATE_TABLE} (view_name, refreshed_at)
+VALUES (:view_name, statement_timestamp())
+ON CONFLICT (view_name) DO UPDATE
+SET refreshed_at = EXCLUDED.refreshed_at
+"""
 
 type PublicTrendRanking = Literal["trending", "fastest_rising", "most_liked"]
 type PublicTrendTimelineGranularity = Literal["month", "year"]
@@ -119,7 +126,10 @@ class PublicTrendsService:
         result = await self._session.execute(
             _typed_text(
                 f"""
-                SELECT mt.*
+                SELECT
+                    mt.*,
+                    {_refresh_timestamp_sql("public_meme_trends_mv")}
+                        AS materialized_view_refreshed_at
                 FROM public_meme_trends_mv mt
                 JOIN memes m ON m.id = mt.meme_id
                 WHERE {where_sql}
@@ -191,7 +201,16 @@ class PublicTrendsService:
             return None
 
         trend_row = await self._session.execute(
-            text("SELECT * FROM public_meme_trends_mv WHERE meme_id = :meme_id"),
+            text(
+                f"""
+                SELECT
+                    trend.*,
+                    {_refresh_timestamp_sql("public_meme_trends_mv")}
+                        AS materialized_view_refreshed_at
+                FROM public_meme_trends_mv trend
+                WHERE trend.meme_id = :meme_id
+                """
+            ),
             {"meme_id": meme_id},
         )
         trend = trend_row.mappings().first()
@@ -231,9 +250,12 @@ class PublicTrendsService:
 
         result = await self._session.execute(
             text(
-                """
-                SELECT *
-                FROM public_tag_trends_mv
+                f"""
+                SELECT
+                    tag_trend.*,
+                    {_refresh_timestamp_sql("public_tag_trends_mv")}
+                        AS materialized_view_refreshed_at
+                FROM public_tag_trends_mv tag_trend
                 ORDER BY trending_score DESC, engagement_24h DESC, tag ASC
                 LIMIT :limit OFFSET :offset
                 """
@@ -252,9 +274,12 @@ class PublicTrendsService:
 
         result = await self._session.execute(
             text(
-                """
-                SELECT *
-                FROM public_template_trends_mv
+                f"""
+                SELECT
+                    template_trend.*,
+                    {_refresh_timestamp_sql("public_template_trends_mv")}
+                        AS materialized_view_refreshed_at
+                FROM public_template_trends_mv template_trend
                 ORDER BY trending_score DESC, engagement_24h DESC, template_slug ASC
                 LIMIT :limit OFFSET :offset
                 """
@@ -280,7 +305,16 @@ class PublicTrendsService:
         if not normalized_tag:
             return None
         result = await self._session.execute(
-            text("SELECT * FROM public_tag_trends_mv WHERE tag = :tag"),
+            text(
+                f"""
+                SELECT
+                    tag_trend.*,
+                    {_refresh_timestamp_sql("public_tag_trends_mv")}
+                        AS materialized_view_refreshed_at
+                FROM public_tag_trends_mv tag_trend
+                WHERE tag_trend.tag = :tag
+                """
+            ),
             {"tag": normalized_tag},
         )
         row = result.mappings().first()
@@ -296,7 +330,16 @@ class PublicTrendsService:
         if not normalized_slug:
             return None
         result = await self._session.execute(
-            text("SELECT * FROM public_template_trends_mv WHERE template_slug = :template_slug"),
+            text(
+                f"""
+                SELECT
+                    template_trend.*,
+                    {_refresh_timestamp_sql("public_template_trends_mv")}
+                        AS materialized_view_refreshed_at
+                FROM public_template_trends_mv template_trend
+                WHERE template_trend.template_slug = :template_slug
+                """
+            ),
             {"template_slug": normalized_slug},
         )
         row = result.mappings().first()
@@ -601,7 +644,16 @@ class PublicTrendsService:
                 no_data_reason="No visible public meme matched this UUID or slug.",
             )
         trend_row = await self._session.execute(
-            text("SELECT * FROM public_meme_trends_mv WHERE meme_id = :meme_id"),
+            text(
+                f"""
+                SELECT
+                    trend.*,
+                    {_refresh_timestamp_sql("public_meme_trends_mv")}
+                        AS materialized_view_refreshed_at
+                FROM public_meme_trends_mv trend
+                WHERE trend.meme_id = :meme_id
+                """
+            ),
             {"meme_id": meme.id},
         )
         trend = trend_row.mappings().first()
@@ -712,10 +764,10 @@ async def refresh_public_trend_materialized_views(engine: AsyncEngine, *, concur
     async with engine.connect() as connection:
         refresh_connection = await connection.execution_options(isolation_level="AUTOCOMMIT")
         for view_name in TREND_MATERIALIZED_VIEWS:
+            refreshed = False
             if concurrently:
                 try:
                     await refresh_connection.execute(text(f"REFRESH MATERIALIZED VIEW CONCURRENTLY {view_name}"))
-                    continue
                 except DBAPIError:
                     logger.warning(
                         "public_trend_mv_concurrent_refresh_fallback",
@@ -726,7 +778,22 @@ async def refresh_public_trend_materialized_views(engine: AsyncEngine, *, concur
                         exc_info=True,
                     )
                     await refresh_connection.rollback()
-            await refresh_connection.execute(text(f"REFRESH MATERIALIZED VIEW {view_name}"))
+                else:
+                    refreshed = True
+            if not refreshed:
+                await refresh_connection.execute(text(f"REFRESH MATERIALIZED VIEW {view_name}"))
+            await refresh_connection.execute(text(_RECORD_REFRESH_SQL), {"view_name": view_name})
+
+
+def _refresh_timestamp_sql(view_name: str) -> str:
+    """Return a fixed-name scalar read for a materialized view's completion time."""
+
+    if view_name not in TREND_MATERIALIZED_VIEWS:
+        raise ValueError(f"Unsupported materialized view refresh state: {view_name}")
+    return (
+        f"(SELECT refresh_state.refreshed_at FROM {_REFRESH_STATE_TABLE} refresh_state "
+        f"WHERE refresh_state.view_name = '{view_name}')"
+    )
 
 
 def _ranking_filters_sql() -> str:
@@ -975,7 +1042,10 @@ def _trend_metrics_from_row(row: dict[str, object]) -> PublicTrendMetricsRead:
         latest_popularity_score=_float(row.get("latest_popularity_score")),
         engagement_24h=_float(row.get("engagement_24h")),
         trending_score=_float(row.get("trending_score")),
-        refreshed_at=cast("datetime | None", row.get("refreshed_at")),
+        refreshed_at=cast(
+            "datetime | None",
+            row.get("materialized_view_refreshed_at") or row.get("refreshed_at"),
+        ),
     )
 
 

@@ -123,33 +123,35 @@ async def run_scheduler_runtime(
             health_reporter.mark_ready()
         await _wait_for_stop(stop_waiter)
     finally:
-        if started:
-            scheduler_instance.shutdown(wait=True)
+        try:
+            if started:
+                scheduler_instance.shutdown(wait=True)
 
-        if acquired_lock is not None:
-            await acquired_lock.release()
+            if acquired_lock is not None:
+                await acquired_lock.release()
+        finally:
+            try:
+                if connection_cm is not None:
+                    if hasattr(connection_cm, "__aexit__"):
+                        await connection_cm.__aexit__(None, None, None)
+                    elif connection is not None and hasattr(connection, "close"):
+                        await connection.close()
+                elif connection is not None and hasattr(connection, "close"):
+                    await connection.close()
+            finally:
+                if owns_engine:
+                    await resolved_engine.dispose()
 
-        if connection_cm is not None:
-            if hasattr(connection_cm, "__aexit__"):
-                await connection_cm.__aexit__(None, None, None)
-            elif connection is not None and hasattr(connection, "close"):
-                await connection.close()
-        elif connection is not None and hasattr(connection, "close"):
-            await connection.close()
-
-        if owns_engine:
-            await resolved_engine.dispose()
-
-        logger.info(
-            "scheduler_runtime_stopped",
-            extra={
-                "event": "scheduler_runtime_stopped",
-                "jobs_registered": len(jobs),
-                "advisory_lock_enabled": resolved_settings.scheduler_advisory_lock_enabled,
-            },
-        )
-        if health_reporter is not None:
-            await health_reporter.stop()
+                logger.info(
+                    "scheduler_runtime_stopped",
+                    extra={
+                        "event": "scheduler_runtime_stopped",
+                        "jobs_registered": len(jobs),
+                        "advisory_lock_enabled": resolved_settings.scheduler_advisory_lock_enabled,
+                    },
+                )
+                if health_reporter is not None:
+                    await health_reporter.stop()
 
 
 async def _wait_for_stop(stop_waiter: Callable[[], Awaitable[None] | None] | None) -> None:

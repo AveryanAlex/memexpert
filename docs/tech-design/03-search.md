@@ -279,7 +279,14 @@ API-owned tiers.
 
 Public-popular fallback paths for Search, Browse, tag pages, and template pages use the same `public_meme_trends_mv` row-ID pager: PostgreSQL orders and slices IDs first, and the service hydrates only the requested page. These surfaces retain their existing pagination totals and visibility semantics; private and mixed-access ranking paths are unchanged.
 
-The materialized view is refreshed on the scheduler's default five-minute cadence, so offset pages are eventually consistent rather than snapshot-isolated. A refresh can move candidates between requests; deterministic ties and client-side ID deduplication make this best effort, and no snapshot token or Redis dependency is introduced. This is a read-path optimization only: it does not add embedding backfills, ingestion or admin recovery behavior, or new operational logging.
+The materialized views are refreshed on the scheduler's default fifteen-minute
+cadence, so offset pages are eventually consistent rather than snapshot-isolated.
+Refresh completion time is stored once per view in
+`materialized_view_refresh_state`; it is not repeated in every materialized row,
+which allows `REFRESH ... CONCURRENTLY` to retain rows whose derived data did not
+change. A refresh can move candidates between requests; deterministic ties and
+client-side ID deduplication make this best effort, and no snapshot token or
+Redis dependency is introduced.
 
 ### Personalized Feed
 
@@ -405,6 +412,14 @@ and exploration candidates; it does not discard those candidates or force a
 keyset session. Neither path loads the catalog into Python. Guest-to-full merge
 takes minimum first-seen, maximum event timestamps, and summed impression
 count, then invalidates the target profile and both viewer feed-pool namespaces.
+
+The fallback query order and cursor are backed by the exact narrow
+`(trending_score DESC, meme_id ASC)` materialized-view index. The public/NSFW,
+filter, and exact-cooldown predicates remain PostgreSQL-authoritative, but the
+ordered scan stops after it finds the requested page instead of joining and
+sorting the full public catalog. Revision `0044` rebuilds the timestamp-bearing
+materialized views and their indexes once to remove pre-existing heap/index
+bloat while introducing the separate refresh-state rows.
 
 Empty Telegram inline queries put currently accessible explicit pins first,
 including private/shared pins, then consume public Home ranking. Both tiers

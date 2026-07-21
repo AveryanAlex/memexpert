@@ -244,7 +244,7 @@ class Settings(BaseSettings):
     pipeline_worker_fail_sync_qdrant_for_meme_file_id: str | None = None
     pipeline_worker_fail_sync_meili_for_meme_file_id: str | None = None
     scheduler_materialized_view_refresh_enabled: bool = True
-    scheduler_materialized_view_refresh_interval_seconds: float = Field(default=300.0, gt=0.0)
+    scheduler_materialized_view_refresh_interval_seconds: float = Field(default=900.0, gt=0.0)
     scheduler_recommendation_profile_rebuild_enabled: bool = True
     scheduler_recommendation_profile_rebuild_interval_seconds: float = Field(default=300.0, gt=0.0)
     scheduler_recommendation_profile_rebuild_batch_size: int = Field(default=50, ge=1, le=500)

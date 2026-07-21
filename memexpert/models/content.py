@@ -185,6 +185,15 @@ class MemeOfTheDaySelection(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     meme: Mapped["Meme | None"] = relationship("Meme", back_populates="motd_selections")
 
 
+class MaterializedViewRefreshState(Base):
+    """One authoritative completion timestamp for each refreshed read model."""
+
+    __tablename__ = "materialized_view_refresh_state"
+
+    view_name: Mapped[str] = mapped_column(Text, primary_key=True)
+    refreshed_at: Mapped[datetime] = mapped_column(nullable=False)
+
+
 class ModerationReport(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     """Durable user/admin report that feeds the admin moderation queue."""
 
@@ -1623,6 +1632,7 @@ __all__ = [
     "BlockedPerceptualHash",
     "BlockedPerceptualHashAuditLog",
     "EmbeddingCache",
+    "MaterializedViewRefreshState",
     "Meme",
     "MemeFile",
     "MemeFileOCRResult",

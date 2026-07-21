@@ -1345,6 +1345,91 @@ async def test_0041_indexes_both_public_meme_analytics_reference_shapes(
     assert remaining == 0
 
 
+async def test_0044_externalizes_refresh_state_and_rebuilds_home_trend_index(
+    empty_public_schema: tuple[AsyncEngine, str],
+) -> None:
+    engine, database_url = empty_public_schema
+    config = _build_alembic_config(database_url)
+    expected_refresh_views = {
+        "public_meme_trends_mv",
+        "public_tag_trends_mv",
+        "public_template_trends_mv",
+        "public_tag_trend_points_mv",
+        "public_template_trend_points_mv",
+        "public_meme_recommendation_features_mv",
+    }
+
+    await _run_alembic_command(command.upgrade, config, "0044")
+
+    assert "materialized_view_refresh_state" in await _get_table_names(engine)
+    async with engine.connect() as connection:
+        refresh_rows = (
+            await connection.execute(
+                text("SELECT view_name, refreshed_at FROM materialized_view_refresh_state ORDER BY view_name")
+            )
+        ).all()
+        timestamped_definitions = {
+            view_name: cast(
+                "str",
+                await connection.scalar(
+                    text("SELECT pg_get_viewdef(CAST(:view_name AS regclass), true)"),
+                    {"view_name": view_name},
+                ),
+            )
+            for view_name in {
+                "public_meme_trends_mv",
+                "public_tag_trends_mv",
+                "public_template_trends_mv",
+                "public_meme_recommendation_features_mv",
+            }
+        }
+        home_index = cast(
+            "str",
+            await connection.scalar(
+                text(
+                    """
+                    SELECT indexdef
+                    FROM pg_indexes
+                    WHERE schemaname = current_schema()
+                      AND indexname = 'ix_public_meme_trends_mv_home_feed'
+                    """
+                )
+            ),
+        )
+        extension_installed = await connection.scalar(
+            text("SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements')")
+        )
+
+    assert {row.view_name for row in refresh_rows} == expected_refresh_views
+    assert all(row.refreshed_at is not None for row in refresh_rows)
+    assert all(
+        "NULL::timestamp with time zone AS refreshed_at" in definition
+        for definition in timestamped_definitions.values()
+    )
+    assert "trending_score DESC, meme_id" in home_index
+    assert extension_installed is True
+
+    await _run_alembic_command(command.downgrade, config, "0043")
+    assert "materialized_view_refresh_state" not in await _get_table_names(engine)
+    async with engine.connect() as connection:
+        downgraded_definition = cast(
+            "str",
+            await connection.scalar(text("SELECT pg_get_viewdef('public_meme_trends_mv'::regclass, true)")),
+        )
+        downgraded_home_index = await connection.scalar(
+            text(
+                """
+                SELECT indexdef
+                FROM pg_indexes
+                WHERE schemaname = current_schema()
+                  AND indexname = 'ix_public_meme_trends_mv_home_feed'
+                """
+            )
+        )
+    assert "now() AS refreshed_at" in downgraded_definition
+    assert downgraded_home_index is None
+
+
 async def test_0042_adds_and_removes_immutable_media_generation_contract(
     empty_public_schema: tuple[AsyncEngine, str],
 ) -> None:

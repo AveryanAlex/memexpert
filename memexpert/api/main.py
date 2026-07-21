@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from memexpert.api.logging import build_uvicorn_logging_config
 from memexpert.core.config import get_settings
 
 
@@ -16,6 +17,7 @@ def main() -> None:
         factory=True,
         host=settings.app_host,
         port=settings.app_port,
+        log_config=build_uvicorn_logging_config(),
     )
 
 

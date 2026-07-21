@@ -1204,7 +1204,7 @@ _COOLDOWN_FILTER_SQL = """
 _TRENDING_CANDIDATES_SQL = f"""
 SELECT
     trend.meme_id,
-    COALESCE(trend.trending_score, 0.0)::double precision AS score
+    trend.trending_score::double precision AS score
 FROM public_meme_trends_mv trend
 JOIN memes meme ON meme.id = trend.meme_id
 WHERE {_SAFETY_FILTER_SQL}
@@ -1212,13 +1212,13 @@ WHERE {_SAFETY_FILTER_SQL}
   AND NOT (meme.id = ANY(CAST(:excluded_meme_ids AS uuid[])))
   AND (
       CAST(:last_score AS double precision) IS NULL
-      OR COALESCE(trend.trending_score, 0.0) < CAST(:last_score AS double precision)
+      OR trend.trending_score < CAST(:last_score AS double precision)
       OR (
-          COALESCE(trend.trending_score, 0.0) = CAST(:last_score AS double precision)
+          trend.trending_score = CAST(:last_score AS double precision)
           AND trend.meme_id > CAST(:last_meme_id AS uuid)
       )
   )
-ORDER BY COALESCE(trend.trending_score, 0.0) DESC, trend.meme_id ASC
+ORDER BY trend.trending_score DESC, trend.meme_id ASC
 LIMIT :limit
 OFFSET :offset
 """

@@ -25,10 +25,15 @@ from memexpert.services.recommendations.features import (
 )
 from memexpert.services.recommendations.profiles import ProfileSignalVector, build_profile_vectors
 from memexpert.services.recommendations.ranking import RankableCandidate, diversity_rerank, score_home_candidates
-from memexpert.services.recommendations.service import _personalized_v2_serving_enabled
+from memexpert.services.recommendations.service import _TRENDING_CANDIDATES_SQL, _personalized_v2_serving_enabled
 from memexpert.services.recommendations.signals import RawRecommendationSignal, signal_policy_for, weight_signals
 
 NOW = datetime(2026, 7, 20, 12, tzinfo=UTC)
+
+
+def test_home_trending_keyset_order_matches_the_exact_paging_index() -> None:
+    assert "ORDER BY trend.trending_score DESC, trend.meme_id ASC" in _TRENDING_CANDIDATES_SQL
+    assert "COALESCE(trend.trending_score" not in _TRENDING_CANDIDATES_SQL
 
 
 def test_removal_cancels_durable_contribution_without_becoming_negative() -> None:

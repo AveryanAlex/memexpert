@@ -74,17 +74,27 @@ class _RuntimeDispatcher:
 
 
 def test_api_main_runs_uvicorn_with_factory_settings() -> None:
+    startup_events: list[str] = []
+    log_config = {"version": 1}
+
+    def build_log_config() -> dict[str, int]:
+        startup_events.append("logging.configure")
+        return log_config
+
     with (
+        patch("memexpert.api.main.build_uvicorn_logging_config", side_effect=build_log_config),
         patch("memexpert.api.main.get_settings", return_value=Settings(app_host="127.0.0.1", app_port=9001)),
-        patch("uvicorn.run") as uvicorn_run,
+        patch("uvicorn.run", side_effect=lambda *_args, **_kwargs: startup_events.append("uvicorn.run")) as uvicorn_run,
     ):
         api_main()
 
+    assert startup_events == ["logging.configure", "uvicorn.run"]
     uvicorn_run.assert_called_once_with(
         "memexpert.api.app:create_app",
         factory=True,
         host="127.0.0.1",
         port=9001,
+        log_config=log_config,
     )
 
 

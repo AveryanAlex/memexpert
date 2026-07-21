@@ -160,7 +160,7 @@ pnpm build
 
 | Job | Enable variable | Interval variable | Default interval |
 |---|---|---|---|
-| Public trend materialized-view refresh | `SCHEDULER_MATERIALIZED_VIEW_REFRESH_ENABLED` | `SCHEDULER_MATERIALIZED_VIEW_REFRESH_INTERVAL_SECONDS` | `300` seconds |
+| Public trend materialized-view refresh | `SCHEDULER_MATERIALIZED_VIEW_REFRESH_ENABLED` | `SCHEDULER_MATERIALIZED_VIEW_REFRESH_INTERVAL_SECONDS` | `900` seconds |
 | Source engagement capture dispatch | `SCHEDULER_SOURCE_ENGAGEMENT_CAPTURE_ENABLED` | `SCHEDULER_SOURCE_ENGAGEMENT_CAPTURE_INTERVAL_SECONDS` | `21600` seconds |
 | Source-channel audience capture dispatch | `SCHEDULER_SOURCE_CHANNEL_AUDIENCE_CAPTURE_ENABLED` | `SCHEDULER_SOURCE_CHANNEL_AUDIENCE_CAPTURE_INTERVAL_SECONDS` | `3600` seconds |
 | Meme of the Day cache refresh | `SCHEDULER_MOTD_ENABLED` | `SCHEDULER_MOTD_INTERVAL_SECONDS` | `86400` seconds |

@@ -374,6 +374,7 @@ def test_settings_parse_scheduler_contracts() -> None:
 def test_settings_scheduler_source_engagement_defaults_match_design() -> None:
     settings = Settings()
 
+    assert settings.scheduler_materialized_view_refresh_interval_seconds == 900.0
     assert settings.scheduler_source_engagement_capture_enabled is True
     assert settings.scheduler_source_engagement_capture_interval_seconds == 21600.0
     assert settings.scheduler_source_engagement_capture_batch_size == 100

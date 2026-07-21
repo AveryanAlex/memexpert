@@ -22,24 +22,37 @@ class PostgresAdvisorySchedulerLock:
         self._acquired = False
 
     async def acquire(self) -> None:
-        result = await self._connection.execute(
-            text("SELECT pg_try_advisory_lock(:key1, :key2)"),
-            {"key1": self._key[0], "key2": self._key[1]},
-        )
-        if not result.scalar():
-            raise SchedulerInstanceLockError("Unable to acquire scheduler advisory lock.")
+        try:
+            result = await self._connection.execute(
+                text("SELECT pg_try_advisory_lock(:key1, :key2)"),
+                {"key1": self._key[0], "key2": self._key[1]},
+            )
+            self._acquired = bool(result.scalar())
+            # This is a session-level lock, so committing clears autobegin's
+            # transaction and backend_xmin without releasing the lock.
+            await self._connection.commit()
+        except BaseException:
+            await self._connection.rollback()
+            raise
 
-        self._acquired = True
+        if not self._acquired:
+            raise SchedulerInstanceLockError("Unable to acquire scheduler advisory lock.")
 
     async def release(self) -> None:
         if not self._acquired:
             return
 
+        try:
+            await self._connection.execute(
+                text("SELECT pg_advisory_unlock(:key1, :key2)"),
+                {"key1": self._key[0], "key2": self._key[1]},
+            )
+            await self._connection.commit()
+        except BaseException:
+            await self._connection.rollback()
+            raise
+
         self._acquired = False
-        await self._connection.execute(
-            text("SELECT pg_advisory_unlock(:key1, :key2)"),
-            {"key1": self._key[0], "key2": self._key[1]},
-        )
 
 __all__ = [
     "PostgresAdvisorySchedulerLock",

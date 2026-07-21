@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import sys
@@ -65,15 +66,30 @@ class FakeResult:
 
 
 class FakeAsyncConnection:
-    def __init__(self, results: list[bool]) -> None:
+    def __init__(self, results: list[bool | BaseException]) -> None:
         self.results = results
         self.calls: list[tuple[str, dict[str, int]]] = []
+        self.transaction_events: list[str] = []
+        self.commit_calls = 0
+        self.rollback_calls = 0
         self.close_calls = 0
 
     async def execute(self, statement: object, params: dict[str, int]) -> FakeResult:
         sql = getattr(statement, "text", str(statement))
         self.calls.append((sql, params))
-        return FakeResult(self.results.pop(0))
+        self.transaction_events.append("execute")
+        result = self.results.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        return FakeResult(result)
+
+    async def commit(self) -> None:
+        self.commit_calls += 1
+        self.transaction_events.append("commit")
+
+    async def rollback(self) -> None:
+        self.rollback_calls += 1
+        self.transaction_events.append("rollback")
 
     async def close(self) -> None:
         self.close_calls += 1
@@ -134,6 +150,12 @@ class FailingLock:
 
     async def release(self) -> None:
         self.release_calls += 1
+
+
+class CancelledReleaseLock(FakeLock):
+    async def release(self) -> None:
+        self.release_calls += 1
+        raise asyncio.CancelledError
 
 
 class FakeEngine:
@@ -949,6 +971,9 @@ async def test_postgres_advisory_scheduler_lock_acquire_success_and_release_once
         ("SELECT pg_try_advisory_lock(:key1, :key2)", {"key1": 11, "key2": 22}),
         ("SELECT pg_advisory_unlock(:key1, :key2)", {"key1": 11, "key2": 22}),
     ]
+    assert connection.transaction_events == ["execute", "commit", "execute", "commit"]
+    assert connection.commit_calls == 2
+    assert connection.rollback_calls == 0
 
 
 @pytest.mark.asyncio
@@ -964,6 +989,9 @@ async def test_postgres_advisory_scheduler_lock_acquire_failure_raises() -> None
     assert connection.calls == [
         ("SELECT pg_try_advisory_lock(:key1, :key2)", {"key1": 33, "key2": 44}),
     ]
+    assert connection.transaction_events == ["execute", "commit"]
+    assert connection.commit_calls == 1
+    assert connection.rollback_calls == 0
 
 
 @pytest.mark.asyncio
@@ -974,6 +1002,22 @@ async def test_postgres_advisory_scheduler_lock_release_is_idempotent_when_never
     await lock.release()
 
     assert connection.calls == []
+    assert connection.commit_calls == 0
+    assert connection.rollback_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_postgres_advisory_scheduler_lock_rolls_back_cancelled_statements() -> None:
+    connection = FakeAsyncConnection([asyncio.CancelledError()])
+    lock = PostgresAdvisorySchedulerLock(connection, (77, 88))
+
+    with pytest.raises(asyncio.CancelledError):
+        await lock.acquire()
+
+    await lock.release()
+    assert connection.transaction_events == ["execute", "rollback"]
+    assert connection.commit_calls == 0
+    assert connection.rollback_calls == 1
 
 
 @pytest.mark.asyncio
@@ -1123,6 +1167,7 @@ async def test_scheduler_runtime_opens_managed_connection_when_lock_seam_missing
         ("SELECT pg_try_advisory_lock(:key1, :key2)", {"key1": key1, "key2": key2}),
         ("SELECT pg_advisory_unlock(:key1, :key2)", {"key1": key1, "key2": key2}),
     ]
+    assert connection.transaction_events == ["execute", "commit", "execute", "commit"]
     assert connection.close_calls == 1
     assert engine.dispose_calls == 0
 
@@ -1167,4 +1212,29 @@ async def test_scheduler_runtime_logs_lock_conflict_and_disposes_owned_engine(
     assert scheduler.shutdown_waits == []
     assert lock.acquire_calls == 1
     assert lock.release_calls == 1
+    assert engine.dispose_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_scheduler_runtime_closes_resources_when_lock_release_is_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings.model_validate({"scheduler_advisory_lock_enabled": True})
+    scheduler = FakeScheduler()
+    engine = FakeEngine()
+    lock = CancelledReleaseLock()
+
+    monkeypatch.setattr("memexpert.scheduler.runtime.build_async_engine", lambda: engine)
+
+    with pytest.raises(asyncio.CancelledError):
+        await run_scheduler_runtime(
+            settings=settings,
+            scheduler=scheduler,
+            stop_waiter=lambda: None,
+            lock=lock,
+        )
+
+    assert lock.acquire_calls == 1
+    assert lock.release_calls == 1
+    assert scheduler.shutdown_waits == [True]
     assert engine.dispose_calls == 1

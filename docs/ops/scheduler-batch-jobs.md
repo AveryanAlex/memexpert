@@ -67,7 +67,7 @@ Source engagement and public trend jobs:
 | `SCHEDULER_SOURCE_CHANNEL_AUDIENCE_CAPTURE_LEASE_TIMEOUT_SECONDS` | `1800` | Lease timeout before an abandoned audience claim can be reclaimed. |
 | `PIPELINE_BROKER_SOURCE_CHANNEL_AUDIENCE_CAPTURE_QUEUE` | `pipeline.source_channel_audience_capture` | Per-session main/retry queue prefix for the existing Telegram worker role. |
 | `SCHEDULER_MATERIALIZED_VIEW_REFRESH_ENABLED` | `true` | Enables the public trend MV refresh job. |
-| `SCHEDULER_MATERIALIZED_VIEW_REFRESH_INTERVAL_SECONDS` | `300` | Refresh cadence for the derived public trend read models. |
+| `SCHEDULER_MATERIALIZED_VIEW_REFRESH_INTERVAL_SECONDS` | `900` | Refresh cadence for the derived public trend read models. |
 
 Recommendation profile job:
 
@@ -209,19 +209,49 @@ part and drains only 50 users at a time by default. Do not claim the backfill
 complete from schema/code presence, and do not run an unbounded live rebuild
 without explicit authorization.
 
+Revision `0044` creates `materialized_view_refresh_state`, rebuilds the public
+trend and recommendation-feature materializations without volatile per-row
+refresh timestamps, recreates their indexes, and seeds one refresh timestamp
+per view. That rebuild is the one-time compaction path for old heap/index bloat;
+do not add a separate `VACUUM FULL` or `REINDEX` during the same rollout.
+
+Treat the `0044` production upgrade as a coordinated maintenance release:
+
+1. Stop the old scheduler and verify no `REFRESH MATERIALIZED VIEW` statement
+   remains active. This releases the old advisory-lock transaction horizon.
+2. Apply the database-container configuration that preloads
+   `pg_stat_statements`, then restart PostgreSQL and confirm health before
+   starting the migration.
+3. Run `alembic upgrade head` with the scheduler still quiesced. The migration
+   takes `ACCESS EXCLUSIVE` locks on the four rebuilt views; readers can wait
+   until commit. PostgreSQL retains the old relation files until commit, so
+   reserve temporary disk headroom at least equal to their current total size.
+4. Verify revision `0044`, the exact Home index, refresh-state rows, compact
+   relation sizes, and `pg_stat_statements` availability before starting the
+   new scheduler/API release.
+5. Start the fixed scheduler and confirm its advisory-lock connection is idle
+   with null `xact_start`/`backend_xmin`; then observe one normal refresh before
+   closing the maintenance window.
+
+The beta Quadlet migration unit has a 30-minute startup budget for this one-time
+rebuild. Do not push the migration as an unattended image-only rollout before
+the database preload/restart and scheduler-quiesce steps are arranged.
+
 ## Materialized View Refresh Order
 
-`materialized-view-refresh` runs on the existing five-minute cadence. It
+`materialized-view-refresh` runs on a fifteen-minute cadence. It
 refreshes `public_meme_trends_mv`, tag/template summaries, tag/template point
 views, and finally `public_meme_recommendation_features_mv`, because the item
 feature view consumes trend ranks. Each view prefers `CONCURRENTLY`; when
 PostgreSQL rejects that mode the job logs
 `public_trend_mv_concurrent_refresh_fallback` with the view name and retries
-that view non-concurrently. A later dependency failure fails the job and leaves
-the last successfully materialized state in place for serving.
+that view non-concurrently. After each successful view refresh, the scheduler
+upserts that view's single `materialized_view_refresh_state` row. A later
+dependency failure fails the job and leaves both the last successfully
+materialized data and its last-success timestamp in place for serving.
 
 Monitor feature-view row count against currently public memes with ready primary
-files, `refreshed_at` age, provenance/source-quality/technical/platform-response
+files, the matching refresh-state age, provenance/source-quality/technical/platform-response
 coverage flags, and exploration-index availability. Missing derived values are
 expected to be neutral `0.5` with false coverage, not zero. Home can continue
 through the older view during a failed refresh, but rising feature age and broad
@@ -497,11 +527,16 @@ LIMIT 100;
 
 SELECT
   count(*) AS feature_rows,
-  min(refreshed_at) AS oldest_refresh,
-  max(refreshed_at) AS newest_refresh,
   count(*) FILTER (WHERE (coverage_flags ->> 'source_quality')::boolean) AS source_quality_covered,
   count(*) FILTER (WHERE (coverage_flags ->> 'platform_response')::boolean) AS response_covered
 FROM public_meme_recommendation_features_mv;
+
+SELECT
+  view_name,
+  refreshed_at,
+  now() - refreshed_at AS refresh_age
+FROM materialized_view_refresh_state
+ORDER BY view_name;
 ```
 
 These reads expose UUIDs and aggregate coverage only. Do not select vectors,
@@ -591,6 +626,10 @@ Automatic replay:
 - Leave a failed recommendation-feature MV refresh to the next scheduled run
   after correcting the PostgreSQL/lock issue. Do not substitute direct writes
   into a materialized view.
+- If the scheduler advisory-lock backend is `idle in transaction`, stop the
+  rollout and fix/restart that scheduler before any compaction. The session-level
+  advisory lock must remain held while `xact_start` and `backend_xmin` are null;
+  otherwise vacuum cannot reclaim refresh churn.
 
 Manual per-file/per-target replay remains the existing operator API path documented in `docs/ops/content-pipeline-search-sync.md`:
 

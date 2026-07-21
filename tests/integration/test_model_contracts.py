@@ -133,6 +133,7 @@ EXPECTED_TABLES = {
     "meme_file_ocr_results",
     "meme_file_sync_target_snapshots",
     "login_events",
+    "materialized_view_refresh_state",
     "media_generations",
     "meme_files",
     "meme_exposures",

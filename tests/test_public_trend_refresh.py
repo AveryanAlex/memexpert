@@ -19,15 +19,17 @@ class FakeRefreshConnection:
     def __init__(self, *, failures: dict[str, BaseException] | None = None) -> None:
         self.failures = failures or {}
         self.calls: list[str] = []
+        self.parameters: list[dict[str, object] | None] = []
         self.rollback_calls = 0
 
     async def execution_options(self, **kwargs: object) -> FakeRefreshConnection:
         assert kwargs == {"isolation_level": "AUTOCOMMIT"}
         return self
 
-    async def execute(self, statement: object) -> None:
+    async def execute(self, statement: object, parameters: dict[str, object] | None = None) -> None:
         sql = getattr(statement, "text", str(statement))
         self.calls.append(sql)
+        self.parameters.append(parameters)
         if failure := self.failures.get(sql):
             raise failure
 
@@ -60,9 +62,11 @@ async def test_public_trend_refresh_uses_dependency_order_with_concurrent_refres
 
     await refresh_public_trend_materialized_views(cast("AsyncEngine", engine), concurrently=True)
 
-    assert connection.calls == [
+    assert connection.calls[::2] == [
         f"REFRESH MATERIALIZED VIEW CONCURRENTLY {view_name}" for view_name in TREND_MATERIALIZED_VIEWS
     ]
+    assert all("INSERT INTO materialized_view_refresh_state" in sql for sql in connection.calls[1::2])
+    assert connection.parameters[1::2] == [{"view_name": view_name} for view_name in TREND_MATERIALIZED_VIEWS]
     assert connection.rollback_calls == 0
 
 
@@ -89,13 +93,18 @@ async def test_public_trend_refresh_logs_and_falls_back_when_concurrent_refresh_
 
     await refresh_public_trend_materialized_views(cast("AsyncEngine", engine), concurrently=True)
 
-    assert connection.calls == [
+    assert connection.calls[:2] == [
         f"REFRESH MATERIALIZED VIEW CONCURRENTLY {TREND_MATERIALIZED_VIEWS[0]}",
         f"REFRESH MATERIALIZED VIEW {TREND_MATERIALIZED_VIEWS[0]}",
-        *[
-            f"REFRESH MATERIALIZED VIEW CONCURRENTLY {view_name}"
-            for view_name in TREND_MATERIALIZED_VIEWS[1:]
-        ],
+    ]
+    assert connection.parameters[2] == {"view_name": TREND_MATERIALIZED_VIEWS[0]}
+    assert connection.calls[3::2] == [
+        f"REFRESH MATERIALIZED VIEW CONCURRENTLY {view_name}"
+        for view_name in TREND_MATERIALIZED_VIEWS[1:]
+    ]
+    assert all("INSERT INTO materialized_view_refresh_state" in sql for sql in connection.calls[2::2])
+    assert connection.parameters[4::2] == [
+        {"view_name": view_name} for view_name in TREND_MATERIALIZED_VIEWS[1:]
     ]
     assert connection.rollback_calls == 1
     assert warning_calls == [
