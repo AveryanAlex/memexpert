@@ -1,4 +1,5 @@
 import type { PublicMemeSearchResultRead } from '$lib/api/types';
+import type { NavigationType } from '@sveltejs/kit';
 import { ApiError } from '$lib/api/client';
 
 const HOME_FEED_STORAGE_PREFIX = 'memexpert:home-feed:v2';
@@ -44,6 +45,10 @@ export async function loadHomeFeedWithCursorRecovery<T>({
 
 export function isExpiredFeedCursorError(error: unknown): boolean {
   return error instanceof ApiError && error.status === 410 && error.code === 'feed_cursor_expired';
+}
+
+export function shouldRestoreHomeFeed(navigationType: NavigationType | null): boolean {
+  return navigationType === 'popstate';
 }
 
 export function homeFeedStorageKey(viewerId: string | null, feedKey: string): string {

@@ -148,6 +148,9 @@ briefly renders. A failed/invalid reauthorization discards storage and leaves
 the fresh SSR page. A `410 feed_cursor_expired` during continuation clears the
 saved state and restarts from a fresh first page once, replacing rather than
 appending so stale and new pools cannot mix.
+Restoration is gated to SvelteKit `popstate` history traversal: reloads, direct
+Home visits, links, programmatic navigation, and route revalidation keep the
+fresh server-rendered feed and replace any older saved state.
 
 ### Search
 

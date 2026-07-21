@@ -177,6 +177,46 @@ test.describe('public masonry feed smoke', () => {
     await expect(feed.getByRole('link', { name: 'Open Smoke test deploy mood' })).toHaveCount(0);
   });
 
+  test('reload and direct Home navigation keep the fresh SSR feed', async ({ baseURL, page }) => {
+    await page.context().addCookies([
+      {
+        name: 'memexpert_access_token',
+        value: 'smoke-full-home-refresh',
+        url: baseURL ?? 'http://127.0.0.1:4174',
+        httpOnly: true,
+        sameSite: 'Lax'
+      }
+    ]);
+    await disableIntersectionObserver(page);
+    let reauthorizationRequests = 0;
+    page.on('request', (request) => {
+      if (new URL(request.url()).pathname === '/api/v1/memes/home-feed/reauthorize') {
+        reauthorizationRequests += 1;
+      }
+    });
+
+    await page.goto('/');
+    const feed = page.getByRole('list', { name: 'Meme results' });
+    await expect(feed.getByRole('link', { name: 'Open Smoke test cat reaction' })).toBeVisible();
+    await expect.poll(() => page.evaluate(() => (
+      Object.keys(sessionStorage).some((key) => key.startsWith('memexpert:home-feed:v2:'))
+    ))).toBe(true);
+
+    await page.reload();
+    await page.waitForLoadState('networkidle');
+    await expect(feed.getByRole('link', { name: 'Open Smoke test deploy mood' })).toBeVisible();
+    await expect(feed.getByRole('link', { name: 'Open Smoke test cat reaction' })).toHaveCount(0);
+    expect(reauthorizationRequests).toBe(0);
+
+    await page.getByRole('link', { name: 'Search', exact: true }).first().click();
+    await expect(page).toHaveURL(/\/search$/);
+    await page.getByRole('link', { name: 'MemeXpert', exact: true }).click();
+    await page.waitForLoadState('networkidle');
+    await expect(feed.getByRole('link', { name: 'Open Smoke test cat reaction' })).toBeVisible();
+    await expect(feed.getByRole('link', { name: 'Open Smoke test deploy mood' })).toHaveCount(0);
+    expect(reauthorizationRequests).toBe(0);
+  });
+
   test('mobile viewport exposes the feed without layout breakage', async ({ page }) => {
     await page.setViewportSize({ width: 390, height: 844 });
     await disableIntersectionObserver(page);

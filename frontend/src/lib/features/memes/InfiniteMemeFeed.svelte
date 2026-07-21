@@ -1,6 +1,7 @@
 <script lang="ts">
   import { browser } from '$app/environment';
-  import { beforeNavigate } from '$app/navigation';
+  import { afterNavigate, beforeNavigate } from '$app/navigation';
+  import { navigating } from '$app/state';
   import {
     DEFAULT_PAGE_SIZE,
     fetchHomeFeed,
@@ -17,7 +18,8 @@
     homeFeedStorageKey,
     loadHomeFeedWithCursorRecovery,
     loadRestorableHomeFeed,
-    persistRestorableHomeFeed
+    persistRestorableHomeFeed,
+    shouldRestoreHomeFeed
   } from './home-feed-session';
   import {
     appendUniqueMemeResults,
@@ -83,6 +85,9 @@
   let activeFeedKey = $state<string | null>(null);
   let activeHomeStorageKey: string | null = null;
   let homeStateReady = $state(false);
+  let awaitingInitialNavigation = $state(true);
+  let pendingHomeNavigationDecision = $state<'fresh' | 'restore' | null>(null);
+  let restoringHomeState = $state(false);
   let observedInitialPage: PublicMemeSearchPageRead | null = null;
   let observedInitialPageViewerId: string | null = null;
   let homeRestoreController: AbortController | null = null;
@@ -101,6 +106,14 @@
   );
   const currentHomeStorageKey = $derived(homeFeedStorageKey(viewerId, currentFeedKey));
   const homeViewerMismatch = $derived(source === 'home' && initialPageViewerId !== viewerId);
+  const homeNavigationPending = $derived(
+    source === 'home' && (
+      awaitingInitialNavigation ||
+      navigating.type !== null ||
+      pendingHomeNavigationDecision !== null ||
+      restoringHomeState
+    )
+  );
   const basePage = $derived(capturedInitialPage ?? initialPage);
   const baseError = $derived(capturedInitialError === undefined ? initialError : capturedInitialError);
   const items = $derived(homeViewerMismatch ? [] : (loadedItems ?? uniqueMemeResults(basePage.items)));
@@ -145,8 +158,14 @@
   const showLoadMore = $derived(hasMore && items.length > 0);
 
   beforeNavigate(() => {
+    pendingHomeNavigationDecision = null;
     persistCurrentHomeState();
     cancelActiveLoad();
+  });
+  afterNavigate((navigation) => {
+    awaitingInitialNavigation = false;
+    pendingHomeNavigationDecision = shouldRestoreHomeFeed(navigation.type) ? 'restore' : 'fresh';
+    finishHomeNavigationDecision();
   });
   onDestroy(cancelActiveLoad);
 
@@ -168,7 +187,8 @@
       capturedInitialPage = homeViewerMismatch ? null : initialPage;
       capturedInitialError = initialError;
       clearLoadedState();
-      if (!homeViewerMismatch) void restoreHomeState();
+      if (!homeViewerMismatch && !homeNavigationPending) homeStateReady = true;
+      finishHomeNavigationDecision();
       return;
     }
 
@@ -195,7 +215,8 @@
     capturedInitialPage = initialPage;
     capturedInitialError = initialError;
     clearLoadedState();
-    void restoreHomeState();
+    homeStateReady = !homeNavigationPending;
+    finishHomeNavigationDecision();
   });
 
   $effect(() => {
@@ -251,8 +272,30 @@
     errorRetryCursor = undefined;
   }
 
+  function finishHomeNavigationDecision() {
+    if (awaitingInitialNavigation || pendingHomeNavigationDecision === null) return;
+    if (source !== 'home') {
+      pendingHomeNavigationDecision = null;
+      homeStateReady = true;
+      return;
+    }
+    if (homeViewerMismatch) return;
+
+    const decision = pendingHomeNavigationDecision;
+    pendingHomeNavigationDecision = null;
+    if (decision === 'restore') {
+      restoringHomeState = true;
+      homeStateReady = false;
+      void restoreHomeState();
+      return;
+    }
+
+    homeStateReady = true;
+  }
+
   async function restoreHomeState() {
     if (!browser || source !== 'home' || basePage.offset > 0) {
+      restoringHomeState = false;
       homeStateReady = true;
       return;
     }
@@ -263,6 +306,7 @@
       { feedKey: currentFeedKey, viewerId }
     );
     if (!restored) {
+      restoringHomeState = false;
       homeStateReady = true;
       return;
     }
@@ -273,6 +317,7 @@
     });
     if (restorableItems.length !== restored.items.length) {
       clearRestorableHomeFeed(sessionStorage, currentHomeStorageKey);
+      restoringHomeState = false;
       homeStateReady = true;
       return;
     }
@@ -311,6 +356,7 @@
     } finally {
       if (token === homeRestoreToken) {
         homeRestoreController = null;
+        restoringHomeState = false;
         homeStateReady = true;
       }
     }
@@ -361,6 +407,7 @@
     homeRestoreToken += 1;
     homeRestoreController?.abort();
     homeRestoreController = null;
+    restoringHomeState = false;
     if (hadActiveLoad) loadedErrorMessage = activeLoadPreviousError;
     activeLoadPreviousError = null;
     loading = false;

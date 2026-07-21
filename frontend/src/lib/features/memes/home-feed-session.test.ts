@@ -6,6 +6,7 @@ import {
   loadHomeFeedWithCursorRecovery,
   loadRestorableHomeFeed,
   persistRestorableHomeFeed,
+  shouldRestoreHomeFeed,
   type RestorableHomeFeedState
 } from './home-feed-session';
 
@@ -14,6 +15,15 @@ describe('restorable home feed sessions', () => {
     expect(homeFeedStorageKey('viewer-a', 'filters-a')).toBe(homeFeedStorageKey('viewer-a', 'filters-a'));
     expect(homeFeedStorageKey('viewer-a', 'filters-a')).not.toBe(homeFeedStorageKey('viewer-b', 'filters-a'));
     expect(homeFeedStorageKey('viewer-a', 'filters-a')).not.toBe(homeFeedStorageKey('viewer-a', 'filters-b'));
+  });
+
+  it('restores only for browser history traversal', () => {
+    expect(shouldRestoreHomeFeed('popstate')).toBe(true);
+    expect(shouldRestoreHomeFeed('enter')).toBe(false);
+    expect(shouldRestoreHomeFeed('link')).toBe(false);
+    expect(shouldRestoreHomeFeed('goto')).toBe(false);
+    expect(shouldRestoreHomeFeed('form')).toBe(false);
+    expect(shouldRestoreHomeFeed(null)).toBe(false);
   });
 
   it('round-trips an unexpired feed pool and rejects another viewer', () => {

@@ -820,6 +820,7 @@ let loginAttemptSequence = 0;
 let detailReadCount = 0;
 let detailViewCount = 0;
 let similarInitialReadCount = 0;
+const rotatingHomeReadCounts = new Map();
 
 const adminSourcePosts = [
   {
@@ -1334,7 +1335,15 @@ const server = createServer((request, response) => {
 
   if (url.pathname === '/api/v1/memes/home-feed') {
     const offset = url.searchParams.has('cursor') ? 12 : Number(url.searchParams.get('offset') ?? 0);
-    const homeMeme = offset > 0 ? nextMeme : meme;
+    const token = accessToken(request);
+    let rotatingReadCount = 0;
+    if (offset <= 0 && token === 'smoke-full-home-refresh') {
+      rotatingReadCount = (rotatingHomeReadCounts.get(token) ?? 0) + 1;
+      rotatingHomeReadCounts.set(token, rotatingReadCount);
+    }
+    const homeMeme = offset > 0 || (rotatingReadCount > 0 && rotatingReadCount % 2 === 0)
+      ? nextMeme
+      : meme;
     const bootstrapHeaders = accessToken(request)
       ? {}
       : viewerState(request, { bootstrap: true }).headers;
@@ -1347,8 +1356,8 @@ const server = createServer((request, response) => {
       offset,
       total: 2,
       has_more: offset <= 0,
-      request_id: `req_smoke_home_${offset}`,
-      feed_session_id: 'feed_smoke_home',
+      request_id: `req_smoke_home_${offset}_${rotatingReadCount}`,
+      feed_session_id: rotatingReadCount > 0 ? `feed_smoke_home_${rotatingReadCount}` : 'feed_smoke_home',
       next_cursor: offset <= 0 ? 'smoke-signed-home-cursor' : null,
       expires_at: '2099-01-01T00:00:00Z'
     }, bootstrapHeaders);
