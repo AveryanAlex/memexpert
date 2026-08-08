@@ -797,9 +797,12 @@ affected session is marked non-runnable while healthy sessions continue. A
 permanent ban surfaces as `PipelineTelegramSessionBannedError` →
 `telegram_session_banned` / HTTP 503. The session row transitions into
 `status=quarantined` and the runtime refuses to use it for any further work.
-An unauthorized or revoked stored session surfaces as
+An unauthorized, duplicated, or revoked stored session surfaces as
 `PipelineTelegramSessionAuthRequiredError` / `crawler_session_not_runnable`; the
-row is marked `status=auth_required`, not quarantined. Recovery options are:
+row is marked `status=auth_required`, its live-listener and heartbeat markers
+are cleared, and the failure is not retried as a provider outage. A duplicated
+auth key cannot be reused; reconnect the account to rotate the stored
+StringSession. Recovery options are:
 
 1. **Move affected sources** to another ready account in `/admin/sources`
    with "Move source". The operator-token `POST /channels/{id}/reassign`

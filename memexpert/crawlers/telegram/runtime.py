@@ -1456,6 +1456,7 @@ class TelegramCrawlerRuntime:
 
         telegram_session.status = TelegramSessionStatus.AUTH_REQUIRED
         telegram_session.live_listener_started_at = None
+        telegram_session.last_heartbeat_at = None
         telegram_session.last_error_class = error_class[:128]
         telegram_session.last_error_text = error_text[:4000]
         await self._commit_runtime_state()

@@ -22,6 +22,7 @@ from pydantic import SecretStr
 from sqlalchemy import select
 from telethon import TelegramClient, events
 from telethon.errors import (
+    AuthKeyDuplicatedError,
     AuthKeyUnregisteredError,
     FloodWaitError,
     RPCError,
@@ -83,6 +84,10 @@ _SESSION_BANNED_EXCEPTIONS: tuple[type[BaseException], ...] = (
     UserDeactivatedError,
     SessionRevokedError,
 )
+_SESSION_AUTH_REQUIRED_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    AuthKeyDuplicatedError,
+    AuthKeyUnregisteredError,
+)
 _EXHAUSTED_REQUEST_PATTERN = re.compile(r"\bRequest was unsuccessful \d+ time\(s\)", re.IGNORECASE)
 
 
@@ -93,8 +98,9 @@ def _translate_telethon_error(exc: BaseException) -> PipelineTelegramError:
 
     * ``FloodWaitError`` carries ``exc.seconds`` — preserve it so the
       runtime can park the session for the correct cooldown.
-    * ``AuthKeyUnregisteredError`` means the stored StringSession is no
-      longer authorized; require re-import without treating it as a ban.
+    * ``AuthKeyDuplicatedError`` / ``AuthKeyUnregisteredError`` mean the
+      stored StringSession is no longer authorized; require re-import without
+      treating it as a transient provider failure or a ban.
     * ``UserDeactivated`` / ``SessionRevoked`` are permanent session failures;
       quarantine without retry.
     * ``RPCError`` (everything else Telegram sends back) + generic
@@ -113,7 +119,7 @@ def _translate_telethon_error(exc: BaseException) -> PipelineTelegramError:
             f"Telegram flood-waited this session for {wait_seconds}s.",
             wait_seconds=wait_seconds,
         )
-    if isinstance(exc, AuthKeyUnregisteredError):
+    if isinstance(exc, _SESSION_AUTH_REQUIRED_EXCEPTIONS):
         return PipelineTelegramSessionAuthRequiredError(
             "Telegram rejected the stored StringSession auth key; import a valid StringSession.",
         )
@@ -345,6 +351,8 @@ class TelethonClientFactory:
             if row is None:
                 return
             row.status = TelegramSessionStatus.AUTH_REQUIRED
+            row.live_listener_started_at = None
+            row.last_heartbeat_at = None
             row.last_error_class = error_class[:128]
             row.last_error_text = error_text[:4000]
             await db_session.commit()

@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, cast
 import pytest
 from pydantic import SecretStr
 from sqlalchemy import select
+from telethon.errors import AuthKeyDuplicatedError
 from telethon.tl.types import (
     Message as TelethonMessage,
 )
@@ -67,6 +68,7 @@ class _FakeTelegramClient:
     authorized: ClassVar[bool] = True
     account: ClassVar[_FakeAccount | None] = _FakeAccount()
     connect_delay_seconds: ClassVar[float] = 0.0
+    connect_error: ClassVar[Exception | None] = None
 
     def __init__(
         self,
@@ -91,6 +93,8 @@ class _FakeTelegramClient:
         self.instances.append(self)
 
     async def connect(self) -> None:
+        if self.connect_error is not None:
+            raise self.connect_error
         if self.connect_delay_seconds:
             await asyncio.sleep(self.connect_delay_seconds)
         self.connected = True
@@ -211,6 +215,7 @@ def _reset_fake_telethon_client() -> None:
     _FakeTelegramClient.authorized = True
     _FakeTelegramClient.account = _FakeAccount()
     _FakeTelegramClient.connect_delay_seconds = 0.0
+    _FakeTelegramClient.connect_error = None
 
 
 def _settings() -> Settings:
@@ -477,6 +482,43 @@ async def test_telethon_factory_marks_unauthorized_string_session_auth_required(
     assert row.status is TelegramSessionStatus.AUTH_REQUIRED
     assert row.last_error_class == PipelineTelegramSessionAuthRequiredError.__name__
     assert row.encrypted_string_session is not None
+
+
+async def test_telethon_factory_marks_duplicated_auth_key_auth_required(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings()
+    await _insert_telegram_session(migrated_db_session, settings=settings)
+    row = await migrated_db_session.scalar(select(TelegramSession).where(TelegramSession.name == "primary"))
+    assert row is not None
+    row.live_listener_started_at = datetime.now(UTC)
+    row.last_heartbeat_at = datetime.now(UTC)
+    await migrated_db_session.commit()
+    import memexpert.crawlers.telegram.telethon_adapter as adapter_module
+
+    monkeypatch.setattr(adapter_module, "StringSession", _FakeStringSession)
+    monkeypatch.setattr(adapter_module, "TelegramClient", _FakeTelegramClient)
+    _FakeTelegramClient.connect_error = AuthKeyDuplicatedError(request=object())
+    factory = TelethonClientFactory(
+        settings=settings,
+        session_name="primary",
+        session_factory=postgres_session_factory,
+    )
+
+    with pytest.raises(PipelineTelegramSessionAuthRequiredError):
+        _ = await factory.get_client()
+
+    async with postgres_session_factory() as verify_session:
+        persisted = await verify_session.scalar(select(TelegramSession).where(TelegramSession.name == "primary"))
+    assert persisted is not None
+    assert persisted.status is TelegramSessionStatus.AUTH_REQUIRED
+    assert persisted.live_listener_started_at is None
+    assert persisted.last_heartbeat_at is None
+    assert persisted.last_error_class == PipelineTelegramSessionAuthRequiredError.__name__
+    assert persisted.encrypted_string_session is not None
+    assert _FakeTelegramClient.instances[0].disconnected is True
 
 
 def test_telethon_factory_requires_api_credentials() -> None:
