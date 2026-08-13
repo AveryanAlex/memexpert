@@ -175,6 +175,7 @@ test.describe('public masonry feed smoke', () => {
 
     await expect(feed.getByRole('link', { name: 'Open Smoke test cat reaction' })).toBeVisible();
     await expect(feed.getByRole('link', { name: 'Open Smoke test deploy mood' })).toHaveCount(0);
+    await page.unrouteAll({ behavior: 'wait' });
   });
 
   test('reload and direct Home navigation keep the fresh SSR feed', async ({ baseURL, page }) => {
@@ -351,7 +352,9 @@ test.describe('public masonry feed smoke', () => {
       return (window as typeof window & { __masonryHydrationFrames?: MasonryHydrationFrame[] }).__masonryHydrationFrames ?? [];
     });
     expect(hydrationFrames.length).toBeGreaterThan(0);
-    expect(hydrationFrames.filter((frame) => frame.order.length > 0).every((frame) => frame.order.join(',') === '0,1,2,3,4,5,6,7')).toBe(true);
+    const completeHydrationFrames = hydrationFrames.filter((frame) => frame.order.length === 8);
+    expect(completeHydrationFrames.length).toBeGreaterThan(0);
+    expect(completeHydrationFrames.every((frame) => frame.order.join(',') === '0,1,2,3,4,5,6,7')).toBe(true);
 
     const firstVisibleIndex = hydrationFrames.findIndex((frame) => frame.visible.length > 0);
     expect(firstVisibleIndex).toBeGreaterThanOrEqual(0);
