@@ -19,7 +19,7 @@ The primary navigation is **Discover**, **Search**, **Saved**, and **Account**.
 
 | Surface | Behavior |
 | --- | --- |
-| Desktop | The header contains the brand, Discover, a query-only global search form, Saved, and one Account or Sign in control. Global search submits to `/search`; filtering belongs on the Search route. |
+| Desktop | The header contains the brand, Discover, a query-only global search form, Saved, and one Account or Sign in control. The search placeholder includes the formatted public, non-sensitive catalog count when available and falls back to generic search copy when it is unavailable. Global search submits to `/search`; filtering belongs on the Search route. |
 | Mobile | A fixed bottom navigation shows an icon and visible label for Discover, Search, Saved, and Account. Page content reserves space so the navigation does not cover the final controls. |
 | Collection routes | `/collection/{id}` is part of the Saved journey, so Saved remains the active navigation destination there. |
 | Trends | Trends are a secondary discovery destination from Discover, not a replacement for Search or Saved in primary navigation. |

@@ -9,6 +9,7 @@ describe('AppShell SSR', () => {
       props: {
         session: guestSession(),
         sessionError: null,
+        searchMemeCount: 12_345,
         currentPath: '/'
       }
     });
@@ -18,7 +19,7 @@ describe('AppShell SSR', () => {
     expect(body).toContain('href="/search"');
     expect(body).toContain('href="/library"');
     expect(body).toContain('Account');
-    expect(body).toContain('Search memes');
+    expect(body).toContain('Search among 12,345 memes');
     expect(body).toContain('aria-label="Mobile navigation"');
     expect(body).not.toContain('More filters');
     expect(body.match(/Sign in/g)).toHaveLength(1);
@@ -43,6 +44,7 @@ describe('AppShell SSR', () => {
     expect(body).toContain('Account');
     expect(body).not.toContain('Sign in');
     expect(body).toContain('href="/profile"');
+    expect(body).toContain('Search memes, reactions, templates');
     expect(body.match(/href="\/profile"[^>]*aria-current="page"/g)).toHaveLength(2);
     expect(body).not.toContain('href="/admin"');
   });

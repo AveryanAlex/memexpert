@@ -9,10 +9,11 @@
   let {
     session,
     sessionError,
+    searchMemeCount = null,
     currentPath = '/',
     onLoginClick,
     children
-  }: { session: CurrentSessionRead | null; sessionError: string | null; currentPath?: string; onLoginClick?: () => void; children?: Snippet } = $props();
+  }: { session: CurrentSessionRead | null; sessionError: string | null; searchMemeCount?: number | null; currentPath?: string; onLoginClick?: () => void; children?: Snippet } = $props();
 
   const navigationItems = $derived(session?.user.is_admin ? [...PRIMARY_NAV_ITEMS, ADMIN_NAV_ITEM] : PRIMARY_NAV_ITEMS);
   const desktopNavigationItems = $derived(navigationItems.filter((item) => item.href !== '/search' && item.href !== '/profile'));
@@ -30,7 +31,7 @@
           <a class={active ? 'rounded-[14px] bg-soft px-3 py-2 text-sm font-semibold text-accent no-underline' : 'rounded-[14px] px-3 py-2 text-sm font-semibold text-muted no-underline hover:bg-cream hover:text-ink'} href={item.href} aria-current={active ? 'page' : undefined}>{item.label}</a>
         {/each}
       </nav>
-      <GlobalSearch />
+      <GlobalSearch memeCount={searchMemeCount} />
       {#if session?.user.account_type === 'full'}
         <a class="app-shell-account hidden shrink-0 items-center gap-2 rounded-[14px] border border-line bg-paper px-3 py-2 text-sm font-semibold no-underline hover:bg-soft md:inline-flex" href="/profile" aria-current={accountIsActive ? 'page' : undefined}><UserCircle class="size-4" aria-hidden="true" /> <span>Account</span></a>
       {:else}
