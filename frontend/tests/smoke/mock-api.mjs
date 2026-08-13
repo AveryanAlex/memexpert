@@ -1106,6 +1106,16 @@ const server = createServer((request, response) => {
     return;
   }
 
+  if (url.pathname === '/api/v1/seo/summary') {
+    sendJson(response, 200, {
+      public_safe_meme_count: 10,
+      tag_count: 6,
+      template_count: 2,
+      updated_at: '2026-01-01T00:00:00Z'
+    });
+    return;
+  }
+
   if (url.pathname === '/api/v1/analytics/interactions/batch' && request.method === 'POST') {
     readRequestJson(request).then((body) => {
       const count = Array.isArray(body?.events) ? body.events.length : 0;
