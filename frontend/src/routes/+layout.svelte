@@ -58,7 +58,7 @@
 <PageViewTracker />
 
 <TooltipProvider delayDuration={500}>
-  <AppShell {session} {sessionError} currentPath={page.url.pathname} onLoginClick={() => (loginOpen = true)}>
+  <AppShell {session} {sessionError} searchMemeCount={data.searchMemeCount} currentPath={page.url.pathname} onLoginClick={() => (loginOpen = true)}>
     {@render children()}
   </AppShell>
   <TelegramLoginModal bind:open={loginOpen} />
