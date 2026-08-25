@@ -359,7 +359,8 @@ up to five spherical-centroid iterations produce two to four clusters, dropping
 clusters below three items while retaining the global centroid.
 
 `UserRecommendationProfileSignal` stores at most the top 500 decayed long-term
-signals for one user, keyed by `(user_id, meme_id)`, with weight,
+signals for one user whose memes still exist in the catalog, keyed by
+`(user_id, meme_id)`, with weight,
 `last_signal_at`, and strong-positive status. Current Favorite, Save, or Pin
 state contributes weight `5` only while it exists. Download, Send/Share, or
 inline chosen/sent contributes `4` to both serving horizons. Send-family rows
@@ -372,7 +373,8 @@ contribution and is not a negative. Long-term
 high-intent events have a 90-day half-life without a retention cutoff; the
 online short-term read has a 24-hour half-life. The separate current-intent
 vector lives only in Redis, has a 30-minute half-life and two-hour TTL, and never
-stores raw query text.
+stores raw query text. Analytics history may outlive a hard-deleted meme; those
+events remain durable but do not enter profile materialization.
 
 `RecommendationDailyAggregate` is a bounded dashboard rollup uniquely keyed by
 date, surface, algorithm version, profile version, and candidate source. It

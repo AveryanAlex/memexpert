@@ -186,8 +186,10 @@ UPDATE SKIP LOCKED`, and rebuilds each user independently. Serving ignores a
 stale vector while this backlog drains.
 
 The rebuild reads current Favorite/Save/Pin state plus indefinitely retained
-high-intent events, applies the 90-day half-life, and stores at most 500 weighted
-meme signals. Slot zero is the global centroid. With at least 20 distinct strong
+high-intent events for memes that still exist, applies the 90-day half-life, and
+stores at most 500 weighted meme signals. Historical events for hard-deleted
+memes remain in analytics but are excluded before the limit is applied. Slot
+zero is the global centroid. With at least 20 distinct strong
 positives, deterministic cosine farthest-first initialization and at most five
 spherical iterations may also store up to four clusters, dropping clusters
 under three items. Profile rows record model/profile versions, counts, weight,
@@ -667,9 +669,10 @@ Full/manual resync:
 - `sync_qdrant_malformed_payload` / `sync_meili_malformed_payload`: payload or provider response shape is invalid. Inspect `last_error_text`; this usually needs a code/config fix rather than repeated replay.
 - `meilisearch-settings-reconcile` with `status='failed'`: inspect the bounded `last_error` and scheduler log. Fix cross-locale key conflicts in the draft and republish, or restore provider health and use Retry sync. Never clear provider synonyms manually as a recovery shortcut.
 - `recommendation-profile-rebuild` with repeated `failed_users`: inspect safe
-  exception context and affected dirty/status timestamps; verify migration head
-  and primary image embedding shape. Do not log profile vectors or clear dirty
-  flags merely to reduce backlog.
+  `recommendation_profile_rebuild_user_failed` exception context and affected
+  dirty/status timestamps; verify migration head and primary image embedding
+  shape. Do not log profile vectors or clear dirty flags merely to reduce
+  backlog.
 - `materialized-view-refresh` failing at
   `public_meme_recommendation_features_mv`: verify the trend view dependency,
   unique indexes, database capacity/locks, and migration head. Keep serving the

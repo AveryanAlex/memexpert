@@ -669,6 +669,69 @@ async def test_profile_rebuild_materializes_only_the_bounded_top_signal_set(
     assert profiles[0].signal_count == settings.recommendation_long_term_signal_limit
 
 
+async def test_profile_rebuild_ignores_events_for_deleted_memes(
+    migrated_db_session: AsyncSession,
+    postgres_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    viewer = build_full_user()
+    migrated_db_session.add(viewer)
+    await migrated_db_session.flush()
+    observed_at = datetime.now(UTC) - timedelta(hours=1)
+    existing_memes: list[Meme] = []
+    for index in range(20):
+        existing_meme = await _create_meme(migrated_db_session)
+        await _add_embedding(migrated_db_session, existing_meme, (1.0, 0.0))
+        existing_memes.append(existing_meme)
+        migrated_db_session.add(
+            _raw_event(
+                user_id=viewer.id,
+                meme_id=existing_meme.id,
+                event_type=AnalyticsEventType.MEME_DOWNLOAD,
+                occurred_at=observed_at + timedelta(seconds=index),
+            )
+        )
+    migrated_db_session.add_all(
+        [
+            _raw_event(
+                user_id=viewer.id,
+                meme_id=uuid.uuid7(),
+                event_type=AnalyticsEventType.MEME_DOWNLOAD,
+                occurred_at=observed_at + timedelta(minutes=1),
+            ),
+            UserRecommendationProfileStatus(user_id=viewer.id, dirty_since=observed_at),
+        ]
+    )
+    await migrated_db_session.commit()
+    settings = Settings.model_validate(
+        {
+            "pipeline_voyage_output_dimensions": 2,
+            "recommendation_long_term_signal_limit": 20,
+            "recommendation_cluster_activation_signals": 500,
+        }
+    )
+
+    result = await rebuild_dirty_recommendation_profiles(
+        postgres_session_factory,
+        settings=settings,
+    )
+
+    async with postgres_session_factory() as verification_session:
+        materialized_ids = set(
+            await verification_session.scalars(
+                select(UserRecommendationProfileSignal.meme_id).where(
+                    UserRecommendationProfileSignal.user_id == viewer.id
+                )
+            )
+        )
+        status = await verification_session.get(UserRecommendationProfileStatus, viewer.id)
+    assert result.claimed_users == 1
+    assert result.rebuilt_users == 1
+    assert result.failed_users == 0
+    assert materialized_ids == {meme.id for meme in existing_memes}
+    assert status is not None
+    assert status.dirty_since is None
+
+
 @pytest.mark.parametrize(
     ("persisted_model_version", "persisted_profile_version"),
     [

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -33,6 +34,8 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +80,10 @@ class RecommendationProfileStore:
             limit=self._settings.recommendation_long_term_signal_limit,
             include_low_intent=False,
         )
+        locked_meme_ids = await self._lock_existing_meme_ids(
+            tuple(signal.meme_id for signal in signals)
+        )
+        signals = [signal for signal in signals if signal.meme_id in locked_meme_ids]
         vectors_by_meme_id = await self._load_embedding_vectors(tuple(signal.meme_id for signal in signals))
         profile_inputs = [
             ProfileSignalVector(
@@ -354,6 +361,20 @@ class RecommendationProfileStore:
                 continue
         return vectors
 
+    async def _lock_existing_meme_ids(
+        self,
+        meme_ids: Sequence[uuid.UUID],
+    ) -> frozenset[uuid.UUID]:
+        if not meme_ids:
+            return frozenset()
+        return frozenset(
+            await self._session.scalars(
+                select(Meme.id)
+                .where(Meme.id.in_(tuple(meme_ids)))
+                .with_for_update(read=True, key_share=True)
+            )
+        )
+
     async def _load_median_positive_popularity(
         self,
         user_id: uuid.UUID,
@@ -468,8 +489,16 @@ async def rebuild_dirty_recommendation_profiles(
             try:
                 async with session.begin_nested():
                     await store.rebuild_user(user_id)
-            except Exception:
+            except Exception as exc:
                 failed += 1
+                logger.warning(
+                    "recommendation_profile_rebuild_user_failed",
+                    extra={
+                        "event": "recommendation_profile_rebuild_user_failed",
+                        "user_id": str(user_id),
+                        "exception_type": type(exc).__name__,
+                    },
+                )
             else:
                 rebuilt += 1
         await session.commit()
@@ -610,13 +639,14 @@ combined AS (
     SELECT * FROM durable_signals
 )
 SELECT
-    meme_id,
+    combined.meme_id,
     sum(weight)::double precision AS weight,
     max(last_signal_at) AS last_signal_at,
     bool_or(is_strong_positive) AS is_strong_positive
 FROM combined
-GROUP BY meme_id
-ORDER BY weight DESC, last_signal_at DESC, meme_id
+JOIN memes ON memes.id = combined.meme_id
+GROUP BY combined.meme_id
+ORDER BY weight DESC, last_signal_at DESC, combined.meme_id
 LIMIT :limit
 """
 
